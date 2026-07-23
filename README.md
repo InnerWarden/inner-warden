@@ -32,11 +32,19 @@ curl -fsSL https://innerwarden.com/free | sh
 Windows (PowerShell):
 
 ```powershell
-irm https://innerwarden.com/free.ps1 | iex
+irm https://innerwarden.com/free.exe -OutFile innerwarden.exe
 ```
 
-Or build it yourself (see below). No account, no telemetry, nothing leaves the
-machine.
+With Rust / cargo (any platform):
+
+```sh
+cargo install --git https://github.com/InnerWarden/inner-warden innerwarden
+```
+
+No account. The guard itself sends nothing off the machine. The `curl | sh`
+installer sends one anonymous, opt-out install ping (version + OS + CPU arch
+only — no IP, no host data; set `INNERWARDEN_NO_TELEMETRY=1` to disable). A
+`cargo install` or from-source build sends nothing at all.
 
 ## What it does
 
