@@ -1,0 +1,26 @@
+[package]
+name = "innerwarden-dashboard-kit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+repository.workspace = true
+homepage.workspace = true
+description = "Versioned public dashboard contracts, fail-closed validators, local collectors, and embedded white UI."
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+rust-embed = "8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+sha2 = "0.10"
+
+[target.'cfg(unix)'.dependencies]
+# Token-history sources are opened with O_NOFOLLOW to keep collection inside
+# the reviewed roots even if a local path is raced into a symlink.
+libc = "0.2"
+
+[dev-dependencies]
+jsonschema = { version = "=0.48.1", default-features = false }
+tempfile = "3"

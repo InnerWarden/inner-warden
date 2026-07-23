@@ -1,0 +1,54 @@
+{
+  "schema_version": "innerwarden.dashboard.v1",
+  "preview_id": "preview-observe-001",
+  "preview_digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+  "issued_at": "2026-07-18T12:00:00Z",
+  "preview_expires_at": "2026-07-18T12:05:00Z",
+  "action_id": "begin_observe",
+  "actor": "fixture-operator",
+  "role": "security_operator",
+  "exact_scope": [{ "id": "workload:agent-lab", "kind": "workload", "display_name": "Agent evaluation workload", "verification": "host_verified", "evidence": [] }],
+  "before_state": {
+    "mode": "disabled",
+    "rollout_state": "eligible",
+    "evaluation_id": "eval-single-host-001",
+    "canary_request_id": null,
+    "decision": null,
+    "duration_seconds": null,
+    "state_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+  },
+  "desired_state": {
+    "mode": "observe",
+    "rollout_state": "observing",
+    "evaluation_id": "eval-single-host-001",
+    "canary_request_id": null,
+    "decision": null,
+    "duration_seconds": null,
+    "state_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+  },
+  "paam_ref": {
+    "id": "PAAM-090",
+    "version": "PAAM-090-v1",
+    "canonicalization": "RFC8785-JCS",
+    "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  },
+  "impact": {
+    "security_effect": "visibility_only",
+    "operational_effect": "scoped",
+    "affected_scope": [{ "id": "workload:agent-lab", "kind": "workload", "display_name": "Agent evaluation workload", "verification": "host_verified", "evidence": [] }],
+    "duration_seconds": null,
+    "limitations": ["Observe permits no actual denial"],
+    "evidence": []
+  },
+  "reversibility": {
+    "reversible": true,
+    "reversal_action_ids": ["emergency_disarm"],
+    "automatic_expiry": false,
+    "expires_at": null
+  },
+  "required_confirmation": {
+    "kind": "typed_scope",
+    "prompt": "OBSERVE workload:agent-lab"
+  },
+  "evidence": []
+}

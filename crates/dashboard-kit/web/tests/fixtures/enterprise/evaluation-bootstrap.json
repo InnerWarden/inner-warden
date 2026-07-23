@@ -1,0 +1,96 @@
+{
+  "schema_version": "innerwarden.dashboard.v1",
+  "generated_at": "2026-07-18T12:00:00Z",
+  "edition": "enterprise",
+  "product_version": "0.16.4-fixture",
+  "community_contract": {
+    "id": "CJC-090",
+    "version": "CJC-090-v1",
+    "canonicalization": "RAW-UTF8-BYTES-SHA256",
+    "digest": "sha256:5f4397b1c74409b06f5405f2ca4b748daea208a7d571abc3b03caf1c5040b62c"
+  },
+  "assurance_matrix": {
+    "id": "AM-090",
+    "version": "AM-090-v1",
+    "canonicalization": "RFC8785-JCS",
+    "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "authorization_matrix": {
+    "id": "PAAM-090",
+    "version": "PAAM-090-v1",
+    "canonicalization": "RFC8785-JCS",
+    "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  },
+  "platform": {
+    "os": "linux-fixture",
+    "architecture": "x86_64-fixture",
+    "enterprise_candidate": true,
+    "reason_code": "deterministic_browser_fixture"
+  },
+  "session": {
+    "authenticated": true,
+    "actor_id": "fixture-operator",
+    "role": "security_operator",
+    "scopes": []
+  },
+  "capabilities": [
+    {
+      "id": "enterprise.evaluation",
+      "tier": "enterprise_core",
+      "availability": "available",
+      "entitlement": "valid",
+      "support": "supported",
+      "desired_mode": "observe",
+      "effective_mode": "observe",
+      "convergence": {
+        "configured": { "state": "yes", "evidence": [], "reason_code": null },
+        "loaded": { "state": "yes", "evidence": [], "reason_code": null },
+        "running": { "state": "yes", "evidence": [], "reason_code": null },
+        "enforcing": { "state": "not_applicable", "evidence": [], "reason_code": null },
+        "verified_effective": { "state": "yes", "evidence": [], "reason_code": null }
+      },
+      "rollout_state": "observing",
+      "health": "healthy",
+      "scope": [],
+      "covered_action_classes": [],
+      "bypass_classes": [],
+      "known_uncovered_paths": [],
+      "freshness": { "observed_at": "2026-07-18T12:00:00Z", "budget_seconds": 60, "state": "fresh", "age_seconds": 0 },
+      "last_evidence": null,
+      "sources": [],
+      "claims": [],
+      "reason_code": null,
+      "summary": "A controlled single-host evaluation is available."
+    },
+    {
+      "id": "enterprise.proof_report",
+      "tier": "enterprise_core",
+      "availability": "unavailable",
+      "entitlement": "valid",
+      "support": "supported",
+      "desired_mode": "unknown",
+      "effective_mode": "unknown",
+      "convergence": {
+        "configured": { "state": "unknown", "evidence": [], "reason_code": "CJC_ID_REMEDIATION_OPEN" },
+        "loaded": { "state": "unknown", "evidence": [], "reason_code": "CJC_ID_REMEDIATION_OPEN" },
+        "running": { "state": "unknown", "evidence": [], "reason_code": "CJC_ID_REMEDIATION_OPEN" },
+        "enforcing": { "state": "not_applicable", "evidence": [], "reason_code": "CJC_ID_REMEDIATION_OPEN" },
+        "verified_effective": { "state": "not_applicable", "evidence": [], "reason_code": "CJC_ID_REMEDIATION_OPEN" }
+      },
+      "rollout_state": "unknown",
+      "health": "unknown",
+      "scope": [],
+      "covered_action_classes": [],
+      "bypass_classes": [],
+      "known_uncovered_paths": [],
+      "freshness": { "observed_at": null, "budget_seconds": 60, "state": "missing", "age_seconds": null },
+      "last_evidence": null,
+      "sources": [],
+      "claims": [],
+      "reason_code": "CJC_ID_REMEDIATION_OPEN",
+      "summary": "Proof generation and export remain gated during Functional Core."
+    }
+  ],
+  "highest_priority_gap": null,
+  "privacy": { "storage": ["deterministic_test_fixture_only"], "redactions": [], "egress": [] }
+}

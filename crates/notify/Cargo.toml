@@ -1,0 +1,18 @@
+[package]
+name = "innerwarden-notify"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "Shared notification layer (Telegram / Slack / Discord / webhook) for InnerWarden. Pure config, payload builders, and message formatting — no HTTP transport, so Community Edition and Active Defence use their own clients while resolving the same channels from the same config."
+
+[dependencies]
+# Pure: config resolution + payload shapes. No HTTP client here on purpose — each
+# product owns its transport (Community = ureq/sync, Active Defence = reqwest/async) while sharing
+# this config + payload logic so both notify the SAME channel from ONE config.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"

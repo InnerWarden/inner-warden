@@ -1,0 +1,1684 @@
+openapi: 3.1.0
+info:
+  title: InnerWarden Dashboard Core API
+  version: 1.0.0
+  description: >-
+    Same-origin contract implemented by Community and Enterprise dashboard servers.
+    Missing or unavailable values are explicit and never silently converted to zero.
+    Community implements the read-only subset on its loopback dashboard. Enterprise
+    serves the same contract behind the existing Active Defence TLS and session
+    boundary. Only routes explicitly marked as Enterprise actions may mutate state.
+    This tracked document is the public API interface contract. It does not by
+    itself claim that a route is deployed, that a private AM/PAAM instance has
+    been published, or that an Enterprise Proof gate has passed.
+x-innerwarden-auth-profiles:
+  edition-aware-read:
+    community_authentication: none
+    community_boundary: loopback_read_only
+    oas_default_security: bearer_or_basic_over_tls
+    community_adapter_exception: >-
+      Only the Community server adapter may bypass the OAS security default,
+      and only for same-origin GET requests on its reviewed loopback read-only
+      boundary. Enterprise middleware must never apply this exception.
+    enterprise_authentication: bearer_or_basic_over_tls
+    enterprise_unauthenticated_effect: reject
+    enterprise_scope_enforcement: required
+  enterprise-read-write:
+    authentication: bearer_or_basic_over_tls
+    unauthenticated_effect: reject
+    scope_enforcement: required
+servers:
+  - url: /api/dashboard/v1
+paths:
+  /bootstrap:
+    get:
+      operationId: getDashboardBootstrap
+      x-innerwarden-auth-profile: edition-aware-read
+      x-innerwarden-enterprise-auth-required: true
+      x-innerwarden-community-loopback-read-exception: true
+      security:
+        - EnterpriseBearer: []
+        - EnterpriseBasic: []
+      description: Community permits loopback unauthenticated read; Enterprise requires Bearer or Basic authentication over TLS.
+      responses:
+        '200':
+          description: Dashboard edition, contracts, platform and capability negotiation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DashboardBootstrap'
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /posture:
+    get:
+      operationId: getDashboardPosture
+      x-innerwarden-auth-profile: edition-aware-read
+      x-innerwarden-enterprise-auth-required: true
+      x-innerwarden-community-loopback-read-exception: true
+      security:
+        - EnterpriseBearer: []
+        - EnterpriseBasic: []
+      responses:
+        '200':
+          description: Protection layers and coverage gaps derived from runtime evidence.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [schema_version, generated_at, layers, gaps]
+                properties:
+                  schema_version: { const: innerwarden.dashboard.v1 }
+                  generated_at: { type: string, format: date-time }
+                  layers:
+                    type: array
+                    items: { $ref: '#/components/schemas/ProtectionLayer' }
+                  gaps:
+                    type: array
+                    items: { $ref: '#/components/schemas/CoverageGap' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /overview:
+    get:
+      operationId: getDashboardOverview
+      x-innerwarden-auth-profile: edition-aware-read
+      x-innerwarden-enterprise-auth-required: true
+      x-innerwarden-community-loopback-read-exception: true
+      security:
+        - EnterpriseBearer: []
+        - EnterpriseBasic: []
+      responses:
+        '200':
+          description: Reconciled summary, work queue and recent material outcomes.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DashboardOverview'
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /cases:
+    get:
+      operationId: listDashboardCases
+      x-innerwarden-auth-profile: edition-aware-read
+      x-innerwarden-enterprise-auth-required: true
+      x-innerwarden-community-loopback-read-exception: true
+      security:
+        - EnterpriseBearer: []
+        - EnterpriseBasic: []
+      parameters:
+        - { in: query, name: cursor, schema: { type: string } }
+        - { in: query, name: limit, schema: { type: integer, minimum: 1, maximum: 100, default: 20 } }
+        - { in: query, name: outcome, schema: { type: string } }
+        - { in: query, name: mode, schema: { $ref: '#/components/schemas/EffectiveMode' } }
+        - { in: query, name: authority, schema: { type: string } }
+        - { in: query, name: capability, schema: { type: string } }
+        - { in: query, name: agent, schema: { type: string } }
+        - { in: query, name: host, schema: { type: string } }
+        - { in: query, name: severity, schema: { type: string } }
+        - { in: query, name: q, schema: { type: string, maxLength: 256 } }
+      responses:
+        '200':
+          description: Bounded cursor-paginated case summaries.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [schema_version, generated_at, items, next_cursor]
+                properties:
+                  schema_version: { const: innerwarden.dashboard.v1 }
+                  generated_at: { type: string, format: date-time }
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/CaseSummary' }
+                  next_cursor: { type: [string, 'null'] }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /cases/{case_id}:
+    get:
+      operationId: getDashboardCase
+      x-innerwarden-auth-profile: edition-aware-read
+      x-innerwarden-enterprise-auth-required: true
+      x-innerwarden-community-loopback-read-exception: true
+      security:
+        - EnterpriseBearer: []
+        - EnterpriseBasic: []
+      parameters:
+        - in: path
+          name: case_id
+          required: true
+          schema: { type: string, minLength: 1, maxLength: 256 }
+      responses:
+        '200':
+          description: Complete normalized case timeline.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UnifiedCase'
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { description: Case not found or outside authorized scope. }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /agents:
+    get:
+      operationId: listDashboardAgents
+      x-innerwarden-auth-profile: edition-aware-read
+      x-innerwarden-enterprise-auth-required: true
+      x-innerwarden-community-loopback-read-exception: true
+      security:
+        - EnterpriseBearer: []
+        - EnterpriseBasic: []
+      description: >-
+        Provider-neutral agent and workload observations. Product names enrich a
+        subject but never establish trust, integration, attribution or protection.
+      responses:
+        '200':
+          description: Bounded local agent inventory with independent capability states.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AgentInventory' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /token-intelligence:
+    get:
+      operationId: getDashboardTokenIntelligence
+      x-innerwarden-auth-profile: edition-aware-read
+      x-innerwarden-enterprise-auth-required: true
+      x-innerwarden-community-loopback-read-exception: true
+      security:
+        - EnterpriseBearer: []
+        - EnterpriseBasic: []
+      description: >-
+        Numeric counters from explicitly supported retained local histories. This is
+        observability, not billing data; unavailable dimensions remain null.
+      responses:
+        '200':
+          description: Privacy-preserving token counters and provenance.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TokenIntelligence' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /evaluation:
+    get:
+      operationId: getEnterpriseEvaluation
+      x-innerwarden-edition: enterprise
+      x-innerwarden-auth-profile: enterprise-read-write
+      x-innerwarden-enterprise-auth-required: true
+      security:
+        - EnterpriseBearer: []
+        - EnterpriseBasic: []
+      responses:
+        '200':
+          description: Current single-host evaluation or explicit unavailable state.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EnterpriseEvaluation' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+    post:
+      operationId: createEnterpriseEvaluationDraft
+      x-innerwarden-edition: enterprise
+      x-innerwarden-auth-profile: enterprise-read-write
+      x-innerwarden-enterprise-auth-required: true
+      description: Create an authenticated, audited draft. Draft creation does not change runtime mode and is not evidence of protection.
+      security:
+        - EnterpriseBearer: []
+        - EnterpriseBasic: []
+      parameters:
+        - $ref: '#/components/parameters/CsrfHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EvaluationDraftInput' }
+      responses:
+        '201':
+          description: Draft created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EnterpriseEvaluation' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /evaluation/{evaluation_id}/draft:
+    patch:
+      operationId: updateEnterpriseEvaluationDraft
+      x-innerwarden-edition: enterprise
+      x-innerwarden-auth-profile: enterprise-read-write
+      x-innerwarden-enterprise-auth-required: true
+      description: Update an unpinned draft. A pinned evaluation is immutable and returns 409.
+      security:
+        - EnterpriseBearer: []
+        - EnterpriseBasic: []
+      parameters:
+        - $ref: '#/components/parameters/EvaluationId'
+        - $ref: '#/components/parameters/CsrfHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EvaluationDraftInput' }
+      responses:
+        '200':
+          description: Draft updated.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EnterpriseEvaluation' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /evaluation/{evaluation_id}/pin:
+    post:
+      operationId: pinEnterpriseEvaluation
+      x-innerwarden-edition: enterprise
+      x-innerwarden-auth-profile: enterprise-read-write
+      x-innerwarden-enterprise-auth-required: true
+      x-innerwarden-action-id: pin_evaluation
+      security:
+        - EnterpriseBearer: []
+        - EnterpriseBasic: []
+      parameters:
+        - $ref: '#/components/parameters/EvaluationId'
+        - $ref: '#/components/parameters/CsrfHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EvaluationPinRequest' }
+      responses:
+        '202':
+          description: Pin request accepted and awaiting durable digest verification.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PrivilegedActionReceipt' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /evaluation/{evaluation_id}/decision:
+    post:
+      operationId: recordEnterpriseEvaluationDecision
+      x-innerwarden-edition: enterprise
+      x-innerwarden-auth-profile: enterprise-read-write
+      x-innerwarden-enterprise-auth-required: true
+      x-innerwarden-action-id: record_evaluation_decision
+      security:
+        - EnterpriseBearer: []
+        - EnterpriseBasic: []
+      parameters:
+        - $ref: '#/components/parameters/EvaluationId'
+        - $ref: '#/components/parameters/CsrfHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EvaluationDecisionRequest' }
+      responses:
+        '202':
+          description: Append-only decision request accepted; this does not create or alter Proof Report evidence.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PrivilegedActionReceipt' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /proof-report:
+    get:
+      operationId: getEnterpriseProofReport
+      x-innerwarden-edition: enterprise
+      x-innerwarden-auth-profile: enterprise-read-write
+      x-innerwarden-enterprise-auth-required: true
+      x-innerwarden-remediation-gate: CJC-ID-REMEDIATION-001
+      description: Disabled until the CJC identity/version/digest remediation gate and private AM/PAAM publication gates pass.
+      security:
+        - EnterpriseBearer: []
+        - EnterpriseBasic: []
+      responses:
+        '200':
+          description: Current report projection with pinned contract versions.
+          content:
+            application/json:
+              schema:
+                $ref: './enterprise-proof-report-v1.schema.json'
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { description: No completed report exists for the authorized scope. }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /diagnostics:
+    get:
+      operationId: getDashboardDiagnostics
+      x-innerwarden-auth-profile: edition-aware-read
+      x-innerwarden-enterprise-auth-required: true
+      x-innerwarden-community-loopback-read-exception: true
+      security:
+        - EnterpriseBearer: []
+        - EnterpriseBasic: []
+      responses:
+        '200':
+          description: Capability impact and technical drill-down.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [schema_version, generated_at, items]
+                properties:
+                  schema_version: { const: innerwarden.dashboard.v1 }
+                  generated_at: { type: string, format: date-time }
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/DiagnosticImpact' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /actions/preview:
+    post:
+      operationId: previewEnterprisePrivilegedAction
+      x-innerwarden-edition: enterprise
+      x-innerwarden-auth-profile: enterprise-read-write
+      x-innerwarden-enterprise-auth-required: true
+      description: >-
+        Build a short-lived, single-use RFC8785-JCS-bound impact preview. Preview
+        creation never changes runtime state and never counts as action success.
+      security:
+        - EnterpriseBearer: []
+        - EnterpriseBasic: []
+      parameters:
+        - $ref: '#/components/parameters/CsrfHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ActionPreviewRequest' }
+      responses:
+        '200':
+          description: Short-lived impact preview bound to the exact request payload.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ActionPreview' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /actions/observe:
+    post:
+      operationId: beginEnterpriseObserve
+      x-innerwarden-edition: enterprise
+      x-innerwarden-auth-profile: enterprise-read-write
+      x-innerwarden-enterprise-auth-required: true
+      x-innerwarden-action-id: begin_observe
+      description: Enter verified non-blocking Observe for the exact pinned evaluation scope under PAAM-090-v1.
+      security:
+        - EnterpriseBearer: []
+        - EnterpriseBasic: []
+      parameters:
+        - $ref: '#/components/parameters/CsrfHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ModeTransitionRequest' }
+      responses:
+        '202':
+          description: Transition requested; effective Observe still requires independent runtime verification.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PrivilegedActionReceipt' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /actions/rehearse:
+    post:
+      operationId: beginEnterpriseRehearse
+      x-innerwarden-edition: enterprise
+      x-innerwarden-auth-profile: enterprise-read-write
+      x-innerwarden-enterprise-auth-required: true
+      x-innerwarden-action-id: begin_rehearse
+      description: Enter verified non-blocking Rehearse for the exact pinned evaluation scope under PAAM-090-v1.
+      security:
+        - EnterpriseBearer: []
+        - EnterpriseBasic: []
+      parameters:
+        - $ref: '#/components/parameters/CsrfHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ModeTransitionRequest' }
+      responses:
+        '202':
+          description: Transition requested; effective Rehearse still requires independent runtime verification.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PrivilegedActionReceipt' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /actions/canary:
+    post:
+      operationId: requestEnterpriseCanary
+      x-innerwarden-edition: enterprise
+      x-innerwarden-auth-profile: enterprise-read-write
+      x-innerwarden-enterprise-auth-required: true
+      x-innerwarden-action-id: start_canary
+      security:
+        - EnterpriseBearer: []
+        - EnterpriseBasic: []
+      description: >-
+        Enterprise only. Requires authentication, CSRF, the pinned authorization
+        matrix entry, step-up when required, bounded scope and expiry.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/StartCanaryRequest' }
+      parameters:
+        - $ref: '#/components/parameters/CsrfHeader'
+      responses:
+        '202':
+          description: Request accepted; not evidence of effective enforcement.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PrivilegedActionReceipt' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /actions/canary/stop:
+    post:
+      operationId: stopEnterpriseCanary
+      x-innerwarden-edition: enterprise
+      x-innerwarden-auth-profile: enterprise-read-write
+      x-innerwarden-enterprise-auth-required: true
+      x-innerwarden-action-id: stop_canary
+      security:
+        - EnterpriseBearer: []
+        - EnterpriseBasic: []
+      description: >-
+        Stop an active or pending canary under PAAM-090-v1. A successful
+        acknowledgement remains pending until the non-Enforce runtime state is
+        independently verified.
+      parameters:
+        - $ref: '#/components/parameters/CsrfHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/StopCanaryRequest' }
+      responses:
+        '202':
+          description: Stop requested; effective state remains pending verification.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PrivilegedActionReceipt' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /actions/disarm:
+    post:
+      operationId: requestEnterpriseDisarm
+      x-innerwarden-edition: enterprise
+      x-innerwarden-auth-profile: enterprise-read-write
+      x-innerwarden-enterprise-auth-required: true
+      x-innerwarden-action-id: emergency_disarm
+      security:
+        - EnterpriseBearer: []
+        - EnterpriseBasic: []
+      description: >-
+        Enterprise local recovery action. It cannot depend on licence validity or a
+        remote coordinator, but still requires the local authorization matrix path.
+        Browser and local recovery channels must invoke the same audited host-side
+        safety primitive; acknowledgement is not effective-state proof.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EmergencyDisarmRequest' }
+      parameters:
+        - $ref: '#/components/parameters/CsrfHeader'
+      responses:
+        '202':
+          description: Disarm requested; effective state remains pending verification.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PrivilegedActionReceipt' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+components:
+  securitySchemes:
+    EnterpriseBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: InnerWardenSession
+      description: Active Defence authenticated bearer session over TLS. Never implemented by Community.
+    EnterpriseBasic:
+      type: http
+      scheme: basic
+      description: Existing Active Defence Basic authentication over TLS for local deployments. Never accepted over plaintext transport.
+  parameters:
+    EvaluationId:
+      in: path
+      name: evaluation_id
+      required: true
+      schema: { type: string, minLength: 1, maxLength: 256 }
+    CsrfHeader:
+      in: header
+      name: X-Requested-With
+      required: true
+      schema: { type: string, const: XMLHttpRequest }
+      description: Existing Active Defence same-origin CSRF signal.
+  responses:
+    Unauthenticated:
+      description: Enterprise authentication is missing or invalid.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    Forbidden:
+      description: Authenticated actor, scope, PAAM entry, preview binding, CSRF or step-up does not authorize the operation.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    Conflict:
+      description: Immutable state, readiness, scope, contract publication, digest or runtime precondition failed.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    RateLimited:
+      description: Bounded local rate limit exceeded; retry only after Retry-After.
+      headers:
+        Retry-After:
+          schema: { type: integer, minimum: 1, maximum: 86400 }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+  schemas:
+    ErrorResponse:
+      type: object
+      additionalProperties: false
+      required: [schema_version, code, message, retryable]
+      properties:
+        schema_version: { const: innerwarden.dashboard.v1 }
+        code: { type: string, minLength: 1, maxLength: 128 }
+        message: { type: string, minLength: 1, maxLength: 2048 }
+        retryable: { type: boolean }
+        remediation_gate: { type: [string, 'null'], maxLength: 128 }
+    Availability:
+      $ref: './dashboard-common-v1.schema.json#/$defs/Availability'
+    EffectiveMode:
+      $ref: './dashboard-common-v1.schema.json#/$defs/EffectiveMode'
+    VersionRef:
+      $ref: './dashboard-common-v1.schema.json#/$defs/VersionRef'
+    PaamVersionRef:
+      allOf:
+        - $ref: '#/components/schemas/VersionRef'
+        - type: object
+          required: [id, version, canonicalization, digest]
+          properties:
+            id: { const: PAAM-090 }
+            version: { const: PAAM-090-v1 }
+            canonicalization: { const: RFC8785-JCS }
+    EvidenceFreshness:
+      $ref: './dashboard-common-v1.schema.json#/$defs/EvidenceFreshness'
+    EvidenceRef:
+      $ref: './dashboard-common-v1.schema.json#/$defs/EvidenceRef'
+    IntegrityVerifiedEvidenceRef:
+      $ref: './dashboard-common-v1.schema.json#/$defs/IntegrityVerifiedEvidenceRef'
+    FreshIntegrityVerifiedEvidenceRef:
+      allOf:
+        - $ref: '#/components/schemas/IntegrityVerifiedEvidenceRef'
+        - type: object
+          properties:
+            freshness:
+              allOf:
+                - $ref: '#/components/schemas/EvidenceFreshness'
+                - type: object
+                  properties:
+                    state: { const: fresh }
+    SourceRef:
+      $ref: './dashboard-common-v1.schema.json#/$defs/SourceRef'
+    StageState:
+      type: object
+      additionalProperties: false
+      required: [state, evidence]
+      properties:
+        state: { type: string, enum: [yes, no, unknown, not_applicable] }
+        evidence: { type: array, items: { $ref: '#/components/schemas/EvidenceRef' } }
+        reason_code: { type: [string, 'null'] }
+      if:
+        properties: { state: { const: yes } }
+        required: [state]
+      then:
+        properties: { evidence: { minItems: 1 } }
+    RuntimeConvergence:
+      type: object
+      additionalProperties: false
+      description: Distinguishes the lifecycle required by FR-012; no later stage is inferred from an earlier one.
+      required: [configured, loaded, running, enforcing, verified_effective]
+      properties:
+        configured: { $ref: '#/components/schemas/StageState' }
+        loaded: { $ref: '#/components/schemas/StageState' }
+        running: { $ref: '#/components/schemas/StageState' }
+        enforcing: { $ref: '#/components/schemas/StageState' }
+        verified_effective: { $ref: '#/components/schemas/StageState' }
+    ClaimRecord:
+      $ref: './dashboard-common-v1.schema.json#/$defs/ClaimRecord'
+    ScopeRef:
+      $ref: './dashboard-common-v1.schema.json#/$defs/ScopeRef'
+    PlatformStatus:
+      type: object
+      additionalProperties: false
+      required: [os, architecture, enterprise_candidate, reason_code]
+      properties:
+        os: { type: string }
+        architecture: { type: string }
+        enterprise_candidate:
+          type: boolean
+          description: OS-level candidate signal only; not proof that kernel, privilege, sensor, or enforcement prerequisites are satisfied.
+        reason_code: { type: [string, 'null'] }
+    DashboardSession:
+      type: object
+      additionalProperties: false
+      required: [authenticated, actor_id, role, scopes]
+      properties:
+        authenticated: { type: boolean }
+        actor_id: { type: [string, 'null'] }
+        role: { type: [string, 'null'] }
+        scopes: { type: array, items: { $ref: '#/components/schemas/ScopeRef' } }
+      if:
+        properties: { authenticated: { const: true } }
+        required: [authenticated]
+      then:
+        properties:
+          actor_id: { type: string, minLength: 1, maxLength: 256 }
+          role: { type: string, minLength: 1, maxLength: 128 }
+      else:
+        properties:
+          actor_id: { type: 'null' }
+          role: { type: 'null' }
+          scopes: { maxItems: 0 }
+    PrivacyBoundary:
+      $ref: './dashboard-common-v1.schema.json#/$defs/PrivacyBoundary'
+    CapabilityStatus:
+      type: object
+      additionalProperties: false
+      required: [id, tier, availability, entitlement, support, desired_mode, effective_mode, convergence, rollout_state, health, scope, covered_action_classes, bypass_classes, known_uncovered_paths, freshness, sources, claims, reason_code, summary]
+      properties:
+        id: { type: string }
+        tier: { type: string, enum: [community, enterprise_core, compliance_extension, fleet_extension, advanced_intelligence_extension] }
+        availability: { $ref: '#/components/schemas/Availability' }
+        entitlement: { type: string, enum: [not_required, valid, grace, expired, invalid, unknown] }
+        support: { type: string, enum: [supported, partial, experimental, unsupported, unknown] }
+        desired_mode: { $ref: '#/components/schemas/EffectiveMode' }
+        effective_mode: { $ref: '#/components/schemas/EffectiveMode' }
+        convergence: { $ref: '#/components/schemas/RuntimeConvergence' }
+        rollout_state: { type: string, enum: [ineligible, eligible, installed, observing, rehearsing, ready, canary, enforcing, degraded, disarmed, unknown] }
+        health: { type: string, enum: [healthy, degraded, failed, unknown] }
+        scope: { type: array, items: { $ref: '#/components/schemas/ScopeRef' } }
+        covered_action_classes: { type: array, items: { type: string } }
+        bypass_classes: { type: array, items: { type: string } }
+        known_uncovered_paths: { type: array, items: { type: string } }
+        freshness: { $ref: '#/components/schemas/EvidenceFreshness' }
+        last_evidence: { oneOf: [{ $ref: '#/components/schemas/EvidenceRef' }, { type: 'null' }] }
+        sources: { type: array, items: { $ref: '#/components/schemas/SourceRef' } }
+        claims: { type: array, items: { $ref: '#/components/schemas/ClaimRecord' } }
+        reason_code: { type: [string, 'null'] }
+        summary: { type: string }
+      allOf:
+        - if:
+            anyOf:
+              - properties: { effective_mode: { const: enforce } }
+                required: [effective_mode]
+              - properties: { rollout_state: { enum: [canary, enforcing] } }
+                required: [rollout_state]
+          then:
+            required: [last_evidence]
+            properties:
+              availability: { const: available }
+              scope: { minItems: 1 }
+              freshness:
+                properties: { state: { const: fresh } }
+              last_evidence: { $ref: '#/components/schemas/IntegrityVerifiedEvidenceRef' }
+              convergence:
+                properties:
+                  configured:
+                    properties:
+                      state: { const: yes }
+                      evidence: { minItems: 1, items: { $ref: '#/components/schemas/IntegrityVerifiedEvidenceRef' } }
+                  loaded:
+                    properties:
+                      state: { const: yes }
+                      evidence: { minItems: 1, items: { $ref: '#/components/schemas/IntegrityVerifiedEvidenceRef' } }
+                  running:
+                    properties:
+                      state: { const: yes }
+                      evidence: { minItems: 1, items: { $ref: '#/components/schemas/IntegrityVerifiedEvidenceRef' } }
+                  enforcing:
+                    properties:
+                      state: { const: yes }
+                      evidence: { minItems: 1, items: { $ref: '#/components/schemas/IntegrityVerifiedEvidenceRef' } }
+                  verified_effective:
+                    properties:
+                      state: { const: yes }
+                      evidence: { minItems: 1, items: { $ref: '#/components/schemas/IntegrityVerifiedEvidenceRef' } }
+    DashboardBootstrap:
+      type: object
+      additionalProperties: false
+      required: [schema_version, generated_at, edition, product_version, community_contract, platform, session, capabilities, highest_priority_gap, privacy]
+      properties:
+        schema_version: { const: innerwarden.dashboard.v1 }
+        generated_at: { type: string, format: date-time }
+        edition: { type: string, enum: [community, enterprise] }
+        product_version: { type: string }
+        community_contract:
+          allOf:
+            - $ref: '#/components/schemas/VersionRef'
+            - type: object
+              required: [id, version, canonicalization, digest]
+              properties:
+                id: { const: CJC-090 }
+                version: { const: CJC-090-v1 }
+                canonicalization: { const: RAW-UTF8-BYTES-SHA256 }
+                digest: { const: 'sha256:5f4397b1c74409b06f5405f2ca4b748daea208a7d571abc3b03caf1c5040b62c' }
+        assurance_matrix: { oneOf: [{ $ref: '#/components/schemas/VersionRef' }, { type: 'null' }] }
+        authorization_matrix: { oneOf: [{ $ref: '#/components/schemas/VersionRef' }, { type: 'null' }] }
+        platform: { $ref: '#/components/schemas/PlatformStatus' }
+        session: { $ref: '#/components/schemas/DashboardSession' }
+        capabilities: { type: array, items: { $ref: '#/components/schemas/CapabilityStatus' } }
+        highest_priority_gap: { oneOf: [{ $ref: '#/components/schemas/CoverageGap' }, { type: 'null' }] }
+        privacy: { $ref: '#/components/schemas/PrivacyBoundary' }
+    CoverageGap:
+      type: object
+      additionalProperties: false
+      required: [id, capability_id, affected_scope, action_classes, state, evidence, next_step]
+      properties:
+        id: { type: string }
+        capability_id: { type: string }
+        affected_scope: { type: array, items: { $ref: '#/components/schemas/ScopeRef' } }
+        action_classes: { type: array, items: { type: string } }
+        state: { type: string, enum: [not_covered, degraded, stale, unknown, unsupported] }
+        evidence: { type: array, items: { $ref: '#/components/schemas/EvidenceRef' } }
+        next_step: { type: string }
+    ProtectionLayer:
+      type: object
+      additionalProperties: false
+      required: [id, label, capability_ids, claim_state, effective_mode, effective_scope, covered_action_classes, known_gaps, freshness, convergence, evidence]
+      properties:
+        id: { type: string }
+        label: { type: string }
+        capability_ids: { type: array, items: { type: string } }
+        claim_state: { type: string, enum: [active, visibility_only, readiness_only, degraded, not_covered, unavailable, unknown] }
+        effective_mode: { $ref: '#/components/schemas/EffectiveMode' }
+        effective_scope: { type: array, items: { $ref: '#/components/schemas/ScopeRef' } }
+        covered_action_classes: { type: array, items: { type: string } }
+        known_gaps: { type: array, items: { $ref: '#/components/schemas/CoverageGap' } }
+        freshness: { $ref: '#/components/schemas/EvidenceFreshness' }
+        convergence: { $ref: '#/components/schemas/RuntimeConvergence' }
+        evidence: { type: array, items: { $ref: '#/components/schemas/EvidenceRef' } }
+      if:
+        properties: { claim_state: { const: active } }
+        required: [claim_state]
+      then:
+        properties:
+          effective_mode: { const: enforce }
+          effective_scope: { minItems: 1 }
+          covered_action_classes: { minItems: 1 }
+          freshness:
+            properties: { state: { const: fresh } }
+          convergence:
+            properties:
+              configured:
+                properties:
+                  state: { const: yes }
+                  evidence: { minItems: 1, items: { $ref: '#/components/schemas/IntegrityVerifiedEvidenceRef' } }
+              loaded:
+                properties:
+                  state: { const: yes }
+                  evidence: { minItems: 1, items: { $ref: '#/components/schemas/IntegrityVerifiedEvidenceRef' } }
+              running:
+                properties:
+                  state: { const: yes }
+                  evidence: { minItems: 1, items: { $ref: '#/components/schemas/IntegrityVerifiedEvidenceRef' } }
+              enforcing:
+                properties:
+                  state: { const: yes }
+                  evidence: { minItems: 1, items: { $ref: '#/components/schemas/IntegrityVerifiedEvidenceRef' } }
+              verified_effective:
+                properties:
+                  state: { const: yes }
+                  evidence: { minItems: 1, items: { $ref: '#/components/schemas/IntegrityVerifiedEvidenceRef' } }
+          evidence:
+            minItems: 1
+            items: { $ref: '#/components/schemas/IntegrityVerifiedEvidenceRef' }
+    Metric:
+      $ref: './dashboard-common-v1.schema.json#/$defs/Metric'
+    CaseSummary:
+      type: object
+      additionalProperties: false
+      required: [id, title, severity, status, scope, latest_event_at, outcome]
+      properties:
+        id: { type: string }
+        title: { type: string }
+        severity: { type: string, enum: [critical, high, medium, low, informational, unknown] }
+        status: { type: string, enum: [open, needs_review, observing, contained, dismissed, closed, unknown] }
+        scope: { type: array, items: { $ref: '#/components/schemas/ScopeRef' } }
+        latest_event_at: { type: string, format: date-time }
+        outcome: { $ref: '#/components/schemas/OutcomeKind' }
+    OutcomeKind:
+      $ref: './dashboard-common-v1.schema.json#/$defs/OutcomeKind'
+    CaseEvent:
+      type: object
+      additionalProperties: false
+      required: [id, event_type, observed_at, recorded_at, summary, relationship, source_refs]
+      properties:
+        id: { type: string }
+        event_type: { type: string, enum: [agent_intent, host_observation, signal, incident, recommendation, policy_decision, enforcement_attempt, verification, operator_action, feedback, evidence_gap] }
+        observed_at: { type: string, format: date-time }
+        recorded_at: { type: string, format: date-time }
+        authority: { type: [string, 'null'] }
+        mode: { oneOf: [{ $ref: '#/components/schemas/EffectiveMode' }, { type: 'null' }] }
+        summary: { type: string, minLength: 1, maxLength: 4096 }
+        relationship: { type: string, enum: [causal, strongly_supported, contextual, unknown] }
+        source_refs: { type: array, items: { $ref: '#/components/schemas/EvidenceRef' } }
+    UnifiedCase:
+      type: object
+      additionalProperties: false
+      required: [id, title, severity, status, scope, latest_event_at, outcome, schema_version, identity, recurrence, timeline, evidence, feedback, verified_outcomes]
+      properties:
+        id: { type: string }
+        title: { type: string }
+        severity: { type: string, enum: [critical, high, medium, low, informational, unknown] }
+        status: { type: string, enum: [open, needs_review, observing, contained, dismissed, closed, unknown] }
+        scope: { type: array, items: { $ref: '#/components/schemas/ScopeRef' } }
+        latest_event_at: { type: string, format: date-time }
+        outcome: { $ref: '#/components/schemas/OutcomeKind' }
+        schema_version: { const: innerwarden.dashboard.v1 }
+        identity:
+          type: object
+          additionalProperties: false
+          required: [subject_ids, confidence, evidence]
+          properties:
+            subject_ids: { type: array, items: { type: string } }
+            confidence: { $ref: './dashboard-common-v1.schema.json#/$defs/IdentityConfidence' }
+            evidence: { type: array, items: { $ref: '#/components/schemas/EvidenceRef' } }
+        recurrence:
+          type: object
+          additionalProperties: false
+          required: [first_seen_at, last_seen_at, occurrences, state]
+          properties:
+            first_seen_at: { type: string, format: date-time }
+            last_seen_at: { type: string, format: date-time }
+            occurrences:
+              description: Canonical non-negative decimal counter; strings avoid I-JSON precision loss.
+              type: string
+              pattern: '^[1-9][0-9]*$'
+            state: { type: string, enum: [single, recurring, persistent, unknown] }
+        timeline: { type: array, items: { $ref: '#/components/schemas/CaseEvent' } }
+        evidence: { type: array, items: { $ref: '#/components/schemas/EvidenceRef' } }
+        feedback:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [id, finding_type, status, actor_id, recorded_at, reason, scope, evidence]
+            properties:
+              id: { type: string }
+              finding_type: { type: string, enum: [true_positive, false_positive, false_deny, override, mute, needs_review, expected, uncertain] }
+              status: { type: string, enum: [open, resolved, accepted_risk] }
+              actor_id: { type: string, minLength: 1, maxLength: 256 }
+              recorded_at: { type: string, format: date-time }
+              reason: { type: string }
+              scope: { type: array, items: { $ref: '#/components/schemas/ScopeRef' } }
+              evidence: { type: array, items: { $ref: '#/components/schemas/EvidenceRef' } }
+        verified_outcomes: { type: array, items: { $ref: '#/components/schemas/VerifiedOutcome' } }
+    VerifiedOutcome:
+      type: object
+      additionalProperties: false
+      required: [outcome, mode, actual_denial_or_containment_occurred, verification_status, effective_scope, evidence]
+      properties:
+        outcome: { $ref: '#/components/schemas/OutcomeKind' }
+        mode: { type: string, enum: [observe, rehearse, enforce] }
+        actual_denial_or_containment_occurred: { type: boolean }
+        verification_status: { type: string, enum: [verified, unverified, not_applicable, unknown] }
+        verifier: { type: [string, 'null'] }
+        verified_at: { type: [string, 'null'], format: date-time }
+        effective_scope: { type: array, items: { $ref: '#/components/schemas/ScopeRef' } }
+        evidence: { type: array, items: { $ref: '#/components/schemas/EvidenceRef' } }
+        enforcement_attempt_id: { type: [string, 'null'] }
+      allOf:
+        - if:
+            properties: { outcome: { enum: [blocked_before_execution, contained] } }
+            required: [outcome]
+          then:
+            required: [verifier, verified_at, enforcement_attempt_id]
+            properties:
+              mode: { const: enforce }
+              actual_denial_or_containment_occurred: { const: true }
+              verification_status: { const: verified }
+              verifier: { type: string, minLength: 1 }
+              verified_at: { type: string, format: date-time }
+              effective_scope: { minItems: 1 }
+              evidence:
+                minItems: 1
+                items: { $ref: '#/components/schemas/IntegrityVerifiedEvidenceRef' }
+              enforcement_attempt_id: { type: string, minLength: 1 }
+        - if:
+            properties: { outcome: { const: would_block } }
+            required: [outcome]
+          then:
+            properties:
+              mode: { enum: [observe, rehearse] }
+              actual_denial_or_containment_occurred: { const: false }
+        - if:
+            properties: { outcome: { const: observed_only } }
+            required: [outcome]
+          then:
+            properties:
+              mode: { const: observe }
+              actual_denial_or_containment_occurred: { const: false }
+        - if:
+            properties: { mode: { enum: [observe, rehearse] } }
+            required: [mode]
+          then:
+            properties:
+              actual_denial_or_containment_occurred: { const: false }
+              outcome: { enum: [observed_only, allowed, would_block, not_observed, unknown] }
+    WorkQueueItem:
+      type: object
+      additionalProperties: false
+      required: [id, kind, title, severity, case_ref, action_id]
+      properties:
+        id: { type: string, minLength: 1, maxLength: 256 }
+        kind: { type: string, enum: [case_review, evidence_gap, pending_action, failed_action, evaluation, unknown] }
+        title: { type: string, minLength: 1, maxLength: 512 }
+        severity: { type: string, enum: [critical, high, medium, low, informational, unknown] }
+        case_ref: { type: [string, 'null'], maxLength: 256 }
+        action_id:
+          oneOf:
+            - $ref: '#/components/schemas/PrivilegedActionId'
+            - type: 'null'
+    WorkQueueSummary:
+      type: object
+      additionalProperties: false
+      required: [availability, total, items, evidence]
+      properties:
+        availability: { $ref: '#/components/schemas/Availability' }
+        total:
+          description: Canonical non-negative decimal counter; strings avoid I-JSON precision loss.
+          type: [string, 'null']
+          pattern: '^(0|[1-9][0-9]*)$'
+        items: { type: array, items: { $ref: '#/components/schemas/WorkQueueItem' } }
+        evidence: { type: array, items: { $ref: '#/components/schemas/EvidenceRef' } }
+    ReconciliationRecord:
+      type: object
+      additionalProperties: false
+      required: [id, state, summary, evidence]
+      properties:
+        id: { type: string, minLength: 1, maxLength: 256 }
+        state: { type: string, enum: [reconciled, explained, unreconciled, unavailable, unknown] }
+        summary: { type: string, minLength: 1, maxLength: 2048 }
+        evidence: { type: array, items: { $ref: '#/components/schemas/EvidenceRef' } }
+    DashboardOverview:
+      type: object
+      additionalProperties: false
+      required: [schema_version, generated_at, layers, work_queue, recent_material_outcomes, coverage_gaps, metrics, briefing, reconciliation]
+      properties:
+        schema_version: { const: innerwarden.dashboard.v1 }
+        generated_at: { type: string, format: date-time }
+        layers: { type: array, items: { $ref: '#/components/schemas/ProtectionLayer' } }
+        work_queue: { $ref: '#/components/schemas/WorkQueueSummary' }
+        recent_material_outcomes: { type: array, items: { $ref: '#/components/schemas/CaseSummary' } }
+        coverage_gaps: { type: array, items: { $ref: '#/components/schemas/CoverageGap' } }
+        metrics: { type: array, items: { $ref: '#/components/schemas/Metric' } }
+        briefing:
+          oneOf:
+            - $ref: '#/components/schemas/SecurityBriefing'
+            - type: 'null'
+        reconciliation: { type: array, items: { $ref: '#/components/schemas/ReconciliationRecord' } }
+    SecurityBriefing:
+      $ref: './dashboard-common-v1.schema.json#/$defs/Briefing'
+    BriefingStatement:
+      $ref: './dashboard-common-v1.schema.json#/$defs/BriefingStatement'
+    EnterpriseEvaluation:
+      oneOf:
+        - $ref: '#/components/schemas/EvaluationUnavailable'
+        - $ref: '#/components/schemas/EvaluationRecord'
+    EvaluationUnavailable:
+      type: object
+      additionalProperties: false
+      required: [schema_version, availability, status, reason_code]
+      properties:
+        schema_version: { const: innerwarden.dashboard.v1 }
+        availability: { enum: [unavailable, unsupported, not_configured, failed, unknown] }
+        status: { const: unavailable }
+        reason_code: { type: string, minLength: 1, maxLength: 128 }
+    EvaluationRecord:
+      type: object
+      additionalProperties: false
+      required: [schema_version, availability, id, version, digest, status, scope, contract_versions, scenarios, thresholds, ownership, false_deny_matrix, operational_impact_matrix, readiness, canary, decision, audit, created_at, updated_at]
+      properties:
+        schema_version: { const: innerwarden.dashboard.v1 }
+        availability: { const: available }
+        id: { type: string, minLength: 1, maxLength: 256 }
+        version: { type: string, minLength: 1, maxLength: 128 }
+        digest: { type: [string, 'null'], pattern: '^sha256:[a-f0-9]{64}$' }
+        status: { type: string, enum: [draft, pinned, baseline, observing, rehearsing, ready, canary, completed, failed, cancelled] }
+        scope: { type: array, minItems: 1, items: { $ref: '#/components/schemas/ScopeRef' } }
+        contract_versions:
+          type: object
+          additionalProperties: false
+          required: [community_journey, assurance_matrix, authorization_matrix, dashboard_api]
+          properties:
+            community_journey: { $ref: '#/components/schemas/VersionRef' }
+            assurance_matrix: { $ref: '#/components/schemas/VersionRef' }
+            authorization_matrix: { $ref: '#/components/schemas/VersionRef' }
+            dashboard_api: { $ref: '#/components/schemas/VersionRef' }
+        scenarios:
+          type: array
+          minItems: 3
+          maxItems: 5
+          items: { $ref: '#/components/schemas/EvaluationScenario' }
+          contains:
+            type: object
+            required: [bypass_class_ids]
+            properties: { bypass_class_ids: { minItems: 1 } }
+          minContains: 1
+        thresholds: { $ref: '#/components/schemas/EvaluationThresholds' }
+        ownership: { $ref: '#/components/schemas/EvaluationOwnership' }
+        false_deny_matrix: { $ref: '#/components/schemas/FalseDenyMatrix' }
+        operational_impact_matrix: { $ref: '#/components/schemas/OperationalImpactMatrix' }
+        readiness:
+          type: array
+          items: { $ref: '#/components/schemas/EvaluationReadinessCheck' }
+        canary:
+          oneOf:
+            - $ref: '#/components/schemas/EvaluationCanary'
+            - type: 'null'
+        decision:
+          oneOf:
+            - $ref: '#/components/schemas/EvaluationDecision'
+            - type: 'null'
+        audit: { $ref: '#/components/schemas/EvaluationAudit' }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+      allOf:
+        - if:
+            properties: { status: { const: draft } }
+            required: [status]
+          then:
+            properties: { digest: { type: [string, 'null'], pattern: '^sha256:[a-f0-9]{64}$' } }
+          else:
+            properties: { digest: { type: string, pattern: '^sha256:[a-f0-9]{64}$' } }
+    EvaluationDraftInput:
+      type: object
+      additionalProperties: false
+      required: [scope, scenarios, thresholds, ownership, false_deny_matrix, operational_impact_matrix, contract_versions, rationale]
+      properties:
+        scope: { type: array, minItems: 1, items: { $ref: '#/components/schemas/ScopeRef' } }
+        scenarios:
+          type: array
+          minItems: 3
+          maxItems: 5
+          items: { $ref: '#/components/schemas/EvaluationScenario' }
+          contains:
+            type: object
+            required: [bypass_class_ids]
+            properties: { bypass_class_ids: { minItems: 1 } }
+          minContains: 1
+        thresholds: { $ref: '#/components/schemas/EvaluationThresholds' }
+        ownership: { $ref: '#/components/schemas/EvaluationOwnership' }
+        false_deny_matrix: { $ref: '#/components/schemas/FalseDenyMatrix' }
+        operational_impact_matrix: { $ref: '#/components/schemas/OperationalImpactMatrix' }
+        contract_versions:
+          type: object
+          additionalProperties: false
+          required: [community_journey, assurance_matrix, authorization_matrix, dashboard_api]
+          properties:
+            community_journey: { $ref: '#/components/schemas/VersionRef' }
+            assurance_matrix: { $ref: '#/components/schemas/VersionRef' }
+            authorization_matrix: { $ref: '#/components/schemas/VersionRef' }
+            dashboard_api: { $ref: '#/components/schemas/VersionRef' }
+        rationale: { type: string, minLength: 3, maxLength: 4096 }
+    EvaluationScenario:
+      type: object
+      additionalProperties: false
+      required: [id, description, non_destructive, preconditions, safe_procedure, scope, bypass_class_ids, covered_action_class, protected_resource, expected_outcomes, pass_criteria, fail_criteria, not_covered_criteria, rollback_procedure, owner, observed_result]
+      properties:
+        id: { type: string, minLength: 1, maxLength: 128 }
+        description: { type: string, minLength: 3, maxLength: 2048 }
+        non_destructive: { const: true }
+        preconditions: { type: array, minItems: 1, items: { type: string, minLength: 1, maxLength: 1024 } }
+        safe_procedure: { type: string, minLength: 3, maxLength: 4096 }
+        scope: { type: array, minItems: 1, items: { $ref: '#/components/schemas/ScopeRef' } }
+        bypass_class_ids: { type: array, uniqueItems: true, items: { type: string } }
+        covered_action_class: { type: string, minLength: 1, maxLength: 128 }
+        protected_resource: { $ref: '#/components/schemas/ScopeRef' }
+        expected_outcomes:
+          type: object
+          additionalProperties: false
+          required: [observe, rehearse, enforce]
+          properties:
+            observe: { type: string, enum: [observed_only, would_block, allowed, not_observed, unknown] }
+            rehearse: { type: string, enum: [would_block, allowed, not_observed, unknown] }
+            enforce: { type: string, enum: [allowed, blocked_before_execution, contained, failed, reverted, not_observed, unknown] }
+        pass_criteria: { type: string, minLength: 3, maxLength: 2048 }
+        fail_criteria: { type: string, minLength: 3, maxLength: 2048 }
+        not_covered_criteria: { type: string, minLength: 3, maxLength: 2048 }
+        rollback_procedure: { type: string, minLength: 3, maxLength: 4096 }
+        owner: { type: string, minLength: 1, maxLength: 256 }
+        observed_result:
+          oneOf:
+            - type: object
+              additionalProperties: false
+              required: [result, actual_outcome, observed_at, evidence]
+              properties:
+                result: { type: string, enum: [pass, fail, not_covered, inconclusive] }
+                actual_outcome: { $ref: '#/components/schemas/VerifiedOutcome' }
+                observed_at: { type: string, format: date-time }
+                evidence: { type: array, minItems: 1, items: { $ref: '#/components/schemas/EvidenceRef' } }
+            - type: 'null'
+    EvaluationThresholds:
+      type: object
+      additionalProperties: false
+      required: [maximum_false_denies, maximum_operational_impact_minutes, required_freshness_seconds, rollback_verification_required]
+      properties:
+        maximum_false_denies: { type: integer, minimum: 0, maximum: 9007199254740991 }
+        maximum_operational_impact_minutes: { type: integer, minimum: 0, maximum: 9007199254740991 }
+        required_freshness_seconds: { type: integer, minimum: 1, maximum: 9007199254740991 }
+        rollback_verification_required: { const: true }
+    EvaluationOwnership:
+      type: object
+      additionalProperties: false
+      required: [evaluation_owner, rollback_owner, security_approver]
+      properties:
+        evaluation_owner: { type: string, minLength: 1, maxLength: 256 }
+        rollback_owner: { type: string, minLength: 1, maxLength: 256 }
+        security_approver: { type: string, minLength: 1, maxLength: 256 }
+    FalseDenyMatrix:
+      type: object
+      additionalProperties: false
+      required: [reviewed_at, owner, findings, unresolved_blockers]
+      properties:
+        reviewed_at: { type: ['string', 'null'], format: date-time }
+        owner: { type: string, minLength: 1, maxLength: 256 }
+        findings:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [id, legitimate_dependency, disposition, evidence]
+            properties:
+              id: { type: string, minLength: 1, maxLength: 128 }
+              legitimate_dependency: { type: string, minLength: 1, maxLength: 2048 }
+              disposition: { type: string, enum: [open, fixed, accepted_risk, not_reproduced] }
+              evidence: { type: array, items: { $ref: '#/components/schemas/EvidenceRef' } }
+        unresolved_blockers: { type: array, items: { type: string, minLength: 1, maxLength: 2048 } }
+    OperationalImpactMatrix:
+      type: object
+      additionalProperties: false
+      required: [reviewed_at, owner, measurements, unresolved_blockers]
+      properties:
+        reviewed_at: { type: ['string', 'null'], format: date-time }
+        owner: { type: string, minLength: 1, maxLength: 256 }
+        measurements: { type: array, items: { $ref: '#/components/schemas/Metric' } }
+        unresolved_blockers: { type: array, items: { type: string, minLength: 1, maxLength: 2048 } }
+    EvaluationAudit:
+      type: object
+      additionalProperties: false
+      required: [entries]
+      properties:
+        entries:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [actor_id, action, recorded_at, reason, evidence]
+            properties:
+              actor_id: { type: string, minLength: 1, maxLength: 256 }
+              action: { type: string, enum: [create_evaluation_draft, update_evaluation_draft, begin_baseline, begin_observe, begin_rehearse, pin_evaluation, record_evaluation_decision, start_canary, stop_canary, emergency_disarm] }
+              recorded_at: { type: string, format: date-time }
+              reason: { type: string, minLength: 3, maxLength: 2048 }
+              evidence: { type: array, items: { $ref: '#/components/schemas/EvidenceRef' } }
+    EvaluationReadinessCheck:
+      type: object
+      additionalProperties: false
+      required: [id, status, summary, evidence]
+      properties:
+        id: { type: string, minLength: 1, maxLength: 128 }
+        status: { type: string, enum: [passed, failed, unknown] }
+        summary: { type: string, minLength: 1, maxLength: 1024 }
+        evidence: { type: array, items: { $ref: '#/components/schemas/EvidenceRef' } }
+    EvaluationCanary:
+      type: object
+      additionalProperties: false
+      required: [state, scope, starts_at, expires_at, receipt_id]
+      properties:
+        state: { type: string, enum: [pending, effective, stopping, expired, disarmed, failed] }
+        scope: { type: array, minItems: 1, items: { $ref: '#/components/schemas/ScopeRef' } }
+        starts_at: { type: string, format: date-time }
+        expires_at: { type: string, format: date-time }
+        receipt_id: { type: string }
+    EvaluationDecision:
+      type: object
+      additionalProperties: false
+      required: [decision, rationale, decided_at, decided_by, evidence]
+      properties:
+        decision: { type: string, enum: [go, no_go, extend_evaluation] }
+        rationale: { type: string, minLength: 3, maxLength: 4096 }
+        decided_at: { type: string, format: date-time }
+        decided_by: { type: string, minLength: 1, maxLength: 256 }
+        evidence: { type: array, items: { $ref: '#/components/schemas/EvidenceRef' } }
+    AgentCapabilityState:
+      $ref: './dashboard-common-v1.schema.json#/$defs/AgentCapabilityState'
+    AgentSubject:
+      $ref: './dashboard-common-v1.schema.json#/$defs/AgentSubject'
+    AgentInventory:
+      type: object
+      additionalProperties: false
+      required: [schema_version, generated_at, availability, discovery_limited, subjects]
+      properties:
+        schema_version: { const: innerwarden.dashboard.v1 }
+        generated_at: { type: string, format: date-time }
+        availability: { $ref: '#/components/schemas/Availability' }
+        discovery_limited: { type: boolean }
+        subjects: { type: array, items: { $ref: '#/components/schemas/AgentSubject' } }
+    TokenCounterSet:
+      type: object
+      additionalProperties: false
+      required: [total, input, output, cache_read_input, cached_input, cache_creation_input, reasoning_output]
+      properties:
+        total: { type: [string, 'null'], pattern: '^(0|[1-9][0-9]*)$' }
+        input: { type: [string, 'null'], pattern: '^(0|[1-9][0-9]*)$' }
+        output: { type: [string, 'null'], pattern: '^(0|[1-9][0-9]*)$' }
+        cache_read_input: { type: [string, 'null'], pattern: '^(0|[1-9][0-9]*)$' }
+        cached_input: { type: [string, 'null'], pattern: '^(0|[1-9][0-9]*)$' }
+        cache_creation_input: { type: [string, 'null'], pattern: '^(0|[1-9][0-9]*)$' }
+        reasoning_output: { type: [string, 'null'], pattern: '^(0|[1-9][0-9]*)$' }
+    TokenProviderUsage:
+      type: object
+      additionalProperties: false
+      required: [agent_id, display_name, availability, counters, sessions, last_observed_at, provenance]
+      properties:
+        agent_id: { type: string }
+        display_name: { type: string }
+        availability: { $ref: '#/components/schemas/Availability' }
+        counters: { $ref: '#/components/schemas/TokenCounterSet' }
+        sessions:
+          description: Canonical non-negative decimal counter; strings avoid I-JSON precision loss.
+          type: [string, 'null']
+          pattern: '^(0|[1-9][0-9]*)$'
+        last_observed_at: { type: [string, 'null'], format: date-time }
+        provenance: { $ref: '#/components/schemas/SourceRef' }
+        note: { type: string }
+      allOf:
+        - if:
+            properties: { availability: { const: available } }
+            required: [availability]
+          then:
+            properties:
+              last_observed_at: { type: string, format: date-time }
+              counters:
+                anyOf:
+                  - properties: { total: { type: string } }
+                  - properties: { input: { type: string } }
+                  - properties: { output: { type: string } }
+                  - properties: { cache_read_input: { type: string } }
+                  - properties: { cached_input: { type: string } }
+                  - properties: { cache_creation_input: { type: string } }
+                  - properties: { reasoning_output: { type: string } }
+        - if:
+            properties: { availability: { enum: [unavailable, unsupported, not_configured, loading, failed, unknown] } }
+            required: [availability]
+          then:
+            properties:
+              sessions: { type: 'null' }
+              last_observed_at: { type: 'null' }
+              counters:
+                properties:
+                  total: { type: 'null' }
+                  input: { type: 'null' }
+                  output: { type: 'null' }
+                  cache_read_input: { type: 'null' }
+                  cached_input: { type: 'null' }
+                  cache_creation_input: { type: 'null' }
+                  reasoning_output: { type: 'null' }
+    TokenIntelligence:
+      type: object
+      additionalProperties: false
+      required: [schema_version, generated_at, availability, scope, totals, providers]
+      properties:
+        schema_version: { const: innerwarden.dashboard.v1 }
+        generated_at: { type: string, format: date-time }
+        availability: { $ref: '#/components/schemas/Availability' }
+        scope: { type: string, enum: [available_local_history, no_supported_history, unknown] }
+        totals: { oneOf: [{ $ref: '#/components/schemas/TokenCounterSet' }, { type: 'null' }] }
+        providers: { type: array, items: { $ref: '#/components/schemas/TokenProviderUsage' } }
+      if:
+        properties: { availability: { const: available } }
+        required: [availability]
+      then:
+        properties:
+          scope: { const: available_local_history }
+          totals:
+            allOf:
+              - $ref: '#/components/schemas/TokenCounterSet'
+              - anyOf:
+                  - properties: { total: { type: string } }
+                  - properties: { input: { type: string } }
+                  - properties: { output: { type: string } }
+                  - properties: { cache_read_input: { type: string } }
+                  - properties: { cached_input: { type: string } }
+                  - properties: { cache_creation_input: { type: string } }
+                  - properties: { reasoning_output: { type: string } }
+          providers:
+            minItems: 1
+            contains:
+              allOf:
+                - $ref: '#/components/schemas/TokenProviderUsage'
+                - properties: { availability: { const: available } }
+                  required: [availability]
+            minContains: 1
+      else:
+        properties:
+          scope: { enum: [no_supported_history, unknown] }
+          totals: { type: 'null' }
+    PublicTechnicalDetail:
+      type: object
+      additionalProperties: false
+      required: [summary, reason_code, source_ids, redactions]
+      properties:
+        summary: { type: string, minLength: 1, maxLength: 2048 }
+        reason_code: { type: [string, 'null'], maxLength: 128 }
+        source_ids: { type: array, items: { type: string, minLength: 1, maxLength: 256 } }
+        redactions: { type: array, items: { type: string, minLength: 1, maxLength: 128 } }
+    DiagnosticImpact:
+      type: object
+      additionalProperties: false
+      required: [id, capability_id, state, affected_scope, security_impact, freshness, next_action, evidence]
+      properties:
+        id: { type: string }
+        capability_id: { type: string }
+        state: { $ref: '#/components/schemas/Availability' }
+        affected_scope: { type: array, items: { $ref: '#/components/schemas/ScopeRef' } }
+        security_impact: { type: string }
+        freshness: { $ref: '#/components/schemas/EvidenceFreshness' }
+        next_action: { type: string }
+        technical_detail:
+          oneOf:
+            - $ref: '#/components/schemas/PublicTechnicalDetail'
+            - type: 'null'
+        evidence: { type: array, items: { $ref: '#/components/schemas/EvidenceRef' } }
+    PrivilegedActionId:
+      type: string
+      enum: [begin_observe, begin_rehearse, pin_evaluation, record_evaluation_decision, start_canary, stop_canary, emergency_disarm]
+    PrivilegedActionBaseRequest:
+      type: object
+      required: [scope_ids, reason, paam_ref, preview_id, preview_digest, preview_expires_at, typed_confirmation]
+      properties:
+        scope_ids:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items: { type: string, minLength: 1, maxLength: 256 }
+        reason: { type: string, minLength: 3, maxLength: 1024 }
+        paam_ref: { $ref: '#/components/schemas/PaamVersionRef' }
+        preview_id: { type: string, minLength: 1, maxLength: 256 }
+        preview_digest: { type: string, pattern: '^sha256:[a-f0-9]{64}$' }
+        preview_expires_at: { type: string, format: date-time }
+        typed_confirmation: { $ref: './dashboard-common-v1.schema.json#/$defs/TypedConfirmation' }
+        step_up_code: { type: [string, 'null'], writeOnly: true }
+    PublicActionState:
+      type: object
+      additionalProperties: false
+      required: [mode, rollout_state, evaluation_id, canary_request_id, decision, duration_seconds, state_digest]
+      properties:
+        mode:
+          oneOf:
+            - $ref: '#/components/schemas/EffectiveMode'
+            - type: 'null'
+        rollout_state:
+          type: [string, 'null']
+          enum: [ineligible, eligible, observing, rehearsing, ready, canary, enforcing, disarmed, failed, unknown, null]
+        evaluation_id: { type: [string, 'null'], maxLength: 256 }
+        canary_request_id: { type: [string, 'null'], maxLength: 256 }
+        decision:
+          type: [string, 'null']
+          enum: [go, no_go, extend_evaluation, null]
+        duration_seconds: { type: [integer, 'null'], minimum: 1, maximum: 3600 }
+        state_digest: { type: [string, 'null'], pattern: '^sha256:[a-f0-9]{64}$' }
+    ActionImpact:
+      type: object
+      additionalProperties: false
+      required: [security_effect, operational_effect, affected_scope, duration_seconds, limitations, evidence]
+      properties:
+        security_effect: { type: string, enum: [visibility_only, would_enforce, enforce, stop_enforcement, disable_enforcement, no_runtime_change, unknown] }
+        operational_effect: { type: string, enum: [none, scoped, host_wide, unknown] }
+        affected_scope: { type: array, items: { $ref: '#/components/schemas/ScopeRef' } }
+        duration_seconds: { type: [integer, 'null'], minimum: 1, maximum: 3600 }
+        limitations: { type: array, items: { type: string, minLength: 1, maxLength: 2048 } }
+        evidence: { type: array, items: { $ref: '#/components/schemas/EvidenceRef' } }
+    ActionReversibility:
+      type: object
+      additionalProperties: false
+      required: [reversible, reversal_action_ids, automatic_expiry, expires_at]
+      properties:
+        reversible: { type: boolean }
+        reversal_action_ids: { type: array, uniqueItems: true, items: { $ref: '#/components/schemas/PrivilegedActionId' } }
+        automatic_expiry: { type: boolean }
+        expires_at: { type: [string, 'null'], format: date-time }
+    ActionReversal:
+      type: object
+      additionalProperties: false
+      required: [action_id, request_id, lifecycle, evidence]
+      properties:
+        action_id: { $ref: '#/components/schemas/PrivilegedActionId' }
+        request_id: { type: [string, 'null'], maxLength: 256 }
+        lifecycle: { $ref: './dashboard-common-v1.schema.json#/$defs/ActionLifecycle' }
+        evidence: { type: array, items: { $ref: '#/components/schemas/EvidenceRef' } }
+    ActionFailure:
+      type: object
+      additionalProperties: false
+      required: [code, message, retryable, remediation_gate, evidence]
+      properties:
+        code: { type: string, minLength: 1, maxLength: 128 }
+        message: { type: string, minLength: 1, maxLength: 2048 }
+        retryable: { type: boolean }
+        remediation_gate: { type: [string, 'null'], maxLength: 128 }
+        evidence: { type: array, minItems: 1, items: { $ref: '#/components/schemas/EvidenceRef' } }
+    ActionPreviewRequest:
+      type: object
+      additionalProperties: false
+      required: [action_id, scope_ids, desired_state, reason, paam_ref]
+      properties:
+        action_id: { $ref: '#/components/schemas/PrivilegedActionId' }
+        evaluation_id: { type: [string, 'null'], maxLength: 256 }
+        scope_ids:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items: { type: string, minLength: 1, maxLength: 256 }
+        desired_state: { $ref: '#/components/schemas/PublicActionState' }
+        reason: { type: string, minLength: 3, maxLength: 1024 }
+        paam_ref: { $ref: '#/components/schemas/PaamVersionRef' }
+    ActionPreview:
+      type: object
+      additionalProperties: false
+      required: [schema_version, preview_id, preview_digest, issued_at, preview_expires_at, action_id, actor, role, exact_scope, before_state, desired_state, paam_ref, impact, reversibility, required_confirmation, evidence]
+      properties:
+        schema_version: { const: innerwarden.dashboard.v1 }
+        preview_id: { type: string, minLength: 1, maxLength: 256 }
+        preview_digest: { type: string, pattern: '^sha256:[a-f0-9]{64}$' }
+        issued_at: { type: string, format: date-time }
+        preview_expires_at: { type: string, format: date-time }
+        action_id: { $ref: '#/components/schemas/PrivilegedActionId' }
+        actor: { type: string, minLength: 1, maxLength: 256 }
+        role: { type: string, minLength: 1, maxLength: 128 }
+        exact_scope: { type: array, minItems: 1, items: { $ref: '#/components/schemas/ScopeRef' } }
+        before_state: { $ref: '#/components/schemas/PublicActionState' }
+        desired_state: { $ref: '#/components/schemas/PublicActionState' }
+        paam_ref: { $ref: '#/components/schemas/PaamVersionRef' }
+        impact: { $ref: '#/components/schemas/ActionImpact' }
+        reversibility: { $ref: '#/components/schemas/ActionReversibility' }
+        required_confirmation:
+          type: object
+          additionalProperties: false
+          required: [kind, prompt]
+          properties:
+            kind: { type: string, enum: [typed_scope, typed_scope_and_duration, typed_DISARM_and_scope, typed_evaluation_and_scope, typed_evaluation_and_decision] }
+            prompt: { type: string, minLength: 1, maxLength: 1024 }
+        evidence: { type: array, items: { $ref: '#/components/schemas/EvidenceRef' } }
+    ModeTransitionRequest:
+      allOf:
+        - $ref: '#/components/schemas/PrivilegedActionBaseRequest'
+        - type: object
+          required: [evaluation_id]
+          properties:
+            evaluation_id: { type: string, minLength: 1, maxLength: 256 }
+            typed_confirmation:
+              allOf:
+                - $ref: './dashboard-common-v1.schema.json#/$defs/TypedConfirmation'
+                - type: object
+                  properties: { kind: { const: typed_scope } }
+      unevaluatedProperties: false
+    EvaluationPinRequest:
+      allOf:
+        - $ref: '#/components/schemas/PrivilegedActionBaseRequest'
+        - type: object
+          required: [evaluation_digest]
+          properties:
+            evaluation_digest: { type: string, pattern: '^sha256:[a-f0-9]{64}$' }
+            typed_confirmation:
+              allOf:
+                - $ref: './dashboard-common-v1.schema.json#/$defs/TypedConfirmation'
+                - type: object
+                  properties: { kind: { const: typed_evaluation_and_scope } }
+      unevaluatedProperties: false
+    EvaluationDecisionRequest:
+      allOf:
+        - $ref: '#/components/schemas/PrivilegedActionBaseRequest'
+        - type: object
+          required: [decision, rationale]
+          properties:
+            decision: { type: string, enum: [go, no_go, extend_evaluation] }
+            rationale: { type: string, minLength: 3, maxLength: 4096 }
+            typed_confirmation:
+              allOf:
+                - $ref: './dashboard-common-v1.schema.json#/$defs/TypedConfirmation'
+                - type: object
+                  properties: { kind: { const: typed_evaluation_and_decision } }
+      unevaluatedProperties: false
+    StartCanaryRequest:
+      allOf:
+        - $ref: '#/components/schemas/PrivilegedActionBaseRequest'
+        - type: object
+          required: [evaluation_id, duration_seconds]
+          properties:
+            evaluation_id: { type: string, minLength: 1, maxLength: 256 }
+            duration_seconds: { type: integer, minimum: 1, maximum: 3600 }
+            typed_confirmation:
+              allOf:
+                - $ref: './dashboard-common-v1.schema.json#/$defs/TypedConfirmation'
+                - type: object
+                  properties: { kind: { const: typed_scope_and_duration } }
+      unevaluatedProperties: false
+    StopCanaryRequest:
+      allOf:
+        - $ref: '#/components/schemas/PrivilegedActionBaseRequest'
+        - type: object
+          required: [canary_request_id]
+          properties:
+            canary_request_id: { type: string, minLength: 1, maxLength: 256 }
+            typed_confirmation:
+              allOf:
+                - $ref: './dashboard-common-v1.schema.json#/$defs/TypedConfirmation'
+                - type: object
+                  properties: { kind: { const: typed_scope } }
+      unevaluatedProperties: false
+    EmergencyDisarmRequest:
+      allOf:
+        - $ref: '#/components/schemas/PrivilegedActionBaseRequest'
+        - type: object
+          properties:
+            typed_confirmation:
+              allOf:
+                - $ref: './dashboard-common-v1.schema.json#/$defs/TypedConfirmation'
+                - type: object
+                  properties: { kind: { const: typed_DISARM_and_scope } }
+      unevaluatedProperties: false
+    PrivilegedActionReceipt:
+      type: object
+      additionalProperties: false
+      required: [request_id, action_id, lifecycle, before_state, desired_state, after_state, effective_state, actor, role, scope, paam_ref, preview_id, preview_digest, acknowledged_at, verified_at, convergence_evidence, expires_at, reversal, audit_ref, failure]
+      properties:
+        request_id: { type: string }
+        action_id: { $ref: '#/components/schemas/PrivilegedActionId' }
+        lifecycle: { $ref: './dashboard-common-v1.schema.json#/$defs/ActionLifecycle' }
+        before_state: { $ref: '#/components/schemas/PublicActionState' }
+        desired_state: { $ref: '#/components/schemas/PublicActionState' }
+        after_state:
+          oneOf:
+            - $ref: '#/components/schemas/PublicActionState'
+            - type: 'null'
+        effective_state:
+          oneOf:
+            - $ref: '#/components/schemas/PublicActionState'
+            - type: 'null'
+        actor: { type: string, minLength: 1, maxLength: 256 }
+        role: { type: string, minLength: 1, maxLength: 128 }
+        scope: { type: array, minItems: 1, items: { $ref: '#/components/schemas/ScopeRef' } }
+        paam_ref: { $ref: '#/components/schemas/PaamVersionRef' }
+        preview_id: { type: string, minLength: 1, maxLength: 256 }
+        preview_digest: { type: string, pattern: '^sha256:[a-f0-9]{64}$' }
+        acknowledged_at: { type: string, format: date-time }
+        verified_at: { type: [string, 'null'], format: date-time }
+        convergence_evidence: { type: array, items: { $ref: '#/components/schemas/EvidenceRef' } }
+        expires_at: { type: [string, 'null'], format: date-time }
+        reversal:
+          oneOf:
+            - $ref: '#/components/schemas/ActionReversal'
+            - type: 'null'
+        audit_ref: { type: string, minLength: 1, maxLength: 256 }
+        failure:
+          oneOf:
+            - $ref: '#/components/schemas/ActionFailure'
+            - type: 'null'
+      allOf:
+        - if:
+            properties: { lifecycle: { const: verified } }
+            required: [lifecycle]
+          then:
+            properties:
+              after_state: { $ref: '#/components/schemas/PublicActionState' }
+              effective_state: { $ref: '#/components/schemas/PublicActionState' }
+              verified_at: { type: string, format: date-time }
+              convergence_evidence:
+                type: array
+                minItems: 1
+                items: { $ref: '#/components/schemas/FreshIntegrityVerifiedEvidenceRef' }
+              failure: { type: 'null' }
+        - if:
+            properties: { lifecycle: { const: failed } }
+            required: [lifecycle]
+          then:
+            properties:
+              effective_state: { type: 'null' }
+              verified_at: { type: 'null' }
+              convergence_evidence: { type: array, maxItems: 0 }
+              failure: { $ref: '#/components/schemas/ActionFailure' }

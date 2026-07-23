@@ -1,0 +1,26 @@
+{
+  "id": "case-missing-evidence-004",
+  "title": "Case with no supporting evidence",
+  "severity": "unknown",
+  "status": "unknown",
+  "scope": [],
+  "latest_event_at": "2026-07-17T13:00:00Z",
+  "outcome": "unknown",
+  "schema_version": "innerwarden.dashboard.v1",
+  "identity": { "subject_ids": [], "confidence": "unattributed", "evidence": [] },
+  "recurrence": { "first_seen_at": "2026-07-17T13:00:00Z", "last_seen_at": "2026-07-17T13:00:00Z", "occurrences": "1", "state": "unknown" },
+  "timeline": [{
+    "id": "gap-004",
+    "event_type": "evidence_gap",
+    "observed_at": "2026-07-17T13:00:00Z",
+    "recorded_at": "2026-07-17T13:00:00Z",
+    "authority": null,
+    "mode": null,
+    "summary": "The producer could not bind source evidence to this record.",
+    "relationship": "unknown",
+    "source_refs": []
+  }],
+  "evidence": [],
+  "feedback": [],
+  "verified_outcomes": []
+}

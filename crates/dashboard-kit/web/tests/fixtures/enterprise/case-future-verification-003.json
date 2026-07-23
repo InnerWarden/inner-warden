@@ -1,0 +1,44 @@
+{
+  "id": "case-future-verification-003",
+  "title": "Producer supplied future and stale containment verification",
+  "severity": "critical",
+  "status": "contained",
+  "scope": [{ "id": "host:prod-02", "kind": "host", "display_name": "Production host 02", "verification": "host_verified", "evidence": [] }],
+  "latest_event_at": "2026-07-18T09:00:00Z",
+  "outcome": "contained",
+  "schema_version": "innerwarden.dashboard.v1",
+  "identity": { "subject_ids": ["host:prod-02"], "confidence": "host_verified", "evidence": [] },
+  "recurrence": { "first_seen_at": "2026-07-18T09:00:00Z", "last_seen_at": "2026-07-18T09:00:00Z", "occurrences": "1", "state": "single" },
+  "timeline": [{
+    "id": "attempt-future-003",
+    "event_type": "enforcement_attempt",
+    "observed_at": "2026-07-18T09:00:00Z",
+    "recorded_at": "2026-07-18T09:00:01Z",
+    "authority": "kernel_control",
+    "mode": "enforce",
+    "summary": "An enforcement attempt was recorded, but its supplied verification is stale and future-dated.",
+    "relationship": "causal",
+    "source_refs": []
+  }],
+  "evidence": [],
+  "feedback": [],
+  "verified_outcomes": [{
+    "outcome": "contained",
+    "mode": "enforce",
+    "actual_denial_or_containment_occurred": true,
+    "verification_status": "verified",
+    "verifier": "future-fixture-verifier",
+    "verified_at": "2099-01-01T00:00:00Z",
+    "effective_scope": [{ "id": "host:prod-02", "kind": "host", "display_name": "Production host 02", "verification": "host_verified", "evidence": [] }],
+    "evidence": [{
+      "id": "ev-stale-future",
+      "kind": "runtime_verification",
+      "source": { "id": "execution-gate", "kind": "kernel_state", "authority": "canonical", "version": "gate-4.2.0", "completeness": "complete", "limitations": ["Fixture evidence is deliberately stale."] },
+      "observed_at": "2026-07-18T09:00:00Z",
+      "integrity": "verified",
+      "redaction": [],
+      "freshness": { "observed_at": "2026-07-18T09:00:00Z", "budget_seconds": 60, "state": "stale", "age_seconds": 10800 }
+    }],
+    "enforcement_attempt_id": "attempt-future-003"
+  }]
+}

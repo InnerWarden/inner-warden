@@ -1,0 +1,17 @@
+# Rust
+/target
+**/target
+
+# Environment and secrets
+.env
+.env.local
+*.key
+*.pem
+*.p12
+
+# Node
+**/node_modules
+
+# OS and logs
+.DS_Store
+*.log

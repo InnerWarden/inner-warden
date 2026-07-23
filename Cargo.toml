@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/agent-guard",
+    "crates/notify",
+    "crates/cli",
+    "crates/graph",
+    "crates/dashboard-kit",
+]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/InnerWarden/innerwarden-community"
+homepage = "https://www.innerwarden.com"
+readme = "README.md"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

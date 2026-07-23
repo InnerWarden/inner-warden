@@ -1,0 +1,39 @@
+{
+  "id": "case-context-only-002",
+  "title": "A very long source-neutral investigation title that remains safely readable when an unfamiliar autonomous agent with a renamed wrapper reports a deny recommendation near an unrelated host observation without establishing that the two records caused one another or that any action was actually blocked",
+  "severity": "medium",
+  "status": "contained",
+  "scope": [{ "id": "agent:renamed-wrapper", "kind": "agent", "display_name": "Unattributed renamed wrapper with an intentionally long display label that must wrap instead of overflowing the case list", "verification": "unattributed", "evidence": [] }],
+  "latest_event_at": "2026-07-18T10:45:00Z",
+  "outcome": "unknown",
+  "schema_version": "innerwarden.dashboard.v1",
+  "identity": { "subject_ids": ["agent:renamed-wrapper"], "confidence": "unattributed", "evidence": [] },
+  "recurrence": { "first_seen_at": "2026-07-18T10:40:00Z", "last_seen_at": "2026-07-18T10:45:00Z", "occurrences": "2", "state": "recurring" },
+  "timeline": [
+    {
+      "id": "recommendation-context-002",
+      "event_type": "recommendation",
+      "observed_at": "2026-07-18T10:44:58Z",
+      "recorded_at": "2026-07-18T10:45:00Z",
+      "authority": "agent_supplied_verdict",
+      "mode": "enforce",
+      "summary": "Deny verdict recommended. This intentionally long content remains plain evidence text and must never be parsed into a verified outcome, broad allowlist or causal conclusion. The display wraps safely even when the source repeats a very long opaque identifier: agent-renamed-wrapper-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.",
+      "relationship": "contextual",
+      "source_refs": []
+    },
+    {
+      "id": "observation-context-002",
+      "event_type": "host_observation",
+      "observed_at": "2026-07-18T10:45:00Z",
+      "recorded_at": "2026-07-18T10:45:01Z",
+      "authority": null,
+      "mode": null,
+      "summary": "An unattributed host observation occurred nearby in time.",
+      "relationship": "contextual",
+      "source_refs": []
+    }
+  ],
+  "evidence": [],
+  "feedback": [],
+  "verified_outcomes": []
+}

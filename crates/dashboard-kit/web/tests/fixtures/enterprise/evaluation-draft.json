@@ -1,0 +1,142 @@
+{
+  "schema_version": "innerwarden.dashboard.v1",
+  "availability": "available",
+  "id": "eval-single-host-001",
+  "version": "draft-4",
+  "digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+  "status": "draft",
+  "scope": [
+    {
+      "id": "host:lab-01",
+      "kind": "host",
+      "display_name": "Approved Linux lab host",
+      "verification": "host_verified",
+      "evidence": []
+    },
+    {
+      "id": "workload:agent-lab",
+      "kind": "workload",
+      "display_name": "Agent evaluation workload",
+      "verification": "host_verified",
+      "evidence": []
+    }
+  ],
+  "contract_versions": {
+    "community_journey": {
+      "id": "CJC-090",
+      "version": "CJC-090-v1",
+      "canonicalization": "RAW-UTF8-BYTES-SHA256",
+      "digest": "sha256:5f4397b1c74409b06f5405f2ca4b748daea208a7d571abc3b03caf1c5040b62c"
+    },
+    "assurance_matrix": {
+      "id": "AM-090",
+      "version": "AM-090-v1",
+      "canonicalization": "RFC8785-JCS",
+      "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "authorization_matrix": {
+      "id": "PAAM-090",
+      "version": "PAAM-090-v1",
+      "canonicalization": "RFC8785-JCS",
+      "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    },
+    "dashboard_api": {
+      "id": "innerwarden.dashboard",
+      "version": "innerwarden.dashboard.v1",
+      "canonicalization": "RFC8785-JCS",
+      "digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    }
+  },
+  "scenarios": [
+    {
+      "id": "scenario-community-baseline",
+      "description": "Record a Community agent-boundary baseline without changing host mode.",
+      "non_destructive": true,
+      "preconditions": ["Community integration reports its own current evidence"],
+      "safe_procedure": "Run the approved inert fixture command and retain only numeric and lifecycle evidence.",
+      "scope": [{ "id": "workload:agent-lab", "kind": "workload", "display_name": "Agent evaluation workload", "verification": "host_verified", "evidence": [] }],
+      "bypass_class_ids": [],
+      "covered_action_class": "process_execution",
+      "protected_resource": { "id": "resource:fixture-command", "kind": "resource", "display_name": "Inert fixture command", "verification": "configured", "evidence": [] },
+      "expected_outcomes": { "observe": "observed_only", "rehearse": "allowed", "enforce": "allowed" },
+      "pass_criteria": "The real Community result is recorded without inferring a host outcome.",
+      "fail_criteria": "The baseline loses evidence or changes host enforcement state.",
+      "not_covered_criteria": "The Community integration does not support this action path.",
+      "rollback_procedure": "Stop the inert fixture and preserve its existing Community configuration.",
+      "owner": "evaluation-owner",
+      "observed_result": null
+    },
+    {
+      "id": "scenario-agent-boundary-bypass",
+      "description": "Exercise a controlled agent-boundary bypass while the host remains authoritative.",
+      "non_destructive": true,
+      "preconditions": ["Host scope is verified", "Only the inert protected resource is selected"],
+      "safe_procedure": "Disable only the approved fixture mediation path and invoke the inert fixture action once.",
+      "scope": [{ "id": "workload:agent-lab", "kind": "workload", "display_name": "Agent evaluation workload", "verification": "host_verified", "evidence": [] }],
+      "bypass_class_ids": ["agent_mediation_absent"],
+      "covered_action_class": "secret_access",
+      "protected_resource": { "id": "resource:synthetic-secret", "kind": "resource", "display_name": "Synthetic secret fixture", "verification": "configured", "evidence": [] },
+      "expected_outcomes": { "observe": "observed_only", "rehearse": "would_block", "enforce": "blocked_before_execution" },
+      "pass_criteria": "Observe records visibility and Rehearse records would-block with zero actual denial.",
+      "fail_criteria": "The host loses visibility, denies during Observe or Rehearse, or reports an unverified block.",
+      "not_covered_criteria": "The action or workload is outside the pinned Assurance Matrix.",
+      "rollback_procedure": "Restore the fixture mediation path and run the documented local disarm verification.",
+      "owner": "security-approver",
+      "observed_result": null
+    },
+    {
+      "id": "scenario-recovery",
+      "description": "Verify that local recovery remains reachable before any optional canary.",
+      "non_destructive": true,
+      "preconditions": ["No production workload is selected"],
+      "safe_procedure": "Review the local CLI path and validate the shared primitive against the fixture host.",
+      "scope": [{ "id": "host:lab-01", "kind": "host", "display_name": "Approved Linux lab host", "verification": "host_verified", "evidence": [] }],
+      "bypass_class_ids": [],
+      "covered_action_class": "execution_control",
+      "protected_resource": { "id": "host:lab-01", "kind": "host", "display_name": "Approved Linux lab host", "verification": "host_verified", "evidence": [] },
+      "expected_outcomes": { "observe": "observed_only", "rehearse": "allowed", "enforce": "reverted" },
+      "pass_criteria": "CLI and HTTP paths converge through the same verified disarmed state.",
+      "fail_criteria": "Recovery depends on licence, coordinator, browser, or acknowledgement alone.",
+      "not_covered_criteria": "The private host primitive is not installed in this fixture.",
+      "rollback_procedure": "Keep the Execution Gate disabled and escalate to the local recovery owner.",
+      "owner": "rollback-owner",
+      "observed_result": null
+    }
+  ],
+  "thresholds": {
+    "maximum_false_denies": 0,
+    "maximum_operational_impact_minutes": 5,
+    "required_freshness_seconds": 30,
+    "rollback_verification_required": true
+  },
+  "ownership": {
+    "evaluation_owner": "evaluation-owner",
+    "rollback_owner": "rollback-owner",
+    "security_approver": "security-approver"
+  },
+  "false_deny_matrix": {
+    "reviewed_at": null,
+    "owner": "evaluation-owner",
+    "findings": [],
+    "unresolved_blockers": ["Observe and Rehearse evidence has not been reviewed"]
+  },
+  "operational_impact_matrix": {
+    "reviewed_at": null,
+    "owner": "evaluation-owner",
+    "measurements": [],
+    "unresolved_blockers": ["The required soak period has not completed"]
+  },
+  "readiness": [
+    { "id": "community_baseline", "status": "unknown", "summary": "The exact twelve-journey baseline has no recorded result yet.", "evidence": [] },
+    { "id": "observe_soak", "status": "unknown", "summary": "Observe and Rehearse soak evidence is pending.", "evidence": [] },
+    { "id": "rollback", "status": "unknown", "summary": "CLI and HTTP disarm convergence is not yet verified.", "evidence": [] },
+    { "id": "proof_publication", "status": "failed", "summary": "CJC remediation and Core hardening gates remain open.", "evidence": [] }
+  ],
+  "canary": null,
+  "decision": null,
+  "audit": {
+    "entries": [{ "actor_id": "fixture-operator", "action": "create_evaluation_draft", "recorded_at": "2026-07-18T11:45:00Z", "reason": "Create the agreed deterministic browser fixture", "evidence": [] }]
+  },
+  "created_at": "2026-07-18T11:45:00Z",
+  "updated_at": "2026-07-18T12:00:00Z"
+}

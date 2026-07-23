@@ -1,0 +1,461 @@
+import { useEffect, useState } from "react";
+import { fetchMeta, type DashboardMeta, type GuardrailMode } from "./api";
+import {
+  dashboardV1Client,
+  retainDashboardResource,
+  type DashboardResource,
+} from "./api/client";
+import type { AgentInventory, DashboardBootstrap, DashboardPosture, TokenIntelligence as TokenIntelligenceContract } from "./api/v1";
+import { CapabilityBoundary } from "./components/CapabilityBoundary";
+import { Header, type HeaderNavigationItem } from "./components/Header";
+import { StatusBadge } from "./components/StatusBadge";
+import { resolveDashboardEdition } from "./edition";
+import { normaliseMode } from "./presentation";
+import { Activity, type ActivityTarget } from "./screens/Activity";
+import { Home } from "./screens/Home";
+import { Agents } from "./screens/Agents";
+import { Posture } from "./screens/Posture";
+import { TokenIntelligence } from "./screens/TokenIntelligence";
+
+export type ShellRoute = "overview" | "activity" | "posture" | "agents" | "tokens";
+
+type BootstrapLoadStatus = "loading" | "ready" | "unavailable" | "error";
+type MetaStatus = "loading" | "ready" | "error";
+
+export function deriveShellNavigation(
+  bootstrap: DashboardBootstrap | undefined,
+  edition: DashboardBootstrap["edition"] | undefined,
+): HeaderNavigationItem<ShellRoute>[] {
+  if (edition === "community") {
+    // Community navigation is a preserved CJC surface and never depends on an
+    // Enterprise producer or entitlement record.
+    return [
+      { route: "overview", label: "Overview" },
+      { route: "activity", label: "Activity" },
+    ];
+  }
+  if (edition !== "enterprise" || bootstrap === undefined) return [];
+
+  const items: HeaderNavigationItem<ShellRoute>[] = [{ route: "overview", label: "Overview" }];
+  if (bootstrap.capabilities.some((capability) => capability.tier === "enterprise_core")) {
+    items.push({ route: "posture", label: "Posture" });
+  }
+  if (bootstrap.capabilities.some((capability) => capability.id === "community.agent_discovery")) {
+    items.push({ route: "agents", label: "Agents" });
+  }
+  if (bootstrap.capabilities.some((capability) => capability.id === "community.token_intelligence")) {
+    items.push({ route: "tokens", label: "Tokens" });
+  }
+  return items;
+}
+
+function routeFromLocation(): ShellRoute {
+  const candidate = new URLSearchParams(window.location.search).get("view");
+  return candidate === "activity" || candidate === "posture" || candidate === "agents" || candidate === "tokens" ? candidate : "overview";
+}
+
+function resourceData<T>(resource: DashboardResource<T>): T | undefined {
+  return resource.state === "ready" || resource.state === "stale" ? resource.data : undefined;
+}
+
+function bootstrapLoadStatus(resource: DashboardResource<DashboardBootstrap>): BootstrapLoadStatus {
+  if (resource.state === "loading" || resource.state === "idle") return "loading";
+  if (resource.state === "ready") return "ready";
+  if (resource.state === "unavailable") return "unavailable";
+  return "error";
+}
+
+export function App() {
+  const [route, setRoute] = useState<ShellRoute>(() => routeFromLocation());
+  const [meta, setMeta] = useState<DashboardMeta>();
+  const [metaStatus, setMetaStatus] = useState<MetaStatus>("loading");
+  const [bootstrapResource, setBootstrapResource] = useState<DashboardResource<DashboardBootstrap>>({ state: "loading" });
+  const [postureResource, setPostureResource] = useState<DashboardResource<DashboardPosture>>({ state: "idle" });
+  const [agentsResource, setAgentsResource] = useState<DashboardResource<AgentInventory>>({ state: "idle" });
+  const [tokensResource, setTokensResource] = useState<DashboardResource<TokenIntelligenceContract>>({ state: "idle" });
+  const [activityTarget, setActivityTarget] = useState<ActivityTarget>();
+  const [consumerEvaluatedAt, setConsumerEvaluatedAt] = useState(() => new Date().toISOString());
+
+  const bootstrap = resourceData(bootstrapResource);
+  const enterpriseConfirmed = bootstrap?.edition === "enterprise";
+  const enterpriseAuthorized = enterpriseConfirmed
+    && bootstrapResource.state === "ready"
+    && bootstrap.session.authenticated === true;
+  const enterpriseCapabilities = bootstrap?.capabilities.filter((capability) => capability.tier === "enterprise_core") ?? [];
+  const agentDiscovery = bootstrap?.capabilities.find((capability) => capability.id === "community.agent_discovery");
+  const tokenIntelligence = bootstrap?.capabilities.find((capability) => capability.id === "community.token_intelligence");
+
+  useEffect(() => {
+    if (!enterpriseConfirmed) return;
+    const tick = () => setConsumerEvaluatedAt(new Date().toISOString());
+    tick();
+    const timer = setInterval(tick, 1_000);
+    return () => clearInterval(timer);
+  }, [enterpriseConfirmed]);
+
+  useEffect(() => {
+    if (enterpriseConfirmed) return;
+    let active = true;
+    let inFlight = false;
+    const load = async () => {
+      if (inFlight) return;
+      inFlight = true;
+      try {
+        const next = await fetchMeta();
+        if (!active) return;
+        setMeta(next);
+        setMetaStatus("ready");
+      } catch {
+        if (active) setMetaStatus("error");
+      } finally {
+        inFlight = false;
+      }
+    };
+    void load();
+    const timer = setInterval(() => void load(), 5_000);
+    return () => {
+      active = false;
+      clearInterval(timer);
+    };
+  }, [enterpriseConfirmed]);
+
+  useEffect(() => {
+    let active = true;
+    let inFlight = false;
+    let controller: AbortController | undefined;
+    const load = async () => {
+      if (inFlight) return;
+      inFlight = true;
+      controller = new AbortController();
+      try {
+        const result = await dashboardV1Client.getBootstrap(controller.signal);
+        if (active) setBootstrapResource((previous) => retainDashboardResource(previous, result));
+      } catch {
+        // Navigation/unmount aborts do not create a producer state.
+      } finally {
+        inFlight = false;
+      }
+    };
+    void load();
+    const timer = setInterval(() => void load(), 5_000);
+    return () => {
+      active = false;
+      controller?.abort("dashboard-unmount");
+      clearInterval(timer);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!enterpriseAuthorized || enterpriseCapabilities.length === 0) {
+      setPostureResource({ state: "idle" });
+      return;
+    }
+    let active = true;
+    let inFlight = false;
+    let controller: AbortController | undefined;
+    setPostureResource({ state: "loading" });
+    const load = async () => {
+      if (inFlight) return;
+      inFlight = true;
+      controller = new AbortController();
+      try {
+        const result = await dashboardV1Client.getPosture(controller.signal);
+        if (active) setPostureResource((previous) => retainDashboardResource(previous, result));
+      } catch {
+        // An abort is scoped to the previous shell/navigation lifecycle.
+      } finally {
+        inFlight = false;
+      }
+    };
+    void load();
+    const timer = setInterval(() => void load(), 5_000);
+    return () => {
+      active = false;
+      controller?.abort("posture-disabled");
+      clearInterval(timer);
+    };
+  }, [enterpriseAuthorized, enterpriseCapabilities.length]);
+
+  useEffect(() => {
+    if (!enterpriseAuthorized || agentDiscovery === undefined) {
+      setAgentsResource({ state: "idle" });
+      return;
+    }
+    let active = true;
+    let inFlight = false;
+    let controller: AbortController | undefined;
+    setAgentsResource({ state: "loading" });
+    const load = async () => {
+      if (inFlight) return;
+      inFlight = true;
+      controller = new AbortController();
+      try {
+        const result = await dashboardV1Client.getAgents(controller.signal);
+        if (active) setAgentsResource((previous) => retainDashboardResource(previous, result));
+      } catch {
+        // An aborted agent request does not synthesize an empty inventory.
+      } finally {
+        inFlight = false;
+      }
+    };
+    void load();
+    const timer = setInterval(() => void load(), 5_000);
+    return () => {
+      active = false;
+      controller?.abort("agent-inventory-disabled");
+      clearInterval(timer);
+    };
+  }, [agentDiscovery, enterpriseAuthorized]);
+
+  useEffect(() => {
+    if (!enterpriseAuthorized || tokenIntelligence === undefined) {
+      setTokensResource({ state: "idle" });
+      return;
+    }
+    let active = true;
+    let inFlight = false;
+    let controller: AbortController | undefined;
+    setTokensResource({ state: "loading" });
+    const load = async () => {
+      if (inFlight) return;
+      inFlight = true;
+      controller = new AbortController();
+      try {
+        const result = await dashboardV1Client.getTokenIntelligence(controller.signal);
+        if (active) setTokensResource((previous) => retainDashboardResource(previous, result));
+      } catch {
+        // An aborted token request does not synthesize zero usage.
+      } finally {
+        inFlight = false;
+      }
+    };
+    void load();
+    const timer = setInterval(() => void load(), 60_000);
+    return () => {
+      active = false;
+      controller?.abort("token-intelligence-disabled");
+      clearInterval(timer);
+    };
+  }, [enterpriseAuthorized, tokenIntelligence]);
+
+  const freshMeta = metaStatus === "ready" ? meta : undefined;
+  const mode = normaliseMode(freshMeta);
+  const edition = resolveDashboardEdition(
+    bootstrap,
+    bootstrapLoadStatus(bootstrapResource),
+    meta?.edition,
+    metaStatus,
+  );
+  const editionLabel = edition === "enterprise" ? "Enterprise" : edition === "community" ? "Community" : "Dashboard";
+  const version = bootstrap?.product_version ?? (edition === "community" ? meta?.version : undefined);
+  const navigation = deriveShellNavigation(bootstrap, edition);
+
+  useEffect(() => {
+    if (navigation.length > 0 && !navigation.some((item) => item.route === route)) setRoute("overview");
+  }, [navigation, route]);
+
+  useEffect(() => {
+    const restore = () => setRoute(routeFromLocation());
+    window.addEventListener("popstate", restore);
+    return () => window.removeEventListener("popstate", restore);
+  }, []);
+
+  useEffect(() => {
+    document.title = `InnerWarden ${editionLabel} — Agent Security`;
+  }, [editionLabel]);
+
+  const navigate = (next: ShellRoute) => {
+    if (next !== "activity") setActivityTarget(undefined);
+    const url = new URL(window.location.href);
+    if (next === "overview") url.searchParams.delete("view");
+    else url.searchParams.set("view", next);
+    for (const key of ["q", "outcome", "severity", "mode", "authority", "capability", "scope_kind", "scope", "window", "cursor", "case"]) url.searchParams.delete(key);
+    window.history.pushState({}, "", url);
+    setRoute(next);
+  };
+  const openActivity = (target?: Omit<ActivityTarget, "requestId">) => {
+    setActivityTarget(target ? { ...target, requestId: Date.now() } : undefined);
+    const url = new URL(window.location.href);
+    url.searchParams.set("view", "activity");
+    window.history.pushState({}, "", url);
+    setRoute("activity");
+  };
+
+  return (
+    <div className="min-h-screen bg-slate-50 text-slate-950">
+      <a
+        href="#main-content"
+        className="sr-only z-50 rounded-md bg-white px-3 py-2 font-semibold text-slate-950 shadow focus:not-sr-only focus:fixed focus:left-3 focus:top-3"
+      >
+        Skip to content
+      </a>
+      <Header
+        editionLabel={editionLabel}
+        version={version}
+        navigation={navigation}
+        activeRoute={route}
+        homeRoute="overview"
+        onNavigate={navigate}
+        status={edition === "community"
+          ? <><ModePill mode={mode} /><ExposureStatus status={metaStatus} exposed={meta?.exposed} /></>
+          : edition === "enterprise"
+            ? <EnterpriseSessionStatus resource={bootstrapResource} />
+            : <BootstrapContractStatus resource={bootstrapResource} />}
+      />
+
+      <main id="main-content" className="mx-auto max-w-6xl px-4 py-6 sm:px-6 sm:py-8 lg:px-8">
+        {edition === "enterprise" && bootstrap && enterpriseAuthorized ? (
+          <EnterpriseRoute
+            route={route}
+            bootstrap={bootstrap}
+            postureResource={postureResource}
+            agentsResource={agentsResource}
+            tokensResource={tokensResource}
+            enterpriseDeclared={enterpriseCapabilities.length > 0}
+            agentDiscovery={agentDiscovery}
+            tokenIntelligence={tokenIntelligence}
+            meta={freshMeta}
+            onOpenActivity={openActivity}
+            evaluatedAt={consumerEvaluatedAt}
+          />
+        ) : edition === "enterprise" && bootstrap ? (
+          <DashboardContractState resource={bootstrapResource} />
+        ) : edition === "community" ? (
+          route === "activity" ? <Activity initialTarget={activityTarget} /> : <Home meta={freshMeta} onOpenActivity={openActivity} />
+        ) : (
+          <DashboardContractState resource={bootstrapResource} />
+        )}
+      </main>
+    </div>
+  );
+}
+
+function EnterpriseRoute({
+  route,
+  bootstrap,
+  postureResource,
+  agentsResource,
+  tokensResource,
+  enterpriseDeclared,
+  agentDiscovery,
+  tokenIntelligence,
+  meta,
+  onOpenActivity,
+  evaluatedAt,
+}: {
+  route: ShellRoute;
+  bootstrap: DashboardBootstrap;
+  postureResource: DashboardResource<DashboardPosture>;
+  agentsResource: DashboardResource<AgentInventory>;
+  tokensResource: DashboardResource<TokenIntelligenceContract>;
+  enterpriseDeclared: boolean;
+  agentDiscovery?: DashboardBootstrap["capabilities"][number];
+  tokenIntelligence?: DashboardBootstrap["capabilities"][number];
+  meta?: DashboardMeta;
+  onOpenActivity: (target?: Omit<ActivityTarget, "requestId">) => void;
+  evaluatedAt: string;
+}) {
+  if (route === "agents") {
+    return (
+      <CapabilityBoundary
+        adapterLabel="Agent inventory"
+        declared={agentDiscovery !== undefined}
+        capability={agentDiscovery}
+        resource={agentsResource}
+      >
+        {(inventory, stale) => <Agents inventory={inventory} stale={stale} />}
+      </CapabilityBoundary>
+    );
+  }
+  if (route === "tokens") {
+    return (
+      <CapabilityBoundary
+        adapterLabel="Token intelligence"
+        declared={tokenIntelligence !== undefined}
+        capability={tokenIntelligence}
+        resource={tokensResource}
+      >
+        {(report, stale) => <TokenIntelligence report={report} stale={stale} />}
+      </CapabilityBoundary>
+    );
+  }
+
+  if (route === "posture") {
+    return (
+      <CapabilityBoundary
+        adapterLabel="Enterprise posture"
+        declared={enterpriseDeclared}
+        capability={bootstrap.capabilities.find((capability) => capability.tier === "enterprise_core")}
+        resource={postureResource}
+      >
+        {(posture, stale) => <Posture bootstrap={bootstrap} posture={posture} current={!stale} evaluatedAt={evaluatedAt} />}
+      </CapabilityBoundary>
+    );
+  }
+
+  return <Home meta={meta} onOpenActivity={onOpenActivity} />;
+}
+
+function EnterpriseSessionStatus({ resource }: { resource: DashboardResource<DashboardBootstrap> }) {
+  if (resource.state === "ready" && resource.data.session.authenticated) return <StatusBadge status="available" label="Authenticated" />;
+  if (resource.state === "ready") return <StatusBadge status="unavailable" label="Authentication required" />;
+  if (resource.state === "stale") {
+    const label = resource.problem.httpStatus === 401 ? "Authentication required" : "Session status stale";
+    return <StatusBadge status="stale" label={label} />;
+  }
+  if (resource.state === "authentication_required") return <StatusBadge status="unavailable" label="Authentication required" />;
+  if (resource.state === "forbidden") return <StatusBadge status="unavailable" label="Session scope forbidden" />;
+  return <StatusBadge status={resource.state === "loading" || resource.state === "idle" ? "loading" : "unknown"} label="Session status unknown" />;
+}
+
+function BootstrapContractStatus({ resource }: { resource: DashboardResource<DashboardBootstrap> }) {
+  if (resource.state === "authentication_required") return <StatusBadge status="unavailable" label="Authentication required" />;
+  if (resource.state === "forbidden") return <StatusBadge status="unavailable" label="Dashboard scope forbidden" />;
+  if (resource.state === "error") return <StatusBadge status="failed" label="Contract invalid" />;
+  if (resource.state === "unavailable" || resource.state === "unsupported") return <StatusBadge status={resource.state} label="v1 adapter unavailable" />;
+  return <StatusBadge status="loading" label="Loading contract" />;
+}
+
+function DashboardContractState({ resource }: { resource: DashboardResource<DashboardBootstrap> }) {
+  const loading = resource.state === "loading" || resource.state === "idle";
+  const auth = resource.state === "authentication_required";
+  return (
+    <section className="rounded-2xl border border-slate-200 bg-white px-6 py-14 text-center shadow-sm" role={auth ? "alert" : "status"}>
+      <div className="flex justify-center"><StatusBadge status={loading ? "loading" : auth ? "unavailable" : "failed"} /></div>
+      <h1 className="mt-4 text-xl font-semibold text-slate-950">
+        {loading ? "Loading dashboard contract" : auth ? "Enterprise authentication required" : "Dashboard contract unavailable"}
+      </h1>
+      <p className="mx-auto mt-2 max-w-xl text-sm leading-6 text-slate-600">
+        {loading
+          ? "Resolving a validated dashboard v1 bootstrap before mounting an edition-specific surface."
+          : auth
+            ? "Authenticate through the serving Active Defence endpoint. No Enterprise data is mounted before that boundary succeeds."
+            : "The dashboard could not validate the same-origin v1 bootstrap. No edition, capability or protection state is inferred."}
+      </p>
+    </section>
+  );
+}
+
+function ExposureStatus({ status, exposed }: { status: MetaStatus; exposed?: boolean }) {
+  if (status === "loading") return <StatusBadge status="loading" label="Checking exposure" />;
+  if (status === "error") {
+    const label = exposed === true ? "Exposed · status stale" : exposed === false ? "Last known local" : "Exposure unknown";
+    return <StatusBadge status={exposed === true ? "failed" : "stale"} label={label} />;
+  }
+  if (exposed === true) return <StatusBadge status="failed" label="Exposed · no authentication" />;
+  if (exposed === false) return <StatusBadge status="available" label="Local · read-only API" />;
+  return <StatusBadge status="unknown" label="Exposure unknown" />;
+}
+
+function ModePill({ mode }: { mode: GuardrailMode }) {
+  const labels: Record<GuardrailMode, string> = {
+    not_configured: "Setup needed",
+    monitor: "Monitor configured",
+    enforce: "Enforce configured",
+    mixed: "Mixed configuration",
+    partial: "Partial coverage",
+    unknown: "Status unknown",
+  };
+  const status = mode === "mixed" || mode === "partial" ? "degraded" : mode === "unknown" ? "unknown" : mode === "not_configured" ? "not_configured" : "available";
+  return <StatusBadge status={status} label={labels[mode]} className="hidden sm:inline-flex" />;
+}

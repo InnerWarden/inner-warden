@@ -1,0 +1,46 @@
+{
+  "schema_version": "innerwarden.dashboard.v1",
+  "generated_at": "2026-07-18T12:00:00Z",
+  "edition": "enterprise",
+  "product_version": "0.16.4-fixture",
+  "community_contract": {
+    "id": "CJC-090",
+    "version": "CJC-090-v1",
+    "canonicalization": "RAW-UTF8-BYTES-SHA256",
+    "digest": "sha256:5f4397b1c74409b06f5405f2ca4b748daea208a7d571abc3b03caf1c5040b62c"
+  },
+  "assurance_matrix": null,
+  "authorization_matrix": null,
+  "platform": { "os": "linux-fixture", "architecture": "x86_64-fixture", "enterprise_candidate": true, "reason_code": "deterministic_browser_fixture" },
+  "session": { "authenticated": true, "actor_id": "fixture-operator", "role": "fixture-read-only", "scopes": [] },
+  "capabilities": [{
+    "id": "enterprise.cases",
+    "tier": "enterprise_core",
+    "availability": "available",
+    "entitlement": "valid",
+    "support": "supported",
+    "desired_mode": "observe",
+    "effective_mode": "observe",
+    "convergence": {
+      "configured": { "state": "yes", "evidence": [], "reason_code": null },
+      "loaded": { "state": "yes", "evidence": [], "reason_code": null },
+      "running": { "state": "yes", "evidence": [], "reason_code": null },
+      "enforcing": { "state": "not_applicable", "evidence": [], "reason_code": null },
+      "verified_effective": { "state": "not_applicable", "evidence": [], "reason_code": null }
+    },
+    "rollout_state": "observing",
+    "health": "healthy",
+    "scope": [],
+    "covered_action_classes": [],
+    "bypass_classes": [],
+    "known_uncovered_paths": [],
+    "freshness": { "observed_at": "2026-07-18T12:00:00Z", "budget_seconds": 60, "state": "fresh", "age_seconds": 0 },
+    "last_evidence": null,
+    "sources": [],
+    "claims": [],
+    "reason_code": null,
+    "summary": "Normalized cases adapter is available for deterministic browser fixtures."
+  }],
+  "highest_priority_gap": null,
+  "privacy": { "storage": ["deterministic_test_fixture_only"], "redactions": [], "egress": [] }
+}

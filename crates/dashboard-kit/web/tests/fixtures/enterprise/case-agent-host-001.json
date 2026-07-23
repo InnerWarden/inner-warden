@@ -1,0 +1,195 @@
+{
+  "id": "case-agent-host-001",
+  "title": "Agent attempted to read a production signing key before a host enforcement attempt",
+  "severity": "high",
+  "status": "needs_review",
+  "scope": [{
+    "id": "host:prod-01",
+    "kind": "host",
+    "display_name": "Production host 01",
+    "verification": "host_verified",
+    "evidence": [{
+      "id": "ev-host-attempt",
+      "kind": "runtime_verification",
+      "source": { "id": "execution-gate", "kind": "kernel_state", "authority": "canonical", "version": "gate-4.2.0", "completeness": "complete", "limitations": [] },
+      "observed_at": "2026-07-18T11:58:30Z",
+      "integrity": "verified",
+      "redaction": ["resource.path"],
+      "freshness": { "observed_at": "2026-07-18T11:58:30Z", "budget_seconds": 120, "state": "fresh", "age_seconds": 90 }
+    }]
+  }],
+  "latest_event_at": "2026-07-18T11:58:30Z",
+  "outcome": "blocked_before_execution",
+  "schema_version": "innerwarden.dashboard.v1",
+  "identity": {
+    "subject_ids": ["agent:codex-session-17", "process-tree:8841", "host:prod-01"],
+    "confidence": "host_verified",
+    "evidence": [{
+      "id": "ev-agent-intent",
+      "kind": "agent_intent",
+      "source": { "id": "agent-hook", "kind": "local_history", "authority": "corroborating", "version": "hook-2.1", "completeness": "complete", "limitations": ["Agent intent is not host execution evidence."] },
+      "observed_at": "2026-07-18T11:57:40Z",
+      "integrity": "local_chain",
+      "redaction": ["command.arguments"],
+      "freshness": { "observed_at": "2026-07-18T11:57:40Z", "budget_seconds": 120, "state": "fresh", "age_seconds": 100 }
+    }]
+  },
+  "recurrence": { "first_seen_at": "2026-07-18T08:02:00Z", "last_seen_at": "2026-07-18T11:58:30Z", "occurrences": "27", "state": "recurring" },
+  "timeline": [
+    {
+      "id": "intent-001",
+      "event_type": "agent_intent",
+      "observed_at": "2026-07-18T11:57:40Z",
+      "recorded_at": "2026-07-18T11:57:41Z",
+      "authority": "agent_hook",
+      "mode": "enforce",
+      "summary": "The agent requested a redacted credential-file read. This is intent evidence only.",
+      "relationship": "contextual",
+      "source_refs": [{
+        "id": "ev-agent-intent",
+        "kind": "agent_intent",
+        "source": { "id": "agent-hook", "kind": "local_history", "authority": "corroborating", "version": "hook-2.1", "completeness": "complete", "limitations": ["Agent intent is not host execution evidence."] },
+        "observed_at": "2026-07-18T11:57:40Z",
+        "integrity": "local_chain",
+        "redaction": ["command.arguments"],
+        "freshness": { "observed_at": "2026-07-18T11:57:40Z", "budget_seconds": 120, "state": "fresh", "age_seconds": 100 }
+      }]
+    },
+    {
+      "id": "host-observation-001",
+      "event_type": "host_observation",
+      "observed_at": "2026-07-18T11:57:42Z",
+      "recorded_at": "2026-07-18T11:57:42Z",
+      "authority": "host_sensor",
+      "mode": "enforce",
+      "summary": "The host observed the attributed process tree opening the redacted resource.",
+      "relationship": "strongly_supported",
+      "source_refs": [{
+        "id": "ev-host-observation",
+        "kind": "host_observation",
+        "source": { "id": "ebpf-file-sensor", "kind": "telemetry", "authority": "canonical", "version": "sensor-8.1", "completeness": "complete", "limitations": [] },
+        "observed_at": "2026-07-18T11:57:42Z",
+        "integrity": "verified",
+        "redaction": ["resource.path"],
+        "freshness": { "observed_at": "2026-07-18T11:57:42Z", "budget_seconds": 120, "state": "fresh", "age_seconds": 98 }
+      }]
+    },
+    {
+      "id": "recommendation-001",
+      "event_type": "recommendation",
+      "observed_at": "2026-07-18T11:57:43Z",
+      "recorded_at": "2026-07-18T11:57:43Z",
+      "authority": "local_model",
+      "mode": "enforce",
+      "summary": "The local model recommended denial with uncertainty retained separately from policy authority.",
+      "relationship": "strongly_supported",
+      "source_refs": [{
+        "id": "ev-model-recommendation",
+        "kind": "recommendation",
+        "source": { "id": "warden-local", "kind": "local_history", "authority": "corroborating", "version": "warden-v5", "completeness": "partial", "limitations": ["Model agreement is not measured detection accuracy."] },
+        "observed_at": "2026-07-18T11:57:43Z",
+        "integrity": "local_chain",
+        "redaction": [],
+        "freshness": { "observed_at": "2026-07-18T11:57:43Z", "budget_seconds": 120, "state": "fresh", "age_seconds": 97 }
+      }]
+    },
+    {
+      "id": "decision-001",
+      "event_type": "policy_decision",
+      "observed_at": "2026-07-18T11:57:44Z",
+      "recorded_at": "2026-07-18T11:57:44Z",
+      "authority": "deterministic_policy",
+      "mode": "enforce",
+      "summary": "The effective policy selected a pre-execution deny for the verified process-tree scope.",
+      "relationship": "causal",
+      "source_refs": [
+        {
+          "id": "ev-policy-decision",
+          "kind": "policy_decision",
+          "source": { "id": "policy-engine", "kind": "configuration", "authority": "canonical", "version": "policy-2026.07.18", "completeness": "complete", "limitations": [] },
+          "observed_at": "2026-07-18T11:57:44Z",
+          "integrity": "verified",
+          "redaction": [],
+          "freshness": { "observed_at": "2026-07-18T11:57:44Z", "budget_seconds": 120, "state": "fresh", "age_seconds": 96 }
+        },
+        {
+          "id": "ev-policy-fallback",
+          "kind": "fallback_state",
+          "source": { "id": "model-fallback-record", "kind": "local_history", "authority": "fallback", "version": "fallback-2", "completeness": "partial", "limitations": ["Fallback record does not replace policy authority."] },
+          "observed_at": "2026-07-18T11:57:44Z",
+          "integrity": "local_chain",
+          "redaction": [],
+          "freshness": { "observed_at": "2026-07-18T11:57:44Z", "budget_seconds": 120, "state": "fresh", "age_seconds": 96 }
+        }
+      ]
+    },
+    {
+      "id": "attempt-001",
+      "event_type": "enforcement_attempt",
+      "observed_at": "2026-07-18T11:57:45Z",
+      "recorded_at": "2026-07-18T11:57:45Z",
+      "authority": "kernel_control",
+      "mode": "enforce",
+      "summary": "Execution Gate attempted to deny the scoped action before execution.",
+      "relationship": "causal",
+      "source_refs": [{
+        "id": "ev-host-attempt",
+        "kind": "runtime_verification",
+        "source": { "id": "execution-gate", "kind": "kernel_state", "authority": "canonical", "version": "gate-4.2.0", "completeness": "complete", "limitations": [] },
+        "observed_at": "2026-07-18T11:58:30Z",
+        "integrity": "verified",
+        "redaction": ["resource.path"],
+        "freshness": { "observed_at": "2026-07-18T11:58:30Z", "budget_seconds": 120, "state": "fresh", "age_seconds": 90 }
+      }]
+    },
+    {
+      "id": "verification-001",
+      "event_type": "verification",
+      "observed_at": "2026-07-18T11:58:30Z",
+      "recorded_at": "2026-07-18T11:58:31Z",
+      "authority": "runtime_verifier",
+      "mode": "enforce",
+      "summary": "Runtime convergence evidence verified that the action did not execute in the effective host scope.",
+      "relationship": "causal",
+      "source_refs": [{
+        "id": "ev-host-attempt",
+        "kind": "runtime_verification",
+        "source": { "id": "execution-gate", "kind": "kernel_state", "authority": "canonical", "version": "gate-4.2.0", "completeness": "complete", "limitations": [] },
+        "observed_at": "2026-07-18T11:58:30Z",
+        "integrity": "verified",
+        "redaction": ["resource.path"],
+        "freshness": { "observed_at": "2026-07-18T11:58:30Z", "budget_seconds": 120, "state": "fresh", "age_seconds": 90 }
+      }]
+    }
+  ],
+  "evidence": [],
+  "feedback": [{
+    "id": "feedback-001",
+    "finding_type": "true_positive",
+    "status": "open",
+    "actor_id": "analyst:fixture",
+    "recorded_at": "2026-07-18T11:59:00Z",
+    "reason": "The scoped fixture action was intentionally prohibited; this read-only feedback record does not create an allowlist.",
+    "scope": [],
+    "evidence": []
+  }],
+  "verified_outcomes": [{
+    "outcome": "blocked_before_execution",
+    "mode": "enforce",
+    "actual_denial_or_containment_occurred": true,
+    "verification_status": "verified",
+    "verifier": "runtime-verifier-v1",
+    "verified_at": "2026-07-18T11:58:31Z",
+    "effective_scope": [{ "id": "host:prod-01", "kind": "host", "display_name": "Production host 01", "verification": "host_verified", "evidence": [] }],
+    "evidence": [{
+      "id": "ev-host-attempt",
+      "kind": "runtime_verification",
+      "source": { "id": "execution-gate", "kind": "kernel_state", "authority": "canonical", "version": "gate-4.2.0", "completeness": "complete", "limitations": [] },
+      "observed_at": "2026-07-18T11:58:30Z",
+      "integrity": "verified",
+      "redaction": ["resource.path"],
+      "freshness": { "observed_at": "2026-07-18T11:58:30Z", "budget_seconds": 120, "state": "fresh", "age_seconds": 90 }
+    }],
+    "enforcement_attempt_id": "attempt-001"
+  }]
+}

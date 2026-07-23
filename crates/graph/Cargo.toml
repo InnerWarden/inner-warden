@@ -1,0 +1,16 @@
+[package]
+name = "innerwarden-graph"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "Local attack-narrative graph model for InnerWarden Community: verdict ingestion, narrative generation and merge, with no I/O."
+
+[dependencies]
+# Pure: graph model + narrative. No HTTP, no filesystem — each product owns its
+# persistence; richer producers can use the open node-kind model in the future.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

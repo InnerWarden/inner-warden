@@ -1,0 +1,184 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://innerwarden.dev/contracts/community-journey-contract-v1.schema.json",
+  "title": "InnerWarden Community Journey Contract v1",
+  "description": "Schema for the frozen Community behaviour baseline. Contract identity and version are fields in the artifact; canonicalization and digest are carried separately by a VersionRef so the file never contains a self-referential digest.",
+  "$comment": "CJC-090-v1 is hashed as exact UTF-8 bytes using RAW-UTF8-BYTES-SHA256. The tracked digest is sha256:5f4397b1c74409b06f5405f2ca4b748daea208a7d571abc3b03caf1c5040b62c. This identifies bytes only and does not assert that any journey passed.",
+  "x-innerwarden-canonicalization": "RAW-UTF8-BYTES-SHA256",
+  "x-innerwarden-digest": "sha256:5f4397b1c74409b06f5405f2ca4b748daea208a7d571abc3b03caf1c5040b62c",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_schema",
+    "contract_id",
+    "version",
+    "status",
+    "immutable",
+    "baseline",
+    "purpose",
+    "source_precedence",
+    "state_semantics",
+    "global_invariants",
+    "community_only_conformance",
+    "acceptance_coverage_notes",
+    "journeys",
+    "release_gate"
+  ],
+  "properties": {
+    "contract_schema": { "const": "innerwarden.community-journey-contract.v1" },
+    "contract_id": { "const": "CJC-090" },
+    "version": { "const": "CJC-090-v1" },
+    "status": { "const": "frozen" },
+    "immutable": { "const": true },
+    "baseline": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "edition", "product_version", "git_commit", "captured_on", "canonical_surface", "dashboard_command", "dashboard_bind", "http_boundary"],
+      "properties": {
+        "repository": { "const": "InnerWarden/innerwarden" },
+        "edition": { "const": "community" },
+        "product_version": { "type": "string", "minLength": 1 },
+        "git_commit": { "type": "string", "pattern": "^[a-f0-9]{40}$" },
+        "captured_on": { "type": "string", "format": "date" },
+        "canonical_surface": { "type": "string", "minLength": 1 },
+        "dashboard_command": { "type": "string", "minLength": 1 },
+        "dashboard_bind": { "type": "string", "minLength": 1 },
+        "http_boundary": { "type": "string", "minLength": 1 }
+      }
+    },
+    "purpose": { "type": "string", "minLength": 1 },
+    "source_precedence": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } },
+    "state_semantics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["expected", "unsupported", "null"],
+      "properties": {
+        "expected": { "$ref": "#/$defs/StateSemantic" },
+        "unsupported": { "$ref": "#/$defs/StateSemantic" },
+        "null": { "$ref": "#/$defs/StateSemantic" }
+      }
+    },
+    "global_invariants": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } },
+    "community_only_conformance": { "$ref": "#/$defs/Conformance" },
+    "acceptance_coverage_notes": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/CoverageNote" }
+    },
+    "journeys": {
+      "type": "array",
+      "minItems": 12,
+      "maxItems": 12,
+      "items": { "$ref": "#/$defs/Journey" }
+    },
+    "release_gate": { "$ref": "#/$defs/ReleaseGate" }
+  },
+  "$defs": {
+    "VersionRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "version", "canonicalization", "digest"],
+      "properties": {
+        "id": { "const": "CJC-090" },
+        "version": { "const": "CJC-090-v1" },
+        "canonicalization": { "const": "RAW-UTF8-BYTES-SHA256" },
+        "digest": { "const": "sha256:5f4397b1c74409b06f5405f2ca4b748daea208a7d571abc3b03caf1c5040b62c" }
+      }
+    },
+    "StateSemantic": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["meaning", "conformance_rule"],
+      "properties": {
+        "meaning": { "type": "string", "minLength": 1 },
+        "conformance_rule": { "type": "string", "minLength": 1 }
+      }
+    },
+    "Conformance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["preconditions", "pass_conditions", "fail_conditions"],
+      "properties": {
+        "preconditions": { "$ref": "#/$defs/NonEmptyStrings" },
+        "pass_conditions": { "$ref": "#/$defs/NonEmptyStrings" },
+        "fail_conditions": { "$ref": "#/$defs/NonEmptyStrings" }
+      }
+    },
+    "CoverageNote": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "status", "summary", "evidence"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^CJC-GAP-[0-9]{3}$" },
+        "status": { "type": "string", "enum": ["open_at_baseline", "intentional_boundary"] },
+        "summary": { "type": "string", "minLength": 1 },
+        "evidence": { "$ref": "#/$defs/NonEmptyStrings" },
+        "implication": { "type": "string", "minLength": 1 }
+      }
+    },
+    "Journey": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "slug", "name", "requirement_refs", "baseline_channels", "entry_points", "expected_behaviour", "state_cases", "must_not_claim", "implementation_refs", "acceptance"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^CJC-090-J(00[1-9]|01[0-2])$" },
+        "slug": { "type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$" },
+        "name": { "type": "string", "minLength": 1 },
+        "requirement_refs": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "pattern": "^FR-[0-9]{3}$" } },
+        "baseline_channels": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["white_dashboard", "read_only_api", "cli"],
+          "properties": {
+            "white_dashboard": { "$ref": "#/$defs/BaselineState" },
+            "read_only_api": { "$ref": "#/$defs/BaselineState" },
+            "cli": { "$ref": "#/$defs/BaselineState" }
+          }
+        },
+        "entry_points": { "$ref": "#/$defs/NonEmptyStrings" },
+        "expected_behaviour": { "$ref": "#/$defs/NonEmptyStrings" },
+        "state_cases": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/StateCase" } },
+        "must_not_claim": { "$ref": "#/$defs/NonEmptyStrings" },
+        "implementation_refs": { "$ref": "#/$defs/NonEmptyStrings" },
+        "acceptance": { "$ref": "#/$defs/Acceptance" }
+      }
+    },
+    "BaselineState": { "type": "string", "enum": ["expected", "unsupported", "null"] },
+    "StateCase": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["when", "state", "result"],
+      "properties": {
+        "when": { "type": "string", "minLength": 1 },
+        "state": { "$ref": "#/$defs/BaselineState" },
+        "result": { "type": "string", "minLength": 1 }
+      }
+    },
+    "Acceptance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "coverage", "automated_evidence", "missing_evidence"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^CJC-090-AT-(00[1-9]|01[0-2])$" },
+        "coverage": { "type": "string", "enum": ["partial", "existing_logic"] },
+        "automated_evidence": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "missing_evidence": { "type": "string", "minLength": 1 }
+      }
+    },
+    "ReleaseGate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["exact_contract", "required_commands", "additional_feature_090_evidence_required", "completion_rule"],
+      "properties": {
+        "exact_contract": { "const": "CJC-090-v1" },
+        "required_commands": { "$ref": "#/$defs/NonEmptyStrings" },
+        "additional_feature_090_evidence_required": { "$ref": "#/$defs/NonEmptyStrings" },
+        "completion_rule": { "type": "string", "minLength": 1 }
+      }
+    },
+    "NonEmptyStrings": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "minLength": 1 }
+    }
+  }
+}

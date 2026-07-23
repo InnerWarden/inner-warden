@@ -1,0 +1,65 @@
+{
+  "community_baseline": {
+    "id": "evidence-community-baseline-001",
+    "kind": "evaluation_readiness",
+    "source": {
+      "id": "community-journey-runner",
+      "kind": "local_history",
+      "authority": "canonical",
+      "version": "CJC-090-v1",
+      "completeness": "complete",
+      "limitations": ["Deterministic fixture evidence; not a customer result"]
+    },
+    "observed_at": "2026-07-18T12:00:30Z",
+    "integrity": "local_chain",
+    "redaction": [],
+    "freshness": {
+      "observed_at": "2026-07-18T12:00:30Z",
+      "budget_seconds": 300,
+      "state": "fresh",
+      "age_seconds": 30
+    }
+  },
+  "observe_soak": {
+    "id": "evidence-observe-soak-001",
+    "kind": "evaluation_readiness",
+    "source": {
+      "id": "enterprise-evaluation-adapter",
+      "kind": "response_lifecycle",
+      "authority": "canonical",
+      "version": "innerwarden.dashboard.v1",
+      "completeness": "complete",
+      "limitations": ["Deterministic fixture evidence; not a customer result"]
+    },
+    "observed_at": "2026-07-18T12:00:40Z",
+    "integrity": "verified",
+    "redaction": [],
+    "freshness": {
+      "observed_at": "2026-07-18T12:00:40Z",
+      "budget_seconds": 300,
+      "state": "fresh",
+      "age_seconds": 20
+    }
+  },
+  "rollback": {
+    "id": "evidence-rollback-001",
+    "kind": "evaluation_readiness",
+    "source": {
+      "id": "local-recovery-verifier",
+      "kind": "kernel_state",
+      "authority": "canonical",
+      "version": "innerwarden.dashboard.v1",
+      "completeness": "complete",
+      "limitations": ["Deterministic fixture evidence; not a customer result"]
+    },
+    "observed_at": "2026-07-18T12:00:45Z",
+    "integrity": "verified",
+    "redaction": [],
+    "freshness": {
+      "observed_at": "2026-07-18T12:00:45Z",
+      "budget_seconds": 300,
+      "state": "fresh",
+      "age_seconds": 15
+    }
+  }
+}

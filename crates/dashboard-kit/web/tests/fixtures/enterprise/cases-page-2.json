@@ -1,0 +1,25 @@
+{
+  "schema_version": "innerwarden.dashboard.v1",
+  "generated_at": "2026-07-18T12:00:00Z",
+  "items": [
+    {
+      "id": "case-future-verification-003",
+      "title": "Producer supplied future and stale containment verification",
+      "severity": "critical",
+      "status": "contained",
+      "scope": [{ "id": "host:prod-02", "kind": "host", "display_name": "Production host 02", "verification": "host_verified", "evidence": [] }],
+      "latest_event_at": "2026-07-18T09:00:00Z",
+      "outcome": "contained"
+    },
+    {
+      "id": "case-missing-evidence-004",
+      "title": "Case with no supporting evidence",
+      "severity": "unknown",
+      "status": "unknown",
+      "scope": [],
+      "latest_event_at": "2026-07-17T13:00:00Z",
+      "outcome": "unknown"
+    }
+  ],
+  "next_cursor": null
+}

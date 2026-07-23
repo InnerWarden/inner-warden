@@ -1,0 +1,9 @@
+{
+  "version": "0.16.4-fixture",
+  "exposed": false,
+  "edition": "community",
+  "guardrail": {
+    "mode": "not_configured",
+    "guarded_agents": 0
+  }
+}

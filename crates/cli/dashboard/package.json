@@ -1,0 +1,12 @@
+{
+  "name": "innerwarden-dashboard-compat",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Compatibility command shim for the canonical dashboard-kit web package.",
+  "scripts": {
+    "build": "npm --prefix ../../dashboard-kit/web ci && npm --prefix ../../dashboard-kit/web run build",
+    "test": "npm --prefix ../../dashboard-kit/web run test:unit",
+    "typecheck": "npm --prefix ../../dashboard-kit/web run typecheck",
+    "bundle:check": "npm --prefix ../../dashboard-kit/web run bundle:check"
+  }
+}

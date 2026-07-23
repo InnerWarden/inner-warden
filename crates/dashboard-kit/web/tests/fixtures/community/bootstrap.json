@@ -1,0 +1,33 @@
+{
+  "schema_version": "innerwarden.dashboard.v1",
+  "generated_at": "2026-07-18T12:00:00Z",
+  "edition": "community",
+  "product_version": "0.16.4-fixture",
+  "community_contract": {
+    "id": "CJC-090",
+    "version": "CJC-090-v1",
+    "canonicalization": "RAW-UTF8-BYTES-SHA256",
+    "digest": "sha256:5f4397b1c74409b06f5405f2ca4b748daea208a7d571abc3b03caf1c5040b62c"
+  },
+  "assurance_matrix": null,
+  "authorization_matrix": null,
+  "platform": {
+    "os": "fixture-os",
+    "architecture": "fixture-architecture",
+    "enterprise_candidate": false,
+    "reason_code": "fixture_has_no_host_producer"
+  },
+  "session": {
+    "authenticated": false,
+    "actor_id": null,
+    "role": null,
+    "scopes": []
+  },
+  "capabilities": [],
+  "highest_priority_gap": null,
+  "privacy": {
+    "storage": ["deterministic_test_fixture_only"],
+    "redactions": [],
+    "egress": []
+  }
+}

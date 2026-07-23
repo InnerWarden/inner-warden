@@ -1,0 +1,43 @@
+{
+  "request_id": "request-observe-001",
+  "action_id": "begin_observe",
+  "lifecycle": "pending",
+  "before_state": {
+    "mode": "disabled",
+    "rollout_state": "eligible",
+    "evaluation_id": "eval-single-host-001",
+    "canary_request_id": null,
+    "decision": null,
+    "duration_seconds": null,
+    "state_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+  },
+  "desired_state": {
+    "mode": "observe",
+    "rollout_state": "observing",
+    "evaluation_id": "eval-single-host-001",
+    "canary_request_id": null,
+    "decision": null,
+    "duration_seconds": null,
+    "state_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+  },
+  "after_state": null,
+  "effective_state": null,
+  "actor": "fixture-operator",
+  "role": "security_operator",
+  "scope": [{ "id": "workload:agent-lab", "kind": "workload", "display_name": "Agent evaluation workload", "verification": "host_verified", "evidence": [] }],
+  "paam_ref": {
+    "id": "PAAM-090",
+    "version": "PAAM-090-v1",
+    "canonicalization": "RFC8785-JCS",
+    "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  },
+  "preview_id": "preview-observe-001",
+  "preview_digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+  "acknowledged_at": "2026-07-18T12:01:00Z",
+  "verified_at": null,
+  "convergence_evidence": [],
+  "expires_at": null,
+  "reversal": null,
+  "audit_ref": "audit-observe-001",
+  "failure": null
+}

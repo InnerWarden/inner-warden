@@ -1,0 +1,85 @@
+[package]
+name = "innerwarden"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "InnerWarden Community Edition: a standalone, cross-platform AI-agent guardrail for Linux, macOS, and Windows. Screens shell commands before they run — no sensor or kernel component."
+
+# cargo-binstall: fetch the prebuilt, signed release binary instead of compiling.
+# Activates once this crate is published to crates.io (`publish = false` today);
+# the per-target maps below point at the rolling `iw-guard` release assets.
+[package.metadata.binstall]
+pkg-fmt = "bin"
+
+[package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
+pkg-url = "https://github.com/InnerWarden/innerwarden-releases/releases/download/iw-guard/innerwarden-linux-x86_64"
+
+[package.metadata.binstall.overrides.aarch64-unknown-linux-gnu]
+pkg-url = "https://github.com/InnerWarden/innerwarden-releases/releases/download/iw-guard/innerwarden-linux-aarch64"
+
+[package.metadata.binstall.overrides.x86_64-apple-darwin]
+pkg-url = "https://github.com/InnerWarden/innerwarden-releases/releases/download/iw-guard/innerwarden-macos-x86_64"
+
+[package.metadata.binstall.overrides.aarch64-apple-darwin]
+pkg-url = "https://github.com/InnerWarden/innerwarden-releases/releases/download/iw-guard/innerwarden-macos-aarch64"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-url = "https://github.com/InnerWarden/innerwarden-releases/releases/download/iw-guard/innerwarden-windows-x86_64.exe"
+
+[package.metadata.binstall.overrides.aarch64-pc-windows-msvc]
+pkg-url = "https://github.com/InnerWarden/innerwarden-releases/releases/download/iw-guard/innerwarden-windows-aarch64.exe"
+
+[[bin]]
+name = "innerwarden"
+path = "src/main.rs"
+
+[dependencies]
+# The guardrail engine. Pure Rust, already Windows-clean (no /proc, cfg(unix),
+# libc, TLS, or C deps on the check-command path). This binary is a thin,
+# additive driver over it - it intentionally does NOT depend on the agent,
+# sensor, ctl, or store crates so it stays portable to Windows.
+innerwarden-agent-guard = { path = "../agent-guard" }
+# Shared notification layer (config + payload builders + format). The SAME crate
+# Active Defence uses, so a user's Telegram/Slack config carries from Community.
+innerwarden-notify = { path = "../notify" }
+# Shared narrative graph (model + verdict ingestion + narrative). The guardrail
+# STARTS the graph from its verdicts; Active Defence complements the same model.
+innerwarden-graph = { path = "../graph" }
+# Parse the optional [llm] second-opinion config file (user's own endpoint/key).
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+# Expand project-secret deny globs (.env.*, secrets/**) for `contain`. Pure Rust.
+glob = "0.3"
+# Advisory file lock (flock) so concurrent `hook`/`check` processes (multi-agent)
+# serialize their read-modify-write of the narrative graph — no lost updates.
+fs4 = { version = "0.8", features = ["sync"] }
+# The canonical white React bundle, versioned dashboard DTOs, and privacy-safe
+# token collector shared with the authenticated Active Defence server.
+innerwarden-dashboard-kit = { path = "../dashboard-kit" }
+serde_json = "1"
+# One-way hook event fingerprints make repeated delivery idempotent without
+# persisting provider tool-use identifiers in the local decision graph.
+sha2 = "0.10"
+# Pure-Rust, no-TLS HTTP server for the optional `serve` mode (loopback only).
+tiny_http = "0.12"
+# Async runtime for the `proxy` mode (the enforcing MCP stdio guard, which pumps
+# the wrapped server's stdio via tokio::process). Windows-clean: no unix APIs.
+tokio = { version = "1", features = ["rt-multi-thread", "io-std", "time"] }
+# Blocking HTTP client for the verdict notifications. rustls TLS = pure Rust, no
+# C deps, stays Windows-clean.
+ureq = { version = "2", features = ["json"] }
+# Arrow-key first-run wizard (`innerwarden setup`): MultiSelect + Input + Password.
+# Same version the Active Defence ctl uses; default-features off keeps it lean + Windows-clean.
+dialoguer = { version = "0.12.0", default-features = false, features = ["password"] }
+
+[target.'cfg(unix)'.dependencies]
+# Open local history files with O_NOFOLLOW so a raced symlink cannot redirect the
+# privacy-preserving token collector outside its reviewed roots.
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

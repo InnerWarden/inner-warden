@@ -1,0 +1,686 @@
+contract_schema: innerwarden.community-journey-contract.v1
+contract_id: CJC-090
+version: CJC-090-v1
+status: frozen
+immutable: true
+
+baseline:
+  repository: InnerWarden/innerwarden
+  edition: community
+  product_version: 0.16.4-rc.1
+  git_commit: de484c34c47164a159f012c863b91cd9f1b001d3
+  captured_on: '2026-07-18'
+  canonical_surface: current white React dashboard
+  dashboard_command: innerwarden dashboard
+  dashboard_bind: loopback by default
+  http_boundary: read-only and unauthenticated
+
+purpose: >-
+  Define exactly which Community journeys feature 090 must preserve when every
+  Enterprise service is absent. This is a behavioural baseline, not a statement
+  that every capability is available in every channel, for every agent, or on
+  every platform.
+
+source_precedence:
+  - current executable behaviour at the pinned commit
+  - current Rust and React source at the pinned commit
+  - automated tests at the pinned commit
+  - feature 090 specification and planning artifacts
+  - historical documentation only when it agrees with the sources above
+
+state_semantics:
+  expected:
+    meaning: >-
+      The capability or behaviour exists in the named baseline channel and must
+      remain usable with Enterprise absent.
+    conformance_rule: The acceptance outcome must match this contract.
+  unsupported:
+    meaning: >-
+      The named channel, platform, integration, or data source deliberately does
+      not implement the capability at this baseline.
+    conformance_rule: >-
+      Show an explicit unsupported or unavailable explanation; do not infer a
+      value, silently hide a material limitation, or present the capability as
+      configured, connected, guarded, or protected.
+  'null':
+    meaning: >-
+      The capability may exist elsewhere, but this channel has no trustworthy
+      observation or projection for the requested value at this baseline.
+    conformance_rule: >-
+      Preserve null or unknown semantics. Never convert null to zero, false,
+      healthy, inactive, allowed, connected, or protected.
+
+global_invariants:
+  - Community remains usable when Active Defence is absent, stopped, unlicensed, or unreachable.
+  - The Community dashboard HTTP surface remains read-only; no CJC journey requires an HTTP mutation.
+  - Installation evidence does not prove runtime activity, integration, guardrail effectiveness, or protection.
+  - A deny recommendation is not a verified block; recommendation, mode, and outcome remain separate.
+  - Monitor mode records what would be screened and does not claim that execution was blocked.
+  - Unknown or unsupported agent identity never grants automatic configuration authority.
+  - Missing numeric history is null or unavailable, never zero unless the source explicitly observed zero.
+  - Token counters are retained local-history observations, not billing totals or a security score.
+  - Community never claims an independent post-compromise host or kernel boundary.
+  - Prompts, responses, tool content, secrets, notification credentials, and raw source paths are not exposed by dashboard projections.
+
+community_only_conformance:
+  preconditions:
+    - Run the pinned Community binary without an Active Defence process or Enterprise API.
+    - Use the default loopback dashboard bind unless an exposure-specific test explicitly opts in.
+    - Exercise empty, available, unsupported, partial, corrupt-source, and refresh-failure states where declared below.
+  pass_conditions:
+    - Every journey whose applicable baseline channel is expected remains reachable and behaves as declared.
+    - Every applicable unsupported case is labelled explicitly and does not gain implied support.
+    - Every applicable null value remains null or unknown and is not rendered as zero or a positive claim.
+    - Enterprise absence creates no broken primary navigation, locked replacement page, or false incident.
+  fail_conditions:
+    - An expected Community journey requires Enterprise to render or operate.
+    - A missing source is displayed as zero, healthy, allowed, connected, enforcing, or protected.
+    - A detected agent is described as automatically integrated without reviewed configuration support.
+    - A dashboard request mutates agent, policy, allow/mute, jail, or notification state.
+
+acceptance_coverage_notes:
+  - id: CJC-GAP-001
+    status: open_at_baseline
+    summary: The React dashboard has build checks but no automated component or browser acceptance suite.
+    evidence:
+      - crates/cli/dashboard/package.json
+    implication: >-
+      Rust source tests support the data semantics below, but feature 090 must add
+      fixture-driven UI conformance before claiming SC-001.
+  - id: CJC-GAP-002
+    status: open_at_baseline
+    summary: AI Jail availability is not projected into the white dashboard or its API.
+    evidence:
+      - crates/cli/src/contain.rs
+      - crates/cli/src/contain_io.rs
+      - crates/cli/dashboard/src/screens/Home.tsx
+  - id: CJC-GAP-003
+    status: open_at_baseline
+    summary: Notification configuration and delivery status are not projected into the white dashboard or its API.
+    evidence:
+      - crates/cli/src/notify_io.rs
+      - crates/notify/src/lib.rs
+  - id: CJC-GAP-004
+    status: intentional_boundary
+    summary: Allow, mute, and review policy controls are CLI-only; the Community dashboard API is read-only.
+    evidence:
+      - crates/cli/src/suppress_io.rs
+      - crates/cli/src/dashboard.rs
+
+journeys:
+  - id: CJC-090-J001
+    slug: edition-shell-and-agent-posture
+    name: Community shell and agent posture
+    requirement_refs: [FR-003, FR-004, FR-005, FR-012, FR-013, FR-014]
+    baseline_channels:
+      white_dashboard: expected
+      read_only_api: expected
+      cli: expected
+    entry_points:
+      - innerwarden dashboard
+      - GET /api/meta
+      - GET /api/overview
+    expected_behaviour:
+      - The white dashboard identifies the edition as Community and exposes Overview and Activity navigation.
+      - Clicking the InnerWarden logo returns to Overview without requiring a page reload.
+      - The posture hero distinguishes setup-needed, monitor, enforce, mixed, partial, and unknown configuration states.
+      - The mode is described as configured posture and tells the user to reload changed agents; it is not a universal runtime-protection claim.
+      - The dashboard reports whether its unauthenticated endpoint is loopback-local, deliberately exposed, stale, or unknown.
+    state_cases:
+      - when: Fresh metadata reports one unambiguous reviewed integration mode.
+        state: expected
+        result: Show the corresponding configured mode and guarded integration count.
+      - when: Metadata refresh fails after a prior response.
+        state: 'null'
+        result: Retain non-security display data but withdraw the live mode claim and show stale or unknown status.
+      - when: Bind or Host-header evidence does not establish a safe local endpoint.
+        state: 'null'
+        result: Do not describe the dashboard as local or safely configured.
+    must_not_claim:
+      - A configured hook or MCP wrapper proves that the agent restarted or that every action is intercepted.
+      - Community provides independent host or kernel containment.
+    implementation_refs:
+      - crates/cli/dashboard/src/App.tsx
+      - crates/cli/dashboard/src/screens/Home.tsx
+      - crates/cli/src/dashboard.rs
+    acceptance:
+      id: CJC-090-AT-001
+      coverage: partial
+      automated_evidence:
+        - 'crates/cli/src/dashboard.rs::tests::meta_json_carries_the_version_and_exposed_flag'
+        - 'crates/cli/src/dashboard.rs::tests::aggregate_mode_never_turns_ambiguity_into_enforcement'
+        - 'crates/cli/src/dashboard.rs::tests::local_dashboard_rejects_dns_rebinding_host_headers'
+        - 'crates/cli/src/dashboard.rs::tests::dist_is_embedded'
+      missing_evidence: Automated React navigation and stale-posture rendering test.
+
+  - id: CJC-090-J002
+    slug: deterministic-action-screening
+    name: Deterministic action screening
+    requirement_refs: [FR-004, FR-005, FR-024, FR-025, FR-033, FR-034]
+    baseline_channels:
+      white_dashboard: expected
+      read_only_api: expected
+      cli: expected
+    entry_points:
+      - innerwarden check "<command>" --json
+      - innerwarden hook
+      - innerwarden proxy --mode <mode> -- <server> [args]
+      - GET /api/overview
+      - GET /api/cases
+    expected_behaviour:
+      - Deterministic rules classify observed commands or supported MCP calls as allow, review, or deny.
+      - The dashboard displays recorded decisions and distinguishes verdict from execution outcome where newer integrations provide outcome evidence.
+      - A missing recommendation remains unknown rather than becoming allow.
+      - MCP request inspection can deny before forwarding in guard mode; response and description findings keep their documented alert-only limits.
+    state_cases:
+      - when: A supported path records a recommendation and an outcome.
+        state: expected
+        result: Display both fields without deriving one from the other.
+      - when: An older graph record has no outcome evidence.
+        state: 'null'
+        result: Show outcome unknown; do not infer allowed or blocked from the recommendation.
+      - when: An agent action bypasses every configured Community mediation path.
+        state: unsupported
+        result: Do not claim that Community screened or controlled that action.
+    must_not_claim:
+      - A risk category is a confirmed attack.
+      - A deny verdict is a verified block without outcome evidence.
+    implementation_refs:
+      - crates/agent-guard/src/rules.rs
+      - crates/agent-guard/src/mcp.rs
+      - crates/cli/src/main.rs
+      - crates/cli/src/graph_io.rs
+      - crates/graph/src/lib.rs
+      - crates/cli/dashboard/src/components/Detail.tsx
+    acceptance:
+      id: CJC-090-AT-002
+      coverage: existing_logic
+      automated_evidence:
+        - 'crates/cli/tests/cli.rs::benign_command_allows_with_exit_0'
+        - 'crates/cli/tests/cli.rs MCP proxy advisory and guard fixtures'
+        - 'crates/graph/src/lib.rs::tests::context_separates_verdict_from_actual_outcome'
+        - 'crates/graph/src/lib.rs::tests::missing_recommendation_is_unknown_not_allow'
+      missing_evidence: End-to-end browser assertion for verdict and outcome labels.
+
+  - id: CJC-090-J003
+    slug: hooks-and-mcp-protection
+    name: Hook and MCP protection status
+    requirement_refs: [FR-004, FR-005, FR-006, FR-034, FR-082, FR-083, FR-087]
+    baseline_channels:
+      white_dashboard: expected
+      read_only_api: expected
+      cli: expected
+    entry_points:
+      - innerwarden setup
+      - innerwarden agents connect [--monitor]
+      - innerwarden install claude-code [--monitor]
+      - GET /api/agents
+    expected_behaviour:
+      - Each detected row shows guardrail mode, mechanism, setup support, automatic-setup eligibility, and detection evidence as separate fields.
+      - Reviewed integrations may expose PreToolUse-hook, MCP JSON, or MCP TOML wiring support.
+      - Unknown and unreviewed configurations remain visible but are manual or unsupported and are never background-mutated.
+      - Monitor and enforce remain distinct; monitor records and screens without blocking.
+    state_cases:
+      - when: A reviewed integration has valid, inspectable wiring.
+        state: expected
+        result: Report the observed mechanism and conservative configured mode.
+      - when: OpenClaw, Hermes, an unknown MCP config, or another unreviewed format is detected without a reviewed adapter.
+        state: unsupported
+        result: Keep the row visible and describe setup as manual or unsupported; do not auto-connect it.
+      - when: Runtime process evidence is not available.
+        state: 'null'
+        result: Report runtime not confirmed instead of running or stopped.
+    must_not_claim:
+      - Detection proves identity, wiring, running state, or effective enforcement.
+      - A product-name substring authorizes known-agent treatment.
+    implementation_refs:
+      - crates/agent-guard/src/agents.rs
+      - crates/agent-guard/src/agents_ops.rs
+      - crates/cli/src/agent_policy.rs
+      - crates/cli/src/dashboard.rs
+      - crates/cli/dashboard/src/components/MachineIntelligence.tsx
+    acceptance:
+      id: CJC-090-AT-003
+      coverage: existing_logic
+      automated_evidence:
+        - 'crates/agent-guard/src/agents.rs::tests::reviewed_agents_are_guardable_and_unreviewed_formats_stay_manual'
+        - 'crates/agent-guard/src/agents.rs::tests::canonical_never_trusts_substring_or_prefix_lookalikes'
+        - 'crates/cli/src/agent_policy.rs::tests::generic_unknown_mcp_config_is_never_background_mutated'
+        - 'crates/cli/src/dashboard.rs::tests::agents_payload_exposes_precise_non_authorizing_evidence'
+        - 'crates/cli/src/dashboard.rs::tests::agents_payload_does_not_claim_a_wrong_matcher_hook_is_guarding_bash'
+      missing_evidence: Browser fixture covering reviewed, unreviewed, partial, and runtime-null cards.
+
+  - id: CJC-090-J004
+    slug: local-decisions-overview
+    name: Local decision overview
+    requirement_refs: [FR-004, FR-005, FR-015, FR-017, FR-018, FR-019, FR-024]
+    baseline_channels:
+      white_dashboard: expected
+      read_only_api: expected
+      cli: expected
+    entry_points:
+      - Dashboard Overview
+      - GET /api/overview
+      - innerwarden graph --stats
+    expected_behaviour:
+      - Show recorded decisions and sessions, deny, review, allow, and unknown verdicts, recent decisions, and top rule categories.
+      - When present, show blocked-before-execution, would-block, screened, and outcome-not-recorded as distinct execution evidence.
+      - A valid empty graph renders an onboarding zero state rather than an incident or broken page.
+      - A refresh failure retains the last good response with an explicit reconnecting or stale notice.
+    state_cases:
+      - when: A valid graph contains no command nodes.
+        state: expected
+        result: Source-confirmed counts may be zero and the no-decisions state is shown.
+      - when: The graph source is unreadable or corrupt.
+        state: 'null'
+        result: Show an error or retained stale response; do not replace the source with all-zero metrics.
+      - when: Execution-outcome fields are absent in an older record.
+        state: 'null'
+        result: Omit or mark the affected outcome metric unavailable.
+    must_not_claim:
+      - Deny-verdict count equals actual blocks.
+      - Category volume equals confirmed attacks.
+    implementation_refs:
+      - crates/graph/src/lib.rs
+      - crates/cli/src/graph_io.rs
+      - crates/cli/src/dashboard.rs
+      - crates/cli/dashboard/src/screens/Home.tsx
+    acceptance:
+      id: CJC-090-AT-004
+      coverage: partial
+      automated_evidence:
+        - 'crates/graph/src/lib.rs::tests::overview_summarizes_counts_categories_and_recent_blocks'
+        - 'crates/graph/src/lib.rs::tests::overview_empty_graph_is_zeroed'
+        - 'crates/graph/src/lib.rs::tests::old_graphs_keep_working_without_inventing_outcomes'
+      missing_evidence: Browser tests for zero, stale, corrupt-source, and outcome-null states.
+
+  - id: CJC-090-J005
+    slug: activity-by-session
+    name: Session activity and decision detail
+    requirement_refs: [FR-004, FR-005, FR-024, FR-025, FR-032, FR-033]
+    baseline_channels:
+      white_dashboard: expected
+      read_only_api: expected
+      cli: expected
+    entry_points:
+      - Dashboard Activity
+      - GET /api/cases?verdict=&q=&session=&offset=&limit=
+      - innerwarden graph
+    expected_behaviour:
+      - List local sessions and their recorded actions through server-side filtering and bounded pagination.
+      - Filter by verdict, search text, and focused session; preserve an explicit no-results state.
+      - Open a decision detail showing recommendation, risk, authority, categories, ASI references, explanation, mode, and outcome when available.
+      - A deep link from recent activity keeps the intended decision reachable even when a session exceeds one response page.
+    state_cases:
+      - when: Matching sessions exist.
+        state: expected
+        result: Return bounded results with total session and decision counts.
+      - when: No records match a filter.
+        state: expected
+        result: Show no matching activity and a clear-filter control.
+      - when: Detail fields such as outcome or recorded time were not captured.
+        state: 'null'
+        result: Render them as unknown or unavailable without inventing a value.
+    must_not_claim:
+      - Temporal adjacency proves causality.
+      - A session label proves a provider or human identity.
+    implementation_refs:
+      - crates/graph/src/lib.rs
+      - crates/cli/src/dashboard.rs
+      - crates/cli/dashboard/src/screens/Cases.tsx
+      - crates/cli/dashboard/src/components/SessionCard.tsx
+      - crates/cli/dashboard/src/components/Detail.tsx
+    acceptance:
+      id: CJC-090-AT-005
+      coverage: partial
+      automated_evidence:
+        - 'crates/graph/src/lib.rs::tests::cases_page_filters_paginates_and_carries_drilldown_detail'
+        - 'crates/graph/src/lib.rs::tests::cases_page_keeps_newest_commands_and_reorders_reused_sessions'
+      missing_evidence: Browser tests for filters, pagination, deep-link detail, empty, and refresh-error states.
+
+  - id: CJC-090-J006
+    slug: allow-mute-and-review-controls
+    name: User allow, mute, and review policy controls
+    requirement_refs: [FR-004, FR-005, FR-031, FR-049]
+    baseline_channels:
+      white_dashboard: unsupported
+      read_only_api: unsupported
+      cli: expected
+    entry_points:
+      - innerwarden allow "<glob>"
+      - innerwarden allow --list
+      - innerwarden allow --remove "<glob>"
+      - innerwarden mute <ATR-rule|category>
+      - innerwarden mute --list
+      - innerwarden mute --remove <ATR-rule|category>
+      - innerwarden hook --block-review
+    expected_behaviour:
+      - An explicit allow pattern is user-attributed and force-allows only matching commands.
+      - Mute clears a flagged decision only when every applicable ATR reason is muted and no independent base-danger signal remains.
+      - Review is non-blocking by default and blocks only when the user explicitly enables block-review on a supported hook path.
+      - The dashboard can display resulting user provenance but does not mutate suppression or review policy.
+    state_cases:
+      - when: A command matches an explicit user allow pattern.
+        state: expected
+        result: Produce an allow recommendation attributed to the user and record the suppression reason.
+      - when: Only some reasons are muted or a base-danger signal remains.
+        state: expected
+        result: Keep the original review or deny recommendation.
+      - when: A user looks for dashboard mutation controls at the pinned baseline.
+        state: unsupported
+        result: No write endpoint exists; direct the operator to the local CLI without showing a fake control.
+    must_not_claim:
+      - Mute is a broad allowlist.
+      - A UI acknowledgement changed effective policy.
+    implementation_refs:
+      - crates/cli/src/suppress.rs
+      - crates/cli/src/suppress_io.rs
+      - crates/cli/src/main.rs
+      - crates/cli/dashboard/src/screens/Home.tsx
+    acceptance:
+      id: CJC-090-AT-006
+      coverage: existing_logic
+      automated_evidence:
+        - 'crates/cli/src/suppress.rs::tests::allow_glob_forces_allow_with_user_attribution'
+        - 'crates/cli/src/suppress.rs::tests::mute_category_clears_only_when_all_reasons_muted'
+        - 'crates/cli/src/suppress.rs::tests::mute_does_not_clear_a_base_danger_signal'
+        - 'crates/cli/src/main.rs::tests::hook_blocks_respects_block_review'
+      missing_evidence: CLI integration coverage for persisted add/list/remove and dashboard read-only conformance.
+
+  - id: CJC-090-J007
+    slug: ai-jail
+    name: AI Jail availability and limits
+    requirement_refs: [FR-004, FR-005, FR-034]
+    baseline_channels:
+      white_dashboard: 'null'
+      read_only_api: 'null'
+      cli: expected
+    entry_points:
+      - innerwarden contain [--monitor|--enforce|--block-review] -- <command...>
+      - innerwarden contain --dry-run -- <command...>
+    expected_behaviour:
+      - On Linux, build a bubblewrap filesystem or namespace jail plan; on macOS, build a sandbox-exec profile.
+      - Start in monitor mode unless enforcement is explicitly selected.
+      - Keep the InnerWarden configuration and key outside the jail, mask declared project secrets, and preserve an explicit list of v1 limits.
+      - Support only the reviewed claude-code target at this baseline; other agent targets fail explicitly.
+      - The pinned white dashboard does not yet report AI Jail availability, backend readiness, or active jailed sessions.
+    state_cases:
+      - when: Linux or macOS has the required trusted sandbox backend and the target is claude-code.
+        state: expected
+        result: The CLI can plan or run the jail with the selected guard mode.
+      - when: The OS is neither Linux nor macOS, the sandbox backend is absent, or the target is not claude-code.
+        state: unsupported
+        result: Fail explicitly and do not describe the agent as jailed.
+      - when: The white dashboard is asked for AI Jail status at the pinned baseline.
+        state: 'null'
+        result: No current status is available; absence must not be rendered as disabled, healthy, active, or protected.
+    must_not_claim:
+      - AI Jail supports arbitrary agents at this baseline.
+      - v1 provides network lockdown; --no-net is explicitly unsupported.
+      - A configured hook proves the child process is inside the jail.
+    implementation_refs:
+      - crates/cli/src/contain.rs
+      - crates/cli/src/contain_io.rs
+      - crates/cli/src/main.rs
+    acceptance:
+      id: CJC-090-AT-007
+      coverage: partial
+      automated_evidence:
+        - 'crates/cli/src/contain.rs::tests::parse_modes_and_errors'
+        - 'crates/cli/src/contain.rs::tests::linux_shadows_the_secret_dir_and_never_binds_ssh'
+        - 'crates/cli/src/contain.rs::tests::macos_denies_secret_dir_read_and_write_last'
+        - 'crates/cli/tests/cli.rs::contain_macos_jail_blocks_the_api_key_but_allows_the_project'
+      missing_evidence: Linux end-to-end backend test and a dashboard availability projection.
+
+  - id: CJC-090-J008
+    slug: agent-discovery
+    name: Conservative local agent discovery
+    requirement_refs: [FR-004, FR-005, FR-006, FR-081, FR-083, FR-086]
+    baseline_channels:
+      white_dashboard: expected
+      read_only_api: expected
+      cli: expected
+    entry_points:
+      - Dashboard section "Agents on this machine"
+      - GET /api/agents
+      - innerwarden agents
+    expected_behaviour:
+      - Show known products and credible unknown or generic agent-like configurations with the exact non-authorizing evidence that found them.
+      - Keep installed, running, detected-by, identity, integration, and guardrail fields independent.
+      - Bound discovery work and disclose when the local safety limit may omit generic MCP candidates.
+      - Do not collapse lookalike names into reviewed known-agent identities.
+    state_cases:
+      - when: Executable, process, configuration, or compatible MCP evidence exists.
+        state: expected
+        result: Surface the candidate with the precise evidence classes available.
+      - when: Runtime enumeration is unavailable or inconclusive.
+        state: 'null'
+        result: Set running to null and show runtime not confirmed.
+      - when: A generic or spoofed candidate has no reviewed adapter.
+        state: unsupported
+        result: Preserve detection while withholding automatic setup and protection claims.
+    must_not_claim:
+      - Presence is proof of installation, running state, known identity, connection, or protection.
+      - A fixed product catalogue exhausts agent discovery.
+    implementation_refs:
+      - crates/agent-guard/src/agents.rs
+      - crates/cli/src/agents_io.rs
+      - crates/cli/src/dashboard.rs
+      - crates/cli/dashboard/src/components/MachineIntelligence.tsx
+    acceptance:
+      id: CJC-090-AT-008
+      coverage: existing_logic
+      automated_evidence:
+        - 'crates/agent-guard/src/agents.rs::tests::summarize_merges_running_and_installed_and_surfaces_unknown'
+        - 'crates/agent-guard/src/agents.rs::tests::unrecognized_surfaces_unknown_agent_like_configs'
+        - 'crates/cli/src/dashboard.rs::tests::agents_payload_is_private_and_read_only'
+        - 'crates/cli/src/dashboard.rs::tests::agents_loading_payload_uses_the_same_v2_contract'
+      missing_evidence: Browser tests for unknown, generic, limited-discovery, and runtime-null states.
+
+  - id: CJC-090-J009
+    slug: integration-status-and-safe-auto-connect
+    name: Integration status and safe automatic setup
+    requirement_refs: [FR-004, FR-005, FR-006, FR-034, FR-082, FR-083, FR-087]
+    baseline_channels:
+      white_dashboard: expected
+      read_only_api: expected
+      cli: expected
+    entry_points:
+      - Dashboard agent cards
+      - GET /api/agents
+      - innerwarden agents connect [--monitor]
+      - innerwarden agents disconnect <name>
+      - innerwarden agents auto-connect --monitor|--off|status
+    expected_behaviour:
+      - Show setup support, mechanism, current conservative mode, automatic-setup eligibility, and current auto-connect policy separately.
+      - Automatic setup is opt-in, monitor-only, dashboard-process-owned, and limited to exact reviewed integration targets.
+      - Preserve existing configurations, explicit disconnects, exclusions, and enforce or partial wrappers; never silently downgrade or broaden them.
+      - Generic discovery alone never grants authority to edit an agent configuration.
+    state_cases:
+      - when: Auto-connect is enabled and an exact reviewed target passes validation.
+        state: expected
+        result: Reconcile it in monitor mode through a reversible reviewed writer.
+      - when: Policy cannot be read, is corrupt, locked, or from an unknown future schema.
+        state: 'null'
+        result: Show policy or eligibility unavailable and make no configuration change.
+      - when: The integration format is unreviewed, generic, unsafe, or symlinked.
+        state: unsupported
+        result: Skip mutation and explain the manual or unsupported status.
+    must_not_claim:
+      - Auto-connect is enabled merely because an agent was detected.
+      - A prior configured mode is current runtime enforcement.
+    implementation_refs:
+      - crates/cli/src/agent_policy.rs
+      - crates/cli/src/agents_io.rs
+      - crates/agent-guard/src/file_update.rs
+      - crates/cli/src/dashboard.rs
+      - crates/cli/dashboard/src/components/MachineIntelligence.tsx
+    acceptance:
+      id: CJC-090-AT-009
+      coverage: existing_logic
+      automated_evidence:
+        - 'crates/cli/src/agent_policy.rs::tests::disabled_policy_never_mutates_an_agent'
+        - 'crates/cli/src/agent_policy.rs::tests::meaningful_claude_and_valid_json_connect_in_monitor_idempotently'
+        - 'crates/cli/src/agent_policy.rs::tests::existing_partial_and_enforce_mcp_wrappers_are_never_repaired_or_downgraded'
+        - 'crates/cli/src/agent_policy.rs::tests::automatic_wiring_skips_symlinked_config_paths'
+        - 'crates/cli/src/dashboard.rs::tests::agents_payload_does_not_mask_a_corrupt_policy_as_disabled'
+      missing_evidence: End-to-end watcher lifecycle and browser policy-state tests.
+
+  - id: CJC-090-J010
+    slug: token-intelligence
+    name: Provenance-aware local token intelligence
+    requirement_refs: [FR-004, FR-005, FR-017, FR-057]
+    baseline_channels:
+      white_dashboard: expected
+      read_only_api: expected
+      cli: unsupported
+    entry_points:
+      - Dashboard section "Token intelligence"
+      - GET /api/token-intelligence
+    expected_behaviour:
+      - Read bounded numeric usage records only from the supported Claude Code and Codex local history roots.
+      - Present Cursor as unsupported rather than reading an undocumented source or estimating usage.
+      - Keep each provider dimension independently nullable and show source, quality, note, sessions, and last-observed time.
+      - Describe totals as partial available local history, not billing data, complete provider usage, or a security score.
+      - Expose no prompt, response, tool content, secret, raw source path, or private record value.
+    state_cases:
+      - when: Valid supported local history contains observed counters.
+        state: expected
+        result: Show the deduplicated numeric counters and provenance with partial-history wording.
+      - when: A dimension or supported history is absent.
+        state: 'null'
+        result: Keep the affected counter null and render Unavailable; an observed zero may remain zero.
+      - when: An agent has no reviewed local token source, including Cursor at this baseline.
+        state: unsupported
+        result: Set all counters and session fields to null and show the unsupported provenance note.
+    must_not_claim:
+      - Retained local history equals provider billing.
+      - Missing history equals zero use.
+      - Token volume measures security risk.
+    implementation_refs:
+      - crates/cli/src/token_usage.rs
+      - crates/cli/src/dashboard.rs
+      - crates/cli/dashboard/src/api.ts
+      - crates/cli/dashboard/src/components/MachineIntelligence.tsx
+    acceptance:
+      id: CJC-090-AT-010
+      coverage: existing_logic
+      automated_evidence:
+        - 'crates/cli/src/token_usage.rs::tests::claude_deduplicates_message_ids_using_one_observed_snapshot'
+        - 'crates/cli/src/token_usage.rs::tests::codex_uses_one_cumulative_max_per_session_without_double_counting_subsets'
+        - 'crates/cli/src/token_usage.rs::tests::unavailable_is_null_while_observed_zero_is_zero'
+        - 'crates/cli/src/token_usage.rs::tests::report_serialization_contains_no_private_source_fields_or_values'
+        - 'crates/cli/src/token_usage.rs::tests::does_not_follow_source_or_file_symlinks'
+      missing_evidence: Browser tests for loading, available, no-data, error, unsupported, and large decimal-string counters.
+
+  - id: CJC-090-J011
+    slug: local-graph-evidence
+    name: Local narrative graph evidence
+    requirement_refs: [FR-004, FR-005, FR-015, FR-021, FR-024, FR-025, FR-033]
+    baseline_channels:
+      white_dashboard: expected
+      read_only_api: expected
+      cli: expected
+    entry_points:
+      - Dashboard Overview and Activity projections
+      - GET /api/graph
+      - GET /api/overview
+      - GET /api/cases
+      - innerwarden graph [--json|--stats|--clear]
+    expected_behaviour:
+      - Persist a local narrative of sessions, screened actions, verdicts, categories, ASI references, authority, mode, and outcomes when observed.
+      - Redact common secret patterns before durable graph storage.
+      - Use bounded Overview and Activity projections for the primary white-dashboard journey; raw graph JSON remains a diagnostic API or CLI representation.
+      - Keep unknown recommendation and outcome states explicit when reading older graph records.
+    state_cases:
+      - when: The graph file is absent because no action has been recorded.
+        state: expected
+        result: Treat it as a valid empty local record and show the no-decisions journey.
+      - when: The graph is unreadable or corrupt.
+        state: 'null'
+        result: Return an error or stale last-good projection; do not invent an empty healthy graph.
+      - when: A raw prompt, response, secret, or full private payload is requested through the dashboard projection.
+        state: unsupported
+        result: Do not expose it; only the redacted bounded evidence model is supported.
+    must_not_claim:
+      - A graph edge proves causality beyond its recorded relationship semantics.
+      - Local graph presence proves host observation or independent evidence integrity.
+    implementation_refs:
+      - crates/graph/src/lib.rs
+      - crates/cli/src/graph_io.rs
+      - crates/cli/src/dashboard.rs
+      - crates/cli/dashboard/src/screens/Home.tsx
+      - crates/cli/dashboard/src/screens/Cases.tsx
+    acceptance:
+      id: CJC-090-AT-011
+      coverage: existing_logic
+      automated_evidence:
+        - 'crates/cli/tests/cli.rs::graph_records_checks_and_narrates'
+        - 'crates/cli/tests/cli.rs::graph_never_persists_a_secret_in_a_screened_command'
+        - 'crates/graph/src/lib.rs::tests::json_round_trip_and_empty'
+        - 'crates/graph/src/lib.rs::tests::decided_by_defaults_to_rules_and_honors_override'
+      missing_evidence: HTTP corrupt-source test and browser evidence-projection test.
+
+  - id: CJC-090-J012
+    slug: notifications-where-configured
+    name: Optional local notifications
+    requirement_refs: [FR-004, FR-005, FR-056]
+    baseline_channels:
+      white_dashboard: 'null'
+      read_only_api: 'null'
+      cli: expected
+    entry_points:
+      - innerwarden notify
+      - innerwarden notify <channel flags> [--notify-review] [--test]
+      - innerwarden setup
+    expected_behaviour:
+      - Configure Telegram, Slack, Discord, or generic webhook notification channels in the local shared notification config.
+      - Send deny notifications best-effort; send review notifications only when the operator explicitly enables them.
+      - Notification failure never changes the guardrail verdict or exit code.
+      - The pinned white dashboard does not expose channel configuration, secrets, delivery health, or test actions.
+    state_cases:
+      - when: At least one channel is configured and a deny verdict is produced.
+        state: expected
+        result: Build and send the configured requests best-effort without changing the verdict.
+      - when: No channel is configured.
+        state: expected
+        result: Produce no notification request and keep the guardrail path functional.
+      - when: The white dashboard is asked for notification configuration or delivery status at the pinned baseline.
+        state: 'null'
+        result: No trustworthy dashboard value is available; never infer disabled, healthy, failed, or configured.
+      - when: A client requests notification configuration through the Community dashboard API.
+        state: unsupported
+        result: No mutation endpoint exists and no credential is exposed.
+    must_not_claim:
+      - A queued or attempted request was delivered successfully without delivery evidence.
+      - Notification configuration is protection or enforcement evidence.
+    implementation_refs:
+      - crates/notify/src/lib.rs
+      - crates/notify/src/cli.rs
+      - crates/cli/src/notify_io.rs
+      - crates/cli/src/setup_io.rs
+    acceptance:
+      id: CJC-090-AT-012
+      coverage: partial
+      automated_evidence:
+        - 'crates/notify/src/lib.rs::tests::should_notify_rules'
+        - 'crates/notify/src/lib.rs::tests::verdict_requests_empty_on_allow_and_ungated_review'
+        - crates/notify/src/cli.rs notification merge, status, and invalid-flag tests
+      missing_evidence: Network-adapter delivery test and dashboard explicit-unavailable projection.
+
+release_gate:
+  exact_contract: CJC-090-v1
+  required_commands:
+    - cargo test -p innerwarden
+    - cargo test -p innerwarden-agent-guard
+    - cargo test -p innerwarden-graph
+    - cargo test -p innerwarden-notify
+    - npm run build --prefix crates/cli/dashboard
+  additional_feature_090_evidence_required:
+    - Fixture-driven UI tests for all twelve journey IDs with Enterprise services absent.
+    - Explicit unsupported and null render tests for every declared state case.
+    - A read-only HTTP route audit proving no Community dashboard mutation endpoint was added.
+    - A Community-only screenshot set for desktop and narrow layouts, used as visual evidence rather than as the sole acceptance test.
+  completion_rule: >-
+    SC-001 may be claimed only when every CJC-090-AT-* identifier passes for the
+    exact pinned contract. Source references or screenshots alone are not a pass.

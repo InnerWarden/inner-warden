@@ -1,0 +1,56 @@
+{
+  "community": {
+    "edition": "Community",
+    "boundary": "INNERWARDEN COMMUNITY",
+    "title": "Connect an agent to start screening its actions.",
+    "description": "Guided setup starts in monitor mode. Captured shell actions, MCP tool calls and one-off checks build the local decision record.",
+    "hostBoundaryTitle": "Extend protection from agent intent to the host.",
+    "hostBoundaryDescription": "Community screens supported agent actions before execution. On supported Linux hosts, Active Defence adds independent host telemetry, incident triage and evidence-backed response, including eBPF enforcement and the kernel Execution Gate. macOS and Windows host protection is planned, not implied by this dashboard."
+  },
+  "observe": {
+    "edition": "Enterprise",
+    "boundary": "Independent host execution control",
+    "assurance": "i Visibility only",
+    "effectiveMode": "Observe",
+    "freshness": "Fresh · 1s",
+    "effectiveScopes": "1",
+    "evidenceRecords": "1"
+  },
+  "rehearse": {
+    "edition": "Enterprise",
+    "boundary": "Independent host execution control",
+    "assurance": "i Readiness only",
+    "effectiveMode": "Rehearse",
+    "freshness": "Fresh · 1s",
+    "effectiveScopes": "1",
+    "evidenceRecords": "1"
+  },
+  "enforce": {
+    "edition": "Enterprise",
+    "boundary": "Independent host execution control",
+    "assurance": "✓ Verified active enforcement",
+    "effectiveMode": "Enforce",
+    "freshness": "Fresh · 1s",
+    "effectiveScopes": "1",
+    "evidenceRecords": "1"
+  },
+  "degraded": {
+    "edition": "Enterprise",
+    "boundary": "Independent host execution control",
+    "assurance": "! Evidence degraded",
+    "effectiveMode": "Observe",
+    "freshness": "Fresh · 1s",
+    "effectiveScopes": "1",
+    "evidenceRecords": "1",
+    "recovery": "Recorded next step: Restore verified runtime convergence before making an enforcement claim"
+  },
+  "unknown": {
+    "edition": "Enterprise",
+    "boundary": "Independent host execution control",
+    "assurance": "? Status unknown",
+    "effectiveMode": "Unknown",
+    "freshness": "Unknown",
+    "effectiveScopes": "0",
+    "evidenceRecords": "0"
+  }
+}
