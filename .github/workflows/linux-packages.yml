@@ -1,0 +1,61 @@
+name: Linux packages (.deb / .rpm)
+
+# Build the Community CLI Debian and RPM packages for amd64 and arm64 from the
+# prebuilt release binaries, prove they install and run on real distros, and
+# upload them as artifacts. Version defaults to npm/package.json.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to package (defaults to npm/package.json)"
+        required: false
+        default: ""
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nfpm
+        run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest
+
+      - name: Resolve version
+        id: v
+        run: |
+          v="${{ inputs.version }}"
+          [ -n "$v" ] || v="$(node -p "require('./npm/package.json').version")"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Download release binaries
+        env:
+          REL: https://github.com/InnerWarden/innerwarden-releases/releases/download/iw-guard
+        run: |
+          mkdir -p bin
+          curl -fsSL -o bin/innerwarden-linux-x86_64 "$REL/innerwarden-linux-x86_64"
+          curl -fsSL -o bin/innerwarden-linux-aarch64 "$REL/innerwarden-linux-aarch64"
+
+      - name: Build packages
+        run: |
+          packaging/build-linux-packages.sh \
+            "${{ steps.v.outputs.version }}" \
+            bin/innerwarden-linux-x86_64 bin/innerwarden-linux-aarch64 out
+
+      - name: Test-install the .deb (native amd64)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y "./out/innerwarden_${{ steps.v.outputs.version }}_amd64.deb"
+          echo -n "deb -> "; innerwarden --version
+
+      - name: Test-install the .rpm (Rocky Linux container)
+        run: |
+          docker run --rm -v "$PWD/out:/pkg" rockylinux:9 bash -c \
+            "dnf install -y /pkg/innerwarden-${{ steps.v.outputs.version }}-1.x86_64.rpm >/dev/null && echo -n 'rpm -> ' && innerwarden --version"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-packages
+          path: |
+            out/*.deb
+            out/*.rpm
