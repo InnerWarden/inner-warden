@@ -1377,7 +1377,17 @@ pub fn check_security_tamper(content: &str) -> Option<(&'static str, u32)> {
     // Deleting/altering InnerWarden's own files, models, or pinned eBPF objects:
     // requires a destructive verb AND an InnerWarden path, so reading/grepping
     // a config file under /etc/innerwarden stays allowed.
-    const DESTRUCTIVE_VERBS: &[&str] = &[
+    // Overwrite via redirect only counts when the redirect TARGET is an
+    // InnerWarden path (`> /usr/local/bin/innerwarden`). A bare `>/` also
+    // appears in benign fd redirects like `2>/dev/null`, so it must not pair
+    // with any incidental mention of an InnerWarden path.
+    let redirect_over_self = INNERWARDEN_SELF_PATHS
+        .iter()
+        .any(|p| lower.contains(&format!("> {p}")) || lower.contains(&format!(">{p}")));
+    // Deleting or moving an InnerWarden file: a removal/move verb plus an
+    // InnerWarden path. Reading or grepping a file under /etc/innerwarden stays
+    // allowed because none of these verbs are present.
+    const REMOVAL_VERBS: &[&str] = &[
         "rm ",
         "rm-",
         "unlink ",
@@ -1385,12 +1395,10 @@ pub fn check_security_tamper(content: &str) -> Option<(&'static str, u32)> {
         "shred ",
         "truncate ",
         "mv ",
-        "> /",
-        ">/",
     ];
-    if DESTRUCTIVE_VERBS.iter().any(|v| lower.contains(v))
-        && INNERWARDEN_SELF_PATHS.iter().any(|p| lower.contains(p))
-    {
+    let removal_of_self = REMOVAL_VERBS.iter().any(|v| lower.contains(v))
+        && INNERWARDEN_SELF_PATHS.iter().any(|p| lower.contains(p));
+    if redirect_over_self || removal_of_self {
         return Some(("removing or altering InnerWarden files", 60));
     }
     None
@@ -2950,6 +2958,47 @@ fn normalize_command_target(target: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn security_tamper_ignores_benign_fd_redirect_near_innerwarden_path() {
+        // Regression: `2>/dev/null` contains `>/`, which must NOT pair with an
+        // incidental InnerWarden path mention and look like a binary overwrite.
+        for benign in [
+            "ls -la /usr/local/bin/innerwarden 2>/dev/null",
+            "systemctl status innerwarden-agent 2>/dev/null",
+            "cat /etc/innerwarden/agent.toml 2>/dev/null",
+            "innerwarden --version 2>/dev/null",
+            "grep -r foo /var/lib/innerwarden 2>/dev/null || true",
+        ] {
+            assert!(
+                check_security_tamper(benign).is_none(),
+                "benign command wrongly flagged as tamper: {benign}"
+            );
+        }
+    }
+
+    #[test]
+    fn security_tamper_still_flags_real_self_tamper() {
+        // Overwriting, removing, moving, or disabling InnerWarden's own files or
+        // services must stay flagged.
+        for evil in [
+            "echo x > /usr/local/bin/innerwarden",
+            "cat payload >/usr/local/bin/innerwarden",
+            "rm -f /usr/local/bin/innerwarden",
+            "rm -rf /etc/innerwarden",
+            "mv /usr/local/bin/innerwarden /tmp/x",
+            "unlink /sys/fs/bpf/innerwarden",
+            "shred /var/lib/innerwarden/state.db",
+            "systemctl stop innerwarden",
+            "pkill -f innerwarden",
+            "innerwarden uninstall",
+        ] {
+            assert!(
+                check_security_tamper(evil).is_some(),
+                "real self-tamper not flagged: {evil}"
+            );
+        }
+    }
 
     #[test]
     fn destructive_rm_root_only_flags_root_not_scoped_absolute_paths() {
