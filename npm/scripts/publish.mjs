@@ -27,7 +27,19 @@ function publish(dir, extraArgs) {
   const args = ["publish", ...extraArgs];
   if (DRY) args.push("--dry-run");
   process.stdout.write(`\n$ npm ${args.join(" ")}   (cwd ${dir})\n`);
-  execFileSync("npm", args, { cwd: dir, stdio: "inherit" });
+  try {
+    const out = execFileSync("npm", args, { cwd: dir, encoding: "utf8", stdio: ["inherit", "pipe", "pipe"] });
+    process.stdout.write(out);
+  } catch (err) {
+    const combined = ((err.stdout || "") + (err.stderr || "")).toString();
+    // Re-runs are safe: a version already on the registry is a success, not a failure.
+    if (/cannot publish over|previously published|EPUBLISHCONFLICT|409 Conflict/i.test(combined)) {
+      process.stdout.write("  already published at this version, skipping.\n");
+      return;
+    }
+    process.stderr.write(combined);
+    throw err;
+  }
 }
 
 // Platform packages (scoped -> --access public).
