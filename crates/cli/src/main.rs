@@ -31,6 +31,7 @@ mod setup;
 mod setup_io;
 mod suppress;
 mod suppress_io;
+mod upgrade;
 mod upsell;
 mod upsell_io;
 
@@ -48,6 +49,7 @@ fn main() -> std::process::ExitCode {
         Some("setup") => setup_io::cmd(&args[1..]),
         Some("install") => cmd_install(&args[1..]),
         Some("uninstall") => cmd_uninstall(&args[1..]),
+        Some("upgrade") | Some("update") | Some("self-update") => upgrade::cmd(&args[1..]),
         Some("agents") => agents_io::cmd(&args[1..]),
         Some("contain") => contain_io::cmd(&args[1..]),
         Some("enforce") => cmd_mode(&args[1..], false),
@@ -523,6 +525,16 @@ fn cmd_install(rest: &[String]) -> std::process::ExitCode {
 /// cannot reliably remove its own file cross-platform) - it prints where it is so
 /// the user can `rm` it if they want it gone.
 fn cmd_uninstall(rest: &[String]) -> std::process::ExitCode {
+    if rest.iter().any(|a| a == "--help" || a == "-h") {
+        print_help();
+        return std::process::ExitCode::SUCCESS;
+    }
+    // Bare `uninstall` (or with --all / --purge) removes InnerWarden entirely:
+    // the agent hook, the config directory, and the binary. `uninstall
+    // claude-code` (a named agent) removes only that agent's hook.
+    if uninstall_targets_whole_install(rest) {
+        return cmd_uninstall_self(rest.iter().any(|a| a == "--purge"));
+    }
     let (agent, settings) = match parse_install_args(rest) {
         InstallArgs::Run {
             agent, settings, ..
@@ -584,6 +596,75 @@ fn cmd_uninstall(rest: &[String]) -> std::process::ExitCode {
             std::process::ExitCode::from(1)
         }
     }
+}
+
+/// `uninstall` with no named agent (empty, or only flags like `--all` /
+/// `--purge`) targets the whole install; a named agent such as `claude-code`
+/// targets only that agent's hook. `--help` is handled before this is called.
+fn uninstall_targets_whole_install(rest: &[String]) -> bool {
+    !rest.iter().any(|a| !a.starts_with('-'))
+}
+
+/// Full self-uninstall: remove the guard hook from the wired agent, delete the
+/// config directory, and remove the binary. `--purge` is accepted for parity
+/// with the installer (local state lives under the config dir, so it is already
+/// removed). Reversible in the sense that reinstalling restores everything;
+/// nothing outside InnerWarden's own paths is touched.
+fn cmd_uninstall_self(purge: bool) -> std::process::ExitCode {
+    let home = match hook::home_dir() {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("innerwarden uninstall: {e}");
+            return std::process::ExitCode::from(2);
+        }
+    };
+    println!("Uninstalling {COMMUNITY_NAME}...");
+
+    // 1. Remove the agent hook (claude-code is the wired agent today).
+    match hook::uninstall_hook(&home, "claude-code", None) {
+        Ok((path, removed)) if removed > 0 => println!(
+            "  hook    : removed {removed} entr{} from {}",
+            if removed == 1 { "y" } else { "ies" },
+            path.display()
+        ),
+        Ok(_) => println!("  hook    : none wired"),
+        Err(e) => eprintln!("  hook    : could not remove ({e})"),
+    }
+
+    // 2. Remove the config directory (guard config + API key + local state).
+    let config_dir = home.join(".config/innerwarden");
+    if config_dir.exists() {
+        match std::fs::remove_dir_all(&config_dir) {
+            Ok(()) => println!("  config  : removed {}", config_dir.display()),
+            Err(e) => eprintln!(
+                "  config  : could not remove {} ({e})",
+                config_dir.display()
+            ),
+        }
+    } else {
+        println!("  config  : none");
+    }
+    let _ = purge; // local state lives under config_dir; already covered.
+
+    // 3. Remove the binary. On Unix a running process can unlink its own
+    // executable and keep running from the open inode; on Windows the file is
+    // locked, so we print the path for the user to delete.
+    if let Ok(exe) = std::env::current_exe() {
+        #[cfg(unix)]
+        match std::fs::remove_file(&exe) {
+            Ok(()) => println!("  binary  : removed {}", exe.display()),
+            Err(e) => println!("  binary  : remove it with `rm {}` ({e})", exe.display()),
+        }
+        #[cfg(not(unix))]
+        {
+            println!("  binary  : a running program cannot delete itself on this OS");
+            println!("            remove it with:  del \"{}\"", exe.display());
+        }
+    }
+
+    println!();
+    println!("{COMMUNITY_NAME} removed. Restart your agent to drop the hook.");
+    std::process::ExitCode::SUCCESS
 }
 
 /// `innerwarden serve [--bind IP:PORT]` - expose the guardrail over plain HTTP on
@@ -794,8 +875,12 @@ fn cmd_proxy(rest: &[String]) -> std::process::ExitCode {
 }
 
 fn print_help() {
+    println!("{}", help_text());
+}
+
+fn help_text() -> String {
     let p = prog();
-    println!(
+    format!(
         "{p} {ver} - {community_edition}\n\
          AI-agent guardrail (cross-platform: Linux, macOS, Windows)\n\
          \n\
@@ -814,6 +899,8 @@ fn print_help() {
            {p} install claude-code [--monitor]\n  \
            \x20                                wire a PreToolUse hook into Claude Code (--monitor = records, never blocks)\n  \
            {p} uninstall claude-code     remove that hook (leaves other settings untouched)\n  \
+           {p} upgrade                   update to the latest signed release (verifies before replacing)\n  \
+           {p} uninstall                 remove InnerWarden entirely: hook, config, and the binary\n  \
            {p} agents [connect [--monitor]|disconnect [--all|<name>]]\n  \
            \x20                                find AI agents on this machine + connect the guard\n  \
            {p} agents auto-connect [--monitor|--off|status]\n  \
@@ -851,12 +938,34 @@ fn print_help() {
         ver = env!("CARGO_PKG_VERSION"),
         bind = DEFAULT_BIND,
         community_edition = COMMUNITY_EDITION_NAME,
-    );
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uninstall_bare_or_flags_only_targets_whole_install() {
+        assert!(uninstall_targets_whole_install(&[]));
+        assert!(uninstall_targets_whole_install(&["--purge".into()]));
+        assert!(uninstall_targets_whole_install(&["--all".into()]));
+        assert!(!uninstall_targets_whole_install(&["claude-code".into()]));
+        assert!(!uninstall_targets_whole_install(&[
+            "claude-code".into(),
+            "--purge".into()
+        ]));
+    }
+
+    #[test]
+    fn help_documents_upgrade_and_full_uninstall() {
+        let help = help_text();
+        assert!(help.contains("upgrade"), "help must mention upgrade");
+        assert!(
+            help.contains("remove InnerWarden entirely"),
+            "help must document the full uninstall"
+        );
+    }
 
     #[test]
     fn dangerous_command_analyzes_to_deny() {
