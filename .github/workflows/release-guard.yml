@@ -1,0 +1,258 @@
+name: Release InnerWarden Community
+
+# Builds the free Community binary (`innerwarden`, crate `cli`) for Linux,
+# macOS, and Windows on x86_64 + aarch64, signs each with Ed25519, and publishes
+# to the ROLLING `iw-guard` release on InnerWarden/innerwarden-releases so the
+# install one-liner always resolves the freshest binary:
+#   curl -fsSL https://innerwarden.com/free | sh
+#
+# Split of responsibility:
+#   - inner-warden          (this repo): the SOURCE. Builds the binary.
+#   - innerwarden-releases  : DISTRIBUTION. Holds the installers, the Scoop
+#                             manifest, and the public key. This job reads the
+#                             installer from there, stamps the fresh pinned key,
+#                             publishes the binaries, and commits the updated
+#                             installer/manifest/key back.
+#
+# Trigger: workflow_dispatch, or a `guard-v*` tag for a named cut.
+#
+# Required repo secrets:
+#   RELEASE_SIGNING_KEY  - Ed25519 private key (PEM) that signs the binaries.
+#   RELEASES_REPO_TOKEN  - token with write access to InnerWarden/innerwarden-releases.
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "guard-v[0-9]+.[0-9]+.[0-9]+"
+      - "guard-v[0-9]+.[0-9]+.[0-9]+-*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: innerwarden-community-release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            builder: zigbuild
+            targets: x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
+          - os: macos-latest
+            builder: cargo
+            targets: x86_64-apple-darwin aarch64-apple-darwin
+          - os: windows-latest
+            builder: cargo
+            targets: x86_64-pc-windows-msvc aarch64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Zig + cargo-zigbuild (linux cross-link)
+        if: matrix.builder == 'zigbuild'
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.13.0
+      - name: cargo-zigbuild
+        if: matrix.builder == 'zigbuild'
+        run: command -v cargo-zigbuild >/dev/null 2>&1 || cargo install cargo-zigbuild --locked
+
+      - name: Test the Community crates
+        if: matrix.builder == 'zigbuild'
+        run: cargo test -p innerwarden -p innerwarden-agent-guard -p innerwarden-dashboard-kit -p innerwarden-graph -p innerwarden-notify
+
+      - name: Build + stage innerwarden for each target
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for t in ${{ matrix.targets }}; do
+            rustup target add "$t"
+            echo "=== building innerwarden for $t ==="
+            if [ "${{ matrix.builder }}" = "zigbuild" ]; then
+              cargo zigbuild --release --target "$t" -p innerwarden
+            else
+              cargo build --release --target "$t" -p innerwarden
+            fi
+            case "$t" in
+              *linux*)   os=linux;   ext="" ;;
+              *darwin*)  os=macos;   ext="" ;;
+              *windows*) os=windows; ext=".exe" ;;
+            esac
+            case "$t" in
+              x86_64-*)  arch=x86_64 ;;
+              aarch64-*) arch=aarch64 ;;
+            esac
+            src="target/$t/release/innerwarden${ext}"
+            dest="dist/innerwarden-${os}-${arch}${ext}"
+            cp "$src" "$dest"
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "$dest" | awk '{print $1}' > "${dest}.sha256"
+            else
+              shasum -a 256 "$dest" | awk '{print $1}' > "${dest}.sha256"
+            fi
+            echo "staged $dest"
+          done
+          ls -lh dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: innerwarden-${{ matrix.os }}
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    name: Sign + publish rolling iw-guard release
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      # The installer, Scoop manifest, and public key live in the DISTRIBUTION
+      # repo, not here. Read them from there, update them, publish, commit back.
+      - name: Checkout the releases (distribution) repo
+        uses: actions/checkout@v4
+        with:
+          repository: InnerWarden/innerwarden-releases
+          token: ${{ secrets.RELEASES_REPO_TOKEN }}
+          path: public-releases
+
+      - name: Gather assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find artifacts -type f -name 'innerwarden-*' -exec cp {} dist/ \;
+          # Installer + PowerShell installer come from the distribution repo.
+          cp public-releases/iw-guard-install.sh dist/iw-guard-install.sh
+          cp public-releases/install.ps1 dist/install.ps1
+          ls -lh dist/
+
+      - name: Regenerate the Scoop manifest (fresh version + hashes)
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x dist/innerwarden-linux-x86_64
+          ver="$(./dist/innerwarden-linux-x86_64 --version | awk '{print $NF}')"
+          h64="$(awk '{print $1}' dist/innerwarden-windows-x86_64.exe.sha256)"
+          harm="$(awk '{print $1}' dist/innerwarden-windows-aarch64.exe.sha256)"
+          python3 - "$ver" "$h64" "$harm" <<'PY'
+          import json, sys
+          ver, h64, harm = sys.argv[1:4]
+          m = json.load(open("public-releases/innerwarden.json"))
+          m["version"] = ver
+          m["architecture"]["64bit"]["hash"] = h64
+          m["architecture"]["arm64"]["hash"] = harm
+          json.dump(m, open("dist/innerwarden.json", "w"), indent=2)
+          PY
+          echo "generated dist/innerwarden.json (version $ver)"
+
+      - name: Sign binaries with Ed25519 and stamp the pinned key
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "$RELEASE_SIGNING_KEY" ]; then
+            echo "::error::RELEASE_SIGNING_KEY is required to publish the rolling Community release."
+            exit 1
+          fi
+          echo "$RELEASE_SIGNING_KEY" > /tmp/sign-key.pem
+          chmod 600 /tmp/sign-key.pem
+          trap 'rm -f /tmp/sign-key.pem /tmp/sign-digest.bin' EXIT
+          for binary in dist/innerwarden-*; do
+            case "$binary" in
+              *.sha256|*.sig|*install.sh|*.pub|*.json) continue ;;
+            esac
+            echo "signing $(basename "$binary")..."
+            openssl dgst -sha256 -binary "$binary" > /tmp/sign-digest.bin
+            openssl pkeyutl -sign -inkey /tmp/sign-key.pem -rawin -in /tmp/sign-digest.bin \
+              | base64 -w 0 > "${binary}.sig"
+          done
+          rawb64="$(openssl pkey -in /tmp/sign-key.pem -pubout -outform DER | tail -c 32 | base64 | tr -d '\n')"
+          printf -- '-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEA%s\n-----END PUBLIC KEY-----\n' \
+            "$rawb64" > dist/innerwarden-release.pub
+          committed="$(sed -n 's|^IW_RELEASE_PUBKEY_B64="\${IW_GUARD_PUBKEY:-\([A-Za-z0-9+/=]*\)}".*|\1|p' dist/iw-guard-install.sh | head -1)"
+          if [ -n "$committed" ] && [ "$committed" != "$rawb64" ]; then
+            echo "::error::iw-guard-install.sh pins a public key that does not match the signing key."
+            exit 1
+          fi
+          sed -i "s|\${IW_GUARD_PUBKEY:-[A-Za-z0-9+/=]*}|\${IW_GUARD_PUBKEY:-$rawb64}|" dist/iw-guard-install.sh
+          grep -q "IW_GUARD_PUBKEY:-$rawb64}" dist/iw-guard-install.sh \
+            || { echo "::error::failed to stamp the pinned public key into the installer"; exit 1; }
+          ls dist/*.sig dist/*.pub
+
+      - name: Verify the asset manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected=(
+            innerwarden-linux-x86_64  innerwarden-linux-aarch64
+            innerwarden-macos-x86_64  innerwarden-macos-aarch64
+            innerwarden-windows-x86_64.exe  innerwarden-windows-aarch64.exe
+          )
+          missing=0
+          for name in "${expected[@]}"; do
+            [ -s "dist/$name" ]          || { echo "MISSING: $name"; missing=1; }
+            [ -s "dist/${name}.sha256" ] || { echo "MISSING: ${name}.sha256"; missing=1; }
+            [ -s "dist/${name}.sig" ]    || { echo "MISSING: ${name}.sig"; missing=1; }
+          done
+          [ -s dist/innerwarden-release.pub ] || { echo "MISSING: innerwarden-release.pub"; missing=1; }
+          [ -s dist/iw-guard-install.sh ]     || { echo "MISSING: iw-guard-install.sh"; missing=1; }
+          [ -s dist/install.ps1 ]             || { echo "MISSING: install.ps1"; missing=1; }
+          [ -s dist/innerwarden.json ]        || { echo "MISSING: innerwarden.json (scoop)"; missing=1; }
+          [ "$missing" -eq 0 ] || { echo "asset manifest verification failed."; exit 1; }
+          echo "All 6 binaries + sha256 + Ed25519 sigs + public key + installers + scoop manifest present."
+
+      - name: Publish rolling iw-guard release
+        uses: softprops/action-gh-release@v2
+        with:
+          repository: InnerWarden/innerwarden-releases
+          token: ${{ secrets.RELEASES_REPO_TOKEN }}
+          tag_name: iw-guard
+          name: InnerWarden Community (rolling)
+          body: |
+            InnerWarden Community: the free, cross-platform AI-agent guardrail.
+
+            ```sh
+            curl -fsSL https://innerwarden.com/free | sh
+            npm install -g innerwarden
+            ```
+
+            Every binary ships SHA-256 and Ed25519 sidecars; the installer verifies
+            both. Rolling release: always the freshest Linux/macOS/Windows
+            (x86_64 + aarch64) binary. Pin a cut with IW_GUARD_TAG=guard-vX.Y.Z.
+          prerelease: false
+          make_latest: false
+          files: dist/*
+          fail_on_unmatched_files: true
+
+      - name: Commit updated installer, manifest, and key back to the releases repo
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp dist/iw-guard-install.sh public-releases/iw-guard-install.sh
+          cp dist/install.ps1 public-releases/install.ps1
+          cp dist/innerwarden.json public-releases/innerwarden.json
+          cp dist/innerwarden-release.pub public-releases/innerwarden-release.pub
+          cd public-releases
+          git config user.name "innerwarden-release-bot"
+          git config user.email "release-bot@innerwarden.com"
+          git add iw-guard-install.sh install.ps1 innerwarden.json innerwarden-release.pub
+          if git diff --cached --quiet; then
+            echo "Distribution metadata already matches this build."
+          else
+            git commit -m "Update InnerWarden Community release metadata"
+            git push origin HEAD:main
+          fi
