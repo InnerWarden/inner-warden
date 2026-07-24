@@ -1,0 +1,48 @@
+{
+  "name": "innerwarden",
+  "version": "1.0.0",
+  "description": "InnerWarden Community: open-source guardrail for AI coding agents. Screens the shell commands and MCP/tool calls your agent runs and returns allow / review / deny, before it runs.",
+  "bin": {
+    "innerwarden": "bin/innerwarden.js",
+    "iw": "bin/innerwarden.js"
+  },
+  "files": [
+    "bin",
+    "README.md"
+  ],
+  "optionalDependencies": {
+    "@innerwarden/cli-linux-x64": "1.0.0",
+    "@innerwarden/cli-linux-arm64": "1.0.0",
+    "@innerwarden/cli-darwin-x64": "1.0.0",
+    "@innerwarden/cli-darwin-arm64": "1.0.0",
+    "@innerwarden/cli-win32-x64": "1.0.0",
+    "@innerwarden/cli-win32-arm64": "1.0.0"
+  },
+  "engines": {
+    "node": ">=16"
+  },
+  "license": "Apache-2.0",
+  "homepage": "https://innerwarden.com",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/InnerWarden/inner-warden.git",
+    "directory": "npm"
+  },
+  "bugs": {
+    "url": "https://github.com/InnerWarden/inner-warden/issues"
+  },
+  "keywords": [
+    "ai",
+    "ai-agent",
+    "agent",
+    "security",
+    "guardrail",
+    "llm",
+    "mcp",
+    "prompt-injection",
+    "claude-code",
+    "cursor",
+    "openclaw",
+    "codex"
+  ]
+}
