@@ -424,7 +424,7 @@ function ActiveDefenceCard() {
           </p>
         </div>
         <a
-          href="https://innerwarden.com/defend"
+          href="https://innerwarden.com/enterprise#enterprise-install"
           target="_blank"
           rel="noreferrer"
           className="inline-flex shrink-0 items-center justify-center rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-semibold text-slate-800 shadow-sm hover:border-slate-400 hover:bg-slate-50"
