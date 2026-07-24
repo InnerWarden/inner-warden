@@ -16,13 +16,20 @@ User-facing install docs (the page we send people) live at
 
 | Artifact | Built from | Published to | Config in this repo |
 | --- | --- | --- | --- |
-| Signed binaries (`innerwarden-<os>-<arch>` + `.sha256` + `.sig`) | the private `innerwarden` monorepo, `release-guard.yml` | rolling `iw-guard` release on `InnerWarden/innerwarden-releases` | n/a (upstream) |
+| Signed binaries (`innerwarden-<os>-<arch>` + `.sha256` + `.sig`) | **this repo**, crate `cli`, via `.github/workflows/release-guard.yml` | rolling `iw-guard` release on `InnerWarden/innerwarden-releases` | `.github/workflows/release-guard.yml` |
 | npm packages (7: `innerwarden` + 6 `@innerwarden/cli-<os>-<arch>`) | the binaries above | npmjs.com | `npm/` + `.github/workflows/npm-publish.yml` |
 | `.deb` / `.rpm` (amd64 + arm64) | the binaries above, via nfpm | attached to the `iw-guard` release | `packaging/` + `.github/workflows/linux-packages.yml` |
-| Shell installer (`curl \| sh`) | n/a | `innerwarden.com/free` -> installer script | `iw-guard-install.sh` (monorepo) |
+| Shell installer (`curl \| sh`), PowerShell installer, Scoop manifest, public key | n/a (hand-maintained) | `innerwarden.com/free` | **`InnerWarden/innerwarden-releases`** (the distribution repo, not here) |
 
 **Everything wraps the same signed binaries.** The binaries are the root of
 trust; npm, deb, rpm, Scoop, ubi/eget/mise all fetch or embed them.
+
+### Repo map (do not confuse these)
+
+- **`InnerWarden/inner-warden`** (this repo): Community source. Builds, signs, and releases the free binary. All Community work goes here.
+- **`InnerWarden/innerwarden-active-defence`**: the paid host stack (sensor, agent, exec-gate, eBPF).
+- **`InnerWarden/innerwarden-releases`**: distribution. Holds the rolling `iw-guard` release plus the installers, Scoop manifest, and `innerwarden-release.pub`.
+- **`InnerWarden/innerwarden`** (the old monorepo): **retired for Community** as of 2026-07-24. Its `release-guard.yml` is now a stub that fails on purpose, and its `RELEASE_SIGNING_KEY` is the old, rotated-out key. Do not build or release Community there.
 
 ---
 
@@ -115,6 +122,16 @@ Local one-off:
 - The `.deb`/`.rpm` ship a standard-format `<file>.sha256`.
 - npm ships a signed **provenance** attestation (verify with
   `npm audit signatures`, or see it on the package page).
+- **Key rotated 2026-07-24.** The previous private key was lost, so the signing
+  key was rotated. The current public key (raw 32 bytes, base64) is
+  `vR3bZQMGNQ7tfoKirl4mbBCE6DekmmEFADL5g984PC4=`, held as `RELEASE_SIGNING_KEY`
+  in this repo, pinned in the installer, and published as
+  `innerwarden-release.pub`. Binaries signed with the old key no longer verify.
+  If the key is ever rotated again: merge the new pin into the distribution repo
+  and run the release pipeline **back to back**. Between those two steps the
+  installer pins a key the published binaries were not signed with, so
+  verification fails and installs are blocked (fail-closed, which is correct, but
+  keep the window short).
 
 Verify a binary (needs OpenSSL >= 1.1.1; macOS: `brew install openssl@3`):
 
@@ -138,18 +155,24 @@ release host.
 
 When a new Community version ships:
 
-1. **Binaries**: cut them upstream: the `innerwarden` monorepo
-   `release-guard.yml` (`workflow_dispatch` or a `guard-v*` tag) rebuilds and
-   signs the per-arch binaries and updates the rolling `iw-guard` release on
-   `InnerWarden/innerwarden-releases`.
-2. **npm**: bump `npm/package.json` (main + the six optionalDependencies), then
-   run `npm-publish.yml` (or push `npm-v<version>`). Verify:
+0. **Version**: bump `version` under `[workspace.package]` in this repo's
+   `Cargo.toml`, run `cargo update -w`, and bump `npm/package.json` (the main
+   version **and** the six pinned `optionalDependencies`). The new version MUST
+   be higher than what npm already serves, or the release silently regresses
+   users. Merge that first.
+1. **Binaries**: run **this repo's** `release-guard.yml` (`workflow_dispatch` or
+   a `guard-v*` tag). It builds all six targets, signs them with
+   `RELEASE_SIGNING_KEY`, stamps the pinned public key into the installer, and
+   updates the rolling `iw-guard` release on `InnerWarden/innerwarden-releases`.
+2. **npm**: run `npm-publish.yml` (or push `npm-v<version>`). Verify:
    `npx innerwarden@<version> --version`.
 3. **.deb / .rpm**: run `linux-packages.yml`, download the artifact, and
-   `gh release upload iw-guard ... *.deb *.rpm *.sha256`.
-4. **Site doc**: if the `.deb`/`.rpm` filenames carry the version, update the
-   examples in `inner-warden-site` `client/src/content/docs/installation.md`.
-5. **Verify**: spot-check one binary signature and `npm audit signatures`.
+   `gh release upload iw-guard ... *.deb *.rpm *.sha256`. Delete the previous
+   version's package assets so the release holds one version.
+4. **Site doc**: update the versioned `.deb`/`.rpm` filenames in
+   `inner-warden-site` `client/src/content/docs/installation.md`.
+5. **Verify**: spot-check one binary signature, run the live installer once, and
+   `npm audit signatures`.
 
 ---
 
@@ -174,7 +197,11 @@ When a new Community version ships:
   `apt update` + auto-upgrade) is a future step; it can be hosted on GitHub with
   our own key, no third-party account.
 - **`cargo install innerwarden` / `cargo binstall`** activate once the crate is
-  published to crates.io (`[package.metadata.binstall]` mapping is already in the
-  monorepo's `guard-cli`).
+  published to crates.io.
+- **The release build needs bubblewrap.** The AI Jail tests require a real
+  `bwrap` binary and unprivileged user namespaces, and fail rather than silently
+  skip isolation, so `release-guard.yml` installs bubblewrap and relaxes the
+  Ubuntu 24.04 AppArmor userns restriction. Do not "fix" a jail-test failure by
+  skipping the test.
 - **Keep this file current.** If you add a channel, change a workflow, or change
   the signing scheme, update this doc in the same PR.
