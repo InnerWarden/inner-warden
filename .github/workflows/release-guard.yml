@@ -65,6 +65,19 @@ jobs:
         if: matrix.builder == 'zigbuild'
         run: command -v cargo-zigbuild >/dev/null 2>&1 || cargo install cargo-zigbuild --locked
 
+      # The AI Jail tests require a real bubblewrap binary and unprivileged user
+      # namespaces: they deliberately fail rather than silently skip isolation.
+      # Ubuntu 24.04 restricts unprivileged userns via AppArmor, which breaks
+      # bwrap's uid map, so allow it here.
+      - name: Install the Linux AI Jail backend
+        if: matrix.builder == 'zigbuild'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes bubblewrap
+          test "$(command -v bwrap)" = /usr/bin/bwrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
+
       - name: Test the Community crates
         if: matrix.builder == 'zigbuild'
         run: cargo test -p innerwarden -p innerwarden-agent-guard -p innerwarden-dashboard-kit -p innerwarden-graph -p innerwarden-notify
