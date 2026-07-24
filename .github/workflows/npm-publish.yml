@@ -1,0 +1,56 @@
+name: Publish to npm (OIDC)
+
+# Publishes the Community CLI to npm using GitHub OIDC trusted publishing.
+# No long-lived npm token and no 2FA bypass: authentication is short-lived and
+# scoped to this workflow, and each package gets a signed provenance
+# attestation linking it back to this repo and build.
+#
+# Prerequisite (one-time, on npmjs.com): configure a Trusted Publisher for the
+# `innerwarden` package and each `@innerwarden/cli-<os>-<arch>` package (or an
+# org-level trusted publisher for the @innerwarden scope), pointing at:
+#   repository:        InnerWarden/inner-warden
+#   workflow filename: npm-publish.yml
+#
+# Release flow: bump the version in npm/package.json, then either run this
+# workflow manually or push a tag matching `npm-v*`.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Pack and validate without publishing"
+        type: boolean
+        default: false
+  push:
+    tags:
+      - "npm-v*"
+
+concurrency:
+  group: npm-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # required for OIDC trusted publishing + provenance
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+
+      # OIDC trusted publishing and provenance need npm >= 11.5.1.
+      - name: Upgrade npm
+        run: npm install -g npm@latest && npm --version
+
+      - name: Assemble platform packages
+        run: node npm/scripts/build.mjs
+
+      - name: Publish
+        env:
+          NPM_PROVENANCE: "1"
+        run: node npm/scripts/publish.mjs ${{ (github.event_name == 'workflow_dispatch' && inputs.dry_run) && '--dry-run' || '' }}

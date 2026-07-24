@@ -24,6 +24,9 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const OUT = join(ROOT, "platforms");
 const DRY = process.argv.includes("--dry-run");
 const OTP = process.env.NPM_OTP || "";
+// In CI with OIDC trusted publishing, set NPM_PROVENANCE=1 to attach a signed
+// provenance attestation linking each package to this repo and build.
+const PROVENANCE = process.env.NPM_PROVENANCE === "1";
 
 if (!existsSync(OUT)) {
   process.stderr.write("platforms/ not found. Run `node scripts/build.mjs` first.\n");
@@ -33,6 +36,7 @@ if (!existsSync(OUT)) {
 function publish(dir, extraArgs) {
   const args = ["publish", ...extraArgs];
   if (OTP) args.push(`--otp=${OTP}`);
+  if (PROVENANCE) args.push("--provenance");
   if (DRY) args.push("--dry-run");
   const shown = args.map((a) => (a.startsWith("--otp=") ? "--otp=******" : a));
   process.stdout.write(`\n$ npm ${shown.join(" ")}   (cwd ${dir})\n`);

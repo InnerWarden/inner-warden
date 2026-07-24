@@ -51,8 +51,14 @@ innerwarden --help
 
 ## Maintainer notes
 
+Releases publish from CI via GitHub OIDC trusted publishing (no npm token, no
+2FA bypass, signed provenance). Bump the version in `package.json`, then run the
+`Publish to npm (OIDC)` workflow or push a `npm-v*` tag.
+
+Local build / manual publish (requires npm 2FA at publish time):
+
 ```sh
 node scripts/build.mjs      # download binaries, assemble npm/platforms/*
 node scripts/publish.mjs --dry-run
-npm login && node scripts/publish.mjs
+node scripts/publish.mjs    # npm will prompt for your authenticator code
 ```
