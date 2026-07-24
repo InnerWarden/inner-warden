@@ -163,6 +163,12 @@ When a new Community version ships:
   `--otp`; OIDC avoids the problem entirely. The very first publish (before OIDC
   could be configured, since npm needs a package to exist before you can add a
   Trusted Publisher) was done interactively via npm's browser session auth.
+- **Transient E404 on the unscoped main package.** During an OIDC publish the six
+  scoped `@innerwarden/cli-*` packages can succeed while the unscoped
+  `innerwarden` package returns `E404 Not Found - PUT .../innerwarden` (the
+  provenance statement is even published first). It is intermittent: just re-run
+  the workflow. The publish script is idempotent, so the already-published scoped
+  packages are skipped and only the main package is retried.
 - **No apt/yum repo yet.** Users install the `.deb`/`.rpm` **file** (`apt install
   ./file.deb`), not `apt install innerwarden`. A hosted, signed repo (for
   `apt update` + auto-upgrade) is a future step; it can be hosted on GitHub with
