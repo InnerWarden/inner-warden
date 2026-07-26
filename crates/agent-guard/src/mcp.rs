@@ -739,8 +739,19 @@ pub fn analyze_command_with(
         "allow"
     };
 
+    // Say what was actually established, not what a reader will assume.
+    //
+    // "no dangerous patterns detected" reads as "we checked and it is safe". It
+    // means only "no rule matched", and it was returned verbatim for `ufw disable`,
+    // `systemctl disable --now innerwarden-sensor` and
+    // `echo 'hax:x:0:0::/root:/bin/bash' >> /etc/passwd`, all scored 0. A caller
+    // could not distinguish a considered pass from an uncovered command — and that
+    // sentence is the one that gets quoted back in a post-incident review.
+    //
+    // Rule coverage is finite by construction. Claiming safety from its silence is
+    // the one thing a guardrail must not do.
     let explanation = if signals.is_empty() {
-        "no dangerous patterns detected".to_string()
+        "no rule matched (absence of a match is not a safety judgement)".to_string()
     } else {
         signals
             .iter()
