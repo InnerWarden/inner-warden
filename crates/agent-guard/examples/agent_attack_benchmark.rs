@@ -53,6 +53,24 @@ fn main() {
          not assert that every installed agent adapter can observe prompts. The \
          score is a regression result for these cases, not adapter coverage.\n"
     );
+    let _ = writeln!(
+        md,
+        "Read **blocked for an agent** as the enforcement number, not the catch rate. \
+         Catch counts `review` as caught, which answers \"was it surfaced\" and cannot \
+         answer \"was it stopped\": a change that moved 54 cases from hard-deny to \
+         review left catch at 100% while enforcement halved. Hard-deny is reported \
+         separately and is expected to be BELOW the catch rate, because an unreviewed \
+         fetch-and-execute over TLS from a named host is not distinguishable from a \
+         vendor install line by its shape, and is enforced by policy rather than by \
+         pretending the engine can tell them apart.\n"
+    );
+    let _ = writeln!(
+        md,
+        "The benign control set includes documented vendor install one-liners \
+         (`benign_install`). It previously held none, so the false-positive rate was \
+         computed over a set that excluded the shape the rules were most aggressive \
+         about; a rule denying every install line on earth scored 0%.\n"
+    );
 
     let _ = writeln!(md, "## Headline\n");
     let _ = writeln!(md, "| Metric | Value |");
@@ -66,7 +84,14 @@ fn main() {
     );
     let _ = writeln!(
         md,
-        "| Malicious hard-denied | {}/{} = {:.1}% |",
+        "| Malicious blocked for an agent (default policy) | **{}/{} = {:.1}%** |",
+        board.agent_blocked,
+        board.malicious_total,
+        board.agent_block_rate()
+    );
+    let _ = writeln!(
+        md,
+        "| Malicious hard-denied by score alone | {}/{} = {:.1}% |",
         board.denied,
         board.malicious_total,
         board.deny_rate()
@@ -180,8 +205,9 @@ fn main() {
     // Also print the headline to stdout.
     println!("=== Agent-Guard Proof Baseline ===");
     println!(
-        "catch (deny|review): {}/{} = {:.1}%   hard-deny: {}/{} = {:.1}%   miss: {}   FP: {}/{} = {:.1}%",
+        "catch (deny|review): {}/{} = {:.1}%   agent-blocked: {}/{} = {:.1}%   hard-deny: {}/{} = {:.1}%   miss: {}   FP: {}/{} = {:.1}%",
         board.caught, board.malicious_total, board.catch_rate(),
+        board.agent_blocked, board.malicious_total, board.agent_block_rate(),
         board.denied, board.malicious_total, board.deny_rate(),
         board.missed,
         board.false_positives, board.benign_total, board.false_positive_rate()

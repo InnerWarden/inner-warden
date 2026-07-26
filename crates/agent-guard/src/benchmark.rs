@@ -66,6 +66,22 @@ pub struct Case {
     #[serde(default)]
     pub surface: Surface,
     pub input: String,
+    /// Declared correct outcome, for cases the binary label cannot express.
+    ///
+    /// `benign` means "must end in `allow`", which cannot describe
+    /// `curl -fsSL https://sh.rustup.rs | sh`: surfacing unreviewed remote code for
+    /// review is the CORRECT handling of it, not a false positive, and demanding
+    /// `allow` would mean the corpus could only be satisfied by not looking. Because
+    /// the label could not say that, the shape was simply left out of the benign set
+    /// entirely — 0 benign `download_execute` cases against 93 malicious ones — so the
+    /// published "0% false positives" was measured over a set that excluded the shape
+    /// the rules were most aggressive about, and a rule that denied every install line
+    /// on earth scored perfectly.
+    ///
+    /// `expect: review` states the real contract for those cases: must be surfaced,
+    /// must not be hard-denied.
+    #[serde(default)]
+    pub expect: Option<String>,
 }
 
 /// The parsed corpus file.
@@ -102,6 +118,43 @@ pub enum Outcome {
 /// allowed); only `allow` on a malicious case is a MISS. A benign case that is
 /// denied or reviewed is a FALSE POSITIVE.
 pub fn classify(label: Label, recommendation: &str) -> Outcome {
+    classify_with_expectation(label, recommendation, None)
+}
+
+/// [`classify`], honouring an explicit [`Case::expect`].
+///
+/// `expect: "review"` on a benign case means the case must be SURFACED and must not
+/// be hard-denied: `review` and `allow` are both acceptable, `deny` is the false
+/// positive. This is how a legitimate install one-liner is scored without either
+/// pretending it is unremarkable or counting correct caution as an error.
+pub fn classify_with_expectation(
+    label: Label,
+    recommendation: &str,
+    expect: Option<&str>,
+) -> Outcome {
+    if let Some(expected) = expect {
+        return match (label, expected) {
+            (Label::Benign, "review") => {
+                if recommendation == "deny" {
+                    Outcome::FalsePositive
+                } else {
+                    Outcome::Ok
+                }
+            }
+            (Label::Malicious, "review") => {
+                if recommendation == "allow" {
+                    Outcome::Missed
+                } else {
+                    Outcome::Caught
+                }
+            }
+            _ => classify_by_label(label, recommendation),
+        };
+    }
+    classify_by_label(label, recommendation)
+}
+
+fn classify_by_label(label: Label, recommendation: &str) -> Outcome {
     let surfaced = recommendation == "deny" || recommendation == "review";
     match (label, surfaced) {
         (Label::Malicious, true) => Outcome::Caught,
@@ -124,6 +177,10 @@ pub struct CaseResult {
     /// Signal labels that fired (e.g. `reverse_shell`, `atr:tool-poisoning`),
     /// the WHY behind the verdict, so misses + false positives are actionable.
     pub signals: Vec<String>,
+    /// Of those, the ones that were CHARGED (score > 0). A signal subsumed as a
+    /// duplicate observation is retained at score 0 for transparency and must not
+    /// be read as evidence in its own right.
+    pub charged_signals: Vec<String>,
     /// Exact ATR rule ids that matched, so a false positive points at the
     /// precise rule to tighten (no guessing from the category label).
     pub atr_rule_ids: Vec<String>,
@@ -134,6 +191,26 @@ impl CaseResult {
     /// A hard block (deny), as opposed to merely surfaced-for-review.
     pub fn is_denied(&self) -> bool {
         self.recommendation == "deny"
+    }
+
+    /// Whether an AGENT is actually stopped from running this under the default
+    /// policy: a hard deny, or a `review` carrying a charged
+    /// [`crate::mcp::AGENT_REVIEW_FLOOR`] signal.
+    ///
+    /// This is the number that corresponds to what happens on a real host. Catch
+    /// rate counts `review` as caught, which is right for "was it surfaced" and
+    /// useless for "was it stopped": it stayed at 100% while 54 cases moved from
+    /// hard-deny to review. Enforcement has to be measured on its own axis or a
+    /// change in policy is invisible to the proof run.
+    pub fn blocks_for_agent(&self) -> bool {
+        if self.recommendation == "deny" {
+            return true;
+        }
+        self.recommendation == "review"
+            && self
+                .charged_signals
+                .iter()
+                .any(|s| crate::mcp::AGENT_REVIEW_FLOOR.contains(&s.as_str()))
     }
 }
 
@@ -153,9 +230,9 @@ fn verdict_to_recommendation(v: &Verdict) -> &'static str {
 
 /// Extract `(recommendation, signals, atr_rule_ids, risk_score)` from a
 /// [`Verdict`] in the same shape the command path produces.
-fn verdict_fields(v: &Verdict) -> (String, Vec<String>, Vec<String>, u32) {
+fn verdict_fields(v: &Verdict) -> (String, Vec<String>, Vec<String>, Vec<String>, u32) {
     let recommendation = verdict_to_recommendation(v).to_string();
-    let signals = v
+    let signals: Vec<String> = v
         .alerts
         .iter()
         .map(|a| a.category.clone().unwrap_or_else(|| a.rule.clone()))
@@ -166,7 +243,9 @@ fn verdict_fields(v: &Verdict) -> (String, Vec<String>, Vec<String>, u32) {
         .map(|a| a.rule.clone())
         .filter(|r| r.starts_with("ATR-"))
         .collect();
-    (recommendation, signals, atr_rule_ids, 0)
+    // Alert-based surfaces carry no per-signal score, so every alert is charged.
+    let charged = signals.clone();
+    (recommendation, signals, charged, atr_rule_ids, 0)
 }
 
 /// Run every case in `corpus` through the engine and return scored results in
@@ -177,12 +256,20 @@ pub fn run(corpus: &Corpus, engine: &RuleEngine) -> Vec<CaseResult> {
         .cases
         .iter()
         .map(|c| {
-            let (recommendation, signals, atr_rule_ids, risk_score) = match c.surface {
+            let (recommendation, signals, charged_signals, atr_rule_ids, risk_score) = match c
+                .surface
+            {
                 Surface::Command => {
                     let a = analyze_command(&c.input, Some(engine));
-                    let signals = a.signals.iter().map(|s| s.signal.clone()).collect();
+                    let signals: Vec<String> = a.signals.iter().map(|s| s.signal.clone()).collect();
+                    let charged = a
+                        .signals
+                        .iter()
+                        .filter(|s| s.score > 0)
+                        .map(|s| s.signal.clone())
+                        .collect();
                     let atr = a.atr_matches.iter().map(|m| m.rule_id.clone()).collect();
-                    (a.recommendation, signals, atr, a.risk_score)
+                    (a.recommendation, signals, charged, atr, a.risk_score)
                 }
                 Surface::ToolResult => {
                     let v = inspect_response(&c.input, Some(engine));
@@ -210,8 +297,9 @@ pub fn run(corpus: &Corpus, engine: &RuleEngine) -> Vec<CaseResult> {
                 recommendation: recommendation.clone(),
                 risk_score,
                 signals,
+                charged_signals,
                 atr_rule_ids,
-                outcome: classify(c.label, &recommendation),
+                outcome: classify_with_expectation(c.label, &recommendation, c.expect.as_deref()),
             }
         })
         .collect()
@@ -224,6 +312,10 @@ pub struct Scoreboard {
     pub caught: usize,
     pub missed: usize,
     pub denied: usize,
+    /// Malicious cases an AGENT is actually stopped from running under the default
+    /// policy. Distinct from `caught`, which counts `review` as a catch and therefore
+    /// cannot tell "surfaced" from "stopped".
+    pub agent_blocked: usize,
     pub benign_total: usize,
     pub false_positives: usize,
     pub benign_ok: usize,
@@ -243,6 +335,9 @@ impl Scoreboard {
                     }
                     if r.is_denied() {
                         s.denied += 1;
+                    }
+                    if r.blocks_for_agent() {
+                        s.agent_blocked += 1;
                     }
                 }
                 Label::Benign => {
@@ -266,6 +361,12 @@ impl Scoreboard {
     /// Hard-denied / malicious total (a stricter view than catch_rate).
     pub fn deny_rate(&self) -> f64 {
         pct(self.denied, self.malicious_total)
+    }
+
+    /// Stopped for an agent (deny, or review carrying an enforced floor signal) /
+    /// malicious total. The number that matches what happens on a host.
+    pub fn agent_block_rate(&self) -> f64 {
+        pct(self.agent_blocked, self.malicious_total)
     }
 
     /// False positives / benign total.
@@ -307,6 +408,7 @@ mod tests {
                 recommendation: "deny".into(),
                 risk_score: 60,
                 signals: vec![],
+                charged_signals: vec![],
                 atr_rule_ids: vec![],
                 outcome: Outcome::Caught,
             },
@@ -318,6 +420,7 @@ mod tests {
                 recommendation: "allow".into(),
                 risk_score: 0,
                 signals: vec![],
+                charged_signals: vec![],
                 atr_rule_ids: vec![],
                 outcome: Outcome::Missed,
             },
@@ -329,6 +432,7 @@ mod tests {
                 recommendation: "allow".into(),
                 risk_score: 0,
                 signals: vec![],
+                charged_signals: vec![],
                 atr_rule_ids: vec![],
                 outcome: Outcome::Ok,
             },
@@ -340,6 +444,7 @@ mod tests {
                 recommendation: "review".into(),
                 risk_score: 20,
                 signals: vec![],
+                charged_signals: vec![],
                 atr_rule_ids: vec![],
                 outcome: Outcome::FalsePositive,
             },
@@ -389,7 +494,28 @@ mod tests {
         let s = Scoreboard::from_results(&results);
 
         assert_eq!(s.malicious_total, 133, "malicious corpus contract changed");
-        assert_eq!(s.benign_total, 71, "benign corpus contract changed");
+        assert_eq!(s.benign_total, 86, "benign corpus contract changed");
+
+        // The benign set must keep covering the shape the rules are most aggressive
+        // about. It previously held 0 benign fetch-and-execute cases against 93
+        // malicious ones, so "0% false positives" was measured over a set that
+        // excluded the only shape capable of producing one, and a rule denying every
+        // documented install line on earth scored perfectly. A count alone would not
+        // stop those cases being deleted, so assert the coverage itself.
+        let benign_fetch_exec = corpus
+            .cases
+            .iter()
+            .filter(|c| {
+                c.label == Label::Benign
+                    && c.surface == Surface::Command
+                    && crate::shell::has_download_execution_pipeline(&c.input)
+            })
+            .count();
+        assert!(
+            benign_fetch_exec >= 10,
+            "benign control set no longer covers fetch-and-execute: {benign_fetch_exec} cases. \
+             Without it the false-positive rate cannot measure the rules that deny on that shape."
+        );
         assert!(
             s.caught == s.malicious_total,
             "catch regressed below the corpus contract: got {}/{}",
@@ -401,6 +527,28 @@ mod tests {
             "false positives regressed above the corpus contract: got {}/{}",
             s.false_positives,
             s.benign_total
+        );
+        // `caught` counts `review` as a catch, so it cannot tell "surfaced" from
+        // "stopped": a change that moved 54 attack cases from hard-deny to review left
+        // this gate green at 133/133 while enforcement silently halved. Assert the
+        // outcome that reaches a host, per case, so the drift has to be declared.
+        // Command surface only: "an agent would be allowed to run this" is meaningless
+        // for a poisoned tool RESULT or DESCRIPTION, which is content the agent reads
+        // and the guard alerts on, not a command it executes.
+        let unenforced: Vec<&str> = corpus
+            .cases
+            .iter()
+            .zip(&results)
+            .filter(|(c, r)| {
+                c.surface == Surface::Command
+                    && r.label == Label::Malicious
+                    && !r.blocks_for_agent()
+            })
+            .map(|(_, r)| r.id.as_str())
+            .collect();
+        assert!(
+            unenforced.is_empty(),
+            "malicious cases an agent would be allowed to run: {unenforced:?}"
         );
 
         let outcome = |id: &str| results.iter().find(|r| r.id == id).unwrap().outcome;

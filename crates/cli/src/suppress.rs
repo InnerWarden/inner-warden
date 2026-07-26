@@ -139,9 +139,21 @@ pub fn apply(command: &str, verdict: &Value, cfg: &SuppressConfig) -> Option<Val
         .and_then(|s| s.as_array())
         .cloned()
         .unwrap_or_default();
+    // A signal subsumed as a duplicate observation is scored 0 and is retained only
+    // as corroborating context. Treating it as a base signal in its own right would
+    // let a zeroed duplicate keep a verdict alive that its charged counterpart no
+    // longer supports, so only charged signals count here.
     let has_base_signal = signals.iter().any(|s| {
         let name = s.get("signal").and_then(|n| n.as_str()).unwrap_or("");
-        !name.starts_with("atr:")
+        // An ABSENT score is charged: only an explicit 0 marks a subsumed duplicate.
+        // Defaulting a missing field to 0 would read "we did not say" as "it counted
+        // for nothing", which is the wrong direction for a control that decides
+        // whether a block survives.
+        let charged = match s.get("score").and_then(|n| n.as_u64()) {
+            Some(score) => score > 0,
+            None => true,
+        };
+        charged && !name.starts_with("atr:")
     });
 
     if all_atr_muted && !has_base_signal {
