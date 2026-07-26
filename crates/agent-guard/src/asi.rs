@@ -132,6 +132,12 @@ pub fn signal_to_asi(signal: &str) -> Option<&'static str> {
         | "download_chmod_execute"
         | "dynamic_code_execution"
         | "tmp_execution"
+        // The aggravating factors that turn a fetch-and-execute from a shape into a
+        // verdict evidence the same class as the shape they qualify.
+        | "fetch_exec_no_tls"
+        | "fetch_exec_ephemeral_host"
+        | "fetch_exec_shortened_source"
+        | "fetch_exec_decoder"
         | "reverse_shell" => "ASI05",
         // ASI02 Tool Misuse & Exploitation, the shell tool driven to a
         // dangerous call.
