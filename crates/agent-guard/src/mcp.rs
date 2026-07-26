@@ -510,6 +510,18 @@ pub fn analyze_command_with(
         score += s;
     }
 
+    // Dual-use: fetching from a numeric address rather than a hostname. Scored to
+    // `review`, not `deny` — suspicious rather than conclusive. A staging download
+    // from an attacker IP previously scored identically to a loopback health check.
+    if let Some((indicator, s)) = threats::check_bare_ip_fetch(scan_cmd) {
+        signals.push(AnalysisSignal {
+            signal: "bare_ip_fetch".into(),
+            score: s,
+            detail: indicator.to_string(),
+        });
+        score += s;
+    }
+
     // Download-and-execute via pipe (score 40).
     if let Some(s) = threats::check_download_execute_pipe(scan_cmd) {
         signals.push(AnalysisSignal {
