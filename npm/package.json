@@ -1,6 +1,6 @@
 {
   "name": "innerwarden",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "InnerWarden Community: open-source guardrail for AI coding agents. Screens the shell commands and MCP/tool calls your agent runs and returns allow / review / deny, before it runs.",
   "bin": {
     "innerwarden": "bin/innerwarden.js",
