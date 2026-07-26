@@ -11,6 +11,13 @@ use std::ops::Range;
 const MAX_AST_DEPTH: usize = 64;
 const MAX_AST_NODES: usize = 16_384;
 
+/// The node budget, so a test can derive an input that genuinely exhausts it rather
+/// than hard-coding a repeat count that silently drifts under the limit.
+#[cfg(test)]
+pub(crate) fn max_ast_nodes() -> usize {
+    MAX_AST_NODES
+}
+
 pub(crate) struct ShellProjection {
     pub(crate) scan: String,
     pub(crate) parsed: bool,
@@ -4655,12 +4662,29 @@ mod tests {
                 has_executable_data_flow(command),
                 "download-to-execution flow was missed: {command}"
             );
+            // Correlation is the subject, not the threshold. These fetch over TLS from
+            // a named host, which is `review` by design; the contract is that the
+            // correlated flow stays surfaced and enforceable rather than degrading to
+            // `allow`. Aggravated variants are asserted to hard-deny in
+            // `mcp::tests::structural_projection_keeps_executable_attack_paths_visible`.
             let analysis = crate::mcp::analyze_command(command, None);
-            assert_eq!(
-                analysis.recommendation, "deny",
-                "download-to-execution must deny: {command}: {}",
+            assert_ne!(
+                analysis.recommendation, "allow",
+                "download-to-execution must be surfaced: {command}: {}",
                 analysis.explanation
             );
+            if analysis.recommendation != "deny" {
+                assert!(
+                    analysis.signals.iter().any(|s| s.score > 0
+                        && matches!(
+                            s.signal.as_str(),
+                            "download_and_execute" | "download_chmod_execute"
+                        )),
+                    "download-to-execution is not denied and carries no agent-floor signal: \
+                     {command}: {}",
+                    analysis.explanation
+                );
+            }
         }
     }
 
@@ -4698,10 +4722,25 @@ mod tests {
                 has_executable_data_flow(reachable),
                 "reachable short-circuit branch must remain covered: {reachable}"
             );
-            assert_eq!(
-                crate::mcp::analyze_command(reachable, None).recommendation,
-                "deny",
-                "reachable branch must deny: {reachable}"
+            // The subject here is reachability, not the threshold. These fetch from a
+            // named host over TLS with no aggravating factor, so the verdict is
+            // `review` by design (see `threats::check_download_execute_pipe`); what
+            // this test must hold is that the reachable branch is still analysed and
+            // still carries the signal the agent hook's floor enforces on.
+            let analysis = crate::mcp::analyze_command(reachable, None);
+            assert_ne!(
+                analysis.recommendation, "allow",
+                "reachable branch must be surfaced: {reachable}: {}",
+                analysis.explanation
+            );
+            assert!(
+                analysis.signals.iter().any(|s| s.score > 0
+                    && matches!(
+                        s.signal.as_str(),
+                        "download_and_execute" | "download_chmod_execute"
+                    )),
+                "reachable branch lost its enforceable signal: {reachable}: {}",
+                analysis.explanation
             );
         }
     }

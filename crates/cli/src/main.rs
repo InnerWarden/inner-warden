@@ -232,13 +232,41 @@ fn hook_verdict(payload: &str) -> Option<(String, serde_json::Value)> {
 }
 
 /// Whether a verdict must block per Claude Code's hook contract: `deny` always,
-/// `review` too when `--block-review`. Pure/tested.
+/// `review` when `--block-review` or when the verdict carries a floor observation
+/// (`innerwarden_agent_guard::mcp::AGENT_REVIEW_FLOOR`, which the proof benchmark
+/// measures against so this policy cannot drift unmeasured). Pure/tested.
 fn hook_blocks(verdict: &serde_json::Value, block_review: bool) -> bool {
     let rec = verdict
         .get("recommendation")
         .and_then(|r| r.as_str())
         .unwrap_or("allow");
-    rec == "deny" || (block_review && rec == "review")
+    if rec == "deny" {
+        return true;
+    }
+    if rec != "review" {
+        return false;
+    }
+    if block_review {
+        return true;
+    }
+    // A signal that was subsumed as a duplicate observation is scored 0 and must
+    // not raise the floor on its own; the charged one is what fired.
+    verdict
+        .get("signals")
+        .and_then(|s| s.as_array())
+        .is_some_and(|signals| {
+            signals.iter().any(|s| {
+                let name = s.get("signal").and_then(|n| n.as_str()).unwrap_or("");
+                // Absent score = charged; only an explicit 0 marks a subsumed
+                // duplicate. Failing the other way would drop the floor whenever a
+                // producer omitted the field.
+                let charged = match s.get("score").and_then(|n| n.as_u64()) {
+                    Some(score) => score > 0,
+                    None => true,
+                };
+                charged && innerwarden_agent_guard::mcp::AGENT_REVIEW_FLOOR.contains(&name)
+            })
+        })
 }
 
 fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
@@ -290,6 +318,18 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
             .and_then(|e| e.as_str())
             .unwrap_or("");
         eprintln!("InnerWarden blocked this command (recommendation={rec}): {expl}");
+        // Say how to proceed. A block with no stated remedy leaves the operator one
+        // obvious move, which is to remove the guard, and that is the outcome this
+        // control exists to avoid. The remedy is deliberately a decision the PERSON
+        // makes, in their own shell, and never something the agent can grant itself.
+        eprintln!(
+            "  To authorise it deliberately: innerwarden allow '{}'",
+            command.replace('\'', "'\\''")
+        );
+        eprintln!(
+            "  Screening covers this agent's tool calls, not your own shell; running \
+             the command yourself is not blocked."
+        );
         std::process::ExitCode::from(2)
     } else {
         std::process::ExitCode::SUCCESS
@@ -1055,6 +1095,49 @@ mod tests {
         );
         let allow = serde_json::json!({"recommendation": "allow"});
         assert!(!hook_blocks(&allow, true));
+    }
+
+    /// A `review` carrying a floor observation blocks under the DEFAULT policy.
+    ///
+    /// The engine scores an unreviewed fetch-and-execute as `review`, because the
+    /// shape cannot tell `curl -fsSL https://sh.rustup.rs | sh` from the same line
+    /// pointed at an attacker. Without this floor, honest uncertainty would have read
+    /// as permission for every agent running the default install.
+    #[test]
+    fn hook_blocks_enforces_the_agent_floor_at_review() {
+        let floored = serde_json::json!({
+            "recommendation": "review",
+            "signals": [{"signal": "download_and_execute", "score": 25}],
+        });
+        assert!(
+            hook_blocks(&floored, false),
+            "an unreviewed fetch-and-execute must not reach an agent's shell by default"
+        );
+
+        // A subsumed duplicate is scored 0 and is not evidence on its own.
+        let subsumed_only = serde_json::json!({
+            "recommendation": "review",
+            "signals": [{"signal": "download_and_execute", "score": 0}],
+        });
+        assert!(
+            !hook_blocks(&subsumed_only, false),
+            "a zeroed duplicate must not raise the floor"
+        );
+
+        // An ABSENT score is charged: "we did not say" is not "it counted for nothing".
+        let no_score = serde_json::json!({
+            "recommendation": "review",
+            "signals": [{"signal": "download_chmod_execute"}],
+        });
+        assert!(hook_blocks(&no_score, false));
+
+        // Any other review is still advisory by default.
+        let other = serde_json::json!({
+            "recommendation": "review",
+            "signals": [{"signal": "bare_ip_fetch", "score": 25}],
+        });
+        assert!(!hook_blocks(&other, false));
+        assert!(hook_blocks(&other, true), "--block-review still blocks it");
     }
 
     #[test]
