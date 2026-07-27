@@ -614,6 +614,46 @@ pub fn normalize_command(cmd: &str) -> String {
     s
 }
 
+/// Collapse the shell no-op rewrites that break a matcher's literal, WITHOUT the
+/// command-substitution unwrapping that [`normalize_command`] also does.
+///
+/// This is the subset safe to apply to an already-projected command string: empty
+/// quotes (`uf''w`), backslash escapes (`n\c`), `${IFS}`/`$IFS` word-splitting, and
+/// zero-width characters. It deliberately does NOT unwrap `$(...)`/backticks/`${x:-…}`
+/// — the shell projection already handles substitution structurally, and unwrapping
+/// it a second time destroys the structure the download-and-execute / data-flow
+/// checks rely on. Applied at the projection layer so every deny-class check scans
+/// text an attacker cannot defeat by inserting no-op syntax, while the
+/// substitution-aware checks keep the structure they need.
+pub fn strip_shell_noops(cmd: &str) -> String {
+    static BACKSLASH: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let backslash =
+        BACKSLASH.get_or_init(|| regex::Regex::new(r"\\([A-Za-z0-9])").expect("static backslash"));
+    // No length cap here (unlike normalize_command): every operation is linear in
+    // the input and there is no superlinear substitution unwrapping, so a big input
+    // is cheap. Truncating would DROP the tail of a long command, letting an attacker
+    // hide the dangerous part behind 8 KB of padding.
+    let mut s: String = cmd
+        .chars()
+        .filter(|c| {
+            !matches!(
+                *c,
+                '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{2060}' | '\u{FEFF}' | '\u{00AD}'
+            )
+        })
+        .collect();
+    for _ in 0..5 {
+        let before = s.clone();
+        s = s.replace("${IFS}", " ").replace("$IFS", " ");
+        s = s.replace("''", "").replace("\"\"", "");
+        s = backslash.replace_all(&s, "$1").into_owned();
+        if s == before {
+            break;
+        }
+    }
+    s
+}
+
 /// Check for dangerous commands. Returns description and whether to block.
 /// Matches BOTH the raw command and its shell-normalized form (see
 /// [`normalize_command`]) so GuardFall shell-rewrite obfuscation is caught, not

