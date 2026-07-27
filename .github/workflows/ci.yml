@@ -50,3 +50,26 @@ jobs:
       - name: Test
         if: runner.os != 'Windows'
         run: cargo test --workspace
+
+      # The wrapper must ask for the platform packages it ships with.
+      #
+      # These pins were hand-maintained and drifted to 1.0.3 while the wrapper was
+      # published as 1.0.4 and then 1.0.5, so `npm i -g innerwarden` resolved the new
+      # version and installed the old binary. Two releases of guard fixes reached
+      # nobody, and the registry dist-tag reported success both times.
+      - name: npm optionalDependencies match the package version
+        if: runner.os == 'Linux'
+        run: |
+          node -e '
+            const p = require("./npm/package.json");
+            const bad = Object.entries(p.optionalDependencies || {})
+              .filter(([, v]) => v !== p.version);
+            if (bad.length) {
+              console.error(
+                "npm/package.json is " + p.version + " but pins " +
+                bad.map(([n, v]) => n + "@" + v).join(", ")
+              );
+              process.exit(1);
+            }
+            console.log("optionalDependencies all pinned to " + p.version);
+          '
