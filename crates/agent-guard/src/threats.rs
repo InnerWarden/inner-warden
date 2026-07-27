@@ -917,11 +917,57 @@ pub fn destructive_rm_root(hay: &str) -> bool {
         .any(segment_is_root_wipe)
 }
 
+/// A byte that continues a path token. A sensitive pattern flanked by these is a
+/// substring of a larger word, not the path itself: `.keys()` contains `.key`,
+/// `.environment` contains `.env`, `grid_rsa` contains `id_rsa`.
+fn is_path_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Boundary-aware search for one sensitive pattern in `hay`.
+///
+/// A plain `contains` fired `.key` inside `d.keys()`, `.env` inside
+/// `.environment` and `id_rsa` inside `grid_rsa`, so screening a shell command
+/// that merely mentioned one of those words as code was denied as a credential
+/// read. The matcher below closes that without weakening real coverage:
+///
+/// - Directory / absolute forms (`.ssh/`, `/etc/shadow`) carry their own anchor
+///   (the slash) and keep the substring match.
+/// - Extension forms (`.pem`, `.key`, `.env`) start with a dot, which already
+///   separates them from a filename stem (`foo.key` is a key file), so only the
+///   TRAILING side is checked: the match must not be followed by a word byte.
+///   `foo.key` and `.env.local` match; `.keys()` and `.environment` do not.
+/// - Bare filenames (`id_rsa`) must be a whole token on BOTH sides.
+fn sensitive_pattern_in(hay: &str, pat: &str) -> bool {
+    if pat.contains('/') {
+        return hay.contains(pat);
+    }
+    let hb = hay.as_bytes();
+    let dot_anchored = pat.starts_with('.');
+    let mut from = 0;
+    while let Some(rel) = hay[from..].find(pat) {
+        let start = from + rel;
+        let end = start + pat.len();
+        let after_ok = end >= hb.len() || !is_path_word_byte(hb[end]);
+        let before_ok = dot_anchored || start == 0 || !is_path_word_byte(hb[start - 1]);
+        if after_ok && before_ok {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
+}
+
 /// Check for sensitive file access. Matches both the raw command and its
 /// de-obfuscated form (zero-width / empty-quote / backslash breaking of a path
 /// literal like `.ss\h/id_rsa` or `.gnu<ZWSP>pg/`), via [`normalize_command`].
 pub fn check_sensitive_path(content: &str) -> Option<&'static str> {
-    let hit = |hay: &str| SENSITIVE_PATHS.iter().find(|p| hay.contains(*p)).copied();
+    let hit = |hay: &str| {
+        SENSITIVE_PATHS
+            .iter()
+            .copied()
+            .find(|p| sensitive_pattern_in(hay, p))
+    };
     hit(content).or_else(|| {
         let n = normalize_command(content);
         if n != content {
@@ -4002,6 +4048,56 @@ mod tests {
     fn detects_sensitive_paths() {
         assert!(check_sensitive_path("/home/user/.ssh/id_rsa").is_some());
         assert!(check_sensitive_path("/tmp/output.txt").is_none());
+    }
+
+    #[test]
+    fn sensitive_extensions_match_the_path_not_a_word_containing_it() {
+        // A sensitive extension is a substring of many ordinary code tokens. A plain
+        // `contains` denied `d.keys()`, `.environment` and `grid_rsa` as credential
+        // reads, which is what made the guard block routine work (and, ironically,
+        // its own source grep). These must NOT register a sensitive path.
+        for benign in [
+            "d.keys()",
+            "for k in config.keys(): pass",
+            "obj.environment",
+            "app.env_config",
+            "grid_rsa_helper",
+            "monkey_patch()",
+            "load(\".keystore\")",
+        ] {
+            assert!(
+                check_sensitive_path(benign).is_none(),
+                "`{benign}` is a word, not a credential path"
+            );
+        }
+
+        // And the real paths still match, on either boundary.
+        for hit in [
+            "secret.key",
+            "server.pem",
+            "client.pfx",
+            ".env",
+            ".env.local",
+            "id_rsa",
+            "backup/id_ed25519",
+            "~/.aws/credentials",
+            "/etc/shadow",
+        ] {
+            assert!(
+                check_sensitive_path(hit).is_some(),
+                "`{hit}` is a sensitive path and must match"
+            );
+        }
+    }
+
+    #[test]
+    fn grepping_for_a_key_string_is_not_a_credential_read() {
+        // The exact false positive that blocked screening a command whose only
+        // mention of `.key` was a search pattern, not a file being read.
+        assert!(check_sensitive_read("grep -rn \"d.keys()\" src/").is_none());
+        assert!(check_sensitive_read("python3 -c \"print(cfg.keys())\"").is_none());
+        // A real read of a key file still fires.
+        assert_eq!(check_sensitive_read("cat deploy.key"), Some((".key", 50)));
     }
 
     #[test]
