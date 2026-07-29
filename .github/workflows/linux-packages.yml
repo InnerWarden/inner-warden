@@ -61,3 +61,23 @@ jobs:
           path: |
             out/*.deb
             out/*.rpm
+
+      # Publish to the SAME rolling release the binaries go to. Without this the
+      # packages only ever existed as CI artifacts, so `dnf`/`apt` users stayed on
+      # whatever version someone last uploaded by hand — the channel silently
+      # rotted three releases behind the binaries (1.0.3 vs 1.0.7). The packages
+      # are published only AFTER both test-installs above pass, so a broken
+      # package can never reach the channel.
+      - name: Checksums
+        run: |
+          cd out
+          for f in *.deb *.rpm; do sha256sum "$f" > "$f.sha256"; done
+          ls -la
+
+      - name: Publish packages to the rolling iw-guard release
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
+        run: |
+          gh release upload iw-guard out/*.deb out/*.rpm out/*.sha256 \
+            --repo InnerWarden/innerwarden-releases --clobber
+          echo "published packages for ${{ steps.v.outputs.version }}"
