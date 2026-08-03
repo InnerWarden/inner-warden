@@ -796,7 +796,7 @@ components:
                 id: { const: CJC-090 }
                 version: { const: CJC-090-v1 }
                 canonicalization: { const: RAW-UTF8-BYTES-SHA256 }
-                digest: { const: 'sha256:5f4397b1c74409b06f5405f2ca4b748daea208a7d571abc3b03caf1c5040b62c' }
+                digest: { const: 'sha256:d9f4fdd94ff1bb238e049fcf2fbed96acc24c32f7c821bc34c366949f7feab87' }
         assurance_matrix: { oneOf: [{ $ref: '#/components/schemas/VersionRef' }, { type: 'null' }] }
         authorization_matrix: { oneOf: [{ $ref: '#/components/schemas/VersionRef' }, { type: 'null' }] }
         platform: { $ref: '#/components/schemas/PlatformStatus' }
