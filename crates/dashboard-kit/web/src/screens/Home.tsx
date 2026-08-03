@@ -17,9 +17,16 @@ type ActivityLink = { id?: string; session?: string; verdict?: string; action?: 
 export function Home({
   meta,
   onOpenActivity,
+  edition,
 }: {
   meta?: DashboardMeta;
   onOpenActivity: (target?: ActivityLink) => void;
+  /**
+   * Drives whether the Active Defence card is an offer or noise. Absent means
+   * the edition has not resolved yet, which is treated as "do not offer" --
+   * an upsell is the wrong thing to guess about.
+   */
+  edition?: "community" | "enterprise";
 }) {
   const [overview, setOverview] = useState<Overview>();
   const [error, setError] = useState<string>();
@@ -114,7 +121,7 @@ export function Home({
       )}
 
       <CommunityIncluded />
-      <ActiveDefenceCard />
+      {edition === "community" ? <ActiveDefenceCard /> : null}
     </div>
   );
 }

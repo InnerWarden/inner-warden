@@ -140,7 +140,16 @@ function LayerSection({
             />
           ))}
         </div>
-      ) : <EmptyState title={emptyTitle} body={emptyBody} />}
+      ) : (
+        // A layer this adapter does not project is a FACT worth stating, but a
+        // tall dashed placeholder gives it the same visual weight as a real
+        // layer and reads as a broken or missing feature. State it compactly:
+        // the disclosure is preserved, the false "something is wrong here"
+        // signal is not.
+        <p className="rounded-lg border border-slate-200 bg-slate-50 px-4 py-3 text-sm leading-6 text-slate-600">
+          <span className="font-semibold text-slate-700">{emptyTitle}.</span> {emptyBody}
+        </p>
+      )}
     </section>
   );
 }

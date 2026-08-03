@@ -3,9 +3,9 @@
   "$id": "https://innerwarden.dev/contracts/community-journey-contract-v1.schema.json",
   "title": "InnerWarden Community Journey Contract v1",
   "description": "Schema for the frozen Community behaviour baseline. Contract identity and version are fields in the artifact; canonicalization and digest are carried separately by a VersionRef so the file never contains a self-referential digest.",
-  "$comment": "CJC-090-v1 is hashed as exact UTF-8 bytes using RAW-UTF8-BYTES-SHA256. The tracked digest is sha256:5f4397b1c74409b06f5405f2ca4b748daea208a7d571abc3b03caf1c5040b62c. This identifies bytes only and does not assert that any journey passed.",
+  "$comment": "CJC-090-v1 is hashed as exact UTF-8 bytes using RAW-UTF8-BYTES-SHA256. The tracked digest is sha256:d9f4fdd94ff1bb238e049fcf2fbed96acc24c32f7c821bc34c366949f7feab87. This identifies bytes only and does not assert that any journey passed.",
   "x-innerwarden-canonicalization": "RAW-UTF8-BYTES-SHA256",
-  "x-innerwarden-digest": "sha256:5f4397b1c74409b06f5405f2ca4b748daea208a7d571abc3b03caf1c5040b62c",
+  "x-innerwarden-digest": "sha256:d9f4fdd94ff1bb238e049fcf2fbed96acc24c32f7c821bc34c366949f7feab87",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -81,7 +81,7 @@
         "id": { "const": "CJC-090" },
         "version": { "const": "CJC-090-v1" },
         "canonicalization": { "const": "RAW-UTF8-BYTES-SHA256" },
-        "digest": { "const": "sha256:5f4397b1c74409b06f5405f2ca4b748daea208a7d571abc3b03caf1c5040b62c" }
+        "digest": { "const": "sha256:d9f4fdd94ff1bb238e049fcf2fbed96acc24c32f7c821bc34c366949f7feab87" }
       }
     },
     "StateSemantic": {

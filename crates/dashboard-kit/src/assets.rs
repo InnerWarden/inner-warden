@@ -75,7 +75,14 @@ fn content_sha256(bytes: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(bytes))
 }
 
-fn validate_manifest_with<B: AsRef<[u8]>>(
+/// Validate a bundle manifest against the files a crate actually embedded.
+///
+/// Public because more than one crate ships a bundle built from this project's
+/// web sources: the Community bundle embedded here, and the Active Defence
+/// bundle that composes these sources with its own screens. Both must be held
+/// to the same integrity rules, and a second copy of these rules is a second
+/// place for them to weaken.
+pub fn validate_manifest_with<B: AsRef<[u8]>>(
     manifest_json: &str,
     assets: &BTreeMap<String, B>,
 ) -> Result<(), String> {
