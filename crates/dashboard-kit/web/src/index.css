@@ -1,5 +1,16 @@
 @import "tailwindcss";
 
+/* Never scan the build output for class names.
+ *
+ * Tailwind v4 auto-detects sources and skips anything gitignored. `dist/` is
+ * COMMITTED here -- the Rust crate embeds it -- so it is not gitignored, and a
+ * rebuild was extracting class-like strings out of the previous build's own
+ * JavaScript. The result was a stylesheet whose bytes depended on whether a
+ * build had run before: identical sources produced different output on a clean
+ * tree than on a dirty one, which makes the shipped bundle unreproducible and
+ * quietly inflates it. */
+@source not "../dist";
+
 :root {
   color-scheme: light;
   font-synthesis: none;
