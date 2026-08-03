@@ -13,7 +13,8 @@
     "build": "npm run typecheck && vite build && node scripts/bundle-manifest.mjs write",
     "bundle:check": "node scripts/bundle-manifest.mjs check",
     "preview": "vite preview",
-    "ci": "npm run test:unit && npm run test:bundle && npm run build && npm run bundle:check && npm run test:browser"
+    "ci": "npm run test:unit && npm run test:bundle && npm run build && npm run bundle:check && npm run bundle:reproducible && npm run test:browser",
+    "bundle:reproducible": "node scripts/reproducible.mjs"
   },
   "dependencies": {
     "react": "^19.0.0",
