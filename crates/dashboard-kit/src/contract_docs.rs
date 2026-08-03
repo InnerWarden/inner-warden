@@ -37,6 +37,14 @@ pub const COMMUNITY_JOURNEY_CONTRACT: &str = include_str!("../contracts/v1/CJC-0
 pub const ENTERPRISE_PROOF_REPORT_PLACEHOLDER: &str =
     include_str!("../contracts/v1/enterprise-proof-report-v1.schema.json");
 
+/// `CJC-090-compatibility.md` -- the CJC compatibility record.
+pub const COMMUNITY_JOURNEY_COMPATIBILITY: &str =
+    include_str!("../contracts/v1/CJC-090-compatibility.md");
+
+/// `C1-contract-compatibility.md` -- the C1-prototype-to-C0 compatibility map.
+pub const C1_CONTRACT_COMPATIBILITY: &str =
+    include_str!("../contracts/v1/C1-contract-compatibility.md");
+
 /// Look a shared document up by the file name the contracts directory uses.
 ///
 /// Returns `None` for a document this crate does not own -- notably the
@@ -49,6 +57,8 @@ pub fn shared_document(name: &str) -> Option<&'static str> {
         "community-journey-contract-v1.schema.json" => Some(COMMUNITY_JOURNEY_CONTRACT_SCHEMA),
         "dashboard-core-v1.openapi.yaml" => Some(DASHBOARD_CORE_OPENAPI),
         "CJC-090-v1.yaml" => Some(COMMUNITY_JOURNEY_CONTRACT),
+        "CJC-090-compatibility.md" => Some(COMMUNITY_JOURNEY_COMPATIBILITY),
+        "C1-contract-compatibility.md" => Some(C1_CONTRACT_COMPATIBILITY),
         _ => None,
     }
 }
@@ -71,6 +81,12 @@ mod tests {
             let raw = shared_document(name).expect("document must be embedded");
             serde_yaml::from_str::<serde_yaml::Value>(raw)
                 .unwrap_or_else(|error| panic!("{name} must be valid YAML: {error}"));
+        }
+        for name in ["CJC-090-compatibility.md", "C1-contract-compatibility.md"] {
+            assert!(
+                !shared_document(name).expect("document must be embedded").is_empty(),
+                "{name} must not be empty"
+            );
         }
     }
 
