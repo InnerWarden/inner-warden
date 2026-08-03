@@ -40,10 +40,29 @@ export function deriveShellNavigation(
   if (bootstrap.capabilities.some((capability) => capability.tier === "enterprise_core")) {
     items.push({ route: "posture", label: "Posture" });
   }
-  if (bootstrap.capabilities.some((capability) => capability.id === "community.agent_discovery")) {
+  // Availability, not mere presence. The capability contract requires the
+  // Enterprise superset to PUBLISH every Community id, so an id being in the
+  // bootstrap payload is guaranteed by design and says nothing about whether
+  // the screen behind it can render. Keying tabs on presence offered screens
+  // whose endpoint reports the source does not exist -- the operator clicks a
+  // tab that can only ever say "no data".
+  //
+  // `community.token_intelligence` is exactly that today: it draws a screen
+  // reading LLM token CONSUMPTION from a usage history no runtime wires.
+  if (
+    bootstrap.capabilities.some(
+      (capability) =>
+        capability.id === "community.agent_discovery" && capability.availability === "available",
+    )
+  ) {
     items.push({ route: "agents", label: "Agents" });
   }
-  if (bootstrap.capabilities.some((capability) => capability.id === "community.token_intelligence")) {
+  if (
+    bootstrap.capabilities.some(
+      (capability) =>
+        capability.id === "community.token_intelligence" && capability.availability === "available",
+    )
+  ) {
     items.push({ route: "tokens", label: "Tokens" });
   }
   return items;
