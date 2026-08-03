@@ -4,11 +4,16 @@ import { deriveShellNavigation } from "./App";
 
 const stage = { state: "unknown" as const, evidence: [], reason_code: "fixture" };
 
-function capability(id: string, tier: CapabilityStatus["tier"], entitlement: CapabilityStatus["entitlement"]): CapabilityStatus {
+function capability(
+  id: string,
+  tier: CapabilityStatus["tier"],
+  entitlement: CapabilityStatus["entitlement"],
+  availability: CapabilityStatus["availability"] = "unsupported",
+): CapabilityStatus {
   return {
     id,
     tier,
-    availability: "unsupported",
+    availability,
     entitlement,
     support: "unsupported",
     desired_mode: "unknown",
@@ -56,13 +61,27 @@ describe("deriveShellNavigation", () => {
 
   it("uses declared capabilities, not licence entitlement, for Enterprise routes", () => {
     const host = capability("kernel_execution_control", "enterprise_core", "invalid");
-    const agents = capability("community.agent_discovery", "community", "not_required");
-    const tokens = capability("community.token_intelligence", "community", "not_required");
+    const agents = capability("community.agent_discovery", "community", "not_required", "available");
+    const tokens = capability("community.token_intelligence", "community", "not_required", "available");
     expect(deriveShellNavigation(bootstrap("enterprise", [host, agents, tokens]), "enterprise")).toEqual([
       { route: "overview", label: "Overview" },
       { route: "posture", label: "Posture" },
       { route: "agents", label: "Agents" },
       { route: "tokens", label: "Tokens" },
+    ]);
+  });
+
+  it("does not offer a tab for a capability that is published but unavailable", () => {
+    // The capability contract requires the Enterprise superset to PUBLISH every
+    // Community id, so presence is guaranteed by design and was never a signal.
+    // A published-but-unavailable record belongs in the inventory, not in the
+    // navigation, or the operator clicks a screen that can only say "no data".
+    const host = capability("kernel_execution_control", "enterprise_core", "invalid");
+    const tokens = capability("community.token_intelligence", "community", "not_required", "unavailable");
+    const agents = capability("community.agent_discovery", "community", "not_required", "unavailable");
+    expect(deriveShellNavigation(bootstrap("enterprise", [host, tokens, agents]), "enterprise")).toEqual([
+      { route: "overview", label: "Overview" },
+      { route: "posture", label: "Posture" },
     ]);
   });
 
