@@ -23,7 +23,8 @@ pub const COMMUNITY_JOURNEY_CONTRACT_SCHEMA: &str =
     include_str!("../contracts/v1/community-journey-contract-v1.schema.json");
 
 /// `dashboard-core-v1.openapi.yaml` -- the API surface both editions serve.
-pub const DASHBOARD_CORE_OPENAPI: &str = include_str!("../contracts/v1/dashboard-core-v1.openapi.yaml");
+pub const DASHBOARD_CORE_OPENAPI: &str =
+    include_str!("../contracts/v1/dashboard-core-v1.openapi.yaml");
 
 /// `CJC-090-v1.yaml` -- the Community Journey Contract itself.
 pub const COMMUNITY_JOURNEY_CONTRACT: &str = include_str!("../contracts/v1/CJC-090-v1.yaml");
@@ -84,7 +85,9 @@ mod tests {
         }
         for name in ["CJC-090-compatibility.md", "C1-contract-compatibility.md"] {
             assert!(
-                !shared_document(name).expect("document must be embedded").is_empty(),
+                !shared_document(name)
+                    .expect("document must be embedded")
+                    .is_empty(),
                 "{name} must not be empty"
             );
         }
