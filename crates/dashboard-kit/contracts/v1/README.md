@@ -56,7 +56,7 @@ The frozen Community baseline is pinned as:
 id:               CJC-090
 version:          CJC-090-v1
 canonicalization: RAW-UTF8-BYTES-SHA256
-digest:           sha256:5f4397b1c74409b06f5405f2ca4b748daea208a7d571abc3b03caf1c5040b62c
+digest:           sha256:d9f4fdd94ff1bb238e049fcf2fbed96acc24c32f7c821bc34c366949f7feab87
 ```
 
 That digest is SHA-256 over the exact checked-in UTF-8 bytes of
