@@ -73,3 +73,45 @@ jobs:
             }
             console.log("optionalDependencies all pinned to " + p.version);
           '
+
+  # The Community dashboard bundle. Nothing ran the web suite or checked the
+  # committed `dist/` before: a source change with no rebuild shipped a stale UI
+  # and 91 unit tests gated nothing.
+  #
+  # `bundle:check` recomputes the SOURCE digest and compares it to the committed
+  # manifest, so a stale bundle is caught without needing vite to produce
+  # byte-identical output on a different machine. `bundle:reproducible` is the
+  # separate guard that the output does not depend on whether a previous build
+  # was on disk.
+  dashboard-web:
+    name: Dashboard bundle
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crates/dashboard-kit/web
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: crates/dashboard-kit/web/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npx tsc -b
+
+      - name: Unit tests
+        run: npx vitest run
+
+      - name: Manifest self-test
+        run: npm run test:bundle
+
+      - name: Committed bundle must match its sources
+        run: npm run bundle:check
+
+      - name: Bundle must not be built out of its own output
+        run: npm run bundle:reproducible
