@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { fetchMeta, type DashboardMeta, type GuardrailMode } from "./api";
 import {
   dashboardV1Client,
@@ -17,7 +17,69 @@ import { Agents } from "./screens/Agents";
 import { Posture } from "./screens/Posture";
 import { TokenIntelligence } from "./screens/TokenIntelligence";
 
-export type ShellRoute = "overview" | "activity" | "posture" | "agents" | "tokens";
+/**
+ * The routes this repository builds. A contributed screen widens the type but
+ * can never take one of these names -- see `contributedScreens`.
+ */
+export type BaseShellRoute = "overview" | "activity" | "posture" | "agents" | "tokens";
+export type ShellRoute = BaseShellRoute | (string & {});
+
+const BASE_ROUTES: readonly string[] = ["overview", "activity", "posture", "agents", "tokens"];
+
+/**
+ * Context the shell hands to a contributed screen.
+ *
+ * Deliberately narrow. The shell keeps ownership of the bootstrap fetch, the
+ * session boundary, navigation and history; a contributed screen owns only what
+ * it draws, and looks up its own capability record from `bootstrap`.
+ */
+export type ScreenContext = {
+  bootstrap: DashboardBootstrap;
+  evaluatedAt: string;
+};
+
+/**
+ * A screen contributed by a build that is not this repository -- today, the
+ * Active Defence bundle's Cases, Evaluation and Proof screens.
+ *
+ * This exists so that adding a screen does not mean forking `App.tsx`. The fork
+ * it replaces drifted on two files it never intended to change: an upsell URL in
+ * `Home.tsx`, and an empty-state fix in `Posture.tsx` that was written, reviewed
+ * and then stranded in the fork for months without reaching a user.
+ */
+export type ScreenModule = {
+  /** The `?view=` value. Must not be a base route. */
+  route: string;
+  label: string;
+  /**
+   * Whether the tab is offered at all.
+   *
+   * Contributed screens follow the same rule the base routes follow: a
+   * capability that is published but not `available` is an inventory entry, not
+   * a screen, so it earns no tab.
+   */
+  offersTab: (bootstrap: DashboardBootstrap) => boolean;
+  /**
+   * When true, an explicit `?view=` still mounts the screen even though
+   * `offersTab` returned false, because the screen renders its own honest
+   * unavailable state.
+   *
+   * Without this the shell would bounce an explicit deep link to Overview,
+   * silently discarding what the operator asked for and replacing a stated
+   * reason with no reason at all.
+   */
+  rendersOwnUnavailableState?: boolean;
+  render: (context: ScreenContext) => ReactNode;
+};
+
+/**
+ * Contributed screens that are safe to mount: a module may not shadow a route
+ * the shell itself owns, so a bad or stale contribution cannot capture
+ * Overview, Posture, Agents or Tokens.
+ */
+function contributedScreens(extraScreens: readonly ScreenModule[]): ScreenModule[] {
+  return extraScreens.filter((screen) => !BASE_ROUTES.includes(screen.route));
+}
 
 type BootstrapLoadStatus = "loading" | "ready" | "unavailable" | "error";
 type MetaStatus = "loading" | "ready" | "error";
@@ -25,6 +87,7 @@ type MetaStatus = "loading" | "ready" | "error";
 export function deriveShellNavigation(
   bootstrap: DashboardBootstrap | undefined,
   edition: DashboardBootstrap["edition"] | undefined,
+  extraScreens: readonly ScreenModule[] = [],
 ): HeaderNavigationItem<ShellRoute>[] {
   if (edition === "community") {
     // Community navigation is a preserved CJC surface and never depends on an
@@ -65,12 +128,43 @@ export function deriveShellNavigation(
   ) {
     items.push({ route: "tokens", label: "Tokens" });
   }
+  for (const screen of contributedScreens(extraScreens)) {
+    if (screen.offersTab(bootstrap)) items.push({ route: screen.route, label: screen.label });
+  }
   return items;
 }
 
-function routeFromLocation(): ShellRoute {
-  const candidate = new URLSearchParams(window.location.search).get("view");
-  return candidate === "activity" || candidate === "posture" || candidate === "agents" || candidate === "tokens" ? candidate : "overview";
+/**
+ * Which route a query string asks for. Pure so it can be tested without a DOM;
+ * `routeFromLocation` is the one-line window wrapper.
+ */
+export function resolveRoute(search: string, extraScreens: readonly ScreenModule[] = []): ShellRoute {
+  const candidate = new URLSearchParams(search).get("view");
+  if (candidate === null) return "overview";
+  if (candidate !== "overview" && BASE_ROUTES.includes(candidate)) return candidate;
+  if (contributedScreens(extraScreens).some((screen) => screen.route === candidate)) return candidate;
+  return "overview";
+}
+
+/**
+ * Whether a route the navigation does not offer should fall back to Overview.
+ *
+ * A contributed screen that renders its own unavailable state is exempt: it
+ * answers "why is this empty" itself, and bouncing would replace that answer
+ * with silence. Pure so the rule is testable without a DOM.
+ */
+export function shouldResetToOverview(
+  route: ShellRoute,
+  navigation: readonly HeaderNavigationItem<ShellRoute>[],
+  extraScreens: readonly ScreenModule[] = [],
+): boolean {
+  const contributed = contributedScreens(extraScreens).find((screen) => screen.route === route);
+  if (contributed?.rendersOwnUnavailableState === true) return false;
+  return navigation.length > 0 && !navigation.some((item) => item.route === route);
+}
+
+function routeFromLocation(extraScreens: readonly ScreenModule[]): ShellRoute {
+  return resolveRoute(window.location.search, extraScreens);
 }
 
 function resourceData<T>(resource: DashboardResource<T>): T | undefined {
@@ -84,8 +178,14 @@ function bootstrapLoadStatus(resource: DashboardResource<DashboardBootstrap>): B
   return "error";
 }
 
-export function App() {
-  const [route, setRoute] = useState<ShellRoute>(() => routeFromLocation());
+export function App({ extraScreens = [] }: { extraScreens?: readonly ScreenModule[] } = {}) {
+  const contributed = contributedScreens(extraScreens);
+  // The popstate listener is registered once and must not resubscribe when a
+  // caller passes a fresh array literal on every render.
+  const contributedRef = useRef(contributed);
+  contributedRef.current = contributed;
+
+  const [route, setRoute] = useState<ShellRoute>(() => routeFromLocation(extraScreens));
   const [meta, setMeta] = useState<DashboardMeta>();
   const [metaStatus, setMetaStatus] = useState<MetaStatus>("loading");
   const [bootstrapResource, setBootstrapResource] = useState<DashboardResource<DashboardBootstrap>>({ state: "loading" });
@@ -267,14 +367,14 @@ export function App() {
   );
   const editionLabel = edition === "enterprise" ? "Enterprise" : edition === "community" ? "Community" : "Dashboard";
   const version = bootstrap?.product_version ?? (edition === "community" ? meta?.version : undefined);
-  const navigation = deriveShellNavigation(bootstrap, edition);
+  const navigation = deriveShellNavigation(bootstrap, edition, contributed);
 
   useEffect(() => {
-    if (navigation.length > 0 && !navigation.some((item) => item.route === route)) setRoute("overview");
+    if (shouldResetToOverview(route, navigation, contributedRef.current)) setRoute("overview");
   }, [navigation, route]);
 
   useEffect(() => {
-    const restore = () => setRoute(routeFromLocation());
+    const restore = () => setRoute(routeFromLocation(contributedRef.current));
     window.addEventListener("popstate", restore);
     return () => window.removeEventListener("popstate", restore);
   }, []);
@@ -336,11 +436,12 @@ export function App() {
             meta={freshMeta}
             onOpenActivity={openActivity}
             evaluatedAt={consumerEvaluatedAt}
+            extraScreens={contributed}
           />
         ) : edition === "enterprise" && bootstrap ? (
           <DashboardContractState resource={bootstrapResource} />
         ) : edition === "community" ? (
-          route === "activity" ? <Activity initialTarget={activityTarget} /> : <Home meta={freshMeta} onOpenActivity={openActivity} />
+          route === "activity" ? <Activity initialTarget={activityTarget} /> : <Home meta={freshMeta} onOpenActivity={openActivity} edition="community" />
         ) : (
           <DashboardContractState resource={bootstrapResource} />
         )}
@@ -361,6 +462,7 @@ function EnterpriseRoute({
   meta,
   onOpenActivity,
   evaluatedAt,
+  extraScreens,
 }: {
   route: ShellRoute;
   bootstrap: DashboardBootstrap;
@@ -373,7 +475,11 @@ function EnterpriseRoute({
   meta?: DashboardMeta;
   onOpenActivity: (target?: Omit<ActivityTarget, "requestId">) => void;
   evaluatedAt: string;
+  extraScreens: readonly ScreenModule[];
 }) {
+  const contributed = extraScreens.find((screen) => screen.route === route);
+  if (contributed !== undefined) return <>{contributed.render({ bootstrap, evaluatedAt })}</>;
+
   if (route === "agents") {
     return (
       <CapabilityBoundary
@@ -412,7 +518,7 @@ function EnterpriseRoute({
     );
   }
 
-  return <Home meta={meta} onOpenActivity={onOpenActivity} />;
+  return <Home meta={meta} onOpenActivity={onOpenActivity} edition="enterprise" />;
 }
 
 function EnterpriseSessionStatus({ resource }: { resource: DashboardResource<DashboardBootstrap> }) {

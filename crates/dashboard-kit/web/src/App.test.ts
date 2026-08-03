@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { CapabilityStatus, DashboardBootstrap } from "./api/v1";
-import { deriveShellNavigation } from "./App";
+import { deriveShellNavigation, resolveRoute, shouldResetToOverview, type ScreenModule } from "./App";
 
 const stage = { state: "unknown" as const, evidence: [], reason_code: "fixture" };
 
@@ -97,5 +97,106 @@ describe("deriveShellNavigation", () => {
       { route: "overview", label: "Overview" },
       { route: "posture", label: "Posture" },
     ]);
+  });
+});
+
+const enterpriseWithScreens = bootstrap("enterprise", [
+  capability("enterprise.posture", "enterprise_core", "valid"),
+]);
+
+function contributedScreen(route: string, offered: boolean, ownState = false): ScreenModule {
+  return {
+    route,
+    label: route.toUpperCase(),
+    offersTab: () => offered,
+    rendersOwnUnavailableState: ownState,
+    render: () => null,
+  };
+}
+
+describe("contributed screens", () => {
+  it("appends a contributed tab after the shell's own tabs", () => {
+    const navigation = deriveShellNavigation(enterpriseWithScreens, "enterprise", [
+      contributedScreen("cases", true),
+    ]);
+    expect(navigation).toEqual([
+      { route: "overview", label: "Overview" },
+      { route: "posture", label: "Posture" },
+      { route: "cases", label: "CASES" },
+    ]);
+  });
+
+  it("holds a contributed screen to the same availability rule as a base screen", () => {
+    const navigation = deriveShellNavigation(enterpriseWithScreens, "enterprise", [
+      contributedScreen("cases", false),
+    ]);
+    expect(navigation.map((item) => item.route)).not.toContain("cases");
+  });
+
+  // A contributed module is loaded by a different build than the one that owns
+  // these routes, so a stale or hostile module must not be able to capture the
+  // shell's own screens by claiming their names.
+  it("refuses to let a contributed screen shadow a route the shell owns", () => {
+    const navigation = deriveShellNavigation(enterpriseWithScreens, "enterprise", [
+      contributedScreen("posture", true),
+    ]);
+    expect(navigation.filter((item) => item.route === "posture")).toEqual([
+      { route: "posture", label: "Posture" },
+    ]);
+  });
+
+  it("never offers a contributed tab to the Community shell", () => {
+    const navigation = deriveShellNavigation(bootstrap("community", []), "community", [
+      contributedScreen("cases", true),
+    ]);
+    expect(navigation.map((item) => item.route)).toEqual(["overview", "activity"]);
+  });
+});
+
+describe("resolveRoute", () => {
+  it("resolves a base route from the query string", () => {
+    expect(resolveRoute("?view=posture")).toBe("posture");
+  });
+
+  it("falls back to overview for a route no build contributed", () => {
+    expect(resolveRoute("?view=cases")).toBe("overview");
+  });
+
+  it("resolves a contributed route once its build supplies the module", () => {
+    expect(resolveRoute("?view=cases", [contributedScreen("cases", true)])).toBe("cases");
+  });
+
+  it("refuses a contributed module that claims a shell-owned route name", () => {
+    expect(resolveRoute("?view=posture", [contributedScreen("posture", true)])).toBe("posture");
+  });
+});
+
+describe("shouldResetToOverview", () => {
+  const navigation = [
+    { route: "overview" as const, label: "Overview" },
+    { route: "posture" as const, label: "Posture" },
+  ];
+
+  it("resets a route the navigation does not offer", () => {
+    expect(shouldResetToOverview("agents", navigation)).toBe(true);
+  });
+
+  it("keeps a route the navigation offers", () => {
+    expect(shouldResetToOverview("posture", navigation)).toBe(false);
+  });
+
+  // The tab is hidden because the capability is unavailable, but an operator who
+  // typed the URL asked a specific question. The screen answers it with a stated
+  // reason; a bounce to Overview would answer with nothing.
+  it("keeps an explicit deep link to a screen that states its own unavailability", () => {
+    expect(shouldResetToOverview("proof", navigation, [contributedScreen("proof", false, true)])).toBe(false);
+  });
+
+  it("still resets a contributed screen that does not state its own unavailability", () => {
+    expect(shouldResetToOverview("cases", navigation, [contributedScreen("cases", false, false)])).toBe(true);
+  });
+
+  it("does not reset while the navigation is still empty", () => {
+    expect(shouldResetToOverview("agents", [])).toBe(false);
   });
 });
