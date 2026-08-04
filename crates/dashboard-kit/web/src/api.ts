@@ -222,8 +222,16 @@ async function getValidated<T>(path: string, validate: (value: unknown) => value
   return value;
 }
 
-export const fetchMeta = () => get<DashboardMeta>("api/meta");
-export const fetchOverview = () => get<Overview>("api/overview");
+// The guard-decision contract has its own path because ONE bundle is served by
+// two products, and `api/overview` already meant something else on the paid side:
+// there it is the host overview (events, incidents, AI), with no `top_categories`.
+// The Overview screen asked for guard decisions, got a host report, sliced a field
+// that was not there, and the whole dashboard rendered WHITE in production.
+//
+// `api/guard/*` is served by both. The free CLI aliases it onto the handlers
+// below; the paid agent answers from the same shared `Graph::overview`.
+export const fetchMeta = () => get<DashboardMeta>("api/guard/meta");
+export const fetchOverview = () => get<Overview>("api/guard/overview");
 export const fetchGraph = () => get<Graph>("api/graph");
 export const fetchAgents = () => getValidated("api/agents", isAgentsResponse);
 export const fetchTokenIntelligence = () => getValidated("api/token-intelligence", isTokenIntelligenceResponse);
