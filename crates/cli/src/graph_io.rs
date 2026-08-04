@@ -389,6 +389,50 @@ fn record(
 /// telemetry can never alter the already-made verdict or the hook exit code.
 /// `command`/`verdict` are already redacted by [`record`]. `ts` is unix seconds
 /// (no chrono dependency needed on this path).
+/// Append one suppression-change record to `guard-events.jsonl`.
+///
+/// A guardrail that can be weakened without leaving a trace has a blind spot
+/// exactly where an attacker aims first. `guard.blocked` recorded every refusal
+/// and NOTHING recorded the refusals being switched off, so the one action that
+/// changes what the guard will stop in future was the one action it did not
+/// report. `innerwarden allow` wrote `suppress.toml` and the event stream did not
+/// move.
+///
+/// Same discipline as [`emit_guard_event`]: best-effort, never alters the write
+/// it reports on, and the pattern is redacted before it is written because a
+/// command glob can carry a secret.
+pub fn record_suppression_change(action: &str, pattern: &str, counts: (usize, usize, usize)) {
+    let Some(graph) = graph_path() else {
+        return;
+    };
+    let Some(dir) = graph.parent() else {
+        return;
+    };
+    use std::io::Write;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let safe = innerwarden_agent_guard::redact::redact_secrets(pattern).text;
+    let line = serde_json::json!({
+        "kind": "guard.suppression_changed",
+        "ts": ts,
+        "action": action,
+        "pattern": safe,
+        "allow_count": counts.0,
+        "mute_rule_count": counts.1,
+        "mute_category_count": counts.2,
+        "session": session_id(None),
+    });
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("guard-events.jsonl"))
+    {
+        let _ = writeln!(f, "{line}");
+    }
+}
+
 fn emit_guard_event(
     graph_path: &std::path::Path,
     command: &str,
