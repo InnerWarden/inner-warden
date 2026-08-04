@@ -64,6 +64,27 @@ export function Home({
   if (!overview && error) return <FullError message={error} />;
   if (!overview) return <OverviewSkeleton />;
 
+  // A producer that omits a required field is a stated fault, not a blank page.
+  //
+  // `top_categories` and `recent_blocks` are non-optional in the Overview
+  // contract, so the code below indexed and sliced them directly. When a server
+  // answered without them the screen threw
+  // `Cannot read properties of undefined (reading 'slice')` during render and the
+  // whole dashboard went WHITE -- no message, no partial render, nothing in the
+  // UI to say which side was at fault. Defaulting to `[]` would be worse: it
+  // would report "no recent activity" for a host whose activity was simply never
+  // sent.
+  const missing = missingOverviewFields(overview);
+  if (missing.length > 0) {
+    return (
+      <FullError
+        message={`This dashboard's data source returned an overview without ${missing.join(", ")}. \
+The Overview contract requires ${missing.length === 1 ? "that field" : "those fields"}, so the \
+figures below cannot be shown. This is a producer fault, not an empty host.`}
+      />
+    );
+  }
+
   const mode = normaliseMode(meta);
   const denyVerdicts = overview.deny_verdicts ?? overview.blocked;
   const reviewVerdicts = overview.review_verdicts ?? overview.review;
@@ -441,6 +462,20 @@ function ActiveDefenceCard() {
       </div>
     </aside>
   );
+}
+
+/// Required Overview fields the producer did not send.
+///
+/// Typed as non-optional in `api.ts`, which is a claim about the producer rather
+/// than a guarantee about the bytes. Checking at the boundary keeps a contract
+/// violation legible instead of turning it into a render crash.
+export function missingOverviewFields(overview: Overview): string[] {
+  const missing: string[] = [];
+  if (!Array.isArray(overview.top_categories)) missing.push("top_categories");
+  if (!Array.isArray(overview.recent_decisions) && !Array.isArray(overview.recent_blocks)) {
+    missing.push("recent_decisions/recent_blocks");
+  }
+  return missing;
 }
 
 function OverviewSkeleton() {
