@@ -761,7 +761,7 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
                 .unwrap_or_else(|_| "{}".into());
                 request.respond(json_response(body))
             }
-            "/api/overview" => match graph_io::load_graph_checked() {
+            "/api/overview" | "/api/guard/overview" => match graph_io::load_graph_checked() {
                 Ok(graph) => {
                     let body =
                         serde_json::to_string(&graph.overview(20)).unwrap_or_else(|_| "{}".into());
@@ -808,7 +808,7 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
                     request.respond(graph_unreadable_response())
                 }
             },
-            "/api/meta" => match agent_snapshot.as_ref() {
+            "/api/meta" | "/api/guard/meta" => match agent_snapshot.as_ref() {
                 Some(shared) => {
                     let snapshot = read_agent_snapshot(shared);
                     request.respond(json_response(meta_json_with_status(
