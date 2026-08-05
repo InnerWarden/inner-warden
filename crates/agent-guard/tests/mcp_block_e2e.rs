@@ -8,12 +8,18 @@
 //!
 //! # How it proves it
 //!
-//! The real MCP server is `cat`, which echoes whatever it is given. That turns
-//! the assertion into a structural one rather than a matter of reading the
-//! proxy's own reply:
+//! The real MCP server is a line-flushing echo, which turns the assertion into a
+//! structural one rather than a matter of reading the proxy's own reply:
 //!
-//! * a call the proxy FORWARDS comes back, because `cat` echoed it;
-//! * a call the proxy BLOCKS never comes back, because `cat` never saw it.
+//! * a call the proxy FORWARDS comes back, because the server echoed it;
+//! * a call the proxy BLOCKS never comes back, because the server never saw it.
+//!
+//! It was `cat` first, and that made the FORWARD case platform-dependent: with
+//! stdout on a pipe, `cat` is fully buffered, so a single small line can sit in
+//! its buffer instead of coming back. It passed on macOS and failed on Linux CI.
+//! The BLOCK assertions never depended on it (bytes that never arrive cannot be
+//! echoed whatever the buffering), but a test that is only sometimes right about
+//! the other half is not worth having.
 //!
 //! So "blocked" means the bytes did not reach the server, which is the property
 //! that matters. A test that only inspected the proxy's error reply could pass
@@ -49,8 +55,15 @@ fn run_through_proxy(requests: &[String], mode: ProxyMode) -> String {
         let client_in = std::io::Cursor::new(input.into_bytes());
         let writer = TestWriter(Arc::clone(&collected));
         let cfg = ProxyConfig {
-            // `cat` is a faithful echo server: whatever reaches it comes back.
-            server_cmd: vec!["cat".to_string()],
+            // An echo server that flushes every line. `-u` forces unbuffered
+            // streams, so what reaches the server comes back immediately rather
+            // than waiting on a buffer that behaves differently per platform.
+            server_cmd: vec![
+                "python3".to_string(),
+                "-u".to_string(),
+                "-c".to_string(),
+                "import sys\nfor line in sys.stdin:\n    sys.stdout.write(line)\n    sys.stdout.flush()".to_string(),
+            ],
             mode,
             as_protocol_error: false,
         };
@@ -93,9 +106,9 @@ impl tokio::io::AsyncWrite for TestWriter {
 
 /// REGRESSION ANCHOR for the product's central claim.
 ///
-/// A dangerous `tools/call` must not reach the server. `cat` echoes everything
-/// it receives, so the absence of the command in the client's output is proof
-/// the bytes were stopped, not merely that the proxy said something about them.
+/// A dangerous `tools/call` must not reach the server. The server echoes
+/// everything it receives, so the absence of the command in the client's output
+/// is proof the bytes were stopped, not merely that the proxy said something.
 #[test]
 fn guard_mode_stops_a_dangerous_tool_call_from_reaching_the_server() {
     let marker = "rm -rf / --no-preserve-root";
@@ -112,7 +125,7 @@ fn guard_mode_stops_a_dangerous_tool_call_from_reaching_the_server() {
 }
 
 /// The other half: guard mode must not be a wall. A benign call is forwarded,
-/// and `cat` echoing it back is the proof that it really was.
+/// and the server echoing it back is the proof that it really was.
 #[test]
 fn guard_mode_still_forwards_a_benign_tool_call() {
     let marker = "git status --short";

@@ -76,11 +76,22 @@ fn now_ms() -> i64 {
 /// the state could not be read or written. See the module note on why failure is
 /// silent.
 pub fn record_call(session: Option<&str>) -> Option<Alert> {
+    record_call_at(session, store_path())
+}
+
+/// [`record_call`] with the store path injected.
+///
+/// Tests used to point this at a temp file by setting `IW_SESSION_FILE`, which
+/// is process-global while cargo runs tests in parallel threads: one test could
+/// redirect another's writes, or leak the variable into a test that expected the
+/// real path. Injecting the path removes the shared mutable state instead of
+/// hoping the schedule is kind.
+fn record_call_at(session: Option<&str>, path: Option<PathBuf>) -> Option<Alert> {
     let session = session?.trim();
     if session.is_empty() {
         return None;
     }
-    let path = store_path()?;
+    let path = path?;
     let now = now_ms();
 
     let mut store: Store = std::fs::read_to_string(&path)
@@ -158,17 +169,15 @@ mod tests {
     fn a_burst_across_separate_invocations_raises_an_alert() {
         let dir = tempfile::tempdir().expect("tempdir");
         let file = dir.path().join("sessions.json");
-        std::env::set_var("IW_SESSION_FILE", &file);
 
         let mut alerted = false;
         // Each iteration reads and writes the file exactly as a separate hook
         // process would.
         for _ in 0..=(innerwarden_agent_guard::session::MAX_CALLS_PER_MINUTE + 1) {
-            if record_call(Some("sess-1")).is_some() {
+            if record_call_at(Some("sess-1"), Some(file.clone())).is_some() {
                 alerted = true;
             }
         }
-        std::env::remove_var("IW_SESSION_FILE");
         assert!(
             alerted,
             "a burst beyond the limit must be visible even though every call is a new process"
@@ -178,8 +187,14 @@ mod tests {
     /// No session id means no tracking, and must never panic or create a file.
     #[test]
     fn an_absent_or_blank_session_is_ignored() {
-        assert!(record_call(None).is_none());
-        assert!(record_call(Some("   ")).is_none());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = Some(dir.path().join("sessions.json"));
+        assert!(record_call_at(None, file.clone()).is_none());
+        assert!(record_call_at(Some("   "), file.clone()).is_none());
+        assert!(
+            !dir.path().join("sessions.json").exists(),
+            "nothing to record means nothing written"
+        );
     }
 
     #[test]
