@@ -1,5 +1,13 @@
 name: Linux packages (.deb / .rpm)
 
+# Least privilege (audit CI-11).
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-packages-${{ github.ref }}
+  cancel-in-progress: false
+
 # Build the Community CLI Debian and RPM packages for amd64 and arm64 from the
 # prebuilt release binaries, prove they install and run on real distros, and
 # upload them as artifacts. Version defaults to npm/package.json.
@@ -16,11 +24,13 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install nfpm
+        # Audit SUP-12: `@latest` meant the tool that BUILDS the .deb/.rpm a user
+        # installs could change under us between two runs of the same commit.
         run: |
-          go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest
+          go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.47.0
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
       - name: Resolve version
@@ -30,13 +40,24 @@ jobs:
           [ -n "$v" ] || v="$(node -p "require('./npm/package.json').version")"
           echo "version=$v" >> "$GITHUB_OUTPUT"
 
-      - name: Download release binaries
+      - name: Download and VERIFY release binaries
         env:
           REL: https://github.com/InnerWarden/innerwarden-releases/releases/download/iw-guard
+        # Audit CI-02 / SUP-05: these bytes used to be curled and packaged with
+        # no check at all, so the .deb/.rpm carried whatever the endpoint served.
+        # Verify the published sha256 AND the Ed25519 signature against the
+        # vendored pin before packaging. Fails closed: a missing sidecar is an
+        # error, never a skipped check.
         run: |
+          set -euo pipefail
           mkdir -p bin
-          curl -fsSL -o bin/innerwarden-linux-x86_64 "$REL/innerwarden-linux-x86_64"
-          curl -fsSL -o bin/innerwarden-linux-aarch64 "$REL/innerwarden-linux-aarch64"
+          for a in innerwarden-linux-x86_64 innerwarden-linux-aarch64; do
+            curl -fsSL -o "bin/$a"        "$REL/$a"
+            curl -fsSL -o "bin/$a.sha256" "$REL/$a.sha256"
+            curl -fsSL -o "bin/$a.sig"    "$REL/$a.sig"
+          done
+          node npm/scripts/verify-release-dir.mjs bin \
+            innerwarden-linux-x86_64 innerwarden-linux-aarch64
 
       - name: Build packages
         run: |
@@ -52,10 +73,10 @@ jobs:
 
       - name: Test-install the .rpm (Rocky Linux container)
         run: |
-          docker run --rm -v "$PWD/out:/pkg" rockylinux:9 bash -c \
+          docker run --rm -v "$PWD/out:/pkg" rockylinux:9@sha256:d644d203142cd5b54ad2a83a203e1dee68af2229f8fe32f52a30c6e1d3c3a9e0 bash -c \
             "dnf install -y /pkg/innerwarden-${{ steps.v.outputs.version }}-1.x86_64.rpm >/dev/null && echo -n 'rpm -> ' && innerwarden --version"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: linux-packages
           path: |

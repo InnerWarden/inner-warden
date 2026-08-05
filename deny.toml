@@ -1,0 +1,58 @@
+# cargo-deny policy (audit SUP-02, SUP-11, CI-07).
+#
+# Before this the repo had no supply-chain gate at all: no advisory check, no
+# licence policy, nothing to stop a copyleft dependency entering an Apache-2.0
+# codebase. This is that gate. It is deliberately strict about the two things
+# that are hard to undo once shipped, a known-vulnerable dependency and an
+# incompatible licence, and quiet about style.
+
+[advisories]
+# A known advisory fails the build. An exception must be written down here with
+# a reason, so the decision is reviewable instead of implicit.
+yanked = "deny"
+ignore = []
+
+[licenses]
+# Apache-2.0 is what this repo publishes under, so an incompatible dependency
+# licence is a licensing defect, not a warning.
+confidence-threshold = 0.9
+allow = [
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "MIT",
+  "MIT-0",
+  "0BSD",
+  "BSD-1-Clause",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  "CC0-1.0",
+  "CDLA-Permissive-2.0",
+  "Unlicense",
+  "MPL-2.0",     # file-level copyleft: linking is fine, edits to those files are not
+  "OpenSSL",
+  "BSL-1.0",
+]
+# Everything else, GPL and AGPL included, is refused by omission.
+
+[bans]
+multiple-versions = "warn"
+# A wildcard on a THIRD-PARTY crate means the bytes can change under us, so it
+# is refused. The four in this workspace are first-party path dependencies on
+# unpublished sibling crates, which carry no such risk.
+wildcards = "deny"
+allow-wildcard-paths = true
+# A build-time dependency on a crate that shells out or fetches at build time is
+# where supply-chain surprises live. None are needed here.
+deny = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# Only crates.io. A git dependency in a published guardrail would mean the bytes
+# a user installs depend on a branch that can move under them.
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

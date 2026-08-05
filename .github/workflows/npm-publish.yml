@@ -1,5 +1,10 @@
 name: Publish to npm (OIDC)
 
+# Least privilege (audit CI-11). `id-token` is required for OIDC provenance and
+# is granted at the JOB that publishes, not repo-wide.
+permissions:
+  contents: read
+
 # Publishes the Community CLI to npm using GitHub OIDC trusted publishing.
 # No long-lived npm token and no 2FA bypass: authentication is short-lived and
 # scoped to this workflow, and each package gets a signed provenance
@@ -30,15 +35,56 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  publish:
+  # Audit CI-04: publishing required no green CI and no human in the loop, so a
+  # tag on a commit whose tests were failing would publish anyway, and npm
+  # provenance would attest it. This gate answers the checks API for the exact
+  # commit being published and refuses when CI is not green on it.
+  gate:
+    name: CI must be green on this commit
     runs-on: ubuntu-latest
+    permissions:
+      checks: read
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Require a green CI run for ${{ github.sha }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          sha="${{ github.sha }}"
+          runs=$(gh api "repos/${{ github.repository }}/actions/workflows/ci.yml/runs?head_sha=$sha&per_page=20" \
+            --jq '[.workflow_runs[] | select(.status=="completed")] | map(.conclusion)')
+          echo "CI conclusions for $sha: $runs"
+          if [ "$runs" = "[]" ]; then
+            echo "::error::no completed CI run for $sha. Publishing an untested commit is how a broken build reaches users."
+            exit 1
+          fi
+          if echo "$runs" | grep -qv 'success'; then
+            if echo "$runs" | python3 -c 'import json,sys; sys.exit(0 if all(c=="success" for c in json.load(sys.stdin)) else 1)'; then
+              :
+            else
+              echo "::error::CI is not green on $sha: $runs"
+              exit 1
+            fi
+          fi
+          echo "CI is green on $sha"
+
+  publish:
+    needs: gate
+    runs-on: ubuntu-latest
+    # A protected environment adds the human step the audit asked for: configure
+    # `npm-publish` in repo settings with a required reviewer. Until it is
+    # configured GitHub treats it as unprotected, so this line is safe to land
+    # before the setting exists and starts enforcing the moment it does.
+    environment: npm-publish
     permissions:
       id-token: write # required for OIDC trusted publishing + provenance
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
