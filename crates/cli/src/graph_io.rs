@@ -167,6 +167,15 @@ fn save(
     path: &std::path::Path,
     expected: Option<&[u8]>,
 ) -> Result<(), GraphRecordError> {
+    // Bound the store on the way out (audit UNSF-05). Readers cap what they
+    // SHOW; without this the file itself grew for the life of the install. Doing
+    // it here means every writer is covered, rather than each remembering to.
+    let mut graph = graph.clone();
+    let dropped = graph.prune();
+    if dropped > 0 {
+        eprintln!("innerwarden: graph pruned {dropped} oldest node(s) to stay within the cap");
+    }
+    let graph = &graph;
     let trusted_root = path
         .parent()
         .ok_or(GraphRecordError::DirectoryUnavailable)?;

@@ -187,6 +187,34 @@ impl Graph {
         }
     }
 
+    /// Cap on retained nodes. Readers already bound what they SHOW (500 items,
+    /// `take(limit)`), but the store itself had no cap, so the file grew for the
+    /// life of the install (audit UNSF-05).
+    ///
+    /// Chosen well above what any reader surfaces, so pruning can never remove
+    /// something a view would have displayed.
+    pub const MAX_NODES: usize = 20_000;
+
+    /// Drop the oldest nodes past [`Self::MAX_NODES`], and every edge that then
+    /// dangles.
+    ///
+    /// Insertion order is the age order here: `upsert_node` appends new ids and
+    /// mutates existing ones in place, so the front of the vector is the oldest
+    /// material. An edge whose endpoint was pruned is removed too, because a
+    /// dangling edge would make a reader render a relationship to a node it
+    /// cannot resolve.
+    pub fn prune(&mut self) -> usize {
+        if self.nodes.len() <= Self::MAX_NODES {
+            return 0;
+        }
+        let excess = self.nodes.len() - Self::MAX_NODES;
+        let dropped: std::collections::HashSet<String> =
+            self.nodes.drain(..excess).map(|n| n.id).collect();
+        self.edges
+            .retain(|e| !dropped.contains(&e.from) && !dropped.contains(&e.to));
+        dropped.len()
+    }
+
     /// Add an edge unless the exact (from,to,kind) already exists.
     pub fn add_edge(&mut self, from: &str, to: &str, kind: &str) {
         let exists = self
@@ -1510,5 +1538,78 @@ mod tests {
         let cmd = g.nodes.iter().find(|n| n.kind == "command").unwrap();
         assert!(cmd.label.chars().count() <= 120);
         assert!(cmd.label.ends_with('…'));
+    }
+}
+
+#[cfg(test)]
+mod prune_tests {
+    use super::*;
+
+    fn node(id: &str) -> Node {
+        Node {
+            id: id.into(),
+            kind: "command".into(),
+            label: id.into(),
+            attrs: Default::default(),
+        }
+    }
+
+    /// REGRESSION ANCHOR for UNSF-05. Readers were bounded, the STORE was not,
+    /// so the file grew for the life of the install.
+    ///
+    /// FAILS ON REVERT: make `prune` a no-op and the length assertion trips.
+    #[test]
+    fn the_store_is_capped_and_drops_the_oldest() {
+        let mut g = Graph::new();
+        for i in 0..(Graph::MAX_NODES + 500) {
+            g.upsert_node(node(&format!("n{i:06}")));
+        }
+        let dropped = g.prune();
+        assert_eq!(dropped, 500);
+        assert_eq!(g.nodes.len(), Graph::MAX_NODES);
+        assert!(
+            g.nodes.iter().all(|n| n.id != "n000000"),
+            "the oldest node must be the one dropped"
+        );
+        assert!(
+            g.nodes
+                .iter()
+                .any(|n| n.id == format!("n{:06}", Graph::MAX_NODES + 499)),
+            "the newest node must survive"
+        );
+    }
+
+    /// An edge pointing at a pruned node would render as a relationship to
+    /// something the reader cannot resolve, so it goes with it.
+    #[test]
+    fn edges_that_would_dangle_are_removed_with_their_node() {
+        let mut g = Graph::new();
+        for i in 0..(Graph::MAX_NODES + 2) {
+            g.upsert_node(node(&format!("n{i:06}")));
+        }
+        g.add_edge("n000000", "n000001", "ran");
+        let survivor = format!("n{:06}", Graph::MAX_NODES + 1);
+        g.add_edge(&survivor, &survivor, "self");
+        g.prune();
+        assert!(
+            !g.edges.iter().any(|e| e.from == "n000000"),
+            "an edge from a pruned node must not survive"
+        );
+        assert!(
+            g.edges.iter().any(|e| e.from == survivor),
+            "an edge between surviving nodes must be kept"
+        );
+    }
+
+    /// Under the cap, pruning must change nothing at all.
+    #[test]
+    fn a_small_graph_is_untouched() {
+        let mut g = Graph::new();
+        g.upsert_node(node("a"));
+        g.upsert_node(node("b"));
+        g.add_edge("a", "b", "ran");
+        assert_eq!(g.prune(), 0);
+        assert_eq!(g.nodes.len(), 2);
+        assert_eq!(g.edges.len(), 1);
     }
 }
