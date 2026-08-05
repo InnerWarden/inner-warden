@@ -271,6 +271,14 @@ pub fn unwrap_toml(doc: &mut DocumentMut) -> usize {
 }
 
 /// Every stdio server is routed through the proxy (and there is at least one).
+/// Is there at least one stdio server not yet routed through the proxy?
+/// See [`super::mcp_wire::has_unguarded_stdio_server`] for why this is distinct
+/// from "has any wiring".
+pub fn has_unguarded_stdio_server_toml(doc: &DocumentMut) -> bool {
+    let (stdio, wrapped) = counts(doc);
+    stdio > wrapped
+}
+
 pub fn is_guarded_toml(doc: &DocumentMut) -> bool {
     let (stdio, wrapped) = counts(doc);
     stdio > 0 && stdio == wrapped

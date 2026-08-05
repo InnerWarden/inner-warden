@@ -25,13 +25,17 @@ mod contain_io;
 mod dashboard;
 mod graph_io;
 mod notify_io;
+mod release_verify;
 mod second_opinion;
 mod second_opinion_io;
+mod serve_owner;
+mod session_store;
 mod setup;
 mod setup_io;
 mod suppress;
 mod suppress_io;
 mod upgrade;
+mod upgrade_plan;
 mod upsell;
 mod upsell_io;
 
@@ -46,10 +50,27 @@ fn main() -> std::process::ExitCode {
         Some("serve") => cmd_serve(&args[1..]),
         Some("proxy") => cmd_proxy(&args[1..]),
         Some("hook") => cmd_hook(&args[1..]),
-        Some("setup") => setup_io::cmd(&args[1..]),
+        // The four verbs both layers implement run HERE, and say so when the
+        // host layer also has one, so its version is discoverable instead of
+        // silently shadowed.
+        Some(v @ ("setup" | "dashboard" | "upgrade" | "update" | "self-update" | "uninstall")) => {
+            let code = match v {
+                "setup" => setup_io::cmd(&args[1..]),
+                "dashboard" => dashboard::cmd(&args[1..]),
+                "uninstall" => cmd_uninstall(&args[1..]),
+                _ => upgrade::cmd(&args[1..]),
+            };
+            let canonical = if v == "update" || v == "self-update" {
+                "upgrade"
+            } else {
+                v
+            };
+            if let Some(hint) = upsell_io::shared_verb_hint(canonical) {
+                eprintln!("{hint}");
+            }
+            code
+        }
         Some("install") => cmd_install(&args[1..]),
-        Some("uninstall") => cmd_uninstall(&args[1..]),
-        Some("upgrade") | Some("update") | Some("self-update") => upgrade::cmd(&args[1..]),
         Some("agents") => agents_io::cmd(&args[1..]),
         Some("contain") => contain_io::cmd(&args[1..]),
         Some("enforce") => cmd_mode(&args[1..], false),
@@ -58,8 +79,14 @@ fn main() -> std::process::ExitCode {
         Some("mute") => suppress_io::cmd_mute(&args[1..]),
         Some("notify") => notify_io::cmd(&args[1..]),
         Some("graph") => graph_io::cmd(&args[1..]),
-        Some("dashboard") => dashboard::cmd(&args[1..]),
         Some("llm") => second_opinion_io::cmd(&args[1..]),
+        // Explicit passthrough to the host layer. The catch-all below only
+        // forwards verbs this binary does NOT know, so a verb that exists on
+        // both sides (`setup`, `dashboard`, `upgrade`, `uninstall`) was always
+        // answered here and its Active Defence counterpart was unreachable. This
+        // makes every host verb reachable by name, with no ambiguity about which
+        // layer answers.
+        Some("host") => upsell_io::cmd_host(&args[1..]),
         Some("--version") | Some("-V") | Some("version") => {
             println!("{} {}", prog(), env!("CARGO_PKG_VERSION"));
             std::process::ExitCode::SUCCESS
@@ -148,7 +175,11 @@ fn cmd_check(rest: &[String]) -> std::process::ExitCode {
         return std::process::ExitCode::from(2);
     }
 
-    let engine = RuleEngine::load_embedded();
+    // Shell surface only: loading the whole corpus compiles 62 regexes
+    // (~130ms) that cannot match a command, on a process that runs per
+    // tool call. See `RuleEngine::load_embedded_for`.
+    let engine =
+        RuleEngine::load_embedded_for(innerwarden_agent_guard::rules::AtrSource::ShellCommand);
     let rules = analyze(&command, &engine);
     // User suppression first (a command the user trusts neither escalates nor
     // alerts); then, for a still-ambiguous case, an optional LLM second opinion.
@@ -227,7 +258,11 @@ fn hook_verdict(payload: &str) -> Option<(String, serde_json::Value)> {
     if command.trim().is_empty() {
         return None;
     }
-    let engine = RuleEngine::load_embedded();
+    // Shell surface only: loading the whole corpus compiles 62 regexes
+    // (~130ms) that cannot match a command, on a process that runs per
+    // tool call. See `RuleEngine::load_embedded_for`.
+    let engine =
+        RuleEngine::load_embedded_for(innerwarden_agent_guard::rules::AtrSource::ShellCommand);
     Some((command.clone(), analyze(&command, &engine)))
 }
 
@@ -269,6 +304,45 @@ fn hook_blocks(verdict: &serde_json::Value, block_review: bool) -> bool {
         })
 }
 
+/// Fold a behavioural alert into the pattern verdict.
+///
+/// The alert describes the SESSION (a burst of calls, repeated sensitive reads),
+/// not this one command, so it must not invent a `deny` on its own: a fast agent
+/// doing safe work is not an attack. It raises an `allow` to `review` and adds
+/// the reason, leaving an existing `review`/`deny` untouched. The policy the
+/// operator already chose then decides what a `review` means.
+///
+/// Pure, so the escalation rule is testable without a session file.
+fn apply_behaviour(
+    mut verdict: serde_json::Value,
+    alert: Option<&innerwarden_agent_guard::session::Alert>,
+) -> serde_json::Value {
+    let Some(alert) = alert else { return verdict };
+    let Some(obj) = verdict.as_object_mut() else {
+        return verdict;
+    };
+    let current = obj
+        .get("recommendation")
+        .and_then(|r| r.as_str())
+        .unwrap_or("allow");
+    if current == "allow" {
+        obj.insert("recommendation".into(), "review".into());
+    }
+    let previous = obj
+        .get("explanation")
+        .and_then(|e| e.as_str())
+        .unwrap_or("")
+        .to_string();
+    let reason = format!("session behaviour: {}", alert.reason);
+    let joined = if previous.is_empty() {
+        reason
+    } else {
+        format!("{previous}; {reason}")
+    };
+    obj.insert("explanation".into(), joined.into());
+    verdict
+}
+
 fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
     let block_review = rest.iter().any(|a| a == "--block-review");
     // Monitor (observe-only): still records every command into the graph, but never
@@ -289,6 +363,15 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
         .unwrap_or(rules);
     let source_session = hook_session(&buf);
     let source_event_id = hook_event_id(&buf);
+
+    // Behavioural layer: a burst of calls, or repeated sensitive reads, is only
+    // visible ACROSS invocations. `agent-guard` has always had the logic; this
+    // binary could not use it because the hook is a one-shot process and the
+    // tracker held `Instant`s. `session_store` persists it, keyed by the session
+    // id the agent already sends us. Best-effort by design: it never blocks a
+    // tool call on its own, it raises the score so the existing policy decides.
+    let behaviour = session_store::record_call(source_session.as_deref());
+    let verdict = apply_behaviour(verdict, behaviour.as_ref());
 
     // Record EVERY screened command into the narrative graph (allow AND deny).
     // Persist recommendation and real outcome separately: monitor records a deny
@@ -446,8 +529,45 @@ enum InstallArgs {
 
 /// Parse the `install` argument list. Pure, so it is unit-testable without
 /// touching the filesystem or `$HOME`.
+/// Resolve which agent `install` should target when none was named.
+///
+/// Detects what has actually run under `home` and prefers an agent that can take
+/// a settings hook. Assuming `claude-code` was how a host with no Claude Code
+/// ended up with a `~/.claude/settings.json` created from nothing and a success
+/// message for an agent that was not there.
+pub(crate) fn resolve_install_target(home: &std::path::Path) -> Result<String, String> {
+    use innerwarden_agent_guard::hook_targets::{self, Mechanism};
+    let found = hook_targets::detect_installed(home);
+    if found.is_empty() {
+        return Err(format!(
+            "no known AI agent detected under {}. Nothing was written: installing a hook for \
+             an absent agent would report protection that does not exist.\n  \
+             Name one explicitly if you are setting up ahead of it:  innerwarden install <{}>",
+            home.display(),
+            hook_targets::known_ids()
+        ));
+    }
+    if let Some(t) = found
+        .iter()
+        .find(|t| matches!(t.mechanism, Mechanism::SettingsHook { .. }))
+    {
+        return Ok(t.id.to_string());
+    }
+    // Everything detected needs a different mechanism, so say which, per agent.
+    let advice = found
+        .iter()
+        .map(|t| format!("  {}", hook_targets::guidance(t)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Err(format!(
+        "detected {} agent(s), none of which exposes a hook this can install into:\n{advice}",
+        found.len()
+    ))
+}
+
 fn parse_install_args(rest: &[String]) -> InstallArgs {
-    let mut agent = String::from("claude-code");
+    // Empty means "detect"; resolved later, once $HOME is known.
+    let mut agent = String::new();
     let mut settings: Option<String> = None;
     let mut block_review = false;
     let mut monitor = false;
@@ -499,6 +619,17 @@ fn cmd_install(rest: &[String]) -> std::process::ExitCode {
             eprintln!("innerwarden install: {e}");
             return std::process::ExitCode::from(2);
         }
+    };
+    let agent = if agent.is_empty() {
+        match resolve_install_target(&home) {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("innerwarden install: {e}");
+                return std::process::ExitCode::from(2);
+            }
+        }
+    } else {
+        agent
     };
     let iw_guard = match std::env::current_exe() {
         Ok(p) => p,
@@ -729,11 +860,18 @@ fn cmd_serve(rest: &[String]) -> std::process::ExitCode {
         }
     }
 
-    let engine = RuleEngine::load_embedded();
+    // Shell surface only: loading the whole corpus compiles 62 regexes
+    // (~130ms) that cannot match a command, on a process that runs per
+    // tool call. See `RuleEngine::load_embedded_for`.
+    let engine =
+        RuleEngine::load_embedded_for(innerwarden_agent_guard::rules::AtrSource::ShellCommand);
     let server = match tiny_http::Server::http(bind.as_str()) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("innerwarden: failed to bind {bind}: {e}");
+            // A bind failure on the contract port usually means Active Defence
+            // is already answering it, which is not a fault to fix.
+            let failure = serve_owner::classify(&bind, serve_owner::contract_answers(&bind));
+            eprintln!("{}", serve_owner::explain(&failure, &bind, &e.to_string()));
             return std::process::ExitCode::from(1);
         }
     };
@@ -940,6 +1078,7 @@ fn help_text() -> String {
            \x20                                wire a PreToolUse hook into Claude Code (--monitor = records, never blocks)\n  \
            {p} uninstall claude-code     remove that hook (leaves other settings untouched)\n  \
            {p} upgrade                   update to the latest signed release (verifies before replacing)\n  \
+         {p} host <command>            run a command in the Active Defence host layer\n  \
            {p} uninstall                 remove InnerWarden entirely: hook, config, and the binary\n  \
            {p} agents [connect [--monitor]|disconnect [--all|<name>]]\n  \
            \x20                                find AI agents on this machine + connect the guard\n  \
@@ -1142,10 +1281,14 @@ mod tests {
 
     #[test]
     fn parse_install_args_defaults_flags_and_errors() {
+        // No agent named means DETECT, resolved once $HOME is known. It used to
+        // default to `claude-code`, which is how a host with no Claude Code got
+        // a settings file created from nothing and a success message for an
+        // agent that was not there.
         assert_eq!(
             parse_install_args(&[]),
             InstallArgs::Run {
-                agent: "claude-code".into(),
+                agent: String::new(),
                 settings: None,
                 block_review: false,
                 monitor: false,
@@ -1169,7 +1312,7 @@ mod tests {
         assert_eq!(
             parse_install_args(&["--monitor".into()]),
             InstallArgs::Run {
-                agent: "claude-code".into(),
+                agent: String::new(),
                 settings: None,
                 block_review: false,
                 monitor: true,
@@ -1200,5 +1343,162 @@ mod tests {
         assert!(!is_deny(&serde_json::json!({"recommendation": "allow"})));
         assert!(!is_deny(&serde_json::json!({"recommendation": "review"})));
         assert!(!is_deny(&serde_json::json!({})));
+    }
+}
+
+#[cfg(test)]
+mod behaviour_tests {
+    use super::*;
+    use innerwarden_agent_guard::session::{Alert, Layer};
+    use serde_json::json;
+
+    fn alert() -> Alert {
+        Alert {
+            layer: Layer::Warn,
+            reason: "31/min exceeds limit (30)".into(),
+        }
+    }
+
+    /// REGRESSION ANCHOR. A session-level signal must reach the verdict at all:
+    /// this is the behaviour `agent-guard` always had and this binary could
+    /// never use, because the hook is one-shot and the tracker held `Instant`s.
+    ///
+    /// FAILS ON REVERT: stop folding the alert in and the recommendation stays
+    /// `allow`.
+    #[test]
+    fn a_session_alert_raises_allow_to_review() {
+        let out = apply_behaviour(json!({"recommendation": "allow"}), Some(&alert()));
+        assert_eq!(out["recommendation"], "review");
+        assert!(out["explanation"]
+            .as_str()
+            .unwrap()
+            .contains("session behaviour"));
+    }
+
+    /// The alert describes the SESSION, not this command. A fast agent doing
+    /// safe work is not an attack, so a rate signal must never manufacture a
+    /// deny on its own.
+    #[test]
+    fn a_session_alert_never_invents_a_deny() {
+        let out = apply_behaviour(json!({"recommendation": "allow"}), Some(&alert()));
+        assert_ne!(out["recommendation"], "deny");
+    }
+
+    /// An existing decision outranks the session signal in both directions: a
+    /// deny is not softened, and a review is not double-counted.
+    #[test]
+    fn an_existing_verdict_is_not_downgraded() {
+        for existing in ["deny", "review"] {
+            let out = apply_behaviour(
+                json!({"recommendation": existing, "explanation": "reverse shell"}),
+                Some(&alert()),
+            );
+            assert_eq!(out["recommendation"], existing);
+            let expl = out["explanation"].as_str().unwrap();
+            assert!(expl.starts_with("reverse shell"), "original reason kept");
+            assert!(
+                expl.contains("session behaviour"),
+                "and the session reason added"
+            );
+        }
+    }
+
+    /// No alert must be byte-for-byte no change, so a quiet session is
+    /// indistinguishable from the behaviour layer being absent.
+    #[test]
+    fn no_alert_leaves_the_verdict_untouched() {
+        let original = json!({"recommendation": "allow", "explanation": "clean"});
+        assert_eq!(apply_behaviour(original.clone(), None), original);
+    }
+}
+
+#[cfg(test)]
+mod install_target_tests {
+    use super::*;
+
+    fn home_with(entries: &[&str]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for e in entries {
+            std::fs::create_dir_all(dir.path().join(e)).expect("mkdir");
+        }
+        dir
+    }
+
+    /// REGRESSION ANCHOR. `install` defaulted to `claude-code`, so on a host
+    /// with none it created `~/.claude/settings.json` from nothing and reported
+    /// success for an agent that was not there. Reported coverage that does not
+    /// exist is worse than none: the operator stops looking.
+    ///
+    /// FAILS ON REVERT: default the agent again and this stops erroring.
+    #[test]
+    fn an_empty_host_is_refused_rather_than_assumed() {
+        let home = home_with(&[]);
+        let err = resolve_install_target(home.path()).unwrap_err();
+        assert!(err.contains("no known AI agent detected"));
+        assert!(
+            !home.path().join(".claude").exists(),
+            "must not create config for an absent agent"
+        );
+    }
+
+    #[test]
+    fn a_detected_hookable_agent_is_chosen() {
+        let home = home_with(&[".claude"]);
+        assert_eq!(resolve_install_target(home.path()).unwrap(), "claude-code");
+    }
+
+    /// When only hookless agents are present, the error must route each one to
+    /// the mechanism that covers it instead of refusing flatly.
+    /// Each hookless agent must be routed to the mechanism that covers IT, and
+    /// to the automatic form of that mechanism where one exists.
+    #[test]
+    fn hookless_agents_are_routed_per_agent() {
+        let home = home_with(&[".cursor", ".codex"]);
+        let err = resolve_install_target(home.path()).unwrap_err();
+        assert!(err.contains("Cursor") && err.contains("Codex CLI"));
+        assert!(
+            err.contains("innerwarden agents connect"),
+            "both are wirable, so the automatic path is the one to name: {err}"
+        );
+    }
+
+    /// REGRESSION ANCHOR. OpenClaw is the agent this product's description names
+    /// first, and it had no path at all: `mcp_wire` located server tables by
+    /// top-level key, and OpenClaw nests its own under `mcp.servers`. It is now
+    /// routed to the automatic path like any other MCP agent.
+    ///
+    /// FAILS ON REVERT: drop the nested path and this stops naming `connect`.
+    #[test]
+    fn openclaw_is_routed_to_the_automatic_path() {
+        let home = home_with(&[".openclaw"]);
+        let err = resolve_install_target(home.path()).unwrap_err();
+        assert!(err.contains("OpenClaw"));
+        assert!(
+            err.contains("innerwarden agents connect openclaw"),
+            "must name the automatic path: {err}"
+        );
+    }
+
+    /// An agent nothing can wire yet must be routed to isolation, never offered
+    /// a connect command that would silently do nothing. Goose keeps its servers
+    /// in YAML, which no writer here can round-trip.
+    #[test]
+    fn an_unwirable_agent_is_routed_to_isolation() {
+        let home = home_with(&[".config/goose"]);
+        let err = resolve_install_target(home.path()).unwrap_err();
+        assert!(err.contains("Goose"));
+        assert!(err.contains("innerwarden contain"), "got: {err}");
+        assert!(
+            !err.contains("agents connect"),
+            "offering a connect that cannot work would be a false promise: {err}"
+        );
+    }
+
+    /// A hookable agent wins over a hookless one, so the strongest available
+    /// mechanism is the default rather than whichever was detected first.
+    #[test]
+    fn a_hookable_agent_is_preferred_over_a_hookless_one() {
+        let home = home_with(&[".cursor", ".claude"]);
+        assert_eq!(resolve_install_target(home.path()).unwrap(), "claude-code");
     }
 }

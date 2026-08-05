@@ -1322,8 +1322,19 @@ mod tests {
             .iter()
             .find(|agent| agent["id"] == "openclaw")
             .unwrap();
-        assert_eq!(openclaw["guardrail"]["setup_support"], "unsupported");
-        assert_eq!(openclaw["auto_connect_eligible"], false);
+        // OpenClaw became automatically guardable on 2026-08-05, once `mcp_wire`
+        // could locate a nested `mcp.servers` table, so the MECHANISM is now
+        // automatic.
+        assert_eq!(openclaw["guardrail"]["setup_support"], "automatic");
+        // Eligibility is a separate question about THIS file, and this fixture
+        // is genuinely JSON5 (`{ gateway: ... }`, an unquoted key). The strict
+        // reader refuses it, so nothing would be rewritten. That refusal IS the
+        // safety property: a file we cannot round-trip losslessly is left alone
+        // rather than mangled.
+        assert_eq!(
+            openclaw["auto_connect_eligible"], false,
+            "a JSON5 config must not be reported as ready to rewrite"
+        );
         assert!(openclaw["detected_by"]
             .as_array()
             .unwrap()

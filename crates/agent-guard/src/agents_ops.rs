@@ -557,6 +557,31 @@ pub fn has_guard_wiring(home: &Path, agent: &str) -> bool {
 /// Inspect any recognised wiring using an already-discovered row. Repair and
 /// mode-switching callers use this form to avoid rediscovering every generic MCP
 /// config once per row; dashboard posture uses [`status_is_effectively_guarded`].
+/// Is there guarding work still to do for this agent?
+///
+/// For a hook agent this is simply "the hook is absent": there is no partial
+/// state. For an MCP agent it means at least one stdio server is still open,
+/// which is NOT the same as "the file has never been touched". See
+/// [`mcp_wire::has_unguarded_stdio_server`].
+pub fn status_has_unguarded_server(home: &Path, agent: &AgentStatus) -> bool {
+    if agent.hookable {
+        return !read_json(&home.join(".claude/settings.json"))
+            .map(|value| hook::has_iwguard_wiring(&value))
+            .unwrap_or(false);
+    }
+    if let Some(relative) = &agent.mcp_json {
+        return read_json(&home.join(relative))
+            .map(|value| mcp_wire::has_unguarded_stdio_server(&value))
+            .unwrap_or(false);
+    }
+    if let Some(relative) = &agent.mcp_toml {
+        return read_toml(&home.join(relative))
+            .map(|document| mcp_wire_toml::has_unguarded_stdio_server_toml(&document))
+            .unwrap_or(false);
+    }
+    false
+}
+
 pub fn status_has_guard_wiring(home: &Path, agent: &AgentStatus) -> bool {
     if agent.hookable {
         return read_json(&home.join(".claude/settings.json"))
@@ -1235,8 +1260,14 @@ mod tests {
                 vec![DiscoveryEvidence::ConfigurationFile],
                 "{name} evidence"
             );
-            assert!(!row.guardable(), "{name} must remain manual");
         }
+        // Hermes has no reviewed MCP surface, so it stays manual. OpenClaw
+        // became guardable on 2026-08-05 once `mcp_wire` could locate a nested
+        // `mcp.servers` table; the point of THIS test is that a config file
+        // alone is evidence of configuration and not of an installed CLI, which
+        // holds for both regardless.
+        let hermes = rows.iter().find(|row| row.name == "hermes").unwrap();
+        assert!(!hermes.guardable(), "hermes must remain manual");
     }
 
     #[cfg(unix)]

@@ -145,9 +145,18 @@ pub const KNOWN: &[Known] = &[
             format: ConfigFormat::Json5Object,
         }),
         hookable: false,
-        // OpenClaw uses JSON5 with nested `mcp.servers`; leave it untouched
-        // until that schema has its own lossless editor.
-        mcp_json: None,
+        // OpenClaw keeps its servers under a NESTED `mcp.servers`, which
+        // `mcp_wire` now locates by path rather than by top-level key.
+        //
+        // The format is declared JSON5, and that is why this was left alone: a
+        // file with comments or trailing commas cannot be rewritten losslessly
+        // by a JSON writer. The guarantee comes from the reader, not from a new
+        // parser: `read_json_for_update` uses `serde_json`, which REJECTS every
+        // JSON5 extension. So a genuinely JSON5 file fails to parse and nothing
+        // is written, while the ordinary case (strict JSON, which is what
+        // OpenClaw actually writes) is guarded. Refusing to touch the file was
+        // never the safety property; parsing strictly is.
+        mcp_json: Some(".openclaw/openclaw.json"),
         mcp_toml: None,
     },
     Known {
@@ -474,15 +483,23 @@ mod tests {
             .filter(|known| guardable(known))
             .map(|known| known.name)
             .collect();
+        // OpenClaw joined on 2026-08-05: `mcp_wire` learned to locate a NESTED
+        // server table (`mcp.servers`), which was the only thing keeping the
+        // agent this product's own description names first unguardable.
         assert_eq!(
             guarded_names,
-            vec!["claude-code", "cursor", "codex", "gemini"]
+            vec!["claude-code", "cursor", "codex", "gemini", "openclaw"]
         );
         let cc = KNOWN.iter().find(|k| k.name == "claude-code").unwrap();
         assert!(cc.hookable && cc.mcp_json.is_none());
         let cursor = KNOWN.iter().find(|k| k.name == "cursor").unwrap();
         assert!(!cursor.hookable && cursor.mcp_json == Some(".cursor/mcp.json"));
         // Codex is wired via its TOML config (~/.codex/config.toml), not an mcp.json.
+        let openclaw = KNOWN.iter().find(|k| k.name == "openclaw").unwrap();
+        assert!(
+            !openclaw.hookable && openclaw.mcp_json == Some(".openclaw/openclaw.json"),
+            "OpenClaw has no hook surface and is guarded through its MCP config"
+        );
         let codex = KNOWN.iter().find(|k| k.name == "codex").unwrap();
         assert!(
             !codex.hookable
@@ -492,7 +509,9 @@ mod tests {
         );
         let gemini = KNOWN.iter().find(|k| k.name == "gemini").unwrap();
         assert_eq!(gemini.mcp_json, Some(".gemini/settings.json"));
-        for name in ["goose", "aider", "openclaw", "hermes"] {
+        // Still manual: Goose keeps its servers in YAML and Aider/Hermes have no
+        // reviewed MCP surface at all, so a JSON writer must not touch either.
+        for name in ["goose", "aider", "hermes"] {
             let known = KNOWN.iter().find(|known| known.name == name).unwrap();
             assert!(!guardable(known), "{name} must remain manual");
         }

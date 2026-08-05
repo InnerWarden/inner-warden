@@ -248,9 +248,22 @@ fn install_hook_with_link_policy(
     monitor: bool,
     reject_symlinks: bool,
 ) -> Result<AutomaticHookInstall, String> {
+    // An agent this build has never heard of is a typo; one it knows but which
+    // has no settings hook gets ROUTED to the mechanism that does cover it,
+    // never a bare refusal. The old message said "only 'claude-code' is
+    // supported today", which on a host running anything else read as
+    // "InnerWarden cannot protect this" and was false.
     if agent != "claude-code" {
+        if let Some(target) = crate::hook_targets::by_id(agent) {
+            return Err(format!(
+                "{} does not expose a hook this can install into.\n  {}",
+                target.display,
+                crate::hook_targets::guidance(target)
+            ));
+        }
         return Err(format!(
-            "unsupported agent '{agent}' (only 'claude-code' is supported today)"
+            "unknown agent '{agent}'. Known: {}",
+            crate::hook_targets::known_ids()
         ));
     }
 
@@ -1170,12 +1183,62 @@ mod tests {
         );
     }
 
+    /// REGRESSION ANCHOR. A KNOWN agent without a hook surface must be routed to
+    /// the mechanism that covers it, not refused. The old message said "only
+    /// 'claude-code' is supported today", which on a host running Cursor read as
+    /// "InnerWarden cannot protect this" and was false: the MCP proxy covers it.
+    ///
+    /// FAILS ON REVERT: restore the blanket refusal and the guidance check trips.
     #[test]
-    fn install_hook_rejects_unknown_agent() {
+    fn a_known_agent_without_a_hook_is_routed_not_refused() {
         let home = tempfile::TempDir::new().unwrap();
         let err =
             install_hook(home.path(), "cursor", None, Path::new("/x"), false, false).unwrap_err();
-        assert!(err.contains("unsupported agent"));
+        assert!(err.contains("Cursor"), "must name the agent: {err}");
+        assert!(
+            err.contains("innerwarden agents connect"),
+            "must name the AUTOMATIC mechanism that covers it: {err}"
+        );
+        assert!(
+            !err.contains("only 'claude-code'"),
+            "must not claim the product supports one agent: {err}"
+        );
+    }
+
+    /// An agent nobody has heard of is a typo, and the error should list what is
+    /// accepted rather than only what is not.
+    #[test]
+    fn an_unknown_agent_lists_what_is_accepted() {
+        let home = tempfile::TempDir::new().unwrap();
+        let err = install_hook(
+            home.path(),
+            "not-an-agent",
+            None,
+            Path::new("/x"),
+            false,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.contains("unknown agent"));
+        assert!(err.contains("claude-code") && err.contains("openclaw"));
+    }
+
+    /// OpenClaw has no hook surface, and must be routed to the MCP path that
+    /// does cover it rather than refused.
+    #[test]
+    fn openclaw_is_routed_to_its_mcp_path() {
+        let home = tempfile::TempDir::new().unwrap();
+        let err =
+            install_hook(home.path(), "openclaw", None, Path::new("/x"), false, false).unwrap_err();
+        assert!(err.contains("OpenClaw"));
+        assert!(
+            err.contains("innerwarden agents connect openclaw"),
+            "must name the automatic mechanism that covers it: {err}"
+        );
+        assert!(
+            err.contains("relays"),
+            "and must explain why a hook is not the mechanism: {err}"
+        );
     }
 
     #[test]
