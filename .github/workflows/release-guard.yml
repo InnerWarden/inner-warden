@@ -71,12 +71,29 @@ jobs:
       # bwrap's uid map, so allow it here.
       - name: Install the Linux AI Jail backend
         if: matrix.builder == 'zigbuild'
+        # Same mitigation CI carries: a fresh runner boots with
+        # unattended-upgrades holding the dpkg lock, and without a lock timeout
+        # this hangs until the job is killed. The release path had the bare
+        # form, so the ONE build that has to succeed on demand was the flakiest.
+        timeout-minutes: 8
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes bubblewrap
+          sudo systemctl stop unattended-upgrades.service 2>/dev/null || true
+          sudo apt-get -o DPkg::Lock::Timeout=300 update
+          sudo apt-get -o DPkg::Lock::Timeout=300 install --yes bubblewrap
           test "$(command -v bwrap)" = /usr/bin/bwrap
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
           sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
+
+      # The dashboard bundle is EMBEDDED in the binary being signed. CI checks
+      # its freshness on every push; the release path did not, so the only
+      # thing between a stale UI and a signed release was remembering to look
+      # at CI before dispatching. Check it here, where it is about to ship.
+      - name: The embedded dashboard bundle must match its sources
+        if: matrix.builder == 'zigbuild'
+        working-directory: crates/dashboard-kit/web
+        run: |
+          npm ci
+          npm run bundle:check
 
       - name: Test the Community crates
         if: matrix.builder == 'zigbuild'
@@ -159,6 +176,16 @@ jobs:
           set -euo pipefail
           chmod +x dist/innerwarden-linux-x86_64
           ver="$(./dist/innerwarden-linux-x86_64 --version | awk '{print $NF}')"
+          # A `guard-v1.1.0` tag cut from a tree that still says 1.0.7 would
+          # publish the new bytes labelled with the old version, to Scoop and to
+          # every consumer that reads the manifest. Nothing checked.
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            want="${GITHUB_REF_NAME#guard-v}"
+            [ "$ver" = "$want" ] || {
+              echo "::error::tag $GITHUB_REF_NAME does not match the built binary, which reports $ver"
+              exit 1
+            }
+          fi
           h64="$(awk '{print $1}' dist/innerwarden-windows-x86_64.exe.sha256)"
           harm="$(awk '{print $1}' dist/innerwarden-windows-aarch64.exe.sha256)"
           python3 - "$ver" "$h64" "$harm" <<'PY'
