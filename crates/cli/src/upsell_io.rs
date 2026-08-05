@@ -102,12 +102,21 @@ pub fn show_upsell(command: &str) -> ExitCode {
 /// The escape hatch for the overlap: without it, a verb both layers implement is
 /// answered here and the host one cannot be reached at all.
 pub fn cmd_host(rest: &[String]) -> ExitCode {
-    let Some(verb) = rest.first() else {
+    // `--help` is a request for usage, not a verb to forward. Delegating it
+    // produced "there is no host layer to run `--help` in", which is nonsense.
+    let asked_for_help = rest
+        .first()
+        .is_some_and(|a| a == "--help" || a == "-h" || a == "help");
+    let Some(verb) = rest.first().filter(|_| !asked_for_help) else {
         eprintln!("innerwarden host <command> [args]");
         eprintln!("  Runs a command in the Active Defence host layer.");
         eprintln!("  Use it to reach a host command whose name this binary also has:");
         eprintln!("    {}", SHARED_VERBS.join(", "));
-        return ExitCode::from(2);
+        return if asked_for_help {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::from(2)
+        };
     };
     if find_ad_cli().is_none() {
         eprintln!(
@@ -157,5 +166,38 @@ mod shared_verb_tests {
     fn an_exclusive_verb_never_points_at_the_host_layer() {
         assert_eq!(shared_verb_hint("check"), None);
         assert_eq!(shared_verb_hint("proxy"), None);
+    }
+}
+
+#[cfg(test)]
+mod host_help_tests {
+    use super::*;
+
+    /// `--help` is a request for usage, not a verb to forward. Delegating it
+    /// produced "there is no host layer to run `--help` in", which is nonsense
+    /// and, on a machine WITH Active Defence, would have run `innerwarden-ctl
+    /// --help` instead of explaining this command.
+    #[test]
+    fn help_is_usage_and_not_a_verb_to_delegate() {
+        for flag in ["--help", "-h", "help"] {
+            let code = cmd_host(&[flag.to_string()]);
+            assert_eq!(
+                format!("{code:?}"),
+                format!("{:?}", ExitCode::SUCCESS),
+                "`host {flag}` must succeed with usage"
+            );
+        }
+    }
+
+    /// No arguments at all is a usage ERROR, so a script that forgot the verb
+    /// fails rather than looking like it worked.
+    #[test]
+    fn a_missing_verb_is_still_an_error() {
+        let code = cmd_host(&[]);
+        assert_ne!(
+            format!("{code:?}"),
+            format!("{:?}", ExitCode::SUCCESS),
+            "a missing verb must not exit 0"
+        );
     }
 }
