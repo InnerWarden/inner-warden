@@ -67,7 +67,12 @@ export type LocalAgent = {
 export type AgentsResponse = {
   schema_version: 2;
   generated_at_ms: number;
-  availability: "loading" | "available" | "error";
+  // "unavailable" is a real answer, not a failure: the endpoint looked and
+  // could not enumerate. The paid side reports it whenever the agent registry
+  // is absent or unreadable. Leaving it out of the union made a valid payload
+  // fail validation, so the panel rendered "did not respond" about an endpoint
+  // that had answered.
+  availability: "loading" | "available" | "error" | "unavailable";
   discovery_limited: boolean;
   auto_connect: {
     status?: "available" | "unavailable";
@@ -171,7 +176,7 @@ function isAgentsResponse(value: unknown): value is AgentsResponse {
   if (!isRecord(value) || !Array.isArray(value.agents) || !isRecord(value.auto_connect)) return false;
   return value.schema_version === 2
     && typeof value.generated_at_ms === "number"
-    && ["loading", "available", "error"].includes(String(value.availability))
+    && ["loading", "available", "error", "unavailable"].includes(String(value.availability))
     && typeof value.discovery_limited === "boolean"
     && (typeof value.auto_connect.enabled === "boolean" || value.auto_connect.enabled === null)
     && (typeof value.auto_connect.mode === "string" || value.auto_connect.mode === null)

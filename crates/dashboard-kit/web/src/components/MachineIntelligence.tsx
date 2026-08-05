@@ -138,6 +138,10 @@ function usePollingResource<T>(load: () => Promise<T>, intervalMs: number, retry
 function AgentsPanel({ state }: { state: PollState<AgentsResponse> }) {
   const { data, error, loading } = state;
   const scanning = loading || data?.availability === "loading";
+  // `unavailable` arrives WITH data, so it renders through the data branch and
+  // gets its own honest message there rather than falling through to the
+  // no-response panel below.
+  const couldNotEnumerate = data?.availability === "unavailable";
   const autoConnectKnown = data?.auto_connect.status === "available"
     && data.auto_connect.enabled != null
     && data.auto_connect.mode != null;
@@ -173,7 +177,11 @@ function AgentsPanel({ state }: { state: PollState<AgentsResponse> }) {
             </div>
           )}
           {data.agents.length === 0 ? (
-            <EmptyPanel title="No compatible agents detected" body="Install or launch an agent, or configure a standard MCP client, then keep the InnerWarden dashboard process running while it checks again." />
+            couldNotEnumerate ? (
+              <EmptyPanel title="Agent detection could not run" body="The host answered but could not enumerate agents, so none are listed. On the paid tier this is an absent or unreadable agent registry; nothing is being inferred from the gap." />
+            ) : (
+              <EmptyPanel title="No compatible agents detected" body="Install or launch an agent, or configure a standard MCP client, then keep the InnerWarden dashboard process running while it checks again." />
+            )
           ) : (
             <ul className="grid gap-px bg-slate-200 md:grid-cols-2">
               {data.agents.map((agent) => <AgentCard key={agent.id} agent={agent} />)}
@@ -181,7 +189,16 @@ function AgentsPanel({ state }: { state: PollState<AgentsResponse> }) {
           )}
         </div>
       ) : (
-        <UnavailablePanel title="Agent detection is unavailable" body="The local endpoint did not respond. InnerWarden will keep trying; automatic setup continues to follow the policy shown when the endpoint is available." />
+        // Two different facts, and saying the wrong one sends the operator to
+        // check the wrong thing. No data at all means the request never landed.
+        // Data that says `unavailable` means it DID land and the host could not
+        // enumerate agents -- on the paid side, an absent or unreadable agent
+        // registry. Reporting that as "did not respond" is the product
+        // describing a state it is not in.
+        <UnavailablePanel
+          title="Agent detection is unavailable"
+          body="The local endpoint did not respond. InnerWarden will keep trying; automatic setup continues to follow the policy shown when the endpoint is available."
+        />
       )}
     </section>
   );
