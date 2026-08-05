@@ -7,7 +7,8 @@
 //! files find configured agents even when idle. A bare dot-directory is only a
 //! possible leftover, never proof of installation. Connecting = wiring the
 //! Community guardrail by a reviewed, agent-specific mechanism. Claude Code
-//! gets the fail-closed PreToolUse hook;
+//! gets the blocking PreToolUse hook (blocking on a deny, not fail-closed: see
+//! `cmd_install`);
 //! Cursor and Gemini use their JSON MCP configuration, and Codex uses TOML.
 //! Other detected agents remain visible but are not modified automatically until
 //! InnerWarden has an integration for their real configuration format.

@@ -41,8 +41,12 @@ Debian/Ubuntu and Fedora/RHEL packages are attached to each release; see
 Windows (PowerShell):
 
 ```powershell
-irm https://innerwarden.com/free.exe -OutFile innerwarden.exe
+irm https://innerwarden.com/free.ps1 | iex
 ```
+
+The installer verifies the binary's SHA-256 and Ed25519 signature against a key
+pinned inside the installer. Downloading the bare `.exe` skips both, which is
+the trust model this project exists to argue against.
 
 With Rust / cargo (any platform):
 
@@ -63,7 +67,9 @@ only — no IP, no host data; set `INNERWARDEN_NO_TELEMETRY=1` to disable). A
   every JSON-RPC message and can refuse a disallowed tool call inline. stdout
   stays pure MCP traffic, alerts go to stderr.
 - AI Jail: run an agent in a constrained profile so a screened-and-denied action
-  is stopped rather than merely flagged.
+  is stopped rather than merely flagged. Linux (bubblewrap) and macOS
+  (sandbox-exec) only; `contain` exits with an explicit error on Windows rather
+  than pretending to isolate.
 - Agent discovery: finds AI agents and agent tooling on the machine so you can
   see what is running and wire the guardrail into it.
 - Local dashboard: a read-only view on loopback at `http://127.0.0.1:8788`

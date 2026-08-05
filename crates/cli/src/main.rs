@@ -510,9 +510,13 @@ fn cmd_mode(rest: &[String], monitor: bool) -> std::process::ExitCode {
 }
 
 /// `innerwarden install [claude-code] [--settings PATH] [--block-review]` - wire the
-/// guardrail into Claude Code as a fail-closed PreToolUse:Bash hook in one
-/// command. The hook runs `innerwarden hook`, which screens each proposed shell
-/// command in-process before it executes. Idempotent; preserves existing settings.
+/// guardrail into Claude Code as a blocking PreToolUse:Bash hook in one command.
+/// The hook runs `innerwarden hook`, which screens each proposed shell command
+/// in-process before it executes and exits non-zero on a deny. It is NOT
+/// fail-closed and must not be described as such: unparseable input, or a tool
+/// call with no shell command in it, is allowed through, because wedging every
+/// non-Bash tool call would get the guardrail uninstalled within the hour.
+/// Idempotent; preserves existing settings.
 /// Parsed `install` arguments (agent target, optional settings path, block-review
 /// flag). `Help` requests the usage text; `Err` carries a message for an
 /// unexpected flag.
