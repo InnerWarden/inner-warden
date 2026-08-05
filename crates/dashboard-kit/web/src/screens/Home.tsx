@@ -108,7 +108,7 @@ figures below cannot be shown. This is a producer fault, not an empty host.`}
       <MachineIntelligence edition={edition} />
 
       {overview.commands === 0 ? (
-        <ZeroState guardedAgents={guardedAgents} />
+        <ZeroState guardedAgents={guardedAgents} edition={edition} />
       ) : (
         <>
           <section aria-labelledby="decision-summary-title">
@@ -414,7 +414,30 @@ function RiskSignals({ items, max }: { items: Overview["top_categories"]; max: n
   );
 }
 
-function ZeroState({ guardedAgents }: { guardedAgents?: number }) {
+/**
+ * The command that actually flips enforcement on, for the product being shown.
+ *
+ * REGRESSION ANCHOR. Step 3 hardcoded `innerwarden enforce`. That command is
+ * real in Community and DOES NOT EXIST in Enterprise, where enforcement is the
+ * kernel exec-gate -- so the final step of the paid onboarding told the
+ * operator to run a command that exits with an error. This file is shared by
+ * both products, which is exactly why the string cannot be a constant.
+ *
+ * Both were verified against the shipped CLIs rather than assumed.
+ */
+export function enforceCommand(edition?: "community" | "enterprise"): string {
+  return edition === "enterprise" ? "innerwarden exec-gate enforce" : "innerwarden enforce";
+}
+
+export function enforceHint(edition?: "community" | "enterprise"): string {
+  return edition === "enterprise"
+    // The paid gate refuses a blind flip: it enforces only after an
+    // observe-armed, scoped, zero-would-block rehearsal.
+    ? "Flip the kernel gate to deny, after a clean rehearsal."
+    : "Block deny decisions on supported integrations.";
+}
+
+function ZeroState({ guardedAgents, edition }: { guardedAgents?: number; edition?: "community" | "enterprise" }) {
   const hasConfiguredAgent = guardedAgents != null && guardedAgents > 0;
   return (
     <section className="rounded-2xl border border-dashed border-slate-300 bg-white p-6 sm:p-8" aria-labelledby="zero-state-title">
@@ -430,7 +453,7 @@ function ZeroState({ guardedAgents }: { guardedAgents?: number }) {
       <ol className="mx-auto mt-7 grid max-w-3xl gap-3 sm:grid-cols-3">
         <OnboardingStep number="1" title="Connect safely" command="innerwarden setup">Detect agents and begin in monitor mode.</OnboardingStep>
         <OnboardingStep number="2" title="Review evidence" command="innerwarden dashboard">Inspect captured shell, MCP and one-off decisions here.</OnboardingStep>
-        <OnboardingStep number="3" title="Enforce when ready" command="innerwarden enforce">Block deny decisions on supported integrations.</OnboardingStep>
+        <OnboardingStep number="3" title="Enforce when ready" command={enforceCommand(edition)}>{enforceHint(edition)}</OnboardingStep>
       </ol>
     </section>
   );

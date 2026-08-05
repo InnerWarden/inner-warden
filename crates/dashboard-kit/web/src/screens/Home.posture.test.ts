@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { ENTERPRISE_UNKNOWN_POSTURE, POSTURES, editionLabel, postureFor } from "./Home";
+import { ENTERPRISE_UNKNOWN_POSTURE, POSTURES, editionLabel, enforceCommand, enforceHint, postureFor } from "./Home";
 
 describe("the unknown posture on a paid host", () => {
   // REGRESSION ANCHOR. Observed on the production box: the Enterprise Overview
@@ -57,5 +57,33 @@ describe("the dashboard names the edition that is installed", () => {
   it("claims neither tier before the edition resolves", () => {
     // Guessing here would put a tier on screen we cannot back yet.
     expect(editionLabel(undefined)).toBe("InnerWarden");
+  });
+});
+
+describe("the enforce step names a command that exists", () => {
+  // REGRESSION ANCHOR. Step 3 hardcoded `innerwarden enforce`. That command is
+  // real in Community and absent from Enterprise, where enforcement is the
+  // kernel exec-gate -- so the last step of the PAID onboarding told the
+  // operator to run something that errors out. Verified against both shipped
+  // CLIs: Community `main.rs` dispatches "enforce"; the Enterprise ctl exposes
+  // `exec-gate {status,arm,rehearse,enforce,disarm}` and no bare `enforce`.
+  //
+  // FAILS ON REVERT: hardcode either string and the other edition trips.
+  it("sends Enterprise to the exec-gate, not to a command it does not have", () => {
+    expect(enforceCommand("enterprise")).toBe("innerwarden exec-gate enforce");
+  });
+
+  it("keeps the Community command, which is real there", () => {
+    expect(enforceCommand("community")).toBe("innerwarden enforce");
+  });
+
+  it("falls back to the Community command before the edition resolves", () => {
+    // The free CLI is the safe default: naming a paid-only command to someone
+    // who does not have it is the failure being fixed.
+    expect(enforceCommand(undefined)).toBe("innerwarden enforce");
+  });
+
+  it("does not promise a blind flip on the paid gate", () => {
+    expect(enforceHint("enterprise")).toContain("rehearsal");
   });
 });
