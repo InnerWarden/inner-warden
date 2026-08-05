@@ -24,13 +24,13 @@ const PRODUCT_LABELS: Record<string, string> = {
   local_session_log: "Local session log",
 };
 
-export function MachineIntelligence() {
+export function MachineIntelligence({ edition }: { edition?: "community" | "enterprise" } = {}) {
   const agents = usePollingResource(fetchAgents, 30_000, agentsAreLoading);
   const tokens = usePollingResource(fetchTokenIntelligence, 60_000, tokensAreLoading);
 
   return (
     <div className="space-y-6">
-      <AgentsPanel state={agents} />
+      <AgentsPanel state={agents} edition={edition} />
       <TokenPanel state={tokens} />
     </div>
   );
@@ -135,7 +135,7 @@ function usePollingResource<T>(load: () => Promise<T>, intervalMs: number, retry
   return state;
 }
 
-function AgentsPanel({ state }: { state: PollState<AgentsResponse> }) {
+function AgentsPanel({ state, edition }: { state: PollState<AgentsResponse>; edition?: "community" | "enterprise" }) {
   const { data, error, loading } = state;
   const scanning = loading || data?.availability === "loading";
   // `unavailable` arrives WITH data, so it renders through the data branch and
@@ -148,7 +148,11 @@ function AgentsPanel({ state }: { state: PollState<AgentsResponse> }) {
   return (
     <section aria-labelledby="local-agents-title" aria-busy={scanning}>
       <SectionHeading
-        eyebrow="Community visibility"
+        // The eyebrow said "Community visibility" on every host, paid ones
+        // included. Local agent detection is not a Community feature -- it is
+        // the same view in both tiers -- so naming a tier here was both wrong
+        // and, on a paid box, a quiet contradiction of the header above it.
+        eyebrow={edition === "enterprise" ? "Local visibility" : "Community visibility"}
         title="Agents on this machine"
         description="Local detection and guardrail setup are shown as separate signals, so presence is never presented as proof of active protection."
         aside={data ? <GeneratedAt value={data.generated_at_ms} /> : undefined}

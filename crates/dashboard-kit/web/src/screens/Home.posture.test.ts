@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { ENTERPRISE_UNKNOWN_POSTURE, POSTURES, postureFor } from "./Home";
+import { ENTERPRISE_UNKNOWN_POSTURE, POSTURES, editionLabel, postureFor } from "./Home";
 
 describe("the unknown posture on a paid host", () => {
   // REGRESSION ANCHOR. Observed on the production box: the Enterprise Overview
@@ -30,5 +30,32 @@ describe("the unknown posture on a paid host", () => {
     const body = ENTERPRISE_UNKNOWN_POSTURE.body.toLowerCase();
     expect(body).toContain("not running on this host");
     expect(body).toContain("posture");
+  });
+});
+
+describe("the dashboard names the edition that is installed", () => {
+  // REGRESSION ANCHOR. The hero eyebrow was the literal string "InnerWarden
+  // Community" on every host. A paid box announced itself as the free product,
+  // and an operator who upgraded saw no change at all -- which reads as the
+  // upgrade not having taken.
+  //
+  // FAILS ON REVERT: hardcode the label again and the enterprise case trips.
+  it("says Enterprise on a paid host and Community on a free one", () => {
+    expect(editionLabel("enterprise")).toBe("InnerWarden Enterprise");
+    expect(editionLabel("community")).toBe("InnerWarden Community");
+  });
+
+  it("follows an upgrade without anything else changing", () => {
+    // The whole point: same screen, same code path, edition flips, and the
+    // product the operator is looking at is renamed to match.
+    const before = editionLabel("community");
+    const after = editionLabel("enterprise");
+    expect(after).not.toBe(before);
+    expect(after).toContain("Enterprise");
+  });
+
+  it("claims neither tier before the edition resolves", () => {
+    // Guessing here would put a tier on screen we cannot back yet.
+    expect(editionLabel(undefined)).toBe("InnerWarden");
   });
 });

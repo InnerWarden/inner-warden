@@ -105,7 +105,7 @@ figures below cannot be shown. This is a producer fault, not an empty host.`}
 
       <PostureHero mode={mode} edition={edition} decisions={overview.commands} sessions={overview.sessions} guardedAgents={guardedAgents} />
 
-      <MachineIntelligence />
+      <MachineIntelligence edition={edition} />
 
       {overview.commands === 0 ? (
         <ZeroState guardedAgents={guardedAgents} />
@@ -141,7 +141,7 @@ figures below cannot be shown. This is a producer fault, not an empty host.`}
         </>
       )}
 
-      <CommunityIncluded />
+      {edition === "enterprise" ? null : <CommunityIncluded />}
       {edition === "community" ? <ActiveDefenceCard /> : null}
     </div>
   );
@@ -155,6 +155,21 @@ figures below cannot be shown. This is a producer fault, not an empty host.`}
 /// Pure so the CHOICE is testable: this package has no jsdom, and a test that
 /// only compares the two constants passes even when the component picks the
 /// wrong one -- which is exactly what a first attempt at this test did.
+/// The product name the operator is actually looking at.
+///
+/// Hardcoded as "InnerWarden Community" until now, on every host. A paid box
+/// therefore announced itself as the free product -- and an operator who
+/// upgraded saw no change at all, which reads as the upgrade not having taken.
+/// `edition` already reaches this screen; it just was not used here.
+///
+/// Unknown edition keeps the neutral brand rather than guessing: claiming
+/// either tier before the bootstrap resolves would be a claim we cannot back.
+export function editionLabel(edition?: "community" | "enterprise"): string {
+  if (edition === "enterprise") return "InnerWarden Enterprise";
+  if (edition === "community") return "InnerWarden Community";
+  return "InnerWarden";
+}
+
 export function postureFor(mode: GuardrailMode, edition?: "community" | "enterprise") {
   return mode === "unknown" && edition === "enterprise"
     ? ENTERPRISE_UNKNOWN_POSTURE
@@ -238,7 +253,7 @@ function PostureHero({ mode, edition, decisions, sessions, guardedAgents }: { mo
               </span>
             )}
           </div>
-          <p className="mt-5 text-xs font-semibold uppercase tracking-[0.16em] text-cyan-700">InnerWarden Community</p>
+          <p className="mt-5 text-xs font-semibold uppercase tracking-[0.16em] text-cyan-700">{editionLabel(edition)}</p>
           <h1 id="posture-title" className="mt-2 max-w-3xl text-2xl font-semibold tracking-tight text-slate-950 sm:text-3xl">
             {posture.title}
           </h1>
