@@ -56,17 +56,19 @@ jobs:
           runs=$(gh api "repos/${{ github.repository }}/actions/workflows/ci.yml/runs?head_sha=$sha&per_page=20" \
             --jq '[.workflow_runs[] | select(.status=="completed")] | map(.conclusion)')
           echo "CI conclusions for $sha: $runs"
-          if [ "$runs" = "[]" ]; then
-            echo "::error::no completed CI run for $sha. Publishing an untested commit is how a broken build reaches users."
+          # Check every conclusion, unconditionally.
+          #
+          # This was wrapped in `if echo "$runs" | grep -qv 'success'`, which is
+          # the one shape that cannot express "not all successes": grep -qv
+          # selects LINES without the word, and $runs is a single line, so
+          # ["success","failure"] contains "success", grep matches nothing, the
+          # branch is skipped, and the gate falls through to "CI is green".
+          # Only an all-failure array took the branch. The gate exists because
+          # publishing an untested commit is how a broken build reaches users;
+          # a gate that passes a mixed result never provided that.
+          if ! printf '%s' "$runs" | python3 -c 'import json,sys; c=json.load(sys.stdin); sys.exit(0 if c and all(x=="success" for x in c) else 1)'; then
+            echo "::error::CI is not green on $sha: $runs"
             exit 1
-          fi
-          if echo "$runs" | grep -qv 'success'; then
-            if echo "$runs" | python3 -c 'import json,sys; sys.exit(0 if all(c=="success" for c in json.load(sys.stdin)) else 1)'; then
-              :
-            else
-              echo "::error::CI is not green on $sha: $runs"
-              exit 1
-            fi
           fi
           echo "CI is green on $sha"
 

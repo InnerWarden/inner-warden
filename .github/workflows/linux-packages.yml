@@ -59,6 +59,24 @@ jobs:
           node npm/scripts/verify-release-dir.mjs bin \
             innerwarden-linux-x86_64 innerwarden-linux-aarch64
 
+      # Verification proves the bytes are genuinely ours. It says nothing about
+      # WHICH version they are, and the rolling `iw-guard` tag serves whatever
+      # was cut last. Run the packages workflow before release-guard has re-cut
+      # and you get a .deb labelled 1.1.0 containing the 1.0.7 binary, published
+      # to the channel, with every check green. npm already refuses this
+      # (npm/scripts/build.mjs); the Linux channel did not.
+      - name: The published binary must BE the version being packaged
+        run: |
+          set -euo pipefail
+          chmod +x bin/innerwarden-linux-x86_64
+          got="$(./bin/innerwarden-linux-x86_64 --version | awk '{print $NF}')"
+          want="${{ steps.v.outputs.version }}"
+          [ "$got" = "$want" ] || {
+            echo "::error::the rolling iw-guard release serves $got but this run packages $want; cut the guard release first"
+            exit 1
+          }
+          echo "rolling release serves $got, packaging $want"
+
       - name: Build packages
         run: |
           packaging/build-linux-packages.sh \
@@ -69,12 +87,21 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y "./out/innerwarden_${{ steps.v.outputs.version }}_amd64.deb"
-          echo -n "deb -> "; innerwarden --version
+          got="$(innerwarden --version | awk '{print $NF}')"
+          [ "$got" = "${{ steps.v.outputs.version }}" ] || {
+            echo "::error::the installed .deb reports $got, not ${{ steps.v.outputs.version }}"
+            exit 1
+          }
+          echo "deb -> $got"
 
       - name: Test-install the .rpm (Rocky Linux container)
         run: |
           docker run --rm -v "$PWD/out:/pkg" rockylinux:9@sha256:d644d203142cd5b54ad2a83a203e1dee68af2229f8fe32f52a30c6e1d3c3a9e0 bash -c \
-            "dnf install -y /pkg/innerwarden-${{ steps.v.outputs.version }}-1.x86_64.rpm >/dev/null && echo -n 'rpm -> ' && innerwarden --version"
+            "set -e
+             dnf install -y /pkg/innerwarden-${{ steps.v.outputs.version }}-1.x86_64.rpm >/dev/null
+             got=\$(innerwarden --version | awk '{print \$NF}')
+             [ \"\$got\" = '${{ steps.v.outputs.version }}' ] || { echo \"the installed .rpm reports \$got\"; exit 1; }
+             echo \"rpm -> \$got\""
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

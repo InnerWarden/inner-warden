@@ -41,7 +41,17 @@ pub enum Mechanism {
     /// No hook surface, but its MCP configuration can be rewritten to run
     /// through the proxy. `innerwarden agents connect` does that automatically;
     /// `why` explains why a hook is not the mechanism.
-    McpProxy { why: &'static str },
+    ///
+    /// `connect` is the name `agents connect` accepts, which is NOT always this
+    /// target's id: the ids here follow the product names a user recognises
+    /// (`codex-cli`), while [`crate::agents::KNOWN`] keys on the short name
+    /// (`codex`). Printing the id sent the operator to a command that answered
+    /// "no guardable agent named `codex-cli` was found" - advice that fails is
+    /// worse than no advice, because it reads as "this cannot be protected".
+    McpProxy {
+        why: &'static str,
+        connect: &'static str,
+    },
     /// No hook, and its MCP config has no lossless editor yet, so nothing can be
     /// wired automatically. `why` names the blocker.
     NotYetWirable { why: &'static str },
@@ -90,6 +100,7 @@ pub static TARGETS: &[HookTarget] = &[
         // is left untouched.
         mechanism: Mechanism::McpProxy {
             why: "no tool gate of its own; it relays whichever harness it drives",
+            connect: "openclaw",
         },
         markers: &[".openclaw", ".config/openclaw"],
     },
@@ -98,6 +109,7 @@ pub static TARGETS: &[HookTarget] = &[
         display: "Codex CLI",
         mechanism: Mechanism::McpProxy {
             why: "its `notify` hook fires AFTER a command runs, so it cannot block one",
+            connect: "codex",
         },
         markers: &[".codex"],
     },
@@ -106,6 +118,7 @@ pub static TARGETS: &[HookTarget] = &[
         display: "Gemini CLI",
         mechanism: Mechanism::McpProxy {
             why: "no pre-execution command hook is exposed",
+            connect: "gemini",
         },
         markers: &[".gemini"],
     },
@@ -130,22 +143,30 @@ pub static TARGETS: &[HookTarget] = &[
         display: "Cursor",
         mechanism: Mechanism::McpProxy {
             why: "commands run inside the editor process; there is no host-side hook",
+            connect: "cursor",
         },
         markers: &[".cursor"],
     },
     HookTarget {
         id: "windsurf",
         display: "Windsurf",
-        mechanism: Mechanism::McpProxy {
-            why: "commands run inside the editor process; there is no host-side hook",
+        // Advertised a connect command that has no target: `agents::KNOWN` has
+        // no Windsurf row, so `agents connect windsurf` answers "no guardable
+        // agent found". Wiring it needs its MCP config path CONFIRMED, not
+        // guessed - writing to the wrong file is the one failure mode this
+        // module must never have. Until then, isolation is the honest answer.
+        mechanism: Mechanism::NotYetWirable {
+            why: "no host-side hook, and its MCP config location is not confirmed here yet",
         },
         markers: &[".windsurf", ".codeium"],
     },
     HookTarget {
         id: "cline",
         display: "Cline",
-        mechanism: Mechanism::McpProxy {
-            why: "commands run inside the editor process; there is no host-side hook",
+        // Same as Windsurf: no `agents::KNOWN` row, so a connect command would
+        // be a false promise.
+        mechanism: Mechanism::NotYetWirable {
+            why: "no host-side hook, and its MCP config location is not confirmed here yet",
         },
         markers: &[".cline"],
     },
@@ -188,9 +209,9 @@ pub fn guidance(target: &HookTarget) -> String {
         // the proxy, reversibly and idempotently. Telling the operator to invoke
         // `innerwarden proxy` by hand would send them the long way round a thing
         // the product already does for them.
-        Mechanism::McpProxy { why } => format!(
-            "{}: {why}. Guard it through its MCP config:  innerwarden agents connect {}",
-            target.display, target.id
+        Mechanism::McpProxy { why, connect } => format!(
+            "{}: {why}. Guard it through its MCP config:  innerwarden agents connect {connect}",
+            target.display
         ),
         Mechanism::NotYetWirable { why } => format!(
             "{}: {why}. Run it isolated for now:  innerwarden contain -- <command>",
@@ -286,6 +307,44 @@ mod tests {
             !g.contains("innerwarden proxy --"),
             "must not send the operator to do it by hand: {g}"
         );
+    }
+
+    /// REGRESSION ANCHOR. `guidance` printed the target's own id, but
+    /// `agents connect` matches against [`crate::agents::KNOWN`] names, which
+    /// are shorter (`codex`, not `codex-cli`). So a host running Codex was told
+    /// to run `innerwarden agents connect codex-cli`, which answered "no
+    /// guardable agent named `codex-cli` was found". Two targets went further
+    /// and advertised a connect for an agent with no KNOWN row at all.
+    ///
+    /// Advice that fails is worse than no advice: it reads as "this product
+    /// cannot protect me". Every command this module prints must resolve.
+    ///
+    /// FAILS ON REVERT: print `target.id` again and Codex/Gemini stop resolving.
+    #[test]
+    fn every_command_the_guidance_prints_resolves_to_a_guardable_agent() {
+        for target in TARGETS {
+            let Mechanism::McpProxy { connect, .. } = target.mechanism else {
+                continue;
+            };
+            let known = crate::agents::KNOWN
+                .iter()
+                .find(|k| k.name == connect)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{} points `agents connect` at unknown `{connect}`",
+                        target.id
+                    )
+                });
+            assert!(
+                known.mcp_json.is_some() || known.mcp_toml.is_some(),
+                "{} is offered the MCP mechanism but `{connect}` has no MCP config to rewrite",
+                target.id
+            );
+            assert!(
+                guidance(target).contains(&format!("innerwarden agents connect {connect}")),
+                "guidance must print the name the command accepts"
+            );
+        }
     }
 
     /// An agent with no hook AND no lossless config editor cannot be wired at
