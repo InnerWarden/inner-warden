@@ -84,6 +84,16 @@ jobs:
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
           sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
 
+      # Pinned, like CI's dashboard job. The runner image ships SOME node, and
+      # "whatever the image has today" is not a thing to depend on in the one
+      # workflow that produces signed bytes.
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        if: matrix.builder == 'zigbuild'
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: crates/dashboard-kit/web/package-lock.json
+
       # The dashboard bundle is EMBEDDED in the binary being signed. CI checks
       # its freshness on every push; the release path did not, so the only
       # thing between a stale UI and a signed release was remembering to look
