@@ -1,7 +1,7 @@
 # InnerWarden Community
 
 > Documento guia. Descreve o que este produto **é hoje**, verificado no código, não o que se pretende que ele seja.
-> Datado de 2026-08-05, workspace `1.0.7`, repo `github.com/InnerWarden/inner-warden` (público, Apache-2.0).
+> Datado de 2026-08-06, workspace `1.1.0`, repo `github.com/InnerWarden/inner-warden` (público, Apache-2.0).
 >
 > **Para o operador:** corrige o que estiver errado ou mal formulado. Depois disto ser aprovado, o código é que se ajusta ao documento, e não o contrário.
 

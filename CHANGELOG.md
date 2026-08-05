@@ -3,6 +3,81 @@
 All notable changes to InnerWarden are documented here. This project
 follows semantic versioning.
 
+## 1.1.0 - 2026-08-06
+
+### Security
+
+- **The updater no longer runs a script it downloads.** `innerwarden upgrade`
+  fetched an installer over the network and piped it to a shell, so an upgrade
+  trusted whatever that endpoint served that day and no signature was ever
+  checked. It now downloads the release asset for the running platform, verifies
+  its SHA-256 and its Ed25519 signature against a public key compiled into the
+  binary doing the upgrading, and swaps it in with an atomic rename beside the
+  target. Either check failing means nothing is written.
+- **Packaging verifies the bytes before it packages them.** The npm and
+  `.deb`/`.rpm` build paths downloaded the release binaries and wrapped them
+  unchecked, so a compromised release host reached users through three channels
+  at once. Both paths now verify SHA-256 and Ed25519 for all six targets before
+  the bytes enter a package, and treat a missing sidecar as an error rather than
+  a skipped check.
+- **A local model can no longer soften a rules verdict.** The optional LLM second
+  opinion could downgrade a rules `deny` to `allow`. The effective verdict is now
+  the stricter of the two, the command under review is delimited as untrusted
+  input in the prompt, and the response records which layer decided.
+- **Publishing is gated on green CI for the exact commit.** A tag on a commit
+  whose tests were failing used to publish anyway, with npm provenance attesting
+  it.
+
+### Added
+
+- **Guards the agent you actually run, not just Claude Code.** `install` used to
+  refuse every other agent with "only 'claude-code' is supported today", which on
+  a host running anything else read as "InnerWarden cannot protect this". Every
+  known agent now resolves to a mechanism and a command that works: a PreToolUse
+  hook where one exists, automatic MCP wiring through `innerwarden agents
+  connect <agent>` where it does not, and `innerwarden contain` for agents with
+  no cooperative surface at all. Claude Code, Cursor, Codex, Gemini CLI and
+  OpenClaw wire automatically; wiring is reversible with `agents disconnect`.
+- **OpenClaw support.** Its MCP servers live under a nested `mcp.servers` table
+  that the config editor could not find, so an OpenClaw install looked unguardable.
+  Sibling keys and unrelated settings are preserved, and a config that is not
+  strict JSON is refused rather than rewritten.
+- **Per-session behaviour in the command hook.** Call rate and repeated access to
+  sensitive paths are now tracked across the one-shot hook invocations that make
+  up a session, so a pattern that only exists across commands is visible to the
+  verdict.
+- **`innerwarden host <command>`.** Four verbs exist in both this guardrail and
+  the paid Active Defence host layer. They run here, say so when the host layer
+  also has one, and `host` reaches that version explicitly instead of it being
+  silently shadowed.
+- **A recording-health surface.** `innerwarden graph` and
+  `/api/guard/record-health` report when the local record has stopped recording
+  and for how long, rather than a dashboard quietly showing older and older data.
+
+### Fixed
+
+- **Recording stopped once the graph passed 16 MiB, and said so only on stderr.**
+  The store was verified against the size limit meant for agent configuration
+  files, and the verification read runs before the prune that would have brought
+  it back under, so an install that crossed the limit never recorded again. The
+  store now has its own ceiling, prune enforces a byte budget and not just a node
+  count, and command ids no longer collide after a prune (which silently
+  overwrote surviving history). The outage is now reported where a human looks.
+- **A quoted heredoc body is text, not code.** Writing a document that quoted a
+  dangerous command, in a pull request body or an incident postmortem, was blocked
+  as though the command were being run. Unquoted delimiters, real substitutions,
+  and pipes into an interpreter are still read as code.
+- **The dashboard tells the truth about what it knows.** It no longer reports a
+  setup state it never determined, no longer tells a paid host it recorded
+  nothing, distinguishes "unavailable" from "empty" and says which failure it
+  was, and serves the agent and token-intelligence views in both editions.
+- **Suppression changes are recorded.** `allow` and `mute` changed what the guard
+  blocks and left no trace.
+- **The hook stopped compiling rules that cannot match.** The ATR corpus was
+  compiled in full on every tool call, including the 62 pattern-tier rules that
+  declare a surface the shell path never presents. Filtering before compilation
+  took the hook from 208 ms to 73 ms.
+
 ## 1.0.7 - 2026-07-29
 
 ### Fixed

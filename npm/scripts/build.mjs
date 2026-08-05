@@ -6,7 +6,7 @@
 // Usage:  node scripts/build.mjs [version]
 // Default version is read from the main package.json.
 
-import { mkdirSync, writeFileSync, chmodSync, rmSync, readFileSync } from "node:fs";
+import { mkdirSync, writeFileSync, chmodSync, rmSync, readFileSync, copyFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
@@ -52,7 +52,7 @@ for (const t of TARGETS) {
     description: `InnerWarden Community prebuilt binary for ${t.os}-${t.cpu}.`,
     os: [t.os],
     cpu: [t.cpu],
-    files: ["bin"],
+    files: ["bin", "LICENSE"],
     license: "Apache-2.0",
     homepage: "https://innerwarden.com",
     repository: {
@@ -62,6 +62,9 @@ for (const t of TARGETS) {
     },
   };
   writeFileSync(join(pkgDir, "package.json"), JSON.stringify(pkg, null, 2) + "\n");
+  // Every platform package declares Apache-2.0; Apache-2.0 section 4(a) requires
+  // shipping the licence text with it. None of them did.
+  copyFileSync(join(ROOT, "..", "LICENSE"), join(pkgDir, "LICENSE"));
 }
 
 // The wrapper must depend on the platform packages THIS run produced.

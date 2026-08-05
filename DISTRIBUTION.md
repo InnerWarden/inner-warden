@@ -20,6 +20,7 @@ User-facing install docs (the page we send people) live at
 | npm packages (7: `innerwarden` + 6 `@innerwarden/cli-<os>-<arch>`) | the binaries above | npmjs.com | `npm/` + `.github/workflows/npm-publish.yml` |
 | `.deb` / `.rpm` (amd64 + arm64) | the binaries above, via nfpm | attached to the `iw-guard` release | `packaging/` + `.github/workflows/linux-packages.yml` |
 | Shell installer (`curl \| sh`), PowerShell installer, Scoop manifest, public key | n/a (hand-maintained) | `innerwarden.com/free` | **`InnerWarden/innerwarden-releases`** (the distribution repo, not here) |
+| In-place upgrade (`innerwarden upgrade`) | the binary already installed | n/a - reads the `iw-guard` release directly | `crates/cli/src/upgrade.rs`, `crates/cli/src/release_verify.rs` |
 
 **Everything wraps the same signed binaries.** The binaries are the root of
 trust; npm, deb, rpm, Scoop, ubi/eget/mise all fetch or embed them.
@@ -57,8 +58,11 @@ Full detail + copy-paste commands: <https://innerwarden.com/docs/installation>.
 - Six platform packages `@innerwarden/cli-{linux,darwin,win32}-{x64,arm64}`,
   each shipping one prebuilt binary. **No postinstall, no install-time
   download** (works with `npm install --ignore-scripts`).
-- `npm/scripts/build.mjs` downloads the binaries from the `iw-guard` release and
-  assembles `npm/platforms/*` (gitignored).
+- `npm/scripts/build.mjs` downloads the binaries from the `iw-guard` release,
+  **verifies SHA-256 + Ed25519 for all six targets before packaging**, refuses to
+  continue if the downloaded binary does not report the version being packaged,
+  auto-repins `optionalDependencies` to that version, and assembles
+  `npm/platforms/*` (gitignored).
 - `npm/scripts/publish.mjs` publishes the platform packages first, then the main
   package. Idempotent (skips already-published versions), supports `NPM_OTP` and
   `NPM_PROVENANCE=1`.
@@ -72,8 +76,13 @@ To publish a new version:
 
 1. Bump `version` in `npm/package.json` **and** the six `optionalDependencies`
    versions to match (they are pinned exact).
-2. Run the **Publish to npm (OIDC)** workflow (`npm-publish.yml`), or push a tag
-   `npm-v<version>`.
+2. **Wait for CI to be green on the exact commit**, then run the **Publish to npm
+   (OIDC)** workflow (`npm-publish.yml`), or push a tag `npm-v<version>`. The
+   workflow's `gate` job queries the checks API for that SHA and refuses unless
+   every completed CI run concluded `success`; tagging before CI finishes fails
+   the publish, it does not queue it. The `publish` job also runs in the
+   `npm-publish` environment, so it waits for a reviewer once that environment is
+   configured with one.
 3. The workflow upgrades npm, assembles the platform packages, and publishes all
    seven with `--provenance`.
 
@@ -102,12 +111,18 @@ each of the seven packages, pointing at `InnerWarden/inner-warden` +
 
 ### Publishing a new version
 
-1. Run the **Linux packages** workflow (`linux-packages.yml`); confirm the
-   test-install steps pass.
-2. Download the `linux-packages` artifact and attach the files to the release:
-   `gh release upload iw-guard --repo InnerWarden/innerwarden-releases *.deb *.rpm *.sha256`
-   (the workflow does not auto-attach yet; that is a follow-up).
-3. Generate + upload `.sha256` sidecars alongside each package.
+1. Run the **Linux packages** workflow (`linux-packages.yml`) AFTER the guard
+   release has been cut for this version. The workflow asserts that the binary
+   the rolling release currently serves reports the version being packaged, so
+   running it early fails loudly instead of shipping a `.deb` labelled 1.1.0 that
+   contains the previous binary.
+2. Nothing to attach by hand: the workflow generates the `.sha256` sidecars and
+   uploads the `.deb`/`.rpm` to the rolling `iw-guard` release itself, but only
+   after both test-installs pass.
+3. **Still manual:** deleting the PREVIOUS version's package assets. `--clobber`
+   overwrites same-named files, and the package filenames carry the version, so
+   the old ones linger until removed:
+   `gh release delete-asset iw-guard <old-file> --repo InnerWarden/innerwarden-releases`.
 
 Local one-off:
 `packaging/build-linux-packages.sh 1.0.0 ./innerwarden-linux-x86_64 ./innerwarden-linux-aarch64 out`
@@ -125,13 +140,25 @@ Local one-off:
 - **Key rotated 2026-07-24.** The previous private key was lost, so the signing
   key was rotated. The current public key (raw 32 bytes, base64) is
   `vR3bZQMGNQ7tfoKirl4mbBCE6DekmmEFADL5g984PC4=`, held as `RELEASE_SIGNING_KEY`
-  in this repo, pinned in the installer, and published as
-  `innerwarden-release.pub`. Binaries signed with the old key no longer verify.
-  If the key is ever rotated again: merge the new pin into the distribution repo
-  and run the release pipeline **back to back**. Between those two steps the
-  installer pins a key the published binaries were not signed with, so
-  verification fails and installs are blocked (fail-closed, which is correct, but
-  keep the window short).
+  in this repo and published as `innerwarden-release.pub`. Binaries signed with
+  the old key no longer verify.
+
+  **There are now three pin sites, not one.** A rotation must update all of them:
+
+  1. `crates/cli/src/release_verify.rs` (`RELEASE_PUBLIC_KEY_B64`) - compiled
+     into every shipped binary and used by `innerwarden upgrade`.
+  2. `npm/scripts/verify-release-asset.mjs` (`RELEASE_PUBLIC_KEY_B64`) - used by
+     the npm and `.deb`/`.rpm` packaging paths.
+  3. `iw-guard-install.sh` in the distribution repo - the `curl | sh` pin.
+
+  The first one has a consequence the others do not: an already-installed binary
+  verifies its own upgrade with the key it was BUILT with, so a rotation
+  permanently breaks `innerwarden upgrade` for the existing installed base. Those
+  users have to reinstall from a channel that ships the new pin. Order a rotation
+  as: land both source pins, cut the release, then merge the installer pin in the
+  distribution repo. Between the last two steps the installer pins a key the
+  published binaries were not signed with, so installs fail closed - correct, but
+  keep the window short.
 
 Verify a binary (needs OpenSSL >= 1.1.1; macOS: `brew install openssl@3`):
 
