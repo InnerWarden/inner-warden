@@ -103,9 +103,9 @@ figures below cannot be shown. This is a producer fault, not an empty host.`}
         </div>
       )}
 
-      <PostureHero mode={mode} decisions={overview.commands} sessions={overview.sessions} guardedAgents={guardedAgents} />
+      <PostureHero mode={mode} edition={edition} decisions={overview.commands} sessions={overview.sessions} guardedAgents={guardedAgents} />
 
-      <MachineIntelligence />
+      <MachineIntelligence edition={edition} />
 
       {overview.commands === 0 ? (
         <ZeroState guardedAgents={guardedAgents} />
@@ -141,13 +141,50 @@ figures below cannot be shown. This is a producer fault, not an empty host.`}
         </>
       )}
 
-      <CommunityIncluded />
+      {edition === "enterprise" ? null : <CommunityIncluded />}
       {edition === "community" ? <ActiveDefenceCard /> : null}
     </div>
   );
 }
 
-const POSTURES: Record<GuardrailMode, { label: string; title: string; body: string; badge: string; panel: string }> = {
+/// What the `unknown` posture means on a paid host: the guardrail hook reports
+/// nothing because it is not the mechanism here, and enforcement posture has a
+/// screen of its own. It does NOT mean nothing is being protected.
+/// Which posture copy the hero shows.
+///
+/// Pure so the CHOICE is testable: this package has no jsdom, and a test that
+/// only compares the two constants passes even when the component picks the
+/// wrong one -- which is exactly what a first attempt at this test did.
+/// The product name the operator is actually looking at.
+///
+/// Hardcoded as "InnerWarden Community" until now, on every host. A paid box
+/// therefore announced itself as the free product -- and an operator who
+/// upgraded saw no change at all, which reads as the upgrade not having taken.
+/// `edition` already reaches this screen; it just was not used here.
+///
+/// Unknown edition keeps the neutral brand rather than guessing: claiming
+/// either tier before the bootstrap resolves would be a claim we cannot back.
+export function editionLabel(edition?: "community" | "enterprise"): string {
+  if (edition === "enterprise") return "InnerWarden Enterprise";
+  if (edition === "community") return "InnerWarden Community";
+  return "InnerWarden";
+}
+
+export function postureFor(mode: GuardrailMode, edition?: "community" | "enterprise") {
+  return mode === "unknown" && edition === "enterprise"
+    ? ENTERPRISE_UNKNOWN_POSTURE
+    : POSTURES[mode];
+}
+
+export const ENTERPRISE_UNKNOWN_POSTURE = {
+  label: "Guardrail decisions not recorded here",
+  title: "Enforcement is reported on Posture, not by decision count.",
+  body: "The agent-guard hook that records per-action decisions is not running on this host, so that counter reads zero. It is not a measure of what the host is protected by \u2014 see Posture for the enforcement layers actually in effect.",
+  badge: "border-slate-300 bg-white text-slate-700",
+  panel: "border-slate-200 from-white to-slate-100",
+};
+
+export const POSTURES: Record<GuardrailMode, { label: string; title: string; body: string; badge: string; panel: string }> = {
   not_configured: {
     label: "Setup needed",
     title: "Connect an agent to start screening its actions.",
@@ -192,8 +229,15 @@ const POSTURES: Record<GuardrailMode, { label: string; title: string; body: stri
   },
 };
 
-function PostureHero({ mode, decisions, sessions, guardedAgents }: { mode: GuardrailMode; decisions: number; sessions: number; guardedAgents?: number }) {
-  const posture = POSTURES[mode];
+function PostureHero({ mode, edition, decisions, sessions, guardedAgents }: { mode: GuardrailMode; edition?: "community" | "enterprise"; decisions: number; sessions: number; guardedAgents?: number }) {
+  // The `unknown` copy is written for Community: "this version records guardrail
+  // decisions" describes the free hook, and the decision count is the free
+  // product's headline. On an Enterprise host that hook is often not installed
+  // at all -- the paid stack is what protects it -- so the same words turn a
+  // correct zero into a claim that the product is idle. Observed on the
+  // production box: 0 decisions on screen while 6,047 incidents sat in its
+  // graph. The number was right; the sentence around it was not.
+  const posture = postureFor(mode, edition);
   return (
     <section className={`overflow-hidden rounded-2xl border bg-gradient-to-br ${posture.panel}`} aria-labelledby="posture-title">
       <div className="grid gap-6 px-5 py-6 sm:px-7 sm:py-8 lg:grid-cols-[minmax(0,1fr)_280px] lg:items-center">
@@ -209,7 +253,7 @@ function PostureHero({ mode, decisions, sessions, guardedAgents }: { mode: Guard
               </span>
             )}
           </div>
-          <p className="mt-5 text-xs font-semibold uppercase tracking-[0.16em] text-cyan-700">InnerWarden Community</p>
+          <p className="mt-5 text-xs font-semibold uppercase tracking-[0.16em] text-cyan-700">{editionLabel(edition)}</p>
           <h1 id="posture-title" className="mt-2 max-w-3xl text-2xl font-semibold tracking-tight text-slate-950 sm:text-3xl">
             {posture.title}
           </h1>
