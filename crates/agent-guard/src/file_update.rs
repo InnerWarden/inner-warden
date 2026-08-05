@@ -14,8 +14,23 @@ use fs4::FileExt;
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-/// Maximum size accepted when reading an agent configuration file.
+/// Maximum size accepted when reading an agent CONFIGURATION file.
+///
+/// This bounds what a hostile or broken agent config can make us read. It is not
+/// a sensible bound for every file this module replaces: the narrative graph is
+/// an append-heavy store we write ourselves, and applying the config limit to it
+/// meant that once it crossed 16 MiB the guard stopped recording entirely and
+/// said so only on stderr, which nobody reads. Six hours of a developer's
+/// commands went unrecorded before it was noticed.
 pub const MAX_CONFIG_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Maximum size accepted for our own append-heavy stores, like the graph.
+///
+/// Generous next to what the node cap allows (20k nodes measured at ~16 MB), so
+/// a store slightly over the config limit still loads and can be pruned back
+/// down instead of wedging. The bound still exists: an unbounded read is how a
+/// corrupt file takes the process with it.
+pub const MAX_OWNED_STORE_BYTES: u64 = 128 * 1024 * 1024;
 
 struct UpdateLock(File);
 
@@ -154,30 +169,31 @@ fn regular_config_metadata(file: &File, path: &Path) -> Result<fs::Metadata, Str
     Ok(metadata)
 }
 
-fn current_bytes(path: &Path) -> Result<Option<Vec<u8>>, String> {
+fn current_bytes(path: &Path, limit: u64) -> Result<Option<Vec<u8>>, String> {
     let file = match open_config(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(format!("reading {}: {error}", path.display())),
     };
     let len = regular_config_metadata(&file, path)?.len();
-    if len > MAX_CONFIG_BYTES {
-        return Err(format!("{} exceeds the config size limit", path.display()));
+    if len > limit {
+        return Err(format!("{} exceeds the size limit", path.display()));
     }
     let mut bytes = Vec::with_capacity(len.try_into().unwrap_or(0));
-    file.take(MAX_CONFIG_BYTES + 1)
+    file.take(limit + 1)
         .read_to_end(&mut bytes)
         .map_err(|error| format!("reading {}: {error}", path.display()))?;
-    if bytes.len() as u64 > MAX_CONFIG_BYTES {
-        return Err(format!(
-            "{} grew beyond the config size limit",
-            path.display()
-        ));
+    if bytes.len() as u64 > limit {
+        return Err(format!("{} grew beyond the size limit", path.display()));
     }
     Ok(Some(bytes))
 }
 
-fn current_bytes_no_symlinks(trusted_root: &Path, path: &Path) -> Result<Option<Vec<u8>>, String> {
+fn current_bytes_no_symlinks(
+    trusted_root: &Path,
+    path: &Path,
+    limit: u64,
+) -> Result<Option<Vec<u8>>, String> {
     ensure_no_symlink_components(trusted_root, path)?;
     let opened = {
         #[cfg(unix)]
@@ -208,18 +224,15 @@ fn current_bytes_no_symlinks(trusted_root: &Path, path: &Path) -> Result<Option<
         Err(error) => return Err(format!("opening {} without links: {error}", path.display())),
     };
     let len = regular_config_metadata(&file, path)?.len();
-    if len > MAX_CONFIG_BYTES {
-        return Err(format!("{} exceeds the config size limit", path.display()));
+    if len > limit {
+        return Err(format!("{} exceeds the size limit", path.display()));
     }
     let mut bytes = Vec::new();
-    file.take(MAX_CONFIG_BYTES + 1)
+    file.take(limit + 1)
         .read_to_end(&mut bytes)
         .map_err(|error| format!("reading {}: {error}", path.display()))?;
-    if bytes.len() as u64 > MAX_CONFIG_BYTES {
-        return Err(format!(
-            "{} grew beyond the config size limit",
-            path.display()
-        ));
+    if bytes.len() as u64 > limit {
+        return Err(format!("{} grew beyond the size limit", path.display()));
     }
     ensure_no_symlink_components(trusted_root, path)?;
     Ok(Some(bytes))
@@ -228,7 +241,7 @@ fn current_bytes_no_symlinks(trusted_root: &Path, path: &Path) -> Result<Option<
 /// Read an agent configuration with a fixed upper bound. A missing file is
 /// represented by `Ok(None)`; other I/O errors fail closed.
 pub fn read_config(path: &Path) -> Result<Option<Vec<u8>>, String> {
-    current_bytes(path)
+    current_bytes(path, MAX_CONFIG_BYTES)
 }
 
 /// Read an agent configuration below `trusted_root` with a fixed upper bound,
@@ -237,14 +250,14 @@ pub fn read_config_no_symlinks(
     trusted_root: &Path,
     path: &Path,
 ) -> Result<Option<Vec<u8>>, String> {
-    current_bytes_no_symlinks(trusted_root, path)
+    current_bytes_no_symlinks(trusted_root, path, MAX_CONFIG_BYTES)
 }
 
 /// Replace `path` without exposing a partially-written file. A file symlink is
 /// resolved and its target is replaced, preserving the link (explicit/manual
 /// config edits therefore keep working with dotfile managers).
 pub fn replace(path: &Path, body: &[u8]) -> Result<(), String> {
-    replace_inner(path, None, body, true, None)
+    replace_inner(path, None, body, true, None, MAX_CONFIG_BYTES)
 }
 
 /// Compare-and-replace variant for read/modify/write operations. `expected`
@@ -256,7 +269,7 @@ pub fn replace_if_unchanged(
     expected: Option<&[u8]>,
     body: &[u8],
 ) -> Result<(), String> {
-    replace_inner(path, Some(expected), body, true, None)
+    replace_inner(path, Some(expected), body, true, None, MAX_CONFIG_BYTES)
 }
 
 /// Automatic/background variant. Unlike explicit commands, it rejects observed
@@ -269,7 +282,39 @@ pub fn replace_if_unchanged_no_symlinks(
     expected: Option<&[u8]>,
     body: &[u8],
 ) -> Result<(), String> {
-    replace_inner(path, Some(expected), body, false, Some(trusted_root))
+    replace_inner(
+        path,
+        Some(expected),
+        body,
+        false,
+        Some(trusted_root),
+        MAX_CONFIG_BYTES,
+    )
+}
+
+/// Same guarantees as [`replace_if_unchanged_no_symlinks`], for a store this
+/// product writes itself rather than an agent's configuration file.
+///
+/// The only difference is the size ceiling. The config ceiling exists to bound
+/// what a hostile or broken agent config can make us read; applying it to our
+/// own append-heavy graph meant that once the graph crossed 16 MiB every write
+/// failed at the verification read, so the pruning that would have brought it
+/// back under the limit could never run. Recording stopped for six hours on a
+/// real install and said so only on stderr.
+pub fn replace_owned_store_no_symlinks(
+    trusted_root: &Path,
+    path: &Path,
+    expected: Option<&[u8]>,
+    body: &[u8],
+) -> Result<(), String> {
+    replace_inner(
+        path,
+        Some(expected),
+        body,
+        false,
+        Some(trusted_root),
+        MAX_OWNED_STORE_BYTES,
+    )
 }
 
 fn replace_inner(
@@ -278,6 +323,7 @@ fn replace_inner(
     body: &[u8],
     follow_file_symlink: bool,
     trusted_root: Option<&Path>,
+    limit: u64,
 ) -> Result<(), String> {
     let path = if follow_file_symlink {
         resolve_target(requested_path)?
@@ -296,11 +342,12 @@ fn replace_inner(
     let _lock = UpdateLock::acquire(&path)?;
     if let Some(expected) = expected {
         let current = if follow_file_symlink {
-            current_bytes(&path)?
+            current_bytes(&path, limit)?
         } else {
             current_bytes_no_symlinks(
                 trusted_root.ok_or_else(|| "missing automatic setup root".to_string())?,
                 &path,
+                limit,
             )?
         };
         if current.as_deref() != expected {
@@ -350,11 +397,12 @@ fn replace_inner(
         // an external write in the final syscall window remains a same-user race.
         if let Some(expected) = expected {
             let current = if follow_file_symlink {
-                current_bytes(&path)?
+                current_bytes(&path, limit)?
             } else {
                 current_bytes_no_symlinks(
                     trusted_root.ok_or_else(|| "missing automatic setup root".to_string())?,
                     &path,
+                    limit,
                 )?
             };
             if current.as_deref() != expected {

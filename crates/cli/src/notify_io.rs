@@ -276,6 +276,18 @@ pub fn fire(command: &str, verdict: &Value) {
     let _ = deliver_with_total_budget(reqs, ENFORCEMENT_DELIVERY_BUDGET);
 }
 
+/// Fire a plain health message on every configured channel, best-effort.
+///
+/// Separate from [`fire`] because this is not a verdict: it carries no command
+/// and is not filtered by the deny/review preference. An operator who wired a
+/// channel to hear about blocks also wants to hear that the record stopped
+/// recording them. Callers must send this at most once per outage episode.
+pub fn fire_text(text: &str) {
+    let config = innerwarden_notify::resolved(|k| std::env::var(k).ok(), config_file().as_deref());
+    let requests = innerwarden_notify::text_requests(&config, text);
+    let _ = deliver_with_total_budget(requests, ENFORCEMENT_DELIVERY_BUDGET);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

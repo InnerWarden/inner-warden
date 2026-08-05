@@ -25,6 +25,7 @@ mod contain_io;
 mod dashboard;
 mod graph_io;
 mod notify_io;
+mod record_health;
 mod release_verify;
 mod second_opinion;
 mod second_opinion_io;
