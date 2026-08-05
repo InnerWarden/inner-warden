@@ -233,8 +233,12 @@ async function getValidated<T>(path: string, validate: (value: unknown) => value
 export const fetchMeta = () => get<DashboardMeta>("api/guard/meta");
 export const fetchOverview = () => get<Overview>("api/guard/overview");
 export const fetchGraph = () => get<Graph>("api/graph");
-export const fetchAgents = () => getValidated("api/agents", isAgentsResponse);
-export const fetchTokenIntelligence = () => getValidated("api/token-intelligence", isTokenIntelligenceResponse);
+// Same reason as `guard/meta` and `guard/overview` above, found the same way:
+// these two still asked for the FREE CLI's paths, so on the paid side they 404ed
+// and the Overview screen showed "unavailable" panels that retried forever.
+// `api/guard/*` is the path both products answer.
+export const fetchAgents = () => getValidated("api/guard/agents", isAgentsResponse);
+export const fetchTokenIntelligence = () => getValidated("api/guard/token-intelligence", isTokenIntelligenceResponse);
 export function fetchCases(p: CasesQuery): Promise<CasesPage> {
   const qs = new URLSearchParams();
   if (p.verdict) qs.set("verdict", p.verdict);

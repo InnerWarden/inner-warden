@@ -824,7 +824,7 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
                     },
                 ))),
             },
-            "/api/agents" => match agent_snapshot.as_ref() {
+            "/api/agents" | "/api/guard/agents" => match agent_snapshot.as_ref() {
                 Some(shared) => {
                     let snapshot = read_agent_snapshot(shared);
                     request.respond(json_response(agent_payload_with_live_watcher(
@@ -834,10 +834,12 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
                 }
                 None => request.respond(json_error_response(503, "user home is unavailable")),
             },
-            "/api/token-intelligence" => match token_intelligence.as_ref() {
-                Some(shared) => request.respond(json_response(token_intelligence_json(shared))),
-                None => request.respond(json_error_response(503, "user home is unavailable")),
-            },
+            "/api/token-intelligence" | "/api/guard/token-intelligence" => {
+                match token_intelligence.as_ref() {
+                    Some(shared) => request.respond(json_response(token_intelligence_json(shared))),
+                    None => request.respond(json_error_response(503, "user home is unavailable")),
+                }
+            }
             other => serve_asset(request, other),
         };
     }
