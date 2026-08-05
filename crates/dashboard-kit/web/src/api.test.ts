@@ -10,6 +10,29 @@ function respond(payload: unknown) {
 
 afterEach(() => vi.unstubAllGlobals());
 
+describe("the path both products answer", () => {
+  // REGRESSION ANCHOR. These two fetchers asked for the FREE CLI's paths while
+  // ONE bundle serves two products, so on the paid side they 404ed and the
+  // Overview screen showed two "unavailable" panels retrying forever. The same
+  // mistake took the whole dashboard WHITE once before, which is why
+  // `guard/meta` and `guard/overview` already moved; these were left behind.
+  //
+  // FAILS ON REVERT: point either fetcher back at its un-namespaced path.
+  it("asks for api/guard/*, not the free CLI's own paths", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({}) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await fetchAgents().catch(() => undefined);
+    await fetchTokenIntelligence().catch(() => undefined);
+
+    const requested = fetchMock.mock.calls.map((call) => String(call[0]));
+    expect(requested.some((url) => url.includes("api/guard/agents"))).toBe(true);
+    expect(requested.some((url) => url.includes("api/guard/token-intelligence"))).toBe(true);
+    expect(requested.some((url) => /(^|\/)api\/agents/.test(url))).toBe(false);
+    expect(requested.some((url) => /(^|\/)api\/token-intelligence/.test(url))).toBe(false);
+  });
+});
+
 describe("dashboard API validation", () => {
   it("accepts explicit unknown auto-connect state instead of coercing it to disabled", async () => {
     respond({

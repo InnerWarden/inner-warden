@@ -36,6 +36,48 @@ export function MachineIntelligence() {
   );
 }
 
+/// A poll the operator does not see.
+///
+/// Refreshing is background work; it is not news. The previous version told the
+/// user about every cycle: it set `refreshing` before each request and, on
+/// failure, replaced a populated panel with "unavailable". Against an endpoint
+/// that answers 404 the retry was a flat 5s, so the whole panel flipped between
+/// content and an error box roughly every five seconds, forever. That reads as a
+/// system malfunctioning in front of you.
+///
+/// Four rules, and each one removes a visible event:
+///
+/// 1. Announce the FIRST load only. Once there is data on screen, a refresh
+///    starts silently — no state write, so no re-render.
+/// 2. Keep the last good data through a failure. A transient error must not
+///    empty a panel that is still showing true, if slightly older, information.
+///    `error` only reaches the UI when there has never been data to show.
+/// 3. Back off. Repeated failures double the delay up to a minute, so a
+///    permanently broken endpoint costs one request a minute instead of twelve.
+/// 4. Do not re-render for an unchanged payload. Most cycles return exactly what
+///    is already on screen.
+export const ERROR_BACKOFF_START_MS = 5_000;
+export const ERROR_BACKOFF_MAX_MS = 60_000;
+
+/// How long to wait after a FAILED poll, and what the next backoff becomes.
+///
+/// Pure so it can be tested: this file has no jsdom, and the kit's convention is
+/// that the decision lives outside the React shell.
+export function nextErrorDelay(backoff: number): { delay: number; next: number } {
+  return {
+    delay: Math.min(backoff, ERROR_BACKOFF_MAX_MS),
+    next: Math.min(backoff * 2, ERROR_BACKOFF_MAX_MS),
+  };
+}
+
+/// Whether a failure should reach the operator.
+///
+/// Only when there is nothing already on screen. Replacing real, slightly older
+/// data with an error box is the flicker the user reported.
+export function shouldSurfaceError(haveData: boolean): boolean {
+  return !haveData;
+}
+
 function usePollingResource<T>(load: () => Promise<T>, intervalMs: number, retrySoon: (data: T) => boolean): PollState<T> {
   const [state, setState] = useState<PollState<T>>(INITIAL_POLL_STATE);
 
@@ -43,25 +85,38 @@ function usePollingResource<T>(load: () => Promise<T>, intervalMs: number, retry
     let active = true;
     let inFlight = false;
     let timer: number | undefined;
+    let backoff = ERROR_BACKOFF_START_MS;
+    let lastSerialised: string | undefined;
+    let haveData = false;
 
     const refresh = () => {
       if (inFlight) return;
       inFlight = true;
       let nextDelay = intervalMs;
-      setState((current) => ({
-        ...current,
-        loading: current.data == null,
-        refreshing: current.data != null,
-      }));
+      // Rule 1: only the first load is worth telling the user about. With data
+      // already on screen this writes nothing, so React does not re-render.
+      if (!haveData) setState((current) => ({ ...current, loading: true, refreshing: false }));
       load()
         .then((data) => {
           if (!active) return;
+          backoff = ERROR_BACKOFF_START_MS;
           nextDelay = retrySoon(data) ? 750 : intervalMs;
+          // Rule 4: an identical payload is not an update.
+          const serialised = JSON.stringify(data);
+          if (haveData && serialised === lastSerialised) return;
+          lastSerialised = serialised;
+          haveData = true;
           setState({ data, error: false, loading: false, refreshing: false });
         })
         .catch(() => {
           if (!active) return;
-          nextDelay = Math.min(intervalMs, 5_000);
+          // Rule 3: a broken endpoint should get quieter, not louder.
+          const step = nextErrorDelay(backoff);
+          nextDelay = step.delay;
+          backoff = step.next;
+          // Rule 2: stale truth beats an empty panel. Surface the error only
+          // when there is nothing already on screen to keep.
+          if (!shouldSurfaceError(haveData)) return;
           setState((current) => ({ ...current, error: true, loading: false, refreshing: false }));
         })
         .finally(() => {
