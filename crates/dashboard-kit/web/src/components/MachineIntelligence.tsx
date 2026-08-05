@@ -230,21 +230,7 @@ function AgentCard({ agent }: { agent: LocalAgent }) {
         </Detail>
         <Detail label="Setup support">{humanise(agent.guardrail.setup_support)}</Detail>
         <Detail label="Mechanism">{agent.guardrail.mechanism ? humanise(agent.guardrail.mechanism) : "Not available"}</Detail>
-        <Detail label="Automatic setup">
-          {agent.guardrail.mode === "partial"
-            ? "Manual review required"
-            : agent.guardrail.mode !== "not_configured"
-            ? "Already configured"
-            : agent.auto_connect_eligible == null
-              ? "Eligibility unavailable"
-              : agent.auto_connect_eligible
-              ? "Eligible when enabled"
-              : agent.guardrail.setup_support === "manual"
-                ? "Manual setup"
-                : agent.guardrail.setup_support === "unsupported"
-                  ? "Not available"
-                  : "Not eligible automatically"}
-        </Detail>
+        <Detail label="Automatic setup">{automaticSetupLabel(agent)}</Detail>
       </dl>
 
       {agent.detected_by.length > 0 && (
@@ -261,6 +247,37 @@ function AgentCard({ agent }: { agent: LocalAgent }) {
       )}
     </li>
   );
+}
+
+/// Modes that positively mean a guardrail IS in place. Anything outside this
+/// set has not told us that, and must not be reported as though it had.
+const CONFIGURED_MODES = new Set(["monitor", "enforce", "mixed"]);
+
+/**
+ * What to say about automatic setup for one agent.
+ *
+ * REGRESSION ANCHOR. This used to read `mode !== "not_configured"` and print
+ * "Already configured" for everything else -- including `unknown`. An agent
+ * whose guardrail state we could not determine was therefore reported to the
+ * operator as configured. On a live host that produced a card claiming
+ * "Already configured" beside "Mechanism: Not available" and "Setup support:
+ * Unsupported", under a banner that said automatic setup was unavailable, for
+ * an agent with no guardrail installed at all.
+ *
+ * "Already configured" is an assurance. It may only be derived from a mode that
+ * positively says so, never from the absence of a negative.
+ */
+export function automaticSetupLabel(agent: LocalAgent): string {
+  if (agent.guardrail.mode === "partial") return "Manual review required";
+  if (CONFIGURED_MODES.has(agent.guardrail.mode)) return "Already configured";
+  // `unknown` lands here rather than in the branch above: not knowing is not a
+  // kind of being configured.
+  if (agent.guardrail.mode === "unknown") return "Not determined";
+  if (agent.auto_connect_eligible == null) return "Eligibility unavailable";
+  if (agent.auto_connect_eligible) return "Eligible when enabled";
+  if (agent.guardrail.setup_support === "manual") return "Manual setup";
+  if (agent.guardrail.setup_support === "unsupported") return "Not available";
+  return "Not eligible automatically";
 }
 
 function agentPresence(agent: LocalAgent): string {
