@@ -10,6 +10,7 @@ import { mkdirSync, writeFileSync, chmodSync, rmSync, readFileSync } from "node:
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
+import { verifyDownloadedFile } from "./verify-release-asset.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const MAIN_PKG = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8"));
@@ -37,6 +38,12 @@ for (const t of TARGETS) {
   const dest = join(binDir, t.exe);
   process.stdout.write(`downloading ${t.asset} -> @innerwarden/cli-${t.slug}\n`);
   execFileSync("curl", ["-fsSL", "-o", dest, `${RELEASE}/${t.asset}`], { stdio: "inherit" });
+  // Verify BEFORE the bytes are packaged and before provenance is attached to
+  // them (audit CI-02 / SUP-05). Fails closed for ALL six targets, not just the
+  // host-native one: a `--version` smoke test catches a stale build, never a
+  // swapped one.
+  verifyDownloadedFile(dest, RELEASE, t.asset);
+  process.stdout.write(`  verified ${t.asset} (sha256 + Ed25519)\n`);
   chmodSync(dest, 0o755);
 
   const pkg = {

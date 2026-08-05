@@ -309,6 +309,19 @@ pub fn inspect_tool_description(
         ));
     }
 
+    // The same hole via compatibility characters rather than invisible ones.
+    // The signal was computed and discarded; a narrowed module surface surfaced
+    // it as an unread field.
+    if deob.nfkc_introduced_ascii {
+        alerts.push(VerdictAlert::builtin(
+            "AG-OBFUSCATION",
+            format!(
+                "tool '{tool_name}' description uses compatibility characters that fold into ASCII (possible smuggling); scanned de-obfuscated"
+            ),
+            true,
+        ));
+    }
+
     if let Some(desc) = threats::check_credentials(description) {
         alerts.push(VerdictAlert::builtin(
             "AG-CRED-DESC",

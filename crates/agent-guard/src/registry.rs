@@ -3,6 +3,30 @@
 //! Agents connect via API or are discovered via `innerwarden agent scan`.
 //! Each connected agent gets an ID, a session tracker, and a policy.
 //! Multiple instances of the same agent type are supported.
+//!
+//! # This is the DAEMON's model, and the free CLI has its own
+//!
+//! An audit flagged this module as dead code in the Community binary, since
+//! nothing there consumes it and only Active Defence does. That framing invites
+//! the wrong fix, so it is written down here: **do not wire this into the
+//! Community CLI.**
+//!
+//! [`ConnectedAgent`] is a LIVE record. It holds a pid, an [`AgentStats`]
+//! counter, and a [`crate::session::SessionTracker`] whose windows are `Instant`
+//! based. All of that assumes a process that stays up and watches. The Community
+//! binary is one-shot: it starts, screens one thing, and exits, so an `Instant`
+//! cannot survive between invocations. That is the same mismatch that kept
+//! `SessionTracker` unusable there until [`crate::session::PersistedSession`]
+//! gave it a shape a CLI can keep.
+//!
+//! The free CLI also already answers the question this module answers, in a form
+//! that fits it: `agent_policy` persists WHICH agents are guarded and reconciles
+//! them, with no live process state. Wiring this module in as well would give one
+//! product two disagreeing registries.
+//!
+//! So: a long-running agent uses this; a one-shot CLI uses its policy file. The
+//! split is deliberate, and a future reader who sees "unused in Community" should
+//! read that as "belongs to the other consumer", not as something to connect up.
 
 use std::collections::HashMap;
 
