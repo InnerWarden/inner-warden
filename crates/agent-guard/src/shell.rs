@@ -3315,12 +3315,63 @@ fn mask_data_heredoc(
     // enclosing pipeline is a known data consumer. Unknown consumers and
     // interpreter wrappers stay visible so a new launcher cannot become a
     // projection bypass.
-    if matches!(owner.as_deref(), Some("cat" | "tee"))
+    if (matches!(owner.as_deref(), Some("cat" | "tee"))
+        || owner_command.is_some_and(|command| reads_stdin_as_message(command, redirected, source)))
         && data_only_pipeline
         && !owner_command.is_some_and(|command| has_execution_sink_ancestor(command, source))
         && !redirected_payload_executed_later(redirected, source)
     {
         mask_preserving_substitutions(body, source, masked, executable_inside_mask);
+    }
+}
+
+/// Does this command read its standard input as a MESSAGE it will never execute?
+///
+/// The heredoc mask is deliberately an allowlist: an unknown consumer stays
+/// visible, so a launcher nobody has heard of cannot become a projection
+/// bypass. `cat` and `tee` were the whole list, which left the commonest
+/// legitimate use of a quoted heredoc outside it — writing prose.
+///
+/// `git commit -F -` with a heredoc body is how a commit message describing an
+/// incident gets written. The body is data to git: it goes into the object
+/// store, never to a shell. But the projection could not tell that from
+/// `bash <<'EOF'`, so a commit message that QUOTED a dangerous command was
+/// screened as an attempt to RUN it. Same for a PR body via `gh --body-file -`.
+/// This is the false positive that costs a guardrail its credibility: the
+/// person it blocks is the person writing up the attack.
+///
+/// Matched on the pair (command, flag), not on the command alone. `git` runs
+/// hooks and `gh` calls an API; neither is being trusted wholesale, only the
+/// specific spelling that means "read the message from stdin".
+fn reads_stdin_as_message(
+    command: tree_sitter::Node<'_>,
+    redirected: tree_sitter::Node<'_>,
+    source: &[u8],
+) -> bool {
+    let Some(name) = command_name(command, source) else {
+        return false;
+    };
+    // Read the words from the whole redirected statement, not the command node.
+    // tree-sitter attaches the bare `-` of `-F -` to the redirect, so the
+    // command node alone reads `git commit -F` and the flag looks valueless.
+    let statement = node_text(redirected, source);
+    let head = statement.split("<<").next().unwrap_or_default().to_string();
+    let words: Vec<&str> = head.split_whitespace().collect();
+    // `-F -` / `--file=-` / `--body-file -`: the value must be exactly `-`,
+    // which is stdin. A path is a different command reading a different thing.
+    let stdin_valued = |flag: &str| -> bool {
+        words
+            .iter()
+            .position(|word| *word == flag)
+            .is_some_and(|index| words.get(index + 1).is_some_and(|value| *value == "-"))
+            || words.iter().any(|word| *word == format!("{flag}=-"))
+    };
+    match normalized_command_name(&name).as_str() {
+        "git" => stdin_valued("-F") || stdin_valued("--file"),
+        "gh" | "glab" => {
+            stdin_valued("--body-file") || stdin_valued("-F") || stdin_valued("--notes-file")
+        }
+        _ => false,
     }
 }
 
@@ -4246,6 +4297,61 @@ fn basename(name: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The dangerous fragment these cases carry, assembled rather than written
+    /// out, so this file is not itself a corpus of runnable destructive
+    /// commands. It is a detector's test material; it should not read as a
+    /// script anyone could paste.
+    fn bulk_delete() -> String {
+        format!("find /srv -type f {}", "-delete")
+    }
+
+    /// REGRESSION ANCHOR. The heredoc mask covered `cat` and `tee` only, so the
+    /// commonest legitimate use of a quoted heredoc — writing prose — was left
+    /// outside it. `git commit -F -` with a body that QUOTED a dangerous
+    /// command was screened as an attempt to RUN it. The person a guardrail
+    /// blocks must never be the person writing up the attack.
+    ///
+    /// FAILS ON REVERT: drop `reads_stdin_as_message` and the body is visible.
+    #[test]
+    fn a_message_read_from_stdin_is_data_not_code() {
+        let payload = bulk_delete();
+        for command in [
+            format!("git commit -F - <<'MSG'\nwe removed the nightly {payload} job\nMSG"),
+            format!("git commit --file=- <<'MSG'\nwe removed the nightly {payload} job\nMSG"),
+            format!("gh pr create --body-file - <<'BODY'\nwe dropped {payload}\nBODY"),
+        ] {
+            let projection = project(&command);
+            assert!(projection.parsed, "should parse: {command}");
+            assert!(
+                !projection.scan.contains("-delete"),
+                "a message body must be masked as data: {command}"
+            );
+        }
+    }
+
+    /// The allowlist must not become a bypass. An interpreter fed the same
+    /// heredoc EXECUTES it, a flag whose value is a real path is reading a file
+    /// rather than stdin, and an unknown consumer stays visible by design.
+    ///
+    /// FAILS ON REVERT: match on the command name alone and these leak through.
+    #[test]
+    fn the_message_allowlist_covers_neither_execution_nor_a_file_argument() {
+        let payload = bulk_delete();
+        for command in [
+            format!("bash <<'RUN'\n{payload}\nRUN"),
+            format!("sh <<'RUN'\n{payload}\nRUN"),
+            format!("python3 <<'RUN'\n{payload}\nRUN"),
+            format!("git commit -F notes.txt <<'MSG'\n{payload}\nMSG"),
+            format!("somenewtool --input - <<'X'\n{payload}\nX"),
+        ] {
+            let projection = project(&command);
+            assert!(
+                projection.scan.contains("-delete"),
+                "must stay visible to the scanner: {command}"
+            );
+        }
+    }
 
     /// The multi-line body idiom is text, and the projection must treat it as
     /// text.
