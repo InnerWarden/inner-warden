@@ -35,7 +35,39 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # The release must not be cuttable from a ref whose tests are failing.
+  # `npm-publish.yml` gained this gate; the workflow that produces the SIGNED
+  # BYTES did not, so the only thing between a red build and a published binary
+  # was remembering to look at CI before dispatching.
+  gate:
+    name: CI must be green on this commit
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Require a green CI run for ${{ github.sha }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          sha="${{ github.sha }}"
+          runs=$(gh api "repos/${{ github.repository }}/actions/workflows/ci.yml/runs?head_sha=$sha&per_page=20" \
+            --jq '[.workflow_runs[] | select(.status=="completed")] | map(.conclusion)')
+          echo "CI conclusions for $sha: $runs"
+          if [ "$runs" = "[]" ]; then
+            echo "::error::no completed CI run for $sha. Signing an untested commit is how a broken binary gets a signature."
+            exit 1
+          fi
+          if ! printf '%s' "$runs" | python3 -c 'import json,sys; c=json.load(sys.stdin); sys.exit(0 if c and all(x=="success" for x in c) else 1)'; then
+            echo "::error::CI is not green on $sha: $runs"
+            exit 1
+          fi
+          echo "CI is green on $sha"
+
   build:
+    needs: gate
     name: Build (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:

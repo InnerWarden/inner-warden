@@ -43,6 +43,11 @@ jobs:
     name: CI must be green on this commit
     runs-on: ubuntu-latest
     permissions:
+      # `actions: read` is what the Actions API this job queries actually needs.
+      # It ran with `checks: read` alone, which is a different API; the call
+      # happened to succeed, so the gap would only surface as a publish failing
+      # for an unrelated-looking reason on the day GitHub tightened the default.
+      actions: read
       checks: read
       contents: read
     steps:
