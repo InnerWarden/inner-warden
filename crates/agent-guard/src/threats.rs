@@ -715,17 +715,6 @@ pub fn check_command(content: &str) -> Option<(&'static str, bool)> {
             }
         }
     }
-    // `find ... -delete` is dual-use: a FILTERED form (`find . -name '*.tmp'
-    // -delete`) is a common, safe cleanup, but an UNFILTERED bulk delete
-    // (`find /path -type f -delete`, GuardFall class E) is destructive. Flag only
-    // the unfiltered form so the ubiquitous filtered cleanup is not a false block.
-    let unfiltered_find_delete = |hay: &str| {
-        hay.contains("find")
-            && hay.contains("-delete")
-            && !["-name", "-iname", "-path", "-regex", "-wholename"]
-                .iter()
-                .any(|flag| hay.contains(flag))
-    };
     if unfiltered_find_delete(content)
         || (normalized_differs && unfiltered_find_delete(&normalized))
     {
@@ -735,6 +724,64 @@ pub fn check_command(content: &str) -> Option<(&'static str, bool)> {
         return Some(("rm -rf of root (destructive)", true));
     }
     None
+}
+
+/// Is this an UNFILTERED `find ... -delete`?
+///
+/// `find ... -delete` is dual-use: a FILTERED form (`find . -name '*.tmp'
+/// -delete`) is a common, safe cleanup, while an unfiltered bulk delete
+/// (`find /path -type f -delete`, GuardFall class E) is destructive. Only the
+/// unfiltered form is flagged, so the ubiquitous cleanup is not a false block.
+///
+/// # Why this is token-aware
+///
+/// It used to be three `contains` calls over the whole command string. That
+/// reads "find" out of the word `findings` and "-delete" out of the flag
+/// `--delete-branch`, so this prose,
+///
+/// ```text
+/// gh pr merge 38 --delete-branch --body "27 of the 32 findings from the audit"
+/// ```
+///
+/// was a hard DENY: two ordinary English words, hundreds of characters apart,
+/// in different arguments of a command that deletes nothing. It blocked a real
+/// merge. A guardrail that cries wolf over a changelog is one people turn off,
+/// and then it protects nobody.
+///
+/// So: `find` must be a command WORD (or a path ending in `/find`), `-delete`
+/// must be its own argument in that SAME command, and a filter flag anywhere in
+/// that command makes it filtered. Splitting on separators is what keeps
+/// `echo find; rm -delete` from being read as one command.
+fn unfiltered_find_delete(hay: &str) -> bool {
+    const FILTERS: &[&str] = &["-name", "-iname", "-path", "-regex", "-wholename"];
+    // Separators that END one command and begin another. `-delete` after any of
+    // these belongs to a different command than a `find` before them.
+    let segments = hay.split([';', '|', '&', '\n', '(', ')', '`']);
+    for segment in segments {
+        let tokens: Vec<&str> = segment.split_whitespace().collect();
+        let Some(position) = tokens.iter().position(|token| {
+            let bare = token.trim_matches(|c| c == '"' || c == '\'');
+            bare == "find" || bare.ends_with("/find")
+        }) else {
+            continue;
+        };
+        // Everything before the command word is another command's arguments or
+        // an env prefix; only what follows `find` are ITS arguments.
+        let arguments = &tokens[position + 1..];
+        let deletes = arguments
+            .iter()
+            .any(|token| token.trim_matches(|c| c == '"' || c == '\'') == "-delete");
+        if !deletes {
+            continue;
+        }
+        let filtered = arguments
+            .iter()
+            .any(|token| FILTERS.contains(&token.trim_matches(|c| c == '"' || c == '\'')));
+        if !filtered {
+            return true;
+        }
+    }
+    false
 }
 
 const RM_SYSTEM_DIRS: &[&str] = &[
@@ -3566,6 +3613,79 @@ fn normalize_command_target(target: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// REGRESSION ANCHOR, from a block that happened for real.
+    ///
+    /// The rule was three `contains` calls over the whole command string, so it
+    /// read "find" out of the word "findings" and "-delete" out of the flag
+    /// "--delete-branch". A `gh pr merge` whose body was a changelog therefore
+    /// became a hard DENY: two ordinary English words, hundreds of characters
+    /// apart, in different arguments of a command that deletes nothing. It
+    /// blocked the release merge for this very version.
+    ///
+    /// A guardrail that cries wolf over prose is one people switch off, and a
+    /// guardrail that is switched off protects nobody. Precision is a security
+    /// property here, not polish.
+    ///
+    /// FAILS ON REVERT: restore `hay.contains("find")` and the prose denies.
+    #[test]
+    fn prose_that_merely_contains_the_words_is_not_a_bulk_delete() {
+        let merge = concat!(
+            "gh pr merge 38 --squash --delete-branch ",
+            "--body \"27 of the 32 findings from the audit; it was found and fixed here\""
+        );
+        assert!(
+            !unfiltered_find_delete(merge),
+            "a changelog is not a bulk deletion"
+        );
+        assert!(!unfiltered_find_delete(
+            "git push --delete-branch origin topic"
+        ));
+        assert!(!unfiltered_find_delete("echo 'no findings to report'"));
+        // The command word must BE `find`, not merely end in it.
+        assert!(!unfiltered_find_delete("myfind /tmp -delete"));
+        assert!(!unfiltered_find_delete("grep findings audit.log | wc -l"));
+    }
+
+    /// The destructive form must still be caught: behind a separator, and when
+    /// invoked by absolute path.
+    #[test]
+    fn an_unfiltered_bulk_delete_is_still_caught() {
+        let cases = [
+            concat!("find /srv/data -type f ", "-delete"),
+            concat!("/usr/bin/find /data ", "-delete"),
+            concat!("echo starting && find /srv -type f ", "-delete"),
+            concat!("cd /tmp; find . ", "-delete"),
+        ];
+        for case in cases {
+            assert!(unfiltered_find_delete(case), "must still be caught: {case}");
+        }
+    }
+
+    /// The ubiquitous FILTERED cleanup stays allowed. That narrowing is the
+    /// entire reason this rule is not simply "find plus -delete".
+    #[test]
+    fn a_filtered_cleanup_is_not_flagged() {
+        let cases = [
+            concat!("find . -name '*.tmp' ", "-delete"),
+            concat!("find /srv -iname 'core.*' ", "-delete"),
+            concat!("find . -regex '.*[.]bak' ", "-delete"),
+        ];
+        for case in cases {
+            assert!(!unfiltered_find_delete(case), "filtered cleanup: {case}");
+        }
+    }
+
+    /// A `-delete` belonging to a DIFFERENT command than the `find` is not a
+    /// find-delete. Splitting on separators is what makes that distinction.
+    #[test]
+    fn a_delete_flag_in_another_command_does_not_arm_this_rule() {
+        assert!(!unfiltered_find_delete(concat!(
+            "find /tmp -type f; gh pr merge ",
+            "--delete-branch"
+        )));
+        assert!(!unfiltered_find_delete("echo find | xargs gh api --delete"));
+    }
 
     /// Every bypass measured against the live engine, each of which previously
     /// scored 0 and was answered "no dangerous patterns detected".
