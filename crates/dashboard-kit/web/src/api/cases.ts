@@ -49,6 +49,19 @@ export type CaseListPage = {
   generated_at: string;
   items: CaseSummary[];
   next_cursor: string | null;
+  /**
+   * Echo of the requested window, present only when the request named one and
+   * the server honours it. The free server sends none of these three fields;
+   * every consumer must treat them as absent-safe.
+   */
+  window?: CaseListWindow;
+  /** Cases in the whole window, not just this page: the "5 of 312" number. */
+  total_in_window?: number;
+  /**
+   * False when a bounded source read hit its row cap, making total_in_window a
+   * LOWER bound. Render "at least N", never bare N, when this is false.
+   */
+  window_complete?: boolean;
 };
 
 export type AuthorityRef = { kind: string; id: string; version?: string | null; inferred?: boolean | null };
@@ -138,9 +151,18 @@ export type UnifiedCase = CaseSummary & {
   enrichment?: CaseEnrichment | null;
 };
 
+/** The server-side time windows the paid Cases API accepts. */
+export type CaseListWindow = "1h" | "24h" | "7d" | "30d" | "all";
+
 export type CaseListQuery = {
   cursor?: string | null;
   limit?: number;
+  /**
+   * Server-side time window. Optional and additive: the free product's server
+   * ignores unknown params it was never sent, and when this is omitted the
+   * request and response are byte-identical to the legacy exchange.
+   */
+  window?: CaseListWindow | "";
   outcome?: SecurityOutcome | "";
   mode?: EffectiveMode | "";
   authority?: string;
@@ -304,16 +326,35 @@ function verifiedOutcome(value: unknown, path: string): VerifiedOutcome {
 export function parseCaseListPage(value: unknown, requestedLimit = 20): CaseListPage {
   if (!Number.isInteger(requestedLimit) || requestedLimit < 1 || requestedLimit > 100) throw new Error("cases.limit: outside 1..100");
   const item = object(value, "cases");
-  exact(item, ["schema_version", "generated_at", "items", "next_cursor"], "cases");
+  exact(item, ["schema_version", "generated_at", "items", "next_cursor", "window", "total_in_window", "window_complete"], "cases");
   if (item.schema_version !== DASHBOARD_SCHEMA_VERSION) throw new Error("cases.schema_version: unsupported contract version");
   const items = array(item.items, "cases.items", caseSummary, requestedLimit);
   if (new Set(items.map((entry) => entry.id)).size !== items.length) throw new Error("cases.items: duplicate case id");
-  return {
+  const page: CaseListPage = {
     schema_version: DASHBOARD_SCHEMA_VERSION,
     generated_at: dateTime(item.generated_at, "cases.generated_at"),
     items,
     next_cursor: nullableString(item.next_cursor, "cases.next_cursor", 2_048),
   };
+  // The windowed trio is all-or-nothing from the paid server; each field is
+  // still validated independently so a half-shaped payload fails loudly
+  // instead of rendering a number that means nothing.
+  if (item.window !== undefined) {
+    const windows: readonly string[] = ["1h", "24h", "7d", "30d", "all"];
+    if (typeof item.window !== "string" || !windows.includes(item.window)) throw new Error("cases.window: unknown window");
+    page.window = item.window as CaseListWindow;
+  }
+  if (item.total_in_window !== undefined) {
+    if (typeof item.total_in_window !== "number" || !Number.isInteger(item.total_in_window) || item.total_in_window < 0) {
+      throw new Error("cases.total_in_window: not a non-negative integer");
+    }
+    page.total_in_window = item.total_in_window;
+  }
+  if (item.window_complete !== undefined) {
+    if (typeof item.window_complete !== "boolean") throw new Error("cases.window_complete: not a boolean");
+    page.window_complete = item.window_complete;
+  }
+  return page;
 }
 
 export function parseUnifiedCase(value: unknown): UnifiedCase {
@@ -447,6 +488,7 @@ export class DashboardCasesClient {
       ["cursor", query.cursor, 2_048], ["outcome", query.outcome, 64], ["mode", query.mode, 64],
       ["authority", query.authority, 256], ["capability", query.capability, 256], ["agent", query.agent, 256],
       ["host", query.host, 256], ["severity", query.severity, 64], ["q", query.q, 256],
+      ["window", query.window, 8],
     ] as const) {
       if (value && value.length <= maximum) parameters.set(name, value);
     }
