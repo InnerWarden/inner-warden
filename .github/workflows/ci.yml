@@ -70,9 +70,21 @@ jobs:
       # work, but a failure is visible here instead of being discovered by
       # whoever installed the package. Remove `continue-on-error` once the
       # file-write cases pass, and delete this note with it.
+      #
+      # Bounded, because the first run of this step showed why it has to be.
+      # Windows had only ever run fmt + clippy here (1-2 minutes). The moment
+      # the suite actually ran, the step passed 35 minutes with no output and
+      # was still going: something in it does not terminate on Windows. Without
+      # a bound that is a six-hour job holding a release, and the "reported"
+      # in this step's name becomes a lie, because a job that never finishes
+      # reports nothing at all.
+      #
+      # continue-on-error means a timeout is recorded and visible without
+      # blocking the build, which is the same contract as a test failure here.
       - name: Test (Windows, reported and not yet gating)
         if: runner.os == 'Windows'
         continue-on-error: true
+        timeout-minutes: 25
         run: cargo test --workspace
 
       # The wrapper must ask for the platform packages it ships with.
