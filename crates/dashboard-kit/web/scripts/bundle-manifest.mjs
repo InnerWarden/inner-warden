@@ -26,10 +26,28 @@ function portablePath(path) {
   return path.split(sep).join("/");
 }
 
+/**
+ * Order two paths the way the Rust validator does: by code unit.
+ *
+ * Every sort in this file used `localeCompare`, which is neither. It is
+ * locale-dependent — the same tree can order differently on two machines, in a
+ * file whose entire purpose is a reproducible digest — and it does not agree
+ * with the byte-wise `<` that `assets.rs` requires the manifest to be sorted by.
+ *
+ * The two only agreed by luck of the content hash. Vite emitted
+ * `index-_wt4hCb1.css` and `index-CmaS9UlA.js`; `localeCompare` puts the
+ * underscore first, byte order puts `C` (0x43) before `_` (0x5F), and the
+ * embedded bundle failed validation with "assets must be sorted and unique" —
+ * which is a dashboard that will not serve, decided by a hash nobody chose.
+ */
+export function byCodeUnit(left, right) {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
 async function regularFiles(directory, kind = "input") {
   const entries = await readdir(directory, { withFileTypes: true });
   const files = [];
-  for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
+  for (const entry of entries.sort((left, right) => byCodeUnit(left.name, right.name))) {
     const path = join(directory, entry.name);
     if (entry.isSymbolicLink()) {
       throw new Error(`bundle ${kind} must not be a symbolic link: ${portablePath(relative(webRoot, path))}`);
@@ -44,8 +62,10 @@ async function sourceInputs() {
   const files = rootInputs.map((path) => join(webRoot, path));
   files.push(...await regularFiles(join(webRoot, "src")));
   files.push(...await regularFiles(join(webRoot, "scripts")));
-  return files.sort((left, right) => portablePath(relative(webRoot, left))
-    .localeCompare(portablePath(relative(webRoot, right))));
+  return files.sort((left, right) => byCodeUnit(
+    portablePath(relative(webRoot, left)),
+    portablePath(relative(webRoot, right)),
+  ));
 }
 
 async function sourceDigest() {
@@ -61,7 +81,7 @@ async function sourceDigest() {
 
 export function digestEntries(inputs) {
   const hash = createHash("sha256");
-  for (const input of [...inputs].sort((left, right) => left.name.localeCompare(right.name))) {
+  for (const input of [...inputs].sort((left, right) => byCodeUnit(left.name, right.name))) {
     hash.update(input.name);
     hash.update("\0");
     hash.update(input.contents.replaceAll("\r\n", "\n"));
@@ -98,8 +118,10 @@ export function assertExactAssetRecords(expected, actual) {
 async function distAssetRecords() {
   const paths = (await regularFiles(distRoot, "output"))
     .filter((path) => path !== manifestPath)
-    .sort((left, right) => portablePath(relative(distRoot, left))
-      .localeCompare(portablePath(relative(distRoot, right))));
+    .sort((left, right) => byCodeUnit(
+      portablePath(relative(distRoot, left)),
+      portablePath(relative(distRoot, right)),
+    ));
   const records = [];
   for (const path of paths) {
     const name = portablePath(relative(distRoot, path));

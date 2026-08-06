@@ -188,8 +188,10 @@ function AgentsPanel({ state, edition }: { state: PollState<AgentsResponse>; edi
               <EmptyPanel title="No compatible agents detected" body="Install or launch an agent, or configure a standard MCP client, then keep the InnerWarden dashboard process running while it checks again." />
             )
           ) : (
-            <ul className="grid gap-px bg-slate-200 md:grid-cols-2">
-              {data.agents.map((agent) => <AgentCard key={agent.id} agent={agent} />)}
+            <ul className={agentGridClass(data.agents.length)}>
+              {data.agents.map((agent, index) => (
+                <AgentCard key={agent.id} agent={agent} spanClass={agentCardSpanClass(index, data.agents.length)} />
+              ))}
             </ul>
           )}
         </div>
@@ -209,11 +211,51 @@ function AgentsPanel({ state, edition }: { state: PollState<AgentsResponse>; edi
   );
 }
 
-function AgentCard({ agent }: { agent: LocalAgent }) {
+/**
+ * The most cards this layout puts on one row.
+ *
+ * Each card carries a heading, six detail cells and a detection-evidence list.
+ * At three across the detail grid collapses to one column per card and the
+ * headings wrap mid-word, so two is the ceiling rather than a placeholder for a
+ * responsive step nobody wrote.
+ */
+export const AGENT_GRID_MAX_COLUMNS = 2;
+
+/**
+ * The grid class for a given number of agent cards.
+ *
+ * REGRESSION ANCHOR. This was a flat `md:grid-cols-2`. The cards sit in a
+ * `gap-px` grid over a `bg-slate-200` parent — the hairline-divider trick —
+ * which means any cell the cards do not fill shows that parent through. On the
+ * common case of exactly ONE agent, the second column was an empty grey panel
+ * sitting beside the single card on every screen wider than `md`, which reads as
+ * a card that failed to load rather than as a host with one agent.
+ */
+export function agentGridClass(count: number): string {
+  // Both class strings are written out in full. Tailwind finds utilities by
+  // scanning the source for literal text, so a name assembled from
+  // `AGENT_GRID_MAX_COLUMNS` at runtime would compile to a class that exists in
+  // the markup and in no stylesheet.
+  return count <= 1 ? "grid gap-px bg-slate-200" : "grid gap-px bg-slate-200 md:grid-cols-2";
+}
+
+/**
+ * Whether a card should span the full row.
+ *
+ * The odd one out. Two columns leave the same grey hole beside the last card at
+ * three, five, seven agents that one column left at one; widening the trailing
+ * card closes it at every count instead of only the count someone tested.
+ */
+export function agentCardSpanClass(index: number, count: number): string {
+  const odd = count > 1 && count % AGENT_GRID_MAX_COLUMNS === 1;
+  return odd && index === count - 1 ? "md:col-span-2" : "";
+}
+
+function AgentCard({ agent, spanClass = "" }: { agent: LocalAgent; spanClass?: string }) {
   const running = runningStatus(agent.running);
   const view = guardrailView(agent.guardrail);
   return (
-    <li className="min-w-0 bg-white p-4 sm:p-5">
+    <li className={`min-w-0 bg-white p-4 sm:p-5 ${spanClass}`}>
       <div className="flex min-w-0 flex-wrap items-start justify-between gap-3">
         <div className="min-w-0">
           <h3 className="truncate text-base font-semibold text-slate-950" title={agent.display_name}>{agent.display_name}</h3>

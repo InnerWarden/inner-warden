@@ -9,6 +9,7 @@ import {
 import { DecidedBy } from "../components/DecidedBy";
 import { MachineIntelligence } from "../components/MachineIntelligence";
 import { Outcome } from "../components/Outcome";
+import { SensorActivity } from "../components/SensorActivity";
 import { Verdict } from "../components/Verdict";
 import { formatTimestamp, humanizeToken, normaliseMode } from "../presentation";
 
@@ -106,6 +107,12 @@ figures below cannot be shown. This is a producer fault, not an empty host.`}
       <PostureHero mode={mode} edition={edition} decisions={overview.commands} sessions={overview.sessions} guardedAgents={guardedAgents} />
 
       <MachineIntelligence edition={edition} />
+
+      {/* Renders nothing at all where `/api/sensors` is not served, which is
+          every Community host. It is mounted unconditionally rather than gated
+          on `edition` so the panel appears from the endpoint that actually has
+          the data, not from a label the shell resolved separately. */}
+      <SensorActivity />
 
       {overview.commands === 0 ? (
         <ZeroState guardedAgents={guardedAgents} edition={edition} />
