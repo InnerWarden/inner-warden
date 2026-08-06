@@ -11,6 +11,15 @@
 # binary so every platform gets the bytes the manifest was computed over.
 crates/dashboard-kit/web/dist/** -text
 
+# Same defect, second file. The frozen journey contract is pinned by
+# COMMUNITY_JOURNEY_CONTRACT_DIGEST and hashed straight from `include_str!`, so
+# a CRLF checkout changes its digest and the pin fails. Confirmed exactly: the
+# digest Windows produced is the sha256 of this file with CRLF endings.
+#
+# Anything whose BYTES are a contract belongs here. A digest pin that only holds
+# on the platforms you happen to test is not a pin.
+crates/dashboard-kit/contracts/** -text
+
 # Same reasoning for the LICENSE the packages now ship at
 # /usr/share/doc/innerwarden/copyright: a .deb built on one platform should not
 # differ from one built on another.
