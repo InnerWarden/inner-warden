@@ -107,3 +107,35 @@ describe("C0 case projections", () => {
     }
   });
 });
+
+describe("server-side case window (paid API opt-in)", () => {
+  const legacy = {
+    schema_version: "innerwarden.dashboard.v1",
+    generated_at: "2026-08-06T12:00:00Z",
+    items: [],
+    next_cursor: null,
+  };
+
+  // REGRESSION ANCHOR. The free server sends none of the windowed fields, and
+  // the screen must keep working against it unchanged: absent means absent,
+  // never a default, never an invented total.
+  it("parses the legacy body exactly as before, with no windowed fields", () => {
+    const page = parseCaseListPage(legacy);
+    expect(page.window).toBeUndefined();
+    expect(page.total_in_window).toBeUndefined();
+    expect(page.window_complete).toBeUndefined();
+  });
+
+  it("parses the windowed trio when the paid server sends it", () => {
+    const page = parseCaseListPage({ ...legacy, window: "7d", total_in_window: 312, window_complete: true });
+    expect(page.window).toBe("7d");
+    expect(page.total_in_window).toBe(312);
+    expect(page.window_complete).toBe(true);
+  });
+
+  it("rejects a malformed windowed payload loudly", () => {
+    expect(() => parseCaseListPage({ ...legacy, window: "fortnight" })).toThrow("unknown window");
+    expect(() => parseCaseListPage({ ...legacy, total_in_window: -1 })).toThrow("non-negative");
+    expect(() => parseCaseListPage({ ...legacy, window_complete: "yes" })).toThrow("not a boolean");
+  });
+});
