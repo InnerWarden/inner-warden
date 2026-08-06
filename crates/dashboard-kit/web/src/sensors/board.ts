@@ -347,6 +347,43 @@ function groupNotes(category: CollectorCategory, rows: readonly CollectorRow[]):
   return notes;
 }
 
+/**
+ * Hoist an inline note that repeats VERBATIM across rows into the group legend,
+ * and strip it from the rows that carried it.
+ *
+ * Faults were exempted from the say-it-once rule on the theory that "a fault is
+ * its own fact". Adversarial review broke the theory with a realistic case: two
+ * collectors both `permission_denied` (dns_capture and tcp_stream both need
+ * CAP_NET_RAW, so one missing capability impairs several rows at once) render
+ * the identical sentence on every row, exactly the repetition the redesign
+ * exists to remove. A note is only a row-specific fact if no other row says the
+ * same thing; when two rows say it verbatim, it is boilerplate by definition,
+ * whatever we believed when we wrote it. Deduping on the RENDERED TEXT rather
+ * than on the state also covers the pathless `source_unavailable` and the
+ * reason-less `unsupported`, and any future state whose note forgets to carry a
+ * fact.
+ */
+function hoistRepeatedNotes(rows: CollectorRow[], notes: CollectorStateNote[]): void {
+  const byText = new Map<string, CollectorRow[]>();
+  for (const row of rows) {
+    if (row.note === undefined) continue;
+    const carriers = byText.get(row.note);
+    if (carriers === undefined) byText.set(row.note, [row]);
+    else carriers.push(row);
+  }
+  for (const [text, carriers] of byText) {
+    if (carriers.length < 2) continue;
+    const first = carriers[0];
+    notes.push({
+      key: first.noteKey,
+      label: `${first.label} \u00d7${carriers.length}`,
+      tone: first.tone,
+      text,
+    });
+    for (const row of carriers) row.note = undefined;
+  }
+}
+
 const GROUP_TITLES: Record<CollectorCategory, string> = {
   telemetry: "Telemetry streams",
   alarm: "Alarm detectors",
@@ -378,12 +415,14 @@ export function collectorGroups(rows: readonly CollectorRow[]): CollectorGroup[]
     const scoped = rows
       .filter((row) => row.category === category)
       .sort((left, right) => TONE_ORDER[left.tone] - TONE_ORDER[right.tone] || right.count - left.count || left.name.localeCompare(right.name));
+    const notes = groupNotes(category, scoped);
+    hoistRepeatedNotes(scoped, notes);
     return {
       category,
       title: GROUP_TITLES[category],
       meaning: GROUP_MEANING[category],
       caption: caption(category, scoped),
-      notes: groupNotes(category, scoped),
+      notes,
       rows: scoped,
     };
   }).filter((group) => group.rows.length > 0);

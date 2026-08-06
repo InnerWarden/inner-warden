@@ -368,3 +368,48 @@ describe("sensorPanelState", () => {
     expect(sensorPanelState({ status: "failed", data })).toEqual({ render: "panel", data, stale: true });
   });
 });
+
+describe("verbatim fault notes are said once, not per row", () => {
+  const activity = (statuses: object[], sources: object[]) =>
+    ({ date: "2026-08-06", total_events: 0, total_incidents: 0, sources, top_kinds: [], detectors: [], event_timeline: {}, collector_health: { statuses } }) as never;
+
+  // REGRESSION ANCHOR. Faults were exempt from the say-it-once rule as "row
+  // facts", and adversarial review broke the exemption with a realistic case:
+  // one missing CAP_NET_RAW impairs dns_capture AND tcp_stream at once, so the
+  // identical permission_denied sentence rendered on both rows. A note two rows
+  // share verbatim is boilerplate by definition.
+  // FAILS ON REVERT: drop the hoistRepeatedNotes call and both rows carry it.
+  it("hoists an identical permission_denied note to the group legend", () => {
+    const rows = collectorRows(activity(
+      [
+        { name: "dns_capture", category: "telemetry", health: { state: "permission_denied" } },
+        { name: "tcp_stream", category: "telemetry", health: { state: "permission_denied" } },
+      ],
+      [
+        { name: "dns_capture", count: 0 },
+        { name: "tcp_stream", count: 0 },
+      ],
+    ));
+    const telemetry = collectorGroups(rows).find((group) => group.category === "telemetry")!;
+    expect(telemetry.rows.filter((row) => row.note !== undefined)).toHaveLength(0);
+    const hoisted = telemetry.notes.filter((note) => note.text.includes("lacks the OS capability"));
+    expect(hoisted).toHaveLength(1);
+    expect(hoisted[0].label).toContain("\u00d72");
+  });
+
+  it("keeps a genuinely unique fault inline on its row", () => {
+    const rows = collectorRows(activity(
+      [
+        { name: "nginx_access", category: "telemetry", health: { state: "source_unavailable", path: "/var/log/nginx/access.log" } },
+        { name: "auth_log", category: "telemetry", health: { state: "active" } },
+      ],
+      [
+        { name: "nginx_access", count: 0 },
+        { name: "auth_log", count: 3 },
+      ],
+    ));
+    const telemetry = collectorGroups(rows).find((group) => group.category === "telemetry")!;
+    const impaired = telemetry.rows.find((row) => row.name === "nginx_access")!;
+    expect(impaired.note).toContain("/var/log/nginx/access.log");
+  });
+});

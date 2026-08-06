@@ -14,6 +14,10 @@ concurrency:
 on:
   push:
   pull_request:
+  # Manual dispatch: during the 2026-08-06 GitHub Actions incident the push
+  # webhook dispatch was swallowed for hours while manual dispatches worked,
+  # leaving green code unmergeable for lack of a trigger. This is the lever.
+  workflow_dispatch:
 
 jobs:
   build:
