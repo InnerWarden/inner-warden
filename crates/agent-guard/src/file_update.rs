@@ -384,6 +384,19 @@ fn replace_inner(
             .map_err(|error| format!("writing {}: {error}", temp.display()))?;
         file.sync_all()
             .map_err(|error| format!("syncing {}: {error}", temp.display()))?;
+        // CLOSE the staged file before replacing with it.
+        //
+        // On Unix `rename(2)` does not care that we still hold a descriptor, so
+        // this drop looks like tidiness. On Windows it is the difference between
+        // working and not: both `ReplaceFileW` and `MoveFileExW` need the
+        // replacement file unshared, and an open handle makes them fail with
+        // ERROR_SHARING_VIOLATION - "The process cannot access the file because
+        // it is being used by another process". That is every config write this
+        // product makes: agent policy, MCP wiring, suppression, the graph. The
+        // Windows binary has been signed and published since 1.0.0 unable to
+        // write its own state, and it stayed invisible because the test suite
+        // had never been run on Windows.
+        drop(file);
 
         if !follow_file_symlink {
             ensure_no_symlink_components(
