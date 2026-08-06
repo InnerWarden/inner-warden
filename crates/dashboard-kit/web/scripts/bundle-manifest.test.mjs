@@ -3,8 +3,39 @@ import test from "node:test";
 import {
   assertExactAssetRecords,
   assetRecord,
+  byCodeUnit,
   digestEntries,
 } from "./bundle-manifest.mjs";
+
+/**
+ * REGRESSION ANCHOR.
+ *
+ * `assets.rs` rejects a manifest whose asset list is not sorted by byte order,
+ * and the embedded bundle is then refused wholesale — a dashboard that will not
+ * serve. This file used to sort with `localeCompare`, which agrees with byte
+ * order for most names and disagrees for some. Which one you get is decided by
+ * Vite's content hash, so the failure arrives on a random build with no source
+ * change to blame it on: the pair below is the one that actually did it.
+ */
+test("asset ordering matches the byte order the Rust validator requires", () => {
+  const emitted = ["assets/index-_wt4hCb1.css", "assets/index-CmaS9UlA.js", "index.html"];
+  const sorted = [...emitted].sort(byCodeUnit);
+  assert.deepEqual(sorted, ["assets/index-CmaS9UlA.js", "assets/index-_wt4hCb1.css", "index.html"]);
+  // Byte order, not the host's collation. Every adjacent pair must satisfy the
+  // same `<` the validator applies.
+  for (let index = 1; index < sorted.length; index += 1) assert.ok(sorted[index - 1] < sorted[index]);
+});
+
+test("source fingerprint does not depend on the host's collation", () => {
+  const inputs = [
+    { name: "src/_leading-underscore.ts", contents: "a\n" },
+    { name: "src/Capital.ts", contents: "b\n" },
+    { name: "src/lower.ts", contents: "c\n" },
+  ];
+  const byBytes = [...inputs].sort((left, right) => byCodeUnit(left.name, right.name)).map((entry) => entry.name);
+  assert.deepEqual(byBytes, ["src/Capital.ts", "src/_leading-underscore.ts", "src/lower.ts"]);
+  assert.equal(digestEntries(inputs), digestEntries([...inputs].reverse()));
+});
 
 const baseline = [
   { name: "src/App.tsx", contents: "export const App = 1;\n" },
