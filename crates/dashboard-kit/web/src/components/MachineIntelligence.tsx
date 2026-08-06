@@ -2,6 +2,7 @@ import { useEffect, useState, type ReactNode } from "react";
 import {
   fetchAgents,
   fetchTokenIntelligence,
+  type AgentGuardrail,
   type AgentsResponse,
   type LocalAgent,
   type TokenAgent,
@@ -210,7 +211,7 @@ function AgentsPanel({ state, edition }: { state: PollState<AgentsResponse>; edi
 
 function AgentCard({ agent }: { agent: LocalAgent }) {
   const running = runningStatus(agent.running);
-  const guardrail = statusTone(agent.guardrail.mode);
+  const view = guardrailView(agent.guardrail);
   return (
     <li className="min-w-0 bg-white p-4 sm:p-5">
       <div className="flex min-w-0 flex-wrap items-start justify-between gap-3">
@@ -224,13 +225,25 @@ function AgentCard({ agent }: { agent: LocalAgent }) {
         </span>
       </div>
 
+      {/* The whole point of the liveness half. An agent with a policy row and no
+          observation used to render as a normal, healthy card; the sentence has
+          to be on the card, not inferable from it. */}
+      {view.notice && (
+        <p role="status" className="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2.5 text-xs leading-5 text-amber-950">
+          {view.notice}
+        </p>
+      )}
+
       <dl className="mt-4 grid grid-cols-1 gap-3 text-xs min-[380px]:grid-cols-2">
-        <Detail label="Configured mode">
-          <span className={`font-semibold ${guardrail}`}>{humanise(agent.guardrail.mode)}</span>
+        <Detail label="Guardrail">
+          <span className={`font-semibold ${view.tone}`}>{view.label}</span>
+          {view.intent && <span className="mt-0.5 block text-[11px] font-normal text-slate-500">{view.intent}</span>}
         </Detail>
         <Detail label="Setup support">{humanise(agent.guardrail.setup_support)}</Detail>
         <Detail label="Mechanism">{agent.guardrail.mechanism ? humanise(agent.guardrail.mechanism) : "Not available"}</Detail>
         <Detail label="Automatic setup">{automaticSetupLabel(agent)}</Detail>
+        {view.lastObserved && <Detail label="Last observed">{view.lastObserved}</Detail>}
+        {view.recordedActivity && <Detail label="Recorded activity">{view.recordedActivity}</Detail>}
       </dl>
 
       {agent.detected_by.length > 0 && (
@@ -253,6 +266,201 @@ function AgentCard({ agent }: { agent: LocalAgent }) {
 /// set has not told us that, and must not be reported as though it had.
 const CONFIGURED_MODES = new Set(["monitor", "enforce", "mixed"]);
 
+/// The mode a producer sends when a policy row exists and NOTHING has been seen
+/// going through it. Deliberately outside [`CONFIGURED_MODES`] so it can never
+/// be rendered as an assurance -- but it still has to be rendered as SOMETHING,
+/// which is what everything below exists to do.
+const CONFIGURED_NOT_OBSERVED = "configured_not_observed";
+
+function readString(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return trimmed === "" ? undefined : trimmed;
+}
+
+function readCount(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+/**
+ * Does the payload positively say a guardrail is in place AND working?
+ *
+ * Two conditions, and both are required. A positive mode is the intent half; an
+ * `observation` other than `observed` is the live half CONTRADICTING it, and the
+ * contradiction wins. A producer that ships the live half therefore gets to veto
+ * its own positive mode, so a build that downgrades `mode` in one code path and
+ * forgets it in another still cannot print an assurance here.
+ *
+ * A producer that sends no `observation` at all (the free CLI) is not treated as
+ * having said "not observed" -- it has said nothing, and the old card is the
+ * honest rendering of that.
+ */
+export function guardrailIsProtecting(guardrail: AgentGuardrail): boolean {
+  if (!CONFIGURED_MODES.has(guardrail.mode)) return false;
+  const observation = readString(guardrail.observation);
+  return observation === undefined || observation === "observed";
+}
+
+/**
+ * Is this the state the whole card had no words for: configured, never seen?
+ *
+ * Recognised two ways, because the truth must not depend on one field arriving.
+ * Explicitly, when the producer already downgraded `mode` to
+ * `configured_not_observed`; and structurally, when a positive intent is
+ * contradicted by the live half.
+ */
+export function guardrailIsConfiguredButUnobserved(guardrail: AgentGuardrail): boolean {
+  if (guardrail.mode === CONFIGURED_NOT_OBSERVED) return true;
+  const observation = readString(guardrail.observation);
+  if (observation === undefined || observation === "observed") return false;
+  const intent = readString(guardrail.configured_mode) ?? guardrail.mode;
+  return CONFIGURED_MODES.has(intent);
+}
+
+/// Everything the agent card needs to say about one guardrail, decided outside
+/// React so the wording is testable without a DOM.
+export type GuardrailView = {
+  /// Whether the card is allowed to read as protection. Nothing else may set a
+  /// positive tone.
+  protecting: boolean;
+  /// A policy row exists and nothing has been seen going through it.
+  unobserved: boolean;
+  label: string;
+  tone: string;
+  /// The recorded intent, when the rendered verdict is not it.
+  intent?: string;
+  lastObserved?: string;
+  recordedActivity?: string;
+  /// The sentence the amber notice prints. Set only when `unobserved`.
+  notice?: string;
+};
+
+/**
+ * REGRESSION ANCHOR.
+ *
+ * The producer started sending an honest payload -- `configured_not_observed`
+ * plus dates, counters and prose -- and the card rendered none of it. The mode
+ * fell through `humanise` to the words "Configured not observed" beside
+ * "Eligibility unavailable", with no date, no age, and nothing to distinguish it
+ * from a card that had simply failed to load. Honest and useless is still a
+ * broken surface: the operator could not tell WHEN it was last seen, so the only
+ * available action was to ignore it.
+ */
+export function guardrailView(guardrail: AgentGuardrail): GuardrailView {
+  const protecting = guardrailIsProtecting(guardrail);
+  const unobserved = guardrailIsConfiguredButUnobserved(guardrail);
+  return {
+    protecting,
+    unobserved,
+    label: unobserved ? "Configured, not observed" : humanise(guardrail.mode),
+    tone: guardrailTone(guardrail),
+    intent: unobserved ? configuredIntentLabel(guardrail) : undefined,
+    lastObserved: lastObservedLabel(guardrail),
+    recordedActivity: recordedActivityLabel(guardrail),
+    notice: unobserved ? unobservedNotice(guardrail) : undefined,
+  };
+}
+
+/// Colour is a claim too. Only a guardrail that has been observed working earns
+/// the positive tone; the unobserved state gets the warning one, and anything
+/// unrecognised stays neutral rather than borrowing either.
+export function guardrailTone(guardrail: AgentGuardrail): string {
+  if (guardrailIsConfiguredButUnobserved(guardrail)) return "text-amber-800";
+  if (guardrailIsProtecting(guardrail)) return guardrail.mode === "mixed" ? "text-amber-700" : "text-blue-700";
+  if (guardrail.mode.toLowerCase().includes("partial")) return "text-amber-700";
+  return "text-slate-700";
+}
+
+/// What the policy row records, kept beside the verdict so nothing is hidden:
+/// the operator still sees what was configured, it just no longer arrives as an
+/// assurance the evidence does not support.
+export function configuredIntentLabel(guardrail: AgentGuardrail): string | undefined {
+  const intent = readString(guardrail.configured_mode);
+  if (intent === undefined || intent === guardrail.mode) return undefined;
+  return `Policy row records ${humanise(intent).toLowerCase()}`;
+}
+
+/// The date half, and the age beside it. An operator looking at a silent agent
+/// needs to know HOW silent; a bare date makes them do the subtraction.
+export function lastObservedLabel(guardrail: AgentGuardrail): string | undefined {
+  const observation = readString(guardrail.observation);
+  const age = formatUnobservedAge(guardrail.unobserved_for_seconds);
+  const observed = formatDate(guardrail.last_observed_at);
+  if (observed) return age ? `${observed} (${age} ago)` : observed;
+  // Below here nothing was ever observed, so the cell only exists when the
+  // producer sent the live half at all. Otherwise it says nothing.
+  if (observation === undefined) return undefined;
+  if (observation === "never_observed") {
+    const configured = formatDate(guardrail.configured_at);
+    if (configured && age) return `Never, ${age} since ${configured}`;
+    if (age) return `Never, ${age} and counting`;
+    return "Never";
+  }
+  return age ? `Not recorded (${age} since configuration)` : "Not recorded";
+}
+
+/// The row's own counters. Zero is a fact worth printing, so it is never elided
+/// into an empty cell.
+export function recordedActivityLabel(guardrail: AgentGuardrail): string | undefined {
+  const count = readCount(guardrail.recorded_activity);
+  if (count === undefined) return undefined;
+  if (count <= 0) return "None recorded";
+  return `${count.toLocaleString()} recorded, undated`;
+}
+
+/**
+ * The sentence on the amber notice.
+ *
+ * The producer's own `summary` is preferred when it sent one -- it is written
+ * against the same evidence and adds the reason ("a policy row is intent, not a
+ * running guardrail"). The derived fallback exists because the free product
+ * serves this endpoint too and sends none of these fields, and because a partial
+ * payload must still produce a sentence rather than a blank.
+ */
+export function unobservedNotice(guardrail: AgentGuardrail): string {
+  const summary = readString(guardrail.summary);
+  if (summary) return summary;
+  const since = formatDate(guardrail.last_observed_at) ?? formatDate(guardrail.configured_at);
+  const age = formatUnobservedAge(guardrail.unobserved_for_seconds);
+  const when = since && age
+    ? `not observed since ${since} (${age})`
+    : since
+      ? `not observed since ${since}`
+      : age
+        ? `not observed for ${age}`
+        : "not observed, and no observation has been recorded";
+  return `Configured, ${when}. A policy row is intent, not a running guardrail.`;
+}
+
+/// A duration in words, coarse on purpose: the point is the ORDER of magnitude
+/// ("16 days"), not a precise interval. Mirrors the producer's own wording so
+/// the derived fallback and the sent summary do not read as two different
+/// products.
+export function formatUnobservedAge(seconds: number | null | undefined): string | undefined {
+  const value = readCount(seconds);
+  if (value === undefined) return undefined;
+  const secs = Math.max(0, Math.floor(value));
+  if (secs < 90) return "less than a minute";
+  if (secs < 5_400) return `${Math.floor(secs / 60)} minutes`;
+  if (secs < 172_800) return `${Math.floor(secs / 3_600)} hours`;
+  const days = Math.floor(secs / 86_400);
+  return `${days} day${days === 1 ? "" : "s"}`;
+}
+
+/// An RFC 3339 timestamp as a calendar day. Falls back to the leading `Y-m-d`
+/// when the runtime cannot parse the string, and to nothing at all when it is
+/// not shaped like a date -- a wrong date is worse than an absent one.
+export function formatDate(value: string | null | undefined): string | undefined {
+  const raw = readString(value);
+  if (raw === undefined) return undefined;
+  const parsed = new Date(raw);
+  if (!Number.isNaN(parsed.getTime())) {
+    return new Intl.DateTimeFormat(undefined, { dateStyle: "medium" }).format(parsed);
+  }
+  const day = raw.slice(0, 10);
+  return /^\d{4}-\d{2}-\d{2}$/.test(day) ? day : undefined;
+}
+
 /**
  * What to say about automatic setup for one agent.
  *
@@ -265,11 +473,16 @@ const CONFIGURED_MODES = new Set(["monitor", "enforce", "mixed"]);
  * an agent with no guardrail installed at all.
  *
  * "Already configured" is an assurance. It may only be derived from a mode that
- * positively says so, never from the absence of a negative.
+ * positively says so, never from the absence of a negative -- and, since the
+ * live half exists, never over the top of evidence that contradicts it.
  */
 export function automaticSetupLabel(agent: LocalAgent): string {
   if (agent.guardrail.mode === "partial") return "Manual review required";
-  if (CONFIGURED_MODES.has(agent.guardrail.mode)) return "Already configured";
+  // Ahead of the positive branch on purpose. This cell is one of the places an
+  // operator reads for "am I covered", so the veto has to reach it too:
+  // configured is not verified, and the words must not blur that.
+  if (guardrailIsConfiguredButUnobserved(agent.guardrail)) return "Configured, not verified";
+  if (guardrailIsProtecting(agent.guardrail)) return "Already configured";
   // `unknown` lands here rather than in the branch above: not knowing is not a
   // kind of being configured.
   if (agent.guardrail.mode === "unknown") return "Not determined";
@@ -480,14 +693,6 @@ function runningStatus(value: boolean | null): { label: string; cls: string } {
   if (value === true) return { label: "Running", cls: "border-emerald-200 bg-emerald-50 text-emerald-700" };
   if (value === false) return { label: "Not running", cls: "border-slate-200 bg-slate-50 text-slate-600" };
   return { label: "Runtime not confirmed", cls: "border-slate-200 bg-slate-50 text-slate-600" };
-}
-
-function statusTone(mode: string): string {
-  const value = mode.toLowerCase();
-  if (value === "enforce") return "text-blue-700";
-  if (value === "monitor") return "text-blue-700";
-  if (value.includes("partial") || value.includes("mixed")) return "text-amber-700";
-  return "text-slate-700";
 }
 
 function humanise(value: string): string {

@@ -1,7 +1,26 @@
 // The shape the thin Rust API (`innerwarden dashboard`) serves. Newer binaries
 // add posture and outcome evidence; every addition stays optional so the UI also
 // works with the original graph-only contract.
+/// The HOST-WIDE posture reported by `guard/meta`. Deliberately unchanged: the
+/// screens that render it hold exhaustive `Record<GuardrailMode, ...>` copy
+/// tables, and no producer sends a per-agent liveness verdict on this field.
 export type GuardrailMode = "not_configured" | "monitor" | "enforce" | "mixed" | "partial" | "unknown";
+
+/// One agent's guardrail mode, which is a strictly wider question than the host
+/// posture above.
+///
+/// `configured_not_observed` is not a sixth kind of "configured". It is what a
+/// producer sends when a policy row exists and NOTHING has been seen going
+/// through it, and it is deliberately outside the set the card is allowed to
+/// render as an assurance.
+export type AgentGuardrailMode = GuardrailMode | "configured_not_observed";
+
+/// What the live half says about a guardrail actually running.
+export type GuardrailObservation =
+  | "observed"
+  | "not_observed_recently"
+  | "never_observed"
+  | "unknown";
 export type DecisionOutcome = "allowed" | "blocked" | "would_block" | "screened" | "unknown";
 export type DecisionMode = "monitor" | "enforce" | "check" | "unknown";
 
@@ -50,17 +69,47 @@ export type Node = { id: string; kind: string; label: string; attrs?: Record<str
 export type Edge = { from: string; to: string; kind: string };
 export type Graph = { nodes: Node[]; edges: Edge[] };
 
+/// One agent's guardrail, in two halves that must never be collapsed.
+///
+/// INTENT is what a policy row records. LIVE is whether anything has been seen
+/// going through it. They have different lifetimes: a row written by one
+/// `connect` stays until something removes it, so "there is a row" and "the
+/// guardrail is working" can diverge for weeks.
+///
+/// The first three fields are the original contract and are always present. The
+/// live half below is OPTIONAL because ONE bundle is served by two products and
+/// the free CLI sends only the original three. Every reader treats an absent
+/// field as "not told", never as a value, so a leaner producer degrades to the
+/// old card instead of blanking the panel.
+export type AgentGuardrail = {
+  /// The mode the card RENDERS. Only ever a positive mode when the evidence
+  /// supports it.
+  mode: AgentGuardrailMode | string;
+  mechanism: string | null;
+  setup_support: string;
+  /// What the policy row records, unmodified, so the intent stays visible.
+  configured_mode?: AgentGuardrailMode | string;
+  observation?: GuardrailObservation | string;
+  /// The row's own activity counters, summed. `null` when it keeps none.
+  recorded_activity?: number | null;
+  /// RFC 3339: when the row was written (intent).
+  configured_at?: string | null;
+  /// RFC 3339: the last time the guardrail was seen running for this agent.
+  last_observed_at?: string | null;
+  /// Seconds since the last observation, or since configuration when there has
+  /// never been one.
+  unobserved_for_seconds?: number | null;
+  /// One sentence naming the state in words.
+  summary?: string;
+};
+
 export type LocalAgent = {
   id: string;
   display_name: string;
   installed: boolean;
   running: boolean | null;
   detected_by: string[];
-  guardrail: {
-    mode: string;
-    mechanism: string | null;
-    setup_support: string;
-  };
+  guardrail: AgentGuardrail;
   auto_connect_eligible: boolean | null;
 };
 
@@ -192,6 +241,13 @@ function isAgentsResponse(value: unknown): value is AgentsResponse {
       && isRecord(agent.guardrail)
       && typeof agent.guardrail.mode === "string"
       && typeof agent.guardrail.setup_support === "string"
+      // The guardrail's LIVE half is deliberately not checked here. Rejecting a
+      // whole payload over one optional prose field would empty the panel, and
+      // this file has already paid for that once: leaving `unavailable` out of
+      // the availability union made a valid body fail validation and the card
+      // reported "did not respond" about an endpoint that had answered. The
+      // readers in MachineIntelligence.tsx `typeof`-check each field instead, so
+      // a malformed one is dropped and the rest of the card still renders.
       && (typeof agent.guardrail.mechanism === "string" || agent.guardrail.mechanism === null)
       && (typeof agent.auto_connect_eligible === "boolean" || agent.auto_connect_eligible === null));
 }
