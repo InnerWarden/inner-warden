@@ -187,6 +187,55 @@ impl Graph {
         }
     }
 
+    /// Cap on retained nodes. Readers already bound what they SHOW (500 items,
+    /// `take(limit)`), but the store itself had no cap, so the file grew for the
+    /// life of the install (audit UNSF-05).
+    ///
+    /// Chosen well above what any reader surfaces, so pruning can never remove
+    /// something a view would have displayed.
+    pub const MAX_NODES: usize = 20_000;
+
+    /// Serialised size the store is kept under, independent of the node count.
+    ///
+    /// Set below every reader limit in the product so a graph that is at its
+    /// node cap still loads with room to spare. Without it the store grew to
+    /// 16,777,528 bytes on a real install, 312 bytes past the 16 MiB reader
+    /// limit, and recording stopped dead for six hours with no visible signal.
+    pub const MAX_BYTES: usize = 12 * 1024 * 1024;
+
+    /// Drop the oldest nodes past [`Self::MAX_NODES`], and every edge that then
+    /// dangles.
+    ///
+    /// Insertion order is the age order here: `upsert_node` appends new ids and
+    /// mutates existing ones in place, so the front of the vector is the oldest
+    /// material. An edge whose endpoint was pruned is removed too, because a
+    /// dangling edge would make a reader render a relationship to a node it
+    /// cannot resolve.
+    pub fn prune(&mut self) -> usize {
+        let mut dropped = self.drop_oldest(self.nodes.len().saturating_sub(Self::MAX_NODES));
+        // A node cap alone does not bound the file. Nodes carry commands, and at
+        // 20k nodes a real graph measured 15.6 MB, close enough to any reader's
+        // limit that one long command could put it over and wedge every later
+        // write. The byte budget is what actually keeps the store loadable.
+        while self.nodes.len() > 1 && self.to_json().len() > Self::MAX_BYTES {
+            dropped += self.drop_oldest((self.nodes.len() / 10).max(1));
+        }
+        dropped
+    }
+
+    /// Drop the `count` oldest nodes and every edge that then dangles.
+    fn drop_oldest(&mut self, count: usize) -> usize {
+        if count == 0 {
+            return 0;
+        }
+        let count = count.min(self.nodes.len());
+        let dropped: std::collections::HashSet<String> =
+            self.nodes.drain(..count).map(|n| n.id).collect();
+        self.edges
+            .retain(|e| !dropped.contains(&e.from) && !dropped.contains(&e.to));
+        dropped.len()
+    }
+
     /// Add an edge unless the exact (from,to,kind) already exists.
     pub fn add_edge(&mut self, from: &str, to: &str, kind: &str) {
         let exists = self
@@ -337,15 +386,23 @@ impl Graph {
         }
     }
 
-    /// The next command index for `session` = how many command nodes it already
-    /// has. A caller ingesting a fresh verdict uses this so commands append in
-    /// order and `next` edges chain correctly.
+    /// The next command index for `session`: one past the HIGHEST index it has.
+    ///
+    /// Deliberately not a count. Ids are `cmd:<session>:<seq>` and `upsert_node`
+    /// mutates a node with an existing id in place, so the moment anything
+    /// removes an old command, a count-derived index points back at an id that
+    /// is still in use and the next command OVERWRITES a surviving one instead
+    /// of appending. Pruning does exactly that, so counting was a data-loss bug
+    /// waiting on a large enough graph.
     pub fn next_seq(&self, session: &str) -> usize {
         let prefix = format!("cmd:{session}:");
         self.nodes
             .iter()
-            .filter(|n| n.kind == "command" && n.id.starts_with(&prefix))
-            .count()
+            .filter(|n| n.kind == "command")
+            .filter_map(|n| n.id.strip_prefix(&prefix))
+            .filter_map(|seq| seq.parse::<usize>().ok())
+            .max()
+            .map_or(0, |highest| highest + 1)
     }
 
     /// Counts for a quick summary / dashboard.
@@ -1510,5 +1567,163 @@ mod tests {
         let cmd = g.nodes.iter().find(|n| n.kind == "command").unwrap();
         assert!(cmd.label.chars().count() <= 120);
         assert!(cmd.label.ends_with('…'));
+    }
+}
+
+#[cfg(test)]
+mod prune_tests {
+    use super::*;
+
+    fn node(id: &str) -> Node {
+        Node {
+            id: id.into(),
+            kind: "command".into(),
+            label: id.into(),
+            attrs: Default::default(),
+        }
+    }
+
+    /// REGRESSION ANCHOR for UNSF-05. Readers were bounded, the STORE was not,
+    /// so the file grew for the life of the install.
+    ///
+    /// FAILS ON REVERT: make `prune` a no-op and the length assertion trips.
+    #[test]
+    fn the_store_is_capped_and_drops_the_oldest() {
+        let mut g = Graph::new();
+        for i in 0..(Graph::MAX_NODES + 500) {
+            g.upsert_node(node(&format!("n{i:06}")));
+        }
+        let dropped = g.prune();
+        assert_eq!(dropped, 500);
+        assert_eq!(g.nodes.len(), Graph::MAX_NODES);
+        assert!(
+            g.nodes.iter().all(|n| n.id != "n000000"),
+            "the oldest node must be the one dropped"
+        );
+        assert!(
+            g.nodes
+                .iter()
+                .any(|n| n.id == format!("n{:06}", Graph::MAX_NODES + 499)),
+            "the newest node must survive"
+        );
+    }
+
+    /// REGRESSION ANCHOR. `next_seq` counted a session's command nodes, so once
+    /// pruning removed any of them the next command reused an id that was still
+    /// in use, and `upsert_node` overwrote that surviving command in place. The
+    /// newest activity then appeared in the middle of the history and an older
+    /// entry was destroyed. Nothing surfaced it; the record simply lied.
+    ///
+    /// Pruning is what makes this reachable, so the two ship together.
+    ///
+    /// FAILS ON REVERT: count the nodes again and the id collides.
+    #[test]
+    fn a_pruned_session_never_reuses_a_command_id() {
+        let mut g = Graph::default();
+        for seq in 0..10 {
+            g.ingest_verdict("s", seq, &format!("cmd {seq}"), &serde_json::json!({}));
+        }
+        // Whatever removes old material - prune, a partial restore, a manual
+        // edit - the surviving ids are what matter, not how many there are.
+        g.nodes.retain(|n| n.id != "cmd:s:0" && n.id != "cmd:s:1");
+
+        let next = g.next_seq("s");
+        assert_eq!(next, 10, "must continue past the highest id, not the count");
+        assert!(
+            !g.nodes.iter().any(|n| n.id == format!("cmd:s:{next}")),
+            "the next id must be free, or the new command overwrites a real one"
+        );
+
+        g.ingest_verdict("s", next, "the newest command", &serde_json::json!({}));
+        let survivors: Vec<&str> = g
+            .nodes
+            .iter()
+            .filter(|n| n.kind == "command")
+            .map(|n| n.label.as_str())
+            .collect();
+        assert!(survivors.contains(&"the newest command"));
+        assert!(
+            survivors.contains(&"cmd 8"),
+            "an existing command must not be overwritten by the new one"
+        );
+    }
+
+    /// REGRESSION ANCHOR, from a real outage on 2026-08-05.
+    ///
+    /// The node cap alone does not bound the FILE. A real install reached
+    /// 21,510 nodes / 16,777,528 bytes: past the 16 MiB limit its own writer
+    /// applied, so the verification read failed and the prune that would have
+    /// rescued it could never run. Recording stopped for six hours.
+    ///
+    /// Even at exactly MAX_NODES that graph serialised to ~15.6 MB, close
+    /// enough that one long command puts it over again. So the store must be
+    /// bounded in BYTES, not only in node count.
+    ///
+    /// FAILS ON REVERT: drop the byte budget from `prune` and this graph stays
+    /// over the limit, exactly as the user's did.
+    #[test]
+    fn prune_bounds_the_serialised_size_not_only_the_node_count() {
+        let mut g = Graph::default();
+        // 700-byte commands are what the real graph held; 20k of them is inside
+        // the node cap and outside any sane byte budget.
+        let long = "x".repeat(700);
+        for i in 0..Graph::MAX_NODES {
+            let mut n = node(&format!("n{i:06}"));
+            n.label = format!("{long}{i}");
+            g.upsert_node(n);
+        }
+        assert_eq!(g.nodes.len(), Graph::MAX_NODES, "still inside the node cap");
+        assert!(
+            g.to_json().len() > Graph::MAX_BYTES,
+            "the setup must reproduce the real shape: at the node cap and over the byte budget"
+        );
+
+        let dropped = g.prune();
+
+        assert!(dropped > 0, "a node cap alone would have dropped nothing");
+        assert!(
+            g.to_json().len() <= Graph::MAX_BYTES,
+            "the store must come back under its own budget, or every later write fails"
+        );
+        assert!(
+            g.nodes
+                .iter()
+                .any(|n| n.id == format!("n{:06}", Graph::MAX_NODES - 1)),
+            "the newest activity must survive: it is what the dashboard shows"
+        );
+    }
+
+    /// An edge pointing at a pruned node would render as a relationship to
+    /// something the reader cannot resolve, so it goes with it.
+    #[test]
+    fn edges_that_would_dangle_are_removed_with_their_node() {
+        let mut g = Graph::new();
+        for i in 0..(Graph::MAX_NODES + 2) {
+            g.upsert_node(node(&format!("n{i:06}")));
+        }
+        g.add_edge("n000000", "n000001", "ran");
+        let survivor = format!("n{:06}", Graph::MAX_NODES + 1);
+        g.add_edge(&survivor, &survivor, "self");
+        g.prune();
+        assert!(
+            !g.edges.iter().any(|e| e.from == "n000000"),
+            "an edge from a pruned node must not survive"
+        );
+        assert!(
+            g.edges.iter().any(|e| e.from == survivor),
+            "an edge between surviving nodes must be kept"
+        );
+    }
+
+    /// Under the cap, pruning must change nothing at all.
+    #[test]
+    fn a_small_graph_is_untouched() {
+        let mut g = Graph::new();
+        g.upsert_node(node("a"));
+        g.upsert_node(node("b"));
+        g.add_edge("a", "b", "ran");
+        assert_eq!(g.prune(), 0);
+        assert_eq!(g.nodes.len(), 2);
+        assert_eq!(g.edges.len(), 1);
     }
 }

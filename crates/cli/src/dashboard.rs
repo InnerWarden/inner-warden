@@ -761,6 +761,24 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
                 .unwrap_or_else(|_| "{}".into());
                 request.respond(json_response(body))
             }
+            // Additive, and deliberately its own route rather than a field on a
+            // versioned projection: a dashboard that renders a stale record must
+            // be able to say WHY it is stale without a schema bump. Absent an
+            // outage the payload is `{"recording":true}` and nothing renders.
+            "/api/guard/record-health" => {
+                let body = match graph_io::current_outage() {
+                    None => serde_json::json!({ "recording": true }),
+                    Some(outage) => serde_json::json!({
+                        "recording": false,
+                        "code": outage.code,
+                        "since_unix": outage.since_unix,
+                        "seconds": outage.seconds(),
+                        "lost_actions": outage.lost,
+                        "summary": outage.summary(),
+                    }),
+                };
+                request.respond(json_response(body.to_string()))
+            }
             "/api/overview" | "/api/guard/overview" => match graph_io::load_graph_checked() {
                 Ok(graph) => {
                     let body =
@@ -1322,8 +1340,19 @@ mod tests {
             .iter()
             .find(|agent| agent["id"] == "openclaw")
             .unwrap();
-        assert_eq!(openclaw["guardrail"]["setup_support"], "unsupported");
-        assert_eq!(openclaw["auto_connect_eligible"], false);
+        // OpenClaw became automatically guardable on 2026-08-05, once `mcp_wire`
+        // could locate a nested `mcp.servers` table, so the MECHANISM is now
+        // automatic.
+        assert_eq!(openclaw["guardrail"]["setup_support"], "automatic");
+        // Eligibility is a separate question about THIS file, and this fixture
+        // is genuinely JSON5 (`{ gateway: ... }`, an unquoted key). The strict
+        // reader refuses it, so nothing would be rewritten. That refusal IS the
+        // safety property: a file we cannot round-trip losslessly is left alone
+        // rather than mangled.
+        assert_eq!(
+            openclaw["auto_connect_eligible"], false,
+            "a JSON5 config must not be reported as ready to rewrite"
+        );
         assert!(openclaw["detected_by"]
             .as_array()
             .unwrap()

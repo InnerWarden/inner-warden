@@ -15,8 +15,25 @@ cargo fmt --all --check        # confirm formatting
 cargo clippy --workspace -- -D warnings   # lint, warnings are errors
 ```
 
-Run all four locally and confirm they pass before you open a pull request. CI
-runs the same checks on Linux, macOS, and Windows.
+Run all four locally and confirm they pass before you open a pull request.
+
+CI runs those four on Linux, macOS, and Windows, plus four gates the list above
+does not cover, so "all four pass" is not the same as "CI will be green":
+
+- `cargo deny check` (advisories, licences, bans, sources). Run it for any
+  dependency change.
+- The dashboard bundle: for any change under `crates/dashboard-kit/web`, run
+  `npm ci && npm run build` there and commit the rebuilt `dist/`, or
+  `npm run bundle:check` fails because the committed bundle no longer matches
+  its sources.
+- The packaging verifier (`node npm/scripts/verify-release-asset.test.mjs`),
+  which also proves itself against a real published artifact.
+- The npm/Cargo version agreement, including the six pinned
+  `optionalDependencies`.
+
+The Windows test run reports but does not gate yet; its known-rough file-write
+cases would otherwise block unrelated work. A Windows failure is still a real
+failure, so read it.
 
 ## Code style
 

@@ -1,5 +1,16 @@
 name: CI
 
+# Least privilege (audit CI-11): CI reads the code and nothing else. A workflow
+# with the default token can write to the repo, which CI has no reason to do.
+permissions:
+  contents: read
+
+# Audit CI-15: a new push supersedes the run it replaces, instead of both
+# finishing and burning a runner on a commit nobody is waiting for.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 on:
   push:
   pull_request:
@@ -14,10 +25,10 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           components: rustfmt, clippy
 
@@ -43,12 +54,37 @@ jobs:
         run: cargo clippy --workspace -- -D warnings
 
       # Full suite (unit + integration) on Linux and macOS, the first-class
-      # platforms. On Windows we run fmt + clippy above (which compile the whole
-      # workspace) as a build check; Windows is experimental and its file-write
-      # integration (hook auto-install, config replace) still has rough edges,
-      # so its test run does not gate the build yet.
+      # platforms.
       - name: Test
         if: runner.os != 'Windows'
+        run: cargo test --workspace
+
+      # Windows used to run fmt + clippy only, on the reasoning that the platform
+      # is experimental and its file-write integration has rough edges (audit
+      # TEST-06). But the project SIGNS AND PUBLISHES Windows binaries, so
+      # "experimental" described the confidence, not the exposure: users were
+      # installing bytes whose test suite had never executed on their OS.
+      #
+      # So the suite now runs on Windows and reports. It does not gate the build
+      # yet, because the known-rough integration cases would block unrelated
+      # work, but a failure is visible here instead of being discovered by
+      # whoever installed the package. Remove `continue-on-error` once the
+      # file-write cases pass, and delete this note with it.
+      #
+      # Bounded, because the first run of this step showed why it has to be.
+      # Windows had only ever run fmt + clippy here (1-2 minutes). The moment
+      # the suite actually ran, the step passed 35 minutes with no output and
+      # was still going: something in it does not terminate on Windows. Without
+      # a bound that is a six-hour job holding a release, and the "reported"
+      # in this step's name becomes a lie, because a job that never finishes
+      # reports nothing at all.
+      #
+      # continue-on-error means a timeout is recorded and visible without
+      # blocking the build, which is the same contract as a test failure here.
+      - name: Test (Windows, reported and not yet gating)
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        timeout-minutes: 25
         run: cargo test --workspace
 
       # The wrapper must ask for the platform packages it ships with.
@@ -57,6 +93,29 @@ jobs:
       # published as 1.0.4 and then 1.0.5, so `npm i -g innerwarden` resolved the new
       # version and installed the old binary. Two releases of guard fixes reached
       # nobody, and the registry dist-tag reported success both times.
+      # Audit CI-10: the check below proved the npm package is internally
+      # consistent, and nothing tied it to the Rust workspace. The two drifted
+      # (npm 1.0.6 against workspace 1.0.7), so the channel a user installs from
+      # can lag the version the code claims to be, silently.
+      - name: npm package version matches the Rust workspace
+        if: runner.os == 'Linux'
+        run: |
+          node -e '
+            const fs = require("fs");
+            const npm = require("./npm/package.json").version;
+            const toml = fs.readFileSync("Cargo.toml", "utf8");
+            const m = toml.match(/^\s*version\s*=\s*"([^"]+)"/m);
+            if (!m) { console.error("could not read the workspace version"); process.exit(1); }
+            if (m[1] !== npm) {
+              console.error(
+                "version drift: Cargo workspace is " + m[1] + ", npm/package.json is " + npm +
+                ". The npm channel would ship a version the code does not claim to be."
+              );
+              process.exit(1);
+            }
+            console.log("npm and workspace agree on " + npm);
+          '
+
       - name: npm optionalDependencies match the package version
         if: runner.os == 'Linux'
         run: |
@@ -90,9 +149,9 @@ jobs:
       run:
         working-directory: crates/dashboard-kit/web
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "20"
           cache: npm
@@ -115,3 +174,51 @@ jobs:
 
       - name: Bundle must not be built out of its own output
         run: npm run bundle:reproducible
+
+  # Audit SUP-02 / CI-07: the repo had no supply-chain gate. This is it. It runs
+  # on every push, so an advisory or an incompatible licence fails a PR instead
+  # of being found in a quarterly review.
+  supply-chain:
+    name: supply chain (cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Install cargo-deny
+        # Pinned to the MAJOR the deny.toml was written and validated against.
+        # ^0.16 was pinned without being run: 0.16 does not accept this config
+        # schema, so the gate failed on its first CI run for a reason that had
+        # nothing to do with the dependencies it exists to check.
+        run: cargo install cargo-deny --locked --version ^0.20
+      - name: Advisories, licences, bans and sources
+        run: cargo deny check
+
+  # Audit CI-02 / SUP-05: the packaging verifier is what stops unverified bytes
+  # entering npm and the .deb/.rpm. It must not be able to rot unnoticed.
+  packaging-verifier:
+    name: packaging verifier
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+      - name: Verifier unit tests
+        run: node npm/scripts/verify-release-asset.test.mjs
+      - name: Prove it against a REAL published artifact
+        # Downloads a genuine release asset with its sidecars, verifies it, and
+        # asserts a one-byte change is refused. Exercises the production key and
+        # the digest-signing assumption without publishing anything.
+        run: |
+          set -euo pipefail
+          REL=https://github.com/InnerWarden/innerwarden-releases/releases/download/iw-guard
+          A=innerwarden-linux-x86_64
+          mkdir -p /tmp/rv
+          for f in "$A" "$A.sha256" "$A.sig"; do curl -fsSL -o "/tmp/rv/$f" "$REL/$f"; done
+          node npm/scripts/verify-release-dir.mjs /tmp/rv "$A"
+          printf '\0' >> "/tmp/rv/$A"
+          if node npm/scripts/verify-release-dir.mjs /tmp/rv "$A"; then
+            echo "::error::the verifier accepted a tampered artifact"; exit 1
+          fi
+          echo "tampered artifact correctly refused"

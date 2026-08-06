@@ -210,12 +210,42 @@ fn unwrap_server(server: &mut Value) -> bool {
     true
 }
 
+/// Where a server table can live, as a path from the config root.
+///
+/// It used to be two top-level keys. OpenClaw nests its table under
+/// `mcp.servers`, so the locator is a PATH rather than a key: the wiring logic
+/// is identical once the table is found, and hardcoding depth-1 was the only
+/// thing keeping a whole agent unguardable.
+const SERVER_TABLE_PATHS: &[&[&str]] = &[&["mcpServers"], &["servers"], &["mcp", "servers"]];
+
+/// Resolve a path to a server table, read-only.
+fn table_at<'a>(root: &'a Value, path: &[&str]) -> Option<&'a serde_json::Map<String, Value>> {
+    let mut node = root;
+    for key in path {
+        node = node.get(key)?;
+    }
+    node.as_object()
+}
+
+/// Resolve a path to a server table for mutation. Never CREATES intermediate
+/// nodes: wiring must only ever touch a table the user already has.
+fn table_at_mut<'a>(
+    root: &'a mut Value,
+    path: &[&str],
+) -> Option<&'a mut serde_json::Map<String, Value>> {
+    let mut node = root;
+    for key in path {
+        node = node.get_mut(key)?;
+    }
+    node.as_object_mut()
+}
+
 /// Apply `f` to every server object under either schema key. Returns how many
 /// times `f` returned true.
 fn for_each_server(root: &mut Value, mut f: impl FnMut(&mut Value) -> bool) -> usize {
     let mut n = 0;
-    for key in ["mcpServers", "servers"] {
-        if let Some(map) = root.get_mut(key).and_then(|m| m.as_object_mut()) {
+    for path in SERVER_TABLE_PATHS {
+        if let Some(map) = table_at_mut(root, path) {
             for (_name, server) in map.iter_mut() {
                 if f(server) {
                     n += 1;
@@ -230,8 +260,8 @@ fn for_each_server(root: &mut Value, mut f: impl FnMut(&mut Value) -> bool) -> u
 fn counts(root: &Value) -> (usize, usize) {
     let mut stdio = 0;
     let mut wrapped = 0;
-    for key in ["mcpServers", "servers"] {
-        if let Some(map) = root.get(key).and_then(|m| m.as_object()) {
+    for path in SERVER_TABLE_PATHS {
+        if let Some(map) = table_at(root, path) {
             for (_name, server) in map {
                 if is_stdio_server(server) {
                     stdio += 1;
@@ -261,6 +291,28 @@ pub fn unwrap(mut root: Value) -> (Value, usize) {
     (root, n)
 }
 
+/// Is there at least one stdio server that is NOT yet routed through the proxy?
+///
+/// # Why this is not `!is_guarded` and not `!has_guard_wiring`
+///
+/// Automatic setup used to be offered only when a config had NO wiring at all
+/// (`!has_guard_wiring`). That conflated two different questions: "have we
+/// touched this file" and "is there work left to do". A config with three stdio
+/// servers where only one is wrapped answers YES to the first, so it was skipped
+/// forever, and the other two stayed unguarded with nothing offering to fix it.
+///
+/// Observed on a real machine (2026-08-05): a Codex config with `icm` wrapped
+/// and `node_repl` and `computer-use` open. The dashboard correctly reported
+/// `partial`, and eligibility said there was nothing to do. Not protected, and
+/// not offered: the worst of both.
+///
+/// Wrapping is idempotent and never nests proxies, so re-running over a
+/// partially wired config only touches what is still open.
+pub fn has_unguarded_stdio_server(root: &Value) -> bool {
+    let (stdio, wrapped) = counts(root);
+    stdio > wrapped
+}
+
 /// Whether this config is guarded: it has at least one stdio server and EVERY
 /// stdio server is routed through the proxy. (A config with only remote `url`
 /// servers, or no servers, is `false`, there is nothing local to guard.) Pure.
@@ -273,19 +325,17 @@ pub fn is_guarded(root: &Value) -> bool {
 /// including a legacy or malformed wrapper. Used to repair partial/broken wiring
 /// without pretending the entire config is protected.
 pub fn has_guard_wiring(root: &Value) -> bool {
-    ["mcpServers", "servers"].iter().any(|key| {
-        root.get(key)
-            .and_then(Value::as_object)
-            .is_some_and(|map| map.values().any(has_proxy_prefix))
-    })
+    SERVER_TABLE_PATHS
+        .iter()
+        .any(|path| table_at(root, path).is_some_and(|map| map.values().any(has_proxy_prefix)))
 }
 
 /// Effective mode across every guarded stdio server. `None` means there is no
 /// fully guarded local server; differing modes are reported as `Mixed`.
 pub fn guarded_mode(root: &Value) -> Option<WiringMode> {
     let mut found: Option<WiringMode> = None;
-    for key in ["mcpServers", "servers"] {
-        if let Some(map) = root.get(key).and_then(Value::as_object) {
+    for path in SERVER_TABLE_PATHS {
+        if let Some(map) = table_at(root, path) {
             for server in map
                 .values()
                 .filter(|server| wrapper_separator(server).is_some())
@@ -314,11 +364,24 @@ pub fn is_automatic_wrap_safe(root: &Value) -> bool {
     if !root.is_object() {
         return false;
     }
-    for key in ["mcpServers", "servers"] {
-        let Some(servers) = root.get(key) else {
+    for path in SERVER_TABLE_PATHS {
+        // A missing table is fine; a table that is not an object is not
+        // something to rewrite blind.
+        let mut node = root;
+        let mut missing = false;
+        for key in *path {
+            match node.get(key) {
+                Some(next) => node = next,
+                None => {
+                    missing = true;
+                    break;
+                }
+            }
+        }
+        if missing {
             continue;
-        };
-        let Some(servers) = servers.as_object() else {
+        }
+        let Some(servers) = node.as_object() else {
             return false;
         };
         for server in servers.values() {
@@ -594,6 +657,177 @@ mod tests {
         assert_eq!(
             unchanged, broken,
             "a broken proxy must never be wrapped again"
+        );
+    }
+}
+
+#[cfg(test)]
+mod nested_table_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// REGRESSION ANCHOR. The table locator was two top-level keys, so an agent
+    /// that nests its servers was unguardable no matter what: `agents connect`
+    /// found no table and silently wired nothing. OpenClaw nests under
+    /// `mcp.servers`, and it is the agent this product's own description names
+    /// first.
+    ///
+    /// FAILS ON REVERT: drop `["mcp","servers"]` from the paths and nothing is
+    /// wrapped.
+    #[test]
+    fn a_nested_server_table_is_wired_like_a_flat_one() {
+        let cfg = json!({
+            "meta": {"version": 1},
+            "mcp": {"servers": {"fs": {"command": "npx", "args": ["-y", "fs-server"]}}}
+        });
+        let (out, n) = wrap(cfg, "/usr/bin/innerwarden", false);
+        assert_eq!(n, 1, "the nested stdio server must be wrapped");
+        let server = &out["mcp"]["servers"]["fs"];
+        assert_eq!(server["command"], "/usr/bin/innerwarden");
+        assert!(
+            server["args"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a == "npx"),
+            "the real server must still be invoked: {server}"
+        );
+        assert!(is_guarded(&out), "and the config must report as guarded");
+    }
+
+    /// Wiring must be reversible for a nested table too, byte for byte.
+    #[test]
+    fn a_nested_table_round_trips() {
+        let original = json!({
+            "mcp": {"servers": {"fs": {"command": "npx", "args": ["-y", "fs-server"]}}}
+        });
+        let (wrapped, _) = wrap(original.clone(), "/usr/bin/innerwarden", false);
+        let (restored, n) = unwrap(wrapped);
+        assert_eq!(n, 1);
+        assert_eq!(
+            restored, original,
+            "unwrap must restore the original exactly"
+        );
+    }
+
+    /// Unrelated keys must survive untouched. OpenClaw's file carries auth,
+    /// channels and gateway config beside the servers, and mangling any of it
+    /// would be worse than not guarding at all.
+    #[test]
+    fn everything_outside_the_table_is_preserved() {
+        let cfg = json!({
+            "meta": {"version": 1},
+            "auth": {"token": "secret"},
+            "channels": [{"id": "main"}],
+            "mcp": {"allowed": ["fs"], "servers": {"fs": {"command": "npx", "args": []}}}
+        });
+        let (out, _) = wrap(cfg.clone(), "/usr/bin/innerwarden", false);
+        assert_eq!(out["meta"], cfg["meta"]);
+        assert_eq!(out["auth"], cfg["auth"]);
+        assert_eq!(out["channels"], cfg["channels"]);
+        assert_eq!(
+            out["mcp"]["allowed"], cfg["mcp"]["allowed"],
+            "a sibling of `servers` must not be disturbed"
+        );
+    }
+
+    /// A config with no table must not gain one. Creating `mcp.servers` where
+    /// the user had none would be inventing configuration.
+    #[test]
+    fn a_missing_table_is_never_created() {
+        let cfg = json!({"meta": {"version": 1}, "tools": {"profile": "coding"}});
+        let (out, n) = wrap(cfg.clone(), "/usr/bin/innerwarden", false);
+        assert_eq!(n, 0);
+        assert_eq!(out, cfg, "an untouched config must be returned unchanged");
+        assert!(out.get("mcp").is_none(), "no table may be conjured");
+    }
+
+    /// A nested table whose entries are malformed must not be auto-wrapped.
+    #[test]
+    fn a_malformed_nested_entry_blocks_automatic_wiring() {
+        let cfg = json!({"mcp": {"servers": {"broken": "not-an-object"}}});
+        assert!(
+            !is_automatic_wrap_safe(&cfg),
+            "automatic wiring must refuse a config it cannot rewrite safely"
+        );
+    }
+}
+
+#[cfg(test)]
+mod partial_wiring_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// REGRESSION ANCHOR. Found on a real machine: a config with one server
+    /// wrapped and two open. "Has any wiring" was used to mean "nothing to do",
+    /// so the two open servers stayed open forever and nothing offered to fix
+    /// them. Not protected, and not offered.
+    ///
+    /// FAILS ON REVERT: express this as `!has_guard_wiring` and it returns false
+    /// for the partial config.
+    #[test]
+    fn a_partially_wired_config_still_has_work_to_do() {
+        let cfg = json!({"mcpServers": {
+            "icm":         {"command": "/home/u/.local/bin/iw", "args": ["proxy", "--mode", "guard", "--", "icm"]},
+            "node_repl":   {"command": "/apps/node_repl", "args": []},
+            "computer-use":{"command": "/apps/SkyComputerUseClient", "args": []}
+        }});
+        assert!(
+            has_guard_wiring(&cfg),
+            "the file HAS been touched, which is a different question"
+        );
+        assert!(
+            !is_guarded(&cfg),
+            "and it is not fully guarded, which the dashboard already said"
+        );
+        assert!(
+            has_unguarded_stdio_server(&cfg),
+            "so there IS still work to do, and that is what eligibility must ask"
+        );
+    }
+
+    /// A fully wired config has nothing left, so it must not be offered again.
+    #[test]
+    fn a_fully_wired_config_has_nothing_left() {
+        let cfg = json!({"mcpServers": {
+            "a": {"command": "/home/u/.local/bin/iw", "args": ["proxy", "--mode", "guard", "--", "a"]}
+        }});
+        assert!(is_guarded(&cfg));
+        assert!(!has_unguarded_stdio_server(&cfg));
+    }
+
+    /// An untouched config is the ordinary case and must still be offered.
+    #[test]
+    fn an_untouched_config_has_work_to_do() {
+        let cfg = json!({"mcpServers": {"a": {"command": "npx", "args": ["-y", "a"]}}});
+        assert!(!has_guard_wiring(&cfg));
+        assert!(has_unguarded_stdio_server(&cfg));
+    }
+
+    /// A remote-only config has no local command to wrap, so there is nothing to
+    /// do and offering it would be noise.
+    #[test]
+    fn a_remote_only_config_has_nothing_to_wrap() {
+        let cfg = json!({"mcpServers": {"remote": {"url": "https://example.com/mcp"}}});
+        assert!(!has_unguarded_stdio_server(&cfg));
+    }
+
+    /// Wrapping a partially wired config must close the gap without nesting a
+    /// proxy inside the one already wrapped.
+    #[test]
+    fn wrapping_a_partial_config_closes_the_gap_without_nesting() {
+        let cfg = json!({"mcpServers": {
+            "wrapped": {"command": "/home/u/.local/bin/iw", "args": ["proxy", "--mode", "guard", "--", "npx", "a"]},
+            "open":    {"command": "npx", "args": ["-y", "b"]}
+        }});
+        let (out, _) = wrap(cfg, "/home/u/.local/bin/iw", false);
+        assert!(is_guarded(&out), "every stdio server must now be wrapped");
+        assert!(!has_unguarded_stdio_server(&out));
+        let args = out["mcpServers"]["wrapped"]["args"].as_array().unwrap();
+        assert_eq!(
+            args.iter().filter(|a| *a == "proxy").count(),
+            1,
+            "the already-wrapped server must not gain a second proxy: {args:?}"
         );
     }
 }

@@ -34,6 +34,31 @@ fn find_ad_cli() -> Option<std::path::PathBuf> {
 /// forwarded, so the single `innerwarden` CLI runs EVERY Active Defence host command on a
 /// licensed box - not just a hard-coded list. (`innerwarden-ctl` enforces the
 /// licence, so no host command runs without a valid one.)
+/// Verbs this binary handles natively that ALSO exist in Active Defence.
+///
+/// The catch-all delegation only fires for a verb this binary does not know, so
+/// these were unreachable on a licensed host: `innerwarden setup` always ran
+/// the Community wizard and the host one could not be reached at all. Naming
+/// them makes the overlap explicit instead of an accident of match order.
+pub const SHARED_VERBS: &[&str] = &["setup", "dashboard", "upgrade", "uninstall"];
+
+/// Is `verb` handled here AND by Active Defence?
+pub fn is_shared_verb(verb: &str) -> bool {
+    SHARED_VERBS.contains(&verb)
+}
+
+/// One line pointing at the host counterpart of a shared verb, when Active
+/// Defence is installed. `None` when it is not, so a free-only machine is never
+/// told about a command it does not have.
+pub fn shared_verb_hint(verb: &str) -> Option<String> {
+    if !is_shared_verb(verb) || find_ad_cli().is_none() {
+        return None;
+    }
+    Some(format!(
+        "  Active Defence has its own `{verb}` for the host layer:  innerwarden host {verb}"
+    ))
+}
+
 pub fn try_delegate(command: &str, args: &[String]) -> Option<ExitCode> {
     let cli = find_ad_cli()?;
     let status = std::process::Command::new(cli)
@@ -70,4 +95,109 @@ pub fn show_upsell(command: &str) -> ExitCode {
         )
     );
     ExitCode::from(3)
+}
+
+/// `innerwarden host <verb> [args]` - always run the Active Defence verb.
+///
+/// The escape hatch for the overlap: without it, a verb both layers implement is
+/// answered here and the host one cannot be reached at all.
+pub fn cmd_host(rest: &[String]) -> ExitCode {
+    // `--help` is a request for usage, not a verb to forward. Delegating it
+    // produced "there is no host layer to run `--help` in", which is nonsense.
+    let asked_for_help = rest
+        .first()
+        .is_some_and(|a| a == "--help" || a == "-h" || a == "help");
+    let Some(verb) = rest.first().filter(|_| !asked_for_help) else {
+        eprintln!("innerwarden host <command> [args]");
+        eprintln!("  Runs a command in the Active Defence host layer.");
+        eprintln!("  Use it to reach a host command whose name this binary also has:");
+        eprintln!("    {}", SHARED_VERBS.join(", "));
+        return if asked_for_help {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::from(2)
+        };
+    };
+    if find_ad_cli().is_none() {
+        eprintln!(
+            "innerwarden host: Active Defence is not installed on this machine, so there is no \
+             host layer to run `{verb}` in."
+        );
+        eprintln!("  → https://innerwarden.com/defend");
+        return ExitCode::from(1);
+    }
+    try_delegate(verb, &rest[1..]).unwrap_or_else(|| {
+        eprintln!("innerwarden host: could not run the Active Defence CLI");
+        ExitCode::from(1)
+    })
+}
+
+#[cfg(test)]
+mod shared_verb_tests {
+    use super::*;
+
+    /// REGRESSION ANCHOR. Delegation only fires for verbs this binary does not
+    /// know, so a verb both layers implement was answered here and the host one
+    /// was unreachable by any spelling. The overlap must be named, not implied
+    /// by match order.
+    ///
+    /// FAILS ON REVERT: empty the list and the membership checks trip.
+    #[test]
+    fn the_overlapping_verbs_are_named() {
+        for v in ["setup", "dashboard", "upgrade", "uninstall"] {
+            assert!(is_shared_verb(v), "`{v}` exists in both layers");
+        }
+        assert!(!is_shared_verb("check"), "check is ours alone");
+        assert!(!is_shared_verb("exec-gate"), "exec-gate is theirs alone");
+    }
+
+    /// A machine without Active Defence must never be told about a command it
+    /// does not have.
+    #[test]
+    fn no_hint_is_offered_when_the_host_layer_is_absent() {
+        if find_ad_cli().is_some() {
+            return; // this machine has it; the other case is covered below
+        }
+        assert_eq!(shared_verb_hint("setup"), None);
+    }
+
+    /// A verb that is ours alone never gets a host hint, whatever is installed.
+    #[test]
+    fn an_exclusive_verb_never_points_at_the_host_layer() {
+        assert_eq!(shared_verb_hint("check"), None);
+        assert_eq!(shared_verb_hint("proxy"), None);
+    }
+}
+
+#[cfg(test)]
+mod host_help_tests {
+    use super::*;
+
+    /// `--help` is a request for usage, not a verb to forward. Delegating it
+    /// produced "there is no host layer to run `--help` in", which is nonsense
+    /// and, on a machine WITH Active Defence, would have run `innerwarden-ctl
+    /// --help` instead of explaining this command.
+    #[test]
+    fn help_is_usage_and_not_a_verb_to_delegate() {
+        for flag in ["--help", "-h", "help"] {
+            let code = cmd_host(&[flag.to_string()]);
+            assert_eq!(
+                format!("{code:?}"),
+                format!("{:?}", ExitCode::SUCCESS),
+                "`host {flag}` must succeed with usage"
+            );
+        }
+    }
+
+    /// No arguments at all is a usage ERROR, so a script that forgot the verb
+    /// fails rather than looking like it worked.
+    #[test]
+    fn a_missing_verb_is_still_an_error() {
+        let code = cmd_host(&[]);
+        assert_ne!(
+            format!("{code:?}"),
+            format!("{:?}", ExitCode::SUCCESS),
+            "a missing verb must not exit 0"
+        );
+    }
 }

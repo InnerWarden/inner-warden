@@ -24,6 +24,7 @@ build_arch() {
   sed -e "s|\${PKG_ARCH}|$arch|g" \
       -e "s|\${PKG_VERSION}|$VERSION|g" \
       -e "s|\${PKG_BIN}|$bin|g" \
+      -e "s|\${PKG_LICENSE}|$ROOT/LICENSE|g" \
       "$TEMPLATE" > "$resolved"
   nfpm package -f "$resolved" -p deb -t "$OUT/"
   nfpm package -f "$resolved" -p rpm -t "$OUT/"

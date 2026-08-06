@@ -28,8 +28,18 @@ pub struct Deobfuscated {
     pub decoded: Vec<String>,
     /// True if at least one invisible/format character was stripped.
     pub stripped_invisible: bool,
-    /// True if NFKC folding changed the invisible-stripped text.
-    pub nfkc_changed: bool,
+    /// True if NFKC folding INTRODUCED ASCII letters that were not there before.
+    ///
+    /// This is the security-relevant half of NFKC folding. Folding alone is
+    /// ordinary: plenty of legitimate non-Latin text changes under NFKC, and
+    /// flagging all of it would punish anyone not writing in English.
+    ///
+    /// Folding that CREATES ASCII is different. Fullwidth `\u{ff52}\u{ff4d}` and
+    /// mathematical alphanumerics fold to plain `rm`, which is how a keyword is
+    /// smuggled past a matcher that only reads the raw bytes. The sibling signal
+    /// `stripped_invisible` already raises an alert for zero-width smuggling;
+    /// this closes the same hole for compatibility characters.
+    pub nfkc_introduced_ascii: bool,
 }
 
 /// Cap on characters scanned. Text longer than this is truncated for the
@@ -81,6 +91,13 @@ pub fn deobfuscate(input: &str) -> Deobfuscated {
 
     let normalized: String = stripped.nfkc().collect();
     let nfkc_changed = normalized != stripped;
+    // ASCII letters that folding created, not merely rearranged.
+    let ascii_before = stripped.chars().filter(|c| c.is_ascii_alphabetic()).count();
+    let ascii_after = normalized
+        .chars()
+        .filter(|c| c.is_ascii_alphabetic())
+        .count();
+    let nfkc_introduced_ascii = nfkc_changed && ascii_after > ascii_before;
 
     let mut decoded = decode_base64_candidates(input);
     if !tags_recovered.trim().is_empty() {
@@ -91,7 +108,7 @@ pub fn deobfuscate(input: &str) -> Deobfuscated {
         decoded,
         normalized,
         stripped_invisible,
-        nfkc_changed,
+        nfkc_introduced_ascii,
     }
 }
 
@@ -188,7 +205,8 @@ mod tests {
         // Fullwidth "IGNORE" folds to ASCII under NFKC.
         let s = "\u{FF29}\u{FF27}\u{FF2E}\u{FF2F}\u{FF32}\u{FF25}";
         let d = deobfuscate(s);
-        assert!(d.nfkc_changed);
+        // Folding created ASCII that was not in the input: the smuggling shape.
+        assert!(d.nfkc_introduced_ascii);
         assert_eq!(d.normalized, "IGNORE");
     }
 
@@ -215,7 +233,7 @@ mod tests {
         let s = "Please summarise the attached quarterly report.";
         let d = deobfuscate(s);
         assert!(!d.stripped_invisible);
-        assert!(!d.nfkc_changed);
+        assert!(!d.nfkc_introduced_ascii);
         assert_eq!(d.normalized, s);
         assert!(d.decoded.is_empty());
     }
@@ -230,5 +248,59 @@ mod tests {
         assert!(!is_invisible('a'));
         assert!(!is_invisible(' '));
         assert!(!is_invisible('é'));
+    }
+}
+
+#[cfg(test)]
+mod nfkc_smuggling_tests {
+    use super::*;
+
+    /// REGRESSION ANCHOR. `nfkc_changed` was computed and never read, so a
+    /// keyword smuggled with compatibility characters folded to plain ASCII and
+    /// raised nothing, while the same trick with zero-width characters raised
+    /// `AG-OBFUSCATION`. Narrowing the module surface (audit ARCH-08) is what
+    /// surfaced it, as an unread field.
+    ///
+    /// FAILS ON REVERT: stop computing `nfkc_introduced_ascii` and this trips.
+    #[test]
+    fn fullwidth_letters_that_fold_into_ascii_are_flagged() {
+        // Fullwidth "rm -rf": folds to plain ASCII a matcher would catch.
+        let d = deobfuscate("\u{ff52}\u{ff4d} -\u{ff52}\u{ff46} /");
+        assert!(
+            d.nfkc_introduced_ascii,
+            "folding that CREATES ascii is the smuggling shape"
+        );
+        assert!(
+            d.normalized.contains("rm"),
+            "and the folded form is what gets scanned: {}",
+            d.normalized
+        );
+    }
+
+    /// Ordinary non-Latin text also changes under NFKC. Flagging it would punish
+    /// anyone not writing in English, so only ASCII-creating folds count.
+    #[test]
+    fn ordinary_text_that_merely_folds_is_not_flagged() {
+        // A ligature folds, and introduces no new ASCII letters beyond itself
+        // being one; the guard is that plain prose must not trip.
+        for benign in [
+            "listar os ficheiros",
+            "日本語のテキスト",
+            "normal ascii text",
+        ] {
+            let d = deobfuscate(benign);
+            assert!(
+                !d.nfkc_introduced_ascii,
+                "benign text must not be flagged as smuggling: {benign:?}"
+            );
+        }
+    }
+
+    /// The plain case must stay silent.
+    #[test]
+    fn unchanged_text_reports_nothing() {
+        let d = deobfuscate("git status");
+        assert!(!d.nfkc_introduced_ascii);
+        assert!(!d.stripped_invisible);
     }
 }

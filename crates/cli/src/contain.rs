@@ -769,6 +769,12 @@ mod tests {
         assert_eq!(Mode::BlockReview.hook_flags(), (true, false));
     }
 
+    // POSIX-only: these build a jail plan for a hardcoded POSIX project path
+    // (`/home/dev/proj`, `/Users/dev/proj`). On Windows that path is not
+    // absolute in the platform's sense, so the safety check rejects it and the
+    // test fails for a reason that has nothing to do with what it asserts.
+    // They were never gated because the suite had never run on Windows.
+    #[cfg(unix)]
     #[test]
     fn linux_shadows_the_secret_dir_and_never_binds_ssh() {
         let plan = build_linux_jail(&inputs(&["claude"])).unwrap();
@@ -842,6 +848,12 @@ mod tests {
         }
     }
 
+    // POSIX-only: these build a jail plan for a hardcoded POSIX project path
+    // (`/home/dev/proj`, `/Users/dev/proj`). On Windows that path is not
+    // absolute in the platform's sense, so the safety check rejects it and the
+    // test fails for a reason that has nothing to do with what it asserts.
+    // They were never gated because the suite had never run on Windows.
+    #[cfg(unix)]
     #[test]
     fn jail_accepts_a_safe_project_sibling() {
         let mut input = inputs(&["claude"]);
@@ -851,6 +863,12 @@ mod tests {
         assert!(build_macos_profile(&input).is_ok());
     }
 
+    // POSIX-only: these build a jail plan for a hardcoded POSIX project path
+    // (`/home/dev/proj`, `/Users/dev/proj`). On Windows that path is not
+    // absolute in the platform's sense, so the safety check rejects it and the
+    // test fails for a reason that has nothing to do with what it asserts.
+    // They were never gated because the suite had never run on Windows.
+    #[cfg(unix)]
     #[test]
     fn linux_reapplies_protected_masks_after_every_writable_bind() {
         let mut input = inputs(&["claude"]);
@@ -899,6 +917,12 @@ mod tests {
         assert!(build_macos_profile(&input).is_err());
     }
 
+    // POSIX-only: these build a jail plan for a hardcoded POSIX project path
+    // (`/home/dev/proj`, `/Users/dev/proj`). On Windows that path is not
+    // absolute in the platform's sense, so the safety check rejects it and the
+    // test fails for a reason that has nothing to do with what it asserts.
+    // They were never gated because the suite had never run on Windows.
+    #[cfg(unix)]
     #[test]
     fn linux_masks_secret_file_with_devnull_and_dir_with_tmpfs() {
         // A tmpfs over a FILE aborts bwrap (ENOTDIR); a file must be masked with a
@@ -925,6 +949,12 @@ mod tests {
         );
     }
 
+    // POSIX-only: these build a jail plan for a hardcoded POSIX project path
+    // (`/home/dev/proj`, `/Users/dev/proj`). On Windows that path is not
+    // absolute in the platform's sense, so the safety check rejects it and the
+    // test fails for a reason that has nothing to do with what it asserts.
+    // They were never gated because the suite had never run on Windows.
+    #[cfg(unix)]
     #[test]
     fn macos_denies_the_resolved_project_secrets() {
         let mut i = inputs(&["claude"]);
@@ -940,6 +970,12 @@ mod tests {
         assert!(p.contains("(deny file-write* (subpath \"/Users/dev/proj/.env.local\"))"));
     }
 
+    // POSIX-only: these build a jail plan for a hardcoded POSIX project path
+    // (`/home/dev/proj`, `/Users/dev/proj`). On Windows that path is not
+    // absolute in the platform's sense, so the safety check rejects it and the
+    // test fails for a reason that has nothing to do with what it asserts.
+    // They were never gated because the suite had never run on Windows.
+    #[cfg(unix)]
     #[test]
     fn linux_env_is_secret_safe() {
         let plan = build_linux_jail(&inputs(&["claude"])).unwrap();
@@ -952,6 +988,12 @@ mod tests {
         assert_eq!(env["IW_NOTIFY_CONFIG"], "");
     }
 
+    // POSIX-only: these build a jail plan for a hardcoded POSIX project path
+    // (`/home/dev/proj`, `/Users/dev/proj`). On Windows that path is not
+    // absolute in the platform's sense, so the safety check rejects it and the
+    // test fails for a reason that has nothing to do with what it asserts.
+    // They were never gated because the suite had never run on Windows.
+    #[cfg(unix)]
     #[test]
     fn macos_denies_secret_dir_read_and_write_last() {
         let mut i = inputs(&["claude"]);

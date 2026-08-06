@@ -1,0 +1,23 @@
+# Secret-scanning allowlist (audit SEC-08).
+#
+# Every entry here is a TEST FIXTURE: a fake credential a detector must be able
+# to recognise. Without this file a scanner reports them as leaked secrets, and a
+# scanner that cries wolf on its own test data is one people learn to skip.
+#
+# The rule for adding a line: it must be a value that was never valid anywhere.
+# A real credential that has been rotated does NOT belong here, it belongs in a
+# rotation record.
+
+# Detector fixtures: the patterns the threat engine must match on.
+crates/agent-guard/src/threats.rs
+crates/agent-guard/src/redact.rs
+
+# OWASP ASI conformance fixtures.
+crates/agent-guard/tests/owasp_asi.rs
+
+# Benchmark corpus: 219 attack and benign cases, including credential-shaped
+# strings the rules are scored against.
+crates/agent-guard/benchmarks/agent_attack_corpus.yml
+
+# The ATR corpus ships regexes that look like secrets by construction.
+rules/atr/

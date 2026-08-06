@@ -15,3 +15,9 @@
 # OS and logs
 .DS_Store
 *.log
+
+# graphify code graph: 81M of local build artefacts, never committed
+graphify-out/
+
+# Local-only specs, never committed
+.specify/

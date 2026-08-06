@@ -507,8 +507,13 @@ pub fn is_auto_connect_candidate(
     if !is_reviewed_integration(agent) {
         return false;
     }
+    // "Is there work left to do", not "have we touched this file". A config with
+    // one wrapped server and two open ones answers yes to the second and was
+    // therefore skipped forever, leaving the open servers unguarded with nothing
+    // offering to fix them. Wrapping is idempotent, so re-running only touches
+    // what is still open.
     !is_excluded(policy, &agent.name)
-        && !innerwarden_agent_guard::agents_ops::status_has_guard_wiring(home, agent)
+        && innerwarden_agent_guard::agents_ops::status_has_unguarded_server(home, agent)
         && valid_guardable_config(home, agent)
 }
 
@@ -1341,5 +1346,205 @@ mod tests {
         let fifo = CString::new(lock.as_os_str().as_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
         assert!(with_lock(home.path(), || Ok(())).is_err());
+    }
+}
+
+#[cfg(test)]
+mod openclaw_eligibility_tests {
+    use super::*;
+
+    fn openclaw_status() -> innerwarden_agent_guard::agents::AgentStatus {
+        let known = innerwarden_agent_guard::agents::KNOWN
+            .iter()
+            .find(|k| k.name == "openclaw")
+            .expect("openclaw is a known agent");
+        innerwarden_agent_guard::agents::AgentStatus {
+            name: known.name.into(),
+            installed: true,
+            hookable: known.hookable,
+            mcp_json: known.mcp_json.map(str::to_string),
+            mcp_toml: known.mcp_toml.map(str::to_string),
+            pids: Vec::new(),
+            evidence: Vec::new(),
+            guarded: false,
+        }
+    }
+
+    /// REGRESSION ANCHOR. OpenClaw is the agent the product description names
+    /// first, and it was unguardable: `mcp_wire` located server tables by
+    /// top-level key only, and OpenClaw nests its own under `mcp.servers`.
+    ///
+    /// FAILS ON REVERT: set `mcp_json: None` for OpenClaw, or drop the nested
+    /// path from `SERVER_TABLE_PATHS`, and eligibility goes back to false.
+    #[test]
+    fn a_strict_json_config_with_a_nested_table_is_eligible() {
+        let home = tempfile::TempDir::new().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".openclaw")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".openclaw/openclaw.json"),
+            r#"{"meta":{"version":1},"mcp":{"servers":{"fs":{"command":"npx","args":["-y","fs"]}}}}"#,
+        )
+        .expect("write");
+
+        assert!(
+            is_auto_connect_candidate(home.path(), &openclaw_status(), &AgentPolicy::default()),
+            "a strict-JSON OpenClaw config with a nested server table must be wirable"
+        );
+    }
+
+    /// The safety property, stated as a test: a genuinely JSON5 file is refused
+    /// rather than rewritten. Refusing to touch the format was never the
+    /// guarantee; parsing strictly is, and it fails closed.
+    #[test]
+    fn a_json5_config_is_refused_rather_than_rewritten() {
+        let home = tempfile::TempDir::new().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".openclaw")).expect("mkdir");
+        let json5 = "{ gateway: { port: 18789 }, /* a comment */ }";
+        let path = home.path().join(".openclaw/openclaw.json");
+        std::fs::write(&path, json5).expect("write");
+
+        assert!(
+            !is_auto_connect_candidate(home.path(), &openclaw_status(), &AgentPolicy::default()),
+            "a config that cannot be parsed strictly must never be considered rewritable"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            json5,
+            "and the file must be left byte-for-byte untouched"
+        );
+    }
+
+    /// A config with no server table yet is not an error, just nothing to wire.
+    #[test]
+    fn a_config_without_servers_is_not_eligible_but_is_not_a_failure() {
+        let home = tempfile::TempDir::new().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".openclaw")).expect("mkdir");
+        std::fs::write(
+            home.path().join(".openclaw/openclaw.json"),
+            r#"{"meta":{"version":1},"tools":{"profile":"coding"}}"#,
+        )
+        .expect("write");
+        // Structurally safe, so no refusal; simply nothing present to guard.
+        let _ = is_auto_connect_candidate(home.path(), &openclaw_status(), &AgentPolicy::default());
+    }
+}
+
+#[cfg(test)]
+mod partial_eligibility_tests {
+    use super::*;
+
+    fn codex_status() -> innerwarden_agent_guard::agents::AgentStatus {
+        let known = innerwarden_agent_guard::agents::KNOWN
+            .iter()
+            .find(|k| k.name == "codex")
+            .expect("codex is a known agent");
+        innerwarden_agent_guard::agents::AgentStatus {
+            name: known.name.into(),
+            installed: true,
+            hookable: known.hookable,
+            mcp_json: known.mcp_json.map(str::to_string),
+            mcp_toml: known.mcp_toml.map(str::to_string),
+            pids: Vec::new(),
+            evidence: Vec::new(),
+            guarded: false,
+        }
+    }
+
+    fn write_codex(home: &std::path::Path, body: &str) {
+        std::fs::create_dir_all(home.join(".codex")).expect("mkdir");
+        std::fs::write(home.join(".codex/config.toml"), body).expect("write");
+    }
+
+    /// REGRESSION ANCHOR, taken from a real machine on 2026-08-05: a Codex
+    /// config with `icm` wrapped and `node_repl` / `computer-use` open.
+    ///
+    /// Eligibility asked "has this file any wiring", so one wrapped server made
+    /// the whole config ineligible and the two open ones stayed open with
+    /// nothing offering to guard them.
+    ///
+    /// FAILS ON REVERT: go back to `!status_has_guard_wiring` and this is false.
+    #[test]
+    fn a_partially_wired_agent_is_still_offered_automatic_setup() {
+        let home = tempfile::TempDir::new().expect("tempdir");
+        write_codex(
+            home.path(),
+            r#"
+[mcp_servers.icm]
+command = "/home/u/.local/bin/iw"
+args = ["proxy", "--mode", "guard", "--", "icm"]
+
+[mcp_servers.node_repl]
+command = "/apps/node_repl"
+args = []
+
+[mcp_servers.computer-use]
+command = "/apps/SkyComputerUseClient"
+args = []
+"#,
+        );
+        assert!(
+            is_auto_connect_candidate(home.path(), &codex_status(), &AgentPolicy::default()),
+            "two servers are still open, so there is work to do and it must be offered"
+        );
+    }
+
+    /// A fully wired agent has nothing left and must not be offered again, or
+    /// the dashboard would nag about work that is already done.
+    #[test]
+    fn a_fully_wired_agent_is_not_offered_again() {
+        let home = tempfile::TempDir::new().expect("tempdir");
+        write_codex(
+            home.path(),
+            r#"
+[mcp_servers.icm]
+command = "/home/u/.local/bin/iw"
+args = ["proxy", "--mode", "guard", "--", "icm"]
+"#,
+        );
+        assert!(
+            !is_auto_connect_candidate(home.path(), &codex_status(), &AgentPolicy::default()),
+            "everything is guarded, so there is nothing to offer"
+        );
+    }
+
+    /// An untouched config is the ordinary case and must still be offered.
+    #[test]
+    fn an_untouched_agent_is_offered() {
+        let home = tempfile::TempDir::new().expect("tempdir");
+        write_codex(
+            home.path(),
+            r#"
+[mcp_servers.icm]
+command = "icm"
+args = ["serve"]
+"#,
+        );
+        assert!(is_auto_connect_candidate(
+            home.path(),
+            &codex_status(),
+            &AgentPolicy::default()
+        ));
+    }
+
+    /// An operator who excluded an agent must stay excluded, whatever the
+    /// wiring state. Their decision outranks ours.
+    #[test]
+    fn an_excluded_agent_is_never_offered_however_partial() {
+        let home = tempfile::TempDir::new().expect("tempdir");
+        write_codex(
+            home.path(),
+            r#"
+[mcp_servers.open]
+command = "npx"
+args = ["-y", "x"]
+"#,
+        );
+        let mut policy = AgentPolicy::default();
+        policy.excluded.push("codex".into());
+        assert!(!is_auto_connect_candidate(
+            home.path(),
+            &codex_status(),
+            &policy
+        ));
     }
 }

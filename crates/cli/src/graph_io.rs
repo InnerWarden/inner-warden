@@ -73,7 +73,19 @@ impl std::fmt::Display for GraphLoadError {
     }
 }
 
+/// Refuse to read a store larger than this into memory. The graph is bounded by
+/// [`Graph::MAX_BYTES`] on the way out, so anything near this is corruption or
+/// another process's file, and an unbounded read would take the CLI with it.
+const MAX_GRAPH_READ_BYTES: u64 = innerwarden_agent_guard::file_update::MAX_OWNED_STORE_BYTES;
+
+fn oversized(path: &std::path::Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|m| m.len() > MAX_GRAPH_READ_BYTES)
+}
+
 fn load_result_at(path: &std::path::Path) -> Loaded {
+    if oversized(path) {
+        return Loaded::Corrupt(GraphLoadError::Unreadable);
+    }
     match std::fs::read_to_string(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Loaded::Empty,
         Err(_) => Loaded::Corrupt(GraphLoadError::Unreadable),
@@ -90,6 +102,9 @@ fn load_result_at(path: &std::path::Path) -> Loaded {
 /// preparing its update. `None` means the path was absent, while `Some([])` is an
 /// existing empty graph file.
 fn load_record_result_at(path: &std::path::Path) -> (Loaded, Option<Vec<u8>>) {
+    if oversized(path) {
+        return (Loaded::Corrupt(GraphLoadError::Unreadable), None);
+    }
     match std::fs::read(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => (Loaded::Empty, None),
         Err(_) => (Loaded::Corrupt(GraphLoadError::Unreadable), None),
@@ -167,10 +182,19 @@ fn save(
     path: &std::path::Path,
     expected: Option<&[u8]>,
 ) -> Result<(), GraphRecordError> {
+    // Bound the store on the way out (audit UNSF-05). Readers cap what they
+    // SHOW; without this the file itself grew for the life of the install. Doing
+    // it here means every writer is covered, rather than each remembering to.
+    let mut graph = graph.clone();
+    let dropped = graph.prune();
+    if dropped > 0 {
+        eprintln!("innerwarden: graph pruned {dropped} oldest node(s) to stay within the cap");
+    }
+    let graph = &graph;
     let trusted_root = path
         .parent()
         .ok_or(GraphRecordError::DirectoryUnavailable)?;
-    innerwarden_agent_guard::file_update::replace_if_unchanged_no_symlinks(
+    innerwarden_agent_guard::file_update::replace_owned_store_no_symlinks(
         trusted_root,
         path,
         expected,
@@ -379,6 +403,17 @@ fn record(
         // execution outcome. The stable code is intentionally path/error-detail
         // free so failures cannot echo local data or secrets into hook output.
         eprintln!("innerwarden: graph record skipped ({error})");
+        // stderr alone hid a six-hour outage. Persist it where the CLI and the
+        // dashboard can find it, and tell someone ONCE per episode.
+        let outage = crate::record_health::note_failure_at(&path, &error.to_string());
+        if crate::record_health::is_first_of_episode_at(&path) {
+            crate::notify_io::fire_text(&outage.summary());
+        }
+    } else if let Some(ended) = crate::record_health::note_success_at(&path) {
+        eprintln!(
+            "innerwarden: recording recovered after {} lost action(s)",
+            ended.lost
+        );
     }
 }
 
@@ -646,6 +681,11 @@ impl Drop for GraphLock {
 
 /// `innerwarden graph [--json | --stats | --clear]` - show the narrative (default),
 /// the raw graph JSON, a one-line summary, or reset it.
+/// The recording outage in progress, for the CLI and the dashboard.
+pub fn current_outage() -> Option<crate::record_health::Outage> {
+    crate::record_health::current()
+}
+
 pub fn cmd(rest: &[String]) -> std::process::ExitCode {
     if rest.iter().any(|a| a == "--clear") {
         if let Some(p) = graph_path() {
@@ -653,6 +693,11 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
             println!("innerwarden graph - cleared {}", p.display());
         }
         return std::process::ExitCode::SUCCESS;
+    }
+    // Print the outage FIRST. A stats line that says "1414 commands" while the
+    // last one was six hours ago is exactly the reading that went unnoticed.
+    if let Some(outage) = current_outage() {
+        eprintln!("innerwarden: {}", outage.summary());
     }
     let g = load_graph();
     if rest.iter().any(|a| a == "--json") {

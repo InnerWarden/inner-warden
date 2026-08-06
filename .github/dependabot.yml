@@ -1,0 +1,29 @@
+# Audit CI-07 / SUP-02: the repo had no dependency update surface at all, so a
+# published advisory reached users only when a human happened to notice it.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      # One PR for routine patch bumps: a stream of single-crate PRs gets
+      # ignored, and being ignored is how an advisory ages.
+      patch-updates:
+        update-types: [patch]
+
+  # The release and signing jobs run these, so a compromised action reaches the
+  # signing key. They are pinned to SHAs (audit CI-03/SUP-03); this is what keeps
+  # the pins current instead of frozen and quietly stale.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: npm
+    directory: /npm
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3

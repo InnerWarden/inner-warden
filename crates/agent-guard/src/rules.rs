@@ -247,6 +247,40 @@ impl RuleEngine {
     /// `rules/atr` corpus). Always available, no filesystem required. Only the
     /// `pattern`-tier rules compile; `semantic`-tier rules are skipped (no
     /// executor yet), so the loaded count is the pattern-tier subset.
+    /// Load only the rules that could ever fire for `source`.
+    ///
+    /// # Why this exists (audit PERF-05)
+    ///
+    /// Loading the corpus compiles 62 regexes, which measured at ~130ms in a
+    /// release build. `innerwarden hook` is a ONE-SHOT process that runs before
+    /// every agent tool call, so it paid that on each call: an agent making 50
+    /// tool calls spent 6.5 seconds inside the guard, while the screening itself
+    /// costs ~40 MICROseconds. The load was three orders of magnitude more than
+    /// the work.
+    ///
+    /// Worse, for the shell surface it bought nothing at all: no rule in the
+    /// corpus declares `shell_command` or `any`, so every one of those 62
+    /// regexes was compiled in order to be filtered out by
+    /// [`source_matches`] before it ran.
+    ///
+    /// So the filter moves ahead of the compile. This is self-adjusting rather
+    /// than a hardcoded skip: the day shell-surface rules are authored, they
+    /// match here and get compiled, and the cost returns in proportion to the
+    /// rules that can actually fire.
+    ///
+    /// A slow guard is a guard that gets switched off, which is the same failure
+    /// as a guard that denies too much, reached from the other side.
+    pub fn load_embedded_for(source: AtrSource) -> Self {
+        let mut rules = Vec::new();
+        collect_embedded_rules_for(&EMBEDDED_ATR_DIR, &mut rules, Some(source));
+        tracing::debug!(
+            rules = rules.len(),
+            source = source.as_str(),
+            "ATR rule engine loaded for one surface"
+        );
+        Self::from_rules(rules)
+    }
+
     pub fn load_embedded() -> Self {
         let mut rules = Vec::new();
         collect_embedded_rules(&EMBEDDED_ATR_DIR, &mut rules);
@@ -387,6 +421,34 @@ impl RuleEngine {
     }
 }
 
+/// Does a rule declaring `declared` apply to a context of `actual`?
+///
+/// # Why the shell surface matches nothing today
+///
+/// The corpus declares 27 rules as `tool_call`, 30 as `llm_io`, and NONE as
+/// `shell_command` or `any`. So screening a shell command matches nothing: every
+/// rule is filtered out here before a regex runs, and `innerwarden check` reports
+/// zero ATR matches whatever it is given. The rules are live on the MCP and LLM
+/// surfaces and absent from the shell one.
+///
+/// # Do NOT "fix" this by treating a shell command as a tool call
+///
+/// It looks like a one-line fix, and the semantics seem to support it: an agent
+/// running a shell command IS invoking its Bash tool, and
+/// [`AtrContext::shell_command`] already populates `tool_args` with the command.
+///
+/// It was tried on 2026-08-05 and measured. Letting `shell_command` satisfy
+/// `tool_call` took the benign benchmark from 0 false positives to **44 of 86**,
+/// every one of them a `deny`. Among the commands it denied: securing your own
+/// key file with chmod, a plain `curl --fail ... -o release.tar.gz` download, and
+/// `printf foo | perl -pe 's/foo/bar/'`. ATR-2026-012 and ATR-2026-066 match
+/// almost any shell text containing a pipe or a fetch, because they were written
+/// against structured MCP tool arguments rather than raw command lines.
+///
+/// A guardrail that denies half of ordinary development work gets switched off,
+/// and then protects nothing. Covering the shell surface is CORPUS work: rules
+/// authored for command lines and measured against the benign benchmark, not a
+/// change to this function.
 fn source_matches(declared: &str, actual: AtrSource) -> bool {
     actual == AtrSource::Any
         || declared.is_empty()
@@ -579,11 +641,33 @@ fn load_rule_file(path: &Path) -> anyhow::Result<Option<CompiledRule>> {
 /// fail to compile, same contract as [`load_rule_file`], minus the filesystem.
 /// Used both by the on-disk loader and the embedded-corpus loader.
 fn load_rule_str(content: &str) -> anyhow::Result<Option<CompiledRule>> {
+    load_rule_str_for(content, None)
+}
+
+/// Parse one rule, optionally skipping it before its regexes are compiled.
+///
+/// The filter has to happen HERE rather than on the finished `Vec`: compiling
+/// the regexes is the expensive part (~130ms for the corpus), so discarding a
+/// rule afterwards costs exactly as much as keeping it. Measured: filtering
+/// after the fact moved the hook from 208ms to 200ms; filtering here is what
+/// actually removes the work.
+fn load_rule_str_for(
+    content: &str,
+    only_for: Option<AtrSource>,
+) -> anyhow::Result<Option<CompiledRule>> {
     let raw: RawRule = serde_yaml::from_str(content)?;
 
     // Only load pattern-tier rules.
     if raw.detection_tier != "pattern" {
         return Ok(None);
+    }
+
+    // Cheap check before the expensive one: a rule that can never match this
+    // surface is not worth compiling.
+    if let Some(source) = only_for {
+        if !source_matches(&raw.agent_source.source_type, source) {
+            return Ok(None);
+        }
     }
 
     let id = raw.id.unwrap_or_default();
@@ -663,6 +747,14 @@ fn load_rule_str(content: &str) -> anyhow::Result<Option<CompiledRule>> {
 /// pushing successfully-compiled pattern-tier rules into `out`. Mirrors
 /// [`collect_yaml_recursive`] + [`load_rule_file`] but over `include_dir` data.
 fn collect_embedded_rules(dir: &Dir<'_>, out: &mut Vec<CompiledRule>) {
+    collect_embedded_rules_for(dir, out, None)
+}
+
+fn collect_embedded_rules_for(
+    dir: &Dir<'_>,
+    out: &mut Vec<CompiledRule>,
+    only_for: Option<AtrSource>,
+) {
     for file in dir.files() {
         let is_yaml = file
             .path()
@@ -675,7 +767,7 @@ fn collect_embedded_rules(dir: &Dir<'_>, out: &mut Vec<CompiledRule>) {
             warn!(file = %file.path().display(), "embedded ATR rule is not valid UTF-8, skipping");
             continue;
         };
-        match load_rule_str(content) {
+        match load_rule_str_for(content, only_for) {
             Ok(Some(rule)) => out.push(rule),
             Ok(None) => {} // skipped (not pattern tier / no compilable conditions)
             Err(e) => {
@@ -684,7 +776,7 @@ fn collect_embedded_rules(dir: &Dir<'_>, out: &mut Vec<CompiledRule>) {
         }
     }
     for sub in dir.dirs() {
-        collect_embedded_rules(sub, out);
+        collect_embedded_rules_for(sub, out, only_for);
     }
 }
 

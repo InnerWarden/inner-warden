@@ -13,8 +13,10 @@ maintainer: "InnerWarden <hello@innerwarden.com>"
 description: |
   Open-source guardrail for AI coding agents.
   Screens the shell commands and MCP/tool calls your agent runs and returns
-  allow / review / deny, before they run. Monitor-only by default, and the
-  evidence stays on your machine.
+  allow / review / deny, before they run. Nothing is wired until you run
+  `innerwarden setup` or `innerwarden install`, and once wired the guard
+  refuses a denied action rather than only reporting it. The evidence stays
+  on your machine.
 vendor: InnerWarden
 homepage: https://innerwarden.com
 license: Apache-2.0
@@ -25,3 +27,9 @@ contents:
     dst: /usr/bin/innerwarden
     file_info:
       mode: 0755
+  # Apache-2.0 section 4(a) requires giving every recipient a copy of the
+  # License. The packages declared Apache-2.0 and shipped no licence text.
+  - src: ${PKG_LICENSE}
+    dst: /usr/share/doc/innerwarden/copyright
+    file_info:
+      mode: 0644

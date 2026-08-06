@@ -23,17 +23,30 @@ Claude Code hook) can refuse an action before it reaches its target.
 
 ## Quick install
 
+npm (every OS, prebuilt and signed, no sudo):
+
+```sh
+npm install -g innerwarden
+```
+
 macOS and Linux:
 
 ```sh
 curl -fsSL https://innerwarden.com/free | sh
 ```
 
+Debian/Ubuntu and Fedora/RHEL packages are attached to each release; see
+[DISTRIBUTION.md](DISTRIBUTION.md) for the current filenames.
+
 Windows (PowerShell):
 
 ```powershell
-irm https://innerwarden.com/free.exe -OutFile innerwarden.exe
+irm https://innerwarden.com/free.ps1 | iex
 ```
+
+The installer verifies the binary's SHA-256 and Ed25519 signature against a key
+pinned inside the installer. Downloading the bare `.exe` skips both, which is
+the trust model this project exists to argue against.
 
 With Rust / cargo (any platform):
 
@@ -54,11 +67,15 @@ only — no IP, no host data; set `INNERWARDEN_NO_TELEMETRY=1` to disable). A
   every JSON-RPC message and can refuse a disallowed tool call inline. stdout
   stays pure MCP traffic, alerts go to stderr.
 - AI Jail: run an agent in a constrained profile so a screened-and-denied action
-  is stopped rather than merely flagged.
+  is stopped rather than merely flagged. Linux (bubblewrap) and macOS
+  (sandbox-exec) only; `contain` exits with an explicit error on Windows rather
+  than pretending to isolate.
 - Agent discovery: finds AI agents and agent tooling on the machine so you can
   see what is running and wire the guardrail into it.
-- Local dashboard: a read-only view on loopback at `http://127.0.0.1:8787`. It
-  never leaves the machine.
+- Local dashboard: a read-only view on loopback at `http://127.0.0.1:8788`
+  (`innerwarden dashboard`). It never leaves the machine. Port 8787 is a
+  different surface: the local check-command contract served by `innerwarden
+  serve`.
 - Notifications: surfaces verdicts and events through your configured channels.
 
 The verdict is JSON: a recommendation (`allow` / `review` / `deny`), a risk
@@ -66,10 +83,19 @@ score, matched signals, and a short explanation.
 
 ## Supported agents
 
-Claude Code (via a PreToolUse hook installed by the guard), plus Cursor and
-Codex (and any other MCP client) through the MCP proxy. Any agent with a
-pre-execution wrapper can gate on the exit code: `innerwarden` exits non-zero on
-a deny.
+Whatever agent you run, there is a mechanism and a command for it:
+
+- **Claude Code** - a PreToolUse hook: `innerwarden install claude-code`.
+- **Cursor, Codex CLI, Gemini CLI, OpenClaw** - no pre-execution hook exists, so
+  the guard wires their MCP configuration to run through its proxy:
+  `innerwarden agents connect <agent>`. Reversible with `agents disconnect`.
+- **Any other MCP client** - point it at `innerwarden proxy -- <server>`.
+- **Anything with no cooperative surface** - run it isolated:
+  `innerwarden contain -- <command>`.
+
+`innerwarden install` with no argument detects what is on the machine and prints
+the mechanism for each. Any agent with a pre-execution wrapper can also gate on
+the exit code directly: `innerwarden` exits non-zero on a deny.
 
 ## Build from source
 

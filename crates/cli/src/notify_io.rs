@@ -276,6 +276,18 @@ pub fn fire(command: &str, verdict: &Value) {
     let _ = deliver_with_total_budget(reqs, ENFORCEMENT_DELIVERY_BUDGET);
 }
 
+/// Fire a plain health message on every configured channel, best-effort.
+///
+/// Separate from [`fire`] because this is not a verdict: it carries no command
+/// and is not filtered by the deny/review preference. An operator who wired a
+/// channel to hear about blocks also wants to hear that the record stopped
+/// recording them. Callers must send this at most once per outage episode.
+pub fn fire_text(text: &str) {
+    let config = innerwarden_notify::resolved(|k| std::env::var(k).ok(), config_file().as_deref());
+    let requests = innerwarden_notify::text_requests(&config, text);
+    let _ = deliver_with_total_budget(requests, ENFORCEMENT_DELIVERY_BUDGET);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -348,8 +360,31 @@ mod tests {
     fn http_500_is_failed_not_delivered() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
+        // Same class of hang as the fan-out test above: a bare `accept()` with a
+        // joined thread turns "the client never connected" into a test binary
+        // that never exits. Bounded, so that case FAILS and says so.
         let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
+            listener
+                .set_nonblocking(true)
+                .expect("nonblocking listener");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "the client never connected to the 500 server"
+                        );
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("accepting the 500 request: {error}"),
+                }
+            };
+            stream.set_nonblocking(false).expect("blocking stream");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("read timeout");
             let mut buffer = [0_u8; 1024];
             let _ = stream.read(&mut buffer);
             stream
@@ -442,13 +477,36 @@ mod tests {
     fn enforcement_fanout_has_one_strict_total_budget() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
+        // Accept whatever arrives, until a deadline. NOT `for _ in 0..4`.
+        //
+        // This test starves the client on purpose: 100 ms of total budget across
+        // four channels is 25 ms each. On Linux and macOS a loopback connect is
+        // sub-millisecond so all four land, and demanding exactly four accepts
+        // looked safe. On Windows a 25 ms connect budget is not comfortably met,
+        // so fewer connections arrive, `accept()` blocks forever waiting for the
+        // fourth, and `server.join()` below never returns. The test binary then
+        // never exits and `cargo test --workspace` hangs with no output - which
+        // is exactly what happened the first time the suite ran on Windows: 35
+        // minutes, no output, two independent runners.
+        //
+        // The client is what this test asserts on. The server exists only to be
+        // slow, so it must never be able to hold the suite hostage.
         let server = std::thread::spawn(move || {
-            for _ in 0..4 {
-                let (stream, _) = listener.accept().unwrap();
-                std::thread::spawn(move || {
-                    std::thread::sleep(Duration::from_secs(1));
-                    drop(stream);
-                });
+            listener
+                .set_nonblocking(true)
+                .expect("nonblocking listener");
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut held = Vec::new();
+            while held.len() < 4 && Instant::now() < deadline {
+                match listener.accept() {
+                    // Hold them open: an accepted-then-closed socket would be a
+                    // fast failure, and slowness is the condition under test.
+                    Ok((stream, _)) => held.push(stream),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("accepting fan-out connection: {error}"),
+                }
             }
         });
         let requests = (0..4)

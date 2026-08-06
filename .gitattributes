@@ -1,0 +1,26 @@
+# The dashboard bundle is verified byte-for-byte.
+#
+# `crates/dashboard-kit/src/assets.rs` embeds `web/dist` and checks every file
+# against the sha256 in `bundle-manifest.json` before serving ANY of it. Git for
+# Windows defaults to `core.autocrlf=true`, so a checkout there rewrites the LF
+# in index.html, the .js and the .css to CRLF. Different bytes, different
+# digest, failed validation, and `assets::get` then returns None for everything:
+# the dashboard on Windows serves nothing at all, and says nothing about why.
+#
+# The bundle is a build artifact, not source to be normalised. Treat it as
+# binary so every platform gets the bytes the manifest was computed over.
+crates/dashboard-kit/web/dist/** -text
+
+# Same defect, second file. The frozen journey contract is pinned by
+# COMMUNITY_JOURNEY_CONTRACT_DIGEST and hashed straight from `include_str!`, so
+# a CRLF checkout changes its digest and the pin fails. Confirmed exactly: the
+# digest Windows produced is the sha256 of this file with CRLF endings.
+#
+# Anything whose BYTES are a contract belongs here. A digest pin that only holds
+# on the platforms you happen to test is not a pin.
+crates/dashboard-kit/contracts/** -text
+
+# Same reasoning for the LICENSE the packages now ship at
+# /usr/share/doc/innerwarden/copyright: a .deb built on one platform should not
+# differ from one built on another.
+LICENSE -text

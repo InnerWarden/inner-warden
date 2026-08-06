@@ -2,10 +2,12 @@
 
 InnerWarden Community Edition is free and source-available. Its technical crate
 and compatibility binary, `innerwarden`, provide a single, dependency-light CLI
-that screens an AI agent's shell command for danger **before it runs** - prompt
-injection, download-and-execute, reverse shells, credential access, and tool
-poisoning (71 ATR rules) - and tags every verdict with its OWASP Agentic Top 10
-id. End-user installs use the canonical `innerwarden` command (or the short
+that screens what an AI agent tries to do **before it runs** and tags every
+verdict with its OWASP Agentic Top 10 id. Two surfaces, two bodies of signal:
+shell commands are screened on command behaviour (download-and-execute, reverse
+shells, credential access, obfuscation), while MCP and tool calls additionally
+match the 71-rule ATR corpus, which covers tool poisoning and prompt injection
+in LLM I/O and tool exchanges. End-user installs use the canonical `innerwarden` command (or the short
 alias `iw`).
 
 It is a thin wrapper over InnerWarden's `check-command` engine
@@ -49,12 +51,15 @@ The verdict is JSON: `recommendation` (`allow` / `review` / `deny`),
 innerwarden install claude-code            # or: --block-review to also block `review`
 ```
 
-This adds a fail-closed `PreToolUse:Bash` hook to `~/.claude/settings.json` (or
+This adds a `PreToolUse:Bash` hook to `~/.claude/settings.json` (or
 `%USERPROFILE%\.claude\settings.json`) that runs `innerwarden hook` before every
 shell command Claude Code proposes. `hook` reads the tool call on stdin, screens
 the command in-process (no agent, no HTTP, offline), and blocks it (exit 2) on a
-`deny`. It is idempotent and preserves any hooks you already have. Restart Claude
-Code to load it.
+`deny`. Input it cannot parse, or a tool call carrying no shell command, is
+allowed through: a guardrail that wedges every non-Bash tool call would be
+removed within the hour, and it screens the surface it was installed for. It is
+idempotent and preserves any hooks you already have. Restart Claude Code to load
+it.
 
 ### Any other agent (gate on the exit code)
 

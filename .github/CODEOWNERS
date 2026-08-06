@@ -1,0 +1,40 @@
+# Audit AIML-05: no CODEOWNERS existed, and every commit in this repo has one
+# author. That is a bus factor of one, and it also means the security-critical
+# paths get no second pair of eyes by default.
+#
+# This file does not conjure a second maintainer. What it does is make review
+# REQUIRED on the paths where a mistake ships to every user, so adding a
+# reviewer later is a settings change rather than a process change.
+
+# Default owner for everything.
+*                                   @maiconesteves
+
+# ── The trust chain ──────────────────────────────────────────────────────────
+# A change here decides whether users install bytes we vouched for. The audit's
+# Critical finding lived entirely in these files.
+/crates/cli/src/release_verify.rs   @maiconesteves
+/crates/cli/src/upgrade.rs          @maiconesteves
+/crates/cli/src/upgrade_plan.rs     @maiconesteves
+/npm/scripts/                       @maiconesteves
+/packaging/                         @maiconesteves
+
+# ── CI, signing and supply chain ─────────────────────────────────────────────
+# The release job holds the signing key; the policy file decides what may enter
+# the dependency tree.
+/.github/workflows/                 @maiconesteves
+/.github/dependabot.yml             @maiconesteves
+/deny.toml                          @maiconesteves
+
+# ── The guardrail engine ─────────────────────────────────────────────────────
+# A weakened rule here is a silent loss of protection, which no test failure
+# announces unless someone wrote the test.
+/crates/agent-guard/src/threats.rs  @maiconesteves
+/crates/agent-guard/src/shell.rs    @maiconesteves
+/crates/agent-guard/src/mcp_proxy/  @maiconesteves
+/crates/agent-guard/src/hook.rs     @maiconesteves
+/crates/agent-guard/src/rules.rs    @maiconesteves
+/rules/atr/                         @maiconesteves
+
+# The measured baselines. A change to either is a change to what the product
+# claims about itself.
+/crates/agent-guard/benchmarks/     @maiconesteves
