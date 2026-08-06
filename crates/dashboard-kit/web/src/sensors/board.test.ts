@@ -5,6 +5,7 @@ import {
   collectorGroups,
   collectorRows,
   sensorPanelState,
+  sharedStateNote,
 } from "./board";
 import type { SensorActivity } from "../api/sensors";
 
@@ -68,7 +69,10 @@ describe("a declared collector is not an active one", () => {
     expect(row.liveness).toBe("impaired");
     expect(row.label).toBe("Source missing");
     expect(row.tone).toBe("warning");
-    expect(row.detail).toContain("/sys/fs/bpf");
+    // A fault is a fact about THIS row, so it stays inline on the row rather
+    // than moving to the shared legend, which has no shared sentence for it.
+    expect(row.note).toContain("/sys/fs/bpf");
+    expect(sharedStateNote("telemetry", "impaired")).toBeUndefined();
   });
 
   it("does not read as active when nothing attested it at all", () => {
@@ -79,7 +83,8 @@ describe("a declared collector is not an active one", () => {
     expect(row.label).toBe("Not attested");
     expect(row.state).toBe("not_reported");
     expect(row.tone).toBe("warning");
-    expect(row.detail).toContain("Declared is not attached");
+    expect(row.noteKey).toBe("unattested");
+    expect(sharedStateNote("telemetry", "unattested")).toContain("Declared is not attached");
   });
 
   it("keeps the fault verdict even when events also arrived, and shows both", () => {
@@ -92,8 +97,8 @@ describe("a declared collector is not an active one", () => {
     const row = rowFor(payload, "auth_log");
     expect(row.active).toBe(false);
     expect(row.label).toBe("Source stale");
-    expect(row.detail).toContain("2026-07-30T02:00:00Z");
-    expect(row.detail).toContain("90 events were still recorded today");
+    expect(row.note).toContain("2026-07-30T02:00:00Z");
+    expect(row.note).toContain("90 events were still recorded today");
   });
 
   it.each([
@@ -137,6 +142,7 @@ describe("zero events is a state, not an error", () => {
     expect(row.liveness).toBe("quiet");
     expect(row.tone).toBe("attention");
     expect(row.label).toBe("Attached, silent");
+    expect(sharedStateNote("telemetry", "quiet")).toContain("worth chasing");
   });
 
   it("reads a silent alarm detector as healthy", () => {
@@ -149,7 +155,7 @@ describe("zero events is a state, not an error", () => {
     expect(row.liveness).toBe("quiet");
     expect(row.tone).toBe("positive");
     expect(row.label).toBe("Quiet");
-    expect(row.detail).toContain("healthy state");
+    expect(sharedStateNote("alarm", "quiet")).toContain("healthy state");
   });
 
   it("reads a firing alarm detector as a finding, not as good news", () => {
@@ -160,7 +166,8 @@ describe("zero events is a state, not an error", () => {
     const row = rowFor(payload, "integrity");
     expect(row.liveness).toBe("reporting");
     expect(row.tone).toBe("attention");
-    expect(row.detail).toContain("4 findings today");
+    expect(row.count).toBe(4);
+    expect(sharedStateNote("alarm", "reporting")).toContain("findings");
   });
 
   it("never hides a collector reporting zero", () => {
@@ -184,7 +191,10 @@ describe("collectorRows", () => {
     const row = rowFor(activity({ sources: [{ name: "journald", count: 400 }] }), "journald");
     expect(row.liveness).toBe("reporting");
     expect(row.active).toBe(true);
-    expect(row.detail).toContain("published no health verdict");
+    // A distinct pill from the attested "Reporting": two rows with the same
+    // label must mean the same thing.
+    expect(row.label).toBe("Reporting, no verdict");
+    expect(sharedStateNote("telemetry", "reporting_no_verdict")).toContain("published no health verdict");
   });
 });
 
@@ -220,6 +230,84 @@ describe("collectorGroups", () => {
   it("omits a category this host has no collectors for", () => {
     const groups = collectorGroups(collectorRows(activity({ sources: [{ name: "journald", count: 1 }] })));
     expect(groups.map((group) => group.category)).toEqual(["telemetry"]);
+  });
+});
+
+/**
+ * THE REPETITION RULE.
+ *
+ * The first shipped board printed each state's explanation on every row in that
+ * state: "Declared, with no events today..." five times in a row, "The sensor
+ * reports the source is live..." four times. The explanation now lives once per
+ * group as a legend note, and a row may only carry prose that is about that row
+ * alone.
+ */
+describe("each state's explanation is said once per group", () => {
+  const payload = activity({
+    sources: [
+      { name: "auditd", count: 0 },
+      { name: "dns_capture", count: 0 },
+      { name: "ebpf", count: 0 },
+      { name: "http_capture", count: 0 },
+      { name: "proc_maps", count: 0 },
+      { name: "journald", count: 0 },
+      { name: "auth_log", count: 0 },
+      { name: "tcp_stream", count: 900 },
+    ],
+    collector_health: {
+      statuses: [
+        { name: "journald", category: "telemetry", health: { state: "active" } },
+        { name: "auth_log", category: "telemetry", health: { state: "active" } },
+        { name: "tcp_stream", category: "telemetry", health: { state: "active" } },
+      ],
+    },
+  });
+
+  it("renders one legend note per state present, not one per row", () => {
+    const [telemetry] = collectorGroups(collectorRows(payload));
+    expect(telemetry.rows).toHaveLength(8);
+    // Five unattested rows and two quiet rows collapse to ONE note each.
+    expect(telemetry.notes.map((note) => note.key)).toEqual(["unattested", "quiet", "reporting"]);
+  });
+
+  it("keeps the legend in the rows' worst-first order, under matching labels", () => {
+    const [telemetry] = collectorGroups(collectorRows(payload));
+    expect(telemetry.notes.map((note) => note.label)).toEqual(["Not attested", "Attached, silent", "Reporting"]);
+    expect(telemetry.notes.map((note) => note.tone)).toEqual(["warning", "attention", "positive"]);
+    expect(telemetry.notes[0].text).toContain("Declared is not attached");
+  });
+
+  it("puts no shared boilerplate on the rows themselves", () => {
+    for (const row of collectorRows(payload)) expect(row.note).toBeUndefined();
+  });
+
+  it("still gives an impaired row its own inline fact, because a fault is not shared", () => {
+    const rows = collectorRows(activity({
+      sources: [{ name: "ebpf", count: 0 }, { name: "auditd", count: 0 }],
+      collector_health: {
+        statuses: [
+          { name: "ebpf", category: "telemetry", health: { state: "source_unavailable", path: "/sys/fs/bpf" } },
+          { name: "auditd", category: "telemetry", health: { state: "permission_denied" } },
+        ],
+      },
+    }));
+    const [telemetry] = collectorGroups(rows);
+    expect(telemetry.notes.map((note) => note.key)).not.toContain("impaired");
+    const notes = telemetry.rows.map((row) => row.note);
+    expect(notes.every((note) => note !== undefined)).toBe(true);
+    // Two impaired rows, two different facts. Nothing repeats.
+    expect(new Set(notes).size).toBe(2);
+  });
+
+  it("shares the disabled explanation instead of restating it per row", () => {
+    expect(sharedStateNote("alarm", "disabled")).toContain("Nothing is watching");
+    expect(sharedStateNote("telemetry", "disabled")).toContain("not being collected");
+    const rows = collectorRows(activity({
+      sources: [{ name: "docker", count: 0 }],
+      collector_health: { statuses: [{ name: "docker", category: "alarm", health: { state: "disabled_by_config" } }] },
+    }));
+    expect(rows[0].noteKey).toBe("disabled");
+    expect(rows[0].note).toBeUndefined();
   });
 });
 

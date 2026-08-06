@@ -101,6 +101,24 @@ export type CollectorLiveness =
 
 export type CollectorTone = "positive" | "attention" | "warning" | "neutral";
 
+/**
+ * Which shared explanation a row falls under.
+ *
+ * Rows in the same state used to each carry the full explanatory sentence, so a
+ * board with five unattested collectors printed the same paragraph five times in
+ * a row. The sentence now lives ONCE per group (see `sharedStateNote`), and the
+ * row carries only this key. `impaired` is the exception: every fault is its own
+ * fact (a path, a timestamp, a capability), so those rows keep an individual
+ * `note` and have no shared sentence.
+ */
+export type CollectorNoteKey =
+  | "reporting"
+  | "reporting_no_verdict"
+  | "quiet"
+  | "disabled"
+  | "unattested"
+  | "impaired";
+
 export type CollectorRow = {
   name: string;
   category: CollectorCategory;
@@ -115,7 +133,13 @@ export type CollectorRow = {
   state: string;
   label: string;
   tone: CollectorTone;
-  detail: string;
+  /** Key into the group's shared state notes. Identical rows share one sentence. */
+  noteKey: CollectorNoteKey;
+  /**
+   * A fact about THIS row only, rendered inline beside it: the fault the sensor
+   * reported, or a contradiction worth reading twice. Never shared boilerplate.
+   */
+  note?: string;
 };
 
 /** Health states that mean the collector is not doing its job. */
@@ -137,7 +161,7 @@ const IMPAIRED_STATES: Readonly<Record<string, string>> = {
  */
 const DISABLED_STATES: readonly string[] = ["disabled_by_config", "disabled"];
 
-function healthDetail(category: CollectorCategory, health: { state: string; path?: string; last_write_iso?: string; reason?: string }): string {
+function faultNote(health: { state: string; path?: string; last_write_iso?: string; reason?: string }): string {
   switch (health.state) {
     case "source_unavailable":
       return `The sensor could not find ${health.path ?? "the configured source"} on this host. `
@@ -147,18 +171,54 @@ function healthDetail(category: CollectorCategory, health: { state: string; path
         + `${health.last_write_iso ?? "an unrecorded time"}. The upstream service has stopped writing.`;
     case "permission_denied":
       return "The sensor lacks the OS capability to read this source. Check the unit's AmbientCapabilities.";
-    case "unsupported":
-      return `Not supported on this host: ${health.reason ?? "no reason reported"}.`;
     default:
+      return `Not supported on this host: ${health.reason ?? "no reason reported"}.`;
+  }
+}
+
+/**
+ * The explanation for every row in `key`'s state, said ONCE per group.
+ *
+ * These sentences used to be copied onto each row, so identical boilerplate
+ * repeated as many times as there were rows in the state. Nothing was removed in
+ * the move: the same distinctions survive, per category, including the one this
+ * panel exists to keep making, that silence is the healthy state for an alarm
+ * and a stopped feed for a telemetry stream.
+ *
+ * `impaired` returns `undefined` on purpose: faults are row-specific facts and
+ * live inline on the row, so a shared sentence would have nothing true to say.
+ */
+export function sharedStateNote(category: CollectorCategory, key: CollectorNoteKey): string | undefined {
+  switch (key) {
+    case "reporting":
+      return category === "alarm"
+        ? "The count is findings today. An alarm detector only speaks when something trips."
+        : "Events arrived today, and the sensor reports the source is live.";
+    case "reporting_no_verdict":
+      return "Events arrived today, but the sensor published no health verdict for these collectors. "
+        + "The events themselves are direct evidence they produced something.";
+    case "quiet":
+      return category === "alarm"
+        ? "Attached and nothing has tripped today. For an alarm detector that is the healthy state."
+        : category === "snapshot"
+          ? "Attached; no snapshot cycle has been recorded today."
+          : "The sensor reports the source is live, but no events have arrived today. An always-on stream at zero is worth chasing.";
+    case "disabled":
       return category === "alarm"
         ? "Disabled in the sensor config. Nothing is watching for this class of event."
         : "Disabled in the sensor config. This stream is not being collected.";
+    case "unattested":
+      return category === "telemetry"
+        ? "Declared, with no events today and no health verdict from the sensor. Declared is not attached: a collector can be configured and have nothing bound in the kernel."
+        : "Declared, with no events today and no health verdict from the sensor. Nothing here says it is attached.";
+    case "impaired":
+      return undefined;
   }
 }
 
 function describe(name: string, count: number, category: CollectorCategory, status?: CollectorStatus): CollectorRow {
   const state = status?.health?.state?.toLowerCase();
-  const row = (over: Pick<CollectorRow, "liveness" | "active" | "label" | "tone" | "detail">): CollectorRow => ({
+  const row = (over: Pick<CollectorRow, "liveness" | "active" | "label" | "tone" | "noteKey"> & Partial<Pick<CollectorRow, "note">>): CollectorRow => ({
     name,
     category,
     count,
@@ -167,20 +227,21 @@ function describe(name: string, count: number, category: CollectorCategory, stat
   });
 
   if (state !== undefined && state in IMPAIRED_STATES) {
-    const detail = healthDetail(category, status!.health!);
+    const fault = faultNote(status!.health!);
     return row({
       liveness: "impaired",
       active: false,
       label: IMPAIRED_STATES[state],
       tone: "warning",
+      noteKey: "impaired",
       // A fault verdict beside a non-zero count is a contradiction, and hiding
       // either half would be the dishonest way to resolve it.
-      detail: count > 0 ? `${detail} ${count.toLocaleString()} events were still recorded today.` : detail,
+      note: count > 0 ? `${fault} ${count.toLocaleString()} events were still recorded today.` : fault,
     });
   }
 
   if (state !== undefined && DISABLED_STATES.includes(state)) {
-    return row({ liveness: "disabled", active: false, label: "Disabled", tone: "neutral", detail: healthDetail(category, status!.health!) });
+    return row({ liveness: "disabled", active: false, label: "Disabled", tone: "neutral", noteKey: "disabled" });
   }
 
   if (state === "active") {
@@ -190,9 +251,7 @@ function describe(name: string, count: number, category: CollectorCategory, stat
         active: true,
         label: "Reporting",
         tone: category === "alarm" ? "attention" : "positive",
-        detail: category === "alarm"
-          ? `${count.toLocaleString()} findings today. An alarm detector only speaks when something trips.`
-          : `${count.toLocaleString()} events today, and the sensor reports the source is live.`,
+        noteKey: "reporting",
       });
     }
     return row({
@@ -200,11 +259,7 @@ function describe(name: string, count: number, category: CollectorCategory, stat
       active: true,
       label: category === "alarm" ? "Quiet" : "Attached, silent",
       tone: category === "alarm" ? "positive" : "attention",
-      detail: category === "alarm"
-        ? "Attached and nothing has tripped today. For an alarm detector that is the healthy state."
-        : category === "snapshot"
-          ? "Attached; no snapshot cycle has been recorded today."
-          : "The sensor reports the source is live, but no events have arrived today. An always-on stream at zero is worth chasing.",
+      noteKey: "quiet",
     });
   }
 
@@ -214,9 +269,12 @@ function describe(name: string, count: number, category: CollectorCategory, stat
     return row({
       liveness: "reporting",
       active: true,
-      label: "Reporting",
+      // A distinct label, not plain "Reporting": two rows with the same pill
+      // must mean the same thing, and this one is running on the strength of
+      // its own events rather than the sensor's attestation.
+      label: "Reporting, no verdict",
       tone: category === "alarm" ? "attention" : "positive",
-      detail: `${count.toLocaleString()} events today. The sensor published no health verdict for it.`,
+      noteKey: "reporting_no_verdict",
     });
   }
 
@@ -228,9 +286,7 @@ function describe(name: string, count: number, category: CollectorCategory, stat
     // whose silence is ordinary — a warning on every quiet alarm would train the
     // operator to ignore the colour.
     tone: category === "telemetry" ? "warning" : "neutral",
-    detail: category === "telemetry"
-      ? "Declared, with no events today and no health verdict from the sensor. Declared is not attached: a collector can be configured and have nothing bound in the kernel."
-      : "Declared, with no events today and no health verdict from the sensor. Nothing here says it is attached.",
+    noteKey: "unattested",
   });
 }
 
@@ -255,14 +311,41 @@ export function collectorRows(activity: SensorActivity): CollectorRow[] {
   });
 }
 
+/** One state's explanation, rendered once for the whole group as a legend line. */
+export type CollectorStateNote = {
+  key: CollectorNoteKey;
+  /** The same words as the pill on the rows it explains, so the two map by eye. */
+  label: string;
+  tone: CollectorTone;
+  text: string;
+};
+
 export type CollectorGroup = {
   category: CollectorCategory;
   title: string;
   /** One line saying how the zeros in this group should be read. */
   meaning: string;
   caption: string;
+  /**
+   * One entry per state present in this group, worst first, matching the row
+   * order. This is the ONLY place the shared explanations render: a state's
+   * sentence appears exactly once no matter how many rows are in it.
+   */
+  notes: CollectorStateNote[];
   rows: CollectorRow[];
 };
+
+function groupNotes(category: CollectorCategory, rows: readonly CollectorRow[]): CollectorStateNote[] {
+  const notes: CollectorStateNote[] = [];
+  const seen = new Set<CollectorNoteKey>();
+  for (const row of rows) {
+    if (seen.has(row.noteKey)) continue;
+    seen.add(row.noteKey);
+    const text = sharedStateNote(category, row.noteKey);
+    if (text !== undefined) notes.push({ key: row.noteKey, label: row.label, tone: row.tone, text });
+  }
+  return notes;
+}
 
 const GROUP_TITLES: Record<CollectorCategory, string> = {
   telemetry: "Telemetry streams",
@@ -300,6 +383,7 @@ export function collectorGroups(rows: readonly CollectorRow[]): CollectorGroup[]
       title: GROUP_TITLES[category],
       meaning: GROUP_MEANING[category],
       caption: caption(category, scoped),
+      notes: groupNotes(category, scoped),
       rows: scoped,
     };
   }).filter((group) => group.rows.length > 0);

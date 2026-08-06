@@ -18,8 +18,8 @@ import {
   type SensorChart,
 } from "../sensors/chart";
 
-const PLOT_WIDTH = 720;
-const PLOT_HEIGHT = 200;
+const PLOT_WIDTH = 960;
+const PLOT_HEIGHT = 240;
 const POLL_MS = 30_000;
 
 /**
@@ -49,8 +49,8 @@ export function SensorActivity() {
           <p className="text-xs font-semibold uppercase tracking-[0.14em] text-cyan-700">Host sensor</p>
           <h2 id="sensor-activity-title" className="mt-1 text-lg font-semibold text-slate-950">Sensor activity</h2>
           <p className="mt-1 max-w-3xl text-sm leading-5 text-slate-600">
-            Events per collector across today, beside what each collector reports about itself. A collector is only shown as
-            running when the sensor attests it or events were observed; being configured is not evidence of either.
+            Events per collector across today, and below it what each collector reports about itself. A collector is only
+            shown as running when the sensor attests it or events were observed; being configured is not evidence of either.
           </p>
         </div>
         {activity.date ? <span className="shrink-0 text-xs tabular-nums text-slate-500">{activity.date} UTC</span> : null}
@@ -62,7 +62,12 @@ export function SensorActivity() {
         </div>
       )}
 
-      <div className="grid min-w-0 gap-4 xl:grid-cols-[minmax(0,1.6fr)_minmax(280px,1fr)]">
+      {/* The chart is the attention-grabber and gets the full width; the board
+          below it is a dense grid rather than a second column. The old
+          two-column layout ended the chart after ~300px and ran the status
+          column for ~1000px, which is a lopsided page with dead whitespace
+          under the one thing worth looking at. */}
+      <div className="min-w-0 space-y-4">
         <TimelineCard activity={activity} chart={chart} />
         <BoardCard rows={rows} groups={groups} />
       </div>
@@ -172,7 +177,7 @@ function Plot({ chart, summary }: { chart: SensorChart; summary: string }) {
         // an inch tall on a phone. Every stroke below carries
         // `vector-effect="non-scaling-stroke"` so the distortion never reaches
         // a line weight.
-        className="h-40 w-full rounded-xl border border-slate-800 bg-slate-950 sm:h-52"
+        className="h-48 w-full rounded-xl border border-slate-800 bg-slate-950 sm:h-64"
         role="img"
         aria-label={summary}
         preserveAspectRatio="none"
@@ -209,7 +214,7 @@ function Plot({ chart, summary }: { chart: SensorChart; summary: string }) {
           </g>
         ))}
       </svg>
-      <div className="mt-1 flex justify-between text-[10px] tabular-nums text-slate-400" aria-hidden="true">
+      <div className="mt-1 flex justify-between text-[11px] tabular-nums text-slate-500" aria-hidden="true">
         {ticks.map((tick) => <span key={tick.label}>{tick.label}</span>)}
       </div>
       <figcaption className="mt-2 flex flex-wrap gap-x-3 gap-y-1.5">
@@ -225,17 +230,31 @@ function Plot({ chart, summary }: { chart: SensorChart; summary: string }) {
   );
 }
 
+/**
+ * The status board, dense on purpose.
+ *
+ * The first version rendered every collector as a full card with its own
+ * explanatory paragraph, and identical states carried identical paragraphs: the
+ * same sentence printed four, five times in a row down a column three screens
+ * tall. Each state's explanation now renders ONCE, as a legend line under its
+ * group header, and a row is a single compact line: state dot, name, pill,
+ * count. Rows flow into up to three columns on wide screens. The only prose a
+ * row may still carry is a fact about that row alone (its fault, its
+ * contradiction), which is exactly the prose that cannot be shared.
+ */
 function BoardCard({ rows, groups }: { rows: CollectorRow[]; groups: CollectorGroup[] }) {
   return (
     <div className="min-w-0 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm sm:p-5">
-      <h3 className="text-sm font-semibold text-slate-900">Collector status</h3>
-      <p className="mt-1 text-xs leading-5 text-slate-600">{boardSummary(rows)}</p>
+      <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
+        <h3 className="text-sm font-semibold text-slate-900">Collector status</h3>
+        <p className="text-xs leading-5 text-slate-600">{boardSummary(rows)}</p>
+      </div>
       {groups.length === 0 ? (
         <p className="mt-3 rounded-xl border border-dashed border-slate-300 bg-slate-50 px-3 py-6 text-center text-xs text-slate-600">
           This host listed no collectors. Nothing is being assumed about what it collects.
         </p>
       ) : (
-        <div className="mt-3 space-y-4">
+        <div className="mt-4 space-y-5">
           {groups.map((group) => <Group key={group.category} group={group} />)}
         </div>
       )}
@@ -246,45 +265,63 @@ function BoardCard({ rows, groups }: { rows: CollectorRow[]; groups: CollectorGr
 function Group({ group }: { group: CollectorGroup }) {
   return (
     <section aria-label={group.title}>
-      <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-0.5">
+      <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-0.5 border-b border-slate-100 pb-1.5">
         <h4 className="text-[11px] font-semibold uppercase tracking-[0.12em] text-slate-500">{group.title}</h4>
         <span className="text-[11px] tabular-nums text-slate-500">{group.caption}</span>
       </div>
-      <p className="mt-0.5 text-[11px] leading-4 text-slate-500">{group.meaning}</p>
-      <ul className="mt-2 space-y-1.5">
+      <ul className="mt-2 grid min-w-0 grid-cols-1 gap-x-6 gap-y-0.5 sm:grid-cols-2 xl:grid-cols-3">
         {group.rows.map((row) => <Row key={row.name} row={row} />)}
       </ul>
+      {/* Each state's meaning, said once for the whole group. The dot and label
+          match the rows above, so the legend maps by eye. */}
+      <div className="mt-2 space-y-0.5">
+        <p className="text-[11px] leading-4 text-slate-500">{group.meaning}</p>
+        {group.notes.map((note) => (
+          <p key={note.key} className="flex min-w-0 items-start gap-1.5 text-[11px] leading-4 text-slate-500">
+            <span className={`mt-[5px] h-1.5 w-1.5 shrink-0 rounded-full ${TONE_DOT[note.tone]}`} aria-hidden="true" />
+            <span>
+              <span className={`font-semibold ${TONE_TEXT[note.tone]}`}>{note.label}:</span> {note.text}
+            </span>
+          </p>
+        ))}
+      </div>
     </section>
   );
 }
 
-const TONE_ROW: Record<CollectorTone, string> = {
-  warning: "border-red-200 bg-red-50",
-  attention: "border-amber-200 bg-amber-50",
-  positive: "border-emerald-200 bg-emerald-50/60",
-  neutral: "border-slate-200 bg-slate-50",
+const TONE_DOT: Record<CollectorTone, string> = {
+  warning: "bg-red-500",
+  attention: "bg-amber-500",
+  positive: "bg-emerald-500",
+  neutral: "bg-slate-400",
+};
+
+const TONE_TEXT: Record<CollectorTone, string> = {
+  warning: "text-red-800",
+  attention: "text-amber-800",
+  positive: "text-emerald-800",
+  neutral: "text-slate-600",
 };
 
 const TONE_PILL: Record<CollectorTone, string> = {
-  warning: "border-red-300 bg-white text-red-800",
-  attention: "border-amber-300 bg-white text-amber-800",
-  positive: "border-emerald-300 bg-white text-emerald-800",
-  neutral: "border-slate-300 bg-white text-slate-700",
+  warning: "border-red-200 bg-red-50 text-red-800",
+  attention: "border-amber-200 bg-amber-50 text-amber-800",
+  positive: "border-emerald-200 bg-emerald-50 text-emerald-800",
+  neutral: "border-slate-200 bg-slate-50 text-slate-600",
 };
 
 function Row({ row }: { row: CollectorRow }) {
   return (
-    <li className={`min-w-0 rounded-lg border px-2.5 py-2 ${TONE_ROW[row.tone]}`}>
-      <div className="flex min-w-0 flex-wrap items-center justify-between gap-x-2 gap-y-1">
-        <span className="min-w-0 truncate font-mono text-xs font-medium text-slate-800" title={row.name}>{row.name}</span>
-        <span className="flex shrink-0 items-center gap-1.5">
-          <span className={`inline-flex rounded-full border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${TONE_PILL[row.tone]}`}>
-            {row.label}
-          </span>
-          <span className="w-14 text-right text-xs tabular-nums text-slate-600">{row.count.toLocaleString()}</span>
+    <li className="min-w-0 py-0.5">
+      <div className="flex min-w-0 items-center gap-2">
+        <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${TONE_DOT[row.tone]}`} aria-hidden="true" />
+        <span className="min-w-0 flex-1 truncate font-mono text-xs font-medium text-slate-800" title={row.name}>{row.name}</span>
+        <span className={`inline-flex shrink-0 rounded-full border px-1.5 py-px text-[10px] font-semibold uppercase tracking-wide ${TONE_PILL[row.tone]}`}>
+          {row.label}
         </span>
+        <span className="w-12 shrink-0 text-right text-xs tabular-nums text-slate-600">{row.count.toLocaleString()}</span>
       </div>
-      <p className="mt-1 text-[11px] leading-4 text-slate-600">{row.detail}</p>
+      {row.note && <p className="mt-0.5 pl-3.5 text-[11px] leading-4 text-slate-600">{row.note}</p>}
     </li>
   );
 }
