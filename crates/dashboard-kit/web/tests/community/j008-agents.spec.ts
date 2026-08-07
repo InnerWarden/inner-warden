@@ -48,6 +48,12 @@ test.describe("CJC-090-J008 conservative general agent discovery", () => {
     }));
 
     await page.goto("/");
+    // The discovery safety limit is producer bookkeeping: it renders as a
+    // collapsed quiet disclosure under the list, never as an amber banner.
+    const disclosure = page.getByText("Some integrations may not be listed");
+    await expect(disclosure).toBeVisible();
+    await expect(page.getByText("Agent discovery reached its local safety limit.")).toBeHidden();
+    await disclosure.click();
     await expect(page.getByText("Agent discovery reached its local safety limit.")).toBeVisible();
     await expect(page.getByText("Automatic setup is")).toContainText("disabled");
 

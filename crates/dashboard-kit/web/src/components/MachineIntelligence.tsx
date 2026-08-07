@@ -136,6 +136,33 @@ function usePollingResource<T>(load: () => Promise<T>, intervalMs: number, retry
   return state;
 }
 
+// Internal bookkeeping stays out of the user's face. Two lines used to render
+// as prominent chrome on every affected load: an amber role="status" banner for
+// the discovery safety limit (a permanent producer bound, not an event), and an
+// "Automatic setup is unavailable" header announcement on hosts where the
+// free-tier mechanism simply does not run. Both truths are preserved, one
+// interaction or one glance lower: a collapsed disclosure and a grey footnote.
+export const DISCOVERY_LIMIT_DISCLOSURE = {
+  kind: "disclosure",
+  summary: "Some integrations may not be listed",
+  body: "Agent discovery reached its local safety limit. Reviewed integrations remain visible, but some generic MCP configurations may be omitted to keep the dashboard responsive.",
+} as const;
+
+export const AUTO_SETUP_UNKNOWN_FOOTNOTE =
+  "Automatic setup policy is not reported here. Check it with the CLI if you need it.";
+
+/** Where the automatic-setup line belongs: a header strip only when the policy
+ * is actually known; otherwise a quiet footnote. */
+export function autoSetupPlacement(known: boolean): "header" | "footnote" {
+  return known ? "header" : "footnote";
+}
+
+/** The discovery-limit truth as a quiet disclosure; null when discovery is not
+ * limited. Never a banner: the limit is permanent producer bookkeeping. */
+export function discoveryLimitNotice(limited: boolean): typeof DISCOVERY_LIMIT_DISCLOSURE | null {
+  return limited ? DISCOVERY_LIMIT_DISCLOSURE : null;
+}
+
 function AgentsPanel({ state, edition }: { state: PollState<AgentsResponse>; edition?: "community" | "enterprise" }) {
   const { data, error, loading } = state;
   const scanning = loading || data?.availability === "loading";
@@ -163,22 +190,21 @@ function AgentsPanel({ state, edition }: { state: PollState<AgentsResponse>; edi
         <PanelSkeleton cards={3} label="Loading locally detected agents" />
       ) : data ? (
         <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
-          <div className="flex flex-col gap-2 border-b border-slate-100 bg-slate-50/70 px-4 py-3 text-xs text-slate-600 sm:flex-row sm:items-center sm:justify-between sm:px-5">
-            <span>
-              Automatic setup is <strong className="font-semibold text-slate-800">{!autoConnectKnown ? "unavailable" : data.auto_connect.enabled ? "enabled" : "disabled"}</strong>
-              {autoConnectKnown && data.auto_connect.enabled ? ` in ${humanise(data.auto_connect.mode!)} mode` : ""}.
-            </span>
-            <span className="tabular-nums">
-              {!autoConnectKnown
-                ? "Check policy with the CLI"
-                : data.auto_connect.enabled
-                ? `Checks every ${formatInterval(data.auto_connect.refresh_interval_secs)}`
-                : "Enable from setup or the CLI"}
-            </span>
-          </div>
-          {data.discovery_limited && (
-            <div className="border-b border-amber-200 bg-amber-50 px-4 py-3 text-xs leading-5 text-amber-950 sm:px-5" role="status">
-              Agent discovery reached its local safety limit. Reviewed integrations remain visible, but some generic MCP configurations may be omitted to keep the dashboard responsive.
+          {autoConnectKnown && (
+            // A KNOWN automatic-setup policy is a user fact worth a header line.
+            // The unknown case is producer bookkeeping (on the paid tier the
+            // free-tier mechanism simply is not a thing) and renders as a quiet
+            // footnote below instead of a permanent header announcement.
+            <div className="flex flex-col gap-2 border-b border-slate-100 bg-slate-50/70 px-4 py-3 text-xs text-slate-600 sm:flex-row sm:items-center sm:justify-between sm:px-5">
+              <span>
+                Automatic setup is <strong className="font-semibold text-slate-800">{data.auto_connect.enabled ? "enabled" : "disabled"}</strong>
+                {data.auto_connect.enabled ? ` in ${humanise(data.auto_connect.mode!)} mode` : ""}.
+              </span>
+              <span className="tabular-nums">
+                {data.auto_connect.enabled
+                  ? `Checks every ${formatInterval(data.auto_connect.refresh_interval_secs)}`
+                  : "Enable from setup or the CLI"}
+              </span>
             </div>
           )}
           {data.agents.length === 0 ? (
@@ -193,6 +219,19 @@ function AgentsPanel({ state, edition }: { state: PollState<AgentsResponse>; edi
                 <AgentCard key={agent.id} agent={agent} spanClass={agentCardSpanClass(index, data.agents.length)} />
               ))}
             </ul>
+          )}
+          {(data.discovery_limited || !autoConnectKnown) && (
+            <div className="border-t border-slate-100 px-4 py-2.5 sm:px-5">
+              {data.discovery_limited && (
+                <details className="text-xs leading-5 text-slate-500">
+                  <summary className="cursor-pointer font-medium hover:text-slate-700">{DISCOVERY_LIMIT_DISCLOSURE.summary}</summary>
+                  <p className="mt-1">{DISCOVERY_LIMIT_DISCLOSURE.body}</p>
+                </details>
+              )}
+              {!autoConnectKnown && (
+                <p className="text-xs leading-5 text-slate-500">{AUTO_SETUP_UNKNOWN_FOOTNOTE}</p>
+              )}
+            </div>
           )}
         </div>
       ) : (

@@ -396,6 +396,13 @@ function agentSubject(value: unknown, path: string): AgentSubject {
     identity_evidence: array(item.identity_evidence, `${path}.identity_evidence`, evidence),
     sessions: array(item.sessions, `${path}.sessions`, agentSession),
     capabilities: array(item.capabilities, `${path}.capabilities`, agentCapability),
+    // Guardrail liveness fields are additive: a producer that predates them
+    // omits them entirely, and absence normalizes to null (unknown), never to
+    // a value that could read as evidence.
+    guardrail_mode: item.guardrail_mode === undefined ? null : nullableText(item.guardrail_mode, `${path}.guardrail_mode`),
+    guardrail_configured_at: item.guardrail_configured_at === undefined ? null : nullableText(item.guardrail_configured_at, `${path}.guardrail_configured_at`),
+    guardrail_recorded_activity: item.guardrail_recorded_activity === undefined ? null : nullableInteger(item.guardrail_recorded_activity, `${path}.guardrail_recorded_activity`),
+    guardrail_last_observed_at: item.guardrail_last_observed_at === undefined ? null : nullableText(item.guardrail_last_observed_at, `${path}.guardrail_last_observed_at`),
   };
   if (parsed.identity_confidence === "host_verified"
     && !parsed.identity_evidence.some((entry) => entry.integrity === "verified")) {
