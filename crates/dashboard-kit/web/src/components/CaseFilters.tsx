@@ -155,7 +155,11 @@ export function CaseFilters({ value, disabled = false, onApply, onClear }: {
         </label>
       </div>
       <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-slate-100 pt-4">
-        <p className="text-xs leading-5 text-slate-500">Scope and time are preserved in this URL. Unsupported server dimensions are applied only to the current bounded page and labelled as such.</p>
+        {/* The second sentence here read "Unsupported server dimensions are applied
+            only to the current bounded page and labelled as such": our plumbing,
+            on every load, for a case that mostly does not apply. The results
+            panel already says it, in plain words, exactly when it does. */}
+        <p className="text-xs leading-5 text-slate-500">Your filters and time window are kept in the address bar, so this view can be bookmarked or shared.</p>
         <div className="flex gap-2">
           <button type="button" disabled={disabled} onClick={onClear} className="rounded-lg px-3 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-100 disabled:opacity-50">Clear</button>
           <button type="submit" disabled={disabled} className="rounded-lg bg-slate-950 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-800 disabled:opacity-50">Apply filters</button>

@@ -100,6 +100,7 @@ const RETIRED: [string, string][] = [
   ["The board beside this", "the board moved below the chart and this kept pointing sideways"],
   ["This is a producer fault, not an empty host", "producer is our word, not theirs"],
   ["Read-only projection", "projection is a contract word"],
+  ["Unsupported server dimensions", "our plumbing on every load, for a case that mostly does not apply"],
 ];
 
 /** Copy that replaced it, and must still be there. */
@@ -111,6 +112,7 @@ const REQUIRED: string[] = [
   "is not part of this installation",
   "Who decided what",
   "When it happened",
+  "kept in the address bar",
 ];
 
 describe("the dashboard speaks to the person using it", () => {
