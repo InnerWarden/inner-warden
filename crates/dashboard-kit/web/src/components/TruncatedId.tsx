@@ -2,7 +2,7 @@ import { useState } from "react";
 
 // A long content-addressed id (case:incident:<64-hex>, event:sqlite-incident:<hash>)
 // is essential for audit but dominates the UI and reads as noise day-to-day. This
-// shows a friendly form — the readable type label + a short hash tail — while
+// shows a friendly form (the readable type label + a short hash tail) while
 // keeping the FULL id one interaction away (native tooltip on hover + copy button
 // to clipboard). Depth preserved, clutter removed.
 
@@ -41,7 +41,7 @@ export function friendlyId(value: string): { label: string; short: string | null
 
 /** A standalone "copy full id" affordance. Kept separate from the label so a
  * caller can render the label inside a semantic element (e.g. an <h3> heading)
- * whose accessible name stays the id itself — not "id Copy full id: id" — while
+ * whose accessible name stays the id itself, not "id Copy full id: id", while
  * still offering copy-to-clipboard next to it. */
 export function CopyIdButton({ value, className = "" }: { value: string; className?: string }) {
   const [copied, setCopied] = useState(false);

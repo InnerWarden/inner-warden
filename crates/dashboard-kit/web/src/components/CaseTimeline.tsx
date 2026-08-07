@@ -70,7 +70,7 @@ export function CaseTimeline({ events }: { events: CaseEvent[] }) {
                 </div>
               </div>
               <p className="mt-3 whitespace-pre-wrap break-words text-sm leading-6 text-slate-800 [overflow-wrap:anywhere]">{event.summary}</p>
-              {event.relationship === "contextual" && <p className="mt-3 rounded-lg bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-900">Context only — this record does not establish causation.</p>}
+              {event.relationship === "contextual" && <p className="mt-3 rounded-lg bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-900">Context only: this record does not establish causation.</p>}
               {event.relationship === "unknown" && <p className="mt-3 rounded-lg bg-slate-100 px-3 py-2 text-xs leading-5 text-slate-700">The relationship to adjacent events is unknown.</p>}
               <dl className="mt-3 grid gap-2 border-t border-slate-200 pt-3 text-xs sm:grid-cols-2">
                 <div><dt className="text-slate-500">Authority</dt><dd className="mt-0.5 break-words font-medium text-slate-800 [overflow-wrap:anywhere]">{event.authority ?? "Unknown"}</dd></div>

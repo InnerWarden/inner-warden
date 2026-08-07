@@ -12,7 +12,7 @@ import type {
 import { StatusBadge } from "./StatusBadge";
 
 // Enrichment renders the signals wired together from the underlying incident /
-// decision / mitre mapping. Everything is producer-REPORTED, not verified — the
+// decision / mitre mapping. Everything is producer-REPORTED, not verified: the
 // section header says so, and every block only renders when its data is present.
 // An orphan observation (no detector/AI/rule) renders a single honest banner
 // instead of empty scaffolding, so an operator immediately understands "nothing
@@ -44,7 +44,7 @@ export function CaseEnrichmentView({ enrichment }: { enrichment: CaseEnrichment 
           <h3 className="font-semibold text-slate-950">Raw host observation</h3>
           <p className="mt-1 text-sm leading-6 text-slate-600">
             No detector, AI model, or rule flagged this as malicious. The sensor recorded the activity for context and
-            recurrence tracking only. There is no threat verdict, no attacker attribution, and no enforcement — treat it
+            recurrence tracking only. There is no threat verdict, no attacker attribution, and no enforcement. Treat it
             as a signal, not a finding.
           </p>
         </div>

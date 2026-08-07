@@ -49,7 +49,7 @@ export function MachineIntelligence({ edition }: { edition?: "community" | "ente
 /// Four rules, and each one removes a visible event:
 ///
 /// 1. Announce the FIRST load only. Once there is data on screen, a refresh
-///    starts silently — no state write, so no re-render.
+///    starts silently: no state write, so no re-render.
 /// 2. Keep the last good data through a failure. A transient error must not
 ///    empty a panel that is still showing true, if slightly older, information.
 ///    `error` only reaches the UI when there has never been data to show.
@@ -225,7 +225,7 @@ export const AGENT_GRID_MAX_COLUMNS = 2;
  * The grid class for a given number of agent cards.
  *
  * REGRESSION ANCHOR. This was a flat `md:grid-cols-2`. The cards sit in a
- * `gap-px` grid over a `bg-slate-200` parent — the hairline-divider trick —
+ * `gap-px` grid over a `bg-slate-200` parent (the hairline-divider trick),
  * which means any cell the cards do not fill shows that parent through. On the
  * common case of exactly ONE agent, the second column was an empty grey panel
  * sitting beside the single card on every screen wider than `md`, which reads as

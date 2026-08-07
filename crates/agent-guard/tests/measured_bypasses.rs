@@ -112,7 +112,7 @@ fn legitimate_work_is_never_denied() {
     let denied: Vec<&str> = legitimate.iter().copied().filter(|c| flagged(c)).collect();
     assert!(
         denied.is_empty(),
-        "FALSE POSITIVES on legitimate work — this is the property that keeps the \
+        "FALSE POSITIVES on legitimate work. This is the property that keeps the \
          guard switched on: {denied:?}"
     );
 }
