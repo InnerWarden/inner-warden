@@ -155,14 +155,17 @@ describe("token surfaces keep the not-a-score limit", () => {
   // activity, and presenting them without the limit invites reading them as a
   // risk metric. The only prior enforcement was a browser test that the same
   // pass turned red without noticing; this pins it at unit level.
-  it("both token footnotes carry the limit", async () => {
-    const { readFileSync } = await import("node:fs");
-    for (const file of [
-      "src/screens/TokenIntelligence.tsx",
-      "src/components/MachineIntelligence.tsx",
-    ]) {
-      const text = readFileSync(file, "utf8");
-      expect(text, `${file} must say the counts are not a security score`).toContain(
+  it("both token footnotes carry the limit", () => {
+    // Vite's raw import keeps this typechecking under the web tsconfig, where
+    // node:fs is deliberately not in scope.
+    const sources = import.meta.glob(
+      ["./screens/TokenIntelligence.tsx", "./components/MachineIntelligence.tsx"],
+      { query: "?raw", import: "default", eager: true },
+    ) as Record<string, string>;
+    const files = Object.keys(sources);
+    expect(files).toHaveLength(2);
+    for (const file of files) {
+      expect(sources[file], `${file} must say the counts are not a security score`).toContain(
         "not a security score",
       );
     }
