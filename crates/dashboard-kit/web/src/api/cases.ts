@@ -401,7 +401,7 @@ export function parseUnifiedCase(value: unknown): UnifiedCase {
 }
 
 // Lenient: enrichment is best-effort context. A missing/partial/malformed block
-// must NEVER fail the whole case — it degrades to `undefined` and the UI renders
+// must NEVER fail the whole case: it degrades to `undefined` and the UI renders
 // honest "not reported" states.
 function parseEnrichment(value: unknown): CaseEnrichment | undefined {
   if (value === null || value === undefined || typeof value !== "object") return undefined;

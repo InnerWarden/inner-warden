@@ -104,7 +104,7 @@ test("status is announced and readable without colour alone at WCAG AA contrast"
 
   const badge = statusRegion.locator('[data-status="unavailable"]');
   await expect(badge).toContainText("Unavailable");
-  await expect(badge.locator('[aria-hidden="true"]')).toHaveText("—");
+  await expect(badge.locator('[aria-hidden="true"]')).toHaveText("–");
   const colours = await badge.evaluate((element) => {
     const style = getComputedStyle(element);
     const canvas = document.createElement("canvas");

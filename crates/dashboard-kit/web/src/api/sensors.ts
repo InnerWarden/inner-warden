@@ -1,5 +1,5 @@
 /**
- * `GET /api/sensors` — what the host sensor itself collected today, per collector.
+ * `GET /api/sensors`: what the host sensor itself collected today, per collector.
  *
  * ONE bundle is served by two products. The paid Active Defence agent serves this
  * endpoint; the free CLI does not serve it at all and answers a JSON 404 for any
@@ -58,7 +58,7 @@ export type SensorActivity = {
   total_incidents: number | null;
   /**
    * The roster. A collector quiet today is deliberately still here with
-   * `count: 0` — the producer unions the lifetime roster with today's counts
+   * `count: 0`. The producer unions the lifetime roster with today's counts
    * precisely so a UTC rollover cannot make 16 of 18 collectors vanish.
    */
   sources: NamedCount[];

@@ -151,7 +151,7 @@ function TimelineCard({ activity, chart }: { activity: SensorActivityPayload; ch
           </p>
           <p className="mx-auto mt-1 max-w-md text-xs leading-5 text-slate-600">
             {chart.emptyReason === "no_events"
-              ? "The host reported time buckets and every one of them was empty. That is a quiet day, not a failure — the board beside this says which collectors are attached."
+              ? "The host reported time buckets and every one of them was empty. That is a quiet day, not a failure. The board beside this says which collectors are attached."
               : "This host sent no per-minute buckets for today. Nothing is being drawn from the gap, and no collector state is inferred from it."}
           </p>
         </div>

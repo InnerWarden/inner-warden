@@ -10,8 +10,8 @@
  * ONE honesty rule drives the shape of everything below. The producer sends only
  * the minutes that HAD events, so plotting the payload's buckets side by side
  * would draw a busy, continuous day out of four scattered spikes. The series is
- * therefore laid out on a real time axis — the whole 24 hours, missing minutes
- * are zero — so silence occupies the width it actually occupied.
+ * therefore laid out on a real time axis: the whole 24 hours, missing minutes
+ * are zero, so silence occupies the width it actually occupied.
  */
 import type { EventTimeline } from "../api/sensors";
 
@@ -98,7 +98,7 @@ function columnFor(minute: number, columnMinutes: number, columns: number): numb
  * Build the stacked series.
  *
  * Bands are ranked by total and tie-broken by name so the same host renders the
- * same chart on every poll — a stack whose order flickers is unreadable.
+ * same chart on every poll: a stack whose order flickers is unreadable.
  */
 export function buildSensorChart(
   timeline: EventTimeline,

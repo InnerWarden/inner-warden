@@ -2003,7 +2003,7 @@ mod shell_rewrite_parity {
             assert_eq!(
                 rew, lit,
                 "no-op rewrite `{rewrite}` scored `{rew}` but its literal form `{literal}` \
-                 scored `{lit}` — the guard is defeated by inserting shell no-op syntax"
+                 scored `{lit}`: the guard is defeated by inserting shell no-op syntax"
             );
         }
     }

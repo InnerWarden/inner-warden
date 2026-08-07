@@ -380,7 +380,7 @@ export function App({ extraScreens = [] }: { extraScreens?: readonly ScreenModul
   }, []);
 
   useEffect(() => {
-    document.title = `InnerWarden ${editionLabel} — Agent Security`;
+    document.title = `InnerWarden ${editionLabel}: Agent Security`;
   }, [editionLabel]);
 
   const navigate = (next: ShellRoute) => {

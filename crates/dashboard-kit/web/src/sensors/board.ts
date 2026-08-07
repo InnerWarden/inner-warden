@@ -11,8 +11,8 @@
  * attached while the surface above it reported the eBPF collector as fine,
  * because "it is in the config" and "it is running" had been allowed to become
  * the same sentence. Here they are three different sentences: the sensor's own
- * health verdict, the events actually observed today, and — when neither is
- * present — an explicit "not attested", which is never styled as good news.
+ * health verdict, the events actually observed today, and, when neither is
+ * present, an explicit "not attested", which is never styled as good news.
  *
  * The second rule: zero is a legitimate answer, and which way it reads depends
  * on what the collector is for. Silence in an event-driven ALARM detector means
@@ -94,7 +94,7 @@ export type CollectorLiveness =
   | "quiet"
   /** The sensor reports a fault: missing source, stale source, no permission, unsupported. */
   | "impaired"
-  /** Switched off in config. Operator choice, not a fault — and not running either. */
+  /** Switched off in config. Operator choice, not a fault, and not running either. */
   | "disabled"
   /** Declared, and nothing has attested it. NOT a synonym for working. */
   | "unattested";
@@ -126,7 +126,7 @@ export type CollectorRow = {
   liveness: CollectorLiveness;
   /**
    * Whether this collector may be presented as running. True only for
-   * `reporting` and `quiet` — never derived from the collector merely existing.
+   * `reporting` and `quiet`, never derived from the collector merely existing.
    */
   active: boolean;
   /** The raw health state, or `"not_reported"` when the host said nothing. */
@@ -155,7 +155,7 @@ const IMPAIRED_STATES: Readonly<Record<string, string>> = {
  *
  * The Rust enum variant is `DisabledByConfig` and serde emits
  * `disabled_by_config`; the deleted frontend tested for `"disabled"` and so
- * never matched a single one — that branch was dead for the whole life of the
+ * never matched a single one: that branch was dead for the whole life of the
  * feature, and a disabled collector rendered under the generic warning pill.
  * Both are accepted here so neither side of that mismatch can resurrect it.
  */
@@ -283,7 +283,7 @@ function describe(name: string, count: number, category: CollectorCategory, stat
     active: false,
     label: "Not attested",
     // Loud for a stream that should never be at zero, neutral for the detectors
-    // whose silence is ordinary — a warning on every quiet alarm would train the
+    // whose silence is ordinary: a warning on every quiet alarm would train the
     // operator to ignore the colour.
     tone: category === "telemetry" ? "warning" : "neutral",
     noteKey: "unattested",
