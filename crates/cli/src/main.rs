@@ -25,6 +25,8 @@ mod contain_io;
 mod dashboard;
 mod graph_io;
 mod notify_io;
+mod observe;
+mod observe_io;
 mod record_health;
 mod release_verify;
 mod second_opinion;
@@ -79,6 +81,10 @@ fn main() -> std::process::ExitCode {
         Some("allow") => suppress_io::cmd_allow(&args[1..]),
         Some("mute") => suppress_io::cmd_mute(&args[1..]),
         Some("notify") => notify_io::cmd(&args[1..]),
+        // Conversation-level attempts: what an agent was ASKED to do, including
+        // the asks the model refused, which produce no command and so reach
+        // nothing else in the product.
+        Some("observe") => observe_io::cmd(&args[1..]),
         Some("graph") => graph_io::cmd(&args[1..]),
         Some("llm") => second_opinion_io::cmd(&args[1..]),
         // Explicit passthrough to the host layer. The catch-all below only
@@ -1099,6 +1105,9 @@ fn help_text() -> String {
            {p} notify [flags]            configure Telegram/Slack/Discord/webhook alerts\n  \
            {p} graph [--json|--stats|--clear]\n  \
            \x20                                local narrative of screened actions, verdicts, and outcomes\n  \
+           {p} observe [status|install|inbound|reply]\n  \
+           \x20                                record dangerous asks that reach an agent in conversation,\n  \
+           \x20                                including the ones the model refuses (observation, not enforcement)\n  \
            {p} dashboard [--bind IP:PORT]  local UI + read-only APIs; optional agent watcher\n  \
            {p} llm [set ...|set-key|status]  optional own-model second opinion on ambiguous cmds\n  \
            \x20                                (setup wizard collects the key for you; set-key adds it later)\n  \
