@@ -21,7 +21,7 @@ regex = "1"
 fancy-regex = "0.18"
 fs4 = { version = "0.8", features = ["sync"] }
 chrono = { version = "0.4", features = ["serde"] }
-sha2 = "0.10"
+sha2 = "0.11"
 anyhow = "1"
 serde_yaml = "0.9"
 include_dir = "0.7"
