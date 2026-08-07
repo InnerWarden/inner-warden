@@ -437,13 +437,6 @@ fn record(
 /// it reports on, and the pattern is redacted before it is written because a
 /// command glob can carry a secret.
 pub fn record_suppression_change(action: &str, pattern: &str, counts: (usize, usize, usize)) {
-    let Some(graph) = graph_path() else {
-        return;
-    };
-    let Some(dir) = graph.parent() else {
-        return;
-    };
-    use std::io::Write;
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -459,12 +452,42 @@ pub fn record_suppression_change(action: &str, pattern: &str, counts: (usize, us
         "mute_category_count": counts.2,
         "session": session_id(None),
     });
-    if let Ok(mut f) = std::fs::OpenOptions::new()
+    append_guard_event(&line);
+}
+
+/// The directory the local record lives in: the graph, the guard event sink and
+/// the conversation-attempt pending file all sit together.
+pub(crate) fn sink_dir() -> Option<std::path::PathBuf> {
+    graph_path()?
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .filter(|dir| !dir.as_os_str().is_empty())
+}
+
+/// Append one already-built record to `guard-events.jsonl`.
+///
+/// The single writer for the sink, so every producer (blocks, suppression
+/// changes, conversation attempts) lands in the same append-only file with the
+/// same best-effort contract: an error here can never alter the decision it
+/// reports on.
+pub(crate) fn append_guard_event(line: &Value) {
+    let Some(dir) = sink_dir() else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(&dir);
+    append_guard_event_at(&dir, line);
+}
+
+/// [`append_guard_event`] against an explicit directory, so the sink's schema
+/// can be exercised without an ambient environment.
+fn append_guard_event_at(dir: &std::path::Path, line: &Value) {
+    use std::io::Write;
+    if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(dir.join("guard-events.jsonl"))
     {
-        let _ = writeln!(f, "{line}");
+        let _ = writeln!(file, "{line}");
     }
 }
 
@@ -476,7 +499,6 @@ fn emit_guard_event(
     outcome: DecisionOutcome,
     session: &str,
 ) {
-    use std::io::Write;
     let Some(dir) = graph_path.parent() else {
         return;
     };
@@ -494,13 +516,7 @@ fn emit_guard_event(
         "detail": command,
         "session": session,
     });
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dir.join("guard-events.jsonl"))
-    {
-        let _ = writeln!(f, "{line}");
-    }
+    append_guard_event_at(dir, &line);
 }
 
 #[allow(clippy::too_many_arguments)]

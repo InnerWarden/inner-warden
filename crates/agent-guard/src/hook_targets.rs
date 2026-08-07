@@ -94,6 +94,16 @@ pub static TARGETS: &[HookTarget] = &[
         // sees a proposed shell command, and its PreToolUse path is a relay of
         // whatever harness it drives. So a hook is not the mechanism for it.
         //
+        // That statement is about ENFORCEMENT and stays true. The message
+        // family is an OBSERVATION surface and a different thing: verified
+        // against openclaw 2026.7.1-2, `message:received` carries the inbound
+        // user text and `message:sent` carries the outbound reply, so an attack
+        // prompt the model refuses can be recorded even though no command ever
+        // existed to screen. `innerwarden observe install` wires that, and the
+        // record it writes says the model decided, never the product. It cannot
+        // block: strings pushed to `event.messages` are ignored for every
+        // `message:*` event.
+        //
         // Its MCP servers live under a NESTED `mcp.servers`, which `mcp_wire`
         // learned to locate on 2026-08-05. A config that is not strict JSON is
         // refused by the reader rather than rewritten, so a genuinely JSON5 file
