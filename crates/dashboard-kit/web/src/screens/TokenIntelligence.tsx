@@ -63,7 +63,7 @@ export function TokenIntelligence({ report, stale = false }: { report: TokenInte
 }
 
 export const PRIVACY_FOOTNOTE =
-  "Counts only. Prompts, responses, tool content and secrets never reach this dashboard, and these are not billing figures.";
+  "Counts only, not a security score. Prompts, responses, tool content and secrets never reach this dashboard, and these are not billing figures.";
 
 function Totals({ counters }: { counters: TokenCounterSet }) {
   return (

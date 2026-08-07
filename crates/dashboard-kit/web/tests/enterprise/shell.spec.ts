@@ -306,5 +306,5 @@ test("Enterprise keeps Community token intelligence visible without losing preci
   await expect(page.getByRole("heading", { name: "Token intelligence" })).toBeVisible();
   await expect(page.getByText("900,719,925,474,099,312,345", { exact: true }).first()).toBeVisible();
   await expect(page.getByText("No supported local counter is available for this source")).toBeVisible();
-  await expect(page.getByText("not billing data or a security score", { exact: false })).toBeVisible();
+  await expect(page.getByText("not a security score", { exact: false })).toBeVisible();
 });

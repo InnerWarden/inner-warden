@@ -154,7 +154,7 @@ export const AUTO_SETUP_UNKNOWN_FOOTNOTE =
 
 /** The privacy fact about token counts: worth stating, not worth a banner. */
 export const TOKEN_PRIVACY_FOOTNOTE =
-  "Counts only. Prompts, responses and tool content never reach this dashboard, and these are not billing figures.";
+  "Counts only, not a security score. Prompts, responses and tool content never reach this dashboard, and these are not billing figures.";
 
 /** Where the automatic-setup line belongs: a header strip only when the policy
  * is actually known; otherwise a quiet footnote. */

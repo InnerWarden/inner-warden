@@ -148,3 +148,23 @@ describe("the dashboard speaks to the person using it", () => {
     expect(withoutComments('const e = "a\\"// b";')).toBe('const e = "a\\"// b";');
   });
 });
+
+describe("token surfaces keep the not-a-score limit", () => {
+  // REGRESSION ANCHOR. An editorial pass dropped "not a security score" from
+  // both token surfaces. That limit is a claim boundary: token counts explain
+  // activity, and presenting them without the limit invites reading them as a
+  // risk metric. The only prior enforcement was a browser test that the same
+  // pass turned red without noticing; this pins it at unit level.
+  it("both token footnotes carry the limit", async () => {
+    const { readFileSync } = await import("node:fs");
+    for (const file of [
+      "src/screens/TokenIntelligence.tsx",
+      "src/components/MachineIntelligence.tsx",
+    ]) {
+      const text = readFileSync(file, "utf8");
+      expect(text, `${file} must say the counts are not a security score`).toContain(
+        "not a security score",
+      );
+    }
+  });
+});

@@ -205,6 +205,28 @@ paths:
         '401': { $ref: '#/components/responses/Unauthenticated' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '429': { $ref: '#/components/responses/RateLimited' }
+  /evaluation/host-gate:
+    get:
+      operationId: getEvaluationHostGate
+      x-innerwarden-edition: enterprise
+      x-innerwarden-auth-profile: enterprise-read-write
+      x-innerwarden-enterprise-auth-required: true
+      description: >-
+        Live kernel-gate state for the enforcement rollout screen. Read-only;
+        arms nothing. An empty evidence window reads inconclusive, never clean,
+        and evidence is labelled with the mode that produced it.
+      security:
+        - EnterpriseBearer: []
+        - EnterpriseBasic: []
+      responses:
+        '200':
+          description: Current host gate projection.
+          content:
+            application/json:
+              schema: { type: object }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
   /evaluation:
     get:
       operationId: getEnterpriseEvaluation
