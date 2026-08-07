@@ -261,17 +261,11 @@ function AgentsPanel({ state, edition }: { state: PollState<AgentsResponse>; edi
 }
 
 /**
- * The most cards this layout puts on one row.
- *
- * Each card carries a heading, six detail cells and a detection-evidence list.
- * At three across the detail grid collapses to one column per card and the
- * headings wrap mid-word, so two is the ceiling rather than a placeholder for a
- * responsive step nobody wrote.
- */
-export const AGENT_GRID_MAX_COLUMNS = 2;
-
-/**
  * The grid class for a given number of agent cards.
+ *
+ * Two across is the ceiling: each card carries a heading, six detail cells and
+ * a detection-evidence list, and at three the detail grid collapses to one
+ * column per card and the headings wrap mid-word. `pair-md` is that ceiling.
  *
  * REGRESSION ANCHOR. This was a flat `md:grid-cols-2`. The cards sit in a
  * `gap-px` grid over a `bg-slate-200` parent (the hairline-divider trick),

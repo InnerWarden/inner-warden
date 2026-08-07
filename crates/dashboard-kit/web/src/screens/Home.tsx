@@ -270,7 +270,7 @@ function PostureHero({ mode, edition, decisions, sessions, guardedAgents }: { mo
               host forever, which is the definition of copy an operator stops
               reading. The facts stay, one click down, where somebody who wants
               them can find them. */}
-          <details className="group mt-5 max-w-2xl">
+          <details className="mt-5 max-w-2xl">
             <summary className="cursor-pointer text-xs font-medium text-slate-500 hover:text-slate-700">
               How this dashboard handles your data
             </summary>
