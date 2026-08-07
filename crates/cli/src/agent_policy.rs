@@ -368,8 +368,10 @@ pub fn with_lock<T>(home: &Path, action: impl FnOnce() -> Result<T, String>) -> 
         .map_err(|error| format!("creating {}: {error}", parent.display()))?;
     let lock_path = parent.join("agents.lock");
     let lock = open_policy_lock(&lock_path)?;
-    lock.lock_exclusive()
-        .map_err(|error| format!("locking {}: {error}", lock_path.display()))?;
+    // BLOCKING exclusive lock: a second InnerWarden process waits here rather
+    // than proceeding unserialized. fs4 1.x renamed `lock_exclusive` to `lock`
+    // with identical semantics (`flock(LOCK_EX)` / `LockFileEx(EXCLUSIVE)`).
+    FileExt::lock(&lock).map_err(|error| format!("locking {}: {error}", lock_path.display()))?;
     let result = action();
     let unlock_result = FileExt::unlock(&lock)
         .map_err(|error| format!("unlocking {}: {error}", lock_path.display()));
@@ -761,6 +763,56 @@ mod tests {
         let body = std::fs::read_to_string(config_path(home.path())).unwrap();
         assert!(body.contains("schema_version = 1"));
         assert!(body.contains("mode = \"monitor\""));
+    }
+
+    /// Explicit connect/disconnect and the background reconciler are only kept
+    /// apart by this lock. It has to EXCLUDE (a second holder cannot enter while
+    /// one is inside) and it has to BLOCK (the loser waits its turn rather than
+    /// erroring or, worse, proceeding). A shared lock, a try-lock or a no-op
+    /// would compile and pass every other test in this module.
+    #[test]
+    fn agent_policy_lock_excludes_a_second_process_and_blocks_until_release() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let home = tempfile::TempDir::new().unwrap();
+        let (inside_tx, inside_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+
+        let holder_home = home.path().to_path_buf();
+        let holder = std::thread::spawn(move || {
+            with_lock(&holder_home, || {
+                inside_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            })
+            .unwrap();
+        });
+        inside_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+
+        let contender_home = home.path().to_path_buf();
+        let contender = std::thread::spawn(move || {
+            with_lock(&contender_home, || {
+                acquired_tx.send(()).unwrap();
+                Ok(())
+            })
+            .unwrap();
+        });
+
+        assert!(
+            acquired_rx
+                .recv_timeout(Duration::from_millis(250))
+                .is_err(),
+            "second holder must not enter the critical section while it is occupied"
+        );
+
+        release_tx.send(()).unwrap();
+        acquired_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("second holder must enter once the lock is released");
+        holder.join().unwrap();
+        contender.join().unwrap();
     }
 
     #[test]
