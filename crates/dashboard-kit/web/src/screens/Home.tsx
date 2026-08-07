@@ -15,13 +15,64 @@ import { formatTimestamp, humanizeToken, normaliseMode } from "../presentation";
 
 type ActivityLink = { id?: string; session?: string; verdict?: string; action?: string };
 
+/**
+ * Where one recorded decision on this screen leads when clicked.
+ *
+ * - `case`: the server named the unified case this decision belongs to, and the
+ *   shell can open the Cases screen, so the entry deep-links to that case.
+ * - `activity`: Community's decision record IS its case surface (one place per
+ *   product, not two screens over the same graph), so the entry opens Activity
+ *   with this decision selected.
+ * - `none`: there is nowhere real to go. The entry must then not look
+ *   clickable, because a link that bounces back to Overview teaches the
+ *   operator that clicking is pointless. This is what every Enterprise entry
+ *   did before the server sent `case_id`.
+ */
+export type DecisionEntryLink =
+  | { kind: "case"; caseId: string }
+  | { kind: "activity" }
+  | { kind: "none" };
+
+export function decisionEntryLink(
+  caseId: string | undefined,
+  edition: "community" | "enterprise" | undefined,
+  canOpenCase: boolean,
+): DecisionEntryLink {
+  if (caseId && canOpenCase) return { kind: "case", caseId };
+  if (edition === "community") return { kind: "activity" };
+  return { kind: "none" };
+}
+
+/**
+ * The "view everything" step out of the Decision record section.
+ *
+ * Community goes to Activity, its decision record. Enterprise goes to Cases
+ * when the shell offers it; when it does not, the button is hidden rather than
+ * rendered as a link that silently lands back on Overview.
+ */
+export function decisionRecordCta(
+  edition: "community" | "enterprise" | undefined,
+  canOpenCase: boolean,
+): { kind: "cases" | "activity" | "hidden"; label: string } {
+  if (edition === "community") return { kind: "activity", label: "View all activity" };
+  if (canOpenCase) return { kind: "cases", label: "View all in Cases" };
+  return { kind: "hidden", label: "" };
+}
+
 export function Home({
   meta,
   onOpenActivity,
+  onOpenCase,
   edition,
 }: {
   meta?: DashboardMeta;
   onOpenActivity: (target?: ActivityLink) => void;
+  /**
+   * Opens the Cases screen, optionally with one case selected. Provided only
+   * when the shell actually has a Cases screen to open; its absence makes
+   * every case link degrade per `decisionEntryLink`.
+   */
+  onOpenCase?: (caseId?: string) => void;
   /**
    * Drives whether the Active Defence card is an offer or noise. Absent means
    * the edition has not resolved yet, which is treated as "do not offer" --
@@ -124,9 +175,19 @@ was incomplete; it does not mean this host is idle.`}
                 <p className="text-xs font-semibold uppercase tracking-[0.14em] text-cyan-700">Decision record</p>
                 <h2 id="decision-summary-title" className="mt-1 text-lg font-semibold text-slate-950">What the guardrail saw</h2>
               </div>
-              <button type="button" onClick={() => onOpenActivity()} className="text-sm font-semibold text-cyan-700 hover:text-cyan-900">
-                View all activity <span aria-hidden="true">→</span>
-              </button>
+              {(() => {
+                const cta = decisionRecordCta(edition, onOpenCase !== undefined);
+                if (cta.kind === "hidden") return null;
+                return (
+                  <button
+                    type="button"
+                    onClick={() => (cta.kind === "cases" ? onOpenCase?.() : onOpenActivity())}
+                    className="text-sm font-semibold text-cyan-700 hover:text-cyan-900"
+                  >
+                    {cta.label} <span aria-hidden="true">→</span>
+                  </button>
+                );
+              })()}
             </div>
             <div className={hasUnknownVerdicts ? "grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-5" : "grid grid-cols-2 gap-3 lg:grid-cols-4"}>
               <Stat label="Recorded decisions" value={overview.commands} detail={`${overview.sessions} session${overview.sessions === 1 ? "" : "s"}`} />
@@ -142,7 +203,7 @@ was incomplete; it does not mean this host is idle.`}
           )}
 
           <div className="grid gap-6 lg:grid-cols-[minmax(0,1.35fr)_minmax(280px,.65fr)]">
-            <RecentActivity items={recent} onOpen={onOpenActivity} />
+            <RecentActivity items={recent} edition={edition} onOpen={onOpenActivity} onOpenCase={onOpenCase} />
             <RiskSignals items={overview.top_categories.slice(0, 6)} max={maxSignal} />
           </div>
         </>
@@ -347,7 +408,12 @@ function OperationalEvidence({ overview }: { overview: Overview }) {
   );
 }
 
-function RecentActivity({ items, onOpen }: { items: DecisionSummary[]; onOpen: (target?: ActivityLink) => void }) {
+function RecentActivity({ items, edition, onOpen, onOpenCase }: {
+  items: DecisionSummary[];
+  edition?: "community" | "enterprise";
+  onOpen: (target?: ActivityLink) => void;
+  onOpenCase?: (caseId?: string) => void;
+}) {
   return (
     <section className="min-w-0" aria-labelledby="recent-activity-title">
       <div className="mb-3">
@@ -360,41 +426,71 @@ function RecentActivity({ items, onOpen }: { items: DecisionSummary[]; onOpen: (
         <ul className="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm">
           {items.map((item, index) => {
             const recommendation = item.recommendation ?? "unknown";
-            const when = formatTimestamp(item.recorded_at_ms);
-            const sessionLabel = item.session === "local" ? "Local session" : item.session;
+            const link = decisionEntryLink(item.case_id, edition, onOpenCase !== undefined);
+            const body = <RecentActivityEntry item={item} clickable={link.kind !== "none"} />;
             return (
               <li key={item.id ?? `${item.session}-${item.command}-${index}`} className="border-b border-slate-100 last:border-0">
-                <button
-                  type="button"
-                  onClick={() => onOpen({ id: item.id, session: item.session, verdict: recommendation, action: item.command })}
-                  className="group grid w-full min-w-0 grid-cols-[7rem_minmax(0,1fr)] items-start gap-x-3 gap-y-2 px-3 py-3 text-left transition-colors hover:bg-slate-50 focus-visible:-outline-offset-2 sm:grid-cols-[7rem_minmax(0,1fr)_auto] sm:px-4"
-                  aria-label={`Open ${recommendation} decision for ${item.command}`}
-                >
-                  <Verdict rec={recommendation} />
-                  <div className="min-w-0 flex-1">
-                    <code className="block truncate text-sm font-medium text-slate-900">{item.command}</code>
-                    <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
-                      <DecidedBy by={item.decided_by} />
-                      <Outcome value={item.outcome ?? "unknown"} />
-                      {item.categories.slice(0, 2).map((category) => (
-                        <span key={category} className="max-w-full truncate rounded-full bg-slate-100 px-2 py-0.5 text-[11px] font-medium text-slate-600">
-                          {humanizeToken(category)}
-                        </span>
-                      ))}
-                    </div>
+                {link.kind === "none" ? (
+                  // No case to open: plain text, no hover, no affordance. A row
+                  // that looks clickable and lands nowhere is worse than one
+                  // that says it is a record.
+                  <div className="grid w-full min-w-0 grid-cols-[7rem_minmax(0,1fr)] items-start gap-x-3 gap-y-2 px-3 py-3 text-left sm:grid-cols-[7rem_minmax(0,1fr)_auto] sm:px-4">
+                    {body}
                   </div>
-                  <div className="col-span-2 flex min-w-0 items-center justify-between gap-3 text-xs text-slate-500 sm:col-span-1 sm:block sm:max-w-28 sm:shrink-0 sm:text-right">
-                    {when && <div className="shrink-0">{when}</div>}
-                    <div className="min-w-0 flex-1 truncate sm:mt-1 sm:max-w-28" title={sessionLabel}>{sessionLabel}</div>
-                    <span className="mt-2 hidden font-semibold text-cyan-700 opacity-0 transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100 sm:inline-block">Open →</span>
-                  </div>
-                </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      link.kind === "case"
+                        ? onOpenCase?.(link.caseId)
+                        : onOpen({ id: item.id, session: item.session, verdict: recommendation, action: item.command })
+                    }
+                    className="group grid w-full min-w-0 grid-cols-[7rem_minmax(0,1fr)] items-start gap-x-3 gap-y-2 px-3 py-3 text-left transition-colors hover:bg-slate-50 focus-visible:-outline-offset-2 sm:grid-cols-[7rem_minmax(0,1fr)_auto] sm:px-4"
+                    aria-label={
+                      link.kind === "case"
+                        ? `Open the case for ${item.command}`
+                        : `Open ${recommendation} decision for ${item.command}`
+                    }
+                  >
+                    {body}
+                  </button>
+                )}
               </li>
             );
           })}
         </ul>
       )}
     </section>
+  );
+}
+
+function RecentActivityEntry({ item, clickable }: { item: DecisionSummary; clickable: boolean }) {
+  const recommendation = item.recommendation ?? "unknown";
+  const when = formatTimestamp(item.recorded_at_ms);
+  const sessionLabel = item.session === "local" ? "Local session" : item.session;
+  return (
+    <>
+      <Verdict rec={recommendation} />
+      <div className="min-w-0 flex-1">
+        <code className="block truncate text-sm font-medium text-slate-900">{item.command}</code>
+        <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+          <DecidedBy by={item.decided_by} />
+          <Outcome value={item.outcome ?? "unknown"} />
+          {item.categories.slice(0, 2).map((category) => (
+            <span key={category} className="max-w-full truncate rounded-full bg-slate-100 px-2 py-0.5 text-[11px] font-medium text-slate-600">
+              {humanizeToken(category)}
+            </span>
+          ))}
+        </div>
+      </div>
+      <div className="col-span-2 flex min-w-0 items-center justify-between gap-3 text-xs text-slate-500 sm:col-span-1 sm:block sm:max-w-28 sm:shrink-0 sm:text-right">
+        {when && <div className="shrink-0">{when}</div>}
+        <div className="min-w-0 flex-1 truncate sm:mt-1 sm:max-w-28" title={sessionLabel}>{sessionLabel}</div>
+        {clickable && (
+          <span className="mt-2 hidden font-semibold text-cyan-700 opacity-0 transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100 sm:inline-block">Open →</span>
+        )}
+      </div>
+    </>
   );
 }
 

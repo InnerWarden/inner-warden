@@ -45,6 +45,13 @@ export type DecisionSummary = {
   recorded_at_ms?: number;
   categories: string[];
   decided_by: string;
+  /**
+   * The unified case this decision belongs to, when the server serves a Cases
+   * screen and this decision has a case there. Optional and additive: the free
+   * server does not send it, and a decision the server could not place in a
+   * case must render as text, not as a link to nowhere.
+   */
+  case_id?: string;
 };
 export type BlockSummary = DecisionSummary;
 export type Overview = {
