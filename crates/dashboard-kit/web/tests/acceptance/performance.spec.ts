@@ -108,7 +108,7 @@ test.describe("CJC-090 / spec 090 T155 — dashboard performance acceptance", ()
     // Sanity: the float-rounded rendering genuinely differs from the exact one.
     expect(LOSSY).not.toBe(EXACT);
 
-    await page.route("**/api/token-intelligence", (route) =>
+    await page.route("**/api/guard/token-intelligence", (route) =>
       fulfill(route, {
         schema_version: 1,
         generated_at_ms: generatedAt,
@@ -160,7 +160,7 @@ test.describe("CJC-090 / spec 090 T155 — dashboard performance acceptance", ()
 
     const caseRequestCursors: (string | null)[] = [];
     await page.route("**/api/dashboard/v1/bootstrap", (route) => fulfill(route, casesBootstrap));
-    await page.route("**/api/meta", (route) => fulfill(route, meta));
+    await page.route("**/api/guard/meta", (route) => fulfill(route, meta));
     await page.route("**/api/dashboard/v1/cases?*", async (route) => {
       const cursor = new URL(route.request().url()).searchParams.get("cursor");
       caseRequestCursors.push(cursor);

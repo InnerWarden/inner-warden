@@ -30,7 +30,7 @@ test.describe("CJC-090-J002 deterministic action screening", () => {
       decided_by: "unknown",
     });
 
-    await page.route("**/api/overview", (route) => fulfillJson(route, {
+    await page.route("**/api/guard/overview", (route) => fulfillJson(route, {
       sessions: 1,
       commands: 3,
       blocked: 2,

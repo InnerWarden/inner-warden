@@ -17,18 +17,24 @@ if (!(["community", "enterprise"].includes(fixture)) || !Number.isInteger(port) 
 }
 
 const fixtureRoot = join(testsRoot, "fixtures", fixture);
+// These paths must be the ones the BUNDLE asks for. They drifted: the client
+// moved to `api/guard/*` and this map stayed on `/api/*`, so every browser test
+// loaded a shell whose overview and meta both 404'd. Fifteen Community specs
+// were asserting against "The local dashboard is unavailable" and the browser
+// suite is not part of CI, so nothing said so. See `fetchMeta`, `fetchOverview`,
+// `fetchAgents` and `fetchTokenIntelligence` in `src/api.ts`.
 const apiFiles = fixture === "community"
   ? new Map([
     ["/api/dashboard/v1/bootstrap", "bootstrap.json"],
-    ["/api/meta", "meta.json"],
-    ["/api/overview", "overview.json"],
-    ["/api/agents", "agents.json"],
-    ["/api/token-intelligence", "token-intelligence.json"],
+    ["/api/guard/meta", "meta.json"],
+    ["/api/guard/overview", "overview.json"],
+    ["/api/guard/agents", "agents.json"],
+    ["/api/guard/token-intelligence", "token-intelligence.json"],
   ])
   : new Map([
     ["/api/dashboard/v1/bootstrap", "bootstrap.json"],
     ["/api/dashboard/v1/posture", "posture.json"],
-    ["/api/meta", "meta.json"],
+    ["/api/guard/meta", "meta.json"],
   ]);
 
 const mime = new Map([

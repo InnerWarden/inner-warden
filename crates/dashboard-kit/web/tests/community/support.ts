@@ -95,10 +95,10 @@ export async function fulfillJson(route: Route, body: unknown, status = 200) {
 }
 
 export async function installOverview(page: Page, body: unknown = EMPTY_OVERVIEW) {
-  await page.route("**/api/overview", (route) => fulfillJson(route, body));
+  await page.route("**/api/guard/overview", (route) => fulfillJson(route, body));
 }
 
 export async function installMachineDefaults(page: Page) {
-  await page.route("**/api/agents", (route) => fulfillJson(route, EMPTY_AGENTS));
-  await page.route("**/api/token-intelligence", (route) => fulfillJson(route, NO_TOKEN_HISTORY));
+  await page.route("**/api/guard/agents", (route) => fulfillJson(route, EMPTY_AGENTS));
+  await page.route("**/api/guard/token-intelligence", (route) => fulfillJson(route, NO_TOKEN_HISTORY));
 }

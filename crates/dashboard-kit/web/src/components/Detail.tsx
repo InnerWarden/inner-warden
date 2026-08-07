@@ -5,13 +5,37 @@ import { DecidedBy } from "./DecidedBy";
 import { Outcome } from "./Outcome";
 import { Verdict } from "./Verdict";
 
+/**
+ * The rows of the decision dialog, in the order the operator asks for them.
+ *
+ * What was the verdict, was it actually stopped, when, where did it come from,
+ * who decided, and only then the score. Before this the order was the payload's:
+ * risk score third, "Sequence #12" fifth, and the timestamp last. Sequence
+ * counts our own rows, is already printed on the list behind this dialog, and
+ * answers none of those questions, so it is gone rather than reordered.
+ */
+export function detailRowLabels(present: { when: boolean; session: boolean; mode: boolean }): string[] {
+  const labels = ["Verdict", "Execution outcome"];
+  if (present.when) labels.push("Recorded");
+  if (present.session) labels.push("Session");
+  labels.push("Decision source");
+  if (present.mode) labels.push("Decision mode");
+  labels.push("Risk score");
+  return labels;
+}
+
 /** An accessible, focus-trapped explanation of one recorded guardrail decision. */
 export function Detail({
   action,
+  session,
   onClose,
   fallbackFocus,
 }: {
   action: ActionView;
+  /** Which session this action came out of. The dig-in question "where from"
+   * had no answer in this dialog at all: the operator had to close it and read
+   * the row behind it. */
+  session?: string;
   onClose: () => void;
   fallbackFocus?: () => void;
 }) {
@@ -66,17 +90,18 @@ export function Detail({
   const decisionMode = modeAtDecisionLabel(action.mode_at_decision);
   const isMcpAction = /^MCP\s*·/i.test(action.command.trimStart());
   const rows: [string, ReactNode][] = useMemo(() => {
-    const values: [string, ReactNode][] = [
-      ["Verdict", <Verdict rec={action.recommendation} />],
-      ["Execution outcome", <Outcome value={action.outcome ?? "unknown"} />],
-      ["Risk score", action.risk == null ? "Not reported" : String(action.risk)],
-      ["Decision source", <DecidedBy by={action.decided_by} />],
-      ["Sequence", `#${action.seq}`],
-    ];
-    if (decisionMode) values.push(["Decision mode", decisionMode]);
-    if (when) values.push(["Recorded", when]);
-    return values;
-  }, [action, decisionMode, when]);
+    const rendered: Record<string, ReactNode> = {
+      Verdict: <Verdict rec={action.recommendation} />,
+      "Execution outcome": <Outcome value={action.outcome ?? "unknown"} />,
+      Recorded: when,
+      Session: session === "local" ? "Local session" : session,
+      "Decision source": <DecidedBy by={action.decided_by} />,
+      "Decision mode": decisionMode,
+      "Risk score": action.risk == null ? "Not reported" : String(action.risk),
+    };
+    return detailRowLabels({ when: Boolean(when), session: Boolean(session), mode: Boolean(decisionMode) })
+      .map((label): [string, ReactNode] => [label, rendered[label]]);
+  }, [action, decisionMode, session, when]);
 
   return (
     <div className="fixed inset-0 z-20 flex items-start justify-center overflow-y-auto bg-slate-950/40 p-3 pt-8 backdrop-blur-[1px] sm:p-6 sm:pt-16" onMouseDown={onClose}>

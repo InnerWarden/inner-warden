@@ -4,9 +4,9 @@ import { EMPTY_OVERVIEW, fulfillJson, installMachineDefaults, NO_TOKEN_HISTORY }
 const generatedAt = Date.UTC(2026, 6, 18, 12, 0, 0);
 
 async function installBase(page: Page) {
-  await page.route("**/api/overview", (route) => fulfillJson(route, EMPTY_OVERVIEW));
+  await page.route("**/api/guard/overview", (route) => fulfillJson(route, EMPTY_OVERVIEW));
   await installMachineDefaults(page);
-  await page.unroute("**/api/token-intelligence");
+  await page.unroute("**/api/guard/token-intelligence");
 }
 
 test.describe("CJC-090-J010 provenance-aware token intelligence", () => {
@@ -14,19 +14,19 @@ test.describe("CJC-090-J010 provenance-aware token intelligence", () => {
     await installBase(page);
     let release!: () => void;
     const ready = new Promise<void>((resolve) => { release = resolve; });
-    await page.route("**/api/token-intelligence", async (route) => {
+    await page.route("**/api/guard/token-intelligence", async (route) => {
       await ready;
       await fulfillJson(route, NO_TOKEN_HISTORY);
     });
     await page.goto("/");
     await expect(page.getByRole("status", { name: "Loading token intelligence" })).toBeVisible();
     release();
-    await expect(page.getByRole("heading", { name: "No local token history available" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "No local token history yet" })).toBeVisible();
   });
 
   test("preserves arbitrary-precision decimal strings and independent null dimensions", async ({ page }) => {
     await installBase(page);
-    await page.route("**/api/token-intelligence", (route) => fulfillJson(route, {
+    await page.route("**/api/guard/token-intelligence", (route) => fulfillJson(route, {
       schema_version: 1,
       generated_at_ms: generatedAt,
       scope: "available_local_history",
@@ -59,15 +59,19 @@ test.describe("CJC-090-J010 provenance-aware token intelligence", () => {
 
   test("shows no-data without turning missing history into zero", async ({ page }) => {
     await installBase(page);
-    await page.route("**/api/token-intelligence", (route) => fulfillJson(route, NO_TOKEN_HISTORY));
+    await page.route("**/api/guard/token-intelligence", (route) => fulfillJson(route, NO_TOKEN_HISTORY));
     await page.goto("/");
-    await expect(page.getByRole("heading", { name: "No local token history available" })).toBeVisible();
-    await expect(page.getByText("A missing counter is shown as unavailable, never as zero.")).toBeVisible();
+    await expect(page.getByRole("heading", { name: "No local token history yet" })).toBeVisible();
+    // The empty state now names the next thing that has to happen instead of
+    // reciting our own rule. The rule it recited is still enforced, and it is
+    // still stated once, under the panel.
+    await expect(page.getByText("Counts appear here once one does.")).toBeVisible();
+    await expect(page.getByText("Prompts, responses and tool content never reach this dashboard")).toBeVisible();
   });
 
   test("shows endpoint errors as unavailable without inferring usage", async ({ page }) => {
     await installBase(page);
-    await page.route("**/api/token-intelligence", (route) => fulfillJson(route, { error: "token_source_failed" }, 503));
+    await page.route("**/api/guard/token-intelligence", (route) => fulfillJson(route, { error: "token_source_failed" }, 503));
     await page.goto("/");
     await expect(page.getByRole("heading", { name: "Token intelligence is unavailable" })).toBeVisible();
     await expect(page.getByText("No usage value is being inferred from the missing response.")).toBeVisible();
@@ -75,7 +79,7 @@ test.describe("CJC-090-J010 provenance-aware token intelligence", () => {
 
   test("keeps unsupported providers explicit and entirely nullable", async ({ page }) => {
     await installBase(page);
-    await page.route("**/api/token-intelligence", (route) => fulfillJson(route, {
+    await page.route("**/api/guard/token-intelligence", (route) => fulfillJson(route, {
       schema_version: 1,
       generated_at_ms: generatedAt,
       scope: "available_local_history",

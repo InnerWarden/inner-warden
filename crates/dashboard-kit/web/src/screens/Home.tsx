@@ -79,9 +79,9 @@ export function Home({
   if (missing.length > 0) {
     return (
       <FullError
-        message={`This dashboard's data source returned an overview without ${missing.join(", ")}. \
-The Overview contract requires ${missing.length === 1 ? "that field" : "those fields"}, so the \
-figures below cannot be shown. This is a producer fault, not an empty host.`}
+        message={`This dashboard asked the local InnerWarden process for the overview and got a \
+reply with no ${missing.join(" and no ")} in it, so the figures below cannot be shown. The reply \
+was incomplete; it does not mean this host is idle.`}
       />
     );
   }
@@ -265,11 +265,21 @@ function PostureHero({ mode, edition, decisions, sessions, guardedAgents }: { mo
             {posture.title}
           </h1>
           <p className="mt-3 max-w-2xl text-sm leading-6 text-slate-600 sm:text-base">{posture.body}</p>
-          <ul className="mt-5 flex flex-wrap gap-x-5 gap-y-2 text-xs font-medium text-slate-600" aria-label="Trust properties">
-            <TrustItem>Local rule analysis</TrustItem>
-            <TrustItem>Read-only dashboard API</TrustItem>
-            <TrustItem>Common secret patterns redacted before storage</TrustItem>
-          </ul>
+          {/* These three lines were a permanent strip across the hero. They are
+              true, and they are the same three sentences on every load of every
+              host forever, which is the definition of copy an operator stops
+              reading. The facts stay, one click down, where somebody who wants
+              them can find them. */}
+          <details className="group mt-5 max-w-2xl">
+            <summary className="cursor-pointer text-xs font-medium text-slate-500 hover:text-slate-700">
+              How this dashboard handles your data
+            </summary>
+            <ul className="mt-2 flex flex-wrap gap-x-5 gap-y-2 text-xs font-medium text-slate-600">
+              <TrustItem>Rules are evaluated on this machine</TrustItem>
+              <TrustItem>This dashboard only reads; it changes nothing</TrustItem>
+              <TrustItem>Common secret patterns are redacted before storage</TrustItem>
+            </ul>
+          </details>
         </div>
         <div className="grid grid-cols-2 gap-3 rounded-xl border border-white/80 bg-white/75 p-4 shadow-sm backdrop-blur">
           <HeroNumber label="Decisions recorded" value={decisions} />
@@ -320,8 +330,11 @@ function OperationalEvidence({ overview }: { overview: Overview }) {
     <section className="rounded-xl border border-slate-200 bg-white px-4 py-3" aria-labelledby="outcome-evidence-title">
       <div className="flex flex-wrap items-center gap-x-6 gap-y-3">
         <div className="mr-auto">
-          <h2 id="outcome-evidence-title" className="text-sm font-semibold text-slate-900">Execution evidence</h2>
-          <p className="text-xs text-slate-500">Outcomes reported by newer guardrail integrations</p>
+          {/* "Outcomes reported by newer guardrail integrations" sat under this
+              heading on every load. Which integrations are new is our
+              bookkeeping; the four labels beside it already say what each
+              number counts. */}
+          <h2 id="outcome-evidence-title" className="text-sm font-semibold text-slate-900">What the guardrail actually did</h2>
         </div>
         {items.map((item) => (
           <div key={item.label} className="min-w-28">
@@ -490,24 +503,29 @@ const COMMUNITY_FEATURES = [
   "Second opinion with your model",
 ];
 
+/**
+ * The feature list, collapsed.
+ *
+ * Eight bullets in a coloured panel on every single load of the Overview, and
+ * not one of them tells an operator anything about THIS host: it is a brochure
+ * printed on the instrument. The list is worth keeping for somebody new, so it
+ * stays, closed, at the bottom of the page.
+ */
 function CommunityIncluded() {
   return (
-    <section className="rounded-2xl border border-cyan-200 bg-cyan-50/60 px-5 py-5 sm:px-6" aria-labelledby="community-included-title">
-      <div className="grid gap-4 lg:grid-cols-[220px_1fr] lg:items-center">
-        <div>
-          <p className="text-xs font-semibold uppercase tracking-[0.14em] text-cyan-800">Community Edition</p>
-          <h2 id="community-included-title" className="mt-1 text-lg font-semibold text-slate-950">Included, not gated</h2>
-        </div>
-        <ul className="grid gap-x-6 gap-y-2 text-sm text-slate-700 sm:grid-cols-2 lg:grid-cols-3">
-          {COMMUNITY_FEATURES.map((feature) => (
-            <li key={feature} className="flex items-center gap-2">
-              <span className="flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-cyan-700 text-[10px] font-bold text-white" aria-hidden="true">✓</span>
-              {feature}
-            </li>
-          ))}
-        </ul>
-      </div>
-    </section>
+    <details className="rounded-2xl border border-slate-200 bg-white px-5 py-4 sm:px-6">
+      <summary className="cursor-pointer text-sm font-semibold text-slate-700 hover:text-slate-950">
+        What Community includes
+      </summary>
+      <ul className="mt-3 grid gap-x-6 gap-y-2 text-sm text-slate-700 sm:grid-cols-2 lg:grid-cols-3">
+        {COMMUNITY_FEATURES.map((feature) => (
+          <li key={feature} className="flex items-center gap-2">
+            <span className="flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-cyan-700 text-[10px] font-bold text-white" aria-hidden="true">✓</span>
+            {feature}
+          </li>
+        ))}
+      </ul>
+    </details>
   );
 }
 

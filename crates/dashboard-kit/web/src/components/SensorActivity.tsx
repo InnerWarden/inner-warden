@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useId, useMemo, useState, type KeyboardEvent, type PointerEvent } from "react";
 import { fetchSensorActivity, type SensorActivity as SensorActivityPayload } from "../api/sensors";
 import {
   boardSummary,
@@ -12,9 +12,14 @@ import {
 } from "../sensors/board";
 import {
   buildSensorChart,
+  busiestColumn,
   chartHourTicks,
   chartSummary,
+  chartValueTicks,
+  columnAtFraction,
+  columnReadout,
   stackedBandPaths,
+  type ColumnReadout,
   type SensorChart,
 } from "../sensors/chart";
 
@@ -151,8 +156,10 @@ function TimelineCard({ activity, chart }: { activity: SensorActivityPayload; ch
           </p>
           <p className="mx-auto mt-1 max-w-md text-xs leading-5 text-slate-600">
             {chart.emptyReason === "no_events"
-              ? "The host reported time buckets and every one of them was empty. That is a quiet day, not a failure. The board beside this says which collectors are attached."
-              : "This host sent no per-minute buckets for today. Nothing is being drawn from the gap, and no collector state is inferred from it."}
+              // The board moved below this card in the full-width layout and
+              // this sentence went on pointing sideways at it.
+              ? "The host reported its time buckets and every one was empty. That is a quiet day, not a failure. Collector status is below."
+              : "This host sent no timeline for today, so there is nothing to draw. Collector status is below; none of it is guessed from the missing timeline."}
           </p>
         </div>
       ) : (
@@ -164,69 +171,195 @@ function TimelineCard({ activity, chart }: { activity: SensorActivityPayload; ch
   );
 }
 
+/**
+ * The stack itself: gradients, an axis with numbers on it, and a readout of the
+ * column under the cursor.
+ *
+ * Nothing here touches the DATA. The columns are still ten real minutes wide,
+ * the totals are still the producer's, the tail is still one honest aggregate
+ * band, and no curve is interpolated between two points, so a one-column spike
+ * still draws as a one-column spike. What changed is that a reader can now tell
+ * what the height MEANS: the vertical axis is labelled, and pointing at a
+ * column says which ten minutes it is and which collector filled it.
+ */
 function Plot({ chart, summary }: { chart: SensorChart; summary: string }) {
   const paths = stackedBandPaths(chart, PLOT_WIDTH, PLOT_HEIGHT);
-  const ticks = chartHourTicks();
-  const gridlines = [0.25, 0.5, 0.75];
+  const hourTicks = chartHourTicks();
+  const valueTicks = chartValueTicks(chart);
+  // `useId` is per-instance, so two plots on one page cannot share a gradient.
+  // The colons React puts in the id are stripped: they are legal in an id and a
+  // needless argument with every `url(#...)` consumer.
+  const gradientPrefix = `iw-band-${useId().replace(/:/g, "")}`;
+  const [pointed, setPointed] = useState<number | null>(null);
+  const resting = useMemo(() => busiestColumn(chart), [chart]);
+  const column = pointed ?? resting;
+  const readout = columnReadout(chart, column);
+  const cursorX = column === null ? null : (column * PLOT_WIDTH) / Math.max(1, chart.columns - 1);
+
+  const track = (event: PointerEvent<SVGSVGElement>) => {
+    const box = event.currentTarget.getBoundingClientRect();
+    if (box.width <= 0) return;
+    setPointed(columnAtFraction(chart, (event.clientX - box.left) / box.width));
+  };
+  const step = (event: KeyboardEvent<SVGSVGElement>) => {
+    const moves: Record<string, number> = { ArrowLeft: -1, ArrowRight: 1, PageUp: 6, PageDown: -6 };
+    const move = moves[event.key];
+    if (move === undefined && event.key !== "Home" && event.key !== "End") return;
+    event.preventDefault();
+    const from = column ?? 0;
+    const next = event.key === "Home" ? 0 : event.key === "End" ? chart.columns - 1 : from + move;
+    setPointed(Math.min(chart.columns - 1, Math.max(0, next)));
+  };
+
   return (
     <figure className="mt-3 min-w-0">
-      <svg
-        viewBox={`0 0 ${PLOT_WIDTH} ${PLOT_HEIGHT}`}
-        // Stretched to the container rather than letter-boxed: a day-long time
-        // series is read left to right, and a fixed aspect ratio would leave it
-        // an inch tall on a phone. Every stroke below carries
-        // `vector-effect="non-scaling-stroke"` so the distortion never reaches
-        // a line weight.
-        className="h-48 w-full rounded-xl border border-slate-800 bg-slate-950 sm:h-64"
-        role="img"
-        aria-label={summary}
-        preserveAspectRatio="none"
-      >
-        {gridlines.map((fraction) => (
-          <line
-            key={`h-${fraction}`}
-            x1={0}
-            y1={PLOT_HEIGHT * fraction}
-            x2={PLOT_WIDTH}
-            y2={PLOT_HEIGHT * fraction}
-            stroke="#1e293b"
-            strokeWidth={1}
-            vectorEffect="non-scaling-stroke"
-          />
-        ))}
-        {ticks.slice(1, -1).map((tick) => (
-          <line
-            key={`v-${tick.label}`}
-            x1={PLOT_WIDTH * tick.fraction}
-            y1={0}
-            x2={PLOT_WIDTH * tick.fraction}
-            y2={PLOT_HEIGHT}
-            stroke="#1e293b"
-            strokeWidth={1}
-            vectorEffect="non-scaling-stroke"
-          />
-        ))}
-        {paths.map((path) => (
-          <g key={path.name}>
-            <title>{path.name}</title>
-            <path d={path.area} fill={path.color} fillOpacity={0.32} />
-            <path d={path.line} fill="none" stroke={path.color} strokeWidth={1.5} vectorEffect="non-scaling-stroke" />
-          </g>
-        ))}
-      </svg>
-      <div className="mt-1 flex justify-between text-[11px] tabular-nums text-slate-500" aria-hidden="true">
-        {ticks.map((tick) => <span key={tick.label}>{tick.label}</span>)}
+      <div className="relative min-w-0">
+        <svg
+          viewBox={`0 0 ${PLOT_WIDTH} ${PLOT_HEIGHT}`}
+          // Stretched to the container rather than letter-boxed: a day-long time
+          // series is read left to right, and a fixed aspect ratio would leave it
+          // an inch tall on a phone. Every stroke below carries
+          // `vector-effect="non-scaling-stroke"` so the distortion never reaches
+          // a line weight.
+          className="h-48 w-full rounded-xl border border-slate-800 bg-slate-950 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cyan-600 sm:h-64"
+          role="img"
+          aria-label={summary}
+          preserveAspectRatio="none"
+          tabIndex={0}
+          onPointerMove={track}
+          onPointerDown={track}
+          onPointerLeave={() => setPointed(null)}
+          onBlur={() => setPointed(null)}
+          onKeyDown={step}
+        >
+          <defs>
+            {paths.map((path, index) => (
+              <linearGradient key={path.name} id={`${gradientPrefix}-${index}`} x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stopColor={path.color} stopOpacity={0.5} />
+                <stop offset="100%" stopColor={path.color} stopOpacity={0.06} />
+              </linearGradient>
+            ))}
+          </defs>
+          {valueTicks.map((tick) => (
+            <line
+              key={`value-${tick.fraction}`}
+              x1={0}
+              y1={PLOT_HEIGHT * tick.fraction}
+              x2={PLOT_WIDTH}
+              y2={PLOT_HEIGHT * tick.fraction}
+              stroke="#1e293b"
+              strokeWidth={1}
+              vectorEffect="non-scaling-stroke"
+            />
+          ))}
+          {hourTicks.slice(1, -1).map((tick) => (
+            <line
+              key={`hour-${tick.label}`}
+              x1={PLOT_WIDTH * tick.fraction}
+              y1={0}
+              x2={PLOT_WIDTH * tick.fraction}
+              y2={PLOT_HEIGHT}
+              stroke="#172033"
+              strokeWidth={1}
+              vectorEffect="non-scaling-stroke"
+            />
+          ))}
+          {paths.map((path, index) => (
+            <g key={path.name}>
+              <title>{path.name}</title>
+              <path d={path.area} fill={`url(#${gradientPrefix}-${index})`} />
+              <path
+                d={path.line}
+                fill="none"
+                stroke={path.color}
+                strokeWidth={1.5}
+                strokeLinejoin="round"
+                strokeLinecap="round"
+                vectorEffect="non-scaling-stroke"
+              />
+            </g>
+          ))}
+          {cursorX !== null && (
+            <line
+              x1={cursorX}
+              y1={0}
+              x2={cursorX}
+              y2={PLOT_HEIGHT}
+              stroke="#94a3b8"
+              strokeWidth={1}
+              strokeDasharray="4 4"
+              vectorEffect="non-scaling-stroke"
+            />
+          )}
+        </svg>
+        <div className="pointer-events-none absolute inset-y-0 left-0 flex flex-col justify-between py-1.5 pl-2 text-[10px] font-medium tabular-nums text-slate-500" aria-hidden="true">
+          {valueTicks.map((tick) => <span key={tick.fraction}>{tick.label}</span>)}
+        </div>
       </div>
-      <figcaption className="mt-2 flex flex-wrap gap-x-3 gap-y-1.5">
+
+      <div className="relative mt-1.5 h-4" aria-hidden="true">
+        {hourTicks.map((tick) => (
+          <span
+            key={tick.label}
+            className={`absolute top-0 text-[11px] tabular-nums text-slate-400 ${
+              tick.fraction === 0 ? "" : tick.fraction === 1 ? "-translate-x-full" : "-translate-x-1/2"
+            }`}
+            style={{ left: `${tick.fraction * 100}%` }}
+          >
+            {tick.label}
+          </span>
+        ))}
+      </div>
+
+      {readout && <ColumnReadoutStrip readout={readout} minutes={chart.columnMinutes} pointing={pointed !== null} />}
+
+      <figcaption className="mt-3 grid gap-x-4 gap-y-1 sm:grid-cols-2 lg:grid-cols-3">
         {chart.bands.map((band) => (
-          <span key={band.name} className="inline-flex min-w-0 items-center gap-1.5 text-[11px] text-slate-600">
+          <span key={band.name} className="flex min-w-0 items-center gap-2 text-[11px] text-slate-600">
             <span className="h-2 w-2 shrink-0 rounded-full" style={{ backgroundColor: band.color }} aria-hidden="true" />
-            <span className="truncate font-medium text-slate-700" title={band.name}>{band.name}</span>
-            <span className="tabular-nums text-slate-400">{band.total.toLocaleString()}</span>
+            <span className="min-w-0 flex-1 truncate font-medium text-slate-700" title={band.name}>{band.name}</span>
+            <span className="shrink-0 tabular-nums text-slate-500">{band.total.toLocaleString()}</span>
           </span>
         ))}
       </figcaption>
     </figure>
+  );
+}
+
+/**
+ * One column, in numbers.
+ *
+ * It rests on the busiest ten minutes of the day rather than sitting blank
+ * until someone hovers, so it is never an empty strip under a full chart, and
+ * on a touch screen it still answers the question without a pointer.
+ */
+function ColumnReadoutStrip({
+  readout,
+  minutes,
+  pointing,
+}: {
+  readout: ColumnReadout;
+  minutes: number;
+  pointing: boolean;
+}) {
+  return (
+    <div className="mt-3 min-w-0 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2" aria-live="off">
+      <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
+        <span className="text-xs font-semibold text-slate-800">
+          {pointing ? readout.window : `Busiest ${minutes} minutes: ${readout.window}`}
+        </span>
+        <span className="text-xs tabular-nums text-slate-600">{readout.total.toLocaleString()} events</span>
+      </div>
+      <div className="mt-1.5 flex flex-wrap gap-x-3 gap-y-1">
+        {readout.entries.map((entry) => (
+          <span key={entry.name} className="inline-flex min-w-0 max-w-full items-center gap-1.5 text-[11px] text-slate-600">
+            <span className="h-1.5 w-1.5 shrink-0 rounded-full" style={{ backgroundColor: entry.color }} aria-hidden="true" />
+            <span className="truncate" title={entry.name}>{entry.name}</span>
+            <span className="shrink-0 tabular-nums text-slate-500">{entry.value.toLocaleString()}</span>
+          </span>
+        ))}
+      </div>
+    </div>
   );
 }
 

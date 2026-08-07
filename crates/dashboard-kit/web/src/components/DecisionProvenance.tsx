@@ -11,13 +11,12 @@ export function DecisionProvenance({ events, feedback }: { events: CaseEvent[]; 
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
           <p className="text-xs font-semibold uppercase tracking-[0.14em] text-cyan-700">Decision record</p>
-          <h2 id="decision-provenance-title" className="mt-1 text-base font-semibold text-slate-950">Authority and provenance</h2>
+          <h2 id="decision-provenance-title" className="mt-1 text-base font-semibold text-slate-950">Who decided what</h2>
         </div>
-        <p className="max-w-md text-xs leading-5 text-slate-500">Recommendations, effective decisions and operator actions remain separate from enforcement and verified outcomes.</p>
       </div>
 
       {decisions.length === 0 ? (
-        <div className="mt-4 rounded-xl border border-dashed border-slate-300 px-4 py-5 text-sm text-slate-600">No decision authority was reported. Decision provenance remains unknown.</div>
+        <div className="mt-4 rounded-xl border border-dashed border-slate-300 px-4 py-5 text-sm text-slate-600">Nobody and nothing is recorded as having decided anything about this case.</div>
       ) : (
         <div className="mt-4 space-y-3">
           {decisions.map((event) => {
@@ -35,17 +34,26 @@ export function DecisionProvenance({ events, feedback }: { events: CaseEvent[]; 
                   <StatusBadge status={uncertain ? "unknown" : "available"} label={uncertain ? "Uncertainty present" : "Current source record"} />
                 </div>
                 <p className="mt-3 whitespace-pre-wrap break-words text-sm leading-6 text-slate-700 [overflow-wrap:anywhere]">{event.summary}</p>
-                <div className="mt-3 grid gap-2 sm:grid-cols-2">
-                  <ProvenanceFact label="Versions" value={versions(event)} />
-                  <ProvenanceFact label="Fallback" value={fallback.length > 0 ? fallback.map((entry) => entry.source.id).join(", ") : "Not reported"} />
-                  <ProvenanceFact label="Relationship" value={event.relationship.replaceAll("_", " ")} />
-                  <ProvenanceFact label="Uncertainty" value={uncertainty(event)} />
-                </div>
-                {event.source_refs.some((entry) => entry.source.limitations.length > 0) && (
-                  <div className="mt-3 rounded-lg bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-900">
-                    <strong>Source limitations:</strong> {event.source_refs.flatMap((entry) => entry.source.limitations).join(" · ")}
+                {/* Four cells of source bookkeeping used to render under every
+                    decision on every case: versions, fallback ids, the
+                    relationship word the badge already carries, and a
+                    semicolon-joined uncertainty string. The badge above says
+                    whether there IS uncertainty, which is the part an operator
+                    reads; the rest is one click away for whoever needs it. */}
+                <details className="mt-3">
+                  <summary className="cursor-pointer text-xs font-medium text-slate-500 hover:text-slate-700">Where this came from</summary>
+                  <div className="mt-2 grid gap-2 sm:grid-cols-2">
+                    <ProvenanceFact label="Versions" value={versions(event)} />
+                    <ProvenanceFact label="Fallback" value={fallback.length > 0 ? fallback.map((entry) => entry.source.id).join(", ") : "Not reported"} />
+                    <ProvenanceFact label="Relationship" value={event.relationship.replaceAll("_", " ")} />
+                    <ProvenanceFact label="Uncertainty" value={uncertainty(event)} />
                   </div>
-                )}
+                  {event.source_refs.some((entry) => entry.source.limitations.length > 0) && (
+                    <p className="mt-2 rounded-lg bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-900">
+                      <strong>Source limitations:</strong> {event.source_refs.flatMap((entry) => entry.source.limitations).join(" · ")}
+                    </p>
+                  )}
+                </details>
                 <EvidenceLinks evidence={event.source_refs} />
               </article>
             );
@@ -56,11 +64,14 @@ export function DecisionProvenance({ events, feedback }: { events: CaseEvent[]; 
       <div className="mt-5 border-t border-slate-200 pt-5">
         <div className="flex flex-wrap items-start justify-between gap-2">
           <h3 className="font-semibold text-slate-950">Analyst feedback</h3>
-          <StatusBadge status="observed_only" label="Read-only projection" />
+          <StatusBadge status="observed_only" label="Read only" />
         </div>
-        <p className="mt-1 text-xs leading-5 text-slate-500">This view does not create allowlists or policy changes. Feedback writes remain unavailable until the reviewed action API exists.</p>
+        {/* Was: "Feedback writes remain unavailable until the reviewed action
+            API exists." Our roadmap is not the user's business; what it means
+            for them is that reading this screen changes nothing. */}
+        <p className="mt-1 text-xs leading-5 text-slate-500">Nothing on this screen changes a rule, an allowlist or a policy.</p>
         {feedback.length === 0 ? (
-          <p className="mt-3 rounded-lg bg-slate-50 px-3 py-3 text-sm text-slate-600">No actor-attributed feedback was reported.</p>
+          <p className="mt-3 rounded-lg bg-slate-50 px-3 py-3 text-sm text-slate-600">No analyst has left a note on this case.</p>
         ) : (
           <ul className="mt-3 space-y-2">
             {feedback.map((record) => (

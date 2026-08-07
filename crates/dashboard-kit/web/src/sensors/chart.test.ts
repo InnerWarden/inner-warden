@@ -6,8 +6,13 @@ import {
   OTHER_BAND,
   bucketMinute,
   buildSensorChart,
+  busiestColumn,
   chartHourTicks,
   chartSummary,
+  chartValueTicks,
+  columnAtFraction,
+  columnReadout,
+  columnWindowLabel,
   stackedBandPaths,
 } from "./chart";
 import type { EventTimeline } from "../api/sensors";
@@ -159,5 +164,96 @@ describe("chart axis and caption", () => {
     const summary = chartSummary(buildSensorChart({ "05:00": { ebpf: 30 } }));
     expect(summary).toContain(`per ${DEFAULT_COLUMN_MINUTES}-minute column`);
     expect(summary).toContain("30 events today");
+  });
+});
+
+/**
+ * The readable half. None of it touches the numbers: a labelled axis, a window
+ * in words and a per-column breakdown all read the same series the stack draws.
+ */
+describe("chart readability", () => {
+  it("labels the vertical axis with real values, from the peak down to zero", () => {
+    const ticks = chartValueTicks(buildSensorChart({ "05:00": { ebpf: 30 }, "06:00": { ebpf: 10 } }));
+    expect(ticks.map((tick) => tick.label)).toEqual(["30", "15", "0"]);
+    expect(ticks.map((tick) => tick.fraction)).toEqual([0, 0.5, 1]);
+  });
+
+  it("labels nothing when there is nothing to scale", () => {
+    expect(chartValueTicks(buildSensorChart({}))).toEqual([]);
+    expect(chartValueTicks(buildSensorChart({ "04:00": { ebpf: 0 } }))).toEqual([]);
+  });
+
+  /**
+   * The y axis is per COLUMN. A reader who assumes per minute is off by the
+   * column width, so the window a column covers is spelled out rather than
+   * inferred from a tick.
+   */
+  it("names the window a column covers", () => {
+    const chart = buildSensorChart({ "14:23": { ebpf: 4 } });
+    expect(columnWindowLabel(chart, 0)).toBe("00:00 to 00:10");
+    expect(columnWindowLabel(chart, 86)).toBe("14:20 to 14:30");
+    expect(columnWindowLabel(chart, chart.columns - 1)).toBe("23:50 to 24:00");
+  });
+
+  it("maps a horizontal position to a column and refuses one off the plot", () => {
+    const chart = buildSensorChart({ "12:00": { ebpf: 1 } });
+    expect(columnAtFraction(chart, 0)).toBe(0);
+    expect(columnAtFraction(chart, 1)).toBe(chart.columns - 1);
+    expect(columnAtFraction(chart, -0.01)).toBeNull();
+    expect(columnAtFraction(chart, 1.01)).toBeNull();
+    expect(columnAtFraction(chart, Number.NaN)).toBeNull();
+    expect(columnAtFraction(buildSensorChart({}), 0.5)).toBeNull();
+  });
+
+  it("reads one column back as its real totals, largest band first", () => {
+    const chart = buildSensorChart({ "08:00": { auditd: 10, ebpf: 90 }, "08:05": { journald: 5 }, "20:00": { ebpf: 1 } });
+    const readout = columnReadout(chart, 48);
+    expect(readout).not.toBeNull();
+    expect(readout?.window).toBe("08:00 to 08:10");
+    expect(readout?.total).toBe(105);
+    expect(readout?.entries.map((entry) => [entry.name, entry.value])).toEqual([["ebpf", 90], ["auditd", 10], ["journald", 5]]);
+  });
+
+  it("omits bands that contributed nothing to the column rather than listing zeroes", () => {
+    const chart = buildSensorChart({ "08:00": { auditd: 10 }, "20:00": { ebpf: 4 } });
+    expect(columnReadout(chart, 48)?.entries.map((entry) => entry.name)).toEqual(["auditd"]);
+    expect(columnReadout(chart, 120)?.entries.map((entry) => entry.name)).toEqual(["ebpf"]);
+  });
+
+  it("has no readout for a column that does not exist or a chart with no data", () => {
+    const chart = buildSensorChart({ "08:00": { auditd: 1 } });
+    expect(columnReadout(chart, null)).toBeNull();
+    expect(columnReadout(chart, -1)).toBeNull();
+    expect(columnReadout(chart, chart.columns)).toBeNull();
+    expect(columnReadout(chart, 1.5)).toBeNull();
+    expect(columnReadout(buildSensorChart({}), 0)).toBeNull();
+  });
+
+  /**
+   * The strip under the chart rests here, so it is never a blank box on load
+   * and answers without a pointer on a touch screen.
+   */
+  it("rests on the busiest column, and on none at all when the day was silent", () => {
+    const chart = buildSensorChart({ "01:00": { ebpf: 5 }, "14:20": { ebpf: 400 }, "22:00": { ebpf: 9 } });
+    expect(busiestColumn(chart)).toBe(86);
+    expect(columnReadout(chart, busiestColumn(chart))?.total).toBe(400);
+    expect(busiestColumn(buildSensorChart({}))).toBeNull();
+    expect(busiestColumn(buildSensorChart({ "04:00": { ebpf: 0 } }))).toBeNull();
+  });
+
+  /**
+   * HONESTY ANCHOR. The prettier chart must not smooth anything: a single busy
+   * ten minutes has to stay a single busy ten minutes, with zero on both sides,
+   * and the tail aggregate keeps its own name.
+   */
+  it("keeps a lone spike a lone spike, and the tail an honest band", () => {
+    const sources: Record<string, number> = { loud: 500 };
+    for (let index = 0; index < 9; index += 1) sources[`quiet_${index}`] = 1;
+    const chart = buildSensorChart({ "14:20": sources }, { maxBands: 2 });
+    const spike = columnReadout(chart, 86);
+    expect(spike?.total).toBe(509);
+    expect(spike?.entries.map((entry) => entry.name)).toEqual(["loud", OTHER_BAND, "quiet_0"]);
+    expect(columnReadout(chart, 85)).toEqual({ column: 85, window: "14:10 to 14:20", total: 0, entries: [] });
+    expect(columnReadout(chart, 87)?.total).toBe(0);
   });
 });

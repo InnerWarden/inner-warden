@@ -32,7 +32,7 @@ export function Activity({ initialTarget }: { initialTarget?: ActivityTarget }) 
   const [page, setPage] = useState<CasesPage>();
   const [error, setError] = useState<string>();
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set());
-  const [detail, setDetail] = useState<ActionView>();
+  const [detail, setDetail] = useState<{ action: ActionView; session: string }>();
   const [fetching, setFetching] = useState(true);
   const [refreshKey, setRefreshKey] = useState(0);
   const targetHandled = useRef(false);
@@ -85,11 +85,13 @@ export function Activity({ initialTarget }: { initialTarget?: ActivityTarget }) 
 
   useEffect(() => {
     if (!page || !initialTarget || targetHandled.current) return;
-    const actions = page.sessions.flatMap((session) => session.items);
-    const match = actions.find((action) =>
-      initialTarget.id ? action.id === initialTarget.id : initialTarget.action ? action.command === initialTarget.action : false,
-    );
-    if (match) setDetail(match);
+    const matches = (action: ActionView) =>
+      initialTarget.id ? action.id === initialTarget.id : initialTarget.action ? action.command === initialTarget.action : false;
+    // The owning session travels with the action, because "where did this come
+    // from" is one of the questions the detail dialog now answers.
+    const owner = page.sessions.find((session) => session.items.some(matches));
+    const match = owner?.items.find(matches);
+    if (owner && match) setDetail({ action: match, session: owner.label });
     targetHandled.current = true;
   }, [page, initialTarget]);
 
@@ -223,7 +225,7 @@ export function Activity({ initialTarget }: { initialTarget?: ActivityTarget }) 
               setFocus(session.label);
               setOffset(0);
             }}
-            onPick={setDetail}
+            onPick={(action) => setDetail({ action, session: session.label })}
           />
         ))}
       </div>
@@ -252,7 +254,7 @@ export function Activity({ initialTarget }: { initialTarget?: ActivityTarget }) 
         </nav>
       )}
 
-      {detail && <Detail action={detail} onClose={closeDetail} fallbackFocus={focusActivityTitle} />}
+      {detail && <Detail action={detail.action} session={detail.session} onClose={closeDetail} fallbackFocus={focusActivityTitle} />}
     </div>
   );
 }
