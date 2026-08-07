@@ -14,7 +14,7 @@ test.describe("CJC-090-J011 corrupt local graph behavior", () => {
 
   test("projects corrupt overview and activity sources as unavailable, never healthy zero data", async ({ page }) => {
     await installMachineDefaults(page);
-    await page.route("**/api/overview", (route) => fulfillJson(route, { error: "graph_corrupt" }, 503));
+    await page.route("**/api/guard/overview", (route) => fulfillJson(route, { error: "graph_corrupt" }, 503));
     await page.route("**/api/cases**", (route) => fulfillJson(route, { error: "graph_corrupt" }, 503));
     await page.goto("/");
 

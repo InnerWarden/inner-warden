@@ -5,6 +5,8 @@ import {
   IDENTITY_TOOLTIP,
   LIVE_OBSERVATION_MAX_AGE_SECS,
   agentDisplay,
+  agentsCardSpanClass,
+  agentsGridClass,
   discoveryFootnote,
   guardrailObservation,
   guardrailStatusLine,
@@ -150,5 +152,50 @@ describe("the empty state names the next step", () => {
     // Verified against the shipped CLI: `innerwarden agents connect` is the
     // real verb (crates/cli/src/main.rs suggests it verbatim).
     expect(EMPTY_STATE.command).toBe("innerwarden agents connect");
+  });
+});
+
+/**
+ * The half empty box. One agent used to take exactly half the page under a flat
+ * `lg:grid-cols-2`, leaving a card-sized hole beside it; three agents left the
+ * same hole beside the third. The grid now asks for no more columns than it has
+ * cards, and a trailing card in an odd row widens to close the gap.
+ */
+describe("the agent grid fills the row it is given", () => {
+  it("gives a single agent the whole width", () => {
+    expect(agentsGridClass(1)).toBe("grid gap-4");
+    expect(agentsCardSpanClass(0, 1)).toBe("");
+  });
+
+  it("splits the row between two agents", () => {
+    expect(agentsGridClass(2)).toBe("grid gap-4 lg:grid-cols-2");
+    expect(agentsCardSpanClass(0, 2)).toBe("");
+    expect(agentsCardSpanClass(1, 2)).toBe("");
+  });
+
+  it("widens the trailing card at every odd count so no cell is left empty", () => {
+    for (const count of [3, 5, 7, 9]) {
+      expect(agentsGridClass(count)).toBe("grid gap-4 lg:grid-cols-2");
+      expect(agentsCardSpanClass(count - 1, count)).toBe("lg:col-span-2");
+      for (let index = 0; index < count - 1; index += 1) expect(agentsCardSpanClass(index, count)).toBe("");
+    }
+  });
+
+  it("leaves even counts alone, because they already fill both columns", () => {
+    for (const count of [2, 4, 6, 12]) {
+      for (let index = 0; index < count; index += 1) expect(agentsCardSpanClass(index, count)).toBe("");
+    }
+  });
+
+  it("is one column below the lg breakpoint at every count from 1 to 6", () => {
+    for (const count of [1, 2, 3, 4, 5, 6]) {
+      for (const token of agentsGridClass(count).split(" ")) {
+        expect(token === "grid" || token === "gap-4" || token.startsWith("lg:")).toBe(true);
+      }
+      for (let index = 0; index < count; index += 1) {
+        const span = agentsCardSpanClass(index, count);
+        if (span !== "") expect(span.startsWith("lg:")).toBe(true);
+      }
+    }
   });
 });

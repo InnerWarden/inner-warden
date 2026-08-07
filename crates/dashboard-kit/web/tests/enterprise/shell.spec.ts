@@ -197,9 +197,9 @@ test("unsupported Enterprise capability stays visible without equivalent-protect
 test("adapter-absent Enterprise shell does not fall back to legacy or Community content", async ({ page }) => {
   await page.goto("/");
 
-  await expect(page.getByRole("heading", { name: "Enterprise posture adapter not declared" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Enterprise posture is not part of this installation" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Posture" })).toHaveCount(0);
-  await expect(page.getByText("Community Edition", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("What Community includes", { exact: true })).toHaveCount(0);
   await expect(page.getByText("No layers reported", { exact: true })).toHaveCount(0);
 });
 

@@ -534,13 +534,21 @@ function EnterpriseSessionStatus({ resource }: { resource: DashboardResource<Das
 }
 
 function BootstrapContractStatus({ resource }: { resource: DashboardResource<DashboardBootstrap> }) {
-  if (resource.state === "authentication_required") return <StatusBadge status="unavailable" label="Authentication required" />;
-  if (resource.state === "forbidden") return <StatusBadge status="unavailable" label="Dashboard scope forbidden" />;
-  if (resource.state === "error") return <StatusBadge status="failed" label="Contract invalid" />;
-  if (resource.state === "unavailable" || resource.state === "unsupported") return <StatusBadge status={resource.state} label="v1 adapter unavailable" />;
-  return <StatusBadge status="loading" label="Loading contract" />;
+  if (resource.state === "authentication_required") return <StatusBadge status="unavailable" label="Sign in required" />;
+  if (resource.state === "forbidden") return <StatusBadge status="unavailable" label="Not allowed for this session" />;
+  if (resource.state === "error") return <StatusBadge status="failed" label="Unreadable reply" />;
+  if (resource.state === "unavailable" || resource.state === "unsupported") return <StatusBadge status={resource.state} label="Host not answering" />;
+  return <StatusBadge status="loading" label="Connecting" />;
 }
 
+/**
+ * The very first thing a user can see, so it is written for them.
+ *
+ * It used to say the dashboard was "resolving a validated dashboard v1
+ * bootstrap before mounting an edition-specific surface". Every word of that is
+ * accurate and none of it belongs on a screen whose only job, at that instant,
+ * is to say whether the thing is working.
+ */
 function DashboardContractState({ resource }: { resource: DashboardResource<DashboardBootstrap> }) {
   const loading = resource.state === "loading" || resource.state === "idle";
   const auth = resource.state === "authentication_required";
@@ -548,14 +556,14 @@ function DashboardContractState({ resource }: { resource: DashboardResource<Dash
     <section className="rounded-2xl border border-slate-200 bg-white px-6 py-14 text-center shadow-sm" role={auth ? "alert" : "status"}>
       <div className="flex justify-center"><StatusBadge status={loading ? "loading" : auth ? "unavailable" : "failed"} /></div>
       <h1 className="mt-4 text-xl font-semibold text-slate-950">
-        {loading ? "Loading dashboard contract" : auth ? "Enterprise authentication required" : "Dashboard contract unavailable"}
+        {loading ? "Connecting to InnerWarden on this machine" : auth ? "Sign in to continue" : "InnerWarden is not answering"}
       </h1>
       <p className="mx-auto mt-2 max-w-xl text-sm leading-6 text-slate-600">
         {loading
-          ? "Resolving a validated dashboard v1 bootstrap before mounting an edition-specific surface."
+          ? "Asking the local process which edition is running before showing anything."
           : auth
-            ? "Authenticate through the serving Active Defence endpoint. No Enterprise data is mounted before that boundary succeeds."
-            : "The dashboard could not validate the same-origin v1 bootstrap. No edition, capability or protection state is inferred."}
+            ? "Sign in through Active Defence on this host. Nothing is shown until that succeeds."
+            : "The local process did not answer, or answered with something this dashboard cannot read. Check that InnerWarden is running, then reload. Nothing about your protection is assumed in the meantime."}
       </p>
     </section>
   );

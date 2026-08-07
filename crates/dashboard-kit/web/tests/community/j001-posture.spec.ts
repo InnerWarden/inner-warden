@@ -10,13 +10,13 @@ test.describe("CJC-090-J001 Community shell and posture", () => {
       if (request.resourceType() === "document") documentRequests += 1;
     });
 
-    await page.route("**/api/meta", (route) => fulfillJson(route, {
+    await page.route("**/api/guard/meta", (route) => fulfillJson(route, {
       version: "0.16.4-fixture",
       exposed: false,
       edition: "community",
       guardrail: { mode: "monitor", guarded_agents: 2 },
     }));
-    await page.route("**/api/overview", async (route) => {
+    await page.route("**/api/guard/overview", async (route) => {
       await overviewReady;
       await fulfillJson(route, EMPTY_OVERVIEW);
     });
@@ -44,7 +44,7 @@ test.describe("CJC-090-J001 Community shell and posture", () => {
   test("withdraws stale posture claims and restores them only after a fresh response", async ({ page }) => {
     let metaRequests = 0;
     await page.clock.install();
-    await page.route("**/api/meta", async (route) => {
+    await page.route("**/api/guard/meta", async (route) => {
       metaRequests += 1;
       if (metaRequests === 2) {
         await fulfillJson(route, { error: "fixture_refresh_failed" }, 503);
@@ -57,7 +57,7 @@ test.describe("CJC-090-J001 Community shell and posture", () => {
         guardrail: { mode: "enforce", guarded_agents: 1 },
       });
     });
-    await page.route("**/api/overview", (route) => fulfillJson(route, EMPTY_OVERVIEW));
+    await page.route("**/api/guard/overview", (route) => fulfillJson(route, EMPTY_OVERVIEW));
     await installMachineDefaults(page);
 
     await page.goto("/");
@@ -74,12 +74,12 @@ test.describe("CJC-090-J001 Community shell and posture", () => {
   });
 
   test("does not infer a safe local endpoint when exposure evidence is absent", async ({ page }) => {
-    await page.route("**/api/meta", (route) => fulfillJson(route, {
+    await page.route("**/api/guard/meta", (route) => fulfillJson(route, {
       version: "0.16.4-fixture",
       edition: "community",
       guardrail: { mode: "unknown" },
     }));
-    await page.route("**/api/overview", (route) => fulfillJson(route, EMPTY_OVERVIEW));
+    await page.route("**/api/guard/overview", (route) => fulfillJson(route, EMPTY_OVERVIEW));
     await installMachineDefaults(page);
     await page.goto("/");
 

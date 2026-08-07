@@ -35,20 +35,20 @@ export function CaseTimeline({ events }: { events: CaseEvent[] }) {
       <section aria-labelledby="case-timeline-title" className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
         <h2 id="case-timeline-title" className="text-base font-semibold text-slate-950">Evidence timeline</h2>
         <div className="mt-4 rounded-xl border border-dashed border-slate-300 px-4 py-6 text-sm text-slate-600">
-          No timeline events were reported. Intent, decision, enforcement and outcome remain unknown.
+          Nothing was recorded for this case, so when it happened, what decided it and what the system did are all unknown.
         </div>
       </section>
     );
   }
 
+  const legend = relationshipLegend(events);
   return (
     <section aria-labelledby="case-timeline-title" className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
-          <p className="text-xs font-semibold uppercase tracking-[0.14em] text-cyan-700">Ordered evidence</p>
+          <p className="text-xs font-semibold uppercase tracking-[0.14em] text-cyan-700">When it happened</p>
           <h2 id="case-timeline-title" className="mt-1 text-base font-semibold text-slate-950">Evidence timeline</h2>
         </div>
-        <p className="max-w-md text-xs leading-5 text-slate-500">Events remain separately typed. Their order does not make a contextual relationship causal.</p>
       </div>
       <ol className="mt-5 space-y-0">
         {events.map((event, index) => (
@@ -70,19 +70,53 @@ export function CaseTimeline({ events }: { events: CaseEvent[] }) {
                 </div>
               </div>
               <p className="mt-3 whitespace-pre-wrap break-words text-sm leading-6 text-slate-800 [overflow-wrap:anywhere]">{event.summary}</p>
-              {event.relationship === "contextual" && <p className="mt-3 rounded-lg bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-900">Context only: this record does not establish causation.</p>}
-              {event.relationship === "unknown" && <p className="mt-3 rounded-lg bg-slate-100 px-3 py-2 text-xs leading-5 text-slate-700">The relationship to adjacent events is unknown.</p>}
+              {/* The two coloured boxes that used to live here repeated, word
+                  for word, what the badge above already says, on every
+                  contextual and every unknown event in the case. One legend
+                  under the list says it once. */}
               <dl className="mt-3 grid gap-2 border-t border-slate-200 pt-3 text-xs sm:grid-cols-2">
-                <div><dt className="text-slate-500">Authority</dt><dd className="mt-0.5 break-words font-medium text-slate-800 [overflow-wrap:anywhere]">{event.authority ?? "Unknown"}</dd></div>
-                <div><dt className="text-slate-500">Recorded</dt><dd className="mt-0.5 font-medium text-slate-800"><time dateTime={event.recorded_at}>{formatTime(event.recorded_at)}</time></dd></div>
+                <div><dt className="text-slate-500">Decided by</dt><dd className="mt-0.5 break-words font-medium text-slate-800 [overflow-wrap:anywhere]">{event.authority ?? "Unknown"}</dd></div>
+                {/* The moment it was WRITTEN DOWN is bookkeeping except in the
+                    one case where it disagrees with the moment it happened,
+                    which is a real fact about a lagging source. */}
+                {recordingLag(event) && (
+                  <div><dt className="text-slate-500">Written down</dt><dd className="mt-0.5 font-medium text-slate-800"><time dateTime={event.recorded_at}>{formatTime(event.recorded_at)}</time></dd></div>
+                )}
               </dl>
               <EvidenceLinks evidence={event.source_refs} />
             </article>
           </li>
         ))}
       </ol>
+      {legend.length > 0 && (
+        <div className="mt-4 space-y-1 border-t border-slate-100 pt-3">
+          {legend.map((line) => <p key={line} className="text-xs leading-5 text-slate-500">{line}</p>)}
+        </div>
+      )}
     </section>
   );
+}
+
+/** True when a source wrote an event down later than it observed it. */
+export function recordingLag(event: Pick<CaseEvent, "observed_at" | "recorded_at">): boolean {
+  return event.recorded_at !== event.observed_at;
+}
+
+/**
+ * What the relationship badges mean, said once for the whole list.
+ *
+ * Only the meanings actually present are printed, so a case whose every event
+ * is causal carries no legend at all. The old rendering put the same amber
+ * paragraph inside every contextual event, which on a busy case was the same
+ * sentence five or six times down one column.
+ */
+export function relationshipLegend(events: Pick<CaseEvent, "relationship">[]): string[] {
+  const present = new Set(events.map((event) => event.relationship));
+  const lines: string[] = [];
+  if (present.has("contextual")) lines.push("Contextual: recorded around the same time. That is not proof it is part of the same act.");
+  if (present.has("unknown")) lines.push("Unknown relationship: how this event relates to the ones next to it was not established.");
+  if (lines.length > 0) lines.push("Order here is chronological, and chronological order alone never makes one event the cause of the next.");
+  return lines;
 }
 
 export function EvidenceLinks({ evidence }: { evidence: CaseEvent["source_refs"] }) {

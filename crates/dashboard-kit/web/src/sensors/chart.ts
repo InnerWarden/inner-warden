@@ -231,6 +231,108 @@ export function chartHourTicks(everyHours = 3): { label: string; fraction: numbe
 }
 
 /**
+ * Value marks for the vertical axis, from the peak down to zero.
+ *
+ * The old plot had three unlabelled rules across it, which told a reader that
+ * the chart had a scale without telling them what it was: a spike could be
+ * eleven events or eleven thousand. The numbers are the real ones off the
+ * stack, rounded nowhere, so a tick is a value that actually occurred on the
+ * axis rather than a pleasant round number the data never reached.
+ */
+export function chartValueTicks(chart: SensorChart): { value: number; fraction: number; label: string }[] {
+  if (chart.empty || chart.peak <= 0) return [];
+  return [1, 0.5, 0].map((share) => {
+    const value = chart.peak * share;
+    return {
+      value,
+      // Fraction DOWN from the top, which is how an SVG y coordinate reads.
+      fraction: 1 - share,
+      label: Math.round(value).toLocaleString(),
+    };
+  });
+}
+
+/** The half-open minute window a column covers, as `HH:MM`. */
+function clockAt(minuteOfDay: number): string {
+  const clamped = Math.max(0, Math.min(MINUTES_IN_DAY, Math.round(minuteOfDay)));
+  return `${String(Math.floor(clamped / 60)).padStart(2, "0")}:${String(clamped % 60).padStart(2, "0")}`;
+}
+
+/**
+ * The time window one column covers, in words.
+ *
+ * Spelled out rather than left to the reader because the columns aggregate: a
+ * point on this chart is ten minutes of a host's life, and a reader who assumes
+ * one minute is off by a factor of ten in the one direction that matters.
+ */
+export function columnWindowLabel(chart: SensorChart, column: number): string {
+  const start = column * chart.columnMinutes;
+  return `${clockAt(start)} to ${clockAt(start + chart.columnMinutes)}`;
+}
+
+/** Which column a horizontal position falls in, or `null` when off the plot. */
+export function columnAtFraction(chart: SensorChart, fraction: number): number | null {
+  if (chart.empty || chart.columns <= 0) return null;
+  if (!Number.isFinite(fraction) || fraction < 0 || fraction > 1) return null;
+  return Math.min(chart.columns - 1, Math.max(0, Math.round(fraction * (chart.columns - 1))));
+}
+
+export type ColumnReadout = {
+  column: number;
+  window: string;
+  total: number;
+  /** Only the bands that actually contributed, largest first. */
+  entries: { name: string; color: string; value: number }[];
+};
+
+/**
+ * What one column of the stack contains.
+ *
+ * A stacked area chart is readable as a shape and unreadable as a number: the
+ * whole point of hovering is to turn "that spike is tall" into "auditd produced
+ * 4,102 events between 14:20 and 14:30". Bands that contributed nothing to the
+ * column are dropped rather than listed as zero, so the readout is as short as
+ * the moment it describes.
+ */
+export function columnReadout(chart: SensorChart, column: number | null): ColumnReadout | null {
+  if (column === null || chart.empty) return null;
+  if (!Number.isInteger(column) || column < 0 || column >= chart.columns) return null;
+  const entries = chart.bands
+    .map((band) => ({ name: band.name, color: band.color, value: band.values[column] ?? 0 }))
+    .filter((entry) => entry.value > 0)
+    .sort((left, right) => right.value - left.value || left.name.localeCompare(right.name));
+  return {
+    column,
+    window: columnWindowLabel(chart, column),
+    total: entries.reduce((sum, entry) => sum + entry.value, 0),
+    entries,
+  };
+}
+
+/**
+ * The column the readout shows when nobody is pointing at one.
+ *
+ * A readout strip that is blank until hovered is a half empty box on every
+ * load, and on a touch screen it is a box that never fills. The busiest ten
+ * minutes of the day is both a real answer and the one an operator was going to
+ * hover for anyway.
+ */
+export function busiestColumn(chart: SensorChart): number | null {
+  if (chart.empty || chart.peak <= 0) return null;
+  let best: number | null = null;
+  let bestTotal = 0;
+  for (let index = 0; index < chart.columns; index += 1) {
+    let sum = 0;
+    for (const band of chart.bands) sum += band.values[index];
+    if (sum > bestTotal) {
+      bestTotal = sum;
+      best = index;
+    }
+  }
+  return best;
+}
+
+/**
  * What the chart is, in one sentence, for a screen reader and for the caption.
  *
  * The unit is spelled out because the y axis is per column, not per minute, and

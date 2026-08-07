@@ -1,3 +1,4 @@
+import { Fragment, type ReactElement } from "react";
 import type {
   AgentActivity,
   AiVerdict,
@@ -52,26 +53,72 @@ export function CaseEnrichmentView({ enrichment }: { enrichment: CaseEnrichment 
     );
   }
 
+  const reasoning: ReactElement[] = [];
+  if (enrichment.ai) reasoning.push(<AiVerdictSection key="ai" value={enrichment.ai} />);
+  if (enrichment.mitre?.length > 0 || enrichment.rules?.length > 0) {
+    reasoning.push(<RulesMitreSection key="rules" rules={enrichment.rules ?? []} mitre={enrichment.mitre ?? []} />);
+  }
+  const blocks: Record<EnrichmentBlock, ReactElement | null> = {
+    agent_activity: enrichment.agent_activity ? <AgentActivitySection value={enrichment.agent_activity} /> : null,
+    detection: enrichment.detection ? <DetectionSection value={enrichment.detection} /> : null,
+    threat_intel: enrichment.threat_intel ? <ThreatIntelSection value={enrichment.threat_intel} /> : null,
+    // One reasoning panel takes the whole row rather than half of it, which is
+    // the same half empty box the agent grid had.
+    reasoning: reasoning.length > 0
+      ? <div className={reasoning.length > 1 ? "grid min-w-0 gap-4 lg:grid-cols-2" : "grid min-w-0 gap-4"}>{reasoning}</div>
+      : null,
+    dns: enrichment.dns?.length > 0 ? <DnsSection value={enrichment.dns} /> : null,
+    honeypot: enrichment.honeypot ? <HoneypotSection value={enrichment.honeypot} /> : null,
+  };
+
   return (
     <section className="min-w-0 space-y-4" aria-label="Case context">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <p className={LABEL}>What happened</p>
-        <StatusBadge status="unknown" label="Producer-reported · not verified" />
-      </div>
-      {enrichment.agent_activity && <AgentActivitySection value={enrichment.agent_activity} />}
-      {enrichment.detection && <DetectionSection value={enrichment.detection} />}
-      <div className="grid min-w-0 gap-4 lg:grid-cols-2">
-        {enrichment.ai && <AiVerdictSection value={enrichment.ai} />}
-        {(enrichment.mitre?.length > 0 || enrichment.rules?.length > 0) && (
-          <RulesMitreSection rules={enrichment.rules ?? []} mitre={enrichment.mitre ?? []} />
-        )}
-      </div>
-      {enrichment.threat_intel && <ThreatIntelSection value={enrichment.threat_intel} />}
-      {enrichment.dns?.length > 0 && <DnsSection value={enrichment.dns} />}
-      {enrichment.honeypot && <HoneypotSection value={enrichment.honeypot} />}
+      <p className={LABEL}>What happened</p>
+      {enrichmentOrder(enrichment).map((key) => <Fragment key={key}>{blocks[key]}</Fragment>)}
+      {/* The "Producer-reported · not verified" badge that used to sit up in
+          the section header was styled as a STATUS, so it read as something to
+          act on when it is a standing property of every case. The sentence is
+          kept, once, where a footnote goes. */}
+      <p className="text-xs leading-5 text-slate-500">{REPORTED_NOT_VERIFIED}</p>
     </section>
   );
 }
+
+export type EnrichmentBlock = "agent_activity" | "detection" | "threat_intel" | "reasoning" | "dns" | "honeypot";
+
+/**
+ * The order the case answers the operator's questions in.
+ *
+ * What happened (the agent, then the detector that flagged it), WHERE IT CAME
+ * FROM, and only then how we reasoned about it. Threat intelligence used to be
+ * the fifth panel, below the model verdict and the rule chips, so "who is doing
+ * this to me" was two screens of our own reasoning away from the IP that
+ * answers it.
+ */
+export const ENRICHMENT_ORDER: readonly EnrichmentBlock[] = [
+  "agent_activity",
+  "detection",
+  "threat_intel",
+  "reasoning",
+  "dns",
+  "honeypot",
+];
+
+/** The blocks this case actually carries, in the order above. */
+export function enrichmentOrder(enrichment: CaseEnrichment): EnrichmentBlock[] {
+  const present: Record<EnrichmentBlock, boolean> = {
+    agent_activity: Boolean(enrichment.agent_activity),
+    detection: Boolean(enrichment.detection),
+    threat_intel: Boolean(enrichment.threat_intel),
+    reasoning: Boolean(enrichment.ai) || (enrichment.rules?.length ?? 0) > 0 || (enrichment.mitre?.length ?? 0) > 0,
+    dns: (enrichment.dns?.length ?? 0) > 0,
+    honeypot: Boolean(enrichment.honeypot),
+  };
+  return ENRICHMENT_ORDER.filter((key) => present[key]);
+}
+
+export const REPORTED_NOT_VERIFIED =
+  "Everything above is what the sensor, the rules and the model reported. It has not been independently verified. What the system did about it is below.";
 
 function Field({ label, value }: { label: string; value: string }) {
   return (
@@ -146,11 +193,13 @@ function DetectionSection({ value }: { value: DetectionContext }) {
   return (
     <section className={CARD} aria-label="Why flagged">
       <p className={LABEL}>Why flagged</p>
-      <dl className="mt-3 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+      {/* "Suggested checks: 3" was a fourth cell here, counting the chips that
+          are printed in full immediately below it. A count of records the
+          reader can see is not a fact about the host. */}
+      <dl className="mt-3 grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
         <Field label="Detector" value={value.detector} />
         {value.kind && <Field label="Signal kind" value={value.kind} />}
         {value.layer && <Field label="Layer" value={value.layer} />}
-        {value.recommended_checks.length > 0 && <Field label="Suggested checks" value={String(value.recommended_checks.length)} />}
       </dl>
       {value.reason && <p className="mt-3 break-words text-sm leading-6 text-slate-700 [overflow-wrap:anywhere]">{value.reason}</p>}
       {value.recommended_checks.length > 0 && (

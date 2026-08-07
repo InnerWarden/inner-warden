@@ -7,7 +7,7 @@ test.describe("CJC-090-J004 local decision overview", () => {
   });
 
   test("renders a source-confirmed zero as onboarding rather than an incident", async ({ page }) => {
-    await page.route("**/api/overview", (route) => fulfillJson(route, EMPTY_OVERVIEW));
+    await page.route("**/api/guard/overview", (route) => fulfillJson(route, EMPTY_OVERVIEW));
     await page.goto("/");
     await expect(page.getByRole("heading", { name: "No decisions recorded yet" })).toBeVisible();
     await expect(page.getByText("The local dashboard is unavailable", { exact: true })).toHaveCount(0);
@@ -16,7 +16,7 @@ test.describe("CJC-090-J004 local decision overview", () => {
   test("retains the last good overview and labels it stale after refresh failure", async ({ page }) => {
     let calls = 0;
     await page.clock.install();
-    await page.route("**/api/overview", async (route) => {
+    await page.route("**/api/guard/overview", async (route) => {
       calls += 1;
       if (calls > 1) {
         await fulfillJson(route, { error: "graph_unreadable" }, 503);
@@ -42,7 +42,7 @@ test.describe("CJC-090-J004 local decision overview", () => {
   });
 
   test("does not replace an initially corrupt source with healthy zero metrics", async ({ page }) => {
-    await page.route("**/api/overview", (route) => fulfillJson(route, { error: "graph_corrupt" }, 503));
+    await page.route("**/api/guard/overview", (route) => fulfillJson(route, { error: "graph_corrupt" }, 503));
     await page.goto("/");
     await expect(page.getByRole("alert")).toContainText("The local dashboard is unavailable");
     await expect(page.getByRole("heading", { name: "No decisions recorded yet" })).toHaveCount(0);
@@ -57,7 +57,7 @@ test.describe("CJC-090-J004 local decision overview", () => {
       outcome: undefined,
       mode_at_decision: undefined,
     });
-    await page.route("**/api/overview", (route) => fulfillJson(route, {
+    await page.route("**/api/guard/overview", (route) => fulfillJson(route, {
       sessions: 1,
       commands: 1,
       blocked: 1,
@@ -77,6 +77,6 @@ test.describe("CJC-090-J004 local decision overview", () => {
     await expect(row).toContainText("Deny");
     await expect(row).toContainText("Outcome unknown");
     await expect(row).not.toContainText("Blocked");
-    await expect(page.getByRole("heading", { name: "Execution evidence" })).toHaveCount(0);
+    await expect(page.getByRole("heading", { name: "What the guardrail actually did" })).toHaveCount(0);
   });
 });

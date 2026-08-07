@@ -1,29 +1,36 @@
 import type { TokenCounterSet, TokenIntelligence as TokenIntelligenceContract, TokenProviderUsage } from "../api/v1";
+import { gridColumnsClass, gridSpanClass, joinClasses } from "../components/cardGrid";
 import { StatusBadge } from "../components/StatusBadge";
+
+/** Provider cards are compact, so three across is comfortable; the shared fill
+ * rule keeps the last row as full as the ones above it at every count. */
+export function providerGridClass(count: number): string {
+  return joinClasses("grid gap-4", gridColumnsClass("trio", count));
+}
+
+export function providerCardSpanClass(index: number, count: number): string {
+  return gridSpanClass("trio", index, count);
+}
 
 export function TokenIntelligence({ report, stale = false }: { report: TokenIntelligenceContract; stale?: boolean }) {
   return (
     <div className="space-y-6">
       <header className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
         <div>
-          <p className="text-xs font-semibold uppercase tracking-[0.16em] text-cyan-700">Agent layer · local resource visibility</p>
+          <p className="text-xs font-semibold uppercase tracking-[0.16em] text-cyan-700">Local resource visibility</p>
           <h1 className="mt-1 text-2xl font-semibold tracking-tight text-slate-950">Token intelligence</h1>
           <p className="mt-2 max-w-3xl text-sm leading-6 text-slate-600">
-            Numeric counters from supported retained local histories. They are observability data, not billing data or a security score.
+            How much your agents have consumed, read from the history each one keeps on this machine.
           </p>
         </div>
         <StatusBadge status={stale ? "stale" : report.availability} />
       </header>
 
-      <div className="rounded-xl border border-cyan-200 bg-cyan-50/70 px-4 py-3 text-xs leading-5 text-cyan-950">
-        <strong className="font-semibold">Privacy boundary:</strong> this projection contains numeric counters and provenance only. It does not contain prompts, responses, tool content or secrets.
-      </div>
-
       {report.totals ? <Totals counters={report.totals} /> : (
         <section className="rounded-2xl border border-dashed border-slate-300 bg-white px-5 py-10 text-center">
-          <h2 className="font-semibold text-slate-900">No aggregate token history is available</h2>
+          <h2 className="font-semibold text-slate-900">No totals yet</h2>
           <p className="mx-auto mt-1 max-w-xl text-sm leading-6 text-slate-600">
-            Missing or unsupported counters remain unavailable; the dashboard never substitutes zero or an estimate.
+            No agent here has recorded a token history InnerWarden can read. A total appears once one does; nothing is estimated in the meantime.
           </p>
         </section>
       )}
@@ -31,17 +38,32 @@ export function TokenIntelligence({ report, stale = false }: { report: TokenInte
       {report.providers.length > 0 ? (
         <section aria-labelledby="token-providers-title">
           <div className="mb-3">
-            <p className="text-xs font-semibold uppercase tracking-[0.14em] text-cyan-700">Independent sources</p>
-            <h2 id="token-providers-title" className="mt-1 text-lg font-semibold text-slate-950">Usage by observed agent source</h2>
+            <p className="text-xs font-semibold uppercase tracking-[0.14em] text-cyan-700">Per agent</p>
+            <h2 id="token-providers-title" className="mt-1 text-lg font-semibold text-slate-950">Usage by agent</h2>
           </div>
-          <ul className="grid gap-4 lg:grid-cols-3">
-            {report.providers.map((provider) => <ProviderCard key={provider.agent_id} provider={provider} stale={stale} />)}
+          <ul className={providerGridClass(report.providers.length)}>
+            {report.providers.map((provider, index) => (
+              <ProviderCard
+                key={provider.agent_id}
+                provider={provider}
+                stale={stale}
+                spanClass={providerCardSpanClass(index, report.providers.length)}
+              />
+            ))}
           </ul>
         </section>
       ) : null}
+
+      {/* Was a cyan "Privacy boundary" panel at the top of every load. The
+          promise it makes is real and permanent, which is exactly why it does
+          not need to be the second thing on the screen. */}
+      <p className="text-xs leading-5 text-slate-500">{PRIVACY_FOOTNOTE}</p>
     </div>
   );
 }
+
+export const PRIVACY_FOOTNOTE =
+  "Counts only. Prompts, responses, tool content and secrets never reach this dashboard, and these are not billing figures.";
 
 function Totals({ counters }: { counters: TokenCounterSet }) {
   return (
@@ -61,10 +83,10 @@ function Totals({ counters }: { counters: TokenCounterSet }) {
   );
 }
 
-function ProviderCard({ provider, stale }: { provider: TokenProviderUsage; stale: boolean }) {
+function ProviderCard({ provider, stale, spanClass = "" }: { provider: TokenProviderUsage; stale: boolean; spanClass?: string }) {
   const hasCounters = Object.values(provider.counters).some((value) => value !== null);
   return (
-    <li className="min-w-0 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+    <li className={joinClasses("min-w-0 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm", spanClass)}>
       <div className="flex min-w-0 flex-wrap items-start justify-between gap-3">
         <div className="min-w-0">
           <h3 className="truncate text-base font-semibold text-slate-950" title={provider.display_name}>{provider.display_name}</h3>

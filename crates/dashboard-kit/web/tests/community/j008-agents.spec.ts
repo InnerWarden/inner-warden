@@ -7,10 +7,10 @@ function agentCard(page: Page, name: string) {
 
 test.describe("CJC-090-J008 conservative general agent discovery", () => {
   test("keeps unknown, generic, limited, OpenClaw, Hermes, and runtime-null candidates non-authorizing", async ({ page }) => {
-    await page.route("**/api/overview", (route) => fulfillJson(route, EMPTY_OVERVIEW));
+    await page.route("**/api/guard/overview", (route) => fulfillJson(route, EMPTY_OVERVIEW));
     await installMachineDefaults(page);
-    await page.unroute("**/api/agents");
-    await page.route("**/api/agents", (route) => fulfillJson(route, {
+    await page.unroute("**/api/guard/agents");
+    await page.route("**/api/guard/agents", (route) => fulfillJson(route, {
       schema_version: 2,
       generated_at_ms: Date.UTC(2026, 6, 18, 12, 0, 0),
       availability: "available",

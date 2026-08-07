@@ -8,6 +8,7 @@ import {
   type TokenAgent,
   type TokenIntelligenceResponse,
 } from "../api";
+import { gridColumnsClass, gridSpanClass, joinClasses } from "./cardGrid";
 
 type PollState<T> = {
   data?: T;
@@ -151,6 +152,10 @@ export const DISCOVERY_LIMIT_DISCLOSURE = {
 export const AUTO_SETUP_UNKNOWN_FOOTNOTE =
   "Automatic setup policy is not reported here. Check it with the CLI if you need it.";
 
+/** The privacy fact about token counts: worth stating, not worth a banner. */
+export const TOKEN_PRIVACY_FOOTNOTE =
+  "Counts only. Prompts, responses and tool content never reach this dashboard, and these are not billing figures.";
+
 /** Where the automatic-setup line belongs: a header strip only when the policy
  * is actually known; otherwise a quiet footnote. */
 export function autoSetupPlacement(known: boolean): "header" | "footnote" {
@@ -182,7 +187,12 @@ function AgentsPanel({ state, edition }: { state: PollState<AgentsResponse>; edi
         // and, on a paid box, a quiet contradiction of the header above it.
         eyebrow={edition === "enterprise" ? "Local visibility" : "Community visibility"}
         title="Agents on this machine"
-        description="Local detection and guardrail setup are shown as separate signals, so presence is never presented as proof of active protection."
+        // Was: "Local detection and guardrail setup are shown as separate
+        // signals, so presence is never presented as proof of active
+        // protection." That is a description of our own rendering rule. The
+        // rule still holds; each card states its own guardrail evidence, which
+        // is where an operator reads it.
+        description="Which agents are here, whether they are running, and whether a guardrail has been seen working on each one."
         aside={data ? <GeneratedAt value={data.generated_at_ms} /> : undefined}
       />
       {error && data && <StaleNotice />}
@@ -251,17 +261,11 @@ function AgentsPanel({ state, edition }: { state: PollState<AgentsResponse>; edi
 }
 
 /**
- * The most cards this layout puts on one row.
- *
- * Each card carries a heading, six detail cells and a detection-evidence list.
- * At three across the detail grid collapses to one column per card and the
- * headings wrap mid-word, so two is the ceiling rather than a placeholder for a
- * responsive step nobody wrote.
- */
-export const AGENT_GRID_MAX_COLUMNS = 2;
-
-/**
  * The grid class for a given number of agent cards.
+ *
+ * Two across is the ceiling: each card carries a heading, six detail cells and
+ * a detection-evidence list, and at three the detail grid collapses to one
+ * column per card and the headings wrap mid-word. `pair-md` is that ceiling.
  *
  * REGRESSION ANCHOR. This was a flat `md:grid-cols-2`. The cards sit in a
  * `gap-px` grid over a `bg-slate-200` parent (the hairline-divider trick),
@@ -271,11 +275,7 @@ export const AGENT_GRID_MAX_COLUMNS = 2;
  * a card that failed to load rather than as a host with one agent.
  */
 export function agentGridClass(count: number): string {
-  // Both class strings are written out in full. Tailwind finds utilities by
-  // scanning the source for literal text, so a name assembled from
-  // `AGENT_GRID_MAX_COLUMNS` at runtime would compile to a class that exists in
-  // the markup and in no stylesheet.
-  return count <= 1 ? "grid gap-px bg-slate-200" : "grid gap-px bg-slate-200 md:grid-cols-2";
+  return joinClasses("grid gap-px bg-slate-200", gridColumnsClass("pair-md", count));
 }
 
 /**
@@ -286,8 +286,7 @@ export function agentGridClass(count: number): string {
  * card closes it at every count instead of only the count someone tested.
  */
 export function agentCardSpanClass(index: number, count: number): string {
-  const odd = count > 1 && count % AGENT_GRID_MAX_COLUMNS === 1;
-  return odd && index === count - 1 ? "md:col-span-2" : "";
+  return gridSpanClass("pair-md", index, count);
 }
 
 function AgentCard({ agent, spanClass = "" }: { agent: LocalAgent; spanClass?: string }) {
@@ -592,32 +591,35 @@ function TokenPanel({ state }: { state: PollState<TokenIntelligenceResponse> }) 
       <SectionHeading
         eyebrow="Local resource visibility"
         title="Token intelligence"
-        description="Available local history helps explain agent activity and context pressure without turning usage into a security score."
+        description="How much each agent on this machine has consumed, read from the history it keeps locally."
         aside={data ? <AvailabilityBadge value={data.availability} /> : undefined}
       />
 
-      <div className="mb-3 rounded-xl border border-cyan-200 bg-cyan-50/70 px-4 py-3 text-xs leading-5 text-cyan-950">
-        <strong className="font-semibold">Privacy by design:</strong> this view receives numeric counters only, not prompts, responses or tool content. Counts come from available local history and are not billing data.
-      </div>
       {error && data && <StaleNotice />}
       {loading && !data ? (
         <PanelSkeleton cards={3} label="Loading token intelligence" lgColumns={3} />
       ) : data ? (
         data.agents.length === 0 ? (
-          <EmptyPanel title="No local token history available" body="A missing counter is shown as unavailable, never as zero. Supported local history will appear after a later check." />
+          <EmptyPanel title="No local token history yet" body="No agent on this machine keeps a token history InnerWarden can read. Counts appear here once one does." />
         ) : (
-          <ul className="grid gap-3 lg:grid-cols-3">
-            {data.agents.map((agent) => <TokenCard key={agent.agent_id} agent={agent} />)}
+          <ul className={joinClasses("grid gap-3", gridColumnsClass("trio", data.agents.length))}>
+            {data.agents.map((agent, index) => (
+              <TokenCard key={agent.agent_id} agent={agent} spanClass={gridSpanClass("trio", index, data.agents.length)} />
+            ))}
           </ul>
         )
       ) : (
         <UnavailablePanel title="Token intelligence is unavailable" body="The local endpoint did not respond. No usage value is being inferred from the missing response." />
       )}
+      {/* The privacy fact used to be a coloured banner ABOVE the counters, on
+          every load, on every host. It is worth stating once and it is worth
+          nobody's attention twice, so it sits under the numbers in grey. */}
+      <p className="mt-3 text-xs leading-5 text-slate-500">{TOKEN_PRIVACY_FOOTNOTE}</p>
     </section>
   );
 }
 
-function TokenCard({ agent }: { agent: TokenAgent }) {
+function TokenCard({ agent, spanClass = "" }: { agent: TokenAgent; spanClass?: string }) {
   const scanning = agent.availability === "loading";
   const unsupported = agent.availability.toLowerCase() === "unsupported";
   const metrics = [
@@ -631,7 +633,7 @@ function TokenCard({ agent }: { agent: TokenAgent }) {
   ] as const;
 
   return (
-    <li className="min-w-0 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm sm:p-5">
+    <li className={joinClasses("min-w-0 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm sm:p-5", spanClass)}>
       <div className="flex min-w-0 flex-wrap items-start justify-between gap-3">
         <div className="min-w-0">
           <h3 className="truncate text-base font-semibold text-slate-950" title={agent.display_name}>{agent.display_name}</h3>

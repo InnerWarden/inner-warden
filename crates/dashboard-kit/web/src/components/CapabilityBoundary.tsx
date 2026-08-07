@@ -5,6 +5,16 @@ import { StatusBadge } from "./StatusBadge";
 
 type BoundaryState = DashboardResource<unknown>["state"] | "adapter_absent";
 
+/**
+ * Why a screen has no data, in words an operator can act on.
+ *
+ * Every one of these sentences used to be written from the wire's point of
+ * view: adapters, bootstraps, projections, contracts, legacy payloads. That
+ * vocabulary describes OUR plumbing, and it reached a user precisely when they
+ * were staring at an empty screen wanting to know what to do about it. The
+ * honesty each sentence carries is untouched, because it is the whole point:
+ * nothing missing is ever reported as zero, healthy, allowed or blocked.
+ */
 export function capabilityBoundaryMessage(
   state: BoundaryState,
   adapterLabel: string,
@@ -12,63 +22,63 @@ export function capabilityBoundaryMessage(
 ): { title: string; body: string; status: string } {
   if (state === "adapter_absent") {
     return {
-      title: `${adapterLabel} adapter not declared`,
-      body: "The validated bootstrap did not declare this capability. Legacy or Community-labelled data is not substituted.",
+      title: `${adapterLabel} is not part of this installation`,
+      body: "This host did not offer this feature, so there is nothing to show. Nothing from another edition is shown in its place.",
       status: "unavailable",
     };
   }
   if (state === "unsupported" || capability?.support === "unsupported" || capability?.availability === "unsupported") {
     return {
-      title: `${adapterLabel} is unsupported`,
-      body: "This host or adapter does not support the capability. No equivalent protection is implied.",
+      title: `${adapterLabel} is not supported on this host`,
+      body: "This machine cannot provide it. That says nothing either way about the protection its other controls give you.",
       status: "unsupported",
     };
   }
   if (state === "authentication_required") {
     return {
-      title: "Enterprise authentication required",
-      body: "Authenticate through the serving Active Defence boundary before this data is mounted.",
+      title: "Sign in to see this",
+      body: "This data stays behind the Active Defence sign-in. Nothing is loaded until that succeeds.",
       status: "unavailable",
     };
   }
   if (state === "forbidden") {
     return {
-      title: `${adapterLabel} is outside this session scope`,
-      body: "The authenticated session is not authorized for this adapter or scope.",
+      title: `Your session cannot see ${adapterLabel.toLowerCase()}`,
+      body: "You are signed in, but this session is not allowed to read it.",
       status: "unavailable",
     };
   }
   if (state === "rate_limited") {
     return {
-      title: `${adapterLabel} is temporarily rate limited`,
-      body: "The previous validated view is not replaced with an empty or inferred state.",
+      title: `${adapterLabel} asked to be left alone for a moment`,
+      body: "Too many requests too quickly. Whatever was already on screen is kept rather than replaced with an empty one.",
       status: "degraded",
     };
   }
   if (state === "conflict") {
     return {
-      title: `${adapterLabel} has a state conflict`,
-      body: "The requested projection conflicts with the current server state or a publication gate. Nothing is inferred or applied.",
+      title: `${adapterLabel} is mid change`,
+      body: "The host is in a different state than this request expected. Nothing was applied and nothing is being guessed at.",
       status: "degraded",
     };
   }
   if (state === "error") {
     return {
-      title: `${adapterLabel} response could not be validated`,
-      body: "The adapter returned an error or an incompatible contract. No legacy payload is used as a fallback.",
+      title: `${adapterLabel} sent something this dashboard cannot read`,
+      body: "The reply failed or did not match what this version expects. Nothing older is shown in its place.",
       status: "failed",
     };
   }
   if (state === "unavailable") {
     return {
       title: `${adapterLabel} is unavailable`,
-      body: "The adapter did not provide a current response. Missing values remain unavailable, not zero or healthy.",
+      body: "This host did not answer. What is missing stays unknown; it is never shown as zero or as healthy.",
       status: "unavailable",
     };
   }
   return {
     title: `Loading ${adapterLabel.toLowerCase()}`,
-    body: "Waiting for a validated same-origin dashboard v1 response.",
+    body: "Waiting for this host to answer.",
     status: "loading",
   };
 }
@@ -96,8 +106,8 @@ export function CapabilityBoundary<T>({
         <div role="status" className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-amber-950">
           <div className="flex flex-wrap items-start justify-between gap-2">
             <div>
-              <div className="font-semibold">Showing the last validated {adapterLabel.toLowerCase()} snapshot</div>
-              <p className="mt-0.5 text-sm">The refresh failed. Current runtime state is unknown until a valid response arrives.</p>
+              <div className="font-semibold">Showing the last good {adapterLabel.toLowerCase()} snapshot</div>
+              <p className="mt-0.5 text-sm">The refresh failed, so this may be out of date. What the host is doing right now is unknown until it answers again.</p>
             </div>
             <StatusBadge status="stale" />
           </div>

@@ -8,7 +8,7 @@ test.describe("CJC-090-J005 activity filters, pagination, and drilldown", () => 
 
   test("uses bounded server filters and pagination and exposes an explicit empty result", async ({ page }) => {
     const seen: URL[] = [];
-    await page.route("**/api/overview", (route) => fulfillJson(route, EMPTY_OVERVIEW));
+    await page.route("**/api/guard/overview", (route) => fulfillJson(route, EMPTY_OVERVIEW));
     await page.route("**/api/cases**", async (route) => {
       const url = new URL(route.request().url());
       seen.push(url);
@@ -78,7 +78,7 @@ test.describe("CJC-090-J005 activity filters, pagination, and drilldown", () => 
       recommendation: "deny",
       explanation: "wrong decision evidence",
     });
-    await page.route("**/api/overview", (route) => fulfillJson(route, {
+    await page.route("**/api/guard/overview", (route) => fulfillJson(route, {
       ...EMPTY_OVERVIEW,
       sessions: 1,
       commands: 1,
@@ -128,7 +128,7 @@ test.describe("CJC-090-J005 activity filters, pagination, and drilldown", () => 
 
   test("retains the last activity page when a refresh fails", async ({ page }) => {
     let calls = 0;
-    await page.route("**/api/overview", (route) => fulfillJson(route, EMPTY_OVERVIEW));
+    await page.route("**/api/guard/overview", (route) => fulfillJson(route, EMPTY_OVERVIEW));
     await page.route("**/api/cases**", async (route) => {
       calls += 1;
       if (calls > 1) {

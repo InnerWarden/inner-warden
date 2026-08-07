@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { AGENT_GRID_MAX_COLUMNS, agentCardSpanClass, agentGridClass } from "./MachineIntelligence";
+import { agentCardSpanClass, agentGridClass } from "./MachineIntelligence";
 
 /**
  * The cards live in a `gap-px` grid over a `bg-slate-200` parent, so every cell
@@ -41,7 +41,6 @@ describe("agent card grid", () => {
   });
 
   it("never asks for more than two columns", () => {
-    expect(AGENT_GRID_MAX_COLUMNS).toBe(2);
     for (const count of [1, 2, 3, 8, 40]) {
       expect(agentGridClass(count)).not.toMatch(/grid-cols-([3-9]|\d\d)/);
     }

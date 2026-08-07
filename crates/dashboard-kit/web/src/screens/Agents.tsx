@@ -1,4 +1,5 @@
 import type { AgentInventory, AgentSubject, IdentityConfidence } from "../api/v1";
+import { gridColumnsClass, gridSpanClass, joinClasses } from "../components/cardGrid";
 import { StatusBadge } from "../components/StatusBadge";
 import { TruncatedId } from "../components/TruncatedId";
 
@@ -146,6 +147,22 @@ export const EMPTY_STATE = {
   command: "innerwarden agents connect",
 } as const;
 
+// ──────────────────────────────── layout ─────────────────────────────────────
+//
+// An agent card carries a heading, a status line and up to three detail cells,
+// so two across is the widest it reads well at. Everything else about the grid
+// is the shared fill rule: the row the cards are given is the row they fill, at
+// one agent as much as at five. Before this, one agent took half the page and
+// the other half was an empty box.
+
+export function agentsGridClass(count: number): string {
+  return joinClasses("grid gap-4", gridColumnsClass("pair-lg", count));
+}
+
+export function agentsCardSpanClass(index: number, count: number): string {
+  return gridSpanClass("pair-lg", index, count);
+}
+
 // ─────────────────────────────── screen ──────────────────────────────────────
 
 export function Agents({ inventory, stale = false, nowMs }: { inventory: AgentInventory; stale?: boolean; nowMs?: number }) {
@@ -165,8 +182,16 @@ export function Agents({ inventory, stale = false, nowMs }: { inventory: AgentIn
       </div>
 
       {inventory.subjects.length > 0 ? (
-        <div className="grid gap-4 lg:grid-cols-2">
-          {inventory.subjects.map((agent) => <AgentCard key={agent.agent_id} agent={agent} stale={stale} nowMs={now} />)}
+        <div className={agentsGridClass(inventory.subjects.length)}>
+          {inventory.subjects.map((agent, index) => (
+            <AgentCard
+              key={agent.agent_id}
+              agent={agent}
+              stale={stale}
+              nowMs={now}
+              spanClass={agentsCardSpanClass(index, inventory.subjects.length)}
+            />
+          ))}
         </div>
       ) : (
         <div className="rounded-xl border border-dashed border-slate-300 bg-white px-5 py-10 text-center">
@@ -182,7 +207,7 @@ export function Agents({ inventory, stale = false, nowMs }: { inventory: AgentIn
   );
 }
 
-function AgentCard({ agent, stale, nowMs }: { agent: AgentSubject; stale: boolean; nowMs: number }) {
+function AgentCard({ agent, stale, nowMs, spanClass = "" }: { agent: AgentSubject; stale: boolean; nowMs: number; spanClass?: string }) {
   const display = agentDisplay(agent);
   const status = guardrailStatusLine(agent, nowMs);
   const tooltip = identityTooltip(agent.identity_confidence);
@@ -193,7 +218,7 @@ function AgentCard({ agent, stale, nowMs }: { agent: AgentSubject; stale: boolea
   ];
   const presentRows = detailRows.filter((row): row is [string, string] => row[1] !== null && row[1] !== undefined);
   return (
-    <article className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+    <article className={joinClasses("min-w-0 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm", spanClass)}>
       <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div className="min-w-0">
           {display.headingIsId ? (
