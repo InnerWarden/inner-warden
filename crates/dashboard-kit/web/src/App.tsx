@@ -167,6 +167,84 @@ function routeFromLocation(extraScreens: readonly ScreenModule[]): ShellRoute {
   return resolveRoute(window.location.search, extraScreens);
 }
 
+/**
+ * Every query parameter a screen owns. Navigation clears them so a filter set
+ * on one screen does not leak into the next; each screen re-writes its own.
+ */
+const SCREEN_PARAMS = [
+  "q", "outcome", "severity", "mode", "authority", "capability", "scope_kind",
+  "scope", "window", "cursor", "case", "decision", "session", "verdict", "action",
+] as const;
+
+const ACTIVITY_PARAM_LIMIT = 256;
+
+/**
+ * The Activity selection carried by the address bar.
+ *
+ * The selection used to live only in React state: clicking a Home entry opened
+ * the right decision, and then a reload, a shared link or the back button lost
+ * it. Community's Activity screen is its case surface, so a decision there
+ * deserves an address exactly like a paid case gets `?view=cases&case=<id>`.
+ * Pure so it is testable without a DOM.
+ */
+export function activityTargetFromSearch(
+  search: string,
+): { id?: string; session?: string; verdict?: string; action?: string } | undefined {
+  const parameters = new URLSearchParams(search);
+  if (parameters.get("view") !== "activity") return undefined;
+  const bounded = (name: string): string | undefined => {
+    const value = parameters.get(name) ?? "";
+    return value.length > 0 && value.length <= ACTIVITY_PARAM_LIMIT ? value : undefined;
+  };
+  const target = {
+    id: bounded("decision"),
+    session: bounded("session"),
+    verdict: bounded("verdict"),
+    action: bounded("action"),
+  };
+  if (!target.id && !target.session && !target.action) return undefined;
+  return target;
+}
+
+/** The URL for one Activity selection; the inverse of `activityTargetFromSearch`. */
+export function activityUrl(
+  target: { id?: string; session?: string; verdict?: string; action?: string } | undefined,
+  current: string,
+): URL {
+  const url = new URL(current);
+  for (const name of SCREEN_PARAMS) url.searchParams.delete(name);
+  url.searchParams.set("view", "activity");
+  const bounded = (value?: string) =>
+    value !== undefined && value.length > 0 && value.length <= ACTIVITY_PARAM_LIMIT
+      ? value
+      : undefined;
+  const values: [string, string | undefined][] = [
+    ["decision", bounded(target?.id)],
+    ["session", bounded(target?.session)],
+    ["verdict", bounded(target?.verdict)],
+    ["action", bounded(target?.action)],
+  ];
+  for (const [name, value] of values) {
+    if (value !== undefined) url.searchParams.set(name, value);
+  }
+  return url;
+}
+
+/**
+ * The URL that opens the Cases screen, optionally on one case: the
+ * click-through target for anything on Home that shows a decision or an event
+ * with a case behind it.
+ */
+export function caseUrl(caseId: string | undefined, current: string): URL {
+  const url = new URL(current);
+  for (const name of SCREEN_PARAMS) url.searchParams.delete(name);
+  url.searchParams.set("view", "cases");
+  if (caseId !== undefined && caseId.length > 0 && caseId.length <= 256) {
+    url.searchParams.set("case", caseId);
+  }
+  return url;
+}
+
 function resourceData<T>(resource: DashboardResource<T>): T | undefined {
   return resource.state === "ready" || resource.state === "stale" ? resource.data : undefined;
 }
@@ -192,7 +270,12 @@ export function App({ extraScreens = [] }: { extraScreens?: readonly ScreenModul
   const [postureResource, setPostureResource] = useState<DashboardResource<DashboardPosture>>({ state: "idle" });
   const [agentsResource, setAgentsResource] = useState<DashboardResource<AgentInventory>>({ state: "idle" });
   const [tokensResource, setTokensResource] = useState<DashboardResource<TokenIntelligenceContract>>({ state: "idle" });
-  const [activityTarget, setActivityTarget] = useState<ActivityTarget>();
+  const [activityTarget, setActivityTarget] = useState<ActivityTarget | undefined>(() => {
+    // A deep link to one decision (`?view=activity&decision=...`) must survive
+    // a reload, exactly like `?view=cases&case=...` does on the paid side.
+    const fromUrl = activityTargetFromSearch(window.location.search);
+    return fromUrl ? { ...fromUrl, requestId: Date.now() } : undefined;
+  });
   const [consumerEvaluatedAt, setConsumerEvaluatedAt] = useState(() => new Date().toISOString());
 
   const bootstrap = resourceData(bootstrapResource);
@@ -374,7 +457,11 @@ export function App({ extraScreens = [] }: { extraScreens?: readonly ScreenModul
   }, [navigation, route]);
 
   useEffect(() => {
-    const restore = () => setRoute(routeFromLocation(contributedRef.current));
+    const restore = () => {
+      setRoute(routeFromLocation(contributedRef.current));
+      const fromUrl = activityTargetFromSearch(window.location.search);
+      setActivityTarget(fromUrl ? { ...fromUrl, requestId: Date.now() } : undefined);
+    };
     window.addEventListener("popstate", restore);
     return () => window.removeEventListener("popstate", restore);
   }, []);
@@ -388,17 +475,22 @@ export function App({ extraScreens = [] }: { extraScreens?: readonly ScreenModul
     const url = new URL(window.location.href);
     if (next === "overview") url.searchParams.delete("view");
     else url.searchParams.set("view", next);
-    for (const key of ["q", "outcome", "severity", "mode", "authority", "capability", "scope_kind", "scope", "window", "cursor", "case"]) url.searchParams.delete(key);
+    for (const key of SCREEN_PARAMS) url.searchParams.delete(key);
     window.history.pushState({}, "", url);
     setRoute(next);
   };
   const openActivity = (target?: Omit<ActivityTarget, "requestId">) => {
     setActivityTarget(target ? { ...target, requestId: Date.now() } : undefined);
-    const url = new URL(window.location.href);
-    url.searchParams.set("view", "activity");
-    window.history.pushState({}, "", url);
+    window.history.pushState({}, "", activityUrl(target, window.location.href));
     setRoute("activity");
   };
+  const openCase = (caseId?: string) => {
+    window.history.pushState({}, "", caseUrl(caseId, window.location.href));
+    setRoute("cases");
+  };
+  // Only a shell that actually mounts a Cases screen may hand out case links;
+  // without one, `?view=cases` resolves straight back to Overview.
+  const casesAvailable = contributed.some((screen) => screen.route === "cases");
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-950">
@@ -435,6 +527,7 @@ export function App({ extraScreens = [] }: { extraScreens?: readonly ScreenModul
             tokenIntelligence={tokenIntelligence}
             meta={freshMeta}
             onOpenActivity={openActivity}
+            onOpenCase={casesAvailable ? openCase : undefined}
             evaluatedAt={consumerEvaluatedAt}
             extraScreens={contributed}
           />
@@ -461,6 +554,7 @@ function EnterpriseRoute({
   tokenIntelligence,
   meta,
   onOpenActivity,
+  onOpenCase,
   evaluatedAt,
   extraScreens,
 }: {
@@ -474,6 +568,7 @@ function EnterpriseRoute({
   tokenIntelligence?: DashboardBootstrap["capabilities"][number];
   meta?: DashboardMeta;
   onOpenActivity: (target?: Omit<ActivityTarget, "requestId">) => void;
+  onOpenCase?: (caseId?: string) => void;
   evaluatedAt: string;
   extraScreens: readonly ScreenModule[];
 }) {
@@ -518,7 +613,7 @@ function EnterpriseRoute({
     );
   }
 
-  return <Home meta={meta} onOpenActivity={onOpenActivity} edition="enterprise" />;
+  return <Home meta={meta} onOpenActivity={onOpenActivity} onOpenCase={onOpenCase} edition="enterprise" />;
 }
 
 function EnterpriseSessionStatus({ resource }: { resource: DashboardResource<DashboardBootstrap> }) {
