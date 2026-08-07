@@ -240,6 +240,15 @@ export type AgentSubject = {
   identity_evidence: EvidenceRef[];
   sessions: AgentSessionRef[];
   capabilities: AgentCapabilityState[];
+  // Guardrail liveness, straight from the durable registry row the producer
+  // reads. All four are optional on the wire (an older producer omits them);
+  // the validator normalizes absence to null. `guardrail_recorded_activity`
+  // distinguishes "the row itself says zero activity" (0) from "the row keeps
+  // no counters" (null), which are different answers and must stay different.
+  guardrail_mode?: string | null;
+  guardrail_configured_at?: string | null;
+  guardrail_recorded_activity?: number | null;
+  guardrail_last_observed_at?: string | null;
 };
 
 export type AgentInventory = {
