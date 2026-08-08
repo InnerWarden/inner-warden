@@ -207,7 +207,7 @@ export function stackedBandPaths(chart: SensorChart, width: number, height: numb
   // them plunges every band to the baseline and holds it flat to 24:00, which
   // reads as "the host died at 14:30" when the host is alive and simply has no
   // future to plot. Ending the path at the last active column leaves the line
-  // sitting at the present — still monitoring — and the empty right-hand side is
+  // sitting at the present, still monitoring, and the empty right-hand side is
   // just the rest of the day, the same as any live time series. A truly stopped
   // host is surfaced by the collector liveness board, not by a misleading cliff
   // that also appears on every healthy afternoon.

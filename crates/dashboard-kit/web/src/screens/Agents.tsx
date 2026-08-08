@@ -169,7 +169,7 @@ export function Agents({ inventory, stale = false, nowMs }: { inventory: AgentIn
   const now = nowMs ?? Date.now();
   const footnote = discoveryFootnote(inventory.discovery_limited);
   return (
-    <div className="space-y-6">
+    <div data-tour="agents" className="space-y-6">
       <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
         <div>
           <p className="text-xs font-semibold uppercase tracking-[0.16em] text-cyan-700">Agents</p>

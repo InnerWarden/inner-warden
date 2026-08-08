@@ -179,7 +179,7 @@ function AgentsPanel({ state, edition }: { state: PollState<AgentsResponse>; edi
     && data.auto_connect.enabled != null
     && data.auto_connect.mode != null;
   return (
-    <section aria-labelledby="local-agents-title" aria-busy={scanning}>
+    <section aria-labelledby="local-agents-title" aria-busy={scanning} data-tour="overview-agents">
       <SectionHeading
         // The eyebrow said "Community visibility" on every host, paid ones
         // included. Local agent detection is not a Community feature -- it is

@@ -41,7 +41,11 @@ export function Header<Route extends string>({
         </button>
 
         {navigation.length > 0 ? (
-          <nav className="order-3 flex w-full gap-1 border-t border-slate-100 pt-2 sm:order-none sm:w-auto sm:border-0 sm:pt-0" aria-label="Dashboard views">
+          <nav
+            className="order-3 flex w-full gap-1 border-t border-slate-100 pt-2 sm:order-none sm:w-auto sm:border-0 sm:pt-0"
+            aria-label="Dashboard views"
+            data-tour="nav"
+          >
             {navigation.map((item) => (
               <button
                 key={item.route}

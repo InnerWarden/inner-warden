@@ -627,7 +627,7 @@ function CommunityIncluded() {
 
 function ActiveDefenceCard() {
   return (
-    <aside className="rounded-2xl border border-slate-200 bg-white p-5 sm:p-6" aria-labelledby="active-defence-title">
+    <aside data-tour="upgrade" className="rounded-2xl border border-slate-200 bg-white p-5 sm:p-6" aria-labelledby="active-defence-title">
       <div className="flex flex-col gap-4 sm:flex-row sm:items-center">
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2">

@@ -120,7 +120,7 @@ export function Activity({ initialTarget }: { initialTarget?: ActivityTarget }) 
 
   return (
     <div className="space-y-5" aria-busy={fetching}>
-      <header className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+      <header className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between" data-tour="activity">
         <div>
           <p className="text-xs font-semibold uppercase tracking-[0.14em] text-cyan-700">Decision record</p>
           <h1 ref={activityTitleRef} tabIndex={-1} className="mt-1 text-2xl font-semibold tracking-tight text-slate-950">Activity</h1>
