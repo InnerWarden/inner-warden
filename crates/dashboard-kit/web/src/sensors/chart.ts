@@ -200,12 +200,30 @@ export function stackedBandPaths(chart: SensorChart, width: number, height: numb
   const x = (index: number) => round((index * width) / (chart.columns - 1));
   const y = (value: number) => round(height - (value / chart.peak) * height);
 
+  // Draw only up to the last column that has data, not all the way to midnight.
+  //
+  // The series spans the whole 24h so past silence keeps its width, but the
+  // columns AFTER now are zero because that time has not happened yet. Drawing
+  // them plunges every band to the baseline and holds it flat to 24:00, which
+  // reads as "the host died at 14:30" when the host is alive and simply has no
+  // future to plot. Ending the path at the last active column leaves the line
+  // sitting at the present — still monitoring — and the empty right-hand side is
+  // just the rest of the day, the same as any live time series. A truly stopped
+  // host is surfaced by the collector liveness board, not by a misleading cliff
+  // that also appears on every healthy afternoon.
+  const lastCol = chart.lastActiveColumn ?? chart.columns - 1;
+  const drawn = lastCol + 1;
+
   const lower = new Array<number>(chart.columns).fill(0);
   const paths: BandPath[] = [];
   for (const band of chart.bands) {
     const upper = lower.map((base, index) => base + band.values[index]);
-    const top = upper.map((value, index) => `${index === 0 ? "M" : "L"}${x(index)} ${y(value)}`).join(" ");
+    const top = upper
+      .slice(0, drawn)
+      .map((value, index) => `${index === 0 ? "M" : "L"}${x(index)} ${y(value)}`)
+      .join(" ");
     const bottom = lower
+      .slice(0, drawn)
       .map((value, index) => ({ value, index }))
       .reverse()
       .map(({ value, index }) => `L${x(index)} ${y(value)}`)
