@@ -1,28 +1,24 @@
-# Rust
-/target
-**/target
 
-# Environment and secrets
+.claude/
+.DS_Store
 .env
 .env.local
-*.key
-*.pem
-*.p12
-
-# Node
-**/node_modules
-
-# OS and logs
-.DS_Store
-*.log
-
-# graphify code graph: 81M of local build artefacts, never committed
-graphify-out/
-
-# Local-only specs, never committed
 .specify/
-
-# Internal product notes. Working documents that describe commercial posture,
-# the paid tier's install behaviour, and where it currently falls short. They
+*.key
+*.log
+*.p12
+*.pem
+**/node_modules
+**/target
+/target
 # belong to the operator, not to a public repository.
+# Environment and secrets
+# graphify code graph: 81M of local build artefacts, never committed
+# Internal product notes. Working documents that describe commercial posture,
+# Local-only specs, never committed
+# Node
+# OS and logs
+# Rust
+# the paid tier's install behaviour, and where it currently falls short. They
+graphify-out/
 PRODUTO.md

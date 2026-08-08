@@ -48,7 +48,7 @@ export function SensorActivity() {
   const groups = collectorGroups(rows);
 
   return (
-    <section aria-labelledby="sensor-activity-title" className="min-w-0">
+    <section data-tour="overview-sensor" aria-labelledby="sensor-activity-title" className="min-w-0">
       <div className="mb-3 flex flex-col items-start gap-2 sm:flex-row sm:items-end sm:justify-between sm:gap-4">
         <div className="min-w-0">
           <p className="text-xs font-semibold uppercase tracking-[0.14em] text-cyan-700">Host sensor</p>

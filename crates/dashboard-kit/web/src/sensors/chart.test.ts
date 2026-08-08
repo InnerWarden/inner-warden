@@ -138,6 +138,34 @@ describe("stackedBandPaths", () => {
     for (const path of paths) expect(path.area.endsWith("Z")).toBe(true);
   });
 
+  /**
+   * The path must end at the last column that has data, not plunge to the
+   * baseline and run flat to midnight. A day with events only up to 12:00 was
+   * drawing every band down to zero and holding it there for the afternoon,
+   * which reads as "the host died at noon" on a host that is alive and simply
+   * has no future to plot yet.
+   */
+  it("ends the line at the last active column instead of falling to zero", () => {
+    // Events only in the morning; the afternoon has not happened.
+    const chart = buildSensorChart({ "00:00": { ebpf: 5 }, "12:00": { ebpf: 5 } });
+    const [path] = stackedBandPaths(chart, 1440, 100);
+    // 10-min columns => 12:00 is column 72. The line's last point must be there,
+    // not at the final column 143 (23:50) sitting on the baseline.
+    const points = path.line.match(/[ML]([\d.]+) ([\d.]+)/g) ?? [];
+    const last = points[points.length - 1];
+    const lastX = Number(/[ML]([\d.]+)/.exec(last)?.[1]);
+    const lastY = Number(/[ML][\d.]+ ([\d.]+)/.exec(last)?.[1]);
+    // x for column 72 of 144 (span 0..143) over width 1440.
+    expect(lastX).toBeCloseTo((72 * 1440) / 143, 0);
+    // and it must be at the top of the stack (peak), NOT the baseline (y=100).
+    expect(lastY).toBeLessThan(100);
+    // no point should sit past the last active column.
+    for (const p of points) {
+      const px = Number(/[ML]([\d.]+)/.exec(p)?.[1]);
+      expect(px).toBeLessThanOrEqual((72 * 1440) / 143 + 0.5);
+    }
+  });
+
   it("produces no geometry for a degenerate plot", () => {
     const chart = buildSensorChart({ "06:00": { ebpf: 4 } });
     expect(stackedBandPaths(chart, 0, 200)).toEqual([]);

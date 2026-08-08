@@ -14,7 +14,7 @@ export function providerCardSpanClass(index: number, count: number): string {
 
 export function TokenIntelligence({ report, stale = false }: { report: TokenIntelligenceContract; stale?: boolean }) {
   return (
-    <div className="space-y-6">
+    <div data-tour="tokens" className="space-y-6">
       <header className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
         <div>
           <p className="text-xs font-semibold uppercase tracking-[0.16em] text-cyan-700">Local resource visibility</p>

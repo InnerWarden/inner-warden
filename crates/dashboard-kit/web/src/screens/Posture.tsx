@@ -155,7 +155,7 @@ export function Posture({
       </div>
 
       {posture.layers.length > 0 ? (
-        <section aria-labelledby="posture-verdict-title" className="overflow-hidden rounded-2xl border border-slate-200 bg-gradient-to-br from-white to-slate-50">
+        <section data-tour="posture" aria-labelledby="posture-verdict-title" className="overflow-hidden rounded-2xl border border-slate-200 bg-gradient-to-br from-white to-slate-50">
           <div className="px-5 py-6 sm:px-7">
             <h3 id="posture-verdict-title" className="text-2xl font-semibold tracking-tight text-slate-950">
               {postureHeadline(pills)}
