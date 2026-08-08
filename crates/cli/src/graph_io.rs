@@ -601,7 +601,31 @@ fn hook_event_hash(session: &str, event_id: &str) -> Option<String> {
     hasher.update(session.as_bytes());
     hasher.update((event_id.len() as u64).to_be_bytes());
     hasher.update(event_id.as_bytes());
-    Some(format!("{:x}", hasher.finalize()))
+    Some(hex_lower(&hasher.finalize()))
+}
+
+/// Render bytes as lowercase hex, two characters per byte, high nibble first.
+///
+/// This is a deliberate transliteration of the `LowerHex` implementation that
+/// `generic_array` provided for digest outputs up to sha2 0.10. sha2 0.11 moved
+/// to `hybrid-array`, whose `Array` type does NOT implement `LowerHex`, so the
+/// rendering has to live here instead. The nibble table and ordering below are
+/// character-for-character the ones the old implementation used, because the
+/// string this produces is a persisted identity: [`hook_event_hash`] writes it
+/// into the append-only decision graph as the `hook_event_hash` attribute, and a
+/// graph written by an older build must keep deduplicating against a newer one.
+///
+/// The old implementation also honoured `f.precision()` to truncate the output.
+/// The only call site here is `{:x}` with no precision, so dropping that branch
+/// cannot change any identity this crate has ever emitted.
+fn hex_lower(bytes: &[u8]) -> String {
+    const LOWER_CHARS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        out.push(LOWER_CHARS[(byte >> 4) as usize] as char);
+        out.push(LOWER_CHARS[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 /// Pure graph mutation used by the filesystem adapter and unit tests. Returns
@@ -664,9 +688,16 @@ impl GraphLock {
         let started = Instant::now();
         let mut on_contention = Some(on_contention);
         loop {
-            match f.try_lock_exclusive() {
+            // NON-blocking attempt, deliberately: this is the bounded-wait
+            // acquisition the timeout above is built on. fs4 1.x renamed
+            // `try_lock_exclusive` to `try_lock` and moved contention out of
+            // `io::Error` into `TryLockError::WouldBlock`, which replaces the
+            // old `lock_is_contended` comparison against
+            // `fs4::lock_contended_error()`. A genuine I/O failure is still a
+            // distinct arm and is still NOT retried.
+            match FileExt::try_lock(&f) {
                 Ok(()) => return Ok(GraphLock(f)),
-                Err(error) if lock_is_contended(&error) => {
+                Err(fs4::TryLockError::WouldBlock) => {
                     if let Some(observer) = on_contention.take() {
                         observer();
                     }
@@ -676,16 +707,10 @@ impl GraphLock {
                     }
                     std::thread::sleep(GRAPH_LOCK_RETRY.min(timeout - elapsed));
                 }
-                Err(_) => return Err(GraphRecordError::LockUnavailable),
+                Err(fs4::TryLockError::Error(_)) => return Err(GraphRecordError::LockUnavailable),
             }
         }
     }
-}
-
-fn lock_is_contended(error: &std::io::Error) -> bool {
-    let expected = fs4::lock_contended_error();
-    error.kind() == expected.kind()
-        || (expected.raw_os_error().is_some() && error.raw_os_error() == expected.raw_os_error())
 }
 
 impl Drop for GraphLock {
@@ -890,6 +915,98 @@ mod tests {
         assert!(persisted.contains("hook_event_hash"));
         assert!(persisted.contains(&hash));
         assert!(!persisted.contains(raw_event_id));
+    }
+
+    /// IDENTITY PIN. `hook_event_hash` is the deduplication key persisted into
+    /// the append-only decision graph as `hook_event_hash`, so its rendered
+    /// STRING is stable data, not an implementation detail: change the encoding
+    /// and every graph already on disk stops matching, and previously suppressed
+    /// redeliveries are re-ingested as fresh commands.
+    ///
+    /// The expected values below were derived from Python's `hashlib`, which
+    /// shares no code with the `sha2` crate, so this test pins the contract
+    /// rather than merely restating whatever the current dependency produces.
+    /// It is a deliberate tripwire for a hashing-library upgrade.
+    #[test]
+    fn hook_event_hash_renders_a_stable_64_char_lowercase_hex_identity() {
+        // sha256("innerwarden-hook-event-v1\0" ++ be64(6) ++ "sess-1"
+        //        ++ be64(5) ++ "evt-1")
+        assert_eq!(
+            hook_event_hash("sess-1", "evt-1").expect("non-empty id hashes"),
+            "6c1dfa81f4f4171e61e98611bcb8a133bfbdbac0bf2a4b847b3c1ad4f24bf32a",
+            "the hook event identity must render byte-for-byte as before"
+        );
+
+        // Shape invariants, independent of any single vector: exactly 64
+        // characters of LOWERCASE hex. A formatter that dropped leading zeros
+        // would shorten the string; an uppercase one would break every
+        // comparison against an already-persisted value.
+        for (session, event) in [("sess-1", "evt-1"), ("s", "e"), ("", "e"), ("sess", "x")] {
+            let Some(rendered) = hook_event_hash(session, event) else {
+                continue;
+            };
+            assert_eq!(rendered.len(), 64, "digest must render as 64 hex chars");
+            assert!(
+                rendered
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+                "digest must render as lowercase hex: {rendered}"
+            );
+        }
+    }
+
+    /// A digest whose FIRST byte is zero is the case a "helpful" hex formatter
+    /// gets wrong: printing the digest as one big integer would emit 62 chars,
+    /// not 64, and silently re-key every record. Pinned with a known input whose
+    /// digest genuinely begins `00`.
+    #[test]
+    fn a_leading_zero_byte_is_still_rendered_as_two_hex_characters() {
+        let mut hasher = Sha256::new();
+        hasher.update(b"iw-leading-zero-291");
+        let rendered = hex_lower(&hasher.finalize());
+        assert_eq!(
+            rendered, "004aa374f92f83558b22b3ff72c05459bd96b0f189b93aac1bf7307e9e98641e",
+            "a leading zero byte must be zero-padded, not truncated"
+        );
+        assert_eq!(rendered.len(), 64);
+    }
+
+    /// `hex_lower` replaced a third-party `LowerHex` impl, so it gets its own
+    /// direct vectors rather than only being covered through the hasher: every
+    /// nibble value must map to the right lowercase character, and byte order
+    /// must be preserved.
+    #[test]
+    fn hex_lower_renders_every_nibble_and_preserves_byte_order() {
+        assert_eq!(hex_lower(&[]), "");
+        assert_eq!(hex_lower(&[0x00]), "00");
+        assert_eq!(hex_lower(&[0xff]), "ff");
+        assert_eq!(hex_lower(&[0x0a]), "0a");
+        assert_eq!(hex_lower(&[0xa0]), "a0");
+        // High nibble first, and order across bytes is preserved.
+        assert_eq!(hex_lower(&[0x01, 0x23, 0x45, 0x67]), "01234567");
+        assert_eq!(hex_lower(&[0x89, 0xab, 0xcd, 0xef]), "89abcdef");
+        // Every byte value renders as exactly two lowercase hex characters, and
+        // agrees with the standard library's own `{:02x}` for that byte.
+        for byte in 0u8..=255 {
+            let rendered = hex_lower(&[byte]);
+            assert_eq!(rendered, format!("{byte:02x}"));
+            assert_eq!(rendered.len(), 2);
+        }
+    }
+
+    /// The two NIST vectors, rendered through the exact `format!("{:x}", ..)`
+    /// path the product uses. If a dependency upgrade changed either the digest
+    /// or the rendering, this fails before any identity on disk is corrupted.
+    #[test]
+    fn the_known_answer_vectors_render_exactly() {
+        assert_eq!(
+            hex_lower(&Sha256::digest(b"abc")),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            hex_lower(&Sha256::digest(b"")),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
     }
 
     #[test]

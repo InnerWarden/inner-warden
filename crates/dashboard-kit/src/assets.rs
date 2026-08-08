@@ -71,8 +71,38 @@ fn valid_sha256(value: &str) -> bool {
     })
 }
 
-fn content_sha256(bytes: &[u8]) -> String {
-    format!("sha256:{:x}", Sha256::digest(bytes))
+/// Render bytes as lowercase hex, two characters per byte, high nibble first.
+///
+/// This is a deliberate transliteration of the `LowerHex` implementation that
+/// `generic_array` provided for digest outputs up to sha2 0.10. sha2 0.11 moved
+/// to `hybrid-array`, whose `Array` type does NOT implement `LowerHex`, so the
+/// rendering has to live here instead. The nibble table and ordering below are
+/// character-for-character the ones the old implementation used, because the
+/// string this produces is persisted data: see [`content_sha256`].
+///
+/// The old implementation also honoured `f.precision()` to truncate the output.
+/// No call site in this crate ever passed a precision (`{:x}`, never `{:.16x}`),
+/// so dropping that branch cannot change any digest this crate has ever emitted.
+fn hex_lower(bytes: &[u8]) -> String {
+    const LOWER_CHARS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        out.push(LOWER_CHARS[(byte >> 4) as usize] as char);
+        out.push(LOWER_CHARS[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+/// Render the `sha256:<hex>` digest string used throughout the bundle manifest
+/// and the versioned contract digests.
+///
+/// The output is COMPARED against strings already committed to disk (every
+/// entry in `web/dist/bundle-manifest.json`, and
+/// [`crate::versions::COMMUNITY_JOURNEY_CONTRACT_DIGEST`]), so its exact
+/// rendering is a compatibility contract, not a formatting preference. Public so
+/// that the one rendering is single-sourced rather than restated per call site.
+pub fn content_sha256(bytes: &[u8]) -> String {
+    format!("sha256:{}", hex_lower(&Sha256::digest(bytes)))
 }
 
 /// Validate a bundle manifest against the files a crate actually embedded.
@@ -247,6 +277,42 @@ mod tests {
     fn canonical_bundle_contains_the_spa_entrypoint() {
         assert_eq!(validate_embedded_bundle(), Ok(()));
         assert!(get("index.html").is_some());
+    }
+
+    /// IDENTITY PIN. `content_sha256` renders the digest that is compared, byte
+    /// for byte, against the `sha256:` strings committed in
+    /// `web/dist/bundle-manifest.json`. If the rendering ever changed, every
+    /// asset would fail its integrity check and the dashboard would serve
+    /// nothing, so the string form is a compatibility contract with data
+    /// already on disk.
+    ///
+    /// The expected value comes from Python's `hashlib`, which shares no code
+    /// with the `sha2` crate, so this pins the contract rather than restating
+    /// the current dependency's behaviour.
+    #[test]
+    fn content_sha256_renders_a_stable_prefixed_lowercase_hex_digest() {
+        assert_eq!(
+            content_sha256(b"export const valid = true;\n"),
+            "sha256:9ba8610918afca985b8d2181c26a95e09d11c200567a81bc19e6a127bb14d4ad"
+        );
+        // NIST vector, through the same rendering path.
+        assert_eq!(
+            content_sha256(b"abc"),
+            "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        // A digest whose first byte is zero: rendering it as one big integer
+        // would emit 62 characters instead of 64 and silently re-key the bundle.
+        assert_eq!(
+            content_sha256(b"iw-leading-zero-291"),
+            "sha256:004aa374f92f83558b22b3ff72c05459bd96b0f189b93aac1bf7307e9e98641e"
+        );
+        // And the shape the validator itself enforces must hold for all of them.
+        for probe in [&b"abc"[..], b"", b"iw-leading-zero-291"] {
+            assert!(
+                valid_sha256(&content_sha256(probe)),
+                "rendered digest must satisfy the validator's own 64-lowercase-hex rule"
+            );
+        }
     }
 
     #[test]

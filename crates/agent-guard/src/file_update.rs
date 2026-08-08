@@ -39,7 +39,12 @@ impl UpdateLock {
         let lock_path = sibling(path, "innerwarden.lock");
         let file = open_lock_file(&lock_path)
             .map_err(|error| format!("opening {}: {error}", lock_path.display()))?;
-        file.lock_exclusive()
+        // BLOCKING exclusive lock. fs4 1.x renamed `lock_exclusive` to `lock`;
+        // both are `flock(LOCK_EX)` on Unix and `LockFileEx(EXCLUSIVE)` on
+        // Windows, so this still waits for the other writer instead of failing.
+        // Called through the trait so it can never silently resolve to the
+        // inherent `std::fs::File::lock` on newer toolchains.
+        FileExt::lock(&file)
             .map_err(|error| format!("locking {}: {error}", lock_path.display()))?;
         Ok(Self(file))
     }
@@ -712,6 +717,46 @@ mod tests {
         let fifo = CString::new(lock.as_os_str().as_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
         assert!(UpdateLock::acquire(&config).is_err());
+    }
+
+    /// The serialization this module promises is only real if the sibling lock
+    /// actually EXCLUDES and actually BLOCKS. A migration that quietly turned it
+    /// into a shared lock, a try-lock, or a no-op would still compile and still
+    /// pass every other test here, while letting two writers interleave a
+    /// read/modify/replace on the same config.
+    #[test]
+    fn update_lock_excludes_a_second_writer_and_blocks_until_release() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("settings.json");
+        let held = UpdateLock::acquire(&path).expect("first writer acquires");
+
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let contender_path = path.clone();
+        let contender = std::thread::spawn(move || {
+            let lock = UpdateLock::acquire(&contender_path).expect("second writer acquires");
+            acquired_tx.send(()).unwrap();
+            drop(lock);
+        });
+
+        // Excludes: while the first lock is held the second acquisition cannot
+        // complete.
+        assert!(
+            acquired_rx
+                .recv_timeout(Duration::from_millis(250))
+                .is_err(),
+            "second writer must not acquire while the lock is held"
+        );
+
+        // Blocks rather than failing: releasing lets the waiter through instead
+        // of it having already returned an error.
+        drop(held);
+        acquired_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("second writer must acquire once the lock is released");
+        contender.join().unwrap();
     }
 
     #[cfg(unix)]

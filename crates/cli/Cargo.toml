@@ -56,14 +56,14 @@ toml = "0.8"
 glob = "0.3"
 # Advisory file lock (flock) so concurrent `hook`/`check` processes (multi-agent)
 # serialize their read-modify-write of the narrative graph — no lost updates.
-fs4 = { version = "0.8", features = ["sync"] }
+fs4 = { version = "1.1", features = ["sync"] }
 # The canonical white React bundle, versioned dashboard DTOs, and privacy-safe
 # token collector shared with the authenticated Active Defence server.
 innerwarden-dashboard-kit = { path = "../dashboard-kit" }
 serde_json = "1"
 # One-way hook event fingerprints make repeated delivery idempotent without
 # persisting provider tool-use identifiers in the local decision graph.
-sha2 = "0.10"
+sha2 = "0.11"
 ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
 base64 = "0.22"
 # Pure-Rust, no-TLS HTTP server for the optional `serve` mode (loopback only).

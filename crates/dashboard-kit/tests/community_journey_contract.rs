@@ -1,7 +1,6 @@
 use std::collections::BTreeSet;
 
 use serde_yaml::Value;
-use sha2::{Digest, Sha256};
 
 const CONTRACT: &str = include_str!("../contracts/v1/CJC-090-v1.yaml");
 const FOUNDATION: &str = include_str!("../contracts/v1/dashboard-core-v1.openapi.yaml");
@@ -187,7 +186,11 @@ fn all_twelve_journeys_have_exact_executable_evidence_locators() {
 
 #[test]
 fn bootstrap_digest_pins_the_exact_frozen_contract_bytes() {
-    let actual = format!("sha256:{:x}", Sha256::digest(CONTRACT.as_bytes()));
+    // Rendered through the crate's own `content_sha256` so the digest string
+    // compared here is produced by the exact code path that renders every other
+    // `sha256:` identity in this crate. A private copy of the hex formatting
+    // could drift from the real one and this test would not notice.
+    let actual = innerwarden_dashboard_kit::assets::content_sha256(CONTRACT.as_bytes());
     assert_eq!(
         actual,
         innerwarden_dashboard_kit::versions::COMMUNITY_JOURNEY_CONTRACT_DIGEST
