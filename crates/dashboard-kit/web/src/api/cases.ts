@@ -171,6 +171,12 @@ export type CaseListQuery = {
   host?: string;
   severity?: CaseSeverity | "";
   q?: string;
+  /**
+   * List order. "recent" is pure chronology (latest event first); "findings"
+   * (the server default when omitted) leads with incident-tier cases, then
+   * severity. Additive like `window`: an older server ignores it.
+   */
+  sort?: "recent" | "findings" | "";
 };
 
 type Fetch = typeof globalThis.fetch;
@@ -488,7 +494,7 @@ export class DashboardCasesClient {
       ["cursor", query.cursor, 2_048], ["outcome", query.outcome, 64], ["mode", query.mode, 64],
       ["authority", query.authority, 256], ["capability", query.capability, 256], ["agent", query.agent, 256],
       ["host", query.host, 256], ["severity", query.severity, 64], ["q", query.q, 256],
-      ["window", query.window, 8],
+      ["window", query.window, 8], ["sort", query.sort, 8],
     ] as const) {
       if (value && value.length <= maximum) parameters.set(name, value);
     }
