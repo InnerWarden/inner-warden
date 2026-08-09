@@ -311,15 +311,33 @@ fn hook_blocks(verdict: &serde_json::Value, block_review: bool) -> bool {
         })
 }
 
-/// Fold a behavioural alert into the pattern verdict.
+/// Fold a behavioural alert into the pattern verdict, as CONTEXT only.
 ///
-/// The alert describes the SESSION (a burst of calls, repeated sensitive reads),
-/// not this one command, so it must not invent a `deny` on its own: a fast agent
-/// doing safe work is not an attack. It raises an `allow` to `review` and adds
-/// the reason, leaving an existing `review`/`deny` untouched. The policy the
-/// operator already chose then decides what a `review` means.
+/// The alert describes the SESSION (a burst of calls), not this one command, so
+/// it is recorded on the verdict and never changes it. A tempo reading is not
+/// evidence about the command in hand.
 ///
-/// Pure, so the escalation rule is testable without a session file.
+/// This used to raise an `allow` to `review`. Two things were wrong with that,
+/// and both were measured on ten days of real hook traffic (15,602 commands):
+///
+/// - It contradicted the contract stated at the call site, "it never blocks a
+///   tool call on its own". A hook run with `--block-review` turns `review` into
+///   a hard stop, so tempo alone did block: 1,620 blocks, of which 1,493 were
+///   the rate rule and 1,485 carried NO other suspicion at all. `cat build.mjs`
+///   and `sed -n '730,830p' Cargo.lock` were refused for arriving quickly.
+/// - It does not bind an attacker. The window is a minute and the limit is a
+///   constant, so anything hostile simply paces under it, while the operator
+///   who cannot slow down absorbs every interruption. A control that only
+///   catches the legitimate user is one the operator learns to wave through,
+///   which is what the 653 `[suppressed: ...]` records in that sample show.
+///
+/// Burst still matters where it carries evidence rather than tempo:
+/// [`session::PersistedSession::record_file_access`] and `check_exfil` correlate
+/// repeated sensitive reads and read-then-outbound, and those raise their own
+/// alerts. An existing `review`/`deny` is left untouched and annotated, so a
+/// burst that accompanies a real signal is still blocked by that signal.
+///
+/// Pure, so the rule is testable without a session file.
 fn apply_behaviour(
     mut verdict: serde_json::Value,
     alert: Option<&innerwarden_agent_guard::session::Alert>,
@@ -328,13 +346,6 @@ fn apply_behaviour(
     let Some(obj) = verdict.as_object_mut() else {
         return verdict;
     };
-    let current = obj
-        .get("recommendation")
-        .and_then(|r| r.as_str())
-        .unwrap_or("allow");
-    if current == "allow" {
-        obj.insert("recommendation".into(), "review".into());
-    }
     let previous = obj
         .get("explanation")
         .and_then(|e| e.as_str())
@@ -1376,13 +1387,12 @@ mod behaviour_tests {
     /// REGRESSION ANCHOR. A session-level signal must reach the verdict at all:
     /// this is the behaviour `agent-guard` always had and this binary could
     /// never use, because the hook is one-shot and the tracker held `Instant`s.
+    /// It arrives as an annotation, which is all a tempo reading is worth.
     ///
-    /// FAILS ON REVERT: stop folding the alert in and the recommendation stays
-    /// `allow`.
+    /// FAILS ON REVERT: stop folding the alert in and the explanation is empty.
     #[test]
-    fn a_session_alert_raises_allow_to_review() {
+    fn a_session_alert_is_recorded_on_the_verdict() {
         let out = apply_behaviour(json!({"recommendation": "allow"}), Some(&alert()));
-        assert_eq!(out["recommendation"], "review");
         assert!(out["explanation"]
             .as_str()
             .unwrap()
@@ -1391,11 +1401,53 @@ mod behaviour_tests {
 
     /// The alert describes the SESSION, not this command. A fast agent doing
     /// safe work is not an attack, so a rate signal must never manufacture a
-    /// deny on its own.
+    /// deny OR a review on its own.
     #[test]
-    fn a_session_alert_never_invents_a_deny() {
+    fn a_session_alert_never_invents_a_verdict() {
         let out = apply_behaviour(json!({"recommendation": "allow"}), Some(&alert()));
-        assert_ne!(out["recommendation"], "deny");
+        assert_eq!(
+            out["recommendation"], "allow",
+            "tempo is context, not a judgement about this command"
+        );
+    }
+
+    /// THE DEFECT THIS FIXES, end to end through the policy layer.
+    ///
+    /// The hook this product ships runs with `--block-review`, so promoting
+    /// `allow` to `review` was a hard refusal. On ten days of real traffic that
+    /// path produced 1,485 refusals of commands carrying no other suspicion.
+    ///
+    /// FAILS ON REVERT: restore the promotion and a zero-risk command blocks
+    /// purely for arriving quickly.
+    #[test]
+    fn tempo_alone_does_not_block_a_zero_risk_command() {
+        let verdict = apply_behaviour(
+            json!({"recommendation": "allow", "risk_score": 0, "signals": []}),
+            Some(&alert()),
+        );
+        assert!(
+            !hook_blocks(&verdict, true),
+            "a burst of safe commands must not stop the agent"
+        );
+    }
+
+    /// The other half of the contract: removing the promotion must not soften a
+    /// command that earned a verdict on its own merits while a burst was in
+    /// progress. The signal blocks; the burst rides along as context.
+    #[test]
+    fn a_burst_alongside_a_real_signal_still_blocks() {
+        for existing in ["deny", "review"] {
+            let verdict = apply_behaviour(
+                json!({
+                    "recommendation": existing,
+                    "risk_score": 50,
+                    "explanation": "reverse shell indicator: `/dev/tcp/`",
+                    "signals": [{"signal": "reverse_shell", "score": 50}],
+                }),
+                Some(&alert()),
+            );
+            assert!(hook_blocks(&verdict, true), "{existing} must still block");
+        }
     }
 
     /// An existing decision outranks the session signal in both directions: a
