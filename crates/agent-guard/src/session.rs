@@ -5,7 +5,17 @@ use std::time::Instant;
 
 use crate::threats;
 
-pub const MAX_CALLS_PER_MINUTE: u32 = 30;
+/// Call rate above which a session's tempo is worth recording as context.
+///
+/// NOT a limit: nothing is refused for crossing it. See `apply_behaviour` in the
+/// CLI for why tempo annotates a verdict instead of changing it.
+///
+/// The value was 30, chosen for a human at a keyboard. An agent reading files in
+/// a loop is not that: over ten days of real hook traffic the legitimate rate
+/// ran 31-72/min with a median of 35, so 30 was crossed almost continuously and
+/// the annotation said nothing. Set above that measured ceiling so crossing it
+/// again means something.
+pub const NOTABLE_CALLS_PER_MINUTE: u32 = 120;
 pub const MAX_FAILURES_PER_SESSION: u32 = 5;
 pub const MAX_SENSITIVE_PER_SESSION: u32 = 3;
 /// How long a read stays relevant to exfiltration correlation. Mirrors the
@@ -52,13 +62,13 @@ impl SessionTracker {
         let cutoff = now - std::time::Duration::from_secs(60);
         self.call_times.retain(|t| *t > cutoff);
 
-        if self.call_times.len() as u32 > MAX_CALLS_PER_MINUTE {
+        if self.call_times.len() as u32 > NOTABLE_CALLS_PER_MINUTE {
             return Some(Alert {
                 layer: Layer::Warn,
                 reason: format!(
-                    "{}/min exceeds limit ({})",
+                    "{}/min sustained (notable above {})",
                     self.call_times.len(),
-                    MAX_CALLS_PER_MINUTE
+                    NOTABLE_CALLS_PER_MINUTE
                 ),
             });
         }
@@ -164,12 +174,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rate_limit() {
+    fn a_notable_rate_raises_an_alert() {
         let mut s = SessionTracker::new();
-        for _ in 0..35 {
+        for _ in 0..=NOTABLE_CALLS_PER_MINUTE {
             s.record_call();
         }
         assert!(s.record_call().is_some());
+    }
+
+    /// The tempo an agent genuinely sustains while doing safe work must stay
+    /// quiet. Measured over ten days of real hook traffic the legitimate rate
+    /// peaked at 72/min, so nothing in that band may raise an alert.
+    ///
+    /// FAILS ON REVERT: put the threshold back to 30 and normal agent work is
+    /// flagged again.
+    #[test]
+    fn the_measured_legitimate_agent_tempo_stays_quiet() {
+        let mut s = SessionTracker::new();
+        for _ in 0..72 {
+            assert!(
+                s.record_call().is_none(),
+                "72/min is real, observed, legitimate agent work"
+            );
+        }
     }
 
     #[test]
@@ -239,20 +266,20 @@ impl PersistedSession {
         self.call_times_ms.push(now_ms);
         let cutoff = now_ms - 60_000;
         self.call_times_ms.retain(|t| *t > cutoff);
-        // Bound the vector even when the caller never trips the limit, so a very
-        // long session cannot grow the state file without end.
-        let ceiling = (MAX_CALLS_PER_MINUTE as usize + 1) * 4;
+        // Bound the vector even when the caller never crosses the threshold, so a
+        // very long session cannot grow the state file without end.
+        let ceiling = (NOTABLE_CALLS_PER_MINUTE as usize + 1) * 4;
         if self.call_times_ms.len() > ceiling {
             let drop = self.call_times_ms.len() - ceiling;
             self.call_times_ms.drain(..drop);
         }
-        if self.call_times_ms.len() as u32 > MAX_CALLS_PER_MINUTE {
+        if self.call_times_ms.len() as u32 > NOTABLE_CALLS_PER_MINUTE {
             return Some(Alert {
                 layer: Layer::Warn,
                 reason: format!(
-                    "{}/min exceeds limit ({})",
+                    "{}/min sustained (notable above {})",
                     self.call_times_ms.len(),
-                    MAX_CALLS_PER_MINUTE
+                    NOTABLE_CALLS_PER_MINUTE
                 ),
             });
         }
@@ -313,7 +340,7 @@ mod persisted_tests {
     fn the_rate_limit_trips_across_separate_invocations() {
         let mut s = PersistedSession::default();
         let mut tripped_at = None;
-        for i in 0..=(MAX_CALLS_PER_MINUTE as i64 + 1) {
+        for i in 0..=(NOTABLE_CALLS_PER_MINUTE as i64 + 1) {
             let resumed: PersistedSession =
                 serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
             s = resumed;
@@ -323,7 +350,7 @@ mod persisted_tests {
         }
         assert_eq!(
             tripped_at,
-            Some(MAX_CALLS_PER_MINUTE as i64),
+            Some(NOTABLE_CALLS_PER_MINUTE as i64),
             "must trip on the call after the limit, counting across processes"
         );
     }
@@ -333,10 +360,10 @@ mod persisted_tests {
     #[test]
     fn calls_outside_the_minute_window_are_forgotten() {
         let mut s = PersistedSession::default();
-        for i in 0..MAX_CALLS_PER_MINUTE as i64 {
+        for i in 0..NOTABLE_CALLS_PER_MINUTE as i64 {
             s.record_call(i);
         }
-        assert_eq!(s.call_times_ms.len(), MAX_CALLS_PER_MINUTE as usize);
+        assert_eq!(s.call_times_ms.len(), NOTABLE_CALLS_PER_MINUTE as usize);
         // Far outside the 60s window: everything before is dropped.
         assert!(s.record_call(500_000).is_none());
         assert_eq!(s.call_times_ms, vec![500_000]);
@@ -351,7 +378,7 @@ mod persisted_tests {
             s.record_call(1_000_000 + i);
         }
         assert!(
-            s.call_times_ms.len() <= (MAX_CALLS_PER_MINUTE as usize + 1) * 4,
+            s.call_times_ms.len() <= (NOTABLE_CALLS_PER_MINUTE as usize + 1) * 4,
             "unbounded growth: {}",
             s.call_times_ms.len()
         );

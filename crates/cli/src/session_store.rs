@@ -173,7 +173,7 @@ mod tests {
         let mut alerted = false;
         // Each iteration reads and writes the file exactly as a separate hook
         // process would.
-        for _ in 0..=(innerwarden_agent_guard::session::MAX_CALLS_PER_MINUTE + 1) {
+        for _ in 0..=(innerwarden_agent_guard::session::NOTABLE_CALLS_PER_MINUTE + 1) {
             if record_call_at(Some("sess-1"), Some(file.clone())).is_some() {
                 alerted = true;
             }

@@ -480,14 +480,36 @@ pub(crate) fn append_guard_event(line: &Value) {
 
 /// [`append_guard_event`] against an explicit directory, so the sink's schema
 /// can be exercised without an ambient environment.
+/// Write one record as ONE `write` call.
+///
+/// `writeln!(file, "{line}")` looks atomic and is not. `File` is unbuffered and
+/// `Display` for a `Value` emits the JSON token by token, so a single record left
+/// as dozens of small writes. Under `O_APPEND` each of those is atomic on its
+/// own, which places a concurrent writer's record *between* them: two hook
+/// processes running for parallel tool calls produced lines like
+/// `{"detail":"{ssh ... < "\"detail/private/tmp/...`, one record torn in half and
+/// another spliced into the wound.
+///
+/// Measured on the operator's own machine: 12 of 1,716 lines would not parse,
+/// destroying 6 records. An audit sink that garbles itself when the thing it
+/// audits gets busy is unreliable exactly when it matters, and the corruption
+/// lands in whatever tails it.
+///
+/// Serialising first and issuing one `write_all` (newline included) makes the
+/// record a single syscall, which is the unit `O_APPEND` keeps intact. That is
+/// the guarantee `O_APPEND` actually offers; it is not a promise about every
+/// filesystem, and this stays best-effort telemetry that can never alter a
+/// verdict.
 fn append_guard_event_at(dir: &std::path::Path, line: &Value) {
     use std::io::Write;
+    let mut record = line.to_string();
+    record.push('\n');
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(dir.join("guard-events.jsonl"))
     {
-        let _ = writeln!(file, "{line}");
+        let _ = file.write_all(record.as_bytes());
     }
 }
 
@@ -764,6 +786,69 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
 mod tests {
     use super::*;
     use innerwarden_agent_guard::mcp::{Verdict, VerdictAlert};
+
+    /// Concurrent writers must not tear each other's records.
+    ///
+    /// The hook is one process per tool call, so an agent issuing parallel tool
+    /// calls runs several at once, all appending here. This reproduces that and
+    /// asserts the only property a JSONL audit sink has to hold: every line
+    /// parses.
+    ///
+    /// FAILS ON REVERT: restore `writeln!(file, "{line}")` and the token-by-token
+    /// writes interleave, producing exactly the unparseable lines found in the
+    /// operator's own `guard-events.jsonl`.
+    #[test]
+    fn concurrent_writers_do_not_tear_records() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().to_path_buf();
+        const WRITERS: usize = 8;
+        const EACH: usize = 40;
+
+        std::thread::scope(|scope| {
+            for writer in 0..WRITERS {
+                let path = path.clone();
+                scope.spawn(move || {
+                    for n in 0..EACH {
+                        // Long, quote-heavy and newline-bearing, like the shell
+                        // commands this sink actually records.
+                        let detail = format!(
+                            "ssh -i ~/.ssh/id_ed25519 host 'sudo sqlite3 db \"select \\\"x\\\" \
+                             from t where id={writer}-{n};\"'\n{}",
+                            "a".repeat(512)
+                        );
+                        append_guard_event_at(
+                            &path,
+                            &serde_json::json!({
+                                "kind": "guard.blocked",
+                                "writer": writer,
+                                "n": n,
+                                "detail": detail,
+                            }),
+                        );
+                    }
+                });
+            }
+        });
+
+        let raw = std::fs::read_to_string(path.join("guard-events.jsonl")).unwrap();
+        let lines: Vec<_> = raw.lines().filter(|l| !l.trim().is_empty()).collect();
+        let bad: Vec<_> = lines
+            .iter()
+            .filter(|l| serde_json::from_str::<Value>(l).is_err())
+            .collect();
+        assert!(
+            bad.is_empty(),
+            "{} of {} lines unparseable; an audit sink that garbles itself under \
+             load is unreliable exactly when it matters",
+            bad.len(),
+            lines.len()
+        );
+        assert_eq!(
+            lines.len(),
+            WRITERS * EACH,
+            "every record must survive as exactly one line"
+        );
+    }
 
     #[test]
     fn emit_guard_event_appends_blocked_line_next_to_graph() {
