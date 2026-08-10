@@ -18,8 +18,12 @@ and verification, and the full cut-a-release checklist.
 
 Distribution lives in:
 
-- `npm/`: the seven npm packages + build/publish scripts.
+- `npm/`: the `innerwarden` wrapper package + build/publish scripts (the six
+  `@innerwarden/cli-<os>-<arch>` platform packages are assembled at publish
+  time, not checked in).
 - `packaging/`: nfpm config + the `.deb`/`.rpm` build script.
+- `.github/workflows/release-guard.yml`: the primary release pipeline that
+  builds and signs the binaries every other channel consumes.
 - `.github/workflows/npm-publish.yml`: publish npm via OIDC.
 - `.github/workflows/linux-packages.yml`: build + test-install `.deb`/`.rpm`.
 
