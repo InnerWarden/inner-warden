@@ -1587,7 +1587,12 @@ mod prune_tests {
     /// so the file grew for the life of the install.
     ///
     /// FAILS ON REVERT: make `prune` a no-op and the length assertion trips.
+    ///
+    /// Skipped under miri: 20k nodes is volume, and volume is the one thing an
+    /// interpreter cannot do cheaply. See the note on
+    /// `prune_bounds_the_serialised_size_not_only_the_node_count`.
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn the_store_is_capped_and_drops_the_oldest() {
         let mut g = Graph::new();
         for i in 0..(Graph::MAX_NODES + 500) {
@@ -1661,7 +1666,22 @@ mod prune_tests {
     ///
     /// FAILS ON REVERT: drop the byte budget from `prune` and this graph stays
     /// over the limit, exactly as the user's did.
+    ///
+    /// Skipped under miri, and the reason is worth writing down because it cost
+    /// a week of nightly runs. This test has to build ~14 MB (20k nodes with
+    /// 700-byte labels) to reproduce "inside the node cap, over the byte
+    /// budget", and `prune` then serialises the whole graph on each pass of its
+    /// shrink loop. Native that is a moment; under an interpreter it does not
+    /// finish, so the nightly `miri` job ran to the 6-hour platform cap and was
+    /// killed every night from 2026-08-06 to 2026-08-12. The run showed as
+    /// "cancelled", which reads as harmless, so nothing was checked for UB the
+    /// whole time.
+    ///
+    /// Nothing is lost by skipping it here: neither this crate nor `notify`
+    /// contains a single `unsafe` block, and what miri is for is exercised by
+    /// the other 26 tests, which run in about a second.
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn prune_bounds_the_serialised_size_not_only_the_node_count() {
         let mut g = Graph::default();
         // 700-byte commands are what the real graph held; 20k of them is inside
@@ -1695,7 +1715,13 @@ mod prune_tests {
 
     /// An edge pointing at a pruned node would render as a relationship to
     /// something the reader cannot resolve, so it goes with it.
+    ///
+    /// Skipped under miri for the same reason as its two neighbours: 20k nodes.
+    /// This one is why the guard below exists — skipping the other two was not
+    /// enough, the nightly simply hung here instead, and only running miri for
+    /// real showed it.
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn edges_that_would_dangle_are_removed_with_their_node() {
         let mut g = Graph::new();
         for i in 0..(Graph::MAX_NODES + 2) {
@@ -1712,6 +1738,68 @@ mod prune_tests {
         assert!(
             g.edges.iter().any(|e| e.from == survivor),
             "an edge between surviving nodes must be kept"
+        );
+    }
+
+    /// A cap-scale test must carry `#[cfg_attr(miri, ignore)]`.
+    ///
+    /// Miri interprets every operation, so building 20k nodes there does not
+    /// finish. The nightly `miri` job had no time budget, so it ran to GitHub's
+    /// 6-hour platform cap and was killed every night from 2026-08-06 to
+    /// 2026-08-12, reporting "cancelled" — which reads as harmless. Nothing was
+    /// checked for undefined behaviour for a week, and nothing said so.
+    ///
+    /// Skipping the two obvious offenders was NOT enough: the run simply hung
+    /// on a third, and that only surfaced by running miri for real. Hence a
+    /// check rather than a habit — the next cap-scale test added here would
+    /// otherwise re-break the nightly silently.
+    ///
+    /// Volume costs nothing under miri anyway: neither this crate nor `notify`
+    /// has a single `unsafe` block, and the remaining tests cover the same code
+    /// paths in about a second.
+    #[test]
+    fn a_cap_scale_test_must_be_skipped_under_miri() {
+        let source = include_str!("lib.rs");
+
+        // Split on the attribute so each chunk ends with one test's body, then
+        // look back at the attributes that introduced it.
+        let mut offenders = Vec::new();
+        for block in source.split("\n    #[test]\n").skip(1) {
+            let (attrs_and_sig, body) = match block.split_once('{') {
+                Some(p) => p,
+                None => continue,
+            };
+            let name = attrs_and_sig
+                .lines()
+                .find_map(|l| l.trim().strip_prefix("fn "))
+                .map(|s| s.split('(').next().unwrap_or(s).to_string())
+                .unwrap_or_default();
+            // Cut at the function's own closing brace. Reading past it lands in
+            // the NEXT test's doc comment, and one of those mentions MAX_NODES
+            // in prose — which flagged an innocent test on the first attempt.
+            let body = body.split("\n    }").next().unwrap_or(body);
+            // Prose does not build a graph, so ignore comments entirely.
+            let code: String = body
+                .lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    !t.starts_with("//")
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let cap_scale = code.contains("MAX_NODES");
+            let skipped = attrs_and_sig.contains("cfg_attr(miri, ignore)");
+            if cap_scale && !skipped && name != "a_cap_scale_test_must_be_skipped_under_miri" {
+                offenders.push(name);
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "these tests build MAX_NODES-scale graphs but are not skipped under \
+             miri, so the nightly undefined-behaviour job will hang until the \
+             6-hour platform cap kills it and report only \"cancelled\": {}",
+            offenders.join(", ")
         );
     }
 
