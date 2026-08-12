@@ -3,6 +3,42 @@
 All notable changes to InnerWarden are documented here. This project
 follows semantic versioning.
 
+## 1.3.2 - 2026-08-13
+
+No behaviour change for users. This release carries build-supply-chain and
+test-corpus hygiene, plus the CI repairs that make the nightly deep checks
+mean something again.
+
+### Security
+
+- **postcss forced past GHSA-fxqj-rqcc-2cmp.** A version at or below 8.5.22
+  reads arbitrary `.map` files from an attacker-controlled `sourceMappingURL`
+  when `from` is unset. It is a development dependency of the dashboard build
+  and never reaches the shipped binary, so this is hygiene rather than an
+  exposure, but the lock now resolves to 8.5.26 through an `overrides` entry.
+  The built bundle is byte-identical.
+- **The Google API key fixture in the ATR corpus is now unmistakably a
+  fixture.** It lived in the `true_positives` block of the rule that detects
+  leaked API keys, next to other synthetic examples, and had an open GitHub
+  secret-scanning alert against it since 2026-07-23. It still matches the
+  rule's own pattern, so the rule keeps being tested.
+
+### Fixed
+
+- **The nightly undefined-behaviour check finishes again.** The `miri` job had
+  no time budget, so it ran to GitHub's six-hour platform cap and was killed
+  every night from 2026-08-06 to 2026-08-12, reporting "cancelled" — which
+  reads as harmless. Nothing was checked for UB for a week and nothing said so.
+  Three tests build 20k-node graphs to prove a byte budget, which an
+  interpreter cannot do cheaply; they are skipped under miri, and a check now
+  fails when a cap-scale test is added without that skip. miri also carries an
+  explicit timeout, so a future hang fails visibly. Running it for real found
+  no undefined behaviour.
+- **The nightly mutation run reports again.** `cargo-mutants` hit its own job
+  timeout, which killed the report upload with it, so every night produced
+  nothing. It now stops itself inside the job budget and ships a partial report
+  that says it is partial.
+
 ## 1.1.0 - 2026-08-06
 
 ### Security
