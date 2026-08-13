@@ -844,6 +844,27 @@ pub fn analyze_command_with(
         score += s;
     }
 
+    // The step BEFORE reading a known secret: sweeping the filesystem for one.
+    // Only counted when the command has not already been charged for reading a
+    // named credential path, so `grep -r password /root/.ssh` is one finding
+    // rather than two stacked into a deny it did not earn.
+    if !signals
+        .iter()
+        .any(|s| s.signal == "sensitive_credential_read")
+    {
+        if let Some((what, s)) = threats::check_credential_hunt(scan_cmd) {
+            signals.push(AnalysisSignal {
+                signal: "credential_hunt".into(),
+                score: s,
+                detail: format!(
+                    "searches the filesystem for credentials (`{what}`) rather than \
+                     naming one: reconnaissance for secrets, MITRE T1552"
+                ),
+            });
+            score += s;
+        }
+    }
+
     // Advisory protected-read check: would this command READ an operator-declared
     // protected secret path? This warns the agent BEFORE it tries (and catches the
     // string-level disguises `cat secret*`, quoted/escaped paths, `..` traversal,
