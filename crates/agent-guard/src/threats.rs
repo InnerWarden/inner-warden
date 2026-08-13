@@ -1157,6 +1157,101 @@ fn ssh_identity_use_only(segment: &str) -> bool {
 /// A path mention by itself is not evidence (`echo ~/.ssh/id_rsa`, documentation,
 /// chmod hardening); the path must be paired with a command that consumes file
 /// content. Operator-declared paths continue to use `check_protected_read`.
+/// Hunting for credentials the command does not yet know the path of.
+///
+/// [`check_sensitive_read`] answers "is this reading a KNOWN secret path", and
+/// it is strong at that. It is structurally blind to the step before: sweeping
+/// the filesystem for secrets whose location is not known yet. Measured on the
+/// live HackMyWarden box, where all three scored 0 and were answered
+/// "no dangerous patterns detected":
+///
+///   cat /home/*/secret* /root/secret* 2>/dev/null
+///   grep -ri password /home
+///   find / -name id_rsa
+///
+/// The first was reported to the operator as "Harmless. Beneath concern." It
+/// returned nothing only because no such file happened to exist. Passing by
+/// luck is not the same as deciding well, and MITRE calls this T1552
+/// (Unsecured Credentials) whether or not it finds anything.
+///
+/// Scored for REVIEW, deliberately, not deny. `grep -r password ./src` is
+/// ordinary work in a code tree, and a guardrail that blocks it gets turned
+/// off. What separates hunting from working is the SCOPE: a system-wide or
+/// all-users sweep, not the keyword. So the broad-root requirement below is
+/// the whole rule, and relaxing it would trade a real signal for noise.
+pub fn check_credential_hunt(content: &str) -> Option<(String, u32)> {
+    static SEARCHER: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static SECRET_TOKEN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static BROAD_ROOT: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+
+    // Verbs that ENUMERATE rather than open one named file: a recursive or
+    // filename search. Plain `cat`/`head` are covered because a glob is what
+    // makes them a sweep, and the glob is required separately below.
+    let searcher = SEARCHER.get_or_init(|| {
+        regex::Regex::new(
+            r"(?i)\b(?:find|locate|fd)\b|\b(?:grep|egrep|rg|ag|ack)\b[^|;&]*\s-{1,2}[a-zA-Z]*r",
+        )
+        .expect("static credential-hunt searcher regex")
+    });
+    // What is being hunted. Deliberately the words an operator would call
+    // secrets, not file extensions alone: `*.pem` in a certs directory is
+    // routine, `find / -name '*.pem'` is not, and the root check separates them.
+    let secret_token = SECRET_TOKEN.get_or_init(|| {
+        regex::Regex::new(
+            r"(?i)(secret|password|passwd|credential|api[_-]?key|id_rsa|id_ed25519|private[_-]?key|\.pem\b|\.p12\b|\.ppk\b|authorized_keys)",
+        )
+        .expect("static credential-hunt token regex")
+    });
+    // System-wide or all-users scope. `/home/*/` counts: sweeping every user's
+    // home is hunting even though each path is shallow. A relative path or a
+    // single named directory does NOT count, which is what keeps a developer
+    // grepping their own tree out of this.
+    let broad_root = BROAD_ROOT.get_or_init(|| {
+        regex::Regex::new(r"(?:^|[\s'\x22])(?:/|~/?|/home/?\*|/home\b|/root\b|/etc\b|/var\b|/srv\b|/opt\b|/mnt\b|/media\b)(?:[\s'\x22/*]|$)")
+            .expect("static credential-hunt root regex")
+    });
+
+    // `locate` and friends read a prebuilt index of the WHOLE filesystem, so
+    // they are system-wide with no path argument at all. Requiring a broad root
+    // of them would mean `locate id_rsa` — the purest form of this — slipped
+    // through on a technicality.
+    static WHOLE_FS: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let whole_fs = WHOLE_FS
+        .get_or_init(|| regex::Regex::new(r"(?i)\b(?:locate|mlocate|plocate)\b").expect("static"));
+
+    // A reader pointed at a glob: `cat /home/*/secret*` names no directory to
+    // search but sweeps all the same. Hoisted out of the loop — compiling this
+    // per segment would put an allocation on the screening hot path.
+    static GLOB_READER_CELL: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let glob_reader = GLOB_READER_CELL.get_or_init(|| {
+        regex::Regex::new(r"(?i)\b(?:cat|head|tail|less|more|strings|cp|tar|zip)\b")
+            .expect("static credential-hunt glob-reader regex")
+    });
+
+    for segment in shell_command_segments(content) {
+        if !secret_token.is_match(segment) {
+            continue;
+        }
+        if !broad_root.is_match(segment) && !whole_fs.is_match(segment) {
+            continue;
+        }
+        // Either an enumerating verb, or a reader pointed at a glob — the
+        // `cat /home/*/secret*` shape, which names no directory to search but
+        // sweeps all the same.
+        let is_search = searcher.is_match(segment);
+        let is_glob_read = segment.contains('*') && glob_reader.is_match(segment);
+        if is_search || is_glob_read {
+            let what = secret_token
+                .captures(segment)
+                .and_then(|c| c.get(1))
+                .map(|m| m.as_str().to_string())
+                .unwrap_or_else(|| "credentials".to_string());
+            return Some((what, 25));
+        }
+    }
+    None
+}
+
 pub fn check_sensitive_read(content: &str) -> Option<(&'static str, u32)> {
     static CRED_DIR: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     static READER: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
@@ -3613,6 +3708,69 @@ fn normalize_command_target(target: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The three shapes that scored 0 on the live challenge box and were
+    /// answered "no dangerous patterns detected" — one of them narrated to the
+    /// operator as "Harmless. Beneath concern." It returned nothing only
+    /// because no such file happened to exist.
+    #[test]
+    fn credential_hunting_is_caught_even_when_no_known_path_is_named() {
+        for cmd in [
+            "cat /home/*/secret* /root/secret* 2>/dev/null",
+            "grep -ri password /home",
+            "find / -name id_rsa 2>/dev/null",
+            "find /home -name '*.pem'",
+            "grep -r api_key /etc",
+            "locate authorized_keys",
+        ] {
+            let hit = check_credential_hunt(cmd);
+            assert!(hit.is_some(), "must flag credential hunting: {cmd}");
+            assert_eq!(hit.unwrap().1, 25, "review band, not deny: {cmd}");
+        }
+    }
+
+    /// The half that decides whether this rule is worth having.
+    ///
+    /// A guardrail that flags `grep -r password ./src` gets switched off, and
+    /// then it protects nothing. What separates hunting from working is the
+    /// SCOPE — system-wide or every user's home — not the keyword, so none of
+    /// these may fire.
+    #[test]
+    fn ordinary_work_in_a_project_tree_is_not_credential_hunting() {
+        for cmd in [
+            "grep -r password ./src",
+            "grep -ri token .",
+            "find . -name '*.pem'",
+            "rg api_key src/",
+            "grep -r secret ../config",
+            "cat ./secrets.example",
+            "ls -la /home/user",
+            "cat /home/user/notes.txt",
+            "find . -name '*.rs' -newer Cargo.toml",
+            // No secret token at all: a plain system-wide search is not this rule's business.
+            "find / -name '*.log'",
+            // A secret token with no broad root and no search verb.
+            "echo my_password_is_here",
+        ] {
+            assert!(
+                check_credential_hunt(cmd).is_none(),
+                "must NOT flag ordinary work: {cmd}"
+            );
+        }
+    }
+
+    /// Reading a KNOWN credential path is already `check_sensitive_read`'s job
+    /// and scores higher. The two must not stack into a deny the command did
+    /// not earn, so the caller suppresses this one when that already fired —
+    /// this pins that they are genuinely distinct checks, not overlapping ones.
+    #[test]
+    fn hunting_and_reading_a_known_path_are_different_findings() {
+        // Names the path outright: the read rule owns this.
+        assert!(check_sensitive_read("cat /root/.ssh/id_rsa").is_some());
+        // Does not know the path yet: only the hunt rule can see it.
+        assert!(check_sensitive_read("find / -name id_rsa").is_none());
+        assert!(check_credential_hunt("find / -name id_rsa").is_some());
+    }
 
     /// REGRESSION ANCHOR, from a block that happened for real.
     ///
