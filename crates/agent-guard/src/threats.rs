@@ -1952,8 +1952,17 @@ pub fn check_security_tamper(content: &str) -> Option<(&'static str, u32)> {
         "truncate ",
         "mv ",
     ];
-    let removal_of_self = REMOVAL_VERBS.iter().any(|v| lower.contains(v))
-        && INNERWARDEN_SELF_PATHS.iter().any(|p| lower.contains(p));
+    // The verb and the InnerWarden path must belong to the SAME command, exactly
+    // as `destructive_rm_root` already requires. Testing both against the whole
+    // string denied ordinary work whenever a removal touching something else
+    // shared a line with a read of our own config: `mv old.txt new.txt && grep
+    // provider /etc/innerwarden/agent.toml` scored 60. The `mv` there never
+    // names an InnerWarden path. A support engineer reading a config beside any
+    // cleanup step got told they were tampering with security monitoring.
+    let removal_of_self = shell_command_segments(&lower).into_iter().any(|seg| {
+        REMOVAL_VERBS.iter().any(|v| seg.contains(v))
+            && INNERWARDEN_SELF_PATHS.iter().any(|p| seg.contains(p))
+    });
     if redirect_over_self || removal_of_self {
         return Some(("removing or altering InnerWarden files", 60));
     }
@@ -4011,6 +4020,52 @@ mod tests {
             assert!(
                 check_security_tamper(evil).is_some(),
                 "real self-tamper not flagged: {evil}"
+            );
+        }
+    }
+
+    /// The removal verb and the InnerWarden path must be the SAME command.
+    ///
+    /// Both were matched against the whole string, so any cleanup step sharing a
+    /// line with a read of our own config scored 60/deny. Measured against the
+    /// shipped build while an operator was inspecting a host: reading
+    /// `agent.toml` beside an unrelated `rm`/`mv` was reported as "disabling or
+    /// tampering with security monitoring". That is the worst possible direction
+    /// for a false positive - it accuses the person doing support of sabotage,
+    /// and it teaches them the tamper verdict is noise.
+    ///
+    /// `destructive_rm_root` already refuses to cross command boundaries for
+    /// exactly this reason; this rule now uses the same segmentation.
+    #[test]
+    fn security_tamper_does_not_pair_a_removal_with_an_unrelated_innerwarden_read() {
+        for benign in [
+            "mv old.txt new.txt && grep provider /etc/innerwarden/agent.toml",
+            "sqlite3 /var/lib/innerwarden/innerwarden.db \"select 1\" ; rm -f /tmp/scratch",
+            "grep -c provider /etc/innerwarden/agent.toml && rm /tmp/x",
+            "rm -rf ./build; cat /etc/innerwarden/agent.toml",
+            "cat /etc/innerwarden/agent.toml | grep provider",
+        ] {
+            assert_eq!(
+                check_security_tamper(benign),
+                None,
+                "benign read flagged as self-tamper: {benign}"
+            );
+        }
+    }
+
+    /// The segmentation must not become an evasion: keeping the verb and the
+    /// InnerWarden path together in one command still denies, whatever else
+    /// shares the line.
+    #[test]
+    fn security_tamper_still_flags_removal_in_the_same_segment() {
+        for evil in [
+            "echo hi && rm -f /usr/local/bin/innerwarden",
+            "ls /tmp; mv /etc/innerwarden/agent.toml /tmp/stolen",
+            "cd /var && shred /var/lib/innerwarden/state.db && echo done",
+        ] {
+            assert!(
+                check_security_tamper(evil).is_some(),
+                "same-segment self-tamper not flagged: {evil}"
             );
         }
     }
