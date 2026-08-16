@@ -3,6 +3,38 @@
 All notable changes to InnerWarden are documented here. This project
 follows semantic versioning.
 
+## 1.3.3 - 2026-08-16
+
+Two screening fixes, both found by running the shipped build against real
+work rather than against the test corpus. Each was verified by reverting the
+fix and watching the new test fail.
+
+### Fixed
+
+- **The tamper rule no longer crosses command boundaries.**
+  `check_security_tamper` tested the removal verb and the InnerWarden path
+  against the whole command string independently, so the two never had to be
+  related to each other. Any ordinary cleanup step that shared a line with a
+  read of our own config was denied at score 60 — a rename of an unrelated
+  file beside a `grep` of `agent.toml`, a `sqlite3` query beside a removal
+  under a temp directory. In none of them does the removal verb name an
+  InnerWarden path, yet all were reported as *"disabling or tampering with
+  security monitoring"*.
+
+  That is the worst direction for a false positive to point. It lands on the
+  person doing support, during an incident, and it teaches them that the
+  tamper verdict is noise — the one verdict that has to keep its credibility.
+
+  `destructive_rm_root` already refused to cross command boundaries for
+  exactly this reason, and the tamper rule now uses the same segmentation:
+  the verb and the path must belong to one command. Genuine self-tamper
+  (removing or moving our own binary, config or state) still denies, whatever
+  else shares the line.
+
+- **Credential hunting is flagged, not just credential reading.** A command
+  that goes looking for secrets across a broad root now scores, where
+  previously only a read of an already-known secret path did.
+
 ## 1.3.2 - 2026-08-13
 
 No behaviour change for users. This release carries build-supply-chain and
