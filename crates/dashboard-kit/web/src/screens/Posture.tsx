@@ -155,23 +155,41 @@ export function Posture({
   posture,
   current,
   evaluatedAt,
+  onCheckNow,
 }: {
   bootstrap: DashboardBootstrap;
   posture: DashboardPosture;
   current: boolean;
   evaluatedAt: string;
+  /** Force a re-read of the host now. Optional so an embedder that has no
+   *  refresh handle simply does not render the button. */
+  onCheckNow?: () => void | Promise<void>;
 }) {
   const pills = posture.layers.map((layer) => controlPill(layer, bootstrap, posture.generated_at, current, evaluatedAt));
   const operatorGaps = dedupeGaps(posture.gaps.filter((gap) => gapAudience(gap) === "operator"));
 
   return (
     <div className="space-y-8">
-      <div>
-        <p className="text-xs font-semibold uppercase tracking-[0.16em] text-cyan-700">Protection posture</p>
-        <h2 className="mt-1 text-xl font-semibold tracking-tight text-slate-950">Host controls</h2>
-        <p className="mt-1 max-w-3xl text-sm leading-6 text-slate-600">
-          What is enforcing, what is watching, and where the gaps are.
-        </p>
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <p className="text-xs font-semibold uppercase tracking-[0.16em] text-cyan-700">Protection posture</p>
+          <h2 className="mt-1 text-xl font-semibold tracking-tight text-slate-950">Host controls</h2>
+          <p className="mt-1 max-w-3xl text-sm leading-6 text-slate-600">
+            What is enforcing, what is watching, and where the gaps are.
+          </p>
+        </div>
+        {/* The page refreshes on a slow cadence now, because the evidence behind
+            it does. An operator who wants an answer this second asks for one
+            instead of waiting out a poll whose length they cannot see. */}
+        {onCheckNow ? (
+          <button
+            type="button"
+            onClick={() => void onCheckNow()}
+            className="shrink-0 rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cyan-600"
+          >
+            Check now
+          </button>
+        ) : null}
       </div>
 
       {posture.layers.length > 0 ? (

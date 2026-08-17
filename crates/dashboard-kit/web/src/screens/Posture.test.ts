@@ -284,3 +284,18 @@ describe("the empty gaps state is one quiet line", () => {
     expect(emptyGapsLine(3)).toBe("No coverage gaps need attention in this snapshot.");
   });
 });
+
+
+describe("the poll cadence matches the evidence it renders", () => {
+  it("refreshes slower than a second but faster than the proof goes stale", async () => {
+    const { POSTURE_REFRESH_MS } = await import("../App");
+    // The evidence behind this screen is the effect canary, which re-runs every
+    // 1200s. Polling every 5s meant 239 of every 240 requests returned the same
+    // proof, and the freshness line read "checked 0s ago" resetting as you
+    // watched it: a number that never settles reads as a system that never
+    // settles.
+    const CANARY_INTERVAL_MS = 1_200_000;
+    expect(POSTURE_REFRESH_MS).toBeGreaterThan(60_000);
+    expect(POSTURE_REFRESH_MS).toBeLessThanOrEqual(CANARY_INTERVAL_MS);
+  });
+});
