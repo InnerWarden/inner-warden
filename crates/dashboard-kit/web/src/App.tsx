@@ -24,6 +24,22 @@ import { TokenIntelligence } from "./screens/TokenIntelligence";
 export type BaseShellRoute = "overview" | "activity" | "posture" | "agents" | "tokens";
 export type ShellRoute = BaseShellRoute | (string & {});
 
+/** How often the posture surfaces re-fetch.
+ *
+ * These polled every 5 seconds while the evidence behind them refreshes every
+ * 20 minutes (the effect-canary interval), so 239 of every 240 requests
+ * returned the same proof and the screen repainted anyway. The visible cost was
+ * a freshness line reading "checked 0s ago" that reset as you watched it, which
+ * reads as a system that never settles.
+ *
+ * Posture is a slow fact: what is armed changes on deploys and incidents, not
+ * second to second. It now refreshes on a cadence the evidence can justify, and
+ * an operator who wants an answer NOW presses Check now rather than waiting out
+ * a poll. Faster-moving screens keep their own cadence; this is the posture
+ * pair only.
+ */
+export const POSTURE_REFRESH_MS = 5 * 60_000;
+
 const BASE_ROUTES: readonly string[] = ["overview", "activity", "posture", "agents", "tokens"];
 
 /**
@@ -261,6 +277,15 @@ export function App({ extraScreens = [] }: { extraScreens?: readonly ScreenModul
   // The popstate listener is registered once and must not resubscribe when a
   // caller passes a fresh array literal on every render.
   const contributedRef = useRef(contributed);
+  // Handles to the two posture fetchers, so "Check now" can force the answer
+  // instead of the operator waiting out a poll they cannot see the length of.
+  const postureRefreshRef = useRef<{ bootstrap?: () => Promise<void>; posture?: () => Promise<void> }>({});
+  const refreshPostureNow = async () => {
+    await Promise.all([
+      postureRefreshRef.current.bootstrap?.(),
+      postureRefreshRef.current.posture?.(),
+    ]);
+  };
   contributedRef.current = contributed;
 
   const [route, setRoute] = useState<ShellRoute>(() => routeFromLocation(extraScreens));
@@ -339,7 +364,8 @@ export function App({ extraScreens = [] }: { extraScreens?: readonly ScreenModul
       }
     };
     void load();
-    const timer = setInterval(() => void load(), 5_000);
+    postureRefreshRef.current.bootstrap = load;
+    const timer = setInterval(() => void load(), POSTURE_REFRESH_MS);
     return () => {
       active = false;
       controller?.abort("dashboard-unmount");
@@ -370,7 +396,8 @@ export function App({ extraScreens = [] }: { extraScreens?: readonly ScreenModul
       }
     };
     void load();
-    const timer = setInterval(() => void load(), 5_000);
+    postureRefreshRef.current.posture = load;
+    const timer = setInterval(() => void load(), POSTURE_REFRESH_MS);
     return () => {
       active = false;
       controller?.abort("posture-disabled");
@@ -530,6 +557,7 @@ export function App({ extraScreens = [] }: { extraScreens?: readonly ScreenModul
             onOpenCase={casesAvailable ? openCase : undefined}
             evaluatedAt={consumerEvaluatedAt}
             extraScreens={contributed}
+            onCheckNow={refreshPostureNow}
           />
         ) : edition === "enterprise" && bootstrap ? (
           <DashboardContractState resource={bootstrapResource} />
@@ -557,6 +585,7 @@ function EnterpriseRoute({
   onOpenCase,
   evaluatedAt,
   extraScreens,
+  onCheckNow,
 }: {
   route: ShellRoute;
   bootstrap: DashboardBootstrap;
@@ -571,6 +600,8 @@ function EnterpriseRoute({
   onOpenCase?: (caseId?: string) => void;
   evaluatedAt: string;
   extraScreens: readonly ScreenModule[];
+  /** Force a posture re-read on demand; see `POSTURE_REFRESH_MS`. */
+  onCheckNow?: () => void | Promise<void>;
 }) {
   const contributed = extraScreens.find((screen) => screen.route === route);
   if (contributed !== undefined) return <>{contributed.render({ bootstrap, evaluatedAt })}</>;
@@ -608,7 +639,9 @@ function EnterpriseRoute({
         capability={bootstrap.capabilities.find((capability) => capability.tier === "enterprise_core")}
         resource={postureResource}
       >
-        {(posture, stale) => <Posture bootstrap={bootstrap} posture={posture} current={!stale} evaluatedAt={evaluatedAt} />}
+        {(posture, stale) => (
+          <Posture bootstrap={bootstrap} posture={posture} current={!stale} evaluatedAt={evaluatedAt} onCheckNow={onCheckNow} />
+        )}
       </CapabilityBoundary>
     );
   }
