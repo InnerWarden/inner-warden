@@ -13,7 +13,7 @@ import type {
   StageAnswer,
 } from "../api/v1";
 import {
-  checkedAgo,
+  checkedAt,
   controlPill,
   emptyGapsLine,
   gapAudience,
@@ -177,7 +177,12 @@ describe("the verdict hero leads with what the user asked", () => {
   it("counts verified controls out of the five the enterprise adapter publishes", () => {
     const pills = posture().layers.map((entry) => controlPill(entry, bootstrap(), generatedAt, true, evaluatedAt));
     expect(pills).toHaveLength(5);
-    expect(postureHeadline(pills)).toBe("0 of 5 host controls verified active");
+    // This fixture has TWO controls enforcing, and the old headline read
+    // "0 of 5 host controls verified active" over exactly this data: it counted
+    // a narrower notion of verified than the rows displayed and never said so.
+    // Production showed the same shortfall, "1 of 5", with three rows reading
+    // Enforcing and the kernel measured as enforcing on two of them.
+    expect(postureHeadline(pills)).toBe("2 of 5 host controls enforcing");
   });
 
   it("never claims verified active without the assurance rule agreeing", () => {
@@ -188,12 +193,12 @@ describe("the verdict hero leads with what the user asked", () => {
     expect(pills.every((pill) => pill.tone !== "positive")).toBe(true);
   });
 
-  it("shows each control in plain words with its scope name and checked age", () => {
+  it("shows each control in plain words with its scope name and check time", () => {
     const pill = controlPill(posture().layers[0], bootstrap(), generatedAt, true, evaluatedAt);
     expect(pill.name).toBe("Independent host execution");
     expect(pill.mode).toBe("Enforcing");
     expect(pill.scope).toBe("OpenClaw workload");
-    expect(pill.freshness).toBe("checked 2s ago");
+    expect(pill.freshness).toMatch(/^as of \d{2}:\d{2}$/);
     // The producer freshness budget is contract bookkeeping; the summary never
     // mentions it.
     expect(pill.freshness).not.toContain("budget");
@@ -214,17 +219,29 @@ describe("mode words are user words", () => {
     expect(plainMode({ effective_mode: "disabled", desired_mode: "disabled" })).toBe("Off");
   });
 
-  it("keeps armed-but-unverified honest without a bare Unknown", () => {
-    expect(plainMode({ effective_mode: "unknown", desired_mode: "enforce" })).toBe("Enforcing, verifying");
-    expect(plainMode({ effective_mode: "unknown", desired_mode: "unknown" })).toBe("Unknown");
+  it("never borrows armed intent as a claim of enforcement", () => {
+    // Returned "Enforcing, verifying", which a production host rendered
+    // directly above a subtitle reading "not checked yet" and a coverage gap
+    // reading "Degraded", all about the same control. Armed-but-unconfirmed is
+    // a check that did not run, not a shade of working.
+    expect(plainMode({ effective_mode: "unknown", desired_mode: "enforce" })).toBe("Not confirmed");
+    expect(plainMode({ effective_mode: "unknown", desired_mode: "unknown" })).toBe("Not confirmed");
+    expect(plainMode({ effective_mode: "unknown", desired_mode: "disabled" })).toBe("Off");
   });
 });
 
-describe("freshness is the user fact, not the producer contract", () => {
-  it("speaks in checked-ago terms", () => {
-    expect(checkedAgo(fresh)).toBe("checked 2s ago");
-    expect(checkedAgo({ ...fresh, age_seconds: 120 })).toBe("checked 2m ago");
-    expect(checkedAgo({ ...fresh, age_seconds: null })).toBe("not checked yet");
+describe("freshness is a wall clock, not a counter that resets as you watch", () => {
+  it("stamps the observation time instead of counting seconds", () => {
+    // Was relative, and with the screen refreshing every few seconds it read
+    // "checked 0s ago" almost permanently, resetting as you looked at it. A
+    // number that never settles reads as a system that never settles.
+    const at = new Date("2026-08-17T14:32:05Z");
+    const hh = String(at.getHours()).padStart(2, "0");
+    expect(checkedAt({ ...fresh, observed_at: at.toISOString() })).toBe(`as of ${hh}:32`);
+  });
+
+  it("says never checked rather than inventing a time", () => {
+    expect(checkedAt({ ...fresh, observed_at: null })).toBe("never checked");
   });
 });
 

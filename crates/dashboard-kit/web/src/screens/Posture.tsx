@@ -20,8 +20,21 @@ import { layerAssuranceLabel } from "../posture/assurance";
 
 const ARMED_MODES = ["enforce", "observe", "rehearse"];
 
-/** Effective mode in plain words. Armed-but-unverified keeps the armed intent
- * visible ("Enforcing, verifying") without claiming verification. */
+/** Effective mode in plain words, from a CLOSED set.
+ *
+ * This used to render "Enforcing, verifying" whenever the effective mode was
+ * unknown but the desired mode was armed. The intent was to avoid a bare
+ * "Unknown" on a control that is demonstrably armed. The effect, on a real
+ * production host, was a page claiming enforcement directly above a subtitle
+ * reading "not checked yet" and a coverage gap reading "Degraded", all about
+ * the same control, on the same render.
+ *
+ * In production there is no half state. A control is enforcing, watching,
+ * deliberately off, or not confirmed. "Armed but we could not confirm it" is
+ * not a fourth shade of working: it is a check that did not run, which is a
+ * bug to fix rather than a phrase to soften. Rendering it as NOT CONFIRMED
+ * keeps proven and assumed distinguishable at a glance, which is the whole
+ * job of this screen. */
 export function plainMode(layer: Pick<ProtectionLayer, "effective_mode" | "desired_mode">): string {
   const words: Record<string, string> = {
     enforce: "Enforcing",
@@ -31,21 +44,25 @@ export function plainMode(layer: Pick<ProtectionLayer, "effective_mode" | "desir
     disabled: "Off",
     mixed: "Mixed",
   };
-  if (layer.effective_mode !== "unknown") return words[layer.effective_mode] ?? "Unknown";
-  if (ARMED_MODES.includes(layer.desired_mode)) return `${words[layer.desired_mode]}, verifying`;
-  if (layer.desired_mode !== "unknown") return words[layer.desired_mode] ?? "Unknown";
-  return "Unknown";
+  if (layer.effective_mode !== "unknown") return words[layer.effective_mode] ?? "Not confirmed";
+  // Armed intent survives in `desired_mode` and in the disclosure; the summary
+  // row does not get to borrow it as a claim.
+  if (ARMED_MODES.includes(layer.desired_mode)) return "Not confirmed";
+  if (layer.desired_mode === "disabled") return "Off";
+  return "Not confirmed";
 }
 
 /** Freshness as the user fact: when this control was last checked. The producer
  * budget is contract bookkeeping and lives in the disclosure only. */
-export function checkedAgo(freshness: EvidenceFreshness): string {
-  if (freshness.age_seconds === null) return "not checked yet";
-  const secs = Math.max(0, freshness.age_seconds);
-  if (secs < 90) return `checked ${secs}s ago`;
-  if (secs < 5_400) return `checked ${Math.floor(secs / 60)}m ago`;
-  if (secs < 172_800) return `checked ${Math.floor(secs / 3_600)}h ago`;
-  return `checked ${Math.floor(secs / 86_400)}d ago`;
+export function checkedAt(freshness: EvidenceFreshness): string {
+  if (freshness.observed_at === null || freshness.observed_at === undefined) {
+    return "never checked";
+  }
+  const at = new Date(freshness.observed_at);
+  if (Number.isNaN(at.getTime())) return "never checked";
+  const hh = String(at.getHours()).padStart(2, "0");
+  const mm = String(at.getMinutes()).padStart(2, "0");
+  return `as of ${hh}:${mm}`;
 }
 
 /** Scope as its display name only; kind and verification detail belong to the
@@ -109,7 +126,7 @@ export function controlPill(
     name: layer.label,
     mode: current ? plainMode(layer) : "Refreshing",
     scope: scopeDisplay(layer.effective_scope),
-    freshness: current ? checkedAgo(layer.freshness) : "refreshing",
+    freshness: current ? checkedAt(layer.freshness) : "refreshing",
     tone: assurance.verifiedActive ? "positive" : operatorGaps.length > 0 ? "attention" : "neutral",
     verified: assurance.verifiedActive,
   };
@@ -117,8 +134,11 @@ export function controlPill(
 
 /** The one-line verdict the screen leads with. */
 export function postureHeadline(pills: ControlPill[]): string {
-  const verified = pills.filter((pill) => pill.verified).length;
-  return `${verified} of ${pills.length} host control${pills.length === 1 ? "" : "s"} verified active`;
+  const enforcing = pills.filter((pill) => pill.mode === "Enforcing").length;
+  const notConfirmed = pills.filter((pill) => pill.mode === "Not confirmed").length;
+  const total = pills.length;
+  const head = `${enforcing} of ${total} host control${total === 1 ? "" : "s"} enforcing`;
+  return notConfirmed > 0 ? `${head}, ${notConfirmed} not confirmed` : head;
 }
 
 /** The quiet line shown when no gap card needs to render. */
@@ -264,7 +284,7 @@ function ControlRow({
           className="shrink-0"
         />
         <span className="[overflow-wrap:anywhere] text-sm text-slate-600">{scopeDisplay(layer.effective_scope)}</span>
-        <span className="shrink-0 text-xs font-medium text-slate-500">{current ? checkedAgo(layer.freshness) : "refreshing"}</span>
+        <span className="shrink-0 text-xs font-medium text-slate-500">{current ? checkedAt(layer.freshness) : "refreshing"}</span>
       </div>
 
       <details className="mt-3 border-t border-slate-100 pt-3">
