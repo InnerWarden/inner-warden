@@ -30,6 +30,7 @@ mod observe;
 mod observe_io;
 mod record_health;
 mod release_verify;
+mod safer_alternative;
 mod second_opinion;
 mod second_opinion_io;
 mod serve_owner;
@@ -420,6 +421,20 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
             .and_then(|e| e.as_str())
             .unwrap_or("");
         eprintln!("InnerWarden blocked this command (recommendation={rec}): {expl}");
+        // Offer the safer neighbour BEFORE the override, when one exists.
+        //
+        // The two lines are not equivalent and their order is the point. An
+        // override tells the operator how to do the blocked thing anyway; a
+        // safer alternative tells them how to get what they wanted without it.
+        // Printing the override first makes it the obvious move, which is how a
+        // guardrail trains people to wave things through.
+        //
+        // This only ever prints. The exit code below is unchanged and nothing
+        // here can turn a deny into a pass.
+        if let Some(alternative) = safer_alternative::for_command(&command) {
+            eprintln!("  Try instead: {}", alternative.command);
+            eprintln!("    ({})", alternative.because);
+        }
         // Say how to proceed. A block with no stated remedy leaves the operator one
         // obvious move, which is to remove the guard, and that is the outcome this
         // control exists to avoid. The remedy is deliberately a decision the PERSON
