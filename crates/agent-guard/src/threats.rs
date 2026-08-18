@@ -1179,6 +1179,120 @@ fn ssh_identity_use_only(segment: &str) -> bool {
 /// off. What separates hunting from working is the SCOPE: a system-wide or
 /// all-users sweep, not the keyword. So the broad-root requirement below is
 /// the whole rule, and relaxing it would trade a real signal for noise.
+/// Does this segment contain a glob the SHELL would actually expand?
+///
+/// The test was `contains('*')`, which counted a star anywhere, quotes and all.
+/// On a real operator command that turned an SQL query into a hunt finding:
+///
+/// ```text
+/// sudo cat /etc/innerwarden/dns-guard-mode
+/// sudo sqlite3 db "select count(*) from incidents"
+/// ```
+///
+/// The keyword came from this product's own `secret-guard` subcommand, the
+/// broad root from `/etc`, and the "glob" from `count(*)`. Three signals, none
+/// of them about hunting for anything.
+///
+/// A quoted star is not a glob. The shell passes it through literally, so the
+/// command opens a file named `*` or hands the character to a program as text;
+/// it cannot sweep a directory. Requiring the star to be unquoted is therefore
+/// not a relaxation but the check this rule always meant, and it opens no door:
+/// anyone who quotes their glob has disarmed it themselves.
+pub(crate) fn contains_unquoted_glob(segment: &str) -> bool {
+    let mut single = false;
+    let mut double = false;
+    let mut escaped = false;
+    for ch in segment.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if !single => escaped = true,
+            '\'' if !double => single = !single,
+            '"' if !single => double = !double,
+            '*' if !single && !double => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Remove quoted here-document BODIES, which are data rather than command text.
+///
+/// Writing a note that mentions a credential path is not reading one. This was
+/// measured on a real operator command: appending to a markdown file whose text
+/// described an earlier finding, and therefore contained `.key`, was reported as
+/// "reads sensitive credential path". Nothing was read. `cat >> notes.md <<'MD'`
+/// is a WRITE, and the only reason the rule fired is that `cat` is a reader verb
+/// and the word appeared somewhere in the line.
+///
+/// Three cases keep the body IN, and each closes a specific way this could
+/// otherwise be abused:
+///
+/// * **Unquoted delimiter** (`<<EOF`). The shell expands `$(...)` and `` ` `` in
+///   an unquoted body, so it is executable surface, not data.
+/// * **Fed to an interpreter** (`python3 - <<'PY'`, `bash <<'SH'`). The body is
+///   the program. This is exactly the shape that put a filesystem sweep inside a
+///   here-document, and suppressing it would be handing over the keys.
+/// * **Redirected INTO a sensitive path** (`cat <<'K' > ~/.ssh/authorized_keys`).
+///   Appending an attacker key is persistence; the target still matters even
+///   though the body is data.
+///
+/// A path named on the command line is untouched in every case: `cat
+/// ~/.ssh/id_rsa >> notes.md` still reads a key, and still fires.
+fn strip_inert_heredoc_bodies(content: &str) -> String {
+    static HEREDOC: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    // `<<` or `<<-`, then a QUOTED delimiter only. An unquoted one is expanded
+    // by the shell and is deliberately not matched here.
+    let heredoc = HEREDOC.get_or_init(|| {
+        regex::Regex::new(r#"<<-?\s*(?:'([A-Za-z_][A-Za-z0-9_]*)'|"([A-Za-z_][A-Za-z0-9_]*)")"#)
+            .expect("static heredoc-delimiter regex")
+    });
+    static INTERPRETER: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let interpreter = INTERPRETER.get_or_init(|| {
+        regex::Regex::new(r"(?i)\b(?:ba|z|k|da)?sh\b|\bpython[0-9.]*\b|\bperl\b|\bruby\b|\bnode\b|\bphp\b|\bawk\b")
+            .expect("static interpreter regex")
+    });
+
+    let Some(caps) = heredoc.captures(content) else {
+        return content.to_string();
+    };
+    let Some(delimiter) = caps.get(1).or_else(|| caps.get(2)).map(|m| m.as_str()) else {
+        return content.to_string();
+    };
+    let opener_end = caps.get(0).map(|m| m.end()).unwrap_or(0);
+    // Everything up to the delimiter is the command line that opened the body.
+    let header = &content[..opener_end];
+    if interpreter.is_match(header) {
+        return content.to_string();
+    }
+    // No separate guard for a sensitive redirect TARGET is needed, and one was
+    // written before being removed as dead: the opening line is preserved
+    // verbatim below, so `cat >> ~/.ssh/authorized_keys <<'K'` keeps its path
+    // and still fires. Only the BODY is dropped. A guard that never changes an
+    // outcome is worse than absent in a security engine — it reads as coverage
+    // and provides none, and a test can pass "because of it" while it does
+    // nothing. Verified by disabling it: the behaviour did not move.
+
+    // Drop from the end of the opener to the terminator line.
+    let rest = &content[opener_end..];
+    let terminator_at = rest
+        .lines()
+        .enumerate()
+        .find_map(|(index, line)| (line.trim() == delimiter).then_some(index));
+    let Some(terminator_index) = terminator_at else {
+        // No terminator in view: keep the text rather than swallow the command.
+        return content.to_string();
+    };
+    let tail: String = rest
+        .lines()
+        .skip(terminator_index + 1)
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("{header}\n{tail}")
+}
+
 pub fn check_credential_hunt(content: &str) -> Option<(String, u32)> {
     static SEARCHER: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     static SECRET_TOKEN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
@@ -1239,7 +1353,7 @@ pub fn check_credential_hunt(content: &str) -> Option<(String, u32)> {
         // `cat /home/*/secret*` shape, which names no directory to search but
         // sweeps all the same.
         let is_search = searcher.is_match(segment);
-        let is_glob_read = segment.contains('*') && glob_reader.is_match(segment);
+        let is_glob_read = contains_unquoted_glob(segment) && glob_reader.is_match(segment);
         if is_search || is_glob_read {
             let what = secret_token
                 .captures(segment)
@@ -1278,6 +1392,12 @@ pub fn check_sensitive_read(content: &str) -> Option<(&'static str, u32)> {
         regex::Regex::new(r"(?:^|[\s/~=:'\x22])\.(aws|ssh|gnupg|kube|azure|gcloud)(?:[/\s'\x22]|$)")
             .expect("static credential-directory regex")
     });
+
+    // A quoted here-document body is DATA being written, not a path being read,
+    // so it is removed before any path matching. See `strip_inert_heredoc_bodies`
+    // for the three cases where the body is NOT inert and stays in.
+    let content = strip_inert_heredoc_bodies(content);
+    let content = content.as_str();
 
     // Correlate the reader and protected path inside the same simple shell
     // command. A reader elsewhere in a command list must not turn a later
@@ -5103,5 +5223,145 @@ mod tests {
         );
         assert_eq!(DANGEROUS_COMMANDS.len(), 40, "dangerous-command count");
         assert_eq!(API_KEY_PATTERNS.len(), 7, "API-key pattern count");
+    }
+}
+
+#[cfg(test)]
+mod unquoted_glob_tests {
+    use super::{check_credential_hunt, contains_unquoted_glob};
+
+    #[test]
+    fn a_bare_star_is_a_glob() {
+        assert!(contains_unquoted_glob("cat /home/*/id_rsa"));
+    }
+
+    /// The shell never expands a quoted star, so it cannot sweep. Both quote
+    /// styles, and an escaped star, are literals.
+    #[test]
+    fn a_quoted_or_escaped_star_is_not_a_glob() {
+        assert!(!contains_unquoted_glob(
+            r#"sqlite3 db "select count(*) from t""#
+        ));
+        assert!(!contains_unquoted_glob(
+            "sqlite3 db 'select count(*) from t'"
+        ));
+        assert!(!contains_unquoted_glob(r"echo \*"));
+    }
+
+    /// A star outside quotes still counts even when the same command also
+    /// contains a quoted one; quoting part of a command must not launder the
+    /// rest of it.
+    #[test]
+    fn a_real_glob_beside_a_quoted_star_still_counts() {
+        assert!(contains_unquoted_glob(r#"cat /home/*/x "count(*)""#));
+    }
+
+    /// EVASION CHECK. The shapes this rule exists for must still be caught.
+    #[test]
+    fn the_sweep_shapes_are_still_caught() {
+        assert!(
+            check_credential_hunt("cat /home/*/secret*").is_some(),
+            "a reader pointed at a glob over every home is the original shape"
+        );
+        assert!(
+            check_credential_hunt("find / -name id_rsa").is_some(),
+            "an enumerating verb over the whole filesystem does not involve a glob at all"
+        );
+        assert!(
+            check_credential_hunt("locate id_rsa").is_some(),
+            "an index reader is whole-filesystem by construction"
+        );
+        assert!(
+            check_credential_hunt("grep -r password /etc").is_some(),
+            "a recursive search over a system root is the textbook case"
+        );
+    }
+
+    /// The operator command that produced the false finding: the product's own
+    /// subcommand name, a system path it legitimately reads, and an SQL
+    /// `count(*)` that is not a glob.
+    #[test]
+    fn an_sql_count_star_is_not_a_credential_hunt() {
+        let cmd = r#"sudo cat /etc/innerwarden/dns-guard-mode; sudo sqlite3 /var/lib/innerwarden/db "select count(*) from incidents"; innerwarden-config-sign secret-guard status"#;
+        assert!(
+            check_credential_hunt(cmd).is_none(),
+            "reading two named files and counting rows is not a filesystem sweep"
+        );
+    }
+}
+
+#[cfg(test)]
+mod heredoc_body_tests {
+    use super::check_sensitive_read;
+
+    /// The measured case: appending a note whose TEXT described an earlier
+    /// finding, and therefore contained a credential path. Nothing was read.
+    #[test]
+    fn writing_a_note_that_mentions_a_key_is_not_reading_one() {
+        let cmd = "cat >> /home/me/notes.md <<'MD'\nThe guard denied it: reads sensitive credential path `.key`\nMD";
+        assert!(
+            check_sensitive_read(cmd).is_none(),
+            "documentation about a credential path is not access to one"
+        );
+    }
+
+    /// EVASION 1. An unquoted delimiter is expanded by the shell, so the body is
+    /// executable surface and must keep its findings.
+    #[test]
+    fn an_unquoted_delimiter_keeps_its_body() {
+        let cmd = "cat > /tmp/x <<EOF\n$(cat ~/.ssh/id_rsa)\nEOF";
+        assert!(
+            check_sensitive_read(cmd).is_some(),
+            "an unquoted body can substitute commands; it is not inert data"
+        );
+    }
+
+    /// EVASION 2. A body fed to an interpreter IS the program. This is the exact
+    /// shape that would otherwise hide a credential read inside a here-document.
+    #[test]
+    fn a_body_fed_to_an_interpreter_keeps_its_findings() {
+        let cmd = "python3 - <<'PY'\nprint(open('/home/me/.ssh/id_rsa').read())\nPY";
+        assert!(
+            check_sensitive_read(cmd).is_some(),
+            "the body is source code being executed, not data being stored"
+        );
+        let shell = "bash <<'SH'\ncat ~/.ssh/id_ed25519\nSH";
+        assert!(check_sensitive_read(shell).is_some());
+    }
+
+    /// EVASION 3. Writing INTO a credential path is persistence, and it still
+    /// fires because only the BODY is dropped: the opening line, redirect target
+    /// and all, is preserved verbatim.
+    ///
+    /// This test earns its place by pinning that property. An explicit guard for
+    /// it was written first and then removed as dead — disabling it changed no
+    /// outcome, because the header never leaves. A guard that cannot fail is
+    /// worse than none in a security engine: it reads as coverage and provides
+    /// nothing.
+    #[test]
+    fn writing_into_a_credential_path_still_fires() {
+        let cmd = "cat >> /home/me/.ssh/authorized_keys <<'K'\nssh-ed25519 AAAA attacker\nK";
+        assert!(
+            check_sensitive_read(cmd).is_some(),
+            "appending to authorized_keys is the classic persistence step"
+        );
+    }
+
+    /// A path named on the command line is untouched by any of this.
+    #[test]
+    fn a_real_read_beside_a_heredoc_still_fires() {
+        let cmd = "cat /home/me/.ssh/id_rsa >> /tmp/out <<'X'\nnothing\nX";
+        assert!(check_sensitive_read(cmd).is_some());
+    }
+
+    /// An unterminated body must not swallow the rest of the command: if the
+    /// terminator is not in view, nothing is stripped.
+    #[test]
+    fn an_unterminated_body_is_left_alone() {
+        let cmd = "cat >> notes.md <<'MD'\ncat /home/me/.ssh/id_rsa";
+        assert!(
+            check_sensitive_read(cmd).is_some(),
+            "without a terminator the body cannot be bounded, so nothing is removed"
+        );
     }
 }
