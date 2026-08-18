@@ -81,10 +81,49 @@ pub fn cmd(rest: &[String]) -> ExitCode {
         Ok(()) => {
             println!();
             println!("Upgrade complete. Confirm with:  innerwarden --version");
+            for line in closing_advice(dashboard_is_serving()) {
+                println!("{line}");
+            }
             ExitCode::SUCCESS
         }
         Err(e) => fail(&format!("verified, but could not replace the binary: {e}")),
     }
+}
+
+/// Is something answering on the dashboard's default address right now?
+///
+/// Probed rather than assumed, and only the default bind is checked: an
+/// operator who moved it knows they did, and guessing at ports would be slower
+/// and no more correct. A short timeout, and any error means "no" — a failed
+/// probe must never turn a successful upgrade into a scary ending.
+fn dashboard_is_serving() -> bool {
+    ureq::get("http://127.0.0.1:8787/api/guard/meta")
+        .timeout(std::time::Duration::from_millis(400))
+        .call()
+        .is_ok()
+}
+
+/// What to print after a successful replace.
+///
+/// `innerwarden --version` reads the file on disk, so it reports the NEW
+/// version the moment the rename lands. A dashboard that was already running
+/// keeps the inode it started with and goes on serving the OLD one. On a real
+/// machine those two surfaces disagreed for nine days, and the closing line
+/// above sent the operator to the surface that agrees.
+///
+/// So when something is answering on the dashboard's address, say so here.
+/// Pure, because the wording is the part worth pinning.
+fn closing_advice(dashboard_running: bool) -> Vec<String> {
+    if !dashboard_running {
+        return Vec::new();
+    }
+    vec![
+        String::new(),
+        "A dashboard is running on 127.0.0.1:8787 and is still executing the".into(),
+        "previous binary: replacing a file does not change a process already".into(),
+        "running it. Restart the dashboard to serve this version.".into(),
+        "  (Its page will say so too, until you do.)".into(),
+    ]
 }
 
 fn fail(message: &str) -> ExitCode {
@@ -214,6 +253,40 @@ mod tests {
         assert!(
             !upgrade_plan::staging_path(&target).exists(),
             "the staging file must be removed when the rename fails"
+        );
+    }
+}
+
+#[cfg(test)]
+mod closing_advice_tests {
+    use super::closing_advice;
+
+    /// Nothing listening: the upgrade ends exactly as it always did. A notice
+    /// about a dashboard that is not running would be noise, and noise in a
+    /// success path is how people learn to skim past the line that matters.
+    #[test]
+    fn a_quiet_host_gets_no_extra_words() {
+        assert!(closing_advice(false).is_empty());
+    }
+
+    /// The production case: a dashboard was left running for nine days, an
+    /// upgrade renamed a new binary over the old one, and the page went on
+    /// serving 1.3.0 while `--version` said 1.3.3. The upgrade's own closing
+    /// line pointed at the surface that agreed.
+    #[test]
+    fn a_running_dashboard_is_named_with_what_to_do_about_it() {
+        let advice = closing_advice(true).join("\n");
+        assert!(
+            advice.contains("127.0.0.1:8787"),
+            "name where it is, so the operator does not have to hunt"
+        );
+        assert!(
+            advice.to_lowercase().contains("restart"),
+            "say what to do, not merely that something is stale"
+        );
+        assert!(
+            advice.to_lowercase().contains("previous binary"),
+            "say WHY, or it reads as a superstition about restarting things"
         );
     }
 }
