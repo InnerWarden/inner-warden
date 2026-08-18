@@ -38,10 +38,25 @@ pub struct GuardrailStatus {
 
 #[derive(Serialize)]
 struct DashboardMeta<'a> {
+    /// The version this process is EXECUTING, which after an in-place upgrade
+    /// is not necessarily the one installed on disk. See `update_pending`.
     version: &'a str,
     exposed: bool,
     edition: &'a str,
     guardrail: &'a GuardrailStatus,
+    /// True when the binary at this process's own path has been replaced since
+    /// it started, so `version` above is the truth about this process and not
+    /// about the installation.
+    ///
+    /// Omitted entirely when nothing is pending, so an ordinary payload is
+    /// unchanged and no reader has to learn a new field to keep working.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    update_pending: bool,
+    /// The sentence to show a reader when `update_pending` is set. Carried in
+    /// the payload rather than written into the frontend so the wording stays
+    /// with the condition that produces it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    update_note: Option<&'a str>,
 }
 
 /// `/api/agents` contract version. Version 2 distinguishes executable presence
@@ -551,12 +566,27 @@ fn aggregate_modes(modes: &[&str]) -> &'static str {
     }
 }
 
-fn meta_json_with_status(exposed: bool, status: &GuardrailStatus) -> String {
+/// The meta payload, with the answer to "is this process still the installed
+/// binary?" supplied rather than probed, so the shape is testable without
+/// renaming files under a running test.
+///
+/// Only `Superseded` sets the flag. `Unknown` is a stat that could not be read,
+/// and putting an upgrade notice on the page for a permissions error would be a
+/// false claim with a call to action attached — the exact failure this whole
+/// field exists to prevent, pointed the other way.
+fn meta_json_with_freshness(
+    exposed: bool,
+    status: &GuardrailStatus,
+    freshness: crate::binary_freshness::Freshness,
+) -> String {
+    let superseded = freshness == crate::binary_freshness::Freshness::Superseded;
     serde_json::to_string(&DashboardMeta {
         version: env!("CARGO_PKG_VERSION"),
         exposed,
         edition: "community",
         guardrail: status,
+        update_pending: superseded,
+        update_note: superseded.then_some(crate::binary_freshness::SUPERSEDED_NOTE),
     })
     .unwrap_or_else(|_| "{}".into())
 }
@@ -649,6 +679,11 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
     // unauthenticated + unencrypted, so binding it to the network by accident would
     // publish the command history + raw graph to anyone who can reach the host.
     let exposed = !is_loopback_bind(&bind);
+    // Recorded BEFORE the server starts, because it is the identity of the file
+    // this process is executing. Captured later it would stat whatever the
+    // upgrade has since put there and compare it against itself, which never
+    // reports a swap and quietly makes the whole check useless.
+    let started_as = crate::binary_freshness::StartupIdentity::capture();
     if exposed && !expose {
         eprintln!(
             "innerwarden dashboard: refusing to bind {bind} - it is NOT loopback, and the dashboard has NO authentication or TLS.\n  This would publish decisions, detected agents, guard modes and token counters. If you really mean to, add --expose."
@@ -826,22 +861,30 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
                     request.respond(graph_unreadable_response())
                 }
             },
-            "/api/meta" | "/api/guard/meta" => match agent_snapshot.as_ref() {
-                Some(shared) => {
-                    let snapshot = read_agent_snapshot(shared);
-                    request.respond(json_response(meta_json_with_status(
+            "/api/meta" | "/api/guard/meta" => {
+                // Re-stat per request rather than once at boot: the upgrade can
+                // land at any moment, and a dashboard people leave running for
+                // days is exactly where a boot-time answer goes stale.
+                let freshness = started_as.freshness();
+                match agent_snapshot.as_ref() {
+                    Some(shared) => {
+                        let snapshot = read_agent_snapshot(shared);
+                        request.respond(json_response(meta_json_with_freshness(
+                            exposed,
+                            &snapshot.guardrail,
+                            freshness,
+                        )))
+                    }
+                    None => request.respond(json_response(meta_json_with_freshness(
                         exposed,
-                        &snapshot.guardrail,
-                    )))
+                        &GuardrailStatus {
+                            mode: "unknown".into(),
+                            guarded_agents: 0,
+                        },
+                        freshness,
+                    ))),
                 }
-                None => request.respond(json_response(meta_json_with_status(
-                    exposed,
-                    &GuardrailStatus {
-                        mode: "unknown".into(),
-                        guarded_agents: 0,
-                    },
-                ))),
-            },
+            }
             "/api/agents" | "/api/guard/agents" => match agent_snapshot.as_ref() {
                 Some(shared) => {
                     let snapshot = read_agent_snapshot(shared);
@@ -1084,7 +1127,8 @@ mod tests {
             mode: "monitor".into(),
             guarded_agents: 2,
         };
-        let m = meta_json_with_status(false, &status);
+        let m =
+            meta_json_with_freshness(false, &status, crate::binary_freshness::Freshness::Current);
         assert!(m.contains("\"version\""));
         assert!(m.contains(env!("CARGO_PKG_VERSION")));
         let v: serde_json::Value = serde_json::from_str(&m).unwrap();
@@ -1093,9 +1137,68 @@ mod tests {
         assert_eq!(v["edition"], "community");
         assert_eq!(v["guardrail"]["mode"], "monitor");
         assert_eq!(v["guardrail"]["guarded_agents"], 2);
-        let e: serde_json::Value =
-            serde_json::from_str(&meta_json_with_status(true, &status)).unwrap();
+        let e: serde_json::Value = serde_json::from_str(&meta_json_with_freshness(
+            true,
+            &status,
+            crate::binary_freshness::Freshness::Current,
+        ))
+        .unwrap();
         assert_eq!(e["exposed"], true);
+        // Nothing pending: the field is absent entirely, so an ordinary payload
+        // is byte-for-byte what it always was and no reader has to learn a new
+        // key to keep working.
+        assert!(v.get("update_pending").is_none());
+        assert!(v.get("update_note").is_none());
+    }
+
+    /// The production case this field exists for: `innerwarden upgrade` renamed
+    /// a new binary over the old one, and a dashboard left running for nine
+    /// days went on serving 1.3.0 while `--version` reported 1.3.3. The page
+    /// was not wrong about itself; it was silent about the difference.
+    #[test]
+    fn a_superseded_binary_is_declared_rather_than_served_silently() {
+        let status = GuardrailStatus {
+            mode: "monitor".into(),
+            guarded_agents: 2,
+        };
+        let json = meta_json_with_freshness(
+            false,
+            &status,
+            crate::binary_freshness::Freshness::Superseded,
+        );
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        // `version` still reports what this process runs. That is the honest
+        // answer to "what am I looking at" and must not be swapped for the
+        // installed one, which this process is not serving.
+        assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(v["update_pending"], true);
+        assert!(
+            v["update_note"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("restart"),
+            "the note has to say what to do, not merely that something is stale"
+        );
+    }
+
+    /// A stat that could not be read is not evidence of an upgrade. Showing the
+    /// notice on `Unknown` would put a call to action on the page for a
+    /// permissions error, which is the same class of false claim pointed the
+    /// other way.
+    #[test]
+    fn an_unknown_freshness_makes_no_claim() {
+        let status = GuardrailStatus {
+            mode: "monitor".into(),
+            guarded_agents: 0,
+        };
+        let v: serde_json::Value = serde_json::from_str(&meta_json_with_freshness(
+            false,
+            &status,
+            crate::binary_freshness::Freshness::Unknown,
+        ))
+        .unwrap();
+        assert!(v.get("update_pending").is_none());
+        assert!(v.get("update_note").is_none());
     }
 
     #[test]

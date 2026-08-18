@@ -20,6 +20,7 @@ use innerwarden_agent_guard::{hook, mcp::analyze_command, rules::RuleEngine};
 
 mod agent_policy;
 mod agents_io;
+mod binary_freshness;
 mod contain;
 mod contain_io;
 mod dashboard;
