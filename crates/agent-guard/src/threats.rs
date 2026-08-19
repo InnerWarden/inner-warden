@@ -867,6 +867,64 @@ fn rm_command_index(tokens: &[String]) -> Option<usize> {
     }
 }
 
+/// Remove command substitutions that sit BEFORE the command word.
+///
+/// A substitution in command position expands to its output, and when that
+/// output is empty the next token becomes the command. Measured on the shipped
+/// guard: `rm -rf /`, `sudo rm -rf /`, `FOO=1 rm -rf /`, `"" rm -rf /` and
+/// `'' rm -rf /` were all recognised as a root wipe, while these were not:
+///
+/// ```text
+/// $() rm -rf /
+/// $(true) rm -rf /
+/// `` rm -rf /
+/// ```
+///
+/// Every one deletes the filesystem. Empty quotes were already fine because the
+/// tokenizer drops them; a substitution was not, because the tokenizer discards
+/// the parentheses and leaves `["$", "true", "rm", ...]`, so the walk over
+/// prefix tokens hit `$` and gave up.
+///
+/// Only LEADING substitutions are removed, and that restriction is the whole
+/// safety argument. Stripping them everywhere would lose `rm -rf $(echo /)`,
+/// where the substitution is the target rather than a prefix, and that shape is
+/// recognised today. What is inside a substitution is not lost either:
+/// `destructive_rm_root` feeds every substitution body through this same check
+/// on its own, so inner and outer text are each judged as the shell would run
+/// them.
+fn strip_leading_substitutions(segment: &str) -> &str {
+    let mut rest = segment.trim_start();
+    loop {
+        let bytes = rest.as_bytes();
+        if rest.starts_with("$(") {
+            let mut depth = 1usize;
+            let mut index = 2usize;
+            while index < bytes.len() && depth > 0 {
+                match bytes[index] {
+                    b'(' => depth += 1,
+                    b')' => depth -= 1,
+                    _ => {}
+                }
+                index += 1;
+            }
+            // Unbalanced: leave it alone rather than guess where it ends.
+            if depth != 0 {
+                return rest;
+            }
+            rest = rest[index..].trim_start();
+            continue;
+        }
+        if let Some(after) = rest.strip_prefix('`') {
+            let Some(close) = after.find('`') else {
+                return rest;
+            };
+            rest = after[close + 1..].trim_start();
+            continue;
+        }
+        return rest;
+    }
+}
+
 /// A single `rm` target that is a system wipe: bare `/`, `/*`, a top-level system
 /// dir itself (`/etc`, `/var`), or all of its contents (`/etc/*`), but NOT a
 /// scoped subpath (`/var/lib/app/cache`, `/home/user/build`, `/tmp/scratch`).
@@ -893,6 +951,9 @@ fn rm_target_is_root_or_system(target: &str) -> bool {
 /// with recursive AND force flags AND a root/system target, all belonging to that
 /// one `rm` invocation? `--no-preserve-root` on the rm counts on its own.
 fn segment_is_root_wipe(segment: &str) -> bool {
+    // A substitution before the command word expands away; see
+    // `strip_leading_substitutions` for why only the leading ones go.
+    let segment = strip_leading_substitutions(segment);
     let tokens = shell_tokens(segment);
     let Some(rm_idx) = rm_command_index(&tokens) else {
         return false;
@@ -5362,6 +5423,74 @@ mod heredoc_body_tests {
         assert!(
             check_sensitive_read(cmd).is_some(),
             "without a terminator the body cannot be bounded, so nothing is removed"
+        );
+    }
+}
+
+#[cfg(test)]
+mod leading_substitution_tests {
+    use super::{destructive_rm_root, strip_leading_substitutions};
+
+    /// The measured bypass. Each of these deletes the filesystem in a real
+    /// shell: the substitution expands to nothing and `rm` becomes the command.
+    /// The shipped guard scored all three as harmless.
+    #[test]
+    fn an_empty_substitution_no_longer_hides_the_command_behind_it() {
+        assert!(destructive_rm_root("$() rm -rf /"));
+        assert!(destructive_rm_root("$(true) rm -rf /"));
+        assert!(destructive_rm_root("`` rm -rf /"));
+        assert!(destructive_rm_root("$(echo) $(true) rm -rf /"));
+    }
+
+    /// The shapes that already worked, kept working. Empty quotes are here
+    /// because they are the same idea and were the reason the gap was not
+    /// obvious: the tokenizer drops them, so they never reached the walk.
+    #[test]
+    fn the_shapes_that_already_worked_still_do() {
+        assert!(destructive_rm_root("rm -rf /"));
+        assert!(destructive_rm_root("sudo rm -rf /"));
+        assert!(destructive_rm_root("FOO=1 rm -rf /"));
+        assert!(destructive_rm_root("\"\" rm -rf /"));
+        assert!(destructive_rm_root("timeout 5 rm -rf /etc"));
+    }
+
+    /// REGRESSION GUARD, and the reason only LEADING substitutions are removed.
+    /// Here the substitution is the TARGET, not a prefix. Stripping everywhere
+    /// would erase the target and turn a recognised wipe into a pass.
+    #[test]
+    fn a_substitution_used_as_the_target_is_untouched() {
+        assert!(destructive_rm_root("rm -rf $(echo /)"));
+        assert!(destructive_rm_root("echo \"$(rm -rf /)\""));
+    }
+
+    /// Ordinary work must not become a finding.
+    #[test]
+    fn ordinary_commands_are_not_wipes() {
+        assert!(!destructive_rm_root("rm -rf /var/lib/app/cache"));
+        assert!(!destructive_rm_root("rm -rf ./target"));
+        assert!(!destructive_rm_root("echo rm -rf /"));
+        assert!(!destructive_rm_root("$(which ls) -la"));
+    }
+
+    /// An unbalanced substitution is left alone rather than guessed at: consuming
+    /// to the end of the string would swallow the command it was hiding.
+    #[test]
+    fn an_unbalanced_substitution_is_left_alone() {
+        assert_eq!(
+            strip_leading_substitutions("$(oops rm -rf /"),
+            "$(oops rm -rf /"
+        );
+        assert_eq!(
+            strip_leading_substitutions("`oops rm -rf /"),
+            "`oops rm -rf /"
+        );
+    }
+
+    #[test]
+    fn nesting_is_counted_so_the_whole_prefix_goes() {
+        assert_eq!(
+            strip_leading_substitutions("$(a $(b) c) rm -rf /"),
+            "rm -rf /"
         );
     }
 }
