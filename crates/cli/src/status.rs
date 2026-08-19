@@ -35,6 +35,10 @@ pub enum Finding {
     NotWorking { what: String, next: String },
     /// Could not be established either way. Never rendered as "off".
     Unknown { what: String, why: String },
+    /// Not set up yet. Distinct from Unknown: nothing is wrong, there is simply
+    /// nothing here to read, and the reader needs a first step rather than a
+    /// diagnosis.
+    NotConfigured { what: String, next: String },
 }
 
 impl fmt::Display for Finding {
@@ -47,6 +51,9 @@ impl fmt::Display for Finding {
             Finding::Unknown { what, why } => {
                 write!(f, "  [unknown] {what}\n            {why}")
             }
+            Finding::NotConfigured { what, next } => {
+                write!(f, "  [not set] {what}\n            start with: {next}")
+            }
         }
     }
 }
@@ -57,6 +64,11 @@ impl fmt::Display for Finding {
 pub struct Facts {
     /// Guard mode as configured: "enforce", "dry-run", or None if unreadable.
     pub mode: Option<String>,
+    /// True when this install has simply not been set up yet: no config, no
+    /// records, nothing wired. A fresh box is not a broken one, and telling a
+    /// beginner three things "could not be read" when the answer is "you have
+    /// not run setup" sends them looking for a fault that does not exist.
+    pub never_configured: bool,
     /// Agents this install is wired into. Empty means none wired, which is not
     /// the same as none present.
     pub wired_agents: Vec<String>,
@@ -71,6 +83,17 @@ pub struct Facts {
 /// PURE: turn observed facts into findings a beginner can act on.
 pub fn assess(facts: &Facts) -> Vec<Finding> {
     let mut out = Vec::new();
+
+    // A fresh install answers in one line instead of three diagnoses.
+    if facts.never_configured {
+        out.push(Finding::NotConfigured {
+            what: "This machine has InnerWarden installed but not set up: no \
+                   config, no wired agent, and nothing screened yet."
+                .into(),
+            next: "innerwarden setup".into(),
+        });
+        return out;
+    }
 
     // ── Mode ────────────────────────────────────────────────────────────────
     match facts.mode.as_deref() {
@@ -164,6 +187,12 @@ pub fn assess(facts: &Facts) -> Vec<Finding> {
 
 /// Is this install doing its job? Only `Working` on the things that matter.
 pub fn headline(findings: &[Finding]) -> &'static str {
+    if findings
+        .iter()
+        .any(|f| matches!(f, Finding::NotConfigured { .. }))
+    {
+        return "InnerWarden is installed and waiting to be set up.";
+    }
     let any_unknown = findings
         .iter()
         .any(|f| matches!(f, Finding::Unknown { .. }));
@@ -193,10 +222,46 @@ pub fn render(facts: &Facts) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// A fresh box is not a broken one.
+    ///
+    /// Before this, a machine with InnerWarden installed but never set up
+    /// answered with three separate "could not be read" diagnoses, which reads
+    /// as three faults. Verified on three hosts (Ubuntu 26.04/k7.0, 24.04/k6.17
+    /// x86_64, and 22.04/k6.8 aarch64) — identical wall of unknowns on each.
+    ///
+    /// The reader needs a first step, not a diagnosis.
+    #[test]
+    fn a_fresh_install_gets_one_instruction_not_three_diagnoses() {
+        let facts = Facts {
+            never_configured: true,
+            ..Facts::default()
+        };
+        let findings = assess(&facts);
+        assert_eq!(findings.len(), 1, "one line, not a wall: {findings:?}");
+        match &findings[0] {
+            Finding::NotConfigured { next, .. } => assert_eq!(next, "innerwarden setup"),
+            other => panic!("a fresh install must be told what to run: {other:?}"),
+        }
+        assert_eq!(
+            headline(&findings),
+            "InnerWarden is installed and waiting to be set up."
+        );
+    }
+
+    /// The short-circuit must not swallow a real problem: once anything IS
+    /// configured, every check runs again.
+    #[test]
+    fn a_configured_install_is_still_assessed_in_full() {
+        let mut f = healthy();
+        f.never_configured = false;
+        assert!(assess(&f).len() > 1);
+    }
+
     use super::*;
 
     fn healthy() -> Facts {
         Facts {
+            never_configured: false,
             mode: Some("enforce".into()),
             wired_agents: vec!["claude-code".into()],
             any_agent_seen: Some(true),
@@ -221,6 +286,7 @@ mod tests {
     #[test]
     fn unreadable_is_never_reported_as_off() {
         let facts = Facts {
+            never_configured: false,
             mode: None,
             wired_agents: vec![],
             any_agent_seen: None,

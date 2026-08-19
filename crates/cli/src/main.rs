@@ -77,7 +77,14 @@ fn status_io_cmd() -> std::process::ExitCode {
         .and_then(|p| std::fs::read_to_string(p).ok())
         .map(|text| text.lines().filter(|l| !l.trim().is_empty()).count() as u64);
 
+    // Absent everything is "not set up", not "unreadable". A fresh box is not a
+    // broken one, and three diagnoses send a beginner hunting a fault that does
+    // not exist.
+    let never_configured =
+        wired_agents.is_empty() && decisions_recorded.unwrap_or(0) == 0 && rows.is_empty();
+
     let facts = status::Facts {
+        never_configured,
         // Mode is not persisted anywhere this command can read today, so it is
         // reported as unknown rather than assumed. Assuming would be the exact
         // mistake this command exists to stop.
