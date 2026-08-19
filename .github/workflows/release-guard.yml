@@ -109,9 +109,36 @@ jobs:
         # form, so the ONE build that has to succeed on demand was the flakiest.
         timeout-minutes: 8
         run: |
-          sudo systemctl stop unattended-upgrades.service 2>/dev/null || true
-          sudo apt-get -o DPkg::Lock::Timeout=300 update
-          sudo apt-get -o DPkg::Lock::Timeout=300 install --yes bubblewrap
+          # Stopping the SERVICE does not kill the apt-get it already spawned,
+          # and the apt-daily timers relaunch it underneath us. On 2026-08-19
+          # this step timed out repeatedly on CI for changes that touched no
+          # workflow code. The release path cannot be a coin flip.
+          sudo systemctl stop \
+            unattended-upgrades.service \
+            apt-daily.service apt-daily-upgrade.service \
+            apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+
+          for _ in $(seq 1 60); do
+            if ! sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 \
+               && ! sudo fuser /var/lib/apt/lists/lock >/dev/null 2>&1; then
+              break
+            fi
+            sleep 2
+          done
+
+          apt_retry() {
+            for attempt in 1 2 3; do
+              if sudo apt-get -o DPkg::Lock::Timeout=180 "$@"; then
+                return 0
+              fi
+              echo "apt-get $* failed (attempt $attempt); retrying" >&2
+              sleep $((attempt * 5))
+            done
+            return 1
+          }
+
+          apt_retry update
+          apt_retry install --yes bubblewrap
           test "$(command -v bwrap)" = /usr/bin/bwrap
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
           sudo sysctl -w kernel.unprivileged_userns_clone=1 || true

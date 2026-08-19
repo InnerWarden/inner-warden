@@ -40,12 +40,45 @@ jobs:
         if: runner.os == 'Linux'
         timeout-minutes: 8
         run: |
-          # The fresh runner boots with unattended-upgrades holding the dpkg/apt
-          # lock; wait it out with a lock timeout and disable the background job
-          # so the install can't hang indefinitely.
-          sudo systemctl stop unattended-upgrades.service 2>/dev/null || true
-          sudo apt-get -o DPkg::Lock::Timeout=300 update
-          sudo apt-get -o DPkg::Lock::Timeout=300 install -y bubblewrap
+          # A fresh runner boots with unattended-upgrades holding the dpkg/apt
+          # lock. Stopping the SERVICE is not enough: it does not kill the
+          # apt-get it already spawned, and the apt-daily timers relaunch it
+          # underneath us. Two PRs failed here on 2026-08-19 with the step
+          # timing out after eight minutes, twice each, on a change that touched
+          # no CI code at all.
+          #
+          # So: stop the timers as well as the services, wait for the lock to be
+          # genuinely free rather than hoping a timeout covers it, and retry the
+          # install, because a transient mirror error should cost a retry rather
+          # than a whole run.
+          sudo systemctl stop \
+            unattended-upgrades.service \
+            apt-daily.service apt-daily-upgrade.service \
+            apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+
+          # Wait for whatever already holds the lock to finish, rather than
+          # racing it. 120s is generous for a runner's boot-time upgrade.
+          for _ in $(seq 1 60); do
+            if ! sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 \
+               && ! sudo fuser /var/lib/apt/lists/lock >/dev/null 2>&1; then
+              break
+            fi
+            sleep 2
+          done
+
+          apt_retry() {
+            for attempt in 1 2 3; do
+              if sudo apt-get -o DPkg::Lock::Timeout=180 "$@"; then
+                return 0
+              fi
+              echo "apt-get $* failed (attempt $attempt); retrying" >&2
+              sleep $((attempt * 5))
+            done
+            return 1
+          }
+
+          apt_retry update
+          apt_retry install -y bubblewrap
           # Ubuntu 24.04 restricts unprivileged user namespaces via AppArmor;
           # the AI Jail backend needs them for its uid map. Allow them in CI.
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
