@@ -1045,11 +1045,35 @@ fn disconnect_one(home: &Path, r: &AgentStatus) -> String {
     format!("  {}, nothing to disconnect", r.name)
 }
 
+/// What to say when the scan matched nothing.
+///
+/// Absence of a SIGNATURE is not absence of an agent, and saying the second when
+/// you mean the first sends a beginner away believing they have nothing to
+/// guard. Detection matches known agents by their command line, so a bespoke
+/// script, a wrapper or a renamed binary matches nothing while running
+/// perfectly. That reader is exactly the one who needs a next step, and exactly
+/// the one the old single line ended the conversation on. Seen on a production
+/// host running a hand-written Python agent this command called "no compatible
+/// AI agents found".
+fn nothing_detected_lines() -> Vec<String> {
+    vec![
+        "innerwarden agents, none of the agents I know by name are running.".into(),
+        String::new(),
+        "  I detect agents by matching known command lines, so a bespoke".into(),
+        "  script, a wrapper or a renamed binary will not show up here even".into(),
+        "  while it is running.".into(),
+        String::new(),
+        "  If you have an agent running:".into(),
+        "    innerwarden hook <your-agent>   wire the in-path guard".into(),
+        "    innerwarden agents --all        show every process I considered".into(),
+    ]
+}
+
 fn list_lines(home: &Path) -> Vec<String> {
     let mut out = Vec::new();
     let rows = rows(home);
     if rows.is_empty() {
-        out.push("innerwarden agents, no compatible AI agents found.".into());
+        out.extend(nothing_detected_lines());
     } else {
         out.push("innerwarden agents, found (connect wires all guardable ones):".into());
         for r in &rows {
@@ -1211,6 +1235,37 @@ pub fn run(home: &Path, args: &[String]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    /// Absence of a SIGNATURE is not absence of an agent.
+    ///
+    /// Detection matches known agents by command line, so a bespoke script, a
+    /// wrapper or a renamed binary matches nothing while running perfectly.
+    /// Saying "no compatible AI agents found" to that reader tells them they
+    /// have nothing to guard, which is the opposite of true and the end of the
+    /// conversation. Seen on a production host running a hand-written Python
+    /// agent.
+    #[test]
+    fn an_empty_scan_explains_itself_and_says_what_to_do() {
+        let text = nothing_detected_lines().join("\n");
+
+        assert!(
+            !text.contains("no compatible AI agents found"),
+            "the old wording reported absence of an agent when it had only \
+             established absence of a signature: {text}"
+        );
+        assert!(
+            text.contains("know by name"),
+            "it must say detection is by name, not by presence: {text}"
+        );
+        assert!(
+            text.contains("bespoke") || text.contains("wrapper") || text.contains("renamed"),
+            "it must name the case where detection cannot work: {text}"
+        );
+        assert!(
+            text.contains("innerwarden hook"),
+            "it must give the reader their next command: {text}"
+        );
+    }
+
     use super::*;
 
     #[test]
