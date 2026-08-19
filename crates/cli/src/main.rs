@@ -37,6 +37,7 @@ mod serve_owner;
 mod session_store;
 mod setup;
 mod setup_io;
+mod status;
 mod suppress;
 mod suppress_io;
 mod upgrade;
@@ -47,6 +48,48 @@ mod upsell_io;
 const DEFAULT_BIND: &str = "127.0.0.1:8787";
 pub(crate) const COMMUNITY_NAME: &str = "InnerWarden Community";
 pub(crate) const COMMUNITY_EDITION_NAME: &str = "InnerWarden Community Edition";
+
+/// Gather what we can establish about this install, then say it plainly.
+///
+/// Anything that cannot be read stays `None`, which the report renders as
+/// `[unknown]` rather than `[off]`. That distinction is the whole point of the
+/// command: reporting "off" when you mean "could not tell" sends the reader to
+/// fix the wrong thing.
+fn status_io_cmd() -> std::process::ExitCode {
+    let home = std::env::var("HOME").ok().map(std::path::PathBuf::from);
+    let rows = home
+        .as_deref()
+        .map(innerwarden_agent_guard::agents_ops::rows)
+        .unwrap_or_default();
+
+    let wired_agents: Vec<String> = rows
+        .iter()
+        .filter(|r| r.guarded)
+        .map(|r| r.name.clone())
+        .collect();
+
+    // Seen at all, wired or not. `None` when we could not look, which the
+    // report renders as unknown rather than as "no agent".
+    let any_agent_seen = home.as_ref().map(|_| !rows.is_empty());
+
+    let decisions_recorded = graph_io::sink_dir()
+        .map(|d| d.join("guard-events.jsonl"))
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|text| text.lines().filter(|l| !l.trim().is_empty()).count() as u64);
+
+    let facts = status::Facts {
+        // Mode is not persisted anywhere this command can read today, so it is
+        // reported as unknown rather than assumed. Assuming would be the exact
+        // mistake this command exists to stop.
+        mode: None,
+        wired_agents,
+        any_agent_seen,
+        decisions_recorded,
+        dashboard_reachable: None,
+    };
+    print!("{}", status::render(&facts));
+    std::process::ExitCode::SUCCESS
+}
 
 fn main() -> std::process::ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -76,6 +119,7 @@ fn main() -> std::process::ExitCode {
             code
         }
         Some("install") => cmd_install(&args[1..]),
+        Some("status") => status_io_cmd(),
         Some("agents") => agents_io::cmd(&args[1..]),
         Some("contain") => contain_io::cmd(&args[1..]),
         Some("enforce") => cmd_mode(&args[1..], false),
