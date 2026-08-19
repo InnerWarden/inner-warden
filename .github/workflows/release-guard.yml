@@ -107,7 +107,11 @@ jobs:
         # unattended-upgrades holding the dpkg lock, and without a lock timeout
         # this hangs until the job is killed. The release path had the bare
         # form, so the ONE build that has to succeed on demand was the flakiest.
-        timeout-minutes: 8
+        #
+        # Budget: 120s lock wait + 3 attempts x 60s lock + backoff is under five
+        # minutes. The previous 8 was SHORTER than the retry loop it contained,
+        # so a slow first attempt killed the job partway through retrying.
+        timeout-minutes: 12
         run: |
           # Stopping the SERVICE does not kill the apt-get it already spawned,
           # and the apt-daily timers relaunch it underneath us. On 2026-08-19
@@ -128,7 +132,18 @@ jobs:
 
           apt_retry() {
             for attempt in 1 2 3; do
-              if sudo apt-get -o DPkg::Lock::Timeout=180 "$@"; then
+              # `timeout` bounds the ATTEMPT in wall-clock. DPkg::Lock::Timeout
+              # only bounds waiting for the dpkg lock, and the observed hang was
+              # not the lock: apt printed the mirrorlist and then sat on a mirror
+              # fetch for twelve minutes until the step budget killed it. The
+              # network timeouts below make apt give up on a dead mirror; the
+              # outer `timeout` is the backstop for everything else.
+              if timeout 150 sudo apt-get \
+                   -o DPkg::Lock::Timeout=60 \
+                   -o Acquire::http::Timeout=20 \
+                   -o Acquire::https::Timeout=20 \
+                   -o Acquire::Retries=2 \
+                   "$@"; then
                 return 0
               fi
               echo "apt-get $* failed (attempt $attempt); retrying" >&2
@@ -137,8 +152,16 @@ jobs:
             return 1
           }
 
-          apt_retry update
-          apt_retry install --yes bubblewrap
+          # Try the cheapest path first. The runner image often already has
+          # bwrap, and when it does not, the package lists it shipped with are
+          # usually enough to install it. `apt-get update` is the step that
+          # actually hangs: on 2026-08-19 all three bounded attempts burned their
+          # full 150s against the same mirror. Refreshing the lists is a
+          # nice-to-have; having bwrap is the requirement.
+          if ! command -v bwrap >/dev/null 2>&1; then
+            apt_retry install --yes bubblewrap \
+              || { apt_retry update && apt_retry install --yes bubblewrap; }
+          fi
           test "$(command -v bwrap)" = /usr/bin/bwrap
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
           sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
