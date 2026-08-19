@@ -71,7 +71,18 @@ jobs:
 
           apt_retry() {
             for attempt in 1 2 3; do
-              if sudo apt-get -o DPkg::Lock::Timeout=60 "$@"; then
+              # `timeout` bounds the ATTEMPT in wall-clock. DPkg::Lock::Timeout
+              # only bounds waiting for the dpkg lock, and the observed hang was
+              # not the lock: apt printed the mirrorlist and then sat on a mirror
+              # fetch for twelve minutes until the step budget killed it. The
+              # network timeouts below make apt give up on a dead mirror; the
+              # outer `timeout` is the backstop for everything else.
+              if timeout 150 sudo apt-get \
+                   -o DPkg::Lock::Timeout=60 \
+                   -o Acquire::http::Timeout=20 \
+                   -o Acquire::https::Timeout=20 \
+                   -o Acquire::Retries=2 \
+                   "$@"; then
                 return 0
               fi
               echo "apt-get $* failed (attempt $attempt); retrying" >&2
