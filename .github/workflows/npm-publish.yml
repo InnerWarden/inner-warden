@@ -16,8 +16,10 @@ permissions:
 #   repository:        InnerWarden/inner-warden
 #   workflow filename: npm-publish.yml
 #
-# Release flow: bump the version in npm/package.json, then either run this
-# workflow manually or push a tag matching `npm-v*`.
+# Release flow: bump the version in npm/package.json and push a `guard-v*` tag.
+# The release workflow publishes the binaries and this one chains off it, so
+# npm never lags the bytes it wraps. The manual trigger and the `npm-v*` tag
+# remain for republishing a channel on its own.
 
 on:
   workflow_dispatch:
@@ -30,9 +32,30 @@ on:
     tags:
       - "npm-v*"
 
+  # `npm install -g innerwarden` is the primary install path, and it had no
+  # trigger tied to the release: the binaries went out under a `guard-v*` tag
+  # while npm sat on whatever was last pushed by hand. It served 1.3.3 for the
+  # length of a release whose binaries were 1.3.4, so the documented install
+  # command handed users an older CLI than the one just shipped. Chain off the
+  # release so a cut moves this channel too.
+  #
+  # Safe to re-run: npm/scripts/publish.mjs treats a version already on the
+  # registry as success, so a re-cut of the same version is a no-op, not a
+  # red workflow.
+  workflow_run:
+    workflows: ["Release InnerWarden Community"]
+    types: [completed]
+
 concurrency:
   group: npm-publish
   cancel-in-progress: false
+
+# The commit to publish. On workflow_run `github.sha` is the default branch
+# head, which is not necessarily the commit that was released; publishing one
+# commit while proving CI green on another is exactly the hole the gate below
+# exists to close.
+env:
+  RELEASE_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
 
 jobs:
   # Audit CI-04: publishing required no green CI and no human in the loop, so a
@@ -42,6 +65,10 @@ jobs:
   gate:
     name: CI must be green on this commit
     runs-on: ubuntu-latest
+    # A release that failed must not publish to npm.
+    if: >-
+      github.event_name != 'workflow_run' ||
+      github.event.workflow_run.conclusion == 'success'
     permissions:
       # `actions: read` is what the Actions API this job queries actually needs.
       # It ran with `checks: read` alone, which is a different API; the call
@@ -52,12 +79,14 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Require a green CI run for ${{ github.sha }}
+        with:
+          ref: ${{ env.RELEASE_SHA }}
+      - name: Require a green CI run for ${{ env.RELEASE_SHA }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          sha="${{ github.sha }}"
+          sha="${{ env.RELEASE_SHA }}"
           runs=$(gh api "repos/${{ github.repository }}/actions/workflows/ci.yml/runs?head_sha=$sha&per_page=20" \
             --jq '[.workflow_runs[] | select(.status=="completed")] | map(.conclusion)')
           echo "CI conclusions for $sha: $runs"
@@ -90,6 +119,9 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Publish the commit the gate proved green, not the branch head.
+          ref: ${{ env.RELEASE_SHA }}
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
