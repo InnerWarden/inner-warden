@@ -107,7 +107,11 @@ jobs:
         # unattended-upgrades holding the dpkg lock, and without a lock timeout
         # this hangs until the job is killed. The release path had the bare
         # form, so the ONE build that has to succeed on demand was the flakiest.
-        timeout-minutes: 8
+        #
+        # Budget: 120s lock wait + 3 attempts x 60s lock + backoff is under five
+        # minutes. The previous 8 was SHORTER than the retry loop it contained,
+        # so a slow first attempt killed the job partway through retrying.
+        timeout-minutes: 12
         run: |
           # Stopping the SERVICE does not kill the apt-get it already spawned,
           # and the apt-daily timers relaunch it underneath us. On 2026-08-19
@@ -128,7 +132,7 @@ jobs:
 
           apt_retry() {
             for attempt in 1 2 3; do
-              if sudo apt-get -o DPkg::Lock::Timeout=180 "$@"; then
+              if sudo apt-get -o DPkg::Lock::Timeout=60 "$@"; then
                 return 0
               fi
               echo "apt-get $* failed (attempt $attempt); retrying" >&2

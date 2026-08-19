@@ -38,7 +38,10 @@ jobs:
 
       - name: Install bubblewrap (Linux AI Jail backend)
         if: runner.os == 'Linux'
-        timeout-minutes: 8
+        # Budget: 120s lock wait + 3 attempts x 60s lock + backoff is under
+        # five minutes. The previous 8 was SHORTER than the retry loop it
+        # contained, so a slow first attempt killed the job mid-retry.
+        timeout-minutes: 12
         run: |
           # A fresh runner boots with unattended-upgrades holding the dpkg/apt
           # lock. Stopping the SERVICE is not enough: it does not kill the
@@ -68,7 +71,7 @@ jobs:
 
           apt_retry() {
             for attempt in 1 2 3; do
-              if sudo apt-get -o DPkg::Lock::Timeout=180 "$@"; then
+              if sudo apt-get -o DPkg::Lock::Timeout=60 "$@"; then
                 return 0
               fi
               echo "apt-get $* failed (attempt $attempt); retrying" >&2
