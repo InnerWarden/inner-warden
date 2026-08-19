@@ -152,8 +152,16 @@ jobs:
             return 1
           }
 
-          apt_retry update
-          apt_retry install --yes bubblewrap
+          # Try the cheapest path first. The runner image often already has
+          # bwrap, and when it does not, the package lists it shipped with are
+          # usually enough to install it. `apt-get update` is the step that
+          # actually hangs: on 2026-08-19 all three bounded attempts burned their
+          # full 150s against the same mirror. Refreshing the lists is a
+          # nice-to-have; having bwrap is the requirement.
+          if ! command -v bwrap >/dev/null 2>&1; then
+            apt_retry install --yes bubblewrap \
+              || { apt_retry update && apt_retry install --yes bubblewrap; }
+          fi
           test "$(command -v bwrap)" = /usr/bin/bwrap
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
           sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
