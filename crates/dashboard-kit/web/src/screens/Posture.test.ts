@@ -462,10 +462,45 @@ describe("no surface can bypass the assurance veto", () => {
       // Its own declaration, and the one function allowed to call it.
       .filter((entry: { line: string; number: number }) => !/^export function dispositionOf/.test(entry.line))
       .filter((entry: { line: string; number: number }) => !/^const reported = dispositionOf\(layer\);$/.test(entry.line))
-      // dispositionReason falls back through it to pick a default sentence,
-      // which is text only and never a colour or a claim.
-      .filter((entry: { line: string; number: number }) => !/^return fallback\[dispositionOf\(layer\)\];$/.test(entry.line));
+      // dispositionReason compares against it to decide whether the host's
+      // sentence still applies, and falls back through it for a default. Text
+      // only: it never picks a colour and never makes a claim.
+      .filter((entry: { line: string; number: number }) => !/^const effective = shown \?\? dispositionOf\(layer\);$/.test(entry.line))
+      .filter((entry: { line: string; number: number }) => !/^if \(layer\.disposition_reason && effective === dispositionOf\(layer\)\) \{$/.test(entry.line));
 
     expect(callSites).toEqual([]);
+  });
+});
+
+describe("the sentence never outranks the badge", () => {
+  it("drops the host's stronger sentence when the veto softened the badge", () => {
+    // Measured on a pilot box 2026-08-20: the row was badged "Working as set
+    // up" and the line directly under it read "is enforcing, and that was
+    // verified on this host". The badge had been through the assurance veto and
+    // the sentence had not, so the words outranked the claim they sat beneath.
+    const layer = {
+      ...FIVE_LAYERS[0],
+      label: "Independent host execution",
+      disposition: "proven" as const,
+      disposition_reason: "Independent host execution is enforcing, and that was verified on this host.",
+    };
+
+    // Veto applied: the sentence must come down with the badge.
+    expect(dispositionReason(layer, "working_as_configured")).toBe(
+      "Independent host execution is doing what it is set to do.",
+    );
+    // No veto: the host's own wording is richer and is kept.
+    expect(dispositionReason(layer, "proven")).toBe(layer.disposition_reason);
+  });
+
+  it("keeps the host sentence whenever the shown state matches", () => {
+    const layer = {
+      ...FIVE_LAYERS[0],
+      disposition: "not_enabled" as const,
+      disposition_reason: "DNS resolution control is switched on but has nothing to act on yet.",
+    };
+    expect(dispositionReason(layer, "not_enabled")).toBe(layer.disposition_reason);
+    // And the default caller, with no shown state, still gets it.
+    expect(dispositionReason(layer)).toBe(layer.disposition_reason);
   });
 });
