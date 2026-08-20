@@ -240,6 +240,27 @@ function layer(value: unknown, path: string): ProtectionLayer {
     desired_mode: item.desired_mode === undefined
       ? "unknown"
       : oneOf(item.desired_mode, ["disabled", "learning", "observe", "rehearse", "enforce", "mixed", "unknown"] as const, `${path}.desired_mode`),
+    // Same tolerance as desired_mode above, and for the same reason: an older
+    // agent sends neither field, and the screen reconstructs a conservative
+    // disposition from what it did send.
+    //
+    // This validator REBUILDS the object field by field, so anything it does
+    // not name is silently dropped: the host can compute a disposition, ship
+    // it, and the surface will never see it. Measured on a pilot box
+    // 2026-08-20: the payload carried `disposition: "not_enabled"` for the DNS
+    // guard and the page rendered "Can't confirm", because the field died here.
+    ...(item.disposition === undefined
+      ? {}
+      : {
+          disposition: oneOf(
+            item.disposition,
+            ["proven", "working_as_configured", "not_enabled", "cannot_verify", "needs_operator"] as const,
+            `${path}.disposition`,
+          ),
+        }),
+    ...(item.disposition_reason === undefined
+      ? {}
+      : { disposition_reason: text(item.disposition_reason, `${path}.disposition_reason`) }),
     effective_scope: array(item.effective_scope, `${path}.effective_scope`, scope), covered_action_classes: stringArray(item.covered_action_classes, `${path}.covered_action_classes`),
     known_gaps: array(item.known_gaps, `${path}.known_gaps`, gap),
     freshness: freshness(item.freshness, `${path}.freshness`),
