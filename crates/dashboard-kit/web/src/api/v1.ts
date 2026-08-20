@@ -21,17 +21,17 @@ export type ClaimState = "active" | "visibility_only" | "readiness_only" | "degr
  * Five values because each maps to a DIFFERENT thing the reader should do; two
  * that shared an action would be one value wearing two names.
  *
- *  - proven                — verified enforcing. Nothing to do. The only
+ *  - proven               : verified enforcing. Nothing to do. The only
  *                            positive colour, because it is the only PROOF.
- *  - working_as_configured — doing exactly what it was set to do. Nothing to
+ *  - working_as_configured: doing exactly what it was set to do. Nothing to
  *                            do. The distance from proven is by design.
- *  - not_enabled           — never turned on, or unsupported here. Nothing is
+ *  - not_enabled          : never turned on, or unsupported here. Nothing is
  *                            broken. Kept separate from working_as_configured
  *                            because "you never switched this on" is the most
  *                            useful thing a new operator can read.
- *  - cannot_verify         — the check did not run or cannot be trusted. This
+ *  - cannot_verify        : the check did not run or cannot be trusted. This
  *                            is the product's problem, never an accusation.
- *  - needs_operator        — a real shortfall with something to do. The ONLY
+ *  - needs_operator       : a real shortfall with something to do. The ONLY
  *                            value that earns an amber card.
  */
 export type LayerDisposition =

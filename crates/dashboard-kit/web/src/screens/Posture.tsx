@@ -101,7 +101,7 @@ export function gapAudience(gap: Pick<CoverageGap, "id" | "state">): "operator" 
  *
  * The host computes this now, because only the host can tell a healthy unarmed
  * control from a broken one. A host on an older build sends no `disposition`,
- * so the fallback reconstructs it from what that build DID send — and it must
+ * so the fallback reconstructs it from what that build DID send: and it must
  * reconstruct it conservatively, never inventing `proven`.
  */
 export function dispositionOf(
@@ -234,7 +234,7 @@ export function controlPill(
     freshness: current ? checkedAt(layer.freshness) : "refreshing",
     // Colour follows the disposition, not "is it verified, else does it have a
     // gap". Under the old rule every control that was not verified-active and
-    // carried any gap went amber — which is every control on a healthy,
+    // carried any gap went amber: which is every control on a healthy,
     // deliberately-unarmed, freshly installed host.
     tone: dispositionTone(disposition),
     verified: assurance.verifiedActive,
@@ -266,7 +266,7 @@ export function postureHeadline(pills: ControlPill[]): string {
     return `${needing} of ${total} host control${s} need${needing === 1 ? "s" : ""} your attention`;
   }
   if (notOn === total) {
-    return `Nothing is turned on yet — ${total} control${s} ready to enable`;
+    return `Nothing is turned on yet: ${total} control${s} ready to enable`;
   }
   if (protecting === total) {
     return `All ${total} host control${s} protecting`;
@@ -276,10 +276,10 @@ export function postureHeadline(pills: ControlPill[]): string {
   // headline that only says "working" hides the proven ones.
   const tail = notOn > 0 ? `, ${notOn} not turned on` : "";
   if (protecting > 0) {
-    return `${protecting} of ${total} host control${s} protecting, the rest working${tail} — nothing needs you`;
+    return `${protecting} of ${total} host control${s} protecting, the rest working${tail}: nothing needs you`;
   }
   const on = total - notOn;
-  return `${on} of ${total} host control${s} working${tail} — nothing needs you`;
+  return `${on} of ${total} host control${s} working${tail}: nothing needs you`;
 }
 
 /** The quiet line shown when no gap card needs to render. */
@@ -308,8 +308,8 @@ export function Posture({
 }) {
   const pills = posture.layers.map((layer) => controlPill(layer, bootstrap, posture.generated_at, current, evaluatedAt));
   // A gap is an amber card only when the control that OWNS it is asking for
-  // the reader. The gap text still exists everywhere else — it stays in the
-  // owning control's disclosure — so nothing is hidden; only the routing
+  // the reader. The gap text still exists everywhere else: it stays in the
+  // owning control's disclosure: so nothing is hidden; only the routing
   // changed. Suppressing the text would trade one dishonesty for another.
   const needy = new Set(
     posture.layers
@@ -447,7 +447,7 @@ function ControlRow({
     .filter((capability): capability is CapabilityStatus => capability !== undefined);
   const disposition = dispositionOf(layer);
   // A gap whose owning control is NOT asking for the reader still belongs in
-  // this disclosure — it is honest boundary text, just not an action card.
+  // this disclosure: it is honest boundary text, just not an action card.
   const verificationGaps = layer.known_gaps.filter(
     (gap) => gapAudience(gap) === "verification" || !needsOperator(disposition),
   );

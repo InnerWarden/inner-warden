@@ -52,7 +52,7 @@ const PRESENTATIONS: Record<string, Omit<StatusPresentation, "label"> & { label?
   // the posture model exists to prevent.
   //
   // `not_enabled` and `cannot_verify` are NEUTRAL on purpose. Both used to
-  // arrive here as `not_covered`, which is `attention` — so a correct fresh
+  // arrive here as `not_covered`, which is `attention`: so a correct fresh
   // install, which arms nothing by design, rendered the whole page amber and
   // taught the operator that amber means nothing.
   proven: { tone: "positive", symbol: "✓", label: "Protecting" },

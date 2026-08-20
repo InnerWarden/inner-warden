@@ -193,7 +193,7 @@ describe("the verdict hero leads with what the user asked", () => {
     // written to catch is still caught: nothing in this fixture is broken, so
     // nothing may be reported as needing attention, and no control may go
     // missing from the count.
-    expect(postureHeadline(pills)).toBe("5 of 5 host controls working — nothing needs you");
+    expect(postureHeadline(pills)).toBe("5 of 5 host controls working: nothing needs you");
   });
 
   it("leads with what needs the reader, not with what is fine", () => {
@@ -209,15 +209,15 @@ describe("the verdict hero leads with what the user asked", () => {
 
   it("does not shout at a correct fresh install", () => {
     // An install deliberately arms nothing. Every control is therefore
-    // unconfigured, which the old model reported as `not_covered` — a state the
-    // badge rendered amber — so a perfectly installed product opened with a
+    // unconfigured, which the old model reported as `not_covered`: a state the
+    // badge rendered amber: so a perfectly installed product opened with a
     // full page of warnings and taught the reader that amber means nothing.
     const layers = FIVE_LAYERS.map((layer) => ({ ...layer, disposition: "not_enabled" as const }));
     const pills = posture(layers).layers.map((entry) =>
       controlPill(entry, bootstrap(), generatedAt, true, evaluatedAt),
     );
 
-    expect(postureHeadline(pills)).toBe("Nothing is turned on yet — 5 controls ready to enable");
+    expect(postureHeadline(pills)).toBe("Nothing is turned on yet: 5 controls ready to enable");
     expect(pills.every((pill) => pill.tone === "neutral")).toBe(true);
     expect(pills.some((pill) => pill.tone === "attention")).toBe(false);
   });
