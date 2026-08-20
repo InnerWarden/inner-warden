@@ -110,10 +110,23 @@ pub fn assess(facts: &Facts) -> Vec<Finding> {
                   than assuming either."
                 .into(),
         }),
+        // Nothing was attempted, so nothing failed.
+        //
+        // This said "Guard mode could not be read. The config was unreadable."
+        // and `main.rs` passes `mode: None` unconditionally, because the mode is
+        // not persisted anywhere this command can see. So the sentence was not
+        // occasionally wrong, it was wrong every single time, for every user,
+        // on the first command a beginner runs after wiring an agent. It sent
+        // them looking for a broken config file that does not exist and never
+        // did.
+        //
+        // "Could not be read" and "there is nowhere to read it from" are
+        // different claims, and only the second one is true here.
         None => out.push(Finding::Unknown {
-            what: "Guard mode could not be read.".into(),
-            why: "The config was unreadable. This is not the same as being off, \
-                  and I will not report it as off."
+            what: "Guard mode is not something this command can see yet.".into(),
+            why: "It is not written anywhere `status` can read, so nothing was \
+                  attempted and nothing failed. Screening still applies; this \
+                  line is about what I can report, not about what is running."
                 .into(),
         }),
     }
@@ -268,6 +281,39 @@ mod tests {
             decisions_recorded: Some(42),
             dashboard_reachable: Some(true),
         }
+    }
+
+    /// Measured on a clean box: install, `agents connect --all`, then `status`.
+    /// The very next line a beginner sees was
+    ///
+    ///   [unknown] Guard mode could not be read.
+    ///             The config was unreadable.
+    ///
+    /// `main.rs` passes `mode: None` unconditionally, because the mode is not
+    /// persisted anywhere this command can see. So that sentence was not
+    /// occasionally wrong; it was wrong for every user, every run, and it named
+    /// a broken config file that does not exist.
+    ///
+    /// Claiming a read failed when no read was attempted is the same defect as
+    /// claiming something is off when it merely could not be established. This
+    /// file exists to refuse the second one, so it must refuse the first.
+    #[test]
+    fn an_unavailable_mode_does_not_blame_a_config_file() {
+        let mut f = healthy();
+        f.mode = None;
+        let rendered = render(&f);
+        assert!(
+            !rendered.contains("config was unreadable"),
+            "nothing was read, so nothing was unreadable:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("could not be read"),
+            "'could not be read' claims an attempt that never happened:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("not written anywhere"),
+            "say the real reason, so nobody goes looking for the file:\n{rendered}"
+        );
     }
 
     #[test]
