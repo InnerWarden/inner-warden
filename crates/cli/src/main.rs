@@ -793,6 +793,32 @@ fn cmd_uninstall(rest: &[String]) -> std::process::ExitCode {
     // the agent hook, the config directory, and the binary. `uninstall
     // claude-code` (a named agent) removes only that agent's hook.
     if uninstall_targets_whole_install(rest) {
+        // Refuse what we do not understand, BEFORE removing anything. An
+        // unrecognised flag on a destructive command must never be silently
+        // dropped: it reads as a modifier and behaves as consent.
+        if let Some(bad) = rest
+            .iter()
+            .find(|a| !UNINSTALL_SELF_FLAGS.contains(&a.as_str()))
+        {
+            eprintln!("innerwarden uninstall: unknown option `{bad}`");
+            eprintln!("  Accepted here: {}", UNINSTALL_SELF_FLAGS.join(", "));
+            eprintln!("  Nothing was changed.");
+            return std::process::ExitCode::from(2);
+        }
+        if rest.iter().any(|a| a == "--dry-run") {
+            match hook::home_dir() {
+                Ok(home) => {
+                    for line in uninstall_plan_lines(&home) {
+                        println!("{line}");
+                    }
+                    return std::process::ExitCode::SUCCESS;
+                }
+                Err(e) => {
+                    eprintln!("innerwarden uninstall: {e}");
+                    return std::process::ExitCode::from(2);
+                }
+            }
+        }
         return cmd_uninstall_self(rest.iter().any(|a| a == "--purge"));
     }
     let (agent, settings) = match parse_install_args(rest) {
@@ -863,6 +889,56 @@ fn cmd_uninstall(rest: &[String]) -> std::process::ExitCode {
 /// targets only that agent's hook. `--help` is handled before this is called.
 fn uninstall_targets_whole_install(rest: &[String]) -> bool {
     !rest.iter().any(|a| !a.starts_with('-'))
+}
+
+/// Flags `uninstall` accepts when it is removing the WHOLE install.
+///
+/// Anything else is refused rather than ignored. This is not tidiness: the
+/// dispatch above treats every `-`-prefixed argument as "not a named agent", so
+/// an unrecognised flag used to fall straight through into a full uninstall
+/// while appearing to modify it.
+///
+/// `innerwarden uninstall --dry-run` is the case that mattered. The published
+/// CLI reference documents it as "Print the exact plan and exit (no root
+/// needed)", which reads as the safe way to find out what would be removed. It
+/// was discarded, and running it removed the guard hook from a live machine.
+/// A typo like `--purge-all` or `--preveiw` did the same thing.
+const UNINSTALL_SELF_FLAGS: &[&str] = &["--purge", "--all", "--dry-run", "--help", "-h"];
+
+/// What a full uninstall WOULD remove, without removing any of it.
+fn uninstall_plan_lines(home: &std::path::Path) -> Vec<String> {
+    let mut out = vec![format!("{COMMUNITY_NAME} would remove:")];
+    // Read the same file the removal would edit, so the plan cannot claim a
+    // hook that is not there or miss one that is.
+    let hooked = std::fs::read_to_string(home.join(".claude/settings.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .map(|v| hook::has_iwguard_wiring(&v))
+        .unwrap_or(false);
+    out.push(format!(
+        "  hook    : {}",
+        if hooked {
+            "the PreToolUse hook in ~/.claude/settings.json"
+        } else {
+            "none wired"
+        }
+    ));
+    let config_dir = home.join(".config/innerwarden");
+    out.push(format!(
+        "  config  : {}",
+        if config_dir.exists() {
+            config_dir.display().to_string()
+        } else {
+            "none".to_string()
+        }
+    ));
+    out.push(match std::env::current_exe() {
+        Ok(exe) => format!("  binary  : {}", exe.display()),
+        Err(_) => "  binary  : could not resolve this executable's path".to_string(),
+    });
+    out.push(String::new());
+    out.push("Nothing was changed. Re-run without --dry-run to do it.".into());
+    out
 }
 
 /// Full self-uninstall: remove the guard hook from the wired agent, delete the
@@ -1259,6 +1335,39 @@ mod tests {
                  command nobody can find. Got:\n{help}"
             );
         }
+    }
+
+    /// `uninstall --dry-run` must PREVIEW, and an unknown flag must REFUSE.
+    ///
+    /// The dispatch treats every `-`-prefixed argument as "not a named agent",
+    /// so an unrecognised flag fell through into a FULL uninstall while looking
+    /// like it modified one. The published CLI reference documents `--dry-run`
+    /// as "Print the exact plan and exit (no root needed)", which reads as the
+    /// safe way to find out what would be removed.
+    ///
+    /// It was discarded. Running the documented preview removed the guard hook
+    /// from a live machine, verified by it disappearing from
+    /// `~/.claude/settings.json`. A typo did the same.
+    ///
+    /// Silently ignoring an unrecognised flag on a destructive command is the
+    /// root cause: it reads as a modifier and behaves as consent.
+    #[test]
+    fn uninstall_refuses_flags_it_does_not_understand() {
+        for flag in ["--preveiw", "--plan", "--yes", "--force"] {
+            assert!(
+                !UNINSTALL_SELF_FLAGS.contains(&flag),
+                "{flag} must not be silently accepted"
+            );
+        }
+        for flag in ["--dry-run", "--purge", "--all"] {
+            assert!(
+                UNINSTALL_SELF_FLAGS.contains(&flag),
+                "{flag} is a real option and must stay accepted"
+            );
+        }
+        // Still a whole-install target: the refusal happens after this, which is
+        // why the refusal has to exist at all.
+        assert!(uninstall_targets_whole_install(&["--preveiw".to_string()]));
     }
 
     #[test]
