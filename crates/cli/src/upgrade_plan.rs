@@ -64,9 +64,143 @@ pub fn staging_path(target: &Path) -> PathBuf {
     dir.join(format!(".{file}.upgrade"))
 }
 
+/// Who owns the installed binary, which decides what "upgrade" even means.
+///
+/// `upgrade` replaces the file it is running from. That is right for the
+/// installer's own copy and wrong for a copy another package manager put
+/// there: overwriting npm's file leaves npm believing it still ships the old
+/// version, and the next `npm install -g` silently reverts the upgrade.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum Managed {
+    /// Installed by `npm install -g innerwarden`.
+    Npm,
+    /// Installed by the shell installer, or built locally.
+    Direct,
+}
+
+/// Classify an install from the path the binary runs from.
+///
+/// npm's global layout puts the real binary under `node_modules`, which is the
+/// one marker that is stable across npm versions, prefixes, and platforms.
+pub fn managed_by(target: &Path) -> Managed {
+    if target
+        .components()
+        .any(|c| c.as_os_str() == "node_modules")
+    {
+        Managed::Npm
+    } else {
+        Managed::Direct
+    }
+}
+
+/// What to tell someone whose binary could not be replaced.
+///
+/// A beginner reading "Permission denied" has no way to know whether the fix is
+/// `sudo`, their package manager, or a reinstall. Worse, on an npm install the
+/// obvious guess is the wrong one: `sudo innerwarden upgrade` would succeed and
+/// then be undone by the next `npm install -g`. Name the actual next command.
+///
+/// `is_root` is passed in rather than read here so the decision stays pure and
+/// the root case is testable on any host.
+pub fn cannot_replace_advice(target: &Path, is_root: bool) -> Vec<String> {
+    let mut out = Vec::new();
+    match managed_by(target) {
+        Managed::Npm => {
+            out.push(format!(
+                "This copy is managed by npm ({}).",
+                target.display()
+            ));
+            out.push("Upgrade it the way it was installed:".into());
+            out.push("    npm install -g innerwarden@latest".into());
+            out.push(String::new());
+            out.push(
+                "Do not use sudo for this. Replacing npm's file by hand leaves npm \
+                 believing it still ships the old version, and the next \
+                 `npm install -g` puts the old one back."
+                    .into(),
+            );
+        }
+        Managed::Direct if !is_root => {
+            out.push(format!("{} is not writable by this user.", target.display()));
+            out.push("Re-run with elevated privileges:".into());
+            out.push("    sudo innerwarden upgrade".into());
+        }
+        Managed::Direct => {
+            out.push(format!(
+                "{} could not be replaced even as root.",
+                target.display()
+            ));
+            out.push(
+                "The filesystem is most likely read-only, or the file is immutable \
+                 (`lsattr`). Reinstall instead:"
+                    .into(),
+            );
+            out.push("    curl -fsSL https://innerwarden.com/free | sh".into());
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// npm's global install is the case where the obvious fix is the wrong one.
+    #[test]
+    fn an_npm_install_is_recognised_from_its_path() {
+        let p = Path::new(
+            "/usr/local/lib/node_modules/innerwarden/node_modules/@innerwarden/cli-linux-x64/bin/innerwarden",
+        );
+        assert_eq!(managed_by(p), Managed::Npm);
+        let advice = cannot_replace_advice(p, false).join("\n");
+        assert!(
+            advice.contains("npm install -g innerwarden@latest"),
+            "an npm install must be pointed at npm, got:\n{advice}"
+        );
+        assert!(
+            advice.contains("Do not use sudo"),
+            "sudo works here and is exactly what makes the upgrade revert later:\n{advice}"
+        );
+    }
+
+    /// Being root does not make overwriting npm's file the right move.
+    #[test]
+    fn root_does_not_change_the_advice_for_an_npm_install() {
+        let p = Path::new("/usr/lib/node_modules/innerwarden/bin/innerwarden");
+        let advice = cannot_replace_advice(p, true).join("\n");
+        assert!(advice.contains("npm install -g innerwarden@latest"), "{advice}");
+        assert!(
+            !advice.contains("sudo innerwarden upgrade"),
+            "escalating would overwrite npm's file, which is the bug:\n{advice}"
+        );
+    }
+
+    /// The ordinary case: installer copy, unprivileged user.
+    #[test]
+    fn a_direct_install_that_is_not_writable_asks_for_sudo() {
+        let p = Path::new("/usr/local/bin/innerwarden");
+        let advice = cannot_replace_advice(p, false).join("\n");
+        assert!(advice.contains("sudo innerwarden upgrade"), "{advice}");
+        assert!(!advice.contains("npm install"), "{advice}");
+    }
+
+    /// Already root and still refused: sudo is not the answer, so do not say it.
+    #[test]
+    fn a_direct_install_failing_as_root_does_not_suggest_sudo() {
+        let p = Path::new("/usr/local/bin/innerwarden");
+        let advice = cannot_replace_advice(p, true).join("\n");
+        assert!(
+            !advice.contains("sudo innerwarden upgrade"),
+            "telling root to use sudo sends them round the same loop:\n{advice}"
+        );
+        assert!(advice.contains("read-only"), "{advice}");
+    }
+
+    #[test]
+    fn a_plain_path_is_not_mistaken_for_npm() {
+        assert_eq!(managed_by(Path::new("/usr/local/bin/innerwarden")), Managed::Direct);
+        assert_eq!(managed_by(Path::new("/home/lab/.local/bin/innerwarden")), Managed::Direct);
+    }
 
     #[test]
     fn every_published_platform_maps_to_its_asset() {
