@@ -131,8 +131,18 @@ export function dispositionReason(
     ProtectionLayer,
     "disposition" | "disposition_reason" | "claim_state" | "effective_mode" | "desired_mode" | "label"
   >,
+  // The disposition actually being SHOWN, after the assurance veto. When it
+  // differs from what the host reported, the host's sentence belongs to the
+  // stronger state and must not be printed under the softer badge: on a real
+  // host that produced a row badged "Working as set up" above the words "is
+  // enforcing, and that was verified on this host". The badge is the claim;
+  // the sentence has to agree with it, not outrank it.
+  shown?: LayerDisposition,
 ): string {
-  if (layer.disposition_reason) return layer.disposition_reason;
+  const effective = shown ?? dispositionOf(layer);
+  if (layer.disposition_reason && effective === dispositionOf(layer)) {
+    return layer.disposition_reason;
+  }
   const fallback: Record<LayerDisposition, string> = {
     proven: `${layer.label} is enforcing, and that was verified on this host.`,
     working_as_configured: `${layer.label} is doing what it is set to do.`,
@@ -140,7 +150,7 @@ export function dispositionReason(
     cannot_verify: `${layer.label} could not be read on this host. This is ours to fix, not yours.`,
     needs_operator: `${layer.label} is not yet doing what it was set to do.`,
   };
-  return fallback[dispositionOf(layer)];
+  return fallback[effective];
 }
 
 /** Only one disposition asks the reader for anything. Amber has to stay scarce
@@ -260,7 +270,7 @@ export function controlPill(
     tone: dispositionTone(disposition),
     verified: assurance.verifiedActive,
     disposition,
-    reason: dispositionReason(layer),
+    reason: dispositionReason(layer, disposition),
   };
 }
 
@@ -495,7 +505,7 @@ function ControlRow({
           disclosure called "How this was verified" to learn that a grey control
           is grey because they have not turned it on yet. */}
       {current ? (
-        <p className="mt-2 text-sm leading-6 text-slate-600">{dispositionReason(layer)}</p>
+        <p className="mt-2 text-sm leading-6 text-slate-600">{dispositionReason(layer, disposition)}</p>
       ) : null}
 
       <details className="mt-3 border-t border-slate-100 pt-3">
