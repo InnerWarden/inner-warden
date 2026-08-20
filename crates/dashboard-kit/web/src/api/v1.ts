@@ -15,6 +15,31 @@ export type EffectiveMode = "disabled" | "learning" | "observe" | "rehearse" | "
 export type StageAnswer = "yes" | "no" | "unknown" | "not_applicable";
 export type FreshnessState = "fresh" | "stale" | "missing" | "unknown";
 export type ClaimState = "active" | "visibility_only" | "readiness_only" | "degraded" | "not_covered" | "unavailable" | "unknown";
+/**
+ * Does this control need the reader, and if not, why not?
+ *
+ * Five values because each maps to a DIFFERENT thing the reader should do; two
+ * that shared an action would be one value wearing two names.
+ *
+ *  - proven                — verified enforcing. Nothing to do. The only
+ *                            positive colour, because it is the only PROOF.
+ *  - working_as_configured — doing exactly what it was set to do. Nothing to
+ *                            do. The distance from proven is by design.
+ *  - not_enabled           — never turned on, or unsupported here. Nothing is
+ *                            broken. Kept separate from working_as_configured
+ *                            because "you never switched this on" is the most
+ *                            useful thing a new operator can read.
+ *  - cannot_verify         — the check did not run or cannot be trusted. This
+ *                            is the product's problem, never an accusation.
+ *  - needs_operator        — a real shortfall with something to do. The ONLY
+ *                            value that earns an amber card.
+ */
+export type LayerDisposition =
+  | "proven"
+  | "working_as_configured"
+  | "not_enabled"
+  | "cannot_verify"
+  | "needs_operator";
 export type SecurityOutcome =
   | "observed_only"
   | "allowed"
@@ -162,6 +187,18 @@ export type ProtectionLayer = {
   label: string;
   capability_ids: string[];
   claim_state: ClaimState;
+  // Whether this needs the reader, and why not when it does not.
+  //
+  // claim_state answers "what is the coverage". It does not answer "should the
+  // person reading this do something", and the surface used to infer the second
+  // from the first. It could not: "not_covered" is the CORRECT state of a
+  // control on a fresh install, because installing deliberately arms nothing,
+  // so a correct install rendered the whole page amber.
+  //
+  // Optional because a host running an older agent will not send it; callers
+  // fall back to the claim_state reading. See dispositionOf in Posture.
+  disposition?: LayerDisposition;
+  disposition_reason?: string;
   effective_mode: EffectiveMode;
   // The configured/armed intent, independent of runtime verification. When
   // effective_mode is "unknown" because active containment is not fully

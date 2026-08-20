@@ -15,8 +15,13 @@ import type {
 import {
   checkedAt,
   controlPill,
+  dispositionLabel,
+  dispositionOf,
+  dispositionReason,
+  dispositionTone,
   emptyGapsLine,
   gapAudience,
+  needsOperator,
   plainMode,
   postureHeadline,
   scopeDisplay,
@@ -182,7 +187,108 @@ describe("the verdict hero leads with what the user asked", () => {
     // a narrower notion of verified than the rows displayed and never said so.
     // Production showed the same shortfall, "1 of 5", with three rows reading
     // Enforcing and the kernel measured as enforcing on two of them.
-    expect(postureHeadline(pills)).toBe("2 of 5 host controls enforcing");
+    //
+    // The headline now leads with whether anything needs the reader, because
+    // that is the question they arrived with. The undercount this test was
+    // written to catch is still caught: nothing in this fixture is broken, so
+    // nothing may be reported as needing attention, and no control may go
+    // missing from the count.
+    expect(postureHeadline(pills)).toBe("5 of 5 host controls working — nothing needs you");
+  });
+
+  it("leads with what needs the reader, not with what is fine", () => {
+    // One control short of what it was asked for; four healthy.
+    const layers = FIVE_LAYERS.map((layer, index) =>
+      index === 0 ? { ...layer, disposition: "needs_operator" as const } : layer,
+    );
+    const pills = posture(layers).layers.map((entry) =>
+      controlPill(entry, bootstrap(), generatedAt, true, evaluatedAt),
+    );
+    expect(postureHeadline(pills)).toBe("1 of 5 host controls needs your attention");
+  });
+
+  it("does not shout at a correct fresh install", () => {
+    // An install deliberately arms nothing. Every control is therefore
+    // unconfigured, which the old model reported as `not_covered` — a state the
+    // badge rendered amber — so a perfectly installed product opened with a
+    // full page of warnings and taught the reader that amber means nothing.
+    const layers = FIVE_LAYERS.map((layer) => ({ ...layer, disposition: "not_enabled" as const }));
+    const pills = posture(layers).layers.map((entry) =>
+      controlPill(entry, bootstrap(), generatedAt, true, evaluatedAt),
+    );
+
+    expect(postureHeadline(pills)).toBe("Nothing is turned on yet — 5 controls ready to enable");
+    expect(pills.every((pill) => pill.tone === "neutral")).toBe(true);
+    expect(pills.some((pill) => pill.tone === "attention")).toBe(false);
+  });
+
+  it("reads an older host's payload without inventing a claim", () => {
+    // A host on a build that predates `disposition` sends none. The fallback
+    // has to reconstruct it from what that build DID send, and it must never
+    // manufacture the one state that means "we proved this protects you".
+    const base = { ...FIVE_LAYERS[0] };
+    delete (base as { disposition?: unknown }).disposition;
+
+    // Doing what it was told, with no host verdict: working, not proven.
+    expect(
+      dispositionOf({ ...base, claim_state: "readiness_only", effective_mode: "observe", desired_mode: "observe" }),
+    ).toBe("working_as_configured");
+
+    // Unreadable is ours, whatever else the payload says.
+    expect(
+      dispositionOf({ ...base, claim_state: "degraded", effective_mode: "unknown", desired_mode: "enforce" }),
+    ).toBe("cannot_verify");
+
+    // Never armed: calm, not an alarm.
+    expect(
+      dispositionOf({ ...base, claim_state: "not_covered", effective_mode: "disabled", desired_mode: "enforce" }),
+    ).toBe("not_enabled");
+
+    // Short of what it was asked for: this one IS the reader's.
+    expect(
+      dispositionOf({ ...base, claim_state: "degraded", effective_mode: "observe", desired_mode: "enforce" }),
+    ).toBe("needs_operator");
+  });
+
+  it("gives every state a sentence, even with none supplied", () => {
+    // A state with no explanation is what made people stop reading this page.
+    const base = { ...FIVE_LAYERS[0], label: "DNS resolution control" };
+    delete (base as { disposition_reason?: unknown }).disposition_reason;
+    for (const disposition of ["proven", "working_as_configured", "not_enabled", "cannot_verify", "needs_operator"] as const) {
+      const why = dispositionReason({ ...base, disposition });
+      expect(why.length).toBeGreaterThan(20);
+      expect(why).toContain("DNS resolution control");
+      expect(dispositionLabel(disposition).length).toBeGreaterThan(0);
+    }
+  });
+
+  it("lets exactly one state ask the reader for something", () => {
+    const asking = (["proven", "working_as_configured", "not_enabled", "cannot_verify", "needs_operator"] as const)
+      .filter(needsOperator);
+    expect(asking).toEqual(["needs_operator"]);
+  });
+
+  it("keeps amber scarce enough to mean something", () => {
+    // Exactly one disposition may colour a control amber. If a second starts
+    // doing it the page drifts back to permanent warnings and this work undoes
+    // itself.
+    const amber = (["proven", "working_as_configured", "not_enabled", "cannot_verify", "needs_operator"] as const)
+      .filter((disposition) => dispositionTone(disposition) === "attention");
+    expect(amber).toEqual(["needs_operator"]);
+  });
+
+  it("blames the product, not the reader, when a probe did not run", () => {
+    // Measured on a pilot box 2026-08-20: the Secret Read Guard was armed and
+    // ENFORCING, and the page said "Not confirmed / never checked", because the
+    // program's kernel instruction-tag was not in a hardcoded two-entry
+    // allowlist and CO-RE relocations make that tag per-kernel. Nothing the
+    // reader could click would have changed it, so it must not read as theirs.
+    const layer = { ...FIVE_LAYERS[0], disposition: "cannot_verify" as const };
+    const pill = controlPill(layer, bootstrap(), generatedAt, true, evaluatedAt);
+
+    expect(pill.tone).toBe("neutral");
+    expect(pill.mode).toBe("Can't confirm");
+    expect(pill.reason).toMatch(/ours to fix, not yours/);
   });
 
   it("never claims verified active without the assurance rule agreeing", () => {
@@ -196,7 +302,11 @@ describe("the verdict hero leads with what the user asked", () => {
   it("shows each control in plain words with its scope name and check time", () => {
     const pill = controlPill(posture().layers[0], bootstrap(), generatedAt, true, evaluatedAt);
     expect(pill.name).toBe("Independent host execution");
-    expect(pill.mode).toBe("Enforcing");
+    // "Working as set up", not "Enforcing": this fixture carries no claims
+    // records, so the assurance rule does not agree that it is verified, and
+    // the pill is not allowed to borrow the stronger word. The control is still
+    // doing what it was told, which is why this is calm and not an alarm.
+    expect(pill.mode).toBe("Working as set up");
     expect(pill.scope).toBe("OpenClaw workload");
     expect(pill.freshness).toMatch(/^as of \d{2}:\d{2}$/);
     // The producer freshness budget is contract bookkeeping; the summary never
