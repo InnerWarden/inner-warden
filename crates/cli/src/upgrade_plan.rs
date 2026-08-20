@@ -83,10 +83,7 @@ pub enum Managed {
 /// npm's global layout puts the real binary under `node_modules`, which is the
 /// one marker that is stable across npm versions, prefixes, and platforms.
 pub fn managed_by(target: &Path) -> Managed {
-    if target
-        .components()
-        .any(|c| c.as_os_str() == "node_modules")
-    {
+    if target.components().any(|c| c.as_os_str() == "node_modules") {
         Managed::Npm
     } else {
         Managed::Direct
@@ -121,7 +118,10 @@ pub fn cannot_replace_advice(target: &Path, is_root: bool) -> Vec<String> {
             );
         }
         Managed::Direct if !is_root => {
-            out.push(format!("{} is not writable by this user.", target.display()));
+            out.push(format!(
+                "{} is not writable by this user.",
+                target.display()
+            ));
             out.push("Re-run with elevated privileges:".into());
             out.push("    sudo innerwarden upgrade".into());
         }
@@ -168,7 +168,10 @@ mod tests {
     fn root_does_not_change_the_advice_for_an_npm_install() {
         let p = Path::new("/usr/lib/node_modules/innerwarden/bin/innerwarden");
         let advice = cannot_replace_advice(p, true).join("\n");
-        assert!(advice.contains("npm install -g innerwarden@latest"), "{advice}");
+        assert!(
+            advice.contains("npm install -g innerwarden@latest"),
+            "{advice}"
+        );
         assert!(
             !advice.contains("sudo innerwarden upgrade"),
             "escalating would overwrite npm's file, which is the bug:\n{advice}"
@@ -198,8 +201,14 @@ mod tests {
 
     #[test]
     fn a_plain_path_is_not_mistaken_for_npm() {
-        assert_eq!(managed_by(Path::new("/usr/local/bin/innerwarden")), Managed::Direct);
-        assert_eq!(managed_by(Path::new("/home/lab/.local/bin/innerwarden")), Managed::Direct);
+        assert_eq!(
+            managed_by(Path::new("/usr/local/bin/innerwarden")),
+            Managed::Direct
+        );
+        assert_eq!(
+            managed_by(Path::new("/home/lab/.local/bin/innerwarden")),
+            Managed::Direct
+        );
     }
 
     #[test]
