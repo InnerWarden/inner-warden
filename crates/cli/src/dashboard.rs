@@ -1489,6 +1489,7 @@ mod tests {
             mcp_json: None,
             mcp_toml: None,
             guarded: false,
+            mode: None,
         }];
 
         let payload: serde_json::Value =

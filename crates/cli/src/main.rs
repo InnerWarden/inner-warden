@@ -1158,6 +1158,8 @@ fn help_text() -> String {
          \n\
          USAGE:\n  \
            {p} setup                     first-run wizard: pick what to enable (arrow keys)\n  \
+             {p} dry-run                   put EVERY connected agent in monitor: records, never blocks\n  \
+             {p} enforce                   the opposite: a denied command is actually refused\n  \
            {p} check \"<command>\" [--json]  analyze a command, print the verdict\n  \
            echo \"<command>\" | {p} check\n  \
            {p} serve [--bind IP:PORT]   serve POST /api/agent/check-command (plain HTTP, loopback)\n  \
@@ -1236,6 +1238,27 @@ mod tests {
             help.contains("remove InnerWarden entirely"),
             "help must document the full uninstall"
         );
+    }
+
+    /// A command that exists and is not in `--help` may as well not exist.
+    ///
+    /// `dry-run` and `enforce` have been dispatched for a long time and were
+    /// never listed. So the one question a new user asks first, "how do I run
+    /// this without it blocking anything yet", had no answer anywhere in the
+    /// product, the site invented a global `--dry-run` flag that has never
+    /// existed, and users were told to hand-configure `proxy --mode advisory`
+    /// instead of running the single command that already does it for every
+    /// connected agent.
+    #[test]
+    fn help_documents_the_two_mode_commands() {
+        let help = help_text();
+        for verb in ["dry-run", "enforce"] {
+            assert!(
+                help.contains(verb),
+                "`{verb}` is a real command; a command absent from --help is a \
+                 command nobody can find. Got:\n{help}"
+            );
+        }
     }
 
     #[test]

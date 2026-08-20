@@ -1419,6 +1419,7 @@ mod openclaw_eligibility_tests {
             pids: Vec::new(),
             evidence: Vec::new(),
             guarded: false,
+            mode: None,
         }
     }
 
@@ -1499,6 +1500,7 @@ mod partial_eligibility_tests {
             pids: Vec::new(),
             evidence: Vec::new(),
             guarded: false,
+            mode: None,
         }
     }
 
