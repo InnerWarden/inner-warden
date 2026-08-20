@@ -43,12 +43,24 @@ jobs:
       github.event_name != 'workflow_run' ||
       github.event.workflow_run.conclusion == 'success'
     steps:
+      # Deliberately the DEFAULT checkout, never `workflow_run.head_sha`.
+      #
+      # A `workflow_run` job is privileged: it holds RELEASES_REPO_TOKEN and can
+      # publish to the distribution repo. Checking out a ref carried by the
+      # event and then running that commit's `packaging/` and `npm/scripts/`
+      # would execute attacker-chosen code with those credentials the moment
+      # anything could trigger the upstream workflow from an untrusted ref.
+      # CodeQL flags it `actions/untrusted-checkout/critical`, and it is right:
+      # today the only trigger is a maintainer's tag, but that is a property of
+      # another file, and nobody would notice the day it changed.
+      #
+      # Checking out the released commit bought nothing anyway. The packages
+      # wrap the PUBLISHED binaries, which are downloaded and signature-verified
+      # below; only the packaging scripts come from the checkout, and those
+      # should be the reviewed ones on the default branch. If the branch has
+      # moved to a version the rolling release does not serve, the consistency
+      # step below fails loudly rather than mispackaging.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          # On workflow_run the default checkout is the default branch, which
-          # is not necessarily the commit that was released. Package the
-          # commit the release actually cut.
-          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.ref }}
 
       - name: Install nfpm
         # Audit SUP-12: `@latest` meant the tool that BUILDS the .deb/.rpm a user

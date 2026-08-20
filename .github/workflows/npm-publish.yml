@@ -50,13 +50,6 @@ concurrency:
   group: npm-publish
   cancel-in-progress: false
 
-# The commit to publish. On workflow_run `github.sha` is the default branch
-# head, which is not necessarily the commit that was released; publishing one
-# commit while proving CI green on another is exactly the hole the gate below
-# exists to close.
-env:
-  RELEASE_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
-
 jobs:
   # Audit CI-04: publishing required no green CI and no human in the loop, so a
   # tag on a commit whose tests were failing would publish anyway, and npm
@@ -78,15 +71,21 @@ jobs:
       checks: read
       contents: read
     steps:
+      # Deliberately the DEFAULT checkout, never `workflow_run.head_sha`.
+      # This job publishes to npm with OIDC; running a commit named by the event
+      # payload would hand that identity to whatever the event pointed at.
+      # CodeQL calls it `actions/untrusted-checkout/critical` and it is right.
+      # The version consistency this would have bought is already enforced
+      # further down by npm/scripts/build.mjs, which runs `--version` on the
+      # actual binary and refuses to publish bytes that disagree with the
+      # version number being published.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ env.RELEASE_SHA }}
-      - name: Require a green CI run for ${{ env.RELEASE_SHA }}
+      - name: Require a green CI run for ${{ github.sha }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          sha="${{ env.RELEASE_SHA }}"
+          sha="${{ github.sha }}"
           runs=$(gh api "repos/${{ github.repository }}/actions/workflows/ci.yml/runs?head_sha=$sha&per_page=20" \
             --jq '[.workflow_runs[] | select(.status=="completed")] | map(.conclusion)')
           echo "CI conclusions for $sha: $runs"
@@ -118,10 +117,9 @@ jobs:
       id-token: write # required for OIDC trusted publishing + provenance
       contents: read
     steps:
+      # Same default checkout as the gate above, so the commit that was proved
+      # green is the commit that gets published.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          # Publish the commit the gate proved green, not the branch head.
-          ref: ${{ env.RELEASE_SHA }}
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
