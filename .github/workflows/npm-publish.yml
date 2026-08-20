@@ -16,8 +16,10 @@ permissions:
 #   repository:        InnerWarden/inner-warden
 #   workflow filename: npm-publish.yml
 #
-# Release flow: bump the version in npm/package.json, then either run this
-# workflow manually or push a tag matching `npm-v*`.
+# Release flow: bump the version in npm/package.json and push a `guard-v*` tag.
+# The release workflow publishes the binaries and this one chains off it, so
+# npm never lags the bytes it wraps. The manual trigger and the `npm-v*` tag
+# remain for republishing a channel on its own.
 
 on:
   workflow_dispatch:
@@ -29,6 +31,20 @@ on:
   push:
     tags:
       - "npm-v*"
+
+  # `npm install -g innerwarden` is the primary install path, and it had no
+  # trigger tied to the release: the binaries went out under a `guard-v*` tag
+  # while npm sat on whatever was last pushed by hand. It served 1.3.3 for the
+  # length of a release whose binaries were 1.3.4, so the documented install
+  # command handed users an older CLI than the one just shipped. Chain off the
+  # release so a cut moves this channel too.
+  #
+  # Safe to re-run: npm/scripts/publish.mjs treats a version already on the
+  # registry as success, so a re-cut of the same version is a no-op, not a
+  # red workflow.
+  workflow_run:
+    workflows: ["Release InnerWarden Community"]
+    types: [completed]
 
 concurrency:
   group: npm-publish
@@ -42,6 +58,10 @@ jobs:
   gate:
     name: CI must be green on this commit
     runs-on: ubuntu-latest
+    # A release that failed must not publish to npm.
+    if: >-
+      github.event_name != 'workflow_run' ||
+      github.event.workflow_run.conclusion == 'success'
     permissions:
       # `actions: read` is what the Actions API this job queries actually needs.
       # It ran with `checks: read` alone, which is a different API; the call
@@ -51,6 +71,14 @@ jobs:
       checks: read
       contents: read
     steps:
+      # Deliberately the DEFAULT checkout, never `workflow_run.head_sha`.
+      # This job publishes to npm with OIDC; running a commit named by the event
+      # payload would hand that identity to whatever the event pointed at.
+      # CodeQL calls it `actions/untrusted-checkout/critical` and it is right.
+      # The version consistency this would have bought is already enforced
+      # further down by npm/scripts/build.mjs, which runs `--version` on the
+      # actual binary and refuses to publish bytes that disagree with the
+      # version number being published.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Require a green CI run for ${{ github.sha }}
         env:
@@ -89,6 +117,8 @@ jobs:
       id-token: write # required for OIDC trusted publishing + provenance
       contents: read
     steps:
+      # Same default checkout as the gate above, so the commit that was proved
+      # green is the commit that gets published.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
