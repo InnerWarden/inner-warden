@@ -1,4 +1,6 @@
 import { describe, expect, it } from "vitest";
+// The screen's own source, for the structural guard at the bottom of this file.
+import postureSource from "./Posture.tsx?raw";
 import type {
   CapabilityStatus,
   CoverageGap,
@@ -21,6 +23,7 @@ import {
   dispositionTone,
   emptyGapsLine,
   gapAudience,
+  effectiveDisposition,
   needsOperator,
   plainMode,
   postureHeadline,
@@ -407,5 +410,62 @@ describe("the poll cadence matches the evidence it renders", () => {
     const CANARY_INTERVAL_MS = 1_200_000;
     expect(POSTURE_REFRESH_MS).toBeGreaterThan(60_000);
     expect(POSTURE_REFRESH_MS).toBeLessThanOrEqual(CANARY_INTERVAL_MS);
+  });
+});
+
+describe("the pill and the row tell one story", () => {
+  it("puts every surface through the same assurance veto", () => {
+    // Measured on a pilot box 2026-08-20: the summary pill read "Working as set
+    // up" and the control row directly below it read "Protecting", for the same
+    // control on the same render, because the pill applied the assurance veto
+    // and the row called dispositionOf directly. A page that contradicts itself
+    // is worse than a page that is wrong: the reader cannot tell which line to
+    // believe, and a security product has nothing to sell once that happens.
+    const layer = { ...FIVE_LAYERS[0], disposition: "proven" as const };
+
+    // The host says proven; the assurance chain has not pinned it.
+    expect(effectiveDisposition(layer, false)).toBe("working_as_configured");
+    // With the chain agreeing, proven survives.
+    expect(effectiveDisposition(layer, true)).toBe("proven");
+
+    // And the pill the screen builds agrees with it, for this fixture where
+    // layerAssuranceLabel reports verifiedActive=false for every control.
+    const pill = controlPill(layer, bootstrap(), generatedAt, true, evaluatedAt);
+    expect(pill.disposition).toBe(effectiveDisposition(layer, pill.verified));
+    expect(pill.mode).toBe(dispositionLabel(effectiveDisposition(layer, pill.verified)));
+  });
+
+  it("never softens anything but an unbacked proven claim", () => {
+    // The veto exists to stop over-claiming. It must not quietly downgrade a
+    // control that is asking for the reader, which would hide real work.
+    for (const disposition of ["working_as_configured", "not_enabled", "cannot_verify", "needs_operator"] as const) {
+      const layer = { ...FIVE_LAYERS[0], disposition };
+      expect(effectiveDisposition(layer, false)).toBe(disposition);
+      expect(effectiveDisposition(layer, true)).toBe(disposition);
+    }
+  });
+});
+
+describe("no surface can bypass the assurance veto", () => {
+  it("routes every read of a layer's disposition through effectiveDisposition", () => {
+    // A structural check, because the failure is structural: the pill applied
+    // the veto and the row did not, and no unit test of a pure function can see
+    // that, since the row is a component. Both surfaces read the same layer, so
+    // the invariant is "nothing but effectiveDisposition calls dispositionOf".
+    //
+    // If this fails, do not add a second veto at the new call site. Route the
+    // new caller through effectiveDisposition, or the two drift again.
+    const callSites = postureSource
+      .split("\n")
+      .map((line: string, index: number) => ({ line: line.trim(), number: index + 1 }))
+      .filter((entry: { line: string; number: number }) => /\bdispositionOf\(/.test(entry.line))
+      // Its own declaration, and the one function allowed to call it.
+      .filter((entry: { line: string; number: number }) => !/^export function dispositionOf/.test(entry.line))
+      .filter((entry: { line: string; number: number }) => !/^const reported = dispositionOf\(layer\);$/.test(entry.line))
+      // dispositionReason falls back through it to pick a default sentence,
+      // which is text only and never a colour or a claim.
+      .filter((entry: { line: string; number: number }) => !/^return fallback\[dispositionOf\(layer\)\];$/.test(entry.line));
+
+    expect(callSites).toEqual([]);
   });
 });

@@ -149,6 +149,29 @@ export function needsOperator(disposition: LayerDisposition): boolean {
   return disposition === "needs_operator";
 }
 
+/**
+ * The disposition a surface may actually show, after the assurance veto.
+ *
+ * `proven` is the only disposition that earns the positive colour, so it is the
+ * only one the assurance rule gets a veto over: a host can report a control as
+ * verified while the assurance chain has not pinned it, and rendering that as
+ * emerald is the over-claim this screen exists to prevent. The downgrade lands
+ * on `working_as_configured`, not on an alarm; only the CLAIM is softened.
+ *
+ * EVERY surface must go through this. The summary pill applied the veto and the
+ * control row did not, so on a real host the same control read "Working as set
+ * up" in the pill and "Protecting" in the row, on the same render. A page that
+ * contradicts itself is worse than a page that is wrong: the reader cannot tell
+ * which line to believe.
+ */
+export function effectiveDisposition(
+  layer: Pick<ProtectionLayer, "disposition" | "claim_state" | "effective_mode" | "desired_mode">,
+  verifiedActive: boolean,
+): LayerDisposition {
+  const reported = dispositionOf(layer);
+  return reported === "proven" && !verifiedActive ? "working_as_configured" : reported;
+}
+
 export type ControlPill = {
   name: string;
   mode: string;
@@ -224,9 +247,7 @@ export function controlPill(
   // The downgrade lands on `working_as_configured`, not on an alarm: the
   // control is still doing what it was told, and the reader still has nothing
   // to do. Only the CLAIM is softened.
-  const reported = dispositionOf(layer);
-  const disposition: LayerDisposition =
-    reported === "proven" && !assurance.verifiedActive ? "working_as_configured" : reported;
+  const disposition = effectiveDisposition(layer, assurance.verifiedActive);
   return {
     name: layer.label,
     mode: current ? dispositionLabel(disposition) : "Refreshing",
@@ -311,9 +332,12 @@ export function Posture({
   // the reader. The gap text still exists everywhere else: it stays in the
   // owning control's disclosure: so nothing is hidden; only the routing
   // changed. Suppressing the text would trade one dishonesty for another.
+  // Read off the PILLS, which have already been through the assurance veto, so
+  // the gap list, the pill and the row cannot end up telling three stories.
+  // `pills` is built from `posture.layers` in order, so the indices line up.
   const needy = new Set(
     posture.layers
-      .filter((layer) => needsOperator(dispositionOf(layer)))
+      .filter((_, index) => needsOperator(pills[index].disposition))
       .flatMap((layer) => layer.capability_ids),
   );
   const operatorGaps = dedupeGaps(
@@ -445,7 +469,8 @@ function ControlRow({
   const relevantCapabilities = layer.capability_ids
     .map((id) => bootstrap.capabilities.find((capability) => capability.id === id))
     .filter((capability): capability is CapabilityStatus => capability !== undefined);
-  const disposition = dispositionOf(layer);
+  // Through the SAME veto the pill uses, or the two disagree on one render.
+  const disposition = effectiveDisposition(layer, assurance.verifiedActive);
   // A gap whose owning control is NOT asking for the reader still belongs in
   // this disclosure: it is honest boundary text, just not an action card.
   const verificationGaps = layer.known_gaps.filter(
