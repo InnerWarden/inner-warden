@@ -54,6 +54,24 @@ pub fn cmd(rest: &[String]) -> ExitCode {
         return ExitCode::from(1);
     };
 
+    // Prove we can replace the binary BEFORE downloading it.
+    //
+    // The check used to happen implicitly, at the rename, after the download
+    // and both signature checks had already run. Someone whose CLI came from
+    // `npm install -g` therefore waited through the whole verified download to
+    // be told "could not replace the binary: Permission denied", with no
+    // indication that the fix is npm rather than sudo. Fail in the first second
+    // instead, and say which command to run.
+    if let Err(e) = can_replace(&target) {
+        eprintln!("innerwarden upgrade: cannot replace the installed binary ({e}).");
+        eprintln!("  Nothing was downloaded. The installed binary is untouched.");
+        eprintln!();
+        for line in upgrade_plan::cannot_replace_advice(&target, running_as_root()) {
+            eprintln!("{line}");
+        }
+        return ExitCode::from(1);
+    }
+
     println!("InnerWarden Community {current}: fetching {asset}...");
     let (bin_url, sha_url, sig_url) = upgrade_plan::urls_for(&asset);
 
@@ -86,8 +104,38 @@ pub fn cmd(rest: &[String]) -> ExitCode {
             }
             ExitCode::SUCCESS
         }
-        Err(e) => fail(&format!("verified, but could not replace the binary: {e}")),
+        Err(e) => {
+            eprintln!("innerwarden upgrade: verified, but could not replace the binary: {e}");
+            eprintln!();
+            for line in upgrade_plan::cannot_replace_advice(&target, running_as_root()) {
+                eprintln!("{line}");
+            }
+            ExitCode::from(1)
+        }
     }
+}
+
+/// Can the binary actually be replaced, right now, by this user?
+///
+/// Writing and removing the real staging file is the honest test: it exercises
+/// the same directory, the same filename, and the same permissions the upgrade
+/// will use. Inspecting the mode bits instead would guess, and would guess
+/// wrong under a read-only mount, an immutable flag, or a full disk.
+fn can_replace(target: &Path) -> std::io::Result<()> {
+    let staged = upgrade_plan::staging_path(target);
+    std::fs::write(&staged, b"")?;
+    std::fs::remove_file(&staged)
+}
+
+#[cfg(unix)]
+fn running_as_root() -> bool {
+    // getuid takes no arguments, touches no memory, and cannot fail.
+    unsafe { libc::getuid() == 0 }
+}
+
+#[cfg(not(unix))]
+fn running_as_root() -> bool {
+    false
 }
 
 /// Is something answering on the dashboard's default address right now?
