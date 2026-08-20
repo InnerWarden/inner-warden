@@ -196,7 +196,7 @@ describe("the verdict hero leads with what the user asked", () => {
     // written to catch is still caught: nothing in this fixture is broken, so
     // nothing may be reported as needing attention, and no control may go
     // missing from the count.
-    expect(postureHeadline(pills)).toBe("5 of 5 host controls working: nothing needs you");
+    expect(postureHeadline(pills)).toBe("5 host controls: 5 working. Nothing needs you.");
   });
 
   it("leads with what needs the reader, not with what is fine", () => {
@@ -502,5 +502,57 @@ describe("the sentence never outranks the badge", () => {
     expect(dispositionReason(layer, "not_enabled")).toBe(layer.disposition_reason);
     // And the default caller, with no shown state, still gets it.
     expect(dispositionReason(layer)).toBe(layer.disposition_reason);
+  });
+});
+
+describe("the headline names every state it counts", () => {
+  it("never sweeps an unconfirmed control into a count of working ones", () => {
+    // The headline read "N protecting, the rest working", and "the rest"
+    // quietly swallowed a control in cannot_verify. On a real host that put a
+    // control the page had just described as unreadable, in its own words "we
+    // will not claim either way", inside a count of things that work.
+    const layers = FIVE_LAYERS.map((layer, index) => ({
+      ...layer,
+      disposition: index === 0 ? ("cannot_verify" as const) : ("working_as_configured" as const),
+    }));
+    const pills = posture(layers).layers.map((entry) =>
+      controlPill(entry, bootstrap(), generatedAt, true, evaluatedAt),
+    );
+
+    const headline = postureHeadline(pills);
+    expect(headline).toContain("1 we can't confirm");
+    expect(headline).toContain("4 working");
+    expect(headline).not.toMatch(/the rest/);
+    // 4 + 1, never 5 working.
+    expect(headline).not.toContain("5 working");
+  });
+
+  it("counts each disposition once and only once", () => {
+    const layers = [
+      { ...FIVE_LAYERS[0], disposition: "proven" as const },
+      { ...FIVE_LAYERS[1], disposition: "working_as_configured" as const },
+      { ...FIVE_LAYERS[2], disposition: "not_enabled" as const },
+      { ...FIVE_LAYERS[3], disposition: "cannot_verify" as const },
+    ];
+    const pills = posture(layers).layers.map((entry) =>
+      controlPill(entry, bootstrap(), generatedAt, true, evaluatedAt),
+    );
+
+    // This fixture carries no claims records, so the assurance rule vetoes the
+    // proven one down to working: 2 working, not 1 protecting + 1 working.
+    expect(postureHeadline(pills)).toBe(
+      "4 host controls: 2 working, 1 not turned on, 1 we can't confirm. Nothing needs you.",
+    );
+  });
+
+  it("still leads with what needs the reader, above every other count", () => {
+    const layers = FIVE_LAYERS.map((layer, index) => ({
+      ...layer,
+      disposition: index === 0 ? ("needs_operator" as const) : ("cannot_verify" as const),
+    }));
+    const pills = posture(layers).layers.map((entry) =>
+      controlPill(entry, bootstrap(), generatedAt, true, evaluatedAt),
+    );
+    expect(postureHeadline(pills)).toBe("1 of 5 host controls needs your attention");
   });
 });

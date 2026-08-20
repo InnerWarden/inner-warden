@@ -302,15 +302,27 @@ export function postureHeadline(pills: ControlPill[]): string {
   if (protecting === total) {
     return `All ${total} host control${s} protecting`;
   }
-  // Proven is scarce and worth naming when it exists. Dropping it would trade
-  // one undercount for another: the old headline hid working controls, and a
-  // headline that only says "working" hides the proven ones.
-  const tail = notOn > 0 ? `, ${notOn} not turned on` : "";
-  if (protecting > 0) {
-    return `${protecting} of ${total} host control${s} protecting, the rest working${tail}: nothing needs you`;
+
+  // Every state is named, and "the rest" is never used to sweep one up.
+  //
+  // The headline read "N protecting, the rest working", and "the rest" quietly
+  // included controls in `cannot_verify`. On a real host that put a control the
+  // page had just described as unreadable, in its own words "we will not claim
+  // either way", inside a count of things that are working. Summarising is not
+  // a licence to claim what the detail refuses to claim, and this page exists
+  // to keep proven, working and unknown apart.
+  const cannotConfirm = pills.filter((pill) => pill.disposition === "cannot_verify").length;
+  const working = pills.filter((pill) => pill.disposition === "working_as_configured").length;
+
+  const parts: string[] = [];
+  if (protecting > 0) parts.push(`${protecting} protecting`);
+  if (working > 0) parts.push(`${working} working`);
+  if (notOn > 0) parts.push(`${notOn} not turned on`);
+  if (cannotConfirm > 0) {
+    parts.push(`${cannotConfirm} we can't confirm`);
   }
-  const on = total - notOn;
-  return `${on} of ${total} host control${s} working${tail}: nothing needs you`;
+
+  return `${total} host control${s}: ${parts.join(", ")}. Nothing needs you.`;
 }
 
 /** The quiet line shown when no gap card needs to render. */
