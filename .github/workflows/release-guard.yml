@@ -53,11 +53,39 @@ jobs:
         run: |
           set -euo pipefail
           sha="${{ github.sha }}"
-          runs=$(gh api "repos/${{ github.repository }}/actions/workflows/ci.yml/runs?head_sha=$sha&per_page=20" \
-            --jq '[.workflow_runs[] | select(.status=="completed")] | map(.conclusion)')
+          api="repos/${{ github.repository }}/actions/workflows/ci.yml/runs?head_sha=$sha&per_page=20"
+
+          # WAIT for a CI run in flight instead of calling it a failure.
+          #
+          # The natural way to cut a release is merge, then tag. CI on the merge
+          # commit is then still running when the tag fires this workflow, no run
+          # has reached "completed", and the gate below saw an empty list and
+          # failed the release. Nothing was wrong with the commit: the answer
+          # simply did not exist yet.
+          #
+          # That cost a real release tonight (guard-v1.3.5, first attempt) and
+          # the only remedy was a manual re-run, which is exactly the kind of
+          # step that gets forgotten. "Not established yet" and "established as
+          # bad" are different, and only the second should stop a release.
+          #
+          # Bounded: 30 minutes, then give up loudly. An unbounded wait would
+          # turn a stuck CI into a stuck release with no message.
+          for _ in $(seq 1 60); do
+            pending=$(gh api "$api" --jq '[.workflow_runs[] | select(.status != "completed")] | length')
+            done_count=$(gh api "$api" --jq '[.workflow_runs[] | select(.status == "completed")] | length')
+            if [ "$pending" -eq 0 ] && [ "$done_count" -gt 0 ]; then break; fi
+            if [ "$pending" -eq 0 ] && [ "$done_count" -eq 0 ]; then
+              echo "no CI run for $sha yet; waiting for one to appear..."
+            else
+              echo "$pending CI run(s) still in flight for $sha; waiting..."
+            fi
+            sleep 30
+          done
+
+          runs=$(gh api "$api" --jq '[.workflow_runs[] | select(.status=="completed")] | map(.conclusion)')
           echo "CI conclusions for $sha: $runs"
           if [ "$runs" = "[]" ]; then
-            echo "::error::no completed CI run for $sha. Signing an untested commit is how a broken binary gets a signature."
+            echo "::error::no completed CI run for $sha after waiting 30 minutes. Signing an untested commit is how a broken binary gets a signature."
             exit 1
           fi
           if ! printf '%s' "$runs" | python3 -c 'import json,sys; c=json.load(sys.stdin); sys.exit(0 if c and all(x=="success" for x in c) else 1)'; then
