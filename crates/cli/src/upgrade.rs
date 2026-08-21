@@ -37,7 +37,31 @@ pub fn cmd(rest: &[String]) -> ExitCode {
         println!("  Downloads the release asset and verifies its SHA-256 and Ed25519 signature");
         println!("  against the key compiled into this binary before replacing anything.");
         println!("  Hooks and config are left untouched.");
+        println!();
+        println!("  --check   report whether a build exists and exit, changing nothing");
         return ExitCode::SUCCESS;
+    }
+
+    // A mutating command must not silently ignore what it was asked to do.
+    //
+    // Only `--help` was recognised; every other flag fell through and the
+    // binary was replaced anyway. `innerwarden upgrade --check` is the obvious
+    // thing to type, it is exactly the flag the PAID CLI supports
+    // (`innerwarden-ctl upgrade --check` reports and exits), and here it
+    // performed the upgrade. Found on a live host 2026-08-21 while trying to
+    // check whether an upgrade was available: it upgraded.
+    //
+    // Unknown flags are now refused rather than ignored, because the failure
+    // mode of guessing wrong on THIS command is replacing the running binary.
+    let check_only = rest.iter().any(|a| a == "--check");
+    if let Some(bad) = rest
+        .iter()
+        .find(|a| a.starts_with('-') && *a != "--check" && *a != "--yes" && *a != "-y")
+    {
+        eprintln!("innerwarden upgrade: unknown option {bad}.");
+        eprintln!("  Nothing was downloaded. The installed binary is untouched.");
+        eprintln!("  Try: innerwarden upgrade [--check]");
+        return ExitCode::from(2);
     }
 
     let current = env!("CARGO_PKG_VERSION");
@@ -70,6 +94,25 @@ pub fn cmd(rest: &[String]) -> ExitCode {
             eprintln!("{line}");
         }
         return ExitCode::from(1);
+    }
+
+    if check_only {
+        // Report, change nothing. The version comparison needs the published
+        // sidecar, so fetch only the small `.sha256` and never the binary.
+        let (_, sha_url, _) = upgrade_plan::urls_for(&asset);
+        match fetch_bytes(&sha_url) {
+            Ok(_) => {
+                println!("InnerWarden Community {current}");
+                println!("  A published build exists for this host ({asset}).");
+                println!("  Run `innerwarden upgrade` to install it.");
+            }
+            Err(e) => {
+                eprintln!("innerwarden upgrade --check: could not reach the release ({e}).");
+                eprintln!("  Nothing was downloaded. The installed binary is untouched.");
+                return ExitCode::from(1);
+            }
+        }
+        return ExitCode::SUCCESS;
     }
 
     println!("InnerWarden Community {current}: fetching {asset}...");
@@ -303,6 +346,60 @@ mod tests {
             "the staging file must be removed when the rename fails"
         );
     }
+    /// An unknown flag must stop the upgrade, not be ignored.
+    ///
+    /// Only `--help` was recognised; everything else fell through and the
+    /// running binary was replaced anyway. Found on a live host 2026-08-21:
+    /// `innerwarden upgrade --check` performed the upgrade. That flag is the
+    /// obvious thing to type and it is exactly what the paid CLI supports, so
+    /// the guess is not exotic.
+    ///
+    /// Structural, NOT a call to `cmd`. My first version of this test invoked
+    /// `cmd(&["--dry-run"])` for real, which is safe only while the refusal is
+    /// present: remove it and the same test walks into the network and replaces
+    /// the test binary. A test whose safety depends on the bug being absent is
+    /// not a test of the bug.
+    #[test]
+    fn an_unknown_flag_refuses_instead_of_upgrading() {
+        let src = include_str!("upgrade.rs");
+        let body = src.split("mod tests").next().unwrap_or(src);
+
+        let refusal_at = body
+            .find("unknown option")
+            .expect("upgrade must refuse an option it does not understand");
+        let fetch_at = body
+            .find("fetching {asset}")
+            .expect("the download announcement must exist");
+        assert!(
+            refusal_at < fetch_at,
+            "the refusal has to come before anything is downloaded or replaced"
+        );
+        assert!(
+            body.contains("return ExitCode::from(2)"),
+            "an unusable invocation must exit non-zero, not proceed"
+        );
+    }
+
+    /// `--check` must never reach the code that replaces the binary.
+    ///
+    /// Structural, because exercising the real path needs the network. The
+    /// invariant is that the check-only branch returns BEFORE the fetch of the
+    /// binary itself.
+    #[test]
+    fn check_only_returns_before_the_binary_is_fetched() {
+        let src = include_str!("upgrade.rs");
+        let body = src.split("mod tests").next().unwrap_or(src);
+        let check_at = body
+            .find("if check_only {")
+            .expect("the check-only branch must exist");
+        let fetch_at = body
+            .find("fetching {asset}")
+            .expect("the download announcement must exist");
+        assert!(
+            check_at < fetch_at,
+            "the --check branch has to return before anything is downloaded or replaced"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -337,4 +434,5 @@ mod closing_advice_tests {
             "say WHY, or it reads as a superstition about restarting things"
         );
     }
+
 }
