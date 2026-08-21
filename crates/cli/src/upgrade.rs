@@ -434,5 +434,4 @@ mod closing_advice_tests {
             "say WHY, or it reads as a superstition about restarting things"
         );
     }
-
 }
