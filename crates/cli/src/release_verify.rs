@@ -98,6 +98,28 @@ pub fn verify_release(
     sha256_sidecar: &str,
     sig_sidecar: &str,
 ) -> Result<(), VerifyError> {
+    verify_release_against(bytes, sha256_sidecar, sig_sidecar, RELEASE_PUBLIC_KEY_B64)
+}
+
+/// The verification body, with the trusted key as a parameter.
+///
+/// Split out so tests exercise THIS function rather than a copy of it. The unit
+/// tests here previously carried a local `verify_with` that re-implemented every
+/// step, because the production entry point hard-codes the pinned key and a test
+/// cannot produce a signature under a key it does not hold. The consequence was
+/// that the body compiled into every shipped binary never ran under its own
+/// tests: the copy could stay correct while the original rotted, and nothing
+/// would say so.
+///
+/// `verify_release` remains the only caller that chooses the key, and a test
+/// below asserts it passes the pinned constant, so the seam cannot become a way
+/// to verify against an attacker's key in production.
+pub fn verify_release_against(
+    bytes: &[u8],
+    sha256_sidecar: &str,
+    sig_sidecar: &str,
+    pubkey_b64: &str,
+) -> Result<(), VerifyError> {
     let expected = parse_digest_sidecar(sha256_sidecar).ok_or(VerifyError::MalformedDigest)?;
     let actual: [u8; 32] = Sha256::digest(bytes).into();
     // Compare the digest BEFORE touching the signature: it is the cheaper check
@@ -107,7 +129,7 @@ pub fn verify_release(
     }
 
     let key_raw = base64::engine::general_purpose::STANDARD
-        .decode(RELEASE_PUBLIC_KEY_B64.trim())
+        .decode(pubkey_b64.trim())
         .map_err(|_| VerifyError::BadPinnedKey)?;
     let key_bytes: [u8; 32] = key_raw.try_into().map_err(|_| VerifyError::BadPinnedKey)?;
     let key = VerifyingKey::from_bytes(&key_bytes).map_err(|_| VerifyError::BadPinnedKey)?;
@@ -149,28 +171,18 @@ mod tests {
 
     /// Verify against an explicitly supplied key, mirroring `verify_release`
     /// with the pin swapped, so the tests do not depend on the production key.
+    /// Drive the PRODUCTION verifier with a test key.
+    ///
+    /// This used to be a local re-implementation of every step in
+    /// `verify_release`, which meant the body shipped in every binary never ran
+    /// under its own tests. It is now a one-line call into that body.
     fn verify_with(
         pubkey_b64: &str,
         bytes: &[u8],
         sha: &str,
         sig: &str,
     ) -> Result<(), VerifyError> {
-        let expected = parse_digest_sidecar(sha).ok_or(VerifyError::MalformedDigest)?;
-        let actual: [u8; 32] = Sha256::digest(bytes).into();
-        if actual != expected {
-            return Err(VerifyError::DigestMismatch);
-        }
-        let raw = base64::engine::general_purpose::STANDARD
-            .decode(pubkey_b64)
-            .map_err(|_| VerifyError::BadPinnedKey)?;
-        let kb: [u8; 32] = raw.try_into().map_err(|_| VerifyError::BadPinnedKey)?;
-        let key = VerifyingKey::from_bytes(&kb).map_err(|_| VerifyError::BadPinnedKey)?;
-        let sr = base64::engine::general_purpose::STANDARD
-            .decode(sig.trim())
-            .map_err(|_| VerifyError::MalformedSignature)?;
-        let sb: [u8; 64] = sr.try_into().map_err(|_| VerifyError::MalformedSignature)?;
-        key.verify_strict(&actual, &Signature::from_bytes(&sb))
-            .map_err(|_| VerifyError::BadSignature)
+        verify_release_against(bytes, sha, sig, pubkey_b64)
     }
 
     #[test]
@@ -269,6 +281,42 @@ mod tests {
         assert!(
             VerifyingKey::from_bytes(&bytes).is_ok(),
             "pinned key must be a valid Ed25519 public key"
+        );
+    }
+
+    /// The seam must not become a way to verify against somebody else's key.
+    ///
+    /// `verify_release_against` exists so tests can drive the production body,
+    /// and the price of that seam is that a future caller could pass any key.
+    /// There is exactly one production caller and it passes the pinned constant;
+    /// this asserts that, by signing with a DIFFERENT key and requiring the
+    /// public entry point to refuse what the parameterised one accepts.
+    ///
+    /// FAILS ON REVERT: make `verify_release` take the key from anywhere else.
+    #[test]
+    fn the_public_entry_point_uses_the_pinned_key_and_only_that() {
+        let attacker = SigningKey::from_bytes(&[42u8; 32]);
+        let attacker_pub =
+            base64::engine::general_purpose::STANDARD.encode(attacker.verifying_key().to_bytes());
+
+        let bytes = b"a release built by somebody else";
+        let digest: [u8; 32] = Sha256::digest(bytes).into();
+        let sha = format!("{}  innerwarden-linux-x86_64", hex(&digest));
+        let sig =
+            base64::engine::general_purpose::STANDARD.encode(attacker.sign(&digest).to_bytes());
+
+        // Against the attacker's own key it verifies, so the artefact is
+        // internally consistent and the only thing standing between it and an
+        // install is which key production trusts.
+        assert!(
+            verify_release_against(bytes, &sha, &sig, &attacker_pub).is_ok(),
+            "precondition: the forgery is well formed"
+        );
+
+        assert_eq!(
+            verify_release(bytes, &sha, &sig),
+            Err(VerifyError::BadSignature),
+            "the shipped entry point must trust the pinned key and nothing else"
         );
     }
 }
