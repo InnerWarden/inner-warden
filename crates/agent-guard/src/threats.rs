@@ -5510,7 +5510,7 @@ mod quote_tracking_tests {
 
     /// The apostrophe inside double quotes. Without the `!double` guard it
     /// would open a single-quoted run that never closes, and every star after
-    /// it would read as quoted — so a real glob would stop being seen.
+    /// it would read as quoted, so a real glob would stop being seen.
     #[test]
     fn an_apostrophe_inside_double_quotes_does_not_open_a_quote() {
         assert!(contains_unquoted_glob("echo \"don't\" /home/*/id_rsa"));
@@ -5549,7 +5549,7 @@ mod quote_tracking_tests {
     /// (`[A-Za-z_][A-Za-z0-9_]*`) happily accepts a credential-shaped word.
     /// Leaving that line in the output turns an ordinary here-document into a
     /// credential-read finding because of the word someone chose to end it
-    /// with — a false positive earned by punctuation.
+    /// with, a false positive earned by punctuation.
     #[test]
     fn the_delimiter_line_is_not_command_text() {
         let key = "id_rsa";
