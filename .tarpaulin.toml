@@ -57,3 +57,21 @@ exclude-files = [
 
 # Tests should not count themselves.
 ignore-tests = true
+
+# Not yet wired into CI, and this is why rather than an omission.
+#
+# On the GitHub runner the run dies immediately after `innerwarden-agent-guard`
+# reports "416 passed; 0 failed", with tarpaulin's `Error: "Test failed during
+# run"` and no failing test named. It passes locally on the same commit and the
+# same config. That crate's tests fork and exec `chmod` and `ls`
+# (`file_update.rs`), which is the same class of interaction the paid repo
+# already documents for its watchdog: "tarpaulin instrumentation segfaults on
+# its fork/exec/pidfd process supervision".
+#
+# The measurement, the floor and the distribution are useful now, and
+# `cargo tarpaulin` works from a developer machine. Wiring a job that is red for
+# a reason unrelated to coverage would teach people to ignore it, and lowering
+# the floor to make it pass would be worse.
+#
+# Next step: reproduce on a Linux host, and either isolate those tests or
+# exclude that binary with the reason written down, the way the paid repo does.
