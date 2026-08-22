@@ -291,6 +291,7 @@ jobs:
           ls -lh dist/
 
       - name: Regenerate the Scoop manifest (fresh version + hashes)
+        id: version
         shell: bash
         run: |
           set -euo pipefail
@@ -318,6 +319,10 @@ jobs:
           json.dump(m, open("dist/innerwarden.json", "w"), indent=2)
           PY
           echo "generated dist/innerwarden.json (version $ver)"
+          # Exported for the immutable versioned release below. Taken from the
+          # BINARY, not from the tag or the workspace manifest, so the release
+          # named guard-vX.Y.Z always contains a binary that reports X.Y.Z.
+          echo "guard_version=$ver" >> "$GITHUB_OUTPUT"
 
       - name: Sign binaries with Ed25519 and stamp the pinned key
         env:
@@ -374,6 +379,67 @@ jobs:
           [ -s dist/innerwarden.json ]        || { echo "MISSING: innerwarden.json (scoop)"; missing=1; }
           [ "$missing" -eq 0 ] || { echo "asset manifest verification failed."; exit 1; }
           echo "All 6 binaries + sha256 + Ed25519 sigs + public key + installers + scoop manifest present."
+
+      # ── Immutable versioned release (DD audit S3) ────────────────────────
+      #
+      # Everything used to publish into the single rolling `iw-guard` tag, whose
+      # binaries are replaced on every cut. The release body has advertised
+      # `IW_GUARD_TAG=guard-vX.Y.Z` for months and the live installer really does
+      # honour it (`RELEASE_TAG="${IW_GUARD_TAG:-iw-guard}"`), but no such tag was
+      # ever created: `gh release view guard-v1.3.7` returned "release not found".
+      # So a documented capability did nothing, reproducible installs were
+      # impossible, and undoing a bad cut meant re-running the whole pipeline from
+      # an older commit because the previous binaries no longer existed anywhere.
+      #
+      # This publishes the SAME signed bytes a second time under an immutable
+      # per-version tag. The rolling tag keeps working exactly as before.
+      - name: Refuse to overwrite a published version
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
+          VER: ${{ steps.version.outputs.guard_version }}
+        run: |
+          set -euo pipefail
+          [ -n "$VER" ] || { echo "::error::no version was exported"; exit 1; }
+          tag="guard-v${VER}"
+          if gh release view "$tag" --repo InnerWarden/innerwarden-releases \
+               --json assets -q '.assets | length' 2>/dev/null | grep -qE '^[1-9]'; then
+            echo "::error::$tag already exists with assets."
+            echo "::error::A published version is immutable: it is the artefact a"
+            echo "::error::customer pinned to and the one a rollback restores."
+            echo "::error::Bump the version instead of republishing this one."
+            exit 1
+          fi
+          echo "$tag is free to publish"
+
+      - name: Publish immutable guard-vX.Y.Z release
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        with:
+          repository: InnerWarden/innerwarden-releases
+          token: ${{ secrets.RELEASES_REPO_TOKEN }}
+          tag_name: guard-v${{ steps.version.outputs.guard_version }}
+          name: InnerWarden Community ${{ steps.version.outputs.guard_version }}
+          body: |
+            InnerWarden Community ${{ steps.version.outputs.guard_version }}.
+
+            An immutable cut. The rolling `iw-guard` release always carries the
+            newest build; this tag carries THIS one, permanently, so an install
+            can be reproduced and a bad cut can be rolled back to it.
+
+            ```sh
+            IW_GUARD_TAG=guard-v${{ steps.version.outputs.guard_version }} \
+              curl -fsSL https://innerwarden.com/free | sh
+            ```
+
+            Same signed bytes as the rolling release for this version: every
+            binary ships SHA-256 and Ed25519 sidecars and the installer verifies
+            both.
+          prerelease: false
+          # `latest` in this repo belongs to the paid product's own tags; a
+          # Community cut must not take it.
+          make_latest: false
+          files: dist/*
+          fail_on_unmatched_files: true
 
       - name: Publish rolling iw-guard release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
