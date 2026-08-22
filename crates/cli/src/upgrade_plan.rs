@@ -40,10 +40,22 @@ pub fn asset_for_this_host() -> Option<String> {
 /// The sidecars are not optional: [`super::release_verify::verify_release`]
 /// needs both, and a missing one is a failure rather than a skipped check.
 pub fn urls_for(asset: &str) -> (String, String, String) {
+    urls_from(RELEASE_BASE, asset)
+}
+
+/// The three URLs for an asset under an arbitrary base.
+///
+/// Split from `urls_for` so a test can point the whole download-and-verify path
+/// at a local server. Before this, every test of that path either hit the real
+/// internet or asserted the order of substrings in the source, and the latter is
+/// what shipped `upgrade --check` performing a real upgrade.
+///
+/// Production has exactly one caller and it passes `RELEASE_BASE`.
+pub fn urls_from(base: &str, asset: &str) -> (String, String, String) {
     (
-        format!("{RELEASE_BASE}/{asset}"),
-        format!("{RELEASE_BASE}/{asset}.sha256"),
-        format!("{RELEASE_BASE}/{asset}.sig"),
+        format!("{base}/{asset}"),
+        format!("{base}/{asset}.sha256"),
+        format!("{base}/{asset}.sig"),
     )
 }
 
