@@ -29,7 +29,7 @@ trust; npm, deb, rpm, Scoop, ubi/eget/mise all fetch or embed them.
 
 - **`InnerWarden/inner-warden`** (this repo): Community source. Builds, signs, and releases the free binary. All Community work goes here.
 - **`InnerWarden/innerwarden-active-defence`**: the paid host stack (sensor, agent, exec-gate, eBPF).
-- **`InnerWarden/innerwarden-releases`**: distribution. Holds the rolling `iw-guard` release plus the installers, Scoop manifest, and `innerwarden-release.pub`.
+- **`InnerWarden/innerwarden-releases`**: distribution. Holds the rolling `iw-guard` release, an immutable `guard-vX.Y.Z` release per cut, plus the installers, Scoop manifest, and `innerwarden-release.pub`.
 - **`InnerWarden/innerwarden`** (the old monorepo): **retired for Community** as of 2026-07-24. Its `release-guard.yml` is now a stub that fails on purpose, and its `RELEASE_SIGNING_KEY` is the old, rotated-out key. Do not build or release Community there.
 
 ---
@@ -190,12 +190,42 @@ When a new Community version ships:
 1. **Binaries**: run **this repo's** `release-guard.yml` (`workflow_dispatch` or
    a `guard-v*` tag). It builds all six targets, signs them with
    `RELEASE_SIGNING_KEY`, stamps the pinned public key into the installer, and
-   updates the rolling `iw-guard` release on `InnerWarden/innerwarden-releases`.
-2. **npm**: run `npm-publish.yml` (or push `npm-v<version>`). Verify:
+   publishes the same signed bytes twice on `InnerWarden/innerwarden-releases`:
+   once to the immutable `guard-vX.Y.Z` tag, once to the rolling `iw-guard` tag.
+   The version comes from the built binary, not from the tag. Republishing an
+   existing `guard-vX.Y.Z` is refused: bump the version instead.
+### Pinning and rollback
+
+The rolling `iw-guard` tag always carries the newest build, so its binaries are
+replaced on every cut. The per-version tag is what makes an install
+reproducible and a rollback possible:
+
+```sh
+# install an exact cut
+IW_GUARD_TAG=guard-v1.3.7 curl -fsSL https://innerwarden.com/free | sh
+
+# roll a host back to the last known-good one
+IW_GUARD_TAG=guard-v1.3.6 curl -fsSL https://innerwarden.com/free | sh
+```
+
+Rolling back the DEFAULT install (what `https://innerwarden.com/free` serves
+with no variable set) means re-running `release-guard.yml` from the older
+commit, which republishes the rolling tag from those bytes. That is a pipeline
+run, not an asset copy, because the rolling tag must keep matching a real cut.
+
+2. **npm**: nothing to run. `npm-publish.yml` chains off a successful
+   `release-guard.yml` through `workflow_run`, and pushing `npm-v<version>` is
+   the manual fallback for when it did not. Verify:
    `npx innerwarden@<version> --version`.
-3. **.deb / .rpm**: run `linux-packages.yml`, download the artifact, and
-   `gh release upload iw-guard ... *.deb *.rpm *.sha256`. Delete the previous
-   version's package assets so the release holds one version.
+3. **.deb / .rpm**: nothing to run, and nothing to upload.
+   `linux-packages.yml` chains off the same completion and uploads the packages
+   to the rolling release itself.
+
+   Previous versions' package assets are deliberately NOT deleted. The runbook
+   used to say to delete them; the site links versioned `.deb`/`.rpm`
+   filenames, so removing an old asset 404s a documented download. The rolling
+   release therefore accumulates packages, which is the intended state rather
+   than an oversight.
 4. **Site doc**: update the versioned `.deb`/`.rpm` filenames in
    `inner-warden-site` `client/src/content/docs/installation.md`.
 5. **Verify**: spot-check one binary signature, run the live installer once, and

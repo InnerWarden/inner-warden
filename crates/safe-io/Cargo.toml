@@ -1,0 +1,17 @@
+[package]
+name = "innerwarden-safe-io"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "Symlink-safe file opening for InnerWarden Community. One implementation of a security-critical pattern that was previously hand-copied into three crates."
+
+# No dependencies beyond libc on unix, on purpose. This crate exists so a
+# security primitive has ONE implementation; giving it a dependency surface would
+# hand it the supply-chain risk of everything that links it, which is every crate
+# in this workspace that touches a file.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

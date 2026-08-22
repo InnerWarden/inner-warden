@@ -1,0 +1,23 @@
+# Pin the toolchain so a new `stable` cannot redden every branch at once.
+#
+# CI resolves `stable` fresh on each run and local machines do not, so the two
+# drift silently. The paid sibling repo measured exactly this on 2026-08-20: its
+# runners moved to 1.98.0 while local was still on 1.97.0, and two lints that
+# ship in 1.98 turned nine untouched files red. The local gate could not see it
+# coming, because 1.97 cannot report lints it does not have. That repo pinned;
+# this one, which builds the binaries the public installs, did not.
+#
+# Pinning does not mean never upgrading. It means the upgrade is a commit,
+# reviewed with the lint fixes it requires, instead of an event that happens to
+# whoever pushes next.
+#
+# Same version as the paid repo on purpose: one author, one workstation, and a
+# shared crate boundary between the two. Two pins that drift from each other
+# would reintroduce the problem across the seam instead of within a repo.
+#
+# `rustfmt` and `clippy` are named because the CI gate runs both. This list is
+# ADDITIVE to the default profile, so a component outside that profile has to be
+# named or it simply is not installed.
+[toolchain]
+channel = "1.98.0"
+components = ["rustfmt", "clippy"]

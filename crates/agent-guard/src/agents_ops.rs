@@ -14,7 +14,7 @@ use serde_json::Value;
 
 use crate::agents::{
     canonical, connect_targets, summarize_discovered, AgentStatus, ConfigFormat, DiscoveryEvidence,
-    KnownDiscovery, ProfileConfig, KNOWN,
+    GuardMode, KnownDiscovery, ProfileConfig, KNOWN,
 };
 use crate::signatures::SignatureIndex;
 use crate::{detect, hook, mcp_wire, mcp_wire_toml};
@@ -675,7 +675,15 @@ fn rows_from_sources(
             mcp_json: (schema == CompatibleMcpSchema::ProxyWrappable).then_some(rel),
             mcp_toml: None,
             guarded,
+            mode: None,
         });
+    }
+    // Read back what the wiring actually DOES, per agent, so the listing can
+    // say "monitor" or "enforce" instead of only "guarded".
+    for r in &mut rows {
+        if r.guarded {
+            r.mode = read_guard_mode(home, &r.name);
+        }
     }
     rows.sort_by(|a, b| a.name.cmp(&b.name));
     (rows, generic.limited || profile_limited)
@@ -808,6 +816,19 @@ fn connect_one_result_with_link_policy(
                 } else {
                     ""
                 };
+                // NOT keyed on `r.guarded`.
+                //
+                // A first attempt reported "already guarded" whenever a hook was
+                // present, which broke hook REPAIR: a hook pointing at an old
+                // binary path is present, is rewritten to the current path, and
+                // that is a change. `reconciler_repairs_hooks_without_promoting_a_wrong_matcher_mode`
+                // caught it, expecting connected=1 and getting 0.
+                //
+                // `Ok(true)` here already means bytes were written. The genuine
+                // no-op has its own arm above (`Ok(false)` -> Skipped, "existing
+                // hook wiring left unchanged"), so the distinction the user needs
+                // is carried by the LISTING showing the mode, not by weakening
+                // this signal.
                 ConnectResult::new(
                     ConnectEffect::Connected,
                     format!("  {} - connected (PreToolUse hook{mode})", r.name),
@@ -1045,18 +1066,63 @@ fn disconnect_one(home: &Path, r: &AgentStatus) -> String {
     format!("  {}, nothing to disconnect", r.name)
 }
 
+/// What to say when the scan matched nothing.
+///
+/// Absence of a SIGNATURE is not absence of an agent, and saying the second when
+/// you mean the first sends a beginner away believing they have nothing to
+/// guard. Detection matches known agents by their command line, so a bespoke
+/// script, a wrapper or a renamed binary matches nothing while running
+/// perfectly. That reader is exactly the one who needs a next step, and exactly
+/// the one the old single line ended the conversation on. Seen on a production
+/// host running a hand-written Python agent this command called "no compatible
+/// AI agents found".
+fn nothing_detected_lines() -> Vec<String> {
+    vec![
+        "innerwarden agents, none of the agents I know by name are running.".into(),
+        String::new(),
+        "  I detect agents by matching known command lines, so a bespoke".into(),
+        "  script, a wrapper or a renamed binary will not show up here even".into(),
+        "  while it is running.".into(),
+        String::new(),
+        "  If you have an agent running:".into(),
+        "    innerwarden hook <your-agent>   wire the in-path guard".into(),
+        "    innerwarden agents --all        show every process I considered".into(),
+    ]
+}
+
 fn list_lines(home: &Path) -> Vec<String> {
     let mut out = Vec::new();
     let rows = rows(home);
     if rows.is_empty() {
-        out.push("innerwarden agents, no compatible AI agents found.".into());
+        out.extend(nothing_detected_lines());
     } else {
-        out.push("innerwarden agents, found (connect wires all guardable ones):".into());
+        // Say what is LEFT to do, not what the command can do in general.
+        //
+        // The header and the footer were both unconditional, so connecting an
+        // agent changed nothing on screen: the same "connect wires all guardable
+        // ones" line above, the same "connect one / all" invitation below, and
+        // the row itself already reading "guarded" before and after. Someone who
+        // had just wired three of four agents was still being told to wire them,
+        // with no way to tell from the output that anything had happened.
+        let pending = rows.iter().filter(|r| r.guardable() && !r.guarded).count();
+        let guarded = rows.iter().filter(|r| r.guarded).count();
+        out.push(match pending {
+            0 if guarded > 0 => format!(
+                "innerwarden agents, all {guarded} guardable agent(s) are wired. Nothing to connect."
+            ),
+            0 => "innerwarden agents, found (none of these can be wired automatically):".into(),
+            n => format!("innerwarden agents, found ({n} not wired yet):"),
+        });
         for r in &rows {
             let guard = if !r.guardable() {
                 "detected (guard manually)".to_string()
             } else if r.guarded {
-                format!("✓ guarded ({})", mechanism(r))
+                // Name the MODE, not just the mechanism. "guarded (hook)" was the
+                // same string whether the hook records or blocks.
+                match r.mode {
+                    Some(m) => format!("✓ guarded ({}, {})", mechanism(r), m.label()),
+                    None => format!("✓ guarded ({}, mode unreadable)", mechanism(r)),
+                }
             } else {
                 format!("not guarded, connect via {}", mechanism(r))
             };
@@ -1077,7 +1143,13 @@ fn list_lines(home: &Path) -> Vec<String> {
             };
             out.push(format!("  {:<13} {:<34} {where_}", r.name, guard));
         }
-        out.push("\n  connect one:  innerwarden agents connect <name>     all:  innerwarden agents connect --all".into());
+        // Only offer the action when there is something to act on.
+        if pending > 0 {
+            out.push(
+                "\n  connect one:  innerwarden agents connect <name>     all:  innerwarden agents connect --all"
+                    .into(),
+            );
+        }
     }
     out
 }
@@ -1209,8 +1281,79 @@ pub fn run(home: &Path, args: &[String]) -> Vec<String> {
     run_with_guard_bin(home, args, &bin)
 }
 
+/// What the wiring for this agent actually does: record, or block.
+///
+/// `is_guarded` answers "is it wired". That was the only thing the listing had,
+/// so an agent connected with `--monitor` and one connected to block printed the
+/// same "✓ guarded" row. Someone who chose monitor deliberately could not
+/// confirm it, and someone who believed they were protected could not discover
+/// they were only recording.
+///
+/// `None` means wired but unreadable, which is reported as unknown rather than
+/// guessed at in either direction.
+fn read_guard_mode(home: &Path, agent: &str) -> Option<GuardMode> {
+    let k = canonical(agent)?;
+    if k.hookable {
+        return read_json(&home.join(".claude/settings.json"))
+            .and_then(|v| hook::effective_iwguard_hook_mode(&v))
+            .map(|m| match m {
+                hook::EffectiveHookMode::Monitor => GuardMode::Monitor,
+                hook::EffectiveHookMode::Enforce => GuardMode::Enforce,
+                hook::EffectiveHookMode::Mixed => GuardMode::Mixed,
+            });
+    }
+    // MCP wiring carries the mode as the proxy's `--mode` argument.
+    let rel = k.mcp_json.or(k.mcp_toml)?;
+    let text = std::fs::read_to_string(home.join(rel)).ok()?;
+    // `advisory` and `warn` pass everything through; `guard` and `kill` block.
+    let recording = text.contains("\"advisory\"") || text.contains("\"warn\"");
+    let blocking = text.contains("\"guard\"") || text.contains("\"kill\"");
+    match (recording, blocking) {
+        (true, false) => Some(GuardMode::Monitor),
+        (false, true) => Some(GuardMode::Enforce),
+        (true, true) => Some(GuardMode::Mixed),
+        // Wrapped by the proxy with no explicit `--mode`, so the proxy's own
+        // default applies. That default is `guard`, i.e. it BLOCKS. Reporting
+        // this as unknown would be the dangerous direction to be vague in: the
+        // whole point of showing the mode is so nobody believes they are only
+        // recording while the guard is refusing things.
+        (false, false) => Some(GuardMode::Enforce),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// Absence of a SIGNATURE is not absence of an agent.
+    ///
+    /// Detection matches known agents by command line, so a bespoke script, a
+    /// wrapper or a renamed binary matches nothing while running perfectly.
+    /// Saying "no compatible AI agents found" to that reader tells them they
+    /// have nothing to guard, which is the opposite of true and the end of the
+    /// conversation. Seen on a production host running a hand-written Python
+    /// agent.
+    #[test]
+    fn an_empty_scan_explains_itself_and_says_what_to_do() {
+        let text = nothing_detected_lines().join("\n");
+
+        assert!(
+            !text.contains("no compatible AI agents found"),
+            "the old wording reported absence of an agent when it had only \
+             established absence of a signature: {text}"
+        );
+        assert!(
+            text.contains("know by name"),
+            "it must say detection is by name, not by presence: {text}"
+        );
+        assert!(
+            text.contains("bespoke") || text.contains("wrapper") || text.contains("renamed"),
+            "it must name the case where detection cannot work: {text}"
+        );
+        assert!(
+            text.contains("innerwarden hook"),
+            "it must give the reader their next command: {text}"
+        );
+    }
+
     use super::*;
 
     #[test]

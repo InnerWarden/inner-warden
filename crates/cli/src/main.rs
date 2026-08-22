@@ -37,6 +37,7 @@ mod serve_owner;
 mod session_store;
 mod setup;
 mod setup_io;
+mod status;
 mod suppress;
 mod suppress_io;
 mod upgrade;
@@ -47,6 +48,55 @@ mod upsell_io;
 const DEFAULT_BIND: &str = "127.0.0.1:8787";
 pub(crate) const COMMUNITY_NAME: &str = "InnerWarden Community";
 pub(crate) const COMMUNITY_EDITION_NAME: &str = "InnerWarden Community Edition";
+
+/// Gather what we can establish about this install, then say it plainly.
+///
+/// Anything that cannot be read stays `None`, which the report renders as
+/// `[unknown]` rather than `[off]`. That distinction is the whole point of the
+/// command: reporting "off" when you mean "could not tell" sends the reader to
+/// fix the wrong thing.
+fn status_io_cmd() -> std::process::ExitCode {
+    let home = std::env::var("HOME").ok().map(std::path::PathBuf::from);
+    let rows = home
+        .as_deref()
+        .map(innerwarden_agent_guard::agents_ops::rows)
+        .unwrap_or_default();
+
+    let wired_agents: Vec<String> = rows
+        .iter()
+        .filter(|r| r.guarded)
+        .map(|r| r.name.clone())
+        .collect();
+
+    // Seen at all, wired or not. `None` when we could not look, which the
+    // report renders as unknown rather than as "no agent".
+    let any_agent_seen = home.as_ref().map(|_| !rows.is_empty());
+
+    let decisions_recorded = graph_io::sink_dir()
+        .map(|d| d.join("guard-events.jsonl"))
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|text| text.lines().filter(|l| !l.trim().is_empty()).count() as u64);
+
+    // Absent everything is "not set up", not "unreadable". A fresh box is not a
+    // broken one, and three diagnoses send a beginner hunting a fault that does
+    // not exist.
+    let never_configured =
+        wired_agents.is_empty() && decisions_recorded.unwrap_or(0) == 0 && rows.is_empty();
+
+    let facts = status::Facts {
+        never_configured,
+        // Mode is not persisted anywhere this command can read today, so it is
+        // reported as unknown rather than assumed. Assuming would be the exact
+        // mistake this command exists to stop.
+        mode: None,
+        wired_agents,
+        any_agent_seen,
+        decisions_recorded,
+        dashboard_reachable: None,
+    };
+    print!("{}", status::render(&facts));
+    std::process::ExitCode::SUCCESS
+}
 
 fn main() -> std::process::ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -76,6 +126,7 @@ fn main() -> std::process::ExitCode {
             code
         }
         Some("install") => cmd_install(&args[1..]),
+        Some("status") => status_io_cmd(),
         Some("agents") => agents_io::cmd(&args[1..]),
         Some("contain") => contain_io::cmd(&args[1..]),
         Some("enforce") => cmd_mode(&args[1..], false),
@@ -742,6 +793,32 @@ fn cmd_uninstall(rest: &[String]) -> std::process::ExitCode {
     // the agent hook, the config directory, and the binary. `uninstall
     // claude-code` (a named agent) removes only that agent's hook.
     if uninstall_targets_whole_install(rest) {
+        // Refuse what we do not understand, BEFORE removing anything. An
+        // unrecognised flag on a destructive command must never be silently
+        // dropped: it reads as a modifier and behaves as consent.
+        if let Some(bad) = rest
+            .iter()
+            .find(|a| !UNINSTALL_SELF_FLAGS.contains(&a.as_str()))
+        {
+            eprintln!("innerwarden uninstall: unknown option `{bad}`");
+            eprintln!("  Accepted here: {}", UNINSTALL_SELF_FLAGS.join(", "));
+            eprintln!("  Nothing was changed.");
+            return std::process::ExitCode::from(2);
+        }
+        if rest.iter().any(|a| a == "--dry-run") {
+            match hook::home_dir() {
+                Ok(home) => {
+                    for line in uninstall_plan_lines(&home) {
+                        println!("{line}");
+                    }
+                    return std::process::ExitCode::SUCCESS;
+                }
+                Err(e) => {
+                    eprintln!("innerwarden uninstall: {e}");
+                    return std::process::ExitCode::from(2);
+                }
+            }
+        }
         return cmd_uninstall_self(rest.iter().any(|a| a == "--purge"));
     }
     let (agent, settings) = match parse_install_args(rest) {
@@ -812,6 +889,56 @@ fn cmd_uninstall(rest: &[String]) -> std::process::ExitCode {
 /// targets only that agent's hook. `--help` is handled before this is called.
 fn uninstall_targets_whole_install(rest: &[String]) -> bool {
     !rest.iter().any(|a| !a.starts_with('-'))
+}
+
+/// Flags `uninstall` accepts when it is removing the WHOLE install.
+///
+/// Anything else is refused rather than ignored. This is not tidiness: the
+/// dispatch above treats every `-`-prefixed argument as "not a named agent", so
+/// an unrecognised flag used to fall straight through into a full uninstall
+/// while appearing to modify it.
+///
+/// `innerwarden uninstall --dry-run` is the case that mattered. The published
+/// CLI reference documents it as "Print the exact plan and exit (no root
+/// needed)", which reads as the safe way to find out what would be removed. It
+/// was discarded, and running it removed the guard hook from a live machine.
+/// A typo like `--purge-all` or `--preveiw` did the same thing.
+const UNINSTALL_SELF_FLAGS: &[&str] = &["--purge", "--all", "--dry-run", "--help", "-h"];
+
+/// What a full uninstall WOULD remove, without removing any of it.
+fn uninstall_plan_lines(home: &std::path::Path) -> Vec<String> {
+    let mut out = vec![format!("{COMMUNITY_NAME} would remove:")];
+    // Read the same file the removal would edit, so the plan cannot claim a
+    // hook that is not there or miss one that is.
+    let hooked = std::fs::read_to_string(home.join(".claude/settings.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .map(|v| hook::has_iwguard_wiring(&v))
+        .unwrap_or(false);
+    out.push(format!(
+        "  hook    : {}",
+        if hooked {
+            "the PreToolUse hook in ~/.claude/settings.json"
+        } else {
+            "none wired"
+        }
+    ));
+    let config_dir = home.join(".config/innerwarden");
+    out.push(format!(
+        "  config  : {}",
+        if config_dir.exists() {
+            config_dir.display().to_string()
+        } else {
+            "none".to_string()
+        }
+    ));
+    out.push(match std::env::current_exe() {
+        Ok(exe) => format!("  binary  : {}", exe.display()),
+        Err(_) => "  binary  : could not resolve this executable's path".to_string(),
+    });
+    out.push(String::new());
+    out.push("Nothing was changed. Re-run without --dry-run to do it.".into());
+    out
 }
 
 /// Full self-uninstall: remove the guard hook from the wired agent, delete the
@@ -1107,6 +1234,8 @@ fn help_text() -> String {
          \n\
          USAGE:\n  \
            {p} setup                     first-run wizard: pick what to enable (arrow keys)\n  \
+             {p} dry-run                   put EVERY connected agent in monitor: records, never blocks\n  \
+             {p} enforce                   the opposite: a denied command is actually refused\n  \
            {p} check \"<command>\" [--json]  analyze a command, print the verdict\n  \
            echo \"<command>\" | {p} check\n  \
            {p} serve [--bind IP:PORT]   serve POST /api/agent/check-command (plain HTTP, loopback)\n  \
@@ -1185,6 +1314,60 @@ mod tests {
             help.contains("remove InnerWarden entirely"),
             "help must document the full uninstall"
         );
+    }
+
+    /// A command that exists and is not in `--help` may as well not exist.
+    ///
+    /// `dry-run` and `enforce` have been dispatched for a long time and were
+    /// never listed. So the one question a new user asks first, "how do I run
+    /// this without it blocking anything yet", had no answer anywhere in the
+    /// product, the site invented a global `--dry-run` flag that has never
+    /// existed, and users were told to hand-configure `proxy --mode advisory`
+    /// instead of running the single command that already does it for every
+    /// connected agent.
+    #[test]
+    fn help_documents_the_two_mode_commands() {
+        let help = help_text();
+        for verb in ["dry-run", "enforce"] {
+            assert!(
+                help.contains(verb),
+                "`{verb}` is a real command; a command absent from --help is a \
+                 command nobody can find. Got:\n{help}"
+            );
+        }
+    }
+
+    /// `uninstall --dry-run` must PREVIEW, and an unknown flag must REFUSE.
+    ///
+    /// The dispatch treats every `-`-prefixed argument as "not a named agent",
+    /// so an unrecognised flag fell through into a FULL uninstall while looking
+    /// like it modified one. The published CLI reference documents `--dry-run`
+    /// as "Print the exact plan and exit (no root needed)", which reads as the
+    /// safe way to find out what would be removed.
+    ///
+    /// It was discarded. Running the documented preview removed the guard hook
+    /// from a live machine, verified by it disappearing from
+    /// `~/.claude/settings.json`. A typo did the same.
+    ///
+    /// Silently ignoring an unrecognised flag on a destructive command is the
+    /// root cause: it reads as a modifier and behaves as consent.
+    #[test]
+    fn uninstall_refuses_flags_it_does_not_understand() {
+        for flag in ["--preveiw", "--plan", "--yes", "--force"] {
+            assert!(
+                !UNINSTALL_SELF_FLAGS.contains(&flag),
+                "{flag} must not be silently accepted"
+            );
+        }
+        for flag in ["--dry-run", "--purge", "--all"] {
+            assert!(
+                UNINSTALL_SELF_FLAGS.contains(&flag),
+                "{flag} is a real option and must stay accepted"
+            );
+        }
+        // Still a whole-install target: the refusal happens after this, which is
+        // why the refusal has to exist at all.
+        assert!(uninstall_targets_whole_install(&["--preveiw".to_string()]));
     }
 
     #[test]

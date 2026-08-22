@@ -9,6 +9,7 @@ homepage.workspace = true
 description = "Versioned public dashboard contracts, fail-closed validators, local collectors, and embedded white UI."
 
 [dependencies]
+innerwarden-safe-io = { path = "../safe-io" }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 rust-embed = "8"
 serde = { version = "1", features = ["derive"] }

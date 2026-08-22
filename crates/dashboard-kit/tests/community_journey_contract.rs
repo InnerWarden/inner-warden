@@ -175,6 +175,30 @@ fn all_twelve_journeys_have_exact_executable_evidence_locators() {
             source.contains(executable_marker),
             "{journey_id} evidence must contain an executable test marker"
         );
+        // DD audit D19. Containing `test(` was, on its own, accepted as
+        // "executable evidence" that a journey passes. It is evidence that a
+        // file parses as a test, and nothing more: for as long as this contract
+        // has existed, `grep playwright .github/workflows/` came back empty, so
+        // an entirely broken journey satisfied it.
+        //
+        // A browser spec is now only evidence if something RUNS it. The Rust
+        // suite cannot run Chromium, so it asserts the chain instead: the spec
+        // lives under a directory the CI job executes, and that job fails on a
+        // failing journey.
+        if locator.ends_with(".spec.ts") {
+            const CI: &str = include_str!("../../../.github/workflows/ci.yml");
+            assert!(
+                CI.contains("playwright test tests/community"),
+                "{journey_id} is a browser spec, and CI does not run the browser \
+                 specs. Presence of a test file is not evidence that the journey \
+                 passes; that was the state this contract shipped in."
+            );
+            assert!(
+                locator.contains("tests/community"),
+                "{journey_id} evidence sits at {locator}, outside the directory \
+                 CI executes, so nothing would run it"
+            );
+        }
         if locator.ends_with(".spec.ts") {
             assert!(
                 source.contains(journey_id),
@@ -277,4 +301,34 @@ fn active_claim_records_pin_the_full_matrix_and_layers_carry_claims() {
         .filter_map(Value::as_str)
         .collect::<BTreeSet<_>>();
     assert!(layer_required.contains("evidence"));
+}
+
+/// The changelog must describe the version this workspace builds.
+///
+/// It stopped at 1.3.3 while the workspace shipped 1.3.7: four releases with no
+/// entry, including one that fixed `uninstall --dry-run` uninstalling. A
+/// changelog four versions behind is worse than none, because a user reading it
+/// concludes nothing changed.
+///
+/// Checked here rather than in a script because a script nobody runs is the same
+/// as the drift it was meant to catch.
+///
+/// FAILS ON REVERT: bump the workspace version without adding an entry.
+#[test]
+fn the_changelog_covers_the_version_being_shipped() {
+    const MANIFEST: &str = include_str!("../../../Cargo.toml");
+    const CHANGELOG: &str = include_str!("../../../CHANGELOG.md");
+
+    let version = MANIFEST
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("version = \""))
+        .and_then(|v| v.split('"').next())
+        .expect("the workspace declares a version");
+
+    assert!(
+        CHANGELOG.contains(&format!("## {version} ")),
+        "the workspace builds {version} and CHANGELOG.md has no entry for it. A \
+         changelog behind the code is worse than none: a reader concludes \
+         nothing changed."
+    );
 }

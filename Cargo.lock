@@ -754,7 +754,7 @@ dependencies = [
 
 [[package]]
 name = "innerwarden"
-version = "1.3.3"
+version = "1.3.7"
 dependencies = [
  "base64",
  "dialoguer",
@@ -765,6 +765,7 @@ dependencies = [
  "innerwarden-dashboard-kit",
  "innerwarden-graph",
  "innerwarden-notify",
+ "innerwarden-safe-io",
  "libc",
  "serde",
  "serde_json",
@@ -778,7 +779,7 @@ dependencies = [
 
 [[package]]
 name = "innerwarden-agent-guard"
-version = "1.3.3"
+version = "1.3.7"
 dependencies = [
  "anyhow",
  "base64",
@@ -786,6 +787,7 @@ dependencies = [
  "fancy-regex 0.18.0",
  "fs4",
  "include_dir",
+ "innerwarden-safe-io",
  "libc",
  "regex",
  "serde",
@@ -804,9 +806,10 @@ dependencies = [
 
 [[package]]
 name = "innerwarden-dashboard-kit"
-version = "1.3.3"
+version = "1.3.7"
 dependencies = [
  "chrono",
+ "innerwarden-safe-io",
  "jsonschema",
  "libc",
  "rust-embed",
@@ -819,7 +822,7 @@ dependencies = [
 
 [[package]]
 name = "innerwarden-graph"
-version = "1.3.3"
+version = "1.3.7"
 dependencies = [
  "serde",
  "serde_json",
@@ -827,11 +830,18 @@ dependencies = [
 
 [[package]]
 name = "innerwarden-notify"
-version = "1.3.3"
+version = "1.3.7"
 dependencies = [
  "serde",
  "serde_json",
  "toml",
+]
+
+[[package]]
+name = "innerwarden-safe-io"
+version = "1.3.7"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

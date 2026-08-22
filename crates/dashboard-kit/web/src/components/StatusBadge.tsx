@@ -43,6 +43,34 @@ const PRESENTATIONS: Record<string, Omit<StatusPresentation, "label"> & { label?
   expired: { tone: "neutral", symbol: "–" },
   rejected: { tone: "critical", symbol: "×" },
   not_observed: { tone: "neutral", symbol: "–", label: "Not observed" },
+
+  // ── Dispositions ──────────────────────────────────────────────────────────
+  //
+  // Only `proven` gets the positive tone. `working_as_configured` is
+  // informational, not emerald: "no action needed" and "we proved this
+  // protects you" are different claims, and collapsing them is the over-claim
+  // the posture model exists to prevent.
+  //
+  // `not_enabled` and `cannot_verify` are NEUTRAL on purpose. Both used to
+  // arrive here as `not_covered`, which is `attention`: so a correct fresh
+  // install, which arms nothing by design, rendered the whole page amber and
+  // taught the operator that amber means nothing.
+  proven: { tone: "positive", symbol: "✓", label: "Protecting" },
+  working_as_configured: { tone: "informational", symbol: "i", label: "Working as set up" },
+  not_enabled: { tone: "neutral", symbol: "–", label: "Not turned on" },
+  cannot_verify: { tone: "neutral", symbol: "?", label: "Can't confirm" },
+  needs_operator: { tone: "attention", symbol: "!", label: "Needs you" },
+
+  // The 5-stage convergence strip rendered every stage in the fallback grey
+  // because these keys were missing, so a converged control looked identical
+  // to an unmeasured one.
+  disabled: { tone: "neutral", symbol: "–", label: "Off" },
+  learning: { tone: "informational", symbol: "i", label: "Learning" },
+  mixed: { tone: "attention", symbol: "!", label: "Partly on" },
+  enforce: { tone: "informational", symbol: "i", label: "Enforcing (declared)" },
+  yes: { tone: "positive", symbol: "✓", label: "Yes" },
+  no: { tone: "neutral", symbol: "–", label: "No" },
+  not_applicable: { tone: "neutral", symbol: "–", label: "Not applicable" },
 };
 
 function humanize(value: string): string {

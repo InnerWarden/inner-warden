@@ -4,6 +4,7 @@ import type {
   DashboardBootstrap,
   DashboardPosture,
   EvidenceFreshness,
+  LayerDisposition,
   ProtectionLayer,
   RuntimeConvergence,
   ScopeRef,
@@ -95,14 +96,141 @@ export function gapAudience(gap: Pick<CoverageGap, "id" | "state">): "operator" 
   return "operator";
 }
 
+/**
+ * The layer's disposition, or the best reading of an older agent's payload.
+ *
+ * The host computes this now, because only the host can tell a healthy unarmed
+ * control from a broken one. A host on an older build sends no `disposition`,
+ * so the fallback reconstructs it from what that build DID send: and it must
+ * reconstruct it conservatively, never inventing `proven`.
+ */
+export function dispositionOf(
+  layer: Pick<ProtectionLayer, "disposition" | "claim_state" | "effective_mode" | "desired_mode">,
+): LayerDisposition {
+  if (layer.disposition) return layer.disposition;
+
+  // Fallback for a host that predates the field.
+  if (layer.claim_state === "active") return "proven";
+  if (layer.effective_mode === "unknown") return "cannot_verify";
+  // "Doing what it was told" is the case the old model could not express, so
+  // it has to be derived here rather than read.
+  if (layer.effective_mode === layer.desired_mode) return "working_as_configured";
+  if (layer.claim_state === "not_covered") return "not_enabled";
+  return "needs_operator";
+}
+
+/**
+ * What the reader should do, in their words.
+ *
+ * The host ships `disposition_reason`; this is the floor under a payload that
+ * has the disposition but no sentence, so no state can ever render bare. A
+ * state with no explanation is what made people stop reading this page.
+ */
+export function dispositionReason(
+  layer: Pick<
+    ProtectionLayer,
+    "disposition" | "disposition_reason" | "claim_state" | "effective_mode" | "desired_mode" | "label"
+  >,
+  // The disposition actually being SHOWN, after the assurance veto. When it
+  // differs from what the host reported, the host's sentence belongs to the
+  // stronger state and must not be printed under the softer badge: on a real
+  // host that produced a row badged "Working as set up" above the words "is
+  // enforcing, and that was verified on this host". The badge is the claim;
+  // the sentence has to agree with it, not outrank it.
+  shown?: LayerDisposition,
+): string {
+  const effective = shown ?? dispositionOf(layer);
+  if (layer.disposition_reason && effective === dispositionOf(layer)) {
+    return layer.disposition_reason;
+  }
+  const fallback: Record<LayerDisposition, string> = {
+    proven: `${layer.label} is enforcing, and that was verified on this host.`,
+    working_as_configured: `${layer.label} is doing what it is set to do.`,
+    not_enabled: `${layer.label} has not been turned on yet. Nothing is wrong.`,
+    cannot_verify: `${layer.label} could not be read on this host. This is ours to fix, not yours.`,
+    needs_operator: `${layer.label} is not yet doing what it was set to do.`,
+  };
+  return fallback[effective];
+}
+
+/** Only one disposition asks the reader for anything. Amber has to stay scarce
+ *  to keep meaning anything. */
+export function needsOperator(disposition: LayerDisposition): boolean {
+  return disposition === "needs_operator";
+}
+
+/**
+ * The disposition a surface may actually show, after the assurance veto.
+ *
+ * `proven` is the only disposition that earns the positive colour, so it is the
+ * only one the assurance rule gets a veto over: a host can report a control as
+ * verified while the assurance chain has not pinned it, and rendering that as
+ * emerald is the over-claim this screen exists to prevent. The downgrade lands
+ * on `working_as_configured`, not on an alarm; only the CLAIM is softened.
+ *
+ * EVERY surface must go through this. The summary pill applied the veto and the
+ * control row did not, so on a real host the same control read "Working as set
+ * up" in the pill and "Protecting" in the row, on the same render. A page that
+ * contradicts itself is worse than a page that is wrong: the reader cannot tell
+ * which line to believe.
+ */
+export function effectiveDisposition(
+  layer: Pick<ProtectionLayer, "disposition" | "claim_state" | "effective_mode" | "desired_mode">,
+  verifiedActive: boolean,
+): LayerDisposition {
+  const reported = dispositionOf(layer);
+  return reported === "proven" && !verifiedActive ? "working_as_configured" : reported;
+}
+
 export type ControlPill = {
   name: string;
   mode: string;
   scope: string;
   freshness: string;
-  tone: "positive" | "attention" | "neutral";
+  tone: "positive" | "attention" | "neutral" | "informational";
   verified: boolean;
+  /** Which of the five states this control is in. Drives colour and routing. */
+  disposition: LayerDisposition;
+  /** One sentence saying what to do, or why there is nothing to do. */
+  reason: string;
 };
+
+/** The colour a disposition earns.
+ *
+ * `positive` is reserved for `proven`. `working_as_configured` reads
+ * informational, not emerald, because "nothing to do" and "we proved this
+ * protects you" are different claims and the page's whole job is keeping them
+ * apart. `not_enabled` and `cannot_verify` are neutral: neither is a fault, and
+ * both used to render amber. */
+export function dispositionTone(disposition: LayerDisposition): ControlPill["tone"] {
+  switch (disposition) {
+    case "proven":
+      return "positive";
+    case "working_as_configured":
+      return "informational";
+    case "needs_operator":
+      return "attention";
+    default:
+      return "neutral";
+  }
+}
+
+/** The words on the pill. Plain enough for someone who has never run a
+ *  security product, because that is who installs this. */
+export function dispositionLabel(disposition: LayerDisposition): string {
+  switch (disposition) {
+    case "proven":
+      return "Protecting";
+    case "working_as_configured":
+      return "Working as set up";
+    case "not_enabled":
+      return "Not turned on";
+    case "cannot_verify":
+      return "Can't confirm";
+    case "needs_operator":
+      return "Needs you";
+  }
+}
 
 export function controlPill(
   layer: ProtectionLayer,
@@ -121,24 +249,80 @@ export function controlPill(
     bootstrap.platform.os,
     current,
   );
-  const operatorGaps = layer.known_gaps.filter((gap) => gapAudience(gap) === "operator");
+  // `proven` is the only disposition that earns the positive colour, so it is
+  // the only one the assurance rule gets a veto over. A host can report a
+  // control as verified while the assurance chain has not pinned it; showing
+  // that as emerald is precisely the over-claim this screen exists to prevent.
+  //
+  // The downgrade lands on `working_as_configured`, not on an alarm: the
+  // control is still doing what it was told, and the reader still has nothing
+  // to do. Only the CLAIM is softened.
+  const disposition = effectiveDisposition(layer, assurance.verifiedActive);
   return {
     name: layer.label,
-    mode: current ? plainMode(layer) : "Refreshing",
+    mode: current ? dispositionLabel(disposition) : "Refreshing",
     scope: scopeDisplay(layer.effective_scope),
     freshness: current ? checkedAt(layer.freshness) : "refreshing",
-    tone: assurance.verifiedActive ? "positive" : operatorGaps.length > 0 ? "attention" : "neutral",
+    // Colour follows the disposition, not "is it verified, else does it have a
+    // gap". Under the old rule every control that was not verified-active and
+    // carried any gap went amber: which is every control on a healthy,
+    // deliberately-unarmed, freshly installed host.
+    tone: dispositionTone(disposition),
     verified: assurance.verifiedActive,
+    disposition,
+    reason: dispositionReason(layer, disposition),
   };
 }
 
-/** The one-line verdict the screen leads with. */
+/** The one-line verdict the screen leads with.
+ *
+ * It counted "enforcing" and "not confirmed" and nothing else, so a host where
+ * every control was healthy but deliberately watching led with `0 of 5`. That
+ * number is true and reads as total failure. Lead with whether anything needs
+ * the reader, because that is the question they came with. */
 export function postureHeadline(pills: ControlPill[]): string {
-  const enforcing = pills.filter((pill) => pill.mode === "Enforcing").length;
-  const notConfirmed = pills.filter((pill) => pill.mode === "Not confirmed").length;
   const total = pills.length;
-  const head = `${enforcing} of ${total} host control${total === 1 ? "" : "s"} enforcing`;
-  return notConfirmed > 0 ? `${head}, ${notConfirmed} not confirmed` : head;
+  if (total === 0) return "No host controls reported";
+
+  const needing = pills.filter((pill) => needsOperator(pill.disposition)).length;
+  const protecting = pills.filter((pill) => pill.disposition === "proven").length;
+  const notOn = pills.filter((pill) => pill.disposition === "not_enabled").length;
+
+  const s = total === 1 ? "" : "s";
+
+  // Anything needing the reader wins the headline: it is the only thing they
+  // can act on, and burying it under a count of what is fine is how a page
+  // stops being read.
+  if (needing > 0) {
+    return `${needing} of ${total} host control${s} need${needing === 1 ? "s" : ""} your attention`;
+  }
+  if (notOn === total) {
+    return `Nothing is turned on yet: ${total} control${s} ready to enable`;
+  }
+  if (protecting === total) {
+    return `All ${total} host control${s} protecting`;
+  }
+
+  // Every state is named, and "the rest" is never used to sweep one up.
+  //
+  // The headline read "N protecting, the rest working", and "the rest" quietly
+  // included controls in `cannot_verify`. On a real host that put a control the
+  // page had just described as unreadable, in its own words "we will not claim
+  // either way", inside a count of things that are working. Summarising is not
+  // a licence to claim what the detail refuses to claim, and this page exists
+  // to keep proven, working and unknown apart.
+  const cannotConfirm = pills.filter((pill) => pill.disposition === "cannot_verify").length;
+  const working = pills.filter((pill) => pill.disposition === "working_as_configured").length;
+
+  const parts: string[] = [];
+  if (protecting > 0) parts.push(`${protecting} protecting`);
+  if (working > 0) parts.push(`${working} working`);
+  if (notOn > 0) parts.push(`${notOn} not turned on`);
+  if (cannotConfirm > 0) {
+    parts.push(`${cannotConfirm} we can't confirm`);
+  }
+
+  return `${total} host control${s}: ${parts.join(", ")}. Nothing needs you.`;
 }
 
 /** The quiet line shown when no gap card needs to render. */
@@ -166,7 +350,21 @@ export function Posture({
   onCheckNow?: () => void | Promise<void>;
 }) {
   const pills = posture.layers.map((layer) => controlPill(layer, bootstrap, posture.generated_at, current, evaluatedAt));
-  const operatorGaps = dedupeGaps(posture.gaps.filter((gap) => gapAudience(gap) === "operator"));
+  // A gap is an amber card only when the control that OWNS it is asking for
+  // the reader. The gap text still exists everywhere else: it stays in the
+  // owning control's disclosure: so nothing is hidden; only the routing
+  // changed. Suppressing the text would trade one dishonesty for another.
+  // Read off the PILLS, which have already been through the assurance veto, so
+  // the gap list, the pill and the row cannot end up telling three stories.
+  // `pills` is built from `posture.layers` in order, so the indices line up.
+  const needy = new Set(
+    posture.layers
+      .filter((_, index) => needsOperator(pills[index].disposition))
+      .flatMap((layer) => layer.capability_ids),
+  );
+  const operatorGaps = dedupeGaps(
+    posture.gaps.filter((gap) => gapAudience(gap) === "operator" && needy.has(gap.capability_id)),
+  );
 
   return (
     <div className="space-y-8">
@@ -202,12 +400,15 @@ export function Posture({
               {pills.map((pill) => (
                 <li
                   key={pill.name}
+                  title={pill.reason}
                   className={`inline-flex max-w-full items-center gap-2 rounded-full border px-3 py-1.5 text-xs font-semibold ${
                     pill.tone === "positive"
                       ? "border-emerald-200 bg-emerald-50 text-emerald-900"
                       : pill.tone === "attention"
                         ? "border-amber-200 bg-amber-50 text-amber-900"
-                        : "border-slate-200 bg-white text-slate-700"
+                        : pill.tone === "informational"
+                          ? "border-cyan-200 bg-cyan-50 text-cyan-900"
+                          : "border-slate-200 bg-white text-slate-700"
                   }`}
                 >
                   <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-current opacity-70" aria-hidden="true" />
@@ -290,20 +491,34 @@ function ControlRow({
   const relevantCapabilities = layer.capability_ids
     .map((id) => bootstrap.capabilities.find((capability) => capability.id === id))
     .filter((capability): capability is CapabilityStatus => capability !== undefined);
-  const verificationGaps = layer.known_gaps.filter((gap) => gapAudience(gap) === "verification");
+  // Through the SAME veto the pill uses, or the two disagree on one render.
+  const disposition = effectiveDisposition(layer, assurance.verifiedActive);
+  // A gap whose owning control is NOT asking for the reader still belongs in
+  // this disclosure: it is honest boundary text, just not an action card.
+  const verificationGaps = layer.known_gaps.filter(
+    (gap) => gapAudience(gap) === "verification" || !needsOperator(disposition),
+  );
 
   return (
     <article className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm sm:p-5">
       <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
         <h3 className="min-w-0 flex-1 truncate text-base font-semibold text-slate-950">{layer.label}</h3>
         <StatusBadge
-          status={current ? layer.effective_mode : "stale"}
-          label={current ? plainMode(layer) : "Refreshing"}
+          status={current ? disposition : "stale"}
+          label={current ? dispositionLabel(disposition) : "Refreshing"}
           className="shrink-0"
         />
         <span className="[overflow-wrap:anywhere] text-sm text-slate-600">{scopeDisplay(layer.effective_scope)}</span>
         <span className="shrink-0 text-xs font-medium text-slate-500">{current ? checkedAt(layer.freshness) : "refreshing"}</span>
       </div>
+
+      {/* The sentence, on the row, not one click away.
+          Someone installing this for the first time should not have to open a
+          disclosure called "How this was verified" to learn that a grey control
+          is grey because they have not turned it on yet. */}
+      {current ? (
+        <p className="mt-2 text-sm leading-6 text-slate-600">{dispositionReason(layer, disposition)}</p>
+      ) : null}
 
       <details className="mt-3 border-t border-slate-100 pt-3">
         <summary className="cursor-pointer text-xs font-semibold text-slate-500 hover:text-slate-700">How this was verified</summary>

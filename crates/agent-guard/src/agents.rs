@@ -263,6 +263,38 @@ pub struct AgentStatus {
     pub mcp_toml: Option<String>,
     /// The guardrail is already wired for it.
     pub guarded: bool,
+    /// Whether that wiring RECORDS or BLOCKS, when it can be read back.
+    ///
+    /// `guarded` alone was all the listing had, so an agent wired with
+    /// `--monitor` and an agent wired to block rendered identically as
+    /// "✓ guarded". Someone who deliberately chose monitor, to watch before
+    /// enforcing, had no way to confirm it from any command, and someone who
+    /// thought they were protected had no way to discover they were only
+    /// recording. That is the worst direction for this to be wrong in.
+    ///
+    /// `None` when the wiring exists but the mode cannot be read back.
+    pub mode: Option<GuardMode>,
+}
+
+/// What wired guarding actually DOES on this agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuardMode {
+    /// Records every screened call, never blocks one.
+    Monitor,
+    /// Refuses what the guard denies.
+    Enforce,
+    /// Wiring disagrees with itself: some entries record, others block.
+    Mixed,
+}
+
+impl GuardMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            GuardMode::Monitor => "monitor",
+            GuardMode::Enforce => "enforce",
+            GuardMode::Mixed => "MIXED",
+        }
+    }
 }
 
 impl AgentStatus {
@@ -337,6 +369,7 @@ pub fn summarize_discovered(
                 mcp_json: known.mcp_json.map(String::from),
                 mcp_toml: known.mcp_toml.map(String::from),
                 guarded,
+                mode: None,
             };
             for item in evidence {
                 row.add_evidence(*item);
@@ -372,6 +405,7 @@ pub fn summarize_discovered(
                     mcp_json: None,
                     mcp_toml: None,
                     guarded: false,
+                    mode: None,
                 });
             }
         }
@@ -603,6 +637,7 @@ mod tests {
                 mcp_json: None,
                 mcp_toml: None,
                 guarded: false,
+                mode: None,
             },
             AgentStatus {
                 name: "cursor".into(),
@@ -613,6 +648,7 @@ mod tests {
                 mcp_json: Some(".cursor/mcp.json".into()),
                 mcp_toml: None,
                 guarded: false,
+                mode: None,
             },
             AgentStatus {
                 name: "mystery".into(),
@@ -623,6 +659,7 @@ mod tests {
                 mcp_json: None,
                 mcp_toml: None,
                 guarded: false,
+                mode: None,
             },
         ];
         // --all now takes BOTH claude-code (hook) AND cursor (mcp), not just the hook one

@@ -1,0 +1,79 @@
+# Coverage collection for the Community workspace (DD audit D16).
+#
+# There was none. No tarpaulin, no codecov, no llvm-cov, no job in any workflow.
+# Mutation testing existed but covered `agent-guard` alone and gated nothing, so
+# the crate holding the updater, the release verifier and 16.8k lines of CLI had
+# no instrumentation at all. That is the crate whose defects replace the binary a
+# user is running.
+#
+# The floor is MEASURED, not chosen. Running this workspace on 2026-08-22 gave
+# 79.42% (10,722 of 13,500 lines). The floor below is set from that number with
+# headroom, for the same reason the paid repo's per-crate floor is: a gate that
+# fires on normal churn is one people learn to force through, and a gate set at
+# today's exact number fires on the first refactor that moves a line.
+#
+# Raise it when the measurement has moved, not on a schedule. A floor that
+# ratchets on a calendar rewards tests written to raise a number.
+#
+# The distribution behind that 79.42%, worth writing down because it says where
+# the risk is rather than where the average is:
+#
+#   64.43%   4161 lines  cli            <- the updater and the release verifier
+#   84.88%   7838 lines  agent-guard
+#   88.76%    881 lines  dashboard-kit
+#   96.98%    431 lines  graph
+#   99.44%    177 lines  notify
+#  100.00%     12 lines  safe-io
+#
+# `cli` is the weakest and it is the crate that replaces the binary a user is
+# running. On 2026-08-21 it shipped `upgrade --check` performing a real upgrade.
+# A per-crate floor is the right next step and is NOT set here, because setting
+# one today at anything meaningful would fail this build immediately: that is a
+# change to make with tests, not with a config line.
+
+[default]
+workspace = true
+
+# 75, against a measured 79.42%. Roughly four points of headroom: enough that
+# ordinary work does not redden CI, tight enough that a real regression cannot
+# hide. Losing four percent of this workspace is roughly 540 lines going
+# untested, which is not noise.
+fail-under = 75.0
+
+# The llvm engine, matching the paid repo. The ptrace engine reports differently
+# on the same tree, and two repos measuring the same thing differently is how a
+# number stops meaning anything across the seam.
+engine = "llvm"
+
+exclude-files = [
+    # Entry points. `main.rs` here is argv dispatch onto functions that ARE
+    # measured; instrumenting it rewards a test that runs the binary to touch a
+    # match arm rather than one that checks a decision.
+    "crates/*/src/main.rs",
+    # Generated or vendored web assets, not Rust behaviour.
+    "crates/*/web/*",
+    "target/*",
+]
+
+# Tests should not count themselves.
+ignore-tests = true
+
+# Wired into CI. Getting there needed one real fix rather than an exclusion:
+# `hot_path_budget` is a performance CEILING, and instrumenting every line it
+# measures turns it into a test of the instrumentation. It is skipped under
+# `cfg(tarpaulin)` with that reason, and the two behavioural tests in the same
+# file still run.
+#
+# Kept for the record, since it is the symptom somebody will hit next:
+#
+# On the GitHub runner the run dies immediately after `innerwarden-agent-guard`
+# reports "416 passed; 0 failed", with tarpaulin's `Error: "Test failed during
+# run"` and no failing test named. It passes locally on the same commit and the
+# same config. That crate's tests fork and exec `chmod` and `ls`
+# (`file_update.rs`), which is the same class of interaction the paid repo
+# already documents for its watchdog: "tarpaulin instrumentation segfaults on
+# its fork/exec/pidfd process supervision".
+#
+# If a coverage run dies with no failing test named, look for a test whose
+# assertion depends on TIME or on process supervision, not for a bug in the
+# coverage config.

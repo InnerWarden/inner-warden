@@ -3,6 +3,64 @@
 All notable changes to InnerWarden are documented here. This project
 follows semantic versioning.
 
+## 1.3.7 - 2026-08-21
+
+Posture reporting. The dashboard could describe a control as working when
+nothing had confirmed it, and a fresh install could read as a fault.
+
+### Fixed
+
+- The headline no longer counts an unconfirmed control as working (#108).
+- A layer's sentence can no longer contradict the badge above it (#107); the
+  pill, the row and the gap list now tell one story (#106).
+- The API validator stopped discarding the layer disposition (#105).
+
+### Added
+
+- Posture says what needs an operator and what is simply fine, so a fresh
+  install is not reported as a problem (#104).
+
+## 1.3.6 - 2026-08-20
+
+### Fixed
+
+- `uninstall --dry-run` uninstalled instead of previewing (#101).
+- The agent view shows which mode the guard is in, and `--help` documents
+  dry-run (#100).
+
+## 1.3.5 - 2026-08-20
+
+### Fixed
+
+- `status` no longer blames a config file that was never read (#97).
+- `upgrade` names the command that actually upgrades this install, which
+  differs by install channel (#96).
+
+### Changed
+
+- One tag now moves every install channel, instead of each being cut by hand
+  (#95).
+
+## 1.3.4 - 2026-08-20
+
+### Fixed
+
+- A fresh install is no longer reported as a broken one (#93).
+- Absence of a signature is not absence of an agent (#89).
+- An empty substitution no longer hides the command behind it (#86).
+- The guard stopped reading data as if it were a command, and now names the
+  safe way out (#85).
+
+### Added
+
+- One command that says whether this install is actually protecting you (#90).
+
+### Changed
+
+- CI: a mutation sweep that finishes and that fails when it should (#87); the
+  apt lock no longer makes every Linux run a coin flip (#91); a retry loop no
+  longer outlives the step it runs inside (#92).
+
 ## 1.3.3 - 2026-08-16
 
 Two screening fixes, both found by running the shipped build against real

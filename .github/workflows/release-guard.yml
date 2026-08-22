@@ -53,11 +53,39 @@ jobs:
         run: |
           set -euo pipefail
           sha="${{ github.sha }}"
-          runs=$(gh api "repos/${{ github.repository }}/actions/workflows/ci.yml/runs?head_sha=$sha&per_page=20" \
-            --jq '[.workflow_runs[] | select(.status=="completed")] | map(.conclusion)')
+          api="repos/${{ github.repository }}/actions/workflows/ci.yml/runs?head_sha=$sha&per_page=20"
+
+          # WAIT for a CI run in flight instead of calling it a failure.
+          #
+          # The natural way to cut a release is merge, then tag. CI on the merge
+          # commit is then still running when the tag fires this workflow, no run
+          # has reached "completed", and the gate below saw an empty list and
+          # failed the release. Nothing was wrong with the commit: the answer
+          # simply did not exist yet.
+          #
+          # That cost a real release tonight (guard-v1.3.5, first attempt) and
+          # the only remedy was a manual re-run, which is exactly the kind of
+          # step that gets forgotten. "Not established yet" and "established as
+          # bad" are different, and only the second should stop a release.
+          #
+          # Bounded: 30 minutes, then give up loudly. An unbounded wait would
+          # turn a stuck CI into a stuck release with no message.
+          for _ in $(seq 1 60); do
+            pending=$(gh api "$api" --jq '[.workflow_runs[] | select(.status != "completed")] | length')
+            done_count=$(gh api "$api" --jq '[.workflow_runs[] | select(.status == "completed")] | length')
+            if [ "$pending" -eq 0 ] && [ "$done_count" -gt 0 ]; then break; fi
+            if [ "$pending" -eq 0 ] && [ "$done_count" -eq 0 ]; then
+              echo "no CI run for $sha yet; waiting for one to appear..."
+            else
+              echo "$pending CI run(s) still in flight for $sha; waiting..."
+            fi
+            sleep 30
+          done
+
+          runs=$(gh api "$api" --jq '[.workflow_runs[] | select(.status=="completed")] | map(.conclusion)')
           echo "CI conclusions for $sha: $runs"
           if [ "$runs" = "[]" ]; then
-            echo "::error::no completed CI run for $sha. Signing an untested commit is how a broken binary gets a signature."
+            echo "::error::no completed CI run for $sha after waiting 30 minutes. Signing an untested commit is how a broken binary gets a signature."
             exit 1
           fi
           if ! printf '%s' "$runs" | python3 -c 'import json,sys; c=json.load(sys.stdin); sys.exit(0 if c and all(x=="success" for x in c) else 1)'; then
@@ -107,11 +135,61 @@ jobs:
         # unattended-upgrades holding the dpkg lock, and without a lock timeout
         # this hangs until the job is killed. The release path had the bare
         # form, so the ONE build that has to succeed on demand was the flakiest.
-        timeout-minutes: 8
+        #
+        # Budget: 120s lock wait + 3 attempts x 60s lock + backoff is under five
+        # minutes. The previous 8 was SHORTER than the retry loop it contained,
+        # so a slow first attempt killed the job partway through retrying.
+        timeout-minutes: 12
         run: |
-          sudo systemctl stop unattended-upgrades.service 2>/dev/null || true
-          sudo apt-get -o DPkg::Lock::Timeout=300 update
-          sudo apt-get -o DPkg::Lock::Timeout=300 install --yes bubblewrap
+          # Stopping the SERVICE does not kill the apt-get it already spawned,
+          # and the apt-daily timers relaunch it underneath us. On 2026-08-19
+          # this step timed out repeatedly on CI for changes that touched no
+          # workflow code. The release path cannot be a coin flip.
+          sudo systemctl stop \
+            unattended-upgrades.service \
+            apt-daily.service apt-daily-upgrade.service \
+            apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+
+          for _ in $(seq 1 60); do
+            if ! sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 \
+               && ! sudo fuser /var/lib/apt/lists/lock >/dev/null 2>&1; then
+              break
+            fi
+            sleep 2
+          done
+
+          apt_retry() {
+            for attempt in 1 2 3; do
+              # `timeout` bounds the ATTEMPT in wall-clock. DPkg::Lock::Timeout
+              # only bounds waiting for the dpkg lock, and the observed hang was
+              # not the lock: apt printed the mirrorlist and then sat on a mirror
+              # fetch for twelve minutes until the step budget killed it. The
+              # network timeouts below make apt give up on a dead mirror; the
+              # outer `timeout` is the backstop for everything else.
+              if timeout 150 sudo apt-get \
+                   -o DPkg::Lock::Timeout=60 \
+                   -o Acquire::http::Timeout=20 \
+                   -o Acquire::https::Timeout=20 \
+                   -o Acquire::Retries=2 \
+                   "$@"; then
+                return 0
+              fi
+              echo "apt-get $* failed (attempt $attempt); retrying" >&2
+              sleep $((attempt * 5))
+            done
+            return 1
+          }
+
+          # Try the cheapest path first. The runner image often already has
+          # bwrap, and when it does not, the package lists it shipped with are
+          # usually enough to install it. `apt-get update` is the step that
+          # actually hangs: on 2026-08-19 all three bounded attempts burned their
+          # full 150s against the same mirror. Refreshing the lists is a
+          # nice-to-have; having bwrap is the requirement.
+          if ! command -v bwrap >/dev/null 2>&1; then
+            apt_retry install --yes bubblewrap \
+              || { apt_retry update && apt_retry install --yes bubblewrap; }
+          fi
           test "$(command -v bwrap)" = /usr/bin/bwrap
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
           sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
@@ -213,6 +291,7 @@ jobs:
           ls -lh dist/
 
       - name: Regenerate the Scoop manifest (fresh version + hashes)
+        id: version
         shell: bash
         run: |
           set -euo pipefail
@@ -240,6 +319,10 @@ jobs:
           json.dump(m, open("dist/innerwarden.json", "w"), indent=2)
           PY
           echo "generated dist/innerwarden.json (version $ver)"
+          # Exported for the immutable versioned release below. Taken from the
+          # BINARY, not from the tag or the workspace manifest, so the release
+          # named guard-vX.Y.Z always contains a binary that reports X.Y.Z.
+          echo "guard_version=$ver" >> "$GITHUB_OUTPUT"
 
       - name: Sign binaries with Ed25519 and stamp the pinned key
         env:
@@ -296,6 +379,67 @@ jobs:
           [ -s dist/innerwarden.json ]        || { echo "MISSING: innerwarden.json (scoop)"; missing=1; }
           [ "$missing" -eq 0 ] || { echo "asset manifest verification failed."; exit 1; }
           echo "All 6 binaries + sha256 + Ed25519 sigs + public key + installers + scoop manifest present."
+
+      # ── Immutable versioned release (DD audit S3) ────────────────────────
+      #
+      # Everything used to publish into the single rolling `iw-guard` tag, whose
+      # binaries are replaced on every cut. The release body has advertised
+      # `IW_GUARD_TAG=guard-vX.Y.Z` for months and the live installer really does
+      # honour it (`RELEASE_TAG="${IW_GUARD_TAG:-iw-guard}"`), but no such tag was
+      # ever created: `gh release view guard-v1.3.7` returned "release not found".
+      # So a documented capability did nothing, reproducible installs were
+      # impossible, and undoing a bad cut meant re-running the whole pipeline from
+      # an older commit because the previous binaries no longer existed anywhere.
+      #
+      # This publishes the SAME signed bytes a second time under an immutable
+      # per-version tag. The rolling tag keeps working exactly as before.
+      - name: Refuse to overwrite a published version
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
+          VER: ${{ steps.version.outputs.guard_version }}
+        run: |
+          set -euo pipefail
+          [ -n "$VER" ] || { echo "::error::no version was exported"; exit 1; }
+          tag="guard-v${VER}"
+          if gh release view "$tag" --repo InnerWarden/innerwarden-releases \
+               --json assets -q '.assets | length' 2>/dev/null | grep -qE '^[1-9]'; then
+            echo "::error::$tag already exists with assets."
+            echo "::error::A published version is immutable: it is the artefact a"
+            echo "::error::customer pinned to and the one a rollback restores."
+            echo "::error::Bump the version instead of republishing this one."
+            exit 1
+          fi
+          echo "$tag is free to publish"
+
+      - name: Publish immutable guard-vX.Y.Z release
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        with:
+          repository: InnerWarden/innerwarden-releases
+          token: ${{ secrets.RELEASES_REPO_TOKEN }}
+          tag_name: guard-v${{ steps.version.outputs.guard_version }}
+          name: InnerWarden Community ${{ steps.version.outputs.guard_version }}
+          body: |
+            InnerWarden Community ${{ steps.version.outputs.guard_version }}.
+
+            An immutable cut. The rolling `iw-guard` release always carries the
+            newest build; this tag carries THIS one, permanently, so an install
+            can be reproduced and a bad cut can be rolled back to it.
+
+            ```sh
+            IW_GUARD_TAG=guard-v${{ steps.version.outputs.guard_version }} \
+              curl -fsSL https://innerwarden.com/free | sh
+            ```
+
+            Same signed bytes as the rolling release for this version: every
+            binary ships SHA-256 and Ed25519 sidecars and the installer verifies
+            both.
+          prerelease: false
+          # `latest` in this repo belongs to the paid product's own tags; a
+          # Community cut must not take it.
+          make_latest: false
+          files: dist/*
+          fail_on_unmatched_files: true
 
       - name: Publish rolling iw-guard release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2

@@ -1,4 +1,6 @@
 import { describe, expect, it } from "vitest";
+// The screen's own source, for the structural guard at the bottom of this file.
+import postureSource from "./Posture.tsx?raw";
 import type {
   CapabilityStatus,
   CoverageGap,
@@ -15,8 +17,14 @@ import type {
 import {
   checkedAt,
   controlPill,
+  dispositionLabel,
+  dispositionOf,
+  dispositionReason,
+  dispositionTone,
   emptyGapsLine,
   gapAudience,
+  effectiveDisposition,
+  needsOperator,
   plainMode,
   postureHeadline,
   scopeDisplay,
@@ -182,7 +190,108 @@ describe("the verdict hero leads with what the user asked", () => {
     // a narrower notion of verified than the rows displayed and never said so.
     // Production showed the same shortfall, "1 of 5", with three rows reading
     // Enforcing and the kernel measured as enforcing on two of them.
-    expect(postureHeadline(pills)).toBe("2 of 5 host controls enforcing");
+    //
+    // The headline now leads with whether anything needs the reader, because
+    // that is the question they arrived with. The undercount this test was
+    // written to catch is still caught: nothing in this fixture is broken, so
+    // nothing may be reported as needing attention, and no control may go
+    // missing from the count.
+    expect(postureHeadline(pills)).toBe("5 host controls: 5 working. Nothing needs you.");
+  });
+
+  it("leads with what needs the reader, not with what is fine", () => {
+    // One control short of what it was asked for; four healthy.
+    const layers = FIVE_LAYERS.map((layer, index) =>
+      index === 0 ? { ...layer, disposition: "needs_operator" as const } : layer,
+    );
+    const pills = posture(layers).layers.map((entry) =>
+      controlPill(entry, bootstrap(), generatedAt, true, evaluatedAt),
+    );
+    expect(postureHeadline(pills)).toBe("1 of 5 host controls needs your attention");
+  });
+
+  it("does not shout at a correct fresh install", () => {
+    // An install deliberately arms nothing. Every control is therefore
+    // unconfigured, which the old model reported as `not_covered`: a state the
+    // badge rendered amber: so a perfectly installed product opened with a
+    // full page of warnings and taught the reader that amber means nothing.
+    const layers = FIVE_LAYERS.map((layer) => ({ ...layer, disposition: "not_enabled" as const }));
+    const pills = posture(layers).layers.map((entry) =>
+      controlPill(entry, bootstrap(), generatedAt, true, evaluatedAt),
+    );
+
+    expect(postureHeadline(pills)).toBe("Nothing is turned on yet: 5 controls ready to enable");
+    expect(pills.every((pill) => pill.tone === "neutral")).toBe(true);
+    expect(pills.some((pill) => pill.tone === "attention")).toBe(false);
+  });
+
+  it("reads an older host's payload without inventing a claim", () => {
+    // A host on a build that predates `disposition` sends none. The fallback
+    // has to reconstruct it from what that build DID send, and it must never
+    // manufacture the one state that means "we proved this protects you".
+    const base = { ...FIVE_LAYERS[0] };
+    delete (base as { disposition?: unknown }).disposition;
+
+    // Doing what it was told, with no host verdict: working, not proven.
+    expect(
+      dispositionOf({ ...base, claim_state: "readiness_only", effective_mode: "observe", desired_mode: "observe" }),
+    ).toBe("working_as_configured");
+
+    // Unreadable is ours, whatever else the payload says.
+    expect(
+      dispositionOf({ ...base, claim_state: "degraded", effective_mode: "unknown", desired_mode: "enforce" }),
+    ).toBe("cannot_verify");
+
+    // Never armed: calm, not an alarm.
+    expect(
+      dispositionOf({ ...base, claim_state: "not_covered", effective_mode: "disabled", desired_mode: "enforce" }),
+    ).toBe("not_enabled");
+
+    // Short of what it was asked for: this one IS the reader's.
+    expect(
+      dispositionOf({ ...base, claim_state: "degraded", effective_mode: "observe", desired_mode: "enforce" }),
+    ).toBe("needs_operator");
+  });
+
+  it("gives every state a sentence, even with none supplied", () => {
+    // A state with no explanation is what made people stop reading this page.
+    const base = { ...FIVE_LAYERS[0], label: "DNS resolution control" };
+    delete (base as { disposition_reason?: unknown }).disposition_reason;
+    for (const disposition of ["proven", "working_as_configured", "not_enabled", "cannot_verify", "needs_operator"] as const) {
+      const why = dispositionReason({ ...base, disposition });
+      expect(why.length).toBeGreaterThan(20);
+      expect(why).toContain("DNS resolution control");
+      expect(dispositionLabel(disposition).length).toBeGreaterThan(0);
+    }
+  });
+
+  it("lets exactly one state ask the reader for something", () => {
+    const asking = (["proven", "working_as_configured", "not_enabled", "cannot_verify", "needs_operator"] as const)
+      .filter(needsOperator);
+    expect(asking).toEqual(["needs_operator"]);
+  });
+
+  it("keeps amber scarce enough to mean something", () => {
+    // Exactly one disposition may colour a control amber. If a second starts
+    // doing it the page drifts back to permanent warnings and this work undoes
+    // itself.
+    const amber = (["proven", "working_as_configured", "not_enabled", "cannot_verify", "needs_operator"] as const)
+      .filter((disposition) => dispositionTone(disposition) === "attention");
+    expect(amber).toEqual(["needs_operator"]);
+  });
+
+  it("blames the product, not the reader, when a probe did not run", () => {
+    // Measured on a pilot box 2026-08-20: the Secret Read Guard was armed and
+    // ENFORCING, and the page said "Not confirmed / never checked", because the
+    // program's kernel instruction-tag was not in a hardcoded two-entry
+    // allowlist and CO-RE relocations make that tag per-kernel. Nothing the
+    // reader could click would have changed it, so it must not read as theirs.
+    const layer = { ...FIVE_LAYERS[0], disposition: "cannot_verify" as const };
+    const pill = controlPill(layer, bootstrap(), generatedAt, true, evaluatedAt);
+
+    expect(pill.tone).toBe("neutral");
+    expect(pill.mode).toBe("Can't confirm");
+    expect(pill.reason).toMatch(/ours to fix, not yours/);
   });
 
   it("never claims verified active without the assurance rule agreeing", () => {
@@ -196,7 +305,11 @@ describe("the verdict hero leads with what the user asked", () => {
   it("shows each control in plain words with its scope name and check time", () => {
     const pill = controlPill(posture().layers[0], bootstrap(), generatedAt, true, evaluatedAt);
     expect(pill.name).toBe("Independent host execution");
-    expect(pill.mode).toBe("Enforcing");
+    // "Working as set up", not "Enforcing": this fixture carries no claims
+    // records, so the assurance rule does not agree that it is verified, and
+    // the pill is not allowed to borrow the stronger word. The control is still
+    // doing what it was told, which is why this is calm and not an alarm.
+    expect(pill.mode).toBe("Working as set up");
     expect(pill.scope).toBe("OpenClaw workload");
     expect(pill.freshness).toMatch(/^as of \d{2}:\d{2}$/);
     // The producer freshness budget is contract bookkeeping; the summary never
@@ -297,5 +410,149 @@ describe("the poll cadence matches the evidence it renders", () => {
     const CANARY_INTERVAL_MS = 1_200_000;
     expect(POSTURE_REFRESH_MS).toBeGreaterThan(60_000);
     expect(POSTURE_REFRESH_MS).toBeLessThanOrEqual(CANARY_INTERVAL_MS);
+  });
+});
+
+describe("the pill and the row tell one story", () => {
+  it("puts every surface through the same assurance veto", () => {
+    // Measured on a pilot box 2026-08-20: the summary pill read "Working as set
+    // up" and the control row directly below it read "Protecting", for the same
+    // control on the same render, because the pill applied the assurance veto
+    // and the row called dispositionOf directly. A page that contradicts itself
+    // is worse than a page that is wrong: the reader cannot tell which line to
+    // believe, and a security product has nothing to sell once that happens.
+    const layer = { ...FIVE_LAYERS[0], disposition: "proven" as const };
+
+    // The host says proven; the assurance chain has not pinned it.
+    expect(effectiveDisposition(layer, false)).toBe("working_as_configured");
+    // With the chain agreeing, proven survives.
+    expect(effectiveDisposition(layer, true)).toBe("proven");
+
+    // And the pill the screen builds agrees with it, for this fixture where
+    // layerAssuranceLabel reports verifiedActive=false for every control.
+    const pill = controlPill(layer, bootstrap(), generatedAt, true, evaluatedAt);
+    expect(pill.disposition).toBe(effectiveDisposition(layer, pill.verified));
+    expect(pill.mode).toBe(dispositionLabel(effectiveDisposition(layer, pill.verified)));
+  });
+
+  it("never softens anything but an unbacked proven claim", () => {
+    // The veto exists to stop over-claiming. It must not quietly downgrade a
+    // control that is asking for the reader, which would hide real work.
+    for (const disposition of ["working_as_configured", "not_enabled", "cannot_verify", "needs_operator"] as const) {
+      const layer = { ...FIVE_LAYERS[0], disposition };
+      expect(effectiveDisposition(layer, false)).toBe(disposition);
+      expect(effectiveDisposition(layer, true)).toBe(disposition);
+    }
+  });
+});
+
+describe("no surface can bypass the assurance veto", () => {
+  it("routes every read of a layer's disposition through effectiveDisposition", () => {
+    // A structural check, because the failure is structural: the pill applied
+    // the veto and the row did not, and no unit test of a pure function can see
+    // that, since the row is a component. Both surfaces read the same layer, so
+    // the invariant is "nothing but effectiveDisposition calls dispositionOf".
+    //
+    // If this fails, do not add a second veto at the new call site. Route the
+    // new caller through effectiveDisposition, or the two drift again.
+    const callSites = postureSource
+      .split("\n")
+      .map((line: string, index: number) => ({ line: line.trim(), number: index + 1 }))
+      .filter((entry: { line: string; number: number }) => /\bdispositionOf\(/.test(entry.line))
+      // Its own declaration, and the one function allowed to call it.
+      .filter((entry: { line: string; number: number }) => !/^export function dispositionOf/.test(entry.line))
+      .filter((entry: { line: string; number: number }) => !/^const reported = dispositionOf\(layer\);$/.test(entry.line))
+      // dispositionReason compares against it to decide whether the host's
+      // sentence still applies, and falls back through it for a default. Text
+      // only: it never picks a colour and never makes a claim.
+      .filter((entry: { line: string; number: number }) => !/^const effective = shown \?\? dispositionOf\(layer\);$/.test(entry.line))
+      .filter((entry: { line: string; number: number }) => !/^if \(layer\.disposition_reason && effective === dispositionOf\(layer\)\) \{$/.test(entry.line));
+
+    expect(callSites).toEqual([]);
+  });
+});
+
+describe("the sentence never outranks the badge", () => {
+  it("drops the host's stronger sentence when the veto softened the badge", () => {
+    // Measured on a pilot box 2026-08-20: the row was badged "Working as set
+    // up" and the line directly under it read "is enforcing, and that was
+    // verified on this host". The badge had been through the assurance veto and
+    // the sentence had not, so the words outranked the claim they sat beneath.
+    const layer = {
+      ...FIVE_LAYERS[0],
+      label: "Independent host execution",
+      disposition: "proven" as const,
+      disposition_reason: "Independent host execution is enforcing, and that was verified on this host.",
+    };
+
+    // Veto applied: the sentence must come down with the badge.
+    expect(dispositionReason(layer, "working_as_configured")).toBe(
+      "Independent host execution is doing what it is set to do.",
+    );
+    // No veto: the host's own wording is richer and is kept.
+    expect(dispositionReason(layer, "proven")).toBe(layer.disposition_reason);
+  });
+
+  it("keeps the host sentence whenever the shown state matches", () => {
+    const layer = {
+      ...FIVE_LAYERS[0],
+      disposition: "not_enabled" as const,
+      disposition_reason: "DNS resolution control is switched on but has nothing to act on yet.",
+    };
+    expect(dispositionReason(layer, "not_enabled")).toBe(layer.disposition_reason);
+    // And the default caller, with no shown state, still gets it.
+    expect(dispositionReason(layer)).toBe(layer.disposition_reason);
+  });
+});
+
+describe("the headline names every state it counts", () => {
+  it("never sweeps an unconfirmed control into a count of working ones", () => {
+    // The headline read "N protecting, the rest working", and "the rest"
+    // quietly swallowed a control in cannot_verify. On a real host that put a
+    // control the page had just described as unreadable, in its own words "we
+    // will not claim either way", inside a count of things that work.
+    const layers = FIVE_LAYERS.map((layer, index) => ({
+      ...layer,
+      disposition: index === 0 ? ("cannot_verify" as const) : ("working_as_configured" as const),
+    }));
+    const pills = posture(layers).layers.map((entry) =>
+      controlPill(entry, bootstrap(), generatedAt, true, evaluatedAt),
+    );
+
+    const headline = postureHeadline(pills);
+    expect(headline).toContain("1 we can't confirm");
+    expect(headline).toContain("4 working");
+    expect(headline).not.toMatch(/the rest/);
+    // 4 + 1, never 5 working.
+    expect(headline).not.toContain("5 working");
+  });
+
+  it("counts each disposition once and only once", () => {
+    const layers = [
+      { ...FIVE_LAYERS[0], disposition: "proven" as const },
+      { ...FIVE_LAYERS[1], disposition: "working_as_configured" as const },
+      { ...FIVE_LAYERS[2], disposition: "not_enabled" as const },
+      { ...FIVE_LAYERS[3], disposition: "cannot_verify" as const },
+    ];
+    const pills = posture(layers).layers.map((entry) =>
+      controlPill(entry, bootstrap(), generatedAt, true, evaluatedAt),
+    );
+
+    // This fixture carries no claims records, so the assurance rule vetoes the
+    // proven one down to working: 2 working, not 1 protecting + 1 working.
+    expect(postureHeadline(pills)).toBe(
+      "4 host controls: 2 working, 1 not turned on, 1 we can't confirm. Nothing needs you.",
+    );
+  });
+
+  it("still leads with what needs the reader, above every other count", () => {
+    const layers = FIVE_LAYERS.map((layer, index) => ({
+      ...layer,
+      disposition: index === 0 ? ("needs_operator" as const) : ("cannot_verify" as const),
+    }));
+    const pills = posture(layers).layers.map((entry) =>
+      controlPill(entry, bootstrap(), generatedAt, true, evaluatedAt),
+    );
+    expect(postureHeadline(pills)).toBe("1 of 5 host controls needs your attention");
   });
 });
