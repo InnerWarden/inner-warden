@@ -283,7 +283,13 @@ jobs:
         run: cargo install cargo-tarpaulin --locked --version ^0.37
 
       - name: Measure, and fail under the floor
-        run: cargo tarpaulin --out Xml
+        # `--engine llvm` on the COMMAND LINE, not only in .tarpaulin.toml.
+        # That is how the paid repo invokes it on the same runner image, and it
+        # matters: on Linux the default engine is ptrace, which is the one that
+        # struggles with tests that fork and exec. This job failed twice with
+        # `Error: "Test failed during run"` and no failing test named while the
+        # config alone carried the engine key.
+        run: cargo tarpaulin --engine llvm --skip-clean --out Xml
 
       - name: Upload coverage report
         if: always()
