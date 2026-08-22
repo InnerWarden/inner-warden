@@ -557,7 +557,24 @@ mod e2e {
     /// A release server that answers exactly what it was given and 404s the rest.
     struct FakeRelease {
         base: String,
+        port: u16,
         _stop: mpsc::Sender<()>,
+    }
+
+    impl Drop for FakeRelease {
+        /// Wake the accept loop so its thread can see the closed channel and
+        /// return.
+        ///
+        /// Without this the thread blocks in `incoming()` forever: the stop
+        /// channel is only checked after a connection arrives, and none ever
+        /// does once the test finishes. A leaked blocked thread per test is
+        /// invisible under `cargo test`, which exits the process regardless, and
+        /// fatal under coverage instrumentation, which waits for the binary to
+        /// come down cleanly and reports `Test failed during run` when it does
+        /// not. That is exactly how this first failed in CI.
+        fn drop(&mut self) {
+            let _ = TcpStream::connect(("127.0.0.1", self.port));
+        }
     }
 
     impl FakeRelease {
@@ -569,7 +586,12 @@ mod e2e {
 
             thread::spawn(move || {
                 for incoming in listener.incoming() {
-                    if stop_rx.try_recv().is_ok() {
+                    // Disconnected means the FakeRelease was dropped: its Drop
+                    // opens one connection purely to get us here.
+                    if matches!(
+                        stop_rx.try_recv(),
+                        Ok(()) | Err(mpsc::TryRecvError::Disconnected)
+                    ) {
                         return;
                     }
                     let Ok(stream) = incoming else { continue };
@@ -579,6 +601,7 @@ mod e2e {
 
             Self {
                 base: format!("http://127.0.0.1:{port}"),
+                port,
                 _stop: stop_tx,
             }
         }
