@@ -21,9 +21,12 @@
 //! match reported as no agent, a block that could not be lifted filed as lifted.
 //! Each one sent someone to fix the wrong thing.
 //!
-//! So every line below is one of three states, and the third is never folded
-//! into the second.
+//! So every line below is one of these states, and "could not tell" is never
+//! folded into "off". Nor is "not set up yet", nor "an optional extra is not
+//! running": each of those has its own state precisely so it cannot be reported
+//! as a fault in the thing that protects the machine.
 
+use innerwarden_agent_guard::agents::GuardMode;
 use std::fmt;
 
 /// What we could establish about one aspect of the install.
@@ -39,6 +42,15 @@ pub enum Finding {
     /// nothing here to read, and the reader needs a first step rather than a
     /// diagnosis.
     NotConfigured { what: String, next: String },
+    /// Established not running, and that is fine: an optional extra nothing is
+    /// protected any less without. Distinct from NotWorking, which is a fault,
+    /// and from Unknown, which is an unanswered question.
+    ///
+    /// Without this variant the only way to say "the dashboard is not up" was
+    /// `NotWorking`, which put a fully wired, enforcing machine under the
+    /// headline "NOT fully protecting this machine" because an optional local
+    /// UI was closed. That is this file's own mistake pointed at a new line.
+    Optional { what: String, next: String },
 }
 
 impl fmt::Display for Finding {
@@ -54,15 +66,72 @@ impl fmt::Display for Finding {
             Finding::NotConfigured { what, next } => {
                 write!(f, "  [not set] {what}\n            start with: {next}")
             }
+            Finding::Optional { what, next } => {
+                write!(f, "  [idle]    {what}\n            if you want it: {next}")
+            }
         }
     }
+}
+
+/// PURE: collapse the per-agent wiring modes into the one line `status` prints.
+///
+/// The mode IS readable: `agents_ops::rows` reads each agent's wiring back and
+/// reports what it actually DOES. `status` fetched those rows already and then
+/// threw the modes away, so the first command a beginner runs after
+/// `innerwarden enforce` told them the mode was not knowable.
+///
+/// Two rules, both in the same direction as the rest of this file:
+///
+/// * one unreadable wiring makes the whole answer `None`, because "enforce" as
+///   a summary of wiring nobody could read back is a guess, and
+/// * agents that disagree, or a single agent whose own wiring disagrees, are
+///   reported as `mixed` rather than rounded to the reassuring half.
+pub fn aggregate_mode(modes: &[Option<GuardMode>]) -> Option<String> {
+    if modes.is_empty() || modes.iter().any(Option::is_none) {
+        return None;
+    }
+    let mut records = false;
+    let mut blocks = false;
+    for mode in modes.iter().flatten() {
+        match mode {
+            GuardMode::Monitor => records = true,
+            GuardMode::Enforce => blocks = true,
+            GuardMode::Mixed => {
+                records = true;
+                blocks = true;
+            }
+        }
+    }
+    match (records, blocks) {
+        (true, true) => Some("mixed".into()),
+        (true, false) => Some("monitor".into()),
+        (false, true) => Some("enforce".into()),
+        (false, false) => None,
+    }
+}
+
+/// PURE: is this HTTP body a local InnerWarden dashboard answering?
+///
+/// Something listening on the port is NOT the question. The check-command
+/// contract shares that port, so a bare TCP connect would report "dashboard is
+/// up" for an Active Defence agent, a stale `serve`, or anything else that
+/// happens to be bound. Only the dashboard's own meta payload counts.
+pub fn is_dashboard_answer(body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .is_some_and(|payload| {
+            payload.get("edition").is_some() && payload.get("guardrail").is_some()
+        })
 }
 
 /// Observed facts. Every field is read live; `None` means "could not read",
 /// which is deliberately different from `Some(false)`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Facts {
-    /// Guard mode as configured: "enforce", "dry-run", or None if unreadable.
+    /// What the wiring of the connected agents actually DOES, summarised:
+    /// "enforce", "monitor" (alias "dry-run"), or "mixed" when it disagrees with
+    /// itself. `None` when nothing is wired to have a mode, or when a wiring
+    /// exists and could not be read back. See [`aggregate_mode`].
     pub mode: Option<String>,
     /// True when this install has simply not been set up yet: no config, no
     /// records, nothing wired. A fresh box is not a broken one, and telling a
@@ -74,9 +143,11 @@ pub struct Facts {
     pub wired_agents: Vec<String>,
     /// Whether ANY agent process was visible, regardless of wiring.
     pub any_agent_seen: Option<bool>,
-    /// Number of guard decisions recorded. `None` = the record could not be read.
+    /// Commands screened and recorded, allows included. `Some(0)` is a record
+    /// that exists with nothing in it yet; `None` is a record that could not be
+    /// read, which is a different sentence and must stay one.
     pub decisions_recorded: Option<u64>,
-    /// Whether the local dashboard answered.
+    /// Whether the local dashboard answered. `None` when it was not probed.
     pub dashboard_reachable: Option<bool>,
 }
 
@@ -104,29 +175,40 @@ pub fn assess(facts: &Facts) -> Vec<Finding> {
             what: "Guard mode is dry-run: refusals are recorded, not applied.".into(),
             next: "innerwarden enforce".into(),
         }),
+        // Some wiring records and some of it blocks. Rounding this to "enforce"
+        // would tell someone they are covered while part of what they run is
+        // not, so it is reported as the half that is not protecting.
+        Some("mixed") => out.push(Finding::NotWorking {
+            what: "Guard mode is mixed: some of the wiring records, some of it \
+                   blocks, so part of what you run is not actually refused."
+                .into(),
+            next: "innerwarden enforce".into(),
+        }),
         Some(other) => out.push(Finding::Unknown {
             what: format!("Guard mode reads as {other:?}, which I do not recognise."),
             why: "Expected enforce or dry-run. Treating this as unknown rather \
                   than assuming either."
                 .into(),
         }),
-        // Nothing was attempted, so nothing failed.
-        //
-        // This said "Guard mode could not be read. The config was unreadable."
-        // and `main.rs` passes `mode: None` unconditionally, because the mode is
-        // not persisted anywhere this command can see. So the sentence was not
-        // occasionally wrong, it was wrong every single time, for every user,
-        // on the first command a beginner runs after wiring an agent. It sent
-        // them looking for a broken config file that does not exist and never
-        // did.
-        //
-        // "Could not be read" and "there is nowhere to read it from" are
-        // different claims, and only the second one is true here.
+        // Nothing is wired, so there is no mode to have. Nothing was attempted
+        // here and nothing failed, and saying otherwise sends the reader to a
+        // config file that does not exist. The wiring line below is the one
+        // that carries the actual news.
+        None if facts.wired_agents.is_empty() => out.push(Finding::Unknown {
+            what: "No agent is wired, so there is no guard mode to report yet.".into(),
+            why: "A mode belongs to wiring: connect an agent and this line \
+                  becomes enforce or dry-run."
+                .into(),
+        }),
+        // Wiring exists and did not read back as either mode. THIS one is a
+        // genuine failed read, and it names the wiring rather than inventing a
+        // broken file elsewhere.
         None => out.push(Finding::Unknown {
-            what: "Guard mode is not something this command can see yet.".into(),
-            why: "It is not written anywhere `status` can read, so nothing was \
-                  attempted and nothing failed. Screening still applies; this \
-                  line is about what I can report, not about what is running."
+            what: "An agent is wired, but what that wiring DOES did not read \
+                   back as enforce or dry-run."
+                .into(),
+            why: "Screening still applies; I will not guess which of the two it \
+                  is. `innerwarden agents` shows the wiring this was read from."
                 .into(),
         }),
     }
@@ -185,8 +267,15 @@ pub fn assess(facts: &Facts) -> Vec<Finding> {
     // ── Dashboard ───────────────────────────────────────────────────────────
     match facts.dashboard_reachable {
         Some(true) => out.push(Finding::Working("Local dashboard is answering.".into())),
-        Some(false) => out.push(Finding::NotWorking {
-            what: "Local dashboard is not answering.".into(),
+        // Not a fault. The dashboard is a window onto what was screened, and a
+        // closed window screens nothing less. Reported as `off` it dragged an
+        // otherwise perfect install under "NOT fully protecting this machine",
+        // which is this file's own mistake wearing a different hat.
+        Some(false) => out.push(Finding::Optional {
+            what: "The local dashboard is not running. It is optional, and \
+                   nothing is screened any less without it. If you started one \
+                   on another address, this line cannot see it."
+                .into(),
             next: "innerwarden dashboard".into(),
         }),
         None => out.push(Finding::Unknown {
@@ -199,6 +288,11 @@ pub fn assess(facts: &Facts) -> Vec<Finding> {
 }
 
 /// Is this install doing its job? Only `Working` on the things that matter.
+///
+/// `Optional` findings never move the verdict. An extra that is not running is
+/// not a hole in what protects the machine, and letting one set the headline is
+/// how "everything here is fine" became a sentence this command could never
+/// print for any install at all.
 pub fn headline(findings: &[Finding]) -> &'static str {
     if findings
         .iter()
@@ -289,18 +383,17 @@ mod tests {
     ///   [unknown] Guard mode could not be read.
     ///             The config was unreadable.
     ///
-    /// `main.rs` passes `mode: None` unconditionally, because the mode is not
-    /// persisted anywhere this command can see. So that sentence was not
-    /// occasionally wrong; it was wrong for every user, every run, and it named
-    /// a broken config file that does not exist.
-    ///
     /// Claiming a read failed when no read was attempted is the same defect as
     /// claiming something is off when it merely could not be established. This
     /// file exists to refuse the second one, so it must refuse the first.
+    ///
+    /// With nothing wired there is no wiring to read a mode from, so this is
+    /// still the case where no read happens and no read may be blamed.
     #[test]
     fn an_unavailable_mode_does_not_blame_a_config_file() {
         let mut f = healthy();
         f.mode = None;
+        f.wired_agents.clear();
         let rendered = render(&f);
         assert!(
             !rendered.contains("config was unreadable"),
@@ -311,8 +404,151 @@ mod tests {
             "'could not be read' claims an attempt that never happened:\n{rendered}"
         );
         assert!(
-            rendered.contains("not written anywhere"),
+            rendered.contains("no guard mode to report yet"),
             "say the real reason, so nobody goes looking for the file:\n{rendered}"
+        );
+    }
+
+    /// The other half of the same rule. Once an agent IS wired, a mode that
+    /// does not read back is a read that really was attempted and really did
+    /// fail, and the line must say so against the wiring it came from rather
+    /// than repeat "there is nowhere to read it from", which by then is false.
+    #[test]
+    fn a_wired_agent_with_an_unreadable_mode_says_which_read_failed() {
+        let mut f = healthy();
+        f.mode = None;
+        let rendered = render(&f);
+        assert!(
+            rendered.contains("An agent is wired"),
+            "name the wiring the failed read came from:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("innerwarden agents"),
+            "point at the command that shows that wiring:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("[off]"),
+            "an unreadable mode is not an off mode:\n{rendered}"
+        );
+    }
+
+    /// REGRESSION ANCHOR for the whole reason this fix exists.
+    ///
+    /// `main.rs` hard-coded `mode: None`, so the line a beginner reads
+    /// IMMEDIATELY after `innerwarden enforce` succeeds said the mode was not
+    /// knowable. The rows it needed were already in hand: `agents_ops::rows`
+    /// reads each wiring back and reports monitor or enforce.
+    ///
+    /// FAILS ON REVERT: drop the modes on the floor again and `aggregate_mode`
+    /// gets `[]`, which is `None`, which is the [unknown] line.
+    #[test]
+    fn a_readable_wiring_is_summarised_into_a_mode() {
+        assert_eq!(
+            aggregate_mode(&[Some(GuardMode::Enforce)]).as_deref(),
+            Some("enforce")
+        );
+        assert_eq!(
+            aggregate_mode(&[Some(GuardMode::Monitor), Some(GuardMode::Monitor)]).as_deref(),
+            Some("monitor")
+        );
+        // The mode line for an enforcing install must read as protection.
+        let mut f = healthy();
+        f.mode = aggregate_mode(&[Some(GuardMode::Enforce)]);
+        match &assess(&f)[0] {
+            Finding::Working(what) => assert!(
+                what.contains("enforce"),
+                "an enforcing install must say enforce: {what}"
+            ),
+            other => panic!("enforce must read as protection: {other:?}"),
+        }
+    }
+
+    /// One wiring nobody could read back poisons the summary: "enforce" would
+    /// then be a claim about a config that was never understood.
+    #[test]
+    fn one_unreadable_wiring_makes_the_whole_mode_unknown() {
+        assert_eq!(aggregate_mode(&[Some(GuardMode::Enforce), None]), None);
+        assert_eq!(aggregate_mode(&[]), None, "nothing wired has no mode");
+    }
+
+    /// Disagreeing wiring is never rounded to the reassuring half: two agents
+    /// where one records and one blocks is not an enforcing machine.
+    #[test]
+    fn disagreeing_wiring_is_reported_as_mixed_not_as_enforce() {
+        assert_eq!(
+            aggregate_mode(&[Some(GuardMode::Enforce), Some(GuardMode::Monitor)]).as_deref(),
+            Some("mixed")
+        );
+        assert_eq!(
+            aggregate_mode(&[Some(GuardMode::Mixed)]).as_deref(),
+            Some("mixed")
+        );
+        let mut f = healthy();
+        f.mode = Some("mixed".into());
+        let findings = assess(&f);
+        match &findings[0] {
+            Finding::NotWorking { what, next } => {
+                assert!(what.contains("mixed"), "{what}");
+                assert_eq!(next, "innerwarden enforce");
+            }
+            other => panic!("mixed wiring must not read as protection: {other:?}"),
+        }
+        assert!(headline(&findings).contains("NOT fully protecting"));
+    }
+
+    /// The dashboard is an optional window, not a wall.
+    ///
+    /// Reported as `[off]`, a closed dashboard put a fully wired, enforcing,
+    /// actively screening install under "NOT fully protecting this machine" and
+    /// handed the reader a fault to chase that was never a fault.
+    ///
+    /// FAILS ON REVERT: make the not-running dashboard `NotWorking` again and
+    /// the headline flips.
+    #[test]
+    fn a_closed_dashboard_is_not_a_hole_in_protection() {
+        let mut f = healthy();
+        f.dashboard_reachable = Some(false);
+        let findings = assess(&f);
+        assert!(
+            findings.iter().any(
+                |x| matches!(x, Finding::Optional { next, .. } if next == "innerwarden dashboard")
+            ),
+            "a dashboard that is not running is optional, not broken: {findings:?}"
+        );
+        assert_eq!(
+            headline(&findings),
+            "InnerWarden is on and screening.",
+            "an optional extra must not set the verdict: {findings:?}"
+        );
+        let rendered = render(&f);
+        assert!(
+            !rendered.contains("[off]"),
+            "nothing here is off:\n{rendered}"
+        );
+    }
+
+    /// There must EXIST an install this command calls fine, or "fine" is not a
+    /// verdict it can reach and every reader learns to ignore the headline.
+    #[test]
+    fn a_fully_working_install_has_a_verdict_it_can_reach() {
+        let mut f = healthy();
+        f.dashboard_reachable = Some(false);
+        f.mode = Some("enforce".into());
+        assert_eq!(headline(&assess(&f)), "InnerWarden is on and screening.");
+    }
+
+    /// Anything at all listening on the port is not a dashboard: the
+    /// check-command contract shares it, and so can an Active Defence agent.
+    #[test]
+    fn only_the_dashboards_own_payload_counts_as_an_answer() {
+        assert!(is_dashboard_answer(
+            r#"{"version":"1.3.2","edition":"community","guardrail":{"mode":"enforce","guarded_agents":1}}"#
+        ));
+        assert!(!is_dashboard_answer("not json at all"));
+        assert!(!is_dashboard_answer(r#"{"error":"unauthorized"}"#));
+        assert!(
+            !is_dashboard_answer(r#"{"edition":"community"}"#),
+            "half a payload is not the dashboard answering"
         );
     }
 

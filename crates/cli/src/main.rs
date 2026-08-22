@@ -56,7 +56,11 @@ pub(crate) const COMMUNITY_EDITION_NAME: &str = "InnerWarden Community Edition";
 /// command: reporting "off" when you mean "could not tell" sends the reader to
 /// fix the wrong thing.
 fn status_io_cmd() -> std::process::ExitCode {
-    let home = std::env::var("HOME").ok().map(std::path::PathBuf::from);
+    // The same home every other command wires against (`USERPROFILE` on
+    // Windows). Reading `HOME` directly meant this command looked at a
+    // different machine from the one `install`, `enforce` and `agents` write
+    // to, and on Windows it looked at nothing at all.
+    let home = hook::home_dir().ok();
     let rows = home
         .as_deref()
         .map(innerwarden_agent_guard::agents_ops::rows)
@@ -72,10 +76,26 @@ fn status_io_cmd() -> std::process::ExitCode {
     // report renders as unknown rather than as "no agent".
     let any_agent_seen = home.as_ref().map(|_| !rows.is_empty());
 
-    let decisions_recorded = graph_io::sink_dir()
-        .map(|d| d.join("guard-events.jsonl"))
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .map(|text| text.lines().filter(|l| !l.trim().is_empty()).count() as u64);
+    // What the wiring DOES, read back from the SAME rows fetched above. This
+    // was hardcoded to `None`, so the mode line read [unknown] on every install
+    // in the world, including the one a beginner sees the moment after
+    // `innerwarden enforce` prints success.
+    let modes: Vec<_> = rows.iter().filter(|r| r.guarded).map(|r| r.mode).collect();
+    let mode = status::aggregate_mode(&modes);
+
+    // The record is the GRAPH: every screened command lands there, allows
+    // included. `guard-events.jsonl` was counted instead, and that sink holds
+    // blocks (plus suppression edits and conversation attempts), so the number
+    // labelled "screening decision(s)" was never the number of decisions, and
+    // an install that had simply never blocked anything counted zero.
+    //
+    // A missing record is zero, not a failure: `Loaded::Empty` covers "nothing
+    // recorded yet" and only a genuinely unreadable record yields `Err`, which
+    // stays `None` so it renders as [unknown] rather than as a quiet zero.
+    let decisions_recorded = match graph_io::load_graph_checked() {
+        Ok(graph) => Some(graph.stats().commands as u64),
+        Err(_) => None,
+    };
 
     // Absent everything is "not set up", not "unreadable". A fresh box is not a
     // broken one, and three diagnoses send a beginner hunting a fault that does
@@ -83,19 +103,40 @@ fn status_io_cmd() -> std::process::ExitCode {
     let never_configured =
         wired_agents.is_empty() && decisions_recorded.unwrap_or(0) == 0 && rows.is_empty();
 
+    // A fresh box answers in one line and never reaches the dashboard finding,
+    // so it must not pay for a socket to produce a line nobody will read.
+    let dashboard_reachable = if never_configured {
+        None
+    } else {
+        Some(dashboard_answers(DEFAULT_BIND))
+    };
+
     let facts = status::Facts {
         never_configured,
-        // Mode is not persisted anywhere this command can read today, so it is
-        // reported as unknown rather than assumed. Assuming would be the exact
-        // mistake this command exists to stop.
-        mode: None,
+        mode,
         wired_agents,
         any_agent_seen,
         decisions_recorded,
-        dashboard_reachable: None,
+        dashboard_reachable,
     };
     print!("{}", status::render(&facts));
     std::process::ExitCode::SUCCESS
+}
+
+/// Does a local InnerWarden dashboard answer on `bind`?
+///
+/// Thin I/O over [`status::is_dashboard_answer`], which holds the rule about
+/// what counts as an answer, so the rule is testable without a socket. A short
+/// timeout because this runs inside the one command a beginner reaches for when
+/// something already feels wrong.
+fn dashboard_answers(bind: &str) -> bool {
+    ureq::get(&format!("http://{bind}/api/meta"))
+        .timeout(std::time::Duration::from_millis(400))
+        .call()
+        .ok()
+        .and_then(|response| response.into_string().ok())
+        .map(|body| status::is_dashboard_answer(&body))
+        .unwrap_or(false)
 }
 
 fn main() -> std::process::ExitCode {
@@ -1233,6 +1274,7 @@ fn help_text() -> String {
          What you learn here carries over 1:1.\n\
          \n\
          USAGE:\n  \
+           {p} status                    is it on, and is it screening anything? start here\n  \
            {p} setup                     first-run wizard: pick what to enable (arrow keys)\n  \
              {p} dry-run                   put EVERY connected agent in monitor: records, never blocks\n  \
              {p} enforce                   the opposite: a denied command is actually refused\n  \
@@ -1325,6 +1367,24 @@ mod tests {
     /// existed, and users were told to hand-configure `proxy --mode advisory`
     /// instead of running the single command that already does it for every
     /// connected agent.
+    /// The same rule, applied to the command a beginner is told to start with.
+    ///
+    /// `status` has been dispatched all along and appeared NOWHERE in `--help`,
+    /// so the one command that answers "is this thing on?" could only be found
+    /// by reading the source. A command absent from --help is a command nobody
+    /// can find.
+    #[test]
+    fn help_documents_the_status_command() {
+        let help = help_text();
+        let listed = help
+            .lines()
+            .any(|line| line.trim_start().starts_with(&format!("{} status", prog())));
+        assert!(
+            listed,
+            "`status` is a real command and must be listed in --help. Got:\n{help}"
+        );
+    }
+
     #[test]
     fn help_documents_the_two_mode_commands() {
         let help = help_text();
