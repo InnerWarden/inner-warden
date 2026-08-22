@@ -40,3 +40,9 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage
 [dev-dependencies]
 tempfile = "3"
 serde_json = "1"
+
+# `cfg(tarpaulin)` is set by cargo-tarpaulin while instrumenting. Declared so the
+# perf-budget test can opt out of a coverage run without tripping the
+# unexpected-cfg lint, which `-D warnings` would turn into a build failure.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tarpaulin)'] }
