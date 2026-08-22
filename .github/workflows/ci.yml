@@ -251,6 +251,129 @@ jobs:
   # Audit SUP-02 / CI-07: the repo had no supply-chain gate. This is it. It runs
   # on every push, so an advisory or an incompatible licence fails a PR instead
   # of being found in a quarterly review.
+  # Coverage (DD audit D16).
+  #
+  # This repo had no instrumentation of any kind. Mutation testing existed but
+  # covered `agent-guard` alone and gated nothing, so `cli` — the updater, the
+  # release verifier, 16.8k lines — had none at all. That is the crate whose
+  # defects replace the binary a user is running, and on 2026-08-21 one did.
+  #
+  # The floor lives in .tarpaulin.toml and is measured, not chosen: 79.42% on the
+  # day it was added, floor at 75.
+  #
+  # Pull requests only, like the paid repo: this is a gate on a change rather
+  # than a metric anybody reads afterwards.
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          # The llvm engine needs source-based coverage tools, and this list is
+          # additive to the default profile, which does not carry them.
+          components: llvm-tools-preview
+
+      # The suite includes a journey test that REFUSES to run without a real
+      # bubblewrap binary, deliberately: silently skipping isolation is how an
+      # isolation guarantee stops being one. The build job installs it; this job
+      # did not, and the coverage run died on that assertion rather than on
+      # anything to do with coverage.
+      - name: Install bubblewrap (Linux AI Jail backend)
+        if: runner.os == 'Linux'
+        # Budget: 120s lock wait + 3 attempts x 60s lock + backoff is under
+        # five minutes. The previous 8 was SHORTER than the retry loop it
+        # contained, so a slow first attempt killed the job mid-retry.
+        timeout-minutes: 12
+        run: |
+          # A fresh runner boots with unattended-upgrades holding the dpkg/apt
+          # lock. Stopping the SERVICE is not enough: it does not kill the
+          # apt-get it already spawned, and the apt-daily timers relaunch it
+          # underneath us. Two PRs failed here on 2026-08-19 with the step
+          # timing out after eight minutes, twice each, on a change that touched
+          # no CI code at all.
+          #
+          # So: stop the timers as well as the services, wait for the lock to be
+          # genuinely free rather than hoping a timeout covers it, and retry the
+          # install, because a transient mirror error should cost a retry rather
+          # than a whole run.
+          sudo systemctl stop \
+            unattended-upgrades.service \
+            apt-daily.service apt-daily-upgrade.service \
+            apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+
+          # Wait for whatever already holds the lock to finish, rather than
+          # racing it. 120s is generous for a runner's boot-time upgrade.
+          for _ in $(seq 1 60); do
+            if ! sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 \
+               && ! sudo fuser /var/lib/apt/lists/lock >/dev/null 2>&1; then
+              break
+            fi
+            sleep 2
+          done
+
+          apt_retry() {
+            for attempt in 1 2 3; do
+              # `timeout` bounds the ATTEMPT in wall-clock. DPkg::Lock::Timeout
+              # only bounds waiting for the dpkg lock, and the observed hang was
+              # not the lock: apt printed the mirrorlist and then sat on a mirror
+              # fetch for twelve minutes until the step budget killed it. The
+              # network timeouts below make apt give up on a dead mirror; the
+              # outer `timeout` is the backstop for everything else.
+              if timeout 150 sudo apt-get \
+                   -o DPkg::Lock::Timeout=60 \
+                   -o Acquire::http::Timeout=20 \
+                   -o Acquire::https::Timeout=20 \
+                   -o Acquire::Retries=2 \
+                   "$@"; then
+                return 0
+              fi
+              echo "apt-get $* failed (attempt $attempt); retrying" >&2
+              sleep $((attempt * 5))
+            done
+            return 1
+          }
+
+          # Try the cheapest path first. The runner image often already has
+          # bwrap, and when it does not, the package lists it shipped with are
+          # usually enough to install it. `apt-get update` is the step that
+          # actually hangs: on 2026-08-19 all three bounded attempts burned their
+          # full 150s against the same mirror. Refreshing the lists is a
+          # nice-to-have; having bwrap is the requirement.
+          if ! command -v bwrap >/dev/null 2>&1; then
+            apt_retry install -y bubblewrap \
+              || { apt_retry update && apt_retry install -y bubblewrap; }
+          fi
+          # Ubuntu 24.04 restricts unprivileged user namespaces via AppArmor;
+          # the AI Jail backend needs them for its uid map. Allow them in CI.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Install cargo-tarpaulin
+        # Pinned to the major this config was measured against.
+        run: cargo install cargo-tarpaulin --locked --version ^0.37
+
+      - name: Measure, and fail under the floor
+        # `--engine llvm` on the COMMAND LINE, not only in .tarpaulin.toml.
+        # That is how the paid repo invokes it on the same runner image, and it
+        # matters: on Linux the default engine is ptrace, which is the one that
+        # struggles with tests that fork and exec. This job failed twice with
+        # `Error: "Test failed during run"` and no failing test named while the
+        # config alone carried the engine key.
+        run: cargo tarpaulin --engine llvm --skip-clean --out Xml
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: tarpaulin-coverage
+          path: cobertura.xml
+          if-no-files-found: ignore
+
   supply-chain:
     name: supply chain (cargo-deny)
     runs-on: ubuntu-latest

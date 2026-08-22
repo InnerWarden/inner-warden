@@ -56,6 +56,20 @@ fn median_micros(command: &str, engine: &RuleEngine) -> u128 {
 /// REGRESSION ANCHOR for PERF-05. The screening path is on every tool call, so
 /// an order-of-magnitude regression is a product defect, not a micro-optimisation
 /// question.
+/// Skipped under coverage instrumentation, deliberately.
+///
+/// Tarpaulin instruments every line it measures, so this stops timing the
+/// screening path and starts timing the instrumentation. The budget was
+/// calibrated on an uninstrumented build and there is no honest instrumented
+/// number to compare against: raising it to fit would remove the ceiling, and
+/// leaving it fails on a slow runner for a reason that has nothing to do with a
+/// regression.
+///
+/// The two behavioural tests below are unaffected and still run under coverage.
+#[cfg_attr(
+    tarpaulin,
+    ignore = "a perf ceiling under instrumentation measures the instrumentation"
+)]
 #[test]
 fn screening_stays_within_its_budget() {
     let engine = RuleEngine::load_embedded();
