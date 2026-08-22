@@ -106,6 +106,18 @@ jobs:
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
           sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
 
+      # The house rule bans U+2014 and nothing in this PUBLIC repo enforced it;
+      # 16 files already carry the character. Ported from the paid repo, where
+      # the same gate spent its entire life green WITHOUT EVER RUNNING: a shallow
+      # checkout has no `origin/main`, and the script's missing-base branch used
+      # to exit 0. It now fetches the base and refuses if it cannot.
+      #
+      # Ubuntu only: the matrix runs three OSes and this answers the same
+      # question on all of them, so running it once is the whole cost.
+      - name: No em dash in the lines this change adds
+        if: matrix.os == 'ubuntu-latest'
+        run: bash scripts/no-em-dash-in-new-lines.sh "origin/${{ github.base_ref || 'main' }}"
+
       - name: Format
         run: cargo fmt --all --check
 
