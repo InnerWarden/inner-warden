@@ -278,3 +278,33 @@ fn active_claim_records_pin_the_full_matrix_and_layers_carry_claims() {
         .collect::<BTreeSet<_>>();
     assert!(layer_required.contains("evidence"));
 }
+
+/// The changelog must describe the version this workspace builds.
+///
+/// It stopped at 1.3.3 while the workspace shipped 1.3.7: four releases with no
+/// entry, including one that fixed `uninstall --dry-run` uninstalling. A
+/// changelog four versions behind is worse than none, because a user reading it
+/// concludes nothing changed.
+///
+/// Checked here rather than in a script because a script nobody runs is the same
+/// as the drift it was meant to catch.
+///
+/// FAILS ON REVERT: bump the workspace version without adding an entry.
+#[test]
+fn the_changelog_covers_the_version_being_shipped() {
+    const MANIFEST: &str = include_str!("../../../Cargo.toml");
+    const CHANGELOG: &str = include_str!("../../../CHANGELOG.md");
+
+    let version = MANIFEST
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("version = \""))
+        .and_then(|v| v.split('"').next())
+        .expect("the workspace declares a version");
+
+    assert!(
+        CHANGELOG.contains(&format!("## {version} ")),
+        "the workspace builds {version} and CHANGELOG.md has no entry for it. A \
+         changelog behind the code is worse than none: a reader concludes \
+         nothing changed."
+    );
+}

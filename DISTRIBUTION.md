@@ -213,11 +213,19 @@ with no variable set) means re-running `release-guard.yml` from the older
 commit, which republishes the rolling tag from those bytes. That is a pipeline
 run, not an asset copy, because the rolling tag must keep matching a real cut.
 
-2. **npm**: run `npm-publish.yml` (or push `npm-v<version>`). Verify:
+2. **npm**: nothing to run. `npm-publish.yml` chains off a successful
+   `release-guard.yml` through `workflow_run`, and pushing `npm-v<version>` is
+   the manual fallback for when it did not. Verify:
    `npx innerwarden@<version> --version`.
-3. **.deb / .rpm**: run `linux-packages.yml`, download the artifact, and
-   `gh release upload iw-guard ... *.deb *.rpm *.sha256`. Delete the previous
-   version's package assets so the release holds one version.
+3. **.deb / .rpm**: nothing to run, and nothing to upload.
+   `linux-packages.yml` chains off the same completion and uploads the packages
+   to the rolling release itself.
+
+   Previous versions' package assets are deliberately NOT deleted. The runbook
+   used to say to delete them; the site links versioned `.deb`/`.rpm`
+   filenames, so removing an old asset 404s a documented download. The rolling
+   release therefore accumulates packages, which is the intended state rather
+   than an oversight.
 4. **Site doc**: update the versioned `.deb`/`.rpm` filenames in
    `inner-warden-site` `client/src/content/docs/installation.md`.
 5. **Verify**: spot-check one binary signature, run the live installer once, and
