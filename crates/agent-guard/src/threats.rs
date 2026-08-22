@@ -1323,8 +1323,17 @@ fn strip_inert_heredoc_bodies(content: &str) -> String {
         return content.to_string();
     };
     let opener_end = caps.get(0).map(|m| m.end()).unwrap_or(0);
-    // Everything up to the delimiter is the command line that opened the body.
-    let header = &content[..opener_end];
+    let opener_start = caps.get(0).map(|m| m.start()).unwrap_or(0);
+    // The command line that opened the body, WITHOUT the `<<'DELIM'` token.
+    //
+    // That token is shell syntax, not an argument, and the delimiter grammar
+    // (`[A-Za-z_][A-Za-z0-9_]*`) accepts credential-shaped words. Leaving it in
+    // meant `cat >> notes.md <<'id_rsa'` was reported as reading a private key,
+    // a false positive earned by the word someone chose to end a here-document
+    // with. Dropping exactly the matched span cannot hide a real path: an
+    // argument sits outside it, so `cat ~/.ssh/id_rsa >> out <<'X'` keeps its
+    // path and still fires.
+    let header = &content[..opener_start];
     if interpreter.is_match(header) {
         return content.to_string();
     }
@@ -5491,6 +5500,68 @@ mod leading_substitution_tests {
         assert_eq!(
             strip_leading_substitutions("$(a $(b) c) rm -rf /"),
             "rm -rf /"
+        );
+    }
+}
+
+#[cfg(test)]
+mod quote_tracking_tests {
+    use super::{contains_unquoted_glob, strip_inert_heredoc_bodies};
+
+    /// The apostrophe inside double quotes. Without the `!double` guard it
+    /// would open a single-quoted run that never closes, and every star after
+    /// it would read as quoted, so a real glob would stop being seen.
+    #[test]
+    fn an_apostrophe_inside_double_quotes_does_not_open_a_quote() {
+        assert!(contains_unquoted_glob("echo \"don't\" /home/*/id_rsa"));
+    }
+
+    /// The mirror case: a double quote inside single quotes. Without the
+    /// `!single` guard it opens a double-quoted run and swallows the rest.
+    #[test]
+    fn a_double_quote_inside_single_quotes_does_not_open_a_quote() {
+        assert!(contains_unquoted_glob("echo '\"' /home/*/id_rsa"));
+    }
+
+    /// The terminator has to match EXACTLY. Comparing the other way round makes
+    /// the first non-matching line the terminator, which leaves the body in and
+    /// puts the finding back.
+    #[test]
+    fn the_body_ends_at_the_delimiter_and_not_before_it() {
+        let cmd = "cat >> /home/me/notes.md <<'MD'\nthe guard named /home/me/.ssh/id_rsa\nMD";
+        assert!(
+            !strip_inert_heredoc_bodies(cmd).contains("id_rsa"),
+            "everything up to the delimiter is data and must be dropped"
+        );
+    }
+
+    /// And the line AFTER the delimiter is command text again, so it stays.
+    #[test]
+    fn what_follows_the_delimiter_is_kept() {
+        let cmd = "cat >> notes.md <<'MD'\ninert text\nMD\ncat /home/me/.ssh/id_rsa";
+        assert!(
+            strip_inert_heredoc_bodies(cmd).contains("id_rsa"),
+            "a real read after the here-document is still a real read"
+        );
+    }
+
+    /// The delimiter line is data too, and the delimiter grammar
+    /// (`[A-Za-z_][A-Za-z0-9_]*`) happily accepts a credential-shaped word.
+    /// Leaving that line in the output turns an ordinary here-document into a
+    /// credential-read finding because of the word someone chose to end it
+    /// with, a false positive earned by punctuation.
+    #[test]
+    fn the_delimiter_line_is_not_command_text() {
+        let key = "id_rsa";
+        let cmd = format!("cat >> /home/me/notes.md <<'{key}'\ninert text\n{key}\nls -la");
+        assert_eq!(
+            strip_inert_heredoc_bodies(&cmd).matches(key).count(),
+            0,
+            "neither the `<<'DELIM'` token nor the terminator line is command text"
+        );
+        assert!(
+            super::check_sensitive_read(&cmd).is_none(),
+            "choosing a credential-shaped delimiter is not reading a credential"
         );
     }
 }
