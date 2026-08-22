@@ -38,6 +38,7 @@ name = "innerwarden"
 path = "src/main.rs"
 
 [dependencies]
+innerwarden-safe-io = { path = "../safe-io" }
 # The guardrail engine. Pure Rust, already Windows-clean (no /proc, cfg(unix),
 # libc, TLS, or C deps on the check-command path). This binary is a thin,
 # additive driver over it - it intentionally does NOT depend on the agent,
