@@ -6,6 +6,7 @@ members = [
     "crates/cli",
     "crates/graph",
     "crates/dashboard-kit",
+    "crates/safe-io",
 ]
 
 [workspace.package]

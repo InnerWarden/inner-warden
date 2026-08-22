@@ -56,16 +56,10 @@ fn open_lock_file(path: &Path) -> std::io::Result<File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        // Mode is this call site's policy, not part of opening safely.
+        options.mode(0o600);
     }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    }
+    innerwarden_safe_io::harden(&mut options);
     let file = options.open(path)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() || is_reparse_or_symlink(&metadata) {
@@ -153,15 +147,19 @@ fn ensure_no_symlink_components(trusted_root: &Path, path: &Path) -> Result<(), 
     Ok(())
 }
 
+/// Open the config for reading, refusing a symlink.
+///
+/// This carried `O_NONBLOCK` alone: no `O_NOFOLLOW`, no Windows reparse flag,
+/// while the WRITE path forty lines above refused symlinks correctly. The
+/// caller then asked `is_reparse_or_symlink` of the opened handle, which cannot
+/// catch it: with the link already followed, `File::metadata()` describes the
+/// TARGET, so a symlink to any readable file reads back as a plain regular file
+/// and is accepted. Reading a config the guard is about to rewrite, through a
+/// link somebody else planted, is the case that check was written to stop.
+///
+/// Now the same shared open as every other site.
 fn open_config(path: &Path) -> std::io::Result<File> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NONBLOCK);
-    }
-    options.open(path)
+    innerwarden_safe_io::open_no_follow(path)
 }
 
 fn regular_config_metadata(file: &File, path: &Path) -> Result<fs::Metadata, String> {
@@ -200,29 +198,7 @@ fn current_bytes_no_symlinks(
     limit: u64,
 ) -> Result<Option<Vec<u8>>, String> {
     ensure_no_symlink_components(trusted_root, path)?;
-    let opened = {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-                .open(path)
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::OpenOptionsExt;
-            const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-            OpenOptions::new()
-                .read(true)
-                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-                .open(path)
-        }
-        #[cfg(not(any(unix, windows)))]
-        {
-            OpenOptions::new().read(true).open(path)
-        }
-    };
+    let opened = innerwarden_safe_io::open_no_follow(path);
     let file = match opened {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -795,5 +771,47 @@ mod tests {
             .file_type()
             .is_symlink());
         assert_eq!(fs::read(target).unwrap(), b"new");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod symlink_read_regression {
+    use super::*;
+
+    /// The config READ path refuses a symlink.
+    ///
+    /// It did not. `open_config` carried `O_NONBLOCK` alone while the write
+    /// path forty lines above refused links correctly, and the
+    /// `is_reparse_or_symlink` check that was supposed to cover it asked the
+    /// question of an already-followed handle, where the answer describes the
+    /// target. So a link planted at the config path was read.
+    ///
+    /// FAILS ON REVERT: give `open_config` its own `OpenOptions` with only
+    /// `O_NONBLOCK` again.
+    #[test]
+    fn a_symlinked_config_is_not_read() {
+        let dir = std::env::temp_dir().join(format!("iw-cfg-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("tempdir");
+
+        let target = dir.join("elsewhere");
+        std::fs::write(&target, b"not-your-config\n").expect("write target");
+        let link = dir.join("config.toml");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+
+        let err = open_config(&link).expect_err("a symlinked config must not open");
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::ELOOP),
+            "expected the open itself to refuse the link, got {err:?}"
+        );
+
+        // And a real file at the same path still opens, so this is a link
+        // refusal and not a broken read path.
+        std::fs::remove_file(&link).expect("unlink");
+        std::fs::write(&link, b"real = true\n").expect("write real config");
+        open_config(&link).expect("a regular config must still open");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

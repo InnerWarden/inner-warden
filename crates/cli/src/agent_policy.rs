@@ -206,17 +206,7 @@ const MAX_POLICY_BYTES: u64 = 1024 * 1024;
 fn read_policy_bytes(path: &Path) -> Result<Option<Vec<u8>>, String> {
     let mut options = OpenOptions::new();
     options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    }
+    innerwarden_safe_io::harden(&mut options);
     let file = match options.open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -388,16 +378,10 @@ fn open_policy_lock(path: &Path) -> Result<std::fs::File, String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        // Mode is this call site's policy, not part of opening safely.
+        options.mode(0o600);
     }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    }
+    innerwarden_safe_io::harden(&mut options);
     let lock = options
         .open(path)
         .map_err(|error| format!("opening {}: {error}", path.display()))?;

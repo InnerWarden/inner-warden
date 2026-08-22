@@ -8,7 +8,7 @@
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -1002,29 +1002,9 @@ fn read_bounded_line(
 }
 
 fn open_source_file(path: &Path) -> std::io::Result<File> {
-    let file = {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-                .open(path)?
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::OpenOptionsExt;
-            const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-            OpenOptions::new()
-                .read(true)
-                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-                .open(path)?
-        }
-        #[cfg(not(any(unix, windows)))]
-        {
-            OpenOptions::new().read(true).open(path)?
-        }
-    };
+    // One shared implementation. This was the third hand copy of a
+    // symlink-safe open in this workspace, and a fourth had already drifted.
+    let file = innerwarden_safe_io::open_no_follow(path)?;
     let metadata = file.metadata()?;
     let unsafe_type = !metadata.is_file()
         || metadata.file_type().is_symlink()
