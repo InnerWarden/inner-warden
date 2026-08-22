@@ -52,7 +52,7 @@ innerwarden-notify = { path = "../notify" }
 innerwarden-graph = { path = "../graph" }
 # Parse the optional [llm] second-opinion config file (user's own endpoint/key).
 serde = { version = "1", features = ["derive"] }
-toml = "0.8"
+toml = "1.1"
 # Expand project-secret deny globs (.env.*, secrets/**) for `contain`. Pure Rust.
 glob = "0.3"
 # Advisory file lock (flock) so concurrent `hook`/`check` processes (multi-agent)
