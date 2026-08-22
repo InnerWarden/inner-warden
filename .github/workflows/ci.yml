@@ -234,6 +234,20 @@ jobs:
       - name: Bundle must not be built out of its own output
         run: npm run bundle:reproducible
 
+      # DD audit D19. Twelve journey specs existed and none of them had ever run
+      # here: `grep playwright .github/workflows/` came back empty. Worse, the
+      # Rust journey contract accepted a spec file CONTAINING the string `test(`
+      # as "executable evidence" that the journey passes, so an entirely broken
+      # journey satisfied the contract as long as the file parsed as a test.
+      #
+      # Only the Community specs run. The enterprise ones belong to the paid
+      # bundle and are not built here.
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+
+      - name: Browser journeys
+        run: npx playwright test tests/community
+
   # Audit SUP-02 / CI-07: the repo had no supply-chain gate. This is it. It runs
   # on every push, so an advisory or an incompatible licence fails a PR instead
   # of being found in a quarterly review.
