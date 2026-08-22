@@ -35,28 +35,123 @@ pub fn asset_for_this_host() -> Option<String> {
     asset_name(std::env::consts::OS, std::env::consts::ARCH)
 }
 
-/// Full download URL for an asset, plus its two sidecars.
+/// The download URL for an asset under a base, plus its two sidecars.
 ///
 /// The sidecars are not optional: [`super::release_verify::verify_release`]
 /// needs both, and a missing one is a failure rather than a skipped check.
-pub fn urls_for(asset: &str) -> (String, String, String) {
-    urls_from(RELEASE_BASE, asset)
-}
-
-/// The three URLs for an asset under an arbitrary base.
 ///
-/// Split from `urls_for` so a test can point the whole download-and-verify path
-/// at a local server. Before this, every test of that path either hit the real
-/// internet or asserted the order of substrings in the source, and the latter is
-/// what shipped `upgrade --check` performing a real upgrade.
+/// The base is a parameter so a test can point the whole download-and-verify
+/// path at a local server. Before that, every test of that path either hit the
+/// real internet or asserted the order of substrings in the source, and the
+/// latter is what shipped `upgrade --check` performing a real upgrade.
 ///
-/// Production has exactly one caller and it passes `RELEASE_BASE`.
+/// Production has exactly one caller and it passes [`RELEASE_BASE`].
 pub fn urls_from(base: &str, asset: &str) -> (String, String, String) {
     (
         format!("{base}/{asset}"),
         format!("{base}/{asset}.sha256"),
         format!("{base}/{asset}.sig"),
     )
+}
+
+/// The asset that names the version the rolling release currently carries.
+///
+/// It is the Scoop manifest, which the release workflow regenerates from the
+/// built binary's own `--version` and uploads alongside the binaries. That makes
+/// it the honest answer to "what would I get?": it is derived from the artifact
+/// rather than from the tag it was cut from, and the workflow refuses to publish
+/// when the two disagree.
+pub const VERSION_MANIFEST_ASSET: &str = "innerwarden.json";
+
+/// URL of the version manifest under an arbitrary base. Split for the same
+/// reason as [`urls_from`]: so a test can serve one.
+pub fn manifest_url_from(base: &str) -> String {
+    format!("{base}/{VERSION_MANIFEST_ASSET}")
+}
+
+/// The version the published release carries, or `None` if the manifest did not
+/// say.
+///
+/// Fails closed into `None` on anything unexpected. A caller must not turn "did
+/// not say" into "an upgrade is available": that is the failure this whole
+/// change exists to remove.
+pub fn published_version(manifest_json: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(manifest_json).ok()?;
+    let raw = v.get("version")?.as_str()?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    Some(raw.to_string())
+}
+
+/// What `innerwarden upgrade --check` established.
+///
+/// A value rather than a printed sentence, so the decision is testable without
+/// a network and without capturing stdout. The previous implementation had no
+/// decision to test: it fetched the `.sha256` sidecar, discarded it, and printed
+/// "Run `innerwarden upgrade` to install it" on any HTTP success, which it said
+/// on 1.3.7 while 1.3.7 was the published release.
+///
+/// The third variant is the point. `--check` must never report an upgrade
+/// because it could not tell, which is the rule [`crate::status`] exists to
+/// enforce: never report "off" when you mean "could not tell".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckOutcome {
+    /// The published build is the one already installed.
+    UpToDate { version: String },
+    /// A different build is published, and `upgrade` would install it.
+    Available {
+        published: String,
+        installed: String,
+    },
+    /// The release answered and did not name a version. Never rendered as an
+    /// available upgrade.
+    Undetermined,
+}
+
+/// Decide what to report from the installed version and the published manifest.
+pub fn check_outcome(installed: &str, manifest_json: &str) -> CheckOutcome {
+    match published_version(manifest_json) {
+        None => CheckOutcome::Undetermined,
+        Some(published) if published == installed => CheckOutcome::UpToDate { version: published },
+        Some(published) => CheckOutcome::Available {
+            published,
+            installed: installed.to_string(),
+        },
+    }
+}
+
+/// The lines `--check` prints, given what it established.
+///
+/// `managed` is taken into account because telling an npm user to run
+/// `innerwarden upgrade` is the same lie in a different place: that command now
+/// refuses, so pointing them at it would waste the round trip.
+pub fn check_lines(outcome: &CheckOutcome, asset: &str, managed: Managed) -> Vec<String> {
+    let install_command = match managed {
+        Managed::Npm => "npm install -g innerwarden@latest",
+        Managed::Direct => "innerwarden upgrade",
+    };
+    match outcome {
+        CheckOutcome::UpToDate { version } => vec![
+            format!("InnerWarden Community {version}"),
+            format!("  Already on the latest build: the published release carries {version} too."),
+            "  Nothing to do.".into(),
+        ],
+        CheckOutcome::Available {
+            published,
+            installed,
+        } => vec![
+            format!("InnerWarden Community {installed}"),
+            format!("  The published release carries {published} ({asset})."),
+            format!("  Run `{install_command}` to install {published}."),
+        ],
+        CheckOutcome::Undetermined => vec![
+            "InnerWarden Community: could not determine the published version.".into(),
+            "  The release answered but did not name a version, so there is nothing".into(),
+            "  to compare against. Not reporting an upgrade on a guess.".into(),
+            "  Nothing was downloaded. The installed binary is untouched.".into(),
+        ],
+    }
 }
 
 /// Where to stage the download: beside the binary being replaced, never in a
@@ -100,6 +195,20 @@ pub fn managed_by(target: &Path) -> Managed {
     } else {
         Managed::Direct
     }
+}
+
+/// Must this invocation stop before anything is downloaded?
+///
+/// Pure, and consulted by `upgrade` BEFORE the first byte is fetched. Until now
+/// `managed_by` had two callers and both were on the failure path, so the npm
+/// hazard was only ever announced to people whose upgrade had already failed for
+/// an unrelated reason. The case it was written for, a user-owned npm prefix,
+/// upgrades successfully and is reverted by the next `npm install -g`.
+///
+/// `check_only` never refuses: reporting a version changes nothing, and the
+/// report names npm's own command instead. `forced` is the user saying they know.
+pub fn npm_refusal_applies(target: &Path, check_only: bool, forced: bool) -> bool {
+    !check_only && !forced && managed_by(target) == Managed::Npm
 }
 
 /// What to tell someone whose binary could not be replaced.
@@ -211,6 +320,54 @@ mod tests {
         assert!(advice.contains("read-only"), "{advice}");
     }
 
+    /// REGRESSION ANCHOR. The npm hazard was detected and documented, and the
+    /// only two callers of `managed_by` were on the FAILURE path.
+    ///
+    /// So the warning appeared only when the replace had also failed, which
+    /// needs a root-owned npm prefix. The install page recommends
+    /// `npm config set prefix ~/.npm-global`, which is user-owned, so the
+    /// replace succeeds: "Upgrade complete", and the next `npm install -g`
+    /// silently puts the old binary back. The one case the advice existed for
+    /// was the one case that never saw it.
+    ///
+    /// FAILS ON REVERT: return `false` unconditionally, i.e. stop consulting
+    /// `managed_by` before the download, and the npm case stops refusing.
+    #[test]
+    fn an_npm_install_is_refused_before_anything_is_downloaded() {
+        let npm = Path::new("/home/lab/.npm-global/lib/node_modules/innerwarden/bin/innerwarden");
+        assert_eq!(managed_by(npm), Managed::Npm, "precondition");
+        assert!(
+            npm_refusal_applies(npm, false, false),
+            "a plain `innerwarden upgrade` on an npm copy must refuse"
+        );
+    }
+
+    /// The three ways the refusal must NOT fire, so it cannot become a blanket
+    /// "upgrade is broken".
+    #[test]
+    fn the_npm_refusal_spares_check_forced_and_direct_installs() {
+        let npm = Path::new("/usr/local/lib/node_modules/innerwarden/bin/innerwarden");
+        let direct = Path::new("/usr/local/bin/innerwarden");
+
+        assert!(
+            !npm_refusal_applies(npm, true, false),
+            "--check changes nothing, so it reports rather than refusing"
+        );
+        assert!(
+            !npm_refusal_applies(npm, false, true),
+            "--yes is the user saying they know what it costs"
+        );
+        assert!(
+            !npm_refusal_applies(direct, false, false),
+            "an installer copy is exactly what upgrade is for"
+        );
+        assert!(
+            !npm_refusal_applies(direct, true, false),
+            "{}",
+            direct.display()
+        );
+    }
+
     #[test]
     fn a_plain_path_is_not_mistaken_for_npm() {
         assert_eq!(
@@ -261,11 +418,130 @@ mod tests {
 
     #[test]
     fn both_sidecars_are_derived_from_the_asset() {
-        let (bin, sha, sig) = urls_for("innerwarden-linux-x86_64");
+        let (bin, sha, sig) = urls_from(RELEASE_BASE, "innerwarden-linux-x86_64");
         assert!(bin.ends_with("/innerwarden-linux-x86_64"));
         assert_eq!(sha, format!("{bin}.sha256"));
         assert_eq!(sig, format!("{bin}.sig"));
         assert!(bin.starts_with("https://"), "never plain http");
+    }
+
+    /// The manifest shape the release actually publishes, trimmed to the field
+    /// this reads. Kept verbatim so a change to the published layout shows up
+    /// here rather than as a silent `Undetermined` on every host.
+    const REAL_MANIFEST: &str = r#"{
+      "version": "1.3.7",
+      "description": "InnerWarden Community Edition",
+      "homepage": "https://innerwarden.com",
+      "architecture": { "64bit": { "hash": "f5cb" } }
+    }"#;
+
+    /// REGRESSION ANCHOR. `upgrade --check` could not answer the one question it
+    /// is asked.
+    ///
+    /// It fetched the `.sha256` sidecar, threw it away, and printed "Run
+    /// `innerwarden upgrade` to install it" whenever the HTTP call succeeded. On
+    /// 1.3.7, with 1.3.7 published, it still said an upgrade was waiting. A check
+    /// that answers "yes" unconditionally is not a check, and users who notice
+    /// stop running it.
+    ///
+    /// FAILS ON REVERT: return `Available` regardless of the versions, which is
+    /// what the old code effectively printed.
+    #[test]
+    fn a_check_on_the_published_version_reports_no_upgrade() {
+        let outcome = check_outcome("1.3.7", REAL_MANIFEST);
+        assert_eq!(
+            outcome,
+            CheckOutcome::UpToDate {
+                version: "1.3.7".into()
+            },
+            "1.3.7 installed against 1.3.7 published is not an upgrade"
+        );
+
+        let lines = check_lines(&outcome, "innerwarden-linux-x86_64", Managed::Direct).join("\n");
+        assert!(
+            lines.contains("Already on the latest build"),
+            "the report must say so in words: {lines}"
+        );
+        assert!(
+            !lines.contains("Run `innerwarden upgrade`"),
+            "there is nothing to install, so do not send anyone to install it: {lines}"
+        );
+    }
+
+    /// The other half: when a newer build IS published, name the version that
+    /// would be installed rather than saying "a build exists".
+    #[test]
+    fn a_check_behind_the_release_names_the_version_it_would_install() {
+        let outcome = check_outcome("1.3.4", REAL_MANIFEST);
+        assert_eq!(
+            outcome,
+            CheckOutcome::Available {
+                published: "1.3.7".into(),
+                installed: "1.3.4".into()
+            }
+        );
+
+        let lines = check_lines(&outcome, "innerwarden-linux-x86_64", Managed::Direct).join("\n");
+        assert!(lines.contains("1.3.7"), "name what would arrive: {lines}");
+        assert!(
+            lines.contains("1.3.4"),
+            "name what is installed, or there is nothing to compare: {lines}"
+        );
+        assert!(lines.contains("Run `innerwarden upgrade`"), "{lines}");
+    }
+
+    /// A manifest that does not name a version must not become "an upgrade is
+    /// available". Never report a verdict when you mean "could not tell".
+    #[test]
+    fn a_manifest_that_names_no_version_is_undetermined_not_available() {
+        for manifest in [
+            "{}",
+            r#"{"version": ""}"#,
+            r#"{"version": 137}"#,
+            "not json at all",
+            "",
+        ] {
+            assert_eq!(
+                check_outcome("1.3.7", manifest),
+                CheckOutcome::Undetermined,
+                "{manifest:?} says nothing about a version"
+            );
+        }
+
+        let lines = check_lines(
+            &CheckOutcome::Undetermined,
+            "innerwarden-linux-x86_64",
+            Managed::Direct,
+        )
+        .join("\n");
+        assert!(
+            !lines.to_lowercase().contains("run `innerwarden upgrade`"),
+            "an unknown state must not be rendered as an available upgrade: {lines}"
+        );
+        assert!(lines.contains("could not determine"), "{lines}");
+    }
+
+    /// An npm-managed install must not be told to run a command that now
+    /// refuses. The check and the upgrade have to agree about what to do next.
+    #[test]
+    fn a_check_on_an_npm_install_points_at_npm() {
+        let outcome = check_outcome("1.3.4", REAL_MANIFEST);
+        let lines = check_lines(&outcome, "innerwarden-linux-x86_64", Managed::Npm).join("\n");
+        assert!(
+            lines.contains("npm install -g innerwarden@latest"),
+            "{lines}"
+        );
+        assert!(
+            !lines.contains("Run `innerwarden upgrade`"),
+            "that command refuses on an npm copy, so do not recommend it: {lines}"
+        );
+    }
+
+    #[test]
+    fn the_version_manifest_sits_beside_the_binaries() {
+        let url = manifest_url_from(RELEASE_BASE);
+        assert_eq!(url, format!("{RELEASE_BASE}/innerwarden.json"));
+        assert!(url.starts_with("https://"), "never plain http");
     }
 
     /// REGRESSION ANCHOR. Staging must be beside the target, not in a shared
