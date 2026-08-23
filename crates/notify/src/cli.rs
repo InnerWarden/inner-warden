@@ -125,13 +125,20 @@ pub fn compute(
             .unwrap_or_default();
         Some(existing.overlay(updates).to_toml())
     };
+    // Plan against the config as it WILL BE, not as it was.
+    //
+    // This read `existing_file`, so `notify --slack-webhook <url> --test` tested
+    // the configuration from before the write. On a fresh config that is no
+    // channels: it sent nothing and said nothing. On a host that already had one
+    // it tested the OLD channel and printed a success line for a channel it had
+    // never contacted, which is worse, because the operator then believes the
+    // one they just set up works.
+    //
+    // Setting a channel and testing it in one command is the obvious thing to
+    // do, `--help` suggests it, and the setup wizard does it.
+    let effective = write.as_deref().or(existing_file);
     let tests = if test {
-        plan(
-            &get_env,
-            existing_file,
-            "innerwarden --test",
-            &test_verdict(),
-        )
+        plan(&get_env, effective, "innerwarden --test", &test_verdict())
     } else {
         Vec::new()
     };
@@ -372,11 +379,20 @@ mod tests {
         }
     }
 
+    /// The name of this test was always right and its assertion was the
+    /// opposite: it pinned `tests[0].url == "https://w"`, the channel that was
+    /// already in the file, while the command being tested had just set
+    /// `https://s`. The comment documented the read-before-write as intended.
+    ///
+    /// What that cost a user: `notify --slack-webhook <url> --test` on a fresh
+    /// config tested nothing and said nothing, and on a host that already had a
+    /// channel it tested the OLD one and printed success for a channel it had
+    /// never contacted.
+    ///
+    /// FAILS ON REVERT: plan against `existing_file` instead of the merged
+    /// config.
     #[test]
     fn compute_set_and_test_from_file_fires_the_just_set_channel() {
-        // Set slack AND --test: the test fan-out reads the SAME existing file, so a
-        // channel already in the file fires. (The just-written slack is not yet in
-        // `existing_file`, mirroring cmd's read-before-write; the file webhook is.)
         let a = compute(
             &args(&["--slack-webhook", "https://s", "--test"]),
             Some(r#"webhook_url = "https://w""#),
@@ -385,8 +401,44 @@ mod tests {
         match a {
             Action::Apply { write, tests } => {
                 assert!(write.unwrap().contains("https://s"));
-                assert_eq!(tests.len(), 1);
-                assert_eq!(tests[0].url, "https://w");
+                let urls: Vec<&str> = tests.iter().map(|t| t.url.as_str()).collect();
+                assert!(
+                    urls.contains(&"https://s"),
+                    "the channel just set MUST be tested, that is the whole point \
+                     of combining --set with --test: {urls:?}"
+                );
+                assert!(
+                    urls.contains(&"https://w"),
+                    "and the channel already configured is still live, so it is \
+                     tested too: {urls:?}"
+                );
+            }
+            other => panic!("expected Apply, got {other:?}"),
+        }
+    }
+
+    /// The case that silently did nothing: no config yet, set a channel and
+    /// test it in one command.
+    ///
+    /// FAILS ON REVERT: with `existing_file` there is no config to plan
+    /// against, so `tests` comes back empty and the command prints nothing.
+    #[test]
+    fn setting_the_first_channel_and_testing_it_actually_sends_something() {
+        let a = compute(
+            &args(&["--slack-webhook", "https://first", "--test"]),
+            None,
+            env(&[]),
+        );
+        match a {
+            Action::Apply { write, tests } => {
+                assert!(write.unwrap().contains("https://first"));
+                assert_eq!(
+                    tests.len(),
+                    1,
+                    "a fresh config plus --test must test the channel just set, \
+                     not silently send nothing"
+                );
+                assert_eq!(tests[0].url, "https://first");
             }
             other => panic!("expected Apply, got {other:?}"),
         }
