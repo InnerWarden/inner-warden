@@ -12,6 +12,7 @@
 use std::io::Read;
 use std::sync::Arc;
 
+use innerwarden_agent_guard::agents_ops;
 use innerwarden_agent_guard::mcp_proxy::enforce::ProxyMode;
 use innerwarden_agent_guard::mcp_proxy::router::ProxyDecision;
 use innerwarden_agent_guard::mcp_proxy::transport::{run_proxy, ProxyConfig};
@@ -946,47 +947,97 @@ fn uninstall_targets_whole_install(rest: &[String]) -> bool {
 /// A typo like `--purge-all` or `--preveiw` did the same thing.
 const UNINSTALL_SELF_FLAGS: &[&str] = &["--purge", "--all", "--dry-run", "--help", "-h"];
 
-/// What a full uninstall WOULD remove, without removing any of it.
-fn uninstall_plan_lines(home: &std::path::Path) -> Vec<String> {
-    let mut out = vec![format!("{COMMUNITY_NAME} would remove:")];
-    // Read the same file the removal would edit, so the plan cannot claim a
-    // hook that is not there or miss one that is.
-    let hooked = std::fs::read_to_string(home.join(".claude/settings.json"))
-        .ok()
-        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-        .map(|v| hook::has_iwguard_wiring(&v))
-        .unwrap_or(false);
-    out.push(format!(
-        "  hook    : {}",
-        if hooked {
-            "the PreToolUse hook in ~/.claude/settings.json"
-        } else {
-            "none wired"
-        }
-    ));
+/// Everything a full uninstall would touch, read from disk once.
+///
+/// Split from the formatting below on purpose: a plan built inline from
+/// `home_dir()` and `current_exe()` can only be tested against whatever the test
+/// runner's own machine happens to look like, which is how the plan came to omit
+/// the agent wiring without a single test noticing.
+struct UninstallFacts {
+    /// Agent configurations that carry InnerWarden wiring right now.
+    wiring: Vec<agents_ops::WiringToUnwind>,
+    config_dir: Option<String>,
+    binary: Option<String>,
+}
+
+fn uninstall_facts(home: &std::path::Path) -> UninstallFacts {
     let config_dir = home.join(".config/innerwarden");
+    UninstallFacts {
+        // Read the same files the removal would edit, so the plan cannot claim
+        // wiring that is not there or miss wiring that is.
+        wiring: agents_ops::wiring_to_unwind(home),
+        config_dir: config_dir
+            .exists()
+            .then(|| config_dir.display().to_string()),
+        binary: std::env::current_exe()
+            .ok()
+            .map(|exe| exe.display().to_string()),
+    }
+}
+
+/// What a full uninstall WOULD remove, without removing any of it. Pure.
+fn uninstall_plan_lines_from(facts: &UninstallFacts) -> Vec<String> {
+    let mut out = vec![format!("{COMMUNITY_NAME} would remove:")];
+    if facts.wiring.is_empty() {
+        out.push("  agents  : no InnerWarden wiring found in any agent configuration".into());
+    } else {
+        for (index, wired) in facts.wiring.iter().enumerate() {
+            let label = if index == 0 {
+                "  agents  : "
+            } else {
+                "            "
+            };
+            out.push(format!(
+                "{label}{} - unwire {}",
+                wired.agent,
+                wired
+                    .paths
+                    .iter()
+                    .map(|p| format!("~/{p}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
     out.push(format!(
         "  config  : {}",
-        if config_dir.exists() {
-            config_dir.display().to_string()
-        } else {
-            "none".to_string()
-        }
+        facts.config_dir.as_deref().unwrap_or("none")
     ));
-    out.push(match std::env::current_exe() {
-        Ok(exe) => format!("  binary  : {}", exe.display()),
-        Err(_) => "  binary  : could not resolve this executable's path".to_string(),
-    });
+    out.push(format!(
+        "  binary  : {}",
+        facts
+            .binary
+            .as_deref()
+            .unwrap_or("could not resolve this executable's path")
+    ));
+    if !facts.wiring.is_empty() {
+        out.push(String::new());
+        out.push("Those configurations start InnerWarden by that exact binary path, so the".into());
+        out.push("wiring is unwound FIRST. If any of it cannot be unwound, nothing else".into());
+        out.push("is removed and the command fails: a deleted binary would break every".into());
+        out.push("MCP server still pointing at it, with nothing left to repair them.".into());
+    }
     out.push(String::new());
     out.push("Nothing was changed. Re-run without --dry-run to do it.".into());
     out
 }
 
-/// Full self-uninstall: remove the guard hook from the wired agent, delete the
-/// config directory, and remove the binary. `--purge` is accepted for parity
-/// with the installer (local state lives under the config dir, so it is already
-/// removed). Reversible in the sense that reinstalling restores everything;
-/// nothing outside InnerWarden's own paths is touched.
+fn uninstall_plan_lines(home: &std::path::Path) -> Vec<String> {
+    uninstall_plan_lines_from(&uninstall_facts(home))
+}
+
+/// Full self-uninstall: unwind the guard out of every agent that starts it,
+/// delete the config directory, and remove the binary. `--purge` is accepted for
+/// parity with the installer (local state lives under the config dir, so it is
+/// already removed). Reversible in the sense that reinstalling restores
+/// everything; nothing outside InnerWarden's own paths is touched.
+///
+/// The unwind is a GATE, not a step. It used to be one call to
+/// `hook::uninstall_hook`, so an agent wired through MCP (Cursor, Codex,
+/// OpenClaw, any generic `mcp.json`) kept `<HOME>/bin/innerwarden proxy --` as
+/// the command for every one of its servers. The binary was deleted underneath
+/// them, every server failed to start, nothing had warned, and the tool that
+/// could have unwound them no longer existed.
 fn cmd_uninstall_self(purge: bool) -> std::process::ExitCode {
     let home = match hook::home_dir() {
         Ok(h) => h,
@@ -997,15 +1048,34 @@ fn cmd_uninstall_self(purge: bool) -> std::process::ExitCode {
     };
     println!("Uninstalling {COMMUNITY_NAME}...");
 
-    // 1. Remove the agent hook (claude-code is the wired agent today).
-    match hook::uninstall_hook(&home, "claude-code", None) {
-        Ok((path, removed)) if removed > 0 => println!(
-            "  hook    : removed {removed} entr{} from {}",
-            if removed == 1 { "y" } else { "ies" },
-            path.display()
-        ),
-        Ok(_) => println!("  hook    : none wired"),
-        Err(e) => eprintln!("  hook    : could not remove ({e})"),
+    // 1. Unwind every agent (PreToolUse hook AND MCP proxy wrappers) BEFORE
+    //    anything is deleted, and stop here if any of it survives.
+    let unwound = agents_ops::unwind_all_wiring(&home);
+    let mut reported = 0usize;
+    for result in &unwound {
+        match result.effect {
+            // Failures go to stderr. A partially failed uninstall that reports
+            // itself on stdout is invisible to a stderr watcher, and the exit
+            // code below is the only other thing that could have said so.
+            agents_ops::DisconnectEffect::Failed => {
+                eprintln!("  agents  : {}", strip_agent_indent(&result.line));
+                reported += 1;
+            }
+            agents_ops::DisconnectEffect::Unwound => {
+                println!("  agents  : {}", strip_agent_indent(&result.line));
+                reported += 1;
+            }
+            agents_ops::DisconnectEffect::NothingWired => {}
+        }
+    }
+    if reported == 0 {
+        println!("  agents  : no InnerWarden wiring found in any agent configuration");
+    }
+    if !agents_ops::unwind_left_nothing_behind(&unwound) {
+        for line in uninstall_blocked_lines(std::env::current_exe().ok().as_deref()) {
+            eprintln!("{line}");
+        }
+        return std::process::ExitCode::from(1);
     }
 
     // 2. Remove the config directory (guard config + API key + local state).
@@ -1040,8 +1110,47 @@ fn cmd_uninstall_self(purge: bool) -> std::process::ExitCode {
     }
 
     println!();
-    println!("{COMMUNITY_NAME} removed. Restart your agent to drop the hook.");
+    println!(
+        "{COMMUNITY_NAME} removed. Restart your agents so they pick up their own \
+         configuration again."
+    );
     std::process::ExitCode::SUCCESS
+}
+
+/// The agent lines carry their own two-space indent for `agents disconnect`.
+/// Reuse the text without doubling the indent under the `  agents  :` label.
+fn strip_agent_indent(line: &str) -> &str {
+    line.strip_prefix("  ").unwrap_or(line)
+}
+
+/// What to say when the unwind failed and the uninstall therefore stopped. Pure.
+///
+/// This is the whole point of the gate, so it has to be printed, exit non-zero,
+/// and give the operator the command to run again. The rejected version pushed
+/// the same "failed" text and then deleted the binary anyway, printed
+/// "InnerWarden Community removed" and returned success.
+fn uninstall_blocked_lines(exe: Option<&std::path::Path>) -> Vec<String> {
+    let retry = match exe {
+        Some(path) => format!("{} uninstall", path.display()),
+        None => format!("{} uninstall", prog()),
+    };
+    let preview = match exe {
+        Some(path) => format!("{} uninstall --dry-run", path.display()),
+        None => format!("{} uninstall --dry-run", prog()),
+    };
+    vec![
+        String::new(),
+        format!("{COMMUNITY_NAME} was NOT removed."),
+        "Some agent wiring above could not be unwound, and those agents still start".into(),
+        "every one of their MCP servers by running this binary. Deleting it now would".into(),
+        "break them with nothing left able to repair them, so nothing else was touched:".into(),
+        "the config directory and the binary are still here.".into(),
+        String::new(),
+        "Fix the reason printed above (usually file permissions or a config that no".into(),
+        "longer parses), then run:".into(),
+        format!("    {preview}"),
+        format!("    {retry}"),
+    ]
 }
 
 /// `innerwarden serve [--bind IP:PORT]` - expose the guardrail over plain HTTP on
@@ -1288,7 +1397,11 @@ fn help_text() -> String {
            {p} uninstall claude-code     remove that hook (leaves other settings untouched)\n  \
            {p} upgrade                   update to the latest signed release (verifies before replacing)\n  \
          {p} host <command>            run a command in the Active Defence host layer\n  \
-           {p} uninstall                 remove InnerWarden entirely: hook, config, and the binary\n  \
+           {p} uninstall [--dry-run]     remove InnerWarden entirely: unwire every connected agent\n  \
+           \x20                                (PreToolUse hook AND MCP proxy wrappers in mcp.json /\n  \
+           \x20                                config.toml), then the config dir, then the binary.\n  \
+           \x20                                If any wiring cannot be unwound it stops and removes\n  \
+           \x20                                nothing. --dry-run prints the plan and changes nothing.\n  \
            {p} agents [connect [--monitor]|disconnect [--all|<name>]]\n  \
            \x20                                find AI agents on this machine + connect the guard\n  \
            {p} agents auto-connect [--monitor|--off|status]\n  \
@@ -1358,6 +1471,91 @@ mod tests {
         );
     }
 
+    fn facts_with_cursor_wiring() -> UninstallFacts {
+        UninstallFacts {
+            wiring: vec![agents_ops::WiringToUnwind {
+                agent: "cursor".into(),
+                paths: vec![".cursor/mcp.json".into()],
+            }],
+            config_dir: Some("/home/u/.config/innerwarden".into()),
+            binary: Some("/home/u/bin/innerwarden".into()),
+        }
+    }
+
+    /// Both the help and the PLAN must name the agent-unwiring step.
+    ///
+    /// The old guard asserted only the substring "remove InnerWarden entirely",
+    /// which stayed true the entire time `uninstall` was removing the binary out
+    /// from under Cursor's MCP wiring. A test that cannot fail on the drift it
+    /// exists to catch is not a guard, so this one asserts the CONTENT of the
+    /// plan: the agent, its config file, and the fact that the wiring goes first.
+    #[test]
+    fn help_and_plan_both_name_the_agent_unwiring_step() {
+        let help = help_text();
+        assert!(
+            help.contains("MCP proxy wrappers"),
+            "--help must say uninstall unwires MCP wiring, not just the hook. Got:\n{help}"
+        );
+        assert!(
+            help.contains("mcp.json"),
+            "--help must name the file it rewrites. Got:\n{help}"
+        );
+
+        let plan = uninstall_plan_lines_from(&facts_with_cursor_wiring()).join("\n");
+        assert!(
+            plan.contains("cursor") && plan.contains(".cursor/mcp.json"),
+            "the plan must name the agent and the config it would rewrite. Got:\n{plan}"
+        );
+        assert!(
+            plan.contains("/home/u/bin/innerwarden"),
+            "the plan must still name the binary. Got:\n{plan}"
+        );
+        assert!(
+            plan.contains("nothing else"),
+            "the plan must say a failed unwind removes nothing else. Got:\n{plan}"
+        );
+        assert!(
+            plan.contains("Nothing was changed."),
+            "a preview must still say it changed nothing. Got:\n{plan}"
+        );
+    }
+
+    /// With no wiring anywhere, the plan says so rather than inventing agents.
+    #[test]
+    fn plan_with_no_wiring_says_so_and_names_no_agent() {
+        let plan = uninstall_plan_lines_from(&UninstallFacts {
+            wiring: Vec::new(),
+            config_dir: None,
+            binary: None,
+        })
+        .join("\n");
+        assert!(plan.contains("no InnerWarden wiring found"), "{plan}");
+        assert!(plan.contains("  config  : none"), "{plan}");
+        assert!(!plan.contains("nothing else"), "{plan}");
+    }
+
+    /// The refusal has to be actionable: say it stopped, and give the command.
+    #[test]
+    fn a_blocked_uninstall_says_nothing_was_removed_and_how_to_retry() {
+        let text = uninstall_blocked_lines(Some(std::path::Path::new("/home/u/bin/innerwarden")))
+            .join("\n");
+        assert!(text.contains("was NOT removed"), "{text}");
+        assert!(
+            text.contains("/home/u/bin/innerwarden uninstall"),
+            "the retry command must be the exact binary path: {text}"
+        );
+        assert!(
+            text.contains("--dry-run"),
+            "and a way to see what is left: {text}"
+        );
+        // Falls back to the program name when the path cannot be resolved.
+        let fallback = uninstall_blocked_lines(None).join("\n");
+        assert!(
+            fallback.contains(&format!("{} uninstall", prog())),
+            "{fallback}"
+        );
+    }
+
     /// A command that exists and is not in `--help` may as well not exist.
     ///
     /// `dry-run` and `enforce` have been dispatched for a long time and were
@@ -1385,12 +1583,22 @@ mod tests {
         );
     }
 
+    /// The mode commands must be LISTED, not merely mentioned.
+    ///
+    /// This asserted the bare substring "dry-run", which any other line
+    /// containing `--dry-run` satisfies. The uninstall entry now documents its
+    /// own `--dry-run` flag, so the substring form would have gone on passing
+    /// with the `dry-run` COMMAND deleted from the listing entirely. Same shape
+    /// as `help_documents_the_status_command`: match the listing line.
     #[test]
     fn help_documents_the_two_mode_commands() {
         let help = help_text();
         for verb in ["dry-run", "enforce"] {
+            let listed = help
+                .lines()
+                .any(|line| line.trim_start().starts_with(&format!("{} {verb}", prog())));
             assert!(
-                help.contains(verb),
+                listed,
                 "`{verb}` is a real command; a command absent from --help is a \
                  command nobody can find. Got:\n{help}"
             );

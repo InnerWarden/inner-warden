@@ -31,7 +31,15 @@ fn scratch_graph() -> &'static std::path::Path {
 /// The CLI under test, pointed at a disposable record by default. A test that
 /// asserts on the record sets `IW_GRAPH_FILE` again; the later value wins.
 fn cli() -> Command {
-    let mut command = Command::new(bin());
+    cli_at(bin())
+}
+
+/// The same disposable environment, for a chosen copy of the binary.
+///
+/// `uninstall` deletes `current_exe()`, so the uninstall tests must never run
+/// the build output itself.
+fn cli_at(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut command = Command::new(program);
     command.env("IW_GRAPH_FILE", scratch_graph());
     command
 }
@@ -842,4 +850,146 @@ fn no_test_spawns_the_cli_without_a_disposable_record() {
              use the cli() helper so the suite cannot write the developer's real graph"
         );
     }
+}
+
+/// A disposable copy of the binary, so `uninstall` deletes that and not the
+/// build output every other test needs.
+#[cfg(unix)]
+fn disposable_binary(dir: &std::path::Path) -> std::path::PathBuf {
+    let copy = dir.join("innerwarden");
+    std::fs::copy(bin(), &copy).expect("copy the binary under test");
+    copy
+}
+
+/// An `mcp.json` with one ordinary stdio server, exactly what a user has before
+/// InnerWarden touches anything.
+#[cfg(unix)]
+fn seed_cursor_config(home: &std::path::Path) {
+    std::fs::create_dir_all(home.join(".cursor")).unwrap();
+    std::fs::write(
+        home.join(".cursor/mcp.json"),
+        r#"{"mcpServers":{"filesystem":{"command":"npx","args":["-y","server-filesystem"]}}}"#,
+    )
+    .unwrap();
+}
+
+/// REGRESSION ANCHOR: `uninstall` must not delete the binary while an agent
+/// still starts its MCP servers by running it.
+///
+/// After `agents connect cursor`, every server in `~/.cursor/mcp.json` spawns
+/// through `<binary> proxy --`. `uninstall` only ever removed the Claude hook,
+/// so it deleted that binary and exited 0. Every Cursor MCP server then failed
+/// to start, nothing had warned, and the tool that could have unwound them was
+/// gone.
+///
+/// The first attempt at the fix ran the unwind, printed its `failed: ...` line,
+/// and then deleted the binary anyway and reported success. So this asserts the
+/// three things that make the fix real: a NON-ZERO exit, the wiring still
+/// intact, and the binary still on disk.
+///
+/// FAILS ON REVERT (either half): drop the unwind and the dry-run names no
+/// agent while the wiring survives a "successful" uninstall; drop the gate and
+/// the binary is gone with `mcp.json` still pointing at it.
+#[cfg(unix)]
+#[test]
+fn uninstall_will_not_delete_itself_while_mcp_wiring_survives() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = tempfile::TempDir::new().unwrap();
+    let bindir = tempfile::TempDir::new().unwrap();
+    let exe = disposable_binary(bindir.path());
+    seed_cursor_config(home.path());
+
+    // Wire Cursor for real: this is what makes every server start through us.
+    let connect = cli_at(&exe)
+        .args(["agents", "connect", "cursor"])
+        .env("HOME", home.path())
+        .output()
+        .expect("agents connect");
+    let mcp_path = home.path().join(".cursor/mcp.json");
+    let wired = std::fs::read_to_string(&mcp_path).unwrap();
+    assert!(
+        wired.contains(exe.to_str().unwrap()),
+        "premise: cursor must now start its servers through the binary. connect said {}\n{wired}",
+        String::from_utf8_lossy(&connect.stdout)
+    );
+
+    // 1. The preview must NAME that wiring. It used to name only the hook, the
+    //    config dir and the binary.
+    let plan = cli_at(&exe)
+        .args(["uninstall", "--dry-run"])
+        .env("HOME", home.path())
+        .output()
+        .expect("uninstall --dry-run");
+    let plan_out = String::from_utf8_lossy(&plan.stdout);
+    assert!(
+        plan_out.contains("cursor") && plan_out.contains(".cursor/mcp.json"),
+        "the plan must name the MCP wiring it would rewrite:\n{plan_out}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&mcp_path).unwrap(),
+        wired,
+        "a preview must change nothing"
+    );
+
+    // 2. Make the unwind impossible, the way a read-only config directory does.
+    let dir = home.path().join(".cursor");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    if std::fs::write(dir.join(".probe"), b"x").is_ok() {
+        // Running as root: the premise cannot hold, so prove nothing.
+        let _ = std::fs::remove_file(dir.join(".probe"));
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        return;
+    }
+
+    let blocked = cli_at(&exe)
+        .arg("uninstall")
+        .env("HOME", home.path())
+        .output()
+        .expect("uninstall");
+    let stderr = String::from_utf8_lossy(&blocked.stderr);
+    assert!(
+        !blocked.status.success(),
+        "an uninstall that could not unwind the wiring must exit non-zero.\nstdout:{}\nstderr:{stderr}",
+        String::from_utf8_lossy(&blocked.stdout)
+    );
+    assert!(
+        stderr.contains("was NOT removed"),
+        "the refusal must be on STDERR, where a partially failed uninstall is \
+         visible to whoever is watching for one:\n{stderr}"
+    );
+    assert!(
+        exe.exists(),
+        "the binary that is still wired into cursor must survive"
+    );
+    assert!(
+        std::fs::read_to_string(&mcp_path)
+            .unwrap()
+            .contains(exe.to_str().unwrap()),
+        "and the wiring it refused to unwind must still be there"
+    );
+
+    // 3. Fix the reason, retry: now it unwinds and only then removes itself.
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let done = cli_at(&exe)
+        .arg("uninstall")
+        .env("HOME", home.path())
+        .output()
+        .expect("uninstall retry");
+    assert!(
+        done.status.success(),
+        "stdout:{}\nstderr:{}",
+        String::from_utf8_lossy(&done.stdout),
+        String::from_utf8_lossy(&done.stderr)
+    );
+    let restored = std::fs::read_to_string(&mcp_path).unwrap();
+    assert!(
+        !restored.contains(exe.to_str().unwrap()),
+        "cursor must be back on its own command:\n{restored}"
+    );
+    assert!(
+        restored.contains("npx"),
+        "and it must be the ORIGINAL command, not an empty file:\n{restored}"
+    );
+    assert!(!exe.exists(), "only now may the binary go");
 }

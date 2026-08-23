@@ -1023,47 +1023,267 @@ pub fn connect_one(
     connect_one_result(home, r, guard_bin, strict, monitor).line
 }
 
-fn disconnect_one(home: &Path, r: &AgentStatus) -> String {
-    if r.hookable {
-        return match hook::uninstall_hook(home, &r.name, None) {
-            Ok((_, n)) if n > 0 => format!("  {}, disconnected", r.name),
-            Ok(_) => format!("  {}, was not connected", r.name),
-            Err(e) => format!("  {}, failed: {e}", r.name),
+/// Machine-readable outcome of removing InnerWarden's wiring from one agent.
+///
+/// Callers must not decide anything by reading the human line. `uninstall` is
+/// the reason this exists: it printed whatever the string API returned,
+/// INCLUDING `failed: ...`, then deleted the binary and exited 0. Every MCP
+/// server still wrapped by that binary then failed to start, and the tool that
+/// could have unwound them was gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisconnectEffect {
+    /// Wiring was found and is gone.
+    Unwound,
+    /// Nothing of ours was in this agent's configuration.
+    NothingWired,
+    /// Wiring is there and could NOT be removed. Nothing downstream of this may
+    /// treat the agent as free of InnerWarden.
+    Failed,
+}
+
+/// One agent's unwind outcome plus the line to show a human.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisconnectResult {
+    pub agent: String,
+    pub effect: DisconnectEffect,
+    pub line: String,
+}
+
+/// What one configuration surface (hook, `mcp.json`, or TOML) reported.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SurfaceOutcome {
+    effect: DisconnectEffect,
+    /// Present only on `Failed`: why, so the operator can fix it and retry.
+    detail: Option<String>,
+}
+
+impl SurfaceOutcome {
+    fn ok(effect: DisconnectEffect) -> Self {
+        Self {
+            effect,
+            detail: None,
+        }
+    }
+
+    fn failed(detail: String) -> Self {
+        Self {
+            effect: DisconnectEffect::Failed,
+            detail: Some(detail),
+        }
+    }
+}
+
+/// Fold one agent's per-surface outcomes into that agent's outcome. Pure.
+///
+/// A single failed surface decides the whole agent. A partially unwound agent
+/// is a broken agent, and must never read as done.
+fn combine_surface_outcomes(agent: &str, outcomes: &[SurfaceOutcome]) -> DisconnectResult {
+    let failures: Vec<&str> = outcomes
+        .iter()
+        .filter_map(|o| o.detail.as_deref())
+        .collect();
+    if !failures.is_empty() {
+        return DisconnectResult {
+            agent: agent.to_string(),
+            effect: DisconnectEffect::Failed,
+            line: format!("  {agent}, failed: {}", failures.join("; ")),
         };
+    }
+    if outcomes.is_empty() {
+        return DisconnectResult {
+            agent: agent.to_string(),
+            effect: DisconnectEffect::NothingWired,
+            line: format!("  {agent}, nothing to disconnect"),
+        };
+    }
+    if outcomes
+        .iter()
+        .any(|o| o.effect == DisconnectEffect::Unwound)
+    {
+        return DisconnectResult {
+            agent: agent.to_string(),
+            effect: DisconnectEffect::Unwound,
+            line: format!("  {agent}, disconnected"),
+        };
+    }
+    DisconnectResult {
+        agent: agent.to_string(),
+        effect: DisconnectEffect::NothingWired,
+        line: format!("  {agent}, was not connected"),
+    }
+}
+
+fn unwind_hook_surface(home: &Path, agent: &str) -> SurfaceOutcome {
+    match hook::uninstall_hook(home, agent, None) {
+        Ok((_, n)) if n > 0 => SurfaceOutcome::ok(DisconnectEffect::Unwound),
+        Ok(_) => SurfaceOutcome::ok(DisconnectEffect::NothingWired),
+        Err(e) => SurfaceOutcome::failed(e),
+    }
+}
+
+fn unwind_mcp_json_surface(home: &Path, relative: &str) -> SurfaceOutcome {
+    let path = home.join(relative);
+    let (cfg, source) = match read_json_for_update(home, &path, false) {
+        Ok(Some(pair)) => pair,
+        Ok(None) => return SurfaceOutcome::ok(DisconnectEffect::NothingWired),
+        Err(error) => return SurfaceOutcome::failed(error),
+    };
+    let (restored, n) = mcp_wire::unwrap(cfg);
+    if n == 0 {
+        return SurfaceOutcome::ok(DisconnectEffect::NothingWired);
+    }
+    match write_json(home, &path, &restored, &source, false) {
+        Ok(()) => SurfaceOutcome::ok(DisconnectEffect::Unwound),
+        Err(e) => SurfaceOutcome::failed(e),
+    }
+}
+
+fn unwind_mcp_toml_surface(home: &Path, relative: &str) -> SurfaceOutcome {
+    let path = home.join(relative);
+    let (mut doc, source) = match read_toml_for_update(home, &path, false) {
+        Ok(Some(pair)) => pair,
+        Ok(None) => return SurfaceOutcome::ok(DisconnectEffect::NothingWired),
+        Err(error) => return SurfaceOutcome::failed(error),
+    };
+    let n = mcp_wire_toml::unwrap_toml(&mut doc);
+    if n == 0 {
+        return SurfaceOutcome::ok(DisconnectEffect::NothingWired);
+    }
+    match write_toml(home, &path, &doc, &source, false) {
+        Ok(()) => SurfaceOutcome::ok(DisconnectEffect::Unwound),
+        Err(e) => SurfaceOutcome::failed(e),
+    }
+}
+
+/// Remove InnerWarden's wiring from EVERY surface this agent carries, and say
+/// what actually happened.
+///
+/// The surfaces are checked in sequence, NOT as `else if`. `hookable` used to
+/// `return` before the MCP branches ever ran, so an agent that carries both a
+/// PreToolUse hook and an `mcp.json` had its hook removed, was reported
+/// "disconnected", and kept every MCP server routed through the guard binary.
+pub fn disconnect_one_result(home: &Path, r: &AgentStatus) -> DisconnectResult {
+    let mut outcomes = Vec::new();
+    if r.hookable {
+        outcomes.push(unwind_hook_surface(home, &r.name));
     }
     if let Some(rel) = &r.mcp_json {
-        let path = home.join(rel);
-        let (cfg, source) = match read_json_for_update(home, &path, false) {
-            Ok(Some(pair)) => pair,
-            Ok(None) => return format!("  {} - was not connected", r.name),
-            Err(error) => return format!("  {} - failed: {error}", r.name),
-        };
-        let (restored, n) = mcp_wire::unwrap(cfg);
-        if n == 0 {
-            return format!("  {}, was not connected", r.name);
-        }
-        return match write_json(home, &path, &restored, &source, false) {
-            Ok(()) => format!("  {}, disconnected", r.name),
-            Err(e) => format!("  {}, failed: {e}", r.name),
-        };
+        outcomes.push(unwind_mcp_json_surface(home, rel));
     }
     if let Some(rel) = &r.mcp_toml {
-        let path = home.join(rel);
-        let (mut doc, source) = match read_toml_for_update(home, &path, false) {
-            Ok(Some(pair)) => pair,
-            Ok(None) => return format!("  {} - was not connected", r.name),
-            Err(error) => return format!("  {} - failed: {error}", r.name),
-        };
-        let n = mcp_wire_toml::unwrap_toml(&mut doc);
-        if n == 0 {
-            return format!("  {}, was not connected", r.name);
-        }
-        return match write_toml(home, &path, &doc, &source, false) {
-            Ok(()) => format!("  {}, disconnected", r.name),
-            Err(e) => format!("  {}, failed: {e}", r.name),
-        };
+        outcomes.push(unwind_mcp_toml_surface(home, rel));
     }
-    format!("  {}, nothing to disconnect", r.name)
+    combine_surface_outcomes(&r.name, &outcomes)
+}
+
+fn disconnect_one(home: &Path, r: &AgentStatus) -> String {
+    disconnect_one_result(home, r).line
+}
+
+/// A configuration file that currently carries InnerWarden wiring.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WiringToUnwind {
+    pub agent: String,
+    /// `$HOME`-relative configuration files that carry our wiring right now.
+    pub paths: Vec<String>,
+}
+
+/// Build a removal target from a reviewed agent, independent of discovery.
+///
+/// Discovery answers "is this agent here"; uninstall must answer "is our wiring
+/// here". They are not the same question: a `~/.claude/settings.json` that no
+/// longer parses drops the row from discovery while the hook is still in the
+/// file, and an uninstalled agent's config keeps whatever we wrote into it.
+fn removal_target(known: &crate::agents::Known) -> AgentStatus {
+    AgentStatus {
+        name: known.name.to_string(),
+        pids: Vec::new(),
+        installed: false,
+        evidence: Vec::new(),
+        hookable: known.hookable,
+        mcp_json: known.mcp_json.map(str::to_string),
+        mcp_toml: known.mcp_toml.map(str::to_string),
+        guarded: false,
+        mode: None,
+    }
+}
+
+/// Every agent configuration a full uninstall must walk: every reviewed wiring
+/// path plus anything discovery found on top (generic MCP clients).
+///
+/// The plan and the removal both go through here, so `--dry-run` cannot name a
+/// smaller set than the removal touches.
+fn removal_targets(home: &Path) -> Vec<AgentStatus> {
+    let mut targets: Vec<AgentStatus> = KNOWN
+        .iter()
+        .filter(|k| k.hookable || k.mcp_json.is_some() || k.mcp_toml.is_some())
+        .map(removal_target)
+        .collect();
+    for row in rows(home) {
+        if row.guardable() && !targets.iter().any(|t| t.name == row.name) {
+            targets.push(row);
+        }
+    }
+    targets.sort_by(|a, b| a.name.cmp(&b.name));
+    targets
+}
+
+/// The configuration files that carry InnerWarden wiring right now, per agent.
+///
+/// This is what a full uninstall would have to unwind, and it is what
+/// `uninstall --dry-run` must show: without it the preview named the hook, the
+/// config directory and the binary, and said nothing about the `mcp.json` files
+/// whose every server starts by running that exact binary path.
+pub fn wiring_to_unwind(home: &Path) -> Vec<WiringToUnwind> {
+    let mut out = Vec::new();
+    for target in removal_targets(home) {
+        let mut paths = Vec::new();
+        if target.hookable {
+            let relative = ".claude/settings.json";
+            if read_json(&home.join(relative)).is_some_and(|v| hook::has_iwguard_wiring(&v)) {
+                paths.push(relative.to_string());
+            }
+        }
+        if let Some(rel) = &target.mcp_json {
+            if read_json(&home.join(rel)).is_some_and(|v| mcp_wire::has_guard_wiring(&v)) {
+                paths.push(rel.clone());
+            }
+        }
+        if let Some(rel) = &target.mcp_toml {
+            if read_toml(&home.join(rel)).is_some_and(|d| mcp_wire_toml::has_guard_wiring_toml(&d))
+            {
+                paths.push(rel.clone());
+            }
+        }
+        if !paths.is_empty() {
+            out.push(WiringToUnwind {
+                agent: target.name,
+                paths,
+            });
+        }
+    }
+    out
+}
+
+/// Unwind InnerWarden's wiring from every agent on this machine.
+///
+/// A full uninstall MUST run this and check [`unwind_left_nothing_behind`]
+/// before it deletes anything else. Deleting the binary while an agent still
+/// spawns its MCP servers through it breaks those servers and removes the only
+/// tool that could have repaired them.
+pub fn unwind_all_wiring(home: &Path) -> Vec<DisconnectResult> {
+    removal_targets(home)
+        .iter()
+        .map(|target| disconnect_one_result(home, target))
+        .collect()
+}
+
+/// Pure: is there no InnerWarden wiring left that we failed to remove?
+///
+/// The uninstall gate. `false` means at least one agent still starts through
+/// the guard binary, so the binary must stay where it is.
+pub fn unwind_left_nothing_behind(results: &[DisconnectResult]) -> bool {
+    !results.iter().any(|r| r.effect == DisconnectEffect::Failed)
 }
 
 /// What to say when the scan matched nothing.
@@ -1318,6 +1538,166 @@ fn read_guard_mode(home: &Path, agent: &str) -> Option<GuardMode> {
         // whole point of showing the mode is so nobody believes they are only
         // recording while the guard is refusing things.
         (false, false) => Some(GuardMode::Enforce),
+    }
+}
+
+#[cfg(test)]
+mod unwind_tests {
+    use super::*;
+
+    fn wired_mcp_json(home: &Path, relative: &str, guard_bin: &str) {
+        let path = home.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let open = serde_json::json!({
+            "mcpServers": {
+                "filesystem": {"command": "npx", "args": ["-y", "server-filesystem"]}
+            }
+        });
+        let (wrapped, n) = mcp_wire::wrap(open, guard_bin, false);
+        assert_eq!(n, 1, "fixture must actually be wired");
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&wrapped).unwrap() + "\n",
+        )
+        .unwrap();
+    }
+
+    /// A failed surface decides the whole agent. Pure fold, no I/O.
+    ///
+    /// `uninstall` used to push whatever line came back and carry on. A fold
+    /// that let one success outvote one failure would put that behaviour back
+    /// behind a type.
+    #[test]
+    fn one_failed_surface_makes_the_whole_agent_failed() {
+        let mixed = [
+            SurfaceOutcome::ok(DisconnectEffect::Unwound),
+            SurfaceOutcome::failed("Permission denied".into()),
+        ];
+        let result = combine_surface_outcomes("cursor", &mixed);
+        assert_eq!(result.effect, DisconnectEffect::Failed);
+        assert!(
+            result.line.contains("Permission denied"),
+            "the reason must survive into the line: {}",
+            result.line
+        );
+        assert!(!unwind_left_nothing_behind(&[result]));
+
+        let all_ok = [
+            SurfaceOutcome::ok(DisconnectEffect::Unwound),
+            SurfaceOutcome::ok(DisconnectEffect::NothingWired),
+        ];
+        let ok = combine_surface_outcomes("cursor", &all_ok);
+        assert_eq!(ok.effect, DisconnectEffect::Unwound);
+        assert!(unwind_left_nothing_behind(&[ok]));
+
+        let untouched = combine_surface_outcomes("cursor", &[]);
+        assert_eq!(untouched.effect, DisconnectEffect::NothingWired);
+        assert!(unwind_left_nothing_behind(&[untouched]));
+    }
+
+    /// An agent that carries BOTH a hook and MCP wiring must lose both.
+    ///
+    /// `hookable` used to `return` before the MCP branches ran, so this agent
+    /// was reported "disconnected" with every MCP server still spawning through
+    /// the guard binary. FAILS ON REVERT: restore the early `return` and the
+    /// mcp.json still contains the proxy command.
+    #[test]
+    fn a_hookable_agent_that_also_has_mcp_wiring_loses_both() {
+        let home = tempfile::TempDir::new().unwrap();
+        let guard_bin = "/opt/innerwarden/bin/innerwarden";
+        hook::install_hook(
+            home.path(),
+            "claude-code",
+            None,
+            Path::new(guard_bin),
+            false,
+            false,
+        )
+        .unwrap();
+        wired_mcp_json(home.path(), ".claude/mcp.json", guard_bin);
+
+        let both = AgentStatus {
+            name: "claude-code".into(),
+            pids: Vec::new(),
+            installed: true,
+            evidence: Vec::new(),
+            hookable: true,
+            mcp_json: Some(".claude/mcp.json".into()),
+            mcp_toml: None,
+            guarded: true,
+            mode: None,
+        };
+        let result = disconnect_one_result(home.path(), &both);
+
+        assert_eq!(result.effect, DisconnectEffect::Unwound, "{result:?}");
+        let settings = std::fs::read_to_string(home.path().join(".claude/settings.json")).unwrap();
+        assert!(
+            !settings.contains(guard_bin),
+            "the hook must be gone: {settings}"
+        );
+        let mcp = std::fs::read_to_string(home.path().join(".claude/mcp.json")).unwrap();
+        assert!(
+            !mcp.contains(guard_bin),
+            "the MCP wrapper must be gone too, not left pointing at a binary that \
+             is about to be deleted: {mcp}"
+        );
+    }
+
+    /// The uninstall preview must name the MCP configs it would rewrite.
+    ///
+    /// FAILS ON REVERT: a plan built only from `.claude/settings.json` reports
+    /// nothing here, which is exactly what shipped: `uninstall --dry-run` named
+    /// the hook, the config dir and the binary while Cursor's every server ran
+    /// through `<HOME>/bin/innerwarden proxy --`.
+    #[test]
+    fn wiring_to_unwind_names_the_mcp_configs_not_only_the_hook() {
+        let home = tempfile::TempDir::new().unwrap();
+        let guard_bin = "/opt/innerwarden/bin/innerwarden";
+        wired_mcp_json(home.path(), ".cursor/mcp.json", guard_bin);
+
+        let plan = wiring_to_unwind(home.path());
+
+        let cursor = plan
+            .iter()
+            .find(|w| w.agent == "cursor")
+            .unwrap_or_else(|| panic!("cursor must be in the plan, got {plan:?}"));
+        assert_eq!(cursor.paths, vec![".cursor/mcp.json".to_string()]);
+    }
+
+    /// Wiring we cannot remove must be reported as FAILED, not as done.
+    #[cfg(unix)]
+    #[test]
+    fn wiring_that_cannot_be_removed_is_reported_as_failed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempfile::TempDir::new().unwrap();
+        let guard_bin = "/opt/innerwarden/bin/innerwarden";
+        wired_mcp_json(home.path(), ".cursor/mcp.json", guard_bin);
+        let dir = home.path().join(".cursor");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        // Root ignores the mode bits, so the premise would be false there.
+        let writable = std::fs::write(dir.join(".probe"), b"x").is_ok();
+        if writable {
+            let _ = std::fs::remove_file(dir.join(".probe"));
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+            return;
+        }
+
+        let results = unwind_all_wiring(home.path());
+        let cursor = results.iter().find(|r| r.agent == "cursor").unwrap();
+
+        assert_eq!(cursor.effect, DisconnectEffect::Failed, "{cursor:?}");
+        assert!(
+            !unwind_left_nothing_behind(&results),
+            "the uninstall gate must refuse to open: {results:?}"
+        );
+        let mcp = std::fs::read_to_string(dir.join("mcp.json")).unwrap();
+        assert!(
+            mcp.contains(guard_bin),
+            "premise: the wiring really is still there"
+        );
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 }
 
