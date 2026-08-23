@@ -226,13 +226,13 @@ pub fn assess(facts: &Facts) -> Vec<Finding> {
                 what: "An agent is running but nothing is wired to the guard, so \
                        its commands are not screened."
                     .into(),
-                next: "innerwarden hook <your-agent>".into(),
+                next: "innerwarden agents connect --all --monitor".into(),
             }),
             Some(false) => out.push(Finding::NotWorking {
                 what: "No agent is wired, and none of the agents I know by name \
                        are running."
                     .into(),
-                next: "start your agent, then: innerwarden hook <your-agent>".into(),
+                next: "start your agent, then: innerwarden agents connect --all --monitor".into(),
             }),
             None => out.push(Finding::Unknown {
                 what: "Could not tell whether any agent is running.".into(),
@@ -609,11 +609,31 @@ mod tests {
         f.wired_agents.clear();
         f.any_agent_seen = Some(true);
         let findings = assess(&f);
-        assert!(findings.iter().any(|x| matches!(
-            x,
-            Finding::NotWorking { what, next }
-                if what.contains("not screened") && next.contains("hook")
-        )));
+        let next = findings
+            .iter()
+            .find_map(|x| match x {
+                Finding::NotWorking { what, next } if what.contains("not screened") => Some(next),
+                _ => None,
+            })
+            .expect("an unwired running agent must be called out");
+
+        // The remedy must be a command that WORKS, not merely a plausible one.
+        //
+        // It used to be `innerwarden hook <your-agent>`, and this assertion
+        // pinned the substring "hook", so the string could rot without the test
+        // noticing. It had: run with stdin closed, `innerwarden hook claude-code`
+        // prints nothing, wires nothing and exits 0. A beginner following the
+        // one line status gives them ends up exactly as unprotected as before,
+        // with no error to tell them so.
+        //
+        // `agents connect --all --monitor` is what setup.rs names as the
+        // non-interactive user's primary action, and it reports what it did per
+        // integration.
+        assert_eq!(next, "innerwarden agents connect --all --monitor");
+        assert!(
+            !next.contains("hook <"),
+            "a placeholder the user has to fill in is not a command they can run"
+        );
     }
 
     /// Zero decisions is genuinely ambiguous and must be said so, not dressed
