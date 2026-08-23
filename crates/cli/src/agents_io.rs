@@ -7,10 +7,6 @@ use crate::agent_policy::{self, DesiredMode};
 
 /// `innerwarden agents [connect|disconnect [--all|<name>]]` - discover + connect.
 pub fn cmd(rest: &[String]) -> std::process::ExitCode {
-    if matches!(rest, [flag] if flag == "--help" || flag == "-h") {
-        print_agents_help();
-        return std::process::ExitCode::SUCCESS;
-    }
     if rest.first().map(String::as_str) != Some("auto-connect") {
         if let Err(error) = agents_ops::validate_args(rest) {
             eprintln!("innerwarden agents: {error}");
@@ -106,12 +102,24 @@ fn is_known_agent_name(name: &str) -> bool {
         .any(|known| known.name.eq_ignore_ascii_case(name))
 }
 
+/// Usage for `innerwarden agents`. Printed by `help::for_invocation` before
+/// dispatch, and by the error paths below when an argument was not understood.
+pub(crate) fn help_text() -> String {
+    let p = crate::prog();
+    format!(
+        "{p} agents [list]\n\
+         {p} agents connect [<name>|--all] [--monitor|--strict]\n\
+         {p} agents disconnect [<name>|--all]\n\
+         {p} agents auto-connect [--monitor|--off|status]\n\
+         \n  \
+         Find the AI agents on this machine and wire the guard into them.\n  \
+         Automatic setup is opt-in and monitor-only; unknown flags fail without\n  \
+         changing anything."
+    )
+}
+
 fn print_agents_help() {
-    println!("innerwarden agents [list]");
-    println!("innerwarden agents connect [<name>|--all] [--monitor|--strict]");
-    println!("innerwarden agents disconnect [<name>|--all]");
-    println!("innerwarden agents auto-connect [--monitor|--off|status]");
-    println!("  Automatic setup is opt-in and monitor-only; unknown flags fail without changes.");
+    println!("{}", help_text());
 }
 
 fn command_target(rest: &[String]) -> Option<&str> {
@@ -152,11 +160,6 @@ fn prepare_policy_for_agent_command(home: &std::path::Path, rest: &[String]) -> 
 fn cmd_auto_connect(home: &std::path::Path, rest: &[String]) -> std::process::ExitCode {
     if rest.is_empty() || matches!(rest, [command] if command == "status") {
         return print_auto_connect_status(home);
-    }
-
-    if matches!(rest, [flag] if flag == "--help" || flag == "-h") {
-        print_auto_connect_help();
-        return std::process::ExitCode::SUCCESS;
     }
 
     let enabled = match rest {
@@ -240,19 +243,27 @@ fn print_auto_connect_status(home: &std::path::Path) -> std::process::ExitCode {
     }
 }
 
+/// Usage for the nested `innerwarden agents auto-connect`. Printed by
+/// `help::for_invocation` before dispatch, and by the error path above.
+pub(crate) fn auto_connect_help_text() -> String {
+    let p = crate::prog();
+    format!(
+        "{p} agents auto-connect [--monitor|--off|status]\n  \
+         Opt in to background discovery while the local dashboard runs.\n\
+         \n  \
+         --monitor   connect newly discovered supported agents in observe-only mode\n  \
+         --off       stop future automatic wiring; existing integrations stay configured\n  \
+         status      show policy schema, state, interval, and explicit exclusions\n\
+         \n  \
+         New wiring and misplaced-only hook repairs are monitor-only.\n  \
+         Recognized Claude hooks may be canonicalized; effective Bash enforcement is\n  \
+         preserved. Existing MCP wrappers and excluded, unknown, or invalid\n  \
+         integrations are unchanged."
+    )
+}
+
 fn print_auto_connect_help() {
-    println!("innerwarden agents auto-connect [--monitor|--off|status]");
-    println!("  opt in to background discovery while the local dashboard runs");
-    println!("  --monitor   connect newly discovered supported agents in observe-only mode");
-    println!("  --off       stop future automatic wiring; existing integrations stay configured");
-    println!("  status      show policy schema, state, interval, and explicit exclusions");
-    println!("  New wiring and misplaced-only hook repairs are monitor-only.");
-    println!(
-        "  Recognized Claude hooks may be canonicalized; effective Bash enforcement is preserved."
-    );
-    println!(
-        "  Existing MCP wrappers and excluded, unknown, or invalid integrations are unchanged."
-    );
+    println!("{}", auto_connect_help_text());
 }
 
 #[cfg(test)]

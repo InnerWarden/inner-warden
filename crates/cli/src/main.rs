@@ -26,6 +26,7 @@ mod contain_io;
 mod dashboard;
 mod first_run;
 mod graph_io;
+mod help;
 mod notify_io;
 mod observe;
 mod observe_io;
@@ -150,6 +151,22 @@ fn dashboard_answers(bind: &str) -> bool {
 
 fn main() -> std::process::ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // Usage is answered BEFORE the verb runs. Every subcommand used to parse
+    // `--help` for itself, or not at all, and `innerwarden allow --help` wrote
+    // the literal string `--help` into the guardrail's own bypass list and
+    // printed success. Doing it here means a verb that reaches its handler is a
+    // verb that was not asked to explain itself, so no future subcommand can
+    // reintroduce that by forgetting to parse a flag. `help` knows the two
+    // carve-outs: `check` screens what it is given, and `contain`/`proxy` wrap a
+    // child command whose flags are not ours.
+    if let Some(verb) = args.first() {
+        if let Some(usage) = help::for_invocation(verb, &args[1..]) {
+            println!("{usage}");
+            return std::process::ExitCode::SUCCESS;
+        }
+    }
+
     match args.first().map(String::as_str) {
         Some("check") => cmd_check(&args[1..]),
         Some("serve") => cmd_serve(&args[1..]),
@@ -668,8 +685,12 @@ fn cmd_mode(rest: &[String], monitor: bool) -> std::process::ExitCode {
 /// non-Bash tool call would get the guardrail uninstalled within the hour.
 /// Idempotent; preserves existing settings.
 /// Parsed `install` arguments (agent target, optional settings path, block-review
-/// flag). `Help` requests the usage text; `Err` carries a message for an
-/// unexpected flag.
+/// flag). `Err` carries a message for an unexpected flag.
+///
+/// There is no `Help` here any more: usage is answered in `main` before dispatch
+/// (see `help::for_invocation`), so `--help` cannot reach this parser. If it ever
+/// did it would be refused as the unexpected argument it is, which writes
+/// nothing.
 #[derive(Debug, PartialEq)]
 enum InstallArgs {
     Run {
@@ -678,7 +699,6 @@ enum InstallArgs {
         block_review: bool,
         monitor: bool,
     },
-    Help,
     Err(String),
 }
 
@@ -737,7 +757,6 @@ fn parse_install_args(rest: &[String]) -> InstallArgs {
             }
             "--block-review" => block_review = true,
             "--monitor" => monitor = true,
-            "--help" | "-h" => return InstallArgs::Help,
             other if !other.starts_with('-') => agent = other.to_string(),
             other => return InstallArgs::Err(format!("unexpected argument `{other}`")),
         }
@@ -758,10 +777,6 @@ fn cmd_install(rest: &[String]) -> std::process::ExitCode {
             block_review,
             monitor,
         } => (agent, settings, block_review, monitor),
-        InstallArgs::Help => {
-            print_help();
-            return std::process::ExitCode::SUCCESS;
-        }
         InstallArgs::Err(msg) => {
             eprintln!("innerwarden install: {msg}");
             return std::process::ExitCode::from(2);
@@ -851,10 +866,6 @@ fn cmd_install(rest: &[String]) -> std::process::ExitCode {
 /// cannot reliably remove its own file cross-platform) - it prints where it is so
 /// the user can `rm` it if they want it gone.
 fn cmd_uninstall(rest: &[String]) -> std::process::ExitCode {
-    if rest.iter().any(|a| a == "--help" || a == "-h") {
-        print_help();
-        return std::process::ExitCode::SUCCESS;
-    }
     // Bare `uninstall` (or with --all / --purge) removes InnerWarden entirely:
     // the agent hook, the config directory, and the binary. `uninstall
     // claude-code` (a named agent) removes only that agent's hook.
@@ -891,10 +902,6 @@ fn cmd_uninstall(rest: &[String]) -> std::process::ExitCode {
         InstallArgs::Run {
             agent, settings, ..
         } => (agent, settings),
-        InstallArgs::Help => {
-            print_help();
-            return std::process::ExitCode::SUCCESS;
-        }
         InstallArgs::Err(msg) => {
             eprintln!("innerwarden uninstall: {msg}");
             return std::process::ExitCode::from(2);
@@ -952,7 +959,8 @@ fn cmd_uninstall(rest: &[String]) -> std::process::ExitCode {
 
 /// `uninstall` with no named agent (empty, or only flags like `--all` /
 /// `--purge`) targets the whole install; a named agent such as `claude-code`
-/// targets only that agent's hook. `--help` is handled before this is called.
+/// targets only that agent's hook. Usage is answered before dispatch, so a help
+/// flag never reaches here.
 fn uninstall_targets_whole_install(rest: &[String]) -> bool {
     !rest.iter().any(|a| !a.starts_with('-'))
 }
@@ -969,7 +977,12 @@ fn uninstall_targets_whole_install(rest: &[String]) -> bool {
 /// needed)", which reads as the safe way to find out what would be removed. It
 /// was discarded, and running it removed the guard hook from a live machine.
 /// A typo like `--purge-all` or `--preveiw` did the same thing.
-const UNINSTALL_SELF_FLAGS: &[&str] = &["--purge", "--all", "--dry-run", "--help", "-h"];
+///
+/// `--help` and `-h` are deliberately NOT in this list. Usage is answered before
+/// dispatch, so they cannot arrive here; if that interception ever regressed,
+/// accepting them here would turn `innerwarden uninstall --help` into a full
+/// uninstall, whereas refusing them changes nothing.
+const UNINSTALL_SELF_FLAGS: &[&str] = &["--purge", "--all", "--dry-run"];
 
 /// What a full uninstall WOULD remove, without removing any of it.
 fn uninstall_plan_lines(home: &std::path::Path) -> Vec<String> {
@@ -1077,17 +1090,10 @@ fn cmd_serve(rest: &[String]) -> std::process::ExitCode {
     let mut bind = DEFAULT_BIND.to_string();
     let mut it = rest.iter();
     while let Some(a) = it.next() {
-        match a.as_str() {
-            "--bind" => {
-                if let Some(v) = it.next() {
-                    bind = v.clone();
-                }
+        if a.as_str() == "--bind" {
+            if let Some(v) = it.next() {
+                bind = v.clone();
             }
-            "--help" | "-h" => {
-                print_help();
-                return std::process::ExitCode::SUCCESS;
-            }
-            _ => {}
         }
     }
 
@@ -1206,10 +1212,6 @@ fn cmd_proxy(rest: &[String]) -> std::process::ExitCode {
                 label = v.clone();
             }
             "--error-response" => error_response = true,
-            "--help" | "-h" => {
-                print_help();
-                return std::process::ExitCode::SUCCESS;
-            }
             "--" => {
                 server_cmd = it.cloned().collect();
                 break;
@@ -1627,9 +1629,14 @@ mod tests {
                 monitor: true,
             }
         );
-        assert_eq!(parse_install_args(&["--help".into()]), InstallArgs::Help);
         assert!(matches!(
             parse_install_args(&["--bogus".into()]),
+            InstallArgs::Err(_)
+        ));
+        // `--help` is answered before dispatch and cannot arrive here. If it
+        // ever did, it must be refused, never taken as an agent name.
+        assert!(matches!(
+            parse_install_args(&["--help".into()]),
             InstallArgs::Err(_)
         ));
     }
