@@ -3,6 +3,77 @@
 All notable changes to InnerWarden are documented here. This project
 follows semantic versioning.
 
+## 1.4.0 - 2026-08-23
+
+The first ten minutes. A new user could install this, follow what it printed,
+and end up unprotected without an error anywhere.
+
+A minor rather than a patch because `upgrade` gained exit codes and the bare
+`innerwarden` command prints something different on a machine with no config.
+
+### Fixed
+
+- `innerwarden allow --help` wrote the literal string `--help` into the
+  guardrail's own bypass list and printed success. `check "--help"` then returned
+  ALLOW with `[suppressed: allow --help]`. `mute --help` was worse: it lands in
+  mute categories, and a muted category suppresses every rule in it against every
+  command. `setup --help` ran the wizard.
+
+  Help is now answered before dispatch for all 24 subcommands. `check` keeps
+  screening: its argument IS the command being examined, so `--help` counts as
+  help only when it is the sole non-output-flag argument, and
+  `check rm -rf / --help` still denies.
+
+- `agents connect` said nothing about restarting. The hook is read only at agent
+  startup, so a user returned to a running session believing it was screened when
+  it was not. Every sibling path already said it. Silent false protection is
+  worse than an error.
+
+- `status` was dispatched and appeared nowhere in `--help`, and it hardcoded the
+  guard mode as unknown while the data it needed was already in hand. The result
+  was that there was NO configuration in which `status` reported everything as
+  fine: the command written for beginners could never tell one they were done.
+  It now appears in help, reads the mode, probes the dashboard, and distinguishes
+  "nothing recorded yet" from "the record could not be read".
+
+- A fresh install reported itself broken. A directory that did not exist yet was
+  treated as unwritable, so `innerwarden graph` on a new machine printed
+  "InnerWarden has not recorded for 0 seconds (actions lost,
+  graph_directory_unwritable)" and the dashboard served the same. A fresh box is
+  not a broken one.
+
+- `upgrade --check` fetched a checksum, discarded it, and told you to upgrade
+  whatever the answer was, including when already current. It now reads the
+  published manifest and says which it is.
+
+- `upgrade` silently fought npm. A binary under a user-owned npm prefix upgraded
+  with no warning and the next `npm install -g` reverted it, with no message from
+  either tool. The site itself recommends that prefix. It now refuses unless
+  forced.
+
+- `uninstall` removed the Claude hook and left every other agent's MCP wiring
+  pointing at a deleted binary.
+
+### Changed
+
+- A bare `innerwarden` on a machine with no configuration prints six lines saying
+  nothing is wired yet, with the two commands to run, instead of 24 subcommands
+  with `setup` on line one. `innerwarden --help` is unchanged.
+
+- `upgrade` exits 2 when it refuses an npm-managed copy, and `upgrade --check`
+  exits 1 when it cannot determine the published version.
+
+### Internal
+
+- CI now refuses an em dash on any line a change adds. The paid repo's version of
+  that gate had been green since it was written without ever running: a shallow
+  checkout has no `origin/master`, and its missing-base branch exited 0. This one
+  fetches the base and refuses if it cannot.
+
+- Coverage is measured with a floor derived from a measurement rather than
+  chosen, browser journeys run instead of being counted, and the updater and
+  release verifier are exercised rather than having their own source read back.
+
 ## 1.3.7 - 2026-08-21
 
 Posture reporting. The dashboard could describe a control as working when

@@ -754,7 +754,7 @@ dependencies = [
 
 [[package]]
 name = "innerwarden"
-version = "1.3.7"
+version = "1.4.0"
 dependencies = [
  "base64",
  "dialoguer",
@@ -779,7 +779,7 @@ dependencies = [
 
 [[package]]
 name = "innerwarden-agent-guard"
-version = "1.3.7"
+version = "1.4.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -806,7 +806,7 @@ dependencies = [
 
 [[package]]
 name = "innerwarden-dashboard-kit"
-version = "1.3.7"
+version = "1.4.0"
 dependencies = [
  "chrono",
  "innerwarden-safe-io",
@@ -822,7 +822,7 @@ dependencies = [
 
 [[package]]
 name = "innerwarden-graph"
-version = "1.3.7"
+version = "1.4.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -830,7 +830,7 @@ dependencies = [
 
 [[package]]
 name = "innerwarden-notify"
-version = "1.3.7"
+version = "1.4.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -839,7 +839,7 @@ dependencies = [
 
 [[package]]
 name = "innerwarden-safe-io"
-version = "1.3.7"
+version = "1.4.0"
 dependencies = [
  "libc",
 ]
