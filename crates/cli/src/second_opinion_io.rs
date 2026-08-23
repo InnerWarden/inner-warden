@@ -60,20 +60,20 @@ fn call_llm(cfg: &LlmConfig, command: &str) -> Option<Value> {
     // model; the redacted form keeps the dangerous SHAPE, so the verdict is unaffected.
     let command = innerwarden_agent_guard::redact::redact_secrets(command).text;
     let body = build_body(&cfg.model, &command);
-    let mut req = ureq::post(&cfg.url)
-        .timeout(std::time::Duration::from_secs(20))
-        .set("Content-Type", "application/json");
+    let mut req = crate::http_io::agent_with_timeout(std::time::Duration::from_secs(20))
+        .post(&cfg.url)
+        .header("Content-Type", "application/json");
     // Key precedence: the named env var (zero key-at-rest) first, then the 0600
     // key file the wizard / `llm set-key` wrote. Resolved off-thread of the config.
     if let Some(key) = cfg.resolve_key(|k| std::env::var(k).ok(), read_key_file) {
         req = if cfg.is_azure() {
-            req.set("api-key", &key)
+            req.header("api-key", &key)
         } else {
-            req.set("Authorization", &format!("Bearer {key}"))
+            req.header("Authorization", &format!("Bearer {key}"))
         };
     }
     let resp = req.send_json(body).ok()?;
-    resp.into_json::<Value>().ok()
+    resp.into_body().read_json::<Value>().ok()
 }
 
 /// Expand a leading `~/` to `$HOME`, then read the file (trimmed by the caller).
@@ -162,27 +162,32 @@ pub fn store_key(key: &str) -> std::io::Result<std::path::PathBuf> {
 /// unreachable). Best-effort: a slow endpoint just times out into an Err.
 pub fn verify_endpoint(cfg: &LlmConfig) -> Result<(), String> {
     let body = build_body(&cfg.model, "echo hello");
-    let mut req = ureq::post(&cfg.url)
-        .timeout(std::time::Duration::from_secs(12))
-        .set("Content-Type", "application/json");
+    let mut req = crate::http_io::agent_with_timeout(std::time::Duration::from_secs(12))
+        .post(&cfg.url)
+        .header("Content-Type", "application/json");
     if let Some(key) = cfg.resolve_key(|k| std::env::var(k).ok(), read_key_file) {
         req = if cfg.is_azure() {
-            req.set("api-key", &key)
+            req.header("api-key", &key)
         } else {
-            req.set("Authorization", &format!("Bearer {key}"))
+            req.header("Authorization", &format!("Bearer {key}"))
         };
     }
     match req.send_json(body) {
         Ok(_) => Ok(()),
-        Err(ureq::Error::Status(401, _)) | Err(ureq::Error::Status(403, _)) => {
-            Err("the API key was rejected (401/403) - check the key".into())
-        }
-        Err(ureq::Error::Status(404, _)) => Err(format!(
-            "model / deployment \"{}\" not found (404) - check the model name",
-            cfg.model
-        )),
-        Err(ureq::Error::Status(code, _)) => Err(format!("endpoint returned HTTP {code}")),
-        Err(ureq::Error::Transport(t)) => Err(format!("could not reach {} ({t})", cfg.url)),
+        // Matched on the STATUS rather than on ureq's variants: the enum grew
+        // from two arms to ten in ureq 3, and an exhaustive list would keep
+        // compiling while quietly losing cases.
+        Err(e) => match crate::http_io::status_of(&e) {
+            Some(401) | Some(403) => {
+                Err("the API key was rejected (401/403) - check the key".into())
+            }
+            Some(404) => Err(format!(
+                "model / deployment \"{}\" not found (404) - check the model name",
+                cfg.model
+            )),
+            Some(code) => Err(format!("endpoint returned HTTP {code}")),
+            None => Err(format!("could not reach {} ({e})", cfg.url)),
+        },
     }
 }
 
