@@ -168,6 +168,13 @@ jobs:
       # consistent, and nothing tied it to the Rust workspace. The two drifted
       # (npm 1.0.6 against workspace 1.0.7), so the channel a user installs from
       # can lag the version the code claims to be, silently.
+      # The npm launcher is the first thing a large share of users ever run, and
+      # what it says when it cannot find its binary was wrong in the case that
+      # happens most: `uninstall` leaves the launcher and removes the binary, and
+      # it then reported the running platform as UNSUPPORTED. It had no tests.
+      - name: The npm launcher's missing-binary message
+        run: node npm/test/shim-message.test.js
+
       - name: npm package version matches the Rust workspace
         if: runner.os == 'Linux'
         run: |
