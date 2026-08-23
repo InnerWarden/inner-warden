@@ -1154,27 +1154,52 @@ fn list_lines(home: &Path) -> Vec<String> {
     out
 }
 
-fn connect_lines(
+/// Everything one `agents` invocation produced: the human-facing lines, plus the
+/// machine-readable count of integrations a CONNECT left wired.
+///
+/// The count exists so a caller can key follow-up advice (for example "restart
+/// your agents so they reload the hook") on what actually happened. Callers must
+/// take it from here rather than scanning `lines` for a word: the same defect
+/// that kept mode/setup counts at zero when punctuation changed is waiting for
+/// anyone who greps this text, and "was not connected" contains "connected"
+/// while "already guarded (MCP proxy, monitor)" does not.
+///
+/// `configured` is zero for every command that is not `connect`, so keying on it
+/// cannot fire after a `disconnect` or a plain listing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunOutcome {
+    pub lines: Vec<String>,
+    pub configured: usize,
+}
+
+fn connect_outcome(
     home: &Path,
     target: Option<&str>,
     strict: bool,
     monitor: bool,
     guard_bin: &str,
-) -> Vec<String> {
+) -> RunOutcome {
     let rows = rows(home);
     let targets = connect_targets(&rows, target);
     if targets.is_empty() {
-        return vec![match target {
-            Some(name) => format!(
-                "innerwarden agents connect - failed: no guardable agent named `{name}` was found"
-            ),
-            None => "innerwarden agents connect - no guardable agent found. Run `innerwarden agents` to see what's detected.".into(),
-        }];
+        return RunOutcome {
+            lines: vec![match target {
+                Some(name) => format!(
+                    "innerwarden agents connect - failed: no guardable agent named `{name}` was found"
+                ),
+                None => "innerwarden agents connect - no guardable agent found. Run `innerwarden agents` to see what's detected.".into(),
+            }],
+            configured: 0,
+        };
     }
-    targets
+    let results: Vec<ConnectResult> = targets
         .iter()
-        .map(|r| connect_one(home, r, guard_bin, strict, monitor))
-        .collect()
+        .map(|r| connect_one_result(home, r, guard_bin, strict, monitor))
+        .collect();
+    RunOutcome {
+        configured: results.iter().filter(|r| r.configured()).count(),
+        lines: results.into_iter().map(|r| r.line).collect(),
+    }
 }
 
 fn disconnect_lines(home: &Path, target: Option<&str>) -> Vec<String> {
@@ -1242,11 +1267,15 @@ pub fn validate_args(args: &[String]) -> Result<(), String> {
 }
 
 /// Run `agents [connect|disconnect [--all|<name>]]` using an explicitly selected
-/// Community guardrail executable. Active Defence uses this entrypoint so it
-/// never writes its host-management CLI into a `proxy` / `hook` configuration.
-pub fn run_with_guard_bin(home: &Path, args: &[String], guard_bin: &str) -> Vec<String> {
+/// Community guardrail executable, reporting what the run actually configured.
+/// Active Defence uses this entrypoint so it never writes its host-management
+/// CLI into a `proxy` / `hook` configuration.
+pub fn run_with_guard_bin_outcome(home: &Path, args: &[String], guard_bin: &str) -> RunOutcome {
     if let Err(error) = validate_args(args) {
-        return vec![format!("innerwarden agents - failed: {error}")];
+        return RunOutcome {
+            lines: vec![format!("innerwarden agents - failed: {error}")],
+            configured: 0,
+        };
     }
     match args.first().map(String::as_str) {
         Some("connect") => {
@@ -1261,24 +1290,43 @@ pub fn run_with_guard_bin(home: &Path, args: &[String], guard_bin: &str) -> Vec<
                 .iter()
                 .find(|a| !a.starts_with("--"))
                 .map(String::as_str);
-            connect_lines(home, target, strict, monitor, guard_bin)
+            connect_outcome(home, target, strict, monitor, guard_bin)
         }
-        Some("disconnect") => disconnect_lines(
-            home,
-            args.get(1)
-                .filter(|a| !a.starts_with("--"))
-                .map(String::as_str),
-        ),
-        _ => list_lines(home),
+        // Only `connect` can leave something newly wired, so every other command
+        // reports zero configured integrations and cannot trigger connect-only
+        // follow-up advice.
+        Some("disconnect") => RunOutcome {
+            lines: disconnect_lines(
+                home,
+                args.get(1)
+                    .filter(|a| !a.starts_with("--"))
+                    .map(String::as_str),
+            ),
+            configured: 0,
+        },
+        _ => RunOutcome {
+            lines: list_lines(home),
+            configured: 0,
+        },
     }
+}
+
+/// Lines-only adapter for callers that do not act on what was configured.
+pub fn run_with_guard_bin(home: &Path, args: &[String], guard_bin: &str) -> Vec<String> {
+    run_with_guard_bin_outcome(home, args, guard_bin).lines
 }
 
 /// Community CLI entrypoint: its current executable is the guardrail that agent
 /// configurations must launch, so resolving it here is safe and keeps callers
 /// simple.
-pub fn run(home: &Path, args: &[String]) -> Vec<String> {
+pub fn run_outcome(home: &Path, args: &[String]) -> RunOutcome {
     let bin = guard_bin();
-    run_with_guard_bin(home, args, &bin)
+    run_with_guard_bin_outcome(home, args, &bin)
+}
+
+/// Lines-only adapter over [`run_outcome`].
+pub fn run(home: &Path, args: &[String]) -> Vec<String> {
+    run_outcome(home, args).lines
 }
 
 /// What the wiring for this agent actually does: record, or block.
@@ -1506,6 +1554,98 @@ mod tests {
             .iter()
             .filter(|row| row.name == "another-agent" || row.name == "new-agent")
             .all(|row| row.guarded && has_guard_wiring(home.path(), &row.name)));
+    }
+
+    /// A guardable agent that needs nothing installed on the host running the
+    /// suite: a recognizable MCP configuration under a disposable HOME.
+    fn a_generic_mcp_agent(home: &Path) {
+        std::fs::create_dir_all(home.join(".new-agent")).unwrap();
+        std::fs::write(
+            home.join(".new-agent/mcp.json"),
+            r#"{"mcpServers":{"local":{"command":"node"}}}"#,
+        )
+        .unwrap();
+    }
+
+    /// The structured signal a caller needs in order to say "restart your
+    /// agents" without scanning the human-facing lines for a word.
+    ///
+    /// One NAMED target, so the count is exact and does not depend on which
+    /// agents happen to be installed on the machine running the suite.
+    ///
+    /// The direction a scan gets wrong is asserted directly: re-running
+    /// `connect` over an already-wired integration prints `already guarded
+    /// (...)`, which does NOT contain the word "connected" while the integration
+    /// is very much configured. Counting by `contains("connected")` reports zero
+    /// there, and the caller stays silent about the restart.
+    #[test]
+    fn an_already_wired_integration_still_counts_as_configured() {
+        let home = tempfile::TempDir::new().unwrap();
+        a_generic_mcp_agent(home.path());
+        let args = vec!["connect".into(), "new-agent".into(), "--monitor".into()];
+
+        let first = run_with_guard_bin_outcome(home.path(), &args, "/abs/innerwarden");
+        assert_eq!(first.lines.len(), 1, "{:?}", first.lines);
+        assert_eq!(first.configured, 1, "{:?}", first.lines);
+
+        let again = run_with_guard_bin_outcome(home.path(), &args, "/abs/innerwarden");
+        assert_eq!(again.lines.len(), 1, "{:?}", again.lines);
+        assert!(
+            again.lines[0].contains("already guarded"),
+            "this test only proves something while the second connect reports \
+             the unchanged wording: {:?}",
+            again.lines
+        );
+        assert!(
+            !again.lines[0].contains("connected"),
+            "and only while that wording lacks the word a naive scan keys on: {:?}",
+            again.lines
+        );
+        assert_eq!(
+            again.configured, 1,
+            "an integration that is already wired IS configured; counting by \
+             scanning the line reports zero here: {:?}",
+            again.lines
+        );
+    }
+
+    /// `disconnect` unwires, so it configures nothing and a caller keying on the
+    /// count cannot tell someone to restart after they deliberately unwired.
+    /// Its `was not connected` line CONTAINS the word a naive scan keys on.
+    #[test]
+    fn disconnect_configures_nothing_even_when_its_lines_say_connected() {
+        let home = tempfile::TempDir::new().unwrap();
+        a_generic_mcp_agent(home.path());
+
+        let outcome = run_with_guard_bin_outcome(
+            home.path(),
+            &["disconnect".into(), "new-agent".into()],
+            "/abs/innerwarden",
+        );
+        assert_eq!(outcome.configured, 0, "{:?}", outcome.lines);
+        assert!(
+            outcome.lines.iter().any(|line| line.contains("connected")),
+            "this test only proves something while a disconnect line carries \
+             the word a naive scan keys on: {:?}",
+            outcome.lines
+        );
+
+        let listed = run_with_guard_bin_outcome(home.path(), &["list".into()], "/abs/innerwarden");
+        assert_eq!(listed.configured, 0, "listing configures nothing");
+    }
+
+    /// A `connect` that found nothing to wire configured nothing.
+    #[test]
+    fn a_connect_with_no_guardable_target_configures_nothing() {
+        let home = tempfile::TempDir::new().unwrap();
+
+        let outcome = run_with_guard_bin_outcome(
+            home.path(),
+            &["connect".into(), "no-such-agent".into()],
+            "/abs/innerwarden",
+        );
+
+        assert_eq!(outcome.configured, 0, "{:?}", outcome.lines);
     }
 
     #[test]

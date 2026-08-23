@@ -60,23 +60,34 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
             }
         }
     }
-    let lines = if mutating {
+    let outcome = if mutating {
         match agent_policy::with_lock(&home, || {
             prepare_policy_for_agent_command(&home, rest)?;
-            Ok(agents_ops::run(&home, rest))
+            Ok(agents_ops::run_outcome(&home, rest))
         }) {
-            Ok(lines) => lines,
+            Ok(outcome) => outcome,
             Err(error) => {
                 eprintln!("innerwarden agents: {error}");
                 return std::process::ExitCode::from(1);
             }
         }
     } else {
-        agents_ops::run(&home, rest)
+        agents_ops::run_outcome(&home, rest)
     };
-    let failed = lines.iter().any(|line| line.contains("failed:"));
-    for line in lines {
+    let failed = outcome.lines.iter().any(|line| line.contains("failed:"));
+    for line in &outcome.lines {
         println!("{line}");
+    }
+    // An agent reads its hook / MCP configuration at STARTUP. Without this the
+    // command printed "connected" and the user went back to a session that was
+    // still running unscreened, believing it was protected.
+    //
+    // The count comes from the engine's own `ConnectEffect`, never from scanning
+    // the lines above, and it is zero for `disconnect`, so nobody is told to
+    // restart after deliberately unwiring. Same wording as `dry-run`/`enforce`
+    // so the product says one thing.
+    if outcome.configured > 0 {
+        println!("{}", crate::RESTART_GUARDED_AGENTS);
     }
     if failed {
         std::process::ExitCode::from(1)

@@ -24,6 +24,7 @@ mod binary_freshness;
 mod contain;
 mod contain_io;
 mod dashboard;
+mod first_run;
 mod graph_io;
 mod help;
 mod notify_io;
@@ -49,6 +50,14 @@ mod upsell_io;
 const DEFAULT_BIND: &str = "127.0.0.1:8787";
 pub(crate) const COMMUNITY_NAME: &str = "InnerWarden Community";
 pub(crate) const COMMUNITY_EDITION_NAME: &str = "InnerWarden Community Edition";
+
+/// The one sentence the product uses to say "a running agent will not pick this
+/// up until it starts again". An agent reads its hook / MCP configuration at
+/// STARTUP, so every path that changes that configuration owes the reader this
+/// line. Shared as a constant so `enforce`, `dry-run` and `agents connect`
+/// cannot drift into three different instructions.
+pub(crate) const RESTART_GUARDED_AGENTS: &str =
+    "  Restart guarded agents so they reload their hook or MCP configuration.";
 
 /// Gather what we can establish about this install, then say it plainly.
 ///
@@ -209,8 +218,24 @@ fn main() -> std::process::ExitCode {
             println!("{} {}", prog(), env!("CARGO_PKG_VERSION"));
             std::process::ExitCode::SUCCESS
         }
-        Some("--help") | Some("-h") | Some("help") | None => {
+        // Asking for help gets help, always. This arm is deliberately SEPARATE
+        // from the bare-invocation arm below: while they shared one arm, giving
+        // the empty case a first-run panel would have swallowed `--help` on
+        // every fresh machine.
+        Some("--help") | Some("-h") | Some("help") => {
             print_help();
+            std::process::ExitCode::SUCCESS
+        }
+        // A bare `innerwarden`. On an install that has never written its config
+        // directory, the reader's question is "am I protected?", not "what is
+        // the syntax of proxy". Anywhere else, including when we cannot read the
+        // home at all, this is unchanged.
+        None => {
+            if first_run::shows_panel(first_run::config_dir_present()) {
+                print!("{}", first_run::panel(&prog(), env!("CARGO_PKG_VERSION")));
+            } else {
+                print_help();
+            }
             std::process::ExitCode::SUCCESS
         }
         // Anything the Community binary does not handle natively. This makes it
@@ -647,7 +672,7 @@ fn cmd_mode(rest: &[String], monitor: bool) -> std::process::ExitCode {
         );
         println!("  Back to observe-only:  innerwarden dry-run");
     }
-    println!("  Restart guarded agents so they reload their hook or MCP configuration.");
+    println!("{RESTART_GUARDED_AGENTS}");
     std::process::ExitCode::SUCCESS
 }
 
