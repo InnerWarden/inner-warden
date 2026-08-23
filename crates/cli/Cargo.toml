@@ -66,7 +66,7 @@ serde_json = "1"
 # persisting provider tool-use identifiers in the local decision graph.
 sha2 = "0.11"
 ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
-base64 = "0.22"
+base64 = "0.23"
 # Pure-Rust, no-TLS HTTP server for the optional `serve` mode (loopback only).
 tiny_http = "0.12"
 # Async runtime for the `proxy` mode (the enforcing MCP stdio guard, which pumps
