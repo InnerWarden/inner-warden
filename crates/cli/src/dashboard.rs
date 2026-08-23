@@ -12,7 +12,9 @@
 
 use serde::Serialize;
 
-const DEFAULT_BIND: &str = "127.0.0.1:8788";
+/// Where the local dashboard binds. `status` probes THIS, not the serve port:
+/// they were both named DEFAULT_BIND and disagreed.
+pub(crate) const DEFAULT_BIND: &str = "127.0.0.1:8788";
 const AGENT_REFRESH_SECS: u64 = 30;
 const TOKEN_REFRESH_SECS: u64 = 300;
 

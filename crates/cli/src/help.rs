@@ -132,7 +132,7 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
              Body: {{\"command\":\"...\"}}. No TLS and no auth, so keep it on loopback.\n\
              \n  \
              --bind    address to listen on (default {bind})",
-            bind = crate::DEFAULT_BIND,
+            bind = crate::SERVE_BIND,
         ),
         "proxy" => format!(
             "{p} proxy [--mode M] [--label L] [--error-response] -- <server> [args...]\n  \

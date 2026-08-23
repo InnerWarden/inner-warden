@@ -48,7 +48,23 @@ mod upgrade_plan;
 mod upsell;
 mod upsell_io;
 
-const DEFAULT_BIND: &str = "127.0.0.1:8787";
+/// Where `innerwarden serve` binds: the check-command endpoint.
+///
+/// NOT the dashboard. Both constants were called DEFAULT_BIND, in two modules,
+/// with different ports, and `status` probed this one for a dashboard that
+/// binds 8788. The result was that the first command anyone runs reported the
+/// dashboard as not running whatever the dashboard was doing.
+const SERVE_BIND: &str = "127.0.0.1:8787";
+
+/// Where `status` looks for a dashboard.
+///
+/// A function rather than a use-site constant so the choice is testable without
+/// a socket. It has to be the DASHBOARD's bind: both constants were called
+/// DEFAULT_BIND, they disagree, and probing the serve port made the first
+/// command anyone runs report the dashboard as absent however it was running.
+fn dashboard_probe_target() -> &'static str {
+    crate::dashboard::DEFAULT_BIND
+}
 pub(crate) const COMMUNITY_NAME: &str = "InnerWarden Community";
 pub(crate) const COMMUNITY_EDITION_NAME: &str = "InnerWarden Community Edition";
 
@@ -119,7 +135,7 @@ fn status_io_cmd() -> std::process::ExitCode {
     let dashboard_reachable = if never_configured {
         None
     } else {
-        Some(dashboard_answers(DEFAULT_BIND))
+        Some(dashboard_answers(dashboard_probe_target()))
     };
 
     let facts = status::Facts {
@@ -1036,7 +1052,27 @@ fn cmd_uninstall_self(purge: bool) -> std::process::ExitCode {
     };
     println!("Uninstalling {COMMUNITY_NAME}...");
 
-    // 1. Remove the agent hook (claude-code is the wired agent today).
+    // 0. Unwire EVERY agent first, not just the hooked one.
+    //
+    // The comment below used to say "claude-code is the wired agent today" and
+    // it stopped being true when `agents connect --all` learned to wire Cursor,
+    // Codex and Gemini. Those are wired by rewriting their MCP config to call
+    // this binary by ABSOLUTE PATH, and step 3 deletes that binary. Uninstalling
+    // without this leaves them launching a path that no longer exists, and the
+    // command that would have fixed it went with the binary.
+    //
+    // Reuses the same entry point `agents disconnect --all` uses, so the two can
+    // never disagree about what unwiring means.
+    let disconnected = crate::agents_io::cmd(&["disconnect".into(), "--all".into()]);
+    if disconnected == std::process::ExitCode::SUCCESS {
+        println!("  agents  : disconnected every wired agent");
+    } else {
+        println!("  agents  : disconnect reported a problem; check `innerwarden agents list`");
+        println!("            before removing the binary, or MCP-wired agents will");
+        println!("            keep calling a path that is about to disappear.");
+    }
+
+    // 1. Remove the agent hook.
     match hook::uninstall_hook(&home, "claude-code", None) {
         Ok((path, removed)) if removed > 0 => println!(
             "  hook    : removed {removed} entr{} from {}",
@@ -1088,7 +1124,7 @@ fn cmd_uninstall_self(purge: bool) -> std::process::ExitCode {
 /// agent's `POST /api/agent/check-command` shape (body `{"command":"..."}`),
 /// minus TLS (loopback only) so the binary pulls no crypto and stays Windows-clean.
 fn cmd_serve(rest: &[String]) -> std::process::ExitCode {
-    let mut bind = DEFAULT_BIND.to_string();
+    let mut bind = SERVE_BIND.to_string();
     let mut it = rest.iter();
     while let Some(a) = it.next() {
         if a.as_str() == "--bind" {
@@ -1355,13 +1391,71 @@ fn help_text() -> String {
            {p} notify --telegram-token <T> --telegram-chat <C> [--test]\n\
          Default serve bind: {bind}",
         ver = env!("CARGO_PKG_VERSION"),
-        bind = DEFAULT_BIND,
+        bind = SERVE_BIND,
         community_edition = COMMUNITY_EDITION_NAME,
     )
 }
 
 #[cfg(test)]
 mod tests {
+    /// A full uninstall must unwire EVERY agent before it deletes the binary.
+    ///
+    /// It removed claude-code's hook only, on a comment that said "claude-code
+    /// is the wired agent today". `agents connect --all` made that false: it
+    /// wires Cursor, Codex and Gemini by writing this binary's ABSOLUTE PATH
+    /// into their MCP config. Deleting the binary without unwiring them leaves
+    /// those servers launching a path that is gone, and `agents disconnect`
+    /// went with the binary.
+    ///
+    /// FAILS ON REVERT: drop the disconnect call from cmd_uninstall_self.
+    #[test]
+    fn uninstall_unwires_every_agent_before_removing_the_binary() {
+        let src = include_str!("main.rs");
+        let start = src
+            .find("fn cmd_uninstall_self")
+            .expect("cmd_uninstall_self exists");
+        let body = &src[start..];
+        // The CALL, not the word: the first version of this searched for
+        // "disconnect" and found it in the println messages this function
+        // prints, so removing the call left the test green.
+        let disconnect = body
+            .find("agents_io::cmd")
+            .expect("uninstall must go through the same entry point as `agents disconnect --all`");
+        let remove_binary = body
+            .find("current_exe")
+            .expect("uninstall removes the binary");
+        assert!(
+            disconnect < remove_binary,
+            "the disconnect has to happen BEFORE the binary is deleted: \
+             an MCP-wired agent points at that path"
+        );
+    }
+
+    /// Two constants named DEFAULT_BIND, in two modules, with different ports,
+    /// and `status` probed the serve one for a dashboard that binds the other.
+    /// The first command anyone runs therefore reported the dashboard as not
+    /// running whatever the dashboard was doing.
+    ///
+    /// FAILS ON REVERT: point the status probe back at SERVE_BIND.
+    #[test]
+    fn the_dashboard_probe_asks_the_dashboard_port_not_the_serve_port() {
+        assert_ne!(
+            SERVE_BIND,
+            crate::dashboard::DEFAULT_BIND,
+            "these are different services; if they ever share a port say so here"
+        );
+        assert_eq!(
+            dashboard_probe_target(),
+            crate::dashboard::DEFAULT_BIND,
+            "status must look for the dashboard where the dashboard listens"
+        );
+        assert_ne!(
+            dashboard_probe_target(),
+            SERVE_BIND,
+            "probing the serve port for a dashboard is the bug this pins"
+        );
+    }
+
     use super::*;
 
     #[test]
