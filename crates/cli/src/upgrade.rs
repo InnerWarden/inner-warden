@@ -52,7 +52,12 @@ pub enum Invocation {
     /// Report whether an upgrade exists and change nothing.
     Check,
     /// Download, verify, and replace.
-    Upgrade,
+    ///
+    /// `forced` carries `--yes`/`-y`, which until now was accepted and did
+    /// nothing at all. It is the acknowledgement that overrides the npm refusal
+    /// below, and nothing else: it does not skip verification, and it cannot
+    /// turn a `--check` into an install.
+    Upgrade { forced: bool },
 }
 
 /// Pure: what the arguments ask for.
@@ -69,7 +74,9 @@ pub fn plan_invocation(rest: &[String]) -> Invocation {
     if rest.iter().any(|a| a == "--check") {
         return Invocation::Check;
     }
-    Invocation::Upgrade
+    Invocation::Upgrade {
+        forced: rest.iter().any(|a| a == "--yes" || a == "-y"),
+    }
 }
 
 pub fn cmd(rest: &[String]) -> ExitCode {
@@ -83,7 +90,8 @@ pub fn cmd(rest: &[String]) -> ExitCode {
         println!("  against the key compiled into this binary before replacing anything.");
         println!("  Hooks and config are left untouched.");
         println!();
-        println!("  --check   report whether a build exists and exit, changing nothing");
+        println!("  --check   report which version is published and exit, changing nothing");
+        println!("  --yes     replace an npm-managed copy anyway (see the refusal for why not)");
         return ExitCode::SUCCESS;
     }
 
@@ -105,6 +113,7 @@ pub fn cmd(rest: &[String]) -> ExitCode {
         return ExitCode::from(2);
     }
     let check_only = invocation == Invocation::Check;
+    let forced = invocation == Invocation::Upgrade { forced: true };
 
     let current = env!("CARGO_PKG_VERSION");
     let Some(asset) = upgrade_plan::asset_for_this_host() else {
@@ -119,6 +128,31 @@ pub fn cmd(rest: &[String]) -> ExitCode {
         eprintln!("innerwarden upgrade: could not locate the running binary.");
         return ExitCode::from(1);
     };
+
+    // An npm-managed copy must not be replaced by hand, and that has to be said
+    // BEFORE the download rather than after a failure.
+    //
+    // `upgrade_plan` already documented this hazard and `managed_by` already
+    // detected it, but both callers were on the FAILURE path: the warning only
+    // ever appeared when the replace had ALSO failed, which happens when npm's
+    // prefix is root-owned. Under `npm config set prefix ~/.npm-global`, which
+    // is exactly what the install page recommends, the prefix is user-owned, so
+    // the replace SUCCEEDS. The user is told "Upgrade complete", npm goes on
+    // believing it ships the old version, and the next `npm install -g` silently
+    // puts the old binary back. The only case the advice existed for was the one
+    // case it was never shown in.
+    if upgrade_plan::npm_refusal_applies(&target, check_only, forced) {
+        eprintln!("innerwarden upgrade: REFUSED, this copy is managed by npm.");
+        eprintln!("  Nothing was downloaded. The installed binary is untouched.");
+        eprintln!();
+        for line in upgrade_plan::cannot_replace_advice(&target, running_as_root()) {
+            eprintln!("{line}");
+        }
+        eprintln!();
+        eprintln!("  To replace npm's file anyway, knowing the next `npm install -g`");
+        eprintln!("  will undo it:  innerwarden upgrade --yes");
+        return ExitCode::from(2);
+    }
 
     // Prove we can replace the binary BEFORE downloading it.
     //
@@ -139,22 +173,38 @@ pub fn cmd(rest: &[String]) -> ExitCode {
     }
 
     if check_only {
-        // Report, change nothing. The version comparison needs the published
-        // sidecar, so fetch only the small `.sha256` and never the binary.
-        let (_, sha_url, _) = upgrade_plan::urls_for(&asset);
-        match fetch_bytes(&sha_url) {
-            Ok(_) => {
-                println!("InnerWarden Community {current}");
-                println!("  A published build exists for this host ({asset}).");
-                println!("  Run `innerwarden upgrade` to install it.");
-            }
+        // Report, change nothing.
+        //
+        // This used to fetch the small `.sha256` sidecar, DISCARD it, and print
+        // "Run `innerwarden upgrade` to install it" on any HTTP success. It said
+        // that on 1.3.7 while 1.3.7 was the published release, because a
+        // reachable sidecar says only that a release exists, never which one. So
+        // it answered "yes, upgrade" to every host that could reach GitHub, and
+        // a check that cannot say "no" answers nothing.
+        //
+        // The published version is named in the manifest the release workflow
+        // generates from the built binary's own `--version` and uploads beside
+        // the binaries, so compare against that. Still small, still no binary
+        // download.
+        let manifest_url = upgrade_plan::manifest_url_from(upgrade_plan::RELEASE_BASE);
+        let manifest = match fetch_text(&manifest_url) {
+            Ok(t) => t,
             Err(e) => {
                 eprintln!("innerwarden upgrade --check: could not reach the release ({e}).");
                 eprintln!("  Nothing was downloaded. The installed binary is untouched.");
                 return ExitCode::from(1);
             }
+        };
+        let outcome = upgrade_plan::check_outcome(current, &manifest);
+        for line in upgrade_plan::check_lines(&outcome, &asset, upgrade_plan::managed_by(&target)) {
+            println!("{line}");
         }
-        return ExitCode::SUCCESS;
+        // "Could not tell" is not success. Exiting 0 there would let a script
+        // treat an unanswerable check as a clean bill of health.
+        return match outcome {
+            upgrade_plan::CheckOutcome::Undetermined => ExitCode::from(1),
+            _ => ExitCode::SUCCESS,
+        };
     }
 
     println!("InnerWarden Community {current}: fetching {asset}...");
@@ -468,9 +518,16 @@ mod tests {
     /// The recognised set, so a flag is not accidentally dropped from it.
     #[test]
     fn the_recognised_flags_behave_as_documented() {
-        assert_eq!(plan_invocation(&[]), Invocation::Upgrade);
-        assert_eq!(plan_invocation(&["--yes".to_string()]), Invocation::Upgrade);
-        assert_eq!(plan_invocation(&["-y".to_string()]), Invocation::Upgrade);
+        assert_eq!(plan_invocation(&[]), Invocation::Upgrade { forced: false });
+        assert_eq!(
+            plan_invocation(&["--yes".to_string()]),
+            Invocation::Upgrade { forced: true },
+            "--yes is the acknowledgement that overrides the npm refusal"
+        );
+        assert_eq!(
+            plan_invocation(&["-y".to_string()]),
+            Invocation::Upgrade { forced: true }
+        );
         assert_eq!(plan_invocation(&["--help".to_string()]), Invocation::Help);
         assert_eq!(plan_invocation(&["-h".to_string()]), Invocation::Help);
     }
@@ -504,7 +561,7 @@ mod tests {
         assert_eq!(plan, Invocation::Check);
         assert_ne!(
             plan,
-            Invocation::Upgrade,
+            Invocation::Upgrade { forced: false },
             "the only thing between --check and a replaced binary is this \
              distinction, and on 2026-08-21 it did not exist"
         );
@@ -822,7 +879,7 @@ mod e2e {
         assert_eq!(plan_invocation(&["--check".to_string()]), Invocation::Check);
         assert_ne!(
             plan_invocation(&["--check".to_string()]),
-            Invocation::Upgrade,
+            Invocation::Upgrade { forced: false },
             "the defect that shipped on 2026-08-21 was exactly this equality"
         );
     }

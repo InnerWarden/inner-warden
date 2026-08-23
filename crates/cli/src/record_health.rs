@@ -113,13 +113,74 @@ pub fn report_at(graph: &Path) -> Option<Outage> {
 
 /// Can this process still write beside the graph? Probes rather than inspecting
 /// mode bits, which say nothing about ACLs, read-only mounts, or a full disk.
+///
+/// # A directory that does not exist yet is not a fault
+///
+/// This used to answer `false` the moment the store directory was absent, and
+/// [`report_at`] turns `false` into an outage. On a brand-new install nothing
+/// has been recorded, so the store has never been created, so the first
+/// `innerwarden graph` a new user ran told them:
+///
+/// ```text
+/// InnerWarden has not recorded for 0 seconds (actions lost, graph_directory_unwritable)
+/// ```
+///
+/// and the dashboard served the same sentence. A fresh box is not a broken one:
+/// this is the mistake [`crate::status`] was written to forbid, reproduced in a
+/// different module. "Not there yet" is not "cannot be written".
+///
+/// So walk up to the nearest ancestor that DOES exist and probe that instead: if
+/// a file can be created there, the store can be created there too, and there is
+/// nothing to report. Asking the question must not create the directory as a
+/// side effect, so nothing here calls `create_dir_all`; the recording path
+/// creates the store when it has something to record.
 fn directory_is_writable(graph: &Path) -> bool {
     let Some(dir) = graph.parent() else {
         return false;
     };
-    if !dir.exists() {
+    // A bare filename has an empty parent, which means the current directory
+    // rather than the filesystem root.
+    let dir = if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    };
+    let Some(existing) = nearest_existing_ancestor(dir) else {
+        return false;
+    };
+    // Something is there and it is not a directory: a file standing where the
+    // store must go can never become the store, and no amount of waiting fixes
+    // it. That IS a fault, and it is reported as one.
+    if !existing.is_dir() {
         return false;
     }
+    probe_writable(existing)
+}
+
+/// The closest ancestor of `dir` (including `dir`) that exists on disk.
+///
+/// `None` only when the walk runs out of components without finding anything,
+/// which on a real filesystem means the root itself is unreadable.
+fn nearest_existing_ancestor(dir: &Path) -> Option<&Path> {
+    let mut candidate = dir;
+    loop {
+        // `symlink_metadata` rather than `exists()`: a dangling symlink standing
+        // where the store must go exists as an entry, and treating it as "not
+        // there yet" would have us probe its parent and report health while
+        // every write to it fails.
+        if std::fs::symlink_metadata(candidate).is_ok() {
+            return Some(candidate);
+        }
+        candidate = match candidate.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => return None,
+        };
+    }
+}
+
+/// Write and remove a file in `dir`. The same permissions creating the store
+/// needs, exercised rather than inferred.
+fn probe_writable(dir: &Path) -> bool {
     let probe = dir.join(format!(".iw-write-probe.{}", std::process::id()));
     match std::fs::write(&probe, b"") {
         Ok(()) => {
@@ -335,6 +396,77 @@ mod tests {
         let reported = report_at(&g).expect("marker is reported");
         assert_eq!(reported.code, "graph_write_failed");
         assert_eq!(reported.lost, 1);
+    }
+
+    /// REGRESSION ANCHOR. A brand-new install reported itself broken.
+    ///
+    /// Nothing has been recorded yet, so the store directory has never been
+    /// created, so `directory_is_writable` answered false and `report_at` turned
+    /// that into "InnerWarden has not recorded for 0 seconds (actions lost,
+    /// graph_directory_unwritable)" on the first `innerwarden graph` and on the
+    /// dashboard. A fresh box is not a broken one.
+    ///
+    /// FAILS ON REVERT: put back `if !dir.exists() { return false; }` and this
+    /// reports an outage on a directory nothing is wrong with.
+    #[test]
+    fn a_store_directory_that_does_not_exist_yet_is_not_an_outage() {
+        let dir = tempfile::tempdir().unwrap();
+        // Two levels deep and absent, exactly as a fresh install finds it before
+        // its first recorded action.
+        let store = dir.path().join("innerwarden").join("store");
+        let g = store.join("graph.json");
+        assert!(!store.exists(), "precondition: the store is not there yet");
+
+        assert!(
+            report_at(&g).is_none(),
+            "a fresh install has recorded nothing; that is not an outage"
+        );
+        assert!(
+            !store.exists(),
+            "asking whether the store could be written must not create it"
+        );
+    }
+
+    /// The other half of the same question: "could be created" is established by
+    /// probing the nearest existing ancestor, so an absent store under an
+    /// ancestor that CANNOT be written is still reported.
+    ///
+    /// Without this the fix would be indistinguishable from deleting the check.
+    ///
+    /// FAILS ON REVERT: return `true` for any absent directory instead of
+    /// probing, and a store that can never be created reads as healthy.
+    #[cfg(unix)]
+    #[test]
+    fn an_absent_store_under_an_unwritable_parent_is_still_an_outage() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("locked");
+        std::fs::create_dir(&parent).unwrap();
+        let g = parent.join("store").join("graph.json");
+        assert!(
+            report_at(&g).is_none(),
+            "precondition: creatable while the parent is writable"
+        );
+
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let outage = report_at(&g).expect("a store that cannot be created is an outage");
+        assert_eq!(outage.code, "graph_directory_unwritable");
+
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(report_at(&g).is_none(), "recovery must clear the report");
+    }
+
+    /// A plain file standing where the store must go can never become the store.
+    /// Unlike an absent directory, waiting does not fix it, so it is a fault.
+    #[test]
+    fn a_file_standing_where_the_store_belongs_is_an_outage() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("store");
+        std::fs::write(&store, b"not a directory").unwrap();
+        let g = store.join("graph.json");
+
+        let outage = report_at(&g).expect("a file in the way is a real fault");
+        assert_eq!(outage.code, "graph_directory_unwritable");
     }
 
     #[test]
