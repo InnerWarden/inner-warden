@@ -13,6 +13,13 @@ A minor rather than a patch because `upgrade` gained exit codes and the bare
 
 ### Fixed
 
+- `cat ~/.aws/credentials` was a review, not a deny, while `cat deploy.pem` was
+  a deny. The hard list was keyed on file EXTENSION rather than on what the file
+  holds, and a `.pem` is frequently a public certificate. The credential file is
+  now scored as one; `~/.aws/config` beside it stays a review, because region
+  and output settings are read legitimately and denying them was never the
+  intent.
+
 - `innerwarden allow --help` wrote the literal string `--help` into the
   guardrail's own bypass list and printed success. `check "--help"` then returned
   ALLOW with `[suppressed: allow --help]`. `mute --help` was worse: it lands in
@@ -64,6 +71,12 @@ A minor rather than a patch because `upgrade` gained exit codes and the bare
   exits 1 when it cannot determine the published version.
 
 ### Internal
+
+- `ureq` 2 to 3. The migration mattered rather than the version: ureq 3 moved
+  timeouts off the request builder onto the agent, so the obvious port silently
+  leaves every network probe unbounded, and its error enum went from two
+  variants to ten, so an exhaustive match keeps compiling while losing cases.
+  Both are now asked as questions (`is_an_answer`, `status_of`) in one place.
 
 - CI now refuses an em dash on any line a change adds. The paid repo's version of
   that gate had been green since it was written without ever running: a shallow
