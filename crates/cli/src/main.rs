@@ -27,6 +27,7 @@ mod dashboard;
 mod first_run;
 mod graph_io;
 mod help;
+mod http_io;
 mod notify_io;
 mod observe;
 mod observe_io;
@@ -140,11 +141,11 @@ fn status_io_cmd() -> std::process::ExitCode {
 /// timeout because this runs inside the one command a beginner reaches for when
 /// something already feels wrong.
 fn dashboard_answers(bind: &str) -> bool {
-    ureq::get(&format!("http://{bind}/api/meta"))
-        .timeout(std::time::Duration::from_millis(400))
+    crate::http_io::agent_with_timeout(std::time::Duration::from_millis(400))
+        .get(&format!("http://{bind}/api/meta"))
         .call()
         .ok()
-        .and_then(|response| response.into_string().ok())
+        .and_then(|mut response| response.body_mut().read_to_string().ok())
         .map(|body| status::is_dashboard_answer(&body))
         .unwrap_or(false)
 }

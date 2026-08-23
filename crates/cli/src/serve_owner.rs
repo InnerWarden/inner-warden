@@ -60,14 +60,12 @@ pub fn classify(bind: &str, contract_answered: bool) -> BindFailure {
 pub fn contract_answers(bind: &str) -> bool {
     for scheme in ["https", "http"] {
         let url = format!("{scheme}://{bind}/api/agent/check-command");
-        match ureq::post(&url)
-            .timeout(std::time::Duration::from_millis(700))
-            .send_json(serde_json::json!({"command": ""}))
-        {
-            Ok(_) => return true,
-            // A status error is still an answer: something is listening.
-            Err(ureq::Error::Status(_, _)) => return true,
-            Err(_) => continue,
+        let answered = crate::http_io::agent_with_timeout(std::time::Duration::from_millis(700))
+            .post(&url)
+            .send_json(serde_json::json!({"command": ""}));
+        // A status error is still an answer: something is listening.
+        if crate::http_io::is_an_answer(&answered) {
+            return true;
         }
     }
     false

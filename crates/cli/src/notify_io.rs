@@ -210,28 +210,29 @@ fn delivery_failure_message(_req: &Request, http_status: Option<u16>) -> String 
 }
 
 fn send_with_timeout(req: &Request, timeout: Duration) -> DeliveryStatus {
-    let resp = ureq::post(&req.url)
-        .timeout(timeout)
-        .set("Content-Type", "application/json")
-        .send_string(&req.body);
+    let resp = crate::http_io::agent_with_timeout(timeout)
+        .post(&req.url)
+        .header("Content-Type", "application/json")
+        .send(&req.body);
     match resp {
-        Ok(response) if (200..300).contains(&response.status()) => DeliveryStatus::Delivered,
+        Ok(response) if (200..300).contains(&response.status().as_u16()) => {
+            DeliveryStatus::Delivered
+        }
         Ok(response) => {
             eprintln!(
                 "innerwarden: {}",
-                delivery_failure_message(req, Some(response.status()))
+                delivery_failure_message(req, Some(response.status().as_u16()))
             );
             DeliveryStatus::Failed
         }
-        Err(ureq::Error::Status(status, _)) => {
+        // ureq 3 turns 4xx/5xx into StatusCode; everything else is a transport
+        // failure. `status_of` keeps this from becoming a variant list that goes
+        // stale the next time ureq adds one.
+        Err(e) => {
             eprintln!(
                 "innerwarden: {}",
-                delivery_failure_message(req, Some(status))
+                delivery_failure_message(req, crate::http_io::status_of(&e))
             );
-            DeliveryStatus::Failed
-        }
-        Err(ureq::Error::Transport(_)) => {
-            eprintln!("innerwarden: {}", delivery_failure_message(req, None));
             DeliveryStatus::Failed
         }
     }
@@ -339,7 +340,17 @@ mod tests {
         assert_eq!(send(&request), DeliveryStatus::Delivered);
         let received = server.join().unwrap();
         assert!(received.starts_with("POST /notify HTTP/1.1"));
-        assert!(received.contains("Content-Type: application/json"));
+        // Case-insensitive because HTTP header NAMES are, and this assertion is
+        // about the request declaring JSON, not about which casing the client
+        // happens to emit. ureq 2 sent `Content-Type`; ureq 3 normalises through
+        // the `http` crate and sends `content-type`, and pinning the old spelling
+        // turned a working request into a red test.
+        assert!(
+            received
+                .to_lowercase()
+                .contains("content-type: application/json"),
+            "the request must declare JSON: {received}"
+        );
         assert!(received.ends_with(r#"{"kind":"deny"}"#));
     }
 

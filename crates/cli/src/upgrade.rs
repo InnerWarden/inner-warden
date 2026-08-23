@@ -274,8 +274,8 @@ fn running_as_root() -> bool {
 /// and no more correct. A short timeout, and any error means "no" — a failed
 /// probe must never turn a successful upgrade into a scary ending.
 fn dashboard_is_serving() -> bool {
-    ureq::get("http://127.0.0.1:8787/api/guard/meta")
-        .timeout(std::time::Duration::from_millis(400))
+    crate::http_io::agent_with_timeout(std::time::Duration::from_millis(400))
+        .get("http://127.0.0.1:8787/api/guard/meta")
         .call()
         .is_ok()
 }
@@ -384,9 +384,10 @@ fn install_verified(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
 /// Download a binary artifact, bounded.
 fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
-    let resp = ureq::get(url).call().map_err(|e| e.to_string())?;
+    let mut resp = ureq::get(url).call().map_err(|e| e.to_string())?;
     let mut buf = Vec::new();
-    resp.into_reader()
+    resp.body_mut()
+        .as_reader()
         .take(MAX_ARTIFACT_BYTES)
         .read_to_end(&mut buf)
         .map_err(|e| e.to_string())?;
@@ -401,7 +402,8 @@ fn fetch_text(url: &str) -> Result<String, String> {
     ureq::get(url)
         .call()
         .map_err(|e| e.to_string())?
-        .into_string()
+        .body_mut()
+        .read_to_string()
         .map_err(|e| e.to_string())
 }
 

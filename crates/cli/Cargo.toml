@@ -74,7 +74,7 @@ tiny_http = "0.12"
 tokio = { version = "1", features = ["rt-multi-thread", "io-std", "time"] }
 # Blocking HTTP client for the verdict notifications. rustls TLS = pure Rust, no
 # C deps, stays Windows-clean.
-ureq = { version = "2", features = ["json"] }
+ureq = { version = "3", features = ["json"] }
 # Arrow-key first-run wizard (`innerwarden setup`): MultiSelect + Input + Password.
 # Same version the Active Defence ctl uses; default-features off keeps it lean + Windows-clean.
 dialoguer = { version = "0.12.0", default-features = false, features = ["password"] }
