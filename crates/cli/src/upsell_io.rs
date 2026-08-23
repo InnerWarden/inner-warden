@@ -102,11 +102,11 @@ pub fn show_upsell(command: &str) -> ExitCode {
 /// The escape hatch for the overlap: without it, a verb both layers implement is
 /// answered here and the host one cannot be reached at all.
 pub fn cmd_host(rest: &[String]) -> ExitCode {
-    // `--help` is a request for usage, not a verb to forward. Delegating it
-    // produced "there is no host layer to run `--help` in", which is nonsense.
-    let asked_for_help = rest
-        .first()
-        .is_some_and(|a| a == "--help" || a == "-h" || a == "help");
+    // `help` is a request for usage, not a verb to forward. Delegating it
+    // produced "there is no host layer to run `help` in", which is nonsense.
+    // The `--help` / `-h` spellings are answered before dispatch, in
+    // `help::for_invocation`.
+    let asked_for_help = rest.first().is_some_and(|a| a == "help");
     let Some(verb) = rest.first().filter(|_| !asked_for_help) else {
         eprintln!("innerwarden host <command> [args]");
         eprintln!("  Runs a command in the Active Defence host layer.");
@@ -177,16 +177,23 @@ mod host_help_tests {
     /// produced "there is no host layer to run `--help` in", which is nonsense
     /// and, on a machine WITH Active Defence, would have run `innerwarden-ctl
     /// --help` instead of explaining this command.
+    ///
+    /// The two flag spellings are now answered before dispatch, so they are
+    /// asserted where that decision lives; the bare word still lands here.
     #[test]
     fn help_is_usage_and_not_a_verb_to_delegate() {
-        for flag in ["--help", "-h", "help"] {
-            let code = cmd_host(&[flag.to_string()]);
-            assert_eq!(
-                format!("{code:?}"),
-                format!("{:?}", ExitCode::SUCCESS),
-                "`host {flag}` must succeed with usage"
+        for flag in ["--help", "-h"] {
+            assert!(
+                crate::help::for_invocation("host", &[flag.to_string()]).is_some(),
+                "`host {flag}` must be answered with usage, never delegated"
             );
         }
+        let code = cmd_host(&["help".to_string()]);
+        assert_eq!(
+            format!("{code:?}"),
+            format!("{:?}", ExitCode::SUCCESS),
+            "`host help` must succeed with usage"
+        );
     }
 
     /// No arguments at all is a usage ERROR, so a script that forgot the verb

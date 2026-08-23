@@ -648,6 +648,23 @@ pub fn content_type(path: &str) -> &'static str {
     }
 }
 
+/// Usage for `innerwarden dashboard`. Printed by `help::for_invocation` before
+/// dispatch, so the command itself never has to recognise a help flag.
+pub(crate) fn help_text() -> String {
+    let p = crate::prog();
+    format!(
+        "{p} dashboard [--bind IP:PORT] [--expose]\n  \
+         Local UI plus read-only APIs over the record this guard keeps (default\n  \
+         {DEFAULT_BIND}). An opt-in monitor-only worker may connect reviewed agents in\n  \
+         the background.\n\
+         \n  \
+         --bind     address to listen on\n  \
+         --expose   allow a NON-loopback bind. The dashboard has NO auth and NO TLS,\n  \
+         \x20          so this publishes decisions, detected agents, modes and token\n  \
+         \x20          counters to anyone who can reach this host."
+    )
+}
+
 /// `innerwarden dashboard [--bind IP:PORT]` - serve local visibility + read-only APIs.
 pub fn cmd(rest: &[String]) -> std::process::ExitCode {
     let mut bind = DEFAULT_BIND.to_string();
@@ -661,16 +678,6 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
                 }
             }
             "--expose" => expose = true,
-            "--help" | "-h" => {
-                println!("innerwarden dashboard [--bind IP:PORT] [--expose]");
-                println!("  local UI with read-only APIs (default {DEFAULT_BIND}).");
-                println!("  an opt-in monitor-only worker may connect reviewed agents in the background.");
-                println!(
-                    "  --expose: allow a NON-loopback bind. The dashboard has NO auth/TLS, so"
-                );
-                println!("            this publishes decisions, detected agents, modes and token counters.");
-                return std::process::ExitCode::SUCCESS;
-            }
             _ => {}
         }
     }
