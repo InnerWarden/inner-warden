@@ -41,8 +41,6 @@ const MAX_ARTIFACT_BYTES: u64 = 128 * 1024 * 1024;
 /// already shipped the defect its tests were supposed to prevent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Invocation {
-    /// Print usage and exit successfully.
-    Help,
     /// Refuse: the flag was not understood. Carries the offending argument.
     ///
     /// A mutating command must not silently ignore what it was asked. The
@@ -60,11 +58,30 @@ pub enum Invocation {
     Upgrade { forced: bool },
 }
 
+/// Usage for `innerwarden upgrade`, named as it was invoked (`update` and
+/// `self-update` reach the same code). Printed by `help::for_invocation` before
+/// dispatch, so this command never has to recognise a help flag itself.
+pub(crate) fn help_text(verb: &str) -> String {
+    let p = crate::prog();
+    format!(
+        "{p} {verb} [--check] [--yes]\n  \
+         Update the InnerWarden Community binary in place to the latest signed\n  \
+         release. It downloads the release asset and verifies its SHA-256 and its\n  \
+         Ed25519 signature against the key compiled into this binary before replacing\n  \
+         anything. Hooks and config are left untouched.\n\
+         \n  \
+         --check   report which version is published, and change nothing\n  \
+         --yes     replace an npm-managed copy anyway (see the refusal for why not)"
+    )
+}
+
 /// Pure: what the arguments ask for.
+///
+/// There is no `Help` here: usage is answered in `main` before dispatch (see
+/// `help::for_invocation`), so a help flag cannot arrive. If one ever did it
+/// would be refused as the unknown option it is, which downloads nothing and
+/// leaves the running binary alone.
 pub fn plan_invocation(rest: &[String]) -> Invocation {
-    if rest.iter().any(|a| a == "--help" || a == "-h") {
-        return Invocation::Help;
-    }
     if let Some(bad) = rest
         .iter()
         .find(|a| a.starts_with('-') && *a != "--check" && *a != "--yes" && *a != "-y")
@@ -81,19 +98,6 @@ pub fn plan_invocation(rest: &[String]) -> Invocation {
 
 pub fn cmd(rest: &[String]) -> ExitCode {
     let invocation = plan_invocation(rest);
-    if invocation == Invocation::Help {
-        println!("innerwarden upgrade");
-        println!(
-            "  Update the InnerWarden Community binary in place to the latest signed release."
-        );
-        println!("  Downloads the release asset and verifies its SHA-256 and Ed25519 signature");
-        println!("  against the key compiled into this binary before replacing anything.");
-        println!("  Hooks and config are left untouched.");
-        println!();
-        println!("  --check   report which version is published and exit, changing nothing");
-        println!("  --yes     replace an npm-managed copy anyway (see the refusal for why not)");
-        return ExitCode::SUCCESS;
-    }
 
     // A mutating command must not silently ignore what it was asked to do.
     //
@@ -528,17 +532,29 @@ mod tests {
             plan_invocation(&["-y".to_string()]),
             Invocation::Upgrade { forced: true }
         );
-        assert_eq!(plan_invocation(&["--help".to_string()]), Invocation::Help);
-        assert_eq!(plan_invocation(&["-h".to_string()]), Invocation::Help);
     }
 
     /// Help wins over a bad flag: `upgrade --help --nonsense` should explain,
     /// not scold. Asking for help is never the dangerous path.
+    ///
+    /// That decision now lives in `help::for_invocation`, which answers before
+    /// dispatch, so this asserts it there and asserts that the flag reaching
+    /// this parser anyway would still download nothing.
     #[test]
-    fn help_takes_precedence_over_a_refusal() {
+    fn help_is_answered_before_this_parser_and_refused_if_it_ever_arrived() {
+        for verb in ["upgrade", "update", "self-update"] {
+            assert!(crate::help::for_invocation(
+                verb,
+                &["--help".to_string(), "--nonsense".to_string()]
+            )
+            .is_some());
+            assert!(crate::help::for_invocation(verb, &["-h".to_string()]).is_some());
+        }
         assert_eq!(
-            plan_invocation(&["--help".to_string(), "--nonsense".to_string()]),
-            Invocation::Help
+            plan_invocation(&["--help".to_string()]),
+            Invocation::Refuse("--help".to_string()),
+            "an unrecognised flag on the command that replaces the running binary \
+             must be refused, never ignored"
         );
     }
 

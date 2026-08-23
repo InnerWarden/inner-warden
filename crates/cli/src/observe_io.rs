@@ -43,7 +43,9 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
         Some("reply") => cmd_reply(&rest[1..]),
         Some("install") => cmd_install(&rest[1..]),
         None | Some("status") => cmd_status(),
-        Some("--help") | Some("-h") | Some("help") => {
+        // `--help` and `-h` are answered before dispatch (`help::for_invocation`);
+        // the bare word still lands here.
+        Some("help") => {
             println!("{}", help_text());
             std::process::ExitCode::SUCCESS
         }
@@ -55,7 +57,7 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
     }
 }
 
-fn help_text() -> String {
+pub(crate) fn help_text() -> String {
     let prog = crate::prog();
     format!(
         "{prog} observe - record dangerous asks that reach an agent in CONVERSATION.\n\
