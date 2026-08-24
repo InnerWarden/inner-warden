@@ -1151,34 +1151,44 @@ fn cmd_uninstall_self(purge: bool) -> std::process::ExitCode {
     // 3. Remove the binary, but only where that is the right move. On Unix a
     // running process can unlink its own executable and keep running from the
     // open inode; on Windows the file is locked, so we print the path instead.
-    let mut left_behind = false;
-    match (removal, exe.as_deref()) {
+    //
+    // Written as an expression rather than a mutated flag: on Windows the
+    // `RemoveHere` arm is only the `cfg(not(unix))` half, which always leaves the
+    // file, so an initial `false` there is assigned and never read. Clippy calls
+    // that out under `-D warnings` and it only appears on the Windows target,
+    // which is a reminder that a green clippy on one OS is not a green clippy.
+    let left_behind = match (removal, exe.as_deref()) {
         (Some(upgrade_plan::BinaryRemoval::RemoveHere), Some(exe)) => {
             #[cfg(unix)]
-            match std::fs::remove_file(exe) {
-                Ok(()) => println!("  binary  : removed {}", exe.display()),
-                Err(e) => {
-                    // The probe said writable and the unlink still failed, so
-                    // something changed underneath us. Report it rather than
-                    // claiming a clean removal.
-                    println!("  binary  : could not remove {} ({e})", exe.display());
-                    left_behind = true;
+            {
+                match std::fs::remove_file(exe) {
+                    Ok(()) => {
+                        println!("  binary  : removed {}", exe.display());
+                        false
+                    }
+                    Err(e) => {
+                        // The probe said writable and the unlink still failed, so
+                        // something changed underneath us. Report it rather than
+                        // claiming a clean removal.
+                        println!("  binary  : could not remove {} ({e})", exe.display());
+                        true
+                    }
                 }
             }
             #[cfg(not(unix))]
             {
                 println!("  binary  : a running program cannot delete itself on this OS");
                 println!("            remove it with:  del \"{}\"", exe.display());
-                left_behind = true;
+                true
             }
         }
         // Already announced up front, before anything was destroyed.
-        (Some(_), _) => left_behind = true,
+        (Some(_), _) => true,
         (None, _) => {
             println!("  binary  : could not resolve this executable's path");
-            left_behind = true;
+            true
         }
-    }
+    };
 
     println!();
     if left_behind {
