@@ -227,6 +227,113 @@ pub fn cmd(_rest: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// What Telegram said when we asked which chat this bot can talk to.
+enum ChatLookup {
+    Found(String),
+    /// The token works, but nobody has messaged the bot, so it has no chat to
+    /// reply to. This is the normal state right after @BotFather hands over a
+    /// token, and it is recoverable by the operator in five seconds.
+    NoMessagesYet,
+    BadToken,
+    Unreachable(String),
+}
+
+/// Pull the most recent chat id out of a Telegram `getUpdates` payload.
+///
+/// Kept separate from the request so the field walk can be read on its own. Most
+/// recent first: a bot that has been messaged before should follow the
+/// conversation the operator just used, not the oldest one it ever saw.
+fn chat_id_from_updates(body: &serde_json::Value) -> Option<String> {
+    let updates = body.get("result")?.as_array()?;
+    updates.iter().rev().find_map(|update| {
+        // A plain message is the common case; the others cover someone who
+        // added the bot to a group or edited their first message instead.
+        [
+            "message",
+            "edited_message",
+            "channel_post",
+            "my_chat_member",
+        ]
+        .iter()
+        .find_map(|key| {
+            update
+                .get(key)?
+                .get("chat")?
+                .get("id")?
+                .as_i64()
+                .map(|id| id.to_string())
+        })
+    })
+}
+
+fn lookup_chat_id(token: &str) -> ChatLookup {
+    let agent = crate::http_io::agent_with_timeout(std::time::Duration::from_secs(10));
+    let url = format!("https://api.telegram.org/bot{token}/getUpdates");
+    match agent.get(&url).call() {
+        Ok(mut response) => match response.body_mut().read_json::<serde_json::Value>() {
+            Ok(body) => match chat_id_from_updates(&body) {
+                Some(id) => ChatLookup::Found(id),
+                None => ChatLookup::NoMessagesYet,
+            },
+            Err(error) => ChatLookup::Unreachable(error.to_string()),
+        },
+        // Telegram answers 401 for a wrong token and 404 for a malformed one.
+        // Both mean the same thing to the operator: what you pasted is not it.
+        Err(error) => match crate::http_io::status_of(&error) {
+            Some(401) | Some(404) => ChatLookup::BadToken,
+            _ => ChatLookup::Unreachable(error.to_string()),
+        },
+    }
+}
+
+/// Get the chat id without making the operator leave the wizard.
+///
+/// Falls back to typing it by hand, always. An automatic step that can fail must
+/// not become the only way through, or a network hiccup costs someone their
+/// alerts entirely.
+fn resolve_chat_id(theme: &ColorfulTheme, token: &str) -> Option<String> {
+    let mut asked_them_to_message_it = false;
+    loop {
+        match lookup_chat_id(token) {
+            ChatLookup::Found(id) => {
+                println!("    ✓ found your chat automatically (id {id}) - nothing to look up.");
+                return Some(id);
+            }
+            ChatLookup::BadToken => {
+                println!("    – Telegram did not accept that token.");
+                println!("      Check you copied all of it from @BotFather, including the part before the colon.");
+                return None;
+            }
+            ChatLookup::Unreachable(error) => {
+                println!("    – could not reach Telegram ({error}).");
+                break;
+            }
+            ChatLookup::NoMessagesYet => {
+                if !asked_them_to_message_it {
+                    println!("    Your bot has not been messaged yet. It can only send to a chat it has seen.");
+                    asked_them_to_message_it = true;
+                }
+                let retry = Confirm::with_theme(theme)
+                    .with_prompt("    Open Telegram, send your bot any message, then answer yes to look again")
+                    .default(true)
+                    .interact()
+                    .unwrap_or(false);
+                if !retry {
+                    break;
+                }
+            }
+        }
+    }
+
+    let typed: String = Input::with_theme(theme)
+        .with_prompt("    Telegram chat id (blank to skip Telegram)")
+        .allow_empty(true)
+        .interact_text()
+        .unwrap_or_default();
+    let typed = typed.trim().to_string();
+    (!typed.is_empty()).then_some(typed)
+}
+
 /// Ask which alert channels to use (any mix) and collect the easy input for each.
 /// Slack/Discord = paste a webhook URL; Telegram = bot token + chat id (with a
 /// one-line how-to). Sends a test ping so the user SEES it works.
@@ -235,13 +342,36 @@ fn configure_alerts(theme: &ColorfulTheme, prog: &str) {
         println!("  (you already have alerts - picking channels here ADDS to them)");
     }
     let channels: &[&str] = &["Telegram", "Slack", "Discord"];
-    let picks = MultiSelect::with_theme(theme)
-        .with_prompt("  Which channels?  (↑↓ move · SPACE to pick · ENTER to confirm - pick as many as you want)")
-        .items(channels)
-        .interact()
-        .unwrap_or_default();
+
+    // Telegram starts TICKED. Reaching this function means the operator already
+    // answered yes to being notified, so an empty tick list is never what they
+    // meant; it is what happens when someone presses ENTER without knowing SPACE
+    // toggles. That happened on a real first run: "yes, notify me" was answered,
+    // no channel came out the other side, and the wizard called it done.
+    let defaults = [true, false, false];
+    let prompt = "  Which channels?  (SPACE toggles · ENTER confirms)";
+    let ask = || {
+        MultiSelect::with_theme(theme)
+            .with_prompt(prompt)
+            .items(channels)
+            .defaults(&defaults)
+            .interact()
+            .unwrap_or_default()
+    };
+
+    let mut picks = ask();
     if picks.is_empty() {
-        println!("  – no channel picked; add later:  {prog} notify --slack-webhook <URL>");
+        // Say what the key does rather than repeating the same prompt: the first
+        // pass already showed it and it did not land.
+        println!("  Nothing is ticked. Move with ↑↓, press SPACE to tick a channel, then ENTER.");
+        picks = ask();
+    }
+    if picks.is_empty() {
+        // Never let "yes, notify me" end in silence. Saying alerts are OFF is the
+        // whole point: the previous wording read like an optional extra note.
+        println!("  – alerts are OFF. You asked to be notified and no channel was set.");
+        println!("    Turn them on any time:");
+        println!("        {prog} notify --telegram-token <TOKEN> --telegram-chat <CHAT_ID>");
         return;
     }
 
@@ -251,26 +381,26 @@ fn configure_alerts(theme: &ColorfulTheme, prog: &str) {
         match channels[i] {
             "Telegram" => {
                 println!(
-                    "    Telegram - create a bot with @BotFather, copy its token, then get your chat id."
+                    "    Telegram - open @BotFather, send /newbot, copy the token it gives you."
                 );
                 let token = Password::with_theme(theme)
                     .with_prompt("    Telegram bot token")
                     .allow_empty_password(true)
                     .interact()
                     .unwrap_or_default();
-                if token.trim().is_empty() {
+                let token = token.trim().to_string();
+                if token.is_empty() {
                     println!("    – no token; Telegram skipped.");
                     continue;
                 }
-                let chat: String = Input::with_theme(theme)
-                    .with_prompt("    Telegram chat id")
-                    .allow_empty(true)
-                    .interact_text()
-                    .unwrap_or_default();
-                if chat.trim().is_empty() {
-                    println!("    – no chat id; Telegram skipped.");
+                // The chat id is where people gave up. The old wizard said "then
+                // get your chat id" and offered no way to get one, so finishing
+                // meant leaving the wizard, running curl against the Telegram API
+                // and reading JSON. Ask Telegram instead.
+                let Some(chat) = resolve_chat_id(theme, &token) else {
+                    println!("    – Telegram skipped.");
                     continue;
-                }
+                };
                 args.push("--telegram-token".into());
                 args.push(token);
                 args.push("--telegram-chat".into());
@@ -310,7 +440,9 @@ fn configure_alerts(theme: &ColorfulTheme, prog: &str) {
     }
 
     if configured == 0 {
-        println!("  – nothing configured; add later:  {prog} notify --slack-webhook <URL>");
+        println!("  – alerts are OFF. A channel was picked but nothing was entered for it.");
+        println!("    Turn them on any time:");
+        println!("        {prog} notify --telegram-token <TOKEN> --telegram-chat <CHAT_ID>");
         return;
     }
     // Fire a test alert so the user immediately sees the channel(s) work.

@@ -1,6 +1,6 @@
 {
   "name": "innerwarden",
-  "version": "1.4.1",
+  "version": "1.4.2",
   "description": "InnerWarden Community: open-source guardrail for AI coding agents. Screens the shell commands and MCP/tool calls your agent runs and returns allow / review / deny, before it runs.",
   "bin": {
     "innerwarden": "bin/innerwarden.js",
@@ -12,12 +12,12 @@
     "LICENSE"
   ],
   "optionalDependencies": {
-    "@innerwarden/cli-linux-x64": "1.4.1",
-    "@innerwarden/cli-linux-arm64": "1.4.1",
-    "@innerwarden/cli-darwin-x64": "1.4.1",
-    "@innerwarden/cli-darwin-arm64": "1.4.1",
-    "@innerwarden/cli-win32-x64": "1.4.1",
-    "@innerwarden/cli-win32-arm64": "1.4.1"
+    "@innerwarden/cli-linux-x64": "1.4.2",
+    "@innerwarden/cli-linux-arm64": "1.4.2",
+    "@innerwarden/cli-darwin-x64": "1.4.2",
+    "@innerwarden/cli-darwin-arm64": "1.4.2",
+    "@innerwarden/cli-win32-x64": "1.4.2",
+    "@innerwarden/cli-win32-arm64": "1.4.2"
   },
   "engines": {
     "node": ">=16"

@@ -3,6 +3,39 @@
 All notable changes to InnerWarden are documented here. This project
 follows semantic versioning.
 
+## 1.4.2 - 2026-08-24
+
+Setting up Telegram alerts is now something the wizard does, rather than
+something it asks you to go and do elsewhere.
+
+### Fixed
+
+- The setup wizard lost the answer to its own question. Answering **yes** to
+  "Get notified when a command is flagged?" led to a channel picker where
+  pressing ENTER selected nothing, and the wizard accepted the empty result,
+  printed a note that read like an optional aside, and moved on. Nothing was
+  written to disk. Someone who asked to be notified was not notified and was
+  never told.
+
+  Telegram now starts ticked, so ENTER alone does the obvious thing. An empty
+  selection is explained once (SPACE toggles) and asked again. If nothing is
+  chosen the wizard says **alerts are OFF** instead of implying success, and the
+  same applies when a channel is picked but left blank. Both recovery lines now
+  name the Telegram flags rather than suggesting a Slack webhook regardless of
+  what was asked for.
+
+### Added
+
+- The wizard fetches your Telegram chat id instead of demanding it. It used to
+  say "then get your chat id" and offer no way to get one, so finishing meant
+  leaving the wizard to call the Telegram API and read JSON by hand. It now asks
+  `getUpdates` and reports the id it found. A bot nobody has messaged yet has no
+  chat to reply to, which is the normal state seconds after @BotFather hands over
+  a token, so that case is explained and retried rather than reported as a
+  failure. A rejected token says it was rejected. Typing the id by hand stays
+  available throughout: an automatic step that can fail must not become the only
+  way through.
+
 ## 1.4.1 - 2026-08-24
 
 Three places the product asserted one thing and behaved otherwise. None let an
