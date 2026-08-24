@@ -1371,6 +1371,69 @@ fn read_guard_mode(home: &Path, agent: &str) -> Option<GuardMode> {
 
 #[cfg(test)]
 mod tests {
+
+    /// `disconnect --all` must not be read as "the agent named --all".
+    ///
+    /// The `!` in `.filter(|a| !a.starts_with("--"))` is what separates a flag
+    /// from a name. A mutant that deleted it survived: nothing asked what
+    /// `disconnect --all` does, so inverting the filter passed every test while
+    /// turning a disconnect-everything into a lookup for an agent that cannot
+    /// exist.
+    ///
+    /// FAILS ON REVERT: delete the `!`.
+    #[test]
+    fn disconnect_all_is_a_flag_not_an_agent_name() {
+        let home = tempfile::TempDir::new().unwrap();
+        let out = run(home.path(), &["disconnect".into(), "--all".into()]);
+        let joined = out.join("\n");
+        assert!(
+            !joined.contains("no guardable agent named `--all`"),
+            "--all is a flag; reading it as a name is the mutant that survived:\n{joined}"
+        );
+    }
+
+    /// A named target that does not exist still says so, or the assertion above
+    /// would pass on a function that ignores its argument entirely.
+    #[test]
+    fn disconnect_a_name_that_does_not_exist_says_which_name() {
+        let home = tempfile::TempDir::new().unwrap();
+        let out = run(home.path(), &["disconnect".into(), "nope".into()]);
+        assert!(
+            out.join("\n").contains("no guardable agent named `nope`"),
+            "a real name must still be looked up: {out:?}"
+        );
+    }
+
+    /// The lines-only adapters are the public entry points, and three mutants
+    /// survived on them by returning empty or default: nothing called them and
+    /// checked the result.
+    ///
+    /// FAILS ON REVERT: make `run` return `vec![]`, or `run_outcome` return
+    /// `Default::default()`.
+    #[test]
+    fn the_lines_adapters_return_what_the_outcome_carries() {
+        let home = tempfile::TempDir::new().unwrap();
+        let args = vec!["list".to_string()];
+
+        let outcome = run_outcome(home.path(), &args);
+        let lines = run(home.path(), &args);
+
+        assert!(
+            !outcome.lines.is_empty(),
+            "run_outcome must produce output for `list`, even on an empty home"
+        );
+        assert_eq!(
+            lines, outcome.lines,
+            "`run` is the lines-only view of `run_outcome`; returning anything \
+             else makes the two entry points disagree"
+        );
+
+        let via_bin = run_with_guard_bin(home.path(), &args, "/usr/local/bin/innerwarden");
+        assert!(
+            !via_bin.is_empty(),
+            "run_with_guard_bin must produce the same shape of output"
+        );
+    }
     /// Absence of a SIGNATURE is not absence of an agent.
     ///
     /// Detection matches known agents by command line, so a bespoke script, a
