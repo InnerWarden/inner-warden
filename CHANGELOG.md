@@ -3,6 +3,45 @@
 All notable changes to InnerWarden are documented here. This project
 follows semantic versioning.
 
+## 1.4.1 - 2026-08-24
+
+Three places the product asserted one thing and behaved otherwise. None let an
+attack through; all three cost a new user time or trust, which is worse for a
+security tool than a missing feature.
+
+### Fixed
+
+- `innerwarden notify --slack-webhook <url> --test` tested the wrong channel. It
+  planned the test against the configuration from BEFORE the write, so on a
+  fresh config it sent nothing and said nothing, and on a host that already had
+  a channel it tested the OLD one and printed a success line for a channel it
+  had never contacted. Setting a channel and testing it in one command is the
+  obvious thing to do, `--help` suggests it, and the setup wizard does it.
+
+  The test covering this was named `..._fires_the_just_set_channel` and asserted
+  that the channel already in the file fired, not the one just set. The name
+  promised the fix and the assertion pinned the bug.
+
+- `innerwarden status` always reported the local dashboard as not running. Two
+  constants were both called `DEFAULT_BIND`, in different modules, with
+  different ports, and the status probe used the `serve` one to look for a
+  dashboard that binds the other. The first command written for beginners was
+  wrong about the second thing it says.
+
+- `innerwarden uninstall` left every non-Claude agent calling a binary that no
+  longer existed. It removed the Claude Code hook only, while Cursor, Codex and
+  Gemini are wired by writing this binary's absolute path into their MCP config,
+  and then it deleted the binary. `innerwarden agents disconnect`, the command
+  that would have fixed it, went with it. Uninstall now unwires every agent
+  first, through the same entry point `agents disconnect --all` uses.
+
+- The npm launcher told supported platforms they were unsupported. After an
+  uninstall (or an install with `--ignore-scripts`) the launcher survives
+  without its binary and reported "no prebuilt binary for linux-x64" one line
+  before listing linux and x64 as supported. It now distinguishes a missing
+  binary on a published platform from a platform that has no build, and names
+  the reinstall.
+
 ## 1.4.0 - 2026-08-23
 
 The first ten minutes. A new user could install this, follow what it printed,
