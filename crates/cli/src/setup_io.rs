@@ -248,16 +248,21 @@ fn chat_id_from_updates(body: &serde_json::Value) -> Option<String> {
     updates.iter().rev().find_map(|update| {
         // A plain message is the common case; the others cover someone who
         // added the bot to a group or edited their first message instead.
-        ["message", "edited_message", "channel_post", "my_chat_member"]
-            .iter()
-            .find_map(|key| {
-                update
-                    .get(key)?
-                    .get("chat")?
-                    .get("id")?
-                    .as_i64()
-                    .map(|id| id.to_string())
-            })
+        [
+            "message",
+            "edited_message",
+            "channel_post",
+            "my_chat_member",
+        ]
+        .iter()
+        .find_map(|key| {
+            update
+                .get(key)?
+                .get("chat")?
+                .get("id")?
+                .as_i64()
+                .map(|id| id.to_string())
+        })
     })
 }
 
@@ -375,7 +380,9 @@ fn configure_alerts(theme: &ColorfulTheme, prog: &str) {
     for &i in &picks {
         match channels[i] {
             "Telegram" => {
-                println!("    Telegram - open @BotFather, send /newbot, copy the token it gives you.");
+                println!(
+                    "    Telegram - open @BotFather, send /newbot, copy the token it gives you."
+                );
                 let token = Password::with_theme(theme)
                     .with_prompt("    Telegram bot token")
                     .allow_empty_password(true)
