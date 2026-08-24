@@ -231,7 +231,12 @@ fn main() -> std::process::ExitCode {
         // makes every host verb reachable by name, with no ambiguity about which
         // layer answers.
         Some("host") => upsell_io::cmd_host(&args[1..]),
-        Some("--version") | Some("-V") | Some("version") => {
+        // `-v` is here because it is what people type. It was the one short form
+        // missing, and the miss was expensive twice over: `innerwarden -v`
+        // answered "unknown command `-v`" and then printed the whole help, so the
+        // one line explaining the problem was pushed off the top of an 80-column
+        // screen by 61 lines of usage. Nothing else in this CLI claims `-v`.
+        Some("--version") | Some("-V") | Some("-v") | Some("version") => {
             println!("{} {}", prog(), env!("CARGO_PKG_VERSION"));
             std::process::ExitCode::SUCCESS
         }
@@ -266,8 +271,9 @@ fn main() -> std::process::ExitCode {
             } else if upsell::is_host_command(other) {
                 upsell_io::show_upsell(other)
             } else {
-                eprintln!("{}: unknown command `{other}`\n", prog());
-                print_help();
+                for line in unknown_command_lines(&prog(), other) {
+                    eprintln!("{line}");
+                }
                 std::process::ExitCode::from(2)
             }
         }
@@ -1028,10 +1034,28 @@ fn uninstall_plan_lines(home: &std::path::Path) -> Vec<String> {
             "none".to_string()
         }
     ));
-    out.push(match std::env::current_exe() {
-        Ok(exe) => format!("  binary  : {}", exe.display()),
-        Err(_) => "  binary  : could not resolve this executable's path".to_string(),
-    });
+    // Ask the same question the real run asks, so the preview cannot promise a
+    // removal the run will not perform. Listing the path unconditionally was the
+    // dry-run's own version of the defect: on an npm install it named a file
+    // that uninstall must not touch.
+    match std::env::current_exe() {
+        Ok(exe) => {
+            let plan = upgrade_plan::plan_binary_removal(
+                upgrade_plan::managed_by(&exe),
+                can_write_beside(&exe),
+            );
+            match plan {
+                upgrade_plan::BinaryRemoval::RemoveHere => {
+                    out.push(format!("  binary  : {}", exe.display()))
+                }
+                other => {
+                    let (lines, _) = upgrade_plan::binary_removal_lines(&other, &exe);
+                    out.extend(lines);
+                }
+            }
+        }
+        Err(_) => out.push("  binary  : could not resolve this executable's path".to_string()),
+    }
     out.push(String::new());
     out.push("Nothing was changed. Re-run without --dry-run to do it.".into());
     out
@@ -1051,6 +1075,32 @@ fn cmd_uninstall_self(purge: bool) -> std::process::ExitCode {
         }
     };
     println!("Uninstalling {COMMUNITY_NAME}...");
+
+    // Decide about the binary BEFORE destroying anything.
+    //
+    // The old order removed the hooks, the config and the API key first and only
+    // then tried to unlink the binary. That is the one step that can fail, and
+    // it ran last, so a failure left the worst combination: the recoverable
+    // state gone, the binary and both npm launchers still there, and
+    // `ExitCode::SUCCESS` printed over it. The remedy it offered
+    // ("remove it with `rm ...`") needed the very root the run did not have, and
+    // for an npm copy it is the move `upgrade_plan::cannot_replace_advice`
+    // already tells people not to make.
+    let exe = std::env::current_exe().ok();
+    let removal = exe.as_deref().map(|exe| {
+        upgrade_plan::plan_binary_removal(upgrade_plan::managed_by(exe), can_write_beside(exe))
+    });
+    // Say it up front, while the machine is still intact and the answer can
+    // change what the operator does.
+    if let (Some(plan), Some(exe)) = (removal.as_ref(), exe.as_deref()) {
+        let (lines, _) = upgrade_plan::binary_removal_lines(plan, exe);
+        for line in &lines {
+            println!("{line}");
+        }
+        if !lines.is_empty() {
+            println!();
+        }
+    }
 
     // 0. Unwire EVERY agent first, not just the hooked one.
     //
@@ -1098,25 +1148,77 @@ fn cmd_uninstall_self(purge: bool) -> std::process::ExitCode {
     }
     let _ = purge; // local state lives under config_dir; already covered.
 
-    // 3. Remove the binary. On Unix a running process can unlink its own
-    // executable and keep running from the open inode; on Windows the file is
-    // locked, so we print the path for the user to delete.
-    if let Ok(exe) = std::env::current_exe() {
-        #[cfg(unix)]
-        match std::fs::remove_file(&exe) {
-            Ok(()) => println!("  binary  : removed {}", exe.display()),
-            Err(e) => println!("  binary  : remove it with `rm {}` ({e})", exe.display()),
+    // 3. Remove the binary, but only where that is the right move. On Unix a
+    // running process can unlink its own executable and keep running from the
+    // open inode; on Windows the file is locked, so we print the path instead.
+    //
+    // Written as an expression rather than a mutated flag: on Windows the
+    // `RemoveHere` arm is only the `cfg(not(unix))` half, which always leaves the
+    // file, so an initial `false` there is assigned and never read. Clippy calls
+    // that out under `-D warnings` and it only appears on the Windows target,
+    // which is a reminder that a green clippy on one OS is not a green clippy.
+    let left_behind = match (removal, exe.as_deref()) {
+        (Some(upgrade_plan::BinaryRemoval::RemoveHere), Some(exe)) => {
+            #[cfg(unix)]
+            {
+                match std::fs::remove_file(exe) {
+                    Ok(()) => {
+                        println!("  binary  : removed {}", exe.display());
+                        false
+                    }
+                    Err(e) => {
+                        // The probe said writable and the unlink still failed, so
+                        // something changed underneath us. Report it rather than
+                        // claiming a clean removal.
+                        println!("  binary  : could not remove {} ({e})", exe.display());
+                        true
+                    }
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                println!("  binary  : a running program cannot delete itself on this OS");
+                println!("            remove it with:  del \"{}\"", exe.display());
+                true
+            }
         }
-        #[cfg(not(unix))]
-        {
-            println!("  binary  : a running program cannot delete itself on this OS");
-            println!("            remove it with:  del \"{}\"", exe.display());
+        // Already announced up front, before anything was destroyed.
+        (Some(_), _) => true,
+        (None, _) => {
+            println!("  binary  : could not resolve this executable's path");
+            true
         }
-    }
+    };
 
     println!();
+    if left_behind {
+        // Never say "removed" over a machine that still has it. The old code
+        // returned SUCCESS unconditionally, so a half-uninstall reported clean
+        // and the next `innerwarden` call announced the product was broken.
+        println!("{COMMUNITY_NAME} partly removed: the binary is still on this machine.");
+        println!("Follow the line above to finish, then restart your agent.");
+        return std::process::ExitCode::from(1);
+    }
     println!("{COMMUNITY_NAME} removed. Restart your agent to drop the hook.");
     std::process::ExitCode::SUCCESS
+}
+
+/// Can this process write in the directory the binary lives in?
+///
+/// Writes and removes a real file rather than reading mode bits, which is the
+/// only method that does not guess wrong under a read-only mount, an immutable
+/// flag or a full disk. `upgrade::can_replace` reaches the same answer the same
+/// way for the same reason; the staging path is shared so the two can never
+/// disagree about which file they mean.
+fn can_write_beside(target: &std::path::Path) -> bool {
+    let staged = upgrade_plan::staging_path(target);
+    match std::fs::write(&staged, b"") {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&staged);
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 /// `innerwarden serve [--bind IP:PORT]` - expose the guardrail over plain HTTP on
@@ -1396,6 +1498,68 @@ fn help_text() -> String {
     )
 }
 
+/// What to say when a token is not a verb this CLI knows.
+///
+/// Pure so the shape can be asserted without spawning anything.
+///
+/// It used to print the one-line error and then the ENTIRE help: 61 lines of
+/// stdout, which wrap to 88 on an 80-column terminal. The reason for the failure
+/// scrolled off the top, so the reader saw a wall of usage and no error. Help is
+/// one command away and it is named here; printing it uninvited is what buried
+/// the message.
+fn unknown_command_lines(prog: &str, attempted: &str) -> Vec<String> {
+    let mut out = vec![format!("{prog}: unknown command `{attempted}`")];
+    // A token starting with `-` is a mistyped flag, not a mistyped verb, and the
+    // list of verbs is no use to someone who wanted a flag.
+    if attempted.starts_with('-') {
+        out.push(format!(
+            "Flags this accepts: --help, --version. Try:  {prog} --help"
+        ));
+    } else {
+        out.push(format!("Run  {prog} --help  for the list of commands."));
+    }
+    out
+}
+
+#[cfg(test)]
+mod unknown_command_tests {
+    use super::unknown_command_lines;
+
+    /// THE REGRESSION. The error must be readable on the screen it lands on.
+    ///
+    /// FAILS ON REVERT: restore `print_help()` after the eprintln and the output
+    /// is 60+ lines again.
+    #[test]
+    fn an_unknown_command_does_not_print_the_whole_help() {
+        let lines = unknown_command_lines("innerwarden", "statsu");
+        assert!(
+            lines.len() <= 3,
+            "the error must not be buried; got {} lines:\n{}",
+            lines.len(),
+            lines.join("\n")
+        );
+        assert!(
+            lines[0].contains("unknown command `statsu`"),
+            "the reason must be the first thing said:\n{}",
+            lines.join("\n")
+        );
+        assert!(
+            lines.join("\n").contains("--help"),
+            "help must still be one command away:\n{}",
+            lines.join("\n")
+        );
+    }
+
+    /// A mistyped FLAG is a different mistake from a mistyped VERB, and the list
+    /// of verbs does not help someone who wanted a flag.
+    #[test]
+    fn a_mistyped_flag_is_told_about_flags_not_verbs() {
+        let said = unknown_command_lines("innerwarden", "--verison").join("\n");
+        assert!(said.contains("--version"), "{said}");
+        assert!(!said.contains("list of commands"), "{said}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     /// A full uninstall must unwire EVERY agent before it deletes the binary.
@@ -1421,14 +1585,25 @@ mod tests {
         let disconnect = body
             .find("agents_io::cmd")
             .expect("uninstall must go through the same entry point as `agents disconnect --all`");
+        // Anchor on the REMOVAL, not on `current_exe`.
+        //
+        // It used to anchor on `current_exe`, and that broke the moment uninstall
+        // started READING its own path early in order to decide, before anything
+        // destructive, whether the binary is npm's to remove. Reading a path is
+        // not deleting a file, so the old anchor reported a violation that was
+        // not one. The property being defended has always been "unwire before the
+        // file goes", so the assertion now names the call that makes it go.
         let remove_binary = body
-            .find("current_exe")
+            .find("remove_file")
             .expect("uninstall removes the binary");
         assert!(
             disconnect < remove_binary,
             "the disconnect has to happen BEFORE the binary is deleted: \
              an MCP-wired agent points at that path"
         );
+        // This scan is the cheap half. `tests/uninstall_is_honest.rs` runs the
+        // real binary and asserts the same ordering from the outside, which is
+        // the half a source scan can never provide.
     }
 
     /// Two constants named DEFAULT_BIND, in two modules, with different ports,

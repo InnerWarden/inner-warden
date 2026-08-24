@@ -42,6 +42,19 @@ function binaryMissingMessage(platform, arch) {
     // platform binary and leaves this shim on PATH, and the shim then reported
     // linux-x64 as having no build while listing linux and x64 as supported.
     // The reader concludes the product does not run on their machine.
+    // The remedy is read at the exact moment the reader has nothing working, so
+    // it must be a command that RUNS. `npm install -g` writes to npm's global
+    // prefix; on a distro-packaged Node that prefix is /usr/local/lib/node_modules
+    // and root-owned, so on Linux it exits EACCES. Measured on a clean Ubuntu
+    // 26.04 machine. Handing that to someone whose install is already broken
+    // spends their next attempt on a second failure.
+    //
+    // The shell installer needs no root on any platform: it verifies the signed
+    // binary and installs into the user's own ~/.local/bin.
+    const rootless =
+      platform === "win32"
+        ? `  irm https://innerwarden.com/free.ps1 | iex\n`
+        : `  curl -fsSL https://innerwarden.com/free | sh\n`;
     return (
       `InnerWarden: ${here} IS supported, but its binary is not installed.\n` +
       `The launcher is here and the program it launches is missing, which\n` +
@@ -50,6 +63,9 @@ function binaryMissingMessage(platform, arch) {
       `  * the install ran with --ignore-scripts or --no-optional;\n` +
       `  * the platform package failed to download.\n` +
       `Reinstall:\n` +
+      rootless +
+      `Or through npm, which on Linux needs sudo because its global prefix is\n` +
+      `root-owned there:\n` +
       `  npm uninstall -g innerwarden && npm install -g innerwarden\n`
     );
   }
