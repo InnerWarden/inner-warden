@@ -12,7 +12,22 @@ concurrency:
   cancel-in-progress: true
 
 on:
+  # `main` ONLY. An unfiltered `push:` alongside `pull_request:` ran the entire
+  # suite TWICE for every pull request: once for the branch push and once for the
+  # PR event. Measured on PR #132, every job appeared twice.
+  #
+  # That is half the Actions bill for nothing, on an account that reached
+  # 45,039 of its 50,000 included minutes. It also made the `coverage` context
+  # ambiguous: that job is `if: github.event_name == 'pull_request'`, so the
+  # branch-push run published it as SKIPPED while the PR run published SUCCESS,
+  # two results for one context name, whichever finished last winning. That
+  # ambiguity is why `coverage` could not be made a required check.
+  #
+  # Pushes to `main` still run, which is what `release-guard.yml` waits for: its
+  # gate looks for a completed `ci.yml` run with `head_sha` equal to the merge
+  # commit, and the merge commit is a push to `main`.
   push:
+    branches: [main]
   pull_request:
   # Manual dispatch: during the 2026-08-06 GitHub Actions incident the push
   # webhook dispatch was swallowed for hours while manual dispatches worked,
