@@ -3,6 +3,54 @@
 All notable changes to InnerWarden are documented here. This project
 follows semantic versioning.
 
+## 1.4.3 - 2026-08-24
+
+Three things the product said that were not true, all found by walking a real
+install on a clean machine. None of them let an attack through; all three cost a
+new user their first ten minutes, which for a security tool is worse.
+
+### Fixed
+
+- `innerwarden uninstall` said "removed" over a machine it had half-uninstalled.
+  Without root against an npm install it destroyed the hook, the config
+  directory and the API key first, then failed to unlink the binary, then
+  printed a success line and exited 0. The next `innerwarden` call answered
+  "linux-x64 IS supported, but its binary is not installed", so the product
+  reported itself broken one command after reporting success.
+
+  The remedy it offered was wrong twice: `rm <path>` needs exactly the root the
+  run had just proven it did not have, and on an npm copy it is the move this
+  crate already documents as wrong, because npm owns the `innerwarden` and `iw`
+  launchers too. `upgrade` has consulted `managed_by` before acting since 1.4.0;
+  `uninstall` never did.
+
+  It now decides before it destroys. An npm-managed copy is left to
+  `npm uninstall -g innerwarden`, which removes the binary, both launchers and
+  npm's record of them. A direct install that cannot be written to says so up
+  front, while the machine is still intact. Anything left behind is reported as
+  left behind and exits non-zero. `--dry-run` previews the same decision, rather
+  than listing a path the real run must not touch.
+
+- The npm launcher's recovery instruction was the command that fails. When the
+  platform binary is missing it is read at the exact moment the reader has
+  nothing working, and it said `npm uninstall -g innerwarden && npm install -g
+  innerwarden`. On a distro-packaged Node, npm's global prefix is
+  `/usr/local/lib/node_modules` and root-owned, so on Linux that exits EACCES.
+  It now leads with the installer that needs no root, per platform, and still
+  offers npm with the sudo requirement stated.
+
+  The test covering that message asserted it contained
+  `npm install -g innerwarden`, which is a substring of the very command being
+  handed out. It passed before the fix and would have passed after it, either
+  way. It has been replaced rather than added to.
+
+- `innerwarden -v` answered "unknown command `-v`" and then printed the whole
+  help. `--version`, `-V` and `version` all worked; the one short form people
+  actually type was the one missing, and the failure path buried its own reason
+  under 61 lines of usage that wrap to 88 on an 80-column terminal. `-v` now
+  answers, and an unrecognised token gets its reason plus a pointer to `--help`
+  instead of the manual. `--help` itself is unchanged.
+
 ## 1.4.2 - 2026-08-24
 
 Setting up Telegram alerts is now something the wizard does, rather than

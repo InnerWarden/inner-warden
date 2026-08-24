@@ -262,9 +262,156 @@ pub fn cannot_replace_advice(target: &Path, is_root: bool) -> Vec<String> {
     out
 }
 
+/// What `uninstall` should do about the binary it is running from.
+///
+/// Separate from the doing so the decision can be made BEFORE anything is
+/// destroyed. The old order removed the config, the key and the hooks first and
+/// only then discovered it could not remove the binary, which is the worst of
+/// both: the recoverable state is gone and the thing you wanted gone is still
+/// there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BinaryRemoval {
+    /// This copy belongs to npm. Do not unlink it: npm also owns the `innerwarden`
+    /// and `iw` launchers, and removing the file by hand leaves both behind
+    /// pointing at nothing while npm still believes it ships the version. The
+    /// same reasoning `cannot_replace_advice` already applies to `upgrade`.
+    LeaveToNpm,
+    /// We can write to it, so remove it here.
+    RemoveHere,
+    /// A direct install we cannot write to. Say so before touching anything else.
+    CannotRemove,
+}
+
+/// Decide what to do about the binary, from facts gathered by the caller.
+///
+/// Pure on purpose: `writable` is passed in rather than probed here, because
+/// probing means writing to the target's directory and that cannot happen inside
+/// a unit test on any host. `upgrade` gathers the same fact with a real write
+/// (`can_replace`), which is the only method that does not guess wrong under a
+/// read-only mount or an immutable flag.
+pub fn plan_binary_removal(managed: Managed, writable: bool) -> BinaryRemoval {
+    match managed {
+        // Checked FIRST and independently of `writable`. A user-owned npm prefix
+        // IS writable, so a writability-first branch would delete npm's file
+        // exactly in the case the product already documents as the wrong move.
+        Managed::Npm => BinaryRemoval::LeaveToNpm,
+        Managed::Direct if writable => BinaryRemoval::RemoveHere,
+        Managed::Direct => BinaryRemoval::CannotRemove,
+    }
+}
+
+/// What to print about the binary, and whether anything is being left behind.
+///
+/// The bool is the half that was missing: the old code printed a line either way
+/// and returned `ExitCode::SUCCESS` unconditionally, so "InnerWarden Community
+/// removed" was said over a machine that still had InnerWarden on it.
+pub fn binary_removal_lines(plan: &BinaryRemoval, target: &Path) -> (Vec<String>, bool) {
+    match plan {
+        BinaryRemoval::LeaveToNpm => (
+            vec![
+                "  binary  : managed by npm, so npm removes it:".into(),
+                "                npm uninstall -g innerwarden".into(),
+                "            That also removes the `innerwarden` and `iw` launchers and".into(),
+                "            npm's record of them. Deleting the file by hand leaves all three."
+                    .into(),
+            ],
+            true,
+        ),
+        BinaryRemoval::CannotRemove => (
+            vec![
+                format!("  binary  : cannot remove {}", target.display()),
+                "            You do not have write access to it. Re-run with the".into(),
+                "            privileges that installed it, or remove it by hand.".into(),
+            ],
+            true,
+        ),
+        BinaryRemoval::RemoveHere => (Vec::new(), false),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The case that cost a real user a broken install: an npm copy is left to
+    /// npm even when the process could unlink it, because being able to is not
+    /// the same as it being right.
+    ///
+    /// FAILS ON REVERT: order the match on `writable` first and this returns
+    /// `RemoveHere` for a user-owned npm prefix.
+    #[test]
+    fn an_npm_copy_is_left_to_npm_even_when_writable() {
+        assert_eq!(
+            plan_binary_removal(Managed::Npm, true),
+            BinaryRemoval::LeaveToNpm
+        );
+        assert_eq!(
+            plan_binary_removal(Managed::Npm, false),
+            BinaryRemoval::LeaveToNpm
+        );
+    }
+
+    /// The other side, so this is not a guard that refuses everything: a direct
+    /// install we own is still removed here, and still exits clean.
+    #[test]
+    fn a_writable_direct_install_is_removed_here_and_leaves_nothing() {
+        let plan = plan_binary_removal(Managed::Direct, true);
+        assert_eq!(plan, BinaryRemoval::RemoveHere);
+        let (lines, left_behind) =
+            binary_removal_lines(&plan, Path::new("/usr/local/bin/innerwarden"));
+        assert!(lines.is_empty(), "nothing to announce when nothing is left");
+        assert!(!left_behind);
+    }
+
+    #[test]
+    fn an_unwritable_direct_install_cannot_be_removed() {
+        assert_eq!(
+            plan_binary_removal(Managed::Direct, false),
+            BinaryRemoval::CannotRemove
+        );
+    }
+
+    /// The remedy the old code printed needed the very root the uninstall did not
+    /// have, and this repo already documents that hand-deleting npm's file is
+    /// wrong (`cannot_replace_advice`). Neither branch may hand out `rm`.
+    ///
+    /// FAILS ON REVERT: the old line was
+    /// "binary  : remove it with `rm {path}` ({e})".
+    #[test]
+    fn neither_branch_tells_the_user_to_rm_the_binary() {
+        for plan in [BinaryRemoval::LeaveToNpm, BinaryRemoval::CannotRemove] {
+            let (lines, _) = binary_removal_lines(&plan, Path::new("/x/bin/innerwarden"));
+            let text = lines.join("\n");
+            assert!(
+                !text.contains("rm "),
+                "{plan:?} must not hand out a bare rm:\n{text}"
+            );
+        }
+    }
+
+    /// npm's branch must name npm's own command, because that is the one that
+    /// removes the launchers too.
+    #[test]
+    fn the_npm_branch_names_npms_own_uninstall() {
+        let (lines, left) = binary_removal_lines(&BinaryRemoval::LeaveToNpm, Path::new("/x"));
+        let text = lines.join("\n");
+        assert!(text.contains("npm uninstall -g innerwarden"), "{text}");
+        assert!(
+            text.contains("launchers"),
+            "the reason must travel with it:\n{text}"
+        );
+        assert!(left, "npm's copy is still on the machine when we finish");
+    }
+
+    /// Anything left behind must be reported as left behind, whatever the reason.
+    #[test]
+    fn every_branch_that_leaves_something_says_so() {
+        for plan in [BinaryRemoval::LeaveToNpm, BinaryRemoval::CannotRemove] {
+            let (lines, left) = binary_removal_lines(&plan, Path::new("/x/innerwarden"));
+            assert!(left, "{plan:?} leaves the binary and must report it");
+            assert!(!lines.is_empty(), "{plan:?} must explain what is left");
+        }
+    }
 
     /// npm's global install is the case where the obvious fix is the wrong one.
     #[test]
