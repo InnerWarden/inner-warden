@@ -38,7 +38,7 @@ trust; npm, deb, rpm, Scoop, ubi/eget/mise all fetch or embed them.
 
 Full detail + copy-paste commands: <https://innerwarden.com/docs/installation>.
 
-- **npm (recommended, all OSes):** `npm install -g innerwarden` / `npx innerwarden`. Prebuilt, signed provenance, no sudo, no postinstall.
+- **npm (all OSes):** `npm install -g innerwarden` / `npx innerwarden`. Prebuilt, signed provenance, no postinstall. Needs `sudo` on Linux: npm's global prefix is `/usr/local/lib/node_modules` on a distro-packaged Node and is root-owned, so without it the command exits EACCES before InnerWarden is reached.
 - **Debian/Ubuntu:** `sudo apt install ./innerwarden_<v>_amd64.deb`
 - **Fedora/RHEL/Rocky:** `sudo dnf install .../innerwarden-<v>-1.x86_64.rpm`
 - **macOS/Linux shell:** `curl -fsSL https://innerwarden.com/free | sh`

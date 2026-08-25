@@ -23,7 +23,8 @@ Claude Code hook) can refuse an action before it reaches its target.
 
 ## Quick install
 
-npm (every OS, prebuilt and signed, no sudo):
+npm (every OS, prebuilt and signed; needs `sudo` on Linux, where npm's global
+prefix is root-owned):
 
 ```sh
 npm install -g innerwarden
