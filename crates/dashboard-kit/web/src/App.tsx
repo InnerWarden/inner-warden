@@ -272,7 +272,26 @@ function bootstrapLoadStatus(resource: DashboardResource<DashboardBootstrap>): B
   return "error";
 }
 
-export function App({ extraScreens = [] }: { extraScreens?: readonly ScreenModule[] } = {}) {
+export function App({
+  extraScreens = [],
+  onMeta,
+}: {
+  extraScreens?: readonly ScreenModule[];
+  /**
+   * Called with each successful `guard/meta` reading, so a sibling of the shell
+   * can use a fact the shell has already fetched.
+   *
+   * It exists because the tour renders outside this component and needs to know
+   * whether this host runs Active Defence. Fetching that itself cost a SECOND
+   * request for the same fact, and a second request is not free: `guard/meta` is
+   * polled, and a consumer that counts the sequence -- as the posture journey
+   * does, failing the second reading to prove a stale claim gets withdrawn --
+   * silently had its 503 answered into the wrong caller. The dashboard read the
+   * same endpoint twice and the two readers disagreed about which answer was
+   * theirs.
+   */
+  onMeta?: (meta: DashboardMeta) => void;
+} = {}) {
   const contributed = contributedScreens(extraScreens);
   // The popstate listener is registered once and must not resubscribe when a
   // caller passes a fresh array literal on every render.
@@ -289,6 +308,10 @@ export function App({ extraScreens = [] }: { extraScreens?: readonly ScreenModul
   contributedRef.current = contributed;
 
   const [route, setRoute] = useState<ShellRoute>(() => routeFromLocation(extraScreens));
+  // Held in a ref so a caller passing a fresh closure on every render cannot
+  // restart the poll, the same reason `contributed` is held above.
+  const onMetaRef = useRef(onMeta);
+  onMetaRef.current = onMeta;
   const [meta, setMeta] = useState<DashboardMeta>();
   const [metaStatus, setMetaStatus] = useState<MetaStatus>("loading");
   const [bootstrapResource, setBootstrapResource] = useState<DashboardResource<DashboardBootstrap>>({ state: "loading" });
@@ -332,6 +355,8 @@ export function App({ extraScreens = [] }: { extraScreens?: readonly ScreenModul
         if (!active) return;
         setMeta(next);
         setMetaStatus("ready");
+        // Published rather than re-fetched by the caller. See `onMeta`.
+        onMetaRef.current?.(next);
       } catch {
         if (active) setMetaStatus("error");
       } finally {

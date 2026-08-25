@@ -144,6 +144,26 @@ export const COMMUNITY_TOUR_STEPS: readonly TourStep[] = [
   },
 ];
 
+/**
+ * The Community steps for a host, with the Active Defence pitch dropped when
+ * that host already runs Active Defence.
+ *
+ * The upgrade step is anchored on the upsell card so the pitch is made once, in
+ * one voice (see the comment on that step). That cuts both ways: once the card
+ * stops offering, this step has to stop too, or the tour becomes the second,
+ * stale copy the anchoring was meant to prevent. A missing anchor is not enough
+ * on its own -- `findTarget` returning null leaves the step rendered, just
+ * unanchored, so the pitch would still be read out to someone who already owns
+ * the product.
+ *
+ * Pure, and takes the answer as an argument, so both outcomes are reachable
+ * from a test without a server.
+ */
+export function communityTourSteps(activeDefenceInstalled: boolean): readonly TourStep[] {
+  if (!activeDefenceInstalled) return COMMUNITY_TOUR_STEPS;
+  return COMMUNITY_TOUR_STEPS.filter((step) => step.key !== COMMUNITY_UPGRADE_STEP_KEY);
+}
+
 /** The storage surface the gate needs; narrowed so tests can hand in a fake. */
 export type TourStorage = {
   getItem(key: string): string | null;

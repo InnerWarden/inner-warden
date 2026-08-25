@@ -59,6 +59,18 @@ struct DashboardMeta<'a> {
     /// with the condition that produces it.
     #[serde(skip_serializing_if = "Option::is_none")]
     update_note: Option<&'a str>,
+    /// True when the paid Active Defence host stack is installed on this
+    /// machine, so the Overview can stop offering the operator something they
+    /// already have. See `upsell_io::active_defence_installed`.
+    ///
+    /// INSTALLED, not ARMED, and the frontend must keep that distinction: this
+    /// dashboard runs unprivileged and cannot read `LSM_POLICY`, so it has no
+    /// standing to say anything is being enforced.
+    ///
+    /// Omitted when false, so a host without Active Defence sends the payload
+    /// it always sent and no existing reader has to learn a field.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    active_defence_installed: bool,
 }
 
 /// `/api/agents` contract version. Version 2 distinguishes executable presence
@@ -576,10 +588,16 @@ fn aggregate_modes(modes: &[&str]) -> &'static str {
 /// and putting an upgrade notice on the page for a permissions error would be a
 /// false claim with a call to action attached — the exact failure this whole
 /// field exists to prevent, pointed the other way.
+///
+/// `active_defence_installed` is a PARAMETER rather than a filesystem read made
+/// in here, so both answers are reachable from a test. Reading the real disk at
+/// this point would leave the field asserted only against whatever the machine
+/// running the test happens to have installed.
 fn meta_json_with_freshness(
     exposed: bool,
     status: &GuardrailStatus,
     freshness: crate::binary_freshness::Freshness,
+    active_defence_installed: bool,
 ) -> String {
     let superseded = freshness == crate::binary_freshness::Freshness::Superseded;
     serde_json::to_string(&DashboardMeta {
@@ -589,6 +607,7 @@ fn meta_json_with_freshness(
         guardrail: status,
         update_pending: superseded,
         update_note: superseded.then_some(crate::binary_freshness::SUPERSEDED_NOTE),
+        active_defence_installed,
     })
     .unwrap_or_else(|_| "{}".into())
 }
@@ -875,6 +894,10 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
                 // land at any moment, and a dashboard people leave running for
                 // days is exactly where a boot-time answer goes stale.
                 let freshness = started_as.freshness();
+                // Re-stat this too, and for the same reason: Active Defence can
+                // be installed while this dashboard is open, and a boot-time
+                // answer would keep offering it for the rest of the session.
+                let ad_installed = crate::upsell_io::active_defence_installed();
                 match agent_snapshot.as_ref() {
                     Some(shared) => {
                         let snapshot = read_agent_snapshot(shared);
@@ -882,6 +905,7 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
                             exposed,
                             &snapshot.guardrail,
                             freshness,
+                            ad_installed,
                         )))
                     }
                     None => request.respond(json_response(meta_json_with_freshness(
@@ -891,6 +915,7 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
                             guarded_agents: 0,
                         },
                         freshness,
+                        ad_installed,
                     ))),
                 }
             }
@@ -1136,8 +1161,12 @@ mod tests {
             mode: "monitor".into(),
             guarded_agents: 2,
         };
-        let m =
-            meta_json_with_freshness(false, &status, crate::binary_freshness::Freshness::Current);
+        let m = meta_json_with_freshness(
+            false,
+            &status,
+            crate::binary_freshness::Freshness::Current,
+            false,
+        );
         assert!(m.contains("\"version\""));
         assert!(m.contains(env!("CARGO_PKG_VERSION")));
         let v: serde_json::Value = serde_json::from_str(&m).unwrap();
@@ -1150,6 +1179,7 @@ mod tests {
             true,
             &status,
             crate::binary_freshness::Freshness::Current,
+            false,
         ))
         .unwrap();
         assert_eq!(e["exposed"], true);
@@ -1174,6 +1204,7 @@ mod tests {
             false,
             &status,
             crate::binary_freshness::Freshness::Superseded,
+            false,
         );
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         // `version` still reports what this process runs. That is the honest
@@ -1204,10 +1235,99 @@ mod tests {
             false,
             &status,
             crate::binary_freshness::Freshness::Unknown,
+            false,
         ))
         .unwrap();
         assert!(v.get("update_pending").is_none());
         assert!(v.get("update_note").is_none());
+    }
+
+    /// THE DEFECT THIS PINS
+    ///
+    /// The Overview closed with a card headed "Extend protection from agent
+    /// intent to the host.", rendered for every Community dashboard. On
+    /// `iw-challenge` -- sensor, watchdog and DNS guard all active, Execution
+    /// Gate `Armed` with 1387 entries, Secret Read Guard in `ENFORCE` and a
+    /// canary proving the denial -- that card told the operator to go and
+    /// acquire what was already running underneath the page. It sat below a
+    /// header reading "Setup needed", so the whole screen read as "you are not
+    /// protected" on a host that was.
+    ///
+    /// The payload now carries the answer so the frontend stops guessing.
+    #[test]
+    fn an_installed_host_stack_is_declared_so_the_page_can_stop_offering_it() {
+        let status = GuardrailStatus {
+            mode: "monitor".into(),
+            guarded_agents: 0,
+        };
+        let v: serde_json::Value = serde_json::from_str(&meta_json_with_freshness(
+            false,
+            &status,
+            crate::binary_freshness::Freshness::Current,
+            true,
+        ))
+        .unwrap();
+        assert_eq!(
+            v["active_defence_installed"], true,
+            "a host running Active Defence has to be able to say so"
+        );
+    }
+
+    /// The other half, and the one that stops the fix becoming the next defect:
+    /// a host WITHOUT Active Defence must still get the offer. Deleting the
+    /// card outright would satisfy the test above on its own.
+    ///
+    /// Absent rather than `false` is deliberate: the ordinary payload stays
+    /// byte-for-byte what it always was, so an older frontend reads a newer
+    /// server exactly as it always did.
+    #[test]
+    fn a_host_without_it_sends_the_payload_it_always_sent() {
+        let status = GuardrailStatus {
+            mode: "monitor".into(),
+            guarded_agents: 0,
+        };
+        let json = meta_json_with_freshness(
+            false,
+            &status,
+            crate::binary_freshness::Freshness::Current,
+            false,
+        );
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(
+            v.get("active_defence_installed").is_none(),
+            "false must be omitted, not serialised: {json}"
+        );
+    }
+
+    /// The claim is INSTALLED, and it must not quietly widen into a claim about
+    /// enforcement. This dashboard runs unprivileged, cannot read `LSM_POLICY`,
+    /// and so has no standing to say a kernel guard is armed. A field named for
+    /// protection would be a claim we cannot support, which on a security
+    /// product is worse than saying too little.
+    #[test]
+    fn the_payload_claims_installation_and_never_enforcement() {
+        let status = GuardrailStatus {
+            mode: "monitor".into(),
+            guarded_agents: 0,
+        };
+        let json = meta_json_with_freshness(
+            false,
+            &status,
+            crate::binary_freshness::Freshness::Current,
+            true,
+        );
+        for forbidden in ["armed", "enforcing", "enforced", "protected"] {
+            assert!(
+                !json.contains(forbidden),
+                "meta must not claim `{forbidden}`; it can only see a binary on disk: {json}"
+            );
+        }
+        // Anti-vacuous: a serializer that returned "{}" would pass every
+        // absence check above without objection.
+        assert!(
+            json.contains("active_defence_installed"),
+            "the field has to be present for the absences to mean anything"
+        );
     }
 
     #[test]

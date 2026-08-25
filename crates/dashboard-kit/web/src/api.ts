@@ -32,6 +32,17 @@ export type DashboardMeta = {
     mode?: GuardrailMode | string;
     guarded_agents?: number;
   };
+  /**
+   * True when the paid Active Defence host stack is installed on this machine.
+   *
+   * Optional because the server omits it when false, so an older server and a
+   * host without Active Defence are the same bytes. Read it as `?? false`.
+   *
+   * INSTALLED, never ARMED. The server finds a binary on disk; it runs
+   * unprivileged and cannot read kernel state, so nothing downstream may turn
+   * this into a claim that something is being enforced.
+   */
+  active_defence_installed?: boolean;
 };
 
 export type CategoryCount = { name: string; count: number };
