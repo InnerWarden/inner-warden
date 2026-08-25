@@ -210,7 +210,12 @@ was incomplete; it does not mean this host is idle.`}
       )}
 
       {edition === "enterprise" ? null : <CommunityIncluded />}
-      {edition === "community" ? <ActiveDefenceCard /> : null}
+      {/* `?? false` reads an older server, which does not send the field, the
+          way it always read it: as an offer. Being wrong toward offering is
+          recoverable; being wrong toward silence hides the product. */}
+      {edition === "community" ? (
+        <ActiveDefenceCard installed={meta?.active_defence_installed ?? false} />
+      ) : null}
     </div>
   );
 }
@@ -625,19 +630,93 @@ function CommunityIncluded() {
   );
 }
 
-function ActiveDefenceCard() {
+/**
+ * The Active Defence slot at the foot of the Community Overview.
+ *
+ * THE DEFECT. This card rendered unconditionally for the Community edition. On
+ * `iw-challenge` -- sensor, watchdog and DNS guard all running, Execution Gate
+ * `Armed` with 1387 entries, Secret Read Guard in `ENFORCE` with a canary
+ * proving the denial -- it told the operator to go and acquire what was already
+ * running underneath the page, beneath a header reading "Setup needed". The
+ * honest reading of that screen was "you are not protected", on a host that was.
+ *
+ * `installed` comes from the server, which looks for the host CLI on disk: the
+ * same check the Community binary already uses to decide whether to delegate a
+ * host command. One definition, so the dashboard cannot disagree with the CLI
+ * about the machine they are both standing on.
+ *
+ * What the installed variant may NOT say is that anything is armed. This
+ * dashboard runs unprivileged and cannot read `LSM_POLICY`. It knows a binary
+ * is on disk, it says exactly that, and it points at the command that does
+ * know. Understating is recoverable; claiming protection we cannot see is not.
+ */
+/**
+ * The wording for each state, as data rather than as JSX only.
+ *
+ * There is no DOM in this test suite, so copy that lives solely inside a
+ * component can only be asserted by grepping the file that declares it -- a
+ * test that matches its own source and passes whatever the component renders.
+ * Exporting the sentences lets the test read the same strings the screen does.
+ */
+export const ACTIVE_DEFENCE_COPY = {
+  offer: {
+    badge: "Host protection",
+    title: "Extend protection from agent intent to the host.",
+    body: "Community screens supported agent actions before execution. On supported Linux hosts, Active Defence adds independent host telemetry, incident triage and evidence-backed response, including eBPF enforcement and the kernel Execution Gate. macOS and Windows host protection is planned, not implied by this dashboard.",
+  },
+  installed: {
+    badge: "Installed on this host",
+    title: "Active Defence is installed on this host.",
+    body: "This page covers the agent layer only. Host telemetry, incident triage and the kernel Execution Gate belong to Active Defence, and this dashboard runs unprivileged, so it cannot read kernel state and does not report here what is running or what is turned on. Ask the host itself:",
+    /**
+     * Verified against a real installation before being written down: on
+     * `iw-challenge`, `innerwarden get status` exits 0 and lists the host
+     * services. The Community binary delegates any verb it does not know to
+     * `innerwarden-ctl`, which is why the plain `innerwarden` spelling is the
+     * right one to print for somebody already reading a Community dashboard.
+     */
+    command: "innerwarden get status",
+  },
+} as const;
+
+/**
+ * Which state the card is in. Trivial today, and named anyway: it is the seam
+ * the tests assert through, and it is where a third state would land if one
+ * ever arrives (installed-but-unlicensed, say).
+ */
+export function activeDefenceCardState(installed: boolean): "installed" | "offer" {
+  return installed ? "installed" : "offer";
+}
+
+function ActiveDefenceCard({ installed }: { installed: boolean }) {
+  if (activeDefenceCardState(installed) === "installed") {
+    const copy = ACTIVE_DEFENCE_COPY.installed;
+    return (
+      <aside
+        data-ad-state="installed"
+        className="rounded-2xl border border-slate-200 bg-white p-5 sm:p-6"
+        aria-labelledby="active-defence-title"
+      >
+        <div className="flex flex-wrap items-center gap-2">
+          <p className="text-xs font-semibold uppercase tracking-[0.14em] text-slate-500">InnerWarden Active Defence</p>
+          <span className="rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[10px] font-semibold text-slate-600">{copy.badge}</span>
+        </div>
+        <h2 id="active-defence-title" className="mt-2 text-lg font-semibold text-slate-950">{copy.title}</h2>
+        <p className="mt-1 max-w-3xl text-sm leading-6 text-slate-600">{copy.body}</p>
+        <code className="mt-3 inline-block rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5 font-mono text-sm text-slate-800">{copy.command}</code>
+      </aside>
+    );
+  }
   return (
-    <aside data-tour="upgrade" className="rounded-2xl border border-slate-200 bg-white p-5 sm:p-6" aria-labelledby="active-defence-title">
+    <aside data-tour="upgrade" data-ad-state="offer" className="rounded-2xl border border-slate-200 bg-white p-5 sm:p-6" aria-labelledby="active-defence-title">
       <div className="flex flex-col gap-4 sm:flex-row sm:items-center">
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2">
             <p className="text-xs font-semibold uppercase tracking-[0.14em] text-slate-500">InnerWarden Active Defence</p>
-            <span className="rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[10px] font-semibold text-slate-600">Host protection</span>
+            <span className="rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[10px] font-semibold text-slate-600">{ACTIVE_DEFENCE_COPY.offer.badge}</span>
           </div>
-          <h2 id="active-defence-title" className="mt-2 text-lg font-semibold text-slate-950">Extend protection from agent intent to the host.</h2>
-          <p className="mt-1 max-w-3xl text-sm leading-6 text-slate-600">
-            Community screens supported agent actions before execution. On supported Linux hosts, Active Defence adds independent host telemetry, incident triage and evidence-backed response, including eBPF enforcement and the kernel Execution Gate. macOS and Windows host protection is planned, not implied by this dashboard.
-          </p>
+          <h2 id="active-defence-title" className="mt-2 text-lg font-semibold text-slate-950">{ACTIVE_DEFENCE_COPY.offer.title}</h2>
+          <p className="mt-1 max-w-3xl text-sm leading-6 text-slate-600">{ACTIVE_DEFENCE_COPY.offer.body}</p>
         </div>
         <a
           href="https://innerwarden.com/enterprise#enterprise-install"

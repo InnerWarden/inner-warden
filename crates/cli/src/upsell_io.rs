@@ -5,26 +5,61 @@
 
 use std::process::ExitCode;
 
+/// The Active Defence host CLI's file name. Its presence on disk is the
+/// product's definition of "Active Defence is installed on this machine".
+const AD_CLI_NAME: &str = "innerwarden-ctl";
+
+/// Standard install dirs searched when `PATH` does not name one. These are the
+/// directories the installer writes to; a change there changes this.
+const AD_INSTALL_DIRS: [&str; 3] = ["/usr/local/bin", "/usr/bin", "/opt/innerwarden/bin"];
+
+/// Search `dirs`, in order, for the Active Defence host CLI.
+///
+/// Split from [`find_ad_cli`] so the search itself is testable against a
+/// directory the test controls. A single function that reads absolute paths and
+/// decides in one step can only be asserted against whatever happens to be
+/// installed on the machine running the test: nothing on a laptop, something
+/// else in CI, and a test that would pass just as happily against a body that
+/// always answered `None`.
+fn find_ad_cli_in<I>(dirs: I) -> Option<std::path::PathBuf>
+where
+    I: IntoIterator<Item = std::path::PathBuf>,
+{
+    dirs.into_iter()
+        .map(|dir| dir.join(AD_CLI_NAME))
+        .find(|p| p.is_file())
+}
+
 /// Locate the Active Defence host CLI (`innerwarden-ctl`) if it is installed: on
 /// PATH, or in a standard install dir. Its presence is how the Community binary knows
 /// Active Defence is on this machine.
 fn find_ad_cli() -> Option<std::path::PathBuf> {
-    const NAME: &str = "innerwarden-ctl";
-    if let Some(paths) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&paths) {
-            let p = dir.join(NAME);
-            if p.is_file() {
-                return Some(p);
-            }
-        }
-    }
-    for base in ["/usr/local/bin", "/usr/bin", "/opt/innerwarden/bin"] {
-        let p = std::path::Path::new(base).join(NAME);
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-    None
+    let on_path = std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+        .unwrap_or_default();
+    find_ad_cli_in(
+        on_path
+            .into_iter()
+            .chain(AD_INSTALL_DIRS.iter().map(std::path::PathBuf::from)),
+    )
+}
+
+/// Whether the paid Active Defence host stack is INSTALLED on this machine.
+///
+/// Public because the dashboard needs this same answer. Its Overview closes
+/// with a card offering Active Defence, and on a host already running it that
+/// card told the operator to go and buy what was already underneath them --
+/// beneath a header reading "Setup needed", so the honest reading of the screen
+/// was "you are not protected". Sharing one definition is the point: a second
+/// detector written for the dashboard could disagree with the delegation path
+/// about the very same host.
+///
+/// INSTALLED, never ARMED. A binary on disk proves someone installed it and
+/// nothing more. Whether a kernel guard is actually armed lives in `LSM_POLICY`,
+/// takes root to read, and this dashboard runs unprivileged. No caller may
+/// promote this answer into a claim about protection.
+pub fn active_defence_installed() -> bool {
+    find_ad_cli().is_some()
 }
 
 /// If Active Defence is installed, DELEGATE this command to it transparently
@@ -206,5 +241,111 @@ mod host_help_tests {
             format!("{:?}", ExitCode::SUCCESS),
             "a missing verb must not exit 0"
         );
+    }
+}
+
+#[cfg(test)]
+mod active_defence_detection_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// THE DEFECT THIS PINS
+    ///
+    /// The Community dashboard's Overview ends with a card headed "Extend
+    /// protection from agent intent to the host." It rendered unconditionally
+    /// for the Community edition, so on `iw-challenge` -- a box running the
+    /// sensor, the watchdog, the DNS guard, an armed Execution Gate with 1387
+    /// entries and a Secret Read Guard in ENFORCE -- the dashboard invited the
+    /// operator to go and acquire what was already running underneath it.
+    ///
+    /// The dashboard now asks this module instead of guessing, so the search
+    /// has to actually find a real file and actually miss when there is none.
+    fn touch(dir: &std::path::Path, name: &str) -> PathBuf {
+        let p = dir.join(name);
+        std::fs::write(&p, b"#!/bin/sh\n").expect("write the fake binary");
+        p
+    }
+
+    #[test]
+    fn the_host_cli_is_found_where_it_is_installed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let expected = touch(dir.path(), AD_CLI_NAME);
+        assert_eq!(
+            find_ad_cli_in([dir.path().to_path_buf()]),
+            Some(expected),
+            "a directory containing {AD_CLI_NAME} means Active Defence is installed"
+        );
+    }
+
+    /// The other half, and the one that keeps the test above honest: a body
+    /// that always answered `Some(..)` would pass the first assertion alone.
+    #[test]
+    fn an_empty_directory_is_not_an_installation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            find_ad_cli_in([dir.path().to_path_buf()]),
+            None,
+            "nothing on disk must not read as an installation"
+        );
+    }
+
+    /// A NEIGHBOUR is not the host CLI. The Community binary is named
+    /// `innerwarden`, and it lives in exactly the directories searched here --
+    /// so a match on the wrong name would report Active Defence installed on
+    /// every Community host in existence, which is the defect inverted.
+    #[test]
+    fn the_community_binary_is_not_mistaken_for_the_host_cli() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        touch(dir.path(), "innerwarden");
+        touch(dir.path(), "innerwarden-guard");
+        assert_eq!(
+            find_ad_cli_in([dir.path().to_path_buf()]),
+            None,
+            "only {AD_CLI_NAME} counts; the Community binary sits in the same dirs"
+        );
+    }
+
+    /// Directories are searched in order and a miss does not stop the search.
+    /// The real caller chains PATH ahead of the standard install dirs, so an
+    /// early empty entry must not shadow a later real one.
+    #[test]
+    fn the_search_continues_past_directories_that_do_not_have_it() {
+        let empty = tempfile::tempdir().expect("tempdir");
+        let real = tempfile::tempdir().expect("tempdir");
+        let expected = touch(real.path(), AD_CLI_NAME);
+        assert_eq!(
+            find_ad_cli_in([empty.path().to_path_buf(), real.path().to_path_buf()]),
+            Some(expected),
+            "an earlier directory without it must not end the search"
+        );
+    }
+
+    /// A path that does not exist at all is a miss, not a panic. `PATH`
+    /// routinely names directories that are not there.
+    #[test]
+    fn a_directory_that_does_not_exist_is_survived() {
+        assert_eq!(
+            find_ad_cli_in([PathBuf::from("/nonexistent-innerwarden-test-dir")]),
+            None
+        );
+    }
+
+    /// A directory NAMED like the binary is not a binary. `is_file` is what
+    /// makes this true; `exists` would not.
+    #[test]
+    fn a_directory_with_the_cli_name_is_not_an_installation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(dir.path().join(AD_CLI_NAME)).expect("create the decoy dir");
+        assert_eq!(find_ad_cli_in([dir.path().to_path_buf()]), None);
+    }
+
+    /// The public predicate is the one the dashboard calls, and it must agree
+    /// with the delegation path on the same host. Asserting agreement rather
+    /// than a fixed value is deliberate: the answer depends on the machine
+    /// running the test, so pinning `true` or `false` would make this either a
+    /// laptop test or a CI test and never both.
+    #[test]
+    fn the_public_predicate_agrees_with_the_delegation_path() {
+        assert_eq!(active_defence_installed(), find_ad_cli().is_some());
     }
 }

@@ -7,6 +7,7 @@ import {
   COMMUNITY_UPGRADE_STEP_KEY,
   TOUR_FINISH_STEP_KEY,
   clampStep,
+  communityTourSteps,
   markTourSeen,
   shouldAutoOpen,
   type TourStorage,
@@ -198,5 +199,42 @@ describe("the open-once gate", () => {
     };
     expect(shouldAutoOpen(broken, COMMUNITY_TOUR_STORAGE_KEY)).toBe(false);
     expect(() => markTourSeen(broken, COMMUNITY_TOUR_STORAGE_KEY)).not.toThrow();
+  });
+});
+
+/**
+ * The upgrade step is anchored on the upsell card precisely so the pitch is
+ * made once. When the card stops offering -- because this host already runs
+ * Active Defence -- the step has to stop too, or the tour becomes the stale
+ * second copy that the anchoring existed to prevent. A missing anchor does not
+ * do it on its own: `findTarget` returning null leaves the step rendered, just
+ * unanchored, so the pitch still gets read out to somebody who already owns it.
+ */
+describe("the tour on a host that already runs Active Defence", () => {
+  it("drops the acquisition step", () => {
+    const keys = communityTourSteps(true).map((step) => step.key);
+    expect(keys).not.toContain(COMMUNITY_UPGRADE_STEP_KEY);
+  });
+
+  it("keeps it on a host that does not", () => {
+    // The other half: filtering the step out unconditionally would pass above.
+    const keys = communityTourSteps(false).map((step) => step.key);
+    expect(keys).toContain(COMMUNITY_UPGRADE_STEP_KEY);
+  });
+
+  it("drops only that step, and keeps a usable tour", () => {
+    const withIt = communityTourSteps(false);
+    const without = communityTourSteps(true);
+    expect(without.length).toBe(withIt.length - 1);
+    expect(without.length).toBeGreaterThan(1);
+    // The closing step must survive, or the tour ends mid-sentence on exactly
+    // the hosts that paid for the product.
+    expect(without.map((step) => step.key)).toContain(TOUR_FINISH_STEP_KEY);
+  });
+
+  it("is pinning a step that actually exists", () => {
+    // Anti-vacuous. If the upgrade step were ever renamed, every assertion
+    // above would pass against a table that never contained it.
+    expect(upgradeStep, "the upgrade step must exist for this suite to mean anything").toBeDefined();
   });
 });

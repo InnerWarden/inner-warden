@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { decisionEntryLink, decisionRecordCta, missingOverviewFields } from "./Home";
+import {
+  ACTIVE_DEFENCE_COPY,
+  activeDefenceCardState,
+  decisionEntryLink,
+  decisionRecordCta,
+  missingOverviewFields,
+} from "./Home";
 import type { Overview } from "../api";
 
 function overview(extra: Record<string, unknown>): Overview {
@@ -92,5 +98,58 @@ describe("decisionRecordCta", () => {
   it("hides the button rather than rendering a link to nowhere", () => {
     expect(decisionRecordCta("enterprise", false).kind).toBe("hidden");
     expect(decisionRecordCta(undefined, false).kind).toBe("hidden");
+  });
+});
+
+/**
+ * THE DEFECT THIS PINS
+ *
+ * The Overview closed with a card headed "Extend protection from agent intent
+ * to the host.", rendered for every Community dashboard regardless of the host.
+ * On `iw-challenge` -- sensor, watchdog and DNS guard running, Execution Gate
+ * `Armed` with 1387 entries, Secret Read Guard in `ENFORCE` and a canary
+ * proving the denial -- it invited the operator to go and acquire what was
+ * already running underneath the page, beneath a header reading "Setup needed".
+ */
+describe("the Active Defence card", () => {
+  it("stops offering the product on a host that already has it", () => {
+    // FAILS ON REVERT: make the state unconditional and this trips.
+    expect(activeDefenceCardState(true)).toBe("installed");
+    expect(ACTIVE_DEFENCE_COPY.installed.title).not.toContain("Extend protection");
+  });
+
+  it("still offers it on a host that does not", () => {
+    // The other half. Without it, deleting the card passes the test above.
+    expect(activeDefenceCardState(false)).toBe("offer");
+    expect(ACTIVE_DEFENCE_COPY.offer.title).toContain("Extend protection");
+  });
+
+  it("never claims the host is armed or enforcing", () => {
+    // This dashboard runs unprivileged and cannot read LSM_POLICY. Saying a
+    // kernel guard is on would be a claim it has no way to check, which on a
+    // security product is worse than saying too little.
+    const shown = [
+      ACTIVE_DEFENCE_COPY.installed.title,
+      ACTIVE_DEFENCE_COPY.installed.body,
+      ACTIVE_DEFENCE_COPY.installed.badge,
+    ].join(" ");
+    for (const claim of ["armed", "enforcing", "enforced", "you are protected", "is protecting"]) {
+      expect(shown.toLowerCase(), `the card must not claim "${claim}"`).not.toContain(claim);
+    }
+    // Anti-vacuous: empty strings would satisfy every absence above.
+    expect(shown.length).toBeGreaterThan(120);
+  });
+
+  it("says where the real answer lives, because it is not on this page", () => {
+    // Verified against a live installation before being written: `innerwarden
+    // get status` exits 0 on iw-challenge and lists the host services.
+    expect(ACTIVE_DEFENCE_COPY.installed.command).toBe("innerwarden get status");
+    expect(ACTIVE_DEFENCE_COPY.installed.body).toContain("Ask the host itself");
+  });
+
+  it("does not send an installed host to the acquisition page", () => {
+    const shown = Object.values(ACTIVE_DEFENCE_COPY.installed).join(" ");
+    expect(shown).not.toContain("innerwarden.com/enterprise");
+    expect(shown).not.toContain("Explore Active Defence");
   });
 });
