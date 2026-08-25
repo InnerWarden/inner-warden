@@ -4,13 +4,34 @@ Open-source guardrail for AI coding agents. InnerWarden screens the shell
 commands and MCP/tool calls your agent runs and returns **allow / review /
 deny**, before they run.
 
-Same install on Linux, macOS, and Windows, no `curl | sh`, no `sudo`:
+Same install on Linux, macOS, and Windows:
 
 ```sh
 npm install -g innerwarden
 ```
 
-or run it without installing:
+**On Linux, expect this to need `sudo`.** `npm install -g` writes to npm's
+global prefix, and on a distro-packaged Node that prefix is
+`/usr/local/lib/node_modules`, owned by root, so the command exits `EACCES`
+before InnerWarden is involved at all. Measured on a clean Ubuntu 26.04 machine.
+Either give it root, or point npm at a prefix you own:
+
+```sh
+sudo npm install -g innerwarden
+# or, entirely in your own directory:
+npm config set prefix ~/.npm-global   # then put ~/.npm-global/bin on PATH
+```
+
+InnerWarden itself never needs root. If you would rather not involve npm's
+prefix at all, the shell installer verifies the signed binary and installs it
+into `~/.local/bin` with no elevation on any platform:
+
+```sh
+curl -fsSL https://innerwarden.com/free | sh          # macOS and Linux
+irm https://innerwarden.com/free.ps1 | iex            # Windows PowerShell
+```
+
+Or run it without installing anything:
 
 ```sh
 npx innerwarden --help

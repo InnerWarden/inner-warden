@@ -190,6 +190,16 @@ jobs:
       - name: The npm launcher's missing-binary message
         run: node npm/test/shim-message.test.js
 
+      # `npm/README.md` is in package.json's `files`, so it IS the npmjs.com
+      # package page, and it said npm needs no sudo. On a distro-packaged Node
+      # `npm install -g` exits EACCES, so the most-read install page in the
+      # product was wrong about the platform most readers are on. The website
+      # repo's version of this gate scanned one DIRECTORY, which is why the same
+      # sentence survived here in three files.
+      - name: No document may claim npm needs no root
+        if: runner.os == 'Linux'
+        run: node scripts/check-install-claims.mjs
+
       - name: npm package version matches the Rust workspace
         if: runner.os == 'Linux'
         run: |
