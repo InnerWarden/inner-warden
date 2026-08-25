@@ -1161,8 +1161,12 @@ mod tests {
             mode: "monitor".into(),
             guarded_agents: 2,
         };
-        let m =
-            meta_json_with_freshness(false, &status, crate::binary_freshness::Freshness::Current, false);
+        let m = meta_json_with_freshness(
+            false,
+            &status,
+            crate::binary_freshness::Freshness::Current,
+            false,
+        );
         assert!(m.contains("\"version\""));
         assert!(m.contains(env!("CARGO_PKG_VERSION")));
         let v: serde_json::Value = serde_json::from_str(&m).unwrap();
