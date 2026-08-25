@@ -1,8 +1,8 @@
-import { StrictMode, useEffect, useState } from "react";
+import { StrictMode, useState } from "react";
 import { createRoot } from "react-dom/client";
 import "./index.css";
 import { App } from "./App";
-import { fetchMeta } from "./api";
+import type { DashboardMeta } from "./api";
 import {
   COMMUNITY_TOUR_STORAGE_KEY,
   TourLauncher,
@@ -14,43 +14,41 @@ import {
 // step table lives in `components/ProductTour.tsx` so a test can import it.
 
 /**
- * The tour renders beside the shell rather than inside it, so it asks the
- * server itself for the one fact that changes its table: whether this host
- * already runs Active Defence. On a host that does, the upgrade step would
- * otherwise read the pitch out to somebody who already owns the product.
+ * The shell and the tour, with the tour's step table decided by a fact the
+ * shell has already read.
  *
- * Until the answer arrives, and if it never does, the full table stands. An
- * unreachable endpoint is not evidence of an installation, and offering a host
+ * The tour needs to know whether this host runs Active Defence: on one that
+ * does, its upgrade step would read the pitch out to somebody who already owns
+ * the product. It takes that answer from `onMeta` rather than fetching it,
+ * because `guard/meta` is POLLED and a second reader of the same endpoint
+ * desynchronises anything counting the sequence. The community posture journey
+ * fails the SECOND reading on purpose, to prove a stale claim gets withdrawn; a
+ * duplicate fetch answered that 503 into the wrong caller, and the claim stood.
+ *
+ * Until a reading arrives, and if none ever does, the full table stands. An
+ * unanswered endpoint is not evidence of an installation, and offering a host
  * something it may well want is the recoverable direction to be wrong in.
  */
-function CommunityTour() {
+function Shell() {
   const [activeDefenceInstalled, setActiveDefenceInstalled] = useState(false);
 
-  useEffect(() => {
-    let active = true;
-    fetchMeta()
-      .then((meta) => {
-        if (active) setActiveDefenceInstalled(meta.active_defence_installed ?? false);
-      })
-      .catch(() => {
-        // Leave the full table in place.
-      });
-    return () => {
-      active = false;
-    };
-  }, []);
-
   return (
-    <TourLauncher
-      steps={communityTourSteps(activeDefenceInstalled)}
-      storageKey={COMMUNITY_TOUR_STORAGE_KEY}
-    />
+    <>
+      <App
+        onMeta={(meta: DashboardMeta) =>
+          setActiveDefenceInstalled(meta.active_defence_installed ?? false)
+        }
+      />
+      <TourLauncher
+        steps={communityTourSteps(activeDefenceInstalled)}
+        storageKey={COMMUNITY_TOUR_STORAGE_KEY}
+      />
+    </>
   );
 }
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
-    <App />
-    <CommunityTour />
+    <Shell />
   </StrictMode>,
 );
