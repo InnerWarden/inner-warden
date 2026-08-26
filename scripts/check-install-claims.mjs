@@ -159,7 +159,11 @@ const INSTALL_CONTEXT = /\bnpm\b|install|\bprebuilt\b|\bprovenance\b|\bpackage m
  * judging each line separately severs it from its own subject.
  */
 const COMMENT_PREFIX = /^\s*(?:\/\/+|\*+\/?|\{\s*\/\*|<!--)\s?/;
-const COMMENT_SUFFIX = /(?:\*\/\s*\}?|-->)\s*$/;
+// `--!>` as well as `-->`: the HTML parser accepts both as a comment end
+// (comment-end-bang state), so a regex that knows only one can be walked
+// past. CodeQL js/bad-tag-filter, and it is right even here, where the job
+// is stripping our own comment markers rather than sanitising input.
+const COMMENT_SUFFIX = /(?:\*\/\s*\}?|--!?>)\s*$/;
 
 /**
  * Every sentence in the file, each carrying the line it starts on.
