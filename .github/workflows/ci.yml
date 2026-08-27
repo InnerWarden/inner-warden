@@ -200,6 +200,13 @@ jobs:
         if: runner.os == 'Linux'
         run: node scripts/check-install-claims.mjs
 
+      # Two front doors to one product. The shell installer opens the wizard;
+      # npm deliberately runs nothing, so its page has to say the second step
+      # out loud. A difference handled only in prose drifts the moment somebody
+      # rewrites the prose.
+      - name: Onboarding parity (npm page names the wizard)
+        run: node scripts/check-onboarding-parity.mjs
+
       - name: npm package version matches the Rust workspace
         if: runner.os == 'Linux'
         run: |

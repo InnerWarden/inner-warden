@@ -8,7 +8,18 @@ Same install on Linux, macOS, and Windows:
 
 ```sh
 npm install -g innerwarden
+innerwarden setup
 ```
+
+**The second line is not optional here.** npm runs nothing at install time, on
+purpose: there is no postinstall script, so `npm install --ignore-scripts`
+works and nothing executes on your machine before you ask it to. That is a
+property worth keeping, and it means npm hands you a binary and stops.
+
+The shell installer at `innerwarden.com/free` opens the same wizard for you
+when it finishes. Installing by npm, you open it yourself. Both arrive at the
+same place: `setup` picks which agents to guard, starts them in dry run, and
+optionally wires alerts.
 
 **On Linux, expect this to need `sudo`.** `npm install -g` writes to npm's
 global prefix, and on a distro-packaged Node that prefix is
