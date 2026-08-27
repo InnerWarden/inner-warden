@@ -28,6 +28,7 @@ prefix is root-owned):
 
 ```sh
 npm install -g innerwarden
+innerwarden setup
 ```
 
 macOS and Linux:
@@ -35,6 +36,10 @@ macOS and Linux:
 ```sh
 curl -fsSL https://innerwarden.com/free | sh
 ```
+
+The shell installer opens `setup` for you when it finishes. npm runs nothing at
+install time, deliberately (no postinstall, so `--ignore-scripts` works), so the
+npm route asks you to open it yourself. Both end in the same wizard.
 
 Debian/Ubuntu and Fedora/RHEL packages are attached to each release; see
 [DISTRIBUTION.md](DISTRIBUTION.md) for the current filenames.
