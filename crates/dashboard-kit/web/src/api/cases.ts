@@ -108,7 +108,21 @@ export type VerifiedOutcome = {
   effective_scope: ScopeRef[];
   evidence: EvidenceRef[];
   enforcement_attempt_id: string | null;
+  // How well the record supports the outcome it reports, DECIDED BY THE
+  // BACKEND. The kit renders this; it does not recompute it. Recomputing it is
+  // the defect: this component used to run its own predicate, which disagreed
+  // with the header's for every in-path guard refusal and printed "Outcome
+  // claim withheld" directly under "Blocked Before Execution".
+  //
+  //   proven    something independent of the actor observed it
+  //   recorded  the component in the path reported it, nothing else watched
+  //   unproven  the record does not hold together
+  trust: OutcomeTrust;
+  trust_explanation: string;
 };
+
+export const OUTCOME_TRUSTS = ["proven", "recorded", "unproven"] as const;
+export type OutcomeTrust = (typeof OUTCOME_TRUSTS)[number];
 
 // --- Enrichment: signals wired together from the underlying incident / decision /
 // mitre mapping. Everything is producer-REPORTED (not verified). Every field is
@@ -315,7 +329,7 @@ function feedback(value: unknown, path: string): FeedbackRecord {
 
 function verifiedOutcome(value: unknown, path: string): VerifiedOutcome {
   const item = object(value, path);
-  exact(item, ["outcome", "mode", "actual_denial_or_containment_occurred", "verification_status", "verifier", "verified_at", "effective_scope", "evidence", "enforcement_attempt_id"], path);
+  exact(item, ["outcome", "mode", "actual_denial_or_containment_occurred", "verification_status", "verifier", "verified_at", "effective_scope", "evidence", "enforcement_attempt_id", "trust", "trust_explanation"], path);
   return {
     outcome: oneOf(item.outcome, OUTCOMES, `${path}.outcome`),
     mode: oneOf(item.mode, MODES, `${path}.mode`),
@@ -326,6 +340,8 @@ function verifiedOutcome(value: unknown, path: string): VerifiedOutcome {
     effective_scope: array(item.effective_scope, `${path}.effective_scope`, parseScopeRef, 100),
     evidence: array(item.evidence, `${path}.evidence`, parseEvidenceRef, 100),
     enforcement_attempt_id: nullableString(item.enforcement_attempt_id, `${path}.enforcement_attempt_id`, 256),
+    trust: oneOf(item.trust, OUTCOME_TRUSTS, `${path}.trust`),
+    trust_explanation: string(item.trust_explanation, `${path}.trust_explanation`, 0, 1024),
   };
 }
 

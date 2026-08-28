@@ -280,7 +280,22 @@ export function controlPill(
  * every control was healthy but deliberately watching led with `0 of 5`. That
  * number is true and reads as total failure. Lead with whether anything needs
  * the reader, because that is the question they came with. */
-export function postureHeadline(pills: ControlPill[]): string {
+/**
+ * The one line at the top of the page.
+ *
+ * Prefers the sentence the HOST computed, because the host is the only side
+ * that can see whether a control's remedy command still needs running. This
+ * screen counting dispositions and writing its own line is how the page came to
+ * say "Nothing needs you." above two cards that each printed a command the
+ * operator had to run: the tail below was unconditional.
+ *
+ * The local computation stays as the fallback, for a producer that sends no
+ * summary, and its tail is now conditional too so the fallback cannot make the
+ * same claim.
+ */
+export function postureHeadline(pills: ControlPill[], hostSummary?: string): string {
+  const fromHost = hostSummary?.trim();
+  if (fromHost) return fromHost;
   const total = pills.length;
   if (total === 0) return "No host controls reported";
 
@@ -322,7 +337,13 @@ export function postureHeadline(pills: ControlPill[]): string {
     parts.push(`${cannotConfirm} we can't confirm`);
   }
 
-  return `${total} host control${s}: ${parts.join(", ")}. Nothing needs you.`;
+  // "Nothing needs you" is a claim about every card on the page, so it may only
+  // be made when no card asks for anything. A control that is off asks to be
+  // turned on, and saying otherwise over its own remedy command is the same
+  // defect this page was built to remove.
+  const nothingToDo = notOn === 0 && cannotConfirm === 0;
+  const tail = nothingToDo ? " Nothing needs you." : "";
+  return `${total} host control${s}: ${parts.join(", ")}.${tail}`;
 }
 
 /** The quiet line shown when no gap card needs to render. */
@@ -394,7 +415,7 @@ export function Posture({
         <section data-tour="posture" aria-labelledby="posture-verdict-title" className="overflow-hidden rounded-2xl border border-slate-200 bg-gradient-to-br from-white to-slate-50">
           <div className="px-5 py-6 sm:px-7">
             <h3 id="posture-verdict-title" className="text-2xl font-semibold tracking-tight text-slate-950">
-              {postureHeadline(pills)}
+              {postureHeadline(pills, posture.summary)}
             </h3>
             <ul className="mt-4 flex flex-wrap gap-2" aria-label="Host controls">
               {pills.map((pill) => (

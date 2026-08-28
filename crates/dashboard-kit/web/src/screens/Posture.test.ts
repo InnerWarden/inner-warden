@@ -540,9 +540,65 @@ describe("the headline names every state it counts", () => {
 
     // This fixture carries no claims records, so the assurance rule vetoes the
     // proven one down to working: 2 working, not 1 protecting + 1 working.
+    //
+    // The tail is gone, and its absence is the point. This assertion used to end
+    // "Nothing needs you." over a page listing a control that is not turned on,
+    // which is the exact sentence spec-053 section 4.3 names: the claim was
+    // unconditional, so one test pinned it in place and it read as intended
+    // behaviour for as long as it shipped.
     expect(postureHeadline(pills)).toBe(
-      "4 host controls: 2 working, 1 not turned on, 1 we can't confirm. Nothing needs you.",
+      "4 host controls: 2 working, 1 not turned on, 1 we can't confirm.",
     );
+  });
+
+  /**
+   * "Nothing needs you" is a claim about every card on the page.
+   *
+   * A control that is off asks to be turned on, and one we cannot read asks to
+   * be looked at. Neither is nothing.
+   */
+  it("only says nothing needs you when nothing on the page asks for anything", () => {
+    const allWorking = FIVE_LAYERS.map((layer) => ({ ...layer, disposition: "working_as_configured" as const }));
+    const working = posture(allWorking).layers.map((entry) =>
+      controlPill(entry, bootstrap(), generatedAt, true, evaluatedAt),
+    );
+    expect(postureHeadline(working)).toContain("Nothing needs you.");
+
+    for (const asking of ["not_enabled", "cannot_verify"] as const) {
+      const mixed = FIVE_LAYERS.map((layer, index) => ({
+        ...layer,
+        disposition: index === 0 ? asking : ("working_as_configured" as const),
+      }));
+      const pills = posture(mixed).layers.map((entry) =>
+        controlPill(entry, bootstrap(), generatedAt, true, evaluatedAt),
+      );
+      expect(postureHeadline(pills)).not.toContain("Nothing needs you.");
+    }
+  });
+
+  /**
+   * The host is the only side that can see whether a remedy command still needs
+   * running, so its sentence wins. This screen computing its own is how the two
+   * came to disagree.
+   */
+  it("prefers the sentence the host computed over its own count", () => {
+    const layers = FIVE_LAYERS.map((layer) => ({ ...layer, disposition: "working_as_configured" as const }));
+    const pills = posture(layers).layers.map((entry) =>
+      controlPill(entry, bootstrap(), generatedAt, true, evaluatedAt),
+    );
+    expect(postureHeadline(pills, "2 of 5 host controls are off and protect nothing")).toBe(
+      "2 of 5 host controls are off and protect nothing",
+    );
+  });
+
+  it("falls back to its own count when the host sent no sentence", () => {
+    const layers = FIVE_LAYERS.map((layer) => ({ ...layer, disposition: "working_as_configured" as const }));
+    const pills = posture(layers).layers.map((entry) =>
+      controlPill(entry, bootstrap(), generatedAt, true, evaluatedAt),
+    );
+    for (const empty of [undefined, "", "   "]) {
+      expect(postureHeadline(pills, empty)).toBe("5 host controls: 5 working. Nothing needs you.");
+    }
   });
 
   it("still leads with what needs the reader, above every other count", () => {
