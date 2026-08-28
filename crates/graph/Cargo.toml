@@ -14,3 +14,9 @@ description = "Local attack-narrative graph model for InnerWarden Community: ver
 # persistence; richer producers can use the open node-kind model in the future.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Parse the product config that declares the shared record location. The FILE is
+# read by the caller (this crate still does no I/O); only the text lands here.
+# A real parser rather than a hand-rolled one because the file is written by the
+# other product's installer and read as untrusted input. Same version the CLI
+# already links, so this adds nothing new to the lock file.
+toml = "1.1"
