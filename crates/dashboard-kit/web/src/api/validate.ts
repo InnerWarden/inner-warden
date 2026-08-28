@@ -327,6 +327,10 @@ export function parseDashboardPosture(value: unknown): DashboardPosture {
     generated_at: text(item.generated_at, "posture.generated_at"),
     layers: array(item.layers, "posture.layers", layer),
     gaps: array(item.gaps, "posture.gaps", gap),
+    // Absent is allowed and means "compute it locally". A present-but-not-a-
+    // string summary is a producer bug and is rejected, because silently
+    // falling back would hide it.
+    ...(item.summary === undefined ? {} : { summary: text(item.summary, "posture.summary") }),
   };
 }
 

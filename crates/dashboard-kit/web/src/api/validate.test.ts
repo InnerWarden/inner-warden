@@ -131,4 +131,29 @@ describe("the disposition survives validation", () => {
     expect(() => parseDashboardPosture(postureWithLayer({ disposition: "probably_fine" })))
       .toThrow(/unsupported value probably_fine/);
   });
+
+  /**
+   * The same defect, one level up. The host computes the page's one-line
+   * verdict, including whether any control still prints a command, and this
+   * function used not to name `summary`, so it ate it and the screen wrote its
+   * own line from the counts alone. That line ended "Nothing needs you."
+   * unconditionally.
+   */
+  it("carries the host's summary instead of eating it", () => {
+    const payload = postureWithLayer({}) as Record<string, unknown>;
+    payload.summary = "2 of 5 host controls are off and protect nothing";
+    expect(parseDashboardPosture(payload).summary).toBe("2 of 5 host controls are off and protect nothing");
+  });
+
+  it("parses a producer that sends no summary at all", () => {
+    expect(parseDashboardPosture(postureWithLayer({})).summary).toBeUndefined();
+  });
+
+  it("rejects a summary that is present but not a string", () => {
+    // Falling back quietly would hide a producer bug behind a page that still
+    // looks right.
+    const payload = postureWithLayer({}) as Record<string, unknown>;
+    payload.summary = 5;
+    expect(() => parseDashboardPosture(payload)).toThrow();
+  });
 });

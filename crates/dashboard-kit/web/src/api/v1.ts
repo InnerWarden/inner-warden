@@ -217,6 +217,15 @@ export type DashboardPosture = {
   generated_at: string;
   layers: ProtectionLayer[];
   gaps: CoverageGap[];
+  /**
+   * The one-line verdict, computed by the host from the SAME layers this
+   * response carries, including the commands those layers print.
+   *
+   * Optional because a producer written before this field existed sends none,
+   * and dropping its whole posture over a missing sentence would be a worse
+   * failure than falling back to a local count.
+   */
+  summary?: string;
 };
 
 export type Metric = {
