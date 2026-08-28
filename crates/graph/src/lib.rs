@@ -66,6 +66,29 @@ pub struct Graph {
 /// with `ProtectHome=yes`, which empties `/home` inside its mount namespace
 /// (measured on test001 on 2026-08-28 and written up in spec-052). Anything the
 /// two halves have to agree on therefore cannot live in the operator home.
+///
+/// # What the paid installer has to create alongside it
+///
+/// ```text
+/// /var/lib/innerwarden/guard/   2770  innerwarden:innerwarden   (setgid)
+///   graph.json                  0660  <operator>:innerwarden
+///   guard-events.jsonl          0660  <operator>:innerwarden
+/// ```
+///
+/// The setgid bit is not decoration. Measured on test001 (Ubuntu 24.04) on
+/// 2026-08-28: a new file in a `0770 <user>:adm` directory lands `<user>:<user>`
+/// and only `2770` gives it `adm`, because Linux hands a new file the CREATOR's
+/// primary group unless the directory says otherwise. A plain `0770` shared
+/// directory therefore produces `<operator>:<operator>` records that the
+/// `innerwarden` user matches only as OTHER, with no bits, which is the same
+/// empty dashboard this whole change exists to end.
+///
+/// The operator must also be a member of the `innerwarden` group (it already
+/// exists, `gid 989`, and is empty today). The free CLI does not rely on the
+/// installer having got either part right: it sets the group of the files it
+/// creates to the shared directory's group, which POSIX permits for a member of
+/// that group. Both halves being correct is belt and braces on purpose, because
+/// one half being correct is exactly what shipped last time.
 pub const GUARD_CONFIG_PATH: &str = "/etc/innerwarden/guard.toml";
 
 /// Upper bound on the product config. It is a handful of lines by design, so a

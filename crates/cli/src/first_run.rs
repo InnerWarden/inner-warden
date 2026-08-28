@@ -13,14 +13,22 @@
 
 use std::path::Path;
 
-/// Whether this install has ever written its own configuration directory: the
-/// parent of whatever [`crate::graph_io::sink_dir`] resolves the record to, so
-/// it follows `IW_GRAPH_FILE`, then the shared location `/etc/innerwarden/guard.toml`
-/// declares when Active Defence is installed, then `~/.config/innerwarden`.
+/// Whether the directory this install records into is there yet: exactly what
+/// [`crate::graph_io::sink_dir`] resolves to, so it follows `IW_GRAPH_FILE`,
+/// then the shared location `/etc/innerwarden/guard.toml` declares when Active
+/// Defence is installed, then `~/.config/innerwarden`.
 ///
 /// Every path that does something - `setup`, `install`, `agents connect`, a
-/// screened command reaching the record - lands there, so its absence is the
-/// closest honest reading of "this install has never done anything".
+/// screened command reaching the record - creates it, so its ABSENCE is the
+/// closest honest reading of "this install has never done anything", and
+/// absence is the only answer [`shows_panel`] acts on.
+///
+/// Presence is deliberately NOT read as the opposite, and since spec-052 it
+/// cannot be: when Active Defence declares the shared location, its installer
+/// creates that directory before the free CLI has done anything at all. So a
+/// present directory means "cannot claim this box is fresh", not "this box is
+/// set up". Erring that way costs a panel that is not shown; erring the other
+/// way tells an operator with a working install that nothing is screening.
 ///
 /// `None` means we could not tell, which callers must treat as "do not claim
 /// nothing is wired" rather than as a fresh box.
@@ -35,7 +43,7 @@ fn dir_exists(dir: &Path) -> bool {
 
 /// Should a bare `innerwarden` answer with the panel instead of full usage?
 ///
-/// Both facts are passed in so the rule is testable without a filesystem: an
+/// The fact is passed in so the rule is testable without a filesystem: an
 /// unreadable home yields `None` and keeps today's behaviour, because reporting
 /// "nothing is wired" when you only established "could not look" sends the
 /// reader to fix a fault that may not exist.

@@ -85,33 +85,52 @@ fn read_product_config_at(path: &std::path::Path) -> innerwarden_graph::ProductC
     }
 }
 
-/// The resolution, with both inputs supplied. Separate from [`resolution`] so
-/// the whole chain (real read, real parse, real precedence) can be exercised
-/// against a temporary file without a machine that has the paid product
-/// installed and without mutating the process environment.
-fn resolve_with(
-    config_path: &std::path::Path,
-    get: impl Fn(&str) -> Option<String>,
-) -> innerwarden_graph::GraphPathResolution {
-    innerwarden_graph::graph_path(get, || read_product_config_at(config_path))
-}
-
 /// Reported at most once per process. A hook runs once per tool call, so this is
 /// one line per screened action at worst, and staying silent is the failure mode
 /// spec-052 exists to end.
 static CONFIG_PROBLEM_REPORTED: std::sync::Once = std::sync::Once::new();
 
-/// Where this process's record lives, and what it had to ignore to decide that.
-fn resolution() -> innerwarden_graph::GraphPathResolution {
-    let resolved = resolve_with(
-        std::path::Path::new(innerwarden_graph::GUARD_CONFIG_PATH),
-        |key| std::env::var(key).ok(),
-    );
+/// The resolution, with every input supplied: the config file to read, the
+/// environment to read it against, and the once-guard the report is spent on.
+///
+/// Separate from [`resolution`] so the whole chain (real read, real parse, real
+/// precedence, real report) can be exercised against a temporary file, without a
+/// machine that has the paid product installed and without mutating the process
+/// environment.
+///
+/// The report lives HERE, inside the resolution, rather than in a caller. There
+/// is deliberately no variant of this that resolves quietly, so no present or
+/// future call site can take the path and forget the half that makes a
+/// divergence visible: a silent fallback puts the free CLI's writes and the paid
+/// agent's reads on two different files, which is the defect being fixed and not
+/// a safe degradation.
+fn resolve_and_report(
+    config_path: &std::path::Path,
+    get: impl Fn(&str) -> Option<String>,
+    reported: &std::sync::Once,
+) -> innerwarden_graph::GraphPathResolution {
+    let resolved = innerwarden_graph::graph_path(get, || read_product_config_at(config_path));
     if let Some(problem) = resolved.config_problem.as_ref() {
         let message = problem.message.clone();
-        CONFIG_PROBLEM_REPORTED.call_once(move || eprintln!("innerwarden: {message}"));
+        reported.call_once(move || eprintln!("innerwarden: {message}"));
     }
     resolved
+}
+
+/// [`resolve_and_report`] against the process-wide once-guard.
+fn resolve_with(
+    config_path: &std::path::Path,
+    get: impl Fn(&str) -> Option<String>,
+) -> innerwarden_graph::GraphPathResolution {
+    resolve_and_report(config_path, get, &CONFIG_PROBLEM_REPORTED)
+}
+
+/// Where this process's record lives, and what it had to ignore to decide that.
+fn resolution() -> innerwarden_graph::GraphPathResolution {
+    resolve_with(
+        std::path::Path::new(innerwarden_graph::GUARD_CONFIG_PATH),
+        |key| std::env::var(key).ok(),
+    )
 }
 
 /// The Community graph file: env `IW_GRAPH_FILE`, else the location declared in
@@ -607,7 +626,7 @@ pub(crate) fn append_guard_event(line: &Value) {
 fn append_guard_event_at(dir: &std::path::Path, line: &Value) {
     use std::io::Write;
     let path = dir.join("guard-events.jsonl");
-    create_sink_with_directory_mode(&path);
+    create_sink_with_directory_ownership(&path);
     let mut record = line.to_string();
     record.push('\n');
     if let Ok(mut file) = std::fs::OpenOptions::new()
@@ -619,35 +638,35 @@ fn append_guard_event_at(dir: &std::path::Path, line: &Value) {
     }
 }
 
-/// Create the sink, if it does not exist yet, with the mode its directory
-/// implies.
+/// Create the sink, if it does not exist yet, with the mode AND group its
+/// directory implies.
 ///
 /// This is the file the paid agent TAILS. Left to `OpenOptions::create`, it
 /// lands at `0666` minus whatever umask the AI agent that spawned the hook had,
-/// which on the shared `0770 innerwarden:innerwarden` directory is not a mode
-/// this product chose. Creating it explicitly is also the only moment at which
-/// the mode is ours to set: an existing file is left exactly as it is, because
-/// an operator who tightened it meant to.
+/// and in the creator's own primary group, which in the shared
+/// `2770 innerwarden:innerwarden` directory is neither a mode nor a group this
+/// product chose for a file two products share. Creating it explicitly is also
+/// the only moment at which either is ours to set: an existing file is left
+/// exactly as it is, because an operator who tightened it meant to.
 ///
 /// Best-effort like everything else on this path. If the create loses a race to
 /// a concurrent hook, the other process created it and the append below still
 /// works.
-fn create_sink_with_directory_mode(path: &std::path::Path) {
+fn create_sink_with_directory_ownership(path: &std::path::Path) {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
         if path.exists() {
             return;
         }
-        let mode = innerwarden_agent_guard::file_update::create_mode_for_directory(
-            path.parent().unwrap_or(path),
-        );
         if let Ok(created) = std::fs::OpenOptions::new()
             .create_new(true)
             .write(true)
             .open(path)
         {
-            let _ = created.set_permissions(std::fs::Permissions::from_mode(mode));
+            let _ = innerwarden_agent_guard::file_update::apply_new_file_ownership(
+                &created,
+                path.parent().unwrap_or(path),
+            );
         }
     }
     #[cfg(not(unix))]
@@ -941,6 +960,28 @@ mod product_config_tests {
         }
     }
 
+    /// Write a product config the way root writes one: readable by everyone,
+    /// writable by nobody else.
+    ///
+    /// The mode is STATED and not inherited, because `std::fs::write` lands at
+    /// `0666` minus the ambient umask and the two platforms disagree about what
+    /// that is. macOS defaults to `umask 022`, so a fixture file arrives `0644`
+    /// and is honoured; a stock Ubuntu user defaults to `umask 002`, so the same
+    /// line arrives `0664` and the resolver correctly refuses it as
+    /// group-writable. Measured on test001 on 2026-08-28, where every fixture
+    /// that inherited its mode failed while the same code passed on the author's
+    /// macOS machine. A suite that only agrees with itself on the platform
+    /// nobody deploys to is not a gate.
+    fn write_config(path: &std::path::Path, text: &str) {
+        std::fs::write(path, text).expect("write product config");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644))
+                .expect("state the product config's mode");
+        }
+    }
+
     /// THE TEST THAT WOULD HAVE CAUGHT IT, at the level a unit test can reach:
     /// with no environment variable at all, the shipped resolution reads a real
     /// product config off a real filesystem and records where it says.
@@ -957,12 +998,11 @@ mod product_config_tests {
     fn with_no_environment_variable_the_shared_record_location_is_honoured() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let config = dir.path().join("guard.toml");
-        std::fs::write(
+        write_config(
             &config,
             "# Written by the InnerWarden Active Defence installer.\n\
              graph_file = \"/var/lib/innerwarden/guard/graph.json\"\n",
-        )
-        .expect("write config");
+        );
 
         let resolved = resolve_with(&config, env(&[("HOME", "/home/op")]));
         assert_eq!(
@@ -1004,11 +1044,10 @@ mod product_config_tests {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let config = dir.path().join("guard.toml");
         let target = dir.path().join("not-created-yet/graph.json");
-        std::fs::write(
+        write_config(
             &config,
-            format!("graph_file = \"{}\"\n", target.to_string_lossy()),
-        )
-        .expect("write config");
+            &format!("graph_file = \"{}\"\n", target.to_string_lossy()),
+        );
 
         let resolved = resolve_with(&config, env(&[("HOME", "/home/op")]));
         assert!(!target.exists());
@@ -1027,7 +1066,7 @@ mod product_config_tests {
     fn a_symlinked_product_config_is_refused_and_reported() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let real = dir.path().join("elsewhere.toml");
-        std::fs::write(&real, "graph_file = \"/tmp/attacker.json\"\n").expect("write");
+        write_config(&real, "graph_file = \"/tmp/attacker.json\"\n");
         let link = dir.path().join("guard.toml");
         std::os::unix::fs::symlink(&real, &link).expect("symlink");
 
@@ -1047,27 +1086,223 @@ mod product_config_tests {
     /// A config anyone can write is a config anyone can use to redirect the
     /// operator's own writes.
     ///
-    /// FAILS ON REVERT: delete the mode check and this file is accepted, so the
-    /// record follows whatever a group-writable `/etc` file says.
+    /// GROUP and WORLD are separate bits and get separate rows. A single `0666`
+    /// fixture trips both at once, so it cannot tell `& 0o022` apart from
+    /// `& 0o002`: under the narrowed rule a `0664 root:staff` file in `/etc` is
+    /// honoured and every member of that group chooses where the operator's
+    /// decisions are written. `0620` and `0602` are each other's control.
+    ///
+    /// FAILS ON REVERT: delete the mode check and every row below is accepted,
+    /// so the record follows whatever a group-writable `/etc` file says.
     #[cfg(unix)]
     #[test]
     fn a_group_or_world_writable_product_config_is_refused() {
         use std::os::unix::fs::PermissionsExt;
+
+        // Group write only, world write only, and both.
+        for mode in [0o620, 0o602, 0o664, 0o646, 0o666] {
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            let config = dir.path().join("guard.toml");
+            std::fs::write(&config, "graph_file = \"/tmp/attacker.json\"\n").expect("write");
+            std::fs::set_permissions(&config, std::fs::Permissions::from_mode(mode))
+                .expect("chmod");
+
+            let resolved = resolve_with(&config, env(&[("HOME", "/home/op")]));
+            assert_eq!(
+                resolved.config_problem.map(|problem| problem.code),
+                Some("config_is_writable_by_others"),
+                "a {mode:o} product config must be refused"
+            );
+            assert_eq!(
+                resolved.path,
+                Some(std::path::PathBuf::from(
+                    "/home/op/.config/innerwarden/graph.json"
+                )),
+                "a refused {mode:o} config must record in the home"
+            );
+        }
+
+        // And the control: a file only its owner can write is honoured, so the
+        // rule above is a rule and not a refusal of everything.
+        for mode in [0o400, 0o600, 0o604, 0o640, 0o644] {
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            let config = dir.path().join("guard.toml");
+            std::fs::write(
+                &config,
+                "graph_file = \"/var/lib/innerwarden/guard/graph.json\"\n",
+            )
+            .expect("write");
+            std::fs::set_permissions(&config, std::fs::Permissions::from_mode(mode))
+                .expect("chmod");
+
+            let resolved = resolve_with(&config, env(&[("HOME", "/home/op")]));
+            assert_eq!(resolved.config_problem, None, "a {mode:o} config is fine");
+            assert_eq!(
+                resolved.path,
+                Some(std::path::PathBuf::from(
+                    "/var/lib/innerwarden/guard/graph.json"
+                )),
+                "a {mode:o} config must be honoured"
+            );
+        }
+    }
+
+    /// A config that EXISTS and cannot be READ is not the same fact as no config
+    /// at all, and the difference is the whole point: absent means the free
+    /// product is installed on its own and the home is right, while unreadable
+    /// means the paid agent is reading a path this process could not learn.
+    ///
+    /// This row of the documented table had no test at the shipped call site.
+    ///
+    /// FAILS ON REVERT: turn the catch-all `Err(_)` arm of
+    /// [`read_product_config_at`] into `ProductConfig::Absent` and a `guard.toml`
+    /// that root wrote `0600` sends every decision quietly back to the home,
+    /// where the agent cannot reach it, with nothing said to anyone.
+    #[cfg(unix)]
+    #[test]
+    fn a_product_config_that_exists_and_cannot_be_read_is_refused_and_reported() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let home = Some(std::path::PathBuf::from(
+            "/home/op/.config/innerwarden/graph.json",
+        ));
+
+        // A non-directory in the middle of the path: the open fails with ENOTDIR
+        // for every user, root included, so this half does not depend on who
+        // runs the suite.
+        let in_the_way = dir.path().join("not-a-directory");
+        std::fs::write(&in_the_way, "x").expect("write");
+        let through_a_file = in_the_way.join("guard.toml");
+        assert_eq!(
+            read_product_config_at(&through_a_file),
+            ProductConfig::Refused("config_unreadable"),
+            "an unreadable config is refused, never reported as absent"
+        );
+        let resolved = resolve_with(&through_a_file, env(&[("HOME", "/home/op")]));
+        assert_eq!(resolved.path, home);
+        assert_eq!(resolved.source, GraphPathSource::OperatorHome);
+        assert_eq!(
+            resolved.config_problem.as_ref().map(|problem| problem.code),
+            Some("config_unreadable"),
+            "falling back to the home without saying so is the split this change ends"
+        );
+
+        // And the case the defect actually looks like: root wrote it, the
+        // operator cannot open it. Root ignores the mode bits, so assert only
+        // what this process can genuinely construct.
+        let unreadable = dir.path().join("guard.toml");
+        std::fs::write(
+            &unreadable,
+            "graph_file = \"/var/lib/innerwarden/guard/graph.json\"\n",
+        )
+        .expect("write");
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod");
+        if std::fs::File::open(&unreadable).is_err() {
+            assert_eq!(
+                read_product_config_at(&unreadable),
+                ProductConfig::Refused("config_unreadable")
+            );
+            let resolved = resolve_with(&unreadable, env(&[("HOME", "/home/op")]));
+            assert_eq!(resolved.path, home);
+            assert_eq!(
+                resolved.config_problem.map(|problem| problem.code),
+                Some("config_unreadable")
+            );
+        }
+    }
+
+    /// The operator has to be TOLD, and that was asserted only where the message
+    /// is BUILT, one crate away. Replacing the `eprintln!` on the shipped path
+    /// with nothing left the whole workspace green while the product silently
+    /// wrote where the agent cannot read.
+    ///
+    /// So run the shipped reporting for real and read the process's own stderr.
+    /// The test harness redirects `eprintln!` into a per-test buffer, which is
+    /// why this re-runs itself as a child with `--nocapture`: the child is the
+    /// only place where the line goes to a file descriptor a parent can observe.
+    ///
+    /// FAILS ON REVERT: delete or silence the `eprintln!` in
+    /// [`resolve_and_report`] and the child prints nothing.
+    #[test]
+    fn a_config_that_cannot_be_honoured_is_reported_to_the_operator() {
+        const CHILD_CONFIG: &str = "IW_TEST_UNHONOURABLE_CONFIG";
+        const NAME: &str = "a_config_that_cannot_be_honoured_is_reported_to_the_operator";
+
+        if let Ok(config) = std::env::var(CHILD_CONFIG) {
+            // The child half. Nothing here writes to stderr except the shipped
+            // resolution, so anything the parent reads came from the product.
+            let resolved = resolve_and_report(
+                std::path::Path::new(&config),
+                env(&[("HOME", "/home/op")]),
+                &std::sync::Once::new(),
+            );
+            assert_eq!(resolved.source, GraphPathSource::OperatorHome);
+            return;
+        }
+
         let dir = tempfile::TempDir::new().expect("tempdir");
         let config = dir.path().join("guard.toml");
-        std::fs::write(&config, "graph_file = \"/tmp/attacker.json\"\n").expect("write");
-        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o666)).expect("chmod");
+        write_config(&config, "graph_file = 42\n");
 
-        let resolved = resolve_with(&config, env(&[("HOME", "/home/op")]));
-        assert_eq!(
-            resolved.config_problem.map(|problem| problem.code),
-            Some("config_is_writable_by_others")
+        let exe = std::env::current_exe().expect("this test binary");
+        let output = std::process::Command::new(exe)
+            // A substring filter, not `--exact`: the exact form needs the full
+            // module path, and a filter that matches NOTHING would run zero
+            // tests and exit 0, which is a gate that cannot fail.
+            .arg(NAME)
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env(CHILD_CONFIG, &config)
+            .output()
+            .expect("re-run this test as a child process");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "the child half must pass; stderr was:\n{stderr}"
         );
-        assert_eq!(
-            resolved.path,
-            Some(std::path::PathBuf::from(
-                "/home/op/.config/innerwarden/graph.json"
-            ))
+        assert!(
+            stdout.contains("1 passed"),
+            "the child must have actually run this one test, or the assertions \
+             below prove nothing; its stdout was:\n{stdout}"
+        );
+        assert!(
+            stderr.contains("innerwarden: /etc/innerwarden/guard.toml exists but does not name"),
+            "the operator must be told the record moved back to the home; \
+             the child's stderr was:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("config_malformed"),
+            "the reason code has to reach the operator too:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("cannot read them"),
+            "and what it costs, not just that something is wrong:\n{stderr}"
+        );
+    }
+
+    /// Told ONCE, not once per resolution. A hook resolves several times in a
+    /// single screened action, and a guardrail that prints the same paragraph
+    /// four times per command teaches the reader to ignore it.
+    #[test]
+    fn the_report_is_spent_once_per_process() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let config = dir.path().join("guard.toml");
+        write_config(&config, "graph_file = 42\n");
+        let reported = std::sync::Once::new();
+
+        for _ in 0..3 {
+            let resolved = resolve_and_report(&config, env(&[("HOME", "/home/op")]), &reported);
+            assert_eq!(
+                resolved.config_problem.map(|problem| problem.code),
+                Some("config_malformed"),
+                "every resolution still carries the problem, spent guard or not"
+            );
+        }
+        assert!(
+            reported.is_completed(),
+            "the guard must have been spent, or the report never happened"
         );
     }
 
@@ -1085,11 +1320,10 @@ mod product_config_tests {
         );
 
         let oversized = dir.path().join("oversized.toml");
-        std::fs::write(
+        write_config(
             &oversized,
-            "#".repeat(innerwarden_graph::MAX_PRODUCT_CONFIG_BYTES as usize + 1),
-        )
-        .expect("write");
+            &"#".repeat(innerwarden_graph::MAX_PRODUCT_CONFIG_BYTES as usize + 1),
+        );
         assert_eq!(
             read_product_config_at(&oversized),
             ProductConfig::Refused("config_too_large")
@@ -1097,13 +1331,19 @@ mod product_config_tests {
 
         let not_utf8 = dir.path().join("not-utf8.toml");
         std::fs::write(&not_utf8, [0x67, 0x66, 0x20, 0xff, 0xfe]).expect("write");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&not_utf8, std::fs::Permissions::from_mode(0o644))
+                .expect("state the mode");
+        }
         assert_eq!(
             read_product_config_at(&not_utf8),
             ProductConfig::Refused("config_not_utf8")
         );
 
         let empty = dir.path().join("empty.toml");
-        std::fs::write(&empty, "").expect("write");
+        write_config(&empty, "");
         assert_eq!(
             read_product_config_at(&empty),
             ProductConfig::Present(String::new())
@@ -1127,29 +1367,114 @@ mod product_config_tests {
         );
     }
 
-    /// WIRING PIN, half two: `resolution` passes that constant, and nothing in
-    /// this file resolves the record path any other way.
+    /// Every `.rs` file this crate ships, read from disk at test time.
+    ///
+    /// `include_str!` cannot do this job: it can only name files the author
+    /// already thought of, and the file that went wrong is by definition the one
+    /// nobody thought of. `CARGO_MANIFEST_DIR` plus a real directory walk covers
+    /// whatever is there, including a module added after this test was written.
+    fn crate_sources() -> Vec<(String, String)> {
+        fn walk(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<(String, String)>) {
+            let entries = std::fs::read_dir(dir)
+                .unwrap_or_else(|error| panic!("reading {}: {error}", dir.display()));
+            for entry in entries {
+                let path = entry.expect("directory entry").path();
+                if path.is_dir() {
+                    walk(&path, root, out);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    let name = path
+                        .strip_prefix(root)
+                        .unwrap_or(&path)
+                        .to_string_lossy()
+                        .into_owned();
+                    // Lossy on purpose. A source that is not valid UTF-8 still
+                    // has to be SCANNED, not skipped and not fatal: skipping
+                    // would let a second resolver hide behind one stray byte,
+                    // and panicking makes an unrelated file in the tree able to
+                    // take this pin down.
+                    let bytes = std::fs::read(&path)
+                        .unwrap_or_else(|error| panic!("reading {}: {error}", path.display()));
+                    out.push((name, String::from_utf8_lossy(&bytes).into_owned()));
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut out = Vec::new();
+        walk(&root, &root, &mut out);
+        out.sort();
+        out
+    }
+
+    /// WIRING PIN, half two: `resolution` passes that constant, and NOTHING in
+    /// this crate resolves the record path any other way.
     ///
     /// A correct resolver nobody calls is exactly how this defect shipped the
     /// first time: the installer was fixed to compute the right PATH and the
     /// agent still could not read the file, and one symptom covered both.
     ///
-    /// FAILS ON REVERT: point `resolution` at a different literal, or call
-    /// `innerwarden_graph::graph_path` from a second place here.
+    /// The previous version of this pin read `include_str!("graph_io.rs")` and
+    /// counted inside THIS FILE ONLY, which is the one file that was never the
+    /// problem. The second resolver lived in `record_health::current()`, and
+    /// putting it back left every test in the workspace green. So the walk below
+    /// enumerates the crate instead of naming a file.
+    ///
+    /// FAILS ON REVERT: point `resolution` at a different literal, or resolve
+    /// the record path from a second place anywhere under `src/`.
     #[test]
-    fn the_shipped_resolution_reads_the_product_config_location() {
-        let source = include_str!("graph_io.rs");
+    fn the_record_path_is_resolved_in_exactly_one_place_in_this_crate() {
+        let sources = crate_sources();
+        assert!(
+            sources.len() >= 20,
+            "the walk found only {} sources under src/; a pin that enumerates \
+             nothing proves nothing",
+            sources.len()
+        );
+        let this_file = "graph_io.rs";
+        assert!(
+            sources.iter().any(|(name, _)| name == this_file),
+            "the walk must at least find the file it is written in, got {:?}",
+            sources.iter().map(|(name, _)| name).collect::<Vec<_>>()
+        );
+
+        // Needles built at runtime, so this test's own text is never a match.
+        let quote = '"';
+        let resolver = format!("{}::graph_path(", "innerwarden_graph");
+        let env_read = format!("var({quote}IW_GRAPH_FILE{quote}");
+        let env_read_os = format!("var_os({quote}IW_GRAPH_FILE{quote}");
+        let home_rule = format!(".config/{}/graph.json", "innerwarden");
+
+        let mut resolvers: Vec<(&str, usize)> = Vec::new();
+        for (name, text) in &sources {
+            let count = text.matches(resolver.as_str()).count();
+            if count > 0 {
+                resolvers.push((name.as_str(), count));
+            }
+            assert!(
+                !text.contains(env_read.as_str()) && !text.contains(env_read_os.as_str()),
+                "{name} reads IW_GRAPH_FILE itself; the override belongs to the one \
+                 resolver, and a second reading of it is how the writes move and the \
+                 readers do not"
+            );
+            assert!(
+                name == this_file || !text.contains(home_rule.as_str()),
+                "{name} builds the operator-home record path itself; there is one \
+                 resolver and this is not it"
+            );
+        }
+        assert_eq!(
+            resolvers,
+            vec![(this_file, 1)],
+            "the record path must be resolved in exactly one place; a second \
+             resolver is how the writes move and the readers do not"
+        );
+
+        let (_, source) = sources
+            .iter()
+            .find(|(name, _)| name == this_file)
+            .expect("this file was found above");
         assert!(
             source.contains("resolve_with(\n        std::path::Path::new(innerwarden_graph::GUARD_CONFIG_PATH),"),
             "resolution() must resolve against GUARD_CONFIG_PATH"
-        );
-        // Built at runtime so this assertion's own text is not a match.
-        let call = format!("{}::graph_path(", "innerwarden_graph");
-        assert_eq!(
-            source.matches(call.as_str()).count(),
-            1,
-            "the record path must be resolved in exactly one place; a second \
-             resolver is how the writes move and the readers do not"
         );
     }
 }
@@ -1224,13 +1549,15 @@ mod tests {
 
     /// THE SEAM, at the mode level. `guard-events.jsonl` is the file the paid
     /// agent TAILS, and it lands in a directory the installer creates
-    /// `0770 innerwarden:innerwarden` with the operator in that group. Left to
+    /// `2770 innerwarden:innerwarden` with the operator in that group. Left to
     /// `OpenOptions::create` it arrives at `0666` minus the umask the AI agent
     /// that spawned the hook happened to have, which is not a mode this product
     /// chose for a file two products share.
     ///
-    /// FAILS ON REVERT: drop `create_sink_with_directory_mode` and the shared
-    /// case is whatever the ambient umask produces, not `0660`.
+    /// The mode is only half of the seam; the group has its own test below.
+    ///
+    /// FAILS ON REVERT: drop `create_sink_with_directory_ownership` and the
+    /// shared case is whatever the ambient umask produces, not `0660`.
     #[cfg(unix)]
     #[test]
     fn the_sink_the_agent_tails_follows_the_directory_it_lands_in() {
@@ -1255,6 +1582,81 @@ mod tests {
                 "a {directory_mode:o} directory must produce a {expected:o} sink, got {mode:o}"
             );
         }
+    }
+
+    /// THE SEAM, at the group level, which no assertion about mode bits can
+    /// see. Measured on test001 (Ubuntu 24.04) on 2026-08-28: a new file in a
+    /// `0770 <user>:adm` directory lands `<user>:<user>`, and only a setgid
+    /// `2770` directory hands it `adm`. So a `0660` sink in a plain
+    /// `0770 innerwarden:innerwarden` directory is `<operator>:<operator>`, the
+    /// agent user matches OTHER, OTHER has nothing, and the dashboard home page
+    /// reports `graph_absent` exactly as before the fix.
+    ///
+    /// The directory here is deliberately not setgid, because that is the state
+    /// this side has to survive if the installer did not set it.
+    ///
+    /// FAILS ON REVERT: drop the group half of `apply_new_file_ownership` and
+    /// the sink the agent tails carries this process's own primary group.
+    #[cfg(unix)]
+    #[test]
+    fn the_sink_the_agent_tails_takes_the_shared_directorys_group() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let Some(shared_group) = a_group_this_process_can_hand_to_a_file() else {
+            panic!(
+                "this machine cannot construct the case: the user running the suite has \
+                 exactly one group and is not root, so no directory can be given a group \
+                 that differs from the one a new file would get. Add the user to a second \
+                 group and re-run; a pass here without this case would prove nothing."
+            );
+        };
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let shared = dir.path().join("guard");
+        std::fs::create_dir(&shared).unwrap();
+        std::os::unix::fs::chown(&shared, None, Some(shared_group)).expect("chgrp the directory");
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o770)).unwrap();
+        assert_eq!(
+            std::fs::metadata(&shared).unwrap().permissions().mode() & 0o7777,
+            0o770,
+            "precondition: the directory is NOT setgid"
+        );
+
+        append_guard_event_at(&shared, &serde_json::json!({"kind": "guard.blocked"}));
+
+        let sink = std::fs::metadata(shared.join("guard-events.jsonl")).unwrap();
+        assert_eq!(
+            sink.gid(),
+            shared_group,
+            "the file the agent tails must carry the shared directory's group, or \
+             the agent user reads it as OTHER and sees nothing"
+        );
+        assert_eq!(sink.permissions().mode() & 0o777, 0o660);
+    }
+
+    /// A group this process belongs to that is NOT its primary group, so a test
+    /// directory can be made to differ from the group the kernel would hand a
+    /// new file. Root may hand a file to any group, so the case is always
+    /// constructible there.
+    #[cfg(unix)]
+    fn a_group_this_process_can_hand_to_a_file() -> Option<u32> {
+        // SAFETY: both calls only read process credentials, take no pointers,
+        // and cannot fail.
+        let (primary, root) = unsafe { (libc::getegid(), libc::geteuid() == 0) };
+        let mut buffer = [0 as libc::gid_t; 64];
+        // SAFETY: the length and the pointer describe `buffer` exactly, and the
+        // result is bounded by that length before it is used as one.
+        let count = unsafe { libc::getgroups(buffer.len() as libc::c_int, buffer.as_mut_ptr()) };
+        if count > 0 {
+            if let Some(other) = buffer[..count as usize]
+                .iter()
+                .copied()
+                .find(|group| *group != primary)
+            {
+                return Some(other);
+            }
+        }
+        root.then(|| primary.wrapping_add(1))
     }
 
     /// And once the file exists its mode is the operator's, not ours. Widening

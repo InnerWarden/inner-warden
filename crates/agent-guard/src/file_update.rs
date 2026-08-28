@@ -32,33 +32,105 @@ pub const MAX_CONFIG_BYTES: u64 = 16 * 1024 * 1024;
 /// corrupt file takes the process with it.
 pub const MAX_OWNED_STORE_BYTES: u64 = 128 * 1024 * 1024;
 
-/// The mode a file this product CREATES should carry, taken from the directory
+/// What a file this product CREATES has to look like, taken from the directory
 /// it lands in instead of from a constant.
 ///
 /// WHY, from spec-052 and its measurements on test001 (2026-08-28): the paid
 /// agent runs as its own `innerwarden` user with `ProtectHome=yes`, which leaves
 /// `/home` empty inside its mount namespace, so the record both halves share has
-/// to move to `/var/lib/innerwarden/guard/`. The installer creates that
-/// directory `0770 innerwarden:innerwarden` and puts the operator in the group.
-/// A hardcoded `0600` produces, there, a file the agent still cannot read, which
-/// is the same "dashboard home page shows an error" symptom by a second route.
+/// to move to `/var/lib/innerwarden/guard/`. That directory is shared: the
+/// operator writes it through the free CLI and the `innerwarden` agent user
+/// reads it.
 ///
-/// A hardcoded `0660` everywhere would be the opposite mistake: this module also
-/// writes agent configuration inside a private home, and widening those is not
-/// something the operator asked for.
+/// # Mode
+///
+/// A hardcoded `0600` produces, in that shared directory, a file the agent still
+/// cannot read, which is the same "dashboard home page shows an error" symptom
+/// by a second route. A hardcoded `0660` everywhere would be the opposite
+/// mistake: this module also writes agent configuration inside a private home,
+/// and widening those is not something the operator asked for.
 ///
 /// So the directory decides, and neither half fights the other about it. Group
 /// write on the directory means the group is already trusted to write there, and
 /// a group readable/writable file is consistent with that; anything else stays
 /// owner-only.
+///
+/// # Group, which is the half a mode alone cannot cover
+///
+/// Measured on test001 (Ubuntu 24.04) on 2026-08-28:
+///
+/// ```text
+/// dir 0770 test001:adm  -> a new file lands test001:test001
+/// dir 2770 test001:adm  -> a new file lands test001:adm
+/// ```
+///
+/// Linux gives a new file the CREATOR's primary group unless the directory
+/// carries the setgid bit. So mode `0660` inside a plain
+/// `0770 innerwarden:innerwarden` directory produces `<operator>:<operator>`,
+/// and the `innerwarden` user that has to read it falls into OTHER with no bits
+/// at all: `graph_absent` again, reached by a third route, and no assertion
+/// about mode bits can see it.
+///
+/// Two things therefore have to be true, and this crate owns the second so the
+/// free half is correct whichever way the installer went:
+///
+/// 1. the paid installer creates the shared directory `2770
+///    innerwarden:innerwarden`, setgid, with the operator in that group;
+/// 2. a file created here in a group-writable directory is given that
+///    directory's group explicitly, which POSIX permits for a member of the
+///    group.
 #[cfg(unix)]
-pub fn create_mode_for_directory(directory: &Path) -> u32 {
-    use std::os::unix::fs::PermissionsExt;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NewFileOwnership {
+    /// Permission bits for a file this product creates.
+    pub mode: u32,
+    /// The group that file has to carry. `Some` only for a shared directory;
+    /// `None` leaves the group exactly as the kernel assigned it.
+    pub group: Option<u32>,
+}
+
+/// The mode and group [`NewFileOwnership`] describes, for one directory.
+#[cfg(unix)]
+pub fn new_file_ownership(directory: &Path) -> NewFileOwnership {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     const GROUP_WRITE: u32 = 0o020;
     match fs::metadata(directory) {
-        Ok(metadata) if metadata.permissions().mode() & GROUP_WRITE != 0 => 0o660,
-        _ => 0o600,
+        Ok(metadata) if metadata.permissions().mode() & GROUP_WRITE != 0 => NewFileOwnership {
+            mode: 0o660,
+            group: Some(metadata.gid()),
+        },
+        _ => NewFileOwnership {
+            mode: 0o600,
+            group: None,
+        },
     }
+}
+
+/// Give a just-created file the mode and group [`new_file_ownership`] derives
+/// from the directory it lands in.
+///
+/// Applied through the open descriptor rather than `OpenOptions::mode`, because
+/// `mode()` is filtered by the process umask and a hook inherits whatever umask
+/// the AI agent that spawned it happened to have. That is not a decision this
+/// product gets to make about a file two products share.
+///
+/// The group is best-effort and the mode is not. Changing a file's group is
+/// permitted for a member of the target group and refused otherwise, so an
+/// operator who was never added to the `innerwarden` group gets `EPERM` here and
+/// no amount of retrying fixes it; failing the write over that would stop the
+/// guardrail recording at all, which is worse than recording into a file the
+/// agent cannot yet read. The mode is unconditionally ours, so a failure there
+/// is a real error.
+#[cfg(unix)]
+pub fn apply_new_file_ownership(file: &File, directory: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let wanted = new_file_ownership(directory);
+    if let Some(group) = wanted.group {
+        // Before the mode, because `chown` may clear the set-user-ID and
+        // set-group-ID bits, so the mode has to be the last word.
+        let _ = std::os::unix::fs::fchown(file, None, Some(group));
+    }
+    file.set_permissions(fs::Permissions::from_mode(wanted.mode))
 }
 
 struct UpdateLock(File);
@@ -384,15 +456,11 @@ fn replace_inner(
         }
         #[cfg(unix)]
         if previous_metadata.is_none() {
-            use std::os::unix::fs::PermissionsExt;
-            // `fchmod` through `set_permissions`, not `OpenOptions::mode`, so the
-            // result is the mode asked for. `mode()` is filtered by the process
-            // umask, and a hook inherits whatever umask the AI agent that spawned
-            // it happened to have, which is not a decision this product gets to
-            // make about a file two products share.
-            let mode = create_mode_for_directory(parent);
-            file.set_permissions(fs::Permissions::from_mode(mode))
-                .map_err(|error| format!("setting permissions on {}: {error}", temp.display()))?;
+            // A file this product is creating, so the directory it lands in
+            // decides both its mode and its group. Applied to the sibling temp,
+            // which `rename` carries over to the destination unchanged.
+            apply_new_file_ownership(&file, parent)
+                .map_err(|error| format!("setting ownership on {}: {error}", temp.display()))?;
         }
         file.write_all(body)
             .map_err(|error| format!("writing {}: {error}", temp.display()))?;
@@ -620,10 +688,13 @@ mod tests {
     /// THE TEST THAT WOULD HAVE CAUGHT THE OTHER HALF of spec-052.
     ///
     /// The record both products share lives in `/var/lib/innerwarden/guard/`,
-    /// created `0770 innerwarden:innerwarden` with the operator in the group. A
+    /// created `2770 innerwarden:innerwarden` with the operator in the group. A
     /// new store created `0600` there is a file the agent still cannot read, and
     /// the symptom is identical to the path being wrong, which is why the first
     /// attempt at this fix looked complete.
+    ///
+    /// The mode is only half of it; the group is the other half and has its own
+    /// test below, because nothing asserted here about mode bits can see it.
     ///
     /// FAILS ON REVERT: restore the hardcoded `from_mode(0o600)` and the shared
     /// case comes back `0600`, invisible to the agent.
@@ -649,9 +720,144 @@ mod tests {
         }
     }
 
+    /// A group this process belongs to that is NOT its primary group, so a test
+    /// directory can be made to differ from the group the kernel would hand a
+    /// new file. Root may hand a file to any group, so the case is always
+    /// constructible there.
+    #[cfg(unix)]
+    fn a_group_this_process_can_hand_to_a_file() -> Option<u32> {
+        // SAFETY: both calls only read process credentials, take no pointers,
+        // and cannot fail.
+        let (primary, root) = unsafe { (libc::getegid(), libc::geteuid() == 0) };
+        let mut buffer = [0 as libc::gid_t; 64];
+        // SAFETY: the length and the pointer describe `buffer` exactly, and the
+        // result is bounded by that length before it is used as one.
+        let count = unsafe { libc::getgroups(buffer.len() as libc::c_int, buffer.as_mut_ptr()) };
+        if count > 0 {
+            if let Some(other) = buffer[..count as usize]
+                .iter()
+                .copied()
+                .find(|group| *group != primary)
+            {
+                return Some(other);
+            }
+        }
+        root.then(|| primary.wrapping_add(1))
+    }
+
+    /// THE HALF THAT NO ASSERTION ABOUT MODE BITS CAN SEE, and it was measured.
+    ///
+    /// On test001 (Ubuntu 24.04) on 2026-08-28:
+    ///
+    /// ```text
+    /// dir 0770 test001:adm  -> a new file lands test001:test001
+    /// dir 2770 test001:adm  -> a new file lands test001:adm
+    /// ```
+    ///
+    /// Linux gives a new file the creator's primary group unless the directory
+    /// is setgid. So mode `0660` inside a plain `0770 innerwarden:innerwarden`
+    /// directory produces `<operator>:<operator>`, the agent user matches only
+    /// OTHER, and OTHER has no bits: the same `graph_absent` dashboard error,
+    /// reached by a third route, with every mode assertion still green.
+    ///
+    /// The directory here is deliberately NOT setgid, because that is the state
+    /// this side must survive if the installer did not set it.
+    ///
+    /// FAILS ON REVERT: drop the `fchown` from [`apply_new_file_ownership`] and
+    /// the store lands in this process's own primary group.
+    #[cfg(unix)]
+    #[test]
+    fn a_new_store_in_a_shared_directory_takes_that_directorys_group() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let Some(shared_group) = a_group_this_process_can_hand_to_a_file() else {
+            panic!(
+                "this machine cannot construct the case: the user running the suite has \
+                 exactly one group and is not root, so no directory can be given a group \
+                 that differs from the one a new file would get. Add the user to a second \
+                 group and re-run; a pass here without this case would prove nothing."
+            );
+        };
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let shared = dir.path().join("guard");
+        std::fs::create_dir(&shared).unwrap();
+        std::os::unix::fs::chown(&shared, None, Some(shared_group)).expect("chgrp the directory");
+        std::fs::set_permissions(&shared, fs::Permissions::from_mode(0o770)).unwrap();
+        let directory = fs::metadata(&shared).unwrap();
+        assert_eq!(
+            directory.gid(),
+            shared_group,
+            "precondition: the directory is owned by the shared group"
+        );
+        assert_eq!(
+            directory.permissions().mode() & 0o7777,
+            0o770,
+            "precondition: the directory is NOT setgid, which is the state this side has to survive"
+        );
+
+        let path = shared.join("graph.json");
+        replace_owned_store_no_symlinks(&shared, &path, None, b"{}").expect("first write");
+
+        let written = fs::metadata(&path).unwrap();
+        assert_eq!(
+            written.gid(),
+            shared_group,
+            "the store must carry the shared directory's group, or the agent user \
+             matches OTHER and reads nothing"
+        );
+        assert_eq!(written.permissions().mode() & 0o777, 0o660);
+    }
+
+    /// And the SECOND write must not undo the first. Every replacement stages a
+    /// fresh sibling and renames it over the destination, and that sibling is a
+    /// new file with the creator's own group; without the ownership restore, a
+    /// shared store would be readable by the agent exactly once.
+    ///
+    /// FAILS ON REVERT: drop the `fchown` from `preserve_metadata` and the
+    /// second write hands the store back to this process's primary group.
+    #[cfg(unix)]
+    #[test]
+    fn rewriting_a_shared_store_keeps_the_group_the_agent_reads_it_by() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let Some(shared_group) = a_group_this_process_can_hand_to_a_file() else {
+            panic!(
+                "this machine cannot construct the case: the user running the suite has \
+                 exactly one group and is not root. Add the user to a second group and \
+                 re-run; a pass here without this case would prove nothing."
+            );
+        };
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let shared = dir.path().join("guard");
+        std::fs::create_dir(&shared).unwrap();
+        std::os::unix::fs::chown(&shared, None, Some(shared_group)).expect("chgrp the directory");
+        std::fs::set_permissions(&shared, fs::Permissions::from_mode(0o770)).unwrap();
+        let path = shared.join("graph.json");
+        replace_owned_store_no_symlinks(&shared, &path, None, b"{}").expect("first write");
+        assert_eq!(
+            fs::metadata(&path).unwrap().gid(),
+            shared_group,
+            "precondition: the first write already put the store in the shared group"
+        );
+
+        replace_owned_store_no_symlinks(&shared, &path, Some(b"{}"), b"{\"nodes\":[]}")
+            .expect("second write");
+
+        let rewritten = fs::metadata(&path).unwrap();
+        assert_eq!(
+            rewritten.gid(),
+            shared_group,
+            "a rewrite must not hand the shared store back to the operator's own group"
+        );
+        assert_eq!(rewritten.permissions().mode() & 0o777, 0o660);
+    }
+
     /// The other direction, and it is not a formality: a private home must not
     /// be widened because a shared directory needed to be. `0600` is still the
-    /// answer for every agent configuration this module writes under a home.
+    /// answer for every agent configuration this module writes under a home, and
+    /// its group is left exactly as the kernel assigned it.
     #[cfg(unix)]
     #[test]
     fn a_new_config_in_a_private_directory_is_still_owner_only() {
@@ -659,6 +865,15 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let path = dir.path().join("settings.json");
+
+        assert_eq!(
+            new_file_ownership(dir.path()),
+            NewFileOwnership {
+                mode: 0o600,
+                group: None
+            },
+            "a private directory must not make this product reassign a group"
+        );
 
         replace(&path, b"{}").expect("write");
 
