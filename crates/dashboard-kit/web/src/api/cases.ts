@@ -121,6 +121,44 @@ export type VerifiedOutcome = {
   trust_explanation: string;
 };
 
+/**
+ * One link the host recorded, already in English.
+ *
+ * The product is sold on a knowledge graph that turns unremarkable events into
+ * one story. Nine graph endpoints existed and no frontend had ever called one,
+ * so what the case actually said was "Unknown relationship: how this event
+ * relates to the ones next to it was not established". The data was there; the
+ * renderer was not.
+ *
+ * The phrasing is decided host-side, for the same reason the outcome verdict is:
+ * a second vocabulary in TypeScript is a second thing to drift.
+ */
+export type CaseLink = {
+  from: string;
+  from_kind: string;
+  /** "was started by", "looked up", "connected out to". */
+  relation: string;
+  to: string;
+  to_kind: string;
+  observed_at: string | null;
+  /** Does this touch the case's own subject, or is it context one hop out? */
+  involves_this_case: boolean;
+};
+
+export type CaseConnections = {
+  links: CaseLink[];
+  /** How many observed links there were before the display cap. */
+  total_recorded: number;
+  /**
+   * Why the block is empty, when it is.
+   *
+   * Never null AND empty: the connection store evicts under a size cap, so an
+   * empty block with no explanation would read as "nothing happened", which is
+   * a claim the store cannot support.
+   */
+  absence_reason: string | null;
+};
+
 export const OUTCOME_TRUSTS = ["proven", "recorded", "unproven"] as const;
 export type OutcomeTrust = (typeof OUTCOME_TRUSTS)[number];
 
@@ -162,6 +200,7 @@ export type UnifiedCase = CaseSummary & {
   evidence: EvidenceRef[];
   feedback: FeedbackRecord[];
   verified_outcomes: VerifiedOutcome[];
+  connections: CaseConnections;
   enrichment?: CaseEnrichment | null;
 };
 
@@ -381,7 +420,7 @@ export function parseCaseListPage(value: unknown, requestedLimit = 20): CaseList
 
 export function parseUnifiedCase(value: unknown): UnifiedCase {
   const item = object(value, "case");
-  exact(item, ["id", "title", "severity", "status", "scope", "latest_event_at", "outcome", "schema_version", "identity", "recurrence", "timeline", "evidence", "feedback", "verified_outcomes", "enrichment"], "case");
+  exact(item, ["id", "title", "severity", "status", "scope", "latest_event_at", "outcome", "schema_version", "identity", "recurrence", "timeline", "evidence", "feedback", "verified_outcomes", "enrichment", "connections"], "case");
   if (item.schema_version !== DASHBOARD_SCHEMA_VERSION) throw new Error("case.schema_version: unsupported contract version");
   const identity = object(item.identity, "case.identity");
   exact(identity, ["subject_ids", "confidence", "evidence"], "case.identity");
@@ -419,6 +458,59 @@ export function parseUnifiedCase(value: unknown): UnifiedCase {
     feedback: array(item.feedback, "case.feedback", feedback, 1_000),
     verified_outcomes: array(item.verified_outcomes, "case.verified_outcomes", verifiedOutcome, 1_000),
     enrichment: parseEnrichment(item.enrichment),
+    connections: parseConnections(item.connections),
+  };
+}
+
+/**
+ * Strict, unlike enrichment, and deliberately so.
+ *
+ * Enrichment is best-effort context that degrades to "not reported". A
+ * connections block that degrades silently produces the exact screen this whole
+ * change exists to remove: an empty area with no explanation, which a reader
+ * can only take as "nothing was connected". A producer that sends a malformed
+ * block is a bug, and it fails here rather than on the customer's screen.
+ *
+ * An ABSENT block is different from a malformed one and is allowed: it means
+ * the host predates this field, and the honest render is to say the host did
+ * not report connections at all.
+ */
+function parseConnections(value: unknown): CaseConnections {
+  if (value === undefined) {
+    return {
+      links: [],
+      total_recorded: 0,
+      absence_reason: "This host has not reported connection records for cases yet.",
+    };
+  }
+  const item = object(value, "case.connections");
+  exact(item, ["links", "total_recorded", "absence_reason"], "case.connections");
+  const links = array(item.links, "case.connections.links", parseCaseLink, 200);
+  const total = item.total_recorded;
+  if (typeof total !== "number" || !Number.isInteger(total) || total < 0) {
+    throw new Error("case.connections.total_recorded: expected a count");
+  }
+  const reason = nullableString(item.absence_reason, "case.connections.absence_reason", 1_024);
+  if (links.length === 0 && reason === null) {
+    // The one combination that must never render. See the Rust side: this is
+    // the struct default, and it only occurs when the host built a case and
+    // never filled the block in.
+    throw new Error("case.connections: empty with no reason, which would render as `nothing happened`");
+  }
+  return { links, total_recorded: total, absence_reason: reason };
+}
+
+function parseCaseLink(value: unknown, path: string): CaseLink {
+  const item = object(value, path);
+  exact(item, ["from", "from_kind", "relation", "to", "to_kind", "observed_at", "involves_this_case"], path);
+  return {
+    from: string(item.from, `${path}.from`, 1, 512),
+    from_kind: string(item.from_kind, `${path}.from_kind`, 1, 64),
+    relation: string(item.relation, `${path}.relation`, 1, 128),
+    to: string(item.to, `${path}.to`, 1, 512),
+    to_kind: string(item.to_kind, `${path}.to_kind`, 1, 64),
+    observed_at: item.observed_at === null ? null : dateTime(item.observed_at, `${path}.observed_at`),
+    involves_this_case: boolean(item.involves_this_case, `${path}.involves_this_case`),
   };
 }
 
