@@ -32,6 +32,35 @@ pub const MAX_CONFIG_BYTES: u64 = 16 * 1024 * 1024;
 /// corrupt file takes the process with it.
 pub const MAX_OWNED_STORE_BYTES: u64 = 128 * 1024 * 1024;
 
+/// The mode a file this product CREATES should carry, taken from the directory
+/// it lands in instead of from a constant.
+///
+/// WHY, from spec-052 and its measurements on test001 (2026-08-28): the paid
+/// agent runs as its own `innerwarden` user with `ProtectHome=yes`, which leaves
+/// `/home` empty inside its mount namespace, so the record both halves share has
+/// to move to `/var/lib/innerwarden/guard/`. The installer creates that
+/// directory `0770 innerwarden:innerwarden` and puts the operator in the group.
+/// A hardcoded `0600` produces, there, a file the agent still cannot read, which
+/// is the same "dashboard home page shows an error" symptom by a second route.
+///
+/// A hardcoded `0660` everywhere would be the opposite mistake: this module also
+/// writes agent configuration inside a private home, and widening those is not
+/// something the operator asked for.
+///
+/// So the directory decides, and neither half fights the other about it. Group
+/// write on the directory means the group is already trusted to write there, and
+/// a group readable/writable file is consistent with that; anything else stays
+/// owner-only.
+#[cfg(unix)]
+pub fn create_mode_for_directory(directory: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    const GROUP_WRITE: u32 = 0o020;
+    match fs::metadata(directory) {
+        Ok(metadata) if metadata.permissions().mode() & GROUP_WRITE != 0 => 0o660,
+        _ => 0o600,
+    }
+}
+
 struct UpdateLock(File);
 
 impl UpdateLock {
@@ -356,10 +385,14 @@ fn replace_inner(
         #[cfg(unix)]
         if previous_metadata.is_none() {
             use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(fs::Permissions::from_mode(0o600))
-                .map_err(|error| {
-                    format!("setting private permissions on {}: {error}", temp.display())
-                })?;
+            // `fchmod` through `set_permissions`, not `OpenOptions::mode`, so the
+            // result is the mode asked for. `mode()` is filtered by the process
+            // umask, and a hook inherits whatever umask the AI agent that spawned
+            // it happened to have, which is not a decision this product gets to
+            // make about a file two products share.
+            let mode = create_mode_for_directory(parent);
+            file.set_permissions(fs::Permissions::from_mode(mode))
+                .map_err(|error| format!("setting permissions on {}: {error}", temp.display()))?;
         }
         file.write_all(body)
             .map_err(|error| format!("writing {}: {error}", temp.display()))?;
@@ -583,6 +616,106 @@ fn replace_windows(path: &Path, temp: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// THE TEST THAT WOULD HAVE CAUGHT THE OTHER HALF of spec-052.
+    ///
+    /// The record both products share lives in `/var/lib/innerwarden/guard/`,
+    /// created `0770 innerwarden:innerwarden` with the operator in the group. A
+    /// new store created `0600` there is a file the agent still cannot read, and
+    /// the symptom is identical to the path being wrong, which is why the first
+    /// attempt at this fix looked complete.
+    ///
+    /// FAILS ON REVERT: restore the hardcoded `from_mode(0o600)` and the shared
+    /// case comes back `0600`, invisible to the agent.
+    #[cfg(unix)]
+    #[test]
+    fn a_new_store_takes_the_mode_its_directory_implies() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for (directory_mode, expected) in [(0o770, 0o660), (0o700, 0o600), (0o755, 0o600)] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let shared = dir.path().join("guard");
+            std::fs::create_dir(&shared).unwrap();
+            std::fs::set_permissions(&shared, fs::Permissions::from_mode(directory_mode)).unwrap();
+            let path = shared.join("graph.json");
+
+            replace_owned_store_no_symlinks(&shared, &path, None, b"{}").expect("first write");
+
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode, expected,
+                "a {directory_mode:o} directory must produce a {expected:o} store, got {mode:o}"
+            );
+        }
+    }
+
+    /// The other direction, and it is not a formality: a private home must not
+    /// be widened because a shared directory needed to be. `0600` is still the
+    /// answer for every agent configuration this module writes under a home.
+    #[cfg(unix)]
+    #[test]
+    fn a_new_config_in_a_private_directory_is_still_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.path().join("settings.json");
+
+        replace(&path, b"{}").expect("write");
+
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    /// An EXISTING file keeps the mode it has, in a group-writable directory as
+    /// everywhere else. The directory decides what a file we create looks like;
+    /// it never relitigates one that already exists.
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_store_keeps_its_own_mode_even_in_a_shared_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o770)).unwrap();
+        let path = dir.path().join("graph.json");
+        fs::write(&path, b"{}").unwrap();
+        std::fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+
+        replace_owned_store_no_symlinks(dir.path(), &path, Some(b"{}"), b"{\"nodes\":[]}")
+            .expect("second write");
+
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+    }
+
+    /// The mode must be the mode asked for, not the mode minus whatever umask a
+    /// hook inherited from the AI agent that spawned it.
+    ///
+    /// FAILS ON REVERT: set the mode with `OpenOptions::mode` instead of
+    /// `set_permissions` and this lands at `0640` under a `0022` umask.
+    #[cfg(unix)]
+    #[test]
+    fn the_umask_of_whoever_spawned_the_hook_does_not_decide_the_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o770)).unwrap();
+        let path = dir.path().join("graph.json");
+
+        // SAFETY: umask is per-process state with no memory safety implications;
+        // it is restored below before any other test can observe it.
+        let previous = unsafe { libc::umask(0o022) };
+        let written = replace_owned_store_no_symlinks(dir.path(), &path, None, b"{}");
+        // SAFETY: as above, restoring the value this test replaced.
+        unsafe { libc::umask(previous) };
+        written.expect("write");
+
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o660
+        );
+    }
 
     #[cfg(unix)]
     #[test]

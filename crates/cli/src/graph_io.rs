@@ -21,11 +21,109 @@ const GRAPH_LOCK_TIMEOUT: Duration = Duration::from_millis(100);
 const GRAPH_LOCK_RETRY: Duration = Duration::from_millis(5);
 static CORRUPT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-/// The Community graph file (env `IW_GRAPH_FILE`, else
-/// `~/.config/innerwarden/graph.json`), resolved by the model crate so all CLI
+/// Read the product config that declares the shared record location.
+///
+/// This file is the untrusted half of the resolution: any local user can read
+/// it, root writes it, and this process cannot verify the intent behind it. So
+/// it is opened with no-follow semantics, checked for shape, bounded, and every
+/// refusal is a stable code the resolver turns into an operator-visible message.
+///
+/// A file NOT being there is the normal, quiet case: the free product installed
+/// on its own keeps writing to the operator home. A file being there and not
+/// usable is loud, because that is the state where the paid agent reads one path
+/// and the free CLI writes another.
+fn read_product_config_at(path: &std::path::Path) -> innerwarden_graph::ProductConfig {
+    use innerwarden_graph::ProductConfig;
+    use std::io::Read as _;
+
+    let file = match innerwarden_safe_io::open_no_follow(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return ProductConfig::Absent,
+        // O_NOFOLLOW reports ELOOP for a symlink, and a symlink here is somebody
+        // steering where the guardrail's record lands, not a packaging choice.
+        #[cfg(unix)]
+        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+            return ProductConfig::Refused("config_is_a_symlink")
+        }
+        Err(_) => return ProductConfig::Refused("config_unreadable"),
+    };
+    let Ok(metadata) = file.metadata() else {
+        return ProductConfig::Refused("config_unreadable");
+    };
+    // A FIFO or a directory in this position: O_NONBLOCK already stopped the
+    // FIFO from hanging the hook, and this is where it stops being read.
+    if !innerwarden_safe_io::is_regular_file(&metadata) {
+        return ProductConfig::Refused("config_not_a_regular_file");
+    }
+    if metadata.len() > innerwarden_graph::MAX_PRODUCT_CONFIG_BYTES {
+        return ProductConfig::Refused("config_too_large");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // Defence in depth. Only root can create `/etc/innerwarden` on a normal
+        // host, so this should be unreachable there; it matters because a config
+        // anyone can write is a config anyone can use to redirect the operator's
+        // own writes to a path of their choosing.
+        if metadata.permissions().mode() & 0o022 != 0 {
+            return ProductConfig::Refused("config_is_writable_by_others");
+        }
+    }
+    let mut text = String::new();
+    match file
+        .take(innerwarden_graph::MAX_PRODUCT_CONFIG_BYTES + 1)
+        .read_to_string(&mut text)
+    {
+        Ok(_) if text.len() as u64 > innerwarden_graph::MAX_PRODUCT_CONFIG_BYTES => {
+            ProductConfig::Refused("config_too_large")
+        }
+        Ok(_) => ProductConfig::Present(text),
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+            ProductConfig::Refused("config_not_utf8")
+        }
+        Err(_) => ProductConfig::Refused("config_unreadable"),
+    }
+}
+
+/// The resolution, with both inputs supplied. Separate from [`resolution`] so
+/// the whole chain (real read, real parse, real precedence) can be exercised
+/// against a temporary file without a machine that has the paid product
+/// installed and without mutating the process environment.
+fn resolve_with(
+    config_path: &std::path::Path,
+    get: impl Fn(&str) -> Option<String>,
+) -> innerwarden_graph::GraphPathResolution {
+    innerwarden_graph::graph_path(get, || read_product_config_at(config_path))
+}
+
+/// Reported at most once per process. A hook runs once per tool call, so this is
+/// one line per screened action at worst, and staying silent is the failure mode
+/// spec-052 exists to end.
+static CONFIG_PROBLEM_REPORTED: std::sync::Once = std::sync::Once::new();
+
+/// Where this process's record lives, and what it had to ignore to decide that.
+fn resolution() -> innerwarden_graph::GraphPathResolution {
+    let resolved = resolve_with(
+        std::path::Path::new(innerwarden_graph::GUARD_CONFIG_PATH),
+        |key| std::env::var(key).ok(),
+    );
+    if let Some(problem) = resolved.config_problem.as_ref() {
+        let message = problem.message.clone();
+        CONFIG_PROBLEM_REPORTED.call_once(move || eprintln!("innerwarden: {message}"));
+    }
+    resolved
+}
+
+/// The Community graph file: env `IW_GRAPH_FILE`, else the location declared in
+/// `/etc/innerwarden/guard.toml` by the paid installer, else
+/// `~/.config/innerwarden/graph.json`. Resolved by the model crate so all CLI
 /// entrypoints use the same local record.
-fn graph_path() -> Option<std::path::PathBuf> {
-    innerwarden_graph::graph_path(|k| std::env::var(k).ok())
+///
+/// `pub(crate)` because there must be exactly ONE of these. `record_health`
+/// used to resolve the path itself, which is how half a fix ships: the writes
+/// move and the thing reporting on them keeps watching the old file.
+pub(crate) fn graph_path() -> Option<std::path::PathBuf> {
+    resolution().path
 }
 
 /// The session the narrative groups under. An explicit environment override wins;
@@ -457,6 +555,12 @@ pub fn record_suppression_change(action: &str, pattern: &str, counts: (usize, us
 
 /// The directory the local record lives in: the graph, the guard event sink and
 /// the conversation-attempt pending file all sit together.
+///
+/// Derived from the resolved graph path, so when Active Defence declares a
+/// shared location the whole set moves with it. That is deliberate: the paid
+/// agent tails `guard-events.jsonl` from beside the graph, and a sink that
+/// stayed in the operator home while the graph moved would be the same split in
+/// a second file.
 pub(crate) fn sink_dir() -> Option<std::path::PathBuf> {
     graph_path()?
         .parent()
@@ -502,15 +606,52 @@ pub(crate) fn append_guard_event(line: &Value) {
 /// verdict.
 fn append_guard_event_at(dir: &std::path::Path, line: &Value) {
     use std::io::Write;
+    let path = dir.join("guard-events.jsonl");
+    create_sink_with_directory_mode(&path);
     let mut record = line.to_string();
     record.push('\n');
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(dir.join("guard-events.jsonl"))
+        .open(&path)
     {
         let _ = file.write_all(record.as_bytes());
     }
+}
+
+/// Create the sink, if it does not exist yet, with the mode its directory
+/// implies.
+///
+/// This is the file the paid agent TAILS. Left to `OpenOptions::create`, it
+/// lands at `0666` minus whatever umask the AI agent that spawned the hook had,
+/// which on the shared `0770 innerwarden:innerwarden` directory is not a mode
+/// this product chose. Creating it explicitly is also the only moment at which
+/// the mode is ours to set: an existing file is left exactly as it is, because
+/// an operator who tightened it meant to.
+///
+/// Best-effort like everything else on this path. If the create loses a race to
+/// a concurrent hook, the other process created it and the append below still
+/// works.
+fn create_sink_with_directory_mode(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if path.exists() {
+            return;
+        }
+        let mode = innerwarden_agent_guard::file_update::create_mode_for_directory(
+            path.parent().unwrap_or(path),
+        );
+        if let Ok(created) = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(path)
+        {
+            let _ = created.set_permissions(std::fs::Permissions::from_mode(mode));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 fn emit_guard_event(
@@ -783,6 +924,237 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
 }
 
 #[cfg(test)]
+mod product_config_tests {
+    use super::*;
+    use innerwarden_graph::{GraphPathSource, ProductConfig};
+
+    fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> + use<> {
+        let owned: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        move |key| {
+            owned
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
+    /// THE TEST THAT WOULD HAVE CAUGHT IT, at the level a unit test can reach:
+    /// with no environment variable at all, the shipped resolution reads a real
+    /// product config off a real filesystem and records where it says.
+    ///
+    /// `IW_GRAPH_FILE` is deliberately absent from the environment this drives.
+    /// The free CLI is launched by AI-agent hooks and by an MCP client, and
+    /// neither sources a shell profile, so a resolution that needs the variable
+    /// exported is the same defect in a new place.
+    ///
+    /// FAILS ON REVERT: drop the product-config step from
+    /// `innerwarden_graph::graph_path`, or stop passing the read into it here,
+    /// and this resolves to the home instead.
+    #[test]
+    fn with_no_environment_variable_the_shared_record_location_is_honoured() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let config = dir.path().join("guard.toml");
+        std::fs::write(
+            &config,
+            "# Written by the InnerWarden Active Defence installer.\n\
+             graph_file = \"/var/lib/innerwarden/guard/graph.json\"\n",
+        )
+        .expect("write config");
+
+        let resolved = resolve_with(&config, env(&[("HOME", "/home/op")]));
+        assert_eq!(
+            resolved.path,
+            Some(std::path::PathBuf::from(
+                "/var/lib/innerwarden/guard/graph.json"
+            ))
+        );
+        assert_eq!(resolved.source, GraphPathSource::ProductConfigFile);
+        assert_eq!(resolved.config_problem, None);
+    }
+
+    /// The free product on its own: no config file, nothing changes, the record
+    /// stays in the home where a standalone product's record belongs.
+    #[test]
+    fn with_no_product_config_the_record_stays_in_the_operator_home() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let resolved = resolve_with(
+            &dir.path().join("absent.toml"),
+            env(&[("HOME", "/home/op")]),
+        );
+        assert_eq!(
+            resolved.path,
+            Some(std::path::PathBuf::from(
+                "/home/op/.config/innerwarden/graph.json"
+            ))
+        );
+        assert_eq!(resolved.source, GraphPathSource::OperatorHome);
+        assert_eq!(resolved.config_problem, None);
+    }
+
+    /// A configured path that does not exist yet still resolves. Falling back to
+    /// the home here would be the split all over again: the agent would read the
+    /// configured file and the CLI would write somewhere else. Creating it is the
+    /// writer's job, and failing to create it is reported by the recording-health
+    /// path, not papered over here.
+    #[test]
+    fn a_configured_path_that_does_not_exist_yet_still_resolves() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let config = dir.path().join("guard.toml");
+        let target = dir.path().join("not-created-yet/graph.json");
+        std::fs::write(
+            &config,
+            format!("graph_file = \"{}\"\n", target.to_string_lossy()),
+        )
+        .expect("write config");
+
+        let resolved = resolve_with(&config, env(&[("HOME", "/home/op")]));
+        assert!(!target.exists());
+        assert_eq!(resolved.path, Some(target));
+        assert_eq!(resolved.source, GraphPathSource::ProductConfigFile);
+    }
+
+    /// A symlink in this position is somebody steering where the guardrail's
+    /// record lands. It must be refused at open, and the refusal must be
+    /// reported rather than silently becoming a home fallback.
+    ///
+    /// FAILS ON REVERT: read the config with `std::fs::read_to_string` and the
+    /// link is followed, so this resolves to the link's target.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_product_config_is_refused_and_reported() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let real = dir.path().join("elsewhere.toml");
+        std::fs::write(&real, "graph_file = \"/tmp/attacker.json\"\n").expect("write");
+        let link = dir.path().join("guard.toml");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+
+        let resolved = resolve_with(&link, env(&[("HOME", "/home/op")]));
+        assert_eq!(
+            resolved.path,
+            Some(std::path::PathBuf::from(
+                "/home/op/.config/innerwarden/graph.json"
+            ))
+        );
+        assert_eq!(
+            resolved.config_problem.map(|problem| problem.code),
+            Some("config_is_a_symlink")
+        );
+    }
+
+    /// A config anyone can write is a config anyone can use to redirect the
+    /// operator's own writes.
+    ///
+    /// FAILS ON REVERT: delete the mode check and this file is accepted, so the
+    /// record follows whatever a group-writable `/etc` file says.
+    #[cfg(unix)]
+    #[test]
+    fn a_group_or_world_writable_product_config_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let config = dir.path().join("guard.toml");
+        std::fs::write(&config, "graph_file = \"/tmp/attacker.json\"\n").expect("write");
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o666)).expect("chmod");
+
+        let resolved = resolve_with(&config, env(&[("HOME", "/home/op")]));
+        assert_eq!(
+            resolved.config_problem.map(|problem| problem.code),
+            Some("config_is_writable_by_others")
+        );
+        assert_eq!(
+            resolved.path,
+            Some(std::path::PathBuf::from(
+                "/home/op/.config/innerwarden/graph.json"
+            ))
+        );
+    }
+
+    /// A directory, a truncated file and non-UTF8 bytes each get their own
+    /// documented outcome instead of an unhandled surprise in the writer.
+    #[test]
+    fn every_broken_shape_of_the_file_has_a_named_outcome() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+
+        let as_directory = dir.path().join("a-directory");
+        std::fs::create_dir(&as_directory).expect("mkdir");
+        assert_eq!(
+            read_product_config_at(&as_directory),
+            ProductConfig::Refused("config_not_a_regular_file")
+        );
+
+        let oversized = dir.path().join("oversized.toml");
+        std::fs::write(
+            &oversized,
+            "#".repeat(innerwarden_graph::MAX_PRODUCT_CONFIG_BYTES as usize + 1),
+        )
+        .expect("write");
+        assert_eq!(
+            read_product_config_at(&oversized),
+            ProductConfig::Refused("config_too_large")
+        );
+
+        let not_utf8 = dir.path().join("not-utf8.toml");
+        std::fs::write(&not_utf8, [0x67, 0x66, 0x20, 0xff, 0xfe]).expect("write");
+        assert_eq!(
+            read_product_config_at(&not_utf8),
+            ProductConfig::Refused("config_not_utf8")
+        );
+
+        let empty = dir.path().join("empty.toml");
+        std::fs::write(&empty, "").expect("write");
+        assert_eq!(
+            read_product_config_at(&empty),
+            ProductConfig::Present(String::new())
+        );
+    }
+
+    /// WIRING PIN, half one: the constant the shipped resolution reads.
+    ///
+    /// The other half cannot be behavioural. Proving it end to end would mean a
+    /// test writing `/etc/innerwarden/guard.toml` on the developer's machine and
+    /// on the self-hosted runners, which is shared mutable state and would change
+    /// where a real install records. So the location is pinned as a value here
+    /// and the call is pinned by reading the source below, the same trade
+    /// `no_test_spawns_the_cli_without_a_disposable_record` in `tests/cli.rs`
+    /// already makes for a case CI cannot reproduce.
+    #[test]
+    fn the_product_config_location_is_the_one_the_paid_installer_writes() {
+        assert_eq!(
+            innerwarden_graph::GUARD_CONFIG_PATH,
+            "/etc/innerwarden/guard.toml"
+        );
+    }
+
+    /// WIRING PIN, half two: `resolution` passes that constant, and nothing in
+    /// this file resolves the record path any other way.
+    ///
+    /// A correct resolver nobody calls is exactly how this defect shipped the
+    /// first time: the installer was fixed to compute the right PATH and the
+    /// agent still could not read the file, and one symptom covered both.
+    ///
+    /// FAILS ON REVERT: point `resolution` at a different literal, or call
+    /// `innerwarden_graph::graph_path` from a second place here.
+    #[test]
+    fn the_shipped_resolution_reads_the_product_config_location() {
+        let source = include_str!("graph_io.rs");
+        assert!(
+            source.contains("resolve_with(\n        std::path::Path::new(innerwarden_graph::GUARD_CONFIG_PATH),"),
+            "resolution() must resolve against GUARD_CONFIG_PATH"
+        );
+        // Built at runtime so this assertion's own text is not a match.
+        let call = format!("{}::graph_path(", "innerwarden_graph");
+        assert_eq!(
+            source.matches(call.as_str()).count(),
+            1,
+            "the record path must be resolved in exactly one place; a second \
+             resolver is how the writes move and the readers do not"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use innerwarden_agent_guard::mcp::{Verdict, VerdictAlert};
@@ -847,6 +1219,61 @@ mod tests {
             lines.len(),
             WRITERS * EACH,
             "every record must survive as exactly one line"
+        );
+    }
+
+    /// THE SEAM, at the mode level. `guard-events.jsonl` is the file the paid
+    /// agent TAILS, and it lands in a directory the installer creates
+    /// `0770 innerwarden:innerwarden` with the operator in that group. Left to
+    /// `OpenOptions::create` it arrives at `0666` minus the umask the AI agent
+    /// that spawned the hook happened to have, which is not a mode this product
+    /// chose for a file two products share.
+    ///
+    /// FAILS ON REVERT: drop `create_sink_with_directory_mode` and the shared
+    /// case is whatever the ambient umask produces, not `0660`.
+    #[cfg(unix)]
+    #[test]
+    fn the_sink_the_agent_tails_follows_the_directory_it_lands_in() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for (directory_mode, expected) in [(0o770, 0o660), (0o700, 0o600)] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let shared = dir.path().join("guard");
+            std::fs::create_dir(&shared).unwrap();
+            std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(directory_mode))
+                .unwrap();
+
+            append_guard_event_at(&shared, &serde_json::json!({"kind": "guard.blocked"}));
+
+            let mode = std::fs::metadata(shared.join("guard-events.jsonl"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                mode, expected,
+                "a {directory_mode:o} directory must produce a {expected:o} sink, got {mode:o}"
+            );
+        }
+    }
+
+    /// And once the file exists its mode is the operator's, not ours. Widening
+    /// something a human deliberately tightened is the opposite of the fix.
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_sink_keeps_the_mode_the_operator_gave_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o770)).unwrap();
+        let sink = dir.path().join("guard-events.jsonl");
+        std::fs::write(&sink, "").unwrap();
+        std::fs::set_permissions(&sink, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        append_guard_event_at(dir.path(), &serde_json::json!({"kind": "guard.blocked"}));
+
+        assert_eq!(
+            std::fs::metadata(&sink).unwrap().permissions().mode() & 0o777,
+            0o600
         );
     }
 

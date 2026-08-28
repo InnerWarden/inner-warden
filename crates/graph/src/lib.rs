@@ -6,6 +6,11 @@
 //! JSON file. The model deliberately leaves room for host-level node kinds, but
 //! no Active Defence ingestion path is implied by this crate today.
 //!
+//! It also owns the RULE for where that file lives ([`graph_path`]), which is
+//! shared logic rather than persistence: the caller supplies the environment and
+//! the bytes it read, this crate decides. That split is what keeps the rule
+//! testable without a machine that has the paid product installed.
+//!
 //! Node/edge `kind` are strings on purpose so Active Defence can add node kinds
 //! (`process`, `file`, `connection`) without this crate changing.
 
@@ -46,17 +51,270 @@ pub struct Graph {
     pub edges: Vec<Edge>,
 }
 
-/// The shared graph-file path, resolved purely from an env getter: the override
-/// `IW_GRAPH_FILE`, else `$HOME/.config/innerwarden/graph.json`. Defined once here
-/// so every Community command uses the same local record. `None` when neither is
-/// set.
-pub fn graph_path(get: impl Fn(&str) -> Option<String>) -> Option<std::path::PathBuf> {
-    if let Some(p) = get("IW_GRAPH_FILE").filter(|s| !s.trim().is_empty()) {
-        return Some(std::path::PathBuf::from(p));
+/// Where the paid product declares the record location that BOTH halves use.
+///
+/// A FILE and not an environment variable, and this is the whole point of it.
+/// The free CLI is started by three different parents: the operator in a shell,
+/// a hook inside an AI agent (which inherits the agent's environment), and the
+/// MCP proxy (which inherits the MCP client's). A variable exported from
+/// `/etc/profile.d` reaches only the first, and the other two are precisely the
+/// ones that produce the decisions the paid dashboard exists to show. A file
+/// every process can open needs nobody to have sourced anything.
+///
+/// World-readable and root-written, under `/etc` because that is where a
+/// system-wide product configuration belongs and because the paid agent runs
+/// with `ProtectHome=yes`, which empties `/home` inside its mount namespace
+/// (measured on test001 on 2026-08-28 and written up in spec-052). Anything the
+/// two halves have to agree on therefore cannot live in the operator home.
+pub const GUARD_CONFIG_PATH: &str = "/etc/innerwarden/guard.toml";
+
+/// Upper bound on the product config. It is a handful of lines by design, so a
+/// large one is either corruption or somebody else's file, and an unbounded read
+/// of a path this code does not own is how a reader becomes a denial of service.
+pub const MAX_PRODUCT_CONFIG_BYTES: u64 = 64 * 1024;
+
+/// Longest record path accepted from the product config.
+const MAX_GRAPH_FILE_CHARS: usize = 4096;
+
+/// What the caller found at [`GUARD_CONFIG_PATH`].
+///
+/// This crate performs no I/O, so the read belongs to the caller; this is the
+/// shape it hands back. `Refused` carries the caller's stable reason code for a
+/// file that exists but could not be trusted or read, which is deliberately NOT
+/// the same as `Absent`: absent means the free product is installed on its own
+/// and the home is the right answer, while refused means the two halves are
+/// about to disagree about where the record lives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProductConfig {
+    /// No such file. Nothing to reconcile.
+    Absent,
+    /// The file's contents, already bounded and vetted by the caller.
+    Present(String),
+    /// The file exists and was not usable, with a stable reason code.
+    Refused(&'static str),
+}
+
+/// Which rule produced the resolved record path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphPathSource {
+    /// `IW_GRAPH_FILE`.
+    EnvironmentOverride,
+    /// [`GUARD_CONFIG_PATH`].
+    ProductConfigFile,
+    /// `$HOME/.config/innerwarden/graph.json`.
+    OperatorHome,
+    /// Nothing named a record file.
+    Unresolved,
+}
+
+/// A product config that exists and cannot be honoured.
+///
+/// It carries a `message` and not just a code because the failure mode this
+/// whole change exists to end is a SILENT divergence: the paid agent reading one
+/// path while the free CLI writes another, with the only symptom being an empty
+/// dashboard. Falling back without saying so would rebuild that exact defect one
+/// layer up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigProblem {
+    /// Stable machine code. Fixed strings only: a code is quoted into an
+    /// operator-visible message, so it must never carry file contents.
+    pub code: &'static str,
+    /// One English line naming the file, the code and the consequence. It
+    /// deliberately does not echo the configured value, because the value is the
+    /// hostile part of a file this process does not own.
+    pub message: String,
+}
+
+/// The resolved record path plus how it was reached.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphPathResolution {
+    /// The record file, or `None` when nothing named one.
+    pub path: Option<std::path::PathBuf>,
+    pub source: GraphPathSource,
+    /// Set only when a product config EXISTS and could not be honoured.
+    pub config_problem: Option<ConfigProblem>,
+}
+
+/// The single `graph_file` key the product config carries. Unknown keys are
+/// accepted and ignored on purpose: a newer installer must be able to add a key
+/// without an older CLI refusing the whole file and silently returning to the
+/// home.
+#[derive(Debug, Deserialize)]
+struct ProductConfigFile {
+    #[serde(default)]
+    graph_file: Option<String>,
+}
+
+/// Read the record path out of the product config text. Pure: the caller does
+/// the I/O. `Err` is a stable reason code.
+///
+/// Hostile input is the premise, not an edge case. Any local user can read this
+/// file, root writes it, and this code cannot verify that the root who wrote it
+/// meant what it says. So the value is validated rather than trusted, and every
+/// rejection is a documented outcome instead of a surprise later in the writer.
+pub fn parse_product_config(text: &str) -> Result<std::path::PathBuf, &'static str> {
+    if text.len() as u64 > MAX_PRODUCT_CONFIG_BYTES {
+        return Err("config_too_large");
     }
-    get("HOME")
+    let parsed: ProductConfigFile = toml::from_str(text).map_err(|_| "config_malformed")?;
+    let Some(raw) = parsed.graph_file else {
+        return Err("config_missing_graph_file");
+    };
+    validate_graph_file(&raw)
+}
+
+/// The rules a configured record path has to satisfy, and why each one exists.
+fn validate_graph_file(raw: &str) -> Result<std::path::PathBuf, &'static str> {
+    if raw.trim().is_empty() {
+        return Err("config_graph_file_empty");
+    }
+    // Surrounding whitespace is silently accepted by most path APIs and is
+    // almost always a typo in a hand-edited file. Refusing beats writing the
+    // record to a neighbouring path nobody expects.
+    if raw != raw.trim() {
+        return Err("config_graph_file_padded");
+    }
+    if raw.chars().count() > MAX_GRAPH_FILE_CHARS {
+        return Err("config_graph_file_too_long");
+    }
+    // Covers NUL, newline and every other control character. A newline here
+    // would be carried into operator-visible output and log lines; a NUL is
+    // where a path stops being the path the check inspected.
+    if raw.chars().any(char::is_control) {
+        return Err("config_graph_file_control_character");
+    }
+    // Compared against a leading slash rather than `Path::is_absolute`, which is
+    // platform dependent: `/var/lib/...` is NOT absolute on Windows, and the
+    // rule this file encodes must mean the same thing everywhere it is read.
+    if !raw.starts_with('/') {
+        return Err("config_graph_file_not_absolute");
+    }
+    if raw.ends_with('/') {
+        return Err("config_graph_file_not_a_file");
+    }
+    let mut segments = raw.split('/').filter(|segment| !segment.is_empty());
+    if segments.clone().any(|segment| segment == "..") {
+        return Err("config_graph_file_parent_traversal");
+    }
+    if segments.next().is_none() {
+        return Err("config_graph_file_not_a_file");
+    }
+    Ok(std::path::PathBuf::from(raw))
+}
+
+/// One English line saying what went wrong and, more importantly, what it costs.
+fn fallback_message(code: &str, recorded_in_home: bool) -> String {
+    if recorded_in_home {
+        format!(
+            "{GUARD_CONFIG_PATH} exists but does not name a usable record file ({code}), \
+             so decisions are being recorded under the operator home instead, where an \
+             InnerWarden agent running as its own user cannot read them. \
+             Fix that file or remove it."
+        )
+    } else {
+        format!(
+            "{GUARD_CONFIG_PATH} exists but does not name a usable record file ({code}), \
+             and no other record location is set, so decisions are not being recorded. \
+             Fix that file or remove it."
+        )
+    }
+}
+
+/// The shared graph-file path: the override `IW_GRAPH_FILE`, else the record
+/// location declared by [`GUARD_CONFIG_PATH`], else
+/// `$HOME/.config/innerwarden/graph.json`. Defined once here so every Community
+/// command uses the same local record.
+///
+/// The middle step is the fix for spec-052. The paid agent runs as its own user
+/// with `ProtectHome=yes`, so it cannot see the operator home at all, let alone
+/// read a `0750` one; the shared record therefore moves to
+/// `/var/lib/innerwarden/guard/` and the paid installer writes that location
+/// here. The free product on its own finds no config file and keeps writing to
+/// the home, which is where a standalone product's record belongs.
+///
+/// A config file that exists and cannot be honoured falls back to the home AND
+/// reports a [`ConfigProblem`], because a silent fallback would put the free
+/// CLI's writes and the paid agent's reads on two different files, which is the
+/// defect being fixed rather than a safe degradation. The caller is responsible
+/// for surfacing it.
+///
+/// A configured path that does not exist yet, or cannot be created, is NOT a
+/// fallback case: it resolves and the writer fails loudly through the existing
+/// recording-health path. Quietly writing somewhere else would split the two
+/// products again, which is the one outcome this function must never produce.
+///
+/// # Every outcome, with its reason code
+///
+/// | state of `/etc/innerwarden/guard.toml` | record path | reported |
+/// |---|---|---|
+/// | absent | `$HOME` | no, this is the free product alone |
+/// | valid | as declared | no |
+/// | symlink (`config_is_a_symlink`) | `$HOME` | yes |
+/// | FIFO, directory, device (`config_not_a_regular_file`) | `$HOME` | yes |
+/// | group or world writable (`config_is_writable_by_others`) | `$HOME` | yes |
+/// | unreadable, any other I/O error (`config_unreadable`) | `$HOME` | yes |
+/// | over 64 KiB (`config_too_large`) | `$HOME` | yes |
+/// | not UTF-8 (`config_not_utf8`) | `$HOME` | yes |
+/// | not TOML, or `graph_file` is not a string (`config_malformed`) | `$HOME` | yes |
+/// | empty, or no `graph_file` key (`config_missing_graph_file`) | `$HOME` | yes |
+/// | `graph_file = ""` (`config_graph_file_empty`) | `$HOME` | yes |
+/// | padded with whitespace (`config_graph_file_padded`) | `$HOME` | yes |
+/// | over 4096 chars (`config_graph_file_too_long`) | `$HOME` | yes |
+/// | control character in it (`config_graph_file_control_character`) | `$HOME` | yes |
+/// | relative (`config_graph_file_not_absolute`) | `$HOME` | yes |
+/// | a directory or `/` (`config_graph_file_not_a_file`) | `$HOME` | yes |
+/// | contains `..` (`config_graph_file_parent_traversal`) | `$HOME` | yes |
+/// | valid, path missing or uncreatable | as declared | by the WRITER, not here |
+///
+/// "Reported" means a [`ConfigProblem`] the caller surfaces. The last row is the
+/// deliberate exception: an unwritable configured path is a writer failure the
+/// recording-health path already reports, and answering it with a quiet home
+/// fallback would recreate the split.
+/// `read_config` is a closure and not a value so the override short-circuits
+/// before any filesystem access. This runs once per screened action on the hook
+/// hot path, and an override means the answer is already known.
+pub fn graph_path(
+    get: impl Fn(&str) -> Option<String>,
+    read_config: impl FnOnce() -> ProductConfig,
+) -> GraphPathResolution {
+    if let Some(p) = get("IW_GRAPH_FILE").filter(|s| !s.trim().is_empty()) {
+        return GraphPathResolution {
+            path: Some(std::path::PathBuf::from(p)),
+            source: GraphPathSource::EnvironmentOverride,
+            config_problem: None,
+        };
+    }
+
+    let code = match read_config() {
+        ProductConfig::Absent => None,
+        ProductConfig::Refused(code) => Some(code),
+        ProductConfig::Present(text) => match parse_product_config(&text) {
+            Ok(path) => {
+                return GraphPathResolution {
+                    path: Some(path),
+                    source: GraphPathSource::ProductConfigFile,
+                    config_problem: None,
+                }
+            }
+            Err(code) => Some(code),
+        },
+    };
+
+    let path = get("HOME")
         .filter(|h| !h.trim().is_empty())
-        .map(|h| std::path::PathBuf::from(h).join(".config/innerwarden/graph.json"))
+        .map(|h| std::path::PathBuf::from(h).join(".config/innerwarden/graph.json"));
+    GraphPathResolution {
+        source: if path.is_some() {
+            GraphPathSource::OperatorHome
+        } else {
+            GraphPathSource::Unresolved
+        },
+        config_problem: code.map(|code| ConfigProblem {
+            code,
+            message: fallback_message(code, path.is_some()),
+        }),
+        path,
+    }
 }
 
 /// Escape/trim a command so a single node label cannot carry a runaway payload.
@@ -1539,24 +1797,237 @@ mod tests {
         }
     }
 
+    fn config(graph_file: &str) -> ProductConfig {
+        ProductConfig::Present(format!("graph_file = \"{graph_file}\"\n"))
+    }
+
+    /// `graph_path` takes a READER, not a value, so an explicit override never
+    /// touches the filesystem. In a test the read has already happened.
+    fn given(config: ProductConfig) -> impl FnOnce() -> ProductConfig {
+        move || config
+    }
+
     #[test]
     fn graph_path_prefers_override_then_home() {
         assert_eq!(
-            graph_path(env(&[("IW_GRAPH_FILE", "/tmp/g.json")])),
+            graph_path(
+                env(&[("IW_GRAPH_FILE", "/tmp/g.json")]),
+                given(ProductConfig::Absent)
+            )
+            .path,
             Some(std::path::PathBuf::from("/tmp/g.json"))
         );
         assert_eq!(
-            graph_path(env(&[("HOME", "/home/x")])),
+            graph_path(env(&[("HOME", "/home/x")]), given(ProductConfig::Absent)).path,
             Some(std::path::PathBuf::from(
                 "/home/x/.config/innerwarden/graph.json"
             ))
         );
         assert_eq!(
-            graph_path(env(&[("IW_GRAPH_FILE", "/o.json"), ("HOME", "/home/x")])),
+            graph_path(
+                env(&[("IW_GRAPH_FILE", "/o.json"), ("HOME", "/home/x")]),
+                given(ProductConfig::Absent)
+            )
+            .path,
             Some(std::path::PathBuf::from("/o.json"))
         );
-        assert_eq!(graph_path(env(&[])), None);
-        assert_eq!(graph_path(env(&[("IW_GRAPH_FILE", "  ")])), None);
+        assert_eq!(
+            graph_path(env(&[]), given(ProductConfig::Absent)).path,
+            None
+        );
+        assert_eq!(
+            graph_path(
+                env(&[("IW_GRAPH_FILE", "  ")]),
+                given(ProductConfig::Absent)
+            )
+            .path,
+            None
+        );
+    }
+
+    /// THE RESOLUTION ORDER spec-052 requires, and it has to hold with NO
+    /// environment variable set: the free CLI is launched by AI-agent hooks and
+    /// by an MCP client, neither of which sources a shell profile, so a fix that
+    /// needs `IW_GRAPH_FILE` exported is not a fix.
+    ///
+    /// FAILS ON REVERT: delete the `ProductConfig::Present` arm from
+    /// [`graph_path`] and the middle case falls through to the home, which is
+    /// the file the paid agent cannot read.
+    #[test]
+    fn a_product_config_beats_the_home_and_loses_to_the_explicit_override() {
+        let shared = "/var/lib/innerwarden/guard/graph.json";
+
+        // No variable anywhere. This is the hook and the MCP proxy.
+        let resolved = graph_path(env(&[("HOME", "/home/op")]), given(config(shared)));
+        assert_eq!(resolved.path, Some(std::path::PathBuf::from(shared)));
+        assert_eq!(resolved.source, GraphPathSource::ProductConfigFile);
+        assert_eq!(resolved.config_problem, None);
+
+        // An explicit override still wins, so `contain` and the test suite can
+        // keep redirecting the record.
+        let overridden = graph_path(
+            env(&[("IW_GRAPH_FILE", "/tmp/o.json"), ("HOME", "/home/op")]),
+            given(config(shared)),
+        );
+        assert_eq!(
+            overridden.path,
+            Some(std::path::PathBuf::from("/tmp/o.json"))
+        );
+        assert_eq!(overridden.source, GraphPathSource::EnvironmentOverride);
+
+        // No paid product installed: nothing changes, the record stays home.
+        let alone = graph_path(env(&[("HOME", "/home/op")]), given(ProductConfig::Absent));
+        assert_eq!(
+            alone.path,
+            Some(std::path::PathBuf::from(
+                "/home/op/.config/innerwarden/graph.json"
+            ))
+        );
+        assert_eq!(alone.source, GraphPathSource::OperatorHome);
+        assert_eq!(alone.config_problem, None);
+    }
+
+    /// Every hostile or broken shape of the config file, and the documented
+    /// outcome for each. The contract is not only "fall back": it is "fall back
+    /// AND report", because a silent fallback puts the free CLI's writes and the
+    /// paid agent's reads on two different files, which is the defect itself.
+    ///
+    /// FAILS ON REVERT: return the home path with `config_problem: None` for a
+    /// present-but-unusable file and every case below fails on the assertion
+    /// that the split was reported.
+    #[test]
+    fn a_config_that_cannot_be_honoured_falls_back_and_says_so() {
+        let cases: &[(&str, ProductConfig)] = &[
+            (
+                "config_malformed",
+                ProductConfig::Present("graph_file =".into()),
+            ),
+            (
+                "config_malformed",
+                ProductConfig::Present("graph_file = 42\n".into()),
+            ),
+            (
+                "config_missing_graph_file",
+                ProductConfig::Present(String::new()),
+            ),
+            (
+                "config_missing_graph_file",
+                ProductConfig::Present("# only a comment\n".into()),
+            ),
+            ("config_graph_file_empty", config("")),
+            ("config_graph_file_padded", config(" /var/lib/x.json")),
+            (
+                "config_graph_file_not_absolute",
+                config("var/lib/innerwarden/guard/graph.json"),
+            ),
+            ("config_graph_file_not_a_file", config("/var/lib/guard/")),
+            ("config_graph_file_not_a_file", config("/")),
+            (
+                "config_graph_file_parent_traversal",
+                config("/var/lib/innerwarden/../../home/op/.ssh/id_ed25519"),
+            ),
+            // The reader's own refusals travel through unchanged.
+            (
+                "config_is_a_symlink",
+                ProductConfig::Refused("config_is_a_symlink"),
+            ),
+            (
+                "config_is_writable_by_others",
+                ProductConfig::Refused("config_is_writable_by_others"),
+            ),
+        ];
+
+        for (code, config) in cases {
+            let resolved = graph_path(env(&[("HOME", "/home/op")]), given(config.clone()));
+            assert_eq!(
+                resolved.path,
+                Some(std::path::PathBuf::from(
+                    "/home/op/.config/innerwarden/graph.json"
+                )),
+                "{code}: an unusable config must not stop the free product recording"
+            );
+            assert_eq!(resolved.source, GraphPathSource::OperatorHome, "{code}");
+            let problem = resolved
+                .config_problem
+                .unwrap_or_else(|| panic!("{code}: the split must be reported, never silent"));
+            assert_eq!(problem.code, *code);
+            assert!(
+                problem.message.contains(GUARD_CONFIG_PATH)
+                    && problem.message.contains(code)
+                    && problem.message.contains("cannot read them"),
+                "{code}: the message must name the file, the reason and the cost: {}",
+                problem.message
+            );
+        }
+    }
+
+    /// A control character in the configured path is rejected rather than
+    /// carried: the value comes from a file this process does not own, and a
+    /// newline in it would be pasted straight into operator-visible output.
+    #[test]
+    fn control_characters_and_over_long_paths_are_rejected() {
+        assert_eq!(
+            parse_product_config("graph_file = \"/var/lib/a\\nb.json\"\n"),
+            Err("config_graph_file_control_character")
+        );
+        let long = format!("/var/{}.json", "a".repeat(MAX_GRAPH_FILE_CHARS));
+        assert_eq!(
+            parse_product_config(&format!("graph_file = \"{long}\"\n")),
+            Err("config_graph_file_too_long")
+        );
+        let oversized = format!(
+            "graph_file = \"/var/lib/x.json\"\n#{}",
+            "p".repeat(MAX_PRODUCT_CONFIG_BYTES as usize)
+        );
+        assert_eq!(parse_product_config(&oversized), Err("config_too_large"));
+    }
+
+    /// The shape the paid installer writes, plus the forward compatibility that
+    /// keeps an older CLI working against a newer installer: an unknown key must
+    /// be ignored, not turned into a silent return to the home.
+    #[test]
+    fn the_installer_shape_parses_including_comments_and_future_keys() {
+        let text = "\
+# Written by the InnerWarden Active Defence installer.
+# Both products read this file; do not edit by hand.
+graph_file = \"/var/lib/innerwarden/guard/graph.json\"
+events_file = \"/var/lib/innerwarden/guard/guard-events.jsonl\"
+";
+        assert_eq!(
+            parse_product_config(text),
+            Ok(std::path::PathBuf::from(
+                "/var/lib/innerwarden/guard/graph.json"
+            ))
+        );
+        assert_eq!(
+            parse_product_config("graph_file = '/var/lib/innerwarden/guard/graph.json'"),
+            Ok(std::path::PathBuf::from(
+                "/var/lib/innerwarden/guard/graph.json"
+            ))
+        );
+    }
+
+    /// The reported message is printed to a hook's stderr, so it must not become
+    /// a channel for whatever the config file contains.
+    #[test]
+    fn the_reported_message_never_echoes_the_configured_value() {
+        let hostile = "/var/lib/\u{1b}[2Jsecret-looking-value";
+        let resolved = graph_path(env(&[("HOME", "/home/op")]), given(config(hostile)));
+        let problem = resolved.config_problem.expect("reported");
+        assert!(!problem.message.contains("secret-looking-value"));
+        assert!(!problem.message.contains('\u{1b}'));
+    }
+
+    /// With nowhere to fall back to, the message must not claim the record went
+    /// to the home. A wrong remedy is worse than none.
+    #[test]
+    fn with_no_home_the_message_says_nothing_is_being_recorded() {
+        let resolved = graph_path(env(&[]), given(ProductConfig::Refused("config_unreadable")));
+        assert_eq!(resolved.path, None);
+        assert_eq!(resolved.source, GraphPathSource::Unresolved);
+        let problem = resolved.config_problem.expect("reported");
+        assert!(problem.message.contains("not being recorded"));
+        assert!(!problem.message.contains("operator home"));
     }
 
     #[test]

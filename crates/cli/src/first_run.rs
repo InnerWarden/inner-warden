@@ -13,8 +13,10 @@
 
 use std::path::Path;
 
-/// Whether this install has ever written its own configuration directory
-/// (`~/.config/innerwarden`, or the parent of `IW_GRAPH_FILE` when set).
+/// Whether this install has ever written its own configuration directory: the
+/// parent of whatever [`crate::graph_io::sink_dir`] resolves the record to, so
+/// it follows `IW_GRAPH_FILE`, then the shared location `/etc/innerwarden/guard.toml`
+/// declares when Active Defence is installed, then `~/.config/innerwarden`.
 ///
 /// Every path that does something - `setup`, `install`, `agents connect`, a
 /// screened command reaching the record - lands there, so its absence is the

@@ -875,6 +875,7 @@ version = "1.4.3"
 dependencies = [
  "serde",
  "serde_json",
+ "toml",
 ]
 
 [[package]]

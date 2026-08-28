@@ -202,8 +202,14 @@ fn last_write_unix(graph: &Path) -> Option<u64> {
 }
 
 /// The outage in progress for the configured graph path, if any.
+///
+/// Resolved through [`crate::graph_io::graph_path`] and NOT by calling the model
+/// crate a second time. A second resolver is how a path fix ships doing nothing:
+/// this call site had its own copy of "env override, else `$HOME`", so it would
+/// have gone on reporting the health of a file in the operator home while every
+/// write went to the location `/etc/innerwarden/guard.toml` declares.
 pub fn current() -> Option<Outage> {
-    report_at(&innerwarden_graph::graph_path(|k| std::env::var(k).ok())?)
+    report_at(&crate::graph_io::graph_path()?)
 }
 
 /// Record one lost write, preserving the episode's start time.
