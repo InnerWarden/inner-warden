@@ -212,6 +212,85 @@ export type ProtectionLayer = {
   convergence: RuntimeConvergence;
   evidence: EvidenceRef[];
 };
+/**
+ * One number the host actually measured, with what it is a number OVER.
+ *
+ * `covers` is not decoration. A count with no stated population is how a
+ * decision total gets read as a claim about enforcement, so the population
+ * travels with the number and the screen prints both or neither.
+ */
+export type MeasuredValue = {
+  id: string;
+  label: string;
+  /** Already formatted by the host, so the screen never re-units a number. */
+  value: string;
+  covers: string;
+};
+
+/** Whether an on-device model decides on this host. */
+export type LocalModelState = "loaded" | "other_provider_decides" | "not_configured";
+
+/**
+ * What the host says about the on-device model that runs inside the agent.
+ *
+ * NOT a host control, and it must never be rendered as one: the model runs in
+ * the agent's own process, so the page footer's rule (host controls are
+ * evaluated from host evidence only) holds by keeping this in its own section.
+ */
+export type LocalModelReport = {
+  state: LocalModelState;
+  /** The name on the site. Present in every state, so a host with no model
+   *  still tells the reader what the thing they bought is called. */
+  display_name: string;
+  provider: string | null;
+  model_id: string | null;
+  roles: string[];
+  measured: MeasuredValue[];
+  /** Named gaps. Never a zero, never an estimate, never an accuracy figure. */
+  not_measured: string[];
+  summary: string;
+};
+
+/**
+ * Whether the guardrail's own record could be read, and what it held.
+ *
+ * Three values because they are three different hosts, and collapsing any two
+ * of them into one empty state is the defect this field exists to prevent:
+ *
+ *  - screening        : the record was READ. Every figure is counted from it,
+ *                       including a zero, which here means "read, and it holds
+ *                       none".
+ *  - no_decisions_yet : the record is in place and nothing has been written to
+ *                       it. A fresh install is this, and it is not a fault.
+ *  - record_unreadable: the record could not be read. The figures are ABSENT
+ *                       rather than zero, because a zero here would report a
+ *                       quiet host to somebody whose records merely could not
+ *                       be opened.
+ */
+export type AgentLayerState = "screening" | "no_decisions_yet" | "record_unreadable";
+
+/**
+ * What the guardrail did, by the guardrail's own account.
+ *
+ * `evidence_basis` is the sentence the HOST ships saying whose word these
+ * figures are. It travels in the payload so the section cannot be rendered
+ * without it, and the screen prints it verbatim rather than writing its own.
+ */
+export type AgentLayerReport = {
+  state: AgentLayerState;
+  /** The CAUSE, not the state. An unreadable record reports which way it was
+   *  unreadable, so no two causes send the operator to check one thing. */
+  reason: string;
+  display_name: string;
+  evidence_basis: string;
+  /** The file the figures were counted from, so the claim is checkable. */
+  evidence_source: string | null;
+  sessions: string[];
+  measured: MeasuredValue[];
+  not_measured: string[];
+  summary: string;
+};
+
 export type DashboardPosture = {
   schema_version: typeof DASHBOARD_SCHEMA_VERSION;
   generated_at: string;
@@ -226,6 +305,30 @@ export type DashboardPosture = {
    * failure than falling back to a local count.
    */
   summary?: string;
+  /**
+   * Controls actively containing, counted by the host off the SAME capabilities
+   * the rows render, so a reader can check the count against the list by
+   * looking. Optional for the same reason `summary` is.
+   */
+  enforcing_count?: number;
+  /** Total controls the host counted, the denominator of `enforcing_count`. */
+  control_count?: number;
+  /**
+   * The on-device model, in its own section rather than in `layers`.
+   *
+   * Optional: a producer that predates it sends nothing, and the page renders
+   * exactly as it did before.
+   */
+  local_model?: LocalModelReport;
+  /**
+   * What the guardrail reports about itself, in its own section rather than in
+   * `layers`.
+   *
+   * Deliberately NOT an input to `enforcing_count`, `control_count`, `gaps` or
+   * `summary`: all four are the host's reading of host evidence, and a figure
+   * the guardrail reports about itself is not host evidence.
+   */
+  agent_layer?: AgentLayerReport;
 };
 
 export type Metric = {

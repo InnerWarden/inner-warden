@@ -2,12 +2,14 @@ import { describe, expect, it } from "vitest";
 // The screen's own source, for the structural guard at the bottom of this file.
 import postureSource from "./Posture.tsx?raw";
 import type {
+  AgentLayerReport,
   CapabilityStatus,
   CoverageGap,
   DashboardBootstrap,
   DashboardPosture,
   EvidenceFreshness,
   EvidenceRef,
+  LocalModelReport,
   ProtectionLayer,
   RuntimeConvergence,
   ScopeRef,
@@ -15,7 +17,9 @@ import type {
   StageAnswer,
 } from "../api/v1";
 import {
+  agentLayerFigures,
   checkedAt,
+  controlCountLine,
   controlPill,
   dispositionLabel,
   dispositionOf,
@@ -24,10 +28,12 @@ import {
   emptyGapsLine,
   gapAudience,
   effectiveDisposition,
+  modelProvenance,
   needsOperator,
   plainMode,
   postureHeadline,
   scopeDisplay,
+  sectionRows,
 } from "./Posture";
 
 // A realistic enterprise posture payload: the five host controls the paid
@@ -610,5 +616,314 @@ describe("the headline names every state it counts", () => {
       controlPill(entry, bootstrap(), generatedAt, true, evaluatedAt),
     );
     expect(postureHeadline(pills)).toBe("1 of 5 host controls needs your attention");
+  });
+});
+
+// ───────── what runs inside the agent, and why it stays out of the rows ──────
+//
+// Measured on the shipped Enterprise bundle before this change: it contained no
+// occurrence of `local_model` or `agent_layer`, on paid hosts that send both.
+// The two features the site sells were invisible on the page a buyer opens to
+// ask whether what they bought is working.
+//
+// Adding them is only safe if the page's footer rule survives intact: host
+// controls are evaluated from host evidence only, and agent metadata never
+// grants host trust. The tests below pin both halves: the sections render, and
+// they touch nothing above them.
+
+const EVIDENCE_BASIS =
+  "Counted from the guardrail's own decision record on this host. It is what the guardrail "
+  + "reports it did, not something the host proved, so nothing in this section changes a host "
+  + "control above.";
+
+const COVERS = "everything in the guardrail's decision record on this host; the record is "
+  + "capped and drops its oldest entries";
+
+const AGENT_LAYER_NAME = "Command and prompt screening, and MCP tool calls";
+
+/** The seven figures the producer emits, at whatever counts are passed. */
+function screeningFigures(counts: number[]): AgentLayerReport["measured"] {
+  const labels = [
+    ["commands_screened", "Commands screened"],
+    ["commands_refused", "Commands the guardrail refused"],
+    ["commands_would_refuse", "Commands it would have refused while only watching"],
+    ["mcp_calls_screened", "MCP tool calls screened"],
+    ["mcp_calls_refused", "MCP tool calls the guardrail refused"],
+    ["mcp_calls_would_refuse", "MCP tool calls it would have refused while only watching"],
+    ["agent_sessions", "AI agent sessions in the record"],
+  ];
+  return labels.map(([id, label], index) => ({ id, label, value: String(counts[index]), covers: COVERS }));
+}
+
+const STANDING_GAPS = [
+  "prompts screened inside an agent conversation: the guardrail writes those to its event log, "
+  + "and this section counts only its decision record",
+  "whether a refusal counted here also stopped the process on this host: that is a host control, "
+  + "and the controls above answer it from host evidence",
+  "how many AI agents are connected: the record holds sessions, and one agent can open many of "
+  + "them or none",
+];
+
+/** A busy host: the record was read and holds 601 screened commands. */
+const SCREENING: AgentLayerReport = {
+  state: "screening",
+  reason: "agent_layer_screening",
+  display_name: AGENT_LAYER_NAME,
+  evidence_basis: EVIDENCE_BASIS,
+  evidence_source: "/var/lib/innerwarden/graph.json",
+  sessions: ["openclaw", "release-check"],
+  measured: screeningFigures([601, 4, 9, 1, 0, 0, 2]),
+  not_measured: STANDING_GAPS,
+  summary: "The guardrail screened 601 commands and 1 MCP tool call on this host, across 2 agent "
+    + "sessions. It refused 4, and recorded 9 more it would have refused had it been enforcing.",
+};
+
+/** A quiet host: the record WAS read, and it holds none. The zeroes are a
+ *  measurement, and they are what makes this host different from the two
+ *  below. */
+const SCREENING_ZERO: AgentLayerReport = {
+  ...SCREENING,
+  sessions: [],
+  measured: screeningFigures([0, 0, 0, 0, 0, 0, 0]),
+  summary: "The guardrail's decision record on this host was read and holds no screened command "
+    + "and no MCP tool call.",
+};
+
+/** A fresh install: the record is in place and nothing has been written to it. */
+const NO_DECISIONS_YET: AgentLayerReport = {
+  ...SCREENING,
+  state: "no_decisions_yet",
+  reason: "agent_layer_no_decisions_yet",
+  sessions: [],
+  measured: [],
+  not_measured: [
+    "anything the guardrail screened: its decision record is in place and nothing has been "
+    + "written to it yet",
+    ...STANDING_GAPS,
+  ],
+  summary: "The guardrail is recording and has not screened anything yet.",
+};
+
+/** A broken seam: the record could not be opened, so there are no figures. */
+const RECORD_UNREADABLE: AgentLayerReport = {
+  ...SCREENING,
+  state: "record_unreadable",
+  reason: "guard_record_permission_denied",
+  sessions: [],
+  measured: [],
+  not_measured: [
+    "anything the guardrail screened: its decision record could not be read, so this is not a "
+    + "quiet host",
+    ...STANDING_GAPS,
+  ],
+  summary: "The guardrail's decision record exists and this agent may not open it.",
+};
+
+const LOADED_MODEL: LocalModelReport = {
+  state: "loaded",
+  display_name: "Local Warden Model",
+  provider: "local_classifier",
+  model_id: "warden-student-v3",
+  roles: ["decides what to do about an incident", "labels an incident"],
+  measured: [
+    {
+      id: "ai_decision_count",
+      label: "Decisions returned",
+      value: "602",
+      covers: "today, on this host: every decision the agent made went to this model",
+    },
+    {
+      id: "avg_decision_latency_ms",
+      label: "Average decision latency",
+      value: "12 ms",
+      covers: "today, on this host: every decision the agent made went to this model",
+    },
+  ],
+  not_measured: [
+    "how often the model agreed with the deterministic rules",
+    "the model's accuracy on this host: scoring it needs outcomes labelled as right or wrong, "
+    + "which this host does not have",
+  ],
+  summary: "The Local Warden Model is loaded and decides on this host. It scores, it does not "
+    + "write, so a written explanation needs a language model connected as well.",
+};
+
+describe("the host's own control count is printed, not recomputed", () => {
+  it("prints the count the host sent, under the host's own sentence", () => {
+    expect(controlCountLine({ enforcing_count: 1, control_count: 5 }))
+      .toBe("The host counts 1 of 5 controls actively containing.");
+    expect(controlCountLine({ enforcing_count: 1, control_count: 1 }))
+      .toBe("The host counts 1 of 1 control actively containing.");
+  });
+
+  it("prints nothing at all for a host that sends neither number", () => {
+    // The alternative is this screen inventing a count of "actively containing"
+    // out of pills that answer a different question, which is the drift the
+    // host-side count exists to end.
+    expect(controlCountLine({})).toBeNull();
+    expect(controlCountLine({ enforcing_count: 1 })).toBeNull();
+    expect(controlCountLine({ control_count: 5 })).toBeNull();
+  });
+
+  it("never becomes the headline", () => {
+    // The headline is the host's summary sentence. The count is a caption under
+    // it, and a caption that could replace the sentence would be a second
+    // verdict on one page.
+    const pills = posture().layers.map((entry) => controlPill(entry, bootstrap(), generatedAt, true, evaluatedAt));
+    expect(postureHeadline(pills, "2 of 5 host controls are off and protect nothing"))
+      .toBe("2 of 5 host controls are off and protect nothing");
+    expect(postureHeadline(pills, "2 of 5 host controls are off and protect nothing"))
+      .not.toContain("actively containing");
+  });
+});
+
+describe("the guardrail section keeps three answers apart", () => {
+  /**
+   * "Read, and it holds none" is not "could not be read", and neither is "in
+   * place and never written to". The producer distinguishes all three; a screen
+   * that collapsed them would report a quiet host to somebody whose files could
+   * not be opened, and call a fresh install broken.
+   */
+  it("gives a different answer for each of the three hosts", () => {
+    expect(agentLayerFigures(SCREENING)).toEqual({ kind: "counted" });
+    expect(agentLayerFigures(SCREENING_ZERO)).toEqual({ kind: "counted" });
+    expect(agentLayerFigures(NO_DECISIONS_YET))
+      .toEqual({ kind: "nothing_recorded", label: "Nothing recorded yet" });
+    expect(agentLayerFigures(RECORD_UNREADABLE))
+      .toEqual({ kind: "unreadable", label: "Record could not be read" });
+
+    const kinds = [NO_DECISIONS_YET, RECORD_UNREADABLE, SCREENING_ZERO].map((report) => agentLayerFigures(report).kind);
+    expect(new Set(kinds).size).toBe(3);
+  });
+
+  it("keeps the zeroes of a record that WAS read", () => {
+    // A zero here is a measurement: this host screened nothing. Hiding it would
+    // make a quiet host look like a broken one.
+    const rows = sectionRows(SCREENING_ZERO);
+    const measured = rows.filter((row) => row.kind === "measured");
+    expect(measured).toHaveLength(7);
+    expect(measured.every((row) => row.kind === "measured" && row.value === "0")).toBe(true);
+    expect(measured.map((row) => row.kind === "measured" && row.id)).toContain("mcp_calls_screened");
+  });
+
+  it("shows no figure at all when the record could not be read", () => {
+    // A zero on THIS host would report a quiet host to somebody whose records
+    // merely could not be opened.
+    const rows = sectionRows(RECORD_UNREADABLE);
+    expect(rows.filter((row) => row.kind === "measured")).toEqual([]);
+    expect(rows.some((row) => row.kind === "measured" && row.value === "0")).toBe(false);
+    // And the reason is the CAUSE, so the operator checks the right thing.
+    expect(RECORD_UNREADABLE.reason).not.toBe(NO_DECISIONS_YET.reason);
+  });
+
+  it("shows no figure for a fresh install either, and says why", () => {
+    const rows = sectionRows(NO_DECISIONS_YET);
+    expect(rows.filter((row) => row.kind === "measured")).toEqual([]);
+    expect(rows.map((row) => row.kind === "not_measured" && row.reason)).toContain(
+      "anything the guardrail screened: its decision record is in place and nothing has been "
+      + "written to it yet",
+    );
+  });
+
+  it("carries the basis and the source the host sent, unrewritten", () => {
+    expect(SCREENING.evidence_basis).toBe(EVIDENCE_BASIS);
+    // The section renders `report.evidence_basis` verbatim; this pins that the
+    // string the screen has to print is the host's, not one written here.
+    expect(postureSource).toContain("{report.evidence_basis}");
+    expect(postureSource).toContain("{report.evidence_source}");
+  });
+});
+
+describe("a gap the host named is never rendered as a number", () => {
+  it("keeps not-measured items out of the measured rows entirely", () => {
+    // "how often the model agreed with the deterministic rules" as a 0 would be
+    // a measurement nobody took, printed on the page whose whole job is telling
+    // proven from assumed apart.
+    const noCounters: LocalModelReport = { ...LOADED_MODEL, measured: [] };
+    const rows = sectionRows(noCounters);
+
+    expect(rows.every((row) => row.kind === "not_measured")).toBe(true);
+    expect(rows.some((row) => row.kind === "measured" && row.value === "0")).toBe(false);
+    expect(rows.map((row) => row.kind === "not_measured" && row.reason)).toEqual(noCounters.not_measured);
+  });
+
+  it("keeps the host's own words for each gap", () => {
+    const rows = sectionRows(LOADED_MODEL);
+    const gaps = rows.filter((row) => row.kind === "not_measured");
+    expect(gaps.map((row) => row.kind === "not_measured" && row.reason)).toEqual([
+      "how often the model agreed with the deterministic rules",
+      "the model's accuracy on this host: scoring it needs outcomes labelled as right or wrong, "
+      + "which this host does not have",
+    ]);
+  });
+
+  it("keeps the population beside every number it does print", () => {
+    // A count with no stated population is how a decision total gets read as a
+    // claim about enforcement.
+    const measured = sectionRows(LOADED_MODEL).filter((row) => row.kind === "measured");
+    expect(measured).toHaveLength(2);
+    expect(measured.every((row) => row.kind === "measured" && row.covers.length > 0)).toBe(true);
+  });
+
+  it("names the model even when the host could not name a build", () => {
+    expect(modelProvenance(LOADED_MODEL)).toBe("provider local_classifier · build warden-student-v3");
+    expect(modelProvenance({ provider: "local_classifier", model_id: null })).toBe("provider local_classifier");
+    expect(modelProvenance({ provider: null, model_id: null })).toBeNull();
+  });
+});
+
+describe("the agent sections never reach a host control", () => {
+  /**
+   * The footer rule is correct and it stays: host controls are evaluated from
+   * host evidence only, and agent metadata never grants host trust. The two
+   * sections are the whole risk of this change, so the coupling is checked
+   * structurally, the way the assurance veto is: no unit test of a pure
+   * function can see a component reading the wrong field.
+   *
+   * If this fails, do not widen the allowed list. The sections render from
+   * their own report and nothing else.
+   */
+  it("reads the two sections in exactly two places, both of them renders", () => {
+    const uses = postureSource
+      .split("\n")
+      .map((line: string) => line.trim())
+      .filter((line: string) => /posture\.(agent_layer|local_model)/.test(line));
+
+    expect(uses).toEqual([
+      "{posture.local_model ? <LocalModelSection report={posture.local_model} /> : null}",
+      "{posture.agent_layer ? <AgentLayerSection report={posture.agent_layer} /> : null}",
+    ]);
+  });
+
+  it("leaves the host's verdict line reading only host material", () => {
+    // The headline takes the pills and the host's own summary. Nothing else may
+    // be passed to it: an agent-reported refusal count in this call is exactly
+    // the trust leak the footer rule forbids.
+    expect(postureSource).toContain("{postureHeadline(pills, posture.summary)}");
+    const headlineCalls = postureSource
+      .split("\n")
+      .map((line: string) => line.trim())
+      .filter((line: string) => /postureHeadline\(/.test(line))
+      .filter((line: string) => !/^export function postureHeadline/.test(line));
+    expect(headlineCalls).toEqual(["{postureHeadline(pills, posture.summary)}"]);
+  });
+
+  it("computes identical pills and headline whether or not the sections are present", () => {
+    const withSections: DashboardPosture = {
+      ...posture(),
+      summary: undefined,
+      local_model: LOADED_MODEL,
+      agent_layer: SCREENING,
+    };
+    const bare = posture();
+
+    const pillsWith = withSections.layers.map((entry) => controlPill(entry, bootstrap(), generatedAt, true, evaluatedAt));
+    const pillsBare = bare.layers.map((entry) => controlPill(entry, bootstrap(), generatedAt, true, evaluatedAt));
+
+    expect(pillsWith).toEqual(pillsBare);
+    expect(postureHeadline(pillsWith, withSections.summary))
+      .toBe(postureHeadline(pillsBare, bare.summary));
+    // 601 screened commands and 4 refusals, and not one of them in the verdict.
+    expect(postureHeadline(pillsWith, withSections.summary)).not.toMatch(/601|refus/);
   });
 });

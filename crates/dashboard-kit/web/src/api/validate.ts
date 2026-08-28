@@ -2,6 +2,7 @@ import {
   DASHBOARD_SCHEMA_VERSION,
   type AgentCapabilityState,
   type AgentInventory,
+  type AgentLayerReport,
   type AgentSessionRef,
   type AgentSubject,
   type CapabilityStatus,
@@ -12,6 +13,8 @@ import {
   type EgressPath,
   type EvidenceFreshness,
   type EvidenceRef,
+  type LocalModelReport,
+  type MeasuredValue,
   type Metric,
   type ProtectionLayer,
   type ScopeRef,
@@ -319,9 +322,76 @@ export function parseDashboardBootstrap(value: unknown): DashboardBootstrap {
   };
 }
 
+function measuredValue(value: unknown, path: string): MeasuredValue {
+  const item = record(value, path);
+  return {
+    id: text(item.id, `${path}.id`),
+    label: text(item.label, `${path}.label`),
+    // Already formatted by the host, so it stays a string: a screen that parsed
+    // it back into a number would have to re-unit it, and "602" and "45 ms" do
+    // not share a unit.
+    value: text(item.value, `${path}.value`),
+    // Never optional. A number with no stated population is the whole defect
+    // these sections exist to avoid.
+    covers: text(item.covers, `${path}.covers`),
+  };
+}
+
+/**
+ * The on-device model section, as the host built it.
+ *
+ * Strict on every field it names, and it names them all. This block is only
+ * present on a producer that ships it, and a producer that ships it half-formed
+ * is a bug that must fail here rather than render as a model that is missing.
+ */
+function localModel(value: unknown, path: string): LocalModelReport {
+  const item = record(value, path);
+  return {
+    state: oneOf(item.state, ["loaded", "other_provider_decides", "not_configured"] as const, `${path}.state`),
+    display_name: text(item.display_name, `${path}.display_name`),
+    provider: nullableText(item.provider, `${path}.provider`),
+    model_id: nullableText(item.model_id, `${path}.model_id`),
+    roles: stringArray(item.roles, `${path}.roles`),
+    measured: array(item.measured, `${path}.measured`, measuredValue),
+    not_measured: stringArray(item.not_measured, `${path}.not_measured`),
+    summary: text(item.summary, `${path}.summary`),
+  };
+}
+
+/**
+ * The guardrail's own account of itself, as the host built it.
+ *
+ * `evidence_basis` is required and is not defaulted here. It is the sentence
+ * that stops these figures being read as host-proved, and a screen that could
+ * render the numbers without it is the one thing this section must not be.
+ */
+function agentLayer(value: unknown, path: string): AgentLayerReport {
+  const item = record(value, path);
+  return {
+    state: oneOf(item.state, ["screening", "no_decisions_yet", "record_unreadable"] as const, `${path}.state`),
+    reason: text(item.reason, `${path}.reason`),
+    display_name: text(item.display_name, `${path}.display_name`),
+    evidence_basis: text(item.evidence_basis, `${path}.evidence_basis`),
+    evidence_source: nullableText(item.evidence_source, `${path}.evidence_source`),
+    sessions: stringArray(item.sessions, `${path}.sessions`),
+    measured: array(item.measured, `${path}.measured`, measuredValue),
+    not_measured: stringArray(item.not_measured, `${path}.not_measured`),
+    summary: text(item.summary, `${path}.summary`),
+  };
+}
+
 export function parseDashboardPosture(value: unknown): DashboardPosture {
   const item = record(value, "posture");
   if (item.schema_version !== DASHBOARD_SCHEMA_VERSION) throw new Error("posture.schema_version: unsupported contract version");
+  // Everything below the required four is ADDITIVE and OPTIONAL, and each entry
+  // follows the same rule: absent is a producer that predates the field and the
+  // page renders as it did before; present-but-malformed is a producer bug and
+  // fails loudly here, the way the case connections block already does.
+  //
+  // This function REBUILDS the response field by field, so a field it does not
+  // name is silently discarded. That is not a hypothetical: it ate `disposition`
+  // on a pilot box, and it was measured eating all four fields below, on a paid
+  // host that sends every one of them, before they were named here.
   return {
     schema_version: DASHBOARD_SCHEMA_VERSION,
     generated_at: text(item.generated_at, "posture.generated_at"),
@@ -331,6 +401,10 @@ export function parseDashboardPosture(value: unknown): DashboardPosture {
     // string summary is a producer bug and is rejected, because silently
     // falling back would hide it.
     ...(item.summary === undefined ? {} : { summary: text(item.summary, "posture.summary") }),
+    ...(item.enforcing_count === undefined ? {} : { enforcing_count: integer(item.enforcing_count, "posture.enforcing_count") }),
+    ...(item.control_count === undefined ? {} : { control_count: integer(item.control_count, "posture.control_count") }),
+    ...(item.local_model === undefined ? {} : { local_model: localModel(item.local_model, "posture.local_model") }),
+    ...(item.agent_layer === undefined ? {} : { agent_layer: agentLayer(item.agent_layer, "posture.agent_layer") }),
   };
 }
 
