@@ -206,3 +206,27 @@ describe("the connections block", () => {
       .toThrow();
   });
 });
+
+describe("the evidence badge", () => {
+  /**
+   * The badge said "Partial evidence" on every row of the production capture,
+   * and it could not have said anything else: its predicate ORed over three
+   * clauses the paid adapter makes permanently true. The host now decides it.
+   */
+  it("carries the host's verdict, both ways", () => {
+    for (const value of [true, false]) {
+      const payload = JSON.parse(JSON.stringify({ ...caseAgentHost, has_gap: value }));
+      expect(parseUnifiedCase(payload).has_gap).toBe(value);
+    }
+  });
+
+  it("treats an absent verdict as not-decided, not as a broken payload", () => {
+    const payload = JSON.parse(JSON.stringify(caseAgentHost));
+    expect(parseUnifiedCase(payload).has_gap).toBeUndefined();
+  });
+
+  it("refuses a verdict that is not a boolean", () => {
+    const payload = JSON.parse(JSON.stringify({ ...caseAgentHost, has_gap: "yes" }));
+    expect(() => parseUnifiedCase(payload)).toThrow();
+  });
+});
