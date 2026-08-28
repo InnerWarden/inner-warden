@@ -201,6 +201,25 @@ export type UnifiedCase = CaseSummary & {
   feedback: FeedbackRecord[];
   verified_outcomes: VerifiedOutcome[];
   connections: CaseConnections;
+  /**
+   * Is anything actually MISSING from this case?
+   *
+   * The screen printed "Partial evidence" on every row, forever. Its own
+   * predicate ORed over three clauses the paid adapter makes permanently true:
+   * `completeness !== "complete"` (never emitted), `integrity === "unverified"`
+   * (every SQLite record) and `freshness !== "fresh"` (every record over the
+   * budget). Three always-true clauses in one OR: it could not have said
+   * anything else.
+   *
+   * Completeness and integrity are properties of the SOURCE and belong in the
+   * source note, stated once. What varies per case, and what a reader can act
+   * on, is whether THIS case has a hole in it. The host decides that and sends
+   * it; the screen renders it.
+   *
+   * Optional because a producer written before this field sends none, and the
+   * screen then falls back to its own predicate rather than dropping the case.
+   */
+  has_gap?: boolean;
   enrichment?: CaseEnrichment | null;
 };
 
@@ -420,7 +439,7 @@ export function parseCaseListPage(value: unknown, requestedLimit = 20): CaseList
 
 export function parseUnifiedCase(value: unknown): UnifiedCase {
   const item = object(value, "case");
-  exact(item, ["id", "title", "severity", "status", "scope", "latest_event_at", "outcome", "schema_version", "identity", "recurrence", "timeline", "evidence", "feedback", "verified_outcomes", "enrichment", "connections"], "case");
+  exact(item, ["id", "title", "severity", "status", "scope", "latest_event_at", "outcome", "schema_version", "identity", "recurrence", "timeline", "evidence", "feedback", "verified_outcomes", "enrichment", "connections", "has_gap"], "case");
   if (item.schema_version !== DASHBOARD_SCHEMA_VERSION) throw new Error("case.schema_version: unsupported contract version");
   const identity = object(item.identity, "case.identity");
   exact(identity, ["subject_ids", "confidence", "evidence"], "case.identity");
@@ -459,6 +478,9 @@ export function parseUnifiedCase(value: unknown): UnifiedCase {
     verified_outcomes: array(item.verified_outcomes, "case.verified_outcomes", verifiedOutcome, 1_000),
     enrichment: parseEnrichment(item.enrichment),
     connections: parseConnections(item.connections),
+    // Absent means "this host does not decide it yet". A present non-boolean is
+    // a producer bug and fails loudly rather than being coerced.
+    ...(item.has_gap === undefined ? {} : { has_gap: boolean(item.has_gap, "case.has_gap") }),
   };
 }
 
