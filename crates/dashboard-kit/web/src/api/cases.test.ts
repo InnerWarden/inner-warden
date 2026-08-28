@@ -139,3 +139,70 @@ describe("server-side case window (paid API opt-in)", () => {
     expect(() => parseCaseListPage({ ...legacy, window_complete: "yes" })).toThrow("not a boolean");
   });
 });
+
+describe("the connections block", () => {
+  const withConnections = (connections: unknown) =>
+    JSON.parse(JSON.stringify({ ...caseAgentHost, connections }));
+
+  const link = {
+    from: "bash",
+    from_kind: "process",
+    relation: "connected out to",
+    to: "203.0.113.9",
+    to_kind: "address",
+    observed_at: "2026-07-18T11:00:00Z",
+    involves_this_case: true,
+  };
+
+  it("carries the links the host phrased", () => {
+    const parsed = parseUnifiedCase(withConnections({ links: [link], total_recorded: 1, absence_reason: null }));
+    expect(parsed.connections.links).toHaveLength(1);
+    expect(parsed.connections.links[0].relation).toBe("connected out to");
+    expect(parsed.connections.total_recorded).toBe(1);
+  });
+
+  /**
+   * THE ONE STATE THAT MUST NEVER RENDER.
+   *
+   * No links and no reason is a blank area, and a blank area can only be read
+   * as "nothing was connected". The connection store evicts under a size cap,
+   * so that is a claim it cannot support. A producer that sends it has a bug,
+   * and it fails here rather than on a customer's screen.
+   */
+  it("refuses an empty block that gives no reason", () => {
+    expect(() => parseUnifiedCase(withConnections({ links: [], total_recorded: 0, absence_reason: null })))
+      .toThrow(/nothing happened/);
+  });
+
+  it("accepts an empty block that says why", () => {
+    const parsed = parseUnifiedCase(withConnections({
+      links: [],
+      total_recorded: 0,
+      absence_reason: "No connections were recorded around this one.",
+    }));
+    expect(parsed.connections.links).toEqual([]);
+    expect(parsed.connections.absence_reason).toContain("No connections");
+  });
+
+  /**
+   * An older host has no such field. That is not a malformed payload, and
+   * failing the whole case over it would take the page down on the very
+   * version that most needs to be readable.
+   */
+  it("treats an absent block as an unreported one, not a broken one", () => {
+    const payload = JSON.parse(JSON.stringify(caseAgentHost));
+    delete payload.connections;
+    const parsed = parseUnifiedCase(payload);
+    expect(parsed.connections.links).toEqual([]);
+    expect(parsed.connections.absence_reason).toBeTruthy();
+  });
+
+  it("rejects a malformed block instead of degrading it", () => {
+    expect(() => parseUnifiedCase(withConnections({ links: [link], total_recorded: -1, absence_reason: null })))
+      .toThrow(/total_recorded/);
+    expect(() => parseUnifiedCase(withConnections({ links: [{ ...link, relation: "" }], total_recorded: 1, absence_reason: null })))
+      .toThrow();
+    expect(() => parseUnifiedCase(withConnections({ links: [link], total_recorded: 1, absence_reason: null, extra: 1 })))
+      .toThrow();
+  });
+});
