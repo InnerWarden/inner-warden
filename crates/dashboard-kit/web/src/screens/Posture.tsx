@@ -1,10 +1,14 @@
+import type { ReactNode } from "react";
 import type {
+  AgentLayerReport,
   CapabilityStatus,
   CoverageGap,
   DashboardBootstrap,
   DashboardPosture,
   EvidenceFreshness,
   LayerDisposition,
+  LocalModelReport,
+  MeasuredValue,
   ProtectionLayer,
   RuntimeConvergence,
   ScopeRef,
@@ -346,6 +350,98 @@ export function postureHeadline(pills: ControlPill[], hostSummary?: string): str
   return `${total} host control${s}: ${parts.join(", ")}.${tail}`;
 }
 
+/**
+ * The host's own count of the controls it just described.
+ *
+ * Printed beside the rows so a reader can check one against the other by
+ * looking, which is the reason the host ships the numbers at all. It is a
+ * caption, never the headline: the headline is the host's `summary` and this
+ * line does not get to compete with it.
+ *
+ * Null on a producer that sends neither number, because the alternative is this
+ * screen inventing a count of "actively containing" from pills that answer a
+ * different question.
+ */
+export function controlCountLine(
+  posture: Pick<DashboardPosture, "enforcing_count" | "control_count">,
+): string | null {
+  const enforcing = posture.enforcing_count;
+  const total = posture.control_count;
+  if (enforcing === undefined || total === undefined) return null;
+  return `The host counts ${enforcing} of ${total} control${total === 1 ? "" : "s"} actively containing.`;
+}
+
+// ───────────────────── what runs inside the agent, kept apart ────────────────
+//
+// Two sections below the host controls, and they are separate on purpose. The
+// page footer's rule is correct and stays: host controls are evaluated from host
+// evidence only, and agent metadata never grants host trust. The on-device model
+// runs in the agent's process and the guardrail's figures are the guardrail's own
+// account of itself, so neither is host evidence and neither may touch a host
+// control's state, colour, or the summary line above.
+//
+// They are here because the page a buyer opens to ask "is it all working" did
+// not contain the feature they bought: the shipped bundle held no occurrence of
+// `local_model` or `agent_layer` at all, on hosts that send both.
+
+/**
+ * One line of a section: a number the host measured, or a gap the host named.
+ *
+ * A gap is NEVER a number. Rendering "how often the model agreed with the
+ * deterministic rules" as `0` would print a measurement nobody took, on the one
+ * page whose job is telling proven from assumed apart.
+ */
+export type SectionRow =
+  | { kind: "measured"; id: string; label: string; value: string; covers: string }
+  | { kind: "not_measured"; reason: string };
+
+export function sectionRows(report: { measured: MeasuredValue[]; not_measured: string[] }): SectionRow[] {
+  return [
+    ...report.measured.map((entry) => ({ kind: "measured" as const, ...entry })),
+    ...report.not_measured.map((reason) => ({ kind: "not_measured" as const, reason })),
+  ];
+}
+
+const isMeasured = (row: SectionRow): row is Extract<SectionRow, { kind: "measured" }> => row.kind === "measured";
+const isNotMeasured = (row: SectionRow): row is Extract<SectionRow, { kind: "not_measured" }> => row.kind === "not_measured";
+
+/**
+ * Which of the three answers the guardrail section is giving.
+ *
+ * They must never collapse into one empty state. A host whose record was READ
+ * and holds nothing gets its zeroes printed, because a zero it measured is a
+ * fact. A host whose record could not be OPENED gets no figures at all, because
+ * a zero there would report a quiet host to somebody whose files merely could
+ * not be read. A fresh install gets neither treatment: nothing has been written
+ * yet, and that is not a fault.
+ *
+ * The label is structure, not a claim. Every sentence in this section, including
+ * the basis line, is the host's own wording rendered verbatim.
+ */
+export type AgentLayerFigures =
+  | { kind: "counted" }
+  | { kind: "nothing_recorded"; label: string }
+  | { kind: "unreadable"; label: string };
+
+export function agentLayerFigures(report: Pick<AgentLayerReport, "state">): AgentLayerFigures {
+  switch (report.state) {
+    case "screening":
+      return { kind: "counted" };
+    case "no_decisions_yet":
+      return { kind: "nothing_recorded", label: "Nothing recorded yet" };
+    case "record_unreadable":
+      return { kind: "unreadable", label: "Record could not be read" };
+  }
+}
+
+/** Which build of the model answered, when the host could tell two apart. */
+export function modelProvenance(report: Pick<LocalModelReport, "provider" | "model_id">): string | null {
+  const parts: string[] = [];
+  if (report.provider) parts.push(`provider ${report.provider}`);
+  if (report.model_id) parts.push(`build ${report.model_id}`);
+  return parts.length > 0 ? parts.join(" · ") : null;
+}
+
 /** The quiet line shown when no gap card needs to render. */
 export function emptyGapsLine(totalGaps: number): string {
   return totalGaps === 0
@@ -417,6 +513,10 @@ export function Posture({
             <h3 id="posture-verdict-title" className="text-2xl font-semibold tracking-tight text-slate-950">
               {postureHeadline(pills, posture.summary)}
             </h3>
+            {/* The host's own count, under its own sentence, never replacing it. */}
+            {controlCountLine(posture) ? (
+              <p className="mt-1.5 text-sm leading-6 text-slate-600">{controlCountLine(posture)}</p>
+            ) : null}
             <ul className="mt-4 flex flex-wrap gap-2" aria-label="Host controls">
               {pills.map((pill) => (
                 <li
@@ -475,7 +575,127 @@ export function Posture({
           <p className="text-sm leading-6 text-slate-600">{emptyGapsLine(posture.gaps.length)}</p>
         )}
       </section>
+
+      {/* Below the host controls, and outside them. A producer that sends
+          neither renders everything above and nothing here, unchanged. */}
+      {posture.local_model ? <LocalModelSection report={posture.local_model} /> : null}
+      {posture.agent_layer ? <AgentLayerSection report={posture.agent_layer} /> : null}
     </div>
+  );
+}
+
+/** The chrome both agent-side sections share, so the separation from the host
+ *  controls is one decision rather than two that can drift. */
+function AgentSideSection({
+  titleId,
+  title,
+  children,
+}: {
+  titleId: string;
+  title: string;
+  children: ReactNode;
+}) {
+  return (
+    <section
+      aria-labelledby={titleId}
+      className="rounded-2xl border border-dashed border-slate-300 bg-slate-50/70 p-4 sm:p-5"
+    >
+      <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">
+        In the agent, not a host control
+      </p>
+      <h2 id={titleId} className="mt-1 text-xl font-semibold tracking-tight text-slate-950">{title}</h2>
+      {children}
+    </section>
+  );
+}
+
+/** The numbers the host measured, and the gaps it named, kept apart on screen
+ *  the way `sectionRows` keeps them apart in the data. */
+function SectionFigures({ rows }: { rows: SectionRow[] }) {
+  const measured = rows.filter(isMeasured);
+  const notMeasured = rows.filter(isNotMeasured);
+  return (
+    <>
+      {measured.length > 0 ? (
+        <dl className="mt-4 grid gap-2 sm:grid-cols-2">
+          {measured.map((row) => (
+            <div key={row.id} className="rounded-xl border border-slate-200 bg-white px-3 py-2.5">
+              <dt className="text-xs font-medium text-slate-500">{row.label}</dt>
+              <dd className="mt-0.5 text-lg font-semibold tabular-nums text-slate-950">{row.value}</dd>
+              {/* The population, in the host's words. A count without one is how
+                  a decision total gets read as a claim about enforcement. */}
+              <dd className="mt-1 text-[11px] leading-4 text-slate-500">{row.covers}</dd>
+            </div>
+          ))}
+        </dl>
+      ) : null}
+      {notMeasured.length > 0 ? (
+        <div className="mt-4">
+          <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-500">Not measured</h3>
+          {/* The host's reason, verbatim, and never a zero standing in for it. */}
+          <ul className="mt-2 space-y-1">
+            {notMeasured.map((row) => (
+              <li key={row.reason} className="text-xs leading-5 text-slate-600">{row.reason}</li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+    </>
+  );
+}
+
+function LocalModelSection({ report }: { report: LocalModelReport }) {
+  const provenance = modelProvenance(report);
+  return (
+    <AgentSideSection titleId="posture-local-model-title" title={report.display_name}>
+      <p className="mt-2 text-sm leading-6 text-slate-700">{report.summary}</p>
+      {provenance ? <p className="mt-1 [overflow-wrap:anywhere] text-xs text-slate-500">{provenance}</p> : null}
+      {report.roles.length > 0 ? (
+        <ul className="mt-3 flex flex-wrap gap-2" aria-label="What this model does">
+          {report.roles.map((role) => (
+            <li key={role} className="rounded-full border border-slate-200 bg-white px-3 py-1 text-xs text-slate-700">{role}</li>
+          ))}
+        </ul>
+      ) : null}
+      <SectionFigures rows={sectionRows(report)} />
+    </AgentSideSection>
+  );
+}
+
+function AgentLayerSection({ report }: { report: AgentLayerReport }) {
+  const figures = agentLayerFigures(report);
+  return (
+    <AgentSideSection titleId="posture-agent-layer-title" title={report.display_name}>
+      <p className="mt-2 text-sm leading-6 text-slate-700">{report.summary}</p>
+      {/* Three states, three renders. A record that was read and holds zeroes
+          keeps its zeroes; a record that could not be opened shows no figure at
+          all, with the cause the host named. */}
+      {figures.kind === "counted" ? null : (
+        <p className="mt-3 flex flex-wrap items-center gap-2 text-xs">
+          <span className="rounded-full border border-slate-300 bg-white px-3 py-1 font-semibold text-slate-700">
+            {figures.label}
+          </span>
+          <span className="[overflow-wrap:anywhere] text-slate-500">{report.reason}</span>
+        </p>
+      )}
+      <SectionFigures rows={sectionRows(report)} />
+      {report.sessions.length > 0 ? (
+        <div className="mt-4">
+          <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-500">Agent sessions in the record</h3>
+          <ul className="mt-2 flex flex-wrap gap-2" aria-label="Agent sessions in the record">
+            {report.sessions.map((session) => (
+              <li key={session} className="[overflow-wrap:anywhere] rounded-lg border border-slate-200 bg-white px-2.5 py-1 font-mono text-[11px] text-slate-700">{session}</li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+      {/* The host ships this sentence so the section cannot be rendered without
+          it. Printed as sent: the screen does not write its own. */}
+      <p className="mt-4 border-t border-slate-200 pt-3 text-xs leading-5 text-slate-500">{report.evidence_basis}</p>
+      {report.evidence_source ? (
+        <p className="mt-1 [overflow-wrap:anywhere] font-mono text-[11px] text-slate-500">{report.evidence_source}</p>
+      ) : null}
+    </AgentSideSection>
   );
 }
 
