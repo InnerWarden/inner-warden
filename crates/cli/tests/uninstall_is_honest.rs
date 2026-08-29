@@ -41,7 +41,10 @@
 //! own tempdir is read or written.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+
+mod fork_safe;
+use fork_safe::{copy_the_binary, spawn_without_racing_a_copy};
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_innerwarden")
@@ -60,8 +63,7 @@ fn as_an_npm_install(root: &Path) -> PathBuf {
         .join("bin");
     std::fs::create_dir_all(&dir).expect("npm layout");
     let target = dir.join(name);
-    // `copy` carries the mode across on Unix, so the copy stays executable.
-    std::fs::copy(source, &target).expect("copy the binary into npm's layout");
+    copy_the_binary(source, &target);
     target
 }
 
@@ -73,7 +75,7 @@ fn as_a_direct_install(root: &Path) -> PathBuf {
     let dir = root.join("usr").join("local").join("bin");
     std::fs::create_dir_all(&dir).expect("direct layout");
     let target = dir.join(name);
-    std::fs::copy(source, &target).expect("copy the binary");
+    copy_the_binary(source, &target);
     target
 }
 
@@ -95,7 +97,13 @@ fn run_uninstall(exe: &Path, home: &Path, extra: &[&str]) -> Output {
     cmd.env("HOME", home);
     // Keep the run offline and non-interactive whatever the environment holds.
     cmd.env_remove("INNERWARDEN_CONFIG_DIR");
-    cmd.output().expect("run uninstall")
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    // The guard is dropped before the wait, so a slow child never blocks
+    // another test's copy. See `fork_safe` for why the fork needs covering.
+    spawn_without_racing_a_copy(&mut cmd)
+        .wait_with_output()
+        .expect("run uninstall")
 }
 
 fn text(out: &Output) -> String {
