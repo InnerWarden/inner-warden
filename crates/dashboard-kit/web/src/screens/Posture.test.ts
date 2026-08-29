@@ -1,4 +1,6 @@
 import { describe, expect, it } from "vitest";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
 // The screen's own source, for the structural guard at the bottom of this file.
 import postureSource from "./Posture.tsx?raw";
 import type {
@@ -32,6 +34,7 @@ import {
   needsOperator,
   plainMode,
   postureHeadline,
+  Posture,
   scopeDisplay,
   sectionRows,
 } from "./Posture";
@@ -185,6 +188,32 @@ function bootstrap(): DashboardBootstrap {
 
 function posture(layers: ProtectionLayer[] = FIVE_LAYERS, gaps: CoverageGap[] = []): DashboardPosture {
   return { schema_version: "innerwarden.dashboard.v1", generated_at: generatedAt, layers, gaps };
+}
+
+/**
+ * The screen as the reader receives it: markup.
+ *
+ * Every guard on this page that only ever called a helper proved the helper and
+ * left the call site free. `agentLayerFigures` was exhaustively tested as a pure
+ * function while nothing pinned that its answer reached a pixel, and the coupling
+ * guard read the source for one spelling of a field name while the component was
+ * free to read it under any other. Rendering is the only check a rename, a
+ * destructure or a deleted element cannot walk around.
+ */
+function render(value: DashboardPosture): string {
+  return renderToStaticMarkup(
+    createElement(Posture, { bootstrap: bootstrap(), posture: value, current: true, evaluatedAt }),
+  );
+}
+
+/** The markup between an opening anchor and the first `end` after it. Used to
+ *  name WHICH region moved when an equality fails, instead of diffing a page. */
+function region(html: string, anchor: string, end: string): string {
+  const from = html.indexOf(anchor);
+  if (from < 0) throw new Error(`anchor not rendered: ${anchor}`);
+  const to = html.indexOf(end, from);
+  if (to < 0) throw new Error(`unterminated region: ${anchor}`);
+  return html.slice(from, to + end.length);
 }
 
 describe("the verdict hero leads with what the user asked", () => {
@@ -825,6 +854,42 @@ describe("the guardrail section keeps three answers apart", () => {
     );
   });
 
+  /**
+   * The three answers have to reach the SCREEN, not just the helper.
+   *
+   * `agentLayerFigures` was proved exhaustively above and the element that
+   * prints its answer was pinned by nothing: deleting the whole badge block from
+   * the section left the typechecker at 0 and every test passing, because the
+   * only structural pin on that component matched on `evidence_basis` and
+   * `evidence_source`, which the deletion did not touch. A proved helper whose
+   * call site is unpinned is a feature that can ship removed.
+   */
+  it("tells the reader on the screen which of the three hosts this is", () => {
+    const html = (report: AgentLayerReport) => render({ ...posture(), agent_layer: report });
+    const unreadableHtml = html(RECORD_UNREADABLE);
+    const freshInstallHtml = html(NO_DECISIONS_YET);
+    const screeningHtml = html(SCREENING);
+
+    // A record that could not be OPENED says so, and names the cause the host
+    // sent, so the operator checks the right thing.
+    expect(unreadableHtml).toContain("Record could not be read");
+    expect(unreadableHtml).toContain(RECORD_UNREADABLE.reason);
+
+    // A fresh install says something different, and it is not a fault.
+    expect(freshInstallHtml).toContain("Nothing recorded yet");
+    expect(freshInstallHtml).toContain(NO_DECISIONS_YET.reason);
+    expect(freshInstallHtml).not.toContain("Record could not be read");
+    expect(unreadableHtml).not.toContain("Nothing recorded yet");
+
+    // And a host that IS screening claims neither: its figures are the answer.
+    expect(screeningHtml).not.toContain("Record could not be read");
+    expect(screeningHtml).not.toContain("Nothing recorded yet");
+    expect(screeningHtml).toContain("601");
+
+    // Three hosts, three renders. Any two collapsing into one is the defect.
+    expect(new Set([unreadableHtml, freshInstallHtml, screeningHtml]).size).toBe(3);
+  });
+
   it("carries the basis and the source the host sent, unrewritten", () => {
     expect(SCREENING.evidence_basis).toBe(EVIDENCE_BASIS);
     // The section renders `report.evidence_basis` verbatim; this pins that the
@@ -874,11 +939,20 @@ describe("a gap the host named is never rendered as a number", () => {
 
 describe("the agent sections never reach a host control", () => {
   /**
-   * The footer rule is correct and it stays: host controls are evaluated from
-   * host evidence only, and agent metadata never grants host trust. The two
-   * sections are the whole risk of this change, so the coupling is checked
-   * structurally, the way the assurance veto is: no unit test of a pure
-   * function can see a component reading the wrong field.
+   * A tripwire, and explicitly NOT the proof.
+   *
+   * It was written as the proof, and it was not one: it filtered on
+   * `posture.agent_layer`, the DOTTED spelling, so `const { agent_layer: a } =
+   * posture` walked straight past it. A reviewer used exactly that to repaint
+   * every host pill emerald and relabel it "Enforcing" from an agent-reported
+   * field, with the typechecker at 0 and every test green. A guard pinned to one
+   * spelling of a name protects the bug it is aimed at.
+   *
+   * What carries the invariant now is the render below, which compares bytes and
+   * cannot be spelled around. This stays because it is cheap and it names the
+   * two lines allowed to touch the fields at all, so a third call site has to be
+   * argued for rather than slipped in. Non-comment lines only: the prose above
+   * these fields names them on purpose.
    *
    * If this fails, do not widen the allowed list. The sections render from
    * their own report and nothing else.
@@ -887,12 +961,66 @@ describe("the agent sections never reach a host control", () => {
     const uses = postureSource
       .split("\n")
       .map((line: string) => line.trim())
-      .filter((line: string) => /posture\.(agent_layer|local_model)/.test(line));
+      .filter((line: string) => !/^(\/\/|\*|\/\*)/.test(line))
+      .filter((line: string) => /\b(agent_layer|local_model)\b/.test(line));
 
     expect(uses).toEqual([
       "{posture.local_model ? <LocalModelSection report={posture.local_model} /> : null}",
       "{posture.agent_layer ? <AgentLayerSection report={posture.agent_layer} /> : null}",
     ]);
+  });
+
+  /**
+   * The proof: the host's half of the page is byte-identical with the agent
+   * sections present and with them absent.
+   *
+   * This is behavioural on purpose. Narrowing the type the pill and headline code
+   * may see was the other candidate and it cannot carry this alone: TypeScript is
+   * structural, so the full posture still satisfies a narrowed parameter, and the
+   * component keeps the whole object in scope whatever a helper is handed. The
+   * forbidden path lives in the component, so the component is what has to be
+   * measured.
+   *
+   * The two sections render last, inside the same wrapper, so everything the host
+   * owns is a literal prefix of the longer render. Anything an agent-reported
+   * field touches above them, a colour, a word, an ordering, breaks the prefix,
+   * under any spelling of any field name.
+   */
+  it("renders identical host controls whether or not the agent sections are present", () => {
+    const bare = posture();
+    const withSections: DashboardPosture = { ...bare, local_model: LOADED_MODEL, agent_layer: SCREENING };
+
+    const bareHtml = render(bare);
+    const withHtml = render(withSections);
+
+    // Not vacuous: the sections really did render, with the agent's figures.
+    expect(withHtml).toContain("In the agent, not a host control");
+    expect(withHtml).toContain(SCREENING.summary);
+    expect(withHtml).toContain(LOADED_MODEL.display_name);
+    expect(bareHtml).not.toContain("In the agent, not a host control");
+
+    const CLOSE = "</div>";
+    expect(bareHtml.endsWith(CLOSE)).toBe(true);
+    const hostHalf = bareHtml.slice(0, -CLOSE.length);
+
+    // Byte identity, and it is the whole assertion. 601 screened commands, 4
+    // refusals, and not one byte of them anywhere the host speaks.
+    expect(withHtml.startsWith(hostHalf)).toBe(true);
+    expect(withHtml.slice(hostHalf.length).endsWith(CLOSE)).toBe(true);
+    expect(hostHalf).not.toMatch(/601|refus/);
+
+    // Named regions too, so a failure says which surface moved rather than
+    // handing the reader two pages of markup to diff.
+    const pills = (html: string) => region(html, 'aria-label="Host controls"', "</ul>");
+    const verdict = (html: string) => region(html, '<h3 id="posture-verdict-title"', "</h3>");
+    expect(pills(withHtml)).toBe(pills(bareHtml));
+    expect(verdict(withHtml)).toBe(verdict(bareHtml));
+
+    // And the specific over-claim the footer rule exists to prevent: this
+    // fixture carries no claims records, so no host pill may be emerald and none
+    // may say Enforcing, however busy the guardrail below it reports being.
+    expect(pills(withHtml)).not.toContain("emerald");
+    expect(pills(withHtml)).not.toContain("Enforcing");
   });
 
   it("leaves the host's verdict line reading only host material", () => {
