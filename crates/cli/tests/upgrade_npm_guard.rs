@@ -25,7 +25,22 @@
 //! first byte is fetched.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
+
+mod fork_safe;
+use fork_safe::{copy_the_binary, spawn_without_racing_a_copy};
+
+/// Run the copied binary, without racing another test's copy of it. See
+/// `fork_safe` for why the fork needs covering on Linux.
+fn run(target: &Path, args: &[&str]) -> Output {
+    let mut cmd = Command::new(target);
+    cmd.args(args);
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    spawn_without_racing_a_copy(&mut cmd)
+        .wait_with_output()
+        .expect("run the binary under test")
+}
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_innerwarden")
@@ -44,8 +59,7 @@ fn as_an_npm_install(root: &Path) -> PathBuf {
         .join("bin");
     std::fs::create_dir_all(&dir).expect("npm layout");
     let target = dir.join(name);
-    // `copy` carries the mode across on Unix, so the copy stays executable.
-    std::fs::copy(source, &target).expect("copy the binary into npm's layout");
+    copy_the_binary(source, &target);
     target
 }
 
@@ -61,10 +75,7 @@ fn an_npm_managed_copy_refuses_before_it_downloads_anything() {
     let target = as_an_npm_install(root.path());
     let before = std::fs::read(&target).expect("read the installed copy");
 
-    let out = Command::new(&target)
-        .arg("upgrade")
-        .output()
-        .expect("run the npm-managed copy");
+    let out = run(&target, &["upgrade"]);
 
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
@@ -114,10 +125,7 @@ fn the_refusal_offers_an_override_the_parser_accepts() {
     let root = tempfile::tempdir().expect("tempdir");
     let target = as_an_npm_install(root.path());
 
-    let out = Command::new(&target)
-        .arg("upgrade")
-        .output()
-        .expect("run the npm-managed copy");
+    let out = run(&target, &["upgrade"]);
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
     assert!(
         stderr.contains("innerwarden upgrade --yes"),
@@ -127,10 +135,7 @@ fn the_refusal_offers_an_override_the_parser_accepts() {
     // `--yes` must not be rejected as an unknown option, which is exit 2 with a
     // different message. Asserted through `--help`-free parsing: an unrecognised
     // flag refuses without ever reaching the npm gate.
-    let unknown = Command::new(&target)
-        .args(["upgrade", "--definitely-not-a-flag"])
-        .output()
-        .expect("run with a bogus flag");
+    let unknown = run(&target, &["upgrade", "--definitely-not-a-flag"]);
     let unknown_err = String::from_utf8_lossy(&unknown.stderr).to_string();
     assert!(
         unknown_err.contains("unknown option"),
