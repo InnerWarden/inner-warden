@@ -1023,6 +1023,57 @@ describe("the agent sections never reach a host control", () => {
     expect(pills(withHtml)).not.toContain("Enforcing");
   });
 
+  /// THE INVARIANT, stated as it actually is.
+  ///
+  /// The sibling test above compares the page with the sections against the page
+  /// WITHOUT them, and that is strictly weaker than the rule it was meant to
+  /// carry. A reviewer proved it: repainting every pill when
+  /// `(agentState ?? "screening") === "screening"` makes the absent render
+  /// repaint identically to the present one, so byte identity, both named
+  /// regions and the prefix all hold by construction. tsc 0, 454/454 green.
+  ///
+  /// Under that mutation a SCREENING host showed five pills reading "Active" and
+  /// an UNREADABLE host showed five reading "Working as set up": the same host
+  /// evidence, different host control text, decided solely by an agent-reported
+  /// field. That is precisely what the footer rule forbids.
+  ///
+  /// So this varies the agent DATA across every state the producer can send.
+  /// A fallback cannot make four different inputs agree, and no spelling of the
+  /// field name matters, because nothing here mentions the field at all.
+  it("decides the host half from host evidence, whatever the agent reports", () => {
+    const base = posture();
+    const variants: Array<[string, DashboardPosture]> = [
+      ["no agent sections at all", base],
+      ["screening", { ...base, local_model: LOADED_MODEL, agent_layer: SCREENING }],
+      ["screening, all zero", { ...base, local_model: LOADED_MODEL, agent_layer: SCREENING_ZERO }],
+      ["nothing recorded yet", { ...base, agent_layer: NO_DECISIONS_YET }],
+      ["record unreadable", { ...base, agent_layer: RECORD_UNREADABLE }],
+      ["a model, no guardrail record", { ...base, local_model: LOADED_MODEL }],
+    ];
+
+    const pills = (html: string) => region(html, 'aria-label="Host controls"', "</ul>");
+    const verdict = (html: string) => region(html, '<h3 id="posture-verdict-title"', "</h3>");
+
+    const [, first] = variants[0];
+    const expectedPills = pills(render(first));
+    const expectedVerdict = verdict(render(first));
+
+    // Not vacuous: the regions must exist and carry the host's controls.
+    expect(expectedPills.length).toBeGreaterThan(40);
+    expect(expectedVerdict.length).toBeGreaterThan(10);
+
+    for (const [name, value] of variants) {
+      const html = render(value);
+      expect(`${name}: ${pills(html)}`).toBe(`${name}: ${expectedPills}`);
+      expect(`${name}: ${verdict(html)}`).toBe(`${name}: ${expectedVerdict}`);
+    }
+
+    // And the sections really did vary, so the loop above compared six pages
+    // that differ below the host half rather than six copies of one page.
+    const rendered = variants.slice(1).map(([, value]) => render(value));
+    expect(new Set(rendered).size).toBe(rendered.length);
+  });
+
   it("leaves the host's verdict line reading only host material", () => {
     // The headline takes the pills and the host's own summary. Nothing else may
     // be passed to it: an agent-reported refusal count in this call is exactly
