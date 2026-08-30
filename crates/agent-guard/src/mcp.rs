@@ -674,6 +674,110 @@ pub fn analyze_command_with(
         score += s;
     }
 
+    // The agent trying to weaken the thing screening it. Scored to deny: every
+    // route here is a deliberate act against the control boundary, and the
+    // operator keeps all of them from their own terminal.
+    if let Some((what, s)) = threats::check_guard_self_disable(scan_cmd) {
+        signals.push(AnalysisSignal {
+            signal: "guard_self_disable".into(),
+            score: s,
+            detail: what.to_string(),
+        });
+        score += s;
+    }
+
+    // Live sessions on this machine, and the kernel knobs that protect them.
+    if let Some((what, s)) = threats::check_local_credential_and_kernel_tamper(scan_cmd) {
+        signals.push(AnalysisSignal {
+            signal: "local_credential_or_kernel_tamper".into(),
+            score: s,
+            detail: what.to_string(),
+        });
+        score += s;
+    }
+
+    // Irreversible destruction of data, and of the infrastructure holding it.
+    if let Some((what, s)) = threats::check_data_destruction(scan_cmd) {
+        signals.push(AnalysisSignal {
+            signal: "data_destruction".into(),
+            score: s,
+            detail: what.to_string(),
+        });
+        score += s;
+    }
+
+    // Removing the record of what happened ends an investigation.
+    if let Some((what, s)) = threats::check_anti_forensics(scan_cmd) {
+        signals.push(AnalysisSignal {
+            signal: "anti_forensics".into(),
+            score: s,
+            detail: what.to_string(),
+        });
+        score += s;
+    }
+
+    // Arranging to run again after this session ends.
+    if let Some((what, s)) = threats::check_persistence_install(scan_cmd) {
+        signals.push(AnalysisSignal {
+            signal: "persistence_install".into(),
+            score: s,
+            detail: what.to_string(),
+        });
+        score += s;
+    }
+
+    // Reaching the node, the cluster identity, or its secrets.
+    if let Some((what, s)) = threats::check_kubernetes_escalation(scan_cmd) {
+        signals.push(AnalysisSignal {
+            signal: "kubernetes_escalation".into(),
+            score: s,
+            detail: what.to_string(),
+        });
+        score += s;
+    }
+
+    // Reading a secret deserves a person, not a refusal.
+    if let Some((what, s)) = threats::check_kubernetes_secret_read(scan_cmd) {
+        signals.push(AnalysisSignal {
+            signal: "kubernetes_secret_read".into(),
+            score: s,
+            detail: what.to_string(),
+        });
+        score += s;
+    }
+
+    // A new root of trust for everything installed after it. Review, not deny:
+    // an internal mirror on a private address is a normal enterprise setup.
+    if let Some((what, s)) = threats::check_untrusted_software_source(scan_cmd) {
+        signals.push(AnalysisSignal {
+            signal: "untrusted_software_source".into(),
+            score: s,
+            detail: what.to_string(),
+        });
+        score += s;
+    }
+
+    // Cloud control plane. A bank is breached through IAM, not through nc.
+    if let Some((what, s)) = threats::check_cloud_control_plane(scan_cmd) {
+        signals.push(AnalysisSignal {
+            signal: "cloud_control_plane".into(),
+            score: s,
+            detail: what.to_string(),
+        });
+        score += s;
+    }
+
+    // Certificate verification switched off: the precondition for a
+    // machine-in-the-middle. Review on its own, deny alongside anything else.
+    if let Some((what, s)) = threats::check_tls_verification_disabled(scan_cmd) {
+        signals.push(AnalysisSignal {
+            signal: "tls_verification_disabled".into(),
+            score: s,
+            detail: what.to_string(),
+        });
+        score += s;
+    }
+
     // Download-and-execute via pipe (score 40).
     if let Some(s) = threats::check_download_execute_pipe(scan_cmd) {
         signals.push(AnalysisSignal {
@@ -1049,6 +1153,30 @@ pub fn analyze_command_with(
     }
 }
 
+/// True when the ONLY thing this command does against the metadata service is
+/// mint an IMDSv2 session token.
+///
+/// PURE. The discriminator is the credential surface, not the address: a command
+/// that touches `security-credentials`, `identity/oauth2/token`, `userdata` or
+/// any `iam/` path is never exempt however it is dressed up.
+fn is_imdsv2_token_handshake_only(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    const CREDENTIAL_SURFACES: &[&str] = &[
+        "security-credentials",
+        "identity/oauth2/token",
+        "/iam/",
+        "user-data",
+        "userdata",
+        "service-accounts",
+    ];
+    if CREDENTIAL_SURFACES.iter().any(|s| lower.contains(s)) {
+        return false;
+    }
+    // The token mint, and nothing else on the metadata service.
+    lower.contains("/latest/api/token")
+        && (lower.contains("x-aws-ec2-metadata-token-ttl-seconds") || lower.contains("-x put"))
+}
+
 fn check_shell_internal_target(command: &str) -> Option<String> {
     use std::sync::OnceLock;
 
@@ -1060,7 +1188,17 @@ fn check_shell_internal_target(command: &str) -> Option<String> {
         )
         .expect("static shell metadata regex")
     });
-    if metadata.is_match(command) {
+    // IMDSv2's token handshake is the HARDENED path and it is what AWS tells
+    // people to use. Refusing it does not stop anybody reading metadata; it
+    // pushes them back to IMDSv1, which is the version SSRF actually walks
+    // through. Measured against a bank's own corpus: the token PUT was the third
+    // most common false positive, and every EC2 workload issues it.
+    //
+    // The exemption is narrow on purpose. It covers ONLY the PUT that mints a
+    // token at `/latest/api/token`, which returns a token and no credential. The
+    // moment a command reaches a credential path the finding stands, which the
+    // `imds_credential_path` test pins.
+    if metadata.is_match(command) && !is_imdsv2_token_handshake_only(command) {
         return Some("request targets a cloud metadata or link-local credential service".into());
     }
 

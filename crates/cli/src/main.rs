@@ -520,6 +520,75 @@ fn apply_behaviour(
     verdict
 }
 
+/// A PostToolUse payload: the tool already ran and its RESULT is attached.
+///
+/// The two-step attack lives entirely in this half. A PreToolUse hook sees the
+/// command and nothing else, so a value that arrived inside a file the agent
+/// read is indistinguishable from one the operator typed. Returning
+/// `(tool_name, result_text)` is what lets the next command be judged on where
+/// its arguments came from.
+fn hook_tool_result(payload: &str) -> Option<(String, String)> {
+    let v: serde_json::Value = serde_json::from_str(payload).ok()?;
+    let response = v.get("tool_response").or_else(|| v.get("toolResponse"))?;
+    let text = match response {
+        serde_json::Value::String(s) => s.clone(),
+        other => serde_json::to_string(other).ok()?,
+    };
+    if text.trim().is_empty() {
+        return None;
+    }
+    let tool = v
+        .get("tool_name")
+        .or_else(|| v.get("toolName"))
+        .and_then(|t| t.as_str())
+        .unwrap_or("a tool")
+        .to_string();
+    Some((tool, text))
+}
+
+/// Raise a verdict because one of the command's arguments came from a tool
+/// result rather than from the operator.
+///
+/// Deliberately `review` and not `deny`. Most tainted arguments are innocent:
+/// an agent reads a config file and then uses the host it names, which is the
+/// job. The point is that the decision stops being automatic. A guard that
+/// refuses every value it did not watch the human type is a guard that cannot
+/// be used, and this repository has a whole evaluation about what that costs.
+fn apply_taint(
+    mut verdict: serde_json::Value,
+    tainted: Option<&(String, String)>,
+) -> serde_json::Value {
+    let Some((value, tool)) = tainted else {
+        return verdict;
+    };
+    let Some(obj) = verdict.as_object_mut() else {
+        return verdict;
+    };
+    let previous = obj
+        .get("explanation")
+        .and_then(|e| e.as_str())
+        .unwrap_or("")
+        .to_string();
+    let reason = format!(
+        "argument `{value}` did not come from you: it arrived in a result from {tool} earlier in this session"
+    );
+    let joined = if previous.is_empty() {
+        reason
+    } else {
+        format!("{previous}; {reason}")
+    };
+    obj.insert("explanation".into(), joined.into());
+    // Never lower a verdict. A command that was already going to be refused
+    // stays refused; this only lifts an `allow` into the operator's view.
+    if obj.get("recommendation").and_then(|r| r.as_str()) == Some("allow") {
+        obj.insert("recommendation".into(), "review".into());
+        let score = obj.get("risk_score").and_then(|s| s.as_u64()).unwrap_or(0);
+        obj.insert("risk_score".into(), score.max(25).into());
+        obj.insert("severity".into(), "medium".into());
+    }
+    verdict
+}
+
 fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
     let block_review = rest.iter().any(|a| a == "--block-review");
     // Monitor (observe-only): still records every command into the graph, but never
@@ -531,6 +600,16 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
     if std::io::stdin().read_to_string(&mut buf).is_err() {
         return std::process::ExitCode::SUCCESS;
     }
+    // PostToolUse: the tool already ran, so there is nothing to permit or
+    // refuse. Record what its result carried and exit 0. Doing this BEFORE the
+    // command extraction matters: a PostToolUse payload also carries the
+    // `tool_input` that produced it, and screening that again would record the
+    // same command twice.
+    if let Some((tool, result)) = hook_tool_result(&buf) {
+        session_store::record_tool_result(hook_session(&buf).as_deref(), &tool, &result);
+        return std::process::ExitCode::SUCCESS;
+    }
+
     let Some((command, rules)) = hook_verdict(&buf) else {
         return std::process::ExitCode::SUCCESS; // no command -> never wedge a tool call
     };
@@ -540,6 +619,11 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
         .unwrap_or(rules);
     let source_session = hook_session(&buf);
     let source_event_id = hook_event_id(&buf);
+
+    // The other half of the two-step defence: is one of this command's
+    // arguments a value that arrived in an earlier tool result?
+    let tainted = session_store::tainted_argument(source_session.as_deref(), &command);
+    let verdict = apply_taint(verdict, tainted.as_ref());
 
     // Behavioural layer: a burst of calls, or repeated sensitive reads, is only
     // visible ACROSS invocations. `agent-guard` has always had the logic; this

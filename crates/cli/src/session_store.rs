@@ -114,6 +114,65 @@ fn record_call_at(session: Option<&str>, path: Option<PathBuf>) -> Option<Alert>
     alert
 }
 
+/// Record the values a TOOL RESULT carried into `session`.
+///
+/// The PostToolUse half of the two-step defence. Same best-effort contract as
+/// [`record_call`]: it can never fail a tool call, because it runs after the
+/// tool already ran.
+pub fn record_tool_result(session: Option<&str>, tool: &str, result: &str) {
+    record_tool_result_at(session, tool, result, store_path());
+}
+
+fn record_tool_result_at(session: Option<&str>, tool: &str, result: &str, path: Option<PathBuf>) {
+    let Some(session) = session.map(str::trim).filter(|s| !s.is_empty()) else {
+        return;
+    };
+    let Some(path) = path else { return };
+    let now = now_ms();
+
+    let mut store: Store = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default();
+
+    let entry = store.sessions.entry(session.to_string()).or_default();
+    entry.last_seen_ms = now;
+    entry.state.record_tool_result(tool, result, now);
+
+    prune(&mut store, now);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(raw) = serde_json::to_string(&store) {
+        let _ = write_private(&path, &raw);
+    }
+}
+
+/// Does `command` carry a value that arrived in an earlier tool result?
+///
+/// Returns `(value, source_tool)`. Reads only: the PreToolUse path must not
+/// mutate state it is about to be judged on.
+pub fn tainted_argument(session: Option<&str>, command: &str) -> Option<(String, String)> {
+    tainted_argument_at(session, command, store_path())
+}
+
+fn tainted_argument_at(
+    session: Option<&str>,
+    command: &str,
+    path: Option<PathBuf>,
+) -> Option<(String, String)> {
+    let session = session.map(str::trim).filter(|s| !s.is_empty())?;
+    let path = path?;
+    let store: Store = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())?;
+    let entry = store.sessions.get(session)?;
+    entry
+        .state
+        .tainted_argument(command, now_ms())
+        .map(|(v, t)| (v.to_string(), t.to_string()))
+}
+
 /// Drop expired sessions, then the oldest ones if still over the cap.
 ///
 /// Pure over the store so the eviction rule is testable without the filesystem.

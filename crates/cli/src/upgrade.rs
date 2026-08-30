@@ -222,6 +222,9 @@ pub fn cmd(rest: &[String]) -> ExitCode {
             println!("Signature verified against this build's pinned release key.");
             println!();
             println!("Upgrade complete. Confirm with:  innerwarden --version");
+            for line in rewire_agents_after_upgrade() {
+                println!("{line}");
+            }
             for line in closing_advice(dashboard_is_serving()) {
                 println!("{line}");
             }
@@ -278,6 +281,53 @@ fn dashboard_is_serving() -> bool {
         .get("http://127.0.0.1:8787/api/guard/meta")
         .call()
         .is_ok()
+}
+
+/// Re-wire every connected agent after the binary is replaced.
+///
+/// Replacing a binary does not change a `settings.json` that was written by the
+/// previous one, and an upgrade that only swaps the file leaves the wiring at
+/// whatever the last INSTALL produced. That is not hypothetical here: this
+/// release adds a `PostToolUse` hook, which is the half that carries tool
+/// results in and makes the two-step attack visible. Without this, every
+/// existing customer would upgrade into a build that HAS the defence and a
+/// configuration that never invokes it, forever, and nothing would say so.
+///
+/// It is the same shape the installer's own comment already warns about:
+/// "anything that only reaches fresh installs leaves every existing customer on
+/// the broken seam forever."
+///
+/// Reconcile is idempotent and repairs in place, so on a host that needs
+/// nothing this is silent. Failure is reported and never fails the upgrade: the
+/// new binary is already on disk and refusing here would leave the operator
+/// believing the upgrade did not happen.
+fn rewire_agents_after_upgrade() -> Vec<String> {
+    let Some(home) = dirs_home() else {
+        return Vec::new();
+    };
+    let guard_bin = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "innerwarden".to_string());
+    let report = crate::agent_policy::reconcile(
+        &home,
+        &guard_bin,
+        &crate::agent_policy::AgentPolicy::default(),
+    );
+    if report.connected == 0 {
+        return Vec::new();
+    }
+    vec![
+        String::new(),
+        format!(
+            "Re-wired {} connected agent(s) so this version's hooks are the ones they run.",
+            report.connected
+        ),
+        "Restart them to pick it up: a hook is read at agent startup.".into(),
+    ]
+}
+
+fn dirs_home() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME").map(std::path::PathBuf::from)
 }
 
 /// What to print after a successful replace.
