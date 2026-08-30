@@ -4,7 +4,19 @@ import { StatusBadge } from "./StatusBadge";
 
 const decisionTypes = new Set(["recommendation", "policy_decision", "operator_action"]);
 
-export function DecisionProvenance({ events, feedback }: { events: CaseEvent[]; feedback: FeedbackRecord[] }) {
+/**
+ * `decidable` says whether the screen embedding this offers any action.
+ *
+ * The panel hard-coded "Read only" and "Nothing on this screen changes a rule,
+ * an allowlist or a policy". That was true of the Community dashboard and true
+ * of Enterprise until the case actions landed, and then it became a flat
+ * contradiction: the badge said nothing here changes anything, and three
+ * buttons that change something sat directly underneath.
+ *
+ * The host that renders the buttons passes `decidable`, so neither product
+ * claims the other's behaviour.
+ */
+export function DecisionProvenance({ events, feedback, decidable = false }: { events: CaseEvent[]; feedback: FeedbackRecord[]; decidable?: boolean }) {
   const decisions = events.filter((event) => decisionTypes.has(event.event_type));
   return (
     <section aria-labelledby="decision-provenance-title" className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
@@ -64,12 +76,14 @@ export function DecisionProvenance({ events, feedback }: { events: CaseEvent[]; 
       <div className="mt-5 border-t border-slate-200 pt-5">
         <div className="flex flex-wrap items-start justify-between gap-2">
           <h3 className="font-semibold text-slate-950">Analyst feedback</h3>
-          <StatusBadge status="observed_only" label="Read only" />
+          {!decidable && <StatusBadge status="observed_only" label="Read only" />}
         </div>
         {/* Was: "Feedback writes remain unavailable until the reviewed action
             API exists." Our roadmap is not the user's business; what it means
             for them is that reading this screen changes nothing. */}
-        <p className="mt-1 text-xs leading-5 text-slate-500">Nothing on this screen changes a rule, an allowlist or a policy.</p>
+        <p className="mt-1 text-xs leading-5 text-slate-500">{decidable
+          ? "Notes are a record of what a person concluded. To change the case itself, use the decision below."
+          : "Nothing on this screen changes a rule, an allowlist or a policy."}</p>
         {feedback.length === 0 ? (
           <p className="mt-3 rounded-lg bg-slate-50 px-3 py-3 text-sm text-slate-600">No analyst has left a note on this case.</p>
         ) : (

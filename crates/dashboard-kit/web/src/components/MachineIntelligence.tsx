@@ -1,4 +1,5 @@
 import { useEffect, useState, type ReactNode } from "react";
+import { plainOrTechnical, useTechnicalDetail } from "./TechnicalDetail";
 import {
   fetchAgents,
   fetchTokenIntelligence,
@@ -290,6 +291,10 @@ export function agentCardSpanClass(index: number, count: number): string {
 }
 
 function AgentCard({ agent, spanClass = "" }: { agent: LocalAgent; spanClass?: string }) {
+  // Subscribes, so flipping the switch re-renders this card. Reading the store
+  // directly here would leave the label on the old register until something
+  // else happened to redraw it.
+  const [technical] = useTechnicalDetail();
   const running = runningStatus(agent.running);
   const view = guardrailView(agent.guardrail);
   return (
@@ -321,7 +326,7 @@ function AgentCard({ agent, spanClass = "" }: { agent: LocalAgent; spanClass?: s
         </Detail>
         <Detail label="Setup support">{humanise(agent.guardrail.setup_support)}</Detail>
         <Detail label="Mechanism">{agent.guardrail.mechanism ? humanise(agent.guardrail.mechanism) : "Not available"}</Detail>
-        <Detail label="Automatic setup">{automaticSetupLabel(agent)}</Detail>
+        <Detail label="Automatic setup">{automaticSetupLabel(agent, technical)}</Detail>
         {view.lastObserved && <Detail label="Last observed">{view.lastObserved}</Detail>}
         {view.recordedActivity && <Detail label="Recorded activity">{view.recordedActivity}</Detail>}
       </dl>
@@ -556,21 +561,36 @@ export function formatDate(value: string | null | undefined): string | undefined
  * positively says so, never from the absence of a negative -- and, since the
  * live half exists, never over the top of evidence that contradicts it.
  */
-export function automaticSetupLabel(agent: LocalAgent): string {
-  if (agent.guardrail.mode === "partial") return "Manual review required";
+export function automaticSetupLabel(agent: LocalAgent, technical = false): string {
+  if (agent.guardrail.mode === "partial") {
+    // Stays loud in BOTH registers: this one needs a person.
+    return "Manual review required";
+  }
   // Ahead of the positive branch on purpose. This cell is one of the places an
   // operator reads for "am I covered", so the veto has to reach it too:
   // configured is not verified, and the words must not blur that.
-  if (guardrailIsConfiguredButUnobserved(agent.guardrail)) return "Configured, not verified";
+  //
+  // The plain wording keeps that distinction and drops the accusation. "Set up,
+  // waiting for first use" says the same two facts a buyer needs, that it IS
+  // configured and that we have not yet seen it work, without reading as a
+  // product confessing it cannot tell. It must never become a bare "Set up".
+  if (guardrailIsConfiguredButUnobserved(agent.guardrail)) {
+    return plainOrTechnical("Set up, waiting for first use", "Configured, not verified", technical);
+  }
   if (guardrailIsProtecting(agent.guardrail)) return "Already configured";
   // `unknown` lands here rather than in the branch above: not knowing is not a
   // kind of being configured.
-  if (agent.guardrail.mode === "unknown") return "Not determined";
-  if (agent.auto_connect_eligible == null) return "Eligibility unavailable";
+  if (agent.guardrail.mode === "unknown") {
+    return plainOrTechnical("No activity seen yet", "Not determined", technical);
+  }
+  if (agent.auto_connect_eligible == null) {
+    // What the reader can DO, rather than what we failed to learn.
+    return plainOrTechnical("Set up by hand", "Eligibility unavailable", technical);
+  }
   if (agent.auto_connect_eligible) return "Eligible when enabled";
   if (agent.guardrail.setup_support === "manual") return "Manual setup";
   if (agent.guardrail.setup_support === "unsupported") return "Not available";
-  return "Not eligible automatically";
+  return plainOrTechnical("Set up by hand", "Not eligible automatically", technical);
 }
 
 function agentPresence(agent: LocalAgent): string {

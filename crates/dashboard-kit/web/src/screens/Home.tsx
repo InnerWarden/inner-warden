@@ -1,4 +1,6 @@
 import { useEffect, useState, type ReactNode } from "react";
+import { headline } from "../components/HeadlineAnswer";
+import { TechnicalOnly } from "../components/TechnicalDetail";
 import {
   fetchOverview,
   type DashboardMeta,
@@ -142,6 +144,14 @@ was incomplete; it does not mean this host is idle.`}
   const reviewVerdicts = overview.review_verdicts ?? overview.review;
   const allowVerdicts = overview.allow_verdicts ?? overview.allowed;
   const hasUnknownVerdicts = overview.unknown_verdicts != null;
+  // Computed from what the host already sent: no new field, no extra request.
+  const summary = headline({
+    needsReview: reviewVerdicts,
+    denyVerdicts,
+    blockedBeforeExecution: overview.actual_blocks ?? 0,
+    monitorOnly: mode === "monitor",
+    unprovenAgents: 0,
+  });
   const recent = (overview.recent_decisions ?? overview.recent_blocks).slice(0, 5);
   const maxSignal = overview.top_categories[0]?.count ?? 0;
   const guardedAgents = meta?.guardrail?.guarded_agents;
@@ -173,7 +183,18 @@ was incomplete; it does not mean this host is idle.`}
             <div className="mb-3 flex flex-col items-start gap-2 sm:flex-row sm:items-end sm:justify-between sm:gap-4">
               <div>
                 <p className="text-xs font-semibold uppercase tracking-[0.14em] text-cyan-700">Decision record</p>
-                <h2 id="decision-summary-title" className="mt-1 text-lg font-semibold text-slate-950">What the guardrail saw</h2>
+                {/* THE ANSWER FIRST, the counters underneath as its evidence.
+                  * Five numbers and no conclusion left the reader to work out
+                  * whether they were safe, and the pairing of "252 classified
+                  * as unsafe" with "3 blocked before execution" reads as a
+                  * confession unless something explains monitor mode. */}
+                <h2 id="decision-summary-title" className="mt-1 text-lg font-semibold text-slate-950">{summary.answer}</h2>
+                {summary.next ? (
+                  <p className="mt-1 text-sm text-slate-600">{summary.next}</p>
+                ) : null}
+                <TechnicalOnly>
+                  <p className="mt-1 text-xs uppercase tracking-wide text-slate-500">What the guardrail saw</p>
+                </TechnicalOnly>
               </div>
               {(() => {
                 const cta = decisionRecordCta(edition, onOpenCase !== undefined);

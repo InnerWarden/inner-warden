@@ -7,14 +7,17 @@
       "title": "Agent attempted to read a production signing key before a host enforcement attempt",
       "severity": "high",
       "status": "needs_review",
-      "scope": [{
-        "id": "host:prod-01",
-        "kind": "host",
-        "display_name": "Production host 01",
-        "verification": "host_verified",
-        "evidence": []
-      }],
+      "scope": [
+        {
+          "id": "host:prod-01",
+          "kind": "host",
+          "display_name": "Production host 01",
+          "verification": "host_verified",
+          "evidence": []
+        }
+      ],
       "latest_event_at": "2026-07-18T11:58:30Z",
+      "recurrence_occurrences": "1",
       "outcome": "blocked_before_execution"
     },
     {
@@ -22,14 +25,17 @@
       "title": "A very long source-neutral investigation title that remains safely readable when an unfamiliar autonomous agent with a renamed wrapper reports a deny recommendation near an unrelated host observation without establishing that the two records caused one another or that any action was actually blocked",
       "severity": "medium",
       "status": "contained",
-      "scope": [{
-        "id": "agent:renamed-wrapper",
-        "kind": "agent",
-        "display_name": "Unattributed renamed wrapper with an intentionally long display label that must wrap instead of overflowing the case list",
-        "verification": "unattributed",
-        "evidence": []
-      }],
+      "scope": [
+        {
+          "id": "agent:renamed-wrapper",
+          "kind": "agent",
+          "display_name": "Unattributed renamed wrapper with an intentionally long display label that must wrap instead of overflowing the case list",
+          "verification": "unattributed",
+          "evidence": []
+        }
+      ],
       "latest_event_at": "2026-07-18T10:45:00Z",
+      "recurrence_occurrences": "1",
       "outcome": "unknown"
     }
   ],

@@ -140,9 +140,15 @@ test.describe("CJC-090-J005 activity filters, pagination, and drilldown", () => 
 
     await page.goto("/");
     await page.getByRole("button", { name: "Activity", exact: true }).click();
-    await expect(page.getByText("last-good-session", { exact: true })).toBeVisible();
+    // The session id is no longer the card's headline: it sits in the secondary
+    // line, shortened, with the full value on the element itself. Anchoring on
+    // the title asserts the WHOLE id survived the failed refresh, which is the
+    // thing an operator pastes into a log search. Matching the rendered text
+    // would only have proved the first eight characters came back.
+    const lastGood = page.getByTitle("last-good-session", { exact: true });
+    await expect(lastGood).toBeVisible();
     await page.getByRole("button", { name: "Deny verdicts", exact: true }).click();
     await expect(page.getByText("Could not refresh. Showing the last available result.")).toBeVisible();
-    await expect(page.getByText("last-good-session", { exact: true })).toBeVisible();
+    await expect(lastGood).toBeVisible();
   });
 });

@@ -505,13 +505,56 @@ impl Graph {
     }
 
     /// Drop the `count` oldest nodes and every edge that then dangles.
+    /// Drop the oldest nodes, EXCEPT session anchors.
+    ///
+    /// # The bug this exists to prevent, measured on a real install
+    ///
+    /// A session node is created before the first command of that session, so
+    /// it is always among the oldest material in the store, and age is exactly
+    /// what this function selects on. Dropping it took every `ran` edge with it
+    /// (`retain` removes an edge whose `from` was dropped), leaving the command
+    /// nodes behind with nothing pointing at them. The next command recreated
+    /// the session node at the END of the vector and started a fresh, tiny set
+    /// of edges.
+    ///
+    /// Measured on the operator's own machine before this fix: 15,632 command
+    /// nodes in the file and 1,889 `ran` edges. The dashboard counts commands
+    /// one way for the Overview and walks `ran` edges for the Activity list, so
+    /// it reported 15,623 decisions recorded and could only ever show 1,876 of
+    /// them. Filtering by "needs review" showed 6 items under a headline that
+    /// said 136. The linked ratio by sequence made the cause unmistakable:
+    /// 87.8% at the start, 0.0% across the whole middle, 66.8% at the end, one
+    /// gap per prune.
+    ///
+    /// The old doc claimed the cap was "chosen well above what any reader
+    /// surfaces, so pruning can never remove something a view would have
+    /// displayed". That was true of the command nodes and false of the one node
+    /// every view depends on to find them.
+    ///
+    /// Session nodes are a handful (4 on that install, against 15k commands),
+    /// so keeping them all costs nothing and preserves the only path a reader
+    /// has into the history.
     fn drop_oldest(&mut self, count: usize) -> usize {
         if count == 0 {
             return 0;
         }
         let count = count.min(self.nodes.len());
-        let dropped: std::collections::HashSet<String> =
-            self.nodes.drain(..count).map(|n| n.id).collect();
+        let mut dropped: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut kept_anchors: Vec<Node> = Vec::new();
+        for node in self.nodes.drain(..count) {
+            if node.kind == "session" {
+                kept_anchors.push(node);
+            } else {
+                dropped.insert(node.id);
+            }
+        }
+        // Anchors go back at the FRONT, so they stay the oldest material and are
+        // offered to the next prune again. Putting them at the back would make
+        // them look newest and quietly reorder the age ordering this function
+        // relies on.
+        for node in kept_anchors.into_iter().rev() {
+            self.nodes.insert(0, node);
+        }
         self.edges
             .retain(|e| !dropped.contains(&e.from) && !dropped.contains(&e.to));
         dropped.len()
@@ -1030,6 +1073,45 @@ impl Graph {
                 })
         };
         let mut sessions: Vec<&Node> = self.nodes.iter().filter(|n| n.kind == "session").collect();
+        // Sessions whose anchor node was pruned and never recreated.
+        //
+        // `drop_oldest` no longer removes anchors, but stores written before
+        // that fix still hold commands whose session node is simply gone: on
+        // the operator's machine, 150 commands across two finished sessions
+        // that never ran again to recreate theirs. Without this they are
+        // counted by the Overview and reachable from no list at all, which is
+        // the same invisibility the id fallback below was written to end.
+        //
+        // Rebuilt from the command ids, which carry the session, so a recovered
+        // session behaves exactly like a live one.
+        let anchored: std::collections::HashSet<&str> = sessions
+            .iter()
+            .map(|s| s.id.strip_prefix("session:").unwrap_or(&s.id))
+            .collect();
+        let mut recovered: Vec<Node> = Vec::new();
+        let mut seen_recovered: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        for node in &self.nodes {
+            if node.kind != "command" {
+                continue;
+            }
+            let Some(rest) = node.id.strip_prefix("cmd:") else {
+                continue;
+            };
+            let Some((session_key, _)) = rest.rsplit_once(':') else {
+                continue;
+            };
+            if anchored.contains(session_key) || !seen_recovered.insert(session_key.to_string()) {
+                continue;
+            }
+            recovered.push(Node {
+                id: format!("session:{session_key}"),
+                kind: "session".into(),
+                label: session_key.to_string(),
+                attrs: BTreeMap::new(),
+            });
+        }
+        sessions.extend(recovered.iter());
         sessions.sort_by_key(|session| std::cmp::Reverse(latest_command_position(session)));
 
         // A matching session, LIGHTWEIGHT: totals + the matched command node refs,
@@ -1059,6 +1141,21 @@ impl Graph {
                     continue;
                 }
             }
+            // Commands reached by the `ran` edge, PLUS any whose id names this
+            // session and whose edge is gone.
+            //
+            // The id is `cmd:{session}:{seq}` (see `ingest_verdict`), so the
+            // link is recoverable from the node itself and needs no extra edge
+            // and no extra bytes in the store. That matters because a prune
+            // used to drop the session anchor and take every `ran` edge with
+            // it: on the operator's own machine 13,748 of 15,632 commands, 88%
+            // of the record, were unreachable from this list while the Overview
+            // happily counted all of them. `drop_oldest` no longer drops
+            // anchors, but that only protects material recorded from now on;
+            // this recovers what was already stranded.
+            let session_key = s.id.strip_prefix("session:").unwrap_or(&s.id);
+            let prefix = format!("cmd:{session_key}:");
+            let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
             let mut cmds: Vec<&Node> = ix
                 .out
                 .get(s.id.as_str())
@@ -1066,7 +1163,17 @@ impl Graph {
                 .flatten()
                 .filter(|e| e.kind == "ran")
                 .filter_map(|e| ix.by_id.get(e.to.as_str()).copied())
+                .inspect(|n| {
+                    seen.insert(n.id.as_str());
+                })
                 .collect();
+            cmds.extend(
+                self.nodes
+                    .iter()
+                    .filter(|n| n.kind == "command")
+                    .filter(|n| n.id.starts_with(prefix.as_str()))
+                    .filter(|n| !seen.contains(n.id.as_str())),
+            );
             cmds.sort_by_key(|n| {
                 std::cmp::Reverse(
                     n.attrs
@@ -1617,6 +1724,115 @@ mod tests {
                 .filter(|e| e.to == "cat:privilege-escalation" && e.kind == "triggered")
                 .count(),
             2
+        );
+    }
+
+    /// THE BUG THAT HID 88% OF THE RECORD, IN BOTH ITS HALVES.
+    ///
+    /// A session node is created before its first command, so it is always the
+    /// oldest material and `drop_oldest` selected it first. Dropping it removed
+    /// every `ran` edge leaving it, stranding the command nodes: measured on a
+    /// real install, 15,632 commands against 1,889 edges, so the Overview said
+    /// 15,623 decisions and the Activity list could reach 1,876 of them.
+    ///
+    /// FAILS ON REVERT: let `drop_oldest` treat a session like any other node
+    /// and the first assertion drops to zero reachable commands.
+    #[test]
+    fn pruning_never_strands_a_session_from_its_commands() {
+        let mut g = Graph::default();
+        // Session first, exactly as the real ingest does it, then commands.
+        for seq in 0..40usize {
+            g.ingest_verdict(
+                "s1",
+                seq,
+                &format!("cmd {seq}"),
+                &json!({"recommendation": "allow"}),
+            );
+        }
+        let before = g.cases_page(None, None, None, 0, 100);
+        assert_eq!(
+            before.total_commands, 40,
+            "precondition: all 40 are reachable"
+        );
+
+        // Prune hard enough to reach the session anchor at the front.
+        g.drop_oldest(30);
+
+        let after = g.cases_page(None, None, None, 0, 100);
+        assert!(
+            after.total_commands > 0,
+            "pruning removed the session anchor and every surviving command \
+             became unreachable, which is exactly how 13,748 real decisions \
+             went missing from the dashboard"
+        );
+        assert!(
+            g.nodes.iter().any(|n| n.kind == "session"),
+            "the anchor must survive a prune: it is the only path a reader has \
+             into the history, and it costs one node"
+        );
+    }
+
+    /// The recovery half: commands whose edge was ALREADY lost are still found,
+    /// because `cmd:{session}:{seq}` names its own session.
+    ///
+    /// FAILS ON REVERT: drop the id-derived fallback in `page` and this reads 0.
+    #[test]
+    fn commands_are_found_even_when_their_edge_is_gone() {
+        let mut g = Graph::default();
+        for seq in 0..10usize {
+            g.ingest_verdict(
+                "s1",
+                seq,
+                &format!("cmd {seq}"),
+                &json!({"recommendation": "allow"}),
+            );
+        }
+        // Simulate the damage already on disk: the anchor's edges are gone but
+        // the command nodes remain.
+        g.edges.retain(|e| e.kind != "ran");
+
+        let page = g.cases_page(None, None, None, 0, 100);
+        assert_eq!(
+            page.total_commands, 10,
+            "every command names its own session in its id, so a missing edge \
+             must not make it invisible"
+        );
+    }
+
+    /// The last 150 that the id fallback alone could not reach.
+    ///
+    /// A session whose anchor was pruned and whose agent never ran again has no
+    /// session node to hang commands from, so a list that iterates session
+    /// nodes skips it entirely while the Overview keeps counting its commands.
+    /// The anchor is rebuilt from the ids instead.
+    ///
+    /// FAILS ON REVERT: drop the recovery loop and total_commands falls back to
+    /// only the sessions that still have a node.
+    #[test]
+    fn a_session_whose_anchor_was_pruned_is_still_listed() {
+        let mut g = Graph::default();
+        for seq in 0..12usize {
+            g.ingest_verdict(
+                "ghost",
+                seq,
+                &format!("cmd {seq}"),
+                &json!({"recommendation": "allow"}),
+            );
+        }
+        // The exact damage: the anchor is gone, the commands remain, and the
+        // agent never ran again to recreate it.
+        g.nodes.retain(|n| n.kind != "session");
+        g.edges.retain(|e| e.kind != "ran");
+
+        let page = g.cases_page(None, None, None, 0, 100);
+        assert_eq!(
+            page.total_commands, 12,
+            "commands whose session node is gone must still be reachable, or \
+             they are counted everywhere and listed nowhere"
+        );
+        assert_eq!(
+            page.total_sessions, 1,
+            "the session is rebuilt from the ids"
         );
     }
 

@@ -108,7 +108,11 @@ describe("a configured but unobserved guardrail is never rendered as protection"
     expect(view.lastObserved).toBe(`Never, 16 days since ${CONFIGURED_DAY}`);
     expect(view.recordedActivity).toBe("None recorded");
     expect(view.intent).toBe("Policy row records monitor");
-    expect(automaticSetupLabel(agentWith(silentForSixteenDays()))).toBe("Configured, not verified");
+    // PLAIN by default, and the distinction survives: it still does not say
+    // "Already configured", which is the assurance this veto exists to withhold.
+    expect(automaticSetupLabel(agentWith(silentForSixteenDays()))).toBe("Set up, waiting for first use");
+    expect(automaticSetupLabel(agentWith(silentForSixteenDays()), true)).toBe("Configured, not verified");
+    expect(automaticSetupLabel(agentWith(silentForSixteenDays()))).not.toBe("Already configured");
   });
 
   // The mode is one field. A producer that downgraded it in one code path and
@@ -119,7 +123,8 @@ describe("a configured but unobserved guardrail is never rendered as protection"
     expect(guardrailIsProtecting(contradicted)).toBe(false);
     expect(guardrailIsConfiguredButUnobserved(contradicted)).toBe(true);
     expect(guardrailView(contradicted).label).toBe("Configured, not observed");
-    expect(automaticSetupLabel(agentWith(contradicted))).toBe("Configured, not verified");
+    expect(automaticSetupLabel(agentWith(contradicted))).toBe("Set up, waiting for first use");
+    expect(automaticSetupLabel(agentWith(contradicted), true)).toBe("Configured, not verified");
   });
 
   it("still says it plainly when the producer sent no prose", () => {

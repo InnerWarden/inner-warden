@@ -35,8 +35,21 @@ export const EMPTY_CASE_VIEW: CaseViewState = {
 
 const outcomes = ["observed_only", "allowed", "blocked_before_execution", "would_block", "contained", "failed", "reverted", "not_observed", "unknown"] as const;
 const severities = ["critical", "high", "medium", "low", "informational", "unknown"] as const;
-const modes = ["disabled", "learning", "observe", "rehearse", "enforce", "mixed", "unknown"] as const;
-const scopeKinds = ["all", "agent", "host", "workload", "resource"] as const;
+// `mixed` is gone for the same reason `resource` is: the mode filter matches
+// against `event.mode` on the case timeline, and no projector ever puts
+// `EffectiveMode::Mixed` on an event. It exists as a label for capability
+// rollups, where several capabilities really can disagree, but a single event
+// happened in exactly one mode. Selecting it could only ever return zero.
+const modes = ["disabled", "learning", "observe", "rehearse", "enforce", "unknown"] as const;
+// Every kind here must be one the host can actually attach to a case, or the
+// operator gets an option that returns nothing for ever and reads as "no
+// results" rather than "no such thing". `resource` was exactly that: the
+// backing `ScopeKind::Resource` is declared and matched for a label, but is
+// never constructed anywhere in the agent, so selecting it could only ever
+// return zero. `session` is absent on purpose, not by oversight: the host folds
+// session scopes into the `agent` filter, so a separate entry would fall back
+// to page-only client filtering and find LESS than `agent` already does.
+const scopeKinds = ["all", "agent", "host", "workload"] as const;
 const windows = ["all", "1h", "24h", "7d", "30d"] as const;
 
 function selected<const T extends readonly string[]>(value: string | null, allowed: T, fallback: T[number] | ""): T[number] | "" {
@@ -129,11 +142,58 @@ export function CaseFilters({ value, disabled = false, onApply, onClear }: {
         </FilterSelect>
         <label className="text-xs font-semibold text-slate-700">
           Decision authority
-          <input value={draft.authority} maxLength={256} disabled={disabled} onChange={(event) => setDraft((current) => ({ ...current, authority: event.target.value }))} placeholder="rule, model, operator…" className="mt-1 block w-full rounded-lg border border-slate-300 px-3 py-2 text-sm font-normal" />
+          {/* Was a free-text box hinting "rule, model, operator". None of those
+              three is a value this filter accepts: it compares against the
+              authority recorded on a timeline event, which is `host-detector`,
+              `action-executor`, `runtime-verifier`, `obvious-gate` and the
+              like. Typing what the placeholder suggested returned zero cases
+              and taught the operator there were none of that kind.
+
+              A closed list cannot mislead, and the values are the producers
+              themselves, named as a person would say them.
+
+              Closing the list was not enough on its own. The first version of
+              it offered six values chosen by hand, and it was still missing the
+              two most common producers on a live host, `host-sensor` and
+              `agent-guard`: an operator asking "what did the guardrail decide?"
+              got nothing back. These are now the literals the host really
+              writes onto a timeline event, grouped by the question being asked,
+              and `case_filter_authorities_are_the_ones_events_really_carry` in
+              the agent fails if a producer starts writing one that is not
+              here. */}
+          <select value={draft.authority} disabled={disabled} onChange={(event) => setDraft((current) => ({ ...current, authority: event.target.value }))} className="mt-1 block w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-normal">
+            <option value="">Anything that decided</option>
+            <optgroup label="Saw it">
+              <option value="host-sensor">Host telemetry</option>
+              <option value="host-detector">Host detector</option>
+              <option value="agent-guard">The agent guardrail</option>
+              <option value="agent-guard-analysis">Agent guardrail analysis</option>
+              <option value="community-agent-boundary">Community agent boundary</option>
+            </optgroup>
+            <optgroup label="Decided it">
+              <option value="obvious-gate">Automatic rule</option>
+              <option value="community-policy">Community policy</option>
+              <option value="operator">An operator</option>
+            </optgroup>
+            <optgroup label="Acted on it">
+              <option value="action-executor">The action executor</option>
+              <option value="runtime-verifier">The runtime verifier</option>
+              <option value="response-lifecycle">Response lifecycle</option>
+            </optgroup>
+          </select>
         </label>
         <label className="text-xs font-semibold text-slate-700">
           Capability
-          <input value={draft.capability} maxLength={256} disabled={disabled} onChange={(event) => setDraft((current) => ({ ...current, capability: event.target.value }))} placeholder="execution, DNS…" className="mt-1 block w-full rounded-lg border border-slate-300 px-3 py-2 text-sm font-normal" />
+          {/* Same trap, worse: the backend match on this field is a CLOSED set
+              of four (`community`/`agent_boundary`, `host`/`host_visibility`,
+              `response`/`response_control`, or an exact evidence-source id),
+              and the box invited "execution, DNS". Neither ever matched. */}
+          <select value={draft.capability} disabled={disabled} onChange={(event) => setDraft((current) => ({ ...current, capability: event.target.value }))} className="mt-1 block w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-normal">
+            <option value="">Anything that saw it</option>
+            <option value="agent_boundary">The agent guardrail</option>
+            <option value="host_visibility">Host telemetry</option>
+            <option value="response_control">Response controls</option>
+          </select>
         </label>
         <FilterSelect label="Time window" value={draft.window} disabled={disabled} onChange={(window) => setDraft((current) => ({ ...current, window: window as CaseWindow }))}>
           <option value="all">All loaded time</option>
@@ -147,7 +207,6 @@ export function CaseFilters({ value, disabled = false, onApply, onClear }: {
           <option value="agent">Agent</option>
           <option value="host">Host</option>
           <option value="workload">Workload</option>
-          <option value="resource">Resource</option>
         </FilterSelect>
         <label className="text-xs font-semibold text-slate-700 md:col-span-2 xl:col-span-3">
           Scope identifier

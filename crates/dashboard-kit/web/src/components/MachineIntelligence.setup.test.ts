@@ -29,7 +29,10 @@ describe("automatic setup is never claimed from ignorance", () => {
   //
   // FAILS ON REVERT: restore the `!== "not_configured"` test and this trips.
   it("does not report an unknown guardrail as configured", () => {
-    expect(automaticSetupLabel(agent({ mode: "unknown" }))).toBe("Not determined");
+    // Not knowing is still not a kind of being configured, in either register.
+    expect(automaticSetupLabel(agent({ mode: "unknown" }))).toBe("No activity seen yet");
+    expect(automaticSetupLabel(agent({ mode: "unknown" }), true)).toBe("Not determined");
+    expect(automaticSetupLabel(agent({ mode: "unknown" }))).not.toContain("configured");
   });
 
   it("still reports the modes that really are configured", () => {
@@ -39,7 +42,10 @@ describe("automatic setup is never claimed from ignorance", () => {
   });
 
   it("keeps the existing not-configured ladder intact", () => {
-    expect(automaticSetupLabel(agent({ mode: "not_configured" }, null))).toBe("Eligibility unavailable");
+    // The plain register says what the reader can DO instead of what we failed
+    // to learn. Both are true; only one is actionable.
+    expect(automaticSetupLabel(agent({ mode: "not_configured" }, null))).toBe("Set up by hand");
+    expect(automaticSetupLabel(agent({ mode: "not_configured" }, null), true)).toBe("Eligibility unavailable");
     expect(automaticSetupLabel(agent({ mode: "not_configured" }, true))).toBe("Eligible when enabled");
     expect(automaticSetupLabel(agent({ mode: "not_configured", setup_support: "manual" }, false))).toBe("Manual setup");
     expect(automaticSetupLabel(agent({ mode: "not_configured", setup_support: "unsupported" }, false))).toBe("Not available");

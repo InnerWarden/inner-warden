@@ -213,10 +213,54 @@ function DetectionSection({ value }: { value: DetectionContext }) {
   );
 }
 
+/**
+ * A verdict a MODEL produced, as opposed to one our own bookkeeping produced.
+ *
+ * The host maps a producer label to a model family and answers `unknown` for
+ * everything that is not one of the three engines it knows. Those producers are
+ * real and their reasons are worth reading, but they are not models: the sweep
+ * that routes an unreviewed finding to a person reports itself as
+ * `orphan-recovery`, and the one that gives up reports `needs-review`.
+ *
+ * Rendering those under "AI verdict / Provider: orphan-recovery" told the
+ * operator an artificial intelligence had looked at the case and was called
+ * "orphan-recovery". Nothing had looked at it, which is the entire point of
+ * those two producers, and the panel said the opposite of the truth.
+ */
+function isModelVerdict(value: AiVerdict): boolean {
+  return value.model_kind === "local_warden" || value.model_kind === "local_classifier" || value.model_kind === "llm";
+}
+
+/** `needs_review` is our wire token. A person reads "Needs review". */
+function humanVerdict(verdict: string): string {
+  const words = verdict.replace(/[_-]+/g, " ").trim();
+  return words.charAt(0).toUpperCase() + words.slice(1);
+}
+
 // --- AI verdict: which model decided, local Warden vs cloud LLM.
 function AiVerdictSection({ value }: { value: AiVerdict }) {
   const isLocal = value.model_kind === "local_warden" || value.model_kind === "local_classifier";
-  const modelLabel = isLocal ? "Local Warden (on-device)" : value.model_kind === "llm" ? "Cloud LLM" : value.provider;
+
+  // No model ran. Say that, and keep the reason, which is the useful half.
+  if (!isModelVerdict(value)) {
+    return (
+      <section className={CARD} aria-label="Automated review">
+        <div className="flex flex-wrap items-start justify-between gap-2">
+          <p className={LABEL}>Automated review</p>
+          <Chip label="No model ran" tone="slate" />
+        </div>
+        {value.verdict && (
+          <dl className="mt-3 grid gap-3 sm:grid-cols-2">
+            <Field label="Outcome" value={humanVerdict(value.verdict)} />
+          </dl>
+        )}
+        {value.reason && <p className="mt-3 break-words text-sm leading-6 text-slate-700 [overflow-wrap:anywhere]">{value.reason}</p>}
+        <p className="mt-2 text-xs text-slate-400">No model classified this one, so there is no model opinion to weigh. What the system did about it is below.</p>
+      </section>
+    );
+  }
+
+  const modelLabel = isLocal ? "Local Warden (on-device)" : "Cloud LLM";
   return (
     <section className={CARD} aria-label="AI verdict">
       <div className="flex flex-wrap items-start justify-between gap-2">
@@ -225,7 +269,7 @@ function AiVerdictSection({ value }: { value: AiVerdict }) {
       </div>
       <dl className="mt-3 grid gap-3 sm:grid-cols-2">
         <Field label="Provider" value={value.provider} />
-        {value.verdict && <Field label="Verdict" value={value.verdict} />}
+        {value.verdict && <Field label="Verdict" value={humanVerdict(value.verdict)} />}
         {value.risk_score != null && <Field label="Risk score" value={String(value.risk_score)} />}
       </dl>
       {value.reason && <p className="mt-3 break-words text-sm leading-6 text-slate-700 [overflow-wrap:anywhere]">{value.reason}</p>}

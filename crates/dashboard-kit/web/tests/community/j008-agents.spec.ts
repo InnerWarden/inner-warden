@@ -73,7 +73,17 @@ test.describe("CJC-090-J008 conservative general agent discovery", () => {
     const hermes = agentCard(page, "Hermes");
     await expect(hermes).toContainText("CLI available on this PATH");
     await expect(hermes).toContainText("Runtime not confirmed");
-    await expect(hermes).toContainText("Eligibility unavailable");
     await expect(hermes).not.toContainText("Running process detected");
+
+    // Two registers, one screen. By default the card tells the reader what to
+    // DO ("Set up by hand"); the reason we cannot offer the automatic path is
+    // provenance, and it lives behind the switch. Both are asserted here, so
+    // neither register can drift: the plain one must never claim eligibility,
+    // and the technical one must still carry the exact reason.
+    await expect(hermes).toContainText("Set up by hand");
+    await expect(hermes).not.toContainText("Eligibility unavailable");
+    await page.getByRole("checkbox", { name: "Show technical detail" }).check();
+    await expect(hermes).toContainText("Eligibility unavailable");
+    await expect(hermes).not.toContainText("Eligible when enabled");
   });
 });
