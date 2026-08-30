@@ -82,6 +82,61 @@ fn detect_claude_code(on_path: bool, dir_configured: bool) -> bool {
 /// under a matcher that certainly includes Bash is replaced in place (and
 /// accidental duplicates are collapsed), so switching monitor/enforce never
 /// leaves an older enforcing hook active beside the new one.
+/// Idempotently install the `PostToolUse` half of the guard.
+///
+/// PreToolUse alone can only ever see the command. That is why the two-step
+/// attack worked: a value that arrived inside a file the agent READ is
+/// indistinguishable, at the moment of the next command, from one the operator
+/// typed. This hook is what carries tool RESULTS in, so the next command can be
+/// judged on where its arguments came from.
+///
+/// The matcher is `*` on purpose. The dangerous result is as likely to come
+/// from a web page, an MCP response or a grep as from a file read, and
+/// enumerating tool names here would leave the gap exactly where the next agent
+/// adds a tool.
+///
+/// This hook can never refuse anything: by the time it runs the tool has
+/// already run. It is pure observation, so unlike the PreToolUse merge there is
+/// no matcher-coverage or block-mode reasoning to get wrong.
+pub fn merge_posttooluse_hook(mut settings: Value, hook_command: &str) -> Value {
+    if !settings.is_object() {
+        settings = json!({});
+    }
+    let obj = settings.as_object_mut().expect("object");
+    let hooks = obj.entry("hooks").or_insert_with(|| json!({}));
+    if !hooks.is_object() {
+        *hooks = json!({});
+    }
+    let post = hooks
+        .as_object_mut()
+        .expect("object")
+        .entry("PostToolUse")
+        .or_insert_with(|| json!([]));
+    if !post.is_array() {
+        *post = json!([]);
+    }
+    let arr = post.as_array_mut().expect("array");
+
+    // Drop any previous InnerWarden PostToolUse hook wherever it sits, so a
+    // reinstall with a new binary path does not leave the old one behind. An
+    // entry whose hook list becomes empty is removed with it; operator hooks in
+    // the same entry are untouched.
+    arr.retain_mut(|entry| {
+        let Some(list) = entry.get_mut("hooks").and_then(Value::as_array_mut) else {
+            return true;
+        };
+        let was_empty = list.is_empty();
+        list.retain(|hook| !is_iwguard_hook(hook));
+        was_empty || !list.is_empty()
+    });
+
+    arr.push(json!({
+        "matcher": "*",
+        "hooks": [ { "type": "command", "command": hook_command } ]
+    }));
+    settings
+}
+
 pub fn merge_pretooluse_bash_hook(mut settings: Value, hook_command: &str) -> Value {
     if !settings.is_object() {
         settings = json!({});
@@ -320,6 +375,11 @@ fn install_hook_with_link_policy(
     let (block_review, monitor) = effective_mode.flags();
     let cmd = hook_command(iw_guard, block_review, monitor);
     let merged = merge_pretooluse_bash_hook(existing.clone(), &cmd);
+    // The observation half. Written with the SAME binary and the same mode
+    // flags, because a PostToolUse hook that points at a different build is a
+    // seam that drifts silently: it would keep feeding a store the screening
+    // half no longer reads.
+    let merged = merge_posttooluse_hook(merged, &cmd);
     // Automatic setup must not treat any recognised legacy hook as proof that
     // the requested wiring is already correct. Reconcile aliases, duplicate
     // entries and mode/path drift first; skip only an exact semantic no-op.
@@ -1559,5 +1619,67 @@ mod tests {
         let home = tempfile::TempDir::new().unwrap();
         let err = uninstall_hook(home.path(), "cursor", None).unwrap_err();
         assert!(err.contains("unsupported agent"));
+    }
+}
+
+#[cfg(test)]
+mod posttooluse_tests {
+    use super::*;
+
+    /// The observation half must be written, and written ONCE however many
+    /// times the install runs.
+    ///
+    /// FAILS ON REVERT: drop the `merge_posttooluse_hook` call from
+    /// `install_hook_with_link_policy` and no PostToolUse entry exists, so the
+    /// two-step defence is present in the binary and never invoked.
+    #[test]
+    fn the_observation_hook_is_written_once_and_stays_once() {
+        let once = merge_posttooluse_hook(json!({}), "\"/p/innerwarden\" hook");
+        let entries = once["hooks"]["PostToolUse"].as_array().expect("array");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0]["matcher"], "*",
+            "a result can come from any tool"
+        );
+
+        let twice = merge_posttooluse_hook(once.clone(), "\"/p/innerwarden\" hook");
+        assert_eq!(twice, once, "installing twice must not duplicate the hook");
+    }
+
+    /// A reinstall from a NEW path replaces the old entry rather than leaving
+    /// two, which would feed the store from a binary the screening half no
+    /// longer is.
+    #[test]
+    fn a_reinstall_from_a_new_path_replaces_rather_than_accumulates() {
+        let first = merge_posttooluse_hook(json!({}), "\"/old/innerwarden\" hook");
+        let second = merge_posttooluse_hook(first, "\"/new/innerwarden\" hook --block-review");
+        let entries = second["hooks"]["PostToolUse"].as_array().expect("array");
+        assert_eq!(entries.len(), 1, "exactly one InnerWarden observation hook");
+        let cmd = entries[0]["hooks"][0]["command"].as_str().unwrap_or("");
+        assert!(cmd.contains("/new/innerwarden"), "{cmd}");
+        assert!(!cmd.contains("/old/innerwarden"), "{cmd}");
+    }
+
+    /// Operator hooks in the same file are not ours to remove.
+    #[test]
+    fn an_operators_own_posttooluse_hook_survives() {
+        let existing = json!({
+            "hooks": {"PostToolUse": [
+                {"matcher": "Write", "hooks": [{"type": "command", "command": "/operator/audit"}]}
+            ]}
+        });
+        let merged = merge_posttooluse_hook(existing, "\"/p/innerwarden\" hook");
+        let entries = merged["hooks"]["PostToolUse"].as_array().expect("array");
+        let commands: Vec<&str> = entries
+            .iter()
+            .flat_map(|e| e["hooks"].as_array().cloned().unwrap_or_default())
+            .filter_map(|h| h["command"].as_str().map(str::to_string))
+            .map(|s| Box::leak(s.into_boxed_str()) as &str)
+            .collect();
+        assert!(
+            commands.iter().any(|c| c.contains("/operator/audit")),
+            "the operator's hook must survive: {commands:?}"
+        );
+        assert!(commands.iter().any(|c| c.contains("/p/innerwarden")));
     }
 }

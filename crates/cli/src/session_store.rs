@@ -70,28 +70,20 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// Record one screened call for `session` and return any behavioural alert.
+/// Record the values a TOOL RESULT carried into `session`.
 ///
-/// `None` when there is nothing to say, when no session id was supplied, or when
-/// the state could not be read or written. See the module note on why failure is
-/// silent.
-pub fn record_call(session: Option<&str>) -> Option<Alert> {
-    record_call_at(session, store_path())
+/// The PostToolUse half of the two-step defence. Same best-effort contract as
+/// [`record_call`]: it can never fail a tool call, because it runs after the
+/// tool already ran.
+pub fn record_tool_result(session: Option<&str>, tool: &str, result: &str) {
+    record_tool_result_at(session, tool, result, store_path());
 }
 
-/// [`record_call`] with the store path injected.
-///
-/// Tests used to point this at a temp file by setting `IW_SESSION_FILE`, which
-/// is process-global while cargo runs tests in parallel threads: one test could
-/// redirect another's writes, or leak the variable into a test that expected the
-/// real path. Injecting the path removes the shared mutable state instead of
-/// hoping the schedule is kind.
-fn record_call_at(session: Option<&str>, path: Option<PathBuf>) -> Option<Alert> {
-    let session = session?.trim();
-    if session.is_empty() {
-        return None;
-    }
-    let path = path?;
+fn record_tool_result_at(session: Option<&str>, tool: &str, result: &str, path: Option<PathBuf>) {
+    let Some(session) = session.map(str::trim).filter(|s| !s.is_empty()) else {
+        return;
+    };
+    let Some(path) = path else { return };
     let now = now_ms();
 
     let mut store: Store = std::fs::read_to_string(&path)
@@ -101,17 +93,70 @@ fn record_call_at(session: Option<&str>, path: Option<PathBuf>) -> Option<Alert>
 
     let entry = store.sessions.entry(session.to_string()).or_default();
     entry.last_seen_ms = now;
-    let alert = entry.state.record_call(now);
+    entry.state.record_tool_result(tool, result, now);
 
     prune(&mut store, now);
-
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     if let Ok(raw) = serde_json::to_string(&store) {
         let _ = write_private(&path, &raw);
     }
-    alert
+}
+
+/// Record one screened call AND report whether the command carries a value that
+/// arrived in an earlier tool result.
+///
+/// One function, because it is ONE read of the store. Asking these separately
+/// meant loading and parsing the whole file twice on every single tool call,
+/// and the hook is on the critical path of every one of them. That doubled cost
+/// was caught by `the_session_layer_really_ran_during_the_burst`: it asserts a
+/// burst counts above the per-minute threshold, `record_call` prunes anything
+/// older than 60 seconds, and the extra parse pushed the burst past the window
+/// under instrumentation so the count never rose. A latency canary, working.
+pub fn record_call_and_taint(
+    session: Option<&str>,
+    command: &str,
+) -> (Option<Alert>, Option<(String, String)>) {
+    record_call_and_taint_at(session, command, store_path())
+}
+
+fn record_call_and_taint_at(
+    session: Option<&str>,
+    command: &str,
+    path: Option<PathBuf>,
+) -> (Option<Alert>, Option<(String, String)>) {
+    let Some(session) = session.map(str::trim).filter(|s| !s.is_empty()) else {
+        return (None, None);
+    };
+    let Some(path) = path else {
+        return (None, None);
+    };
+    let now = now_ms();
+
+    let mut store: Store = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default();
+
+    let entry = store.sessions.entry(session.to_string()).or_default();
+    entry.last_seen_ms = now;
+    // Read the taint BEFORE recording the call, so the answer is about the state
+    // this command arrived into.
+    let tainted = entry
+        .state
+        .tainted_argument(command, now)
+        .map(|(v, t)| (v.to_string(), t.to_string()));
+    let alert = entry.state.record_call(now);
+
+    prune(&mut store, now);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(raw) = serde_json::to_string(&store) {
+        let _ = write_private(&path, &raw);
+    }
+    (alert, tainted)
 }
 
 /// Drop expired sessions, then the oldest ones if still over the cap.
@@ -174,7 +219,10 @@ mod tests {
         // Each iteration reads and writes the file exactly as a separate hook
         // process would.
         for _ in 0..=(innerwarden_agent_guard::session::NOTABLE_CALLS_PER_MINUTE + 1) {
-            if record_call_at(Some("sess-1"), Some(file.clone())).is_some() {
+            if record_call_and_taint_at(Some("sess-1"), "ls", Some(file.clone()))
+                .0
+                .is_some()
+            {
                 alerted = true;
             }
         }
@@ -189,8 +237,12 @@ mod tests {
     fn an_absent_or_blank_session_is_ignored() {
         let dir = tempfile::tempdir().expect("tempdir");
         let file = Some(dir.path().join("sessions.json"));
-        assert!(record_call_at(None, file.clone()).is_none());
-        assert!(record_call_at(Some("   "), file.clone()).is_none());
+        assert!(record_call_and_taint_at(None, "ls", file.clone())
+            .0
+            .is_none());
+        assert!(record_call_and_taint_at(Some("   "), "ls", file.clone())
+            .0
+            .is_none());
         assert!(
             !dir.path().join("sessions.json").exists(),
             "nothing to record means nothing written"

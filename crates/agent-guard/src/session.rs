@@ -255,6 +255,77 @@ pub struct PersistedSession {
     pub failures: u32,
     #[serde(default)]
     pub sensitive_accesses: Vec<String>,
+    /// Values that entered this session inside a TOOL RESULT, newest last.
+    ///
+    /// This is the state the two-step attack needs and the product did not have.
+    /// A value that arrives in something the agent READ (a file, a web page, an
+    /// issue comment, an MCP response) is attacker-influenced by default: the
+    /// agent did not choose it, the content did. When one of them reappears as
+    /// an argument in a later command, statelessly inspecting that command
+    /// cannot see anything wrong, because there is nothing wrong with the
+    /// command. The wrongness is in where the value came from.
+    #[serde(default)]
+    pub tainted_values: Vec<TaintedValue>,
+}
+
+/// One value carried in from a tool result, with when it arrived and what
+/// brought it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TaintedValue {
+    pub value: String,
+    /// The tool whose result carried it, for the operator-facing explanation.
+    pub source_tool: String,
+    pub seen_ms: i64,
+}
+
+/// How long a value stays tainted.
+///
+/// Long enough to cover a realistic multi-step task, short enough that a
+/// day-long session does not accumulate every host name it has ever read. The
+/// window is a product decision, not a security one: past it, the value is
+/// still suspicious, we just stop claiming to know where it came from.
+pub const TAINT_TTL_MS: i64 = 30 * 60 * 1000;
+
+/// Cap on remembered values, so a session that reads a large file cannot grow
+/// the state file without end.
+pub const MAX_TAINTED_VALUES: usize = 64;
+
+/// Pull the values worth remembering out of a tool result.
+///
+/// PURE. Deliberately narrow: hosts, IP literals, URLs and absolute paths are
+/// the things that become arguments. Prose is not extracted, because a rule
+/// that taints every word turns the next command into a false positive.
+///
+/// Short tokens are dropped: a two-character "value" would match inside almost
+/// any later command and the finding would be noise.
+pub fn extract_taintable_values(result: &str) -> Vec<String> {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(
+            r#"(?ix)
+              (?: https?://[^\s"'<>()]+ )                       # a URL
+            | (?: \b\d{1,3}(?:\.\d{1,3}){3} \b )                # an IPv4 literal
+            | (?: \b(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,} \b )  # a hostname
+            | (?: (?:^|\s) /(?:[\w.-]+/)*[\w.-]+ )              # an absolute path
+            "#,
+        )
+        .expect("static taintable value regex")
+    });
+    let mut out: Vec<String> = Vec::new();
+    for m in re.find_iter(result) {
+        let v = m.as_str().trim().trim_end_matches(['.', ',', ';', ':']);
+        // Too short to be distinctive: it would match inside unrelated commands.
+        if v.len() < 8 {
+            continue;
+        }
+        if !out.iter().any(|e: &String| e == v) {
+            out.push(v.to_string());
+        }
+        if out.len() >= MAX_TAINTED_VALUES {
+            break;
+        }
+    }
+    out
 }
 
 impl PersistedSession {
@@ -311,6 +382,54 @@ impl PersistedSession {
             layer: Layer::Warn,
             reason: format!("sensitive file: {path}"),
         })
+    }
+
+    /// Record the values a tool result carried into this session.
+    ///
+    /// `now_ms` is injected for the same reason the call window injects it: the
+    /// expiry has to be testable without sleeping.
+    pub fn record_tool_result(&mut self, tool: &str, result: &str, now_ms: i64) {
+        for value in extract_taintable_values(result) {
+            if let Some(existing) = self.tainted_values.iter_mut().find(|t| t.value == value) {
+                existing.seen_ms = now_ms;
+                continue;
+            }
+            self.tainted_values.push(TaintedValue {
+                value,
+                source_tool: tool.to_string(),
+                seen_ms: now_ms,
+            });
+        }
+        self.expire_taint(now_ms);
+    }
+
+    /// Drop values that have aged out, then bound the list.
+    pub fn expire_taint(&mut self, now_ms: i64) {
+        let cutoff = now_ms - TAINT_TTL_MS;
+        self.tainted_values.retain(|t| t.seen_ms > cutoff);
+        if self.tainted_values.len() > MAX_TAINTED_VALUES {
+            let drop = self.tainted_values.len() - MAX_TAINTED_VALUES;
+            self.tainted_values.drain(..drop);
+        }
+    }
+
+    /// Does this command carry a value that arrived in a tool result?
+    ///
+    /// The whole point of the two-step attack is that the answer to "is this
+    /// command dangerous" is NO. `scp build.tar.gz deploy@host:/opt/` is an
+    /// ordinary deployment. It stops being ordinary when the host came out of a
+    /// file the agent was asked to read, because then the destination was
+    /// chosen by whoever wrote that file.
+    ///
+    /// Returns the matched value and the tool that carried it, so the operator
+    /// is told WHERE it came from rather than just that something is wrong.
+    pub fn tainted_argument(&self, command: &str, now_ms: i64) -> Option<(&str, &str)> {
+        let cutoff = now_ms - TAINT_TTL_MS;
+        self.tainted_values
+            .iter()
+            .filter(|t| t.seen_ms > cutoff)
+            .find(|t| command.contains(&t.value))
+            .map(|t| (t.value.as_str(), t.source_tool.as_str()))
     }
 }
 
