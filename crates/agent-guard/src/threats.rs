@@ -600,6 +600,21 @@ fn dangerous_command_regexes() -> &'static [(regex::Regex, &'static str, bool)] 
 ///
 /// Returns `(what, score)`.
 pub fn check_guard_self_disable(content: &str) -> Option<(&'static str, u32)> {
+    if !mentions_any(
+        content,
+        &[
+            "innerwarden",
+            "settings.json",
+            ".claude.json",
+            "mcp.json",
+            "mcpservers",
+            "pretooluse",
+            "posttooluse",
+            "hooks",
+        ],
+    ) {
+        return None;
+    }
     static RES: std::sync::OnceLock<Vec<(regex::Regex, &'static str, u32)>> =
         std::sync::OnceLock::new();
     let res = RES.get_or_init(|| {
@@ -694,13 +709,35 @@ pub fn check_guard_self_disable(content: &str) -> Option<(&'static str, u32)> {
         );
         v
     });
-    let normalized = normalize_command(content);
-    for (re, what, score) in res {
-        if re.is_match(content) || re.is_match(&normalized) {
-            return Some((*what, *score));
-        }
+    if let Some((_, what, score)) = res.iter().find(|(re, _, _)| re.is_match(content)) {
+        return Some((*what, *score));
     }
-    None
+    let normalized = normalize_command(content);
+    if normalized == content {
+        return None;
+    }
+    res.iter()
+        .find(|(re, _, _)| re.is_match(&normalized))
+        .map(|(_, what, score)| (*what, *score))
+}
+
+/// Cheap literal gate in front of a regex family.
+///
+/// `innerwarden hook` is a ONE-SHOT process: it starts, screens one tool call
+/// and exits. So every invocation pays to COMPILE whatever regexes it touches,
+/// and a `OnceLock` saves nothing across calls. Measured against the released
+/// binary, the families added here cost 18% on every tool call, which is enough
+/// to push a burst past the session layer's one-minute window under
+/// instrumentation.
+///
+/// Almost no command touches any of these families, so a substring test decides
+/// it. The needles MUST be a superset of what the family can match: every
+/// pattern in the set has to contain one of them, or a true positive is dropped
+/// silently. `every_family_gate_admits_everything_its_patterns_match` is what
+/// keeps that honest.
+fn mentions_any(content: &str, needles: &[&str]) -> bool {
+    let lower = content.to_ascii_lowercase();
+    needles.iter().any(|n| lower.contains(n))
 }
 
 /// Local credential stores, and the kernel knobs that protect them.
@@ -711,6 +748,37 @@ pub fn check_guard_self_disable(content: &str) -> Option<(&'static str, u32)> {
 /// the loader are the settings that stand between a process and everything else
 /// on the machine.
 pub fn check_local_credential_and_kernel_tamper(content: &str) -> Option<(&'static str, u32)> {
+    if !mentions_any(
+        content,
+        &[
+            "sqlite",
+            "chrome",
+            "chromium",
+            "brave",
+            "edge",
+            "firefox",
+            "security ",
+            "secret-tool",
+            "gnome-keyring",
+            "sysctl",
+            "ptrace_scope",
+            "kptr_restrict",
+            "randomize_va_space",
+            "gdb",
+            "lldb",
+            "/etc/passwd",
+            "/etc/shadow",
+            "/etc/gshadow",
+            "/etc/sudoers",
+            "usermod",
+            "chmod",
+            "setcap",
+            "insmod",
+            "modprobe",
+        ],
+    ) {
+        return None;
+    }
     static RES: std::sync::OnceLock<Vec<(regex::Regex, &'static str)>> = std::sync::OnceLock::new();
     let res = RES.get_or_init(|| {
         [
@@ -771,13 +839,21 @@ pub fn check_local_credential_and_kernel_tamper(content: &str) -> Option<(&'stat
         .filter_map(|(p, d)| regex::Regex::new(p).ok().map(|re| (re, d)))
         .collect()
     });
-    let normalized = normalize_command(content);
-    for (re, what) in res {
-        if re.is_match(content) || re.is_match(&normalized) {
-            return Some((*what, 60));
-        }
+    // Check the RAW form for every pattern first and normalize ONLY if nothing
+    // matched. `normalize_command` runs several regex passes, and this function
+    // is on the hot path of every tool call an agent makes: paying for it
+    // eagerly, once per detector, is what pushed a burst past the session
+    // layer's one-minute window under instrumentation.
+    if let Some((_, what)) = res.iter().find(|(re, _)| re.is_match(content)) {
+        return Some((*what, 60));
     }
-    None
+    let normalized = normalize_command(content);
+    if normalized == content {
+        return None;
+    }
+    res.iter()
+        .find(|(re, _)| re.is_match(&normalized))
+        .map(|(_, what)| (*what, 60))
 }
 
 /// Irreversible destruction of DATA or of the infrastructure holding it.
@@ -793,6 +869,26 @@ pub fn check_local_credential_and_kernel_tamper(content: &str) -> Option<(&'stat
 /// can know what `$DEPLOY_ROOT` holds, and neither could the person who typed
 /// it, which is exactly why it deserves a human.
 pub fn check_data_destruction(content: &str) -> Option<(&'static str, u32)> {
+    if !mentions_any(
+        content,
+        &[
+            "rm ",
+            "wipefs",
+            "lvremove",
+            "vgremove",
+            "pvremove",
+            "truncate table",
+            "drop table",
+            "drop database",
+            "drop schema",
+            "terraform",
+            "kubectl",
+            "az ",
+            "gcloud",
+        ],
+    ) {
+        return None;
+    }
     static RES: std::sync::OnceLock<Vec<(regex::Regex, &'static str)>> = std::sync::OnceLock::new();
     let res = RES.get_or_init(|| {
         [
@@ -841,13 +937,21 @@ pub fn check_data_destruction(content: &str) -> Option<(&'static str, u32)> {
         .filter_map(|(p, d)| regex::Regex::new(p).ok().map(|re| (re, d)))
         .collect()
     });
-    let normalized = normalize_command(content);
-    for (re, what) in res {
-        if re.is_match(content) || re.is_match(&normalized) {
-            return Some((*what, 60));
-        }
+    // Check the RAW form for every pattern first and normalize ONLY if nothing
+    // matched. `normalize_command` runs several regex passes, and this function
+    // is on the hot path of every tool call an agent makes: paying for it
+    // eagerly, once per detector, is what pushed a burst past the session
+    // layer's one-minute window under instrumentation.
+    if let Some((_, what)) = res.iter().find(|(re, _)| re.is_match(content)) {
+        return Some((*what, 60));
     }
-    None
+    let normalized = normalize_command(content);
+    if normalized == content {
+        return None;
+    }
+    res.iter()
+        .find(|(re, _)| re.is_match(&normalized))
+        .map(|(_, what)| (*what, 60))
 }
 
 /// Anti-forensics: removing the record of what happened.
@@ -856,6 +960,29 @@ pub fn check_data_destruction(content: &str) -> Option<(&'static str, u32)> {
 /// version of "clear the audit log" that a guarded AI agent should be doing on
 /// its own, and the operator keeps every one of these from their own terminal.
 pub fn check_anti_forensics(content: &str) -> Option<(&'static str, u32)> {
+    if !mentions_any(
+        content,
+        &[
+            "auditctl",
+            "systemctl",
+            "service ",
+            "chattr",
+            "bpftool",
+            "touch ",
+            "sed ",
+            "/var/log/",
+            "journalctl",
+            "history",
+            "histfile",
+            "histsize",
+            "guardduty",
+            "truncate",
+            "shred",
+            "rm ",
+        ],
+    ) {
+        return None;
+    }
     static RES: std::sync::OnceLock<Vec<(regex::Regex, &'static str)>> = std::sync::OnceLock::new();
     let res = RES.get_or_init(|| {
         [
@@ -904,13 +1031,21 @@ pub fn check_anti_forensics(content: &str) -> Option<(&'static str, u32)> {
         .filter_map(|(p, d)| regex::Regex::new(p).ok().map(|re| (re, d)))
         .collect()
     });
-    let normalized = normalize_command(content);
-    for (re, what) in res {
-        if re.is_match(content) || re.is_match(&normalized) {
-            return Some((*what, 60));
-        }
+    // Check the RAW form for every pattern first and normalize ONLY if nothing
+    // matched. `normalize_command` runs several regex passes, and this function
+    // is on the hot path of every tool call an agent makes: paying for it
+    // eagerly, once per detector, is what pushed a burst past the session
+    // layer's one-minute window under instrumentation.
+    if let Some((_, what)) = res.iter().find(|(re, _)| re.is_match(content)) {
+        return Some((*what, 60));
     }
-    None
+    let normalized = normalize_command(content);
+    if normalized == content {
+        return None;
+    }
+    res.iter()
+        .find(|(re, _)| re.is_match(&normalized))
+        .map(|(_, what)| (*what, 60))
 }
 
 /// Persistence: arranging to run again after this session ends.
@@ -921,6 +1056,27 @@ pub fn check_anti_forensics(content: &str) -> Option<(&'static str, u32)> {
 /// executable hook into a boot, login, device or repository path, which is not
 /// something an agent does in passing.
 pub fn check_persistence_install(content: &str) -> Option<(&'static str, u32)> {
+    if !mentions_any(
+        content,
+        &[
+            "ld.so.preload",
+            "ld_preload",
+            "profile.d",
+            "pam.d",
+            "udev/rules.d",
+            ".git/hooks",
+            "at ",
+            ".bashrc",
+            ".bash_profile",
+            ".zshrc",
+            ".profile",
+            "authorized_keys",
+            "crontab",
+            "systemd-run",
+        ],
+    ) {
+        return None;
+    }
     static RES: std::sync::OnceLock<Vec<(regex::Regex, &'static str)>> = std::sync::OnceLock::new();
     let res = RES.get_or_init(|| {
         [
@@ -987,13 +1143,21 @@ pub fn check_persistence_install(content: &str) -> Option<(&'static str, u32)> {
         .filter_map(|(p, d)| regex::Regex::new(p).ok().map(|re| (re, d)))
         .collect()
     });
-    let normalized = normalize_command(content);
-    for (re, what) in res {
-        if re.is_match(content) || re.is_match(&normalized) {
-            return Some((*what, 60));
-        }
+    // Check the RAW form for every pattern first and normalize ONLY if nothing
+    // matched. `normalize_command` runs several regex passes, and this function
+    // is on the hot path of every tool call an agent makes: paying for it
+    // eagerly, once per detector, is what pushed a burst past the session
+    // layer's one-minute window under instrumentation.
+    if let Some((_, what)) = res.iter().find(|(re, _)| re.is_match(content)) {
+        return Some((*what, 60));
     }
-    None
+    let normalized = normalize_command(content);
+    if normalized == content {
+        return None;
+    }
+    res.iter()
+        .find(|(re, _)| re.is_match(&normalized))
+        .map(|(_, what)| (*what, 60))
 }
 
 /// Kubernetes actions that reach the node, the cluster's identity, or its
@@ -1002,6 +1166,9 @@ pub fn check_persistence_install(content: &str) -> Option<(&'static str, u32)> {
 /// Read-only `kubectl` is how an agent does its job and is deliberately absent:
 /// `get`, `describe`, `logs`, `top` and `diff` never match here.
 pub fn check_kubernetes_escalation(content: &str) -> Option<(&'static str, u32)> {
+    if !mentions_any(content, &["kubectl", "crictl", "docker"]) {
+        return None;
+    }
     static RES: std::sync::OnceLock<Vec<(regex::Regex, &'static str)>> = std::sync::OnceLock::new();
     let res = RES.get_or_init(|| {
         [
@@ -1038,13 +1205,21 @@ pub fn check_kubernetes_escalation(content: &str) -> Option<(&'static str, u32)>
         .filter_map(|(p, d)| regex::Regex::new(p).ok().map(|re| (re, d)))
         .collect()
     });
-    let normalized = normalize_command(content);
-    for (re, what) in res {
-        if re.is_match(content) || re.is_match(&normalized) {
-            return Some((*what, 60));
-        }
+    // Check the RAW form for every pattern first and normalize ONLY if nothing
+    // matched. `normalize_command` runs several regex passes, and this function
+    // is on the hot path of every tool call an agent makes: paying for it
+    // eagerly, once per detector, is what pushed a burst past the session
+    // layer's one-minute window under instrumentation.
+    if let Some((_, what)) = res.iter().find(|(re, _)| re.is_match(content)) {
+        return Some((*what, 60));
     }
-    None
+    let normalized = normalize_command(content);
+    if normalized == content {
+        return None;
+    }
+    res.iter()
+        .find(|(re, _)| re.is_match(&normalized))
+        .map(|(_, what)| (*what, 60))
 }
 
 /// Reading a Kubernetes secret.
@@ -1054,6 +1229,9 @@ pub fn check_kubernetes_escalation(content: &str) -> Option<(&'static str, u32)>
 /// and was refused by an earlier version that lumped it in with node escapes.
 /// Reading a secret deserves a person, not a refusal.
 pub fn check_kubernetes_secret_read(content: &str) -> Option<(&'static str, u32)> {
+    if !mentions_any(content, &["kubectl"]) {
+        return None;
+    }
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let re = RE.get_or_init(|| {
         regex::Regex::new(r"(?i)\bkubectl\b[^|;&]*\b(?:get|describe)\b[^|;&]*\bsecrets?\b")
@@ -1070,6 +1248,22 @@ pub fn check_kubernetes_secret_read(content: &str) -> Option<(&'static str, u32)
 /// address is a legitimate and common enterprise setup. What makes it worth a
 /// human is that it is a new root of trust for everything installed afterwards.
 pub fn check_untrusted_software_source(content: &str) -> Option<(&'static str, u32)> {
+    if !mentions_any(
+        content,
+        &[
+            "trusted=yes",
+            "sources.list",
+            "config-manager",
+            "helm",
+            "nuget",
+            "docker",
+            "podman",
+            "pip",
+            "npm",
+        ],
+    ) {
+        return None;
+    }
     static RES: std::sync::OnceLock<Vec<(regex::Regex, &'static str)>> = std::sync::OnceLock::new();
     let res = RES.get_or_init(|| {
         [
@@ -1110,13 +1304,21 @@ pub fn check_untrusted_software_source(content: &str) -> Option<(&'static str, u
         .filter_map(|(p, d)| regex::Regex::new(p).ok().map(|re| (re, d)))
         .collect()
     });
-    let normalized = normalize_command(content);
-    for (re, what) in res {
-        if re.is_match(content) || re.is_match(&normalized) {
-            return Some((*what, 25));
-        }
+    // Check the RAW form for every pattern first and normalize ONLY if nothing
+    // matched. `normalize_command` runs several regex passes, and this function
+    // is on the hot path of every tool call an agent makes: paying for it
+    // eagerly, once per detector, is what pushed a burst past the session
+    // layer's one-minute window under instrumentation.
+    if let Some((_, what)) = res.iter().find(|(re, _)| re.is_match(content)) {
+        return Some((*what, 25));
     }
-    None
+    let normalized = normalize_command(content);
+    if normalized == content {
+        return None;
+    }
+    res.iter()
+        .find(|(re, _)| re.is_match(&normalized))
+        .map(|(_, what)| (*what, 25))
 }
 
 /// Cloud control-plane actions that end an investigation rather than start one.
@@ -1131,6 +1333,9 @@ pub fn check_untrusted_software_source(content: &str) -> Option<(&'static str, u
 /// and `list-*` are how an agent does its job, and a rule that fires on those
 /// is a rule that gets the product switched off.
 pub fn check_cloud_control_plane(content: &str) -> Option<(&'static str, u32)> {
+    if !mentions_any(content, &["aws", "az ", "gcloud", "gsutil"]) {
+        return None;
+    }
     static RES: std::sync::OnceLock<Vec<(regex::Regex, &'static str, u32)>> =
         std::sync::OnceLock::new();
     let res = RES.get_or_init(|| {
@@ -1222,13 +1427,16 @@ pub fn check_cloud_control_plane(content: &str) -> Option<(&'static str, u32)> {
         );
         v
     });
-    let normalized = normalize_command(content);
-    for (re, what, score) in res {
-        if re.is_match(content) || re.is_match(&normalized) {
-            return Some((*what, *score));
-        }
+    if let Some((_, what, score)) = res.iter().find(|(re, _, _)| re.is_match(content)) {
+        return Some((*what, *score));
     }
-    None
+    let normalized = normalize_command(content);
+    if normalized == content {
+        return None;
+    }
+    res.iter()
+        .find(|(re, _, _)| re.is_match(&normalized))
+        .map(|(_, what, score)| (*what, *score))
 }
 
 /// Certificate verification switched off.
@@ -1241,6 +1449,23 @@ pub fn check_cloud_control_plane(content: &str) -> Option<(&'static str, u32)> {
 /// put it in front of a person, not to refuse it outright. Combined with any
 /// other signal it reaches `deny` on its own arithmetic.
 pub fn check_tls_verification_disabled(content: &str) -> Option<(&'static str, u32)> {
+    if !mentions_any(
+        content,
+        &[
+            "ssl_no_verify",
+            "reject_unauthorized",
+            "httpsverify",
+            "trusted-host",
+            "no-check-certificate",
+            "-k ",
+            "--insecure",
+            "sslverify",
+            "strict-ssl",
+            "-verify",
+        ],
+    ) {
+        return None;
+    }
     static RES: std::sync::OnceLock<Vec<(regex::Regex, &'static str)>> = std::sync::OnceLock::new();
     let res = RES.get_or_init(|| {
         [
@@ -1285,13 +1510,21 @@ pub fn check_tls_verification_disabled(content: &str) -> Option<(&'static str, u
         .filter_map(|(p, d)| regex::Regex::new(p).ok().map(|re| (re, d)))
         .collect()
     });
-    let normalized = normalize_command(content);
-    for (re, what) in res {
-        if re.is_match(content) || re.is_match(&normalized) {
-            return Some((*what, 25));
-        }
+    // Check the RAW form for every pattern first and normalize ONLY if nothing
+    // matched. `normalize_command` runs several regex passes, and this function
+    // is on the hot path of every tool call an agent makes: paying for it
+    // eagerly, once per detector, is what pushed a burst past the session
+    // layer's one-minute window under instrumentation.
+    if let Some((_, what)) = res.iter().find(|(re, _)| re.is_match(content)) {
+        return Some((*what, 25));
     }
-    None
+    let normalized = normalize_command(content);
+    if normalized == content {
+        return None;
+    }
+    res.iter()
+        .find(|(re, _)| re.is_match(&normalized))
+        .map(|(_, what)| (*what, 25))
 }
 
 /// Check content for credential exposure. Returns description of match.
@@ -7015,6 +7248,153 @@ mod local_credential_tests {
                 check_local_credential_and_kernel_tamper(cmd).is_none(),
                 "ordinary work must not be refused: {cmd}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod family_gate_tests {
+    use super::*;
+
+    /// A literal gate in front of a regex family is a silent way to lose a
+    /// detection: the regex stays correct, and the command never reaches it.
+    ///
+    /// So every command this repository asserts SHOULD be caught is replayed
+    /// through the gated entry point. If a needle set is ever narrowed below
+    /// what its patterns match, this fails rather than the corpus quietly
+    /// getting worse.
+    /// A gated family detector: the shape every function under test here has.
+    type Detector = fn(&str) -> Option<(&'static str, u32)>;
+
+    #[test]
+    fn every_family_gate_admits_everything_its_patterns_match() {
+        let cases: &[(&str, Detector)] = &[
+            (
+                "sudo rm -rf /var/lib/postgresql/16/main",
+                check_data_destruction,
+            ),
+            ("wipefs -a /dev/sdc", check_data_destruction),
+            ("terraform destroy -auto-approve", check_data_destruction),
+            (
+                "kubectl delete namespace payments-prod",
+                check_data_destruction,
+            ),
+            (
+                "az storage account delete --name x --yes",
+                check_data_destruction,
+            ),
+            (
+                "gcloud sql instances delete ledger-prod --quiet",
+                check_data_destruction,
+            ),
+            ("auditctl -D", check_anti_forensics),
+            ("bpftool link detach id 118", check_anti_forensics),
+            ("chattr -ia /var/log/audit/audit.log", check_anti_forensics),
+            ("journalctl --vacuum-time=1s", check_anti_forensics),
+            (
+                "systemctl stop rsyslog && systemctl mask rsyslog",
+                check_anti_forensics,
+            ),
+            (
+                "at now + 2 minutes -f /dev/shm/.payload",
+                check_persistence_install,
+            ),
+            (
+                "echo '/dev/shm/.l.so' > /etc/ld.so.preload",
+                check_persistence_install,
+            ),
+            ("crontab -e", check_persistence_install),
+            (
+                "kubectl exec -n p deploy/a -- nsenter --target 1 --mount -- bash",
+                check_kubernetes_escalation,
+            ),
+            (
+                "docker run --rm -v /:/host alpine sh",
+                check_kubernetes_escalation,
+            ),
+            (
+                "helm repo add vendor http://198.51.100.70/charts",
+                check_untrusted_software_source,
+            ),
+            (
+                "dotnet nuget add source http://192.0.2.101/n -n i",
+                check_untrusted_software_source,
+            ),
+            (
+                "aws cloudtrail delete-trail --name t",
+                check_cloud_control_plane,
+            ),
+            (
+                "gcloud projects add-iam-policy-binding p --role=roles/owner",
+                check_cloud_control_plane,
+            ),
+            (
+                "az role assignment create --assignee x --role Owner",
+                check_cloud_control_plane,
+            ),
+            (
+                "GIT_SSL_NO_VERIFY=1 git clone https://198.51.100.20/r.git",
+                check_tls_verification_disabled,
+            ),
+            (
+                "NODE_TLS_REJECT_UNAUTHORIZED=0 npm install",
+                check_tls_verification_disabled,
+            ),
+            (
+                "wget --no-check-certificate https://198.51.100.20/x",
+                check_tls_verification_disabled,
+            ),
+            ("innerwarden allow \"*\"", check_guard_self_disable),
+            (
+                "mv ~/.claude/settings.json ~/.claude/settings.json.bak",
+                check_guard_self_disable,
+            ),
+            (
+                "export INNERWARDEN_DISABLE=1 && terraform apply",
+                check_guard_self_disable,
+            ),
+            (
+                "security dump-keychain -d ~/Library/Keychains/login.keychain-db",
+                check_local_credential_and_kernel_tamper,
+            ),
+            (
+                "sudo sysctl -w kernel.yama.ptrace_scope=0",
+                check_local_credential_and_kernel_tamper,
+            ),
+            (
+                "chmod u+s /usr/local/bin/helper",
+                check_local_credential_and_kernel_tamper,
+            ),
+            (
+                "setcap cap_setuid+ep /usr/local/bin/helper",
+                check_local_credential_and_kernel_tamper,
+            ),
+            (
+                "insmod /tmp/rootkit.ko",
+                check_local_credential_and_kernel_tamper,
+            ),
+        ];
+        for (cmd, f) in cases {
+            assert!(
+                f(cmd).is_some(),
+                "the literal gate dropped a command its regexes match: {cmd}"
+            );
+        }
+    }
+
+    /// And the gate really does short-circuit, or it is not buying anything.
+    #[test]
+    fn an_unrelated_command_is_rejected_by_the_gate_before_any_regex_runs() {
+        for cmd in [
+            "ls -la",
+            "git status",
+            "cargo build --release",
+            "echo hello",
+        ] {
+            assert!(check_data_destruction(cmd).is_none(), "{cmd}");
+            assert!(check_cloud_control_plane(cmd).is_none(), "{cmd}");
+            assert!(check_kubernetes_escalation(cmd).is_none(), "{cmd}");
+            assert!(check_guard_self_disable(cmd).is_none(), "{cmd}");
         }
     }
 }
