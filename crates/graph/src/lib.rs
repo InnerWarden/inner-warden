@@ -1089,7 +1089,8 @@ impl Graph {
             .map(|s| s.id.strip_prefix("session:").unwrap_or(&s.id))
             .collect();
         let mut recovered: Vec<Node> = Vec::new();
-        let mut seen_recovered: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut seen_recovered: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         for node in &self.nodes {
             if node.kind != "command" {
                 continue;
@@ -1741,10 +1742,18 @@ mod tests {
         let mut g = Graph::default();
         // Session first, exactly as the real ingest does it, then commands.
         for seq in 0..40usize {
-            g.ingest_verdict("s1", seq, &format!("cmd {seq}"), &json!({"recommendation": "allow"}));
+            g.ingest_verdict(
+                "s1",
+                seq,
+                &format!("cmd {seq}"),
+                &json!({"recommendation": "allow"}),
+            );
         }
         let before = g.cases_page(None, None, None, 0, 100);
-        assert_eq!(before.total_commands, 40, "precondition: all 40 are reachable");
+        assert_eq!(
+            before.total_commands, 40,
+            "precondition: all 40 are reachable"
+        );
 
         // Prune hard enough to reach the session anchor at the front.
         g.drop_oldest(30);
@@ -1771,7 +1780,12 @@ mod tests {
     fn commands_are_found_even_when_their_edge_is_gone() {
         let mut g = Graph::default();
         for seq in 0..10usize {
-            g.ingest_verdict("s1", seq, &format!("cmd {seq}"), &json!({"recommendation": "allow"}));
+            g.ingest_verdict(
+                "s1",
+                seq,
+                &format!("cmd {seq}"),
+                &json!({"recommendation": "allow"}),
+            );
         }
         // Simulate the damage already on disk: the anchor's edges are gone but
         // the command nodes remain.
@@ -1798,7 +1812,12 @@ mod tests {
     fn a_session_whose_anchor_was_pruned_is_still_listed() {
         let mut g = Graph::default();
         for seq in 0..12usize {
-            g.ingest_verdict("ghost", seq, &format!("cmd {seq}"), &json!({"recommendation": "allow"}));
+            g.ingest_verdict(
+                "ghost",
+                seq,
+                &format!("cmd {seq}"),
+                &json!({"recommendation": "allow"}),
+            );
         }
         // The exact damage: the anchor is gone, the commands remain, and the
         // agent never ran again to recreate it.
@@ -1811,7 +1830,10 @@ mod tests {
             "commands whose session node is gone must still be reachable, or \
              they are counted everywhere and listed nowhere"
         );
-        assert_eq!(page.total_sessions, 1, "the session is rebuilt from the ids");
+        assert_eq!(
+            page.total_sessions, 1,
+            "the session is rebuilt from the ids"
+        );
     }
 
     #[test]
