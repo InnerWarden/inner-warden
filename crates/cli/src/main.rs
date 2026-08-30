@@ -620,19 +620,19 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
     let source_session = hook_session(&buf);
     let source_event_id = hook_event_id(&buf);
 
-    // The other half of the two-step defence: is one of this command's
-    // arguments a value that arrived in an earlier tool result?
-    let tainted = session_store::tainted_argument(source_session.as_deref(), &command);
-    let verdict = apply_taint(verdict, tainted.as_ref());
-
     // Behavioural layer: a burst of calls, or repeated sensitive reads, is only
     // visible ACROSS invocations. `agent-guard` has always had the logic; this
     // binary could not use it because the hook is a one-shot process and the
     // tracker held `Instant`s. `session_store` persists it, keyed by the session
     // id the agent already sends us. Best-effort by design: it never blocks a
     // tool call on its own, it raises the score so the existing policy decides.
-    let behaviour = session_store::record_call(source_session.as_deref());
+    // ONE read of the session store answers both questions: the behavioural
+    // burst AND whether an argument arrived in an earlier tool result. They were
+    // two reads, which doubled the work on the hot path of every tool call.
+    let (behaviour, tainted) =
+        session_store::record_call_and_taint(source_session.as_deref(), &command);
     let verdict = apply_behaviour(verdict, behaviour.as_ref());
+    let verdict = apply_taint(verdict, tainted.as_ref());
 
     // Record EVERY screened command into the narrative graph (allow AND deny).
     // Persist recommendation and real outcome separately: monitor records a deny
