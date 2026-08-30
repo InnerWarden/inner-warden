@@ -110,3 +110,63 @@ describe("the payload contract", () => {
     expect(() => parseUnifiedCase(bogus)).toThrow();
   });
 });
+
+/**
+ * THE LIE THE PRODUCT TOLD 17488 TIMES.
+ *
+ * `awaiting_human` is the most common execution result on a live host: an
+ * action the product decided on and queued for a person. The projector turns it
+ * into lifecycle `pending` with outcome `not_observed`, and both halves are
+ * true on their own. Rendered together they said "Never happened" and "There is
+ * no record of this happening" over work that was sitting in the operator's
+ * queue, which is the exact opposite of what he needed to read.
+ *
+ * The lifecycle was already on the wire and this component already received the
+ * timeline and ignored it, so the fix reads what was there. It must NOT be
+ * "anything not observed is pending": only a lifecycle that explicitly says
+ * pending changes the words, and the machine-readable `status` keeps the wire
+ * value so nothing downstream starts seeing an outcome the host never sent.
+ *
+ * FAILS ON REVERT: drop the pending branch from `verifiedOutcomePresentation`
+ * and the label goes back to "Never happened".
+ */
+describe("an action queued for a person", () => {
+  const queued = (lifecycle: string | null) => ({
+    outcome: {
+      outcome: "not_observed",
+      mode: "enforce",
+      actual_denial_or_containment_occurred: false,
+      verification_status: "not_applicable",
+      verifier: null,
+      verified_at: null,
+      effective_scope: [],
+      evidence: [],
+      enforcement_attempt_id: null,
+      trust: "recorded",
+      trust_explanation: "Recorded by the host.",
+    } as unknown as VerifiedOutcome,
+    timeline: [{ action_lifecycle: lifecycle }] as never,
+  });
+
+  it("says it is waiting for you, not that it never happened", () => {
+    const { outcome, timeline } = queued("pending");
+    const presentation = verifiedOutcomePresentation(outcome, timeline, "2026-08-30T00:00:00Z");
+    expect(presentation.label).toBe("Waiting for you");
+    expect(presentation.label).not.toBe("Never happened");
+    expect(presentation.meaning).not.toContain("no record of this happening");
+    expect(presentation.tone).toBe("attention");
+  });
+
+  it("keeps the wire value in status, so downstream sees what the host sent", () => {
+    const { outcome, timeline } = queued("pending");
+    expect(verifiedOutcomePresentation(outcome, timeline, "2026-08-30T00:00:00Z").status).toBe("not_observed");
+  });
+
+  it("does not relabel a genuine not_observed that nobody is waiting on", () => {
+    for (const lifecycle of [null, "rejected", "applied"]) {
+      const { outcome, timeline } = queued(lifecycle);
+      const presentation = verifiedOutcomePresentation(outcome, timeline, "2026-08-30T00:00:00Z");
+      expect(presentation.label, `lifecycle ${lifecycle} must not be read as queued`).toBe("Never happened");
+    }
+  });
+});

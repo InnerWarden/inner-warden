@@ -32,6 +32,8 @@ const scope = {
   verification: "host_verified",
   evidence: [evidence],
 };
+// The count is flat on a SUMMARY and nested under `recurrence` on a DETAIL, so
+// a detail payload is built from `detailShape` and never by spreading this.
 const summary = {
   id: "case-1",
   title: "Fixture case",
@@ -39,8 +41,15 @@ const summary = {
   status: "needs_review",
   scope: [scope],
   latest_event_at: at,
+  recurrence_occurrences: "1",
   outcome: "unknown",
 };
+
+/** The summary minus the fields that only exist on a summary. */
+function detailShape() {
+  const { recurrence_occurrences: _flatCount, ...rest } = summary;
+  return rest;
+}
 
 describe("C0 case projections", () => {
   it("parses only a bounded cursor page", () => {
@@ -58,7 +67,7 @@ describe("C0 case projections", () => {
 
   it("does not derive a verified outcome from workflow status or decision text", () => {
     const parsed = parseUnifiedCase({
-      ...summary,
+      ...detailShape(),
       status: "contained",
       schema_version: "innerwarden.dashboard.v1",
       identity: { subject_ids: ["agent:fixture"], confidence: "declared", evidence: [] },

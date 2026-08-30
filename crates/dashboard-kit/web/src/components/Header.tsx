@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import { TechnicalDetailToggle } from "./TechnicalDetail";
 import logo from "../assets/logo.svg";
 
 export type HeaderNavigationItem<Route extends string> = {
@@ -65,7 +66,14 @@ export function Header<Route extends string>({
           </nav>
         ) : null}
 
-        <div className="ml-auto flex items-center gap-2 text-xs">{status}</div>
+        {/* The switch lives here, next to the status, because that is where
+          * someone looks when they want to know more about what they are being
+          * told. Off by default: the plain answer is the one a buyer needs, and
+          * the evidence is for whoever asks for it. */}
+        <div className="ml-auto flex items-center gap-3 text-xs">
+          <TechnicalDetailToggle />
+          {status}
+        </div>
       </div>
     </header>
   );

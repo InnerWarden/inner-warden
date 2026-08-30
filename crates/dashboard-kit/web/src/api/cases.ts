@@ -41,6 +41,9 @@ export type CaseSummary = {
   status: CaseStatus;
   scope: ScopeRef[];
   latest_event_at: string;
+  /// How many times this same finding has been seen. Decimal string, like every
+  /// u64 on this contract.
+  recurrence_occurrences: string;
   outcome: SecurityOutcome;
 };
 
@@ -266,6 +269,18 @@ function object(value: unknown, path: string): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
+/**
+ * A count the host sends as a decimal STRING, so a u64 cannot lose precision on
+ * the way through JSON. Same rule the case detail already applied to
+ * `recurrence.occurrences`, lifted here so the summary and the detail cannot
+ * disagree about what a valid count looks like.
+ */
+function positiveDecimal(value: unknown, path: string): string {
+  const text = string(value, path, 1, 128);
+  if (!/^[1-9][0-9]*$/.test(text)) throw new Error(`${path}: expected positive decimal string`);
+  return text;
+}
+
 function exact(item: Record<string, unknown>, allowed: readonly string[], path: string): void {
   const extras = Object.keys(item).filter((key) => !allowed.includes(key));
   if (extras.length > 0) throw new Error(`${path}: unexpected field ${extras[0]}`);
@@ -307,7 +322,7 @@ function boolean(value: unknown, path: string): boolean {
 
 function caseSummary(value: unknown, path: string): CaseSummary {
   const item = object(value, path);
-  exact(item, ["id", "title", "severity", "status", "scope", "latest_event_at", "outcome"], path);
+  exact(item, ["id", "title", "severity", "status", "scope", "latest_event_at", "recurrence_occurrences", "outcome"], path);
   return {
     id: string(item.id, `${path}.id`, 1, 256),
     title: string(item.title, `${path}.title`, 1, 1_024),
@@ -315,6 +330,9 @@ function caseSummary(value: unknown, path: string): CaseSummary {
     status: oneOf(item.status, STATUSES, `${path}.status`),
     scope: array(item.scope, `${path}.scope`, parseScopeRef, 100),
     latest_event_at: dateTime(item.latest_event_at, `${path}.latest_event_at`),
+    // Sent on the summary so the list can answer instead of telling the reader
+    // to open the case and find out.
+    recurrence_occurrences: positiveDecimal(item.recurrence_occurrences, `${path}.recurrence_occurrences`),
     outcome: oneOf(item.outcome, OUTCOMES, `${path}.outcome`),
   };
 }
@@ -452,6 +470,10 @@ export function parseUnifiedCase(value: unknown): UnifiedCase {
     status: item.status,
     scope: item.scope,
     latest_event_at: item.latest_event_at,
+    // The detail carries the count inside `recurrence`; the summary carries it
+    // flat. Fed from the same source here so a case cannot report one number in
+    // the list and another when opened.
+    recurrence_occurrences: recurrence.occurrences,
     outcome: item.outcome,
   }, "case");
   const occurrences = string(recurrence.occurrences, "case.recurrence.occurrences", 1, 128);

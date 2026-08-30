@@ -8,6 +8,43 @@ import { Verdict } from "./Verdict";
 const INITIAL_ACTIONS = 5;
 const ACTION_PAGE = 10;
 
+/**
+ * A heading a person can find themselves in.
+ *
+ * Session ids are UUIDs minted by whatever agent produced the run, and the card
+ * used to print one as its title:
+ *
+ *   › 86498977-2bae-499e-a894-32344a661ed5   13225 actions
+ *   › 0f1bdd7e-c08f-4678-b0c9-cdfea8c8af0d     519 actions
+ *
+ * Nothing there tells an operator which run is which, and the first of those is
+ * the session they are sitting in. The graph stores no attributes on a session
+ * node, so there is no agent name to print, but every action carries
+ * `recorded_at_ms`, and WHEN a run happened is what a person actually navigates
+ * by. The id stays on the card, in the secondary line, for correlating with a
+ * log; it just stops being the headline.
+ */
+export function sessionHeading(s: SessionView): string {
+  if (s.label === "local") return "Local session";
+  const stamps = s.items
+    .map((item) => item.recorded_at_ms)
+    .filter((ms): ms is number => typeof ms === "number" && Number.isFinite(ms));
+  if (stamps.length === 0) return "Agent session";
+  const first = new Date(Math.min(...stamps));
+  const last = new Date(Math.max(...stamps));
+  const day = new Intl.DateTimeFormat(undefined, { day: "numeric", month: "short" });
+  const time = new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit" });
+  const sameDay = first.toDateString() === last.toDateString();
+  return sameDay
+    ? `Agent session, ${day.format(first)} ${time.format(first)} to ${time.format(last)}`
+    : `Agent session, ${day.format(first)} to ${day.format(last)}`;
+}
+
+/** The id, kept reachable but no longer shouted. */
+export function shortId(label: string): string {
+  return label.length > 12 ? `${label.slice(0, 8)}...` : label;
+}
+
 /** One recorded session with a bounded, progressively disclosed action list. */
 export function SessionCard({
   s,
@@ -48,9 +85,10 @@ export function SessionCard({
         >
           <span className={`mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center text-slate-500 transition-transform ${open ? "rotate-90" : ""}`} aria-hidden="true">›</span>
           <span className="min-w-0 flex-1">
-            <span className="block truncate text-sm font-semibold text-slate-950">{s.label === "local" ? "Local session" : s.label}</span>
+            <span className="block truncate text-sm font-semibold text-slate-950">{sessionHeading(s)}</span>
             <span className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-xs text-slate-500">
               <span>{s.commands} action{s.commands === 1 ? "" : "s"}</span>
+              {s.label !== "local" && <span className="font-mono text-slate-400" title={s.label}>{shortId(s.label)}</span>}
               {denyVerdicts > 0 && <span className="font-medium text-red-700">{denyVerdicts} deny verdict{denyVerdicts === 1 ? "" : "s"}</span>}
               {reviewVerdicts > 0 && <span className="font-medium text-amber-700">{reviewVerdicts} review</span>}
               {unknownVerdicts > 0 && <span className="font-medium text-slate-700">{unknownVerdicts} unknown</span>}

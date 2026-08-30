@@ -7,8 +7,17 @@
       "title": "Producer supplied future and stale containment verification",
       "severity": "critical",
       "status": "contained",
-      "scope": [{ "id": "host:prod-02", "kind": "host", "display_name": "Production host 02", "verification": "host_verified", "evidence": [] }],
+      "scope": [
+        {
+          "id": "host:prod-02",
+          "kind": "host",
+          "display_name": "Production host 02",
+          "verification": "host_verified",
+          "evidence": []
+        }
+      ],
       "latest_event_at": "2026-07-18T09:00:00Z",
+      "recurrence_occurrences": "1",
       "outcome": "contained"
     },
     {
@@ -18,6 +27,7 @@
       "status": "unknown",
       "scope": [],
       "latest_event_at": "2026-07-17T13:00:00Z",
+      "recurrence_occurrences": "1",
       "outcome": "unknown"
     }
   ],
