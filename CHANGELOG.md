@@ -3,6 +3,66 @@
 All notable changes to InnerWarden are documented here. This project
 follows semantic versioning.
 
+## 1.4.5 - 2026-08-30
+
+We ran the product the way a bank's security team would: 764 realistic commands,
+built as nine independent batches and deliberately mixed. 310 that must be
+refused, 357 that must run, 97 judgement calls. The benign half is the larger one
+on purpose, because a guard that blocks real work gets switched off in week two.
+
+                       before    after
+    attacks blocked     48.7%    75.2%
+    attacks caught      51.0%    78.7%
+    ordinary work       96.6%    98.6%
+    hard false positives    7        0
+
+### Added
+
+- **The guard now has a memory.** A value that arrives in a tool result and
+  reappears as an argument later is the attack a stateless screener cannot see,
+  because the second command is not wrong; its origin is. A `PostToolUse` hook
+  carries results in, the session remembers what they contained for 30 minutes,
+  and a command carrying one is held for review with the value and the source
+  tool named. It never lowers a verdict: a command already refused stays refused.
+
+  `innerwarden upgrade` now reconciles the hooks it wrote, so an existing
+  install gets the observation half rather than a build that has the defence and
+  a configuration that never invokes it.
+
+- Detection for seven families that previously scored zero: cloud control-plane
+  actions (audit trail, threat detection, IAM grants, public buckets, key
+  deletion), data destruction, anti-forensics, persistence installs, Kubernetes
+  escapes, untrusted software sources, and local credential stores and kernel
+  hardening knobs. Every family ships its ordinary neighbours as pinned
+  negatives, so `terraform plan`, `kubectl get`, `crontab -l`, `chmod 755` and
+  `journalctl -u` stay untouched.
+
+- Certificate verification being switched off is now visible: `--trusted-host`,
+  `GIT_SSL_NO_VERIFY`, `NODE_TLS_REJECT_UNAUTHORIZED=0`, `curl -k` and the rest.
+
+### Fixed
+
+- **An agent could switch its own guard off.** A wildcard force-allow,
+  `dry-run`, `mute`, and deleting or rewriting the hook configuration all
+  returned `allow` at risk 0, while the loud routes were already refused.
+  Confirmed by effect: with a wildcard allow in place the hook returned exit 0
+  for a command it refuses a second earlier. Every quiet route now denies, and
+  reading the configuration still does not.
+
+- Twelve false positives, collapsing into four rules. `eval "$(...)"` alone was
+  four of them and fires on `kubectl completion`, `direnv hook` and
+  `ssh-agent -s`. Also IMDSv2's token handshake, which is the hardened path AWS
+  tells people to use; `shred` of a runtime token, where refusing teaches people
+  to leave it on disk; `/etc/ssl/certs/*.pem`, which is public by definition;
+  and `.env.example`, which is a committed template.
+
+### Performance
+
+- The hook is a one-shot process, so every tool call pays to compile whatever
+  regexes it touches. A literal gate now decides each family before a single
+  regex is built, and normalization is lazy. Measured over 40 invocations
+  against 1.4.4: **5.45s to 4.00s**, with detection unchanged.
+
 ## 1.4.4 - 2026-08-30
 
 The dashboard opened with five counters and left the arithmetic to the reader,
