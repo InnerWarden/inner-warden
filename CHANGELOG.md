@@ -3,6 +3,49 @@
 All notable changes to InnerWarden are documented here. This project
 follows semantic versioning.
 
+## 1.4.4 - 2026-08-30
+
+The dashboard opened with five counters and left the arithmetic to the reader,
+and the graph behind it was quietly losing most of what it recorded.
+
+### Fixed
+
+- **The graph dropped 88% of the record.** `drop_oldest` selects the oldest
+  nodes, a session anchor is always older than every command under it, so the
+  first prune to reach the anchor removed it and `retain` then removed every
+  `ran` edge that pointed at it. The commands were still stored and nothing
+  could reach them. Pruning now keeps session anchors, `cases_page` recovers
+  commands whose edge is gone by their `cmd:{session}:` prefix, and a session
+  whose anchor was pruned is rebuilt from the ids that survive.
+
+  Measured on one real store before and after: activity total 1,951 to 15,707,
+  sessions 4 to 6, and the needs-review filter 6 to 136. Nothing new was
+  recorded; that is all record that was already on disk and unreachable.
+
+- **The screen did not answer the question people open it with.** A new
+  headline computes the conclusion instead of printing counters: whether
+  anything needs the reader, and what to do about it. Monitor mode is reported
+  as the choice it is rather than as a failure, because calling it a fault
+  pushes people to enforce before they are ready.
+
+- **Evidence moved behind a switch instead of shouting.** "Configured, not
+  verified", "Authority unknown", "Partial evidence" and the rest were each
+  true and together read as a product that does not know what it is doing. They
+  now live behind **Show technical detail**, off by default and persisted. The
+  line that is not crossed: a good state may hide its provenance, a bad one may
+  never hide its existence. Queued work, failures and hosts needing attention
+  stay visible in both registers, and there is a test that refuses "Protected"
+  while anything is queued.
+
+- **A session was headlined by its own UUID.** The list read as four
+  indistinguishable hex strings, one of which was the session the reader was
+  sitting in. The heading is now the time range the run covers; the id stays on
+  the card for correlating with a log.
+
+- Hidden technical markup is not mounted rather than hidden with CSS, and
+  nothing extra is fetched for the technical register, so the switch costs
+  nothing while it is off.
+
 ## 1.4.3 - 2026-08-24
 
 Three things the product said that were not true, all found by walking a real
