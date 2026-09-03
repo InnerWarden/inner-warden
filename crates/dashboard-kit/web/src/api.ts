@@ -82,6 +82,21 @@ export type Overview = {
   screened?: number;
   outcomes_unknown?: number;
   recent_decisions?: DecisionSummary[];
+  /**
+   * The hero sentence, computed by the host from the SAME counters this
+   * payload carries.
+   *
+   * The screen used to choose its own copy from a table keyed on the guardrail
+   * mode, and on a paid host that mode reads `unknown`, which selected a
+   * constant asserting the decision counter reads zero. Measured on
+   * live.innerwarden.com 2026-08-31: the page displayed "Guardrail decisions
+   * not recorded here ... so that counter reads zero" while this very endpoint
+   * answered `commands: 8, deny_verdicts: 5, allowed: 3, actual_blocks: 1`.
+   *
+   * Optional because an older host does not send it; the screen falls back to
+   * its table when it is absent, so a mixed fleet keeps working.
+   */
+  headline?: { label: string; title: string; body: string };
 };
 export type Node = { id: string; kind: string; label: string; attrs?: Record<string, string> };
 export type Edge = { from: string; to: string; kind: string };
