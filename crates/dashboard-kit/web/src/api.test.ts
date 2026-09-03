@@ -54,6 +54,46 @@ describe("dashboard API validation", () => {
     expect(payload.auto_connect.mode).toBeNull();
   });
 
+  /// REGRESSION ANCHOR, third occurrence on the same field.
+  //
+  // The availability union was closed, so a value the host had learned to send
+  // failed the whole payload and the panel reported "The local endpoint did not
+  // respond" about an endpoint that had answered. It happened with
+  // "unavailable", was fixed by adding that word, and happened again the moment
+  // the host learned to distinguish a readable but EMPTY agent registry and sent
+  // "not_configured".
+  //
+  // FAILS ON REVERT: close the union again in `isAgentsResponse`.
+  it("accepts an availability word it has never seen rather than failing the payload", async () => {
+    for (const availability of ["not_configured", "degraded", "a_word_from_a_newer_host"]) {
+      respond({
+        schema_version: 2,
+        generated_at_ms: 1,
+        availability,
+        discovery_limited: true,
+        auto_connect: { status: "unavailable", enabled: null, mode: null, refresh_interval_secs: 60 },
+        agents: [],
+      });
+      const payload = await fetchAgents();
+      expect(payload.availability).toBe(availability);
+    }
+  });
+
+  // The other half of the same defect: a payload that is genuinely malformed
+  // must still be refused, so the fix above cannot have been made by deleting
+  // the validation.
+  it("still refuses a payload whose availability is not a string at all", async () => {
+    respond({
+      schema_version: 2,
+      generated_at_ms: 1,
+      availability: 7,
+      discovery_limited: true,
+      auto_connect: { status: "unavailable", enabled: null, mode: null, refresh_interval_secs: 60 },
+      agents: [],
+    });
+    await expect(fetchAgents()).rejects.toThrow();
+  });
+
   it("accepts lossless decimal token strings and rejects rounded JS numbers", async () => {
     const row = {
       agent_id: "codex",
