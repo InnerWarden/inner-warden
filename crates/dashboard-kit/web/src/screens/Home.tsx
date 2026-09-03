@@ -165,7 +165,7 @@ was incomplete; it does not mean this host is idle.`}
         </div>
       )}
 
-      <PostureHero mode={mode} edition={edition} decisions={overview.commands} sessions={overview.sessions} guardedAgents={guardedAgents} />
+      <PostureHero mode={mode} edition={edition} decisions={overview.commands} sessions={overview.sessions} guardedAgents={guardedAgents} hostHeadline={overview.headline} />
 
       <MachineIntelligence edition={edition} />
 
@@ -323,7 +323,11 @@ export const POSTURES: Record<GuardrailMode, { label: string; title: string; bod
   },
 };
 
-function PostureHero({ mode, edition, decisions, sessions, guardedAgents }: { mode: GuardrailMode; edition?: "community" | "enterprise"; decisions: number; sessions: number; guardedAgents?: number }) {
+// Exported so a test can RENDER it and read the words it actually prints.
+// The first version of this test rebuilt the merge expression inline and
+// asserted on its own object, so it passed with the fix reverted: it proved
+// that spreading two objects works, not that this screen honours the host.
+export function PostureHero({ mode, edition, decisions, sessions, guardedAgents, hostHeadline }: { mode: GuardrailMode; edition?: "community" | "enterprise"; decisions: number; sessions: number; guardedAgents?: number; hostHeadline?: { label: string; title: string; body: string } }) {
   // The `unknown` copy is written for Community: "this version records guardrail
   // decisions" describes the free hook, and the decision count is the free
   // product's headline. On an Enterprise host that hook is often not installed
@@ -331,7 +335,19 @@ function PostureHero({ mode, edition, decisions, sessions, guardedAgents }: { mo
   // correct zero into a claim that the product is idle. Observed on the
   // production box: 0 decisions on screen while 6,047 incidents sat in its
   // graph. The number was right; the sentence around it was not.
-  const posture = postureFor(mode, edition);
+  // The HOST decides the sentence when it offers one.
+  //
+  // `postureFor` picks from a table keyed on the guardrail mode, and on a paid
+  // host that mode is `unknown`, which selected a constant stating the decision
+  // counter reads zero. The host computes the real sentence from the same
+  // counters it just sent (`agent/src/dashboard/guard_headline.rs`), and the
+  // screen ignored it. Measured on live.innerwarden.com 2026-08-31: the page
+  // said the counter reads zero beside a payload carrying 8 screened commands
+  // and 5 deny verdicts.
+  //
+  // Colours stay local because they are presentation; only the words come from
+  // the host, and only when it sent them.
+  const posture = { ...postureFor(mode, edition), ...(hostHeadline ?? {}) };
   return (
     <section className={`overflow-hidden rounded-2xl border bg-gradient-to-br ${posture.panel}`} aria-labelledby="posture-title">
       <div className="grid gap-6 px-5 py-6 sm:px-7 sm:py-8 lg:grid-cols-[minmax(0,1fr)_280px] lg:items-center">
