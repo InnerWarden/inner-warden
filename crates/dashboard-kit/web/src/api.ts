@@ -149,12 +149,22 @@ export type LocalAgent = {
 export type AgentsResponse = {
   schema_version: 2;
   generated_at_ms: number;
+  // A STRING, not a closed union, and that is the third fix to this one field.
+  //
   // "unavailable" is a real answer, not a failure: the endpoint looked and
-  // could not enumerate. The paid side reports it whenever the agent registry
-  // is absent or unreadable. Leaving it out of the union made a valid payload
-  // fail validation, so the panel rendered "did not respond" about an endpoint
-  // that had answered.
-  availability: "loading" | "available" | "error" | "unavailable";
+  // could not enumerate. Leaving it out of the union made a valid payload fail
+  // validation, so the panel rendered "did not respond" about an endpoint that
+  // had answered. It was added. Then the host learned to distinguish a readable
+  // but EMPTY registry and sent "not_configured", which the union rejected, and
+  // the panel said "did not respond" again about an endpoint that had answered
+  // again.
+  //
+  // A closed union here fails the whole payload over one word, and the failure
+  // mode is always the same lie. The host owns this vocabulary and will keep
+  // growing it; the readers below already branch on the values they care about
+  // and humanise the rest, so an unrecognised state renders as itself instead
+  // of as a dead endpoint.
+  availability: string;
   discovery_limited: boolean;
   auto_connect: {
     status?: "available" | "unavailable";
@@ -258,7 +268,7 @@ function isAgentsResponse(value: unknown): value is AgentsResponse {
   if (!isRecord(value) || !Array.isArray(value.agents) || !isRecord(value.auto_connect)) return false;
   return value.schema_version === 2
     && typeof value.generated_at_ms === "number"
-    && ["loading", "available", "error", "unavailable"].includes(String(value.availability))
+    && typeof value.availability === "string"
     && typeof value.discovery_limited === "boolean"
     && (typeof value.auto_connect.enabled === "boolean" || value.auto_connect.enabled === null)
     && (typeof value.auto_connect.mode === "string" || value.auto_connect.mode === null)
