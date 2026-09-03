@@ -3087,10 +3087,10 @@ fn tee_output_targets(node: tree_sitter::Node<'_>, source: &[u8]) -> Vec<String>
 fn output_redirect_targets(redirected: tree_sitter::Node<'_>, source: &[u8]) -> Vec<String> {
     let mut targets = Vec::new();
     for index in 0..redirected.child_count() {
-        if redirected.field_name_for_child(index as u32) != Some("redirect") {
+        if redirected.field_name_for_child(index) != Some("redirect") {
             continue;
         }
-        let Some(redirect) = redirected.child(index as u32) else {
+        let Some(redirect) = redirected.child(index) else {
             continue;
         };
         if redirect.kind() != "file_redirect" {
@@ -3546,8 +3546,8 @@ fn heredoc_start_is_quoted(redirect: tree_sitter::Node<'_>, source: &[u8]) -> bo
 fn command_arguments(command: tree_sitter::Node<'_>) -> Vec<tree_sitter::Node<'_>> {
     (0..command.child_count())
         .filter_map(|index| {
-            (command.field_name_for_child(index as u32) == Some("argument"))
-                .then(|| command.child(index as u32))
+            (command.field_name_for_child(index) == Some("argument"))
+                .then(|| command.child(index))
                 .flatten()
         })
         .collect()
