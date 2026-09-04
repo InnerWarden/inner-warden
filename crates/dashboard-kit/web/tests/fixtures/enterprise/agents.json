@@ -1,0 +1,13 @@
+{
+  "schema_version": 2,
+  "generated_at_ms": 0,
+  "availability": "not_configured",
+  "discovery_limited": true,
+  "auto_connect": {
+    "status": "unavailable",
+    "enabled": null,
+    "mode": null,
+    "refresh_interval_secs": 60
+  },
+  "agents": []
+}

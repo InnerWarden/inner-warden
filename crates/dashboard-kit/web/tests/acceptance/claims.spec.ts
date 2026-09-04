@@ -17,7 +17,11 @@ import type {
 } from "../../src/api/v1";
 
 const communityUrl = "http://127.0.0.1:4173/";
-const enterpriseUrl = "http://127.0.0.1:4174/";
+// The Posture LAYERS these specs read live on the Posture screen, which is where
+// the Overview hero points ("the enforcement layers actually in effect are
+// reported on Posture"). Landing on "/" put every one of them on Overview, where
+// no layer article exists.
+const enterpriseUrl = "http://127.0.0.1:4174/?view=posture";
 const generatedAt = "2026-07-18T12:00:01Z";
 const observedAt = "2026-07-18T12:00:00Z";
 const evaluatedAt = "2026-07-18T12:00:01Z";

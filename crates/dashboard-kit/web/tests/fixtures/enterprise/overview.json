@@ -1,0 +1,18 @@
+{
+  "sessions": 0,
+  "commands": 0,
+  "blocked": 0,
+  "review": 0,
+  "allowed": 0,
+  "deny_verdicts": 0,
+  "review_verdicts": 0,
+  "allow_verdicts": 0,
+  "unknown_verdicts": 0,
+  "actual_blocks": 0,
+  "would_block": 0,
+  "screened": 0,
+  "outcomes_unknown": 0,
+  "top_categories": [],
+  "recent_blocks": [],
+  "recent_decisions": []
+}

@@ -35,6 +35,15 @@ const apiFiles = fixture === "community"
     ["/api/dashboard/v1/bootstrap", "bootstrap.json"],
     ["/api/dashboard/v1/posture", "posture.json"],
     ["/api/guard/meta", "meta.json"],
+    // The SAME drift the paragraph above describes, left unfixed on this half.
+    // The Community map was corrected and this one kept three routes while the
+    // shared shell fetches five, so `fetchOverview` 404'd, `Home` rendered its
+    // `FullError` ("The local dashboard is unavailable"), and every spec that
+    // navigates to this server asserted against that error page instead of
+    // against the product. Nineteen specs, and nothing ran them here either.
+    ["/api/guard/overview", "overview.json"],
+    ["/api/guard/agents", "agents.json"],
+    ["/api/guard/token-intelligence", "token-intelligence.json"],
   ]);
 
 const mime = new Map([
