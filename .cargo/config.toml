@@ -1,0 +1,12 @@
+# The Windows binaries must run on a stock Windows, which ships no Visual C++
+# runtime. Built without this, innerwarden.exe imported vcruntime140.dll and
+# died at start with STATUS_DLL_NOT_FOUND (exit -1073741515) on a fresh Windows
+# Server 2022 on 2026-09-08, right after the site's installer said "Done".
+# GitHub's windows runners carry the redistributable, so CI never saw it.
+# +crt-static links the C runtime into the exe; release-guard.yml checks the
+# built file imports no vcruntime.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
