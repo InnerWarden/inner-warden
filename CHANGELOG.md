@@ -3,6 +3,18 @@
 All notable changes to InnerWarden are documented here. This project
 follows semantic versioning.
 
+## 1.4.8 - 2026-09-08
+
+### Fixed
+
+- **The hook no longer lets a tool call it cannot read pass in silence.** Fed an
+  empty stdin, non-JSON, or a shell tool call with no command string, the hook
+  exited 0 and said nothing, so a payload shape it did not understand (an agent
+  update, an encoding problem) would have let every command run unscreened. In
+  enforce it now refuses such a call (exit 2, reason on stderr); in monitor it
+  says the call was not screened (exit 1). Well-formed calls for tools that
+  carry no command (Read, Edit) still pass untouched.
+
 ## 1.4.7 - 2026-09-08
 
 ### Fixed

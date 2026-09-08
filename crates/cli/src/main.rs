@@ -374,6 +374,87 @@ fn cmd_check(rest: &[String]) -> std::process::ExitCode {
 /// unparsable payload) allows, so a non-Bash tool call is never wedged.
 /// Extract the shell command from a Claude Code PreToolUse payload (empty when
 /// absent/unparsable). Pure/tested; shared by `hook_verdict` and the notify path.
+/// What arrived on the hook's stdin, classified before anything is screened.
+#[derive(Debug, PartialEq)]
+enum HookInput {
+    /// A shell command to screen.
+    Command(String),
+    /// Well formed, but not a shell call (a Read, an Edit, a tool this hook is
+    /// not registered for): nothing to permit or refuse.
+    NotAShellCall,
+    /// Could not be read as a tool call. The hook is registered for shell
+    /// tools, so this is a schema change, an encoding problem or a broken
+    /// agent, never a normal call. Measured 2026-09-08: the hook answered
+    /// exit 0, silently, to an empty stdin, to `garbage`, and to a Bash call
+    /// with no command, so a payload it could not read would have let every
+    /// command run unscreened with nothing on the screen.
+    Unreadable(&'static str),
+}
+
+/// Tool names that carry a shell command in `tool_input.command`.
+const SHELL_TOOLS: &[&str] = &[
+    "Bash",
+    "shell",
+    "run_shell",
+    "run_command",
+    "execute_command",
+    "terminal",
+];
+
+fn classify_hook_input(buf: &str) -> HookInput {
+    if buf.trim().is_empty() {
+        return HookInput::Unreadable("empty stdin");
+    }
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(buf) else {
+        return HookInput::Unreadable("not JSON");
+    };
+    let command = v
+        .get("tool_input")
+        .and_then(|t| t.get("command"))
+        .and_then(|c| c.as_str())
+        .unwrap_or("")
+        .trim();
+    if !command.is_empty() {
+        return HookInput::Command(command.to_string());
+    }
+    let tool = v
+        .get("tool_name")
+        .or_else(|| v.get("tool"))
+        .and_then(|t| t.as_str())
+        .unwrap_or("");
+    if SHELL_TOOLS.iter().any(|s| s.eq_ignore_ascii_case(tool)) {
+        return HookInput::Unreadable("a shell tool call with no command string");
+    }
+    HookInput::NotAShellCall
+}
+
+/// The exit code for a tool call the hook could not read. Claude Code treats
+/// 2 as "block, show stderr" and any other non-zero as "show stderr, carry
+/// on". Enforce refuses (fail-closed); monitor never blocks, so it says so.
+fn unreadable_exit_code(monitor: bool) -> u8 {
+    if monitor {
+        1
+    } else {
+        2
+    }
+}
+
+fn hook_unreadable(why: &str, monitor: bool) -> std::process::ExitCode {
+    if monitor {
+        eprintln!(
+            "InnerWarden hook: could not read this tool call ({why}); it was NOT screened \
+             (monitor mode never blocks)."
+        );
+    } else {
+        eprintln!(
+            "InnerWarden hook: could not read this tool call ({why}); refusing it rather than \
+             letting it run unscreened.\n  If your agent just updated, run `innerwarden agents` \
+             and report the payload shape; `innerwarden dry-run` records without blocking."
+        );
+    }
+    std::process::ExitCode::from(unreadable_exit_code(monitor))
+}
+
 fn hook_command(payload: &str) -> String {
     serde_json::from_str::<serde_json::Value>(payload)
         .ok()
@@ -420,7 +501,12 @@ fn hook_event_id(payload: &str) -> Option<String> {
 /// wedged). Pure/tested; the block decision + graph recording live in `cmd_hook`
 /// so EVERY screened command is recorded, not only the blocked ones.
 fn hook_verdict(payload: &str) -> Option<(String, serde_json::Value)> {
-    let command = hook_command(payload);
+    hook_verdict_for(&hook_command(payload))
+}
+
+/// The verdict for one command string (the payload already read).
+fn hook_verdict_for(command: &str) -> Option<(String, serde_json::Value)> {
+    let command = command.to_string();
     if command.trim().is_empty() {
         return None;
     }
@@ -598,7 +684,7 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
 
     let mut buf = String::new();
     if std::io::stdin().read_to_string(&mut buf).is_err() {
-        return std::process::ExitCode::SUCCESS;
+        return hook_unreadable("stdin could not be read", monitor);
     }
     // PostToolUse: the tool already ran, so there is nothing to permit or
     // refuse. Record what its result carried and exit 0. Doing this BEFORE the
@@ -610,8 +696,14 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
         return std::process::ExitCode::SUCCESS;
     }
 
-    let Some((command, rules)) = hook_verdict(&buf) else {
-        return std::process::ExitCode::SUCCESS; // no command -> never wedge a tool call
+    let command = match classify_hook_input(&buf) {
+        HookInput::Command(command) => command,
+        // A well-formed call for a tool with no command: never wedge it.
+        HookInput::NotAShellCall => return std::process::ExitCode::SUCCESS,
+        HookInput::Unreadable(why) => return hook_unreadable(why, monitor),
+    };
+    let Some((command, rules)) = hook_verdict_for(&command) else {
+        return std::process::ExitCode::SUCCESS;
     };
     // User suppression first, then an optional LLM second opinion for the rest.
     let verdict = suppress_io::consider(&command, &rules)
@@ -2211,5 +2303,50 @@ mod install_target_tests {
     fn a_hookable_agent_is_preferred_over_a_hookless_one() {
         let home = home_with(&[".cursor", ".claude"]);
         assert_eq!(resolve_install_target(home.path()).unwrap(), "claude-code");
+    }
+
+    #[test]
+    fn hook_input_is_classified_before_anything_is_screened() {
+        assert_eq!(
+            classify_hook_input(""),
+            HookInput::Unreadable("empty stdin")
+        );
+        assert_eq!(
+            classify_hook_input("   \n"),
+            HookInput::Unreadable("empty stdin")
+        );
+        assert_eq!(
+            classify_hook_input("garbage"),
+            HookInput::Unreadable("not JSON")
+        );
+        assert_eq!(
+            classify_hook_input(
+                r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{}}"#
+            ),
+            HookInput::Unreadable("a shell tool call with no command string")
+        );
+        assert_eq!(
+            classify_hook_input(r#"{"tool_name":"run_shell","tool_input":{"command":"   "}}"#),
+            HookInput::Unreadable("a shell tool call with no command string")
+        );
+        // A Read tool call is well formed and carries no command: nothing to screen.
+        assert_eq!(
+            classify_hook_input(
+                r#"{"hook_event_name":"PreToolUse","tool_name":"Read","tool_input":{"file_path":"/etc/hosts"}}"#
+            ),
+            HookInput::NotAShellCall
+        );
+        assert_eq!(
+            classify_hook_input(r#"{"tool_name":"Bash","tool_input":{"command":"ls -la"}}"#),
+            HookInput::Command("ls -la".into())
+        );
+    }
+
+    /// Claude Code: 2 blocks and shows stderr; any other non-zero shows stderr
+    /// and carries on. Enforce refuses what it cannot read; monitor never blocks.
+    #[test]
+    fn an_unreadable_call_is_refused_in_enforce_and_loud_in_monitor() {
+        assert_eq!(unreadable_exit_code(false), 2);
+        assert_eq!(unreadable_exit_code(true), 1);
     }
 }
