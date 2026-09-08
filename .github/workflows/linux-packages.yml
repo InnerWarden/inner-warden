@@ -152,6 +152,28 @@ jobs:
       # rotted three releases behind the binaries (1.0.3 vs 1.0.7). The packages
       # are published only AFTER both test-installs above pass, so a broken
       # package can never reach the channel.
+      # The rolling tag carries the newest build, but its package files carried
+      # the version in their names, so nothing could link "the current package":
+      # the site's install page linked innerwarden_1.3.3_amd64.deb by name and
+      # served it, nine releases on, to every apt/dnf user who followed it. The
+      # copies below keep a fixed name on the rolling tag, like the binaries do
+      # (innerwarden-linux-x86_64), so a link stays current and the versioned
+      # file next to it stays available for a pin.
+      - name: Rolling names, so a link can mean "the current package"
+        run: |
+          cd out
+          v="${{ steps.v.outputs.version }}"
+          for pair in \
+            "innerwarden_${v}_amd64.deb:innerwarden_amd64.deb" \
+            "innerwarden_${v}_arm64.deb:innerwarden_arm64.deb" \
+            "innerwarden-${v}-1.x86_64.rpm:innerwarden.x86_64.rpm" \
+            "innerwarden-${v}-1.aarch64.rpm:innerwarden.aarch64.rpm"; do
+            src="${pair%%:*}"; dst="${pair##*:}"
+            [ -f "$src" ] || { echo "::error::expected package $src is not in out/"; ls -la; exit 1; }
+            cp "$src" "$dst"
+          done
+          ls -la
+
       - name: Checksums
         run: |
           cd out
