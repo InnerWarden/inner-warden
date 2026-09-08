@@ -185,6 +185,7 @@ pub fn parked_path(target: &Path) -> PathBuf {
 /// `innerwarden.exe` as COPIES (Unix gets symlinks). An upgrade that replaced
 /// only the target left `iw --version` on the old build. These are the
 /// siblings to refresh after the target lands; the target itself is excluded.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn sibling_copies(target: &Path) -> Vec<PathBuf> {
     let dir = target.parent().unwrap_or_else(|| Path::new("."));
     let own = target.file_name().map(|n| n.to_string_lossy().to_string());
