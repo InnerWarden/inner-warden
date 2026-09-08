@@ -356,6 +356,22 @@ fn run_linux(input: &JailInputs) -> ExitCode {
         );
         return ExitCode::from(1);
     };
+    // Say why the jail cannot be built BEFORE bwrap dies with an error that
+    // names neither the cause nor the fix. The sysctl file exists only on
+    // kernels that carry the restriction; the profile check is on disk because
+    // the loaded-profiles list is root-only.
+    let sysctl =
+        std::fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns").ok();
+    let profile_on_disk = Path::new("/etc/apparmor.d/bwrap").exists()
+        || Path::new("/etc/apparmor.d/usr.bin.bwrap").exists();
+    if let Some(lines) =
+        crate::contain::userns_restriction_advice(sysctl.as_deref(), profile_on_disk, &bwrap)
+    {
+        for line in lines {
+            eprintln!("{line}");
+        }
+        return ExitCode::from(1);
+    }
     announce(input);
     let status = Command::new(bwrap)
         .args(&plan.bwrap_args)

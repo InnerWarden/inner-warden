@@ -663,6 +663,53 @@ pub fn compute_jail_env(input: &JailInputs) -> Vec<(String, String)> {
     ]
 }
 
+/// Ubuntu 24.04 and later restrict unprivileged user namespaces
+/// (`kernel.apparmor_restrict_unprivileged_userns = 1`). Under that sysctl an
+/// unconfined `bwrap` cannot set up its uid map and dies with
+/// `bwrap: setting up uid map: Permission denied`, which names neither the
+/// cause nor the fix. The supported fix is an AppArmor profile that grants the
+/// binary `userns`; this says so before spawning, with the exact profile.
+///
+/// Measured on a stock Ubuntu 24.04 Azure image on 2026-09-08: the sysctl is
+/// 1, the image ships no profile for bwrap, and the profile below makes
+/// `innerwarden contain` run.
+///
+/// Pure: the sysctl's text (or `None` where the file does not exist, every
+/// non-Ubuntu kernel), whether a bwrap profile is present on disk, and the
+/// bwrap path to name in the profile. `Some(lines)` means refuse and print.
+pub fn userns_restriction_advice(
+    sysctl: Option<&str>,
+    profile_on_disk: bool,
+    bwrap: &Path,
+) -> Option<Vec<String>> {
+    let restricted = sysctl.map(|v| v.trim() == "1").unwrap_or(false);
+    if !restricted || profile_on_disk {
+        return None;
+    }
+    let bwrap = bwrap.display();
+    Some(vec![
+        "innerwarden contain: this kernel restricts unprivileged user namespaces".into(),
+        "  (kernel.apparmor_restrict_unprivileged_userns = 1, the Ubuntu 24.04 default), and"
+            .into(),
+        format!("  {bwrap} has no AppArmor profile granting it one, so the jail cannot be built"),
+        "  (bwrap would fail with: setting up uid map: Permission denied).".into(),
+        "".into(),
+        "  Grant bwrap a user namespace, once, without weakening the sysctl for everything else:"
+            .into(),
+        "    sudo tee /etc/apparmor.d/bwrap >/dev/null <<'EOF'".into(),
+        "    abi <abi/4.0>,".into(),
+        "    include <tunables/global>".into(),
+        format!("    profile bwrap {bwrap} flags=(unconfined) {{"),
+        "      userns,".into(),
+        "      include if exists <local/bwrap>".into(),
+        "    }".into(),
+        "    EOF".into(),
+        "    sudo apparmor_parser -r /etc/apparmor.d/bwrap".into(),
+        "".into(),
+        "  Then run this command again. Nothing was run.".into(),
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1045,5 +1092,39 @@ mod tests {
         // regex escape neutralizes metachars
         let r = sbpl_regex_escape("a.b*c|d");
         assert_eq!(r, "a\\.b\\*c\\|d");
+    }
+
+    #[test]
+    fn userns_restriction_is_named_only_when_it_will_bite() {
+        use std::path::Path;
+        let bwrap = Path::new("/usr/bin/bwrap");
+        // The measured stock Ubuntu 24.04 host: restricted, no profile.
+        let lines = userns_restriction_advice(Some("1\n"), false, bwrap).expect("advice");
+        let text = lines.join("\n");
+        assert!(
+            text.contains("apparmor_restrict_unprivileged_userns"),
+            "{text}"
+        );
+        assert!(
+            text.contains("profile bwrap /usr/bin/bwrap flags=(unconfined)"),
+            "{text}"
+        );
+        assert!(text.contains("userns,"), "{text}");
+        assert!(
+            text.contains("apparmor_parser -r /etc/apparmor.d/bwrap"),
+            "{text}"
+        );
+        assert!(text.contains("Nothing was run"), "{text}");
+        // With the profile on disk the jail builds: say nothing.
+        assert!(userns_restriction_advice(Some("1"), true, bwrap).is_none());
+        // Sysctl off, or absent (every non-Ubuntu kernel): say nothing.
+        assert!(userns_restriction_advice(Some("0"), false, bwrap).is_none());
+        assert!(userns_restriction_advice(None, false, bwrap).is_none());
+        // The profile names the resolved binary, not a guess.
+        let other =
+            userns_restriction_advice(Some("1"), false, Path::new("/usr/local/bin/bwrap")).unwrap();
+        assert!(other
+            .join("\n")
+            .contains("profile bwrap /usr/local/bin/bwrap"));
     }
 }

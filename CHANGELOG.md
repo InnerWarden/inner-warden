@@ -3,6 +3,26 @@
 All notable changes to InnerWarden are documented here. This project
 follows semantic versioning.
 
+## 1.4.6 - 2026-09-08
+
+Two things a new user meets in the first hour on a stock Ubuntu 24.04 host,
+found by installing the way the site says to and running each command in
+`--help`.
+
+### Fixed
+
+- **`innerwarden contain` on Ubuntu 24.04.** The jail died with
+  `bwrap: setting up uid map: Permission denied`. The kernel there restricts
+  unprivileged user namespaces (`kernel.apparmor_restrict_unprivileged_userns`)
+  and the image ships no AppArmor profile for `bwrap`. `contain` now checks
+  both before building the jail and, when it cannot, prints the profile that
+  grants `bwrap` a user namespace and the `apparmor_parser` line to load it,
+  then runs nothing. The sysctl stays as it was.
+- **`innerwarden upgrade` on an up-to-date host** fetched the published
+  binary, replaced identical bytes and reported "Upgrade complete". It now
+  reads the manifest first and stops with "Already on the latest build", as
+  `upgrade --check` already did. `--yes` still replaces the file.
+
 ## 1.4.5 - 2026-08-30
 
 We ran the product the way a bank's security team would: 764 realistic commands,

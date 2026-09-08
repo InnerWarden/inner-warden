@@ -121,6 +121,13 @@ pub fn check_outcome(installed: &str, manifest_json: &str) -> CheckOutcome {
     }
 }
 
+/// `upgrade` without `--yes` replaces nothing when the published build is the
+/// one already installed. Only that outcome: an unreadable manifest is
+/// `Undetermined` and must not stop an upgrade, it just cannot short-circuit it.
+pub fn nothing_to_do(outcome: &CheckOutcome) -> bool {
+    matches!(outcome, CheckOutcome::UpToDate { .. })
+}
+
 /// The lines `--check` prints, given what it established.
 ///
 /// `managed` is taken into account because telling an npm user to run
@@ -737,5 +744,17 @@ mod tests {
             staged.display()
         );
         assert!(staged.is_relative(), "must not escape to an absolute path");
+    }
+
+    #[test]
+    fn upgrade_stops_only_when_the_published_build_is_the_installed_one() {
+        assert!(nothing_to_do(&CheckOutcome::UpToDate {
+            version: "1.4.5".into()
+        }));
+        assert!(!nothing_to_do(&CheckOutcome::Available {
+            published: "1.4.6".into(),
+            installed: "1.4.5".into()
+        }));
+        assert!(!nothing_to_do(&CheckOutcome::Undetermined));
     }
 }
