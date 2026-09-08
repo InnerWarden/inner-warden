@@ -825,13 +825,13 @@ mod tests {
 
     #[test]
     fn the_sibling_copies_are_the_other_names_beside_the_target() {
-        let sib = sibling_copies(Path::new(r"C:\P\InnerWarden\innerwarden.exe"));
+        let sib = sibling_copies(Path::new("/p/InnerWarden/innerwarden.exe"));
         let names: Vec<String> = sib
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
             .collect();
         assert_eq!(names, vec!["iw.exe", "iw-guard.exe"]);
-        let sib = sibling_copies(Path::new(r"C:\P\InnerWarden\iw.exe"));
+        let sib = sibling_copies(Path::new("/p/InnerWarden/iw.exe"));
         let names: Vec<String> = sib
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
