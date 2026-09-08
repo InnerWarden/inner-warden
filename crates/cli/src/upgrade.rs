@@ -132,6 +132,8 @@ pub fn cmd(rest: &[String]) -> ExitCode {
         eprintln!("innerwarden upgrade: could not locate the running binary.");
         return ExitCode::from(1);
     };
+    // A parked image from the previous Windows upgrade (see install_verified).
+    let _ = std::fs::remove_file(upgrade_plan::parked_path(&target));
 
     // An npm-managed copy must not be replaced by hand, and that has to be said
     // BEFORE the download rather than after a failure.
@@ -442,6 +444,56 @@ fn install_verified(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))?;
     }
+    #[cfg(windows)]
+    {
+        // A running Windows image cannot be replaced by a rename over it, but
+        // it can itself be renamed. Park it beside itself, land the staged
+        // file where it was, then try to drop the parked one; while it is
+        // still executing that removal fails and the next `upgrade` clears it.
+        // Measured on a stock Windows Server 2022 on 2026-09-08: the plain
+        // rename failed and the operator was told to run `sudo`.
+        let parked = upgrade_plan::parked_path(target);
+        let _ = std::fs::remove_file(&parked);
+        if target.exists() {
+            if let Err(e) = std::fs::rename(target, &parked) {
+                let _ = std::fs::remove_file(&staged);
+                return Err(e);
+            }
+        }
+        return match std::fs::rename(&staged, target) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&parked);
+                // The installer's copies beside the target must follow it, or
+                // `iw --version` stays on the old build. Best effort: a copy
+                // that cannot be refreshed is reported, not fatal.
+                for sibling in upgrade_plan::sibling_copies(target) {
+                    if !sibling.exists() {
+                        continue;
+                    }
+                    let sib_parked = upgrade_plan::parked_path(&sibling);
+                    let _ = std::fs::remove_file(&sib_parked);
+                    let ok = std::fs::rename(&sibling, &sib_parked).is_ok()
+                        && std::fs::copy(target, &sibling).is_ok();
+                    if ok {
+                        let _ = std::fs::remove_file(&sib_parked);
+                    } else {
+                        let _ = std::fs::rename(&sib_parked, &sibling);
+                        eprintln!(
+                            "innerwarden upgrade: {} was not refreshed; re-run the installer to update it",
+                            sibling.display()
+                        );
+                    }
+                }
+                Ok(())
+            }
+            Err(e) => {
+                let _ = std::fs::rename(&parked, target);
+                let _ = std::fs::remove_file(&staged);
+                Err(e)
+            }
+        };
+    }
+    #[cfg(not(windows))]
     match std::fs::rename(&staged, target) {
         Ok(()) => Ok(()),
         Err(e) => {
