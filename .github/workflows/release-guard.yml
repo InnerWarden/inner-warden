@@ -243,6 +243,15 @@ jobs:
             esac
             src="target/$t/release/innerwarden${ext}"
             dest="dist/innerwarden-${os}-${arch}${ext}"
+            # A Windows exe that imports the Visual C++ runtime dies at start on
+            # a stock Windows (no redistributable) with STATUS_DLL_NOT_FOUND,
+            # right after the installer said "Done". Measured on a fresh Windows
+            # Server 2022 on 2026-09-08. .cargo/config.toml links the CRT in;
+            # this is the check that the flag reached the build.
+            if [ "$os" = "windows" ] && grep -aqi "vcruntime140" "$src"; then
+              echo "::error::$src imports vcruntime140.dll; it would not start on a stock Windows. +crt-static did not reach this build."
+              exit 1
+            fi
             cp "$src" "$dest"
             if command -v sha256sum >/dev/null 2>&1; then
               sha256sum "$dest" | awk '{print $1}' > "${dest}.sha256"

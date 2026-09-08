@@ -3,6 +3,19 @@
 All notable changes to InnerWarden are documented here. This project
 follows semantic versioning.
 
+## 1.4.7 - 2026-09-08
+
+### Fixed
+
+- **Windows: the binary now starts on a stock machine.** `innerwarden.exe`
+  imported `vcruntime140.dll`, which a fresh Windows without the Visual C++
+  redistributable does not have; the installer said "Done" and the first
+  command died with `STATUS_DLL_NOT_FOUND`. The C runtime is now linked in
+  (`+crt-static`) and the release build fails if the exe still imports it.
+- **Windows: the install command names `www.innerwarden.com`.** Windows
+  PowerShell 5.1 does not follow the apex's 308 redirect; PowerShell 7 does,
+  which is why the runners never saw it.
+
 ## 1.4.6 - 2026-09-08
 
 Two things a new user meets in the first hour on a stock Ubuntu 24.04 host,
