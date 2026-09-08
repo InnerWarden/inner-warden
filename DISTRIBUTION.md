@@ -18,7 +18,7 @@ User-facing install docs (the page we send people) live at
 | --- | --- | --- | --- |
 | Signed binaries (`innerwarden-<os>-<arch>` + `.sha256` + `.sig`) | **this repo**, crate `cli`, via `.github/workflows/release-guard.yml` | rolling `iw-guard` release on `InnerWarden/innerwarden-releases` | `.github/workflows/release-guard.yml` |
 | npm packages (7: `innerwarden` + 6 `@innerwarden/cli-<os>-<arch>`) | the binaries above | npmjs.com | `npm/` + `.github/workflows/npm-publish.yml` |
-| `.deb` / `.rpm` (amd64 + arm64) | the binaries above, via nfpm | attached to the `iw-guard` release | `packaging/` + `.github/workflows/linux-packages.yml` |
+| `.deb` / `.rpm` (amd64 + arm64) | the binaries above, via nfpm | attached to the `iw-guard` release | `packaging/` + `.github/workflows/linux-packages.yml` Fixed-name copies (`innerwarden_amd64.deb`, `innerwarden_arm64.deb`, `innerwarden.x86_64.rpm`, `innerwarden.aarch64.rpm`) sit next to the versioned files, so the site links stay current (#159). |
 | Shell installer (`curl \| sh`), PowerShell installer, Scoop manifest, public key | n/a (hand-maintained) | `innerwarden.com/free` | **`InnerWarden/innerwarden-releases`** (the distribution repo, not here) |
 | In-place upgrade (`innerwarden upgrade`) | the binary already installed | n/a - reads the `iw-guard` release directly | `crates/cli/src/upgrade.rs`, `crates/cli/src/release_verify.rs` |
 
@@ -123,6 +123,8 @@ each of the seven packages, pointing at `InnerWarden/inner-warden` +
    overwrites same-named files, and the package filenames carry the version, so
    the old ones linger until removed:
    `gh release delete-asset iw-guard <old-file> --repo InnerWarden/innerwarden-releases`.
+   Delete only versions older than the PREVIOUS one (keep two for a rollback)
+   and never the fixed-name copies: the site links those.
 
 Local one-off:
 `packaging/build-linux-packages.sh 1.0.0 ./innerwarden-linux-x86_64 ./innerwarden-linux-aarch64 out`
