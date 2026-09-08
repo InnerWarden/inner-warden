@@ -3,6 +3,18 @@
 All notable changes to InnerWarden are documented here. This project
 follows semantic versioning.
 
+## 1.4.9 - 2026-09-08
+
+### Fixed
+
+- **Windows: `innerwarden upgrade` now replaces the running binary.** It
+  renamed the new file over the running `innerwarden.exe`, which Windows
+  refuses (`Access is denied`), and then advised `sudo innerwarden upgrade`.
+  The running image is now parked beside itself, the new one lands in its
+  place, and the installer's `iw.exe` / `iw-guard.exe` copies are refreshed
+  too. The advice on Windows names the real causes: another InnerWarden
+  process, or a folder that needs an elevated PowerShell.
+
 ## 1.4.8 - 2026-09-08
 
 ### Fixed

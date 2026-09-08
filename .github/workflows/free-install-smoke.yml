@@ -103,3 +103,62 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "allow case exit=$LASTEXITCODE, expected 0" }
           innerwarden upgrade --check
           innerwarden status
+
+  # The upgrade path a real user takes: the PREVIOUS cut is installed with the
+  # site's installer pinned to its tag, then `innerwarden upgrade` must land
+  # the newest. This is what a running-image replace on Windows and the copied
+  # aliases beside it are proven by; `upgrade --check` alone proves nothing.
+  upgrade-from-previous:
+    name: upgrade from the previous cut, ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - name: Resolve the two newest cuts
+        id: cuts
+        shell: bash
+        run: |
+          tags=$(curl -fsSL "https://api.github.com/repos/InnerWarden/innerwarden-releases/releases?per_page=50" | grep -oE '"tag_name": *"guard-v[0-9.]+"' | grep -oE 'guard-v[0-9.]+' | sort -V)
+          latest=$(echo "$tags" | tail -1); previous=$(echo "$tags" | tail -2 | head -1)
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"; echo "previous=$previous" >> "$GITHUB_OUTPUT"
+          echo "previous=$previous latest=$latest"
+      - name: Install the previous cut (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: IW_GUARD_TAG=${{ steps.cuts.outputs.previous }} sh -c 'curl -fsSL https://innerwarden.com/free | sh'
+      - name: Install the previous cut (windows, PowerShell 5.1)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $script = [scriptblock]::Create((irm https://www.innerwarden.com/free.ps1))
+          & $script -Version "${{ steps.cuts.outputs.previous }}"
+      - name: Upgrade to the newest (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+          before=$(innerwarden --version | awk '{print $NF}'); echo "before: $before"
+          innerwarden upgrade
+          after=$(innerwarden --version | awk '{print $NF}'); echo "after: $after"
+          want="${{ steps.cuts.outputs.latest }}"; want="${want#guard-v}"
+          [ "$after" = "$want" ] || { echo "expected $want after upgrade, got $after"; exit 1; }
+          [ "$before" != "$after" ] || { echo "the previous cut already reported $after; the upgrade path was not exercised"; exit 1; }
+      - name: Upgrade to the newest (windows, PowerShell 5.1)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          $env:Path = "$env:LOCALAPPDATA\Programs\InnerWarden;" + $env:Path
+          $before = (innerwarden --version | Out-String).Trim().Split(" ")[-1]; Write-Output "before: $before"
+          innerwarden upgrade
+          if ($LASTEXITCODE -ne 0) { throw "upgrade exit=$LASTEXITCODE" }
+          $after = (innerwarden --version | Out-String).Trim().Split(" ")[-1]; Write-Output "after: $after"
+          $want = "${{ steps.cuts.outputs.latest }}".Replace("guard-v", "")
+          if ($after -ne $want) { throw "expected $want after upgrade, got $after" }
+          if ($before -eq $after) { throw "the previous cut already reported $after; the upgrade path was not exercised" }
+          $iw = (iw --version | Out-String).Trim().Split(" ")[-1]
+          if ($iw -ne $want) { throw "iw.exe stayed on $iw" }
+

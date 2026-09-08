@@ -169,6 +169,33 @@ pub fn check_lines(outcome: &CheckOutcome, asset: &str, managed: Managed) -> Vec
 /// can swap them in that window. Staging in the destination directory also keeps
 /// the final step a same-filesystem rename, which is atomic; a cross-device move
 /// is a copy, and a copy can be interrupted half-written.
+/// Where a running Windows image is parked while the staged one lands: a
+/// running exe cannot be replaced by a rename over it, but it can itself be
+/// renamed. Beside the target, so both moves are same-directory renames.
+pub fn parked_path(target: &Path) -> PathBuf {
+    let file = target
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "innerwarden".to_string());
+    let dir = target.parent().unwrap_or_else(|| Path::new("."));
+    dir.join(format!("{file}.old"))
+}
+
+/// The Windows installer lays `iw.exe` and `iw-guard.exe` beside
+/// `innerwarden.exe` as COPIES (Unix gets symlinks). An upgrade that replaced
+/// only the target left `iw --version` on the old build. These are the
+/// siblings to refresh after the target lands; the target itself is excluded.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn sibling_copies(target: &Path) -> Vec<PathBuf> {
+    let dir = target.parent().unwrap_or_else(|| Path::new("."));
+    let own = target.file_name().map(|n| n.to_string_lossy().to_string());
+    ["iw.exe", "iw-guard.exe", "innerwarden.exe"]
+        .iter()
+        .filter(|n| own.as_deref() != Some(n))
+        .map(|n| dir.join(n))
+        .collect()
+}
+
 pub fn staging_path(target: &Path) -> PathBuf {
     let file = target
         .file_name()
@@ -228,7 +255,29 @@ pub fn npm_refusal_applies(target: &Path, check_only: bool, forced: bool) -> boo
 /// `is_root` is passed in rather than read here so the decision stays pure and
 /// the root case is testable on any host.
 pub fn cannot_replace_advice(target: &Path, is_root: bool) -> Vec<String> {
+    cannot_replace_advice_on(target, is_root, std::env::consts::OS)
+}
+
+/// The advice by platform. `sudo` is a Unix word: on Windows the usual reason
+/// is another InnerWarden process holding the file, or a folder that needs
+/// an elevated PowerShell. Read on a stock Windows Server 2022 on 2026-09-08,
+/// where a failed replace told the operator to run `sudo innerwarden upgrade`.
+pub fn cannot_replace_advice_on(target: &Path, is_root: bool, os: &str) -> Vec<String> {
     let mut out = Vec::new();
+    if os == "windows" && managed_by(target) == Managed::Direct {
+        out.push(format!("{} could not be replaced.", target.display()));
+        out.push(
+            "Close every other InnerWarden process (a dashboard, an agent's hook still \
+             running) and re-run `innerwarden upgrade`."
+                .into(),
+        );
+        out.push(
+            "If the folder itself is not writable, run PowerShell as Administrator and \
+             re-run it there."
+                .into(),
+        );
+        return out;
+    }
     match managed_by(target) {
         Managed::Npm => {
             out.push(format!(
@@ -756,5 +805,49 @@ mod tests {
             installed: "1.4.5".into()
         }));
         assert!(!nothing_to_do(&CheckOutcome::Undetermined));
+    }
+
+    #[test]
+    fn a_parked_image_sits_beside_its_target() {
+        let p = parked_path(Path::new(
+            r"C:\Users\me\AppData\Local\Programs\InnerWarden\innerwarden.exe",
+        ));
+        assert!(
+            p.to_string_lossy().ends_with("innerwarden.exe.old"),
+            "{}",
+            p.display()
+        );
+        assert_eq!(
+            p.parent(),
+            Path::new(r"C:\Users\me\AppData\Local\Programs\InnerWarden\innerwarden.exe").parent()
+        );
+    }
+
+    #[test]
+    fn the_sibling_copies_are_the_other_names_beside_the_target() {
+        let sib = sibling_copies(Path::new("/p/InnerWarden/innerwarden.exe"));
+        let names: Vec<String> = sib
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, vec!["iw.exe", "iw-guard.exe"]);
+        let sib = sibling_copies(Path::new("/p/InnerWarden/iw.exe"));
+        let names: Vec<String> = sib
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, vec!["iw-guard.exe", "innerwarden.exe"]);
+    }
+
+    /// `sudo` must never be the advice on Windows; the Unix advice is unchanged.
+    #[test]
+    fn the_cannot_replace_advice_speaks_the_platform() {
+        let t = Path::new("/home/me/.local/bin/innerwarden");
+        let win = cannot_replace_advice_on(t, false, "windows").join("\n");
+        assert!(!win.contains("sudo"), "{win}");
+        assert!(win.contains("Administrator"), "{win}");
+        assert!(win.contains("other InnerWarden process"), "{win}");
+        let unix = cannot_replace_advice_on(t, false, "linux").join("\n");
+        assert!(unix.contains("sudo innerwarden upgrade"), "{unix}");
     }
 }

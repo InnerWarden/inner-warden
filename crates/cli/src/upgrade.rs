@@ -132,6 +132,8 @@ pub fn cmd(rest: &[String]) -> ExitCode {
         eprintln!("innerwarden upgrade: could not locate the running binary.");
         return ExitCode::from(1);
     };
+    // A parked image from the previous Windows upgrade (see install_verified).
+    let _ = std::fs::remove_file(upgrade_plan::parked_path(&target));
 
     // An npm-managed copy must not be replaced by hand, and that has to be said
     // BEFORE the download rather than after a failure.
@@ -442,16 +444,66 @@ fn install_verified(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))?;
     }
-    match std::fs::rename(&staged, target) {
+    land(&staged, target)
+}
+
+/// Land the staged file on the target: one atomic rename, same directory.
+#[cfg(not(windows))]
+fn land(staged: &Path, target: &Path) -> std::io::Result<()> {
+    match std::fs::rename(staged, target) {
         Ok(()) => Ok(()),
         Err(e) => {
-            let _ = std::fs::remove_file(&staged);
+            let _ = std::fs::remove_file(staged);
             Err(e)
         }
     }
 }
 
-/// Download a binary artifact, bounded.
+/// Land the staged file on the target on Windows. A running Windows image
+/// cannot be replaced by a rename over it, but it can itself be renamed:
+/// park it beside itself, land the staged file where it was, then try to
+/// drop the parked one; while it still executes that removal fails and the
+/// next `upgrade` clears it. Measured on a stock Windows Server 2022 on
+/// 2026-09-08: the plain rename failed and the operator was told to run
+/// `sudo`. The installer's copies beside the target must follow it, or
+/// `iw --version` stays on the old build: best effort, reported, not fatal.
+#[cfg(windows)]
+fn land(staged: &Path, target: &Path) -> std::io::Result<()> {
+    let parked = upgrade_plan::parked_path(target);
+    let _ = std::fs::remove_file(&parked);
+    if target.exists() {
+        if let Err(e) = std::fs::rename(target, &parked) {
+            let _ = std::fs::remove_file(staged);
+            return Err(e);
+        }
+    }
+    if let Err(e) = std::fs::rename(staged, target) {
+        let _ = std::fs::rename(&parked, target);
+        let _ = std::fs::remove_file(staged);
+        return Err(e);
+    }
+    let _ = std::fs::remove_file(&parked);
+    for sibling in upgrade_plan::sibling_copies(target) {
+        if !sibling.exists() {
+            continue;
+        }
+        let sib_parked = upgrade_plan::parked_path(&sibling);
+        let _ = std::fs::remove_file(&sib_parked);
+        let ok = std::fs::rename(&sibling, &sib_parked).is_ok()
+            && std::fs::copy(target, &sibling).is_ok();
+        if ok {
+            let _ = std::fs::remove_file(&sib_parked);
+        } else {
+            let _ = std::fs::rename(&sib_parked, &sibling);
+            eprintln!(
+                "innerwarden upgrade: {} was not refreshed; re-run the installer to update it",
+                sibling.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
     let mut resp = ureq::get(url).call().map_err(|e| e.to_string())?;
     let mut buf = Vec::new();
