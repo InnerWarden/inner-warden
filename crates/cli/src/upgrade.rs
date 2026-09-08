@@ -211,6 +211,25 @@ pub fn cmd(rest: &[String]) -> ExitCode {
         };
     }
 
+    // Already on the published build: say so and stop. This fetched and
+    // replaced identical bytes and reported "Upgrade complete" every time it
+    // was run on an up-to-date host (measured 2026-09-08, same sha before and
+    // after). `--yes` still replaces, for a host whose file is suspect. A
+    // manifest that cannot be read does not block the upgrade path below.
+    if !forced {
+        let manifest_url = upgrade_plan::manifest_url_from(upgrade_plan::RELEASE_BASE);
+        if let Ok(manifest) = fetch_text(&manifest_url) {
+            let outcome = upgrade_plan::check_outcome(current, &manifest);
+            if upgrade_plan::nothing_to_do(&outcome) {
+                for line in
+                    upgrade_plan::check_lines(&outcome, &asset, upgrade_plan::managed_by(&target))
+                {
+                    println!("{line}");
+                }
+                return ExitCode::SUCCESS;
+            }
+        }
+    }
     println!("InnerWarden Community {current}: fetching {asset}...");
 
     // One implementation, shared with the tests. Before this the download,
