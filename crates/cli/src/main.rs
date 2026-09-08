@@ -455,6 +455,7 @@ fn hook_unreadable(why: &str, monitor: bool) -> std::process::ExitCode {
     std::process::ExitCode::from(unreadable_exit_code(monitor))
 }
 
+#[cfg(test)]
 fn hook_command(payload: &str) -> String {
     serde_json::from_str::<serde_json::Value>(payload)
         .ok()
@@ -500,6 +501,7 @@ fn hook_event_id(payload: &str) -> Option<String> {
 /// or `None` when the payload carries no command (so a non-Bash tool call is never
 /// wedged). Pure/tested; the block decision + graph recording live in `cmd_hook`
 /// so EVERY screened command is recorded, not only the blocked ones.
+#[cfg(test)]
 fn hook_verdict(payload: &str) -> Option<(String, serde_json::Value)> {
     hook_verdict_for(&hook_command(payload))
 }
