@@ -3192,16 +3192,23 @@ fn check_firewall_teardown(lower: &str) -> Option<&'static str> {
 }
 
 /// Destroying the record of what happened (MITRE T1070 Indicator Removal).
-fn check_log_destruction(lower: &str) -> Option<&'static str> {
+fn check_log_destruction(lower: &str) -> Option<(&'static str, u32)> {
+    // Two different things get called "log destruction", and flattening them to
+    // one score was the product arguing with itself. A shell history file is one
+    // user's convenience record, and `history -c` ends a lot of ordinary sessions;
+    // the systemd journal and /var/log are the HOST's audit trail, and destroying
+    // those is the same class of defence evasion as tearing the firewall down,
+    // which scores 60 six lines above this. Both still deny (the action threshold
+    // is 40); what changes is the label the operator reads.
     const SHELL_HISTORY: &[&str] = &["history -c", "history -cw", "unset histfile", "histfile="];
     if SHELL_HISTORY.iter().any(|p| lower.contains(p)) {
-        return Some("clear shell history");
+        return Some(("clear shell history", 50));
     }
     if lower.contains("journalctl") && (lower.contains("--vacuum") || lower.contains("--rotate")) {
-        return Some("vacuum the systemd journal");
+        return Some(("vacuum the systemd journal", 60));
     }
     // A destructive verb aimed at a log path. Reading or grepping a log stays
-    // allowed because none of these verbs are involved — that matters, because
+    // allowed because none of these verbs are involved, and that matters, because
     // `grep -c 'Failed password' /var/log/auth.log` is ordinary defensive work.
     const LOG_PATHS: &[&str] = &["/var/log", ".bash_history", "/var/audit"];
     const DESTRUCTIVE: &[&str] = &[
@@ -3215,7 +3222,14 @@ fn check_log_destruction(lower: &str) -> Option<&'static str> {
     ];
     if LOG_PATHS.iter().any(|p| lower.contains(p)) && DESTRUCTIVE.iter().any(|v| lower.contains(v))
     {
-        return Some("destroy or overwrite host logs");
+        // `.bash_history` reached through a destructive verb is still one user's
+        // record, so it keeps the shell-history score; /var/log and /var/audit are
+        // the host's.
+        let host_trail = lower.contains("/var/log") || lower.contains("/var/audit");
+        return Some((
+            "destroy or overwrite host logs",
+            if host_trail { 60 } else { 50 },
+        ));
     }
     None
 }
@@ -3277,8 +3291,8 @@ pub fn check_security_tamper(content: &str) -> Option<(&'static str, u32)> {
         return Some((hit, 60));
     }
     // Destroying the record of what happened (MITRE T1070 Indicator Removal).
-    if let Some(hit) = check_log_destruction(&lower) {
-        return Some((hit, 50));
+    if let Some((hit, score)) = check_log_destruction(&lower) {
+        return Some((hit, score));
     }
     // Granting yourself an account (T1136 Create Account). The classic
     // `echo 'hax:x:0:0::/root:/bin/bash' >> /etc/passwd` scored 0.
@@ -5883,6 +5897,74 @@ mod tests {
     /// Serious enough to block, labelled as though it were not. This asserts
     /// the WORD matches the ACTION, not a particular number, so a later
     /// re-scoring cannot quietly bring the contradiction back.
+    #[test]
+    fn destroying_the_hosts_audit_trail_is_never_labelled_medium() {
+        // Tearing the firewall down scores 60 and reads HIGH. Wiping the record of
+        // what happened is the same class of defence evasion (MITRE T1070), and it
+        // used to read MEDIUM beside it.
+        for command in [
+            "rm -rf /var/log/*",
+            "shred -u /var/log/auth.log",
+            "truncate -s 0 /var/log/syslog",
+            "journalctl --vacuum-time=1s",
+            "rm /var/audit/audit.log",
+            "echo > /var/log/secure",
+        ] {
+            let a = crate::mcp::analyze_command(command, None);
+            assert_eq!(a.recommendation, "deny", "{command}");
+            assert_ne!(
+                a.severity, "medium",
+                "{command} destroys the host audit trail; calling it medium puts it \
+                 below `ufw disable` in the same list (score {})",
+                a.risk_score
+            );
+        }
+    }
+
+    #[test]
+    fn the_split_is_whose_record_is_destroyed() {
+        // Asserted on this rule's own contribution, not on the aggregate
+        // severity: several rules score the same command and the total is
+        // theirs together, so an aggregate assertion here would pass or fail
+        // for reasons that have nothing to do with this split.
+        //
+        // The host's audit trail scores what tearing the firewall down scores.
+        for command in [
+            "rm -rf /var/log/*",
+            "shred -u /var/log/auth.log",
+            "truncate -s 0 /var/log/syslog",
+            "journalctl --vacuum-time=1s",
+            "rm /var/audit/audit.log",
+            "echo > /var/log/secure",
+        ] {
+            let (_, score) = check_security_tamper(command)
+                .unwrap_or_else(|| panic!("{command} must still be caught"));
+            assert_eq!(score, 60, "{command} destroys the host audit trail");
+        }
+        // One user's own record keeps the lower score. Both deny; the action
+        // threshold is 40.
+        for command in ["history -c", "unset HISTFILE", "rm ~/.bash_history"] {
+            let (_, score) = check_security_tamper(command)
+                .unwrap_or_else(|| panic!("{command} must still be caught"));
+            assert_eq!(score, 50, "{command} is one user's history");
+            assert!(score >= 40, "{command} must still deny");
+        }
+    }
+
+    #[test]
+    fn reading_a_log_is_not_destroying_it() {
+        // The guard against fixing severity by widening the match: defensive work
+        // on the same paths must stay untouched.
+        for command in [
+            "grep -c 'Failed password' /var/log/auth.log",
+            "tail -f /var/log/syslog",
+            "journalctl -u sshd --since today",
+        ] {
+            let a = crate::mcp::analyze_command(command, None);
+            assert_ne!(a.recommendation, "deny", "{command}");
+        }
+    }
+
     #[test]
     fn a_denied_secret_read_is_never_labelled_medium() {
         for command in [
