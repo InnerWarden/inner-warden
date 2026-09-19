@@ -2665,7 +2665,22 @@ pub fn check_sensitive_read(content: &str) -> Option<(&'static str, u32)> {
                 | ".key"
                 | ".pfx"
         );
-        return Some((path, if hard { 50 } else { 20 }));
+        // 60, not 50, for the always-secret class. The thresholds are
+        //
+        //     severity   >= 60 high, >= 30 medium
+        //     action     >= 40 deny, >= 20 review
+        //
+        // so 50 denied and still rendered "medium". The operator alert for
+        // `cat /etc/shadow` read "MEDIUM - DENIED", which is the product
+        // arguing with itself in one line: serious enough to block, labelled
+        // as though it were not. Built-in signals all top out at 50, so this
+        // was true of EVERY single-signal detection, however clear-cut.
+        //
+        // The action does not change: 50 and 60 both deny. Only the word does.
+        // The soft class stays at 20 and stays review, because a tool reading
+        // `.env` or `.npmrc` is ordinary and a hard block there is a false
+        // deny (see the note on `hard`).
+        return Some((path, if hard { 60 } else { 20 }));
     }
     None
 }
@@ -5810,7 +5825,7 @@ mod tests {
         assert!(check_sensitive_read("grep -rn \"d.keys()\" src/").is_none());
         assert!(check_sensitive_read("python3 -c \"print(cfg.keys())\"").is_none());
         // A real read of a key file still fires.
-        assert_eq!(check_sensitive_read("cat deploy.key"), Some((".key", 50)));
+        assert_eq!(check_sensitive_read("cat deploy.key"), Some((".key", 60)));
     }
 
     /// The live cloud credential is now scored like a credential, and the
@@ -5835,7 +5850,7 @@ mod tests {
         ] {
             assert_eq!(
                 check_sensitive_read(cmd),
-                Some((".aws/credentials", 50)),
+                Some((".aws/credentials", 60)),
                 "reading long-lived AWS keys must score like a credential: {cmd}"
             );
         }
@@ -5857,11 +5872,61 @@ mod tests {
         );
     }
 
+    /// The alert an operator actually received on 2026-09-19:
+    ///
+    /// ```text
+    /// 🟠 MEDIUM - DENIED
+    /// Command: cat /etc/shadow
+    /// Risk score: 50
+    /// ```
+    ///
+    /// Serious enough to block, labelled as though it were not. This asserts
+    /// the WORD matches the ACTION, not a particular number, so a later
+    /// re-scoring cannot quietly bring the contradiction back.
+    #[test]
+    fn a_denied_secret_read_is_never_labelled_medium() {
+        for command in [
+            "cat /etc/shadow",
+            "cat /etc/gshadow",
+            "cat ~/.ssh/id_rsa",
+            "base64 ~/.aws/credentials",
+            "cat deploy.key",
+        ] {
+            let a = crate::mcp::analyze_command(command, None);
+            assert_eq!(a.recommendation, "deny", "{command}");
+            assert_ne!(
+                a.severity, "medium",
+                "{command} is denied; calling it medium is the product arguing \
+                 with itself in one line (score {})",
+                a.risk_score
+            );
+        }
+    }
+
+    /// The other half, and the reason the soft class exists: a tool reading
+    /// `.env` or the AWS config beside the credentials is ordinary work. Those
+    /// must stay review, or the fix above becomes a wave of false denies.
+    #[test]
+    fn the_soft_class_still_only_asks_for_review() {
+        for (command, expected) in [
+            ("cat .env", ".env"),
+            ("cat ~/.npmrc", ".npmrc"),
+            ("cat ~/.aws/config", ".aws/"),
+        ] {
+            let hit = check_sensitive_read(command);
+            assert_eq!(
+                hit,
+                Some((expected, 20)),
+                "{command} must stay at the review score"
+            );
+        }
+    }
+
     #[test]
     fn sensitive_paths_require_a_content_read() {
         assert_eq!(
             check_sensitive_read("cat /etc/shadow"),
-            Some(("/etc/shadow", 50))
+            Some(("/etc/shadow", 60))
         );
         // Was `(".aws/", 20)`, a review. Archiving the file that holds
         // long-lived AWS access keys is exfil preparation, and it now scores
@@ -5869,7 +5934,7 @@ mod tests {
         // `the_aws_credential_file_is_hard_but_the_config_beside_it_is_not`.
         assert_eq!(
             check_sensitive_read("tar czf backup.tgz ~/.aws/credentials"),
-            Some((".aws/credentials", 50))
+            Some((".aws/credentials", 60))
         );
         for benign in [
             "echo '~/.ssh/id_rsa is documented here'",
