@@ -132,6 +132,12 @@ build, test, and submit changes.
 
 Apache-2.0. See `LICENSE`.
 
+The YAML detection rules under `rules/atr/` are derived from
+[Agent Threat Rules](https://github.com/Agent-Threat-Rule/agent-threat-rules),
+Copyright (c) 2026 ATR Contributors, MIT licensed. See `NOTICE` and
+`LICENSE-MIT`. The engine that loads them, and everything else here, is
+Apache-2.0.
+
 InnerWarden also offers a commercial host-enforcement layer for Linux production
 fleets (kernel-level enforcement, host telemetry, autonomous response). See
 [innerwarden.com](https://innerwarden.com). It is a separate product; this
