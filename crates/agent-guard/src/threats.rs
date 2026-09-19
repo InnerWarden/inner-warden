@@ -5922,17 +5922,32 @@ mod tests {
     }
 
     #[test]
-    fn clearing_your_own_shell_history_still_denies_without_claiming_high() {
-        // The other half of the split: one user's convenience record, not the
-        // host's. It must keep denying, and it must not be promoted to HIGH.
+    fn the_split_is_whose_record_is_destroyed() {
+        // Asserted on this rule's own contribution, not on the aggregate
+        // severity: several rules score the same command and the total is
+        // theirs together, so an aggregate assertion here would pass or fail
+        // for reasons that have nothing to do with this split.
+        //
+        // The host's audit trail scores what tearing the firewall down scores.
+        for command in [
+            "rm -rf /var/log/*",
+            "shred -u /var/log/auth.log",
+            "truncate -s 0 /var/log/syslog",
+            "journalctl --vacuum-time=1s",
+            "rm /var/audit/audit.log",
+            "echo > /var/log/secure",
+        ] {
+            let (_, score) = check_security_tamper(command)
+                .unwrap_or_else(|| panic!("{command} must still be caught"));
+            assert_eq!(score, 60, "{command} destroys the host audit trail");
+        }
+        // One user's own record keeps the lower score. Both deny; the action
+        // threshold is 40.
         for command in ["history -c", "unset HISTFILE", "rm ~/.bash_history"] {
-            let a = crate::mcp::analyze_command(command, None);
-            assert_eq!(a.recommendation, "deny", "{command}");
-            assert_eq!(
-                a.severity, "medium",
-                "{command} is one user's history (score {})",
-                a.risk_score
-            );
+            let (_, score) = check_security_tamper(command)
+                .unwrap_or_else(|| panic!("{command} must still be caught"));
+            assert_eq!(score, 50, "{command} is one user's history");
+            assert!(score >= 40, "{command} must still deny");
         }
     }
 
