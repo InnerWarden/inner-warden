@@ -396,14 +396,73 @@ const GROUP_MEANING: Record<CollectorCategory, string> = {
   snapshot: "Periodic inventories. The count is completed cycles, not detections.",
 };
 
+/**
+ * The caption's buckets, and the rule they obey: every row lands in exactly one.
+ *
+ * The caption used to count two overlapping filters, `liveness === "reporting"`
+ * and `!active`, and print both beside the group total. A quiet row is active
+ * and not reporting, so it fell in NEITHER: a group of 15 telemetry streams
+ * with 10 reporting, 1 quiet and 4 inactive captioned itself "10 of 15
+ * reporting, 4 not confirmed running" and the fifteenth row was simply missing
+ * from the sentence.
+ *
+ * Disabled fell into the doubt bucket for the opposite reason. "Not confirmed
+ * running" is an absence of evidence; a disabled collector is the presence of a
+ * decision, and a stronger fact: the operator switched it off, so nothing is
+ * watching for that class of event. Folding one into the other both overstates
+ * the unknowns and hides the state somebody can act on.
+ *
+ * The buckets sum to the row count, and the test asserts that sum. That
+ * assertion, not this comment, is what stops a sixth liveness from reopening
+ * the same hole.
+ */
+export type CaptionCounts = {
+  /** Events arrived today. */
+  reporting: number;
+  /** Attested and producing nothing today: healthy for an alarm, not for a stream. */
+  silent: number;
+  /** Impaired or never attested: we cannot say this one is running. */
+  notRunning: number;
+  /** Switched off in the sensor config. Not running, and not in doubt either. */
+  disabled: number;
+};
+
+export function captionCounts(rows: readonly CollectorRow[]): CaptionCounts {
+  const counts: CaptionCounts = { reporting: 0, silent: 0, notRunning: 0, disabled: 0 };
+  for (const row of rows) {
+    switch (row.liveness) {
+      case "reporting":
+        counts.reporting += 1;
+        break;
+      case "quiet":
+        counts.silent += 1;
+        break;
+      case "disabled":
+        counts.disabled += 1;
+        break;
+      case "impaired":
+      case "unattested":
+        counts.notRunning += 1;
+        break;
+    }
+  }
+  return counts;
+}
+
 function caption(category: CollectorCategory, rows: CollectorRow[]): string {
   if (rows.length === 0) return "None reported";
-  const reporting = rows.filter((row) => row.liveness === "reporting").length;
-  const notRunning = rows.filter((row) => !row.active).length;
-  const head = category === "alarm"
-    ? `${reporting} of ${rows.length} with findings`
-    : `${reporting} of ${rows.length} reporting`;
-  return notRunning === 0 ? head : `${head} · ${notRunning} not confirmed running`;
+  const { reporting, silent, notRunning, disabled } = captionCounts(rows);
+  const parts: string[] = [
+    category === "alarm"
+      ? `${reporting} of ${rows.length} with findings`
+      : `${reporting} of ${rows.length} reporting`,
+  ];
+  // The same words the rows in that state wear, per category, so the caption
+  // and the pills below it can be matched by eye.
+  if (silent > 0) parts.push(category === "alarm" ? `${silent} quiet` : `${silent} attached but silent`);
+  if (notRunning > 0) parts.push(`${notRunning} not confirmed running`);
+  if (disabled > 0) parts.push(`${disabled} switched off`);
+  return parts.join(" · ");
 }
 
 /**
@@ -434,19 +493,37 @@ const TONE_ORDER: Record<CollectorTone, number> = { warning: 0, attention: 1, ne
 /**
  * The one-line verdict above the board.
  *
- * Counts what is NOT confirmed running rather than what is, because that is the
- * number an operator acts on, and because "18 collectors active" was exactly the
+ * Counts what is NOT reporting rather than what is, because that is the number
+ * an operator acts on, and because "18 collectors active" was exactly the
  * sentence that let a host with nothing attached look healthy.
+ *
+ * Each clause here must name the population it counts, and count every row the
+ * board shows in that state. Two ways of getting that wrong have already
+ * shipped: a filter narrower than the pill its rows wear (telemetry only, under
+ * two rows both labelled "Attached, silent"), and a state left out altogether
+ * (disabled, so a board with a detector switched off called itself all
+ * confirmed running).
  */
 export function boardSummary(rows: readonly CollectorRow[]): string {
   if (rows.length === 0) return "No collectors were reported by this host.";
   const impaired = rows.filter((row) => row.liveness === "impaired").length;
   const unattested = rows.filter((row) => row.liveness === "unattested").length;
-  const silentStreams = rows.filter((row) => row.category === "telemetry" && row.liveness === "quiet").length;
+  // Every row that WEARS the "Attached, silent" pill, which is every quiet row
+  // outside the alarm group. Counting only the telemetry ones printed "25
+  // collectors: 1 attached but silent" above two rows each labelled exactly
+  // that, because a quiet snapshot collector gets the same pill and was left
+  // out of the headline. A quiet ALARM keeps its own pill ("Quiet") and stays
+  // out of this count: silence is its healthy state, not something to chase.
+  const silent = rows.filter((row) => row.liveness === "quiet" && row.category !== "alarm").length;
+  // Switched off is a fact, not a nil. Without this the summary of a board
+  // whose only non-reporting collector was disabled read "all confirmed
+  // running", which is the one sentence this function exists not to print.
+  const disabled = rows.filter((row) => row.liveness === "disabled").length;
   const parts: string[] = [];
   if (impaired > 0) parts.push(`${impaired} reporting a fault`);
   if (unattested > 0) parts.push(`${unattested} declared but not attested`);
-  if (silentStreams > 0) parts.push(`${silentStreams} attached but silent`);
+  if (silent > 0) parts.push(`${silent} attached but silent`);
+  if (disabled > 0) parts.push(`${disabled} switched off`);
   if (parts.length === 0) return `${rows.length} collectors, all confirmed running.`;
   return `${rows.length} collectors: ${parts.join(", ")}.`;
 }

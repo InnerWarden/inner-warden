@@ -238,6 +238,25 @@ describe("caseUrl", () => {
     const url = caseUrl("x".repeat(257), base);
     expect(url.searchParams.get("case")).toBeNull();
   });
+
+  /**
+   * "View all in Cases" is clicked from beside a counter that covers the whole
+   * decision record, and the Cases list defaults to the last 24 hours, so the
+   * same click used to answer a narrower question than the operator had just
+   * read: 17 decisions here, 1 case there.
+   *
+   * FAILS ON REVERT: without the span the landing view is the 24 hour default
+   * and the parameter is absent.
+   */
+  it("opens the whole list over the span the Home counter is over", () => {
+    expect(caseUrl(undefined, base).searchParams.get("window")).toBe("all");
+  });
+
+  it("says nothing about the window when it is opening one named case", () => {
+    // A named case is its own answer, and it carries no counter that promised a
+    // span. The Cases screen keeps its own default for the list around it.
+    expect(caseUrl("case:x:1", base).searchParams.get("window")).toBeNull();
+  });
 });
 
 describe("activity selection in the address bar", () => {

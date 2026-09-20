@@ -46,6 +46,67 @@ export const COMMUNITY_UPGRADE_STEP_KEY = "upgrade";
 /** The key of the closing step, so a composed table can keep it last. */
 export const TOUR_FINISH_STEP_KEY = "finish";
 
+/** The key of the opening step, which talks about the tour rather than a screen. */
+export const TOUR_WELCOME_STEP_KEY = "welcome";
+
+/**
+ * The key of the step that walks to the Activity screen.
+ *
+ * Named because that screen is Community's and only Community's: the Enterprise
+ * shell has no Activity tab (`deriveShellNavigation` in App.tsx), and the Cases
+ * screen is its decision record instead. See `stepsForShell`, which drops the
+ * step wherever the tab is not offered.
+ */
+export const ACTIVITY_TOUR_STEP_KEY = "activity";
+
+/**
+ * Drop every step whose screen this shell does not offer.
+ *
+ * A step with a `route` DRIVES the address bar to it. A shell with no such tab
+ * bounces the route straight back to Overview (`shouldResetToOverview`), the
+ * step's anchor never mounts, and the card centres itself and reads out copy
+ * about a screen the operator cannot reach. That is not theoretical: the
+ * composed Enterprise table carried the Activity step from the day it was
+ * composed, so an Enterprise operator on step 4 read "every command an agent
+ * tried, grouped by session" while looking at the Overview's flat Recent
+ * activity list of five. The copy was right about Activity; the step was on the
+ * wrong screen, because Activity is not one of this shell's tabs.
+ *
+ * Two routes are always kept: a step with no route stays where it is, and
+ * `overview` is the fallback every shell lands on. An EMPTY route list drops
+ * nothing, because a nav that has not rendered yet is missing evidence, not
+ * evidence that the shell has no screens.
+ *
+ * A contributed screen the shell renders without offering a tab is dropped too.
+ * Such a screen can be addressed directly and answers for itself, but a tour
+ * that walks an operator onto it leaves them on a screen with no tab to come
+ * back from, which is a worse place to be than one step shorter.
+ */
+export function stepsForShell(
+  steps: readonly TourStep[],
+  routes: readonly string[],
+): readonly TourStep[] {
+  if (routes.length === 0) return steps;
+  return steps.filter(
+    (step) => step.route === undefined || step.route === "overview" || routes.includes(step.route),
+  );
+}
+
+/**
+ * The routes this shell actually offers, read off the nav the header rendered.
+ *
+ * The header is the one surface that already knows the answer: it is handed
+ * `deriveShellNavigation`'s result, tabs and all. Reading it back from the DOM
+ * keeps the tour out of the shell's internals and means the paid bundle needs
+ * no change of its own to stop walking operators to a screen it does not have.
+ */
+function shellRoutes(): string[] {
+  const buttons = document.querySelectorAll<HTMLElement>('nav[aria-label="Dashboard views"] [data-route]');
+  return Array.from(buttons)
+    .map((button) => button.dataset.route ?? "")
+    .filter((route) => route.length > 0);
+}
+
 /**
  * The Community tour.
  *
@@ -102,9 +163,16 @@ export const PAID_SCREEN_TOUR_STEPS: readonly TourStep[] = [
 
 export const COMMUNITY_TOUR_STEPS: readonly TourStep[] = [
   {
-    key: "welcome",
+    key: TOUR_WELCOME_STEP_KEY,
     title: "Welcome to InnerWarden",
-    body: "A quick tour of what this dashboard shows you. It takes under a minute.",
+    // NO DURATION PROMISE. This copy is shared: the same sentence opens the
+    // Community table and the Enterprise one the paid bundle composes, which is
+    // twice the length. It promised "under a minute" over twelve steps, written
+    // when the only table had six. A fixed number would drift the same way, so
+    // the card's own step counter is the thing that states the size, and it
+    // counts the table actually being walked.
+    body: "A guided walk through what this dashboard shows you, one screen at a time. "
+      + "The counter below says how many steps there are, and Skip closes the tour at any point.",
   },
   {
     key: "nav",
@@ -120,7 +188,7 @@ export const COMMUNITY_TOUR_STEPS: readonly TourStep[] = [
     selectors: ['[data-tour="overview-agents"]', 'section[aria-labelledby="local-agents-title"]'],
   },
   {
-    key: "activity",
+    key: ACTIVITY_TOUR_STEP_KEY,
     title: "What your agents did",
     body: "Every command an agent tried, grouped by session, with the verdict for each one. Open a line to see why it was decided that way.",
     route: "activity",
@@ -534,6 +602,19 @@ export function TourLauncher({
 }) {
   const [open, setOpen] = useState(false);
   const [slot, setSlot] = useState<Element | "fallback" | null>(null);
+  // The table this run walks, fixed at the moment the tour opens. Filtering on
+  // every render would let the step count change underneath an operator who is
+  // halfway through it, which is how a tour silently ends early.
+  const [walking, setWalking] = useState<readonly TourStep[]>(steps);
+  // Read through a ref so the auto-open effect does not restart when a caller
+  // passes a fresh array literal.
+  const stepsRef = useRef(steps);
+  stepsRef.current = steps;
+
+  const openTour = () => {
+    setWalking(stepsForShell(stepsRef.current, shellRoutes()));
+    setOpen(true);
+  };
 
   useEffect(() => {
     // An automated browser (Playwright and friends set navigator.webdriver)
@@ -543,7 +624,10 @@ export function TourLauncher({
     if (window.navigator.webdriver) return;
     if (!shouldAutoOpen(window.localStorage, storageKey)) return;
     // Let the shell paint first so the welcome card appears over a real page.
-    const timer = window.setTimeout(() => setOpen(true), 600);
+    const timer = window.setTimeout(() => {
+      setWalking(stepsForShell(stepsRef.current, shellRoutes()));
+      setOpen(true);
+    }, 600);
     return () => window.clearTimeout(timer);
   }, [storageKey]);
 
@@ -579,7 +663,7 @@ export function TourLauncher({
   const button = (
     <button
       type="button"
-      onClick={() => setOpen(true)}
+      onClick={openTour}
       aria-label="Open the product tour"
       className="rounded-lg border border-slate-300 bg-white px-2.5 py-1 text-xs font-semibold text-slate-600 shadow-sm transition-colors hover:bg-slate-100 hover:text-slate-900"
     >
@@ -594,7 +678,7 @@ export function TourLauncher({
       ) : (
         createPortal(button, slot)
       )}
-      {open ? <ProductTour steps={steps} onClose={close} /> : null}
+      {open ? <ProductTour steps={walking} onClose={close} /> : null}
     </>
   );
 }

