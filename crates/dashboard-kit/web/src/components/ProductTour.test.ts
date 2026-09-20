@@ -318,5 +318,32 @@ describe("stepsForShell", () => {
     // screens. Treating it as the latter would silently gut the tour on a slow
     // bootstrap, which is worse than the defect being fixed.
     expect(stepsForShell(COMMUNITY_TOUR_STEPS, [])).toEqual(COMMUNITY_TOUR_STEPS);
+
+ * A tour step may only promise what a producer can actually fill.
+ *
+ * The Agents step said "with its runtime, its model". The agent inventory
+ * hardcodes `runtime: null` and `model: null` on every subject, and the agent
+ * card filters null detail rows out before rendering, so those two fields have
+ * never appeared on any host. The tour was pointing at a screen and describing
+ * something that is not on it.
+ *
+ * FAILS ON REVERT: restore "its runtime, its model" and the first expectation
+ * sees the forbidden phrase.
+ */
+describe("the tour does not promise fields no producer fills", () => {
+  const agents = PAID_SCREEN_TOUR_STEPS.find((step) => step.key === "agents");
+
+  it("has an Agents step to check", () => {
+    expect(agents).toBeDefined();
+  });
+
+  it("stops promising a runtime and a model", () => {
+    expect(agents!.body).not.toContain("runtime");
+    expect(agents!.body).not.toContain("model");
+  });
+
+  it("still describes what the screen really shows", () => {
+    expect(agents!.body).toContain("guardrail");
+    expect(agents!.body).toContain("running");
   });
 });

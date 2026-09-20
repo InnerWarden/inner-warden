@@ -58,11 +58,23 @@ export type CaseListPage = {
    * every consumer must treat them as absent-safe.
    */
   window?: CaseListWindow;
-  /** Cases in the whole window, not just this page: the "5 of 312" number. */
+  /**
+   * How many cases the server's projection HOLDS for the window, before
+   * pagination: the "5 of 312" number. It is a count of the projection, not a
+   * count of the window; `window_complete` says whether the two are the same.
+   */
   total_in_window?: number;
   /**
-   * False when a bounded source read hit its row cap, making total_in_window a
-   * LOWER bound. Render "at least N", never bare N, when this is false.
+   * False when a bounded source read hit its row cap, so `total_in_window`
+   * describes a TRUNCATED projection rather than the window.
+   *
+   * It is not a lower bound, and this doc used to say it was. The server reads
+   * each source table as a tail of its newest rows, and many rows collapse
+   * into one case, so new arrivals can evict more cases than they add: the
+   * number falls while the store only grows. One host reported 4,924 and then
+   * 4,922 two loads apart, under a label reading "at least".
+   *
+   * So never render "at least N" from this. Say what the read was.
    */
   window_complete?: boolean;
 };

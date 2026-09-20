@@ -147,8 +147,12 @@ export const PAID_SCREEN_TOUR_STEPS: readonly TourStep[] = [
   },
   {
     key: "agents",
+    // "with its runtime, its model" was a promise no producer could keep: the
+    // agent inventory hardcodes both fields to null, and the card filters null
+    // detail rows out before rendering, so neither has ever appeared on any
+    // host. The step now names only what the screen actually shows.
     title: "Per-agent detail",
-    body: "Every agent in one place, with its runtime, its model and the evidence that its guardrail was really running.",
+    body: "Every agent in one place, with whether it is running and the evidence that its guardrail was really working on it.",
     route: "agents",
     selectors: ['[data-tour="agents"]'],
   },
