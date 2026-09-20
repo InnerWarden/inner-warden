@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { CaseEvent } from "../api/cases";
-import { recordingLag, relationshipLegend } from "./CaseTimeline";
+import { modeBadge, recordingLag, relationshipLegend } from "./CaseTimeline";
+import { statusPresentation } from "./StatusBadge";
 
 type Relationship = CaseEvent["relationship"];
 
@@ -54,5 +55,37 @@ describe("the moment a source wrote an event down", () => {
 
   it("is shown when the source recorded it later than it happened", () => {
     expect(recordingLag({ observed_at: "2026-08-07T10:00:00Z", recorded_at: "2026-08-07T10:04:00Z" })).toBe(true);
+  });
+});
+
+/**
+ * A step in enforcing mode carried an amber exclamation mark, on a decision
+ * that had succeeded, because the call site hardcoded `status="degraded"` for
+ * enforce and `status="unknown"` for everything else. The mode in which the
+ * product protects you was the only one flagged as a problem, and every other
+ * mode looked identical to "we do not know".
+ *
+ * FAILS ON REVERT: hand "degraded" back to the badge for enforce and the tone
+ * is "attention" with an exclamation mark again.
+ */
+describe("the effective mode of a step", () => {
+  it("never warns about the mode in which the product protects you", () => {
+    const presentation = statusPresentation(modeBadge("enforce").status, modeBadge("enforce").label);
+    expect(presentation.tone).toBe("informational");
+    expect(presentation.symbol).not.toBe("!");
+    expect(presentation.label).toBe("enforce mode");
+  });
+
+  it("tells the modes apart instead of collapsing them into one question mark", () => {
+    const modes = ["disabled", "learning", "observe", "rehearse", "enforce", "mixed", "unknown"] as const;
+    const symbols = modes.map((mode) => statusPresentation(modeBadge(mode).status).symbol);
+    expect(new Set(symbols).size).toBeGreaterThan(1);
+    // And only the honest unknown keeps the question mark.
+    expect(statusPresentation(modeBadge("unknown").status).symbol).toBe("?");
+    expect(statusPresentation(modeBadge("observe").status).symbol).not.toBe("?");
+  });
+
+  it("keeps naming the mode it is showing", () => {
+    expect(modeBadge("rehearse")).toEqual({ status: "rehearse", label: "rehearse mode" });
   });
 });
