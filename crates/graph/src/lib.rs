@@ -792,12 +792,29 @@ impl Graph {
                     Some("allow") => s.allow_verdicts += 1,
                     _ => s.unknown_verdicts += 1,
                 }
-                match n.attrs.get("outcome").map(String::as_str) {
+                let outcome = n.attrs.get("outcome").map(String::as_str);
+                match outcome {
                     Some("blocked") => s.actual_blocks += 1,
                     Some("would_block") => s.would_block += 1,
                     Some("screened") => s.screened += 1,
                     Some("allowed") => {}
                     _ => s.outcomes_unknown += 1,
+                }
+                // The CROSS of the two, because the marginals cannot answer the
+                // one question the headline asks.
+                //
+                // `deny_verdicts` partitions by RECOMMENDATION and
+                // `actual_blocks` by OUTCOME, so "how many denies were not
+                // blocked" is not `deny_verdicts - actual_blocks`, and it is not
+                // that minus `screened` either: on the measured host `screened`
+                // (16) included the six allows, so subtracting it explained away
+                // ten real denies and the page went back to saying everything
+                // was fine. Two axes, one join, counted here where both
+                // attributes are on the same node.
+                if n.attrs.get("recommendation").map(String::as_str) == Some("deny")
+                    && outcome != Some("blocked")
+                {
+                    s.denies_without_block += 1;
                 }
             }
         }
@@ -1028,6 +1045,7 @@ impl Graph {
             would_block: stats.would_block,
             screened: stats.screened,
             outcomes_unknown: stats.outcomes_unknown,
+            denies_without_block: stats.denies_without_block,
             top_categories,
             recent_blocks: blocks,
             recent_decisions,
@@ -1378,6 +1396,19 @@ pub struct GraphStats {
     pub would_block: usize,
     pub screened: usize,
     pub outcomes_unknown: usize,
+    /// Commands the guardrail said DENY on whose outcome was not a block.
+    ///
+    /// A cross of two partitions that the marginals beside it cannot express:
+    /// `deny_verdicts` counts recommendations, `actual_blocks` counts outcomes,
+    /// and `screened` counts outcomes for allows as well as denies. Anyone
+    /// deriving this by subtraction gets it wrong, which is why it is counted
+    /// where both attributes sit on one node.
+    ///
+    /// Most of these are a one-off `check-command`: the guard was asked, it
+    /// answered deny, and there was no execution to stop. That is the product
+    /// working, not failing, so a screen must not read this as a breach. What
+    /// nobody here can know is whether the caller honoured the answer.
+    pub denies_without_block: usize,
 }
 
 /// The Home-screen summary (JSON-serialized by the dashboard API).
@@ -1406,6 +1437,19 @@ pub struct Overview {
     pub would_block: usize,
     pub screened: usize,
     pub outcomes_unknown: usize,
+    /// Commands the guardrail said DENY on whose outcome was not a block.
+    ///
+    /// A cross of two partitions that the marginals beside it cannot express:
+    /// `deny_verdicts` counts recommendations, `actual_blocks` counts outcomes,
+    /// and `screened` counts outcomes for allows as well as denies. Anyone
+    /// deriving this by subtraction gets it wrong, which is why it is counted
+    /// where both attributes sit on one node.
+    ///
+    /// Most of these are a one-off `check-command`: the guard was asked, it
+    /// answered deny, and there was no execution to stop. That is the product
+    /// working, not failing, so a screen must not read this as a breach. What
+    /// nobody here can know is whether the caller honoured the answer.
+    pub denies_without_block: usize,
     pub top_categories: Vec<CategoryCount>,
     /// Legacy list of deny verdicts; entries now include their actual outcome.
     pub recent_blocks: Vec<BlockSummary>,

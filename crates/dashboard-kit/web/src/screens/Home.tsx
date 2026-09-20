@@ -199,6 +199,7 @@ was incomplete; it does not mean this host is idle.`}
     wouldBlock: overview.would_block ?? null,
     screened: overview.screened ?? null,
     outcomesUnknown: overview.outcomes_unknown ?? null,
+    deniesWithoutBlock: overview.denies_without_block ?? null,
     monitorOnly: mode === "monitor",
     unprovenAgents: 0,
   });

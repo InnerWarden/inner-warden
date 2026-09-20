@@ -8,6 +8,7 @@ const healthy = {
   wouldBlock: 0,
   screened: 0,
   outcomesUnknown: 0,
+  deniesWithoutBlock: 0,
   monitorOnly: false,
   unprovenAgents: 0,
 };
@@ -35,7 +36,7 @@ describe("headline answer", () => {
     for (const extra of [{}, { monitorOnly: true }, { unprovenAgents: 3 }]) {
       const result = headline({ ...healthy, needsReview: 136, ...extra });
       expect(result.answer).toContain("136");
-      expect(result.answer).not.toContain("Protected");
+      expect(result.answer).not.toContain("Protected. Nothing needs you");
       expect(result.tone).toBe("attention");
       expect(result.next, "a queued state must say where to go").toBeTruthy();
     }
@@ -73,72 +74,79 @@ describe("headline answer", () => {
    * report. So no arithmetic in this function could reach the sentence.
    */
   /**
-   * AN EXPLAINED OUTCOME IS NOT A GAP.
+   * THE ARITHMETIC THAT WAS WRONG.
    *
-   * The first version of this branch subtracted only the blocks, so monitor
-   * mode, a one-off check and an unreadable outcome each read as an unsafe
-   * action nobody stopped. All three arrive on the same payload, and the card
-   * directly under this sentence lists them, so the headline accused the host
-   * over numbers printed just below it.
+   * The first fix subtracted the outcome counters from the deny count. Those
+   * are two different partitions: `screened` covers allows as well as denies,
+   * and on the measured host it was 16 against 11 denies, so the subtraction
+   * explained away ten real denies and the page went back to saying everything
+   * was fine. The producer now counts the cross and this reads it.
    *
-   * FAILS ON REVERT: drop `explained` from the subtraction and each of these
-   * produces the accusation.
+   * FAILS ON REVERT: derive the number here again and the measured host stops
+   * reporting its ten.
    */
-  it("does not accuse a host over outcomes it explained", () => {
-    // Monitor mode: the operator chose to watch, so nothing was stopped and
-    // nothing is wrong.
-    const watching = headline({
+  it("reads the producer's cross instead of subtracting the marginals", () => {
+    // The measured host, exactly: 11 deny, 1 blocked, 16 screened (six of which
+    // are allows), and ten denies whose outcome was not a block.
+    const measured = headline({
       ...healthy,
-      denyVerdicts: 2,
+      denyVerdicts: 11,
       blockedBeforeExecution: 1,
-      wouldBlock: 1,
+      screened: 16,
+      deniesWithoutBlock: 10,
     });
-    expect(watching.answer).not.toContain("no block recorded");
-
-    // A one-off check never had an execution to stop.
-    const checked = headline({
+    expect(measured.answer).toContain("10");
+    // The marginals must not be able to talk it out of the number.
+    const noisy = headline({
       ...healthy,
-      denyVerdicts: 2,
+      denyVerdicts: 11,
       blockedBeforeExecution: 1,
-      screened: 1,
+      screened: 999,
+      wouldBlock: 999,
+      outcomesUnknown: 999,
+      deniesWithoutBlock: 10,
     });
-    expect(checked.answer).not.toContain("no block recorded");
-
-    // The host DID record an outcome; this version cannot read it. That is a
-    // reason to say less, not to accuse.
-    const unreadable = headline({
-      ...healthy,
-      denyVerdicts: 2,
-      blockedBeforeExecution: 1,
-      outcomesUnknown: 1,
-    });
-    expect(unreadable.answer).not.toContain("no block recorded");
-
-    // All three together.
-    const mixed = headline({
-      ...healthy,
-      denyVerdicts: 4,
-      blockedBeforeExecution: 1,
-      wouldBlock: 1,
-      screened: 1,
-      outcomesUnknown: 1,
-    });
-    expect(mixed.answer).not.toContain("no block recorded");
+    expect(noisy.answer).toContain("10");
   });
 
   /**
-   * The other direction: an explanation must not swallow a real gap. One deny
-   * is explained, one is not, and the one that is not still has to be said.
+   * A HEALTHY HOST MUST NOT BE PAINTED RED.
+   *
+   * A screened deny is the guard being ASKED and answering: there was no
+   * execution to stop. Alarming over it would fill a working host with lights
+   * about questions it got right, which teaches the operator to ignore the
+   * screen. It reports the number and keeps the good tone, and it says the one
+   * thing nobody can know.
    */
-  it("still counts the unsafe actions nothing explains", () => {
+  it("reports a screened deny without raising an alarm", () => {
     const result = headline({
       ...healthy,
-      denyVerdicts: 3,
+      denyVerdicts: 11,
       blockedBeforeExecution: 1,
-      wouldBlock: 1,
+      screened: 16,
+      deniesWithoutBlock: 10,
     });
-    expect(result.answer).toContain("1 unsafe action judged");
-    expect(result.tone).toBe("attention");
+    expect(result.tone).toBe("good");
+    expect(result.answer).toContain("Protecting");
+    expect(result.next).toContain("not recorded");
+    for (const alarming of ["breach", "attack", "succeeded", "failed", "unprotected"]) {
+      expect(result.answer).not.toContain(alarming);
+    }
+  });
+
+  /**
+   * And the clean host still gets the clean sentence: no number is invented to
+   * look busy.
+   */
+  it("says nothing needs you when every deny was stopped", () => {
+    const result = headline({
+      ...healthy,
+      denyVerdicts: 11,
+      blockedBeforeExecution: 11,
+      deniesWithoutBlock: 0,
+    });
+    expect(result.answer).toBe("Protected. Nothing needs you.");
+    expect(result.tone).toBe("good");
   });
 
   /**
@@ -146,18 +154,18 @@ describe("headline answer", () => {
    * send the reader there expecting that word.
    */
   it("does not promise Posture will name what is enforcing", () => {
-    const result = headline({ ...healthy, denyVerdicts: 11, blockedBeforeExecution: 1 });
+    const result = headline({ ...healthy, denyVerdicts: 11, blockedBeforeExecution: 1, deniesWithoutBlock: 10 });
     expect(result.next).not.toContain("enforcing");
   });
 
-  it("never says protected while unsafe verdicts have no block against them", () => {
-    const result = headline({ ...healthy, denyVerdicts: 11, blockedBeforeExecution: 1 });
-    expect(result.answer).not.toContain("Protected");
+  it("never says nothing needs you while unsafe verdicts have no block against them", () => {
+    const result = headline({ ...healthy, denyVerdicts: 11, blockedBeforeExecution: 1, deniesWithoutBlock: 10 });
+    expect(result.answer).not.toContain("Protected. Nothing needs you");
     expect(result.answer).toContain("10");
-    expect(result.tone).toBe("attention");
+    expect(result.tone).toBe("good");
     expect(result.next).toContain("11");
     expect(result.next).toContain("1 stopped before execution");
-    expect(result.next).toContain("Posture");
+    expect(result.next).toContain("not recorded");
   });
 
   /**
@@ -165,8 +173,8 @@ describe("headline answer", () => {
    * in nothing but the number of blocks must not produce the same sentence.
    */
   it("changes its answer when the number of blocks changes", () => {
-    const unstopped = headline({ ...healthy, denyVerdicts: 11, blockedBeforeExecution: 1 });
-    const allStopped = headline({ ...healthy, denyVerdicts: 11, blockedBeforeExecution: 11 });
+    const unstopped = headline({ ...healthy, denyVerdicts: 11, blockedBeforeExecution: 1, deniesWithoutBlock: 10 });
+    const allStopped = headline({ ...healthy, denyVerdicts: 11, blockedBeforeExecution: 11, deniesWithoutBlock: 0 });
     expect(unstopped.answer).not.toBe(allStopped.answer);
     expect(allStopped.answer).toBe("Protected. Nothing needs you.");
     // More blocks than deny verdicts is normal: a block can belong to a review
@@ -177,11 +185,11 @@ describe("headline answer", () => {
   });
 
   it("counts one unstopped action in the singular", () => {
-    expect(headline({ ...healthy, denyVerdicts: 4, blockedBeforeExecution: 3 }).answer).toBe(
-      "1 unsafe action judged, no block recorded",
+    expect(headline({ ...healthy, denyVerdicts: 4, blockedBeforeExecution: 3, deniesWithoutBlock: 1 }).answer).toBe(
+      "Protecting. 1 unsafe action judged, not stopped here",
     );
-    expect(headline({ ...healthy, denyVerdicts: 4, blockedBeforeExecution: 2 }).answer).toBe(
-      "2 unsafe actions judged, no block recorded",
+      expect(headline({ ...healthy, denyVerdicts: 4, blockedBeforeExecution: 2, deniesWithoutBlock: 2 }).answer).toBe(
+        "Protecting. 2 unsafe actions judged, not stopped here",
     );
   });
 
@@ -191,9 +199,9 @@ describe("headline answer", () => {
    * "succeeded" and "attacks" are claims this function has no evidence for.
    */
   it("reports the record, not an outcome it cannot see", () => {
-    const result = headline({ ...healthy, denyVerdicts: 11, blockedBeforeExecution: 1 });
+    const result = headline({ ...healthy, denyVerdicts: 11, blockedBeforeExecution: 1, deniesWithoutBlock: 10 });
     expect(result.answer).not.toMatch(/attack|succeed|breach|compromis|ran\b/i);
-    expect(result.answer).toContain("no block recorded");
+    expect(result.answer).toContain("not stopped here");
   });
 
   /**
@@ -204,9 +212,13 @@ describe("headline answer", () => {
   it("says the outcome is unrecorded rather than inventing a gap", () => {
     const result = headline({ ...healthy, denyVerdicts: 11, blockedBeforeExecution: null });
     expect(result.answer).toBe("11 judged unsafe, outcome not recorded");
-    expect(result.answer).not.toContain("Protected");
-    expect(result.tone).toBe("attention");
-    expect(result.next).toContain("Posture");
+    expect(result.answer).not.toContain("Protected. Nothing needs you");
+      // A host reporting NO outcome at all is not the screened-deny case: the
+      // product cannot see what happened, which is a visibility gap and does
+      // deserve the operator's attention. It is also unreachable on a real
+      // host today, since `actual_blocks` is always sent.
+      expect(result.tone).toBe("attention");
+      expect(result.next).toContain("no outcome");
   });
 
   it("mentions an unproven agent without making it the headline", () => {

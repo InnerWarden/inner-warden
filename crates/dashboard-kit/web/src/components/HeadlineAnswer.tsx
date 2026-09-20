@@ -39,6 +39,16 @@ export type HeadlineInput = {
   screened: number | null;
   /** Verdicts whose recorded outcome this version cannot read. */
   outcomesUnknown: number | null;
+  /**
+   * Denies whose outcome was NOT a block, counted by the producer as a cross of
+   * the two partitions.
+   *
+   * Never derive this here. `denyVerdicts` partitions by recommendation and the
+   * outcome counters partition by outcome, and `screened` covers allows too: on
+   * the measured host it was 16 against 11 denies, so subtracting it explained
+   * away ten real denies and the page went back to saying all was well.
+   */
+  deniesWithoutBlock: number | null;
   /** True when the guardrail is watching but not enforcing. */
   monitorOnly: boolean;
   /** Agents configured but never seen working. */
@@ -118,33 +128,29 @@ export function headline(input: HeadlineInput): Headline {
         tone: "attention",
       };
     }
-      // Subtract the outcomes the host EXPLAINED before accusing it of anything.
-      //
-      // The first version of this branch counted every deny with no block as a
-      // gap, which turned three ordinary states into an accusation: monitor
-      // mode (would_block), a one-off check that never had an execution to stop
-      // (screened), and an outcome the host did record but this version cannot
-      // read (outcomes_unknown). All three arrive on the SAME payload as the
-      // blocks, and the card directly below this sentence already lists them,
-      // so reading the blocks and ignoring the rest made the headline
-      // contradict the card under it. That is the defect this branch exists to
-      // kill, pointed the other way.
-      const explained =
-        (input.wouldBlock ?? 0) + (input.screened ?? 0) + (input.outcomesUnknown ?? 0);
-      const noBlockRecorded = Math.max(
-        0,
-        input.denyVerdicts - input.blockedBeforeExecution - explained,
-      );
+      // Counted by the PRODUCER as a cross of the two partitions, never derived
+      // here. `denyVerdicts` partitions by recommendation and the outcome
+      // counters partition by outcome, and `screened` covers allows too: on the
+      // measured host it was 16 against 11 denies, so subtracting it explained
+      // away ten real denies and the page went back to saying all was well.
+      const noBlockRecorded = input.deniesWithoutBlock ?? 0;
     if (noBlockRecorded > 0) {
       // A floor, not an estimate: a recorded block may belong to a verdict that
       // was not a deny, so the true number of unsafe verdicts with nothing
       // against them can only be this or higher. Understating is the only safe
       // direction for a number that accuses.
       const plural = noBlockRecorded === 1 ? "action" : "actions";
+        // TONE, deliberately good. Most of these are a one-off `check-command`:
+        // the guard was asked, it answered deny, and there was no execution to
+        // stop. That is the product WORKING. Painting a healthy host red over
+        // questions it answered correctly is its own kind of lie, and the fast
+        // way to teach an operator to ignore the screen. This reports, it does
+        // not accuse. The one thing nobody here can know is whether the caller
+        // honoured the answer, and that is what the detail says.
       return {
-        answer: `${noBlockRecorded.toLocaleString()} unsafe ${plural} judged, no block recorded`,
-        next: `${input.denyVerdicts.toLocaleString()} classified as unsafe, ${input.blockedBeforeExecution.toLocaleString()} stopped before execution. Open Posture to see what each control is doing.`,
-        tone: "attention",
+          answer: `Protecting. ${noBlockRecorded.toLocaleString()} unsafe ${plural} judged, not stopped here`,
+          next: `${input.denyVerdicts.toLocaleString()} judged unsafe, ${input.blockedBeforeExecution.toLocaleString()} stopped before execution here. The rest were one-off checks with no execution to stop, so whether the caller honoured the answer is not recorded on this host.`,
+          tone: "good",
       };
     }
   }
