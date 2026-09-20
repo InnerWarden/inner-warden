@@ -75,7 +75,11 @@ export function decisionRecordCta(
  * to say what each figure means rather than to bend one into the other.
  */
 export function recordedDecisionsDetail(sessions: number): string {
-  return `All time, across ${sessions} session${sessions === 1 ? "" : "s"}`;
+  // NOT "all time". `Graph::prune` drops the oldest nodes past MAX_NODES and
+  // sheds another tenth on top, so the store is bounded and the oldest
+  // decisions are gone. Saying "all time" over a pruned record is the same
+  // class of claim this whole pass is removing.
+  return `No time window, across ${sessions} session${sessions === 1 ? "" : "s"}`;
 }
 
 /**
@@ -192,6 +196,9 @@ was incomplete; it does not mean this host is idle.`}
     // `?? null`, never `?? 0`: a host that sends no outcome figures has not
     // said it stopped nothing, and the headline must not read it as if it had.
     blockedBeforeExecution: overview.actual_blocks ?? null,
+    wouldBlock: overview.would_block ?? null,
+    screened: overview.screened ?? null,
+    outcomesUnknown: overview.outcomes_unknown ?? null,
     monitorOnly: mode === "monitor",
     unprovenAgents: 0,
   });

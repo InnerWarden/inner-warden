@@ -29,6 +29,16 @@ export type HeadlineInput = {
    * stopping nothing when the truth is that it never said.
    */
   blockedBeforeExecution: number | null;
+  /**
+   * Verdicts the guardrail would have blocked but did not, because it was not
+   * enforcing. A verdict counted here is EXPLAINED: the operator chose to
+   * watch, so it is not a gap they have to answer for.
+   */
+  wouldBlock: number | null;
+  /** Verdicts from a one-off check, which never had an execution to stop. */
+  screened: number | null;
+  /** Verdicts whose recorded outcome this version cannot read. */
+  outcomesUnknown: number | null;
   /** True when the guardrail is watching but not enforcing. */
   monitorOnly: boolean;
   /** Agents configured but never seen working. */
@@ -104,11 +114,27 @@ export function headline(input: HeadlineInput): Headline {
       // claimed. "Not recorded" beats a confident wrong number.
       return {
         answer: `${input.denyVerdicts.toLocaleString()} judged unsafe, outcome not recorded`,
-        next: "This host reports no outcome for its verdicts. Open Posture to see which controls are actually enforcing.",
+        next: "This host reports no outcome for its verdicts. Open Posture to see what each control is doing.",
         tone: "attention",
       };
     }
-    const noBlockRecorded = input.denyVerdicts - input.blockedBeforeExecution;
+      // Subtract the outcomes the host EXPLAINED before accusing it of anything.
+      //
+      // The first version of this branch counted every deny with no block as a
+      // gap, which turned three ordinary states into an accusation: monitor
+      // mode (would_block), a one-off check that never had an execution to stop
+      // (screened), and an outcome the host did record but this version cannot
+      // read (outcomes_unknown). All three arrive on the SAME payload as the
+      // blocks, and the card directly below this sentence already lists them,
+      // so reading the blocks and ignoring the rest made the headline
+      // contradict the card under it. That is the defect this branch exists to
+      // kill, pointed the other way.
+      const explained =
+        (input.wouldBlock ?? 0) + (input.screened ?? 0) + (input.outcomesUnknown ?? 0);
+      const noBlockRecorded = Math.max(
+        0,
+        input.denyVerdicts - input.blockedBeforeExecution - explained,
+      );
     if (noBlockRecorded > 0) {
       // A floor, not an estimate: a recorded block may belong to a verdict that
       // was not a deny, so the true number of unsafe verdicts with nothing
@@ -117,7 +143,7 @@ export function headline(input: HeadlineInput): Headline {
       const plural = noBlockRecorded === 1 ? "action" : "actions";
       return {
         answer: `${noBlockRecorded.toLocaleString()} unsafe ${plural} judged, no block recorded`,
-        next: `${input.denyVerdicts.toLocaleString()} classified as unsafe, ${input.blockedBeforeExecution.toLocaleString()} stopped before execution. Open Posture to see which controls are actually enforcing.`,
+        next: `${input.denyVerdicts.toLocaleString()} classified as unsafe, ${input.blockedBeforeExecution.toLocaleString()} stopped before execution. Open Posture to see what each control is doing.`,
         tone: "attention",
       };
     }

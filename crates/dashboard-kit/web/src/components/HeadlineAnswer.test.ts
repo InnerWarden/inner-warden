@@ -5,6 +5,9 @@ const healthy = {
   needsReview: 0,
   denyVerdicts: 0,
   blockedBeforeExecution: 0,
+  wouldBlock: 0,
+  screened: 0,
+  outcomesUnknown: 0,
   monitorOnly: false,
   unprovenAgents: 0,
 };
@@ -69,6 +72,84 @@ describe("headline answer", () => {
    * `denyVerdicts` was gated on monitor mode, which a paid host can never
    * report. So no arithmetic in this function could reach the sentence.
    */
+  /**
+   * AN EXPLAINED OUTCOME IS NOT A GAP.
+   *
+   * The first version of this branch subtracted only the blocks, so monitor
+   * mode, a one-off check and an unreadable outcome each read as an unsafe
+   * action nobody stopped. All three arrive on the same payload, and the card
+   * directly under this sentence lists them, so the headline accused the host
+   * over numbers printed just below it.
+   *
+   * FAILS ON REVERT: drop `explained` from the subtraction and each of these
+   * produces the accusation.
+   */
+  it("does not accuse a host over outcomes it explained", () => {
+    // Monitor mode: the operator chose to watch, so nothing was stopped and
+    // nothing is wrong.
+    const watching = headline({
+      ...healthy,
+      denyVerdicts: 2,
+      blockedBeforeExecution: 1,
+      wouldBlock: 1,
+    });
+    expect(watching.answer).not.toContain("no block recorded");
+
+    // A one-off check never had an execution to stop.
+    const checked = headline({
+      ...healthy,
+      denyVerdicts: 2,
+      blockedBeforeExecution: 1,
+      screened: 1,
+    });
+    expect(checked.answer).not.toContain("no block recorded");
+
+    // The host DID record an outcome; this version cannot read it. That is a
+    // reason to say less, not to accuse.
+    const unreadable = headline({
+      ...healthy,
+      denyVerdicts: 2,
+      blockedBeforeExecution: 1,
+      outcomesUnknown: 1,
+    });
+    expect(unreadable.answer).not.toContain("no block recorded");
+
+    // All three together.
+    const mixed = headline({
+      ...healthy,
+      denyVerdicts: 4,
+      blockedBeforeExecution: 1,
+      wouldBlock: 1,
+      screened: 1,
+      outcomesUnknown: 1,
+    });
+    expect(mixed.answer).not.toContain("no block recorded");
+  });
+
+  /**
+   * The other direction: an explanation must not swallow a real gap. One deny
+   * is explained, one is not, and the one that is not still has to be said.
+   */
+  it("still counts the unsafe actions nothing explains", () => {
+    const result = headline({
+      ...healthy,
+      denyVerdicts: 3,
+      blockedBeforeExecution: 1,
+      wouldBlock: 1,
+    });
+    expect(result.answer).toContain("1 unsafe action judged");
+    expect(result.tone).toBe("attention");
+  });
+
+  /**
+   * Posture never calls an unpinned claim "enforcing", so the headline must not
+   * send the reader there expecting that word.
+   */
+  it("does not promise Posture will name what is enforcing", () => {
+    const result = headline({ ...healthy, denyVerdicts: 11, blockedBeforeExecution: 1 });
+    expect(result.next).not.toContain("enforcing");
+  });
+
   it("never says protected while unsafe verdicts have no block against them", () => {
     const result = headline({ ...healthy, denyVerdicts: 11, blockedBeforeExecution: 1 });
     expect(result.answer).not.toContain("Protected");

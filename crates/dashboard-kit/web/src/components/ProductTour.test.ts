@@ -318,7 +318,10 @@ describe("stepsForShell", () => {
     // screens. Treating it as the latter would silently gut the tour on a slow
     // bootstrap, which is worse than the defect being fixed.
     expect(stepsForShell(COMMUNITY_TOUR_STEPS, [])).toEqual(COMMUNITY_TOUR_STEPS);
+  });
+});
 
+/**
  * A tour step may only promise what a producer can actually fill.
  *
  * The Agents step said "with its runtime, its model". The agent inventory

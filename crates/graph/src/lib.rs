@@ -775,33 +775,30 @@ impl Graph {
             }
         }
         for n in &self.nodes {
-            match n.kind.as_str() {
-                "command" => {
-                    s.commands += 1;
-                    if let Some(session) = command_session(&n.id) {
-                        sessions.insert(session);
-                    }
-                    match n.attrs.get("recommendation").map(String::as_str) {
-                        Some("deny") => {
-                            s.blocked += 1; // backwards-compatible alias
-                            s.deny_verdicts += 1;
-                        }
-                        Some("review") => {
-                            s.review += 1; // backwards-compatible alias
-                            s.review_verdicts += 1;
-                        }
-                        Some("allow") => s.allow_verdicts += 1,
-                        _ => s.unknown_verdicts += 1,
-                    }
-                    match n.attrs.get("outcome").map(String::as_str) {
-                        Some("blocked") => s.actual_blocks += 1,
-                        Some("would_block") => s.would_block += 1,
-                        Some("screened") => s.screened += 1,
-                        Some("allowed") => {}
-                        _ => s.outcomes_unknown += 1,
-                    }
+            if n.kind == "command" {
+                s.commands += 1;
+                if let Some(session) = command_session(&n.id) {
+                    sessions.insert(session);
                 }
-                _ => {}
+                match n.attrs.get("recommendation").map(String::as_str) {
+                    Some("deny") => {
+                        s.blocked += 1; // backwards-compatible alias
+                        s.deny_verdicts += 1;
+                    }
+                    Some("review") => {
+                        s.review += 1; // backwards-compatible alias
+                        s.review_verdicts += 1;
+                    }
+                    Some("allow") => s.allow_verdicts += 1,
+                    _ => s.unknown_verdicts += 1,
+                }
+                match n.attrs.get("outcome").map(String::as_str) {
+                    Some("blocked") => s.actual_blocks += 1,
+                    Some("would_block") => s.would_block += 1,
+                    Some("screened") => s.screened += 1,
+                    Some("allowed") => {}
+                    _ => s.outcomes_unknown += 1,
+                }
             }
         }
         s.sessions = sessions.len();

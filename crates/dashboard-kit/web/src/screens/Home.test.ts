@@ -168,12 +168,12 @@ describe("recordedDecisionsDetail", () => {
   // FAILS ON REVERT: the old detail was "3 sessions" and carried no span.
   it("states the span the count is over, not only the session total", () => {
     const detail = recordedDecisionsDetail(3);
-    expect(detail).toContain("All time");
+    expect(detail).toContain("No time window");
     expect(detail).toContain("3 sessions");
   });
 
   it("keeps the singular for a single session", () => {
-    expect(recordedDecisionsDetail(1)).toBe("All time, across 1 session");
+    expect(recordedDecisionsDetail(1)).toBe("No time window, across 1 session");
   });
 });
 
