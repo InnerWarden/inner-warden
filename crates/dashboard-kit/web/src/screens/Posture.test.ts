@@ -21,6 +21,7 @@ import type {
 import {
   agentLayerFigures,
   checkedAt,
+  claimSoftened,
   controlCountLine,
   controlPill,
   dispositionLabel,
@@ -340,11 +341,16 @@ describe("the verdict hero leads with what the user asked", () => {
   it("shows each control in plain words with its scope name and check time", () => {
     const pill = controlPill(posture().layers[0], bootstrap(), generatedAt, true, evaluatedAt);
     expect(pill.name).toBe("Independent host execution");
-    // "Working as set up", not "Enforcing": this fixture carries no claims
-    // records, so the assurance rule does not agree that it is verified, and
-    // the pill is not allowed to borrow the stronger word. The control is still
-    // doing what it was told, which is why this is calm and not an alarm.
-    expect(pill.mode).toBe("Working as set up");
+    // Not "Enforcing": this fixture carries no claims records, so the assurance
+    // rule does not agree that it is verified, and the pill is not allowed to
+    // borrow the stronger word. The control is still doing what it was told,
+    // which is why this is calm and not an alarm.
+    //
+    // "Working, not proven", not "Working as set up": the host reported this
+    // one as proven and the veto softened it, which is a different fact from a
+    // control that was only ever configured, and the host's own headline counts
+    // the two apart.
+    expect(pill.mode).toBe("Working, not proven");
     expect(pill.scope).toBe("OpenClaw workload");
     expect(pill.freshness).toMatch(/^as of \d{2}:\d{2}$/);
     // The producer freshness budget is contract bookkeeping; the summary never
@@ -425,11 +431,36 @@ describe("gap routing: amber is reserved for what the user must act on", () => {
 
 describe("the empty gaps state is one quiet line", () => {
   it("says the positive thing and stops", () => {
-    expect(emptyGapsLine(0)).toBe("No coverage gaps in this snapshot.");
+    expect(emptyGapsLine(0)).toBe(
+      "No gaps reported by the host controls above. Sensor collector state is not part of this check.",
+    );
   });
 
   it("stays honest when only verification-lane gaps exist", () => {
-    expect(emptyGapsLine(3)).toBe("No coverage gaps need attention in this snapshot.");
+    expect(emptyGapsLine(3)).toBe(
+      "No gaps in the host controls above need your attention. Sensor collector state is not part of this check.",
+    );
+  });
+
+  /**
+   * Measured on the live dashboard: this line read "No coverage gaps need
+   * attention in this snapshot" while the docker detector was DISABLED and four
+   * telemetry streams were silent, which the operator could see on the same
+   * session.
+   *
+   * `posture.gaps` cannot carry that fact. The producer emits gap ids only for
+   * the kernel execution-control capability's own proof chain, and collector
+   * state travels on the sensor board instead, so the old sentence claimed a
+   * clean bill over a population it had never looked at. It may only speak for
+   * what it examined.
+   */
+  it("never claims a clean bill over coverage it cannot see", () => {
+    for (const total of [0, 3]) {
+      const line = emptyGapsLine(total);
+      expect(line).not.toContain("No coverage gaps");
+      expect(line).toContain("host controls above");
+      expect(line).toContain("Sensor collector state is not part of this check.");
+    }
   });
 });
 
@@ -467,7 +498,60 @@ describe("the pill and the row tell one story", () => {
     // layerAssuranceLabel reports verifiedActive=false for every control.
     const pill = controlPill(layer, bootstrap(), generatedAt, true, evaluatedAt);
     expect(pill.disposition).toBe(effectiveDisposition(layer, pill.verified));
-    expect(pill.mode).toBe(dispositionLabel(effectiveDisposition(layer, pill.verified)));
+    expect(pill.mode).toBe(
+      dispositionLabel(effectiveDisposition(layer, pill.verified), claimSoftened(layer, pill.verified)),
+    );
+  });
+
+  /**
+   * THE SPLIT THE READER CAN CHECK.
+   *
+   * Measured on the live dashboard: the headline read "3 protecting, 1 working"
+   * and all four controls wore the identical chip "Working as set up". The host
+   * counts its sentence from the RAW dispositions it sent; every chip here is
+   * computed after the assurance veto, which lands a host-reported `proven` on
+   * `working_as_configured`. Both sides were behaving as written and the page
+   * contradicted itself, which is the failure mode this screen exists to
+   * prevent.
+   *
+   * The veto stays. What changes is that a softened claim no longer borrows the
+   * words of a control that was only ever configured.
+   */
+  it("keeps a softened claim distinguishable from a control that was only configured", () => {
+    const provenLayer = { ...FIVE_LAYERS[0], disposition: "proven" as const };
+    const configuredLayer = { ...FIVE_LAYERS[1], disposition: "working_as_configured" as const };
+
+    const softened = controlPill(provenLayer, bootstrap(), generatedAt, true, evaluatedAt);
+    const configured = controlPill(configuredLayer, bootstrap(), generatedAt, true, evaluatedAt);
+
+    // Same disposition after the veto, because the veto is doing its job.
+    expect(softened.disposition).toBe("working_as_configured");
+    expect(configured.disposition).toBe("working_as_configured");
+    // Different chip, because they are not the same fact.
+    expect(softened.mode).not.toBe(configured.mode);
+    expect(softened.mode).toBe("Working, not proven");
+    expect(configured.mode).toBe("Working as set up");
+
+    // The softened chip softens the CLAIM and nothing else. It must not invent
+    // a mode: this control may well be enforcing, we merely have not pinned it.
+    expect(softened.mode).not.toMatch(/watch|containing|off|disabled/i);
+    // And it stays calm: the veto is not an alarm.
+    expect(softened.tone).toBe("informational");
+    expect(needsOperator(softened.disposition)).toBe(false);
+  });
+
+  it("only softens the chip of a claim the host actually made", () => {
+    for (const disposition of ["working_as_configured", "not_enabled", "cannot_verify", "needs_operator"] as const) {
+      const layer = { ...FIVE_LAYERS[0], disposition };
+      expect(claimSoftened(layer, false)).toBe(false);
+      expect(claimSoftened(layer, true)).toBe(false);
+    }
+    const proven = { ...FIVE_LAYERS[0], disposition: "proven" as const };
+    expect(claimSoftened(proven, false)).toBe(true);
+    // With the chain agreeing there is nothing to soften: the chip says
+    // "Protecting" and must not carry a doubt the evidence does not have.
+    expect(claimSoftened(proven, true)).toBe(false);
+    expect(dispositionLabel(effectiveDisposition(proven, true), claimSoftened(proven, true))).toBe("Protecting");
   });
 
   it("never softens anything but an unbacked proven claim", () => {

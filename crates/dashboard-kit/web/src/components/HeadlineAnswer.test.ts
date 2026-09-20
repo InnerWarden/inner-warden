@@ -59,6 +59,75 @@ describe("headline answer", () => {
     expect(result.answer).not.toMatch(/unprotected|fail|error/i);
   });
 
+  /**
+   * THE LIABILITY. Measured on the live enterprise dashboard: eleven deny
+   * verdicts, one "Blocked before execution" printed directly underneath, and
+   * the headline read "Protected. Nothing needs you.".
+   *
+   * `blockedBeforeExecution` was declared in the input type, computed by the
+   * caller and never read once in the body, and the only branch that looked at
+   * `denyVerdicts` was gated on monitor mode, which a paid host can never
+   * report. So no arithmetic in this function could reach the sentence.
+   */
+  it("never says protected while unsafe verdicts have no block against them", () => {
+    const result = headline({ ...healthy, denyVerdicts: 11, blockedBeforeExecution: 1 });
+    expect(result.answer).not.toContain("Protected");
+    expect(result.answer).toContain("10");
+    expect(result.tone).toBe("attention");
+    expect(result.next).toContain("11");
+    expect(result.next).toContain("1 stopped before execution");
+    expect(result.next).toContain("Posture");
+  });
+
+  /**
+   * The input must be READ, which is the defect this pins. Two calls differing
+   * in nothing but the number of blocks must not produce the same sentence.
+   */
+  it("changes its answer when the number of blocks changes", () => {
+    const unstopped = headline({ ...healthy, denyVerdicts: 11, blockedBeforeExecution: 1 });
+    const allStopped = headline({ ...healthy, denyVerdicts: 11, blockedBeforeExecution: 11 });
+    expect(unstopped.answer).not.toBe(allStopped.answer);
+    expect(allStopped.answer).toBe("Protected. Nothing needs you.");
+    // More blocks than deny verdicts is normal: a block can belong to a review
+    // verdict. It must not turn into a negative count.
+    expect(headline({ ...healthy, denyVerdicts: 11, blockedBeforeExecution: 14 }).answer).toBe(
+      "Protected. Nothing needs you.",
+    );
+  });
+
+  it("counts one unstopped action in the singular", () => {
+    expect(headline({ ...healthy, denyVerdicts: 4, blockedBeforeExecution: 3 }).answer).toBe(
+      "1 unsafe action judged, no block recorded",
+    );
+    expect(headline({ ...healthy, denyVerdicts: 4, blockedBeforeExecution: 2 }).answer).toBe(
+      "2 unsafe actions judged, no block recorded",
+    );
+  });
+
+  /**
+   * The sentence accuses, so it may only say what the two counters support.
+   * "Judged unsafe with no block recorded" is a fact about the record; "ran",
+   * "succeeded" and "attacks" are claims this function has no evidence for.
+   */
+  it("reports the record, not an outcome it cannot see", () => {
+    const result = headline({ ...healthy, denyVerdicts: 11, blockedBeforeExecution: 1 });
+    expect(result.answer).not.toMatch(/attack|succeed|breach|compromis|ran\b/i);
+    expect(result.answer).toContain("no block recorded");
+  });
+
+  /**
+   * A host that sends no outcome figures at all has not said it stopped
+   * nothing. Claiming a gap of eleven there would be the same over-claim in the
+   * other direction, so the gap is not computed and not printed.
+   */
+  it("says the outcome is unrecorded rather than inventing a gap", () => {
+    const result = headline({ ...healthy, denyVerdicts: 11, blockedBeforeExecution: null });
+    expect(result.answer).toBe("11 judged unsafe, outcome not recorded");
+    expect(result.answer).not.toContain("Protected");
+    expect(result.tone).toBe("attention");
+    expect(result.next).toContain("Posture");
+  });
+
   it("mentions an unproven agent without making it the headline", () => {
     const result = headline({ ...healthy, unprovenAgents: 2 });
     expect(result.answer).toBe("Protecting");

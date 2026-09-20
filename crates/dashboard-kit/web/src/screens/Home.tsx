@@ -148,7 +148,9 @@ was incomplete; it does not mean this host is idle.`}
   const summary = headline({
     needsReview: reviewVerdicts,
     denyVerdicts,
-    blockedBeforeExecution: overview.actual_blocks ?? 0,
+    // `?? null`, never `?? 0`: a host that sends no outcome figures has not
+    // said it stopped nothing, and the headline must not read it as if it had.
+    blockedBeforeExecution: overview.actual_blocks ?? null,
     monitorOnly: mode === "monitor",
     unprovenAgents: 0,
   });

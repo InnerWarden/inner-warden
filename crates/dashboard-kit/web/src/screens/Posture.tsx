@@ -186,6 +186,35 @@ export function effectiveDisposition(
   return reported === "proven" && !verifiedActive ? "working_as_configured" : reported;
 }
 
+/**
+ * Did the assurance veto soften this control's claim?
+ *
+ * The host counts its headline off the RAW dispositions it sent, so a host that
+ * reported three controls as proven leads with "3 protecting, 1 working". Every
+ * chip on this page is computed after the veto, and the veto lands all three of
+ * those on `working_as_configured`: so four controls wore the identical chip
+ * "Working as set up" under a sentence that had just split them three to one.
+ * A reader cannot check a sentence against chips that say the same thing.
+ *
+ * This is the difference the chip needs to show, and it is a real difference,
+ * not a cosmetic one: a control the host claims is verified but whose proof
+ * chain is unpinned is not the same fact as a control that is simply doing what
+ * it was configured to do.
+ *
+ * It reads the reported state as `effectiveDisposition(layer, true)`, which is
+ * the veto switched off, rather than calling `dispositionOf` directly. One
+ * reader of the raw disposition is the whole point of the veto.
+ */
+export function claimSoftened(
+  layer: Pick<ProtectionLayer, "disposition" | "claim_state" | "effective_mode" | "desired_mode">,
+  verifiedActive: boolean,
+): boolean {
+  return (
+    effectiveDisposition(layer, true) === "proven" &&
+    effectiveDisposition(layer, verifiedActive) !== "proven"
+  );
+}
+
 export type ControlPill = {
   name: string;
   mode: string;
@@ -220,8 +249,20 @@ export function dispositionTone(disposition: LayerDisposition): ControlPill["ton
 }
 
 /** The words on the pill. Plain enough for someone who has never run a
- *  security product, because that is who installs this. */
-export function dispositionLabel(disposition: LayerDisposition): string {
+ *  security product, because that is who installs this.
+ *
+ *  `softened` is the control the host reported as proven and the assurance
+ *  chain did not pin. It shares a disposition with a control that is merely
+ *  doing what it was configured to do, and it must not share a chip: the host
+ *  headline counts the two apart, and a page whose chips collapse a split the
+ *  sentence above them just made cannot be checked by the person reading it.
+ *
+ *  It says "not proven" and stops. It does not say "watching" or "not
+ *  containing", which would be this page inventing a fact about the control's
+ *  mode out of a missing proof. Only the CLAIM is softened; the control may
+ *  well be enforcing. */
+export function dispositionLabel(disposition: LayerDisposition, softened = false): string {
+  if (softened && disposition === "working_as_configured") return "Working, not proven";
   switch (disposition) {
     case "proven":
       return "Protecting";
@@ -262,9 +303,10 @@ export function controlPill(
   // control is still doing what it was told, and the reader still has nothing
   // to do. Only the CLAIM is softened.
   const disposition = effectiveDisposition(layer, assurance.verifiedActive);
+  const softened = claimSoftened(layer, assurance.verifiedActive);
   return {
     name: layer.label,
-    mode: current ? dispositionLabel(disposition) : "Refreshing",
+    mode: current ? dispositionLabel(disposition, softened) : "Refreshing",
     scope: scopeDisplay(layer.effective_scope),
     freshness: current ? checkedAt(layer.freshness) : "refreshing",
     // Colour follows the disposition, not "is it verified, else does it have a
@@ -442,11 +484,26 @@ export function modelProvenance(report: Pick<LocalModelReport, "provider" | "mod
   return parts.length > 0 ? parts.join(" · ") : null;
 }
 
-/** The quiet line shown when no gap card needs to render. */
+/**
+ * The quiet line shown when no gap card needs to render.
+ *
+ * It answers for what was actually examined, and it used to answer for more.
+ * "No coverage gaps in this snapshot" reads as a statement about everything the
+ * product watches, and it rendered on a host with a detector switched off and
+ * four telemetry streams silent. `posture.gaps` is the host controls' own
+ * `known_gaps` flattened by the producer: it is the enforcement chain auditing
+ * itself, and it has no field that can carry the state of a sensor collector.
+ * A sentence must not answer a question its data cannot reach, so this one now
+ * names its subject and says what it leaves out.
+ *
+ * When the producer starts publishing collector coverage as gaps, this line is
+ * the thing to widen, not before.
+ */
 export function emptyGapsLine(totalGaps: number): string {
+  const limit = " Sensor collector state is not part of this check.";
   return totalGaps === 0
-    ? "No coverage gaps in this snapshot."
-    : "No coverage gaps need attention in this snapshot.";
+    ? `No gaps reported by the host controls above.${limit}`
+    : `No gaps in the host controls above need your attention.${limit}`;
 }
 
 // ────────────────────────────────── screen ───────────────────────────────────
@@ -746,7 +803,7 @@ function ControlRow({
         <h3 className="min-w-0 flex-1 truncate text-base font-semibold text-slate-950">{layer.label}</h3>
         <StatusBadge
           status={current ? disposition : "stale"}
-          label={current ? dispositionLabel(disposition) : "Refreshing"}
+          label={current ? dispositionLabel(disposition, claimSoftened(layer, assurance.verifiedActive)) : "Refreshing"}
           className="shrink-0"
         />
         <span className="[overflow-wrap:anywhere] text-sm text-slate-600">{scopeDisplay(layer.effective_scope)}</span>

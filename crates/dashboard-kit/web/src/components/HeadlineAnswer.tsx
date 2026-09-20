@@ -21,8 +21,14 @@ export type HeadlineInput = {
   needsReview: number;
   /** Verdicts of "unsafe". */
   denyVerdicts: number;
-  /** Of those, how many were actually stopped before running. */
-  blockedBeforeExecution: number;
+  /**
+   * How many decisions the host recorded as stopped before running.
+   *
+   * `null` when the host reports no outcome figures at all. A missing figure is
+   * NOT zero: reading it as zero would let this function accuse a host of
+   * stopping nothing when the truth is that it never said.
+   */
+  blockedBeforeExecution: number | null;
   /** True when the guardrail is watching but not enforcing. */
   monitorOnly: boolean;
   /** Agents configured but never seen working. */
@@ -47,11 +53,21 @@ export type Headline = {
  *    is queued. "Watching, not blocking" is what the operator picked; saying it
  *    plainly is honest, and it explains the deny-versus-blocked gap that
  *    otherwise reads as the product failing to act.
- * 3. An agent that is configured but never observed working is worth a nudge,
+ * 3. A verdict is not an act. When the host judged actions unsafe and recorded
+ *    fewer blocks than verdicts, that gap IS the headline. A reassuring
+ *    sentence printed above it is the worst thing a security product can say,
+ *    and it is what this screen used to say: `blockedBeforeExecution` arrived
+ *    from the caller and was never read, so eleven unsafe verdicts against one
+ *    recorded block still led with "Protected. Nothing needs you.".
+ *    The wording stays at what the two counters support, which is verdicts
+ *    with no block recorded against them. It is not a count of attacks that
+ *    succeeded, and this function has no evidence that any of them ran.
+ * 4. An agent that is configured but never observed working is worth a nudge,
  *    but it is not an emergency and does not deserve the top line to itself.
- * 4. Otherwise: protected, nothing to do. Reached only when nothing is queued,
- *    enforcement is on, and every agent has been seen working. It is a narrow
- *    door on purpose.
+ * 5. Otherwise: protected, nothing to do. Reached only when nothing is queued,
+ *    the host is not merely watching, every unsafe verdict it reported has a
+ *    block recorded against it, and every agent has been seen working. It is a
+ *    narrow door on purpose.
  */
 export function headline(input: HeadlineInput): Headline {
   if (input.needsReview > 0) {
@@ -74,6 +90,37 @@ export function headline(input: HeadlineInput): Headline {
           : "Switch to enforcing when you are ready.",
       tone: "attention",
     };
+  }
+  // The gap between judging and acting, which nothing compared until now.
+  //
+  // It sits above the agent nudge and above the final return because an
+  // unstopped unsafe action outranks both: an operator who reads "Protecting"
+  // over this gap has been told the opposite of what the counters beside it
+  // say. Monitor mode is handled above and keeps its own sentence, since there
+  // the gap is the deployment the operator chose, not a surprise.
+  if (input.denyVerdicts > 0) {
+    if (input.blockedBeforeExecution === null) {
+      // Outcomes were never reported, so the gap cannot be computed and is not
+      // claimed. "Not recorded" beats a confident wrong number.
+      return {
+        answer: `${input.denyVerdicts.toLocaleString()} judged unsafe, outcome not recorded`,
+        next: "This host reports no outcome for its verdicts. Open Posture to see which controls are actually enforcing.",
+        tone: "attention",
+      };
+    }
+    const noBlockRecorded = input.denyVerdicts - input.blockedBeforeExecution;
+    if (noBlockRecorded > 0) {
+      // A floor, not an estimate: a recorded block may belong to a verdict that
+      // was not a deny, so the true number of unsafe verdicts with nothing
+      // against them can only be this or higher. Understating is the only safe
+      // direction for a number that accuses.
+      const plural = noBlockRecorded === 1 ? "action" : "actions";
+      return {
+        answer: `${noBlockRecorded.toLocaleString()} unsafe ${plural} judged, no block recorded`,
+        next: `${input.denyVerdicts.toLocaleString()} classified as unsafe, ${input.blockedBeforeExecution.toLocaleString()} stopped before execution. Open Posture to see which controls are actually enforcing.`,
+        tone: "attention",
+      };
+    }
   }
   if (input.unprovenAgents > 0) {
     const plural = input.unprovenAgents === 1 ? "agent has" : "agents have";
