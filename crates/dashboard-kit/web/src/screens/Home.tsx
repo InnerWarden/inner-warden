@@ -340,7 +340,7 @@ export const POSTURES: Record<GuardrailMode, { label: string; title: string; bod
   monitor: {
     label: "Monitor configured",
     title: "Build confidence before you turn on blocking.",
-    body: "Configured integrations screen activity without blocking it after the agent reloads them. Review the local evidence before enforcing.",
+    body: "Once an agent reloads this wiring, the integrations you configured screen its activity without blocking any of it. Review the local evidence before enforcing.",
     badge: "border-blue-200 bg-blue-50 text-blue-700",
     panel: "border-blue-200 from-blue-50 to-white",
   },

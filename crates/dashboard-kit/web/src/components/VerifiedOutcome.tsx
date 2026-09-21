@@ -1,6 +1,7 @@
 import type { CaseEvent, VerifiedOutcome as VerifiedOutcomeRecord } from "../api/cases";
 import type { SecurityOutcome } from "../api/v1";
 import { StatusBadge, type StatusTone } from "./StatusBadge";
+import { formatAbsolute } from "../presentation";
 import { EvidenceLinks } from "./CaseTimeline";
 import { TechnicalOnly } from "./TechnicalDetail";
 
@@ -249,5 +250,5 @@ function checkedWord(presentation: OutcomePresentation): string {
 }
 
 function formatTime(value: string): string {
-  return new Intl.DateTimeFormat("en", { dateStyle: "medium", timeStyle: "short", timeZone: "UTC" }).format(new Date(value));
+  return formatAbsolute(value) ?? value;
 }

@@ -1,5 +1,6 @@
 import type { CaseEvent, CaseEventType, RelationshipConfidence } from "../api/cases";
 import { StatusBadge } from "./StatusBadge";
+import { formatAbsolute } from "../presentation";
 import { friendlyId } from "./TruncatedId";
 
 const eventLabels: Record<CaseEventType, string> = {
@@ -154,5 +155,5 @@ export function EvidenceLinks({ evidence }: { evidence: CaseEvent["source_refs"]
 }
 
 function formatTime(value: string): string {
-  return new Intl.DateTimeFormat("en", { dateStyle: "medium", timeStyle: "medium", timeZone: "UTC" }).format(new Date(value));
+  return formatAbsolute(value) ?? value;
 }
