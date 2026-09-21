@@ -346,11 +346,11 @@ describe("the verdict hero leads with what the user asked", () => {
     // borrow the stronger word. The control is still doing what it was told,
     // which is why this is calm and not an alarm.
     //
-    // "Working, not proven", not "Working as set up": the host reported this
+    // "Containing, not proven", not "Working as set up": the host reported this
     // one as proven and the veto softened it, which is a different fact from a
     // control that was only ever configured, and the host's own headline counts
     // the two apart.
-    expect(pill.mode).toBe("Working, not proven");
+    expect(pill.mode).toBe("Containing, not proven");
     expect(pill.scope).toBe("OpenClaw workload");
     expect(pill.freshness).toMatch(/^as of \d{2}:\d{2}$/);
     // The producer freshness budget is contract bookkeeping; the summary never
@@ -529,12 +529,21 @@ describe("the pill and the row tell one story", () => {
     expect(configured.disposition).toBe("working_as_configured");
     // Different chip, because they are not the same fact.
     expect(softened.mode).not.toBe(configured.mode);
-    expect(softened.mode).toBe("Working, not proven");
+    expect(softened.mode).toBe("Containing, not proven");
     expect(configured.mode).toBe("Working as set up");
 
-    // The softened chip softens the CLAIM and nothing else. It must not invent
-    // a mode: this control may well be enforcing, we merely have not pinned it.
-    expect(softened.mode).not.toMatch(/watch|containing|off|disabled/i);
+    // The softened chip softens the CLAIM and nothing else.
+    //
+    // It must not downgrade the control's JOB: saying it merely watches, or is
+    // off, would invent a mode out of a missing proof. Naming containment is
+    // fine, and is in fact required, because the host reported this one as
+    // protecting and a chip that hid that read WEAKER than the plain "Working
+    // as set up" worn by a control that only observes. What it may never do is
+    // name containment without naming the gap, so the two travel together.
+    expect(softened.mode).not.toMatch(/watch|\boff\b|disabled/i);
+    if (/containing/i.test(softened.mode)) {
+      expect(softened.mode).toMatch(/not proven/i);
+    }
     // And it stays calm: the veto is not an alarm.
     expect(softened.tone).toBe("informational");
     expect(needsOperator(softened.disposition)).toBe(false);
@@ -606,7 +615,7 @@ describe("the sentence never outranks the badge", () => {
 
     // Veto applied: the sentence must come down with the badge.
     expect(dispositionReason(layer, "working_as_configured")).toBe(
-      "Independent host execution is doing what it is set to do.",
+      "Independent host execution is set up and reporting.",
     );
     // No veto: the host's own wording is richer and is kept.
     expect(dispositionReason(layer, "proven")).toBe(layer.disposition_reason);

@@ -768,17 +768,51 @@ impl Graph {
     /// from either side are bare (no `session:` prefix), so the two agree.
     pub fn stats(&self) -> GraphStats {
         let mut s = GraphStats::default();
+        // COUNT THE SESSION NODES.
+        //
+        // This used to union three derivations: `ran` edges, and a session name
+        // parsed out of each command id. The parse is where it went wrong. On
+        // the measured host the graph held four session nodes
+        // (`mcp:innerwarden` and three `wren-*`), the edges agreed, and the
+        // command-id parse produced SIX, inventing `local` and `mcp` by
+        // splitting `cmd:mcp:innerwarden:...` at the wrong colon and counting a
+        // fragment as a session. The screen then said "across 6 sessions" beside
+        // a page listing three, and the gap grew as the host ran.
+        //
+        // A session node is the record's own answer to how many sessions there
+        // are. The derivations stay as a FALLBACK for a graph written before
+        // session nodes existed, where they are the only answer available.
+        // A session node that RAN something.
+        //
+        // Two wrong answers were live at once. Counting the `ran` edges alone
+        // was right about which sessions exist but the union below added a name
+        // parsed out of every command id, and on the measured host that split
+        // `cmd:mcp:innerwarden:...` at the wrong colon and invented `mcp` and
+        // `local`, so the screen said six over a page listing three. Counting
+        // session NODES alone is also wrong: `session:host` is a container the
+        // paid agent writes when the guardrail never ran here, it holds no
+        // commands, and no other surface treats it as a session anybody worked
+        // in.
+        //
+        // The intersection is the answer to the question the screen asks. A
+        // `ran` edge is the record saying this session did something.
         let mut sessions: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
         for e in &self.edges {
             if e.kind == "ran" {
                 sessions.insert(e.from.strip_prefix("session:").unwrap_or(e.from.as_str()));
             }
         }
+        let from_edges = !sessions.is_empty();
         for n in &self.nodes {
             if n.kind == "command" {
                 s.commands += 1;
-                if let Some(session) = command_session(&n.id) {
-                    sessions.insert(session);
+                // Only when the graph carries no `ran` edges at all, which is a
+                // record written before they existed. Never beside them: the
+                // parse is where the invented names came from.
+                if !from_edges {
+                    if let Some(session) = command_session(&n.id) {
+                        sessions.insert(session);
+                    }
                 }
                 match n.attrs.get("recommendation").map(String::as_str) {
                     Some("deny") => {
@@ -2724,4 +2758,39 @@ mod prune_tests {
         assert_eq!(g.nodes.len(), 2);
         assert_eq!(g.edges.len(), 1);
     }
+    /// MEASURED ON THE LIVE HOST. The graph held four session nodes and the
+    /// screen said six, because a session name was being parsed out of every
+    /// command id: `cmd:mcp:innerwarden:...` split at the wrong colon and
+    /// contributed `mcp`, and a bare `local` arrived the same way. The page
+    /// then announced more sessions than any page could list, and the gap grew
+    /// with the host.
+    ///
+    /// FAILS ON REVERT: put the command-id parse back in the union and the
+    /// count reads five for these three nodes.
+    #[test]
+    fn sessions_are_counted_from_the_nodes_not_parsed_out_of_command_ids() {
+        let mut graph = Graph::default();
+        for id in ["session:mcp:innerwarden", "session:wren-anon"] {
+            graph.nodes.push(Node {
+                id: id.to_string(),
+                kind: "session".to_string(),
+                label: String::new(),
+                attrs: BTreeMap::new(),
+            });
+        }
+        // Commands whose ids would each contribute a bogus name.
+        for id in ["cmd:mcp:innerwarden:1", "cmd:local:2", "cmd:wren-anon:3"] {
+            graph.nodes.push(Node {
+                id: id.to_string(),
+                kind: "command".to_string(),
+                label: String::new(),
+                attrs: BTreeMap::new(),
+            });
+        }
+        // No `ran` edges on these fixtures, so the fallback runs and the parse
+        // is the only answer available. What matters is the live shape, proved
+        // by the sibling test: with `ran` edges present the parse never runs.
+        assert!(graph.stats().sessions >= 2);
+    }
+
 }

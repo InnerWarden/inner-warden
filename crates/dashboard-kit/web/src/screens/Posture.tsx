@@ -149,7 +149,11 @@ export function dispositionReason(
   }
   const fallback: Record<LayerDisposition, string> = {
     proven: `${layer.label} is enforcing, and that was verified on this host.`,
-    working_as_configured: `${layer.label} is doing what it is set to do.`,
+    // Deliberately not "is doing what it is set to do": that sentence rendered
+    // under a chip reading "not proven", so the card asserted in prose exactly
+    // what the chip beside it declined to assert. This says what is on record
+    // and stops.
+    working_as_configured: `${layer.label} is set up and reporting.`,
     not_enabled: `${layer.label} has not been turned on yet. Nothing is wrong.`,
     cannot_verify: `${layer.label} could not be read on this host. This is ours to fix, not yours.`,
     needs_operator: `${layer.label} is not yet doing what it was set to do.`,
@@ -262,7 +266,14 @@ export function dispositionTone(disposition: LayerDisposition): ControlPill["ton
  *  mode out of a missing proof. Only the CLAIM is softened; the control may
  *  well be enforcing. */
 export function dispositionLabel(disposition: LayerDisposition, softened = false): string {
-  if (softened && disposition === "working_as_configured") return "Working, not proven";
+  // "Containing", not "Working". A softened chip is a control the HOST called
+  // proven and whose assurance chain this page could not pin, so what it does is
+  // known and only the proof is missing. Labelling it "Working, not proven" put
+  // it BELOW the plain "Working as set up" worn by a control that only observes,
+  // so the page read as if containment were weaker than watching, and it
+  // contradicted its own summary of "3 protecting, 1 working". Name the job,
+  // then name what is missing.
+  if (softened && disposition === "working_as_configured") return "Containing, not proven";
   switch (disposition) {
     case "proven":
       return "Protecting";

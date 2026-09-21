@@ -252,10 +252,22 @@ describe("caseUrl", () => {
     expect(caseUrl(undefined, base).searchParams.get("window")).toBe("all");
   });
 
-  it("says nothing about the window when it is opening one named case", () => {
-    // A named case is its own answer, and it carries no counter that promised a
-    // span. The Cases screen keeps its own default for the list around it.
-    expect(caseUrl("case:x:1", base).searchParams.get("window")).toBeNull();
+  /**
+   * MEASURED ON THE LIVE BOX. This test used to pin the opposite, and the
+   * opposite was the defect: a deep link naming one case landed on the Cases
+   * default of the last 24 hours, so opening anything older showed a list the
+   * case was not in, with nothing selected. Six attempts, and the operator read
+   * it as a broken link.
+   *
+   * A link that names its target must not be filtered out by a default the
+   * operator never chose. The screen's own controls can narrow it afterwards.
+   *
+   * FAILS ON REVERT: drop the window from the named-case branch and this reads
+   * null again.
+   */
+  it("carries the span with the case it names, so the target is in the list", () => {
+    expect(caseUrl("case:x:1", base).searchParams.get("window")).toBe("all");
+    expect(caseUrl("case:x:1", base).searchParams.get("case")).toBe("case:x:1");
   });
 });
 

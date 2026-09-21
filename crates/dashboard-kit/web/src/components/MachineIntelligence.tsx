@@ -197,7 +197,7 @@ export function agentsEmptyState(availability: string | undefined): { title: str
   if (availability === "degraded") {
     return {
       title: "Agents seen, but none wired to a guardrail",
-      body: "This host has recorded agent activity, so agents are present, but none of them has a guardrail policy on file and none can be listed here. Run innerwarden agents connect on each agent to put a guardrail on it and give it a row.",
+      body: "This host has recorded agent activity, but none of them has a guardrail policy on file and none can be listed here. Run innerwarden agents connect on each agent to put a guardrail on it and give it a row.",
     };
   }
   return {

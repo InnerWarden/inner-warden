@@ -187,7 +187,12 @@ export const COMMUNITY_TOUR_STEPS: readonly TourStep[] = [
   {
     key: "overview-agents",
     title: "Agents on this machine",
-    body: "The AI agents found on this machine, whether they are running, and whether a guardrail has been seen protecting each one.",
+    // Promises only what a producer fills. The inventory is built from the
+    // policy rows `agents connect` writes, so on a host with none the card says
+    // so and lists nothing. It used to promise a per-agent runtime, a model and
+    // proof that each guardrail was seen working, none of which any producer
+    // sets, and the step pointed at a card saying no agent could be listed.
+    body: "Whether any agent on this machine has a guardrail policy on file, and what to run if none has.",
     route: "overview",
     selectors: ['[data-tour="overview-agents"]', 'section[aria-labelledby="local-agents-title"]'],
   },
