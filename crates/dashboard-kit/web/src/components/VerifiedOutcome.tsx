@@ -214,8 +214,19 @@ export function VerifiedOutcome({ outcome, timeline, evaluatedAt }: {
       <TechnicalOnly>
         <dl className="mt-3 grid gap-2 border-t border-slate-200 pt-3 text-xs sm:grid-cols-3">
           <div><dt className="text-slate-500">Checked by someone else</dt><dd className="mt-0.5 font-semibold text-slate-800">{checkedWord(presentation)}</dd></div>
-          <div><dt className="text-slate-500">Reported by</dt><dd className="mt-0.5 break-words font-semibold text-slate-800 [overflow-wrap:anywhere]">{outcome.verifier ?? "Not reported"}</dd></div>
-          <div><dt className="text-slate-500">Recorded at</dt><dd className="mt-0.5 font-semibold text-slate-800">{outcome.verified_at ? formatTime(outcome.verified_at) : "Not reported"}</dd></div>
+        {/* A CELL IS RENDERED ONLY WHEN IT HAS A VALUE.
+          *
+          * These printed "Reported by: Not reported" and "Recorded at: Not
+          * reported", a label beside a non-value, which reads as a field the
+          * product failed to fill rather than as a fact. Nothing is lost by
+          * dropping them: "Checked by someone else" answers whether anybody
+          * else saw this, and it is always rendered. */}
+        {outcome.verifier ? (
+          <div><dt className="text-slate-500">Reported by</dt><dd className="mt-0.5 break-words font-semibold text-slate-800 [overflow-wrap:anywhere]">{outcome.verifier}</dd></div>
+        ) : null}
+        {outcome.verified_at ? (
+          <div><dt className="text-slate-500">Recorded at</dt><dd className="mt-0.5 font-semibold text-slate-800">{formatTime(outcome.verified_at)}</dd></div>
+        ) : null}
         </dl>
       </TechnicalOnly>
       <EvidenceLinks evidence={outcome.evidence} />
