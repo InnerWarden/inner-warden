@@ -1282,6 +1282,24 @@ impl Graph {
                     .filter(|n| n.id.starts_with(prefix.as_str()))
                     .filter(|n| !seen.contains(n.id.as_str())),
             );
+            // A session that ran nothing is not a session anybody worked in.
+            //
+            // MEASURED in the third dashboard audit: the Overview tile said
+            // four sessions and this list showed three. The tile counts the
+            // sessions that hold a `ran` edge, on the reasoning that
+            // `session:host` is a container the paid agent writes when the
+            // guardrail never ran here and holds no commands. This list counted
+            // session NODES, so it kept that container, counted it, and then
+            // had nothing to draw for it. Two screens answering the same
+            // question with different rules is a difference the reader has to
+            // explain, and the only explanation available to them is data loss.
+            //
+            // The same rule, applied here: no commands, not a session. That
+            // also removes an empty row from the list, which is what the
+            // fourth session would have rendered as.
+            if cmds.is_empty() {
+                continue;
+            }
             cmds.sort_by_key(|n| {
                 std::cmp::Reverse(
                     n.attrs
@@ -1684,6 +1702,43 @@ mod tests {
         assert_eq!(cases.sessions[0].actual_blocks, 1);
         assert_eq!(cases.sessions[0].would_block, 1);
         assert_eq!(cases.sessions[0].items[0].id, "cmd:s1:2");
+    }
+
+    /// MEASURED in the third dashboard audit: the Overview tile said four
+    /// sessions and the Activity list showed three. The tile counts sessions
+    /// that hold a `ran` edge; the list counted session NODES, which includes
+    /// the `session:host` container the paid agent writes when the guardrail
+    /// never ran on this host. A reader with two numbers and no rule to tell
+    /// them apart reads the smaller one as data loss.
+    ///
+    /// FAILS ON REVERT: drop the empty-session guard and the list says 2 while
+    /// the Overview says 1.
+    #[test]
+    fn the_two_session_counts_answer_the_same_question() {
+        let graph = r#"{
+            "nodes": [
+                {"id":"session:worked","kind":"session","label":"worked"},
+                {"id":"session:host","kind":"session","label":"host"},
+                {"id":"cmd:worked:0","kind":"command","label":"ls","attrs":{"recommendation":"allow","seq":"0"}}
+            ],
+            "edges": [{"from":"session:worked","to":"cmd:worked:0","kind":"ran"}]
+        }"#;
+        let g = Graph::from_json(graph).unwrap();
+        let overview = g.overview(10);
+        let page = g.cases_page(None, None, None, 0, 10);
+        assert_eq!(
+            overview.sessions, 1,
+            "a container that ran nothing is not a session anybody worked in"
+        );
+        assert_eq!(
+            page.total_sessions, overview.sessions,
+            "the list and the tile must not answer the same question differently"
+        );
+        assert_eq!(
+            page.sessions.len(),
+            1,
+            "and the empty one must not render as a row with nothing in it"
+        );
     }
 
     #[test]
@@ -2792,5 +2847,4 @@ mod prune_tests {
         // by the sibling test: with `ran` edges present the parse never runs.
         assert!(graph.stats().sessions >= 2);
     }
-
 }
