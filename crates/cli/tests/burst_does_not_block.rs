@@ -107,6 +107,22 @@ fn a_burst_of_harmless_commands_is_never_refused() {
 /// If session tracking silently stopped running, every command would be allowed
 /// and the burst test would go green while proving nothing. So assert the state
 /// the tracker is supposed to be keeping actually exists and counted the burst.
+///
+/// Skipped under coverage, for the reason `.tarpaulin.toml` already predicts:
+/// "if a coverage run dies with no failing test named, look for a test whose
+/// assertion depends on TIME or on process supervision". This one spawns the
+/// hook once per command in the burst, over a hundred processes, and
+/// instrumenting every one of them turns a test of the session tracker into a
+/// test of how fast the instrumentation can fork. Measured on the runner:
+/// `Timed out waiting for test response` after sixty seconds, against sixteen
+/// seconds uninstrumented locally.
+///
+/// It still runs, uninstrumented, in `build and test` on Linux, macOS and
+/// Windows, which is where its answer actually matters.
+#[cfg_attr(
+    tarpaulin,
+    ignore = "spawns the hook once per burst command; instrumented it times out rather than measures"
+)]
 #[test]
 fn the_session_layer_really_ran_during_the_burst() {
     let host = Host::new();

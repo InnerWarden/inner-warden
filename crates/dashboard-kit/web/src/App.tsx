@@ -257,7 +257,24 @@ export function caseUrl(caseId: string | undefined, current: string): URL {
   url.searchParams.set("view", "cases");
   if (caseId !== undefined && caseId.length > 0 && caseId.length <= 256) {
     url.searchParams.set("case", caseId);
+    // The window has to travel with the case, and this used to return before
+    // setting it. A deep link names ONE case; the Cases list then applied its
+    // default last-24-hours filter to it, so opening anything older landed on a
+    // list the case was not in, with nothing selected. The operator read that
+    // as a broken link. A link that names its target must not be filtered out
+    // by a default the operator never chose.
+    url.searchParams.set("window", "all");
+    return url;
   }
+  // No case named: this is Home's "View all in Cases", clicked from beside a
+  // tile counting the WHOLE decision record. The Cases list defaults to the
+  // last 24 hours (`readCaseViewState`), so that click used to answer a
+  // narrower question than the one the operator had just read, and the drop
+  // from 17 decisions to 1 case looked like lost data. Handing it the same span
+  // makes the two screens answer the same question, and the span lands in the
+  // address bar like every other Cases filter, so it can be narrowed from the
+  // controls on that screen.
+  url.searchParams.set("window", "all");
   return url;
 }
 

@@ -51,6 +51,11 @@ export function Header<Route extends string>({
               <button
                 key={item.route}
                 type="button"
+                // The route, not only its label: this nav is the one place that
+                // knows which screens this shell really offers, and the product
+                // tour reads it back from here so it cannot walk an operator to
+                // a tab that does not exist (see `stepsForShell`).
+                data-route={item.route}
                 onClick={() => onNavigate(item.route)}
                 aria-current={activeRoute === item.route ? "page" : undefined}
                 aria-pressed={activeRoute === item.route}

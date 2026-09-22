@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   boardSummary,
+  captionCounts,
   collectorCategory,
   collectorGroups,
   collectorRows,
@@ -311,6 +312,74 @@ describe("each state's explanation is said once per group", () => {
   });
 });
 
+/**
+ * THE CAPTION IS A PARTITION.
+ *
+ * An operator counted the rows: "10 of 15 reporting, 4 not confirmed running"
+ * over a group where 5 rows were not reporting. The two halves of the caption
+ * used different predicates (`liveness === "reporting"` and `!active`) and the
+ * quiet row was in neither, so it vanished from the sentence. A disabled row
+ * had the opposite problem: it was counted as doubt when it is a decision.
+ */
+describe("the caption accounts for every row in the group", () => {
+  const payload = activity({
+    sources: [
+      { name: "journald", count: 5 },
+      { name: "auth_log", count: 0 },
+      { name: "ebpf", count: 0 },
+      { name: "auditd", count: 0 },
+      { name: "dns_capture", count: 0 },
+    ],
+    collector_health: {
+      statuses: [
+        { name: "journald", category: "telemetry", health: { state: "active" } },
+        { name: "auth_log", category: "telemetry", health: { state: "active" } },
+        { name: "auditd", category: "telemetry", health: { state: "disabled_by_config" } },
+        { name: "dns_capture", category: "telemetry", health: { state: "permission_denied" } },
+      ],
+    },
+  });
+
+  // FAILS ON REVERT: the old caption read "1 of 5 reporting · 3 not confirmed
+  // running", which both dropped the quiet row and counted the disabled one as
+  // an unknown.
+  it("names the silent row instead of leaving it out of the sentence", () => {
+    const [telemetry] = collectorGroups(collectorRows(payload));
+    expect(telemetry.rows).toHaveLength(5);
+    expect(telemetry.caption).toContain("1 of 5 reporting");
+    expect(telemetry.caption).toContain("1 attached but silent");
+    expect(telemetry.caption).toContain("2 not confirmed running");
+  });
+
+  it("calls a disabled collector switched off, not unconfirmed", () => {
+    const [telemetry] = collectorGroups(collectorRows(payload));
+    expect(telemetry.caption).toContain("1 switched off");
+    expect(telemetry.caption).not.toContain("3 not confirmed running");
+  });
+
+  it("puts every liveness in exactly one bucket, so nothing can go uncounted", () => {
+    const [telemetry] = collectorGroups(collectorRows(payload));
+    const counts = captionCounts(telemetry.rows);
+    expect(counts).toEqual({ reporting: 1, silent: 1, notRunning: 2, disabled: 1 });
+    expect(counts.reporting + counts.silent + counts.notRunning + counts.disabled)
+      .toBe(telemetry.rows.length);
+  });
+
+  it("uses each category's own word for silence, matching the pill on the row", () => {
+    const alarms = collectorGroups(collectorRows(activity({
+      sources: [{ name: "tls_fingerprint", count: 0 }, { name: "usb_monitor", count: 0 }],
+      collector_health: {
+        statuses: [
+          { name: "tls_fingerprint", category: "alarm", health: { state: "active" } },
+          { name: "usb_monitor", category: "alarm", health: { state: "active" } },
+        ],
+      },
+    })))[0];
+    expect(alarms.rows.every((row) => row.label === "Quiet")).toBe(true);
+    expect(alarms.caption).toBe("0 of 2 with findings · 2 quiet");
+  });
+});
+
 describe("boardSummary", () => {
   it("counts what is not confirmed running, because that is the actionable number", () => {
     const rows = collectorRows(activity({
@@ -335,6 +404,51 @@ describe("boardSummary", () => {
 
   it("does not invent collectors for a host that listed none", () => {
     expect(boardSummary([])).toBe("No collectors were reported by this host.");
+  });
+
+  /**
+   * An operator read "25 collectors: 1 attached but silent" above two rows both
+   * labelled "Attached, silent". The headline counted telemetry only, while the
+   * pill is worn by every quiet row outside the alarm group.
+   *
+   * FAILS ON REVERT: the telemetry-only filter says 1 where two rows say it.
+   */
+  it("counts every row wearing the silent pill, not the telemetry ones only", () => {
+    const rows = collectorRows(activity({
+      sources: [
+        { name: "file_extract", count: 0 },
+        { name: "suid_inventory", count: 0 },
+        { name: "tls_fingerprint", count: 0 },
+      ],
+      collector_health: {
+        statuses: [
+          { name: "file_extract", category: "telemetry", health: { state: "active" } },
+          { name: "suid_inventory", category: "snapshot", health: { state: "active" } },
+          { name: "tls_fingerprint", category: "alarm", health: { state: "active" } },
+        ],
+      },
+    }));
+    expect(rows.filter((row) => row.label === "Attached, silent")).toHaveLength(2);
+    expect(boardSummary(rows)).toBe("3 collectors: 2 attached but silent.");
+  });
+
+  /**
+   * FAILS ON REVERT: with disabled unsaid, a board whose docker detector is
+   * switched off summarised itself as "2 collectors, all confirmed running",
+   * which is the exact sentence this function exists to never print.
+   */
+  it("says what was switched off instead of absorbing it into the total", () => {
+    const rows = collectorRows(activity({
+      sources: [{ name: "journald", count: 5 }, { name: "docker", count: 0 }],
+      collector_health: {
+        statuses: [
+          { name: "journald", category: "telemetry", health: { state: "active" } },
+          { name: "docker", category: "alarm", health: { state: "disabled_by_config" } },
+        ],
+      },
+    }));
+    expect(boardSummary(rows)).toBe("2 collectors: 1 switched off.");
+    expect(boardSummary(rows)).not.toContain("all confirmed running");
   });
 });
 

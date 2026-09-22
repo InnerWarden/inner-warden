@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   AUTO_SETUP_UNKNOWN_FOOTNOTE,
   DISCOVERY_LIMIT_DISCLOSURE,
+  agentsEmptyState,
   autoSetupPlacement,
   discoveryLimitNotice,
 } from "./MachineIntelligence";
@@ -43,5 +44,38 @@ describe("the automatic-setup line earns its header placement", () => {
     // The footnote tells the user where to look, not what the system lacks.
     expect(AUTO_SETUP_UNKNOWN_FOOTNOTE).toContain("CLI");
     expect(AUTO_SETUP_UNKNOWN_FOOTNOTE).not.toMatch(/unavailable/i);
+  });
+});
+
+/**
+ * An empty agent list has three meanings, and the panel used to have two words
+ * for them.
+ *
+ * On the audited host the guardrail registry was readable and empty while the
+ * guard record held three agent sessions and seventeen screened actions, which
+ * the rest of the same dashboard was showing. That host reported `degraded`,
+ * which fell through to "No compatible agents detected": the screen told the
+ * operator there was nothing here, about a machine it could see agents on.
+ *
+ * FAILS ON REVERT: collapse `degraded` back into the final branch and the
+ * first expectation below reads the false absence.
+ */
+describe("an empty agent list says which kind of empty it is", () => {
+  it("does not claim an absence when the host has evidence it cannot enumerate", () => {
+    const state = agentsEmptyState("degraded");
+    expect(state.title).not.toContain("No compatible agents detected");
+    expect(state.title).toContain("Agents seen");
+    expect(state.body).toContain("recorded agent activity");
+    expect(state.body).toContain("innerwarden agents connect");
+  });
+
+  it("keeps the could-not-look message for a host that could not look", () => {
+    expect(agentsEmptyState("unavailable").title).toBe("Agent detection could not run");
+  });
+
+  it("still says nothing is here when nothing is here", () => {
+    for (const availability of ["not_configured", "available", undefined]) {
+      expect(agentsEmptyState(availability).title).toBe("No compatible agents detected");
+    }
   });
 });

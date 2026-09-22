@@ -1,15 +1,18 @@
 import { deriveShellNavigation } from "../App";
 import { describe, expect, it } from "vitest";
 import {
+  ACTIVITY_TOUR_STEP_KEY,
   COMMUNITY_TOUR_STEPS,
   PAID_SCREEN_TOUR_STEPS,
   COMMUNITY_TOUR_STORAGE_KEY,
   COMMUNITY_UPGRADE_STEP_KEY,
   TOUR_FINISH_STEP_KEY,
+  TOUR_WELCOME_STEP_KEY,
   clampStep,
   communityTourSteps,
   markTourSeen,
   shouldAutoOpen,
+  stepsForShell,
   type TourStorage,
 } from "./ProductTour";
 
@@ -236,5 +239,114 @@ describe("the tour on a host that already runs Active Defence", () => {
     // Anti-vacuous. If the upgrade step were ever renamed, every assertion
     // above would pass against a table that never contained it.
     expect(upgradeStep, "the upgrade step must exist for this suite to mean anything").toBeDefined();
+  });
+});
+
+/**
+ * THE WELCOME CARD MUST NOT PROMISE A LENGTH IT CANNOT KEEP.
+ *
+ * This copy is shared. The paid bundle composes the same opening step into a
+ * table twice the size, so "it takes under a minute" was read over twelve steps
+ * by every Enterprise operator. Any fixed claim about size or duration written
+ * here drifts the moment a step is added anywhere, which is why the card's own
+ * counter is what states the size.
+ */
+describe("the opening step", () => {
+  const welcome = COMMUNITY_TOUR_STEPS.find((step) => step.key === TOUR_WELCOME_STEP_KEY);
+
+  it("exists, so the assertions below are about something", () => {
+    expect(welcome).toBeDefined();
+    expect(COMMUNITY_TOUR_STEPS[0].key).toBe(TOUR_WELCOME_STEP_KEY);
+  });
+
+  // FAILS ON REVERT: the shipped copy was "It takes under a minute".
+  it("makes no promise about how long the tour takes", () => {
+    const body = (welcome?.body ?? "").toLowerCase();
+    for (const claim of ["minute", "second", "under a", "takes about", "quick tour"]) {
+      expect(body, `the welcome step must not promise "${claim}"`).not.toContain(claim);
+    }
+  });
+
+  it("points at the counter that does know the size of this tour", () => {
+    expect(welcome?.body ?? "").toContain("The counter below says how many steps there are");
+  });
+
+  it("says how to leave, since the tour opens itself uninvited on a first visit", () => {
+    expect(welcome?.body ?? "").toContain("Skip");
+  });
+});
+
+/**
+ * A STEP MAY NOT WALK TO A SCREEN THIS SHELL DOES NOT HAVE.
+ *
+ * The Enterprise shell has no Activity tab, and its composed table carried the
+ * Activity step anyway: the route was bounced back to Overview, the anchor
+ * never mounted, and the card read out "every command an agent tried, grouped
+ * by session" over the Overview's flat list of five. The copy was right about
+ * the Activity screen; the step was on the wrong shell.
+ */
+describe("stepsForShell", () => {
+  const keysOf = (steps: readonly { key: string }[]) => steps.map((step) => step.key);
+
+  // FAILS ON REVERT: unfiltered, the activity step survives on a shell with no
+  // Activity tab, which is exactly what shipped.
+  it("drops a step whose tab this shell does not offer", () => {
+    const walked = stepsForShell(COMMUNITY_TOUR_STEPS, ["overview", "posture", "agents", "tokens"]);
+    expect(keysOf(walked)).not.toContain(ACTIVITY_TOUR_STEP_KEY);
+  });
+
+  it("keeps that same step on a shell that does offer the tab", () => {
+    // The other half: filtering unconditionally would pass the assertion above.
+    // The community routes are the shell's own answer, not a list kept here.
+    const community = deriveShellNavigation(undefined, "community").map((item) => item.route);
+    expect(community).toContain("activity");
+    const walked = stepsForShell(COMMUNITY_TOUR_STEPS, community);
+    expect(keysOf(walked)).toContain(ACTIVITY_TOUR_STEP_KEY);
+  });
+
+  it("keeps the steps that need no tab at all", () => {
+    const walked = stepsForShell(COMMUNITY_TOUR_STEPS, ["posture"]);
+    const keys = keysOf(walked);
+    // Welcome and finish have no route, and overview is where every shell lands.
+    expect(keys).toContain(TOUR_WELCOME_STEP_KEY);
+    expect(keys).toContain(TOUR_FINISH_STEP_KEY);
+    expect(keys).toContain(COMMUNITY_UPGRADE_STEP_KEY);
+  });
+
+  it("drops nothing when the nav has not rendered yet", () => {
+    // An empty list is missing evidence, not evidence that the shell has no
+    // screens. Treating it as the latter would silently gut the tour on a slow
+    // bootstrap, which is worse than the defect being fixed.
+    expect(stepsForShell(COMMUNITY_TOUR_STEPS, [])).toEqual(COMMUNITY_TOUR_STEPS);
+  });
+});
+
+/**
+ * A tour step may only promise what a producer can actually fill.
+ *
+ * The Agents step said "with its runtime, its model". The agent inventory
+ * hardcodes `runtime: null` and `model: null` on every subject, and the agent
+ * card filters null detail rows out before rendering, so those two fields have
+ * never appeared on any host. The tour was pointing at a screen and describing
+ * something that is not on it.
+ *
+ * FAILS ON REVERT: restore "its runtime, its model" and the first expectation
+ * sees the forbidden phrase.
+ */
+describe("the tour does not promise fields no producer fills", () => {
+  const agents = PAID_SCREEN_TOUR_STEPS.find((step) => step.key === "agents");
+
+  it("has an Agents step to check", () => {
+    expect(agents).toBeDefined();
+  });
+
+  it("stops promising a runtime and a model", () => {
+    expect(agents!.body).not.toContain("runtime");
+    expect(agents!.body).not.toContain("model");
+  });
+
+  it("still describes what the screen really shows", () => {
+    expect(agents!.body).toContain("guardrail");
+    expect(agents!.body).toContain("running");
   });
 });

@@ -61,6 +61,51 @@ export function decisionRecordCta(
   return { kind: "hidden", label: "" };
 }
 
+/**
+ * What the "Recorded decisions" tile is a count OF, and over what span.
+ *
+ * The number is `Overview.commands`: every decision node in the guard graph, for
+ * the whole life of that file, ungrouped and unwindowed. The screen its CTA
+ * opens counts CASES, and counts them inside a window that defaults to the last
+ * 24 hours. An operator read 17 here and 1 there and reasonably took it for
+ * data loss, because neither screen said what it was counting or over how long.
+ *
+ * Stating the span is the fix. Making the two numbers equal is not available:
+ * they are different units, and the honest move when a screen cannot compare is
+ * to say what each figure means rather than to bend one into the other.
+ */
+export function recordedDecisionsDetail(sessions: number): string {
+  // NOT "all time". `Graph::prune` drops the oldest nodes past MAX_NODES and
+  // sheds another tenth on top, so the store is bounded and the oldest
+  // decisions are gone. Saying "all time" over a pruned record is the same
+  // class of claim this whole pass is removing.
+  return `No time window, across ${sessions} session${sessions === 1 ? "" : "s"}`;
+}
+
+/**
+ * The footnote under Risk signals, which says what those bars count.
+ *
+ * They count rule CATEGORIES matched, never decisions. One decision can match
+ * several categories at once, and a decision whose rule carries no category
+ * matches none at all (every built-in MCP rule is in that state today), so the
+ * column does not and cannot add up to the deny count printed beside it. An
+ * operator compared "3" here with "11 deny verdicts" there and read the gap as
+ * missing signal.
+ *
+ * The card also shows only the most frequent few of what the host sent, so it
+ * says when it is not showing everything. Neither half may be fixed by making
+ * the numbers match: they are different units, and forcing them together would
+ * print a figure no rule match supports.
+ */
+export function riskSignalsFootnote(shown: number, sent: number): string {
+  const unit = "These count rule categories matched, not decisions: one decision can match several, "
+    + "and a decision whose rule carries no category matches none, so they do not add up to the "
+    + "verdict counts above.";
+  const truncated = sent > shown ? ` Showing the ${shown} most frequent.` : "";
+  return `${unit}${truncated} A match is not a confirmed attack; a user or model decision may still `
+    + "allow a matched action.";
+}
+
 export function Home({
   meta,
   onOpenActivity,
@@ -148,7 +193,13 @@ was incomplete; it does not mean this host is idle.`}
   const summary = headline({
     needsReview: reviewVerdicts,
     denyVerdicts,
-    blockedBeforeExecution: overview.actual_blocks ?? 0,
+    // `?? null`, never `?? 0`: a host that sends no outcome figures has not
+    // said it stopped nothing, and the headline must not read it as if it had.
+    blockedBeforeExecution: overview.actual_blocks ?? null,
+    wouldBlock: overview.would_block ?? null,
+    screened: overview.screened ?? null,
+    outcomesUnknown: overview.outcomes_unknown ?? null,
+    deniesWithoutBlock: overview.denies_without_block ?? null,
     monitorOnly: mode === "monitor",
     unprovenAgents: 0,
   });
@@ -211,7 +262,7 @@ was incomplete; it does not mean this host is idle.`}
               })()}
             </div>
             <div className={hasUnknownVerdicts ? "grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-5" : "grid grid-cols-2 gap-3 lg:grid-cols-4"}>
-              <Stat label="Recorded decisions" value={overview.commands} detail={`${overview.sessions} session${overview.sessions === 1 ? "" : "s"}`} />
+              <Stat label="Recorded decisions" value={overview.commands} detail={recordedDecisionsDetail(overview.sessions)} />
               <Stat label="Deny verdicts" value={denyVerdicts} detail="Classified as unsafe" tone={denyVerdicts > 0 ? "danger" : undefined} />
               <Stat label="Needs review" value={reviewVerdicts} detail="Requires human judgement" tone={reviewVerdicts > 0 ? "attention" : undefined} />
               <Stat label="Allowed" value={allowVerdicts} detail="No blocking verdict" tone="positive" />
@@ -225,7 +276,7 @@ was incomplete; it does not mean this host is idle.`}
 
           <div className="grid gap-6 lg:grid-cols-[minmax(0,1.35fr)_minmax(280px,.65fr)]">
             <RecentActivity items={recent} edition={edition} onOpen={onOpenActivity} onOpenCase={onOpenCase} />
-            <RiskSignals items={overview.top_categories.slice(0, 6)} max={maxSignal} />
+            <RiskSignals items={overview.top_categories.slice(0, 6)} sent={overview.top_categories.length} max={maxSignal} />
           </div>
         </>
       )}
@@ -289,7 +340,7 @@ export const POSTURES: Record<GuardrailMode, { label: string; title: string; bod
   monitor: {
     label: "Monitor configured",
     title: "Build confidence before you turn on blocking.",
-    body: "Configured integrations screen activity without blocking it after the agent reloads them. Review the local evidence before enforcing.",
+    body: "Once an agent reloads this wiring, the integrations you configured screen its activity without blocking any of it. Review the local evidence before enforcing.",
     badge: "border-blue-200 bg-blue-50 text-blue-700",
     panel: "border-blue-200 from-blue-50 to-white",
   },
@@ -536,7 +587,7 @@ function RecentActivityEntry({ item, clickable }: { item: DecisionSummary; click
   );
 }
 
-function RiskSignals({ items, max }: { items: Overview["top_categories"]; max: number }) {
+function RiskSignals({ items, sent, max }: { items: Overview["top_categories"]; sent: number; max: number }) {
   return (
     <section className="min-w-0" aria-labelledby="risk-signals-title">
       <div className="mb-3">
@@ -565,7 +616,7 @@ function RiskSignals({ items, max }: { items: Overview["top_categories"]; max: n
           </ul>
         )}
         <p className="mt-4 border-t border-slate-100 pt-3 text-xs leading-5 text-slate-500">
-          Categories show rule matches, not confirmed attacks. A user or model decision may still allow a matched action.
+          {riskSignalsFootnote(items.length, sent)}
         </p>
       </div>
     </section>

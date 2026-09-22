@@ -1,6 +1,7 @@
 import type { TokenCounterSet, TokenIntelligence as TokenIntelligenceContract, TokenProviderUsage } from "../api/v1";
 import { gridColumnsClass, gridSpanClass, joinClasses } from "../components/cardGrid";
 import { StatusBadge } from "../components/StatusBadge";
+import { formatAbsolute } from "../presentation";
 
 /** Provider cards are compact, so three across is comfortable; the shared fill
  * rule keeps the last row as full as the ones above it at every count. */
@@ -139,7 +140,7 @@ function formatDecimal(value: string | null): string {
 function formatTimestamp(value: string | null): string {
   if (value === null) return "Unavailable";
   const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? value : new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(date);
+  return formatAbsolute(date) ?? value;
 }
 
 function humanize(value: string): string {

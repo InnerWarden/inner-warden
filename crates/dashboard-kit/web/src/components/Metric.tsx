@@ -1,5 +1,6 @@
 import type { Metric as MetricProjection } from "../api/v1";
 import { StatusBadge } from "./StatusBadge";
+import { formatAbsolute } from "../presentation";
 
 function groupDecimal(value: string): string {
   return /^(0|[1-9][0-9]*)$/.test(value) ? value.replace(/\B(?=(\d{3})+(?!\d))/g, ",") : value;
@@ -18,7 +19,7 @@ export function formatMetricValue(metric: Pick<MetricProjection, "availability" 
 function formatTime(value: string | null): string {
   if (value === null) return "Not reported";
   const parsed = new Date(value);
-  return Number.isNaN(parsed.getTime()) ? value : new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(parsed);
+  return formatAbsolute(parsed) ?? value;
 }
 
 function sourceLabel(metric: MetricProjection): string {

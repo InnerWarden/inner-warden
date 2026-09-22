@@ -169,13 +169,50 @@ export function discoveryLimitNotice(limited: boolean): typeof DISCOVERY_LIMIT_D
   return limited ? DISCOVERY_LIMIT_DISCLOSURE : null;
 }
 
+/**
+ * Which empty panel an agent list with no rows gets, from the availability the
+ * host reported.
+ *
+ * Three states, not two, because there are three different things a host can
+ * mean by "no agents listed":
+ *
+ * - `unavailable`: the host could not look. Nothing is inferred from the gap.
+ * - `degraded`: the host looked, could not enumerate everything, and HAS
+ *   evidence of an agent it cannot list. On the paid tier this is a readable
+ *   but empty guardrail registry on a machine whose guard record holds agent
+ *   sessions. This state used to fall through to "No compatible agents
+ *   detected", which told an operator there was nothing here while the rest of
+ *   the same dashboard showed that agent's sessions and its screened actions.
+ * - anything else: the host looked and there is genuinely nothing.
+ *
+ * Pure, so the three are testable without a poll.
+ */
+export function agentsEmptyState(availability: string | undefined): { title: string; body: string } {
+  if (availability === "unavailable") {
+    return {
+      title: "Agent detection could not run",
+      body: "The host answered but could not enumerate agents, so none are listed. On the paid tier this is an absent or unreadable agent registry; nothing is being inferred from the gap.",
+    };
+  }
+  if (availability === "degraded") {
+    return {
+      title: "Agents seen, but none wired to a guardrail",
+      body: "This host has recorded agent activity, but none of them has a guardrail policy on file and none can be listed here. Run innerwarden agents connect on each agent to put a guardrail on it and give it a row.",
+    };
+  }
+  return {
+    title: "No compatible agents detected",
+    body: "Install or launch an agent, or configure a standard MCP client, then keep the InnerWarden dashboard process running while it checks again.",
+  };
+}
+
 function AgentsPanel({ state, edition }: { state: PollState<AgentsResponse>; edition?: "community" | "enterprise" }) {
   const { data, error, loading } = state;
   const scanning = loading || data?.availability === "loading";
-  // `unavailable` arrives WITH data, so it renders through the data branch and
-  // gets its own honest message there rather than falling through to the
-  // no-response panel below.
-  const couldNotEnumerate = data?.availability === "unavailable";
+  // `unavailable` and `degraded` both arrive WITH data, so they render through
+  // the data branch and get their own honest message there rather than falling
+  // through to the no-response panel below.
+  const emptyState = agentsEmptyState(data?.availability);
   const autoConnectKnown = data?.auto_connect.status === "available"
     && data.auto_connect.enabled != null
     && data.auto_connect.mode != null;
@@ -219,11 +256,7 @@ function AgentsPanel({ state, edition }: { state: PollState<AgentsResponse>; edi
             </div>
           )}
           {data.agents.length === 0 ? (
-            couldNotEnumerate ? (
-              <EmptyPanel title="Agent detection could not run" body="The host answered but could not enumerate agents, so none are listed. On the paid tier this is an absent or unreadable agent registry; nothing is being inferred from the gap." />
-            ) : (
-              <EmptyPanel title="No compatible agents detected" body="Install or launch an agent, or configure a standard MCP client, then keep the InnerWarden dashboard process running while it checks again." />
-            )
+            <EmptyPanel title={emptyState.title} body={emptyState.body} />
           ) : (
             <ul className={agentGridClass(data.agents.length)}>
               {data.agents.map((agent, index) => (

@@ -81,6 +81,9 @@ export type Overview = {
   would_block?: number;
   screened?: number;
   outcomes_unknown?: number;
+  /** Denies whose outcome was not a block. A cross of two partitions, counted
+   * by the producer; never derive it from the marginals beside it. */
+  denies_without_block?: number;
   recent_decisions?: DecisionSummary[];
   /**
    * The hero sentence, computed by the host from the SAME counters this
@@ -238,6 +241,9 @@ export type SessionView = {
   would_block?: number;
   screened?: number;
   outcomes_unknown?: number;
+  /** Denies whose outcome was not a block. A cross of two partitions, counted
+   * by the producer; never derive it from the marginals beside it. */
+  denies_without_block?: number;
 };
 export type CasesPage = {
   sessions: SessionView[]; total_sessions: number; total_commands: number;

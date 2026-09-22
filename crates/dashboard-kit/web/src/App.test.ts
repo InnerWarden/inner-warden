@@ -238,6 +238,37 @@ describe("caseUrl", () => {
     const url = caseUrl("x".repeat(257), base);
     expect(url.searchParams.get("case")).toBeNull();
   });
+
+  /**
+   * "View all in Cases" is clicked from beside a counter that covers the whole
+   * decision record, and the Cases list defaults to the last 24 hours, so the
+   * same click used to answer a narrower question than the operator had just
+   * read: 17 decisions here, 1 case there.
+   *
+   * FAILS ON REVERT: without the span the landing view is the 24 hour default
+   * and the parameter is absent.
+   */
+  it("opens the whole list over the span the Home counter is over", () => {
+    expect(caseUrl(undefined, base).searchParams.get("window")).toBe("all");
+  });
+
+  /**
+   * MEASURED ON THE LIVE BOX. This test used to pin the opposite, and the
+   * opposite was the defect: a deep link naming one case landed on the Cases
+   * default of the last 24 hours, so opening anything older showed a list the
+   * case was not in, with nothing selected. Six attempts, and the operator read
+   * it as a broken link.
+   *
+   * A link that names its target must not be filtered out by a default the
+   * operator never chose. The screen's own controls can narrow it afterwards.
+   *
+   * FAILS ON REVERT: drop the window from the named-case branch and this reads
+   * null again.
+   */
+  it("carries the span with the case it names, so the target is in the list", () => {
+    expect(caseUrl("case:x:1", base).searchParams.get("window")).toBe("all");
+    expect(caseUrl("case:x:1", base).searchParams.get("case")).toBe("case:x:1");
+  });
 });
 
 describe("activity selection in the address bar", () => {

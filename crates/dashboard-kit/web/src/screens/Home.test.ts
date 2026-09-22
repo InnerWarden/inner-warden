@@ -5,6 +5,8 @@ import {
   decisionEntryLink,
   decisionRecordCta,
   missingOverviewFields,
+  recordedDecisionsDetail,
+  riskSignalsFootnote,
 } from "./Home";
 import type { Overview } from "../api";
 
@@ -151,5 +153,54 @@ describe("the Active Defence card", () => {
     const shown = Object.values(ACTIVE_DEFENCE_COPY.installed).join(" ");
     expect(shown).not.toContain("innerwarden.com/enterprise");
     expect(shown).not.toContain("Explore Active Defence");
+  });
+});
+
+/**
+ * TWO COUNTERS THAT CANNOT BE COMPARED.
+ *
+ * An operator read "Recorded decisions 17", clicked through to Cases and found
+ * one case. Neither number was wrong: this tile counts decision nodes for the
+ * whole life of the graph, and the Cases list counts cases inside a window that
+ * defaults to 24 hours. What was missing was either screen saying so.
+ */
+describe("recordedDecisionsDetail", () => {
+  // FAILS ON REVERT: the old detail was "3 sessions" and carried no span.
+  it("states the span the count is over, not only the session total", () => {
+    const detail = recordedDecisionsDetail(3);
+    expect(detail).toContain("No time window");
+    expect(detail).toContain("3 sessions");
+  });
+
+  it("keeps the singular for a single session", () => {
+    expect(recordedDecisionsDetail(1)).toBe("No time window, across 1 session");
+  });
+});
+
+/**
+ * RULE CATEGORIES ARE NOT DECISIONS.
+ *
+ * The same operator totalled the Risk signals bars at 3 and read them against
+ * 11 deny verdicts. A decision can match several categories, or none at all, so
+ * the two columns are different units, and the card has to say which it is
+ * rather than have the gap read as lost signal.
+ */
+describe("riskSignalsFootnote", () => {
+  // FAILS ON REVERT: the old footnote spoke only about attacks, and never about
+  // what the numbers count or why they do not add up to the verdicts.
+  it("says the bars count categories, not decisions", () => {
+    const text = riskSignalsFootnote(3, 3);
+    expect(text).toContain("rule categories matched, not decisions");
+    expect(text).toContain("do not add up to the verdict counts");
+    expect(text).toContain("matches none");
+  });
+
+  it("does not claim to be showing everything when it is not", () => {
+    expect(riskSignalsFootnote(6, 8)).toContain("Showing the 6 most frequent.");
+    expect(riskSignalsFootnote(6, 6)).not.toContain("Showing the");
+  });
+
+  it("keeps the standing warning that a match is not an attack", () => {
+    expect(riskSignalsFootnote(2, 2)).toContain("not a confirmed attack");
   });
 });

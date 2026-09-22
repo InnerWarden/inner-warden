@@ -1,5 +1,6 @@
 import type { CaseEvent, CaseEventType, RelationshipConfidence } from "../api/cases";
 import { StatusBadge } from "./StatusBadge";
+import { formatAbsolute } from "../presentation";
 import { friendlyId } from "./TruncatedId";
 
 const eventLabels: Record<CaseEventType, string> = {
@@ -22,6 +23,22 @@ const relationshipLabels: Record<RelationshipConfidence, string> = {
   contextual: "Contextual",
   unknown: "Unknown relationship",
 };
+
+/**
+ * The badge a step's effective mode renders as.
+ *
+ * This passed `status="degraded"` for enforce and `status="unknown"` for
+ * everything else. `degraded` is tone "attention" with an exclamation mark, so
+ * the one mode in which the product actually protects you was the only one to
+ * carry a warning sign, on steps that had succeeded; and observe, rehearse,
+ * learning, disabled and mixed were flattened into one grey question mark.
+ *
+ * `StatusBadge` already carries a presentation for every mode the contract can
+ * emit, so the mode IS the status and none of them needs a special case.
+ */
+export function modeBadge(mode: NonNullable<CaseEvent["mode"]>): { status: string; label: string } {
+  return { status: mode, label: `${mode} mode` };
+}
 
 export function evidenceDomId(id: string): string {
   let encoded = "";
@@ -66,7 +83,7 @@ export function CaseTimeline({ events }: { events: CaseEvent[] }) {
                     status={event.relationship === "causal" ? "available" : event.relationship === "strongly_supported" ? "degraded" : "unknown"}
                     label={relationshipLabels[event.relationship]}
                   />
-                  {event.mode && <StatusBadge status={event.mode === "enforce" ? "degraded" : "unknown"} label={`${event.mode} mode`} />}
+                  {event.mode && <StatusBadge {...modeBadge(event.mode)} />}
                 </div>
               </div>
               <p className="mt-3 whitespace-pre-wrap break-words text-sm leading-6 text-slate-800 [overflow-wrap:anywhere]">{event.summary}</p>
@@ -138,5 +155,5 @@ export function EvidenceLinks({ evidence }: { evidence: CaseEvent["source_refs"]
 }
 
 function formatTime(value: string): string {
-  return new Intl.DateTimeFormat("en", { dateStyle: "medium", timeStyle: "medium", timeZone: "UTC" }).format(new Date(value));
+  return formatAbsolute(value) ?? value;
 }
