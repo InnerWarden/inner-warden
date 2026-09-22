@@ -274,6 +274,8 @@ was incomplete; it does not mean this host is idle.`}
             <OperationalEvidence overview={overview} />
           )}
 
+          <HostAttention waiting={overview.host_attention} />
+
           <div className="grid gap-6 lg:grid-cols-[minmax(0,1.35fr)_minmax(280px,.65fr)]">
             <RecentActivity items={recent} edition={edition} onOpen={onOpenActivity} onOpenCase={onOpenCase} />
             <RiskSignals items={overview.top_categories.slice(0, 6)} sent={overview.top_categories.length} max={maxSignal} />
@@ -584,6 +586,65 @@ function RecentActivityEntry({ item, clickable }: { item: DecisionSummary; click
         )}
       </div>
     </>
+  );
+}
+
+/**
+ * What the HOST has waiting, or nothing at all.
+ *
+ * This page is the agent layer's and said nothing about the host, so an
+ * operator reading a healthy agent picture had no way to know the host side
+ * was holding anything.
+ *
+ * Three rules, and each of them is the operator's standing instruction that
+ * this dashboard must not fill with warnings that mean nothing:
+ *
+ *  * ABSENT is not zero. A build with no host layer omits the field and this
+ *    renders nothing, rather than a zero that would claim knowledge of
+ *    something it cannot see.
+ *  * Zero waiting is GOOD news and is said in one calm line, not as a tile
+ *    competing for attention.
+ *  * The number counts distinct ADDRESSES, not rows, and says so on the
+ *    screen. Measured on a production host: 851 incidents in a day, 42
+ *    undecided, behind eight addresses. Eight is actionable; 851 is a wall.
+ */
+export function hostAttentionLine(
+  waiting: Overview["host_attention"],
+): { tone: "quiet" | "waiting"; title: string; body: string } | undefined {
+  if (waiting === undefined) return undefined;
+  const count = waiting.addresses_waiting;
+  if (!Number.isFinite(count) || count < 0) return undefined;
+  if (count === 0) {
+    return {
+      tone: "quiet",
+      title: "Nothing on the host is waiting for you",
+      body: "Every address this host saw today has been decided on.",
+    };
+  }
+  return {
+    tone: "waiting",
+    title: `${count.toLocaleString()} ${count === 1 ? "address is" : "addresses are"} waiting on you`,
+    body: waiting.counts,
+  };
+}
+
+function HostAttention({ waiting }: { waiting: Overview["host_attention"] }) {
+  const line = hostAttentionLine(waiting);
+  if (line === undefined) return null;
+  const quiet = line.tone === "quiet";
+  return (
+    <section
+      aria-labelledby="host-attention-title"
+      className={`rounded-xl border p-4 shadow-sm ${quiet ? "border-slate-200 bg-white" : "border-amber-200 bg-amber-50"}`}
+    >
+      <h2
+        id="host-attention-title"
+        className={`text-sm font-semibold ${quiet ? "text-slate-950" : "text-amber-900"}`}
+      >
+        {line.title}
+      </h2>
+      <p className={`mt-1 text-sm leading-6 ${quiet ? "text-slate-600" : "text-amber-900"}`}>{line.body}</p>
+    </section>
   );
 }
 

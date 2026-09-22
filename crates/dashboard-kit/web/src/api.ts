@@ -86,6 +86,30 @@ export type Overview = {
   denies_without_block?: number;
   recent_decisions?: DecisionSummary[];
   /**
+   * What the HOST has waiting, when this build has a host at all.
+   *
+   * This screen is the agent layer's, and it carried no sign that the host
+   * side was holding anything, so an operator reading a healthy agent picture
+   * had no way to know. The number existed the whole time, on a paid endpoint
+   * this page does not call.
+   *
+   * Counted per distinct external ADDRESS, not per case, and that difference
+   * is the point. Measured on a production host 2026-09-22: 851 incidents that
+   * day, 42 of them with no decision or awaiting confirmation, behind EIGHT
+   * addresses, among them a rootkit finding and a log-tampering one. Eight is
+   * a number somebody can act on; 851 is a wall.
+   *
+   * ABSENT, never zero, on a build with no host layer: Community has none, and
+   * a rendered zero would be this product making a claim about something it
+   * cannot see. The screen renders nothing when the field is missing.
+   */
+  host_attention?: {
+    addresses_waiting: number;
+    /** What the number counts, in the producer's own words, so a reader can
+     * check it without leaving the screen. */
+    counts: string;
+  };
+  /**
    * The hero sentence, computed by the host from the SAME counters this
    * payload carries.
    *
