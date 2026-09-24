@@ -1,6 +1,11 @@
 import { verdictLabel } from "../presentation";
 
-export function Verdict({ rec }: { rec?: string }) {
+/**
+ * `reviewLabel` replaces the words on a `review` chip where the shared
+ * "Needs review" would collide with something else on the same screen (see
+ * `REVIEW_VERDICT_CHIP` in Home). The colours never change with it.
+ */
+export function Verdict({ rec, reviewLabel }: { rec?: string; reviewLabel?: string }) {
   const map: Record<string, [string, string]> = {
     deny: ["bg-red-500", "border-red-200 bg-red-50 text-red-700"],
     review: ["bg-amber-500", "border-amber-200 bg-amber-50 text-amber-800"],
@@ -13,7 +18,7 @@ export function Verdict({ rec }: { rec?: string }) {
   return (
     <span className={`inline-flex shrink-0 self-start justify-self-start items-center gap-1.5 whitespace-nowrap rounded-lg border px-2.5 py-0.5 text-xs font-semibold leading-5 ${cls}`}>
       <span className={`h-1.5 w-1.5 rounded-full ${dot}`} aria-hidden="true" />
-      {verdictLabel(hit ? rec : undefined)}
+      {hit && rec === "review" && reviewLabel ? reviewLabel : verdictLabel(hit ? rec : undefined)}
     </span>
   );
 }

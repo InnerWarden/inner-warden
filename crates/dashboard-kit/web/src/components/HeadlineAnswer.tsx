@@ -17,8 +17,43 @@
  */
 
 export type HeadlineInput = {
-  /** Actions the product decided it cannot settle alone. */
+  /**
+   * Agent actions the agent guardrail answered `review` on: it could not
+   * settle them alone. These are guardrail verdicts. A paid host's Cases screen
+   * has a "Needs review" status of its own, and that is a case status, not a
+   * guardrail verdict: a different count, under the same two words.
+   *
+   * It is NOT a count of actions being held. A `review` verdict stops the
+   * action only where the hook runs in block-review mode, and a one-off
+   * `innerwarden check` records a verdict with nothing pending at all. The
+   * count cannot tell which, so the sentence says "flagged", never "waiting".
+   */
   needsReview: number;
+  /**
+   * Where the actions counted in `needsReview` can be listed, which is where
+   * the Decision record's "view everything" button goes (`decisionRecordCta`
+   * in Home), so the sentence and the button can never disagree.
+   *
+   * It used to be one constant, "Open Activity and filter by Needs review.",
+   * on both products. Enterprise has no Activity tab at all, so a paid reader
+   * was sent to a screen that does not exist, and the only "Needs review"
+   * they could find was the Cases status: a case status, not a guardrail
+   * verdict.
+   */
+  reviewListedIn: "activity" | "cases" | "hidden";
+  /**
+   * Whether the Recent activity section on the same page lists decisions with
+   * their verdicts: true only when the host sent `recent_decisions` and it is
+   * not empty. Read only when `reviewListedIn` is `hidden`, where Recent
+   * activity is the one place left to point at.
+   *
+   * False on an older host that sends only `recent_blocks`: that list holds
+   * deny verdicts alone, so a `review` verdict never appears in it, and
+   * pointing a reader at it for one is a promise the section cannot keep. An
+   * empty list says "No recent decisions are available yet." directly under
+   * the sentence that would have sent them there.
+   */
+  recentShowsDecisions: boolean;
   /** Verdicts of "unsafe". */
   denyVerdicts: number;
   /**
@@ -64,11 +99,45 @@ export type Headline = {
 };
 
 /**
+ * Where to go to see the actions the agent guardrail flagged for review, named
+ * by a control that exists on the product the reader is looking at.
+ *
+ * - `activity` (Community): the Activity tab, and its "Needs review" verdict
+ *   filter, which lists exactly these.
+ * - `cases` (Enterprise with a Cases screen): there is no Activity tab. The
+ *   guardrail's verdicts sit inside the agent-session cases, which the
+ *   Capability filter's "The agent guardrail" option narrows to. The Cases
+ *   screen's own "Needs review" is a case status, not a guardrail verdict,
+ *   and must not be named here: that is the collision this sentence exists to
+ *   avoid.
+ * - `hidden`: no screen lists them all, and the sentence says so rather than
+ *   naming one. It points at Recent activity only when that section really
+ *   lists decisions with their verdicts (`recentShowsDecisions`).
+ */
+export function reviewRemedy(
+  where: HeadlineInput["reviewListedIn"],
+  recentShowsDecisions: boolean,
+): string {
+  if (where === "activity") return "Open Activity and filter by Needs review.";
+  if (where === "cases") {
+    return "These are the agent guardrail's verdicts, not host cases. Use View all in Cases and set "
+      + "Capability to \"The agent guardrail\" to find them in their agent sessions.";
+  }
+  if (recentShowsDecisions) {
+    return "These are the agent guardrail's verdicts. Recent activity below shows the latest decisions "
+      + "with their verdicts; no screen in this installation lists them all.";
+  }
+  return "These are the agent guardrail's verdicts. No screen in this installation lists them.";
+}
+
+/**
  * Rules, in priority order, and the reasoning behind each.
  *
- * 1. Work queued for a person wins over everything. It is the only state where
- *    the product is genuinely waiting on the reader, and burying it under a
- *    reassuring headline would be the worst thing this screen could do.
+ * 1. Actions the guardrail flagged for a person win over everything. Burying
+ *    them under a reassuring headline would be the worst thing this screen
+ *    could do. The sentence says they were FLAGGED, not that they are waiting:
+ *    the count includes one-off checks where nothing is pending, and it cannot
+ *    tell whether the hook held anything (see `needsReview`).
  * 2. Monitor mode is reported as a CHOICE, not a failure, and only once nothing
  *    is queued. "Watching, not blocking" is what the operator picked; saying it
  *    plainly is honest, and it explains the deny-versus-blocked gap that
@@ -91,10 +160,19 @@ export type Headline = {
  */
 export function headline(input: HeadlineInput): Headline {
   if (input.needsReview > 0) {
-    const plural = input.needsReview === 1 ? "action needs" : "actions need";
+    // "agent actions", not "actions": on a paid host this sentence sits on the
+    // same page as a count of host cases waiting, and the two are different
+    // things counted by different parts of the product.
+    //
+    // "were flagged for review", not "need your decision": the tile under this
+    // sentence says flagged, and this count cannot tell whether anything was
+    // held. A one-off `innerwarden check` answered `review` is counted here
+    // with nothing pending, and "need your decision" told its reader something
+    // was waiting on them that never was.
+    const plural = input.needsReview === 1 ? "agent action was" : "agent actions were";
     return {
-      answer: `${input.needsReview.toLocaleString()} ${plural} your decision`,
-      next: "Open Activity and filter by Needs review.",
+      answer: `${input.needsReview.toLocaleString()} ${plural} flagged for review`,
+      next: reviewRemedy(input.reviewListedIn, input.recentShowsDecisions),
       tone: "attention",
     };
   }

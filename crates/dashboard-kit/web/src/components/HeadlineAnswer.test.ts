@@ -3,6 +3,8 @@ import { headline } from "./HeadlineAnswer";
 
 const healthy = {
   needsReview: 0,
+  reviewListedIn: "activity" as const,
+  recentShowsDecisions: true,
   denyVerdicts: 0,
   blockedBeforeExecution: 0,
   wouldBlock: 0,
@@ -43,8 +45,23 @@ describe("headline answer", () => {
   });
 
   it("counts one action in the singular, because 1 actions is a tell", () => {
-    expect(headline({ ...healthy, needsReview: 1 }).answer).toBe("1 action needs your decision");
-    expect(headline({ ...healthy, needsReview: 2 }).answer).toBe("2 actions need your decision");
+    expect(headline({ ...healthy, needsReview: 1 }).answer).toBe("1 agent action was flagged for review");
+    expect(headline({ ...healthy, needsReview: 2 }).answer).toBe("2 agent actions were flagged for review");
+  });
+
+  /**
+   * The count is every decision the guardrail answered `review` on, and that
+   * includes one-off `innerwarden check` screenings, where nothing is pending
+   * and nobody has anything to decide. The headline read "2 agent actions need
+   * your decision" over a record of five screened checks. It now says what the
+   * count supports, in the same word the tile under it uses.
+   */
+  it("says the actions were flagged, never that they wait on the reader", () => {
+    const allScreened = headline({ ...healthy, needsReview: 2, screened: 5 });
+    expect(allScreened.answer).toBe("2 agent actions were flagged for review");
+    expect(allScreened.answer).not.toContain("decision");
+    expect(allScreened.answer).not.toContain("need");
+    expect(allScreened.tone).toBe("attention");
   });
 
   /**

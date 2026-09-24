@@ -4,7 +4,9 @@ import { Detail } from "../components/Detail";
 import { SessionCard } from "../components/SessionCard";
 
 const LIMIT = 12;
-const VERDICTS: [string, string][] = [
+/** The verdict filter buttons. Exported so copy that tells a reader to press
+ * one can be checked against the buttons that actually exist. */
+export const VERDICTS: [string, string][] = [
   ["", "All decisions"],
   ["deny", "Deny verdicts"],
   ["review", "Needs review"],
