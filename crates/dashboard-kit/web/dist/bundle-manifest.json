@@ -1,21 +1,21 @@
 {
   "schema": "innerwarden.dashboard.bundle.v1",
-  "source_digest": "sha256:a625e3a9ec5450db916cc726005910bb5b11fe43e2efcb2221cc23142d4d44c7",
+  "source_digest": "sha256:2fb9d46f815f46010f2bf71c601e2150a1c4a57a54df17635c805148b61cd01e",
   "entrypoint": "index.html",
   "assets": [
     {
-      "path": "assets/index-Cat2IZtn.css",
-      "sha256": "sha256:2e41056f16b9ce91286a462f2ca99cbb194009fbf595b29513c602d1eb9153a2",
-      "size": 44069
+      "path": "assets/index-B8tvIPlh.css",
+      "sha256": "sha256:d15cf8f60832cc5be107de8a60e741ae5748d76ea8024044bc5f4a92461866c6",
+      "size": 44189
     },
     {
-      "path": "assets/index-DzYEE6nc.js",
-      "sha256": "sha256:d9c6aed7f97bd8e284bb19bb99761b96998ac49df45221200223b52a5ec8b5a2",
-      "size": 372640
+      "path": "assets/index-Cl5rXSzJ.js",
+      "sha256": "sha256:20d3fabe6d2efa420da2f6551d89f70bd70b134463cfe4f680ad67696ee9381d",
+      "size": 374641
     },
     {
       "path": "index.html",
-      "sha256": "sha256:4dbd73d5ef0062aafcf566f83794a847665e5f8ea215f3571b1e15f02882939f",
+      "sha256": "sha256:d2f075fcb347004a6299626335bad62f3f2a5b3962ce847e1523630f9472aa47",
       "size": 543
     }
   ]

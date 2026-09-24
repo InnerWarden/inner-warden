@@ -15,8 +15,8 @@ describe("the status filter in the address bar", () => {
   });
 
   /**
-   * `dismissed`, `closed` and `observing` exist on the host's enum and no
-   * projector assigns them. A URL naming one falls back to no filter rather
+   * `dismissed` and `closed` exist on the host's enum and no projector
+   * assigns them. A URL naming one falls back to no filter rather
    * than to a dropdown value the operator cannot see.
    */
   it("drops a status the host never produces, and junk", () => {
