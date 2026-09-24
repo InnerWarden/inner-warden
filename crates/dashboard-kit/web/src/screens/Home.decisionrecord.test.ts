@@ -111,4 +111,19 @@ describe("the Decision record decides its button and its remedy together", () =>
     );
     expect([record.denyVerdicts, record.reviewVerdicts, record.allowVerdicts]).toEqual([1, 2, 3]);
   });
+
+  /**
+   * An older host sends only the legacy counters (`blocked`, `review`,
+   * `allowed`). They count the same verdicts, so the tiles and the headline
+   * read them rather than a zero the host never said.
+   */
+  it("reads an older host's legacy counters when the named fields are absent", () => {
+    const legacy = overview({ blocked: 4, review: 5, allowed: 6 });
+    delete legacy.deny_verdicts;
+    delete legacy.review_verdicts;
+    delete legacy.allow_verdicts;
+    const record = decisionRecord(legacy, "community", false, "enforce");
+    expect([record.denyVerdicts, record.reviewVerdicts, record.allowVerdicts]).toEqual([4, 5, 6]);
+    expect(record.summary.answer).toBe("5 agent actions were flagged for review");
+  });
 });

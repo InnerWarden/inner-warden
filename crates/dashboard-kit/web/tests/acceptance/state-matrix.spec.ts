@@ -58,9 +58,33 @@ test("no-data is a valid empty projection and never an adapter error", async ({ 
   await page.goto("/?view=cases&q=no-match");
 
   await expect(page.getByRole("heading", { name: "No matching cases" })).toBeVisible();
-  await expect(page.getByText("0 on this page", { exact: true })).toBeVisible();
+  await expect(page.getByText("0 rows on this page", { exact: true })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Cases response could not be validated" })).toHaveCount(0);
   await expect(page.getByRole("heading", { name: "Cases is unavailable" })).toHaveCount(0);
+});
+
+/**
+ * The pages walk ROWS, folded per recurring finding, and the window holds
+ * CASES, counted before that fold so per-filter totals add up. The count line
+ * takes its "of" from the row total and names the case total apart, and the
+ * list request asks the server for the row total, which it sends only when
+ * asked.
+ */
+test("the count line pages against rows and names the cases in the window apart", async ({ page }) => {
+  const listRequests: URL[] = [];
+  await installCases(page, (route) => {
+    listRequests.push(new URL(route.request().url()));
+    return route.fulfill({
+      json: { ...structuredClone(pageOne), window: "7d", total_in_window: 4_394, window_complete: true, rows_in_window: 312 },
+    });
+  });
+  await page.goto("/?view=cases&window=7d");
+
+  await expect(page.getByText("2 rows on this page of 312 · 4,394 cases in this window", { exact: true })).toBeVisible();
+  // The case total is never the denominator of the rows.
+  await expect(page.getByText("of 4,394", { exact: false })).toHaveCount(0);
+  expect(listRequests.length).toBeGreaterThan(0);
+  for (const url of listRequests) expect(url.searchParams.get("include")).toBe("rows_in_window");
 });
 
 test("partial evidence stays explicit and cannot create a verified outcome", async ({ page }) => {

@@ -9,7 +9,7 @@ test.describe("CJC-090-J004 local decision overview", () => {
   test("renders a source-confirmed zero as onboarding rather than an incident", async ({ page }) => {
     await page.route("**/api/guard/overview", (route) => fulfillJson(route, EMPTY_OVERVIEW));
     await page.goto("/");
-    await expect(page.getByRole("heading", { name: "No decisions recorded yet" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "No agent guardrail decisions recorded yet" })).toBeVisible();
     await expect(page.getByText("The local dashboard is unavailable", { exact: true })).toHaveCount(0);
   });
 
@@ -45,7 +45,7 @@ test.describe("CJC-090-J004 local decision overview", () => {
     await page.route("**/api/guard/overview", (route) => fulfillJson(route, { error: "graph_corrupt" }, 503));
     await page.goto("/");
     await expect(page.getByRole("alert")).toContainText("The local dashboard is unavailable");
-    await expect(page.getByRole("heading", { name: "No decisions recorded yet" })).toHaveCount(0);
+    await expect(page.getByRole("heading", { name: /decisions recorded yet/i })).toHaveCount(0);
     await expect(page.getByText("Recorded decisions", { exact: true })).toHaveCount(0);
   });
 

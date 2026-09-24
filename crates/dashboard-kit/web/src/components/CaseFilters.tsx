@@ -120,6 +120,21 @@ export function writeCaseViewState(state: CaseViewState, mode: "push" | "replace
   window.history[mode === "push" ? "pushState" : "replaceState"]({}, "", url);
 }
 
+/**
+ * What Apply hands the screen: the draft with its typed fields trimmed, so a
+ * stray space does not turn a match into zero results, and the cursor
+ * dropped, because a cursor belongs to the result set it came from and new
+ * filters start again at the first page.
+ */
+export function appliedCaseView(draft: CaseViewState): CaseViewState {
+  return { ...draft, query: draft.query.trim(), authority: draft.authority.trim(), capability: draft.capability.trim(), scopeId: draft.scopeId.trim(), cursor: null };
+}
+
+/**
+ * The filters, holding what the operator is choosing until they press Apply.
+ * A new `value` from the screen replaces the draft, so a filter set anywhere
+ * else (a link, Clear) is what the form shows.
+ */
 export function CaseFilters({ value, disabled = false, onApply, onClear }: {
   value: CaseViewState;
   disabled?: boolean;
@@ -128,10 +143,25 @@ export function CaseFilters({ value, disabled = false, onApply, onClear }: {
 }) {
   const [draft, setDraft] = useState(value);
   useEffect(() => setDraft(value), [value]);
+  return <CaseFiltersForm draft={draft} disabled={disabled} onDraft={setDraft} onApply={onApply} onClear={onClear} />;
+}
 
+/**
+ * The form itself, holding no state: every change is handed to `onDraft` as
+ * an update of the current draft, and Apply hands `appliedCaseView(draft)` to
+ * `onApply`. Kept apart from the state so what each control does to the
+ * draft can be exercised with the draft handed in.
+ */
+export function CaseFiltersForm({ draft, disabled, onDraft: setDraft, onApply, onClear }: {
+  draft: CaseViewState;
+  disabled: boolean;
+  onDraft: (update: (current: CaseViewState) => CaseViewState) => void;
+  onApply: (next: CaseViewState) => void;
+  onClear: () => void;
+}) {
   const submit = (event: FormEvent) => {
     event.preventDefault();
-    onApply({ ...draft, query: draft.query.trim(), authority: draft.authority.trim(), capability: draft.capability.trim(), scopeId: draft.scopeId.trim(), cursor: null });
+    onApply(appliedCaseView(draft));
   };
 
   return (

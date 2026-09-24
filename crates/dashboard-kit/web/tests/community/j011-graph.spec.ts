@@ -19,7 +19,7 @@ test.describe("CJC-090-J011 corrupt local graph behavior", () => {
     await page.goto("/");
 
     await expect(page.getByRole("alert")).toContainText("The local dashboard is unavailable");
-    await expect(page.getByRole("heading", { name: "No decisions recorded yet" })).toHaveCount(0);
+    await expect(page.getByRole("heading", { name: /decisions recorded yet/i })).toHaveCount(0);
     await expect(page.getByText("Recorded decisions", { exact: true })).toHaveCount(0);
 
     await page.getByRole("button", { name: "Activity", exact: true }).click();

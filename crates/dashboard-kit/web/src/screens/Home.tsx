@@ -241,17 +241,6 @@ was incomplete; it does not mean this host is idle.`}
   }
 
   const mode = normaliseMode(meta);
-  // One decision about where "everything" lives, read by both the button and
-  // the headline's remedy, so the sentence never names a screen the button
-  // beside it does not open.
-  const { cta, summary, denyVerdicts, reviewVerdicts, allowVerdicts } = decisionRecord(
-    overview,
-    edition,
-    onOpenCase !== undefined,
-    mode,
-  );
-  const recent = (overview.recent_decisions ?? overview.recent_blocks).slice(0, 5);
-  const maxSignal = overview.top_categories[0]?.count ?? 0;
   const guardedAgents = meta?.guardrail?.guarded_agents;
 
   return (
@@ -273,59 +262,15 @@ was incomplete; it does not mean this host is idle.`}
           the data, not from a label the shell resolved separately. */}
       <SensorActivity />
 
-      {overview.commands === 0 ? (
-        <ZeroState guardedAgents={guardedAgents} edition={edition} />
-      ) : (
-        <>
-          <section aria-labelledby="decision-summary-title">
-            <div className="mb-3 flex flex-col items-start gap-2 sm:flex-row sm:items-end sm:justify-between sm:gap-4">
-              <div>
-                <p className="text-xs font-semibold uppercase tracking-[0.14em] text-cyan-700">Decision record</p>
-                {/* THE ANSWER FIRST, the counters underneath as its evidence.
-                  * Five numbers and no conclusion left the reader to work out
-                  * whether they were safe, and the pairing of "252 classified
-                  * as unsafe" with "3 blocked before execution" reads as a
-                  * confession unless something explains monitor mode. */}
-                <h2 id="decision-summary-title" className="mt-1 text-lg font-semibold text-slate-950">{summary.answer}</h2>
-                {summary.next ? (
-                  <p className="mt-1 text-sm text-slate-600">{summary.next}</p>
-                ) : null}
-                <TechnicalOnly>
-                  <p className="mt-1 text-xs uppercase tracking-wide text-slate-500">What the guardrail saw</p>
-                </TechnicalOnly>
-              </div>
-              {cta.kind === "hidden" ? null : (
-                <button
-                  type="button"
-                  onClick={() => (cta.kind === "cases" ? onOpenCase?.() : onOpenActivity())}
-                  className="text-sm font-semibold text-cyan-700 hover:text-cyan-900"
-                >
-                  {cta.label} <span aria-hidden="true">→</span>
-                </button>
-              )}
-            </div>
-            <DecisionCounts
-              commands={overview.commands}
-              sessions={overview.sessions}
-              denyVerdicts={denyVerdicts}
-              reviewVerdicts={reviewVerdicts}
-              allowVerdicts={allowVerdicts}
-              unknownVerdicts={overview.unknown_verdicts}
-            />
-          </section>
-
-          {(overview.actual_blocks != null || overview.would_block != null || overview.screened != null || overview.outcomes_unknown != null) && (
-            <OperationalEvidence overview={overview} />
-          )}
-
-          <HostAttention waiting={overview.host_attention} onOpen={onOpenQueue} />
-
-          <div className="grid gap-6 lg:grid-cols-[minmax(0,1.35fr)_minmax(280px,.65fr)]">
-            <RecentActivity items={recent} edition={edition} onOpen={onOpenActivity} onOpenCase={onOpenCase} />
-            <RiskSignals items={overview.top_categories.slice(0, 6)} sent={overview.top_categories.length} max={maxSignal} />
-          </div>
-        </>
-      )}
+      <OverviewRecord
+        overview={overview}
+        mode={mode}
+        edition={edition}
+        guardedAgents={guardedAgents}
+        onOpenActivity={onOpenActivity}
+        onOpenCase={onOpenCase}
+        onOpenQueue={onOpenQueue}
+      />
 
       {edition === "enterprise" ? null : <CommunityIncluded />}
       {/* `?? false` reads an older server, which does not send the field, the
@@ -335,6 +280,114 @@ was incomplete; it does not mean this host is idle.`}
         <ActiveDefenceCard installed={meta?.active_defence_installed ?? false} />
       ) : null}
     </div>
+  );
+}
+
+/**
+ * The guardrail's decision record, or its onboarding when it has none, and
+ * the host's waiting line beside either.
+ *
+ * The host line used to render only in the branch for a guardrail that had
+ * recorded decisions. A paid host whose agent guardrail had recorded none took
+ * the onboarding branch and never said "8 addresses are waiting on you", the
+ * first thing a reader who does not know the product needs from this screen.
+ * That line reads the HOST layer (`host_attention`), not the guardrail, so it
+ * now renders whenever the host sent it, whatever the guardrail recorded.
+ * Absent, which is every Community host, it still renders nothing.
+ *
+ * With no decisions it sits above the onboarding steps: something waiting on
+ * the host now matters more than connecting an agent later. With decisions it
+ * keeps its place under the decision record.
+ */
+export function OverviewRecord({
+  overview,
+  mode,
+  edition,
+  guardedAgents,
+  onOpenActivity,
+  onOpenCase,
+  onOpenQueue,
+}: {
+  overview: Overview;
+  mode: GuardrailMode;
+  edition?: "community" | "enterprise";
+  guardedAgents?: number;
+  onOpenActivity: (target?: ActivityLink) => void;
+  onOpenCase?: (caseId?: string) => void;
+  onOpenQueue?: () => void;
+}) {
+  const hostAttention = <HostAttention waiting={overview.host_attention} onOpen={onOpenQueue} />;
+  if (overview.commands === 0) {
+    return (
+      <>
+        {hostAttention}
+        <ZeroState guardedAgents={guardedAgents} edition={edition} />
+      </>
+    );
+  }
+
+  // One decision about where "everything" lives, read by both the button and
+  // the headline's remedy, so the sentence never names a screen the button
+  // beside it does not open.
+  const { cta, summary, denyVerdicts, reviewVerdicts, allowVerdicts } = decisionRecord(
+    overview,
+    edition,
+    onOpenCase !== undefined,
+    mode,
+  );
+  const recent = (overview.recent_decisions ?? overview.recent_blocks).slice(0, 5);
+  const maxSignal = overview.top_categories[0]?.count ?? 0;
+
+  return (
+    <>
+      <section aria-labelledby="decision-summary-title">
+        <div className="mb-3 flex flex-col items-start gap-2 sm:flex-row sm:items-end sm:justify-between sm:gap-4">
+          <div>
+            <p className="text-xs font-semibold uppercase tracking-[0.14em] text-cyan-700">Decision record</p>
+            {/* THE ANSWER FIRST, the counters underneath as its evidence.
+              * Five numbers and no conclusion left the reader to work out
+              * whether they were safe, and the pairing of "252 classified
+              * as unsafe" with "3 blocked before execution" reads as a
+              * confession unless something explains monitor mode. */}
+            <h2 id="decision-summary-title" className="mt-1 text-lg font-semibold text-slate-950">{summary.answer}</h2>
+            {summary.next ? (
+              <p className="mt-1 text-sm text-slate-600">{summary.next}</p>
+            ) : null}
+            <TechnicalOnly>
+              <p className="mt-1 text-xs uppercase tracking-wide text-slate-500">What the guardrail saw</p>
+            </TechnicalOnly>
+          </div>
+          {cta.kind === "hidden" ? null : (
+            <button
+              type="button"
+              onClick={() => (cta.kind === "cases" ? onOpenCase?.() : onOpenActivity())}
+              className="text-sm font-semibold text-cyan-700 hover:text-cyan-900"
+            >
+              {cta.label} <span aria-hidden="true">→</span>
+            </button>
+          )}
+        </div>
+        <DecisionCounts
+          commands={overview.commands}
+          sessions={overview.sessions}
+          denyVerdicts={denyVerdicts}
+          reviewVerdicts={reviewVerdicts}
+          allowVerdicts={allowVerdicts}
+          unknownVerdicts={overview.unknown_verdicts}
+        />
+      </section>
+
+      {(overview.actual_blocks != null || overview.would_block != null || overview.screened != null || overview.outcomes_unknown != null) && (
+        <OperationalEvidence overview={overview} />
+      )}
+
+      {hostAttention}
+
+      <div className="grid gap-6 lg:grid-cols-[minmax(0,1.35fr)_minmax(280px,.65fr)]">
+        <RecentActivity items={recent} edition={edition} onOpen={onOpenActivity} onOpenCase={onOpenCase} />
+        <RiskSignals items={overview.top_categories.slice(0, 6)} sent={overview.top_categories.length} max={maxSignal} />
+      </div>
+    </>
   );
 }
 
@@ -852,13 +905,22 @@ export function enforceHint(edition?: "community" | "enterprise"): string {
     : "Block deny decisions on supported integrations.";
 }
 
+/**
+ * The onboarding panel for an agent guardrail that has recorded nothing.
+ *
+ * The heading names whose decisions it means. On a paid host the host line
+ * ("8 addresses are waiting on you ... latest decision is absent or awaiting
+ * confirmation") sits directly above it, and a bare "No decisions recorded
+ * yet" under that reads as a statement about the host's decisions, which the
+ * line above has just contradicted.
+ */
 function ZeroState({ guardedAgents, edition }: { guardedAgents?: number; edition?: "community" | "enterprise" }) {
   const hasConfiguredAgent = guardedAgents != null && guardedAgents > 0;
   return (
     <section className="rounded-2xl border border-dashed border-slate-300 bg-white p-6 sm:p-8" aria-labelledby="zero-state-title">
       <div className="mx-auto max-w-3xl text-center">
         <div className="mx-auto flex h-11 w-11 items-center justify-center rounded-xl bg-cyan-50 text-lg font-bold text-cyan-800" aria-hidden="true">IW</div>
-        <h2 id="zero-state-title" className="mt-4 text-xl font-semibold text-slate-950">No decisions recorded yet</h2>
+        <h2 id="zero-state-title" className="mt-4 text-xl font-semibold text-slate-950">No agent guardrail decisions recorded yet</h2>
         <p className="mx-auto mt-2 max-w-xl text-sm leading-6 text-slate-600">
           {hasConfiguredAgent
             ? "The guardrail is configured. Captured shell actions, MCP tool calls and one-off checks appear here as a local activity record."

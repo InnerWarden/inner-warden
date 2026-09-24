@@ -187,7 +187,7 @@ test.describe("CJC-090 / spec 090 T155 — dashboard performance acceptance", ()
     // The first page is bounded and labelled as such.
     await expect(page.getByRole("heading", { name: "Case results" })).toBeVisible();
     await expect(
-      page.getByText(`${pageOne.items.length} on this page`, { exact: false }),
+      page.getByText(`${pageOne.items.length} ${pageOne.items.length === 1 ? "row" : "rows"} on this page`, { exact: false }),
     ).toBeVisible();
     expect(
       pageOne.items.length,
