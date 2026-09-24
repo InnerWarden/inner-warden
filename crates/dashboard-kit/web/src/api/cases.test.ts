@@ -149,6 +149,86 @@ describe("server-side case window (paid API opt-in)", () => {
   });
 });
 
+/**
+ * `rows_in_window` is the row count after the recurrence fold, the "of M" the
+ * pages walk; `total_in_window` counts the cases behind those rows. The paid
+ * server sends the row count only when the list request asks for it, and the
+ * parser is exact-key, so a bundle that did not know the key would reject the
+ * whole page.
+ */
+describe("the row total beside the case total", () => {
+  const legacy = {
+    schema_version: "innerwarden.dashboard.v1",
+    generated_at: "2026-09-24T08:00:00Z",
+    items: [],
+    next_cursor: null,
+  };
+
+  it("keeps the row total apart from the case total", () => {
+    const page = parseCaseListPage({ ...legacy, window: "7d", total_in_window: 4_394, window_complete: true, rows_in_window: 312 });
+    expect(page.rows_in_window).toBe(312);
+    expect(page.total_in_window).toBe(4_394);
+  });
+
+  it("accepts the row total without a window, as the server sends it", () => {
+    const page = parseCaseListPage({ ...legacy, rows_in_window: 0 });
+    expect(page.rows_in_window).toBe(0);
+    expect(page.total_in_window).toBeUndefined();
+  });
+
+  it("leaves it absent when the server did not send it, never zero", () => {
+    const page = parseCaseListPage({ ...legacy, window: "7d", total_in_window: 4_394, window_complete: true });
+    expect(page.rows_in_window).toBeUndefined();
+    expect("rows_in_window" in page).toBe(false);
+  });
+
+  it("rejects a row total that is not a count, naming the field", () => {
+    for (const value of [-1, 1.5, "312", null, Number.NaN]) {
+      expect(() => parseCaseListPage({ ...legacy, rows_in_window: value })).toThrow("cases.rows_in_window: not a non-negative integer");
+    }
+  });
+
+  /**
+   * The rows on a page are some of the rows that match, so a row total below
+   * the page's own item count is a count that cannot be true, and would print
+   * "2 rows on this page of 1". It fails as a contract fault, naming why.
+   */
+  it("rejects a row total smaller than the page it came with", () => {
+    expect(casesPageOne.items.length).toBe(2);
+    expect(() => parseCaseListPage({ ...casesPageOne, rows_in_window: 1 }))
+      .toThrow("cases.rows_in_window: fewer rows than this page holds");
+    // The boundary: exactly the page is the last page of a list that fits on one.
+    expect(parseCaseListPage({ ...casesPageOne, rows_in_window: 2 }).rows_in_window).toBe(2);
+  });
+
+  /**
+   * The fold only merges cases into rows, so there are never more rows than the
+   * cases behind them. A row total above the case total is a count that cannot
+   * be true, and would print "20 rows on this page of 5 · 2 cases".
+   */
+  it("rejects more rows than the cases they were folded from", () => {
+    expect(() => parseCaseListPage({ ...legacy, window: "7d", total_in_window: 2, window_complete: true, rows_in_window: 5 }))
+      .toThrow("cases.rows_in_window: more rows than the cases they were folded from");
+    // Equal is a window where nothing recurred: every case is its own row.
+    expect(parseCaseListPage({ ...legacy, window: "7d", total_in_window: 5, window_complete: true, rows_in_window: 5 }).rows_in_window).toBe(5);
+    // With no case total sent there is nothing to hold it against.
+    expect(parseCaseListPage({ ...legacy, rows_in_window: 5 }).rows_in_window).toBe(5);
+  });
+
+  /**
+   * JSON can carry -0, which is an integer and not below zero, so it passes
+   * every check above and used to print "of -0". The parser hands on 0.
+   */
+  it("reads a JSON -0 as zero for both totals", () => {
+    const page = parseCaseListPage(JSON.parse(
+      '{"schema_version":"innerwarden.dashboard.v1","generated_at":"2026-09-24T08:00:00Z","items":[],"next_cursor":null,'
+      + '"window":"7d","total_in_window":-0,"window_complete":true,"rows_in_window":-0}',
+    ));
+    expect(Object.is(page.rows_in_window, 0)).toBe(true);
+    expect(Object.is(page.total_in_window, 0)).toBe(true);
+  });
+});
+
 describe("the connections block", () => {
   const withConnections = (connections: unknown) =>
     JSON.parse(JSON.stringify({ ...caseAgentHost, connections }));

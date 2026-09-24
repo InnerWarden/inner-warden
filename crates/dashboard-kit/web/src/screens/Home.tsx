@@ -1,5 +1,5 @@
 import { useEffect, useState, type ReactNode } from "react";
-import { headline } from "../components/HeadlineAnswer";
+import { headline, type Headline } from "../components/HeadlineAnswer";
 import { TechnicalOnly } from "../components/TechnicalDetail";
 import {
   fetchOverview,
@@ -59,6 +59,55 @@ export function decisionRecordCta(
   if (edition === "community") return { kind: "activity", label: "View all activity" };
   if (canOpenCase) return { kind: "cases", label: "View all in Cases" };
   return { kind: "hidden", label: "" };
+}
+
+/**
+ * What the Decision record section says: its "view everything" button, the
+ * headline above the tiles, and the three verdict counts the tiles show.
+ *
+ * One function decides all of it from what the host sent, so the headline's
+ * remedy and the button beside it read ONE decision about where "everything"
+ * lives and can never name different screens. This was once two calls in the
+ * render, and nothing checked that the remedy followed the button: hardcoding
+ * the remedy back to "activity" sent every paid reader to an Activity tab their
+ * shell does not have, and every test stayed green. Being a pure function of
+ * its inputs is what lets a test hand it a paid shell and read the answer.
+ */
+export function decisionRecord(
+  overview: Overview,
+  edition: "community" | "enterprise" | undefined,
+  canOpenCase: boolean,
+  mode: GuardrailMode,
+): {
+  cta: ReturnType<typeof decisionRecordCta>;
+  summary: Headline;
+  denyVerdicts: number;
+  reviewVerdicts: number;
+  allowVerdicts: number;
+} {
+  const denyVerdicts = overview.deny_verdicts ?? overview.blocked;
+  const reviewVerdicts = overview.review_verdicts ?? overview.review;
+  const allowVerdicts = overview.allow_verdicts ?? overview.allowed;
+  const cta = decisionRecordCta(edition, canOpenCase);
+  // Computed from what the host already sent: no new field, no extra request.
+  const summary = headline({
+    needsReview: reviewVerdicts,
+    reviewListedIn: cta.kind,
+    // Recent activity lists verdicts only from `recent_decisions`; the older
+    // `recent_blocks` fallback holds denies alone. See `recentShowsDecisions`.
+    recentShowsDecisions: (overview.recent_decisions?.length ?? 0) > 0,
+    denyVerdicts,
+    // `?? null`, never `?? 0`: a host that sends no outcome figures has not
+    // said it stopped nothing, and the headline must not read it as if it had.
+    blockedBeforeExecution: overview.actual_blocks ?? null,
+    wouldBlock: overview.would_block ?? null,
+    screened: overview.screened ?? null,
+    outcomesUnknown: overview.outcomes_unknown ?? null,
+    deniesWithoutBlock: overview.denies_without_block ?? null,
+    monitorOnly: mode === "monitor",
+    unprovenAgents: 0,
+  });
+  return { cta, summary, denyVerdicts, reviewVerdicts, allowVerdicts };
 }
 
 /**
@@ -192,26 +241,6 @@ was incomplete; it does not mean this host is idle.`}
   }
 
   const mode = normaliseMode(meta);
-  const denyVerdicts = overview.deny_verdicts ?? overview.blocked;
-  const reviewVerdicts = overview.review_verdicts ?? overview.review;
-  const allowVerdicts = overview.allow_verdicts ?? overview.allowed;
-  const hasUnknownVerdicts = overview.unknown_verdicts != null;
-  // Computed from what the host already sent: no new field, no extra request.
-  const summary = headline({
-    needsReview: reviewVerdicts,
-    denyVerdicts,
-    // `?? null`, never `?? 0`: a host that sends no outcome figures has not
-    // said it stopped nothing, and the headline must not read it as if it had.
-    blockedBeforeExecution: overview.actual_blocks ?? null,
-    wouldBlock: overview.would_block ?? null,
-    screened: overview.screened ?? null,
-    outcomesUnknown: overview.outcomes_unknown ?? null,
-    deniesWithoutBlock: overview.denies_without_block ?? null,
-    monitorOnly: mode === "monitor",
-    unprovenAgents: 0,
-  });
-  const recent = (overview.recent_decisions ?? overview.recent_blocks).slice(0, 5);
-  const maxSignal = overview.top_categories[0]?.count ?? 0;
   const guardedAgents = meta?.guardrail?.guarded_agents;
 
   return (
@@ -233,62 +262,15 @@ was incomplete; it does not mean this host is idle.`}
           the data, not from a label the shell resolved separately. */}
       <SensorActivity />
 
-      {overview.commands === 0 ? (
-        <ZeroState guardedAgents={guardedAgents} edition={edition} />
-      ) : (
-        <>
-          <section aria-labelledby="decision-summary-title">
-            <div className="mb-3 flex flex-col items-start gap-2 sm:flex-row sm:items-end sm:justify-between sm:gap-4">
-              <div>
-                <p className="text-xs font-semibold uppercase tracking-[0.14em] text-cyan-700">Decision record</p>
-                {/* THE ANSWER FIRST, the counters underneath as its evidence.
-                  * Five numbers and no conclusion left the reader to work out
-                  * whether they were safe, and the pairing of "252 classified
-                  * as unsafe" with "3 blocked before execution" reads as a
-                  * confession unless something explains monitor mode. */}
-                <h2 id="decision-summary-title" className="mt-1 text-lg font-semibold text-slate-950">{summary.answer}</h2>
-                {summary.next ? (
-                  <p className="mt-1 text-sm text-slate-600">{summary.next}</p>
-                ) : null}
-                <TechnicalOnly>
-                  <p className="mt-1 text-xs uppercase tracking-wide text-slate-500">What the guardrail saw</p>
-                </TechnicalOnly>
-              </div>
-              {(() => {
-                const cta = decisionRecordCta(edition, onOpenCase !== undefined);
-                if (cta.kind === "hidden") return null;
-                return (
-                  <button
-                    type="button"
-                    onClick={() => (cta.kind === "cases" ? onOpenCase?.() : onOpenActivity())}
-                    className="text-sm font-semibold text-cyan-700 hover:text-cyan-900"
-                  >
-                    {cta.label} <span aria-hidden="true">→</span>
-                  </button>
-                );
-              })()}
-            </div>
-            <div className={hasUnknownVerdicts ? "grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-5" : "grid grid-cols-2 gap-3 lg:grid-cols-4"}>
-              <Stat label="Recorded decisions" value={overview.commands} detail={recordedDecisionsDetail(overview.sessions)} />
-              <Stat label="Deny verdicts" value={denyVerdicts} detail="Classified as unsafe" tone={denyVerdicts > 0 ? "danger" : undefined} />
-              <Stat label="Needs review" value={reviewVerdicts} detail="Requires human judgement" tone={reviewVerdicts > 0 ? "attention" : undefined} />
-              <Stat label="Allowed" value={allowVerdicts} detail="No blocking verdict" tone="positive" />
-              {hasUnknownVerdicts && <Stat label="Unknown verdicts" value={overview.unknown_verdicts ?? 0} detail="Could not be classified" tone={(overview.unknown_verdicts ?? 0) > 0 ? "attention" : undefined} />}
-            </div>
-          </section>
-
-          {(overview.actual_blocks != null || overview.would_block != null || overview.screened != null || overview.outcomes_unknown != null) && (
-            <OperationalEvidence overview={overview} />
-          )}
-
-          <HostAttention waiting={overview.host_attention} onOpen={onOpenQueue} />
-
-          <div className="grid gap-6 lg:grid-cols-[minmax(0,1.35fr)_minmax(280px,.65fr)]">
-            <RecentActivity items={recent} edition={edition} onOpen={onOpenActivity} onOpenCase={onOpenCase} />
-            <RiskSignals items={overview.top_categories.slice(0, 6)} sent={overview.top_categories.length} max={maxSignal} />
-          </div>
-        </>
-      )}
+      <OverviewRecord
+        overview={overview}
+        mode={mode}
+        edition={edition}
+        guardedAgents={guardedAgents}
+        onOpenActivity={onOpenActivity}
+        onOpenCase={onOpenCase}
+        onOpenQueue={onOpenQueue}
+      />
 
       {edition === "enterprise" ? null : <CommunityIncluded />}
       {/* `?? false` reads an older server, which does not send the field, the
@@ -298,6 +280,114 @@ was incomplete; it does not mean this host is idle.`}
         <ActiveDefenceCard installed={meta?.active_defence_installed ?? false} />
       ) : null}
     </div>
+  );
+}
+
+/**
+ * The guardrail's decision record, or its onboarding when it has none, and
+ * the host's waiting line beside either.
+ *
+ * The host line used to render only in the branch for a guardrail that had
+ * recorded decisions. A paid host whose agent guardrail had recorded none took
+ * the onboarding branch and never said "8 addresses are waiting on you", the
+ * first thing a reader who does not know the product needs from this screen.
+ * That line reads the HOST layer (`host_attention`), not the guardrail, so it
+ * now renders whenever the host sent it, whatever the guardrail recorded.
+ * Absent, which is every Community host, it still renders nothing.
+ *
+ * With no decisions it sits above the onboarding steps: something waiting on
+ * the host now matters more than connecting an agent later. With decisions it
+ * keeps its place under the decision record.
+ */
+export function OverviewRecord({
+  overview,
+  mode,
+  edition,
+  guardedAgents,
+  onOpenActivity,
+  onOpenCase,
+  onOpenQueue,
+}: {
+  overview: Overview;
+  mode: GuardrailMode;
+  edition?: "community" | "enterprise";
+  guardedAgents?: number;
+  onOpenActivity: (target?: ActivityLink) => void;
+  onOpenCase?: (caseId?: string) => void;
+  onOpenQueue?: () => void;
+}) {
+  const hostAttention = <HostAttention waiting={overview.host_attention} onOpen={onOpenQueue} />;
+  if (overview.commands === 0) {
+    return (
+      <>
+        {hostAttention}
+        <ZeroState guardedAgents={guardedAgents} edition={edition} />
+      </>
+    );
+  }
+
+  // One decision about where "everything" lives, read by both the button and
+  // the headline's remedy, so the sentence never names a screen the button
+  // beside it does not open.
+  const { cta, summary, denyVerdicts, reviewVerdicts, allowVerdicts } = decisionRecord(
+    overview,
+    edition,
+    onOpenCase !== undefined,
+    mode,
+  );
+  const recent = (overview.recent_decisions ?? overview.recent_blocks).slice(0, 5);
+  const maxSignal = overview.top_categories[0]?.count ?? 0;
+
+  return (
+    <>
+      <section aria-labelledby="decision-summary-title">
+        <div className="mb-3 flex flex-col items-start gap-2 sm:flex-row sm:items-end sm:justify-between sm:gap-4">
+          <div>
+            <p className="text-xs font-semibold uppercase tracking-[0.14em] text-cyan-700">Decision record</p>
+            {/* THE ANSWER FIRST, the counters underneath as its evidence.
+              * Five numbers and no conclusion left the reader to work out
+              * whether they were safe, and the pairing of "252 classified
+              * as unsafe" with "3 blocked before execution" reads as a
+              * confession unless something explains monitor mode. */}
+            <h2 id="decision-summary-title" className="mt-1 text-lg font-semibold text-slate-950">{summary.answer}</h2>
+            {summary.next ? (
+              <p className="mt-1 text-sm text-slate-600">{summary.next}</p>
+            ) : null}
+            <TechnicalOnly>
+              <p className="mt-1 text-xs uppercase tracking-wide text-slate-500">What the guardrail saw</p>
+            </TechnicalOnly>
+          </div>
+          {cta.kind === "hidden" ? null : (
+            <button
+              type="button"
+              onClick={() => (cta.kind === "cases" ? onOpenCase?.() : onOpenActivity())}
+              className="text-sm font-semibold text-cyan-700 hover:text-cyan-900"
+            >
+              {cta.label} <span aria-hidden="true">→</span>
+            </button>
+          )}
+        </div>
+        <DecisionCounts
+          commands={overview.commands}
+          sessions={overview.sessions}
+          denyVerdicts={denyVerdicts}
+          reviewVerdicts={reviewVerdicts}
+          allowVerdicts={allowVerdicts}
+          unknownVerdicts={overview.unknown_verdicts}
+        />
+      </section>
+
+      {(overview.actual_blocks != null || overview.would_block != null || overview.screened != null || overview.outcomes_unknown != null) && (
+        <OperationalEvidence overview={overview} />
+      )}
+
+      {hostAttention}
+
+      <div className="grid gap-6 lg:grid-cols-[minmax(0,1.35fr)_minmax(280px,.65fr)]">
+        <RecentActivity items={recent} edition={edition} onOpen={onOpenActivity} onOpenCase={onOpenCase} />
+        <RiskSignals items={overview.top_categories.slice(0, 6)} sent={overview.top_categories.length} max={maxSignal} />
+      </div>
+    </>
   );
 }
 
@@ -471,6 +561,64 @@ function HeroNumber({ label, value }: { label: string; value: number }) {
   );
 }
 
+/**
+ * The tile that counts the agent guardrail's `review` verdicts.
+ *
+ * It was labelled "Needs review" / "Requires human judgement". The number is
+ * graph decisions the agent guardrail answered `review` on. A paid host's
+ * Cases screen offers a "Needs review" status too, and that is a case status,
+ * not a guardrail verdict: a different count, so one paid Overview read 0 here
+ * while Cases listed hundreds of rows under the same two words. A reader with
+ * no way to know the two are different took it for a contradiction,
+ * reasonably.
+ *
+ * The label says whose verdict this is and about what, in words that are true
+ * on Community (no host layer, no Cases screen) and on Enterprise alike.
+ * "flagged", not "held": a `review` verdict only stops the action where the
+ * hook runs in block-review mode, and this count does not know which ran.
+ */
+export const REVIEW_VERDICTS_TILE = {
+  label: "Agent actions flagged for review",
+  detail: "The agent guardrail asked for a person's judgement",
+} as const;
+
+/**
+ * The chip a `review` verdict wears in this page's Recent activity.
+ *
+ * Everywhere else the chip reads "Needs review" (`verdictLabel`), which is
+ * also the name of Activity's verdict filter, and the Community remedy tells
+ * its reader to press that filter, so the shared label stays. On THIS page it
+ * cannot: a paid Overview sits one click from a Cases status of the same two
+ * words, and the tile above says "flagged for review". The chip here uses the
+ * tile's word, so the page does not name one verdict two ways.
+ */
+export const REVIEW_VERDICT_CHIP = "Flagged for review";
+
+/**
+ * The Decision record's tiles. Exported so a test can RENDER them and read
+ * the words the screen prints, not a copy of them.
+ */
+export function DecisionCounts({ commands, sessions, denyVerdicts, reviewVerdicts, allowVerdicts, unknownVerdicts }: {
+  commands: number;
+  sessions: number;
+  denyVerdicts: number;
+  reviewVerdicts: number;
+  allowVerdicts: number;
+  /** Absent on an older host, which then gets no tile rather than a zero. */
+  unknownVerdicts?: number;
+}) {
+  const hasUnknownVerdicts = unknownVerdicts != null;
+  return (
+    <div className={hasUnknownVerdicts ? "grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-5" : "grid grid-cols-2 gap-3 lg:grid-cols-4"}>
+      <Stat label="Recorded decisions" value={commands} detail={recordedDecisionsDetail(sessions)} />
+      <Stat label="Deny verdicts" value={denyVerdicts} detail="Classified as unsafe" tone={denyVerdicts > 0 ? "danger" : undefined} />
+      <Stat label={REVIEW_VERDICTS_TILE.label} value={reviewVerdicts} detail={REVIEW_VERDICTS_TILE.detail} tone={reviewVerdicts > 0 ? "attention" : undefined} />
+      <Stat label="Allowed" value={allowVerdicts} detail="No blocking verdict" tone="positive" />
+      {hasUnknownVerdicts && <Stat label="Unknown verdicts" value={unknownVerdicts ?? 0} detail="Could not be classified" tone={(unknownVerdicts ?? 0) > 0 ? "attention" : undefined} />}
+    </div>
+  );
+}
+
 function Stat({ label, value, detail, tone }: { label: string; value: number; detail: string; tone?: "danger" | "attention" | "positive" }) {
   const number = tone === "danger" ? "text-red-700" : tone === "attention" ? "text-amber-700" : tone === "positive" ? "text-emerald-700" : "text-slate-950";
   return (
@@ -510,7 +658,8 @@ function OperationalEvidence({ overview }: { overview: Overview }) {
   );
 }
 
-function RecentActivity({ items, edition, onOpen, onOpenCase }: {
+/** Exported so a test can RENDER the entries and read the words they print. */
+export function RecentActivity({ items, edition, onOpen, onOpenCase }: {
   items: DecisionSummary[];
   edition?: "community" | "enterprise";
   onOpen: (target?: ActivityLink) => void;
@@ -572,7 +721,7 @@ function RecentActivityEntry({ item, clickable }: { item: DecisionSummary; click
   const sessionLabel = item.session === "local" ? "Local session" : item.session;
   return (
     <>
-      <Verdict rec={recommendation} />
+      <Verdict rec={recommendation} reviewLabel={REVIEW_VERDICT_CHIP} />
       <div className="min-w-0 flex-1">
         <code className="block truncate text-sm font-medium text-slate-900">{item.command}</code>
         <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
@@ -614,10 +763,36 @@ function RecentActivityEntry({ item, clickable }: { item: DecisionSummary; click
  *  * The number counts distinct ADDRESSES, not rows, and says so on the
  *    screen. Measured on a production host: 851 incidents in a day, 42
  *    undecided, behind eight addresses. Eight is actionable; 851 is a wall.
+ *
+ * `through` is the way to the list, and it must not promise the list is the
+ * number. The line counts ADDRESSES seen TODAY; the link opens CASES of ALL
+ * time with status `waiting` (the contract with the paid server, which this
+ * wording does not change). One address can own many cases, and a case
+ * waiting since yesterday is still waiting, so the list can be far longer
+ * than the number above it. "See what is waiting" under "8 addresses" told a
+ * reader they were about to see those eight; the words now name the unit and
+ * the span of what the link opens.
+ *
+ * The note also says the list is not only the host's, because on the paid
+ * server it is not: every agent-session case is created `Open`, and `waiting`
+ * matches `Open` as well as `NeedsReview`, so each agent session is in that
+ * list too. The link is deliberately NOT narrowed to the host with
+ * `capability=host_visibility`: that filter keeps only cases with host SQLite
+ * evidence, and would drop a standalone response case whose reversal failed
+ * (`NeedsReview`, response-lifecycle evidence only), which is a host problem a
+ * person must act on. The filter takes one value, so "host OR response" cannot
+ * be asked for. Saying what the list holds hides nothing; a narrower list
+ * would.
  */
 export function hostAttentionLine(
   waiting: Overview["host_attention"],
-): { tone: "quiet" | "waiting"; title: string; body: string } | undefined {
+): {
+  tone: "quiet" | "waiting";
+  title: string;
+  body: string;
+  /** The link to the waiting cases, and what it opens. Only when something waits. */
+  through?: { label: string; note: string };
+} | undefined {
   if (waiting === undefined) return undefined;
   const count = waiting.addresses_waiting;
   if (!Number.isFinite(count) || count < 0) return undefined;
@@ -632,6 +807,10 @@ export function hostAttentionLine(
     tone: "waiting",
     title: `${count.toLocaleString()} ${count === 1 ? "address is" : "addresses are"} waiting on you`,
     body: waiting.counts,
+    through: {
+      label: "See all waiting cases, from any day",
+      note: "That list shows cases rather than addresses, every day rather than only today, and the agent's cases as well as the host's, so it can be longer than this number.",
+    },
   };
 }
 
@@ -640,9 +819,9 @@ export function HostAttention({ waiting, onOpen }: { waiting: Overview["host_att
   if (line === undefined) return null;
   const quiet = line.tone === "quiet";
   // The way through is offered only when there is somewhere to go AND
-  // something to see there: a "see what is waiting" under "nothing is
+  // something to see there: a link to the waiting cases under "nothing is
   // waiting" is a link to an empty list.
-  const through = !quiet && onOpen !== undefined;
+  const through = !quiet && onOpen !== undefined ? line.through : undefined;
   return (
     <section
       aria-labelledby="host-attention-title"
@@ -656,9 +835,12 @@ export function HostAttention({ waiting, onOpen }: { waiting: Overview["host_att
       </h2>
       <p className={`mt-1 text-sm leading-6 ${quiet ? "text-slate-600" : "text-amber-900"}`}>{line.body}</p>
       {through && (
-        <button type="button" onClick={onOpen} className="mt-3 text-sm font-semibold text-amber-900 underline decoration-amber-400 underline-offset-4 hover:text-amber-950">
-          See what is waiting <span aria-hidden="true">→</span>
-        </button>
+        <div className="mt-3">
+          <button type="button" onClick={onOpen} className="text-sm font-semibold text-amber-900 underline decoration-amber-400 underline-offset-4 hover:text-amber-950">
+            {through.label} <span aria-hidden="true">→</span>
+          </button>
+          <p className="mt-1 text-xs leading-5 text-amber-800">{through.note}</p>
+        </div>
       )}
     </section>
   );
@@ -723,13 +905,22 @@ export function enforceHint(edition?: "community" | "enterprise"): string {
     : "Block deny decisions on supported integrations.";
 }
 
+/**
+ * The onboarding panel for an agent guardrail that has recorded nothing.
+ *
+ * The heading names whose decisions it means. On a paid host the host line
+ * ("8 addresses are waiting on you ... latest decision is absent or awaiting
+ * confirmation") sits directly above it, and a bare "No decisions recorded
+ * yet" under that reads as a statement about the host's decisions, which the
+ * line above has just contradicted.
+ */
 function ZeroState({ guardedAgents, edition }: { guardedAgents?: number; edition?: "community" | "enterprise" }) {
   const hasConfiguredAgent = guardedAgents != null && guardedAgents > 0;
   return (
     <section className="rounded-2xl border border-dashed border-slate-300 bg-white p-6 sm:p-8" aria-labelledby="zero-state-title">
       <div className="mx-auto max-w-3xl text-center">
         <div className="mx-auto flex h-11 w-11 items-center justify-center rounded-xl bg-cyan-50 text-lg font-bold text-cyan-800" aria-hidden="true">IW</div>
-        <h2 id="zero-state-title" className="mt-4 text-xl font-semibold text-slate-950">No decisions recorded yet</h2>
+        <h2 id="zero-state-title" className="mt-4 text-xl font-semibold text-slate-950">No agent guardrail decisions recorded yet</h2>
         <p className="mx-auto mt-2 max-w-xl text-sm leading-6 text-slate-600">
           {hasConfiguredAgent
             ? "The guardrail is configured. Captured shell actions, MCP tool calls and one-off checks appear here as a local activity record."

@@ -59,11 +59,33 @@ export type CaseListPage = {
    */
   window?: CaseListWindow;
   /**
-   * How many cases the server's projection HOLDS for the window, before
-   * pagination: the "5 of 312" number. It is a count of the projection, not a
-   * count of the window; `window_complete` says whether the two are the same.
+   * How many CASES the server's projection holds for the window that match
+   * the filters, counted before pagination AND before the recurrence fold. It
+   * is a count of the projection, not a count of the window;
+   * `window_complete` says whether the two are the same.
+   *
+   * Counting before the fold is what makes it add up: every case has exactly
+   * one outcome and one severity, so the totals under each value of either
+   * filter sum to the unfiltered total. It is therefore NOT the number of rows
+   * the pages walk. A group of three occurrences of one finding is one row in
+   * `items` and three here, so a screen that says "20 of M" while paging must
+   * take M from `rows_in_window`, never from this.
    */
   total_in_window?: number;
+  /**
+   * How many ROWS match the filters, counted after the recurrence fold and
+   * before paging: walking every page with the cursor yields exactly this
+   * many items. It is read from the same bounded projection as
+   * `total_in_window`, so `window_complete` qualifies it the same way.
+   *
+   * Sent only when the request asks with `include=rows_in_window`, which
+   * `DashboardCasesClient.list` does unless this server has refused the
+   * parameter, because a bundle whose parser does not know the key rejects
+   * the whole body. The free server sends neither number, and a paid server
+   * older than the field sends no row total; absent means not reported, never
+   * zero.
+   */
+  rows_in_window?: number;
   /**
    * False when a bounded source read hit its row cap, so `total_in_window`
    * describes a TRUNCATED projection rather than the window.
@@ -245,9 +267,8 @@ export type CaseListQuery = {
   cursor?: string | null;
   limit?: number;
   /**
-   * Server-side time window. Optional and additive: the free product's server
-   * ignores unknown params it was never sent, and when this is omitted the
-   * request and response are byte-identical to the legacy exchange.
+   * Server-side time window. Optional and additive: when this is omitted the
+   * response carries no windowed fields, exactly like the legacy exchange.
    */
   window?: CaseListWindow | "";
   outcome?: SecurityOutcome | "";
@@ -442,7 +463,7 @@ function verifiedOutcome(value: unknown, path: string): VerifiedOutcome {
 export function parseCaseListPage(value: unknown, requestedLimit = 20): CaseListPage {
   if (!Number.isInteger(requestedLimit) || requestedLimit < 1 || requestedLimit > 100) throw new Error("cases.limit: outside 1..100");
   const item = object(value, "cases");
-  exact(item, ["schema_version", "generated_at", "items", "next_cursor", "window", "total_in_window", "window_complete"], "cases");
+  exact(item, ["schema_version", "generated_at", "items", "next_cursor", "window", "total_in_window", "window_complete", "rows_in_window"], "cases");
   if (item.schema_version !== DASHBOARD_SCHEMA_VERSION) throw new Error("cases.schema_version: unsupported contract version");
   const items = array(item.items, "cases.items", caseSummary, requestedLimit);
   if (new Set(items.map((entry) => entry.id)).size !== items.length) throw new Error("cases.items: duplicate case id");
@@ -464,11 +485,34 @@ export function parseCaseListPage(value: unknown, requestedLimit = 20): CaseList
     if (typeof item.total_in_window !== "number" || !Number.isInteger(item.total_in_window) || item.total_in_window < 0) {
       throw new Error("cases.total_in_window: not a non-negative integer");
     }
-    page.total_in_window = item.total_in_window;
+    // `+ 0` turns a JSON -0, which passes both checks above, into 0, so no
+    // screen prints "-0".
+    page.total_in_window = item.total_in_window + 0;
   }
   if (item.window_complete !== undefined) {
     if (typeof item.window_complete !== "boolean") throw new Error("cases.window_complete: not a boolean");
     page.window_complete = item.window_complete;
+  }
+  // Rows after the recurrence fold, the "of M" a paging screen needs. Sent by
+  // the paid server on request, with or without a window, so it is not part of
+  // the windowed trio. It is still checked against the numbers it sits beside,
+  // because two facts about it hold on every server and a count that breaks
+  // either would print a line like "20 rows on this page of 3":
+  //
+  // * the rows on this page are some of the rows that match, so the total is
+  //   never fewer than the page holds;
+  // * the fold only merges cases into rows, so there are never more rows than
+  //   the cases they were folded from (`total_in_window`, when it was sent).
+  if (item.rows_in_window !== undefined) {
+    if (typeof item.rows_in_window !== "number" || !Number.isInteger(item.rows_in_window) || item.rows_in_window < 0) {
+      throw new Error("cases.rows_in_window: not a non-negative integer");
+    }
+    const rows = item.rows_in_window + 0;
+    if (rows < items.length) throw new Error("cases.rows_in_window: fewer rows than this page holds");
+    if (page.total_in_window !== undefined && rows > page.total_in_window) {
+      throw new Error("cases.rows_in_window: more rows than the cases they were folded from");
+    }
+    page.rows_in_window = rows;
   }
   return page;
 }
@@ -647,17 +691,33 @@ function invalidRequest(endpoint: "cases" | "case_detail", code: string, message
   return { state: "error", problem };
 }
 
+/**
+ * The paid server's answer to a query parameter it does not know: 400 with
+ * this code. A server that predates `include` answers `include=rows_in_window`
+ * with it. Matched on status AND code, so a refused filter, window or cursor
+ * (each has its own code) is reported as it is and never retried.
+ */
+const UNKNOWN_QUERY_PARAMETER = "enterprise_cases_query_invalid";
+
+function refusedAsUnknownParameter(result: DashboardClientResult<unknown>): boolean {
+  return result.state === "error"
+    && result.problem.httpStatus === 400
+    && result.problem.code === UNKNOWN_QUERY_PARAMETER;
+}
+
 export class DashboardCasesClient {
   readonly #fetch: Fetch;
+  /** Set once this server answered a list request without the row total after refusing it. */
+  #rowTotalRefused = false;
 
   constructor(fetchImplementation: Fetch = globalThis.fetch) {
     this.#fetch = fetchImplementation.bind(globalThis);
   }
 
-  list(query: CaseListQuery = {}, signal?: AbortSignal): Promise<DashboardClientResult<CaseListPage>> {
+  async list(query: CaseListQuery = {}, signal?: AbortSignal): Promise<DashboardClientResult<CaseListPage>> {
     const limit = query.limit ?? 20;
     if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
-      return Promise.resolve(invalidRequest("cases", "invalid_limit", "Case page size must be between 1 and 100."));
+      return invalidRequest("cases", "invalid_limit", "Case page size must be between 1 and 100.");
     }
     const parameters = new URLSearchParams({ limit: String(limit) });
     for (const [name, value, maximum] of [
@@ -668,7 +728,36 @@ export class DashboardCasesClient {
     ] as const) {
       if (value && value.length <= maximum) parameters.set(name, value);
     }
-    return this.#get("cases", `${DASHBOARD_API_ROOT}/cases?${parameters}`, (payload) => parseCaseListPage(payload, limit), signal);
+    // Asked for first. `total_in_window` counts cases before the recurrence
+    // fold and the pages walk rows after it, so without this the only "of M"
+    // on offer is a number the pages can never reach. The paid server sends
+    // the field only on request because an older bundle's exact-key parser
+    // rejects it, and it refuses an `include` name it does not serve rather
+    // than silently answering without it.
+    //
+    // A paid server older than the field refuses `include` itself, as an
+    // unknown parameter, and that refusal used to fail the whole Cases screen.
+    // So on exactly that refusal the same request is sent once more without
+    // it: the page then has no row total and the count line leaves its "of M"
+    // out, which is what it does for any server that did not send one. Once
+    // the plain request has been answered this client stops asking, so every
+    // refresh against an older server costs one request, not two. The free
+    // server has no case list at all.
+    const url = (withRowTotal: boolean) => {
+      const sent = new URLSearchParams(parameters);
+      if (withRowTotal) sent.set("include", "rows_in_window");
+      return `${DASHBOARD_API_ROOT}/cases?${sent}`;
+    };
+    const parse = (payload: unknown) => parseCaseListPage(payload, limit);
+    if (!this.#rowTotalRefused) {
+      const asked = await this.#get("cases", url(true), parse, signal);
+      if (!refusedAsUnknownParameter(asked)) return asked;
+    }
+    const plain = await this.#get("cases", url(false), parse, signal);
+    // Remembered only once the plain request is answered. Two refusals in a
+    // row mean the parameter was not the problem, and the next call asks again.
+    if (plain.state === "ready") this.#rowTotalRefused = true;
+    return plain;
   }
 
   get(caseId: string, signal?: AbortSignal): Promise<DashboardClientResult<UnifiedCase>> {
