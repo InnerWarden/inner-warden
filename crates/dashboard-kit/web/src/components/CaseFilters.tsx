@@ -9,7 +9,7 @@ export type CaseScopeKind = "all" | "agent" | "host" | "workload" | "resource";
  * every case whose latest decision is absent or awaiting confirmation, which
  * is the same pair the Overview counts as waiting on you.
  */
-export type CaseQueueStatus = "waiting" | "needs_review" | "open" | "contained";
+export type CaseQueueStatus = "waiting" | "needs_review" | "open" | "observing" | "contained";
 
 export type CaseViewState = {
   query: string;
@@ -43,16 +43,20 @@ export const EMPTY_CASE_VIEW: CaseViewState = {
 
 const outcomes = ["observed_only", "allowed", "blocked_before_execution", "would_block", "contained", "failed", "reverted", "not_observed", "unknown"] as const;
 const severities = ["critical", "high", "medium", "low", "informational", "unknown"] as const;
-// Only the statuses a case can actually reach, plus the queue. The host's
-// enum also declares `observing`, `dismissed` and `closed`, and no projector
-// has ever assigned them; offering them would be the `resource` mistake over
-// again. `every_status_the_filter_offers_is_one_the_projector_produces` in the
-// agent fails the moment a projector starts producing one of them.
-const statuses = ["waiting", "needs_review", "open", "contained"] as const;
+// Only the statuses a case can actually reach, plus the queue. `observing` is
+// reachable since the paid host stopped queueing agent sessions that have
+// nothing for a person to decide (they are recorded as observing instead), so
+// it is offered: it is where a technical reader finds those sessions. The
+// host's enum also declares `dismissed` and `closed`, and no projector assigns
+// them; offering them would be the `resource` mistake over again.
+// `every_status_the_filter_offers_is_one_the_projector_produces` in the agent
+// fails the moment the two lists part.
+const statuses = ["waiting", "needs_review", "open", "observing", "contained"] as const;
 const statusLabels: Record<(typeof statuses)[number], string> = {
   waiting: "Waiting for a decision",
   needs_review: "Needs review",
   open: "Open, nothing decided yet",
+  observing: "Watched, nothing to decide",
   contained: "Contained",
 };
 // `mixed` is gone for the same reason `resource` is: the mode filter matches

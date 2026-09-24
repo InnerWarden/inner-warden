@@ -9,7 +9,7 @@ import { caseViewUrl, EMPTY_CASE_VIEW, readCaseViewState } from "./CaseFilters";
  */
 describe("the status filter in the address bar", () => {
   it("reads the queue and each reachable status", () => {
-    for (const status of ["waiting", "needs_review", "open", "contained"]) {
+    for (const status of ["waiting", "needs_review", "open", "observing", "contained"]) {
       expect(readCaseViewState(`?view=cases&status=${status}`).status).toBe(status);
     }
   });
@@ -20,7 +20,7 @@ describe("the status filter in the address bar", () => {
    * than to a dropdown value the operator cannot see.
    */
   it("drops a status the host never produces, and junk", () => {
-    for (const status of ["dismissed", "closed", "observing", "unknown", "WAITING", "", "*"]) {
+    for (const status of ["dismissed", "closed", "unknown", "WAITING", "", "*"]) {
       expect(readCaseViewState(`?view=cases&status=${encodeURIComponent(status)}`).status).toBe("");
     }
     expect(readCaseViewState("?view=cases").status).toBe("");
