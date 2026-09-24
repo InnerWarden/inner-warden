@@ -279,7 +279,7 @@ export type CaseListQuery = {
   host?: string;
   severity?: CaseSeverity | "";
   /**
-   * One status (`needs_review`, `open`, `contained`) or the `waiting` queue,
+   * One status (`needs_review`, `open`, `observing`, `contained`) or the `waiting` queue,
    * which is the first two together. Matches the case's own `status`; the
    * host answers nothing, not everything, for a value it does not know.
    */

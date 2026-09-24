@@ -208,6 +208,18 @@ describe("the case filter form", () => {
     expect(html).toContain('<option value="waiting" selected="">Waiting for a decision</option>');
     expect(html).toContain('<option value="all" selected="">All loaded time</option>');
   });
+
+  /**
+   * Agent sessions with nothing for a person to decide are recorded as
+   * `observing` by the paid host and left out of the waiting queue, so the
+   * only way to list them is to ask for that status by name.
+   */
+  it("offers the sessions that are only watched, in words a reader understands", () => {
+    const html = renderToStaticMarkup(
+      <CaseFilters value={{ ...EMPTY_CASE_VIEW, status: "observing" }} onApply={() => undefined} onClear={() => undefined} />,
+    );
+    expect(html).toContain('<option value="observing" selected="">Watched, nothing to decide</option>');
+  });
 });
 
 describe("what Apply hands the screen", () => {
