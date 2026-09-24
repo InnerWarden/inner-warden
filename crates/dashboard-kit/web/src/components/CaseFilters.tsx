@@ -6,8 +6,16 @@ export type CaseWindow = "all" | "1h" | "24h" | "7d" | "30d";
 export type CaseScopeKind = "all" | "agent" | "host" | "workload" | "resource";
 /**
  * The queue, or one status. `waiting` is `needs_review` and `open` together:
- * every case whose latest decision is absent or awaiting confirmation, which
- * is the same pair the Overview counts as waiting on you.
+ * every case waiting on a person. On a paid host that decides its queue by
+ * the Overview's reading, that is a case nothing has decided on (a high or
+ * critical one, or one behind an address the Overview counts), a case whose
+ * latest decision leaves it to a person, a critical case or one on the threat
+ * floor that no person has answered, a response that failed, and an agent
+ * session a person must look at. The Overview's host line reads the same rule
+ * for today (in addresses, plus the findings an address count leaves out),
+ * so the line and this queue describe one population, the line for today and
+ * the queue for every day. An older paid host fills the queue by severity
+ * alone, high and critical as `needs_review` and the rest as `open`.
  */
 export type CaseQueueStatus = "waiting" | "needs_review" | "open" | "observing" | "contained";
 
@@ -44,9 +52,14 @@ export const EMPTY_CASE_VIEW: CaseViewState = {
 const outcomes = ["observed_only", "allowed", "blocked_before_execution", "would_block", "contained", "failed", "reverted", "not_observed", "unknown"] as const;
 const severities = ["critical", "high", "medium", "low", "informational", "unknown"] as const;
 // Only the statuses a case can actually reach, plus the queue. `observing` is
-// reachable since the paid host stopped queueing agent sessions that have
-// nothing for a person to decide (they are recorded as observing instead), so
-// it is offered: it is where a technical reader finds those sessions. The
+// where a case goes when nothing waits on a person and no containment covers
+// it: the host blocked it, sent it to the honeypot, watched it or dismissed
+// it, a person answered it (Dismiss, Keep watching), or it is below the bar
+// nobody is asked about, which includes agent sessions with nothing for a
+// person to decide. So its label says what all of those share, "Nothing
+// waiting on you", in the words the enterprise case row and detail print for
+// the same status. It used to read "Watched, nothing to
+// decide", and "watched" is false for a case a person just dismissed. The
 // host's enum also declares `dismissed` and `closed`, and no projector assigns
 // them; offering them would be the `resource` mistake over again.
 // `every_status_the_filter_offers_is_one_the_projector_produces` in the agent
@@ -56,7 +69,7 @@ const statusLabels: Record<(typeof statuses)[number], string> = {
   waiting: "Waiting for a decision",
   needs_review: "Needs review",
   open: "Open, nothing decided yet",
-  observing: "Watched, nothing to decide",
+  observing: "Nothing waiting on you",
   contained: "Contained",
 };
 // `mixed` is gone for the same reason `resource` is: the mode filter matches

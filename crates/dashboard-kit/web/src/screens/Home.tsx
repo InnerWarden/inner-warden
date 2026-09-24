@@ -764,64 +764,161 @@ function RecentActivityEntry({ item, clickable }: { item: DecisionSummary; click
  *    screen. Measured on a production host: 851 incidents in a day, 42
  *    undecided, behind eight addresses. Eight is actionable; 851 is a wall.
  *
+ * The addresses are not everything the host has waiting. A finding that
+ * names no outside address (a privilege escalation, a lateral movement to an
+ * internal one) has nothing for an address count to count, and a high one
+ * nothing has decided on is in the waiting queue all the same. The line read
+ * "Nothing on the host is waiting for you" over a queue holding it, and hid
+ * the way to that queue. The paid host now serves those beside the addresses
+ * (`findings_waiting_off_the_line`, by the queue's own rule), and the title
+ * counts both: "8 addresses, and 3 findings the address count leaves out, are
+ * waiting on you". The findings are named as the ones the address count
+ * leaves out, not as "other findings": an address is not a finding, and a
+ * finding counted here can stand behind one of the eight addresses (a
+ * critical the product only watched, on an address that also has an
+ * undecided finding). An older host does not send the findings, and the line
+ * then reads the addresses alone, as it did.
+ *
+ * Both numbers are TODAY's; the queue is every day's. So zero today is not
+ * zero in the queue: a finding from yesterday that is still waiting on a
+ * person (an undecided privilege escalation that arrived at 23:30 and was
+ * parked for review at 00:30) is in the queue while both of today's counts
+ * read 0. The calm line therefore says TODAY, "Nothing new on the host today
+ * is waiting for you", and the way to the queue stays offered under it, in
+ * calmer words, because the queue can still hold something. Saying "nothing
+ * is waiting" and hiding the link there was the defect one day later.
+ *
+ * What each number counts is the producer's own sentence, and it is long and
+ * exact because it is the definition a reader checks the number against. It is
+ * not the answer, and it is written in the producer's terms. So it sits behind
+ * "What these numbers count", closed: the title and the link are the plain
+ * answer, and the definition is one click away for whoever wants to check it.
+ *
  * `through` is the way to the list, and it must not promise the list is the
- * number. The line counts ADDRESSES seen TODAY; the link opens CASES of ALL
- * time with status `waiting` (the contract with the paid server, which this
- * wording does not change). One address can own many cases, and a case
- * waiting since yesterday is still waiting, so the list can be far longer
- * than the number above it. "See what is waiting" under "8 addresses" told a
- * reader they were about to see those eight; the words now name the unit and
- * the span of what the link opens.
+ * number. The line counts ADDRESSES and findings seen TODAY; the link opens
+ * CASES of ALL time with status `waiting` (the contract with the paid server,
+ * which this wording does not change). The list will not match an address
+ * count in either direction: one address can own several cases, and one case
+ * (a distributed SSH attack) can name several addresses. A finding is one
+ * case, so the note speaks of addresses only when the title counted them.
  *
  * The note also says the list is not only the host's, because on the paid
- * server it is not: every agent-session case is created `Open`, and `waiting`
- * matches `Open` as well as `NeedsReview`, so each agent session is in that
- * list too. The link is deliberately NOT narrowed to the host with
- * `capability=host_visibility`: that filter keeps only cases with host SQLite
- * evidence, and would drop a standalone response case whose reversal failed
- * (`NeedsReview`, response-lifecycle evidence only), which is a host problem a
- * person must act on. The filter takes one value, so "host OR response" cannot
- * be asked for. Saying what the list holds hides nothing; a narrower list
- * would.
+ * server it is not: an agent session a person must look at (a deny the guard
+ * did not stop, a verdict it cannot read) waits there too, and so does a
+ * response that failed on any day. The link is deliberately NOT narrowed to
+ * the host with `capability=host_visibility`: that filter keeps only cases
+ * with host SQLite evidence, and would drop a standalone response case whose
+ * reversal failed (`NeedsReview`, response-lifecycle evidence only), which is
+ * a host problem a person must act on. The filter takes one value, so "host
+ * OR response" cannot be asked for. Saying what the list holds hides nothing;
+ * a narrower list would.
  */
 export function hostAttentionLine(
   waiting: Overview["host_attention"],
 ): {
   tone: "quiet" | "waiting";
   title: string;
-  body: string;
-  /** The link to the waiting cases, and what it opens. Only when something waits. */
-  through?: { label: string; note: string };
+  /** One plain sentence under the calm title. The waiting title needs none. */
+  body?: string;
+  /** What each number the title names counts, in the producer's words, in
+   * the order the title names them. Shown behind a disclosure, not as the
+   * answer. Empty under the calm line. */
+  definitions: { label: string; text: string }[];
+  /** The link to the waiting queue, and what it opens. */
+  through: { label: string; note: string };
 } | undefined {
   if (waiting === undefined) return undefined;
-  const count = waiting.addresses_waiting;
-  if (!Number.isFinite(count) || count < 0) return undefined;
-  if (count === 0) {
+  const addresses = wholeCount(waiting.addresses_waiting);
+  // The line's own number is not a count: say nothing rather than a guess.
+  if (addresses === undefined) return undefined;
+  // Not sent by an older host, and not trusted when it is not a count: either
+  // way the line reads the addresses alone, as it always did.
+  const sentFindings = wholeCount(waiting.findings_waiting_off_the_line);
+  const findings = sentFindings ?? 0;
+  if (addresses === 0 && findings === 0) {
     return {
       tone: "quiet",
-      title: "Nothing on the host is waiting for you",
-      body: "Every address this host saw today has been decided on.",
+      title: "Nothing new on the host today is waiting for you",
+      // A host that counts findings too can say that nothing it found today
+      // asks for a person. An older one counted addresses only, and its zero
+      // says no more than that.
+      body: sentFindings === undefined
+        ? "Every address this host saw today has been decided on."
+        : "Nothing the host found today is asking for a person.",
+      definitions: [],
+      through: {
+        label: "See the waiting queue, from any day",
+        note: "This line counts today only. The queue also keeps what earlier days left waiting, and the agent's cases as well as the host's, so it may not be empty.",
+      },
     };
+  }
+  const definitions: { label: string; text: string }[] = [];
+  if (addresses > 0) definitions.push({ label: "Addresses", text: asSentence(waiting.counts) });
+  if (findings > 0) {
+    const counts = waiting.findings_waiting_off_the_line_counts;
+    definitions.push({
+      label: "Findings",
+      text: asSentence(typeof counts === "string" && counts.trim() !== "" ? counts : FINDINGS_OFF_THE_LINE_FALLBACK),
+    });
   }
   return {
     tone: "waiting",
-    title: `${count.toLocaleString()} ${count === 1 ? "address is" : "addresses are"} waiting on you`,
-    body: waiting.counts,
+    title: waitingTitle(addresses, findings),
+    definitions,
     through: {
       label: "See all waiting cases, from any day",
-      note: "That list shows cases rather than addresses, every day rather than only today, and the agent's cases as well as the host's, so it can be longer than this number.",
+      note: throughNote(addresses, findings),
     },
   };
+}
+
+/** A count this line can print: a non-negative whole number, nothing else. */
+function wholeCount(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
+
+/** The producer writes its definitions as clauses ("distinct outside
+ * addresses, today, ..."). Under a label they read as sentences: capital
+ * first, full stop last. The words are the producer's, unchanged. */
+function asSentence(text: string): string {
+  const trimmed = text.trim();
+  if (trimmed === "") return trimmed;
+  const capital = trimmed.charAt(0).toUpperCase() + trimmed.slice(1);
+  return /[.!?]$/.test(capital) ? capital : `${capital}.`;
+}
+
+/** Said when a host sends the findings count without its definition. */
+const FINDINGS_OFF_THE_LINE_FALLBACK =
+  "host findings from today that wait in Cases and that a count of addresses cannot include, one per finding";
+
+function waitingTitle(addresses: number, findings: number): string {
+  const addressPart = `${addresses.toLocaleString()} ${addresses === 1 ? "address" : "addresses"}`;
+  if (findings === 0) return `${addressPart} ${addresses === 1 ? "is" : "are"} waiting on you`;
+  const findingPart = `${findings.toLocaleString()} ${findings === 1 ? "finding" : "findings"}`;
+  if (addresses === 0) return `${findingPart} ${findings === 1 ? "is" : "are"} waiting on you`;
+  // Not "other findings": an address is not a finding, and these are the
+  // findings the address count left out, never the same waiting twice.
+  return `${addressPart}, and ${findingPart} the address count leaves out, are waiting on you`;
+}
+
+function throughNote(addresses: number, findings: number): string {
+  const span = "every day rather than only today, and the agent's cases as well as the host's";
+  if (addresses === 0) {
+    return `That list holds ${span}, so it can be longer than this number.`;
+  }
+  const these = findings === 0 ? "this number" : "these numbers";
+  return `That list shows cases rather than addresses, so it will not match ${these}: one address can have several cases, and one case can name several addresses. It also holds ${span}.`;
 }
 
 export function HostAttention({ waiting, onOpen }: { waiting: Overview["host_attention"]; onOpen?: () => void }) {
   const line = hostAttentionLine(waiting);
   if (line === undefined) return null;
   const quiet = line.tone === "quiet";
-  // The way through is offered only when there is somewhere to go AND
-  // something to see there: a link to the waiting cases under "nothing is
-  // waiting" is a link to an empty list.
-  const through = !quiet && onOpen !== undefined ? line.through : undefined;
+  // The way through is offered whenever there is somewhere to go: under the
+  // calm line too, because today's zero does not empty a queue that keeps
+  // every day. Without a Cases screen there is nothing to open, and the note,
+  // which explains the link, goes with it.
+  const through = onOpen !== undefined ? line.through : undefined;
   return (
     <section
       aria-labelledby="host-attention-title"
@@ -833,14 +930,37 @@ export function HostAttention({ waiting, onOpen }: { waiting: Overview["host_att
       >
         {line.title}
       </h2>
-      <p className={`mt-1 text-sm leading-6 ${quiet ? "text-slate-600" : "text-amber-900"}`}>{line.body}</p>
+      {line.body !== undefined && (
+        <p className={`mt-1 text-sm leading-6 ${quiet ? "text-slate-600" : "text-amber-900"}`}>{line.body}</p>
+      )}
       {through && (
         <div className="mt-3">
-          <button type="button" onClick={onOpen} className="text-sm font-semibold text-amber-900 underline decoration-amber-400 underline-offset-4 hover:text-amber-950">
+          <button
+            type="button"
+            onClick={onOpen}
+            className={quiet
+              ? "text-sm font-semibold text-slate-700 underline decoration-slate-300 underline-offset-4 hover:text-slate-950"
+              : "text-sm font-semibold text-amber-900 underline decoration-amber-400 underline-offset-4 hover:text-amber-950"}
+          >
             {through.label} <span aria-hidden="true">→</span>
           </button>
-          <p className="mt-1 text-xs leading-5 text-amber-800">{through.note}</p>
+          <p className={`mt-1 text-xs leading-5 ${quiet ? "text-slate-500" : "text-amber-800"}`}>{through.note}</p>
         </div>
+      )}
+      {line.definitions.length > 0 && (
+        <details className="mt-3">
+          <summary className="cursor-pointer text-xs font-semibold text-amber-800 hover:text-amber-950">
+            {line.definitions.length === 1 ? "What this number counts" : "What these numbers count"}
+          </summary>
+          <dl className="mt-2 space-y-2 text-xs leading-5 text-amber-900">
+            {line.definitions.map((definition) => (
+              <div key={definition.label}>
+                <dt className="font-semibold">{definition.label}</dt>
+                <dd>{definition.text}</dd>
+              </div>
+            ))}
+          </dl>
+        </details>
       )}
     </section>
   );

@@ -210,15 +210,21 @@ describe("the case filter form", () => {
   });
 
   /**
-   * Agent sessions with nothing for a person to decide are recorded as
-   * `observing` by the paid host and left out of the waiting queue, so the
-   * only way to list them is to ask for that status by name.
+   * `observing` is every case that left the queue without a containment: the
+   * host blocked, honeypotted, watched or dismissed it, a person answered it,
+   * or nobody is asked about it. The only way to list them is to ask for that
+   * status by name, so it is offered, in the words the enterprise case row
+   * and detail print for it.
+   *
+   * FAILS ON REVERT: the label read "Watched, nothing to decide", and a case
+   * a person had just dismissed is not watched.
    */
-  it("offers the sessions that are only watched, in words a reader understands", () => {
+  it("offers the cases nothing waits on, in the words the case row prints", () => {
     const html = renderToStaticMarkup(
       <CaseFilters value={{ ...EMPTY_CASE_VIEW, status: "observing" }} onApply={() => undefined} onClear={() => undefined} />,
     );
-    expect(html).toContain('<option value="observing" selected="">Watched, nothing to decide</option>');
+    expect(html).toContain('<option value="observing" selected="">Nothing waiting on you</option>');
+    expect(html).not.toContain("Watched");
   });
 });
 

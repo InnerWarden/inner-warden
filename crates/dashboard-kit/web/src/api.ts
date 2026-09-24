@@ -106,8 +106,34 @@ export type Overview = {
   host_attention?: {
     addresses_waiting: number;
     /** What the number counts, in the producer's own words, so a reader can
-     * check it without leaving the screen. */
+     * check it without leaving the screen (behind "What these numbers
+     * count"). */
     counts: string;
+    /**
+     * Today's host findings in the waiting queue that the address count
+     * leaves out, one per finding: a finding whose latest decision leaves it
+     * to a person, a high or critical one nothing has decided on, and a
+     * critical one, or one on the threat floor (a kind the product never
+     * closes on its own, such as a rootkit or a reverse shell), that no person
+     * has answered, when the address count cannot include it (it names no
+     * outside address, only an allowlisted one, a cloud provider's or one
+     * blocked for another finding, the host reads it as its own traffic, or it
+     * is kept for research only). The paid host counts them by the queue's own
+     * rule, including a containment the record stands behind, which takes a
+     * finding out of the queue and so out of this count.
+     *
+     * Served because a line reading "Nothing on the host is waiting for you"
+     * sat over a queue holding an undecided privilege escalation: it named no
+     * address, so the address count read 0 and the way to the queue was
+     * hidden.
+     *
+     * Optional: an older host does not send it, and the line then reads the
+     * addresses alone, exactly as before. A value that is not a non-negative
+     * whole number is read as not sent.
+     */
+    findings_waiting_off_the_line?: number;
+    /** What `findings_waiting_off_the_line` counts, in the producer's words. */
+    findings_waiting_off_the_line_counts?: string;
   };
   /**
    * The hero sentence, computed by the host from the SAME counters this
