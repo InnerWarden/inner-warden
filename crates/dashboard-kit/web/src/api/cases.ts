@@ -257,6 +257,12 @@ export type CaseListQuery = {
   agent?: string;
   host?: string;
   severity?: CaseSeverity | "";
+  /**
+   * One status (`needs_review`, `open`, `contained`) or the `waiting` queue,
+   * which is the first two together. Matches the case's own `status`; the
+   * host answers nothing, not everything, for a value it does not know.
+   */
+  status?: string;
   q?: string;
   /**
    * List order. "recent" is pure chronology (latest event first); "findings"
@@ -657,7 +663,7 @@ export class DashboardCasesClient {
     for (const [name, value, maximum] of [
       ["cursor", query.cursor, 2_048], ["outcome", query.outcome, 64], ["mode", query.mode, 64],
       ["authority", query.authority, 256], ["capability", query.capability, 256], ["agent", query.agent, 256],
-      ["host", query.host, 256], ["severity", query.severity, 64], ["q", query.q, 256],
+      ["host", query.host, 256], ["severity", query.severity, 64], ["status", query.status, 32], ["q", query.q, 256],
       ["window", query.window, 8], ["sort", query.sort, 8],
     ] as const) {
       if (value && value.length <= maximum) parameters.set(name, value);
