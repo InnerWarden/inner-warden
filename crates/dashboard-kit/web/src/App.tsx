@@ -188,7 +188,7 @@ function routeFromLocation(extraScreens: readonly ScreenModule[]): ShellRoute {
  * on one screen does not leak into the next; each screen re-writes its own.
  */
 const SCREEN_PARAMS = [
-  "q", "outcome", "severity", "mode", "authority", "capability", "scope_kind",
+  "q", "outcome", "severity", "status", "mode", "authority", "capability", "scope_kind",
   "scope", "window", "cursor", "case", "decision", "session", "verdict", "action",
 ] as const;
 
@@ -274,6 +274,22 @@ export function caseUrl(caseId: string | undefined, current: string): URL {
   // makes the two screens answer the same question, and the span lands in the
   // address bar like every other Cases filter, so it can be narrowed from the
   // controls on that screen.
+  url.searchParams.set("window", "all");
+  return url;
+}
+
+/**
+ * The Cases screen narrowed to what is waiting on a person, over all time.
+ *
+ * This is where the Overview's "N addresses are waiting on you" line sends
+ * the reader. `waiting` is every case whose latest decision is absent or
+ * awaiting confirmation, the pair that line counts; and `all` time rather
+ * than the list's 24-hour default, because a case waiting since yesterday
+ * is still waiting.
+ */
+export function caseQueueUrl(current: string): URL {
+  const url = caseUrl(undefined, current);
+  url.searchParams.set("status", "waiting");
   url.searchParams.set("window", "all");
   return url;
 }
@@ -557,6 +573,10 @@ export function App({
     window.history.pushState({}, "", caseUrl(caseId, window.location.href));
     setRoute("cases");
   };
+  const openQueue = () => {
+    window.history.pushState({}, "", caseQueueUrl(window.location.href));
+    setRoute("cases");
+  };
   // Only a shell that actually mounts a Cases screen may hand out case links;
   // without one, `?view=cases` resolves straight back to Overview.
   const casesAvailable = contributed.some((screen) => screen.route === "cases");
@@ -597,6 +617,7 @@ export function App({
             meta={freshMeta}
             onOpenActivity={openActivity}
             onOpenCase={casesAvailable ? openCase : undefined}
+            onOpenQueue={casesAvailable ? openQueue : undefined}
             evaluatedAt={consumerEvaluatedAt}
             extraScreens={contributed}
             onCheckNow={refreshPostureNow}
@@ -625,6 +646,7 @@ function EnterpriseRoute({
   meta,
   onOpenActivity,
   onOpenCase,
+  onOpenQueue,
   evaluatedAt,
   extraScreens,
   onCheckNow,
@@ -640,6 +662,8 @@ function EnterpriseRoute({
   meta?: DashboardMeta;
   onOpenActivity: (target?: Omit<ActivityTarget, "requestId">) => void;
   onOpenCase?: (caseId?: string) => void;
+  /** Opens the Cases screen on the waiting queue; see `caseQueueUrl`. */
+  onOpenQueue?: () => void;
   evaluatedAt: string;
   extraScreens: readonly ScreenModule[];
   /** Force a posture re-read on demand; see `POSTURE_REFRESH_MS`. */
@@ -688,7 +712,7 @@ function EnterpriseRoute({
     );
   }
 
-  return <Home meta={meta} onOpenActivity={onOpenActivity} onOpenCase={onOpenCase} edition="enterprise" />;
+  return <Home meta={meta} onOpenActivity={onOpenActivity} onOpenCase={onOpenCase} onOpenQueue={onOpenQueue} edition="enterprise" />;
 }
 
 function EnterpriseSessionStatus({ resource }: { resource: DashboardResource<DashboardBootstrap> }) {

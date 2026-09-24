@@ -283,7 +283,7 @@ export function markTourSeen(storage: TourStorage, storageKey: string): void {
  * filter or selection the operator left behind.
  */
 const SCREEN_PARAMS = [
-  "q", "outcome", "severity", "mode", "authority", "capability", "scope_kind",
+  "q", "outcome", "severity", "status", "mode", "authority", "capability", "scope_kind",
   "scope", "window", "cursor", "case", "decision", "session", "verdict", "action",
 ] as const;
 

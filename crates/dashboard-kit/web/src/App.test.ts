@@ -3,6 +3,7 @@ import type { CapabilityStatus, DashboardBootstrap } from "./api/v1";
 import {
   activityTargetFromSearch,
   activityUrl,
+  caseQueueUrl,
   caseUrl,
   deriveShellNavigation,
   resolveRoute,
@@ -234,6 +235,11 @@ describe("caseUrl", () => {
     expect(url.searchParams.get("case")).toBe("case:x:1");
   });
 
+  it("forgets a status filter left behind, like every other Cases parameter", () => {
+    const url = caseUrl("case:x:1", "https://dashboard.test/?view=cases&status=contained");
+    expect(url.searchParams.get("status")).toBeNull();
+  });
+
   it("refuses an oversized case id rather than minting an unbounded URL", () => {
     const url = caseUrl("x".repeat(257), base);
     expect(url.searchParams.get("case")).toBeNull();
@@ -292,5 +298,29 @@ describe("activity selection in the address bar", () => {
       verdict: undefined,
       action: undefined,
     });
+  });
+});
+
+/**
+ * The Overview's "N addresses are waiting on you" line sends the reader here.
+ * The queue is `waiting` (absent or awaiting decision), over ALL time,
+ * because a case waiting since yesterday is still waiting; the list's own
+ * default would hide it.
+ */
+describe("caseQueueUrl", () => {
+  it("opens Cases on the waiting queue over all time, nothing selected", () => {
+    const url = caseQueueUrl("https://dashboard.test/?view=overview");
+    expect(url.searchParams.get("view")).toBe("cases");
+    expect(url.searchParams.get("status")).toBe("waiting");
+    expect(url.searchParams.get("window")).toBe("all");
+    expect(url.searchParams.get("case")).toBeNull();
+  });
+
+  it("clears the filters another visit left behind", () => {
+    const url = caseQueueUrl("https://dashboard.test/?view=cases&severity=low&status=contained&window=1h&case=case:x:1");
+    expect(url.searchParams.get("severity")).toBeNull();
+    expect(url.searchParams.get("case")).toBeNull();
+    expect(url.searchParams.get("status")).toBe("waiting");
+    expect(url.searchParams.get("window")).toBe("all");
   });
 });

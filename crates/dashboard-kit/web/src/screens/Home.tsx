@@ -110,6 +110,7 @@ export function Home({
   meta,
   onOpenActivity,
   onOpenCase,
+  onOpenQueue,
   edition,
 }: {
   meta?: DashboardMeta;
@@ -120,6 +121,12 @@ export function Home({
    * every case link degrade per `decisionEntryLink`.
    */
   onOpenCase?: (caseId?: string) => void;
+  /**
+   * Opens the Cases screen on the queue of what is waiting for a decision.
+   * The "waiting on you" line is a dead end without it: a number, and no way
+   * to get to the cases it counts.
+   */
+  onOpenQueue?: () => void;
   /**
    * Drives whether the Active Defence card is an offer or noise. Absent means
    * the edition has not resolved yet, which is treated as "do not offer" --
@@ -274,7 +281,7 @@ was incomplete; it does not mean this host is idle.`}
             <OperationalEvidence overview={overview} />
           )}
 
-          <HostAttention waiting={overview.host_attention} />
+          <HostAttention waiting={overview.host_attention} onOpen={onOpenQueue} />
 
           <div className="grid gap-6 lg:grid-cols-[minmax(0,1.35fr)_minmax(280px,.65fr)]">
             <RecentActivity items={recent} edition={edition} onOpen={onOpenActivity} onOpenCase={onOpenCase} />
@@ -628,10 +635,14 @@ export function hostAttentionLine(
   };
 }
 
-function HostAttention({ waiting }: { waiting: Overview["host_attention"] }) {
+export function HostAttention({ waiting, onOpen }: { waiting: Overview["host_attention"]; onOpen?: () => void }) {
   const line = hostAttentionLine(waiting);
   if (line === undefined) return null;
   const quiet = line.tone === "quiet";
+  // The way through is offered only when there is somewhere to go AND
+  // something to see there: a "see what is waiting" under "nothing is
+  // waiting" is a link to an empty list.
+  const through = !quiet && onOpen !== undefined;
   return (
     <section
       aria-labelledby="host-attention-title"
@@ -644,6 +655,11 @@ function HostAttention({ waiting }: { waiting: Overview["host_attention"] }) {
         {line.title}
       </h2>
       <p className={`mt-1 text-sm leading-6 ${quiet ? "text-slate-600" : "text-amber-900"}`}>{line.body}</p>
+      {through && (
+        <button type="button" onClick={onOpen} className="mt-3 text-sm font-semibold text-amber-900 underline decoration-amber-400 underline-offset-4 hover:text-amber-950">
+          See what is waiting <span aria-hidden="true">→</span>
+        </button>
+      )}
     </section>
   );
 }

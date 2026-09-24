@@ -4,11 +4,18 @@ import type { EffectiveMode, SecurityOutcome } from "../api/v1";
 
 export type CaseWindow = "all" | "1h" | "24h" | "7d" | "30d";
 export type CaseScopeKind = "all" | "agent" | "host" | "workload" | "resource";
+/**
+ * The queue, or one status. `waiting` is `needs_review` and `open` together:
+ * every case whose latest decision is absent or awaiting confirmation, which
+ * is the same pair the Overview counts as waiting on you.
+ */
+export type CaseQueueStatus = "waiting" | "needs_review" | "open" | "contained";
 
 export type CaseViewState = {
   query: string;
   outcome: SecurityOutcome | "";
   severity: CaseSeverity | "";
+  status: CaseQueueStatus | "";
   mode: EffectiveMode | "";
   authority: string;
   capability: string;
@@ -23,6 +30,7 @@ export const EMPTY_CASE_VIEW: CaseViewState = {
   query: "",
   outcome: "",
   severity: "",
+  status: "",
   mode: "",
   authority: "",
   capability: "",
@@ -35,6 +43,18 @@ export const EMPTY_CASE_VIEW: CaseViewState = {
 
 const outcomes = ["observed_only", "allowed", "blocked_before_execution", "would_block", "contained", "failed", "reverted", "not_observed", "unknown"] as const;
 const severities = ["critical", "high", "medium", "low", "informational", "unknown"] as const;
+// Only the statuses a case can actually reach, plus the queue. The host's
+// enum also declares `observing`, `dismissed` and `closed`, and no projector
+// has ever assigned them; offering them would be the `resource` mistake over
+// again. `every_status_the_filter_offers_is_one_the_projector_produces` in the
+// agent fails the moment a projector starts producing one of them.
+const statuses = ["waiting", "needs_review", "open", "contained"] as const;
+const statusLabels: Record<(typeof statuses)[number], string> = {
+  waiting: "Waiting for a decision",
+  needs_review: "Needs review",
+  open: "Open, nothing decided yet",
+  contained: "Contained",
+};
 // `mixed` is gone for the same reason `resource` is: the mode filter matches
 // against `event.mode` on the case timeline, and no projector ever puts
 // `EffectiveMode::Mixed` on an event. It exists as a label for capability
@@ -67,6 +87,7 @@ export function readCaseViewState(search = window.location.search): CaseViewStat
     query: bounded(parameters, "q", 256),
     outcome: selected(parameters.get("outcome"), outcomes, ""),
     severity: selected(parameters.get("severity"), severities, ""),
+    status: selected(parameters.get("status"), statuses, ""),
     mode: selected(parameters.get("mode"), modes, ""),
     authority: bounded(parameters, "authority", 256),
     capability: bounded(parameters, "capability", 256),
@@ -83,7 +104,7 @@ export function caseViewUrl(state: CaseViewState, current = window.location.href
   url.searchParams.set("view", "cases");
   const values: [string, string, string][] = [
     ["q", state.query, ""], ["outcome", state.outcome, ""], ["severity", state.severity, ""],
-    ["mode", state.mode, ""], ["authority", state.authority, ""], ["capability", state.capability, ""],
+    ["status", state.status, ""], ["mode", state.mode, ""], ["authority", state.authority, ""], ["capability", state.capability, ""],
     ["scope_kind", state.scopeKind, "all"], ["scope", state.scopeId, ""], ["window", state.window, "24h"],
     ["cursor", state.cursor ?? "", ""], ["case", state.selectedCase ?? "", ""],
   ];
@@ -135,6 +156,10 @@ export function CaseFilters({ value, disabled = false, onApply, onClear }: {
         <FilterSelect label="Severity" value={draft.severity} disabled={disabled} onChange={(severity) => setDraft((current) => ({ ...current, severity: severity as CaseViewState["severity"] }))}>
           <option value="">All severities</option>
           {severities.map((severity) => <option key={severity} value={severity}>{severity}</option>)}
+        </FilterSelect>
+        <FilterSelect label="Status" value={draft.status} disabled={disabled} onChange={(status) => setDraft((current) => ({ ...current, status: status as CaseViewState["status"] }))}>
+          <option value="">Any status</option>
+          {statuses.map((status) => <option key={status} value={status}>{statusLabels[status]}</option>)}
         </FilterSelect>
         <FilterSelect label="Mode" value={draft.mode} disabled={disabled} onChange={(mode) => setDraft((current) => ({ ...current, mode: mode as CaseViewState["mode"] }))}>
           <option value="">All modes</option>

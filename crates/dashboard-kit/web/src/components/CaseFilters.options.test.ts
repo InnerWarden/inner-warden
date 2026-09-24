@@ -88,7 +88,7 @@ describe("case filter options", () => {
   });
 
   it("mode and outcome render from their arrays, so they cannot drift", () => {
-    for (const name of ["outcomes", "severities", "modes"]) {
+    for (const name of ["outcomes", "severities", "modes", "statuses"]) {
       expect(source, `${name} must render via .map so the array stays the only source`).toContain(
         `${name}.map(`,
       );
