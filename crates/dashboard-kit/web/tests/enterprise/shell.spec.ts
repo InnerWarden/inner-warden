@@ -153,11 +153,11 @@ test("healthy Enterprise mounts capability-derived Posture without Community ups
   await page.goto("/");
 
   await expect(page.getByText("Enterprise", { exact: true })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Posture" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Protection" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Runtime assurance foundation" })).toBeVisible();
   await expect(page.getByText("Explore Active Defence", { exact: false })).toHaveCount(0);
 
-  await page.getByRole("button", { name: "Posture" }).click();
+  await page.getByRole("button", { name: "Protection" }).click();
   await expect(page.getByRole("heading", { name: "Agent-boundary controls" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Independent host controls" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Host visibility" })).toBeVisible();
@@ -167,7 +167,7 @@ test("healthy Enterprise mounts capability-derived Posture without Community ups
 test("partial Enterprise keeps the scoped gap and degraded semantics visible", async ({ page }) => {
   await installEnterpriseState(page, "partial");
   await page.goto("/");
-  await page.getByRole("button", { name: "Posture" }).click();
+  await page.getByRole("button", { name: "Protection" }).click();
 
   await expect(page.getByText("Evidence degraded", { exact: true })).toBeVisible();
   await expect(page.getByText("Degraded", { exact: true }).first()).toBeVisible();
@@ -177,7 +177,7 @@ test("partial Enterprise keeps the scoped gap and degraded semantics visible", a
 test("stale Enterprise never presents last-known host posture as current", async ({ page }) => {
   await installEnterpriseState(page, "stale");
   await page.goto("/");
-  await page.getByRole("button", { name: "Posture" }).click();
+  await page.getByRole("button", { name: "Protection" }).click();
 
   await expect(page.getByText(/Stale; 90s old; 30s budget/)).toBeVisible();
   await expect(page.getByText("Verified active enforcement", { exact: true })).toHaveCount(0);
@@ -186,7 +186,7 @@ test("stale Enterprise never presents last-known host posture as current", async
 test("unsupported Enterprise capability stays visible without equivalent-protection wording", async ({ page }) => {
   await installEnterpriseState(page, "unsupported");
   await page.goto("/");
-  await page.getByRole("button", { name: "Posture" }).click();
+  await page.getByRole("button", { name: "Protection" }).click();
 
   await expect(page.getByText("Unavailable", { exact: true }).first()).toBeVisible();
   await expect(page.getByText("Unsupported", { exact: true }).first()).toBeVisible();
@@ -198,7 +198,7 @@ test("adapter-absent Enterprise shell does not fall back to legacy or Community 
   await page.goto("/");
 
   await expect(page.getByRole("heading", { name: "Enterprise posture is not part of this installation" })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Posture" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Protection" })).toHaveCount(0);
   await expect(page.getByText("What Community includes", { exact: true })).toHaveCount(0);
   await expect(page.getByText("No layers reported", { exact: true })).toHaveCount(0);
 });

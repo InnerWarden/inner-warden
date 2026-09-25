@@ -164,7 +164,8 @@ export const PAID_SCREEN_TOUR_STEPS: readonly TourStep[] = [
   },
   {
     key: "posture",
-    title: "Protection posture",
+    // The tab's own name, so the step and the tab it points at agree.
+    title: "Protection",
     body: "The protection layers actually in effect here: what is switched on, what is only watching, and where the gaps are.",
     route: "posture",
     selectors: [

@@ -687,8 +687,8 @@ export function postureFor(mode: GuardrailMode, edition?: "community" | "enterpr
 
 export const ENTERPRISE_UNKNOWN_POSTURE = {
   label: "Guardrail decisions not recorded here",
-  title: "Enforcement is reported on Posture, not by decision count.",
-  body: "The agent-guard hook that records per-action decisions is not running on this host, so that counter reads zero. It is not a measure of what the host is protected by. See Posture for the enforcement layers actually in effect.",
+  title: "Enforcement is reported on Protection, not by decision count.",
+  body: "The agent-guard hook that records per-action decisions is not running on this host, so that counter reads zero. It is not a measure of what the host is protected by. See Protection for the enforcement layers actually in effect.",
   badge: "border-slate-300 bg-white text-slate-700",
   panel: "border-slate-200 from-white to-slate-100",
 };

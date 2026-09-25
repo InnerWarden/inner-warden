@@ -138,6 +138,18 @@ export function reviewRemedy(
 }
 
 /**
+ * Where to look when the host reports no outcome for its verdicts.
+ *
+ * The paid screen that says what each control is doing is the Protection tab
+ * (the `posture` route, renamed on the paid shell). Community's sentence is
+ * left exactly as it was.
+ */
+export function outcomeNotRecordedNext(where: HeadlineInput["reviewListedIn"]): string {
+  if (where === "activity") return "This host reports no outcome for its verdicts. Open Posture to see what each control is doing.";
+  return "This host reports no outcome for its verdicts. Open Protection to see what each control is doing.";
+}
+
+/**
  * Rules, in priority order, and the reasoning behind each.
  *
  * 1. Actions the guardrail flagged for a person win over everything. Burying
@@ -209,7 +221,7 @@ export function headline(input: HeadlineInput): Headline {
       // claimed. "Not recorded" beats a confident wrong number.
       return {
         answer: `${input.denyVerdicts.toLocaleString()} judged unsafe, outcome not recorded`,
-        next: "This host reports no outcome for its verdicts. Open Posture to see what each control is doing.",
+        next: outcomeNotRecordedNext(input.reviewListedIn),
         tone: "attention",
       };
     }

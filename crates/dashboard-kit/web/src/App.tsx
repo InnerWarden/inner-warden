@@ -45,6 +45,9 @@ export const POSTURE_REFRESH_MS = 5 * 60_000;
 
 const BASE_ROUTES: readonly string[] = ["overview", "activity", "posture", "agents", "tokens"];
 
+/** The Enterprise tab for the `posture` route. */
+export const PROTECTION_LABEL = "Protection";
+
 /**
  * Context the shell hands to a contributed screen.
  *
@@ -120,7 +123,12 @@ export function deriveShellNavigation(
 
   const items: HeaderNavigationItem<ShellRoute>[] = [{ route: "overview", label: "Overview" }];
   if (bootstrap.capabilities.some((capability) => capability.tier === "enterprise_core")) {
-    items.push({ route: "posture", label: "Posture" });
+    // "Protection", not "Posture": the screen answers what is switched on to
+    // protect this host, and "posture" is our word for it, not a reader's.
+    // The route stays `posture`, so every link and bookmark keeps working.
+    // Community's navigation never offers this screen, so it has no name to
+    // keep there.
+    items.push({ route: "posture", label: PROTECTION_LABEL });
   }
   // Availability, not mere presence. The capability contract requires the
   // Enterprise superset to PUBLISH every Community id, so an id being in the
