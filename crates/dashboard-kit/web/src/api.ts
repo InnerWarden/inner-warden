@@ -63,6 +63,17 @@ export type DecisionSummary = {
    * case must render as text, not as a link to nowhere.
    */
   case_id?: string;
+  /**
+   * The program the KERNEL refused to start while this command ran, when the
+   * host holds a kernel record of it (an exec-gate denial in the agent's own
+   * unit, at the same time).
+   *
+   * Without it a command the rules allowed read "Allowed" on this page while
+   * the kernel had stopped part of it: `id && sudo -n true` was allowed by
+   * the rules, and the kernel refused `/usr/bin/sudo`. Optional: absent means
+   * no kernel record, not that the kernel allowed it.
+   */
+  kernel_stopped?: string;
 };
 export type BlockSummary = DecisionSummary;
 export type Overview = {
@@ -150,6 +161,34 @@ export type Overview = {
    * its table when it is absent, so a mixed fleet keeps working.
    */
   headline?: { label: string; title: string; body: string };
+  /**
+   * The Overview's three questions, answered by the host: messages to the AI
+   * agent (`prompt`), what the agent did (`agent`), and attacks on the server
+   * (`host`). One card each; see `lanes.ts`.
+   *
+   * ABSENT, never empty, on a host that does not answer them, and the screen
+   * then renders exactly as it did before lanes existed. A host may send only
+   * the lanes it has data for. Each lane is validated on its own
+   * (`overviewLaneCards`), and one the screen cannot show honestly is
+   * dropped, not completed.
+   */
+  lanes?: Partial<Record<"prompt" | "agent" | "host", OverviewLaneWire>>;
+};
+
+/** One lane as the host sends it. Read through `parseLaneCard`, never directly. */
+export type OverviewLaneWire = {
+  /** `no_source`: nothing on this host feeds the lane, so it has no number. */
+  availability: "available" | "no_source";
+  /** The span `count` covers, one of the Cases windows. Required when available. */
+  window?: "1h" | "24h" | "7d" | "30d" | "all";
+  /** Cases in the lane in that window. Required when available; ignored otherwise. */
+  count?: number;
+  /** The host's own sentence about the lane, or how to turn its source on. */
+  sentence: string;
+  /** Cases in the lane waiting on a person. */
+  waiting?: number;
+  /** The newest case in the lane. */
+  latest?: { title: string; at: string; case_id?: string | null } | null;
 };
 export type Node = { id: string; kind: string; label: string; attrs?: Record<string, string> };
 export type Edge = { from: string; to: string; kind: string };

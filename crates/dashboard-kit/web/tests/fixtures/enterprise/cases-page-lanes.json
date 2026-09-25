@@ -1,0 +1,34 @@
+{
+  "schema_version": "innerwarden.dashboard.v1",
+  "generated_at": "2026-09-25T10:20:00Z",
+  "items": [
+    {
+      "id": "case:community-session:lane-agent-1",
+      "title": "AI agent session wren-visitor-28eb7f9c: 2 commands, 1 refused before it ran, 1 stopped by the kernel",
+      "severity": "high",
+      "status": "contained",
+      "scope": [
+        {
+          "id": "agent:wren-visitor-28eb7f9c",
+          "kind": "agent",
+          "display_name": "wren-visitor-28eb7f9c",
+          "verification": "declared",
+          "evidence": []
+        }
+      ],
+      "latest_event_at": "2026-09-25T10:17:00Z",
+      "recurrence_occurrences": "1",
+      "outcome": "blocked_before_execution"
+    }
+  ],
+  "next_cursor": null,
+  "window": "24h",
+  "total_in_window": 1,
+  "window_complete": true,
+  "rows_in_window": 1,
+  "lane_counts": {
+    "prompt": 3,
+    "agent": 1,
+    "host": 823
+  }
+}

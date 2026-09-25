@@ -30,7 +30,25 @@ export type TourStep = {
   route?: string;
   /** Selectors tried in order; undefined = a centered card with no spotlight. */
   selectors?: readonly string[];
+  /**
+   * The step points at something only some hosts show, so it is skipped,
+   * in the direction the reader was going, when its anchor has not appeared
+   * after the quick burst of retries (`skipsMissingAnchor`). Without this a
+   * card about a panel this host does not show floats over the middle of the
+   * screen, reading out copy about nothing. The Overview shows either the
+   * lane cards or the sensor and agent panels up front, depending on what
+   * the host sends, and a tour table is fixed before either is known.
+   */
+  optional?: boolean;
 };
+
+/** Retries the quick burst makes before a missing anchor counts as absent. */
+export const OPTIONAL_ANCHOR_ATTEMPTS = 15;
+
+/** Whether a step should be passed over because its anchor never appeared. */
+export function skipsMissingAnchor(step: Pick<TourStep, "optional">, attempts: number): boolean {
+  return step.optional === true && attempts >= OPTIONAL_ANCHOR_ATTEMPTS;
+}
 
 /** Community's own gate key. Each edition tracks its own dismissal. */
 export const COMMUNITY_TOUR_STORAGE_KEY = "iw-community-tour-v1";
@@ -128,11 +146,21 @@ function shellRoutes(): string[] {
  */
 export const PAID_SCREEN_TOUR_STEPS: readonly TourStep[] = [
   {
+    key: "overview-lanes",
+    title: "Three questions",
+    body: "What people sent your AI agent, what your agent tried to do, and what came at this server from the internet. Each card opens the cases behind it.",
+    route: "overview",
+    selectors: ['[data-tour="overview-lanes"]', 'section[aria-labelledby="lanes-title"]'],
+    optional: true,
+  },
+  {
     key: "overview-sensor",
     title: "Sensor activity",
     body: "What the host sensor saw today, collector by collector, so silence from a collector is visible rather than assumed.",
     route: "overview",
     selectors: ['[data-tour="overview-sensor"]', 'section[aria-labelledby="sensor-activity-title"]'],
+    // Behind the technical switch on a host that shows the lane cards.
+    optional: true,
   },
   {
     key: "posture",
@@ -195,6 +223,8 @@ export const COMMUNITY_TOUR_STEPS: readonly TourStep[] = [
     body: "Whether any agent on this machine has a guardrail policy on file, and what to run if none has.",
     route: "overview",
     selectors: ['[data-tour="overview-agents"]', 'section[aria-labelledby="local-agents-title"]'],
+    // Behind the technical switch on a host that shows the lane cards.
+    optional: true,
   },
   {
     key: ACTIVITY_TOUR_STEP_KEY,
@@ -284,7 +314,7 @@ export function markTourSeen(storage: TourStorage, storageKey: string): void {
  */
 const SCREEN_PARAMS = [
   "q", "outcome", "severity", "status", "mode", "authority", "capability", "scope_kind",
-  "scope", "window", "cursor", "case", "decision", "session", "verdict", "action",
+  "scope", "window", "cursor", "case", "decision", "session", "verdict", "action", "lane",
 ] as const;
 
 function currentRoute(): string {
@@ -391,12 +421,16 @@ export function ProductTour({ steps, onClose }: { steps: readonly TourStep[]; on
   const total = steps.length;
   const step = steps[stepIndex];
   const lastStep = stepIndex === total - 1;
+  // Which way the reader was going, so a step skipped for a missing anchor
+  // is passed over forwards on Next and backwards on Back.
+  const directionRef = useRef<1 | -1>(1);
 
   const advance = (delta: number) => {
     if (delta > 0 && lastStep) {
       onClose();
       return;
     }
+    directionRef.current = delta < 0 ? -1 : 1;
     setStepIndex((current) => clampStep(current, delta, total));
   };
 
@@ -422,7 +456,12 @@ export function ProductTour({ steps, onClose }: { steps: readonly TourStep[]; on
         return;
       }
       attempts += 1;
-      window.setTimeout(locate, attempts < 15 ? 120 : 600);
+      if (skipsMissingAnchor(current, attempts)) {
+        const count = stepsRef.current.length;
+        setStepIndex((index) => clampStep(index, directionRef.current, count));
+        return;
+      }
+      window.setTimeout(locate, attempts < OPTIONAL_ANCHOR_ATTEMPTS ? 120 : 600);
     };
     window.setTimeout(locate, 80);
     return () => {

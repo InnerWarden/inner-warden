@@ -84,7 +84,11 @@ test("the count line pages against rows and names the cases in the window apart"
   // The case total is never the denominator of the rows.
   await expect(page.getByText("of 4,394", { exact: false })).toHaveCount(0);
   expect(listRequests.length).toBeGreaterThan(0);
-  for (const url of listRequests) expect(url.searchParams.get("include")).toBe("rows_in_window");
+  // Every request asks for the row total. A screen that also asks for the
+  // lane counts sends both names in the one comma-separated value.
+  for (const url of listRequests) {
+    expect((url.searchParams.get("include") ?? "").split(",")).toContain("rows_in_window");
+  }
 });
 
 test("partial evidence stays explicit and cannot create a verified outcome", async ({ page }) => {

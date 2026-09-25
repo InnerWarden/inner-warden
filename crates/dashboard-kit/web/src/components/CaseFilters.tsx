@@ -1,6 +1,7 @@
 import { useEffect, useState, type FormEvent, type ReactNode } from "react";
 import type { CaseSeverity } from "../api/cases";
 import type { EffectiveMode, SecurityOutcome } from "../api/v1";
+import { isCaseLaneChoice, type CaseLaneChoice } from "../lanes";
 
 export type CaseWindow = "all" | "1h" | "24h" | "7d" | "30d";
 export type CaseScopeKind = "all" | "agent" | "host" | "workload" | "resource";
@@ -32,6 +33,13 @@ export type CaseViewState = {
   window: CaseWindow;
   cursor: string | null;
   selectedCase: string | null;
+  /**
+   * The lane the list is open on, or `everything`. Empty when the address
+   * names none, which is not "every case": the screen then opens the lane
+   * `defaultCaseLane` picks (the one this viewer last used, or the agent's
+   * lane where there are agent records).
+   */
+  lane: CaseLaneChoice | "";
 };
 
 export const EMPTY_CASE_VIEW: CaseViewState = {
@@ -47,6 +55,7 @@ export const EMPTY_CASE_VIEW: CaseViewState = {
   window: "24h",
   cursor: null,
   selectedCase: null,
+  lane: "",
 };
 
 const outcomes = ["observed_only", "allowed", "blocked_before_execution", "would_block", "contained", "failed", "reverted", "not_observed", "unknown"] as const;
@@ -113,6 +122,7 @@ export function readCaseViewState(search = window.location.search): CaseViewStat
     window: selected(parameters.get("window"), windows, "24h") as CaseWindow,
     cursor: bounded(parameters, "cursor", 2_048) || null,
     selectedCase: bounded(parameters, "case", 256) || null,
+    lane: isCaseLaneChoice(parameters.get("lane")) ? parameters.get("lane") as CaseLaneChoice : "",
   };
 }
 
@@ -123,7 +133,7 @@ export function caseViewUrl(state: CaseViewState, current = window.location.href
     ["q", state.query, ""], ["outcome", state.outcome, ""], ["severity", state.severity, ""],
     ["status", state.status, ""], ["mode", state.mode, ""], ["authority", state.authority, ""], ["capability", state.capability, ""],
     ["scope_kind", state.scopeKind, "all"], ["scope", state.scopeId, ""], ["window", state.window, "24h"],
-    ["cursor", state.cursor ?? "", ""], ["case", state.selectedCase ?? "", ""],
+    ["cursor", state.cursor ?? "", ""], ["case", state.selectedCase ?? "", ""], ["lane", state.lane, ""],
   ];
   for (const [name, value, defaultValue] of values) {
     if (value === defaultValue) url.searchParams.delete(name);

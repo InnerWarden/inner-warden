@@ -34,6 +34,12 @@ export type CaseEventType =
   | "evidence_gap";
 export type RelationshipConfidence = "causal" | "strongly_supported" | "contextual" | "unknown";
 
+// The lanes live in their own dependency-free module so the Overview, which
+// every edition renders, can name them without pulling this client (and the
+// instance it creates at load) into a bundle that never lists a case.
+export { CASE_LANES, isCaseLane, type CaseLane, type CaseLaneCounts } from "./lanes";
+import { CASE_LANES, isCaseLane, type CaseLane, type CaseLaneCounts } from "./lanes";
+
 export type CaseSummary = {
   id: string;
   title: string;
@@ -99,6 +105,23 @@ export type CaseListPage = {
    * So never render "at least N" from this. Say what the read was.
    */
   window_complete?: boolean;
+  /**
+   * How many cases each lane holds, for the same window and filters with the
+   * lane left out, so every lane tab can carry its own number whichever tab is
+   * open.
+   *
+   * Sent only when the request asks with `include=lane_counts`, for the same
+   * reason as `rows_in_window`: an older bundle's exact-key parser rejects a
+   * body with a key it does not know. Its PRESENCE is also the one sign that
+   * this server files cases into lanes at all, so a screen offers lane tabs
+   * only when it arrived; a server that refused the parameter answered without
+   * it, and its list is the unfiltered one.
+   *
+   * Read leniently, one lane at a time: a count that is not a non-negative
+   * whole number is read as not sent, so one bad number costs its tab a badge
+   * and never costs the reader the whole list.
+   */
+  lane_counts?: CaseLaneCounts;
 };
 
 export type AuthorityRef = { kind: string; id: string; version?: string | null; inferred?: boolean | null };
@@ -291,6 +314,18 @@ export type CaseListQuery = {
    * severity. Additive like `window`: an older server ignores it.
    */
   sort?: "recent" | "findings" | "";
+  /**
+   * Only the cases the host filed into this lane. Empty or absent asks for
+   * every case, exactly as before lanes existed.
+   *
+   * A server older than lanes refuses the parameter as unknown, and the
+   * client then asks again without it and without `lane_counts`: the answer is
+   * the unfiltered list, and its missing `lane_counts` is how the screen
+   * learns to stop offering lanes. It is never silently a lane it is not.
+   */
+  lane?: CaseLane | "";
+  /** Ask for `lane_counts` beside the page (`include=lane_counts`). */
+  lane_counts?: boolean;
 };
 
 type Fetch = typeof globalThis.fetch;
@@ -463,7 +498,7 @@ function verifiedOutcome(value: unknown, path: string): VerifiedOutcome {
 export function parseCaseListPage(value: unknown, requestedLimit = 20): CaseListPage {
   if (!Number.isInteger(requestedLimit) || requestedLimit < 1 || requestedLimit > 100) throw new Error("cases.limit: outside 1..100");
   const item = object(value, "cases");
-  exact(item, ["schema_version", "generated_at", "items", "next_cursor", "window", "total_in_window", "window_complete", "rows_in_window"], "cases");
+  exact(item, ["schema_version", "generated_at", "items", "next_cursor", "window", "total_in_window", "window_complete", "rows_in_window", "lane_counts"], "cases");
   if (item.schema_version !== DASHBOARD_SCHEMA_VERSION) throw new Error("cases.schema_version: unsupported contract version");
   const items = array(item.items, "cases.items", caseSummary, requestedLimit);
   if (new Set(items.map((entry) => entry.id)).size !== items.length) throw new Error("cases.items: duplicate case id");
@@ -514,7 +549,26 @@ export function parseCaseListPage(value: unknown, requestedLimit = 20): CaseList
     }
     page.rows_in_window = rows;
   }
+  const laneCounts = parseLaneCounts(item.lane_counts);
+  if (laneCounts !== undefined) page.lane_counts = laneCounts;
   return page;
+}
+
+/**
+ * `lane_counts`, one lane at a time. Absent, or not an object, is not sent.
+ * A lane whose count is not a non-negative whole number is left out, and a
+ * key that names no lane this bundle knows is ignored, so a host that grows a
+ * fourth lane does not blank the list on an older bundle.
+ */
+export function parseLaneCounts(value: unknown): CaseLaneCounts | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const raw = value as Record<string, unknown>;
+  const counts: CaseLaneCounts = {};
+  for (const lane of CASE_LANES) {
+    const count = raw[lane];
+    if (typeof count === "number" && Number.isSafeInteger(count) && count >= 0) counts[lane] = count + 0;
+  }
+  return counts;
 }
 
 export function parseUnifiedCase(value: unknown): UnifiedCase {
@@ -705,10 +759,15 @@ function refusedAsUnknownParameter(result: DashboardClientResult<unknown>): bool
     && result.problem.code === UNKNOWN_QUERY_PARAMETER;
 }
 
+/** What one list request asks for beyond the filters. */
+type ListAsk = { lanes: boolean; rows: boolean };
+
 export class DashboardCasesClient {
   readonly #fetch: Fetch;
   /** Set once this server answered a list request without the row total after refusing it. */
   #rowTotalRefused = false;
+  /** Set once this server answered a list request without lanes after refusing them. */
+  #lanesRefused = false;
 
   constructor(fetchImplementation: Fetch = globalThis.fetch) {
     this.#fetch = fetchImplementation.bind(globalThis);
@@ -743,21 +802,48 @@ export class DashboardCasesClient {
     // the plain request has been answered this client stops asking, so every
     // refresh against an older server costs one request, not two. The free
     // server has no case list at all.
-    const url = (withRowTotal: boolean) => {
+    //
+    // Lanes are newer than the row total and follow the same rule, one step
+    // earlier. A request that names a lane, or asks for `lane_counts`, goes
+    // first with both; a server older than lanes refuses it as an unknown
+    // parameter and is asked again without the lane and without the counts,
+    // which is the unfiltered list. That answer carries no `lane_counts`, and
+    // the missing counts are how a screen learns to stop offering lanes, so
+    // the list is never presented as a lane it is not. Several `include`
+    // names travel as one comma-separated value.
+    const lane = isCaseLane(query.lane) ? query.lane : "";
+    const wantsLanes = lane !== "" || query.lane_counts === true;
+    const url = (ask: ListAsk) => {
       const sent = new URLSearchParams(parameters);
-      if (withRowTotal) sent.set("include", "rows_in_window");
+      if (ask.lanes && lane !== "") sent.set("lane", lane);
+      const include = [
+        ...(ask.rows ? ["rows_in_window"] : []),
+        ...(ask.lanes && query.lane_counts === true ? ["lane_counts"] : []),
+      ];
+      if (include.length > 0) sent.set("include", include.join(","));
       return `${DASHBOARD_API_ROOT}/cases?${sent}`;
     };
     const parse = (payload: unknown) => parseCaseListPage(payload, limit);
-    if (!this.#rowTotalRefused) {
-      const asked = await this.#get("cases", url(true), parse, signal);
-      if (!refusedAsUnknownParameter(asked)) return asked;
+    // Most specific first. Each refusal as an unknown parameter drops the
+    // newest thing asked for; the plain request is always the last resort.
+    const asks: ListAsk[] = [];
+    if (wantsLanes && !this.#lanesRefused) asks.push({ lanes: true, rows: !this.#rowTotalRefused });
+    if (!this.#rowTotalRefused) asks.push({ lanes: false, rows: true });
+    asks.push({ lanes: false, rows: false });
+    for (let index = 0; ; index += 1) {
+      const ask = asks[index];
+      const result = await this.#get("cases", url(ask), parse, signal);
+      if (index < asks.length - 1 && refusedAsUnknownParameter(result)) continue;
+      // Remembered only once a narrower request is answered. Refusals all the
+      // way down mean the parameters were not the problem, and the next call
+      // asks again.
+      if (result.state === "ready" && index > 0) {
+        const refused = asks.slice(0, index);
+        if (refused.some((earlier) => earlier.lanes)) this.#lanesRefused = true;
+        if (!ask.rows && refused.some((earlier) => earlier.rows)) this.#rowTotalRefused = true;
+      }
+      return result;
     }
-    const plain = await this.#get("cases", url(false), parse, signal);
-    // Remembered only once the plain request is answered. Two refusals in a
-    // row mean the parameter was not the problem, and the next call asks again.
-    if (plain.state === "ready") this.#rowTotalRefused = true;
-    return plain;
   }
 
   get(caseId: string, signal?: AbortSignal): Promise<DashboardClientResult<UnifiedCase>> {

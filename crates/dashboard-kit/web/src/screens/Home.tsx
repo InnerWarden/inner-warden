@@ -1,6 +1,6 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { headline, type Headline } from "../components/HeadlineAnswer";
-import { TechnicalOnly } from "../components/TechnicalDetail";
+import { TechnicalOnly, useTechnicalDetail } from "../components/TechnicalDetail";
 import {
   fetchOverview,
   type DashboardMeta,
@@ -8,11 +8,14 @@ import {
   type GuardrailMode,
   type Overview,
 } from "../api";
+import type { CaseLane } from "../api/cases";
 import { DecidedBy } from "../components/DecidedBy";
+import { LaneCards, type LaneOpenOptions } from "../components/LaneCards";
 import { MachineIntelligence } from "../components/MachineIntelligence";
 import { Outcome } from "../components/Outcome";
 import { SensorActivity } from "../components/SensorActivity";
 import { Verdict } from "../components/Verdict";
+import { overviewLaneCards, type LaneCard } from "../lanes";
 import { formatTimestamp, humanizeToken, normaliseMode } from "../presentation";
 
 type ActivityLink = { id?: string; session?: string; verdict?: string; action?: string };
@@ -51,12 +54,21 @@ export function decisionEntryLink(
  * Community goes to Activity, its decision record. Enterprise goes to Cases
  * when the shell offers it; when it does not, the button is hidden rather than
  * rendered as a link that silently lands back on Overview.
+ *
+ * On a host that files cases into lanes it goes to the agent's lane (`lane`),
+ * where these decisions are, instead of the whole case list: the button used
+ * to open every case on the host, thousands of them, beside a record counting
+ * a handful of agent decisions, and told the reader to find them with a
+ * filter. A host that does not serve lanes keeps the old destination, because
+ * its Cases screen cannot open a lane.
  */
 export function decisionRecordCta(
   edition: "community" | "enterprise" | undefined,
   canOpenCase: boolean,
-): { kind: "cases" | "activity" | "hidden"; label: string } {
+  lanesServed = false,
+): { kind: "cases" | "lane" | "activity" | "hidden"; label: string } {
   if (edition === "community") return { kind: "activity", label: "View all activity" };
+  if (canOpenCase && lanesServed) return { kind: "lane", label: "View all in Cases" };
   if (canOpenCase) return { kind: "cases", label: "View all in Cases" };
   return { kind: "hidden", label: "" };
 }
@@ -78,6 +90,7 @@ export function decisionRecord(
   edition: "community" | "enterprise" | undefined,
   canOpenCase: boolean,
   mode: GuardrailMode,
+  lanesServed = false,
 ): {
   cta: ReturnType<typeof decisionRecordCta>;
   summary: Headline;
@@ -88,7 +101,7 @@ export function decisionRecord(
   const denyVerdicts = overview.deny_verdicts ?? overview.blocked;
   const reviewVerdicts = overview.review_verdicts ?? overview.review;
   const allowVerdicts = overview.allow_verdicts ?? overview.allowed;
-  const cta = decisionRecordCta(edition, canOpenCase);
+  const cta = decisionRecordCta(edition, canOpenCase, lanesServed);
   // Computed from what the host already sent: no new field, no extra request.
   const summary = headline({
     needsReview: reviewVerdicts,
@@ -160,16 +173,26 @@ export function Home({
   onOpenActivity,
   onOpenCase,
   onOpenQueue,
+  onOpenLane,
+  machinePanels,
   edition,
 }: {
   meta?: DashboardMeta;
   onOpenActivity: (target?: ActivityLink) => void;
   /**
-   * Opens the Cases screen, optionally with one case selected. Provided only
+   * Opens the Cases screen, optionally with one case selected, and with the
+   * lane it belongs to when the link came from a lane card. Provided only
    * when the shell actually has a Cases screen to open; its absence makes
    * every case link degrade per `decisionEntryLink`.
    */
-  onOpenCase?: (caseId?: string) => void;
+  onOpenCase?: (caseId?: string, lane?: CaseLane) => void;
+  /**
+   * Opens the Cases screen on one lane. Provided only when the shell has a
+   * Cases screen; a lane card without it links nowhere (`laneLink`).
+   */
+  onOpenLane?: (lane: CaseLane, options: LaneOpenOptions) => void;
+  /** Which of the agent and token panels the shell offers; see `LanesOverview`. */
+  machinePanels?: MachinePanels;
   /**
    * Opens the Cases screen on the queue of what is waiting for a decision.
    * The "waiting on you" line is a dead end without it: a number, and no way
@@ -240,17 +263,93 @@ was incomplete; it does not mean this host is idle.`}
     );
   }
 
+  return (
+    <OverviewScreen
+      overview={overview}
+      meta={meta}
+      edition={edition}
+      fetching={fetching}
+      reconnecting={error !== undefined}
+      onOpenActivity={onOpenActivity}
+      onOpenCase={onOpenCase}
+      onOpenQueue={onOpenQueue}
+      onOpenLane={onOpenLane}
+      machinePanels={machinePanels}
+    />
+  );
+}
+
+/**
+ * The Overview once the host has answered, with nothing fetched here, so a
+ * test can render every branch from a payload it hands in.
+ *
+ * Two layouts, chosen by what the HOST sent, never by the edition:
+ *
+ *  - No `lanes` (every Community host, and every paid host older than the
+ *    field): exactly the page this was before lanes existed, element for
+ *    element. `Home.lanes.render.test.tsx` pins that markup.
+ *  - `lanes`: the three questions lead, one card each. What the page used to
+ *    lead with (the posture hero, the agent and token panels, the sensor
+ *    chart, the decision tiles, "What the guardrail actually did" and the
+ *    risk signals) is still here, whole, behind the technical switch for
+ *    whoever wants the numbers behind the cards. What changes what a reader
+ *    should DO stays visible in both views: the host's waiting line, a
+ *    decision record that is flagging something, and the recent decisions.
+ */
+export function OverviewScreen({
+  overview,
+  meta,
+  edition,
+  fetching = false,
+  reconnecting = false,
+  onOpenActivity,
+  onOpenCase,
+  onOpenQueue,
+  onOpenLane,
+  machinePanels,
+}: {
+  overview: Overview;
+  meta?: DashboardMeta;
+  edition?: "community" | "enterprise";
+  fetching?: boolean;
+  reconnecting?: boolean;
+  onOpenActivity: (target?: ActivityLink) => void;
+  onOpenCase?: (caseId?: string, lane?: CaseLane) => void;
+  onOpenQueue?: () => void;
+  onOpenLane?: (lane: CaseLane, options: LaneOpenOptions) => void;
+  machinePanels?: MachinePanels;
+}) {
+  const [technical] = useTechnicalDetail();
   const mode = normaliseMode(meta);
   const guardedAgents = meta?.guardrail?.guarded_agents;
+  const laneCards = overviewLaneCards(overview.lanes);
+
+  if (laneCards !== undefined) {
+    return (
+      <LanesOverview
+        overview={overview}
+        laneCards={laneCards}
+        technical={technical}
+        mode={mode}
+        edition={edition}
+        guardedAgents={guardedAgents}
+        fetching={fetching}
+        reconnecting={reconnecting}
+        onOpenActivity={onOpenActivity}
+        onOpenCase={onOpenCase}
+        onOpenQueue={onOpenQueue}
+        onOpenLane={onOpenLane}
+        machinePanels={machinePanels}
+        // `?? false` reads an older server the way the layout without lanes
+        // reads it: as an offer.
+        activeDefenceInstalled={meta?.active_defence_installed ?? false}
+      />
+    );
+  }
 
   return (
     <div className="min-w-0 space-y-6 sm:space-y-8" aria-busy={fetching}>
-      {error && (
-        <div role="status" className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
-          <span>Reconnecting to the local dashboard. The figures below may be slightly out of date.</span>
-          <span className="text-xs font-medium text-amber-700">Last good response retained</span>
-        </div>
-      )}
+      {reconnecting && <ReconnectingNotice />}
 
       <PostureHero mode={mode} edition={edition} decisions={overview.commands} sessions={overview.sessions} guardedAgents={guardedAgents} hostHeadline={overview.headline} />
 
@@ -278,6 +377,135 @@ was incomplete; it does not mean this host is idle.`}
           recoverable; being wrong toward silence hides the product. */}
       {edition === "community" ? (
         <ActiveDefenceCard installed={meta?.active_defence_installed ?? false} />
+      ) : null}
+    </div>
+  );
+}
+
+/** Which of the agent and token panels this shell may show; see `LanesOverview`. */
+export type MachinePanels = { agents: boolean; tokens: boolean };
+
+function ReconnectingNotice() {
+  return (
+    <div role="status" className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+      <span>Reconnecting to the local dashboard. The figures below may be slightly out of date.</span>
+      <span className="text-xs font-medium text-amber-700">Last good response retained</span>
+    </div>
+  );
+}
+
+/**
+ * The Overview on a host that answers the three questions.
+ *
+ * The decision record keeps its place in the plain view only while it is
+ * flagging something (`tone === "attention"`): agent actions flagged for a
+ * person, or verdicts whose outcome was never recorded. A calm record is the
+ * agent card's evidence, and moves behind the switch with its tiles.
+ *
+ * The agent and token panels follow the shell: on a paid host whose bootstrap
+ * says the source is `not_configured`, the nav already offers no tab for it,
+ * and the panel here said "none wired to a guardrail" about an agent the host
+ * was screening through another path. On this layout they render only where
+ * the source is configured, and only in the technical view. The layout
+ * without lanes keeps them as they were.
+ */
+function LanesOverview({
+  overview,
+  laneCards,
+  technical,
+  mode,
+  edition,
+  guardedAgents,
+  fetching,
+  reconnecting,
+  onOpenActivity,
+  onOpenCase,
+  onOpenQueue,
+  onOpenLane,
+  machinePanels,
+  activeDefenceInstalled,
+}: {
+  overview: Overview;
+  laneCards: LaneCard[];
+  technical: boolean;
+  activeDefenceInstalled: boolean;
+  mode: GuardrailMode;
+  edition?: "community" | "enterprise";
+  guardedAgents?: number;
+  fetching: boolean;
+  reconnecting: boolean;
+  onOpenActivity: (target?: ActivityLink) => void;
+  onOpenCase?: (caseId?: string, lane?: CaseLane) => void;
+  onOpenQueue?: () => void;
+  onOpenLane?: (lane: CaseLane, options: LaneOpenOptions) => void;
+  machinePanels?: MachinePanels;
+}) {
+  const hasDecisions = overview.commands > 0;
+  const record = hasDecisions
+    ? decisionRecord(overview, edition, onOpenCase !== undefined, mode, onOpenLane !== undefined)
+    : undefined;
+  const showRecord = record !== undefined && (technical || record.summary.tone === "attention");
+  const recent = (overview.recent_decisions ?? overview.recent_blocks).slice(0, 5);
+  const agents = machinePanels?.agents ?? true;
+  const tokens = machinePanels?.tokens ?? true;
+  return (
+    <div className="min-w-0 space-y-6 sm:space-y-8" aria-busy={fetching}>
+      {reconnecting && <ReconnectingNotice />}
+
+      <LaneCards
+        cards={laneCards}
+        edition={edition}
+        onOpenLane={onOpenLane}
+        onOpenCase={onOpenCase === undefined ? undefined : (caseId, lane) => onOpenCase(caseId, lane)}
+        onOpenActivity={() => onOpenActivity()}
+      />
+
+      <HostAttention waiting={overview.host_attention} onOpen={onOpenQueue} />
+
+      {showRecord && record !== undefined ? (
+        <DecisionRecordSection
+          record={record}
+          overview={overview}
+          tiles={technical}
+          onOpenActivity={onOpenActivity}
+          onOpenCase={onOpenCase}
+          onOpenLane={onOpenLane}
+        />
+      ) : null}
+
+      {recent.length > 0 || technical ? (
+        <div className={technical ? "grid gap-6 lg:grid-cols-[minmax(0,1.35fr)_minmax(280px,.65fr)]" : ""}>
+          <RecentActivity items={recent} edition={edition} onOpen={onOpenActivity} onOpenCase={onOpenCase} />
+          {technical ? (
+            <RiskSignals items={overview.top_categories.slice(0, 6)} sent={overview.top_categories.length} max={overview.top_categories[0]?.count ?? 0} />
+          ) : null}
+        </div>
+      ) : null}
+
+      <TechnicalOnly>
+        <section aria-labelledby="overview-technical-title" className="space-y-6 border-t border-slate-200 pt-6 sm:space-y-8">
+          <div>
+            <p className="text-xs font-semibold uppercase tracking-[0.14em] text-cyan-700">Technical detail</p>
+            <h2 id="overview-technical-title" className="mt-1 text-lg font-semibold text-slate-950">The records behind these cards</h2>
+          </div>
+          <PostureHero
+            mode={mode}
+            edition={edition}
+            decisions={overview.commands}
+            sessions={overview.sessions}
+            guardedAgents={guardedAgents}
+            hostHeadline={overview.headline}
+            headingLevel="h2"
+          />
+          {agents || tokens ? <MachineIntelligence edition={edition} showAgents={agents} showTokens={tokens} /> : null}
+          <SensorActivity />
+          {hasDecisions ? null : <ZeroState guardedAgents={guardedAgents} edition={edition} />}
+        </section>
+      </TechnicalOnly>
+
+      {edition === "enterprise" ? null : <CommunityIncluded />}
+      {edition === "community" ? (
+        <ActiveDefenceCard installed={activeDefenceInstalled} />
       ) : null}
     </div>
   );
@@ -329,15 +557,57 @@ export function OverviewRecord({
   // One decision about where "everything" lives, read by both the button and
   // the headline's remedy, so the sentence never names a screen the button
   // beside it does not open.
-  const { cta, summary, denyVerdicts, reviewVerdicts, allowVerdicts } = decisionRecord(
-    overview,
-    edition,
-    onOpenCase !== undefined,
-    mode,
-  );
+  const record = decisionRecord(overview, edition, onOpenCase !== undefined, mode);
   const recent = (overview.recent_decisions ?? overview.recent_blocks).slice(0, 5);
   const maxSignal = overview.top_categories[0]?.count ?? 0;
 
+  return (
+    <>
+      <DecisionRecordSection
+        record={record}
+        overview={overview}
+        tiles
+        onOpenActivity={onOpenActivity}
+        onOpenCase={onOpenCase}
+      />
+
+      {hostAttention}
+
+      <div className="grid gap-6 lg:grid-cols-[minmax(0,1.35fr)_minmax(280px,.65fr)]">
+        <RecentActivity items={recent} edition={edition} onOpen={onOpenActivity} onOpenCase={onOpenCase} />
+        <RiskSignals items={overview.top_categories.slice(0, 6)} sent={overview.top_categories.length} max={maxSignal} />
+      </div>
+    </>
+  );
+}
+
+/**
+ * The Decision record's headline, its "view everything" button and, with
+ * `tiles`, the counters under it and what the guardrail actually did. The
+ * layout without lanes always shows the tiles; the lanes layout shows them in
+ * the technical view only (see `LanesOverview`).
+ */
+function DecisionRecordSection({
+  record,
+  overview,
+  tiles,
+  onOpenActivity,
+  onOpenCase,
+  onOpenLane,
+}: {
+  record: ReturnType<typeof decisionRecord>;
+  overview: Overview;
+  tiles: boolean;
+  onOpenActivity: (target?: ActivityLink) => void;
+  onOpenCase?: (caseId?: string, lane?: CaseLane) => void;
+  onOpenLane?: (lane: CaseLane, options: LaneOpenOptions) => void;
+}) {
+  const { cta, summary, denyVerdicts, reviewVerdicts, allowVerdicts } = record;
+  const openAll = () => {
+    if (cta.kind === "cases") onOpenCase?.();
+    else if (cta.kind === "lane") onOpenLane?.("agent", { window: "all" });
+    else onOpenActivity();
+  };
   return (
     <>
       <section aria-labelledby="decision-summary-title">
@@ -360,33 +630,28 @@ export function OverviewRecord({
           {cta.kind === "hidden" ? null : (
             <button
               type="button"
-              onClick={() => (cta.kind === "cases" ? onOpenCase?.() : onOpenActivity())}
+              onClick={openAll}
               className="text-sm font-semibold text-cyan-700 hover:text-cyan-900"
             >
               {cta.label} <span aria-hidden="true">→</span>
             </button>
           )}
         </div>
-        <DecisionCounts
-          commands={overview.commands}
-          sessions={overview.sessions}
-          denyVerdicts={denyVerdicts}
-          reviewVerdicts={reviewVerdicts}
-          allowVerdicts={allowVerdicts}
-          unknownVerdicts={overview.unknown_verdicts}
-        />
+        {tiles ? (
+          <DecisionCounts
+            commands={overview.commands}
+            sessions={overview.sessions}
+            denyVerdicts={denyVerdicts}
+            reviewVerdicts={reviewVerdicts}
+            allowVerdicts={allowVerdicts}
+            unknownVerdicts={overview.unknown_verdicts}
+          />
+        ) : null}
       </section>
 
-      {(overview.actual_blocks != null || overview.would_block != null || overview.screened != null || overview.outcomes_unknown != null) && (
+      {tiles && (overview.actual_blocks != null || overview.would_block != null || overview.screened != null || overview.outcomes_unknown != null) && (
         <OperationalEvidence overview={overview} />
       )}
-
-      {hostAttention}
-
-      <div className="grid gap-6 lg:grid-cols-[minmax(0,1.35fr)_minmax(280px,.65fr)]">
-        <RecentActivity items={recent} edition={edition} onOpen={onOpenActivity} onOpenCase={onOpenCase} />
-        <RiskSignals items={overview.top_categories.slice(0, 6)} sent={overview.top_categories.length} max={maxSignal} />
-      </div>
     </>
   );
 }
@@ -477,7 +742,8 @@ export const POSTURES: Record<GuardrailMode, { label: string; title: string; bod
 // The first version of this test rebuilt the merge expression inline and
 // asserted on its own object, so it passed with the fix reverted: it proved
 // that spreading two objects works, not that this screen honours the host.
-export function PostureHero({ mode, edition, decisions, sessions, guardedAgents, hostHeadline }: { mode: GuardrailMode; edition?: "community" | "enterprise"; decisions: number; sessions: number; guardedAgents?: number; hostHeadline?: { label: string; title: string; body: string } }) {
+export function PostureHero({ mode, edition, decisions, sessions, guardedAgents, hostHeadline, headingLevel = "h1" }: { mode: GuardrailMode; edition?: "community" | "enterprise"; decisions: number; sessions: number; guardedAgents?: number; hostHeadline?: { label: string; title: string; body: string }; /** `h2` where the page already has its `h1` (the lanes layout). */ headingLevel?: "h1" | "h2" }) {
+  const Heading = headingLevel;
   // The `unknown` copy is written for Community: "this version records guardrail
   // decisions" describes the free hook, and the decision count is the free
   // product's headline. On an Enterprise host that hook is often not installed
@@ -514,9 +780,9 @@ export function PostureHero({ mode, edition, decisions, sessions, guardedAgents,
             )}
           </div>
           <p className="mt-5 text-xs font-semibold uppercase tracking-[0.16em] text-cyan-700">{editionLabel(edition)}</p>
-          <h1 id="posture-title" className="mt-2 max-w-3xl text-2xl font-semibold tracking-tight text-slate-950 sm:text-3xl">
+          <Heading id="posture-title" className="mt-2 max-w-3xl text-2xl font-semibold tracking-tight text-slate-950 sm:text-3xl">
             {posture.title}
-          </h1>
+          </Heading>
           <p className="mt-3 max-w-2xl text-sm leading-6 text-slate-600 sm:text-base">{posture.body}</p>
           {/* These three lines were a permanent strip across the hero. They are
               true, and they are the same three sentences on every load of every
@@ -715,6 +981,26 @@ export function RecentActivity({ items, edition, onOpen, onOpenCase }: {
   );
 }
 
+/**
+ * The program the kernel refused to start during this decision, when the host
+ * sent one (`kernel_stopped`). Anything that is not a short printable path or
+ * name is read as not sent: the chip must not print a value it cannot vouch
+ * for.
+ */
+export function kernelStopped(item: Pick<DecisionSummary, "kernel_stopped">): string | undefined {
+  const value = item.kernel_stopped;
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  if (trimmed.length === 0 || trimmed.length > 512 || /[\u0000-\u001f\u007f]/.test(trimmed)) return undefined;
+  return trimmed;
+}
+
+/** "The kernel stopped sudo": the program's own name, not its path. */
+export function kernelStoppedLabel(program: string): string {
+  const name = program.split("/").filter((part) => part.length > 0).pop() ?? program;
+  return `The kernel stopped ${name}`;
+}
+
 function RecentActivityEntry({ item, clickable }: { item: DecisionSummary; clickable: boolean }) {
   const recommendation = item.recommendation ?? "unknown";
   const when = formatTimestamp(item.recorded_at_ms);
@@ -727,6 +1013,11 @@ function RecentActivityEntry({ item, clickable }: { item: DecisionSummary; click
         <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
           <DecidedBy by={item.decided_by} />
           <Outcome value={item.outcome ?? "unknown"} />
+          {kernelStopped(item) ? (
+            <span className="max-w-full break-words rounded-md border border-rose-200 bg-rose-50 px-2 py-0.5 text-[11px] font-semibold text-rose-800 [overflow-wrap:anywhere]">
+              {kernelStoppedLabel(kernelStopped(item) as string)}
+            </span>
+          ) : null}
           {item.categories.slice(0, 2).map((category) => (
             <span key={category} className="max-w-full truncate rounded-full bg-slate-100 px-2 py-0.5 text-[11px] font-medium text-slate-600">
               {humanizeToken(category)}

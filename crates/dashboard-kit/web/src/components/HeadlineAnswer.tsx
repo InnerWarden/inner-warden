@@ -40,7 +40,7 @@ export type HeadlineInput = {
    * they could find was the Cases status: a case status, not a guardrail
    * verdict.
    */
-  reviewListedIn: "activity" | "cases" | "hidden";
+  reviewListedIn: "activity" | "cases" | "lane" | "hidden";
   /**
    * Whether the Recent activity section on the same page lists decisions with
    * their verdicts: true only when the host sent `recent_decisions` and it is
@@ -110,6 +110,9 @@ export type Headline = {
  *   screen's own "Needs review" is a case status, not a guardrail verdict,
  *   and must not be named here: that is the collision this sentence exists to
  *   avoid.
+ * - `lane` (Enterprise on a host that files cases into lanes): the button
+ *   opens the agent's lane directly, so the sentence names the lane rather
+ *   than a filter the reader would have to set by hand.
  * - `hidden`: no screen lists them all, and the sentence says so rather than
  *   naming one. It points at Recent activity only when that section really
  *   lists decisions with their verdicts (`recentShowsDecisions`).
@@ -119,6 +122,10 @@ export function reviewRemedy(
   recentShowsDecisions: boolean,
 ): string {
   if (where === "activity") return "Open Activity and filter by Needs review.";
+  if (where === "lane") {
+    return "These are the agent guardrail's verdicts, not host cases. View all in Cases opens them under "
+      + "What your AI agent did.";
+  }
   if (where === "cases") {
     return "These are the agent guardrail's verdicts, not host cases. Use View all in Cases and set "
       + "Capability to \"The agent guardrail\" to find them in their agent sessions.";
