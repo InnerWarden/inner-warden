@@ -582,6 +582,25 @@ export function OverviewRecord({
 }
 
 /**
+ * Where the Decision record's "view everything" button goes. The record
+ * counts the agent's screened commands, so on a host that files cases into
+ * lanes it opens the agent's lane, spelled as the server spells it, over all
+ * time: the record's counters are not windowed.
+ */
+export function openDecisionRecord(
+  cta: ReturnType<typeof decisionRecordCta>,
+  open: {
+    onOpenActivity: (target?: ActivityLink) => void;
+    onOpenCase?: (caseId?: string, lane?: CaseLane) => void;
+    onOpenLane?: (lane: CaseLane, options: LaneOpenOptions) => void;
+  },
+): void {
+  if (cta.kind === "cases") open.onOpenCase?.();
+  else if (cta.kind === "lane") open.onOpenLane?.("agent_actions", { window: "all" });
+  else if (cta.kind === "activity") open.onOpenActivity();
+}
+
+/**
  * The Decision record's headline, its "view everything" button and, with
  * `tiles`, the counters under it and what the guardrail actually did. The
  * layout without lanes always shows the tiles; the lanes layout shows them in
@@ -603,11 +622,7 @@ function DecisionRecordSection({
   onOpenLane?: (lane: CaseLane, options: LaneOpenOptions) => void;
 }) {
   const { cta, summary, denyVerdicts, reviewVerdicts, allowVerdicts } = record;
-  const openAll = () => {
-    if (cta.kind === "cases") onOpenCase?.();
-    else if (cta.kind === "lane") onOpenLane?.("agent", { window: "all" });
-    else onOpenActivity();
-  };
+  const openAll = () => openDecisionRecord(cta, { onOpenActivity, onOpenCase, onOpenLane });
   return (
     <>
       <section aria-labelledby="decision-summary-title">

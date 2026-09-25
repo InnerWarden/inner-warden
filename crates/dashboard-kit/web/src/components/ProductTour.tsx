@@ -148,7 +148,7 @@ export const PAID_SCREEN_TOUR_STEPS: readonly TourStep[] = [
   {
     key: "overview-lanes",
     title: "Three questions",
-    body: "What people sent your AI agent, what your agent tried to do, and what came at this server from the internet. Each card opens the cases behind it.",
+    body: "What people sent your AI agent, what your agent tried to do, and what came at this server from the internet. A card with a link opens the cases behind it.",
     route: "overview",
     selectors: ['[data-tour="overview-lanes"]', 'section[aria-labelledby="lanes-title"]'],
     optional: true,

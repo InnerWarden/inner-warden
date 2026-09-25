@@ -163,31 +163,45 @@ export type Overview = {
   headline?: { label: string; title: string; body: string };
   /**
    * The Overview's three questions, answered by the host: messages to the AI
-   * agent (`prompt`), what the agent did (`agent`), and attacks on the server
-   * (`host`). One card each; see `lanes.ts`.
+   * agent (`agent_messages`), what the agent did (`agent_actions`), and
+   * attacks on the server (`server_attacks`). One card each; see `lanes.ts`.
    *
-   * ABSENT, never empty, on a host that does not answer them, and the screen
-   * then renders exactly as it did before lanes existed. A host may send only
-   * the lanes it has data for. Each lane is validated on its own
-   * (`overviewLaneCards`), and one the screen cannot show honestly is
-   * dropped, not completed.
+   * ABSENT, never empty, on a host that does not answer them (Community,
+   * which has no host store, and every paid host older than the field), and
+   * the screen then renders exactly as it did before lanes existed: absent is
+   * not zero. Each lane is validated on its own (`overviewLaneCards`), and one
+   * the screen cannot show honestly is dropped, not completed.
    */
-  lanes?: Partial<Record<"prompt" | "agent" | "host", OverviewLaneWire>>;
+  lanes?: Partial<Record<"agent_messages" | "agent_actions" | "server_attacks", OverviewLaneWire>>;
 };
 
 /** One lane as the host sends it. Read through `parseLaneCard`, never directly. */
 export type OverviewLaneWire = {
+  /** The lane this card is about; the same value as the key it is sent under. */
+  lane?: "agent_messages" | "agent_actions" | "server_attacks";
   /** `no_source`: nothing on this host feeds the lane, so it has no number. */
   availability: "available" | "no_source";
-  /** The span `count` covers, one of the Cases windows. Required when available. */
+  /**
+   * The span `count` covers, as the `window` the Cases list takes: `7d` for
+   * the two agent lanes, `24h` for the server's.
+   */
   window?: "1h" | "24h" | "7d" | "30d" | "all";
-  /** Cases in the lane in that window. Required when available; ignored otherwise. */
+  /**
+   * What `count_of` names, in that window. NOT a count of the cases the lane
+   * lists: the agent's lane counts the COMMANDS it tried, and its Cases lane
+   * shows one row per session. Absent when `no_source`: absent is not zero.
+   */
   count?: number;
-  /** The host's own sentence about the lane, or how to turn its source on. */
+  /** The noun the card prints after `count`. */
+  count_of?: "messages" | "commands" | "findings";
+  /** The host's own sentence about the lane, or what is not being read yet. */
   sentence: string;
-  /** Cases in the lane waiting on a person. */
-  waiting?: number;
-  /** The newest case in the lane. */
+  /**
+   * Cases of the lane in the waiting queue, in `window`. `null` for the
+   * server's lane, whose sentence carries today's waiting figures.
+   */
+  waiting?: number | null;
+  /** The newest case in the lane, titled as the Cases list titles it. */
   latest?: { title: string; at: string; case_id?: string | null } | null;
 };
 export type Node = { id: string; kind: string; label: string; attrs?: Record<string, string> };

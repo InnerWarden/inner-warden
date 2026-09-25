@@ -10,10 +10,11 @@ import type { CaseListWindow } from "./api/cases";
  * server, and nothing at all about the messages people sent the agent. The
  * lanes are those three questions:
  *
- *  - `prompt`: messages to the AI agent, including anyone trying to talk it
- *    into something, and who stopped each one;
- *  - `agent`: what the agent tried to run, and what InnerWarden decided;
- *  - `host`: attacks on the server itself.
+ *  - `agent_messages`: messages to the AI agent, including anyone trying to
+ *    talk it into something, and who stopped each one;
+ *  - `agent_actions`: what the agent tried to run, and what InnerWarden
+ *    decided;
+ *  - `server_attacks`: attacks on the server itself.
  *
  * The HOST files each case into a lane and writes each lane's sentence, from
  * the same facts it counts (the `HeadlineAnswer` rule: the screen renders the
@@ -35,21 +36,23 @@ export type LaneCopy = {
 };
 
 export const LANE_COPY: Record<CaseLane, LaneCopy> = {
-  prompt: {
+  agent_messages: {
     name: "Messages to your AI agent",
     blurb: "Someone trying to talk your agent into something, and who stopped it.",
     link: "See the messages",
     intro:
-      "Messages sent to your AI agent. For each one that tried to make it do something unsafe, who stopped it: the agent itself, its AI provider's filter, or InnerWarden.",
+      "Messages sent to your AI agent, one case each. For each one that tried to make it do something unsafe, who stopped it: the agent itself, its AI provider's filter, or InnerWarden.",
   },
-  agent: {
+  // The card counts COMMANDS and this lane lists one case per SESSION, so
+  // neither the link nor the intro may promise one row per command.
+  agent_actions: {
     name: "What your AI agent did",
     blurb: "Every command your agent tried, and what InnerWarden decided.",
-    link: "See every command",
+    link: "See the sessions",
     intro:
-      "Every command your AI agent tried to run, what InnerWarden decided, and whether the kernel had to step in.",
+      "One case for each session of your AI agent: every command it tried to run in it, what InnerWarden decided, and whether the kernel had to step in.",
   },
-  host: {
+  server_attacks: {
     name: "Attacks on this server",
     blurb: "Attacks from the internet, the honeypot, and what the kernel caught.",
     link: "See the attacks",
@@ -77,6 +80,32 @@ export const LANE_WINDOW_PHRASE: Record<CaseListWindow, string> = {
 
 const WINDOWS: readonly CaseListWindow[] = ["1h", "24h", "7d", "30d", "all"];
 
+/**
+ * What a card's number counts, as the host names it (`count_of`): the noun
+ * printed after the number. The agent's lane counts COMMANDS while its Cases
+ * lane lists sessions, so a bare number there would read as a count of the
+ * cases the link opens, and it is not one.
+ */
+export const LANE_COUNT_OF = ["messages", "commands", "findings"] as const;
+export type LaneCountOf = (typeof LANE_COUNT_OF)[number];
+
+const COUNT_NOUNS: Record<LaneCountOf, { one: string; many: string }> = {
+  messages: { one: "message", many: "messages" },
+  commands: { one: "command", many: "commands" },
+  findings: { one: "finding", many: "findings" },
+};
+
+/**
+ * The noun after a card's number ("1 command", "8 commands"), or nothing when
+ * the host named no unit this bundle knows: the number is then printed on its
+ * own, never with a unit guessed for it.
+ */
+export function laneCountNoun(countOf: LaneCountOf | undefined, count: number): string | undefined {
+  if (countOf === undefined) return undefined;
+  const nouns = COUNT_NOUNS[countOf];
+  return count === 1 ? nouns.one : nouns.many;
+}
+
 /** The newest case in a lane, as the host named it. */
 export type LaneLatest = {
   title: string;
@@ -99,9 +128,15 @@ export type LaneCard =
       lane: CaseLane;
       state: "available";
       count: number;
+      /** What `count` counts. Absent when the host named no unit this bundle knows. */
+      countOf?: LaneCountOf;
       window: CaseListWindow;
       sentence: string;
-      /** Cases in the lane waiting on a person. Absent when not sent. */
+      /**
+       * Cases of the lane in the waiting queue, counted in `window`. Absent
+       * when the host sent none: it sends `null` for the server's lane,
+       * whose own sentence says what waits there today.
+       */
       waiting?: number;
       latest?: LaneLatest;
     }
@@ -146,11 +181,14 @@ function latestOf(value: unknown): LaneLatest | undefined {
  * is dropped rather than completed by guesswork. The extras are optional and
  * dropped one by one: a malformed `latest` or `waiting` costs the card that
  * line, never the card. An availability this bundle does not know is dropped
- * too, because it cannot know what the host meant by it.
+ * too, because it cannot know what the host meant by it, and so is a card
+ * that names a different lane from the key it was sent under: one of the two
+ * is wrong, and the card cannot say which.
  */
 export function parseLaneCard(lane: CaseLane, value: unknown): LaneCard | undefined {
   const item = record(value);
   if (item === undefined) return undefined;
+  if (item.lane !== undefined && item.lane !== lane) return undefined;
   const sentence = text(item.sentence, SENTENCE_MAX);
   if (sentence === undefined) return undefined;
   if (item.availability === "no_source") return { lane, state: "no_source", sentence };
@@ -159,6 +197,8 @@ export function parseLaneCard(lane: CaseLane, value: unknown): LaneCard | undefi
   const window = WINDOWS.find((candidate) => candidate === item.window);
   if (count === undefined || window === undefined) return undefined;
   const card: LaneCard = { lane, state: "available", count, window, sentence };
+  const countOf = LANE_COUNT_OF.find((candidate) => candidate === item.count_of);
+  if (countOf !== undefined) card.countOf = countOf;
   const waiting = wholeCount(item.waiting);
   if (waiting !== undefined) card.waiting = waiting;
   const latest = latestOf(item.latest);
@@ -173,8 +213,9 @@ export function parseLaneCard(lane: CaseLane, value: unknown): LaneCard | undefi
  * ABSENT IS NOT EMPTY, the rule `host_attention` already follows. A host that
  * sends no `lanes` (every Community host today, and every paid host older than
  * the field) gets `undefined`, and the Overview renders exactly as it did
- * before lanes existed. A host that sends only some lanes gets only those
- * cards: a Community host with agent records and nothing else shows one.
+ * before lanes existed. The host sends all three when it sends any; a lane
+ * that is missing or cannot be shown honestly is not drawn, and the others
+ * still are.
  */
 export function overviewLaneCards(lanes: unknown): LaneCard[] | undefined {
   const item = record(lanes);
@@ -201,16 +242,17 @@ export function laneParameter(choice: CaseLaneChoice): CaseLane | "" {
 /**
  * The lane the Cases screen opens on when the address names none.
  *
- * The lane this viewer last used, when there is one. Otherwise the agent's
- * lane when this host has agent records, because that is the question most
- * readers arrive with, and the server's lane when it has none, so a host with
- * no agent never opens on an empty tab. When the counts are not known yet the
- * agent's lane is the guess, and the first answer corrects it.
+ * The lane this viewer last used, when there is one. Otherwise what the
+ * agent did when this host has records of it, because that is the question
+ * most readers arrive with, and the attacks on the server when it has none,
+ * so a host with no agent never opens on an empty tab. When the counts are
+ * not known yet the agent's lane is the guess, and the first answer corrects
+ * it.
  */
 export function defaultCaseLane(remembered: CaseLaneChoice | undefined, counts: CaseLaneCounts | undefined): CaseLaneChoice {
   if (remembered !== undefined) return remembered;
-  if (counts === undefined) return "agent";
-  return (counts.agent ?? 0) > 0 ? "agent" : "host";
+  if (counts === undefined) return "agent_actions";
+  return (counts.agent_actions ?? 0) > 0 ? "agent_actions" : "server_attacks";
 }
 
 export const CASE_LANE_STORAGE_KEY = "innerwarden.cases-lane";

@@ -1,5 +1,5 @@
 import type { CaseLane, CaseListWindow } from "../api/cases";
-import { LANE_COPY, LANE_WINDOW_PHRASE, type LaneCard } from "../lanes";
+import { LANE_COPY, LANE_WINDOW_PHRASE, laneCountNoun, type LaneCard } from "../lanes";
 import { formatAbsolute, formatTimestamp } from "../presentation";
 import { gridColumnsClass, gridSpanClass, joinClasses } from "./cardGrid";
 
@@ -22,13 +22,14 @@ export function laneLink(
   canOpenLane: boolean,
 ): "cases" | "activity" | "none" {
   if (canOpenLane) return "cases";
-  if (edition === "community" && lane === "agent") return "activity";
+  if (edition === "community" && lane === "agent_actions") return "activity";
   return "none";
 }
 
 /**
- * The three questions, one card each: a number, the span it covers, the host's
- * sentence, the newest case and the way into the cases behind it.
+ * The three questions, one card each: a number with what it counts, the span
+ * it covers, the host's sentence, the newest case and the way into the cases
+ * behind it.
  *
  * Every word a reader sees about what HAPPENED is the host's (`sentence`,
  * `latest.title`); the card adds only what the lane is and where it leads.
@@ -51,7 +52,10 @@ export function LaneCards({
   onOpenCase?: (caseId: string, lane: CaseLane) => void;
   onOpenActivity?: () => void;
 }) {
-  const leadsSomewhere = cards.some(
+  // The promise is about EVERY card, so it is made only when every card keeps
+  // it: a card with no source, or with nowhere to open, has no link, and the
+  // sentence above it must not say it has one.
+  const everyCardLeads = cards.length > 0 && cards.every(
     (card) => card.state === "available" && laneLink(card.lane, edition, onOpenLane !== undefined) !== "none",
   );
   return (
@@ -60,7 +64,7 @@ export function LaneCards({
         What is happening here
       </h1>
       <p className="mt-2 max-w-3xl text-sm leading-6 text-slate-600">
-        {leadsSomewhere
+        {everyCardLeads
           ? "Answered from this host's own records. Each card opens what is behind it."
           : "Answered from this host's own records."}
       </p>
@@ -101,6 +105,7 @@ function LaneCardView({
   const available = card.state === "available";
   const waiting = available ? card.waiting ?? 0 : 0;
   const latest = available ? card.latest : undefined;
+  const noun = available ? laneCountNoun(card.countOf, card.count) : undefined;
   const open = () => {
     if (link === "cases" && available) onOpenLane?.(card.lane, { window: card.window });
     else if (link === "activity") onOpenActivity?.();
@@ -117,7 +122,12 @@ function LaneCardView({
       {available ? (
         <p className="mt-4 flex flex-wrap items-baseline gap-x-2">
           <span data-lane-count className="text-3xl font-semibold tabular-nums text-slate-950">{card.count.toLocaleString()}</span>
-          <span className="text-xs text-slate-500">{LANE_WINDOW_PHRASE[card.window]}</span>
+          {/* A real space, so the number and its unit are one phrase to a
+              screen reader and in copied text; the flex gap draws it. */}
+          {" "}
+          <span className="text-xs text-slate-500">
+            {noun === undefined ? LANE_WINDOW_PHRASE[card.window] : `${noun} ${LANE_WINDOW_PHRASE[card.window]}`}
+          </span>
         </p>
       ) : null}
       <p className="mt-3 break-words text-sm leading-6 text-slate-700 [overflow-wrap:anywhere]">{card.sentence}</p>
@@ -145,9 +155,12 @@ function LaneCardView({
         <div className="mt-auto flex flex-wrap items-center gap-x-4 gap-y-2 pt-4">
           {waiting > 0 ? (
             link === "cases" ? (
+              // The host counts what is waiting inside the card's own window,
+              // so the list it opens is that window too: the number on the
+              // chip and the rows behind it describe the same span.
               <button
                 type="button"
-                onClick={() => onOpenLane?.(card.lane, { window: "all", status: "waiting" })}
+                onClick={() => available && onOpenLane?.(card.lane, { window: card.window, status: "waiting" })}
                 className="rounded-full border border-amber-200 bg-amber-50 px-3 py-1 text-xs font-semibold text-amber-900 hover:border-amber-300 hover:bg-amber-100"
               >
                 {waiting.toLocaleString()} waiting on you <span aria-hidden="true">→</span>

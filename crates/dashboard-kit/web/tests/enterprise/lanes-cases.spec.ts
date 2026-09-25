@@ -8,25 +8,33 @@ const fixture = (name: string) => JSON.parse(readFileSync(
 
 // These journeys need the paid Cases screen, which is not in this repository:
 // they run in the paid bundle after composition, once its Cases screen draws
-// the kit's `CaseLaneTabs` from the list's `lane_counts`.
+// the kit's `CaseLaneTabs` wherever the list answer's `lane_filter` says the
+// lane was served, with the badges from the last `lane_counts` it received.
+//
+// The Overview, every list page and both refusals were written by the paid
+// server's own tests, not by hand: one message to the agent, one agent denial
+// and three host findings.
 const casesBootstrap = fixture("cases-bootstrap");
 const lanesOverview = fixture("overview-lanes");
-const lanesPage = fixture("cases-page-lanes");
 const pageOne = fixture("cases-page-1");
 const caseDetail = fixture("case-agent-host-001");
-
-const UNKNOWN_PARAMETER = {
-  status: 400,
-  json: { code: "enterprise_cases_query_invalid", message: "The cases query contains an unknown or malformed parameter.", retryable: false },
+const refusals = fixture("cases-lanes-refusals");
+const lanePages: Record<string, Record<string, unknown>> = {
+  "": fixture("cases-lanes-everything"),
+  agent_messages: fixture("cases-lanes-agent-messages"),
+  agent_actions: fixture("cases-lanes-agent-actions"),
+  server_attacks: fixture("cases-lanes-server-attacks"),
 };
+
+const UNKNOWN_PARAMETER = { status: 400, json: refusals.refused_include_name.body };
+const UNKNOWN_LANE = { status: 400, json: refusals.refused_lane_value.body };
 
 const includes = (url: URL) => (url.searchParams.get("include") ?? "").split(",").filter((name) => name.length > 0);
 
 /**
- * A host that files cases into lanes. Every list answer carries the lane
- * counts when asked, and the rows it lists do not depend on the lane: these
- * journeys are about what the screen ASKS for and what it shows around the
- * list, not about the host's filing.
+ * A host that files cases into lanes, answering as the real one does: each
+ * lane's own page, the counts and the row total only when named, and any
+ * other lane refused as a filter.
  */
 async function lanesHost(page: Page, requests: URL[]) {
   await page.route("**/api/dashboard/v1/bootstrap", (route) => route.fulfill({ json: casesBootstrap }));
@@ -34,8 +42,18 @@ async function lanesHost(page: Page, requests: URL[]) {
   await page.route("**/api/dashboard/v1/cases?*", (route) => {
     const url = new URL(route.request().url());
     requests.push(url);
-    const { lane_counts: counts, ...page } = lanesPage;
-    return route.fulfill({ json: includes(url).includes("lane_counts") ? { ...page, lane_counts: counts } : page });
+    const lanePage = lanePages[url.searchParams.get("lane") ?? ""];
+    if (lanePage === undefined) return route.fulfill(UNKNOWN_LANE);
+    const names = includes(url);
+    if (names.some((name) => !["rows_in_window", "lane_counts", "item_lane"].includes(name))) return route.fulfill(UNKNOWN_PARAMETER);
+    const { lane_counts: counts, rows_in_window: rows, ...rest } = lanePage;
+    return route.fulfill({
+      json: {
+        ...rest,
+        ...(names.includes("rows_in_window") ? { rows_in_window: rows } : {}),
+        ...(names.includes("lane_counts") ? { lane_counts: counts } : {}),
+      },
+    });
   });
   await page.route(/\/api\/dashboard\/v1\/cases\/[^/?]+(\?.*)?$/, (route) => route.fulfill({ json: caseDetail }));
 }
@@ -58,45 +76,48 @@ test("a lane card opens Cases on its lane, with its tab chosen", async ({ page }
   await lanesHost(page, requests);
   await page.goto("/");
 
-  const asked = listRequest(page, "agent");
-  await page.getByRole("region", { name: "What your AI agent did" }).getByRole("button", { name: "See every command" }).click();
+  const asked = listRequest(page, "agent_actions");
+  await page.getByRole("region", { name: "What your AI agent did" }).getByRole("button", { name: "See the sessions" }).click();
   const url = new URL((await asked).url());
-  expect(url.searchParams.get("window")).toBe("24h");
+  expect(url.searchParams.get("window")).toBe("7d");
   expect(includes(url)).toContain("lane_counts");
 
   await expect(page).toHaveURL(/[?&]view=cases(?:&|$)/);
-  await expect(page).toHaveURL(/[?&]lane=agent(?:&|$)/);
-  await expect(page).toHaveURL(/[?&]window=24h(?:&|$)/);
+  await expect(page).toHaveURL(/[?&]lane=agent_actions(?:&|$)/);
+  await expect(page).toHaveURL(/[?&]window=7d(?:&|$)/);
   const tabs = page.getByRole("tablist", { name: "Case lanes" });
   await expect(tabs.getByRole("tab", { name: /What your AI agent did/ })).toHaveAttribute("aria-selected", "true");
   // Each tab carries the host's own count for its lane.
-  await expect(tabs.getByRole("tab", { name: /Attacks on this server, 823 cases/ })).toBeVisible();
-  await expect(tabs.getByRole("tab", { name: /Messages to your AI agent, 3 cases/ })).toBeVisible();
-  await expect(page.getByText("Every command your AI agent tried to run", { exact: false })).toBeVisible();
+  await expect(tabs.getByRole("tab", { name: /Attacks on this server, 3 cases/ })).toBeVisible();
+  await expect(tabs.getByRole("tab", { name: /Messages to your AI agent, 1 case/ })).toBeVisible();
+  await expect(page.getByText("One case for each session of your AI agent", { exact: false })).toBeVisible();
+  await expect(page.getByText("Visitor 28eb7f9c asked your AI agent to download and run a script", { exact: false })).toBeVisible();
 });
 
 /** A tab is a filter like any other: it is asked of the host and kept in the address. */
 test("choosing a tab asks the host for that lane and keeps it in the address", async ({ page }) => {
   const requests: URL[] = [];
   await lanesHost(page, requests);
-  await page.goto("/?view=cases&lane=agent&window=24h");
+  // The address the server's own Overview links to.
+  await page.goto("/?view=cases&lane=agent_actions&window=7d");
   const tabs = page.getByRole("tablist", { name: "Case lanes" });
   await expect(tabs.getByRole("tab", { name: /What your AI agent did/ })).toHaveAttribute("aria-selected", "true");
 
-  const asked = listRequest(page, "host");
+  const asked = listRequest(page, "server_attacks");
   await tabs.getByRole("tab", { name: /Attacks on this server/ }).click();
   const url = new URL((await asked).url());
-  expect(url.searchParams.get("window")).toBe("24h");
-  await expect(page).toHaveURL(/[?&]lane=host(?:&|$)/);
+  expect(url.searchParams.get("window")).toBe("7d");
+  await expect(page).toHaveURL(/[?&]lane=server_attacks(?:&|$)/);
   await expect(tabs.getByRole("tab", { name: /Attacks on this server/ })).toHaveAttribute("aria-selected", "true");
+  await expect(page.getByText("Possible SSH brute force from 203.0.0.1", { exact: false })).toBeVisible();
 
   // The arrow keys move along the row, as tabs do.
   await tabs.getByRole("tab", { name: /Attacks on this server/ }).focus();
-  const left = listRequest(page, "agent");
+  const left = listRequest(page, "agent_actions");
   await page.keyboard.press("ArrowLeft");
   await left;
   await expect(tabs.getByRole("tab", { name: /What your AI agent did/ })).toBeFocused();
-  await expect(page).toHaveURL(/[?&]lane=agent(?:&|$)/);
+  await expect(page).toHaveURL(/[?&]lane=agent_actions(?:&|$)/);
 });
 
 /**
@@ -107,16 +128,16 @@ test("Cases opens the lane this viewer last used, and the agent's lane the first
   const requests: URL[] = [];
   await lanesHost(page, requests);
 
-  const first = listRequest(page, "agent");
+  const first = listRequest(page, "agent_actions");
   await page.goto("/?view=cases");
   await first;
   await expect(page.getByRole("tab", { name: /What your AI agent did/ })).toHaveAttribute("aria-selected", "true");
 
-  const chosen = listRequest(page, "prompt");
+  const chosen = listRequest(page, "agent_messages");
   await page.getByRole("tab", { name: /Messages to your AI agent/ }).click();
   await chosen;
 
-  const again = listRequest(page, "prompt");
+  const again = listRequest(page, "agent_messages");
   await page.getByRole("button", { name: "Overview", exact: true }).click();
   await page.getByRole("button", { name: "Cases", exact: true }).click();
   await again;
@@ -131,30 +152,34 @@ test("Cases opens the lane this viewer last used, and the agent's lane the first
 test("every case is offered in the technical view, as a request with no lane", async ({ page }) => {
   const requests: URL[] = [];
   await lanesHost(page, requests);
-  await page.goto("/?view=cases&lane=host");
+  await page.goto("/?view=cases&lane=server_attacks");
   const tabs = page.getByRole("tablist", { name: "Case lanes" });
-  await expect(tabs.getByRole("tab", { name: "Everything" })).toHaveCount(0);
+  await expect(tabs.getByRole("tab", { name: /^Everything/ })).toHaveCount(0);
 
   await page.getByLabel("Show technical detail").check();
   const everything = listRequest(page, null, (url) => includes(url).includes("lane_counts"));
-  await tabs.getByRole("tab", { name: "Everything" }).click();
+  // Its badge is the three lanes and the cases in none, added up.
+  await tabs.getByRole("tab", { name: "Everything, 7 cases" }).click();
   await everything;
   await expect(page).toHaveURL(/[?&]lane=everything(?:&|$)/);
   await page.getByLabel("Show technical detail").uncheck();
 });
 
-/** What is waiting on a person opens inside the lane it was counted in. */
-test("the waiting count on a card opens what is waiting in that lane", async ({ page }) => {
+/**
+ * What is waiting on a person opens inside the lane it was counted in, over
+ * the window it was counted in, so the chip and the list agree.
+ */
+test("the waiting count on a card opens what is waiting in that lane and window", async ({ page }) => {
   const requests: URL[] = [];
   await lanesHost(page, requests);
   await page.goto("/");
 
-  const asked = listRequest(page, "host", (url) => url.searchParams.get("status") === "waiting");
-  await page.getByRole("region", { name: "Attacks on this server" }).getByRole("button", { name: "32 waiting on you" }).click();
+  const asked = listRequest(page, "agent_messages", (url) => url.searchParams.get("status") === "waiting");
+  await page.getByRole("region", { name: "Messages to your AI agent" }).getByRole("button", { name: "1 waiting on you" }).click();
   const url = new URL((await asked).url());
-  expect(url.searchParams.get("window")).toBe("all");
+  expect(url.searchParams.get("window")).toBe("7d");
   await expect(page).toHaveURL(/[?&]status=waiting(?:&|$)/);
-  await expect(page.getByRole("tab", { name: /Attacks on this server/ })).toHaveAttribute("aria-selected", "true");
+  await expect(page.getByRole("tab", { name: /Messages to your AI agent/ })).toHaveAttribute("aria-selected", "true");
 });
 
 test("the newest case on a card opens inside its lane", async ({ page }) => {
@@ -162,13 +187,14 @@ test("the newest case on a card opens inside its lane", async ({ page }) => {
   await lanesHost(page, requests);
   await page.goto("/");
 
-  const asked = listRequest(page, "agent");
+  const asked = listRequest(page, "agent_actions");
   await page.getByRole("region", { name: "What your AI agent did" })
-    .getByRole("button", { name: /AI agent session wren-visitor-28eb7f9c/ })
+    .getByRole("button", { name: /Visitor 28eb7f9c asked your AI agent to run a command as root/ })
     .click();
   await asked;
-  await expect(page).toHaveURL(/[?&]case=case%3Acommunity-session%3Alane-agent-1(?:&|$)/);
-  await expect(page).toHaveURL(/[?&]lane=agent(?:&|$)/);
+  const caseId = lanesOverview.lanes.agent_actions.latest.case_id as string;
+  expect(new URL(page.url()).searchParams.get("case")).toBe(caseId);
+  await expect(page).toHaveURL(/[?&]lane=agent_actions(?:&|$)/);
 });
 
 /**
@@ -188,7 +214,7 @@ test("a server that files no cases into lanes lists them all, with no tabs", asy
   });
   await page.route(/\/api\/dashboard\/v1\/cases\/[^/?]+(\?.*)?$/, (route) => route.fulfill({ json: caseDetail }));
 
-  await page.goto("/?view=cases&lane=agent");
+  await page.goto("/?view=cases&lane=agent_actions");
   await expect(page.getByRole("heading", { name: "Case results" })).toBeVisible();
   await expect(page.getByRole("tablist", { name: "Case lanes" })).toHaveCount(0);
   await expect(page.getByText("Agent attempted to read a production signing key", { exact: false })).toBeVisible();

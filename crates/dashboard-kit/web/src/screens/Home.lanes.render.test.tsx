@@ -6,8 +6,13 @@ import { setTechnicalDetail } from "../components/TechnicalDetail";
 import { OverviewScreen } from "./Home";
 import communityOverview from "../../tests/fixtures/community/overview.json";
 import hostWaitingOverview from "../../tests/fixtures/enterprise/overview-host-waiting.json";
-import lanesOverview from "../../tests/fixtures/enterprise/overview-lanes.json";
-import partialLanesOverview from "../../tests/fixtures/enterprise/overview-lanes-partial.json";
+// Both written by the paid server's own tests, not by hand. The server's
+// test builds the lanes without the host's waiting line, so the page below
+// adds the one an older paid host sent, to show both on one screen.
+import serverLanesOverview from "../../tests/fixtures/enterprise/overview-lanes.json";
+import noSourceOverview from "../../tests/fixtures/enterprise/overview-lanes-no-source.json";
+
+const lanesOverview = { ...serverLanesOverview, host_attention: hostWaitingOverview.host_attention };
 
 /**
  * The Overview, RENDERED from a payload handed in, in both layouts.
@@ -84,7 +89,7 @@ describe("an Overview whose host answers the three questions", () => {
     expect(html.match(/data-lane="/g)).toHaveLength(3);
     expect(html.match(/<h1/g)).toHaveLength(1);
     expect(html).toContain('<h1 id="lanes-title"');
-    expect(html.indexOf('data-lane="prompt"')).toBeLessThan(html.indexOf("host-attention-title"));
+    expect(html.indexOf('data-lane="agent_messages"')).toBeLessThan(html.indexOf("host-attention-title"));
   });
 
   /**
@@ -115,7 +120,7 @@ describe("an Overview whose host answers the three questions", () => {
     expect(html).toContain("Risk signals");
     expect(html).toContain("local-agents-title");
     // The cards stay on top in both views.
-    expect(html.indexOf('data-lane="prompt"')).toBeLessThan(html.indexOf("posture-title"));
+    expect(html.indexOf('data-lane="agent_messages"')).toBeLessThan(html.indexOf("posture-title"));
   });
 
   /**
@@ -124,7 +129,7 @@ describe("an Overview whose host answers the three questions", () => {
    */
   it("keeps what is waiting and what just happened in the plain view", () => {
     const html = render(lanesOverview, "enterprise");
-    expect(html).toContain("1 address is waiting on you");
+    expect(html).toContain("8 addresses are waiting on you");
     expect(html).toContain("Recent activity");
     expect(html).toContain("The kernel stopped sudo");
   });
@@ -158,11 +163,32 @@ describe("an Overview whose host answers the three questions", () => {
     expect(html).not.toContain("set Capability");
   });
 
-  it("draws only the lanes the host sent, and a lane with no source without a number", () => {
-    const html = render(partialLanesOverview, "enterprise");
+  it("draws a lane with no source without a number, beside the lanes that have one", () => {
+    const html = render(noSourceOverview, "enterprise");
+    expect(html.match(/data-lane="/g)).toHaveLength(3);
+    expect(html.match(/data-lane-state="no_source"/g)).toHaveLength(1);
+    expect(html.match(/data-lane-count/g)).toHaveLength(2);
+  });
+
+  it("draws only the lanes it can read", () => {
+    const { server_attacks: _dropped, ...twoLanes } = serverLanesOverview.lanes;
+    const html = render({ ...lanesOverview, lanes: twoLanes }, "enterprise");
     expect(html.match(/data-lane="/g)).toHaveLength(2);
-    expect(html).toContain('data-lane-state="no_source"');
-    expect(html).not.toContain('data-lane="host"');
+    expect(html).not.toContain('data-lane="server_attacks"');
+  });
+
+  /**
+   * THE DEFECT THIS PINS: the kit read lanes named `prompt`, `agent` and
+   * `host`, and the server sends `agent_messages`, `agent_actions` and
+   * `server_attacks`, so on a real host the Overview never took the lanes
+   * layout at all. This renders the server's own payload.
+   *
+   * FAILS ON REVERT: read the old names and this page has no lane card.
+   */
+  it("takes the lanes layout from the payload the server sends", () => {
+    const html = render(serverLanesOverview, "enterprise");
+    expect(html).toContain('<h1 id="lanes-title"');
+    expect(html.match(/data-lane="/g)).toHaveLength(3);
   });
 
   /**

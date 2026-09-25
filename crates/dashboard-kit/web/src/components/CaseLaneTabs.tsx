@@ -1,5 +1,5 @@
 import type { KeyboardEvent } from "react";
-import { CASE_LANES, type CaseLaneCounts } from "../api/lanes";
+import { CASE_LANES, everythingCount, type CaseLaneCounts } from "../api/lanes";
 import { EVERYTHING_COPY, LANE_COPY, type CaseLaneChoice } from "../lanes";
 import { useTechnicalDetail } from "./TechnicalDetail";
 
@@ -19,7 +19,8 @@ export type CaseLaneTab = {
  * "Everything" lists raw telemetry and response bookkeeping beside the lanes,
  * which is a technical view's question, so it is offered only there, or when
  * the address already opened it (a shared link must not land on a tab that is
- * not on screen).
+ * not on screen). Its badge is the lanes and the cases in none added up, and
+ * only when all four were counted.
  */
 export function laneTabs(value: CaseLaneChoice, counts: CaseLaneCounts | undefined, technical: boolean): CaseLaneTab[] {
   const tabs: CaseLaneTab[] = CASE_LANES.map((lane) => ({
@@ -29,7 +30,13 @@ export function laneTabs(value: CaseLaneChoice, counts: CaseLaneCounts | undefin
     selected: value === lane,
   }));
   if (technical || value === "everything") {
-    tabs.push({ choice: "everything", label: EVERYTHING_COPY.name, selected: value === "everything" });
+    const every = everythingCount(counts);
+    tabs.push({
+      choice: "everything",
+      label: EVERYTHING_COPY.name,
+      ...(every === undefined ? {} : { count: every }),
+      selected: value === "everything",
+    });
   }
   return tabs;
 }
@@ -67,10 +74,13 @@ export function laneTabId(choice: CaseLaneChoice): string {
 /**
  * The lane tabs on a Cases screen.
  *
- * Offer them only when the list answer carried `lane_counts`: that is the
- * host saying it files cases into lanes. A host older than lanes lists every
- * case under one heading, as it always did, and a tab row over that list
- * would claim a filter nothing applied.
+ * Offer them only when the list answer says the lane was served
+ * (`lane_filter.served`): that is the request the host answered carrying the
+ * lane. A host older than lanes lists every case under one heading, as it
+ * always did (`served: false`), and a tab row over that list would claim a
+ * filter nothing applied. Whether `lane_counts` came back is NOT the sign:
+ * the counts cost the host a full read, so a lane is polled without them
+ * and keeps its tabs, with the badges from the last answer that had them.
  *
  * The screen owns the choice and the request; this draws the row, says what
  * the open tab lists, and moves the selection with the keyboard.

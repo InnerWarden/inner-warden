@@ -6,13 +6,15 @@ const fixture = (name: string) => JSON.parse(readFileSync(
   "utf8",
 ));
 
-// A paid host that answers the Overview's three questions, and the same host
-// on a server that answers only two, one of them with no source to read.
-const casesBootstrap = fixture("cases-bootstrap");
-const lanesOverview = fixture("overview-lanes");
-const partialLanesOverview = fixture("overview-lanes-partial");
 // A paid server from before lanes.
 const olderOverview = fixture("overview-host-waiting");
+// A paid host that answers the Overview's three questions, and one that
+// records no messages to its agent. Both written by the paid server's own
+// tests, not by hand. The server's test builds the lanes without the host's
+// waiting line, so the page adds the one the older host sent.
+const casesBootstrap = fixture("cases-bootstrap");
+const lanesOverview = { ...fixture("overview-lanes"), host_attention: olderOverview.host_attention };
+const noSourceOverview = fixture("overview-lanes-no-source");
 
 async function open(page: Page, overview: unknown) {
   await page.route("**/api/dashboard/v1/bootstrap", (route) => route.fulfill({ json: casesBootstrap }));
@@ -34,33 +36,36 @@ test("a paid Overview leads with the three questions, one card each", async ({ p
   await open(page, lanesOverview);
 
   await expect(page.getByRole("heading", { level: 1, name: "What is happening here" })).toBeVisible();
-  const prompt = page.getByRole("region", { name: "Messages to your AI agent" });
+  const messages = page.getByRole("region", { name: "Messages to your AI agent" });
   const agent = page.getByRole("region", { name: "What your AI agent did" });
-  const host = page.getByRole("region", { name: "Attacks on this server" });
-  for (const card of [prompt, agent, host]) await expect(card).toBeVisible();
+  const server = page.getByRole("region", { name: "Attacks on this server" });
+  for (const card of [messages, agent, server]) await expect(card).toBeVisible();
 
-  await expect(agent).toContainText("8");
-  await expect(agent).toContainText("in the last 24 hours");
-  await expect(agent).toContainText("Your agent tried 8 commands. InnerWarden refused 5 before they ran");
+  // Each number says what it counts: the agent's card counts commands, and
+  // the Cases lane it opens lists sessions.
+  await expect(agent.locator("[data-lane-count]")).toHaveText("2");
+  await expect(agent.locator("[data-lane-count] + span")).toHaveText("commands in the last 7 days");
+  await expect(agent).toContainText("Your AI agent tried 2 commands in the last 7 days: InnerWarden refused 1 before they ran");
   await expect(agent).toContainText("Latest:");
-  await expect(agent).toContainText("AI agent session wren-visitor-28eb7f9c");
-  await expect(prompt).toContainText("its AI provider's filter caught 1");
-  await expect(host).toContainText("823");
+  await expect(agent).toContainText("Visitor 28eb7f9c asked your AI agent to run a command as root");
+  await expect(messages).toContainText("the agent declined 1 on its own");
+  await expect(server.locator("[data-lane-count] + span")).toHaveText("findings in the last 24 hours");
   // What is waiting on a person is never behind the switch.
-  await expect(host).toContainText("32 waiting on you");
-  await expect(page.getByRole("region", { name: "1 address is waiting on you" })).toBeVisible();
+  await expect(messages).toContainText("1 waiting on you");
+  await expect(server).not.toContainText("waiting on you");
+  await expect(page.getByRole("region", { name: "8 addresses are waiting on you" })).toBeVisible();
   // What the kernel stopped reads as stopped, not as allowed.
   await expect(page.getByRole("region", { name: "Recent activity" })).toContainText("The kernel stopped sudo");
 
   // The figures the page used to lead with are behind the switch, whole.
-  await expect(page.getByRole("heading", { name: "8 agent actions screened on this host." })).toHaveCount(0);
+  await expect(page.getByRole("heading", { name: "2 agent actions screened on this host." })).toHaveCount(0);
   await expect(page.getByText("Recorded decisions", { exact: true })).toHaveCount(0);
   await expect(page.getByRole("heading", { name: "What the guardrail actually did" })).toHaveCount(0);
   await expect(page.getByRole("heading", { name: "Risk signals" })).toHaveCount(0);
 
   await page.getByLabel("Show technical detail").check();
   await expect(page.getByRole("heading", { name: "The records behind these cards" })).toBeVisible();
-  await expect(page.getByRole("heading", { level: 2, name: "8 agent actions screened on this host." })).toBeVisible();
+  await expect(page.getByRole("heading", { level: 2, name: "2 agent actions screened on this host." })).toBeVisible();
   await expect(page.getByText("Recorded decisions", { exact: true })).toBeVisible();
   await expect(page.getByRole("heading", { name: "What the guardrail actually did" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Risk signals" })).toBeVisible();
@@ -71,18 +76,18 @@ test("a paid Overview leads with the three questions, one card each", async ({ p
 
 /**
  * A lane with nothing on this host to read has no number, never a zero, and
- * the host's sentence says how to turn the source on. A lane the host did not
- * send is not drawn at all.
+ * the host's sentence says what is not being read. The line over the cards
+ * promises a link on every card only when every card has one.
  */
-test("a lane with no source says so without a number, and a lane not sent is not drawn", async ({ page }) => {
-  await open(page, partialLanesOverview);
+test("a lane with no source says so without a number", async ({ page }) => {
+  await open(page, noSourceOverview);
 
-  const prompt = page.getByRole("region", { name: "Messages to your AI agent" });
-  await expect(prompt).toContainText("InnerWarden is not reading this agent's conversations yet");
-  await expect(prompt.locator("[data-lane-count]")).toHaveCount(0);
-  await expect(prompt.getByRole("button")).toHaveCount(0);
-  await expect(page.getByRole("region", { name: "What your AI agent did" })).toBeVisible();
-  await expect(page.getByRole("region", { name: "Attacks on this server" })).toHaveCount(0);
+  const messages = page.getByRole("region", { name: "Messages to your AI agent" });
+  await expect(messages).toContainText("InnerWarden is not reading your AI agent's messages yet");
+  await expect(messages.locator("[data-lane-count]")).toHaveCount(0);
+  await expect(messages.getByRole("button")).toHaveCount(0);
+  await expect(page.getByRole("region", { name: "What your AI agent did" }).locator("[data-lane-count] + span")).toHaveText("commands in the last 7 days");
+  await expect(page.getByText("Each card opens what is behind it.")).toHaveCount(0);
 });
 
 /**

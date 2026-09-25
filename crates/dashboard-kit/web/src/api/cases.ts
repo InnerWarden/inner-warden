@@ -37,8 +37,20 @@ export type RelationshipConfidence = "causal" | "strongly_supported" | "contextu
 // The lanes live in their own dependency-free module so the Overview, which
 // every edition renders, can name them without pulling this client (and the
 // instance it creates at load) into a bundle that never lists a case.
-export { CASE_LANES, isCaseLane, type CaseLane, type CaseLaneCounts } from "./lanes";
-import { CASE_LANES, isCaseLane, type CaseLane, type CaseLaneCounts } from "./lanes";
+export { CASE_LANES, OTHER_LANE_COUNT, everythingCount, isCaseLane, type CaseLane, type CaseLaneCounts } from "./lanes";
+import { CASE_LANES, OTHER_LANE_COUNT, isCaseLane, type CaseLane, type CaseLaneCounts } from "./lanes";
+
+/**
+ * Whether a list answer is a lane, as the CLIENT knows it from which of its
+ * requests the server answered. See `CaseListPage.lane_filter`.
+ */
+export type CaseListLaneFilter =
+  /** The request that answered carried the lane parameters: this server files
+   * cases into lanes, and the rows are `lane` (`null`: every case). */
+  | { served: true; lane: CaseLane | null }
+  /** This server refused lanes and was asked again without them: the rows are
+   * every case, whatever lane was asked for. */
+  | { served: false };
 
 export type CaseSummary = {
   id: string;
@@ -106,22 +118,40 @@ export type CaseListPage = {
    */
   window_complete?: boolean;
   /**
-   * How many cases each lane holds, for the same window and filters with the
-   * lane left out, so every lane tab can carry its own number whichever tab is
-   * open.
+   * How many cases each lane holds, and how many belong to no lane (`other`),
+   * for the same window and filters with the lane set aside, so every lane
+   * tab can carry its own number whichever tab is open. The four add up to
+   * the list's total without a lane (`everythingCount`).
    *
    * Sent only when the request asks with `include=lane_counts`, for the same
    * reason as `rows_in_window`: an older bundle's exact-key parser rejects a
-   * body with a key it does not know. Its PRESENCE is also the one sign that
-   * this server files cases into lanes at all, so a screen offers lane tabs
-   * only when it arrived; a server that refused the parameter answered without
-   * it, and its list is the unfiltered one.
+   * body with a key it does not know. Asking for it costs the host a full
+   * read even on an agent lane, so a screen asks on first load, on a tab
+   * switch or on a slow cadence, and its absence from a fast poll says
+   * nothing about lanes: whether the rows are a lane is `lane_filter`.
    *
-   * Read leniently, one lane at a time: a count that is not a non-negative
+   * Read leniently, one key at a time: a count that is not a non-negative
    * whole number is read as not sent, so one bad number costs its tab a badge
    * and never costs the reader the whole list.
    */
   lane_counts?: CaseLaneCounts;
+  /**
+   * Whether these rows are a lane. Set by the client, NEVER read from the
+   * wire (the exact envelope refuses the key), and only on an answer to a
+   * request that named a lane or asked for `lane_counts`:
+   *
+   *  - `{ served: true, lane }`: the request that answered carried the lane
+   *    parameters. The server files cases into lanes, and the rows are that
+   *    lane (`null` when no lane was named: every case).
+   *  - `{ served: false }`: the server refused lanes, was asked again without
+   *    them, and the rows are every case whatever lane was asked for.
+   *
+   * Absent when the request asked nothing about lanes. A screen offers lane
+   * tabs on `served`, not on whether `lane_counts` came back: a fast poll of
+   * a lane without the counts is still that lane, and an older server's list
+   * is never presented as one.
+   */
+  lane_filter?: CaseListLaneFilter;
 };
 
 export type AuthorityRef = { kind: string; id: string; version?: string | null; inferred?: boolean | null };
@@ -344,11 +374,16 @@ export type CaseListQuery = {
    *
    * A server older than lanes refuses the parameter as unknown, and the
    * client then asks again without it and without `lane_counts`: the answer is
-   * the unfiltered list, and its missing `lane_counts` is how the screen
-   * learns to stop offering lanes. It is never silently a lane it is not.
+   * the unfiltered list, marked `lane_filter: { served: false }`, which is how
+   * the screen learns to stop offering lanes. It is never silently a lane it
+   * is not.
    */
   lane?: CaseLane | "";
-  /** Ask for `lane_counts` beside the page (`include=lane_counts`). */
+  /**
+   * Ask for `lane_counts` beside the page (`include=lane_counts`). It forces
+   * the host's full read, so ask on first load, on a tab switch or on a slow
+   * cadence, and poll a lane without it.
+   */
   lane_counts?: boolean;
 };
 
@@ -579,20 +614,24 @@ export function parseCaseListPage(value: unknown, requestedLimit = 20): CaseList
 }
 
 /**
- * `lane_counts`, one lane at a time. Absent, or not an object, is not sent.
- * A lane whose count is not a non-negative whole number is left out, and a
- * key that names no lane this bundle knows is ignored, so a host that grows a
- * fourth lane does not blank the list on an older bundle.
+ * `lane_counts`, one key at a time: the three lanes and `other`. Absent, or
+ * not an object, is not sent. A key whose count is not a non-negative whole
+ * number is left out, and a key this bundle does not know is ignored, so a
+ * host that grows a fourth lane does not blank the list on an older bundle.
+ *
+ * An object with none of the known keys readable is not sent either. An empty
+ * `{}` would still read as PRESENT, and a screen would draw tabs with no
+ * badges and pick its default lane from counts that say nothing.
  */
 export function parseLaneCounts(value: unknown): CaseLaneCounts | undefined {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
   const raw = value as Record<string, unknown>;
   const counts: CaseLaneCounts = {};
-  for (const lane of CASE_LANES) {
-    const count = raw[lane];
-    if (typeof count === "number" && Number.isSafeInteger(count) && count >= 0) counts[lane] = count + 0;
+  for (const key of [...CASE_LANES, OTHER_LANE_COUNT] as const) {
+    const count = raw[key];
+    if (typeof count === "number" && Number.isSafeInteger(count) && count >= 0) counts[key] = count + 0;
   }
-  return counts;
+  return Object.keys(counts).length > 0 ? counts : undefined;
 }
 
 export function parseUnifiedCase(value: unknown): UnifiedCase {
@@ -847,10 +886,10 @@ export class DashboardCasesClient {
     // earlier. A request that names a lane, or asks for `lane_counts`, goes
     // first with both; a server older than lanes refuses it as an unknown
     // parameter and is asked again without the lane and without the counts,
-    // which is the unfiltered list. That answer carries no `lane_counts`, and
-    // the missing counts are how a screen learns to stop offering lanes, so
-    // the list is never presented as a lane it is not. Several `include`
-    // names travel as one comma-separated value.
+    // which is the unfiltered list. The answer says which of the two it is
+    // (`lane_filter`), whether or not the counts were asked for, so a fast
+    // poll of a lane is never presented as a lane it is not. Several
+    // `include` names travel as one comma-separated value.
     const lane = isCaseLane(query.lane) ? query.lane : "";
     const wantsLanes = lane !== "" || query.lane_counts === true;
     const url = (ask: ListAsk) => {
@@ -881,6 +920,11 @@ export class DashboardCasesClient {
         const refused = asks.slice(0, index);
         if (refused.some((earlier) => earlier.lanes)) this.#lanesRefused = true;
         if (!ask.rows && refused.some((earlier) => earlier.rows)) this.#rowTotalRefused = true;
+      }
+      // Marked from the request that ANSWERED, never from what came back in
+      // the body: only that request knows whether the lane went with it.
+      if (result.state === "ready" && wantsLanes) {
+        result.data.lane_filter = ask.lanes ? { served: true, lane: lane === "" ? null : lane } : { served: false };
       }
       return result;
     }

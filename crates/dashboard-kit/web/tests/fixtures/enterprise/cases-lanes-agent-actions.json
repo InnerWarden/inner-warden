@@ -1,0 +1,74 @@
+{
+  "generated_at": "2026-09-25T17:44:59.604306Z",
+  "items": [
+    {
+      "id": "case:incident:883fa341d658e4908a5ce8a23a4d6254090010c189f6fce5835e8d9e3abaadde",
+      "latest_event_at": "2026-09-25T16:54:59.148038Z",
+      "outcome": "unknown",
+      "recurrence_occurrences": "1",
+      "scope": [
+        {
+          "display_name": "wren-visitor-28eb7f9c",
+          "evidence": [
+            {
+              "freshness": {
+                "age_seconds": 3000,
+                "budget_seconds": 7776000,
+                "observed_at": "2026-09-25T16:54:59.148038Z",
+                "state": "fresh"
+              },
+              "id": "event:sqlite-incident:eecbd12e1f3ea45c15e73070658a438f07e2ef60324382c7f31e2b1fa7b451e0",
+              "integrity": "unverified",
+              "kind": "sqlite_incident",
+              "observed_at": "2026-09-25T16:54:59.148038Z",
+              "redaction": [],
+              "source": {
+                "authority": "canonical",
+                "completeness": "partial",
+                "id": "agent-guard-incidents",
+                "kind": "sqlite",
+                "limitations": [
+                  "recorded at the agent boundary by the InnerWarden guard, not by a host detector",
+                  "incident detection is not an enforcement outcome"
+                ],
+                "version": "1"
+              }
+            }
+          ],
+          "id": "agent:declared:wren-visitor-28eb7f9c",
+          "kind": "agent",
+          "verification": "declared"
+        },
+        {
+          "display_name": "this host",
+          "evidence": [],
+          "id": "host:local",
+          "kind": "host",
+          "verification": "configured"
+        },
+        {
+          "display_name": "local tenant",
+          "evidence": [],
+          "id": "tenant:local",
+          "kind": "tenant",
+          "verification": "configured"
+        }
+      ],
+      "severity": "high",
+      "status": "needs_review",
+      "title": "Visitor 28eb7f9c asked your AI agent to download and run a script; InnerWarden judged it unsafe, but it may still have run"
+    }
+  ],
+  "lane_counts": {
+    "agent_actions": 1,
+    "agent_messages": 1,
+    "other": 2,
+    "server_attacks": 3
+  },
+  "next_cursor": null,
+  "rows_in_window": 1,
+  "schema_version": "innerwarden.dashboard.v1",
+  "total_in_window": 1,
+  "window": "7d",
+  "window_complete": true
+}

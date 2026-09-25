@@ -1,0 +1,24 @@
+{
+  "refused_lane_value": {
+    "status": 400,
+    "request": "/api/dashboard/v1/cases?window=7d&lane=agent",
+    "body": {
+      "code": "enterprise_cases_filter_invalid",
+      "message": "A cases filter is empty, oversized, or contains control characters.",
+      "remediation_gate": null,
+      "retryable": false,
+      "schema_version": "innerwarden.dashboard.v1"
+    }
+  },
+  "refused_include_name": {
+    "status": 400,
+    "request": "/api/dashboard/v1/cases?window=7d&include=lane_counts,bogus",
+    "body": {
+      "code": "enterprise_cases_query_invalid",
+      "message": "The cases query contains an unknown or malformed parameter.",
+      "remediation_gate": null,
+      "retryable": false,
+      "schema_version": "innerwarden.dashboard.v1"
+    }
+  }
+}
