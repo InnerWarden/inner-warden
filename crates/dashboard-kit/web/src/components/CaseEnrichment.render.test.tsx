@@ -93,6 +93,37 @@ describe("the case context, rendered", () => {
   });
 
   /**
+   * THE DEFECT THIS PINS: when no model ran, the review's own reason was
+   * printed in the plain view whatever it said, and on a live case it said
+   * "Auto-blocked: ssh_bruteforce from 72.167.227.34 (rule-based, no AI
+   * needed, block 24h)" and "threat_intel matched on the first sighting".
+   * A reason built from tokens is kept for the technical view; one that
+   * reads as words is still shown to everyone.
+   *
+   * FAILS ON REVERT: print the reason unguarded and the tokens are in the
+   * plain view.
+   */
+  it("keeps a reason built from tokens for the technical view when no model ran", () => {
+    const withReason = (reason: string) => parseUnifiedCase({
+      ...heldBackCase,
+      enrichment: { ...heldBackCase.enrichment, ai: { provider: "rule-engine", model_kind: "unknown", verdict: "block_ip", reason } },
+    }).enrichment;
+    for (const reason of [
+      "Auto-blocked: ssh_bruteforce from 72.167.227.34 (rule-based, no AI needed, block 24h)",
+      "Blocking 112.161.26.125. threat_intel matched on the first sighting.",
+    ]) {
+      const plain = renderToStaticMarkup(<CaseEnrichmentView enrichment={withReason(reason)} />);
+      expect(plain, reason).not.toContain("_");
+      expect(plain, reason).toContain("No model classified this one");
+      setTechnicalDetail(true);
+      expect(renderToStaticMarkup(<CaseEnrichmentView enrichment={withReason(reason)} />), reason).toContain(reason);
+      setTechnicalDetail(false);
+    }
+    const words = "Repeat offender: blocked 3 times.";
+    expect(renderToStaticMarkup(<CaseEnrichmentView enrichment={withReason(words)} />)).toContain(words);
+  });
+
+  /**
    * THE DEFECT THIS PINS: a map whose marker was the country's centroid,
    * with two decimals of false precision, a dashed "No geolocation" box
    * where there was none, and a footnote doubting everything above it and

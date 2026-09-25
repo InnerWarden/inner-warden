@@ -12,6 +12,7 @@ import type {
 } from "../api/cases";
 import { StatusBadge } from "./StatusBadge";
 import { TechnicalOnly } from "./TechnicalDetail";
+import { readsAsPlainWords } from "../presentation";
 
 // Enrichment renders the signals wired together from the underlying incident /
 // decision / mitre mapping. Everything is producer-REPORTED, not verified: the
@@ -247,6 +248,21 @@ function humanVerdict(verdict: string): string {
   return words.charAt(0).toUpperCase() + words.slice(1);
 }
 
+/**
+ * The reason an automated review wrote, shown to every reader only when it
+ * reads as plain words.
+ *
+ * These reasons are the producer's own text, and some are built from its
+ * tokens: "Auto-blocked: ssh_bruteforce from 203.0.113.9 (rule-based, no AI
+ * needed, block 24h)" and "threat_intel matched on the first sighting" were
+ * both on a live case in the plain view. Such a reason is kept, whole, for
+ * the technical view; a reason that reads as words is shown to everyone.
+ */
+function AutomatedReviewReason({ reason }: { reason: string }) {
+  const text = <p className="mt-3 break-words text-sm leading-6 text-slate-700 [overflow-wrap:anywhere]">{reason}</p>;
+  return readsAsPlainWords(reason) ? text : <TechnicalOnly>{text}</TechnicalOnly>;
+}
+
 // --- AI verdict: which model decided, local Warden vs cloud LLM.
 function AiVerdictSection({ value }: { value: AiVerdict }) {
   const isLocal = value.model_kind === "local_warden" || value.model_kind === "local_classifier";
@@ -267,7 +283,7 @@ function AiVerdictSection({ value }: { value: AiVerdict }) {
             <Field label={RECOMMENDED_ACTION} value={humanVerdict(value.verdict)} />
           </dl>
         )}
-        {value.reason && <p className="mt-3 break-words text-sm leading-6 text-slate-700 [overflow-wrap:anywhere]">{value.reason}</p>}
+        {value.reason ? <AutomatedReviewReason reason={value.reason} /> : null}
         <p className="mt-2 text-xs text-slate-400">No model classified this one, so there is no model opinion to weigh.</p>
       </section>
     );
