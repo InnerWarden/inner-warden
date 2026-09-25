@@ -59,6 +59,7 @@ export function CaseTimeline({ events }: { events: CaseEvent[] }) {
   }
 
   const legend = relationshipLegend(events);
+  const root = rootEventId(events);
   return (
     <section aria-labelledby="case-timeline-title" className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
       <div className="flex flex-wrap items-start justify-between gap-3">
@@ -79,10 +80,12 @@ export function CaseTimeline({ events }: { events: CaseEvent[] }) {
                   <p className="mt-0.5 text-xs text-slate-500"><time dateTime={event.observed_at}>{formatTime(event.observed_at)}</time></p>
                 </div>
                 <div className="flex flex-wrap gap-1.5">
-                  <StatusBadge
-                    status={event.relationship === "causal" ? "available" : event.relationship === "strongly_supported" ? "degraded" : "unknown"}
-                    label={relationshipLabels[event.relationship]}
-                  />
+                  {event.id === root && event.relationship === "unknown" ? null : (
+                    <StatusBadge
+                      status={event.relationship === "causal" ? "available" : event.relationship === "strongly_supported" ? "degraded" : "unknown"}
+                      label={relationshipLabels[event.relationship]}
+                    />
+                  )}
                   {event.mode && <StatusBadge {...modeBadge(event.mode)} />}
                 </div>
               </div>
@@ -127,13 +130,34 @@ export function recordingLag(event: Pick<CaseEvent, "observed_at" | "recorded_at
  * paragraph inside every contextual event, which on a busy case was the same
  * sentence five or six times down one column.
  */
-export function relationshipLegend(events: Pick<CaseEvent, "relationship">[]): string[] {
-  const present = new Set(events.map((event) => event.relationship));
+export function relationshipLegend(events: (Pick<CaseEvent, "relationship"> & Partial<Pick<CaseEvent, "id" | "event_type">>)[]): string[] {
+  // The case's own incident is where the case starts, so how it relates to
+  // "the events next to it" is not a question: the host marks it unknown on
+  // every incident case, and that alone printed the unknown legend and a
+  // "? Unknown relationship" badge on step one of every one of them.
+  const root = rootEventId(events);
+  const present = new Set(events.filter((event, index) => !isRoot(event, index, root)).map((event) => event.relationship));
   const lines: string[] = [];
   if (present.has("contextual")) lines.push("Contextual: recorded around the same time. That is not proof it is part of the same act.");
   if (present.has("unknown")) lines.push("Unknown relationship: how this event relates to the ones next to it was not established.");
   if (lines.length > 0) lines.push("Order here is chronological, and chronological order alone never makes one event the cause of the next.");
   return lines;
+}
+
+/**
+ * The event the case starts from: its first incident. Only an event the host
+ * typed as an incident can be it, so a timeline of decisions alone has none,
+ * and every one of its events is explained as before.
+ */
+export function rootEventId(events: Partial<Pick<CaseEvent, "id" | "event_type">>[]): string | undefined {
+  const index = events.findIndex((event) => event.event_type === "incident");
+  if (index === -1) return undefined;
+  return events[index].id ?? `#${index}`;
+}
+
+function isRoot(event: Partial<Pick<CaseEvent, "id" | "event_type">>, index: number, root: string | undefined): boolean {
+  if (root === undefined || event.event_type !== "incident") return false;
+  return (event.id ?? `#${index}`) === root;
 }
 
 export function EvidenceLinks({ evidence }: { evidence: CaseEvent["source_refs"] }) {

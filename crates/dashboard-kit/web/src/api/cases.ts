@@ -226,8 +226,32 @@ export type OutcomeTrust = (typeof OUTCOME_TRUSTS)[number];
 // mitre mapping. Everything is producer-REPORTED (not verified). Every field is
 // optional so an orphan observation serialises an all-empty enrichment and the UI
 // renders honest "not reported" states instead of inventing data.
-export type DetectionContext = { detector: string; kind?: string | null; layer?: string | null; reason?: string | null; recommended_checks: string[] };
-export type AiVerdict = { provider: string; model_kind: string; verdict?: string | null; risk_score?: number | null; reason?: string | null };
+export type DetectionContext = {
+  detector: string;
+  kind?: string | null;
+  layer?: string | null;
+  reason?: string | null;
+  recommended_checks: string[];
+  /**
+   * The command the finding is about, when the detector saw one: the primary
+   * fact of an exec or copy finding. The host sent it and this parser dropped
+   * it, so a case whose summary did not happen to quote it never showed it.
+   */
+  command?: string | null;
+};
+export type AiVerdict = {
+  provider: string;
+  model_kind: string;
+  verdict?: string | null;
+  risk_score?: number | null;
+  reason?: string | null;
+  /**
+   * Who recommended it, in plain words ("On-device Warden model"). The host
+   * sends it beside `provider`, which is its wire token (`local_classifier`),
+   * and the screen printed the token because this parser dropped the words.
+   */
+  decided_by?: string | null;
+};
 export type AgentActivity = { agent_name: string; command?: string | null; atr_rule_ids: string[]; risk_score?: number | null; recommendation?: string | null; explanation?: string | null };
 export type RuleHit = { kind: string; id: string; name?: string | null };
 export type MitreRef = { technique_id: string; technique_name?: string | null; tactic?: string | null };
@@ -699,10 +723,26 @@ function parseEnrichment(value: unknown): CaseEnrichment | undefined {
 
   return {
     detection: det && str(det.detector)
-      ? { detector: str(det.detector)!, kind: str(det.kind) ?? null, layer: str(det.layer) ?? null, reason: str(det.reason) ?? null, recommended_checks: strArr(det.recommended_checks) }
+      ? {
+          detector: str(det.detector)!,
+          kind: str(det.kind) ?? null,
+          layer: str(det.layer) ?? null,
+          reason: str(det.reason) ?? null,
+          recommended_checks: strArr(det.recommended_checks),
+          // Kept only when sent, so a host older than the field parses to
+          // exactly the object it always did.
+          ...(str(det.command) === undefined ? {} : { command: str(det.command)! }),
+        }
       : null,
     ai: ai && str(ai.provider)
-      ? { provider: str(ai.provider)!, model_kind: str(ai.model_kind) ?? "unknown", verdict: str(ai.verdict) ?? null, risk_score: num(ai.risk_score) ?? null, reason: str(ai.reason) ?? null }
+      ? {
+          provider: str(ai.provider)!,
+          model_kind: str(ai.model_kind) ?? "unknown",
+          verdict: str(ai.verdict) ?? null,
+          risk_score: num(ai.risk_score) ?? null,
+          reason: str(ai.reason) ?? null,
+          ...(str(ai.decided_by, 256) === undefined ? {} : { decided_by: str(ai.decided_by, 256)! }),
+        }
       : null,
     agent_activity: act && str(act.agent_name)
       ? { agent_name: str(act.agent_name)!, command: str(act.command) ?? null, atr_rule_ids: strArr(act.atr_rule_ids), risk_score: num(act.risk_score) ?? null, recommendation: str(act.recommendation) ?? null, explanation: str(act.explanation) ?? null }

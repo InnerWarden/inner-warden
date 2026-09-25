@@ -1,0 +1,352 @@
+{
+  "schema_version": "innerwarden.dashboard.v1",
+  "id": "case:incident:fixture-held-back-005",
+  "title": "Deception observation: Always-on honeypot session",
+  "severity": "high",
+  "status": "needs_review",
+  "scope": [
+    {
+      "id": "host:local",
+      "kind": "host",
+      "display_name": "this host",
+      "verification": "configured",
+      "evidence": []
+    },
+    {
+      "id": "tenant:local",
+      "kind": "tenant",
+      "display_name": "local tenant",
+      "verification": "configured",
+      "evidence": []
+    }
+  ],
+  "latest_event_at": "2026-09-24T08:45:30.203331555Z",
+  "outcome": "not_observed",
+  "identity": {
+    "subject_ids": [
+      "entity:Ip:198.51.100.23",
+      "incident:honeypot:always-on:always-on-198-51-100-23-1790239502"
+    ],
+    "confidence": "declared",
+    "evidence": [
+      {
+        "id": "event:sqlite-incident:fixture-2",
+        "kind": "sqlite_incident",
+        "source": {
+          "id": "active-defence-incidents",
+          "kind": "sqlite",
+          "authority": "canonical",
+          "version": "1",
+          "completeness": "partial",
+          "limitations": [
+            "some legacy producers remain JSONL-only",
+            "incident detection is not an enforcement outcome"
+          ]
+        },
+        "observed_at": "2026-09-24T08:45:03.859749065Z",
+        "integrity": "unverified",
+        "redaction": [],
+        "freshness": {
+          "observed_at": "2026-09-24T08:45:03.859749065Z",
+          "budget_seconds": 7776000,
+          "state": "fresh",
+          "age_seconds": 110754
+        }
+      }
+    ]
+  },
+  "recurrence": {
+    "first_seen_at": "2026-09-24T08:45:03.859749065Z",
+    "last_seen_at": "2026-09-24T08:45:03.859749065Z",
+    "occurrences": "1",
+    "state": "single"
+  },
+  "timeline": [
+    {
+      "id": "event:sqlite-incident:fixture-2",
+      "event_type": "incident",
+      "observed_at": "2026-09-24T08:45:03.859749065Z",
+      "recorded_at": "2026-09-24T08:45:03.859749065Z",
+      "authority": "host-detector",
+      "mode": null,
+      "summary": "198.51.100.23 interacted with the always-on honeypot for 2s: 1 authentication attempt(s), 0 shell command(s). Recorded whether or not the responder blocked the address.",
+      "relationship": "unknown",
+      "source_refs": [
+        {
+          "id": "event:sqlite-incident:fixture-2",
+          "kind": "sqlite_incident",
+          "source": {
+            "id": "active-defence-incidents",
+            "kind": "sqlite",
+            "authority": "canonical",
+            "version": "1",
+            "completeness": "partial",
+            "limitations": [
+              "some legacy producers remain JSONL-only",
+              "incident detection is not an enforcement outcome"
+            ]
+          },
+          "observed_at": "2026-09-24T08:45:03.859749065Z",
+          "integrity": "unverified",
+          "redaction": [],
+          "freshness": {
+            "observed_at": "2026-09-24T08:45:03.859749065Z",
+            "budget_seconds": 7776000,
+            "state": "fresh",
+            "age_seconds": 110754
+          }
+        }
+      ]
+    },
+    {
+      "id": "event:sqlite-decision:fixture-3",
+      "event_type": "policy_decision",
+      "observed_at": "2026-09-24T08:45:30.203331555Z",
+      "recorded_at": "2026-09-24T08:45:30.203331555Z",
+      "authority": "local_classifier",
+      "mode": "enforce",
+      "summary": "Decision block_ip: Local Warden decided block_ip with confidence 0.857. Markers: safelist=Google Cloud, country=AU, incidents_given_as_context=2, incident_tags=[honeypot,always-on]. Alternatives: dismiss (0.013), ignore (0.001), monitor (0.131). [repeat offender - blocked 2 times, TTL 1 hours] [correlated: honeypot, threat_intel] [intel: risk 62, regular_scanner, 4 visits]",
+      "relationship": "causal",
+      "source_refs": [
+        {
+          "id": "event:sqlite-decision:fixture-3",
+          "kind": "sqlite_decision",
+          "source": {
+            "id": "active-defence-decisions",
+            "kind": "sqlite",
+            "authority": "canonical",
+            "version": "1",
+            "completeness": "partial",
+            "limitations": [
+              "decision rows record intent and may diverge from the JSONL audit mirror",
+              "auto_executed and execution_result are not runtime convergence proof"
+            ]
+          },
+          "observed_at": "2026-09-24T08:45:30.203331555Z",
+          "integrity": "local_chain",
+          "redaction": [],
+          "freshness": {
+            "observed_at": "2026-09-24T08:45:30.203331555Z",
+            "budget_seconds": 7776000,
+            "state": "fresh",
+            "age_seconds": 110728
+          }
+        }
+      ],
+      "decision_provenance": {
+        "model": {
+          "kind": "model",
+          "id": "ai_local_warden",
+          "version": null,
+          "inferred": false
+        }
+      }
+    },
+    {
+      "id": "event:sqlite-decision:fixture-4",
+      "event_type": "enforcement_attempt",
+      "observed_at": "2026-09-24T08:45:30.203331555Z",
+      "recorded_at": "2026-09-24T08:45:30.203331555Z",
+      "authority": "action-executor",
+      "mode": "enforce",
+      "summary": "Executor result: skipped: 198.51.100.23 is in cloud provider safelist (Google Cloud)",
+      "relationship": "causal",
+      "source_refs": [
+        {
+          "id": "event:sqlite-decision:fixture-3",
+          "kind": "sqlite_decision",
+          "source": {
+            "id": "active-defence-decisions",
+            "kind": "sqlite",
+            "authority": "canonical",
+            "version": "1",
+            "completeness": "partial",
+            "limitations": [
+              "decision rows record intent and may diverge from the JSONL audit mirror",
+              "auto_executed and execution_result are not runtime convergence proof"
+            ]
+          },
+          "observed_at": "2026-09-24T08:45:30.203331555Z",
+          "integrity": "local_chain",
+          "redaction": [],
+          "freshness": {
+            "observed_at": "2026-09-24T08:45:30.203331555Z",
+            "budget_seconds": 7776000,
+            "state": "fresh",
+            "age_seconds": 110728
+          }
+        }
+      ],
+      "action_lifecycle": "rejected",
+      "decision_provenance": {
+        "model": {
+          "kind": "model",
+          "id": "ai_local_warden",
+          "version": null,
+          "inferred": false
+        }
+      }
+    }
+  ],
+  "evidence": [
+    {
+      "id": "event:sqlite-decision:fixture-3",
+      "kind": "sqlite_decision",
+      "source": {
+        "id": "active-defence-decisions",
+        "kind": "sqlite",
+        "authority": "canonical",
+        "version": "1",
+        "completeness": "partial",
+        "limitations": [
+          "decision rows record intent and may diverge from the JSONL audit mirror",
+          "auto_executed and execution_result are not runtime convergence proof"
+        ]
+      },
+      "observed_at": "2026-09-24T08:45:30.203331555Z",
+      "integrity": "local_chain",
+      "redaction": [],
+      "freshness": {
+        "observed_at": "2026-09-24T08:45:30.203331555Z",
+        "budget_seconds": 7776000,
+        "state": "fresh",
+        "age_seconds": 110728
+      }
+    },
+    {
+      "id": "event:sqlite-incident:fixture-2",
+      "kind": "sqlite_incident",
+      "source": {
+        "id": "active-defence-incidents",
+        "kind": "sqlite",
+        "authority": "canonical",
+        "version": "1",
+        "completeness": "partial",
+        "limitations": [
+          "some legacy producers remain JSONL-only",
+          "incident detection is not an enforcement outcome"
+        ]
+      },
+      "observed_at": "2026-09-24T08:45:03.859749065Z",
+      "integrity": "unverified",
+      "redaction": [],
+      "freshness": {
+        "observed_at": "2026-09-24T08:45:03.859749065Z",
+        "budget_seconds": 7776000,
+        "state": "fresh",
+        "age_seconds": 110754
+      }
+    }
+  ],
+  "feedback": [],
+  "verified_outcomes": [
+    {
+      "outcome": "not_observed",
+      "mode": "enforce",
+      "actual_denial_or_containment_occurred": false,
+      "verification_status": "not_applicable",
+      "verifier": null,
+      "verified_at": null,
+      "effective_scope": [
+        {
+          "id": "tenant:local",
+          "kind": "tenant",
+          "display_name": "local tenant",
+          "verification": "configured",
+          "evidence": []
+        },
+        {
+          "id": "host:local",
+          "kind": "host",
+          "display_name": "this host",
+          "verification": "configured",
+          "evidence": []
+        }
+      ],
+      "evidence": [
+        {
+          "id": "event:sqlite-decision:fixture-3",
+          "kind": "sqlite_decision",
+          "source": {
+            "id": "active-defence-decisions",
+            "kind": "sqlite",
+            "authority": "canonical",
+            "version": "1",
+            "completeness": "partial",
+            "limitations": [
+              "decision rows record intent and may diverge from the JSONL audit mirror",
+              "auto_executed and execution_result are not runtime convergence proof"
+            ]
+          },
+          "observed_at": "2026-09-24T08:45:30.203331555Z",
+          "integrity": "local_chain",
+          "redaction": [],
+          "freshness": {
+            "observed_at": "2026-09-24T08:45:30.203331555Z",
+            "budget_seconds": 7776000,
+            "state": "fresh",
+            "age_seconds": 110728
+          }
+        }
+      ],
+      "enforcement_attempt_id": null,
+      "trust": "recorded",
+      "trust_explanation": "Recorded by the component that saw it. Nothing else watched it, so we report it as that component's own record."
+    }
+  ],
+  "enrichment": {
+    "detection": {
+      "detector": "Honeypot",
+      "detector_token": "honeypot",
+      "kind": null,
+      "layer": null,
+      "layer_token": null,
+      "reason": "198.51.100.23 interacted with the always-on honeypot for 2s: 1 authentication attempt(s), 0 shell command(s). Recorded whether or not the responder blocked the address.",
+      "recommended_checks": [
+        "innerwarden-ctl get incidents --detector honeypot"
+      ]
+    },
+    "ai": {
+      "provider": "local_classifier",
+      "model_kind": "local_classifier",
+      "verdict": "Block IP",
+      "action": "block_ip",
+      "decided_by": "On-device Warden model",
+      "decided_by_token": "ai_local_warden",
+      "risk_score": null,
+      "reason": "Local Warden decided block_ip with confidence 0.857. Markers: safelist=Google Cloud, country=AU, incidents_given_as_context=2, incident_tags=[honeypot,always-on]. Alternatives: dismiss (0.013), ignore (0.001), monitor (0.131). [repeat offender - blocked 2 times, TTL 1 hours] [correlated: honeypot, threat_intel] [intel: risk 62, regular_scanner, 4 visits]"
+    },
+    "agent_activity": null,
+    "rules": [],
+    "mitre": [],
+    "threat_intel": {
+      "ip": "198.51.100.23",
+      "geo": {
+        "country": "Australia",
+        "city": null,
+        "lat": -25.3,
+        "lon": 133.8,
+        "asn": "AS396982 Google LLC",
+        "isp": "Google LLC"
+      },
+      "abuseipdb_score": null,
+      "dshield": null,
+      "dna_fingerprint": null,
+      "campaign_ids": []
+    },
+    "honeypot": {
+      "session_id": "always-on-198-51-100-23-1790239502",
+      "protocol": null,
+      "commands": [],
+      "credentials_seen": null
+    },
+    "dns": [],
+    "reason_code": null
+  },
+  "connections": {
+    "links": [],
+    "total_recorded": 0,
+    "absence_reason": "We have no connection records for this one. That can mean nothing was linked to it, or that the links have already been dropped: the connection history has a size limit and the oldest records are discarded first."
+  },
+  "has_gap": true
+}

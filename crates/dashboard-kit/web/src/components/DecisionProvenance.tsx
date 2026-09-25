@@ -4,6 +4,10 @@ import { StatusBadge } from "./StatusBadge";
 
 const decisionTypes = new Set(["recommendation", "policy_decision", "operator_action"]);
 
+/** Said where the screen offers the case's decision buttons, wherever they sit. */
+export const PROVENANCE_DECIDABLE_NOTE =
+  "Notes are a record of what a person concluded. To change the case itself, use its decision buttons.";
+
 /**
  * `decidable` says whether the screen embedding this offers any action.
  *
@@ -81,8 +85,11 @@ export function DecisionProvenance({ events, feedback, decidable = false }: { ev
         {/* Was: "Feedback writes remain unavailable until the reviewed action
             API exists." Our roadmap is not the user's business; what it means
             for them is that reading this screen changes nothing. */}
+        {/* "Use the decision below" pointed at a position: the decision
+            moved to the top of the case, and the sentence sent the reader
+            down a page to look for it. It names the control, not a place. */}
         <p className="mt-1 text-xs leading-5 text-slate-500">{decidable
-          ? "Notes are a record of what a person concluded. To change the case itself, use the decision below."
+          ? PROVENANCE_DECIDABLE_NOTE
           : "Nothing on this screen changes a rule, an allowlist or a policy."}</p>
         {feedback.length === 0 ? (
           <p className="mt-3 rounded-lg bg-slate-50 px-3 py-3 text-sm text-slate-600">No analyst has left a note on this case.</p>

@@ -11,6 +11,7 @@ import type {
   HoneypotContext,
 } from "../api/cases";
 import { StatusBadge } from "./StatusBadge";
+import { TechnicalOnly } from "./TechnicalDetail";
 
 // Enrichment renders the signals wired together from the underlying incident /
 // decision / mitre mapping. Everything is producer-REPORTED, not verified: the
@@ -75,11 +76,12 @@ export function CaseEnrichmentView({ enrichment }: { enrichment: CaseEnrichment 
     <section className="min-w-0 space-y-4" aria-label="Case context">
       <p className={LABEL}>What happened</p>
       {enrichmentOrder(enrichment).map((key) => <Fragment key={key}>{blocks[key]}</Fragment>)}
-      {/* The "Producer-reported · not verified" badge that used to sit up in
-          the section header was styled as a STATUS, so it read as something to
-          act on when it is a standing property of every case. The sentence is
-          kept, once, where a footnote goes. */}
-      <p className="text-xs leading-5 text-slate-500">{REPORTED_NOT_VERIFIED}</p>
+      {/* A footnote used to close this section on every case: "Everything
+          above is what the sensor, the rules and the model reported. It has
+          not been independently verified. What the system did about it is
+          below." It read as the product doubting its own findings, it pointed
+          at a position the page no longer keeps, and whether an outcome was
+          checked independently is said where the outcome is, per outcome. */}
     </section>
   );
 }
@@ -116,9 +118,6 @@ export function enrichmentOrder(enrichment: CaseEnrichment): EnrichmentBlock[] {
   };
   return ENRICHMENT_ORDER.filter((key) => present[key]);
 }
-
-export const REPORTED_NOT_VERIFIED =
-  "Everything above is what the sensor, the rules and the model reported. It has not been independently verified. What the system did about it is below.";
 
 function Field({ label, value }: { label: string; value: string }) {
   return (
@@ -202,6 +201,14 @@ function DetectionSection({ value }: { value: DetectionContext }) {
         {value.layer && <Field label="Layer" value={value.layer} />}
       </dl>
       {value.reason && <p className="mt-3 break-words text-sm leading-6 text-slate-700 [overflow-wrap:anywhere]">{value.reason}</p>}
+      {value.command ? (
+        <div className="mt-3">
+          <p className="mb-1 text-xs text-slate-500">The command</p>
+          <pre className="max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-xl bg-slate-950 px-4 py-3 text-xs leading-6 text-slate-100 [overflow-wrap:anywhere]">
+            <code>{value.command}</code>
+          </pre>
+        </div>
+      ) : null}
       {value.recommended_checks.length > 0 && (
         <div className="mt-3 flex flex-wrap gap-1.5">
           {value.recommended_checks.map((c) => (
@@ -231,6 +238,9 @@ function isModelVerdict(value: AiVerdict): boolean {
   return value.model_kind === "local_warden" || value.model_kind === "local_classifier" || value.model_kind === "llm";
 }
 
+/** What the model or the rule proposed, as distinct from what happened. */
+export const RECOMMENDED_ACTION = "Recommended action";
+
 /** `needs_review` is our wire token. A person reads "Needs review". */
 function humanVerdict(verdict: string): string {
   const words = verdict.replace(/[_-]+/g, " ").trim();
@@ -251,29 +261,43 @@ function AiVerdictSection({ value }: { value: AiVerdict }) {
         </div>
         {value.verdict && (
           <dl className="mt-3 grid gap-3 sm:grid-cols-2">
-            <Field label="Outcome" value={humanVerdict(value.verdict)} />
+            {/* A recommendation, not an outcome: "Outcome: Block IP" sat on
+                cases whose block was refused. What happened is the outcome's
+                own panel. */}
+            <Field label={RECOMMENDED_ACTION} value={humanVerdict(value.verdict)} />
           </dl>
         )}
         {value.reason && <p className="mt-3 break-words text-sm leading-6 text-slate-700 [overflow-wrap:anywhere]">{value.reason}</p>}
-        <p className="mt-2 text-xs text-slate-400">No model classified this one, so there is no model opinion to weigh. What the system did about it is below.</p>
+        <p className="mt-2 text-xs text-slate-400">No model classified this one, so there is no model opinion to weigh.</p>
       </section>
     );
   }
 
   const modelLabel = isLocal ? "Local Warden (on-device)" : "Cloud LLM";
   return (
-    <section className={CARD} aria-label="AI verdict">
+    <section className={CARD} aria-label={RECOMMENDED_ACTION}>
       <div className="flex flex-wrap items-start justify-between gap-2">
-        <p className={LABEL}>AI verdict</p>
+        {/* It was labelled "AI verdict", with "Verdict: Block IP" under it, on
+            cases where nothing was blocked: the model recommends, and what
+            happened is the outcome's own panel. */}
+        <p className={LABEL}>{RECOMMENDED_ACTION}</p>
         <Chip label={modelLabel} tone={isLocal ? "cyan" : "violet"} />
       </div>
       <dl className="mt-3 grid gap-3 sm:grid-cols-2">
-        <Field label="Provider" value={value.provider} />
-        {value.verdict && <Field label="Verdict" value={humanVerdict(value.verdict)} />}
+        {value.decided_by ? <Field label="Recommended by" value={value.decided_by} /> : null}
+        {value.verdict && <Field label="Action" value={humanVerdict(value.verdict)} />}
         {value.risk_score != null && <Field label="Risk score" value={String(value.risk_score)} />}
       </dl>
-      {value.reason && <p className="mt-3 break-words text-sm leading-6 text-slate-700 [overflow-wrap:anywhere]">{value.reason}</p>}
-      <p className="mt-2 text-xs text-slate-400">Model classification is a signal; it does not by itself establish a block or containment.</p>
+      {/* The producer's token and the model's own dump (confidence, markers,
+          alternatives) are for whoever audits the model, not for the reader
+          deciding the case. */}
+      <TechnicalOnly>
+        <dl className="mt-3 grid gap-3 sm:grid-cols-2">
+          <Field label="Provider" value={value.provider} />
+        </dl>
+        {value.reason && <p className="mt-3 break-words text-sm leading-6 text-slate-700 [overflow-wrap:anywhere]">{value.reason}</p>}
+      </TechnicalOnly>
+      <p className="mt-2 text-xs text-slate-400">A model's recommendation is a signal; it does not by itself establish a block or containment.</p>
     </section>
   );
 }
@@ -309,14 +333,20 @@ function RulesMitreSection({ rules, mitre }: { rules: RuleHit[]; mitre: MitreRef
   );
 }
 
-// --- Threat intelligence: source IP + geo map + reputation.
+// --- Threat intelligence: source IP, where it is registered, reputation.
+//
+// A map sat beside these, and on the hosts measured its marker was a
+// country's centroid (the United States put it in the middle of Kansas),
+// printed with two decimals of false precision; an address with no location
+// got a large dashed box saying so instead. The country is already a line
+// here, and neither drawing added a fact.
 function ThreatIntelSection({ value }: { value: ThreatIntel }) {
   const geo = value.geo;
   const place = [geo?.city, geo?.country].filter(Boolean).join(", ");
   return (
     <section className={CARD} aria-label="Threat intelligence">
       <p className={LABEL}>Threat intelligence</p>
-      <div className="mt-3 grid min-w-0 gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.1fr)]">
+      <div className="mt-3 min-w-0">
         <div className="min-w-0 space-y-3">
           <dl className="grid gap-3 sm:grid-cols-2">
             {value.ip && <Field label="Source IP" value={value.ip} />}
@@ -338,47 +368,8 @@ function ThreatIntelSection({ value }: { value: ThreatIntel }) {
             <p className="text-xs text-slate-400">Behavioural DNA / campaign links are correlation signals, not proof of a single actor.</p>
           )}
         </div>
-        {geo?.lat != null && geo?.lon != null ? (
-          <GeoMiniMap lat={geo.lat} lon={geo.lon} label={place || value.ip || "source"} />
-        ) : value.ip ? (
-          <div className="flex items-center justify-center rounded-xl border border-dashed border-slate-300 bg-slate-50 px-4 py-8 text-center text-xs text-slate-500">
-            No geolocation reported for this IP.
-          </div>
-        ) : null}
       </div>
     </section>
-  );
-}
-
-// Privacy-safe inline graticule map (no external tiles / no network). Equirectangular
-// projection: x = lon+180 (0..360), y = 90-lat (0..180). A marker + coordinate
-// readout shows WHERE without pretending to be a detailed cartographic tile.
-function GeoMiniMap({ lat, lon, label }: { lat: number; lon: number; label: string }) {
-  const x = Math.min(360, Math.max(0, lon + 180));
-  const y = Math.min(180, Math.max(0, 90 - lat));
-  return (
-    <figure className="min-w-0">
-      <svg viewBox="0 0 360 180" className="h-auto w-full rounded-xl border border-slate-200 bg-slate-900" role="img" aria-label={`Approximate location: ${label}`}>
-        <rect x="0" y="0" width="360" height="180" fill="#0f172a" />
-        {/* graticule */}
-        {[30, 60, 90, 120, 150].map((gy) => (
-          <line key={`h${gy}`} x1="0" y1={gy} x2="360" y2={gy} stroke="#1e293b" strokeWidth="0.6" />
-        ))}
-        {[60, 120, 180, 240, 300].map((gx) => (
-          <line key={`v${gx}`} x1={gx} y1="0" x2={gx} y2="180" stroke="#1e293b" strokeWidth="0.6" />
-        ))}
-        {/* equator + prime meridian */}
-        <line x1="0" y1="90" x2="360" y2="90" stroke="#334155" strokeWidth="0.8" />
-        <line x1="180" y1="0" x2="180" y2="180" stroke="#334155" strokeWidth="0.8" />
-        {/* marker */}
-        <circle cx={x} cy={y} r="8" fill="#22d3ee" opacity="0.18" />
-        <circle cx={x} cy={y} r="3.2" fill="#22d3ee" stroke="#0f172a" strokeWidth="0.8" />
-      </svg>
-      <figcaption className="mt-1.5 flex flex-wrap items-center justify-between gap-2 text-xs text-slate-500">
-        <span className="break-words [overflow-wrap:anywhere]">{label}</span>
-        <span className="tabular-nums text-slate-400">{lat.toFixed(2)}, {lon.toFixed(2)}</span>
-      </figcaption>
-    </figure>
   );
 }
 

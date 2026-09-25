@@ -163,10 +163,23 @@ describe("an action queued for a person", () => {
   });
 
   it("does not relabel a genuine not_observed that nobody is waiting on", () => {
-    for (const lifecycle of [null, "rejected", "applied"]) {
+    for (const lifecycle of [null, "applied"]) {
       const { outcome, timeline } = queued(lifecycle);
       const presentation = verifiedOutcomePresentation(outcome, timeline, "2026-08-30T00:00:00Z");
       expect(presentation.label, `lifecycle ${lifecycle} must not be read as queued`).toBe("Never happened");
     }
+  });
+
+  /**
+   * This used to pin `rejected` to "Never happened" as well. A rejected
+   * action is not queued, which still holds, but it is not an absence
+   * either: it was decided and held back, and the panel now says so (see
+   * `VerifiedOutcome.heldback.test.ts`). It must still never read as waiting.
+   */
+  it("reads a rejected action as held back, never as queued", () => {
+    const { outcome, timeline } = queued("rejected");
+    const presentation = verifiedOutcomePresentation(outcome, timeline, "2026-08-30T00:00:00Z");
+    expect(presentation.label).toBe("Held back");
+    expect(presentation.label).not.toBe("Waiting for you");
   });
 });
