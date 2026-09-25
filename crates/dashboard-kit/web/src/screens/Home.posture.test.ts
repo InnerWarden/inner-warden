@@ -29,7 +29,11 @@ describe("the unknown posture on a paid host", () => {
   it("says why the counter is zero instead of implying nothing is protected", () => {
     const body = ENTERPRISE_UNKNOWN_POSTURE.body.toLowerCase();
     expect(body).toContain("not running on this host");
-    expect(body).toContain("posture");
+    // It points at the screen that answers it, by the name the paid tab
+    // carries: "Protection" (the route is still `posture`).
+    expect(ENTERPRISE_UNKNOWN_POSTURE.body).toContain("See Protection");
+    expect(ENTERPRISE_UNKNOWN_POSTURE.title).toContain("Protection");
+    expect(`${ENTERPRISE_UNKNOWN_POSTURE.title} ${ENTERPRISE_UNKNOWN_POSTURE.body}`).not.toContain("Posture");
   });
 });
 

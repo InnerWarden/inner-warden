@@ -12,7 +12,10 @@ import { StatusBadge } from "./components/StatusBadge";
 import { resolveDashboardEdition } from "./edition";
 import { normaliseMode } from "./presentation";
 import { Activity, type ActivityTarget } from "./screens/Activity";
-import { Home } from "./screens/Home";
+import { Home, type MachinePanels } from "./screens/Home";
+import { isCaseLane, type CaseLane } from "./api/lanes";
+import type { CaseListWindow } from "./api/cases";
+import type { LaneOpenOptions } from "./components/LaneCards";
 import { Agents } from "./screens/Agents";
 import { Posture } from "./screens/Posture";
 import { TokenIntelligence } from "./screens/TokenIntelligence";
@@ -41,6 +44,9 @@ export type ShellRoute = BaseShellRoute | (string & {});
 export const POSTURE_REFRESH_MS = 5 * 60_000;
 
 const BASE_ROUTES: readonly string[] = ["overview", "activity", "posture", "agents", "tokens"];
+
+/** The Enterprise tab for the `posture` route. */
+export const PROTECTION_LABEL = "Protection";
 
 /**
  * Context the shell hands to a contributed screen.
@@ -117,7 +123,12 @@ export function deriveShellNavigation(
 
   const items: HeaderNavigationItem<ShellRoute>[] = [{ route: "overview", label: "Overview" }];
   if (bootstrap.capabilities.some((capability) => capability.tier === "enterprise_core")) {
-    items.push({ route: "posture", label: "Posture" });
+    // "Protection", not "Posture": the screen answers what is switched on to
+    // protect this host, and "posture" is our word for it, not a reader's.
+    // The route stays `posture`, so every link and bookmark keeps working.
+    // Community's navigation never offers this screen, so it has no name to
+    // keep there.
+    items.push({ route: "posture", label: PROTECTION_LABEL });
   }
   // Availability, not mere presence. The capability contract requires the
   // Enterprise superset to PUBLISH every Community id, so an id being in the
@@ -189,7 +200,7 @@ function routeFromLocation(extraScreens: readonly ScreenModule[]): ShellRoute {
  */
 const SCREEN_PARAMS = [
   "q", "outcome", "severity", "status", "mode", "authority", "capability", "scope_kind",
-  "scope", "window", "cursor", "case", "decision", "session", "verdict", "action",
+  "scope", "window", "cursor", "case", "decision", "session", "verdict", "action", "lane",
 ] as const;
 
 const ACTIVITY_PARAM_LIMIT = 256;
@@ -251,12 +262,15 @@ export function activityUrl(
  * click-through target for anything on Home that shows a decision or an event
  * with a case behind it.
  */
-export function caseUrl(caseId: string | undefined, current: string): URL {
+export function caseUrl(caseId: string | undefined, current: string, lane?: CaseLane): URL {
   const url = new URL(current);
   for (const name of SCREEN_PARAMS) url.searchParams.delete(name);
   url.searchParams.set("view", "cases");
   if (caseId !== undefined && caseId.length > 0 && caseId.length <= 256) {
     url.searchParams.set("case", caseId);
+    // A case opened from a lane card opens inside that lane, so the list
+    // beside it is the one the card was about.
+    if (isCaseLane(lane)) url.searchParams.set("lane", lane);
     // The window has to travel with the case, and this used to return before
     // setting it. A deep link names ONE case; the Cases list then applied its
     // default last-24-hours filter to it, so opening anything older landed on a
@@ -292,6 +306,41 @@ export function caseQueueUrl(current: string): URL {
   url.searchParams.set("status", "waiting");
   url.searchParams.set("window", "all");
   return url;
+}
+
+/**
+ * The Cases screen opened on one lane: where each Overview lane card sends
+ * its reader, in the window the card counted, so the list and the number
+ * describe the same span. `status` narrows it to what is waiting on a person
+ * within the lane.
+ */
+export function caseLaneUrl(
+  lane: CaseLane,
+  options: { window?: CaseListWindow; status?: "waiting" },
+  current: string,
+): URL {
+  const url = caseUrl(undefined, current);
+  url.searchParams.set("lane", lane);
+  url.searchParams.set("window", options.window ?? "all");
+  if (options.status !== undefined) url.searchParams.set("status", options.status);
+  return url;
+}
+
+/**
+ * Which of the Overview's agent and token panels an Enterprise shell offers.
+ *
+ * The same availability rule as the nav: a source the host reports as
+ * `not_configured` earns no tab, and on the lanes Overview no panel either.
+ * An absent capability keeps the panel, as before.
+ */
+export function machinePanelsFor(bootstrap: DashboardBootstrap | undefined): MachinePanels | undefined {
+  if (bootstrap === undefined) return undefined;
+  const configured = (id: string) =>
+    bootstrap.capabilities.find((capability) => capability.id === id)?.availability !== "not_configured";
+  return {
+    agents: configured("community.agent_discovery"),
+    tokens: configured("community.token_intelligence"),
+  };
 }
 
 function resourceData<T>(resource: DashboardResource<T>): T | undefined {
@@ -569,8 +618,12 @@ export function App({
     window.history.pushState({}, "", activityUrl(target, window.location.href));
     setRoute("activity");
   };
-  const openCase = (caseId?: string) => {
-    window.history.pushState({}, "", caseUrl(caseId, window.location.href));
+  const openCase = (caseId?: string, lane?: CaseLane) => {
+    window.history.pushState({}, "", caseUrl(caseId, window.location.href, lane));
+    setRoute("cases");
+  };
+  const openLane = (lane: CaseLane, options: LaneOpenOptions) => {
+    window.history.pushState({}, "", caseLaneUrl(lane, options, window.location.href));
     setRoute("cases");
   };
   const openQueue = () => {
@@ -618,6 +671,7 @@ export function App({
             onOpenActivity={openActivity}
             onOpenCase={casesAvailable ? openCase : undefined}
             onOpenQueue={casesAvailable ? openQueue : undefined}
+            onOpenLane={casesAvailable ? openLane : undefined}
             evaluatedAt={consumerEvaluatedAt}
             extraScreens={contributed}
             onCheckNow={refreshPostureNow}
@@ -647,6 +701,7 @@ function EnterpriseRoute({
   onOpenActivity,
   onOpenCase,
   onOpenQueue,
+  onOpenLane,
   evaluatedAt,
   extraScreens,
   onCheckNow,
@@ -661,9 +716,11 @@ function EnterpriseRoute({
   tokenIntelligence?: DashboardBootstrap["capabilities"][number];
   meta?: DashboardMeta;
   onOpenActivity: (target?: Omit<ActivityTarget, "requestId">) => void;
-  onOpenCase?: (caseId?: string) => void;
+  onOpenCase?: (caseId?: string, lane?: CaseLane) => void;
   /** Opens the Cases screen on the waiting queue; see `caseQueueUrl`. */
   onOpenQueue?: () => void;
+  /** Opens the Cases screen on one lane; see `caseLaneUrl`. */
+  onOpenLane?: (lane: CaseLane, options: LaneOpenOptions) => void;
   evaluatedAt: string;
   extraScreens: readonly ScreenModule[];
   /** Force a posture re-read on demand; see `POSTURE_REFRESH_MS`. */
@@ -712,7 +769,17 @@ function EnterpriseRoute({
     );
   }
 
-  return <Home meta={meta} onOpenActivity={onOpenActivity} onOpenCase={onOpenCase} onOpenQueue={onOpenQueue} edition="enterprise" />;
+  return (
+    <Home
+      meta={meta}
+      onOpenActivity={onOpenActivity}
+      onOpenCase={onOpenCase}
+      onOpenQueue={onOpenQueue}
+      onOpenLane={onOpenLane}
+      machinePanels={machinePanelsFor(bootstrap)}
+      edition="enterprise"
+    />
+  );
 }
 
 function EnterpriseSessionStatus({ resource }: { resource: DashboardResource<DashboardBootstrap> }) {

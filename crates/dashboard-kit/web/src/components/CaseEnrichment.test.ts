@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { CaseEnrichment } from "../api/cases";
-import { ENRICHMENT_ORDER, REPORTED_NOT_VERIFIED, enrichmentOrder } from "./CaseEnrichment";
+import { ENRICHMENT_ORDER, enrichmentOrder } from "./CaseEnrichment";
 
 function enrichment(overrides: Partial<CaseEnrichment> = {}): CaseEnrichment {
   return {
@@ -65,11 +65,7 @@ describe("a case answers where it came from before it explains itself", () => {
   });
 });
 
-describe("the not-verified truth is a footnote, not a status badge", () => {
-  // It was a StatusBadge in the section header on every case: a control styled
-  // as something to act on, for a standing property of every case there is.
-  it("keeps the honesty and points at where the answer is", () => {
-    expect(REPORTED_NOT_VERIFIED).toContain("not been independently verified");
-    expect(REPORTED_NOT_VERIFIED).toContain("What the system did about it is below");
-  });
-});
+// The footnote that closed this section ("It has not been independently
+// verified. What the system did about it is below.") is gone: see
+// `CaseEnrichment.render.test.tsx`, which renders the section and pins its
+// absence.

@@ -11,7 +11,7 @@ test("Enterprise mounts the shared shell without inventing host outcomes", async
   await expect(page.getByText("Enterprise", { exact: true })).toBeVisible();
   await expect(page.getByText("Authenticated", { exact: true })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Enterprise posture is not part of this installation" })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Posture" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Protection" })).toHaveCount(0);
   await expect(page.getByRole("heading", { name: "Runtime assurance foundation" })).toHaveCount(0);
   await expect(page.getByRole("heading", { name: "No layers reported" })).toHaveCount(0);
   await expect(page.getByText("Verified active enforcement", { exact: true })).toHaveCount(0);

@@ -1,0 +1,57 @@
+{
+  "actual_blocks": 0,
+  "allow_verdicts": 0,
+  "allowed": 0,
+  "blocked": 0,
+  "commands": 0,
+  "denies_without_block": 0,
+  "deny_verdicts": 0,
+  "guard_state": "no_decisions_yet",
+  "guard_state_detail": "InnerWarden is recording, and no agent decision has been screened yet. Connect an AI agent with `innerwarden agents connect --all` and the first decision will appear here.",
+  "headline": {
+    "body": "The decision counter reads zero: no agent action has been screened here yet. This counter records what was screened. It is not a measure of what this host is protected by: the enforcement layers actually in effect are reported on Posture.",
+    "label": "No decisions recorded yet",
+    "title": "Nothing has been screened on this host yet."
+  },
+  "lanes": {
+    "agent_actions": {
+      "availability": "available",
+      "count": 0,
+      "count_of": "commands",
+      "lane": "agent_actions",
+      "latest": null,
+      "sentence": "Your AI agent ran no command through InnerWarden in the last 7 days.",
+      "waiting": 0,
+      "window": "7d"
+    },
+    "agent_messages": {
+      "availability": "no_source",
+      "count_of": "messages",
+      "lane": "agent_messages",
+      "latest": null,
+      "sentence": "InnerWarden is not reading your AI agent's messages yet, so one it turns down on its own leaves no record. What it tries to run is still checked.",
+      "waiting": null,
+      "window": "7d"
+    },
+    "server_attacks": {
+      "availability": "available",
+      "count": 0,
+      "count_of": "findings",
+      "lane": "server_attacks",
+      "latest": null,
+      "sentence": "0 findings about this server in the last 24 hours.",
+      "waiting": null,
+      "window": "24h"
+    }
+  },
+  "outcomes_unknown": 0,
+  "recent_blocks": [],
+  "recent_decisions": [],
+  "review": 0,
+  "review_verdicts": 0,
+  "screened": 0,
+  "sessions": 0,
+  "top_categories": [],
+  "unknown_verdicts": 0,
+  "would_block": 0
+}

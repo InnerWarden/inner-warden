@@ -1,0 +1,92 @@
+{
+  "generated_at": "2026-09-25T17:44:59.647388Z",
+  "items": [
+    {
+      "id": "case:incident:0e1a266ce6b5709b6d10e4871c2e121a3cf537e66d39207a1c52590701a522b2",
+      "latest_event_at": "2026-09-25T17:04:59.148038Z",
+      "outcome": "observed_only",
+      "recurrence_occurrences": "1",
+      "scope": [
+        {
+          "display_name": "this host",
+          "evidence": [],
+          "id": "host:local",
+          "kind": "host",
+          "verification": "configured"
+        },
+        {
+          "display_name": "local tenant",
+          "evidence": [],
+          "id": "tenant:local",
+          "kind": "tenant",
+          "verification": "configured"
+        }
+      ],
+      "severity": "critical",
+      "status": "open",
+      "title": "Possible SSH brute force from 203.0.0.1"
+    },
+    {
+      "id": "case:incident:588a970cfa3f847f559a7dfac1f5e92cef7803dae170e04f80f4cc4c2f22e098",
+      "latest_event_at": "2026-09-25T17:04:59.148038Z",
+      "outcome": "observed_only",
+      "recurrence_occurrences": "1",
+      "scope": [
+        {
+          "display_name": "this host",
+          "evidence": [],
+          "id": "host:local",
+          "kind": "host",
+          "verification": "configured"
+        },
+        {
+          "display_name": "local tenant",
+          "evidence": [],
+          "id": "tenant:local",
+          "kind": "tenant",
+          "verification": "configured"
+        }
+      ],
+      "severity": "critical",
+      "status": "open",
+      "title": "Possible SSH brute force from 203.0.0.2"
+    },
+    {
+      "id": "case:incident:932f826b1d13e9ad7b0903955c2c3aa17c99082ec3ea4a51148875d9812fcf80",
+      "latest_event_at": "2026-09-25T17:04:59.148038Z",
+      "outcome": "observed_only",
+      "recurrence_occurrences": "1",
+      "scope": [
+        {
+          "display_name": "this host",
+          "evidence": [],
+          "id": "host:local",
+          "kind": "host",
+          "verification": "configured"
+        },
+        {
+          "display_name": "local tenant",
+          "evidence": [],
+          "id": "tenant:local",
+          "kind": "tenant",
+          "verification": "configured"
+        }
+      ],
+      "severity": "critical",
+      "status": "open",
+      "title": "Possible SSH brute force from 203.0.0.3"
+    }
+  ],
+  "lane_counts": {
+    "agent_actions": 1,
+    "agent_messages": 1,
+    "other": 2,
+    "server_attacks": 3
+  },
+  "next_cursor": null,
+  "rows_in_window": 3,
+  "schema_version": "innerwarden.dashboard.v1",
+  "total_in_window": 3,
+  "window": "7d",
+  "window_complete": true
+}

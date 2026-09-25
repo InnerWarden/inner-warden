@@ -1,7 +1,7 @@
 import type { CaseEvent, VerifiedOutcome as VerifiedOutcomeRecord } from "../api/cases";
 import type { SecurityOutcome } from "../api/v1";
 import { StatusBadge, type StatusTone } from "./StatusBadge";
-import { formatAbsolute } from "../presentation";
+import { formatAbsolute, readsAsPlainWords } from "../presentation";
 import { EvidenceLinks } from "./CaseTimeline";
 import { TechnicalOnly } from "./TechnicalDetail";
 
@@ -72,6 +72,20 @@ export function verifiedOutcomePresentation(outcome: VerifiedOutcomeRecord, time
       meaning: "It is waiting for a person to apply it. It has not been missed and it has not failed.",
     };
   }
+  const heldBack = outcome.outcome === "not_observed" ? heldBackReason(outcome, timeline) : undefined;
+  if (heldBack !== undefined) {
+    // Same rule as the pending case above: the wire value stays, only the
+    // words a person reads change.
+    return {
+      trusted: true,
+      independentlyChecked,
+      status: outcome.outcome,
+      label: "Held back",
+      tone: "informational",
+      explanation: outcome.trust_explanation,
+      meaning: `Held back: ${heldBack}`,
+    };
+  }
   return {
     trusted: true,
     independentlyChecked,
@@ -81,6 +95,104 @@ export function verifiedOutcomePresentation(outcome: VerifiedOutcomeRecord, time
     explanation: outcome.trust_explanation,
     meaning: outcomeMeaning(outcome.outcome),
   };
+}
+
+/**
+ * Why an action was decided and then not carried out, when the record says
+ * so.
+ *
+ * A block skipped because the address belongs to a cloud provider, or refused
+ * because it is the management network, projects to lifecycle `rejected` with
+ * outcome `not_observed`, because nothing was observed to happen to the
+ * attack. The panel rendered the outcome alone: "Never happened" and "There
+ * is no record of this happening", over a timeline whose next step read
+ * "Executor result: skipped: ... is in cloud provider safelist". Both were
+ * true, and together they told the reader the attack never happened.
+ *
+ * The lifecycle is already on the wire (`action_lifecycle` on the timeline
+ * event of the attempt), so this reads it rather than adding a field the
+ * exact case parser would reject on an older bundle. The event is the one
+ * whose evidence is the outcome's own; failing that, the only rejected event
+ * on the case; failing that, none, and the outcome keeps its own words.
+ */
+export function heldBackReason(outcome: Pick<VerifiedOutcomeRecord, "evidence">, timeline: CaseEvent[]): string | undefined {
+  const rejected = timeline.filter((event) => event.action_lifecycle === "rejected");
+  if (rejected.length === 0) return undefined;
+  const own = new Set(outcome.evidence.map((entry) => entry.id));
+  const event = rejected.find((candidate) => (candidate.source_refs ?? []).some((entry) => own.has(entry.id)))
+    ?? (rejected.length === 1 ? rejected[0] : undefined);
+  if (event === undefined) return undefined;
+  return sentence(heldBackWords(event));
+}
+
+/**
+ * Said when a PERSON decided not to act. The executor writes "ignored by
+ * operator", "dismissed by operator" and "rejected by operator <name>" for a
+ * choice made in chat, and the generic words for "ignored" and "dismissed"
+ * below credit the automatic review with it, which is the wrong actor.
+ */
+const HELD_BACK_BY_A_PERSON = "a person chose not to act on it";
+
+/** Result words the executor writes that mean "decided, then not done". */
+const HELD_BACK_PLAIN: Record<string, string | undefined> = {
+  "rate-limited": "too many blocks in the last minute",
+  dismissed: "the automatic review decided it was not worth acting on",
+  ignored: "the automatic review decided it was not worth acting on",
+  suppressed: "it matched your allowlist",
+  redecided: "a later decision replaced it",
+  // The executor's own reason follows these, and it is already a sentence.
+  skipped: undefined,
+  refused: undefined,
+  "not executed": undefined,
+};
+
+const HELD_BACK_FALLBACK = "it was decided, and then not carried out";
+
+/**
+ * The executor's own reasons that have plain words, by family. Its lines name
+ * a skill by its id ("kill-process skill not available"), print the model's
+ * raw confidence ("AI did not recommend auto-execution (0.42)") or a config
+ * key, and each family says one thing a person can act on.
+ */
+const HELD_BACK_REASONS: readonly (readonly [RegExp, string])[] = [
+  [/\bresponder disabled\b|\bskill\b.*\bnot (?:available|allowed|in allowed_skills)\b|^no \S+ skill available\b/i, "this response is not switched on here"],
+  [/^AI did not recommend auto-execution\b/i, "the review did not recommend acting automatically"],
+  [/^confidence\b.*\bbelow threshold\b/i, "the review was not confident enough to act automatically"],
+  [/^already blocked\b/i, "it was already blocked"],
+  [/^circuit breaker tripped\b/i, "too many blocks in the last hour"],
+  [/\ballowlist/i, "it matched your allowlist"],
+];
+
+/**
+ * The reason in words, never in the executor's tokens.
+ *
+ * A rehearsal is held back by the mode, whatever the line says. Otherwise the
+ * line is "Executor result: <result>: <reason>"; a result that has its own
+ * plain words uses them, and one that is followed by the executor's reason
+ * uses that reason, but only when it reads as a sentence. A reason carrying
+ * an identifier, a digest or `key=value` markers is not shown, because this
+ * is the plain view: the whole line is still on the timeline for whoever
+ * wants it.
+ */
+function heldBackWords(event: Pick<CaseEvent, "summary" | "mode">): string {
+  if (event.mode === "rehearse") return "this server is in watch mode, so nothing was enforced";
+  const line = (event.summary ?? "").trim().replace(/^executor result:\s*/i, "");
+  // Before the result words: "dismissed by operator" is a person's choice,
+  // and "dismissed" alone would hand it to the automatic review.
+  if (/\bby (?:the )?operator\b/i.test(line)) return HELD_BACK_BY_A_PERSON;
+  const match = /^(rate-limited|dismissed|ignored|suppressed|redecided|skipped|refused|not executed)\b[:\s]*(.*)$/is.exec(line);
+  if (match === null) return HELD_BACK_FALLBACK;
+  const plain = HELD_BACK_PLAIN[match[1].toLowerCase()];
+  if (plain !== undefined) return plain;
+  const reason = match[2].trim();
+  const family = HELD_BACK_REASONS.find(([pattern]) => pattern.test(reason));
+  if (family !== undefined) return family[1];
+  return readsAsPlainWords(reason, 240) ? reason : HELD_BACK_FALLBACK;
+}
+
+function sentence(text: string): string {
+  const trimmed = text.trim();
+  return /[.!?]$/.test(trimmed) ? trimmed : `${trimmed}.`;
 }
 
 /**

@@ -27,16 +27,35 @@ const PRODUCT_LABELS: Record<string, string> = {
   local_session_log: "Local session log",
 };
 
-export function MachineIntelligence({ edition }: { edition?: "community" | "enterprise" } = {}) {
-  const agents = usePollingResource(fetchAgents, 30_000, agentsAreLoading);
-  const tokens = usePollingResource(fetchTokenIntelligence, 60_000, tokensAreLoading);
-
+/**
+ * The agent and token panels.
+ *
+ * `showAgents` and `showTokens` let a shell leave out a panel whose source it
+ * already knows is not configured (see `LanesOverview` in Home). Both default
+ * to shown, which is every caller before they existed. A panel left out is
+ * not polled either.
+ */
+export function MachineIntelligence({ edition, showAgents = true, showTokens = true }: {
+  edition?: "community" | "enterprise";
+  showAgents?: boolean;
+  showTokens?: boolean;
+} = {}) {
   return (
     <div className="space-y-6">
-      <AgentsPanel state={agents} edition={edition} />
-      <TokenPanel state={tokens} />
+      {showAgents ? <PolledAgentsPanel edition={edition} /> : null}
+      {showTokens ? <PolledTokenPanel /> : null}
     </div>
   );
+}
+
+function PolledAgentsPanel({ edition }: { edition?: "community" | "enterprise" }) {
+  const agents = usePollingResource(fetchAgents, 30_000, agentsAreLoading);
+  return <AgentsPanel state={agents} edition={edition} />;
+}
+
+function PolledTokenPanel() {
+  const tokens = usePollingResource(fetchTokenIntelligence, 60_000, tokensAreLoading);
+  return <TokenPanel state={tokens} />;
 }
 
 /// A poll the operator does not see.

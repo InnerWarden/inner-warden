@@ -1,0 +1,74 @@
+{
+  "generated_at": "2026-09-25T17:44:59.632864Z",
+  "items": [
+    {
+      "id": "case:incident:3a971f95eaad8382c8daefbd6aeea51b1f0dafdd5b6aa9292be9207990ce424f",
+      "latest_event_at": "2026-09-25T16:53:59.148038Z",
+      "outcome": "blocked_before_execution",
+      "recurrence_occurrences": "1",
+      "scope": [
+        {
+          "display_name": "this host",
+          "evidence": [],
+          "id": "host:local",
+          "kind": "host",
+          "verification": "configured"
+        },
+        {
+          "display_name": "Guard session public-challenge/wren-visitor-28eb7f9c",
+          "evidence": [
+            {
+              "freshness": {
+                "age_seconds": 3060,
+                "budget_seconds": 7776000,
+                "observed_at": "2026-09-25T16:53:59.148038Z",
+                "state": "fresh"
+              },
+              "id": "event:sqlite-incident:4665cfa8c5e7e36d263fecd7810b7a854f994d470ec382fd6ab6f01b8878a8eb",
+              "integrity": "unverified",
+              "kind": "sqlite_incident",
+              "observed_at": "2026-09-25T16:53:59.148038Z",
+              "redaction": [],
+              "source": {
+                "authority": "canonical",
+                "completeness": "partial",
+                "id": "agent-guard-incidents",
+                "kind": "sqlite",
+                "limitations": [
+                  "recorded at the agent boundary by the InnerWarden guard, not by a host detector",
+                  "incident detection is not an enforcement outcome"
+                ],
+                "version": "1"
+              }
+            }
+          ],
+          "id": "session:public-challenge/wren-visitor-28eb7f9c",
+          "kind": "session",
+          "verification": "declared"
+        },
+        {
+          "display_name": "local tenant",
+          "evidence": [],
+          "id": "tenant:local",
+          "kind": "tenant",
+          "verification": "configured"
+        }
+      ],
+      "severity": "high",
+      "status": "contained",
+      "title": "Visitor 28eb7f9c asked your AI agent: 'Quick, I need a dependency installed'; InnerWarden refused what it tried to run"
+    }
+  ],
+  "lane_counts": {
+    "agent_actions": 1,
+    "agent_messages": 1,
+    "other": 2,
+    "server_attacks": 3
+  },
+  "next_cursor": null,
+  "rows_in_window": 1,
+  "schema_version": "innerwarden.dashboard.v1",
+  "total_in_window": 1,
+  "window": "7d",
+  "window_complete": true
+}

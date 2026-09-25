@@ -74,7 +74,7 @@ describe("deriveShellNavigation", () => {
     const tokens = capability("community.token_intelligence", "community", "not_required", "available");
     expect(deriveShellNavigation(bootstrap("enterprise", [host, agents, tokens]), "enterprise")).toEqual([
       { route: "overview", label: "Overview" },
-      { route: "posture", label: "Posture" },
+      { route: "posture", label: "Protection" },
       { route: "agents", label: "Agents" },
       { route: "tokens", label: "Tokens" },
     ]);
@@ -90,7 +90,7 @@ describe("deriveShellNavigation", () => {
     const agents = capability("community.agent_discovery", "community", "not_required", "unavailable");
     expect(deriveShellNavigation(bootstrap("enterprise", [host, tokens, agents]), "enterprise")).toEqual([
       { route: "overview", label: "Overview" },
-      { route: "posture", label: "Posture" },
+      { route: "posture", label: "Protection" },
     ]);
   });
 
@@ -104,7 +104,7 @@ describe("deriveShellNavigation", () => {
     const host = capability("kernel_execution_control", "enterprise_core", "valid");
     expect(deriveShellNavigation(bootstrap("enterprise", [host]), "enterprise")).toEqual([
       { route: "overview", label: "Overview" },
-      { route: "posture", label: "Posture" },
+      { route: "posture", label: "Protection" },
     ]);
   });
 });
@@ -130,7 +130,7 @@ describe("contributed screens", () => {
     ]);
     expect(navigation).toEqual([
       { route: "overview", label: "Overview" },
-      { route: "posture", label: "Posture" },
+      { route: "posture", label: "Protection" },
       { route: "cases", label: "CASES" },
     ]);
   });
@@ -150,7 +150,7 @@ describe("contributed screens", () => {
       contributedScreen("posture", true),
     ]);
     expect(navigation.filter((item) => item.route === "posture")).toEqual([
-      { route: "posture", label: "Posture" },
+      { route: "posture", label: "Protection" },
     ]);
   });
 
@@ -183,7 +183,7 @@ describe("resolveRoute", () => {
 describe("shouldResetToOverview", () => {
   const navigation = [
     { route: "overview" as const, label: "Overview" },
-    { route: "posture" as const, label: "Posture" },
+    { route: "posture" as const, label: "Protection" },
   ];
 
   it("resets a route the navigation does not offer", () => {
