@@ -40,14 +40,21 @@ const distAssets = join(webRoot, "dist", "assets");
 // longer drags in). That is known, wanted growth, so the line moves to
 // 600,000B and keeps a margin for the paid Cases screen to wire the tabs; it
 // does not move to wherever the bundle happens to be.
+//
+// Re-measured 2026-09-26 for the paid edition's analyst tools: a verdict on the
+// case, blocking an address with a confirmation, the exclusion dialog and an
+// Exclusions screen. With them the Enterprise bundle is 635,135B of JS and
+// 685,546B of assets. Community does not carry them and is unchanged. The JS
+// and single-asset lines move to 700,000B and the asset total to 760,000B,
+// about 10% over the measured bundle: room for known work, not a blank cheque.
 const FIRST_MEANINGFUL_CONTENT_BUDGET_MS = 4_000;
 const POLL_MIN_GAP_MS = 4_000; // the shell polls on a 5s interval; allow scheduling slack
 const POLL_MAX_REQUESTS_IN_WINDOW = 3; // over a ~7.5s observation window
 const MAX_CASES_PER_PAGE = 50; // a page must stay bounded regardless of the backend
-const MAX_TOTAL_JS_BYTES = 600_000;
+const MAX_TOTAL_JS_BYTES = 700_000;
 const MAX_TOTAL_CSS_BYTES = 60_000;
-const MAX_SINGLE_ASSET_BYTES = 600_000;
-const MAX_TOTAL_ASSET_BYTES = 680_000;
+const MAX_SINGLE_ASSET_BYTES = 700_000;
+const MAX_TOTAL_ASSET_BYTES = 760_000;
 
 const COMMUNITY_META = {
   version: "0.16.4-fixture",
