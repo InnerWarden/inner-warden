@@ -80,7 +80,7 @@ const distAssets = join(webRoot, "dist", "assets");
 // and a case that tells its story (the four step ladder, who it was, what the
 // agent tried and who stopped it, the events in order, what it touched). Built
 // from this kit composed with the paid delta, the Enterprise bundle is
-// 810,886B of JS, 58,207B of CSS and 869,093B of assets (766,733B of JS
+// 810,981B of JS, 58,454B of CSS and 869,435B of assets (766,733B of JS
 // before). Community grows by under 2KB (421,525B of JS). The CSS was held
 // under its line by reusing utilities, so the 60,000B CSS line does not move.
 // The JS and single-asset lines move to the measured bundle plus 16,000B,
