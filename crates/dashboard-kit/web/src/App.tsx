@@ -794,8 +794,15 @@ function EnterpriseRoute({
   );
 }
 
+/**
+ * A calm status keeps its symbol and says its words to screen readers only
+ * below 400 px, where the words cost the header a row. A status that asks
+ * for something keeps its words at every width.
+ */
+const NARROW_LABEL = "max-[399px]:sr-only";
+
 function EnterpriseSessionStatus({ resource }: { resource: DashboardResource<DashboardBootstrap> }) {
-  if (resource.state === "ready" && resource.data.session.authenticated) return <StatusBadge status="available" label="Authenticated" />;
+  if (resource.state === "ready" && resource.data.session.authenticated) return <StatusBadge status="available" label="Authenticated" labelClassName={NARROW_LABEL} />;
   if (resource.state === "ready") return <StatusBadge status="unavailable" label="Authentication required" />;
   if (resource.state === "stale") {
     const label = resource.problem.httpStatus === 401 ? "Authentication required" : "Session status stale";
@@ -849,7 +856,7 @@ function ExposureStatus({ status, exposed }: { status: MetaStatus; exposed?: boo
     return <StatusBadge status={exposed === true ? "failed" : "stale"} label={label} />;
   }
   if (exposed === true) return <StatusBadge status="failed" label="Exposed · no authentication" />;
-  if (exposed === false) return <StatusBadge status="available" label="Local · read-only API" />;
+  if (exposed === false) return <StatusBadge status="available" label="Local · read-only API" labelClassName={NARROW_LABEL} />;
   return <StatusBadge status="unknown" label="Exposure unknown" />;
 }
 
@@ -863,5 +870,12 @@ function ModePill({ mode }: { mode: GuardrailMode }) {
     unknown: "Status unknown",
   };
   const status = mode === "mixed" || mode === "partial" ? "degraded" : mode === "unknown" ? "unknown" : mode === "not_configured" ? "not_configured" : "available";
-  return <StatusBadge status={status} label={labels[mode]} className="hidden sm:inline-flex" />;
+  // Wrapped, because the badge draws itself inline-flex and the stylesheet
+  // decides which of two display classes on one element wins: the pill was
+  // meant to leave narrow screens and did not.
+  return (
+    <span className="hidden sm:inline-flex">
+      <StatusBadge status={status} label={labels[mode]} />
+    </span>
+  );
 }

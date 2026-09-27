@@ -92,11 +92,14 @@ export function StatusBadge({
   label,
   tone,
   className = "",
+  labelClassName = "",
 }: {
   status: string;
   label?: string;
   tone?: StatusTone;
   className?: string;
+  /** Classes for the label alone, e.g. to keep it for screen readers only on a narrow screen. */
+  labelClassName?: string;
 }) {
   const presentation = statusPresentation(status, label, tone);
   const classes: Record<StatusTone, string> = {
@@ -117,7 +120,7 @@ export function StatusBadge({
           boundaries and keeps its min-content width at the longest word, so a
           short single-word label like "medium" never shatters into a vertical
           char stack when a sibling flex item is wide. */}
-      <span className="min-w-0 break-words">{presentation.label}</span>
+      <span className={`min-w-0 break-words ${labelClassName}`.trim()}>{presentation.label}</span>
     </span>
   );
 }

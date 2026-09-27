@@ -741,7 +741,7 @@ export function Posture({
                 <li
                   key={pill.name}
                   title={pill.reason}
-                  className={`inline-flex max-w-full items-center gap-2 rounded-full border px-3 py-1.5 text-xs font-semibold ${
+                  className={`inline-flex max-w-full flex-wrap items-center gap-x-2 gap-y-0.5 rounded-full border px-3 py-1.5 text-xs font-semibold ${
                     pill.tone === "positive"
                       ? "border-emerald-200 bg-emerald-50 text-emerald-900"
                       : pill.tone === "attention"
@@ -752,7 +752,9 @@ export function Posture({
                   }`}
                 >
                   <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-current opacity-70" aria-hidden="true" />
-                  <span className="truncate">{pill.name}</span>
+                  {/* Wrapped, never cut: at 320 px "Independent host
+                      execution" was cut to "Independent ho..." */}
+                  <span className="min-w-0 break-words">{pill.name}</span>
                   <span className="shrink-0 font-medium opacity-80">{pill.mode}</span>
                 </li>
               ))}

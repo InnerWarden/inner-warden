@@ -759,7 +759,9 @@ export function TourLauncher({
   }, [storageKey]);
 
   useEffect(() => {
-    const find = () => document.querySelector("header div.ml-auto");
+    // The header's own slot first (inside its small-screen menu), then the
+    // header's status area, as before.
+    const find = () => document.querySelector("header [data-tour-slot]") ?? document.querySelector("header div.ml-auto");
     const existing = find();
     if (existing !== null) {
       setSlot(existing);
