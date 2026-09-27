@@ -679,7 +679,7 @@ export function App({
         ) : edition === "enterprise" && bootstrap ? (
           <DashboardContractState resource={bootstrapResource} />
         ) : edition === "community" ? (
-          route === "activity" ? <Activity initialTarget={activityTarget} /> : <Home meta={freshMeta} onOpenActivity={openActivity} edition="community" />
+          route === "activity" ? <Activity initialTarget={activityTarget} /> : <Home meta={freshMeta} onOpenActivity={openActivity} edition="community" dashboardAccess={bootstrap?.dashboard_access} />
         ) : (
           <DashboardContractState resource={bootstrapResource} />
         )}
@@ -778,6 +778,7 @@ function EnterpriseRoute({
       onOpenLane={onOpenLane}
       machinePanels={machinePanelsFor(bootstrap)}
       edition="enterprise"
+      dashboardAccess={bootstrap.dashboard_access}
     />
   );
 }

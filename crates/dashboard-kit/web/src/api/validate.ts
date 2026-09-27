@@ -1,4 +1,5 @@
 import {
+  DASHBOARD_ACCESS,
   DASHBOARD_SCHEMA_VERSION,
   type AgentCapabilityState,
   type AgentInventory,
@@ -8,6 +9,7 @@ import {
   type CapabilityStatus,
   type ClaimRecord,
   type CoverageGap,
+  type DashboardAccess,
   type DashboardBootstrap,
   type DashboardPosture,
   type EgressPath,
@@ -298,13 +300,27 @@ function egressPath(value: unknown, path: string): EgressPath {
   };
 }
 
+/**
+ * `dashboard_access`, read leniently: a value this bundle does not know is
+ * read as not sent, never as a reason to refuse the whole bootstrap. The
+ * bootstrap decides whether the dashboard renders at all, and one optional
+ * word must not cost the reader every screen.
+ */
+export function dashboardAccessOf(value: unknown): DashboardAccess | undefined {
+  return DASHBOARD_ACCESS.find((candidate) => candidate === value);
+}
+
 export function parseDashboardBootstrap(value: unknown): DashboardBootstrap {
   const item = record(value, "bootstrap");
   if (item.schema_version !== DASHBOARD_SCHEMA_VERSION) throw new Error("bootstrap.schema_version: unsupported contract version");
   const platform = record(item.platform, "bootstrap.platform");
   const session = record(item.session, "bootstrap.session");
   const privacy = record(item.privacy, "bootstrap.privacy");
+  const access = dashboardAccessOf(item.dashboard_access);
   return {
+    // Only when sent and known: an older server's bootstrap has no such key,
+    // and the parsed value must not grow one either.
+    ...(access === undefined ? {} : { dashboard_access: access }),
     schema_version: DASHBOARD_SCHEMA_VERSION, generated_at: text(item.generated_at, "bootstrap.generated_at"),
     edition: oneOf(item.edition, ["community", "enterprise"] as const, "bootstrap.edition"), product_version: text(item.product_version, "bootstrap.product_version"),
     community_contract: versionRef(item.community_contract, "bootstrap.community_contract"),

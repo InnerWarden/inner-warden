@@ -9,6 +9,7 @@ import {
   type Overview,
 } from "../api";
 import type { CaseLane } from "../api/cases";
+import type { DashboardAccess } from "../api/v1";
 import { DecidedBy } from "../components/DecidedBy";
 import { LaneCards, type LaneOpenOptions } from "../components/LaneCards";
 import { MachineIntelligence } from "../components/MachineIntelligence";
@@ -176,8 +177,11 @@ export function Home({
   onOpenLane,
   machinePanels,
   edition,
+  dashboardAccess,
 }: {
   meta?: DashboardMeta;
+  /** What this dashboard can change, as the server said it; see `dashboardAccessClaim`. */
+  dashboardAccess?: DashboardAccess;
   onOpenActivity: (target?: ActivityLink) => void;
   /**
    * Opens the Cases screen, optionally with one case selected, and with the
@@ -275,6 +279,7 @@ was incomplete; it does not mean this host is idle.`}
       onOpenQueue={onOpenQueue}
       onOpenLane={onOpenLane}
       machinePanels={machinePanels}
+      dashboardAccess={dashboardAccess}
     />
   );
 }
@@ -307,10 +312,12 @@ export function OverviewScreen({
   onOpenQueue,
   onOpenLane,
   machinePanels,
+  dashboardAccess,
 }: {
   overview: Overview;
   meta?: DashboardMeta;
   edition?: "community" | "enterprise";
+  dashboardAccess?: DashboardAccess;
   fetching?: boolean;
   reconnecting?: boolean;
   onOpenActivity: (target?: ActivityLink) => void;
@@ -323,6 +330,7 @@ export function OverviewScreen({
   const mode = normaliseMode(meta);
   const guardedAgents = meta?.guardrail?.guarded_agents;
   const laneCards = overviewLaneCards(overview.lanes);
+  const accessClaim = dashboardAccessClaim(edition, dashboardAccess);
 
   if (laneCards !== undefined) {
     return (
@@ -340,6 +348,7 @@ export function OverviewScreen({
         onOpenQueue={onOpenQueue}
         onOpenLane={onOpenLane}
         machinePanels={machinePanels}
+        accessClaim={accessClaim}
         // `?? false` reads an older server the way the layout without lanes
         // reads it: as an offer.
         activeDefenceInstalled={meta?.active_defence_installed ?? false}
@@ -351,7 +360,7 @@ export function OverviewScreen({
     <div className="min-w-0 space-y-6 sm:space-y-8" aria-busy={fetching}>
       {reconnecting && <ReconnectingNotice />}
 
-      <PostureHero mode={mode} edition={edition} decisions={overview.commands} sessions={overview.sessions} guardedAgents={guardedAgents} hostHeadline={overview.headline} />
+      <PostureHero mode={mode} edition={edition} decisions={overview.commands} sessions={overview.sessions} guardedAgents={guardedAgents} hostHeadline={overview.headline} accessClaim={accessClaim} />
 
       <MachineIntelligence edition={edition} />
 
@@ -424,11 +433,13 @@ function LanesOverview({
   onOpenLane,
   machinePanels,
   activeDefenceInstalled,
+  accessClaim,
 }: {
   overview: Overview;
   laneCards: LaneCard[];
   technical: boolean;
   activeDefenceInstalled: boolean;
+  accessClaim?: string;
   mode: GuardrailMode;
   edition?: "community" | "enterprise";
   guardedAgents?: number;
@@ -496,6 +507,7 @@ function LanesOverview({
             guardedAgents={guardedAgents}
             hostHeadline={overview.headline}
             headingLevel="h2"
+            accessClaim={accessClaim}
           />
           {agents || tokens ? <MachineIntelligence edition={edition} showAgents={agents} showTokens={tokens} /> : null}
           <SensorActivity />
@@ -671,6 +683,39 @@ function DecisionRecordSection({
   );
 }
 
+/** The data-handling line for a dashboard that changes nothing. */
+export const READ_ONLY_CLAIM = "This dashboard only reads; it changes nothing";
+
+/** The data-handling line for a dashboard that can change the host. */
+export const CONFIRMED_CHANGES_CLAIM =
+  "Reads by default. Every change asks you to confirm it (and for a code where one is set), is recorded under your name and lands in the admin audit trail";
+
+/**
+ * What the Overview may say about what this dashboard changes.
+ *
+ * The hero ticked "This dashboard only reads; it changes nothing" on every
+ * host. That is true of Community, whose dashboard API answers GET and
+ * nothing else, and false of the paid dashboard, which offers block,
+ * unblock, exclusions and a verdict on each case. A ticked claim that is
+ * false on the edition a reviewer is looking at costs every other tick on
+ * the page.
+ *
+ * The server's word decides when it gave one (`dashboard_access`). A server
+ * older than the field has said which edition it is, and the edition is what
+ * it says about this: Community reads only, the paid dashboard asks before
+ * each change. With no edition resolved nothing is claimed either way.
+ */
+export function dashboardAccessClaim(
+  edition: "community" | "enterprise" | undefined,
+  declared: DashboardAccess | undefined,
+): string | undefined {
+  if (declared === "read_only") return READ_ONLY_CLAIM;
+  if (declared === "confirmed_changes") return CONFIRMED_CHANGES_CLAIM;
+  if (edition === "community") return READ_ONLY_CLAIM;
+  if (edition === "enterprise") return CONFIRMED_CHANGES_CLAIM;
+  return undefined;
+}
+
 /// What the `unknown` posture means on a paid host: the guardrail hook reports
 /// nothing because it is not the mechanism here, and enforcement posture has a
 /// screen of its own. It does NOT mean nothing is being protected.
@@ -757,7 +802,7 @@ export const POSTURES: Record<GuardrailMode, { label: string; title: string; bod
 // The first version of this test rebuilt the merge expression inline and
 // asserted on its own object, so it passed with the fix reverted: it proved
 // that spreading two objects works, not that this screen honours the host.
-export function PostureHero({ mode, edition, decisions, sessions, guardedAgents, hostHeadline, headingLevel = "h1" }: { mode: GuardrailMode; edition?: "community" | "enterprise"; decisions: number; sessions: number; guardedAgents?: number; hostHeadline?: { label: string; title: string; body: string }; /** `h2` where the page already has its `h1` (the lanes layout). */ headingLevel?: "h1" | "h2" }) {
+export function PostureHero({ mode, edition, decisions, sessions, guardedAgents, hostHeadline, headingLevel = "h1", accessClaim }: { mode: GuardrailMode; edition?: "community" | "enterprise"; decisions: number; sessions: number; guardedAgents?: number; hostHeadline?: { label: string; title: string; body: string }; /** `h2` where the page already has its `h1` (the lanes layout). */ headingLevel?: "h1" | "h2"; /** What this dashboard can change, from `dashboardAccessClaim`; no line when absent. */ accessClaim?: string }) {
   const Heading = headingLevel;
   // The `unknown` copy is written for Community: "this version records guardrail
   // decisions" describes the free hook, and the decision count is the free
@@ -810,7 +855,7 @@ export function PostureHero({ mode, edition, decisions, sessions, guardedAgents,
             </summary>
             <ul className="mt-2 flex flex-wrap gap-x-5 gap-y-2 text-xs font-medium text-slate-600">
               <TrustItem>Rules are evaluated on this machine</TrustItem>
-              <TrustItem>This dashboard only reads; it changes nothing</TrustItem>
+              {accessClaim === undefined ? null : <TrustItem>{accessClaim}</TrustItem>}
               <TrustItem>Common secret patterns are redacted before storage</TrustItem>
             </ul>
           </details>

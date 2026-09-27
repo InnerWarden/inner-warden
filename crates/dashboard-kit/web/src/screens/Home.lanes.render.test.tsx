@@ -70,6 +70,8 @@ describe("an Overview whose host sends no lanes", () => {
     await expect(render(communityOverview, "community", monitorMeta("community"))).toMatchFileSnapshot("./__snapshots__/overview-community-no-lanes.html");
   });
 
+  // One line moved on purpose: the data-handling tick no longer claims the
+  // paid dashboard only reads (`dashboardAccessClaim`). Nothing else did.
   it("renders the paid page exactly as it was, in both views", async () => {
     await expect(render(hostWaitingOverview, "enterprise", monitorMeta("enterprise"))).toMatchFileSnapshot("./__snapshots__/overview-enterprise-no-lanes.html");
     setTechnicalDetail(true);
