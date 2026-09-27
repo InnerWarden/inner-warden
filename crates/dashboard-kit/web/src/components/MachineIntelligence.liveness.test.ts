@@ -12,6 +12,7 @@ import {
   recordedActivityLabel,
 } from "./MachineIntelligence";
 import type { AgentGuardrail, LocalAgent } from "../api";
+import { formatDay } from "../presentation";
 
 const DAY = 86_400;
 
@@ -19,7 +20,8 @@ const DAY = 86_400;
 /// "19 Jul 2026" passes in London and fails in CI. The structure around the date
 /// is what these tests are actually asserting, so the day itself is rendered the
 /// same way the component renders it.
-const day = (iso: string) => new Intl.DateTimeFormat(undefined, { dateStyle: "medium" }).format(new Date(iso));
+// The component prints days through the kit's one formatter; so does this.
+const day = (iso: string) => formatDay(new Date(iso));
 const CONFIGURED_DAY = day("2026-07-19T12:00:00Z");
 
 function guardrail(over: Partial<AgentGuardrail> = {}): AgentGuardrail {
