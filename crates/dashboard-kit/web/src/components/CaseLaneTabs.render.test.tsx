@@ -19,6 +19,34 @@ const noop = () => undefined;
 const serverCounts = { agent_messages: 1, agent_actions: 1, server_attacks: 3, other: 2 };
 
 describe("the tab row", () => {
+  /**
+   * A screen can say what a count is when it knows better than the lane's
+   * default ("0 waiting" while the list shows only what waits, where "0
+   * messages" read as data lost), and a partial read wears "~" with why.
+   *
+   * FAILS ON REVERT: ignore `unitFor` and the badge reads "0 messages"; ignore
+   * `partial` and a figure the host could not vouch for reads exact.
+   */
+  it("prints the unit a screen names, and a partial count as about", () => {
+    const html = renderToStaticMarkup(
+      <CaseLaneTabs
+        value="agent_messages"
+        counts={{ ...serverCounts, agent_messages: 0 }}
+        onChange={noop}
+        window="7d"
+        unitFor={() => ({ one: "waiting", many: "waiting" })}
+        partial
+      />,
+    );
+    expect(html).toContain("0 waiting");
+    expect(html).not.toContain("0 messages");
+    expect(html).toContain('aria-label="Messages to your AI agent, about 0 waiting in the last 7 days"');
+    expect(html).toMatch(/title="Counted from the newest records[^"]*"[^>]*>~0 waiting/);
+    const plain = renderToStaticMarkup(<CaseLaneTabs value="agent_messages" counts={serverCounts} onChange={noop} window="7d" />);
+    expect(plain).not.toContain("~");
+    expect(plain).toContain("1 message");
+  });
+
   it("offers the three lanes, named the way the operator names them, with the host's counts", () => {
     const html = renderToStaticMarkup(<CaseLaneTabs value="agent_actions" counts={{ ...serverCounts, server_attacks: 823 }} onChange={noop} panelId="case-list" />);
     expect(html).toContain('role="tablist"');
@@ -203,5 +231,30 @@ describe("the span beside each count", () => {
     expect(html).not.toContain(" · ");
     expect(html).not.toContain("Time window");
     expect(html).toContain('aria-label="Attacks on this server, 3 cases"');
+  });
+
+  /**
+   * Each lane wears its glyph, the same one its card wears, hidden from a
+   * screen reader: the tab's name is what is said, and it does not change.
+   */
+  it("puts the lane's glyph before its name, hidden, and keeps the name the tab is called by", () => {
+    const html = renderToStaticMarkup(<CaseLaneTabs value="agent_actions" counts={serverCounts} onChange={noop} window="7d" />);
+    expect(html.match(/<svg viewBox="0 0 16 16" aria-hidden="true"/g)).toHaveLength(3);
+    expect(html).toContain('aria-label="What your AI agent did, 1 session in the last 7 days"');
+    expect(html).toContain('aria-label="Attacks on this server, 3 cases in the last 7 days"');
+  });
+
+  /**
+   * A screen that says what the lane lists beside the lane's numbers passes
+   * `intro={false}`, so the sentence is on screen once; every other caller
+   * still gets it under the row.
+   *
+   * FAILS ON REVERT: ignore the prop and the sentence is printed twice on the
+   * paid Cases screen.
+   */
+  it("leaves the lane's sentence out only when told to", () => {
+    const sentence = laneIntro("agent_actions");
+    expect(renderToStaticMarkup(<CaseLaneTabs value="agent_actions" counts={serverCounts} onChange={noop} />)).toContain(sentence);
+    expect(renderToStaticMarkup(<CaseLaneTabs value="agent_actions" counts={serverCounts} onChange={noop} intro={false} />)).not.toContain(sentence);
   });
 });

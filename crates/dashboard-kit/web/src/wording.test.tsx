@@ -30,12 +30,12 @@ describe("one way to print a count", () => {
 describe("the count line's badge", () => {
   /**
    * FAILS ON REVERT: wear "available" whatever the read covered and the green
-   * check is back on "from a partial read".
+   * check is back on a partial read.
    */
   it("is neutral on a partial read, and never a green check over it", () => {
     const partial = casePageCountBadge(20, { rows_in_window: 312, total_in_window: 4_394, window_complete: false }, false);
     expect(partial.status).toBe("partial");
-    expect(partial.label).toContain("from a partial read");
+    expect(partial.label).toContain("(counted from the newest records)");
     expect(statusPresentation(partial.status).tone).toBe("neutral");
     expect(statusPresentation(partial.status).symbol).not.toBe("✓");
   });

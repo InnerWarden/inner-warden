@@ -12,12 +12,14 @@ export const OUTCOME_CHIPS: Record<string, { label: string; meaning: string; cla
   blocked: {
     label: "Blocked",
     meaning: "The guardrail refused it before it ran.",
-    className: "border-red-200 bg-red-50 text-red-700",
+    // The outcome palette's accent: a refusal is a stop, not a bad thing
+    // that happened (`outcomeTone`, `refused_before_run`).
+    className: "border-cyan-200 bg-cyan-50 text-cyan-900",
   },
   would_block: {
     label: "Would block",
     meaning: "Watch mode: the guardrail would have refused it, and let it run.",
-    className: "border-blue-200 bg-blue-50 text-blue-700",
+    className: "border-slate-300 bg-slate-50 text-slate-700",
   },
   allowed: {
     label: "Allowed to run",

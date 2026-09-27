@@ -1,3 +1,5 @@
+import type { CaseLaneChoice } from "../lanes";
+
 /**
  * One small glyph per product concept, nothing decorative: 16 by 16, one
  * stroked path in the text colour, hidden from screen readers because the
@@ -14,9 +16,35 @@ export const GLYPHS = {
   camera: "M1.5 5.5h3l1.5-2h4l1.5 2h3v8h-13zM8 7a2.5 2.5 0 1 0 0 5 2.5 2.5 0 0 0 0-5z",
   server: "M2 2.5h12V7H2zM2 9h12v4.5H2zM4.5 4.75h1M4.5 11.25h1",
   cloud: "M4.5 12.5H12a2.75 2.75 0 0 0 .4-5.5A4.25 4.25 0 0 0 4.1 6.9 2.8 2.8 0 0 0 4.5 12.5z",
+  // Cases: who asked, what ran, who it was, and what it touched.
+  chat: "M2 2.5h12v8.5H7.5L4.5 13.5V11H2z",
+  prompt: "M1.5 2.5h13v11h-13zM4.5 6l2 2-2 2M8 10.5h3.5",
+  target: "M8 3a5 5 0 1 0 0 10A5 5 0 0 0 8 3zM8 1v3.5M8 11.5V15M1 8h3.5M11.5 8H15",
+  person: "M8 1.75a2.75 2.75 0 1 0 0 5.5 2.75 2.75 0 0 0 0-5.5zM2.5 14.5c.6-3 2.8-4.75 5.5-4.75s4.9 1.75 5.5 4.75",
+  decoy: "M10.5 1.5v8.25a3.25 3.25 0 0 1-6.5 0V7.5l2.25 2.25M9 1.5h3",
+  egress: "M9 2.5H2.5v11H9M6 8h8.5M11.5 5l3 3-3 3",
+  file: "M3.5 1.5h6l3 3v10h-9zM9.5 1.5v3h3",
 } as const;
 
 export type GlyphName = keyof typeof GLYPHS;
+
+/**
+ * The glyph for a lane of cases, on its tab and its card: a speech bubble for
+ * the messages to the agent, a prompt for what the agent ran, a server for
+ * the attacks on it. The whole list is no one concept and gets none.
+ */
+export function laneGlyph(lane: CaseLaneChoice): GlyphName | undefined {
+  switch (lane) {
+    case "agent_messages":
+      return "chat";
+    case "agent_actions":
+      return "prompt";
+    case "server_attacks":
+      return "server";
+    default:
+      return undefined;
+  }
+}
 
 export function Glyph({ name, className = "h-4 w-4" }: { name: GlyphName; className?: string }) {
   return (

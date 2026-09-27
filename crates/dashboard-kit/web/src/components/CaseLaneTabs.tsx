@@ -3,6 +3,7 @@ import { CASE_LANES, everythingCount, type CaseLaneCounts } from "../api/lanes";
 import { EVERYTHING_COPY, LANE_COPY, LANE_WINDOW_PHRASE, type CaseLaneChoice } from "../lanes";
 import { CASE_WINDOW_LABELS, CASE_WINDOWS, type CaseWindow } from "./CaseFilters";
 import { useTechnicalDetail } from "./TechnicalDetail";
+import { Glyph, laneGlyph } from "./icons";
 import { formatCount } from "../presentation";
 import { windowWords } from "../windows";
 
@@ -29,9 +30,11 @@ export const LANE_CASE_UNIT: Record<CaseLaneChoice, { one: string; many: string 
   everything: { one: "case", many: "cases" },
 };
 
+/** What a screen may say one of a tab's counts is, in place of the lane's own unit. */
+export type LaneUnit = { one: string; many: string };
+
 /** A tab's count with its unit: "4 sessions", "1 message", "2,435 cases". */
-export function laneTabCount(choice: CaseLaneChoice, count: number): string {
-  const unit = LANE_CASE_UNIT[choice];
+export function laneTabCount(choice: CaseLaneChoice, count: number, unit: LaneUnit = LANE_CASE_UNIT[choice]): string {
   return `${formatCount(count)} ${count === 1 ? unit.one : unit.many}`;
 }
 
@@ -99,14 +102,23 @@ export function laneIntro(value: CaseLaneChoice): string {
  * counted over when the screen passed one: "Attacks on this server, 823
  * cases in the last 7 days".
  */
-export function laneTabName(tab: Pick<CaseLaneTab, "choice" | "label" | "count">, window?: CaseWindow): string {
+export function laneTabName(tab: Pick<CaseLaneTab, "choice" | "label" | "count">, window?: CaseWindow, unit?: LaneUnit, partial = false): string {
   if (tab.count === undefined) return tab.label;
-  const counted = `${tab.label}, ${laneTabCount(tab.choice, tab.count)}`;
+  const counted = `${tab.label}, ${partial ? "about " : ""}${laneTabCount(tab.choice, tab.count, unit)}`;
   return window === undefined ? counted : `${counted} ${LANE_WINDOW_PHRASE[window]}`;
 }
 
+/** Said on a tab's count the host read only part of the window for. */
+export const PARTIAL_COUNT = "Counted from the newest records: this number can fall as the oldest are dropped.";
+
 export function laneTabId(choice: CaseLaneChoice): string {
   return `case-lane-tab-${choice}`;
+}
+
+/** The lane's glyph before its name; hidden from screen readers, the name says it. */
+function TabGlyph({ choice }: { choice: CaseLaneChoice }) {
+  const glyph = laneGlyph(choice);
+  return glyph === undefined ? null : <Glyph name={glyph} className="h-4 w-4 opacity-80" />;
 }
 
 /**
@@ -130,6 +142,9 @@ export function CaseLaneTabs({
   panelId,
   window,
   onWindowChange,
+  intro = true,
+  unitFor,
+  partial = false,
 }: {
   value: CaseLaneChoice;
   counts?: CaseLaneCounts;
@@ -158,6 +173,24 @@ export function CaseLaneTabs({
    * "Time window" for one value, one applying at once and one on Apply.
    */
   onWindowChange?: (next: CaseWindow) => void;
+  /**
+   * Whether the row says what the open tab lists (`laneIntro`) under itself.
+   * A screen that says it elsewhere, beside the lane's own numbers, passes
+   * `false`, so the sentence is on screen once.
+   */
+  intro?: boolean;
+  /**
+   * What one of a tab's counts is, when the screen knows better than the
+   * lane's default: every count "waiting" while the list shows only what
+   * waits ("0 messages" read as data lost), or "cases" in a lane that holds
+   * more than sessions. Absent, or `undefined` for a lane: its own unit.
+   */
+  unitFor?: (choice: CaseLaneChoice) => LaneUnit | undefined;
+  /**
+   * The counts come from a partial read: each badge says "~" before its
+   * figure, with why in its title, as the lane's own card says its figure.
+   */
+  partial?: boolean;
 }) {
   const [technical] = useTechnicalDetail();
   const tabs = laneTabs(value, counts, technical);
@@ -173,41 +206,52 @@ export function CaseLaneTabs({
   return (
     <div className="min-w-0">
       <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
-        <div role="tablist" aria-label="Case lanes" className="flex min-w-0 flex-wrap gap-2">
-          {tabs.map((tab) => (
-            <button
-              key={tab.choice}
-              id={laneTabId(tab.choice)}
-              type="button"
-              role="tab"
-              aria-selected={tab.selected}
-              aria-controls={panelId}
-              tabIndex={tab.selected ? 0 : -1}
-              data-lane={tab.choice}
-              // The badge is a number on its own; said aloud it needs its noun.
-              aria-label={tab.count === undefined ? undefined : laneTabName(tab, window)}
-              onClick={() => onChange(tab.choice)}
-              onKeyDown={onKeyDown}
-              className={`inline-flex max-w-full items-center gap-2 rounded-lg border px-3 py-2 text-left text-sm font-semibold transition-colors ${
-                tab.selected
-                  ? "border-slate-900 bg-slate-900 text-white"
-                  : "border-slate-300 bg-white text-slate-700 hover:bg-slate-50"
-              }`}
-            >
-              <span className="min-w-0 break-words">{tab.label}</span>
-              {tab.count !== undefined ? (
-                <span
-                  aria-hidden="true"
-                  className={`rounded-full px-2 py-0.5 text-xs tabular-nums ${tab.selected ? "bg-white/20 text-white" : "bg-slate-100 text-slate-700"}`}
-                >
-                  {window === undefined ? formatCount(tab.count) : laneTabCount(tab.choice, tab.count)}
-                  {window === undefined ? null : (
-                    <span className="font-normal opacity-80"> · {LANE_TAB_SPAN[window]}</span>
-                  )}
+        {/* On a phone each tab is one full-width row, its name on the left and
+            its badge whole on the right, so the widths line up and a badge
+            never breaks mid-phrase. */}
+        <div role="tablist" aria-label="Case lanes" className="flex w-full min-w-0 flex-col gap-2 sm:w-auto sm:flex-row sm:flex-wrap">
+          {tabs.map((tab) => {
+            const unit = unitFor?.(tab.choice);
+            return (
+              <button
+                key={tab.choice}
+                id={laneTabId(tab.choice)}
+                type="button"
+                role="tab"
+                aria-selected={tab.selected}
+                aria-controls={panelId}
+                tabIndex={tab.selected ? 0 : -1}
+                data-lane={tab.choice}
+                // The badge is a number on its own; said aloud it needs its noun.
+                aria-label={tab.count === undefined ? undefined : laneTabName(tab, window, unit, partial)}
+                onClick={() => onChange(tab.choice)}
+                onKeyDown={onKeyDown}
+                className={`inline-flex w-full max-w-full items-center justify-between gap-2 rounded-lg border px-3 py-2 text-left text-sm font-semibold transition-colors sm:w-auto sm:justify-start ${
+                  tab.selected
+                    ? "border-slate-900 bg-slate-900 text-white"
+                    : "border-slate-300 bg-white text-slate-700 hover:bg-slate-50"
+                }`}
+              >
+                <span className="flex min-w-0 items-center gap-2">
+                  <TabGlyph choice={tab.choice} />
+                  <span className="min-w-0 break-words">{tab.label}</span>
                 </span>
-              ) : null}
-            </button>
-          ))}
+                {tab.count !== undefined ? (
+                  <span
+                    aria-hidden="true"
+                    title={partial ? PARTIAL_COUNT : undefined}
+                    className={`shrink-0 whitespace-nowrap rounded-full px-2 py-0.5 text-xs tabular-nums ${tab.selected ? "bg-white/20 text-white" : "bg-slate-100 text-slate-700"}`}
+                  >
+                    {partial ? "~" : ""}
+                    {window === undefined ? formatCount(tab.count) : laneTabCount(tab.choice, tab.count, unit)}
+                    {window === undefined ? null : (
+                      <span className="font-normal opacity-80"> · {LANE_TAB_SPAN[window]}</span>
+                    )}
+                  </span>
+                ) : null}
+              </button>
+            );
+          })}
         </div>
         {window !== undefined && onWindowChange !== undefined ? (
           <label className="inline-flex items-center gap-2 text-xs font-semibold text-slate-700">
@@ -222,7 +266,7 @@ export function CaseLaneTabs({
           </label>
         ) : null}
       </div>
-      <p className="mt-2 max-w-3xl text-sm leading-6 text-slate-600">{laneIntro(value)}</p>
+      {intro ? <p className="mt-2 max-w-3xl text-sm leading-6 text-slate-600">{laneIntro(value)}</p> : null}
     </div>
   );
 }

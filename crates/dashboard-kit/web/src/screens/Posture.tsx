@@ -17,7 +17,7 @@ import { StatusBadge, statusPresentation } from "../components/StatusBadge";
 import { setTechnicalDetail, TechnicalOnly, useTechnicalDetail } from "../components/TechnicalDetail";
 import { OutcomeBreakdown } from "../components/LaneCards";
 import { controlGlyph, Glyph } from "../components/icons";
-import { Ring, type Part } from "../components/viz";
+import { Ring, Steps, type Part, type StepMark } from "../components/viz";
 import { LANE_WINDOW_PHRASE, type AgentCommands } from "../lanes";
 import { formatClock, formatCount, freshnessLabel, timeTitle } from "../presentation";
 import { layerAssuranceLabel, type LayerAssuranceLabel } from "../posture/assurance";
@@ -1727,8 +1727,8 @@ export const STAGES = [
   ["verified_effective", "Verified"],
 ] as const satisfies readonly (readonly [keyof RuntimeConvergence, string])[];
 
-/** How one stage is drawn. */
-export type StageMark = "done" | "verified" | "unproven" | "unknown" | "not_applicable" | "no" | "stale";
+/** How one stage is drawn: the shared ladder marks (`viz.tsx`), less the case's "waiting". */
+export type StageMark = Exclude<StepMark, "waiting">;
 
 /**
  * One stage's mark: a filled dot for a stage that is so, the Verified stage
@@ -1752,16 +1752,6 @@ export function stageMark(state: RuntimeConvergence["configured"]["state"], veri
   }
 }
 
-const STAGE_MARK_CLASS: Record<StageMark, string> = {
-  done: "h-2.5 w-2.5 rounded-full bg-slate-800",
-  verified: "h-2.5 w-2.5 rounded-full bg-emerald-500 ring-2 ring-emerald-100",
-  unproven: "h-2.5 w-2.5 rounded-full border-[1.5px] border-slate-400 bg-white",
-  unknown: "h-2.5 w-2.5 rounded-full border-[1.5px] border-slate-400 bg-white",
-  not_applicable: "h-0.5 w-2.5 bg-slate-300",
-  no: "h-2.5 w-2.5 rounded-full border-2 border-rose-500 bg-white",
-  stale: "h-2.5 w-2.5 rounded-full border border-slate-300 bg-white",
-};
-
 const STAGE_MARK_WORDS: Record<StageMark, string> = {
   done: "yes",
   verified: "yes, verified on this host",
@@ -1775,26 +1765,15 @@ const STAGE_MARK_WORDS: Record<StageMark, string> = {
 /**
  * How far a control is proven: five dots, joined where two neighbouring
  * stages are both so. Aligned into one matrix down the page on a wide screen.
+ * The marks are the shared ladder's (`Steps`), so a case's ladder reads the
+ * same.
  */
 export function Ladder({ layer, name, current, softened }: { layer: Pick<ProtectionLayer, "convergence">; name: string; current: boolean; softened: boolean }) {
-  const marks = STAGES.map(([key], index) => stageMark(layer.convergence[key].state, index === STAGES.length - 1, softened, current));
-  const solid = (mark: StageMark) => mark === "done" || mark === "verified";
-  return (
-    <ol aria-label={`How far ${name} is proven`} className="grid w-full max-w-72 grid-cols-5">
-      {STAGES.map(([key, label], index) => (
-        <li key={key} data-stage={key} data-mark={marks[index]} title={`${label}: ${STAGE_MARK_WORDS[marks[index]]}`} className="relative flex h-5 items-center justify-center">
-          {index < STAGES.length - 1 ? (
-            <span
-              aria-hidden="true"
-              className={`absolute left-1/2 top-1/2 h-px w-full ${solid(marks[index]) && solid(marks[index + 1]) ? "bg-slate-800" : "bg-slate-200"}`}
-            />
-          ) : null}
-          <span aria-hidden="true" className={`relative block ${STAGE_MARK_CLASS[marks[index]]}`} />
-          <span className="sr-only">{`${label}: ${STAGE_MARK_WORDS[marks[index]]}`}</span>
-        </li>
-      ))}
-    </ol>
-  );
+  const steps = STAGES.map(([key, label], index) => {
+    const mark = stageMark(layer.convergence[key].state, index === STAGES.length - 1, softened, current);
+    return { key, label, mark, words: STAGE_MARK_WORDS[mark] };
+  });
+  return <Steps steps={steps} label={`How far ${name} is proven`} />;
 }
 
 /** The host's reason for each stage that is not a plain yes, in words, for the technical view. */

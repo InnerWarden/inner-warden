@@ -10,7 +10,6 @@ import type {
   ThreatIntel,
   HoneypotContext,
 } from "../api/cases";
-import { StatusBadge } from "./StatusBadge";
 import { TechnicalOnly } from "./TechnicalDetail";
 import { readsAsPlainWords } from "../presentation";
 
@@ -37,9 +36,16 @@ function hasAny(e: CaseEnrichment): boolean {
   );
 }
 
-export function CaseEnrichmentView({ enrichment }: { enrichment: CaseEnrichment | null | undefined }) {
+/**
+ * `finding`: the case's own record says something flagged it (an incident, a
+ * signal or a decision is on its timeline). Then "Raw host observation, no
+ * detector flagged this" would contradict the page above it, so a finding
+ * whose engines left no trace here shows nothing rather than that banner.
+ */
+export function CaseEnrichmentView({ enrichment, finding = false }: { enrichment: CaseEnrichment | null | undefined; finding?: boolean }) {
   if (!enrichment) return null;
   if (!hasAny(enrichment)) {
+    if (finding) return null;
     return (
       <section className={CARD} aria-label="Why this is a case">
         <p className={LABEL}>Why this is a case</p>
@@ -75,7 +81,10 @@ export function CaseEnrichmentView({ enrichment }: { enrichment: CaseEnrichment 
 
   return (
     <section className="min-w-0 space-y-4" aria-label="Case context">
-      <p className={LABEL}>What happened</p>
+      {/* Not "What happened": the summary card above already asks that, and
+          two eyebrows with one question read as the page repeating itself.
+          This is what each engine said. */}
+      <p className={LABEL}>What InnerWarden's engines reported</p>
       {enrichmentOrder(enrichment).map((key) => <Fragment key={key}>{blocks[key]}</Fragment>)}
       {/* A footnote used to close this section on every case: "Everything
           above is what the sensor, the rules and the model reported. It has
@@ -129,12 +138,15 @@ function Field({ label, value }: { label: string; value: string }) {
   );
 }
 
-function Chip({ label, tone = "slate" }: { label: string; tone?: "slate" | "cyan" | "amber" | "rose" | "violet" }) {
+/**
+ * A label chip. No amber and no rose here: on a case, amber means a person is
+ * needed and rose a bad thing that happened, and a MITRE id, a rule, a score
+ * or a count of captured logins is neither. They are references.
+ */
+function Chip({ label, tone = "slate" }: { label: string; tone?: "slate" | "cyan" | "violet" }) {
   const tones: Record<string, string> = {
     slate: "border-slate-200 bg-slate-50 text-slate-700",
     cyan: "border-cyan-200 bg-cyan-50 text-cyan-800",
-    amber: "border-amber-200 bg-amber-50 text-amber-900",
-    rose: "border-rose-200 bg-rose-50 text-rose-800",
     violet: "border-violet-200 bg-violet-50 text-violet-800",
   };
   return (
@@ -144,19 +156,36 @@ function Chip({ label, tone = "slate" }: { label: string; tone?: "slate" | "cyan
   );
 }
 
+/** A name that is only an id: a UUID, or a long run of hex. */
+export function isBareId(name: string): boolean {
+  const value = name.trim();
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value) || /^[0-9a-f]{16,}$/i.test(value);
+}
+
 // --- Agent activity: the AI agent was flagged doing something (dangerous command
 // / injected prompt). This is the most important block when present, so it leads.
 function AgentActivitySection({ value }: { value: AgentActivity }) {
   const risk = value.risk_score;
-  const tone = risk != null && risk >= 70 ? "rose" : risk != null && risk >= 40 ? "amber" : "slate";
   return (
-    <section className={`${CARD} border-l-4 border-l-rose-400`} aria-label="AI agent activity">
+    <section className={CARD} aria-label="AI agent activity">
       <div className="flex flex-wrap items-start justify-between gap-2">
         <div className="min-w-0">
           <p className={LABEL}>AI agent flagged</p>
-          <h3 className="mt-1 break-words text-base font-semibold text-slate-950 [overflow-wrap:anywhere]">{value.agent_name}</h3>
+          {/* A bare session id is an investigator's handle, not a name. */}
+          {isBareId(value.agent_name) ? (
+            <>
+              <h3 className="mt-1 text-base font-semibold text-slate-950">An AI agent session</h3>
+              <TechnicalOnly>
+                <p className="mt-0.5 break-all font-mono text-xs text-slate-500">{value.agent_name}</p>
+              </TechnicalOnly>
+            </>
+          ) : (
+            <h3 className="mt-1 break-words text-base font-semibold text-slate-950 [overflow-wrap:anywhere]">{value.agent_name}</h3>
+          )}
         </div>
-        {risk != null && <StatusBadge status={tone === "rose" ? "degraded" : tone === "amber" ? "degraded" : "unknown"} label={`Risk ${risk}`} />}
+        {/* The guard's score has no ceiling of 100: "Risk 140 of 100" read as
+            a defect to anyone who opened the details. The score as it is. */}
+        {risk != null && <Chip label={`Risk score ${risk}`} />}
       </div>
       {value.command && (
         <div className="mt-3">
@@ -171,13 +200,13 @@ function AgentActivitySection({ value }: { value: AgentActivity }) {
           <p className="mb-1.5 text-xs text-slate-500">ATR rules matched</p>
           <div className="flex flex-wrap gap-1.5">
             {value.atr_rule_ids.map((id) => (
-              <Chip key={id} label={id} tone="rose" />
+              <Chip key={id} label={id} />
             ))}
           </div>
         </div>
       )}
       {value.recommendation && (
-        <p className="mt-3 break-words rounded-lg bg-amber-50 px-3 py-2 text-xs leading-6 text-amber-900 [overflow-wrap:anywhere]">
+        <p className="mt-3 break-words rounded-lg bg-slate-50 px-3 py-2 text-xs leading-6 text-slate-800 [overflow-wrap:anywhere]">
           <strong>Recommendation:</strong> {value.recommendation}
         </p>
       )}
@@ -185,6 +214,21 @@ function AgentActivitySection({ value }: { value: AgentActivity }) {
         <p className="mt-2 break-words text-xs leading-6 text-slate-600 [overflow-wrap:anywhere]">{value.explanation}</p>
       )}
     </section>
+  );
+}
+
+/** What the detector suggests looking at next, as a list: each one a line to read, not a label. */
+function RecommendedChecks({ checks }: { checks: readonly string[] }) {
+  if (checks.length === 0) return null;
+  return (
+    <div className="mt-3">
+      <p className="text-xs text-slate-500">Worth checking</p>
+      <ul className="mt-1 list-disc space-y-0.5 pl-5 text-sm leading-6 text-slate-700">
+        {checks.map((check) => (
+          <li key={check} className="break-words [overflow-wrap:anywhere]">{check}</li>
+        ))}
+      </ul>
+    </div>
   );
 }
 
@@ -201,7 +245,13 @@ function DetectionSection({ value }: { value: DetectionContext }) {
         {value.kind && <Field label="Signal kind" value={value.kind} />}
         {value.layer && <Field label="Layer" value={value.layer} />}
       </dl>
-      {value.reason && <p className="mt-3 break-words text-sm leading-6 text-slate-700 [overflow-wrap:anywhere]">{value.reason}</p>}
+      {/* The detector's own report, quoted: evidence for whoever checks the
+          finding. The page above already says what happened in plain words. */}
+      {value.reason ? (
+        <TechnicalOnly>
+          <p className="mt-3 break-words text-sm leading-6 text-slate-700 [overflow-wrap:anywhere]">{value.reason}</p>
+        </TechnicalOnly>
+      ) : null}
       {value.command ? (
         <div className="mt-3">
           <p className="mb-1 text-xs text-slate-500">The command</p>
@@ -210,13 +260,12 @@ function DetectionSection({ value }: { value: DetectionContext }) {
           </pre>
         </div>
       ) : null}
-      {value.recommended_checks.length > 0 && (
-        <div className="mt-3 flex flex-wrap gap-1.5">
-          {value.recommended_checks.map((c) => (
-            <Chip key={c} label={c} />
-          ))}
-        </div>
-      )}
+      <RecommendedChecks checks={value.recommended_checks.filter((check) => readsAsPlainWords(check))} />
+      {/* A check written as a command (`innerwarden-ctl get incidents ...`)
+          is for whoever runs the server, not for the reader of the case. */}
+      <TechnicalOnly>
+        <RecommendedChecks checks={value.recommended_checks.filter((check) => !readsAsPlainWords(check))} />
+      </TechnicalOnly>
     </section>
   );
 }
@@ -320,8 +369,6 @@ function AiVerdictSection({ value }: { value: AiVerdict }) {
 
 // --- Rules + MITRE.
 function RulesMitreSection({ rules, mitre }: { rules: RuleHit[]; mitre: MitreRef[] }) {
-  const ruleTone = (kind: string) =>
-    kind === "sigma" ? "cyan" : kind === "yara" ? "violet" : kind === "correlation" ? "amber" : "slate";
   return (
     <section className={CARD} aria-label="Rules and MITRE">
       <p className={LABEL}>Rules & technique mapping</p>
@@ -330,7 +377,7 @@ function RulesMitreSection({ rules, mitre }: { rules: RuleHit[]; mitre: MitreRef
           <p className="mb-1.5 text-xs text-slate-500">MITRE ATT&CK</p>
           <div className="flex flex-wrap gap-1.5">
             {mitre.map((m) => (
-              <Chip key={m.technique_id} label={`${m.technique_id}${m.technique_name ? ` · ${m.technique_name}` : ""}${m.tactic ? ` (${m.tactic})` : ""}`} tone="amber" />
+              <Chip key={m.technique_id} label={`${m.technique_id}${m.technique_name ? ` · ${m.technique_name}` : ""}${m.tactic ? ` (${m.tactic})` : ""}`} />
             ))}
           </div>
         </div>
@@ -340,7 +387,7 @@ function RulesMitreSection({ rules, mitre }: { rules: RuleHit[]; mitre: MitreRef
           <p className="mb-1.5 text-xs text-slate-500">Rules matched</p>
           <div className="flex flex-wrap gap-1.5">
             {rules.map((r) => (
-              <Chip key={`${r.kind}:${r.id}`} label={`${r.kind}: ${r.name ?? r.id}`} tone={ruleTone(r.kind) as "slate"} />
+              <Chip key={`${r.kind}:${r.id}`} label={`${r.kind}: ${r.name ?? r.id}`} />
             ))}
           </div>
         </div>
@@ -371,13 +418,11 @@ function ThreatIntelSection({ value }: { value: ThreatIntel }) {
             {geo?.isp && <Field label="Network" value={geo.isp} />}
           </dl>
           <div className="flex flex-wrap gap-1.5">
-            {value.abuseipdb_score != null && (
-              <Chip label={`AbuseIPDB ${value.abuseipdb_score}/100`} tone={value.abuseipdb_score >= 50 ? "rose" : "slate"} />
-            )}
-            {value.dshield && <Chip label="DShield attacker" tone="rose" />}
-            {value.dna_fingerprint && <Chip label={`DNA ${value.dna_fingerprint.slice(0, 12)}…`} tone="violet" />}
+            {value.abuseipdb_score != null && <Chip label={`AbuseIPDB ${value.abuseipdb_score} of 100`} />}
+            {value.dshield && <Chip label="Listed by DShield" />}
+            {value.dna_fingerprint && <Chip label={`DNA ${value.dna_fingerprint.slice(0, 12)}…`} />}
             {value.campaign_ids.map((c) => (
-              <Chip key={c} label={`Campaign ${c}`} tone="amber" />
+              <Chip key={c} label={`Campaign ${c}`} />
             ))}
           </div>
           {(value.dna_fingerprint || value.campaign_ids.length > 0) && (
@@ -392,7 +437,7 @@ function ThreatIntelSection({ value }: { value: ThreatIntel }) {
 // --- DNS lookups.
 function DnsSection({ value }: { value: DnsLookup[] }) {
   const actionTone = (a: string | null | undefined) =>
-    a === "enforce" || a === "block" || a === "blocked" ? "rose" : a === "would_block" || a === "observe" ? "amber" : "slate";
+    a === "enforce" || a === "block" || a === "blocked" ? "cyan" : "slate";
   return (
     <section className={CARD} aria-label="DNS lookups">
       <p className={LABEL}>DNS lookups</p>
@@ -420,7 +465,7 @@ function HoneypotSection({ value }: { value: HoneypotContext }) {
         <div className="flex flex-wrap gap-1.5">
           {value.protocol && <Chip label={value.protocol.toUpperCase()} tone="cyan" />}
           {value.credentials_seen != null && value.credentials_seen > 0 && (
-            <Chip label={`${value.credentials_seen} credential${value.credentials_seen === 1 ? "" : "s"} captured`} tone="amber" />
+            <Chip label={`${value.credentials_seen} credential${value.credentials_seen === 1 ? "" : "s"} captured`} />
           )}
         </div>
       </div>

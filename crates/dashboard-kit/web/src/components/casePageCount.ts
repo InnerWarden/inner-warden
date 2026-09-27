@@ -33,9 +33,13 @@ export function casePageCountLabel(
   // The span by name when the server echoed it ("in the last 7 days"): "in
   // this window" left the reader to find which window that was.
   const span = page.window === undefined ? "in this window" : LANE_WINDOW_PHRASE[page.window];
-  if (page.total_in_window !== undefined) label += ` · ${counted(page.total_in_window, "case", "cases")} ${span}`;
   const qualified = page.rows_in_window !== undefined || page.total_in_window !== undefined;
-  if (qualified && page.window_complete === false) label += ", from a partial read";
+  const partial = qualified && page.window_complete === false;
+  // A partial read says "about" before the figure it cannot vouch for and
+  // where it counted from, in words: "from a partial read" after two counts
+  // in two units could not be parsed in a glance.
+  if (page.total_in_window !== undefined) label += ` · ${partial ? "about " : ""}${counted(page.total_in_window, "case", "cases")} ${span}`;
+  if (partial) label += " (counted from the newest records)";
   return label;
 }
 
