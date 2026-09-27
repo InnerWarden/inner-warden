@@ -135,7 +135,7 @@ export function dispositionReason(
   layer: Pick<
     ProtectionLayer,
     "disposition" | "disposition_reason" | "claim_state" | "effective_mode" | "desired_mode" | "label"
-  >,
+  > & Partial<Pick<ProtectionLayer, "id" | "capability_ids">>,
   // The disposition actually being SHOWN, after the assurance veto. When it
   // differs from what the host reported, the host's sentence belongs to the
   // stronger state and must not be printed under the softer badge: on a real
@@ -148,16 +148,18 @@ export function dispositionReason(
   if (layer.disposition_reason && effective === dispositionOf(layer)) {
     return layer.disposition_reason;
   }
+  // The name the reader bought, where the control has one.
+  const label = controlName({ id: layer.id ?? "", label: layer.label, capability_ids: layer.capability_ids ?? [] }).name;
   const fallback: Record<LayerDisposition, string> = {
-    proven: `${layer.label} is enforcing, and that was verified on this host.`,
+    proven: `${label} is enforcing, and that was verified on this host.`,
     // Deliberately not "is doing what it is set to do": that sentence rendered
     // under a chip reading "not proven", so the card asserted in prose exactly
     // what the chip beside it declined to assert. This says what is on record
     // and stops.
-    working_as_configured: `${layer.label} is set up and reporting.`,
-    not_enabled: `${layer.label} has not been turned on yet. Nothing is wrong.`,
-    cannot_verify: `${layer.label} could not be read on this host. This is ours to fix, not yours.`,
-    needs_operator: `${layer.label} is not yet doing what it was set to do.`,
+    working_as_configured: `${label} is set up and reporting.`,
+    not_enabled: `${label} has not been turned on yet. Nothing is wrong.`,
+    cannot_verify: `${label} could not be read on this host. This is ours to fix, not yours.`,
+    needs_operator: `${label} is not yet doing what it was set to do.`,
   };
   return fallback[effective];
 }
@@ -218,6 +220,54 @@ export function claimSoftened(
     effectiveDisposition(layer, true) === "proven" &&
     effectiveDisposition(layer, verifiedActive) !== "proven"
   );
+}
+
+/**
+ * The name a control is sold under, and what it does in general words.
+ *
+ * The site sells Execution Gate, Secret Read Guard and DNS Guard. This page
+ * named the same three "Independent host execution", "Secret access
+ * control" and "DNS resolution control", and a buyer looking for what they
+ * paid for found none of the names. The product name is the title now, and
+ * the general description sits under it, so both readers find their word.
+ *
+ * Matched on the ids the host sends (the layer's own id, or any capability
+ * id it carries), never on the label: a label is prose and may be reworded.
+ * A control with no product name of its own (host visibility, response
+ * controls) keeps the host's label and has no second line.
+ */
+export type ControlName = { name: string; description?: string };
+
+const PRODUCT_NAMES: readonly { ids: readonly string[]; name: string; description: string }[] = [
+  {
+    ids: ["independent_host_execution", "kernel_execution_control", "host_execution_layer"],
+    name: "Execution Gate",
+    description: "Independent host execution control",
+  },
+  {
+    ids: ["secret_access_control", "secret_read_guard", "secret_guard_layer"],
+    name: "Secret Read Guard",
+    description: "Secret access control",
+  },
+  {
+    ids: ["dns_resolution_control", "dns_guard", "dns_guard_layer"],
+    name: "DNS Guard",
+    description: "DNS resolution control",
+  },
+];
+
+function productFor(ids: readonly string[]): (typeof PRODUCT_NAMES)[number] | undefined {
+  return PRODUCT_NAMES.find((product) => ids.some((id) => product.ids.includes(id)));
+}
+
+export function controlName(layer: Pick<ProtectionLayer, "id" | "label" | "capability_ids">): ControlName {
+  const product = productFor([layer.id, ...layer.capability_ids]);
+  return product === undefined ? { name: layer.label } : { name: product.name, description: product.description };
+}
+
+/** A capability by the product name it belongs to, or its id in words. */
+export function capabilityName(id: string): string {
+  return productFor([id])?.name ?? humanize(id);
 }
 
 export type ControlPill = {
@@ -324,7 +374,7 @@ export function controlPill(
   const disposition = effectiveDisposition(layer, assurance.verifiedActive);
   const softened = claimSoftened(layer, assurance.verifiedActive);
   return {
-    name: layer.label,
+    name: controlName(layer).name,
     mode: current ? dispositionLabel(disposition, softened) : "Refreshing",
     scope: scopeDisplay(layer.effective_scope),
     freshness: current ? checkedAt(layer.freshness) : "refreshing",
@@ -897,10 +947,16 @@ function ControlRow({
     (gap) => gapAudience(gap) === "verification" || !needsOperator(disposition),
   );
 
+  const name = controlName(layer);
   return (
     <article className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm sm:p-5">
       <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
-        <h3 className="min-w-0 flex-1 truncate text-base font-semibold text-slate-950">{layer.label}</h3>
+        <div className="min-w-0 flex-1">
+          <h3 className="break-words text-base font-semibold text-slate-950">{name.name}</h3>
+          {name.description === undefined ? null : (
+            <p className="text-xs text-slate-500">{name.description}</p>
+          )}
+        </div>
         <StatusBadge
           status={current ? disposition : "stale"}
           label={current ? dispositionLabel(disposition, claimSoftened(layer, assurance.verifiedActive)) : "Refreshing"}
@@ -945,7 +1001,7 @@ function ControlRow({
               <ul className="mt-2 space-y-2">
                 {relevantCapabilities.map((capability) => (
                   <li key={capability.id} className="flex flex-wrap items-start justify-between gap-2 rounded-lg border border-slate-100 bg-slate-50 px-3 py-2 text-sm">
-                    <span className="[overflow-wrap:anywhere] font-medium text-slate-800">{humanize(capability.id)}</span>
+                    <span className="[overflow-wrap:anywhere] font-medium text-slate-800">{capabilityName(capability.id)}</span>
                     <StatusBadge status={current ? capability.availability : "stale"} />
                   </li>
                 ))}
@@ -992,7 +1048,7 @@ function GapCard({ gap }: { gap: CoverageGap }) {
       <div className="flex flex-wrap items-start justify-between gap-2">
         <div className="min-w-0">
           <StatusBadge status={gap.state} />
-          <h3 className="mt-2 [overflow-wrap:anywhere] font-semibold text-slate-950">{humanize(gap.capability_id)}</h3>
+          <h3 className="mt-2 [overflow-wrap:anywhere] font-semibold text-slate-950">{capabilityName(gap.capability_id)}</h3>
         </div>
       </div>
       <p className="mt-2 text-sm leading-6 text-slate-800">{sentence(gap.next_step)}</p>
@@ -1012,7 +1068,17 @@ function sentence(value: string): string {
   return /[.!?]$/.test(capitalized) ? capitalized : `${capitalized}.`;
 }
 
-function humanize(value: string): string {
-  const text = value.replace(/[._-]+/g, " ").replace(/\s+/g, " ").trim();
+/** Words that are initials, spelled the way people write them. */
+const INITIALISMS: Record<string, string> = { dns: "DNS", mcp: "MCP", ai: "AI", llm: "LLM", ssh: "SSH", bpf: "BPF", ebpf: "eBPF", lsm: "LSM", id: "ID", ip: "IP", tls: "TLS" };
+
+/** An id in words: `dns_resolution_control` reads "DNS resolution control", never "Dns". */
+export function humanize(value: string): string {
+  const text = value
+    .replace(/[._-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .split(" ")
+    .map((word) => INITIALISMS[word.toLowerCase()] ?? word)
+    .join(" ");
   return text ? text.charAt(0).toUpperCase() + text.slice(1) : "Unknown";
 }

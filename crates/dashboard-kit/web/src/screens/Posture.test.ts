@@ -295,12 +295,13 @@ describe("the verdict hero leads with what the user asked", () => {
 
   it("gives every state a sentence, even with none supplied", () => {
     // A state with no explanation is what made people stop reading this page.
-    const base = { ...FIVE_LAYERS[0], label: "DNS resolution control" };
+    // Named the way the reader bought it: the fallback says "DNS Guard".
+    const base = { ...FIVE_LAYERS[2], label: "DNS resolution control" };
     delete (base as { disposition_reason?: unknown }).disposition_reason;
     for (const disposition of ["proven", "working_as_configured", "not_enabled", "cannot_verify", "needs_operator"] as const) {
       const why = dispositionReason({ ...base, disposition });
       expect(why.length).toBeGreaterThan(20);
-      expect(why).toContain("DNS resolution control");
+      expect(why).toContain("DNS Guard");
       expect(dispositionLabel(disposition).length).toBeGreaterThan(0);
     }
   });
@@ -344,7 +345,7 @@ describe("the verdict hero leads with what the user asked", () => {
 
   it("shows each control in plain words with its scope name and check time", () => {
     const pill = controlPill(posture().layers[0], bootstrap(), generatedAt, true, evaluatedAt);
-    expect(pill.name).toBe("Independent host execution");
+    expect(pill.name).toBe("Execution Gate");
     // Not "Enforcing": this fixture carries no claims records, so the assurance
     // rule does not agree that it is verified, and the pill is not allowed to
     // borrow the stronger word. The control is still doing what it was told,
@@ -619,7 +620,7 @@ describe("the sentence never outranks the badge", () => {
 
     // Veto applied: the sentence must come down with the badge.
     expect(dispositionReason(layer, "working_as_configured")).toBe(
-      "Independent host execution is set up and reporting.",
+      "Execution Gate is set up and reporting.",
     );
     // No veto: the host's own wording is richer and is kept.
     expect(dispositionReason(layer, "proven")).toBe(layer.disposition_reason);
