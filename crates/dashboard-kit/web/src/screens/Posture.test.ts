@@ -232,7 +232,11 @@ describe("the verdict hero leads with what the user asked", () => {
     // written to catch is still caught: nothing in this fixture is broken, so
     // nothing may be reported as needing attention, and no control may go
     // missing from the count.
-    expect(postureHeadline(pills)).toBe("5 host controls: 5 working. Nothing needs you.");
+    //
+    // The two enforcing controls are reported proven and this fixture pins no
+    // assurance, so their chips read "Containing, not proven", and the
+    // headline counts them the way the chips show them.
+    expect(postureHeadline(pills)).toBe("5 host controls: 2 containing but not proven, 3 working. Nothing needs you.");
   });
 
   it("leads with what needs the reader, not with what is fine", () => {
@@ -667,7 +671,9 @@ describe("the headline names every state it counts", () => {
     );
 
     // This fixture carries no claims records, so the assurance rule vetoes the
-    // proven one down to working: 2 working, not 1 protecting + 1 working.
+    // proven one: its chip reads "Containing, not proven", and the headline
+    // counts it as that, apart from the one that is plainly working, never as
+    // 1 protecting.
     //
     // The tail is gone, and its absence is the point. This assertion used to end
     // "Nothing needs you." over a page listing a control that is not turned on,
@@ -675,7 +681,7 @@ describe("the headline names every state it counts", () => {
     // unconditional, so one test pinned it in place and it read as intended
     // behaviour for as long as it shipped.
     expect(postureHeadline(pills)).toBe(
-      "4 host controls: 2 working, 1 not turned on, 1 we can't confirm.",
+      "4 host controls: 1 containing but not proven, 1 working, 1 not turned on, 1 we can't confirm.",
     );
   });
 
@@ -717,6 +723,23 @@ describe("the headline names every state it counts", () => {
     expect(postureHeadline(pills, "2 of 5 host controls are off and protect nothing")).toBe(
       "2 of 5 host controls are off and protect nothing",
     );
+  });
+
+  /**
+   * THE DEFECT: "3 protecting" over one "Protecting" chip and two reading
+   * "Containing, not proven". The host counts what it sent, and the veto
+   * moved two chips off it, so the headline and the chips told two stories.
+   *
+   * FAILS ON REVERT: prefer the host's sentence whatever the chips show and
+   * this headline says 2 protecting over chips that say none.
+   */
+  it("leads with the host's sentence only while every chip shows what the host counted", () => {
+    const pills = posture().layers.map((entry) => controlPill(entry, bootstrap(), generatedAt, true, evaluatedAt));
+    expect(pills.filter((pill) => pill.softened)).toHaveLength(2);
+    expect(postureHeadline(pills, "5 host controls: 2 protecting, 3 working.")).toBe(
+      "5 host controls: 2 containing but not proven, 3 working. Nothing needs you.",
+    );
+    expect(pills.filter((pill) => pill.mode === "Containing, not proven")).toHaveLength(2);
   });
 
   it("falls back to its own count when the host sent no sentence", () => {
@@ -891,7 +914,8 @@ describe("the host's own control count is printed, not recomputed", () => {
     // The headline is the host's summary sentence. The count is a caption under
     // it, and a caption that could replace the sentence would be a second
     // verdict on one page.
-    const pills = posture().layers.map((entry) => controlPill(entry, bootstrap(), generatedAt, true, evaluatedAt));
+    const working = FIVE_LAYERS.map((layer) => ({ ...layer, disposition: "working_as_configured" as const }));
+    const pills = posture(working).layers.map((entry) => controlPill(entry, bootstrap(), generatedAt, true, evaluatedAt));
     expect(postureHeadline(pills, "2 of 5 host controls are off and protect nothing"))
       .toBe("2 of 5 host controls are off and protect nothing");
     expect(postureHeadline(pills, "2 of 5 host controls are off and protect nothing"))

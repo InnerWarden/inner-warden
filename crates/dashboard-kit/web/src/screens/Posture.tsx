@@ -14,7 +14,8 @@ import type {
   ScopeRef,
 } from "../api/v1";
 import { StatusBadge } from "../components/StatusBadge";
-import { layerAssuranceLabel } from "../posture/assurance";
+import { TechnicalOnly } from "../components/TechnicalDetail";
+import { layerAssuranceLabel, type LayerAssuranceLabel } from "../posture/assurance";
 
 // ─────────────────────────── user-facing projections ─────────────────────────
 //
@@ -228,6 +229,11 @@ export type ControlPill = {
   verified: boolean;
   /** Which of the five states this control is in. Drives colour and routing. */
   disposition: LayerDisposition;
+  /**
+   * The host reported this control as proven and the assurance chain did not
+   * pin it, so its chip reads "Containing, not proven" (`claimSoftened`).
+   */
+  softened: boolean;
   /** One sentence saying what to do, or why there is nothing to do. */
   reason: string;
 };
@@ -294,8 +300,10 @@ export function controlPill(
   generatedAt: string,
   current: boolean,
   evaluatedAt: string,
+  /** The assurance already decided for this read (`heldAssurance`); computed here when absent. */
+  decided?: LayerAssuranceLabel,
 ): ControlPill {
-  const assurance = layerAssuranceLabel(
+  const assurance = decided ?? layerAssuranceLabel(
     layer,
     bootstrap.capabilities,
     bootstrap.assurance_matrix,
@@ -327,8 +335,81 @@ export function controlPill(
     tone: dispositionTone(disposition),
     verified: assurance.verifiedActive,
     disposition,
+    softened,
     reason: dispositionReason(layer, disposition),
   };
+}
+
+/** The assurance a control holds once this page verified it on a read. */
+const HELD_VERIFIED: LayerAssuranceLabel = { label: "Verified active enforcement", status: "active", verifiedActive: true };
+
+/**
+ * Which controls were verified on each posture READ, by the read itself.
+ *
+ * Keyed on the snapshot object: the shell keeps one object per successful
+ * read (a re-read, even of identical bytes, is a new object), so a hold lasts
+ * exactly as long as the read it was made on, and survives the reader leaving
+ * the screen and coming back.
+ */
+const heldByRead = new WeakMap<DashboardPosture, Set<string>>();
+
+/**
+ * The assurance each control shows for this read, with a verification held
+ * until the next read instead of lapsing between reads.
+ *
+ * The check binds each control's evidence to the consumer's clock, which
+ * ticks every second, against a producer budget of seconds, while the page
+ * reads the host every few minutes. So a control verified at the read went
+ * from "Protecting" to "Containing, not proven" half a minute later, and back
+ * when the reader pressed Check now: the chips changed on every press and
+ * nothing on the host had. A reader cannot trust chips that move when nothing
+ * moved.
+ *
+ * Now a control verified on a read stays verified for the life of that read,
+ * the chip keeps its "as of" time, and the next read decides again from
+ * scratch. A read that no longer verifies it (the evidence went stale at the
+ * host, a contradicting record, a snapshot the host keeps re-serving) demotes
+ * it at that read. A page whose reading is not current holds nothing: it says
+ * "Refreshing".
+ */
+export function heldAssurance(
+  posture: DashboardPosture,
+  layer: ProtectionLayer,
+  computed: LayerAssuranceLabel,
+  current: boolean,
+  held: WeakMap<DashboardPosture, Set<string>> = heldByRead,
+): LayerAssuranceLabel {
+  if (!current) return computed;
+  let verified = held.get(posture);
+  if (verified === undefined) {
+    verified = new Set();
+    held.set(posture, verified);
+  }
+  if (computed.verifiedActive) {
+    verified.add(layer.id);
+    return computed;
+  }
+  return verified.has(layer.id) ? HELD_VERIFIED : computed;
+}
+
+function assuranceFor(
+  posture: DashboardPosture,
+  layer: ProtectionLayer,
+  bootstrap: DashboardBootstrap,
+  current: boolean,
+  evaluatedAt: string,
+): LayerAssuranceLabel {
+  const computed = layerAssuranceLabel(
+    layer,
+    bootstrap.capabilities,
+    bootstrap.assurance_matrix,
+    posture.generated_at,
+    bootstrap.generated_at,
+    evaluatedAt,
+    bootstrap.platform.os,
+    current,
+  );
+  return heldAssurance(posture, layer, computed, current);
 }
 
 /** The one-line verdict the screen leads with.
@@ -351,8 +432,14 @@ export function controlPill(
  * same claim.
  */
 export function postureHeadline(pills: ControlPill[], hostSummary?: string): string {
+  // The host counts the dispositions it SENT. A chip the assurance veto
+  // softened shows another state, so the host's sentence then counts states
+  // the chips below it do not show: "3 protecting" over one "Protecting" and
+  // two "Containing, not proven". The page is only checkable when its
+  // headline and its chips come from the same states, so the host's sentence
+  // leads only while no chip moved away from what it counted.
   const fromHost = hostSummary?.trim();
-  if (fromHost) return fromHost;
+  if (fromHost && !pills.some((pill) => pill.softened)) return fromHost;
   const total = pills.length;
   if (total === 0) return "No host controls reported";
 
@@ -384,10 +471,15 @@ export function postureHeadline(pills: ControlPill[], hostSummary?: string): str
   // a licence to claim what the detail refuses to claim, and this page exists
   // to keep proven, working and unknown apart.
   const cannotConfirm = pills.filter((pill) => pill.disposition === "cannot_verify").length;
-  const working = pills.filter((pill) => pill.disposition === "working_as_configured").length;
+  // Counted apart from the plainly working ones because the chip is apart:
+  // "Containing, not proven" is a control the host says contains, whose proof
+  // this page could not pin, not one that merely does what it was set to.
+  const unproven = pills.filter((pill) => pill.disposition === "working_as_configured" && pill.softened).length;
+  const working = pills.filter((pill) => pill.disposition === "working_as_configured" && !pill.softened).length;
 
   const parts: string[] = [];
   if (protecting > 0) parts.push(`${protecting} protecting`);
+  if (unproven > 0) parts.push(`${unproven} containing but not proven`);
   if (working > 0) parts.push(`${working} working`);
   if (notOn > 0) parts.push(`${notOn} not turned on`);
   if (cannotConfirm > 0) {
@@ -534,7 +626,11 @@ export function Posture({
    *  refresh handle simply does not render the button. */
   onCheckNow?: () => void | Promise<void>;
 }) {
-  const pills = posture.layers.map((layer) => controlPill(layer, bootstrap, posture.generated_at, current, evaluatedAt));
+  // One assurance per control for this read, shared by its chip, its row and
+  // the headline, so the three cannot tell different stories.
+  const assurances = posture.layers.map((layer) => assuranceFor(posture, layer, bootstrap, current, evaluatedAt));
+  const pills = posture.layers.map((layer, index) =>
+    controlPill(layer, bootstrap, posture.generated_at, current, evaluatedAt, assurances[index]));
   // A gap is an amber card only when the control that OWNS it is asking for
   // the reader. The gap text still exists everywhere else: it stays in the
   // owning control's disclosure: so nothing is hidden; only the routing
@@ -581,9 +677,14 @@ export function Posture({
             <h3 id="posture-verdict-title" className="text-2xl font-semibold tracking-tight text-slate-950">
               {postureHeadline(pills, posture.summary)}
             </h3>
-            {/* The host's own count, under its own sentence, never replacing it. */}
+            {/* The host's own count, never replacing the headline. It is a
+                second count from a second source, and beside the headline in
+                the plain view it read as a second verdict; it stays for
+                whoever checks one against the other. */}
             {controlCountLine(posture) ? (
-              <p className="mt-1.5 text-sm leading-6 text-slate-600">{controlCountLine(posture)}</p>
+              <TechnicalOnly>
+                <p className="mt-1.5 text-sm leading-6 text-slate-600">{controlCountLine(posture)}</p>
+              </TechnicalOnly>
             ) : null}
             <ul className="mt-4 flex flex-wrap gap-2" aria-label="Host controls">
               {pills.map((pill) => (
@@ -617,14 +718,13 @@ export function Posture({
       <section aria-labelledby="posture-controls-title">
         <h3 id="posture-controls-title" className="sr-only">Control details</h3>
         <div className="space-y-3">
-          {posture.layers.map((layer) => (
+          {posture.layers.map((layer, index) => (
             <ControlRow
               key={layer.id}
               layer={layer}
               bootstrap={bootstrap}
-              generatedAt={posture.generated_at}
               current={current}
-              evaluatedAt={evaluatedAt}
+              assurance={assurances[index]}
             />
           ))}
         </div>
@@ -777,26 +877,15 @@ function dedupeGaps(gaps: CoverageGap[]): CoverageGap[] {
 function ControlRow({
   layer,
   bootstrap,
-  generatedAt,
   current,
-  evaluatedAt,
+  assurance,
 }: {
   layer: ProtectionLayer;
   bootstrap: DashboardBootstrap;
-  generatedAt: string;
   current: boolean;
-  evaluatedAt: string;
+  /** The same assurance the chip for this control was drawn from. */
+  assurance: LayerAssuranceLabel;
 }) {
-  const assurance = layerAssuranceLabel(
-    layer,
-    bootstrap.capabilities,
-    bootstrap.assurance_matrix,
-    generatedAt,
-    bootstrap.generated_at,
-    evaluatedAt,
-    bootstrap.platform.os,
-    current,
-  );
   const relevantCapabilities = layer.capability_ids
     .map((id) => bootstrap.capabilities.find((capability) => capability.id === id))
     .filter((capability): capability is CapabilityStatus => capability !== undefined);
