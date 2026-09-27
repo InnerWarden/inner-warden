@@ -8,7 +8,8 @@ import {
   type GuardrailMode,
   type Overview,
 } from "../api";
-import type { CaseLane } from "../api/cases";
+import type { CaseLane, CaseListWindow } from "../api/cases";
+import type { DashboardAccess } from "../api/v1";
 import { DecidedBy } from "../components/DecidedBy";
 import { LaneCards, type LaneOpenOptions } from "../components/LaneCards";
 import { MachineIntelligence } from "../components/MachineIntelligence";
@@ -16,7 +17,10 @@ import { Outcome } from "../components/Outcome";
 import { SensorActivity } from "../components/SensorActivity";
 import { Verdict } from "../components/Verdict";
 import { overviewLaneCards, type LaneCard } from "../lanes";
-import { formatTimestamp, humanizeToken, normaliseMode } from "../presentation";
+import { OVERVIEW_AGENTS_TOUR_STEP_KEY, OVERVIEW_SENSOR_TOUR_STEP_KEY, TOUR_ABSENT_ATTRIBUTE } from "../components/tourKeys";
+import { hasControlCharacters, humanizeToken, normaliseMode, formatCount } from "../presentation";
+import { When } from "../components/When";
+import { isCaseListWindow, WINDOW_WORDS } from "../windows";
 
 type ActivityLink = { id?: string; session?: string; verdict?: string; action?: string };
 
@@ -176,8 +180,18 @@ export function Home({
   onOpenLane,
   machinePanels,
   edition,
+  dashboardAccess,
+  onOpenAuditTrail,
 }: {
   meta?: DashboardMeta;
+  /** What this dashboard can change, as the server said it; see `dashboardAccessClaim`. */
+  dashboardAccess?: DashboardAccess;
+  /**
+   * Opens the screen that lists the admin audit trail, when the server named
+   * one and the shell offers it (`audit_trail_view`). The claim that every
+   * change "lands in the admin audit trail" then links to it.
+   */
+  onOpenAuditTrail?: () => void;
   onOpenActivity: (target?: ActivityLink) => void;
   /**
    * Opens the Cases screen, optionally with one case selected, and with the
@@ -185,7 +199,7 @@ export function Home({
    * when the shell actually has a Cases screen to open; its absence makes
    * every case link degrade per `decisionEntryLink`.
    */
-  onOpenCase?: (caseId?: string, lane?: CaseLane) => void;
+  onOpenCase?: (caseId?: string, lane?: CaseLane, window?: CaseListWindow) => void;
   /**
    * Opens the Cases screen on one lane. Provided only when the shell has a
    * Cases screen; a lane card without it links nowhere (`laneLink`).
@@ -198,7 +212,7 @@ export function Home({
    * The "waiting on you" line is a dead end without it: a number, and no way
    * to get to the cases it counts.
    */
-  onOpenQueue?: () => void;
+  onOpenQueue?: (options?: QueueOpenOptions) => void;
   /**
    * Drives whether the Active Defence card is an offer or noise. Absent means
    * the edition has not resolved yet, which is treated as "do not offer" --
@@ -275,6 +289,8 @@ was incomplete; it does not mean this host is idle.`}
       onOpenQueue={onOpenQueue}
       onOpenLane={onOpenLane}
       machinePanels={machinePanels}
+      dashboardAccess={dashboardAccess}
+      onOpenAuditTrail={onOpenAuditTrail}
     />
   );
 }
@@ -307,15 +323,20 @@ export function OverviewScreen({
   onOpenQueue,
   onOpenLane,
   machinePanels,
+  dashboardAccess,
+  onOpenAuditTrail,
 }: {
   overview: Overview;
   meta?: DashboardMeta;
   edition?: "community" | "enterprise";
+  dashboardAccess?: DashboardAccess;
+  /** See `Home`'s `onOpenAuditTrail`. */
+  onOpenAuditTrail?: () => void;
   fetching?: boolean;
   reconnecting?: boolean;
   onOpenActivity: (target?: ActivityLink) => void;
-  onOpenCase?: (caseId?: string, lane?: CaseLane) => void;
-  onOpenQueue?: () => void;
+  onOpenCase?: (caseId?: string, lane?: CaseLane, window?: CaseListWindow) => void;
+  onOpenQueue?: (options?: QueueOpenOptions) => void;
   onOpenLane?: (lane: CaseLane, options: LaneOpenOptions) => void;
   machinePanels?: MachinePanels;
 }) {
@@ -323,6 +344,7 @@ export function OverviewScreen({
   const mode = normaliseMode(meta);
   const guardedAgents = meta?.guardrail?.guarded_agents;
   const laneCards = overviewLaneCards(overview.lanes);
+  const accessClaim = dashboardAccessClaim(edition, dashboardAccess);
 
   if (laneCards !== undefined) {
     return (
@@ -340,6 +362,8 @@ export function OverviewScreen({
         onOpenQueue={onOpenQueue}
         onOpenLane={onOpenLane}
         machinePanels={machinePanels}
+        accessClaim={accessClaim}
+        onOpenAuditTrail={onOpenAuditTrail}
         // `?? false` reads an older server the way the layout without lanes
         // reads it: as an offer.
         activeDefenceInstalled={meta?.active_defence_installed ?? false}
@@ -351,7 +375,7 @@ export function OverviewScreen({
     <div className="min-w-0 space-y-6 sm:space-y-8" aria-busy={fetching}>
       {reconnecting && <ReconnectingNotice />}
 
-      <PostureHero mode={mode} edition={edition} decisions={overview.commands} sessions={overview.sessions} guardedAgents={guardedAgents} hostHeadline={overview.headline} />
+      <PostureHero mode={mode} edition={edition} decisions={overview.commands} sessions={overview.sessions} guardedAgents={guardedAgents} hostHeadline={overview.headline} accessClaim={accessClaim} onOpenAuditTrail={onOpenAuditTrail} />
 
       <MachineIntelligence edition={edition} />
 
@@ -424,19 +448,23 @@ function LanesOverview({
   onOpenLane,
   machinePanels,
   activeDefenceInstalled,
+  accessClaim,
+  onOpenAuditTrail,
 }: {
   overview: Overview;
   laneCards: LaneCard[];
   technical: boolean;
   activeDefenceInstalled: boolean;
+  accessClaim?: string;
+  onOpenAuditTrail?: () => void;
   mode: GuardrailMode;
   edition?: "community" | "enterprise";
   guardedAgents?: number;
   fetching: boolean;
   reconnecting: boolean;
   onOpenActivity: (target?: ActivityLink) => void;
-  onOpenCase?: (caseId?: string, lane?: CaseLane) => void;
-  onOpenQueue?: () => void;
+  onOpenCase?: (caseId?: string, lane?: CaseLane, window?: CaseListWindow) => void;
+  onOpenQueue?: (options?: QueueOpenOptions) => void;
   onOpenLane?: (lane: CaseLane, options: LaneOpenOptions) => void;
   machinePanels?: MachinePanels;
 }) {
@@ -448,19 +476,21 @@ function LanesOverview({
   const recent = (overview.recent_decisions ?? overview.recent_blocks).slice(0, 5);
   const agents = machinePanels?.agents ?? true;
   const tokens = machinePanels?.tokens ?? true;
+  const absentFromTour = lanesTourAbsent(technical, agents);
   return (
     <div className="min-w-0 space-y-6 sm:space-y-8" aria-busy={fetching}>
       {reconnecting && <ReconnectingNotice />}
+      {absentFromTour.length > 0 ? <span hidden {...{ [TOUR_ABSENT_ATTRIBUTE]: absentFromTour.join(" ") }} /> : null}
 
       <LaneCards
         cards={laneCards}
         edition={edition}
         onOpenLane={onOpenLane}
-        onOpenCase={onOpenCase === undefined ? undefined : (caseId, lane) => onOpenCase(caseId, lane)}
+        onOpenCase={onOpenCase === undefined ? undefined : (caseId, lane, window) => onOpenCase(caseId, lane, window)}
         onOpenActivity={() => onOpenActivity()}
       />
 
-      <HostAttention waiting={overview.host_attention} onOpen={onOpenQueue} />
+      <WaitingLine overview={overview} onOpenQueue={onOpenQueue} cards={laneCards} />
 
       {showRecord && record !== undefined ? (
         <DecisionRecordSection
@@ -496,6 +526,8 @@ function LanesOverview({
             guardedAgents={guardedAgents}
             hostHeadline={overview.headline}
             headingLevel="h2"
+            accessClaim={accessClaim}
+            onOpenAuditTrail={onOpenAuditTrail}
           />
           {agents || tokens ? <MachineIntelligence edition={edition} showAgents={agents} showTokens={tokens} /> : null}
           <SensorActivity />
@@ -509,6 +541,20 @@ function LanesOverview({
       ) : null}
     </div>
   );
+}
+
+/**
+ * The tour steps whose panels this layout does not draw in the view on
+ * screen: the agent and sensor panels are in the technical section, and the
+ * agent panel only where the shell offers it. The tour drops those steps
+ * instead of floating a card over the page about a panel that is not there
+ * (`declaredAbsent`). The sensor panel can still be absent in the technical
+ * view (a host with no sensor endpoint draws none), which only the fetch can
+ * tell, and the tour's own wait covers that.
+ */
+export function lanesTourAbsent(technical: boolean, agentsOffered: boolean): string[] {
+  if (!technical) return [OVERVIEW_AGENTS_TOUR_STEP_KEY, OVERVIEW_SENSOR_TOUR_STEP_KEY];
+  return agentsOffered ? [] : [OVERVIEW_AGENTS_TOUR_STEP_KEY];
 }
 
 /**
@@ -542,9 +588,9 @@ export function OverviewRecord({
   guardedAgents?: number;
   onOpenActivity: (target?: ActivityLink) => void;
   onOpenCase?: (caseId?: string) => void;
-  onOpenQueue?: () => void;
+  onOpenQueue?: (options?: QueueOpenOptions) => void;
 }) {
-  const hostAttention = <HostAttention waiting={overview.host_attention} onOpen={onOpenQueue} />;
+  const hostAttention = <WaitingLine overview={overview} onOpenQueue={onOpenQueue} />;
   if (overview.commands === 0) {
     return (
       <>
@@ -591,7 +637,7 @@ export function openDecisionRecord(
   cta: ReturnType<typeof decisionRecordCta>,
   open: {
     onOpenActivity: (target?: ActivityLink) => void;
-    onOpenCase?: (caseId?: string, lane?: CaseLane) => void;
+    onOpenCase?: (caseId?: string, lane?: CaseLane, window?: CaseListWindow) => void;
     onOpenLane?: (lane: CaseLane, options: LaneOpenOptions) => void;
   },
 ): void {
@@ -618,7 +664,7 @@ function DecisionRecordSection({
   overview: Overview;
   tiles: boolean;
   onOpenActivity: (target?: ActivityLink) => void;
-  onOpenCase?: (caseId?: string, lane?: CaseLane) => void;
+  onOpenCase?: (caseId?: string, lane?: CaseLane, window?: CaseListWindow) => void;
   onOpenLane?: (lane: CaseLane, options: LaneOpenOptions) => void;
 }) {
   const { cta, summary, denyVerdicts, reviewVerdicts, allowVerdicts } = record;
@@ -669,6 +715,39 @@ function DecisionRecordSection({
       )}
     </>
   );
+}
+
+/** The data-handling line for a dashboard that changes nothing. */
+export const READ_ONLY_CLAIM = "This dashboard only reads; it changes nothing";
+
+/** The data-handling line for a dashboard that can change the host. */
+export const CONFIRMED_CHANGES_CLAIM =
+  "Reads by default. Every change asks you to confirm it (and for a code where one is set), is recorded under your name and lands in the admin audit trail";
+
+/**
+ * What the Overview may say about what this dashboard changes.
+ *
+ * The hero ticked "This dashboard only reads; it changes nothing" on every
+ * host. That is true of Community, whose dashboard API answers GET and
+ * nothing else, and false of the paid dashboard, which offers block,
+ * unblock, exclusions and a verdict on each case. A ticked claim that is
+ * false on the edition a reviewer is looking at costs every other tick on
+ * the page.
+ *
+ * The server's word decides when it gave one (`dashboard_access`). A server
+ * older than the field has said which edition it is, and the edition is what
+ * it says about this: Community reads only, the paid dashboard asks before
+ * each change. With no edition resolved nothing is claimed either way.
+ */
+export function dashboardAccessClaim(
+  edition: "community" | "enterprise" | undefined,
+  declared: DashboardAccess | undefined,
+): string | undefined {
+  if (declared === "read_only") return READ_ONLY_CLAIM;
+  if (declared === "confirmed_changes") return CONFIRMED_CHANGES_CLAIM;
+  if (edition === "community") return READ_ONLY_CLAIM;
+  if (edition === "enterprise") return CONFIRMED_CHANGES_CLAIM;
+  return undefined;
 }
 
 /// What the `unknown` posture means on a paid host: the guardrail hook reports
@@ -757,7 +836,7 @@ export const POSTURES: Record<GuardrailMode, { label: string; title: string; bod
 // The first version of this test rebuilt the merge expression inline and
 // asserted on its own object, so it passed with the fix reverted: it proved
 // that spreading two objects works, not that this screen honours the host.
-export function PostureHero({ mode, edition, decisions, sessions, guardedAgents, hostHeadline, headingLevel = "h1" }: { mode: GuardrailMode; edition?: "community" | "enterprise"; decisions: number; sessions: number; guardedAgents?: number; hostHeadline?: { label: string; title: string; body: string }; /** `h2` where the page already has its `h1` (the lanes layout). */ headingLevel?: "h1" | "h2" }) {
+export function PostureHero({ mode, edition, decisions, sessions, guardedAgents, hostHeadline, headingLevel = "h1", accessClaim, onOpenAuditTrail }: { mode: GuardrailMode; edition?: "community" | "enterprise"; decisions: number; sessions: number; guardedAgents?: number; hostHeadline?: { label: string; title: string; body: string }; /** `h2` where the page already has its `h1` (the lanes layout). */ headingLevel?: "h1" | "h2"; /** What this dashboard can change, from `dashboardAccessClaim`; no line when absent. */ accessClaim?: string; /** Opens the admin audit trail the claim names, when the shell has it. */ onOpenAuditTrail?: () => void }) {
   const Heading = headingLevel;
   // The `unknown` copy is written for Community: "this version records guardrail
   // decisions" describes the free hook, and the decision count is the free
@@ -810,7 +889,19 @@ export function PostureHero({ mode, edition, decisions, sessions, guardedAgents,
             </summary>
             <ul className="mt-2 flex flex-wrap gap-x-5 gap-y-2 text-xs font-medium text-slate-600">
               <TrustItem>Rules are evaluated on this machine</TrustItem>
-              <TrustItem>This dashboard only reads; it changes nothing</TrustItem>
+              {accessClaim === undefined ? null : (
+                <TrustItem>
+                  {accessClaim}
+                  {/* The claim names a trail; where the server named the
+                      screen that lists it, the claim leads there. Without
+                      one the line is exactly what it was. */}
+                  {accessClaim === CONFIRMED_CHANGES_CLAIM && onOpenAuditTrail !== undefined ? (
+                    <button type="button" onClick={onOpenAuditTrail} className="font-semibold text-cyan-700 underline decoration-cyan-300 underline-offset-2 hover:text-cyan-900">
+                      See the audit trail
+                    </button>
+                  ) : null}
+                </TrustItem>
+              )}
               <TrustItem>Common secret patterns are redacted before storage</TrustItem>
             </ul>
           </details>
@@ -836,7 +927,7 @@ function TrustItem({ children }: { children: ReactNode }) {
 function HeroNumber({ label, value }: { label: string; value: number }) {
   return (
     <div>
-      <div className="text-2xl font-semibold tabular-nums text-slate-950">{value.toLocaleString()}</div>
+      <div className="text-2xl font-semibold tabular-nums text-slate-950">{formatCount(value)}</div>
       <div className="mt-0.5 text-xs font-medium text-slate-500">{label}</div>
     </div>
   );
@@ -904,7 +995,7 @@ function Stat({ label, value, detail, tone }: { label: string; value: number; de
   const number = tone === "danger" ? "text-red-700" : tone === "attention" ? "text-amber-700" : tone === "positive" ? "text-emerald-700" : "text-slate-950";
   return (
     <article className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
-      <div className={`text-2xl font-semibold tabular-nums ${number}`}>{value.toLocaleString()}</div>
+      <div className={`text-2xl font-semibold tabular-nums ${number}`}>{formatCount(value)}</div>
       <div className="mt-1 text-sm font-semibold text-slate-800">{label}</div>
       <p className="mt-1 text-xs text-slate-500">{detail}</p>
     </article>
@@ -915,7 +1006,9 @@ function OperationalEvidence({ overview }: { overview: Overview }) {
   const items = [
     { label: "Blocked before execution", value: overview.actual_blocks, cls: "text-red-700" },
     { label: "Would block in monitor mode", value: overview.would_block, cls: "text-blue-700" },
-    { label: "Screened by one-off check", value: overview.screened, cls: "text-cyan-700" },
+    // The chip on each recent decision says "Checked only" for the same
+    // outcome: one word for it on one page, with what it means beside it.
+    { label: "Checked only (one-off check)", value: overview.screened, cls: "text-cyan-700" },
     { label: "Outcome not recorded", value: overview.outcomes_unknown, cls: "text-slate-700" },
   ].filter((item) => item.value != null);
   return (
@@ -930,7 +1023,7 @@ function OperationalEvidence({ overview }: { overview: Overview }) {
         </div>
         {items.map((item) => (
           <div key={item.label} className="min-w-28">
-            <div className={`text-lg font-semibold tabular-nums ${item.cls}`}>{item.value?.toLocaleString()}</div>
+            <div className={`text-lg font-semibold tabular-nums ${item.cls}`}>{(item.value == null ? undefined : formatCount(item.value))}</div>
             <div className="text-[11px] text-slate-500">{item.label}</div>
           </div>
         ))}
@@ -1006,7 +1099,7 @@ export function kernelStopped(item: Pick<DecisionSummary, "kernel_stopped">): st
   const value = item.kernel_stopped;
   if (typeof value !== "string") return undefined;
   const trimmed = value.trim();
-  if (trimmed.length === 0 || trimmed.length > 512 || /[\u0000-\u001f\u007f]/.test(trimmed)) return undefined;
+  if (trimmed.length === 0 || trimmed.length > 512 || hasControlCharacters(trimmed)) return undefined;
   return trimmed;
 }
 
@@ -1016,38 +1109,250 @@ export function kernelStoppedLabel(program: string): string {
   return `The kernel stopped ${name}`;
 }
 
+/** The final outcome of a decision the kernel stopped, as its one pill says it. */
+export const KERNEL_STOPPED_OUTCOME = "Stopped by the kernel";
+
+/** Who gave the verdict, as a sentence names them; see `kernelStoppedDetail`. */
+const VERDICT_BY: Record<string, string> = {
+  rules: "the rule engine",
+  graph: "the session graph",
+  warden: "the on-device Warden",
+  llm: "your model",
+  human: "a person",
+  user: "the user",
+  "host-edr": "host defence",
+};
+
+/**
+ * What happened, in order, under a decision the kernel stopped: "The kernel
+ * stopped sudo at exec; the rule engine had allowed it."
+ *
+ * The row read a green "Allowed", "Allowed to run" and "The kernel stopped
+ * nc" side by side: the rule engine's verdict as the outcome, and the
+ * kernel's refusal as a footnote to it. The kernel's refusal is what finally
+ * happened, so it is the row's one outcome, and the verdict before it is
+ * said here as what came first.
+ */
+export function kernelStoppedDetail(item: Pick<DecisionSummary, "recommendation" | "decided_by">, program: string): string {
+  const stopped = `${kernelStoppedLabel(program)} at exec`;
+  const who = VERDICT_BY[item.decided_by ?? ""] ?? "the guardrail";
+  const verdict = item.recommendation === "allow"
+    ? "had allowed it"
+    : item.recommendation === "deny"
+      ? "had judged it unsafe"
+      : item.recommendation === "review"
+        ? "had flagged it for review"
+        : undefined;
+  return verdict === undefined ? `${stopped}.` : `${stopped}; ${who} ${verdict}.`;
+}
+
 function RecentActivityEntry({ item, clickable }: { item: DecisionSummary; clickable: boolean }) {
   const recommendation = item.recommendation ?? "unknown";
-  const when = formatTimestamp(item.recorded_at_ms);
+  const when = item.recorded_at_ms == null || !Number.isFinite(item.recorded_at_ms) ? undefined : item.recorded_at_ms;
   const sessionLabel = item.session === "local" ? "Local session" : item.session;
+  const stopped = kernelStopped(item);
   return (
     <>
-      <Verdict rec={recommendation} reviewLabel={REVIEW_VERDICT_CHIP} />
+      {stopped === undefined ? (
+        <Verdict rec={recommendation} reviewLabel={REVIEW_VERDICT_CHIP} />
+      ) : (
+        // One final outcome for the row. The verdict before it is in the
+        // line under the command, never a green pill beside a refusal.
+        <span
+          data-final-outcome="kernel_stopped"
+          className="inline-flex shrink-0 self-start justify-self-start items-center gap-1.5 rounded-lg border border-rose-200 bg-rose-50 px-2.5 py-0.5 text-xs font-semibold leading-5 text-rose-800"
+        >
+          <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-rose-500" aria-hidden="true" />
+          {KERNEL_STOPPED_OUTCOME}
+        </span>
+      )}
       <div className="min-w-0 flex-1">
         <code className="block truncate text-sm font-medium text-slate-900">{item.command}</code>
         <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
           <DecidedBy by={item.decided_by} />
-          <Outcome value={item.outcome ?? "unknown"} />
-          {kernelStopped(item) ? (
-            <span className="max-w-full break-words rounded-md border border-rose-200 bg-rose-50 px-2 py-0.5 text-[11px] font-semibold text-rose-800 [overflow-wrap:anywhere]">
-              {kernelStoppedLabel(kernelStopped(item) as string)}
-            </span>
-          ) : null}
+          {stopped === undefined ? <Outcome value={item.outcome ?? "unknown"} /> : null}
           {item.categories.slice(0, 2).map((category) => (
             <span key={category} className="max-w-full truncate rounded-full bg-slate-100 px-2 py-0.5 text-[11px] font-medium text-slate-600">
               {humanizeToken(category)}
             </span>
           ))}
         </div>
+        {stopped === undefined ? null : (
+          <p className="mt-1.5 break-words text-xs leading-5 text-rose-900 [overflow-wrap:anywhere]">{kernelStoppedDetail(item, stopped)}</p>
+        )}
       </div>
       <div className="col-span-2 flex min-w-0 items-center justify-between gap-3 text-xs text-slate-500 sm:col-span-1 sm:block sm:max-w-28 sm:shrink-0 sm:text-right">
-        {when && <div className="shrink-0">{when}</div>}
+        {when !== undefined && <div className="shrink-0"><When at={when} relative /></div>}
         <div className="min-w-0 flex-1 truncate sm:mt-1 sm:max-w-28" title={sessionLabel}>{sessionLabel}</div>
         {clickable && (
           <span className="mt-2 hidden font-semibold text-cyan-700 opacity-0 transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100 sm:inline-block">Open →</span>
         )}
       </div>
     </>
+  );
+}
+
+/** Where the waiting line's link goes: the queue, in the span it counted. */
+export type QueueOpenOptions = { window?: CaseListWindow };
+
+/** The server's one waiting count, read from `overview.waiting`. */
+export type WaitingCount = {
+  count: number;
+  window: CaseListWindow;
+  /** How many of `count` arrived today, when the server said and it is not more than `count`. */
+  today?: number;
+};
+
+/**
+ * The server's one count of what waits on a person, or nothing.
+ *
+ * "Waiting on you" read 1 on the Overview's banner, 2 on the agent's card,
+ * 145 on Cases and 257 on the list the card opened: five counts of five
+ * things under one phrase. The paid host now owns one definition and one
+ * count, the one its Cases filter `status=waiting` lists, and sends it with
+ * the span it counted. A count that is not a whole number, or a span this
+ * bundle does not know, is read as not sent, and the Overview reads the
+ * host's older address line instead, exactly as before. A "today" that is
+ * not a whole number no larger than the count is dropped on its own.
+ */
+export function waitingCount(value: unknown): WaitingCount | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const item = value as Record<string, unknown>;
+  const count = wholeCount(item.count);
+  const window = isCaseListWindow(item.window) ? item.window : undefined;
+  if (count === undefined || window === undefined) return undefined;
+  const today = wholeCount(item.today);
+  return today !== undefined && today <= count ? { count, window, today } : { count, window };
+}
+
+/**
+ * The waiting line, from the server's one count: the number, the span it was
+ * counted over, the part of it that is today's when the server said, and a
+ * link to exactly the list it counted. It replaces the address line and its
+ * long "What this number counts": the count is the list, so there is nothing
+ * to reconcile.
+ *
+ * The span is always said, "all time" included. A count over all time read
+ * "145 cases are waiting on you" with no span, directly under cards that each
+ * say "in the last 7 days" and whose chips count that week only, so the page
+ * showed two numbers that seemed to disagree and did not say why.
+ */
+export function waitingLine(waiting: WaitingCount): {
+  tone: "quiet" | "waiting";
+  title: string;
+  /** The span the count covers: "Counted over the last 7 days." */
+  span: string;
+  body?: string;
+  through?: { label: string; window: CaseListWindow };
+} {
+  const span = `Counted over ${WINDOW_WORDS[waiting.window].span}.`;
+  if (waiting.count === 0) {
+    return {
+      tone: "quiet",
+      title: "Nothing is waiting on you",
+      span,
+      body: "No case on this host needs a person.",
+    };
+  }
+  const one = waiting.count === 1;
+  const n = formatCount(waiting.count);
+  return {
+    tone: "waiting",
+    title: `${n} ${one ? "case is" : "cases are"} waiting on you`,
+    span,
+    ...(waiting.today === undefined ? {} : { body: todaySubset(waiting.count, waiting.today) }),
+    through: { label: one ? "See the waiting case" : `See the ${n} waiting cases`, window: waiting.window },
+  };
+}
+
+/**
+ * How the waiting count sits beside the lane cards' "waiting on you" chips,
+ * when that can be said, or nothing.
+ *
+ * The line counts every lane; each chip counts its own lane in its card's
+ * span. A new server read "3 cases from the last 7 days are waiting on you"
+ * over a single "2 waiting on you" chip, and nothing said where the third
+ * one was. So:
+ *
+ *  - Cards that all count one span other than the count's: the line says
+ *    which span the cards count, since the two numbers cover different
+ *    spans ("The cards above count the last 7 days.").
+ *  - The same span, every card with a waiting count, and the chips adding
+ *    up to less than the total: the rest are cases no lane lists ("1 more
+ *    is outside the lanes above.").
+ *  - Anything else (cards over mixed spans, which the intro already says; a
+ *    card with no waiting count; chips adding up to the total, or beyond it,
+ *    which this page cannot explain): nothing.
+ */
+export function waitingAcrossLanes(waiting: WaitingCount, cards: readonly LaneCard[] | undefined): string | undefined {
+  if (cards === undefined || waiting.count === 0) return undefined;
+  const counted = cards.flatMap((card) => (card.state === "available" ? [card] : []));
+  if (counted.length === 0) return undefined;
+  const spans = new Set(counted.map((card) => card.window));
+  if (spans.size !== 1) return undefined;
+  const [span] = spans;
+  if (span !== waiting.window) return `The cards above count ${WINDOW_WORDS[span].span}.`;
+  if (counted.some((card) => card.waiting === undefined)) return undefined;
+  const inLanes = counted.reduce((sum, card) => sum + (card.waiting ?? 0), 0);
+  const rest = waiting.count - inLanes;
+  if (rest <= 0) return undefined;
+  return `${formatCount(rest)} more ${rest === 1 ? "is" : "are"} outside the lanes above.`;
+}
+
+/** Which part of the waiting count is today's, and which is older, named honestly. */
+function todaySubset(count: number, today: number): string {
+  if (count === 1) return today === 1 ? "It arrived today." : "It is from an earlier day.";
+  if (today === count) return "All of them arrived today.";
+  if (today === 0) return "None of them arrived today; they are from earlier days.";
+  const rest = count - today;
+  return `${formatCount(today)} arrived today; ${formatCount(rest)} more ${rest === 1 ? "is" : "are"} from earlier days.`;
+}
+
+/**
+ * The line under the lane cards: the server's one waiting count when it sent
+ * one, and the host's address line otherwise (`HostAttention`), which is
+ * every host older than the count.
+ */
+export function WaitingLine({ overview, onOpenQueue, cards }: {
+  overview: Overview;
+  onOpenQueue?: (options?: QueueOpenOptions) => void;
+  /** The lane cards drawn above, so the line can say how its count sits beside theirs. */
+  cards?: readonly LaneCard[];
+}) {
+  const waiting = waitingCount(overview.waiting);
+  if (waiting === undefined) return <HostAttention waiting={overview.host_attention} onOpen={onOpenQueue === undefined ? undefined : () => onOpenQueue()} />;
+  const line = waitingLine(waiting);
+  const quiet = line.tone === "quiet";
+  const through = onOpenQueue !== undefined ? line.through : undefined;
+  const across = waitingAcrossLanes(waiting, cards);
+  return (
+    <section
+      aria-labelledby="host-attention-title"
+      data-waiting-count={waiting.count}
+      className={`rounded-xl border p-4 shadow-sm ${quiet ? "border-slate-200 bg-white" : "border-amber-200 bg-amber-50"}`}
+    >
+      <h2 id="host-attention-title" className={`text-sm font-semibold ${quiet ? "text-slate-950" : "text-amber-900"}`}>
+        {line.title}
+      </h2>
+      <p data-waiting-span className={`mt-0.5 text-xs ${quiet ? "text-slate-500" : "text-amber-800"}`}>{line.span}</p>
+      {line.body !== undefined && (
+        <p className={`mt-1 text-sm leading-6 ${quiet ? "text-slate-600" : "text-amber-900"}`}>{line.body}</p>
+      )}
+      {across !== undefined && (
+        <p data-waiting-across className="mt-1 text-sm leading-6 text-amber-900">{across}</p>
+      )}
+      {through !== undefined && (
+        <div className="mt-3">
+          <button
+            type="button"
+            onClick={() => onOpenQueue?.({ window: through.window })}
+            className="text-sm font-semibold text-amber-900 underline decoration-amber-400 underline-offset-4 hover:text-amber-950"
+          >
+            {through.label} <span aria-hidden="true">→</span>
+          </button>
+        </div>
+      )}
+    </section>
   );
 }
 
@@ -1198,9 +1503,9 @@ const FINDINGS_OFF_THE_LINE_FALLBACK =
   "host findings from today that wait in Cases and that a count of addresses cannot include, one per finding";
 
 function waitingTitle(addresses: number, findings: number): string {
-  const addressPart = `${addresses.toLocaleString()} ${addresses === 1 ? "address" : "addresses"}`;
+  const addressPart = `${formatCount(addresses)} ${addresses === 1 ? "address" : "addresses"}`;
   if (findings === 0) return `${addressPart} ${addresses === 1 ? "is" : "are"} waiting on you`;
-  const findingPart = `${findings.toLocaleString()} ${findings === 1 ? "finding" : "findings"}`;
+  const findingPart = `${formatCount(findings)} ${findings === 1 ? "finding" : "findings"}`;
   if (addresses === 0) return `${findingPart} ${findings === 1 ? "is" : "are"} waiting on you`;
   // Not "other findings": an address is not a finding, and these are the
   // findings the address count left out, never the same waiting twice.
@@ -1288,7 +1593,7 @@ function RiskSignals({ items, sent, max }: { items: Overview["top_categories"]; 
               <li key={item.name}>
                 <div className="mb-1.5 flex items-center justify-between gap-3 text-xs">
                   <span className="truncate font-medium text-slate-700" title={item.name}>{humanizeToken(item.name)}</span>
-                  <span className="tabular-nums text-slate-500">{item.count}</span>
+                  <span className="tabular-nums text-slate-500">{formatCount(item.count)}</span>
                 </div>
                 <div className="h-1.5 overflow-hidden rounded-full bg-slate-100" aria-hidden="true">
                   <div

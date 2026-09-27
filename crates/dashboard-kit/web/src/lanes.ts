@@ -1,5 +1,7 @@
 import { CASE_LANES, isCaseLane, type CaseLane, type CaseLaneCounts } from "./api/lanes";
 import type { CaseListWindow } from "./api/cases";
+import { hasControlCharacters } from "./presentation";
+import { isCaseListWindow, windowWords, withinWindow } from "./windows";
 
 /**
  * Three questions, one place each.
@@ -70,15 +72,7 @@ export const EVERYTHING_COPY = {
 } as const;
 
 /** What the card's small print says about the span its number covers. */
-export const LANE_WINDOW_PHRASE: Record<CaseListWindow, string> = {
-  "1h": "in the last hour",
-  "24h": "in the last 24 hours",
-  "7d": "in the last 7 days",
-  "30d": "in the last 30 days",
-  all: "in everything this host has kept",
-};
-
-const WINDOWS: readonly CaseListWindow[] = ["1h", "24h", "7d", "30d", "all"];
+export const LANE_WINDOW_PHRASE: Record<CaseListWindow, string> = windowWords("during");
 
 /**
  * What a card's number counts, as the host names it (`count_of`): the noun
@@ -116,6 +110,12 @@ export type LaneLatest = {
 };
 
 /**
+ * One part of a card's number, as the host split it: "2 refused before they
+ * ran", "4 stopped by the kernel".
+ */
+export type LanePart = { key: string; count: number; label: string };
+
+/**
  * One lane card, read from the host's `overview.lanes.<lane>`.
  *
  * `no_source` is a real answer, not a zero: nothing on this host feeds the
@@ -139,6 +139,11 @@ export type LaneCard =
        */
       waiting?: number;
       latest?: LaneLatest;
+      /**
+       * How `count` splits by what finally happened, when the host sent a
+       * split whose parts add up to `count` exactly (`laneBreakdown`).
+       */
+      breakdown?: LanePart[];
     }
   | { lane: CaseLane; state: "no_source"; sentence: string };
 
@@ -163,6 +168,41 @@ function wholeCount(value: unknown): number | undefined {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value + 0 : undefined;
 }
 
+const PART_KEY = /^[a-z][a-z0-9_]{0,63}$/;
+const PART_LABEL_MAX = 120;
+const PARTS_MAX = 8;
+
+/**
+ * The split of a card's number, or nothing.
+ *
+ * The agent's card read "8 in the last 7 days" over "tried 7 commands" and a
+ * split of 2, 4 and 3, which is 9: three numbers, three answers. A split is
+ * shown only when it is one answer: every part a whole count with a plain
+ * label and its own key, and the parts adding up to the headline exactly.
+ * One malformed part, a repeated key, or a sum that is not the headline, and
+ * the whole split is dropped, never a part of it: a split with a part
+ * missing is a set of numbers that does not add up, which is the defect.
+ */
+export function laneBreakdown(value: unknown, total: number): LanePart[] | undefined {
+  if (!Array.isArray(value) || value.length === 0 || value.length > PARTS_MAX) return undefined;
+  const parts: LanePart[] = [];
+  const keys = new Set<string>();
+  let sum = 0;
+  for (const entry of value) {
+    const item = record(entry);
+    if (item === undefined) return undefined;
+    const key = typeof item.key === "string" && PART_KEY.test(item.key) ? item.key : undefined;
+    const count = wholeCount(item.count);
+    const label = text(item.label, PART_LABEL_MAX);
+    if (key === undefined || count === undefined || label === undefined || keys.has(key)) return undefined;
+    if (hasControlCharacters(label)) return undefined;
+    keys.add(key);
+    sum += count;
+    parts.push({ key, count, label });
+  }
+  return Number.isSafeInteger(sum) && sum === total ? parts : undefined;
+}
+
 function latestOf(value: unknown): LaneLatest | undefined {
   const item = record(value);
   if (item === undefined) return undefined;
@@ -171,6 +211,21 @@ function latestOf(value: unknown): LaneLatest | undefined {
   if (title === undefined || at === undefined) return undefined;
   const caseId = text(item.case_id, CASE_ID_MAX);
   return caseId === undefined ? { title, at } : { title, at, caseId };
+}
+
+/**
+ * The span a card's newest case opens in: the card's own span when the case
+ * is inside it, and every day when it is not.
+ *
+ * Opening the newest case in the card's span puts it in the list beside it,
+ * the list the card described. Nothing makes the host's newest case fall in
+ * that span, though (a walk found a 7 September case under "7 days"), and a
+ * case opened over a list that does not hold it is the broken link a reader
+ * reports: the detail opens, and nothing beside it is the case. So the span
+ * travels only when the case's time is in it.
+ */
+export function latestCaseWindow(latest: Pick<LaneLatest, "at">, window: CaseListWindow, now: number): CaseListWindow {
+  return withinWindow(latest.at, window, now) ? window : "all";
 }
 
 /**
@@ -194,7 +249,7 @@ export function parseLaneCard(lane: CaseLane, value: unknown): LaneCard | undefi
   if (item.availability === "no_source") return { lane, state: "no_source", sentence };
   if (item.availability !== "available") return undefined;
   const count = wholeCount(item.count);
-  const window = WINDOWS.find((candidate) => candidate === item.window);
+  const window = isCaseListWindow(item.window) ? item.window : undefined;
   if (count === undefined || window === undefined) return undefined;
   const card: LaneCard = { lane, state: "available", count, window, sentence };
   const countOf = LANE_COUNT_OF.find((candidate) => candidate === item.count_of);
@@ -203,6 +258,8 @@ export function parseLaneCard(lane: CaseLane, value: unknown): LaneCard | undefi
   if (waiting !== undefined) card.waiting = waiting;
   const latest = latestOf(item.latest);
   if (latest !== undefined) card.latest = latest;
+  const breakdown = laneBreakdown(item.breakdown, count);
+  if (breakdown !== undefined) card.breakdown = breakdown;
   return card;
 }
 

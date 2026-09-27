@@ -1,9 +1,10 @@
 import type { CaseEvent, VerifiedOutcome as VerifiedOutcomeRecord } from "../api/cases";
 import type { SecurityOutcome } from "../api/v1";
 import { StatusBadge, type StatusTone } from "./StatusBadge";
-import { formatAbsolute, readsAsPlainWords } from "../presentation";
+import { readsAsPlainWords } from "../presentation";
 import { EvidenceLinks } from "./CaseTimeline";
 import { TechnicalOnly } from "./TechnicalDetail";
+import { When } from "./When";
 
 export type OutcomePresentation = {
   /// The header may report this outcome. `recorded` counts: an in-path guard
@@ -338,7 +339,7 @@ export function VerifiedOutcome({ outcome, timeline, evaluatedAt }: {
           <div><dt className="text-slate-500">Reported by</dt><dd className="mt-0.5 break-words font-semibold text-slate-800 [overflow-wrap:anywhere]">{outcome.verifier}</dd></div>
         ) : null}
         {outcome.verified_at ? (
-          <div><dt className="text-slate-500">Recorded at</dt><dd className="mt-0.5 font-semibold text-slate-800">{formatTime(outcome.verified_at)}</dd></div>
+          <div><dt className="text-slate-500">Recorded at</dt><dd className="mt-0.5 font-semibold text-slate-800"><When at={outcome.verified_at} /></dd></div>
         ) : null}
         </dl>
       </TechnicalOnly>
@@ -361,6 +362,3 @@ function checkedWord(presentation: OutcomePresentation): string {
   return "Nothing to check";
 }
 
-function formatTime(value: string): string {
-  return formatAbsolute(value) ?? value;
-}

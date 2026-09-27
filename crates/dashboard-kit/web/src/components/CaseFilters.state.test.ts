@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { caseViewUrl, EMPTY_CASE_VIEW, readCaseViewState } from "./CaseFilters";
+import { caseViewUrl, DEFAULT_CASE_WINDOW, EMPTY_CASE_VIEW, readCaseViewState } from "./CaseFilters";
 
 /**
  * The status filter travels in the address bar like every other Cases
@@ -42,5 +42,22 @@ describe("the status filter in the address bar", () => {
     expect(back.status).toBe("contained");
     expect(back.severity).toBe("high");
     expect(back.window).toBe("7d");
+  });
+});
+
+/**
+ * Cases opens on the span the Overview's cards count. It opened on the last
+ * 24 hours while the cards counted 7 days, so a reader who read "4 messages
+ * in the last 7 days" and pressed the Cases tab found 2, over a span nothing
+ * on screen named.
+ *
+ * FAILS ON REVERT: put the default back to 24h and both halves read it.
+ */
+describe("the span Cases opens on", () => {
+  it("is the last 7 days when the address names none, and is left out of the address", () => {
+    expect(DEFAULT_CASE_WINDOW).toBe("7d");
+    expect(readCaseViewState("?view=cases").window).toBe("7d");
+    expect(caseViewUrl(EMPTY_CASE_VIEW, "https://dashboard.test/?view=cases").searchParams.has("window")).toBe(false);
+    expect(caseViewUrl({ ...EMPTY_CASE_VIEW, window: "24h" }, "https://dashboard.test/?view=cases").searchParams.get("window")).toBe("24h");
   });
 });

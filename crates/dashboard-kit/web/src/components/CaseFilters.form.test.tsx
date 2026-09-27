@@ -206,7 +206,24 @@ describe("the case filter form", () => {
       <CaseFilters value={{ ...EMPTY_CASE_VIEW, status: "waiting", window: "all" }} onApply={() => undefined} onClear={() => undefined} />,
     );
     expect(html).toContain('<option value="waiting" selected="">Waiting for a decision</option>');
-    expect(html).toContain('<option value="all" selected="">All loaded time</option>');
+    expect(html).toContain('<option value="all" selected="">All time</option>');
+  });
+
+  /**
+   * A Cases screen that draws the window beside its lane tabs hides this
+   * form's select, so the screen has one "Time window" control, not two
+   * (one applying at once, one on Apply). Apply keeps the window the draft
+   * holds.
+   *
+   * FAILS ON REVERT: ignore `hideWindow` and the form draws a second control.
+   */
+  it("leaves the window select out when the screen draws it beside the tabs, and keeps the window", () => {
+    const shown = renderToStaticMarkup(<CaseFilters value={{ ...EMPTY_CASE_VIEW, window: "30d" }} onApply={() => undefined} onClear={() => undefined} />);
+    expect(shown).toContain("Time window");
+    const hidden = renderToStaticMarkup(<CaseFilters value={{ ...EMPTY_CASE_VIEW, window: "30d" }} onApply={() => undefined} onClear={() => undefined} hideWindow />);
+    expect(hidden).not.toContain("Time window");
+    expect(hidden).not.toContain('<option value="30d"');
+    expect(appliedCaseView({ ...EMPTY_CASE_VIEW, window: "30d" }).window).toBe("30d");
   });
 
   /**
@@ -281,9 +298,9 @@ describe("writing the view to the address bar", () => {
 
   it("replaces the current entry when asked to", () => {
     const history = stubWindow();
-    writeCaseViewState({ ...EMPTY_CASE_VIEW, window: "7d" }, "replace");
+    writeCaseViewState({ ...EMPTY_CASE_VIEW, window: "30d" }, "replace");
     expect(history.pushState).not.toHaveBeenCalled();
     expect(history.replaceState).toHaveBeenCalledOnce();
-    expect((history.replaceState.mock.calls[0][2] as URL).searchParams.get("window")).toBe("7d");
+    expect((history.replaceState.mock.calls[0][2] as URL).searchParams.get("window")).toBe("30d");
   });
 });

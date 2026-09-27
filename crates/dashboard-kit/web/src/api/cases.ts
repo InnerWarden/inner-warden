@@ -1,9 +1,12 @@
 import {
   DASHBOARD_API_ROOT,
+  DASHBOARD_FETCH_TIMEOUT_MS,
   contractProblem,
   failureForStatus,
   networkProblem,
+  requestDeadline,
   responseProblem,
+  timeoutProblem,
   type DashboardApiProblem,
   type DashboardClientFailure,
   type DashboardClientResult,
@@ -17,6 +20,7 @@ import {
   type SecurityOutcome,
 } from "./v1";
 import { parseEvidenceRef, parseScopeRef } from "./validate";
+import { isCaseListWindow } from "../windows";
 
 export type CaseSeverity = "critical" | "high" | "medium" | "low" | "informational" | "unknown";
 export type CaseStatus = "open" | "needs_review" | "observing" | "contained" | "dismissed" | "closed" | "unknown";
@@ -571,9 +575,8 @@ export function parseCaseListPage(value: unknown, requestedLimit = 20): CaseList
   // still validated independently so a half-shaped payload fails loudly
   // instead of rendering a number that means nothing.
   if (item.window !== undefined) {
-    const windows: readonly string[] = ["1h", "24h", "7d", "30d", "all"];
-    if (typeof item.window !== "string" || !windows.includes(item.window)) throw new Error("cases.window: unknown window");
-    page.window = item.window as CaseListWindow;
+    if (!isCaseListWindow(item.window)) throw new Error("cases.window: unknown window");
+    page.window = item.window;
   }
   if (item.total_in_window !== undefined) {
     if (typeof item.total_in_window !== "number" || !Number.isInteger(item.total_in_window) || item.total_in_window < 0) {
@@ -848,8 +851,11 @@ export class DashboardCasesClient {
   /** Set once this server answered a list request without lanes after refusing them. */
   #lanesRefused = false;
 
-  constructor(fetchImplementation: Fetch = globalThis.fetch) {
+  readonly #timeoutMs: number;
+
+  constructor(fetchImplementation: Fetch = globalThis.fetch, timeoutMs: number = DASHBOARD_FETCH_TIMEOUT_MS) {
     this.#fetch = fetchImplementation.bind(globalThis);
+    this.#timeoutMs = timeoutMs;
   }
 
   async list(query: CaseListQuery = {}, signal?: AbortSignal): Promise<DashboardClientResult<CaseListPage>> {
@@ -938,25 +944,34 @@ export class DashboardCasesClient {
   }
 
   async #get<T>(endpoint: "cases" | "case_detail", url: string, parser: (value: unknown) => T, signal?: AbortSignal): Promise<DashboardClientResult<T>> {
-    let response: Response;
+    // Bounded like every dashboard request (`DASHBOARD_FETCH_TIMEOUT_MS`): a
+    // list that never answers is reported, not waited on for good.
+    const deadline = requestDeadline(signal, this.#timeoutMs);
     try {
-      response = await this.#fetch(url, {
-        method: "GET",
-        cache: "no-store",
-        credentials: "same-origin",
-        redirect: "error",
-        headers: { accept: "application/json" },
-        signal,
-      });
-    } catch (error) {
-      if (signal?.aborted || (error instanceof DOMException && error.name === "AbortError")) throw error;
-      return networkProblem(endpoint);
-    }
-    if (!response.ok) return failureForStatus(await responseProblem(response, endpoint));
-    try {
-      return { state: "ready", data: parser(await response.json()) };
-    } catch {
-      return contractProblem(endpoint);
+      let response: Response;
+      try {
+        response = await this.#fetch(url, {
+          method: "GET",
+          cache: "no-store",
+          credentials: "same-origin",
+          redirect: "error",
+          headers: { accept: "application/json" },
+          signal: deadline.signal,
+        });
+      } catch (error) {
+        if (deadline.timedOut()) return timeoutProblem(endpoint);
+        if (signal?.aborted || (error instanceof DOMException && error.name === "AbortError")) throw error;
+        return networkProblem(endpoint);
+      }
+      if (!response.ok) return failureForStatus(await responseProblem(response, endpoint));
+      try {
+        return { state: "ready", data: parser(await response.json()) };
+      } catch {
+        if (deadline.timedOut()) return timeoutProblem(endpoint);
+        return contractProblem(endpoint);
+      }
+    } finally {
+      deadline.done();
     }
   }
 }

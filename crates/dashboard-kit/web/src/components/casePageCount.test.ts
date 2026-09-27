@@ -40,7 +40,20 @@ describe("the case page count line", () => {
       window_complete: true,
       rows_in_window: 312,
     });
-    expect(casePageCountLabel(20, page)).toBe("20 rows on this page of 312 · 4,394 cases in this window");
+    expect(casePageCountLabel(20, page)).toBe("20 rows on this page of 312 · 4,394 cases in the last 7 days");
+  });
+
+  /**
+   * "in this window" left the reader to work out which window. The server
+   * echoes the one it answered for, and the line names it.
+   *
+   * FAILS ON REVERT: print "in this window" whatever the page says and the
+   * span is gone again.
+   */
+  it("names the span the server answered for, and says this window only when it named none", () => {
+    expect(casePageCountLabel(3, { total_in_window: 3, window: "24h" })).toBe("3 rows on this page · 3 cases in the last 24 hours");
+    expect(casePageCountLabel(3, { total_in_window: 3, window: "all" })).toBe("3 rows on this page · 3 cases over all time");
+    expect(casePageCountLabel(3, { total_in_window: 3 })).toBe("3 rows on this page · 3 cases in this window");
   });
 
   it("says only what the page shows when the server sent neither total", () => {

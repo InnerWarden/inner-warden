@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { createPortal } from "react-dom";
+import { OVERVIEW_AGENTS_TOUR_STEP_KEY, OVERVIEW_SENSOR_TOUR_STEP_KEY, TOUR_ABSENT_ATTRIBUTE } from "./tourKeys";
 
 /**
  * The guided product tour: one engine, one step table per edition.
@@ -44,6 +45,58 @@ export type TourStep = {
 
 /** Retries the quick burst makes before a missing anchor counts as absent. */
 export const OPTIONAL_ANCHOR_ATTEMPTS = 15;
+
+/**
+ * A screen says which tour steps point at something it does not render in
+ * the view it is showing, with `TOUR_ABSENT_ATTRIBUTE` (see `tourKeys.ts`).
+ *
+ * The screen is the one side that knows. The Overview on a host that shows
+ * the lane cards keeps the agent and sensor panels behind the technical
+ * switch, and a tour table is fixed before the host has answered, so those
+ * steps waited out a burst of retries with the card floating over the middle
+ * of the page, reading copy about panels that were not there, and the
+ * counter counted them as steps. A step the screen declares absent is
+ * dropped before it is shown, and from the counter.
+ */
+export { OVERVIEW_AGENTS_TOUR_STEP_KEY, OVERVIEW_SENSOR_TOUR_STEP_KEY, TOUR_ABSENT_ATTRIBUTE };
+
+const STEP_KEY = /^[a-z0-9-]{1,64}$/;
+
+/** Whether the page on screen declares this step's anchor absent. */
+export function declaredAbsent(key: string, root: Pick<ParentNode, "querySelector"> = document): boolean {
+  // Keys are plain tokens; anything else is never matched, rather than
+  // spliced into a selector.
+  if (!STEP_KEY.test(key)) return false;
+  return root.querySelector(`[${TOUR_ABSENT_ATTRIBUTE}~="${key}"]`) !== null;
+}
+
+/**
+ * The table without the steps the screen declares absent. The steps with no
+ * anchor (the opening and closing cards) are never absent.
+ */
+export function withoutAbsentSteps(
+  steps: readonly TourStep[],
+  isAbsent: (key: string) => boolean,
+): readonly TourStep[] {
+  return steps.filter((step) => step.selectors === undefined || !isAbsent(step.key));
+}
+
+/**
+ * The table and position after dropping the step at `index`, which the tour
+ * found nothing to show for. Going forward, the next step slides into the
+ * same position; going back, the one before it is shown. The counter then
+ * counts what is left, so it never promises a step the reader will not see.
+ */
+export function dropStep(
+  table: readonly TourStep[],
+  index: number,
+  direction: 1 | -1,
+): { table: readonly TourStep[]; index: number } {
+  if (index < 0 || index >= table.length) return { table, index };
+  const next = table.filter((_, position) => position !== index);
+  const moved = direction < 0 ? index - 1 : index;
+  return { table: next, index: Math.min(Math.max(moved, 0), Math.max(next.length - 1, 0)) };
+}
 
 /** Whether a step should be passed over because its anchor never appeared. */
 export function skipsMissingAnchor(step: Pick<TourStep, "optional">, attempts: number): boolean {
@@ -154,7 +207,7 @@ export const PAID_SCREEN_TOUR_STEPS: readonly TourStep[] = [
     optional: true,
   },
   {
-    key: "overview-sensor",
+    key: OVERVIEW_SENSOR_TOUR_STEP_KEY,
     title: "Sensor activity",
     body: "What the host sensor saw today, collector by collector, so silence from a collector is visible rather than assumed.",
     route: "overview",
@@ -214,7 +267,7 @@ export const COMMUNITY_TOUR_STEPS: readonly TourStep[] = [
     selectors: ['[data-tour="nav"]', 'nav[aria-label="Dashboard views"]'],
   },
   {
-    key: "overview-agents",
+    key: OVERVIEW_AGENTS_TOUR_STEP_KEY,
     title: "Agents on this machine",
     // Promises only what a producer fills. The inventory is built from the
     // policy rows `agents connect` writes, so on a host with none the card says
@@ -408,7 +461,12 @@ function cardStyle(rect: SpotRect | null, narrow: boolean): CSSProperties {
 }
 
 export function ProductTour({ steps, onClose }: { steps: readonly TourStep[]; onClose: () => void }) {
-  const [stepIndex, setStepIndex] = useState(0);
+  // The table this run walks. It starts as the caller's and only ever loses
+  // a step the tour found nothing to show for (`dropStep`).
+  const [walk, setWalk] = useState<{ table: readonly TourStep[]; index: number }>({ table: steps, index: 0 });
+  const stepIndex = walk.index;
+  const setStepIndex = (update: (current: number) => number) =>
+    setWalk((current) => ({ ...current, index: update(current.index) }));
   const [target, setTarget] = useState<HTMLElement | null>(null);
   const [rect, setRect] = useState<SpotRect | null>(null);
   const [narrow, setNarrow] = useState(() => window.innerWidth < NARROW_VIEWPORT);
@@ -416,11 +474,12 @@ export function ProductTour({ steps, onClose }: { steps: readonly TourStep[]; on
   const primaryRef = useRef<HTMLButtonElement | null>(null);
   // The effect below reads the step for the index it runs on; keeping the table
   // in a ref means a caller passing a fresh array literal cannot restart it.
-  const stepsRef = useRef(steps);
-  stepsRef.current = steps;
+  const stepsRef = useRef(walk.table);
+  stepsRef.current = walk.table;
 
-  const total = steps.length;
-  const step = steps[stepIndex];
+  const total = walk.table.length;
+  const step = walk.table[stepIndex];
+  const stepKey = step?.key;
   const lastStep = stepIndex === total - 1;
   // Which way the reader was going, so a step skipped for a missing anchor
   // is passed over forwards on Next and backwards on Back.
@@ -448,8 +507,23 @@ export function ProductTour({ steps, onClose }: { steps: readonly TourStep[]; on
     if (selectors === undefined) return;
     let cancelled = false;
     let attempts = 0;
+    // Nothing to show for this step on this host: drop it from the walk, so
+    // the reader goes on to the next one and the counter stops counting it.
+    const drop = () => {
+      setWalk((walking) =>
+        walking.table[walking.index]?.key === current.key
+          ? dropStep(walking.table, walking.index, directionRef.current)
+          : walking,
+      );
+    };
     const locate = () => {
       if (cancelled) return;
+      // The screen says it does not render this step's anchor in the view it
+      // is showing: no point waiting for it.
+      if (declaredAbsent(current.key)) {
+        drop();
+        return;
+      }
       const found = findTarget(selectors);
       if (found !== null) {
         found.scrollIntoView({ block: "center" });
@@ -458,8 +532,7 @@ export function ProductTour({ steps, onClose }: { steps: readonly TourStep[]; on
       }
       attempts += 1;
       if (skipsMissingAnchor(current, attempts)) {
-        const count = stepsRef.current.length;
-        setStepIndex((index) => clampStep(index, directionRef.current, count));
+        drop();
         return;
       }
       window.setTimeout(locate, attempts < OPTIONAL_ANCHOR_ATTEMPTS ? 120 : 600);
@@ -468,7 +541,7 @@ export function ProductTour({ steps, onClose }: { steps: readonly TourStep[]; on
     return () => {
       cancelled = true;
     };
-  }, [stepIndex]);
+  }, [stepIndex, stepKey]);
 
   // Track the anchor while it is on screen: layout shifts, scrolling and
   // rotation all move it, and the spotlight must follow.
@@ -531,15 +604,16 @@ export function ProductTour({ steps, onClose }: { steps: readonly TourStep[]; on
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-    // advance closes over lastStep, which changes with the step.
+    // advance closes over lastStep and the table's length, which change with
+    // the step and when a step is dropped.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [stepIndex]);
+  }, [stepIndex, total]);
 
   // The card is a dialog: focus lands on the primary control each step, stays
   // trapped inside, and returns to wherever it came from on close.
   useEffect(() => {
     primaryRef.current?.focus();
-  }, [stepIndex]);
+  }, [stepIndex, stepKey]);
 
   useEffect(() => {
     const previous = document.activeElement instanceof HTMLElement ? document.activeElement : null;
@@ -660,8 +734,12 @@ export function TourLauncher({
   const stepsRef = useRef(steps);
   stepsRef.current = steps;
 
+  // The steps this shell offers, less the ones the screen on display says it
+  // does not render; a step on a screen not yet shown is judged on arrival.
+  const tableForNow = () => withoutAbsentSteps(stepsForShell(stepsRef.current, shellRoutes()), (key) => declaredAbsent(key));
+
   const openTour = () => {
-    setWalking(stepsForShell(stepsRef.current, shellRoutes()));
+    setWalking(tableForNow());
     setOpen(true);
   };
 
@@ -674,14 +752,16 @@ export function TourLauncher({
     if (!shouldAutoOpen(window.localStorage, storageKey)) return;
     // Let the shell paint first so the welcome card appears over a real page.
     const timer = window.setTimeout(() => {
-      setWalking(stepsForShell(stepsRef.current, shellRoutes()));
+      setWalking(tableForNow());
       setOpen(true);
     }, 600);
     return () => window.clearTimeout(timer);
   }, [storageKey]);
 
   useEffect(() => {
-    const find = () => document.querySelector("header div.ml-auto");
+    // The header's own slot first (inside its small-screen menu), then the
+    // header's status area, as before.
+    const find = () => document.querySelector("header [data-tour-slot]") ?? document.querySelector("header div.ml-auto");
     const existing = find();
     if (existing !== null) {
       setSlot(existing);

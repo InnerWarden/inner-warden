@@ -1,4 +1,6 @@
 import type { CaseListPage } from "../api/cases";
+import { LANE_WINDOW_PHRASE } from "../lanes";
+import { formatCount } from "../presentation";
 
 /**
  * The count line above a page of cases: "20 rows on this page of 312 · 4,394
@@ -24,11 +26,14 @@ import type { CaseListPage } from "../api/cases";
  */
 export function casePageCountLabel(
   visible: number,
-  page: Pick<CaseListPage, "rows_in_window" | "total_in_window" | "window_complete">,
+  page: Pick<CaseListPage, "rows_in_window" | "total_in_window" | "window_complete" | "window">,
 ): string {
   let label = `${counted(visible, "row", "rows")} on this page`;
   if (page.rows_in_window !== undefined) label += ` of ${number(page.rows_in_window)}`;
-  if (page.total_in_window !== undefined) label += ` · ${counted(page.total_in_window, "case", "cases")} in this window`;
+  // The span by name when the server echoed it ("in the last 7 days"): "in
+  // this window" left the reader to find which window that was.
+  const span = page.window === undefined ? "in this window" : LANE_WINDOW_PHRASE[page.window];
+  if (page.total_in_window !== undefined) label += ` · ${counted(page.total_in_window, "case", "cases")} ${span}`;
   const qualified = page.rows_in_window !== undefined || page.total_in_window !== undefined;
   if (qualified && page.window_complete === false) label += ", from a partial read";
   return label;
@@ -39,7 +44,24 @@ function counted(value: number, one: string, many: string): string {
 }
 
 // One fixed locale, so the same count reads the same on every viewer's screen
-// and in every test. `+ 0` turns -0 into 0, which would otherwise print "-0".
+// and in every test (`formatCount`).
 function number(value: number): string {
-  return (value + 0).toLocaleString("en-US");
+  return formatCount(value);
+}
+
+/**
+ * The badge the count line wears: the list's state, never a promise the line
+ * does not make. A green check sat on "from a partial read", which reads as
+ * all clear over numbers that describe only part of the window. A partial
+ * read is neutral, and a list being refreshed says so.
+ */
+export function casePageCountBadge(
+  visible: number,
+  page: Pick<CaseListPage, "rows_in_window" | "total_in_window" | "window_complete" | "window">,
+  stale: boolean,
+): { status: "stale" | "partial" | "available"; label: string } {
+  const label = casePageCountLabel(visible, page);
+  if (stale) return { status: "stale", label };
+  const qualified = page.rows_in_window !== undefined || page.total_in_window !== undefined;
+  return { status: qualified && page.window_complete === false ? "partial" : "available", label };
 }

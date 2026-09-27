@@ -10,6 +10,7 @@ import {
   type TokenIntelligenceResponse,
 } from "../api";
 import { gridColumnsClass, gridSpanClass, joinClasses } from "./cardGrid";
+import { formatAbsolute, formatCount, formatDay } from "../presentation";
 
 type PollState<T> = {
   data?: T;
@@ -542,7 +543,7 @@ export function recordedActivityLabel(guardrail: AgentGuardrail): string | undef
   const count = readCount(guardrail.recorded_activity);
   if (count === undefined) return undefined;
   if (count <= 0) return "None recorded";
-  return `${count.toLocaleString()} recorded, undated`;
+  return `${formatCount(count)} recorded, undated`;
 }
 
 /**
@@ -592,7 +593,7 @@ export function formatDate(value: string | null | undefined): string | undefined
   if (raw === undefined) return undefined;
   const parsed = new Date(raw);
   if (!Number.isNaN(parsed.getTime())) {
-    return new Intl.DateTimeFormat(undefined, { dateStyle: "medium" }).format(parsed);
+    return formatDay(parsed);
   }
   const day = raw.slice(0, 10);
   return /^\d{4}-\d{2}-\d{2}$/.test(day) ? day : undefined;
@@ -859,9 +860,9 @@ function humanise(value: string): string {
 
 function formatNullableCount(value: string | number | null, scanning = false): string {
   if (value == null) return scanning ? "Scanning…" : "Unavailable";
-  if (typeof value === "number") return Number.isFinite(value) ? value.toLocaleString() : "Unavailable";
+  if (typeof value === "number") return Number.isFinite(value) ? formatCount(value) : "Unavailable";
   try {
-    return BigInt(value).toLocaleString();
+    return formatCount(BigInt(value));
   } catch {
     return "Unavailable";
   }
@@ -869,12 +870,7 @@ function formatNullableCount(value: string | number | null, scanning = false): s
 
 function formatObservedAt(value: number | null): string {
   if (value == null || !Number.isFinite(value)) return "Unavailable";
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return "Unavailable";
-  return new Intl.DateTimeFormat(undefined, {
-    dateStyle: "medium",
-    timeStyle: "short",
-  }).format(date);
+  return formatAbsolute(value) ?? "Unavailable";
 }
 
 function formatInterval(seconds: number): string {

@@ -1,3 +1,4 @@
+import { DASHBOARD_FETCH_TIMEOUT_MS, requestDeadline } from "./api/client";
 // The shape the thin Rust API (`innerwarden dashboard`) serves. Newer binaries
 // add posture and outcome evidence; every addition stays optional so the UI also
 // works with the original graph-only contract.
@@ -147,6 +148,17 @@ export type Overview = {
     findings_waiting_off_the_line_counts?: string;
   };
   /**
+   * What waits on a person, by the server's one definition: the cases its
+   * Cases filter `status=waiting` lists, counted in `window`, the span that
+   * filter is opened with. `today` is how many of them arrived today.
+   *
+   * When sent, the Overview's waiting line reads this and links to exactly
+   * that list, and `host_attention` is not read. Optional: an older host
+   * sends none, and the line reads `host_attention` as before. Read through
+   * `waitingCount`, never directly.
+   */
+  waiting?: { count: number; window: "1h" | "24h" | "7d" | "30d" | "all"; today?: number };
+  /**
    * The hero sentence, computed by the host from the SAME counters this
    * payload carries.
    *
@@ -203,6 +215,16 @@ export type OverviewLaneWire = {
   waiting?: number | null;
   /** The newest case in the lane, titled as the Cases list titles it. */
   latest?: { title: string; at: string; case_id?: string | null } | null;
+  /**
+   * How `count` splits by what finally happened, one part per outcome, each
+   * thing counted once: a command the guardrail refused and the kernel also
+   * stopped is one part, not two. `label` is the host's words for the part,
+   * written for its count ("refused before they ran", "stopped by the
+   * kernel", "may have run"). The parts must add up to `count` exactly, or
+   * the card shows no split at all (`laneBreakdown`). Optional: an older host
+   * sends none and the card is as it was.
+   */
+  breakdown?: { key: string; count: number; label: string }[];
 };
 export type Node = { id: string; kind: string; label: string; attrs?: Record<string, string> };
 export type Edge = { from: string; to: string; kind: string };
@@ -357,12 +379,23 @@ export type CasesQuery = {
 };
 
 async function get<T>(path: string): Promise<T> {
-  const r = await fetch(path, { cache: "no-store" });
-  if (!r.ok) {
-    const payload = await r.json().catch(() => undefined) as { error?: string } | undefined;
-    throw new Error(payload?.error ?? `${path}: ${r.status}`);
+  // Bounded like every dashboard request (`DASHBOARD_FETCH_TIMEOUT_MS`): the
+  // Overview polls with an in-flight guard, and one request that never
+  // answered held every later poll back while the page kept its last answer.
+  const deadline = requestDeadline(undefined, DASHBOARD_FETCH_TIMEOUT_MS);
+  try {
+    const r = await fetch(path, { cache: "no-store", signal: deadline.signal });
+    if (!r.ok) {
+      const payload = await r.json().catch(() => undefined) as { error?: string } | undefined;
+      throw new Error(payload?.error ?? `${path}: ${r.status}`);
+    }
+    return await r.json();
+  } catch (error) {
+    if (deadline.timedOut()) throw new Error(`${path}: no answer in time`);
+    throw error;
+  } finally {
+    deadline.done();
   }
-  return r.json();
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

@@ -1,7 +1,7 @@
 import type { CaseEvent, CaseEventType, RelationshipConfidence } from "../api/cases";
 import { StatusBadge } from "./StatusBadge";
-import { formatAbsolute } from "../presentation";
 import { friendlyId } from "./TruncatedId";
+import { When } from "./When";
 
 const eventLabels: Record<CaseEventType, string> = {
   agent_intent: "Agent intent",
@@ -77,7 +77,7 @@ export function CaseTimeline({ events }: { events: CaseEvent[] }) {
               <div className="flex flex-wrap items-start justify-between gap-2">
                 <div className="min-w-0">
                   <h3 className="font-semibold text-slate-950">{eventLabels[event.event_type]}</h3>
-                  <p className="mt-0.5 text-xs text-slate-500"><time dateTime={event.observed_at}>{formatTime(event.observed_at)}</time></p>
+                  <p className="mt-0.5 text-xs text-slate-500"><When at={event.observed_at} /></p>
                 </div>
                 <div className="flex flex-wrap gap-1.5">
                   {event.id === root && event.relationship === "unknown" ? null : (
@@ -100,7 +100,7 @@ export function CaseTimeline({ events }: { events: CaseEvent[] }) {
                     one case where it disagrees with the moment it happened,
                     which is a real fact about a lagging source. */}
                 {recordingLag(event) && (
-                  <div><dt className="text-slate-500">Written down</dt><dd className="mt-0.5 font-medium text-slate-800"><time dateTime={event.recorded_at}>{formatTime(event.recorded_at)}</time></dd></div>
+                  <div><dt className="text-slate-500">Written down</dt><dd className="mt-0.5 font-medium text-slate-800"><When at={event.recorded_at} /></dd></div>
                 )}
               </dl>
               <EvidenceLinks evidence={event.source_refs} />
@@ -178,6 +178,3 @@ export function EvidenceLinks({ evidence }: { evidence: CaseEvent["source_refs"]
   );
 }
 
-function formatTime(value: string): string {
-  return formatAbsolute(value) ?? value;
-}

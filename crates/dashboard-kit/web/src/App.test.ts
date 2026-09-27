@@ -275,6 +275,19 @@ describe("caseUrl", () => {
     expect(caseUrl("case:x:1", base).searchParams.get("window")).toBe("all");
     expect(caseUrl("case:x:1", base).searchParams.get("case")).toBe("case:x:1");
   });
+
+  /**
+   * A lane card's newest case was counted inside the card's window, so it
+   * opens there, and the list beside it is the one the card described. A
+   * window this shell does not know is not written into the address.
+   *
+   * FAILS ON REVERT: always write `all` for a named case and this reads it.
+   */
+  it("opens a named case in the window the link counted it in", () => {
+    expect(caseUrl("case:x:1", base, "agent_actions", "7d").searchParams.get("window")).toBe("7d");
+    expect(caseUrl("case:x:1", base, "agent_actions", "7d").searchParams.get("lane")).toBe("agent_actions");
+    expect(caseUrl("case:x:1", base, undefined, "fortnight" as never).searchParams.get("window")).toBe("all");
+  });
 });
 
 describe("activity selection in the address bar", () => {
@@ -308,11 +321,14 @@ describe("activity selection in the address bar", () => {
  * default would hide it.
  */
 describe("caseQueueUrl", () => {
-  it("opens Cases on the waiting queue over all time, nothing selected", () => {
+  it("opens Cases on the waiting queue over all time, every lane, nothing selected", () => {
     const url = caseQueueUrl("https://dashboard.test/?view=overview");
     expect(url.searchParams.get("view")).toBe("cases");
     expect(url.searchParams.get("status")).toBe("waiting");
     expect(url.searchParams.get("window")).toBe("all");
+    // FAILS ON REVERT: no lane in the address and the Cases screen opens one
+    // lane, under a count of every lane.
+    expect(url.searchParams.get("lane")).toBe("everything");
     expect(url.searchParams.get("case")).toBeNull();
   });
 

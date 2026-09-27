@@ -44,3 +44,25 @@ describe("a session heading a person can navigate by", () => {
     expect(sessionHeading(session({ items: [] }))).toBe("Agent session");
   });
 });
+
+/**
+ * One day is one calendar day, year included. The rule compared day and
+ * month only, so a session whose first and last events fall on the same
+ * date in different years read as a same-day range with times.
+ *
+ * FAILS ON REVERT: compare "5 Jan" with "5 Jan" and the year-long session is
+ * printed "5 Jan 09:00 to 10:00".
+ */
+describe("a session across years", () => {
+  it("is not a same-day range when the date repeats a year later", () => {
+    const first = Date.UTC(2026, 0, 5, 9, 0);
+    const last = Date.UTC(2027, 0, 5, 10, 0);
+    const heading = sessionHeading(session({ items: [at(first), at(last)] as never }), "UTC");
+    expect(heading).toBe("Agent session, 5 Jan 2026 to 5 Jan 2027");
+  });
+
+  it("keeps the short days within one year, and the times within one day", () => {
+    expect(sessionHeading(session({ items: [at(Date.UTC(2026, 0, 5, 9)), at(Date.UTC(2026, 0, 7, 9))] as never }), "UTC")).toBe("Agent session, 5 Jan to 7 Jan");
+    expect(sessionHeading(session({ items: [at(Date.UTC(2026, 0, 5, 9)), at(Date.UTC(2026, 0, 5, 10))] as never }), "UTC")).toBe("Agent session, 5 Jan 09:00 to 10:00 UTC");
+  });
+});

@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, type ReactNode } from "react";
 import type { ActionView } from "../api";
-import { formatTimestamp, humanizeToken, modeAtDecisionLabel } from "../presentation";
+import { humanizeToken, modeAtDecisionLabel } from "../presentation";
+import { When } from "./When";
 import { DecidedBy } from "./DecidedBy";
 import { Outcome } from "./Outcome";
 import { Verdict } from "./Verdict";
@@ -86,20 +87,22 @@ export function Detail({
     };
   }, [fallbackFocus, onClose]);
 
-  const when = formatTimestamp(action.recorded_at_ms);
+  const when = action.recorded_at_ms == null || !Number.isFinite(action.recorded_at_ms)
+    ? undefined
+    : action.recorded_at_ms;
   const decisionMode = modeAtDecisionLabel(action.mode_at_decision);
   const isMcpAction = /^MCP\s*·/i.test(action.command.trimStart());
   const rows: [string, ReactNode][] = useMemo(() => {
     const rendered: Record<string, ReactNode> = {
       Verdict: <Verdict rec={action.recommendation} />,
       "Execution outcome": <Outcome value={action.outcome ?? "unknown"} />,
-      Recorded: when,
+      Recorded: when === undefined ? undefined : <When at={when} relative />,
       Session: session === "local" ? "Local session" : session,
       "Decision source": <DecidedBy by={action.decided_by} />,
       "Decision mode": decisionMode,
       "Risk score": action.risk == null ? "Not reported" : String(action.risk),
     };
-    return detailRowLabels({ when: Boolean(when), session: Boolean(session), mode: Boolean(decisionMode) })
+    return detailRowLabels({ when: when !== undefined, session: Boolean(session), mode: Boolean(decisionMode) })
       .map((label): [string, ReactNode] => [label, rendered[label]]);
   }, [action, decisionMode, session, when]);
 

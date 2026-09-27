@@ -10,9 +10,11 @@ import { CapabilityBoundary } from "./components/CapabilityBoundary";
 import { Header, type HeaderNavigationItem } from "./components/Header";
 import { StatusBadge } from "./components/StatusBadge";
 import { resolveDashboardEdition } from "./edition";
-import { normaliseMode } from "./presentation";
+import { hasControlCharacters, normaliseMode } from "./presentation";
+import { POSTURE_REFRESH_MS } from "./posture/refresh";
+import { isCaseListWindow } from "./windows";
 import { Activity, type ActivityTarget } from "./screens/Activity";
-import { Home, type MachinePanels } from "./screens/Home";
+import { Home, type MachinePanels, type QueueOpenOptions } from "./screens/Home";
 import { isCaseLane, type CaseLane } from "./api/lanes";
 import type { CaseListWindow } from "./api/cases";
 import type { LaneOpenOptions } from "./components/LaneCards";
@@ -27,21 +29,8 @@ import { TokenIntelligence } from "./screens/TokenIntelligence";
 export type BaseShellRoute = "overview" | "activity" | "posture" | "agents" | "tokens";
 export type ShellRoute = BaseShellRoute | (string & {});
 
-/** How often the posture surfaces re-fetch.
- *
- * These polled every 5 seconds while the evidence behind them refreshes every
- * 20 minutes (the effect-canary interval), so 239 of every 240 requests
- * returned the same proof and the screen repainted anyway. The visible cost was
- * a freshness line reading "checked 0s ago" that reset as you watched it, which
- * reads as a system that never settles.
- *
- * Posture is a slow fact: what is armed changes on deploys and incidents, not
- * second to second. It now refreshes on a cadence the evidence can justify, and
- * an operator who wants an answer NOW presses Check now rather than waiting out
- * a poll. Faster-moving screens keep their own cadence; this is the posture
- * pair only.
- */
-export const POSTURE_REFRESH_MS = 5 * 60_000;
+/** How often the posture surfaces re-fetch; see `posture/refresh.ts`. */
+export { POSTURE_REFRESH_MS };
 
 const BASE_ROUTES: readonly string[] = ["overview", "activity", "posture", "agents", "tokens"];
 
@@ -262,7 +251,7 @@ export function activityUrl(
  * click-through target for anything on Home that shows a decision or an event
  * with a case behind it.
  */
-export function caseUrl(caseId: string | undefined, current: string, lane?: CaseLane): URL {
+export function caseUrl(caseId: string | undefined, current: string, lane?: CaseLane, window?: CaseListWindow): URL {
   const url = new URL(current);
   for (const name of SCREEN_PARAMS) url.searchParams.delete(name);
   url.searchParams.set("view", "cases");
@@ -273,11 +262,16 @@ export function caseUrl(caseId: string | undefined, current: string, lane?: Case
     if (isCaseLane(lane)) url.searchParams.set("lane", lane);
     // The window has to travel with the case, and this used to return before
     // setting it. A deep link names ONE case; the Cases list then applied its
-    // default last-24-hours filter to it, so opening anything older landed on a
-    // list the case was not in, with nothing selected. The operator read that
-    // as a broken link. A link that names its target must not be filtered out
-    // by a default the operator never chose.
-    url.searchParams.set("window", "all");
+    // default window to it, so opening anything older landed on a list the
+    // case was not in, with nothing selected. The operator read that as a
+    // broken link. A link that names its target must not be filtered out by a
+    // default the operator never chose.
+    //
+    // A link that knows the span its case was counted in, and that the case
+    // falls in (a lane card's newest case, `latestCaseWindow`), opens that
+    // span instead: the list beside it is the one the card described. Every
+    // other link opens every day.
+    url.searchParams.set("window", isCaseListWindow(window) ? window : "all");
     return url;
   }
   // No case named: this is Home's "View all in Cases", clicked from beside a
@@ -293,18 +287,29 @@ export function caseUrl(caseId: string | undefined, current: string, lane?: Case
 }
 
 /**
- * The Cases screen narrowed to what is waiting on a person, over all time.
+ * The Cases screen narrowed to what is waiting on a person, over every lane.
  *
- * This is where the Overview's "N addresses are waiting on you" line sends
- * the reader. `waiting` is every case whose latest decision is absent or
- * awaiting confirmation, the pair that line counts; and `all` time rather
- * than the list's 24-hour default, because a case waiting since yesterday
- * is still waiting.
+ * This is where the Overview's waiting line sends the reader. `waiting` is
+ * every case whose latest decision is absent or awaiting confirmation, the
+ * pair that line counts; and all time rather than the list's default,
+ * because a case waiting since yesterday is still waiting, unless the server
+ * said which span it counted.
+ *
+ * `lane=everything`, because the count is every lane's. With no lane in the
+ * address the Cases screen opens ONE lane (the one this viewer last used, or
+ * the agent's or the server's), so "See the 145 waiting cases" listed the
+ * waiting cases of one lane under a count of all of them, the same mismatch
+ * (145 on one screen, 257 on the next) the one count was meant to end. On a
+ * server older than lanes the word is no lane at all, which is the whole
+ * list it always opened.
  */
-export function caseQueueUrl(current: string): URL {
+export function caseQueueUrl(current: string, window: CaseListWindow = "all"): URL {
   const url = caseUrl(undefined, current);
+  url.searchParams.set("lane", "everything");
   url.searchParams.set("status", "waiting");
-  url.searchParams.set("window", "all");
+  // The span the server counted its waiting cases in, when it said: the
+  // number on the line and the list behind the link are then one thing.
+  url.searchParams.set("window", isCaseListWindow(window) ? window : "all");
   return url;
 }
 
@@ -324,6 +329,21 @@ export function caseLaneUrl(
   url.searchParams.set("window", options.window ?? "all");
   if (options.status !== undefined) url.searchParams.set("status", options.status);
   return url;
+}
+
+/**
+ * The way to the admin audit trail, when the server named its screen
+ * (`audit_trail_view`) and this shell offers that screen as a tab. A route
+ * the navigation does not offer gets no link: a link that lands back on the
+ * Overview is worse than the claim alone.
+ */
+export function auditTrailOpener<Route extends string>(
+  view: string | undefined,
+  navigation: readonly HeaderNavigationItem<Route>[],
+  navigate: (route: Route) => void,
+): (() => void) | undefined {
+  const offered = view === undefined ? undefined : navigation.find((item) => item.route === view);
+  return offered === undefined ? undefined : () => navigate(offered.route);
 }
 
 /**
@@ -618,21 +638,22 @@ export function App({
     window.history.pushState({}, "", activityUrl(target, window.location.href));
     setRoute("activity");
   };
-  const openCase = (caseId?: string, lane?: CaseLane) => {
-    window.history.pushState({}, "", caseUrl(caseId, window.location.href, lane));
+  const openCase = (caseId?: string, lane?: CaseLane, span?: CaseListWindow) => {
+    window.history.pushState({}, "", caseUrl(caseId, window.location.href, lane, span));
     setRoute("cases");
   };
   const openLane = (lane: CaseLane, options: LaneOpenOptions) => {
     window.history.pushState({}, "", caseLaneUrl(lane, options, window.location.href));
     setRoute("cases");
   };
-  const openQueue = () => {
-    window.history.pushState({}, "", caseQueueUrl(window.location.href));
+  const openQueue = (options?: QueueOpenOptions) => {
+    window.history.pushState({}, "", caseQueueUrl(window.location.href, options?.window));
     setRoute("cases");
   };
   // Only a shell that actually mounts a Cases screen may hand out case links;
   // without one, `?view=cases` resolves straight back to Overview.
   const casesAvailable = contributed.some((screen) => screen.route === "cases");
+  const openAuditTrail = auditTrailOpener(bootstrap?.audit_trail_view, navigation, navigate);
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-950">
@@ -649,6 +670,7 @@ export function App({
         activeRoute={route}
         homeRoute="overview"
         onNavigate={navigate}
+        account={edition === "enterprise" ? signedInAccount(bootstrapResource) : undefined}
         status={edition === "community"
           ? <><ModePill mode={mode} /><ExposureStatus status={metaStatus} exposed={meta?.exposed} /></>
           : edition === "enterprise"
@@ -675,11 +697,12 @@ export function App({
             evaluatedAt={consumerEvaluatedAt}
             extraScreens={contributed}
             onCheckNow={refreshPostureNow}
+            onOpenAuditTrail={openAuditTrail}
           />
         ) : edition === "enterprise" && bootstrap ? (
           <DashboardContractState resource={bootstrapResource} />
         ) : edition === "community" ? (
-          route === "activity" ? <Activity initialTarget={activityTarget} /> : <Home meta={freshMeta} onOpenActivity={openActivity} edition="community" />
+          route === "activity" ? <Activity initialTarget={activityTarget} /> : <Home meta={freshMeta} onOpenActivity={openActivity} edition="community" dashboardAccess={bootstrap?.dashboard_access} />
         ) : (
           <DashboardContractState resource={bootstrapResource} />
         )}
@@ -705,6 +728,7 @@ function EnterpriseRoute({
   evaluatedAt,
   extraScreens,
   onCheckNow,
+  onOpenAuditTrail,
 }: {
   route: ShellRoute;
   bootstrap: DashboardBootstrap;
@@ -716,15 +740,17 @@ function EnterpriseRoute({
   tokenIntelligence?: DashboardBootstrap["capabilities"][number];
   meta?: DashboardMeta;
   onOpenActivity: (target?: Omit<ActivityTarget, "requestId">) => void;
-  onOpenCase?: (caseId?: string, lane?: CaseLane) => void;
+  onOpenCase?: (caseId?: string, lane?: CaseLane, window?: CaseListWindow) => void;
   /** Opens the Cases screen on the waiting queue; see `caseQueueUrl`. */
-  onOpenQueue?: () => void;
+  onOpenQueue?: (options?: QueueOpenOptions) => void;
   /** Opens the Cases screen on one lane; see `caseLaneUrl`. */
   onOpenLane?: (lane: CaseLane, options: LaneOpenOptions) => void;
   evaluatedAt: string;
   extraScreens: readonly ScreenModule[];
   /** Force a posture re-read on demand; see `POSTURE_REFRESH_MS`. */
   onCheckNow?: () => void | Promise<void>;
+  /** Opens the admin audit trail; see `auditTrailOpener`. */
+  onOpenAuditTrail?: () => void;
 }) {
   const contributed = extraScreens.find((screen) => screen.route === route);
   if (contributed !== undefined) return <>{contributed.render({ bootstrap, evaluatedAt })}</>;
@@ -778,12 +804,56 @@ function EnterpriseRoute({
       onOpenLane={onOpenLane}
       machinePanels={machinePanelsFor(bootstrap)}
       edition="enterprise"
+      dashboardAccess={bootstrap.dashboard_access}
+      onOpenAuditTrail={onOpenAuditTrail}
     />
   );
 }
 
+/**
+ * A calm status keeps its symbol and says its words to screen readers only
+ * below 400 px, where the words cost the header a row. A status that asks
+ * for something keeps its words at every width.
+ */
+const NARROW_LABEL = "max-[399px]:sr-only";
+
+/**
+ * The session badge names who is signed in. A change on the paid dashboard
+ * is "recorded under your name", and the page said so without ever showing
+ * the name. A name that is not a short plain one (empty, very long, or
+ * carrying a control or format character, a bidi override among them) is
+ * not printed; the badge then says "Signed in".
+ */
+export function signedInLabel(actorId: string | null | undefined): string {
+  const name = typeof actorId === "string" ? actorId.trim() : "";
+  if (name === "" || name.length > 64 || hasControlCharacters(name)) return "Signed in";
+  return `Signed in as ${name}`;
+}
+
+/** Who is signed in, for the header's small-screen menu; nothing when no one is. */
+export function signedInAccount(resource: DashboardResource<DashboardBootstrap>): string | undefined {
+  return resource.state === "ready" && resource.data.session.authenticated
+    ? signedInLabel(resource.data.session.actor_id)
+    : undefined;
+}
+
 function EnterpriseSessionStatus({ resource }: { resource: DashboardResource<DashboardBootstrap> }) {
-  if (resource.state === "ready" && resource.data.session.authenticated) return <StatusBadge status="available" label="Authenticated" />;
+  const account = signedInAccount(resource);
+  if (account !== undefined) {
+    // A name may be one long token (a 64-character id): it breaks anywhere
+    // rather than push the header sideways. Below 400 px the words are for
+    // screen readers only, so the check carries them in its title, and the
+    // menu says them in full (`Header`'s `account`).
+    return (
+      <StatusBadge
+        status="available"
+        label={account}
+        title={account}
+        className="min-w-0"
+        labelClassName={`${NARROW_LABEL} [overflow-wrap:anywhere]`}
+      />
+    );
+  }
   if (resource.state === "ready") return <StatusBadge status="unavailable" label="Authentication required" />;
   if (resource.state === "stale") {
     const label = resource.problem.httpStatus === 401 ? "Authentication required" : "Session status stale";
@@ -837,7 +907,7 @@ function ExposureStatus({ status, exposed }: { status: MetaStatus; exposed?: boo
     return <StatusBadge status={exposed === true ? "failed" : "stale"} label={label} />;
   }
   if (exposed === true) return <StatusBadge status="failed" label="Exposed · no authentication" />;
-  if (exposed === false) return <StatusBadge status="available" label="Local · read-only API" />;
+  if (exposed === false) return <StatusBadge status="available" label="Local · read-only API" labelClassName={NARROW_LABEL} />;
   return <StatusBadge status="unknown" label="Exposure unknown" />;
 }
 
@@ -851,5 +921,12 @@ function ModePill({ mode }: { mode: GuardrailMode }) {
     unknown: "Status unknown",
   };
   const status = mode === "mixed" || mode === "partial" ? "degraded" : mode === "unknown" ? "unknown" : mode === "not_configured" ? "not_configured" : "available";
-  return <StatusBadge status={status} label={labels[mode]} className="hidden sm:inline-flex" />;
+  // Wrapped, because the badge draws itself inline-flex and the stylesheet
+  // decides which of two display classes on one element wins: the pill was
+  // meant to leave narrow screens and did not.
+  return (
+    <span className="hidden sm:inline-flex">
+      <StatusBadge status={status} label={labels[mode]} />
+    </span>
+  );
 }

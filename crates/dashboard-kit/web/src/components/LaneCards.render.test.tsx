@@ -1,8 +1,9 @@
 import { renderToStaticMarkup } from "react-dom/server";
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { overviewLaneCards, parseLaneCard, type LaneCard } from "../lanes";
-import { LaneCards, laneLink, type LaneOpenOptions } from "./LaneCards";
+import { latestCaseWindow, overviewLaneCards, parseLaneCard, type LaneCard } from "../lanes";
+import { LaneCards, laneLink, lanesIntro, type LaneOpenOptions } from "./LaneCards";
+import { When } from "./When";
 // Both written by the paid server's own tests, not by hand.
 import lanesOverview from "../../tests/fixtures/enterprise/overview-lanes.json";
 import noSourceOverview from "../../tests/fixtures/enterprise/overview-lanes-no-source.json";
@@ -33,6 +34,9 @@ function buttons(node: unknown, found: Element[] = []): Element[] {
   }
   if (typeof node !== "object" || node === null || !("props" in node)) return found;
   const element = node as Element;
+  // A time holds no button, and it reads the technical switch through a hook,
+  // which only runs inside a render.
+  if (element.type === When) return found;
   if (typeof element.type === "function") {
     return buttons((element.type as (props: Record<string, unknown>) => unknown)(element.props), found);
   }
@@ -223,5 +227,109 @@ describe("the cards fill their row", () => {
     expect(two).not.toContain("lg:grid-cols-6");
     const three = renderToStaticMarkup(<LaneCards cards={cards} edition="enterprise" />);
     expect(three).toContain("lg:grid-cols-6");
+  });
+});
+
+/**
+ * The three numbers are read side by side, so the page says what span they
+ * cover: once, when every card counts the same one, and plainly when they do
+ * not. The Overview used to mix 7 days and 24 hours under one heading with
+ * nothing above the cards saying so.
+ */
+describe("the span the cards count", () => {
+  const sevenDays = cards.map((entry) => (entry.state === "available" ? { ...entry, window: "7d" as const } : entry));
+
+  it("names the one span every card counts", () => {
+    expect(lanesIntro(sevenDays, true)).toBe("Answered from this host's own records, over the last 7 days. Each card opens what is behind it.");
+    expect(lanesIntro(sevenDays, false)).toBe("Answered from this host's own records, over the last 7 days.");
+  });
+
+  /**
+   * FAILS ON REVERT: drop the mixed branch and a page counting 7 days on two
+   * cards and 24 hours on the third reads as one picture.
+   */
+  it("says the cards count different spans when they do", () => {
+    expect(lanesIntro(cards, true)).toBe(
+      "Answered from this host's own records. The cards count different spans, and each one says which. Each card opens what is behind it.",
+    );
+  });
+
+  it("names no span when no card has a number", () => {
+    const noSource = parseLaneCard("agent_messages", { availability: "no_source", sentence: "Not read yet." }) as LaneCard;
+    expect(lanesIntro([noSource], false)).toBe("Answered from this host's own records.");
+  });
+});
+
+/**
+ * THE RULE THIS PINS: a card's newest case opens inside the span the card
+ * counted. It opened every day, so the list beside the case was not the one
+ * the card described.
+ *
+ * FAILS ON REVERT: call `onOpenCase` without the card's window and the case
+ * opens over all time.
+ */
+describe("the newest case on a card", () => {
+  // The fixture's newest cases are from the evening of 25 September; the
+  // clock is set just after, so each is inside its card's span.
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-25T18:00:00Z"));
+  });
+  afterEach(() => vi.useRealTimers());
+
+  it("opens in its lane, in the window the card counted", () => {
+    const opened: unknown[][] = [];
+    const tree = LaneCards({
+      cards,
+      edition: "enterprise",
+      onOpenLane: noop,
+      onOpenCase: (...args) => void opened.push(args),
+      onOpenActivity: noop,
+    });
+    const latest = buttons(tree).filter((button) => text(button.props.children) === lanesOverview.lanes.agent_actions.latest.title);
+    expect(latest).toHaveLength(1);
+    (latest[0].props.onClick as () => void)();
+    expect(opened).toEqual([[lanesOverview.lanes.agent_actions.latest.case_id, "agent_actions", "7d"]]);
+    const server = buttons(tree).find((button) => text(button.props.children) === lanesOverview.lanes.server_attacks.latest.title);
+    if (server === undefined) throw new Error("the server card should open its newest case");
+    (server.props.onClick as () => void)();
+    expect(opened[1]).toEqual([lanesOverview.lanes.server_attacks.latest.case_id, "server_attacks", "24h"]);
+  });
+
+  /**
+   * Nothing makes the host's newest case fall inside the card's span (a walk
+   * found a 7 September case under "7 days"). Opened over a list that does
+   * not hold it, the case is the broken link a reader reports, so a case
+   * older than the span opens over every day.
+   *
+   * FAILS ON REVERT: pass the card's window unconditionally and the 24-hour
+   * card opens its two-day-old case over the last 24 hours.
+   */
+  it("opens over every day when the case is older than the card's span", () => {
+    vi.setSystemTime(new Date("2026-09-27T18:00:00Z"));
+    const opened: unknown[][] = [];
+    const tree = LaneCards({ cards, edition: "enterprise", onOpenLane: noop, onOpenCase: (...args) => void opened.push(args), onOpenActivity: noop });
+    const server = buttons(tree).find((button) => text(button.props.children) === lanesOverview.lanes.server_attacks.latest.title);
+    (server?.props.onClick as () => void)();
+    const agent = buttons(tree).find((button) => text(button.props.children) === lanesOverview.lanes.agent_actions.latest.title);
+    (agent?.props.onClick as () => void)();
+    expect(opened).toEqual([
+      [lanesOverview.lanes.server_attacks.latest.case_id, "server_attacks", "all"],
+      [lanesOverview.lanes.agent_actions.latest.case_id, "agent_actions", "7d"],
+    ]);
+  });
+});
+
+describe("the span a newest case opens in", () => {
+  const now = Date.parse("2026-09-27T12:00:00Z");
+  it("is the card's span when the case is in it, and every day when it is not", () => {
+    expect(latestCaseWindow({ at: "2026-09-27T11:30:00Z" }, "1h", now)).toBe("1h");
+    expect(latestCaseWindow({ at: "2026-09-27T10:30:00Z" }, "1h", now)).toBe("all");
+    expect(latestCaseWindow({ at: "2026-09-20T12:00:01Z" }, "7d", now)).toBe("7d");
+    expect(latestCaseWindow({ at: "2026-09-07T09:00:00Z" }, "7d", now)).toBe("all");
+    expect(latestCaseWindow({ at: "2026-08-28T12:00:01Z" }, "30d", now)).toBe("30d");
+    expect(latestCaseWindow({ at: "2020-01-01T00:00:00Z" }, "all", now)).toBe("all");
+    // A little after now (the host's clock ahead of the reader's) is inside.
+    expect(latestCaseWindow({ at: "2026-09-27T12:00:05Z" }, "24h", now)).toBe("24h");
   });
 });

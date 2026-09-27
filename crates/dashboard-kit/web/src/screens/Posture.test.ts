@@ -232,7 +232,11 @@ describe("the verdict hero leads with what the user asked", () => {
     // written to catch is still caught: nothing in this fixture is broken, so
     // nothing may be reported as needing attention, and no control may go
     // missing from the count.
-    expect(postureHeadline(pills)).toBe("5 host controls: 5 working. Nothing needs you.");
+    //
+    // The two enforcing controls are reported proven and this fixture pins no
+    // assurance, so their chips read "Containing, not proven", and the
+    // headline counts them the way the chips show them.
+    expect(postureHeadline(pills)).toBe("5 host controls: 2 containing but not proven, 3 working. Nothing needs you.");
   });
 
   it("leads with what needs the reader, not with what is fine", () => {
@@ -291,12 +295,13 @@ describe("the verdict hero leads with what the user asked", () => {
 
   it("gives every state a sentence, even with none supplied", () => {
     // A state with no explanation is what made people stop reading this page.
-    const base = { ...FIVE_LAYERS[0], label: "DNS resolution control" };
+    // Named the way the reader bought it: the fallback says "DNS Guard".
+    const base = { ...FIVE_LAYERS[2], label: "DNS resolution control" };
     delete (base as { disposition_reason?: unknown }).disposition_reason;
     for (const disposition of ["proven", "working_as_configured", "not_enabled", "cannot_verify", "needs_operator"] as const) {
       const why = dispositionReason({ ...base, disposition });
       expect(why.length).toBeGreaterThan(20);
-      expect(why).toContain("DNS resolution control");
+      expect(why).toContain("DNS Guard");
       expect(dispositionLabel(disposition).length).toBeGreaterThan(0);
     }
   });
@@ -340,7 +345,7 @@ describe("the verdict hero leads with what the user asked", () => {
 
   it("shows each control in plain words with its scope name and check time", () => {
     const pill = controlPill(posture().layers[0], bootstrap(), generatedAt, true, evaluatedAt);
-    expect(pill.name).toBe("Independent host execution");
+    expect(pill.name).toBe("Execution Gate");
     // Not "Enforcing": this fixture carries no claims records, so the assurance
     // rule does not agree that it is verified, and the pill is not allowed to
     // borrow the stronger word. The control is still doing what it was told,
@@ -352,7 +357,8 @@ describe("the verdict hero leads with what the user asked", () => {
     // the two apart.
     expect(pill.mode).toBe("Containing, not proven");
     expect(pill.scope).toBe("OpenClaw workload");
-    expect(pill.freshness).toMatch(/^as of \d{2}:\d{2}$/);
+    // A time with its zone, and the date too when the check was not today.
+    expect(pill.freshness).toMatch(/^as of (\d{1,2} \S+ \d{4}, )?\d{2}:\d{2} \S+$/);
     // The producer freshness budget is contract bookkeeping; the summary never
     // mentions it.
     expect(pill.freshness).not.toContain("budget");
@@ -389,9 +395,22 @@ describe("freshness is a wall clock, not a counter that resets as you watch", ()
     // Was relative, and with the screen refreshing every few seconds it read
     // "checked 0s ago" almost permanently, resetting as you looked at it. A
     // number that never settles reads as a system that never settles.
-    const at = new Date("2026-08-17T14:32:05Z");
-    const hh = String(at.getHours()).padStart(2, "0");
-    expect(checkedAt({ ...fresh, observed_at: at.toISOString() })).toBe(`as of ${hh}:32`);
+    const at = "2026-08-17T14:32:05Z";
+    expect(checkedAt({ ...fresh, observed_at: at }, new Date("2026-08-17T18:00:00Z"), "Europe/London")).toBe("as of 15:32 BST");
+    expect(checkedAt({ ...fresh, observed_at: at }, new Date("2026-08-17T18:00:00Z"), "UTC")).toBe("as of 14:32 UTC");
+  });
+
+  /**
+   * "as of 01:21" read the same on a check from this morning and one from
+   * last week. A check from another day says its date.
+   *
+   * FAILS ON REVERT: print the hour and minute alone and last week's check
+   * reads as this morning's.
+   */
+  it("says the date when the check was not today, and the zone always", () => {
+    const at = "2026-08-17T14:32:05Z";
+    expect(checkedAt({ ...fresh, observed_at: at }, new Date("2026-08-24T09:00:00Z"), "Europe/London"))
+      .toMatch(/^as of 17 Aug 2026, 15:32 BST$/);
   });
 
   it("says never checked rather than inventing a time", () => {
@@ -615,10 +634,11 @@ describe("the sentence never outranks the badge", () => {
 
     // Veto applied: the sentence must come down with the badge.
     expect(dispositionReason(layer, "working_as_configured")).toBe(
-      "Independent host execution is set up and reporting.",
+      "Execution Gate is set up and reporting.",
     );
-    // No veto: the host's own wording is richer and is kept.
-    expect(dispositionReason(layer, "proven")).toBe(layer.disposition_reason);
+    // No veto: the host's own wording is richer and is kept, with the
+    // control called by the name on its card (`withProductName`).
+    expect(dispositionReason(layer, "proven")).toBe("Execution Gate is enforcing, and that was verified on this host.");
   });
 
   it("keeps the host sentence whenever the shown state matches", () => {
@@ -667,7 +687,9 @@ describe("the headline names every state it counts", () => {
     );
 
     // This fixture carries no claims records, so the assurance rule vetoes the
-    // proven one down to working: 2 working, not 1 protecting + 1 working.
+    // proven one: its chip reads "Containing, not proven", and the headline
+    // counts it as that, apart from the one that is plainly working, never as
+    // 1 protecting.
     //
     // The tail is gone, and its absence is the point. This assertion used to end
     // "Nothing needs you." over a page listing a control that is not turned on,
@@ -675,7 +697,7 @@ describe("the headline names every state it counts", () => {
     // unconditional, so one test pinned it in place and it read as intended
     // behaviour for as long as it shipped.
     expect(postureHeadline(pills)).toBe(
-      "4 host controls: 2 working, 1 not turned on, 1 we can't confirm.",
+      "4 host controls: 1 containing but not proven, 1 working, 1 not turned on, 1 we can't confirm.",
     );
   });
 
@@ -717,6 +739,23 @@ describe("the headline names every state it counts", () => {
     expect(postureHeadline(pills, "2 of 5 host controls are off and protect nothing")).toBe(
       "2 of 5 host controls are off and protect nothing",
     );
+  });
+
+  /**
+   * THE DEFECT: "3 protecting" over one "Protecting" chip and two reading
+   * "Containing, not proven". The host counts what it sent, and the veto
+   * moved two chips off it, so the headline and the chips told two stories.
+   *
+   * FAILS ON REVERT: prefer the host's sentence whatever the chips show and
+   * this headline says 2 protecting over chips that say none.
+   */
+  it("leads with the host's sentence only while every chip shows what the host counted", () => {
+    const pills = posture().layers.map((entry) => controlPill(entry, bootstrap(), generatedAt, true, evaluatedAt));
+    expect(pills.filter((pill) => pill.softened)).toHaveLength(2);
+    expect(postureHeadline(pills, "5 host controls: 2 protecting, 3 working.")).toBe(
+      "5 host controls: 2 containing but not proven, 3 working. Nothing needs you.",
+    );
+    expect(pills.filter((pill) => pill.mode === "Containing, not proven")).toHaveLength(2);
   });
 
   it("falls back to its own count when the host sent no sentence", () => {
@@ -891,7 +930,8 @@ describe("the host's own control count is printed, not recomputed", () => {
     // The headline is the host's summary sentence. The count is a caption under
     // it, and a caption that could replace the sentence would be a second
     // verdict on one page.
-    const pills = posture().layers.map((entry) => controlPill(entry, bootstrap(), generatedAt, true, evaluatedAt));
+    const working = FIVE_LAYERS.map((layer) => ({ ...layer, disposition: "working_as_configured" as const }));
+    const pills = posture(working).layers.map((entry) => controlPill(entry, bootstrap(), generatedAt, true, evaluatedAt));
     expect(postureHeadline(pills, "2 of 5 host controls are off and protect nothing"))
       .toBe("2 of 5 host controls are off and protect nothing");
     expect(postureHeadline(pills, "2 of 5 host controls are off and protect nothing"))

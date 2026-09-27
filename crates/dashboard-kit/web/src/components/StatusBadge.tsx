@@ -43,6 +43,8 @@ const PRESENTATIONS: Record<string, Omit<StatusPresentation, "label"> & { label?
   expired: { tone: "neutral", symbol: "–" },
   rejected: { tone: "critical", symbol: "×" },
   not_observed: { tone: "neutral", symbol: "–", label: "Not observed" },
+  // A read that covered part of what was asked: neither all clear nor a fault.
+  partial: { tone: "neutral", symbol: "~", label: "Partial" },
 
   // ── Dispositions ──────────────────────────────────────────────────────────
   //
@@ -92,11 +94,17 @@ export function StatusBadge({
   label,
   tone,
   className = "",
+  labelClassName = "",
+  title,
 }: {
   status: string;
   label?: string;
   tone?: StatusTone;
   className?: string;
+  /** Classes for the label alone, e.g. to keep it for screen readers only on a narrow screen. */
+  labelClassName?: string;
+  /** Said on hover, for a badge whose words are hidden on a narrow screen. */
+  title?: string;
 }) {
   const presentation = statusPresentation(status, label, tone);
   const classes: Record<StatusTone, string> = {
@@ -110,6 +118,7 @@ export function StatusBadge({
   return (
     <span
       data-status={status}
+      title={title}
       className={`inline-flex w-fit max-w-full items-start gap-1.5 rounded-md border px-2.5 py-1 text-xs font-semibold leading-4 ${classes[presentation.tone]} ${className}`}
     >
       <span className="shrink-0 font-bold" aria-hidden="true">{presentation.symbol}</span>
@@ -117,7 +126,7 @@ export function StatusBadge({
           boundaries and keeps its min-content width at the longest word, so a
           short single-word label like "medium" never shatters into a vertical
           char stack when a sibling flex item is wide. */}
-      <span className="min-w-0 break-words">{presentation.label}</span>
+      <span className={`min-w-0 break-words ${labelClassName}`.trim()}>{presentation.label}</span>
     </span>
   );
 }

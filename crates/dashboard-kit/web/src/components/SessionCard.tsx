@@ -1,6 +1,6 @@
 import { useEffect, useId, useState } from "react";
 import type { ActionView, SessionView } from "../api";
-import { formatTimestamp, humanizeToken } from "../presentation";
+import { formatDay, formatTimestamp, humanizeToken } from "../presentation";
 import { DecidedBy } from "./DecidedBy";
 import { Outcome } from "./Outcome";
 import { Verdict } from "./Verdict";
@@ -24,7 +24,7 @@ const ACTION_PAGE = 10;
  * by. The id stays on the card, in the secondary line, for correlating with a
  * log; it just stops being the headline.
  */
-export function sessionHeading(s: SessionView): string {
+export function sessionHeading(s: SessionView, timeZone?: string): string {
   if (s.label === "local") return "Local session";
   const stamps = s.items
     .map((item) => item.recorded_at_ms)
@@ -32,12 +32,19 @@ export function sessionHeading(s: SessionView): string {
   if (stamps.length === 0) return "Agent session";
   const first = new Date(Math.min(...stamps));
   const last = new Date(Math.max(...stamps));
-  const day = new Intl.DateTimeFormat(undefined, { day: "numeric", month: "short" });
-  const time = new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit" });
-  const sameDay = first.toDateString() === last.toDateString();
-  return sameDay
-    ? `Agent session, ${day.format(first)} ${time.format(first)} to ${time.format(last)}`
-    : `Agent session, ${day.format(first)} to ${day.format(last)}`;
+  // The dashboard's one rule: the reader's clock, with its zone said once.
+  const day = new Intl.DateTimeFormat("en-GB", { day: "numeric", month: "short", timeZone });
+  const time = new Intl.DateTimeFormat("en-GB", { hour: "2-digit", minute: "2-digit", hourCycle: "h23", timeZone });
+  const zoned = new Intl.DateTimeFormat("en-GB", { hour: "2-digit", minute: "2-digit", hourCycle: "h23", timeZoneName: "short", timeZone });
+  // One day is the same calendar day, year included: a session from 5 Jan
+  // one year to 5 Jan the next is not a same-day range with times.
+  const sameDay = formatDay(first, timeZone) === formatDay(last, timeZone);
+  if (sameDay) return `Agent session, ${day.format(first)} ${time.format(first)} to ${zoned.format(last)}`;
+  // Across a new year the short day is ambiguous, so both ends carry it.
+  const sameYear = first.toLocaleString("en-GB", { year: "numeric", timeZone }) === last.toLocaleString("en-GB", { year: "numeric", timeZone });
+  return sameYear
+    ? `Agent session, ${day.format(first)} to ${day.format(last)}`
+    : `Agent session, ${formatDay(first, timeZone)} to ${formatDay(last, timeZone)}`;
 }
 
 /** The id, kept reachable but no longer shouted. */
