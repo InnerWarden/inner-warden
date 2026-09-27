@@ -136,7 +136,7 @@ describe("one lane card", () => {
   it("keeps what the number counts, and prints no unit it was not told", () => {
     const card = parseLaneCard("agent_actions", agent);
     expect(card?.state === "available" ? card.countOf : undefined).toBe("commands");
-    for (const countOf of [undefined, null, "cases", "Commands", 3]) {
+    for (const countOf of [undefined, null, "sessions", "Commands", 3]) {
       const unknown = parseLaneCard("agent_actions", { ...agent, count_of: countOf });
       if (unknown?.state !== "available") throw new Error("an unknown unit must not cost the card");
       expect("countOf" in unknown, String(countOf)).toBe(false);
@@ -145,6 +145,7 @@ describe("one lane card", () => {
     expect(laneCountNoun("commands", 1)).toBe("command");
     expect(laneCountNoun("messages", 0)).toBe("messages");
     expect(laneCountNoun("findings", 1)).toBe("finding");
+    expect(laneCountNoun("cases", 2_428)).toBe("cases");
     expect(laneCountNoun(undefined, 8)).toBeUndefined();
   });
 

@@ -87,14 +87,26 @@ describe("the figures in an agent-side section", () => {
    * FAILS ON REVERT: print the caption on every tile again and it appears
    * seven times.
    */
-  it("says the shared caption once, and keeps every zero on the page as a zero", () => {
+  it("says the shared caption once, and keeps every zero one switch away as a zero", () => {
     const html = render();
     expect(html.split(esc(COVERS))).toHaveLength(2);
-    expect(html).toContain("Zero: </span>Commands it would have refused while only watching; MCP tool calls screened; MCP tool calls the guardrail refused; MCP tool calls it would have refused while only watching.");
     expect(html.match(/<dt /g)).toHaveLength(3);
+    // Beside tiles that read something, the zeros are their provenance: in
+    // the technical view, still as zeros, never dropped.
+    expect(html).not.toContain("Zero: </span>");
+    setTechnicalDetail(true);
+    expect(render()).toContain("Zero: </span>Commands it would have refused while only watching; MCP tool calls screened; MCP tool calls the guardrail refused; MCP tool calls it would have refused while only watching.");
+  });
+
+  /** With no tile at all, the zeros are the section's figures, and stay in the plain view. */
+  it("keeps the zeros in the plain view when nothing else was measured", () => {
+    const quiet = { ...REPORT, measured: figures([0, 0, 0, 0, 0, 0, 0]) };
+    const html = renderToStaticMarkup(<Posture bootstrap={bootstrap} posture={{ ...posture, agent_layer: quiet }} current evaluatedAt="2026-07-18T12:00:01Z" />);
+    expect(html).toContain("Zero: </span>");
   });
 
   it("prints each caption beside its figure when the figures cover different things", () => {
+    setTechnicalDetail(true);
     const mixed = { ...REPORT, measured: [...figures([7, 2, 0, 0, 0, 0, 4]).slice(0, 6), { id: "x", label: "Other", value: "3", covers: "today" }] };
     const layout = figureLayout(sectionRows(mixed));
     expect(layout.sharedCovers).toBeUndefined();

@@ -118,9 +118,13 @@ function read(): DashboardPosture {
 
 function chip(posture: DashboardPosture, evaluatedAt: string, current = true, reading: DashboardBootstrap = bootstrap): string {
   const html = renderToStaticMarkup(<Posture bootstrap={reading} posture={posture} current={current} evaluatedAt={evaluatedAt} />);
-  const list = html.slice(html.indexOf('aria-label="Host controls"'));
-  const match = list.match(/<span class="shrink-0 font-medium opacity-80">([^<]*)<\/span>/);
-  return match?.[1] ?? "";
+  // The control's state is said twice: by its segment of the ring and by the
+  // badge on its row. The two are one computation, and a read where they
+  // disagree fails here whatever the state is.
+  const ring = html.match(/<title>[^<:]*: ([^<]*)<\/title>/)?.[1] ?? "";
+  const row = html.slice(html.indexOf("<article")).match(/<span class="min-w-0 break-words">([^<]*)<\/span>/)?.[1] ?? "";
+  expect(ring).toBe(row);
+  return row;
 }
 
 describe("a proven control on a page left open", () => {

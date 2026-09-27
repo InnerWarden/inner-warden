@@ -1,9 +1,69 @@
 import type { CaseLane, CaseListWindow } from "../api/cases";
-import { LANE_COPY, LANE_WINDOW_PHRASE, laneCountNoun, latestCaseWindow, type LaneCard } from "../lanes";
+import { LANE_COPY, LANE_WINDOW_PHRASE, laneCountNoun, latestCaseWindow, type LaneCard, type LanePart } from "../lanes";
 import { formatCount } from "../presentation";
 import { windowWords } from "../windows";
 import { When } from "./When";
 import { gridColumnsClass, gridSpanClass, joinClasses } from "./cardGrid";
+import { TechnicalOnly } from "./TechnicalDetail";
+import { Bar, Swatch, type Part } from "./viz";
+
+/**
+ * What happened to each command or message, as a colour with a job:
+ * InnerWarden stopping it is the accent (before it ran darker, the kernel
+ * lighter), a command that may have run while judged unsafe is the one bad
+ * outcome, what was only watched, declined by the agent itself or allowed is
+ * grey, and what nobody answered or nobody could place is hatched so it
+ * never reads as a settled state. A key this bundle does not know is plain
+ * grey: it still counts, and it claims nothing.
+ */
+const OUTCOME_TONES: Record<string, Pick<Part, "tone" | "hatched">> = {
+  refused_before_run: { tone: "accent" },
+  kernel_stopped: { tone: "accentLight" },
+  unsafe_may_have_run: { tone: "bad" },
+  would_have_refused: { tone: "watch" },
+  held_for_review: { tone: "other", hatched: true },
+  unplaced: { tone: "other", hatched: true },
+  allowed: { tone: "watchLight" },
+  // Messages to the agent (the paid host's messages card).
+  stopped_by_innerwarden: { tone: "accent" },
+  declined_by_agent: { tone: "watch" },
+  filtered_by_provider: { tone: "other" },
+  answered: { tone: "watchLight" },
+};
+
+export function outcomeParts(parts: readonly LanePart[]): Part[] {
+  return parts.map((part) => ({
+    key: part.key,
+    value: part.count,
+    label: `${part.label}: ${formatCount(part.count)}`,
+    ...(OUTCOME_TONES[part.key] ?? { tone: "other" as const }),
+  }));
+}
+
+/**
+ * The split of a count as a bar and its legend: every part with something in
+ * it, each with its own swatch and number, adding up to the count. The zeros
+ * are not drawn; the caller says them where it needs to.
+ */
+export function OutcomeBreakdown({ parts, label, className = "" }: { parts: readonly LanePart[]; label: string; className?: string }) {
+  const counted = parts.filter((part) => part.count > 0);
+  const drawn = outcomeParts(counted);
+  return (
+    <div className={className}>
+      <Bar parts={drawn} label={label} />
+      <ul data-lane-breakdown className="mt-3 space-y-1 text-sm text-slate-700">
+        {counted.map((part, index) => (
+          <li key={part.key} data-part={part.key} className="flex items-baseline gap-2">
+            <Swatch part={drawn[index]} className="h-2.5 w-2.5 self-center" />
+            <span className="min-w-6 text-right font-semibold tabular-nums text-slate-950">{formatCount(part.count)}</span>
+            {" "}
+            <span className="min-w-0 break-words">{part.label}</span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
 
 export type LaneOpenOptions = { window: CaseListWindow; status?: "waiting" };
 
@@ -135,6 +195,7 @@ function LaneCardView({
   const waiting = available ? card.waiting ?? 0 : 0;
   const latest = available ? card.latest : undefined;
   const noun = available ? laneCountNoun(card.countOf, card.count) : undefined;
+  const split = available && card.breakdown !== undefined && card.breakdown.some((part) => part.count > 0);
   const open = () => {
     if (link === "cases" && available) onOpenLane?.(card.lane, { window: card.window });
     else if (link === "activity") onOpenActivity?.();
@@ -159,22 +220,26 @@ function LaneCardView({
           </span>
         </p>
       ) : null}
-      {available && card.breakdown !== undefined && card.breakdown.some((part) => part.count > 0) ? (
+      {available && split ? (
         // The split of the number above, each part counted once, adding up
         // to it exactly: the host's split is dropped whole when it does not.
         // A split with nothing in any part draws no list at all, not an
         // empty one a screen reader announces as a list of no items.
-        <ul data-lane-breakdown className="mt-3 space-y-1 text-sm text-slate-700">
-          {card.breakdown.filter((part) => part.count > 0).map((part) => (
-            <li key={part.key} data-part={part.key} className="flex items-baseline gap-2">
-              <span className="min-w-8 text-right font-semibold tabular-nums text-slate-950">{formatCount(part.count)}</span>
-              {" "}
-              <span className="min-w-0 break-words">{part.label}</span>
-            </li>
-          ))}
-        </ul>
+        <OutcomeBreakdown
+          parts={card.breakdown ?? []}
+          label={`${copy.name}: what happened to each of the ${formatCount(card.count)}`}
+          className="mt-4"
+        />
       ) : null}
-      <p className="mt-3 break-words text-sm leading-6 text-slate-700 [overflow-wrap:anywhere]">{card.sentence}</p>
+      {split ? (
+        // The list above says the host's sentence part by part, so the
+        // sentence is the evidence behind it, one switch away.
+        <TechnicalOnly>
+          <p className="mt-3 break-words text-sm leading-6 text-slate-700 [overflow-wrap:anywhere]">{card.sentence}</p>
+        </TechnicalOnly>
+      ) : (
+        <p className="mt-3 break-words text-sm leading-6 text-slate-700 [overflow-wrap:anywhere]">{card.sentence}</p>
+      )}
       {latest ? (
         <p className="mt-3 break-words rounded-lg bg-slate-50 px-3 py-2 text-xs leading-5 text-slate-600 [overflow-wrap:anywhere]">
           <span className="font-semibold text-slate-800">Latest: </span>

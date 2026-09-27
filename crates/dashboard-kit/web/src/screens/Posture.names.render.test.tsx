@@ -1,5 +1,6 @@
 import { renderToStaticMarkup } from "react-dom/server";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
+import { setTechnicalDetail } from "../components/TechnicalDetail";
 
 import type { DashboardBootstrap, DashboardPosture, ProtectionLayer } from "../api/v1";
 import { capabilityName, controlName, dispositionReason, humanize, Posture, unconfirmedLine, withProductName } from "./Posture";
@@ -59,6 +60,8 @@ const bootstrap = {
   privacy: { storage: [], redactions: [], egress: [] },
 } as DashboardBootstrap;
 
+afterEach(() => setTechnicalDetail(false));
+
 describe("the names on Protection", () => {
   it("titles each control the host sends by the product name, with the general words under it", () => {
     const names = SENT.map(([id, capability, label]) => controlName(layer(id, capability, label)));
@@ -83,10 +86,10 @@ describe("the names on Protection", () => {
   });
 
   /**
-   * FAILS ON REVERT: title the row with `layer.label` and the chips and rows
+   * FAILS ON REVERT: title the row with `layer.label` and the ring and rows
    * say "Independent host execution" again.
    */
-  it("prints the product names on the chips and the rows, and the general words once under each", () => {
+  it("prints the product names on the ring and the rows, and the general words once under each", () => {
     const posture: DashboardPosture = {
       schema_version: "innerwarden.dashboard.v1",
       generated_at: "2026-07-18T12:00:01Z",
@@ -94,12 +97,18 @@ describe("the names on Protection", () => {
       gaps: [],
     };
     const html = renderToStaticMarkup(<Posture bootstrap={bootstrap} posture={posture} current evaluatedAt="2026-07-18T12:00:01Z" />);
-    const chips = html.slice(html.indexOf('aria-label="Host controls"'), html.indexOf("posture-controls-title"));
+    // The ring names each control in its segment, in the host's order.
+    const ring = html.slice(html.indexOf('aria-labelledby="posture-verdict-title"'), html.indexOf("posture-controls-title"));
     for (const name of ["Execution Gate", "Secret Read Guard", "DNS Guard", "Host visibility", "Response controls"]) {
-      expect(chips).toContain(`>${name}</span>`);
+      expect(ring).toContain(`<title>${name}: `);
       expect(html).toContain(`>${name}</h3>`);
     }
-    expect(html.match(/>Independent host execution control</g)).toHaveLength(1);
+    // What a product name stands for is for whoever maps it to the
+    // capability: in the technical view, once.
+    expect(html).not.toContain(">Independent host execution control<");
+    setTechnicalDetail(true);
+    const technical = renderToStaticMarkup(<Posture bootstrap={bootstrap} posture={posture} current evaluatedAt="2026-07-18T12:00:01Z" />);
+    expect(technical.match(/>Independent host execution control</g)).toHaveLength(1);
   });
 
   it("names a capability by its product, and spells initials as people write them", () => {
@@ -107,6 +116,12 @@ describe("the names on Protection", () => {
     expect(capabilityName("dns_resolution_control")).toBe("DNS Guard");
     expect(capabilityName("host_visibility")).toBe("Host visibility");
     expect(humanize("dns_resolution_control")).toBe("DNS resolution control");
+    // An initialism keeps its own spelling, even as the first word.
+    expect(humanize("ebpf")).toBe("eBPF");
+    expect(humanize("tcp_stream")).toBe("TCP stream");
+    expect(humanize("usb_monitor")).toBe("USB monitor");
+    expect(humanize("suid_inventory")).toBe("SUID inventory");
+    expect(humanize("")).toBe("Unknown");
     expect(humanize("mcp.tool_calls")).toBe("MCP tool calls");
     expect(humanize("")).toBe("Unknown");
   });
@@ -133,7 +148,7 @@ describe("the ids that carry a product name", () => {
     }
   });
 
-  it("draws one chip per layer, even for two layers of one product", () => {
+  it("draws one ring segment per layer, even for two layers of one product", () => {
     const posture: DashboardPosture = {
       schema_version: "innerwarden.dashboard.v1",
       generated_at: "2026-07-18T12:00:01Z",
@@ -141,8 +156,9 @@ describe("the ids that carry a product name", () => {
       gaps: [],
     };
     const html = renderToStaticMarkup(<Posture bootstrap={bootstrap} posture={posture} current evaluatedAt="2026-07-18T12:00:01Z" />);
-    const chips = html.slice(html.indexOf('aria-label="Host controls"'), html.indexOf("posture-controls-title"));
-    expect(chips.match(/>Execution Gate<\/span>/g)).toHaveLength(2);
+    // The ring names each control in its segment, in the host's order.
+    const ring = html.slice(html.indexOf('aria-labelledby="posture-verdict-title"'), html.indexOf("posture-controls-title"));
+    expect(ring.match(/<title>Execution Gate: /g)).toHaveLength(2);
   });
 });
 

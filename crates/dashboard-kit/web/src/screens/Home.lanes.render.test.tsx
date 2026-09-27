@@ -77,7 +77,7 @@ describe("an Overview whose host sends no lanes", () => {
     await expect(render(communityOverview, "community", monitorMeta("community"))).toMatchFileSnapshot("./__snapshots__/overview-community-no-lanes.html");
   });
 
-  // Five things moved on purpose, and nothing else did; each is asserted on
+  // Six things moved on purpose, and nothing else did; each is asserted on
   // its own below, so a reviewer reading the diff of the pinned markup knows
   // what every changed spot is:
   //  1. the data-handling tick no longer claims the paid dashboard only
@@ -90,7 +90,9 @@ describe("an Overview whose host sends no lanes", () => {
   //     its title (`When`), where it was bare text;
   //  5. in the technical view that time is printed in UTC, labelled, where
   //     it was relative ("4 days ago"), for whoever lines it up with a log
-  //     (`whenText`).
+  //     (`whenText`);
+  //  6. under a count, why the waiting list will not match it opens with
+  //     "What this number counts" instead of sitting under the link.
   it("renders the paid page exactly as it was, in both views", async () => {
     const plain = render(hostWaitingOverview, "enterprise", monitorMeta("enterprise"));
     await expect(plain).toMatchFileSnapshot("./__snapshots__/overview-enterprise-no-lanes.html");
@@ -108,6 +110,10 @@ describe("an Overview whose host sends no lanes", () => {
     }
     expect(plain).toContain("(2026-09-21T14:13:20Z)\">4 days ago</time>");
     expect(technical).toContain("(2026-09-21T14:13:20Z)\">21 Sept 2026, 14:13 UTC</time>");
+    for (const html of [plain, technical]) {
+      const note = html.indexOf("That list shows cases rather than addresses");
+      expect(note).toBeGreaterThan(html.indexOf("What this number counts</summary>"));
+    }
   });
 
   it("has no lane card and keeps the posture hero as the page heading", () => {

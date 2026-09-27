@@ -1,3 +1,5 @@
+import type { AgentCommands } from "../lanes";
+
 export const DASHBOARD_SCHEMA_VERSION = "innerwarden.dashboard.v1" as const;
 
 export type Availability =
@@ -355,6 +357,12 @@ export type DashboardPosture = {
    * the guardrail reports about itself is not host evidence.
    */
   agent_layer?: AgentLayerReport;
+  /**
+   * The AI agent's commands over one window, split by what happened to each:
+   * the Overview's agent card counts the same tally. Dropped whole, never in
+   * part, when it does not add up (`parseAgentCommands`).
+   */
+  agent_commands?: AgentCommands;
 };
 
 export type Metric = {

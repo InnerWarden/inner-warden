@@ -27,6 +27,7 @@ import {
   type TokenProviderUsage,
   type VersionRef,
 } from "./v1";
+import { parseAgentCommands } from "../lanes";
 
 function record(value: unknown, path: string): Record<string, unknown> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error(`${path}: expected object`);
@@ -406,6 +407,11 @@ function agentLayer(value: unknown, path: string): AgentLayerReport {
   };
 }
 
+function agentCommandsOf(value: unknown): Pick<DashboardPosture, "agent_commands"> {
+  const parsed = value === undefined ? undefined : parseAgentCommands(value);
+  return parsed === undefined ? {} : { agent_commands: parsed };
+}
+
 export function parseDashboardPosture(value: unknown): DashboardPosture {
   const item = record(value, "posture");
   if (item.schema_version !== DASHBOARD_SCHEMA_VERSION) throw new Error("posture.schema_version: unsupported contract version");
@@ -431,6 +437,10 @@ export function parseDashboardPosture(value: unknown): DashboardPosture {
     ...(item.control_count === undefined ? {} : { control_count: integer(item.control_count, "posture.control_count") }),
     ...(item.local_model === undefined ? {} : { local_model: localModel(item.local_model, "posture.local_model") }),
     ...(item.agent_layer === undefined ? {} : { agent_layer: agentLayer(item.agent_layer, "posture.agent_layer") }),
+    // The agent's commands are the one addition that is dropped rather than
+    // failed when malformed: the tally is a split that must add up, and one
+    // that does not is no reason to lose every host control above it.
+    ...agentCommandsOf(item.agent_commands),
   };
 }
 

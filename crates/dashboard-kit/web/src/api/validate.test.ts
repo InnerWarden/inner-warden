@@ -379,3 +379,48 @@ describe("an older host that sends neither section still parses", () => {
     expect(parsed.layers).toHaveLength(1);
   });
 });
+
+/**
+ * The agent's command tally for the card's window (`posture.agent_commands`).
+ * The field-by-field rebuild dropped it, so Protection could not print the
+ * Overview card's number. A tally that does not add up is dropped whole, and
+ * only the tally: the host controls above it are no reason to lose.
+ */
+describe("the agent's command tally survives validation", () => {
+  const tally = () => ({
+    window: "7d",
+    count: 8,
+    count_of: "commands",
+    breakdown: [
+      { key: "refused_before_run", count: 2, label: "Refused by InnerWarden before it ran" },
+      { key: "kernel_stopped", count: 2, label: "Stopped by the kernel" },
+      { key: "unsafe_may_have_run", count: 3, label: "Judged unsafe, and may have run" },
+      { key: "allowed", count: 1, label: "Allowed" },
+    ],
+    unexplained_program_starts: { refused: 4, waiting: 0 },
+    sentence: "Your AI agent tried 8 commands in the last 7 days.",
+  });
+
+  it("keeps the count, the window, the split and the program starts", () => {
+    const parsed = parseDashboardPosture({ ...(postureWithLayer({}) as Record<string, unknown>), agent_commands: tally() });
+    expect(parsed.agent_commands?.count).toBe(8);
+    expect(parsed.agent_commands?.window).toBe("7d");
+    expect(parsed.agent_commands?.breakdown.map((part) => part.count)).toEqual([2, 2, 3, 1]);
+    expect(parsed.agent_commands?.unexplainedRefused).toBe(4);
+  });
+
+  /** FAILS ON REVERT: validate it strictly and a split that does not add up empties Protection. */
+  it("drops a tally whose split does not add up, and keeps every host control", () => {
+    for (const bad of [
+      { ...tally(), count: 9 },
+      { ...tally(), count_of: "sessions" },
+      { ...tally(), window: "fortnight" },
+      { ...tally(), breakdown: "8" },
+      "eight",
+    ]) {
+      const parsed = parseDashboardPosture({ ...(postureWithLayer({}) as Record<string, unknown>), agent_commands: bad });
+      expect(parsed.agent_commands, JSON.stringify(bad)).toBeUndefined();
+      expect(parsed.layers).toHaveLength(1);
+    }
+  });
+});

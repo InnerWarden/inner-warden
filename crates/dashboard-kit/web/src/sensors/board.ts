@@ -100,7 +100,7 @@ export type CollectorLiveness =
   /** Declared, and nothing has attested it. NOT a synonym for working. */
   | "unattested";
 
-export type CollectorTone = "positive" | "attention" | "warning" | "neutral";
+export type CollectorTone = "positive" | "informational" | "attention" | "warning" | "neutral";
 
 /**
  * Which shared explanation a row falls under.
@@ -148,7 +148,8 @@ const IMPAIRED_STATES: Readonly<Record<string, string>> = {
   source_unavailable: "Source missing",
   source_empty: "Source stale",
   permission_denied: "No permission",
-  unsupported: "Unsupported",
+  unsupported: "Not supported here",
+  failed: "Failed",
 };
 
 /**
@@ -170,6 +171,8 @@ function faultNote(health: { state: string; path?: string; last_write_iso?: stri
     case "source_empty":
       return `${health.path ?? "The source"} exists but has not been written to since `
         + `${health.last_write_iso ?? "an unrecorded time"}. The upstream service has stopped writing.`;
+    case "failed":
+      return "The sensor reports this collector failed.";
     case "permission_denied":
       return "The sensor lacks the OS capability to read this source. Check the unit's AmbientCapabilities.";
     default:
@@ -193,7 +196,7 @@ export function sharedStateNote(category: CollectorCategory, key: CollectorNoteK
   switch (key) {
     case "reporting":
       return category === "alarm"
-        ? "The count is findings today. An alarm detector only speaks when something trips."
+        ? "The count is alerts today. An alarm detector only speaks when something trips."
         : "Events arrived today, and the sensor reports the source is live.";
     case "reporting_no_verdict":
       return "Events arrived today, but the sensor published no health verdict for these collectors. "
@@ -233,7 +236,9 @@ function describe(name: string, count: number, category: CollectorCategory, stat
       liveness: "impaired",
       active: false,
       label: IMPAIRED_STATES[state],
-      tone: "warning",
+      // Red only for what the host itself counts as broken: an unsupported
+      // collector is off on this platform, which is not a fault.
+      tone: state === "unsupported" ? "neutral" : "warning",
       noteKey: "impaired",
       // A fault verdict beside a non-zero count is a contradiction, and hiding
       // either half would be the dishonest way to resolve it.
@@ -241,8 +246,12 @@ function describe(name: string, count: number, category: CollectorCategory, stat
     });
   }
 
+  if (state === "starting") {
+    return row({ liveness: "unattested", active: false, label: "Starting", tone: "neutral", noteKey: "impaired", note: "The sensor is still starting this collector." });
+  }
+
   if (state !== undefined && DISABLED_STATES.includes(state)) {
-    return row({ liveness: "disabled", active: false, label: "Disabled", tone: "neutral", noteKey: "disabled" });
+    return row({ liveness: "disabled", active: false, label: "Off by setting", tone: "neutral", noteKey: "disabled" });
   }
 
   if (state === "active") {
@@ -250,16 +259,16 @@ function describe(name: string, count: number, category: CollectorCategory, stat
       return row({
         liveness: "reporting",
         active: true,
-        label: "Reporting",
-        tone: category === "alarm" ? "attention" : "positive",
+        label: "On",
+        tone: category === "alarm" ? "informational" : "positive",
         noteKey: "reporting",
       });
     }
     return row({
       liveness: "quiet",
       active: true,
-      label: category === "alarm" ? "Quiet" : "Attached, silent",
-      tone: category === "alarm" ? "positive" : "attention",
+      label: category === "alarm" ? "On, nothing tripped" : "Quiet",
+      tone: category === "alarm" ? "informational" : "neutral",
       noteKey: "quiet",
     });
   }
@@ -273,8 +282,8 @@ function describe(name: string, count: number, category: CollectorCategory, stat
       // A distinct label, not plain "Reporting": two rows with the same pill
       // must mean the same thing, and this one is running on the strength of
       // its own events rather than the sensor's attestation.
-      label: "Reporting, no verdict",
-      tone: category === "alarm" ? "attention" : "positive",
+      label: "On, no verdict",
+      tone: category === "alarm" ? "informational" : "positive",
       noteKey: "reporting_no_verdict",
     });
   }
@@ -282,11 +291,11 @@ function describe(name: string, count: number, category: CollectorCategory, stat
   return row({
     liveness: "unattested",
     active: false,
-    label: "Not attested",
-    // Loud for a stream that should never be at zero, neutral for the detectors
-    // whose silence is ordinary: a warning on every quiet alarm would train the
-    // operator to ignore the colour.
-    tone: category === "telemetry" ? "warning" : "neutral",
+    label: "Not confirmed",
+    // Grey, never amber or red: nothing attested it, which is not the same as
+    // a fault the host counts. Amber is for what needs a person and red for
+    // what the host itself calls broken; an unknown is neither.
+    tone: "neutral",
     noteKey: "unattested",
   });
 }
@@ -393,7 +402,7 @@ const GROUP_TITLES: Record<CollectorCategory, string> = {
 
 const GROUP_MEANING: Record<CollectorCategory, string> = {
   telemetry: "Always-on feeds. A stream at zero has stopped, and says so here rather than disappearing.",
-  alarm: "Event-driven detectors. Silence is the healthy state; a count is a finding.",
+  alarm: "Event-driven detectors. They speak only when something trips; a count is alerts.",
   snapshot: "Periodic inventories. The count is completed cycles, not detections.",
 };
 
@@ -453,16 +462,19 @@ export function captionCounts(rows: readonly CollectorRow[]): CaptionCounts {
 function caption(category: CollectorCategory, rows: CollectorRow[]): string {
   if (rows.length === 0) return "None reported";
   const { reporting, silent, notRunning, disabled } = captionCounts(rows);
+  // The words the paid Protection screen uses for the same states, so the
+  // two views of one sensor never speak two vocabularies. An alarm's count
+  // is its alerts; "findings" is the word for what the detectors raised.
   const parts: string[] = [
     category === "alarm"
-      ? `${reporting} of ${rows.length} with findings`
-      : `${reporting} of ${rows.length} reporting`,
+      ? `${reporting} of ${rows.length} with alerts today`
+      : `${reporting} of ${rows.length} on`,
   ];
-  // The same words the rows in that state wear, per category, so the caption
-  // and the pills below it can be matched by eye.
-  if (silent > 0) parts.push(category === "alarm" ? `${silent} quiet` : `${silent} attached but silent`);
-  if (notRunning > 0) parts.push(`${notRunning} not confirmed running`);
-  if (disabled > 0) parts.push(`${disabled} switched off`);
+  // The same words the rows in that state wear, so the caption and the pills
+  // below it can be matched by eye.
+  if (silent > 0) parts.push(category === "alarm" ? `${silent} on, nothing tripped` : `${silent} quiet`);
+  if (notRunning > 0) parts.push(`${notRunning} not confirmed`);
+  if (disabled > 0) parts.push(`${disabled} off by setting`);
   return parts.join(" · ");
 }
 
@@ -489,7 +501,7 @@ export function collectorGroups(rows: readonly CollectorRow[]): CollectorGroup[]
 }
 
 /** Worst first. What needs attention should not be below the fold. */
-const TONE_ORDER: Record<CollectorTone, number> = { warning: 0, attention: 1, neutral: 2, positive: 3 };
+const TONE_ORDER: Record<CollectorTone, number> = { warning: 0, attention: 1, neutral: 2, informational: 3, positive: 4 };
 
 /**
  * The one-line verdict above the board.
@@ -501,7 +513,7 @@ const TONE_ORDER: Record<CollectorTone, number> = { warning: 0, attention: 1, ne
  * Each clause here must name the population it counts, and count every row the
  * board shows in that state. Two ways of getting that wrong have already
  * shipped: a filter narrower than the pill its rows wear (telemetry only, under
- * two rows both labelled "Attached, silent"), and a state left out altogether
+ * two rows both labelled "Quiet"), and a state left out altogether
  * (disabled, so a board with a detector switched off called itself all
  * confirmed running).
  */
@@ -509,12 +521,12 @@ export function boardSummary(rows: readonly CollectorRow[]): string {
   if (rows.length === 0) return "No collectors were reported by this host.";
   const impaired = rows.filter((row) => row.liveness === "impaired").length;
   const unattested = rows.filter((row) => row.liveness === "unattested").length;
-  // Every row that WEARS the "Attached, silent" pill, which is every quiet row
-  // outside the alarm group. Counting only the telemetry ones printed "25
-  // collectors: 1 attached but silent" above two rows each labelled exactly
-  // that, because a quiet snapshot collector gets the same pill and was left
-  // out of the headline. A quiet ALARM keeps its own pill ("Quiet") and stays
-  // out of this count: silence is its healthy state, not something to chase.
+  // Every row that WEARS the "Quiet" pill, which is every quiet row outside
+  // the alarm group. Counting only the telemetry ones printed "25 collectors:
+  // 1 quiet" above two rows each labelled exactly that, because a quiet
+  // snapshot collector gets the same pill and was left out of the headline. A
+  // quiet ALARM wears its own pill ("On, nothing tripped") and stays out of
+  // this count: silence is its healthy state, not something to chase.
   const silent = rows.filter((row) => row.liveness === "quiet" && row.category !== "alarm").length;
   // Switched off is a fact, not a nil. Without this the summary of a board
   // whose only non-reporting collector was disabled read "all confirmed
@@ -522,10 +534,10 @@ export function boardSummary(rows: readonly CollectorRow[]): string {
   const disabled = rows.filter((row) => row.liveness === "disabled").length;
   const parts: string[] = [];
   if (impaired > 0) parts.push(`${impaired} reporting a fault`);
-  if (unattested > 0) parts.push(`${unattested} declared but not attested`);
-  if (silent > 0) parts.push(`${silent} attached but silent`);
-  if (disabled > 0) parts.push(`${disabled} switched off`);
-  if (parts.length === 0) return `${rows.length} collectors, all confirmed running.`;
+  if (unattested > 0) parts.push(`${unattested} not confirmed`);
+  if (silent > 0) parts.push(`${silent} quiet`);
+  if (disabled > 0) parts.push(`${disabled} off by setting`);
+  if (parts.length === 0) return `${rows.length} collectors, all confirmed on.`;
   return `${rows.length} collectors: ${parts.join(", ")}.`;
 }
 

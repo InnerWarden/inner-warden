@@ -81,9 +81,11 @@ describe("a declared collector is not an active one", () => {
     const row = rowFor(payload, "ebpf");
     expect(row.active).toBe(false);
     expect(row.liveness).toBe("unattested");
-    expect(row.label).toBe("Not attested");
+    expect(row.label).toBe("Not confirmed");
     expect(row.state).toBe("not_reported");
-    expect(row.tone).toBe("warning");
+    // Grey: nothing attested it, which is not a fault the host counts. Red is
+    // kept for what the host calls broken, amber for what needs a person.
+    expect(row.tone).toBe("neutral");
     expect(row.noteKey).toBe("unattested");
     expect(sharedStateNote("telemetry", "unattested")).toContain("Declared is not attached");
   });
@@ -103,9 +105,12 @@ describe("a declared collector is not an active one", () => {
   });
 
   it.each([
-    ["permission_denied", "No permission"],
-    ["unsupported", "Unsupported"],
-  ])("does not read as active for %s", (state, label) => {
+    ["permission_denied", "No permission", "warning"],
+    ["unsupported", "Not supported here", "neutral"],
+    // The host counts `failed` as broken (`host_visibility.rs::counts`); it
+    // fell through to "Not attested" here and read as a doubt, not a fault.
+    ["failed", "Failed", "warning"],
+  ])("does not read as active for %s", (state, label, tone) => {
     const payload = activity({
       sources: [{ name: "dns_capture", count: 0 }],
       collector_health: { statuses: [{ name: "dns_capture", health: { state, reason: "no CAP_NET_RAW" } }] },
@@ -113,6 +118,20 @@ describe("a declared collector is not an active one", () => {
     const row = rowFor(payload, "dns_capture");
     expect(row.active).toBe(false);
     expect(row.label).toBe(label);
+    // Red only for what the host itself counts as broken: an unsupported
+    // collector is off on this platform, which is not a fault.
+    expect(row.tone).toBe(tone);
+  });
+
+  it("reads a collector the sensor is still starting as starting, not as running or failed", () => {
+    const payload = activity({
+      sources: [{ name: "ebpf", count: 0 }],
+      collector_health: { statuses: [{ name: "ebpf", category: "telemetry", health: { state: "starting" } }] },
+    });
+    const row = rowFor(payload, "ebpf");
+    expect(row.active).toBe(false);
+    expect(row.label).toBe("Starting");
+    expect(row.tone).toBe("neutral");
   });
 
   /**
@@ -128,7 +147,7 @@ describe("a declared collector is not an active one", () => {
     const row = rowFor(payload, "docker");
     expect(row.liveness).toBe("disabled");
     expect(row.active).toBe(false);
-    expect(row.label).toBe("Disabled");
+    expect(row.label).toBe("Off by setting");
   });
 });
 
@@ -141,8 +160,10 @@ describe("zero events is a state, not an error", () => {
     const row = rowFor(payload, "journald");
     expect(row.active).toBe(true);
     expect(row.liveness).toBe("quiet");
-    expect(row.tone).toBe("attention");
-    expect(row.label).toBe("Attached, silent");
+    // Grey, not amber: a silent stream is worth chasing, and the words say so,
+    // but amber is kept for what the host says needs a person.
+    expect(row.tone).toBe("neutral");
+    expect(row.label).toBe("Quiet");
     expect(sharedStateNote("telemetry", "quiet")).toContain("worth chasing");
   });
 
@@ -154,8 +175,10 @@ describe("zero events is a state, not an error", () => {
     const row = rowFor(payload, "tls_fingerprint");
     expect(row.active).toBe(true);
     expect(row.liveness).toBe("quiet");
-    expect(row.tone).toBe("positive");
-    expect(row.label).toBe("Quiet");
+    // On, and healthy in its silence: the "on" colour. Emerald is kept for a
+    // state confirmed by evidence, and a quiet detector has produced none.
+    expect(row.tone).toBe("informational");
+    expect(row.label).toBe("On, nothing tripped");
     expect(sharedStateNote("alarm", "quiet")).toContain("healthy state");
   });
 
@@ -166,9 +189,11 @@ describe("zero events is a state, not an error", () => {
     });
     const row = rowFor(payload, "integrity");
     expect(row.liveness).toBe("reporting");
-    expect(row.tone).toBe("attention");
+    // A finding is not good news, and it is not a person being needed either:
+    // the detector is on and speaking, so it wears the "on" colour.
+    expect(row.tone).toBe("informational");
     expect(row.count).toBe(4);
-    expect(sharedStateNote("alarm", "reporting")).toContain("findings");
+    expect(sharedStateNote("alarm", "reporting")).toContain("alerts");
   });
 
   it("never hides a collector reporting zero", () => {
@@ -194,7 +219,7 @@ describe("collectorRows", () => {
     expect(row.active).toBe(true);
     // A distinct pill from the attested "Reporting": two rows with the same
     // label must mean the same thing.
-    expect(row.label).toBe("Reporting, no verdict");
+    expect(row.label).toBe("On, no verdict");
     expect(sharedStateNote("telemetry", "reporting_no_verdict")).toContain("published no health verdict");
   });
 });
@@ -225,7 +250,7 @@ describe("collectorGroups", () => {
   it("puts what needs attention above what does not", () => {
     const telemetry = collectorGroups(collectorRows(payload))[0];
     expect(telemetry.rows.map((row) => row.name)).toEqual(["ebpf", "journald"]);
-    expect(telemetry.caption).toContain("not confirmed running");
+    expect(telemetry.caption).toContain("not confirmed");
   });
 
   it("omits a category this host has no collectors for", () => {
@@ -273,8 +298,8 @@ describe("each state's explanation is said once per group", () => {
 
   it("keeps the legend in the rows' worst-first order, under matching labels", () => {
     const [telemetry] = collectorGroups(collectorRows(payload));
-    expect(telemetry.notes.map((note) => note.label)).toEqual(["Not attested", "Attached, silent", "Reporting"]);
-    expect(telemetry.notes.map((note) => note.tone)).toEqual(["warning", "attention", "positive"]);
+    expect(telemetry.notes.map((note) => note.label)).toEqual(["Not confirmed", "Quiet", "On"]);
+    expect(telemetry.notes.map((note) => note.tone)).toEqual(["neutral", "neutral", "positive"]);
     expect(telemetry.notes[0].text).toContain("Declared is not attached");
   });
 
@@ -346,15 +371,15 @@ describe("the caption accounts for every row in the group", () => {
   it("names the silent row instead of leaving it out of the sentence", () => {
     const [telemetry] = collectorGroups(collectorRows(payload));
     expect(telemetry.rows).toHaveLength(5);
-    expect(telemetry.caption).toContain("1 of 5 reporting");
-    expect(telemetry.caption).toContain("1 attached but silent");
-    expect(telemetry.caption).toContain("2 not confirmed running");
+    expect(telemetry.caption).toContain("1 of 5 on");
+    expect(telemetry.caption).toContain("1 quiet");
+    expect(telemetry.caption).toContain("2 not confirmed");
   });
 
   it("calls a disabled collector switched off, not unconfirmed", () => {
     const [telemetry] = collectorGroups(collectorRows(payload));
-    expect(telemetry.caption).toContain("1 switched off");
-    expect(telemetry.caption).not.toContain("3 not confirmed running");
+    expect(telemetry.caption).toContain("1 off by setting");
+    expect(telemetry.caption).not.toContain("3 not confirmed");
   });
 
   it("puts every liveness in exactly one bucket, so nothing can go uncounted", () => {
@@ -375,8 +400,8 @@ describe("the caption accounts for every row in the group", () => {
         ],
       },
     })))[0];
-    expect(alarms.rows.every((row) => row.label === "Quiet")).toBe(true);
-    expect(alarms.caption).toBe("0 of 2 with findings · 2 quiet");
+    expect(alarms.rows.every((row) => row.label === "On, nothing tripped")).toBe(true);
+    expect(alarms.caption).toBe("0 of 2 with alerts today · 2 on, nothing tripped");
   });
 });
 
@@ -391,7 +416,7 @@ describe("boardSummary", () => {
         ],
       },
     }));
-    expect(boardSummary(rows)).toBe("3 collectors: 1 reporting a fault, 1 declared but not attested.");
+    expect(boardSummary(rows)).toBe("3 collectors: 1 reporting a fault, 1 not confirmed.");
   });
 
   it("says so plainly when everything is confirmed", () => {
@@ -399,7 +424,7 @@ describe("boardSummary", () => {
       sources: [{ name: "journald", count: 5 }],
       collector_health: { statuses: [{ name: "journald", health: { state: "active" } }] },
     }));
-    expect(boardSummary(rows)).toBe("1 collectors, all confirmed running.");
+    expect(boardSummary(rows)).toBe("1 collectors, all confirmed on.");
   });
 
   it("does not invent collectors for a host that listed none", () => {
@@ -428,8 +453,8 @@ describe("boardSummary", () => {
         ],
       },
     }));
-    expect(rows.filter((row) => row.label === "Attached, silent")).toHaveLength(2);
-    expect(boardSummary(rows)).toBe("3 collectors: 2 attached but silent.");
+    expect(rows.filter((row) => row.label === "Quiet")).toHaveLength(2);
+    expect(boardSummary(rows)).toBe("3 collectors: 2 quiet.");
   });
 
   /**
@@ -447,8 +472,8 @@ describe("boardSummary", () => {
         ],
       },
     }));
-    expect(boardSummary(rows)).toBe("2 collectors: 1 switched off.");
-    expect(boardSummary(rows)).not.toContain("all confirmed running");
+    expect(boardSummary(rows)).toBe("2 collectors: 1 off by setting.");
+    expect(boardSummary(rows)).not.toContain("all confirmed on");
   });
 });
 

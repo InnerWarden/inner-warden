@@ -1555,7 +1555,12 @@ export function HostAttention({ waiting, onOpen }: { waiting: Overview["host_att
           >
             {through.label} <span aria-hidden="true">→</span>
           </button>
-          <p className={`mt-1 text-xs leading-5 ${quiet ? "text-slate-500" : "text-amber-800"}`}>{through.note}</p>
+          {/* Under a count, why the list will not match it is part of what the
+              count means, so it opens with the definitions; under the calm
+              line it is the only thing said about the list, and stays. */}
+          {line.definitions.length === 0 ? (
+            <p className={`mt-1 text-xs leading-5 ${quiet ? "text-slate-500" : "text-amber-800"}`}>{through.note}</p>
+          ) : null}
         </div>
       )}
       {line.definitions.length > 0 && (
@@ -1571,6 +1576,7 @@ export function HostAttention({ waiting, onOpen }: { waiting: Overview["host_att
               </div>
             ))}
           </dl>
+          {through ? <p className="mt-2 text-xs leading-5 text-amber-800">{through.note}</p> : null}
         </details>
       )}
     </section>
