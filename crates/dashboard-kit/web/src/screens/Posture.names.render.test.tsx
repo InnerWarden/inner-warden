@@ -208,6 +208,18 @@ describe("the coverage gaps section", () => {
     expect(html).not.toContain("can&#x27;t confirm:");
   });
 
+  /**
+   * A failed refresh left the page on an older read and the section said "No
+   * gaps ... need your attention" under a DNS Guard reading "Can't confirm".
+   * FAILS ON REVERT: render emptyGapsLine whatever `current` is.
+   */
+  it("never says there are no gaps on a read that is not current", () => {
+    const html = renderToStaticMarkup(<Posture bootstrap={bootstrap} posture={{ schema_version: "innerwarden.dashboard.v1", generated_at: "2026-07-18T12:00:01Z", layers: [visible, dns], gaps: [] }} current={false} evaluatedAt="2026-07-18T12:00:01Z" />);
+    const section = html.slice(html.indexOf('id="posture-gaps-title"'));
+    expect(section).not.toContain("No gaps");
+    expect(section).toContain("cannot say there are no gaps");
+  });
+
   it("lists three or more in plain words", () => {
     expect(unconfirmedLine(["A", "B", "C"])).toBe("3 controls we can't confirm: A, B and C. We will not claim them either way.");
   });

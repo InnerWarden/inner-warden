@@ -793,6 +793,18 @@ export function emptyGapsLine(totalGaps: number): string {
 }
 
 /**
+ * What the section says when the last posture refresh failed and the page is
+ * showing an older read. Measured on the challenge box (2026-09-27): a failed
+ * refresh emptied the list of controls the page cannot confirm, and the
+ * section fell through to "No gaps in the host controls above need your
+ * attention" under a DNS Guard reading "Can't confirm". A read that is not
+ * current can say what it last saw, never that nothing is wrong.
+ */
+export function staleGapsLine(): string {
+  return "The host's controls could not be read again just now, so this page cannot say there are no gaps. The cards above are the last read.";
+}
+
+/**
  * The controls whose state this page cannot confirm: ones reading "Can't
  * confirm", and ones claimed as working or protecting that were never
  * checked. A control that is off was never checked because it is off, which
@@ -970,7 +982,7 @@ export function Posture({
           </p>
         ) : null}
         {operatorGaps.length === 0 && unconfirmed.length === 0 ? (
-          <p className="text-sm leading-6 text-slate-600">{emptyGapsLine(posture.gaps.length)}</p>
+          <p className="text-sm leading-6 text-slate-600">{current ? emptyGapsLine(posture.gaps.length) : staleGapsLine()}</p>
         ) : null}
       </section>
 
