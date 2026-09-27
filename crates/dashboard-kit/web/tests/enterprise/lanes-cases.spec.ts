@@ -89,7 +89,7 @@ test("a lane card opens Cases on its lane, with its tab chosen", async ({ page }
   await expect(tabs.getByRole("tab", { name: /What your AI agent did/ })).toHaveAttribute("aria-selected", "true");
   // Each tab carries the host's own count for its lane.
   await expect(tabs.getByRole("tab", { name: /Attacks on this server, 3 cases/ })).toBeVisible();
-  await expect(tabs.getByRole("tab", { name: /Messages to your AI agent, 1 case/ })).toBeVisible();
+  await expect(tabs.getByRole("tab", { name: /Messages to your AI agent, 1 message/ })).toBeVisible();
   await expect(page.getByText("One case for each session of your AI agent", { exact: false })).toBeVisible();
   await expect(page.getByText("Visitor 28eb7f9c asked your AI agent to download and run a script", { exact: false })).toBeVisible();
 });
