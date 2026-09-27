@@ -116,6 +116,12 @@ describe("the names on Protection", () => {
     expect(capabilityName("dns_resolution_control")).toBe("DNS Guard");
     expect(capabilityName("host_visibility")).toBe("Host visibility");
     expect(humanize("dns_resolution_control")).toBe("DNS resolution control");
+    // An initialism keeps its own spelling, even as the first word.
+    expect(humanize("ebpf")).toBe("eBPF");
+    expect(humanize("tcp_stream")).toBe("TCP stream");
+    expect(humanize("usb_monitor")).toBe("USB monitor");
+    expect(humanize("suid_inventory")).toBe("SUID inventory");
+    expect(humanize("")).toBe("Unknown");
     expect(humanize("mcp.tool_calls")).toBe("MCP tool calls");
     expect(humanize("")).toBe("Unknown");
   });

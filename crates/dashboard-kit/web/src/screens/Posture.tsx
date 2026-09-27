@@ -1040,13 +1040,13 @@ function PostureHero({ pills, current, posture, onCheckNow, children }: { pills:
           </TechnicalOnly>
         ) : null}
       </div>
-      <div className="flex w-full shrink-0 flex-row-reverse items-center justify-between gap-3 border-t border-slate-100 pt-4 sm:w-auto sm:flex-col sm:items-end sm:self-stretch sm:justify-center sm:border-l sm:border-t-0 sm:pl-6 sm:pt-0">
+      <div className="flex shrink-0 items-center gap-3">
         {/* The page refreshes on a slow cadence, because the evidence
             behind it does. An operator who wants an answer this second asks
             for one instead of waiting out a poll whose length they cannot
             see. */}
         {onCheckNow ? <CheckNowButton onCheckNow={onCheckNow} /> : null}
-        <p className="text-xs text-slate-500 sm:text-right">
+        <p className="text-xs text-slate-500">
           {current ? (clock === undefined ? "Not checked yet." : `Checked ${clock}.`) : "Reading the host again."}
         </p>
       </div>
@@ -1613,15 +1613,15 @@ function ControlRow({
           </div>
         </div>
         <div className="flex min-w-0 flex-1 items-center justify-between gap-3 lg:contents">
-          <span className="lg:mt-[3px] lg:w-48 lg:shrink-0">
+          <span className="lg:flex lg:h-8 lg:w-48 lg:shrink-0 lg:items-center">
             <ControlBadge status={current ? disposition : "stale"} label={current ? dispositionLabel(disposition, softened) : "Refreshing"} />
           </span>
-          <span className="hidden lg:mt-1.5 lg:block lg:w-72 lg:shrink-0">
+          <span className="hidden lg:flex lg:h-8 lg:w-72 lg:shrink-0 lg:items-center">
             <Ladder layer={layer} name={name.name} current={current} softened={softened} />
           </span>
           <span
             data-checked-at={technical || lagging || !current ? "shown" : "same"}
-            className="shrink-0 text-right text-xs font-medium text-slate-500 lg:mt-2 lg:w-32"
+            className="shrink-0 text-right text-xs font-medium text-slate-500 lg:flex lg:h-8 lg:w-32 lg:items-center lg:justify-end"
             title={current && layer.freshness.observed_at ? timeTitle(layer.freshness.observed_at) : undefined}
           >
             {!current ? "refreshing" : technical || lagging ? checkedAt(layer.freshness, new Date(), technical ? "UTC" : undefined) : null}
@@ -1836,14 +1836,24 @@ function sentence(value: string): string {
 /** Words that are initials, spelled the way people write them. */
 const INITIALISMS: Record<string, string> = { dns: "DNS", mcp: "MCP", ai: "AI", llm: "LLM", ssh: "SSH", bpf: "BPF", ebpf: "eBPF", lsm: "LSM", id: "ID", ip: "IP", tls: "TLS", tcp: "TCP", http: "HTTP", usb: "USB", suid: "SUID", aws: "AWS" };
 
-/** An id in words: `dns_resolution_control` reads "DNS resolution control", never "Dns". */
+/**
+ * An id in words: `dns_resolution_control` reads "DNS resolution control",
+ * never "Dns", and `ebpf` reads "eBPF", never "EBPF": an initialism keeps
+ * its own spelling even as the first word.
+ */
 export function humanize(value: string): string {
-  const text = value
+  const words = value
     .replace(/[._-]+/g, " ")
     .replace(/\s+/g, " ")
     .trim()
     .split(" ")
-    .map((word) => INITIALISMS[word.toLowerCase()] ?? word)
+    .filter((word) => word !== "");
+  if (words.length === 0) return "Unknown";
+  return words
+    .map((word, index) => {
+      const initials = INITIALISMS[word.toLowerCase()];
+      if (initials !== undefined) return initials;
+      return index === 0 ? word.charAt(0).toUpperCase() + word.slice(1) : word;
+    })
     .join(" ");
-  return text ? text.charAt(0).toUpperCase() + text.slice(1) : "Unknown";
 }
