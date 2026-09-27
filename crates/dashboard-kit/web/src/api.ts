@@ -203,6 +203,16 @@ export type OverviewLaneWire = {
   waiting?: number | null;
   /** The newest case in the lane, titled as the Cases list titles it. */
   latest?: { title: string; at: string; case_id?: string | null } | null;
+  /**
+   * How `count` splits by what finally happened, one part per outcome, each
+   * thing counted once: a command the guardrail refused and the kernel also
+   * stopped is one part, not two. `label` is the host's words for the part,
+   * written for its count ("refused before they ran", "stopped by the
+   * kernel", "may have run"). The parts must add up to `count` exactly, or
+   * the card shows no split at all (`laneBreakdown`). Optional: an older host
+   * sends none and the card is as it was.
+   */
+  breakdown?: { key: string; count: number; label: string }[];
 };
 export type Node = { id: string; kind: string; label: string; attrs?: Record<string, string> };
 export type Edge = { from: string; to: string; kind: string };

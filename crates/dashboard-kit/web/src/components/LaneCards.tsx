@@ -164,6 +164,19 @@ function LaneCardView({
           </span>
         </p>
       ) : null}
+      {available && card.breakdown !== undefined ? (
+        // The split of the number above, each part counted once, adding up
+        // to it exactly: the host's split is dropped whole when it does not.
+        <ul data-lane-breakdown className="mt-3 space-y-1 text-sm text-slate-700">
+          {card.breakdown.filter((part) => part.count > 0).map((part) => (
+            <li key={part.key} data-part={part.key} className="flex items-baseline gap-2">
+              <span className="min-w-8 text-right font-semibold tabular-nums text-slate-950">{formatCount(part.count)}</span>
+              {" "}
+              <span className="min-w-0 break-words">{part.label}</span>
+            </li>
+          ))}
+        </ul>
+      ) : null}
       <p className="mt-3 break-words text-sm leading-6 text-slate-700 [overflow-wrap:anywhere]">{card.sentence}</p>
       {latest ? (
         <p className="mt-3 break-words rounded-lg bg-slate-50 px-3 py-2 text-xs leading-5 text-slate-600 [overflow-wrap:anywhere]">
