@@ -310,6 +310,14 @@ export function dashboardAccessOf(value: unknown): DashboardAccess | undefined {
   return DASHBOARD_ACCESS.find((candidate) => candidate === value);
 }
 
+/**
+ * `audit_trail_view`, read leniently like `dashboard_access`: a route name
+ * (lower case, digits, `_` or `-`, at most 64 characters) or not sent.
+ */
+export function auditTrailViewOf(value: unknown): string | undefined {
+  return typeof value === "string" && /^[a-z][a-z0-9_-]{0,63}$/.test(value) ? value : undefined;
+}
+
 export function parseDashboardBootstrap(value: unknown): DashboardBootstrap {
   const item = record(value, "bootstrap");
   if (item.schema_version !== DASHBOARD_SCHEMA_VERSION) throw new Error("bootstrap.schema_version: unsupported contract version");
@@ -317,10 +325,12 @@ export function parseDashboardBootstrap(value: unknown): DashboardBootstrap {
   const session = record(item.session, "bootstrap.session");
   const privacy = record(item.privacy, "bootstrap.privacy");
   const access = dashboardAccessOf(item.dashboard_access);
+  const auditTrail = auditTrailViewOf(item.audit_trail_view);
   return {
     // Only when sent and known: an older server's bootstrap has no such key,
     // and the parsed value must not grow one either.
     ...(access === undefined ? {} : { dashboard_access: access }),
+    ...(auditTrail === undefined ? {} : { audit_trail_view: auditTrail }),
     schema_version: DASHBOARD_SCHEMA_VERSION, generated_at: text(item.generated_at, "bootstrap.generated_at"),
     edition: oneOf(item.edition, ["community", "enterprise"] as const, "bootstrap.edition"), product_version: text(item.product_version, "bootstrap.product_version"),
     community_contract: versionRef(item.community_contract, "bootstrap.community_contract"),

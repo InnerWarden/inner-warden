@@ -183,6 +183,20 @@ export function formatCount(value: number | bigint): string {
   return COUNT_FORMAT.format(typeof value === "bigint" ? value : value + 0);
 }
 
+/**
+ * Whether host text carries a character that is not text: a control
+ * character (C0, DEL or C1) or a format character, which includes the bidi
+ * overrides and isolates (U+202A to U+202E, U+2066 to U+2069).
+ *
+ * The first rule rejected C0 and DEL only, so a label carrying U+202E (right
+ * to left override) passed and could reorder the words printed after it on
+ * the badge, and C1 controls passed as well. Text that must be printed as
+ * the host sent it is refused whole instead.
+ */
+export function hasControlCharacters(text: string): boolean {
+  return /[\p{Cc}\p{Cf}]/u.test(text);
+}
+
 export function modeAtDecisionLabel(value?: string): string | undefined {
   if (value === "monitor") return "Monitor mode";
   if (value === "enforce") return "Enforce mode";

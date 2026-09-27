@@ -5,6 +5,11 @@ export type LayerAssuranceLabel = {
   label: string;
   status: string;
   verifiedActive: boolean;
+  /**
+   * When the page last verified it, for a verification held from earlier in
+   * the read (`heldAssurance`): the label then says when, not a present tense.
+   */
+  verifiedAt?: number;
 };
 
 export function layerAssuranceLabel(

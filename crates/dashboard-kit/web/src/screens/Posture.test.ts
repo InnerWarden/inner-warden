@@ -636,8 +636,9 @@ describe("the sentence never outranks the badge", () => {
     expect(dispositionReason(layer, "working_as_configured")).toBe(
       "Execution Gate is set up and reporting.",
     );
-    // No veto: the host's own wording is richer and is kept.
-    expect(dispositionReason(layer, "proven")).toBe(layer.disposition_reason);
+    // No veto: the host's own wording is richer and is kept, with the
+    // control called by the name on its card (`withProductName`).
+    expect(dispositionReason(layer, "proven")).toBe("Execution Gate is enforcing, and that was verified on this host.");
   });
 
   it("keeps the host sentence whenever the shown state matches", () => {

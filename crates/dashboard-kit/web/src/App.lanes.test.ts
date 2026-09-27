@@ -67,7 +67,9 @@ describe("a case opened from a lane", () => {
    */
   it("is dropped when the reader goes anywhere else", () => {
     const inLane = "https://dashboard.test/?view=cases&lane=agent_actions&window=7d";
-    expect(caseQueueUrl(inLane).searchParams.has("lane")).toBe(false);
+    // The queue is every lane's, so it names every case, never the lane the
+    // reader was in (`caseQueueUrl`).
+    expect(caseQueueUrl(inLane).searchParams.get("lane")).toBe("everything");
     expect(caseUrl("case:x:1", inLane).searchParams.has("lane")).toBe(false);
     expect(activityUrl({ id: "d1" }, inLane).searchParams.has("lane")).toBe(false);
   });

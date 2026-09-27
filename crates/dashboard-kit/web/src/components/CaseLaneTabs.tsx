@@ -4,19 +4,36 @@ import { EVERYTHING_COPY, LANE_COPY, LANE_WINDOW_PHRASE, type CaseLaneChoice } f
 import { CASE_WINDOW_LABELS, CASE_WINDOWS, type CaseWindow } from "./CaseFilters";
 import { useTechnicalDetail } from "./TechnicalDetail";
 import { formatCount } from "../presentation";
+import { windowWords } from "../windows";
 
 /**
- * The span beside a tab's count, short enough to sit in the badge: "1,298 ·
- * 7 days". A count with no span was how a reader compared 4 on the Overview
- * (7 days) with 2 here (24 hours) and read it as lost data.
+ * The span beside a tab's count, short enough to sit in the badge: "1,298
+ * cases · 7 days". A count with no span was how a reader compared 4 on the
+ * Overview (7 days) with 2 here (24 hours) and read it as lost data.
  */
-export const LANE_TAB_SPAN: Record<CaseWindow, string> = {
-  "1h": "1 hour",
-  "24h": "24 hours",
-  "7d": "7 days",
-  "30d": "30 days",
-  all: "any day",
+export const LANE_TAB_SPAN: Record<CaseWindow, string> = windowWords("short");
+
+/**
+ * What one case in each tab is, so a tab's count names its unit.
+ *
+ * The agent's Overview card counts COMMANDS, and its tab lists one case per
+ * SESSION: with the unit said only aloud, the badge read "4 · 7 days" under
+ * a card reading 7, and a reader took the two for one count that had lost
+ * three ("Agent: 8, then 4"). A message is one case, and an attack or any
+ * case in the whole list is a case.
+ */
+export const LANE_CASE_UNIT: Record<CaseLaneChoice, { one: string; many: string }> = {
+  agent_messages: { one: "message", many: "messages" },
+  agent_actions: { one: "session", many: "sessions" },
+  server_attacks: { one: "case", many: "cases" },
+  everything: { one: "case", many: "cases" },
 };
+
+/** A tab's count with its unit: "4 sessions", "1 message", "2,435 cases". */
+export function laneTabCount(choice: CaseLaneChoice, count: number): string {
+  const unit = LANE_CASE_UNIT[choice];
+  return `${formatCount(count)} ${count === 1 ? unit.one : unit.many}`;
+}
 
 export type CaseLaneTab = {
   choice: CaseLaneChoice;
@@ -78,12 +95,13 @@ export function laneIntro(value: CaseLaneChoice): string {
 
 /**
  * What a tab with a count is called aloud: "Attacks on this server, 823
- * cases", and with the span it was counted over when the screen passed one:
- * "Attacks on this server, 823 cases in the last 7 days".
+ * cases", "What your AI agent did, 4 sessions", and with the span it was
+ * counted over when the screen passed one: "Attacks on this server, 823
+ * cases in the last 7 days".
  */
-export function laneTabName(tab: Pick<CaseLaneTab, "label" | "count">, window?: CaseWindow): string {
+export function laneTabName(tab: Pick<CaseLaneTab, "choice" | "label" | "count">, window?: CaseWindow): string {
   if (tab.count === undefined) return tab.label;
-  const counted = `${tab.label}, ${formatCount(tab.count)} ${tab.count === 1 ? "case" : "cases"}`;
+  const counted = `${tab.label}, ${laneTabCount(tab.choice, tab.count)}`;
   return window === undefined ? counted : `${counted} ${LANE_WINDOW_PHRASE[window]}`;
 }
 
@@ -119,15 +137,25 @@ export function CaseLaneTabs({
   /** The id of the list the tabs control, for `aria-controls`. */
   panelId?: string;
   /**
-   * The span the counts cover, the list's own window. Printed beside every
-   * count, so a badge never reads as a number over no span. Absent: badges as
-   * before.
+   * The span the counts cover. Printed beside every count with the count's
+   * unit ("4 sessions · 7 days"), so a badge never reads as a number over no
+   * span. Absent: badges as before, the number alone.
+   *
+   * Pass the window the SERVER echoed with the counts (`page.window`), never
+   * the one the screen asked for: a server that did not honour `?window=`
+   * sends no echo, and its counts cover no such span. Labelling them with the
+   * dropdown's span would print "· 7 days" beside counts of every day.
+   * `casePageCountLabel` reads the echo the same way.
    */
   window?: CaseWindow;
   /**
    * Changes the list's window from beside the tabs, where the counts it
    * changes are. Offered only with `window`: a picker with no value is a
    * control over nothing. The screen owns the request and the address bar.
+   *
+   * A screen that passes this must hide the filter form's own window select
+   * (`CaseFiltersForm` with `hideWindow`), or it draws two controls named
+   * "Time window" for one value, one applying at once and one on Apply.
    */
   onWindowChange?: (next: CaseWindow) => void;
 }) {
@@ -172,7 +200,7 @@ export function CaseLaneTabs({
                   aria-hidden="true"
                   className={`rounded-full px-2 py-0.5 text-xs tabular-nums ${tab.selected ? "bg-white/20 text-white" : "bg-slate-100 text-slate-700"}`}
                 >
-                  {formatCount(tab.count)}
+                  {window === undefined ? formatCount(tab.count) : laneTabCount(tab.choice, tab.count)}
                   {window === undefined ? null : (
                     <span className="font-normal opacity-80"> · {LANE_TAB_SPAN[window]}</span>
                   )}

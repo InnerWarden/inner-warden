@@ -77,12 +77,37 @@ describe("an Overview whose host sends no lanes", () => {
     await expect(render(communityOverview, "community", monitorMeta("community"))).toMatchFileSnapshot("./__snapshots__/overview-community-no-lanes.html");
   });
 
-  // One line moved on purpose: the data-handling tick no longer claims the
-  // paid dashboard only reads (`dashboardAccessClaim`). Nothing else did.
+  // Five things moved on purpose, and nothing else did; each is asserted on
+  // its own below, so a reviewer reading the diff of the pinned markup knows
+  // what every changed spot is:
+  //  1. the data-handling tick no longer claims the paid dashboard only
+  //     reads (`dashboardAccessClaim`);
+  //  2. a recent decision's outcome chip says "Checked only" where it said
+  //     "Screened", with what that means in its title (`OUTCOME_CHIPS`);
+  //  3. the tile for the same outcome says "Checked only (one-off check)"
+  //     where it said "Screened by one-off check", one word for it per page;
+  //  4. the recent decision's time is a <time> element with the instant in
+  //     its title (`When`), where it was bare text;
+  //  5. in the technical view that time is printed in UTC, labelled, where
+  //     it was relative ("4 days ago"), for whoever lines it up with a log
+  //     (`whenText`).
   it("renders the paid page exactly as it was, in both views", async () => {
-    await expect(render(hostWaitingOverview, "enterprise", monitorMeta("enterprise"))).toMatchFileSnapshot("./__snapshots__/overview-enterprise-no-lanes.html");
+    const plain = render(hostWaitingOverview, "enterprise", monitorMeta("enterprise"));
+    await expect(plain).toMatchFileSnapshot("./__snapshots__/overview-enterprise-no-lanes.html");
     setTechnicalDetail(true);
-    await expect(render(hostWaitingOverview, "enterprise", monitorMeta("enterprise"))).toMatchFileSnapshot("./__snapshots__/overview-enterprise-no-lanes-technical.html");
+    const technical = render(hostWaitingOverview, "enterprise", monitorMeta("enterprise"));
+    await expect(technical).toMatchFileSnapshot("./__snapshots__/overview-enterprise-no-lanes-technical.html");
+    for (const html of [plain, technical]) {
+      expect(html).toContain("Reads by default. Every change asks you to confirm it");
+      expect(html).not.toContain("This dashboard only reads");
+      expect(html).toMatch(/title="Judged by a one-off check\.[^"]*"[^>]*>Checked only<\/span>/);
+      expect(html).not.toContain(">Screened<");
+      expect(html).toContain(">Checked only (one-off check)</div>");
+      expect(html).not.toContain("Screened by one-off check");
+      expect(html).toMatch(/<time dateTime="2026-09-21T14:13:20Z" title="[^"]*\(2026-09-21T14:13:20Z\)">/);
+    }
+    expect(plain).toContain("(2026-09-21T14:13:20Z)\">4 days ago</time>");
+    expect(technical).toContain("(2026-09-21T14:13:20Z)\">21 Sept 2026, 14:13 UTC</time>");
   });
 
   it("has no lane card and keeps the posture hero as the page heading", () => {

@@ -178,6 +178,17 @@ export type DashboardBootstrap = {
    * not sent. The Overview then decides by edition, see `dashboardAccessClaim`.
    */
   dashboard_access?: DashboardAccess;
+  /**
+   * The `?view=` route of the screen that lists the admin audit trail, when
+   * the server has one: the trail the `confirmed_changes` claim says every
+   * change lands in. The Overview links the claim to it when the shell
+   * offers that screen, and says the claim alone otherwise.
+   *
+   * Optional and read leniently (`auditTrailViewOf`): a lower-case route
+   * name or nothing. A server older than the field sends nothing and the
+   * claim reads as it did.
+   */
+  audit_trail_view?: string;
 };
 export const DASHBOARD_ACCESS = ["read_only", "confirmed_changes"] as const;
 export type DashboardAccess = (typeof DASHBOARD_ACCESS)[number];

@@ -1,11 +1,12 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 
-import { signedInLabel } from "./App";
+import { signedInAccount, signedInLabel } from "./App";
+import { Header } from "./components/Header";
 import { casePageCountBadge } from "./components/casePageCount";
 import { Outcome, OUTCOME_CHIPS } from "./components/Outcome";
 import { statusPresentation } from "./components/StatusBadge";
-import { formatCount } from "./presentation";
+import { formatCount, hasControlCharacters } from "./presentation";
 import { agreeWithControls, dispositionReason } from "./screens/Posture";
 
 /**
@@ -89,5 +90,34 @@ describe("who is signed in", () => {
     expect(signedInLabel("  ")).toBe("Signed in");
     expect(signedInLabel("x".repeat(65))).toBe("Signed in");
     expect(signedInLabel("bad\u0007name")).toBe("Signed in");
+    // FAILS ON REVERT: reject C0 and DEL alone, and a C1 control or a right
+    // to left override (which reorders the badge's words) is printed.
+    expect(signedInLabel("bad\u0085name")).toBe("Signed in");
+    expect(signedInLabel("alice\u202Enimda")).toBe("Signed in");
+    expect(signedInLabel("\u2066alice\u2069")).toBe("Signed in");
+    expect(signedInLabel("zoë.o'brien-ops@example.test")).toBe("Signed in as zoë.o'brien-ops@example.test");
+  });
+
+  it("gives the menu the name, and the badge its words on hover", () => {
+    const ready = { state: "ready" as const, data: { session: { authenticated: true, actor_id: "alice" } } } as unknown as Parameters<typeof signedInAccount>[0];
+    expect(signedInAccount(ready)).toBe("Signed in as alice");
+    const signedOut = { state: "ready" as const, data: { session: { authenticated: false, actor_id: null } } } as unknown as Parameters<typeof signedInAccount>[0];
+    expect(signedInAccount(signedOut)).toBeUndefined();
+    expect(signedInAccount({ state: "loading" })).toBeUndefined();
+    const menu = renderToStaticMarkup(
+      <Header editionLabel="Enterprise" navigation={[]} activeRoute="overview" homeRoute="overview" onNavigate={() => undefined} status={null} account="Signed in as alice" />,
+    );
+    // Said in the menu below 400 px, where the badge keeps only its check.
+    expect(menu).toMatch(/<p data-header-account="true" class="[^"]*min-\[400px\]:hidden[^"]*">Signed in as alice<\/p>/);
+    expect(renderToStaticMarkup(
+      <Header editionLabel="Community" navigation={[]} activeRoute="overview" homeRoute="overview" onNavigate={() => undefined} status={null} />,
+    )).not.toContain("data-header-account");
+  });
+
+  it("names every control or format character as not text", () => {
+    for (const bad of ["\u0000", "\u001f", "\u007f", "\u0085", "\u009f", "\u200e", "\u202a", "\u202e", "\u2066", "\u2069", "\ufeff"]) {
+      expect(hasControlCharacters(`a${bad}b`), JSON.stringify(bad)).toBe(true);
+    }
+    expect(hasControlCharacters("plain words, é and 漢字")).toBe(false);
   });
 });

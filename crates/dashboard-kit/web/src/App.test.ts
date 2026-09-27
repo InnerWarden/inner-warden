@@ -321,11 +321,14 @@ describe("activity selection in the address bar", () => {
  * default would hide it.
  */
 describe("caseQueueUrl", () => {
-  it("opens Cases on the waiting queue over all time, nothing selected", () => {
+  it("opens Cases on the waiting queue over all time, every lane, nothing selected", () => {
     const url = caseQueueUrl("https://dashboard.test/?view=overview");
     expect(url.searchParams.get("view")).toBe("cases");
     expect(url.searchParams.get("status")).toBe("waiting");
     expect(url.searchParams.get("window")).toBe("all");
+    // FAILS ON REVERT: no lane in the address and the Cases screen opens one
+    // lane, under a count of every lane.
+    expect(url.searchParams.get("lane")).toBe("everything");
     expect(url.searchParams.get("case")).toBeNull();
   });
 

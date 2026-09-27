@@ -3,7 +3,8 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import type { CapabilityStatus, DashboardBootstrap, DashboardPosture, EvidenceRef, ProtectionLayer, ScopeRef } from "../api/v1";
 import { setTechnicalDetail } from "../components/TechnicalDetail";
-import { heldAssurance, Posture } from "./Posture";
+import { POSTURE_REFRESH_MS } from "../posture/refresh";
+import { bootstrapStillBacks, heldAssurance, HOLD_GRACE_MS, Posture, type HeldVerification } from "./Posture";
 
 /**
  * A control the host proved, on a page the reader leaves open.
@@ -115,8 +116,8 @@ function read(): DashboardPosture {
   return { schema_version: "innerwarden.dashboard.v1", generated_at: GENERATED, layers: [layer()], gaps: [] };
 }
 
-function chip(posture: DashboardPosture, evaluatedAt: string, current = true): string {
-  const html = renderToStaticMarkup(<Posture bootstrap={bootstrap} posture={posture} current={current} evaluatedAt={evaluatedAt} />);
+function chip(posture: DashboardPosture, evaluatedAt: string, current = true, reading: DashboardBootstrap = bootstrap): string {
+  const html = renderToStaticMarkup(<Posture bootstrap={reading} posture={posture} current={current} evaluatedAt={evaluatedAt} />);
   const list = html.slice(html.indexOf('aria-label="Host controls"'));
   const match = list.match(/<span class="shrink-0 font-medium opacity-80">([^<]*)<\/span>/);
   return match?.[1] ?? "";
@@ -156,28 +157,101 @@ describe("a proven control on a page left open", () => {
   });
 
   it("holds only what that read verified, never what it did not", () => {
-    const held = new WeakMap<DashboardPosture, Set<string>>();
+    const held = new WeakMap<DashboardPosture, Map<string, HeldVerification>>();
     const snapshot = read();
+    const at = { bootstrap, evaluatedAt: GENERATED };
+    const later = { bootstrap, evaluatedAt: "2026-07-18T12:00:40Z" };
     const withheld = { label: "Active claim withheld", status: "degraded", verifiedActive: false };
-    expect(heldAssurance(snapshot, layer(), withheld, true, held)).toEqual(withheld);
+    expect(heldAssurance(snapshot, layer(), withheld, true, at, held)).toEqual(withheld);
     const verified = { label: "Verified active enforcement", status: "active", verifiedActive: true };
-    expect(heldAssurance(snapshot, layer(), verified, true, held).verifiedActive).toBe(true);
-    expect(heldAssurance(snapshot, layer(), withheld, true, held).verifiedActive).toBe(true);
-    expect(heldAssurance(snapshot, { ...layer(), id: "another" }, withheld, true, held)).toEqual(withheld);
-    expect(heldAssurance(read(), layer(), withheld, true, held)).toEqual(withheld);
+    expect(heldAssurance(snapshot, layer(), verified, true, at, held).verifiedActive).toBe(true);
+    expect(heldAssurance(snapshot, layer(), withheld, true, later, held).verifiedActive).toBe(true);
+    expect(heldAssurance(snapshot, { ...layer(), id: "another" }, withheld, true, later, held)).toEqual(withheld);
+    expect(heldAssurance(read(), layer(), withheld, true, later, held)).toEqual(withheld);
   });
 
   /**
    * The row under the chips reads the same assurance: the disclosure never
-   * says the claim was withheld beside a chip that says it was proven.
+   * says the claim was withheld beside a chip that says it was proven. And
+   * a verification held from earlier in the read says when it was made,
+   * never a present tense.
    */
-  it("tells the chip, the row and the disclosure the same story", () => {
+  it("tells the chip, the row and the disclosure the same story, and says when it was verified", () => {
     const snapshot = read();
-    renderToStaticMarkup(<Posture bootstrap={bootstrap} posture={snapshot} current evaluatedAt={GENERATED} />);
+    const first = renderToStaticMarkup(<Posture bootstrap={bootstrap} posture={snapshot} current evaluatedAt={GENERATED} />);
+    expect(first).toContain(">Verified active enforcement<");
     const later = renderToStaticMarkup(<Posture bootstrap={bootstrap} posture={snapshot} current evaluatedAt="2026-07-18T12:00:40Z" />);
-    expect(later).toContain("Verified active enforcement");
+    expect(later).toContain("Active enforcement verified at ");
+    expect(later).not.toContain(">Verified active enforcement<");
     expect(later).not.toContain("Active claim withheld");
     expect(later).not.toContain("Containing, not proven");
+  });
+});
+
+/**
+ * A hold keeps a verification for as long as it could still be true on the
+ * read it was made on, and no longer. Each of these FAILS ON REVERT to a hold
+ * keyed on the posture object alone: that one kept "Protecting" under a
+ * bootstrap withdrawing the capability, two hours past the claim's expiry,
+ * and on a read that had stalled.
+ */
+describe("a held verification", () => {
+  /** The same bootstrap, the capability withdrawn: health failed, no claims. */
+  function withdrawn(): DashboardBootstrap {
+    return {
+      ...bootstrap,
+      generated_at: "2026-07-18T12:03:00Z",
+      capabilities: [{ ...capability(), health: "failed", availability: "degraded", claims: [] }],
+    };
+  }
+
+  it("ends at a new bootstrap read that withdraws the capability, on the same posture read", () => {
+    const snapshot = read();
+    expect(chip(snapshot, GENERATED)).toBe("Protecting");
+    expect(chip(snapshot, "2026-07-18T12:03:00Z", true, withdrawn())).toBe("Containing, not proven");
+    // And a new posture read under that bootstrap decides the same.
+    expect(chip(read(), "2026-07-18T12:03:00Z", true, withdrawn())).toBe("Containing, not proven");
+  });
+
+  it("survives a new bootstrap read that still backs the control", () => {
+    const snapshot = read();
+    expect(chip(snapshot, GENERATED)).toBe("Protecting");
+    const again = { ...bootstrap, generated_at: "2026-07-18T12:03:00Z", capabilities: [capability()] };
+    expect(chip(snapshot, "2026-07-18T12:03:00Z", true, again)).toBe("Protecting");
+  });
+
+  it("never outlives the claim's expiry", () => {
+    const snapshot = read();
+    expect(chip(snapshot, GENERATED)).toBe("Protecting");
+    // The claim expires at 13:00; the read is otherwise still being held.
+    const shortClaim = { ...bootstrap, capabilities: [{ ...capability(), claims: capability().claims.map((claim) => ({ ...claim, expires_at: "2026-07-18T12:02:00Z" })) }] };
+    const early = read();
+    expect(chip(early, GENERATED, true, shortClaim)).toBe("Protecting");
+    expect(chip(early, "2026-07-18T12:01:59Z", true, shortClaim)).toBe("Protecting");
+    expect(chip(early, "2026-07-18T12:02:01Z", true, shortClaim)).toBe("Containing, not proven");
+    expect(chip(snapshot, "2026-07-18T15:00:00Z")).toBe("Containing, not proven");
+  });
+
+  it("never outlives a poll and its grace, so a stalled read is not proof", () => {
+    const snapshot = read();
+    expect(chip(snapshot, GENERATED)).toBe("Protecting");
+    const edge = Date.parse(GENERATED) + POSTURE_REFRESH_MS + HOLD_GRACE_MS;
+    expect(chip(snapshot, new Date(edge).toISOString())).toBe("Protecting");
+    expect(chip(snapshot, new Date(edge + 1_000).toISOString())).toBe("Containing, not proven");
+    // Once lapsed it stays lapsed on that read.
+    expect(chip(snapshot, new Date(edge - 1_000).toISOString())).toBe("Containing, not proven");
+  });
+
+  it("reads a withdrawal the way the page's own check would", () => {
+    const now = Date.parse(GENERATED);
+    expect(bootstrapStillBacks(layer(), bootstrap, now)).toBe(true);
+    expect(bootstrapStillBacks(layer(), withdrawn(), now)).toBe(false);
+    expect(bootstrapStillBacks(layer(), { ...bootstrap, capabilities: [] }, now)).toBe(false);
+    expect(bootstrapStillBacks(layer(), { ...bootstrap, assurance_matrix: null }, now)).toBe(false);
+    expect(bootstrapStillBacks(layer(), bootstrap, Date.parse("2026-07-18T13:00:01Z"))).toBe(false);
+    for (const change of [{ rollout_state: "observing" }, { effective_mode: "observe" }, { bypass_classes: ["x"] }, { known_uncovered_paths: ["y"] }, { support: "partial" }]) {
+      expect(bootstrapStillBacks(layer(), { ...bootstrap, capabilities: [{ ...capability(), ...change } as CapabilityStatus] }, now), JSON.stringify(change)).toBe(false);
+    }
   });
 });
 

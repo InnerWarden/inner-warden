@@ -1,9 +1,11 @@
 import { useEffect, useState, type FormEvent, type ReactNode } from "react";
-import type { CaseSeverity } from "../api/cases";
+import type { CaseListWindow, CaseSeverity } from "../api/cases";
 import type { EffectiveMode, SecurityOutcome } from "../api/v1";
 import { isCaseLaneChoice, type CaseLaneChoice } from "../lanes";
+import { CASE_LIST_WINDOWS, windowWords } from "../windows";
 
-export type CaseWindow = "all" | "1h" | "24h" | "7d" | "30d";
+/** A span a Cases list is counted over: the spans the Cases API accepts. */
+export type CaseWindow = CaseListWindow;
 
 /**
  * The span Cases opens on when the address names none: the last 7 days, the
@@ -14,13 +16,7 @@ export type CaseWindow = "all" | "1h" | "24h" | "7d" | "30d";
 export const DEFAULT_CASE_WINDOW: CaseWindow = "7d";
 
 /** Each span a Cases list offers, in the words its controls print. */
-export const CASE_WINDOW_LABELS: Record<CaseWindow, string> = {
-  all: "All loaded time",
-  "1h": "Last hour",
-  "24h": "Last 24 hours",
-  "7d": "Last 7 days",
-  "30d": "Last 30 days",
-};
+export const CASE_WINDOW_LABELS: Record<CaseWindow, string> = windowWords("label");
 export type CaseScopeKind = "all" | "agent" | "host" | "workload" | "resource";
 /**
  * The queue, or one status. `waiting` is `needs_review` and `open` together:
@@ -113,7 +109,7 @@ const modes = ["disabled", "learning", "observe", "rehearse", "enforce", "unknow
 // session scopes into the `agent` filter, so a separate entry would fall back
 // to page-only client filtering and find LESS than `agent` already does.
 const scopeKinds = ["all", "agent", "host", "workload"] as const;
-const windows = ["all", "1h", "24h", "7d", "30d"] as const;
+const windows = CASE_LIST_WINDOWS;
 /** The spans, in the order every window control offers them. */
 export const CASE_WINDOWS: readonly CaseWindow[] = windows;
 
@@ -181,15 +177,17 @@ export function appliedCaseView(draft: CaseViewState): CaseViewState {
  * A new `value` from the screen replaces the draft, so a filter set anywhere
  * else (a link, Clear) is what the form shows.
  */
-export function CaseFilters({ value, disabled = false, onApply, onClear }: {
+export function CaseFilters({ value, disabled = false, onApply, onClear, hideWindow = false }: {
   value: CaseViewState;
   disabled?: boolean;
   onApply: (next: CaseViewState) => void;
   onClear: () => void;
+  /** See `CaseFiltersForm`. */
+  hideWindow?: boolean;
 }) {
   const [draft, setDraft] = useState(value);
   useEffect(() => setDraft(value), [value]);
-  return <CaseFiltersForm draft={draft} disabled={disabled} onDraft={setDraft} onApply={onApply} onClear={onClear} />;
+  return <CaseFiltersForm draft={draft} disabled={disabled} onDraft={setDraft} onApply={onApply} onClear={onClear} hideWindow={hideWindow} />;
 }
 
 /**
@@ -198,12 +196,21 @@ export function CaseFilters({ value, disabled = false, onApply, onClear }: {
  * `onApply`. Kept apart from the state so what each control does to the
  * draft can be exercised with the draft handed in.
  */
-export function CaseFiltersForm({ draft, disabled, onDraft: setDraft, onApply, onClear }: {
+export function CaseFiltersForm({ draft, disabled, onDraft: setDraft, onApply, onClear, hideWindow = false }: {
   draft: CaseViewState;
   disabled: boolean;
   onDraft: (update: (current: CaseViewState) => CaseViewState) => void;
   onApply: (next: CaseViewState) => void;
   onClear: () => void;
+  /**
+   * Leave the "Time window" select out of the form, for a screen that draws
+   * the window beside its lane tabs (`CaseLaneTabs` with `onWindowChange`).
+   * With both, the screen had two controls named "Time window" for one
+   * value: the one beside the tabs applied at once, and this one applied on
+   * Apply and could undo it. The draft still carries the window, so Apply
+   * keeps whatever the tabs chose.
+   */
+  hideWindow?: boolean;
 }) {
   const submit = (event: FormEvent) => {
     event.preventDefault();
@@ -296,9 +303,11 @@ export function CaseFiltersForm({ draft, disabled, onDraft: setDraft, onApply, o
             <option value="response_control">Response controls</option>
           </select>
         </label>
-        <FilterSelect label="Time window" value={draft.window} disabled={disabled} onChange={(window) => setDraft((current) => ({ ...current, window: window as CaseWindow }))}>
-          {CASE_WINDOWS.map((span) => <option key={span} value={span}>{CASE_WINDOW_LABELS[span]}</option>)}
-        </FilterSelect>
+        {hideWindow ? null : (
+          <FilterSelect label="Time window" value={draft.window} disabled={disabled} onChange={(window) => setDraft((current) => ({ ...current, window: window as CaseWindow }))}>
+            {CASE_WINDOWS.map((span) => <option key={span} value={span}>{CASE_WINDOW_LABELS[span]}</option>)}
+          </FilterSelect>
+        )}
         <FilterSelect label="Scope type" value={draft.scopeKind} disabled={disabled} onChange={(scopeKind) => setDraft((current) => ({ ...current, scopeKind: scopeKind as CaseScopeKind, scopeId: scopeKind === "all" ? "" : current.scopeId }))}>
           <option value="all">All scopes</option>
           <option value="agent">Agent</option>

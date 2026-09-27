@@ -45,6 +45,11 @@ describe("the split of a card's number", () => {
       [{ key: "a", count: 1.5, label: "x" }, { key: "b", count: 0.5, label: "y" }],
       [{ key: "a", count: 2, label: "" }],
       [{ key: "a", count: 2, label: "bad\u0007label" }],
+      // A C1 control, and a right to left override that would reorder the
+      // words printed after it.
+      [{ key: "a", count: 2, label: "bad\u0085label" }],
+      [{ key: "a", count: 2, label: "refused \u202Enur ot\u202C" }],
+      [{ key: "a", count: 2, label: "isolated \u2067x\u2069" }],
       [{ key: "a", count: 1, label: "x" }, { key: "a", count: 1, label: "y" }],
       ["a", "b"],
       [],
@@ -71,5 +76,21 @@ describe("the split of a card's number", () => {
     expect(html).toContain(">stopped by the kernel<");
     expect(html).not.toContain("may have run<");
     expect(html.indexOf("data-lane-count")).toBeLessThan(html.indexOf("data-lane-breakdown"));
+  });
+
+  /**
+   * A split that adds up because every part is zero, under a card of zero,
+   * is a valid answer with nothing to draw.
+   *
+   * FAILS ON REVERT: draw the list around the filter and an empty list with
+   * its margin is announced as a list of no items.
+   */
+  it("draws no list at all when no part has anything in it", () => {
+    const empty = [{ key: "refused_before_run", count: 0, label: "refused before they ran" }];
+    expect(laneBreakdown(empty, 0)).toEqual(empty);
+    const card = parseLaneCard("agent_actions", { ...agent, count: 0, breakdown: empty }) as LaneCard;
+    const html = renderToStaticMarkup(<LaneCards cards={[card]} edition="enterprise" />);
+    expect(html).not.toContain("data-lane-breakdown");
+    expect(html).not.toContain("<ul");
   });
 });

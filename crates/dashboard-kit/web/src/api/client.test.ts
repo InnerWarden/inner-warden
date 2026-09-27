@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { DashboardV1Client, retainDashboardResource, type DashboardResource } from "./client";
+import { DashboardCasesClient } from "./cases";
 
 const bootstrap = {
   schema_version: "innerwarden.dashboard.v1",
@@ -119,5 +120,43 @@ describe("DashboardV1Client", () => {
         retryAfterSeconds: null,
       },
     })).toMatchObject({ state: "stale", data: bootstrap, problem: { code: "adapter_unavailable" } });
+  });
+});
+
+
+/**
+ * A request that never answers is a failure, not a wait. The screens poll
+ * with an in-flight guard, so one hung request held every later poll back,
+ * and Protection went on holding a verification made on a read it could no
+ * longer renew.
+ *
+ * FAILS ON REVERT: fetch without a deadline and these never settle.
+ */
+describe("a dashboard request that never answers", () => {
+  /** A fetch that answers only by rejecting when its signal aborts. */
+  function hanging(): typeof fetch {
+    return ((_url: string, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+    })) as unknown as typeof fetch;
+  }
+
+  it("is reported as unavailable when it runs past the deadline, so the page turns stale", async () => {
+    const result = await new DashboardV1Client(hanging(), 20).getPosture();
+    expect(result).toMatchObject({ state: "unavailable", problem: { code: "request_timed_out", endpoint: "posture", retryable: true } });
+    const previous: DashboardResource<{ n: number }> = { state: "ready", data: { n: 1 } };
+    expect(retainDashboardResource(previous, result as never).state).toBe("stale");
+    await expect(new DashboardCasesClient(hanging(), 20).get("case:1")).resolves.toMatchObject({ problem: { code: "request_timed_out" } });
+  });
+
+  it("still hands the caller's own abort back to the caller", async () => {
+    const controller = new AbortController();
+    const pending = new DashboardV1Client(hanging(), 10_000).getBootstrap(controller.signal);
+    controller.abort("dashboard-unmount");
+    await expect(pending).rejects.toBeDefined();
+  });
+
+  it("does not time out an answer that arrived in time", async () => {
+    const client = new DashboardV1Client((async () => jsonResponse(bootstrap)) as unknown as typeof fetch, 20);
+    await expect(client.getBootstrap()).resolves.toMatchObject({ state: "ready" });
   });
 });

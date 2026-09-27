@@ -95,6 +95,7 @@ export function StatusBadge({
   tone,
   className = "",
   labelClassName = "",
+  title,
 }: {
   status: string;
   label?: string;
@@ -102,6 +103,8 @@ export function StatusBadge({
   className?: string;
   /** Classes for the label alone, e.g. to keep it for screen readers only on a narrow screen. */
   labelClassName?: string;
+  /** Said on hover, for a badge whose words are hidden on a narrow screen. */
+  title?: string;
 }) {
   const presentation = statusPresentation(status, label, tone);
   const classes: Record<StatusTone, string> = {
@@ -115,6 +118,7 @@ export function StatusBadge({
   return (
     <span
       data-status={status}
+      title={title}
       className={`inline-flex w-fit max-w-full items-start gap-1.5 rounded-md border px-2.5 py-1 text-xs font-semibold leading-4 ${classes[presentation.tone]} ${className}`}
     >
       <span className="shrink-0 font-bold" aria-hidden="true">{presentation.symbol}</span>

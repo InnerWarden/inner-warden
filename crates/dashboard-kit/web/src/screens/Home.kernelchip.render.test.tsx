@@ -2,7 +2,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 
 import type { DecisionSummary } from "../api";
-import { kernelStopped, kernelStoppedLabel, RecentActivity } from "./Home";
+import { KERNEL_STOPPED_OUTCOME, kernelStopped, kernelStoppedDetail, kernelStoppedLabel, RecentActivity } from "./Home";
 
 /**
  * THE DEFECT THIS PINS
@@ -53,5 +53,39 @@ describe("a decision the kernel stopped part of", () => {
     expect(kernelStoppedLabel("/usr/bin/sudo")).toBe("The kernel stopped sudo");
     expect(kernelStoppedLabel("sudo")).toBe("The kernel stopped sudo");
     expect(kernelStoppedLabel("/opt/tool/")).toBe("The kernel stopped tool");
+  });
+});
+
+/**
+ * One row read a green "Allowed", "Allowed to run" and "The kernel stopped
+ * nc": the rule engine's verdict as the outcome, and the kernel's refusal as
+ * a footnote. What finally happened is the kernel's refusal, so it is the
+ * row's one outcome, and the verdict before it is said as what came first.
+ *
+ * FAILS ON REVERT: print the verdict pill and the outcome chip as before and
+ * the row says "Allowed" twice beside a refusal.
+ */
+describe("the one outcome of a decision the kernel stopped", () => {
+  it("is Stopped by the kernel, with no allowed pill or chip beside it", () => {
+    const html = render({ ...allowed, command: "nc -zv 1.1.1.1 443", kernel_stopped: "/usr/bin/nc" });
+    expect(html).toContain(`data-final-outcome="kernel_stopped"`);
+    expect(html).toContain(`>${KERNEL_STOPPED_OUTCOME}</span>`);
+    expect(html).not.toContain(">Allowed<");
+    expect(html).not.toContain("Allowed to run");
+    expect(html).toContain("The kernel stopped nc at exec; the rule engine had allowed it.");
+  });
+
+  it("says what came before in the verdict's own words", () => {
+    expect(kernelStoppedDetail({ recommendation: "deny", decided_by: "warden" }, "/usr/bin/curl")).toBe("The kernel stopped curl at exec; the on-device Warden had judged it unsafe.");
+    expect(kernelStoppedDetail({ recommendation: "review", decided_by: "graph" }, "wget")).toBe("The kernel stopped wget at exec; the session graph had flagged it for review.");
+    expect(kernelStoppedDetail({ recommendation: "allow", decided_by: "unknown" }, "nc")).toBe("The kernel stopped nc at exec; the guardrail had allowed it.");
+    expect(kernelStoppedDetail({ recommendation: undefined, decided_by: "rules" }, "nc")).toBe("The kernel stopped nc at exec.");
+  });
+
+  it("leaves a decision the kernel did not touch as it was", () => {
+    const html = render(allowed);
+    expect(html).toContain(">Allowed<");
+    expect(html).toContain("Allowed to run");
+    expect(html).not.toContain(KERNEL_STOPPED_OUTCOME);
   });
 });

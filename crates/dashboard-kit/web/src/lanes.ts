@@ -1,5 +1,7 @@
 import { CASE_LANES, isCaseLane, type CaseLane, type CaseLaneCounts } from "./api/lanes";
 import type { CaseListWindow } from "./api/cases";
+import { hasControlCharacters } from "./presentation";
+import { isCaseListWindow, windowWords, withinWindow } from "./windows";
 
 /**
  * Three questions, one place each.
@@ -70,15 +72,7 @@ export const EVERYTHING_COPY = {
 } as const;
 
 /** What the card's small print says about the span its number covers. */
-export const LANE_WINDOW_PHRASE: Record<CaseListWindow, string> = {
-  "1h": "in the last hour",
-  "24h": "in the last 24 hours",
-  "7d": "in the last 7 days",
-  "30d": "in the last 30 days",
-  all: "in everything this host has kept",
-};
-
-const WINDOWS: readonly CaseListWindow[] = ["1h", "24h", "7d", "30d", "all"];
+export const LANE_WINDOW_PHRASE: Record<CaseListWindow, string> = windowWords("during");
 
 /**
  * What a card's number counts, as the host names it (`count_of`): the noun
@@ -201,7 +195,7 @@ export function laneBreakdown(value: unknown, total: number): LanePart[] | undef
     const count = wholeCount(item.count);
     const label = text(item.label, PART_LABEL_MAX);
     if (key === undefined || count === undefined || label === undefined || keys.has(key)) return undefined;
-    if (/[\u0000-\u001f\u007f]/.test(label)) return undefined;
+    if (hasControlCharacters(label)) return undefined;
     keys.add(key);
     sum += count;
     parts.push({ key, count, label });
@@ -217,6 +211,21 @@ function latestOf(value: unknown): LaneLatest | undefined {
   if (title === undefined || at === undefined) return undefined;
   const caseId = text(item.case_id, CASE_ID_MAX);
   return caseId === undefined ? { title, at } : { title, at, caseId };
+}
+
+/**
+ * The span a card's newest case opens in: the card's own span when the case
+ * is inside it, and every day when it is not.
+ *
+ * Opening the newest case in the card's span puts it in the list beside it,
+ * the list the card described. Nothing makes the host's newest case fall in
+ * that span, though (a walk found a 7 September case under "7 days"), and a
+ * case opened over a list that does not hold it is the broken link a reader
+ * reports: the detail opens, and nothing beside it is the case. So the span
+ * travels only when the case's time is in it.
+ */
+export function latestCaseWindow(latest: Pick<LaneLatest, "at">, window: CaseListWindow, now: number): CaseListWindow {
+  return withinWindow(latest.at, window, now) ? window : "all";
 }
 
 /**
@@ -240,7 +249,7 @@ export function parseLaneCard(lane: CaseLane, value: unknown): LaneCard | undefi
   if (item.availability === "no_source") return { lane, state: "no_source", sentence };
   if (item.availability !== "available") return undefined;
   const count = wholeCount(item.count);
-  const window = WINDOWS.find((candidate) => candidate === item.window);
+  const window = isCaseListWindow(item.window) ? item.window : undefined;
   if (count === undefined || window === undefined) return undefined;
   const card: LaneCard = { lane, state: "available", count, window, sentence };
   const countOf = LANE_COUNT_OF.find((candidate) => candidate === item.count_of);

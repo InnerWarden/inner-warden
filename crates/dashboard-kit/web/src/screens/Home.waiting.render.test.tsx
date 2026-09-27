@@ -3,7 +3,9 @@ import { describe, expect, it } from "vitest";
 
 import type { Overview } from "../api";
 import { caseQueueUrl } from "../App";
-import { OverviewScreen, WaitingLine, waitingCount, waitingLine, type QueueOpenOptions } from "./Home";
+import { OverviewScreen, WaitingLine, waitingAcrossLanes, waitingCount, waitingLine, type QueueOpenOptions } from "./Home";
+import { readCaseViewState } from "../components/CaseFilters";
+import { laneParameter, type LaneCard } from "../lanes";
 import hostWaitingOverview from "../../tests/fixtures/enterprise/overview-host-waiting.json";
 import serverLanesOverview from "../../tests/fixtures/enterprise/overview-lanes.json";
 
@@ -65,6 +67,7 @@ describe("the waiting line", () => {
     expect(waitingLine({ count: 145, window: "all", today: 1 })).toEqual({
       tone: "waiting",
       title: "145 cases are waiting on you",
+      span: "Counted over all time.",
       body: "1 arrived today; 144 more are from earlier days.",
       through: { label: "See the 145 waiting cases", window: "all" },
     });
@@ -74,19 +77,37 @@ describe("the waiting line", () => {
     expect(waitingLine({ count: 3, window: "all" }).body).toBeUndefined();
   });
 
-  it("says one case in the singular, and names the span when it is not every day", () => {
+  it("says one case in the singular", () => {
     expect(waitingLine({ count: 1, window: "7d", today: 0 })).toEqual({
       tone: "waiting",
-      title: "1 case from the last 7 days is waiting on you",
+      title: "1 case is waiting on you",
+      span: "Counted over the last 7 days.",
       body: "It is from an earlier day.",
       through: { label: "See the waiting case", window: "7d" },
     });
-    expect(waitingLine({ count: 1_298, window: "24h" }).title).toBe("1,298 cases from the last 24 hours are waiting on you");
+    expect(waitingLine({ count: 1_298, window: "24h" }).title).toBe("1,298 cases are waiting on you");
+  });
+
+  /**
+   * A count over all time read "145 cases are waiting on you" with no span,
+   * under cards that each say "in the last 7 days", so the page showed two
+   * counts that seemed to disagree and did not say why. Every span is named,
+   * all time included, in the one set of words every window control uses.
+   *
+   * FAILS ON REVERT: name no span for all time and the line reads as a count
+   * of the cards' week.
+   */
+  it("names the span it was counted over, every span, all time included", () => {
+    expect(waitingLine({ count: 145, window: "all" }).span).toBe("Counted over all time.");
+    expect(waitingLine({ count: 3, window: "1h" }).span).toBe("Counted over the last hour.");
+    expect(waitingLine({ count: 3, window: "30d" }).span).toBe("Counted over the last 30 days.");
+    const html = renderToStaticMarkup(<WaitingLine overview={{ ...withAddresses, waiting: { count: 145, window: "all", today: 1 } }} />);
+    expect(html).toContain("Counted over all time.");
   });
 
   it("is calm and offers no empty list when nothing waits", () => {
-    expect(waitingLine({ count: 0, window: "all" })).toEqual({ tone: "quiet", title: "Nothing is waiting on you", body: "No case on this host needs a person." });
-    expect(waitingLine({ count: 0, window: "7d" }).body).toBe("No case from the last 7 days needs a person.");
+    expect(waitingLine({ count: 0, window: "all" })).toEqual({ tone: "quiet", title: "Nothing is waiting on you", span: "Counted over all time.", body: "No case on this host needs a person." });
+    expect(waitingLine({ count: 0, window: "7d" }).span).toBe("Counted over the last 7 days.");
   });
 });
 
@@ -114,7 +135,16 @@ describe("on the Overview", () => {
    * FAILS ON REVERT: open the queue without the span and a 7-day count opens
    * every day's list.
    */
-  it("opens exactly the list it counted", () => {
+  /**
+   * The count is every lane's, so the list it opens is every lane's:
+   * `lane=everything`. With no lane in the address the Cases screen opens
+   * ONE lane (the one last used, or the agent's or the server's), and "See
+   * the 145 waiting cases" listed one lane's waiting cases under a count of
+   * all of them.
+   *
+   * FAILS ON REVERT: leave the lane out and the Cases screen picks one.
+   */
+  it("opens exactly the list it counted: the waiting filter, every lane, the server's span", () => {
     const opened: (QueueOpenOptions | undefined)[] = [];
     const tree = WaitingLine({ overview: { ...withAddresses, waiting: { count: 4, window: "7d" } }, onOpenQueue: (options) => void opened.push(options) });
     const [link] = buttons(tree);
@@ -123,12 +153,69 @@ describe("on the Overview", () => {
     const url = caseQueueUrl("https://dashboard.test/?view=overview", "7d");
     expect(url.searchParams.get("status")).toBe("waiting");
     expect(url.searchParams.get("window")).toBe("7d");
+    expect(url.searchParams.get("lane")).toBe("everything");
+    // What the Cases screen reads back from that address: every case.
+    const view = readCaseViewState(url.search);
+    expect(view.lane).toBe("everything");
+    expect(laneParameter(view.lane as "everything")).toBe("");
     expect(caseQueueUrl("https://dashboard.test/?view=overview").searchParams.get("window")).toBe("all");
+    expect(caseQueueUrl("https://dashboard.test/?view=cases&lane=server_attacks").searchParams.get("lane")).toBe("everything");
   });
 
   it("offers no link without a Cases screen", () => {
     const html = renderToStaticMarkup(<WaitingLine overview={{ ...withAddresses, waiting: { count: 4, window: "7d" } }} />);
-    expect(html).toContain("4 cases from the last 7 days are waiting on you");
+    expect(html).toContain("4 cases are waiting on you");
+    expect(html).toContain("Counted over the last 7 days.");
     expect(html).not.toContain("<button");
+  });
+});
+
+/**
+ * The line counts every lane; each card's chip counts its own lane in its
+ * card's span. A new server read "3 cases ... are waiting on you" over one
+ * "2 waiting on you" chip, and nothing said where the third one was.
+ */
+describe("the waiting count beside the lane cards", () => {
+  const card = (lane: "agent_messages" | "agent_actions" | "server_attacks", waiting: number | undefined, window: "7d" | "all" = "7d"): LaneCard => ({
+    lane, state: "available", count: 10, window, sentence: "x", ...(waiting === undefined ? {} : { waiting }),
+  });
+
+  /**
+   * FAILS ON REVERT: compare nothing and the third case is unaccounted for.
+   */
+  it("says how many are outside the lanes when the chips add up to less", () => {
+    const cards = [card("agent_messages", 0), card("agent_actions", 2), card("server_attacks", 0)];
+    expect(waitingAcrossLanes({ count: 3, window: "7d" }, cards)).toBe("1 more is outside the lanes above.");
+    expect(waitingAcrossLanes({ count: 5, window: "7d" }, cards)).toBe("3 more are outside the lanes above.");
+    const html = renderToStaticMarkup(<WaitingLine overview={{ ...withAddresses, waiting: { count: 3, window: "7d" } }} cards={cards} />);
+    expect(html).toContain("1 more is outside the lanes above.");
+  });
+
+  it("says which span the cards count when it is not the count's", () => {
+    const cards = [card("agent_messages", 0), card("agent_actions", 2), card("server_attacks", 1)];
+    expect(waitingAcrossLanes({ count: 145, window: "all" }, cards)).toBe("The cards above count the last 7 days.");
+  });
+
+  it("says nothing it cannot back", () => {
+    const even = [card("agent_messages", 1), card("agent_actions", 2), card("server_attacks", 0)];
+    expect(waitingAcrossLanes({ count: 3, window: "7d" }, even)).toBeUndefined();
+    // The server's lane sent no waiting count: nothing to add up.
+    expect(waitingAcrossLanes({ count: 3, window: "7d" }, [card("agent_actions", 2), card("server_attacks", undefined)])).toBeUndefined();
+    // Chips beyond the total: this page cannot say why.
+    expect(waitingAcrossLanes({ count: 1, window: "7d" }, even)).toBeUndefined();
+    // Cards over mixed spans: the intro already says so.
+    expect(waitingAcrossLanes({ count: 3, window: "7d" }, [card("agent_actions", 2), card("server_attacks", 0, "all")])).toBeUndefined();
+    expect(waitingAcrossLanes({ count: 0, window: "7d" }, [card("agent_actions", 0)])).toBeUndefined();
+    expect(waitingAcrossLanes({ count: 3, window: "7d" }, undefined)).toBeUndefined();
+  });
+
+  it("is drawn on the lanes Overview from the cards above it", () => {
+    // The fixture's cards count different spans, which the intro says; here
+    // every card counts the last 7 days.
+    const lanes = structuredClone(serverLanesOverview.lanes) as Record<string, Record<string, unknown>>;
+    for (const lane of Object.values(lanes)) lane.window = "7d";
+    const html = render({ ...withAddresses, lanes, waiting: { count: 145, window: "all", today: 1 } } as unknown as Overview);
+    expect(html).toContain("The cards above count the last 7 days.");
+    expect(render({ ...withAddresses, waiting: { count: 145, window: "all", today: 1 } })).not.toContain("The cards above count");
   });
 });

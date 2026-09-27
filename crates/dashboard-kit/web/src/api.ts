@@ -1,3 +1,4 @@
+import { DASHBOARD_FETCH_TIMEOUT_MS, requestDeadline } from "./api/client";
 // The shape the thin Rust API (`innerwarden dashboard`) serves. Newer binaries
 // add posture and outcome evidence; every addition stays optional so the UI also
 // works with the original graph-only contract.
@@ -378,12 +379,23 @@ export type CasesQuery = {
 };
 
 async function get<T>(path: string): Promise<T> {
-  const r = await fetch(path, { cache: "no-store" });
-  if (!r.ok) {
-    const payload = await r.json().catch(() => undefined) as { error?: string } | undefined;
-    throw new Error(payload?.error ?? `${path}: ${r.status}`);
+  // Bounded like every dashboard request (`DASHBOARD_FETCH_TIMEOUT_MS`): the
+  // Overview polls with an in-flight guard, and one request that never
+  // answered held every later poll back while the page kept its last answer.
+  const deadline = requestDeadline(undefined, DASHBOARD_FETCH_TIMEOUT_MS);
+  try {
+    const r = await fetch(path, { cache: "no-store", signal: deadline.signal });
+    if (!r.ok) {
+      const payload = await r.json().catch(() => undefined) as { error?: string } | undefined;
+      throw new Error(payload?.error ?? `${path}: ${r.status}`);
+    }
+    return await r.json();
+  } catch (error) {
+    if (deadline.timedOut()) throw new Error(`${path}: no answer in time`);
+    throw error;
+  } finally {
+    deadline.done();
   }
-  return r.json();
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

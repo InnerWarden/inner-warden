@@ -239,12 +239,14 @@ function datum(layer: Locator, label: string) {
 }
 
 async function enterpriseClaimLanguage(page: Page) {
+  // The row is titled by the product name, with the general words on the
+  // line under it; `boundary` reads that line, so the snapshot keeps them.
   const layer = page.getByRole("article").filter({
-    has: page.getByRole("heading", { name: "Independent host execution control" }),
+    has: page.getByRole("heading", { name: "Execution Gate" }),
   });
   return {
     edition: await normalizedText(page.getByText("Enterprise", { exact: true }).first()),
-    boundary: await normalizedText(layer.getByRole("heading", { name: "Independent host execution control" })),
+    boundary: await normalizedText(layer.getByRole("heading", { name: "Execution Gate" }).locator("xpath=following-sibling::p[1]")),
     assurance: await normalizedText(layer.locator("[data-status]").first()),
     effectiveMode: await datum(layer, "Effective mode"),
     freshness: await datum(layer, "Freshness"),

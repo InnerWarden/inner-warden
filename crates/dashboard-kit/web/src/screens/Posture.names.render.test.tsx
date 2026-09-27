@@ -2,7 +2,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 
 import type { DashboardBootstrap, DashboardPosture, ProtectionLayer } from "../api/v1";
-import { capabilityName, controlName, humanize, Posture } from "./Posture";
+import { capabilityName, controlName, dispositionReason, humanize, Posture, unconfirmedLine, withProductName } from "./Posture";
 
 /**
  * The site sells Execution Gate, Secret Read Guard and DNS Guard. Protection
@@ -109,5 +109,106 @@ describe("the names on Protection", () => {
     expect(humanize("dns_resolution_control")).toBe("DNS resolution control");
     expect(humanize("mcp.tool_calls")).toBe("MCP tool calls");
     expect(humanize("")).toBe("Unknown");
+  });
+});
+
+/**
+ * Exactly the six ids the host sends for the three products. Three more
+ * (`host_execution_layer`, `secret_guard_layer`, `dns_guard_layer`) existed
+ * only in this repository's own fixtures.
+ *
+ * FAILS ON REVERT: keep the alias ids and a layer no host sends is named.
+ */
+describe("the ids that carry a product name", () => {
+  it("are the host's six, and nothing else", () => {
+    for (const alias of ["host_execution_layer", "secret_guard_layer", "dns_guard_layer"]) {
+      expect(controlName(layer(alias, "something_else", "Plain label")).name, alias).toBe("Plain label");
+    }
+    for (const [id, name] of [
+      ["independent_host_execution", "Execution Gate"], ["kernel_execution_control", "Execution Gate"],
+      ["secret_access_control", "Secret Read Guard"], ["secret_read_guard", "Secret Read Guard"],
+      ["dns_resolution_control", "DNS Guard"], ["dns_guard", "DNS Guard"],
+    ]) {
+      expect(controlName(layer("x", id, "Plain label")).name, id).toBe(name);
+    }
+  });
+
+  it("draws one chip per layer, even for two layers of one product", () => {
+    const posture: DashboardPosture = {
+      schema_version: "innerwarden.dashboard.v1",
+      generated_at: "2026-07-18T12:00:01Z",
+      layers: [layer("independent_host_execution", "kernel_execution_control", "A"), layer("second_gate", "kernel_execution_control", "B")],
+      gaps: [],
+    };
+    const html = renderToStaticMarkup(<Posture bootstrap={bootstrap} posture={posture} current evaluatedAt="2026-07-18T12:00:01Z" />);
+    const chips = html.slice(html.indexOf('aria-label="Host controls"'), html.indexOf("posture-controls-title"));
+    expect(chips.match(/>Execution Gate<\/span>/g)).toHaveLength(2);
+  });
+});
+
+/**
+ * The card's title said "Execution Gate" and the host's sentence under it
+ * began "Independent host execution is blocking...": one card, one control,
+ * two names.
+ *
+ * FAILS ON REVERT: print the host's sentence as sent and the generic name is
+ * back under the product name.
+ */
+describe("the host's sentence under a product name", () => {
+  it("calls the control by its product name where the sentence opens with the host's label", () => {
+    const gate = { ...layer("independent_host_execution", "kernel_execution_control", "Independent host execution"), disposition_reason: "Independent host execution is blocking unlisted programs for 1 agent." };
+    expect(dispositionReason(gate)).toBe("Execution Gate is blocking unlisted programs for 1 agent.");
+    const dns = { ...layer("dns_resolution_control", "dns_resolution_control", "DNS resolution control"), disposition: "cannot_verify" as const, disposition_reason: "DNS resolution control could not be read on this host." };
+    expect(dispositionReason(dns)).toBe("DNS Guard could not be read on this host.");
+    // The general words under the title count as the control's name too.
+    expect(withProductName("Secret access control is set up.", layer("secret_access_control", "secret_access_control", "Secrets"))).toBe("Secret Read Guard is set up.");
+  });
+
+  it("touches nothing else", () => {
+    const gate = layer("independent_host_execution", "kernel_execution_control", "Independent host execution");
+    expect(withProductName("The kernel checks independent host execution on exec.", gate)).toBe("The kernel checks independent host execution on exec.");
+    expect(withProductName("Independent host executions are counted.", gate)).toBe("Independent host executions are counted.");
+    // A control with no product name keeps the host's words.
+    expect(withProductName("Host visibility is reporting.", layer("host_visibility", "host_visibility", "Host visibility"))).toBe("Host visibility is reporting.");
+  });
+});
+
+/**
+ * "Coverage gaps: No gaps reported by the host controls above" sat under
+ * "DNS Guard · Can't confirm · never checked", and a buyer read it as: the
+ * DNS Guard I paid for is unchecked, and there are no gaps.
+ *
+ * FAILS ON REVERT: read `posture.gaps` alone and the section says there are
+ * no gaps under a control the page cannot confirm.
+ */
+describe("the coverage gaps section", () => {
+  const checked = { observed_at: "2026-07-18T12:00:00Z", budget_seconds: 30, state: "fresh" as const, age_seconds: 1 };
+  const visible = { ...layer("host_visibility", "host_visibility", "Host visibility"), freshness: checked };
+  const dns = { ...layer("dns_resolution_control", "dns_resolution_control", "DNS resolution control"), disposition: "cannot_verify" as const, effective_mode: "unknown" as const };
+  const gaps = (layers: ProtectionLayer[]) => {
+    const html = renderToStaticMarkup(<Posture bootstrap={bootstrap} posture={{ schema_version: "innerwarden.dashboard.v1", generated_at: "2026-07-18T12:00:01Z", layers, gaps: [] }} current evaluatedAt="2026-07-18T12:00:01Z" />);
+    return html.slice(html.indexOf('id="posture-gaps-title"'));
+  };
+
+  it("names a control it can't confirm as a gap, and does not say there are none", () => {
+    const html = gaps([visible, dns]);
+    expect(html).toContain("1 control we can&#x27;t confirm: DNS Guard. We will not claim it either way.");
+    expect(html).not.toContain("No gaps");
+  });
+
+  it("counts a control claimed as working that was never checked", () => {
+    const html = gaps([visible, layer("secret_access_control", "secret_access_control", "Secret access control"), dns]);
+    expect(html).toContain("2 controls we can&#x27;t confirm: Secret Read Guard and DNS Guard. We will not claim them either way.");
+  });
+
+  it("does not count a control that is off, and says no gaps only when every control is known", () => {
+    const off = { ...layer("dns_resolution_control", "dns_resolution_control", "DNS resolution control"), disposition: "not_enabled" as const, effective_mode: "disabled" as const, desired_mode: "disabled" as const };
+    const html = gaps([visible, off]);
+    expect(html).toContain("No gaps reported by the host controls above.");
+    expect(html).not.toContain("can&#x27;t confirm:");
+  });
+
+  it("lists three or more in plain words", () => {
+    expect(unconfirmedLine(["A", "B", "C"])).toBe("3 controls we can't confirm: A, B and C. We will not claim them either way.");
   });
 });

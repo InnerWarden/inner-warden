@@ -14,9 +14,10 @@ import type {
   ScopeRef,
 } from "../api/v1";
 import { StatusBadge } from "../components/StatusBadge";
-import { TechnicalOnly } from "../components/TechnicalDetail";
+import { setTechnicalDetail, TechnicalOnly, useTechnicalDetail } from "../components/TechnicalDetail";
 import { formatClock, freshnessLabel, timeTitle } from "../presentation";
 import { layerAssuranceLabel, type LayerAssuranceLabel } from "../posture/assurance";
+import { POSTURE_REFRESH_MS } from "../posture/refresh";
 
 // ─────────────────────────── user-facing projections ─────────────────────────
 //
@@ -147,7 +148,7 @@ export function dispositionReason(
 ): string {
   const effective = shown ?? dispositionOf(layer);
   if (layer.disposition_reason && effective === dispositionOf(layer)) {
-    return agreeWithControls(layer.disposition_reason);
+    return agreeWithControls(withProductName(layer.disposition_reason, layer));
   }
   // The name the reader bought, where the control has one.
   const label = controlName({ id: layer.id ?? "", label: layer.label, capability_ids: layer.capability_ids ?? [] }).name;
@@ -252,19 +253,22 @@ export function claimSoftened(
  */
 export type ControlName = { name: string; description?: string };
 
+// Exactly the six ids the paid host sends for these three controls, a layer
+// id and a capability id each: an id no host sends is a name this page could
+// hand out to something it does not know.
 const PRODUCT_NAMES: readonly { ids: readonly string[]; name: string; description: string }[] = [
   {
-    ids: ["independent_host_execution", "kernel_execution_control", "host_execution_layer"],
+    ids: ["independent_host_execution", "kernel_execution_control"],
     name: "Execution Gate",
     description: "Independent host execution control",
   },
   {
-    ids: ["secret_access_control", "secret_read_guard", "secret_guard_layer"],
+    ids: ["secret_access_control", "secret_read_guard"],
     name: "Secret Read Guard",
     description: "Secret access control",
   },
   {
-    ids: ["dns_resolution_control", "dns_guard", "dns_guard_layer"],
+    ids: ["dns_resolution_control", "dns_guard"],
     name: "DNS Guard",
     description: "DNS resolution control",
   },
@@ -277,6 +281,34 @@ function productFor(ids: readonly string[]): (typeof PRODUCT_NAMES)[number] | un
 export function controlName(layer: Pick<ProtectionLayer, "id" | "label" | "capability_ids">): ControlName {
   const product = productFor([layer.id, ...layer.capability_ids]);
   return product === undefined ? { name: layer.label } : { name: product.name, description: product.description };
+}
+
+/**
+ * The host's sentence about a control, with the control called by the name
+ * on its card.
+ *
+ * The card's title says "Execution Gate" and the host's sentence under it
+ * began "Independent host execution is blocking...", so one card named the
+ * control twice, two ways. Where the sentence OPENS with the host's label
+ * for the control (or the general words under the title), that opening is
+ * the control's name and is written as the product name. Nothing else in
+ * the sentence is touched, and a control with no product name keeps the
+ * host's words.
+ */
+export function withProductName(
+  sentence: string,
+  layer: Pick<ProtectionLayer, "label"> & Partial<Pick<ProtectionLayer, "id" | "capability_ids">>,
+): string {
+  const product = productFor([layer.id ?? "", ...(layer.capability_ids ?? [])]);
+  if (product === undefined) return sentence;
+  const lead = sentence.trimStart();
+  for (const phrase of [layer.label, product.description].map((value) => value.trim()).filter((value) => value !== "")) {
+    if (lead.length < phrase.length || lead.slice(0, phrase.length).toLowerCase() !== phrase.toLowerCase()) continue;
+    // A whole phrase only: "DNS resolution controller" is not "DNS resolution control".
+    if (/^[\p{L}\p{N}_]/u.test(lead.slice(phrase.length))) continue;
+    return `${product.name}${lead.slice(phrase.length)}`;
+  }
+  return sentence;
 }
 
 /** A capability by the product name it belongs to, or its id in words. */
@@ -404,22 +436,82 @@ export function controlPill(
   };
 }
 
-/** The assurance a control holds once this page verified it on a read. */
-const HELD_VERIFIED: LayerAssuranceLabel = { label: "Verified active enforcement", status: "active", verifiedActive: true };
+/**
+ * How long past the posture poll a verification may be held while the next
+ * read is on its way: a read in flight, or a poll that fired a little late.
+ * Past it the page has no current proof, and the chip says so.
+ */
+export const HOLD_GRACE_MS = 60_000;
+
+/** One verification this page made on a read, and what it may be held against. */
+export type HeldVerification = {
+  /** The bootstrap read the verification was made with. */
+  bootstrap: DashboardBootstrap;
+  /** The consumer's clock the last time the read verified it. */
+  at: number;
+  /** When the hold lapses: a poll and its grace later, or the claim's expiry. */
+  until: number;
+};
 
 /**
  * Which controls were verified on each posture READ, by the read itself.
  *
  * Keyed on the snapshot object: the shell keeps one object per successful
  * read (a re-read, even of identical bytes, is a new object), so a hold lasts
- * exactly as long as the read it was made on, and survives the reader leaving
+ * at most as long as the read it was made on, and survives the reader leaving
  * the screen and coming back.
  */
-const heldByRead = new WeakMap<DashboardPosture, Set<string>>();
+const heldByRead = new WeakMap<DashboardPosture, Map<string, HeldVerification>>();
+
+/**
+ * The capability records behind a layer, in a bootstrap, still claim what
+ * they claimed when the page verified it: available, supported, healthy,
+ * enforcing, with nothing uncovered, and a verified claim that has not
+ * expired at `now`. A bootstrap that withdraws the capability (health
+ * failed, degraded, no claims, an expired claim) does not.
+ */
+export function bootstrapStillBacks(layer: Pick<ProtectionLayer, "capability_ids">, bootstrap: DashboardBootstrap, now: number): boolean {
+  const records = bootstrap.capabilities.filter((capability) => layer.capability_ids.includes(capability.id));
+  return bootstrap.assurance_matrix !== null
+    && records.length > 0
+    && records.every((capability) => capability.tier === "enterprise_core"
+      && capability.availability === "available"
+      && capability.support === "supported"
+      && capability.effective_mode === "enforce"
+      && capability.rollout_state === "enforcing"
+      && capability.health === "healthy"
+      && capability.bypass_classes.length === 0
+      && capability.known_uncovered_paths.length === 0
+      && capability.claims.some((claim) => claim.status === "verified"
+        && claim.expires_at !== null
+        && Number.isFinite(Date.parse(claim.expires_at))
+        && now <= Date.parse(claim.expires_at)));
+}
+
+/** The earliest expiry of the verified claims behind a layer, or none. */
+function claimsExpireAt(layer: Pick<ProtectionLayer, "capability_ids">, bootstrap: DashboardBootstrap): number {
+  const expiries = bootstrap.capabilities
+    .filter((capability) => layer.capability_ids.includes(capability.id))
+    .flatMap((capability) => capability.claims)
+    .filter((claim) => claim.status === "verified" && claim.expires_at !== null)
+    .map((claim) => Date.parse(claim.expires_at as string))
+    .filter(Number.isFinite);
+  return expiries.length === 0 ? Number.POSITIVE_INFINITY : Math.min(...expiries);
+}
+
+/**
+ * What the disclosure says about a verification held from earlier on the
+ * read: when it was made, never a present tense. The chip says Protecting;
+ * the disclosure says since when that is known.
+ */
+export function heldVerifiedLabel(at: number, now: number, timeZone?: string): string {
+  const clock = formatClock(new Date(at), new Date(now), timeZone);
+  return clock === undefined ? "Active enforcement verified earlier" : `Active enforcement verified at ${clock}`;
+}
 
 /**
  * The assurance each control shows for this read, with a verification held
- * until the next read instead of lapsing between reads.
+ * across the seconds of the read instead of lapsing between polls.
  *
  * The check binds each control's evidence to the consumer's clock, which
  * ticks every second, against a producer budget of seconds, while the page
@@ -429,31 +521,58 @@ const heldByRead = new WeakMap<DashboardPosture, Set<string>>();
  * nothing on the host had. A reader cannot trust chips that move when nothing
  * moved.
  *
- * Now a control verified on a read stays verified for the life of that read,
- * the chip keeps its "as of" time, and the next read decides again from
- * scratch. A read that no longer verifies it (the evidence went stale at the
- * host, a contradicting record, a snapshot the host keeps re-serving) demotes
- * it at that read. A page whose reading is not current holds nothing: it says
- * "Refreshing".
+ * So a control verified on a read keeps its verification while that read is
+ * the page's reading, and no longer than it could still be true:
+ *
+ *  - The next posture read decides again from scratch (a host re-serving a
+ *    frozen snapshot is a new read, judged by the clock at that read).
+ *  - A new bootstrap read that withdraws the control's capability, or whose
+ *    claim has expired, ends the hold at once (`bootstrapStillBacks`): a
+ *    contradicting record demotes it at that read.
+ *  - The hold never outlives the verified claim's `expires_at`, nor the
+ *    posture poll plus `HOLD_GRACE_MS` after the page last verified it: a
+ *    read that stalled is not proof, and the requests are bounded
+ *    (`DASHBOARD_FETCH_TIMEOUT_MS`), so a hung one turns the page stale.
+ *  - A page whose reading is not current holds nothing: it says "Refreshing".
+ *
+ * While held, the disclosure says when the verification was made
+ * (`heldVerifiedLabel`) rather than a present tense.
  */
 export function heldAssurance(
   posture: DashboardPosture,
   layer: ProtectionLayer,
   computed: LayerAssuranceLabel,
   current: boolean,
-  held: WeakMap<DashboardPosture, Set<string>> = heldByRead,
+  context: { bootstrap: DashboardBootstrap; evaluatedAt: string },
+  held: WeakMap<DashboardPosture, Map<string, HeldVerification>> = heldByRead,
 ): LayerAssuranceLabel {
   if (!current) return computed;
+  const now = Date.parse(context.evaluatedAt);
   let verified = held.get(posture);
   if (verified === undefined) {
-    verified = new Set();
+    verified = new Map();
     held.set(posture, verified);
   }
   if (computed.verifiedActive) {
-    verified.add(layer.id);
+    if (Number.isFinite(now)) {
+      verified.set(layer.id, {
+        bootstrap: context.bootstrap,
+        at: now,
+        until: Math.min(now + POSTURE_REFRESH_MS + HOLD_GRACE_MS, claimsExpireAt(layer, context.bootstrap)),
+      });
+    }
     return computed;
   }
-  return verified.has(layer.id) ? HELD_VERIFIED : computed;
+  const hold = verified.get(layer.id);
+  if (hold === undefined) return computed;
+  const lapsed = !Number.isFinite(now)
+    || now > hold.until
+    || (context.bootstrap !== hold.bootstrap && !bootstrapStillBacks(layer, context.bootstrap, now));
+  if (lapsed) {
+    verified.delete(layer.id);
+    return computed;
+  }
+  return { label: heldVerifiedLabel(hold.at, now), status: "active", verifiedActive: true, verifiedAt: hold.at };
 }
 
 function assuranceFor(
@@ -473,7 +592,7 @@ function assuranceFor(
     bootstrap.platform.os,
     current,
   );
-  return heldAssurance(posture, layer, computed, current);
+  return heldAssurance(posture, layer, computed, current, { bootstrap, evaluatedAt });
 }
 
 /** The one-line verdict the screen leads with.
@@ -673,6 +792,36 @@ export function emptyGapsLine(totalGaps: number): string {
     : `No gaps in the host controls above need your attention.${limit}`;
 }
 
+/**
+ * The controls whose state this page cannot confirm: ones reading "Can't
+ * confirm", and ones claimed as working or protecting that were never
+ * checked. A control that is off was never checked because it is off, which
+ * is not a gap.
+ *
+ * "Coverage gaps: No gaps reported" sat under "DNS Guard · Can't confirm ·
+ * never checked", and a buyer read it as: the DNS Guard I paid for is
+ * unchecked, and there are no gaps. `posture.gaps` is what the host listed;
+ * what the page itself cannot vouch for is a gap all the same.
+ */
+export function unconfirmedControls(layers: readonly ProtectionLayer[], pills: readonly ControlPill[]): string[] {
+  return layers.flatMap((layer, index) => {
+    const pill = pills[index];
+    if (pill === undefined) return [];
+    const neverChecked = layer.freshness.observed_at === null || layer.freshness.observed_at === undefined;
+    const claimed = pill.disposition === "proven" || pill.disposition === "working_as_configured";
+    return pill.disposition === "cannot_verify" || (neverChecked && claimed) ? [pill.name] : [];
+  });
+}
+
+/** "1 control we can't confirm: DNS Guard. We will not claim it either way." */
+export function unconfirmedLine(names: readonly string[]): string {
+  const one = names.length === 1;
+  const listed = names.length <= 2
+    ? names.join(" and ")
+    : `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
+  return `${names.length} control${one ? "" : "s"} we can't confirm: ${listed}. We will not claim ${one ? "it" : "them"} either way.`;
+}
+
 // ────────────────────────────────── screen ───────────────────────────────────
 
 export function Posture({
@@ -710,6 +859,10 @@ export function Posture({
   const operatorGaps = dedupeGaps(
     posture.gaps.filter((gap) => gapAudience(gap) === "operator" && needy.has(gap.capability_id)),
   );
+  // A control the page cannot confirm is a gap in what it can say, even
+  // when the host listed none for it: the section said "No gaps" under a
+  // DNS Guard reading "Can't confirm · never checked".
+  const unconfirmed = current ? unconfirmedControls(posture.layers, pills) : [];
 
   return (
     <div className="space-y-6">
@@ -751,9 +904,11 @@ export function Posture({
               </TechnicalOnly>
             ) : null}
             <ul className="mt-4 flex flex-wrap gap-2" aria-label="Host controls">
-              {pills.map((pill) => (
+              {pills.map((pill, index) => (
                 <li
-                  key={pill.name}
+                  // By the layer, not the name: names come from a product
+                  // table now, and two layers could share one.
+                  key={posture.layers[index].id}
                   title={pill.reason}
                   className={`inline-flex max-w-full flex-wrap items-center gap-x-2 gap-y-0.5 rounded-full border px-3 py-1.5 text-xs font-semibold ${
                     pill.tone === "positive"
@@ -791,6 +946,7 @@ export function Posture({
               bootstrap={bootstrap}
               current={current}
               assurance={assurances[index]}
+              evaluatedAt={evaluatedAt}
             />
           ))}
         </div>
@@ -807,9 +963,15 @@ export function Posture({
         </div>
         {operatorGaps.length > 0 ? (
           <div className="space-y-3">{operatorGaps.map((gap) => <GapCard key={gap.id} gap={gap} />)}</div>
-        ) : (
+        ) : null}
+        {unconfirmed.length > 0 ? (
+          <p data-unconfirmed-controls className={`${operatorGaps.length > 0 ? "mt-3 " : ""}rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm leading-6 text-slate-700`}>
+            {unconfirmedLine(unconfirmed)}
+          </p>
+        ) : null}
+        {operatorGaps.length === 0 && unconfirmed.length === 0 ? (
           <p className="text-sm leading-6 text-slate-600">{emptyGapsLine(posture.gaps.length)}</p>
-        )}
+        ) : null}
       </section>
 
       {/* Below the host controls, and outside them. A producer that sends
@@ -917,10 +1079,11 @@ function SectionFigures({ rows }: { rows: SectionRow[] }) {
       {shared !== undefined && (layout.tiles.length > 0 || layout.zeros.length > 0) ? (
         <p className="mt-1 text-[11px] leading-4 text-slate-500">What these cover: {shared}.</p>
       ) : null}
+      {notMeasured.length > 0 ? <NotMeasuredNote count={notMeasured.length} /> : null}
       {notMeasured.length > 0 ? (
         // What the host could not measure is its own account of its limits:
-        // evidence for whoever audits the figures, not an answer, so it sits
-        // behind the switch. It is never a zero standing in for a figure.
+        // evidence for whoever audits the figures, not an answer, so the list
+        // sits behind the switch. It is never a zero standing in for a figure.
         <TechnicalOnly>
           <div className="mt-3">
             <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-500">Not measured</h3>
@@ -933,6 +1096,33 @@ function SectionFigures({ rows }: { rows: SectionRow[] }) {
         </TechnicalOnly>
       ) : null}
     </>
+  );
+}
+
+/** "2 figures are not measured on this host." */
+export function notMeasuredLine(count: number): string {
+  return count === 1 ? "1 figure is not measured on this host." : `${count} figures are not measured on this host.`;
+}
+
+/**
+ * In the plain view, that something is not measured, and the way to the
+ * list. The list is the auditor's; that there is one is everyone's: a page
+ * that hid it would hide the existence of a gap, which the switch never may.
+ */
+function NotMeasuredNote({ count }: { count: number }) {
+  const [technical] = useTechnicalDetail();
+  if (technical) return null;
+  return (
+    <p data-not-measured className="mt-2 text-xs leading-5 text-slate-600">
+      {notMeasuredLine(count)}{" "}
+      <button
+        type="button"
+        onClick={() => setTechnicalDetail(true)}
+        className="font-semibold text-cyan-700 underline decoration-cyan-300 underline-offset-2 hover:text-cyan-900"
+      >
+        Show which
+      </button>
+    </p>
   );
 }
 
@@ -1012,12 +1202,15 @@ function ControlRow({
   bootstrap,
   current,
   assurance,
+  evaluatedAt,
 }: {
   layer: ProtectionLayer;
   bootstrap: DashboardBootstrap;
   current: boolean;
   /** The same assurance the chip for this control was drawn from. */
   assurance: LayerAssuranceLabel;
+  /** The consumer's clock this render was judged at. */
+  evaluatedAt: string;
 }) {
   const relevantCapabilities = layer.capability_ids
     .map((id) => bootstrap.capabilities.find((capability) => capability.id === id))
@@ -1031,10 +1224,15 @@ function ControlRow({
   );
 
   const name = controlName(layer);
+  const [technical] = useTechnicalDetail();
   return (
     <article className="rounded-2xl border border-slate-200 bg-white px-4 py-3 shadow-sm">
       <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
-        <div className="min-w-0 flex-1">
+        {/* A basis of its own, so on a narrow screen the title takes the
+            row and the badge, scope and time wrap under it. With a basis of
+            zero it stayed beside them, shrank to what they left (26 px at
+            320) and broke "Execution Gate" into a column of fragments. */}
+        <div className="min-w-0 flex-[1_1_12rem]">
           <h3 className="break-words text-base font-semibold text-slate-950">{name.name}</h3>
           {name.description === undefined ? null : (
             <p className="text-xs text-slate-500">{name.description}</p>
@@ -1050,7 +1248,7 @@ function ControlRow({
           className="shrink-0 text-xs font-medium text-slate-500"
           title={current && layer.freshness.observed_at ? timeTitle(layer.freshness.observed_at) : undefined}
         >
-          {current ? checkedAt(layer.freshness) : "refreshing"}
+          {current ? checkedAt(layer.freshness, new Date(), technical ? "UTC" : undefined) : "refreshing"}
         </span>
       </div>
 
@@ -1066,7 +1264,14 @@ function ControlRow({
         <summary className="cursor-pointer text-xs font-semibold text-slate-500 hover:text-slate-700">How this was verified</summary>
         <div className="mt-3 space-y-5">
           <div className="flex flex-wrap items-center gap-3">
-            <StatusBadge status={current ? assurance.status : "stale"} label={current ? assurance.label : "Awaiting a current snapshot"} />
+            <StatusBadge
+              status={current ? assurance.status : "stale"}
+              label={!current
+                ? "Awaiting a current snapshot"
+                : assurance.verifiedAt === undefined
+                  ? assurance.label
+                  : heldVerifiedLabel(assurance.verifiedAt, Date.parse(evaluatedAt), technical ? "UTC" : undefined)}
+            />
             <span className="text-xs text-slate-500">
               {layer.evidence.length} evidence record{layer.evidence.length === 1 ? "" : "s"} · {freshnessLabel(layer.freshness)}
             </span>

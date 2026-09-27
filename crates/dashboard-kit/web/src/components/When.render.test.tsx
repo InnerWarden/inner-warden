@@ -1,7 +1,8 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { When } from "./When";
+import { setTechnicalDetail } from "./TechnicalDetail";
+import { When, whenText } from "./When";
 import { pinZone } from "../test-support/zone";
 
 /**
@@ -21,6 +22,7 @@ beforeEach(() => {
 afterEach(() => {
   vi.useRealTimers();
   restoreZone();
+  setTechnicalDetail(false);
 });
 
 describe("a time on screen", () => {
@@ -42,5 +44,28 @@ describe("a time on screen", () => {
 
   it("prints nothing for a value that is not a time", () => {
     expect(renderToStaticMarkup(<When at="not a time" />)).toBe("");
+  });
+});
+
+/**
+ * The investigator's view prints UTC, labelled, and never a relative time:
+ * the instant was one hover away, and a hover is out of reach on a touch
+ * screen. The plain view keeps the reader's clock.
+ *
+ * FAILS ON REVERT: print the plain words in both views and the technical
+ * view reads "3 hours ago" in BST beside a host log in UTC.
+ */
+describe("a time in the technical view", () => {
+  it("is UTC with its label, absolute where the plain view is relative", () => {
+    setTechnicalDetail(true);
+    expect(renderToStaticMarkup(<When at="2026-09-21T17:28:42Z" />)).toMatch(/>21 Sept? 2026, 17:28 UTC<\/time>$/);
+    expect(renderToStaticMarkup(<When at={Date.parse("2026-09-25T09:00:00Z")} relative />)).toMatch(/>25 Sept? 2026, 09:00 UTC<\/time>$/);
+    setTechnicalDetail(false);
+    expect(renderToStaticMarkup(<When at="2026-09-21T17:28:42Z" />)).toMatch(/>21 Sept? 2026, 18:28 BST<\/time>$/);
+  });
+
+  it("chooses its words from the view alone", () => {
+    expect(whenText("2026-09-21T17:28:42Z", false, true)).toMatch(/^21 Sept? 2026, 17:28 UTC$/);
+    expect(whenText(Date.parse("2026-09-25T09:00:00Z"), true, false)).toBe("3 hours ago");
   });
 });

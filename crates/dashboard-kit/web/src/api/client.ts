@@ -102,6 +102,62 @@ export function networkProblem(endpoint: DashboardEndpoint): DashboardClientFail
   };
 }
 
+/**
+ * How long one dashboard request may take before it is given up.
+ *
+ * The screens poll with an in-flight guard, so a request that never answered
+ * held every later poll back for good, and the page went on showing the last
+ * answer as current: Protection held a control at "Protecting" on a read it
+ * could no longer renew. A request past this is a failure like a dropped
+ * connection, so the page marks what it shows as stale and the next poll
+ * asks again.
+ */
+export const DASHBOARD_FETCH_TIMEOUT_MS = 30_000;
+
+export function timeoutProblem(endpoint: DashboardEndpoint): DashboardClientFailure {
+  return {
+    state: "unavailable",
+    problem: {
+      endpoint,
+      httpStatus: null,
+      code: "request_timed_out",
+      message: "The same-origin dashboard adapter did not answer in time.",
+      retryable: true,
+      retryAfterSeconds: null,
+    },
+  };
+}
+
+/**
+ * A signal for one request that aborts when the caller's does, or when the
+ * request has run for `timeoutMs`. `timedOut()` tells the two apart: the
+ * caller's abort is theirs to handle, a timeout is a failure to report.
+ * `done()` must be called when the request settles.
+ */
+export function requestDeadline(signal: AbortSignal | undefined, timeoutMs: number): {
+  signal: AbortSignal;
+  timedOut: () => boolean;
+  done: () => void;
+} {
+  const controller = new AbortController();
+  let expired = false;
+  const forward = () => controller.abort(signal?.reason);
+  if (signal?.aborted) controller.abort(signal.reason);
+  else signal?.addEventListener("abort", forward, { once: true });
+  const timer = setTimeout(() => {
+    expired = true;
+    controller.abort("request-timed-out");
+  }, timeoutMs);
+  return {
+    signal: controller.signal,
+    timedOut: () => expired,
+    done: () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", forward);
+    },
+  };
+}
+
 export function contractProblem(endpoint: DashboardEndpoint): DashboardClientFailure {
   return {
     state: "error",
@@ -118,12 +174,14 @@ export function contractProblem(endpoint: DashboardEndpoint): DashboardClientFai
 
 export class DashboardV1Client {
   readonly #fetch: Fetch;
+  readonly #timeoutMs: number;
 
-  constructor(fetchImplementation: Fetch = globalThis.fetch) {
+  constructor(fetchImplementation: Fetch = globalThis.fetch, timeoutMs: number = DASHBOARD_FETCH_TIMEOUT_MS) {
     // Native browser fetch is a host method. Keep its global receiver when it
     // is stored behind the typed client instead of invoking it with the client
     // instance as `this` (which some runtimes reject before issuing a request).
     this.#fetch = fetchImplementation.bind(globalThis);
+    this.#timeoutMs = timeoutMs;
   }
 
   getBootstrap(signal?: AbortSignal): Promise<DashboardClientResult<DashboardBootstrap>> {
@@ -143,29 +201,37 @@ export class DashboardV1Client {
   }
 
   async #get<T>(endpoint: DashboardEndpoint, parser: Parser<T>, signal?: AbortSignal): Promise<DashboardClientResult<T>> {
-    let response: Response;
+    const deadline = requestDeadline(signal, this.#timeoutMs);
     try {
-      response = await this.#fetch(`${DASHBOARD_API_ROOT}/${endpoint}`, {
-        method: "GET",
-        cache: "no-store",
-        credentials: "same-origin",
-        redirect: "error",
-        headers: { accept: "application/json" },
-        signal,
-      });
-    } catch (error) {
-      if (signal?.aborted || (error instanceof DOMException && error.name === "AbortError")) throw error;
-      return networkProblem(endpoint);
-    }
+      let response: Response;
+      try {
+        response = await this.#fetch(`${DASHBOARD_API_ROOT}/${endpoint}`, {
+          method: "GET",
+          cache: "no-store",
+          credentials: "same-origin",
+          redirect: "error",
+          headers: { accept: "application/json" },
+          signal: deadline.signal,
+        });
+      } catch (error) {
+        if (deadline.timedOut()) return timeoutProblem(endpoint);
+        if (signal?.aborted || (error instanceof DOMException && error.name === "AbortError")) throw error;
+        return networkProblem(endpoint);
+      }
 
-    if (!response.ok) return failureForStatus(await responseProblem(response, endpoint));
+      if (!response.ok) return failureForStatus(await responseProblem(response, endpoint));
 
-    let payload: unknown;
-    try {
-      payload = await response.json();
-      return { state: "ready", data: parser(payload) };
-    } catch {
-      return contractProblem(endpoint);
+      let payload: unknown;
+      try {
+        payload = await response.json();
+        return { state: "ready", data: parser(payload) };
+      } catch {
+        // A body that stopped arriving is a timeout, not a malformed reply.
+        if (deadline.timedOut()) return timeoutProblem(endpoint);
+        return contractProblem(endpoint);
+      }
+    } finally {
+      deadline.done();
     }
   }
 }

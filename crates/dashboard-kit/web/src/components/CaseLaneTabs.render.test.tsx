@@ -1,7 +1,7 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { CaseLaneTabs, laneIntro, laneTabs, nextLaneTab } from "./CaseLaneTabs";
+import { CaseLaneTabs, laneIntro, laneTabCount, laneTabs, nextLaneTab } from "./CaseLaneTabs";
 import { caseViewUrl, EMPTY_CASE_VIEW, readCaseViewState } from "./CaseFilters";
 import { setTechnicalDetail } from "./TechnicalDetail";
 
@@ -28,7 +28,9 @@ describe("the tab row", () => {
     expect(html).toContain("Attacks on this server");
     expect(html).toContain(">823</span>");
     expect(html).toContain('aria-label="Attacks on this server, 823 cases"');
-    expect(html).toContain('aria-label="What your AI agent did, 1 case"');
+    // One case per session in the agent's lane, so the count is sessions.
+    expect(html).toContain('aria-label="What your AI agent did, 1 session"');
+    expect(html).toContain('aria-label="Messages to your AI agent, 1 message"');
     expect(html).toContain('aria-controls="case-list"');
   });
 
@@ -158,7 +160,27 @@ describe("the span beside each count", () => {
     const html = renderToStaticMarkup(<CaseLaneTabs value="agent_actions" counts={serverCounts} onChange={noop} window="7d" />);
     expect(html.match(/ · 7 days<\/span>/g)).toHaveLength(3);
     expect(html).toContain('aria-label="Attacks on this server, 3 cases in the last 7 days"');
-    expect(html).toContain('aria-label="What your AI agent did, 1 case in the last 7 days"');
+    expect(html).toContain('aria-label="What your AI agent did, 1 session in the last 7 days"');
+  });
+
+  /**
+   * The agent's Overview card counts commands, and its tab lists one case per
+   * session. With the unit said only aloud, the badge read "4 · 7 days" under
+   * a card reading 7, and a reader took the two for one count that had lost
+   * three. Each badge names what it counts.
+   *
+   * FAILS ON REVERT: print the number alone and "1 · 7 days" is back.
+   */
+  it("names each count's unit in the badge, the lane's own", () => {
+    const html = renderToStaticMarkup(
+      <CaseLaneTabs value="agent_actions" counts={{ agent_messages: 1, agent_actions: 4, server_attacks: 2_435, other: 2 }} onChange={noop} window="all" />,
+    );
+    expect(html).toContain(">1 message<span");
+    expect(html).toContain(">4 sessions<span");
+    expect(html).toContain(">2,435 cases<span");
+    expect(html.match(/ · all time<\/span>/g)).toHaveLength(3);
+    expect(laneTabCount("everything", 1)).toBe("1 case");
+    expect(laneTabCount("agent_actions", 1)).toBe("1 session");
   });
 
   it("offers a visible window control only with a window and a way to change it", () => {

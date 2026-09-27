@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import type { AgentLayerReport, DashboardBootstrap, DashboardPosture } from "../api/v1";
 import { setTechnicalDetail } from "../components/TechnicalDetail";
-import { figureLayout, Posture, sectionRows } from "./Posture";
+import { figureLayout, notMeasuredLine, Posture, sectionRows } from "./Posture";
 
 /**
  * Protection was about 5,000 px tall at 1440 wide and over 10,000 at 320.
@@ -126,5 +126,36 @@ describe("the auditor's material", () => {
     expect(plain).toContain(REPORT.summary);
     expect(plain).toContain("In the agent, not a host control");
     expect(plain).toContain(">7</dd>");
+  });
+});
+
+/**
+ * The list of what is not measured is the auditor's; that there is one is
+ * everyone's. A plain page that said nothing hid the existence of a gap,
+ * which the switch never may.
+ *
+ * FAILS ON REVERT: wrap the whole block in the switch and the plain view
+ * never admits a figure is missing.
+ */
+describe("what is not measured, in the plain view", () => {
+  it("is one line with the way to the list, and the list is behind the switch", () => {
+    const plain = render();
+    expect(plain).toContain("1 figure is not measured on this host.");
+    expect(plain).toContain(">Show which</button>");
+    expect(plain).not.toContain("how many AI agents are connected");
+    setTechnicalDetail(true);
+    const technical = render();
+    expect(technical).toContain("how many AI agents are connected");
+    expect(technical).not.toContain("is not measured on this host");
+  });
+
+  it("counts in words that agree with the number", () => {
+    expect(notMeasuredLine(1)).toBe("1 figure is not measured on this host.");
+    expect(notMeasuredLine(3)).toBe("3 figures are not measured on this host.");
+  });
+
+  it("says nothing when everything was measured", () => {
+    const html = renderToStaticMarkup(<Posture bootstrap={bootstrap} posture={{ ...posture, agent_layer: { ...REPORT, not_measured: [] } }} current evaluatedAt="2026-07-18T12:00:01Z" />);
+    expect(html).not.toContain("not measured on this host");
   });
 });

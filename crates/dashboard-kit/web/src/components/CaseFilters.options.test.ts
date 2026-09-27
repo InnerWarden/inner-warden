@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
 
+import { CASE_LIST_WINDOWS } from "../windows";
+import { CASE_WINDOWS } from "./CaseFilters";
+
 /**
  * A filter option that the host can never satisfy is worse than a missing one:
  * it returns zero results and reads as "there are none of those" rather than
@@ -101,8 +104,12 @@ describe("case filter options", () => {
    * tabs), so no control can offer a span the address bar would refuse.
    */
   it("windows render from their validation array, under the name every window control shares", () => {
-    expect(validationArray("windows")).toEqual(["all", "1h", "24h", "7d", "30d"]);
+    // The one list of spans (`windows.ts`) is what the address bar validates
+    // against and what every window control offers.
+    expect(CASE_LIST_WINDOWS).toEqual(["all", "1h", "24h", "7d", "30d"]);
+    expect(source).toContain("const windows = CASE_LIST_WINDOWS;");
     expect(source).toContain("export const CASE_WINDOWS: readonly CaseWindow[] = windows;");
     expect(source).toContain("CASE_WINDOWS.map(");
+    expect(CASE_WINDOWS).toBe(CASE_LIST_WINDOWS);
   });
 });

@@ -52,7 +52,7 @@ describe("the case page count line", () => {
    */
   it("names the span the server answered for, and says this window only when it named none", () => {
     expect(casePageCountLabel(3, { total_in_window: 3, window: "24h" })).toBe("3 rows on this page · 3 cases in the last 24 hours");
-    expect(casePageCountLabel(3, { total_in_window: 3, window: "all" })).toBe("3 rows on this page · 3 cases in everything this host has kept");
+    expect(casePageCountLabel(3, { total_in_window: 3, window: "all" })).toBe("3 rows on this page · 3 cases over all time");
     expect(casePageCountLabel(3, { total_in_window: 3 })).toBe("3 rows on this page · 3 cases in this window");
   });
 

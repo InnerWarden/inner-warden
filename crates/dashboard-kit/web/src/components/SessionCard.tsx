@@ -1,6 +1,6 @@
 import { useEffect, useId, useState } from "react";
 import type { ActionView, SessionView } from "../api";
-import { formatTimestamp, humanizeToken } from "../presentation";
+import { formatDay, formatTimestamp, humanizeToken } from "../presentation";
 import { DecidedBy } from "./DecidedBy";
 import { Outcome } from "./Outcome";
 import { Verdict } from "./Verdict";
@@ -36,10 +36,15 @@ export function sessionHeading(s: SessionView, timeZone?: string): string {
   const day = new Intl.DateTimeFormat("en-GB", { day: "numeric", month: "short", timeZone });
   const time = new Intl.DateTimeFormat("en-GB", { hour: "2-digit", minute: "2-digit", hourCycle: "h23", timeZone });
   const zoned = new Intl.DateTimeFormat("en-GB", { hour: "2-digit", minute: "2-digit", hourCycle: "h23", timeZoneName: "short", timeZone });
-  const sameDay = day.format(first) === day.format(last);
-  return sameDay
-    ? `Agent session, ${day.format(first)} ${time.format(first)} to ${zoned.format(last)}`
-    : `Agent session, ${day.format(first)} to ${day.format(last)}`;
+  // One day is the same calendar day, year included: a session from 5 Jan
+  // one year to 5 Jan the next is not a same-day range with times.
+  const sameDay = formatDay(first, timeZone) === formatDay(last, timeZone);
+  if (sameDay) return `Agent session, ${day.format(first)} ${time.format(first)} to ${zoned.format(last)}`;
+  // Across a new year the short day is ambiguous, so both ends carry it.
+  const sameYear = first.toLocaleString("en-GB", { year: "numeric", timeZone }) === last.toLocaleString("en-GB", { year: "numeric", timeZone });
+  return sameYear
+    ? `Agent session, ${day.format(first)} to ${day.format(last)}`
+    : `Agent session, ${formatDay(first, timeZone)} to ${formatDay(last, timeZone)}`;
 }
 
 /** The id, kept reachable but no longer shouted. */

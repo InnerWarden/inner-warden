@@ -1,8 +1,9 @@
 import { renderToStaticMarkup } from "react-dom/server";
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { overviewLaneCards, parseLaneCard, type LaneCard } from "../lanes";
+import { latestCaseWindow, overviewLaneCards, parseLaneCard, type LaneCard } from "../lanes";
 import { LaneCards, laneLink, lanesIntro, type LaneOpenOptions } from "./LaneCards";
+import { When } from "./When";
 // Both written by the paid server's own tests, not by hand.
 import lanesOverview from "../../tests/fixtures/enterprise/overview-lanes.json";
 import noSourceOverview from "../../tests/fixtures/enterprise/overview-lanes-no-source.json";
@@ -33,6 +34,9 @@ function buttons(node: unknown, found: Element[] = []): Element[] {
   }
   if (typeof node !== "object" || node === null || !("props" in node)) return found;
   const element = node as Element;
+  // A time holds no button, and it reads the technical switch through a hook,
+  // which only runs inside a render.
+  if (element.type === When) return found;
   if (typeof element.type === "function") {
     return buttons((element.type as (props: Record<string, unknown>) => unknown)(element.props), found);
   }
@@ -265,6 +269,14 @@ describe("the span the cards count", () => {
  * opens over all time.
  */
 describe("the newest case on a card", () => {
+  // The fixture's newest cases are from the evening of 25 September; the
+  // clock is set just after, so each is inside its card's span.
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-25T18:00:00Z"));
+  });
+  afterEach(() => vi.useRealTimers());
+
   it("opens in its lane, in the window the card counted", () => {
     const opened: unknown[][] = [];
     const tree = LaneCards({
@@ -282,5 +294,42 @@ describe("the newest case on a card", () => {
     if (server === undefined) throw new Error("the server card should open its newest case");
     (server.props.onClick as () => void)();
     expect(opened[1]).toEqual([lanesOverview.lanes.server_attacks.latest.case_id, "server_attacks", "24h"]);
+  });
+
+  /**
+   * Nothing makes the host's newest case fall inside the card's span (a walk
+   * found a 7 September case under "7 days"). Opened over a list that does
+   * not hold it, the case is the broken link a reader reports, so a case
+   * older than the span opens over every day.
+   *
+   * FAILS ON REVERT: pass the card's window unconditionally and the 24-hour
+   * card opens its two-day-old case over the last 24 hours.
+   */
+  it("opens over every day when the case is older than the card's span", () => {
+    vi.setSystemTime(new Date("2026-09-27T18:00:00Z"));
+    const opened: unknown[][] = [];
+    const tree = LaneCards({ cards, edition: "enterprise", onOpenLane: noop, onOpenCase: (...args) => void opened.push(args), onOpenActivity: noop });
+    const server = buttons(tree).find((button) => text(button.props.children) === lanesOverview.lanes.server_attacks.latest.title);
+    (server?.props.onClick as () => void)();
+    const agent = buttons(tree).find((button) => text(button.props.children) === lanesOverview.lanes.agent_actions.latest.title);
+    (agent?.props.onClick as () => void)();
+    expect(opened).toEqual([
+      [lanesOverview.lanes.server_attacks.latest.case_id, "server_attacks", "all"],
+      [lanesOverview.lanes.agent_actions.latest.case_id, "agent_actions", "7d"],
+    ]);
+  });
+});
+
+describe("the span a newest case opens in", () => {
+  const now = Date.parse("2026-09-27T12:00:00Z");
+  it("is the card's span when the case is in it, and every day when it is not", () => {
+    expect(latestCaseWindow({ at: "2026-09-27T11:30:00Z" }, "1h", now)).toBe("1h");
+    expect(latestCaseWindow({ at: "2026-09-27T10:30:00Z" }, "1h", now)).toBe("all");
+    expect(latestCaseWindow({ at: "2026-09-20T12:00:01Z" }, "7d", now)).toBe("7d");
+    expect(latestCaseWindow({ at: "2026-09-07T09:00:00Z" }, "7d", now)).toBe("all");
+    expect(latestCaseWindow({ at: "2026-08-28T12:00:01Z" }, "30d", now)).toBe("30d");
+    expect(latestCaseWindow({ at: "2020-01-01T00:00:00Z" }, "all", now)).toBe("all");
+    // A little after now (the host's clock ahead of the reader's) is inside.
+    expect(latestCaseWindow({ at: "2026-09-27T12:00:05Z" }, "24h", now)).toBe("24h");
   });
 });

@@ -1,6 +1,7 @@
 import type { CaseLane, CaseListWindow } from "../api/cases";
-import { LANE_COPY, LANE_WINDOW_PHRASE, laneCountNoun, type LaneCard } from "../lanes";
+import { LANE_COPY, LANE_WINDOW_PHRASE, laneCountNoun, latestCaseWindow, type LaneCard } from "../lanes";
 import { formatCount } from "../presentation";
+import { windowWords } from "../windows";
 import { When } from "./When";
 import { gridColumnsClass, gridSpanClass, joinClasses } from "./cardGrid";
 
@@ -41,13 +42,7 @@ export function laneLink(
  * Cases screen to open.
  */
 /** The span a card counts, named after "over": "over the last 7 days". */
-export const LANE_SPAN_NAME: Record<CaseListWindow, string> = {
-  "1h": "the last hour",
-  "24h": "the last 24 hours",
-  "7d": "the last 7 days",
-  "30d": "the last 30 days",
-  all: "everything this host has kept",
-};
+export const LANE_SPAN_NAME: Record<CaseListWindow, string> = windowWords("span");
 
 /**
  * The line under the page heading: whose records these are, over what span,
@@ -81,9 +76,9 @@ export function LaneCards({
   edition?: "community" | "enterprise";
   onOpenLane?: (lane: CaseLane, options: LaneOpenOptions) => void;
   /**
-   * Opens one case inside its lane, in the window the card counted, so the
-   * list beside the case is the one the card was about (and the case, the
-   * newest in that window, is in it).
+   * Opens one case inside its lane, in the window the card counted when the
+   * case is inside it (`latestCaseWindow`), so the list beside the case is
+   * the one the card was about.
    */
   onOpenCase?: (caseId: string, lane: CaseLane, window: CaseListWindow) => void;
   onOpenActivity?: () => void;
@@ -164,9 +159,11 @@ function LaneCardView({
           </span>
         </p>
       ) : null}
-      {available && card.breakdown !== undefined ? (
+      {available && card.breakdown !== undefined && card.breakdown.some((part) => part.count > 0) ? (
         // The split of the number above, each part counted once, adding up
         // to it exactly: the host's split is dropped whole when it does not.
+        // A split with nothing in any part draws no list at all, not an
+        // empty one a screen reader announces as a list of no items.
         <ul data-lane-breakdown className="mt-3 space-y-1 text-sm text-slate-700">
           {card.breakdown.filter((part) => part.count > 0).map((part) => (
             <li key={part.key} data-part={part.key} className="flex items-baseline gap-2">
@@ -184,7 +181,7 @@ function LaneCardView({
           {latest.caseId !== undefined && onOpenCase !== undefined ? (
             <button
               type="button"
-              onClick={() => available && onOpenCase(latest.caseId as string, card.lane, card.window)}
+              onClick={() => available && onOpenCase(latest.caseId as string, card.lane, latestCaseWindow(latest, card.window, Date.now()))}
               className="text-left font-medium text-cyan-800 underline decoration-cyan-300 underline-offset-2 hover:text-cyan-950"
             >
               {latest.title}
