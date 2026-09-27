@@ -90,8 +90,8 @@ const distAssets = join(webRoot, "dist", "assets");
 // Re-measured 2026-09-27 after the review of Cases (each agent row in its
 // lane's outcome, the ladder's captions in words, the checked part read as
 // the record allows, the flow's deciders as one line of chips): the
-// Enterprise bundle is 824,544B of JS, 59,263B of CSS and 883,807B of
-// assets. No line moves. The CSS has 737B of headroom under its 60,000B
+// Enterprise bundle is 824,655B of JS, 59,408B of CSS and 884,063B of
+// assets. No line moves. The CSS has 592B of headroom under its 60,000B
 // line: the next change that adds utilities trims first (reuse what the
 // bundle has), or moves this line by measurement here.
 const FIRST_MEANINGFUL_CONTENT_BUDGET_MS = 4_000;
