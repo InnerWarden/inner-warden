@@ -12,7 +12,7 @@ import { StatusBadge } from "./components/StatusBadge";
 import { resolveDashboardEdition } from "./edition";
 import { normaliseMode } from "./presentation";
 import { Activity, type ActivityTarget } from "./screens/Activity";
-import { Home, type MachinePanels } from "./screens/Home";
+import { Home, type MachinePanels, type QueueOpenOptions } from "./screens/Home";
 import { isCaseLane, type CaseLane } from "./api/lanes";
 import type { CaseListWindow } from "./api/cases";
 import type { LaneOpenOptions } from "./components/LaneCards";
@@ -312,10 +312,12 @@ export function caseUrl(caseId: string | undefined, current: string, lane?: Case
  * than the list's 24-hour default, because a case waiting since yesterday
  * is still waiting.
  */
-export function caseQueueUrl(current: string): URL {
+export function caseQueueUrl(current: string, window: CaseListWindow = "all"): URL {
   const url = caseUrl(undefined, current);
   url.searchParams.set("status", "waiting");
-  url.searchParams.set("window", "all");
+  // The span the server counted its waiting cases in, when it said: the
+  // number on the line and the list behind the link are then one thing.
+  url.searchParams.set("window", isCaseListWindow(window) ? window : "all");
   return url;
 }
 
@@ -637,8 +639,8 @@ export function App({
     window.history.pushState({}, "", caseLaneUrl(lane, options, window.location.href));
     setRoute("cases");
   };
-  const openQueue = () => {
-    window.history.pushState({}, "", caseQueueUrl(window.location.href));
+  const openQueue = (options?: QueueOpenOptions) => {
+    window.history.pushState({}, "", caseQueueUrl(window.location.href, options?.window));
     setRoute("cases");
   };
   // Only a shell that actually mounts a Cases screen may hand out case links;
@@ -729,7 +731,7 @@ function EnterpriseRoute({
   onOpenActivity: (target?: Omit<ActivityTarget, "requestId">) => void;
   onOpenCase?: (caseId?: string, lane?: CaseLane, window?: CaseListWindow) => void;
   /** Opens the Cases screen on the waiting queue; see `caseQueueUrl`. */
-  onOpenQueue?: () => void;
+  onOpenQueue?: (options?: QueueOpenOptions) => void;
   /** Opens the Cases screen on one lane; see `caseLaneUrl`. */
   onOpenLane?: (lane: CaseLane, options: LaneOpenOptions) => void;
   evaluatedAt: string;

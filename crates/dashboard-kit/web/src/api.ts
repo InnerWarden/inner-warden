@@ -147,6 +147,17 @@ export type Overview = {
     findings_waiting_off_the_line_counts?: string;
   };
   /**
+   * What waits on a person, by the server's one definition: the cases its
+   * Cases filter `status=waiting` lists, counted in `window`, the span that
+   * filter is opened with. `today` is how many of them arrived today.
+   *
+   * When sent, the Overview's waiting line reads this and links to exactly
+   * that list, and `host_attention` is not read. Optional: an older host
+   * sends none, and the line reads `host_attention` as before. Read through
+   * `waitingCount`, never directly.
+   */
+  waiting?: { count: number; window: "1h" | "24h" | "7d" | "30d" | "all"; today?: number };
+  /**
    * The hero sentence, computed by the host from the SAME counters this
    * payload carries.
    *

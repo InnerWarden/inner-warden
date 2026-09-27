@@ -204,7 +204,7 @@ export function Home({
    * The "waiting on you" line is a dead end without it: a number, and no way
    * to get to the cases it counts.
    */
-  onOpenQueue?: () => void;
+  onOpenQueue?: (options?: QueueOpenOptions) => void;
   /**
    * Drives whether the Active Defence card is an offer or noise. Absent means
    * the edition has not resolved yet, which is treated as "do not offer" --
@@ -324,7 +324,7 @@ export function OverviewScreen({
   reconnecting?: boolean;
   onOpenActivity: (target?: ActivityLink) => void;
   onOpenCase?: (caseId?: string, lane?: CaseLane, window?: CaseListWindow) => void;
-  onOpenQueue?: () => void;
+  onOpenQueue?: (options?: QueueOpenOptions) => void;
   onOpenLane?: (lane: CaseLane, options: LaneOpenOptions) => void;
   machinePanels?: MachinePanels;
 }) {
@@ -449,7 +449,7 @@ function LanesOverview({
   reconnecting: boolean;
   onOpenActivity: (target?: ActivityLink) => void;
   onOpenCase?: (caseId?: string, lane?: CaseLane, window?: CaseListWindow) => void;
-  onOpenQueue?: () => void;
+  onOpenQueue?: (options?: QueueOpenOptions) => void;
   onOpenLane?: (lane: CaseLane, options: LaneOpenOptions) => void;
   machinePanels?: MachinePanels;
 }) {
@@ -475,7 +475,7 @@ function LanesOverview({
         onOpenActivity={() => onOpenActivity()}
       />
 
-      <HostAttention waiting={overview.host_attention} onOpen={onOpenQueue} />
+      <WaitingLine overview={overview} onOpenQueue={onOpenQueue} />
 
       {showRecord && record !== undefined ? (
         <DecisionRecordSection
@@ -572,9 +572,9 @@ export function OverviewRecord({
   guardedAgents?: number;
   onOpenActivity: (target?: ActivityLink) => void;
   onOpenCase?: (caseId?: string) => void;
-  onOpenQueue?: () => void;
+  onOpenQueue?: (options?: QueueOpenOptions) => void;
 }) {
-  const hostAttention = <HostAttention waiting={overview.host_attention} onOpen={onOpenQueue} />;
+  const hostAttention = <WaitingLine overview={overview} onOpenQueue={onOpenQueue} />;
   if (overview.commands === 0) {
     return (
       <>
@@ -1111,6 +1111,127 @@ function RecentActivityEntry({ item, clickable }: { item: DecisionSummary; click
         )}
       </div>
     </>
+  );
+}
+
+/** Where the waiting line's link goes: the queue, in the span it counted. */
+export type QueueOpenOptions = { window?: CaseListWindow };
+
+/** The server's one waiting count, read from `overview.waiting`. */
+export type WaitingCount = {
+  count: number;
+  window: CaseListWindow;
+  /** How many of `count` arrived today, when the server said and it is not more than `count`. */
+  today?: number;
+};
+
+const QUEUE_WINDOWS: readonly CaseListWindow[] = ["1h", "24h", "7d", "30d", "all"];
+
+/**
+ * The server's one count of what waits on a person, or nothing.
+ *
+ * "Waiting on you" read 1 on the Overview's banner, 2 on the agent's card,
+ * 145 on Cases and 257 on the list the card opened: five counts of five
+ * things under one phrase. The paid host now owns one definition and one
+ * count, the one its Cases filter `status=waiting` lists, and sends it with
+ * the span it counted. A count that is not a whole number, or a span this
+ * bundle does not know, is read as not sent, and the Overview reads the
+ * host's older address line instead, exactly as before. A "today" that is
+ * not a whole number no larger than the count is dropped on its own.
+ */
+export function waitingCount(value: unknown): WaitingCount | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const item = value as Record<string, unknown>;
+  const count = wholeCount(item.count);
+  const window = QUEUE_WINDOWS.find((candidate) => candidate === item.window);
+  if (count === undefined || window === undefined) return undefined;
+  const today = wholeCount(item.today);
+  return today !== undefined && today <= count ? { count, window, today } : { count, window };
+}
+
+/** The span after "from": "from the last 7 days", or nothing for every day. */
+const FROM_SPAN: Record<CaseListWindow, string> = {
+  "1h": " from the last hour",
+  "24h": " from the last 24 hours",
+  "7d": " from the last 7 days",
+  "30d": " from the last 30 days",
+  all: "",
+};
+
+/**
+ * The waiting line, from the server's one count: the number, the part of it
+ * that is today's when the server said, and a link to exactly the list it
+ * counted. It replaces the address line and its long "What this number
+ * counts": the count is the list, so there is nothing to reconcile.
+ */
+export function waitingLine(waiting: WaitingCount): {
+  tone: "quiet" | "waiting";
+  title: string;
+  body?: string;
+  through?: { label: string; window: CaseListWindow };
+} {
+  const span = FROM_SPAN[waiting.window];
+  if (waiting.count === 0) {
+    return {
+      tone: "quiet",
+      title: "Nothing is waiting on you",
+      body: waiting.window === "all" ? "No case on this host needs a person." : `No case${span} needs a person.`,
+    };
+  }
+  const one = waiting.count === 1;
+  const n = formatCount(waiting.count);
+  return {
+    tone: "waiting",
+    title: `${n} ${one ? "case" : "cases"}${span} ${one ? "is" : "are"} waiting on you`,
+    ...(waiting.today === undefined ? {} : { body: todaySubset(waiting.count, waiting.today) }),
+    through: { label: one ? "See the waiting case" : `See the ${n} waiting cases`, window: waiting.window },
+  };
+}
+
+/** Which part of the waiting count is today's, and which is older, named honestly. */
+function todaySubset(count: number, today: number): string {
+  if (count === 1) return today === 1 ? "It arrived today." : "It is from an earlier day.";
+  if (today === count) return "All of them arrived today.";
+  if (today === 0) return "None of them arrived today; they are from earlier days.";
+  const rest = count - today;
+  return `${formatCount(today)} arrived today; ${formatCount(rest)} more ${rest === 1 ? "is" : "are"} from earlier days.`;
+}
+
+/**
+ * The line under the lane cards: the server's one waiting count when it sent
+ * one, and the host's address line otherwise (`HostAttention`), which is
+ * every host older than the count.
+ */
+export function WaitingLine({ overview, onOpenQueue }: { overview: Overview; onOpenQueue?: (options?: QueueOpenOptions) => void }) {
+  const waiting = waitingCount(overview.waiting);
+  if (waiting === undefined) return <HostAttention waiting={overview.host_attention} onOpen={onOpenQueue === undefined ? undefined : () => onOpenQueue()} />;
+  const line = waitingLine(waiting);
+  const quiet = line.tone === "quiet";
+  const through = onOpenQueue !== undefined ? line.through : undefined;
+  return (
+    <section
+      aria-labelledby="host-attention-title"
+      data-waiting-count={waiting.count}
+      className={`rounded-xl border p-4 shadow-sm ${quiet ? "border-slate-200 bg-white" : "border-amber-200 bg-amber-50"}`}
+    >
+      <h2 id="host-attention-title" className={`text-sm font-semibold ${quiet ? "text-slate-950" : "text-amber-900"}`}>
+        {line.title}
+      </h2>
+      {line.body !== undefined && (
+        <p className={`mt-1 text-sm leading-6 ${quiet ? "text-slate-600" : "text-amber-900"}`}>{line.body}</p>
+      )}
+      {through !== undefined && (
+        <div className="mt-3">
+          <button
+            type="button"
+            onClick={() => onOpenQueue?.({ window: through.window })}
+            className="text-sm font-semibold text-amber-900 underline decoration-amber-400 underline-offset-4 hover:text-amber-950"
+          >
+            {through.label} <span aria-hidden="true">→</span>
+          </button>
+        </div>
+      )}
+    </section>
   );
 }
 
