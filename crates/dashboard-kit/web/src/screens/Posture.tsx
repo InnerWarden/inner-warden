@@ -15,6 +15,7 @@ import type {
 } from "../api/v1";
 import { StatusBadge } from "../components/StatusBadge";
 import { TechnicalOnly } from "../components/TechnicalDetail";
+import { formatClock, freshnessLabel, timeTitle } from "../presentation";
 import { layerAssuranceLabel, type LayerAssuranceLabel } from "../posture/assurance";
 
 // ─────────────────────────── user-facing projections ─────────────────────────
@@ -60,15 +61,15 @@ export function plainMode(layer: Pick<ProtectionLayer, "effective_mode" | "desir
 
 /** Freshness as the user fact: when this control was last checked. The producer
  * budget is contract bookkeeping and lives in the disclosure only. */
-export function checkedAt(freshness: EvidenceFreshness): string {
+export function checkedAt(freshness: EvidenceFreshness, now: Date = new Date(), timeZone?: string): string {
   if (freshness.observed_at === null || freshness.observed_at === undefined) {
     return "never checked";
   }
-  const at = new Date(freshness.observed_at);
-  if (Number.isNaN(at.getTime())) return "never checked";
-  const hh = String(at.getHours()).padStart(2, "0");
-  const mm = String(at.getMinutes()).padStart(2, "0");
-  return `as of ${hh}:${mm}`;
+  // The time of day with its zone when the check was today, and the date as
+  // well when it was not: "as of 01:21" read the same on a check from this
+  // morning and one from last week.
+  const at = formatClock(freshness.observed_at, now, timeZone);
+  return at === undefined ? "never checked" : `as of ${at}`;
 }
 
 /** Scope as its display name only; kind and verification detail belong to the
@@ -1045,7 +1046,12 @@ function ControlRow({
           className="shrink-0"
         />
         <span className="[overflow-wrap:anywhere] text-sm text-slate-600">{scopeDisplay(layer.effective_scope)}</span>
-        <span className="shrink-0 text-xs font-medium text-slate-500">{current ? checkedAt(layer.freshness) : "refreshing"}</span>
+        <span
+          className="shrink-0 text-xs font-medium text-slate-500"
+          title={current && layer.freshness.observed_at ? timeTitle(layer.freshness.observed_at) : undefined}
+        >
+          {current ? checkedAt(layer.freshness) : "refreshing"}
+        </span>
       </div>
 
       {/* The sentence, on the row, not one click away.
@@ -1062,8 +1068,7 @@ function ControlRow({
           <div className="flex flex-wrap items-center gap-3">
             <StatusBadge status={current ? assurance.status : "stale"} label={current ? assurance.label : "Awaiting a current snapshot"} />
             <span className="text-xs text-slate-500">
-              {layer.evidence.length} evidence record{layer.evidence.length === 1 ? "" : "s"} · freshness {humanize(layer.freshness.state)}
-              {layer.freshness.age_seconds !== null ? `, ${layer.freshness.age_seconds}s old` : ""} · {layer.freshness.budget_seconds}s producer budget
+              {layer.evidence.length} evidence record{layer.evidence.length === 1 ? "" : "s"} · {freshnessLabel(layer.freshness)}
             </span>
           </div>
           <div>

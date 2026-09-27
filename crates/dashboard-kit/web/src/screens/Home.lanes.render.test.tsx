@@ -11,6 +11,7 @@ import hostWaitingOverview from "../../tests/fixtures/enterprise/overview-host-w
 // adds the one an older paid host sent, to show both on one screen.
 import serverLanesOverview from "../../tests/fixtures/enterprise/overview-lanes.json";
 import noSourceOverview from "../../tests/fixtures/enterprise/overview-lanes-no-source.json";
+import { pinZone } from "../test-support/zone";
 
 const lanesOverview = { ...serverLanesOverview, host_attention: hostWaitingOverview.host_attention };
 
@@ -47,8 +48,13 @@ function render(overview: unknown, edition: "community" | "enterprise", extra: P
   );
 }
 
+let restoreZone = () => undefined as void;
+
 beforeEach(() => {
-  // Recent activity prints relative times; the pinned markup needs one clock.
+  // Recent activity prints relative times, and each time's title the
+  // reader's local time with its zone; the pinned markup needs one clock in
+  // one zone, whatever zone the machine running the tests is in.
+  restoreZone = pinZone("UTC");
   vi.useFakeTimers();
   vi.setSystemTime(new Date("2026-09-25T12:00:00Z"));
   setTechnicalDetail(false);
@@ -57,6 +63,7 @@ beforeEach(() => {
 afterEach(() => {
   setTechnicalDetail(false);
   vi.useRealTimers();
+  restoreZone();
 });
 
 describe("an Overview whose host sends no lanes", () => {

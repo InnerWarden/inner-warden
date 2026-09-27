@@ -24,7 +24,7 @@ const ACTION_PAGE = 10;
  * by. The id stays on the card, in the secondary line, for correlating with a
  * log; it just stops being the headline.
  */
-export function sessionHeading(s: SessionView): string {
+export function sessionHeading(s: SessionView, timeZone?: string): string {
   if (s.label === "local") return "Local session";
   const stamps = s.items
     .map((item) => item.recorded_at_ms)
@@ -32,11 +32,13 @@ export function sessionHeading(s: SessionView): string {
   if (stamps.length === 0) return "Agent session";
   const first = new Date(Math.min(...stamps));
   const last = new Date(Math.max(...stamps));
-  const day = new Intl.DateTimeFormat(undefined, { day: "numeric", month: "short" });
-  const time = new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit" });
-  const sameDay = first.toDateString() === last.toDateString();
+  // The dashboard's one rule: the reader's clock, with its zone said once.
+  const day = new Intl.DateTimeFormat("en-GB", { day: "numeric", month: "short", timeZone });
+  const time = new Intl.DateTimeFormat("en-GB", { hour: "2-digit", minute: "2-digit", hourCycle: "h23", timeZone });
+  const zoned = new Intl.DateTimeFormat("en-GB", { hour: "2-digit", minute: "2-digit", hourCycle: "h23", timeZoneName: "short", timeZone });
+  const sameDay = day.format(first) === day.format(last);
   return sameDay
-    ? `Agent session, ${day.format(first)} ${time.format(first)} to ${time.format(last)}`
+    ? `Agent session, ${day.format(first)} ${time.format(first)} to ${zoned.format(last)}`
     : `Agent session, ${day.format(first)} to ${day.format(last)}`;
 }
 

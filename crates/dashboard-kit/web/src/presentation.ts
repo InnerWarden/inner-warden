@@ -50,31 +50,108 @@ export function normaliseMode(meta?: DashboardMeta): GuardrailMode {
 }
 
 /**
- * One absolute timestamp format for the whole dashboard, in UTC.
+ * One absolute timestamp format for the whole dashboard: the reader's own
+ * clock, with the zone printed, "21 Sept 2026, 18:28 BST". The exact instant
+ * travels with it, in ISO 8601 UTC, in the element's title (`timeTitle`).
  *
- * MEASURED in the third dashboard audit: one screen read "21/09/2026, 17:28"
- * and another "Sep 21, 2026, 17:28" for the same instant, because half the
- * formatters passed `undefined` (the viewer's locale and zone) and half passed
- * "en" with `timeZone: "UTC"`. A reader comparing two panels could not tell
- * whether the difference was formatting or a different time.
+ * The third dashboard audit found one screen reading "21/09/2026, 17:28" and
+ * another "Sep 21, 2026, 17:28" for the same instant, because half the
+ * formatters took the viewer's locale and zone and half asked for UTC, and
+ * the fix then was UTC everywhere. The next walk found the cost of that: one
+ * event read in local time on one panel and in unlabelled UTC on another, on
+ * two calendar dates, and a reader in London had to know the rule to read
+ * any of them. One rule now: every absolute time is the reader's local time
+ * and says which zone that is, every panel uses this one function, and the
+ * zone-free instant is one hover away for a report or a host log.
  *
- * UTC is the side to standardise on, not the viewer's zone. These are evidence
- * timestamps: they are quoted in incident reports, compared against host logs
- * and read by more than one operator, and every one of those uses breaks when
- * the same instant renders differently per reader. The zone is named in the
- * string rather than assumed, so nobody has to know this rule to read one.
+ * `timeZone` is for tests and for a caller that must print another zone; the
+ * dashboard itself never passes it.
  *
  * Relative wording ("2 hours ago") is unaffected: it has no zone to get wrong.
  */
-export function formatAbsolute(value: Date | number | string): string | undefined {
+export function formatAbsolute(value: Date | number | string, timeZone?: string): string | undefined {
   const date = value instanceof Date ? value : new Date(value);
   if (Number.isNaN(date.getTime())) return undefined;
-  const rendered = new Intl.DateTimeFormat("en-GB", {
-    dateStyle: "medium",
-    timeStyle: "short",
-    timeZone: "UTC",
+  return new Intl.DateTimeFormat("en-GB", {
+    day: "numeric",
+    month: "short",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+    timeZoneName: "short",
+    timeZone,
   }).format(date);
-  return `${rendered} UTC`;
+}
+
+/** A calendar day in the same words as `formatAbsolute`: "21 Sept 2026". */
+export function formatDay(value: Date | number | string, timeZone?: string): string | undefined {
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) return undefined;
+  return new Intl.DateTimeFormat("en-GB", { day: "numeric", month: "short", year: "numeric", timeZone }).format(date);
+}
+
+/** The instant in ISO 8601 UTC, to the second: "2026-09-21T17:28:42Z". */
+export function isoInstant(value: Date | number | string): string | undefined {
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) return undefined;
+  return date.toISOString().replace(/\.000Z$/, "Z");
+}
+
+/**
+ * What a time's title says on hover: the reader's local time with its zone,
+ * and the ISO instant, "21 Sept 2026, 18:28 BST (2026-09-21T17:28:42Z)".
+ */
+export function timeTitle(value: Date | number | string, timeZone?: string): string | undefined {
+  const local = formatAbsolute(value, timeZone);
+  const iso = isoInstant(value);
+  return local === undefined || iso === undefined ? undefined : `${local} (${iso})`;
+}
+
+/**
+ * A time of day when it is today where the reader is, and the full absolute
+ * time otherwise: "01:21 BST", "24 Sept 2026, 01:21 BST". An "as of 01:21"
+ * with no date read the same on a check from this morning and one from last
+ * week.
+ */
+export function formatClock(value: Date | number | string, now: Date = new Date(), timeZone?: string): string | undefined {
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) return undefined;
+  if (formatDay(date, timeZone) !== formatDay(now, timeZone)) return formatAbsolute(date, timeZone);
+  return new Intl.DateTimeFormat("en-GB", { hour: "2-digit", minute: "2-digit", hourCycle: "h23", timeZoneName: "short", timeZone }).format(date);
+}
+
+/** A length of time in the largest unit that fits: "12 s", "5 min", "3 h", "20 d". */
+export function formatDuration(seconds: number): string {
+  const secs = Math.max(0, Math.floor(seconds));
+  if (secs < 120) return `${secs} s`;
+  if (secs < 7_200) return `${Math.floor(secs / 60)} min`;
+  if (secs < 172_800) return `${Math.floor(secs / 3_600)} h`;
+  return `${Math.floor(secs / 86_400)} d`;
+}
+
+/**
+ * How old a piece of evidence is, against the budget its producer set, in
+ * place of a bare "Fresh" or "Stale": "20 d old, within its 90 d budget",
+ * "3 d old, past its 1 d budget". A 20-day-old record read "Fresh" beside
+ * 3-day-old ones reading "Stale", because each was judged by a budget the
+ * reader could not see. With the age and the budget printed, the word
+ * explains itself. No age reported says so, and a record never observed
+ * says "never checked".
+ */
+export function freshnessLabel(freshness: {
+  observed_at: string | null;
+  age_seconds: number | null;
+  budget_seconds: number;
+}): string {
+  if (freshness.observed_at === null) return "never checked";
+  if (freshness.age_seconds === null || !Number.isFinite(freshness.age_seconds)) return "age not reported";
+  const age = `${formatDuration(freshness.age_seconds)} old`;
+  if (!Number.isFinite(freshness.budget_seconds) || freshness.budget_seconds <= 0) return age;
+  const budget = formatDuration(freshness.budget_seconds);
+  return freshness.age_seconds <= freshness.budget_seconds
+    ? `${age}, within its ${budget} budget`
+    : `${age}, past its ${budget} budget`;
 }
 
 export function formatTimestamp(value?: number): string | undefined {

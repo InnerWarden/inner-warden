@@ -18,7 +18,8 @@ import { SensorActivity } from "../components/SensorActivity";
 import { Verdict } from "../components/Verdict";
 import { overviewLaneCards, type LaneCard } from "../lanes";
 import { OVERVIEW_AGENTS_TOUR_STEP_KEY, OVERVIEW_SENSOR_TOUR_STEP_KEY, TOUR_ABSENT_ATTRIBUTE } from "../components/tourKeys";
-import { formatTimestamp, humanizeToken, normaliseMode, formatCount } from "../presentation";
+import { humanizeToken, normaliseMode, formatCount } from "../presentation";
+import { When } from "../components/When";
 
 type ActivityLink = { id?: string; session?: string; verdict?: string; action?: string };
 
@@ -1080,7 +1081,7 @@ export function kernelStoppedLabel(program: string): string {
 
 function RecentActivityEntry({ item, clickable }: { item: DecisionSummary; clickable: boolean }) {
   const recommendation = item.recommendation ?? "unknown";
-  const when = formatTimestamp(item.recorded_at_ms);
+  const when = item.recorded_at_ms == null || !Number.isFinite(item.recorded_at_ms) ? undefined : item.recorded_at_ms;
   const sessionLabel = item.session === "local" ? "Local session" : item.session;
   return (
     <>
@@ -1103,7 +1104,7 @@ function RecentActivityEntry({ item, clickable }: { item: DecisionSummary; click
         </div>
       </div>
       <div className="col-span-2 flex min-w-0 items-center justify-between gap-3 text-xs text-slate-500 sm:col-span-1 sm:block sm:max-w-28 sm:shrink-0 sm:text-right">
-        {when && <div className="shrink-0">{when}</div>}
+        {when !== undefined && <div className="shrink-0"><When at={when} relative /></div>}
         <div className="min-w-0 flex-1 truncate sm:mt-1 sm:max-w-28" title={sessionLabel}>{sessionLabel}</div>
         {clickable && (
           <span className="mt-2 hidden font-semibold text-cyan-700 opacity-0 transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100 sm:inline-block">Open →</span>

@@ -357,7 +357,8 @@ describe("the verdict hero leads with what the user asked", () => {
     // the two apart.
     expect(pill.mode).toBe("Containing, not proven");
     expect(pill.scope).toBe("OpenClaw workload");
-    expect(pill.freshness).toMatch(/^as of \d{2}:\d{2}$/);
+    // A time with its zone, and the date too when the check was not today.
+    expect(pill.freshness).toMatch(/^as of (\d{1,2} \S+ \d{4}, )?\d{2}:\d{2} \S+$/);
     // The producer freshness budget is contract bookkeeping; the summary never
     // mentions it.
     expect(pill.freshness).not.toContain("budget");
@@ -394,9 +395,22 @@ describe("freshness is a wall clock, not a counter that resets as you watch", ()
     // Was relative, and with the screen refreshing every few seconds it read
     // "checked 0s ago" almost permanently, resetting as you looked at it. A
     // number that never settles reads as a system that never settles.
-    const at = new Date("2026-08-17T14:32:05Z");
-    const hh = String(at.getHours()).padStart(2, "0");
-    expect(checkedAt({ ...fresh, observed_at: at.toISOString() })).toBe(`as of ${hh}:32`);
+    const at = "2026-08-17T14:32:05Z";
+    expect(checkedAt({ ...fresh, observed_at: at }, new Date("2026-08-17T18:00:00Z"), "Europe/London")).toBe("as of 15:32 BST");
+    expect(checkedAt({ ...fresh, observed_at: at }, new Date("2026-08-17T18:00:00Z"), "UTC")).toBe("as of 14:32 UTC");
+  });
+
+  /**
+   * "as of 01:21" read the same on a check from this morning and one from
+   * last week. A check from another day says its date.
+   *
+   * FAILS ON REVERT: print the hour and minute alone and last week's check
+   * reads as this morning's.
+   */
+  it("says the date when the check was not today, and the zone always", () => {
+    const at = "2026-08-17T14:32:05Z";
+    expect(checkedAt({ ...fresh, observed_at: at }, new Date("2026-08-24T09:00:00Z"), "Europe/London"))
+      .toMatch(/^as of 17 Aug 2026, 15:32 BST$/);
   });
 
   it("says never checked rather than inventing a time", () => {

@@ -1,6 +1,7 @@
 import type { CaseLane, CaseListWindow } from "../api/cases";
 import { LANE_COPY, LANE_WINDOW_PHRASE, laneCountNoun, type LaneCard } from "../lanes";
-import { formatAbsolute, formatTimestamp, formatCount } from "../presentation";
+import { formatCount } from "../presentation";
+import { When } from "./When";
 import { gridColumnsClass, gridSpanClass, joinClasses } from "./cardGrid";
 
 export type LaneOpenOptions = { window: CaseListWindow; status?: "waiting" };
@@ -180,7 +181,7 @@ function LaneCardView({
           )}
           <span className="text-slate-500">
             {" · "}
-            <time dateTime={latest.at} title={formatAbsolute(latest.at)}>{formatTimestamp(Date.parse(latest.at))}</time>
+            <When at={latest.at} relative />
           </span>
         </p>
       ) : null}
