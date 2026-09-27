@@ -146,7 +146,7 @@ export function dispositionReason(
 ): string {
   const effective = shown ?? dispositionOf(layer);
   if (layer.disposition_reason && effective === dispositionOf(layer)) {
-    return layer.disposition_reason;
+    return agreeWithControls(layer.disposition_reason);
   }
   // The name the reader bought, where the control has one.
   const label = controlName({ id: layer.id ?? "", label: layer.label, capability_ids: layer.capability_ids ?? [] }).name;
@@ -161,7 +161,20 @@ export function dispositionReason(
     cannot_verify: `${label} could not be read on this host. This is ours to fix, not yours.`,
     needs_operator: `${label} is not yet doing what it was set to do.`,
   };
-  return fallback[effective];
+  return agreeWithControls(fallback[effective]);
+}
+
+/**
+ * "Response controls is blocking" reads as a slip on the one page that asks
+ * to be believed word for word. A control named in the plural ("... controls")
+ * takes "are" (and "have", "were"). Only that construction is touched: every
+ * other word of the host's sentence is printed as sent.
+ */
+export function agreeWithControls(sentence: string): string {
+  return sentence
+    .replace(/\bcontrols is\b/g, "controls are")
+    .replace(/\bcontrols has\b/g, "controls have")
+    .replace(/\bcontrols was\b/g, "controls were");
 }
 
 /** Only one disposition asks the reader for anything. Amber has to stay scarce

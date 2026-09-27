@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { fetchCases, type ActionView, type CasesPage } from "../api";
 import { Detail } from "../components/Detail";
 import { SessionCard } from "../components/SessionCard";
+import { formatCount } from "../presentation";
 
 const LIMIT = 12;
 /** The verdict filter buttons. Exported so copy that tells a reader to press
@@ -131,9 +132,9 @@ export function Activity({ initialTarget }: { initialTarget?: ActivityTarget }) 
         {page && (
           <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-sm text-slate-600" aria-live="polite">
             {fetching && <span className="text-xs font-semibold text-cyan-800" aria-hidden="true">Updating…</span>}
-            <span><span className="font-semibold tabular-nums text-slate-900">{page.total_commands.toLocaleString()}</span> {filtering ? "matching " : ""}decision{page.total_commands === 1 ? "" : "s"}</span>
+            <span><span className="font-semibold tabular-nums text-slate-900">{formatCount(page.total_commands)}</span> {filtering ? "matching " : ""}decision{page.total_commands === 1 ? "" : "s"}</span>
             <span aria-hidden="true"> · </span>
-            <span><span className="font-semibold tabular-nums text-slate-900">{page.total_sessions.toLocaleString()}</span> session{page.total_sessions === 1 ? "" : "s"}</span>
+            <span><span className="font-semibold tabular-nums text-slate-900">{formatCount(page.total_sessions)}</span> session{page.total_sessions === 1 ? "" : "s"}</span>
           </div>
         )}
       </header>

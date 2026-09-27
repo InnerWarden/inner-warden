@@ -3,6 +3,7 @@ import { CASE_LANES, everythingCount, type CaseLaneCounts } from "../api/lanes";
 import { EVERYTHING_COPY, LANE_COPY, LANE_WINDOW_PHRASE, type CaseLaneChoice } from "../lanes";
 import { CASE_WINDOW_LABELS, CASE_WINDOWS, type CaseWindow } from "./CaseFilters";
 import { useTechnicalDetail } from "./TechnicalDetail";
+import { formatCount } from "../presentation";
 
 /**
  * The span beside a tab's count, short enough to sit in the badge: "1,298 ·
@@ -82,7 +83,7 @@ export function laneIntro(value: CaseLaneChoice): string {
  */
 export function laneTabName(tab: Pick<CaseLaneTab, "label" | "count">, window?: CaseWindow): string {
   if (tab.count === undefined) return tab.label;
-  const counted = `${tab.label}, ${tab.count.toLocaleString()} ${tab.count === 1 ? "case" : "cases"}`;
+  const counted = `${tab.label}, ${formatCount(tab.count)} ${tab.count === 1 ? "case" : "cases"}`;
   return window === undefined ? counted : `${counted} ${LANE_WINDOW_PHRASE[window]}`;
 }
 
@@ -171,7 +172,7 @@ export function CaseLaneTabs({
                   aria-hidden="true"
                   className={`rounded-full px-2 py-0.5 text-xs tabular-nums ${tab.selected ? "bg-white/20 text-white" : "bg-slate-100 text-slate-700"}`}
                 >
-                  {tab.count.toLocaleString()}
+                  {formatCount(tab.count)}
                   {window === undefined ? null : (
                     <span className="font-normal opacity-80"> · {LANE_TAB_SPAN[window]}</span>
                   )}

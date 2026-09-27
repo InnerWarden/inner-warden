@@ -18,7 +18,7 @@ import { SensorActivity } from "../components/SensorActivity";
 import { Verdict } from "../components/Verdict";
 import { overviewLaneCards, type LaneCard } from "../lanes";
 import { OVERVIEW_AGENTS_TOUR_STEP_KEY, OVERVIEW_SENSOR_TOUR_STEP_KEY, TOUR_ABSENT_ATTRIBUTE } from "../components/tourKeys";
-import { formatTimestamp, humanizeToken, normaliseMode } from "../presentation";
+import { formatTimestamp, humanizeToken, normaliseMode, formatCount } from "../presentation";
 
 type ActivityLink = { id?: string; session?: string; verdict?: string; action?: string };
 
@@ -898,7 +898,7 @@ function TrustItem({ children }: { children: ReactNode }) {
 function HeroNumber({ label, value }: { label: string; value: number }) {
   return (
     <div>
-      <div className="text-2xl font-semibold tabular-nums text-slate-950">{value.toLocaleString()}</div>
+      <div className="text-2xl font-semibold tabular-nums text-slate-950">{formatCount(value)}</div>
       <div className="mt-0.5 text-xs font-medium text-slate-500">{label}</div>
     </div>
   );
@@ -966,7 +966,7 @@ function Stat({ label, value, detail, tone }: { label: string; value: number; de
   const number = tone === "danger" ? "text-red-700" : tone === "attention" ? "text-amber-700" : tone === "positive" ? "text-emerald-700" : "text-slate-950";
   return (
     <article className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
-      <div className={`text-2xl font-semibold tabular-nums ${number}`}>{value.toLocaleString()}</div>
+      <div className={`text-2xl font-semibold tabular-nums ${number}`}>{formatCount(value)}</div>
       <div className="mt-1 text-sm font-semibold text-slate-800">{label}</div>
       <p className="mt-1 text-xs text-slate-500">{detail}</p>
     </article>
@@ -992,7 +992,7 @@ function OperationalEvidence({ overview }: { overview: Overview }) {
         </div>
         {items.map((item) => (
           <div key={item.label} className="min-w-28">
-            <div className={`text-lg font-semibold tabular-nums ${item.cls}`}>{item.value?.toLocaleString()}</div>
+            <div className={`text-lg font-semibold tabular-nums ${item.cls}`}>{(item.value == null ? undefined : formatCount(item.value))}</div>
             <div className="text-[11px] text-slate-500">{item.label}</div>
           </div>
         ))}
@@ -1260,9 +1260,9 @@ const FINDINGS_OFF_THE_LINE_FALLBACK =
   "host findings from today that wait in Cases and that a count of addresses cannot include, one per finding";
 
 function waitingTitle(addresses: number, findings: number): string {
-  const addressPart = `${addresses.toLocaleString()} ${addresses === 1 ? "address" : "addresses"}`;
+  const addressPart = `${formatCount(addresses)} ${addresses === 1 ? "address" : "addresses"}`;
   if (findings === 0) return `${addressPart} ${addresses === 1 ? "is" : "are"} waiting on you`;
-  const findingPart = `${findings.toLocaleString()} ${findings === 1 ? "finding" : "findings"}`;
+  const findingPart = `${formatCount(findings)} ${findings === 1 ? "finding" : "findings"}`;
   if (addresses === 0) return `${findingPart} ${findings === 1 ? "is" : "are"} waiting on you`;
   // Not "other findings": an address is not a finding, and these are the
   // findings the address count left out, never the same waiting twice.
@@ -1350,7 +1350,7 @@ function RiskSignals({ items, sent, max }: { items: Overview["top_categories"]; 
               <li key={item.name}>
                 <div className="mb-1.5 flex items-center justify-between gap-3 text-xs">
                   <span className="truncate font-medium text-slate-700" title={item.name}>{humanizeToken(item.name)}</span>
-                  <span className="tabular-nums text-slate-500">{item.count}</span>
+                  <span className="tabular-nums text-slate-500">{formatCount(item.count)}</span>
                 </div>
                 <div className="h-1.5 overflow-hidden rounded-full bg-slate-100" aria-hidden="true">
                   <div

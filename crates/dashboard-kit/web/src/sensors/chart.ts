@@ -14,6 +14,7 @@
  * are zero, so silence occupies the width it actually occupied.
  */
 import type { EventTimeline } from "../api/sensors";
+import { formatCount } from "../presentation";
 
 export const MINUTES_IN_DAY = 1_440;
 
@@ -265,7 +266,7 @@ export function chartValueTicks(chart: SensorChart): { value: number; fraction: 
       value,
       // Fraction DOWN from the top, which is how an SVG y coordinate reads.
       fraction: 1 - share,
-      label: Math.round(value).toLocaleString(),
+      label: formatCount(Math.round(value)),
     };
   });
 }
@@ -363,6 +364,6 @@ export function chartSummary(chart: SensorChart): string {
       : "No event time series was reported for today.";
   }
   const collectors = `${chart.bands.length} band${chart.bands.length === 1 ? "" : "s"}`;
-  return `${chart.total.toLocaleString()} events today across ${collectors}, `
-    + `peaking at ${chart.peak.toLocaleString()} events per ${chart.columnMinutes}-minute column.`;
+  return `${formatCount(chart.total)} events today across ${collectors}, `
+    + `peaking at ${formatCount(chart.peak)} events per ${chart.columnMinutes}-minute column.`;
 }

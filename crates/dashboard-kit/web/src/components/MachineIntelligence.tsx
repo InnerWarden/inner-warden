@@ -10,6 +10,7 @@ import {
   type TokenIntelligenceResponse,
 } from "../api";
 import { gridColumnsClass, gridSpanClass, joinClasses } from "./cardGrid";
+import { formatCount } from "../presentation";
 
 type PollState<T> = {
   data?: T;
@@ -542,7 +543,7 @@ export function recordedActivityLabel(guardrail: AgentGuardrail): string | undef
   const count = readCount(guardrail.recorded_activity);
   if (count === undefined) return undefined;
   if (count <= 0) return "None recorded";
-  return `${count.toLocaleString()} recorded, undated`;
+  return `${formatCount(count)} recorded, undated`;
 }
 
 /**
@@ -859,9 +860,9 @@ function humanise(value: string): string {
 
 function formatNullableCount(value: string | number | null, scanning = false): string {
   if (value == null) return scanning ? "Scanning…" : "Unavailable";
-  if (typeof value === "number") return Number.isFinite(value) ? value.toLocaleString() : "Unavailable";
+  if (typeof value === "number") return Number.isFinite(value) ? formatCount(value) : "Unavailable";
   try {
-    return BigInt(value).toLocaleString();
+    return formatCount(BigInt(value));
   } catch {
     return "Unavailable";
   }

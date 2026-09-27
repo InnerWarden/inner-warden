@@ -1,3 +1,5 @@
+import { formatCount } from "../presentation";
+
 /**
  * The one sentence a customer came for.
  *
@@ -190,7 +192,7 @@ export function headline(input: HeadlineInput): Headline {
     // was waiting on them that never was.
     const plural = input.needsReview === 1 ? "agent action was" : "agent actions were";
     return {
-      answer: `${input.needsReview.toLocaleString()} ${plural} flagged for review`,
+      answer: `${formatCount(input.needsReview)} ${plural} flagged for review`,
       next: reviewRemedy(input.reviewListedIn, input.recentShowsDecisions),
       tone: "attention",
     };
@@ -203,7 +205,7 @@ export function headline(input: HeadlineInput): Headline {
       answer: "Watching, not blocking",
       next:
         input.denyVerdicts > 0
-          ? `${input.denyVerdicts.toLocaleString()} actions would have been blocked. Switch to enforcing when you are ready.`
+          ? `${formatCount(input.denyVerdicts)} actions would have been blocked. Switch to enforcing when you are ready.`
           : "Switch to enforcing when you are ready.",
       tone: "attention",
     };
@@ -220,7 +222,7 @@ export function headline(input: HeadlineInput): Headline {
       // Outcomes were never reported, so the gap cannot be computed and is not
       // claimed. "Not recorded" beats a confident wrong number.
       return {
-        answer: `${input.denyVerdicts.toLocaleString()} judged unsafe, outcome not recorded`,
+        answer: `${formatCount(input.denyVerdicts)} judged unsafe, outcome not recorded`,
         next: outcomeNotRecordedNext(input.reviewListedIn),
         tone: "attention",
       };
@@ -245,8 +247,8 @@ export function headline(input: HeadlineInput): Headline {
         // not accuse. The one thing nobody here can know is whether the caller
         // honoured the answer, and that is what the detail says.
       return {
-          answer: `Protecting. ${noBlockRecorded.toLocaleString()} unsafe ${plural} judged, not stopped here`,
-          next: `${input.denyVerdicts.toLocaleString()} judged unsafe, ${input.blockedBeforeExecution.toLocaleString()} stopped before execution here. The rest were one-off checks with no execution to stop, so whether the caller honoured the answer is not recorded on this host.`,
+          answer: `Protecting. ${formatCount(noBlockRecorded)} unsafe ${plural} judged, not stopped here`,
+          next: `${formatCount(input.denyVerdicts)} judged unsafe, ${formatCount(input.blockedBeforeExecution)} stopped before execution here. The rest were one-off checks with no execution to stop, so whether the caller honoured the answer is not recorded on this host.`,
           tone: "good",
       };
     }

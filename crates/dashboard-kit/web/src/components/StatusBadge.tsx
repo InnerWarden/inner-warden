@@ -43,6 +43,8 @@ const PRESENTATIONS: Record<string, Omit<StatusPresentation, "label"> & { label?
   expired: { tone: "neutral", symbol: "–" },
   rejected: { tone: "critical", symbol: "×" },
   not_observed: { tone: "neutral", symbol: "–", label: "Not observed" },
+  // A read that covered part of what was asked: neither all clear nor a fault.
+  partial: { tone: "neutral", symbol: "~", label: "Partial" },
 
   // ── Dispositions ──────────────────────────────────────────────────────────
   //

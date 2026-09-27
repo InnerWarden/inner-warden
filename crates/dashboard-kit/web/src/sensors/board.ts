@@ -21,6 +21,7 @@
  * by category is what makes a zero readable.
  */
 import type { CollectorCategory, CollectorStatus, SensorActivity } from "../api/sensors";
+import { formatCount } from "../presentation";
 
 /**
  * Mirror of the sensor's `COLLECTOR_MANIFEST`
@@ -236,7 +237,7 @@ function describe(name: string, count: number, category: CollectorCategory, stat
       noteKey: "impaired",
       // A fault verdict beside a non-zero count is a contradiction, and hiding
       // either half would be the dishonest way to resolve it.
-      note: count > 0 ? `${fault} ${count.toLocaleString()} events were still recorded today.` : fault,
+      note: count > 0 ? `${fault} ${formatCount(count)} events were still recorded today.` : fault,
     });
   }
 

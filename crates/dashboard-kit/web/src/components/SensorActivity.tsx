@@ -22,6 +22,7 @@ import {
   type ColumnReadout,
   type SensorChart,
 } from "../sensors/chart";
+import { formatCount } from "../presentation";
 
 const PLOT_WIDTH = 960;
 const PLOT_HEIGHT = 240;
@@ -143,9 +144,9 @@ function TimelineCard({ activity, chart }: { activity: SensorActivityPayload; ch
       <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
         <h3 className="text-sm font-semibold text-slate-900">Events per collector</h3>
         <p className="text-xs tabular-nums text-slate-500">
-          {activity.total_events == null ? "Total not reported" : `${activity.total_events.toLocaleString()} events`}
+          {activity.total_events == null ? "Total not reported" : `${formatCount(activity.total_events)} events`}
           <span aria-hidden="true" className="px-1.5 text-slate-300">·</span>
-          {activity.total_incidents == null ? "incidents not reported" : `${activity.total_incidents.toLocaleString()} incidents`}
+          {activity.total_incidents == null ? "incidents not reported" : `${formatCount(activity.total_incidents)} incidents`}
         </p>
       </div>
 
@@ -318,7 +319,7 @@ function Plot({ chart, summary }: { chart: SensorChart; summary: string }) {
           <span key={band.name} className="flex min-w-0 items-center gap-2 text-[11px] text-slate-600">
             <span className="h-2 w-2 shrink-0 rounded-full" style={{ backgroundColor: band.color }} aria-hidden="true" />
             <span className="min-w-0 flex-1 truncate font-medium text-slate-700" title={band.name}>{band.name}</span>
-            <span className="shrink-0 tabular-nums text-slate-500">{band.total.toLocaleString()}</span>
+            <span className="shrink-0 tabular-nums text-slate-500">{formatCount(band.total)}</span>
           </span>
         ))}
       </figcaption>
@@ -348,14 +349,14 @@ function ColumnReadoutStrip({
         <span className="text-xs font-semibold text-slate-800">
           {pointing ? readout.window : `Busiest ${minutes} minutes: ${readout.window}`}
         </span>
-        <span className="text-xs tabular-nums text-slate-600">{readout.total.toLocaleString()} events</span>
+        <span className="text-xs tabular-nums text-slate-600">{formatCount(readout.total)} events</span>
       </div>
       <div className="mt-1.5 flex flex-wrap gap-x-3 gap-y-1">
         {readout.entries.map((entry) => (
           <span key={entry.name} className="inline-flex min-w-0 max-w-full items-center gap-1.5 text-[11px] text-slate-600">
             <span className="h-1.5 w-1.5 shrink-0 rounded-full" style={{ backgroundColor: entry.color }} aria-hidden="true" />
             <span className="truncate" title={entry.name}>{entry.name}</span>
-            <span className="shrink-0 tabular-nums text-slate-500">{entry.value.toLocaleString()}</span>
+            <span className="shrink-0 tabular-nums text-slate-500">{formatCount(entry.value)}</span>
           </span>
         ))}
       </div>
@@ -452,7 +453,7 @@ function Row({ row }: { row: CollectorRow }) {
         <span className={`inline-flex shrink-0 rounded-full border px-1.5 py-px text-[10px] font-semibold uppercase tracking-wide ${TONE_PILL[row.tone]}`}>
           {row.label}
         </span>
-        <span className="w-12 shrink-0 text-right text-xs tabular-nums text-slate-600">{row.count.toLocaleString()}</span>
+        <span className="w-12 shrink-0 text-right text-xs tabular-nums text-slate-600">{formatCount(row.count)}</span>
       </div>
       {row.note && <p className="mt-0.5 pl-3.5 text-[11px] leading-4 text-slate-600">{row.note}</p>}
     </li>

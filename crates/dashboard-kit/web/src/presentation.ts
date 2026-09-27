@@ -91,6 +91,21 @@ export function formatTimestamp(value?: number): string | undefined {
   return formatAbsolute(date);
 }
 
+/**
+ * One way to print a count, everywhere: "1,298", for every viewer.
+ *
+ * Counts went through the viewer's locale in most places and a fixed one in
+ * others, so one card could print "1,298" beside "1298", and the same number
+ * read "1.298" on a German machine in one panel and "1,298" in the next. A
+ * fixed locale makes a count read the same on every screen, in every test
+ * and in a quoted report. `+ 0` turns -0 into 0, which would print "-0".
+ */
+const COUNT_FORMAT = new Intl.NumberFormat("en-GB");
+
+export function formatCount(value: number | bigint): string {
+  return COUNT_FORMAT.format(typeof value === "bigint" ? value : value + 0);
+}
+
 export function modeAtDecisionLabel(value?: string): string | undefined {
   if (value === "monitor") return "Monitor mode";
   if (value === "enforce") return "Enforce mode";

@@ -1,6 +1,6 @@
 import type { CaseLane, CaseListWindow } from "../api/cases";
 import { LANE_COPY, LANE_WINDOW_PHRASE, laneCountNoun, type LaneCard } from "../lanes";
-import { formatAbsolute, formatTimestamp } from "../presentation";
+import { formatAbsolute, formatTimestamp, formatCount } from "../presentation";
 import { gridColumnsClass, gridSpanClass, joinClasses } from "./cardGrid";
 
 export type LaneOpenOptions = { window: CaseListWindow; status?: "waiting" };
@@ -154,7 +154,7 @@ function LaneCardView({
       <p className="mt-1 text-xs leading-5 text-slate-500">{copy.blurb}</p>
       {available ? (
         <p className="mt-4 flex flex-wrap items-baseline gap-x-2">
-          <span data-lane-count className="text-3xl font-semibold tabular-nums text-slate-950">{card.count.toLocaleString()}</span>
+          <span data-lane-count className="text-3xl font-semibold tabular-nums text-slate-950">{formatCount(card.count)}</span>
           {/* A real space, so the number and its unit are one phrase to a
               screen reader and in copied text; the flex gap draws it. */}
           {" "}
@@ -196,11 +196,11 @@ function LaneCardView({
                 onClick={() => available && onOpenLane?.(card.lane, { window: card.window, status: "waiting" })}
                 className="rounded-full border border-amber-200 bg-amber-50 px-3 py-1 text-xs font-semibold text-amber-900 hover:border-amber-300 hover:bg-amber-100"
               >
-                {waiting.toLocaleString()} waiting on you <span aria-hidden="true">→</span>
+                {formatCount(waiting)} waiting on you <span aria-hidden="true">→</span>
               </button>
             ) : (
               <span className="rounded-full border border-amber-200 bg-amber-50 px-3 py-1 text-xs font-semibold text-amber-900">
-                {waiting.toLocaleString()} waiting on you
+                {formatCount(waiting)} waiting on you
               </span>
             )
           ) : null}

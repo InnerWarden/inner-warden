@@ -801,8 +801,23 @@ function EnterpriseRoute({
  */
 const NARROW_LABEL = "max-[399px]:sr-only";
 
+/**
+ * The session badge names who is signed in. A change on the paid dashboard
+ * is "recorded under your name", and the page said so without ever showing
+ * the name. A name that is not a short plain one (empty, very long, or
+ * carrying control characters) is not printed; the badge then says
+ * "Signed in".
+ */
+export function signedInLabel(actorId: string | null | undefined): string {
+  const name = typeof actorId === "string" ? actorId.trim() : "";
+  if (name === "" || name.length > 64 || /[\u0000-\u001f\u007f]/.test(name)) return "Signed in";
+  return `Signed in as ${name}`;
+}
+
 function EnterpriseSessionStatus({ resource }: { resource: DashboardResource<DashboardBootstrap> }) {
-  if (resource.state === "ready" && resource.data.session.authenticated) return <StatusBadge status="available" label="Authenticated" labelClassName={NARROW_LABEL} />;
+  if (resource.state === "ready" && resource.data.session.authenticated) {
+    return <StatusBadge status="available" label={signedInLabel(resource.data.session.actor_id)} labelClassName={NARROW_LABEL} />;
+  }
   if (resource.state === "ready") return <StatusBadge status="unavailable" label="Authentication required" />;
   if (resource.state === "stale") {
     const label = resource.problem.httpStatus === 401 ? "Authentication required" : "Session status stale";
