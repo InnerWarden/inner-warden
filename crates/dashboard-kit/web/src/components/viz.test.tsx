@@ -153,7 +153,35 @@ describe("the ladder's steps", () => {
       <Steps label="Case" captions steps={[{ ...step("seen", "done"), caption: "14:56 BST" }, step("verified", "verified")]} />,
     );
     expect(html).toContain("14:56 BST");
-    expect(html).toContain('aria-hidden="true" class="mt-0.5');
+    expect(html).toMatch(/aria-hidden="true" class="[^"]*mt-0\.5 leading-4/);
     expect((html.match(/font-semibold text-slate-800">/g) ?? []).length).toBe(2);
+  });
+
+  /**
+   * A mark whose colour carries a claim carries a shape too: a check on the
+   * confirmed mark, "!" on the one waiting on a person. The caption's words
+   * are said aloud with the mark, since the drawn caption is hidden.
+   *
+   * FAILS ON REVERT: drop the glyph and confirmed and done differ by colour
+   * alone; drop `captionWords` and a screen reader hears no time.
+   */
+  it("gives the confirmed and the waiting marks a shape, and says the caption aloud", () => {
+    const html = renderToStaticMarkup(
+      <Steps
+        label="Case"
+        captions
+        compact
+        steps={[
+          { ...step("seen", "done"), caption: "4 Sept", captionWords: "4 Sept 2026, 17:29 BST" },
+          step("decided", "waiting"),
+          step("verified", "verified"),
+        ]}
+      />,
+    );
+    expect(html).toContain("seen: seen words, 4 Sept 2026, 17:29 BST");
+    expect((html.match(/<svg viewBox="0 0 10 10"/g) ?? []).length).toBe(2);
+    expect(html).toContain('d="M2.7 5.2 4.4 6.8 7.4 3.4"');
+    expect(html).toContain("h-3");
+    expect(html).toContain("leading-3");
   });
 });

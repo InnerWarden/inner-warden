@@ -86,6 +86,14 @@ const distAssets = join(webRoot, "dist", "assets");
 // The JS and single-asset lines move to the measured bundle plus 16,000B,
 // rounded up to the next 5,000B: 830,000B; the asset total the same way:
 // 890,000B.
+//
+// Re-measured 2026-09-27 after the review of Cases (each agent row in its
+// lane's outcome, the ladder's captions in words, the checked part read as
+// the record allows, the flow's deciders as one line of chips): the
+// Enterprise bundle is 824,544B of JS, 59,263B of CSS and 883,807B of
+// assets. No line moves. The CSS has 737B of headroom under its 60,000B
+// line: the next change that adds utilities trims first (reuse what the
+// bundle has), or moves this line by measurement here.
 const FIRST_MEANINGFUL_CONTENT_BUDGET_MS = 4_000;
 const POLL_MIN_GAP_MS = 4_000; // the shell polls on a 5s interval; allow scheduling slack
 const POLL_MAX_REQUESTS_IN_WINDOW = 3; // over a ~7.5s observation window

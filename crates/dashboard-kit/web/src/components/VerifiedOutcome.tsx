@@ -257,14 +257,14 @@ function label(outcome: SecurityOutcome, independentlyChecked: boolean): string 
 }
 
 function tone(outcome: SecurityOutcome): StatusTone {
+  // The outcome palette (`outcomeTone`): a stop is the accent, a failure
+  // rose, everything else neutral. "Allowed" is not a confirmed good state,
+  // so it is never emerald, and "would have been blocked" needs nobody, so
+  // it is never amber.
   const tones: Partial<Record<SecurityOutcome, StatusTone>> = {
-    blocked_before_execution: "critical",
-    contained: "positive",
-    allowed: "positive",
-    would_block: "attention",
-    observed_only: "informational",
+    blocked_before_execution: "stopped",
+    contained: "stopped",
     failed: "critical",
-    reverted: "informational",
   };
   return tones[outcome] ?? "neutral";
 }

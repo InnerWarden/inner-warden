@@ -19,6 +19,34 @@ const noop = () => undefined;
 const serverCounts = { agent_messages: 1, agent_actions: 1, server_attacks: 3, other: 2 };
 
 describe("the tab row", () => {
+  /**
+   * A screen can say what a count is when it knows better than the lane's
+   * default ("0 waiting" while the list shows only what waits, where "0
+   * messages" read as data lost), and a partial read wears "~" with why.
+   *
+   * FAILS ON REVERT: ignore `unitFor` and the badge reads "0 messages"; ignore
+   * `partial` and a figure the host could not vouch for reads exact.
+   */
+  it("prints the unit a screen names, and a partial count as about", () => {
+    const html = renderToStaticMarkup(
+      <CaseLaneTabs
+        value="agent_messages"
+        counts={{ ...serverCounts, agent_messages: 0 }}
+        onChange={noop}
+        window="7d"
+        unitFor={() => ({ one: "waiting", many: "waiting" })}
+        partial
+      />,
+    );
+    expect(html).toContain("0 waiting");
+    expect(html).not.toContain("0 messages");
+    expect(html).toContain('aria-label="Messages to your AI agent, about 0 waiting in the last 7 days"');
+    expect(html).toMatch(/title="Counted from the newest records[^"]*"[^>]*>~0 waiting/);
+    const plain = renderToStaticMarkup(<CaseLaneTabs value="agent_messages" counts={serverCounts} onChange={noop} window="7d" />);
+    expect(plain).not.toContain("~");
+    expect(plain).toContain("1 message");
+  });
+
   it("offers the three lanes, named the way the operator names them, with the host's counts", () => {
     const html = renderToStaticMarkup(<CaseLaneTabs value="agent_actions" counts={{ ...serverCounts, server_attacks: 823 }} onChange={noop} panelId="case-list" />);
     expect(html).toContain('role="tablist"');

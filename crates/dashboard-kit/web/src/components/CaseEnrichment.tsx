@@ -81,7 +81,10 @@ export function CaseEnrichmentView({ enrichment, finding = false }: { enrichment
 
   return (
     <section className="min-w-0 space-y-4" aria-label="Case context">
-      <p className={LABEL}>What happened</p>
+      {/* Not "What happened": the summary card above already asks that, and
+          two eyebrows with one question read as the page repeating itself.
+          This is what each engine said. */}
+      <p className={LABEL}>What InnerWarden's engines reported</p>
       {enrichmentOrder(enrichment).map((key) => <Fragment key={key}>{blocks[key]}</Fragment>)}
       {/* A footnote used to close this section on every case: "Everything
           above is what the sensor, the rules and the model reported. It has
@@ -153,6 +156,12 @@ function Chip({ label, tone = "slate" }: { label: string; tone?: "slate" | "cyan
   );
 }
 
+/** A name that is only an id: a UUID, or a long run of hex. */
+export function isBareId(name: string): boolean {
+  const value = name.trim();
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value) || /^[0-9a-f]{16,}$/i.test(value);
+}
+
 // --- Agent activity: the AI agent was flagged doing something (dangerous command
 // / injected prompt). This is the most important block when present, so it leads.
 function AgentActivitySection({ value }: { value: AgentActivity }) {
@@ -162,9 +171,21 @@ function AgentActivitySection({ value }: { value: AgentActivity }) {
       <div className="flex flex-wrap items-start justify-between gap-2">
         <div className="min-w-0">
           <p className={LABEL}>AI agent flagged</p>
-          <h3 className="mt-1 break-words text-base font-semibold text-slate-950 [overflow-wrap:anywhere]">{value.agent_name}</h3>
+          {/* A bare session id is an investigator's handle, not a name. */}
+          {isBareId(value.agent_name) ? (
+            <>
+              <h3 className="mt-1 text-base font-semibold text-slate-950">An AI agent session</h3>
+              <TechnicalOnly>
+                <p className="mt-0.5 break-all font-mono text-xs text-slate-500">{value.agent_name}</p>
+              </TechnicalOnly>
+            </>
+          ) : (
+            <h3 className="mt-1 break-words text-base font-semibold text-slate-950 [overflow-wrap:anywhere]">{value.agent_name}</h3>
+          )}
         </div>
-        {risk != null && <Chip label={`Risk ${risk} of 100`} />}
+        {/* The guard's score has no ceiling of 100: "Risk 140 of 100" read as
+            a defect to anyone who opened the details. The score as it is. */}
+        {risk != null && <Chip label={`Risk score ${risk}`} />}
       </div>
       {value.command && (
         <div className="mt-3">

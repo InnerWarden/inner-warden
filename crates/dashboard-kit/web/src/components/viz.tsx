@@ -204,11 +204,36 @@ export const STEP_MARK_CLASS: Record<StepMark, string> = {
   verified: "h-2.5 w-2.5 rounded-full bg-emerald-500 ring-2 ring-emerald-100",
   unproven: "h-2.5 w-2.5 rounded-full border-[1.5px] border-slate-400 bg-white",
   unknown: "h-2.5 w-2.5 rounded-full border-[1.5px] border-slate-400 bg-white",
-  not_applicable: "h-0.5 w-2.5 bg-slate-300",
+  // slate-400, not 300: the dash has to survive a projector.
+  not_applicable: "h-0.5 w-2.5 bg-slate-400",
   no: "h-2.5 w-2.5 rounded-full border-2 border-rose-500 bg-white",
   stale: "h-2.5 w-2.5 rounded-full border border-slate-300 bg-white",
   waiting: "h-2.5 w-2.5 rounded-full bg-amber-500 ring-2 ring-amber-100",
 };
+
+/**
+ * A shape inside the two marks whose colour carries a claim, so the claim is
+ * never colour alone: a check on the confirmed mark and "!" on the one that
+ * waits on a person (SPEC 2.1). Every other mark is told apart by its shape.
+ */
+export function StepMarkGlyph({ mark }: { mark: StepMark }) {
+  if (mark === "verified") {
+    return (
+      <svg viewBox="0 0 10 10" aria-hidden="true" className="absolute inset-0 h-full w-full" fill="none" stroke="#ffffff" strokeWidth={1.6} strokeLinecap="round" strokeLinejoin="round">
+        <path d="M2.7 5.2 4.4 6.8 7.4 3.4" />
+      </svg>
+    );
+  }
+  if (mark === "waiting") {
+    return (
+      <svg viewBox="0 0 10 10" aria-hidden="true" className="absolute inset-0 h-full w-full" fill="#ffffff">
+        <rect x="4.35" y="2" width="1.3" height="4" rx="0.5" />
+        <circle cx="5" cy="7.6" r="0.75" />
+      </svg>
+    );
+  }
+  return null;
+}
 
 export type Step = {
   key: string;
@@ -218,6 +243,12 @@ export type Step = {
   words: string;
   /** Under the label when captions are drawn: a time, a gap. */
   caption?: ReactNode;
+  /**
+   * The caption in words, for a screen reader: the drawn caption is hidden
+   * from one (it is a picture of a time), so without this "Seen: on record"
+   * was said with no time at all.
+   */
+  captionWords?: string;
 };
 
 /** The Protection ladder keeps its literal five columns; any other ladder shares its columns evenly. */
@@ -238,11 +269,18 @@ export function Steps({
   steps,
   label,
   captions = false,
+  compact = false,
   className = "max-w-72",
 }: {
   steps: readonly Step[];
   label: string;
   captions?: boolean;
+  /**
+   * With captions, the tight form a case's summary card draws: a 12 px mark
+   * row and 12 px lines, so the ladder costs the decision under it as little
+   * height as it can (about 38 px, from about 54).
+   */
+  compact?: boolean;
   className?: string;
 }) {
   const columns = STEP_COLUMNS[steps.length] ?? "grid-flow-col auto-cols-fr";
@@ -256,8 +294,12 @@ export function Steps({
               className={`absolute left-1/2 top-1/2 h-px w-full ${stepsJoined(step.mark, steps[index + 1].mark) ? "bg-slate-800" : "bg-slate-200"}`}
             />
           ) : null;
-        const mark = <span aria-hidden="true" className={`relative block ${STEP_MARK_CLASS[step.mark]}`} />;
-        const said = <span className="sr-only">{`${step.label}: ${step.words}`}</span>;
+        const mark = (
+          <span aria-hidden="true" className={`relative block ${STEP_MARK_CLASS[step.mark]}`}>
+            <StepMarkGlyph mark={step.mark} />
+          </span>
+        );
+        const said = <span className="sr-only">{`${step.label}: ${step.words}${step.captionWords === undefined ? "" : `, ${step.captionWords}`}`}</span>;
         const title = `${step.label}: ${step.words}`;
         if (!captions) {
           return (
@@ -270,12 +312,12 @@ export function Steps({
         }
         return (
           <li key={step.key} data-stage={step.key} data-mark={step.mark} title={title} className="flex min-w-0 flex-col items-center">
-            <span className="relative flex h-5 w-full items-center justify-center">
+            <span className={`relative flex w-full items-center justify-center ${compact ? "h-3" : "h-5"}`}>
               {line}
               {mark}
             </span>
             {said}
-            <span aria-hidden="true" className="mt-0.5 max-w-full text-center text-[11px] leading-4 text-slate-600">
+            <span aria-hidden="true" className={`max-w-full text-center text-[11px] text-slate-600 ${compact ? "mt-px leading-3" : "mt-0.5 leading-4"}`}>
               <span className="block font-semibold text-slate-800">{step.label}</span>
               {step.caption === undefined ? null : <span className="block tabular-nums">{step.caption}</span>}
             </span>

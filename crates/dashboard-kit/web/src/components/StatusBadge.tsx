@@ -1,4 +1,10 @@
-export type StatusTone = "positive" | "informational" | "attention" | "critical" | "neutral";
+/**
+ * `stopped` is InnerWarden (or the kernel) stopping something: the outcome
+ * palette's accent, the colour the lane bars and the case rows draw a stop
+ * in, never emerald (emerald is a read back that was confirmed) and never
+ * rose (rose is a bad thing that happened).
+ */
+export type StatusTone = "positive" | "informational" | "attention" | "critical" | "neutral" | "stopped";
 
 export type StatusPresentation = {
   label: string;
@@ -12,15 +18,20 @@ const PRESENTATIONS: Record<string, Omit<StatusPresentation, "label"> & { label?
   healthy: { tone: "positive", symbol: "✓" },
   host_verified: { tone: "positive", symbol: "✓", label: "Host verified" },
   allowed: { tone: "positive", symbol: "✓" },
-  contained: { tone: "positive", symbol: "✓" },
-  blocked_before_execution: { tone: "critical", symbol: "×", label: "Blocked before execution" },
+  // A case's outcomes, in the outcome palette every screen draws them in
+  // (`outcomeTone`): a stop is the accent, a failure rose, anything only
+  // watched, let through or not on record neutral. Contained was emerald and
+  // a refusal before it ran red, one click from a lane bar drawing the same
+  // outcomes cyan.
+  contained: { tone: "stopped", symbol: "■" },
+  blocked_before_execution: { tone: "stopped", symbol: "■", label: "Blocked before execution" },
   failed: { tone: "critical", symbol: "×" },
   contradicted: { tone: "critical", symbol: "×" },
   conflicting: { tone: "critical", symbol: "×", label: "Conflicting identity" },
   unsupported: { tone: "critical", symbol: "–" },
   degraded: { tone: "attention", symbol: "!" },
   stale: { tone: "attention", symbol: "!" },
-  would_block: { tone: "attention", symbol: "!", label: "Would block" },
+  would_block: { tone: "neutral", symbol: "i", label: "Would block" },
   not_covered: { tone: "attention", symbol: "!", label: "Not covered" },
   not_configured: { tone: "neutral", symbol: "–", label: "Not configured" },
   unavailable: { tone: "neutral", symbol: "–" },
@@ -29,13 +40,13 @@ const PRESENTATIONS: Record<string, Omit<StatusPresentation, "label"> & { label?
   unknown: { tone: "neutral", symbol: "?" },
   declared: { tone: "informational", symbol: "i", label: "Declared only" },
   configured: { tone: "informational", symbol: "i", label: "Configured identity" },
-  observed_only: { tone: "informational", symbol: "i", label: "Observed only" },
+  observed_only: { tone: "neutral", symbol: "i", label: "Observed only" },
   visibility_only: { tone: "informational", symbol: "i", label: "Visibility only" },
   readiness_only: { tone: "informational", symbol: "i", label: "Readiness only" },
   observe: { tone: "informational", symbol: "i" },
   rehearse: { tone: "informational", symbol: "i" },
   loading: { tone: "informational", symbol: "…" },
-  reverted: { tone: "informational", symbol: "↺" },
+  reverted: { tone: "neutral", symbol: "↺" },
   pending: { tone: "attention", symbol: "…" },
   requested: { tone: "attention", symbol: "…" },
   applied: { tone: "attention", symbol: "!" },
@@ -111,8 +122,9 @@ export function StatusBadge({
     positive: "border-emerald-200 bg-emerald-50 text-emerald-800",
     informational: "border-blue-200 bg-blue-50 text-blue-800",
     attention: "border-amber-200 bg-amber-50 text-amber-900",
-    critical: "border-red-200 bg-red-50 text-red-800",
+    critical: "border-rose-200 bg-rose-50 text-rose-800",
     neutral: "border-slate-200 bg-slate-50 text-slate-700",
+    stopped: "border-cyan-200 bg-cyan-50 text-cyan-900",
   };
 
   return (

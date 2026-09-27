@@ -75,11 +75,11 @@ describe("the case page count line", () => {
   /**
    * A partial read is a bounded tail of the sources, and its numbers can FALL
    * while the store grows (one host read 4,924 and then 4,922). So it is never
-   * "at least N"; the line says the read was partial.
+   * "at least N"; the line says "about" and where it counted from.
    */
   it("says a partial read was partial, and never calls it a floor", () => {
     const label = casePageCountLabel(20, { rows_in_window: 312, total_in_window: 4_394, window_complete: false });
-    expect(label).toBe("20 rows on this page of 312 · 4,394 cases in this window, from a partial read");
+    expect(label).toBe("20 rows on this page of 312 · about 4,394 cases in this window (counted from the newest records)");
     expect(label).not.toContain("at least");
   });
 

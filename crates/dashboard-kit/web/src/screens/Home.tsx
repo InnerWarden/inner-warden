@@ -11,7 +11,8 @@ import {
 import type { CaseLane, CaseListWindow } from "../api/cases";
 import type { DashboardAccess } from "../api/v1";
 import { DecidedBy } from "../components/DecidedBy";
-import { LaneCards, type LaneOpenOptions } from "../components/LaneCards";
+import { LaneCards, outcomeTone, type LaneOpenOptions } from "../components/LaneCards";
+import { TONE_HEX } from "../components/viz";
 import { MachineIntelligence } from "../components/MachineIntelligence";
 import { Outcome } from "../components/Outcome";
 import { SensorActivity } from "../components/SensorActivity";
@@ -1158,11 +1159,14 @@ function RecentActivityEntry({ item, clickable }: { item: DecisionSummary; click
       ) : (
         // One final outcome for the row. The verdict before it is in the
         // line under the command, never a green pill beside a refusal.
+        // The kernel stopping it is the outcome palette's light accent, the
+        // colour its lane bar and its case draw it in: never rose, which is a
+        // bad thing that happened.
         <span
           data-final-outcome="kernel_stopped"
-          className="inline-flex shrink-0 self-start justify-self-start items-center gap-1.5 rounded-lg border border-rose-200 bg-rose-50 px-2.5 py-0.5 text-xs font-semibold leading-5 text-rose-800"
+          className="inline-flex shrink-0 self-start justify-self-start items-center gap-1.5 rounded-lg border border-cyan-200 bg-cyan-50 px-2.5 py-0.5 text-xs font-semibold leading-5 text-cyan-900"
         >
-          <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-rose-500" aria-hidden="true" />
+          <span className="h-1.5 w-1.5 shrink-0 rounded-full" style={{ background: TONE_HEX[outcomeTone("kernel_stopped").tone] }} aria-hidden="true" />
           {KERNEL_STOPPED_OUTCOME}
         </span>
       )}
@@ -1178,7 +1182,7 @@ function RecentActivityEntry({ item, clickable }: { item: DecisionSummary; click
           ))}
         </div>
         {stopped === undefined ? null : (
-          <p className="mt-1.5 break-words text-xs leading-5 text-rose-900 [overflow-wrap:anywhere]">{kernelStoppedDetail(item, stopped)}</p>
+          <p className="mt-1.5 break-words text-xs leading-5 text-slate-700 [overflow-wrap:anywhere]">{kernelStoppedDetail(item, stopped)}</p>
         )}
       </div>
       <div className="col-span-2 flex min-w-0 items-center justify-between gap-3 text-xs text-slate-500 sm:col-span-1 sm:block sm:max-w-28 sm:shrink-0 sm:text-right">
