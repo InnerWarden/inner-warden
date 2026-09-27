@@ -203,6 +203,39 @@ export function laneBreakdown(value: unknown, total: number): LanePart[] | undef
   return Number.isSafeInteger(sum) && sum === total ? parts : undefined;
 }
 
+/**
+ * What the AI agent's commands came to over one window, as the Protection page
+ * reads it (`posture.agent_commands`): the SAME tally the Overview's agent card
+ * counts, so the two screens print one number.
+ */
+export type AgentCommands = {
+  window: CaseListWindow;
+  count: number;
+  breakdown: LanePart[];
+  /** Program starts in the agent's scope the kernel refused that no command explains. */
+  unexplainedRefused?: number;
+  sentence: string;
+};
+
+/**
+ * The host's tally, or nothing when it cannot be shown honestly: a count, a
+ * known window, the host's sentence and a split that adds up to the count.
+ * One malformed part drops the tally, never the page it sits on.
+ */
+export function parseAgentCommands(value: unknown): AgentCommands | undefined {
+  const item = record(value);
+  if (item === undefined || item.count_of !== "commands") return undefined;
+  const count = wholeCount(item.count);
+  const window = isCaseListWindow(item.window) ? item.window : undefined;
+  const sentence = text(item.sentence, SENTENCE_MAX);
+  if (count === undefined || window === undefined || sentence === undefined) return undefined;
+  const breakdown = laneBreakdown(item.breakdown, count);
+  if (breakdown === undefined) return undefined;
+  const starts = record(item.unexplained_program_starts);
+  const refused = starts === undefined ? undefined : wholeCount(starts.refused);
+  return { window, count, breakdown, sentence, ...(refused === undefined ? {} : { unexplainedRefused: refused }) };
+}
+
 function latestOf(value: unknown): LaneLatest | undefined {
   const item = record(value);
   if (item === undefined) return undefined;

@@ -2,6 +2,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 
 import { LaneCards } from "./components/LaneCards";
+import { setTechnicalDetail } from "./components/TechnicalDetail";
 import { laneBreakdown, overviewLaneCards, parseLaneCard, type LaneCard } from "./lanes";
 import lanesOverview from "../tests/fixtures/enterprise/overview-lanes.json";
 
@@ -76,6 +77,36 @@ describe("the split of a card's number", () => {
     expect(html).toContain(">stopped by the kernel<");
     expect(html).not.toContain("may have run<");
     expect(html.indexOf("data-lane-count")).toBeLessThan(html.indexOf("data-lane-breakdown"));
+  });
+
+  /**
+   * The split is drawn as a bar, each part a segment as wide as its share,
+   * with the list under it as its legend. The host's sentence says the same
+   * parts in words, so it is the evidence behind the bar, one switch away.
+   *
+   * FAILS ON REVERT: print the sentence in the plain view again and the card
+   * says every number twice; size a segment by anything but its count and
+   * the widths stop adding up to the whole.
+   */
+  it("draws the split as a bar that adds up to the number, and keeps the sentence behind the switch", () => {
+    const card = parseLaneCard("agent_actions", { ...agent, breakdown: split }) as Extract<LaneCard, { state: "available" }>;
+    const plain = renderToStaticMarkup(<LaneCards cards={[card]} edition="enterprise" />);
+    const widths = [...plain.matchAll(/data-segment="([^"]+)"[^>]*?style="width:([\d.]+)%/g)];
+    expect(widths.map((match) => match[1])).toEqual(["refused_before_run", "kernel_stopped"]);
+    expect(widths.reduce((sum, match) => sum + Number(match[2]), 0)).toBeCloseTo(100, 5);
+    expect(plain).toContain('role="img" aria-label="What your AI agent did: what happened to each of the 2"');
+    expect(plain).not.toContain(card.sentence);
+    setTechnicalDetail(true);
+    try {
+      expect(renderToStaticMarkup(<LaneCards cards={[card]} edition="enterprise" />)).toContain(card.sentence);
+    } finally {
+      setTechnicalDetail(false);
+    }
+  });
+
+  it("keeps the sentence in the plain view on a card with no split to draw", () => {
+    const card = parseLaneCard("agent_actions", agent) as Extract<LaneCard, { state: "available" }>;
+    expect(renderToStaticMarkup(<LaneCards cards={[card]} edition="enterprise" />)).toContain(card.sentence);
   });
 
   /**

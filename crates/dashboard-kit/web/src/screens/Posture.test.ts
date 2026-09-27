@@ -1099,7 +1099,9 @@ describe("the agent sections never reach a host control", () => {
 
     expect(uses).toEqual([
       "{posture.local_model ? <LocalModelSection report={posture.local_model} /> : null}",
-      "{posture.agent_layer ? <AgentLayerSection report={posture.agent_layer} /> : null}",
+      // The one line the agent's section is drawn from also hands it the
+      // agent's command tally, which is not a host control either.
+      "{posture.agent_layer ? <AgentLayerSection report={posture.agent_layer} commands={posture.agent_commands} /> : null}",
     ]);
   });
 

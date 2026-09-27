@@ -47,14 +47,26 @@ const distAssets = join(webRoot, "dist", "assets");
 // 685,546B of assets. Community does not carry them and is unchanged. The JS
 // and single-asset lines move to 700,000B and the asset total to 760,000B,
 // about 10% over the measured bundle: room for known work, not a blank cheque.
+//
+// Re-measured 2026-09-27 for Protection and the Overview drawn instead of
+// written: the ring of controls and the proof ladder on each row, the agent's
+// commands as a bar, and in the paid edition the sensor's collectors with a
+// plot of the day, a Footprint card of pictures and the tiles of what is live
+// on the Overview. Built from this kit composed with the paid delta, the
+// Enterprise bundle is about 751,500B of JS and 808,500B of assets (691,576B
+// and 743,660B before). Community grows by about 14KB (404,168B to 418,552B
+// of JS). The JS and single-asset lines move to the measured bundle plus
+// 16,000B, rounded up to the next 5,000B: 770,000B; the asset total the same
+// way: 825,000B. Splitting the bundle would not help: this test sums every
+// .js in dist/assets.
 const FIRST_MEANINGFUL_CONTENT_BUDGET_MS = 4_000;
 const POLL_MIN_GAP_MS = 4_000; // the shell polls on a 5s interval; allow scheduling slack
 const POLL_MAX_REQUESTS_IN_WINDOW = 3; // over a ~7.5s observation window
 const MAX_CASES_PER_PAGE = 50; // a page must stay bounded regardless of the backend
-const MAX_TOTAL_JS_BYTES = 700_000;
+const MAX_TOTAL_JS_BYTES = 770_000;
 const MAX_TOTAL_CSS_BYTES = 60_000;
-const MAX_SINGLE_ASSET_BYTES = 700_000;
-const MAX_TOTAL_ASSET_BYTES = 760_000;
+const MAX_SINGLE_ASSET_BYTES = 770_000;
+const MAX_TOTAL_ASSET_BYTES = 825_000;
 
 const COMMUNITY_META = {
   version: "0.16.4-fixture",

@@ -427,6 +427,7 @@ const TONE_DOT: Record<CollectorTone, string> = {
   warning: "bg-red-500",
   attention: "bg-amber-500",
   positive: "bg-emerald-500",
+  informational: "bg-cyan-600",
   neutral: "bg-slate-400",
 };
 
@@ -434,6 +435,7 @@ const TONE_TEXT: Record<CollectorTone, string> = {
   warning: "text-red-800",
   attention: "text-amber-800",
   positive: "text-emerald-800",
+  informational: "text-cyan-800",
   neutral: "text-slate-600",
 };
 
@@ -441,6 +443,7 @@ const TONE_PILL: Record<CollectorTone, string> = {
   warning: "border-red-200 bg-red-50 text-red-800",
   attention: "border-amber-200 bg-amber-50 text-amber-800",
   positive: "border-emerald-200 bg-emerald-50 text-emerald-800",
+  informational: "border-cyan-200 bg-cyan-50 text-cyan-800",
   neutral: "border-slate-200 bg-slate-50 text-slate-600",
 };
 

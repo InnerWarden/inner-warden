@@ -100,7 +100,7 @@ export type CollectorLiveness =
   /** Declared, and nothing has attested it. NOT a synonym for working. */
   | "unattested";
 
-export type CollectorTone = "positive" | "attention" | "warning" | "neutral";
+export type CollectorTone = "positive" | "informational" | "attention" | "warning" | "neutral";
 
 /**
  * Which shared explanation a row falls under.
@@ -149,6 +149,7 @@ const IMPAIRED_STATES: Readonly<Record<string, string>> = {
   source_empty: "Source stale",
   permission_denied: "No permission",
   unsupported: "Unsupported",
+  failed: "Failed",
 };
 
 /**
@@ -170,6 +171,8 @@ function faultNote(health: { state: string; path?: string; last_write_iso?: stri
     case "source_empty":
       return `${health.path ?? "The source"} exists but has not been written to since `
         + `${health.last_write_iso ?? "an unrecorded time"}. The upstream service has stopped writing.`;
+    case "failed":
+      return "The sensor reports this collector failed.";
     case "permission_denied":
       return "The sensor lacks the OS capability to read this source. Check the unit's AmbientCapabilities.";
     default:
@@ -233,12 +236,18 @@ function describe(name: string, count: number, category: CollectorCategory, stat
       liveness: "impaired",
       active: false,
       label: IMPAIRED_STATES[state],
-      tone: "warning",
+      // Red only for what the host itself counts as broken: an unsupported
+      // collector is off on this platform, which is not a fault.
+      tone: state === "unsupported" ? "neutral" : "warning",
       noteKey: "impaired",
       // A fault verdict beside a non-zero count is a contradiction, and hiding
       // either half would be the dishonest way to resolve it.
       note: count > 0 ? `${fault} ${formatCount(count)} events were still recorded today.` : fault,
     });
+  }
+
+  if (state === "starting") {
+    return row({ liveness: "unattested", active: false, label: "Starting", tone: "neutral", noteKey: "impaired", note: "The sensor is still starting this collector." });
   }
 
   if (state !== undefined && DISABLED_STATES.includes(state)) {
@@ -251,7 +260,7 @@ function describe(name: string, count: number, category: CollectorCategory, stat
         liveness: "reporting",
         active: true,
         label: "Reporting",
-        tone: category === "alarm" ? "attention" : "positive",
+        tone: category === "alarm" ? "informational" : "positive",
         noteKey: "reporting",
       });
     }
@@ -259,7 +268,7 @@ function describe(name: string, count: number, category: CollectorCategory, stat
       liveness: "quiet",
       active: true,
       label: category === "alarm" ? "Quiet" : "Attached, silent",
-      tone: category === "alarm" ? "positive" : "attention",
+      tone: category === "alarm" ? "informational" : "neutral",
       noteKey: "quiet",
     });
   }
@@ -274,7 +283,7 @@ function describe(name: string, count: number, category: CollectorCategory, stat
       // must mean the same thing, and this one is running on the strength of
       // its own events rather than the sensor's attestation.
       label: "Reporting, no verdict",
-      tone: category === "alarm" ? "attention" : "positive",
+      tone: category === "alarm" ? "informational" : "positive",
       noteKey: "reporting_no_verdict",
     });
   }
@@ -283,10 +292,10 @@ function describe(name: string, count: number, category: CollectorCategory, stat
     liveness: "unattested",
     active: false,
     label: "Not attested",
-    // Loud for a stream that should never be at zero, neutral for the detectors
-    // whose silence is ordinary: a warning on every quiet alarm would train the
-    // operator to ignore the colour.
-    tone: category === "telemetry" ? "warning" : "neutral",
+    // Grey, never amber or red: nothing attested it, which is not the same as
+    // a fault the host counts. Amber is for what needs a person and red for
+    // what the host itself calls broken; an unknown is neither.
+    tone: "neutral",
     noteKey: "unattested",
   });
 }
@@ -489,7 +498,7 @@ export function collectorGroups(rows: readonly CollectorRow[]): CollectorGroup[]
 }
 
 /** Worst first. What needs attention should not be below the fold. */
-const TONE_ORDER: Record<CollectorTone, number> = { warning: 0, attention: 1, neutral: 2, positive: 3 };
+const TONE_ORDER: Record<CollectorTone, number> = { warning: 0, attention: 1, neutral: 2, informational: 3, positive: 4 };
 
 /**
  * The one-line verdict above the board.

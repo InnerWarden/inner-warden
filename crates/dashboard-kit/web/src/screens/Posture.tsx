@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { Children, type ReactNode } from "react";
 import type {
   AgentLayerReport,
   CapabilityStatus,
@@ -13,9 +13,13 @@ import type {
   RuntimeConvergence,
   ScopeRef,
 } from "../api/v1";
-import { StatusBadge } from "../components/StatusBadge";
+import { StatusBadge, statusPresentation } from "../components/StatusBadge";
 import { setTechnicalDetail, TechnicalOnly, useTechnicalDetail } from "../components/TechnicalDetail";
-import { formatClock, freshnessLabel, timeTitle } from "../presentation";
+import { OutcomeBreakdown } from "../components/LaneCards";
+import { controlGlyph, Glyph } from "../components/icons";
+import { Ring, type Part } from "../components/viz";
+import { LANE_WINDOW_PHRASE, type AgentCommands } from "../lanes";
+import { formatClock, formatCount, freshnessLabel, timeTitle } from "../presentation";
 import { layerAssuranceLabel, type LayerAssuranceLabel } from "../posture/assurance";
 import { POSTURE_REFRESH_MS } from "../posture/refresh";
 
@@ -834,6 +838,188 @@ export function unconfirmedLine(names: readonly string[]): string {
   return `${names.length} control${one ? "" : "s"} we can't confirm: ${listed}. We will not claim ${one ? "it" : "them"} either way.`;
 }
 
+/**
+ * Every control's chip for one read, and the assurance each chip was drawn
+ * from: the one computation this page's ring, counts and rows share, and the
+ * one a paid Overview tile calls too, with the veto and the held verification
+ * applied, so no two surfaces can tell two stories about the same read.
+ */
+export function controlPills(
+  posture: DashboardPosture,
+  bootstrap: DashboardBootstrap,
+  current: boolean,
+  evaluatedAt: string,
+): { assurances: LayerAssuranceLabel[]; pills: ControlPill[] } {
+  const assurances = posture.layers.map((layer) => assuranceFor(posture, layer, bootstrap, current, evaluatedAt));
+  const pills = posture.layers.map((layer, index) =>
+    controlPill(layer, bootstrap, posture.generated_at, current, evaluatedAt, assurances[index]));
+  return { assurances, pills };
+}
+
+/** How many controls wear each chip. */
+export type StateCount = {
+  key: "proven" | "softened" | "working" | "not_enabled" | "cannot_verify" | "needs_operator";
+  count: number;
+  label: string;
+};
+
+/**
+ * One count per state that has a control in it, in the order a reader
+ * weighs them, and the controls that need the reader ALWAYS, so a zero is
+ * seen rather than inferred. A softened control is counted apart, because
+ * its chip is apart ("Containing, not proven").
+ */
+export function stateCounts(pills: readonly ControlPill[]): StateCount[] {
+  const count = (test: (pill: ControlPill) => boolean) => pills.filter(test).length;
+  const needing = count((pill) => pill.disposition === "needs_operator");
+  const counts: StateCount[] = [
+    { key: "proven", count: count((pill) => pill.disposition === "proven"), label: "Protecting" },
+    { key: "softened", count: count((pill) => pill.disposition === "working_as_configured" && pill.softened), label: "Containing, not proven" },
+    { key: "working", count: count((pill) => pill.disposition === "working_as_configured" && !pill.softened), label: "Working as set up" },
+    { key: "not_enabled", count: count((pill) => pill.disposition === "not_enabled"), label: "Not turned on" },
+    { key: "cannot_verify", count: count((pill) => pill.disposition === "cannot_verify"), label: "Can't confirm" },
+  ];
+  return [
+    ...counts.filter((entry) => entry.count > 0),
+    { key: "needs_operator", count: needing, label: needing === 1 ? "Needs you" : "Need you" },
+  ];
+}
+
+/**
+ * The ring's segments: one per control, in the order the host sent them,
+ * each the colour of the chip it wears after the veto. Only a proven control
+ * is emerald; one this page cannot confirm is an outline, never a fill; a
+ * read that is not current is all grey.
+ */
+export function ringParts(pills: readonly ControlPill[], current: boolean): Part[] {
+  return pills.map((pill, index): Part => {
+    const base = { key: String(index), value: 1, label: `${pill.name}: ${pill.mode}` };
+    if (!current) return { ...base, tone: "off" };
+    switch (pill.disposition) {
+      case "proven":
+        return { ...base, tone: "proven" };
+      case "working_as_configured":
+        return { ...base, tone: "working" };
+      case "needs_operator":
+        return { ...base, tone: "attention" };
+      case "cannot_verify":
+        return { ...base, tone: "unknown", hollow: true };
+      default:
+        return { ...base, tone: "off" };
+    }
+  });
+}
+
+/** When the newest of the controls was checked, or nothing when none was. */
+export function latestCheck(layers: readonly Pick<ProtectionLayer, "freshness">[]): string | undefined {
+  let latest: string | undefined;
+  for (const layer of layers) {
+    const at = layer.freshness.observed_at;
+    if (typeof at === "string" && Number.isFinite(Date.parse(at)) && (latest === undefined || Date.parse(at) > Date.parse(latest))) latest = at;
+  }
+  return latest;
+}
+
+const COUNT_CHIP: Record<StateCount["key"], string> = {
+  proven: "border-emerald-200 bg-emerald-50 text-emerald-900",
+  softened: "border-cyan-200 bg-cyan-50 text-cyan-900",
+  working: "border-cyan-200 bg-cyan-50 text-cyan-900",
+  not_enabled: "border-slate-200 bg-slate-50 text-slate-700",
+  cannot_verify: "border-dashed border-slate-400 bg-white text-slate-700",
+  needs_operator: "border-slate-200 bg-white text-slate-600",
+};
+
+const COUNT_DOT: Record<StateCount["key"], string> = {
+  proven: "bg-emerald-500",
+  softened: "bg-cyan-600",
+  working: "bg-cyan-600",
+  not_enabled: "bg-slate-200",
+  cannot_verify: "border border-dashed border-slate-400",
+  needs_operator: "bg-amber-500",
+};
+
+/** The verdict: the ring of controls, the host's headline, a count per state. */
+function PostureHero({ pills, current, posture, children }: { pills: ControlPill[]; current: boolean; posture: DashboardPosture; children: ReactNode }) {
+  const [technical] = useTechnicalDetail();
+  const total = pills.length;
+  const needing = pills.filter((pill) => needsOperator(pill.disposition)).length;
+  const working = pills.filter((pill) => pill.disposition === "proven" || pill.disposition === "working_as_configured").length;
+  const checked = latestCheck(posture.layers);
+  const clock = checked === undefined ? undefined : formatClock(checked, new Date(), technical ? "UTC" : undefined);
+  const ringLabel = !current
+    ? `${total} host controls, refreshing`
+    : needing > 0
+      ? `${needing} of ${total} host controls need you`
+      : `${working} of ${total} host controls working`;
+  return (
+    <div className="flex flex-col items-center gap-5 px-5 py-5 sm:flex-row sm:items-center sm:gap-7 sm:px-6">
+      <Ring parts={ringParts(pills, current)} size={144} stroke={12} label={ringLabel}>
+        {!current ? (
+          <span className="text-sm font-semibold text-slate-500">Refreshing</span>
+        ) : needing > 0 ? (
+          <>
+            <span className="text-4xl font-semibold text-amber-600">{needing}</span>
+            <span className="mt-0.5 text-xs font-medium text-amber-800">{needing === 1 ? "needs you" : "need you"}</span>
+          </>
+        ) : (
+          <>
+            <span className="text-4xl font-semibold text-slate-950">{working}</span>
+            <span className="mt-0.5 text-xs font-medium text-slate-500">of {total} working</span>
+          </>
+        )}
+      </Ring>
+      <div className="min-w-0 flex-1">
+        <h3 id="posture-verdict-title" className="text-xl font-semibold tracking-tight text-slate-950 sm:text-2xl">
+          {children}
+        </h3>
+        <ul className="mt-3 flex flex-wrap gap-2" aria-label="Host controls">
+          {current
+            ? stateCounts(pills).map((entry) => (
+              <li
+                key={entry.key}
+                data-state={entry.key}
+                className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-xs font-medium ${
+                  entry.key === "needs_operator" && entry.count > 0 ? "border-amber-200 bg-amber-50 text-amber-900" : COUNT_CHIP[entry.key]
+                }`}
+              >
+                {entry.key === "needs_operator" && entry.count === 0 ? null : (
+                  <span aria-hidden="true" className={`h-2 w-2 shrink-0 rounded-full ${COUNT_DOT[entry.key]}`} />
+                )}
+                <span className="font-semibold tabular-nums">{entry.count}</span> {entry.label}
+              </li>
+            ))
+            : <li className="inline-flex rounded-full border border-slate-200 bg-white px-2.5 py-0.5 text-xs font-medium text-slate-600">Refreshing</li>}
+        </ul>
+        <p className="mt-3 text-xs text-slate-500">
+          {current ? (clock === undefined ? "Not checked yet." : `Checked ${clock}.`) : "Reading the host again."}
+        </p>
+        {/* The host's own count, never replacing the headline. It is a
+            second count from a second source, and beside the headline in
+            the plain view it read as a second verdict; it stays for
+            whoever checks one against the other. */}
+        {controlCountLine(posture) ? (
+          <TechnicalOnly>
+            <p className="mt-1 text-xs leading-5 text-slate-500">{controlCountLine(posture)}</p>
+          </TechnicalOnly>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * The host's sentence with each backticked command drawn as code, so a
+ * command the reader runs looks like one, and no backtick is printed.
+ */
+export function withCode(sentence: string): ReactNode[] {
+  return sentence.split(/`([^`]+)`/).map((part, index) =>
+    index % 2 === 1 ? (
+      <code key={index} className="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[0.85em] text-slate-800 [overflow-wrap:anywhere]">{part}</code>
+    ) : (
+      part
+    ));
+}
+
 // ────────────────────────────────── screen ───────────────────────────────────
 
 export function Posture({
@@ -851,11 +1037,9 @@ export function Posture({
    *  refresh handle simply does not render the button. */
   onCheckNow?: () => void | Promise<void>;
 }) {
-  // One assurance per control for this read, shared by its chip, its row and
-  // the headline, so the three cannot tell different stories.
-  const assurances = posture.layers.map((layer) => assuranceFor(posture, layer, bootstrap, current, evaluatedAt));
-  const pills = posture.layers.map((layer, index) =>
-    controlPill(layer, bootstrap, posture.generated_at, current, evaluatedAt, assurances[index]));
+  // One assurance per control for this read, shared by its segment of the
+  // ring, its row and the headline, so the three cannot tell different stories.
+  const { assurances, pills } = controlPills(posture, bootstrap, current, evaluatedAt);
   // A gap is an amber card only when the control that OWNS it is asking for
   // the reader. The gap text still exists everywhere else: it stays in the
   // owning control's disclosure: so nothing is hidden; only the routing
@@ -875,6 +1059,10 @@ export function Posture({
   // when the host listed none for it: the section said "No gaps" under a
   // DNS Guard reading "Can't confirm · never checked".
   const unconfirmed = current ? unconfirmedControls(posture.layers, pills) : [];
+  // The one line alone sits beside its heading on a wide screen: a card
+  // around a single sentence read as a second verdict. Amber gap cards keep
+  // their own layout.
+  const compactGaps = operatorGaps.length === 0 && unconfirmed.length > 0;
 
   return (
     <div className="space-y-6">
@@ -901,46 +1089,10 @@ export function Posture({
       </div>
 
       {posture.layers.length > 0 ? (
-        <section data-tour="posture" aria-labelledby="posture-verdict-title" className="overflow-hidden rounded-2xl border border-slate-200 bg-gradient-to-br from-white to-slate-50">
-          <div className="px-5 py-5 sm:px-6">
-            <h3 id="posture-verdict-title" className="text-2xl font-semibold tracking-tight text-slate-950">
-              {postureHeadline(pills, posture.summary)}
-            </h3>
-            {/* The host's own count, never replacing the headline. It is a
-                second count from a second source, and beside the headline in
-                the plain view it read as a second verdict; it stays for
-                whoever checks one against the other. */}
-            {controlCountLine(posture) ? (
-              <TechnicalOnly>
-                <p className="mt-1.5 text-sm leading-6 text-slate-600">{controlCountLine(posture)}</p>
-              </TechnicalOnly>
-            ) : null}
-            <ul className="mt-4 flex flex-wrap gap-2" aria-label="Host controls">
-              {pills.map((pill, index) => (
-                <li
-                  // By the layer, not the name: names come from a product
-                  // table now, and two layers could share one.
-                  key={posture.layers[index].id}
-                  title={pill.reason}
-                  className={`inline-flex max-w-full flex-wrap items-center gap-x-2 gap-y-0.5 rounded-full border px-3 py-1.5 text-xs font-semibold ${
-                    pill.tone === "positive"
-                      ? "border-emerald-200 bg-emerald-50 text-emerald-900"
-                      : pill.tone === "attention"
-                        ? "border-amber-200 bg-amber-50 text-amber-900"
-                        : pill.tone === "informational"
-                          ? "border-cyan-200 bg-cyan-50 text-cyan-900"
-                          : "border-slate-200 bg-white text-slate-700"
-                  }`}
-                >
-                  <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-current opacity-70" aria-hidden="true" />
-                  {/* Wrapped, never cut: at 320 px "Independent host
-                      execution" was cut to "Independent ho..." */}
-                  <span className="min-w-0 break-words">{pill.name}</span>
-                  <span className="shrink-0 font-medium opacity-80">{pill.mode}</span>
-                </li>
-              ))}
-            </ul>
-          </div>
+        <section data-tour="posture" aria-labelledby="posture-verdict-title" className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
+          <PostureHero pills={pills} current={current} posture={posture}>
+            {postureHeadline(pills, posture.summary)}
+          </PostureHero>
         </section>
       ) : (
         <p className="rounded-lg border border-slate-200 bg-slate-50 px-4 py-3 text-sm leading-6 text-slate-600">
@@ -950,6 +1102,24 @@ export function Posture({
 
       <section aria-labelledby="posture-controls-title">
         <h3 id="posture-controls-title" className="sr-only">Control details</h3>
+        {posture.layers.length > 0 ? (
+          <>
+            {/* The five stages once, over the column every row's ladder sits
+                in, so the ladders read as one matrix. Under lg the rows
+                stack, and the stages are named once above them instead. */}
+            <div aria-hidden="true" className="hidden px-4 pb-1.5 lg:flex lg:items-end lg:gap-6">
+              <span className="flex-1" />
+              <span className="w-48" />
+              <span className="grid w-72 grid-cols-5 text-center text-[11px] font-medium text-slate-500">
+                {STAGES.map(([, label]) => <span key={label}>{label}</span>)}
+              </span>
+              <span className="w-32" />
+            </div>
+            <p aria-hidden="true" className="pb-1.5 text-[11px] font-medium text-slate-500 lg:hidden">
+              {STAGES.map(([, label]) => label).join(" › ")}
+            </p>
+          </>
+        ) : null}
         <div className="space-y-2">
           {posture.layers.map((layer, index) => (
             <ControlRow
@@ -969,16 +1139,24 @@ export function Posture({
         </TechnicalOnly>
       </section>
 
-      <section aria-labelledby="posture-gaps-title">
-        <div className="mb-2">
-          <h2 id="posture-gaps-title" className="text-lg font-semibold tracking-tight text-slate-950">Coverage gaps</h2>
+      <section aria-labelledby="posture-gaps-title" className={compactGaps ? "sm:flex sm:items-baseline sm:gap-4" : undefined}>
+        <div className={compactGaps ? "mb-1 shrink-0 sm:mb-0" : "mb-2"}>
+          <h2 id="posture-gaps-title" className={`${compactGaps ? "text-base" : "text-lg"} font-semibold tracking-tight text-slate-950`}>Coverage gaps</h2>
         </div>
         {operatorGaps.length > 0 ? (
           <div className="space-y-3">{operatorGaps.map((gap) => <GapCard key={gap.id} gap={gap} />)}</div>
         ) : null}
         {unconfirmed.length > 0 ? (
-          <p data-unconfirmed-controls className={`${operatorGaps.length > 0 ? "mt-3 " : ""}rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm leading-6 text-slate-700`}>
-            {unconfirmedLine(unconfirmed)}
+          <p
+            data-unconfirmed-controls
+            className={compactGaps
+              ? "flex min-w-0 items-start gap-2 text-sm leading-6 text-slate-700"
+              : `${operatorGaps.length > 0 ? "mt-3 " : ""}rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm leading-6 text-slate-700`}
+          >
+            {compactGaps ? (
+              <span aria-hidden="true" className="mt-1 flex h-4 w-4 shrink-0 items-center justify-center rounded-full border border-dashed border-slate-400 text-[10px] font-semibold text-slate-500">?</span>
+            ) : null}
+            <span className="min-w-0">{unconfirmedLine(unconfirmed)}</span>
           </p>
         ) : null}
         {operatorGaps.length === 0 && unconfirmed.length === 0 ? (
@@ -987,11 +1165,25 @@ export function Posture({
       </section>
 
       {/* Below the host controls, and outside them. A producer that sends
-          neither renders everything above and nothing here, unchanged. */}
-      {posture.local_model ? <LocalModelSection report={posture.local_model} /> : null}
-      {posture.agent_layer ? <AgentLayerSection report={posture.agent_layer} /> : null}
+          neither renders everything above and nothing here, unchanged. Side
+          by side on a wide screen, each holding its own figure. */}
+      <AgentBand>
+        {posture.local_model ? <LocalModelSection report={posture.local_model} /> : null}
+        {posture.agent_layer ? <AgentLayerSection report={posture.agent_layer} commands={posture.agent_commands} /> : null}
+      </AgentBand>
     </div>
   );
+}
+
+/**
+ * The agent-side sections as one band: side by side on a wide screen when
+ * there are two, each holding its own figure; nothing at all when there are
+ * none. It reads only what it is handed, never the posture.
+ */
+function AgentBand({ children }: { children: ReactNode }) {
+  const sections = Children.toArray(children);
+  if (sections.length === 0) return null;
+  return <div className={sections.length > 1 ? "grid gap-4 lg:grid-cols-2" : undefined}>{sections}</div>;
 }
 
 /** The chrome both agent-side sections share, so the separation from the host
@@ -1073,7 +1265,7 @@ function SectionFigures({ rows }: { rows: SectionRow[] }) {
           {layout.tiles.map((row) => (
             <div key={row.id} className="rounded-xl border border-slate-200 bg-white px-3 py-2">
               <dt className="text-xs font-medium text-slate-500">{row.label}</dt>
-              <dd className="mt-0.5 text-lg font-semibold tabular-nums text-slate-950">{row.value}</dd>
+              <dd className="mt-0.5 text-2xl font-semibold text-slate-950">{row.value}</dd>
               {/* The population, in the host's words. A count without one is how
                   a decision total gets read as a claim about enforcement. Said
                   once under the figures when every figure shares it. */}
@@ -1160,11 +1352,53 @@ function LocalModelSection({ report }: { report: LocalModelReport }) {
   );
 }
 
-function AgentLayerSection({ report }: { report: AgentLayerReport }) {
+/**
+ * The agent's commands over the card's window, drawn: the count the
+ * Overview's agent card prints, the split of it as a bar with its legend,
+ * the parts that read zero said once, and the program starts the kernel
+ * refused that no command explains.
+ */
+function AgentCommandsFigure({ commands }: { commands: AgentCommands }) {
+  const zeros = commands.breakdown.filter((part) => part.count === 0);
+  const refused = commands.unexplainedRefused ?? 0;
+  return (
+    <div className="mt-3">
+      <p className="flex flex-wrap items-baseline gap-x-2">
+        <span data-agent-commands-count className="text-4xl font-semibold text-slate-950">{formatCount(commands.count)}</span>
+        {" "}
+        <span className="text-sm text-slate-500">{commands.count === 1 ? "command" : "commands"} {LANE_WINDOW_PHRASE[commands.window]}</span>
+      </p>
+      {commands.count > 0 ? (
+        <OutcomeBreakdown parts={commands.breakdown} label={`What happened to each of the ${formatCount(commands.count)} commands`} className="mt-4" />
+      ) : null}
+      {commands.count > 0 && zeros.length > 0 ? (
+        <p className="mt-2 text-xs leading-5 text-slate-500">
+          <span className="font-semibold text-slate-600">Zero: </span>
+          {zeros.map((part) => part.label).join("; ")}.
+        </p>
+      ) : null}
+      {refused > 0 ? (
+        <p className="mt-3 text-sm leading-6 text-slate-700">
+          The kernel also refused {formatCount(refused)} program {refused === 1 ? "start" : "starts"} in the agent's scope that no command explains.
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
+function AgentLayerSection({ report, commands }: { report: AgentLayerReport; commands?: AgentCommands }) {
   const figures = agentLayerFigures(report);
+  const notMeasured = report.not_measured.length;
   return (
     <AgentSideSection titleId="posture-agent-layer-title" title={report.display_name}>
-      <p className="mt-2 text-sm leading-6 text-slate-700">{report.summary}</p>
+      {/* With the host's tally the section leads with it, drawn; the host's
+          sentence says the same facts in words and moves behind the switch
+          with the record's own figures. Without it, as before. */}
+      {commands ? (
+        <AgentCommandsFigure commands={commands} />
+      ) : (
+        <p className="mt-2 text-sm leading-6 text-slate-700">{report.summary}</p>
+      )}
       {/* Three states, three renders. A record that was read and holds zeroes
           keeps its zeroes; a record that could not be opened shows no figure at
           all, with the cause the host named. */}
@@ -1176,7 +1410,17 @@ function AgentLayerSection({ report }: { report: AgentLayerReport }) {
           <span className="[overflow-wrap:anywhere] text-slate-500">{report.reason}</span>
         </p>
       )}
-      <SectionFigures rows={sectionRows(report)} />
+      {commands ? (
+        <>
+          {notMeasured > 0 ? <NotMeasuredNote count={notMeasured} /> : null}
+          <TechnicalOnly>
+            <p className="mt-4 border-t border-slate-200 pt-3 text-sm leading-6 text-slate-700">{report.summary}</p>
+            <SectionFigures rows={sectionRows(report)} />
+          </TechnicalOnly>
+        </>
+      ) : (
+        <SectionFigures rows={sectionRows(report)} />
+      )}
       {/* The session ids, the record's basis and its file are the evidence
           behind the figures, for whoever audits them. The section's eyebrow
           already says, in the plain view, that none of it is a host control. */}
@@ -1236,40 +1480,64 @@ function ControlRow({
   );
 
   const name = controlName(layer);
+  const softened = claimSoftened(layer, assurance.verifiedActive);
+  const glyph = controlGlyph([layer.id, ...layer.capability_ids]);
+  const scoped = layer.effective_scope.some((scope) => scope.kind !== "host");
   const [technical] = useTechnicalDetail();
   return (
     <article className="rounded-2xl border border-slate-200 bg-white px-4 py-3 shadow-sm">
-      <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-2 lg:flex-nowrap lg:gap-6">
         {/* A basis of its own, so on a narrow screen the title takes the
-            row and the badge, scope and time wrap under it. With a basis of
-            zero it stayed beside them, shrank to what they left (26 px at
-            320) and broke "Execution Gate" into a column of fragments. */}
-        <div className="min-w-0 flex-[1_1_12rem]">
-          <h3 className="break-words text-base font-semibold text-slate-950">{name.name}</h3>
-          {name.description === undefined ? null : (
-            <p className="text-xs text-slate-500">{name.description}</p>
+            row and the badge and time wrap under it. With a basis of zero it
+            stayed beside them, shrank to what they left (26 px at 320) and
+            broke "Execution Gate" into a column of fragments. */}
+        <div className="flex min-w-0 flex-[1_1_100%] items-start gap-3 lg:flex-1">
+          {glyph === undefined ? null : (
+            <span className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-slate-100 text-slate-700">
+              <Glyph name={glyph} />
+            </span>
           )}
+          <div className="min-w-0 flex-1">
+            <h3 className="break-words text-base font-semibold text-slate-950">{name.name}</h3>
+            {name.description === undefined ? null : (
+              <p className="text-xs text-slate-500">{name.description}</p>
+            )}
+            {/* The scope, plainly, only where it is narrower than the host:
+                "this host" on every other row said nothing. */}
+            {scoped ? (
+              <p className="mt-1 break-words text-xs text-slate-600 [overflow-wrap:anywhere]">
+                <span className="text-slate-500">Covers </span>
+                {withCode(scopeDisplay(layer.effective_scope))}
+              </p>
+            ) : null}
+          </div>
         </div>
-        <StatusBadge
-          status={current ? disposition : "stale"}
-          label={current ? dispositionLabel(disposition, claimSoftened(layer, assurance.verifiedActive)) : "Refreshing"}
-          className="shrink-0"
-        />
-        <span className="[overflow-wrap:anywhere] text-sm text-slate-600">{scopeDisplay(layer.effective_scope)}</span>
-        <span
-          className="shrink-0 text-xs font-medium text-slate-500"
-          title={current && layer.freshness.observed_at ? timeTitle(layer.freshness.observed_at) : undefined}
-        >
-          {current ? checkedAt(layer.freshness, new Date(), technical ? "UTC" : undefined) : "refreshing"}
-        </span>
+        <div className="flex min-w-0 flex-1 items-center justify-between gap-3 lg:contents">
+          <span className="lg:w-48 lg:shrink-0">
+            <ControlBadge status={current ? disposition : "stale"} label={current ? dispositionLabel(disposition, softened) : "Refreshing"} />
+          </span>
+          <span className="hidden lg:block lg:w-72 lg:shrink-0">
+            <Ladder layer={layer} name={name.name} current={current} softened={softened} />
+          </span>
+          <span
+            className="shrink-0 text-right text-xs font-medium text-slate-500 lg:w-32"
+            title={current && layer.freshness.observed_at ? timeTitle(layer.freshness.observed_at) : undefined}
+          >
+            {current ? checkedAt(layer.freshness, new Date(), technical ? "UTC" : undefined) : "refreshing"}
+          </span>
+        </div>
+        <div className="w-full lg:hidden">
+          <Ladder layer={layer} name={name.name} current={current} softened={softened} />
+        </div>
       </div>
+      {technical && current ? <StageReasons convergence={layer.convergence} /> : null}
 
       {/* The sentence, on the row, not one click away.
           Someone installing this for the first time should not have to open a
           disclosure called "How this was verified" to learn that a grey control
           is grey because they have not turned it on yet. */}
       {current ? (
-        <p className="mt-1 text-sm leading-6 text-slate-600">{dispositionReason(layer, disposition)}</p>
+        <p className="mt-2 text-sm leading-6 text-slate-600">{withCode(dispositionReason(layer, disposition))}</p>
       ) : null}
 
       <details className="mt-2 border-t border-slate-100 pt-2">
@@ -1287,10 +1555,6 @@ function ControlRow({
             <span className="text-xs text-slate-500">
               {layer.evidence.length} evidence record{layer.evidence.length === 1 ? "" : "s"} · {freshnessLabel(layer.freshness)}
             </span>
-          </div>
-          <div>
-            <h4 className="text-xs font-semibold uppercase tracking-wide text-slate-500">Runtime convergence</h4>
-            <Convergence convergence={layer.convergence} current={current} />
           </div>
           <div>
             <h4 className="text-xs font-semibold uppercase tracking-wide text-slate-500">Effective scope</h4>
@@ -1325,25 +1589,117 @@ function ControlRow({
   );
 }
 
-function Convergence({ convergence, current }: { convergence: RuntimeConvergence; current: boolean }) {
-  const stages = [
-    ["Configured", convergence.configured],
-    ["Loaded", convergence.loaded],
-    ["Running", convergence.running],
-    ["Enforcing", convergence.enforcing],
-    ["Verified effective", convergence.verified_effective],
-  ] as const;
+/**
+ * A control's state on its row, in the colours its segment of the ring and
+ * its count chip wear: emerald only for a proven control, cyan for one doing
+ * what it was set up to do, amber only for one that needs the reader, an
+ * outline for one this page cannot confirm.
+ */
+const CONTROL_BADGE: Record<LayerDisposition | "stale", string> = {
+  proven: "border-emerald-200 bg-emerald-50 text-emerald-800",
+  working_as_configured: "border-cyan-200 bg-cyan-50 text-cyan-800",
+  needs_operator: "border-amber-200 bg-amber-50 text-amber-900",
+  cannot_verify: "border-dashed border-slate-400 bg-white text-slate-700",
+  not_enabled: "border-slate-200 bg-slate-50 text-slate-700",
+  stale: "border-slate-200 bg-slate-50 text-slate-600",
+};
+
+function ControlBadge({ status, label }: { status: LayerDisposition | "stale"; label: string }) {
   return (
-    <ol className="mt-2 grid grid-cols-2 gap-2 sm:grid-cols-5">
-      {stages.map(([label, stage]) => (
-        <li key={label} className="rounded-lg border border-slate-100 bg-slate-50 p-2.5">
-          <div className="text-[11px] font-semibold text-slate-600">{label}</div>
-          <div className="mt-1"><StatusBadge status={current ? stage.state : "stale"} /></div>
-          {stage.reason_code ? <div className="mt-1 [overflow-wrap:anywhere] text-[10px] text-slate-500">{humanize(stage.reason_code)}</div> : null}
+    <span data-status={status} className={`inline-flex w-fit max-w-full shrink-0 items-start gap-1.5 rounded-md border px-2.5 py-1 text-xs font-semibold leading-4 ${CONTROL_BADGE[status]}`}>
+      <span className="shrink-0 font-bold" aria-hidden="true">{statusPresentation(status).symbol}</span>
+      <span className="min-w-0 break-words">{label}</span>
+    </span>
+  );
+}
+
+/** The five stages a control is proven through, in order. */
+export const STAGES = [
+  ["configured", "Configured"],
+  ["loaded", "Loaded"],
+  ["running", "Running"],
+  ["enforcing", "Enforcing"],
+  ["verified_effective", "Verified"],
+] as const satisfies readonly (readonly [keyof RuntimeConvergence, string])[];
+
+/** How one stage is drawn. */
+export type StageMark = "done" | "verified" | "unproven" | "unknown" | "not_applicable" | "no" | "stale";
+
+/**
+ * One stage's mark: a filled dot for a stage that is so, the Verified stage
+ * emerald only when the chip agrees (a softened control's Verified is
+ * hollow: the host says it, this page could not pin the proof), a hollow dot
+ * for what is not known, a dash for a stage that does not apply, a red ring
+ * for a factual No, and all hollow on a read that is not current.
+ */
+export function stageMark(state: RuntimeConvergence["configured"]["state"], verifiedStage: boolean, softened: boolean, current: boolean): StageMark {
+  if (!current) return "stale";
+  switch (state) {
+    case "yes":
+      if (!verifiedStage) return "done";
+      return softened ? "unproven" : "verified";
+    case "no":
+      return "no";
+    case "not_applicable":
+      return "not_applicable";
+    default:
+      return "unknown";
+  }
+}
+
+const STAGE_MARK_CLASS: Record<StageMark, string> = {
+  done: "h-2.5 w-2.5 rounded-full bg-slate-800",
+  verified: "h-2.5 w-2.5 rounded-full bg-emerald-500 ring-2 ring-emerald-100",
+  unproven: "h-2.5 w-2.5 rounded-full border-[1.5px] border-slate-400 bg-white",
+  unknown: "h-2.5 w-2.5 rounded-full border-[1.5px] border-slate-400 bg-white",
+  not_applicable: "h-0.5 w-2.5 bg-slate-300",
+  no: "h-2.5 w-2.5 rounded-full border-2 border-rose-500 bg-white",
+  stale: "h-2.5 w-2.5 rounded-full border border-slate-300 bg-white",
+};
+
+const STAGE_MARK_WORDS: Record<StageMark, string> = {
+  done: "yes",
+  verified: "yes, verified on this host",
+  unproven: "the host reports it verified; this page could not pin the proof",
+  unknown: "not known",
+  not_applicable: "does not apply",
+  no: "no",
+  stale: "refreshing",
+};
+
+/**
+ * How far a control is proven: five dots, joined where two neighbouring
+ * stages are both so. Aligned into one matrix down the page on a wide screen.
+ */
+export function Ladder({ layer, name, current, softened }: { layer: Pick<ProtectionLayer, "convergence">; name: string; current: boolean; softened: boolean }) {
+  const marks = STAGES.map(([key], index) => stageMark(layer.convergence[key].state, index === STAGES.length - 1, softened, current));
+  const solid = (mark: StageMark) => mark === "done" || mark === "verified";
+  return (
+    <ol aria-label={`How far ${name} is proven`} className="grid w-full max-w-72 grid-cols-5">
+      {STAGES.map(([key, label], index) => (
+        <li key={key} data-stage={key} data-mark={marks[index]} title={`${label}: ${STAGE_MARK_WORDS[marks[index]]}`} className="relative flex h-5 items-center justify-center">
+          {index < STAGES.length - 1 ? (
+            <span
+              aria-hidden="true"
+              className={`absolute left-1/2 top-1/2 h-px w-full ${solid(marks[index]) && solid(marks[index + 1]) ? "bg-slate-800" : "bg-slate-200"}`}
+            />
+          ) : null}
+          <span aria-hidden="true" className={`relative block ${STAGE_MARK_CLASS[marks[index]]}`} />
+          <span className="sr-only">{`${label}: ${STAGE_MARK_WORDS[marks[index]]}`}</span>
         </li>
       ))}
     </ol>
   );
+}
+
+/** The host's reason for each stage that is not a plain yes, in words, for the technical view. */
+function StageReasons({ convergence }: { convergence: RuntimeConvergence }) {
+  const reasons = STAGES.flatMap(([key, label]) => {
+    const stage = convergence[key];
+    return stage.state !== "yes" && stage.reason_code ? [`${label}: ${humanize(stage.reason_code)}`] : [];
+  });
+  if (reasons.length === 0) return null;
+  return <p className="mt-1.5 text-[11px] leading-4 text-slate-500 [overflow-wrap:anywhere]">{reasons.join(" · ")}</p>;
 }
 
 function GapCard({ gap }: { gap: CoverageGap }) {

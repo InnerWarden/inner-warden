@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
-import { TechnicalDetailToggle } from "./TechnicalDetail";
+import { TechnicalDetailToggle, useTechnicalDetail } from "./TechnicalDetail";
 import logo from "../assets/logo.svg";
 
 /**
@@ -17,6 +17,14 @@ export type HeaderNavigationItem<Route extends string> = {
  * Whether a key press closes the small-screen menu: Escape, the way every
  * menu that floats over a page closes.
  */
+/**
+ * The release a reader names ("0.16.66"), without the build it came from
+ * ("+g267f0bd5..."): the build is evidence, one switch away.
+ */
+export function shortVersion(version: string): string {
+  return version.split("+")[0];
+}
+
 export function closesMenu(key: string): boolean {
   return key === "Escape";
 }
@@ -49,6 +57,7 @@ export function Header<Route extends string>({
   // button, so the header is one row over the nav instead of three: at 320
   // px it took 175 of 640 px before the page began.
   const [menuOpen, setMenuOpen] = useState(false);
+  const [technical] = useTechnicalDetail();
   const menuButton = useRef<HTMLButtonElement>(null);
   const menuPanel = useRef<HTMLDivElement>(null);
 
@@ -95,7 +104,7 @@ export function Header<Route extends string>({
             <span className="text-sm font-semibold text-slate-900">{editionLabel}</span>
             {/* Below 400 px the version costs the header a row; it is one
                 click away in the product's own status. */}
-            {version ? <span className="hidden text-[11px] font-medium text-slate-500 min-[400px]:inline">v{version}</span> : null}
+            {version ? <span className="hidden text-[11px] font-medium text-slate-500 min-[400px]:inline" title={`v${version}`}>v{technical ? version : shortVersion(version)}</span> : null}
           </div>
         </button>
 
