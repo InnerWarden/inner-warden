@@ -189,6 +189,103 @@ export function Swatch({ part, className = "h-2.5 w-2.5" }: { part: Pick<Part, "
   );
 }
 
+/**
+ * How one step of a ladder is drawn, the same marks wherever a ladder is:
+ * a filled dot for a step that is so, emerald only for one read back and
+ * confirmed, a hollow dot for what is not known (or not checked by anything
+ * else), a dash for a step that does not apply, a red ring for a factual No,
+ * a faint outline on a read that is not current, and amber only for a step
+ * that waits on a person.
+ */
+export type StepMark = "done" | "verified" | "unproven" | "unknown" | "not_applicable" | "no" | "stale" | "waiting";
+
+export const STEP_MARK_CLASS: Record<StepMark, string> = {
+  done: "h-2.5 w-2.5 rounded-full bg-slate-800",
+  verified: "h-2.5 w-2.5 rounded-full bg-emerald-500 ring-2 ring-emerald-100",
+  unproven: "h-2.5 w-2.5 rounded-full border-[1.5px] border-slate-400 bg-white",
+  unknown: "h-2.5 w-2.5 rounded-full border-[1.5px] border-slate-400 bg-white",
+  not_applicable: "h-0.5 w-2.5 bg-slate-300",
+  no: "h-2.5 w-2.5 rounded-full border-2 border-rose-500 bg-white",
+  stale: "h-2.5 w-2.5 rounded-full border border-slate-300 bg-white",
+  waiting: "h-2.5 w-2.5 rounded-full bg-amber-500 ring-2 ring-amber-100",
+};
+
+export type Step = {
+  key: string;
+  label: string;
+  mark: StepMark;
+  /** What the mark means, said aloud and in the title: "Enforced: yes, by the kernel". */
+  words: string;
+  /** Under the label when captions are drawn: a time, a gap. */
+  caption?: ReactNode;
+};
+
+/** The Protection ladder keeps its literal five columns; any other ladder shares its columns evenly. */
+const STEP_COLUMNS: Record<number, string> = { 5: "grid-cols-5" };
+
+/** Two neighbouring steps are joined by a dark line only when both are so. */
+export function stepsJoined(left: StepMark, right: StepMark): boolean {
+  const solid = (mark: StepMark) => mark === "done" || mark === "verified";
+  return solid(left) && solid(right);
+}
+
+/**
+ * A ladder of steps: one mark per step, joined where two neighbours are both
+ * so. Without captions it is the Protection ladder's row exactly; with them
+ * each step's label and caption sit under its mark.
+ */
+export function Steps({
+  steps,
+  label,
+  captions = false,
+  className = "max-w-72",
+}: {
+  steps: readonly Step[];
+  label: string;
+  captions?: boolean;
+  className?: string;
+}) {
+  const columns = STEP_COLUMNS[steps.length] ?? "grid-flow-col auto-cols-fr";
+  return (
+    <ol aria-label={label} className={`grid w-full ${className} ${columns}`}>
+      {steps.map((step, index) => {
+        const line =
+          index < steps.length - 1 ? (
+            <span
+              aria-hidden="true"
+              className={`absolute left-1/2 top-1/2 h-px w-full ${stepsJoined(step.mark, steps[index + 1].mark) ? "bg-slate-800" : "bg-slate-200"}`}
+            />
+          ) : null;
+        const mark = <span aria-hidden="true" className={`relative block ${STEP_MARK_CLASS[step.mark]}`} />;
+        const said = <span className="sr-only">{`${step.label}: ${step.words}`}</span>;
+        const title = `${step.label}: ${step.words}`;
+        if (!captions) {
+          return (
+            <li key={step.key} data-stage={step.key} data-mark={step.mark} title={title} className="relative flex h-5 items-center justify-center">
+              {line}
+              {mark}
+              {said}
+            </li>
+          );
+        }
+        return (
+          <li key={step.key} data-stage={step.key} data-mark={step.mark} title={title} className="flex min-w-0 flex-col items-center">
+            <span className="relative flex h-5 w-full items-center justify-center">
+              {line}
+              {mark}
+            </span>
+            {said}
+            <span aria-hidden="true" className="mt-0.5 max-w-full text-center text-[11px] leading-4 text-slate-600">
+              <span className="block font-semibold text-slate-800">{step.label}</span>
+              {step.caption === undefined ? null : <span className="block tabular-nums">{step.caption}</span>}
+            </span>
+          </li>
+        );
+      })}
+    </ol>
+  );
+}
+
 /** The share of a spark's box left above its highest point, so a peak never reads as a ceiling. */
 export const SPARK_HEADROOM = 0.25;
 

@@ -16,7 +16,9 @@ import { Bar, Swatch, type Part } from "./viz";
  * never reads as a settled state. A key this bundle does not know is plain
  * grey: it still counts, and it claims nothing.
  */
-const OUTCOME_TONES: Record<string, Pick<Part, "tone" | "hatched">> = {
+export type OutcomeTone = Pick<Part, "tone" | "hatched" | "hollow">;
+
+const OUTCOME_TONES: Record<string, OutcomeTone> = {
   refused_before_run: { tone: "accent" },
   kernel_stopped: { tone: "accentLight" },
   unsafe_may_have_run: { tone: "bad" },
@@ -29,14 +31,36 @@ const OUTCOME_TONES: Record<string, Pick<Part, "tone" | "hatched">> = {
   declined_by_agent: { tone: "watch" },
   filtered_by_provider: { tone: "other" },
   answered: { tone: "watchLight" },
+  // A case's own outcome (`SecurityOutcome`), in the same jobs: InnerWarden
+  // blocking it is the accent, the kernel refusing it before it ran the
+  // lighter accent (never rose: nothing bad happened), only watched or let
+  // through is grey, a failed action is the one bad outcome, what nobody saw
+  // is hatched and what the record does not say is an outline, never a fill.
+  contained: { tone: "accent" },
+  blocked_before_execution: { tone: "accentLight" },
+  would_block: { tone: "watch" },
+  observed_only: { tone: "watchLight" },
+  reverted: { tone: "other" },
+  failed: { tone: "bad" },
+  not_observed: { tone: "other", hatched: true },
+  unknown: { tone: "unknown", hollow: true },
 };
+
+/**
+ * The tone of one outcome, by the key the host counts it under, on every
+ * screen that draws one: a lane's bar, a case's row, a flow's end. A key this
+ * bundle does not know is plain grey: it still counts, and it claims nothing.
+ */
+export function outcomeTone(key: string): OutcomeTone {
+  return OUTCOME_TONES[key] ?? { tone: "other" };
+}
 
 export function outcomeParts(parts: readonly LanePart[]): Part[] {
   return parts.map((part) => ({
     key: part.key,
     value: part.count,
     label: `${part.label}: ${formatCount(part.count)}`,
-    ...(OUTCOME_TONES[part.key] ?? { tone: "other" as const }),
+    ...outcomeTone(part.key),
   }));
 }
 

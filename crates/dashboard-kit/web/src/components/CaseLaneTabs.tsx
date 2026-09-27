@@ -3,6 +3,7 @@ import { CASE_LANES, everythingCount, type CaseLaneCounts } from "../api/lanes";
 import { EVERYTHING_COPY, LANE_COPY, LANE_WINDOW_PHRASE, type CaseLaneChoice } from "../lanes";
 import { CASE_WINDOW_LABELS, CASE_WINDOWS, type CaseWindow } from "./CaseFilters";
 import { useTechnicalDetail } from "./TechnicalDetail";
+import { Glyph, laneGlyph } from "./icons";
 import { formatCount } from "../presentation";
 import { windowWords } from "../windows";
 
@@ -109,6 +110,12 @@ export function laneTabId(choice: CaseLaneChoice): string {
   return `case-lane-tab-${choice}`;
 }
 
+/** The lane's glyph before its name; hidden from screen readers, the name says it. */
+function TabGlyph({ choice }: { choice: CaseLaneChoice }) {
+  const glyph = laneGlyph(choice);
+  return glyph === undefined ? null : <Glyph name={glyph} className="h-4 w-4 opacity-80" />;
+}
+
 /**
  * The lane tabs on a Cases screen.
  *
@@ -130,6 +137,7 @@ export function CaseLaneTabs({
   panelId,
   window,
   onWindowChange,
+  intro = true,
 }: {
   value: CaseLaneChoice;
   counts?: CaseLaneCounts;
@@ -158,6 +166,12 @@ export function CaseLaneTabs({
    * "Time window" for one value, one applying at once and one on Apply.
    */
   onWindowChange?: (next: CaseWindow) => void;
+  /**
+   * Whether the row says what the open tab lists (`laneIntro`) under itself.
+   * A screen that says it elsewhere, beside the lane's own numbers, passes
+   * `false`, so the sentence is on screen once.
+   */
+  intro?: boolean;
 }) {
   const [technical] = useTechnicalDetail();
   const tabs = laneTabs(value, counts, technical);
@@ -194,6 +208,7 @@ export function CaseLaneTabs({
                   : "border-slate-300 bg-white text-slate-700 hover:bg-slate-50"
               }`}
             >
+              <TabGlyph choice={tab.choice} />
               <span className="min-w-0 break-words">{tab.label}</span>
               {tab.count !== undefined ? (
                 <span
@@ -222,7 +237,7 @@ export function CaseLaneTabs({
           </label>
         ) : null}
       </div>
-      <p className="mt-2 max-w-3xl text-sm leading-6 text-slate-600">{laneIntro(value)}</p>
+      {intro ? <p className="mt-2 max-w-3xl text-sm leading-6 text-slate-600">{laneIntro(value)}</p> : null}
     </div>
   );
 }

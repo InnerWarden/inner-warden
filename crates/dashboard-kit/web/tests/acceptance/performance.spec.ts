@@ -73,14 +73,27 @@ const distAssets = join(webRoot, "dist", "assets");
 // 60,000B CSS line does not move. The JS and single-asset lines move to the
 // measured bundle plus 16,000B, rounded up to the next 5,000B: 785,000B; the
 // asset total the same way: 845,000B.
+//
+// Re-measured 2026-09-27 for Cases drawn the way Protection and the Overview
+// are: this kit's shared step marks, lane glyphs and one outcome palette, and
+// in the paid edition a lane card over the list, rows that read at a glance,
+// and a case that tells its story (the four step ladder, who it was, what the
+// agent tried and who stopped it, the events in order, what it touched). Built
+// from this kit composed with the paid delta, the Enterprise bundle is
+// 810,886B of JS, 58,207B of CSS and 869,093B of assets (766,733B of JS
+// before). Community grows by under 2KB (421,525B of JS). The CSS was held
+// under its line by reusing utilities, so the 60,000B CSS line does not move.
+// The JS and single-asset lines move to the measured bundle plus 16,000B,
+// rounded up to the next 5,000B: 830,000B; the asset total the same way:
+// 890,000B.
 const FIRST_MEANINGFUL_CONTENT_BUDGET_MS = 4_000;
 const POLL_MIN_GAP_MS = 4_000; // the shell polls on a 5s interval; allow scheduling slack
 const POLL_MAX_REQUESTS_IN_WINDOW = 3; // over a ~7.5s observation window
 const MAX_CASES_PER_PAGE = 50; // a page must stay bounded regardless of the backend
-const MAX_TOTAL_JS_BYTES = 785_000;
+const MAX_TOTAL_JS_BYTES = 830_000;
 const MAX_TOTAL_CSS_BYTES = 60_000;
-const MAX_SINGLE_ASSET_BYTES = 785_000;
-const MAX_TOTAL_ASSET_BYTES = 845_000;
+const MAX_SINGLE_ASSET_BYTES = 830_000;
+const MAX_TOTAL_ASSET_BYTES = 890_000;
 
 const COMMUNITY_META = {
   version: "0.16.4-fixture",

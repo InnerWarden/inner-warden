@@ -146,3 +146,64 @@ describe("the case context, rendered", () => {
     expect(renderToStaticMarkup(<CaseEnrichmentView enrichment={noGeo.enrichment} />)).not.toContain("No geolocation");
   });
 });
+
+describe("the case context says a finding is a finding, in neutral labels", () => {
+  const empty = { detection: null, ai: null, agent_activity: null, rules: [], mitre: [], threat_intel: null, honeypot: null, dns: [], reason_code: null };
+
+  /**
+   * THE DEFECT THIS PINS: a case whose own timeline holds the incident that
+   * opened it was told "No detector, AI model, or rule flagged this as
+   * malicious" whenever its engines left nothing here.
+   *
+   * FAILS ON REVERT: ignore `finding` and the banner contradicts the page.
+   */
+  it("never calls a finding a raw host observation", () => {
+    const bare = parseUnifiedCase({ ...heldBackCase, enrichment: empty }).enrichment;
+    expect(renderToStaticMarkup(<CaseEnrichmentView enrichment={bare} />)).toContain("Raw host observation");
+    expect(renderToStaticMarkup(<CaseEnrichmentView enrichment={bare} finding />)).toBe("");
+  });
+
+  /**
+   * The detector's report is quoted evidence; the page above already says
+   * what happened. A check written as a command is for whoever runs the
+   * server.
+   *
+   * FAILS ON REVERT: print the reason or the ctl command in the plain view.
+   */
+  it("keeps the detector's report and a command-shaped check for the technical view", () => {
+    const reason = heldBackCase.enrichment.detection.reason;
+    const plain = renderToStaticMarkup(<CaseEnrichmentView enrichment={parsed.enrichment} />);
+    expect(plain).not.toContain(reason);
+    expect(plain).not.toContain("innerwarden-ctl");
+    setTechnicalDetail(true);
+    const technical = renderToStaticMarkup(<CaseEnrichmentView enrichment={parsed.enrichment} />);
+    expect(technical).toContain(reason);
+    expect(technical).toContain("<li");
+    expect(technical).toContain("innerwarden-ctl get incidents --detector honeypot");
+  });
+
+  /**
+   * Amber on a case means a person is needed, and rose a bad thing that
+   * happened. A MITRE id, a rule, a reputation score, a campaign and a count
+   * of captured logins are neither.
+   *
+   * FAILS ON REVERT: put any chip back on amber or rose.
+   */
+  it("draws MITRE, rules, reputation, campaigns and captured logins without amber or rose", () => {
+    const loud = parseUnifiedCase({
+      ...heldBackCase,
+      enrichment: {
+        ...heldBackCase.enrichment,
+        mitre: [{ technique_id: "T1110", technique_name: "Brute Force", tactic: "credential-access" }],
+        rules: [{ kind: "correlation", id: "r1", name: "Repeat" }],
+        threat_intel: { ...heldBackCase.enrichment.threat_intel, abuseipdb_score: 97, dshield: true, campaign_ids: ["c-1"] },
+        honeypot: { ...heldBackCase.enrichment.honeypot, credentials_seen: 3 },
+      },
+    }).enrichment;
+    const html = renderToStaticMarkup(<CaseEnrichmentView enrichment={loud} />);
+    expect(html).toContain("T1110");
+    expect(html).toContain("AbuseIPDB 97 of 100");
+    expect(html).toContain("3 credentials captured");
+    expect(html).not.toMatch(/amber-|rose-/);
+  });
+});

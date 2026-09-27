@@ -2,7 +2,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { latestCaseWindow, overviewLaneCards, parseLaneCard, type LaneCard } from "../lanes";
-import { LaneCards, laneLink, lanesIntro, type LaneOpenOptions } from "./LaneCards";
+import { LaneCards, laneLink, lanesIntro, outcomeTone, type LaneOpenOptions } from "./LaneCards";
 import { When } from "./When";
 // Both written by the paid server's own tests, not by hand.
 import lanesOverview from "../../tests/fixtures/enterprise/overview-lanes.json";
@@ -317,6 +317,32 @@ describe("the newest case on a card", () => {
       [lanesOverview.lanes.server_attacks.latest.case_id, "server_attacks", "all"],
       [lanesOverview.lanes.agent_actions.latest.case_id, "agent_actions", "7d"],
     ]);
+  });
+});
+
+describe("one tone per outcome, on every screen that draws one", () => {
+  const SECURITY_OUTCOMES = ["observed_only", "allowed", "blocked_before_execution", "would_block", "contained", "failed", "reverted", "not_observed", "unknown"] as const;
+
+  /**
+   * A case's outcome is drawn in the same jobs as a lane's: InnerWarden
+   * stopping it is the accent (the kernel's refusal the lighter one, never
+   * rose), a failed action the one bad outcome, and what the record does not
+   * say an outline.
+   *
+   * FAILS ON REVERT: drop a case outcome from the table and it falls to the
+   * unknown key's plain grey; colour a kernel refusal rose and this sees it.
+   */
+  it("gives every case outcome its own tone, with failed the only bad one", () => {
+    for (const outcome of SECURITY_OUTCOMES) {
+      const tone = outcomeTone(outcome);
+      expect(tone.tone === "bad", outcome).toBe(outcome === "failed");
+    }
+    expect(outcomeTone("contained")).toEqual({ tone: "accent" });
+    expect(outcomeTone("blocked_before_execution")).toEqual({ tone: "accentLight" });
+    expect(outcomeTone("kernel_stopped")).toEqual(outcomeTone("blocked_before_execution"));
+    expect(outcomeTone("unknown")).toEqual({ tone: "unknown", hollow: true });
+    expect(outcomeTone("not_observed").hatched).toBe(true);
+    expect(outcomeTone("a_key_from_a_newer_host")).toEqual({ tone: "other" });
   });
 });
 

@@ -1,7 +1,7 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 
-import { arcPath, Bar, drawnParts, Gauge, partFill, Ring, RING_OFF, Spark, sparkPoints, TONE_HEX, type Part } from "./viz";
+import { arcPath, Bar, drawnParts, Gauge, partFill, Ring, RING_OFF, Spark, sparkPoints, STEP_MARK_CLASS, Steps, stepsJoined, TONE_HEX, type Part, type StepMark } from "./viz";
 
 /**
  * The shared drawing primitives. A visual is read before a word is, so each
@@ -104,5 +104,56 @@ describe("the sparkline", () => {
     const html = renderToStaticMarkup(<Spark values={[4]} label="one point" />);
     expect(html).not.toContain("polyline");
     expect(html).toContain('aria-label="one point"');
+  });
+});
+
+describe("the ladder's steps", () => {
+  const MARKS: readonly StepMark[] = ["done", "verified", "unproven", "unknown", "not_applicable", "no", "stale", "waiting"];
+  const step = (key: string, mark: StepMark) => ({ key, label: key, mark, words: `${key} words` });
+
+  /**
+   * The colour rules a ladder carries wherever it is drawn: amber is a person
+   * needed and nothing else, emerald is read back and confirmed and nothing
+   * else, and what is not known is an outline.
+   *
+   * FAILS ON REVERT: give `unknown` or `unproven` a fill, or a second mark
+   * amber, and this sees it.
+   */
+  it("keeps amber for waiting, emerald for verified, and draws the unknown hollow", () => {
+    for (const mark of MARKS) {
+      expect(STEP_MARK_CLASS[mark].includes("amber"), mark).toBe(mark === "waiting");
+      expect(STEP_MARK_CLASS[mark].includes("emerald"), mark).toBe(mark === "verified");
+    }
+    expect(STEP_MARK_CLASS.unknown).toContain("bg-white");
+    expect(STEP_MARK_CLASS.unproven).toContain("bg-white");
+    expect(STEP_MARK_CLASS.not_applicable).toContain("h-0.5");
+    expect(STEP_MARK_CLASS.no).toContain("border-rose-500");
+  });
+
+  it("joins two neighbours with a dark line only when both are so", () => {
+    expect(stepsJoined("done", "verified")).toBe(true);
+    expect(stepsJoined("done", "done")).toBe(true);
+    for (const mark of ["unproven", "unknown", "not_applicable", "no", "stale", "waiting"] as const) {
+      expect(stepsJoined("done", mark), mark).toBe(false);
+      expect(stepsJoined(mark, "done"), mark).toBe(false);
+    }
+  });
+
+  it("says every step aloud and in its title, and marks it for tests by stage and mark", () => {
+    const html = renderToStaticMarkup(<Steps label="How far" steps={[step("seen", "done"), step("decided", "waiting"), step("enforced", "not_applicable"), step("verified", "not_applicable")]} />);
+    expect(html).toContain('aria-label="How far"');
+    expect(html).toContain("grid-flow-col auto-cols-fr");
+    expect([...html.matchAll(/data-mark="([^"]+)"/g)].map((match) => match[1])).toEqual(["done", "waiting", "not_applicable", "not_applicable"]);
+    expect(html).toContain('title="decided: decided words"');
+    expect(html).toContain('<span class="sr-only">decided: decided words</span>');
+  });
+
+  it("prints each label and caption under its mark when captions are asked for, hidden from a screen reader that already heard them", () => {
+    const html = renderToStaticMarkup(
+      <Steps label="Case" captions steps={[{ ...step("seen", "done"), caption: "14:56 BST" }, step("verified", "verified")]} />,
+    );
+    expect(html).toContain("14:56 BST");
+    expect(html).toContain('aria-hidden="true" class="mt-0.5');
+    expect((html.match(/font-semibold text-slate-800">/g) ?? []).length).toBe(2);
   });
 });

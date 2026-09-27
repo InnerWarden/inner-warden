@@ -204,4 +204,29 @@ describe("the span beside each count", () => {
     expect(html).not.toContain("Time window");
     expect(html).toContain('aria-label="Attacks on this server, 3 cases"');
   });
+
+  /**
+   * Each lane wears its glyph, the same one its card wears, hidden from a
+   * screen reader: the tab's name is what is said, and it does not change.
+   */
+  it("puts the lane's glyph before its name, hidden, and keeps the name the tab is called by", () => {
+    const html = renderToStaticMarkup(<CaseLaneTabs value="agent_actions" counts={serverCounts} onChange={noop} window="7d" />);
+    expect(html.match(/<svg viewBox="0 0 16 16" aria-hidden="true"/g)).toHaveLength(3);
+    expect(html).toContain('aria-label="What your AI agent did, 1 session in the last 7 days"');
+    expect(html).toContain('aria-label="Attacks on this server, 3 cases in the last 7 days"');
+  });
+
+  /**
+   * A screen that says what the lane lists beside the lane's numbers passes
+   * `intro={false}`, so the sentence is on screen once; every other caller
+   * still gets it under the row.
+   *
+   * FAILS ON REVERT: ignore the prop and the sentence is printed twice on the
+   * paid Cases screen.
+   */
+  it("leaves the lane's sentence out only when told to", () => {
+    const sentence = laneIntro("agent_actions");
+    expect(renderToStaticMarkup(<CaseLaneTabs value="agent_actions" counts={serverCounts} onChange={noop} />)).toContain(sentence);
+    expect(renderToStaticMarkup(<CaseLaneTabs value="agent_actions" counts={serverCounts} onChange={noop} intro={false} />)).not.toContain(sentence);
+  });
 });
