@@ -29,6 +29,7 @@ import {
   dispositionReason,
   dispositionTone,
   emptyGapsLine,
+  GAPS_SCOPE_NOTE,
   gapAudience,
   effectiveDisposition,
   modelProvenance,
@@ -451,13 +452,13 @@ describe("gap routing: amber is reserved for what the user must act on", () => {
 describe("the empty gaps state is one quiet line", () => {
   it("says the positive thing and stops", () => {
     expect(emptyGapsLine(0)).toBe(
-      "No gaps reported by the host controls above. Sensor collector state is not part of this check.",
+      "No gaps reported by the host controls above.",
     );
   });
 
   it("stays honest when only verification-lane gaps exist", () => {
     expect(emptyGapsLine(3)).toBe(
-      "No gaps in the host controls above need your attention. Sensor collector state is not part of this check.",
+      "No gaps in the host controls above need your attention.",
     );
   });
 
@@ -478,7 +479,7 @@ describe("the empty gaps state is one quiet line", () => {
       const line = emptyGapsLine(total);
       expect(line).not.toContain("No coverage gaps");
       expect(line).toContain("host controls above");
-      expect(line).toContain("Sensor collector state is not part of this check.");
+      expect(GAPS_SCOPE_NOTE).toBe("Sensor collector state is not part of this check.");
     }
   });
 });

@@ -1,7 +1,7 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 
-import { arcPath, Bar, drawnParts, Gauge, partFill, Ring, Spark, sparkPoints, TONE_HEX, type Part } from "./viz";
+import { arcPath, Bar, drawnParts, Gauge, partFill, Ring, RING_OFF, Spark, sparkPoints, TONE_HEX, type Part } from "./viz";
 
 /**
  * The shared drawing primitives. A visual is read before a word is, so each
@@ -31,6 +31,17 @@ describe("the ring", () => {
     expect(hollow).not.toContain('stroke-width="12"');
     expect(hollow).not.toContain(TONE_HEX.proven);
     expect(hollow).not.toContain(TONE_HEX.working);
+  });
+
+  /**
+   * FAILS ON REVERT: the bar's off (slate-200) on the ring's slate-100 track
+   * is 1.1 to 1 and cannot be seen; the legend alone carried the count.
+   */
+  it("draws an off part a shade darker than the track", () => {
+    const html = renderToStaticMarkup(<Ring label="x" parts={[part("o", 1, { tone: "off" }), part("w", 1)]} />);
+    const off = html.slice(html.indexOf('data-segment="o"'), html.indexOf('data-segment="w"'));
+    expect(off).toContain(RING_OFF);
+    expect(off).not.toContain(TONE_HEX.off);
   });
 
   it("draws only the track when nothing has a value", () => {
@@ -73,8 +84,20 @@ describe("the sparkline", () => {
     expect(sparkPoints([0, 0, 0], 24)).toBe("0.0,24.0 50.0,24.0 100.0,24.0");
   });
 
-  it("puts the peak at the top of its own scale", () => {
-    expect(sparkPoints([0, 5, 10], 24)).toBe("0.0,24.0 50.0,13.0 100.0,2.0");
+  it("puts the peak near the top of its own scale, with a quarter of the box above it", () => {
+    expect(sparkPoints([0, 5, 10], 24)).toBe("0.0,24.0 50.0,15.4 100.0,6.8");
+  });
+
+  /**
+   * FAILS ON REVERT: a steady series scaled to its peak filled the box, and
+   * its 12% fill read as a solid slab, a rendering glitch rather than a flow.
+   */
+  it("draws a steady series as a level line at mid-height, and fades its area to nothing", () => {
+    expect(sparkPoints([100, 104, 98, 101], 24)).toBe("0.0,12.0 33.3,12.0 66.7,12.0 100.0,12.0");
+    const html = renderToStaticMarkup(<Spark values={[1, 3, 2]} label="a flow" />);
+    expect(html).toContain("<linearGradient");
+    expect(html).toContain('stop-opacity="0"');
+    expect(html).not.toContain('fill-opacity="0.12"');
   });
 
   it("draws nothing for fewer than two points, and says what it plots", () => {

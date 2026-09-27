@@ -80,13 +80,14 @@ export const LANE_WINDOW_PHRASE: Record<CaseListWindow, string> = windowWords("d
  * lane lists sessions, so a bare number there would read as a count of the
  * cases the link opens, and it is not one.
  */
-export const LANE_COUNT_OF = ["messages", "commands", "findings"] as const;
+export const LANE_COUNT_OF = ["messages", "commands", "findings", "cases"] as const;
 export type LaneCountOf = (typeof LANE_COUNT_OF)[number];
 
 const COUNT_NOUNS: Record<LaneCountOf, { one: string; many: string }> = {
   messages: { one: "message", many: "messages" },
   commands: { one: "command", many: "commands" },
   findings: { one: "finding", many: "findings" },
+  cases: { one: "case", many: "cases" },
 };
 
 /**

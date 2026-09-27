@@ -8,12 +8,13 @@ import { TechnicalOnly } from "./TechnicalDetail";
 import { Bar, Swatch, type Part } from "./viz";
 
 /**
- * What happened to each command, as a colour with a job: InnerWarden stopping
- * it is the accent (before it ran darker, the kernel lighter), a command that
- * may have run while judged unsafe is the one bad outcome, what was only
- * watched or allowed is grey, and what nobody answered or nobody could place
- * is hatched so it never reads as a settled state. A key this bundle does not
- * know is plain grey: it still counts, and it claims nothing.
+ * What happened to each command or message, as a colour with a job:
+ * InnerWarden stopping it is the accent (before it ran darker, the kernel
+ * lighter), a command that may have run while judged unsafe is the one bad
+ * outcome, what was only watched, declined by the agent itself or allowed is
+ * grey, and what nobody answered or nobody could place is hatched so it
+ * never reads as a settled state. A key this bundle does not know is plain
+ * grey: it still counts, and it claims nothing.
  */
 const OUTCOME_TONES: Record<string, Pick<Part, "tone" | "hatched">> = {
   refused_before_run: { tone: "accent" },
@@ -23,6 +24,11 @@ const OUTCOME_TONES: Record<string, Pick<Part, "tone" | "hatched">> = {
   held_for_review: { tone: "other", hatched: true },
   unplaced: { tone: "other", hatched: true },
   allowed: { tone: "watchLight" },
+  // Messages to the agent (the paid host's messages card).
+  stopped_by_innerwarden: { tone: "accent" },
+  declined_by_agent: { tone: "watch" },
+  filtered_by_provider: { tone: "other" },
+  answered: { tone: "watchLight" },
 };
 
 export function outcomeParts(parts: readonly LanePart[]): Part[] {

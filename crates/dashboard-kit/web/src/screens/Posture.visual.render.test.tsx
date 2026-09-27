@@ -3,8 +3,8 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import type { AgentLayerReport, CapabilityStatus, DashboardBootstrap, DashboardPosture, EvidenceRef, LayerDisposition, ProtectionLayer, ScopeRef } from "../api/v1";
 import { setTechnicalDetail } from "../components/TechnicalDetail";
-import { TONE_HEX } from "../components/viz";
-import { controlPills, latestCheck, ringParts, stageMark, stateCounts, withCode, Posture } from "./Posture";
+import { RING_OFF, TONE_HEX } from "../components/viz";
+import { checkedLate, controlPills, latestCheck, reasonAddsToBadge, ringParts, stageMark, stateCounts, withCode, Posture } from "./Posture";
 
 /**
  * Protection drawn: a ring with one segment per control, a count per state,
@@ -164,7 +164,7 @@ describe("the ring of controls", () => {
 
   it("is all grey and says Refreshing on a read that is not current", () => {
     const html = render(posture([gate(), watcher()]), bootstrap(), false);
-    for (const drawn of strokes(html)) expect(drawn).toContain(`stroke="${TONE_HEX.off}"`);
+    for (const drawn of strokes(html)) expect(drawn).toContain(`stroke="${RING_OFF}"`);
     expect(hero(html)).toContain(">Refreshing</span>");
     expect(hero(html)).not.toContain(TONE_HEX.proven);
   });
@@ -296,7 +296,8 @@ describe("the agent's commands on Protection", () => {
     expect(plain).toMatch(/data-agent-commands-count="true"[^>]*>8<\/span>/);
     expect(plain).toContain("commands in the last 7 days");
     expect(plain).toContain('data-segment="unsafe_may_have_run"');
-    expect(plain).toContain("<span class=\"font-semibold text-slate-600\">Zero: </span>Held for a review nobody answered.");
+    // The zeros are the bar's provenance: one switch away, still zeros.
+    expect(plain).not.toContain("Zero: </span>");
     expect(plain).toContain("The kernel also refused 4 program starts in the agent&#x27;s scope that no command explains.");
     expect(plain).not.toContain(report.summary);
     // That something is not measured is still said plainly.
@@ -305,6 +306,7 @@ describe("the agent's commands on Protection", () => {
     const technical = render(withCommands);
     expect(technical).toContain(report.summary);
     expect(technical).toContain(">Commands screened</dt>");
+    expect(technical).toContain("<span class=\"font-semibold text-slate-600\">Zero: </span>Held for a review nobody answered.");
   });
 
   it("reads as before on a host that sends no tally", () => {
@@ -317,5 +319,84 @@ describe("the agent's commands on Protection", () => {
     const bare = render(posture([gate()]));
     const hostHalf = bare.slice(0, -"</div>".length);
     expect(render(withCommands).startsWith(hostHalf)).toBe(true);
+  });
+
+  /**
+   * FAILS ON REVERT: a grid row stretched the local model's card to the
+   * height of the screening card's record, 757 px of empty card in the view
+   * an evaluator opens.
+   */
+  it("pairs the two agent cards in the plain view and stacks them in the technical one", () => {
+    const both = { ...withCommands, local_model: { state: "loaded" as const, display_name: "Local Warden Model", provider: null, model_id: null, roles: [], measured: [], not_measured: [], summary: "s" } };
+    expect(render(both)).toContain('data-agent-band="paired" class="grid gap-4 lg:grid-cols-2"');
+    setTechnicalDetail(true);
+    const technical = render(both);
+    expect(technical).toContain('data-agent-band="stacked"');
+    expect(technical).not.toContain("lg:grid-cols-2\"><section");
+  });
+});
+
+describe("a control's row", () => {
+  const row = (html: string, name: string) => {
+    const start = html.indexOf(`>${name}</h3>`);
+    return html.slice(start, html.indexOf("</article>", start));
+  };
+
+  /**
+   * For a control protecting, or working as set up, the sentence restated
+   * the badge and the ladder beside it; it is kept where it says more.
+   *
+   * FAILS ON REVERT: five sentences, three of them "X is blocking, and that
+   * was verified on this host.", under five badges saying the same.
+   */
+  it("says its sentence only where it says more than the badge", () => {
+    expect(reasonAddsToBadge("proven", false, "It is blocking.")).toBe(false);
+    expect(reasonAddsToBadge("working_as_configured", false, "It is watching.")).toBe(false);
+    expect(reasonAddsToBadge("working_as_configured", false, "When ready, run `dns-guard arm`.")).toBe(true);
+    expect(reasonAddsToBadge("working_as_configured", true, "Blocking, not proven.")).toBe(true);
+    for (const disposition of ["cannot_verify", "needs_operator", "not_enabled"] as const) expect(reasonAddsToBadge(disposition, false, "x")).toBe(true);
+    const html = render(posture([gate(), watcher(), unreadable()]));
+    expect(row(html, "Execution Gate")).not.toContain("is blocking, and that was verified");
+    expect(row(html, "Secret Read Guard")).toContain("could not be read");
+    setTechnicalDetail(true);
+    expect(row(render(posture([gate(), watcher()])), "Execution Gate")).toContain("verified on this host");
+  });
+
+  /** A row's own time only when it lags the hero's by more than 5 minutes. */
+  it("prints its own check only when it is older than the hero's", () => {
+    expect(checkedLate("2026-07-18T12:00:00Z", "2026-07-18T12:04:00Z")).toBe(false);
+    expect(checkedLate("2026-07-18T11:50:00Z", "2026-07-18T12:00:00Z")).toBe(true);
+    expect(checkedLate(null, "2026-07-18T12:00:00Z")).toBe(true);
+    const late = layer("host_visibility", "host_visibility", "working_as_configured", { freshness: freshness("2026-07-18T11:40:00Z") });
+    const html = render(posture([gate(), late]));
+    expect(row(html, "Execution Gate")).toContain('data-checked-at="same"');
+    expect(row(html, "host_visibility")).toContain('data-checked-at="shown"');
+  });
+
+  /** The badge, the ladder and the time on the title's line, so the ladders read as one matrix. */
+  it("lines the ladder up with the title on every row", () => {
+    const html = render(posture([gate(), watcher()]));
+    expect(html.match(/lg:flex-nowrap lg:items-start lg:gap-6/g)).toHaveLength(2);
+    expect(html.match(/leading-8 text-slate-950">/g)).toHaveLength(2);
+  });
+
+  /** A short command is one chip on a phone, never "challenge-" over "agent.service". */
+  it("keeps a short command whole and lets only a long one break", () => {
+    const [short] = renderToStaticMarkup(<>{withCode("run `challenge-agent.service` now")}</>).match(/<code[^>]*>/g) ?? [];
+    expect(short).toContain("whitespace-nowrap");
+    const [long] = renderToStaticMarkup(<>{withCode(`run \`${"a".repeat(40)}\``)}</>).match(/<code[^>]*>/g) ?? [];
+    expect(long).toContain("[overflow-wrap:anywhere]");
+  });
+});
+
+describe("the hero", () => {
+  /** The refresh sits with the verdict it refreshes, not floating above the card. */
+  it("holds the check time and the Check now button beside the verdict", () => {
+    const html = renderToStaticMarkup(<Posture bootstrap={bootstrap()} posture={posture([gate()])} current evaluatedAt={GENERATED} onCheckNow={() => undefined} />);
+    expect(hero(html)).toContain(">Check now</button>");
+    expect(hero(html)).toContain("Checked ");
+    expect(html.match(/>Check now</g)).toHaveLength(1);
+    const empty = renderToStaticMarkup(<Posture bootstrap={bootstrap()} posture={posture([])} current evaluatedAt={GENERATED} onCheckNow={() => undefined} />);
+    expect(empty).toContain(">Check now</button>");
   });
 });

@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { useId, type ReactNode } from "react";
 
 /**
  * The drawing primitives every screen shares: a ring, a proportional bar and
@@ -64,6 +64,9 @@ export function drawnParts(parts: readonly Part[]): Part[] {
 
 const TAU = Math.PI * 2;
 
+/** An off part on a ring: slate-300, visible on the slate-100 track. */
+export const RING_OFF = "#cbd5e1";
+
 /** A clockwise arc from 12 o'clock, `from` and `to` in turns of the circle. */
 export function arcPath(c: number, r: number, from: number, to: number): string {
   const point = (turn: number) => {
@@ -107,7 +110,9 @@ export function Ring({
             const to = Math.max(from + 0.001, at + share - gap / 2);
             at += share;
             const whole = shown.length === 1;
-            const colour = TONE_HEX[part.tone];
+            // Off is drawn a shade darker on a ring than in a bar: the bar's
+            // off (slate-200) on the ring's slate-100 track could not be seen.
+            const colour = part.tone === "off" ? RING_OFF : TONE_HEX[part.tone];
             return (
               <g key={part.key} data-segment={part.key}>
                 <title>{part.label}</title>
@@ -184,22 +189,45 @@ export function Swatch({ part, className = "h-2.5 w-2.5" }: { part: Pick<Part, "
   );
 }
 
-/** Points of a series on its own scale, in a 100 by `height` box. Silence sits on the baseline. */
+/** The share of a spark's box left above its highest point, so a peak never reads as a ceiling. */
+export const SPARK_HEADROOM = 0.25;
+
+/** Below this spread, (max - min) / max, a series is steady and drawn as a level line at mid-height. */
+export const SPARK_STEADY = 0.1;
+
+/**
+ * Points of a series on its own scale, in a 100 by `height` box, the top
+ * quarter left empty. Silence sits on the baseline. A steady series (it
+ * varies by under a tenth of its peak) is a level line at mid-height: scaled
+ * to its peak it filled the box and read as a solid slab, a glitch rather
+ * than a flow.
+ */
 export function sparkPoints(values: readonly number[], height = 24): string {
-  const max = Math.max(0, ...values.filter(Number.isFinite));
+  const finite = values.filter(Number.isFinite);
+  const max = Math.max(0, ...finite);
+  const min = finite.length === 0 ? 0 : Math.min(...finite);
+  const steady = max > 0 && (max - min) / max < SPARK_STEADY;
   const n = values.length;
+  const span = (height - 1) * (1 - SPARK_HEADROOM);
   return values
     .map((value, index) => {
       const x = n <= 1 ? 0 : (index * 100) / (n - 1);
-      const y = max <= 0 || !Number.isFinite(value) ? height : height - (value / max) * (height - 2);
+      const y = max <= 0 || !Number.isFinite(value)
+        ? height
+        : steady
+          ? height / 2
+          : height - (value / max) * span;
       return `${x.toFixed(1)},${y.toFixed(1)}`;
     })
     .join(" ");
 }
 
+
+
 /**
  * A sparkline on its own scale: the number beside it carries the value. A
- * series of zeros is a flat line on the baseline, never interpolated.
+ * series of zeros is a flat line on the baseline, never interpolated; the
+ * area under the line fades to nothing, as the day's plot does.
  */
 export function Spark({
   values,
@@ -216,12 +244,21 @@ export function Spark({
 }) {
   const points = sparkPoints(values, height);
   const colour = TONE_HEX[tone];
+  // One gradient per drawing, under React's own id for it, reduced to the
+  // characters an SVG url() reference takes.
+  const fill = `spark-fill-${useId().replace(/[^A-Za-z0-9_-]/g, "")}`;
   return (
     <svg viewBox={`0 0 100 ${height}`} preserveAspectRatio="none" className={className} role="img" aria-label={label}>
       <title>{label}</title>
       {values.length > 1 ? (
         <>
-          <polygon points={`0,${height} ${points} 100,${height}`} fill={colour} fillOpacity={0.12} />
+          <defs>
+            <linearGradient id={fill} x1="0" x2="0" y1="0" y2="1">
+              <stop offset="0%" stopColor={colour} stopOpacity={0.28} />
+              <stop offset="100%" stopColor={colour} stopOpacity={0} />
+            </linearGradient>
+          </defs>
+          <polygon points={`0,${height} ${points} 100,${height}`} fill={`url(#${fill})`} />
           <polyline points={points} fill="none" stroke={colour} strokeWidth={1.5} strokeLinejoin="round" vectorEffect="non-scaling-stroke" />
         </>
       ) : null}

@@ -1,5 +1,6 @@
 import { renderToStaticMarkup } from "react-dom/server";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
+import { setTechnicalDetail } from "../components/TechnicalDetail";
 
 import type { DashboardBootstrap, DashboardPosture, ProtectionLayer } from "../api/v1";
 import { capabilityName, controlName, dispositionReason, humanize, Posture, unconfirmedLine, withProductName } from "./Posture";
@@ -59,6 +60,8 @@ const bootstrap = {
   privacy: { storage: [], redactions: [], egress: [] },
 } as DashboardBootstrap;
 
+afterEach(() => setTechnicalDetail(false));
+
 describe("the names on Protection", () => {
   it("titles each control the host sends by the product name, with the general words under it", () => {
     const names = SENT.map(([id, capability, label]) => controlName(layer(id, capability, label)));
@@ -100,7 +103,12 @@ describe("the names on Protection", () => {
       expect(ring).toContain(`<title>${name}: `);
       expect(html).toContain(`>${name}</h3>`);
     }
-    expect(html.match(/>Independent host execution control</g)).toHaveLength(1);
+    // What a product name stands for is for whoever maps it to the
+    // capability: in the technical view, once.
+    expect(html).not.toContain(">Independent host execution control<");
+    setTechnicalDetail(true);
+    const technical = renderToStaticMarkup(<Posture bootstrap={bootstrap} posture={posture} current evaluatedAt="2026-07-18T12:00:01Z" />);
+    expect(technical.match(/>Independent host execution control</g)).toHaveLength(1);
   });
 
   it("names a capability by its product, and spells initials as people write them", () => {

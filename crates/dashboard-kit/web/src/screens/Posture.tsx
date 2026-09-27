@@ -77,6 +77,34 @@ export function checkedAt(freshness: EvidenceFreshness, now: Date = new Date(), 
   return at === undefined ? "never checked" : `as of ${at}`;
 }
 
+/** How much older than the newest check a row's own check must be to be printed on it. */
+export const CHECK_LAG_MS = 5 * 60 * 1_000;
+
+/**
+ * Whether a control's check is worth its own time on its row: never
+ * checked, or more than `CHECK_LAG_MS` older than the newest check the hero
+ * states. A row checked with the others says nothing the hero does not.
+ */
+export function checkedLate(observedAt: string | null | undefined, latest: string | undefined): boolean {
+  if (observedAt === null || observedAt === undefined) return true;
+  const at = Date.parse(observedAt);
+  const newest = latest === undefined ? Number.NaN : Date.parse(latest);
+  if (!Number.isFinite(at) || !Number.isFinite(newest)) return true;
+  return newest - at > CHECK_LAG_MS;
+}
+
+/**
+ * Whether a control's sentence says more than its badge and its ladder: a
+ * command to run, a control that is not on, one this page cannot confirm,
+ * one that needs the reader, or one softened from protecting. For a control
+ * protecting, or working as set up, it restated the badge.
+ */
+export function reasonAddsToBadge(disposition: LayerDisposition, softened: boolean, reason: string): boolean {
+  if (reason.includes("`")) return true;
+  if (disposition === "proven") return false;
+  return !(disposition === "working_as_configured" && !softened);
+}
+
 /** Scope as its display name only; kind and verification detail belong to the
  * disclosure, not to every summary row. */
 export function scopeDisplay(scopes: ScopeRef[]): string {
@@ -784,17 +812,25 @@ export function modelProvenance(report: Pick<LocalModelReport, "provider" | "mod
  * `known_gaps` flattened by the producer: it is the enforcement chain auditing
  * itself, and it has no field that can carry the state of a sensor collector.
  * A sentence must not answer a question its data cannot reach, so this one now
- * names its subject and says what it leaves out.
+ * names its subject, and what it leaves out is said behind the switch
+ * (`GAPS_SCOPE_NOTE`).
  *
  * When the producer starts publishing collector coverage as gaps, this line is
  * the thing to widen, not before.
  */
 export function emptyGapsLine(totalGaps: number): string {
-  const limit = " Sensor collector state is not part of this check.";
   return totalGaps === 0
-    ? `No gaps reported by the host controls above.${limit}`
-    : `No gaps in the host controls above need your attention.${limit}`;
+    ? "No gaps reported by the host controls above."
+    : "No gaps in the host controls above need your attention.";
 }
+
+/**
+ * What the check leaves out, said to whoever audits it: the line above
+ * names its subject (the host controls), so this is the provenance of a
+ * good state and sits behind the switch. On the paid screen the sensor's
+ * collectors follow directly.
+ */
+export const GAPS_SCOPE_NOTE = "Sensor collector state is not part of this check.";
 
 /**
  * What the section says when the last posture refresh failed and the page is
@@ -938,8 +974,12 @@ const COUNT_DOT: Record<StateCount["key"], string> = {
   needs_operator: "bg-amber-500",
 };
 
-/** The verdict: the ring of controls, the host's headline, a count per state. */
-function PostureHero({ pills, current, posture, children }: { pills: ControlPill[]; current: boolean; posture: DashboardPosture; children: ReactNode }) {
+/**
+ * The verdict: the ring of controls, the host's headline, a count per state
+ * as the ring's legend, and, beside them, when it was checked and the button
+ * that checks again: the refresh sits with the verdict it refreshes.
+ */
+function PostureHero({ pills, current, posture, onCheckNow, children }: { pills: ControlPill[]; current: boolean; posture: DashboardPosture; onCheckNow?: () => void | Promise<void>; children: ReactNode }) {
   const [technical] = useTechnicalDetail();
   const total = pills.length;
   const needing = pills.filter((pill) => needsOperator(pill.disposition)).length;
@@ -990,20 +1030,39 @@ function PostureHero({ pills, current, posture, children }: { pills: ControlPill
             ))
             : <li className="inline-flex rounded-full border border-slate-200 bg-white px-2.5 py-0.5 text-xs font-medium text-slate-600">Refreshing</li>}
         </ul>
-        <p className="mt-3 text-xs text-slate-500">
-          {current ? (clock === undefined ? "Not checked yet." : `Checked ${clock}.`) : "Reading the host again."}
-        </p>
         {/* The host's own count, never replacing the headline. It is a
             second count from a second source, and beside the headline in
             the plain view it read as a second verdict; it stays for
             whoever checks one against the other. */}
         {controlCountLine(posture) ? (
           <TechnicalOnly>
-            <p className="mt-1 text-xs leading-5 text-slate-500">{controlCountLine(posture)}</p>
+            <p className="mt-2 text-xs leading-5 text-slate-500">{controlCountLine(posture)}</p>
           </TechnicalOnly>
         ) : null}
       </div>
+      <div className="flex w-full shrink-0 flex-row-reverse items-center justify-between gap-3 border-t border-slate-100 pt-4 sm:w-auto sm:flex-col sm:items-end sm:self-stretch sm:justify-center sm:border-l sm:border-t-0 sm:pl-6 sm:pt-0">
+        {/* The page refreshes on a slow cadence, because the evidence
+            behind it does. An operator who wants an answer this second asks
+            for one instead of waiting out a poll whose length they cannot
+            see. */}
+        {onCheckNow ? <CheckNowButton onCheckNow={onCheckNow} /> : null}
+        <p className="text-xs text-slate-500 sm:text-right">
+          {current ? (clock === undefined ? "Not checked yet." : `Checked ${clock}.`) : "Reading the host again."}
+        </p>
+      </div>
     </div>
+  );
+}
+
+function CheckNowButton({ onCheckNow }: { onCheckNow: () => void | Promise<void> }) {
+  return (
+    <button
+      type="button"
+      onClick={() => void onCheckNow()}
+      className="shrink-0 rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cyan-600"
+    >
+      Check now
+    </button>
   );
 }
 
@@ -1014,11 +1073,17 @@ function PostureHero({ pills, current, posture, children }: { pills: ControlPill
 export function withCode(sentence: string): ReactNode[] {
   return sentence.split(/`([^`]+)`/).map((part, index) =>
     index % 2 === 1 ? (
-      <code key={index} className="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[0.85em] text-slate-800 [overflow-wrap:anywhere]">{part}</code>
+      // A short command or name is one unbroken chip ("challenge-" over
+      // "agent.service" read as two things on a phone); only a long one may
+      // break, anywhere, to fit.
+      <code key={index} className={`rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[0.85em] text-slate-800 ${part.length <= CODE_UNBROKEN_MAX ? "whitespace-nowrap" : "[overflow-wrap:anywhere]"}`}>{part}</code>
     ) : (
       part
     ));
 }
+
+/** The longest command or name a code chip keeps on one line. */
+export const CODE_UNBROKEN_MAX = 32;
 
 // ────────────────────────────────── screen ───────────────────────────────────
 
@@ -1074,23 +1139,14 @@ export function Posture({
             What is enforcing, what is watching, and where the gaps are.
           </p>
         </div>
-        {/* The page refreshes on a slow cadence now, because the evidence behind
-            it does. An operator who wants an answer this second asks for one
-            instead of waiting out a poll whose length they cannot see. */}
-        {onCheckNow ? (
-          <button
-            type="button"
-            onClick={() => void onCheckNow()}
-            className="shrink-0 rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cyan-600"
-          >
-            Check now
-          </button>
-        ) : null}
+        {/* With a verdict the button sits beside it (`PostureHero`); with no
+            control reported there is none, and it stays up here. */}
+        {onCheckNow && posture.layers.length === 0 ? <CheckNowButton onCheckNow={onCheckNow} /> : null}
       </div>
 
       {posture.layers.length > 0 ? (
         <section data-tour="posture" aria-labelledby="posture-verdict-title" className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
-          <PostureHero pills={pills} current={current} posture={posture}>
+          <PostureHero pills={pills} current={current} posture={posture} onCheckNow={onCheckNow}>
             {postureHeadline(pills, posture.summary)}
           </PostureHero>
         </section>
@@ -1129,6 +1185,7 @@ export function Posture({
               current={current}
               assurance={assurances[index]}
               evaluatedAt={evaluatedAt}
+              latestCheckedAt={latestCheck(posture.layers)}
             />
           ))}
         </div>
@@ -1160,7 +1217,10 @@ export function Posture({
           </p>
         ) : null}
         {operatorGaps.length === 0 && unconfirmed.length === 0 ? (
-          <p className="text-sm leading-6 text-slate-600">{current ? emptyGapsLine(posture.gaps.length) : staleGapsLine()}</p>
+          <p className="text-sm leading-6 text-slate-600">
+            {current ? emptyGapsLine(posture.gaps.length) : staleGapsLine()}
+            {current ? <TechnicalOnly>{` ${GAPS_SCOPE_NOTE}`}</TechnicalOnly> : null}
+          </p>
         ) : null}
       </section>
 
@@ -1181,9 +1241,14 @@ export function Posture({
  * none. It reads only what it is handed, never the posture.
  */
 function AgentBand({ children }: { children: ReactNode }) {
+  const [technical] = useTechnicalDetail();
   const sections = Children.toArray(children);
   if (sections.length === 0) return null;
-  return <div className={sections.length > 1 ? "grid gap-4 lg:grid-cols-2" : undefined}>{sections}</div>;
+  // Side by side only in the plain view, where each card holds one figure
+  // and the two end together. The technical view adds the screening's
+  // record to one of them, and a grid row stretched the other to its height:
+  // 757 px of empty card on the challenge box.
+  return <div data-agent-band={technical ? "stacked" : "paired"} className={sections.length > 1 ? `grid gap-4 ${technical ? "" : "lg:grid-cols-2"}` : undefined}>{sections}</div>;
 }
 
 /** The chrome both agent-side sections share, so the separation from the host
@@ -1274,11 +1339,18 @@ function SectionFigures({ rows }: { rows: SectionRow[] }) {
           ))}
         </dl>
       ) : null}
+      {/* A figure the host measured at zero never disappears. Beside tiles
+          that read something, a line of them restated nothing a reader acts
+          on: it is the provenance of the tiles, one switch away. With no
+          tile at all, the zeros are the section's figures and stay. */}
       {layout.zeros.length > 0 ? (
-        <p className="mt-2 text-xs leading-5 text-slate-600">
-          <span className="font-semibold text-slate-700">Zero: </span>
-          {zeroLine(layout.zeros, shared !== undefined)}.
-        </p>
+        layout.tiles.length > 0 ? (
+          <TechnicalOnly>
+            <ZeroLine text={zeroLine(layout.zeros, shared !== undefined)} />
+          </TechnicalOnly>
+        ) : (
+          <ZeroLine text={zeroLine(layout.zeros, shared !== undefined)} />
+        )
       ) : null}
       {shared !== undefined && (layout.tiles.length > 0 || layout.zeros.length > 0) ? (
         <p className="mt-1 text-[11px] leading-4 text-slate-500">What these cover: {shared}.</p>
@@ -1300,6 +1372,15 @@ function SectionFigures({ rows }: { rows: SectionRow[] }) {
         </TechnicalOnly>
       ) : null}
     </>
+  );
+}
+
+function ZeroLine({ text }: { text: string }) {
+  return (
+    <p className="mt-2 text-xs leading-5 text-slate-600">
+      <span className="font-semibold text-slate-700">Zero: </span>
+      {text}.
+    </p>
   );
 }
 
@@ -1372,10 +1453,12 @@ function AgentCommandsFigure({ commands }: { commands: AgentCommands }) {
         <OutcomeBreakdown parts={commands.breakdown} label={`What happened to each of the ${formatCount(commands.count)} commands`} className="mt-4" />
       ) : null}
       {commands.count > 0 && zeros.length > 0 ? (
-        <p className="mt-2 text-xs leading-5 text-slate-500">
-          <span className="font-semibold text-slate-600">Zero: </span>
-          {zeros.map((part) => part.label).join("; ")}.
-        </p>
+        <TechnicalOnly>
+          <p className="mt-2 text-xs leading-5 text-slate-500">
+            <span className="font-semibold text-slate-600">Zero: </span>
+            {zeros.map((part) => part.label).join("; ")}.
+          </p>
+        </TechnicalOnly>
       ) : null}
       {refused > 0 ? (
         <p className="mt-3 text-sm leading-6 text-slate-700">
@@ -1459,6 +1542,7 @@ function ControlRow({
   current,
   assurance,
   evaluatedAt,
+  latestCheckedAt,
 }: {
   layer: ProtectionLayer;
   bootstrap: DashboardBootstrap;
@@ -1467,6 +1551,8 @@ function ControlRow({
   assurance: LayerAssuranceLabel;
   /** The consumer's clock this render was judged at. */
   evaluatedAt: string;
+  /** The newest check of any control, the one the hero states. */
+  latestCheckedAt?: string;
 }) {
   const relevantCapabilities = layer.capability_ids
     .map((id) => bootstrap.capabilities.find((capability) => capability.id === id))
@@ -1484,28 +1570,42 @@ function ControlRow({
   const glyph = controlGlyph([layer.id, ...layer.capability_ids]);
   const scoped = layer.effective_scope.some((scope) => scope.kind !== "host");
   const [technical] = useTechnicalDetail();
+  const reason = dispositionReason(layer, disposition);
+  // The time of this row's check only where it says something: a check more
+  // than 5 minutes older than the newest one the hero states. Beside the
+  // hero's "Checked 14:56", five rows of "as of 14:56" said it five times.
+  const lagging = checkedLate(layer.freshness.observed_at, latestCheckedAt);
   return (
     <article className="rounded-2xl border border-slate-200 bg-white px-4 py-3 shadow-sm">
-      <div className="flex flex-wrap items-center gap-x-4 gap-y-2 lg:flex-nowrap lg:gap-6">
+      {/* The badge, the ladder and the time sit on the title's line, so the
+          ladders of every row read down the page as one matrix; centred on
+          a title with a description and a scope under it they sat 25 px
+          lower than on a row with neither. */}
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-2 lg:flex-nowrap lg:items-start lg:gap-6">
         {/* A basis of its own, so on a narrow screen the title takes the
             row and the badge and time wrap under it. With a basis of zero it
             stayed beside them, shrank to what they left (26 px at 320) and
             broke "Execution Gate" into a column of fragments. */}
         <div className="flex min-w-0 flex-[1_1_100%] items-start gap-3 lg:flex-1">
           {glyph === undefined ? null : (
-            <span className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-slate-100 text-slate-700">
+            <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-slate-100 text-slate-700">
               <Glyph name={glyph} />
             </span>
           )}
           <div className="min-w-0 flex-1">
-            <h3 className="break-words text-base font-semibold text-slate-950">{name.name}</h3>
+            <h3 className="break-words text-base font-semibold leading-8 text-slate-950">{name.name}</h3>
+            {/* What the product name stands for, for whoever maps it to the
+                capability: not every row has one, and on some rows it only
+                pushed the rest down. */}
             {name.description === undefined ? null : (
-              <p className="text-xs text-slate-500">{name.description}</p>
+              <TechnicalOnly>
+                <p className="text-xs text-slate-500">{name.description}</p>
+              </TechnicalOnly>
             )}
             {/* The scope, plainly, only where it is narrower than the host:
                 "this host" on every other row said nothing. */}
             {scoped ? (
-              <p className="mt-1 break-words text-xs text-slate-600 [overflow-wrap:anywhere]">
+              <p className="break-words text-xs text-slate-600 [overflow-wrap:anywhere]">
                 <span className="text-slate-500">Covers </span>
                 {withCode(scopeDisplay(layer.effective_scope))}
               </p>
@@ -1513,17 +1613,18 @@ function ControlRow({
           </div>
         </div>
         <div className="flex min-w-0 flex-1 items-center justify-between gap-3 lg:contents">
-          <span className="lg:w-48 lg:shrink-0">
+          <span className="lg:mt-[3px] lg:w-48 lg:shrink-0">
             <ControlBadge status={current ? disposition : "stale"} label={current ? dispositionLabel(disposition, softened) : "Refreshing"} />
           </span>
-          <span className="hidden lg:block lg:w-72 lg:shrink-0">
+          <span className="hidden lg:mt-1.5 lg:block lg:w-72 lg:shrink-0">
             <Ladder layer={layer} name={name.name} current={current} softened={softened} />
           </span>
           <span
-            className="shrink-0 text-right text-xs font-medium text-slate-500 lg:w-32"
+            data-checked-at={technical || lagging || !current ? "shown" : "same"}
+            className="shrink-0 text-right text-xs font-medium text-slate-500 lg:mt-2 lg:w-32"
             title={current && layer.freshness.observed_at ? timeTitle(layer.freshness.observed_at) : undefined}
           >
-            {current ? checkedAt(layer.freshness, new Date(), technical ? "UTC" : undefined) : "refreshing"}
+            {!current ? "refreshing" : technical || lagging ? checkedAt(layer.freshness, new Date(), technical ? "UTC" : undefined) : null}
           </span>
         </div>
         <div className="w-full lg:hidden">
@@ -1532,12 +1633,16 @@ function ControlRow({
       </div>
       {technical && current ? <StageReasons convergence={layer.convergence} /> : null}
 
-      {/* The sentence, on the row, not one click away.
-          Someone installing this for the first time should not have to open a
-          disclosure called "How this was verified" to learn that a grey control
-          is grey because they have not turned it on yet. */}
-      {current ? (
-        <p className="mt-2 text-sm leading-6 text-slate-600">{withCode(dispositionReason(layer, disposition))}</p>
+      {/* The sentence, on the row, not one click away, where it says more
+          than the badge and the ladder do: a command to run, a control not
+          on, one this page cannot confirm or one that needs the reader.
+          Someone installing this for the first time should not have to open
+          a disclosure called "How this was verified" to learn that a grey
+          control is grey because they have not turned it on yet. For a
+          control protecting, or working as set up, it restated the badge;
+          it is the provenance of that good state, one switch away. */}
+      {current && (technical || reasonAddsToBadge(disposition, softened, reason)) ? (
+        <p className="mt-2 text-sm leading-6 text-slate-600">{withCode(reason)}</p>
       ) : null}
 
       <details className="mt-2 border-t border-slate-100 pt-2">
@@ -1729,7 +1834,7 @@ function sentence(value: string): string {
 }
 
 /** Words that are initials, spelled the way people write them. */
-const INITIALISMS: Record<string, string> = { dns: "DNS", mcp: "MCP", ai: "AI", llm: "LLM", ssh: "SSH", bpf: "BPF", ebpf: "eBPF", lsm: "LSM", id: "ID", ip: "IP", tls: "TLS" };
+const INITIALISMS: Record<string, string> = { dns: "DNS", mcp: "MCP", ai: "AI", llm: "LLM", ssh: "SSH", bpf: "BPF", ebpf: "eBPF", lsm: "LSM", id: "ID", ip: "IP", tls: "TLS", tcp: "TCP", http: "HTTP", usb: "USB", suid: "SUID", aws: "AWS" };
 
 /** An id in words: `dns_resolution_control` reads "DNS resolution control", never "Dns". */
 export function humanize(value: string): string {
