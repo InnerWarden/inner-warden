@@ -212,3 +212,33 @@ describe("an Overview whose host answers the three questions", () => {
     expect(html).toContain('data-ad-state="offer"');
   });
 });
+
+/**
+ * The tour's "Agents on this machine" and "Sensor activity" steps pointed at
+ * panels this layout keeps behind the technical switch. The page says so in
+ * its markup, and the tour drops those steps instead of floating over it.
+ */
+describe("what the lanes Overview tells the tour", () => {
+  const marker = (html: string) => html.match(/data-tour-absent="([^"]*)"/)?.[1];
+
+  it("names both panels in the plain view, where neither is drawn", () => {
+    const html = render(lanesOverview, "enterprise");
+    expect(marker(html)).toBe("overview-agents overview-sensor");
+    expect(html).not.toContain("local-agents-title");
+  });
+
+  it("names nothing in the technical view, where both are drawn", () => {
+    setTechnicalDetail(true);
+    expect(marker(render(lanesOverview, "enterprise"))).toBeUndefined();
+  });
+
+  it("names the agent panel in the technical view when the shell does not offer it", () => {
+    setTechnicalDetail(true);
+    expect(marker(render(lanesOverview, "enterprise", { machinePanels: { agents: false, tokens: true } }))).toBe("overview-agents");
+  });
+
+  it("adds nothing to the layout without lanes, which draws both panels", () => {
+    expect(marker(render(hostWaitingOverview, "enterprise"))).toBeUndefined();
+    expect(marker(render(communityOverview, "community"))).toBeUndefined();
+  });
+});

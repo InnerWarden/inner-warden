@@ -17,6 +17,7 @@ import { Outcome } from "../components/Outcome";
 import { SensorActivity } from "../components/SensorActivity";
 import { Verdict } from "../components/Verdict";
 import { overviewLaneCards, type LaneCard } from "../lanes";
+import { OVERVIEW_AGENTS_TOUR_STEP_KEY, OVERVIEW_SENSOR_TOUR_STEP_KEY, TOUR_ABSENT_ATTRIBUTE } from "../components/tourKeys";
 import { formatTimestamp, humanizeToken, normaliseMode } from "../presentation";
 
 type ActivityLink = { id?: string; session?: string; verdict?: string; action?: string };
@@ -459,9 +460,11 @@ function LanesOverview({
   const recent = (overview.recent_decisions ?? overview.recent_blocks).slice(0, 5);
   const agents = machinePanels?.agents ?? true;
   const tokens = machinePanels?.tokens ?? true;
+  const absentFromTour = lanesTourAbsent(technical, agents);
   return (
     <div className="min-w-0 space-y-6 sm:space-y-8" aria-busy={fetching}>
       {reconnecting && <ReconnectingNotice />}
+      {absentFromTour.length > 0 ? <span hidden {...{ [TOUR_ABSENT_ATTRIBUTE]: absentFromTour.join(" ") }} /> : null}
 
       <LaneCards
         cards={laneCards}
@@ -521,6 +524,20 @@ function LanesOverview({
       ) : null}
     </div>
   );
+}
+
+/**
+ * The tour steps whose panels this layout does not draw in the view on
+ * screen: the agent and sensor panels are in the technical section, and the
+ * agent panel only where the shell offers it. The tour drops those steps
+ * instead of floating a card over the page about a panel that is not there
+ * (`declaredAbsent`). The sensor panel can still be absent in the technical
+ * view (a host with no sensor endpoint draws none), which only the fetch can
+ * tell, and the tour's own wait covers that.
+ */
+export function lanesTourAbsent(technical: boolean, agentsOffered: boolean): string[] {
+  if (!technical) return [OVERVIEW_AGENTS_TOUR_STEP_KEY, OVERVIEW_SENSOR_TOUR_STEP_KEY];
+  return agentsOffered ? [] : [OVERVIEW_AGENTS_TOUR_STEP_KEY];
 }
 
 /**
