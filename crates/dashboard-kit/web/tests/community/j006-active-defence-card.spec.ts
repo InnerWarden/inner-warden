@@ -107,10 +107,14 @@ test.describe("CJC-J006 the Active Defence card reads the host", () => {
     await expect(page.locator('[data-ad-state="offer"]')).toBeVisible();
     expect(metaRequests, "the first paint must read guard/meta exactly once").toBe(1);
 
-    // And one per interval after that, not two.
-    await page.clock.fastForward(5_000);
+    // And one per interval after that, not two. The next poll is scheduled
+    // when the previous answer lands, so each step overshoots the 5 s interval
+    // by 500 ms: on a slow runner an exact 5 s step could stop just short of
+    // it. 5.5 s is still well under two intervals, so a doubled poll would
+    // still read as 3 after the first step.
+    await page.clock.fastForward(5_500);
     await expect.poll(() => metaRequests).toBe(2);
-    await page.clock.fastForward(5_000);
+    await page.clock.fastForward(5_500);
     await expect.poll(() => metaRequests).toBe(3);
   });
 });
