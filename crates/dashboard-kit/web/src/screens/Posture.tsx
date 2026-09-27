@@ -698,7 +698,7 @@ export function Posture({
   );
 
   return (
-    <div className="space-y-8">
+    <div className="space-y-6">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
           <p className="text-xs font-semibold uppercase tracking-[0.16em] text-cyan-700">Protection posture</p>
@@ -723,7 +723,7 @@ export function Posture({
 
       {posture.layers.length > 0 ? (
         <section data-tour="posture" aria-labelledby="posture-verdict-title" className="overflow-hidden rounded-2xl border border-slate-200 bg-gradient-to-br from-white to-slate-50">
-          <div className="px-5 py-6 sm:px-7">
+          <div className="px-5 py-5 sm:px-6">
             <h3 id="posture-verdict-title" className="text-2xl font-semibold tracking-tight text-slate-950">
               {postureHeadline(pills, posture.summary)}
             </h3>
@@ -767,7 +767,7 @@ export function Posture({
 
       <section aria-labelledby="posture-controls-title">
         <h3 id="posture-controls-title" className="sr-only">Control details</h3>
-        <div className="space-y-3">
+        <div className="space-y-2">
           {posture.layers.map((layer, index) => (
             <ControlRow
               key={layer.id}
@@ -778,14 +778,16 @@ export function Posture({
             />
           ))}
         </div>
-        <p className="mt-3 text-xs leading-5 text-slate-500">
-          Host controls are evaluated from host evidence only; agent metadata never grants host trust.
-        </p>
+        <TechnicalOnly>
+          <p className="mt-3 text-xs leading-5 text-slate-500">
+            Host controls are evaluated from host evidence only; agent metadata never grants host trust.
+          </p>
+        </TechnicalOnly>
       </section>
 
       <section aria-labelledby="posture-gaps-title">
-        <div className="mb-4">
-          <h2 id="posture-gaps-title" className="text-xl font-semibold tracking-tight text-slate-950">Coverage gaps</h2>
+        <div className="mb-2">
+          <h2 id="posture-gaps-title" className="text-lg font-semibold tracking-tight text-slate-950">Coverage gaps</h2>
         </div>
         {operatorGaps.length > 0 ? (
           <div className="space-y-3">{operatorGaps.map((gap) => <GapCard key={gap.id} gap={gap} />)}</div>
@@ -827,36 +829,92 @@ function AgentSideSection({
   );
 }
 
+/**
+ * How a section's measured figures are laid out: a tile for each figure that
+ * reads something, one line naming every figure that reads zero, and the
+ * population they cover said once when they share one.
+ *
+ * Seven tiles, six of them zero, each repeating the same forty-word caption,
+ * made the guardrail's section most of a screen tall and said one thing seven
+ * times. A zero is still printed, as a zero, in the line: a figure the host
+ * measured never disappears, it just stops taking a tile.
+ */
+export type FigureLayout = {
+  tiles: Extract<SectionRow, { kind: "measured" }>[];
+  zeros: Extract<SectionRow, { kind: "measured" }>[];
+  /** The population every figure covers, when they all cover the same one. */
+  sharedCovers?: string;
+};
+
+export function figureLayout(rows: SectionRow[]): FigureLayout {
+  const measured = rows.filter(isMeasured);
+  const covers = new Set(measured.map((row) => row.covers));
+  const [only] = covers;
+  const sharedCovers = covers.size === 1 && only !== undefined && only.trim() !== "" ? only : undefined;
+  return {
+    tiles: measured.filter((row) => row.value.trim() !== "0"),
+    zeros: measured.filter((row) => row.value.trim() === "0"),
+    ...(sharedCovers === undefined ? {} : { sharedCovers }),
+  };
+}
+
+/**
+ * The zeros, by label. With no caption shared by the whole section, the ones
+ * that share a population are listed together and it is said once after
+ * them: "A; B (today)".
+ */
+export function zeroLine(zeros: Extract<SectionRow, { kind: "measured" }>[], captionSaidElsewhere: boolean): string {
+  if (captionSaidElsewhere) return zeros.map((row) => row.label).join("; ");
+  const groups = new Map<string, string[]>();
+  for (const row of zeros) groups.set(row.covers, [...(groups.get(row.covers) ?? []), row.label]);
+  return [...groups].map(([covers, labels]) => `${labels.join("; ")} (${covers})`).join("; ");
+}
+
 /** The numbers the host measured, and the gaps it named, kept apart on screen
  *  the way `sectionRows` keeps them apart in the data. */
 function SectionFigures({ rows }: { rows: SectionRow[] }) {
-  const measured = rows.filter(isMeasured);
+  const layout = figureLayout(rows);
   const notMeasured = rows.filter(isNotMeasured);
+  const shared = layout.sharedCovers;
   return (
     <>
-      {measured.length > 0 ? (
-        <dl className="mt-4 grid gap-2 sm:grid-cols-2">
-          {measured.map((row) => (
-            <div key={row.id} className="rounded-xl border border-slate-200 bg-white px-3 py-2.5">
+      {layout.tiles.length > 0 ? (
+        <dl className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+          {layout.tiles.map((row) => (
+            <div key={row.id} className="rounded-xl border border-slate-200 bg-white px-3 py-2">
               <dt className="text-xs font-medium text-slate-500">{row.label}</dt>
               <dd className="mt-0.5 text-lg font-semibold tabular-nums text-slate-950">{row.value}</dd>
               {/* The population, in the host's words. A count without one is how
-                  a decision total gets read as a claim about enforcement. */}
-              <dd className="mt-1 text-[11px] leading-4 text-slate-500">{row.covers}</dd>
+                  a decision total gets read as a claim about enforcement. Said
+                  once under the figures when every figure shares it. */}
+              {shared === undefined ? <dd className="mt-1 text-[11px] leading-4 text-slate-500">{row.covers}</dd> : null}
             </div>
           ))}
         </dl>
       ) : null}
+      {layout.zeros.length > 0 ? (
+        <p className="mt-2 text-xs leading-5 text-slate-600">
+          <span className="font-semibold text-slate-700">Zero: </span>
+          {zeroLine(layout.zeros, shared !== undefined)}.
+        </p>
+      ) : null}
+      {shared !== undefined && (layout.tiles.length > 0 || layout.zeros.length > 0) ? (
+        <p className="mt-1 text-[11px] leading-4 text-slate-500">What these cover: {shared}.</p>
+      ) : null}
       {notMeasured.length > 0 ? (
-        <div className="mt-4">
-          <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-500">Not measured</h3>
-          {/* The host's reason, verbatim, and never a zero standing in for it. */}
-          <ul className="mt-2 space-y-1">
-            {notMeasured.map((row) => (
-              <li key={row.reason} className="text-xs leading-5 text-slate-600">{row.reason}</li>
-            ))}
-          </ul>
-        </div>
+        // What the host could not measure is its own account of its limits:
+        // evidence for whoever audits the figures, not an answer, so it sits
+        // behind the switch. It is never a zero standing in for a figure.
+        <TechnicalOnly>
+          <div className="mt-3">
+            <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-500">Not measured</h3>
+            <ul className="mt-2 space-y-1">
+              {notMeasured.map((row) => (
+                <li key={row.reason} className="text-xs leading-5 text-slate-600">{row.reason}</li>
+              ))}
+            </ul>
+          </div>
+        </TechnicalOnly>
       ) : null}
     </>
   );
@@ -867,7 +925,11 @@ function LocalModelSection({ report }: { report: LocalModelReport }) {
   return (
     <AgentSideSection titleId="posture-local-model-title" title={report.display_name}>
       <p className="mt-2 text-sm leading-6 text-slate-700">{report.summary}</p>
-      {provenance ? <p className="mt-1 [overflow-wrap:anywhere] text-xs text-slate-500">{provenance}</p> : null}
+      {provenance ? (
+        <TechnicalOnly>
+          <p className="mt-1 [overflow-wrap:anywhere] text-xs text-slate-500">{provenance}</p>
+        </TechnicalOnly>
+      ) : null}
       {report.roles.length > 0 ? (
         <ul className="mt-3 flex flex-wrap gap-2" aria-label="What this model does">
           {report.roles.map((role) => (
@@ -897,22 +959,27 @@ function AgentLayerSection({ report }: { report: AgentLayerReport }) {
         </p>
       )}
       <SectionFigures rows={sectionRows(report)} />
-      {report.sessions.length > 0 ? (
-        <div className="mt-4">
-          <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-500">Agent sessions in the record</h3>
-          <ul className="mt-2 flex flex-wrap gap-2" aria-label="Agent sessions in the record">
-            {report.sessions.map((session) => (
-              <li key={session} className="[overflow-wrap:anywhere] rounded-lg border border-slate-200 bg-white px-2.5 py-1 font-mono text-[11px] text-slate-700">{session}</li>
-            ))}
-          </ul>
-        </div>
-      ) : null}
-      {/* The host ships this sentence so the section cannot be rendered without
-          it. Printed as sent: the screen does not write its own. */}
-      <p className="mt-4 border-t border-slate-200 pt-3 text-xs leading-5 text-slate-500">{report.evidence_basis}</p>
-      {report.evidence_source ? (
-        <p className="mt-1 [overflow-wrap:anywhere] font-mono text-[11px] text-slate-500">{report.evidence_source}</p>
-      ) : null}
+      {/* The session ids, the record's basis and its file are the evidence
+          behind the figures, for whoever audits them. The section's eyebrow
+          already says, in the plain view, that none of it is a host control. */}
+      <TechnicalOnly>
+        {report.sessions.length > 0 ? (
+          <div className="mt-4">
+            <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-500">Agent sessions in the record</h3>
+            <ul className="mt-2 flex flex-wrap gap-2" aria-label="Agent sessions in the record">
+              {report.sessions.map((session) => (
+                <li key={session} className="[overflow-wrap:anywhere] rounded-lg border border-slate-200 bg-white px-2.5 py-1 font-mono text-[11px] text-slate-700">{session}</li>
+              ))}
+            </ul>
+          </div>
+        ) : null}
+        {/* The host ships this sentence so the section cannot be rendered
+            without it. Printed as sent: the screen does not write its own. */}
+        <p className="mt-4 border-t border-slate-200 pt-3 text-xs leading-5 text-slate-500">{report.evidence_basis}</p>
+        {report.evidence_source ? (
+          <p className="mt-1 [overflow-wrap:anywhere] font-mono text-[11px] text-slate-500">{report.evidence_source}</p>
+        ) : null}
+      </TechnicalOnly>
     </AgentSideSection>
   );
 }
@@ -949,7 +1016,7 @@ function ControlRow({
 
   const name = controlName(layer);
   return (
-    <article className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm sm:p-5">
+    <article className="rounded-2xl border border-slate-200 bg-white px-4 py-3 shadow-sm">
       <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
         <div className="min-w-0 flex-1">
           <h3 className="break-words text-base font-semibold text-slate-950">{name.name}</h3>
@@ -971,10 +1038,10 @@ function ControlRow({
           disclosure called "How this was verified" to learn that a grey control
           is grey because they have not turned it on yet. */}
       {current ? (
-        <p className="mt-2 text-sm leading-6 text-slate-600">{dispositionReason(layer, disposition)}</p>
+        <p className="mt-1 text-sm leading-6 text-slate-600">{dispositionReason(layer, disposition)}</p>
       ) : null}
 
-      <details className="mt-3 border-t border-slate-100 pt-3">
+      <details className="mt-2 border-t border-slate-100 pt-2">
         <summary className="cursor-pointer text-xs font-semibold text-slate-500 hover:text-slate-700">How this was verified</summary>
         <div className="mt-3 space-y-5">
           <div className="flex flex-wrap items-center gap-3">
