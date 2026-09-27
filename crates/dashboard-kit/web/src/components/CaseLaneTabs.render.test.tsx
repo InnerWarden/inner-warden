@@ -146,3 +146,40 @@ describe("the lane in the address bar", () => {
     expect(back.status).toBe("waiting");
   });
 });
+
+/**
+ * A count with no span was how a reader compared 4 on the Overview (7 days)
+ * with 2 here (24 hours) and read it as lost data. With the list's window
+ * handed in, every count carries it, on screen and aloud, and the window can
+ * be changed from beside the counts it changes.
+ */
+describe("the span beside each count", () => {
+  it("prints the window next to every tab count, and names it aloud", () => {
+    const html = renderToStaticMarkup(<CaseLaneTabs value="agent_actions" counts={serverCounts} onChange={noop} window="7d" />);
+    expect(html.match(/ · 7 days<\/span>/g)).toHaveLength(3);
+    expect(html).toContain('aria-label="Attacks on this server, 3 cases in the last 7 days"');
+    expect(html).toContain('aria-label="What your AI agent did, 1 case in the last 7 days"');
+  });
+
+  it("offers a visible window control only with a window and a way to change it", () => {
+    const picked: string[] = [];
+    const withControl = renderToStaticMarkup(
+      <CaseLaneTabs value="agent_actions" counts={serverCounts} onChange={noop} window="24h" onWindowChange={(next) => picked.push(next)} />,
+    );
+    expect(withControl).toContain("Time window");
+    expect(withControl).toMatch(/<option value="24h" selected="">Last 24 hours<\/option>/);
+    expect(withControl.match(/<option /g)).toHaveLength(5);
+    expect(renderToStaticMarkup(<CaseLaneTabs value="agent_actions" counts={serverCounts} onChange={noop} window="24h" />)).not.toContain("Time window");
+  });
+
+  /**
+   * An older Cases screen passes no window, and its tabs read as they did:
+   * the counts alone, and no control.
+   */
+  it("draws the counts alone when the screen passes no window", () => {
+    const html = renderToStaticMarkup(<CaseLaneTabs value="agent_actions" counts={serverCounts} onChange={noop} />);
+    expect(html).not.toContain(" · ");
+    expect(html).not.toContain("Time window");
+    expect(html).toContain('aria-label="Attacks on this server, 3 cases"');
+  });
+});

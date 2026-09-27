@@ -281,9 +281,9 @@ describe("writing the view to the address bar", () => {
 
   it("replaces the current entry when asked to", () => {
     const history = stubWindow();
-    writeCaseViewState({ ...EMPTY_CASE_VIEW, window: "7d" }, "replace");
+    writeCaseViewState({ ...EMPTY_CASE_VIEW, window: "30d" }, "replace");
     expect(history.pushState).not.toHaveBeenCalled();
     expect(history.replaceState).toHaveBeenCalledOnce();
-    expect((history.replaceState.mock.calls[0][2] as URL).searchParams.get("window")).toBe("7d");
+    expect((history.replaceState.mock.calls[0][2] as URL).searchParams.get("window")).toBe("30d");
   });
 });

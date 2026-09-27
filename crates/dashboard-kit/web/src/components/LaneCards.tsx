@@ -39,6 +39,36 @@ export function laneLink(
  * waiting count renders in both views, and as plain text when there is no
  * Cases screen to open.
  */
+/** The span a card counts, named after "over": "over the last 7 days". */
+export const LANE_SPAN_NAME: Record<CaseListWindow, string> = {
+  "1h": "the last hour",
+  "24h": "the last 24 hours",
+  "7d": "the last 7 days",
+  "30d": "the last 30 days",
+  all: "everything this host has kept",
+};
+
+/**
+ * The line under the page heading: whose records these are, over what span,
+ * and whether every card leads somewhere.
+ *
+ * The span is named ONCE when every card counts the same one, so a reader
+ * knows the three numbers can be read side by side. When they do not (a host
+ * that counts the server's lane over 24 hours and the agent's over 7 days),
+ * the line says so rather than letting three numbers over three spans read as
+ * one picture; each card still names its own.
+ */
+export function lanesIntro(cards: readonly LaneCard[], everyCardLeads: boolean): string {
+  const spans = new Set(cards.flatMap((card) => (card.state === "available" ? [card.window] : [])));
+  const [only] = spans;
+  const base = spans.size === 1 && only !== undefined
+    ? `Answered from this host's own records, over ${LANE_SPAN_NAME[only]}.`
+    : spans.size > 1
+      ? "Answered from this host's own records. The cards count different spans, and each one says which."
+      : "Answered from this host's own records.";
+  return everyCardLeads ? `${base} Each card opens what is behind it.` : base;
+}
+
 export function LaneCards({
   cards,
   edition,
@@ -49,7 +79,12 @@ export function LaneCards({
   cards: LaneCard[];
   edition?: "community" | "enterprise";
   onOpenLane?: (lane: CaseLane, options: LaneOpenOptions) => void;
-  onOpenCase?: (caseId: string, lane: CaseLane) => void;
+  /**
+   * Opens one case inside its lane, in the window the card counted, so the
+   * list beside the case is the one the card was about (and the case, the
+   * newest in that window, is in it).
+   */
+  onOpenCase?: (caseId: string, lane: CaseLane, window: CaseListWindow) => void;
   onOpenActivity?: () => void;
 }) {
   // The promise is about EVERY card, so it is made only when every card keeps
@@ -64,9 +99,7 @@ export function LaneCards({
         What is happening here
       </h1>
       <p className="mt-2 max-w-3xl text-sm leading-6 text-slate-600">
-        {everyCardLeads
-          ? "Answered from this host's own records. Each card opens what is behind it."
-          : "Answered from this host's own records."}
+        {lanesIntro(cards, everyCardLeads)}
       </p>
       <div className={joinClasses("mt-5 grid gap-4", gridColumnsClass("trio", cards.length))}>
         {cards.map((card, index) => (
@@ -97,7 +130,7 @@ function LaneCardView({
   spanClass: string;
   link: ReturnType<typeof laneLink>;
   onOpenLane?: (lane: CaseLane, options: LaneOpenOptions) => void;
-  onOpenCase?: (caseId: string, lane: CaseLane) => void;
+  onOpenCase?: (caseId: string, lane: CaseLane, window: CaseListWindow) => void;
   onOpenActivity?: () => void;
 }) {
   const copy = LANE_COPY[card.lane];
@@ -137,7 +170,7 @@ function LaneCardView({
           {latest.caseId !== undefined && onOpenCase !== undefined ? (
             <button
               type="button"
-              onClick={() => onOpenCase(latest.caseId as string, card.lane)}
+              onClick={() => available && onOpenCase(latest.caseId as string, card.lane, card.window)}
               className="text-left font-medium text-cyan-800 underline decoration-cyan-300 underline-offset-2 hover:text-cyan-950"
             >
               {latest.title}

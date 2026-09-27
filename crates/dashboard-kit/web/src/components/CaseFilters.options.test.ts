@@ -57,7 +57,7 @@ describe("case filter options", () => {
    * validates the URL parameter against the array, so choosing Resource now
    * silently fell back to "all" on reload.
    */
-  it.each(["scopeKinds", "windows"])(
+  it.each(["scopeKinds"])(
     "%s validates no value the operator cannot see",
     (name) => {
       const rendered = literalOptions();
@@ -93,5 +93,16 @@ describe("case filter options", () => {
         `${name}.map(`,
       );
     }
+  });
+
+  /**
+   * The windows render from their array too, through the name every window
+   * control shares (the form's select and the span picker beside the lane
+   * tabs), so no control can offer a span the address bar would refuse.
+   */
+  it("windows render from their validation array, under the name every window control shares", () => {
+    expect(validationArray("windows")).toEqual(["all", "1h", "24h", "7d", "30d"]);
+    expect(source).toContain("export const CASE_WINDOWS: readonly CaseWindow[] = windows;");
+    expect(source).toContain("CASE_WINDOWS.map(");
   });
 });

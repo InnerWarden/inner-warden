@@ -1,7 +1,21 @@
 import type { KeyboardEvent } from "react";
 import { CASE_LANES, everythingCount, type CaseLaneCounts } from "../api/lanes";
-import { EVERYTHING_COPY, LANE_COPY, type CaseLaneChoice } from "../lanes";
+import { EVERYTHING_COPY, LANE_COPY, LANE_WINDOW_PHRASE, type CaseLaneChoice } from "../lanes";
+import { CASE_WINDOW_LABELS, CASE_WINDOWS, type CaseWindow } from "./CaseFilters";
 import { useTechnicalDetail } from "./TechnicalDetail";
+
+/**
+ * The span beside a tab's count, short enough to sit in the badge: "1,298 ·
+ * 7 days". A count with no span was how a reader compared 4 on the Overview
+ * (7 days) with 2 here (24 hours) and read it as lost data.
+ */
+export const LANE_TAB_SPAN: Record<CaseWindow, string> = {
+  "1h": "1 hour",
+  "24h": "24 hours",
+  "7d": "7 days",
+  "30d": "30 days",
+  all: "any day",
+};
 
 export type CaseLaneTab = {
   choice: CaseLaneChoice;
@@ -61,10 +75,15 @@ export function laneIntro(value: CaseLaneChoice): string {
   return value === "everything" ? EVERYTHING_COPY.intro : LANE_COPY[value].intro;
 }
 
-/** What a tab with a count is called aloud: "Attacks on this server, 823 cases". */
-export function laneTabName(tab: Pick<CaseLaneTab, "label" | "count">): string {
+/**
+ * What a tab with a count is called aloud: "Attacks on this server, 823
+ * cases", and with the span it was counted over when the screen passed one:
+ * "Attacks on this server, 823 cases in the last 7 days".
+ */
+export function laneTabName(tab: Pick<CaseLaneTab, "label" | "count">, window?: CaseWindow): string {
   if (tab.count === undefined) return tab.label;
-  return `${tab.label}, ${tab.count.toLocaleString()} ${tab.count === 1 ? "case" : "cases"}`;
+  const counted = `${tab.label}, ${tab.count.toLocaleString()} ${tab.count === 1 ? "case" : "cases"}`;
+  return window === undefined ? counted : `${counted} ${LANE_WINDOW_PHRASE[window]}`;
 }
 
 export function laneTabId(choice: CaseLaneChoice): string {
@@ -90,12 +109,26 @@ export function CaseLaneTabs({
   counts,
   onChange,
   panelId,
+  window,
+  onWindowChange,
 }: {
   value: CaseLaneChoice;
   counts?: CaseLaneCounts;
   onChange: (next: CaseLaneChoice) => void;
   /** The id of the list the tabs control, for `aria-controls`. */
   panelId?: string;
+  /**
+   * The span the counts cover, the list's own window. Printed beside every
+   * count, so a badge never reads as a number over no span. Absent: badges as
+   * before.
+   */
+  window?: CaseWindow;
+  /**
+   * Changes the list's window from beside the tabs, where the counts it
+   * changes are. Offered only with `window`: a picker with no value is a
+   * control over nothing. The screen owns the request and the address bar.
+   */
+  onWindowChange?: (next: CaseWindow) => void;
 }) {
   const [technical] = useTechnicalDetail();
   const tabs = laneTabs(value, counts, technical);
@@ -110,38 +143,55 @@ export function CaseLaneTabs({
   };
   return (
     <div className="min-w-0">
-      <div role="tablist" aria-label="Case lanes" className="flex flex-wrap gap-2">
-        {tabs.map((tab) => (
-          <button
-            key={tab.choice}
-            id={laneTabId(tab.choice)}
-            type="button"
-            role="tab"
-            aria-selected={tab.selected}
-            aria-controls={panelId}
-            tabIndex={tab.selected ? 0 : -1}
-            data-lane={tab.choice}
-            // The badge is a number on its own; said aloud it needs its noun.
-            aria-label={tab.count === undefined ? undefined : laneTabName(tab)}
-            onClick={() => onChange(tab.choice)}
-            onKeyDown={onKeyDown}
-            className={`inline-flex max-w-full items-center gap-2 rounded-lg border px-3 py-2 text-left text-sm font-semibold transition-colors ${
-              tab.selected
-                ? "border-slate-900 bg-slate-900 text-white"
-                : "border-slate-300 bg-white text-slate-700 hover:bg-slate-50"
-            }`}
-          >
-            <span className="min-w-0 break-words">{tab.label}</span>
-            {tab.count !== undefined ? (
-              <span
-                aria-hidden="true"
-                className={`rounded-full px-2 py-0.5 text-xs tabular-nums ${tab.selected ? "bg-white/20 text-white" : "bg-slate-100 text-slate-700"}`}
-              >
-                {tab.count.toLocaleString()}
-              </span>
-            ) : null}
-          </button>
-        ))}
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+        <div role="tablist" aria-label="Case lanes" className="flex min-w-0 flex-wrap gap-2">
+          {tabs.map((tab) => (
+            <button
+              key={tab.choice}
+              id={laneTabId(tab.choice)}
+              type="button"
+              role="tab"
+              aria-selected={tab.selected}
+              aria-controls={panelId}
+              tabIndex={tab.selected ? 0 : -1}
+              data-lane={tab.choice}
+              // The badge is a number on its own; said aloud it needs its noun.
+              aria-label={tab.count === undefined ? undefined : laneTabName(tab, window)}
+              onClick={() => onChange(tab.choice)}
+              onKeyDown={onKeyDown}
+              className={`inline-flex max-w-full items-center gap-2 rounded-lg border px-3 py-2 text-left text-sm font-semibold transition-colors ${
+                tab.selected
+                  ? "border-slate-900 bg-slate-900 text-white"
+                  : "border-slate-300 bg-white text-slate-700 hover:bg-slate-50"
+              }`}
+            >
+              <span className="min-w-0 break-words">{tab.label}</span>
+              {tab.count !== undefined ? (
+                <span
+                  aria-hidden="true"
+                  className={`rounded-full px-2 py-0.5 text-xs tabular-nums ${tab.selected ? "bg-white/20 text-white" : "bg-slate-100 text-slate-700"}`}
+                >
+                  {tab.count.toLocaleString()}
+                  {window === undefined ? null : (
+                    <span className="font-normal opacity-80"> · {LANE_TAB_SPAN[window]}</span>
+                  )}
+                </span>
+              ) : null}
+            </button>
+          ))}
+        </div>
+        {window !== undefined && onWindowChange !== undefined ? (
+          <label className="inline-flex items-center gap-2 text-xs font-semibold text-slate-700">
+            Time window
+            <select
+              value={window}
+              onChange={(event) => onWindowChange(event.target.value as CaseWindow)}
+              className="rounded-lg border border-slate-300 bg-white px-2 py-1.5 text-sm font-normal text-slate-950"
+            >
+              {CASE_WINDOWS.map((span) => <option key={span} value={span}>{CASE_WINDOW_LABELS[span]}</option>)}
+            </select>
+          </label>
+        ) : null}
       </div>
       <p className="mt-2 max-w-3xl text-sm leading-6 text-slate-600">{laneIntro(value)}</p>
     </div>

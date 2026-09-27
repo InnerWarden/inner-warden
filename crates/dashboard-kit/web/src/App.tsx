@@ -257,12 +257,18 @@ export function activityUrl(
   return url;
 }
 
+const CASE_LIST_WINDOWS: readonly string[] = ["1h", "24h", "7d", "30d", "all"];
+
+function isCaseListWindow(value: unknown): value is CaseListWindow {
+  return typeof value === "string" && CASE_LIST_WINDOWS.includes(value);
+}
+
 /**
  * The URL that opens the Cases screen, optionally on one case: the
  * click-through target for anything on Home that shows a decision or an event
  * with a case behind it.
  */
-export function caseUrl(caseId: string | undefined, current: string, lane?: CaseLane): URL {
+export function caseUrl(caseId: string | undefined, current: string, lane?: CaseLane, window?: CaseListWindow): URL {
   const url = new URL(current);
   for (const name of SCREEN_PARAMS) url.searchParams.delete(name);
   url.searchParams.set("view", "cases");
@@ -273,11 +279,16 @@ export function caseUrl(caseId: string | undefined, current: string, lane?: Case
     if (isCaseLane(lane)) url.searchParams.set("lane", lane);
     // The window has to travel with the case, and this used to return before
     // setting it. A deep link names ONE case; the Cases list then applied its
-    // default last-24-hours filter to it, so opening anything older landed on a
-    // list the case was not in, with nothing selected. The operator read that
-    // as a broken link. A link that names its target must not be filtered out
-    // by a default the operator never chose.
-    url.searchParams.set("window", "all");
+    // default window to it, so opening anything older landed on a list the
+    // case was not in, with nothing selected. The operator read that as a
+    // broken link. A link that names its target must not be filtered out by a
+    // default the operator never chose.
+    //
+    // A link that knows the span its case was counted in (a lane card's
+    // newest case, from a card counting the last 7 days) opens that span
+    // instead: the case is in it, and the list beside it is the one the card
+    // described. Every other link opens every day.
+    url.searchParams.set("window", isCaseListWindow(window) ? window : "all");
     return url;
   }
   // No case named: this is Home's "View all in Cases", clicked from beside a
@@ -618,8 +629,8 @@ export function App({
     window.history.pushState({}, "", activityUrl(target, window.location.href));
     setRoute("activity");
   };
-  const openCase = (caseId?: string, lane?: CaseLane) => {
-    window.history.pushState({}, "", caseUrl(caseId, window.location.href, lane));
+  const openCase = (caseId?: string, lane?: CaseLane, span?: CaseListWindow) => {
+    window.history.pushState({}, "", caseUrl(caseId, window.location.href, lane, span));
     setRoute("cases");
   };
   const openLane = (lane: CaseLane, options: LaneOpenOptions) => {
@@ -716,7 +727,7 @@ function EnterpriseRoute({
   tokenIntelligence?: DashboardBootstrap["capabilities"][number];
   meta?: DashboardMeta;
   onOpenActivity: (target?: Omit<ActivityTarget, "requestId">) => void;
-  onOpenCase?: (caseId?: string, lane?: CaseLane) => void;
+  onOpenCase?: (caseId?: string, lane?: CaseLane, window?: CaseListWindow) => void;
   /** Opens the Cases screen on the waiting queue; see `caseQueueUrl`. */
   onOpenQueue?: () => void;
   /** Opens the Cases screen on one lane; see `caseLaneUrl`. */

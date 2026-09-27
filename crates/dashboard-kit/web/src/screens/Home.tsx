@@ -8,7 +8,7 @@ import {
   type GuardrailMode,
   type Overview,
 } from "../api";
-import type { CaseLane } from "../api/cases";
+import type { CaseLane, CaseListWindow } from "../api/cases";
 import type { DashboardAccess } from "../api/v1";
 import { DecidedBy } from "../components/DecidedBy";
 import { LaneCards, type LaneOpenOptions } from "../components/LaneCards";
@@ -189,7 +189,7 @@ export function Home({
    * when the shell actually has a Cases screen to open; its absence makes
    * every case link degrade per `decisionEntryLink`.
    */
-  onOpenCase?: (caseId?: string, lane?: CaseLane) => void;
+  onOpenCase?: (caseId?: string, lane?: CaseLane, window?: CaseListWindow) => void;
   /**
    * Opens the Cases screen on one lane. Provided only when the shell has a
    * Cases screen; a lane card without it links nowhere (`laneLink`).
@@ -321,7 +321,7 @@ export function OverviewScreen({
   fetching?: boolean;
   reconnecting?: boolean;
   onOpenActivity: (target?: ActivityLink) => void;
-  onOpenCase?: (caseId?: string, lane?: CaseLane) => void;
+  onOpenCase?: (caseId?: string, lane?: CaseLane, window?: CaseListWindow) => void;
   onOpenQueue?: () => void;
   onOpenLane?: (lane: CaseLane, options: LaneOpenOptions) => void;
   machinePanels?: MachinePanels;
@@ -446,7 +446,7 @@ function LanesOverview({
   fetching: boolean;
   reconnecting: boolean;
   onOpenActivity: (target?: ActivityLink) => void;
-  onOpenCase?: (caseId?: string, lane?: CaseLane) => void;
+  onOpenCase?: (caseId?: string, lane?: CaseLane, window?: CaseListWindow) => void;
   onOpenQueue?: () => void;
   onOpenLane?: (lane: CaseLane, options: LaneOpenOptions) => void;
   machinePanels?: MachinePanels;
@@ -467,7 +467,7 @@ function LanesOverview({
         cards={laneCards}
         edition={edition}
         onOpenLane={onOpenLane}
-        onOpenCase={onOpenCase === undefined ? undefined : (caseId, lane) => onOpenCase(caseId, lane)}
+        onOpenCase={onOpenCase === undefined ? undefined : (caseId, lane, window) => onOpenCase(caseId, lane, window)}
         onOpenActivity={() => onOpenActivity()}
       />
 
@@ -603,7 +603,7 @@ export function openDecisionRecord(
   cta: ReturnType<typeof decisionRecordCta>,
   open: {
     onOpenActivity: (target?: ActivityLink) => void;
-    onOpenCase?: (caseId?: string, lane?: CaseLane) => void;
+    onOpenCase?: (caseId?: string, lane?: CaseLane, window?: CaseListWindow) => void;
     onOpenLane?: (lane: CaseLane, options: LaneOpenOptions) => void;
   },
 ): void {
@@ -630,7 +630,7 @@ function DecisionRecordSection({
   overview: Overview;
   tiles: boolean;
   onOpenActivity: (target?: ActivityLink) => void;
-  onOpenCase?: (caseId?: string, lane?: CaseLane) => void;
+  onOpenCase?: (caseId?: string, lane?: CaseLane, window?: CaseListWindow) => void;
   onOpenLane?: (lane: CaseLane, options: LaneOpenOptions) => void;
 }) {
   const { cta, summary, denyVerdicts, reviewVerdicts, allowVerdicts } = record;

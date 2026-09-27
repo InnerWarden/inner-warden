@@ -80,7 +80,7 @@ test("the count line pages against rows and names the cases in the window apart"
   });
   await page.goto("/?view=cases&window=7d");
 
-  await expect(page.getByText("2 rows on this page of 312 · 4,394 cases in this window", { exact: true })).toBeVisible();
+  await expect(page.getByText("2 rows on this page of 312 · 4,394 cases in the last 7 days", { exact: true })).toBeVisible();
   // The case total is never the denominator of the rows.
   await expect(page.getByText("of 4,394", { exact: false })).toHaveCount(0);
   expect(listRequests.length).toBeGreaterThan(0);

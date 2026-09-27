@@ -4,6 +4,23 @@ import type { EffectiveMode, SecurityOutcome } from "../api/v1";
 import { isCaseLaneChoice, type CaseLaneChoice } from "../lanes";
 
 export type CaseWindow = "all" | "1h" | "24h" | "7d" | "30d";
+
+/**
+ * The span Cases opens on when the address names none: the last 7 days, the
+ * span the Overview's cards count. It was the last 24 hours, so a reader who
+ * read "4 messages in the last 7 days" on the Overview and pressed the Cases
+ * tab found 2, over a span nothing on screen named.
+ */
+export const DEFAULT_CASE_WINDOW: CaseWindow = "7d";
+
+/** Each span a Cases list offers, in the words its controls print. */
+export const CASE_WINDOW_LABELS: Record<CaseWindow, string> = {
+  all: "All loaded time",
+  "1h": "Last hour",
+  "24h": "Last 24 hours",
+  "7d": "Last 7 days",
+  "30d": "Last 30 days",
+};
 export type CaseScopeKind = "all" | "agent" | "host" | "workload" | "resource";
 /**
  * The queue, or one status. `waiting` is `needs_review` and `open` together:
@@ -52,7 +69,7 @@ export const EMPTY_CASE_VIEW: CaseViewState = {
   capability: "",
   scopeKind: "all",
   scopeId: "",
-  window: "24h",
+  window: DEFAULT_CASE_WINDOW,
   cursor: null,
   selectedCase: null,
   lane: "",
@@ -97,6 +114,8 @@ const modes = ["disabled", "learning", "observe", "rehearse", "enforce", "unknow
 // to page-only client filtering and find LESS than `agent` already does.
 const scopeKinds = ["all", "agent", "host", "workload"] as const;
 const windows = ["all", "1h", "24h", "7d", "30d"] as const;
+/** The spans, in the order every window control offers them. */
+export const CASE_WINDOWS: readonly CaseWindow[] = windows;
 
 function selected<const T extends readonly string[]>(value: string | null, allowed: T, fallback: T[number] | ""): T[number] | "" {
   return value !== null && allowed.includes(value) ? value as T[number] : fallback;
@@ -119,7 +138,7 @@ export function readCaseViewState(search = window.location.search): CaseViewStat
     capability: bounded(parameters, "capability", 256),
     scopeKind: selected(parameters.get("scope_kind"), scopeKinds, "all") as CaseScopeKind,
     scopeId: bounded(parameters, "scope", 256),
-    window: selected(parameters.get("window"), windows, "24h") as CaseWindow,
+    window: selected(parameters.get("window"), windows, DEFAULT_CASE_WINDOW) as CaseWindow,
     cursor: bounded(parameters, "cursor", 2_048) || null,
     selectedCase: bounded(parameters, "case", 256) || null,
     lane: isCaseLaneChoice(parameters.get("lane")) ? parameters.get("lane") as CaseLaneChoice : "",
@@ -132,7 +151,7 @@ export function caseViewUrl(state: CaseViewState, current = window.location.href
   const values: [string, string, string][] = [
     ["q", state.query, ""], ["outcome", state.outcome, ""], ["severity", state.severity, ""],
     ["status", state.status, ""], ["mode", state.mode, ""], ["authority", state.authority, ""], ["capability", state.capability, ""],
-    ["scope_kind", state.scopeKind, "all"], ["scope", state.scopeId, ""], ["window", state.window, "24h"],
+    ["scope_kind", state.scopeKind, "all"], ["scope", state.scopeId, ""], ["window", state.window, DEFAULT_CASE_WINDOW],
     ["cursor", state.cursor ?? "", ""], ["case", state.selectedCase ?? "", ""], ["lane", state.lane, ""],
   ];
   for (const [name, value, defaultValue] of values) {
@@ -278,11 +297,7 @@ export function CaseFiltersForm({ draft, disabled, onDraft: setDraft, onApply, o
           </select>
         </label>
         <FilterSelect label="Time window" value={draft.window} disabled={disabled} onChange={(window) => setDraft((current) => ({ ...current, window: window as CaseWindow }))}>
-          <option value="all">All loaded time</option>
-          <option value="1h">Last hour</option>
-          <option value="24h">Last 24 hours</option>
-          <option value="7d">Last 7 days</option>
-          <option value="30d">Last 30 days</option>
+          {CASE_WINDOWS.map((span) => <option key={span} value={span}>{CASE_WINDOW_LABELS[span]}</option>)}
         </FilterSelect>
         <FilterSelect label="Scope type" value={draft.scopeKind} disabled={disabled} onChange={(scopeKind) => setDraft((current) => ({ ...current, scopeKind: scopeKind as CaseScopeKind, scopeId: scopeKind === "all" ? "" : current.scopeId }))}>
           <option value="all">All scopes</option>
