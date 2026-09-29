@@ -1,5 +1,13 @@
 import { deriveShellNavigation } from "../App";
 import { describe, expect, it } from "vitest";
+
+/** The tabs the Community entry point hands the shell (`main.tsx`). */
+const COMMUNITY_SHELL_TABS = [
+  { route: "posture" as const, label: "Protection" },
+  { route: "activity" as const, label: "Cases" },
+  { route: "agents" as const, label: "Agents" },
+  { route: "tokens" as const, label: "Tokens" },
+];
 import {
   ACTIVITY_TOUR_STEP_KEY,
   COMMUNITY_TOUR_STEPS,
@@ -53,7 +61,7 @@ describe("the step table", () => {
     // `shouldResetToOverview`. A hardcoded allow-list here passed while three
     // steps pointed at Enterprise-only tabs, so the assertion now reads the
     // same function the shell does.
-    const offered = new Set(deriveShellNavigation(undefined, "community").map((item) => item.route));
+    const offered = new Set(deriveShellNavigation(undefined, "community", [], COMMUNITY_SHELL_TABS).map((item) => item.route));
     for (const step of COMMUNITY_TOUR_STEPS) {
       if (step.route !== undefined) {
         expect(offered, `step ${step.key} routes to ${step.route}, which the community shell never renders`).toContain(step.route);
@@ -298,7 +306,7 @@ describe("stepsForShell", () => {
   it("keeps that same step on a shell that does offer the tab", () => {
     // The other half: filtering unconditionally would pass the assertion above.
     // The community routes are the shell's own answer, not a list kept here.
-    const community = deriveShellNavigation(undefined, "community").map((item) => item.route);
+    const community = deriveShellNavigation(undefined, "community", [], COMMUNITY_SHELL_TABS).map((item) => item.route);
     expect(community).toContain("activity");
     const walked = stepsForShell(COMMUNITY_TOUR_STEPS, community);
     expect(keysOf(walked)).toContain(ACTIVITY_TOUR_STEP_KEY);

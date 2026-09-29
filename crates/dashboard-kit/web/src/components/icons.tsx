@@ -24,6 +24,10 @@ export const GLYPHS = {
   decoy: "M10.5 1.5v8.25a3.25 3.25 0 0 1-6.5 0V7.5l2.25 2.25M9 1.5h3",
   egress: "M9 2.5H2.5v11H9M6 8h8.5M11.5 5l3 3-3 3",
   file: "M3.5 1.5h6l3 3v10h-9zM9.5 1.5v3h3",
+  // An MCP tool call: a two-prong plug.
+  plug: "M6 1.5v3M10 1.5v3M4 4.5h8v3a4 4 0 0 1-8 0zM8 11.5v3",
+  // AI Jail: a square with three bars.
+  cage: "M2.5 2.5h11v11h-11zM5.25 2.5v11M8 2.5v11M10.75 2.5v11",
 } as const;
 
 export type GlyphName = keyof typeof GLYPHS;

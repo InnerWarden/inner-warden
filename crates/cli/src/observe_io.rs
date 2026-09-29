@@ -395,6 +395,30 @@ fn cmd_install(rest: &[String]) -> std::process::ExitCode {
     std::process::ExitCode::SUCCESS
 }
 
+/// Whether this machine has an OpenClaw config for `observe install` to write
+/// into. Without one, `observe install` changes nothing and exits 1, so the
+/// dashboard never offers it.
+pub(crate) fn openclaw_present() -> bool {
+    innerwarden_agent_guard::hook::home_dir()
+        .map(|home| openclaw_config(&home).is_file())
+        .unwrap_or(false)
+}
+
+/// Whether conversation attempts are observed on this host: the hook is
+/// installed and enabled. The same test `observe status` prints.
+pub(crate) fn installed() -> bool {
+    let Ok(home) = innerwarden_agent_guard::hook::home_dir() else {
+        return false;
+    };
+    let installed = hook_dir(&home).join("handler.js").exists();
+    installed
+        && std::fs::read_to_string(openclaw_config(&home))
+            .ok()
+            .and_then(|body| serde_json::from_str::<Value>(&body).ok())
+            .map(|root| crate::observe::hook_is_enabled(&root, HOOK_NAME))
+            .unwrap_or(false)
+}
+
 /// `innerwarden observe status` - can this host see a conversation attempt at
 /// all? An honest gap is worth more than an assumed capability.
 fn cmd_status() -> std::process::ExitCode {

@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { createContext, useContext, useEffect, useState, type ReactNode } from "react";
 import { plainOrTechnical, useTechnicalDetail } from "./TechnicalDetail";
 import {
   fetchAgents,
@@ -29,33 +29,69 @@ const PRODUCT_LABELS: Record<string, string> = {
 };
 
 /**
+ * Whether the panels draw in neutral tones (`tones="neutral"`): every
+ * emerald and amber class becomes its slate twin, and a "Runtime not
+ * confirmed" badge is not drawn. For a page whose colour rules forbid both
+ * here (Community confirms nothing after the fact, so it has no emerald, and
+ * its amber is only for a person's task, which its own rows already carry).
+ */
+const NeutralTones = createContext(false);
+
+const TONE_CLASS = /\b(border|bg|text)-(emerald|amber)-(\d{2,3})\b/g;
+
+/** `className` with emerald and amber turned slate when the panel is neutral. */
+export function neutralTone(className: string, neutral: boolean): string {
+  return neutral ? className.replace(TONE_CLASS, (_, part: string, _hue: string, shade: string) => `${part}-slate-${shade}`) : className;
+}
+
+function useTone(): (className: string) => string {
+  const neutral = useContext(NeutralTones);
+  return (className: string) => neutralTone(className, neutral);
+}
+
+/**
  * The agent and token panels.
  *
  * `showAgents` and `showTokens` let a shell leave out a panel whose source it
  * already knows is not configured (see `LanesOverview` in Home). Both default
  * to shown, which is every caller before they existed. A panel left out is
- * not polled either.
+ * not polled either. `tones` defaults to the panels' own colours; "neutral"
+ * draws them in slate (see `NeutralTones`).
  */
-export function MachineIntelligence({ edition, showAgents = true, showTokens = true }: {
+export function MachineIntelligence({ edition, showAgents = true, showTokens = true, tones }: {
   edition?: "community" | "enterprise";
   showAgents?: boolean;
   showTokens?: boolean;
+  tones?: "neutral";
 } = {}) {
   return (
-    <div className="space-y-6">
-      {showAgents ? <PolledAgentsPanel edition={edition} /> : null}
-      {showTokens ? <PolledTokenPanel /> : null}
-    </div>
+    <NeutralTones.Provider value={tones === "neutral"}>
+      <div className="space-y-6">
+        {showAgents ? <PolledAgentsPanel edition={edition} /> : null}
+        {showTokens ? <PolledTokenPanel /> : null}
+      </div>
+    </NeutralTones.Provider>
   );
 }
 
+/**
+ * Answers a shell already holds, drawn at once instead of a loading panel
+ * while the panels' own first poll is on its way. Absent (the default): the
+ * panels start empty, as they always did. A render test seeds it too, so a
+ * rule about what the panels draw is checked against drawn panels, not
+ * against their loading state.
+ */
+export const MachineIntelligenceSeed = createContext<{ agents?: AgentsResponse; tokens?: TokenIntelligenceResponse }>({});
+
 function PolledAgentsPanel({ edition }: { edition?: "community" | "enterprise" }) {
-  const agents = usePollingResource(fetchAgents, 30_000, agentsAreLoading);
+  const seed = useContext(MachineIntelligenceSeed).agents;
+  const agents = usePollingResource(fetchAgents, 30_000, agentsAreLoading, seed);
   return <AgentsPanel state={agents} edition={edition} />;
 }
 
 function PolledTokenPanel() {
-  const tokens = usePollingResource(fetchTokenIntelligence, 60_000, tokensAreLoading);
+  const seed = useContext(MachineIntelligenceSeed).tokens;
+  const tokens = usePollingResource(fetchTokenIntelligence, 60_000, tokensAreLoading, seed);
   return <TokenPanel state={tokens} />;
 }
 
@@ -101,8 +137,10 @@ export function shouldSurfaceError(haveData: boolean): boolean {
   return !haveData;
 }
 
-function usePollingResource<T>(load: () => Promise<T>, intervalMs: number, retrySoon: (data: T) => boolean): PollState<T> {
-  const [state, setState] = useState<PollState<T>>(INITIAL_POLL_STATE);
+function usePollingResource<T>(load: () => Promise<T>, intervalMs: number, retrySoon: (data: T) => boolean, initial?: T): PollState<T> {
+  const [state, setState] = useState<PollState<T>>(() =>
+    initial === undefined ? INITIAL_POLL_STATE : { data: initial, error: false, loading: false, refreshing: false },
+  );
 
   useEffect(() => {
     let active = true;
@@ -110,7 +148,7 @@ function usePollingResource<T>(load: () => Promise<T>, intervalMs: number, retry
     let timer: number | undefined;
     let backoff = ERROR_BACKOFF_START_MS;
     let lastSerialised: string | undefined;
-    let haveData = false;
+    let haveData = initial !== undefined;
 
     const refresh = () => {
       if (inFlight) return;
@@ -348,6 +386,8 @@ function AgentCard({ agent, spanClass = "" }: { agent: LocalAgent; spanClass?: s
   // directly here would leave the label on the old register until something
   // else happened to redraw it.
   const [technical] = useTechnicalDetail();
+  const tone = useTone();
+  const neutral = useContext(NeutralTones);
   const running = runningStatus(agent.running);
   const view = guardrailView(agent.guardrail);
   return (
@@ -357,24 +397,28 @@ function AgentCard({ agent, spanClass = "" }: { agent: LocalAgent; spanClass?: s
           <h3 className="truncate text-base font-semibold text-slate-950" title={agent.display_name}>{agent.display_name}</h3>
           <p className="mt-1 text-xs text-slate-500">{agentPresence(agent)}</p>
         </div>
-        <span className={`inline-flex shrink-0 items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-semibold ${running.cls}`}>
-          <span className="h-1.5 w-1.5 rounded-full bg-current" aria-hidden="true" />
-          {running.label}
-        </span>
+        {/* A neutral panel leaves out a badge that says only that nothing was
+            checked: the page it sits on says that once, for every agent. */}
+        {neutral && agent.running === null ? null : (
+          <span className={`inline-flex shrink-0 items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-semibold ${tone(running.cls)}`}>
+            <span className="h-1.5 w-1.5 rounded-full bg-current" aria-hidden="true" />
+            {running.label}
+          </span>
+        )}
       </div>
 
       {/* The whole point of the liveness half. An agent with a policy row and no
           observation used to render as a normal, healthy card; the sentence has
           to be on the card, not inferable from it. */}
       {view.notice && (
-        <p role="status" className="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2.5 text-xs leading-5 text-amber-950">
+        <p role="status" className={tone("mt-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2.5 text-xs leading-5 text-amber-950")}>
           {view.notice}
         </p>
       )}
 
       <dl className="mt-4 grid grid-cols-1 gap-3 text-xs min-[380px]:grid-cols-2">
         <Detail label="Guardrail">
-          <span className={`font-semibold ${view.tone}`}>{view.label}</span>
+          <span className={`font-semibold ${tone(view.tone)}`}>{view.label}</span>
           {view.intent && <span className="mt-0.5 block text-[11px] font-normal text-slate-500">{view.intent}</span>}
         </Detail>
         <Detail label="Setup support">{humanise(agent.guardrail.setup_support)}</Detail>
@@ -789,6 +833,7 @@ function Detail({ label, children }: { label: string; children: ReactNode }) {
 }
 
 function AvailabilityBadge({ value }: { value: string }) {
+  const tone = useTone();
   const normalised = value.toLowerCase();
   const cls = normalised.includes("error") || normalised.includes("failed")
     ? "border-red-200 bg-red-50 text-red-700"
@@ -799,7 +844,7 @@ function AvailabilityBadge({ value }: { value: string }) {
     : normalised.includes("available") && !normalised.includes("unavailable")
       ? "border-emerald-200 bg-emerald-50 text-emerald-700"
       : "border-slate-200 bg-slate-50 text-slate-600";
-  return <span className={`inline-flex rounded-full border px-2.5 py-1 text-xs font-semibold ${cls}`}>{humanise(value)}</span>;
+  return <span className={`inline-flex rounded-full border px-2.5 py-1 text-xs font-semibold ${tone(cls)}`}>{humanise(value)}</span>;
 }
 
 function GeneratedAt({ value }: { value: number }) {
@@ -807,8 +852,9 @@ function GeneratedAt({ value }: { value: number }) {
 }
 
 function StaleNotice() {
+  const tone = useTone();
   return (
-    <div role="status" className="mb-3 rounded-xl border border-amber-200 bg-amber-50 px-4 py-2.5 text-xs text-amber-900">
+    <div role="status" className={tone("mb-3 rounded-xl border border-amber-200 bg-amber-50 px-4 py-2.5 text-xs text-amber-900")}>
       Latest refresh failed. The last available local snapshot is retained.
     </div>
   );
@@ -837,8 +883,9 @@ function EmptyPanel({ title, body }: { title: string; body: string }) {
 }
 
 function UnavailablePanel({ title, body }: { title: string; body: string }) {
+  const tone = useTone();
   return (
-    <div role="alert" className="rounded-2xl border border-amber-200 bg-amber-50 px-4 py-5 text-amber-950 sm:px-5">
+    <div role="alert" className={tone("rounded-2xl border border-amber-200 bg-amber-50 px-4 py-5 text-amber-950 sm:px-5")}>
       <h3 className="font-semibold">{title}</h3>
       <p className="mt-1 text-sm leading-6">{body}</p>
     </div>

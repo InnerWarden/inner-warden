@@ -1,7 +1,69 @@
 {
+  "agents": [
+    {
+      "agent_id": "claude",
+      "availability": "available",
+      "cache_creation_input_tokens": "38308385",
+      "cache_read_input_tokens": "1271432724",
+      "cached_input_tokens": null,
+      "display_name": "Claude Code",
+      "input_tokens": "6312",
+      "last_observed_at_ms": 1790690580000,
+      "output_tokens": "2606929",
+      "parts_disjoint": true,
+      "provenance": {
+        "note": "Read from the agent's own history on this machine.",
+        "quality": "provider_reported",
+        "source": "local_history"
+      },
+      "reasoning_output_tokens": null,
+      "sessions": 18,
+      "total_tokens": "1312354350"
+    },
+    {
+      "agent_id": "codex",
+      "availability": "available",
+      "cache_creation_input_tokens": null,
+      "cache_read_input_tokens": null,
+      "cached_input_tokens": "959384704",
+      "display_name": "Codex",
+      "input_tokens": "1001500704",
+      "last_observed_at_ms": 1790604300000,
+      "output_tokens": "2885285",
+      "parts_disjoint": false,
+      "provenance": {
+        "note": "Read from the agent's own history on this machine.",
+        "quality": "provider_reported",
+        "source": "local_history"
+      },
+      "reasoning_output_tokens": "844960",
+      "sessions": 17,
+      "total_tokens": "1004385989"
+    },
+    {
+      "agent_id": "cursor",
+      "availability": "unsupported",
+      "cache_creation_input_tokens": null,
+      "cache_read_input_tokens": null,
+      "cached_input_tokens": null,
+      "display_name": "Cursor",
+      "input_tokens": null,
+      "last_observed_at_ms": null,
+      "output_tokens": null,
+      "parts_disjoint": false,
+      "provenance": {
+        "note": "No supported local token source is available; no billing estimate is inferred.",
+        "quality": "unsupported",
+        "source": "not_available"
+      },
+      "reasoning_output_tokens": null,
+      "sessions": null,
+      "total_tokens": null
+    }
+  ],
+  "availability": "partial",
+  "generated_at_ms": 1790690700000,
   "schema_version": 1,
-  "generated_at_ms": 0,
   "scope": "available_local_history",
-  "availability": "no_data",
-  "agents": []
+  "totals": null
 }

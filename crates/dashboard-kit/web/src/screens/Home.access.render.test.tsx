@@ -7,7 +7,7 @@ import { auditTrailViewOf, parseDashboardBootstrap } from "../api/validate";
 import { auditTrailOpener } from "../App";
 import { setTechnicalDetail } from "../components/TechnicalDetail";
 import { CONFIRMED_CHANGES_CLAIM, OverviewScreen, READ_ONLY_CLAIM, dashboardAccessClaim } from "./Home";
-import communityOverview from "../../tests/fixtures/community/overview.json";
+import communityOverview from "../../tests/fixtures/community/overview-no-lanes.json";
 import enterpriseBootstrap from "../../tests/fixtures/enterprise/bootstrap.json";
 
 /**

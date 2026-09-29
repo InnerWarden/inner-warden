@@ -61,11 +61,31 @@ function bootstrap(edition: DashboardBootstrap["edition"], capabilities: Capabil
 }
 
 describe("deriveShellNavigation", () => {
-  it("preserves the complete Community shell when Enterprise is absent", () => {
+  it("builds the Community shell from the screens its entry point hands in, in their order", () => {
     expect(deriveShellNavigation(bootstrap("community", []), "community")).toEqual([
       { route: "overview", label: "Overview" },
-      { route: "activity", label: "Activity" },
     ]);
+    const screens = [
+      { route: "overview" as const, label: "Home" },
+      { route: "posture" as const, label: "Protection" },
+      { route: "activity" as const, label: "Cases" },
+      { route: "agents" as const, label: "Agents" },
+      { route: "tokens" as const, label: "Tokens" },
+      { route: "tokens" as const, label: "Twice" },
+    ];
+    expect(deriveShellNavigation(bootstrap("community", []), "community", [], screens)).toEqual([
+      { route: "overview", label: "Overview" },
+      { route: "posture", label: "Protection" },
+      { route: "activity", label: "Cases" },
+      { route: "agents", label: "Agents" },
+      { route: "tokens", label: "Tokens" },
+    ]);
+  });
+
+  it("never lets the Community screens reach the paid navigation", () => {
+    const screens = [{ route: "activity" as const, label: "Cases" }];
+    const paid = deriveShellNavigation(bootstrap("enterprise", []), "enterprise", [], screens);
+    expect(paid.map((item) => item.label)).not.toContain("Cases");
   });
 
   it("uses declared capabilities, not licence entitlement, for Enterprise routes", () => {
@@ -158,7 +178,7 @@ describe("contributed screens", () => {
     const navigation = deriveShellNavigation(bootstrap("community", []), "community", [
       contributedScreen("cases", true),
     ]);
-    expect(navigation.map((item) => item.route)).toEqual(["overview", "activity"]);
+    expect(navigation.map((item) => item.route)).toEqual(["overview"]);
   });
 });
 

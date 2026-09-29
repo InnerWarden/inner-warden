@@ -47,9 +47,17 @@ const reviewDecision: DecisionSummary = {
   decided_by: "rules",
 };
 
+/** The Community entry point's tabs, as `main.tsx` hands them to the shell. */
+const COMMUNITY_TABS = [
+  { route: "posture" as const, label: "Protection" },
+  { route: "activity" as const, label: "Cases" },
+  { route: "agents" as const, label: "Agents" },
+  { route: "tokens" as const, label: "Tokens" },
+];
+
 function tabs(edition: "community" | "enterprise"): string[] {
   const bootstrap = edition === "enterprise" ? (casesBootstrap as unknown as DashboardBootstrap) : undefined;
-  return deriveShellNavigation(bootstrap, edition).map((item) => item.label);
+  return deriveShellNavigation(bootstrap, edition, [], edition === "community" ? COMMUNITY_TABS : undefined).map((item) => item.label);
 }
 
 describe("the Decision record decides its button and its remedy together", () => {
@@ -65,12 +73,12 @@ describe("the Decision record decides its button and its remedy together", () =>
     expect(record.summary.next).toContain(record.cta.label);
   });
 
-  it("sends Community to Activity, the tab it does draw", () => {
+  it("sends Community to Cases, the tab it draws for the activity route", () => {
     const record = decisionRecord(overview(), "community", false, "enforce");
 
-    expect(tabs("community")).toContain("Activity");
+    expect(tabs("community")).toContain("Cases");
     expect(record.cta.kind).toBe("activity");
-    expect(record.summary.next).toContain("Open Activity");
+    expect(record.summary.next).toContain("Open Cases");
   });
 
   it("names no screen on a paid shell with no Cases to open", () => {

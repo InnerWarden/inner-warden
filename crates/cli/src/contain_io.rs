@@ -256,6 +256,19 @@ fn detect_worktree(project: &Path) -> Option<Worktree> {
     })
 }
 
+/// The jail backend `innerwarden contain` would use on this machine, by name,
+/// or `None` when there is none it trusts. The same lookup `contain` runs, so
+/// the dashboard never says "Ready" for a jail that would refuse to start.
+pub(crate) fn jail_backend() -> Option<&'static str> {
+    if cfg!(target_os = "linux") {
+        resolve_backend(&["/usr/bin/bwrap", "/bin/bwrap", "/usr/local/bin/bwrap"]).map(|_| "bwrap")
+    } else if cfg!(target_os = "macos") {
+        resolve_backend(&["/usr/bin/sandbox-exec"]).map(|_| "sandbox-exec")
+    } else {
+        None
+    }
+}
+
 /// Resolve a sandbox backend from a compile-time list of trusted absolute paths.
 /// Release builds have no environment/PATH override. On Unix the executable and
 /// every path component must be root-owned, not group/world-writable, and not a

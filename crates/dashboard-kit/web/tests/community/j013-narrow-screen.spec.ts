@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { expect, test, type Page } from "@playwright/test";
+import { CASE, COMMUNITY_TABS, PAGE_READY } from "./support";
 
 const bootstrap = JSON.parse(readFileSync(new URL("../fixtures/community/bootstrap.json", import.meta.url), "utf8"));
 const enterpriseBootstrap = JSON.parse(readFileSync(new URL("../fixtures/enterprise/bootstrap.json", import.meta.url), "utf8"));
@@ -7,8 +8,9 @@ const enterpriseBootstrap = JSON.parse(readFileSync(new URL("../fixtures/enterpr
 /**
  * A phone, 320 px wide. The page scrolled sideways (scrollWidth 337) and the
  * header took 175 of 640 px before anything the reader came for. Every
- * Community screen now fits the width, and the header is one row over the
- * nav, with the technical switch and the tour behind one button.
+ * Community page now fits the width, the five tabs wrap to a second line
+ * instead of scrolling, and the technical switch and the tour sit behind one
+ * button.
  */
 
 test.use({ viewport: { width: 320, height: 640 } });
@@ -24,10 +26,13 @@ async function pageWidth(page: Page) {
   }));
 }
 
-for (const [name, path, drawn] of [
-  ["Overview", "/", "#posture-title"],
-  ["Activity", "/?view=activity", '[data-tour="activity"]'],
-] as const) {
+const PAGES: [string, string, string][] = [
+  ...COMMUNITY_TABS.map(([label, path]) => [label, path, PAGE_READY[label]] as [string, string, string]),
+  ["A case", `/?view=activity&decision=${encodeURIComponent(CASE.domainFetch)}`, `section[data-case="${CASE.domainFetch}"]`],
+  ["A message", "/?view=activity&lane=agent_messages&decision=eaaf70209eb20103", 'section[data-case="eaaf70209eb20103"]'],
+];
+
+for (const [name, path, drawn] of PAGES) {
   test(`${name} fits a 320 px screen without scrolling sideways`, async ({ page }) => {
     await page.route("**/api/dashboard/v1/bootstrap", (route) =>
       route.fulfill({ json: { ...bootstrap, product_version: LONG_VERSION } }));
@@ -39,12 +44,21 @@ for (const [name, path, drawn] of [
   });
 }
 
-test("the header is one row over the nav, with the switch and the tour behind the menu", async ({ page }) => {
+test("the five tabs wrap inside the screen, and the header stays under a third of it", async ({ page }) => {
   await page.goto("/");
-  const header = page.locator("header");
-  await expect(page.getByRole("navigation", { name: "Dashboard views" })).toBeVisible();
-  const height = await header.evaluate((element) => element.getBoundingClientRect().height);
-  expect(height).toBeLessThan(120);
+  const nav = page.getByRole("navigation", { name: "Dashboard views" });
+  await expect(nav).toBeVisible();
+  const tabs = nav.getByRole("button");
+  await expect(tabs).toHaveCount(COMMUNITY_TABS.length);
+  for (const box of await tabs.evaluateAll((buttons) => buttons.map((button) => button.getBoundingClientRect().toJSON() as DOMRect))) {
+    expect(box.left).toBeGreaterThanOrEqual(0);
+    expect(box.right).toBeLessThanOrEqual(320);
+  }
+  const height = await page.locator("header").evaluate((element) => element.getBoundingClientRect().height);
+  expect(height).toBeLessThan(640 / 3);
+
+  // The mode is said in words at this width too, not a bare mark.
+  await expect(page.locator("header [data-meta-status]")).toHaveText(/Partly connected/);
 
   const toggle = page.getByRole("checkbox", { name: "Show technical detail" });
   await expect(toggle).toBeHidden();
@@ -54,6 +68,39 @@ test("the header is one row over the nav, with the switch and the tour behind th
   await expect(menu).toHaveAttribute("aria-expanded", "true");
   await expect(toggle).toBeVisible();
   await expect(page.getByRole("button", { name: "Open the product tour" })).toBeVisible();
+});
+
+/** FAILS ON REVERT: at 390 the tabs wrapped, "Tokens" alone on a second row. */
+for (const width of [320, 390]) {
+  test(`the five tabs share one row at ${width} px`, async ({ page }) => {
+    await page.setViewportSize({ width, height: 800 });
+    await page.goto("/");
+    const tabs = page.getByRole("navigation", { name: "Dashboard views" }).getByRole("button");
+    await expect(tabs).toHaveCount(COMMUNITY_TABS.length);
+    const tops = await tabs.evaluateAll((buttons) => buttons.map((button) => Math.round(button.getBoundingClientRect().top)));
+    expect(new Set(tops).size).toBe(1);
+  });
+}
+
+/**
+ * A case's neighbours say their outcome in words for a screen reader at
+ * every width. Below 640 px the words were `display: none`, so the only
+ * signal left was the colour of a dot.
+ */
+test("each neighbour of a case says its outcome to a screen reader on a phone", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 800 });
+  await page.goto(`/?view=activity&decision=${encodeURIComponent(CASE.domainFetch)}`);
+  const around = page.locator('section[aria-labelledby="around-title"] li');
+  await expect(around.first()).toBeVisible();
+  const rows = await around.evaluateAll((items) => items.map((item) => {
+    const words = item.querySelector("[data-outcome-words]");
+    return { text: words?.textContent ?? "", shown: words !== null && getComputedStyle(words).display !== "none" };
+  }));
+  expect(rows.length).toBeGreaterThan(1);
+  for (const row of rows) {
+    expect(row.text.length).toBeGreaterThan(0);
+    expect(row.shown).toBe(true);
+  }
 });
 
 /**
@@ -84,7 +131,7 @@ test("the menu closes on Escape, on a press outside it, and on going to another 
   await expect(menu).toHaveAttribute("aria-expanded", "true");
   await toggle.click();
 
-  await page.getByRole("navigation", { name: "Dashboard views" }).getByRole("button", { name: "Activity" }).click();
+  await page.getByRole("navigation", { name: "Dashboard views" }).getByRole("button", { name: "Cases" }).click();
   await expect(menu).toHaveAttribute("aria-expanded", "false");
   await expect(toggle).toBeHidden();
 });
@@ -98,6 +145,39 @@ test.describe("on a wide screen", () => {
     await expect(page.getByRole("button", { name: "Open the product tour" })).toBeVisible();
     await expect(page.getByRole("button", { name: "Menu" })).toBeHidden();
   });
+});
+
+/**
+ * FAILS ON REVERT: a second chip ("Local only" in the technical view, "Open
+ * to the network" beside "Partly connected") wrapped the Community header to
+ * two rows at 1440, where the paid header is always one.
+ */
+test.describe("the header at a desk", () => {
+  test.use({ viewport: { width: 1440, height: 900 } });
+  const NOTICES: [string, Record<string, unknown>][] = [
+    ["plain", {}],
+    ["exposed", { exposed: true }],
+    ["installed", { active_defence_installed: true }],
+    ["update", { update_pending: true, update_note: "A newer InnerWarden is installed. Restart the dashboard to use it." }],
+  ];
+  for (const [name, patch] of NOTICES) {
+    for (const technical of [false, true]) {
+      test(`is one row: ${name}${technical ? ", technical view" : ""}`, async ({ page }) => {
+        const meta = JSON.parse(readFileSync(new URL("../fixtures/community/meta.json", import.meta.url), "utf8"));
+        await page.route("**/api/guard/meta", (route) => route.fulfill({ json: { ...meta, ...patch } }));
+        if (name === "plain") {
+          await page.route("**/api/guard/record-health", (route) => route.fulfill({ json: { recording: false, since_unix: 1_790_680_000, lost_actions: 3 } }));
+        }
+        await page.goto("/");
+        await expect(page.locator("header [data-meta-status]")).toHaveAttribute("data-meta-status", "ready");
+        if (technical) await page.getByRole("checkbox", { name: "Show technical detail" }).check();
+        await expect(page.locator("header [data-chip]")).toHaveCount(1);
+        const nav = await page.getByRole("navigation", { name: "Dashboard views" }).boundingBox();
+        const chip = await page.locator("header [data-chip]").boundingBox();
+        expect(Math.abs((chip!.y + chip!.height / 2) - (nav!.y + nav!.height / 2))).toBeLessThan(12);
+      });
+    }
+  }
 });
 
 // ─────────────────── the paid Protection screen on a phone ───────────────────

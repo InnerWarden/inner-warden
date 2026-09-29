@@ -106,6 +106,119 @@ struct AgentView {
     detected_by: Vec<&'static str>,
     guardrail: AgentGuardrailView,
     auto_connect_eligible: Option<bool>,
+    /// The one command that changes this agent's state, when there is one,
+    /// built from the name `agents connect` itself accepts. Absent when the
+    /// agent is already refusing, or cannot be connected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_step: Option<AgentNextStep>,
+    /// For a hook written before hooks named their agent: the reconnect, in
+    /// the hook's own mode, that adds the name. Its cases say "An agent"
+    /// until then, and the page says why.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    identity_step: Option<AgentNextStep>,
+}
+
+/// The step that names an agent whose hook does not, from the hook's own
+/// settings (`unnamed_hook_reconnect_flag`), or `None`.
+fn identity_step(name: &str, settings: &serde_json::Value) -> Option<AgentNextStep> {
+    let flag = innerwarden_agent_guard::hook::unnamed_hook_reconnect_flag(settings)?;
+    Some(AgentNextStep {
+        label: "To name it in its cases:",
+        command: format!("innerwarden agents connect {name}{flag}"),
+        line: "Its hook was set up before hooks named their agent, so its cases say \"An agent\". Reconnecting in the same mode adds the name; nothing else changes.",
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct AgentNextStep {
+    label: &'static str,
+    command: String,
+    line: &'static str,
+}
+
+/// What to run for one agent, from its state and the host's mode.
+///
+/// Never an enforce for a host the operator keeps in monitor mode without
+/// saying so: a new agent joins the others in the mode they already run in.
+/// The name is the row's own (`agents connect` matches it exactly), never a
+/// product name rebuilt from the display name.
+fn agent_next_step(
+    name: &str,
+    mode: &str,
+    setup_support: &str,
+    host_mode: &str,
+    wired_monitor: bool,
+) -> Option<AgentNextStep> {
+    if setup_support == "unsupported" {
+        return None;
+    }
+    match mode {
+        "not_configured" => {
+            // A host with no agent connected yet (or one that cannot be read)
+            // starts in monitor mode, as the Overview's Getting started and
+            // the agent card both say: `agents connect` alone would enforce.
+            let monitor = matches!(host_mode, "monitor" | "not_configured" | "unknown");
+            Some(AgentNextStep {
+                label: "To put the guard in front of it:",
+                command: format!(
+                    "innerwarden agents connect {name}{}",
+                    if monitor { " --monitor" } else { "" }
+                ),
+                line: if host_mode == "monitor" {
+                    "It joins your other agents in monitor mode: recorded, nothing refused."
+                } else if monitor {
+                    "It starts in monitor mode: every command is recorded and nothing is refused."
+                } else {
+                    "Every command it tries is then screened, and a deny is refused."
+                },
+            })
+        }
+        "partial" => Some(AgentNextStep {
+            label: "To finish connecting it:",
+            command: format!(
+                "innerwarden agents connect {name}{}",
+                if wired_monitor { " --monitor" } else { "" }
+            ),
+            line: "Wires the MCP servers that are still open, in the mode the others run in.",
+        }),
+        "monitor" | "mixed" => Some(AgentNextStep {
+            label: "To refuse a deny as well:",
+            command: "innerwarden enforce".into(),
+            line: "Switches every connected agent from watching to refusing a deny.",
+        }),
+        _ => None,
+    }
+}
+
+/// Whether an agent's WIRED servers run in monitor mode, for a partly
+/// connected agent: finishing the wiring must not flip the ones already there.
+fn agent_wired_monitor(
+    home: &std::path::Path,
+    agent: &innerwarden_agent_guard::agents::AgentStatus,
+) -> bool {
+    if let Some(rel) = &agent.mcp_json {
+        return innerwarden_agent_guard::file_update::read_config_no_symlinks(
+            home,
+            &home.join(rel),
+        )
+        .ok()
+        .flatten()
+        .and_then(|body| serde_json::from_slice::<serde_json::Value>(&body).ok())
+        .and_then(|config| innerwarden_agent_guard::mcp_wire::guarded_mode(&config))
+            == Some(innerwarden_agent_guard::mcp_wire::WiringMode::Monitor);
+    }
+    if let Some(rel) = &agent.mcp_toml {
+        return innerwarden_agent_guard::file_update::read_config_no_symlinks(
+            home,
+            &home.join(rel),
+        )
+        .ok()
+        .flatten()
+        .and_then(|body| std::str::from_utf8(&body).ok()?.parse().ok())
+        .and_then(|config| innerwarden_agent_guard::mcp_wire_toml::guarded_mode_toml(&config))
+            == Some(innerwarden_agent_guard::mcp_wire_toml::WiringMode::Monitor);
+    }
+    false
 }
 
 #[derive(Serialize)]
@@ -185,6 +298,7 @@ fn agents_json_with_status(
         Ok(policy) => (policy, true),
         Err(_) => (crate::agent_policy::AgentPolicy::default(), false),
     };
+    let host_mode = guardrail_status_from_rows(home, rows).mode;
     let agents = rows
         .iter()
         .map(|agent| {
@@ -196,6 +310,25 @@ fn agents_json_with_status(
                 .iter()
                 .map(|evidence| evidence.api_name())
                 .collect();
+            let mode = if effectively_guarded {
+                agent_mode(home, agent).to_string()
+            } else {
+                "not_configured".into()
+            };
+            let setup_support = if known && agent.guardable() {
+                "automatic"
+            } else if agent.guardable() {
+                "manual"
+            } else {
+                "unsupported"
+            };
+            let next_step = agent_next_step(
+                &agent.name,
+                &mode,
+                setup_support,
+                &host_mode,
+                mode == "partial" && agent_wired_monitor(home, agent),
+            );
             AgentView {
                 id: agent.name.clone(),
                 display_name: display_agent_name(&agent.name),
@@ -207,22 +340,23 @@ fn agents_json_with_status(
                 },
                 detected_by,
                 guardrail: AgentGuardrailView {
-                    mode: if effectively_guarded {
-                        agent_mode(home, agent).to_string()
-                    } else {
-                        "not_configured".into()
-                    },
+                    mode,
                     mechanism: agent_mechanism(agent),
-                    setup_support: if known && agent.guardable() {
-                        "automatic"
-                    } else if agent.guardable() {
-                        "manual"
-                    } else {
-                        "unsupported"
-                    },
+                    setup_support,
                 },
                 auto_connect_eligible: policy_available
                     .then(|| crate::agent_policy::is_auto_connect_candidate(home, agent, &policy)),
+                next_step,
+                identity_step: if agent.hookable && effectively_guarded {
+                    let path = home.join(".claude/settings.json");
+                    innerwarden_agent_guard::file_update::read_config_no_symlinks(home, &path)
+                        .ok()
+                        .flatten()
+                        .and_then(|body| serde_json::from_slice::<serde_json::Value>(&body).ok())
+                        .and_then(|settings| identity_step(&agent.name, &settings))
+                } else {
+                    None
+                },
             }
         })
         .collect();
@@ -773,6 +907,9 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
         );
     let url = format!("http://{bind}");
     eprintln!("innerwarden dashboard: serving on {url}  (read-only API; Ctrl-C to stop)");
+    // The graph and the event log, parsed once per version of each file. The
+    // loop is single-threaded, so the caches need no lock.
+    let mut community = CommunityRecord::default();
 
     for request in server.incoming_requests() {
         // A loopback socket alone is not a DNS-rebinding boundary. Browsers send
@@ -842,17 +979,99 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
                 };
                 request.respond(json_response(body.to_string()))
             }
-            "/api/overview" | "/api/guard/overview" => match graph_io::load_graph_checked() {
+            "/api/overview" | "/api/guard/overview" => match community.graph() {
                 Ok(graph) => {
-                    let body =
-                        serde_json::to_string(&graph.overview(20)).unwrap_or_else(|_| "{}".into());
-                    request.respond(json_response(body))
+                    let guard_mode = agent_snapshot
+                        .as_ref()
+                        .map(|shared| read_agent_snapshot(shared).guardrail.mode)
+                        .unwrap_or_else(|| "unknown".into());
+                    let log = community.log();
+                    let now = now_ms();
+                    let tally = graph.agent_actions_tally(
+                        now.saturating_sub(crate::dashboard_community::LANE_WINDOW_MS),
+                    );
+                    let record = graph.record_span();
+                    let facts = crate::dashboard_community::LaneFacts {
+                        now_ms: now,
+                        tally: &tally,
+                        record: &record,
+                        guard_mode: &guard_mode,
+                        observe_installed: crate::observe_io::installed(),
+                        openclaw_present: crate::observe_io::openclaw_present(),
+                        log: &log,
+                    };
+                    let overview =
+                        serde_json::to_value(graph.overview(20)).unwrap_or(serde_json::Value::Null);
+                    let body = crate::dashboard_community::overview_json(overview, &facts);
+                    request.respond(json_response(body.to_string()))
                 }
                 Err(error) => {
                     log_graph_unreadable(&error);
                     request.respond(graph_unreadable_response())
                 }
             },
+            "/api/guard/decisions" => {
+                let graph = match community.graph() {
+                    Ok(graph) => graph,
+                    Err(error) => {
+                        log_graph_unreadable(&error);
+                        let _ = request.respond(graph_unreadable_response());
+                        continue;
+                    }
+                };
+                let (status, body) =
+                    decisions_body(&graph, &query, &crate::suppress_io::current(), now_ms());
+                request.respond(json_response(body).with_status_code(status))
+            }
+            "/api/guard/decision" => {
+                let graph = match community.graph() {
+                    Ok(graph) => graph,
+                    Err(error) => {
+                        log_graph_unreadable(&error);
+                        let _ = request.respond(graph_unreadable_response());
+                        continue;
+                    }
+                };
+                let (status, body) = decision_body(&graph, &query, &crate::suppress_io::current());
+                request.respond(json_response(body).with_status_code(status))
+            }
+            "/api/guard/history" => {
+                let log = community.log();
+                let (status, body) = history_body(&log, &query, now_ms());
+                request.respond(json_response(body).with_status_code(status))
+            }
+            "/api/guard/protection" => {
+                let outage = graph_io::current_outage();
+                // What the record's flagged decisions reached for, so the paid
+                // rows can say what happened HERE. An unreadable record says
+                // no count at all.
+                let flagged = community.graph().ok().map(|graph| {
+                    crate::dashboard_community::flagged_concerns(
+                        &graph.flagged_summaries(),
+                        graph.record_span().oldest_at_ms,
+                    )
+                });
+                let facts = crate::dashboard_community::ProtectionFacts {
+                    now_ms: now_ms(),
+                    os: std::env::consts::OS,
+                    recording: outage.is_none(),
+                    outage_since_unix: outage.as_ref().map(|outage| outage.since_unix),
+                    lost_actions: outage.as_ref().map(|outage| outage.lost),
+                    jail_backend: crate::contain_io::jail_backend(),
+                    observe_installed: crate::observe_io::installed(),
+                    openclaw_present: crate::observe_io::openclaw_present(),
+                    alert_channels: crate::notify_io::channel_count(),
+                    second_opinion_provider: crate::second_opinion_io::provider(),
+                    suppress: crate::suppress_io::current(),
+                    flagged,
+                };
+                request.respond(json_response(
+                    crate::dashboard_community::protection_json(&facts).to_string(),
+                ))
+            }
+            // Deprecated: no page of the bundled dashboard calls this since
+            // Community's Cases lists `guard/decisions`. Served for one release
+            // so an older page left open keeps working.
             "/api/cases" => {
                 let g = match graph_io::load_graph_checked() {
                     Ok(graph) => graph,
@@ -922,16 +1141,36 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
             "/api/agents" | "/api/guard/agents" => match agent_snapshot.as_ref() {
                 Some(shared) => {
                     let snapshot = read_agent_snapshot(shared);
-                    request.respond(json_response(agent_payload_with_live_watcher(
-                        snapshot.json,
-                        watcher_status.as_ref(),
-                    )))
+                    let body =
+                        agent_payload_with_live_watcher(snapshot.json, watcher_status.as_ref());
+                    // Last screened, from the decisions that name each agent,
+                    // or from its channel when it is the only agent on it. An
+                    // unreadable record adds nothing and hides nothing.
+                    let (seen, channels, unnamed) = community
+                        .graph()
+                        .map(|graph| {
+                            (
+                                graph.agents_last_seen(),
+                                graph.channels_last_seen(),
+                                graph.unnamed_channels_last_seen(),
+                            )
+                        })
+                        .unwrap_or_default();
+                    request.respond(json_response(
+                        crate::dashboard_community::agents_with_last_screened(
+                            &body, &seen, &channels, &unnamed,
+                        ),
+                    ))
                 }
                 None => request.respond(json_error_response(503, "user home is unavailable")),
             },
             "/api/token-intelligence" | "/api/guard/token-intelligence" => {
                 match token_intelligence.as_ref() {
-                    Some(shared) => request.respond(json_response(token_intelligence_json(shared))),
+                    Some(shared) => request.respond(json_response(
+                        crate::dashboard_community::token_intelligence_with_parts(
+                            &token_intelligence_json(shared),
+                        ),
+                    )),
                     None => request.respond(json_error_response(503, "user home is unavailable")),
                 }
             }
@@ -939,6 +1178,216 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
         };
     }
     std::process::ExitCode::SUCCESS
+}
+
+/// The longest value a Cases filter or id may carry. Longer is refused, never
+/// cut: a cut id names a different decision.
+const QUERY_VALUE_MAX: usize = 256;
+
+/// The event log is read from its end, at most this much of it.
+const EVENT_LOG_READ_MAX: u64 = 48 * 1024 * 1024;
+
+/// The decision record and the guard's event log, each parsed once per
+/// version of its file.
+#[derive(Default)]
+struct CommunityRecord {
+    graph: crate::dashboard_community::CachedFile<innerwarden_graph::Graph>,
+    log: crate::dashboard_community::CachedFile<crate::dashboard_community::EventLog>,
+}
+
+fn file_identity(path: &std::path::Path) -> Option<crate::dashboard_community::FileIdentity> {
+    let metadata = std::fs::metadata(path).ok()?;
+    Some((metadata.len(), metadata.modified().ok()?))
+}
+
+impl CommunityRecord {
+    fn graph(
+        &mut self,
+    ) -> Result<std::sync::Arc<innerwarden_graph::Graph>, graph_io::GraphLoadError> {
+        let identity = graph_io::graph_path().as_deref().and_then(file_identity);
+        self.graph
+            .get_or_load(identity, graph_io::load_graph_checked)
+    }
+
+    fn log(&mut self) -> std::sync::Arc<crate::dashboard_community::EventLog> {
+        let path = graph_io::sink_dir().map(|dir| dir.join("guard-events.jsonl"));
+        let identity = path.as_deref().and_then(file_identity);
+        match self
+            .log
+            .get_or_load::<()>(identity, || Ok(read_event_log(path.as_deref())))
+        {
+            Ok(log) => log,
+            Err(()) => std::sync::Arc::new(crate::dashboard_community::EventLog::unreadable()),
+        }
+    }
+}
+
+/// Read the guard's event log: absent is an empty log, not an unreadable
+/// one; a file too large to read whole is read from its end, dropping the
+/// line the cut lands in.
+fn read_event_log(path: Option<&std::path::Path>) -> crate::dashboard_community::EventLog {
+    use std::io::{Read, Seek, SeekFrom};
+    let empty = || crate::dashboard_community::parse_event_log("");
+    let Some(path) = path else {
+        return empty();
+    };
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return empty(),
+        Err(_) => return crate::dashboard_community::EventLog::unreadable(),
+    };
+    let length = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let start = length.saturating_sub(EVENT_LOG_READ_MAX);
+    if start > 0 && file.seek(SeekFrom::Start(start)).is_err() {
+        return crate::dashboard_community::EventLog::unreadable();
+    }
+    let mut bytes = Vec::new();
+    if file
+        .take(EVENT_LOG_READ_MAX)
+        .read_to_end(&mut bytes)
+        .is_err()
+    {
+        return crate::dashboard_community::EventLog::unreadable();
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    let text = if start > 0 {
+        text.split_once('\n').map_or("", |(_, rest)| rest)
+    } else {
+        &text
+    };
+    crate::dashboard_community::parse_event_log(text)
+}
+
+/// The Cases list's query, validated. A value this route does not know is a
+/// 400 with a code, never a filter silently dropped: a dropped filter would
+/// list decisions the reader asked to leave out.
+fn decision_query(query: &str) -> Result<innerwarden_graph::DecisionQuery, &'static str> {
+    let bounded = |name: &str| -> Result<Option<String>, &'static str> {
+        match query_param(query, name) {
+            Some(value) if value.len() > QUERY_VALUE_MAX => Err("filter_too_long"),
+            other => Ok(other),
+        }
+    };
+    let outcome = bounded("outcome")?;
+    if outcome
+        .as_deref()
+        .is_some_and(|outcome| !innerwarden_graph::OUTCOME_KEYS.contains(&outcome))
+    {
+        return Err("outcome_invalid");
+    }
+    let verdict = bounded("verdict")?;
+    if verdict
+        .as_deref()
+        .is_some_and(|verdict| !matches!(verdict, "deny" | "review" | "allow" | "unknown"))
+    {
+        return Err("verdict_invalid");
+    }
+    let flagged_only = match query_param(query, "flagged").as_deref() {
+        None | Some("1") => true,
+        Some("0") => false,
+        Some(_) => return Err("flagged_invalid"),
+    };
+    let limit = match query_param(query, "limit") {
+        None => 25,
+        Some(limit) => limit
+            .parse::<usize>()
+            .ok()
+            .filter(|limit| (1..=innerwarden_graph::MAX_DECISIONS_PAGE).contains(limit))
+            .ok_or("limit_invalid")?,
+    };
+    let cursor = crate::dashboard_community::parse_cursor(bounded("cursor")?.as_deref())
+        .map_err(|()| "cursor_invalid")?;
+    Ok(innerwarden_graph::DecisionQuery {
+        flagged_only,
+        outcome,
+        verdict,
+        reason: bounded("reason")?,
+        reason_not: bounded("reason_not")?,
+        session: bounded("session")?,
+        text: bounded("q")?,
+        cursor,
+        limit,
+    })
+}
+
+/// `GET /api/guard/decisions`, as a status and a body. Pure, so the route's
+/// answers are testable without a socket.
+fn decisions_body(
+    graph: &innerwarden_graph::Graph,
+    query: &str,
+    suppress: &crate::suppress::SuppressConfig,
+    now_ms: u64,
+) -> (u16, String) {
+    match decision_query(query) {
+        Ok(decision_query) => {
+            let page = graph.decisions_page(&decision_query);
+            (
+                200,
+                crate::dashboard_community::decisions_json(&page, suppress, now_ms).to_string(),
+            )
+        }
+        Err(code) => (400, serde_json::json!({ "error": code }).to_string()),
+    }
+}
+
+/// `GET /api/guard/history`, as a status and a body: the log counted, or with
+/// `kind=attempt` one page of messages. A messages cursor this log does not
+/// hold is a 400 with the same code the decisions route answers, never page
+/// one served again as "older".
+fn history_body(
+    log: &crate::dashboard_community::EventLog,
+    query: &str,
+    now_ms: u64,
+) -> (u16, String) {
+    if query_param(query, "kind").as_deref() != Some("attempt") {
+        return (
+            200,
+            crate::dashboard_community::history_json(log, now_ms).to_string(),
+        );
+    }
+    let limit = query_param(query, "limit")
+        .and_then(|limit| limit.parse::<usize>().ok())
+        .unwrap_or(25);
+    let cursor = query_param(query, "cursor");
+    if cursor
+        .as_deref()
+        .is_some_and(|cursor| cursor.len() > QUERY_VALUE_MAX)
+    {
+        return (
+            400,
+            serde_json::json!({ "error": "cursor_invalid" }).to_string(),
+        );
+    }
+    match crate::dashboard_community::attempts_json(log, cursor.as_deref(), limit) {
+        Ok(body) => (200, body.to_string()),
+        Err(()) => (
+            400,
+            serde_json::json!({ "error": "cursor_invalid" }).to_string(),
+        ),
+    }
+}
+
+/// `GET /api/guard/decision?id=`, as a status and a body. A decision the
+/// record no longer holds (a prune dropped it) is a 404 with a code the page
+/// words, never an empty case.
+fn decision_body(
+    graph: &innerwarden_graph::Graph,
+    query: &str,
+    suppress: &crate::suppress::SuppressConfig,
+) -> (u16, String) {
+    match query_param(query, "id")
+        .filter(|id| id.len() <= QUERY_VALUE_MAX)
+        .and_then(|id| graph.decision(&id))
+    {
+        Some(detail) => (
+            200,
+            crate::dashboard_community::decision_json(&detail, suppress).to_string(),
+        ),
+        None => (
+            404,
+            serde_json::json!({ "error": "decision_not_in_record" }).to_string(),
+        ),
+    }
 }
 
 /// Extract a query-string parameter (`k=v&k2=v2`), with minimal `+`/`%XX`
@@ -1088,6 +1537,9 @@ fn serve_asset(request: tiny_http::Request, url: &str) -> std::io::Result<()> {
 }
 
 #[cfg(test)]
+mod fixtures;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1136,6 +1588,183 @@ mod tests {
         );
         assert_eq!(content_type("assets/a.css"), "text/css; charset=utf-8");
         assert_eq!(content_type("x.unknown"), "application/octet-stream");
+    }
+
+    #[test]
+    fn every_new_community_route_is_get_only() {
+        for path in [
+            "/api/guard/decisions",
+            "/api/guard/decision",
+            "/api/guard/history",
+            "/api/guard/protection",
+        ] {
+            assert!(api_method_is_allowed(path, &tiny_http::Method::Get));
+            for method in [
+                tiny_http::Method::Post,
+                tiny_http::Method::Put,
+                tiny_http::Method::Delete,
+                tiny_http::Method::Patch,
+            ] {
+                assert!(!api_method_is_allowed(path, &method), "{path} {method:?}");
+            }
+        }
+        // And every JSON answer carries the same headers the old routes did.
+        let response = json_response("{}".into());
+        let headers: Vec<String> = response
+            .headers()
+            .iter()
+            .map(|header| format!("{}: {}", header.field, header.value))
+            .collect();
+        assert!(headers.contains(&"Cache-Control: no-store".to_string()));
+        assert!(headers.contains(&"X-Content-Type-Options: nosniff".to_string()));
+    }
+
+    fn decisions_fixture() -> innerwarden_graph::Graph {
+        let mut graph = innerwarden_graph::Graph::new();
+        for seq in 0..3usize {
+            graph.ingest_verdict_with_context(
+                "s1",
+                seq,
+                &format!("bash /tmp/{seq}.sh"),
+                &serde_json::json!({"recommendation": "review", "explanation": "references world-writable directory: /tmp/"}),
+                innerwarden_graph::DecisionContext {
+                    mode: innerwarden_graph::DecisionMode::Monitor,
+                    outcome: innerwarden_graph::DecisionOutcome::Allowed,
+                    recorded_at_ms: Some(1_000 + seq as u64),
+                },
+            );
+        }
+        graph
+    }
+
+    #[test]
+    fn decision_route_answers_404_for_a_pruned_id() {
+        let mut graph = decisions_fixture();
+        let suppress = crate::suppress::SuppressConfig::default();
+        let (status, body) = decision_body(&graph, "id=cmd%3As1%3A0", &suppress);
+        assert_eq!(status, 200, "{body}");
+        graph.nodes.retain(|node| node.id != "cmd:s1:0");
+        let (status, body) = decision_body(&graph, "id=cmd%3As1%3A0", &suppress);
+        assert_eq!(status, 404);
+        assert!(body.contains("decision_not_in_record"));
+        let (status, _) = decision_body(&graph, "", &suppress);
+        assert_eq!(status, 404);
+    }
+
+    #[test]
+    fn decisions_route_refuses_what_it_does_not_know() {
+        let graph = decisions_fixture();
+        let suppress = crate::suppress::SuppressConfig::default();
+        let (status, body) = decisions_body(&graph, "limit=2", &suppress, 5);
+        assert_eq!(status, 200);
+        let page: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(page["items"].as_array().unwrap().len(), 2);
+        assert_eq!(page["total"], 3);
+        let cursor = page["next_cursor"].as_str().unwrap().to_string();
+        let (status, body) =
+            decisions_body(&graph, &format!("limit=2&cursor={cursor}"), &suppress, 5);
+        assert_eq!(status, 200);
+        let next: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(next["items"].as_array().unwrap().len(), 1);
+        for (query, code) in [
+            ("outcome=everything", "outcome_invalid"),
+            ("verdict=maybe", "verdict_invalid"),
+            ("flagged=yes", "flagged_invalid"),
+            ("limit=51", "limit_invalid"),
+            ("limit=0", "limit_invalid"),
+            ("cursor=not-a-cursor", "cursor_invalid"),
+        ] {
+            let (status, body) = decisions_body(&graph, query, &suppress, 5);
+            assert_eq!(status, 400, "{query}");
+            assert!(body.contains(code), "{query}: {body}");
+        }
+        let long = format!("q={}", "a".repeat(300));
+        assert_eq!(decisions_body(&graph, &long, &suppress, 5).0, 400);
+    }
+
+    #[test]
+    fn a_missing_event_log_is_empty_and_a_large_one_is_read_from_its_end() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let missing = read_event_log(Some(&dir.path().join("guard-events.jsonl")));
+        assert!(missing.readable);
+        assert_eq!(missing.blocked.len(), 0);
+        let path = dir.path().join("guard-events.jsonl");
+        std::fs::write(
+            &path,
+            "{\"kind\":\"guard.blocked\",\"ts\":1,\"outcome\":\"blocked\"}\n",
+        )
+        .unwrap();
+        let log = read_event_log(Some(&path));
+        assert_eq!(log.blocked.len(), 1);
+        assert_eq!(read_event_log(None).blocked.len(), 0);
+    }
+
+    #[test]
+    fn agent_next_steps_keep_the_mode_the_host_runs_in() {
+        let new_in_monitor =
+            agent_next_step("cursor", "not_configured", "automatic", "monitor", false).unwrap();
+        assert_eq!(
+            new_in_monitor.command,
+            "innerwarden agents connect cursor --monitor"
+        );
+        let new_in_enforce =
+            agent_next_step("cursor", "not_configured", "automatic", "enforce", false).unwrap();
+        assert_eq!(new_in_enforce.command, "innerwarden agents connect cursor");
+        let partial = agent_next_step("codex", "partial", "automatic", "partial", true).unwrap();
+        assert_eq!(
+            partial.command,
+            "innerwarden agents connect codex --monitor"
+        );
+        let watching =
+            agent_next_step("claude-code", "monitor", "automatic", "monitor", false).unwrap();
+        assert_eq!(watching.command, "innerwarden enforce");
+        assert!(agent_next_step("cursor", "enforce", "automatic", "enforce", false).is_none());
+        assert!(agent_next_step("x", "not_configured", "unsupported", "monitor", false).is_none());
+        assert!(agent_next_step("x", "unknown", "automatic", "monitor", false).is_none());
+    }
+
+    #[test]
+    fn the_first_agent_on_a_new_host_is_connected_in_monitor_mode() {
+        // Nothing connected yet, or a host mode that could not be read: start
+        // watching, as Getting started and the agent card say. `agents
+        // connect` alone would enforce.
+        for host in ["not_configured", "unknown"] {
+            let step =
+                agent_next_step("claude-code", "not_configured", "automatic", host, false).unwrap();
+            assert_eq!(
+                step.command, "innerwarden agents connect claude-code --monitor",
+                "{host}"
+            );
+            assert!(step.line.contains("monitor mode"), "{host}");
+        }
+    }
+
+    #[test]
+    fn an_unnamed_hook_is_offered_the_reconnect_that_names_it_in_its_own_mode() {
+        let hook = |command: &str| serde_json::json!({"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": command}]}]}});
+        let step =
+            identity_step("claude-code", &hook("\"/opt/innerwarden\" hook --monitor")).unwrap();
+        assert_eq!(
+            step.command,
+            "innerwarden agents connect claude-code --monitor"
+        );
+        let step = identity_step("claude-code", &hook("\"/opt/innerwarden\" hook")).unwrap();
+        assert_eq!(step.command, "innerwarden agents connect claude-code");
+        assert!(identity_step(
+            "claude-code",
+            &hook("\"/opt/innerwarden\" hook --monitor --agent claude-code")
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn an_unknown_messages_cursor_is_a_400() {
+        let log = crate::dashboard_community::parse_event_log("");
+        let (status, body) = history_body(&log, "kind=attempt&cursor=nope", 0);
+        assert_eq!(status, 400);
+        assert!(body.contains("cursor_invalid"));
+        assert_eq!(history_body(&log, "kind=attempt", 0).0, 200);
+        assert_eq!(history_body(&log, "", 0).0, 200);
     }
 
     #[test]

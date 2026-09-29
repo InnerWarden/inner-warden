@@ -11,7 +11,9 @@
 
 use innerwarden_agent_guard::mcp_proxy::enforce::ProxyMode;
 use innerwarden_agent_guard::mcp_proxy::router::ProxyDecision;
-use innerwarden_graph::{DecisionContext, DecisionMode, DecisionOutcome, Graph};
+use innerwarden_graph::{
+    DecisionChannel, DecisionContext, DecisionMode, DecisionOrigin, DecisionOutcome, Graph,
+};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -331,13 +333,102 @@ pub fn record_check(command: &str, verdict: &Value) {
         DecisionOutcome::Screened,
         None,
         None,
+        check_origin(verdict),
     );
+}
+
+/// Where a check by hand came from: a person, with no agent and no folder.
+fn check_origin(verdict: &Value) -> DecisionOrigin {
+    DecisionOrigin {
+        channel: Some(DecisionChannel::Check),
+        rules: verdict_rules(verdict),
+        ..DecisionOrigin::default()
+    }
+}
+
+/// Where a hook decision came from: the agent the hook line names (never a
+/// guess from the payload) and the basename of the folder it ran in.
+fn hook_origin(verdict: &Value, agent: Option<&str>, cwd: Option<&str>) -> DecisionOrigin {
+    DecisionOrigin {
+        channel: Some(DecisionChannel::Hook),
+        agent: agent.map(str::to_string),
+        project: cwd.and_then(project_name),
+        rules: verdict_rules(verdict),
+    }
+}
+
+/// Where an MCP tool call came from: the agent the proxy line names, and the
+/// rules its inspector raised.
+fn mcp_origin(decision: &ProxyDecision, agent: Option<&str>) -> DecisionOrigin {
+    let mut rules: Vec<String> = Vec::new();
+    for alert in &decision.verdict.alerts {
+        if !rules.contains(&alert.rule) {
+            rules.push(alert.rule.clone());
+        }
+    }
+    DecisionOrigin {
+        channel: Some(DecisionChannel::Mcp),
+        agent: agent.map(str::to_string),
+        project: None,
+        rules,
+    }
+}
+
+/// The ids of the rules a verdict rests on, primary first: the charged
+/// signals in the order the engine raised them (the order its explanation
+/// lists them in), then the ATR rule ids. A subsumed duplicate (score 0) is
+/// not a reason and is left out; a signal with no score is charged.
+pub(crate) fn verdict_rules(verdict: &Value) -> Vec<String> {
+    let mut rules: Vec<String> = Vec::new();
+    let mut push = |rule: &str| {
+        let rule = rule.trim();
+        if !rule.is_empty() && !rules.iter().any(|seen| seen == rule) {
+            rules.push(rule.to_string());
+        }
+    };
+    for signal in verdict
+        .get("signals")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let name = signal.get("signal").and_then(Value::as_str).unwrap_or("");
+        let charged = signal
+            .get("score")
+            .and_then(Value::as_u64)
+            .is_none_or(|score| score > 0);
+        if charged && !name.starts_with("atr:") {
+            push(name);
+        }
+    }
+    for matched in verdict
+        .get("atr_matches")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if let Some(rule) = matched.get("rule_id").and_then(Value::as_str) {
+            push(rule);
+        }
+    }
+    rules
+}
+
+/// The folder a command ran in, as its BASENAME only, redacted. A path never
+/// reaches the record: the folder's name says which project, the path says
+/// whose machine.
+pub(crate) fn project_name(cwd: &str) -> Option<String> {
+    let name = std::path::Path::new(cwd.trim()).file_name()?.to_str()?;
+    let name = innerwarden_agent_guard::redact::redact_secrets(name).text;
+    let name: String = name.chars().take(120).collect();
+    (!name.is_empty() && !name.contains(['/', '\\']) && name != "." && name != "..").then_some(name)
 }
 
 /// Record a hook decision. `would_block_under_policy` is the exact result of the
 /// hook policy (`deny`, plus review when strict); monitor mode records that as
 /// `would_block`, while enforcement records `blocked` only when the hook really
 /// returns its blocking exit code.
+#[allow(clippy::too_many_arguments)]
 pub fn record_hook(
     command: &str,
     verdict: &Value,
@@ -345,6 +436,8 @@ pub fn record_hook(
     would_block_under_policy: bool,
     source_session: Option<&str>,
     source_event_id: Option<&str>,
+    agent: Option<&str>,
+    cwd: Option<&str>,
 ) {
     let (mode, outcome) = if monitor {
         (
@@ -372,6 +465,7 @@ pub fn record_hook(
         outcome,
         source_session,
         source_event_id,
+        hook_origin(verdict, agent, cwd),
     );
 }
 
@@ -379,7 +473,12 @@ pub fn record_hook(
 /// responses are deliberately ignored so a response cannot masquerade as an
 /// action in the activity timeline. The router exposes only a bounded, redacted
 /// tool summary, never raw arguments, at this persistence boundary.
-pub fn record_mcp(decision: &ProxyDecision, proxy_mode: ProxyMode, source_session: Option<&str>) {
+pub fn record_mcp(
+    decision: &ProxyDecision,
+    proxy_mode: ProxyMode,
+    source_session: Option<&str>,
+    agent: Option<&str>,
+) {
     if decision.direction != "client->server" || decision.method.as_deref() != Some("tools/call") {
         return;
     }
@@ -389,7 +488,15 @@ pub fn record_mcp(decision: &ProxyDecision, proxy_mode: ProxyMode, source_sessio
 
     let verdict = mcp_graph_verdict(decision);
     let (mode, outcome) = mcp_context(decision, proxy_mode);
-    record(summary, &verdict, mode, outcome, source_session, None);
+    record(
+        summary,
+        &verdict,
+        mode,
+        outcome,
+        source_session,
+        None,
+        mcp_origin(decision, agent),
+    );
 }
 
 fn mcp_context(decision: &ProxyDecision, proxy_mode: ProxyMode) -> (DecisionMode, DecisionOutcome) {
@@ -479,6 +586,7 @@ fn record(
     outcome: DecisionOutcome,
     source_session: Option<&str>,
     source_event_id: Option<&str>,
+    origin: DecisionOrigin,
 ) {
     // Redact secrets from the command BEFORE it is persisted. A secret in a
     // screened command (`export API_KEY=…`, `curl -H "Authorization: sk-…"`)
@@ -505,13 +613,13 @@ fn record(
     ) {
         emit_guard_event(&path, &command, &verdict, mode, outcome, &session);
     }
-    if let Err(error) = record_at_with_options(
+    if let Err(error) = record_at_with_origin(
         &path,
         &session,
         &command,
         &verdict,
-        mode,
-        outcome,
+        DecisionContextParts { mode, outcome },
+        &origin,
         event_hash.as_deref(),
         GRAPH_LOCK_TIMEOUT,
         || {},
@@ -701,6 +809,14 @@ fn emit_guard_event(
     append_guard_event_at(dir, &line);
 }
 
+/// A decision's mode and outcome, before the time is stamped on them.
+#[derive(Debug, Clone, Copy)]
+struct DecisionContextParts {
+    mode: DecisionMode,
+    outcome: DecisionOutcome,
+}
+
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn record_at_with_options<F>(
     path: &std::path::Path,
@@ -716,6 +832,35 @@ fn record_at_with_options<F>(
 where
     F: FnOnce(),
 {
+    record_at_with_origin(
+        path,
+        session,
+        command,
+        verdict,
+        DecisionContextParts { mode, outcome },
+        &DecisionOrigin::default(),
+        event_hash,
+        lock_timeout,
+        on_lock_contention,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_at_with_origin<F>(
+    path: &std::path::Path,
+    session: &str,
+    command: &str,
+    verdict: &Value,
+    context: DecisionContextParts,
+    origin: &DecisionOrigin,
+    event_hash: Option<&str>,
+    lock_timeout: Duration,
+    on_lock_contention: F,
+) -> Result<(), GraphRecordError>
+where
+    F: FnOnce(),
+{
+    let DecisionContextParts { mode, outcome } = context;
     let dir = path
         .parent()
         .ok_or(GraphRecordError::DirectoryUnavailable)?;
@@ -751,7 +896,7 @@ where
         .duration_since(std::time::UNIX_EPOCH)
         .ok()
         .and_then(|d| u64::try_from(d.as_millis()).ok());
-    if !ingest_record(
+    if !ingest_record_with_origin(
         &mut g,
         session,
         command,
@@ -761,6 +906,7 @@ where
             outcome,
             recorded_at_ms,
         },
+        origin,
         event_hash,
     ) {
         return Ok(());
@@ -814,12 +960,33 @@ fn hex_lower(bytes: &[u8]) -> String {
 /// false when this exact hook event was already recorded. The duplicate check
 /// runs while the caller holds the graph lock, so concurrent redelivery cannot
 /// race through the read-modify-write boundary.
+#[cfg(test)]
 fn ingest_record(
     graph: &mut Graph,
     session: &str,
     command: &str,
     verdict: &Value,
     context: DecisionContext,
+    event_hash: Option<&str>,
+) -> bool {
+    ingest_record_with_origin(
+        graph,
+        session,
+        command,
+        verdict,
+        context,
+        &DecisionOrigin::default(),
+        event_hash,
+    )
+}
+
+fn ingest_record_with_origin(
+    graph: &mut Graph,
+    session: &str,
+    command: &str,
+    verdict: &Value,
+    context: DecisionContext,
+    origin: &DecisionOrigin,
     event_hash: Option<&str>,
 ) -> bool {
     if event_hash.is_some_and(|candidate| {
@@ -832,7 +999,7 @@ fn ingest_record(
     }
 
     let seq = graph.next_seq(session);
-    graph.ingest_verdict_with_context(session, seq, command, verdict, context);
+    graph.ingest_verdict_with_origin(session, seq, command, verdict, context, origin);
     if let Some(event_hash) = event_hash {
         let command_id = format!("cmd:{session}:{seq}");
         if let Some(node) = graph.nodes.iter_mut().find(|node| node.id == command_id) {
@@ -1482,6 +1649,88 @@ mod product_config_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn channel_is_written_by_the_calling_path() {
+        let verdict = json!({
+            "recommendation": "deny",
+            "signals": [{"signal": "sensitive_credential_read", "score": 50}],
+        });
+        assert_eq!(check_origin(&verdict).channel, Some(DecisionChannel::Check));
+        let hook = hook_origin(&verdict, Some("claude-code"), Some("/home/dev/my-app"));
+        assert_eq!(hook.channel, Some(DecisionChannel::Hook));
+        assert_eq!(hook.agent.as_deref(), Some("claude-code"));
+        assert_eq!(hook.project.as_deref(), Some("my-app"));
+        assert_eq!(hook.rules, ["sensitive_credential_read"]);
+        let mut graph = Graph::new();
+        assert!(ingest_record_with_origin(
+            &mut graph,
+            "s1",
+            "cat ~/.ssh/config",
+            &verdict,
+            DecisionContext::default(),
+            &hook,
+            None,
+        ));
+        let node = graph.nodes.iter().find(|n| n.kind == "command").unwrap();
+        assert_eq!(node.attrs.get("channel").map(String::as_str), Some("hook"));
+        assert_eq!(
+            node.attrs.get("project").map(String::as_str),
+            Some("my-app")
+        );
+    }
+
+    #[test]
+    fn agent_is_absent_without_the_flag() {
+        let origin = hook_origin(&json!({"recommendation": "allow"}), None, None);
+        assert_eq!(origin.agent, None);
+        assert_eq!(origin.project, None);
+        let mut graph = Graph::new();
+        ingest_record_with_origin(
+            &mut graph,
+            "s1",
+            "ls",
+            &json!({"recommendation": "allow"}),
+            DecisionContext::default(),
+            &origin,
+            None,
+        );
+        let node = graph.nodes.iter().find(|n| n.kind == "command").unwrap();
+        assert!(!node.attrs.contains_key("agent"));
+    }
+
+    #[test]
+    fn project_is_a_basename_never_a_path() {
+        assert_eq!(
+            project_name("/Users/someone/work/my-app").as_deref(),
+            Some("my-app")
+        );
+        assert_eq!(
+            project_name("/Users/someone/work/my-app/").as_deref(),
+            Some("my-app")
+        );
+        assert_eq!(project_name("/"), None);
+        assert_eq!(project_name(""), None);
+        assert_eq!(project_name(".."), None);
+    }
+
+    #[test]
+    fn verdict_rules_are_primary_first_and_skip_what_was_not_charged() {
+        let verdict = json!({
+            "signals": [
+                {"signal": "download_and_execute", "score": 40},
+                {"signal": "dynamic_code_execution", "score": 0},
+                {"signal": "atr:tool-poisoning", "score": 20},
+                {"signal": "tmp_execution"},
+            ],
+            "atr_matches": [{"rule_id": "ATR-2026-010", "category": "tool-poisoning"}],
+        });
+        assert_eq!(
+            verdict_rules(&verdict),
+            ["download_and_execute", "tmp_execution", "ATR-2026-010"]
+        );
+        assert!(verdict_rules(&json!({})).is_empty());
+    }
     use innerwarden_agent_guard::mcp::{Verdict, VerdictAlert};
 
     /// Concurrent writers must not tear each other's records.

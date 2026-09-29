@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
-import { fetchMeta, type DashboardMeta, type GuardrailMode } from "./api";
+import { fetchMeta, type DashboardMeta } from "./api";
 import {
   dashboardV1Client,
   retainDashboardResource,
@@ -10,10 +10,10 @@ import { CapabilityBoundary } from "./components/CapabilityBoundary";
 import { Header, type HeaderNavigationItem } from "./components/Header";
 import { StatusBadge } from "./components/StatusBadge";
 import { resolveDashboardEdition } from "./edition";
-import { hasControlCharacters, normaliseMode } from "./presentation";
+import { pollChain } from "./hooks/pollChain";
+import { hasControlCharacters } from "./presentation";
 import { POSTURE_REFRESH_MS } from "./posture/refresh";
 import { isCaseListWindow } from "./windows";
-import { Activity, type ActivityTarget } from "./screens/Activity";
 import { Home, type MachinePanels, type QueueOpenOptions } from "./screens/Home";
 import { isCaseLane, type CaseLane } from "./api/lanes";
 import type { CaseListWindow } from "./api/cases";
@@ -83,6 +83,55 @@ export type ScreenModule = {
   render: (context: ScreenContext) => ReactNode;
 };
 
+/** How often the shell re-reads `guard/meta`, counted from the previous answer. */
+export const META_POLL_MS = 5_000;
+
+type MetaStatus = "loading" | "ready" | "error";
+
+/**
+ * What the shell hands a Community screen: the facts it already read, and
+ * the way to move between screens. Deliberately narrow, like `ScreenContext`.
+ */
+export type CommunityScreenContext = {
+  meta?: DashboardMeta;
+  metaStatus: MetaStatus;
+  bootstrap?: DashboardBootstrap;
+  /**
+   * Go to one of the shell's routes, with that screen's own address
+   * parameters. Every other screen parameter is cleared, as the nav does.
+   */
+  navigate: (route: ShellRoute, params?: Readonly<Record<string, string>>) => void;
+  /** The address's query string, so a screen re-reads its own parameters when they change. */
+  search: string;
+};
+
+export type CommunityScreen = {
+  route: BaseShellRoute;
+  label: string;
+  render: (context: CommunityScreenContext) => ReactNode;
+};
+
+/**
+ * The Community edition's own screens, handed in by the Community entry point
+ * (`main.tsx`). The paid shell never passes it; a Community shell without it
+ * renders the kit Overview alone, which only a test ever does.
+ *
+ * Its screens take BASE routes (`activity`, `posture`, `agents`, `tokens`),
+ * so every existing link and tour step keeps working, and `BASE_ROUTES` and
+ * `contributedScreens` are untouched.
+ */
+export type CommunityShell = {
+  screens: readonly CommunityScreen[];
+  /** The header's status, from the shell's own `guard/meta` reading. */
+  status: (meta: DashboardMeta | undefined, metaStatus: MetaStatus) => ReactNode;
+  /**
+   * An address written for another edition, rewritten for this one: the
+   * query string to use instead, or `undefined` to leave it. Applied once,
+   * with `history.replaceState`, as soon as the edition is known.
+   */
+  alias?: (search: string) => string | undefined;
+};
+
 /**
  * Contributed screens that are safe to mount: a module may not shadow a route
  * the shell itself owns, so a bad or stale contribution cannot capture
@@ -93,20 +142,24 @@ function contributedScreens(extraScreens: readonly ScreenModule[]): ScreenModule
 }
 
 type BootstrapLoadStatus = "loading" | "ready" | "unavailable" | "error";
-type MetaStatus = "loading" | "ready" | "error";
 
 export function deriveShellNavigation(
   bootstrap: DashboardBootstrap | undefined,
   edition: DashboardBootstrap["edition"] | undefined,
   extraScreens: readonly ScreenModule[] = [],
+  communityScreens?: readonly Pick<CommunityScreen, "route" | "label">[],
 ): HeaderNavigationItem<ShellRoute>[] {
   if (edition === "community") {
-    // Community navigation is a preserved CJC surface and never depends on an
-    // Enterprise producer or entitlement record.
-    return [
-      { route: "overview", label: "Overview" },
-      { route: "activity", label: "Activity" },
-    ];
+    // Community navigation never depends on an Enterprise producer or
+    // entitlement record: it is Overview plus the screens the Community entry
+    // point hands in, in its order.
+    const items: HeaderNavigationItem<ShellRoute>[] = [{ route: "overview", label: "Overview" }];
+    for (const screen of communityScreens ?? []) {
+      if (screen.route !== "overview" && !items.some((item) => item.route === screen.route)) {
+        items.push({ route: screen.route, label: screen.label });
+      }
+    }
+    return items;
   }
   if (edition !== "enterprise" || bootstrap === undefined) return [];
 
@@ -190,6 +243,7 @@ function routeFromLocation(extraScreens: readonly ScreenModule[]): ShellRoute {
 const SCREEN_PARAMS = [
   "q", "outcome", "severity", "status", "mode", "authority", "capability", "scope_kind",
   "scope", "window", "cursor", "case", "decision", "session", "verdict", "action", "lane",
+  "reason", "hide",
 ] as const;
 
 const ACTIVITY_PARAM_LIMIT = 256;
@@ -374,11 +428,17 @@ function bootstrapLoadStatus(resource: DashboardResource<DashboardBootstrap>): B
   return "error";
 }
 
+/** A Home entry's selection, carried to the Activity route by `activityUrl`. */
+type ActivityLink = { id?: string; session?: string; verdict?: string; action?: string };
+
 export function App({
   extraScreens = [],
   onMeta,
+  communityScreens,
 }: {
   extraScreens?: readonly ScreenModule[];
+  /** The Community edition's screens; see `CommunityShell`. The paid shell never passes it. */
+  communityScreens?: CommunityShell;
   /**
    * Called with each successful `guard/meta` reading, so a sibling of the shell
    * can use a fact the shell has already fetched.
@@ -420,12 +480,6 @@ export function App({
   const [postureResource, setPostureResource] = useState<DashboardResource<DashboardPosture>>({ state: "idle" });
   const [agentsResource, setAgentsResource] = useState<DashboardResource<AgentInventory>>({ state: "idle" });
   const [tokensResource, setTokensResource] = useState<DashboardResource<TokenIntelligenceContract>>({ state: "idle" });
-  const [activityTarget, setActivityTarget] = useState<ActivityTarget | undefined>(() => {
-    // A deep link to one decision (`?view=activity&decision=...`) must survive
-    // a reload, exactly like `?view=cases&case=...` does on the paid side.
-    const fromUrl = activityTargetFromSearch(window.location.search);
-    return fromUrl ? { ...fromUrl, requestId: Date.now() } : undefined;
-  });
   const [consumerEvaluatedAt, setConsumerEvaluatedAt] = useState(() => new Date().toISOString());
 
   const bootstrap = resourceData(bootstrapResource);
@@ -448,10 +502,10 @@ export function App({
   useEffect(() => {
     if (enterpriseConfirmed) return;
     let active = true;
-    let inFlight = false;
-    const load = async () => {
-      if (inFlight) return;
-      inFlight = true;
+    // A chain, not an interval: the next reading is asked for exactly
+    // `META_POLL_MS` after the previous one settles, so there is one request
+    // per interval by construction and never two in flight (`pollChain`).
+    const stop = pollChain(async () => {
       try {
         const next = await fetchMeta();
         if (!active) return;
@@ -461,15 +515,11 @@ export function App({
         onMetaRef.current?.(next);
       } catch {
         if (active) setMetaStatus("error");
-      } finally {
-        inFlight = false;
       }
-    };
-    void load();
-    const timer = setInterval(() => void load(), 5_000);
+    }, META_POLL_MS);
     return () => {
       active = false;
-      clearInterval(timer);
+      stop();
     };
   }, [enterpriseConfirmed]);
 
@@ -595,7 +645,6 @@ export function App({
   }, [enterpriseAuthorized, tokenIntelligence]);
 
   const freshMeta = metaStatus === "ready" ? meta : undefined;
-  const mode = normaliseMode(freshMeta);
   const edition = resolveDashboardEdition(
     bootstrap,
     bootstrapLoadStatus(bootstrapResource),
@@ -604,7 +653,11 @@ export function App({
   );
   const editionLabel = edition === "enterprise" ? "Enterprise" : edition === "community" ? "Community" : "Dashboard";
   const version = bootstrap?.product_version ?? (edition === "community" ? meta?.version : undefined);
-  const navigation = deriveShellNavigation(bootstrap, edition, contributed);
+  const community = edition === "community" ? communityScreens : undefined;
+  const navigation = deriveShellNavigation(bootstrap, edition, contributed, community?.screens);
+  // The address's query string, kept in state so a Community screen re-reads
+  // its own parameters when they change without the route changing.
+  const [search, setSearch] = useState(() => window.location.search);
 
   useEffect(() => {
     if (shouldResetToOverview(route, navigation, contributedRef.current)) setRoute("overview");
@@ -613,29 +666,46 @@ export function App({
   useEffect(() => {
     const restore = () => {
       setRoute(routeFromLocation(contributedRef.current));
-      const fromUrl = activityTargetFromSearch(window.location.search);
-      setActivityTarget(fromUrl ? { ...fromUrl, requestId: Date.now() } : undefined);
+      setSearch(window.location.search);
     };
     window.addEventListener("popstate", restore);
     return () => window.removeEventListener("popstate", restore);
   }, []);
 
+  // An address written for another edition (`?view=cases&case=...`),
+  // rewritten once the edition is known, in place, so the back button does
+  // not return to an address this shell cannot open.
+  const alias = community?.alias;
+  useEffect(() => {
+    if (alias === undefined) return;
+    const rewritten = alias(window.location.search);
+    if (rewritten === undefined || rewritten === window.location.search) return;
+    const url = new URL(window.location.href);
+    url.search = rewritten;
+    window.history.replaceState({}, "", url);
+    setRoute(routeFromLocation(contributedRef.current));
+    setSearch(window.location.search);
+  }, [alias]);
+
   useEffect(() => {
     document.title = `InnerWarden ${editionLabel}: Agent Security`;
   }, [editionLabel]);
 
-  const navigate = (next: ShellRoute) => {
-    if (next !== "activity") setActivityTarget(undefined);
+  const navigate = (next: ShellRoute, params?: Readonly<Record<string, string>>) => {
     const url = new URL(window.location.href);
     if (next === "overview") url.searchParams.delete("view");
     else url.searchParams.set("view", next);
     for (const key of SCREEN_PARAMS) url.searchParams.delete(key);
+    for (const [key, value] of Object.entries(params ?? {})) {
+      if (value.length > 0 && value.length <= 256) url.searchParams.set(key, value);
+    }
     window.history.pushState({}, "", url);
+    setSearch(url.search);
     setRoute(next);
   };
-  const openActivity = (target?: Omit<ActivityTarget, "requestId">) => {
-    setActivityTarget(target ? { ...target, requestId: Date.now() } : undefined);
+  const openActivity = (target?: ActivityLink) => {
     window.history.pushState({}, "", activityUrl(target, window.location.href));
+    setSearch(window.location.search);
     setRoute("activity");
   };
   const openCase = (caseId?: string, lane?: CaseLane, span?: CaseListWindow) => {
@@ -671,8 +741,13 @@ export function App({
         homeRoute="overview"
         onNavigate={navigate}
         account={edition === "enterprise" ? signedInAccount(bootstrapResource) : undefined}
+        navLayout={edition === "community" && community !== undefined ? "fit" : undefined}
+        technicalLabel={edition === "community" && community !== undefined ? "Technical detail" : undefined}
         status={edition === "community"
-          ? <><ModePill mode={mode} /><ExposureStatus status={metaStatus} exposed={meta?.exposed} /></>
+          // `data-meta-status` says which reading the status is drawn from:
+          // a test waits on it, never on a default the page shows before
+          // `guard/meta` has answered.
+          ? <span data-meta-status={metaStatus} className="flex min-w-0 items-center gap-2">{community?.status(freshMeta ?? meta, metaStatus)}</span>
           : edition === "enterprise"
             ? <EnterpriseSessionStatus resource={bootstrapResource} />
             : <BootstrapContractStatus resource={bootstrapResource} />}
@@ -702,7 +777,12 @@ export function App({
         ) : edition === "enterprise" && bootstrap ? (
           <DashboardContractState resource={bootstrapResource} />
         ) : edition === "community" ? (
-          route === "activity" ? <Activity initialTarget={activityTarget} /> : <Home meta={freshMeta} onOpenActivity={openActivity} edition="community" dashboardAccess={bootstrap?.dashboard_access} />
+          <CommunityRoute
+            route={route}
+            shell={community}
+            context={{ meta: freshMeta, metaStatus, bootstrap, navigate, search }}
+            onOpenActivity={openActivity}
+          />
         ) : (
           <DashboardContractState resource={bootstrapResource} />
         )}
@@ -739,7 +819,7 @@ function EnterpriseRoute({
   agentDiscovery?: DashboardBootstrap["capabilities"][number];
   tokenIntelligence?: DashboardBootstrap["capabilities"][number];
   meta?: DashboardMeta;
-  onOpenActivity: (target?: Omit<ActivityTarget, "requestId">) => void;
+  onOpenActivity: (target?: ActivityLink) => void;
   onOpenCase?: (caseId?: string, lane?: CaseLane, window?: CaseListWindow) => void;
   /** Opens the Cases screen on the waiting queue; see `caseQueueUrl`. */
   onOpenQueue?: (options?: QueueOpenOptions) => void;
@@ -900,33 +980,30 @@ function DashboardContractState({ resource }: { resource: DashboardResource<Dash
   );
 }
 
-function ExposureStatus({ status, exposed }: { status: MetaStatus; exposed?: boolean }) {
-  if (status === "loading") return <StatusBadge status="loading" label="Checking exposure" />;
-  if (status === "error") {
-    const label = exposed === true ? "Exposed · status stale" : exposed === false ? "Last known local" : "Exposure unknown";
-    return <StatusBadge status={exposed === true ? "failed" : "stale"} label={label} />;
-  }
-  if (exposed === true) return <StatusBadge status="failed" label="Exposed · no authentication" />;
-  if (exposed === false) return <StatusBadge status="available" label="Local · read-only API" labelClassName={NARROW_LABEL} />;
-  return <StatusBadge status="unknown" label="Exposure unknown" />;
-}
-
-function ModePill({ mode }: { mode: GuardrailMode }) {
-  const labels: Record<GuardrailMode, string> = {
-    not_configured: "Setup needed",
-    monitor: "Monitor configured",
-    enforce: "Enforce configured",
-    mixed: "Mixed configuration",
-    partial: "Partial coverage",
-    unknown: "Status unknown",
-  };
-  const status = mode === "mixed" || mode === "partial" ? "degraded" : mode === "unknown" ? "unknown" : mode === "not_configured" ? "not_configured" : "available";
-  // Wrapped, because the badge draws itself inline-flex and the stylesheet
-  // decides which of two display classes on one element wins: the pill was
-  // meant to leave narrow screens and did not.
+/**
+ * The Community routes: the entry point's screen for the route, or the kit
+ * Overview when the shell was handed no screens (which only a test does).
+ */
+function CommunityRoute({
+  route,
+  shell,
+  context,
+  onOpenActivity,
+}: {
+  route: ShellRoute;
+  shell?: CommunityShell;
+  context: CommunityScreenContext;
+  onOpenActivity: (target?: ActivityLink) => void;
+}) {
+  const screen = shell?.screens.find((candidate) => candidate.route === route)
+    ?? shell?.screens.find((candidate) => candidate.route === "overview");
+  if (screen !== undefined) return <>{screen.render(context)}</>;
   return (
-    <span className="hidden sm:inline-flex">
-      <StatusBadge status={status} label={labels[mode]} />
-    </span>
+    <Home
+      meta={context.meta}
+      onOpenActivity={onOpenActivity}
+      edition="community"
+      dashboardAccess={context.bootstrap?.dashboard_access}
+    />
   );
 }

@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { COMMUNITY_TABS } from "./support";
 
 test("Community works with every Enterprise producer absent", async ({ page }) => {
   const postureRequests: string[] = [];
@@ -9,9 +10,8 @@ test("Community works with every Enterprise producer absent", async ({ page }) =
   await page.goto("/");
 
   await expect(page.getByText("Community", { exact: true })).toBeVisible();
-  await expect(page.getByRole("heading", { name: "Connect an agent to start screening its actions." })).toBeVisible();
-  await expect(page.getByRole("navigation", { name: "Dashboard views" })).toContainText("Overview");
-  await expect(page.getByRole("navigation", { name: "Dashboard views" })).toContainText("Activity");
+  await expect(page.getByRole("heading", { name: "What is happening here" })).toBeVisible();
+  await expect(page.getByRole("navigation", { name: "Dashboard views" }).getByRole("button")).toHaveText(COMMUNITY_TABS.map(([label]) => label));
   await expect(page.getByText("InnerWarden Enterprise", { exact: true })).toHaveCount(0);
   expect(postureRequests).toEqual([]);
 });

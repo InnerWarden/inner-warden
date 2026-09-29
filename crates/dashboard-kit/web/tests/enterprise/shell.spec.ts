@@ -137,15 +137,18 @@ async function installEnterpriseState(page: Page, state: "healthy" | "partial" |
   await page.route("**/api/dashboard/v1/posture", (route) => route.fulfill({ json: hostPosture(state) }));
 }
 
+// The Community pages are mounted by the kit's own entry point, so this runs
+// against the kit's bundle; a bundle that overlays its own entry point and
+// never serves the Community edition has nothing here to test.
 test("Community keeps its current white shell and logo returns to home", async ({ page }) => {
   await page.goto("http://127.0.0.1:4173/");
   await expect(page.getByText("Community", { exact: true })).toBeVisible();
-  await expect(page.getByRole("heading", { name: "Connect an agent to start screening its actions." })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "What is happening here" })).toBeVisible();
 
-  await page.getByRole("button", { name: "Activity" }).click();
-  await expect(page.getByRole("heading", { name: "Activity" })).toBeVisible();
+  await page.getByRole("navigation", { name: "Dashboard views" }).getByRole("button", { name: "Cases", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Cases", exact: true, level: 1 })).toBeVisible();
   await page.getByRole("button", { name: "Go to overview" }).click();
-  await expect(page.getByRole("heading", { name: "Connect an agent to start screening its actions." })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "What is happening here" })).toBeVisible();
 });
 
 test("healthy Enterprise mounts capability-derived Posture without Community upsell content", async ({ page }) => {

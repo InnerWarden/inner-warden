@@ -110,8 +110,16 @@ export function plainOrTechnical(plain: string, technical: string, enabled: bool
   return enabled ? technical : plain;
 }
 
-/** The switch itself. Small, and it says what it does. */
-export function TechnicalDetailToggle({ className = "" }: { className?: string }) {
+/** The switch's name for a screen reader, whatever words are drawn beside it. */
+const TOGGLE_NAME = "Show technical detail";
+
+/**
+ * The switch itself. Small, and it says what it does. `label` shortens the
+ * words drawn beside it (a header with little room); the switch's accessible
+ * name stays "Show technical detail", which contains the shorter words, so
+ * what a reader sees is still what a voice user says. Absent: today's words.
+ */
+export function TechnicalDetailToggle({ className = "", label = TOGGLE_NAME }: { className?: string; label?: string }) {
   const [enabled, setEnabled] = useTechnicalDetail();
   return (
     <label className={`inline-flex cursor-pointer items-center gap-2 text-xs text-slate-600 ${className}`}>
@@ -119,9 +127,10 @@ export function TechnicalDetailToggle({ className = "" }: { className?: string }
         type="checkbox"
         checked={enabled}
         onChange={(event) => setEnabled(event.target.checked)}
+        aria-label={label === TOGGLE_NAME ? undefined : TOGGLE_NAME}
         className="h-3.5 w-3.5 rounded border-slate-300"
       />
-      <span>Show technical detail</span>
+      <span>{label}</span>
     </label>
   );
 }

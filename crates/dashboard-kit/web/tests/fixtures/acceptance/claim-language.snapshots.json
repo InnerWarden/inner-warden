@@ -1,11 +1,11 @@
 {
   "community": {
     "edition": "Community",
-    "boundary": "INNERWARDEN COMMUNITY",
-    "title": "Connect an agent to start screening its actions.",
-    "description": "Guided setup starts in monitor mode. Captured shell actions, MCP tool calls and one-off checks build the local decision record.",
-    "hostBoundaryTitle": "Extend protection from agent intent to the host.",
-    "hostBoundaryDescription": "Community screens supported agent actions before execution. On supported Linux hosts, Active Defence adds independent host telemetry, incident triage and evidence-backed response, including eBPF enforcement and the kernel Execution Gate. macOS and Windows host protection is planned, not implied by this dashboard."
+    "title": "What is happening here",
+    "description": "From this machine's own records.",
+    "hostBoundaryTitle": "Attacks on this machine",
+    "hostBoundary": "Community watches what your AI agents try to run. It does not watch this machine itself.",
+    "hostBoundaryOffer": "21 flagged commands ran here since 25 Sept 2026: Community relies on your agent asking first. On a Linux server, Active Defence adds the kernel Execution Gate, and watches the server itself with the host sensor, an SSH decoy and automatic response."
   },
   "observe": {
     "edition": "Enterprise",

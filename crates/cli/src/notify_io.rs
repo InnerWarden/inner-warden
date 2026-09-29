@@ -124,6 +124,22 @@ fn write_config_file(path: &Path, content: &str) -> Result<(), String> {
     clamp_private_file(path)
 }
 
+/// How many alert channels are wired (Telegram, Slack, Discord, a webhook),
+/// counted from the same resolved config `fire` sends through. A count only:
+/// nothing about a channel's address leaves this function.
+pub(crate) fn channel_count() -> usize {
+    let config = innerwarden_notify::resolved(|k| std::env::var(k).ok(), config_file().as_deref());
+    [
+        config.telegram.is_some(),
+        config.slack_webhook.is_some(),
+        config.discord_webhook.is_some(),
+        config.webhook_url.is_some(),
+    ]
+    .iter()
+    .filter(|wired| **wired)
+    .count()
+}
+
 /// Whether at least one notification channel is already configured (used by the
 /// setup wizard to pre-check the box on a re-run).
 pub fn is_configured() -> bool {

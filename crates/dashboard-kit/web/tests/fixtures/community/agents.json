@@ -1,13 +1,103 @@
 {
-  "schema_version": 2,
-  "generated_at_ms": 0,
-  "availability": "available",
-  "discovery_limited": true,
+  "agents": [
+    {
+      "auto_connect_eligible": false,
+      "detected_by": [
+        "executable_on_path",
+        "configuration_file"
+      ],
+      "display_name": "Claude Code",
+      "guardrail": {
+        "last_observed_at": "2026-09-29T14:03:00Z",
+        "mechanism": "pretooluse_hook",
+        "mode": "monitor",
+        "setup_support": "automatic"
+      },
+      "id": "claude-code",
+      "installed": true,
+      "next_step": {
+        "command": "innerwarden enforce",
+        "label": "To refuse a deny as well:",
+        "line": "Switches every connected agent from watching to refusing a deny."
+      },
+      "running": null
+    },
+    {
+      "auto_connect_eligible": false,
+      "detected_by": [
+        "executable_on_path",
+        "configuration_file"
+      ],
+      "display_name": "Codex",
+      "guardrail": {
+        "mechanism": "mcp_proxy",
+        "mode": "partial",
+        "setup_support": "automatic"
+      },
+      "id": "codex",
+      "installed": true,
+      "next_step": {
+        "command": "innerwarden agents connect codex --monitor",
+        "label": "To finish connecting it:",
+        "line": "Wires the MCP servers that are still open, in the mode the others run in."
+      },
+      "running": null
+    },
+    {
+      "auto_connect_eligible": false,
+      "detected_by": [
+        "executable_on_path",
+        "configuration_file"
+      ],
+      "display_name": "Cursor",
+      "guardrail": {
+        "last_observed_at": "2026-09-29T12:05:00Z",
+        "mechanism": "mcp_proxy",
+        "mode": "enforce",
+        "setup_support": "automatic"
+      },
+      "id": "cursor",
+      "installed": true,
+      "running": null
+    },
+    {
+      "auto_connect_eligible": false,
+      "detected_by": [
+        "executable_on_path",
+        "configuration_file"
+      ],
+      "display_name": "Gemini CLI",
+      "guardrail": {
+        "mechanism": "mcp_proxy",
+        "mode": "enforce",
+        "setup_support": "automatic"
+      },
+      "id": "gemini",
+      "installed": true,
+      "running": null
+    }
+  ],
   "auto_connect": {
-    "status": "unavailable",
-    "enabled": false,
-    "mode": "disabled",
-    "refresh_interval_secs": 30
+    "enabled": true,
+    "mode": "monitor",
+    "refresh_interval_secs": 60,
+    "status": "available",
+    "watcher": {
+      "effective_policy_mode": null,
+      "last_reconcile_at_ms": null,
+      "lifecycle": "unavailable",
+      "policy_available": false,
+      "policy_enabled": null,
+      "reason_code": "watcher_unavailable"
+    }
   },
-  "agents": []
+  "availability": "available",
+  "discovery_limited": false,
+  "generated_at_ms": 1790690700000,
+  "schema_version": 2,
+  "screened_by_channel": {
+    "hook": "2026-09-29T14:03:00Z",
+    "mcp": "2026-09-29T12:05:00Z"
+  },
+  "unnamed_by_channel": {}
 }

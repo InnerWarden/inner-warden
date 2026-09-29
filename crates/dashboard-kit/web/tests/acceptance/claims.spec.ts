@@ -261,22 +261,30 @@ async function expectNoUnsupportedProtectionClaim(page: Page) {
   await expect(page.getByText("Contained", { exact: true })).toHaveCount(0);
 }
 
+/**
+ * The Community Overview's own pages (the kit entry point mounts them): the
+ * lanes say what this machine's records hold, and the card for attacks on
+ * this machine says plainly that Community does not watch it, with the one
+ * offer beside it. Regenerated deliberately when the Community pages
+ * replaced the posture hero; the prohibitions below did not change.
+ */
 test("Community language states its useful agent boundary without implying host protection", async ({ page }) => {
   await page.goto(communityUrl);
 
-  const communityHero = page.locator("section[aria-labelledby='posture-title']");
-  const hostBoundary = page.locator("aside[aria-labelledby='active-defence-title']");
+  const lanes = page.locator("section[aria-labelledby='lanes-title']");
+  const hostBoundary = page.locator("[data-lane='server_attacks']");
+  await expect(hostBoundary.locator("[data-ad-state='offer']")).toBeVisible();
   const language = {
     edition: await normalizedText(page.getByText("Community", { exact: true }).first()),
-    boundary: await normalizedText(communityHero.getByText("InnerWarden Community", { exact: true })),
-    title: await normalizedText(communityHero.locator("#posture-title")),
-    description: await normalizedText(communityHero.locator("#posture-title + p")),
-    hostBoundaryTitle: await normalizedText(hostBoundary.locator("#active-defence-title")),
-    hostBoundaryDescription: await normalizedText(hostBoundary.locator("#active-defence-title + p")),
+    title: await normalizedText(lanes.locator("#lanes-title")),
+    description: await normalizedText(lanes.locator("#lanes-title + p")),
+    hostBoundaryTitle: await normalizedText(hostBoundary.locator("#lane-server_attacks-title")),
+    hostBoundary: await normalizedText(hostBoundary.getByText("It does not watch this machine itself.", { exact: false })),
+    hostBoundaryOffer: await normalizedText(hostBoundary.locator("[data-ad-state='offer'] [data-offer-words]")),
   };
 
   expect(language).toEqual(claimLanguageSnapshots.community);
-  await expect(page.getByText("Verified active enforcement", { exact: true })).toHaveCount(0);
+  await expectNoUnsupportedProtectionClaim(page);
 });
 
 test("Observe language is visibility-only", async ({ page }) => {
