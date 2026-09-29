@@ -244,6 +244,18 @@ pub fn is_automatic_merge_safe(settings: &Value) -> bool {
 /// `hook` (and `--block-review` when requested). Quoting handles a path with
 /// spaces (e.g. `C:\Users\Some Name\...`).
 pub fn hook_command(iw_guard: &Path, block_review: bool, monitor: bool) -> String {
+    hook_command_for(iw_guard, block_review, monitor, None)
+}
+
+/// [`hook_command`], naming the agent the hook serves (`--agent <id>`), so
+/// every decision it records says which agent asked. The id is written only
+/// when it is a plain agent id; anything else is left out rather than quoted.
+pub fn hook_command_for(
+    iw_guard: &Path,
+    block_review: bool,
+    monitor: bool,
+    agent: Option<&str>,
+) -> String {
     // `monitor` wins: it records every command but never blocks, so a dev gets the
     // live graph without the guardrail denying day-to-day work.
     let flag = if monitor {
@@ -253,7 +265,41 @@ pub fn hook_command(iw_guard: &Path, block_review: bool, monitor: bool) -> Strin
     } else {
         ""
     };
-    format!("\"{}\" hook{flag}", iw_guard.display())
+    let agent = agent
+        .filter(|agent| is_agent_id(agent))
+        .map(|agent| format!(" --agent {agent}"))
+        .unwrap_or_default();
+    format!("\"{}\" hook{flag}{agent}", iw_guard.display())
+}
+
+/// A plain agent id (`claude-code`): lowercase letters, digits, `-` and `_`.
+pub fn is_agent_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+}
+
+/// The agent an existing InnerWarden hook names: `None` when there is no
+/// recognised hook at all, `Some(None)` when there is one that names no
+/// agent. Rewriting a hook keeps this exactly as it was: a hook written
+/// before `--agent` existed is correct as it stands, and must never be
+/// rewritten just to add an identity.
+fn existing_agent_flag(settings: &Value) -> Option<Option<String>> {
+    let hooks: Vec<&Value> = settings
+        .get("hooks")
+        .and_then(|hooks| hooks.get("PreToolUse"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.get("hooks").and_then(Value::as_array))
+        .flatten()
+        .collect();
+    hooks
+        .into_iter()
+        .find_map(iwguard_hook_parts)
+        .map(|(_, agent)| agent)
 }
 
 /// Core installer with the home directory injected, so it is unit-testable
@@ -373,7 +419,10 @@ fn install_hook_with_link_policy(
         requested_mode
     };
     let (block_review, monitor) = effective_mode.flags();
-    let cmd = hook_command(iw_guard, block_review, monitor);
+    // A NEW connection names its agent; an existing hook keeps whatever it
+    // named, including nothing (`existing_agent_flag`).
+    let agent_flag = existing_agent_flag(&existing).unwrap_or_else(|| Some(agent.to_string()));
+    let cmd = hook_command_for(iw_guard, block_review, monitor, agent_flag.as_deref());
     let merged = merge_pretooluse_bash_hook(existing.clone(), &cmd);
     // The observation half. Written with the SAME binary and the same mode
     // flags, because a PostToolUse hook that points at a different build is a
@@ -518,26 +567,42 @@ fn is_innerwarden_executable(executable: &str) -> bool {
 /// the unrelated system `iw` utility, a neighbouring executable like
 /// `innerwarden-helper`, or a shell command that only mentions InnerWarden.
 fn iwguard_hook_mode(hook: &Value) -> Option<HookProtection> {
-    hook.get("command")
+    iwguard_hook_parts(hook).map(|(mode, _)| mode)
+}
+
+/// The mode an InnerWarden hook runs in, and the agent it names.
+///
+/// The grammar is the one [`hook_command_for`] writes and nothing wider:
+/// `<innerwarden> hook`, then at most one mode flag, then at most one
+/// `--agent <id>`. A repeated flag, an unknown word or an agent id that is not
+/// a plain id means the line is not ours, exactly as before `--agent` existed:
+/// uninstall and repair must never claim an operator's own command.
+fn iwguard_hook_parts(hook: &Value) -> Option<(HookProtection, Option<String>)> {
+    let words = hook
+        .get("command")
         .and_then(Value::as_str)
-        .and_then(hook_command_words)
-        .and_then(|words| match words.as_slice() {
-            [executable, subcommand]
-                if is_innerwarden_executable(executable) && subcommand == "hook" =>
-            {
-                Some(HookProtection::Enforce)
-            }
-            [executable, subcommand, flag]
-                if is_innerwarden_executable(executable) && subcommand == "hook" =>
-            {
-                match flag.as_str() {
-                    "--monitor" => Some(HookProtection::Monitor),
-                    "--block-review" => Some(HookProtection::BlockReview),
-                    _ => None,
-                }
-            }
-            _ => None,
-        })
+        .and_then(hook_command_words)?;
+    let (executable, rest) = words.split_first()?;
+    let (subcommand, flags) = rest.split_first()?;
+    if !is_innerwarden_executable(executable) || subcommand != "hook" {
+        return None;
+    }
+    let (mode_flag, agent_flags) = match flags.first().map(String::as_str) {
+        Some("--monitor" | "--block-review") => (flags.first(), &flags[1..]),
+        _ => (None, flags),
+    };
+    let mode = match mode_flag.map(String::as_str) {
+        None => HookProtection::Enforce,
+        Some("--monitor") => HookProtection::Monitor,
+        Some(_) => HookProtection::BlockReview,
+    };
+    match agent_flags {
+        [] => Some((mode, None)),
+        [flag, agent] if flag == "--agent" && is_agent_id(agent) => {
+            Some((mode, Some(agent.clone())))
+        }
+        _ => None,
+    }
 }
 
 fn is_iwguard_hook(hook: &Value) -> bool {
@@ -694,7 +759,10 @@ pub fn needs_iwguard_hook_reconciliation(
     let effective_mode = strongest_effective_iwguard_hook_mode(settings)
         .map_or(requested_mode, |current| current.max(requested_mode));
     let (block_review, monitor) = effective_mode.flags();
-    let command = hook_command(iw_guard, block_review, monitor);
+    // The agent the existing hook names, kept as it is: a hook with no
+    // `--agent` is correct wiring, never drift to repair.
+    let agent = existing_agent_flag(settings).flatten();
+    let command = hook_command_for(iw_guard, block_review, monitor, agent.as_deref());
     merge_pretooluse_bash_hook(settings.clone(), &command) != *settings
 }
 
@@ -1149,6 +1217,121 @@ mod tests {
     }
 
     #[test]
+    fn a_hook_that_names_its_agent_is_still_recognised_in_every_mode() {
+        for (command, mode, agent) in [
+            (
+                "\"/x/innerwarden\" hook --agent claude-code",
+                HookProtection::Enforce,
+                Some("claude-code"),
+            ),
+            (
+                "\"/x/innerwarden\" hook --monitor --agent claude-code",
+                HookProtection::Monitor,
+                Some("claude-code"),
+            ),
+            (
+                "\"/x/innerwarden\" hook --block-review --agent claude-code",
+                HookProtection::BlockReview,
+                Some("claude-code"),
+            ),
+            (
+                "\"/x/innerwarden\" hook --monitor",
+                HookProtection::Monitor,
+                None,
+            ),
+        ] {
+            let hook = json!({"command": command});
+            assert_eq!(
+                iwguard_hook_parts(&hook),
+                Some((mode, agent.map(str::to_string))),
+                "{command}"
+            );
+        }
+        // Anything wider than the grammar the installer writes is not ours.
+        for command in [
+            "\"/x/innerwarden\" hook --agent",
+            "\"/x/innerwarden\" hook --agent Claude",
+            "\"/x/innerwarden\" hook --agent claude-code --monitor",
+            "\"/x/innerwarden\" hook --monitor --monitor",
+            "\"/x/innerwarden\" hook --agent a --agent b",
+            "\"/x/innerwarden\" hook --agent claude-code; rm -rf /",
+        ] {
+            assert_eq!(
+                iwguard_hook_parts(&json!({"command": command})),
+                None,
+                "{command}"
+            );
+        }
+        assert_eq!(
+            hook_command_for(
+                Path::new("/x/innerwarden"),
+                false,
+                true,
+                Some("claude-code")
+            ),
+            "\"/x/innerwarden\" hook --monitor --agent claude-code"
+        );
+        // An id that is not a plain id is left out, never quoted in.
+        assert_eq!(
+            hook_command_for(Path::new("/x/innerwarden"), false, false, Some("x; rm")),
+            "\"/x/innerwarden\" hook"
+        );
+    }
+
+    /// A hook written before `--agent` existed is CORRECT wiring. Adding the
+    /// flag must never turn every existing install into drift that the
+    /// background reconciler then rewrites.
+    #[test]
+    fn a_hook_without_agent_flag_is_not_drift() {
+        let iw = Path::new("/opt/innerwarden");
+        for command in [
+            "\"/opt/innerwarden\" hook --monitor",
+            "\"/opt/innerwarden\" hook --monitor --agent claude-code",
+        ] {
+            let settings = json!({"hooks": {"PreToolUse": [
+                {"matcher": "Bash", "hooks": [{"type": "command", "command": command}]}
+            ]}});
+            assert!(
+                !needs_iwguard_hook_reconciliation(&settings, iw, false, true),
+                "{command}"
+            );
+        }
+        // Path drift is still drift, and its repair keeps the hook as it was.
+        let old_path = json!({"hooks": {"PreToolUse": [
+            {"matcher": "Bash", "hooks": [{"type": "command", "command": "\"/old/innerwarden\" hook --monitor"}]}
+        ]}});
+        assert!(needs_iwguard_hook_reconciliation(
+            &old_path, iw, false, true
+        ));
+    }
+
+    #[test]
+    fn reinstalling_keeps_whatever_agent_the_existing_hook_named() {
+        let home = tempfile::TempDir::new().unwrap();
+        let settings = home.path().join(".claude/settings.json");
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        std::fs::write(
+            &settings,
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"\"/opt/innerwarden\" hook --monitor"}]}]}}"#,
+        )
+        .unwrap();
+        install_hook(
+            home.path(),
+            "claude-code",
+            None,
+            Path::new("/opt/innerwarden"),
+            false,
+            false,
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(
+            v["hooks"]["PreToolUse"][0]["hooks"][0]["command"], "\"/opt/innerwarden\" hook",
+            "switching mode rewrites the mode and adds no identity"
+        );
+    }
+
+    #[test]
     fn install_hook_writes_and_merges_settings() {
         let home = tempfile::TempDir::new().unwrap();
         let settings = home.path().join(".claude/settings.json");
@@ -1160,9 +1343,10 @@ mod tests {
 
         let v: Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
         assert_eq!(v["model"], "sonnet", "unrelated key preserved");
+        // A new connection names the agent it serves.
         assert_eq!(
             v["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
-            "\"/opt/innerwarden\" hook --block-review"
+            "\"/opt/innerwarden\" hook --block-review --agent claude-code"
         );
 
         // Idempotent.
@@ -1239,7 +1423,7 @@ mod tests {
         let v: Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
         assert_eq!(
             v["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
-            "\"/opt/innerwarden\" hook --monitor"
+            "\"/opt/innerwarden\" hook --monitor --agent claude-code"
         );
     }
 
