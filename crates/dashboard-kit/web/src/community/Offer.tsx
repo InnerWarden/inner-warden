@@ -58,6 +58,48 @@ export function OfferBox({ offer, installed, onDismissed }: { offer: Offer; inst
   );
 }
 
+/**
+ * An offer as one slate band, under a case rather than inside it: the
+ * reader's own step stays the heaviest thing on the card. A text link, not a
+ * button, so it never outweighs the Copy beside the reader's own command.
+ * Same "Not now", same remembered slot as `OfferBox`.
+ */
+export function OfferLine({ offer, installed }: { offer: Offer; installed: boolean }) {
+  const box = useRef<HTMLElement>(null);
+  const [hidden, setHidden] = useState(() => dismissed(offer.slot));
+  if (installed) return <InstalledLine />;
+  if (hidden) return null;
+  const hide = () => {
+    const next = nextFocusable(box.current);
+    dismiss(offer.slot);
+    setHidden(true);
+    next?.focus();
+  };
+  return (
+    <aside
+      ref={box}
+      aria-label="Active Defence"
+      data-offer={offer.key}
+      data-ad-state="offer"
+      data-tour="upgrade-offer"
+      className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-2.5 text-sm leading-6 text-slate-600"
+    >
+      <span className="mr-1.5 text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-500">Active Defence</span>
+      <span>{offer.body}</span>{" "}
+      <span className="whitespace-nowrap">
+        <a href={offer.href} target="_blank" rel="noreferrer" className="font-semibold text-cyan-700 hover:text-cyan-900">
+          {offer.action} <span aria-hidden="true">↗</span>
+          <span className="sr-only"> (opens innerwarden.com)</span>
+        </a>
+        <span aria-hidden="true" className="mx-1.5 text-slate-400">·</span>
+        <button type="button" onClick={hide} aria-label="Not now: hide this offer" className="font-semibold text-slate-600 hover:text-slate-900">
+          Not now
+        </button>
+      </span>
+    </aside>
+  );
+}
+
 /** The next element a keyboard can reach after `element`, inside the same section. */
 function nextFocusable(element: HTMLElement | null): HTMLElement | null {
   if (element === null) return null;

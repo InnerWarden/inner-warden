@@ -42,7 +42,7 @@ export function CommunityTokens() {
       )}
       <p className="text-xs leading-5 text-slate-500">Read from each agent's own history on this machine; prompts and responses never reach this dashboard.</p>
       <TechnicalOnly>
-        <MachineIntelligence edition="community" showAgents={false} showTokens />
+        <MachineIntelligence edition="community" showAgents={false} showTokens tones="neutral" />
       </TechnicalOnly>
     </div>
   );
@@ -61,8 +61,9 @@ function TokenRowView({ row, largest }: { row: TokenRow; largest: bigint }) {
   // The bar's length is this agent's share of the largest, so two agents
   // read side by side; its parts are this agent's own split.
   const width = Math.max(0.02, share(whole, largest));
+  // A count the history does not report is left unsaid, never a zero.
   const meta = [
-    `${formatCount(row.sessions ?? 0)} ${row.sessions === 1 ? "session" : "sessions"}`,
+    row.sessions === null ? undefined : `${formatCount(row.sessions)} ${row.sessions === 1 ? "session" : "sessions"}`,
     row.lastUsedAt === undefined ? undefined : `last used ${formatDay(row.lastUsedAt)}`,
   ].filter((part): part is string => part !== undefined);
   return (

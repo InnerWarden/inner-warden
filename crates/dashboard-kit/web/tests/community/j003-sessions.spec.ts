@@ -105,7 +105,8 @@ test.describe("CJC-090-J003 reviewed and unreviewed integration sessions", () =>
     await expect(reviewed).toContainText("Already configured");
 
     const unreviewed = card(page, "OpenClaw");
-    await expect(unreviewed).toContainText("Runtime not confirmed");
+    // Not checked is said once for the page, below, never as a badge per card.
+    await expect(unreviewed).not.toContainText("Runtime not confirmed");
     await expect(unreviewed).toContainText("Manual");
     await expect(unreviewed).toContainText("Not available");
     await expect(unreviewed).not.toContainText("Eligible when enabled");

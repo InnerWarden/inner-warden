@@ -98,20 +98,21 @@ test.describe("CJC-090-J008 conservative general agent discovery", () => {
 
     const generic = card(page, "Unknown MCP client");
     await expect(generic).toContainText("Compatible MCP configuration found");
-    await expect(generic).toContainText("Runtime not confirmed");
+    await expect(generic).not.toContainText("Runtime not confirmed");
     await expect(generic).toContainText("Unsupported");
     await expect(generic).toContainText("Not available");
     await expect(generic).not.toContainText("Eligible when enabled");
 
     const openClaw = card(page, "OpenClaw");
     await expect(openClaw).toContainText("Configuration found; CLI not confirmed");
-    await expect(openClaw).toContainText("Runtime not confirmed");
+    await expect(openClaw).not.toContainText("Runtime not confirmed");
     await expect(openClaw).toContainText("Manual setup");
     await expect(openClaw).not.toContainText("Already configured");
 
     const hermes = card(page, "Hermes");
     await expect(hermes).toContainText("CLI available on this PATH");
-    await expect(hermes).toContainText("Runtime not confirmed");
+    await expect(hermes).not.toContainText("Runtime not confirmed");
+    await expect(page.getByText("Whether an agent is running is not checked on this platform.")).toBeVisible();
     await expect(hermes).not.toContainText("Running process detected");
     await expect(hermes).toContainText("Eligibility unavailable");
     await expect(hermes).not.toContainText("Eligible when enabled");

@@ -7,11 +7,15 @@ import { CASE, EMPTY_DECISIONS, fixture, fulfillJson, guardRoute } from "./suppo
  * link to one decision opens it whether or not it is on the loaded page.
  */
 
+/**
+ * The LIST's requests. The agent tab's count (`limit=1`, no filter) is its
+ * own small poll and says nothing about what the list asked for.
+ */
 function decisionsRequests(page: import("@playwright/test").Page) {
   const seen: URL[] = [];
   page.on("request", (request) => {
     const url = new URL(request.url());
-    if (url.pathname === "/api/guard/decisions") seen.push(url);
+    if (url.pathname === "/api/guard/decisions" && url.searchParams.get("limit") !== "1") seen.push(url);
   });
   return seen;
 }
@@ -78,7 +82,7 @@ test.describe("CJC-090-J005 activity filters, pagination, and drilldown", () => 
     const seen = decisionsRequests(page);
     await page.goto("/?view=activity&reason=rule%3Atmp_execution");
     await expect.poll(() => seen.at(-1)?.searchParams.get("reason")).toBe("rule:tmp_execution");
-    await expect(page.getByRole("button", { name: "world-writable folder: 14 flagged" })).toHaveAttribute("aria-pressed", "true");
+    await expect(page.getByRole("button", { name: "world-writable folder: 15 flagged" })).toHaveAttribute("aria-pressed", "true");
 
     await page.goto("/?view=activity&lane=agent_messages");
     await expect(page.getByRole("tab", { name: /Messages to your AI agent/ })).toHaveAttribute("aria-selected", "true");

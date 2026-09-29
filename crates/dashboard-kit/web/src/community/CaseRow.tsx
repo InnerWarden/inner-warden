@@ -1,9 +1,9 @@
 import type { KeyboardEvent } from "react";
 import { TechnicalOnly } from "../components/TechnicalDetail";
 import { Glyph, type GlyphName } from "../components/icons";
-import { When } from "../components/When";
+import { formatAbsolute } from "../presentation";
 import type { Attempt, Decision } from "./api";
-import { OutcomeDot } from "./parts";
+import { Ago, HiddenChip, OutcomeDot } from "./parts";
 import { OUTCOME_WORDS, WHO_WORDS, type Channel } from "./words";
 
 export const CHANNEL_GLYPH: Record<Channel, GlyphName> = {
@@ -28,11 +28,16 @@ export function rowKeys(event: KeyboardEvent<HTMLButtonElement>, move: (delta: n
   move(event.key === "ArrowDown" ? 1 : -1);
 }
 
+/** The command in a row: up to two lines, so the part that got it flagged (`| sh`) is rarely cut. */
+const ROW_TITLE = "line-clamp-2 break-words font-mono text-sm leading-5 text-slate-950 [overflow-wrap:anywhere]";
+
 /**
- * One flagged decision in a list: the command (as recorded, whole on hover),
- * what happened to it, when, who asked, in which folder, and the rule's few
- * words. No step number, no session id, no score: those are the technical
- * view's, in the case itself.
+ * One flagged decision in a list: the command (two lines at most, whole on
+ * hover), what happened to it, how long ago, who asked, in which folder, and
+ * the rule's few words. The outcome words are the row's main signal and are
+ * never cut; the time stays relative in both views, and the technical line
+ * says the exact UTC time. No step number, no session id, no score: those
+ * are the technical view's, in the case itself.
  */
 export function CaseRow({
   item,
@@ -59,24 +64,23 @@ export function CaseRow({
         {open ? <span aria-hidden="true" className="absolute inset-y-0 left-0 w-1 bg-cyan-700" /> : null}
         <Glyph name={CHANNEL_GLYPH[item.channel]} className="mt-0.5 h-4 w-4 text-slate-500" />
         <span className="min-w-0 flex-1">
-          <span
-            className="block truncate font-mono text-sm leading-5 text-slate-950"
-            title={item.commandWhole ? item.command : `${item.command} (shortened when it was recorded)`}
-          >
+          <span className={ROW_TITLE} title={item.commandWhole ? item.command : `${item.command} (not shown exactly as it ran)`}>
             {item.command}
           </span>
-          <span className="mt-1 flex min-w-0 items-center gap-x-3 text-xs">
-            <span className="inline-flex min-w-0 items-center gap-1.5 text-slate-700" data-outcome-words={item.outcomeKey}>
+          <span className="mt-1 flex min-w-0 flex-wrap items-center gap-x-3 gap-y-0.5 text-xs">
+            <span className="inline-flex items-center gap-1.5 text-slate-700" data-outcome-words={item.outcomeKey}>
               <OutcomeDot outcome={item.outcomeKey} />
-              <span className="truncate">{OUTCOME_WORDS[item.outcomeKey]}</span>
+              <span className="whitespace-nowrap">{OUTCOME_WORDS[item.outcomeKey]}</span>
             </span>
+            {item.hiddenCharacters ? <HiddenChip compact /> : null}
             {item.recordedAt === undefined ? null : (
-              <span className="ml-auto whitespace-nowrap tabular-nums text-slate-500"><When at={item.recordedAt} relative /></span>
+              <span className="ml-auto whitespace-nowrap tabular-nums text-slate-500"><Ago at={item.recordedAt} /></span>
             )}
           </span>
           <span className="mt-0.5 block truncate text-xs text-slate-600">{meta.join(" · ")}</span>
           <TechnicalOnly>
             <span className="mt-1 flex min-w-0 flex-wrap items-center gap-x-2 text-[11px] text-slate-500">
+              {item.recordedAt === undefined ? null : <span className="tabular-nums">{formatAbsolute(item.recordedAt, "UTC")}</span>}
               <span className="truncate font-mono">{item.id}</span>
               <span>{item.recommendation}</span>
               <span>{item.mode}</span>
@@ -104,14 +108,18 @@ export function MessageRow({ item, open, onOpen, onMove }: { item: Attempt; open
         <Glyph name="chat" className="mt-0.5 h-4 w-4 text-slate-500" />
         <span className="min-w-0 flex-1">
           <span className="line-clamp-2 break-words text-sm leading-5 text-slate-950 [overflow-wrap:anywhere]">{item.detail}</span>
-          <span className="mt-1 flex min-w-0 items-center gap-x-3 text-xs">
-            <span className="inline-flex min-w-0 items-center gap-1.5 text-slate-700">
+          <span className="mt-1 flex min-w-0 flex-wrap items-center gap-x-3 gap-y-0.5 text-xs">
+            <span className="inline-flex items-center gap-1.5 text-slate-700" data-outcome-words={item.outcomeKey}>
               <OutcomeDot outcome={item.outcomeKey} />
-              <span className="truncate">{OUTCOME_WORDS[item.outcomeKey]}</span>
+              <span className="whitespace-nowrap">{OUTCOME_WORDS[item.outcomeKey]}</span>
             </span>
-            <span className="ml-auto whitespace-nowrap tabular-nums text-slate-500"><When at={item.at} relative /></span>
+            {item.hiddenCharacters ? <HiddenChip compact /> : null}
+            <span className="ml-auto whitespace-nowrap tabular-nums text-slate-500"><Ago at={item.at} /></span>
           </span>
           <span className="mt-0.5 block truncate text-xs text-slate-600">Someone on {item.channelWords}</span>
+          <TechnicalOnly>
+            <span className="mt-1 block text-[11px] tabular-nums text-slate-500">{formatAbsolute(item.at, "UTC")}</span>
+          </TechnicalOnly>
         </span>
       </button>
     </li>

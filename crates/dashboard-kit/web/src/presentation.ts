@@ -187,24 +187,34 @@ export function formatCount(value: number | bigint): string {
  * A large count in words, for a tile where the exact figure would not be read
  * as a number: "2.3 billion", "38 million", "412 thousand". Below 100,000 it
  * is the exact figure (`formatCount`), because a count a reader can hold whole
- * is not rounded. One decimal where it changes the reading, none past ten.
+ * is not rounded.
+ *
+ * Below ten of a million or more it always keeps one decimal, so two counts
+ * side by side read at the same precision ("1.3 billion" beside "1.0
+ * billion", never beside "1 billion", which looks rounder and less exact than
+ * it is). A count that rounds up to a thousand of one scale is said in the
+ * next one: 999,960 is "1.0 million", never "1,000 thousand".
  */
 export function compactCount(value: number | bigint): string {
   const exact = typeof value === "bigint" ? value : BigInt(Math.max(0, Math.round(Number.isFinite(value) ? value : 0)));
   if (exact < 100_000n) return formatCount(exact);
   const scales: [bigint, string][] = [
-    [1_000_000_000_000n, "trillion"],
-    [1_000_000_000n, "billion"],
-    [1_000_000n, "million"],
     [1_000n, "thousand"],
+    [1_000_000n, "million"],
+    [1_000_000_000n, "billion"],
+    [1_000_000_000_000n, "trillion"],
   ];
-  for (const [scale, word] of scales) {
-    if (exact < scale) continue;
+  // The largest scale the count reaches, then up while the rounded figure
+  // would say a thousand of it.
+  let at = scales.length - 1;
+  while (at > 0 && exact < scales[at][0]) at -= 1;
+  for (; at < scales.length; at += 1) {
+    const [scale, word] = scales[at];
     // Tenths, computed in integers so a count past 2^53 is not rounded twice.
     const tenths = (exact * 10n + scale / 2n) / scale;
-    const whole = tenths / 10n;
-    const shown = whole >= 10n || tenths % 10n === 0n ? formatCount(whole >= 10n ? (exact + scale / 2n) / scale : whole) : `${whole}.${tenths % 10n}`;
-    return `${shown} ${word}`;
+    if (tenths < 100n && scale >= 1_000_000n) return `${tenths / 10n}.${tenths % 10n} ${word}`;
+    const whole = (exact + scale / 2n) / scale;
+    if (whole < 1_000n || at === scales.length - 1) return `${formatCount(whole)} ${word}`;
   }
   return formatCount(exact);
 }

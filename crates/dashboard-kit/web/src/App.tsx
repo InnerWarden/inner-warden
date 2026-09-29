@@ -243,7 +243,7 @@ function routeFromLocation(extraScreens: readonly ScreenModule[]): ShellRoute {
 const SCREEN_PARAMS = [
   "q", "outcome", "severity", "status", "mode", "authority", "capability", "scope_kind",
   "scope", "window", "cursor", "case", "decision", "session", "verdict", "action", "lane",
-  "reason",
+  "reason", "hide",
 ] as const;
 
 const ACTIVITY_PARAM_LIMIT = 256;
@@ -741,6 +741,7 @@ export function App({
         homeRoute="overview"
         onNavigate={navigate}
         account={edition === "enterprise" ? signedInAccount(bootstrapResource) : undefined}
+        navLayout={edition === "community" && community !== undefined ? "fit" : undefined}
         status={edition === "community"
           // `data-meta-status` says which reading the status is drawn from:
           // a test waits on it, never on a default the page shows before

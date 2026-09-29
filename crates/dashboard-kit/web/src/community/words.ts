@@ -32,7 +32,7 @@ export const OUTCOME_WORDS: Record<DecisionOutcomeKey | MessageOutcomeKey, strin
   checked_only: "Checked by hand",
   unplaced: "Outcome not recorded",
   stopped_by_innerwarden: "Stopped by InnerWarden",
-  declined_by_agent: "Your agent declined",
+  declined_by_agent: "Declined by your agent",
   answered: "Answered",
 };
 

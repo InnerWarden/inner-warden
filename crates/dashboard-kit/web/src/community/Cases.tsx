@@ -5,7 +5,7 @@ import { CaseLaneTabs } from "../components/CaseLaneTabs";
 import { casePageCountLabel } from "../components/casePageCount";
 import { Bar, type Part } from "../components/viz";
 import type { LanePart } from "../lanes";
-import { formatCount, formatDay } from "../presentation";
+import { formatCount, formatDay, normaliseMode } from "../presentation";
 import {
   fetchAttempts,
   fetchDecision,
@@ -48,7 +48,11 @@ function bounded(value: string | null): string | undefined {
   return value !== null && value.length > 0 && value.length <= PARAM_MAX ? value : undefined;
 }
 
-/** The Cases screen's state, read from the address, so a reload or a shared link lands on the same list. */
+/**
+ * The Cases screen's state, read from the address, so a reload or a shared
+ * link lands on the same list. `hide` is a reason the reader hid from the
+ * list: a view, never a setting (the guard keeps flagging it).
+ */
 export function casesParams(search: string): CasesParams {
   const params = new URLSearchParams(search);
   const outcome = bounded(params.get("outcome"));
@@ -58,6 +62,7 @@ export function casesParams(search: string): CasesParams {
     query: {
       ...(outcome !== undefined && (DECISION_OUTCOMES as readonly string[]).includes(outcome) ? { outcome } : {}),
       ...(bounded(params.get("reason")) === undefined ? {} : { reason: bounded(params.get("reason")) }),
+      ...(bounded(params.get("hide")) === undefined ? {} : { reasonNot: bounded(params.get("hide")) }),
       ...(bounded(params.get("session")) === undefined ? {} : { session: bounded(params.get("session")) }),
       ...(bounded(params.get("q")) === undefined ? {} : { q: bounded(params.get("q")) }),
       ...(bounded(params.get("cursor")) === undefined ? {} : { cursor: bounded(params.get("cursor")) }),
@@ -65,12 +70,12 @@ export function casesParams(search: string): CasesParams {
   };
 }
 
-function toParams(state: CasesParams): Record<string, string> {
+export function toParams(state: CasesParams): Record<string, string> {
   const out: Record<string, string> = {};
   if (state.lane === "agent_messages") out.lane = "agent_messages";
   if (state.open !== undefined) out.decision = state.open;
   for (const [key, value] of Object.entries(state.query)) {
-    if (typeof value === "string" && value.length > 0) out[key] = value;
+    if (typeof value === "string" && value.length > 0) out[key === "reasonNot" ? "hide" : key] = value;
   }
   return out;
 }
@@ -95,11 +100,16 @@ export function outcomeParts(page: Pick<DecisionsPage, "byOutcome" | "total">, f
 export function CommunityCases({ context }: { context: CommunityScreenContext }) {
   const state = casesParams(context.search);
   const history = usePolled(fetchHistory, 60_000, "history");
+  // The agent tab's count, whichever tab is open: the same whole-record
+  // figure the list's summary says.
+  const flagged = usePolled(() => fetchDecisions({ limit: 1 }), 60_000, "flagged-count");
   const messagesOffered = (history.data?.messages.recorded ?? 0) > 0 || state.lane === "agent_messages";
   const go = (next: CasesParams) => context.navigate("activity", toParams(next));
   const os = asPlatform(context.bootstrap?.platform.os);
   const installed = context.meta?.active_defence_installed === true;
+  const hostMode = normaliseMode(context.meta);
   const refreshRef = useRef<() => void>(() => undefined);
+  const messages = state.lane === "agent_messages";
 
   return (
     <div className="min-w-0 space-y-5">
@@ -108,7 +118,9 @@ export function CommunityCases({ context }: { context: CommunityScreenContext })
         title="Cases"
         titleId="cases-title"
         tour="activity"
-        description="Every command or tool call the guard flagged: who asked, what was decided, and what you can do."
+        description={messages
+          ? "Risky messages people sent your agent, one case each: what was asked, who decided, and what you can do."
+          : "Every command or tool call the guard flagged: who asked, what was decided, and what you can do."}
         aside={
           <button
             type="button"
@@ -124,7 +136,8 @@ export function CommunityCases({ context }: { context: CommunityScreenContext })
           value={state.lane}
           choices={["agent_actions", "agent_messages"]}
           counts={{
-            ...(history.data === undefined ? {} : { agent_messages: history.data.messages.recorded }),
+            ...(flagged.data === undefined ? {} : { agent_actions: flagged.data.flaggedTotal }),
+            ...(history.data === undefined || !history.data.readable ? {} : { agent_messages: history.data.messages.recorded }),
           }}
           unitFor={(choice) => (choice === "agent_actions" ? { one: "case", many: "cases" } : undefined)}
           intro={false}
@@ -133,10 +146,10 @@ export function CommunityCases({ context }: { context: CommunityScreenContext })
         />
       ) : null}
       <div id="cases-panel">
-        {state.lane === "agent_messages" ? (
-          <MessagesLane state={state} go={go} os={os} installed={installed} refreshRef={refreshRef} />
+        {messages ? (
+          <MessagesLane state={state} go={go} os={os} installed={installed} hostMode={hostMode} refreshRef={refreshRef} since={history.data?.readable ? history.data.since : undefined} />
         ) : (
-          <ActionsLane state={state} go={go} os={os} installed={installed} refreshRef={refreshRef} />
+          <ActionsLane state={state} go={go} os={os} installed={installed} hostMode={hostMode} refreshRef={refreshRef} />
         )}
       </div>
     </div>
@@ -148,7 +161,10 @@ type LaneProps = {
   go: (next: CasesParams) => void;
   os: ReturnType<typeof asPlatform>;
   installed: boolean;
+  hostMode: string;
   refreshRef: { current: () => void };
+  /** When the guard's event log begins: the span a message count covers. */
+  since?: string;
 };
 
 /** The list and the open case, side by side at `lg`; one above the other below it. */
@@ -210,6 +226,7 @@ function ActionsLane({ state, go, os, installed, refreshRef }: LaneProps) {
     }
   };
   const filtered = query.outcome !== undefined || query.reason !== undefined || query.q !== undefined || query.session !== undefined;
+  const hideReason = (reasonNot: string | undefined) => go({ ...state, query: { ...query, cursor: undefined, reasonNot, ...(reasonNot !== undefined && query.reason === reasonNot ? { reason: undefined } : {}) } });
 
   const list = (
     <div className="min-w-0 overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
@@ -223,7 +240,13 @@ function ActionsLane({ state, go, os, installed, refreshRef }: LaneProps) {
         )
       ) : (
         <>
-          <FlaggedSummary page={page.data} filtered={filtered} query={query} onReason={(reason) => go({ ...state, open: undefined, query: { ...query, cursor: undefined, reason } })} />
+          <FlaggedSummary
+            page={page.data}
+            filtered={filtered}
+            query={query}
+            onReason={(reason) => go({ ...state, open: undefined, query: { ...query, cursor: undefined, reason, ...(reason !== undefined && reason === query.reasonNot ? { reasonNot: undefined } : {}) } })}
+            onHide={hideReason}
+          />
           <ListControls
             page={page.data}
             query={query}
@@ -231,7 +254,7 @@ function ActionsLane({ state, go, os, installed, refreshRef }: LaneProps) {
             onQuery={(next) => go({ ...state, open: undefined, query: next })}
           />
           {page.stale ? <div className="px-4 pt-2"><StaleLine onRetry={page.refresh} /></div> : null}
-          <CaseList page={page.data} open={open} onOpen={openItem} onMove={move} filtered={filtered} onClear={() => go({ lane: "agent_actions", query: {} })} />
+          <CaseList page={page.data} open={open} onOpen={openItem} onMove={move} filtered={filtered || query.reasonNot !== undefined} onClear={() => go({ lane: "agent_actions", query: {} })} />
           <Pager
             atStart={query.cursor === undefined}
             next={page.data.nextCursor}
@@ -269,6 +292,7 @@ function ActionsLane({ state, go, os, installed, refreshRef }: LaneProps) {
           onOlder={at >= 0 && at < items.length - 1 ? () => openItem(items[at + 1].id) : undefined}
           onOpen={openItem}
           onSession={(session) => go({ lane: "agent_actions", open: found.item.id, query: { session } })}
+          onHideReason={(reason) => hideReason(reason)}
         />
       );
     } else if (detail.error !== undefined) {
@@ -281,13 +305,43 @@ function ActionsLane({ state, go, os, installed, refreshRef }: LaneProps) {
   return <Layout list={list} detail={pane} openId={open} count={items.length} />;
 }
 
-function FlaggedSummary({ page, filtered, query, onReason }: { page: DecisionsPage; filtered: boolean; query: DecisionsQuery; onReason: (reason: string | undefined) => void }) {
+/** The label under the bar: the sum of the bar's own parts, never a figure the bar does not draw. */
+export function barLabel(parts: readonly LanePart[]): string {
+  const sum = parts.reduce((total, part) => total + part.count, 0);
+  return `What happened to the ${formatCount(sum)} flagged ${sum === 1 ? "command" : "commands"}`;
+}
+
+function FlaggedSummary({
+  page,
+  filtered,
+  query,
+  onReason,
+  onHide,
+}: {
+  page: DecisionsPage;
+  filtered: boolean;
+  query: DecisionsQuery;
+  onReason: (reason: string | undefined) => void;
+  onHide: (reason: string | undefined) => void;
+}) {
   const parts = outcomeParts(page, query.outcome !== undefined);
   const since = page.record.oldestAt === undefined ? undefined : formatDay(page.record.oldestAt);
   const top = page.reasons[0]?.count ?? 0;
   const [first, rest] = [page.reasons.slice(0, REASONS_OPEN), page.reasons.slice(REASONS_OPEN)];
   const hidden = page.reasonsDistinct - page.reasons.length;
   const mutes = page.suppress.muteRules + page.suppress.muteCategories;
+  const hiddenReason = query.reasonNot === undefined ? undefined : page.reasons.find((reason) => reason.key === query.reasonNot);
+  const reasonRow = (reason: Reason) => (
+    <ReasonButton
+      key={reason.key}
+      reason={reason}
+      top={top}
+      active={query.reason === reason.key}
+      hidden={query.reasonNot === reason.key}
+      onReason={onReason}
+      onHide={onHide}
+    />
+  );
   return (
     <section aria-labelledby="flagged-summary-title" className="border-b border-slate-200 p-4">
       <Eyebrow glyph="prompt" id="flagged-summary-title">What your AI agent did</Eyebrow>
@@ -297,6 +351,14 @@ function FlaggedSummary({ page, filtered, query, onReason }: { page: DecisionsPa
             <span className="text-2xl font-semibold text-slate-950">{formatCount(page.total)}</span>{" "}
             <span className="text-sm text-slate-600">match · of {formatCount(page.flaggedTotal)} flagged</span>
           </>
+        ) : query.reasonNot !== undefined ? (
+          <>
+            <span className="text-2xl font-semibold text-slate-950">{formatCount(page.total)}</span>{" "}
+            <span data-hidden-summary className="text-sm text-slate-600">
+              flagged without {hiddenReason === undefined ? "the hidden reason" : hiddenReason.short}
+              {since === undefined ? "" : ` · since ${since}`}
+            </span>
+          </>
         ) : (
           <>
             <span className="text-2xl font-semibold text-slate-950">{formatCount(page.flaggedTotal)}</span>{" "}
@@ -304,25 +366,25 @@ function FlaggedSummary({ page, filtered, query, onReason }: { page: DecisionsPa
           </>
         )}
       </p>
-      {parts === undefined ? null : (
-        <OutcomeBreakdown parts={parts} label={`What happened to the ${formatCount(page.total)} flagged commands`} className="mt-3" />
+      {query.reasonNot === undefined ? null : (
+        <p className="mt-1 text-xs leading-5 text-slate-500">
+          Hidden from this list only; the guard still flags them.{" "}
+          <button type="button" onClick={() => onHide(undefined)} className="font-semibold text-cyan-700 hover:text-cyan-900">Show them again</button>
+        </p>
       )}
+      {parts === undefined ? null : <OutcomeBreakdown parts={parts} label={barLabel(parts)} className="mt-3" />}
       {page.reasons.length === 0 ? null : (
         <details className="group mt-4" open={typeof window === "undefined" || window.matchMedia?.("(min-width: 640px)").matches !== false}>
           <summary className="cursor-pointer text-xs font-semibold uppercase tracking-[0.14em] text-slate-500">
             Why they were flagged
           </summary>
-          <ul className="mt-2 space-y-0.5">
-            {first.map((reason) => <ReasonButton key={reason.key} reason={reason} top={top} active={query.reason === reason.key} onReason={onReason} />)}
-          </ul>
+          <ul className="mt-2 space-y-0.5">{first.map(reasonRow)}</ul>
           {rest.length === 0 ? null : (
             <details className="mt-1">
               <summary className="cursor-pointer text-xs font-semibold text-cyan-700">
                 {rest.length + Math.max(0, hidden)} more {rest.length + Math.max(0, hidden) === 1 ? "reason" : "reasons"}
               </summary>
-              <ul className="mt-1 space-y-0.5">
-                {rest.map((reason) => <ReasonButton key={reason.key} reason={reason} top={top} active={query.reason === reason.key} onReason={onReason} />)}
-              </ul>
+              <ul className="mt-1 space-y-0.5">{rest.map(reasonRow)}</ul>
               {hidden > 0 ? <p className="mt-1 text-xs text-slate-500">{formatCount(hidden)} rarer {hidden === 1 ? "reason is" : "reasons are"} not listed.</p> : null}
             </details>
           )}
@@ -337,24 +399,56 @@ function FlaggedSummary({ page, filtered, query, onReason }: { page: DecisionsPa
   );
 }
 
-function ReasonButton({ reason, top, active, onReason }: { reason: Reason; top: number; active: boolean; onReason: (reason: string | undefined) => void }) {
+/**
+ * One reason: its count and bar, the words (two lines at most, never cut to
+ * a stub), a press that lists only it, and a quiet "Hide" that leaves it out
+ * of the list (a view only).
+ */
+function ReasonButton({
+  reason,
+  top,
+  active,
+  hidden,
+  onReason,
+  onHide,
+}: {
+  reason: Reason;
+  top: number;
+  active: boolean;
+  hidden: boolean;
+  onReason: (reason: string | undefined) => void;
+  onHide: (reason: string | undefined) => void;
+}) {
   const parts: Part[] = [
     { key: "count", value: reason.count, tone: "watch", label: `${formatCount(reason.count)} flagged for this reason` },
     { key: "rest", value: Math.max(0, top - reason.count), tone: "off", label: "" },
   ];
   return (
-    <li>
+    <li className={`flex items-start gap-1 ${hidden ? "opacity-60" : ""}`} data-reason={reason.key}>
       <button
         type="button"
         aria-pressed={active}
         aria-label={`${reason.short}: ${formatCount(reason.count)} flagged`}
         onClick={() => onReason(active ? undefined : reason.key)}
         title={reason.words}
-        className={`flex w-full min-w-0 items-center gap-2 rounded-md px-1.5 py-1 text-left text-xs ${active ? "bg-slate-900 text-white" : "text-slate-700 hover:bg-slate-50"}`}
+        className={`flex min-w-0 flex-1 items-start gap-2 rounded-md px-1.5 py-1 text-left text-xs ${active ? "bg-slate-900 text-white" : "text-slate-700 hover:bg-slate-50"}`}
       >
         <span className="w-10 shrink-0 text-right font-semibold tabular-nums">{formatCount(reason.count)}</span>
-        <span className="w-24 shrink-0"><Bar parts={parts} label={`${formatCount(reason.count)} of ${formatCount(top)}`} className="h-1.5" /></span>
-        <span className="min-w-0 flex-1 truncate">{reason.short}</span>
+        {/* The words get the row's width, the bar sits under them: in a
+            353 px column beside a bar they were cut to "download run by a". */}
+        <span className="min-w-0 flex-1">
+          <span className="block break-words line-clamp-2">{reason.short}</span>
+          <span className="mt-1 block max-w-[10rem]"><Bar parts={parts} label={`${formatCount(reason.count)} of ${formatCount(top)}`} className="h-1" /></span>
+        </span>
+      </button>
+      <button
+        type="button"
+        aria-pressed={hidden}
+        aria-label={hidden ? `Show ${reason.short} in the list again` : `Hide ${reason.short} from the list`}
+        onClick={() => onHide(hidden ? undefined : reason.key)}
+        className="shrink-0 rounded-md px-1.5 py-1 text-[11px] font-semibold text-slate-500 hover:bg-slate-50 hover:text-slate-800"
+      >
+        {hidden ? "Show" : "Hide"}
       </button>
     </li>
   );
@@ -400,11 +494,24 @@ function ListControls({ page, query, visible, onQuery }: { page: DecisionsPage; 
       </form>
       <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-500">
         <span data-count-line>{casePageCountLabel(visible, { rows_in_window: page.total })}</span>
-        {any ? <button type="button" onClick={() => onQuery({})} className="font-semibold text-cyan-700 hover:text-cyan-900">Clear filters</button> : null}
+        {any ? <button type="button" onClick={() => onQuery(query.reasonNot === undefined ? {} : { reasonNot: query.reasonNot })} className="font-semibold text-cyan-700 hover:text-cyan-900">Clear filters</button> : null}
       </div>
       {query.session === undefined ? null : <p className="text-xs text-slate-600">Only the session {query.session.slice(0, 8)}.</p>}
     </div>
   );
+}
+
+/**
+ * What an empty list says, decided by the RECORD's counts, never by how many
+ * rows were drawn: a page whose rows could not all be read must not say
+ * "Nothing flagged".
+ */
+export function emptyListWords(page: Pick<DecisionsPage, "flaggedTotal" | "total" | "record">, filtered: boolean): string {
+  if (filtered) return page.total === 0 ? "No flagged command matches these filters." : `${formatCount(page.total)} flagged could not be shown.`;
+  if (page.flaggedTotal > 0) return `${formatCount(page.flaggedTotal)} flagged could not be shown.`;
+  if (page.record.decisions === 0) return "Nothing recorded yet. Connect an agent and its commands appear here.";
+  const since = page.record.oldestAt === undefined ? "" : ` since ${formatDay(page.record.oldestAt)}`;
+  return `Nothing flagged${since}. ${formatCount(page.record.decisions)} ${page.record.decisions === 1 ? "command was" : "commands were"} screened and allowed.`;
 }
 
 function CaseList({
@@ -425,19 +532,10 @@ function CaseList({
   if (page.items.length === 0) {
     return (
       <div className="px-4 py-6 text-sm leading-6 text-slate-600">
-        {filtered ? (
-          <>
-            <p>No flagged command matches these filters.</p>
-            <button type="button" onClick={onClear} className="mt-1 font-semibold text-cyan-700 hover:text-cyan-900">Clear filters</button>
-          </>
-        ) : page.record.decisions === 0 ? (
-          <p>Nothing recorded yet. Connect an agent and its commands appear here.</p>
-        ) : (
-          <p>
-            Nothing flagged{page.record.oldestAt === undefined ? "" : ` since ${formatDay(page.record.oldestAt)}`}. {formatCount(page.record.decisions)}{" "}
-            {page.record.decisions === 1 ? "command was" : "commands were"} screened and allowed.
-          </p>
-        )}
+        <p data-empty-list>{emptyListWords(page, filtered)}</p>
+        {filtered && page.total === 0 ? (
+          <button type="button" onClick={onClear} className="mt-1 font-semibold text-cyan-700 hover:text-cyan-900">Clear filters</button>
+        ) : null}
       </div>
     );
   }
@@ -506,7 +604,7 @@ function Pager({ atStart, next, onNewest, onOlder }: { atStart: boolean; next?: 
   );
 }
 
-function MessagesLane({ state, go, os, installed, refreshRef }: LaneProps) {
+function MessagesLane({ state, go, os, installed, hostMode, refreshRef, since }: LaneProps) {
   const cursor = state.query.cursor;
   const page = usePolled(() => fetchAttempts(cursor), cursor === undefined ? MESSAGES_POLL_MS : 0, cursor ?? "");
   refreshRef.current = page.refresh;
@@ -522,16 +620,20 @@ function MessagesLane({ state, go, os, installed, refreshRef }: LaneProps) {
     <div className="min-w-0 overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
       <div className="border-b border-slate-200 p-4">
         <Eyebrow glyph="chat">Messages to your AI agent</Eyebrow>
-        <p className="mt-2 flex flex-wrap items-baseline gap-x-1.5">
-          <span className="text-2xl font-semibold text-slate-950">{formatCount(page.data?.total ?? 0)}</span>{" "}
-          <span className="text-sm text-slate-600">recorded</span>
-        </p>
-        <p className="mt-1 text-xs leading-5 text-slate-500">Risky messages people sent your agent, one case each. Observe records them; it does not block them.</p>
+        {page.data === undefined ? null : (
+          <p className="mt-2 flex flex-wrap items-baseline gap-x-1.5">
+            <span className="text-2xl font-semibold text-slate-950">{formatCount(page.data.total)}</span>{" "}
+            <span className="text-sm text-slate-600">recorded{since === undefined ? "" : ` since ${formatDay(since)}`}</span>
+          </p>
+        )}
+        <p className="mt-1 text-xs leading-5 text-slate-500">Observe records them; it does not block them.</p>
       </div>
       {page.data === undefined ? (
         page.error === undefined ? <div className="p-4"><Skeleton className="h-40 border-0" /></div> : <div className="p-4"><Unreadable title="The event log could not be read" onRetry={page.refresh} /></div>
       ) : items.length === 0 ? (
-        <p className="px-4 py-6 text-sm text-slate-600">No risky message has been recorded.</p>
+        <p className="px-4 py-6 text-sm text-slate-600">
+          {page.data.total === 0 ? "No risky message has been recorded." : `${formatCount(page.data.total)} recorded could not be shown.`}
+        </p>
       ) : (
         <ul className="divide-y divide-slate-100">
           {items.map((item) => <MessageRow key={item.id} item={item} open={open === item.id} onOpen={openItem} onMove={move} />)}
@@ -552,6 +654,6 @@ function MessagesLane({ state, go, os, installed, refreshRef }: LaneProps) {
     ? <CaseGuide />
     : openItemData === undefined
       ? page.data === undefined ? <Skeleton className="h-96" /> : <Unreadable title="This message is not on this page of the list" body="Use Newest to go back to the start." />
-      : <MessageDetail item={openItemData} os={os} installed={installed} />;
+      : <MessageDetail item={openItemData} os={os} installed={installed} hostMode={hostMode} />;
   return <Layout list={list} detail={pane} openId={open} count={items.length} />;
 }

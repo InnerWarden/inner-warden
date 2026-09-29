@@ -166,10 +166,19 @@ export function LaneCards({
   linkLabel,
   footer,
   align,
+  title,
+  blurb,
+  beforeCards,
 }: {
   cards: LaneCard[];
   /** The line under the heading, in place of `lanesIntro`. Absent: `lanesIntro`. */
   intro?: string;
+  /** A card's heading, in place of the lane's own name (`LANE_COPY`). Absent, or `undefined` for a lane: the lane's own. */
+  title?: (lane: CaseLane) => string | undefined;
+  /** The line under a card's heading, in place of the lane's own (`LANE_COPY`). Absent, or `undefined` for a lane: the lane's own. */
+  blurb?: (lane: CaseLane) => string | undefined;
+  /** Drawn between the heading and the cards (a first run's own steps). Absent: nothing. */
+  beforeCards?: ReactNode;
   /** A card's link words, in place of the lane's own (`LANE_COPY`). Absent, or `undefined` for a lane: the lane's own. */
   linkLabel?: (lane: CaseLane) => string | undefined;
   /** Drawn at a card's foot, above its link row. Absent: nothing. */
@@ -204,6 +213,7 @@ export function LaneCards({
       <p className="mt-2 max-w-3xl text-sm leading-6 text-slate-600">
         {intro ?? lanesIntro(cards, everyCardLeads)}
       </p>
+      {beforeCards === undefined || beforeCards === null ? null : <div className="mt-5">{beforeCards}</div>}
       <div className={joinClasses("mt-5 grid gap-4", gridColumnsClass("trio", cards.length), align === "start" && "items-start")}>
         {cards.map((card, index) => (
           <LaneCardView
@@ -216,6 +226,8 @@ export function LaneCards({
             onOpenActivity={onOpenActivity}
             linkWords={linkLabel?.(card.lane)}
             footer={footer?.(card)}
+            titleWords={title?.(card.lane)}
+            blurbWords={blurb?.(card.lane)}
           />
         ))}
       </div>
@@ -232,6 +244,8 @@ function LaneCardView({
   onOpenActivity,
   linkWords,
   footer,
+  titleWords,
+  blurbWords,
 }: {
   card: LaneCard;
   spanClass: string;
@@ -241,6 +255,8 @@ function LaneCardView({
   onOpenActivity?: () => void;
   linkWords?: string;
   footer?: ReactNode;
+  titleWords?: string;
+  blurbWords?: string;
 }) {
   const copy = LANE_COPY[card.lane];
   const titleId = `lane-${card.lane}-title`;
@@ -265,8 +281,8 @@ function LaneCardView({
       data-lane-state={card.state}
       className={joinClasses("flex min-w-0 flex-col rounded-2xl border border-slate-200 bg-white p-5 shadow-sm", spanClass)}
     >
-      <h2 id={titleId} className="text-base font-semibold text-slate-950">{copy.name}</h2>
-      <p className="mt-1 text-xs leading-5 text-slate-500">{copy.blurb}</p>
+      <h2 id={titleId} className="text-base font-semibold text-slate-950">{titleWords ?? copy.name}</h2>
+      <p className="mt-1 text-xs leading-5 text-slate-500">{blurbWords ?? copy.blurb}</p>
       {available ? (
         <p className="mt-4 flex flex-wrap items-baseline gap-x-2">
           <span data-lane-count className="text-3xl font-semibold tabular-nums text-slate-950">{formatCount(card.count)}</span>
@@ -305,7 +321,7 @@ function LaneCardView({
             <button
               type="button"
               onClick={() => available && onOpenCase(latest.caseId as string, card.lane, latestCaseWindow(latest, card.window, Date.now()))}
-              className="text-left font-medium text-cyan-800 underline decoration-cyan-300 underline-offset-2 hover:text-cyan-950"
+              className="text-left font-medium text-cyan-800 underline decoration-cyan-300 underline-offset-2 [overflow-wrap:anywhere] hover:text-cyan-950"
             >
               {latest.title}
             </button>

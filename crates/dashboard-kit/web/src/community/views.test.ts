@@ -94,7 +94,7 @@ describe("what Community covers", () => {
   it("says who is not behind the guard and who is, and never names one agent as both", () => {
     const controls = communityControls({ agents: agentRows(agents), now: Date.parse("2026-09-29T14:05:00Z") });
     const tools = controls.find((control) => control.key === "tool_call_screening");
-    expect(tools?.line).toBe("Codex is not fully behind the guard. Cursor and Gemini CLI are.");
+    expect(tools?.line).toBe("Cursor and Gemini CLI refuse a deny. Codex is not fully behind the guard.");
   });
 
   it("counts an agent with no connection at all as needing you, and a leftover configuration not at all", () => {

@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type ReactNode } from "react";
 import { outcomeTone } from "../components/LaneCards";
 import { Glyph, type GlyphName } from "../components/icons";
 import { partFill } from "../components/viz";
+import { formatTimestamp, isoInstant, timeTitle } from "../presentation";
 
 /**
  * The small pieces every Community page is built from, in the paid redesign's
@@ -112,16 +113,68 @@ export function OutcomeDot({ outcome, className = "" }: { outcome: string; class
   );
 }
 
+/** A token longer than this may break anywhere (a path at 390 px); shorter ones never do. */
+const LONG_TOKEN = 28;
+
+/**
+ * A command's words, each kept whole on a line: a hyphen is a line-break
+ * opportunity, so `--all` would otherwise wrap into a dangling `--` and
+ * `all`. Only a token longer than `LONG_TOKEN` (a path) may break inside, so
+ * a long path still wraps at 390 px. In a template, a `<placeholder>` is a
+ * `<var>`, drawn apart from the words to type as they are.
+ */
+export function commandTokens(command: string, template: boolean): ReactNode[] {
+  const parts = command.split(/(\s+)/);
+  return parts.map((part, index) => {
+    if (part.length === 0) return null;
+    if (/^\s+$/.test(part)) return part;
+    const wrap = part.length > LONG_TOKEN ? "[overflow-wrap:anywhere]" : "whitespace-nowrap";
+    if (!template || !/<[^<>]+>/.test(part)) {
+      return <span key={index} className={wrap}>{part}</span>;
+    }
+    return (
+      <span key={index} className={wrap}>
+        {part.split(/(<[^<>]+>)/).map((piece, at) =>
+          /^<[^<>]+>$/.test(piece) ? (
+            <var key={at} data-placeholder className="rounded bg-white px-0.5 font-mono not-italic text-slate-500 ring-1 ring-inset ring-slate-300">
+              {piece}
+            </var>
+          ) : (
+            piece
+          ),
+        )}
+      </span>
+    );
+  });
+}
+
 /**
  * A command to copy, whole, in a box that wraps inside itself and never
  * scrolls the page sideways. Printed exactly as the CLI sent it: the page
  * never builds a command from parts.
+ *
+ * `copy={false}` shows it with no Copy button: a template (`template`), whose
+ * `<placeholder>` would be pasted as it is, or a command that is not the one
+ * that ran (shortened, or shown with its hidden characters written out).
+ * Copying either would put a command that does not work, or does something
+ * else, in the reader's clipboard.
  */
-export function CopyCommand({ command, className = "" }: { command: string; className?: string }) {
+export function CopyCommand({
+  command,
+  className = "",
+  copy = true,
+  template = false,
+}: {
+  command: string;
+  className?: string;
+  copy?: boolean;
+  template?: boolean;
+}) {
   const [copied, setCopied] = useState(false);
   const timer = useRef<ReturnType<typeof setTimeout>>(undefined);
   useEffect(() => () => clearTimeout(timer.current), []);
-  const copy = () => {
+  const canCopy = copy && !template;
+  const onCopy = () => {
     const done = () => {
       setCopied(true);
       clearTimeout(timer.current);
@@ -134,17 +187,57 @@ export function CopyCommand({ command, className = "" }: { command: string; clas
     }
   };
   return (
-    <div className={`flex min-w-0 items-start gap-2 rounded-lg border border-slate-200 bg-slate-50 py-1.5 pl-3 pr-1.5 ${className}`}>
-      <code data-command className="min-w-0 flex-1 break-words py-0.5 font-mono text-[13px] leading-5 text-slate-900 [overflow-wrap:anywhere]">{command}</code>
-      <button
-        type="button"
-        onClick={copy}
-        aria-label={`Copy the command ${command}`}
-        className="shrink-0 rounded-md border border-slate-300 bg-white px-2 py-1 text-xs font-semibold text-slate-700 hover:bg-slate-100"
+    <div className={`flex min-w-0 items-start gap-2 rounded-lg border border-slate-200 bg-slate-50 py-1.5 pl-3 ${canCopy ? "pr-1.5" : "pr-3"} ${className}`}>
+      <code
+        data-command
+        {...(template ? { "data-template": "" } : {})}
+        className="min-w-0 flex-1 break-words py-0.5 font-mono text-[13px] leading-5 text-slate-900"
       >
-        {copied ? "Copied" : "Copy"}
-      </button>
+        {commandTokens(command, template)}
+      </code>
+      {canCopy ? (
+        <button
+          type="button"
+          onClick={onCopy}
+          aria-label={`Copy the command ${command}`}
+          className="shrink-0 rounded-md border border-slate-300 bg-white px-2 py-1 text-xs font-semibold text-slate-700 hover:bg-slate-100"
+        >
+          {copied ? "Copied" : "Copy"}
+        </button>
+      ) : null}
     </div>
+  );
+}
+
+/**
+ * How long ago, in both views. The kit's `When` prints absolute UTC in the
+ * technical view, which in a list row takes the width the outcome words need;
+ * a row keeps "3 hours ago" and says the UTC time on its technical line.
+ */
+export function Ago({ at, className }: { at: string | number; className?: string }) {
+  const iso = isoInstant(at);
+  if (iso === undefined) return null;
+  return (
+    <time dateTime={typeof at === "string" ? at : iso} title={timeTitle(at)} className={className}>
+      {formatTimestamp(new Date(at).getTime())}
+    </time>
+  );
+}
+
+/**
+ * Said beside a command or a message that carried characters a reader
+ * cannot see. Slate: it is evidence, not an alarm and not a person's task.
+ */
+export function HiddenChip({ className = "", compact = false }: { className?: string; compact?: boolean }) {
+  return (
+    <span
+      data-hidden-characters
+      title="Characters that do not show on screen (a direction override, a zero-width space, tag characters) are written out as \u{...}."
+      className={`inline-flex w-fit shrink-0 items-center gap-1 rounded-md border border-slate-300 bg-white px-1.5 py-0.5 text-[11px] font-semibold leading-4 text-slate-700 ${className}`}
+    >
+      <span aria-hidden="true" className="font-mono">\u</span>
+      {compact ? "Hidden characters" : "Contains hidden characters"}
+    </span>
   );
 }
 

@@ -20,6 +20,11 @@ export type AgentRow = {
   /** A person is needed: it is not, or only partly, behind the guard. */
   needsYou: boolean;
   next?: AgentNextStep;
+  /**
+   * For a hook written before hooks named their agent: the reconnect, in the
+   * hook's own mode, that names it (the CLI's `identity_step`).
+   */
+  identity?: AgentNextStep;
   /** `null` where the platform does not check (macOS). */
   running: boolean | null;
   lastScreenedAt?: string;
@@ -56,6 +61,7 @@ export function agentRows(response: AgentsResponse | undefined): AgentRow[] {
   return response.agents.map((agent) => {
     const state = agentState(agent);
     const next = readAgentNextStep((agent as LocalAgent & { next_step?: unknown }).next_step);
+    const identity = readAgentNextStep((agent as LocalAgent & { identity_step?: unknown }).identity_step);
     const lastScreened = (agent.guardrail as { last_observed_at?: unknown }).last_observed_at;
     return {
       id: agent.id,
@@ -64,6 +70,7 @@ export function agentRows(response: AgentsResponse | undefined): AgentRow[] {
       state,
       needsYou: state === "partial" || (state === "not_connected" && presentHere(agent)),
       ...(next === undefined ? {} : { next }),
+      ...(identity === undefined ? {} : { identity }),
       running: agent.running,
       ...(typeof lastScreened === "string" && Number.isFinite(Date.parse(lastScreened)) ? { lastScreenedAt: lastScreened } : {}),
     };

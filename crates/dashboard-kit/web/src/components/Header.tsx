@@ -38,7 +38,15 @@ export function Header<Route extends string>({
   onNavigate,
   status,
   account,
+  navLayout = "wrap",
 }: {
+  /**
+   * "wrap" (the default, today's markup): below the small breakpoint the tabs
+   * wrap onto a second line. "fit": below it they share ONE row in equal
+   * columns with smaller type, for a shell with few, short tabs (Community's
+   * five), so a phone does not lose a row to one orphan tab.
+   */
+  navLayout?: "wrap" | "fit";
   editionLabel: string;
   version?: string;
   navigation: HeaderNavigationItem<Route>[];
@@ -112,7 +120,9 @@ export function Header<Route extends string>({
           <nav
             // Wraps to a second line on a narrow screen rather than pushing the
             // page sideways: five tabs do not fit in 320 px on one.
-            className="order-3 flex w-full flex-wrap gap-1 gap-y-1 border-t border-slate-100 pt-2 sm:order-none sm:w-auto sm:border-0 sm:pt-0"
+            className={navLayout === "fit"
+              ? "order-3 grid w-full auto-cols-fr grid-flow-col gap-1 sm:gap-0.5 border-t border-slate-100 pt-2 sm:order-none sm:flex sm:w-auto sm:flex-wrap sm:border-0 sm:pt-0"
+              : "order-3 flex w-full flex-wrap gap-1 gap-y-1 border-t border-slate-100 pt-2 sm:order-none sm:w-auto sm:border-0 sm:pt-0"}
             aria-label="Dashboard views"
             data-tour="nav"
           >
@@ -128,7 +138,7 @@ export function Header<Route extends string>({
                 onClick={() => navigate(item.route)}
                 aria-current={activeRoute === item.route ? "page" : undefined}
                 aria-pressed={activeRoute === item.route}
-                className={`rounded-lg px-3 py-2 text-sm font-semibold transition-colors ${
+                className={`rounded-lg ${navLayout === "fit" ? "min-w-0 px-1 py-2 text-xs sm:px-2.5 sm:text-sm" : "px-3 py-2 text-sm"} font-semibold transition-colors ${
                   activeRoute === item.route
                     ? "bg-slate-900 text-white"
                     : "text-slate-600 hover:bg-slate-100 hover:text-slate-950"

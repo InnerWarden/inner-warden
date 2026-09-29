@@ -70,6 +70,39 @@ test("the five tabs wrap inside the screen, and the header stays under a third o
   await expect(page.getByRole("button", { name: "Open the product tour" })).toBeVisible();
 });
 
+/** FAILS ON REVERT: at 390 the tabs wrapped, "Tokens" alone on a second row. */
+for (const width of [320, 390]) {
+  test(`the five tabs share one row at ${width} px`, async ({ page }) => {
+    await page.setViewportSize({ width, height: 800 });
+    await page.goto("/");
+    const tabs = page.getByRole("navigation", { name: "Dashboard views" }).getByRole("button");
+    await expect(tabs).toHaveCount(COMMUNITY_TABS.length);
+    const tops = await tabs.evaluateAll((buttons) => buttons.map((button) => Math.round(button.getBoundingClientRect().top)));
+    expect(new Set(tops).size).toBe(1);
+  });
+}
+
+/**
+ * A case's neighbours say their outcome in words for a screen reader at
+ * every width. Below 640 px the words were `display: none`, so the only
+ * signal left was the colour of a dot.
+ */
+test("each neighbour of a case says its outcome to a screen reader on a phone", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 800 });
+  await page.goto(`/?view=activity&decision=${encodeURIComponent(CASE.domainFetch)}`);
+  const around = page.locator('section[aria-labelledby="around-title"] li');
+  await expect(around.first()).toBeVisible();
+  const rows = await around.evaluateAll((items) => items.map((item) => {
+    const words = item.querySelector("[data-outcome-words]");
+    return { text: words?.textContent ?? "", shown: words !== null && getComputedStyle(words).display !== "none" };
+  }));
+  expect(rows.length).toBeGreaterThan(1);
+  for (const row of rows) {
+    expect(row.text.length).toBeGreaterThan(0);
+    expect(row.shown).toBe(true);
+  }
+});
+
 /**
  * The menu floats over the page, so it closes the ways a floating menu does.
  * It stayed open after Escape, after a press outside it and after going to
@@ -112,6 +145,39 @@ test.describe("on a wide screen", () => {
     await expect(page.getByRole("button", { name: "Open the product tour" })).toBeVisible();
     await expect(page.getByRole("button", { name: "Menu" })).toBeHidden();
   });
+});
+
+/**
+ * FAILS ON REVERT: a second chip ("Local only" in the technical view, "Open
+ * to the network" beside "Partly connected") wrapped the Community header to
+ * two rows at 1440, where the paid header is always one.
+ */
+test.describe("the header at a desk", () => {
+  test.use({ viewport: { width: 1440, height: 900 } });
+  const NOTICES: [string, Record<string, unknown>][] = [
+    ["plain", {}],
+    ["exposed", { exposed: true }],
+    ["installed", { active_defence_installed: true }],
+    ["update", { update_pending: true, update_note: "A newer InnerWarden is installed. Restart the dashboard to use it." }],
+  ];
+  for (const [name, patch] of NOTICES) {
+    for (const technical of [false, true]) {
+      test(`is one row: ${name}${technical ? ", technical view" : ""}`, async ({ page }) => {
+        const meta = JSON.parse(readFileSync(new URL("../fixtures/community/meta.json", import.meta.url), "utf8"));
+        await page.route("**/api/guard/meta", (route) => route.fulfill({ json: { ...meta, ...patch } }));
+        if (name === "plain") {
+          await page.route("**/api/guard/record-health", (route) => route.fulfill({ json: { recording: false, since_unix: 1_790_680_000, lost_actions: 3 } }));
+        }
+        await page.goto("/");
+        await expect(page.locator("header [data-meta-status]")).toHaveAttribute("data-meta-status", "ready");
+        if (technical) await page.getByRole("checkbox", { name: "Show technical detail" }).check();
+        await expect(page.locator("header [data-chip]")).toHaveCount(1);
+        const nav = await page.getByRole("navigation", { name: "Dashboard views" }).boundingBox();
+        const chip = await page.locator("header [data-chip]").boundingBox();
+        expect(Math.abs((chip!.y + chip!.height / 2) - (nav!.y + nav!.height / 2))).toBeLessThan(12);
+      });
+    }
+  }
 });
 
 // ─────────────────── the paid Protection screen on a phone ───────────────────

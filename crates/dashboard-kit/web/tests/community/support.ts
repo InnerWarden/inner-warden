@@ -21,9 +21,9 @@ export const S_INFRA = "7e0a55f1-demo-4000-8000-000000000002";
 /** Fixture cases, by what happened to them. */
 export const CASE = {
   /** `cat ~/.ssh/config` in monitor mode: a deny, recorded, and it ran. */
-  wouldRefuse: `cmd:${S_APP}:63`,
+  wouldRefuse: `cmd:${S_APP}:66`,
   /** `bash /tmp/build-cache/run.sh --clean`: a review, and it ran. */
-  flaggedRan: `cmd:${S_APP}:62`,
+  flaggedRan: `cmd:${S_APP}:64`,
   /** `curl ... | sh` in monitor mode: a fetch from the internet by name. */
   domainFetch: `cmd:${S_APP}:56`,
   /** `sudo rm -rf / --no-preserve-root` in enforce mode: refused. */
@@ -32,6 +32,10 @@ export const CASE = {
   unsafeRan: "cmd:mcp:cursor:1",
   /** `innerwarden check` by hand. */
   checked: "cmd:local:0",
+  /** The agent's own scratch script, under a folder named for its session. */
+  scratch: `cmd:${S_APP}:65`,
+  /** A command carrying a bidi override and a zero-width space. */
+  hidden: `cmd:${S_APP}:58`,
 } as const;
 
 export const META = {
@@ -78,7 +82,8 @@ export const NO_TOKEN_HISTORY = {
 
 /**
  * The overview a fresh install answers, as the CLI builds it: nothing
- * recorded, no agent connected, observe not installed.
+ * recorded, no agent connected, and no OpenClaw for `observe` to record
+ * through (so it offers no `observe install`).
  */
 export const ZERO_OVERVIEW = {
   sessions: 0,
@@ -110,11 +115,7 @@ export const ZERO_OVERVIEW = {
     agent_messages: {
       lane: "agent_messages",
       availability: "no_source",
-      sentence: "Nothing records what people ask your agent yet.",
-      next_step: {
-        command: "innerwarden observe install",
-        line: "Records the risky messages people send your agent. It does not block them.",
-      },
+      sentence: "Recording what people ask your agent needs OpenClaw, a chat gateway for agents. None is set up on this machine.",
     },
     server_attacks: {
       lane: "server_attacks",
@@ -122,7 +123,7 @@ export const ZERO_OVERVIEW = {
       sentence: "Community watches what your AI agents try to run. It does not watch this machine itself.",
     },
   },
-  record: { decisions: 0, flagged: 0 },
+  record: { decisions: 0, flagged: 0, checked: 0 },
 };
 
 export const EMPTY_DECISIONS = {
@@ -136,7 +137,7 @@ export const EMPTY_DECISIONS = {
   reasons_distinct: 0,
   sessions: {},
   suppress: { allow: 0, mute_rules: 0, mute_categories: 0 },
-  record: { decisions: 0, flagged: 0 },
+  record: { decisions: 0, flagged: 0, checked: 0 },
 };
 
 export const EMPTY_HISTORY = {

@@ -10,6 +10,13 @@ import { nameList, type AgentRow } from "./agentsView";
  * acts), on (slate: working as set up, watching, recording), needs you
  * (amber: a person has to do something) and off (the faint track: off by
  * choice is not a problem, and the ring says "off", never "missing").
+ *
+ * A screening control is ONE row over several agents, so its state is one
+ * word while its agents can differ: Tool-call screening is "needs you"
+ * because Codex is partly connected, while Cursor and Gemini CLI refuse. The
+ * control carries the agents that refuse (`refusingAgents`), so neither its
+ * line, nor its ladder, nor the ring's legend can say nothing refuses while
+ * something does.
  */
 export type ControlState = "refusing" | "on" | "needs" | "off";
 
@@ -22,22 +29,50 @@ export type Control = {
   state: ControlState | "none";
   /** One plain line on what it does here. */
   line: string;
-  /** A command the CLI or the product documents, and what it is for. */
-  command?: { label: string; command: string };
+  /**
+   * A command the CLI or the product documents, and what it is for. A
+   * `template` holds a `<placeholder>` to fill in: shown, never copied.
+   */
+  command?: { label: string; command: string; template?: boolean };
   /** The four-step ladder, for the two screening controls. */
   ladder?: Step[];
+  /** The agents this control refuses a deny for, whatever its one state says. */
+  refusingAgents?: string[];
 };
 
 const SEEN_WITHIN_MS = 24 * 3_600_000;
 
-function screeningLadder(rows: readonly AgentRow[], now: number): Step[] {
+function recent(at: string | undefined, now: number): boolean {
+  return at !== undefined && Number.isFinite(Date.parse(at)) && now - Date.parse(at) <= SEEN_WITHIN_MS;
+}
+
+/**
+ * The four steps of one screening control, per agent where they differ.
+ *
+ * "Seen working" reads the decision record, not only the agents that name
+ * themselves in it: a hook written before hooks named their agent still
+ * screens, and the channel's newest decision (`channelSeenAt`) says so.
+ */
+function screeningLadder(rows: readonly AgentRow[], channelSeenAt: string | undefined, now: number): Step[] {
   const connected = rows.some((row) => row.state === "refusing" || row.state === "watching" || row.state === "partial");
-  const refusing = rows.length > 0 && rows.every((row) => row.state === "refusing");
-  const seen = rows.some((row) => row.lastScreenedAt !== undefined && now - Date.parse(row.lastScreenedAt) <= SEEN_WITHIN_MS);
+  const refusing = rows.filter((row) => row.state === "refusing");
+  const others = rows.filter((row) => row.state !== "refusing");
+  const seen = recent(channelSeenAt, now) || rows.some((row) => recent(row.lastScreenedAt, now));
+  const everSeen = channelSeenAt !== undefined || rows.some((row) => row.lastScreenedAt !== undefined);
+  const refusingWords = refusing.length === 0
+    ? "watching only: nothing is refused"
+    : others.length === 0
+      ? "a deny is refused before it runs"
+      : `${nameList(refusing.map((row) => row.name))} ${refusing.length === 1 ? "refuses" : "refuse"} a deny; ${nameList(others.map((row) => row.name))} ${others.length === 1 ? "does" : "do"} not`;
   return [
     { key: "connected", label: "Connected", mark: connected ? "done" : "not_applicable", words: connected ? "the guard is wired in" : "no agent is connected" },
-    { key: "seen", label: "Seen working", mark: seen ? "done" : "unknown", words: seen ? "screened a command in the last 24 hours" : "not reported by this build" },
-    { key: "refusing", label: "Refusing", mark: refusing ? "done" : "not_applicable", words: refusing ? "a deny is refused before it runs" : "watching only: nothing is refused" },
+    {
+      key: "seen",
+      label: "Seen working",
+      mark: seen ? "done" : "unknown",
+      words: seen ? "screened in the last 24 hours" : everSeen ? "nothing screened in the last 24 hours" : "nothing screened yet",
+    },
+    { key: "refusing", label: "Refusing", mark: refusing.length > 0 ? "done" : "not_applicable", words: refusingWords },
     { key: "checked", label: "Checked after", mark: "unknown", words: "not checked by a second part of InnerWarden" },
   ];
 }
@@ -48,6 +83,7 @@ function screening(
   name: string,
   through: string,
   rows: readonly AgentRow[],
+  channelSeenAt: string | undefined,
   now: number,
 ): Control {
   // What the rows count as agents here: not one the guard cannot wire, and
@@ -60,36 +96,45 @@ function screening(
   const refusing = present.filter((row) => row.state === "refusing");
   const watching = present.filter((row) => row.state === "watching");
   const names = nameList(present.map((row) => row.name));
-  const behind = present.filter((row) => !row.needsYou);
   const firstNext = [...needs, ...watching, ...present].find((row) => row.next !== undefined)?.next;
   const command = firstNext === undefined ? undefined : { label: firstNext.label, command: firstNext.command };
+  const ladder = screeningLadder(present, channelSeenAt, now);
+  const refusingAgents = refusing.map((row) => row.name);
+  const refuses = (list: readonly AgentRow[]) => `${nameList(list.map((row) => row.name))} ${list.length === 1 ? "refuses" : "refuse"} a deny.`;
   if (needs.length > 0) {
     const who = nameList(needs.map((row) => row.name));
+    const notBehind = `${who} ${needs.length === 1 ? "is" : "are"} not fully behind the guard.`;
+    const rest = present.filter((row) => !row.needsYou && row.state !== "refusing");
+    const restWords = rest.length === 0 ? "" : ` ${nameList(rest.map((row) => row.name))} ${rest.length === 1 ? "watches" : "watch"} only.`;
     return {
       key, glyph, name,
       status: needs.every((row) => row.state === "partial") ? "Partly connected" : "Not connected",
       state: "needs",
-      line: `${who} ${needs.length === 1 ? "is" : "are"} not fully behind the guard.${behind.length === 0 ? "" : ` ${nameList(behind.map((row) => row.name))} ${behind.length === 1 ? "is" : "are"}.`}`,
+      line: `${refusing.length === 0 ? "" : `${refuses(refusing)} `}${notBehind}${restWords}`,
       ...(command === undefined ? {} : { command }),
-      ladder: screeningLadder(present, now),
+      ladder,
+      refusingAgents,
     };
   }
   if (refusing.length === present.length) {
-    return { key, glyph, name, status: "Refusing", state: "refusing", line: `${names}, ${through}. A deny is refused before it runs.`, ladder: screeningLadder(present, now) };
+    return { key, glyph, name, status: "Refusing", state: "refusing", line: `${names}, ${through}. A deny is refused before it runs.`, ladder, refusingAgents };
   }
   if (watching.length === present.length) {
     return {
       key, glyph, name, status: "Watching only", state: "on",
       line: `${names}, ${through}. Every command is recorded; none is refused.`,
       ...(command === undefined ? {} : { command }),
-      ladder: screeningLadder(present, now),
+      ladder,
+      refusingAgents,
     };
   }
+  const rest = present.filter((row) => row.state !== "refusing");
   return {
     key, glyph, name, status: "Some refuse", state: "on",
-    line: `${names}, ${through}. ${nameList(refusing.map((row) => row.name))} ${refusing.length === 1 ? "refuses" : "refuse"} a deny; the rest watch.`,
+    line: `${refuses(refusing)} ${nameList(rest.map((row) => row.name))} ${rest.length === 1 ? "watches" : "watch"} only.`,
     ...(command === undefined ? {} : { command }),
-    ladder: screeningLadder(present, now),
+    ladder,
+    refusingAgents,
   };
 }
 
@@ -99,7 +144,10 @@ export type ControlsInput = {
   health?: RecordHealth;
   record?: RecordSpan;
   sinceWords?: string;
+  /** `undefined` when the event log was not read: then no count is said. */
   messagesRecorded?: number;
+  /** The newest decision each channel screened, named or not (`screened_by_channel`). */
+  channelSeen?: { hook?: string; mcp?: string };
   now: number;
 };
 
@@ -110,8 +158,8 @@ export function communityControls(input: ControlsInput): Control[] {
   // screening, rather than left out of both.
   const unwired = (row: AgentRow) => row.mechanism === undefined && row.needsYou;
   const controls: Control[] = [
-    screening("command_screening", "prompt", "Command screening", "through its shell hook", agents.filter((row) => row.mechanism === "hook" || unwired(row)), now),
-    screening("tool_call_screening", "plug", "Tool-call screening", "through the MCP proxy", agents.filter((row) => row.mechanism === "mcp"), now),
+    screening("command_screening", "prompt", "Command screening", "through its shell hook", agents.filter((row) => row.mechanism === "hook" || unwired(row)), input.channelSeen?.hook, now),
+    screening("tool_call_screening", "plug", "Tool-call screening", "through the MCP proxy", agents.filter((row) => row.mechanism === "mcp"), input.channelSeen?.mcp, now),
   ];
   const recording = health?.recording ?? protection?.record.recording;
   controls.push({
@@ -134,21 +182,13 @@ export function communityControls(input: ControlsInput): Control[] {
       status: protection.jail.available ? "Ready" : "Not available here",
       state: protection.jail.available ? "on" : "off",
       line: protection.jail.available
-        ? "Runs an agent in a jail with the guard inside it, when you ask for one."
+        ? "Runs an agent in a jail when you ask for one, with the guard inside it for Claude Code; other agents get the walls."
         : "This machine has no sandbox the jail trusts.",
-      ...(protection.jail.available ? { command: { label: "To start one:", command: "innerwarden contain -- <command>" } } : {}),
+      ...(protection.jail.available
+        ? { command: { label: "To start one, with your agent's own command in place of <command>:", command: "innerwarden contain -- <command>", template: true } }
+        : {}),
     });
-    controls.push({
-      key: "messages",
-      glyph: "chat",
-      name: "Messages to your agent",
-      status: protection.observe.installed ? "Recording" : "Off",
-      state: protection.observe.installed ? "on" : "off",
-      line: protection.observe.installed
-        ? `${(input.messagesRecorded ?? 0).toLocaleString("en-GB")} recorded. Records the risky ones; it does not block them.`
-        : "Records the risky messages people send your agent. It does not block them.",
-      ...(protection.observe.installed ? {} : { command: { label: "To turn it on:", command: "innerwarden observe install" } }),
-    });
+    controls.push(messagesControl(protection, input.messagesRecorded));
     controls.push({
       key: "alerts",
       glyph: "bell",
@@ -169,7 +209,9 @@ export function communityControls(input: ControlsInput): Control[] {
       line: protection.secondOpinion.configured
         ? "Your own model is asked about commands the rules cannot settle."
         : "Asks your own model about commands the rules cannot settle.",
-      ...(protection.secondOpinion.configured ? {} : { command: { label: "To set it up:", command: "innerwarden llm set" } }),
+      ...(protection.secondOpinion.configured
+        ? {}
+        : { command: { label: "To set it up, with your model's address and name:", command: "innerwarden llm set --url <URL> --model <MODEL>", template: true } }),
     });
     const suppress = protection.suppress;
     const mutes = suppress.muteRules + suppress.muteCategories;
@@ -184,12 +226,54 @@ export function communityControls(input: ControlsInput): Control[] {
   return controls;
 }
 
+/**
+ * Messages to the agent. Recording them goes through an OpenClaw chat
+ * gateway: where there is none, `observe install` changes nothing and exits
+ * 1, so it is not offered, and the control is not counted as "off" in a ring
+ * that could never turn it on.
+ */
+function messagesControl(protection: Protection, recorded: number | undefined): Control {
+  const base = { key: "messages", glyph: "chat" as const, name: "Messages to your agent" };
+  if (protection.observe.installed) {
+    return {
+      ...base,
+      status: "Recording",
+      state: "on",
+      line: `${recorded === undefined ? "" : `${recorded.toLocaleString("en-GB")} recorded. `}Records the risky ones; it does not block them.`,
+    };
+  }
+  if (!protection.observe.available) {
+    return {
+      ...base,
+      status: "Needs OpenClaw",
+      state: "none",
+      line: "Needs OpenClaw: records the risky messages people send your agent through a chat gateway.",
+    };
+  }
+  return {
+    ...base,
+    status: "Off",
+    state: "off",
+    line: "Records the risky messages people send your agent through OpenClaw. It does not block them.",
+    command: { label: "To turn it on:", command: "innerwarden observe install" },
+  };
+}
+
 export type ControlCounts = Record<ControlState, number>;
 
 export function controlCounts(controls: readonly Control[]): ControlCounts {
   const counts: ControlCounts = { refusing: 0, on: 0, needs: 0, off: 0 };
   for (const control of controls) if (control.state !== "none") counts[control.state] += 1;
   return counts;
+}
+
+/**
+ * Whether some agent refuses a deny under a control whose one state is not
+ * "refusing": the ring's legend then says "Some refuse" rather than
+ * "0 Refusing" beside agents that refuse.
+ */
+export function someRefuse(controls: readonly Control[]): boolean {
+  return controls.some((control) => control.state !== "refusing" && (control.refusingAgents?.length ?? 0) > 0);
 }
 
 /** The ring's parts, in reading order, each with its count in its label. */

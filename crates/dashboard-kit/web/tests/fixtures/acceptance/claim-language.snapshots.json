@@ -3,9 +3,9 @@
     "edition": "Community",
     "title": "What is happening here",
     "description": "From this machine's own records.",
-    "hostBoundaryTitle": "Attacks on this server",
+    "hostBoundaryTitle": "Attacks on this machine",
     "hostBoundary": "Community watches what your AI agents try to run. It does not watch this machine itself.",
-    "hostBoundaryOffer": "Active Defence runs on Linux servers, where it adds the host sensor, an SSH decoy, and automatic response that blocks an attacker and checks the block held."
+    "hostBoundaryOffer": "21 flagged commands ran here since 25 Sept 2026: Community relies on your agent asking first. On a Linux server, Active Defence adds the kernel Execution Gate, and watches the server itself with the host sensor, an SSH decoy and automatic response."
   },
   "observe": {
     "edition": "Enterprise",

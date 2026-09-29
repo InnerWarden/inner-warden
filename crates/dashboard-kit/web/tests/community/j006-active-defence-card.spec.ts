@@ -33,9 +33,12 @@ test.describe("CJC-J006 the Active Defence card reads the host", () => {
     await page.goto("/");
     const offer = page.locator('[data-lane="server_attacks"] [data-ad-state="offer"]');
     await expect(offer).toBeVisible();
-    await expect(offer).toContainText("the host sensor, an SSH decoy, and automatic response");
+    // It leads with this machine's own count, then the one capability about the agent.
+    await expect(offer).toContainText("flagged commands ran here since 25 Sept 2026: Community relies on your agent asking first.");
+    await expect(offer).toContainText("the kernel Execution Gate, and watches the server itself with the host sensor, an SSH decoy and automatic response");
     // This fixture host is not Linux: the offer does not pretend it can run here.
-    await expect(offer).toContainText("Active Defence runs on Linux servers, where it adds");
+    await expect(offer).toContainText("On a Linux server, Active Defence adds");
+    await expect(offer).not.toContainText("would have");
     await expect(page.locator('[data-ad-state="offer"]')).toHaveCount(1);
     await expectHonestUpsell(page);
   });

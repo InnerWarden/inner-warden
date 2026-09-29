@@ -88,14 +88,16 @@ test.describe("CJC-090-J001 Community shell and posture", () => {
     await expect(status).not.toHaveText(/Open to the network/);
   });
 
-  test("says Local only in the technical view when the host says so, and nothing about it in the plain view", async ({ page }) => {
+  test("says Local only once, at the foot of the page, in the technical view, never as a second header chip", async ({ page }) => {
     await page.route(guardRoute("meta"), (route) => fulfillJson(route, META));
     await page.goto("/");
     const status = page.locator("header [data-meta-status]");
     await expect(status).toHaveAttribute("data-meta-status", "ready");
-    await expect(status).not.toHaveText(/Local only/);
+    await expect(page.locator("[data-local-only]")).toHaveCount(0);
     await page.getByRole("checkbox", { name: "Show technical detail" }).check();
-    await expect(status).toHaveText(/Local only/);
+    await expect(status).not.toHaveText(/Local only/);
+    await expect(status.locator("[data-chip]")).toHaveCount(1);
+    await expect(page.locator("[data-local-only]")).toHaveText(/Local only/);
   });
 
   test("opens each tab from its own address instead of falling back to Overview", async ({ page }) => {

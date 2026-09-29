@@ -3,6 +3,7 @@ import { MachineIntelligence } from "../components/MachineIntelligence";
 import { TechnicalOnly } from "../components/TechnicalDetail";
 import { When } from "../components/When";
 import { agentRows, type AgentRow } from "./agentsView";
+import { readUnnamedByChannel } from "./api";
 import { CARD, Chip, CopyCommand, PageHeader, Skeleton, StaleLine, Unreadable, type ChipTone } from "./parts";
 import { usePolled } from "./poll";
 import { STATE_WORDS, type AgentState } from "./words";
@@ -36,6 +37,23 @@ function rowLine(row: AgentRow): string | undefined {
   return undefined;
 }
 
+const CONNECTED: readonly AgentRow["state"][] = ["refusing", "watching", "partial"];
+
+/**
+ * When the guard last screened something for this agent, by what it screens
+ * (a shell hook screens commands, the MCP proxy tool calls), or that nothing
+ * has been screened yet. Said only from facts: "nothing yet" only where the
+ * channel holds no decision that names nobody (`unnamed`), since such a
+ * decision could be this agent's; otherwise no line.
+ */
+export function screenedLine(row: AgentRow, unnamed: { hook?: string; mcp?: string } | undefined): { at?: string; words: string } | undefined {
+  if (!CONNECTED.includes(row.state) || row.mechanism === undefined) return undefined;
+  const thing = row.mechanism === "mcp" ? "tool call" : "command";
+  if (row.lastScreenedAt !== undefined) return { at: row.lastScreenedAt, words: `Last screened a ${thing}` };
+  if (unnamed !== undefined && unnamed[row.mechanism] === undefined) return { words: `No ${thing} screened yet.` };
+  return undefined;
+}
+
 /**
  * Community's Agents: one row per AI agent on this machine, whether the guard
  * is in front of it, and the one command (the CLI's, printed as sent) that
@@ -45,6 +63,7 @@ export function CommunityAgents() {
   const agents = usePolled(fetchAgents, AGENTS_PAGE_POLL_MS, "agents");
   const rows = agentRows(agents.data);
   const auto = autoConnectLine(agents.data);
+  const unnamed = readUnnamedByChannel(agents.data);
   return (
     <div className="min-w-0 space-y-5" data-tour="agents">
       <PageHeader
@@ -83,18 +102,27 @@ export function CommunityAgents() {
                 <div className="min-w-0 flex-1">
                   <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
                     <Chip tone={row.state === "not_connected" && !row.needsYou ? "off" : STATE_TONE[row.state]} label={STATE_WORDS[row.state]} />
-                    {row.lastScreenedAt === undefined ? null : (
-                      <span className="text-xs text-slate-600">Last screened a command <When at={row.lastScreenedAt} relative /></span>
-                    )}
+                    {(() => {
+                      const screened = screenedLine(row, unnamed);
+                      if (screened === undefined) return null;
+                      return (
+                        <span data-screened className="text-xs text-slate-600">
+                          {screened.words}
+                          {screened.at === undefined ? null : <> <When at={screened.at} relative /></>}
+                        </span>
+                      );
+                    })()}
                     {row.running === true ? <span className="text-xs text-slate-600">Running now</span> : null}
                   </div>
                   {rowLine(row) === undefined ? null : <p className="mt-1 text-sm leading-6 text-slate-600">{rowLine(row)}</p>}
-                  {row.next === undefined ? null : (
-                    <div className="mt-2 max-w-xl">
-                      <p className="text-xs font-semibold text-slate-700">{row.next.label}</p>
-                      <CopyCommand command={row.next.command} className="mt-1" />
-                      <p className="mt-1 text-xs leading-5 text-slate-600">{row.next.line}</p>
-                    </div>
+                  {[row.next, row.identity].map((step) =>
+                    step === undefined ? null : (
+                      <div key={step.command} className="mt-2 max-w-xl">
+                        <p className="text-xs font-semibold text-slate-700">{step.label}</p>
+                        <CopyCommand command={step.command} className="mt-1" />
+                        <p className="mt-1 text-xs leading-5 text-slate-600">{step.line}</p>
+                      </div>
+                    ),
                   )}
                 </div>
               </li>
@@ -108,7 +136,7 @@ export function CommunityAgents() {
         </section>
       )}
       <TechnicalOnly>
-        <MachineIntelligence edition="community" showAgents showTokens={false} />
+        <MachineIntelligence edition="community" showAgents showTokens={false} tones="neutral" />
       </TechnicalOnly>
     </div>
   );

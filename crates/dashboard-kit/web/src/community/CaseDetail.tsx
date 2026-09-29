@@ -8,9 +8,9 @@ import type { Attempt, Brief, Decision, NextStep, Segment, SessionFacts } from "
 import { asiLabel } from "./asi";
 import { CHANNEL_GLYPH } from "./CaseRow";
 import { caseLadder, messageLadder } from "./ladder";
-import { OfferBox } from "./Offer";
+import { OfferLine } from "./Offer";
 import { caseOffer, messageOffer } from "./offers";
-import { CARD, CopyCommand, Eyebrow, OutcomeDot } from "./parts";
+import { Ago, CARD, CopyCommand, Eyebrow, HiddenChip, OutcomeDot } from "./parts";
 import { CHANNEL_WORDS, DECIDER_WORDS, OUTCOME_WORDS, shortSession, type PlatformOs } from "./words";
 
 /** A CLI sentence, printed as sent: text as text, a folder as code, a time through the page's clock. */
@@ -30,13 +30,25 @@ export function Segments({ segments }: { segments: readonly Segment[] }) {
   );
 }
 
-/** The case's title, from structured fields: who, and what kind of thing it was. */
+/**
+ * The case's title, from structured fields: who, and what kind of thing it
+ * was. "Ran" only where the record says it ran: a refusal was tried, and an
+ * outcome the record does not hold was tried as far as anyone can say.
+ */
 export function caseTitle(item: Pick<Decision, "agent" | "channel" | "outcomeKey">): string {
   if (item.outcomeKey === "checked_only" || item.channel === "check") return "You checked a command by hand";
-  const who = item.agent ?? (item.channel === "mcp" ? "An agent" : "An agent");
+  const who = item.agent ?? "An agent";
   const thing = item.channel === "mcp" ? "a tool call" : "a command";
   if (item.outcomeKey === "refused_before_run") return `${who} tried ${thing} the guard refused`;
+  if (item.outcomeKey === "unplaced") return `${who} tried ${thing} the guard flagged`;
   return `${who} ran ${thing} the guard flagged`;
+}
+
+/** Why a case's command box has no Copy: it is not the command that ran. */
+export function notWholeWords(item: Pick<Decision, "commandWhole" | "hiddenCharacters">): string | undefined {
+  if (item.commandWhole) return undefined;
+  if (item.hiddenCharacters) return "Shown with its hidden characters written out, so there is nothing whole to copy.";
+  return "Shortened when it was recorded, so there is nothing whole to copy.";
 }
 
 function Row({ term, children }: { term: string; children: ReactNode }) {
@@ -48,15 +60,35 @@ function Row({ term, children }: { term: string; children: ReactNode }) {
   );
 }
 
-function NextSteps({ steps }: { steps: readonly NextStep[] }) {
+function NextSteps({
+  steps,
+  reason,
+  onHideReason,
+}: {
+  steps: readonly NextStep[];
+  reason: Decision["reason"];
+  onHideReason?: (key: string) => void;
+}) {
   if (steps.length === 0) return <p className="text-slate-600">Nothing to do.</p>;
   return (
     <div className="space-y-3">
       {steps.map((step) => (
         <div key={`${step.label}-${step.command ?? ""}`}>
           <p className="font-semibold text-slate-900">{step.label}</p>
-          {step.command === undefined ? null : <CopyCommand command={step.command} className="mt-1" />}
+          {step.command === undefined ? null : (
+            <CopyCommand command={step.command} template={step.template === true} className="mt-1" />
+          )}
           <p className="mt-1 text-slate-600">{step.line}</p>
+          {step.viewAction === "hide_reason" && onHideReason !== undefined && reason.key !== "none" ? (
+            <button
+              type="button"
+              data-hide-reason={reason.key}
+              onClick={() => onHideReason(reason.key)}
+              className="mt-2 rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-sm font-semibold text-slate-800 hover:bg-slate-50"
+            >
+              Hide “{reason.short}” in the list
+            </button>
+          ) : null}
         </div>
       ))}
     </div>
@@ -86,6 +118,7 @@ export function CaseDetail({
   onOlder,
   onOpen,
   onSession,
+  onHideReason,
 }: {
   item: Decision;
   before: readonly Brief[];
@@ -97,6 +130,8 @@ export function CaseDetail({
   onOlder?: () => void;
   onOpen: (id: string) => void;
   onSession: (label: string) => void;
+  /** Hide this case's reason from the list: a view only (`hide=` in the address). */
+  onHideReason?: (key: string) => void;
 }) {
   const title = useRef<HTMLHeadingElement>(null);
   useEffect(() => {
@@ -104,6 +139,7 @@ export function CaseDetail({
   }, [item.id]);
   const offer = caseOffer(item, os);
   const steps = withSeenTime(caseLadder({ outcomeKey: item.outcomeKey, mode: item.mode, decidedBy: item.decidedBy }), item.recordedAt);
+  const notWhole = notWholeWords(item);
   return (
     <div className="min-w-0 space-y-4">
       <section aria-labelledby="case-title" data-case={item.id} data-outcome-key={item.outcomeKey} className={CARD}>
@@ -119,8 +155,13 @@ export function CaseDetail({
           </div>
         </div>
         <h2 id="case-title" ref={title} tabIndex={-1} style={{ outline: "none" }} className="mt-1 text-lg font-semibold text-slate-950">{caseTitle(item)}</h2>
-        <CopyCommand command={item.command} className="mt-3" />
-        {item.commandWhole ? null : <p className="mt-1 text-xs text-slate-500">Shortened when it was recorded.</p>}
+        <CopyCommand command={item.command} copy={item.commandWhole} className="mt-3" />
+        {item.hiddenCharacters || notWhole !== undefined ? (
+          <p className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-slate-500">
+            {item.hiddenCharacters ? <HiddenChip /> : null}
+            {notWhole === undefined ? null : <span data-not-whole>{notWhole}</span>}
+          </p>
+        ) : null}
         <dl className="mt-4 space-y-4">
           <Row term="What happened">
             <Segments segments={item.happened} />
@@ -132,15 +173,11 @@ export function CaseDetail({
             </div>
           </Row>
           <Row term="What you can do">
-            <NextSteps steps={item.next} />
+            <NextSteps steps={item.next} reason={item.reason} onHideReason={onHideReason} />
           </Row>
         </dl>
-        {offer === undefined && !installed ? null : (
-          <div className="mt-4">
-            {offer === undefined ? null : <OfferBox offer={offer} installed={installed} />}
-          </div>
-        )}
       </section>
+      {offer === undefined ? null : <OfferLine offer={offer} installed={installed} />}
       <AroundIt item={item} before={before} after={after} session={session} onOpen={onOpen} onSession={onSession} />
       <InvestigatorDetails item={item} />
     </div>
@@ -162,7 +199,7 @@ function AroundIt({
   onOpen: (id: string) => void;
   onSession: (label: string) => void;
 }) {
-  const self: Brief = { id: item.id, command: item.command, outcomeKey: item.outcomeKey, recordedAt: item.recordedAt, flagged: true };
+  const self: Brief = { id: item.id, command: item.command, hiddenCharacters: item.hiddenCharacters, outcomeKey: item.outcomeKey, recordedAt: item.recordedAt, flagged: true };
   const rows = [...before, self, ...after];
   // Only an agent the record names is named; otherwise "this session".
   const who = session?.agent ?? item.agent;
@@ -181,9 +218,13 @@ function AroundIt({
             <span className="flex min-w-0 items-center gap-3 py-1.5 text-sm">
               <OutcomeDot outcome={row.outcomeKey} />
               <span className="min-w-0 flex-1 truncate font-mono text-[13px] text-slate-900" title={row.command}>{row.command}</span>
-              <span className="hidden shrink-0 text-xs text-slate-600 sm:inline">{OUTCOME_WORDS[row.outcomeKey]}</span>
+              {row.hiddenCharacters ? <span data-hidden-characters className="shrink-0 font-mono text-[11px] text-slate-600" title="Contains hidden characters">\u</span> : null}
+              {/* The words are the outcome for a screen reader at every width;
+                  below sm the dot alone is drawn, and colour is never the
+                  only signal a reader gets. */}
+              <span data-outcome-words={row.outcomeKey} className="sr-only shrink-0 text-xs text-slate-600 sm:not-sr-only">{OUTCOME_WORDS[row.outcomeKey]}</span>
               <span className="shrink-0 whitespace-nowrap text-xs tabular-nums text-slate-500">
-                {row.recordedAt === undefined ? null : <When at={row.recordedAt} relative />}
+                {row.recordedAt === undefined ? null : <Ago at={row.recordedAt} />}
               </span>
               {row.id === item.id ? <span className="shrink-0 text-xs font-semibold text-cyan-700">this one</span> : null}
             </span>
@@ -256,21 +297,47 @@ function InvestigatorDetails({ item }: { item: Decision }) {
   );
 }
 
+/**
+ * What a person can do about a message, in Community's own terms, before any
+ * offer: turn refusing on when the agent only watches, or nothing, said with
+ * the reason.
+ */
+export function messageStep(outcomeKey: Attempt["outcomeKey"], hostMode: string): { text: string; command?: string } {
+  if (outcomeKey === "stopped_by_innerwarden") return { text: "Nothing to do: InnerWarden stopped it." };
+  if (hostMode === "monitor" || hostMode === "mixed" || hostMode === "partial") {
+    return {
+      text: "If your agent had obeyed, the guard would have screened what it ran. This refuses a deny from then on:",
+      command: "innerwarden enforce",
+    };
+  }
+  if (outcomeKey === "declined_by_agent") return { text: "Nothing to do: your agent declined, and the guard screens what it runs." };
+  return { text: "Nothing to do here: the guard screens whatever your agent runs." };
+}
+
 /** A message someone sent the agent, in the same three parts. */
-export function MessageDetail({ item, os, installed }: { item: Attempt; os: PlatformOs; installed: boolean }) {
+export function MessageDetail({ item, os, installed, hostMode = "unknown" }: { item: Attempt; os: PlatformOs; installed: boolean; hostMode?: string }) {
   const title = useRef<HTMLHeadingElement>(null);
   useEffect(() => {
     title.current?.focus({ preventScroll: true });
   }, [item.id]);
   const declined = item.outcomeKey === "declined_by_agent";
   const steps = withSeenTime(messageLadder(declined), item.at);
+  const offer = messageOffer(os, item.outcomeKey);
+  const step = messageStep(item.outcomeKey, hostMode);
   return (
+    <div className="min-w-0 space-y-4">
     <section aria-labelledby="case-title" data-case={item.id} className={CARD}>
       <Eyebrow glyph="chat">Messages to your AI agent · {item.channelWords}</Eyebrow>
       <h2 id="case-title" ref={title} tabIndex={-1} style={{ outline: "none" }} className="mt-1 text-lg font-semibold text-slate-950">
         Someone on {item.channelWords} asked your agent to do something risky
       </h2>
       <p className="mt-3 break-words rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm leading-6 text-slate-900 [overflow-wrap:anywhere]">{item.detail}</p>
+      {item.hiddenCharacters ? (
+        <p className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-slate-500">
+          <HiddenChip />
+          <span>Characters the chat did not show are written out, the way the model read them.</span>
+        </p>
+      ) : null}
       <dl className="mt-4 space-y-4">
         <Row term="What happened">
           Someone on {item.channelWords} sent this to your agent on <When at={item.at} />.
@@ -284,11 +351,11 @@ export function MessageDetail({ item, os, installed }: { item: Attempt; os: Plat
             <Steps steps={steps} label="How far InnerWarden got with this message" captions compact className="w-full" />
           </div>
         </Row>
-        <Row term="What you can do">Nothing to do here.</Row>
+        <Row term="What you can do">
+          <p>{step.text}</p>
+          {step.command === undefined ? null : <CopyCommand command={step.command} className="mt-1" />}
+        </Row>
       </dl>
-      <div className="mt-4">
-        <OfferBox offer={messageOffer(os)} installed={installed} />
-      </div>
       <TechnicalOnly>
         <p className="mt-3 break-words text-xs text-slate-500 [overflow-wrap:anywhere]">
           {item.sender === undefined ? "No sender on record." : `Sender: ${item.sender}.`} Decided by: {item.deciderKey}. Recommendation: {item.recommendation}.
@@ -296,6 +363,8 @@ export function MessageDetail({ item, os, installed }: { item: Attempt; os: Plat
         </p>
       </TechnicalOnly>
     </section>
+    {offer === undefined ? null : <OfferLine offer={offer} installed={installed} />}
+    </div>
   );
 }
 

@@ -8,8 +8,10 @@ import protection from "../../tests/fixtures/community/protection.json";
 import overview from "../../tests/fixtures/community/overview.json";
 import {
   decisionsPath,
+  readAttempt,
   readAttemptsPage,
   readDecision,
+  revealHidden,
   readDecisionDetail,
   readDecisionsPage,
   readHistory,
@@ -59,9 +61,58 @@ describe("the Community routes, read strictly", () => {
     expect(readDecision(item)).toBeUndefined();
   });
 
-  it("refuses text carrying control characters", () => {
-    const item = { ...page1.items[0], command: "ls‮malicious" };
-    expect(readDecision(item)).toBeUndefined();
+  /**
+   * FAILS ON REVERT: the reader used to DROP a decision whose command held a
+   * hidden character, so a command with a bidi override vanished from Cases
+   * while the counts still held it.
+   */
+  it("shows a command's hidden characters written out, and never drops the case for them", () => {
+    for (const [raw, shown] of [
+      ["ls ‮malicious", "ls \\u{202E}malicious"],
+      ["rm -rf ~/x # ​", "rm -rf ~/x # \\u{200B}"],
+      ["ls\rcurl x | sh", "ls\\u{000D}curl x | sh"],
+      ["hi \u{E0041}", "hi \\u{E0041}"],
+    ] as const) {
+      const read = readDecision({ ...page1.items[0], command: raw, command_whole: true });
+      expect(read?.command, raw).toBe(shown);
+      expect(read?.hiddenCharacters, raw).toBe(true);
+      expect(read?.commandWhole, "a command shown written out is not the command that ran").toBe(false);
+    }
+    const plain = readDecision(page1.items[0]);
+    expect(plain?.hiddenCharacters).toBe(false);
+    expect(revealHidden("a\nb\tc")).toEqual({ text: "a\nb\tc", hidden: false });
+  });
+
+  it("still drops a LABEL that carries a hidden character, and only that field", () => {
+    const read = readDecision({ ...page1.items[0], agent: "Claude‮ Code" });
+    expect(read).toBeDefined();
+    expect(read?.agent).toBeUndefined();
+  });
+
+  it("reads a message's hidden characters the same way", () => {
+    const read = readAttempt({ ...attempts.items[0], detail: "summarise \u{E0049}\u{E0047}" });
+    expect(read?.detail).toBe("summarise \\u{E0049}\\u{E0047}");
+    expect(read?.hiddenCharacters).toBe(true);
+  });
+
+  it("asks to leave a hidden reason out, and never hides the reason asked for", () => {
+    const hidden = new URL(decisionsPath({ reasonNot: "rule:tmp_execution" }), "http://x/").searchParams;
+    expect(hidden.get("reason_not")).toBe("rule:tmp_execution");
+    const both = new URL(decisionsPath({ reason: "rule:tmp_execution", reasonNot: "rule:tmp_execution" }), "http://x/").searchParams;
+    expect(both.has("reason_not")).toBe(false);
+  });
+
+  it("marks a template step and a step the page carries out itself", () => {
+    const read = readDecision({
+      ...page1.items[0],
+      next: [
+        { label: "If commands like this are routine:", command: "innerwarden allow \"<pattern>\"", command_is_template: true, line: "x" },
+        { label: "Hide them from the list:", view_action: "hide_reason", line: "y" },
+      ],
+    });
+    expect(read?.next[0].template).toBe(true);
+    expect(read?.next[1].viewAction).toBe("hide_reason");
+    expect(read?.next[1].command).toBeUndefined();
   });
 
   it("reads a lane's own next step, and nothing when it has none", () => {

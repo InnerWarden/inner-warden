@@ -52,7 +52,9 @@ export function caseLadder(input: LadderInput, seenCaption?: string): Step[] {
     : { mark: "not_applicable", words: "nothing to check" };
   return [
     { key: "seen", label: "Seen", mark: "done", words: "on record", ...(seenCaption === undefined ? {} : { caption: seenCaption, captionWords: seenCaption }) },
-    { key: "decided", label: "Decided", mark: "done", words: decider === undefined ? "decided" : `decided by ${decider}`, caption: "+0 s" },
+    // No caption: the record keeps one time per decision, so a "+0 s" here
+    // would be a constant dressed as a measurement.
+    { key: "decided", label: "Decided", mark: "done", words: decider === undefined ? "decided" : `decided by ${decider}` },
     { key: "enforced", label: "Enforced", mark: enforce.mark, words: enforce.words, ...(enforce.caption === undefined ? {} : { caption: enforce.caption, captionWords: enforce.caption }) },
     { key: "verified", label: "Verified", mark: verified.mark, words: verified.words, ...(verified.caption === undefined ? {} : { caption: verified.caption, captionWords: verified.caption }) },
   ];

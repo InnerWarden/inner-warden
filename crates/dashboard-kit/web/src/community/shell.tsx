@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
 import { PROTECTION_LABEL, type CommunityScreenContext, type CommunityShell } from "../App";
+import { TechnicalOnly } from "../components/TechnicalDetail";
 import { CommunityAgents } from "./Agents";
 import { CommunityCases } from "./Cases";
 import { HeaderStatus } from "./HeaderStatus";
@@ -8,12 +9,23 @@ import { CommunityOverview } from "./Overview";
 import { CommunityProtection } from "./Protection";
 import { CommunityTokens } from "./Tokens";
 
-/** Every Community page: the notices first, then the page. */
+/**
+ * Every Community page: the notices first, then the page, then (technical
+ * view) whether this dashboard answers only on this machine, which used to be
+ * a second header chip.
+ */
 function Page({ context, children }: { context: CommunityScreenContext; children: ReactNode }) {
   return (
     <div className="min-w-0 space-y-6">
       <PageNotices meta={context.meta} />
       {children}
+      {context.meta?.exposed === false ? (
+        <TechnicalOnly>
+          <p data-local-only className="border-t border-slate-200 pt-4 text-xs text-slate-500">
+            Local only: this dashboard answers on this machine and nowhere else.
+          </p>
+        </TechnicalOnly>
+      ) : null}
     </div>
   );
 }
