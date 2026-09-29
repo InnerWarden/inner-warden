@@ -104,8 +104,8 @@ export type Headline = {
  * Where to go to see the actions the agent guardrail flagged for review, named
  * by a control that exists on the product the reader is looking at.
  *
- * - `activity` (Community): the Activity tab, and its "Needs review" verdict
- *   filter, which lists exactly these.
+ * - `activity` (Community): the Cases tab (the `activity` route), which
+ *   lists every flagged command, one case each.
  * - `cases` (Enterprise with a Cases screen): there is no Activity tab. The
  *   guardrail's verdicts sit inside the agent-session cases, which the
  *   Capability filter's "The agent guardrail" option narrows to. The Cases
@@ -123,7 +123,9 @@ export function reviewRemedy(
   where: HeadlineInput["reviewListedIn"],
   recentShowsDecisions: boolean,
 ): string {
-  if (where === "activity") return "Open Activity and filter by Needs review.";
+  // Community's `activity` route is its Cases screen: one case per flagged
+  // command, with what the reader can do about each.
+  if (where === "activity") return "Open Cases: every command the guard flagged is there, with what you can do about it.";
   if (where === "lane") {
     return "These are the agent guardrail's verdicts, not host cases. View all in Cases opens them under "
       + "What your AI agent did.";
@@ -143,11 +145,11 @@ export function reviewRemedy(
  * Where to look when the host reports no outcome for its verdicts.
  *
  * The paid screen that says what each control is doing is the Protection tab
- * (the `posture` route, renamed on the paid shell). Community's sentence is
- * left exactly as it was.
+ * (the `posture` route, renamed on the paid shell). Community's tab for the
+ * same route says what Community covers here.
  */
 export function outcomeNotRecordedNext(where: HeadlineInput["reviewListedIn"]): string {
-  if (where === "activity") return "This host reports no outcome for its verdicts. Open Posture to see what each control is doing.";
+  if (where === "activity") return "This host reports no outcome for its verdicts. Open Protection to see what Community covers here.";
   return "This host reports no outcome for its verdicts. Open Protection to see what each control is doing.";
 }
 

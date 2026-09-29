@@ -3,7 +3,6 @@ import { describe, expect, it } from "vitest";
 
 import { deriveShellNavigation } from "../App";
 import type { DashboardBootstrap } from "../api/v1";
-import { VERDICTS } from "../screens/Activity";
 import { decisionRecordCta } from "../screens/Home";
 import casesBootstrap from "../../tests/fixtures/enterprise/cases-bootstrap.json";
 import { CaseFilters, EMPTY_CASE_VIEW } from "./CaseFilters";
@@ -63,15 +62,15 @@ function optionsOf(markup: string, label: string): string {
 }
 
 describe("the review remedy names a control the reader has", () => {
-  it("sends Community to Activity and the verdict filter that lists exactly these", () => {
+  it("sends Community to its Cases tab, which lists every flagged command", () => {
     const where = decisionRecordCta("community", false).kind;
     const next = headline({ ...queued, reviewListedIn: where }).next ?? "";
 
-    // The tab and the button it names both exist on Community.
-    expect(tabLabels(deriveShellNavigation(undefined, "community"))).toContain("Activity");
-    expect(VERDICTS.find(([value]) => value === "review")?.[1]).toBe("Needs review");
-    expect(next).toContain("Open Activity");
-    expect(next).toContain("Needs review");
+    // The tab it names is the one the Community shell offers for the route.
+    const community = deriveShellNavigation(undefined, "community", [], [{ route: "activity", label: "Cases" }]);
+    expect(tabLabels(community)).toContain("Cases");
+    expect(next).toContain("Open Cases");
+    expect(next).not.toContain("Activity");
   });
 
   it("never sends Enterprise to Activity, which its shell does not offer", () => {
