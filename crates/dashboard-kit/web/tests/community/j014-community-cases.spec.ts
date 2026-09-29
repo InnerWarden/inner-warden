@@ -38,11 +38,14 @@ for (const [name, id] of [
 ] as const) {
   test(`what you can do is on the first screen for ${name} case`, async ({ page }) => {
     const card = await openCase(page, id);
-    const answer = card.locator("dt").filter({ hasText: "What you can do" });
+    const answer = card.locator("dl > div").filter({ has: page.locator("dt", { hasText: "What you can do" }) }).locator("dd");
     await expect(answer).toBeVisible();
-    const box = await answer.boundingBox();
+    // Its first line sits on the first screen with room below it for the
+    // command. Measured against the screen, not a pixel row: the same page
+    // lays out about 60 px taller with Linux fonts than with macOS ones.
+    const box = await answer.locator("p").first().boundingBox();
     expect(box).not.toBeNull();
-    expect(box!.y).toBeLessThanOrEqual(600);
+    expect(box!.y + box!.height).toBeLessThanOrEqual(900 - 100);
   });
 }
 
