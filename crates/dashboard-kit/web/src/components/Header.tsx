@@ -110,7 +110,9 @@ export function Header<Route extends string>({
 
         {navigation.length > 0 ? (
           <nav
-            className="order-3 flex w-full gap-1 border-t border-slate-100 pt-2 sm:order-none sm:w-auto sm:border-0 sm:pt-0"
+            // Wraps to a second line on a narrow screen rather than pushing the
+            // page sideways: five tabs do not fit in 320 px on one.
+            className="order-3 flex w-full flex-wrap gap-1 gap-y-1 border-t border-slate-100 pt-2 sm:order-none sm:w-auto sm:border-0 sm:pt-0"
             aria-label="Dashboard views"
             data-tour="nav"
           >

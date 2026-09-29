@@ -1,6 +1,8 @@
+import type { ReactNode } from "react";
 import type { CaseLane, CaseListWindow } from "../api/cases";
 import { LANE_COPY, LANE_WINDOW_PHRASE, laneCountNoun, latestCaseWindow, type LaneCard, type LanePart } from "../lanes";
-import { formatCount } from "../presentation";
+import { formatCount, formatDay } from "../presentation";
+import { countWords } from "../readCount";
 import { windowWords } from "../windows";
 import { When } from "./When";
 import { gridColumnsClass, gridSpanClass, joinClasses } from "./cardGrid";
@@ -26,6 +28,11 @@ const OUTCOME_TONES: Record<string, OutcomeTone> = {
   held_for_review: { tone: "other", hatched: true },
   unplaced: { tone: "other", hatched: true },
   allowed: { tone: "watchLight" },
+  // Community's own two: a flagged command that ran (the rules asked for a
+  // review, or monitor mode only watched), and a command a person checked by
+  // hand, which ran nothing.
+  flagged_ran: { tone: "other" },
+  checked_only: { tone: "watchLight" },
   // Messages to the agent (the paid host's messages card).
   stopped_by_innerwarden: { tone: "accent" },
   declined_by_agent: { tone: "watch" },
@@ -155,8 +162,24 @@ export function LaneCards({
   onOpenLane,
   onOpenCase,
   onOpenActivity,
+  intro,
+  linkLabel,
+  footer,
+  align,
 }: {
   cards: LaneCard[];
+  /** The line under the heading, in place of `lanesIntro`. Absent: `lanesIntro`. */
+  intro?: string;
+  /** A card's link words, in place of the lane's own (`LANE_COPY`). Absent, or `undefined` for a lane: the lane's own. */
+  linkLabel?: (lane: CaseLane) => string | undefined;
+  /** Drawn at a card's foot, above its link row. Absent: nothing. */
+  footer?: (card: LaneCard) => ReactNode;
+  /**
+   * "start": each card keeps its own height, for a row where one card holds
+   * much more than another (a card with nothing to count beside a full one
+   * would otherwise stretch into an empty box). Absent: the cards stretch.
+   */
+  align?: "start";
   edition?: "community" | "enterprise";
   onOpenLane?: (lane: CaseLane, options: LaneOpenOptions) => void;
   /**
@@ -179,9 +202,9 @@ export function LaneCards({
         What is happening here
       </h1>
       <p className="mt-2 max-w-3xl text-sm leading-6 text-slate-600">
-        {lanesIntro(cards, everyCardLeads)}
+        {intro ?? lanesIntro(cards, everyCardLeads)}
       </p>
-      <div className={joinClasses("mt-5 grid gap-4", gridColumnsClass("trio", cards.length))}>
+      <div className={joinClasses("mt-5 grid gap-4", gridColumnsClass("trio", cards.length), align === "start" && "items-start")}>
         {cards.map((card, index) => (
           <LaneCardView
             key={card.lane}
@@ -191,6 +214,8 @@ export function LaneCards({
             onOpenLane={onOpenLane}
             onOpenCase={onOpenCase}
             onOpenActivity={onOpenActivity}
+            linkWords={linkLabel?.(card.lane)}
+            footer={footer?.(card)}
           />
         ))}
       </div>
@@ -205,6 +230,8 @@ function LaneCardView({
   onOpenLane,
   onOpenCase,
   onOpenActivity,
+  linkWords,
+  footer,
 }: {
   card: LaneCard;
   spanClass: string;
@@ -212,13 +239,20 @@ function LaneCardView({
   onOpenLane?: (lane: CaseLane, options: LaneOpenOptions) => void;
   onOpenCase?: (caseId: string, lane: CaseLane, window: CaseListWindow) => void;
   onOpenActivity?: () => void;
+  linkWords?: string;
+  footer?: ReactNode;
 }) {
   const copy = LANE_COPY[card.lane];
   const titleId = `lane-${card.lane}-title`;
   const available = card.state === "available";
   const waiting = available ? card.waiting ?? 0 : 0;
+  // A capped read's waiting count is a floor: "At least 4 waiting on you".
+  const waitingWords = available ? countWords(waiting, card.waitingComplete !== false, "floor", "sentence") : "";
   const latest = available ? card.latest : undefined;
   const noun = available ? laneCountNoun(card.countOf, card.count) : undefined;
+  // The record starts inside the window: the count covers "since" that day.
+  const since = available && card.since !== undefined ? formatDay(card.since) : undefined;
+  const span = available ? (since === undefined ? LANE_WINDOW_PHRASE[card.window] : `since ${since}`) : "";
   const split = available && card.breakdown !== undefined && card.breakdown.some((part) => part.count > 0);
   const open = () => {
     if (link === "cases" && available) onOpenLane?.(card.lane, { window: card.window });
@@ -240,7 +274,7 @@ function LaneCardView({
               screen reader and in copied text; the flex gap draws it. */}
           {" "}
           <span className="text-xs text-slate-500">
-            {noun === undefined ? LANE_WINDOW_PHRASE[card.window] : `${noun} ${LANE_WINDOW_PHRASE[card.window]}`}
+            {noun === undefined ? span : `${noun} ${span}`}
           </span>
         </p>
       ) : null}
@@ -284,6 +318,7 @@ function LaneCardView({
           </span>
         </p>
       ) : null}
+      {footer === undefined || footer === null ? null : <div className="mt-4">{footer}</div>}
       {(waiting > 0 || (link !== "none" && available)) && (
         <div className="mt-auto flex flex-wrap items-center gap-x-4 gap-y-2 pt-4">
           {waiting > 0 ? (
@@ -296,17 +331,17 @@ function LaneCardView({
                 onClick={() => available && onOpenLane?.(card.lane, { window: card.window, status: "waiting" })}
                 className="rounded-full border border-amber-200 bg-amber-50 px-3 py-1 text-xs font-semibold text-amber-900 hover:border-amber-300 hover:bg-amber-100"
               >
-                {formatCount(waiting)} waiting on you <span aria-hidden="true">→</span>
+                {waitingWords} waiting on you <span aria-hidden="true">→</span>
               </button>
             ) : (
               <span className="rounded-full border border-amber-200 bg-amber-50 px-3 py-1 text-xs font-semibold text-amber-900">
-                {formatCount(waiting)} waiting on you
+                {waitingWords} waiting on you
               </span>
             )
           ) : null}
           {link !== "none" && available ? (
             <button type="button" onClick={open} className="text-sm font-semibold text-cyan-700 hover:text-cyan-900">
-              {link === "activity" ? "See every command in Activity" : copy.link} <span aria-hidden="true">→</span>
+              {linkWords ?? (link === "activity" ? "See every command in Activity" : copy.link)} <span aria-hidden="true">→</span>
             </button>
           ) : null}
         </div>

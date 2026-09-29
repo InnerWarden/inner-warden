@@ -145,6 +145,17 @@ export type LaneCard =
        * split whose parts add up to `count` exactly (`laneBreakdown`).
        */
       breakdown?: LanePart[];
+      /**
+       * RFC 3339: the host's record starts inside the window, at this time,
+       * so the count covers "since" then rather than the whole window. Only
+       * a time later than the window's start is kept.
+       */
+      since?: string;
+      /**
+       * `false` when the host counted `waiting` from a capped read: the chip
+       * then says "At least" (`readCount.ts`, a floor). Absent: complete.
+       */
+      waitingComplete?: boolean;
     }
   | { lane: CaseLane; state: "no_source"; sentence: string };
 
@@ -294,7 +305,21 @@ export function parseLaneCard(lane: CaseLane, value: unknown): LaneCard | undefi
   if (latest !== undefined) card.latest = latest;
   const breakdown = laneBreakdown(item.breakdown, count);
   if (breakdown !== undefined) card.breakdown = breakdown;
+  const since = laneSince(item.since);
+  if (since !== undefined) card.since = since;
+  if (typeof item.waiting_complete === "boolean") card.waitingComplete = item.waiting_complete;
   return card;
+}
+
+/**
+ * A card's `since`, kept only when it is a readable RFC 3339 time. The host
+ * sends it only when its record starts inside the card's window, at the
+ * moment it counted; the card prints it in place of the window's words, so
+ * a count is never said to cover days the record does not hold.
+ */
+export function laneSince(value: unknown): string | undefined {
+  if (typeof value !== "string" || !RFC3339.test(value)) return undefined;
+  return Number.isFinite(Date.parse(value)) ? value : undefined;
 }
 
 /**

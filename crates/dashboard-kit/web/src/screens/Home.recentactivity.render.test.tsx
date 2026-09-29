@@ -3,7 +3,6 @@ import { describe, expect, it } from "vitest";
 
 import type { DecisionSummary } from "../api";
 import { Verdict } from "../components/Verdict";
-import { VERDICTS } from "./Activity";
 import { RecentActivity } from "./Home";
 
 /**
@@ -55,13 +54,11 @@ describe("a review chip on the Overview", () => {
   });
 
   /**
-   * Everywhere else the chip still reads "Needs review", because that is the
-   * name of Activity's verdict filter, and the Community remedy tells its
-   * reader to press that filter. Renaming the chip everywhere would break that
-   * pairing, so only this page's chip changes.
+   * Everywhere else the shared verdict chip still reads "Needs review": only
+   * this page's chip changes, because only this page sits beside a Cases
+   * screen that uses the same two words for a case status.
    */
-  it("keeps the shared label elsewhere, where Activity's filter button bears it", () => {
-    expect(VERDICTS.find(([value]) => value === "review")?.[1]).toBe("Needs review");
+  it("keeps the shared label elsewhere", () => {
     expect(renderToStaticMarkup(<Verdict rec="review" />)).toContain("Needs review");
   });
 });

@@ -1,6 +1,7 @@
 import type { CaseListPage } from "../api/cases";
 import { LANE_WINDOW_PHRASE } from "../lanes";
 import { formatCount } from "../presentation";
+import { countWords } from "../readCount";
 
 /**
  * The count line above a page of cases: "20 rows on this page of 312 · 4,394
@@ -38,7 +39,11 @@ export function casePageCountLabel(
   // A partial read says "about" before the figure it cannot vouch for and
   // where it counted from, in words: "from a partial read" after two counts
   // in two units could not be parsed in a glance.
-  if (page.total_in_window !== undefined) label += ` · ${partial ? "about " : ""}${counted(page.total_in_window, "case", "cases")} ${span}`;
+  // A SAMPLE of a truncated read, never a floor: `readCount.ts`.
+  if (page.total_in_window !== undefined) {
+    const total = page.total_in_window;
+    label += ` · ${countWords(total, !partial, "sample", "inline")} ${total === 1 ? "case" : "cases"} ${span}`;
+  }
   if (partial) label += " (counted from the newest records)";
   return label;
 }

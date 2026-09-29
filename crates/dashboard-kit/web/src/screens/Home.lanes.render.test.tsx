@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Overview } from "../api";
 import { setTechnicalDetail } from "../components/TechnicalDetail";
 import { OverviewScreen } from "./Home";
-import communityOverview from "../../tests/fixtures/community/overview.json";
+import communityOverview from "../../tests/fixtures/community/overview-no-lanes.json";
 import hostWaitingOverview from "../../tests/fixtures/enterprise/overview-host-waiting.json";
 // Both written by the paid server's own tests, not by hand. The server's
 // test builds the lanes without the host's waiting line, so the page below

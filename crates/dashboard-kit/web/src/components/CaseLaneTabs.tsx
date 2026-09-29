@@ -1,10 +1,11 @@
 import type { KeyboardEvent } from "react";
 import { CASE_LANES, everythingCount, type CaseLaneCounts } from "../api/lanes";
-import { EVERYTHING_COPY, LANE_COPY, LANE_WINDOW_PHRASE, type CaseLaneChoice } from "../lanes";
+import { defaultCaseLane, EVERYTHING_COPY, LANE_COPY, LANE_WINDOW_PHRASE, type CaseLaneChoice } from "../lanes";
 import { CASE_WINDOW_LABELS, CASE_WINDOWS, type CaseWindow } from "./CaseFilters";
 import { useTechnicalDetail } from "./TechnicalDetail";
 import { Glyph, laneGlyph } from "./icons";
 import { formatCount } from "../presentation";
+import { countWords } from "../readCount";
 import { windowWords } from "../windows";
 
 /**
@@ -57,14 +58,51 @@ export type CaseLaneTab = {
  * not on screen). Its badge is the lanes and the cases in none added up, and
  * only when all four were counted.
  */
-export function laneTabs(value: CaseLaneChoice, counts: CaseLaneCounts | undefined, technical: boolean): CaseLaneTab[] {
+export type LaneTabOptions = {
+  /**
+   * The tabs this screen offers, in its own order. Absent: the three lanes,
+   * and Everything where the rule below allows it. A screen whose product has
+   * no Everything list and no server lane (Community) passes only its own.
+   */
+  choices?: readonly CaseLaneChoice[];
+  /**
+   * The list's status filter, when the screen has one. With it, the plain
+   * view offers Everything only while the list is narrowed to what is waiting
+   * on a person: that is where the Overview's waiting link lands (every
+   * lane's count), and once the reader releases the filter, Everything is the
+   * raw telemetry this rule keeps behind the technical switch. Absent: the
+   * rule is as it always was.
+   */
+  statusFilter?: string;
+};
+
+export function laneTabs(
+  value: CaseLaneChoice,
+  counts: CaseLaneCounts | undefined,
+  technical: boolean,
+  options: LaneTabOptions = {},
+): CaseLaneTab[] {
+  if (options.choices !== undefined) {
+    return options.choices.map((choice) => {
+      const count = choice === "everything" ? everythingCount(counts) : counts?.[choice];
+      return {
+        choice,
+        label: choice === "everything" ? EVERYTHING_COPY.name : LANE_COPY[choice].name,
+        ...(count === undefined ? {} : { count }),
+        selected: value === choice,
+      };
+    });
+  }
   const tabs: CaseLaneTab[] = CASE_LANES.map((lane) => ({
     choice: lane,
     label: LANE_COPY[lane].name,
     ...(counts?.[lane] === undefined ? {} : { count: counts[lane] }),
     selected: value === lane,
   }));
-  if (technical || value === "everything") {
+  const everythingOffered = options.statusFilter === undefined
+    ? technical || value === "everything"
+    : technical || (value === "everything" && options.statusFilter === "waiting");
+  if (everythingOffered) {
     const every = everythingCount(counts);
     tabs.push({
       choice: "everything",
@@ -75,6 +113,31 @@ export function laneTabs(value: CaseLaneChoice, counts: CaseLaneCounts | undefin
   }
   return tabs;
 }
+
+/**
+ * The lane a plain viewer lands on when they release the waiting filter while
+ * on Everything, or `undefined` when nothing needs to move.
+ *
+ * The Overview's waiting link opens Everything narrowed to what waits, because
+ * the count it follows is every lane's. Released, that tab is the whole raw
+ * list, telemetry included, which the plain view does not offer: the viewer is
+ * taken to their own lane (`defaultCaseLane`) instead, and the screen says
+ * where the rest is.
+ */
+export function laneAfterWaitingCleared(
+  value: CaseLaneChoice,
+  technical: boolean,
+  remembered: CaseLaneChoice | undefined,
+  counts: CaseLaneCounts | undefined,
+): CaseLaneChoice | undefined {
+  if (technical || value !== "everything") return undefined;
+  const next = defaultCaseLane(remembered === "everything" ? undefined : remembered, counts);
+  return next === "everything" ? "agent_actions" : next;
+}
+
+/** Said when a plain viewer is moved off Everything by `laneAfterWaitingCleared`. */
+export const EVERYTHING_MOVED_NOTE =
+  "Showing what your AI agent did. Every case, raw telemetry included, is under Show technical detail.";
 
 /**
  * Where the arrow keys, Home and End take the selection, per the tabs
@@ -104,7 +167,9 @@ export function laneIntro(value: CaseLaneChoice): string {
  */
 export function laneTabName(tab: Pick<CaseLaneTab, "choice" | "label" | "count">, window?: CaseWindow, unit?: LaneUnit, partial = false): string {
   if (tab.count === undefined) return tab.label;
-  const counted = `${tab.label}, ${partial ? "about " : ""}${laneTabCount(tab.choice, tab.count, unit)}`;
+  // A tab's count is a SAMPLE of a truncated read, never a floor (`readCount.ts`).
+  const nouns = unit ?? LANE_CASE_UNIT[tab.choice];
+  const counted = `${tab.label}, ${countWords(tab.count, !partial, "sample", "inline")} ${tab.count === 1 ? nouns.one : nouns.many}`;
   return window === undefined ? counted : `${counted} ${LANE_WINDOW_PHRASE[window]}`;
 }
 
@@ -145,7 +210,13 @@ export function CaseLaneTabs({
   intro = true,
   unitFor,
   partial = false,
+  choices,
+  statusFilter,
 }: {
+  /** See `LaneTabOptions.choices`. */
+  choices?: readonly CaseLaneChoice[];
+  /** See `LaneTabOptions.statusFilter`. */
+  statusFilter?: string;
   value: CaseLaneChoice;
   counts?: CaseLaneCounts;
   onChange: (next: CaseLaneChoice) => void;
@@ -193,7 +264,10 @@ export function CaseLaneTabs({
   partial?: boolean;
 }) {
   const [technical] = useTechnicalDetail();
-  const tabs = laneTabs(value, counts, technical);
+  const tabs = laneTabs(value, counts, technical, {
+    ...(choices === undefined ? {} : { choices }),
+    ...(statusFilter === undefined ? {} : { statusFilter }),
+  });
   const onKeyDown = (event: KeyboardEvent<HTMLButtonElement>) => {
     const next = nextLaneTab(tabs, value, event.key);
     if (next === undefined) return;
@@ -242,8 +316,8 @@ export function CaseLaneTabs({
                     title={partial ? PARTIAL_COUNT : undefined}
                     className={`shrink-0 whitespace-nowrap rounded-full px-2 py-0.5 text-xs tabular-nums ${tab.selected ? "bg-white/20 text-white" : "bg-slate-100 text-slate-700"}`}
                   >
-                    {partial ? "~" : ""}
-                    {window === undefined ? formatCount(tab.count) : laneTabCount(tab.choice, tab.count, unit)}
+                    {countWords(tab.count, !partial, "sample", "badge")}
+                    {window === undefined ? null : ` ${tab.count === 1 ? (unit ?? LANE_CASE_UNIT[tab.choice]).one : (unit ?? LANE_CASE_UNIT[tab.choice]).many}`}
                     {window === undefined ? null : (
                       <span className="font-normal opacity-80"> · {LANE_TAB_SPAN[window]}</span>
                     )}

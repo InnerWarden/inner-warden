@@ -22,6 +22,7 @@ import { OVERVIEW_AGENTS_TOUR_STEP_KEY, OVERVIEW_SENSOR_TOUR_STEP_KEY, TOUR_ABSE
 import { hasControlCharacters, humanizeToken, normaliseMode, formatCount } from "../presentation";
 import { When } from "../components/When";
 import { isCaseListWindow, WINDOW_WORDS } from "../windows";
+import { countWords } from "../readCount";
 
 type ActivityLink = { id?: string; session?: string; verdict?: string; action?: string };
 
@@ -484,7 +485,7 @@ function LanesOverview({
       {absentFromTour.length > 0 ? <span hidden {...{ [TOUR_ABSENT_ATTRIBUTE]: absentFromTour.join(" ") }} /> : null}
 
       <LaneCards
-        cards={laneCards}
+        cards={cardsWithWaitingFloor(laneCards, waitingCount(overview.waiting))}
         edition={edition}
         onOpenLane={onOpenLane}
         onOpenCase={onOpenCase === undefined ? undefined : (caseId, lane, window) => onOpenCase(caseId, lane, window)}
@@ -1205,6 +1206,12 @@ export type WaitingCount = {
   window: CaseListWindow;
   /** How many of `count` arrived today, when the server said and it is not more than `count`. */
   today?: number;
+  /**
+   * `false` when the server counted from a capped read of its newest records:
+   * the count is then a FLOOR ("At least 202", `readCount.ts`). Absent or
+   * `true`: the count is whole.
+   */
+  complete?: boolean;
 };
 
 /**
@@ -1226,7 +1233,9 @@ export function waitingCount(value: unknown): WaitingCount | undefined {
   const window = isCaseListWindow(item.window) ? item.window : undefined;
   if (count === undefined || window === undefined) return undefined;
   const today = wholeCount(item.today);
-  return today !== undefined && today <= count ? { count, window, today } : { count, window };
+  const waiting: WaitingCount = today !== undefined && today <= count ? { count, window, today } : { count, window };
+  if (typeof item.complete === "boolean") waiting.complete = item.complete;
+  return waiting;
 }
 
 /**
@@ -1260,6 +1269,19 @@ export function waitingLine(waiting: WaitingCount): {
   }
   const one = waiting.count === 1;
   const n = formatCount(waiting.count);
+  if (waiting.complete === false) {
+    // A FLOOR (`readCount.ts`): every case counted is waiting, and older ones
+    // the capped read did not reach can only add more. "At least" is true of
+    // it; a split of a floor into today and earlier is not a fact, so none is
+    // printed, and the link names no number (the list prints its own).
+    return {
+      tone: "waiting",
+      title: `${countWords(waiting.count, false, "floor", "sentence")} ${one ? "case is" : "cases are"} waiting on you`,
+      span,
+      body: "InnerWarden read only its newest records, so older cases may be waiting too.",
+      through: { label: "See the waiting cases", window: waiting.window },
+    };
+  }
   return {
     tone: "waiting",
     title: `${n} ${one ? "case is" : "cases are"} waiting on you`,
@@ -1289,7 +1311,8 @@ export function waitingLine(waiting: WaitingCount): {
  *    which this page cannot explain): nothing.
  */
 export function waitingAcrossLanes(waiting: WaitingCount, cards: readonly LaneCard[] | undefined): string | undefined {
-  if (cards === undefined || waiting.count === 0) return undefined;
+  // A floor minus the chips proves nothing about what is outside the lanes.
+  if (cards === undefined || waiting.count === 0 || waiting.complete === false) return undefined;
   const counted = cards.flatMap((card) => (card.state === "available" ? [card] : []));
   if (counted.length === 0) return undefined;
   const spans = new Set(counted.map((card) => card.window));
@@ -1301,6 +1324,23 @@ export function waitingAcrossLanes(waiting: WaitingCount, cards: readonly LaneCa
   const rest = waiting.count - inLanes;
   if (rest <= 0) return undefined;
   return `${formatCount(rest)} more ${rest === 1 ? "is" : "are"} outside the lanes above.`;
+}
+
+/**
+ * The lane cards with each chip's promise made explicit: a card counted over
+ * the same window as a waiting count the server read from a capped read
+ * inherits that count's `complete: false`, until the server says per lane
+ * (`waiting_complete`). It is the same read, and "at least" is true of a floor
+ * even when the count happened to be whole, so the inheritance can only
+ * understate.
+ */
+export function cardsWithWaitingFloor(cards: LaneCard[], waiting: WaitingCount | undefined): LaneCard[] {
+  if (waiting?.complete !== false) return cards;
+  return cards.map((card) =>
+    card.state === "available" && card.waitingComplete === undefined && card.window === waiting.window
+      ? { ...card, waitingComplete: false }
+      : card,
+  );
 }
 
 /** Which part of the waiting count is today's, and which is older, named honestly. */

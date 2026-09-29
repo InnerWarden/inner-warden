@@ -184,6 +184,32 @@ export function formatCount(value: number | bigint): string {
 }
 
 /**
+ * A large count in words, for a tile where the exact figure would not be read
+ * as a number: "2.3 billion", "38 million", "412 thousand". Below 100,000 it
+ * is the exact figure (`formatCount`), because a count a reader can hold whole
+ * is not rounded. One decimal where it changes the reading, none past ten.
+ */
+export function compactCount(value: number | bigint): string {
+  const exact = typeof value === "bigint" ? value : BigInt(Math.max(0, Math.round(Number.isFinite(value) ? value : 0)));
+  if (exact < 100_000n) return formatCount(exact);
+  const scales: [bigint, string][] = [
+    [1_000_000_000_000n, "trillion"],
+    [1_000_000_000n, "billion"],
+    [1_000_000n, "million"],
+    [1_000n, "thousand"],
+  ];
+  for (const [scale, word] of scales) {
+    if (exact < scale) continue;
+    // Tenths, computed in integers so a count past 2^53 is not rounded twice.
+    const tenths = (exact * 10n + scale / 2n) / scale;
+    const whole = tenths / 10n;
+    const shown = whole >= 10n || tenths % 10n === 0n ? formatCount(whole >= 10n ? (exact + scale / 2n) / scale : whole) : `${whole}.${tenths % 10n}`;
+    return `${shown} ${word}`;
+  }
+  return formatCount(exact);
+}
+
+/**
  * Whether host text carries a character that is not text: a control
  * character (C0, DEL or C1) or a format character, which includes the bidi
  * overrides and isolates (U+202A to U+202E, U+2066 to U+2069).

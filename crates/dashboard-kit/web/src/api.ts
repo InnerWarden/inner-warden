@@ -44,6 +44,14 @@ export type DashboardMeta = {
    * this into a claim that something is being enforced.
    */
   active_defence_installed?: boolean;
+  /**
+   * True when the binary on disk has been replaced since this process
+   * started: `version` is then this process, not the installation, and
+   * `update_note` says what to do. Omitted when nothing is pending.
+   */
+  update_pending?: boolean;
+  /** The server's own sentence for `update_pending`, printed as sent. */
+  update_note?: string;
 };
 
 export type CategoryCount = { name: string; count: number };
@@ -157,7 +165,16 @@ export type Overview = {
    * sends none, and the line reads `host_attention` as before. Read through
    * `waitingCount`, never directly.
    */
-  waiting?: { count: number; window: "1h" | "24h" | "7d" | "30d" | "all"; today?: number };
+  waiting?: {
+    count: number;
+    window: "1h" | "24h" | "7d" | "30d" | "all";
+    today?: number;
+    /**
+     * `false` when the server counted from a capped read of its newest
+     * records: the count is then a floor, "At least N" (`readCount.ts`).
+     */
+    complete?: boolean;
+  };
   /**
    * The hero sentence, computed by the host from the SAME counters this
    * payload carries.
@@ -225,6 +242,13 @@ export type OverviewLaneWire = {
    * sends none and the card is as it was.
    */
   breakdown?: { key: string; count: number; label: string }[];
+  /**
+   * RFC 3339: the host's record starts inside `window`, at this time, so the
+   * count covers "since" then. Sent only when it is inside the window.
+   */
+  since?: string;
+  /** `false` when `waiting` was counted from a capped read (a floor). */
+  waiting_complete?: boolean;
 };
 export type Node = { id: string; kind: string; label: string; attrs?: Record<string, string> };
 export type Edge = { from: string; to: string; kind: string };
@@ -396,6 +420,15 @@ async function get<T>(path: string): Promise<T> {
   } finally {
     deadline.done();
   }
+}
+
+/**
+ * One bounded GET under `api/`, for a screen that validates the answer with
+ * its own strict reader. A non-2xx answer throws with the server's `error`
+ * code as the message (`graph_unreadable`, `decision_not_in_record`).
+ */
+export function getJson<T = unknown>(path: string): Promise<T> {
+  return get<T>(path);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
