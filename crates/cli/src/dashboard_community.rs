@@ -797,6 +797,33 @@ fn time(ms: u64) -> Value {
     json!({ "kind": "time", "at": rfc3339(ms) })
 }
 
+/// A rule's words between `lead` and `tail`, each `quoted` part as code, the
+/// way the page prints a folder: the backticks are the rule's own markup, and
+/// a reader saw them as stray characters ("path: `.ssh/`."). Backticks that do
+/// not pair up are left as written.
+fn push_rule_words(segments: &mut Vec<Value>, lead: &str, words: &str, tail: &str) {
+    let parts: Vec<&str> = words.split('`').collect();
+    if parts.len() < 3 || parts.len().is_multiple_of(2) {
+        segments.push(text(format!("{lead}{words}{tail}")));
+        return;
+    }
+    let mut pending = String::from(lead);
+    for (index, part) in parts.iter().enumerate() {
+        if index % 2 == 0 {
+            pending.push_str(part);
+        } else if !part.trim().is_empty() {
+            if !pending.is_empty() {
+                segments.push(text(std::mem::take(&mut pending)));
+            }
+            segments.push(code(*part));
+        }
+    }
+    pending.push_str(tail);
+    if !pending.is_empty() {
+        segments.push(text(pending));
+    }
+}
+
 /// What happened, as segments the page prints in order: text as text, a
 /// folder or a command as code, a time through the page's own clock.
 fn happened(record: &DecisionRecord) -> Vec<Value> {
@@ -828,10 +855,12 @@ fn happened(record: &DecisionRecord) -> Vec<Value> {
                 0 => String::new(),
                 n => format!(", and {}", plural(n, "more reason", "more reasons")),
             };
-            segments.push(text(format!(
-                ". The guard flagged it: {}{more}.",
-                revealed(record.reason_words.trim_end_matches('.'))
-            )));
+            push_rule_words(
+                &mut segments,
+                ". The guard flagged it: ",
+                &revealed(record.reason_words.trim_end_matches('.')),
+                &format!("{more}."),
+            );
         }
     } else {
         segments.push(text(". The guard allowed it."));
@@ -997,7 +1026,7 @@ fn hide_reason_step() -> Value {
     let mut value = step(
         "Hide them from the list:",
         None,
-        "These run from your agent's own temp folder, which is new every session, so an allow would never match again. Hiding them changes this view only; the guard keeps flagging them.",
+        "They run from your agent's own temp folder, new each session, so an allow would never match. Hiding changes this view only; the guard still flags them.",
     );
     value["view_action"] = json!("hide_reason");
     value
@@ -1918,6 +1947,41 @@ mod tests {
         assert!(commands(view["next"].as_array().unwrap()).is_empty());
         // The pattern itself never leaves the process.
         assert!(!view.to_string().contains("make *"));
+    }
+
+    #[test]
+    fn a_rules_quoted_words_are_code_never_stray_backticks() {
+        let mut segments = Vec::new();
+        push_rule_words(
+            &mut segments,
+            ". The guard flagged it: ",
+            "reads sensitive credential path: `.ssh/`",
+            ".",
+        );
+        assert_eq!(
+            segments,
+            vec![
+                json!({"kind": "text", "text": ". The guard flagged it: reads sensitive credential path: "}),
+                json!({"kind": "code", "text": ".ssh/"}),
+                json!({"kind": "text", "text": "."}),
+            ]
+        );
+        // Unpaired backticks are the rule's words as written, in one piece.
+        let mut odd = Vec::new();
+        push_rule_words(&mut odd, "lead ", "a `b", ".");
+        assert_eq!(odd, vec![json!({"kind": "text", "text": "lead a `b."})]);
+        // Two pairs are two code parts, and nothing empty is left behind.
+        let mut two = Vec::new();
+        push_rule_words(&mut two, "x ", "`a` and `b`", "");
+        assert_eq!(
+            two,
+            vec![
+                json!({"kind": "text", "text": "x "}),
+                json!({"kind": "code", "text": "a"}),
+                json!({"kind": "text", "text": " and "}),
+                json!({"kind": "code", "text": "b"}),
+            ]
+        );
     }
 
     #[test]

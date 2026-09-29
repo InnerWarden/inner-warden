@@ -213,7 +213,15 @@
           },
           {
             "kind": "text",
-            "text": ". The guard flagged it: searches the filesystem for credentials (`grep -r password`) rather than naming one."
+            "text": ". The guard flagged it: searches the filesystem for credentials ("
+          },
+          {
+            "kind": "code",
+            "text": "grep -r password"
+          },
+          {
+            "kind": "text",
+            "text": ") rather than naming one."
           }
         ]
       }
@@ -354,7 +362,15 @@
           },
           {
             "kind": "text",
-            "text": ". The guard flagged it: persistence indicator: `authorized_keys`."
+            "text": ". The guard flagged it: persistence indicator: "
+          },
+          {
+            "kind": "code",
+            "text": "authorized_keys"
+          },
+          {
+            "kind": "text",
+            "text": "."
           }
         ]
       }

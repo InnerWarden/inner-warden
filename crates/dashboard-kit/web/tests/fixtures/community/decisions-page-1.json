@@ -73,7 +73,15 @@
           },
           {
             "kind": "text",
-            "text": ". The guard flagged it: reads sensitive credential path: `.ssh/`."
+            "text": ". The guard flagged it: reads sensitive credential path: "
+          },
+          {
+            "kind": "code",
+            "text": ".ssh/"
+          },
+          {
+            "kind": "text",
+            "text": "."
           }
         ]
       }
@@ -97,7 +105,7 @@
       "next": [
         {
           "label": "Hide them from the list:",
-          "line": "These run from your agent's own temp folder, which is new every session, so an allow would never match again. Hiding them changes this view only; the guard keeps flagging them.",
+          "line": "They run from your agent's own temp folder, new each session, so an allow would never match. Hiding changes this view only; the guard still flags them.",
           "view_action": "hide_reason"
         }
       ],
@@ -837,7 +845,15 @@
           },
           {
             "kind": "text",
-            "text": ". The guard flagged it: reads sensitive credential path: `.aws/credentials`."
+            "text": ". The guard flagged it: reads sensitive credential path: "
+          },
+          {
+            "kind": "code",
+            "text": ".aws/credentials"
+          },
+          {
+            "kind": "text",
+            "text": "."
           }
         ]
       }
@@ -1043,7 +1059,15 @@
           },
           {
             "kind": "text",
-            "text": ". The guard flagged it: obfuscation pattern: `bytes.fromhex`."
+            "text": ". The guard flagged it: obfuscation pattern: "
+          },
+          {
+            "kind": "code",
+            "text": "bytes.fromhex"
+          },
+          {
+            "kind": "text",
+            "text": "."
           }
         ]
       }
@@ -1242,7 +1266,15 @@
           },
           {
             "kind": "text",
-            "text": ". The guard flagged it: reads sensitive credential path: `.env`."
+            "text": ". The guard flagged it: reads sensitive credential path: "
+          },
+          {
+            "kind": "code",
+            "text": ".env"
+          },
+          {
+            "kind": "text",
+            "text": "."
           }
         ]
       }
