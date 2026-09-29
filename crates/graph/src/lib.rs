@@ -18,6 +18,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 
+mod decisions;
+pub use decisions::*;
+
 /// A graph node, keyed by a stable `id` so ingesting the same thing twice merges
 /// rather than duplicates.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -631,6 +634,31 @@ impl Graph {
         verdict: &Value,
         context: DecisionContext,
     ) {
+        self.ingest_verdict_with_origin(
+            session,
+            seq,
+            command,
+            verdict,
+            context,
+            &DecisionOrigin::default(),
+        );
+    }
+
+    /// Ingest a verdict with where it came from as well: the channel that
+    /// screened it, the agent that asked (when the caller was told), the folder
+    /// it ran in, and the rule ids behind the verdict. Every origin field is
+    /// optional and written only when present, so an older producer's node and
+    /// a newer one merge without either erasing the other, and a node written
+    /// before these fields existed reads as unknown, never as a guess.
+    pub fn ingest_verdict_with_origin(
+        &mut self,
+        session: &str,
+        seq: usize,
+        command: &str,
+        verdict: &Value,
+        context: DecisionContext,
+        origin: &DecisionOrigin,
+    ) {
         let session_id = format!("session:{session}");
         self.upsert_node(Node {
             id: session_id.clone(),
@@ -679,6 +707,7 @@ impl Graph {
                 attrs.insert("explanation".into(), short(why, 300));
             }
         }
+        origin.write_attrs(&mut attrs);
         self.upsert_node(Node {
             id: cmd_id.clone(),
             kind: "command".into(),
