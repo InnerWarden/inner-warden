@@ -177,6 +177,13 @@ pub fn is_flagged(node: &Node) -> bool {
         || matches!(attr(node, "outcome"), Some("blocked" | "would_block"))
 }
 
+/// A flagged decision an AGENT made. A command a person checked by hand with
+/// `innerwarden check` is not something the agent did, so it is left out of
+/// every "flagged" count and list unless the reader asks for checks.
+pub fn is_flagged_agent_action(node: &Node) -> bool {
+    is_flagged(node) && outcome_key(node) != "checked_only"
+}
+
 /// The prefix this CLI writes before an MCP tool call's summary.
 const MCP_LABEL_PREFIX: &str = "MCP · ";
 
@@ -417,7 +424,10 @@ pub struct SessionFacts {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct RecordSpan {
     pub decisions: usize,
+    /// Flagged decisions an agent made: checks by hand are not in here.
     pub flagged: usize,
+    /// Decisions that were a check by hand (`innerwarden check`).
+    pub checked: usize,
     pub oldest_at_ms: Option<u64>,
     pub newest_at_ms: Option<u64>,
 }
@@ -441,6 +451,9 @@ pub struct DecisionQuery {
     pub outcome: Option<String>,
     pub verdict: Option<String>,
     pub reason: Option<String>,
+    /// Leave one reason out: the reader hid it from the list. A view only;
+    /// the guard keeps flagging it.
+    pub reason_not: Option<String>,
     pub session: Option<String>,
     /// A case-insensitive substring of the command.
     pub text: Option<String>,
@@ -455,6 +468,7 @@ impl Default for DecisionQuery {
             outcome: None,
             verdict: None,
             reason: None,
+            reason_not: None,
             session: None,
             text: None,
             cursor: None,
@@ -475,7 +489,8 @@ pub struct DecisionsPage {
     pub next_cursor: Option<String>,
     /// Decisions matching every filter.
     pub total: usize,
-    /// Flagged decisions in the whole record, whatever the filters.
+    /// Flagged decisions an agent made in the whole record, whatever the
+    /// filters. Checks by hand are not counted.
     pub flagged_total: usize,
     /// The matching decisions by outcome, with the outcome filter set aside, so
     /// the bar beside a filtered list still shows every outcome. Adds up to
@@ -488,6 +503,15 @@ pub struct DecisionsPage {
     pub record: RecordSpan,
     /// The sessions of the items on this page, counted over the whole record.
     pub sessions: BTreeMap<String, SessionFacts>,
+}
+
+/// One flagged decision, reduced to what a count by concern needs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FlaggedSummary {
+    pub outcome_key: &'static str,
+    pub rules: Vec<String>,
+    /// The words of its first reason, for a record older than rule ids.
+    pub reason_words: String,
 }
 
 /// A decision and the commands just before and after it in its session.
@@ -621,7 +645,7 @@ impl Graph {
                 .or_insert_with(|| (SessionFacts::default(), row.key.clone()));
             let (session, newest) = entry;
             session.decisions += 1;
-            if row.flagged {
+            if row.flagged && row.outcome != "checked_only" {
                 session.flagged += 1;
             }
             if let Some(ms) = recorded_at_ms(row.node) {
@@ -666,13 +690,64 @@ impl Graph {
         seen
     }
 
+    /// The newest decision each CHANNEL screened (`hook`, `mcp`), whether or
+    /// not it named its agent: proof a screening path is working, for a hook
+    /// written before hooks named their agent.
+    pub fn channels_last_seen(&self) -> BTreeMap<&'static str, u64> {
+        self.channel_times(false)
+    }
+
+    /// The newest decision each channel screened that names NO agent. A
+    /// channel absent here holds only named decisions, so an agent none of
+    /// them names has screened nothing through it.
+    pub fn unnamed_channels_last_seen(&self) -> BTreeMap<&'static str, u64> {
+        self.channel_times(true)
+    }
+
+    fn channel_times(&self, unnamed_only: bool) -> BTreeMap<&'static str, u64> {
+        let mut seen: BTreeMap<&'static str, u64> = BTreeMap::new();
+        for node in self.nodes.iter().filter(|node| node.kind == "command") {
+            if unnamed_only && attr(node, "agent").is_some_and(valid_agent) {
+                continue;
+            }
+            let channel = channel_of(node);
+            if channel != "hook" && channel != "mcp" {
+                continue;
+            }
+            let Some(ms) = recorded_at_ms(node) else {
+                continue;
+            };
+            let newest = seen.entry(channel).or_insert(ms);
+            *newest = (*newest).max(ms);
+        }
+        seen
+    }
+
+    /// One entry per flagged decision an agent made: what happened to it and
+    /// the rules behind it, for the caller to count by what it reached for.
+    /// Cheap: no linked labels, no sentence.
+    pub fn flagged_summaries(&self) -> Vec<FlaggedSummary> {
+        self.nodes
+            .iter()
+            .filter(|node| node.kind == "command" && is_flagged_agent_action(node))
+            .map(|node| FlaggedSummary {
+                outcome_key: outcome_key(node),
+                rules: rules_of(node),
+                reason_words: reason_words(node),
+            })
+            .collect()
+    }
+
     /// How far back the record goes and how much of it the guard flagged.
     pub fn record_span(&self) -> RecordSpan {
         let mut span = RecordSpan::default();
         for node in self.nodes.iter().filter(|node| node.kind == "command") {
             span.decisions += 1;
-            if is_flagged(node) {
+            if is_flagged_agent_action(node) {
                 span.flagged += 1;
+            }
+            if outcome_key(node) == "checked_only" {
+                span.checked += 1;
             }
             if let Some(ms) = recorded_at_ms(node) {
                 span.oldest_at_ms = Some(span.oldest_at_ms.map_or(ms, |oldest| oldest.min(ms)));
@@ -740,10 +815,15 @@ impl Graph {
             .filter(|text| !text.is_empty())
             .map(str::to_lowercase);
         let verdict = query.verdict.as_deref();
+        // A check by hand is flagged only when the reader asks for checks: it
+        // is not something the agent did, and the counts beside the list (the
+        // Overview's agent card among them) are about the agent.
+        let wants_checks = query.outcome.as_deref() == Some("checked_only");
         // Every filter except the outcome and the reason, which each have a
         // count that sets its own filter aside.
         let base = |row: &Row<'_>| {
-            (!query.flagged_only || row.flagged)
+            (!query.flagged_only
+                || (row.flagged && (wants_checks || row.outcome != "checked_only")))
                 && verdict.is_none_or(|verdict| {
                     attr(row.node, "recommendation").unwrap_or("unknown") == verdict
                 })
@@ -756,14 +836,17 @@ impl Graph {
                     .is_none_or(|text| row.node.label.to_lowercase().contains(text))
         };
         let outcome_ok = |row: &Row<'_>| query.outcome.as_deref().is_none_or(|o| row.outcome == o);
-        let reason_ok = |row: &Row<'_>| query.reason.as_deref().is_none_or(|r| row.reason == r);
+        let reason_ok = |row: &Row<'_>| {
+            query.reason.as_deref().is_none_or(|r| row.reason == r)
+                && query.reason_not.as_deref().is_none_or(|r| row.reason != r)
+        };
 
         let mut by_outcome: BTreeMap<&'static str, usize> = BTreeMap::new();
         let mut reasons: HashMap<&str, (usize, &OrderKey, &Node)> = HashMap::new();
         let mut matching: Vec<&Row<'_>> = Vec::new();
         let mut flagged_total = 0usize;
         for row in &rows {
-            if row.flagged {
+            if row.flagged && row.outcome != "checked_only" {
                 flagged_total += 1;
             }
             if !base(row) {
@@ -1090,11 +1173,11 @@ mod tests {
         let g = record();
         let page = g.decisions_page(&DecisionQuery::default());
         let ids: Vec<&str> = page.items.iter().map(|item| item.id.as_str()).collect();
+        // The check by hand (s1:5) is not the agent's: it is not listed.
         assert_eq!(
             ids,
             [
                 "cmd:mcp:innerwarden:0",
-                "cmd:s1:5",
                 "cmd:s1:4",
                 "cmd:s1:3",
                 "cmd:s1:2",
@@ -1102,18 +1185,89 @@ mod tests {
             ]
         );
         assert!(page.items.iter().all(|item| item.flagged));
-        assert_eq!(page.total, 6);
-        assert_eq!(page.flagged_total, 6);
+        assert_eq!(page.total, 5);
+        assert_eq!(page.flagged_total, 5);
         assert_eq!(page.record.decisions, 7);
-        assert_eq!(page.record.flagged, 6);
+        assert_eq!(page.record.flagged, 5);
+        assert_eq!(page.record.checked, 1);
         assert!(page.next_cursor.is_none());
         assert_eq!(page.items[0].channel, "mcp");
         assert_eq!(page.items[0].outcome_key, "unsafe_may_have_run");
-        assert_eq!(page.items[1].outcome_key, "checked_only");
-        assert_eq!(page.items[1].channel, "hook", "the origin said hook");
-        assert_eq!(page.items[2].outcome_key, "refused_before_run");
-        assert_eq!(page.items[3].outcome_key, "flagged_ran");
-        assert_eq!(page.items[5].outcome_key, "would_have_refused");
+        assert_eq!(page.items[1].outcome_key, "refused_before_run");
+        assert_eq!(page.items[2].outcome_key, "flagged_ran");
+        assert_eq!(page.items[4].outcome_key, "would_have_refused");
+    }
+
+    #[test]
+    fn a_check_by_hand_is_listed_only_when_the_reader_asks_for_checks() {
+        let g = record();
+        let checks = g.decisions_page(&DecisionQuery {
+            outcome: Some("checked_only".into()),
+            ..DecisionQuery::default()
+        });
+        let ids: Vec<&str> = checks.items.iter().map(|item| item.id.as_str()).collect();
+        assert_eq!(ids, ["cmd:s1:5"]);
+        assert_eq!(checks.items[0].channel, "hook", "the origin said hook");
+        // The whole-record count stays the agent's.
+        assert_eq!(checks.flagged_total, 5);
+        // The agent's card and the list count the same flagged decisions.
+        assert_eq!(g.agent_actions_tally(0).flagged, checks.flagged_total);
+        assert_eq!(g.decision("cmd:s1:5").unwrap().session.flagged, 4);
+    }
+
+    #[test]
+    fn a_hidden_reason_leaves_the_list_and_the_bar_but_not_the_reasons() {
+        let g = record();
+        let hidden = g.decisions_page(&DecisionQuery {
+            reason_not: Some("rule:tmp_execution".into()),
+            ..DecisionQuery::default()
+        });
+        assert_eq!(hidden.total, 3);
+        assert!(hidden
+            .items
+            .iter()
+            .all(|item| item.reason_key != "rule:tmp_execution"));
+        assert_eq!(hidden.by_outcome.values().sum::<usize>(), 3);
+        assert!(
+            hidden
+                .reasons
+                .iter()
+                .any(|reason| reason.key == "rule:tmp_execution"),
+            "the reasons list keeps the hidden one, so it can be shown again"
+        );
+        assert_eq!(hidden.flagged_total, 5);
+    }
+
+    #[test]
+    fn channels_last_seen_reads_every_decision_named_or_not() {
+        let mut g = record();
+        g.ingest_verdict_with_context(
+            "s9",
+            0,
+            "ls",
+            &verdict("allow", ""),
+            context(DecisionMode::Monitor, DecisionOutcome::Allowed, 99_000),
+        );
+        let seen = g.channels_last_seen();
+        assert_eq!(seen.get("hook"), Some(&99_000));
+        assert_eq!(seen.get("mcp"), Some(&7_000));
+        assert!(Graph::new().channels_last_seen().is_empty());
+        // Only the node that names nobody is unnamed: every other one in the
+        // record names claude-code.
+        let unnamed = g.unnamed_channels_last_seen();
+        assert_eq!(unnamed.get("hook"), Some(&99_000));
+        assert_eq!(unnamed.get("mcp"), None);
+    }
+
+    #[test]
+    fn flagged_summaries_are_the_agents_flagged_decisions() {
+        let g = record();
+        let summaries = g.flagged_summaries();
+        assert_eq!(summaries.len(), g.record_span().flagged);
+        assert!(summaries.iter().all(|s| s.outcome_key != "checked_only"));
+        assert!(summaries
+            .iter()
+            .any(|s| s.rules == ["sensitive_credential_read".to_string()]));
     }
 
     #[test]
@@ -1128,7 +1282,7 @@ mod tests {
             ..DecisionQuery::default()
         });
         assert_eq!(filtered.total, 2);
-        assert_eq!(filtered.by_outcome.values().sum::<usize>(), 6);
+        assert_eq!(filtered.by_outcome.values().sum::<usize>(), 5);
     }
 
     #[test]
@@ -1383,7 +1537,7 @@ mod tests {
             verdict: Some("deny".into()),
             ..DecisionQuery::default()
         });
-        assert_eq!(deny.total, 4);
+        assert_eq!(deny.total, 3, "the deny checked by hand is not listed");
         let session = g.decisions_page(&DecisionQuery {
             session: Some("mcp:innerwarden".into()),
             ..DecisionQuery::default()
@@ -1411,7 +1565,7 @@ mod tests {
         assert_eq!(before, ["cmd:s1:0", "cmd:s1:1"]);
         assert_eq!(detail.after[0].id, "cmd:s1:3");
         assert_eq!(detail.session.decisions, 6);
-        assert_eq!(detail.session.flagged, 5);
+        assert_eq!(detail.session.flagged, 4);
         assert_eq!(detail.session.agent.as_deref(), Some("claude-code"));
         assert!(g.decision("cmd:s1:99").is_none());
         assert!(g.decision("session:s1").is_none());
@@ -1497,7 +1651,10 @@ mod tests {
             &verdict("deny", "x"),
             context(DecisionMode::Check, DecisionOutcome::Screened, 2),
         );
-        let page = g.decisions_page(&DecisionQuery::default());
+        let page = g.decisions_page(&DecisionQuery {
+            flagged_only: false,
+            ..DecisionQuery::default()
+        });
         let channels: Vec<&str> = page.items.iter().map(|item| item.channel).collect();
         assert_eq!(channels, ["check", "mcp"]);
     }
