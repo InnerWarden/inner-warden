@@ -30,6 +30,8 @@ export type Offer = {
   slot: OfferSlot;
   /** A stable name for the situation, for `data-offer`. */
   key: string;
+  /** What happened HERE, said first and apart from the pitch: the reader's own number. */
+  lead?: string;
   body: string;
   action: string;
   href: string;
@@ -60,7 +62,8 @@ export function serverOffer(os: PlatformOs, ran?: RanHere): Offer {
   return {
     slot: "server",
     key: "server",
-    body: `${reliance} ${lead(os)} Active Defence adds the kernel Execution Gate, and watches the server itself with the host sensor, an SSH decoy and automatic response.`,
+    lead: reliance,
+    body: `${lead(os)} Active Defence adds the kernel Execution Gate, and watches the server itself with the host sensor, an SSH decoy and automatic response.`,
     action: "See Active Defence",
     href: PRICING_URL,
   };

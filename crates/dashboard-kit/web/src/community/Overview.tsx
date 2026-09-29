@@ -264,7 +264,7 @@ function laneFooter(card: LaneCard, facts: FooterFacts): ReactNode {
   if (card.state !== "no_source") return undefined;
   // The first run's steps sit above the cards; the card does not repeat them.
   if (card.lane === "agent_actions" && facts.nothingYet) {
-    return <p className="text-sm leading-6 text-slate-600">No agent is connected yet. Start above.</p>;
+    return <p className="text-sm leading-6 text-slate-600">Start with the steps above.</p>;
   }
   const step = readLaneNextStep(facts.overview.lanes, card.lane);
   if (step === undefined) return undefined;
@@ -350,7 +350,7 @@ function OnThisMachine({
                 : "No AI agent found on this machine."}
             </p>
           ) : (
-            <div className="flex items-center gap-2.5 sm:gap-3">
+            <div className="flex flex-col items-start gap-2 sm:flex-row sm:items-center sm:gap-3">
               <Ring parts={ringParts} size={44} stroke={6} label={`${connected} of ${summary.total} agents connected`} />
               <div className="min-w-0">
                 <p className="flex flex-wrap items-baseline gap-x-1.5">

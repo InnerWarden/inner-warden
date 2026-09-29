@@ -34,7 +34,10 @@ export function OfferBox({ offer, installed, onDismissed }: { offer: Offer; inst
       className="rounded-xl border border-slate-200 bg-white p-4"
     >
       <p id={titleId} className="text-xs font-semibold uppercase tracking-[0.14em] text-slate-500">Active Defence</p>
-      <p className="mt-1 text-sm leading-6 text-slate-700">{offer.body}</p>
+      <div data-offer-words className="mt-1 space-y-1 text-sm leading-6 text-slate-700">
+        {offer.lead === undefined ? null : <p className="font-semibold text-slate-900">{offer.lead}</p>}
+        <p>{offer.body}</p>
+      </div>
       <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-2">
         <a
           href={offer.href}

@@ -155,20 +155,20 @@ export function CaseDetail({
           </div>
         </div>
         <h2 id="case-title" ref={title} tabIndex={-1} style={{ outline: "none" }} className="mt-1 text-lg font-semibold text-slate-950">{caseTitle(item)}</h2>
-        <CopyCommand command={item.command} copy={item.commandWhole} className="mt-3" />
+        <CopyCommand command={item.command} copy={item.commandWhole} className="mt-2" />
         {item.hiddenCharacters || notWhole !== undefined ? (
           <p className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-slate-500">
             {item.hiddenCharacters ? <HiddenChip /> : null}
             {notWhole === undefined ? null : <span data-not-whole>{notWhole}</span>}
           </p>
         ) : null}
-        <dl className="mt-4 space-y-4">
+        <dl className="mt-3 space-y-3">
           <Row term="What happened">
             <Segments segments={item.happened} />
           </Row>
           <Row term="What InnerWarden did">
             <p>{item.did}</p>
-            <div className="mt-2 max-w-md rounded-xl border border-slate-200 bg-slate-50 px-3 pb-2 pt-3">
+            <div className="mt-1.5 max-w-md rounded-xl border border-slate-200 bg-slate-50 px-3 pb-1.5 pt-2.5">
               <Steps steps={steps} label="How far InnerWarden got with this case" captions compact className="w-full" />
             </div>
           </Row>
@@ -326,44 +326,44 @@ export function MessageDetail({ item, os, installed, hostMode = "unknown" }: { i
   const step = messageStep(item.outcomeKey, hostMode);
   return (
     <div className="min-w-0 space-y-4">
-    <section aria-labelledby="case-title" data-case={item.id} className={CARD}>
-      <Eyebrow glyph="chat">Messages to your AI agent · {item.channelWords}</Eyebrow>
-      <h2 id="case-title" ref={title} tabIndex={-1} style={{ outline: "none" }} className="mt-1 text-lg font-semibold text-slate-950">
-        Someone on {item.channelWords} asked your agent to do something risky
-      </h2>
-      <p className="mt-3 break-words rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm leading-6 text-slate-900 [overflow-wrap:anywhere]">{item.detail}</p>
-      {item.hiddenCharacters ? (
-        <p className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-slate-500">
-          <HiddenChip />
-          <span>Characters the chat did not show are written out, the way the model read them.</span>
-        </p>
-      ) : null}
-      <dl className="mt-4 space-y-4">
-        <Row term="What happened">
-          Someone on {item.channelWords} sent this to your agent on <When at={item.at} />.
-        </Row>
-        <Row term="What InnerWarden did">
-          <p>
-            Recorded it. {item.decider}
-            {declined ? "; nothing was enforced, because observe records and does not block." : "."}
+      <section aria-labelledby="case-title" data-case={item.id} className={CARD}>
+        <Eyebrow glyph="chat">Messages to your AI agent · {item.channelWords}</Eyebrow>
+        <h2 id="case-title" ref={title} tabIndex={-1} style={{ outline: "none" }} className="mt-1 text-lg font-semibold text-slate-950">
+          Someone on {item.channelWords} asked your agent to do something risky
+        </h2>
+        <p className="mt-3 break-words rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm leading-6 text-slate-900 [overflow-wrap:anywhere]">{item.detail}</p>
+        {item.hiddenCharacters ? (
+          <p className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-slate-500">
+            <HiddenChip />
+            <span>Characters the chat did not show are written out, the way the model read them.</span>
           </p>
-          <div className="mt-2 max-w-md rounded-xl border border-slate-200 bg-slate-50 px-3 pb-2 pt-3">
-            <Steps steps={steps} label="How far InnerWarden got with this message" captions compact className="w-full" />
-          </div>
-        </Row>
-        <Row term="What you can do">
-          <p>{step.text}</p>
-          {step.command === undefined ? null : <CopyCommand command={step.command} className="mt-1" />}
-        </Row>
-      </dl>
-      <TechnicalOnly>
-        <p className="mt-3 break-words text-xs text-slate-500 [overflow-wrap:anywhere]">
-          {item.sender === undefined ? "No sender on record." : `Sender: ${item.sender}.`} Decided by: {item.deciderKey}. Recommendation: {item.recommendation}.
-          {item.risk === undefined ? "" : ` Risk ${item.risk}, as the rules scored it.`}
-        </p>
-      </TechnicalOnly>
-    </section>
-    {offer === undefined ? null : <OfferLine offer={offer} installed={installed} />}
+        ) : null}
+        <dl className="mt-3 space-y-3">
+          <Row term="What happened">
+            Someone on {item.channelWords} sent this to your agent on <When at={item.at} />.
+          </Row>
+          <Row term="What InnerWarden did">
+            <p>
+              Recorded it. {item.decider}
+              {declined ? "; nothing was enforced, because observe records and does not block." : "."}
+            </p>
+            <div className="mt-1.5 max-w-md rounded-xl border border-slate-200 bg-slate-50 px-3 pb-1.5 pt-2.5">
+              <Steps steps={steps} label="How far InnerWarden got with this message" captions compact className="w-full" />
+            </div>
+          </Row>
+          <Row term="What you can do">
+            <p>{step.text}</p>
+            {step.command === undefined ? null : <CopyCommand command={step.command} className="mt-1" />}
+          </Row>
+        </dl>
+        <TechnicalOnly>
+          <p className="mt-3 break-words text-xs text-slate-500 [overflow-wrap:anywhere]">
+            {item.sender === undefined ? "No sender on record." : `Sender: ${item.sender}.`} Decided by: {item.deciderKey}. Recommendation: {item.recommendation}.
+            {item.risk === undefined ? "" : ` Risk ${item.risk}, as the rules scored it.`}
+          </p>
+        </TechnicalOnly>
+      </section>
+      {offer === undefined ? null : <OfferLine offer={offer} installed={installed} />}
     </div>
   );
 }

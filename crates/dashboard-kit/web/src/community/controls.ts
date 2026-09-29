@@ -247,7 +247,7 @@ function messagesControl(protection: Protection, recorded: number | undefined): 
       ...base,
       status: "Needs OpenClaw",
       state: "none",
-      line: "Needs OpenClaw: records the risky messages people send your agent through a chat gateway.",
+      line: "Records the risky messages people send your agent through OpenClaw, a chat gateway. None is set up here.",
     };
   }
   return {

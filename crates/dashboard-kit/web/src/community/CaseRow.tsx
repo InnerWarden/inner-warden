@@ -28,8 +28,12 @@ export function rowKeys(event: KeyboardEvent<HTMLButtonElement>, move: (delta: n
   move(event.key === "ArrowDown" ? 1 : -1);
 }
 
-/** The command in a row: up to two lines, so the part that got it flagged (`| sh`) is rarely cut. */
-const ROW_TITLE = "line-clamp-2 break-words font-mono text-sm leading-5 text-slate-950 [overflow-wrap:anywhere]";
+/**
+ * The command in a row: up to two FULL lines, so the part that got it flagged
+ * (`| sh`) is rarely cut. It breaks anywhere: breaking at a space moved a long
+ * URL whole onto the second line and cut the pipe after it.
+ */
+const ROW_TITLE = "line-clamp-2 break-all font-mono text-sm leading-5 text-slate-950";
 
 /**
  * One flagged decision in a list: the command (two lines at most, whole on

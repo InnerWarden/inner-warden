@@ -388,7 +388,7 @@ describe("the first run", () => {
     expect(html).not.toContain("data-offer");
     // The connect command is said once, in the steps, not again in the card.
     expect(commandBoxes(html).filter((box) => box.text === "innerwarden agents connect --all --monitor").length).toBe(1);
-    expect(html).toContain("No agent is connected yet. Start above.");
+    expect(html).toContain("Start with the steps above.");
     // The page they are reading is not a step.
     expect(commandBoxes(html).some((box) => box.text === "innerwarden dashboard")).toBe(false);
     // No observe install where there is no OpenClaw.

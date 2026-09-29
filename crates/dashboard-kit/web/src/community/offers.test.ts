@@ -33,7 +33,10 @@ describe("which offer a case gets", () => {
         expect(body).not.toMatch(/would have/i);
       }
     }
-    for (const count of [0, 1, 761]) expect(serverOffer("macos", { count, span: "since 25 Sept" }).body).not.toMatch(/would have/i);
+    for (const count of [0, 1, 761]) {
+      const offer = serverOffer("macos", { count, span: "since 25 Sept" });
+      expect(`${offer.lead} ${offer.body}`).not.toMatch(/would have/i);
+    }
   });
 
   /** An offer under a case sits under the reader's own step: it must never outweigh it. */
@@ -103,12 +106,22 @@ describe("which offer a case gets", () => {
 describe("the Overview's offer", () => {
   /** It leads with the reader's own number, and the one capability about their agent. */
   it("leads with the flagged commands that ran here, then the agent's capability, then the server", () => {
-    const body = serverOffer("macos", { count: 761, span: "since 25 Sept" }).body;
-    expect(body.startsWith("761 flagged commands ran here since 25 Sept: Community relies on your agent asking first.")).toBe(true);
-    expect(body.indexOf("Execution Gate")).toBeLessThan(body.indexOf("host sensor"));
-    expect(serverOffer("macos", { count: 1, span: "in the last 7 days" }).body).toContain("1 flagged command ran here");
+    const offer = serverOffer("macos", { count: 761, span: "since 25 Sept" });
+    expect(offer.lead).toBe("761 flagged commands ran here since 25 Sept: Community relies on your agent asking first.");
+    expect(offer.body.indexOf("Execution Gate")).toBeLessThan(offer.body.indexOf("host sensor"));
+    expect(serverOffer("macos", { count: 1, span: "in the last 7 days" }).lead).toContain("1 flagged command ran here");
     // Nothing ran: no count is invented.
-    expect(serverOffer("macos", { count: 0, span: "in the last 7 days" }).body).not.toMatch(/\d/);
+    const none = serverOffer("macos", { count: 0, span: "in the last 7 days" });
+    expect(`${none.lead} ${none.body}`).not.toMatch(/\d/);
+  });
+
+  /** A paragraph over 160 characters is not read on a card; the two halves each fit. */
+  it("says its two halves in two short paragraphs", () => {
+    for (const os of ["linux", "macos"] as const) {
+      const offer = serverOffer(os, { count: 1_004, span: "since 25 Sept 2026" });
+      expect(offer.lead!.length).toBeLessThan(CASE_OFFER_MAX);
+      expect(offer.body.length).toBeLessThan(CASE_OFFER_MAX);
+    }
   });
 });
 

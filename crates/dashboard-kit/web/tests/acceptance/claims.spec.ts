@@ -280,7 +280,7 @@ test("Community language states its useful agent boundary without implying host 
     description: await normalizedText(lanes.locator("#lanes-title + p")),
     hostBoundaryTitle: await normalizedText(hostBoundary.locator("#lane-server_attacks-title")),
     hostBoundary: await normalizedText(hostBoundary.getByText("It does not watch this machine itself.", { exact: false })),
-    hostBoundaryOffer: await normalizedText(hostBoundary.locator("[data-ad-state='offer'] p").nth(1)),
+    hostBoundaryOffer: await normalizedText(hostBoundary.locator("[data-ad-state='offer'] [data-offer-words]")),
   };
 
   expect(language).toEqual(claimLanguageSnapshots.community);

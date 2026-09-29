@@ -19,7 +19,7 @@ test.describe("CJC-090-J004 local decision overview", () => {
     await expect(actions).toContainText("No agent is connected to the guard yet.");
     // The card does not repeat the steps above it.
     await expect(actions.locator("[data-command]")).toHaveCount(0);
-    await expect(actions).toContainText("Start above.");
+    await expect(actions).toContainText("Start with the steps above.");
     // Getting started says what to do; an empty "Recently flagged" would only repeat that nothing happened.
     await expect(page.getByRole("heading", { name: "Recently flagged" })).toHaveCount(0);
     await expect(page.getByText("No AI agent found on this machine.")).toBeVisible();
