@@ -1,0 +1,28 @@
+{
+  "alerts": {
+    "channels": 0
+  },
+  "generated_at_ms": 1790690700000,
+  "jail": {
+    "available": true,
+    "backend": "sandbox-exec"
+  },
+  "observe": {
+    "installed": true
+  },
+  "platform": {
+    "os": "macos"
+  },
+  "record": {
+    "recording": true
+  },
+  "schema_version": 1,
+  "second_opinion": {
+    "configured": false
+  },
+  "suppress": {
+    "allow": 2,
+    "mute_categories": 0,
+    "mute_rules": 1
+  }
+}

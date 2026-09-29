@@ -40,6 +40,22 @@ pub fn is_configured() -> bool {
     load_config().map(|c| c.has_valid_url()).unwrap_or(false)
 }
 
+/// The provider of a usable second-opinion endpoint ("openai" when the config
+/// names none), or `None` when none is configured. The name only: never the
+/// URL, the model or anything about the key.
+pub(crate) fn provider() -> Option<String> {
+    load_config()
+        .filter(|config| config.has_valid_url())
+        .map(|config| {
+            let provider = config.provider.trim();
+            if provider.is_empty() {
+                "openai".to_string()
+            } else {
+                provider.to_ascii_lowercase()
+            }
+        })
+}
+
 /// Whether the configured endpoint currently has a usable API key (env or file).
 /// Used by the wizard: a configured-but-keyless endpoint should let the user paste
 /// the key on a re-run instead of silently reporting "already set".

@@ -99,6 +99,13 @@ fn suppression_delta(
     out
 }
 
+/// The user's suppression config as it is on disk now, for the dashboard's
+/// counts and its "you have since allowed this" line. Never serialised whole:
+/// patterns can hold commands with keys in them.
+pub(crate) fn current() -> SuppressConfig {
+    load()
+}
+
 /// Apply user suppression to a rules verdict (best-effort). Returns an overriding
 /// verdict when the command is allowed/muted, else `None`.
 pub fn consider(command: &str, verdict: &Value) -> Option<Value> {
