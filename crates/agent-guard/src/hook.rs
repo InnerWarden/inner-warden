@@ -302,6 +302,38 @@ fn existing_agent_flag(settings: &Value) -> Option<Option<String>> {
         .map(|(_, agent)| agent)
 }
 
+/// For a hook that names no agent, the mode flag `agents connect claude-code`
+/// needs to rewrite it in the mode it already has (` --monitor`, ` --strict`,
+/// or nothing for enforce): run by hand, that adds the agent's name and
+/// changes nothing else. `None` when there is no hook, when it already names
+/// its agent, or when its entries disagree on a mode (a reconnect would pick
+/// one, which is not "nothing else").
+pub fn unnamed_hook_reconnect_flag(settings: &Value) -> Option<&'static str> {
+    if existing_agent_flag(settings) != Some(None) {
+        return None;
+    }
+    let modes: Vec<HookProtection> = settings
+        .get("hooks")
+        .and_then(|hooks| hooks.get("PreToolUse"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|entry| bash_matcher_coverage(entry) == BashMatcherCoverage::Includes)
+        .filter_map(|entry| entry.get("hooks").and_then(Value::as_array))
+        .flatten()
+        .filter_map(iwguard_hook_mode)
+        .collect();
+    let first = *modes.first()?;
+    if modes.iter().any(|mode| *mode != first) {
+        return None;
+    }
+    Some(match first {
+        HookProtection::Monitor => " --monitor",
+        HookProtection::Enforce => "",
+        HookProtection::BlockReview => " --strict",
+    })
+}
+
 /// Core installer with the home directory injected, so it is unit-testable
 /// against a temp dir without touching the real home. `iw_guard` is the path to
 /// this binary that the hook will invoke.
@@ -419,9 +451,16 @@ fn install_hook_with_link_policy(
         requested_mode
     };
     let (block_review, monitor) = effective_mode.flags();
-    // A NEW connection names its agent; an existing hook keeps whatever it
-    // named, including nothing (`existing_agent_flag`).
-    let agent_flag = existing_agent_flag(&existing).unwrap_or_else(|| Some(agent.to_string()));
+    // A NEW connection names its agent, and an existing hook that names one
+    // keeps it. A hook that names NONE (written before hooks named their
+    // agent) is left alone by background setup, which never churns a correct
+    // hook; a person who runs `install` or `agents connect` by hand gets the
+    // name added, which is the one way such a hook ever gains it.
+    let agent_flag = match existing_agent_flag(&existing) {
+        Some(Some(named)) => Some(named),
+        Some(None) if reject_symlinks => None,
+        _ => Some(agent.to_string()),
+    };
     let cmd = hook_command_for(iw_guard, block_review, monitor, agent_flag.as_deref());
     let merged = merge_pretooluse_bash_hook(existing.clone(), &cmd);
     // The observation half. Written with the SAME binary and the same mode
@@ -1306,13 +1345,55 @@ mod tests {
     }
 
     #[test]
-    fn reinstalling_keeps_whatever_agent_the_existing_hook_named() {
+    fn a_hand_run_install_names_an_unnamed_hook_and_background_setup_does_not() {
+        let unnamed = r#"{"hooks":{"PostToolUse":[{"matcher":"*","hooks":[{"type":"command","command":"\"/opt/innerwarden\" hook --monitor"}]}],"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"\"/opt/innerwarden\" hook --monitor"}]}]}}"#;
+        // By hand: the name is added, in the mode asked for.
+        let home = tempfile::TempDir::new().unwrap();
+        let settings = home.path().join(".claude/settings.json");
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        std::fs::write(&settings, unnamed).unwrap();
+        install_hook(
+            home.path(),
+            "claude-code",
+            None,
+            Path::new("/opt/innerwarden"),
+            false,
+            true,
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(
+            v["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+            "\"/opt/innerwarden\" hook --monitor --agent claude-code"
+        );
+        assert_eq!(unnamed_hook_reconnect_flag(&v), None, "it is named now");
+
+        // In the background: a correct hook is never rewritten to add a name.
+        let home = tempfile::TempDir::new().unwrap();
+        let settings = home.path().join(".claude/settings.json");
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        std::fs::write(&settings, unnamed).unwrap();
+        let result = install_hook_no_symlinks(
+            home.path(),
+            "claude-code",
+            None,
+            Path::new("/opt/innerwarden"),
+            false,
+            true,
+        )
+        .unwrap();
+        assert!(matches!(result, AutomaticHookInstall::SkippedExisting));
+        assert_eq!(std::fs::read_to_string(&settings).unwrap(), unnamed);
+    }
+
+    #[test]
+    fn a_hook_that_names_its_agent_keeps_the_name_on_reinstall() {
         let home = tempfile::TempDir::new().unwrap();
         let settings = home.path().join(".claude/settings.json");
         std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
         std::fs::write(
             &settings,
-            r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"\"/opt/innerwarden\" hook --monitor"}]}]}}"#,
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"\"/opt/innerwarden\" hook --monitor --agent claude-code"}]}]}}"#,
         )
         .unwrap();
         install_hook(
@@ -1326,9 +1407,33 @@ mod tests {
         .unwrap();
         let v: Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
         assert_eq!(
-            v["hooks"]["PreToolUse"][0]["hooks"][0]["command"], "\"/opt/innerwarden\" hook",
-            "switching mode rewrites the mode and adds no identity"
+            v["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+            "\"/opt/innerwarden\" hook --agent claude-code",
+            "switching mode rewrites the mode and keeps the name"
         );
+    }
+
+    #[test]
+    fn the_reconnect_flag_keeps_the_hooks_own_mode() {
+        let hook = |command: &str| json!({"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": command}]}]}});
+        assert_eq!(
+            unnamed_hook_reconnect_flag(&hook("\"/opt/innerwarden\" hook --monitor")),
+            Some(" --monitor")
+        );
+        assert_eq!(
+            unnamed_hook_reconnect_flag(&hook("\"/opt/innerwarden\" hook")),
+            Some("")
+        );
+        assert_eq!(
+            unnamed_hook_reconnect_flag(&hook("\"/opt/innerwarden\" hook --block-review")),
+            Some(" --strict")
+        );
+        assert_eq!(unnamed_hook_reconnect_flag(&json!({})), None);
+        let mixed = json!({"hooks": {"PreToolUse": [
+            {"matcher": "Bash", "hooks": [{"type": "command", "command": "\"/opt/innerwarden\" hook --monitor"}]},
+            {"matcher": "Bash", "hooks": [{"type": "command", "command": "\"/opt/innerwarden\" hook"}]},
+        ]}});
+        assert_eq!(unnamed_hook_reconnect_flag(&mixed), None);
     }
 
     #[test]

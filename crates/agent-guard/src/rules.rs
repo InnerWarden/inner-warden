@@ -460,6 +460,16 @@ impl RuleEngine {
     pub fn rule_count(&self) -> usize {
         self.rules.len()
     }
+
+    /// Each loaded rule's id and title (`ATR-2026-099`, "High-Risk Tool
+    /// Invocation Without Human Confirmation"), for a reader that names a rule
+    /// in words rather than by its id.
+    pub fn titles(&self) -> Vec<(String, String)> {
+        self.rules
+            .iter()
+            .map(|rule| (rule.id.clone(), rule.title.clone()))
+            .collect()
+    }
 }
 
 /// Does a rule declaring `declared` apply to a context of `actual`?
