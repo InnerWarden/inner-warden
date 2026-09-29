@@ -29,10 +29,19 @@ describe("the Protection tab", () => {
     expect(items.some((item) => item.label === "Posture")).toBe(false);
   });
 
-  it("leaves Community's navigation exactly as it was", () => {
+  it("gives Community the tabs its entry point hands in, and nothing from the paid shell", () => {
     expect(deriveShellNavigation(bootstrap("community"), "community")).toEqual([
       { route: "overview", label: "Overview" },
-      { route: "activity", label: "Activity" },
+    ]);
+    expect(
+      deriveShellNavigation(bootstrap("community"), "community", [], [
+        { route: "posture", label: "Protection" },
+        { route: "activity", label: "Cases" },
+      ]),
+    ).toEqual([
+      { route: "overview", label: "Overview" },
+      { route: "posture", label: "Protection" },
+      { route: "activity", label: "Cases" },
     ]);
   });
 
@@ -58,8 +67,8 @@ describe("the Protection tab", () => {
     expect(PAID_SCREEN_TOUR_STEPS.find((step) => step.route === "posture")?.title).toBe("Protection");
   });
 
-  /** Community's own sentence is not changed by a paid rename. */
-  it("keeps Community's sentence as it was", () => {
-    expect(outcomeNotRecordedNext("activity")).toBe("This host reports no outcome for its verdicts. Open Posture to see what each control is doing.");
+  /** Community's tab for the same route is called Protection too, and says what Community covers. */
+  it("sends Community to the tab its shell names Protection", () => {
+    expect(outcomeNotRecordedNext("activity")).toBe("This host reports no outcome for its verdicts. Open Protection to see what Community covers here.");
   });
 });
