@@ -130,19 +130,40 @@ export const INSTALLED_LINE = {
   command: "innerwarden get status",
 } as const;
 
-/** One paid capability, by the name the product is sold under. */
-export type PaidCapability = { key: string; glyph: "gate" | "key" | "globe" | "eye" | "decoy" | "shield" | "person"; name: string; line: string };
+/**
+ * One paid capability, by the name the product is sold under. `nameOnly`: the
+ * name is all this public page may say of it, so its line says nothing of the
+ * capability itself, and a fact from this machine takes the line's place.
+ */
+export type PaidCapability = {
+  key: string;
+  glyph: "gate" | "key" | "globe" | "eye" | "decoy" | "shield" | "person";
+  name: string;
+  line: string;
+  nameOnly?: true;
+};
 
 /** Protection's "Not in Community", in the words already public on innerwarden.com. */
 export const NOT_IN_COMMUNITY: readonly PaidCapability[] = [
   { key: "execution_gate", glyph: "gate", name: "Execution Gate", line: "A program nobody authorized does not start, even when the agent never asks the guard." },
-  { key: "secret_read_guard", glyph: "key", name: "Secret Read Guard", line: "Part of Active Defence." },
+  { key: "secret_read_guard", glyph: "key", name: "Secret Read Guard", line: "Part of Active Defence.", nameOnly: true },
   { key: "dns_guard", glyph: "globe", name: "DNS Guard", line: "Refuses domains you did not approve." },
   { key: "host_sensor", glyph: "eye", name: "Host sensor", line: "Watches programs and connections on the server, not only what the agent reports." },
   { key: "ssh_decoy", glyph: "decoy", name: "SSH decoy", line: "A decoy SSH login that records what attackers try." },
   { key: "automatic_response", glyph: "shield", name: "Automatic response", line: "Blocks an attacking address for a set time and checks the block held." },
   { key: "analyst_tools", glyph: "person", name: "Analyst tools", line: "Verdicts, blocking from a case, exclusions, and a second factor for changes." },
 ];
+
+/**
+ * The lines one "Not in Community" row prints, in order: what the capability
+ * does, then this machine's own fact. A name-only row with a fact prints the
+ * fact alone ("43 cases here reached for a credential file"), never
+ * "Part of Active Defence." above it.
+ */
+export function paidRowLines(capability: PaidCapability, fact: string | undefined): { line?: string; fact?: string } {
+  if (fact === undefined) return { line: capability.line };
+  return capability.nameOnly === true ? { fact } : { line: capability.line, fact };
+}
 
 /**
  * What happened ON THIS MACHINE that a paid row answers, from the CLI's

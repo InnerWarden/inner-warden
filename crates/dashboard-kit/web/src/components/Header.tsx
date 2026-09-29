@@ -39,14 +39,23 @@ export function Header<Route extends string>({
   status,
   account,
   navLayout = "wrap",
+  technicalLabel,
 }: {
   /**
    * "wrap" (the default, today's markup): below the small breakpoint the tabs
    * wrap onto a second line. "fit": below it they share ONE row in equal
    * columns with smaller type, for a shell with few, short tabs (Community's
-   * five), so a phone does not lose a row to one orphan tab.
+   * five), so a phone does not lose a row to one orphan tab. From the small
+   * breakpoint up, "fit" also spends a little less space between the tabs and
+   * the header's parts, so five tabs and a status keep one row at a desk.
    */
   navLayout?: "wrap" | "fit";
+  /**
+   * The words drawn beside the technical switch, for a shell whose one header
+   * row is full. Absent: "Show technical detail". The switch's accessible name
+   * is "Show technical detail" either way.
+   */
+  technicalLabel?: string;
   editionLabel: string;
   version?: string;
   navigation: HeaderNavigationItem<Route>[];
@@ -99,7 +108,11 @@ export function Header<Route extends string>({
 
   return (
     <header className="relative border-b border-slate-200 bg-white">
-      <div className="mx-auto flex max-w-6xl flex-wrap items-center gap-x-3 gap-y-2 px-4 py-2 sm:gap-x-5 sm:gap-y-3 sm:px-6 sm:py-3 lg:px-8">
+      {/* With the Linux runner's fonts (DejaVu Sans) Community's one row at
+          1440 was 25 px short beside "Partly connected" and 50 px short beside
+          "Open to the network". "fit" gives back 36 px from the gaps and the
+          tabs' padding, and Community's shorter switch words 35 more. */}
+      <div className={`mx-auto flex max-w-6xl flex-wrap items-center gap-x-3 gap-y-2 px-4 py-2 ${navLayout === "fit" ? "sm:gap-x-4" : "sm:gap-x-5"} sm:gap-y-3 sm:px-6 sm:py-3 lg:px-8`}>
         <button
           type="button"
           onClick={() => navigate(homeRoute)}
@@ -138,7 +151,7 @@ export function Header<Route extends string>({
                 onClick={() => navigate(item.route)}
                 aria-current={activeRoute === item.route ? "page" : undefined}
                 aria-pressed={activeRoute === item.route}
-                className={`rounded-lg ${navLayout === "fit" ? "min-w-0 px-1 py-2 text-xs sm:px-2.5 sm:text-sm" : "px-3 py-2 text-sm"} font-semibold transition-colors ${
+                className={`rounded-lg ${navLayout === "fit" ? "min-w-0 px-1 py-2 text-xs sm:px-2 sm:text-sm" : "px-3 py-2 text-sm"} font-semibold transition-colors ${
                   activeRoute === item.route
                     ? "bg-slate-900 text-white"
                     : "text-slate-600 hover:bg-slate-100 hover:text-slate-950"
@@ -157,7 +170,7 @@ export function Header<Route extends string>({
           *
           * `min-w-0`, so a long status (a 64-character name) wraps inside the
           * header instead of pushing it past the edge. */}
-        <div className="ml-auto flex min-w-0 items-center gap-2 text-xs sm:gap-3">
+        <div className={`ml-auto flex min-w-0 items-center gap-2 text-xs ${navLayout === "fit" ? "" : "sm:gap-3"}`}>
           <button
             ref={menuButton}
             type="button"
@@ -173,12 +186,12 @@ export function Header<Route extends string>({
             ref={menuPanel}
             id="header-menu"
             {...{ [HEADER_TOUR_SLOT]: "" }}
-            className={`${menuOpen ? "absolute right-4 top-full z-40 mt-1 flex max-w-[calc(100vw-2rem)] flex-col items-start gap-3 rounded-xl border border-slate-200 bg-white p-3 shadow-lg" : "hidden"} sm:static sm:z-auto sm:mt-0 sm:flex sm:max-w-none sm:flex-row sm:items-center sm:gap-3 sm:rounded-none sm:border-0 sm:bg-transparent sm:p-0 sm:shadow-none`}
+            className={`${menuOpen ? "absolute right-4 top-full z-40 mt-1 flex max-w-[calc(100vw-2rem)] flex-col items-start gap-3 rounded-xl border border-slate-200 bg-white p-3 shadow-lg" : "hidden"} sm:static sm:z-auto sm:mt-0 sm:flex sm:max-w-none sm:flex-row sm:items-center ${navLayout === "fit" ? "sm:gap-2" : "sm:gap-3"} sm:rounded-none sm:border-0 sm:bg-transparent sm:p-0 sm:shadow-none`}
           >
             {account === undefined ? null : (
               <p data-header-account className="text-xs font-medium text-slate-700 [overflow-wrap:anywhere] min-[400px]:hidden">{account}</p>
             )}
-            <TechnicalDetailToggle />
+            <TechnicalDetailToggle label={technicalLabel} />
           </div>
           {status}
         </div>

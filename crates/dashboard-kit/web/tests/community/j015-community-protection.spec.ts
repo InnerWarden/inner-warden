@@ -38,9 +38,10 @@ test("Not in Community names the paid features, says nothing of how one works, a
   await expect(section.locator("li[data-paid]")).toHaveCount(7);
   const guard = section.locator('li[data-paid="secret_read_guard"]');
   await expect(guard).toContainText("Secret Read Guard");
-  await expect(guard).toContainText("Part of Active Defence.");
-  // Tied to this machine: a count of what happened here, and no word on how it works.
+  // Tied to this machine: a count of what happened here, and no word on how
+  // it works. The count takes the place of the name-only placeholder.
   await expect(guard.locator("[data-paid-fact]")).toHaveText("4 cases here reached for a credential file since 25 Sept 2026.");
+  await expect(guard).not.toContainText("Part of Active Defence.");
   await expect(section.locator('li[data-paid="execution_gate"] [data-paid-fact]')).toHaveText("21 flagged commands ran on this machine since 25 Sept 2026.");
   await expect(section.locator('li[data-paid="host_sensor"] [data-paid-fact]')).toHaveCount(0);
   const link = section.getByRole("link", { name: /Compare the editions/ });

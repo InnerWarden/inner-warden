@@ -114,7 +114,12 @@ export function OutcomeDot({ outcome, className = "" }: { outcome: string; class
 }
 
 /** A token longer than this may break anywhere (a path at 390 px); shorter ones never do. */
-const LONG_TOKEN = 28;
+export const LONG_TOKEN = 28;
+
+/** How a code token wraps: a short one ("my-app", ".ssh/") never breaks at its hyphen or dot. */
+export function tokenWrap(token: string): string {
+  return token.length > LONG_TOKEN ? "[overflow-wrap:anywhere]" : "whitespace-nowrap";
+}
 
 /**
  * A command's words, each kept whole on a line: a hyphen is a line-break
@@ -128,7 +133,7 @@ export function commandTokens(command: string, template: boolean): ReactNode[] {
   return parts.map((part, index) => {
     if (part.length === 0) return null;
     if (/^\s+$/.test(part)) return part;
-    const wrap = part.length > LONG_TOKEN ? "[overflow-wrap:anywhere]" : "whitespace-nowrap";
+    const wrap = tokenWrap(part);
     if (!template || !/<[^<>]+>/.test(part)) {
       return <span key={index} className={wrap}>{part}</span>;
     }

@@ -742,6 +742,7 @@ export function App({
         onNavigate={navigate}
         account={edition === "enterprise" ? signedInAccount(bootstrapResource) : undefined}
         navLayout={edition === "community" && community !== undefined ? "fit" : undefined}
+        technicalLabel={edition === "community" && community !== undefined ? "Technical detail" : undefined}
         status={edition === "community"
           // `data-meta-status` says which reading the status is drawn from:
           // a test waits on it, never on a default the page shows before

@@ -104,15 +104,22 @@ const render = (element: ReactElement) =>
     </MachineIntelligenceSeed.Provider>,
   );
 
-/** What a reader reads: the markup's text, tags gone, entities read back. */
+const ENTITIES: Record<string, string> = { "&#x27;": "'", "&quot;": '"', "&lt;": "<", "&gt;": ">", "&amp;": "&" };
+
+/**
+ * What a reader reads: the markup's text, tags gone, entities read back.
+ * Tags are removed until none is left (one pass can leave a tag its own
+ * removal put together), and entities are read back in ONE pass, so "&amp;lt;"
+ * stays "&lt;" as the page shows it.
+ */
 function textOf(html: string): string {
-  return html
-    .replace(/<[^>]+>/g, "")
-    .replace(/&#x27;/g, "'")
-    .replace(/&quot;/g, '"')
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&amp;/g, "&");
+  let text = html;
+  let previous: string;
+  do {
+    previous = text;
+    text = text.replace(/<[^<>]*>/g, "");
+  } while (text !== previous);
+  return text.replace(/&(?:#x27|quot|lt|gt|amp);/g, (entity) => ENTITIES[entity]);
 }
 
 /** Every command box's text, as a reader sees it (its words are spans). */
@@ -272,7 +279,10 @@ describe("the Overview", () => {
     const mac = render(<CommunityOverview context={context()} />);
     const server = mac.slice(mac.indexOf('data-lane="server_attacks"'));
     expect(server).toContain("Attacks on this machine");
-    expect(server).toContain("Community does not watch this. Active Defence does, on Linux servers.");
+    expect(server).toContain("Active Defence watches this on Linux servers.");
+    // Said once: the CLI's sentence says Community does not watch it, and the
+    // line under the heading does not say it again.
+    expect(textOf(server).match(/does not watch/g)).toHaveLength(1);
     expect(server).not.toContain("honeypot");
     const linux = render(<CommunityOverview context={context("", META, "linux")} />);
     expect(linux.slice(linux.indexOf('data-lane="server_attacks"'))).toContain("Attacks on this server");
@@ -337,8 +347,7 @@ describe("the Overview", () => {
     expect(html).toContain("6 more in a row, flagged for the same reason");
     expect(html).toContain("bash /tmp/agent-scratch/0e6f3c1a-5b2d-4c7e-9a10-2f3b4c5d6e7f/check.sh");
     expect(html).not.toContain("bash /tmp/build-cache/step-1.sh");
-    const text = html.replace(/<[^>]+>/g, " ");
-    expect(text).not.toMatch(/[0-9a-f]{8}-demo-4000/);
+    expect(textOf(html)).not.toMatch(/[0-9a-f]{8}-demo-4000/);
   });
 
   /** One reason can be three quarters of a real record: the list must still show the rest. */
@@ -420,6 +429,23 @@ describe("Cases", () => {
     const text = textOf(render(<CommunityCases context={context("?view=activity")} />));
     expect(text).not.toMatch(/\[ATR-/);
     expect(text).toContain("high-risk tool invocation without human");
+  });
+
+  /**
+   * A rule's quoted words are code, never stray backticks ("path: `.ssh/`."),
+   * and a short code word stays whole on a phone ("my-" / "app" before).
+   */
+  it("prints a rule's quoted words as code, kept whole", () => {
+    const credential = page1.items.find((item) => item.concern === "credential_read")!;
+    const detail = caseHtml(credential.id);
+    const story = detail.slice(detail.indexOf(">What happened</dt>"), detail.indexOf(">What InnerWarden did</dt>"));
+    expect(textOf(story)).not.toContain("`");
+    const codes = [...story.matchAll(/<code data-segment-code="" class="([^"]*)">([^<]*)<\/code>/g)];
+    expect(codes.map((match) => match[2])).toContain("my-app");
+    for (const [, classes, text] of codes) {
+      expect(classes, text).toContain(text.length > 28 ? "[overflow-wrap:anywhere]" : "whitespace-nowrap");
+    }
+    expect(codes.some(([, , text]) => text.startsWith("."))).toBe(true);
   });
 
   it("shows every case's three parts, in order, with what you can do", () => {

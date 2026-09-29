@@ -37,6 +37,17 @@ describe("the Community routes, read strictly", () => {
     expect(readOverviewRecord(overview.record)?.decisions).toBe(overview.record.decisions);
   });
 
+  /**
+   * A case's step line sits under the reader's one action: no plain line over
+   * 160 characters (spec). The scratch-script step read 175 and wrapped to
+   * three lines above its only button.
+   */
+  it("serves every step line a case can show in at most 160 characters", () => {
+    const lines = Object.values(byId).flatMap((detail) => readDecisionDetail(detail).item.next.map((step) => step.line));
+    expect(lines.length).toBeGreaterThan(10);
+    expect(lines.filter((line) => line.length > 160)).toEqual([]);
+  });
+
   it("drops one malformed item and keeps the rest", () => {
     const broken = { ...page1, items: [{ id: "x" }, ...page1.items] };
     expect(readDecisionsPage(broken).items).toHaveLength(page1.items.length);

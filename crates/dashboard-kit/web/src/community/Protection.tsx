@@ -9,7 +9,7 @@ import { fetchHistory, fetchProtection, fetchRecordHealth, readOverviewRecord, r
 import { communityControls, controlCounts, controlRing, someRefuse, type Control, type ControlCounts, type ControlState } from "./controls";
 import { dismissed } from "./dismiss";
 import { InstalledLine, OfferBox } from "./Offer";
-import { NOT_IN_COMMUNITY, paidRowFact, protectionOffer } from "./offers";
+import { NOT_IN_COMMUNITY, paidRowFact, paidRowLines, protectionOffer } from "./offers";
 import { CARD, Chip, CopyCommand, PageHeader, Skeleton, StaleLine, Unreadable, type ChipTone } from "./parts";
 import { usePolled } from "./poll";
 import { asPlatform, PLATFORM_WORDS } from "./words";
@@ -230,7 +230,7 @@ function NotInCommunity({ installed, flagged }: { installed: boolean; flagged?: 
       <div className={`mt-3 ${CARD}`}>
         <ul className="divide-y divide-slate-100">
           {NOT_IN_COMMUNITY.map((capability) => {
-            const fact = paidRowFact(capability.key, flagged, sinceWords);
+            const lines = paidRowLines(capability, paidRowFact(capability.key, flagged, sinceWords));
             return (
               <li key={capability.key} data-paid={capability.key} className="flex items-start gap-3 py-2.5 first:pt-0">
                 <Glyph name={capability.glyph} className="mt-0.5 h-4 w-4 text-slate-400" />
@@ -243,8 +243,8 @@ function NotInCommunity({ installed, flagged }: { installed: boolean; flagged?: 
                     </span>
                   </p>
                   <div className="min-w-0 text-sm leading-6">
-                    <p className="text-slate-600">{capability.line}</p>
-                    {fact === undefined ? null : <p data-paid-fact className="text-slate-800">{fact}</p>}
+                    {lines.line === undefined ? null : <p className="text-slate-600">{lines.line}</p>}
+                    {lines.fact === undefined ? null : <p data-paid-fact className="text-slate-800">{lines.fact}</p>}
                   </div>
                 </div>
               </li>

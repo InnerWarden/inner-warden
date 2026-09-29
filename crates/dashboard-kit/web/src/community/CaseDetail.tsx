@@ -10,7 +10,7 @@ import { CHANNEL_GLYPH } from "./CaseRow";
 import { caseLadder, messageLadder } from "./ladder";
 import { OfferLine } from "./Offer";
 import { caseOffer, messageOffer } from "./offers";
-import { Ago, CARD, CopyCommand, Eyebrow, HiddenChip, OutcomeDot } from "./parts";
+import { Ago, CARD, CopyCommand, Eyebrow, HiddenChip, OutcomeDot, tokenWrap } from "./parts";
 import { CHANNEL_WORDS, DECIDER_WORDS, OUTCOME_WORDS, shortSession, type PlatformOs } from "./words";
 
 /** A CLI sentence, printed as sent: text as text, a folder as code, a time through the page's clock. */
@@ -21,7 +21,7 @@ export function Segments({ segments }: { segments: readonly Segment[] }) {
         segment.kind === "time" ? (
           <When key={index} at={segment.at} />
         ) : segment.kind === "code" ? (
-          <code key={index} className="rounded bg-slate-100 px-1 font-mono text-[13px] text-slate-900">{segment.text}</code>
+          <code key={index} data-segment-code="" className={`rounded bg-slate-100 px-1 font-mono text-[13px] text-slate-900 ${tokenWrap(segment.text)}`}>{segment.text}</code>
         ) : (
           <span key={index}>{segment.text}</span>
         ),

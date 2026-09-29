@@ -169,12 +169,15 @@ export function CommunityOverview({ context }: { context: CommunityScreenContext
           onOpenCase={(caseId, lane) => openCases(lane === "agent_messages" ? { lane, decision: caseId } : { decision: caseId })}
           linkLabel={(lane) => (lane === "agent_actions" ? "See the flagged commands" : lane === "agent_messages" ? "See the messages" : undefined)}
           title={(lane) => (lane === "server_attacks" && os !== "linux" ? "Attacks on this machine" : undefined)}
+          // The CLI's own sentence under it already says Community does not
+          // watch this machine; the line under the heading says who does,
+          // never the paid card's "the honeypot, and what the kernel caught".
           blurb={(lane) =>
             lane !== "server_attacks"
               ? undefined
               : os === "linux"
-                ? "Community does not watch this. Active Defence does."
-                : "Community does not watch this. Active Defence does, on Linux servers."
+                ? "Active Defence watches this."
+                : "Active Defence watches this on Linux servers."
           }
           footer={(card) =>
             laneFooter(card, {

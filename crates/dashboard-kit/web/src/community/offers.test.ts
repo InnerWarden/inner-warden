@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 
 /** An en or an em dash, built at run time so this file carries neither. */
 const DASHES = new RegExp(`[${String.fromCharCode(0x2013)}${String.fromCharCode(0x2014)}]`);
-import { CASE_OFFER_MAX, caseOffer, EDITIONS_URL, INSTALLED_LINE, messageOffer, NOT_IN_COMMUNITY, paidRowFact, PRICING_URL, protectionOffer, serverOffer } from "./offers";
+import { CASE_OFFER_MAX, caseOffer, EDITIONS_URL, INSTALLED_LINE, messageOffer, NOT_IN_COMMUNITY, paidRowFact, paidRowLines, PRICING_URL, protectionOffer, serverOffer } from "./offers";
 import { DECISION_OUTCOMES, MESSAGE_OUTCOMES } from "./words";
 
 const CONCERNS = ["credential_read", "domain_fetch", "other"] as const;
@@ -138,5 +138,19 @@ describe("what a paid row says about this machine", () => {
     expect(paidRowFact("execution_gate", { ...flagged, ran: 0 }, "25 Sept")).toBeUndefined();
     expect(paidRowFact("host_sensor", flagged, "25 Sept")).toBeUndefined();
     expect(paidRowFact("execution_gate", undefined, "25 Sept")).toBeUndefined();
+  });
+
+  /**
+   * FAILS ON REVERT: Secret Read Guard read "Part of Active Defence." above
+   * this machine's own count, a placeholder where the count says more.
+   */
+  it("gives a name-only row's line up to this machine's fact, and keeps every other line", () => {
+    const row = (key: string) => NOT_IN_COMMUNITY.find((capability) => capability.key === key)!;
+    const fact = "3 cases here reached for a credential file since 25 Sept.";
+    expect(paidRowLines(row("secret_read_guard"), fact)).toEqual({ fact });
+    expect(paidRowLines(row("secret_read_guard"), undefined)).toEqual({ line: "Part of Active Defence." });
+    const gate = row("execution_gate");
+    expect(paidRowLines(gate, "19 flagged commands ran.")).toEqual({ line: gate.line, fact: "19 flagged commands ran." });
+    expect(NOT_IN_COMMUNITY.filter((capability) => capability.nameOnly === true).map((capability) => capability.key)).toEqual(["secret_read_guard"]);
   });
 });
