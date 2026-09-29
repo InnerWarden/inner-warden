@@ -53,7 +53,7 @@ function contrast(foreground: [number, number, number], background: [number, num
 
 test("primary navigation is keyboard-completable and exposes a visible focus indicator", async ({ page }) => {
   await page.goto(communityUrl);
-  await expect(page.getByRole("heading", { name: "Connect an agent to start screening its actions." })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "What is happening here" })).toBeVisible();
 
   const skipLink = page.getByRole("link", { name: "Skip to content" });
   await page.keyboard.press("Tab");
@@ -61,19 +61,40 @@ test("primary navigation is keyboard-completable and exposes a visible focus ind
   await expect(skipLink).toBeVisible();
   await expectVisibleFocus(skipLink);
 
-  const activity = page.getByRole("button", { name: "Activity" });
-  await tabTo(page, activity);
-  await expectVisibleFocus(activity);
+  // Every one of the five tabs is reached from the keyboard, in order, and
+  // shows where the focus is.
+  const nav = page.getByRole("navigation", { name: "Dashboard views" });
+  for (const label of ["Protection", "Cases", "Agents", "Tokens"]) {
+    const tab = nav.getByRole("button", { name: label, exact: true });
+    await tabTo(page, tab);
+    await expectVisibleFocus(tab);
+  }
+
+  const cases = nav.getByRole("button", { name: "Cases", exact: true });
+  await tabTo(page, cases, true);
   await page.keyboard.press("Enter");
   await expect(page).toHaveURL(/view=activity/);
-  await expect(page.getByRole("heading", { name: "Activity", exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Cases", exact: true, level: 1 })).toBeVisible();
 
-  const overview = page.getByRole("button", { name: "Overview", exact: true });
+  const overview = nav.getByRole("button", { name: "Overview", exact: true });
   await tabTo(page, overview, true);
   await expectVisibleFocus(overview);
   await page.keyboard.press("Enter");
   await expect(page).not.toHaveURL(/view=/);
-  await expect(page.getByRole("heading", { name: "Connect an agent to start screening its actions." })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "What is happening here" })).toBeVisible();
+});
+
+test("opening a Community case from the keyboard puts focus on its title", async ({ page }) => {
+  await page.goto(`${communityUrl}/?view=activity`);
+  const first = page.locator("[data-case-row] button").first();
+  await expect(first).toBeVisible();
+  await tabTo(page, first);
+  await expectVisibleFocus(first);
+  await page.keyboard.press("Enter");
+  const title = page.locator("section[data-case] h2");
+  await expect(title).toBeFocused();
+  // The row stays marked as the open one, for a screen reader too.
+  await expect(first).toHaveAttribute("aria-current", "true");
 });
 
 test("keyboard case selection preserves visible focus when detail context changes", async ({ page }) => {

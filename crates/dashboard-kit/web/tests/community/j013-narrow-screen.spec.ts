@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { expect, test, type Page } from "@playwright/test";
+import { CASE, COMMUNITY_TABS, PAGE_READY } from "./support";
 
 const bootstrap = JSON.parse(readFileSync(new URL("../fixtures/community/bootstrap.json", import.meta.url), "utf8"));
 const enterpriseBootstrap = JSON.parse(readFileSync(new URL("../fixtures/enterprise/bootstrap.json", import.meta.url), "utf8"));
@@ -7,8 +8,9 @@ const enterpriseBootstrap = JSON.parse(readFileSync(new URL("../fixtures/enterpr
 /**
  * A phone, 320 px wide. The page scrolled sideways (scrollWidth 337) and the
  * header took 175 of 640 px before anything the reader came for. Every
- * Community screen now fits the width, and the header is one row over the
- * nav, with the technical switch and the tour behind one button.
+ * Community page now fits the width, the five tabs wrap to a second line
+ * instead of scrolling, and the technical switch and the tour sit behind one
+ * button.
  */
 
 test.use({ viewport: { width: 320, height: 640 } });
@@ -24,10 +26,13 @@ async function pageWidth(page: Page) {
   }));
 }
 
-for (const [name, path, drawn] of [
-  ["Overview", "/", "#posture-title"],
-  ["Activity", "/?view=activity", '[data-tour="activity"]'],
-] as const) {
+const PAGES: [string, string, string][] = [
+  ...COMMUNITY_TABS.map(([label, path]) => [label, path, PAGE_READY[label]] as [string, string, string]),
+  ["A case", `/?view=activity&decision=${encodeURIComponent(CASE.domainFetch)}`, `section[data-case="${CASE.domainFetch}"]`],
+  ["A message", "/?view=activity&lane=agent_messages&decision=eaaf70209eb20103", 'section[data-case="eaaf70209eb20103"]'],
+];
+
+for (const [name, path, drawn] of PAGES) {
   test(`${name} fits a 320 px screen without scrolling sideways`, async ({ page }) => {
     await page.route("**/api/dashboard/v1/bootstrap", (route) =>
       route.fulfill({ json: { ...bootstrap, product_version: LONG_VERSION } }));
@@ -39,12 +44,21 @@ for (const [name, path, drawn] of [
   });
 }
 
-test("the header is one row over the nav, with the switch and the tour behind the menu", async ({ page }) => {
+test("the five tabs wrap inside the screen, and the header stays under a third of it", async ({ page }) => {
   await page.goto("/");
-  const header = page.locator("header");
-  await expect(page.getByRole("navigation", { name: "Dashboard views" })).toBeVisible();
-  const height = await header.evaluate((element) => element.getBoundingClientRect().height);
-  expect(height).toBeLessThan(120);
+  const nav = page.getByRole("navigation", { name: "Dashboard views" });
+  await expect(nav).toBeVisible();
+  const tabs = nav.getByRole("button");
+  await expect(tabs).toHaveCount(COMMUNITY_TABS.length);
+  for (const box of await tabs.evaluateAll((buttons) => buttons.map((button) => button.getBoundingClientRect().toJSON() as DOMRect))) {
+    expect(box.left).toBeGreaterThanOrEqual(0);
+    expect(box.right).toBeLessThanOrEqual(320);
+  }
+  const height = await page.locator("header").evaluate((element) => element.getBoundingClientRect().height);
+  expect(height).toBeLessThan(640 / 3);
+
+  // The mode is said in words at this width too, not a bare mark.
+  await expect(page.locator("header [data-meta-status]")).toHaveText(/Partly connected/);
 
   const toggle = page.getByRole("checkbox", { name: "Show technical detail" });
   await expect(toggle).toBeHidden();
@@ -84,7 +98,7 @@ test("the menu closes on Escape, on a press outside it, and on going to another 
   await expect(menu).toHaveAttribute("aria-expanded", "true");
   await toggle.click();
 
-  await page.getByRole("navigation", { name: "Dashboard views" }).getByRole("button", { name: "Activity" }).click();
+  await page.getByRole("navigation", { name: "Dashboard views" }).getByRole("button", { name: "Cases" }).click();
   await expect(menu).toHaveAttribute("aria-expanded", "false");
   await expect(toggle).toBeHidden();
 });

@@ -98,6 +98,7 @@ const FIRST_MEANINGFUL_CONTENT_BUDGET_MS = 4_000;
 const POLL_MIN_GAP_MS = 4_000; // the shell polls on a 5s interval; allow scheduling slack
 const POLL_MAX_REQUESTS_IN_WINDOW = 3; // over a ~7.5s observation window
 const MAX_CASES_PER_PAGE = 50; // a page must stay bounded regardless of the backend
+const MAX_COMMUNITY_CASES_PAGE_BYTES = 40_000; // one page of 25 flagged decisions, with their words and next steps
 const MAX_TOTAL_JS_BYTES = 830_000;
 const MAX_TOTAL_CSS_BYTES = 60_000;
 const MAX_SINGLE_ASSET_BYTES = 830_000;
@@ -124,9 +125,7 @@ test.describe("CJC-090 / spec 090 T155 — dashboard performance acceptance", ()
     await page.goto("/", { waitUntil: "commit" });
     // The Community shell's first meaningful, claim-honest content — not a spinner.
     await expect(page.getByText("Community", { exact: true })).toBeVisible();
-    await expect(
-      page.getByRole("heading", { name: "Connect an agent to start screening its actions." }),
-    ).toBeVisible();
+    await expect(page.getByRole("heading", { name: "What is happening here" })).toBeVisible();
     const elapsed = Date.now() - started;
     expect(
       elapsed,
@@ -215,15 +214,40 @@ test.describe("CJC-090 / spec 090 T155 — dashboard performance acceptance", ()
       }),
     );
 
-    await page.goto("/");
+    await page.goto("/?view=tokens");
+    // The plain row: the exact counter, never a float's rounding of it.
+    const row = page.locator('li[data-token-agent="codex"]');
+    await expect(row).toContainText(EXACT);
+    await expect(row).not.toContainText(LOSSY);
+
+    // The technical card keeps the exact string and the provenance words.
+    await page.getByRole("checkbox", { name: "Show technical detail" }).check();
     const card = page
-      .locator("li")
+      .locator('section[aria-labelledby="token-intelligence-title"] li')
       .filter({ has: page.getByRole("heading", { name: "Codex", exact: true }) });
     await expect(card).toContainText(EXACT);
     // Community claim language + no float corruption.
     await expect(card).not.toContainText(LOSSY);
     await expect(card).toContainText("Retained local history; not billing data.");
     await expect(card).not.toContainText("billing total");
+  });
+
+  test("Community Cases asks for one bounded page, and the page stays small", async ({ page }) => {
+    const pages: { limit: number; bytes: number }[] = [];
+    page.on("response", async (response) => {
+      const url = new URL(response.url());
+      if (url.pathname !== "/api/guard/decisions") return;
+      pages.push({ limit: Number(url.searchParams.get("limit")), bytes: (await response.body()).byteLength });
+    });
+    await page.goto("/?view=activity");
+    await expect(page.locator("[data-case-row]").first()).toBeVisible();
+    await expect.poll(() => pages.length).toBeGreaterThan(0);
+    for (const { limit, bytes } of pages) {
+      expect(limit, `a Cases page asked for ${limit} decisions; the cap is ${MAX_CASES_PER_PAGE}`).toBeGreaterThan(0);
+      expect(limit).toBeLessThanOrEqual(MAX_CASES_PER_PAGE);
+      // The page it replaced polled 227 KB every few seconds.
+      expect(bytes, `a Cases page weighed ${bytes} bytes`).toBeLessThan(MAX_COMMUNITY_CASES_PAGE_BYTES);
+    }
   });
 
   test("Enterprise case pagination stays bounded and cursor-driven", async ({ page }) => {

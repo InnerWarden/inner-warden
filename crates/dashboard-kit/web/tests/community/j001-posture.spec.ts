@@ -1,89 +1,109 @@
 import { expect, test } from "@playwright/test";
-import { casesPage, EMPTY_OVERVIEW, fulfillJson, installMachineDefaults } from "./support";
+import { COMMUNITY_TABS, fulfillJson, guardRoute, META } from "./support";
 
+/**
+ * CJC-090-J001. The Community shell: five tabs (the `activity` route is the
+ * one labelled Cases), the mode the guard runs in as ONE chip in words, and
+ * nothing that calls the dashboard local or safe unless the host said so.
+ */
 test.describe("CJC-090-J001 Community shell and posture", () => {
-  test("shows loading, fresh configured posture, navigation, and logo-home without reload", async ({ page }) => {
-    let releaseOverview!: () => void;
-    const overviewReady = new Promise<void>((resolve) => { releaseOverview = resolve; });
+  test("names the edition, shows the mode in words once guard/meta answers, and the logo goes home without a reload", async ({ page }) => {
+    let releaseMeta!: () => void;
+    const metaReady = new Promise<void>((resolve) => { releaseMeta = resolve; });
     let documentRequests = 0;
     page.on("request", (request) => {
       if (request.resourceType() === "document") documentRequests += 1;
     });
-
-    await page.route("**/api/guard/meta", (route) => fulfillJson(route, {
-      version: "0.16.4-fixture",
-      exposed: false,
-      edition: "community",
-      guardrail: { mode: "monitor", guarded_agents: 2 },
-    }));
-    await page.route("**/api/guard/overview", async (route) => {
-      await overviewReady;
-      await fulfillJson(route, EMPTY_OVERVIEW);
+    await page.route(guardRoute("meta"), async (route) => {
+      await metaReady;
+      await fulfillJson(route, { ...META, guardrail: { mode: "monitor", guarded_agents: 2 } });
     });
-    await page.route("**/api/cases**", (route) => fulfillJson(route, casesPage({ sessions: [], total_sessions: 0, total_commands: 0 })));
-    await installMachineDefaults(page);
 
     await page.goto("/");
     await expect(page.getByText("Community", { exact: true })).toBeVisible();
-    await expect(page.getByRole("status", { name: "Loading overview" })).toBeVisible();
-    releaseOverview();
+    const status = page.locator("header [data-meta-status]");
+    // Before the host answers, the header claims nothing.
+    await expect(status).toHaveAttribute("data-meta-status", "loading");
+    await expect(status).toHaveText(/Checking/);
+    releaseMeta();
+    await expect(status).toHaveAttribute("data-meta-status", "ready");
+    await expect(status).toHaveText(/Watching only/);
 
-    await expect(page.getByText("Monitor configured", { exact: true }).first()).toBeVisible();
-    await expect(page.getByText("2 agent integrations configured", { exact: true })).toBeVisible();
-    await expect(page.getByText("Local · read-only API", { exact: true })).toBeVisible();
-    await expect(page.getByRole("navigation", { name: "Dashboard views" })).toContainText("Overview");
-    await expect(page.getByRole("navigation", { name: "Dashboard views" })).toContainText("Activity");
+    const nav = page.getByRole("navigation", { name: "Dashboard views" });
+    await expect(nav.getByRole("button")).toHaveText(COMMUNITY_TABS.map(([label]) => label));
+    // The plain view never recites the API's own description of itself.
+    await expect(page.getByText("Local · read-only API", { exact: true })).toHaveCount(0);
+    await expect(page.getByText("Local only", { exact: true })).toHaveCount(0);
 
-    await page.getByRole("button", { name: "Activity", exact: true }).click();
-    await expect(page.getByRole("heading", { name: "Activity", exact: true })).toBeVisible();
+    await nav.getByRole("button", { name: "Cases", exact: true }).click();
+    await expect(page.getByRole("heading", { name: "Cases", exact: true, level: 1 })).toBeVisible();
+    await expect(page).toHaveURL(/\?view=activity$/);
     await page.getByRole("button", { name: "Go to overview" }).click();
-    await expect(page.getByRole("heading", { name: "Build confidence before you turn on blocking." })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "What is happening here" })).toBeVisible();
+    expect(new URL(page.url()).search).toBe("");
     expect(documentRequests).toBe(1);
   });
 
-  test("withdraws stale posture claims and restores them only after a fresh response", async ({ page }) => {
+  test("withdraws the mode when a refresh fails, and restores it only on a fresh answer", async ({ page }) => {
     let metaRequests = 0;
     await page.clock.install();
-    await page.route("**/api/guard/meta", async (route) => {
+    await page.route(guardRoute("meta"), async (route) => {
       metaRequests += 1;
       if (metaRequests === 2) {
         await fulfillJson(route, { error: "fixture_refresh_failed" }, 503);
         return;
       }
-      await fulfillJson(route, {
-        version: "0.16.4-fixture",
-        exposed: false,
-        edition: "community",
-        guardrail: { mode: "enforce", guarded_agents: 1 },
-      });
+      await fulfillJson(route, { ...META, guardrail: { mode: "enforce", guarded_agents: 1 } });
     });
-    await page.route("**/api/guard/overview", (route) => fulfillJson(route, EMPTY_OVERVIEW));
-    await installMachineDefaults(page);
 
     await page.goto("/");
-    await expect(page.getByText("Enforce configured", { exact: true }).first()).toBeVisible();
-    await page.clock.fastForward(5_000);
-    await expect(page.getByText("Last known local", { exact: true })).toBeVisible();
-    await expect(page.getByText("Status unknown", { exact: true })).toBeVisible();
-    await expect(page.getByRole("heading", { name: "Agent action security, with evidence." })).toBeVisible();
-    await expect(page.getByText("Enforce configured", { exact: true })).toHaveCount(0);
+    const status = page.locator("header [data-meta-status]");
+    await expect(status).toHaveAttribute("data-meta-status", "ready");
+    await expect(status).toHaveText(/Refusing/);
 
-    await page.clock.fastForward(5_000);
-    await expect(page.getByText("Enforce configured", { exact: true }).first()).toBeVisible();
-    await expect(page.getByText("Local · read-only API", { exact: true })).toBeVisible();
+    await page.clock.runFor(5_000);
+    await expect(status).toHaveAttribute("data-meta-status", "error");
+    await expect(status).toHaveText(/Status unknown/);
+    await expect(status).not.toHaveText(/Refusing/);
+    // The page itself stays: a failed refresh withdraws a claim, not the screen.
+    await expect(page.getByRole("heading", { name: "What is happening here" })).toBeVisible();
+
+    await page.clock.runFor(5_000);
+    await expect(status).toHaveAttribute("data-meta-status", "ready");
+    await expect(status).toHaveText(/Refusing/);
   });
 
-  test("does not infer a safe local endpoint when exposure evidence is absent", async ({ page }) => {
-    await page.route("**/api/guard/meta", (route) => fulfillJson(route, {
-      version: "0.16.4-fixture",
+  test("never calls the dashboard local when the host did not say where it listens", async ({ page }) => {
+    await page.route(guardRoute("meta"), (route) => fulfillJson(route, {
+      version: "1.5.0-fixture",
       edition: "community",
       guardrail: { mode: "unknown" },
     }));
-    await page.route("**/api/guard/overview", (route) => fulfillJson(route, EMPTY_OVERVIEW));
-    await installMachineDefaults(page);
     await page.goto("/");
+    const status = page.locator("header [data-meta-status]");
+    await expect(status).toHaveAttribute("data-meta-status", "ready");
+    await expect(status).toHaveText(/Status unknown/);
+    await page.getByRole("checkbox", { name: "Show technical detail" }).check();
+    await expect(status).not.toHaveText(/Local only/);
+    await expect(status).not.toHaveText(/Open to the network/);
+  });
 
-    await expect(page.getByText("Exposure unknown", { exact: true })).toBeVisible();
-    await expect(page.getByText("Local · read-only API", { exact: true })).toHaveCount(0);
+  test("says Local only in the technical view when the host says so, and nothing about it in the plain view", async ({ page }) => {
+    await page.route(guardRoute("meta"), (route) => fulfillJson(route, META));
+    await page.goto("/");
+    const status = page.locator("header [data-meta-status]");
+    await expect(status).toHaveAttribute("data-meta-status", "ready");
+    await expect(status).not.toHaveText(/Local only/);
+    await page.getByRole("checkbox", { name: "Show technical detail" }).check();
+    await expect(status).toHaveText(/Local only/);
+  });
+
+  test("opens each tab from its own address instead of falling back to Overview", async ({ page }) => {
+    for (const [label, path] of COMMUNITY_TABS.slice(1)) {
+      await page.goto(path);
+      await expect(page.getByRole("navigation", { name: "Dashboard views" }).getByRole("button", { name: label, exact: true }))
+        .toHaveAttribute("aria-current", "page");
+      await expect(page.getByRole("heading", { level: 1 }).first()).toBeVisible();
+    }
   });
 });

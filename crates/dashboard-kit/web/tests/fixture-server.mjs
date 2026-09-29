@@ -30,6 +30,8 @@ const apiFiles = fixture === "community"
     ["/api/guard/overview", "overview.json"],
     ["/api/guard/agents", "agents.json"],
     ["/api/guard/token-intelligence", "token-intelligence.json"],
+    ["/api/guard/protection", "protection.json"],
+    ["/api/guard/record-health", "record-health.json"],
   ])
   : new Map([
     ["/api/dashboard/v1/bootstrap", "bootstrap.json"],
@@ -80,10 +82,38 @@ const server = createServer(async (request, response) => {
       write(response, 405, "application/json; charset=utf-8", JSON.stringify({ error: "method_not_allowed" }));
       return;
     }
-    const path = new URL(request.url ?? "/", `http://127.0.0.1:${port}`).pathname;
+    const address = new URL(request.url ?? "/", `http://127.0.0.1:${port}`);
+    const path = address.pathname;
     if (path === "/healthz") {
       write(response, 200, "text/plain; charset=utf-8", "ok\n");
       return;
+    }
+    // Community's routes that answer by query, from the files the CLI's own
+    // fixture writer rendered (`community_fixtures_match_what_the_cli_serves`).
+    if (fixture === "community") {
+      const json = "application/json; charset=utf-8";
+      if (path === "/api/guard/decisions") {
+        const file = address.searchParams.has("cursor") ? "decisions-page-2.json" : "decisions-page-1.json";
+        const page = JSON.parse(await readFile(join(fixtureRoot, file), "utf8"));
+        // A smaller page (the Overview's five) is the first rows of the same
+        // page, with the cursor the server would send after them.
+        const limit = Number.parseInt(address.searchParams.get("limit") ?? "", 10);
+        if (Number.isInteger(limit) && limit > 0 && limit < page.items.length) page.items = page.items.slice(0, limit);
+        write(response, 200, json, JSON.stringify(page));
+        return;
+      }
+      if (path === "/api/guard/decision") {
+        const all = JSON.parse(await readFile(join(fixtureRoot, "decisions-by-id.json"), "utf8"));
+        const found = all[address.searchParams.get("id") ?? ""];
+        if (found === undefined) write(response, 404, json, JSON.stringify({ error: "decision_not_in_record" }));
+        else write(response, 200, json, JSON.stringify(found));
+        return;
+      }
+      if (path === "/api/guard/history") {
+        const file = address.searchParams.get("kind") === "attempt" ? "history-attempts.json" : "history.json";
+        write(response, 200, json, await regularFile(join(fixtureRoot, file)));
+        return;
+      }
     }
     const fixtureFile = apiFiles.get(path);
     if (fixtureFile) {
