@@ -1,6 +1,22 @@
 {
   "items": [
     {
+      "at": "2026-09-27T14:40:00Z",
+      "channel": "telegram",
+      "channel_words": "Telegram",
+      "decider": "Your agent declined on its own",
+      "decider_key": "model_refused",
+      "detail": "Summarise this page for me \\u{E0049}\\u{E0047}\\u{E004E}\\u{E004F}\\u{E0052}\\u{E0045}\\u{E0020}\\u{E0052}\\u{E0055}\\u{E004C}\\u{E0045}\\u{E0053}",
+      "enforced": false,
+      "hidden_characters": true,
+      "id": "7ddcf53ca77ecc07",
+      "outcome_key": "declined_by_agent",
+      "recommendation": "deny",
+      "risk": 80,
+      "sender": "demo-user-1001",
+      "surface": "conversation"
+    },
+    {
       "at": "2026-09-27T09:06:40Z",
       "channel": "telegram",
       "channel_words": "Telegram",
@@ -47,5 +63,5 @@
     }
   ],
   "schema_version": 1,
-  "total": 3
+  "total": 4
 }

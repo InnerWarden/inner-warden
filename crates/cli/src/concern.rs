@@ -201,12 +201,67 @@ pub fn is_mutable_rule(rule: &str) -> bool {
     rule.to_ascii_uppercase().starts_with("ATR-")
 }
 
+/// A title in the case a sentence uses: "High-Risk Tool Invocation" is
+/// "high-risk tool invocation". A word with two or more capitals (an acronym
+/// such as MCP or SSRF, or OAuth) keeps its case.
+fn sentence_case(title: &str) -> String {
+    title
+        .split(' ')
+        .map(|word| {
+            if word.chars().filter(|c| c.is_uppercase()).count() >= 2 && !word.contains('-') {
+                word.to_string()
+            } else {
+                word.to_lowercase()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// A few words for an ATR rule, from its title in the rules this binary
+/// ships (`rules/atr`), read once. `None` for an id those rules do not hold.
+pub fn atr_short_words(rule: &str) -> Option<String> {
+    use std::collections::HashMap;
+    use std::sync::OnceLock;
+    static TITLES: OnceLock<HashMap<String, String>> = OnceLock::new();
+    if !is_mutable_rule(rule) {
+        return None;
+    }
+    let titles = TITLES.get_or_init(|| {
+        innerwarden_agent_guard::rules::RuleEngine::load_embedded()
+            .titles()
+            .into_iter()
+            .collect()
+    });
+    titles
+        .get(rule)
+        .map(|title| cut_words(&sentence_case(title), 40))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn rules(ids: &[&str]) -> Vec<String> {
         ids.iter().map(|id| id.to_string()).collect()
+    }
+
+    #[test]
+    fn an_atr_rule_is_named_by_its_title_in_sentence_case() {
+        assert_eq!(
+            atr_short_words("ATR-2026-099").as_deref(),
+            Some("high-risk tool invocation without human…")
+        );
+        assert_eq!(
+            sentence_case("MCP Tool Supply Chain Poisoning"),
+            "MCP tool supply chain poisoning"
+        );
+        assert_eq!(
+            sentence_case("OAuth and API Token Interception"),
+            "OAuth and API token interception"
+        );
+        assert_eq!(atr_short_words("ATR-1999-000"), None);
+        assert_eq!(atr_short_words("tmp_execution"), None);
     }
 
     #[test]

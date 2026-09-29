@@ -94,5 +94,10 @@
   "availability": "available",
   "discovery_limited": false,
   "generated_at_ms": 1790690700000,
-  "schema_version": 2
+  "schema_version": 2,
+  "screened_by_channel": {
+    "hook": "2026-09-29T14:03:00Z",
+    "mcp": "2026-09-29T12:05:00Z"
+  },
+  "unnamed_by_channel": {}
 }

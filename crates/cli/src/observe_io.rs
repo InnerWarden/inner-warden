@@ -395,6 +395,15 @@ fn cmd_install(rest: &[String]) -> std::process::ExitCode {
     std::process::ExitCode::SUCCESS
 }
 
+/// Whether this machine has an OpenClaw config for `observe install` to write
+/// into. Without one, `observe install` changes nothing and exits 1, so the
+/// dashboard never offers it.
+pub(crate) fn openclaw_present() -> bool {
+    innerwarden_agent_guard::hook::home_dir()
+        .map(|home| openclaw_config(&home).is_file())
+        .unwrap_or(false)
+}
+
 /// Whether conversation attempts are observed on this host: the hook is
 /// installed and enabled. The same test `observe status` prints.
 pub(crate) fn installed() -> bool {

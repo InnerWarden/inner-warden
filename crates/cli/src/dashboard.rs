@@ -111,6 +111,22 @@ struct AgentView {
     /// agent is already refusing, or cannot be connected.
     #[serde(skip_serializing_if = "Option::is_none")]
     next_step: Option<AgentNextStep>,
+    /// For a hook written before hooks named their agent: the reconnect, in
+    /// the hook's own mode, that adds the name. Its cases say "An agent"
+    /// until then, and the page says why.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    identity_step: Option<AgentNextStep>,
+}
+
+/// The step that names an agent whose hook does not, from the hook's own
+/// settings (`unnamed_hook_reconnect_flag`), or `None`.
+fn identity_step(name: &str, settings: &serde_json::Value) -> Option<AgentNextStep> {
+    let flag = innerwarden_agent_guard::hook::unnamed_hook_reconnect_flag(settings)?;
+    Some(AgentNextStep {
+        label: "To name it in its cases:",
+        command: format!("innerwarden agents connect {name}{flag}"),
+        line: "Its hook was set up before hooks named their agent, so its cases say \"An agent\". Reconnecting in the same mode adds the name; nothing else changes.",
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -138,15 +154,20 @@ fn agent_next_step(
     }
     match mode {
         "not_configured" => {
-            let monitor = host_mode == "monitor";
+            // A host with no agent connected yet (or one that cannot be read)
+            // starts in monitor mode, as the Overview's Getting started and
+            // the agent card both say: `agents connect` alone would enforce.
+            let monitor = matches!(host_mode, "monitor" | "not_configured" | "unknown");
             Some(AgentNextStep {
                 label: "To put the guard in front of it:",
                 command: format!(
                     "innerwarden agents connect {name}{}",
                     if monitor { " --monitor" } else { "" }
                 ),
-                line: if monitor {
+                line: if host_mode == "monitor" {
                     "It joins your other agents in monitor mode: recorded, nothing refused."
+                } else if monitor {
+                    "It starts in monitor mode: every command is recorded and nothing is refused."
                 } else {
                     "Every command it tries is then screened, and a deny is refused."
                 },
@@ -326,6 +347,16 @@ fn agents_json_with_status(
                 auto_connect_eligible: policy_available
                     .then(|| crate::agent_policy::is_auto_connect_candidate(home, agent, &policy)),
                 next_step,
+                identity_step: if agent.hookable && effectively_guarded {
+                    let path = home.join(".claude/settings.json");
+                    innerwarden_agent_guard::file_update::read_config_no_symlinks(home, &path)
+                        .ok()
+                        .flatten()
+                        .and_then(|body| serde_json::from_slice::<serde_json::Value>(&body).ok())
+                        .and_then(|settings| identity_step(&agent.name, &settings))
+                } else {
+                    None
+                },
             }
         })
         .collect();
@@ -966,6 +997,7 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
                         record: &record,
                         guard_mode: &guard_mode,
                         observe_installed: crate::observe_io::installed(),
+                        openclaw_present: crate::observe_io::openclaw_present(),
                         log: &log,
                     };
                     let overview =
@@ -1005,24 +1037,20 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
             }
             "/api/guard/history" => {
                 let log = community.log();
-                let body = if query_param(&query, "kind").as_deref() == Some("attempt") {
-                    let limit = query_param(&query, "limit")
-                        .and_then(|limit| limit.parse::<usize>().ok())
-                        .unwrap_or(25);
-                    crate::dashboard_community::attempts_json(
-                        &log,
-                        query_param(&query, "cursor")
-                            .filter(|cursor| cursor.len() <= QUERY_VALUE_MAX)
-                            .as_deref(),
-                        limit,
-                    )
-                } else {
-                    crate::dashboard_community::history_json(&log, now_ms())
-                };
-                request.respond(json_response(body.to_string()))
+                let (status, body) = history_body(&log, &query, now_ms());
+                request.respond(json_response(body).with_status_code(status))
             }
             "/api/guard/protection" => {
                 let outage = graph_io::current_outage();
+                // What the record's flagged decisions reached for, so the paid
+                // rows can say what happened HERE. An unreadable record says
+                // no count at all.
+                let flagged = community.graph().ok().map(|graph| {
+                    crate::dashboard_community::flagged_concerns(
+                        &graph.flagged_summaries(),
+                        graph.record_span().oldest_at_ms,
+                    )
+                });
                 let facts = crate::dashboard_community::ProtectionFacts {
                     now_ms: now_ms(),
                     os: std::env::consts::OS,
@@ -1031,9 +1059,11 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
                     lost_actions: outage.as_ref().map(|outage| outage.lost),
                     jail_backend: crate::contain_io::jail_backend(),
                     observe_installed: crate::observe_io::installed(),
+                    openclaw_present: crate::observe_io::openclaw_present(),
                     alert_channels: crate::notify_io::channel_count(),
                     second_opinion_provider: crate::second_opinion_io::provider(),
                     suppress: crate::suppress_io::current(),
+                    flagged,
                 };
                 request.respond(json_response(
                     crate::dashboard_community::protection_json(&facts).to_string(),
@@ -1113,14 +1143,23 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
                     let snapshot = read_agent_snapshot(shared);
                     let body =
                         agent_payload_with_live_watcher(snapshot.json, watcher_status.as_ref());
-                    // Last screened, from the decisions that name each agent.
-                    // An unreadable record adds nothing and hides nothing.
-                    let seen = community
+                    // Last screened, from the decisions that name each agent,
+                    // or from its channel when it is the only agent on it. An
+                    // unreadable record adds nothing and hides nothing.
+                    let (seen, channels, unnamed) = community
                         .graph()
-                        .map(|graph| graph.agents_last_seen())
+                        .map(|graph| {
+                            (
+                                graph.agents_last_seen(),
+                                graph.channels_last_seen(),
+                                graph.unnamed_channels_last_seen(),
+                            )
+                        })
                         .unwrap_or_default();
                     request.respond(json_response(
-                        crate::dashboard_community::agents_with_last_screened(&body, &seen),
+                        crate::dashboard_community::agents_with_last_screened(
+                            &body, &seen, &channels, &unnamed,
+                        ),
                     ))
                 }
                 None => request.respond(json_error_response(503, "user home is unavailable")),
@@ -1263,6 +1302,7 @@ fn decision_query(query: &str) -> Result<innerwarden_graph::DecisionQuery, &'sta
         outcome,
         verdict,
         reason: bounded("reason")?,
+        reason_not: bounded("reason_not")?,
         session: bounded("session")?,
         text: bounded("q")?,
         cursor,
@@ -1287,6 +1327,43 @@ fn decisions_body(
             )
         }
         Err(code) => (400, serde_json::json!({ "error": code }).to_string()),
+    }
+}
+
+/// `GET /api/guard/history`, as a status and a body: the log counted, or with
+/// `kind=attempt` one page of messages. A messages cursor this log does not
+/// hold is a 400 with the same code the decisions route answers, never page
+/// one served again as "older".
+fn history_body(
+    log: &crate::dashboard_community::EventLog,
+    query: &str,
+    now_ms: u64,
+) -> (u16, String) {
+    if query_param(query, "kind").as_deref() != Some("attempt") {
+        return (
+            200,
+            crate::dashboard_community::history_json(log, now_ms).to_string(),
+        );
+    }
+    let limit = query_param(query, "limit")
+        .and_then(|limit| limit.parse::<usize>().ok())
+        .unwrap_or(25);
+    let cursor = query_param(query, "cursor");
+    if cursor
+        .as_deref()
+        .is_some_and(|cursor| cursor.len() > QUERY_VALUE_MAX)
+    {
+        return (
+            400,
+            serde_json::json!({ "error": "cursor_invalid" }).to_string(),
+        );
+    }
+    match crate::dashboard_community::attempts_json(log, cursor.as_deref(), limit) {
+        Ok(body) => (200, body.to_string()),
+        Err(()) => (
+            400,
+            serde_json::json!({ "error": "cursor_invalid" }).to_string(),
+        ),
     }
 }
 
@@ -1644,6 +1721,50 @@ mod tests {
         assert!(agent_next_step("cursor", "enforce", "automatic", "enforce", false).is_none());
         assert!(agent_next_step("x", "not_configured", "unsupported", "monitor", false).is_none());
         assert!(agent_next_step("x", "unknown", "automatic", "monitor", false).is_none());
+    }
+
+    #[test]
+    fn the_first_agent_on_a_new_host_is_connected_in_monitor_mode() {
+        // Nothing connected yet, or a host mode that could not be read: start
+        // watching, as Getting started and the agent card say. `agents
+        // connect` alone would enforce.
+        for host in ["not_configured", "unknown"] {
+            let step =
+                agent_next_step("claude-code", "not_configured", "automatic", host, false).unwrap();
+            assert_eq!(
+                step.command, "innerwarden agents connect claude-code --monitor",
+                "{host}"
+            );
+            assert!(step.line.contains("monitor mode"), "{host}");
+        }
+    }
+
+    #[test]
+    fn an_unnamed_hook_is_offered_the_reconnect_that_names_it_in_its_own_mode() {
+        let hook = |command: &str| serde_json::json!({"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": command}]}]}});
+        let step =
+            identity_step("claude-code", &hook("\"/opt/innerwarden\" hook --monitor")).unwrap();
+        assert_eq!(
+            step.command,
+            "innerwarden agents connect claude-code --monitor"
+        );
+        let step = identity_step("claude-code", &hook("\"/opt/innerwarden\" hook")).unwrap();
+        assert_eq!(step.command, "innerwarden agents connect claude-code");
+        assert!(identity_step(
+            "claude-code",
+            &hook("\"/opt/innerwarden\" hook --monitor --agent claude-code")
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn an_unknown_messages_cursor_is_a_400() {
+        let log = crate::dashboard_community::parse_event_log("");
+        let (status, body) = history_body(&log, "kind=attempt&cursor=nope", 0);
+        assert_eq!(status, 400);
+        assert!(body.contains("cursor_invalid"));
+        assert_eq!(history_body(&log, "kind=attempt", 0).0, 200);
+        assert_eq!(history_body(&log, "", 0).0, 200);
     }
 
     #[test]
