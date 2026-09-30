@@ -3,6 +3,35 @@
 All notable changes to InnerWarden are documented here. This project
 follows semantic versioning.
 
+## 1.5.0 - 2026-09-30
+
+### Added
+
+- **A dashboard you can read at a glance.** `innerwarden dashboard` now opens
+  on five pages in the same design as the full product: Overview (what your
+  agents did, messages sent to your agent, and what this machine does not
+  watch), Protection (what Community covers here, with what it refused for
+  you since the guard's log began), Cases, Agents and Tokens.
+- **Cases.** Every command or tool call the guard flagged is a case with three
+  answers: what happened, what InnerWarden did (seen, decided, enforced,
+  verified), and what you can do, as the exact `innerwarden` command. Runs of
+  one reason fold into one line; filters and links live in the address.
+- **An honest path to Active Defence.** At most one offer per page, tied to
+  the case on screen, dismissible, never a lock or a blur. Where Active
+  Defence is installed, the offer is one line saying so.
+
+### Changed
+
+- **Destroying the host's audit trail is HIGH**, not MEDIUM, and a denied
+  secret read is no longer MEDIUM.
+- **Counts say what they count.** One timestamp format, one count per
+  session on every screen, and a partial read says "at least N".
+
+### Fixed
+
+- **rustls 0.23.45** closes RUSTSEC-2026-0285.
+- **The vendored ATR rules carry their MIT notice.**
+
 ## 1.4.9 - 2026-09-08
 
 ### Fixed
