@@ -69,19 +69,95 @@ fn executable_on_path(names: &[&str], path_env: Option<&OsStr>) -> bool {
 }
 
 fn executable_file(path: &Path) -> bool {
-    let Ok(metadata) = std::fs::metadata(path) else {
-        return false;
+    path_fact(path) == hook::ProgramFact::Executable
+}
+
+/// What is at `path`, from metadata alone. Nothing is ever executed.
+///
+/// "Not there" and "could not look" are different answers: only the first may
+/// be reported as a broken hook.
+fn path_fact(path: &Path) -> hook::ProgramFact {
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return hook::ProgramFact::Missing
+        }
+        Err(_) => return hook::ProgramFact::Unreadable,
     };
     if !metadata.is_file() {
-        return false;
+        return hook::ProgramFact::NotExecutable;
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        metadata.permissions().mode() & 0o111 != 0
+        if metadata.permissions().mode() & 0o111 == 0 {
+            return hook::ProgramFact::NotExecutable;
+        }
     }
-    #[cfg(not(unix))]
-    true
+    hook::ProgramFact::Executable
+}
+
+/// Look for the program a hook runs, WITHOUT running it: file metadata for a
+/// path, and the same metadata-only `PATH` walk discovery uses for a bare name.
+/// A path relative to a directory is not looked up at all, because it is
+/// relative to wherever the agent starts; [`hook::judge_hook_program`] says so.
+fn program_fact(program: &str, path_env: Option<&OsStr>) -> hook::ProgramFact {
+    if !program.contains(['/', '\\']) {
+        return if executable_on_path(&[program], path_env) {
+            hook::ProgramFact::Executable
+        } else {
+            hook::ProgramFact::Missing
+        };
+    }
+    if !Path::new(program).is_absolute() {
+        return hook::ProgramFact::Unreadable;
+    }
+    path_fact(Path::new(program))
+}
+
+/// The one answer to "does Claude Code's hook screen Bash right now": a
+/// recognised hook under a matcher that covers Bash, whose program is there to
+/// start. A hook that could not be checked still counts, because "could not
+/// tell" is never "off"; one whose program is gone does not, because it
+/// screens nothing.
+fn claude_hook_screens(settings: &Value, path_env: Option<&OsStr>) -> bool {
+    matches!(
+        hook::judge_iwguard_hooks(settings, |program| program_fact(program, path_env)),
+        Some(hook::HookProgram::Runs | hook::HookProgram::Unknown { .. })
+    )
+}
+
+/// Whether the hook this agent is wired with runs a program that is there.
+/// `None` for an agent guarded some other way, or with no InnerWarden hook that
+/// screens Bash. Shared by `status`, `agents` and the dashboard so all three
+/// give the same answer.
+pub fn hook_program(home: &Path, agent: &AgentStatus) -> Option<hook::HookProgram> {
+    if !agent.hookable {
+        return None;
+    }
+    let settings = read_json(&home.join(".claude/settings.json"))?;
+    let path_env = std::env::var_os("PATH");
+    hook::judge_iwguard_hooks(&settings, |program| {
+        program_fact(program, path_env.as_deref())
+    })
+}
+
+/// The command that rewrites this agent's hook to point at the binary the user
+/// runs it with, in the mode the hook already has. It is the per-agent
+/// `install` command the CLI names everywhere else, never a second spelling.
+pub fn hook_repair_command(home: &Path, agent: &AgentStatus) -> String {
+    let install = crate::hook_targets::by_id(&agent.name)
+        .map(crate::hook_targets::guidance)
+        .unwrap_or_else(|| format!("innerwarden install {}", agent.name));
+    let flag = read_json(&home.join(".claude/settings.json"))
+        .map(|settings| hook::install_mode_flag(&settings))
+        .unwrap_or("");
+    format!("{install}{flag}")
 }
 
 fn marker_exists_without_following_symlinks(home: &Path, relative: &str) -> bool {
@@ -495,13 +571,13 @@ fn write_toml(
 /// Is the guard wired for this agent? Claude Code = the PreToolUse hook; an MCP
 /// agent = every stdio server in its config (reviewed JSON or Codex's TOML
 /// `[mcp_servers]`) routed through the proxy.
-fn is_guarded(home: &Path, agent: &str) -> bool {
+fn is_guarded(home: &Path, agent: &str, path_env: Option<&OsStr>) -> bool {
     let Some(k) = canonical(agent) else {
         return false;
     };
     if k.hookable {
         return read_json(&home.join(".claude/settings.json"))
-            .map(|v| hook::has_iwguard_hook(&v))
+            .map(|v| claude_hook_screens(&v, path_env))
             .unwrap_or(false);
     }
     if let Some(rel) = k.mcp_json {
@@ -608,8 +684,9 @@ pub fn status_has_guard_wiring(home: &Path, agent: &AgentStatus) -> bool {
 /// can repair it without falsely claiming active shell protection.
 pub fn status_is_effectively_guarded(home: &Path, agent: &AgentStatus) -> bool {
     if agent.hookable {
+        let path_env = std::env::var_os("PATH");
         return read_json(&home.join(".claude/settings.json"))
-            .map(|value| hook::has_iwguard_hook(&value))
+            .map(|value| claude_hook_screens(&value, path_env.as_deref()))
             .unwrap_or(false);
     }
     status_has_guard_wiring(home, agent)
@@ -641,7 +718,9 @@ fn rows_from_sources(
     path_env: Option<&OsStr>,
 ) -> (Vec<AgentStatus>, bool) {
     let (discovered, profile_limited) = discover_known(home, path_env);
-    let mut rows = summarize_discovered(running, &discovered, |name| is_guarded(home, name));
+    let mut rows = summarize_discovered(running, &discovered, |name| {
+        is_guarded(home, name, path_env)
+    });
 
     // A valid-looking MCP config is itself a discovery signal. Known paths have
     // richer reviewed rows above; every other match stays a generic MCP client
@@ -1111,11 +1190,22 @@ fn list_lines(home: &Path) -> Vec<String> {
                 "innerwarden agents, all {guarded} guardable agent(s) are wired. Nothing to connect."
             ),
             0 => "innerwarden agents, found (none of these can be wired automatically):".into(),
-            n => format!("innerwarden agents, found ({n} not wired yet):"),
+            // "Not guarded", not "not wired": a hook whose program is gone is
+            // wired and still screens nothing.
+            n => format!("innerwarden agents, found ({n} not guarded yet):"),
         });
         for r in &rows {
+            // A hook whose program is gone is wiring that screens nothing. It
+            // used to read "✓ guarded" here, as it did in `status` and on the
+            // dashboard, because a hook was judged by its text alone.
+            let broken = match (r.guarded, hook_program(home, r)) {
+                (false, Some(hook::HookProgram::Broken { problem, .. })) => Some(problem),
+                _ => None,
+            };
             let guard = if !r.guardable() {
                 "detected (guard manually)".to_string()
+            } else if broken.is_some() {
+                "✗ wired, but its hook cannot run".to_string()
             } else if r.guarded {
                 // Name the MODE, not just the mechanism. "guarded (hook)" was the
                 // same string whether the hook records or blocks.
@@ -1142,6 +1232,13 @@ fn list_lines(home: &Path) -> Vec<String> {
                 "detected".to_string()
             };
             out.push(format!("  {:<13} {:<34} {where_}", r.name, guard));
+            if let Some(problem) = broken {
+                out.push(format!(
+                    "  {:<13} {problem}, so nothing is screened. Fix: {}",
+                    "",
+                    hook_repair_command(home, r)
+                ));
+            }
         }
         // Only offer the action when there is something to act on.
         if pending > 0 {
@@ -1837,7 +1934,7 @@ mod tests {
         )
         .unwrap();
         assert!(has_guard_wiring(home.path(), "cursor"));
-        assert!(!is_guarded(home.path(), "cursor"));
+        assert!(!is_guarded(home.path(), "cursor", None));
 
         std::fs::create_dir_all(home.path().join(".codex")).unwrap();
         std::fs::write(
@@ -1846,7 +1943,7 @@ mod tests {
         )
         .unwrap();
         assert!(has_guard_wiring(home.path(), "codex"));
-        assert!(!is_guarded(home.path(), "codex"));
+        assert!(!is_guarded(home.path(), "codex", None));
     }
 
     #[test]
@@ -1891,7 +1988,7 @@ mod tests {
             "/abs/innerwarden",
         );
         assert!(output.iter().any(|line| line.contains("failed:")));
-        assert!(is_guarded(home.path(), "cursor"));
+        assert!(is_guarded(home.path(), "cursor", None));
     }
 
     #[test]
@@ -1924,6 +2021,153 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(home.path().join(".cursor/mcp.json")).unwrap(),
             existing
+        );
+    }
+
+    /// Wire Claude Code's hook at `bin` exactly as `install` writes it.
+    fn wire_claude_hook_at(home: &Path, bin: &Path) {
+        let settings = hook::merge_pretooluse_bash_hook(
+            serde_json::json!({}),
+            &hook::hook_command_for(bin, false, true, Some("claude-code")),
+        );
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::write(
+            home.join(".claude/settings.json"),
+            serde_json::to_vec_pretty(&settings).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// A hook is only text. When the program it names is gone, Claude Code's
+    /// exec fails, it reports a non-blocking hook error, and the command runs
+    /// unscreened. `status`, `agents` and the dashboard all called that agent
+    /// guarded, because each judged the hook by its text alone. Measured on a
+    /// real Mac whose hook pointed at a cleaned `target/release` build.
+    ///
+    /// All three now ask the one shared judgement, so this pins each surface
+    /// against the same file, then puts the program back and checks every one
+    /// of them returns to guarded.
+    #[test]
+    fn a_hook_whose_program_is_gone_is_not_guarded_on_any_surface() {
+        let home = tempfile::TempDir::new().unwrap();
+        let bin = home.path().join("cleaned/target/release/innerwarden");
+        wire_claude_hook_at(home.path(), &bin);
+
+        let (rows, _) = rows_from_sources(home.path(), &[], None);
+        let claude = rows.iter().find(|row| row.name == "claude-code").unwrap();
+        assert!(!claude.guarded, "the listing and status read this flag");
+        assert!(
+            !status_is_effectively_guarded(home.path(), claude),
+            "the dashboard reads this one"
+        );
+        assert!(
+            status_has_guard_wiring(home.path(), claude),
+            "the wiring is still there to repair; only the claim of screening changes"
+        );
+        match hook_program(home.path(), claude) {
+            Some(hook::HookProgram::Broken { program, problem }) => {
+                assert_eq!(program, bin.display().to_string());
+                assert!(problem.contains("which does not exist"), "{problem}");
+            }
+            other => panic!("a missing program must be reported as broken: {other:?}"),
+        }
+        assert_eq!(
+            hook_repair_command(home.path(), claude),
+            "innerwarden install claude-code --monitor",
+            "the remedy is the real install command, in the mode the hook had"
+        );
+
+        let listed =
+            run_with_guard_bin(home.path(), &["list".into()], "/abs/innerwarden").join("\n");
+        assert!(!listed.contains("✓ guarded"), "{listed}");
+        assert!(
+            listed.contains("✗ wired, but its hook cannot run"),
+            "{listed}"
+        );
+        assert!(
+            listed.contains(&format!(
+                "its hook runs {}, which does not exist",
+                bin.display()
+            )),
+            "{listed}"
+        );
+        assert!(
+            listed.contains("Fix: innerwarden install claude-code --monitor"),
+            "{listed}"
+        );
+
+        // The program comes back: every surface returns to guarded.
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let (rows, _) = rows_from_sources(home.path(), &[], None);
+        let claude = rows.iter().find(|row| row.name == "claude-code").unwrap();
+        assert!(claude.guarded);
+        assert!(status_is_effectively_guarded(home.path(), claude));
+        assert_eq!(
+            hook_program(home.path(), claude),
+            Some(hook::HookProgram::Runs)
+        );
+        let listed =
+            run_with_guard_bin(home.path(), &["list".into()], "/abs/innerwarden").join("\n");
+        assert!(listed.contains("✓ guarded (hook, monitor)"), "{listed}");
+    }
+
+    /// A file that is there but cannot be executed starts nothing either.
+    #[cfg(unix)]
+    #[test]
+    fn a_hook_whose_program_is_not_executable_is_not_guarded() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::TempDir::new().unwrap();
+        let bin = home.path().join("bin/innerwarden");
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o644)).unwrap();
+        wire_claude_hook_at(home.path(), &bin);
+
+        let (rows, _) = rows_from_sources(home.path(), &[], None);
+        let claude = rows.iter().find(|row| row.name == "claude-code").unwrap();
+        assert!(!claude.guarded);
+        match hook_program(home.path(), claude) {
+            Some(hook::HookProgram::Broken { problem, .. }) => {
+                assert!(
+                    problem.contains("which is not an executable file"),
+                    "{problem}"
+                )
+            }
+            other => panic!("a non-executable program must be reported as broken: {other:?}"),
+        }
+    }
+
+    /// A bare name is looked up along `PATH`, from metadata only, never run.
+    #[test]
+    fn a_bare_hook_program_is_found_along_path() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let bin = dir.path().join("innerwarden");
+        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let path_env = std::env::join_paths([dir.path()]).unwrap();
+        assert_eq!(
+            program_fact("innerwarden", Some(&path_env)),
+            hook::ProgramFact::Executable
+        );
+        let elsewhere = tempfile::TempDir::new().unwrap();
+        let path_env = std::env::join_paths([elsewhere.path()]).unwrap();
+        assert_eq!(
+            program_fact("innerwarden", Some(&path_env)),
+            hook::ProgramFact::Missing
+        );
+        assert_eq!(
+            program_fact("innerwarden", None),
+            hook::ProgramFact::Missing
         );
     }
 }

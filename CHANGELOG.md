@@ -3,6 +3,15 @@
 All notable changes to InnerWarden are documented here. This project
 follows semantic versioning.
 
+## Unreleased
+
+### Fixed
+
+- **A hook whose binary is gone is no longer "on".** `status`, `agents` and the
+  dashboard now say so, name the missing path and the `innerwarden install`
+  that fixes it. A week-old record no longer proves commands reach the guard,
+  and auto-connect logs a change once, not every minute.
+
 ## 1.5.0 - 2026-09-30
 
 ### Added

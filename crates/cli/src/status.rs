@@ -27,7 +27,38 @@
 //! as a fault in the thing that protects the machine.
 
 use innerwarden_agent_guard::agents::GuardMode;
+use innerwarden_agent_guard::hook::HookProgram;
 use std::fmt;
+
+/// How old the newest recorded decision may be before it stops counting as
+/// proof that commands are reaching the guard now.
+///
+/// The count alone was the proof, and a count never goes down: a hook that died
+/// weeks ago left `[on] N screening decision(s) recorded` on screen for as long
+/// as the record lasted. A week covers a quiet weekend and a short holiday
+/// without calling a working install stale.
+pub const EVIDENCE_STALE_AFTER_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// A wired agent whose hook is not known to run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookTrouble {
+    pub agent: String,
+    /// `Broken` or `Unknown`; an agent whose hook runs is never listed here.
+    pub program: HookProgram,
+    /// The command that rewrites the hook to a binary that is there.
+    pub next: String,
+}
+
+/// PURE: a duration a person reads at a glance, in its largest whole unit.
+pub fn age_words(secs: u64) -> String {
+    let (n, unit) = match secs {
+        0..=59 => return "less than a minute".into(),
+        60..=3_599 => (secs / 60, "minute"),
+        3_600..=86_399 => (secs / 3_600, "hour"),
+        _ => (secs / 86_400, "day"),
+    };
+    format!("{n} {unit}{}", if n == 1 { "" } else { "s" })
+}
 
 /// What we could establish about one aspect of the install.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,15 +169,22 @@ pub struct Facts {
     /// beginner three things "could not be read" when the answer is "you have
     /// not run setup" sends them looking for a fault that does not exist.
     pub never_configured: bool,
-    /// Agents this install is wired into. Empty means none wired, which is not
-    /// the same as none present.
+    /// Agents this install is wired into whose hook can run. Empty means none
+    /// wired, which is not the same as none present.
     pub wired_agents: Vec<String>,
+    /// Agents that are wired, but whose hook runs a program that is not there
+    /// (or could not be checked). Never also in `wired_agents`: a hook that
+    /// cannot start screens nothing, whatever its text says.
+    pub hook_trouble: Vec<HookTrouble>,
     /// Whether ANY agent process was visible, regardless of wiring.
     pub any_agent_seen: Option<bool>,
     /// Commands screened and recorded, allows included. `Some(0)` is a record
     /// that exists with nothing in it yet; `None` is a record that could not be
     /// read, which is a different sentence and must stay one.
     pub decisions_recorded: Option<u64>,
+    /// How long ago the newest decision was recorded. `None` when no decision
+    /// says when, which is "cannot tell", not "never".
+    pub newest_decision_age_secs: Option<u64>,
     /// Whether the local dashboard answered. `None` when it was not probed.
     pub dashboard_reachable: Option<bool>,
 }
@@ -194,6 +232,14 @@ pub fn assess(facts: &Facts) -> Vec<Finding> {
         // here and nothing failed, and saying otherwise sends the reader to a
         // config file that does not exist. The wiring line below is the one
         // that carries the actual news.
+        None if facts.wired_agents.is_empty() && !facts.hook_trouble.is_empty() => {
+            out.push(Finding::Unknown {
+                what: "No wired agent has a hook that runs, so no guard mode is in \
+                       effect."
+                    .into(),
+                why: "The wiring lines below say what is wrong and how to fix it.".into(),
+            })
+        }
         None if facts.wired_agents.is_empty() => out.push(Finding::Unknown {
             what: "No agent is wired, so there is no guard mode to report yet.".into(),
             why: "A mode belongs to wiring: connect an agent and this line \
@@ -214,13 +260,37 @@ pub fn assess(facts: &Facts) -> Vec<Finding> {
     }
 
     // ── Wiring ──────────────────────────────────────────────────────────────
+    // A hook is only text. Claude Code runs it, the exec fails, it reports a
+    // non-blocking hook error and the command goes ahead unscreened. This line
+    // said `[on] Wired into 1: claude-code.` on a Mac whose hook pointed at a
+    // cleaned build for weeks, so an agent is only "wired" here once the
+    // program its hook runs is there.
+    for trouble in &facts.hook_trouble {
+        match &trouble.program {
+            HookProgram::Broken { problem, .. } => out.push(Finding::NotWorking {
+                what: format!(
+                    "{} is wired, but {problem}, so none of its commands are screened.",
+                    trouble.agent
+                ),
+                next: trouble.next.clone(),
+            }),
+            HookProgram::Unknown { why, .. } => out.push(Finding::Unknown {
+                what: format!(
+                    "{} is wired, but I could not confirm its hook can run.",
+                    trouble.agent
+                ),
+                why: format!("{why}. If it does not, `{}` rewrites it.", trouble.next),
+            }),
+            HookProgram::Runs => {}
+        }
+    }
     if !facts.wired_agents.is_empty() {
         out.push(Finding::Working(format!(
             "Wired into {}: {}.",
             facts.wired_agents.len(),
             facts.wired_agents.join(", ")
         )));
-    } else {
+    } else if facts.hook_trouble.is_empty() {
         match facts.any_agent_seen {
             Some(true) => out.push(Finding::NotWorking {
                 what: "An agent is running but nothing is wired to the guard, so \
@@ -252,10 +322,37 @@ pub fn assess(facts: &Facts) -> Vec<Finding> {
                   agent and check again."
                 .into(),
         }),
-        Some(n) => out.push(Finding::Working(format!(
-            "{n} screening decision(s) recorded, so commands really are reaching \
-             the guard."
-        ))),
+        // The count only ever grows, so on its own it proves something reached
+        // the guard ONCE. Whether commands are reaching it NOW is the time of
+        // the newest one.
+        Some(n) => match facts.newest_decision_age_secs {
+            Some(age) if age <= EVIDENCE_STALE_AFTER_SECS => out.push(Finding::Working(format!(
+                "{n} screening decision(s) recorded, the newest {} ago, so commands \
+                 really are reaching the guard.",
+                age_words(age)
+            ))),
+            Some(age) => out.push(Finding::Unknown {
+                what: format!(
+                    "{n} screening decision(s) recorded, but the newest is {} old.",
+                    age_words(age)
+                ),
+                why: "That is too old to show commands are reaching the guard now. If \
+                      your agent has run commands since, they were not screened: \
+                      restart it so it reloads its hook, run one command through it, \
+                      and check again. `innerwarden agents` shows how each agent is \
+                      wired."
+                    .into(),
+            }),
+            None => out.push(Finding::Unknown {
+                what: format!(
+                    "{n} screening decision(s) recorded, but none says when it was \
+                     made."
+                ),
+                why: "So I cannot tell whether commands are reaching the guard now. \
+                      Run a command through your agent and check again."
+                    .into(),
+            }),
+        },
         None => out.push(Finding::Unknown {
             what: "The decision record could not be read.".into(),
             why: "Without it I cannot tell whether anything has been screened, \
@@ -371,8 +468,10 @@ mod tests {
             never_configured: false,
             mode: Some("enforce".into()),
             wired_agents: vec!["claude-code".into()],
+            hook_trouble: vec![],
             any_agent_seen: Some(true),
             decisions_recorded: Some(42),
+            newest_decision_age_secs: Some(90),
             dashboard_reachable: Some(true),
         }
     }
@@ -571,8 +670,10 @@ mod tests {
             never_configured: false,
             mode: None,
             wired_agents: vec![],
+            hook_trouble: vec![],
             any_agent_seen: None,
             decisions_recorded: None,
+            newest_decision_age_secs: None,
             dashboard_reachable: None,
         };
         for finding in assess(&facts) {
@@ -648,6 +749,261 @@ mod tests {
             Finding::Unknown { what, why }
                 if what.contains("No screening decisions") && why.contains("quiet machine")
         )));
+    }
+
+    /// Facts for an install whose only agent is wired to a hook whose program
+    /// the caller found in `fact`, as `main.rs` hands them over: an agent whose
+    /// hook does not run is in `hook_trouble` and NOT in `wired_agents`, and
+    /// with no readable wiring left there is no mode.
+    fn wired_to(program: &str, fact: ProgramFact, next: &str) -> Facts {
+        let mut f = healthy();
+        match judge_hook_program(program, fact) {
+            HookProgram::Runs => {}
+            verdict => {
+                f.wired_agents.clear();
+                f.mode = None;
+                f.hook_trouble = vec![HookTrouble {
+                    agent: "claude-code".into(),
+                    program: verdict,
+                    next: next.into(),
+                }];
+            }
+        }
+        f
+    }
+
+    use innerwarden_agent_guard::hook::{judge_hook_program, ProgramFact};
+
+    /// An absolute program path on this platform. `/x` is not absolute on
+    /// Windows, where this suite also runs.
+    fn abs(dir: &str) -> String {
+        if cfg!(windows) {
+            format!(r"C:\{dir}\innerwarden.exe")
+        } else {
+            format!("/{dir}/innerwarden")
+        }
+    }
+
+    /// REGRESSION ANCHOR, measured on a real Mac on 2026-09-30.
+    ///
+    /// The Claude Code hook pointed at a `target/release` build that had been
+    /// cleaned. Claude Code ran the hook, the exec failed as a non-blocking
+    /// error, and nothing was screened for weeks, while this command said
+    /// `[on] Wired into 1: claude-code.` under "on and screening".
+    ///
+    /// FAILS ON REVERT: drop the `hook_trouble` findings and nothing names the
+    /// path, the remedy is gone, and the headline claims protection.
+    #[test]
+    fn a_wired_hook_whose_program_is_gone_is_not_on() {
+        let program = abs("nonexistent/target/release");
+        let f = wired_to(
+            &program,
+            ProgramFact::Missing,
+            "innerwarden install claude-code --monitor",
+        );
+        let findings = assess(&f);
+        let (what, next) = findings
+            .iter()
+            .find_map(|x| match x {
+                Finding::NotWorking { what, next } if what.contains("claude-code") => {
+                    Some((what, next))
+                }
+                _ => None,
+            })
+            .expect("a dead hook must be reported as not working");
+        assert_eq!(
+            *what,
+            format!(
+                "claude-code is wired, but its hook runs {program}, which does not \
+                 exist, so none of its commands are screened."
+            )
+        );
+        assert_eq!(next, "innerwarden install claude-code --monitor");
+        assert_eq!(
+            headline(&findings),
+            "InnerWarden is installed but NOT fully protecting this machine."
+        );
+        let rendered = render(&f);
+        assert!(!rendered.contains("Wired into"), "{rendered}");
+        assert!(
+            !rendered.contains("No agent is wired"),
+            "an agent IS wired; its hook is what is broken:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("try: innerwarden install claude-code --monitor"),
+            "{rendered}"
+        );
+    }
+
+    /// The other side of the same line: a hook whose program is there stays on.
+    #[test]
+    fn a_wired_hook_whose_program_runs_stays_on() {
+        let f = wired_to(&abs("usr/local/bin"), ProgramFact::Executable, "unused");
+        let findings = assess(&f);
+        assert!(findings
+            .iter()
+            .any(|x| matches!(x, Finding::Working(what) if what == "Wired into 1: claude-code.")));
+        assert_eq!(headline(&findings), "InnerWarden is on and screening.");
+    }
+
+    #[test]
+    fn a_wired_hook_whose_program_is_not_executable_is_not_on() {
+        let program = abs("opt/iw");
+        let f = wired_to(
+            &program,
+            ProgramFact::NotExecutable,
+            "innerwarden install claude-code",
+        );
+        let findings = assess(&f);
+        let expected = format!("{program}, which is not an executable file");
+        assert!(
+            findings.iter().any(|x| matches!(
+                x,
+                Finding::NotWorking { what, next }
+                    if what.contains(&expected)
+                        && next == "innerwarden install claude-code"
+            )),
+            "{findings:?}"
+        );
+        assert!(headline(&findings).contains("NOT fully protecting"));
+    }
+
+    #[test]
+    fn a_wired_hook_whose_bare_program_is_not_on_path_is_not_on() {
+        let f = wired_to(
+            "innerwarden",
+            ProgramFact::Missing,
+            "innerwarden install claude-code",
+        );
+        let findings = assess(&f);
+        assert!(
+            findings.iter().any(|x| matches!(
+                x,
+                Finding::NotWorking { what, .. }
+                    if what.contains("its hook runs `innerwarden`, which is not on PATH")
+            )),
+            "{findings:?}"
+        );
+        assert!(headline(&findings).contains("NOT fully protecting"));
+    }
+
+    /// A hook that could not be checked is unknown, never off, and never on.
+    #[test]
+    fn a_hook_that_could_not_be_checked_is_unknown_not_off() {
+        let f = wired_to(
+            &abs("opt/iw"),
+            ProgramFact::Unreadable,
+            "innerwarden install claude-code",
+        );
+        let findings = assess(&f);
+        assert!(
+            findings.iter().any(|x| matches!(
+                x,
+                Finding::Unknown { what, why }
+                    if what == "claude-code is wired, but I could not confirm its hook can run."
+                        && why.contains("`innerwarden install claude-code` rewrites it")
+            )),
+            "{findings:?}"
+        );
+        assert!(
+            !findings.iter().any(
+                |x| matches!(x, Finding::NotWorking { what, .. } if what.contains("claude-code"))
+            ),
+            "could not tell is not off: {findings:?}"
+        );
+        assert!(!render(&f).contains("Wired into"));
+    }
+
+    /// REGRESSION ANCHOR for the second line on the same screen.
+    ///
+    /// `[on] N screening decision(s) recorded, so commands really are reaching
+    /// the guard` was decided by the all-time count, which never goes down. With
+    /// a dead hook it stayed on forever. It is now the time of the newest
+    /// decision that decides.
+    ///
+    /// FAILS ON REVERT: decide on the count alone and a month-old record reads
+    /// as `[on] ... really are reaching the guard`.
+    #[test]
+    fn old_decisions_do_not_claim_commands_are_reaching_the_guard() {
+        let mut f = healthy();
+        f.newest_decision_age_secs = Some(30 * 24 * 60 * 60);
+        let findings = assess(&f);
+        assert!(
+            !findings
+                .iter()
+                .any(|x| matches!(x, Finding::Working(what) if what.contains("reaching"))),
+            "a month-old decision is not commands reaching the guard: {findings:?}"
+        );
+        let (what, why) = findings
+            .iter()
+            .find_map(|x| match x {
+                Finding::Unknown { what, why } if what.contains("screening decision") => {
+                    Some((what, why))
+                }
+                _ => None,
+            })
+            .expect("stale evidence must be reported, not dropped");
+        assert_eq!(
+            what,
+            "42 screening decision(s) recorded, but the newest is 30 days old."
+        );
+        assert!(why.contains("restart it so it reloads its hook"), "{why}");
+        assert!(why.contains("`innerwarden agents`"), "{why}");
+        assert_eq!(
+            headline(&findings),
+            "InnerWarden is on, but some things could not be verified."
+        );
+    }
+
+    #[test]
+    fn recent_decisions_still_prove_commands_are_reaching_the_guard() {
+        let f = healthy();
+        let findings = assess(&f);
+        assert!(
+            findings.iter().any(|x| matches!(
+                x,
+                Finding::Working(what) if what == "42 screening decision(s) recorded, the \
+                    newest 1 minute ago, so commands really are reaching the guard."
+            )),
+            "{findings:?}"
+        );
+    }
+
+    /// The threshold is inclusive: a week old still counts, a second more does not.
+    #[test]
+    fn the_staleness_line_is_a_week() {
+        let mut f = healthy();
+        f.newest_decision_age_secs = Some(EVIDENCE_STALE_AFTER_SECS);
+        assert_eq!(headline(&assess(&f)), "InnerWarden is on and screening.");
+        f.newest_decision_age_secs = Some(EVIDENCE_STALE_AFTER_SECS + 1);
+        assert_ne!(headline(&assess(&f)), "InnerWarden is on and screening.");
+    }
+
+    /// A record whose decisions say nothing about when cannot prove "now".
+    #[test]
+    fn decisions_without_a_time_do_not_claim_commands_are_reaching_the_guard() {
+        let mut f = healthy();
+        f.newest_decision_age_secs = None;
+        let findings = assess(&f);
+        assert!(
+            findings.iter().any(|x| matches!(
+                x,
+                Finding::Unknown { what, .. } if what.contains("none says when it was made")
+            )),
+            "{findings:?}"
+        );
+        assert!(!findings
+            .iter()
+            .any(|x| matches!(x, Finding::Working(what) if what.contains("reaching"))));
+    }
+
+    #[test]
+    fn ages_read_in_their_largest_whole_unit() {
+        assert_eq!(age_words(5), "less than a minute");
+        assert_eq!(age_words(60), "1 minute");
+        assert_eq!(age_words(150), "2 minutes");
+        assert_eq!(age_words(3_600), "1 hour");
+        assert_eq!(age_words(86_400 * 3 + 5), "3 days");
     }
 
     /// A mode string nobody recognises is unknown, never silently treated as

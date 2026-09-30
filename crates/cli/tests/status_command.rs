@@ -203,3 +203,54 @@ fn the_mode_line_tracks_what_the_wiring_actually_does() {
          fine; a verdict nothing can reach teaches readers to ignore it:\n{screening}"
     );
 }
+
+/// REGRESSION ANCHOR, measured on a real Mac on 2026-09-30.
+///
+/// Claude Code's hook named a `target/release` build that had since been
+/// cleaned. Claude Code ran the hook, the exec failed as a non-blocking error,
+/// and nothing was screened for weeks, while this command said
+///
+///   [on]      Wired into 1: claude-code.
+///
+/// This is that settings file, over the real binary: the wiring line must name
+/// the missing program and the command that fixes it, and the headline must
+/// not claim protection.
+///
+/// FAILS ON REVERT: judge the hook by its text again and it reads as wired.
+#[test]
+fn a_hook_pointing_at_a_removed_build_is_not_reported_on() {
+    let home = tempfile::TempDir::new().expect("temp home");
+    let gone = home.path().join("cleaned/target/release/innerwarden");
+    let command = format!("\"{}\" hook --monitor --agent claude-code", gone.display());
+    std::fs::create_dir_all(home.path().join(".claude")).expect("agent config dir");
+    std::fs::write(
+        home.path().join(".claude/settings.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({"hooks": {"PreToolUse": [{
+            "matcher": "Bash",
+            "hooks": [{"type": "command", "command": command}]
+        }]}}))
+        .expect("settings json"),
+    )
+    .expect("write settings");
+
+    let out = run(home.path(), &["status"]);
+    assert!(
+        !out.contains("Wired into"),
+        "a hook that cannot start screens nothing:\n{out}"
+    );
+    assert!(
+        out.contains(&format!(
+            "claude-code is wired, but its hook runs {}, which does not exist",
+            gone.display()
+        )),
+        "name the program that is missing:\n{out}"
+    );
+    assert!(
+        out.contains("try: innerwarden install claude-code --monitor"),
+        "hand over the command that fixes it, in the mode the hook had:\n{out}"
+    );
+    assert!(
+        out.contains("InnerWarden is installed but NOT fully protecting this machine."),
+        "{out}"
+    );
+}
