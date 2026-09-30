@@ -117,6 +117,49 @@ pub enum Logged {
 /// The key the watcher files the policy's own read failures under.
 const POLICY_KEY: &str = "agent policy";
 
+/// The key the watcher files "my own binary cannot run" under.
+const SELF_KEY: &str = "dashboard binary";
+
+/// What Linux appends to `/proc/self/exe` once the running file was replaced.
+const DELETED_SUFFIX: &str = " (deleted)";
+
+/// PURE: the path this watcher may write into an agent's wiring, from the raw
+/// `current_exe` string and what the caller found at the candidate path.
+///
+/// The watcher writes its OWN path into every hook it repairs, and that path
+/// was never checked. Two ways it goes wrong on a real machine:
+///
+/// * a dashboard started from a `target/release` build keeps running after
+///   `cargo clean` removes it, and its next repair points a correct hook at a
+///   file that is gone, so nothing is screened from then on; and
+/// * after an in-place upgrade on Linux the running image reads as
+///   `/usr/local/bin/innerwarden (deleted)`. Written into a hook, that is a
+///   command nothing recognises as InnerWarden's, so it was APPENDED next to
+///   the valid hook rather than replacing it.
+///
+/// The suffix is stripped, and the path is used only when the caller found an
+/// executable file there: after an upgrade that is the new binary at the same
+/// path, which is the right target. Anything else is an `Err` carrying the one
+/// line to log, and the pass writes nothing.
+pub fn resolve_self_bin(
+    raw: &str,
+    fact: impl Fn(&str) -> innerwarden_agent_guard::hook::ProgramFact,
+) -> Result<String, String> {
+    use innerwarden_agent_guard::hook::ProgramFact;
+    let path = raw.strip_suffix(DELETED_SUFFIX).unwrap_or(raw);
+    let state = match fact(path) {
+        ProgramFact::Executable => return Ok(path.to_string()),
+        ProgramFact::Missing => "is gone",
+        ProgramFact::NotExecutable => "is not executable",
+        ProgramFact::Unreadable => "could not be checked",
+    };
+    Err(format!(
+        "  this dashboard's own binary, {path}, {state}, so auto-connect will not write \
+         it into any agent's wiring. Restart `innerwarden dashboard` from the \
+         innerwarden you run."
+    ))
+}
+
 /// PURE: which lines one watcher pass prints, given what earlier passes left.
 ///
 /// The watcher runs every minute for as long as the dashboard is up, and it
@@ -737,17 +780,100 @@ pub fn spawn_dashboard_reconciler(
     home: PathBuf,
     guard_bin: String,
 ) -> Result<DashboardReconciler, String> {
+    let path_env = std::env::var_os("PATH");
     spawn_dashboard_reconciler_with_interval(
         home,
         guard_bin,
         std::time::Duration::from_secs(RECONCILE_INTERVAL_SECS),
+        move |path| innerwarden_agent_guard::agents_ops::program_fact(path, path_env.as_deref()),
     )
+}
+
+/// One pass of the dashboard's watcher: find the binary it may write into
+/// agents' wiring, reconcile with it, and say what CHANGED.
+///
+/// The fact about its own binary is handed in, and read again on every pass,
+/// because the file can disappear under a running dashboard at any time.
+fn watcher_pass(
+    home: &Path,
+    raw_guard_bin: &str,
+    self_fact: &dyn Fn(&str) -> innerwarden_agent_guard::hook::ProgramFact,
+    logged: &mut BTreeMap<String, Logged>,
+) -> (Vec<String>, DashboardReconcilerStatus) {
+    let guard_bin = match resolve_self_bin(raw_guard_bin, self_fact) {
+        Ok(path) => path,
+        Err(line) => {
+            // Nothing is written, hook or MCP: every write would name a
+            // program that cannot start. The policy is only read, to keep the
+            // dashboard's view of it honest.
+            let pass = BTreeMap::from([(SELF_KEY.to_string(), AgentTick::Failed(line))]);
+            let enabled = load(home).ok().map(|policy| policy.auto_connect);
+            return (
+                lines_to_log(logged, &pass),
+                DashboardReconcilerStatus {
+                    lifecycle: WatcherLifecycle::Running,
+                    policy_available: enabled.is_some(),
+                    policy_enabled: enabled,
+                    effective_policy_mode: enabled
+                        .map(|on| if on { "monitor" } else { "disabled" }.into()),
+                    last_reconcile_at_ms: Some(epoch_ms()),
+                    reason_code: Some("guard_binary_missing".into()),
+                },
+            );
+        }
+    };
+    match reconcile_current(home, &guard_bin) {
+        Ok((policy, report)) => {
+            let failed = report.has_failures();
+            let mut pass = report.outcomes;
+            pass.insert(POLICY_KEY.into(), AgentTick::Quiet);
+            pass.insert(SELF_KEY.into(), AgentTick::Quiet);
+            (
+                lines_to_log(logged, &pass),
+                DashboardReconcilerStatus {
+                    lifecycle: WatcherLifecycle::Running,
+                    policy_available: true,
+                    policy_enabled: Some(policy.auto_connect),
+                    effective_policy_mode: Some(if policy.auto_connect {
+                        "monitor".into()
+                    } else {
+                        "disabled".into()
+                    }),
+                    last_reconcile_at_ms: Some(epoch_ms()),
+                    reason_code: failed.then(|| "reconcile_failed".into()),
+                },
+            )
+        }
+        Err(error) => {
+            // The same error every minute is one line, not one a minute, and
+            // the pass after it clears says so.
+            let pass = BTreeMap::from([
+                (
+                    POLICY_KEY.to_string(),
+                    AgentTick::Failed(format!(" {error}")),
+                ),
+                (SELF_KEY.to_string(), AgentTick::Quiet),
+            ]);
+            (
+                lines_to_log(logged, &pass),
+                DashboardReconcilerStatus {
+                    lifecycle: WatcherLifecycle::Running,
+                    policy_available: false,
+                    policy_enabled: None,
+                    effective_policy_mode: None,
+                    last_reconcile_at_ms: Some(epoch_ms()),
+                    reason_code: Some("policy_unavailable".into()),
+                },
+            )
+        }
+    }
 }
 
 pub(crate) fn spawn_dashboard_reconciler_with_interval(
     home: PathBuf,
     guard_bin: String,
     interval: std::time::Duration,
+    self_fact: impl Fn(&str) -> innerwarden_agent_guard::hook::ProgramFact + Send + 'static,
 ) -> Result<DashboardReconciler, String> {
     let status = std::sync::Arc::new(std::sync::RwLock::new(DashboardReconcilerStatus::starting()));
     let status_writer = std::sync::Arc::clone(&status);
@@ -757,53 +883,11 @@ pub(crate) fn spawn_dashboard_reconciler_with_interval(
         .spawn(move || {
             let mut logged: BTreeMap<String, Logged> = BTreeMap::new();
             loop {
-                match reconcile_current(&home, &guard_bin) {
-                    Ok((policy, report)) => {
-                        let failed = report.has_failures();
-                        let mut pass = report.outcomes;
-                        pass.insert(POLICY_KEY.into(), AgentTick::Quiet);
-                        for line in lines_to_log(&mut logged, &pass) {
-                            eprintln!("innerwarden auto-connect:{line}");
-                        }
-                        replace_dashboard_reconciler_status(
-                            &status_writer,
-                            DashboardReconcilerStatus {
-                                lifecycle: WatcherLifecycle::Running,
-                                policy_available: true,
-                                policy_enabled: Some(policy.auto_connect),
-                                effective_policy_mode: Some(if policy.auto_connect {
-                                    "monitor".into()
-                                } else {
-                                    "disabled".into()
-                                }),
-                                last_reconcile_at_ms: Some(epoch_ms()),
-                                reason_code: failed.then(|| "reconcile_failed".into()),
-                            },
-                        );
-                    }
-                    Err(error) => {
-                        // The same error every minute is one line, not one a
-                        // minute, and the pass after it clears says so.
-                        let pass = BTreeMap::from([(
-                            POLICY_KEY.to_string(),
-                            AgentTick::Failed(format!(" {error}")),
-                        )]);
-                        for line in lines_to_log(&mut logged, &pass) {
-                            eprintln!("innerwarden auto-connect:{line}");
-                        }
-                        replace_dashboard_reconciler_status(
-                            &status_writer,
-                            DashboardReconcilerStatus {
-                                lifecycle: WatcherLifecycle::Running,
-                                policy_available: false,
-                                policy_enabled: None,
-                                effective_policy_mode: None,
-                                last_reconcile_at_ms: Some(epoch_ms()),
-                                reason_code: Some("policy_unavailable".into()),
-                            },
-                        );
-                    }
+                let (lines, pass_status) = watcher_pass(&home, &guard_bin, &self_fact, &mut logged);
+                for line in lines {
+                    eprintln!("innerwarden auto-connect:{line}");
                 }
+                replace_dashboard_reconciler_status(&status_writer, pass_status);
                 match stop_rx.recv_timeout(interval) {
                     Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
@@ -1005,6 +1089,195 @@ mod tests {
         );
         assert!(logged_by_a[2].is_empty(), "{:?}", logged_by_a[2]);
         assert!(logged_by_a[3].is_empty(), "{:?}", logged_by_a[3]);
+    }
+
+    use innerwarden_agent_guard::hook::ProgramFact;
+
+    const UPGRADED: &str = "/usr/local/bin/innerwarden";
+    const DELETED: &str = "/usr/local/bin/innerwarden (deleted)";
+
+    /// Linux after an in-place upgrade: the running image reads as
+    /// `... (deleted)`, and the new binary sits at the same path. That path is
+    /// the right one to write, and it is the one the fact is asked about.
+    #[test]
+    fn a_replaced_binary_resolves_to_the_upgraded_file_at_the_same_path() {
+        let asked = std::cell::RefCell::new(Vec::new());
+        let resolved = resolve_self_bin(DELETED, |path| {
+            asked.borrow_mut().push(path.to_string());
+            ProgramFact::Executable
+        });
+        assert_eq!(resolved, Ok(UPGRADED.to_string()));
+        assert_eq!(asked.into_inner(), vec![UPGRADED.to_string()]);
+        assert_eq!(
+            resolve_self_bin(UPGRADED, |_| ProgramFact::Executable),
+            Ok(UPGRADED.to_string())
+        );
+    }
+
+    /// A self path with nothing runnable behind it is never handed to a writer,
+    /// and the refusal says which path and what to do.
+    #[test]
+    fn a_self_path_that_cannot_run_is_never_resolved() {
+        let gone = resolve_self_bin(DELETED, |_| ProgramFact::Missing).unwrap_err();
+        assert_eq!(
+            gone,
+            "  this dashboard's own binary, /usr/local/bin/innerwarden, is gone, so \
+             auto-connect will not write it into any agent's wiring. Restart \
+             `innerwarden dashboard` from the innerwarden you run."
+        );
+        let cleaned = resolve_self_bin("/dev/target/release/innerwarden", |_| ProgramFact::Missing);
+        assert!(cleaned
+            .unwrap_err()
+            .contains("/dev/target/release/innerwarden, is gone"));
+        assert!(resolve_self_bin(UPGRADED, |_| ProgramFact::NotExecutable)
+            .unwrap_err()
+            .contains("is not executable"));
+        assert!(resolve_self_bin(UPGRADED, |_| ProgramFact::Unreadable)
+            .unwrap_err()
+            .contains("could not be checked"));
+    }
+
+    fn write_claude_hook(home: &Path, program: &str) -> std::path::PathBuf {
+        let path = home.join(".claude/settings.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let settings = serde_json::json!({"hooks": {"PreToolUse": [{
+            "matcher": "Bash",
+            "hooks": [{
+                "type": "command",
+                "command": format!("\"{program}\" hook --monitor --agent claude-code")
+            }]
+        }]}});
+        std::fs::write(&path, serde_json::to_vec_pretty(&settings).unwrap()).unwrap();
+        path
+    }
+
+    fn pre_tool_use_commands(path: &Path) -> Vec<String> {
+        let settings: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        settings["hooks"]["PreToolUse"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|entry| entry["hooks"].as_array().unwrap().clone())
+            .map(|hook| hook["command"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// The upgrade case end to end: the watcher repairs a stale hook to the
+    /// upgraded binary's real path, and there is exactly one hook afterwards.
+    /// Before, it wrote `... (deleted)` and appended it beside the old one.
+    ///
+    /// FAILS ON REVERT: hand the raw `current_exe` string to reconcile again
+    /// and the pass writes nothing it recognises (the writer now refuses), so
+    /// the hook still names the old path.
+    #[test]
+    fn the_watcher_writes_the_upgraded_path_never_the_deleted_name() {
+        let home = tempfile::TempDir::new().unwrap();
+        let path = write_claude_hook(home.path(), "/old/target/release/innerwarden");
+        persisted_enabled_policy(home.path());
+        let fact = |path: &str| {
+            if path == UPGRADED {
+                ProgramFact::Executable
+            } else {
+                ProgramFact::Missing
+            }
+        };
+        let mut logged = BTreeMap::new();
+        let (lines, status) = watcher_pass(home.path(), DELETED, &fact, &mut logged);
+        assert_eq!(
+            pre_tool_use_commands(&path),
+            vec![format!("\"{UPGRADED}\" hook --monitor --agent claude-code")]
+        );
+        assert!(!std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("(deleted)"));
+        assert_eq!(
+            lines,
+            vec![
+                "  claude-code - connected (PreToolUse hook, monitor (records, never blocks))"
+                    .to_string()
+            ]
+        );
+        assert_eq!(status.reason_code, None);
+    }
+
+    /// Nothing runnable at the path: the pass writes nothing at all, says so
+    /// once however long it lasts, and says so again when it clears.
+    ///
+    /// FAILS ON REVERT: skip the self check and the hook is rewritten to
+    /// `/usr/local/bin/innerwarden (deleted)`'s stripped or raw form.
+    #[test]
+    fn a_deleted_binary_with_nothing_at_its_path_writes_nothing_and_says_so_once() {
+        let home = tempfile::TempDir::new().unwrap();
+        let path = write_claude_hook(home.path(), "/old/target/release/innerwarden");
+        let before = std::fs::read(&path).unwrap();
+        persisted_enabled_policy(home.path());
+        let mut logged = BTreeMap::new();
+        let mut printed = Vec::new();
+        for _ in 0..3 {
+            let (lines, status) =
+                watcher_pass(home.path(), DELETED, &|_| ProgramFact::Missing, &mut logged);
+            assert_eq!(status.reason_code.as_deref(), Some("guard_binary_missing"));
+            assert_eq!(status.policy_enabled, Some(true));
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                before,
+                "nothing may be written"
+            );
+            printed.push(lines);
+        }
+        assert_eq!(printed[0].len(), 1);
+        assert!(
+            printed[0][0].contains("/usr/local/bin/innerwarden, is gone"),
+            "{:?}",
+            printed[0]
+        );
+        assert!(
+            printed[1].is_empty() && printed[2].is_empty(),
+            "{printed:?}"
+        );
+
+        // The upgraded binary lands: the pass repairs, and says it recovered.
+        let (lines, status) = watcher_pass(
+            home.path(),
+            DELETED,
+            &|_| ProgramFact::Executable,
+            &mut logged,
+        );
+        assert_eq!(status.reason_code, None);
+        assert!(lines.contains(
+            &"  dashboard binary - recovered: the last pass completed without error".to_string()
+        ));
+        assert_eq!(
+            pre_tool_use_commands(&path),
+            vec![format!("\"{UPGRADED}\" hook --monitor --agent claude-code")]
+        );
+    }
+
+    /// The `cargo clean` case: the hook points at the installed binary and is
+    /// correct; the dashboard runs from a build that has since been removed.
+    /// Repairing "path drift" toward the dashboard's own path would point a
+    /// working hook at a file that is gone, which is how a hook ends up dead.
+    ///
+    /// FAILS ON REVERT: reconcile with the unchecked self path and the correct
+    /// hook is rewritten to `/dev/target/release/innerwarden`.
+    #[test]
+    fn a_correct_hook_is_not_rewritten_to_a_removed_build() {
+        let home = tempfile::TempDir::new().unwrap();
+        let path = write_claude_hook(home.path(), "/installed/bin/innerwarden");
+        let before = std::fs::read(&path).unwrap();
+        persisted_enabled_policy(home.path());
+        let mut logged = BTreeMap::new();
+        let (lines, status) = watcher_pass(
+            home.path(),
+            "/dev/target/release/innerwarden",
+            &|_| ProgramFact::Missing,
+            &mut logged,
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(status.reason_code.as_deref(), Some("guard_binary_missing"));
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("/dev/target/release/innerwarden, is gone"));
     }
 
     /// An agent no longer in the pass (gone, or auto-connect switched off) is
@@ -1553,6 +1826,7 @@ mod tests {
             home.path().to_path_buf(),
             "/abs/innerwarden".into(),
             std::time::Duration::from_millis(10),
+            |_| innerwarden_agent_guard::hook::ProgramFact::Executable,
         )
         .unwrap();
         let shared = watcher.status();
@@ -1598,6 +1872,7 @@ mod tests {
             home.path().to_path_buf(),
             "/abs/innerwarden".into(),
             std::time::Duration::from_millis(10),
+            |_| innerwarden_agent_guard::hook::ProgramFact::Executable,
         )
         .unwrap();
         let shared = watcher.status();

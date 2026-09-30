@@ -462,6 +462,19 @@ fn install_hook_with_link_policy(
         _ => Some(agent.to_string()),
     };
     let cmd = hook_command_for(iw_guard, block_review, monitor, agent_flag.as_deref());
+    // Background setup writes only a command it will recognise as its own
+    // afterwards. One it would not (a binary path reading
+    // `innerwarden (deleted)` after an in-place upgrade on Linux, or a renamed
+    // build) cannot replace the existing hook, so the merge APPENDS it beside
+    // the valid one, and nothing could ever repair or remove it again. An
+    // explicit `install` keeps its old latitude: a person asked for it.
+    if reject_symlinks && !is_iwguard_hook(&json!({ "type": "command", "command": cmd })) {
+        return Err(format!(
+            "automatic setup refuses to write `{cmd}`: it would not recognise that \
+             command as its own, so it would sit beside the existing hook instead of \
+             replacing it"
+        ));
+    }
     let merged = merge_pretooluse_bash_hook(existing.clone(), &cmd);
     // The observation half. Written with the SAME binary and the same mode
     // flags, because a PostToolUse hook that points at a different build is a
@@ -2281,5 +2294,49 @@ mod hook_program_tests {
             " --block-review"
         );
         assert_eq!(install_mode_flag(&measured("\"/x/innerwarden\" hook")), "");
+    }
+}
+
+/// What background setup may write into Claude Code's settings.
+#[cfg(test)]
+mod automatic_write_tests {
+    use super::*;
+
+    /// A command automatic setup would not recognise as its own is refused,
+    /// never appended beside the valid hook. Measured before this: a binary
+    /// path reading `innerwarden (deleted)` (Linux, after an in-place upgrade)
+    /// left the old hook in place and added a second entry naming a file that
+    /// does not exist, in both PreToolUse and PostToolUse.
+    ///
+    /// FAILS ON REVERT: drop the refusal and the file gains a second
+    /// PreToolUse entry.
+    #[test]
+    fn automatic_setup_never_appends_a_command_it_would_not_recognise() {
+        let home = tempfile::TempDir::new().unwrap();
+        let settings = home.path().join(".claude/settings.json");
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        let valid = merge_pretooluse_bash_hook(
+            json!({}),
+            "\"/usr/local/bin/innerwarden\" hook --monitor --agent claude-code",
+        );
+        std::fs::write(&settings, serde_json::to_vec_pretty(&valid).unwrap()).unwrap();
+        let before = std::fs::read(&settings).unwrap();
+
+        let refused = install_hook_no_symlinks(
+            home.path(),
+            "claude-code",
+            None,
+            Path::new("/usr/local/bin/innerwarden (deleted)"),
+            false,
+            true,
+        );
+        match refused {
+            Err(error) => assert!(
+                error.contains("would not recognise that command as its own"),
+                "{error}"
+            ),
+            Ok(_) => panic!("an unrecognisable command must not be written"),
+        }
+        assert_eq!(std::fs::read(&settings).unwrap(), before);
     }
 }

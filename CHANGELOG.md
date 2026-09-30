@@ -11,6 +11,7 @@ follows semantic versioning.
   dashboard now say so, name the missing path and the `innerwarden install`
   that fixes it. A week-old record no longer proves commands reach the guard,
   and auto-connect logs a change once, not every minute.
+- **Auto-connect never writes a hook naming a binary that is gone.**
 
 ## 1.5.0 - 2026-09-30
 

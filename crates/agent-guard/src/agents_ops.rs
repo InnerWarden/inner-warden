@@ -106,7 +106,7 @@ fn path_fact(path: &Path) -> hook::ProgramFact {
 /// path, and the same metadata-only `PATH` walk discovery uses for a bare name.
 /// A path relative to a directory is not looked up at all, because it is
 /// relative to wherever the agent starts; [`hook::judge_hook_program`] says so.
-fn program_fact(program: &str, path_env: Option<&OsStr>) -> hook::ProgramFact {
+pub fn program_fact(program: &str, path_env: Option<&OsStr>) -> hook::ProgramFact {
     if !program.contains(['/', '\\']) {
         return if executable_on_path(&[program], path_env) {
             hook::ProgramFact::Executable
