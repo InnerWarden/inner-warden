@@ -3,6 +3,19 @@
 All notable changes to InnerWarden are documented here. This project
 follows semantic versioning.
 
+## 1.5.1 - 2026-09-30
+
+### Fixed
+
+- **A hook whose binary is gone is no longer "on".** `status`, `agents` and the
+  dashboard now say so, name the missing path and the `innerwarden install`
+  that fixes it. A week-old record no longer proves commands reach the guard,
+  and auto-connect logs a change once, not every minute.
+- **Auto-connect never writes a hook naming a binary that is gone.** After an
+  in-place upgrade on Linux, or once a build is cleaned, the dashboard's
+  background setup could point a hook at a path that no longer runs. It now
+  writes nothing and says once that the dashboard needs a restart.
+
 ## 1.5.0 - 2026-09-30
 
 ### Added

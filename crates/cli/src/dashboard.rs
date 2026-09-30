@@ -2451,6 +2451,7 @@ mod tests {
             home.path().to_path_buf(),
             "/abs/innerwarden".into(),
             std::time::Duration::from_millis(10),
+            |_| innerwarden_agent_guard::hook::ProgramFact::Executable,
         )
         .unwrap();
         let shared = watcher.status();

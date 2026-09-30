@@ -462,6 +462,19 @@ fn install_hook_with_link_policy(
         _ => Some(agent.to_string()),
     };
     let cmd = hook_command_for(iw_guard, block_review, monitor, agent_flag.as_deref());
+    // Background setup writes only a command it will recognise as its own
+    // afterwards. One it would not (a binary path reading
+    // `innerwarden (deleted)` after an in-place upgrade on Linux, or a renamed
+    // build) cannot replace the existing hook, so the merge APPENDS it beside
+    // the valid one, and nothing could ever repair or remove it again. An
+    // explicit `install` keeps its old latitude: a person asked for it.
+    if reject_symlinks && !is_iwguard_hook(&json!({ "type": "command", "command": cmd })) {
+        return Err(format!(
+            "automatic setup refuses to write `{cmd}`: it would not recognise that \
+             command as its own, so it would sit beside the existing hook instead of \
+             replacing it"
+        ));
+    }
     let merged = merge_pretooluse_bash_hook(existing.clone(), &cmd);
     // The observation half. Written with the SAME binary and the same mode
     // flags, because a PostToolUse hook that points at a different build is a
@@ -778,6 +791,142 @@ pub fn has_iwguard_wiring(settings: &Value) -> bool {
 /// evidence, but are never presented as active command protection.
 pub fn has_iwguard_hook(settings: &Value) -> bool {
     effective_iwguard_hook_mode(settings).is_some()
+}
+
+/// What the caller found when it looked for the program a hook runs.
+///
+/// Handed in, never looked up here, so [`judge_hook_program`] is testable
+/// without a filesystem or a `PATH`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProgramFact {
+    /// There, a regular file, and executable.
+    Executable,
+    /// There, but not an executable regular file.
+    NotExecutable,
+    /// Not there: no such path, or a bare name no `PATH` directory holds.
+    Missing,
+    /// The look itself failed, for example a permission error on the way.
+    Unreadable,
+}
+
+/// Whether the program an InnerWarden hook runs is there for the agent to
+/// start.
+///
+/// A recognised hook was all "guarded" used to mean, and a hook is only text.
+/// Claude Code runs the command, the exec fails, it reports a non-blocking hook
+/// error, and the tool call goes ahead unscreened. A Mac sat like that for
+/// weeks, pointing at a `target/release` build that had been cleaned, while
+/// `status` said `[on]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HookProgram {
+    /// It is there and executable, so the agent can start it.
+    Runs,
+    /// It is not, so the hook fails and nothing is screened. `problem` is a
+    /// clause naming the program, for a sentence about the agent.
+    Broken { program: String, problem: String },
+    /// Could not be established either way. Never reported as broken.
+    Unknown { program: String, why: String },
+}
+
+/// PURE: judge one hook program from what the caller found when it looked.
+///
+/// A bare name (no directory) is found through `PATH`, the way the agent's
+/// shell finds it. A path relative to a directory is relative to wherever the
+/// agent was started, which is not knowable from here, so it stays unknown
+/// whatever the caller found.
+pub fn judge_hook_program(program: &str, fact: ProgramFact) -> HookProgram {
+    let bare = !program.contains(['/', '\\']);
+    if !bare && !Path::new(program).is_absolute() {
+        return HookProgram::Unknown {
+            program: program.to_string(),
+            why: format!(
+                "its hook runs {program}, a path relative to wherever the agent starts, \
+                 so I cannot check it from here"
+            ),
+        };
+    }
+    let problem = match (fact, bare) {
+        (ProgramFact::Executable, _) => return HookProgram::Runs,
+        (ProgramFact::Unreadable, _) => {
+            return HookProgram::Unknown {
+                program: program.to_string(),
+                why: format!("its hook runs {program}, and I could not look to see if it is there"),
+            }
+        }
+        // A shell skips a PATH entry that is not executable and keeps looking,
+        // so for a bare name the two facts mean the same thing.
+        (ProgramFact::Missing | ProgramFact::NotExecutable, true) => {
+            format!("its hook runs `{program}`, which is not on PATH")
+        }
+        (ProgramFact::Missing, false) => format!("its hook runs {program}, which does not exist"),
+        (ProgramFact::NotExecutable, false) => {
+            format!("its hook runs {program}, which is not an executable file")
+        }
+    };
+    HookProgram::Broken {
+        program: program.to_string(),
+        problem,
+    }
+}
+
+/// The program each InnerWarden hook effective under `PreToolUse:Bash` runs,
+/// quotes removed, in file order.
+///
+/// Read with the same small grammar detection uses, so a program is only ever
+/// taken from a command this module already calls its own.
+pub fn effective_iwguard_hook_programs(settings: &Value) -> Vec<String> {
+    settings
+        .get("hooks")
+        .and_then(|hooks| hooks.get("PreToolUse"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|entry| bash_matcher_coverage(entry) == BashMatcherCoverage::Includes)
+        .filter_map(|entry| entry.get("hooks").and_then(Value::as_array))
+        .flatten()
+        .filter(|hook| is_iwguard_hook(hook))
+        .filter_map(|hook| hook.get("command").and_then(Value::as_str))
+        .filter_map(hook_command_words)
+        .filter_map(|words| words.into_iter().next())
+        .collect()
+}
+
+/// PURE: can the InnerWarden hooks that screen Bash actually start? `None`
+/// when there are none.
+///
+/// Claude Code runs every matching hook, so ONE that runs is enough for the
+/// command to be screened. Short of that, one that could not be checked makes
+/// the answer unknown rather than broken: "could not tell" is never "off".
+pub fn judge_iwguard_hooks(
+    settings: &Value,
+    fact: impl Fn(&str) -> ProgramFact,
+) -> Option<HookProgram> {
+    let verdicts: Vec<HookProgram> = effective_iwguard_hook_programs(settings)
+        .iter()
+        .map(|program| judge_hook_program(program, fact(program)))
+        .collect();
+    if verdicts.is_empty() {
+        return None;
+    }
+    if verdicts.contains(&HookProgram::Runs) {
+        return Some(HookProgram::Runs);
+    }
+    verdicts
+        .iter()
+        .find(|verdict| matches!(verdict, HookProgram::Unknown { .. }))
+        .or_else(|| verdicts.first())
+        .cloned()
+}
+
+/// PURE: the `install` flag that rewrites these hooks in the mode they already
+/// have, so the remedy for a broken hook never changes what it does. Mixed
+/// wiring keeps its strongest half, as automatic repair does.
+pub fn install_mode_flag(settings: &Value) -> &'static str {
+    match strongest_effective_iwguard_hook_mode(settings) {
+        Some(HookProtection::Monitor) => " --monitor",
+        Some(HookProtection::BlockReview) => " --block-review",
+        Some(HookProtection::Enforce) | None => "",
+    }
 }
 
 /// Whether automatic setup would make a semantic change to existing hook
@@ -1970,5 +2119,224 @@ mod posttooluse_tests {
             "the operator's hook must survive: {commands:?}"
         );
         assert!(commands.iter().any(|c| c.contains("/p/innerwarden")));
+    }
+}
+
+/// Whether a hook's program is there to run: the judgement `status`, `agents`
+/// and the dashboard share. Every fact is handed in, so nothing here reads the
+/// real filesystem or `PATH`.
+#[cfg(test)]
+mod hook_program_tests {
+    use super::*;
+
+    /// The exact settings measured on a real Mac: the hook named a
+    /// `target/release` build that `cargo clean` had removed, and `status` said
+    /// `[on] Wired into 1: claude-code.` for weeks.
+    fn measured(command: &str) -> Value {
+        json!({"hooks": {"PreToolUse": [{
+            "matcher": "Bash",
+            "hooks": [{"type": "command", "command": command}]
+        }]}})
+    }
+
+    /// An absolute program path on this platform. `/x` is not absolute on
+    /// Windows, where this suite also runs.
+    fn abs(dir: &str) -> String {
+        if cfg!(windows) {
+            format!(r"C:\{dir}\innerwarden.exe")
+        } else {
+            format!("/{dir}/innerwarden")
+        }
+    }
+
+    fn gone() -> String {
+        format!(
+            "\"{}\" hook --monitor --agent claude-code",
+            abs("nonexistent/target/release")
+        )
+    }
+
+    #[test]
+    fn a_hook_whose_program_is_gone_does_not_run_and_says_which_path() {
+        let verdict = judge_iwguard_hooks(&measured(&gone()), |_| ProgramFact::Missing);
+        let expected = abs("nonexistent/target/release");
+        match verdict {
+            Some(HookProgram::Broken { program, problem }) => {
+                assert_eq!(program, expected);
+                assert_eq!(
+                    problem,
+                    format!("its hook runs {expected}, which does not exist")
+                );
+            }
+            other => panic!("a hook that cannot start screens nothing: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_hook_whose_program_is_there_and_executable_runs() {
+        let asked = std::cell::RefCell::new(Vec::new());
+        let verdict = judge_iwguard_hooks(&measured(&gone()), |program| {
+            asked.borrow_mut().push(program.to_string());
+            ProgramFact::Executable
+        });
+        assert_eq!(verdict, Some(HookProgram::Runs));
+        // The fact asked for is the program with its quotes removed, not the
+        // whole command line and not the quoted word.
+        assert_eq!(asked.into_inner(), vec![abs("nonexistent/target/release")]);
+    }
+
+    #[test]
+    fn a_hook_whose_program_is_not_executable_does_not_run() {
+        let program = abs("opt/iw");
+        match judge_hook_program(&program, ProgramFact::NotExecutable) {
+            HookProgram::Broken { problem, .. } => assert_eq!(
+                problem,
+                format!("its hook runs {program}, which is not an executable file")
+            ),
+            other => panic!("a file nobody can execute screens nothing: {other:?}"),
+        }
+    }
+
+    /// A bare name is found through `PATH`, as the agent's shell finds it. An
+    /// unquoted command is read by the same grammar as a quoted one.
+    #[test]
+    fn a_bare_program_that_is_not_on_path_does_not_run() {
+        let settings = measured("innerwarden hook --agent claude-code");
+        assert_eq!(
+            effective_iwguard_hook_programs(&settings),
+            vec!["innerwarden".to_string()]
+        );
+        match judge_iwguard_hooks(&settings, |_| ProgramFact::Missing) {
+            Some(HookProgram::Broken { program, problem }) => {
+                assert_eq!(program, "innerwarden");
+                assert_eq!(problem, "its hook runs `innerwarden`, which is not on PATH");
+            }
+            other => panic!("a name no PATH directory holds cannot start: {other:?}"),
+        }
+        assert_eq!(
+            judge_iwguard_hooks(&settings, |_| ProgramFact::Executable),
+            Some(HookProgram::Runs)
+        );
+    }
+
+    #[test]
+    fn an_unquoted_absolute_program_is_read_the_same_way() {
+        let settings = measured("/usr/local/bin/innerwarden hook --monitor");
+        assert_eq!(
+            effective_iwguard_hook_programs(&settings),
+            vec!["/usr/local/bin/innerwarden".to_string()]
+        );
+    }
+
+    /// "Could not tell" is never "off": neither a failed look nor a path
+    /// relative to wherever the agent starts may be reported as broken.
+    #[test]
+    fn a_program_that_could_not_be_checked_is_unknown_not_broken() {
+        assert!(matches!(
+            judge_hook_program(&abs("opt/iw"), ProgramFact::Unreadable),
+            HookProgram::Unknown { .. }
+        ));
+        // Relative to the agent's own working directory: unknowable from here,
+        // whatever a lookup from this process happened to find.
+        for fact in [ProgramFact::Missing, ProgramFact::Executable] {
+            match judge_hook_program("target/release/innerwarden", fact) {
+                HookProgram::Unknown { why, .. } => {
+                    assert!(
+                        why.contains("relative to wherever the agent starts"),
+                        "{why}"
+                    )
+                }
+                other => panic!("a relative path cannot be judged from here: {other:?}"),
+            }
+        }
+    }
+
+    /// Only hooks that screen Bash are judged, and only commands this module
+    /// already calls its own: an operator's script or a hook under another
+    /// matcher is never mistaken for the guard.
+    #[test]
+    fn only_the_guards_own_bash_hooks_are_judged() {
+        let settings = json!({"hooks": {"PreToolUse": [
+            {"matcher": "Write", "hooks": [{"type": "command", "command": "\"/gone/innerwarden\" hook"}]},
+            {"matcher": "Bash", "hooks": [{"type": "command", "command": "/operator/check.sh"}]}
+        ]}});
+        assert!(effective_iwguard_hook_programs(&settings).is_empty());
+        assert_eq!(
+            judge_iwguard_hooks(&settings, |_| ProgramFact::Missing),
+            None
+        );
+    }
+
+    /// Claude Code runs every matching hook, so one that starts still screens.
+    #[test]
+    fn one_hook_that_runs_is_enough() {
+        let here = abs("here");
+        let settings = json!({"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
+            {"type": "command", "command": format!("\"{}\" hook", abs("gone"))},
+            {"type": "command", "command": format!("\"{here}\" hook")}
+        ]}]}});
+        let verdict = judge_iwguard_hooks(&settings, |program| {
+            if program == here {
+                ProgramFact::Executable
+            } else {
+                ProgramFact::Missing
+            }
+        });
+        assert_eq!(verdict, Some(HookProgram::Runs));
+    }
+
+    /// The remedy must not quietly change what the hook does.
+    #[test]
+    fn the_repair_keeps_the_mode_the_hook_has() {
+        assert_eq!(install_mode_flag(&measured(&gone())), " --monitor");
+        assert_eq!(
+            install_mode_flag(&measured("\"/x/innerwarden\" hook --block-review")),
+            " --block-review"
+        );
+        assert_eq!(install_mode_flag(&measured("\"/x/innerwarden\" hook")), "");
+    }
+}
+
+/// What background setup may write into Claude Code's settings.
+#[cfg(test)]
+mod automatic_write_tests {
+    use super::*;
+
+    /// A command automatic setup would not recognise as its own is refused,
+    /// never appended beside the valid hook. Measured before this: a binary
+    /// path reading `innerwarden (deleted)` (Linux, after an in-place upgrade)
+    /// left the old hook in place and added a second entry naming a file that
+    /// does not exist, in both PreToolUse and PostToolUse.
+    ///
+    /// FAILS ON REVERT: drop the refusal and the file gains a second
+    /// PreToolUse entry.
+    #[test]
+    fn automatic_setup_never_appends_a_command_it_would_not_recognise() {
+        let home = tempfile::TempDir::new().unwrap();
+        let settings = home.path().join(".claude/settings.json");
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        let valid = merge_pretooluse_bash_hook(
+            json!({}),
+            "\"/usr/local/bin/innerwarden\" hook --monitor --agent claude-code",
+        );
+        std::fs::write(&settings, serde_json::to_vec_pretty(&valid).unwrap()).unwrap();
+        let before = std::fs::read(&settings).unwrap();
+
+        let refused = install_hook_no_symlinks(
+            home.path(),
+            "claude-code",
+            None,
+            Path::new("/usr/local/bin/innerwarden (deleted)"),
+            false,
+            true,
+        );
+        match refused {
+            Err(error) => assert!(
+                error.contains("would not recognise that command as its own"),
+                "{error}"
+            ),
+            Ok(_) => panic!("an unrecognisable command must not be written"),
+        }
+        assert_eq!(std::fs::read(&settings).unwrap(), before);
     }
 }

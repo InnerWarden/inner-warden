@@ -95,9 +95,29 @@ fn status_io_cmd() -> std::process::ExitCode {
         .map(innerwarden_agent_guard::agents_ops::rows)
         .unwrap_or_default();
 
+    // Wired agents whose hook is not known to run: its program is gone, is not
+    // executable, or could not be checked. Judged by the same shared function
+    // `agents` and the dashboard use, so the three cannot disagree.
+    let hook_trouble: Vec<status::HookTrouble> = home
+        .as_deref()
+        .map(|home| {
+            use innerwarden_agent_guard::{agents_ops, hook::HookProgram};
+            rows.iter()
+                .filter_map(|r| match agents_ops::hook_program(home, r)? {
+                    HookProgram::Runs => None,
+                    program => Some(status::HookTrouble {
+                        agent: r.name.clone(),
+                        program,
+                        next: agents_ops::hook_repair_command(home, r),
+                    }),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     let wired_agents: Vec<String> = rows
         .iter()
-        .filter(|r| r.guarded)
+        .filter(|r| r.guarded && !hook_trouble.iter().any(|t| t.agent == r.name))
         .map(|r| r.name.clone())
         .collect();
 
@@ -121,10 +141,21 @@ fn status_io_cmd() -> std::process::ExitCode {
     // A missing record is zero, not a failure: `Loaded::Empty` covers "nothing
     // recorded yet" and only a genuinely unreadable record yields `Err`, which
     // stays `None` so it renders as [unknown] rather than as a quiet zero.
-    let decisions_recorded = match graph_io::load_graph_checked() {
-        Ok(graph) => Some(graph.stats().commands as u64),
-        Err(_) => None,
+    //
+    // The count alone never goes down, so it cannot say whether commands are
+    // reaching the guard NOW. The time of the newest decision can.
+    let (decisions_recorded, newest_decision_ms) = match graph_io::load_graph_checked() {
+        Ok(graph) => (
+            Some(graph.stats().commands as u64),
+            graph.newest_decision_ms(),
+        ),
+        Err(_) => (None, None),
     };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0);
+    let newest_decision_age_secs = newest_decision_ms.map(|ms| now_ms.saturating_sub(ms) / 1000);
 
     // Absent everything is "not set up", not "unreadable". A fresh box is not a
     // broken one, and three diagnoses send a beginner hunting a fault that does
@@ -144,8 +175,10 @@ fn status_io_cmd() -> std::process::ExitCode {
         never_configured,
         mode,
         wired_agents,
+        hook_trouble,
         any_agent_seen,
         decisions_recorded,
+        newest_decision_age_secs,
         dashboard_reachable,
     };
     print!("{}", status::render(&facts));

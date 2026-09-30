@@ -690,6 +690,17 @@ impl Graph {
         seen
     }
 
+    /// When the newest decision of any kind was recorded, or `None` when no
+    /// decision says. The count of decisions only ever grows, so it cannot say
+    /// whether anything is reaching the guard NOW; this can.
+    pub fn newest_decision_ms(&self) -> Option<u64> {
+        self.nodes
+            .iter()
+            .filter(|node| node.kind == "command")
+            .filter_map(recorded_at_ms)
+            .max()
+    }
+
     /// The newest decision each CHANNEL screened (`hook`, `mcp`), whether or
     /// not it named its agent: proof a screening path is working, for a hook
     /// written before hooks named their agent.
@@ -1252,6 +1263,8 @@ mod tests {
         assert_eq!(seen.get("hook"), Some(&99_000));
         assert_eq!(seen.get("mcp"), Some(&7_000));
         assert!(Graph::new().channels_last_seen().is_empty());
+        assert_eq!(g.newest_decision_ms(), Some(99_000));
+        assert_eq!(Graph::new().newest_decision_ms(), None);
         // Only the node that names nobody is unnamed: every other one in the
         // record names claude-code.
         let unnamed = g.unnamed_channels_last_seen();
