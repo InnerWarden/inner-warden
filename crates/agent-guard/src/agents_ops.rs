@@ -72,6 +72,21 @@ fn executable_file(path: &Path) -> bool {
     path_fact(path) == hook::ProgramFact::Executable
 }
 
+/// What a failed metadata lookup says about a path. The path, or a directory
+/// on the way to it, not existing is `Missing`. Anything else (permission
+/// denied, an I/O error) means the look itself failed: `Unreadable`, which is
+/// never reported as a broken hook. Split out of [`path_fact`] so the answer
+/// for each error is tested without a filesystem that denies anything, which
+/// a test running as root would never see.
+fn failed_lookup_fact(kind: std::io::ErrorKind) -> hook::ProgramFact {
+    match kind {
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory => {
+            hook::ProgramFact::Missing
+        }
+        _ => hook::ProgramFact::Unreadable,
+    }
+}
+
 /// What is at `path`, from metadata alone. Nothing is ever executed.
 ///
 /// "Not there" and "could not look" are different answers: only the first may
@@ -79,15 +94,7 @@ fn executable_file(path: &Path) -> bool {
 fn path_fact(path: &Path) -> hook::ProgramFact {
     let metadata = match std::fs::metadata(path) {
         Ok(metadata) => metadata,
-        Err(error)
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-            ) =>
-        {
-            return hook::ProgramFact::Missing
-        }
-        Err(_) => return hook::ProgramFact::Unreadable,
+        Err(error) => return failed_lookup_fact(error.kind()),
     };
     if !metadata.is_file() {
         return hook::ProgramFact::NotExecutable;
@@ -1468,6 +1475,37 @@ fn read_guard_mode(home: &Path, agent: &str) -> Option<GuardMode> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A hook whose program could not be looked at is "could not tell", never
+    /// "gone": only a path that is not there may be reported as a broken hook.
+    /// The nightly cargo-mutants run found no test that told the two apart
+    /// (`matches!(kind, NotFound | NotADirectory)` replaced with `true`
+    /// survived).
+    ///
+    /// FAILS ON REVERT: classify every failed lookup as `Missing`.
+    #[test]
+    fn a_lookup_that_failed_is_unreadable_and_only_not_there_is_missing() {
+        use crate::hook::ProgramFact;
+        use std::io::ErrorKind;
+        for kind in [ErrorKind::NotFound, ErrorKind::NotADirectory] {
+            assert_eq!(
+                super::failed_lookup_fact(kind),
+                ProgramFact::Missing,
+                "{kind:?}"
+            );
+        }
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::Interrupted,
+            ErrorKind::Other,
+        ] {
+            assert_eq!(
+                super::failed_lookup_fact(kind),
+                ProgramFact::Unreadable,
+                "{kind:?} is a failed look, not a missing program"
+            );
+        }
+    }
 
     /// `disconnect --all` must not be read as "the agent named --all".
     ///
