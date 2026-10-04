@@ -1027,13 +1027,18 @@ impl GraphLock {
     {
         use fs4::FileExt;
         let lock_path = path.with_extension("json.lock");
-        let f = std::fs::OpenOptions::new()
-            .read(true)
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&lock_path)
-            .map_err(|_| GraphRecordError::LockUnavailable)?;
+        // Opened the way every writer of the shared record has to open it
+        // (`file_update::open_shared_lock`): read-only when it exists, created
+        // in the directory's group where the directory is shared, and replaced
+        // there when an older release left one this account cannot open. This
+        // asked for write access on a lock root had created `0644`, so after a
+        // single `sudo` run the operator could not take it, and every decision
+        // from then on was `graph_lock_unavailable`.
+        let open = || {
+            innerwarden_agent_guard::file_update::open_shared_lock(&lock_path)
+                .map_err(|_| GraphRecordError::LockUnavailable)
+        };
+        let mut f = open()?;
         let started = Instant::now();
         let mut on_contention = Some(on_contention);
         loop {
@@ -1045,6 +1050,16 @@ impl GraphLock {
             // `fs4::lock_contended_error()`. A genuine I/O failure is still a
             // distinct arm and is still NOT retried.
             match FileExt::try_lock(&f) {
+                // A lock replaced while this writer waited serialises nothing:
+                // take the one that is there now.
+                Ok(())
+                    if !innerwarden_agent_guard::file_update::lock_still_names(&f, &lock_path) =>
+                {
+                    if started.elapsed() >= timeout {
+                        return Err(GraphRecordError::LockTimedOut);
+                    }
+                    f = open()?;
+                }
                 Ok(()) => return Ok(GraphLock(f)),
                 Err(fs4::TryLockError::WouldBlock) => {
                     if let Some(observer) = on_contention.take() {
@@ -2302,6 +2317,57 @@ mod tests {
             .nodes
             .iter()
             .any(|node| node.id == "cmd:agent-codex:0"));
+    }
+
+    /// THE DEMO-HOST DEFECT, the lock half. One `sudo` run of this CLI (which
+    /// `innerwarden-ctl drill` used to do) created `graph.json.lock` as root,
+    /// `0644`: readable by the operator, not writable. The lock was opened
+    /// read-write, so every later decision was `graph_lock_unavailable`.
+    ///
+    /// FAILS ON REVERT: open the lock read-write again and this record fails
+    /// with `LockUnavailable`.
+    #[cfg(unix)]
+    #[test]
+    fn a_graph_lock_another_account_created_does_not_stop_recording() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: reads the process credentials, cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            panic!(
+                "running as root, which ignores file modes, so a lock this account may \
+                 only read cannot be constructed. Run the suite as an ordinary account."
+            );
+        }
+        let dir = tempfile::TempDir::new().unwrap();
+        let shared = dir.path().join("guard");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o2770)).unwrap();
+        let path = shared.join("graph.json");
+        let lock = path.with_extension("json.lock");
+        std::fs::write(&lock, b"").unwrap();
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o444)).unwrap();
+        assert!(
+            std::fs::OpenOptions::new().write(true).open(&lock).is_err(),
+            "precondition: the lock is one this account may read and not write"
+        );
+
+        record_at_with_options(
+            &path,
+            "agent-after-sudo",
+            "git status",
+            &json!({"recommendation": "allow"}),
+            DecisionMode::Monitor,
+            DecisionOutcome::Allowed,
+            None,
+            GRAPH_LOCK_TIMEOUT,
+            || {},
+        )
+        .expect("a lock somebody else created must not stop the recording");
+
+        let graph = Graph::from_json(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(graph
+            .nodes
+            .iter()
+            .any(|node| node.id == "cmd:agent-after-sudo:0"));
     }
 
     #[test]

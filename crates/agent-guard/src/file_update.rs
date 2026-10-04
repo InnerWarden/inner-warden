@@ -133,35 +133,230 @@ pub fn apply_new_file_ownership(file: &File, directory: &Path) -> std::io::Resul
     file.set_permissions(fs::Permissions::from_mode(wanted.mode))
 }
 
-struct UpdateLock(File);
+/// Whose file a replaced file is once the replacement is in place.
+///
+/// An agent configuration belongs to the person whose agent it configures, so
+/// its owner is part of what a replace preserves, and a replace that cannot
+/// put it back is refused. A record this product SHARES through a
+/// group-writable directory is different: every member of that group already
+/// replaces it by renaming over it, and the kernel allows that whoever owns
+/// the old file. Refusing the write there protects nobody and stops the
+/// recording (see [`when_the_owner_cannot_be_restored`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ownership {
+    Preserve,
+    SharedRecord,
+}
 
-impl UpdateLock {
-    fn acquire(path: &Path) -> Result<Self, String> {
-        let lock_path = sibling(path, "innerwarden.lock");
-        let file = open_lock_file(&lock_path)
-            .map_err(|error| format!("opening {}: {error}", lock_path.display()))?;
-        // BLOCKING exclusive lock. fs4 1.x renamed `lock_exclusive` to `lock`;
-        // both are `flock(LOCK_EX)` on Unix and `LockFileEx(EXCLUSIVE)` on
-        // Windows, so this still waits for the other writer instead of failing.
-        // Called through the trait so it can never silently resolve to the
-        // inherent `std::fs::File::lock` on newer toolchains.
-        FileExt::lock(&file)
-            .map_err(|error| format!("locking {}: {error}", lock_path.display()))?;
-        Ok(Self(file))
+/// A directory several accounts write by design: group-writable, and not
+/// sticky. In a sticky directory (`/tmp`) an entry belongs to its owner and
+/// nobody else may replace it, so nothing there is shared in this sense.
+#[cfg(unix)]
+fn is_shared_directory(mode: u32) -> bool {
+    const GROUP_WRITE: u32 = 0o020;
+    const STICKY: u32 = 0o1000;
+    mode & GROUP_WRITE != 0 && mode & STICKY == 0
+}
+
+/// Why a replace that could not restore the previous owner is refused.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OwnerRefusal {
+    /// An agent configuration: its owner is preserved or the write fails.
+    ConfigurationOwnerIsKept,
+    /// The restore failed for a reason other than missing privilege, which
+    /// keeping the writer as owner would not answer.
+    NotAPrivilegeError,
+    /// The directory could not be read, so nothing shows it is shared.
+    DirectoryUnreadable,
+    /// The directory is not writable by its group: only its owner replaces
+    /// what is in it, so a different owner must not result from a write.
+    DirectoryNotShared,
+    /// The directory is sticky: each entry belongs to its owner.
+    DirectorySticky,
+}
+
+#[cfg(unix)]
+impl std::fmt::Display for OwnerRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::ConfigurationOwnerIsKept => "the owner of an agent configuration is kept",
+            Self::NotAPrivilegeError => "the failure was not a missing privilege",
+            Self::DirectoryUnreadable => "its directory could not be read",
+            Self::DirectoryNotShared => "its directory is not shared with a group",
+            Self::DirectorySticky => "its directory is sticky, so the file is its owner's",
+        })
     }
 }
 
-fn open_lock_file(path: &Path) -> std::io::Result<File> {
+/// What a writer that could not give the replacement back to the previous
+/// owner does instead. PURE: the facts are handed in.
+///
+/// THE CASE: `/var/lib/innerwarden/guard/graph.json` is shared, `2770
+/// innerwarden:innerwarden`, and the operator records into it through this
+/// crate as a member of that group. Once anything running as root rewrote or
+/// created it (the paid agent, or `sudo innerwarden-ctl drill`, which ran this
+/// CLI as root), it was root's file, and every later write by the operator
+/// staged a sibling, asked `fchown(sibling, 0, innerwarden)`, got `EPERM`, and
+/// threw the write away. Every decision after that was lost, permanently: no
+/// later write could ever succeed, because each one asked for the same
+/// impossible owner.
+///
+/// So in a SHARED directory a writer that may not restore the owner keeps the
+/// record as its own, in the directory's group, with the mode it had. That
+/// takes nothing from anyone: the same writer could already replace the file
+/// by renaming over it, which is what this write does, and the group the other
+/// half reads it through is kept. Everywhere else the refusal stands: an agent
+/// configuration keeps its owner or is not written, a private directory never
+/// hands a file to a different account, and a sticky directory's entries stay
+/// their owners'.
+#[cfg(unix)]
+fn when_the_owner_cannot_be_restored(
+    ownership: Ownership,
+    restore_errno: Option<i32>,
+    directory: Option<(u32, u32)>,
+) -> Result<u32, OwnerRefusal> {
+    if ownership != Ownership::SharedRecord {
+        return Err(OwnerRefusal::ConfigurationOwnerIsKept);
+    }
+    if restore_errno != Some(libc::EPERM) {
+        return Err(OwnerRefusal::NotAPrivilegeError);
+    }
+    let (mode, group) = directory.ok_or(OwnerRefusal::DirectoryUnreadable)?;
+    if mode & 0o1000 != 0 {
+        return Err(OwnerRefusal::DirectorySticky);
+    }
+    if !is_shared_directory(mode) {
+        return Err(OwnerRefusal::DirectoryNotShared);
+    }
+    Ok(group)
+}
+
+/// How many times a lock is re-opened when it is found replaced under us.
+const LOCK_ATTEMPTS: usize = 4;
+
+struct UpdateLock(File);
+
+impl UpdateLock {
+    fn acquire(path: &Path, ownership: Ownership) -> Result<Self, String> {
+        let lock_path = sibling(path, "innerwarden.lock");
+        for _ in 0..LOCK_ATTEMPTS {
+            let file = open_lock(&lock_path, ownership == Ownership::SharedRecord)
+                .map_err(|error| format!("opening {}: {error}", lock_path.display()))?;
+            // BLOCKING exclusive lock. fs4 1.x renamed `lock_exclusive` to `lock`;
+            // both are `flock(LOCK_EX)` on Unix and `LockFileEx(EXCLUSIVE)` on
+            // Windows, so this still waits for the other writer instead of failing.
+            // Called through the trait so it can never silently resolve to the
+            // inherent `std::fs::File::lock` on newer toolchains.
+            FileExt::lock(&file)
+                .map_err(|error| format!("locking {}: {error}", lock_path.display()))?;
+            if lock_still_names(&file, &lock_path) {
+                return Ok(Self(file));
+            }
+        }
+        Err(format!(
+            "{} kept being replaced while waiting for it",
+            lock_path.display()
+        ))
+    }
+}
+
+/// Open the sibling lock for a store in a SHARED directory, the way every
+/// writer of that store has to: see [`open_lock`]. Unusable legacy locks there
+/// are replaced.
+pub fn open_shared_lock(path: &Path) -> std::io::Result<File> {
+    open_lock(path, true)
+}
+
+/// Whether `file`, a lock just taken, is still the file at `path`.
+///
+/// A lock that was replaced while this writer waited on it serialises nothing:
+/// the next writer opens the new file. The caller re-opens and locks again.
+pub fn lock_still_names(file: &File, path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (file.metadata(), fs::symlink_metadata(path)) {
+            (Ok(held), Ok(named)) => held.dev() == named.dev() && held.ino() == named.ino(),
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (file, path);
+        true
+    }
+}
+
+/// Open a lock file, which needs a descriptor and nothing more.
+///
+/// THREE things about it, all measured on a shared store:
+///
+/// 1. An existing lock is opened READ-ONLY. `flock` and `LockFileEx` both take
+///    a read-only handle, and asking for write access as well meant that a
+///    lock somebody else had created (root, through `sudo`, or the paid agent)
+///    with the group's read bit and not its write bit refused the operator
+///    outright, and every write of the store failed at "opening the lock".
+/// 2. A NEW lock takes its mode and group from the directory it lands in, the
+///    same rule as every file this product creates ([`new_file_ownership`]):
+///    `0660` in the directory's group where that directory is shared, `0600`
+///    everywhere else. A hardcoded `0600` lock created by root in the shared
+///    directory locked every other account out of it.
+/// 3. With `heal`, a lock this account cannot open at all, in a shared
+///    directory, is REPLACED by a usable one. Such a lock was left by an older
+///    release run as root, and nothing else would ever fix it. Replacing it
+///    takes nothing from anyone: every member of the group may already rename
+///    over any name in that directory. Root never gets here (it opens
+///    anything), and a private directory never heals.
+fn open_lock(path: &Path, heal: bool) -> std::io::Result<File> {
+    #[cfg(not(unix))]
+    let _ = heal;
+    match open_existing_lock(path) {
+        Ok(file) => return Ok(file),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        #[cfg(unix)]
+        Err(error) if heal && error.kind() == std::io::ErrorKind::PermissionDenied => {
+            let directory = path.parent().ok_or(error)?;
+            replace_unusable_lock(path, directory)?;
+            return open_existing_lock(path);
+        }
+        Err(error) => return Err(error),
+    }
     let mut options = OpenOptions::new();
-    options.read(true).write(true).create(true).truncate(false);
+    options.read(true).write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        // Mode is this call site's policy, not part of opening safely.
+        // The directory decides the final mode below; this is only what the
+        // file has before that, so it starts private.
         options.mode(0o600);
     }
     innerwarden_safe_io::harden(&mut options);
+    match options.open(path) {
+        Ok(file) => {
+            regular_lock(&file)?;
+            #[cfg(unix)]
+            if let Some(directory) = path.parent() {
+                apply_new_file_ownership(&file, directory)?;
+            }
+            Ok(file)
+        }
+        // Another writer created it first: use that one.
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => open_existing_lock(path),
+        Err(error) => Err(error),
+    }
+}
+
+fn open_existing_lock(path: &Path) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    innerwarden_safe_io::harden(&mut options);
     let file = options.open(path)?;
+    regular_lock(&file)?;
+    Ok(file)
+}
+
+fn regular_lock(file: &File) -> std::io::Result<()> {
     let metadata = file.metadata()?;
     if !metadata.is_file() || is_reparse_or_symlink(&metadata) {
         return Err(std::io::Error::new(
@@ -169,7 +364,46 @@ fn open_lock_file(path: &Path) -> std::io::Result<File> {
             "lock path is not a regular file",
         ));
     }
-    Ok(file)
+    Ok(())
+}
+
+/// Replace a lock this account cannot open with a fresh one it can, in a
+/// shared directory only. See [`open_lock`].
+///
+/// The fresh lock is staged under a private name and RENAMED over the old one,
+/// so the name is never missing and a link planted there is replaced, never
+/// followed. A writer that healed it first wins: if the name opens by the time
+/// the replacement is ready, the replacement is discarded.
+#[cfg(unix)]
+fn replace_unusable_lock(path: &Path, directory: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let mode = fs::metadata(directory)?.mode();
+    if !is_shared_directory(mode) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "the lock cannot be opened and its directory is not shared",
+        ));
+    }
+    let staged = private_temp(path);
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true).mode(0o600);
+    innerwarden_safe_io::harden(&mut options);
+    let file = options.open(&staged)?;
+    let prepared = apply_new_file_ownership(&file, directory);
+    drop(file);
+    if let Err(error) = prepared {
+        let _ = fs::remove_file(&staged);
+        return Err(error);
+    }
+    if open_existing_lock(path).is_ok() {
+        let _ = fs::remove_file(&staged);
+        return Ok(());
+    }
+    let renamed = fs::rename(&staged, path);
+    if renamed.is_err() {
+        let _ = fs::remove_file(&staged);
+    }
+    renamed
 }
 
 impl Drop for UpdateLock {
@@ -339,7 +573,15 @@ pub fn read_config_no_symlinks(
 /// resolved and its target is replaced, preserving the link (explicit/manual
 /// config edits therefore keep working with dotfile managers).
 pub fn replace(path: &Path, body: &[u8]) -> Result<(), String> {
-    replace_inner(path, None, body, true, None, MAX_CONFIG_BYTES)
+    replace_inner(
+        path,
+        None,
+        body,
+        true,
+        None,
+        MAX_CONFIG_BYTES,
+        Ownership::Preserve,
+    )
 }
 
 /// Compare-and-replace variant for read/modify/write operations. `expected`
@@ -351,7 +593,15 @@ pub fn replace_if_unchanged(
     expected: Option<&[u8]>,
     body: &[u8],
 ) -> Result<(), String> {
-    replace_inner(path, Some(expected), body, true, None, MAX_CONFIG_BYTES)
+    replace_inner(
+        path,
+        Some(expected),
+        body,
+        true,
+        None,
+        MAX_CONFIG_BYTES,
+        Ownership::Preserve,
+    )
 }
 
 /// Automatic/background variant. Unlike explicit commands, it rejects observed
@@ -371,6 +621,7 @@ pub fn replace_if_unchanged_no_symlinks(
         false,
         Some(trusted_root),
         MAX_CONFIG_BYTES,
+        Ownership::Preserve,
     )
 }
 
@@ -396,9 +647,31 @@ pub fn replace_owned_store_no_symlinks(
         false,
         Some(trusted_root),
         MAX_OWNED_STORE_BYTES,
+        Ownership::SharedRecord,
     )
 }
 
+/// Give a staged replacement the previous file's owner and group: the
+/// production `fchown`, swapped in tests for one that answers as an
+/// unprivileged writer would.
+type RestoreOwner = fn(&File, u32, u32) -> std::io::Result<()>;
+
+#[cfg(unix)]
+fn restore_owner(file: &File, uid: u32, gid: u32) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: a valid open descriptor and plain integer ids.
+    if unsafe { libc::fchown(file.as_raw_fd(), uid, gid) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn restore_owner(_file: &File, _uid: u32, _gid: u32) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn replace_inner(
     requested_path: &Path,
     expected: Option<Option<&[u8]>>,
@@ -406,6 +679,30 @@ fn replace_inner(
     follow_file_symlink: bool,
     trusted_root: Option<&Path>,
     limit: u64,
+    ownership: Ownership,
+) -> Result<(), String> {
+    replace_inner_with(
+        requested_path,
+        expected,
+        body,
+        follow_file_symlink,
+        trusted_root,
+        limit,
+        ownership,
+        restore_owner,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn replace_inner_with(
+    requested_path: &Path,
+    expected: Option<Option<&[u8]>>,
+    body: &[u8],
+    follow_file_symlink: bool,
+    trusted_root: Option<&Path>,
+    limit: u64,
+    ownership: Ownership,
+    restore_owner: RestoreOwner,
 ) -> Result<(), String> {
     let path = if follow_file_symlink {
         resolve_target(requested_path)?
@@ -421,7 +718,7 @@ fn replace_inner(
         .ok_or_else(|| format!("{} has no parent directory", path.display()))?;
     fs::create_dir_all(parent)
         .map_err(|error| format!("creating {}: {error}", parent.display()))?;
-    let _lock = UpdateLock::acquire(&path)?;
+    let _lock = UpdateLock::acquire(&path, ownership)?;
     if let Some(expected) = expected {
         let current = if follow_file_symlink {
             current_bytes(&path, limit)?
@@ -452,7 +749,7 @@ fn replace_inner(
             .open(&temp)
             .map_err(|error| format!("creating {}: {error}", temp.display()))?;
         if let Some(metadata) = previous_metadata.as_ref() {
-            preserve_metadata(&path, &temp, &file, metadata)?;
+            preserve_metadata(&path, &temp, &file, metadata, ownership, restore_owner)?;
         }
         #[cfg(unix)]
         if previous_metadata.is_none() {
@@ -534,18 +831,41 @@ fn preserve_metadata(
     temp: &Path,
     file: &File,
     metadata: &fs::Metadata,
+    ownership: Ownership,
+    restore_owner: RestoreOwner,
 ) -> Result<(), String> {
     #[cfg(unix)]
     {
-        use std::os::fd::AsRawFd;
         use std::os::unix::fs::MetadataExt;
 
-        if unsafe { libc::fchown(file.as_raw_fd(), metadata.uid(), metadata.gid()) } != 0 {
-            return Err(format!(
-                "preserving ownership on {}: {}",
-                temp.display(),
-                std::io::Error::last_os_error()
-            ));
+        if let Err(error) = restore_owner(file, metadata.uid(), metadata.gid()) {
+            let directory = source
+                .parent()
+                .and_then(|directory| fs::metadata(directory).ok())
+                .map(|directory| (directory.mode(), directory.gid()));
+            let group =
+                when_the_owner_cannot_be_restored(ownership, error.raw_os_error(), directory)
+                    .map_err(|refusal| {
+                        format!(
+                            "preserving ownership on {}: {error} ({refusal})",
+                            temp.display()
+                        )
+                    })?;
+            // The writer stays the owner. The GROUP is the part the other half
+            // reads the record through, so it is not best-effort here: a record
+            // that cannot be put in the shared group is refused rather than
+            // written where the agent cannot read it.
+            let _ = std::os::unix::fs::fchown(file, None, Some(group));
+            let landed = file
+                .metadata()
+                .map_err(|error| format!("inspecting {}: {error}", temp.display()))?;
+            if landed.gid() != group {
+                return Err(format!(
+                    "preserving ownership on {}: {error}, and the replacement could not be \
+                     given the shared group {group}",
+                    temp.display()
+                ));
+            }
         }
 
         #[cfg(target_vendor = "apple")]
@@ -1035,12 +1355,12 @@ mod tests {
         let target = dir.path().join("other.lock");
         fs::write(&target, b"").unwrap();
         symlink(&target, &lock).unwrap();
-        assert!(UpdateLock::acquire(&config).is_err());
+        assert!(UpdateLock::acquire(&config, Ownership::Preserve).is_err());
         fs::remove_file(&lock).unwrap();
 
         let fifo = CString::new(lock.as_os_str().as_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
-        assert!(UpdateLock::acquire(&config).is_err());
+        assert!(UpdateLock::acquire(&config, Ownership::Preserve).is_err());
     }
 
     /// The serialization this module promises is only real if the sibling lock
@@ -1055,12 +1375,13 @@ mod tests {
 
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("settings.json");
-        let held = UpdateLock::acquire(&path).expect("first writer acquires");
+        let held = UpdateLock::acquire(&path, Ownership::Preserve).expect("first writer acquires");
 
         let (acquired_tx, acquired_rx) = mpsc::channel();
         let contender_path = path.clone();
         let contender = std::thread::spawn(move || {
-            let lock = UpdateLock::acquire(&contender_path).expect("second writer acquires");
+            let lock = UpdateLock::acquire(&contender_path, Ownership::Preserve)
+                .expect("second writer acquires");
             acquired_tx.send(()).unwrap();
             drop(lock);
         });
@@ -1119,6 +1440,365 @@ mod tests {
             .file_type()
             .is_symlink());
         assert_eq!(fs::read(target).unwrap(), b"new");
+    }
+
+    // ── a shared record that somebody else last wrote ──────────────────────
+
+    /// What an unprivileged writer gets from `fchown` to another account.
+    #[cfg(unix)]
+    fn restore_refused(_file: &File, _uid: u32, _gid: u32) -> std::io::Result<()> {
+        Err(std::io::Error::from_raw_os_error(libc::EPERM))
+    }
+
+    /// A non-root account cannot construct "a file I may not open" for itself
+    /// with modes: root opens anything. Said, rather than passed vacuously.
+    #[cfg(unix)]
+    fn require_unprivileged(test: &str) {
+        // SAFETY: reads the process credentials, cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            panic!(
+                "{test}: running as root, which ignores file modes, so the case cannot be \
+                 constructed. Run the suite as an ordinary account; a pass here would prove \
+                 nothing."
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    fn shared_dir_with_mode(mode: u32) -> (tempfile::TempDir, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let shared = dir.path().join("guard");
+        fs::create_dir(&shared).unwrap();
+        if let Some(group) = a_group_this_process_can_hand_to_a_file() {
+            // A group that is not this process's primary one, so "the record
+            // carries the directory's group" cannot hold by accident.
+            let _ = std::os::unix::fs::chown(&shared, None, Some(group));
+        }
+        fs::set_permissions(&shared, fs::Permissions::from_mode(mode)).unwrap();
+        (dir, shared)
+    }
+
+    /// THE DEFECT, decision half. Every refusal is a different reason, and the
+    /// only shape that keeps the writer as owner is a shared record, a missing
+    /// privilege, and a group-writable directory that is not sticky.
+    #[cfg(unix)]
+    #[test]
+    fn only_a_shared_record_in_a_shared_directory_changes_hands() {
+        const SHARED: (u32, u32) = (0o2770, 986);
+        assert_eq!(
+            when_the_owner_cannot_be_restored(
+                Ownership::SharedRecord,
+                Some(libc::EPERM),
+                Some(SHARED)
+            ),
+            Ok(986),
+            "the shared record is kept writable, in the directory's group"
+        );
+        assert_eq!(
+            when_the_owner_cannot_be_restored(
+                Ownership::SharedRecord,
+                Some(libc::EPERM),
+                Some((0o770, 986))
+            ),
+            Ok(986),
+            "setgid or not, a group-writable directory is shared"
+        );
+        assert_eq!(
+            when_the_owner_cannot_be_restored(Ownership::Preserve, Some(libc::EPERM), Some(SHARED)),
+            Err(OwnerRefusal::ConfigurationOwnerIsKept),
+            "an agent configuration keeps its owner or is not written, wherever it is"
+        );
+        assert_eq!(
+            when_the_owner_cannot_be_restored(
+                Ownership::SharedRecord,
+                Some(libc::EIO),
+                Some(SHARED)
+            ),
+            Err(OwnerRefusal::NotAPrivilegeError)
+        );
+        assert_eq!(
+            when_the_owner_cannot_be_restored(Ownership::SharedRecord, None, Some(SHARED)),
+            Err(OwnerRefusal::NotAPrivilegeError)
+        );
+        assert_eq!(
+            when_the_owner_cannot_be_restored(Ownership::SharedRecord, Some(libc::EPERM), None),
+            Err(OwnerRefusal::DirectoryUnreadable)
+        );
+        for private in [0o700, 0o750, 0o755, 0o2750] {
+            assert_eq!(
+                when_the_owner_cannot_be_restored(
+                    Ownership::SharedRecord,
+                    Some(libc::EPERM),
+                    Some((private, 986))
+                ),
+                Err(OwnerRefusal::DirectoryNotShared),
+                "a {private:o} directory is its owner's: a file there never changes hands"
+            );
+        }
+        for sticky in [0o1777, 0o1770, 0o3770] {
+            assert_eq!(
+                when_the_owner_cannot_be_restored(
+                    Ownership::SharedRecord,
+                    Some(libc::EPERM),
+                    Some((sticky, 986))
+                ),
+                Err(OwnerRefusal::DirectorySticky),
+                "a {sticky:o} directory keeps each entry its owner's"
+            );
+        }
+    }
+
+    /// THE DEFECT, as the operator met it: the shared graph belonged to root,
+    /// the operator's write could not give it back, and the write was thrown
+    /// away. Now it lands, owned by the writer, in the directory's group, with
+    /// the mode it had.
+    ///
+    /// FAILS ON REVERT: make `preserve_metadata` return the `fchown` error
+    /// again and this write is refused, as every one was on the demo host.
+    #[cfg(unix)]
+    #[test]
+    fn a_shared_record_another_account_owns_is_still_written() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let (_dir, shared) = shared_dir_with_mode(0o770);
+        let path = shared.join("graph.json");
+        fs::write(&path, b"{}").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+
+        replace_inner_with(
+            &path,
+            Some(Some(b"{}")),
+            b"{\"nodes\":[1]}",
+            false,
+            Some(&shared),
+            MAX_OWNED_STORE_BYTES,
+            Ownership::SharedRecord,
+            restore_refused,
+        )
+        .expect("a shared record must still be written when its owner cannot be restored");
+
+        assert_eq!(fs::read(&path).unwrap(), b"{\"nodes\":[1]}");
+        let written = fs::metadata(&path).unwrap();
+        // SAFETY: reads the process credentials, cannot fail.
+        assert_eq!(
+            written.uid(),
+            unsafe { libc::geteuid() },
+            "the writer owns it"
+        );
+        assert_eq!(
+            written.gid(),
+            fs::metadata(&shared).unwrap().gid(),
+            "it stays in the shared group the other half reads it through"
+        );
+        assert_eq!(
+            written.permissions().mode() & 0o7777,
+            0o640,
+            "with the mode it had"
+        );
+    }
+
+    /// The same failure on an agent CONFIGURATION is still a refusal, for the
+    /// reason that names it, and the file is untouched: a writer must not end
+    /// up owning somebody else's configuration because a directory was shared.
+    #[cfg(unix)]
+    #[test]
+    fn a_configuration_another_account_owns_is_still_refused() {
+        let (_dir, shared) = shared_dir_with_mode(0o770);
+        let path = shared.join("settings.json");
+        fs::write(&path, b"{}").unwrap();
+
+        let error = replace_inner_with(
+            &path,
+            Some(Some(b"{}")),
+            b"{\"hooks\":[]}",
+            false,
+            Some(&shared),
+            MAX_CONFIG_BYTES,
+            Ownership::Preserve,
+            restore_refused,
+        )
+        .expect_err("a configuration keeps its owner or is not written");
+        assert!(
+            error.ends_with(&format!("({})", OwnerRefusal::ConfigurationOwnerIsKept)),
+            "refused for the wrong reason: {error}"
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"{}");
+    }
+
+    /// And a record outside a shared directory never changes hands: the
+    /// refusal, its reason, and the file left as it was.
+    #[cfg(unix)]
+    #[test]
+    fn a_record_in_a_private_or_sticky_directory_never_changes_hands() {
+        for (mode, reason) in [
+            (0o755, OwnerRefusal::DirectoryNotShared),
+            (0o1770, OwnerRefusal::DirectorySticky),
+        ] {
+            let (_dir, shared) = shared_dir_with_mode(mode);
+            let path = shared.join("graph.json");
+            fs::write(&path, b"{}").unwrap();
+
+            let error = replace_inner_with(
+                &path,
+                Some(Some(b"{}")),
+                b"{\"nodes\":[1]}",
+                false,
+                Some(&shared),
+                MAX_OWNED_STORE_BYTES,
+                Ownership::SharedRecord,
+                restore_refused,
+            )
+            .expect_err("only a shared directory hands a record to its writer");
+            assert!(
+                error.ends_with(&format!("({reason})")),
+                "{mode:o}: refused for the wrong reason: {error}"
+            );
+            assert_eq!(fs::read(&path).unwrap(), b"{}");
+        }
+    }
+
+    /// A lock somebody else created, readable by this account and not
+    /// writable, still serialises. `flock` needs a descriptor, not write
+    /// access; asking for write as well refused the operator outright.
+    ///
+    /// FAILS ON REVERT: open the existing lock read-write again and the write
+    /// fails at "opening the lock".
+    #[cfg(unix)]
+    #[test]
+    fn a_lock_this_account_may_only_read_still_serialises_the_write() {
+        use std::os::unix::fs::PermissionsExt;
+        require_unprivileged("a_lock_this_account_may_only_read_still_serialises_the_write");
+        // Where no lock is ever replaced (a private directory, and an agent
+        // configuration anywhere), so only the read-only open can make this
+        // pass.
+        let private = tempfile::TempDir::new().unwrap();
+        fs::set_permissions(private.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let (_dir, shared) = shared_dir_with_mode(0o770);
+        for (root, path, shared_record) in [
+            (private.path(), private.path().join("graph.json"), true),
+            (shared.as_path(), shared.join("settings.json"), false),
+        ] {
+            let lock = sibling(&path, "innerwarden.lock");
+            fs::write(&lock, b"").unwrap();
+            fs::set_permissions(&lock, fs::Permissions::from_mode(0o440)).unwrap();
+            assert!(
+                OpenOptions::new().write(true).open(&lock).is_err(),
+                "precondition: this account may not write the lock"
+            );
+
+            let written = if shared_record {
+                replace_owned_store_no_symlinks(root, &path, None, b"{}")
+            } else {
+                replace_if_unchanged_no_symlinks(root, &path, None, b"{}")
+            };
+            written.unwrap_or_else(|error| {
+                panic!(
+                    "a readable lock is all a lock needs, at {}: {error}",
+                    lock.display()
+                )
+            });
+
+            let ownership = if shared_record {
+                Ownership::SharedRecord
+            } else {
+                Ownership::Preserve
+            };
+            let held = UpdateLock::acquire(&path, ownership).expect("held");
+            assert!(
+                FileExt::try_lock(&open_existing_lock(&lock).unwrap()).is_err(),
+                "and it still EXCLUDES: a second descriptor cannot take it"
+            );
+            drop(held);
+        }
+    }
+
+    /// A new lock in the shared directory is one every member of the group can
+    /// open, whoever made it. A hardcoded `0600` lock made by root there shut
+    /// the operator out of the store for good.
+    ///
+    /// FAILS ON REVERT: create the lock with a fixed `0600` again.
+    #[cfg(unix)]
+    #[test]
+    fn a_new_lock_in_a_shared_directory_is_one_the_group_can_open() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let (_dir, shared) = shared_dir_with_mode(0o770);
+        let path = shared.join("graph.json");
+
+        replace_owned_store_no_symlinks(&shared, &path, None, b"{}").expect("write");
+
+        let lock = fs::metadata(sibling(&path, "innerwarden.lock")).unwrap();
+        assert_eq!(lock.permissions().mode() & 0o777, 0o660);
+        assert_eq!(lock.gid(), fs::metadata(&shared).unwrap().gid());
+
+        // A private directory keeps its private lock.
+        let private = tempfile::TempDir::new().unwrap();
+        fs::set_permissions(private.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let config = private.path().join("settings.json");
+        replace(&config, b"{}").expect("write");
+        assert_eq!(
+            fs::metadata(sibling(&config, "innerwarden.lock"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    /// A lock this account cannot open AT ALL, left in the shared directory by
+    /// an older release run as root, is replaced by one it can, so recording
+    /// resumes instead of failing forever. Only there: in a private directory,
+    /// or for an agent configuration, the refusal stands.
+    ///
+    /// FAILS ON REVERT: drop the heal from `open_lock` and the shared write
+    /// fails at "opening the lock".
+    #[cfg(unix)]
+    #[test]
+    fn an_unusable_lock_in_a_shared_directory_is_replaced_and_nowhere_else() {
+        use std::os::unix::fs::PermissionsExt;
+        require_unprivileged("an_unusable_lock_in_a_shared_directory_is_replaced_and_nowhere_else");
+        let plant = |dir: &Path, name: &str| -> PathBuf {
+            let path = dir.join(name);
+            let lock = sibling(&path, "innerwarden.lock");
+            fs::write(&lock, b"").unwrap();
+            fs::set_permissions(&lock, fs::Permissions::from_mode(0o000)).unwrap();
+            assert!(
+                open_existing_lock(&lock).is_err(),
+                "precondition: this account cannot open the planted lock"
+            );
+            path
+        };
+
+        let (_dir, shared) = shared_dir_with_mode(0o770);
+        let path = plant(&shared, "graph.json");
+        replace_owned_store_no_symlinks(&shared, &path, None, b"{}")
+            .expect("the shared record is written past an unusable legacy lock");
+        assert_eq!(fs::read(&path).unwrap(), b"{}");
+        assert_eq!(
+            fs::metadata(sibling(&path, "innerwarden.lock"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o660,
+            "the replacement is one the whole group can open"
+        );
+
+        let config = plant(&shared, "settings.json");
+        assert!(
+            replace_if_unchanged_no_symlinks(&shared, &config, None, b"{}").is_err(),
+            "an agent configuration's lock is never replaced"
+        );
+        assert!(!config.exists());
+
+        let private = tempfile::TempDir::new().unwrap();
+        fs::set_permissions(private.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let store = plant(private.path(), "graph.json");
+        assert!(
+            replace_owned_store_no_symlinks(private.path(), &store, None, b"{}").is_err(),
+            "a private directory never heals a lock"
+        );
+        assert!(!store.exists());
     }
 }
 
