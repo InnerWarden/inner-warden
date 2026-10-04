@@ -737,12 +737,20 @@ fn append_guard_event_at(dir: &std::path::Path, line: &Value) {
     create_sink_with_directory_ownership(&path);
     let mut record = line.to_string();
     record.push('\n');
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
-        let _ = file.write_all(record.as_bytes());
+    // Never through a link, never waiting on a FIFO, only into a plain file.
+    // The directory is shared with the guarded agent's uid, and this CLI is also
+    // run as root (`sudo`): appending through a name that uid had pointed at a
+    // root-owned file would have been root writing a line of its choosing there.
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    innerwarden_safe_io::harden(&mut options);
+    if let Ok(mut file) = options.open(&path) {
+        if file
+            .metadata()
+            .is_ok_and(|metadata| innerwarden_safe_io::is_regular_file(&metadata))
+        {
+            let _ = file.write_all(record.as_bytes());
+        }
     }
 }
 
@@ -1941,6 +1949,25 @@ mod tests {
             std::fs::metadata(&sink).unwrap().permissions().mode() & 0o777,
             0o600
         );
+    }
+
+    /// The sink the paid agent tails is in a directory the guarded agent's
+    /// uid writes, and this CLI also runs as root. A link planted at its name
+    /// is never appended through.
+    ///
+    /// FAILS ON REVERT: open it without `harden` and the victim gains a line.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_at_the_guard_event_sink_is_never_appended_through() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let elsewhere = tempfile::TempDir::new().unwrap();
+        let victim = elsewhere.path().join("cron-job");
+        std::fs::write(&victim, "# untouched\n").unwrap();
+        std::os::unix::fs::symlink(&victim, dir.path().join("guard-events.jsonl")).unwrap();
+
+        append_guard_event_at(dir.path(), &json!({"kind": "guard.blocked"}));
+
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "# untouched\n");
     }
 
     #[test]

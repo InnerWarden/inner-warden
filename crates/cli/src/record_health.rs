@@ -180,14 +180,70 @@ fn nearest_existing_ancestor(dir: &Path) -> Option<&Path> {
 
 /// Write and remove a file in `dir`. The same permissions creating the store
 /// needs, exercised rather than inferred.
+///
+/// Created EXCLUSIVELY: the name is predictable and the directory may be one
+/// another account writes, so a link planted there must make the probe fail,
+/// never be followed. `std::fs::write` truncated whatever it pointed at, as
+/// whoever ran the CLI, root included.
 fn probe_writable(dir: &Path) -> bool {
     let probe = dir.join(format!(".iw-write-probe.{}", std::process::id()));
-    match std::fs::write(&probe, b"") {
-        Ok(()) => {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    innerwarden_safe_io::harden(&mut options);
+    match options.open(&probe) {
+        Ok(_) => {
             let _ = std::fs::remove_file(&probe);
             true
         }
         Err(_) => false,
+    }
+}
+
+/// Write the health record beside the graph without following a link.
+///
+/// The graph's directory is shared with the guarded agent's uid when Active
+/// Defence is installed, and this CLI also runs as root. `std::fs::write`
+/// opened the name with `O_CREAT|O_TRUNC` and followed whatever was there, so a
+/// link the agent's uid put at `record-health.json` made root truncate and
+/// rewrite its target the next time a record failed, and the guarded uid can
+/// make a record fail at will by holding the graph lock. A new file takes the
+/// mode and group its directory implies, like every other file this product
+/// creates there, so whoever records next can update it.
+fn write_health(path: &Path, body: &[u8]) {
+    use std::io::Write;
+    let mut create = std::fs::OpenOptions::new();
+    create.write(true).create_new(true);
+    innerwarden_safe_io::harden(&mut create);
+    let file = match create.open(path) {
+        Ok(file) => {
+            #[cfg(unix)]
+            if let Some(directory) = path.parent() {
+                let _ = innerwarden_agent_guard::file_update::apply_new_file_ownership(
+                    &file, directory,
+                );
+            }
+            file
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let mut existing = std::fs::OpenOptions::new();
+            existing.write(true);
+            innerwarden_safe_io::harden(&mut existing);
+            match existing.open(path) {
+                Ok(file) => file,
+                Err(_) => return,
+            }
+        }
+        Err(_) => return,
+    };
+    if !file
+        .metadata()
+        .is_ok_and(|metadata| innerwarden_safe_io::is_regular_file(&metadata))
+    {
+        return;
+    }
+    let mut file = file;
+    if file.set_len(0).is_ok() {
+        let _ = file.write_all(body);
     }
 }
 
@@ -242,7 +298,7 @@ pub fn note_failure_at(graph: &Path, code: &str) -> Outage {
         "lost": outage.lost,
         "first_of_episode": first_of_episode,
     });
-    let _ = std::fs::write(health_path(graph), body.to_string());
+    write_health(&health_path(graph), body.to_string().as_bytes());
     outage
 }
 
@@ -482,5 +538,77 @@ mod tests {
         std::fs::write(health_path(&g), "{not json").unwrap();
         assert!(read_at(&g).is_none());
         assert!(!is_first_of_episode_at(&g));
+    }
+
+    /// The health record sits in a directory the guarded agent's uid writes,
+    /// and this CLI also runs as root. A link planted at its name must never
+    /// be written through: the guarded uid can make a record fail at will (it
+    /// only has to hold the graph lock), and `std::fs::write` then truncated
+    /// and rewrote whatever the link named, as root.
+    ///
+    /// FAILS ON REVERT: write it with `std::fs::write` again and the victim is
+    /// overwritten.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_at_the_health_record_is_never_written_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let victim = elsewhere.path().join("sudoers");
+        std::fs::write(&victim, "root ALL=(ALL) ALL\n").unwrap();
+        let g = graph_in(&dir);
+        std::os::unix::fs::symlink(&victim, health_path(&g)).unwrap();
+
+        let _ = note_failure_at(&g, "graph_lock_timeout");
+
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "root ALL=(ALL) ALL\n",
+            "the file the link named was written"
+        );
+        assert!(std::fs::symlink_metadata(health_path(&g))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    /// Same rule for the write probe, whose name is predictable.
+    ///
+    /// FAILS ON REVERT: probe with `std::fs::write` and the victim is truncated.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_at_the_write_probe_is_never_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let victim = elsewhere.path().join("shadow");
+        std::fs::write(&victim, "root:x:0:0\n").unwrap();
+        let probe = dir
+            .path()
+            .join(format!(".iw-write-probe.{}", std::process::id()));
+        std::os::unix::fs::symlink(&victim, &probe).unwrap();
+
+        let _ = probe_writable(dir.path());
+
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "root:x:0:0\n");
+    }
+
+    /// A health record the first writer created in a shared directory is one
+    /// the next writer, another member of the group, can update.
+    #[cfg(unix)]
+    #[test]
+    fn a_new_health_record_in_a_shared_directory_takes_its_group_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o2770)).unwrap();
+        let g = graph_in(&dir);
+        let _ = note_failure_at(&g, "graph_write_failed");
+        assert_eq!(
+            std::fs::metadata(health_path(&g))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o660
+        );
+        assert_eq!(read_at(&g).expect("readable").code, "graph_write_failed");
     }
 }
