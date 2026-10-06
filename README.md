@@ -119,8 +119,12 @@ Whatever agent you run, there is a mechanism and a command for it:
   message hooks see the inbound prompt and the reply, so
   `innerwarden observe install` records a dangerous ask even when the model,
   not the guard, is what stopped it. The Control UI chat reports no reply to
-  hooks, so an ask made there is recorded after two minutes with the outcome
-  stated as not visible.
+  hooks, so the same command installs a small OpenClaw plugin that reads how
+  each Control UI turn ended (a tool call, a reply, or neither; never the
+  words), granted the conversation access OpenClaw requires for that. Without
+  it, an ask made there is recorded after two minutes with the outcome stated
+  as not visible. `innerwarden upgrade` brings both up to the new version's
+  where nobody changed them.
 - **Any other MCP client** - point it at `innerwarden proxy -- <server>`.
 - **Anything with no cooperative surface** - run it isolated:
   `innerwarden contain -- <command>`.

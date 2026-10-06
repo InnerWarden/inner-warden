@@ -7,11 +7,17 @@ follows semantic versioning.
 
 ### Upgrade notes: what to do
 
-- **OpenClaw message hook: install it again.** `innerwarden observe install`,
-  then restart the OpenClaw gateway. The hook an earlier version wrote keeps
-  running after an upgrade, and with it Control UI chats are recorded only
-  after 15 minutes and without the agent's name. `innerwarden observe status`,
-  the dashboard's Messages card and `upgrade` now say when it is out of date.
+- **OpenClaw message hook: install it again, this once.**
+  `innerwarden observe install`, then restart the OpenClaw gateway. The hook
+  an earlier version wrote keeps running after an upgrade, and with it
+  Control UI chats are recorded only after 15 minutes and without the agent's
+  name. The install now also adds the reply plugin (below), and grants it the
+  conversation access OpenClaw requires before a plugin can read a turn; it
+  says so, and leaves alone an entry you turned off and your `plugins.allow`,
+  `plugins.deny` and `plugins.enabled`. From this version on, `upgrade` brings
+  the hook and the plugin up to the new version's itself (`observe refresh`).
+  `innerwarden observe status` and the dashboard's Messages card say when
+  either is an earlier version's, or is not what InnerWarden wrote.
 - **A copy installed from the `.deb` or `.rpm` is upgraded with the package.**
   `innerwarden upgrade` refuses it and exits 2, so an unattended
   `sudo innerwarden upgrade` on such a host now fails. Use the command it
@@ -30,6 +36,27 @@ follows semantic versioning.
 
 ### Changed
 
+- **A Control UI ask is recorded with how the turn ended.** OpenClaw reports
+  no reply from its Control UI chat to hooks, so an ask made there was
+  recorded after two minutes with the outcome not seen. `observe install`
+  now adds an OpenClaw plugin, `innerwarden-replies`, that reads the end of
+  each Control UI turn a person started (OpenClaw's typed `agent_end` hook)
+  and reports only its shape, a tool call, a reply, or neither, to the new
+  `innerwarden observe ended`. That closes the ask whose message started the
+  turn, and no other: a turn that replied with no tool call is a reply like
+  any on Telegram; one that called a tool is recorded as `undetermined` with
+  `decider_basis: tool_call_in_turn`, because a tool the guard does not
+  screen leaves nothing in its record, and a reply after it does not show the
+  agent declined; one that ended with nothing said is `undetermined`,
+  `turn_ended_without_reply`. A heartbeat or cron turn never closes an ask.
+  The gateway logs the plugin as one it cannot verify, because it was not
+  installed through `openclaw plugins install`.
+- **`upgrade` refreshes what `observe install` wrote.** After the binary is
+  replaced, the new binary's `innerwarden observe refresh` replaces the
+  message hook's and the reply plugin's files with the new version's where
+  they are exactly what an earlier release wrote. A file somebody changed is
+  left as it is and named, nothing that was not installed is added, and the
+  gateway is never restarted: the upgrade says to restart it.
 - **The MCP proxy ends with its session.** When the client closes, the proxy
   relays the server's last output for 3 s, then stops the server: SIGTERM to
   its whole process group, SIGKILL 1 s later, so a server started through

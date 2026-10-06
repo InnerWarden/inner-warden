@@ -408,6 +408,12 @@ fn decider_words(decider: &str, basis: &str) -> &'static str {
         ("undetermined", "next_message_before_reply") => {
             "Outcome not seen: another message arrived before any reply"
         }
+        ("undetermined", "tool_call_in_turn") => {
+            "Outcome not seen: your agent used a tool while answering, so its reply does not show it declined"
+        }
+        ("undetermined", "turn_ended_without_reply") => {
+            "Outcome not seen: your agent's turn ended without a reply"
+        }
         ("undetermined", "no_reply_observed_within_ttl") => {
             "Outcome not seen: no reply arrived within 15 minutes"
         }
@@ -576,11 +582,11 @@ pub(crate) struct LaneFacts<'a> {
     /// has the guard in front of it.
     pub guard_mode: &'a str,
     pub observe_installed: bool,
-    /// The installed OpenClaw message hook is the one this binary ships.
-    /// `observe install` writes it once and an upgrade does not touch it, so
-    /// after an upgrade a host keeps running the old one until the operator
-    /// installs it again. True when no hook is installed.
-    pub observe_current: bool,
+    /// What `observe install` left in OpenClaw (the message hook and the reply
+    /// plugin), judged against what this binary ships. It writes them once,
+    /// and a host keeps running an earlier version's until they are installed
+    /// again or an upgrade refreshes them.
+    pub observation: crate::observe_io::Observation,
     /// An OpenClaw config is on this machine: `innerwarden observe install`
     /// has something to install into. Without one it exits 1 and changes
     /// nothing, so it is never offered.
@@ -777,19 +783,65 @@ fn agent_messages_lane(facts: &LaneFacts<'_>) -> Value {
             }),
         );
     }
-    // A hook an earlier version wrote keeps running after an upgrade, and
-    // this card's count is only as good as the hook feeding it: say so where
-    // the count is read, with the step that fixes it.
-    if facts.observe_installed && !facts.observe_current {
-        object.insert(
-            "next_step".into(),
-            json!({
-                "command": "innerwarden observe install",
-                "line": "The message hook on this machine is older than this version: Control UI chats are recorded only after 15 minutes, and without your agent's name. Install it again, then restart the OpenClaw gateway.",
-            }),
-        );
+    // This card's count is only as good as what feeds it: say so where the
+    // count is read, with the step that fixes it.
+    if facts.observe_installed {
+        if let Some((command, line)) = messages_step(&facts.observation, &recent) {
+            object.insert(
+                "next_step".into(),
+                json!({ "command": command, "line": line }),
+            );
+        }
     }
     Value::Object(object)
+}
+
+/// The step the Messages card carries while the message hook is installed,
+/// if what `observe install` left needs one. PURE.
+///
+/// A file InnerWarden did not write comes first: what it records cannot be
+/// relied on. Then an earlier version's files, which an upgrade from a
+/// version that could not refresh them leaves in place. Then a reply plugin
+/// that does not run, but only once a Control UI ask in the window has been
+/// recorded without its outcome: a host that never uses that chat does not
+/// need the plugin, and a step it can never clear would be noise.
+fn messages_step(
+    observation: &crate::observe_io::Observation,
+    recent: &[&Attempt],
+) -> Option<(&'static str, &'static str)> {
+    use crate::observe::InstalledFiles;
+    let units = [observation.hook, observation.plugin];
+    if units
+        .iter()
+        .any(|unit| matches!(unit, InstalledFiles::Changed(_)))
+    {
+        return Some((
+            "innerwarden observe install",
+            "The message hook on this machine is not the one InnerWarden wrote, so what this card counts cannot be relied on. Install it again, then restart the OpenClaw gateway.",
+        ));
+    }
+    if units.contains(&InstalledFiles::Outdated) {
+        return Some((
+            "innerwarden observe install",
+            "The message hook on this machine is an earlier version's, and this version's records more. Install it again, then restart the OpenClaw gateway.",
+        ));
+    }
+    let unseen_control_ui = recent
+        .iter()
+        .any(|attempt| attempt.basis == "channel_reports_no_reply");
+    if !unseen_control_ui || observation.plugin_runs() {
+        return None;
+    }
+    if observation.plugin == InstalledFiles::NotInstalled {
+        return Some((
+            "innerwarden observe install",
+            "Control UI chats are recorded without how your agent's turn ended. Installing again adds the plugin that reads it; then restart the OpenClaw gateway.",
+        ));
+    }
+    Some((
+        "innerwarden observe status",
+        "The plugin that reads how a Control UI turn ended is installed, but your OpenClaw settings keep it from running. This command names the setting.",
+    ))
 }
 
 /// `lanes`: the three cards. The server's lane is always `no_source` here:
@@ -2223,6 +2275,16 @@ mod tests {
             words(line("undetermined", "pending_state_unavailable")),
             "Outcome not seen: InnerWarden could not hold the message to wait for the reply"
         );
+        // A turn the reply plugin saw end: one that called a tool never
+        // reads as a refusal, and one that ended with nothing said is not one.
+        assert_eq!(
+            words(line("undetermined", "tool_call_in_turn")),
+            "Outcome not seen: your agent used a tool while answering, so its reply does not show it declined"
+        );
+        assert_eq!(
+            words(line("undetermined", "turn_ended_without_reply")),
+            "Outcome not seen: your agent's turn ended without a reply"
+        );
         // What the guard's sink held in the window is said as such, and the
         // worst of it, a flagged action monitor mode let run, is never
         // softened into "not seen" alone.
@@ -2256,6 +2318,8 @@ mod tests {
             ("undetermined", "guard_block_recorded_in_window"),
             ("undetermined", "pending_limit_reached"),
             ("undetermined", "pending_state_unavailable"),
+            ("undetermined", "tool_call_in_turn"),
+            ("undetermined", "turn_ended_without_reply"),
         ] {
             assert!(decider_words(decider, basis).chars().count() <= 120);
         }
@@ -2555,7 +2619,7 @@ mod tests {
             record,
             guard_mode: mode,
             observe_installed: false,
-            observe_current: true,
+            observation: crate::observe_io::Observation::NONE,
             openclaw_present: true,
             log,
         }
@@ -2586,34 +2650,141 @@ mod tests {
     /// A hook an earlier version wrote keeps running after an upgrade, so
     /// the Messages card read "nothing risky reached your agent" for a
     /// Control UI ask for fifteen minutes, with nothing anywhere a customer
-    /// looks saying why. The card now carries the step.
+    /// looks saying why. The card carries the step, and says which of the
+    /// two it is: an earlier version's hook, or one InnerWarden did not
+    /// write, whose count cannot be relied on at all.
     ///
-    /// FAILS ON REVERT: drop the step and the out-of-date hook says nothing.
+    /// FAILS ON REVERT: drop the step and the out-of-date hook says nothing;
+    /// drop the changed arm and a hook InnerWarden did not write gets no step
+    /// at all.
     #[test]
-    fn an_out_of_date_message_hook_is_named_on_its_card() {
+    fn an_out_of_date_or_changed_message_hook_is_named_on_its_card() {
+        use crate::observe::InstalledFiles;
         let g = Graph::new();
         let tally = g.agent_actions_tally(0);
         let record = g.record_span();
         let log = EventLog::default();
-        let installed = |current: bool| {
+        let installed = |hook: InstalledFiles, plugin: InstalledFiles| {
             lanes_json(&LaneFacts {
                 observe_installed: true,
-                observe_current: current,
+                observation: crate::observe_io::Observation {
+                    hook,
+                    plugin,
+                    plugin_blocker: None,
+                },
                 ..lane_facts(&tally, &record, "monitor", &log)
             })
         };
-        let stale = installed(false);
-        assert_eq!(stale["agent_messages"]["availability"], "available");
+        let line = |card: &Value| -> String {
+            assert_eq!(card["agent_messages"]["availability"], "available");
+            assert_eq!(
+                card["agent_messages"]["next_step"]["command"],
+                "innerwarden observe install"
+            );
+            let line = card["agent_messages"]["next_step"]["line"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            assert!(line.contains("restart the OpenClaw gateway"), "{line}");
+            assert!(line.chars().count() <= 300, "the page cuts a line past 300");
+            line
+        };
+        let stale = line(&installed(
+            InstalledFiles::Outdated,
+            InstalledFiles::Current,
+        ));
+        assert!(stale.contains("an earlier version's"), "{stale}");
+        let stale_plugin = line(&installed(
+            InstalledFiles::Current,
+            InstalledFiles::Outdated,
+        ));
+        assert!(
+            stale_plugin.contains("an earlier version's"),
+            "{stale_plugin}"
+        );
+        for changed in [
+            installed(
+                InstalledFiles::Changed("handler.js"),
+                InstalledFiles::Current,
+            ),
+            installed(
+                InstalledFiles::Outdated,
+                InstalledFiles::Changed("index.js"),
+            ),
+        ] {
+            let line = line(&changed);
+            assert!(line.contains("not the one InnerWarden wrote"), "{line}");
+            assert!(line.contains("cannot be relied on"), "{line}");
+        }
+        assert!(
+            installed(InstalledFiles::Current, InstalledFiles::Current)["agent_messages"]
+                .get("next_step")
+                .is_none()
+        );
+    }
+
+    /// Control UI asks are recorded without their outcome until the reply
+    /// plugin runs. The card says so once such an ask is on it, with the step
+    /// that fits: install, where the plugin is missing, or `observe status`,
+    /// where the operator's own plugin settings keep it from running (an
+    /// install changes no policy, so offering it there would not help). A
+    /// host that never used that chat gets no step it can never clear.
+    ///
+    /// FAILS ON REVERT: drop the plugin arm of `messages_step` and the card
+    /// with an unseen Control UI ask carries no step.
+    #[test]
+    fn an_unseen_control_ui_ask_names_the_missing_or_blocked_plugin() {
+        use crate::observe::{InstalledFiles, PluginBlocker};
+        let g = Graph::new();
+        let tally = g.agent_actions_tally(0);
+        let record = g.record_span();
+        let unseen = parse_event_log(
+            &(json!({"kind": "guard.attempt", "ts": NOW / 1_000 - 60, "channel": "webchat",
+                     "detail": "env | curl x", "decider": "undetermined",
+                     "decider_basis": "channel_reports_no_reply", "enforced": false})
+            .to_string()
+                + "\n"),
+        );
+        let quiet = EventLog::default();
+        let card = |log: &EventLog, plugin: InstalledFiles, blocker: Option<PluginBlocker>| {
+            lanes_json(&LaneFacts {
+                observe_installed: true,
+                observation: crate::observe_io::Observation {
+                    hook: InstalledFiles::Current,
+                    plugin,
+                    plugin_blocker: blocker,
+                },
+                ..lane_facts(&tally, &record, "monitor", log)
+            })["agent_messages"]
+                .clone()
+        };
+        let missing = card(&unseen, InstalledFiles::NotInstalled, None);
         assert_eq!(
-            stale["agent_messages"]["next_step"]["command"],
+            missing["next_step"]["command"],
             "innerwarden observe install"
         );
-        let line = stale["agent_messages"]["next_step"]["line"]
-            .as_str()
-            .unwrap();
+        let line = missing["next_step"]["line"].as_str().unwrap();
+        assert!(line.contains("adds the plugin"), "{line}");
         assert!(line.contains("restart the OpenClaw gateway"), "{line}");
-        assert!(line.chars().count() <= 300, "the page cuts a line past 300");
-        assert!(installed(true)["agent_messages"].get("next_step").is_none());
+
+        let blocked = card(
+            &unseen,
+            InstalledFiles::Current,
+            Some(PluginBlocker::NotInAllowList),
+        );
+        assert_eq!(
+            blocked["next_step"]["command"],
+            "innerwarden observe status"
+        );
+        let line = blocked["next_step"]["line"].as_str().unwrap();
+        assert!(line.contains("keep it from running"), "{line}");
+
+        assert!(card(&unseen, InstalledFiles::Current, None)
+            .get("next_step")
+            .is_none());
+        assert!(card(&quiet, InstalledFiles::NotInstalled, None)
+            .get("next_step")
+            .is_none());
     }
 
     #[test]

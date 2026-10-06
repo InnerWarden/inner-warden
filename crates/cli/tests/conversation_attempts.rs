@@ -693,12 +693,14 @@ fn status_admits_the_gap_when_nothing_is_wired() {
     );
 }
 
-/// A hook installed by an earlier release keeps running after an upgrade,
-/// because nothing but `observe install` rewrites it. Status says so and names
-/// the command, and says nothing once the hook is current.
+/// A hook installed by an earlier release keeps running after an upgrade
+/// from a version that could not refresh it. Status says so and names the
+/// command, says something different for a hook no release wrote, and says
+/// nothing of the kind once the hook is current.
 ///
 /// FAILS ON REVERT: drop the comparison from status and the older hook reads
-/// as fully current.
+/// as fully current; judge a changed hook as merely older and the edited
+/// handler reads "an earlier version's".
 #[test]
 fn status_names_a_hook_older_than_the_binary() {
     let dir = tempfile::TempDir::new().expect("scratch dir");
@@ -730,24 +732,45 @@ fn status_names_a_hook_older_than_the_binary() {
 
     let current = status();
     assert!(current.contains("ARE observed"), "{current}");
-    assert!(!current.contains("older than"), "{current}");
+    assert!(!current.contains("earlier version's"), "{current}");
+    assert!(
+        !current.contains("not the one InnerWarden wrote"),
+        "{current}"
+    );
+    assert!(
+        current.contains("the reply plugin reports how each turn ends"),
+        "{current}"
+    );
 
-    // The handler an earlier release wrote.
+    // The handler 1.5.1 wrote.
     let handler = dir
         .path()
         .join(".openclaw/hooks/innerwarden-attempts/handler.js");
     std::fs::write(
         &handler,
-        "const handler = async () => {};\nexport default handler;\n",
+        include_str!("fixtures/openclaw-hook-1.5.1/handler.js"),
     )
     .expect("older handler");
     let stale = status();
     assert!(stale.contains("ARE observed"), "{stale}");
     assert!(
-        stale.contains("older than the one this binary ships"),
+        stale.contains("The installed hook is an earlier version's"),
         "status must say the hook is out of date: {stale}"
     );
     assert!(stale.contains("observe install"), "{stale}");
+
+    // A handler no release wrote.
+    std::fs::write(
+        &handler,
+        "const handler = async () => {};\nexport default handler;\n",
+    )
+    .expect("changed handler");
+    let changed = status();
+    assert!(
+        changed.contains("The installed hook is not the one InnerWarden wrote: handler.js"),
+        "{changed}"
+    );
+    assert!(!changed.contains("earlier version's"), "{changed}");
 }
 
 /// A pending state the hook cannot read sends every ask straight to the sink
@@ -1051,4 +1074,230 @@ fn settle_closes_a_webchat_ask_only_after_its_hold() {
     assert_eq!(attempts[0]["enforced"], false);
     assert_eq!(attempts[0]["channel"], "webchat");
     assert!(host.pending_sessions().is_empty());
+}
+
+/// The reply plugin's report of a Control UI turn's end closes the ask whose
+/// message started that turn, and only that one: the end of an earlier turn,
+/// still running when the next message arrived, leaves the newer ask held.
+/// How the turn ended is the record's basis, and a turn that called a tool
+/// is never a refusal. Once closed, the message hook's own timer finds
+/// nothing left to settle, so the ask is recorded once.
+///
+/// FAILS ON REVERT: without the verb the binary exits 2 and records nothing;
+/// match the turn by session alone and the earlier turn closes the newer ask.
+#[test]
+fn a_control_ui_turn_end_closes_only_the_ask_it_started() {
+    let host = Host::new();
+    let session = "agent:main:main";
+    let inbound = |message: &str, ask: &str| {
+        let out = host.run(
+            &[
+                "observe",
+                "inbound",
+                "--session",
+                session,
+                "--channel",
+                "webchat",
+                "--agent",
+                "openclaw",
+                "--message",
+                message,
+            ],
+            ask,
+        );
+        assert_eq!(out.status.code(), Some(0));
+    };
+    let ended = |run: &str, turn: &str| {
+        let out = host.run(
+            &[
+                "observe",
+                "ended",
+                "--session",
+                session,
+                "--run",
+                run,
+                "--turn",
+                turn,
+            ],
+            "",
+        );
+        assert_eq!(out.status.code(), Some(0), "ended must never fail");
+    };
+
+    inbound("run-2", MINER_PROMPT);
+    ended("run-1", "replied");
+    assert!(host.attempts().is_empty(), "{:?}", host.attempts());
+    assert_eq!(host.pending_sessions(), vec![session.to_string()]);
+
+    ended("run-2", "used_tools");
+    let attempts = host.attempts();
+    assert_eq!(attempts.len(), 1, "{attempts:?}");
+    assert_eq!(attempts[0]["decider"], "undetermined");
+    assert_eq!(attempts[0]["decider_basis"], "tool_call_in_turn");
+    assert_eq!(attempts[0]["enforced"], false);
+    assert_eq!(attempts[0]["channel"], "webchat");
+    assert!(host.pending_sessions().is_empty());
+
+    inbound("run-3", EXFIL_PROMPT);
+    ended("run-3", "replied");
+    host.age(200);
+    host.settle(session);
+    let attempts = host.attempts();
+    assert_eq!(attempts.len(), 2, "recorded once: {attempts:?}");
+    assert_eq!(attempts[1]["decider"], "model_refused");
+    assert_eq!(
+        attempts[1]["decider_basis"],
+        "no_screened_execution_recorded_in_window"
+    );
+
+    let bad = host.run(
+        &[
+            "observe",
+            "ended",
+            "--session",
+            session,
+            "--run",
+            "run-4",
+            "--turn",
+            "declined",
+        ],
+        "",
+    );
+    assert_eq!(
+        bad.status.code(),
+        Some(2),
+        "an unknown turn shape is a usage error"
+    );
+}
+
+/// An OpenClaw home in a scratch directory, for the commands that take
+/// `--home`.
+fn openclaw_home() -> tempfile::TempDir {
+    let home = tempfile::TempDir::new().expect("home");
+    std::fs::create_dir_all(home.path().join(".openclaw")).expect(".openclaw");
+    home
+}
+
+fn run_in_home(home: &std::path::Path, args: &[&str]) -> std::process::Output {
+    Command::new(bin())
+        .args(args)
+        .arg("--home")
+        .arg(home)
+        .env("IW_GRAPH_FILE", home.join("guard/graph.json"))
+        .stdin(Stdio::null())
+        .output()
+        .expect("run innerwarden")
+}
+
+/// `observe install` writes the reply plugin beside the message hook and
+/// enables both, granting the plugin the conversation access OpenClaw needs
+/// before it runs a plugin's `agent_end` hook, and leaving everything else in
+/// the config as it was, the operator's plugin allowlist included.
+///
+/// FAILS ON REVERT: write the hook alone and the plugin directory is missing.
+#[test]
+fn observe_install_writes_and_enables_the_reply_plugin() {
+    let home = openclaw_home();
+    let config = home.path().join(".openclaw/openclaw.json");
+    std::fs::write(
+        &config,
+        r#"{"auth":{"profiles":{"x":{"mode":"api_key"}}},"plugins":{"allow":["voice-call"]}}"#,
+    )
+    .expect("config");
+    let out = run_in_home(home.path(), &["observe", "install"]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let plugin = home.path().join(".openclaw/extensions/innerwarden-replies");
+    assert_eq!(
+        std::fs::read_to_string(plugin.join("index.js")).expect("index.js"),
+        include_str!("../assets/openclaw-plugin/index.js")
+    );
+    for name in ["openclaw.plugin.json", "package.json", "bin.json"] {
+        assert!(plugin.join(name).is_file(), "{name}");
+    }
+    let root: Value =
+        serde_json::from_str(&std::fs::read_to_string(&config).expect("config")).expect("json");
+    assert_eq!(
+        root["plugins"]["entries"]["innerwarden-replies"],
+        serde_json::json!({"enabled": true, "hooks": {"allowConversationAccess": true}})
+    );
+    assert_eq!(root["plugins"]["allow"], serde_json::json!(["voice-call"]));
+    assert_eq!(root["auth"]["profiles"]["x"]["mode"], "api_key");
+    assert_eq!(
+        root["hooks"]["internal"]["entries"]["innerwarden-attempts"]["enabled"],
+        true
+    );
+    // The allowlist keeps the plugin out, and the install says so.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("will not run:\n  plugins.allow does not list innerwarden-replies"),
+        "{stdout}"
+    );
+}
+
+/// `observe refresh` (what `upgrade` runs with the new binary) replaces the
+/// hook 1.5.1 wrote with this version's, says to restart the gateway, offers
+/// the reply plugin without installing it, and leaves a hook somebody
+/// changed exactly as it is.
+///
+/// FAILS ON REVERT: without the verb the binary exits 2 and the 1.5.1 handler
+/// stays on disk.
+#[test]
+fn observe_refresh_updates_what_a_release_wrote_and_leaves_what_somebody_changed() {
+    let home = openclaw_home();
+    let hook = home.path().join(".openclaw/hooks/innerwarden-attempts");
+    std::fs::create_dir_all(&hook).expect("hook dir");
+    std::fs::write(
+        hook.join("handler.js"),
+        include_str!("fixtures/openclaw-hook-1.5.1/handler.js"),
+    )
+    .expect("handler");
+    std::fs::write(
+        hook.join("HOOK.md"),
+        include_str!("fixtures/openclaw-hook-1.5.1/HOOK.md"),
+    )
+    .expect("doc");
+
+    let out = run_in_home(home.path(), &["observe", "refresh"]);
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Updated OpenClaw's message hook to this version's."),
+        "{stdout}"
+    );
+    assert!(stdout.contains("Restart the OpenClaw gateway"), "{stdout}");
+    assert!(
+        stdout.contains("observe install"),
+        "the plugin is offered: {stdout}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(hook.join("handler.js")).expect("handler"),
+        include_str!("../assets/openclaw-hook/handler.js")
+    );
+    assert!(
+        !home.path().join(".openclaw/extensions").exists(),
+        "a refresh installs nothing that was not installed"
+    );
+
+    // Run again: current, nothing to say about the hook.
+    let again = run_in_home(home.path(), &["observe", "refresh"]);
+    assert!(!String::from_utf8_lossy(&again.stdout).contains("Updated"));
+
+    // A hook somebody changed is left and named.
+    std::fs::write(hook.join("handler.js"), "export default async () => {};\n").expect("edit");
+    let changed = run_in_home(home.path(), &["observe", "refresh"]);
+    assert_eq!(changed.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&changed.stdout);
+    assert!(
+        stdout.contains("left as it is: handler.js matches no version"),
+        "{stdout}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(hook.join("handler.js")).expect("handler"),
+        "export default async () => {};\n"
+    );
 }

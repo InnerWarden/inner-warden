@@ -18,14 +18,20 @@ use std::path::{Path, PathBuf};
 
 use crate::observe::{
     agent_field, asks_for_a_miner, attempt_line, bounded_field, conversation_analysis,
-    correlation_window, guard_window, needs_block_correlation, outcome, redact_and_bound,
-    AskFindings, Decider, Departure, GuardWindow, Leaving, NoReply, Pending, PendingAsk,
-    MAX_ASK_CHARS, PENDING_TTL_SECONDS, UNREPORTED_REPLY_WAIT_SECONDS,
+    correlation_window, enable_plugin_entry, guard_window, installed_files, message_id_field,
+    needs_block_correlation, outcome, plugin_blocker, redact_and_bound, AskFindings, Decider,
+    Departure, GuardWindow, InstalledFiles, Leaving, NoReply, Pending, PendingAsk, PluginBlocker,
+    PluginEntry, ShippedFile, TurnEnd, MAX_ASK_CHARS, PENDING_TTL_SECONDS,
+    UNREPORTED_REPLY_WAIT_SECONDS,
 };
 
 /// The hook directory name inside `~/.openclaw/hooks/`, and the config key that
 /// enables it. OpenClaw derives the config key from the hook name.
 const HOOK_NAME: &str = "innerwarden-attempts";
+
+/// The reply plugin's id: its directory inside `~/.openclaw/extensions/`, and
+/// its key under `plugins.entries`.
+const PLUGIN_ID: &str = "innerwarden-replies";
 
 /// The most stdin this reads. A pasted document is not a better attempt record
 /// than its first pages, and an unbounded read is a way to stall a gateway.
@@ -58,13 +64,56 @@ const PENDING_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(1)
 
 const HOOK_DOC: &str = include_str!("../assets/openclaw-hook/HOOK.md");
 const HOOK_HANDLER: &str = include_str!("../assets/openclaw-hook/handler.js");
+const PLUGIN_ENTRY: &str = include_str!("../assets/openclaw-plugin/index.js");
+const PLUGIN_MANIFEST: &str = include_str!("../assets/openclaw-plugin/openclaw.plugin.json");
+const PLUGIN_PACKAGE: &str = include_str!("../assets/openclaw-plugin/package.json");
+
+/// The message hook's files, `handler.js` first: it being there is what makes
+/// the hook installed. The earlier digests are the bodies Community 1.2.0
+/// through 1.5.1 shipped (one each, unchanged across those releases), read
+/// from the release tags. When a release changes a file, the digest of the
+/// body it replaces goes here: `the_shipped_files_are_the_pinned_ones` fails
+/// until it does.
+const HOOK_FILES: [ShippedFile; 2] = [
+    ShippedFile {
+        name: "handler.js",
+        body: HOOK_HANDLER,
+        earlier: &["d58c13d9d2f481f773d81c484474468e9233369efd4d49539cad7166ca6673d9"],
+    },
+    ShippedFile {
+        name: "HOOK.md",
+        body: HOOK_DOC,
+        earlier: &["6e99a2648f690360b5c4bcebcb577b61445e0859f7e883003b76d772d45610dc"],
+    },
+];
+
+/// The reply plugin's files, its entry first. No earlier release shipped it.
+const PLUGIN_FILES: [ShippedFile; 3] = [
+    ShippedFile {
+        name: "index.js",
+        body: PLUGIN_ENTRY,
+        earlier: &[],
+    },
+    ShippedFile {
+        name: "openclaw.plugin.json",
+        body: PLUGIN_MANIFEST,
+        earlier: &[],
+    },
+    ShippedFile {
+        name: "package.json",
+        body: PLUGIN_PACKAGE,
+        earlier: &[],
+    },
+];
 
 pub fn cmd(rest: &[String]) -> std::process::ExitCode {
     match rest.first().map(String::as_str) {
         Some("inbound") => cmd_inbound(&rest[1..]),
         Some("reply") => cmd_reply(&rest[1..]),
         Some("settle") => cmd_settle(&rest[1..]),
+        Some("ended") => cmd_ended(&rest[1..]),
         Some("install") => cmd_install(&rest[1..]),
+        Some("refresh") => cmd_refresh(&rest[1..]),
         None | Some("status") => cmd_status(),
         // `--help` and `-h` are answered before dispatch (`help::for_invocation`);
         // the bare word still lands here.
@@ -92,11 +141,17 @@ pub(crate) fn help_text() -> String {
          \n\
          USAGE:\n  \
            {prog} observe status                    is the surface wired on this host?\n  \
-           {prog} observe install [--home <dir>]    wire it into OpenClaw (message hooks)\n  \
+           {prog} observe install [--home <dir>]    wire it into OpenClaw (message hook and\n  \
+           \x20                                       the reply plugin for the Control UI chat)\n  \
+           {prog} observe refresh [--home <dir>]    bring what install wrote up to this version,\n  \
+           \x20                                       where nobody changed it (upgrade runs this)\n  \
            {prog} observe inbound --session <k> [--channel <c>] [--sender <s>] [--agent <a>]\n  \
-           \x20                                       score the user text on stdin\n  \
+           \x20                       [--message <id>]   score the user text on stdin\n  \
            {prog} observe reply --session <k> [--channel <c>] [--decider <d>]\n  \
            \x20                                       close the attempt the session was waiting on\n  \
+           {prog} observe ended --session <k> --run <id> --turn <replied|used_tools|no_reply>\n  \
+           \x20                                       close the ask that started turn <id>, as the\n  \
+           \x20                                       reply plugin saw the turn end\n  \
            {prog} observe settle --session <k>\n  \
            \x20                                       close it where the channel never reports the\n  \
            \x20                                       reply (OpenClaw webchat): after {UNREPORTED_REPLY_WAIT_SECONDS}s, outcome unknown\n\
@@ -353,6 +408,7 @@ fn scored_ask(rest: &[String], session: &str, text: &str, at: u64) -> Option<Pen
         signals: findings.signals(),
         asked_at: at,
         agent: agent_field(flag(rest, "--agent").as_deref()),
+        message: message_id_field(flag(rest, "--message").as_deref()),
     })
 }
 
@@ -400,7 +456,9 @@ fn cmd_reply(rest: &[String]) -> std::process::ExitCode {
 /// [`UNREPORTED_REPLY_WAIT_SECONDS`].
 ///
 /// The hook calls this on a timer after a webchat message, because OpenClaw
-/// emits no event when a Control UI reply completes. The record says so
+/// emits no internal hook event when a Control UI reply completes. Where the
+/// reply plugin reported the turn's end first (`observe ended`), the ask is
+/// already closed and this finds nothing. Otherwise the record says so
 /// (`channel_reports_no_reply`) and names no model decision: nothing here saw
 /// a reply. Nor does it name the guard: what the sink held in the window is
 /// the record's basis, never its decider (`observe::outcome`). A call before
@@ -418,6 +476,53 @@ fn cmd_settle(rest: &[String]) -> std::process::ExitCode {
             .map(|ask| Leaving {
                 ask,
                 departure: Departure::Unanswered(NoReply::ChannelReportsNone),
+            })
+            .into_iter()
+            .collect()
+    });
+    std::process::ExitCode::SUCCESS
+}
+
+// ── ended ────────────────────────────────────────────────────────────────────
+
+/// `innerwarden observe ended` - the agent's turn that an ask started is over,
+/// and `--turn` says how it ended. The reply plugin calls this from OpenClaw's
+/// `agent_end` hook for a Control UI turn, which the message hook never sees
+/// end.
+///
+/// Only the ask whose message started THIS turn is closed (`--run`, matched
+/// against the id the message hook recorded with it), so a turn still
+/// answering an earlier message never closes a newer ask. Nothing held for
+/// the run: nothing to do, and the message hook's timer settles an ask that
+/// arrives later. A turn that replied with no tool call is a reply like any
+/// other: what the guard recorded in the turn still decides first
+/// (`observe::outcome`). One that called a tool, or ended with nothing said,
+/// is recorded with its outcome unknown and that as its reason.
+///
+/// Anything that can run this CLI as the agent's account can call it, as it
+/// can call `observe reply`: a conversation record is evidence of what the
+/// model did, never of enforcement, and a call here can no more credit the
+/// guard than a reply can.
+fn cmd_ended(rest: &[String]) -> std::process::ExitCode {
+    let Some(turn) = flag(rest, "--turn").and_then(|value| TurnEnd::parse(&value)) else {
+        eprintln!("innerwarden observe ended: --turn must be replied, used_tools or no_reply");
+        return std::process::ExitCode::from(2);
+    };
+    let session = bounded_field(&flag(rest, "--session").unwrap_or_default(), 120);
+    let run = message_id_field(flag(rest, "--run").as_deref());
+    if session.trim().is_empty() || run.is_empty() {
+        return std::process::ExitCode::SUCCESS;
+    }
+    let Some(dir) = crate::graph_io::sink_dir() else {
+        return std::process::ExitCode::SUCCESS;
+    };
+    let at = now();
+    settle_with(&dir, at, |state| {
+        state
+            .take_for_run(&session, &run)
+            .map(|ask| Leaving {
+                ask,
+                departure: Departure::TurnEnded(turn),
             })
             .into_iter()
             .collect()
@@ -455,12 +560,42 @@ fn hook_dir(home: &Path) -> PathBuf {
     home.join(".openclaw/hooks").join(HOOK_NAME)
 }
 
-/// `innerwarden observe install` - write the OpenClaw hook and enable it.
+/// Where OpenClaw discovers a plugin it was not installed through its own
+/// CLI: a package directory under `~/.openclaw/extensions/`.
+fn plugin_dir(home: &Path) -> PathBuf {
+    home.join(".openclaw/extensions").join(PLUGIN_ID)
+}
+
+/// Write `files` and the pinned binary path into `directory`, creating it.
+/// The explicit install writes the way it always has: what the operator asked
+/// for, over whatever is there.
+fn write_files(directory: &Path, files: &[ShippedFile], bin_json: &str) -> Result<(), String> {
+    std::fs::create_dir_all(directory)
+        .map_err(|error| format!("creating {}: {error}", directory.display()))?;
+    let bodies = files
+        .iter()
+        .map(|file| (file.name, file.body))
+        .chain(std::iter::once(("bin.json", bin_json)));
+    for (name, body) in bodies {
+        let path = directory.join(name);
+        std::fs::write(&path, body)
+            .map_err(|error| format!("writing {}: {error}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// `innerwarden observe install` - write the OpenClaw hook and the reply
+/// plugin, and enable both.
 ///
 /// The config is only rewritten when it parses as strict JSON, the same
 /// discipline the MCP wiring follows: the file also holds the operator's auth
 /// profiles and channel tokens, and a guard that mangles them has cost more
 /// than it protects.
+///
+/// The plugin is granted conversation access, which OpenClaw requires before
+/// it runs a non-bundled plugin's `agent_end` hook, and the output says so. An
+/// entry the operator turned off stays off, and the operator's plugin policy
+/// (`plugins.enabled`, `allow`, `deny`) is reported, never edited.
 fn cmd_install(rest: &[String]) -> std::process::ExitCode {
     let home = match home(rest) {
         Ok(home) => home,
@@ -478,30 +613,17 @@ fn cmd_install(rest: &[String]) -> std::process::ExitCode {
         return std::process::ExitCode::from(1);
     }
     let directory = hook_dir(&home);
-    if let Err(error) = std::fs::create_dir_all(&directory) {
-        eprintln!(
-            "innerwarden observe: creating {}: {error}",
-            directory.display()
-        );
-        return std::process::ExitCode::from(1);
-    }
+    let plugin_directory = plugin_dir(&home);
     let binary = std::env::current_exe()
         .map(|path| path.display().to_string())
         .unwrap_or_else(|_| "innerwarden".to_string());
-    let files: [(&str, String); 3] = [
-        ("HOOK.md", HOOK_DOC.to_string()),
-        ("handler.js", HOOK_HANDLER.to_string()),
-        (
-            "bin.json",
-            serde_json::json!({ "bin": binary }).to_string() + "\n",
-        ),
-    ];
-    for (name, body) in files {
-        if let Err(error) = std::fs::write(directory.join(name), body) {
-            eprintln!(
-                "innerwarden observe: writing {}: {error}",
-                directory.join(name).display()
-            );
+    let bin_json = serde_json::json!({ "bin": binary }).to_string() + "\n";
+    for (target, files) in [
+        (&directory, &HOOK_FILES[..]),
+        (&plugin_directory, &PLUGIN_FILES[..]),
+    ] {
+        if let Err(error) = write_files(target, files, &bin_json) {
+            eprintln!("innerwarden observe: {error}");
             return std::process::ExitCode::from(1);
         }
     }
@@ -523,12 +645,16 @@ fn cmd_install(rest: &[String]) -> std::process::ExitCode {
     let Ok(root) = serde_json::from_slice::<Value>(&source) else {
         eprintln!(
             "innerwarden observe: {} is not strict JSON, so it was left untouched.\n  \
-             Enable the hook by hand: hooks.internal.entries.{HOOK_NAME}.enabled = true",
+             Enable the hook by hand: hooks.internal.entries.{HOOK_NAME}.enabled = true\n  \
+             and the reply plugin: plugins.entries.{PLUGIN_ID}.enabled = true and\n  \
+             plugins.entries.{PLUGIN_ID}.hooks.allowConversationAccess = true",
             config_path.display()
         );
         return std::process::ExitCode::from(1);
     };
-    let (updated, changed) = crate::observe::enable_hook_entry(root, HOOK_NAME);
+    let (updated, hook_changed) = crate::observe::enable_hook_entry(root, HOOK_NAME);
+    let (updated, plugin_entry) = enable_plugin_entry(updated, PLUGIN_ID);
+    let changed = hook_changed || plugin_entry == PluginEntry::Enabled { changed: true };
     if changed {
         let body = match serde_json::to_string_pretty(&updated) {
             Ok(body) => body + "\n",
@@ -549,14 +675,57 @@ fn cmd_install(rest: &[String]) -> std::process::ExitCode {
     println!(
         "innerwarden observe - conversation attempts are now observed for OpenClaw.\n  \
          hook:   {}\n  \
+         plugin: {}\n  \
          config: {}\n  \
-         Restart the gateway to load it, then a dangerous ask is recorded even when\n  \
+         Restart the gateway to load them, then a dangerous ask is recorded even when\n  \
          the model refuses it. This is observation, not enforcement: each record\n  \
          names who decided, and a model refusal is never reported as a block.",
         directory.display(),
+        plugin_directory.display(),
         config_path.display()
     );
+    for line in plugin_install_lines(plugin_entry, plugin_blocker(&updated, PLUGIN_ID)) {
+        println!("{line}");
+    }
     std::process::ExitCode::SUCCESS
+}
+
+/// What `observe install` says about the reply plugin. PURE: how the entry
+/// was left and what in the config still blocks it are handed in.
+fn plugin_install_lines(entry: PluginEntry, blocker: Option<PluginBlocker>) -> Vec<String> {
+    let not_seen = "  Until it runs, a Control UI ask is recorded after two minutes with the\n  \
+                    outcome not seen.";
+    let lines = match (entry, blocker) {
+        (PluginEntry::UnexpectedShape, _) => format!(
+            "  The reply plugin was not enabled: in the config,\n  \
+             plugins.entries.{PLUGIN_ID} is not a table, so it was left as it is.\n\
+             {not_seen}"
+        ),
+        (PluginEntry::LeftOff, _) => format!(
+            "  The reply plugin is turned off in your config\n  \
+             (plugins.entries.{PLUGIN_ID}), and an install does not turn back on\n  \
+             what you turned off.\n\
+             {not_seen}"
+        ),
+        (PluginEntry::Enabled { .. }, Some(blocker)) => format!(
+            "  The reply plugin will not run:\n  \
+             {}.\n  \
+             That is your plugin policy, and it was left as it is.\n\
+             {not_seen}",
+            blocker.key(PLUGIN_ID)
+        ),
+        (PluginEntry::Enabled { .. }, None) => format!(
+            "  The plugin reads how each Control UI turn ends (a tool call, a reply, or\n  \
+             neither) so an ask made there is recorded with its outcome. OpenClaw lets a\n  \
+             plugin read a turn only with conversation access, so it was granted:\n  \
+             plugins.entries.{PLUGIN_ID}.hooks.allowConversationAccess\n  \
+             No conversation text leaves the gateway through it. The gateway logs it as\n  \
+             a plugin it cannot verify, because it was not installed through\n  \
+             `openclaw plugins install`. To look at it:\n  \
+             openclaw plugins inspect {PLUGIN_ID}"
+        ),
+    };
+    lines.lines().map(str::to_string).collect()
 }
 
 /// Whether this machine has an OpenClaw config for `observe install` to write
@@ -603,24 +772,278 @@ fn pending_notice(path: &Path, read_error: Option<&str>) -> Option<String> {
     ))
 }
 
-/// Whether the installed handler is the one this binary ships. `observe
-/// install` writes it once and an upgrade does not touch it, so a fix to the
-/// handler reaches a host only when the operator runs install again, and
-/// status and the dashboard are where that has to be said.
-fn hook_is_current(installed_handler: Option<&str>) -> bool {
-    installed_handler == Some(HOOK_HANDLER)
+/// The bytes found under each of `files` in `directory`, `None` for a file
+/// that is not there, or the first error reading one. Read the way a config
+/// the guard may rewrite is read: bounded, never through a link at the file's
+/// name, and never blocking on something that is not a plain file. The
+/// directory sits where the agent's own account can write, and the dashboard
+/// reads it on every page.
+fn read_installed(directory: &Path, files: &[ShippedFile]) -> Vec<Result<Option<Vec<u8>>, String>> {
+    files
+        .iter()
+        .map(|file| {
+            innerwarden_agent_guard::file_update::read_config_no_symlinks(
+                directory,
+                &directory.join(file.name),
+            )
+        })
+        .collect()
 }
 
-/// Whether the OpenClaw hook installed on this host, if any, is the one this
-/// binary ships. True when none is installed: there is nothing out of date.
-pub(crate) fn installed_hook_is_current() -> bool {
-    let Ok(home) = innerwarden_agent_guard::hook::home_dir() else {
-        return true;
-    };
-    match std::fs::read_to_string(hook_dir(&home).join("handler.js")) {
-        Ok(handler) => hook_is_current(Some(&handler)),
-        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+/// Judge what `observe install` left in `directory` against what this version
+/// ships. A file that is there and cannot be read as a plain file is not one
+/// InnerWarden can vouch for, and is judged as changed.
+fn judge(directory: &Path, files: &[ShippedFile]) -> InstalledFiles {
+    let read = read_installed(directory, files);
+    if matches!(read.first(), Some(Ok(None)) | None) {
+        return InstalledFiles::NotInstalled;
     }
+    let mut installed = Vec::with_capacity(read.len());
+    for (file, bytes) in files.iter().zip(read) {
+        match bytes {
+            Ok(bytes) => installed.push(bytes),
+            Err(_) => return InstalledFiles::Changed(file.name),
+        }
+    }
+    installed_files(files, &installed)
+}
+
+/// What `observe install` left in OpenClaw on this host, as this version
+/// judges it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Observation {
+    /// The message hook's files.
+    pub hook: InstalledFiles,
+    /// The reply plugin's files.
+    pub plugin: InstalledFiles,
+    /// What in the OpenClaw config keeps the reply plugin from running. A
+    /// config that cannot be read or parsed runs nothing: `EntryOff`.
+    pub plugin_blocker: Option<PluginBlocker>,
+}
+
+impl Observation {
+    /// Nothing installed, which is also what a host with no home reads as.
+    pub(crate) const NONE: Self = Self {
+        hook: InstalledFiles::NotInstalled,
+        plugin: InstalledFiles::NotInstalled,
+        plugin_blocker: None,
+    };
+
+    /// The reply plugin is there, is a version InnerWarden wrote, and nothing
+    /// in the config keeps it from running.
+    pub(crate) fn plugin_runs(&self) -> bool {
+        matches!(
+            self.plugin,
+            InstalledFiles::Current | InstalledFiles::Outdated
+        ) && self.plugin_blocker.is_none()
+    }
+}
+
+/// [`Observation`] for this host.
+pub(crate) fn observation() -> Observation {
+    match innerwarden_agent_guard::hook::home_dir() {
+        Ok(home) => observation_at(&home),
+        Err(_) => Observation::NONE,
+    }
+}
+
+fn observation_at(home: &Path) -> Observation {
+    let config = std::fs::read_to_string(openclaw_config(home))
+        .ok()
+        .and_then(|body| serde_json::from_str::<Value>(&body).ok());
+    Observation {
+        hook: judge(&hook_dir(home), &HOOK_FILES),
+        plugin: judge(&plugin_dir(home), &PLUGIN_FILES),
+        plugin_blocker: match &config {
+            Some(root) => plugin_blocker(root, PLUGIN_ID),
+            None => Some(PluginBlocker::EntryOff),
+        },
+    }
+}
+
+/// Whether `observe install` left anything in OpenClaw on this host, for
+/// `upgrade` to decide whether there is anything to refresh. Only names are
+/// looked at.
+pub(crate) fn openclaw_files_present() -> bool {
+    let Ok(home) = innerwarden_agent_guard::hook::home_dir() else {
+        return false;
+    };
+    [
+        hook_dir(&home).join(HOOK_FILES[0].name),
+        plugin_dir(&home).join(PLUGIN_FILES[0].name),
+    ]
+    .iter()
+    .any(|path| std::fs::symlink_metadata(path).is_ok())
+}
+
+/// What `observe status` says about the files `observe install` wrote, after
+/// its first lines. PURE.
+fn observation_lines(observation: &Observation, prog: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    match observation.hook {
+        InstalledFiles::Outdated => lines.push(format!(
+            "  The installed hook is an earlier version's, and this version's records more.\n  \
+             To update it:  {prog} observe install   (then restart the gateway)"
+        )),
+        InstalledFiles::Changed(file) => lines.push(format!(
+            "  The installed hook is not the one InnerWarden wrote: {file} matches no\n  \
+             version it shipped, so what it records cannot be relied on.\n  \
+             To replace it:  {prog} observe install   (then restart the gateway)"
+        )),
+        InstalledFiles::NotInstalled | InstalledFiles::Current => {}
+    }
+    let not_seen = "an ask made there is recorded after two minutes with the\n  \
+                    outcome not seen";
+    match (observation.plugin, observation.plugin_blocker) {
+        (InstalledFiles::NotInstalled, _) => lines.push(format!(
+            "  Control UI chats: the reply plugin is not installed, so\n  \
+             {not_seen}.\n  \
+             To add it:  {prog} observe install   (then restart the gateway)"
+        )),
+        (InstalledFiles::Changed(file), _) => lines.push(format!(
+            "  Control UI chats: the reply plugin is not the one InnerWarden wrote:\n  \
+             {file} matches no version it shipped.\n  \
+             To replace it:  {prog} observe install   (then restart the gateway)"
+        )),
+        (_, Some(blocker)) => lines.push(format!(
+            "  Control UI chats: the reply plugin is installed but will not run:\n  \
+             {}.\n  \
+             Until it does, {not_seen}.",
+            blocker.key(PLUGIN_ID)
+        )),
+        (InstalledFiles::Outdated, None) => lines.push(format!(
+            "  Control UI chats: the reply plugin is an earlier version's.\n  \
+             To update it:  {prog} observe install   (then restart the gateway)"
+        )),
+        (InstalledFiles::Current, None) => lines
+            .push("  Control UI chats: the reply plugin reports how each turn ends.".to_string()),
+    }
+    lines
+}
+
+// ── refresh ──────────────────────────────────────────────────────────────────
+
+/// What `observe refresh` did with one set of files.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Refreshed {
+    NotInstalled,
+    Current,
+    Updated,
+    /// Left as it is: this file is not one any release wrote.
+    Changed(&'static str),
+    /// Could not be read or replaced, for this reason.
+    Failed(String),
+}
+
+/// Bring the files under `directory` up to this version's, if every one of
+/// them is exactly what some release wrote.
+///
+/// Each file is replaced only if it still holds the bytes just read, and never
+/// through a link anywhere below `home`: an upgrade can run as root while the
+/// directory belongs to the account the gateway (and the agent) runs as, and
+/// a link planted between the read and the write must not turn this into a
+/// root write somewhere else. A file somebody changed is left alone, and so is
+/// the rest of its set.
+fn refresh_files(home: &Path, directory: &Path, files: &[ShippedFile]) -> Refreshed {
+    let read = read_installed(directory, files);
+    if matches!(read.first(), Some(Ok(None)) | None) {
+        return Refreshed::NotInstalled;
+    }
+    let mut installed = Vec::with_capacity(read.len());
+    for bytes in read {
+        match bytes {
+            Ok(bytes) => installed.push(bytes),
+            Err(error) => return Refreshed::Failed(error),
+        }
+    }
+    match installed_files(files, &installed) {
+        InstalledFiles::NotInstalled => Refreshed::NotInstalled,
+        InstalledFiles::Current => Refreshed::Current,
+        InstalledFiles::Changed(file) => Refreshed::Changed(file),
+        InstalledFiles::Outdated => {
+            for (file, bytes) in files.iter().zip(&installed) {
+                if bytes.as_deref() == Some(file.body.as_bytes()) {
+                    continue;
+                }
+                if let Err(error) =
+                    innerwarden_agent_guard::file_update::replace_if_unchanged_no_symlinks(
+                        home,
+                        &directory.join(file.name),
+                        bytes.as_deref(),
+                        file.body.as_bytes(),
+                    )
+                {
+                    return Refreshed::Failed(error);
+                }
+            }
+            Refreshed::Updated
+        }
+    }
+}
+
+/// What `observe refresh` prints. PURE. Nothing is said about a set that is
+/// current or not installed, except that a hook without the reply plugin is
+/// told what the plugin adds: an upgrade never installs what the operator
+/// did not.
+fn refresh_lines(hook: &Refreshed, plugin: &Refreshed, prog: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    for (what, refreshed) in [
+        ("OpenClaw's message hook", hook),
+        ("OpenClaw's reply plugin", plugin),
+    ] {
+        match refreshed {
+            Refreshed::Updated => lines.push(format!("Updated {what} to this version's.")),
+            Refreshed::Changed(file) => lines.push(format!(
+                "{what} was left as it is: {file} matches no version InnerWarden shipped,\n\
+                 so it was changed after it was installed. To replace it with this version's:\n  \
+                 {prog} observe install"
+            )),
+            Refreshed::Failed(error) => lines.push(format!(
+                "{what} could not be updated ({error}).\nTo update it:  {prog} observe install"
+            )),
+            Refreshed::NotInstalled | Refreshed::Current => {}
+        }
+    }
+    if [hook, plugin].contains(&&Refreshed::Updated) {
+        lines
+            .push("Restart the OpenClaw gateway to load it: nothing here restarts it.".to_string());
+    }
+    let hook_in_place = matches!(hook, Refreshed::Current | Refreshed::Updated);
+    if hook_in_place && *plugin == Refreshed::NotInstalled {
+        lines.push(format!(
+            "Control UI chats are recorded without how each turn ended. To add the reply\n\
+             plugin that reads it (it is granted conversation access):  {prog} observe install"
+        ));
+    }
+    lines
+}
+
+/// `innerwarden observe refresh` - bring the files `observe install` wrote up
+/// to this version's, where they are exactly what an earlier release wrote.
+///
+/// `observe install` writes them once and replacing the binary does not touch
+/// them, so `innerwarden upgrade` runs this with the NEW binary once it is in
+/// place: only the new version knows what it ships. Nothing is installed that
+/// was not, nothing anybody changed is overwritten (it is named instead), and
+/// the gateway is never restarted. Exits 1 when a file could not be read or
+/// replaced.
+fn cmd_refresh(rest: &[String]) -> std::process::ExitCode {
+    let home = match home(rest) {
+        Ok(home) => home,
+        Err(error) => {
+            eprintln!("innerwarden observe: {error}");
+            return std::process::ExitCode::from(2);
+        }
+    };
+    let hook = refresh_files(&home, &hook_dir(&home), &HOOK_FILES);
+    let plugin = refresh_files(&home, &plugin_dir(&home), &PLUGIN_FILES);
+    for line in refresh_lines(&hook, &plugin, &crate::prog()) {
+        println!("{line}");
+    }
+    if matches!(hook, Refreshed::Failed(_)) || matches!(plugin, Refreshed::Failed(_)) {
+        return std::process::ExitCode::from(1);
+    }
+    std::process::ExitCode::SUCCESS
 }
 
 /// `innerwarden observe status` - can this host see a conversation attempt at
@@ -661,14 +1084,8 @@ fn cmd_status() -> std::process::ExitCode {
                 println!("{notice}");
             }
         }
-        let installed_handler = std::fs::read_to_string(directory.join("handler.js")).ok();
-        if !hook_is_current(installed_handler.as_deref()) {
-            println!(
-                "  The installed hook is older than the one this binary ships: it does not\n  \
-                 record Control UI chat asks until they expire, or name the agent.\n  \
-                 To update it:  {} observe install   (then restart the gateway)",
-                crate::prog()
-            );
+        for line in observation_lines(&observation_at(&home), &crate::prog()) {
+            println!("{line}");
         }
         return std::process::ExitCode::SUCCESS;
     }
@@ -723,6 +1140,7 @@ mod tests {
             signals: vec!["dangerous_command".into()],
             asked_at: at,
             agent: "openclaw".into(),
+            message: String::new(),
         }
     }
 
@@ -943,5 +1361,337 @@ mod tests {
         assert!(HOOK_HANDLER.contains("const AGENT = \"openclaw\";"));
         assert_eq!(agent_field(Some("openclaw")), "openclaw");
         assert!(HOOK_HANDLER.contains("const UNREPORTED_REPLY_CHANNEL = \"webchat\";"));
+    }
+
+    /// The 1.5.1 message hook, as that release shipped it (read from the
+    /// release tag). Every release from 1.2.0 to 1.5.1 shipped these bytes.
+    const HANDLER_1_5_1: &str = include_str!("../tests/fixtures/openclaw-hook-1.5.1/handler.js");
+    const HOOK_DOC_1_5_1: &str = include_str!("../tests/fixtures/openclaw-hook-1.5.1/HOOK.md");
+
+    /// The digests of what THIS version ships, pinned. A release that changes
+    /// one of these files must move the old digest into the file's `earlier`
+    /// list, or every host still running the old file would read it as
+    /// changed by somebody, and no upgrade would ever replace it. This fails
+    /// until that is done, and checks the earlier digests against the real
+    /// bytes 1.5.1 shipped rather than against a hex string alone.
+    #[test]
+    fn the_shipped_files_are_the_pinned_ones() {
+        let pinned: [(&str, &str); 5] = [
+            (
+                "handler.js",
+                "a1954a47b1dbf17124a9262606f170d0869db55803d2312f9571bb6d0d6b2b1b",
+            ),
+            (
+                "HOOK.md",
+                "a5546f8a51ebebe250c23f87bd560f1a20305bad40d50dad9f0c9b2dbe0c9539",
+            ),
+            (
+                "index.js",
+                "3dcec78c443d984105b34bbeda747bee3402ad8111528e8c2ebebdb35e85d2cd",
+            ),
+            (
+                "openclaw.plugin.json",
+                "19ba38f05331a870ed71289055e64e07309d20ebf4d5076068872ab9c9b53410",
+            ),
+            (
+                "package.json",
+                "7380542a44f9ba7596f69707d07d208f2f7221eaa850aa2f4291c50216aaa7f3",
+            ),
+        ];
+        let shipped: Vec<&ShippedFile> = HOOK_FILES.iter().chain(PLUGIN_FILES.iter()).collect();
+        for (file, (name, digest)) in shipped.iter().zip(pinned) {
+            assert_eq!(file.name, name);
+            assert_eq!(
+                crate::observe::sha256_hex(file.body.as_bytes()),
+                digest,
+                "{name} changed: put the old digest in its `earlier` list, then pin the new one"
+            );
+            assert!(
+                !file.earlier.contains(&digest),
+                "{name}: current is not earlier"
+            );
+        }
+        assert!(HOOK_FILES[0]
+            .earlier
+            .contains(&crate::observe::sha256_hex(HANDLER_1_5_1.as_bytes()).as_str()));
+        assert!(HOOK_FILES[1]
+            .earlier
+            .contains(&crate::observe::sha256_hex(HOOK_DOC_1_5_1.as_bytes()).as_str()));
+    }
+
+    /// A home with the hook 1.5.1 installed (and its own bin.json).
+    fn home_with_hook(handler: &str, doc: &str) -> tempfile::TempDir {
+        let home = tempfile::TempDir::new().expect("home");
+        let dir = hook_dir(home.path());
+        std::fs::create_dir_all(&dir).expect("hook dir");
+        std::fs::write(dir.join("handler.js"), handler).expect("handler");
+        std::fs::write(dir.join("HOOK.md"), doc).expect("doc");
+        std::fs::write(dir.join("bin.json"), "{\"bin\":\"/opt/iw/innerwarden\"}\n").expect("bin");
+        home
+    }
+
+    /// The hook an earlier release wrote is replaced by this version's, file
+    /// by file, and the host's own pinned binary path is left as it is.
+    /// Nothing is installed that was not.
+    ///
+    /// FAILS ON REVERT: drop the write in `refresh_files` and the 1.5.1
+    /// handler is still on disk after the refresh.
+    #[test]
+    fn a_hook_an_earlier_release_wrote_is_refreshed() {
+        let home = home_with_hook(HANDLER_1_5_1, HOOK_DOC_1_5_1);
+        let dir = hook_dir(home.path());
+        assert_eq!(judge(&dir, &HOOK_FILES), InstalledFiles::Outdated);
+        assert_eq!(
+            refresh_files(home.path(), &dir, &HOOK_FILES),
+            Refreshed::Updated
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("handler.js")).unwrap(),
+            HOOK_HANDLER
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("HOOK.md")).unwrap(),
+            HOOK_DOC
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("bin.json")).unwrap(),
+            "{\"bin\":\"/opt/iw/innerwarden\"}\n"
+        );
+        assert_eq!(judge(&dir, &HOOK_FILES), InstalledFiles::Current);
+        assert_eq!(
+            refresh_files(home.path(), &dir, &HOOK_FILES),
+            Refreshed::Current
+        );
+        // The plugin was never installed here, and a refresh does not add it.
+        let plugin = plugin_dir(home.path());
+        assert_eq!(
+            refresh_files(home.path(), &plugin, &PLUGIN_FILES),
+            Refreshed::NotInstalled
+        );
+        assert!(!plugin.exists());
+    }
+
+    /// A hook somebody changed is left exactly as it is, and named: it can be
+    /// the operator's own fix, and it can be an agent's way of switching the
+    /// observation off. Either way an upgrade must not erase it silently.
+    ///
+    /// FAILS ON REVERT: overwrite whatever is there and the edited handler is
+    /// gone after the refresh.
+    #[test]
+    fn a_hook_somebody_changed_is_left_and_named() {
+        let edited = format!("{HANDLER_1_5_1}\n// local change\n");
+        let home = home_with_hook(&edited, HOOK_DOC_1_5_1);
+        let dir = hook_dir(home.path());
+        assert_eq!(
+            refresh_files(home.path(), &dir, &HOOK_FILES),
+            Refreshed::Changed("handler.js")
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("handler.js")).unwrap(),
+            edited
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("HOOK.md")).unwrap(),
+            HOOK_DOC_1_5_1,
+            "the rest of the set is left too"
+        );
+        assert_eq!(
+            judge(&dir, &HOOK_FILES),
+            InstalledFiles::Changed("handler.js")
+        );
+    }
+
+    /// An upgrade can run as root while the hook directory belongs to the
+    /// account the gateway and the agent run as. A link planted at a hook
+    /// file, pointing at a file holding the very bytes an earlier release
+    /// wrote, must not turn the refresh into a root write through it.
+    ///
+    /// FAILS ON REVERT: read and replace with the link-following calls
+    /// (`std::fs::read`, `replace`) and the victim holds this version's
+    /// handler.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_at_a_hook_file_is_never_refreshed_through() {
+        let home = home_with_hook(HANDLER_1_5_1, HOOK_DOC_1_5_1);
+        let dir = hook_dir(home.path());
+        let victim = home.path().join("victim.js");
+        std::fs::write(&victim, HANDLER_1_5_1).expect("victim");
+        std::fs::remove_file(dir.join("handler.js")).expect("unlink");
+        std::os::unix::fs::symlink(&victim, dir.join("handler.js")).expect("plant link");
+
+        let refreshed = refresh_files(home.path(), &dir, &HOOK_FILES);
+        assert!(matches!(refreshed, Refreshed::Failed(_)), "{refreshed:?}");
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), HANDLER_1_5_1);
+        assert!(std::fs::symlink_metadata(dir.join("handler.js"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        // Status and the dashboard read it as not the file InnerWarden wrote.
+        assert_eq!(
+            judge(&dir, &HOOK_FILES),
+            InstalledFiles::Changed("handler.js")
+        );
+    }
+
+    /// What the refresh says, and what it never says: nothing for a set that
+    /// is current or absent, the restart step only when it wrote something,
+    /// and the plugin offered (never installed) where only the hook is there.
+    #[test]
+    fn the_refresh_says_what_it_did_and_what_is_left() {
+        let lines = |hook: Refreshed, plugin: Refreshed| {
+            refresh_lines(&hook, &plugin, "innerwarden").join("\n")
+        };
+        assert_eq!(lines(Refreshed::NotInstalled, Refreshed::NotInstalled), "");
+        assert_eq!(lines(Refreshed::Current, Refreshed::Current), "");
+        let updated = lines(Refreshed::Updated, Refreshed::Current);
+        assert!(
+            updated.contains("Updated OpenClaw's message hook"),
+            "{updated}"
+        );
+        assert!(
+            updated.contains("Restart the OpenClaw gateway"),
+            "{updated}"
+        );
+        let changed = lines(Refreshed::Changed("handler.js"), Refreshed::Current);
+        assert!(
+            changed.contains("left as it is: handler.js matches no version"),
+            "{changed}"
+        );
+        assert!(changed.contains("innerwarden observe install"), "{changed}");
+        assert!(
+            !changed.contains("Restart"),
+            "nothing was written: {changed}"
+        );
+        let failed = lines(
+            Refreshed::Failed("refused a link".into()),
+            Refreshed::Current,
+        );
+        assert!(
+            failed.contains("could not be updated (refused a link)"),
+            "{failed}"
+        );
+        let no_plugin = lines(Refreshed::Updated, Refreshed::NotInstalled);
+        assert!(no_plugin.contains("To add the reply"), "{no_plugin}");
+        assert!(no_plugin.contains("conversation access"), "{no_plugin}");
+        assert!(!lines(Refreshed::NotInstalled, Refreshed::NotInstalled).contains("reply"));
+    }
+
+    /// The install says what it granted the plugin, and when the operator's
+    /// own settings keep it from running, which setting, and that it was left.
+    #[test]
+    fn the_install_says_what_the_plugin_was_granted_or_why_it_will_not_run() {
+        let granted = plugin_install_lines(PluginEntry::Enabled { changed: true }, None).join("\n");
+        assert!(granted.contains("allowConversationAccess"), "{granted}");
+        assert!(granted.contains("No conversation"), "{granted}");
+        let blocked = plugin_install_lines(
+            PluginEntry::Enabled { changed: true },
+            Some(PluginBlocker::NotInAllowList),
+        )
+        .join("\n");
+        assert!(
+            blocked.contains("will not run:\n  plugins.allow does not list innerwarden-replies"),
+            "{blocked}"
+        );
+        assert!(blocked.contains("outcome not seen"), "{blocked}");
+        let off =
+            plugin_install_lines(PluginEntry::LeftOff, Some(PluginBlocker::EntryOff)).join("\n");
+        assert!(off.contains("does not turn back on"), "{off}");
+        let odd = plugin_install_lines(PluginEntry::UnexpectedShape, None).join("\n");
+        assert!(odd.contains("not a table"), "{odd}");
+        for lines in [granted, blocked, off, odd] {
+            for line in lines.lines() {
+                assert!(line.chars().count() <= 80, "wrap this line: {line}");
+            }
+        }
+    }
+
+    /// `observe status` names the state of each set, and a plugin the config
+    /// blocks names the setting.
+    #[test]
+    fn status_names_an_earlier_or_changed_hook_and_the_plugin_state() {
+        let lines = |hook, plugin, blocker| {
+            observation_lines(
+                &Observation {
+                    hook,
+                    plugin,
+                    plugin_blocker: blocker,
+                },
+                "innerwarden",
+            )
+            .join("\n")
+        };
+        let all_good = lines(InstalledFiles::Current, InstalledFiles::Current, None);
+        assert_eq!(
+            all_good,
+            "  Control UI chats: the reply plugin reports how each turn ends."
+        );
+        let stale = lines(InstalledFiles::Outdated, InstalledFiles::Current, None);
+        assert!(stale.contains("an earlier version's"), "{stale}");
+        let changed = lines(
+            InstalledFiles::Changed("handler.js"),
+            InstalledFiles::Current,
+            None,
+        );
+        assert!(
+            changed.contains("not the one InnerWarden wrote: handler.js"),
+            "{changed}"
+        );
+        let missing = lines(InstalledFiles::Current, InstalledFiles::NotInstalled, None);
+        assert!(
+            missing.contains("reply plugin is not installed"),
+            "{missing}"
+        );
+        let blocked = lines(
+            InstalledFiles::Current,
+            InstalledFiles::Current,
+            Some(PluginBlocker::AllPluginsOff),
+        );
+        assert!(
+            blocked.contains("will not run:\n  plugins.enabled is false"),
+            "{blocked}"
+        );
+        for text in [all_good, stale, changed, missing, blocked] {
+            for line in text.lines() {
+                assert!(line.chars().count() <= 82, "wrap this line: {line}");
+            }
+        }
+    }
+
+    /// A turn's end closes the ask it started, recorded once, and with how
+    /// the turn ended as its basis.
+    #[test]
+    fn a_turn_end_records_its_ask_once_with_how_it_ended() {
+        let dir = tempfile::TempDir::new().expect("scratch dir");
+        update_pending(dir.path(), 1_000, |state| {
+            state.remember(PendingAsk {
+                message: "run-1".into(),
+                ..ask("agent:main:main", 1_000)
+            })
+        })
+        .expect("held");
+        let end = |run: &str| {
+            settle_with(dir.path(), 1_010, |state| {
+                state
+                    .take_for_run("agent:main:main", run)
+                    .map(|ask| Leaving {
+                        ask,
+                        departure: Departure::TurnEnded(TurnEnd::UsedTools),
+                    })
+                    .into_iter()
+                    .collect()
+            })
+        };
+        end("run-0");
+        assert!(
+            attempts(dir.path()).is_empty(),
+            "another turn closes nothing"
+        );
+        end("run-1");
+        end("run-1");
+        let recorded = attempts(dir.path());
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        assert_eq!(recorded[0]["decider"], "undetermined");
+        assert_eq!(recorded[0]["decider_basis"], "tool_call_in_turn");
+        assert_eq!(recorded[0]["enforced"], false);
     }
 }

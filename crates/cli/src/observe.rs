@@ -48,7 +48,9 @@ pub const PENDING_TTL_SECONDS: u64 = 900;
 /// OpenClaw's Control UI chat (`webchat`) streams the reply back over the
 /// gateway connection and emits no `message:sent` for it: in 2026.9.7 that
 /// event comes only from outbound channel delivery, and no internal hook event
-/// marks the end of a webchat turn at all. Waiting for a reply there waits for
+/// marks the end of a webchat turn at all. The reply plugin sees that end
+/// through the typed `agent_end` hook and closes the ask with how the turn
+/// ended (`TurnEnd`). Where it does not, waiting for a reply waits for
 /// something that cannot arrive, so the ask is held only long enough for a
 /// guard block in the same turn to be seen, and then recorded with the outcome
 /// stated as not visible. Two minutes covers a turn with several tool calls
@@ -122,6 +124,12 @@ pub enum Basis {
     /// The channel never reports the agent's reply to the hook (OpenClaw's
     /// Control UI chat), so no reply could be observed.
     ChannelReportsNoReply,
+    /// The agent's turn that answered the ask called a tool. Whatever it
+    /// said afterwards, it acted, and a reply is no evidence that it declined.
+    ToolCallInTurn,
+    /// The agent's turn that answered the ask ended without a reply: it
+    /// failed, was stopped, or said nothing.
+    TurnEndedWithoutReply,
     /// More sessions were waiting than the pending state holds, and this was
     /// the oldest.
     PendingLimitReached,
@@ -142,6 +150,8 @@ impl Basis {
             Self::NoReplyWithinTtl => "no_reply_observed_within_ttl",
             Self::NextMessageBeforeReply => "next_message_before_reply",
             Self::ChannelReportsNoReply => "channel_reports_no_reply",
+            Self::ToolCallInTurn => "tool_call_in_turn",
+            Self::TurnEndedWithoutReply => "turn_ended_without_reply",
             Self::PendingLimitReached => "pending_limit_reached",
             Self::PendingStateUnavailable => "pending_state_unavailable",
             Self::Declared => "declared_by_caller",
@@ -172,6 +182,13 @@ pub struct PendingAsk {
     /// named something that is not a plain agent id.
     #[serde(default)]
     pub agent: String,
+    /// The id of the message that carried the ask, where the hook reports
+    /// one that the agent's turn is known by: on OpenClaw's Control UI chat
+    /// the gateway gives the turn the message's id as its run id. A report
+    /// that a turn ended settles the ask only when it names this run
+    /// ([`Pending::take_for_run`]). Empty everywhere else.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub message: String,
 }
 
 /// The agent name an ask may carry: a plain agent id, or nothing. The value
@@ -180,6 +197,24 @@ pub struct PendingAsk {
 pub fn agent_field(value: Option<&str>) -> String {
     value
         .filter(|value| innerwarden_agent_guard::hook::is_agent_id(value))
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// The message or run id an ask may carry: up to 128 letters, digits and
+/// `-_.:`, or nothing. Compared for equality, so it is checked rather than
+/// redacted: a redaction that rewrote an id would make a turn's end miss the
+/// ask it answers.
+pub fn message_id_field(value: Option<&str>) -> String {
+    value
+        .map(str::trim)
+        .filter(|id| {
+            !id.is_empty()
+                && id.len() <= 128
+                && id
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
+        })
         .unwrap_or_default()
         .to_string()
 }
@@ -196,6 +231,8 @@ pub struct Pending {
 pub enum Departure {
     /// The session's reply arrived. `declared` is a decider the caller stated.
     Replied { declared: Option<Decider> },
+    /// The agent's turn that the ask started ended, and this is how.
+    TurnEnded(TurnEnd),
     /// No reply arrived within [`PENDING_TTL_SECONDS`].
     Expired,
     /// It left before any reply could be observed, for this reason.
@@ -224,6 +261,32 @@ impl NoReply {
             Self::ChannelReportsNone => Basis::ChannelReportsNoReply,
             Self::PendingLimit => Basis::PendingLimitReached,
             Self::StateUnavailable => Basis::PendingStateUnavailable,
+        }
+    }
+}
+
+/// How the agent's turn that answered an ask ended, as OpenClaw reports the
+/// end of a turn to a plugin (`agent_end`): the turn's own messages, read by
+/// the plugin InnerWarden installs beside the message hook. Only the shape
+/// travels, never the words: a reply is text from the agent with no tool
+/// call anywhere in the turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnEnd {
+    /// The turn ended with a reply, and called no tool on the way.
+    Replied,
+    /// The turn called a tool (and may have replied too).
+    UsedTools,
+    /// The turn failed, was stopped, or ended with nothing said.
+    NoReply,
+}
+
+impl TurnEnd {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "replied" => Some(Self::Replied),
+            "used_tools" => Some(Self::UsedTools),
+            "no_reply" => Some(Self::NoReply),
+            _ => None,
         }
     }
 }
@@ -274,6 +337,25 @@ impl Pending {
     /// Take the ask this session is waiting on, if any.
     pub fn take(&mut self, session: &str) -> Option<PendingAsk> {
         let index = self.asks.iter().position(|ask| ask.session == session)?;
+        Some(self.asks.remove(index))
+    }
+
+    /// Take the ask this session is waiting on only if it is the one that
+    /// started the turn `run`.
+    ///
+    /// A turn's end says nothing about an ask that arrived during it: a turn
+    /// still answering an earlier message ends after the next one has arrived,
+    /// and closing that next ask on it would record a reply to a different
+    /// message. So the turn is matched by id, never by session and time, and an
+    /// ask that carries no message id is never taken here.
+    pub fn take_for_run(&mut self, session: &str, run: &str) -> Option<PendingAsk> {
+        if run.is_empty() {
+            return None;
+        }
+        let index = self
+            .asks
+            .iter()
+            .position(|ask| ask.session == session && ask.message == run)?;
         Some(self.asks.remove(index))
     }
 
@@ -361,20 +443,34 @@ pub struct GuardWindow {
 ///
 /// An expired ask is not correlated at all, because its window can be hours
 /// wide by the time a later hook call flushes it.
+///
+/// A turn that ended is a reply only when it called no tool and said
+/// something. One that called a tool acted, and its reply proves no refusal:
+/// a native tool the guard does not screen leaves no line in the sink, so
+/// "nothing screened ran" would be true while the ask was carried out. One
+/// that ended with nothing said is not a refusal either.
 pub fn outcome(leaving: Leaving, window: GuardWindow, recorded_at: u64) -> Attempt {
     let refused = window.refused_this_session || window.refused_unattributed;
+    let replied = matches!(
+        leaving.departure,
+        Departure::Replied { declared: None } | Departure::TurnEnded(TurnEnd::Replied)
+    );
     let (decider, basis) = match leaving.departure {
         Departure::Replied {
             declared: Some(decider),
         } => (decider, Basis::Declared),
         Departure::Expired => (Decider::Undetermined, Basis::NoReplyWithinTtl),
         _ if window.flagged_ran => (Decider::Undetermined, Basis::FlaggedActionRanInWindow),
-        Departure::Replied { declared: None } if window.refused_this_session => {
+        _ if replied && window.refused_this_session => {
             (Decider::GuardDenied, Basis::GuardBlockInWindow)
         }
         _ if refused => (Decider::Undetermined, Basis::GuardBlockInWindow),
-        Departure::Replied { declared: None } => {
+        Departure::Replied { declared: None } | Departure::TurnEnded(TurnEnd::Replied) => {
             (Decider::ModelRefused, Basis::NoScreenedExecution)
+        }
+        Departure::TurnEnded(TurnEnd::UsedTools) => (Decider::Undetermined, Basis::ToolCallInTurn),
+        Departure::TurnEnded(TurnEnd::NoReply) => {
+            (Decider::Undetermined, Basis::TurnEndedWithoutReply)
         }
         Departure::Unanswered(reason) => (Decider::Undetermined, reason.basis()),
     };
@@ -400,14 +496,15 @@ pub fn needs_block_correlation(departure: Departure) -> bool {
 /// future (anything can append one) never reaches an ask. An ask that left
 /// with no reply is held to the length of one turn, the hold a webchat ask
 /// gets: a superseded ask can be fifteen minutes old, and a block from then
-/// says nothing about it.
+/// says nothing about it. A turn that was seen to end is read to its end,
+/// however long it took.
 pub fn correlation_window(leaving: &Leaving, recorded_at: u64) -> (u64, u64) {
     let from = leaving.ask.asked_at;
     let until = match leaving.departure {
         Departure::Unanswered(_) => {
             recorded_at.min(from.saturating_add(UNREPORTED_REPLY_WAIT_SECONDS))
         }
-        Departure::Replied { .. } | Departure::Expired => recorded_at,
+        Departure::Replied { .. } | Departure::TurnEnded(_) | Departure::Expired => recorded_at,
     };
     (from, until)
 }
@@ -1233,6 +1330,192 @@ pub fn hook_is_enabled(root: &Value, hook: &str) -> bool {
     internal_on && entry_on
 }
 
+/// How `observe install` left the reply plugin's entry in an OpenClaw config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PluginEntry {
+    /// Enabled, with the conversation access its `agent_end` hook needs.
+    /// `changed` says whether the config had to be edited for it.
+    Enabled { changed: bool },
+    /// The operator turned the entry or its conversation access off, and an
+    /// install does not turn back on what the operator turned off.
+    LeftOff,
+    /// A level of the entry exists and is not a table, so nothing was edited.
+    UnexpectedShape,
+}
+
+/// Enable the reply plugin's entry and grant it conversation access
+/// (`plugins.entries.<id>.enabled` and
+/// `plugins.entries.<id>.hooks.allowConversationAccess`), returning the edited
+/// config.
+///
+/// OpenClaw runs a non-bundled plugin's `agent_end` hook only with that access,
+/// because the hook sees the turn's messages. Only those two keys are written.
+/// `plugins.enabled`, `plugins.allow` and `plugins.deny` are the operator's
+/// policy over every plugin and are never edited here ([`plugin_blocker`]
+/// reports them). An explicit `false` on either key is the operator's choice,
+/// and is left as it is.
+pub fn enable_plugin_entry(mut root: Value, plugin: &str) -> (Value, PluginEntry) {
+    if !root.is_object() {
+        return (root, PluginEntry::UnexpectedShape);
+    }
+    let entry = root.pointer(&format!("/plugins/entries/{plugin}"));
+    let turned_off = |key: &str| {
+        entry
+            .and_then(|entry| entry.pointer(key))
+            .and_then(Value::as_bool)
+            == Some(false)
+    };
+    if turned_off("/enabled") || turned_off("/hooks/allowConversationAccess") {
+        return (root, PluginEntry::LeftOff);
+    }
+    let before = root.clone();
+    let Some(entry) = object_at(&mut root, &["plugins", "entries", plugin]) else {
+        return (before, PluginEntry::UnexpectedShape);
+    };
+    entry.insert("enabled".into(), json!(true));
+    let Some(hooks) = object_at(&mut root, &["plugins", "entries", plugin, "hooks"]) else {
+        return (before, PluginEntry::UnexpectedShape);
+    };
+    hooks.insert("allowConversationAccess".into(), json!(true));
+    let changed = root != before;
+    (root, PluginEntry::Enabled { changed })
+}
+
+/// What in an OpenClaw config keeps a plugin from running its `agent_end`
+/// hook, read the way the gateway reads it (2026.9.7): all plugins off, the
+/// plugin denied, its entry off, an allowlist that leaves it out, or no
+/// conversation access.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PluginBlocker {
+    AllPluginsOff,
+    Denied,
+    EntryOff,
+    NotInAllowList,
+    NoConversationAccess,
+}
+
+impl PluginBlocker {
+    /// The config key that blocks it, for the operator to look at.
+    pub fn key(self, plugin: &str) -> String {
+        match self {
+            Self::AllPluginsOff => "plugins.enabled is false".into(),
+            Self::Denied => format!("plugins.deny lists {plugin}"),
+            Self::EntryOff => format!("plugins.entries.{plugin}.enabled is not true"),
+            Self::NotInAllowList => format!("plugins.allow does not list {plugin}"),
+            Self::NoConversationAccess => {
+                format!("plugins.entries.{plugin}.hooks.allowConversationAccess is not true")
+            }
+        }
+    }
+}
+
+/// The first thing that keeps `plugin` from observing a turn's end, if any.
+pub fn plugin_blocker(root: &Value, plugin: &str) -> Option<PluginBlocker> {
+    let plugins = root.get("plugins");
+    let listed = |key: &str| {
+        plugins
+            .and_then(|plugins| plugins.get(key))
+            .and_then(Value::as_array)
+            .map(|list| list.iter().any(|item| item.as_str() == Some(plugin)))
+    };
+    if plugins
+        .and_then(|plugins| plugins.get("enabled"))
+        .and_then(Value::as_bool)
+        == Some(false)
+    {
+        return Some(PluginBlocker::AllPluginsOff);
+    }
+    if listed("deny") == Some(true) {
+        return Some(PluginBlocker::Denied);
+    }
+    let entry = root.pointer(&format!("/plugins/entries/{plugin}"));
+    let on = |key: &str| {
+        entry
+            .and_then(|entry| entry.pointer(key))
+            .and_then(Value::as_bool)
+            == Some(true)
+    };
+    if !on("/enabled") {
+        return Some(PluginBlocker::EntryOff);
+    }
+    let allow_is_set = plugins
+        .and_then(|plugins| plugins.get("allow"))
+        .and_then(Value::as_array)
+        .is_some_and(|list| !list.is_empty());
+    if allow_is_set && listed("allow") != Some(true) {
+        return Some(PluginBlocker::NotInAllowList);
+    }
+    if !on("/hooks/allowConversationAccess") {
+        return Some(PluginBlocker::NoConversationAccess);
+    }
+    None
+}
+
+/// One file `observe install` writes into OpenClaw: its name, the body this
+/// version ships, and the SHA-256 of every body an earlier release shipped
+/// under that name.
+///
+/// The earlier digests are what lets an upgrade replace a file that is
+/// exactly what InnerWarden wrote, and leave alone one somebody changed.
+#[derive(Debug, Clone, Copy)]
+pub struct ShippedFile {
+    pub name: &'static str,
+    pub body: &'static str,
+    pub earlier: &'static [&'static str],
+}
+
+/// What is installed under one set of [`ShippedFile`]s (the message hook, or
+/// the reply plugin), judged against what this version ships.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstalledFiles {
+    /// The first file of the set is not there: nothing is installed.
+    NotInstalled,
+    /// Every file is the one this version ships.
+    Current,
+    /// Every file is one some release shipped (or is missing), and at least
+    /// one is not this version's.
+    Outdated,
+    /// This file is not one any release shipped: somebody changed it.
+    Changed(&'static str),
+}
+
+/// The lowercase hex SHA-256 of `bytes`.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Judge what is installed. PURE: `installed[i]` holds the bytes found under
+/// `files[i].name`, `None` when there is no such file.
+pub fn installed_files(files: &[ShippedFile], installed: &[Option<Vec<u8>>]) -> InstalledFiles {
+    if installed.first().is_none_or(Option::is_none) {
+        return InstalledFiles::NotInstalled;
+    }
+    let mut outdated = false;
+    for (file, bytes) in files.iter().zip(installed) {
+        let Some(bytes) = bytes else {
+            outdated = true;
+            continue;
+        };
+        if bytes.as_slice() == file.body.as_bytes() {
+            continue;
+        }
+        if file.earlier.contains(&sha256_hex(bytes).as_str()) {
+            outdated = true;
+            continue;
+        }
+        return InstalledFiles::Changed(file.name);
+    }
+    if outdated {
+        InstalledFiles::Outdated
+    } else {
+        InstalledFiles::Current
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1278,6 +1561,7 @@ mod tests {
             signals: vec!["dangerous_command".into()],
             asked_at: at,
             agent: "openclaw".into(),
+            message: String::new(),
         }
     }
 
@@ -2439,5 +2723,346 @@ mod tests {
             assert_eq!(Decider::parse(decider.as_str()), Some(decider));
         }
         assert_eq!(Decider::parse("blocked"), None);
+    }
+
+    /// An ask on the Control UI chat, carrying the id its turn runs under.
+    fn webchat(session: &str, message: &str, at: u64) -> PendingAsk {
+        PendingAsk {
+            channel: "webchat".into(),
+            message: message.into(),
+            ..pending(session, at)
+        }
+    }
+
+    /// A turn's end closes only the ask whose message started that turn. A
+    /// turn still answering an earlier message ends after the next message
+    /// arrived, and closing the newer ask on it would record a reply to a
+    /// message the agent never answered.
+    ///
+    /// FAILS ON REVERT: match on the session alone (`take`) and the earlier
+    /// turn's end takes the newer ask.
+    #[test]
+    fn a_turn_end_closes_only_the_ask_that_started_it() {
+        let mut state = Pending::default();
+        state.remember(webchat("s1", "run-2", 200));
+        assert!(
+            state.take_for_run("s1", "run-1").is_none(),
+            "the earlier turn's end must not close the newer ask"
+        );
+        assert!(
+            state.take_for_run("s2", "run-2").is_none(),
+            "another session"
+        );
+        assert!(state.take_for_run("s1", "").is_none(), "no run id");
+        let taken = state.take_for_run("s1", "run-2").expect("its own turn");
+        assert_eq!(taken.asked_at, 200);
+        assert!(state.asks.is_empty());
+
+        // An ask with no message id (any other channel) is never taken by a
+        // turn's end, whatever the run is called.
+        state.remember(pending("s1", 300));
+        assert!(state.take_for_run("s1", "").is_none());
+        assert!(state.take_for_run("s1", "run-3").is_none());
+        assert_eq!(state.asks.len(), 1);
+    }
+
+    /// How the turn ended decides the record. A turn that called a tool and
+    /// then said no is THE attacker form: the agent ran the miner through a
+    /// native tool the guard does not screen (nothing lands in the sink),
+    /// then replied "I can't help with that". Reading the reply as a refusal
+    /// would put "your agent declined on its own" over a miner that is
+    /// running. And a turn that ended with nothing said refused nothing.
+    ///
+    /// FAILS ON REVERT: settle every turn end as a reply and the tool call
+    /// reads `model_refused`.
+    #[test]
+    fn a_turn_that_used_a_tool_is_never_a_refusal() {
+        let leave = |turn| Leaving {
+            ask: webchat("s1", "run-1", 100),
+            departure: Departure::TurnEnded(turn),
+        };
+        let replied = outcome(leave(TurnEnd::Replied), NOTHING, 120);
+        assert_eq!(
+            (replied.decider, replied.basis),
+            (Decider::ModelRefused, Basis::NoScreenedExecution)
+        );
+        let acted = outcome(leave(TurnEnd::UsedTools), NOTHING, 120);
+        assert_eq!(
+            (acted.decider, acted.basis),
+            (Decider::Undetermined, Basis::ToolCallInTurn)
+        );
+        assert_eq!(attempt_line(&acted)["decider_basis"], "tool_call_in_turn");
+        assert_eq!(attempt_line(&acted)["enforced"], false);
+        let silent = outcome(leave(TurnEnd::NoReply), NOTHING, 120);
+        assert_eq!(
+            (silent.decider, silent.basis),
+            (Decider::Undetermined, Basis::TurnEndedWithoutReply)
+        );
+
+        // What the guard recorded in the turn still decides first, exactly as
+        // for a reply: a flagged action that ran outranks everything, and a
+        // refusal no line ties to this ask credits no one.
+        for turn in [TurnEnd::Replied, TurnEnd::UsedTools, TurnEnd::NoReply] {
+            let ran = outcome(leave(turn), FLAGGED_RAN, 120);
+            assert_eq!(
+                (ran.decider, ran.basis),
+                (Decider::Undetermined, Basis::FlaggedActionRanInWindow),
+                "{turn:?}"
+            );
+            let unattributed = outcome(leave(turn), REFUSED_UNATTRIBUTED, 120);
+            assert_eq!(
+                (unattributed.decider, unattributed.basis),
+                (Decider::Undetermined, Basis::GuardBlockInWindow),
+                "{turn:?}"
+            );
+            assert!(needs_block_correlation(Departure::TurnEnded(turn)));
+        }
+        // The guard is named only for a turn that replied, as for any reply;
+        // a turn that also ran tools may have run one the guard never saw.
+        let denied = outcome(leave(TurnEnd::Replied), REFUSED_THIS_SESSION, 120);
+        assert_eq!(denied.decider, Decider::GuardDenied);
+        let mixed = outcome(leave(TurnEnd::UsedTools), REFUSED_THIS_SESSION, 120);
+        assert_eq!(
+            (mixed.decider, mixed.basis),
+            (Decider::Undetermined, Basis::GuardBlockInWindow)
+        );
+        for turn in ["replied", "used_tools", "no_reply"] {
+            assert!(TurnEnd::parse(turn).is_some(), "{turn}");
+        }
+        assert_eq!(TurnEnd::parse("model_refused"), None);
+    }
+
+    /// A turn that was seen to end is read to its end, however long it ran:
+    /// the one-turn cap is for an ask that left with no turn seen.
+    ///
+    /// FAILS ON REVERT: correlate a turn end like an unanswered ask and the
+    /// window stops at the two-minute hold.
+    #[test]
+    fn a_turn_end_is_correlated_to_its_end() {
+        let leaving = Leaving {
+            ask: webchat("s1", "run-1", 100),
+            departure: Departure::TurnEnded(TurnEnd::Replied),
+        };
+        assert_eq!(correlation_window(&leaving, 900), (100, 900));
+    }
+
+    /// A message id is compared, not read, so it is checked rather than
+    /// redacted: a rewritten id would make a turn's end miss its ask.
+    #[test]
+    fn a_message_id_is_kept_whole_or_dropped() {
+        assert_eq!(
+            message_id_field(Some("3f2b9c1e-7a1d-4b6e-9f00-1c2d3e4f5a6b")),
+            "3f2b9c1e-7a1d-4b6e-9f00-1c2d3e4f5a6b"
+        );
+        assert_eq!(message_id_field(Some(" run:1.a_b ")), "run:1.a_b");
+        assert_eq!(message_id_field(Some("a b")), "");
+        assert_eq!(message_id_field(Some("x\ny")), "");
+        assert_eq!(message_id_field(Some(&"a".repeat(129))), "");
+        assert_eq!(message_id_field(Some("")), "");
+        assert_eq!(message_id_field(None), "");
+    }
+
+    /// The message id is stored with the ask and read back; a pending file
+    /// from before it existed still loads, with none.
+    #[test]
+    fn a_held_ask_keeps_its_message_id_across_the_file() {
+        let mut state = Pending::default();
+        state.remember(webchat("s1", "run-1", 100));
+        let parsed = Pending::from_json(&state.to_json());
+        assert_eq!(parsed.asks[0].message, "run-1");
+        let old = r#"{"asks":[{"session":"s1","ask":"x","asked_at":5,"agent":"openclaw"}]}"#;
+        assert_eq!(Pending::from_json(old).asks[0].message, "");
+        // An ask with no id writes no field at all.
+        let mut plain = Pending::default();
+        plain.remember(pending("s1", 100));
+        assert!(!plain.to_json().contains("message"));
+    }
+
+    const PLUGIN: &str = "innerwarden-replies";
+
+    /// Enabling the reply plugin touches its own entry and nothing else: the
+    /// file holds auth profiles and channel tokens, and the operator's policy
+    /// over every plugin (`plugins.enabled`, `allow`, `deny`) is theirs.
+    ///
+    /// FAILS ON REVERT: leave out the conversation access and OpenClaw never
+    /// runs the plugin's `agent_end` hook.
+    #[test]
+    fn enabling_the_plugin_grants_its_access_and_touches_nothing_else() {
+        let root = json!({
+            "auth": {"profiles": {"openai:default": {"mode": "api_key"}}},
+            "plugins": {"allow": ["voice-call"], "deny": ["x"], "entries": {"voice-call": {"enabled": true}}},
+        });
+        let (out, entry) = enable_plugin_entry(root.clone(), PLUGIN);
+        assert_eq!(entry, PluginEntry::Enabled { changed: true });
+        assert_eq!(out["plugins"]["entries"][PLUGIN]["enabled"], true);
+        assert_eq!(
+            out["plugins"]["entries"][PLUGIN]["hooks"]["allowConversationAccess"],
+            true
+        );
+        assert_eq!(out["auth"], root["auth"]);
+        assert_eq!(
+            out["plugins"]["allow"],
+            json!(["voice-call"]),
+            "policy untouched"
+        );
+        assert_eq!(out["plugins"]["deny"], json!(["x"]));
+        assert_eq!(
+            out["plugins"]["entries"]["voice-call"],
+            json!({"enabled": true})
+        );
+        let (again, entry) = enable_plugin_entry(out.clone(), PLUGIN);
+        assert_eq!(entry, PluginEntry::Enabled { changed: false });
+        assert_eq!(again, out);
+        // A config with no plugins block gets one.
+        let (fresh, entry) = enable_plugin_entry(json!({}), PLUGIN);
+        assert_eq!(entry, PluginEntry::Enabled { changed: true });
+        assert_eq!(plugin_blocker(&fresh, PLUGIN), None);
+    }
+
+    /// What the operator turned off stays off, and a shape that is not a
+    /// table is refused rather than overwritten.
+    ///
+    /// FAILS ON REVERT: write `enabled: true` over an explicit `false` and the
+    /// install turns back on a plugin the operator turned off.
+    #[test]
+    fn the_plugin_entry_the_operator_turned_off_stays_off() {
+        for off in [
+            json!({"plugins": {"entries": {PLUGIN: {"enabled": false}}}}),
+            json!({"plugins": {"entries": {PLUGIN: {"enabled": true, "hooks": {"allowConversationAccess": false}}}}}),
+        ] {
+            let (out, entry) = enable_plugin_entry(off.clone(), PLUGIN);
+            assert_eq!(entry, PluginEntry::LeftOff);
+            assert_eq!(out, off, "nothing edited");
+        }
+        for odd in [
+            json!({"plugins": "all"}),
+            json!({"plugins": {"entries": {PLUGIN: {"enabled": true, "hooks": 3}}}}),
+        ] {
+            let (out, entry) = enable_plugin_entry(odd.clone(), PLUGIN);
+            assert_eq!(entry, PluginEntry::UnexpectedShape);
+            assert_eq!(out, odd, "nothing edited");
+        }
+    }
+
+    /// The config is read the way the gateway reads it, so the operator is
+    /// told the one setting that keeps the plugin from running.
+    #[test]
+    fn what_keeps_the_plugin_from_running_is_named() {
+        let on = json!({"enabled": true, "hooks": {"allowConversationAccess": true}});
+        let with = |plugins: Value| json!({ "plugins": plugins });
+        assert_eq!(
+            plugin_blocker(&with(json!({"entries": {PLUGIN: on}})), PLUGIN),
+            None
+        );
+        assert_eq!(
+            plugin_blocker(
+                &with(json!({"enabled": false, "entries": {PLUGIN: on}})),
+                PLUGIN
+            ),
+            Some(PluginBlocker::AllPluginsOff)
+        );
+        assert_eq!(
+            plugin_blocker(
+                &with(json!({"deny": [PLUGIN], "entries": {PLUGIN: on}})),
+                PLUGIN
+            ),
+            Some(PluginBlocker::Denied)
+        );
+        assert_eq!(
+            plugin_blocker(&with(json!({"entries": {}})), PLUGIN),
+            Some(PluginBlocker::EntryOff)
+        );
+        assert_eq!(
+            plugin_blocker(
+                &with(json!({"allow": ["voice-call"], "entries": {PLUGIN: on}})),
+                PLUGIN
+            ),
+            Some(PluginBlocker::NotInAllowList)
+        );
+        // An empty allowlist restricts nothing, as in the gateway.
+        assert_eq!(
+            plugin_blocker(&with(json!({"allow": [], "entries": {PLUGIN: on}})), PLUGIN),
+            None
+        );
+        assert_eq!(
+            plugin_blocker(
+                &with(json!({"allow": [PLUGIN], "entries": {PLUGIN: on}})),
+                PLUGIN
+            ),
+            None
+        );
+        assert_eq!(
+            plugin_blocker(
+                &with(json!({"entries": {PLUGIN: {"enabled": true}}})),
+                PLUGIN
+            ),
+            Some(PluginBlocker::NoConversationAccess)
+        );
+        assert!(PluginBlocker::NotInAllowList
+            .key(PLUGIN)
+            .contains("plugins.allow does not list innerwarden-replies"));
+    }
+
+    const CURRENT: &str = "the body this version ships";
+    const EARLIER: &str = "the body a release shipped before";
+
+    fn shipped() -> [ShippedFile; 2] {
+        // Leaked so the digest can be a `&'static str`, as in the real table.
+        let earlier: &'static str = Box::leak(sha256_hex(EARLIER.as_bytes()).into_boxed_str());
+        let earlier: &'static [&'static str] = Box::leak(vec![earlier].into_boxed_slice());
+        [
+            ShippedFile {
+                name: "handler.js",
+                body: CURRENT,
+                earlier,
+            },
+            ShippedFile {
+                name: "HOOK.md",
+                body: CURRENT,
+                earlier,
+            },
+        ]
+    }
+
+    /// What is installed is judged against every body a release shipped: the
+    /// current one, an earlier one (outdated, safe to replace), or neither
+    /// (somebody changed it, and it is left alone and named).
+    ///
+    /// FAILS ON REVERT: judge anything that is not the current body as
+    /// outdated, and a file somebody edited would be overwritten by the next
+    /// upgrade.
+    #[test]
+    fn installed_files_are_current_outdated_or_changed() {
+        let files = shipped();
+        let some = |text: &str| Some(text.as_bytes().to_vec());
+        assert_eq!(
+            installed_files(&files, &[None, some(CURRENT)]),
+            InstalledFiles::NotInstalled
+        );
+        assert_eq!(
+            installed_files(&files, &[some(CURRENT), some(CURRENT)]),
+            InstalledFiles::Current
+        );
+        assert_eq!(
+            installed_files(&files, &[some(EARLIER), some(CURRENT)]),
+            InstalledFiles::Outdated
+        );
+        assert_eq!(
+            installed_files(&files, &[some(CURRENT), None]),
+            InstalledFiles::Outdated,
+            "a missing companion file is written back, not a change"
+        );
+        assert_eq!(
+            installed_files(&files, &[some(EARLIER), some("edited by hand")]),
+            InstalledFiles::Changed("HOOK.md")
+        );
+        assert_eq!(
+            installed_files(&files, &[some("// disabled"), some(CURRENT)]),
+            InstalledFiles::Changed("handler.js")
+        );
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
     }
 }

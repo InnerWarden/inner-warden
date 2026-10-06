@@ -365,7 +365,7 @@ pub fn cmd(rest: &[String]) -> ExitCode {
             for line in closing_advice(dashboard_is_serving()) {
                 println!("{line}");
             }
-            for line in observe_hook_advice(crate::observe_io::installed()) {
+            for line in refresh_openclaw_files(&target) {
                 println!("{line}");
             }
             ExitCode::SUCCESS
@@ -493,27 +493,70 @@ fn closing_advice(dashboard_running: bool) -> Vec<String> {
     ]
 }
 
-/// What to print after a successful replace when OpenClaw's message hook is
-/// installed.
+/// Bring what `observe install` wrote into OpenClaw (the message hook and the
+/// reply plugin) up to the new version's, after a successful replace.
 ///
-/// `observe install` writes that hook once, and replacing the binary does not
-/// touch it, so the gateway keeps running the hook the previous version wrote:
-/// a fix to the hook reaches a host only when it is installed again. This
-/// process is the previous version and cannot tell whether the new one ships a
-/// different hook, so the step is given whenever one is installed, with the
-/// command that answers the question. The gateway is never restarted from
-/// here. Pure, because the wording is the part worth pinning.
-fn observe_hook_advice(hook_installed: bool) -> Vec<String> {
-    if !hook_installed {
+/// `observe install` writes those files once, and replacing the binary does
+/// not touch them, so the gateway kept running whatever the previous version
+/// wrote until the operator installed them again. This process IS the
+/// previous version and cannot know what the new one ships, so it runs the
+/// new binary's `observe refresh`, which replaces a file only where it is
+/// exactly what some release wrote, names one somebody changed instead of
+/// overwriting it, installs nothing that was not installed, and never
+/// restarts the gateway. Nothing installed: nothing to say.
+fn refresh_openclaw_files(target: &Path) -> Vec<String> {
+    if !crate::observe_io::openclaw_files_present() {
         return Vec::new();
     }
-    vec![
-        String::new(),
-        "OpenClaw's message hook is still the one the previous version installed.".into(),
-        "To run this version's:  innerwarden observe install".into(),
-        "then restart the OpenClaw gateway. `innerwarden observe status` says".into(),
-        "whether the installed hook is current.".into(),
-    ]
+    let ran = std::process::Command::new(target)
+        .args(["observe", "refresh"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()
+        .map(|out| RefreshRun {
+            code: out.status.code(),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        });
+    refresh_report(ran.as_ref())
+}
+
+/// What the new binary's `observe refresh` did, as the upgrade saw it.
+struct RefreshRun {
+    code: Option<i32>,
+    stdout: String,
+    stderr: String,
+}
+
+/// What the upgrade prints for the refresh. PURE.
+///
+/// The refresh's own words when it ran, set off by a blank line. When it
+/// could not run at all, or answered as a binary that does not know the
+/// command (exit 2), the step by hand: the hook stays whatever the previous
+/// version wrote until somebody installs it again, and saying nothing is how
+/// that went unnoticed.
+fn refresh_report(ran: Option<&RefreshRun>) -> Vec<String> {
+    match ran {
+        Some(run) if run.code.is_some() && run.code != Some(2) => {
+            let mut lines: Vec<String> = run
+                .stdout
+                .lines()
+                .chain(run.stderr.lines())
+                .map(str::to_string)
+                .collect();
+            if !lines.is_empty() {
+                lines.insert(0, String::new());
+            }
+            lines
+        }
+        _ => vec![
+            String::new(),
+            "OpenClaw's message hook is still the one the previous version installed.".into(),
+            "To run this version's:  innerwarden observe install".into(),
+            "then restart the OpenClaw gateway. `innerwarden observe status` says".into(),
+            "whether the installed hook is current.".into(),
+        ],
+    }
 }
 
 fn fail(message: &str) -> ExitCode {
@@ -948,20 +991,77 @@ mod installed_binary_tests {
 
 #[cfg(test)]
 mod closing_advice_tests {
-    use super::{closing_advice, observe_hook_advice};
+    use super::{closing_advice, refresh_report, RefreshRun};
 
-    /// An upgrade leaves OpenClaw's message hook as the previous version
-    /// wrote it, and nothing at the end of an upgrade said so: Control UI
-    /// chats went on being recorded only after fifteen minutes.
+    fn ran(code: i32, stdout: &str, stderr: &str) -> RefreshRun {
+        RefreshRun {
+            code: Some(code),
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+        }
+    }
+
+    /// An upgrade left OpenClaw's message hook as the previous version wrote
+    /// it, and only said so. It now runs the NEW binary's `observe refresh`,
+    /// and prints what that did, set off from the lines above.
     ///
-    /// FAILS ON REVERT: drop the advice and an installed hook gets no step.
+    /// FAILS ON REVERT: print the fixed advice again and the refresh's own
+    /// words never reach the operator.
     #[test]
-    fn an_installed_message_hook_gets_the_step_to_update_it() {
-        assert!(observe_hook_advice(false).is_empty());
-        let advice = observe_hook_advice(true).join("\n");
-        assert!(advice.contains("innerwarden observe install"), "{advice}");
-        assert!(advice.contains("restart the OpenClaw gateway"), "{advice}");
-        assert!(advice.contains("observe status"), "{advice}");
+    fn the_new_binarys_refresh_is_what_the_upgrade_prints() {
+        let updated = ran(
+            0,
+            "Updated OpenClaw's message hook to this version's.\nRestart the OpenClaw gateway to load it: nothing here restarts it.\n",
+            "",
+        );
+        assert_eq!(
+            refresh_report(Some(&updated)),
+            vec![
+                String::new(),
+                "Updated OpenClaw's message hook to this version's.".to_string(),
+                "Restart the OpenClaw gateway to load it: nothing here restarts it.".to_string(),
+            ]
+        );
+        // Current, or nothing installed: the refresh says nothing, and so
+        // does the upgrade.
+        assert!(refresh_report(Some(&ran(0, "", ""))).is_empty());
+        // A refresh that failed says why on its own lines, stderr included.
+        let failed = refresh_report(Some(&ran(
+            1,
+            "OpenClaw's message hook could not be updated (x).\n",
+            "",
+        )));
+        assert_eq!(
+            failed[1],
+            "OpenClaw's message hook could not be updated (x)."
+        );
+    }
+
+    /// A new binary that could not be run, or does not know the command
+    /// (exit 2), refreshed nothing: the hook is still the previous version's,
+    /// and the upgrade gives the step by hand rather than saying nothing.
+    ///
+    /// FAILS ON REVERT: print the refresh's (empty) output whatever its exit
+    /// code and an unknown command ends the upgrade in silence.
+    #[test]
+    fn a_refresh_that_could_not_run_gives_the_step_by_hand() {
+        for run in [
+            None,
+            Some(ran(2, "", "unknown subcommand `refresh`")),
+            Some(RefreshRun {
+                code: None,
+                stdout: String::new(),
+                stderr: String::new(),
+            }),
+        ] {
+            let advice = refresh_report(run.as_ref()).join("\n");
+            assert!(
+                advice.contains("still the one the previous version installed"),
+                "{advice}"
+            );
+            assert!(advice.contains("innerwarden observe install"), "{advice}");
+            assert!(advice.contains("restart the OpenClaw gateway"), "{advice}");
+        }
     }
 
     /// Nothing listening: the upgrade ends exactly as it always did. A notice

@@ -60,6 +60,10 @@ that ends any other way is recorded as `undetermined`, with the reason:
   (`next_message_before_reply`); both asks are recorded
 - no reply arrived within 15 minutes (`no_reply_observed_within_ttl`)
 - the channel never reports the reply (`channel_reports_no_reply`, below)
+- on the Control UI chat (below), the turn that answered it called a tool
+  (`tool_call_in_turn`): whatever the agent said after that, it acted, so its
+  reply does not show it declined; or the turn ended with nothing said,
+  failed or was stopped (`turn_ended_without_reply`)
 - monitor mode let an action the guard flagged run in the same turn
   (`flagged_action_ran_in_window`). This outranks every other reason: it is
   the one that says the attack may have worked
@@ -76,16 +80,41 @@ ask was recorded, or naming another agent, is not read at all.
 
 OpenClaw fires `message:received` for a Control UI message, but streams the
 reply back over the gateway connection and fires no `message:sent` for it, and
-no other hook event marks the end of a webchat turn. So a dangerous webchat ask
-is held for two minutes, long enough for what the guard records in the same
-turn to be seen, and then recorded as `undetermined`, with
+no internal hook event marks the end of a webchat turn. OpenClaw's typed
+plugin hook `agent_end` does, so `innerwarden observe install` also installs a
+small plugin, `innerwarden-replies` (in `~/.openclaw/extensions/`), that reads
+how each Control UI turn a person started ended: a tool call, a reply, or
+neither. It hands that one word, with the turn's id, to
+`innerwarden observe ended`, which closes the ask whose message started that
+turn, and no other. No conversation text leaves the gateway through it.
+OpenClaw lets a plugin read a turn only with conversation access, so the
+install grants it (`plugins.entries.innerwarden-replies.hooks.allowConversationAccess`)
+and says so; an entry you turned off stays off, and your `plugins.allow`,
+`plugins.deny` and `plugins.enabled` are reported, never edited. The gateway
+logs it as a plugin it cannot verify, because it was not installed through
+`openclaw plugins install`; `openclaw plugins inspect innerwarden-replies`
+shows it. A heartbeat or cron turn never closes an ask.
+
+A reply with no tool call in the turn is settled like any other reply. Where
+the plugin does not run, or its report cannot be matched to the ask, a
+dangerous webchat ask is held for two minutes, long enough for what the guard
+records in the same turn to be seen, and then recorded as `undetermined`, with
 `channel_reports_no_reply` or what the guard recorded in that turn as its
 basis. It never says the model declined there, because nothing here saw the
-reply, and it never says the guard stopped it either. If the
-gateway restarts inside those two minutes, the ask is recorded once it has
-waited 15 minutes, by the next message this hook sees.
+reply, and it never says the guard stopped it either. If the gateway restarts
+inside those two minutes, the ask is recorded once it has waited 15 minutes,
+by the next message this hook sees.
+
+## After an upgrade
+
+`innerwarden upgrade` runs the new binary's `innerwarden observe refresh`,
+which replaces this hook's files and the plugin's with the new version's where
+they are exactly what an earlier release wrote. A file somebody changed is
+left as it is and named. It installs nothing that was not installed and never
+restarts the gateway: restart it to load the new files.
 
 ## Requirements
 
 The `innerwarden` binary. `innerwarden observe install` writes its absolute
-path into `bin.json` next to this file; `IW_GUARD_BIN` overrides it.
+path into `bin.json` next to this file and next to the plugin's;
+`IW_GUARD_BIN` overrides it.

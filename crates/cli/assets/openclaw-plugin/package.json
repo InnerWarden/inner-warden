@@ -1,0 +1,10 @@
+{
+  "name": "innerwarden-replies",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Tells innerwarden observe how a Control UI turn ended, so a dangerous ask made there is recorded with its outcome.",
+  "type": "module",
+  "openclaw": {
+    "extensions": ["./index.js"]
+  }
+}

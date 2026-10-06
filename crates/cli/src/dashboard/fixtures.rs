@@ -501,7 +501,11 @@ pub(super) fn fixtures() -> Vec<(&'static str, Value)> {
         record: &span,
         guard_mode: "partial",
         observe_installed: true,
-        observe_current: true,
+        observation: crate::observe_io::Observation {
+            hook: crate::observe::InstalledFiles::Current,
+            plugin: crate::observe::InstalledFiles::Current,
+            plugin_blocker: None,
+        },
         openclaw_present: true,
         log: &log,
     };
