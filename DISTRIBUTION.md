@@ -112,7 +112,9 @@ each of the seven packages, pointing at `InnerWarden/inner-warden` +
   (`dpkg-query -S`) and rpm (`rpm -qf`) whether they record the file it runs
   from: when one does, `innerwarden upgrade` refuses (as it does for npm) and
   prints the commands that install the fixed-name package from the rolling
-  release, `upgrade --check` names those commands instead of `innerwarden
+  release (one command: fetch it and its `.sha256` into a `mktemp -d`
+  directory, `sha256sum -c`, then install it by path; never `dnf install
+  <URL>`), `upgrade --check` names those commands instead of `innerwarden
   upgrade`, and `innerwarden uninstall` leaves the file
   to `sudo apt remove innerwarden` / `sudo dnf remove innerwarden`. Replacing
   or deleting it by hand would leave the package database recording a file
@@ -146,7 +148,9 @@ Local one-off:
 - Every release binary ships `<asset>.sha256` (bare hash) and `<asset>.sig`
   (Ed25519 **over the SHA-256 digest** of the binary). The release publishes the
   public key as `innerwarden-release.pub` (PEM, `MCowBQYDK2VwAyEA...`).
-- The `.deb`/`.rpm` ship a standard-format `<file>.sha256`.
+- The `.deb`/`.rpm` ship a standard-format `<file>.sha256`. They are not
+  signed: the checksum proves a download arrived whole, not who published it.
+  Signing them with the release key is open work for this pipeline.
 - npm ships a signed **provenance** attestation (verify with
   `npm audit signatures`, or see it on the package page).
 - **Key rotated 2026-07-24.** The previous private key was lost, so the signing

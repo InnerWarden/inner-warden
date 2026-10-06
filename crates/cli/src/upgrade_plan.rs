@@ -165,6 +165,7 @@ pub fn check_lines(
                             .into_iter()
                             .map(|c| format!("      {c}")),
                     );
+                    out.push(format!("  {PACKAGE_NOTE}"));
                 }
                 Managed::Npm | Managed::Direct => out.push(format!(
                     "  Run `{}` to install {published}.",
@@ -398,28 +399,49 @@ fn rpm_arch(arch: &str) -> Option<&'static str> {
 /// release, installed by path, so `apt upgrade innerwarden` would answer that
 /// nothing is newer. The fixed-name packages on the rolling release always
 /// carry the current build, which is what the install page links.
+///
+/// A package is installed as root, maintainer scripts included, so it is
+/// fetched into a directory only this account can write (`mktemp -d`, never
+/// the current directory, which may be `/tmp`), checked against the checksum
+/// the release publishes beside it, and installed only if the check passes:
+/// the steps are ONE command chained with `&&`, so a failed check stops it.
+/// Never `dnf install <URL>`: dnf checks no signature on a URL or a local
+/// file by default. The packages are not signed, so the checksum proves the
+/// download arrived whole, not who published it; [`PACKAGE_NOTE`] says so.
 pub fn upgrade_commands(managed: &Managed, arch: &str) -> Vec<String> {
     match managed {
         Managed::Npm => vec!["npm install -g innerwarden@latest".into()],
         Managed::Direct => vec!["innerwarden upgrade".into()],
         Managed::System(PackageOwner::Dpkg { .. }) => match deb_arch(arch) {
-            Some(a) => vec![
-                format!("curl -fsSLO {RELEASE_BASE}/innerwarden_{a}.deb"),
-                format!("sudo apt install ./innerwarden_{a}.deb"),
-            ],
+            Some(a) => fetched_and_checked(&format!("innerwarden_{a}.deb"), "sudo apt install"),
             None => vec![format!(
-                "sudo apt install ./<the newer .deb for {arch}, from {RELEASE_BASE}>"
+                "sudo apt install <the newer .deb for {arch} from {RELEASE_BASE}, checked against its .sha256>"
             )],
         },
         Managed::System(PackageOwner::Rpm { .. }) => match rpm_arch(arch) {
-            Some(a) => vec![format!(
-                "sudo dnf install {RELEASE_BASE}/innerwarden.{a}.rpm"
-            )],
+            Some(a) => fetched_and_checked(&format!("innerwarden.{a}.rpm"), "sudo dnf install"),
             None => vec![format!(
-                "sudo dnf install <the newer .rpm for {arch}, from {RELEASE_BASE}>"
+                "sudo dnf install <the newer .rpm for {arch} from {RELEASE_BASE}, checked against its .sha256>"
             )],
         },
     }
+}
+
+/// What the checksum in [`upgrade_commands`] does and does not prove.
+pub const PACKAGE_NOTE: &str = "The checksum proves the download arrived whole, not who \
+     published it: the packages are not signed, unlike the release binaries.";
+
+/// One shell command, as lines continued with `\`: fetch `file` and its
+/// `.sha256` into a fresh private directory, check it, and install it with
+/// `install` only if the check passed.
+fn fetched_and_checked(file: &str, install: &str) -> Vec<String> {
+    vec![
+        "dir=\"$(mktemp -d)\" \\".into(),
+        format!("  && curl -fsSL -o \"$dir/{file}\" {RELEASE_BASE}/{file} \\"),
+        format!("  && curl -fsSL -o \"$dir/{file}.sha256\" {RELEASE_BASE}/{file}.sha256 \\"),
+        format!("  && (cd \"$dir\" && sha256sum -c {file}.sha256) \\"),
+        format!("  && {install} \"$dir/{file}\""),
+    ]
 }
 
 pub fn staging_path(target: &Path) -> PathBuf {
@@ -606,6 +628,7 @@ pub fn cannot_replace_advice_on(
             for command in upgrade_commands(managed, arch) {
                 out.push(format!("    {command}"));
             }
+            out.push(PACKAGE_NOTE.into());
             out.push(String::new());
             out.push(format!(
                 "Replacing the file by hand leaves {} recording the old version over \
@@ -1279,13 +1302,16 @@ mod tests {
         )
         .join("\n");
         assert!(
-            lines.contains(&format!("curl -fsSLO {RELEASE_BASE}/innerwarden_amd64.deb")),
+            lines.contains(&format!(
+                "curl -fsSL -o \"$dir/innerwarden_amd64.deb\" {RELEASE_BASE}/innerwarden_amd64.deb"
+            )),
             "{lines}"
         );
         assert!(
-            lines.contains("sudo apt install ./innerwarden_amd64.deb"),
+            lines.contains("&& sudo apt install \"$dir/innerwarden_amd64.deb\""),
             "{lines}"
         );
+        assert!(lines.contains(PACKAGE_NOTE), "{lines}");
         assert!(lines.contains("the .deb package `innerwarden`"), "{lines}");
         assert!(
             !lines.contains("innerwarden upgrade"),
@@ -1308,16 +1334,104 @@ mod tests {
         )
         .join("\n");
         assert!(
-            lines.contains(&format!(
-                "sudo dnf install {RELEASE_BASE}/innerwarden.aarch64.rpm"
-            )),
+            lines.contains("&& sudo dnf install \"$dir/innerwarden.aarch64.rpm\""),
             "{lines}"
         );
-        assert!(!lines.contains("innerwarden upgrade"), "{lines}");
+        assert!(
+            !lines.contains("dnf install https"),
+            "dnf checks no signature on a URL: {lines}"
+        );
 
         let unknown = upgrade_commands(&Managed::System(deb()), "riscv64").join("\n");
         assert!(!unknown.contains("innerwarden_riscv64.deb"), "{unknown}");
         assert!(unknown.contains("sudo apt install"), "{unknown}");
+        assert!(unknown.contains(".sha256"), "{unknown}");
+    }
+
+    /// A package is installed as root, maintainer scripts included. The
+    /// advice used to download it into the current directory (which may be
+    /// `/tmp`, where another account can swap it before the install) and to
+    /// run `dnf install <URL>`, with no check at all. Now every packaged
+    /// install is fetched into a fresh private directory, checked against the
+    /// release's checksum, and installed only if the check passed: ONE command
+    /// chained with `&&`, each line continued, so a failed check stops it.
+    ///
+    /// FAILS ON REVERT: the old commands fetch into `.` and never check.
+    #[test]
+    fn a_package_is_fetched_privately_and_checked_before_it_is_installed() {
+        for (owner, arch, file, install) in [
+            (deb(), "x86_64", "innerwarden_amd64.deb", "sudo apt install"),
+            (
+                deb(),
+                "aarch64",
+                "innerwarden_arm64.deb",
+                "sudo apt install",
+            ),
+            (
+                rpm(),
+                "x86_64",
+                "innerwarden.x86_64.rpm",
+                "sudo dnf install",
+            ),
+            (
+                rpm(),
+                "aarch64",
+                "innerwarden.aarch64.rpm",
+                "sudo dnf install",
+            ),
+        ] {
+            let lines = upgrade_commands(&Managed::System(owner), arch);
+            assert_eq!(lines[0], "dir=\"$(mktemp -d)\" \\", "{lines:?}");
+            let (last, rest) = lines.split_last().expect("lines");
+            assert!(
+                rest.iter().all(|line| line.ends_with(" \\")),
+                "one command: {lines:?}"
+            );
+            assert!(
+                lines[1..]
+                    .iter()
+                    .all(|line| line.trim_start().starts_with("&& ")),
+                "{lines:?}"
+            );
+            let check = lines
+                .iter()
+                .position(|line| line.contains(&format!("sha256sum -c {file}.sha256")))
+                .unwrap_or_else(|| panic!("no checksum check: {lines:?}"));
+            let fetch_sum = lines
+                .iter()
+                .position(|line| line.contains(&format!("{RELEASE_BASE}/{file}.sha256")))
+                .expect("the checksum is fetched");
+            assert!(fetch_sum < check, "{lines:?}");
+            assert_eq!(*last, format!("  && {install} \"$dir/{file}\""));
+            assert!(
+                !lines
+                    .iter()
+                    .any(|line| line.contains("-O ") || line.contains("-fsSLO")),
+                "nothing is saved into the current directory: {lines:?}"
+            );
+        }
+    }
+
+    /// The checksum each command checks is the sidecar the release workflow
+    /// writes beside the fixed-name copy, as `sha256sum -c` reads it: made in
+    /// the package directory, so it names the bare file.
+    ///
+    /// FAILS ON DRIFT: write the sidecars before the fixed-name copies, or
+    /// from outside `out`, and `sha256sum -c` finds no file to check.
+    #[test]
+    fn the_checksums_checked_are_the_ones_the_release_uploads() {
+        let workflow = include_str!("../../../.github/workflows/linux-packages.yml");
+        let copies = workflow
+            .find("cp \"$src\" \"$dst\"")
+            .expect("fixed-name copies");
+        let sums = workflow
+            .find("for f in *.deb *.rpm; do sha256sum \"$f\" > \"$f.sha256\"; done")
+            .expect("sidecars for every package file");
+        assert!(copies < sums, "the sidecars cover the fixed-name copies");
+        assert!(workflow[..sums]
+            .rfind("cd out")
+            .is_some_and(|cd| cd > copies));
+        assert!(workflow.contains("out/*.sha256"), "and they are uploaded");
     }
 
     /// The package files the advice names are the fixed-name copies the
@@ -1365,9 +1479,10 @@ mod tests {
             "{lines}"
         );
         assert!(
-            lines.contains("sudo apt install ./innerwarden_arm64.deb"),
+            lines.contains("&& sudo apt install \"$dir/innerwarden_arm64.deb\""),
             "{lines}"
         );
+        assert!(lines.contains(PACKAGE_NOTE), "{lines}");
         assert!(lines.contains("sudo innerwarden upgrade --yes"), "{lines}");
         assert!(!lines.contains("npm"), "nothing here is npm's: {lines}");
     }
