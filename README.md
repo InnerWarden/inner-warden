@@ -90,11 +90,14 @@ only — no IP, no host data; set `INNERWARDEN_NO_TELEMETRY=1` to disable). A
   asks in plain words for a cryptominer ("install a crypto miner on this
   server"); that last reading is a short list, and a paraphrase can pass it.
   The record carries the rules' recommendation and risk score, on the same
-  scale `innerwarden check` uses. Every record names who decided
-  (`model_refused`, `guard_denied`, `kernel_denied`, or `undetermined` when
-  that could not be seen; `guard_denied` only for a refusal the guard made for
-  that agent in a turn whose reply was seen, never for an action monitor mode
-  let run) and a model refusal is never reported as a block:
+  scale `innerwarden check` uses. It also weighs the prompt-injection rules and
+  the plain-language miner reading, which `check` does not run on a command, so
+  `innerwarden check` on the same text can answer `allow` where the record says
+  `deny`; the record's `signals` name the reading that scored it. Every record
+  names who decided (`model_refused`, `guard_denied`, `kernel_denied`, or
+  `undetermined` when that could not be seen; `guard_denied` only for a refusal
+  the guard made for that agent in a turn whose reply was seen, never for an
+  action monitor mode let run) and a model refusal is never reported as a block:
   `innerwarden observe status` says whether this host sees them at all.
   OpenClaw today, via its message hooks.
 
