@@ -86,3 +86,10 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+
+# `cfg(tarpaulin)` is set by cargo-tarpaulin while instrumenting. Declared so a
+# test that opts out of a coverage run (tests/burst_does_not_block.rs) does not
+# trip the unexpected-cfg lint, which `-D warnings` turns into a build failure
+# under `cargo clippy --all-targets`.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tarpaulin)'] }
