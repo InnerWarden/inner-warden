@@ -1058,6 +1058,7 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
                         record: &record,
                         guard_mode: &guard_mode,
                         observe_installed: crate::observe_io::installed(),
+                        observe_current: crate::observe_io::installed_hook_is_current(),
                         openclaw_present: crate::observe_io::openclaw_present(),
                         log: &log,
                     };

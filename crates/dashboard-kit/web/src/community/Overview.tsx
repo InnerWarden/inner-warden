@@ -264,15 +264,23 @@ function laneFooter(card: LaneCard, facts: FooterFacts): ReactNode {
       </p>
     );
   }
+  // A Messages card that records can still need a step: a message hook an
+  // earlier version wrote, which the CLI names with the command that fixes it.
+  if (card.lane === "agent_messages" && card.state === "available") {
+    return laneStep(readLaneNextStep(facts.overview.lanes, card.lane));
+  }
   if (card.state !== "no_source") return undefined;
   // The first run's steps sit above the cards; the card does not repeat them.
   if (card.lane === "agent_actions" && facts.nothingYet) {
     return <p className="text-sm leading-6 text-slate-600">Start with the steps above.</p>;
   }
-  const step = readLaneNextStep(facts.overview.lanes, card.lane);
+  return laneStep(readLaneNextStep(facts.overview.lanes, card.lane));
+}
+
+function laneStep(step: { command: string; line: string } | undefined): ReactNode {
   if (step === undefined) return undefined;
   return (
-    <div>
+    <div data-lane-step>
       <CopyCommand command={step.command} />
       <p className="mt-1.5 text-xs leading-5 text-slate-600">{step.line}</p>
     </div>

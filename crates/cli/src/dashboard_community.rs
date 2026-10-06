@@ -576,6 +576,11 @@ pub(crate) struct LaneFacts<'a> {
     /// has the guard in front of it.
     pub guard_mode: &'a str,
     pub observe_installed: bool,
+    /// The installed OpenClaw message hook is the one this binary ships.
+    /// `observe install` writes it once and an upgrade does not touch it, so
+    /// after an upgrade a host keeps running the old one until the operator
+    /// installs it again. True when no hook is installed.
+    pub observe_current: bool,
     /// An OpenClaw config is on this machine: `innerwarden observe install`
     /// has something to install into. Without one it exits 1 and changes
     /// nothing, so it is never offered.
@@ -769,6 +774,18 @@ fn agent_messages_lane(facts: &LaneFacts<'_>) -> Value {
                 ),
                 "at": rfc3339(latest.ts * 1_000),
                 "case_id": latest.id,
+            }),
+        );
+    }
+    // A hook an earlier version wrote keeps running after an upgrade, and
+    // this card's count is only as good as the hook feeding it: say so where
+    // the count is read, with the step that fixes it.
+    if facts.observe_installed && !facts.observe_current {
+        object.insert(
+            "next_step".into(),
+            json!({
+                "command": "innerwarden observe install",
+                "line": "The message hook on this machine is older than this version: Control UI chats are recorded only after 15 minutes, and without your agent's name. Install it again, then restart the OpenClaw gateway.",
             }),
         );
     }
@@ -2538,6 +2555,7 @@ mod tests {
             record,
             guard_mode: mode,
             observe_installed: false,
+            observe_current: true,
             openclaw_present: true,
             log,
         }
@@ -2563,6 +2581,39 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("OpenClaw"));
+    }
+
+    /// A hook an earlier version wrote keeps running after an upgrade, so
+    /// the Messages card read "nothing risky reached your agent" for a
+    /// Control UI ask for fifteen minutes, with nothing anywhere a customer
+    /// looks saying why. The card now carries the step.
+    ///
+    /// FAILS ON REVERT: drop the step and the out-of-date hook says nothing.
+    #[test]
+    fn an_out_of_date_message_hook_is_named_on_its_card() {
+        let g = Graph::new();
+        let tally = g.agent_actions_tally(0);
+        let record = g.record_span();
+        let log = EventLog::default();
+        let installed = |current: bool| {
+            lanes_json(&LaneFacts {
+                observe_installed: true,
+                observe_current: current,
+                ..lane_facts(&tally, &record, "monitor", &log)
+            })
+        };
+        let stale = installed(false);
+        assert_eq!(stale["agent_messages"]["availability"], "available");
+        assert_eq!(
+            stale["agent_messages"]["next_step"]["command"],
+            "innerwarden observe install"
+        );
+        let line = stale["agent_messages"]["next_step"]["line"]
+            .as_str()
+            .unwrap();
+        assert!(line.contains("restart the OpenClaw gateway"), "{line}");
+        assert!(line.chars().count() <= 300, "the page cuts a line past 300");
+        assert!(installed(true)["agent_messages"].get("next_step").is_none());
     }
 
     #[test]

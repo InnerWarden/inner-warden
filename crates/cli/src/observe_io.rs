@@ -586,9 +586,21 @@ fn pending_notice(path: &Path, read_error: Option<&str>) -> Option<String> {
 /// Whether the installed handler is the one this binary ships. `observe
 /// install` writes it once and an upgrade does not touch it, so a fix to the
 /// handler reaches a host only when the operator runs install again, and
-/// status is where that has to be said.
+/// status and the dashboard are where that has to be said.
 fn hook_is_current(installed_handler: Option<&str>) -> bool {
     installed_handler == Some(HOOK_HANDLER)
+}
+
+/// Whether the OpenClaw hook installed on this host, if any, is the one this
+/// binary ships. True when none is installed: there is nothing out of date.
+pub(crate) fn installed_hook_is_current() -> bool {
+    let Ok(home) = innerwarden_agent_guard::hook::home_dir() else {
+        return true;
+    };
+    match std::fs::read_to_string(hook_dir(&home).join("handler.js")) {
+        Ok(handler) => hook_is_current(Some(&handler)),
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    }
 }
 
 /// `innerwarden observe status` - can this host see a conversation attempt at

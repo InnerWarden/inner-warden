@@ -377,6 +377,37 @@ describe("the Overview", () => {
   });
 });
 
+describe("an out-of-date message hook", () => {
+  /**
+   * The hook an earlier version wrote keeps running after an upgrade. The
+   * CLI names it on the Messages card with the command that fixes it, and
+   * the card shows it while it still shows its count. FAILS ON REVERT: render
+   * a step on a no_source card only, and the step is gone.
+   */
+  it("shows the CLI's step on a Messages card that records", () => {
+    const lanes = overviewFixture.lanes;
+    answers.set("overview", {
+      ...overviewFixture,
+      lanes: {
+        ...lanes,
+        agent_messages: {
+          ...lanes.agent_messages,
+          next_step: { command: "innerwarden observe install", line: "The message hook on this machine is older than this version." },
+        },
+      },
+    });
+    const html = render(<CommunityOverview context={context()} />);
+    const card = html.slice(html.indexOf('data-lane="agent_messages"'), html.indexOf('data-lane="server_attacks"'));
+    expect(card).toContain("data-lane-step");
+    expect(commandBoxes(card).map((box) => box.text)).toContain("innerwarden observe install");
+    expect(textOf(card)).toContain("older than this version");
+    // Without the step the card shows none.
+    answers.set("overview", overviewFixture);
+    const plain = render(<CommunityOverview context={context()} />);
+    expect(plain).not.toContain("innerwarden observe install");
+  });
+});
+
 describe("the first run", () => {
   const ZERO = {
     ...overviewFixture,

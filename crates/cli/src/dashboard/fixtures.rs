@@ -501,6 +501,7 @@ pub(super) fn fixtures() -> Vec<(&'static str, Value)> {
         record: &span,
         guard_mode: "partial",
         observe_installed: true,
+        observe_current: true,
         openclaw_present: true,
         log: &log,
     };

@@ -365,6 +365,9 @@ pub fn cmd(rest: &[String]) -> ExitCode {
             for line in closing_advice(dashboard_is_serving()) {
                 println!("{line}");
             }
+            for line in observe_hook_advice(crate::observe_io::installed()) {
+                println!("{line}");
+            }
             ExitCode::SUCCESS
         }
         FetchOutcome::DownloadFailed(what) => fail(&format!("could not download the {what}")),
@@ -487,6 +490,29 @@ fn closing_advice(dashboard_running: bool) -> Vec<String> {
         "previous binary: replacing a file does not change a process already".into(),
         "running it. Restart the dashboard to serve this version.".into(),
         "  (Its page will say so too, until you do.)".into(),
+    ]
+}
+
+/// What to print after a successful replace when OpenClaw's message hook is
+/// installed.
+///
+/// `observe install` writes that hook once, and replacing the binary does not
+/// touch it, so the gateway keeps running the hook the previous version wrote:
+/// a fix to the hook reaches a host only when it is installed again. This
+/// process is the previous version and cannot tell whether the new one ships a
+/// different hook, so the step is given whenever one is installed, with the
+/// command that answers the question. The gateway is never restarted from
+/// here. Pure, because the wording is the part worth pinning.
+fn observe_hook_advice(hook_installed: bool) -> Vec<String> {
+    if !hook_installed {
+        return Vec::new();
+    }
+    vec![
+        String::new(),
+        "OpenClaw's message hook is still the one the previous version installed.".into(),
+        "To run this version's:  innerwarden observe install".into(),
+        "then restart the OpenClaw gateway. `innerwarden observe status` says".into(),
+        "whether the installed hook is current.".into(),
     ]
 }
 
@@ -922,7 +948,21 @@ mod installed_binary_tests {
 
 #[cfg(test)]
 mod closing_advice_tests {
-    use super::closing_advice;
+    use super::{closing_advice, observe_hook_advice};
+
+    /// An upgrade leaves OpenClaw's message hook as the previous version
+    /// wrote it, and nothing at the end of an upgrade said so: Control UI
+    /// chats went on being recorded only after fifteen minutes.
+    ///
+    /// FAILS ON REVERT: drop the advice and an installed hook gets no step.
+    #[test]
+    fn an_installed_message_hook_gets_the_step_to_update_it() {
+        assert!(observe_hook_advice(false).is_empty());
+        let advice = observe_hook_advice(true).join("\n");
+        assert!(advice.contains("innerwarden observe install"), "{advice}");
+        assert!(advice.contains("restart the OpenClaw gateway"), "{advice}");
+        assert!(advice.contains("observe status"), "{advice}");
+    }
 
     /// Nothing listening: the upgrade ends exactly as it always did. A notice
     /// about a dashboard that is not running would be noise, and noise in a
