@@ -266,6 +266,97 @@ fn proxy_guard_records_an_actual_block() {
     assert_eq!(command["attrs"]["outcome"], "blocked");
 }
 
+/// A monitor-only host records a loop as what it is, and nothing else. Four
+/// identical tool calls in a burst, then a different one: the fourth is a
+/// would-block for the loop breaker, the different call is a plain allow, and
+/// the guard event sink gets one line. The breaker used to stay tripped, so
+/// every later call on a monitor-only host became a would-block record and a
+/// guard event until the proxy restarted.
+#[cfg(unix)]
+#[test]
+fn proxy_monitor_only_records_a_loop_and_nothing_after_it() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let graph_path = dir.path().join("graph.json");
+    let call = |id: u32, location: &str| {
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": {"name": "weather", "arguments": {"location": location}}
+        })
+    };
+    let calls = [
+        call(1, "NYC"),
+        call(2, "NYC"),
+        call(3, "NYC"),
+        call(4, "NYC"),
+        call(5, "London"),
+    ];
+
+    let out = run_proxy_fixture("advisory", &graph_path, &calls);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for c in &calls {
+        assert!(
+            stdout.contains(&c.to_string()),
+            "monitor-only forwards every call, the loop included: {c}"
+        );
+    }
+
+    let graph: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&graph_path).unwrap()).unwrap();
+    let mut commands: Vec<&serde_json::Value> = graph["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|n| n["kind"] == "command")
+        .collect();
+    commands.sort_by_key(|n| {
+        n["attrs"]["seq"]
+            .as_str()
+            .and_then(|s| s.parse::<u64>().ok())
+            .expect("every command has a sequence number")
+    });
+    let recorded: Vec<(bool, &str)> = commands
+        .iter()
+        .map(|n| {
+            (
+                n["label"].as_str().unwrap().contains("London"),
+                n["attrs"]["outcome"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        recorded,
+        [
+            (false, "allowed"),
+            (false, "allowed"),
+            (false, "allowed"),
+            (false, "would_block"),
+            (true, "allowed"),
+        ],
+        "only the fast repeat is a would-block"
+    );
+    assert_eq!(commands[3]["attrs"]["rules"], "AG-ASI09-BREAKER");
+    assert_eq!(commands[3]["attrs"]["recommendation"], "deny");
+    assert!(commands[4]["attrs"]["rules"].is_null());
+
+    let events = std::fs::read_to_string(dir.path().join("guard-events.jsonl")).unwrap();
+    let blocked: Vec<&str> = events
+        .lines()
+        .filter(|l| l.contains("\"kind\":\"guard.blocked\""))
+        .collect();
+    assert_eq!(
+        blocked.len(),
+        1,
+        "one guard event, for the repeat: {events}"
+    );
+    assert!(blocked[0].contains("\"outcome\":\"would_block\""));
+    assert!(blocked[0].contains("NYC"), "{}", blocked[0]);
+}
+
 /// Feed a Claude Code PreToolUse payload on stdin and return the exit code.
 fn run_hook(payload: &str) -> Option<i32> {
     let mut child = cli()

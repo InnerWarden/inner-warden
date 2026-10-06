@@ -35,15 +35,12 @@ fn asi01_agent_goal_hijack_injection_is_detected() {
 fn asi02_tool_misuse_loop_amplification_trips_breaker() {
     // ASI02 Tool Misuse & Exploitation includes unsafe recursion / excessive
     // execution: a runaway identical-tool-call loop trips the circuit breaker.
-    let mut b = Breaker::new(BreakerConfig {
-        cost_ceiling_usd: 100.0,
-        max_identical_calls: 3,
-    });
-    for _ in 0..3 {
-        assert!(!b.record("search(same)", 0.0).is_tripped());
+    let mut b = Breaker::new(BreakerConfig::default());
+    for t in 0..3 {
+        assert!(!b.record("search(same)", t).is_tripped());
     }
     assert!(
-        b.record("search(same)", 0.0).is_tripped(),
+        b.record("search(same)", 3).is_tripped(),
         "ASI02: a runaway identical-call loop must trip the breaker",
     );
     assert_eq!(

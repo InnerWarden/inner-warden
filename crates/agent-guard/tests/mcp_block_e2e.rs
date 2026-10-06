@@ -171,3 +171,51 @@ fn a_block_does_not_break_the_rest_of_the_session() {
         "the session must survive a block and keep serving:\n{seen}"
     );
 }
+
+/// A loop is held only while it loops, and only that call. Four identical calls
+/// in a burst: the fourth never reaches the server and the client is told why,
+/// and a different call right after it still goes through. The breaker used to
+/// stay tripped for every later call, whatever it was, for the life of the
+/// proxy, so one loop took every tool away from the agent.
+#[test]
+fn guard_mode_refuses_a_fast_repeat_and_nothing_else() {
+    let repeated = "git status --short";
+    let different = "git log --oneline -5";
+    let requests = [
+        tool_call(11, repeated),
+        tool_call(12, repeated),
+        tool_call(13, repeated),
+        tool_call(14, repeated),
+        tool_call(15, different),
+    ];
+    let seen = run_through_proxy(&requests, ProxyMode::Guard);
+
+    let mut reached_the_server = Vec::new();
+    let mut refused = Vec::new();
+    for line in seen.lines() {
+        let reply: serde_json::Value =
+            serde_json::from_str(line).unwrap_or_else(|e| panic!("{e}: {line}"));
+        let id = reply["id"].as_u64().expect("every line answers an id");
+        if reply["method"] == "tools/call" {
+            reached_the_server.push(id);
+        } else if reply["result"]["isError"] == true {
+            refused.push((id, line.to_string()));
+        }
+    }
+    reached_the_server.sort_unstable();
+    assert_eq!(
+        reached_the_server,
+        [11, 12, 13, 15],
+        "only the fast repeat is held back:\n{seen}"
+    );
+    assert_eq!(refused.len(), 1, "{seen}");
+    assert_eq!(refused[0].0, 14);
+    assert!(
+        refused[0].1.contains("AG-ASI09-BREAKER")
+            && refused[0]
+                .1
+                .contains("already made 3 times in the last 60 s"),
+        "the refusal says it was the loop breaker and why: {}",
+        refused[0].1
+    );
+}

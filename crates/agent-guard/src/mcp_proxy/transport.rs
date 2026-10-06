@@ -158,8 +158,10 @@ enum ServerAction {
     },
 }
 
-/// Pure: classify a client→server line. Mutates the id→method map for requests
-/// and consults the session [`TaintTracker`] to escalate confused-deputy calls.
+/// Pure: classify a client→server line. Mutates the id→method map for requests,
+/// consults the session [`TaintTracker`] to escalate confused-deputy calls, and
+/// records each `tools/call` in the session loop breaker at `now_secs` (seconds
+/// since the proxy started, handed in so the decision never reads a clock).
 fn classify_client_line(
     line: &str,
     cfg: &ProxyConfig,
@@ -167,6 +169,7 @@ fn classify_client_line(
     map: &mut IdMethodMap,
     taint: &mut TaintTracker,
     breaker: &mut crate::breaker::Breaker,
+    now_secs: u64,
 ) -> ClientAction {
     match parse_line(line) {
         ParsedLine::Empty => ClientAction::Drop,
@@ -178,26 +181,28 @@ fn classify_client_line(
             let mut decision =
                 route_message(&env, Direction::ClientToServer, None, engine, Some(taint));
 
-            // ASI09 (Cost / Quota Abuse): a hijacked or looping agent hammering
-            // the SAME tool call every iteration is a runaway retry storm. Record
-            // each `tools/call` against the per-session circuit breaker. A trip is
-            // a deny *recommendation* that still goes through `apply_mode`: monitor
-            // modes must remain transparent, while guard/kill may stop the call.
-            // (The cost-ceiling half lives at the LLM gateway; the proxy sees the
-            // loop symptom.)
+            // Loop breaker: a hijacked or looping agent hammering the SAME tool
+            // call is a runaway retry storm. Each `tools/call` is recorded in the
+            // session breaker, which is windowed and per call (see
+            // `crate::breaker`). A trip is one more deny *recommendation* that
+            // still goes through `apply_mode`: monitor modes stay transparent,
+            // guard/kill may stop the call. It is ADDED to the call's verdict,
+            // never put in its place: the call's own findings (a credential, a
+            // tainted token) stay in the record and the denial.
             if env.method.as_deref() == Some("tools/call") {
                 let sig = tool_call_signature(&env);
                 if let crate::breaker::BreakerVerdict::Tripped { reason } =
-                    breaker.record(&sig, 0.0)
+                    breaker.record(&sig, now_secs)
                 {
-                    decision.verdict = crate::mcp::Verdict {
-                        allowed: false,
-                        alerts: vec![crate::mcp::VerdictAlert::builtin(
+                    decision.verdict.allowed = false;
+                    decision
+                        .verdict
+                        .alerts
+                        .push(crate::mcp::VerdictAlert::builtin(
                             "AG-ASI09-BREAKER",
-                            format!("cost/quota breaker tripped: {reason}"),
+                            reason,
                             true,
-                        )],
-                    };
+                        ));
                 }
             }
             let is_tool_call = decision.direction == Direction::ClientToServer.label()
@@ -226,9 +231,10 @@ fn classify_client_line(
     }
 }
 
-/// Signature for the ASI09 loop guard: the tool name plus its arguments, so an
+/// Signature for the loop breaker: the tool name plus its arguments, so an
 /// agent re-issuing the IDENTICAL call collides (a retry storm) while distinct
 /// calls stay separate. Arguments are stringified stably enough for equality.
+/// The breaker hashes it and keeps only the hash; the string is dropped here.
 fn tool_call_signature(env: &super::jsonrpc::JsonRpcEnvelope) -> String {
     let params = env.params.as_ref();
     let name = params
@@ -352,8 +358,10 @@ where
     // Per-connection session state for confused-deputy detection: tool results
     // record their long tokens; a later call reusing one is escalated.
     let mut taint = TaintTracker::new();
-    // ASI09 loop/quota guard for this session (see classify_client_line).
+    // Loop breaker for this session (see classify_client_line), on a monotonic
+    // clock that starts with the proxy.
     let mut breaker = crate::breaker::Breaker::new(crate::breaker::BreakerConfig::default());
+    let started = std::time::Instant::now();
     let mut err_open = true;
 
     loop {
@@ -367,7 +375,8 @@ where
                         child_stdin = None;
                     }
                     Some(line) => {
-                        match classify_client_line(&line, &cfg, engine, &mut map, &mut taint, &mut breaker) {
+                        let now_secs = started.elapsed().as_secs();
+                        match classify_client_line(&line, &cfg, engine, &mut map, &mut taint, &mut breaker, now_secs) {
                             ClientAction::Drop => {}
                             ClientAction::Forward { raw, event } => {
                                 if let Some(ci) = child_stdin.as_mut() {
@@ -494,7 +503,8 @@ mod tests {
                 None,
                 &mut m,
                 &mut TaintTracker::new(),
-                &mut crate::breaker::Breaker::new(crate::breaker::BreakerConfig::default())
+                &mut crate::breaker::Breaker::new(crate::breaker::BreakerConfig::default()),
+                0,
             ),
             ClientAction::Drop
         ));
@@ -510,7 +520,8 @@ mod tests {
                 None,
                 &mut m,
                 &mut TaintTracker::new(),
-                &mut crate::breaker::Breaker::new(crate::breaker::BreakerConfig::default())
+                &mut crate::breaker::Breaker::new(crate::breaker::BreakerConfig::default()),
+                0,
             ),
             ClientAction::Forward { event: None, .. }
         ));
@@ -521,7 +532,8 @@ mod tests {
                 None,
                 &mut m,
                 &mut TaintTracker::new(),
-                &mut crate::breaker::Breaker::new(crate::breaker::BreakerConfig::default())
+                &mut crate::breaker::Breaker::new(crate::breaker::BreakerConfig::default()),
+                0,
             ),
             ClientAction::Forward {
                 event: Some(ProxyDecision {
@@ -548,6 +560,7 @@ mod tests {
             &mut m,
             &mut TaintTracker::new(),
             &mut crate::breaker::Breaker::new(crate::breaker::BreakerConfig::default()),
+            0,
         ) {
             ClientAction::Forward { event: Some(d), .. } => {
                 assert!(d.verdict.alerts.iter().any(|a| a.rule == "AG-CRED"));
@@ -566,6 +579,7 @@ mod tests {
             &mut m,
             &mut TaintTracker::new(),
             &mut crate::breaker::Breaker::new(crate::breaker::BreakerConfig::default()),
+            0,
         ) {
             ClientAction::Deny { denial, kill, .. } => {
                 assert!(!kill);
@@ -591,10 +605,40 @@ mod tests {
             &mut m,
             &mut TaintTracker::new(),
             &mut crate::breaker::Breaker::new(crate::breaker::BreakerConfig::default()),
+            0,
         ) {
             ClientAction::Deny { kill, .. } => assert!(kill),
             other => panic!("expected Deny+kill, got {other:?}"),
         }
+    }
+
+    /// One `tools/call` per id, same tool and arguments as [`CLEAN`] unless
+    /// `location` differs.
+    fn weather_call(id: u32, location: &str) -> String {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"weather","arguments":{{"location":"{location}"}}}}}}"#
+        )
+    }
+
+    /// The decision a `tools/call` produced, whether it was forwarded or denied.
+    fn decision_of(action: ClientAction) -> (bool, ProxyDecision) {
+        match action {
+            ClientAction::Forward {
+                event: Some(decision),
+                ..
+            } => (false, decision),
+            ClientAction::Deny { decision, .. } => (true, decision),
+            other => panic!("a tools/call must produce a decision, got {other:?}"),
+        }
+    }
+
+    fn rules(decision: &ProxyDecision) -> Vec<&str> {
+        decision
+            .verdict
+            .alerts
+            .iter()
+            .map(|a| a.rule.as_str())
+            .collect()
     }
 
     #[test]
@@ -604,29 +648,24 @@ mod tests {
             let mut taint = TaintTracker::new();
             let mut breaker =
                 crate::breaker::Breaker::new(crate::breaker::BreakerConfig::default());
-            for attempt in 1..=5 {
-                match classify_client_line(
+            for attempt in 1..=5u64 {
+                let action = classify_client_line(
                     CLEAN,
                     &cfg(mode),
                     None,
                     &mut map,
                     &mut taint,
                     &mut breaker,
-                ) {
-                    ClientAction::Forward {
-                        event: Some(decision),
-                        ..
-                    } => {
-                        if attempt >= 4 {
-                            assert!(!decision.verdict.allowed);
-                            assert!(decision
-                                .verdict
-                                .alerts
-                                .iter()
-                                .any(|a| a.rule == "AG-ASI09-BREAKER"));
-                        }
-                    }
-                    other => panic!("{mode:?} must forward breaker trips, got {other:?}"),
+                    attempt,
+                );
+                let (denied, decision) = decision_of(action);
+                assert!(!denied, "{mode:?} must forward breaker trips");
+                if attempt >= 4 {
+                    assert!(!decision.verdict.allowed);
+                    assert_eq!(rules(&decision), ["AG-ASI09-BREAKER"]);
+                } else {
+                    assert!(decision.verdict.allowed);
+                    assert!(rules(&decision).is_empty());
                 }
             }
         }
@@ -637,7 +676,7 @@ mod tests {
         let mut map = IdMethodMap::new();
         let mut taint = TaintTracker::new();
         let mut breaker = crate::breaker::Breaker::new(crate::breaker::BreakerConfig::default());
-        for _ in 0..3 {
+        for t in 0..3 {
             assert!(matches!(
                 classify_client_line(
                     CLEAN,
@@ -646,6 +685,7 @@ mod tests {
                     &mut map,
                     &mut taint,
                     &mut breaker,
+                    t,
                 ),
                 ClientAction::Forward { .. }
             ));
@@ -657,13 +697,105 @@ mod tests {
             &mut map,
             &mut taint,
             &mut breaker,
+            3,
         ) {
-            ClientAction::Deny { decision, .. } => assert!(decision
-                .verdict
-                .alerts
-                .iter()
-                .any(|a| a.rule == "AG-ASI09-BREAKER")),
+            ClientAction::Deny {
+                denial, decision, ..
+            } => {
+                assert_eq!(rules(&decision), ["AG-ASI09-BREAKER"]);
+                assert!(
+                    denial.contains("already made 3 times in the last 60 s"),
+                    "the agent is told why: {denial}"
+                );
+            }
             other => panic!("guard must block the fourth identical call, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_breaker_trip_never_refuses_a_different_call_and_ends_with_its_window() {
+        // The sticky breaker refused (guard) or flagged (monitor) EVERY later
+        // call once one loop had tripped it, so a monitor-only host filled
+        // with false would-block records until the proxy restarted.
+        for mode in [ProxyMode::Advisory, ProxyMode::Guard] {
+            let mut map = IdMethodMap::new();
+            let mut taint = TaintTracker::new();
+            let mut breaker =
+                crate::breaker::Breaker::new(crate::breaker::BreakerConfig::default());
+            let mut classify = |line: &str, now: u64| {
+                decision_of(classify_client_line(
+                    line,
+                    &cfg(mode),
+                    None,
+                    &mut map,
+                    &mut taint,
+                    &mut breaker,
+                    now,
+                ))
+            };
+            for t in 0..3 {
+                assert!(classify(&weather_call(1, "NYC"), t).1.verdict.allowed);
+            }
+            let (denied, looped) = classify(&weather_call(4, "NYC"), 3);
+            assert_eq!(denied, mode.blocks(), "{mode:?}");
+            assert_eq!(rules(&looped), ["AG-ASI09-BREAKER"], "{mode:?}");
+
+            let (denied, other) = classify(&weather_call(5, "London"), 4);
+            assert!(!denied, "{mode:?}: a different call was refused");
+            assert!(other.verdict.allowed, "{mode:?}: {:?}", rules(&other));
+            assert!(rules(&other).is_empty(), "{mode:?}: {:?}", rules(&other));
+
+            let (denied, later) = classify(&weather_call(6, "NYC"), 64);
+            assert!(!denied, "{mode:?}: the loop stayed shut past its window");
+            assert!(later.verdict.allowed, "{mode:?}: {:?}", rules(&later));
+        }
+    }
+
+    #[test]
+    fn the_breaker_keeps_the_calls_own_findings() {
+        // A trip used to REPLACE the verdict, so a looping credential leak was
+        // recorded and refused as a loop only, and the credential finding was
+        // gone from the record.
+        for mode in [ProxyMode::Advisory, ProxyMode::Guard] {
+            let mut map = IdMethodMap::new();
+            let mut taint = TaintTracker::new();
+            let mut breaker =
+                crate::breaker::Breaker::new(crate::breaker::BreakerConfig::default());
+            for t in 0..3 {
+                let (_, decision) = decision_of(classify_client_line(
+                    CREDS,
+                    &cfg(mode),
+                    None,
+                    &mut map,
+                    &mut taint,
+                    &mut breaker,
+                    t,
+                ));
+                assert_eq!(rules(&decision), ["AG-CRED"], "{mode:?}");
+            }
+            let action = classify_client_line(
+                CREDS,
+                &cfg(mode),
+                None,
+                &mut map,
+                &mut taint,
+                &mut breaker,
+                3,
+            );
+            if let ClientAction::Deny { denial, .. } = &action {
+                assert!(
+                    denial.contains("AG-CRED"),
+                    "the denial names the call's own finding first: {denial}"
+                );
+            }
+            let (denied, decision) = decision_of(action);
+            assert_eq!(denied, mode.blocks(), "{mode:?}");
+            assert!(!decision.verdict.allowed);
+            assert_eq!(
+                rules(&decision),
+                ["AG-CRED", "AG-ASI09-BREAKER"],
+                "{mode:?}"
+            );
         }
     }
 
