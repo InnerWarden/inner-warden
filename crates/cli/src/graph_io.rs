@@ -750,16 +750,32 @@ pub(crate) fn append_guard_event_at(dir: &std::path::Path, line: &Value) {
     // that uid had pointed at a root-owned file would have been root writing a
     // line of its choosing there. `harden` refuses a symbolic link at open; a
     // HARD link opens fine and is only visible in the link count.
+    //
+    // A refused or failed append is said on stderr, and the condition behind
+    // it is what `record_health::report_at` reports as an outage, so the
+    // dashboard and `innerwarden graph` show the sink as not recording rather
+    // than as a quiet, healthy host.
     let mut options = std::fs::OpenOptions::new();
     options.create(true).append(true);
     innerwarden_safe_io::harden(&mut options);
-    if let Ok(mut file) = options.open(&path) {
-        if file
-            .metadata()
-            .is_ok_and(|metadata| innerwarden_safe_io::is_regular_file_with_one_name(&metadata))
-        {
-            let _ = file.write_all(record.as_bytes());
-        }
+    let refused = match options.open(&path) {
+        Ok(mut file) => match file.metadata() {
+            Ok(metadata) => match crate::record_health::refusal(&metadata) {
+                Some(why) => Some(crate::record_health::refusal_words(why).to_string()),
+                None => file
+                    .write_all(record.as_bytes())
+                    .err()
+                    .map(|e| format!("could not be written ({})", e.kind())),
+            },
+            Err(error) => Some(format!("could not be read ({})", error.kind())),
+        },
+        Err(error) => Some(format!("could not be opened ({})", error.kind())),
+    };
+    if let Some(why) = refused {
+        eprintln!(
+            "innerwarden: a guard event was not recorded: guard-events.jsonl {why}. \
+             `innerwarden graph --stats` says what to do."
+        );
     }
 }
 
