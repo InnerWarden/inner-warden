@@ -370,12 +370,15 @@ pub(crate) fn parse_event_log(text: &str) -> EventLog {
 }
 
 /// A message's outcome key, from who decided. A model that declined is the
-/// agent's own doing; only a control that refused is InnerWarden's.
+/// agent's own doing; only a control that refused is InnerWarden's. Anything
+/// else is an outcome that could not be seen (`not_seen`), never "not
+/// recorded": a chat that does not report the agent's reply is a limit of the
+/// channel, not a fault in the record.
 fn attempt_outcome(attempt: &Attempt) -> &'static str {
     match attempt.decider.as_str() {
         "model_refused" => "declined_by_agent",
         "guard_denied" | "kernel_denied" if attempt.enforced => "stopped_by_innerwarden",
-        _ => "unplaced",
+        _ => "not_seen",
     }
 }
 
@@ -595,6 +598,7 @@ pub(crate) fn part_label(key: &str) -> &'static str {
         "stopped_by_innerwarden" => "Stopped by InnerWarden",
         "declined_by_agent" => "Declined by your agent",
         "answered" => "Answered",
+        "not_seen" => "Outcome not seen",
         _ => "Outcome not recorded",
     }
 }
@@ -721,7 +725,7 @@ fn agent_messages_lane(facts: &LaneFacts<'_>) -> Value {
         .filter(|attempt| attempt.ts >= window_start)
         .collect();
     let mut parts: Vec<(&'static str, usize)> = Vec::new();
-    for key in ["stopped_by_innerwarden", "declined_by_agent", "unplaced"] {
+    for key in ["stopped_by_innerwarden", "declined_by_agent", "not_seen"] {
         let count = recent
             .iter()
             .filter(|attempt| attempt_outcome(attempt) == key)
@@ -2577,6 +2581,7 @@ mod tests {
             ("stopped_by_innerwarden", "Stopped by InnerWarden"),
             ("declined_by_agent", "Declined by your agent"),
             ("answered", "Answered"),
+            ("not_seen", "Outcome not seen"),
         ] {
             assert_eq!(part_label(key), words);
         }
@@ -2592,6 +2597,7 @@ mod tests {
             "stopped_by_innerwarden",
             "declined_by_agent",
             "answered",
+            "not_seen",
         ] {
             let line = format!("  {key}: \"{}\",", part_label(key));
             assert!(words.contains(&line), "words.ts has no `{line}`");
@@ -2734,6 +2740,29 @@ mod tests {
             .starts_with("Someone on Telegram"));
         // The sender stays out of the lane.
         assert!(!lanes.to_string().contains("12345"));
+
+        // A message whose outcome could not be seen is counted as NOT SEEN,
+        // never "not recorded", which reads as a recording fault when it is a
+        // limit of the chat. FAILS ON REVERT: key it `unplaced` again and the
+        // card reads "Outcome not recorded".
+        let unseen = EventLog {
+            attempts: vec![Attempt {
+                ts: NOW / 1_000 - 3_600,
+                decider: "undetermined".into(),
+                basis: "channel_reports_no_reply".into(),
+                ..stale.attempts[0].clone()
+            }],
+            ..stale.clone()
+        };
+        let lanes = lanes_json(&lane_facts(&tally, &record, "monitor", &unseen));
+        assert_eq!(
+            lanes["agent_messages"]["breakdown"][0],
+            json!({"key": "not_seen", "count": 1, "label": "Outcome not seen"})
+        );
+        assert_eq!(
+            attempts_json(&unseen, None, 10).unwrap()["items"][0]["outcome_key"],
+            "not_seen"
+        );
     }
 
     #[test]

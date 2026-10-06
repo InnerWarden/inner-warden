@@ -38,6 +38,9 @@ const OUTCOME_TONES: Record<string, OutcomeTone> = {
   declined_by_agent: { tone: "watch" },
   filtered_by_provider: { tone: "other" },
   answered: { tone: "watchLight" },
+  // A message whose outcome the record could not see (Community): hatched
+  // like any outcome nobody could place.
+  not_seen: { tone: "other", hatched: true },
   // A case's own outcome (`SecurityOutcome`), in the same jobs: InnerWarden
   // blocking it is the accent, the kernel refusing it before it ran the
   // lighter accent (never rose: nothing bad happened), only watched or let
