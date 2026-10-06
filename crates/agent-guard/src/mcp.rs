@@ -122,6 +122,10 @@ pub fn inspect_tool_call(
         ));
     }
 
+    if let Some(alert) = privileged_write_alert(tool_name, args) {
+        alerts.push(alert);
+    }
+
     // Lowercase the (possibly large) args once, not once per IOC.
     let args_lower = args_str.to_lowercase();
     for ioc in threats::SUPPLY_CHAIN_IOCS {
@@ -198,6 +202,94 @@ fn shell_command_argument<'a>(tool_name: &str, args: &'a serde_json::Value) -> O
     ["command", "cmd", "script"]
         .iter()
         .find_map(|key| object.get(*key).and_then(serde_json::Value::as_str))
+}
+
+/// The tools of the reference MCP filesystem server that only read inside its
+/// allowed directories (annotated `readOnlyHint: true, openWorldHint: false`):
+/// the listing tools plus the file readers. The only calls a listing token may
+/// flow into without an alert (see [`crate::mcp_proxy::taint`]), and the only
+/// calls that may name a privileged file without being taken for a change to
+/// it (see [`privileged_write_alert`]).
+pub(crate) const READ_ONLY_TOOLS: &[&str] = &[
+    "read_file",
+    "read_text_file",
+    "read_media_file",
+    "read_multiple_files",
+    "get_file_info",
+    "list_directory",
+    "list_directory_with_sizes",
+    "directory_tree",
+    "search_files",
+    "list_allowed_directories",
+];
+
+/// Arguments that carry what is written rather than where: `write_file`'s
+/// `content`, `edit_file`'s `oldText` / `newText`, and the same values under
+/// the names other file-editing tools give them. A string under one of these
+/// is file content, so a one-line file that holds a path (`/usr/lib/jvm/...`)
+/// is not taken for a write to that path.
+const CONTENT_ARGS: &[&str] = &[
+    "content",
+    "text",
+    "oldText",
+    "newText",
+    "old_text",
+    "new_text",
+    "old_str",
+    "new_str",
+    "old_string",
+    "new_string",
+    "file_text",
+];
+
+/// Refuse a tool call that would change a file granting privilege or a login,
+/// or holding code that runs as root (`AG-PRIV-WRITE`).
+///
+/// Judged on the target, not on the tool's name: every absolute path the call
+/// names, as a value or as a key, at any depth, outside [`CONTENT_ARGS`], is
+/// resolved and looked up with [`threats::privileged_write_target`]. So
+/// `write_file`, `edit_file`, `move_file` (either end), `create_directory` and
+/// any other server's tool are held to the same files, however the path is
+/// spelled. Only the reference filesystem server's [`READ_ONLY_TOOLS`] may name
+/// such a file, since they cannot change it.
+///
+/// Before this, ATR-2026-040 refused `write_file` by name, which refused every
+/// ordinary write and let the same server's `edit_file` and `move_file` change
+/// `/etc//sudoers` or `/etc/cron.d/x` unchallenged.
+fn privileged_write_alert(tool_name: &str, args: &serde_json::Value) -> Option<VerdictAlert> {
+    if READ_ONLY_TOOLS.contains(&tool_name) {
+        return None;
+    }
+    let mut pending = vec![args];
+    while let Some(value) = pending.pop() {
+        let found = match value {
+            serde_json::Value::String(s) => threats::privileged_write_target(s),
+            serde_json::Value::Array(items) => {
+                pending.extend(items);
+                None
+            }
+            serde_json::Value::Object(map) => map.iter().find_map(|(key, value)| {
+                if !(value.is_string() && CONTENT_ARGS.contains(&key.as_str())) {
+                    pending.push(value);
+                }
+                threats::privileged_write_target(key)
+            }),
+            _ => None,
+        };
+        if let Some((what, path)) = found {
+            let shown: String = crate::redact::redact_secrets(&path)
+                .text
+                .chars()
+                .take(160)
+                .collect();
+            return Some(VerdictAlert::builtin(
+                "AG-PRIV-WRITE",
+                format!("may change `{shown}`, part of {what}"),
+                true,
+            ));
+        }
+    }
+    None
 }
 
 /// Inspect direct LLM/user input on the correct surface. This is deliberately
@@ -1485,6 +1577,202 @@ mod tests {
             ".env read must be review, not a hard block: {:?}",
             env.alerts
         );
+    }
+
+    fn priv_write(v: &Verdict) -> Option<&VerdictAlert> {
+        v.alerts.iter().find(|a| a.rule == "AG-PRIV-WRITE")
+    }
+
+    /// REGRESSION ANCHOR, from a live run against the reference MCP filesystem
+    /// server (2026.8.31) behind the proxy in guard mode.
+    ///
+    /// ATR-2026-040 matched the tool NAME `write_file`, at critical severity,
+    /// so every write through the server was refused, an ordinary one inside
+    /// its allowed directories included. The shipped rules, as the proxy loads
+    /// them, must let an ordinary write through under every name it arrives
+    /// with, and raise nothing at all about it.
+    ///
+    /// FAILS ON REVERT: put `write_file` back in the rule's tool-name condition
+    /// and the first call is refused with ATR-2026-040.
+    #[test]
+    fn an_ordinary_file_write_passes_the_shipped_rules() {
+        let engine = RuleEngine::load_embedded();
+        let file = "/home/dev/project/src/main.rs";
+        for (tool, args) in [
+            (
+                "write_file",
+                serde_json::json!({"path": file, "content": "fn main() {}\n"}),
+            ),
+            (
+                "mcp__filesystem__write_file",
+                serde_json::json!({"path": file, "content": "fn main() {}\n"}),
+            ),
+            (
+                "edit_file",
+                serde_json::json!({"path": file, "edits": [{"oldText": "main", "newText": "start"}]}),
+            ),
+            (
+                "move_file",
+                serde_json::json!({"source": file, "destination": "/home/dev/project/src/lib.rs"}),
+            ),
+            (
+                "create_directory",
+                serde_json::json!({"path": "/home/dev/project/src/bin"}),
+            ),
+        ] {
+            let v = inspect_tool_call(tool, &args, Some(&engine));
+            assert!(
+                v.allowed && v.alerts.is_empty(),
+                "{tool} {args} was flagged: {:?}",
+                v.alerts
+            );
+        }
+    }
+
+    /// What the tool-name match stood in for, judged on the target instead:
+    /// a call that would change a file granting privilege or a login is
+    /// refused, whichever tool makes it and however the path is spelled. The
+    /// raw-text conditions of ATR-2026-040 miss `/etc//sudoers`, and they
+    /// never covered cron, the dynamic linker, PAM or `/etc/group`; the name
+    /// match had refused those for `write_file` only, and `edit_file` /
+    /// `move_file` reached them unchallenged.
+    ///
+    /// Checked with no rule engine, so the refusal is this check's own and no
+    /// ATR rule is standing in for it.
+    ///
+    /// FAILS ON REVERT: drop the `privileged_write_alert` call and every one
+    /// of these is allowed.
+    #[test]
+    fn a_change_to_a_privileged_file_is_refused_by_any_tool_in_any_spelling() {
+        let cases = [
+            (
+                "write_file",
+                serde_json::json!({"path": "/etc//sudoers", "content": "agent ALL=(ALL) NOPASSWD: ALL"}),
+                "/etc/sudoers",
+            ),
+            (
+                "write_file",
+                serde_json::json!({"path": "/etc/./sudoers.d/agent", "content": "x"}),
+                "/etc/sudoers.d/agent",
+            ),
+            (
+                "write_file",
+                serde_json::json!({"path": "/tmp/../etc/ld.so.preload", "content": "/dev/shm/x.so"}),
+                "/etc/ld.so.preload",
+            ),
+            (
+                "write_file",
+                serde_json::json!({"path": "/etc/cron.d/agent", "content": "* * * * * root /tmp/x"}),
+                "/etc/cron.d/agent",
+            ),
+            (
+                "write_file",
+                serde_json::json!({"path": "/etc/group", "content": "sudo:x:27:agent"}),
+                "/etc/group",
+            ),
+            (
+                "edit_file",
+                serde_json::json!({"path": "/etc/./sudoers", "edits": [{"oldText": "a", "newText": "b"}]}),
+                "/etc/sudoers",
+            ),
+            (
+                "edit_file",
+                serde_json::json!({"path": "/etc/pam.d/sudo", "edits": [{"oldText": "required", "newText": "sufficient"}]}),
+                "/etc/pam.d/sudo",
+            ),
+            (
+                "move_file",
+                serde_json::json!({"source": "/home/dev/x", "destination": "/private/etc/sudoers.d/agent"}),
+                "/etc/sudoers.d/agent",
+            ),
+            (
+                "move_file",
+                serde_json::json!({"source": "/etc/sudoers.d/deny-agent", "destination": "/home/dev/x"}),
+                "/etc/sudoers.d/deny-agent",
+            ),
+            (
+                "create_directory",
+                serde_json::json!({"path": "/etc/systemd/system/agent.service.d"}),
+                "/etc/systemd/system/agent.service.d",
+            ),
+            (
+                "save",
+                serde_json::json!({"target": {"file": "file:///root/.ssh/authorized_keys"}}),
+                "/root/.ssh/authorized_keys",
+            ),
+            (
+                "write_files",
+                serde_json::json!({"files": {"/etc/cron.d/agent": "* * * * * root id"}}),
+                "/etc/cron.d/agent",
+            ),
+            (
+                "write_files",
+                serde_json::json!({"paths": ["/home/dev/ok", "/usr/bin/sudo"]}),
+                "/usr/bin/sudo",
+            ),
+        ];
+        for (tool, args, file) in cases {
+            let v = inspect_tool_call(tool, &args, None);
+            assert!(!v.allowed, "{tool} {args} was allowed: {:?}", v.alerts);
+            let alert = priv_write(&v).unwrap_or_else(|| panic!("{tool} {args}: {:?}", v.alerts));
+            assert!(alert.block, "{tool} {args}");
+            assert!(
+                alert
+                    .detail
+                    .starts_with(&format!("may change `{file}`, part of ")),
+                "{tool} {args}: {}",
+                alert.detail
+            );
+        }
+    }
+
+    /// The reference server's read-only tools only read, so naming a
+    /// privileged file is not a change to it: a debugging agent reading a PAM
+    /// stack or listing the cron directory is not refused for it.
+    #[test]
+    fn a_read_only_tool_may_name_a_privileged_file() {
+        for (tool, args) in [
+            (
+                "read_text_file",
+                serde_json::json!({"path": "/etc/pam.d/sudo"}),
+            ),
+            (
+                "read_multiple_files",
+                serde_json::json!({"paths": ["/etc/cron.d/backup", "/etc/systemd/system/app.service"]}),
+            ),
+            (
+                "get_file_info",
+                serde_json::json!({"path": "/etc/ld.so.preload"}),
+            ),
+            ("list_directory", serde_json::json!({"path": "/etc/cron.d"})),
+        ] {
+            let v = inspect_tool_call(tool, &args, None);
+            assert!(priv_write(&v).is_none(), "{tool} {args}: {:?}", v.alerts);
+        }
+    }
+
+    /// What is written is not where it is written. A one-line file that holds
+    /// a system path, or an edit whose text is one, changes the file named by
+    /// `path` and nothing else. A path given as a key is still a target.
+    #[test]
+    fn a_path_inside_written_content_is_not_a_target() {
+        for (tool, args) in [
+            (
+                "write_file",
+                serde_json::json!({"path": "/home/dev/.java-home", "content": "/usr/lib/jvm/java-17"}),
+            ),
+            (
+                "edit_file",
+                serde_json::json!({"path": "/home/dev/notes.md", "edits": [{"oldText": "/etc/sudoers", "newText": "/etc/sudoers.d/app"}]}),
+            ),
+        ] {
+            let v = inspect_tool_call(tool, &args, None);
+            assert!(
+                v.allowed && priv_write(&v).is_none(),
+                "{tool} {args}: {:?}",
+                v.alerts
+            );
+        }
     }
 
     #[test]

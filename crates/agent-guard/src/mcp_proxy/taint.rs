@@ -104,7 +104,7 @@ use std::hash::BuildHasher;
 
 use serde_json::Value;
 
-use crate::mcp::VerdictAlert;
+use crate::mcp::{VerdictAlert, READ_ONLY_TOOLS};
 
 /// Minimum token length (in bytes) to track. Below this, a token is a common
 /// short word that would false-positive; at/above it, it is almost always a
@@ -142,23 +142,6 @@ const NO_SLOT: u32 = u32::MAX;
 /// a list of names (entries, matches, allowed directories) rather than file
 /// contents.
 const LISTING_TOOLS: &[&str] = &[
-    "list_directory",
-    "list_directory_with_sizes",
-    "directory_tree",
-    "search_files",
-    "list_allowed_directories",
-];
-
-/// The tools of the reference MCP filesystem server that only read inside its
-/// allowed directories (annotated `readOnlyHint: true, openWorldHint: false`):
-/// the listing tools plus the file readers. The only calls a listing token may
-/// flow into without an alert.
-const READ_ONLY_TOOLS: &[&str] = &[
-    "read_file",
-    "read_text_file",
-    "read_media_file",
-    "read_multiple_files",
-    "get_file_info",
     "list_directory",
     "list_directory_with_sizes",
     "directory_tree",

@@ -3915,6 +3915,263 @@ fn is_sensitive_download_target(target: &str) -> bool {
         .any(|profile| target == *profile || target.ends_with(&format!("/{profile}")))
 }
 
+/// One location in [`PRIVILEGED_WRITE_TARGETS`], in the lowercase form
+/// [`privileged_write_target`] compares against.
+#[derive(Clone, Copy)]
+enum Place {
+    /// This file.
+    File(&'static str),
+    /// This directory and everything under it.
+    Tree(&'static str),
+    /// Any path with a component of this name, wherever it is: a `.ssh`
+    /// directory is the same thing in every home.
+    Component(&'static str),
+}
+
+impl Place {
+    fn holds(self, path: &str) -> bool {
+        match self {
+            Place::File(file) => path == file,
+            Place::Tree(dir) => path
+                .strip_prefix(dir)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('/')),
+            Place::Component(name) => path.split('/').any(|part| part == name),
+        }
+    }
+}
+
+/// The files whose change hands over privilege or a login: each decides who
+/// may log in or act as root, or holds code that runs as root or inside every
+/// program. In MITRE ATT&CK terms: sudo and doas rules (T1548.003), accounts
+/// and groups (T1098), login authentication (T1556.003), SSH keys (T1098.004),
+/// the dynamic linker (T1574.006), scheduled jobs (T1053.003), boot and login
+/// services (T1543, T1037), kernel modules (T1547.006) and the programs root
+/// runs (T1574). It holds every file the shell analyzer refuses to see
+/// overwritten ([`is_authentication_write_target`]).
+///
+/// Written by an agent's tool, any of them hands the agent, or whoever steered
+/// it, more than the agent was given. A change to the agent's own shell
+/// startup files or to a project's `.git/hooks` runs code as the agent's own
+/// account, not as anyone more, and is not here.
+///
+/// First match wins, so a specific place sits ahead of the tree that holds it
+/// (`/usr/lib/systemd/system` before `/usr/lib`).
+const PRIVILEGED_WRITE_TARGETS: &[(&str, &[Place])] = &[
+    (
+        "the sudo rules, which decide who may run commands as root",
+        &[
+            Place::File("/etc/sudoers"),
+            Place::Tree("/etc/sudoers.d"),
+            Place::File("/etc/sudo.conf"),
+            Place::File("/etc/doas.conf"),
+        ],
+    ),
+    (
+        "the account and group database",
+        &[
+            Place::File("/etc/passwd"),
+            Place::File("/etc/shadow"),
+            Place::File("/etc/group"),
+            Place::File("/etc/gshadow"),
+            Place::File("/etc/master.passwd"),
+        ],
+    ),
+    (
+        "the login authentication and security policy",
+        &[
+            Place::Tree("/etc/pam.d"),
+            Place::File("/etc/pam.conf"),
+            Place::Tree("/etc/security"),
+            Place::Tree("/etc/polkit-1"),
+            Place::Tree("/usr/share/polkit-1"),
+            Place::Tree("/library/security/securityagentplugins"),
+        ],
+    ),
+    (
+        "the SSH login keys and settings",
+        &[Place::Tree("/etc/ssh"), Place::Component(".ssh")],
+    ),
+    (
+        "the stored GnuPG keys and git credentials",
+        &[
+            Place::Component(".gnupg"),
+            Place::Component(".git-credentials"),
+        ],
+    ),
+    (
+        "root's home directory",
+        &[Place::Tree("/root"), Place::Tree("/var/root")],
+    ),
+    (
+        "the libraries loaded into every program",
+        &[
+            Place::File("/etc/ld.so.preload"),
+            Place::File("/etc/ld.so.conf"),
+            Place::Tree("/etc/ld.so.conf.d"),
+        ],
+    ),
+    (
+        "the jobs the system runs on a schedule",
+        &[
+            Place::File("/etc/crontab"),
+            Place::File("/etc/anacrontab"),
+            Place::Tree("/etc/cron.d"),
+            Place::Tree("/etc/cron.hourly"),
+            Place::Tree("/etc/cron.daily"),
+            Place::Tree("/etc/cron.weekly"),
+            Place::Tree("/etc/cron.monthly"),
+            Place::Tree("/var/spool/cron"),
+            Place::Tree("/var/at"),
+            Place::Tree("/etc/periodic"),
+        ],
+    ),
+    (
+        "the services and scripts the system runs at boot or login",
+        &[
+            Place::Tree("/etc/systemd/system"),
+            Place::Tree("/etc/systemd/user"),
+            Place::Tree("/run/systemd/system"),
+            Place::Tree("/lib/systemd/system"),
+            Place::Tree("/usr/lib/systemd/system"),
+            Place::Tree("/etc/init.d"),
+            Place::Tree("/etc/init"),
+            Place::Tree("/etc/rc.d"),
+            Place::File("/etc/rc.local"),
+            Place::Tree("/etc/update-motd.d"),
+            Place::Tree("/library/launchdaemons"),
+            Place::Tree("/library/launchagents"),
+            Place::Tree("/library/startupitems"),
+        ],
+    ),
+    (
+        "the device rules, which run commands as root when hardware appears",
+        &[
+            Place::Tree("/etc/udev/rules.d"),
+            Place::Tree("/lib/udev/rules.d"),
+            Place::Tree("/usr/lib/udev/rules.d"),
+        ],
+    ),
+    (
+        "the kernel module loading rules",
+        &[
+            Place::File("/etc/modules"),
+            Place::Tree("/etc/modprobe.d"),
+            Place::Tree("/etc/modules-load.d"),
+            Place::Tree("/lib/modprobe.d"),
+            Place::Tree("/usr/lib/modprobe.d"),
+        ],
+    ),
+    (
+        "the system's programs and libraries",
+        &[
+            Place::Tree("/bin"),
+            Place::Tree("/sbin"),
+            Place::Tree("/usr/bin"),
+            Place::Tree("/usr/sbin"),
+            Place::Tree("/usr/local/bin"),
+            Place::Tree("/usr/local/sbin"),
+            Place::Tree("/lib"),
+            Place::Tree("/lib32"),
+            Place::Tree("/lib64"),
+            Place::Tree("/usr/lib"),
+            Place::Tree("/usr/lib32"),
+            Place::Tree("/usr/lib64"),
+            Place::Tree("/usr/libexec"),
+            Place::Tree("/boot"),
+        ],
+    ),
+];
+
+/// What changing the file a tool argument names would hand over, as plain
+/// words, and the path as it was resolved; `None` when the file is not one of
+/// [`PRIVILEGED_WRITE_TARGETS`] or the argument is not an absolute path.
+///
+/// The path is resolved the way the file system will resolve it, without
+/// touching the file system, so a spelling cannot step around the list:
+/// `/etc//sudoers`, `/etc/./sudoers.d/x`, `/tmp/../etc/sudoers.d/x`,
+/// `file:///etc/sudoers%2Ed/x`, `~root/.ssh/authorized_keys`, upper case (the
+/// macOS file system ignores case) and macOS's `/private/etc` and
+/// `/System/Volumes/Data` names for `/etc` all resolve to the file they write.
+///
+/// A relative path is not judged: the server resolves it against its own
+/// allowed directories, which this function is not told. Neither is `~/`,
+/// the home of whichever account runs the server.
+pub(crate) fn privileged_write_target(argument: &str) -> Option<(&'static str, String)> {
+    let path = absolute_target_path(argument)?;
+    PRIVILEGED_WRITE_TARGETS
+        .iter()
+        .find(|(_, places)| places.iter().any(|place| place.holds(&path)))
+        .map(|(what, _)| (*what, path))
+}
+
+/// The absolute, lowercase, lexically resolved path a tool argument names, or
+/// `None` when it names no absolute path (see [`privileged_write_target`]).
+fn absolute_target_path(argument: &str) -> Option<String> {
+    let trimmed = argument.trim().trim_matches(['"', '\'']);
+    // Most arguments are not paths at all: decide that before copying them.
+    let path: std::borrow::Cow<'_, str> = if trimmed
+        .get(..5)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("file:"))
+    {
+        let rest = &trimmed[5..];
+        let rest = rest.strip_prefix("//").unwrap_or(rest);
+        let rest = match rest.get(..9) {
+            Some(host) if host.eq_ignore_ascii_case("localhost") => &rest[9..],
+            _ => rest,
+        };
+        percent_decode(rest).into()
+    } else if let Some(rest) = trimmed
+        .strip_prefix("~root")
+        .filter(|rest| rest.is_empty() || rest.starts_with('/'))
+    {
+        format!("/root{rest}").into()
+    } else {
+        trimmed.into()
+    };
+    if !path.starts_with('/') {
+        return None;
+    }
+    let mut resolved = collapse_path(&path).to_lowercase();
+    // macOS: the data volume is mounted at `/System/Volumes/Data`, and `/etc`
+    // and `/var` are links into `/private`.
+    for alias in ["/system/volumes/data", "/private"] {
+        if let Some(rest) = resolved.strip_prefix(alias) {
+            if rest.is_empty() || rest.starts_with('/') {
+                resolved = if rest.is_empty() {
+                    "/".to_string()
+                } else {
+                    rest.to_string()
+                };
+            }
+        }
+    }
+    Some(resolved)
+}
+
+/// Decode `%XX` escapes, as a server taking a `file:` URL does before it
+/// opens the path. An escape that is not two hex digits is kept as written.
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let hex = |b: u8| (b as char).to_digit(16);
+        match (bytes.get(index + 1), bytes.get(index + 2)) {
+            (Some(&high), Some(&low)) if bytes[index] == b'%' => {
+                if let (Some(high), Some(low)) = (hex(high), hex(low)) {
+                    out.push((high * 16 + low) as u8);
+                    index += 3;
+                    continue;
+                }
+                out.push(bytes[index]);
+            }
+            _ => out.push(bytes[index]),
+        }
+        index += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TargetExecution {
     None,
@@ -7542,6 +7799,180 @@ mod family_gate_tests {
             assert!(check_cloud_control_plane(cmd).is_none(), "{cmd}");
             assert!(check_kubernetes_escalation(cmd).is_none(), "{cmd}");
             assert!(check_guard_self_disable(cmd).is_none(), "{cmd}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod privileged_write_target_tests {
+    use super::{is_authentication_write_target, privileged_write_target};
+
+    const SUDO: &str = "the sudo rules, which decide who may run commands as root";
+
+    /// The spellings a path takes on its way to the same file. The list is
+    /// matched against the resolved path, so every one of these is the sudo
+    /// rules; a matcher over the raw text (ATR-2026-040's `/etc/sudoers`
+    /// substring) misses `/etc//sudoers` and `/etc/./sudoers`.
+    ///
+    /// FAILS ON REVERT of the resolution: compare the raw argument instead and
+    /// `/etc//sudoers` is not the sudo rules.
+    #[test]
+    fn every_spelling_of_a_privileged_file_resolves_to_it() {
+        for (spelling, file) in [
+            ("/etc/sudoers", "/etc/sudoers"),
+            ("/etc//sudoers", "/etc/sudoers"),
+            ("/etc/./sudoers", "/etc/sudoers"),
+            ("/etc/sudoers/", "/etc/sudoers"),
+            ("/tmp/../etc/sudoers.d/agent", "/etc/sudoers.d/agent"),
+            ("/../etc/sudoers.d/agent", "/etc/sudoers.d/agent"),
+            ("/etc/sudoers.d", "/etc/sudoers.d"),
+            ("  /etc/sudoers.d/agent\t", "/etc/sudoers.d/agent"),
+            ("'/etc/sudoers.d/agent'", "/etc/sudoers.d/agent"),
+            ("/ETC/Sudoers.D/agent", "/etc/sudoers.d/agent"),
+            ("/private/etc/sudoers.d/agent", "/etc/sudoers.d/agent"),
+            ("/System/Volumes/Data/private/etc/sudoers", "/etc/sudoers"),
+            ("file:///etc/sudoers.d/agent", "/etc/sudoers.d/agent"),
+            ("FILE://localhost/etc/sudoers", "/etc/sudoers"),
+            ("file:/etc/sudoers%2Ed/agent", "/etc/sudoers.d/agent"),
+            ("/etc/sudoers.d/a b", "/etc/sudoers.d/a b"),
+            ("/etc/doas.conf", "/etc/doas.conf"),
+        ] {
+            assert_eq!(
+                privileged_write_target(spelling),
+                Some((SUDO, file.to_string())),
+                "{spelling:?}"
+            );
+        }
+    }
+
+    /// One file from each group, so a group whose entries stop matching is
+    /// seen here, with the words a person is shown for it.
+    #[test]
+    fn each_group_names_what_the_file_hands_over() {
+        for (path, what) in [
+            ("/etc/group", "the account and group database"),
+            ("/etc/master.passwd", "the account and group database"),
+            (
+                "/etc/pam.d/sudo",
+                "the login authentication and security policy",
+            ),
+            (
+                "/etc/polkit-1/rules.d/49-agent.rules",
+                "the login authentication and security policy",
+            ),
+            ("/etc/ssh/sshd_config", "the SSH login keys and settings"),
+            (
+                "/home/dev/.ssh/authorized_keys",
+                "the SSH login keys and settings",
+            ),
+            (
+                "/home/dev/.gnupg/gpg-agent.conf",
+                "the stored GnuPG keys and git credentials",
+            ),
+            ("~root/.bashrc", "root's home directory"),
+            ("/var/root/.zshrc", "root's home directory"),
+            (
+                "/etc/ld.so.preload",
+                "the libraries loaded into every program",
+            ),
+            (
+                "/etc/cron.d/backup",
+                "the jobs the system runs on a schedule",
+            ),
+            (
+                "/var/spool/cron/crontabs/root",
+                "the jobs the system runs on a schedule",
+            ),
+            (
+                "/etc/systemd/system/agent.service",
+                "the services and scripts the system runs at boot or login",
+            ),
+            (
+                "/usr/lib/systemd/system/agent.service",
+                "the services and scripts the system runs at boot or login",
+            ),
+            (
+                "/Library/LaunchDaemons/com.agent.plist",
+                "the services and scripts the system runs at boot or login",
+            ),
+            (
+                "/etc/udev/rules.d/99-agent.rules",
+                "the device rules, which run commands as root when hardware appears",
+            ),
+            (
+                "/etc/modprobe.d/agent.conf",
+                "the kernel module loading rules",
+            ),
+            ("/usr/local/bin/sudo", "the system's programs and libraries"),
+            ("/boot/grub/grub.cfg", "the system's programs and libraries"),
+        ] {
+            assert_eq!(
+                privileged_write_target(path).map(|(found, _)| found),
+                Some(what),
+                "{path}"
+            );
+        }
+    }
+
+    /// The other half: a neighbour of a privileged file is not that file, and
+    /// a project's own tree is not the system's. A list that took these would
+    /// refuse ordinary work, and a guard that refuses ordinary work is
+    /// switched off.
+    #[test]
+    fn a_neighbour_or_a_project_file_is_not_a_privileged_file() {
+        for path in [
+            "/etc/sudoers.bak",
+            "/etc/sudoers.d.orig/agent",
+            "/etc/systemd/system.conf",
+            "/etc/hosts",
+            "/etc/nginx/nginx.conf",
+            "/rootfs/etc/passwd",
+            "/home/dev/project/etc/sudoers.d/app",
+            "/home/dev/project/lib/index.js",
+            "/home/dev/project/bin/cli.js",
+            "/home/dev/.bashrc",
+            "/home/dev/project/.git/hooks/pre-commit",
+            "/usr/local/share/doc/x",
+            "/opt/homebrew/bin/tool",
+            "/tmp/sudoers",
+            // A relative path is resolved by the server against its allowed
+            // directories, which this check is not told; `~/` is the home of
+            // whoever runs the server.
+            "etc/sudoers.d/agent",
+            "lib/index.js",
+            "../etc/passwd",
+            "~/.bashrc",
+            "~rootless/.bashrc",
+            "C:\\Windows\\System32\\drivers\\etc\\hosts",
+            "",
+            "sudoers",
+        ] {
+            assert_eq!(privileged_write_target(path), None, "{path}");
+        }
+    }
+
+    /// The doc comment says every file the shell analyzer refuses to see
+    /// overwritten is on this list. Held here, so the two cannot drift: a
+    /// write the shell refuses is not let through on the MCP surface.
+    #[test]
+    fn every_file_the_shell_refuses_to_overwrite_is_on_the_list() {
+        for path in [
+            "/home/dev/.ssh/id_rsa",
+            "/home/dev/.ssh/id_ed25519",
+            "/home/dev/.ssh/id_ecdsa",
+            "/home/dev/.ssh/id_dsa",
+            "/home/dev/.ssh/authorized_keys",
+            "/root/.ssh/authorized_keys",
+            "/home/dev/.git-credentials",
+            "/etc/shadow",
+            "/etc/gshadow",
+            "/etc/sudoers",
+            "/etc/sudoers.d/agent",
+            "/etc/ssh/sshd_config",
+            "/home/dev/.gnupg/private-keys-v1.d/key",
+        ] {
+            assert!(is_authentication_write_target(path), "{path}");
+            assert!(privileged_write_target(path).is_some(), "{path}");
         }
     }
 }

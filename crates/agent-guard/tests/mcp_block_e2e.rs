@@ -29,6 +29,7 @@ use std::sync::{Arc, Mutex};
 
 use innerwarden_agent_guard::mcp_proxy::enforce::ProxyMode;
 use innerwarden_agent_guard::mcp_proxy::transport::{run_proxy_with_io, ProxyConfig};
+use innerwarden_agent_guard::rules::RuleEngine;
 
 /// A `tools/call` carrying a shell command, in the shape the proxy inspects.
 fn tool_call(id: u32, command: &str) -> String {
@@ -38,10 +39,30 @@ fn tool_call(id: u32, command: &str) -> String {
     )
 }
 
+/// A `tools/call` of a filesystem tool, in the shape an MCP client sends it.
+fn fs_call(id: u32, tool: &str, arguments: serde_json::Value) -> String {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "tools/call",
+        "params": {"name": tool, "arguments": arguments},
+    })
+    .to_string()
+}
+
 /// Drive the proxy over an in-memory client pipe with `cat` as the server.
 ///
 /// Returns everything the client saw.
 fn run_through_proxy(requests: &[String], mode: ProxyMode) -> String {
+    run_through_proxy_with(requests, mode, None)
+}
+
+/// [`run_through_proxy`] with a rule engine, as `innerwarden proxy` runs it.
+fn run_through_proxy_with(
+    requests: &[String],
+    mode: ProxyMode,
+    engine: Option<Arc<RuleEngine>>,
+) -> String {
     let input = format!("{}\n", requests.join("\n"));
     let out = Arc::new(Mutex::new(Vec::<u8>::new()));
 
@@ -69,7 +90,7 @@ fn run_through_proxy(requests: &[String], mode: ProxyMode) -> String {
         };
         let _ = tokio::time::timeout(
             std::time::Duration::from_secs(20),
-            run_proxy_with_io(client_in, writer, cfg, None, |_| {}),
+            run_proxy_with_io(client_in, writer, cfg, engine, |_| {}),
         )
         .await;
     });
@@ -134,6 +155,60 @@ fn guard_mode_still_forwards_a_benign_tool_call() {
     assert!(
         seen.contains(marker),
         "a benign call must reach the server and come back:\n{seen}"
+    );
+}
+
+/// REGRESSION ANCHOR, from a live run behind the reference MCP filesystem
+/// server: in guard mode, with the rules `innerwarden proxy` loads, every
+/// `write_file` was refused, because ATR-2026-040 matched the tool's name. An
+/// ordinary write must reach the server; a write that grants sudo must not,
+/// here spelled `/etc//sudoers.d`, which no rule matching the raw text sees.
+///
+/// FAILS ON REVERT: put `write_file` back in ATR-2026-040's tool-name
+/// condition and the ordinary write never reaches the server; drop the
+/// `AG-PRIV-WRITE` check and the sudoers write does.
+#[test]
+fn guard_mode_with_the_shipped_rules_forwards_an_ordinary_write_and_stops_a_sudo_grant() {
+    let engine = Arc::new(RuleEngine::load_embedded());
+    let ordinary = "ordinary-write-reached-the-server";
+    let grant = "sudo-grant-reached-the-server";
+    let seen = run_through_proxy_with(
+        &[
+            fs_call(
+                21,
+                "write_file",
+                serde_json::json!({"path": "/home/dev/project/notes.md", "content": ordinary}),
+            ),
+            fs_call(
+                22,
+                "write_file",
+                serde_json::json!({"path": "/etc//sudoers.d/agent", "content": grant}),
+            ),
+        ],
+        ProxyMode::Guard,
+        Some(engine),
+    );
+
+    assert!(
+        seen.contains(ordinary),
+        "an ordinary write must reach the server and come back:\n{seen}"
+    );
+    assert!(
+        !seen.contains(grant),
+        "the sudo grant reached the server and was echoed back:\n{seen}"
+    );
+    let refusal = seen
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("json line"))
+        .find(|reply| reply["id"] == 22)
+        .unwrap_or_else(|| panic!("the sudo grant must be answered:\n{seen}"));
+    assert_eq!(refusal["result"]["isError"], true, "{refusal}");
+    let text = refusal["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        text.contains("AG-PRIV-WRITE: may change `/etc/sudoers.d/agent`, part of the sudo rules"),
+        "the refusal says which file and why: {text}"
     );
 }
 

@@ -72,6 +72,20 @@ follows semantic versioning.
   sample of up to 4 KiB, drawn by a key chosen per proxy; a value over 256
   bytes is kept by its start, which still matches a call that carries all of
   it. The store stays bounded, at about 1.1 MiB per proxy.
+- **The MCP proxy no longer refuses every `write_file`.** ATR-2026-040 matched
+  the tool's name, so in guard mode (the proxy's default) every write through
+  a filesystem server was refused, an ordinary one inside its allowed
+  directories included, while the same server's `edit_file` and `move_file`
+  were not checked at all. The rule no longer looks at the name. A tool call
+  that may change a file granting privilege or a login, or holding code that
+  runs as root, is refused instead (`AG-PRIV-WRITE`), whichever tool makes it
+  and however the path is spelled (`/etc//sudoers`, `/tmp/../etc/cron.d/x`,
+  `/private/etc/...`, `file://`): the sudo, doas and polkit rules, PAM,
+  accounts and groups, SSH keys and server settings, root's home, the dynamic
+  linker's preload list, system cron jobs and boot services, udev and kernel
+  module rules, and the system's programs. Only the filesystem server's
+  read-only tools may name these files. A relative path is not judged: the
+  server resolves it against its allowed directories.
 
 ## 1.5.1 - 2026-09-30
 
