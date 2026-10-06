@@ -477,10 +477,30 @@ pub fn disable_auto_connect(home: &Path) -> Result<AgentPolicy, String> {
     set_auto_connect(home, false, DesiredMode::Monitor)
 }
 
+/// How long an InnerWarden process waits for the agent-policy lock before it
+/// gives up and says the lock is held. Longer than an agent configuration
+/// write's own lock wait (2 s), since the holder may be waiting on one.
+const POLICY_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Run an operation while holding the Community agent-policy lock. Explicit CLI
 /// connect/disconnect and automatic reconcile share this lock, preventing two
 /// InnerWarden processes from concurrently changing the same agent configuration.
+///
+/// The wait for it is bounded ([`POLICY_LOCK_WAIT`]). The lock file is the
+/// user's, so the guarded agent's own account can open and hold it, and a
+/// blocking wait let it keep `innerwarden enforce` from switching to enforce,
+/// `upgrade` from finishing, and the dashboard's auto-connect from running,
+/// all without a word. Past the wait, nothing is changed and the error names
+/// the lock.
 pub fn with_lock<T>(home: &Path, action: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    with_lock_within(home, POLICY_LOCK_WAIT, action)
+}
+
+fn with_lock_within<T>(
+    home: &Path,
+    wait: std::time::Duration,
+    action: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
     use fs4::FileExt;
 
     let path = config_path(home);
@@ -491,10 +511,21 @@ pub fn with_lock<T>(home: &Path, action: impl FnOnce() -> Result<T, String>) -> 
         .map_err(|error| format!("creating {}: {error}", parent.display()))?;
     let lock_path = parent.join("agents.lock");
     let lock = open_policy_lock(&lock_path)?;
-    // BLOCKING exclusive lock: a second InnerWarden process waits here rather
-    // than proceeding unserialized. fs4 1.x renamed `lock_exclusive` to `lock`
-    // with identical semantics (`flock(LOCK_EX)` / `LockFileEx(EXCLUSIVE)`).
-    FileExt::lock(&lock).map_err(|error| format!("locking {}: {error}", lock_path.display()))?;
+    // Exclusive lock, waited for up to `wait`: a second InnerWarden process
+    // waits its turn here rather than proceeding unserialized, and gives up
+    // rather than waiting forever on a holder that never lets go.
+    match innerwarden_agent_guard::file_update::lock_within(&lock, wait) {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(format!(
+                "{} was held by another process for {} ms; nothing was changed, \
+                 retry once it is released",
+                lock_path.display(),
+                wait.as_millis()
+            ))
+        }
+        Err(error) => return Err(format!("locking {}: {error}", lock_path.display())),
+    }
     let result = action();
     let unlock_result = FileExt::unlock(&lock)
         .map_err(|error| format!("unlocking {}: {error}", lock_path.display()));
@@ -1313,9 +1344,10 @@ mod tests {
 
     /// Explicit connect/disconnect and the background reconciler are only kept
     /// apart by this lock. It has to EXCLUDE (a second holder cannot enter while
-    /// one is inside) and it has to BLOCK (the loser waits its turn rather than
-    /// erroring or, worse, proceeding). A shared lock, a try-lock or a no-op
-    /// would compile and pass every other test in this module.
+    /// one is inside) and it has to WAIT (the loser waits its turn rather than
+    /// erroring at once or, worse, proceeding). A shared lock, a single
+    /// try-lock or a no-op would compile and pass every other test in this
+    /// module. The wait is bounded: see the next test.
     #[test]
     fn agent_policy_lock_excludes_a_second_process_and_blocks_until_release() {
         use std::sync::mpsc;
@@ -1359,6 +1391,58 @@ mod tests {
             .expect("second holder must enter once the lock is released");
         holder.join().unwrap();
         contender.join().unwrap();
+    }
+
+    /// The wait is bounded. The lock file is the user's, so the guarded
+    /// agent's account can open and hold it; a holder that never lets go must
+    /// not keep `enforce`, `upgrade` or the dashboard's auto-connect waiting
+    /// forever. Past the wait, the action is not run and the error names the
+    /// lock.
+    ///
+    /// FAILS ON REVERT: with the blocking lock, nothing comes back.
+    #[test]
+    fn the_policy_lock_wait_is_bounded_and_names_the_lock() {
+        use fs4::FileExt;
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let home = tempfile::TempDir::new().unwrap();
+        let dir = config_path(home.path()).parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&dir).unwrap();
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join("agents.lock"))
+            .unwrap();
+        FileExt::lock(&holder).unwrap();
+
+        let wait = Duration::from_millis(200);
+        let (done_tx, done_rx) = mpsc::channel();
+        let contender_home = home.path().to_path_buf();
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let mut ran = false;
+            let result = with_lock_within(&contender_home, wait, || {
+                ran = true;
+                Ok(())
+            });
+            let _ = done_tx.send((result, ran, started.elapsed()));
+        });
+        let (result, ran, elapsed) = done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("still waiting on a lock somebody else holds: the wait is not bounded");
+        let error = result.expect_err("refused while the lock is held");
+        assert!(
+            error.contains("agents.lock was held by another process for 200 ms"),
+            "{error}"
+        );
+        assert!(!ran, "the action must not run without the lock");
+        assert!(elapsed >= wait, "it waited its bound first: {elapsed:?}");
+
+        drop(holder);
+        assert_eq!(with_lock_within(home.path(), wait, || Ok(7)), Ok(7));
     }
 
     #[test]

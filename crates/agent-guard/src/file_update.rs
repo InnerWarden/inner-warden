@@ -376,6 +376,14 @@ fn take_lock_within(file: &File, started: Instant, wait: Duration) -> std::io::R
     }
 }
 
+/// Take an exclusive lock on `file`, trying again until `wait` has passed:
+/// `Ok(false)` when another holder kept it the whole time. For a lock outside
+/// this module that the guarded agent's own account can open, which a
+/// blocking lock would let it hold the caller on forever.
+pub fn lock_within(file: &File, wait: Duration) -> std::io::Result<bool> {
+    take_lock_within(file, Instant::now(), wait)
+}
+
 /// What a writer that found the update lock held does next, `elapsed` into a
 /// wait of `wait`: pause this long and try again, or give up (`None`). PURE:
 /// the clock reading is handed in.

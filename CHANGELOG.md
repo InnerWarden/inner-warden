@@ -139,7 +139,11 @@ follows semantic versioning.
   Every lock the record takes is now waited for at most 100 ms: the verdict is
   returned as normal, and the skipped record is reported as a recording
   outage, `graph_lock_timeout`. Agent configuration writes give up after 2 s
-  and say which lock was held. `innerwarden observe` gives up after 1 s, and
+  and say which lock was held, and so does the agent-policy lock
+  (`~/.config/innerwarden/agents.lock`) after 5 s: `enforce`, `dry-run`,
+  `agents connect` and `disconnect`, `setup`, `upgrade`'s rewiring and the
+  dashboard's auto-connect all take it first, and a holder that never let go
+  kept each of them waiting for good. `innerwarden observe` gives up after 1 s, and
   an ask it could not hold is recorded at once with its outcome unknown.
 - **One large tool result no longer clears what the MCP proxy remembers.**
   The proxy keeps the long values of each tool result so that a later call
