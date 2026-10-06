@@ -357,6 +357,172 @@ fn proxy_monitor_only_records_a_loop_and_nothing_after_it() {
     assert!(blocked[0].contains("NYC"), "{}", blocked[0]);
 }
 
+/// Whether `pid` still runs. A killed child nobody has reaped yet is a zombie:
+/// it runs nothing. Shells out (`kill -0`, `ps`) so the check needs no unsafe.
+#[cfg(unix)]
+fn process_runs(pid: u32) -> bool {
+    let exists = Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        // Cannot tell: say it runs, so a test fails rather than passes blind.
+        .unwrap_or(true);
+    if !exists {
+        return false;
+    }
+    match Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+    {
+        Ok(out) => {
+            let stat = String::from_utf8_lossy(&out.stdout);
+            let stat = stat.trim();
+            !stat.is_empty() && !stat.starts_with('Z')
+        }
+        Err(_) => true,
+    }
+}
+
+/// The pid an MCP server fixture wrote once it was running.
+#[cfg(unix)]
+fn fixture_pid(pid_file: &std::path::Path) -> u32 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if let Ok(text) = std::fs::read_to_string(pid_file) {
+            if let (true, Ok(pid)) = (text.ends_with('\n'), text.trim().parse()) {
+                return pid;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the MCP server fixture never started"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// Wait up to `limit` for `child` to exit; kill it if it does not, so a
+/// failing test never leaves it behind.
+#[cfg(unix)]
+fn exits_within(
+    child: &mut std::process::Child,
+    limit: std::time::Duration,
+) -> Option<std::process::ExitStatus> {
+    let deadline = std::time::Instant::now() + limit;
+    while std::time::Instant::now() < deadline {
+        if let Some(status) = child.try_wait().unwrap() {
+            return Some(status);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    None
+}
+
+/// An MCP server that writes its pid to `$1`, ignores the end of its input and
+/// SIGTERM, and gives up on its own after a minute, so a proxy that fails to
+/// stop it leaves nothing running for long.
+#[cfg(unix)]
+const STUBBORN_SERVER: &str = r#"echo $$ > "$1"; trap '' TERM; exec sleep 60"#;
+
+#[cfg(unix)]
+#[test]
+fn a_proxy_told_to_stop_stops_its_server_and_exits() {
+    // An MCP client whose proxy has not exited 2 s after it closed the proxy's
+    // input sends SIGTERM (the official SDK and OpenClaw both do). That killed
+    // the proxy outright and left its server running with nobody reading it.
+    for signal in ["TERM", "HUP", "INT"] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let pid_file = dir.path().join("server.pid");
+        let mut proxy = cli()
+            .args(["proxy", "--mode", "advisory", "--label", "e2e", "--"])
+            .args(["sh", "-c", STUBBORN_SERVER, "sh"])
+            .arg(&pid_file)
+            .env("IW_GRAPH_FILE", dir.path().join("graph.json"))
+            // Held open for the whole test: the client is still connected.
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn the proxy");
+        let server = fixture_pid(&pid_file);
+
+        let sent = Command::new("kill")
+            .args([format!("-{signal}"), proxy.id().to_string()])
+            .status()
+            .unwrap();
+        assert!(sent.success());
+        let status = exits_within(&mut proxy, std::time::Duration::from_secs(10));
+        let status = status.unwrap_or_else(|| panic!("SIG{signal}: the proxy did not exit"));
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "SIG{signal}: the proxy was killed by the signal instead of ending its session"
+        );
+        assert!(
+            !process_runs(server),
+            "SIG{signal}: the proxy exited and left its server running"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_hangup_the_client_chose_to_ignore_does_not_end_the_session() {
+    // A client started under nohup passes SIGHUP on ignored: its tools must
+    // survive a hangup, so the proxy must not install a handler over that.
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::process::CommandExt;
+
+    let echo = "while IFS= read -r line; do printf '%s\\n' \"$line\"; done";
+    let mut command = cli();
+    command
+        .args(["proxy", "--mode", "advisory", "--label", "e2e", "--"])
+        .args(["sh", "-c", echo])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    // SAFETY: signal(2) is async-signal-safe, and this runs in the forked
+    // child before exec, as nohup would.
+    unsafe {
+        command.pre_exec(|| {
+            libc::signal(libc::SIGHUP, libc::SIG_IGN);
+            Ok(())
+        });
+    }
+    let mut proxy = command.spawn().expect("spawn the proxy");
+    let mut stdin = proxy.stdin.take().unwrap();
+    let mut stdout = BufReader::new(proxy.stdout.take().unwrap());
+    let call = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"weather","arguments":{"location":"NYC"}}}"#;
+
+    // One round trip first, so the hangup lands on a proxy that is running.
+    writeln!(stdin, "{call}").unwrap();
+    let mut echoed = String::new();
+    stdout.read_line(&mut echoed).unwrap();
+    assert_eq!(echoed.trim_end(), call);
+
+    let sent = Command::new("kill")
+        .args(["-HUP", &proxy.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(sent.success());
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    assert!(
+        proxy.try_wait().unwrap().is_none(),
+        "an ignored SIGHUP ended the session"
+    );
+    writeln!(stdin, "{call}").unwrap();
+    echoed.clear();
+    stdout.read_line(&mut echoed).unwrap();
+    assert_eq!(echoed.trim_end(), call, "the session stopped answering");
+
+    drop(stdin);
+    let status = exits_within(&mut proxy, std::time::Duration::from_secs(10));
+    assert_eq!(status.and_then(|s| s.code()), Some(0));
+}
+
 /// Feed a Claude Code PreToolUse payload on stdin and return the exit code.
 fn run_hook(payload: &str) -> Option<i32> {
     let mut child = cli()

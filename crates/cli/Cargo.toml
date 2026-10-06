@@ -71,7 +71,7 @@ base64 = "0.23"
 tiny_http = "0.12"
 # Async runtime for the `proxy` mode (the enforcing MCP stdio guard, which pumps
 # the wrapped server's stdio via tokio::process). Windows-clean: no unix APIs.
-tokio = { version = "1", features = ["rt-multi-thread", "io-std", "time"] }
+tokio = { version = "1", features = ["rt", "io-std", "time"] }
 # Blocking HTTP client for the verdict notifications. rustls TLS = pure Rust, no
 # C deps, stays Windows-clean.
 ureq = { version = "3", features = ["json"] }

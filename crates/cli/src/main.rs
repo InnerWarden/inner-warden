@@ -1654,7 +1654,10 @@ fn cmd_proxy(rest: &[String]) -> std::process::ExitCode {
         as_protocol_error: error_response,
     };
 
-    let rt = match tokio::runtime::Builder::new_multi_thread()
+    // One thread: the proxy is a single task by design (one writer to the
+    // client, no spawned pumps), so worker threads only sat idle, one per CPU,
+    // in every proxy an MCP client keeps open.
+    let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
     {
@@ -1673,7 +1676,13 @@ fn cmd_proxy(rest: &[String]) -> std::process::ExitCode {
             eprintln!("{}", format_alert(&label, d));
         }
     };
-    match rt.block_on(run_proxy(cfg, Some(engine), on_event)) {
+    let result = rt.block_on(run_proxy(cfg, Some(engine), on_event));
+    // The server is stopped and reaped by now. Dropping the runtime normally
+    // would wait for its blocking tasks, and the read on our stdin is one that
+    // cannot be cancelled: a proxy told to stop while its client was still
+    // connected would hang here until the client wrote or closed.
+    rt.shutdown_background();
+    match result {
         Ok(code) => std::process::ExitCode::from(code.clamp(0, 255) as u8),
         Err(e) => {
             eprintln!("innerwarden proxy: {e}");
