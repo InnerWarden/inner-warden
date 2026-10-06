@@ -1134,9 +1134,8 @@ fn cmd_install(rest: &[String]) -> std::process::ExitCode {
 /// `innerwarden uninstall [claude-code] [--settings PATH]` - the inverse of
 /// `install`: remove the innerwarden PreToolUse hook from the agent's settings,
 /// leaving every other setting and hook untouched. Safe to run when nothing is
-/// installed (removes 0). Does not delete the binary itself (a running process
-/// cannot reliably remove its own file cross-platform) - it prints where it is so
-/// the user can `rm` it if they want it gone.
+/// installed (removes 0). Does not delete the binary: it names the full
+/// `uninstall`, which decides whether the binary is this install's to delete.
 fn cmd_uninstall(rest: &[String]) -> std::process::ExitCode {
     // Bare `uninstall` (or with --all / --purge) removes InnerWarden entirely:
     // the agent hook, the config directory, the binary and its shortcuts. `uninstall
@@ -1217,9 +1216,13 @@ fn cmd_uninstall(rest: &[String]) -> std::process::ExitCode {
                 println!();
                 println!("The innerwarden binary is still installed;");
             }
-            if let Ok(exe) = std::env::current_exe() {
-                println!("remove it with:  rm {}", exe.display());
-            }
+            // Never a bare `rm` of this file: it may be npm's, a package's, or
+            // a copy another program keeps. The full uninstall decides that,
+            // and says what it removes and what it leaves before it starts.
+            println!(
+                "to remove InnerWarden entirely:  {} uninstall   (preview: --dry-run)",
+                prog()
+            );
             std::process::ExitCode::SUCCESS
         }
         Err(e) => {
@@ -1287,7 +1290,7 @@ fn uninstall_plan_lines(home: &std::path::Path) -> Vec<String> {
     // removal the run will not perform. Listing the path unconditionally was the
     // dry-run's own version of the defect: on an npm install it named a file
     // that uninstall must not touch.
-    match binary_verdict() {
+    match binary_verdict(home) {
         Some(verdict) => {
             match &verdict.removal {
                 upgrade_plan::BinaryRemoval::RemoveHere => {
@@ -1337,7 +1340,7 @@ fn cmd_uninstall_self(purge: bool) -> std::process::ExitCode {
     // ("remove it with `rm ...`") needed the very root the run did not have, and
     // for an npm copy it is the move `upgrade_plan::cannot_replace_advice`
     // already tells people not to make.
-    let verdict = binary_verdict();
+    let verdict = binary_verdict(&home);
     // Say it up front, while the machine is still intact and the answer can
     // change what the operator does.
     if let Some(verdict) = verdict.as_ref() {
@@ -1438,9 +1441,10 @@ fn cmd_uninstall_self(purge: bool) -> std::process::ExitCode {
                         false
                     }
                     Err(e) => {
-                        // The probe said writable and the unlink still failed, so
-                        // something changed underneath us. Report it rather than
-                        // claiming a clean removal.
+                        // The metadata said deletable and the unlink still failed
+                        // (an append-only directory, or something changed
+                        // underneath us). Report it rather than claiming a clean
+                        // removal.
                         println!("  binary  : could not remove {} ({e})", exe.display());
                         true
                     }
@@ -1485,7 +1489,7 @@ struct BinaryVerdict {
     exe: std::path::PathBuf,
     removal: upgrade_plan::BinaryRemoval,
     /// Empty unless the binary is removed here: a binary left to npm, a
-    /// package manager or the operator keeps its shortcuts too.
+    /// package manager, its owner or the operator keeps its shortcuts too.
     aliases: upgrade_plan::AliasPlan,
 }
 
@@ -1493,13 +1497,30 @@ struct BinaryVerdict {
 /// so `--dry-run` cannot promise what the run will not do.
 ///
 /// Read before anything is removed: whether a shortcut leads to this binary
-/// can only be asked while the binary is still there.
-fn binary_verdict() -> Option<BinaryVerdict> {
+/// can only be asked while the binary is still there. Nothing here writes, so
+/// the preview can ask it too: it used to find out whether the binary could
+/// be deleted by creating and deleting a file beside it.
+fn binary_verdict(home: &std::path::Path) -> Option<BinaryVerdict> {
     let exe = upgrade::installed_binary().ok()?;
     let managed = upgrade_plan::managed_by(&exe, upgrade::package_owner(&exe).as_ref());
-    let removal = upgrade_plan::plan_binary_removal(&managed, can_write_beside(&exe));
+    // Whether a copy npm or a package owns could be deleted, or where it came
+    // from, does not change what is done with it, so nothing is read for one.
+    let (origin, facts) = if managed == upgrade_plan::Managed::Direct {
+        let facts = upgrade::alias_facts(&exe);
+        let origin = upgrade_plan::copy_origin(
+            &exe,
+            std::env::consts::EXE_SUFFIX,
+            in_installer_dir(&exe, home),
+            upgrade_plan::a_shortcut_is_this_binary(&facts, &exe),
+        );
+        (origin, facts)
+    } else {
+        (upgrade_plan::CopyOrigin::Unrecognised, Vec::new())
+    };
+    let writable = origin == upgrade_plan::CopyOrigin::Installer && can_unlink(&exe);
+    let removal = upgrade_plan::plan_binary_removal(&managed, &origin, writable);
     let aliases = if removal == upgrade_plan::BinaryRemoval::RemoveHere {
-        upgrade_plan::plan_alias_removal(&alias_facts(&exe), &exe)
+        upgrade_plan::plan_alias_removal(&facts, &exe)
     } else {
         upgrade_plan::AliasPlan::default()
     };
@@ -1510,58 +1531,67 @@ fn binary_verdict() -> Option<BinaryVerdict> {
     })
 }
 
-/// What is at each installed name beside `exe` (`iw`, `iw-guard`, and
-/// `innerwarden` when run as one of those). Names that are not there are left
-/// out; a name that cannot be inspected is `Unreadable`, never "not there".
-fn alias_facts(exe: &std::path::Path) -> Vec<upgrade_plan::AliasFact> {
-    use upgrade_plan::{AliasEntry, AliasFact};
-    upgrade_plan::siblings_named(exe, std::env::consts::EXE_SUFFIX)
-        .into_iter()
-        .filter_map(|path| {
-            let entry = match std::fs::symlink_metadata(&path) {
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
-                Err(_) => AliasEntry::Unreadable,
-                Ok(meta) if meta.file_type().is_symlink() => AliasEntry::Link {
-                    resolves_to: std::fs::canonicalize(&path).ok(),
-                },
-                Ok(meta) if meta.is_file() => AliasEntry::File {
-                    same_bytes: same_bytes(&path, exe),
-                },
-                Ok(_) => AliasEntry::Unreadable,
-            };
-            Some(AliasFact { path, entry })
-        })
-        .collect()
-}
-
-/// Do two files hold the same bytes? Any read failure answers no, which keeps
-/// the file.
-fn same_bytes(a: &std::path::Path, b: &std::path::Path) -> bool {
-    let (Ok(ma), Ok(mb)) = (std::fs::metadata(a), std::fs::metadata(b)) else {
+/// Is `exe` in the directory the installer uses by default for this account:
+/// `~/.local/bin` (the shell installer), or `%LOCALAPPDATA%\Programs\InnerWarden`
+/// (the Windows one)? Both sides resolved, so a link in either path cannot
+/// make them differ; a directory that cannot be resolved is not it.
+fn in_installer_dir(exe: &std::path::Path, home: &std::path::Path) -> bool {
+    let default_dir = if cfg!(windows) {
+        match std::env::var_os("LOCALAPPDATA") {
+            Some(local) => std::path::PathBuf::from(local)
+                .join("Programs")
+                .join("InnerWarden"),
+            None => return false,
+        }
+    } else {
+        home.join(".local").join("bin")
+    };
+    let (Some(dir), Ok(default_dir)) = (exe.parent(), std::fs::canonicalize(&default_dir)) else {
         return false;
     };
-    if ma.len() != mb.len() {
-        return false;
-    }
-    matches!((std::fs::read(a), std::fs::read(b)), (Ok(x), Ok(y)) if x == y)
+    std::fs::canonicalize(dir).is_ok_and(|dir| dir == default_dir)
 }
 
-/// Can this process write in the directory the binary lives in?
-///
-/// Writes and removes a real file rather than reading mode bits, which is the
-/// only method that does not guess wrong under a read-only mount, an immutable
-/// flag or a full disk. `upgrade::can_replace` reaches the same answer the same
-/// way for the same reason; the staging path is shared so the two can never
-/// disagree about which file they mean.
-fn can_write_beside(target: &std::path::Path) -> bool {
-    let staged = upgrade_plan::staging_path(target);
-    match std::fs::write(&staged, b"") {
-        Ok(()) => {
-            let _ = std::fs::remove_file(&staged);
-            true
+/// Can this account delete the binary? Read from metadata, never by writing
+/// (see `upgrade_plan::unlink_permitted`).
+#[cfg(unix)]
+fn can_unlink(exe: &std::path::Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    // The kernel's own access check: it already answers no on a read-only
+    // mount and on an immutable inode. `access` asks for the real ids, which
+    // are the effective ones here, since this program is never setuid.
+    fn access(path: &std::path::Path, mode: libc::c_int) -> Result<(), Option<i32>> {
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| None)?;
+        match unsafe { libc::access(c.as_ptr(), mode) } {
+            0 => Ok(()),
+            _ => Err(std::io::Error::last_os_error().raw_os_error()),
         }
-        Err(_) => false,
     }
+    let Some(dir) = exe.parent() else {
+        return false;
+    };
+    let (Ok(dir_meta), Ok(file_meta)) = (std::fs::metadata(dir), std::fs::symlink_metadata(exe))
+    else {
+        return false;
+    };
+    upgrade_plan::unlink_permitted(&upgrade_plan::UnlinkFacts {
+        dir_writable: access(dir, libc::W_OK | libc::X_OK).is_ok(),
+        file_immutable: access(exe, libc::W_OK) == Err(Some(libc::EPERM)),
+        sticky_dir: dir_meta.mode() & 0o1000 != 0,
+        // geteuid takes no arguments, touches no memory, and cannot fail.
+        euid: unsafe { libc::geteuid() },
+        dir_uid: dir_meta.uid(),
+        file_uid: file_meta.uid(),
+    })
+}
+
+/// Windows never deletes the running binary (see `cmd_uninstall_self`), so
+/// this only decides whether it is named for removal by hand. A read-only
+/// file cannot be deleted there.
+#[cfg(not(unix))]
+fn can_unlink(exe: &std::path::Path) -> bool {
+    std::fs::metadata(exe).is_ok_and(|m| !m.permissions().readonly())
 }
 
 /// `innerwarden serve [--bind IP:PORT]` - expose the guardrail over plain HTTP on

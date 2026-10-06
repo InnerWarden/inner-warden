@@ -162,7 +162,11 @@ Local one-off:
   **There are now three pin sites, not one.** A rotation must update all of them:
 
   1. `crates/cli/src/release_verify.rs` (`RELEASE_PUBLIC_KEY_B64`) - compiled
-     into every shipped binary and used by `innerwarden upgrade`.
+     into every shipped binary and used by `innerwarden upgrade`. It is also
+     how `upgrade` and `uninstall` recognise an earlier build left as an `iw` /
+     `iw-guard` copy beside the binary (`upgrade_plan::is_innerwarden_build`),
+     without running it. After a rotation, copies from before it are no longer
+     recognised: they are left in place as somebody else's file.
   2. `npm/scripts/verify-release-asset.mjs` (`RELEASE_PUBLIC_KEY_B64`) - used by
      the npm and `.deb`/`.rpm` packaging paths.
   3. `iw-guard-install.sh` in the distribution repo - the `curl | sh` pin.

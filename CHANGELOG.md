@@ -28,6 +28,12 @@ follows semantic versioning.
   configuration and the `iw` / `iw-guard` shortcuts, leaves the binary to
   `sudo apt remove innerwarden` or `sudo dnf remove innerwarden`, and exits 1
   with "partly removed" until that is done.
+- **`innerwarden uninstall` removes only the installer's copy.** A binary
+  the installer did not lay down (installed with `cargo install`, with Scoop,
+  or a copy another program keeps for itself) is now left where it is, with
+  the command that removes it where there is one, and the run exits 1 with
+  "partly removed". After uninstalling a cargo or Scoop copy, finish with
+  `cargo uninstall innerwarden` or `scoop uninstall innerwarden`.
 - **Reconnect MCP agents to have them named.** `innerwarden agents connect`
   now writes `--label` and `--agent` into each MCP wrapper, so its decisions
   are recorded under the session `mcp:<agent>` instead of `mcp:innerwarden`.
@@ -87,6 +93,37 @@ follows semantic versioning.
 
 ### Fixed
 
+- **`uninstall` no longer deletes a copy it did not install.** It decided
+  from npm, the `.deb`/`.rpm` database and whether the file could be deleted,
+  and as root every file can be, so `sudo innerwarden uninstall` run from a
+  copy another program keeps for itself deleted it. The binary is now removed
+  only when it is the installer's: named `innerwarden`, `iw` or `iw-guard`,
+  and either in the installer's directory for this account (`~/.local/bin`,
+  or `%LOCALAPPDATA%\Programs\InnerWarden` on Windows) or with an `iw` or
+  `iw-guard` beside it that links to it or is a copy of it. Anything else is
+  kept and named, and the hooks and configuration are still removed.
+- **`uninstall --dry-run` writes nothing.** The preview found out whether the
+  binary could be deleted by creating and deleting a file beside it. Both the
+  preview and the run now read that from the file system's own permission
+  check, without writing.
+- **`upgrade` refreshes the installer's `iw` and `iw-guard` copies.** Where
+  the shell installer cannot make a link it copies the binary instead, and on
+  Linux and macOS `upgrade` replaced only `innerwarden`, so `iw` went on
+  running the build first installed, and `uninstall` then kept both copies as
+  another program's. A copy is now replaced with the binary when it is this
+  build or any earlier one (recognised by the release key every build since
+  1.1.0 carries, without running it), and `uninstall` removes such a copy. A
+  link is left a link, and a file that is not InnerWarden is not touched.
+- **`upgrade` never writes through a link at its staging name.** The new
+  binary is staged beside the old one, and a link planted under that name, in
+  a directory another account can write, made `sudo innerwarden upgrade` write
+  the release (and its first check, an empty file) over whatever the link
+  pointed at. Whatever is at the staging name is now removed first and the
+  file is created afresh.
+- **Removing one agent's hook no longer prints `rm <path>`.** `innerwarden
+  uninstall <agent>` ended by handing out a bare `rm` of whatever copy was
+  running, an npm or package copy included. It now points at the full
+  `innerwarden uninstall`, which decides whether the binary is its to remove.
 - **A question about a miner is not an attack attempt.** The command rules
   refuse a miner binary wherever its name appears, so a message such as "how
   do I remove xmrig from this box?" was recorded as a conversation attempt,

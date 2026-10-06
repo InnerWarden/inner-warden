@@ -68,12 +68,26 @@ fn as_an_npm_install(root: &Path) -> PathBuf {
 }
 
 /// A direct install: the binary somewhere ordinary, with no `node_modules`
-/// anywhere in its path.
+/// anywhere in its path, and nothing beside it.
+#[cfg(unix)]
 fn as_a_direct_install(root: &Path) -> PathBuf {
     let source = Path::new(bin());
     let name = source.file_name().expect("the test binary has a name");
     let dir = root.join("usr").join("local").join("bin");
     std::fs::create_dir_all(&dir).expect("direct layout");
+    let target = dir.join(name);
+    copy_the_binary(source, &target);
+    target
+}
+
+/// The shell installer's default: `~/.local/bin/innerwarden` of the account
+/// being uninstalled, with no shortcut beside it.
+#[cfg(unix)]
+fn in_the_installers_directory(home: &Path) -> PathBuf {
+    let source = Path::new(bin());
+    let name = source.file_name().expect("the test binary has a name");
+    let dir = home.join(".local").join("bin");
+    std::fs::create_dir_all(&dir).expect("the installer's directory");
     let target = dir.join(name);
     copy_the_binary(source, &target);
     target
@@ -95,6 +109,8 @@ fn run_uninstall(exe: &Path, home: &Path, extra: &[&str]) -> Output {
     cmd.arg("uninstall");
     cmd.args(extra);
     cmd.env("HOME", home);
+    // Windows reads the home directory from here, not from HOME.
+    cmd.env("USERPROFILE", home);
     // Keep the run offline and non-interactive whatever the environment holds.
     cmd.env_remove("INNERWARDEN_CONFIG_DIR");
     cmd.stdout(Stdio::piped());
@@ -177,16 +193,19 @@ fn the_binary_verdict_is_announced_before_anything_is_destroyed() {
     );
 }
 
-/// The other side, so this is not a guard that refuses everything: a direct
-/// install the process owns is removed, reports removal, and exits 0.
+/// The other side, so this is not a guard that refuses everything: the
+/// installer's own copy, in its default directory, is removed, reports
+/// removal, and exits 0, even with no shortcut beside it.
 ///
 /// Without this, "never exit 0" would pass the test above and be a regression.
+/// Unix only: Windows never deletes the running binary, and its installer's
+/// directory is not under the home directory.
+#[cfg(unix)]
 #[test]
 fn a_writable_direct_install_is_removed_and_exits_clean() {
-    let root = tempfile::tempdir().expect("tempdir");
     let home = tempfile::tempdir().expect("home");
     seed_home(home.path());
-    let exe = as_a_direct_install(root.path());
+    let exe = in_the_installers_directory(home.path());
 
     let out = run_uninstall(&exe, home.path(), &[]);
     let said = text(&out);
@@ -203,6 +222,134 @@ fn a_writable_direct_install_is_removed_and_exits_clean() {
     assert!(
         !exe.exists(),
         "a writable direct install must actually be gone:\n{said}"
+    );
+}
+
+/// REGRESSION ANCHOR. A copy the installer did not lay down was deleted by
+/// any `uninstall` that could delete it, and as root that is every copy: one
+/// another product keeps for itself (its own name in its own directory, or a
+/// lone `innerwarden` there) went with the hooks. Here the copies sit where
+/// this account can delete them, which is exactly root's position everywhere.
+/// The run still removes this account's hooks and configuration, keeps the
+/// copy, says why, and does not report a clean uninstall.
+///
+/// FAILS ON REVERT: decide by writability alone and each copy is deleted,
+/// with "removed" and exit 0.
+#[cfg(unix)]
+#[test]
+fn a_deletable_copy_the_installer_did_not_lay_down_is_kept() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let home = tempfile::tempdir().expect("home");
+    let pinned_dir = root
+        .path()
+        .join("usr")
+        .join("local")
+        .join("lib")
+        .join("product");
+    std::fs::create_dir_all(&pinned_dir).expect("another product's directory");
+    let pinned = pinned_dir.join("guard-cli");
+    copy_the_binary(Path::new(bin()), &pinned);
+    // Its own name, even in the installer's directory, is not the installer's.
+    let named_otherwise = home.path().join(".local").join("bin").join("guard-cli");
+    std::fs::create_dir_all(named_otherwise.parent().unwrap()).expect("dir");
+    copy_the_binary(Path::new(bin()), &named_otherwise);
+
+    for exe in [as_a_direct_install(root.path()), pinned, named_otherwise] {
+        seed_home(home.path());
+        let out = run_uninstall(&exe, home.path(), &[]);
+        let said = text(&out);
+
+        assert!(exe.exists(), "{} was deleted:\n{said}", exe.display());
+        assert!(
+            said.contains("It is not a copy the InnerWarden installer laid down"),
+            "the run must say why the copy stays:\n{said}"
+        );
+        assert!(said.contains("binary  : kept"), "{said}");
+        assert_ne!(out.status.code(), Some(0), "{said}");
+        assert!(
+            !home.path().join(".config/innerwarden").exists(),
+            "this account's configuration is still removed:\n{said}"
+        );
+    }
+}
+
+/// `--dry-run` writes nothing at all. It used to find out whether the binary
+/// could be deleted by creating and deleting a file beside it, so a preview
+/// modified the directory the binary is installed in.
+///
+/// FAILS ON REVERT: the probe moves the directory's modification time to now.
+#[cfg(unix)]
+#[test]
+fn dry_run_writes_nothing_beside_the_binary() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let home = tempfile::tempdir().expect("home");
+    seed_home(home.path());
+    let exe = as_an_installer_layout(root.path());
+    let dir = exe.parent().unwrap().to_path_buf();
+    let long_ago =
+        std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+    std::fs::File::open(&dir)
+        .and_then(|d| d.set_modified(long_ago))
+        .expect("date the directory");
+
+    let said = text(&run_uninstall(&exe, home.path(), &["--dry-run"]));
+
+    let resolved = std::fs::canonicalize(&exe).expect("resolve the binary");
+    assert!(
+        said.contains(&format!("binary  : {}", resolved.display())),
+        "the preview must still name the binary for removal:\n{said}"
+    );
+    assert_eq!(
+        std::fs::metadata(&dir).unwrap().modified().unwrap(),
+        long_ago,
+        "--dry-run wrote in the binary's directory:\n{said}"
+    );
+}
+
+/// An `iw` the installer copied, left on an older build by an upgrade that
+/// did not refresh it, is still InnerWarden and goes with the binary.
+///
+/// FAILS ON REVERT: remove only a copy with this binary's exact bytes and the
+/// older copy is kept as "a different file".
+#[cfg(unix)]
+#[test]
+fn an_older_copy_beside_the_binary_goes_with_it() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let home = tempfile::tempdir().expect("home");
+    seed_home(home.path());
+    let exe = as_a_direct_install(root.path());
+    let dir = exe.parent().unwrap().to_path_buf();
+    std::os::unix::fs::symlink(exe.file_name().unwrap(), dir.join("iw-guard")).expect("link");
+    let mut older = std::fs::read(bin()).expect("read the binary");
+    older.extend_from_slice(b"a different build");
+    std::fs::write(dir.join("iw"), &older).expect("an older copy");
+
+    let out = run_uninstall(&exe, home.path(), &[]);
+    let said = text(&out);
+
+    for path in [exe.clone(), dir.join("iw"), dir.join("iw-guard")] {
+        assert!(!present(&path), "{} must go:\n{said}", path.display());
+    }
+    assert_eq!(out.status.code(), Some(0), "{said}");
+}
+
+/// Removing one agent's hook leaves the binary, and the way to remove that is
+/// the full uninstall, which decides whether the file is this install's. It
+/// used to print `rm <path>` for whatever copy was running: npm's, a
+/// package's, or another program's.
+///
+/// FAILS ON REVERT: the old line was "remove it with:  rm <path>".
+#[test]
+fn removing_one_agents_hook_never_hands_out_rm() {
+    let home = tempfile::tempdir().expect("home");
+    let out = run_uninstall(Path::new(bin()), home.path(), &["claude-code"]);
+    let said = text(&out);
+
+    assert_eq!(out.status.code(), Some(0), "{said}");
+    assert!(!said.contains("rm "), "{said}");
+    assert!(
+        said.contains("to remove InnerWarden entirely:  innerwarden uninstall"),
+        "{said}"
     );
 }
 
@@ -324,7 +471,9 @@ fn a_shortcut_name_that_is_another_program_is_left_alone() {
     let root = tempfile::tempdir().expect("tempdir");
     let home = tempfile::tempdir().expect("home");
     seed_home(home.path());
-    let exe = as_a_direct_install(root.path());
+    // In the installer's directory: with neither shortcut leading to it, that
+    // is what says the binary is the installer's.
+    let exe = in_the_installers_directory(home.path());
     let dir = exe.parent().unwrap().to_path_buf();
 
     let other_dir = root.path().join("opt").join("other").join("bin");

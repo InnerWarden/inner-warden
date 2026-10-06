@@ -68,7 +68,8 @@ pub(crate) fn help_text(verb: &str) -> String {
          Update the InnerWarden Community binary in place to the latest signed\n  \
          release. It downloads the release asset and verifies its SHA-256 and its\n  \
          Ed25519 signature against the key compiled into this binary before replacing\n  \
-         anything. Hooks and config are left untouched.\n\
+         anything. The `iw` and `iw-guard` copies the installer laid beside it are\n  \
+         replaced too. Hooks and config are left untouched.\n\
          \n  \
          --check   report which version is published, and change nothing\n  \
          --yes     replace a copy npm, apt or dnf installed anyway (see the refusal\n  \
@@ -395,7 +396,7 @@ pub fn cmd(rest: &[String]) -> ExitCode {
 /// wrong under a read-only mount, an immutable flag, or a full disk.
 fn can_replace(target: &Path) -> std::io::Result<()> {
     let staged = upgrade_plan::staging_path(target);
-    std::fs::write(&staged, b"")?;
+    write_executable(&staged, b"")?;
     std::fs::remove_file(&staged)
 }
 
@@ -622,14 +623,120 @@ pub fn fetch_verify_install(base: &str, asset: &str, target: &Path) -> FetchOutc
 }
 
 fn install_verified(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    // Which of the names beside the binary are the installer's copies of it,
+    // read BEFORE it is replaced: afterwards "the same bytes" means the new
+    // ones. Windows refreshes its copies inside `land`.
+    #[cfg(not(windows))]
+    let copies = upgrade_plan::copies_to_refresh(&alias_facts(target), target);
     let staged = upgrade_plan::staging_path(target);
-    std::fs::write(&staged, bytes)?;
+    write_executable(&staged, bytes)?;
+    land(&staged, target)?;
+    #[cfg(not(windows))]
+    for copy in copies {
+        if let Err(e) = refresh_copy(&copy, bytes) {
+            eprintln!(
+                "innerwarden upgrade: {} was not refreshed ({e}); re-run the installer to update it",
+                copy.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Create `path` afresh and write `bytes` into it, executable.
+///
+/// Every staging name sits in the binary's directory, and that directory can
+/// be writable by an account other than the one upgrading: `sudo innerwarden
+/// upgrade` on a user's own install, whose agent runs as that user. A plain
+/// write follows a link planted under the staging name, so root wrote the
+/// release (or, for the probe, nothing: a truncation) over whatever the link
+/// pointed at, and the rename then put the link itself where the binary was.
+/// So whatever is at the name is removed first, which removes a link and not
+/// what it points at, and `create_new` refuses a link or a file planted in
+/// between. The mode is set on the open file, never through the path.
+fn write_executable(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(bytes)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o755))?;
     }
-    land(&staged, target)
+    Ok(())
+}
+
+/// Replace one of the installer's copies with the verified bytes, the same
+/// way the binary itself is replaced: staged beside it, then one rename.
+///
+/// The shell installer copies the binary to `iw` and `iw-guard` where it
+/// cannot make a link, and an upgrade used to replace only the binary, so
+/// both went on running the build first installed. Best effort and reported,
+/// never fatal: the binary itself is already the new one.
+#[cfg(not(windows))]
+fn refresh_copy(copy: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let staged = upgrade_plan::staging_path(copy);
+    let landed = write_executable(&staged, bytes).and_then(|()| std::fs::rename(&staged, copy));
+    if landed.is_err() {
+        let _ = std::fs::remove_file(&staged);
+    }
+    landed
+}
+
+/// Bound on a file `alias_facts` reads whole. Far above any build: a release
+/// is single digit MB, and an unoptimised Linux build with debug information
+/// is about 135 MB, beyond the download cap above.
+const MAX_BUILD_BYTES: u64 = 512 * 1024 * 1024;
+
+/// What is at each installed name beside `exe` (`iw`, `iw-guard`, and
+/// `innerwarden` when run as one of those). Names that are not there are left
+/// out; a name that cannot be inspected is `Unreadable`, never "not there".
+///
+/// Shared by `uninstall` (which shortcuts go with the binary, and whether the
+/// binary is the installer's at all) and `upgrade` (which copies follow it).
+pub(crate) fn alias_facts(exe: &Path) -> Vec<upgrade_plan::AliasFact> {
+    use upgrade_plan::{AliasEntry, AliasFact};
+    // Read once, and only when a regular file beside it needs comparing.
+    let mut exe_bytes: Option<Option<Vec<u8>>> = None;
+    upgrade_plan::siblings_named(exe, std::env::consts::EXE_SUFFIX)
+        .into_iter()
+        .filter_map(|path| {
+            let entry = match std::fs::symlink_metadata(&path) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+                Err(_) => AliasEntry::Unreadable,
+                Ok(meta) if meta.file_type().is_symlink() => AliasEntry::Link {
+                    resolves_to: std::fs::canonicalize(&path).ok(),
+                },
+                // Larger than any build could be: not one, and not worth reading.
+                Ok(meta) if meta.is_file() && meta.len() > MAX_BUILD_BYTES => AliasEntry::File {
+                    same_bytes: false,
+                    innerwarden_build: false,
+                },
+                Ok(meta) if meta.is_file() => match std::fs::read(&path) {
+                    Ok(bytes) => {
+                        let ours = exe_bytes.get_or_insert_with(|| std::fs::read(exe).ok());
+                        AliasEntry::File {
+                            same_bytes: ours.as_deref() == Some(bytes.as_slice()),
+                            innerwarden_build: upgrade_plan::is_innerwarden_build(
+                                &bytes,
+                                release_verify::RELEASE_PUBLIC_KEY_B64.as_bytes(),
+                            ),
+                        }
+                    }
+                    Err(_) => AliasEntry::Unreadable,
+                },
+                Ok(_) => AliasEntry::Unreadable,
+            };
+            Some(AliasFact { path, entry })
+        })
+        .collect()
 }
 
 /// Land the staged file on the target: one atomic rename, same directory.
@@ -652,6 +759,7 @@ fn land(staged: &Path, target: &Path) -> std::io::Result<()> {
 /// 2026-09-08: the plain rename failed and the operator was told to run
 /// `sudo`. The installer's copies beside the target must follow it, or
 /// `iw --version` stays on the old build: best effort, reported, not fatal.
+/// (Elsewhere `install_verified` refreshes them, after this lands.)
 #[cfg(windows)]
 fn land(staged: &Path, target: &Path) -> std::io::Result<()> {
     let parked = upgrade_plan::parked_path(target);
@@ -790,6 +898,135 @@ mod tests {
         assert!(
             !upgrade_plan::staging_path(&target).exists(),
             "the staging file must be removed when the rename fails"
+        );
+    }
+
+    /// What an older release looks like to the upgrade: an executable that
+    /// carries the release key, with bytes other than the binary being
+    /// replaced.
+    #[cfg(unix)]
+    fn an_older_build() -> Vec<u8> {
+        let mut bytes = b"\x7fELF older build ".to_vec();
+        bytes.extend_from_slice(release_verify::RELEASE_PUBLIC_KEY_B64.as_bytes());
+        bytes
+    }
+
+    /// REGRESSION ANCHOR. Where the shell installer could not make a link it
+    /// copied the binary to `iw` and `iw-guard`, and `upgrade` replaced only
+    /// the binary: both copies went on running the build first installed, and
+    /// `uninstall` later kept them as "a different file". The copies follow
+    /// the binary now, including one an earlier upgrade already left behind,
+    /// and the installer's link stays a link.
+    ///
+    /// FAILS ON REVERT: drop the refresh from `install_verified` and `iw`
+    /// still reads "old binary".
+    #[cfg(unix)]
+    #[test]
+    fn the_installers_copies_follow_the_binary() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("innerwarden");
+        std::fs::write(&target, b"old binary").expect("seed");
+        std::fs::write(dir.path().join("iw"), b"old binary").expect("a copy of it");
+        std::fs::write(dir.path().join("iw-guard"), an_older_build()).expect("an older copy");
+
+        install_verified(&target, b"new binary").expect("install");
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"new binary");
+        for name in ["iw", "iw-guard"] {
+            let copy = dir.path().join(name);
+            assert_eq!(
+                std::fs::read(&copy).unwrap(),
+                b"new binary",
+                "{name} must follow the binary"
+            );
+            assert!(
+                !upgrade_plan::staging_path(&copy).exists(),
+                "{name}'s staging file must not survive"
+            );
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&copy).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o755, "{name} must stay executable");
+        }
+    }
+
+    /// A link planted under a staging name is never written through. The
+    /// binary's directory can be writable by an account other than the one
+    /// upgrading (`sudo innerwarden upgrade` on a user's install), and a plain
+    /// write followed the link: the release landed on whatever it pointed at,
+    /// and the probe truncated it.
+    ///
+    /// FAILS ON REVERT: write the staging names with `std::fs::write` and the
+    /// victim holds "new binary" (or nothing, after the probe).
+    #[cfg(unix)]
+    #[test]
+    fn a_link_planted_under_a_staging_name_is_not_written_through() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let elsewhere = tempfile::tempdir().expect("another directory");
+        let victim = elsewhere.path().join("victim");
+        std::fs::write(&victim, b"precious").expect("victim");
+        let target = dir.path().join("innerwarden");
+        std::fs::write(&target, b"old binary").expect("seed");
+        std::fs::write(dir.path().join("iw"), b"old binary").expect("a copy of it");
+        for name in ["innerwarden", "iw"] {
+            let staged = upgrade_plan::staging_path(&dir.path().join(name));
+            std::os::unix::fs::symlink(&victim, staged).expect("plant a link");
+        }
+
+        can_replace(&target).expect("the probe");
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"precious",
+            "the probe wrote through the link"
+        );
+        std::os::unix::fs::symlink(&victim, upgrade_plan::staging_path(&target))
+            .expect("plant it again");
+        install_verified(&target, b"new binary").expect("install");
+
+        assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
+        for name in ["innerwarden", "iw"] {
+            let path = dir.path().join(name);
+            assert!(
+                std::fs::symlink_metadata(&path)
+                    .unwrap()
+                    .file_type()
+                    .is_file(),
+                "{name} must be a regular file, not the planted link"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), b"new binary", "{name}");
+        }
+    }
+
+    /// A link already follows the binary and stays a link; a file under one of
+    /// the names that is not a build of this program is somebody else's and is
+    /// not overwritten.
+    ///
+    /// FAILS ON REVERT: refresh every regular file beside the binary and the
+    /// other tool's `iw-guard` is replaced by InnerWarden.
+    #[cfg(unix)]
+    #[test]
+    fn a_name_beside_the_binary_that_is_not_its_copy_is_not_overwritten() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("innerwarden");
+        std::fs::write(&target, b"old binary").expect("seed");
+        std::os::unix::fs::symlink("innerwarden", dir.path().join("iw")).expect("link");
+        let other = b"\x7fELF another program called iw-guard".to_vec();
+        std::fs::write(dir.path().join("iw-guard"), &other).expect("another tool");
+
+        install_verified(&target, b"new binary").expect("install");
+
+        let iw = dir.path().join("iw");
+        assert!(
+            std::fs::symlink_metadata(&iw)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the link must stay a link"
+        );
+        assert_eq!(std::fs::read(&iw).unwrap(), b"new binary");
+        assert_eq!(
+            std::fs::read(dir.path().join("iw-guard")).unwrap(),
+            other,
+            "another program's file must be left exactly as it was"
         );
     }
     /// An unknown flag refuses, and refuses BEFORE anything is fetched.

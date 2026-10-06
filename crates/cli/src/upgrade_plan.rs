@@ -234,17 +234,60 @@ pub fn sibling_copies(target: &Path) -> Vec<PathBuf> {
     siblings_named(target, ".exe")
 }
 
+/// Is `name` one of the names an install lays down, with `suffix` appended
+/// (`.exe` on Windows, nothing elsewhere)?
+fn is_installed_name(name: &str, suffix: &str) -> bool {
+    INSTALLED_NAMES
+        .iter()
+        .any(|n| name.strip_suffix(suffix) == Some(*n))
+}
+
 /// What is at one of the installed names beside the binary, as the caller
-/// found it. Read once, before anything is removed.
+/// found it. Read once, before anything is removed or replaced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AliasEntry {
     /// A symbolic link, and the canonical path it leads to (`None` when it
     /// leads to nothing that exists).
     Link { resolves_to: Option<PathBuf> },
-    /// A regular file, and whether its bytes are this binary's bytes.
-    File { same_bytes: bool },
+    /// A regular file: whether its bytes are this binary's bytes, and whether
+    /// it is a build of this program at all (see [`is_innerwarden_build`]),
+    /// which an installer copy that an earlier upgrade left on the old build
+    /// still is.
+    File {
+        same_bytes: bool,
+        innerwarden_build: bool,
+    },
     /// It could not be read, or it is neither a link nor a regular file.
     Unreadable,
+}
+
+/// Is this file a build of InnerWarden Community?
+///
+/// The installer lays `iw` and `iw-guard` as copies where it cannot make a
+/// link, and `upgrade` used to replace only the binary, so those copies stayed
+/// on whichever build was installed first. Comparing bytes with the running
+/// binary cannot recognise them, and running a file to ask its version is not
+/// something a removal or an upgrade may do. What every build carries is the
+/// release key it verifies upgrades against (`release_verify`), compiled in
+/// as text since 1.1.0: an executable that carries it is one of ours, older or
+/// newer. `key` is handed in so the decision stays pure.
+///
+/// The executable header is required too, so a text that quotes the key (the
+/// shell installer pins the same key) is not taken for a build. Somebody who
+/// writes a file that passes this into the binary's directory could as well
+/// have deleted or replaced what is there, so nothing is gained by forging it.
+pub fn is_innerwarden_build(bytes: &[u8], key: &[u8]) -> bool {
+    const HEADERS: [&[u8]; 6] = [
+        b"\x7fELF",          // Linux
+        b"\xcf\xfa\xed\xfe", // Mach-O, 64-bit
+        b"\xce\xfa\xed\xfe", // Mach-O, 32-bit
+        b"\xca\xfe\xba\xbe", // Mach-O, universal
+        b"\xbe\xba\xfe\xca", // Mach-O, universal, other byte order
+        b"MZ",               // Windows
+    ];
+    !key.is_empty()
+        && HEADERS.iter().any(|h| bytes.starts_with(h))
+        && bytes.windows(key.len()).any(|w| w == key)
 }
 
 /// One installed name that exists beside the binary. Names that are not there
@@ -267,12 +310,14 @@ pub struct AliasPlan {
 ///
 /// Uninstall removed the one file it ran from and left `iw` and `iw-guard`
 /// behind, two links to a file that no longer existed. A name is removed only
-/// when it is provably this binary: a link that resolves to `exe` (canonical,
-/// resolved by the caller), or a regular file with `exe`'s exact bytes (the
-/// installer's copy where a link could not be made). Anything else carrying
-/// the name is somebody else's, or an older copy, and is left where it is: a
-/// link to another program, a dangling link, a file with other bytes, or
-/// something unreadable. Removing a link never touches what it points to.
+/// when it is provably this program: a link that resolves to `exe` (canonical,
+/// resolved by the caller), a regular file with `exe`'s exact bytes (the
+/// installer's copy where a link could not be made), or a regular file that is
+/// another build of it (that copy, left on an older build by an upgrade that
+/// did not refresh it). Anything else carrying the name is somebody else's and
+/// is left where it is: a link to another program, a dangling link, a file
+/// that is not InnerWarden, or something unreadable. Removing a link never
+/// touches what it points to.
 pub fn plan_alias_removal(facts: &[AliasFact], exe: &Path) -> AliasPlan {
     let mut plan = AliasPlan::default();
     for fact in facts {
@@ -292,8 +337,11 @@ pub fn plan_alias_removal(facts: &[AliasFact], exe: &Path) -> AliasPlan {
             AliasEntry::Link { resolves_to: None } => plan
                 .keep
                 .push((fact.path.clone(), "it links to nothing that exists")),
-            AliasEntry::File { same_bytes: true } => plan.remove.push(fact.path.clone()),
-            AliasEntry::File { same_bytes: false } => plan.keep.push((
+            AliasEntry::File {
+                same_bytes,
+                innerwarden_build,
+            } if *same_bytes || *innerwarden_build => plan.remove.push(fact.path.clone()),
+            AliasEntry::File { .. } => plan.keep.push((
                 fact.path.clone(),
                 "it is a different file, another program or an older copy",
             )),
@@ -301,6 +349,146 @@ pub fn plan_alias_removal(facts: &[AliasFact], exe: &Path) -> AliasPlan {
         }
     }
     plan
+}
+
+/// Is one of the names beside the binary provably this very binary: a link
+/// that resolves to it, or a copy with its exact bytes?
+///
+/// That is the shell installer's mark: it lays `iw` and `iw-guard` beside
+/// `innerwarden` in whatever directory it was pointed at. Another build of the
+/// program does not count here, only this one does.
+pub fn a_shortcut_is_this_binary(facts: &[AliasFact], exe: &Path) -> bool {
+    facts.iter().any(|fact| {
+        fact.path != exe
+            && match &fact.entry {
+                AliasEntry::Link {
+                    resolves_to: Some(to),
+                } => to == exe,
+                AliasEntry::File { same_bytes, .. } => *same_bytes,
+                _ => false,
+            }
+    })
+}
+
+/// The installer's copies beside `target` that an upgrade must replace too.
+///
+/// Where the shell installer could not make a link it copies the binary to
+/// `iw` and `iw-guard`, and an upgrade that replaced only `target` left both
+/// running the old build (and `uninstall` then kept them as somebody else's).
+/// A copy follows the binary when it is this build's bytes or another build of
+/// the program. A link already follows it, and anything else is not ours to
+/// overwrite. Decided BEFORE `target` is replaced: afterwards "the same bytes"
+/// would mean the new ones.
+#[cfg_attr(windows, allow(dead_code))]
+pub fn copies_to_refresh(facts: &[AliasFact], target: &Path) -> Vec<PathBuf> {
+    facts
+        .iter()
+        .filter(|fact| fact.path != target)
+        .filter(|fact| {
+            matches!(
+                fact.entry,
+                AliasEntry::File {
+                    same_bytes: true,
+                    ..
+                } | AliasEntry::File {
+                    innerwarden_build: true,
+                    ..
+                }
+            )
+        })
+        .map(|fact| fact.path.clone())
+        .collect()
+}
+
+/// Where a binary that no package manager records came from, as far as its
+/// location tells.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CopyOrigin {
+    /// Laid down by the InnerWarden installer: under one of its names, and
+    /// either in its default directory for this account or with an `iw` /
+    /// `iw-guard` beside it that is this binary.
+    Installer,
+    /// `cargo install`, which records it under `.cargo`.
+    Cargo,
+    /// Scoop, which keeps it under `scoop\apps\innerwarden`.
+    Scoop,
+    /// None of these: a copy another program keeps for itself, a build tree,
+    /// or a file moved by hand.
+    Unrecognised,
+}
+
+/// Classify a binary that npm, dpkg and rpm do not record.
+///
+/// Being able to delete a file is not the same as it being ours to delete, and
+/// as root it says nothing at all: root can delete any of them. So `uninstall`
+/// removes only what the installer laid down, recognised by the names it uses
+/// and either the directory it installs to by default (`in_installer_dir`,
+/// compared by the caller with both paths resolved) or the shortcut it lays
+/// beside the binary wherever it was pointed (`a_shortcut_is_this_binary`). A
+/// copy another product pins for itself (`/usr/local/lib/<product>/guard-cli`,
+/// a lone `innerwarden` in its own directory) has neither, and is left to it.
+pub fn copy_origin(
+    exe: &Path,
+    suffix: &str,
+    in_installer_dir: bool,
+    a_shortcut_is_this_binary: bool,
+) -> CopyOrigin {
+    let installed_name = exe
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| is_installed_name(n, suffix));
+    if installed_name && (in_installer_dir || a_shortcut_is_this_binary) {
+        return CopyOrigin::Installer;
+    }
+    let names: Vec<String> = exe
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().to_ascii_lowercase())
+        .collect();
+    let n = names.len();
+    if n >= 3 && names[n - 2] == "bin" && names[n - 3] == ".cargo" {
+        return CopyOrigin::Cargo;
+    }
+    let scoop_app = names
+        .iter()
+        .position(|c| c == "scoop")
+        .is_some_and(|i| names[i..].windows(2).any(|w| w == ["apps", "innerwarden"]));
+    if scoop_app {
+        return CopyOrigin::Scoop;
+    }
+    CopyOrigin::Unrecognised
+}
+
+/// What decides whether this account can delete the binary, read from
+/// metadata alone (see `unlink_permitted`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(unix), allow(dead_code))]
+pub struct UnlinkFacts {
+    /// `access(dir, W_OK | X_OK)` succeeded: the kernel's own answer, which
+    /// already says no on a read-only mount or an immutable directory.
+    pub dir_writable: bool,
+    /// `access(file, W_OK)` failed with `EPERM`, which is how the kernel
+    /// refuses a write to an immutable file whoever asks.
+    pub file_immutable: bool,
+    /// The directory carries the sticky bit (`/tmp`).
+    pub sticky_dir: bool,
+    pub euid: u32,
+    pub dir_uid: u32,
+    pub file_uid: u32,
+}
+
+/// Could this account unlink the binary? Pure.
+///
+/// Answered without writing anything, so `uninstall --dry-run` can ask it: the
+/// preview used to find out by creating and deleting a file beside the binary.
+/// It is also the question an unlink actually asks, which creating a file is
+/// not: on a full disk a create fails while an unlink works, and in a sticky
+/// directory a create works while unlinking another account's file does not.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub fn unlink_permitted(f: &UnlinkFacts) -> bool {
+    if !f.dir_writable || f.file_immutable {
+        return false;
+    }
+    !f.sticky_dir || f.euid == 0 || f.euid == f.file_uid || f.euid == f.dir_uid
 }
 
 /// Which system package database records the installed file, as read by the
@@ -679,20 +867,33 @@ pub enum BinaryRemoval {
     /// it, and its record of it with it; unlinking it here, which root can do,
     /// leaves dpkg or rpm recording a package whose file is gone.
     LeaveToPackage(PackageOwner),
-    /// We can write to it, so remove it here.
+    /// `cargo install` put it there, and `cargo uninstall` removes it along
+    /// with cargo's record of it.
+    LeaveToCargo,
+    /// Scoop put it there, and `scoop uninstall` removes it with the `iw` and
+    /// `iw-guard` shims Scoop made for it.
+    LeaveToScoop,
+    /// Not a copy the installer laid down (see [`copy_origin`]), so it may be
+    /// another program's. Left where it is, whoever could delete it.
+    LeaveUnrecognised,
+    /// The installer's copy, and we can delete it, so remove it here.
     RemoveHere,
-    /// A direct install we cannot write to. Say so before touching anything else.
+    /// The installer's copy, and this account cannot delete it. Say so before
+    /// touching anything else.
     CannotRemove,
 }
 
 /// Decide what to do about the binary, from facts gathered by the caller.
 ///
-/// Pure on purpose: `writable` is passed in rather than probed here, because
-/// probing means writing to the target's directory and that cannot happen inside
-/// a unit test on any host. `upgrade` gathers the same fact with a real write
-/// (`can_replace`), which is the only method that does not guess wrong under a
-/// read-only mount or an immutable flag.
-pub fn plan_binary_removal(managed: &Managed, writable: bool) -> BinaryRemoval {
+/// Pure on purpose: `origin` and `writable` are gathered by the caller, so the
+/// decision is testable on any host. `writable` is read from metadata
+/// ([`unlink_permitted`]) and never by writing beside the binary, because the
+/// same decision answers `uninstall --dry-run`, which must change nothing.
+pub fn plan_binary_removal(
+    managed: &Managed,
+    origin: &CopyOrigin,
+    writable: bool,
+) -> BinaryRemoval {
     match managed {
         // Checked FIRST and independently of `writable`. A user-owned npm prefix
         // IS writable, so a writability-first branch would delete npm's file
@@ -701,8 +902,15 @@ pub fn plan_binary_removal(managed: &Managed, writable: bool) -> BinaryRemoval {
         // The same for a package: `sudo innerwarden uninstall` can write
         // `/usr/bin`, and that is exactly when it must not unlink dpkg's file.
         Managed::System(owner) => BinaryRemoval::LeaveToPackage(owner.clone()),
-        Managed::Direct if writable => BinaryRemoval::RemoveHere,
-        Managed::Direct => BinaryRemoval::CannotRemove,
+        // And for every other copy that is not the installer's: run as root,
+        // `writable` is true of any of them, so it cannot be what decides.
+        Managed::Direct => match origin {
+            CopyOrigin::Cargo => BinaryRemoval::LeaveToCargo,
+            CopyOrigin::Scoop => BinaryRemoval::LeaveToScoop,
+            CopyOrigin::Unrecognised => BinaryRemoval::LeaveUnrecognised,
+            CopyOrigin::Installer if writable => BinaryRemoval::RemoveHere,
+            CopyOrigin::Installer => BinaryRemoval::CannotRemove,
+        },
     }
 }
 
@@ -739,10 +947,40 @@ pub fn binary_removal_lines(plan: &BinaryRemoval, target: &Path) -> (Vec<String>
             ],
             true,
         ),
+        BinaryRemoval::LeaveToCargo => (
+            vec![
+                "  binary  : installed by cargo, so cargo removes it:".into(),
+                "                cargo uninstall innerwarden".into(),
+                "            Deleting the file by hand leaves cargo recording an install".into(),
+                "            whose file is gone.".into(),
+            ],
+            true,
+        ),
+        BinaryRemoval::LeaveToScoop => (
+            vec![
+                "  binary  : installed by Scoop, so Scoop removes it:".into(),
+                "                scoop uninstall innerwarden".into(),
+                "            That also removes the `iw` and `iw-guard` shims Scoop made".into(),
+                "            for it, which deleting the file by hand leaves behind.".into(),
+            ],
+            true,
+        ),
+        BinaryRemoval::LeaveUnrecognised => (
+            vec![
+                format!("  binary  : kept {}", target.display()),
+                "            It is not a copy the InnerWarden installer laid down: it is not"
+                    .into(),
+                "            in the installer's directory, and no `iw` or `iw-guard` beside".into(),
+                "            it is this binary. Another program may run this copy, so it is".into(),
+                "            left for whoever put it there.".into(),
+            ],
+            true,
+        ),
         BinaryRemoval::CannotRemove => (
             vec![
                 format!("  binary  : cannot remove {}", target.display()),
-                "            You do not have write access to it. Re-run with the".into(),
+                "            This account cannot delete it (no write access to its".into(),
+                "            directory, or the file is immutable). Re-run with the".into(),
                 "            privileges that installed it, or remove it by hand.".into(),
             ],
             true,
@@ -764,11 +1002,11 @@ mod tests {
     #[test]
     fn an_npm_copy_is_left_to_npm_even_when_writable() {
         assert_eq!(
-            plan_binary_removal(&Managed::Npm, true),
+            plan_binary_removal(&Managed::Npm, &CopyOrigin::Installer, true),
             BinaryRemoval::LeaveToNpm
         );
         assert_eq!(
-            plan_binary_removal(&Managed::Npm, false),
+            plan_binary_removal(&Managed::Npm, &CopyOrigin::Installer, false),
             BinaryRemoval::LeaveToNpm
         );
     }
@@ -777,7 +1015,7 @@ mod tests {
     /// install we own is still removed here, and still exits clean.
     #[test]
     fn a_writable_direct_install_is_removed_here_and_leaves_nothing() {
-        let plan = plan_binary_removal(&Managed::Direct, true);
+        let plan = plan_binary_removal(&Managed::Direct, &CopyOrigin::Installer, true);
         assert_eq!(plan, BinaryRemoval::RemoveHere);
         let (lines, left_behind) =
             binary_removal_lines(&plan, Path::new("/usr/local/bin/innerwarden"));
@@ -788,9 +1026,187 @@ mod tests {
     #[test]
     fn an_unwritable_direct_install_cannot_be_removed() {
         assert_eq!(
-            plan_binary_removal(&Managed::Direct, false),
+            plan_binary_removal(&Managed::Direct, &CopyOrigin::Installer, false),
             BinaryRemoval::CannotRemove
         );
+    }
+
+    /// Every branch that leaves the binary where it is.
+    const LEAVING: [BinaryRemoval; 5] = [
+        BinaryRemoval::LeaveToNpm,
+        BinaryRemoval::LeaveToCargo,
+        BinaryRemoval::LeaveToScoop,
+        BinaryRemoval::LeaveUnrecognised,
+        BinaryRemoval::CannotRemove,
+    ];
+
+    /// REGRESSION ANCHOR. `sudo innerwarden uninstall` run from a copy the
+    /// installer did not lay down (one another product pins for itself) deleted
+    /// it, because the only facts consulted were npm, dpkg/rpm and whether the
+    /// file could be deleted, and as root every file can be.
+    ///
+    /// FAILS ON REVERT: decide a direct copy by `writable` alone and this is
+    /// `RemoveHere`.
+    #[test]
+    fn a_copy_the_installer_did_not_lay_down_is_kept_even_when_deletable() {
+        for (origin, expected) in [
+            (CopyOrigin::Unrecognised, BinaryRemoval::LeaveUnrecognised),
+            (CopyOrigin::Cargo, BinaryRemoval::LeaveToCargo),
+            (CopyOrigin::Scoop, BinaryRemoval::LeaveToScoop),
+        ] {
+            assert_eq!(
+                plan_binary_removal(&Managed::Direct, &origin, true),
+                expected,
+                "{origin:?}"
+            );
+            assert_eq!(
+                plan_binary_removal(&Managed::Direct, &origin, false),
+                expected,
+                "{origin:?} is not ours whether or not it could be deleted"
+            );
+        }
+    }
+
+    /// Where a copy came from, from its path and the two facts the caller
+    /// gathers. The installer is recognised by its names AND by its directory
+    /// or its shortcut; a copy that only has the name, or only the place, is
+    /// somebody else's. (Windows paths are written with `/`, which Windows
+    /// reads as a separator too, so this runs on every host.)
+    ///
+    /// FAILS ON REVERT: drop the name check and `guard-cli` in the installer's
+    /// directory is `Installer`; drop the directory and shortcut check and the
+    /// lone `innerwarden` another product keeps is `Installer`.
+    #[test]
+    fn only_the_installers_names_in_its_place_are_the_installers() {
+        let home_bin = Path::new("/h/.local/bin/innerwarden");
+        assert_eq!(
+            copy_origin(home_bin, "", true, false),
+            CopyOrigin::Installer
+        );
+        assert_eq!(
+            copy_origin(Path::new("/usr/local/bin/innerwarden"), "", false, true),
+            CopyOrigin::Installer,
+            "IW_GUARD_DIR anywhere, recognised by the shortcut beside it"
+        );
+        assert_eq!(
+            copy_origin(Path::new("/usr/local/bin/iw"), "", false, true),
+            CopyOrigin::Installer,
+            "run as a copied shortcut"
+        );
+        // Another product's pinned copy: its own name, or ours alone.
+        for (exe, in_dir, shortcut) in [
+            ("/usr/local/lib/product/guard-cli", false, false),
+            ("/h/.local/bin/guard-cli", true, false),
+            ("/h/.local/bin/guard-cli", false, true),
+            ("/opt/product/bin/innerwarden", false, false),
+            ("/home/dev/src/target/release/innerwarden", false, false),
+        ] {
+            assert_eq!(
+                copy_origin(Path::new(exe), "", in_dir, shortcut),
+                CopyOrigin::Unrecognised,
+                "{exe} in_dir={in_dir} shortcut={shortcut}"
+            );
+        }
+        assert_eq!(
+            copy_origin(Path::new("/h/.cargo/bin/innerwarden"), "", false, false),
+            CopyOrigin::Cargo
+        );
+        assert_eq!(
+            copy_origin(
+                Path::new("C:/Users/a/scoop/apps/innerwarden/current/innerwarden.exe"),
+                ".exe",
+                false,
+                false
+            ),
+            CopyOrigin::Scoop
+        );
+        assert_eq!(
+            copy_origin(
+                Path::new("C:/Users/a/AppData/Local/Programs/InnerWarden/innerwarden.exe"),
+                ".exe",
+                true,
+                false
+            ),
+            CopyOrigin::Installer
+        );
+        assert_eq!(
+            copy_origin(
+                Path::new("C:/Program Files/InnerWarden/iw-guard.exe"),
+                ".exe",
+                false,
+                false
+            ),
+            CopyOrigin::Unrecognised,
+            "a copy pinned beside another product's binaries"
+        );
+    }
+
+    /// cargo and Scoop keep a record of what they installed; their branch
+    /// names their own command, and the unrecognised branch says why the file
+    /// stays and names it.
+    #[test]
+    fn each_leaving_branch_names_who_removes_it() {
+        let exe = Path::new("/opt/product/bin/innerwarden");
+        for (plan, want) in [
+            (BinaryRemoval::LeaveToCargo, "cargo uninstall innerwarden"),
+            (BinaryRemoval::LeaveToScoop, "scoop uninstall innerwarden"),
+            (
+                BinaryRemoval::LeaveUnrecognised,
+                "It is not a copy the InnerWarden installer laid down",
+            ),
+        ] {
+            let (lines, left) = binary_removal_lines(&plan, exe);
+            let text = lines.join("\n");
+            assert!(text.contains(want), "{plan:?}:\n{text}");
+            assert!(left, "{plan:?}");
+        }
+        let (lines, _) = binary_removal_lines(&BinaryRemoval::LeaveUnrecognised, exe);
+        assert_eq!(lines[0], "  binary  : kept /opt/product/bin/innerwarden");
+    }
+
+    fn unlink_facts() -> UnlinkFacts {
+        UnlinkFacts {
+            dir_writable: true,
+            file_immutable: false,
+            sticky_dir: false,
+            euid: 1000,
+            dir_uid: 1000,
+            file_uid: 1000,
+        }
+    }
+
+    /// Whether the binary can be deleted, decided from metadata. The kernel's
+    /// answer about the directory comes first; an immutable file cannot be
+    /// deleted even by root; in a sticky directory only the file's owner, the
+    /// directory's owner or root may delete it.
+    #[test]
+    fn deletion_is_decided_from_metadata() {
+        let ok = unlink_facts();
+        assert!(unlink_permitted(&ok));
+        assert!(!unlink_permitted(&UnlinkFacts {
+            dir_writable: false,
+            ..ok
+        }));
+        assert!(!unlink_permitted(&UnlinkFacts {
+            file_immutable: true,
+            euid: 0,
+            ..ok
+        }));
+        let sticky_other = UnlinkFacts {
+            sticky_dir: true,
+            dir_uid: 0,
+            file_uid: 1001,
+            ..ok
+        };
+        assert!(!unlink_permitted(&sticky_other));
+        assert!(unlink_permitted(&UnlinkFacts {
+            euid: 0,
+            ..sticky_other
+        }));
+        assert!(unlink_permitted(&UnlinkFacts {
+            file_uid: 1000,
+            ..sticky_other
+        }));
     }
 
     /// The remedy the old code printed needed the very root the uninstall did not
@@ -801,7 +1217,7 @@ mod tests {
     /// "binary  : remove it with `rm {path}` ({e})".
     #[test]
     fn neither_branch_tells_the_user_to_rm_the_binary() {
-        for plan in [BinaryRemoval::LeaveToNpm, BinaryRemoval::CannotRemove] {
+        for plan in LEAVING {
             let (lines, _) = binary_removal_lines(&plan, Path::new("/x/bin/innerwarden"));
             let text = lines.join("\n");
             assert!(
@@ -828,7 +1244,7 @@ mod tests {
     /// Anything left behind must be reported as left behind, whatever the reason.
     #[test]
     fn every_branch_that_leaves_something_says_so() {
-        for plan in [BinaryRemoval::LeaveToNpm, BinaryRemoval::CannotRemove] {
+        for plan in LEAVING {
             let (lines, left) = binary_removal_lines(&plan, Path::new("/x/innerwarden"));
             assert!(left, "{plan:?} leaves the binary and must report it");
             assert!(!lines.is_empty(), "{plan:?} must explain what is left");
@@ -1516,7 +1932,11 @@ mod tests {
             (deb(), "sudo apt remove innerwarden"),
             (rpm(), "sudo dnf remove innerwarden"),
         ] {
-            let plan = plan_binary_removal(&Managed::System(owner.clone()), true);
+            let plan = plan_binary_removal(
+                &Managed::System(owner.clone()),
+                &CopyOrigin::Installer,
+                true,
+            );
             assert_eq!(plan, BinaryRemoval::LeaveToPackage(owner));
             let (lines, left) = binary_removal_lines(&plan, Path::new(PACKAGED));
             let text = lines.join("\n");
@@ -1600,7 +2020,10 @@ mod tests {
     fn file(path: &str, same_bytes: bool) -> AliasFact {
         AliasFact {
             path: PathBuf::from(path),
-            entry: AliasEntry::File { same_bytes },
+            entry: AliasEntry::File {
+                same_bytes,
+                innerwarden_build: same_bytes,
+            },
         }
     }
 
@@ -1666,6 +2089,131 @@ mod tests {
                     "it is a different file, another program or an older copy"
                 ),
                 ("/h/c/iw-guard", "it could not be read"),
+            ]
+        );
+    }
+
+    fn older_build(path: &str) -> AliasFact {
+        AliasFact {
+            path: PathBuf::from(path),
+            entry: AliasEntry::File {
+                same_bytes: false,
+                innerwarden_build: true,
+            },
+        }
+    }
+
+    const KEY: &[u8] = b"vR3bZQMGNQ7tfoKirl4mbBCE6DekmmEFADL5g984PC4=";
+
+    fn with_header(header: &[u8], body: &[u8]) -> Vec<u8> {
+        let mut out = header.to_vec();
+        out.extend_from_slice(b"\0\0padding ");
+        out.extend_from_slice(body);
+        out.extend_from_slice(b" trailing");
+        out
+    }
+
+    /// A build of this program is an executable carrying the release key it
+    /// pins. The key quoted in a text (the shell installer pins it too), an
+    /// executable without it, or a file too short to hold it, are not.
+    ///
+    /// FAILS ON REVERT: drop the header check and the installer's own text is
+    /// taken for a build; drop the key check and any executable is.
+    #[test]
+    fn a_build_of_this_program_is_an_executable_carrying_its_release_key() {
+        for header in [
+            &b"\x7fELF"[..],
+            b"\xcf\xfa\xed\xfe",
+            b"\xca\xfe\xba\xbe",
+            b"MZ",
+        ] {
+            assert!(is_innerwarden_build(&with_header(header, KEY), KEY));
+        }
+        assert!(!is_innerwarden_build(&with_header(b"#!/bin/sh", KEY), KEY));
+        assert!(!is_innerwarden_build(
+            &with_header(b"\x7fELF", b"another program"),
+            KEY
+        ));
+        assert!(!is_innerwarden_build(b"\x7fELF", KEY));
+        assert!(!is_innerwarden_build(&with_header(b"\x7fELF", KEY), b""));
+    }
+
+    /// An installer copy that an earlier upgrade left on the old build is
+    /// still this program's, and goes with it. A file that is not a build of
+    /// it stays.
+    ///
+    /// FAILS ON REVERT: remove only `same_bytes` copies and the older build is
+    /// kept as "a different file", which is how uninstall left them.
+    #[test]
+    fn an_older_build_left_beside_the_binary_goes_with_it() {
+        let exe = "/h/.local/bin/innerwarden";
+        let plan = plan_alias_removal(
+            &[
+                older_build("/h/.local/bin/iw"),
+                file("/h/.local/bin/iw-guard", false),
+            ],
+            Path::new(exe),
+        );
+        assert_eq!(plan.remove, vec![PathBuf::from("/h/.local/bin/iw")]);
+        assert_eq!(
+            plan.keep,
+            vec![(
+                PathBuf::from("/h/.local/bin/iw-guard"),
+                "it is a different file, another program or an older copy"
+            )]
+        );
+    }
+
+    /// The installer's mark is a shortcut that is THIS binary. Another build
+    /// beside it, a link elsewhere, or the binary itself listed among the
+    /// names, are not that mark.
+    #[test]
+    fn the_installers_mark_is_a_shortcut_that_is_this_binary() {
+        let exe = "/opt/p/bin/innerwarden";
+        assert!(a_shortcut_is_this_binary(
+            &[link("/opt/p/bin/iw", Some(exe))],
+            Path::new(exe)
+        ));
+        assert!(a_shortcut_is_this_binary(
+            &[file("/opt/p/bin/iw-guard", true)],
+            Path::new(exe)
+        ));
+        assert!(!a_shortcut_is_this_binary(
+            &[
+                older_build("/opt/p/bin/iw"),
+                link("/opt/p/bin/iw-guard", Some("/opt/q/iw")),
+                link("/opt/p/bin/x", None),
+                file(exe, true),
+            ],
+            Path::new(exe)
+        ));
+    }
+
+    /// `upgrade` refreshes the installer's copies: this build's bytes, or an
+    /// older build an earlier upgrade did not refresh. A link follows the
+    /// binary already, and a file that is not a build of it is not ours to
+    /// overwrite.
+    ///
+    /// FAILS ON REVERT: an empty list, which is what upgrade did on Unix.
+    #[test]
+    fn upgrade_refreshes_only_the_installers_copies() {
+        let target = "/h/.local/bin/innerwarden";
+        let facts = [
+            file("/h/.local/bin/iw", true),
+            older_build("/h/.local/bin/iw-guard"),
+            link("/h/a/iw", Some(target)),
+            file("/h/b/iw", false),
+            AliasFact {
+                path: PathBuf::from("/h/c/iw"),
+                entry: AliasEntry::Unreadable,
+            },
+            file(target, true),
+        ];
+        assert_eq!(
+            copies_to_refresh(&facts, Path::new(target)),
+            vec![
+                PathBuf::from("/h/.local/bin/iw"),
+                PathBuf::from("/h/.local/bin/iw-guard")
             ]
         );
     }

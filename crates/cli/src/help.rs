@@ -186,11 +186,12 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
              other setting untouched.\n  \
              With no agent named, remove InnerWarden entirely: the hook, the config\n  \
              directory, the binary, and the `iw` and `iw-guard` shortcuts beside it\n  \
-             that lead to it. A binary npm, apt or dnf installed is left to that\n  \
-             package manager, and the command that removes it is printed.\n\
+             that lead to it. A binary npm, apt, dnf, cargo or Scoop installed is left\n  \
+             to it, and the command that removes it is printed. A copy the installer\n  \
+             did not lay down (one another program keeps) is left where it is.\n\
              \n  \
-             --dry-run   print exactly what a full uninstall would remove, and change\n  \
-             \x20           nothing\n  \
+             --dry-run   print exactly what a full uninstall would remove; nothing is\n  \
+             \x20           changed or written\n  \
              --purge     accepted for parity with the installer (local state lives\n  \
              \x20           under the config directory, so it goes either way)"
         ),
