@@ -47,6 +47,10 @@ const TRIGGER = "user";
 const UNREPORTED_REPLY_CHANNEL = "webchat";
 /** OpenClaw's record of a tool run inside a tool (a nested call). */
 const NESTED_TOOL_ACTIVITY = "openclaw.nested-tool.v1";
+/** The message roles OpenClaw 2026.9.7 puts in a turn. */
+const KNOWN_ROLES = new Set(["user", "assistant", "toolResult"]);
+/** The content blocks it puts in them. */
+const KNOWN_BLOCKS = new Set(["text", "toolCall", "thinking", "image"]);
 /**
  * How far before the turn's start (now less its duration) a message may be
  * stamped and still be read as the turn's own. The two clock readings are the
@@ -110,6 +114,20 @@ function callsATool(message) {
   );
 }
 
+/**
+ * Whether this is a message in a shape this plugin was written against. A
+ * tool call in a shape it does not know (another OpenClaw version, a
+ * provider's own `tool_use` block) would otherwise go unseen, and the turn
+ * would be reported as a reply.
+ */
+function knownShape(message) {
+  if (message?.customType === NESTED_TOOL_ACTIVITY) return true;
+  if (!KNOWN_ROLES.has(message?.role)) return false;
+  const content = message.content;
+  if (content === undefined || content === null || typeof content === "string") return true;
+  return Array.isArray(content) && content.every((block) => KNOWN_BLOCKS.has(block?.type));
+}
+
 function saysSomething(message) {
   const content = message?.content;
   if (typeof content === "string") return content.trim() !== "";
@@ -129,7 +147,10 @@ function saysSomething(message) {
  * and from just after the last message a person sent. A tool call anywhere in
  * the turn makes it `used_tools`, whatever was said after it. A reply is the
  * turn's last assistant message, after the person's last message, with text
- * in it and no error. Exported for the tests.
+ * in it and no error. A turn holding a message in a shape this plugin does
+ * not know is `undefined` unless it is `used_tools`: what it cannot read is
+ * never reported as a reply or as nothing said, and the message hook's timer
+ * records the ask as not seen. Exported for the tests.
  */
 export function turnEnd(event, now) {
   const messages = Array.isArray(event?.messages) ? event.messages : [];
@@ -150,6 +171,7 @@ export function turnEnd(event, now) {
   if (candidates.length === 0) return undefined;
   const turn = messages.slice(Math.min(...candidates));
   if (turn.some(callsATool)) return "used_tools";
+  if (!turn.every(knownShape)) return undefined;
   if (event.success !== true) return "no_reply";
   const reply = turn.findLast((message) => message?.role === "assistant");
   const afterPrompt = reply !== undefined && messages.lastIndexOf(reply) > lastPrompt;

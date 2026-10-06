@@ -1387,7 +1387,7 @@ mod tests {
             ),
             (
                 "index.js",
-                "3dcec78c443d984105b34bbeda747bee3402ad8111528e8c2ebebdb35e85d2cd",
+                "fd5049ef4a5dbf4a40cbf3ad43ea2d64482569e0ca48ff2f534abf60019bd7cf",
             ),
             (
                 "openclaw.plugin.json",

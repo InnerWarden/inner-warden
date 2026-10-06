@@ -330,6 +330,52 @@ fn a_turn_that_failed_or_said_nothing_is_reported_as_no_reply() {
     }
 }
 
+/// A turn holding a message in a shape the plugin was not written against is
+/// not reported as a reply: another OpenClaw version, or a provider that
+/// passes its own `tool_use` block through, could carry a tool call the
+/// plugin cannot see, and "replied" is the one report that would hide it. The
+/// ask is left to the message hook's timer, which records it as not seen. A
+/// tool call the plugin does recognise is still reported, whatever else the
+/// turn holds.
+///
+/// FAILS ON REVERT: drop the shape check in `turnEnd` and the first two turns
+/// are reported as `replied`.
+#[test]
+fn a_turn_in_a_shape_the_plugin_does_not_know_is_not_reported_as_a_reply() {
+    if !node_available("a_turn_in_a_shape_the_plugin_does_not_know_is_not_reported_as_a_reply") {
+        return;
+    }
+    let tool_use = format!(
+        r#"{THE_ASK},
+          {{"role":"assistant","content":[{{"type":"tool_use","id":"t1","name":"exec","input":{{"command":"./xmrig"}}}}],
+           "stopReason":"toolUse","timestamp":1791308349600}},
+          {JUST_NO}"#
+    );
+    let tool_role = format!(
+        r#"{THE_ASK},
+          {{"role":"tool","content":[{{"type":"text","text":"started"}}],"timestamp":1791308349610}},
+          {JUST_NO}"#
+    );
+    let known_tool_and_unknown = format!(
+        r#"{THE_ASK},
+          {{"role":"assistant","content":[{{"type":"toolCall","id":"c1","name":"exec","arguments":{{}}}}],
+           "stopReason":"toolUse","timestamp":1791308349600}},
+          {{"role":"tool","content":[],"timestamp":1791308349610}},
+          {JUST_NO}"#
+    );
+    let driven = drive(&format!(
+        "[{}, {}, {}]",
+        turn("run-tool-use", &tool_use, true),
+        turn("run-tool-role", &tool_role, true),
+        turn("run-both", &known_tool_and_unknown, true)
+    ));
+    assert_eq!(
+        driven.calls,
+        "ARGS observe ended --session agent:main:main --run run-both --turn used_tools\nSTDIN \n",
+        "only the turn with a tool call the plugin recognises is reported"
+    );
+}
+
 /// Only a Control UI turn a person started is read. `agent_end` takes no
 /// trigger filter (the host honours `eligibleTriggers` for
 /// `before_agent_reply` only), so a heartbeat or cron turn in the SAME session
