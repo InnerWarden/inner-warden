@@ -3,6 +3,56 @@
 All notable changes to InnerWarden are documented here. This project
 follows semantic versioning.
 
+## Unreleased
+
+### Upgrade notes: what to do
+
+- **OpenClaw message hook: install it again.** `innerwarden observe install`,
+  then restart the OpenClaw gateway. The hook an earlier version wrote keeps
+  running after an upgrade, and with it Control UI chats are recorded only
+  after 15 minutes and without the agent's name. `innerwarden observe status`,
+  the dashboard's Messages card and `upgrade` now say when it is out of date.
+- **A copy installed from the `.deb` or `.rpm` is upgraded with the package.**
+  `innerwarden upgrade` refuses it and exits 2, so an unattended
+  `sudo innerwarden upgrade` on such a host now fails. Use the command it
+  prints (it fetches the package and its checksum into a private directory,
+  checks it, then installs it), or `--yes` to replace the file anyway.
+  `upgrade --check` reports on every kind of install.
+- **`innerwarden uninstall` on a packaged copy** removes the hooks, the
+  configuration and the `iw` / `iw-guard` shortcuts, leaves the binary to
+  `sudo apt remove innerwarden` or `sudo dnf remove innerwarden`, and exits 1
+  with "partly removed" until that is done.
+- **Reconnect MCP agents to have them named.** `innerwarden agents connect`
+  now writes `--label` and `--agent` into each MCP wrapper, so its decisions
+  are recorded under the session `mcp:<agent>` instead of `mcp:innerwarden`.
+  Run it again for wrappers an earlier version wrote; history recorded before
+  that stays under the old session.
+
+### Changed
+
+- **The MCP proxy ends with its session.** When the client closes, the proxy
+  relays the server's last output for 3 s, then stops the server: SIGTERM to
+  its whole process group, SIGKILL 1 s later, so a server started through
+  `npx`, `uvx` or `sh -c` is stopped with its launcher.
+- **The MCP loop breaker holds one call for one window.** An identical tool
+  call made more than 3 times within 60 s is refused (guard) or flagged
+  (advisory), that call only, and the refusal says when it is accepted again.
+  The cost ceiling is gone. Library users: `innerwarden_agent_guard::breaker`'s
+  `BreakerConfig` and `Breaker::record` changed.
+- **Conversation records claim less, and say why.** `guard_denied` is recorded
+  only for an observed reply and an enforce-mode refusal on a line naming the
+  agent that was asked; a monitor-mode `would_block` in the window is recorded
+  as `undetermined` with `decider_basis: flagged_action_ran_in_window`, never
+  as a refusal or as the model declining. `guard.attempt` gains `agent` and
+  the bases `next_message_before_reply`, `channel_reports_no_reply`,
+  `pending_limit_reached`, `pending_state_unavailable` and
+  `flagged_action_ran_in_window`; `guard.blocked` gains `agent`.
+- **A guard event file that cannot be written is an outage.** A link, a second
+  name, something that is not a plain file, or a file this account cannot
+  append to, at `guard-events.jsonl` or `record-health.json`, is reported by
+  `innerwarden graph` and the dashboard with the fix, instead of dropping lines
+  silently.
+
 ## 1.5.1 - 2026-09-30
 
 ### Fixed
