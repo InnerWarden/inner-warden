@@ -2,6 +2,7 @@
 //! them against content at various inspection points.
 
 use std::path::Path;
+use std::sync::OnceLock;
 
 use fancy_regex::Regex as FancyRegex;
 use include_dir::{include_dir, Dir};
@@ -85,7 +86,7 @@ pub struct AtrReferences {
     pub mitre_attack: Vec<String>,
 }
 
-/// A compiled ATR rule ready for matching.
+/// A loaded ATR rule ready for matching.
 struct CompiledRule {
     id: String,
     title: String,
@@ -96,9 +97,83 @@ struct CompiledRule {
     /// every surface. Keeping this separate from `field` prevents a prompt
     /// rule with `field: content` from being run over an executable command.
     source_type: String,
-    conditions: Vec<CompiledCondition>,
+    conditions: RuleConditions,
     logic: ConditionLogic,
     references: AtrReferences,
+}
+
+/// One regex condition as the rule wrote it, before it is compiled.
+struct PendingCondition {
+    field: AtrField,
+    pattern: String,
+    description: String,
+}
+
+/// A rule's regex conditions, compiled the first time the rule is evaluated.
+///
+/// # Why the shipped corpus compiles on first use
+///
+/// The compiled regexes are almost all of the engine's memory. The shipped
+/// corpus has close to 600 conditions, and its bounded repetitions
+/// (`.{0,200}`, `[^)]{0,300}`) over Unicode classes compile to large automata,
+/// built once forwards and once in reverse: about 34 MB of heap for the whole
+/// corpus, before any search warms a cache. Measured on Linux x86_64 release,
+/// that put each `innerwarden proxy` at about 41 MB of private anonymous
+/// memory before it had screened anything. An MCP client keeps one proxy per
+/// wrapped server open for its whole session, so a user with five servers in
+/// two editors paid that ten times over.
+///
+/// Most of it could never run. The proxy inspects tool calls, tool
+/// descriptions and tool results (`tool_call` and `mcp_exchange` rules); the
+/// `llm_io` rules alone are about 21 MB, and [`source_matches`] filters every
+/// one of them out before a regex is consulted. So a rule now compiles when a
+/// context it applies to first reaches it, and a rule no inspected surface
+/// selects is never compiled at all.
+///
+/// Detection is unchanged by construction: a rule is compiled before its first
+/// evaluation completes, through the same compiler as before, so its first
+/// answer is the answer the eager load would have given. Nothing is skipped
+/// while it warms up, and concurrent first evaluations wait for the one
+/// compile rather than racing past it ([`OnceLock`]).
+///
+/// The surfaces are not listed anywhere. A hand-written "rules the proxy
+/// needs" list would be correct on the day it was written and silently drop a
+/// detection the day the proxy starts inspecting something new; this way a new
+/// inspection compiles what it needs the first time it runs.
+///
+/// Rules read from disk still compile at load (see [`Compile::AtLoad`]).
+struct RuleConditions {
+    pending: Vec<PendingCondition>,
+    compiled: OnceLock<Vec<CompiledCondition>>,
+}
+
+impl RuleConditions {
+    /// The compiled conditions, compiling them on the first call.
+    fn get(&self, rule_id: &str) -> &[CompiledCondition] {
+        self.compiled
+            .get_or_init(|| compile_conditions(rule_id, &self.pending))
+    }
+
+    /// Whether this rule's regexes have been compiled yet.
+    #[cfg(test)]
+    fn is_compiled(&self) -> bool {
+        self.compiled.get().is_some()
+    }
+}
+
+/// When a parsed rule's regexes are compiled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Compile {
+    /// Before the rule is accepted, for rules read from disk. An operator's
+    /// rule whose every pattern fails to compile must be rejected at load:
+    /// as an overlay it would otherwise replace the shipped rule of the same
+    /// id with one that can never match, and nothing would say so until it
+    /// was evaluated.
+    AtLoad,
+    /// On first evaluation, for the corpus embedded in the binary, whose
+    /// every pattern is checked to compile by
+    /// `every_embedded_condition_compiles` (see [`RuleConditions`]).
+    OnFirstUse,
 }
 
 /// The host-authoritative surface being inspected. Rule authors already
@@ -248,30 +323,28 @@ impl RuleEngine {
         Ok(Self::from_rules(rules))
     }
 
-    /// Load the ATR rules embedded in the binary at compile time (the vendored
-    /// `rules/atr` corpus). Always available, no filesystem required. Only the
-    /// `pattern`-tier rules compile; `semantic`-tier rules are skipped (no
-    /// executor yet), so the loaded count is the pattern-tier subset.
-    /// Load only the rules that could ever fire for `source`.
+    /// Load only the embedded rules that could ever fire for `source`.
     ///
     /// # Why this exists (audit PERF-05)
     ///
-    /// Loading the corpus compiles 62 regexes, which measured at ~130ms in a
-    /// release build. `innerwarden hook` is a ONE-SHOT process that runs before
-    /// every agent tool call, so it paid that on each call: an agent making 50
-    /// tool calls spent 6.5 seconds inside the guard, while the screening itself
-    /// costs ~40 MICROseconds. The load was three orders of magnitude more than
-    /// the work.
+    /// Loading the corpus used to compile 62 rules' regexes, measured at ~130ms
+    /// in a release build. `innerwarden hook` is a ONE-SHOT process that runs
+    /// before every agent tool call, so it paid that on each call: an agent
+    /// making 50 tool calls spent 6.5 seconds inside the guard, while the
+    /// screening itself costs ~40 MICROseconds. The load was three orders of
+    /// magnitude more than the work.
     ///
     /// Worse, for the shell surface it bought nothing at all: no rule in the
-    /// corpus declares `shell_command` or `any`, so every one of those 62
-    /// regexes was compiled in order to be filtered out by
-    /// [`source_matches`] before it ran.
+    /// corpus declares `shell_command` or `any`, so every one of those regexes
+    /// was compiled in order to be filtered out by [`source_matches`] before it
+    /// ran.
     ///
-    /// So the filter moves ahead of the compile. This is self-adjusting rather
+    /// The filter moved ahead of the compile, and the embedded corpus now
+    /// compiles each rule on first use anyway ([`RuleConditions`]), so a load is
+    /// only the YAML parse. What the filter still buys is an engine that holds
+    /// and counts only rules its surface can match. It is self-adjusting rather
     /// than a hardcoded skip: the day shell-surface rules are authored, they
-    /// match here and get compiled, and the cost returns in proportion to the
-    /// rules that can actually fire.
+    /// match here and are kept.
     ///
     /// A slow guard is a guard that gets switched off, which is the same failure
     /// as a guard that denies too much, reached from the other side.
@@ -286,6 +359,14 @@ impl RuleEngine {
         Self::from_rules(rules)
     }
 
+    /// Load the ATR rules embedded in the binary at compile time (the vendored
+    /// `rules/atr` corpus). Always available, no filesystem required. Only the
+    /// `pattern`-tier rules load; `semantic`-tier rules are skipped (no
+    /// executor yet), so the loaded count is the pattern-tier subset.
+    ///
+    /// Each rule's regexes compile the first time a context it applies to
+    /// reaches it, so an engine pays memory only for the surfaces its process
+    /// inspects. See [`RuleConditions`] for why and what it saves.
     pub fn load_embedded() -> Self {
         let mut rules = Vec::new();
         collect_embedded_rules(&EMBEDDED_ATR_DIR, &mut rules);
@@ -470,6 +551,17 @@ impl RuleEngine {
             .map(|rule| (rule.id.clone(), rule.title.clone()))
             .collect()
     }
+
+    /// The id and declared surface of each rule whose regexes are compiled
+    /// so far: what this engine has paid memory for.
+    #[cfg(test)]
+    pub(crate) fn compiled_rules(&self) -> Vec<(&str, &str)> {
+        self.rules
+            .iter()
+            .filter(|rule| rule.conditions.is_compiled())
+            .map(|rule| (rule.id.as_str(), rule.source_type.as_str()))
+            .collect()
+    }
 }
 
 /// Does a rule declaring `declared` apply to a context of `actual`?
@@ -529,8 +621,9 @@ fn make_match(rule: &CompiledRule, description: String) -> AtrMatch {
 }
 
 fn eval_rule_context(rule: &CompiledRule, context: AtrContext<'_>) -> Option<AtrMatch> {
+    let conditions = rule.conditions.get(&rule.id);
     match rule.logic {
-        ConditionLogic::Any => rule.conditions.iter().find_map(|condition| {
+        ConditionLogic::Any => conditions.iter().find_map(|condition| {
             let value = context_value(context, condition.field)?;
             condition
                 .regex
@@ -539,7 +632,7 @@ fn eval_rule_context(rule: &CompiledRule, context: AtrContext<'_>) -> Option<Atr
         }),
         ConditionLogic::All => {
             let mut first = None;
-            for condition in &rule.conditions {
+            for condition in conditions {
                 let value = context_value(context, condition.field)?;
                 if !condition.regex.is_match(value) {
                     return None;
@@ -683,28 +776,25 @@ fn parse_field(raw: &str) -> AtrField {
 
 fn load_rule_file(path: &Path) -> anyhow::Result<Option<CompiledRule>> {
     let content = std::fs::read_to_string(path)?;
-    load_rule_str(&content)
+    load_rule_str_for(&content, None, Compile::AtLoad)
 }
 
-/// Parse and compile a single ATR rule from raw YAML text.
+/// Parse one rule, optionally skipping it before anything is kept for it.
 ///
-/// Returns `Ok(None)` for non-pattern-tier rules or rules whose conditions all
-/// fail to compile, same contract as [`load_rule_file`], minus the filesystem.
-/// Used both by the on-disk loader and the embedded-corpus loader.
-fn load_rule_str(content: &str) -> anyhow::Result<Option<CompiledRule>> {
-    load_rule_str_for(content, None)
-}
-
-/// Parse one rule, optionally skipping it before its regexes are compiled.
+/// Returns `Ok(None)` for non-pattern-tier rules, rules with no regex
+/// condition, a rule `only_for` excludes, and (with [`Compile::AtLoad`]) a
+/// rule whose every condition fails to compile.
 ///
-/// The filter has to happen HERE rather than on the finished `Vec`: compiling
-/// the regexes is the expensive part (~130ms for the corpus), so discarding a
-/// rule afterwards costs exactly as much as keeping it. Measured: filtering
-/// after the fact moved the hook from 208ms to 200ms; filtering here is what
-/// actually removes the work.
+/// The surface filter happens here rather than on the finished `Vec` because
+/// it once had to: compiling was the expensive part of a load (~130ms for the
+/// corpus), so discarding a rule afterwards cost exactly as much as keeping it.
+/// With the embedded corpus compiling on first use ([`RuleConditions`]) a load
+/// is now only the YAML parse, and the filter keeps an engine scoped to one
+/// surface from holding (and counting) rules that surface can never match.
 fn load_rule_str_for(
     content: &str,
     only_for: Option<AtrSource>,
+    when: Compile,
 ) -> anyhow::Result<Option<CompiledRule>> {
     let raw: RawRule = serde_yaml::from_str(content)?;
 
@@ -713,8 +803,8 @@ fn load_rule_str_for(
         return Ok(None);
     }
 
-    // Cheap check before the expensive one: a rule that can never match this
-    // surface is not worth compiling.
+    // Cheap check before anything else: a rule that can never match this
+    // surface is not worth keeping.
     if let Some(source) = only_for {
         if !source_matches(&raw.agent_source.source_type, source) {
             return Ok(None);
@@ -724,7 +814,21 @@ fn load_rule_str_for(
     let id = raw.id.unwrap_or_default();
     let title = raw.title.unwrap_or_default();
 
-    if raw.detection.conditions.is_empty() {
+    let pending: Vec<PendingCondition> = raw
+        .detection
+        .conditions
+        .iter()
+        .filter(|cond| cond.operator == "regex" && !cond.value.is_empty())
+        .map(|cond| PendingCondition {
+            field: parse_field(&cond.field),
+            pattern: cond.value.clone(),
+            description: cond
+                .description
+                .clone()
+                .unwrap_or_else(|| format!("{id} match")),
+        })
+        .collect();
+    if pending.is_empty() {
         return Ok(None);
     }
 
@@ -733,52 +837,11 @@ fn load_rule_str_for(
         _ => ConditionLogic::Any,
     };
 
-    let mut conditions = Vec::new();
-    for cond in &raw.detection.conditions {
-        if cond.operator != "regex" || cond.value.is_empty() {
-            continue;
-        }
-        match Regex::new(&cond.value) {
-            Ok(re) => {
-                conditions.push(CompiledCondition {
-                    field: parse_field(&cond.field),
-                    regex: CompiledRegex::Fast(re),
-                    description: cond
-                        .description
-                        .clone()
-                        .unwrap_or_else(|| format!("{id} match")),
-                });
-            }
-            Err(e_fast) => match FancyRegex::new(&cond.value) {
-                Ok(re) => {
-                    warn!(
-                        rule = %id,
-                        pattern = %cond.value,
-                        "compiled ATR regex with fancy-regex fallback"
-                    );
-                    conditions.push(CompiledCondition {
-                        field: parse_field(&cond.field),
-                        regex: CompiledRegex::Fancy(re),
-                        description: cond
-                            .description
-                            .clone()
-                            .unwrap_or_else(|| format!("{id} match")),
-                    });
-                }
-                Err(e_fancy) => {
-                    warn!(
-                        rule = %id,
-                        pattern = %cond.value,
-                        regex_error = %e_fast,
-                        fancy_error = %e_fancy,
-                        "failed to compile ATR regex, skipping condition"
-                    );
-                }
-            },
-        }
-    }
-
-    if conditions.is_empty() {
+    let conditions = RuleConditions {
+        pending,
+        compiled: OnceLock::new(),
+    };
+    if when == Compile::AtLoad && conditions.get(&id).is_empty() {
         return Ok(None);
     }
 
@@ -794,8 +857,46 @@ fn load_rule_str_for(
     }))
 }
 
+/// Compile a rule's regex conditions. A pattern the `regex` crate rejects
+/// (look-around, back-references) falls back to `fancy-regex`; a pattern
+/// neither accepts is skipped with a warning, and the rule keeps the rest.
+fn compile_conditions(rule_id: &str, pending: &[PendingCondition]) -> Vec<CompiledCondition> {
+    let mut conditions = Vec::with_capacity(pending.len());
+    for cond in pending {
+        let regex = match Regex::new(&cond.pattern) {
+            Ok(re) => CompiledRegex::Fast(re),
+            Err(e_fast) => match FancyRegex::new(&cond.pattern) {
+                Ok(re) => {
+                    warn!(
+                        rule = %rule_id,
+                        pattern = %cond.pattern,
+                        "compiled ATR regex with fancy-regex fallback"
+                    );
+                    CompiledRegex::Fancy(re)
+                }
+                Err(e_fancy) => {
+                    warn!(
+                        rule = %rule_id,
+                        pattern = %cond.pattern,
+                        regex_error = %e_fast,
+                        fancy_error = %e_fancy,
+                        "failed to compile ATR regex, skipping condition"
+                    );
+                    continue;
+                }
+            },
+        };
+        conditions.push(CompiledCondition {
+            field: cond.field,
+            regex,
+            description: cond.description.clone(),
+        });
+    }
+    conditions
+}
+
 /// Recursively parse every `*.yaml`/`*.yml` file in an embedded directory tree,
-/// pushing successfully-compiled pattern-tier rules into `out`. Mirrors
+/// pushing pattern-tier rules into `out`, to compile on first use. Mirrors
 /// [`collect_yaml_recursive`] + [`load_rule_file`] but over `include_dir` data.
 fn collect_embedded_rules(dir: &Dir<'_>, out: &mut Vec<CompiledRule>) {
     collect_embedded_rules_for(dir, out, None)
@@ -818,9 +919,9 @@ fn collect_embedded_rules_for(
             warn!(file = %file.path().display(), "embedded ATR rule is not valid UTF-8, skipping");
             continue;
         };
-        match load_rule_str_for(content, only_for) {
+        match load_rule_str_for(content, only_for, Compile::OnFirstUse) {
             Ok(Some(rule)) => out.push(rule),
-            Ok(None) => {} // skipped (not pattern tier / no compilable conditions)
+            Ok(None) => {} // skipped (not pattern tier / no regex conditions / other surface)
             Err(e) => {
                 warn!(file = %file.path().display(), error = %e, "failed to load embedded ATR rule")
             }
@@ -1125,9 +1226,11 @@ detection:
     #[test]
     fn embedded_corpus_loads_all_pattern_tier_rules() {
         // Anchors the vendored `rules/atr` corpus against drift: if a community
-        // rule's YAML breaks deserialization or a regex fails to compile, this
-        // count drops and CI fails HERE (in this crate) instead of silently
-        // degrading the engine in prod.
+        // rule's YAML breaks deserialization, this count drops and CI fails
+        // HERE (in this crate) instead of silently degrading the engine in
+        // prod. A regex that fails to compile is caught by
+        // `every_embedded_condition_compiles`: the embedded corpus compiles on
+        // first use, so a load no longer sees one.
         let engine = RuleEngine::load_embedded();
         assert_eq!(
             engine.rule_count(),
@@ -1146,6 +1249,220 @@ detection:
         assert!(
             matches.iter().any(|m| m.rule_id == "ATR-2026-080"),
             "embedded corpus should flag the ATR-2026-080 encoding-evasion payload, got {matches:?}"
+        );
+    }
+
+    /// Every regex condition in the corpus the binary ships compiles, with
+    /// the `regex` crate or its `fancy-regex` fallback.
+    ///
+    /// The embedded corpus compiles on first use ([`RuleConditions`]), so a
+    /// pattern that fails no longer keeps its rule out of the load: the rule
+    /// would load, count, and then quietly lack that condition, or match
+    /// nothing at all. Rules read from disk are still refused at load
+    /// ([`Compile::AtLoad`]); this is the same guarantee for the shipped ones,
+    /// stronger than the old one, which only noticed a rule losing EVERY
+    /// condition.
+    #[test]
+    fn every_embedded_condition_compiles() {
+        let engine = RuleEngine::load_embedded();
+        let broken: Vec<String> = engine
+            .rules
+            .iter()
+            .filter_map(|rule| {
+                let compiled = rule.conditions.get(&rule.id).len();
+                let written = rule.conditions.pending.len();
+                (compiled != written).then(|| format!("{} ({compiled}/{written})", rule.id))
+            })
+            .collect();
+        assert!(
+            broken.is_empty(),
+            "shipped ATR rules with a condition that does not compile (compiled/written): {broken:?}"
+        );
+    }
+
+    /// REGRESSION ANCHOR for the MCP proxy's memory (each proxy held about
+    /// 41 MB of compiled rules before it had screened anything).
+    ///
+    /// Loading the corpus must compile nothing, and inspecting one surface
+    /// must compile exactly the rules that surface selects: all of them, before
+    /// the first answer, and none of the others.
+    ///
+    /// FAILS ON REVERT: compile the embedded corpus at load
+    /// (`Compile::AtLoad` in `collect_embedded_rules_for`) and the load
+    /// already holds every rule's regexes.
+    #[test]
+    fn a_rule_compiles_when_a_surface_it_applies_to_is_first_inspected() {
+        let engine = RuleEngine::load_embedded();
+        assert!(
+            engine.compiled_rules().is_empty(),
+            "loading the corpus compiled rules nothing has inspected yet: {:?}",
+            engine.compiled_rules()
+        );
+
+        let matches = engine.check_context(AtrContext::tool_call(
+            "fetch",
+            "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+        ));
+        assert!(
+            matches.iter().any(|m| m.rule_id == "ATR-2026-013"),
+            "the first tool call inspected must already be screened by its rules, got {matches:?}"
+        );
+
+        let compiled = engine.compiled_rules();
+        let foreign: Vec<_> = compiled
+            .iter()
+            .filter(|(_, source)| *source != "tool_call")
+            .collect();
+        assert!(
+            foreign.is_empty(),
+            "inspecting a tool call compiled rules no tool call can select: {foreign:?}"
+        );
+        let tool_call_rules = engine
+            .rules
+            .iter()
+            .filter(|rule| rule.source_type == "tool_call")
+            .count();
+        assert_eq!(
+            compiled.len(),
+            tool_call_rules,
+            "every tool_call rule must be compiled once a tool call has been inspected"
+        );
+    }
+
+    /// Every text the shipped corpus carries as a test case, positive or
+    /// negative, whatever field it was written under.
+    fn embedded_test_case_texts() -> Vec<String> {
+        fn strings(value: &serde_yaml::Value, out: &mut Vec<String>) {
+            match value {
+                serde_yaml::Value::String(text) => out.push(text.clone()),
+                serde_yaml::Value::Sequence(items) => {
+                    items.iter().for_each(|item| strings(item, out))
+                }
+                serde_yaml::Value::Mapping(map) => {
+                    for (key, item) in map {
+                        // The case's verdict and prose are not inputs.
+                        if matches!(
+                            key.as_str(),
+                            Some(
+                                "expected"
+                                    | "description"
+                                    | "reason"
+                                    | "notes"
+                                    | "matched_condition"
+                            )
+                        ) {
+                            continue;
+                        }
+                        strings(item, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        fn walk(dir: &Dir<'_>, out: &mut Vec<String>) {
+            for file in dir.files() {
+                let Some(content) = file.contents_utf8() else {
+                    continue;
+                };
+                let Ok(doc) = serde_yaml::from_str::<serde_yaml::Value>(content) else {
+                    continue;
+                };
+                if let Some(cases) = doc.get("test_cases") {
+                    strings(cases, out);
+                }
+            }
+            dir.dirs().for_each(|sub| walk(sub, out));
+        }
+        let mut out = Vec::new();
+        walk(&EMBEDDED_ATR_DIR, &mut out);
+        out
+    }
+
+    /// The embedded corpus, compiled at load as it was before it compiled on
+    /// first use: the reference the lazy engine is compared with.
+    fn embedded_compiled_at_load() -> RuleEngine {
+        fn walk(dir: &Dir<'_>, out: &mut Vec<CompiledRule>) {
+            for file in dir.files() {
+                if let Some(Ok(Some(rule))) = file
+                    .contents_utf8()
+                    .map(|content| load_rule_str_for(content, None, Compile::AtLoad))
+                {
+                    out.push(rule);
+                }
+            }
+            dir.dirs().for_each(|sub| walk(sub, out));
+        }
+        let mut rules = Vec::new();
+        walk(&EMBEDDED_ATR_DIR, &mut rules);
+        RuleEngine::from_rules(rules)
+    }
+
+    /// Compiling on first use must not change one verdict. Every test-case
+    /// text in the shipped corpus is inspected on every surface, by an engine
+    /// compiled at load and by a fresh one compiled as it goes, and the
+    /// matches (rule, condition, severity) must be the same.
+    #[test]
+    fn compiling_on_first_use_gives_the_verdicts_compiling_at_load_gives() {
+        let texts = embedded_test_case_texts();
+        assert!(
+            texts.len() > 500,
+            "expected the corpus's test cases, found {} texts",
+            texts.len()
+        );
+        let at_load = embedded_compiled_at_load();
+        let on_first_use = RuleEngine::load_embedded();
+        assert_eq!(at_load.rule_count(), on_first_use.rule_count());
+
+        let surfaces = [
+            AtrSource::Any,
+            AtrSource::LlmIo,
+            AtrSource::ToolCall,
+            AtrSource::McpExchange,
+            AtrSource::MultiAgentComm,
+            AtrSource::AgentCommunication,
+            AtrSource::MemoryAccess,
+            AtrSource::ContextWindow,
+            AtrSource::ShellCommand,
+        ];
+        let verdicts = |engine: &RuleEngine, context: AtrContext<'_>| {
+            let mut found: Vec<(String, String, String)> = engine
+                .check_context(context)
+                .into_iter()
+                .map(|m| (m.rule_id, m.matched_condition, m.severity))
+                .collect();
+            found.sort();
+            found
+        };
+
+        let mut fired = std::collections::HashSet::new();
+        for text in &texts {
+            for source in surfaces {
+                let context = AtrContext {
+                    source,
+                    user_input: Some(text),
+                    tool_args: Some(text),
+                    tool_response: Some(text),
+                    tool_name: Some(text),
+                    content: Some(text),
+                };
+                let expected = verdicts(&at_load, context);
+                let got = verdicts(&on_first_use, context);
+                assert_eq!(
+                    got,
+                    expected,
+                    "compiled on first use, {} disagreed on {text:?}",
+                    source.as_str()
+                );
+                fired.extend(expected.into_iter().map(|(id, _, _)| id));
+            }
+        }
+        // Not a comparison of two silences: the corpus's own cases fire
+        // nearly every rule (61 of 62 when this was written).
+        assert!(
+            fired.len() * 10 >= at_load.rule_count() * 9,
+            "only {} of {} rules fired on the corpus's test cases",
+            fired.len(),
+            at_load.rule_count()
         );
     }
 

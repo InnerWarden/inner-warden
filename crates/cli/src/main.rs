@@ -376,9 +376,9 @@ fn cmd_check(rest: &[String]) -> std::process::ExitCode {
         return std::process::ExitCode::from(2);
     }
 
-    // Shell surface only: loading the whole corpus compiles 62 regexes
-    // (~130ms) that cannot match a command, on a process that runs per
-    // tool call. See `RuleEngine::load_embedded_for`.
+    // Shell surface only: an engine that holds just the rules a command can
+    // match, on a process that runs per tool call. See
+    // `RuleEngine::load_embedded_for`.
     let engine =
         RuleEngine::load_embedded_for(innerwarden_agent_guard::rules::AtrSource::ShellCommand);
     let rules = analyze(&command, &engine);
@@ -578,9 +578,9 @@ fn hook_verdict_for(command: &str) -> Option<(String, serde_json::Value)> {
     if command.trim().is_empty() {
         return None;
     }
-    // Shell surface only: loading the whole corpus compiles 62 regexes
-    // (~130ms) that cannot match a command, on a process that runs per
-    // tool call. See `RuleEngine::load_embedded_for`.
+    // Shell surface only: an engine that holds just the rules a command can
+    // match, on a process that runs per tool call. See
+    // `RuleEngine::load_embedded_for`.
     let engine =
         RuleEngine::load_embedded_for(innerwarden_agent_guard::rules::AtrSource::ShellCommand);
     Some((command.clone(), analyze(&command, &engine)))
@@ -1609,9 +1609,9 @@ fn cmd_serve(rest: &[String]) -> std::process::ExitCode {
         }
     }
 
-    // Shell surface only: loading the whole corpus compiles 62 regexes
-    // (~130ms) that cannot match a command, on a process that runs per
-    // tool call. See `RuleEngine::load_embedded_for`.
+    // Shell surface only: an engine that holds just the rules a command can
+    // match, on a process that runs per tool call. See
+    // `RuleEngine::load_embedded_for`.
     let engine =
         RuleEngine::load_embedded_for(innerwarden_agent_guard::rules::AtrSource::ShellCommand);
     let server = match tiny_http::Server::http(bind.as_str()) {

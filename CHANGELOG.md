@@ -149,6 +149,13 @@ follows semantic versioning.
   sample of up to 4 KiB, drawn by a key chosen per proxy; a value over 256
   bytes is kept by its start, which still matches a call that carries all of
   it. The store stays bounded, at about 1.1 MiB per proxy.
+- **Each MCP proxy uses about half the memory.** A proxy compiled every rule
+  in the shipped corpus as it started, about 47 MB before it had screened a
+  message, half of it rules for model prompts that a proxy never applies.
+  Each rule is now compiled the first time something it applies to is
+  screened, before that first verdict is given: a proxy starts at about 6 MB
+  and, once tool calls and results have passed through it, holds about 25 MB
+  where it held about 52 MB (Linux x86_64). The verdicts are unchanged.
 - **The MCP proxy no longer refuses every `write_file`.** ATR-2026-040 matched
   the tool's name, so in guard mode (the proxy's default) every write through
   a filesystem server was refused, an ordinary one inside its allowed

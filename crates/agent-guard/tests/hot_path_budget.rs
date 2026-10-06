@@ -100,21 +100,25 @@ fn screening_stays_within_its_budget() {
 /// REGRESSION ANCHOR for the fix that came out of PERF-05.
 ///
 /// `innerwarden hook` is a one-shot process: it loads the rule corpus, screens
-/// one command, and exits. Loading the FULL corpus compiles 62 regexes, which
-/// measured at ~130ms release and ~1.2s debug, and the hook paid it on every
-/// agent tool call while the screening itself cost ~40 microseconds.
+/// one command, and exits. Loading the FULL corpus used to compile 62 rules'
+/// regexes, which measured at ~130ms release and ~1.2s debug, and the hook
+/// paid it on every agent tool call while the screening itself cost ~40
+/// microseconds.
 ///
 /// None of those regexes could fire: no rule in the corpus declares the shell
 /// surface, so all 62 were compiled in order to be filtered out. Loading only
 /// what can match took one end-to-end hook invocation from **208ms to 73ms**.
+/// The embedded corpus has since moved to compiling each rule on first use
+/// (`rules::RuleConditions`), so a load is the YAML parse alone.
 ///
-/// FAILS ON REVERT: filter after compiling instead of before (which was the
-/// first attempt, and moved the hook from 208ms to 200ms), or point the hook
-/// back at the unfiltered loader.
+/// FAILS ON REVERT: a load that compiles what its surface cannot match, that
+/// is, the corpus compiled at load with the surface filter applied after the
+/// compile instead of before (the first attempt, which moved the hook from
+/// 208ms to 200ms).
 #[test]
 fn the_shell_surface_loads_only_what_can_match_it() {
-    // Generous against the measured near-zero cost, tight enough that loading
-    // the full corpus here (seconds in debug) cannot pass.
+    // Generous against the measured near-zero cost, tight enough that
+    // compiling the full corpus here (seconds in debug) cannot pass.
     const SHELL_LOAD_BUDGET_MICROS: u128 = 300_000;
 
     let start = Instant::now();
