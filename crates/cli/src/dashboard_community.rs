@@ -369,15 +369,23 @@ pub(crate) fn parse_event_log(text: &str) -> EventLog {
     log
 }
 
-/// A message's outcome key, from who decided. A model that declined is the
-/// agent's own doing; only a control that refused is InnerWarden's. Anything
-/// else is an outcome that could not be seen (`not_seen`), never "not
-/// recorded": a chat that does not report the agent's reply is a limit of the
-/// channel, not a fault in the record.
+/// A message's outcome key, from who decided. Only a control that refused is
+/// InnerWarden's. A model that declined is the agent's own doing, and only a
+/// caller that knows it says so (`declared_by_caller`). A reply that was seen
+/// is `answered`: its words are never read, so it does not show the agent
+/// declined, and records an earlier version wrote as `model_refused` from a
+/// reply alone read the same way. Anything else is an outcome that could not
+/// be seen (`not_seen`), never "not recorded": a chat that does not report
+/// the agent's reply is a limit of the channel, not a fault in the record.
 fn attempt_outcome(attempt: &Attempt) -> &'static str {
-    match attempt.decider.as_str() {
-        "model_refused" => "declined_by_agent",
-        "guard_denied" | "kernel_denied" if attempt.enforced => "stopped_by_innerwarden",
+    match (attempt.decider.as_str(), attempt.basis.as_str()) {
+        ("guard_denied" | "kernel_denied", _) if attempt.enforced => "stopped_by_innerwarden",
+        ("model_refused", "declared_by_caller") => "declined_by_agent",
+        (
+            "model_refused" | "undetermined",
+            "no_screened_execution_recorded_in_window" | "replied_without_tool_call",
+        ) => "answered",
+        ("model_refused", _) => "declined_by_agent",
         _ => "not_seen",
     }
 }
@@ -399,6 +407,12 @@ fn channel_words(channel: &str) -> String {
 /// recording fault when it is a limit of the channel.
 fn decider_words(decider: &str, basis: &str) -> &'static str {
     match (decider, basis) {
+        ("model_refused" | "undetermined", "no_screened_execution_recorded_in_window") => {
+            "Your agent replied, and nothing the guard screens ran; a tool it does not screen would not show here"
+        }
+        ("undetermined", "replied_without_tool_call") => {
+            "Your agent answered without running anything; whether it declined is not seen"
+        }
         ("model_refused", _) => "Your agent declined on its own",
         ("guard_denied", _) => "The guard refused it",
         ("kernel_denied", _) => "The kernel refused it",
@@ -736,7 +750,12 @@ fn agent_messages_lane(facts: &LaneFacts<'_>) -> Value {
         .filter(|attempt| attempt.ts >= window_start)
         .collect();
     let mut parts: Vec<(&'static str, usize)> = Vec::new();
-    for key in ["stopped_by_innerwarden", "declined_by_agent", "not_seen"] {
+    for key in [
+        "stopped_by_innerwarden",
+        "declined_by_agent",
+        "answered",
+        "not_seen",
+    ] {
         let count = recent
             .iter()
             .filter(|attempt| attempt_outcome(attempt) == key)
@@ -2300,12 +2319,22 @@ mod tests {
             words(line("undetermined", "some_future_basis")),
             "Outcome not seen"
         );
-        // A refusal is still the agent's, whatever the basis says.
+        // A reply is an answer, not a refusal: its words are not read, and a
+        // tool the guard does not screen leaves nothing. A record an earlier
+        // version wrote as `model_refused` from a reply alone reads the same.
+        for decider in ["undetermined", "model_refused"] {
+            assert_eq!(
+                words(line(decider, "no_screened_execution_recorded_in_window")),
+                "Your agent replied, and nothing the guard screens ran; a tool it does not screen would not show here"
+            );
+        }
         assert_eq!(
-            words(line(
-                "model_refused",
-                "no_screened_execution_recorded_in_window"
-            )),
+            words(line("undetermined", "replied_without_tool_call")),
+            "Your agent answered without running anything; whether it declined is not seen"
+        );
+        // A refusal a caller states is the agent's.
+        assert_eq!(
+            words(line("model_refused", "declared_by_caller")),
             "Your agent declined on its own"
         );
         // A line that names no decider at all is the one that was not recorded.
@@ -2320,6 +2349,8 @@ mod tests {
             ("undetermined", "pending_state_unavailable"),
             ("undetermined", "tool_call_in_turn"),
             ("undetermined", "turn_ended_without_reply"),
+            ("undetermined", "replied_without_tool_call"),
+            ("undetermined", "no_screened_execution_recorded_in_window"),
         ] {
             assert!(decider_words(decider, basis).chars().count() <= 120);
         }
@@ -2785,6 +2816,61 @@ mod tests {
         assert!(card(&quiet, InstalledFiles::NotInstalled, None)
             .get("next_step")
             .is_none());
+    }
+
+    /// A reply is an answer, never "declined by your agent": its words are
+    /// not read, and a tool the guard does not screen leaves nothing. That
+    /// holds for a record an earlier version wrote as `model_refused` from a
+    /// reply alone; only a refusal a caller stated is the agent's. The
+    /// Messages card counts each under the same key.
+    ///
+    /// FAILS ON REVERT: map `model_refused` to `declined_by_agent` whatever
+    /// its basis and the old record is counted as declined.
+    #[test]
+    fn a_reply_is_counted_as_answered_and_only_a_stated_refusal_as_declined() {
+        let line = |decider: &str, basis: &str, ts: u64| {
+            json!({"kind": "guard.attempt", "ts": ts, "channel": "telegram",
+                   "detail": "nohup ./xmrig &", "decider": decider,
+                   "decider_basis": basis, "enforced": false})
+            .to_string()
+        };
+        let now_s = 1_789_950_000;
+        let text = [
+            line(
+                "model_refused",
+                "no_screened_execution_recorded_in_window",
+                now_s,
+            ),
+            line(
+                "undetermined",
+                "no_screened_execution_recorded_in_window",
+                now_s + 1,
+            ),
+            line("undetermined", "replied_without_tool_call", now_s + 2),
+            line("model_refused", "declared_by_caller", now_s + 3),
+            line("undetermined", "tool_call_in_turn", now_s + 4),
+        ]
+        .join("\n");
+        let log = parse_event_log(&text);
+        let keys: Vec<&str> = log.attempts.iter().map(attempt_outcome).collect();
+        assert_eq!(
+            keys,
+            [
+                "not_seen",
+                "declined_by_agent",
+                "answered",
+                "answered",
+                "answered"
+            ],
+            "newest first"
+        );
+        let attempts = attempts_json(&log, None, 10).unwrap();
+        assert_eq!(
+            attempts["items"][1]["decider"],
+            "Your agent declined on its own"
+        );
+        assert_eq!(attempts["items"][1]["outcome_key"], "declined_by_agent");
+        assert_eq!(attempts["items"][4]["outcome_key"], "answered");
     }
 
     #[test]

@@ -10,11 +10,16 @@
 //! nothing.
 //!
 //! This module models the record that closes that gap, and the one property it
-//! must never lose: an attempt seen at the conversation layer is evidence that
-//! the MODEL declined, not evidence that InnerWarden blocked anything. So every
-//! record names its [`Decider`] and carries [`Decider::enforced`], and a
-//! consumer that wants to claim an enforcement win has to read a field that
-//! says `false`.
+//! must never lose: an attempt seen at the conversation layer is evidence of
+//! what the agent did in answer, never evidence that InnerWarden blocked
+//! anything. So every record names its [`Decider`] and carries
+//! [`Decider::enforced`], and a consumer that wants to claim an enforcement
+//! win has to read a field that says `false`. Nor is a reply evidence that
+//! the model declined: the reply's words are never read, and a reply that
+//! gives the attacker what they asked for, or follows a tool the guard does
+//! not screen, looks the same from here. A reply is recorded as answered
+//! ([`Basis::NoScreenedExecution`], [`Basis::ReplyWithoutToolCall`]), with
+//! the outcome left undetermined.
 //!
 //! All I/O (stdin, the sink, the pending file, the OpenClaw config) lives in
 //! `observe_io`.
@@ -61,6 +66,9 @@ pub const UNREPORTED_REPLY_WAIT_SECONDS: u64 = 120;
 ///
 /// The distinction is the whole point of the record. Three of these four are
 /// real answers and only two of them are the product doing anything.
+/// `observe` concludes [`Decider::ModelRefused`] only when the caller states
+/// it (`--decider`): it never reads a reply's words, so a reply alone does
+/// not show the model declined.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decider {
     /// The model declined in conversation. Nothing was enforced.
@@ -107,8 +115,15 @@ impl Decider {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Basis {
     /// A reply was delivered and no guard block was recorded in the window, so
-    /// nothing the guard screens ever ran.
+    /// nothing the guard screens ran. A tool the guard does not screen (an
+    /// OpenClaw agent's own exec) leaves nothing in its record, and the
+    /// reply's words are not read, so this says the agent answered, not that
+    /// it declined.
     NoScreenedExecution,
+    /// The agent's turn that answered the ask ended with a reply and called
+    /// no tool (the reply plugin read the turn). It ran nothing; whether its
+    /// reply declined or complied in words is not seen.
+    ReplyWithoutToolCall,
     /// The guard recorded a block in the same window as the ask.
     GuardBlockInWindow,
     /// Monitor mode let an action the guard flagged run in the same window as
@@ -145,6 +160,7 @@ impl Basis {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::NoScreenedExecution => "no_screened_execution_recorded_in_window",
+            Self::ReplyWithoutToolCall => "replied_without_tool_call",
             Self::GuardBlockInWindow => "guard_block_recorded_in_window",
             Self::FlaggedActionRanInWindow => "flagged_action_ran_in_window",
             Self::NoReplyWithinTtl => "no_reply_observed_within_ttl",
@@ -418,8 +434,15 @@ pub struct GuardWindow {
 /// How an ask that left the pending state is recorded. PURE: what the guard
 /// recorded in the ask's window is handed in.
 ///
-/// A model refusal is concluded only from a reply that was observed, and only
-/// when nothing in the window says otherwise. The guard is named as the
+/// A model refusal is never concluded here, only stated by a caller that
+/// knows it (`--decider`). An observed reply with nothing in the window
+/// saying otherwise is recorded as answered, outcome undetermined: on a
+/// channel whose turn the reply plugin read, that the turn called no tool
+/// ([`Basis::ReplyWithoutToolCall`]); anywhere else, that nothing the guard
+/// screens ran ([`Basis::NoScreenedExecution`]). The reply's words are not
+/// read, so a reply that complies in words, or one after a tool the guard
+/// does not screen, would otherwise read as the model declining. The guard is
+/// named as the
 /// decider only for a refusal it made in enforce mode, on a line naming the
 /// agent that was asked and the session the ask arrived in, of a turn whose
 /// reply was observed. The time window alone ties nothing to the ask: two
@@ -445,10 +468,10 @@ pub struct GuardWindow {
 /// wide by the time a later hook call flushes it.
 ///
 /// A turn that ended is a reply only when it called no tool and said
-/// something. One that called a tool acted, and its reply proves no refusal:
-/// a native tool the guard does not screen leaves no line in the sink, so
-/// "nothing screened ran" would be true while the ask was carried out. One
-/// that ended with nothing said is not a refusal either.
+/// something. One that called a tool acted: a native tool the guard does not
+/// screen leaves no line in the sink, so "nothing screened ran" would be true
+/// while the ask was carried out. One that ended with nothing said is not a
+/// reply either.
 pub fn outcome(leaving: Leaving, window: GuardWindow, recorded_at: u64) -> Attempt {
     let refused = window.refused_this_session || window.refused_unattributed;
     let replied = matches!(
@@ -465,8 +488,11 @@ pub fn outcome(leaving: Leaving, window: GuardWindow, recorded_at: u64) -> Attem
             (Decider::GuardDenied, Basis::GuardBlockInWindow)
         }
         _ if refused => (Decider::Undetermined, Basis::GuardBlockInWindow),
-        Departure::Replied { declared: None } | Departure::TurnEnded(TurnEnd::Replied) => {
-            (Decider::ModelRefused, Basis::NoScreenedExecution)
+        Departure::Replied { declared: None } => {
+            (Decider::Undetermined, Basis::NoScreenedExecution)
+        }
+        Departure::TurnEnded(TurnEnd::Replied) => {
+            (Decider::Undetermined, Basis::ReplyWithoutToolCall)
         }
         Departure::TurnEnded(TurnEnd::UsedTools) => (Decider::Undetermined, Basis::ToolCallInTurn),
         Departure::TurnEnded(TurnEnd::NoReply) => {
@@ -971,10 +997,44 @@ const QUESTION_OPENERS: &[&str] = &[
 /// reading: "configure xmrig for our pool and monitor the hashrate" is not a
 /// defence of xmrig.
 const BETWEEN_ACTION_AND_NAME: &[&str] = &[
-    "a", "an", "the", "some", "this", "that", "these", "those", "my", "our", "your", "their",
-    "its", "any", "all", "every", "each", "for", "on", "of", "in", "about", "against", "from",
-    "and", "or", "running", "rogue", "malicious", "old", "stray", "leftover", "suspicious",
-    "hidden", "unknown", "unwanted", "existing", "active",
+    "a",
+    "an",
+    "the",
+    "some",
+    "this",
+    "that",
+    "these",
+    "those",
+    "my",
+    "our",
+    "your",
+    "their",
+    "its",
+    "any",
+    "all",
+    "every",
+    "each",
+    "for",
+    "on",
+    "of",
+    "in",
+    "about",
+    "against",
+    "from",
+    "and",
+    "or",
+    "running",
+    "rogue",
+    "malicious",
+    "old",
+    "stray",
+    "leftover",
+    "suspicious",
+    "hidden",
+    "unknown",
+    "unwanted",
+    "existing",
+    "active",
 ];
 
 /// The most words [`BETWEEN_ACTION_AND_NAME`] may put there.
@@ -2394,23 +2454,32 @@ mod tests {
     }
 
     /// The settlements that existed before still hold where the evidence
-    /// carries them: a reply with nothing in its window is the model
-    /// declining, a reply with this agent's refusal in its window is the
+    /// carries them: a reply with this agent's refusal in its window is the
     /// guard, a stated decider is taken as stated, and an expired ask is
     /// unknown and is not correlated with blocks, because its window can be
     /// hours wide. A refusal no line ties to this agent is reported as being
-    /// in the window, and credits no one.
+    /// in the window, and credits no one. A reply with nothing in its window
+    /// is an answer, not a refusal: its words are not read, and a tool the
+    /// guard does not screen leaves nothing in the window.
+    ///
+    /// FAILS ON REVERT: read a reply with nothing in its window as the model
+    /// declining again and the first assert sees `model_refused`.
     #[test]
     fn replies_and_expiry_settle_on_what_the_window_holds() {
         let leave = |departure| Leaving {
             ask: pending("s1", 100),
             departure,
         };
-        let refused = outcome(leave(Departure::Replied { declared: None }), NOTHING, 120);
+        let answered = outcome(leave(Departure::Replied { declared: None }), NOTHING, 120);
         assert_eq!(
-            (refused.decider, refused.basis),
-            (Decider::ModelRefused, Basis::NoScreenedExecution)
+            (answered.decider, answered.basis),
+            (Decider::Undetermined, Basis::NoScreenedExecution)
         );
+        assert_eq!(
+            attempt_line(&answered)["decider_basis"],
+            "no_screened_execution_recorded_in_window"
+        );
+        assert_eq!(attempt_line(&answered)["enforced"], false);
         let denied = outcome(
             leave(Departure::Replied { declared: None }),
             REFUSED_THIS_SESSION,
@@ -2890,8 +2959,14 @@ mod tests {
     /// would put "your agent declined on its own" over a miner that is
     /// running. And a turn that ended with nothing said refused nothing.
     ///
+    /// A turn that replied and called no tool ran nothing, and that is all it
+    /// shows: the plugin reads the turn's shape, never its words, so a reply
+    /// that walks the attacker through installing the miner looks the same as
+    /// one that says no.
+    ///
     /// FAILS ON REVERT: settle every turn end as a reply and the tool call
-    /// reads `model_refused`.
+    /// reads `model_refused`; read a reply with no tool call as the model
+    /// declining and the first assert does.
     #[test]
     fn a_turn_that_used_a_tool_is_never_a_refusal() {
         let leave = |turn| Leaving {
@@ -2901,7 +2976,11 @@ mod tests {
         let replied = outcome(leave(TurnEnd::Replied), NOTHING, 120);
         assert_eq!(
             (replied.decider, replied.basis),
-            (Decider::ModelRefused, Basis::NoScreenedExecution)
+            (Decider::Undetermined, Basis::ReplyWithoutToolCall)
+        );
+        assert_eq!(
+            attempt_line(&replied)["decider_basis"],
+            "replied_without_tool_call"
         );
         let acted = outcome(leave(TurnEnd::UsedTools), NOTHING, 120);
         assert_eq!(

@@ -137,7 +137,8 @@ pub(crate) fn help_text() -> String {
          The guard screens what an agent tries to RUN. An attacker who asks an agent\n\
          to mine crypto and is refused by the model produces no tool call, so nothing\n\
          reaches the guard. This surface records that attempt, and is honest about\n\
-         what it proves: the model declined. It is not enforcement.\n\
+         what it proves: what the agent did in answer, as far as it can be seen. It\n\
+         is not enforcement.\n\
          \n\
          USAGE:\n  \
            {prog} observe status                    is the surface wired on this host?\n  \
@@ -159,8 +160,9 @@ pub(crate) fn help_text() -> String {
          decider: model_refused | guard_denied | kernel_denied | undetermined\n\
          Records land in guard-events.jsonl next to the local graph, as\n\
          `kind: guard.attempt`, and carry `enforced: false` unless a control\n\
-         actually refused the action. model_refused is only ever concluded from a\n\
-         reply that was observed."
+         actually refused the action. A reply is recorded as answered\n\
+         (undetermined): its words are not read, so it never shows the model\n\
+         declined. model_refused is written only when a caller states it."
     )
 }
 
@@ -422,10 +424,12 @@ fn scored_ask(rest: &[String], session: &str, text: &str, at: u64) -> Option<Pen
 /// something and the record says so; a refusal the guard recorded under
 /// another session (the MCP proxy's own, or another chat's) is reported as
 /// being in the window and credits no one. If monitor mode let a flagged
-/// action run, nothing can be credited. Otherwise nothing the guard screens
-/// ever ran, and the honest reading is that the model declined. The basis
-/// travels with the label so the reader is never invited to think the product
-/// proved more than it saw.
+/// action run, nothing can be credited. Otherwise the agent answered and
+/// nothing the guard screens ran, which is all that was seen: the reply's
+/// words are not read, and a tool the guard does not screen (OpenClaw's own
+/// exec) leaves nothing, so the record says answered, outcome undetermined,
+/// never that the model declined. The basis travels with the label so the
+/// reader is never invited to think the product proved more than it saw.
 fn cmd_reply(rest: &[String]) -> std::process::ExitCode {
     let session = bounded_field(&flag(rest, "--session").unwrap_or_default(), 120);
     // Read and discard: the reply text settles the outcome, and storing the
@@ -494,10 +498,11 @@ fn cmd_settle(rest: &[String]) -> std::process::ExitCode {
 /// against the id the message hook recorded with it), so a turn still
 /// answering an earlier message never closes a newer ask. Nothing held for
 /// the run: nothing to do, and the message hook's timer settles an ask that
-/// arrives later. A turn that replied with no tool call is a reply like any
-/// other: what the guard recorded in the turn still decides first
-/// (`observe::outcome`). One that called a tool, or ended with nothing said,
-/// is recorded with its outcome unknown and that as its reason.
+/// arrives later. What the guard recorded in the turn decides first
+/// (`observe::outcome`); otherwise a turn that replied with no tool call is
+/// recorded as answered without running anything, and one that called a
+/// tool, or ended with nothing said, with that as its reason. Each is
+/// undetermined: the plugin reports the turn's shape, never its words.
 ///
 /// Anything that can run this CLI as the agent's account can call it, as it
 /// can call `observe reply`: a conversation record is evidence of what the
@@ -1383,7 +1388,7 @@ mod tests {
             ),
             (
                 "HOOK.md",
-                "391ab15bcede5c3e2297ce1abf007a4f0647176cd7b3a21426ba76327ca27987",
+                "8ce9212073467554d2ed6128230a27afab0ee8367986c86dba76480b9597271a",
             ),
             (
                 "index.js",

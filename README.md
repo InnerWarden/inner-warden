@@ -100,11 +100,13 @@ only — no IP, no host data; set `INNERWARDEN_NO_TELEMETRY=1` to disable). A
   the plain-language miner reading, which `check` does not run on a command, so
   `innerwarden check` on the same text can answer `allow` where the record says
   `deny`; the record's `signals` name the reading that scored it. Every record
-  names who decided (`model_refused`, `guard_denied`, `kernel_denied`, or
-  `undetermined` when that could not be seen; `guard_denied` only for a refusal
-  the guard made for that agent, in that conversation's session, in a turn
-  whose reply was seen, never for an action monitor mode let run) and a model
-  refusal is never reported as a block:
+  names who decided (`guard_denied`, `kernel_denied`, `model_refused` only
+  when a caller states it, or `undetermined` when that could not be seen, a
+  reply included: its words are not read, and a tool the guard does not
+  screen leaves nothing, so a reply does not show the agent declined;
+  `guard_denied` only for a refusal the guard made for that agent, in that
+  conversation's session, in a turn whose reply was seen, never for an action
+  monitor mode let run) and a model refusal is never reported as a block:
   `innerwarden observe status` says whether this host sees them at all.
   OpenClaw today, via its message hooks.
 

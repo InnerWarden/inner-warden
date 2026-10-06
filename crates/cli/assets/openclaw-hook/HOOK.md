@@ -49,9 +49,14 @@ actually refused the action.
 - what that conclusion rests on (`decider_basis`)
 - the timestamp, the channel the message arrived on, and the agent (`openclaw`)
 
-`model_refused` is only ever concluded from a reply that was observed, with
-nothing in that turn saying otherwise. `guard_denied` needs the same observed
-reply and a refusal the guard made in enforce mode, recorded after the ask, on
+A reply is recorded as `undetermined`: the agent answered, and its words are
+never read, so a reply that does what the attacker asked in words, or one
+that follows a tool the guard does not screen (OpenClaw's own exec), would
+look the same as one that says no. The basis says what was seen: nothing the
+guard screens ran (`no_screened_execution_recorded_in_window`), or, on the
+Control UI chat, the turn called no tool at all (`replied_without_tool_call`).
+`model_refused` is written only when a caller states it. `guard_denied` needs
+an observed reply and a refusal the guard made in enforce mode, recorded after the ask, on
 a line that names this agent (`openclaw`) and this conversation's session. The
 MCP proxy that guards OpenClaw records its decisions under its own session,
 never a chat's, so a refusal it makes in the same turn is recorded as
@@ -98,7 +103,8 @@ logs it as a plugin it cannot verify, because it was not installed through
 `openclaw plugins install`; `openclaw plugins inspect innerwarden-replies`
 shows it. A heartbeat or cron turn never closes an ask.
 
-A reply with no tool call in the turn is settled like any other reply. Where
+A reply with no tool call in the turn is recorded as answered without running
+anything (`replied_without_tool_call`), outcome `undetermined`. Where
 the plugin does not run, or its report cannot be matched to the ask, a
 dangerous webchat ask is held for two minutes, long enough for what the guard
 records in the same turn to be seen, and then recorded as `undetermined`, with

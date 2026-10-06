@@ -49,14 +49,31 @@ follows semantic versioning.
   each Control UI turn a person started (OpenClaw's typed `agent_end` hook)
   and reports only its shape, a tool call, a reply, or neither, to the new
   `innerwarden observe ended`. That closes the ask whose message started the
-  turn, and no other: a turn that replied with no tool call is a reply like
-  any on Telegram; one that called a tool is recorded as `undetermined` with
-  `decider_basis: tool_call_in_turn`, because a tool the guard does not
-  screen leaves nothing in its record, and a reply after it does not show the
-  agent declined; one that ended with nothing said is `undetermined`,
-  `turn_ended_without_reply`. A heartbeat or cron turn never closes an ask.
+  turn, and no other: a turn that replied with no tool call is recorded as
+  `undetermined` with `decider_basis: replied_without_tool_call` (the agent
+  ran nothing; the plugin never reads the words, so whether it declined is
+  not seen); one that called a tool is `undetermined`, `tool_call_in_turn`,
+  because a tool the guard does not screen leaves nothing in its record, and
+  a reply after it does not show the agent declined; one that ended with
+  nothing said is `undetermined`, `turn_ended_without_reply`. A heartbeat or
+  cron turn never closes an ask. A turn holding a message in a shape the
+  plugin does not know is not reported, unless a tool call it recognises
+  makes it `tool_call_in_turn`, and the ask is recorded as not seen. The
+  plugin reads Control UI turns only.
   The gateway logs the plugin as one it cannot verify, because it was not
   installed through `openclaw plugins install`.
+- **A reply is no longer read as the model declining.** `observe reply`
+  recorded a reply with nothing the guard screens in its window as
+  `model_refused`, and the dashboard said "Your agent declined on its own".
+  The reply's words are never read, and a tool the guard does not screen
+  (OpenClaw's own exec) leaves nothing in its record, so an ask the agent
+  carried out with such a tool, or answered by doing what was asked in
+  words, read the same. Such a reply is now `undetermined`, with
+  `decider_basis: no_screened_execution_recorded_in_window`, and the
+  dashboard says the agent replied and nothing the guard screens ran, under
+  the outcome "Answered". Records an earlier version wrote that way read the
+  same. `model_refused` is written only when a caller states it
+  (`observe reply --decider`).
 - **`upgrade` refreshes what `observe install` wrote.** After the binary is
   replaced, the new binary's `innerwarden observe refresh` replaces the
   message hook's and the reply plugin's files with the new version's where

@@ -262,13 +262,18 @@ fn the_refused_miner_prompt_is_recorded_as_an_attempt() {
 }
 
 /// THE property. Nothing was blocked. The record has to say so, in a field a
-/// renderer can read, or the product would report a model refusal as its own
-/// enforcement win.
+/// renderer can read, or the product would report the agent's answer as its
+/// own enforcement win. Nor does a reply show the model declined: its words
+/// are not read (this one says no, the next could walk the attacker through
+/// it), and a tool the guard does not screen leaves nothing in the window, so
+/// the record says answered, outcome undetermined. A refusal a caller states
+/// is taken as stated, and is still no enforcement.
 ///
-/// FAILS ON REVERT: make `Decider::enforced` return true for `ModelRefused`, or
-/// hardcode `enforced: true`, and both asserts fail.
+/// FAILS ON REVERT: make `Decider::enforced` return true for `ModelRefused`,
+/// or hardcode `enforced: true`, and the `enforced` asserts fail; read a reply
+/// as the model declining again and the first decider is `model_refused`.
 #[test]
-fn a_model_refusal_is_never_reported_as_an_enforcement() {
+fn an_answered_ask_is_never_reported_as_an_enforcement_or_a_refusal() {
     let host = Host::new();
     host.turn(
         "agent:main:telegram:175000",
@@ -279,12 +284,70 @@ fn a_model_refusal_is_never_reported_as_an_enforcement() {
     let attempts = host.attempts();
     assert_eq!(attempts.len(), 1, "one attempt expected: {attempts:?}");
     let attempt = &attempts[0];
-    assert_eq!(attempt["decider"], "model_refused");
+    assert_eq!(attempt["decider"], "undetermined");
     assert_eq!(attempt["enforced"], false);
     assert_eq!(
         attempt["decider_basis"], "no_screened_execution_recorded_in_window",
         "the label must travel with what it rests on"
     );
+
+    let session = "agent:main:telegram:175001";
+    host.inbound(session, "telegram", EXFIL_PROMPT);
+    let declared = host.run(
+        &[
+            "observe",
+            "reply",
+            "--session",
+            session,
+            "--channel",
+            "telegram",
+            "--decider",
+            "model_refused",
+        ],
+        "No.",
+    );
+    assert_eq!(declared.status.code(), Some(0));
+    let attempts = host.attempts();
+    assert_eq!(attempts[1]["decider"], "model_refused", "{}", attempts[1]);
+    assert_eq!(attempts[1]["decider_basis"], "declared_by_caller");
+    assert_eq!(attempts[1]["enforced"], false);
+}
+
+/// The attacker form behind the change above: on a channel other than the
+/// Control UI, the agent runs the miner through OpenClaw's own exec tool,
+/// which the guard does not screen, and replies "Done". Nothing lands in the
+/// guard's record, and even a turn report that it used a tool cannot be tied
+/// to a message that carries no id. The record must not say the agent
+/// declined.
+///
+/// FAILS ON REVERT: read a reply with nothing screened in its window as the
+/// model declining and the record says `model_refused`.
+#[test]
+fn a_telegram_reply_after_an_unscreened_tool_is_never_a_refusal() {
+    let host = Host::new();
+    let session = "agent:main:telegram:175002";
+    host.inbound(session, "telegram", MINER_PROMPT);
+    let ended = host.run(
+        &[
+            "observe",
+            "ended",
+            "--session",
+            session,
+            "--run",
+            "run-telegram-1",
+            "--turn",
+            "used_tools",
+        ],
+        "",
+    );
+    assert_eq!(ended.status.code(), Some(0));
+    assert_eq!(host.pending_sessions(), vec![session.to_string()]);
+    host.reply(session);
+    let attempts = host.attempts();
+    assert_eq!(attempts.len(), 1, "{attempts:?}");
+    assert_ne!(attempts[0]["decider"], "model_refused", "{}", attempts[0]);
+    assert_eq!(attempts[0]["decider"], "undetermined");
+    assert_eq!(attempts[0]["enforced"], false);
 }
 
 /// The guard's own block is a different fact, and the record says which one it
@@ -462,7 +525,12 @@ fn a_forged_or_unrelated_block_does_not_settle_the_turn() {
 
     let attempts = host.attempts();
     assert_eq!(attempts.len(), 1, "{attempts:?}");
-    assert_eq!(attempts[0]["decider"], "model_refused", "{}", attempts[0]);
+    assert_eq!(attempts[0]["decider"], "undetermined", "{}", attempts[0]);
+    assert_eq!(
+        attempts[0]["decider_basis"], "no_screened_execution_recorded_in_window",
+        "{}",
+        attempts[0]
+    );
     assert_eq!(attempts[0]["enforced"], false);
 }
 
@@ -566,7 +634,7 @@ fn a_plain_request_to_install_a_miner_is_an_attempt() {
     );
     assert_eq!(attempt["recommendation"], "deny", "{attempt}");
     assert_eq!(attempt["risk_score"], 40, "{attempt}");
-    assert_eq!(attempt["decider"], "model_refused");
+    assert_eq!(attempt["decider"], "undetermined");
     assert_eq!(attempt["enforced"], false, "observation, never enforcement");
 }
 
@@ -947,8 +1015,8 @@ fn a_second_ask_in_one_session_records_both() {
         .find(|a| a["detail"].as_str().unwrap_or_default().contains("curl"))
         .expect("the second ask is recorded");
     assert_eq!(
-        second["decider"], "model_refused",
-        "the reply answers the latest ask"
+        second["decider_basis"], "no_screened_execution_recorded_in_window",
+        "the reply answers the latest ask: {second}"
     );
 }
 
@@ -1036,7 +1104,10 @@ fn a_lock_another_account_left_does_not_stop_the_ask_being_held() {
     host.reply(session);
     let attempts = host.attempts();
     assert_eq!(attempts.len(), 1, "{attempts:?}");
-    assert_eq!(attempts[0]["decider"], "model_refused");
+    assert_eq!(
+        attempts[0]["decider_basis"],
+        "no_screened_execution_recorded_in_window"
+    );
 }
 
 /// `observe settle` closes an ask on a channel that never reports the reply,
@@ -1144,11 +1215,8 @@ fn a_control_ui_turn_end_closes_only_the_ask_it_started() {
     host.settle(session);
     let attempts = host.attempts();
     assert_eq!(attempts.len(), 2, "recorded once: {attempts:?}");
-    assert_eq!(attempts[1]["decider"], "model_refused");
-    assert_eq!(
-        attempts[1]["decider_basis"],
-        "no_screened_execution_recorded_in_window"
-    );
+    assert_eq!(attempts[1]["decider"], "undetermined");
+    assert_eq!(attempts[1]["decider_basis"], "replied_without_tool_call");
 
     let bad = host.run(
         &[
