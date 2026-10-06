@@ -127,10 +127,21 @@ impl Breaker {
         recent.last_touch = self.touches;
         recent.accepted.retain(|&at| is_live(at, now_secs, window));
         if recent.accepted.len() >= limit {
+            // When the oldest accepted call leaves the window, one more of
+            // these is accepted. Said in the reason, because an agent told only
+            // that its call was refused reads the refusal as permanent and
+            // gives up on a job a retry half a minute later would finish.
+            let accepted_again_in = recent
+                .accepted
+                .front()
+                .map_or(window, |&oldest| (oldest + window).saturating_sub(now_secs))
+                .max(1);
             return BreakerVerdict::Tripped {
                 reason: format!(
                     "identical tool call (same tool, same arguments) already made {limit} times \
-                     in the last {window} s, the pattern of a runaway loop"
+                     in the last {window} s, the pattern of a runaway loop; the breaker accepts \
+                     this same call again in {accepted_again_in} s, and does not hold back any \
+                     other call"
                 ),
             };
         }
@@ -213,6 +224,12 @@ mod tests {
         assert!(
             why.contains("already made 3 times in the last 60 s"),
             "the reason must say what was counted: {why}"
+        );
+        // ...and when the same call is accepted again: the oldest accepted
+        // call (t=0) leaves the window at t=60, 57 s after this trip.
+        assert!(
+            why.contains("accepts this same call again in 57 s"),
+            "the reason must say when it ends: {why}"
         );
         // The first accepted call (t=0) is a full window old at t=60, so one
         // repeat is accepted again; the trip at t=3 did not hold it shut.
@@ -326,6 +343,36 @@ mod tests {
         );
         // y() was forgotten, so it starts fresh.
         assert_eq!(b.record("y()", 5), BreakerVerdict::Ok);
+    }
+
+    /// D4: the breaker is never permanent, so its refusal must not read as
+    /// permanent either. An agent polling a job every 10 s is told when its
+    /// poll is accepted again, and that time is when it is.
+    ///
+    /// FAILS ON REVERT: drop the time from the reason and the agent is told
+    /// only that its call was refused.
+    #[test]
+    fn a_trip_says_when_the_same_call_is_accepted_again() {
+        let mut b = Breaker::new(BreakerConfig::default());
+        for t in [0, 10, 20] {
+            assert_eq!(
+                b.record("get_job_status({\"id\":7})", t),
+                BreakerVerdict::Ok
+            );
+        }
+        let why = reason(b.record("get_job_status({\"id\":7})", 30));
+        assert!(why.contains("again in 30 s"), "{why}");
+        assert!(why.contains("does not hold back any other call"), "{why}");
+        let why = reason(b.record("get_job_status({\"id\":7})", 59));
+        assert!(why.contains("again in 1 s"), "{why}");
+        // And it is: at t=60 the call at t=0 has left the window.
+        assert_eq!(
+            b.record("get_job_status({\"id\":7})", 60),
+            BreakerVerdict::Ok
+        );
+        // A clock that reads earlier than the calls never says "now".
+        let why = reason(b.record("get_job_status({\"id\":7})", 5));
+        assert!(why.contains("again in 65 s"), "{why}");
     }
 
     #[test]
