@@ -17,8 +17,10 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::observe::{
-    attempt_line, bounded_field, dangerous, guard_block_since, redact_and_bound, signal_names,
-    Attempt, Basis, Decider, Pending, PendingAsk, MAX_ASK_CHARS, PENDING_TTL_SECONDS,
+    agent_field, attempt_line, bounded_field, dangerous, guard_block_since,
+    needs_block_correlation, outcome, redact_and_bound, signal_names, Decider, Departure, Leaving,
+    NoReply, Pending, PendingAsk, MAX_ASK_CHARS, PENDING_TTL_SECONDS,
+    UNREPORTED_REPLY_WAIT_SECONDS,
 };
 
 /// The hook directory name inside `~/.openclaw/hooks/`, and the config key that
@@ -34,6 +36,15 @@ const MAX_STDIN_BYTES: u64 = 64 * 1024;
 /// long-lived sink.
 const SINK_TAIL_BYTES: u64 = 256 * 1024;
 
+/// The pending state, beside the graph and the sink.
+const PENDING_FILE: &str = "observe-pending.json";
+
+/// How many times one hook call re-reads and re-applies its change when another
+/// call changed the pending state first. Hook calls overlap on a busy gateway
+/// (every message event is dispatched without waiting for the last), and a
+/// lost compare-and-swap used to be skipped, which lost the ask it carried.
+const PENDING_UPDATE_ATTEMPTS: usize = 4;
+
 const HOOK_DOC: &str = include_str!("../assets/openclaw-hook/HOOK.md");
 const HOOK_HANDLER: &str = include_str!("../assets/openclaw-hook/handler.js");
 
@@ -41,6 +52,7 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
     match rest.first().map(String::as_str) {
         Some("inbound") => cmd_inbound(&rest[1..]),
         Some("reply") => cmd_reply(&rest[1..]),
+        Some("settle") => cmd_settle(&rest[1..]),
         Some("install") => cmd_install(&rest[1..]),
         None | Some("status") => cmd_status(),
         // `--help` and `-h` are answered before dispatch (`help::for_invocation`);
@@ -70,15 +82,19 @@ pub(crate) fn help_text() -> String {
          USAGE:\n  \
            {prog} observe status                    is the surface wired on this host?\n  \
            {prog} observe install [--home <dir>]    wire it into OpenClaw (message hooks)\n  \
-           {prog} observe inbound --session <k> [--channel <c>] [--sender <s>]\n  \
+           {prog} observe inbound --session <k> [--channel <c>] [--sender <s>] [--agent <a>]\n  \
            \x20                                       score the user text on stdin\n  \
            {prog} observe reply --session <k> [--channel <c>] [--decider <d>]\n  \
-           \x20                                       close the attempt the session was waiting on\n\
+           \x20                                       close the attempt the session was waiting on\n  \
+           {prog} observe settle --session <k>\n  \
+           \x20                                       close it where the channel never reports the\n  \
+           \x20                                       reply (OpenClaw webchat): after {UNREPORTED_REPLY_WAIT_SECONDS}s, outcome unknown\n\
          \n\
          decider: model_refused | guard_denied | kernel_denied | undetermined\n\
          Records land in guard-events.jsonl next to the local graph, as\n\
          `kind: guard.attempt`, and carry `enforced: false` unless a control\n\
-         actually refused the action."
+         actually refused the action. model_refused is only ever concluded from a\n\
+         reply that was observed."
     )
 }
 
@@ -105,69 +121,125 @@ fn read_stdin() -> String {
     buffer
 }
 
-fn pending_path() -> Option<PathBuf> {
-    crate::graph_io::sink_dir().map(|dir| dir.join("observe-pending.json"))
-}
-
-/// Read the pending file, returning the parsed state and the exact bytes read,
+/// Read the pending state, returning the parsed state and the exact bytes read,
 /// so the write back can be a compare-and-swap.
-fn load_pending(path: &Path) -> (Pending, Option<Vec<u8>>) {
-    match innerwarden_agent_guard::file_update::read_config(path) {
-        Ok(Some(bytes)) => {
+///
+/// The directory is shared with the guarded agent's account, and this CLI is
+/// also run as root, so a link at the name is refused rather than followed. A
+/// file that is there and cannot be read is an error, not an empty state: an
+/// empty state saved back over it would be a write the reader never saw.
+/// Content that does not parse is an empty state, and is replaced.
+fn load_pending(dir: &Path, path: &Path) -> Result<(Pending, Option<Vec<u8>>), String> {
+    match innerwarden_agent_guard::file_update::read_config_no_symlinks(dir, path)? {
+        Some(bytes) => {
             let parsed = std::str::from_utf8(&bytes)
                 .map(Pending::from_json)
                 .unwrap_or_default();
-            (parsed, Some(bytes))
+            Ok((parsed, Some(bytes)))
         }
-        _ => (Pending::default(), None),
+        None => Ok((Pending::default(), None)),
     }
 }
 
 /// Write the pending state back only if nobody else changed it meanwhile.
 ///
-/// Two hook invocations can overlap on a busy gateway. A lost update costs one
-/// unpaired attempt record; a torn file would cost every pending attempt, so
-/// the write is a compare-and-swap and a conflict is simply skipped.
-fn save_pending(path: &Path, state: &Pending, expected: Option<&[u8]>) {
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let _ = innerwarden_agent_guard::file_update::replace_if_unchanged(
+/// The writer for a record this product SHARES: never through a link at the
+/// name (the file sits where the agent's account can plant one, and a root run
+/// that followed it replaced the link's target with this JSON), and still
+/// written when another account of the shared group wrote it last (a root-run
+/// call used to leave a file every later ask failed to update, with the error
+/// discarded).
+fn save_pending(
+    dir: &Path,
+    path: &Path,
+    state: &Pending,
+    expected: Option<&[u8]>,
+) -> Result<(), String> {
+    innerwarden_agent_guard::file_update::replace_owned_store_no_symlinks(
+        dir,
         path,
         expected,
         state.to_json().as_bytes(),
-    );
+    )
 }
 
-/// Record every attempt whose reply never arrived. Called on both hook paths so
-/// a stale entry always lands eventually: a gateway restart must not be a way
-/// to make an attempt disappear.
-fn flush_expired(state: &mut Pending, at: u64) -> usize {
-    let expired = state.expire(at, PENDING_TTL_SECONDS);
-    for ask in &expired {
-        write_attempt(&Attempt {
-            ask: ask.clone(),
-            recorded_at: at,
-            decider: Decider::Undetermined,
-            basis: Basis::NoReplyWithinTtl,
-        });
+/// Apply one change to the pending state and persist it.
+///
+/// Every ask that leaves the state (expired, replied to, pushed out) is handed
+/// back ONLY once the state without it is on disk, so each ask is recorded
+/// exactly once: a call that cannot save records nothing it took, and the asks
+/// stay in the file for a later call. A save that lost a race to another hook
+/// call is retried from a fresh read, because the change is pure and can be
+/// applied again.
+fn update_pending(
+    dir: &Path,
+    at: u64,
+    mut change: impl FnMut(&mut Pending) -> Vec<Leaving>,
+) -> Result<Vec<Leaving>, String> {
+    let path = dir.join(PENDING_FILE);
+    let mut last_error = String::new();
+    for _ in 0..PENDING_UPDATE_ATTEMPTS {
+        let (mut state, expected) = load_pending(dir, &path)?;
+        let before = state.clone();
+        let mut leaving: Vec<Leaving> = state
+            .expire(at, PENDING_TTL_SECONDS)
+            .into_iter()
+            .map(|ask| Leaving {
+                ask,
+                departure: Departure::Expired,
+            })
+            .collect();
+        leaving.extend(change(&mut state));
+        if state == before {
+            return Ok(leaving);
+        }
+        match save_pending(dir, &path, &state, expected.as_deref()) {
+            Ok(()) => return Ok(leaving),
+            Err(error) => last_error = error,
+        }
     }
-    expired.len()
+    Err(last_error)
 }
 
-fn write_attempt(attempt: &Attempt) {
-    crate::graph_io::append_guard_event(&attempt_line(attempt));
+/// Record every ask that left the pending state.
+///
+/// The sink is read for the guard-block correlation only when a decision
+/// depends on it, and once per call.
+fn record(dir: &Path, leaving: Vec<Leaving>, at: u64) {
+    let correlate = leaving
+        .iter()
+        .any(|leaving| needs_block_correlation(leaving.departure));
+    let tail = if correlate {
+        sink_tail(dir)
+    } else {
+        String::new()
+    };
+    for leaving in leaving {
+        let blocked = needs_block_correlation(leaving.departure)
+            && guard_block_since(&tail, leaving.ask.asked_at);
+        let attempt = outcome(leaving, blocked, at);
+        crate::graph_io::append_guard_event_at(dir, &attempt_line(&attempt));
+    }
 }
 
 /// The tail of the guard event sink, for the block correlation.
-fn sink_tail() -> String {
-    let Some(path) = crate::graph_io::sink_dir().map(|dir| dir.join("guard-events.jsonl")) else {
+///
+/// Opened without following a link and only as a regular file: the directory
+/// is shared with the agent's account, a FIFO at the name would hang the
+/// gateway turn that spawned this, and a link would make a root run read
+/// whatever it points at.
+fn sink_tail(dir: &Path) -> String {
+    let path = dir.join("guard-events.jsonl");
+    let Ok(mut file) = innerwarden_safe_io::open_no_follow(&path) else {
         return String::new();
     };
-    let Ok(mut file) = std::fs::File::open(&path) else {
+    let Ok(metadata) = file.metadata() else {
         return String::new();
     };
-    let length = file.metadata().map(|meta| meta.len()).unwrap_or(0);
+    if !innerwarden_safe_io::is_regular_file(&metadata) {
+        return String::new();
+    }
+    let length = metadata.len();
     if length > SINK_TAIL_BYTES {
         use std::io::Seek;
         let _ = file.seek(std::io::SeekFrom::Start(length - SINK_TAIL_BYTES));
@@ -182,50 +254,72 @@ fn sink_tail() -> String {
 /// `innerwarden observe inbound` - score the user text and remember it if the
 /// guard's own rule engine calls it dangerous.
 ///
-/// Nothing is recorded here. The record is written when the outcome is known,
-/// so one attempt produces one line rather than an open one plus a correction.
+/// Nothing is recorded for the new ask here while it can be held: the record
+/// is written when the outcome is known, so one attempt produces one line
+/// rather than an open one plus a correction. What this call pushes out of the
+/// pending state (an earlier ask in the same session, the oldest ask over the
+/// bound, anything expired) is recorded now. If the pending state cannot be
+/// read or written, the new ask is recorded at once with its outcome unknown,
+/// because holding it is impossible and dropping it is not an option.
 fn cmd_inbound(rest: &[String]) -> std::process::ExitCode {
     let session = bounded_field(&flag(rest, "--session").unwrap_or_default(), 120);
     let text = read_stdin();
-    let Some(path) = pending_path() else {
+    let Some(dir) = crate::graph_io::sink_dir() else {
         return std::process::ExitCode::SUCCESS;
     };
     let at = now();
-    let (mut state, expected) = load_pending(&path);
-    let flushed = flush_expired(&mut state, at);
-
-    if session.trim().is_empty() || text.trim().is_empty() {
-        if flushed > 0 {
-            save_pending(&path, &state, expected.as_deref());
+    // Scored before the pending state is read, so the read-modify-write holds
+    // no rule-engine loading inside its window.
+    let ask = (!session.trim().is_empty() && !text.trim().is_empty())
+        .then(|| scored_ask(rest, &session, &text, at))
+        .flatten();
+    let _ = std::fs::create_dir_all(&dir);
+    match update_pending(&dir, at, |state| match &ask {
+        Some(ask) => state.remember(ask.clone()),
+        None => Vec::new(),
+    }) {
+        Ok(leaving) => record(&dir, leaving, at),
+        Err(error) => {
+            eprintln!(
+                "innerwarden observe: the pending state could not be updated ({error}); \
+                 recording the ask now, with its outcome unknown"
+            );
+            if let Some(ask) = ask {
+                record(
+                    &dir,
+                    vec![Leaving {
+                        ask,
+                        departure: Departure::Unanswered(NoReply::StateUnavailable),
+                    }],
+                    at,
+                );
+            }
         }
-        return std::process::ExitCode::SUCCESS;
     }
+    std::process::ExitCode::SUCCESS
+}
 
+/// The ask to hold, when the guard's own rule engine calls the text dangerous.
+fn scored_ask(rest: &[String], session: &str, text: &str, at: u64) -> Option<PendingAsk> {
     // Shell surface for the structural analyzer, LLM surface for the ATR
     // prompt-injection rules. A conversation carries both shapes.
     let shell = RuleEngine::load_embedded_for(AtrSource::ShellCommand);
-    let analysis = analyze_command(&text, Some(&shell));
-    let injection = RuleEngine::load_embedded_for(AtrSource::LlmIo).check_user_input(&text);
-
+    let analysis = analyze_command(text, Some(&shell));
+    let injection = RuleEngine::load_embedded_for(AtrSource::LlmIo).check_user_input(text);
     if !dangerous(&analysis, &injection) {
-        if flushed > 0 {
-            save_pending(&path, &state, expected.as_deref());
-        }
-        return std::process::ExitCode::SUCCESS;
+        return None;
     }
-
-    state.remember(PendingAsk {
-        session: session.clone(),
+    Some(PendingAsk {
+        session: session.to_string(),
         channel: bounded_field(&flag(rest, "--channel").unwrap_or_default(), 64),
         sender: bounded_field(&flag(rest, "--sender").unwrap_or_default(), 64),
-        ask: redact_and_bound(&text, MAX_ASK_CHARS),
+        ask: redact_and_bound(text, MAX_ASK_CHARS),
         recommendation: analysis.recommendation.clone(),
         risk_score: analysis.risk_score,
         signals: signal_names(&analysis, &injection),
         asked_at: at,
-    });
-    save_pending(&path, &state, expected.as_deref());
-    std::process::ExitCode::SUCCESS
+        agent: agent_field(flag(rest, "--agent").as_deref()),
+    })
 }
 
 // ── reply ────────────────────────────────────────────────────────────────────
@@ -243,35 +337,66 @@ fn cmd_reply(rest: &[String]) -> std::process::ExitCode {
     // Read and discard: the reply text settles the outcome, and storing the
     // model's words would put a second copy of the conversation in the sink.
     let _ = read_stdin();
-    let Some(path) = pending_path() else {
+    let Some(dir) = crate::graph_io::sink_dir() else {
         return std::process::ExitCode::SUCCESS;
     };
     let at = now();
-    let (mut state, expected) = load_pending(&path);
-    let flushed = flush_expired(&mut state, at);
-    let Some(ask) = state.take(&session) else {
-        if flushed > 0 {
-            save_pending(&path, &state, expected.as_deref());
-        }
+    let declared = flag(rest, "--decider").and_then(|value| Decider::parse(&value));
+    settle_with(&dir, at, |state| {
+        state
+            .take(&session)
+            .map(|ask| Leaving {
+                ask,
+                departure: Departure::Replied { declared },
+            })
+            .into_iter()
+            .collect()
+    });
+    std::process::ExitCode::SUCCESS
+}
+
+// ── settle ───────────────────────────────────────────────────────────────────
+
+/// `innerwarden observe settle` - the session speaks on a channel that never
+/// reports the agent's reply, so close its ask once it has waited
+/// [`UNREPORTED_REPLY_WAIT_SECONDS`].
+///
+/// The hook calls this on a timer after a webchat message, because OpenClaw
+/// emits no event when a Control UI reply completes. The record says so
+/// (`channel_reports_no_reply`) and names no model decision: nothing here saw
+/// a reply. A guard block in the window still names the guard. A call before
+/// the wait is over leaves the ask alone, so the timer an older ask started can
+/// never close a newer one, and no caller can settle an ask early.
+fn cmd_settle(rest: &[String]) -> std::process::ExitCode {
+    let session = bounded_field(&flag(rest, "--session").unwrap_or_default(), 120);
+    let Some(dir) = crate::graph_io::sink_dir() else {
         return std::process::ExitCode::SUCCESS;
     };
-
-    let declared = flag(rest, "--decider").and_then(|value| Decider::parse(&value));
-    let (decider, basis) = match declared {
-        Some(decider) => (decider, Basis::Declared),
-        None if guard_block_since(&sink_tail(), ask.asked_at) => {
-            (Decider::GuardDenied, Basis::GuardBlockInWindow)
-        }
-        None => (Decider::ModelRefused, Basis::NoScreenedExecution),
-    };
-    write_attempt(&Attempt {
-        ask,
-        recorded_at: at,
-        decider,
-        basis,
+    let at = now();
+    settle_with(&dir, at, |state| {
+        state
+            .take_if_waited(&session, at, UNREPORTED_REPLY_WAIT_SECONDS)
+            .map(|ask| Leaving {
+                ask,
+                departure: Departure::Unanswered(NoReply::ChannelReportsNone),
+            })
+            .into_iter()
+            .collect()
     });
-    save_pending(&path, &state, expected.as_deref());
     std::process::ExitCode::SUCCESS
+}
+
+/// Take what `change` closes out of the pending state and record it, once the
+/// state without it is saved. A failure leaves it pending, so a later call
+/// records it; it is reported, never swallowed.
+fn settle_with(dir: &Path, at: u64, change: impl FnMut(&mut Pending) -> Vec<Leaving>) {
+    match update_pending(dir, at, change) {
+        Ok(leaving) => record(dir, leaving, at),
+        Err(error) => eprintln!(
+            "innerwarden observe: the pending state could not be updated ({error}); \
+             the attempt stays pending and is recorded by a later call"
+        ),
+    }
 }
 
 // ── install / status ─────────────────────────────────────────────────────────
@@ -419,6 +544,14 @@ pub(crate) fn installed() -> bool {
             .unwrap_or(false)
 }
 
+/// Whether the installed handler is the one this binary ships. `observe
+/// install` writes it once and an upgrade does not touch it, so a fix to the
+/// handler reaches a host only when the operator runs install again, and
+/// status is where that has to be said.
+fn hook_is_current(installed_handler: Option<&str>) -> bool {
+    installed_handler == Some(HOOK_HANDLER)
+}
+
 /// `innerwarden observe status` - can this host see a conversation attempt at
 /// all? An honest gap is worth more than an assumed capability.
 fn cmd_status() -> std::process::ExitCode {
@@ -434,7 +567,9 @@ fn cmd_status() -> std::process::ExitCode {
         .and_then(|body| serde_json::from_str::<Value>(&body).ok())
         .map(|root| crate::observe::hook_is_enabled(&root, HOOK_NAME))
         .unwrap_or(false);
-    let recorded = sink_tail()
+    let recorded = crate::graph_io::sink_dir()
+        .map(|dir| sink_tail(&dir))
+        .unwrap_or_default()
         .lines()
         .filter(|line| line.contains("\"kind\":\"guard.attempt\""))
         .count();
@@ -448,6 +583,15 @@ fn cmd_status() -> std::process::ExitCode {
              What it does not: it is not enforcement, and a model refusal is never a block.",
             directory.display()
         );
+        let installed_handler = std::fs::read_to_string(directory.join("handler.js")).ok();
+        if !hook_is_current(installed_handler.as_deref()) {
+            println!(
+                "  The installed hook is older than the one this binary ships: it does not\n  \
+                 record Control UI chat asks until they expire, or name the agent.\n  \
+                 To update it:  {} observe install   (then restart the gateway)",
+                crate::prog()
+            );
+        }
         return std::process::ExitCode::SUCCESS;
     }
     println!(
@@ -487,5 +631,175 @@ mod tests {
         assert!(help.contains("not enforcement"), "{help}");
         assert!(help.contains("model_refused"), "{help}");
         assert!(help.contains("guard.attempt"), "{help}");
+        assert!(help.contains("observe settle"), "{help}");
+    }
+
+    fn ask(session: &str, at: u64) -> PendingAsk {
+        PendingAsk {
+            session: session.into(),
+            channel: "webchat".into(),
+            sender: String::new(),
+            ask: "nohup ./xmrig -o pool.example:3333 &".into(),
+            recommendation: "deny".into(),
+            risk_score: 90,
+            signals: vec!["dangerous_command".into()],
+            asked_at: at,
+            agent: "openclaw".into(),
+        }
+    }
+
+    fn attempts(dir: &Path) -> Vec<Value> {
+        std::fs::read_to_string(dir.join("guard-events.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|line| line["kind"] == "guard.attempt")
+            .collect()
+    }
+
+    /// The race a planted link wins against a root-run `observe`: the pending
+    /// file was a regular file when it was read, and is a link to a file with
+    /// the very same bytes by the time it is written. The compare-and-swap
+    /// cannot tell, so the only defence is never following the name.
+    ///
+    /// FAILS ON REVERT: write through `replace_if_unchanged` again (link
+    /// followed, its target replaced) and the victim holds pending JSON.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_at_the_pending_file_is_never_written_through() {
+        let dir = tempfile::TempDir::new().expect("scratch dir");
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"root:x:0:0::/root:/bin/sh\n").expect("victim");
+        let pending = dir.path().join(PENDING_FILE);
+        std::os::unix::fs::symlink(&victim, &pending).expect("plant link");
+
+        let mut state = Pending::default();
+        state.remember(ask("agent:main:main", 100));
+        let refused = save_pending(
+            dir.path(),
+            &pending,
+            &state,
+            Some(b"root:x:0:0::/root:/bin/sh\n"),
+        );
+        assert!(refused.is_err(), "a link must never be written through");
+        assert_eq!(
+            std::fs::read(&victim).expect("victim"),
+            b"root:x:0:0::/root:/bin/sh\n",
+            "the link's target is untouched"
+        );
+        assert!(
+            std::fs::symlink_metadata(&pending)
+                .expect("link")
+                .file_type()
+                .is_symlink(),
+            "and the link itself is left for the operator to see"
+        );
+        // Reading refuses it the same way: a link is not an empty state.
+        assert!(load_pending(dir.path(), &pending).is_err());
+    }
+
+    /// Two hook calls that overlap both change the pending state. The one that
+    /// loses the compare-and-swap used to skip its write, and the ask it was
+    /// holding was gone. Now it reads again and applies its change again.
+    ///
+    /// FAILS ON REVERT: make `update_pending` give up on the first failed
+    /// save, and the second ask is never held.
+    #[test]
+    fn a_lost_race_is_retried_not_dropped() {
+        let dir = tempfile::TempDir::new().expect("scratch dir");
+        let path = dir.path().join(PENDING_FILE);
+        let mut calls = 0;
+        let leaving = update_pending(dir.path(), 1_000, |state| {
+            calls += 1;
+            if calls == 1 {
+                // Another hook call lands its own ask between this call's read
+                // and its write.
+                let mut other = Pending::default();
+                other.remember(ask("agent:main:telegram:1", 990));
+                std::fs::write(&path, other.to_json()).expect("concurrent write");
+            }
+            state.remember(ask("agent:main:main", 1_000))
+        })
+        .expect("the change lands on the retry");
+        assert!(leaving.is_empty());
+        assert_eq!(calls, 2, "applied again from a fresh read");
+        let (saved, _) = load_pending(dir.path(), &path).expect("readable");
+        let sessions: Vec<&str> = saved.asks.iter().map(|a| a.session.as_str()).collect();
+        assert_eq!(
+            sessions,
+            vec!["agent:main:telegram:1", "agent:main:main"],
+            "both asks are held: neither writer lost its change"
+        );
+    }
+
+    /// Recording is exactly once and only after the save: what `record`
+    /// writes for a webchat ask the settle closes says the reply was not
+    /// visible, names the agent, and never claims the model declined.
+    #[test]
+    fn a_settled_webchat_ask_is_recorded_once_as_unknown() {
+        let dir = tempfile::TempDir::new().expect("scratch dir");
+        let at = 1_000 + UNREPORTED_REPLY_WAIT_SECONDS;
+        update_pending(dir.path(), 1_000, |state| {
+            state.remember(ask("agent:main:main", 1_000))
+        })
+        .expect("held");
+        let early = update_pending(dir.path(), at - 1, |state| {
+            state
+                .take_if_waited("agent:main:main", at - 1, UNREPORTED_REPLY_WAIT_SECONDS)
+                .map(|ask| Leaving {
+                    ask,
+                    departure: Departure::Unanswered(NoReply::ChannelReportsNone),
+                })
+                .into_iter()
+                .collect()
+        })
+        .expect("readable");
+        assert!(early.is_empty(), "too early to settle");
+
+        settle_with(dir.path(), at, |state| {
+            state
+                .take_if_waited("agent:main:main", at, UNREPORTED_REPLY_WAIT_SECONDS)
+                .map(|ask| Leaving {
+                    ask,
+                    departure: Departure::Unanswered(NoReply::ChannelReportsNone),
+                })
+                .into_iter()
+                .collect()
+        });
+        let recorded = attempts(dir.path());
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        assert_eq!(recorded[0]["decider"], "undetermined");
+        assert_eq!(recorded[0]["decider_basis"], "channel_reports_no_reply");
+        assert_eq!(recorded[0]["enforced"], false);
+        assert_eq!(recorded[0]["agent"], "openclaw");
+        assert_eq!(recorded[0]["channel"], "webchat");
+        let (left, _) = load_pending(dir.path(), &dir.path().join(PENDING_FILE)).expect("readable");
+        assert!(left.asks.is_empty(), "taken out of the pending state");
+    }
+
+    /// The handler's settle timer and agent name are the CLI's to agree with.
+    /// A timer that fired before the CLI's hold was over would be refused, and
+    /// the ask would wait for its TTL again; a name the CLI rejects would be
+    /// dropped from every record.
+    #[test]
+    fn the_shipped_handler_agrees_with_the_cli() {
+        let number = |name: &str| -> u64 {
+            let line = HOOK_HANDLER
+                .lines()
+                .find(|line| line.starts_with(&format!("const {name} = ")))
+                .unwrap_or_else(|| panic!("{name} missing from handler.js"));
+            line.trim_start_matches(&format!("const {name} = "))
+                .trim_end_matches(';')
+                .replace('_', "")
+                .parse()
+                .unwrap_or_else(|_| panic!("{name} is not a number: {line}"))
+        };
+        assert!(
+            number("UNREPORTED_REPLY_SETTLE_MS") > UNREPORTED_REPLY_WAIT_SECONDS * 1_000,
+            "the handler must settle after the CLI's hold, not before"
+        );
+        assert!(HOOK_HANDLER.contains("const AGENT = \"openclaw\";"));
+        assert_eq!(agent_field(Some("openclaw")), "openclaw");
+        assert!(HOOK_HANDLER.contains("const UNREPORTED_REPLY_CHANNEL = \"webchat\";"));
     }
 }

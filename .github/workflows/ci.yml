@@ -141,8 +141,15 @@ jobs:
 
       # Full suite (unit + integration) on Linux and macOS, the first-class
       # platforms.
+      #
+      # IW_REQUIRE_NODE: the OpenClaw hook handler is JavaScript, and its tests
+      # skip where node is missing so a contributor without node can still run
+      # the suite. Here a missing node is a failure instead: a gate that cannot
+      # run must not report green.
       - name: Test
         if: runner.os != 'Windows'
+        env:
+          IW_REQUIRE_NODE: "1"
         run: cargo test --workspace
 
       # Windows used to run fmt + clippy only, on the reasoning that the platform

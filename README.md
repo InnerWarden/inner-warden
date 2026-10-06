@@ -86,9 +86,10 @@ only — no IP, no host data; set `INNERWARDEN_NO_TELEMETRY=1` to disable). A
 - Conversation attempts: records what an agent was ASKED to do when the ask is
   dangerous, including the asks a model refuses on its own. Those produce no
   command, so they reach nothing else in the product. Every record names who
-  decided (`model_refused`, `guard_denied`, `kernel_denied`) and a model refusal
-  is never reported as a block: `innerwarden observe status` says whether this
-  host sees them at all. OpenClaw today, via its message hooks.
+  decided (`model_refused`, `guard_denied`, `kernel_denied`, or `undetermined`
+  when that could not be seen) and a model refusal is never reported as a
+  block: `innerwarden observe status` says whether this host sees them at all.
+  OpenClaw today, via its message hooks.
 
 The verdict is JSON: a recommendation (`allow` / `review` / `deny`), a risk
 score, matched signals, and a short explanation.
@@ -104,7 +105,9 @@ Whatever agent you run, there is a mechanism and a command for it:
   OpenClaw has one more surface, and it observes rather than enforces: its
   message hooks see the inbound prompt and the reply, so
   `innerwarden observe install` records a dangerous ask even when the model,
-  not the guard, is what stopped it.
+  not the guard, is what stopped it. The Control UI chat reports no reply to
+  hooks, so an ask made there is recorded after two minutes with the outcome
+  stated as not visible.
 - **Any other MCP client** - point it at `innerwarden proxy -- <server>`.
 - **Anything with no cooperative surface** - run it isolated:
   `innerwarden contain -- <command>`.

@@ -40,7 +40,27 @@ actually refused the action.
 - the ask, redacted through the guard's redaction path and bounded
 - who decided: `model_refused`, `guard_denied`, `kernel_denied` or `undetermined`
 - what that conclusion rests on (`decider_basis`)
-- the timestamp and the channel the message arrived on
+- the timestamp, the channel the message arrived on, and the agent (`openclaw`)
+
+`model_refused` is only ever concluded from a reply that was observed. An ask
+that ends any other way is recorded as `undetermined`, or `guard_denied` when
+the guard recorded a block after it arrived:
+
+- the same conversation sent another dangerous message before any reply
+  (`next_message_before_reply`); both asks are recorded
+- no reply arrived within 15 minutes (`no_reply_observed_within_ttl`)
+- the channel never reports the reply (`channel_reports_no_reply`, below)
+
+## The Control UI chat (webchat)
+
+OpenClaw fires `message:received` for a Control UI message, but streams the
+reply back over the gateway connection and fires no `message:sent` for it, and
+no other hook event marks the end of a webchat turn. So a dangerous webchat ask
+is held for two minutes, long enough for a guard block in the same turn to be
+seen, and then recorded with `decider_basis: channel_reports_no_reply`. It
+never says the model declined there, because nothing here saw the reply. If the
+gateway restarts inside those two minutes, the ask is recorded once it has
+waited 15 minutes, by the next message this hook sees.
 
 ## Requirements
 

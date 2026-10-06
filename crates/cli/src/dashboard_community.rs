@@ -243,6 +243,9 @@ pub(crate) struct Attempt {
     pub sender: Option<String>,
     pub surface: String,
     pub decider: String,
+    /// What the decider rests on (`decider_basis`), so an unknown outcome can
+    /// say why it is unknown.
+    pub basis: String,
     pub enforced: bool,
     pub recommendation: String,
     pub risk: Option<u64>,
@@ -347,6 +350,7 @@ pub(crate) fn parse_event_log(text: &str) -> EventLog {
                         .map(|sender| one_line(&revealed(sender), 64)),
                     surface: text("surface"),
                     decider: text("decider"),
+                    basis: text("decider_basis"),
                     enforced: record
                         .get("enforced")
                         .and_then(Value::as_bool)
@@ -387,11 +391,24 @@ fn channel_words(channel: &str) -> String {
     }
 }
 
-fn decider_words(decider: &str) -> &'static str {
-    match decider {
-        "model_refused" => "Your agent declined on its own",
-        "guard_denied" => "The guard refused it",
-        "kernel_denied" => "The kernel refused it",
+/// Who decided, in words. An outcome that could not be seen says why, because
+/// "not recorded" on a chat that never reports the agent's reply reads like a
+/// recording fault when it is a limit of the channel.
+fn decider_words(decider: &str, basis: &str) -> &'static str {
+    match (decider, basis) {
+        ("model_refused", _) => "Your agent declined on its own",
+        ("guard_denied", _) => "The guard refused it",
+        ("kernel_denied", _) => "The kernel refused it",
+        ("undetermined", "channel_reports_no_reply") => {
+            "Outcome not seen: this chat does not report your agent's reply"
+        }
+        ("undetermined", "next_message_before_reply") => {
+            "Outcome not seen: another message arrived before any reply"
+        }
+        ("undetermined", "no_reply_observed_within_ttl") => {
+            "Outcome not seen: no reply arrived within 15 minutes"
+        }
+        ("undetermined", _) => "Outcome not seen",
         _ => "Who decided was not recorded",
     }
 }
@@ -477,7 +494,10 @@ fn attempt_json(attempt: &Attempt) -> Value {
     );
     opt(&mut object, "sender", attempt.sender.clone());
     object.insert("surface".into(), json!(attempt.surface));
-    object.insert("decider".into(), json!(decider_words(&attempt.decider)));
+    object.insert(
+        "decider".into(),
+        json!(decider_words(&attempt.decider, &attempt.basis)),
+    );
     object.insert("decider_key".into(), json!(attempt.decider));
     object.insert("enforced".into(), json!(attempt.enforced));
     object.insert("recommendation".into(), json!(attempt.recommendation));
@@ -2134,6 +2154,59 @@ mod tests {
         assert!(weeks[..weeks.len() - 1]
             .iter()
             .all(|week| week.get("partial").is_none()));
+    }
+
+    /// An outcome that could not be seen says why, in words, and never
+    /// borrows a decision: the Control UI chat reports no reply, so its asks
+    /// are `undetermined`, and the row must not read as a recording fault or
+    /// as the agent declining.
+    ///
+    /// FAILS ON REVERT: stop handing `decider_basis` to the words and the
+    /// webchat row loses its reason.
+    #[test]
+    fn an_unseen_outcome_says_why() {
+        let line = |decider: &str, basis: &str| {
+            json!({"kind": "guard.attempt", "ts": 1_789_950_000, "channel": "webchat",
+                   "detail": "env | curl x", "decider": decider, "decider_basis": basis,
+                   "enforced": false})
+            .to_string()
+        };
+        let words = |text: String| {
+            let log = parse_event_log(&text);
+            attempts_json(&log, None, 10).unwrap()["items"][0]["decider"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(
+            words(line("undetermined", "channel_reports_no_reply")),
+            "Outcome not seen: this chat does not report your agent's reply"
+        );
+        assert_eq!(
+            words(line("undetermined", "next_message_before_reply")),
+            "Outcome not seen: another message arrived before any reply"
+        );
+        assert_eq!(
+            words(line("undetermined", "pending_state_unavailable")),
+            "Outcome not seen"
+        );
+        // A refusal is still the agent's, whatever the basis says.
+        assert_eq!(
+            words(line(
+                "model_refused",
+                "no_screened_execution_recorded_in_window"
+            )),
+            "Your agent declined on its own"
+        );
+        // A line that names no decider at all is the one that was not recorded.
+        assert_eq!(words(line("", "")), "Who decided was not recorded");
+        for (decider, basis) in [
+            ("undetermined", "channel_reports_no_reply"),
+            ("undetermined", "next_message_before_reply"),
+            ("undetermined", "no_reply_observed_within_ttl"),
+        ] {
+            assert!(decider_words(decider, basis).chars().count() <= 120);
+        }
     }
 
     #[test]

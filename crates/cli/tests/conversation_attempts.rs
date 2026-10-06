@@ -40,6 +40,63 @@ impl Host {
         Self { _dir: dir, graph }
     }
 
+    /// A host whose record directory is SHARED (group-writable, not sticky),
+    /// the shape the paid installer gives `/var/lib/innerwarden/guard`.
+    #[cfg(unix)]
+    fn shared() -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().expect("scratch dir");
+        let guard = dir.path().join("guard");
+        std::fs::create_dir(&guard).expect("guard dir");
+        std::fs::set_permissions(&guard, std::fs::Permissions::from_mode(0o770)).expect("share it");
+        Self {
+            graph: guard.join("graph.json"),
+            _dir: dir,
+        }
+    }
+
+    fn record_dir(&self) -> std::path::PathBuf {
+        self.graph.parent().expect("record dir").to_path_buf()
+    }
+
+    fn pending_file(&self) -> std::path::PathBuf {
+        self.record_dir().join("observe-pending.json")
+    }
+
+    /// The sessions the pending state is holding an ask for.
+    fn pending_sessions(&self) -> Vec<String> {
+        let body = std::fs::read_to_string(self.pending_file()).unwrap_or_default();
+        serde_json::from_str::<Value>(&body)
+            .ok()
+            .and_then(|state| state["asks"].as_array().cloned())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|ask| ask["session"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    fn inbound(&self, session: &str, channel: &str, ask: &str) {
+        let out = self.run(
+            &[
+                "observe",
+                "inbound",
+                "--session",
+                session,
+                "--channel",
+                channel,
+                "--agent",
+                "openclaw",
+            ],
+            ask,
+        );
+        assert_eq!(out.status.code(), Some(0), "inbound must never fail");
+    }
+
+    fn reply(&self, session: &str) {
+        let out = self.run(&["observe", "reply", "--session", session], "No.");
+        assert_eq!(out.status.code(), Some(0), "reply must never fail");
+    }
+
     fn run(&self, args: &[&str], stdin: &str) -> std::process::Output {
         let mut child = Command::new(bin())
             .args(args)
@@ -318,6 +375,63 @@ fn status_admits_the_gap_when_nothing_is_wired() {
     );
 }
 
+/// A hook installed by an earlier release keeps running after an upgrade,
+/// because nothing but `observe install` rewrites it. Status says so and names
+/// the command, and says nothing once the hook is current.
+///
+/// FAILS ON REVERT: drop the comparison from status and the older hook reads
+/// as fully current.
+#[test]
+fn status_names_a_hook_older_than_the_binary() {
+    let dir = tempfile::TempDir::new().expect("scratch dir");
+    let config = dir.path().join(".openclaw/openclaw.json");
+    std::fs::create_dir_all(config.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&config, "{}").expect("write config");
+    let status = || {
+        let out = Command::new(bin())
+            .args(["observe", "status"])
+            .env("HOME", dir.path())
+            .env("USERPROFILE", dir.path())
+            .env("IW_GRAPH_FILE", dir.path().join("graph.json"))
+            .output()
+            .expect("run innerwarden");
+        assert_eq!(out.status.code(), Some(0));
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+    let install = Command::new(bin())
+        .args([
+            "observe",
+            "install",
+            "--home",
+            &dir.path().display().to_string(),
+        ])
+        .env("IW_GRAPH_FILE", dir.path().join("graph.json"))
+        .output()
+        .expect("run innerwarden");
+    assert_eq!(install.status.code(), Some(0));
+
+    let current = status();
+    assert!(current.contains("ARE observed"), "{current}");
+    assert!(!current.contains("older than"), "{current}");
+
+    // The handler an earlier release wrote.
+    let handler = dir
+        .path()
+        .join(".openclaw/hooks/innerwarden-attempts/handler.js");
+    std::fs::write(
+        &handler,
+        "const handler = async () => {};\nexport default handler;\n",
+    )
+    .expect("older handler");
+    let stale = status();
+    assert!(stale.contains("ARE observed"), "{stale}");
+    assert!(
+        stale.contains("older than the one this binary ships"),
+        "status must say the hook is out of date: {stale}"
+    );
+    assert!(stale.contains("observe install"), "{stale}");
+}
+
 /// Wiring OpenClaw is one command, and it must leave the rest of a config that
 /// holds auth profiles and channel tokens exactly as it found it.
 #[test]
@@ -409,4 +523,170 @@ fn install_refuses_to_rewrite_a_config_it_cannot_parse() {
         original,
         "the config must be byte-identical after a refusal"
     );
+}
+
+/// THE evidence-erasure case. Two dangerous asks in one conversation before
+/// any reply: the second used to delete the first from the pending state with
+/// nothing written, so an attacker could make an attempt vanish by sending
+/// another one, and on a channel that never reports a reply every ask but the
+/// last vanished that way.
+///
+/// FAILS ON REVERT: delete the earlier ask in `remember` again and only one
+/// attempt is recorded.
+#[test]
+fn a_second_ask_in_one_session_records_both() {
+    let host = Host::new();
+    let session = "agent:main:telegram:175000";
+    host.inbound(session, "telegram", MINER_PROMPT);
+    host.inbound(session, "telegram", EXFIL_PROMPT);
+    host.reply(session);
+
+    let attempts = host.attempts();
+    assert_eq!(
+        attempts.len(),
+        2,
+        "both asks must be recorded: {attempts:?}"
+    );
+    let first = attempts
+        .iter()
+        .find(|a| a["detail"].as_str().unwrap_or_default().contains("xmrig"))
+        .expect("the first ask is recorded");
+    assert_eq!(
+        first["decider"], "undetermined",
+        "no reply answered the first ask, so the model is not credited: {first}"
+    );
+    assert_eq!(first["decider_basis"], "next_message_before_reply");
+    assert_eq!(first["enforced"], false);
+    let second = attempts
+        .iter()
+        .find(|a| a["detail"].as_str().unwrap_or_default().contains("curl"))
+        .expect("the second ask is recorded");
+    assert_eq!(
+        second["decider"], "model_refused",
+        "the reply answers the latest ask"
+    );
+}
+
+/// The record names the agent the hook declared, so a consumer can tell which
+/// agent was asked.
+///
+/// FAILS ON REVERT: stop reading `--agent` on inbound and the field is absent.
+#[test]
+fn the_attempt_names_the_agent_the_hook_declares() {
+    let host = Host::new();
+    let session = "agent:main:telegram:175000";
+    host.inbound(session, "telegram", MINER_PROMPT);
+    host.reply(session);
+    let attempts = host.attempts();
+    assert_eq!(attempts.len(), 1, "{attempts:?}");
+    assert_eq!(attempts[0]["agent"], "openclaw");
+}
+
+/// A link planted at the pending file (the directory is shared with the
+/// agent's account, and this CLI also runs as root) is never followed, and the
+/// ask is not lost to it either: the state cannot be held, so the ask is
+/// recorded at once with its outcome unknown and the reason named.
+///
+/// FAILS ON REVERT: let an unusable pending state drop the ask again, and
+/// nothing is recorded.
+#[cfg(unix)]
+#[test]
+fn a_pending_file_that_cannot_be_held_still_records_the_ask() {
+    let host = Host::new();
+    let victim = host.record_dir().join("victim");
+    std::fs::write(&victim, "keep me\n").expect("victim");
+    std::os::unix::fs::symlink(&victim, host.pending_file()).expect("plant link");
+
+    host.inbound("agent:main:main", "webchat", MINER_PROMPT);
+
+    assert_eq!(
+        std::fs::read_to_string(&victim).expect("victim"),
+        "keep me\n",
+        "the link's target is untouched"
+    );
+    let attempts = host.attempts();
+    assert_eq!(attempts.len(), 1, "the ask must not be lost: {attempts:?}");
+    assert_eq!(attempts[0]["decider"], "undetermined");
+    assert_eq!(attempts[0]["decider_basis"], "pending_state_unavailable");
+    assert_eq!(attempts[0]["enforced"], false);
+}
+
+/// A lock another account left in the shared directory, one this account
+/// cannot even open (an older release run as root created it `0600`), must not
+/// stop the ask being held. The writer for agent configurations refuses that
+/// and the ask was dropped with the error discarded; the shared-record writer
+/// replaces the lock, as every group member may.
+///
+/// FAILS ON REVERT: save the pending state with the agent-configuration
+/// writer (`replace_if_unchanged`) again, and the ask is never held.
+#[cfg(unix)]
+#[test]
+fn a_lock_another_account_left_does_not_stop_the_ask_being_held() {
+    use std::os::unix::fs::PermissionsExt;
+    // SAFETY: reads the process credentials, cannot fail.
+    assert_ne!(
+        unsafe { libc::geteuid() },
+        0,
+        "running as root, which opens any file, so the case cannot be constructed; \
+         run the suite as an ordinary account"
+    );
+    let host = Host::shared();
+    let lock = host
+        .record_dir()
+        .join(".observe-pending.json.innerwarden.lock");
+    std::fs::write(&lock, b"").expect("plant lock");
+    std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+    assert!(
+        std::fs::File::open(&lock).is_err(),
+        "precondition: this account cannot open the planted lock"
+    );
+
+    let session = "agent:main:telegram:175000";
+    host.inbound(session, "telegram", MINER_PROMPT);
+    assert_eq!(
+        host.pending_sessions(),
+        vec![session.to_string()],
+        "the ask is held for its reply"
+    );
+    host.reply(session);
+    let attempts = host.attempts();
+    assert_eq!(attempts.len(), 1, "{attempts:?}");
+    assert_eq!(attempts[0]["decider"], "model_refused");
+}
+
+/// `observe settle` closes an ask on a channel that never reports the reply,
+/// once the ask has waited the hold, and says the reply was not visible. Before
+/// the hold is over it changes nothing, so neither an early timer nor any other
+/// caller can close an ask early.
+///
+/// FAILS ON REVERT: without the verb the binary exits 2 and records nothing.
+#[test]
+fn settle_closes_a_webchat_ask_only_after_its_hold() {
+    let host = Host::new();
+    host.inbound("agent:main:main", "webchat", EXFIL_PROMPT);
+    let early = host.run(&["observe", "settle", "--session", "agent:main:main"], "");
+    assert_eq!(early.status.code(), Some(0));
+    assert!(
+        host.attempts().is_empty(),
+        "too early: {:?}",
+        host.attempts()
+    );
+    assert_eq!(host.pending_sessions(), vec!["agent:main:main".to_string()]);
+
+    // Age the held ask past the hold, as two minutes would.
+    let body = std::fs::read_to_string(host.pending_file()).expect("pending");
+    let mut state: Value = serde_json::from_str(&body).expect("json");
+    let asked_at = state["asks"][0]["asked_at"].as_u64().expect("asked_at");
+    state["asks"][0]["asked_at"] = serde_json::json!(asked_at - 200);
+    std::fs::write(host.pending_file(), state.to_string()).expect("age it");
+
+    let settled = host.run(&["observe", "settle", "--session", "agent:main:main"], "");
+    assert_eq!(settled.status.code(), Some(0));
+    let attempts = host.attempts();
+    assert_eq!(attempts.len(), 1, "{attempts:?}");
+    assert_eq!(attempts[0]["decider"], "undetermined");
+    assert_eq!(attempts[0]["decider_basis"], "channel_reports_no_reply");
+    assert_eq!(attempts[0]["enforced"], false);
+    assert_eq!(attempts[0]["channel"], "webchat");
+    assert!(host.pending_sessions().is_empty());
 }

@@ -731,7 +731,7 @@ pub(crate) fn append_guard_event(line: &Value) {
 /// the guarantee `O_APPEND` actually offers; it is not a promise about every
 /// filesystem, and this stays best-effort telemetry that can never alter a
 /// verdict.
-fn append_guard_event_at(dir: &std::path::Path, line: &Value) {
+pub(crate) fn append_guard_event_at(dir: &std::path::Path, line: &Value) {
     use std::io::Write;
     let path = dir.join("guard-events.jsonl");
     create_sink_with_directory_ownership(&path);

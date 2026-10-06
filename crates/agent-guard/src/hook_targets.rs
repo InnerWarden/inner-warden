@@ -99,7 +99,9 @@ pub static TARGETS: &[HookTarget] = &[
         // against openclaw 2026.7.1-2, `message:received` carries the inbound
         // user text and `message:sent` carries the outbound reply, so an attack
         // prompt the model refuses can be recorded even though no command ever
-        // existed to screen. `innerwarden observe install` wires that, and the
+        // existed to screen. (Not on the Control UI chat: in 2026.9.7 its reply
+        // streams over the gateway connection and fires no `message:sent`, so
+        // `innerwarden observe settle` records those asks as not visible.) `innerwarden observe install` wires that, and the
         // record it writes says the model decided, never the product. It cannot
         // block: strings pushed to `event.messages` are ignored for every
         // `message:*` event.

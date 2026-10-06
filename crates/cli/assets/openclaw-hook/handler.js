@@ -7,6 +7,14 @@
  * inbound user text (`message:received`) and the outbound assistant reply
  * (`message:sent`), which is exactly what a refused attack attempt looks like.
  *
+ * Except on the Control UI chat. A `webchat` turn fires `message:received`, but
+ * its reply is streamed back over the gateway connection and never fires
+ * `message:sent` (in 2026.9.7 that event comes only from outbound channel
+ * delivery), and no internal hook event marks the end of a webchat turn. So
+ * for a webchat message this asks `innerwarden observe settle` to close the
+ * ask after a fixed wait, and the record says the reply was not visible
+ * rather than that the model declined.
+ *
  * This handler observes and never decides. It cannot cancel a message and does
  * not try to: it hands the text to `innerwarden observe`, which does the
  * scoring and the recording. Every failure here is swallowed, because a
@@ -22,6 +30,16 @@ import { fileURLToPath } from "node:url";
 const TIMEOUT_MS = 4000;
 /** Text beyond this is not needed to judge an ask, and is not worth the pipe. */
 const MAX_INPUT_BYTES = 64 * 1024;
+/** The hook is installed for one agent, and every record it causes says so. */
+const AGENT = "openclaw";
+/** The channel whose replies OpenClaw never reports to internal hooks. */
+const UNREPORTED_REPLY_CHANNEL = "webchat";
+/**
+ * When to settle a webchat ask. The CLI holds it for 120 s (long enough for a
+ * guard block in the same turn to be seen) and refuses to settle it earlier,
+ * so this only has to be later than that.
+ */
+const UNREPORTED_REPLY_SETTLE_MS = 125_000;
 
 const hookDir = path.dirname(fileURLToPath(import.meta.url));
 
@@ -89,9 +107,31 @@ const handler = async (event) => {
     const sender = text(context.metadata?.senderId) || text(context.from);
     await run(
       bin,
-      ["observe", "inbound", "--session", session, "--channel", channel, "--sender", sender],
+      [
+        "observe",
+        "inbound",
+        "--session",
+        session,
+        "--channel",
+        channel,
+        "--sender",
+        sender,
+        "--agent",
+        AGENT,
+      ],
       content,
     );
+    if (channel === UNREPORTED_REPLY_CHANNEL) {
+      // Not awaited: the gateway turn must not wait two minutes on telemetry,
+      // and an unref'd timer never holds a gateway shutdown open. A timer lost
+      // to a restart costs only the wait: the ask is still recorded when its
+      // pending entry expires.
+      const timer = setTimeout(
+        () => run(bin, ["observe", "settle", "--session", session], ""),
+        UNREPORTED_REPLY_SETTLE_MS,
+      );
+      timer?.unref?.();
+    }
     return;
   }
 
