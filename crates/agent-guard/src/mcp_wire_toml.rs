@@ -16,7 +16,7 @@
 
 use toml_edit::{value, Array, DocumentMut, Item, Table, Value};
 
-use crate::mcp_wire::{is_wrapper_name, naming, proxy_agent};
+use crate::mcp_wire::{is_wrapper_name, naming, proxy_agent, wrapper_blocks};
 
 /// The basename of a command path, cross-platform (`/` and `\`), lowercased.
 fn basename(cmd: &str) -> String {
@@ -65,6 +65,9 @@ fn wrapper_separator(server: &Table) -> Option<usize> {
     args.iter().position(|v| v.as_str() == Some("--"))
 }
 
+/// The mode this server's proxy runs in, read from its own wrapper the way
+/// `innerwarden proxy` reads it ([`wrapper_blocks`]); `None` for a server that
+/// is not a complete wrapper.
 fn server_mode(server: &Table) -> Option<WiringMode> {
     let separator = wrapper_separator(server)?;
     let args = server.get("args").and_then(Item::as_array)?;
@@ -75,28 +78,12 @@ fn server_mode(server: &Table) -> Option<WiringMode> {
     {
         return None;
     }
-    let values: Vec<&Value> = args.iter().collect();
-    let mut mode: Option<&str> = None;
-    let mut i = 1usize;
-    while i < separator {
-        let arg = values[i].as_str()?;
-        if arg == "--mode" {
-            mode = Some(values.get(i + 1)?.as_str()?);
-            i += 2;
-        } else if let Some(value) = arg.strip_prefix("--mode=") {
-            mode = Some(value);
-            i += 1;
-        } else {
-            i += 1;
-        }
-    }
-    match mode {
-        // Legacy Community wrappers were written as `proxy -- <child>`; the
-        // Community CLI's historical default is guard, so they enforce.
-        None | Some("guard" | "kill") => Some(WiringMode::Enforce),
-        Some("advisory" | "warn") => Some(WiringMode::Monitor),
-        Some(_) => None,
-    }
+    let options = wrapper_options(server)?;
+    Some(if wrapper_blocks(&options)? {
+        WiringMode::Enforce
+    } else {
+        WiringMode::Monitor
+    })
 }
 
 /// True when a server table is already routed through the guard proxy: its command
@@ -828,6 +815,36 @@ mod agent_naming_tests {
             let d = wrapper(BIN, args);
             assert!(is_guarded_toml(&d), "{args}");
             assert_eq!(guarded_mode_toml(&d), Some(mode), "{args}");
+        }
+    }
+
+    /// The TOML twin of the JSON reader's
+    /// [`crate::mcp_wire`] `a_flag_value_is_never_read_as_the_mode` and
+    /// `a_flag_that_takes_the_separator_leaves_no_mode_to_report`: a Codex
+    /// wrapper's mode is read the way `innerwarden proxy` reads it.
+    ///
+    /// FAILS ON REVERT: step over every option one word at a time in this
+    /// module's `server_mode` again; the first case reads `Some(Enforce)` and
+    /// the last reads guarded.
+    #[test]
+    fn the_mode_is_read_the_way_the_proxy_reads_its_options() {
+        for (args, mode) in [
+            (
+                "[\"proxy\", \"--mode\", \"advisory\", \"--label\", \"--mode=guard\", \"--\", \"icm\"]",
+                Some(WiringMode::Monitor),
+            ),
+            (
+                "[\"proxy\", \"--label\", \"--mode\", \"--\", \"icm\"]",
+                Some(WiringMode::Enforce),
+            ),
+            (
+                "[\"proxy\", \"--mode\", \"guard\", \"--label\", \"--\", \"--mode\", \"advisory\", \"--\", \"icm\"]",
+                None,
+            ),
+        ] {
+            let d = wrapper(BIN, args);
+            assert_eq!(is_guarded_toml(&d), mode.is_some(), "{args}");
+            assert_eq!(guarded_mode_toml(&d), mode, "{args}");
         }
     }
 

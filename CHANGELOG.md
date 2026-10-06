@@ -86,6 +86,18 @@ follows semantic versioning.
   module rules, and the system's programs. Only the filesystem server's
   read-only tools may name these files. A relative path is not judged: the
   server resolves it against its allowed directories.
+- **`innerwarden agents` and `status` report the mode each MCP proxy runs in.**
+  The mode was guessed by searching the agent's configuration for the words
+  `advisory`, `warn`, `guard` and `kill` anywhere in it, so a log level or a
+  server's own argument could decide it, and a wrapper set to
+  `--mode=advisory` beside any other `"guard"` was listed as enforce while it
+  only recorded. Each wrapper's arguments are now read the way the proxy reads
+  them, the way the dashboard already did, and a flag's value is never taken
+  for the mode (`--label --mode=guard` is a label). A wrapper whose last
+  option before `--` is a flag waiting for its value is listed as not guarded:
+  the proxy takes that `--` as the value and runs the options written after
+  it. A generic MCP client now shows the mode of its own configuration: it
+  showed none, and one kept in `~/.claude/` showed Claude Code's.
 
 ## 1.5.1 - 2026-09-30
 

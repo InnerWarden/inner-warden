@@ -68,6 +68,9 @@ fn wrapper_separator(server: &Value) -> Option<usize> {
     args.iter().position(|v| v.as_str() == Some("--"))
 }
 
+/// The mode this server's proxy runs in, read from its own wrapper the way
+/// `innerwarden proxy` reads it ([`wrapper_blocks`]); `None` for a server that
+/// is not a complete wrapper.
 fn server_mode(server: &Value) -> Option<WiringMode> {
     let separator = wrapper_separator(server)?;
     let args = server.get("args")?.as_array()?;
@@ -78,25 +81,43 @@ fn server_mode(server: &Value) -> Option<WiringMode> {
     {
         return None;
     }
-    let mut mode: Option<&str> = None;
-    let mut i = 1usize;
-    while i < separator {
-        let arg = args[i].as_str()?;
-        if arg == "--mode" {
-            mode = Some(args.get(i + 1)?.as_str()?);
-            i += 2;
-        } else if let Some(value) = arg.strip_prefix("--mode=") {
-            mode = Some(value);
-            i += 1;
-        } else {
-            i += 1;
-        }
+    let options: Vec<Option<&str>> = args[1..separator].iter().map(Value::as_str).collect();
+    Some(if wrapper_blocks(&options)? {
+        WiringMode::Enforce
+    } else {
+        WiringMode::Monitor
+    })
+}
+
+/// Whether `innerwarden proxy`, started with these options (the words between
+/// `proxy` and the wrapper's `--`), refuses what the guard denies:
+/// `Some(true)` for `guard` and `kill`, `Some(false)` for `advisory` and
+/// `warn`, which only record.
+///
+/// No `--mode` at all is `Some(true)`: legacy Community wrappers were written
+/// as `proxy -- <child>`, and the proxy's default is `guard`.
+///
+/// The options are read as the proxy reads them ([`OptionWalk`]), never by
+/// looking for a word: `--label --mode=guard` is a label, and the proxy runs
+/// the mode given before it.
+///
+/// `None` when the proxy does not run these options as they look:
+/// * a word that is not a string, or a `--mode` value the proxy refuses;
+/// * a flag that takes a value standing last, so the proxy takes the `--` for
+///   that value and reads the words after it as more options. In
+///   `--mode guard --label -- --mode advisory -- <child>` the proxy runs
+///   `advisory`, while the words in front of the first `--` say `guard`.
+pub(crate) fn wrapper_blocks(options: &[Option<&str>]) -> Option<bool> {
+    if options.iter().any(Option::is_none) {
+        return None;
     }
-    match mode {
-        // Legacy Community wrappers were written as `proxy -- <child>`; the
-        // Community CLI's historical default is guard, so they enforce.
-        None | Some("guard" | "kill") => Some(WiringMode::Enforce),
-        Some("advisory" | "warn") => Some(WiringMode::Monitor),
+    let walk = walk_options(options);
+    if walk.takes_the_separator {
+        return None;
+    }
+    match walk.mode {
+        None | Some(Some("guard" | "kill")) => Some(true),
+        Some(Some("advisory" | "warn")) => Some(false),
         Some(_) => None,
     }
 }
@@ -150,7 +171,7 @@ pub(crate) struct Naming {
 /// A wrapper's proxy options (the words between `proxy` and its `--`), read
 /// the way `innerwarden proxy` reads them: `--mode`, `--label` and `--agent`
 /// each take the next word as their value, an inline `--flag=value` takes
-/// none, and the last `--agent` wins.
+/// none, and the last `--mode` and the last `--agent` win.
 struct OptionWalk<'a> {
     labelled: bool,
     /// The value of the last `--agent`, `Some(None)` for one with no value.
@@ -158,6 +179,11 @@ struct OptionWalk<'a> {
     agent_flags: usize,
     /// Positions of every `--agent` word and its value.
     agent_words: Vec<usize>,
+    /// The value of the last `--mode`, `Some(None)` for one with no value.
+    mode: Option<Option<&'a str>>,
+    /// The last option is a flag that takes a value, so the proxy takes the
+    /// wrapper's `--` as that value.
+    takes_the_separator: bool,
 }
 
 fn walk_options<'a>(options: &[Option<&'a str>]) -> OptionWalk<'a> {
@@ -166,15 +192,23 @@ fn walk_options<'a>(options: &[Option<&'a str>]) -> OptionWalk<'a> {
         agent: None,
         agent_flags: 0,
         agent_words: Vec::new(),
+        mode: None,
+        takes_the_separator: false,
     };
     let mut i = 0usize;
     while i < options.len() {
+        let last = i + 1 == options.len();
         match options[i] {
             Some("--label") => {
                 walk.labelled = true;
+                walk.takes_the_separator |= last;
                 i += 2;
             }
-            Some("--mode") => i += 2,
+            Some("--mode") => {
+                walk.mode = Some(options.get(i + 1).copied().flatten());
+                walk.takes_the_separator |= last;
+                i += 2;
+            }
             Some("--agent") => {
                 walk.agent = Some(options.get(i + 1).copied().flatten());
                 walk.agent_flags += 1;
@@ -182,7 +216,12 @@ fn walk_options<'a>(options: &[Option<&'a str>]) -> OptionWalk<'a> {
                 if i + 1 < options.len() {
                     walk.agent_words.push(i + 1);
                 }
+                walk.takes_the_separator |= last;
                 i += 2;
+            }
+            Some(word) if word.starts_with("--mode=") => {
+                walk.mode = Some(Some(&word["--mode=".len()..]));
+                i += 1;
             }
             Some(word) if word.starts_with("--label=") => {
                 walk.labelled = true;
@@ -1229,6 +1268,77 @@ mod agent_naming_tests {
             let cfg = openclaw(args.clone());
             assert!(is_guarded(&cfg), "{args}");
             assert_eq!(guarded_mode(&cfg), Some(mode), "{args}");
+        }
+    }
+
+    /// A flag's value is never read as the mode. `innerwarden proxy` takes the
+    /// word after `--label` or `--agent` as that flag's value whatever it says,
+    /// so `--label --mode=guard` is a label and the proxy runs the mode given
+    /// before it. The reader stepped one word at a time and took any
+    /// `--mode` it met, so a configuration anyone with the agent's account can
+    /// edit could keep a recording proxy listed as enforce.
+    ///
+    /// FAILS ON REVERT: step over every option one word at a time in
+    /// `server_mode` again; the first case reads `Some(Enforce)`.
+    #[test]
+    fn a_flag_value_is_never_read_as_the_mode() {
+        for (args, mode) in [
+            (
+                json!([
+                    "proxy",
+                    "--mode",
+                    "advisory",
+                    "--label",
+                    "--mode=guard",
+                    "--",
+                    "npx"
+                ]),
+                WiringMode::Monitor,
+            ),
+            (
+                json!([
+                    "proxy",
+                    "--mode",
+                    "advisory",
+                    "--agent",
+                    "--mode=kill",
+                    "--",
+                    "npx"
+                ]),
+                WiringMode::Monitor,
+            ),
+            // The label is `--mode`; no mode is given, so the proxy's default
+            // (`guard`) applies.
+            (
+                json!(["proxy", "--label", "--mode", "--", "npx"]),
+                WiringMode::Enforce,
+            ),
+        ] {
+            let cfg = openclaw(args.clone());
+            assert!(is_guarded(&cfg), "{args}");
+            assert_eq!(guarded_mode(&cfg), Some(mode), "{args}");
+        }
+    }
+
+    /// A flag that takes a value, standing just before the first `--`, takes
+    /// that `--` as its value: the proxy reads on, and runs the mode written
+    /// AFTER it. The words in front of the first `--` are not what runs, so
+    /// such a wrapper has no mode to report and is not guarded.
+    ///
+    /// FAILS ON REVERT: drop the `takes_the_separator` check from
+    /// `wrapper_blocks`; the first case reads guarded, `Some(Enforce)`, while
+    /// its proxy records only.
+    #[test]
+    fn a_flag_that_takes_the_separator_leaves_no_mode_to_report() {
+        for args in [
+            json!(["proxy", "--mode", "guard", "--label", "--", "--mode", "advisory", "--", "npx"]),
+            json!(["proxy", "--mode", "guard", "--agent", "--", "--mode", "advisory", "--", "npx"]),
+            json!(["proxy", "--mode", "--", "npx"]),
+        ] {
+            let cfg = openclaw(args.clone());
+            assert!(!is_guarded(&cfg), "{args}");
+            assert!(has_unguarded_stdio_server(&cfg), "{args}");
+            assert_eq!(guarded_mode(&cfg), None, "{args}");
         }
     }
 

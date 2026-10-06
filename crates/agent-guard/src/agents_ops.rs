@@ -768,7 +768,7 @@ fn rows_from_sources(
     // say "monitor" or "enforce" instead of only "guarded".
     for r in &mut rows {
         if r.guarded {
-            r.mode = read_guard_mode(home, &r.name);
+            r.mode = read_guard_mode(home, r);
         }
     }
     rows.sort_by(|a, b| a.name.cmp(&b.name));
@@ -1449,9 +1449,20 @@ pub fn run(home: &Path, args: &[String]) -> Vec<String> {
 ///
 /// `None` means wired but unreadable, which is reported as unknown rather than
 /// guessed at in either direction.
-fn read_guard_mode(home: &Path, agent: &str) -> Option<GuardMode> {
-    let k = canonical(agent)?;
-    if k.hookable {
+///
+/// The row's OWN wiring is read: the hook for a hook agent, and otherwise the
+/// MCP configuration the row was discovered from. Looking the row's name up in
+/// the reviewed table instead gave every generic MCP client no mode at all, and
+/// one whose directory is named like a reviewed agent's alias (`~/.claude/`,
+/// `~/.codex-cli/`) the mode of that other agent's wiring.
+///
+/// An MCP mode is the one each wrapper's proxy runs in, read from its own
+/// argument list ([`mcp_wire::guarded_mode`]). It used to be a search of the
+/// file's text for the words `"advisory"`, `"warn"`, `"guard"` and `"kill"`
+/// anywhere, so `--mode=advisory` (no quote before the word) beside any other
+/// `"guard"` in the file read as enforce while every call was let through.
+fn read_guard_mode(home: &Path, row: &AgentStatus) -> Option<GuardMode> {
+    if row.hookable {
         return read_json(&home.join(".claude/settings.json"))
             .and_then(|v| hook::effective_iwguard_hook_mode(&v))
             .map(|m| match m {
@@ -1460,23 +1471,25 @@ fn read_guard_mode(home: &Path, agent: &str) -> Option<GuardMode> {
                 hook::EffectiveHookMode::Mixed => GuardMode::Mixed,
             });
     }
-    // MCP wiring carries the mode as the proxy's `--mode` argument.
-    let rel = k.mcp_json.or(k.mcp_toml)?;
-    let text = std::fs::read_to_string(home.join(rel)).ok()?;
-    // `advisory` and `warn` pass everything through; `guard` and `kill` block.
-    let recording = text.contains("\"advisory\"") || text.contains("\"warn\"");
-    let blocking = text.contains("\"guard\"") || text.contains("\"kill\"");
-    match (recording, blocking) {
-        (true, false) => Some(GuardMode::Monitor),
-        (false, true) => Some(GuardMode::Enforce),
-        (true, true) => Some(GuardMode::Mixed),
-        // Wrapped by the proxy with no explicit `--mode`, so the proxy's own
-        // default applies. That default is `guard`, i.e. it BLOCKS. Reporting
-        // this as unknown would be the dangerous direction to be vague in: the
-        // whole point of showing the mode is so nobody believes they are only
-        // recording while the guard is refusing things.
-        (false, false) => Some(GuardMode::Enforce),
+    if let Some(rel) = &row.mcp_json {
+        return read_json(&home.join(rel))
+            .and_then(|config| mcp_wire::guarded_mode(&config))
+            .map(|m| match m {
+                mcp_wire::WiringMode::Monitor => GuardMode::Monitor,
+                mcp_wire::WiringMode::Enforce => GuardMode::Enforce,
+                mcp_wire::WiringMode::Mixed => GuardMode::Mixed,
+            });
     }
+    if let Some(rel) = &row.mcp_toml {
+        return read_toml(&home.join(rel))
+            .and_then(|config| mcp_wire_toml::guarded_mode_toml(&config))
+            .map(|m| match m {
+                mcp_wire_toml::WiringMode::Monitor => GuardMode::Monitor,
+                mcp_wire_toml::WiringMode::Enforce => GuardMode::Enforce,
+                mcp_wire_toml::WiringMode::Mixed => GuardMode::Mixed,
+            });
+    }
+    None
 }
 
 #[cfg(test)]
@@ -1988,6 +2001,88 @@ mod tests {
         .unwrap();
         assert!(has_guard_wiring(home.path(), "codex"));
         assert!(!is_guarded(home.path(), "codex", None));
+    }
+
+    /// The mode `agents` and `status` print for an MCP agent was a search of
+    /// the configuration's text for `"advisory"`, `"warn"`, `"guard"` and
+    /// `"kill"` anywhere. The words a configuration holds for other reasons
+    /// (a log level, a server's own argument) decided it, and the inline
+    /// `--mode=advisory` matched nothing.
+    ///
+    /// The attacker form is the first: whoever can edit the agent's own
+    /// configuration (the agent itself, under its user's account) turns every
+    /// wrapper to `--mode=advisory`, so the proxies only record, and the listing
+    /// kept saying enforce because another `"guard"` was in the file.
+    ///
+    /// FAILS ON REVERT: restore the text search in `read_guard_mode`; the
+    /// recording Cursor wiring reads `Some(Enforce)`.
+    #[test]
+    fn the_listed_mcp_mode_is_what_each_wrapper_runs_not_a_word_in_the_file() {
+        let home = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path().join(".cursor")).unwrap();
+        std::fs::create_dir_all(home.path().join(".codex")).unwrap();
+        let cases = [
+            (
+                // Records only; `"guard"` is a profile the server is given.
+                r#"{"mcpServers":{"fs":{"command":"/abs/innerwarden","args":["proxy","--label","cursor","--agent","cursor","--mode=advisory","--","npx","fs-server","--profile","guard"]}}}"#,
+                "[mcp_servers.icm]\ncommand = \"/abs/innerwarden\"\nargs = [\"proxy\", \"--mode=advisory\", \"--\", \"icm\"]\nenv = { ICM_POLICY = \"kill\" }\n",
+                GuardMode::Monitor,
+            ),
+            (
+                // Blocks; `"warn"` is the server's log level.
+                r#"{"mcpServers":{"fs":{"command":"/abs/innerwarden","args":["proxy","--mode","guard","--","npx","fs-server"],"env":{"LOG_LEVEL":"warn"}}}}"#,
+                "log_level = \"warn\"\n\n[mcp_servers.icm]\ncommand = \"/abs/innerwarden\"\nargs = [\"proxy\", \"--mode\", \"guard\", \"--\", \"icm\"]\n",
+                GuardMode::Enforce,
+            ),
+        ];
+        for (cursor, codex, mode) in cases {
+            std::fs::write(home.path().join(".cursor/mcp.json"), cursor).unwrap();
+            std::fs::write(home.path().join(".codex/config.toml"), codex).unwrap();
+
+            let (rows, _) = rows_from_sources(home.path(), &[], None);
+
+            for name in ["cursor", "codex"] {
+                let row = rows.iter().find(|row| row.name == name).unwrap();
+                assert!(row.guarded, "{name}: {cursor} / {codex}");
+                assert_eq!(row.mode, Some(mode), "{name}: {cursor} / {codex}");
+            }
+        }
+    }
+
+    /// A generic MCP client's mode is read from ITS configuration. The row's
+    /// name was looked up in the reviewed table instead, so a guarded generic
+    /// client had no mode ("mode unreadable", and `status` printed the mode as
+    /// unknown for the whole host), and one in `~/.claude/`, which is named
+    /// `claude`, an alias of Claude Code, was given the Claude Code hook's mode.
+    ///
+    /// FAILS ON REVERT: look the row up by name again; `claude` reads
+    /// `Some(Enforce)` (the hook's) and `windsurf` reads `None`.
+    #[test]
+    fn a_generic_mcp_client_reports_the_mode_of_its_own_configuration() {
+        let home = tempfile::TempDir::new().unwrap();
+        let recording = r#"{"mcpServers":{"fs":{"command":"/abs/innerwarden","args":["proxy","--mode","advisory","--","npx","fs-server"]}}}"#;
+        for dir in [".claude", ".windsurf"] {
+            std::fs::create_dir_all(home.path().join(dir)).unwrap();
+            std::fs::write(home.path().join(dir).join("mcp.json"), recording).unwrap();
+        }
+        // Claude Code's own hook enforces.
+        std::fs::write(
+            home.path().join(".claude/settings.json"),
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"/abs/innerwarden hook"}]}]}}"#,
+        )
+        .unwrap();
+
+        let (rows, _) = rows_from_sources(home.path(), &[], None);
+
+        for name in ["claude", "windsurf"] {
+            let row = rows.iter().find(|row| row.name == name).unwrap();
+            assert_eq!(
+                row.mcp_json.as_deref(),
+                Some(format!(".{name}/mcp.json").as_str())
+            );
+            assert!(row.guarded, "{name}");
+            assert_eq!(row.mode, Some(GuardMode::Monitor), "{name}");
+        }
     }
 
     #[test]

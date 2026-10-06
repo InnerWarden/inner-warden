@@ -138,6 +138,90 @@ fn proxy_accepts_inline_mode_and_label_used_by_existing_wrappers() {
     );
 }
 
+/// The mode `agents`, `status` and the dashboard report for an MCP wrapper is
+/// the mode its proxy RUNS in. Each wrapper here is started for real and the
+/// proxy's own banner (`proxy mode=...`) is compared with what the wiring
+/// reader makes of the same words: whenever the reader names a mode, it is the
+/// proxy's. In the first two attacker forms a flag's value looks like a
+/// `--mode`; the last two are written so that the words in front of the first
+/// `--` say `guard` or `kill` while the proxy records only.
+///
+/// FAILS ON REVERT: step over the wrapper's options one word at a time in
+/// `mcp_wire::server_mode` again; `--mode advisory --label --mode=guard` reads
+/// `Enforce` while its proxy prints `mode=advisory`.
+#[cfg(unix)]
+#[test]
+fn the_mode_read_from_a_wrapper_is_the_mode_its_proxy_runs() {
+    use innerwarden_agent_guard::mcp_wire::{guarded_mode, WiringMode};
+    let cases: &[(&[&str], Option<WiringMode>)] = &[
+        (&[], Some(WiringMode::Enforce)),
+        (&["--mode", "advisory"], Some(WiringMode::Monitor)),
+        (&["--mode=warn"], Some(WiringMode::Monitor)),
+        (
+            &["--label", "x", "--mode", "kill"],
+            Some(WiringMode::Enforce),
+        ),
+        // Attacker forms.
+        (
+            &["--mode", "advisory", "--label", "--mode=guard"],
+            Some(WiringMode::Monitor),
+        ),
+        (
+            &["--mode", "advisory", "--agent", "--mode=kill"],
+            Some(WiringMode::Monitor),
+        ),
+        (
+            &["--mode", "guard", "--label", "--", "--mode", "advisory"],
+            None,
+        ),
+        (&["--mode", "kill", "--agent", "--", "--mode=warn"], None),
+        // The label is `--mode`; no mode is given, so the default applies.
+        (
+            &["--label", "--mode", "--agent", "codex"],
+            Some(WiringMode::Enforce),
+        ),
+    ];
+    for (options, expected) in cases {
+        let mut args = vec!["proxy"];
+        args.extend_from_slice(options);
+        args.extend_from_slice(&["--", "cat"]);
+
+        let out = cli()
+            .args(&args)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run the wrapper's proxy");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{args:?}: {stderr}");
+        let ran = stderr
+            .split_once("proxy mode=")
+            .and_then(|(_, rest)| rest.split_whitespace().next())
+            .unwrap_or_else(|| panic!("{args:?}: no mode banner in {stderr}"));
+        let runs = match ran {
+            "guard" | "kill" => WiringMode::Enforce,
+            "advisory" | "warn" => WiringMode::Monitor,
+            other => panic!("{args:?}: the proxy ran an unknown mode {other}"),
+        };
+
+        let config = serde_json::json!({"mcpServers": {"s": {"command": bin(), "args": args}}});
+        let read = guarded_mode(&config);
+        if let Some(read) = read {
+            assert_eq!(
+                read, runs,
+                "{args:?}: the reader says {read:?}, the proxy runs {ran}"
+            );
+        }
+        assert_eq!(read, *expected, "reader on {args:?}, the proxy runs {ran}");
+        if expected.is_none() {
+            assert_eq!(
+                runs,
+                WiringMode::Monitor,
+                "{args:?}: these cases are the ones whose proxy records only"
+            );
+        }
+    }
+}
+
 #[cfg(unix)]
 fn run_proxy_fixture(
     mode: &str,
