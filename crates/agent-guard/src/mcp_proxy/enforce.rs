@@ -155,7 +155,7 @@ pub fn synthesize_denial(d: &ProxyDecision, as_protocol_error: bool) -> String {
 mod tests {
     use super::*;
     use crate::mcp_proxy::jsonrpc::{parse_line, ParsedLine};
-    use crate::mcp_proxy::router::{route_message, Direction};
+    use crate::mcp_proxy::router::{route_message, Direction, PendingRequest};
 
     fn env(line: &str) -> crate::mcp_proxy::jsonrpc::JsonRpcEnvelope {
         match parse_line(line) {
@@ -185,7 +185,10 @@ mod tests {
         let d = route_message(
             &env(line),
             Direction::ServerToClient,
-            Some("tools/call"),
+            Some(&PendingRequest {
+                method: "tools/call".into(),
+                tool: None,
+            }),
             None,
             None,
         );
