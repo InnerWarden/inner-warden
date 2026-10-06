@@ -11,17 +11,16 @@
 //! than no telemetry surface.
 
 use innerwarden_agent_guard::file_update::ReplaceError;
-use innerwarden_agent_guard::mcp::analyze_command;
 use innerwarden_agent_guard::rules::{AtrSource, RuleEngine};
 use serde_json::Value;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::observe::{
-    agent_field, asks_for_a_miner, attempt_line, bounded_field, correlation_window, guard_window,
-    needs_block_correlation, outcome, redact_and_bound, AskFindings, Decider, Departure,
-    GuardWindow, Leaving, NoReply, Pending, PendingAsk, MAX_ASK_CHARS, PENDING_TTL_SECONDS,
-    UNREPORTED_REPLY_WAIT_SECONDS,
+    agent_field, asks_for_a_miner, attempt_line, bounded_field, conversation_analysis,
+    correlation_window, guard_window, needs_block_correlation, outcome, redact_and_bound,
+    AskFindings, Decider, Departure, GuardWindow, Leaving, NoReply, Pending, PendingAsk,
+    MAX_ASK_CHARS, PENDING_TTL_SECONDS, UNREPORTED_REPLY_WAIT_SECONDS,
 };
 
 /// The hook directory name inside `~/.openclaw/hooks/`, and the config key that
@@ -233,7 +232,7 @@ fn record(dir: &Path, leaving: Vec<Leaving>, at: u64) {
     for leaving in leaving {
         let window = if needs_block_correlation(leaving.departure) {
             let (from, until) = correlation_window(&leaving, at);
-            guard_window(&tail, &leaving.ask.agent, from, until)
+            guard_window(&tail, &leaving.ask.agent, &leaving.ask.session, from, until)
         } else {
             GuardWindow::default()
         };
@@ -329,9 +328,11 @@ fn cmd_inbound(rest: &[String]) -> std::process::ExitCode {
 fn scored_ask(rest: &[String], session: &str, text: &str, at: u64) -> Option<PendingAsk> {
     // Shell surface for the structural analyzer, LLM surface for the ATR
     // prompt-injection rules, and the plain-language reading for a request
-    // neither covers. A conversation carries all three shapes.
+    // neither covers. A conversation carries all three shapes. The analyzer
+    // reads the message as a person wrote it: a miner name that is only
+    // talked about is not a command (`observe::conversation_analysis`).
     let shell = RuleEngine::load_embedded_for(AtrSource::ShellCommand);
-    let analysis = analyze_command(text, Some(&shell));
+    let analysis = conversation_analysis(text, &shell);
     let injection = RuleEngine::load_embedded_for(AtrSource::LlmIo).check_user_input(text);
     let findings = AskFindings {
         analysis: &analysis,
@@ -361,11 +362,14 @@ fn scored_ask(rest: &[String], session: &str, text: &str, at: u64) -> Option<Pen
 /// closed and recorded.
 ///
 /// The decider is established, not assumed. If the guard refused an action of
-/// this agent since the ask arrived, a control refused something and the
-/// record says so. If monitor mode let a flagged action run, nothing can be
-/// credited. Otherwise nothing the guard screens ever ran, and the honest
-/// reading is that the model declined. The basis travels with the label so the
-/// reader is never invited to think the product proved more than it saw.
+/// this agent in this session since the ask arrived, a control refused
+/// something and the record says so; a refusal the guard recorded under
+/// another session (the MCP proxy's own, or another chat's) is reported as
+/// being in the window and credits no one. If monitor mode let a flagged
+/// action run, nothing can be credited. Otherwise nothing the guard screens
+/// ever ran, and the honest reading is that the model declined. The basis
+/// travels with the label so the reader is never invited to think the product
+/// proved more than it saw.
 fn cmd_reply(rest: &[String]) -> std::process::ExitCode {
     let session = bounded_field(&flag(rest, "--session").unwrap_or_default(), 120);
     // Read and discard: the reply text settles the outcome, and storing the

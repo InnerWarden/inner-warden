@@ -18,7 +18,9 @@ Sends the inbound message text and the outbound reply notice to
 `innerwarden observe`, which scores the ask with the free guard's own rules
 (the command rules, the prompt-injection rules, and a short plain-language
 list for a cryptominer request) and, when it is dangerous, appends one
-`guard.attempt` record to `guard-events.jsonl`.
+`guard.attempt` record to `guard-events.jsonl`. A miner's name that is only
+talked about ("how do I remove xmrig from this box?") is not read as a
+command; one that is asked for, or given as a command, is.
 
 ## Why this exists
 
@@ -47,8 +49,12 @@ actually refused the action.
 `model_refused` is only ever concluded from a reply that was observed, with
 nothing in that turn saying otherwise. `guard_denied` needs the same observed
 reply and a refusal the guard made in enforce mode, recorded after the ask, on
-a line that names this agent (`openclaw`). An ask that ends any other way is
-recorded as `undetermined`, with the reason:
+a line that names this agent (`openclaw`) and this conversation's session. The
+MCP proxy that guards OpenClaw records its decisions under its own session,
+never a chat's, so a refusal it makes in the same turn is recorded as
+`guard_block_recorded_in_window` below: one gateway holds many chats at once,
+and the time alone does not say which chat the refusal belonged to. An ask
+that ends any other way is recorded as `undetermined`, with the reason:
 
 - the same conversation sent another dangerous message before any reply
   (`next_message_before_reply`); both asks are recorded
@@ -59,7 +65,8 @@ recorded as `undetermined`, with the reason:
   the one that says the attack may have worked
 - the guard refused an action in the same turn, but the record cannot rest on
   it (`guard_block_recorded_in_window`): no reply was observed, or the refusal
-  names no agent. The refusal is a record of its own either way
+  names no agent, or another session. The refusal is a record of its own
+  either way
 
 The guard's event file can be appended to by the agent's own account, so a line
 there never settles an ask that nothing answered, and a line stamped after the

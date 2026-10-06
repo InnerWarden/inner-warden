@@ -41,9 +41,14 @@ follows semantic versioning.
   `BreakerConfig` and `Breaker::record` changed.
 - **Conversation records claim less, and say why.** `guard_denied` is recorded
   only for an observed reply and an enforce-mode refusal on a line naming the
-  agent that was asked; a monitor-mode `would_block` in the window is recorded
-  as `undetermined` with `decider_basis: flagged_action_ran_in_window`, never
-  as a refusal or as the model declining. `guard.attempt` gains `agent` and
+  agent that was asked and the session the ask arrived in. A refusal of the
+  same agent in another conversation, or under the MCP proxy's own session
+  (how OpenClaw is guarded), is recorded as `undetermined` with
+  `decider_basis: guard_block_recorded_in_window`; it used to stamp whatever
+  ask was waiting `guard_denied`, `enforced: true`. A monitor-mode
+  `would_block` in the window is recorded as `undetermined` with
+  `decider_basis: flagged_action_ran_in_window`, never as a refusal or as the
+  model declining. `guard.attempt` gains `agent` and
   the bases `next_message_before_reply`, `channel_reports_no_reply`,
   `pending_limit_reached`, `pending_state_unavailable` and
   `flagged_action_ran_in_window`; `guard.blocked` gains `agent`.
@@ -55,6 +60,14 @@ follows semantic versioning.
 
 ### Fixed
 
+- **A question about a miner is not an attack attempt.** The command rules
+  refuse a miner binary wherever its name appears, so a message such as "how
+  do I remove xmrig from this box?" was recorded as a conversation attempt,
+  deny 40. A name that is only talked about (a question about it, or a
+  removal, as a plain word) is now taken out before the rules read the
+  message. A message that asks for anything, or gives the miner as a command
+  (`nohup xmrig`, `xmrig -o ...`), is read as before, and the command screener
+  is unchanged: a miner in a command an agent runs is still refused.
 - **A held lock no longer holds back the hook's verdict.** The hook records
   each decision before it answers, and one of the locks that write takes was
   waited for with no time limit, so any account able to open that lock (the
