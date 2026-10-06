@@ -277,6 +277,16 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # `cargo deny` checks advisories in the Rust tree only, and Dependabot has
+      # no update surface for this directory, so nothing failed when an advisory
+      # landed here: GHSA-82fw-gwwq-j7x9 (vitest) stayed an open alert on this
+      # public repo for weeks after the patched release. This fails a pull
+      # request on a known advisory in this npm tree the way `cargo deny check`
+      # does for crates. Dev dependencies count: the test runner and the build
+      # tools run here and on every contributor's machine.
+      - name: No known advisory in the npm tree
+        run: npm audit --audit-level=moderate
+
       - name: Typecheck
         run: npx tsc -b
 
