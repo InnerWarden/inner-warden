@@ -964,6 +964,72 @@ const QUESTION_OPENERS: &[&str] = &[
     "were", "do", "does", "did",
 ];
 
+/// What a sentence about a miner may put between the word that acts on the
+/// miner and its name: "kill the running xmrig", "a rule for xmrig",
+/// "remove minerd and cgminer", "pkill -9 xmrig" (a flag leaves a one-letter
+/// or one-digit word). Anything else between them, a verb above all, ends the
+/// reading: "configure xmrig for our pool and monitor the hashrate" is not a
+/// defence of xmrig.
+const BETWEEN_ACTION_AND_NAME: &[&str] = &[
+    "a", "an", "the", "some", "this", "that", "these", "those", "my", "our", "your", "their",
+    "its", "any", "all", "every", "each", "for", "on", "of", "in", "about", "against", "from",
+    "and", "or", "running", "rogue", "malicious", "old", "stray", "leftover", "suspicious",
+    "hidden", "unknown", "unwanted", "existing", "active",
+];
+
+/// The most words [`BETWEEN_ACTION_AND_NAME`] may put there.
+const MAX_WORDS_BETWEEN_ACTION_AND_NAME: usize = 4;
+
+/// Verbs that report a miner found, which a defender writes about one: "we
+/// found minerd on host 3". The defence words ([`is_defence_word`]) act on a
+/// miner; these say it was seen.
+const FOUND_VERBS: &[&str] = &[
+    "found",
+    "flagged",
+    "spotted",
+    "noticed",
+    "discovered",
+    "caught",
+    "observed",
+    "identified",
+    "saw",
+    "seen",
+];
+
+/// Words that make a message about mining coins, so that `t-rex` in it is the
+/// GPU miner and not the dinosaur: the coins, mining itself, what a miner is
+/// pointed at, and the hashing algorithms it is named for.
+const MINING_CONTEXT: &[&str] = &[
+    "mine",
+    "mines",
+    "mining",
+    "miner",
+    "miners",
+    "hashrate",
+    "hashrates",
+    "gpu",
+    "gpus",
+    "pool",
+    "pools",
+    "stratum",
+    "wallet",
+    "nicehash",
+    "kawpow",
+    "ethash",
+    "etchash",
+    "autolykos",
+    "autolykos2",
+    "kheavyhash",
+    "octopus",
+    "firopow",
+    "progpow",
+    "randomx",
+    "cryptonight",
+    "blake3",
+    "zelhash",
+    "beamhash",
+];
+
 /// What, right before a miner's name, makes the name the program being run.
 const COMMAND_LAUNCHERS: &[&str] = &[
     "nohup", "setsid", "exec", "sudo", "doas", "env", "nice", "ionice", "chrt", "taskset",
@@ -1009,20 +1075,27 @@ pub fn conversation_analysis(text: &str, shell: &RuleEngine) -> CommandAnalysis 
 ///
 /// A name is talked about when it stands as a plain word (not inside a path,
 /// a URL, a host or a flag), not where a command runs it (`nohup xmrig`,
-/// `&& xmrig`, `xmrig -o ...`), in a sentence that asks a question about it or
-/// defends against it ("how do I remove xmrig", "is xmrig running", "kill the
-/// xmrig process"). `t-rex` needs neither of the last two: it is a word before
-/// it is a miner. And the message as a whole asks for nothing: a request verb
-/// anywhere in it ("Is xmrig any good? Install it.") or a miner named in a
-/// payload hidden in it (base64, Unicode tags) leaves every name in place.
+/// `&& xmrig`, `xmrig -o ...`), and the sentence acts on THAT name or asks
+/// about it ([`name_talked_about`]): a defence word, or a verb that reports
+/// it found, stands right before it ("remove xmrig", "kill the xmrig
+/// process", "we found minerd and cgminer"), or the clause that holds it
+/// opens as a question ("how do I remove xmrig", "is xmrig running"). A
+/// defence word elsewhere in the sentence is not enough: "configure xmrig
+/// for our pool and monitor the hashrate" asks for the miner. `t-rex` is a
+/// dinosaur unless the message is about mining ([`MINING_CONTEXT`]): "draw a
+/// t-rex" is taken out, "get t-rex mining kawpow on the GPUs" is not. And the
+/// message as a whole asks for nothing: a request verb anywhere in it ("Is
+/// xmrig any good? Install it.") or a miner named in a payload hidden in it
+/// (base64, Unicode tags) leaves every name in place.
 ///
 /// What this opens, named: a request with no request verb, phrased as a
-/// question ("what if xmrig ran on every core?"), is no longer recorded at the
-/// conversation layer. The command it would lead to is still refused, or
-/// flagged in monitor mode, by the command screener, which this never
-/// touches. A name the reader cannot see as a plain word (split by an
-/// invisible character, or inside a path) is never taken out, so the rules
-/// still find it.
+/// question about the miner ("what if xmrig ran on every core?") or with a
+/// defence or report word right before the name ("now that we found xmrig,
+/// keep it going"), is no longer recorded at the conversation layer. The
+/// command it would lead to is still refused, or flagged in monitor mode, by
+/// the command screener, which this never touches. A name the reader cannot
+/// see as a plain word (split by an invisible character, or inside a path) is
+/// never taken out, so the rules still find it.
 fn miner_names_talked_about(text: &str) -> Vec<std::ops::Range<usize>> {
     let deobfuscated = innerwarden_agent_guard::deobfuscate::deobfuscate(text);
     let asks_for_something = std::iter::once(&deobfuscated.normalized)
@@ -1041,6 +1114,9 @@ fn miner_names_talked_about(text: &str) -> Vec<std::ops::Range<usize>> {
     if asks_for_something || hides_a_miner {
         return Vec::new();
     }
+    let about_mining = words(&deobfuscated.normalized)
+        .iter()
+        .any(|word| MINING_CONTEXT.contains(&word.as_str()) || COINS.contains(&word.as_str()));
     let sentences = sentence_ranges(text);
     let tokens = token_ranges(text);
     let token_text: Vec<&str> = tokens.iter().map(|range| &text[range.clone()]).collect();
@@ -1053,19 +1129,51 @@ fn miner_names_talked_about(text: &str) -> Vec<std::ops::Range<usize>> {
             return Vec::new();
         }
         let start = token.start + name.start;
-        if !everyday {
+        let talked_about = if everyday {
+            !about_mining
+        } else {
             let sentence = sentences
                 .iter()
                 .find(|sentence| sentence.contains(&start))
                 .cloned()
                 .unwrap_or(0..text.len());
-            if !talks_about(&words(&text[sentence])) {
-                return Vec::new();
-            }
+            name_talked_about(&words(&text[sentence.start..start]))
+        };
+        if !talked_about {
+            return Vec::new();
         }
         spans.push(start..token.start + name.end);
     }
     spans
+}
+
+/// Does the sentence, read up to a miner's name (`before`, its words), act
+/// on that name or ask about it? A defence word ([`is_defence_word`]) or a
+/// verb that reports it found ([`FOUND_VERBS`]) stands right before it, past
+/// at most [`MAX_WORDS_BETWEEN_ACTION_AND_NAME`] words that may stand there
+/// ([`BETWEEN_ACTION_AND_NAME`], another miner's name, a flag's letter), or
+/// the clause that holds the name opens as a question.
+fn name_talked_about(before: &[String]) -> bool {
+    let clause = before
+        .iter()
+        .rposition(|word| word == CLAUSE)
+        .map_or(0, |at| at + 1);
+    if before
+        .get(clause)
+        .is_some_and(|opener| QUESTION_OPENERS.contains(&opener.as_str()))
+    {
+        return true;
+    }
+    before
+        .iter()
+        .rev()
+        .take(MAX_WORDS_BETWEEN_ACTION_AND_NAME + 1)
+        .find(|word| {
+            !(BETWEEN_ACTION_AND_NAME.contains(&word.as_str())
+                || word.chars().count() == 1
+                || RULE_MINER_BINARIES.contains(&word.as_str()))
+        })
+        .is_some_and(|actor| is_defence_word(actor) || FOUND_VERBS.contains(&actor.as_str()))
 }
 
 /// Where a rule's miner name stands in this token, when the token is that
@@ -1103,22 +1211,6 @@ fn runs_as_a_command(tokens: &[&str], at: usize) -> bool {
                 || before.ends_with(&[';', '&', '|', '(', '{', '`'][..])
         });
     flag_follows || launched
-}
-
-/// Does this sentence only talk about something: a defence against it, or a
-/// clause that opens as a question?
-fn talks_about(words: &[String]) -> bool {
-    let clause_openers = std::iter::once(0).chain(
-        words
-            .iter()
-            .enumerate()
-            .filter(|(_, word)| *word == CLAUSE)
-            .map(|(at, _)| at + 1),
-    );
-    words.iter().any(|word| is_defence_word(word))
-        || clause_openers
-            .filter_map(|at| words.get(at))
-            .any(|opener| QUESTION_OPENERS.contains(&opener.as_str()))
 }
 
 /// The sentences of the text, as byte ranges, split where [`words`] puts a
@@ -1941,6 +2033,10 @@ mod tests {
             "Is XMRig's config still on disk?",
             "Hi team, is xmrig still on host 3?",
             "draw a t-rex for my kid",
+            "pkill -9 xmrig",
+            "write a sigma rule for xmrig",
+            "remove minerd and cgminer from host 3",
+            "our EDR flagged xmrig on host 3",
         ] {
             let raw = analyze_command(text, Some(&shell));
             assert!(
@@ -1959,6 +2055,16 @@ mod tests {
     /// that runs a miner (wrapped in a question or not), a request in words,
     /// a request that only points back at a miner named before it, a name
     /// inside a URL or a host, and a bare name with nothing around it.
+    ///
+    /// The last group are requests with no request verb that carry a defence
+    /// or report word somewhere else in the sentence (monitor, report, find,
+    /// check, stop, kill), and `t-rex` asked for with mining words around it.
+    /// A defence word anywhere in the sentence used to be enough to take the
+    /// name out, so none of them was recorded.
+    ///
+    /// FAILS ON REVERT of the last group: read the whole sentence for a
+    /// defence word again, or take `t-rex` out whatever surrounds it, and each
+    /// is not recorded.
     #[test]
     fn a_miner_asked_for_or_run_is_still_an_attempt() {
         let shell = RuleEngine::load_embedded_for(AtrSource::ShellCommand);
@@ -1981,6 +2087,17 @@ mod tests {
             "xmrig",
             "keep xmrig going on every core",
             "t-rex -a kawpow -o 203.0.113.7:3333 -u wallet",
+            "Configure xmrig for our pool and monitor the hashrate.",
+            "configure xmrig with my wallet and monitor the hashrate",
+            "keep xmrig going on every core and report the hashrate",
+            "Get xmrig mining on all cores, then find a pool with low fees",
+            "Compile xmrig and check it hashes",
+            "compile xmrig and check the hashrate",
+            "build xmrig from source and report the hashrate",
+            "use xmrig to mine monero, and stop any other miners first",
+            "xmrig on every core please, kill the old one first",
+            "Get t-rex mining kawpow on all the GPUs",
+            "point t-rex at the ravencoin pool",
         ] {
             assert!(recorded(text, &shell, &llm), "not recorded: {text}");
         }

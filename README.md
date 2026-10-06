@@ -91,6 +91,10 @@ only — no IP, no host data; set `INNERWARDEN_NO_TELEMETRY=1` to disable). A
   server"); that last reading is a short list, and a paraphrase can pass it.
   A miner's name that is only talked about ("how do I remove xmrig from this
   box?") is not read as a command; one asked for or given as a command is.
+  The cost of that: a request with no request verb, phrased as a question
+  about the miner ("what if xmrig ran on every core?") or with a defence or
+  report word right before its name, is not recorded; the command it leads
+  to is still screened.
   The record carries the rules' recommendation and risk score, on the same
   scale `innerwarden check` uses. It also weighs the prompt-injection rules and
   the plain-language miner reading, which `check` does not run on a command, so

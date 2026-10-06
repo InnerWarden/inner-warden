@@ -127,11 +127,19 @@ follows semantic versioning.
 - **A question about a miner is not an attack attempt.** The command rules
   refuse a miner binary wherever its name appears, so a message such as "how
   do I remove xmrig from this box?" was recorded as a conversation attempt,
-  deny 40. A name that is only talked about (a question about it, or a
-  removal, as a plain word) is now taken out before the rules read the
-  message. A message that asks for anything, or gives the miner as a command
-  (`nohup xmrig`, `xmrig -o ...`), is read as before, and the command screener
-  is unchanged: a miner in a command an agent runs is still refused.
+  deny 40. A name that is only talked about is now taken out before the rules
+  read the message: a plain word the sentence acts on right before it
+  ("remove xmrig", "kill the xmrig process", "we found minerd") or asks about
+  in the clause that holds it ("how do I remove xmrig", "is xmrig running"),
+  and `t-rex` unless the message is about mining. A message that asks for
+  anything, gives the miner as a command (`nohup xmrig`, `xmrig -o ...`), or
+  has a defence word only elsewhere in the sentence ("configure xmrig and
+  monitor the hashrate") is read as before. What is no longer recorded: a
+  request with no request verb, phrased as a question about the miner ("what
+  if xmrig ran on every core?") or with a defence or report word right
+  before its name ("now that we found xmrig, keep it going"). The command
+  such an ask leads to is still screened: a miner in a command an agent runs
+  is still refused.
 - **A held lock no longer holds back the hook's verdict.** The hook records
   each decision before it answers, and one of the locks that write takes was
   waited for with no time limit, so any account able to open that lock (the

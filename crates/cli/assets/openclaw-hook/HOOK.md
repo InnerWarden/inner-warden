@@ -20,7 +20,10 @@ Sends the inbound message text and the outbound reply notice to
 list for a cryptominer request) and, when it is dangerous, appends one
 `guard.attempt` record to `guard-events.jsonl`. A miner's name that is only
 talked about ("how do I remove xmrig from this box?") is not read as a
-command; one that is asked for, or given as a command, is.
+command; one that is asked for, or given as a command, is. A request with no
+request verb, phrased as a question about the miner ("what if xmrig ran on
+every core?") or with a defence or report word right before its name, is not
+recorded; the command it leads to is still screened.
 
 ## Why this exists
 

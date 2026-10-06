@@ -1383,7 +1383,7 @@ mod tests {
             ),
             (
                 "HOOK.md",
-                "a5546f8a51ebebe250c23f87bd560f1a20305bad40d50dad9f0c9b2dbe0c9539",
+                "391ab15bcede5c3e2297ce1abf007a4f0647176cd7b3a21426ba76327ca27987",
             ),
             (
                 "index.js",
