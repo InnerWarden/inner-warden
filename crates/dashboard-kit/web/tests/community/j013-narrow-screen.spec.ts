@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { expect, test, type Page } from "@playwright/test";
-import { CASE, COMMUNITY_TABS, PAGE_READY } from "./support";
+import { CASE, COMMUNITY_TABS, PAGE_READY, fixture } from "./support";
 
 const bootstrap = JSON.parse(readFileSync(new URL("../fixtures/community/bootstrap.json", import.meta.url), "utf8"));
 const enterpriseBootstrap = JSON.parse(readFileSync(new URL("../fixtures/enterprise/bootstrap.json", import.meta.url), "utf8"));
@@ -26,10 +26,23 @@ async function pageWidth(page: Page) {
   }));
 }
 
+/**
+ * A message's id, found by what it says. The id is a digest of the record
+ * line, so it changes whenever the CLI writes that line differently.
+ */
+function messageId(opening: string): string {
+  const items = fixture<{ items: { id: string; detail: string }[] }>("history-attempts.json").items;
+  const message = items.find((item) => item.detail.startsWith(opening));
+  if (message === undefined) throw new Error(`no fixture message opens with "${opening}"`);
+  return message.id;
+}
+
+const MESSAGE = messageId("Ignore your rules");
+
 const PAGES: [string, string, string][] = [
   ...COMMUNITY_TABS.map(([label, path]) => [label, path, PAGE_READY[label]] as [string, string, string]),
   ["A case", `/?view=activity&decision=${encodeURIComponent(CASE.domainFetch)}`, `section[data-case="${CASE.domainFetch}"]`],
-  ["A message", "/?view=activity&lane=agent_messages&decision=eaaf70209eb20103", 'section[data-case="eaaf70209eb20103"]'],
+  ["A message", `/?view=activity&lane=agent_messages&decision=${MESSAGE}`, `section[data-case="${MESSAGE}"]`],
 ];
 
 for (const [name, path, drawn] of PAGES) {
