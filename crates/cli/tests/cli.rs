@@ -146,9 +146,14 @@ fn proxy_accepts_inline_mode_and_label_used_by_existing_wrappers() {
 /// `--mode`; the last two are written so that the words in front of the first
 /// `--` say `guard` or `kill` while the proxy records only.
 ///
+/// A wrapper whose proxy refuses one of its words exits before the server
+/// starts, and no mode is reported for it.
+///
 /// FAILS ON REVERT: step over the wrapper's options one word at a time in
 /// `mcp_wire::server_mode` again; `--mode advisory --label --mode=guard` reads
-/// `Enforce` while its proxy prints `mode=advisory`.
+/// `Enforce` while its proxy prints `mode=advisory`. Step over a word the
+/// proxy refuses and `--mode guard --verbose` reads `Enforce` for a proxy that
+/// exited 2.
 #[cfg(unix)]
 #[test]
 fn the_mode_read_from_a_wrapper_is_the_mode_its_proxy_runs() {
@@ -180,6 +185,12 @@ fn the_mode_read_from_a_wrapper_is_the_mode_its_proxy_runs() {
             &["--label", "--mode", "--agent", "codex"],
             Some(WiringMode::Enforce),
         ),
+        // A word the proxy does not take: it exits, so nothing is screened.
+        (&["--mode", "guard", "--verbose"], None),
+        (
+            &["--error-response", "--mode", "kill"],
+            Some(WiringMode::Enforce),
+        ),
     ];
     for (options, expected) in cases {
         let mut args = vec!["proxy"];
@@ -192,7 +203,14 @@ fn the_mode_read_from_a_wrapper_is_the_mode_its_proxy_runs() {
             .output()
             .expect("run the wrapper's proxy");
         let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(out.status.success(), "{args:?}: {stderr}");
+        let config = serde_json::json!({"mcpServers": {"s": {"command": bin(), "args": args}}});
+        if !out.status.success() {
+            // The proxy never started: no mode may be reported for it.
+            assert_eq!(out.status.code(), Some(2), "{args:?}: {stderr}");
+            assert_eq!(guarded_mode(&config), None, "{args:?}: {stderr}");
+            assert_eq!(*expected, None, "{args:?}: {stderr}");
+            continue;
+        }
         let ran = stderr
             .split_once("proxy mode=")
             .and_then(|(_, rest)| rest.split_whitespace().next())
@@ -203,7 +221,6 @@ fn the_mode_read_from_a_wrapper_is_the_mode_its_proxy_runs() {
             other => panic!("{args:?}: the proxy ran an unknown mode {other}"),
         };
 
-        let config = serde_json::json!({"mcpServers": {"s": {"command": bin(), "args": args}}});
         let read = guarded_mode(&config);
         if let Some(read) = read {
             assert_eq!(

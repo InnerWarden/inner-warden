@@ -202,8 +202,16 @@ follows semantic versioning.
   for the mode (`--label --mode=guard` is a label). A wrapper whose last
   option before `--` is a flag waiting for its value is listed as not guarded:
   the proxy takes that `--` as the value and runs the options written after
-  it. A generic MCP client now shows the mode of its own configuration: it
-  showed none, and one kept in `~/.claude/` showed Claude Code's.
+  it. A wrapper whose proxy refuses one of its words (`--verbose`) exits
+  before its server starts, and is listed as not guarded. Only a command
+  named `innerwarden`, `iw` or `iw-guard` is taken for the guard: any name
+  that began with `innerwarden` counted, so a script under such a name was
+  listed as the guard in enforce mode while it ran the server unscreened.
+  Such a server is now listed as not guarded, and connecting the agent wraps
+  it in the real proxy. The configuration is read, not the binary: a program
+  written under one of the guard's own names is still taken for it. A
+  generic MCP client now shows the mode of its own configuration: it showed
+  none, and one kept in `~/.claude/` showed Claude Code's.
 - **A loop-breaker finding names the risks a loop is.** `AG-ASI09-BREAKER`
   carried no OWASP Agentic class, so its case read "OWASP Agentic: none",
   and its id points at ASI09, human-agent trust exploitation, which a loop is

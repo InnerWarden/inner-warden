@@ -16,16 +16,7 @@
 
 use toml_edit::{value, Array, DocumentMut, Item, Table, Value};
 
-use crate::mcp_wire::{is_wrapper_name, naming, proxy_agent, wrapper_blocks};
-
-/// The basename of a command path, cross-platform (`/` and `\`), lowercased.
-fn basename(cmd: &str) -> String {
-    cmd.rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(cmd)
-        .trim_end_matches(".exe")
-        .to_ascii_lowercase()
-}
+use crate::mcp_wire::{is_guard_command, is_wrapper_name, naming, proxy_agent, wrapper_blocks};
 
 /// Effective enforcement of MCP servers wired through the local proxy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,11 +30,7 @@ fn has_proxy_prefix(server: &Table) -> bool {
     let is_guard = server
         .get("command")
         .and_then(Item::as_str)
-        .map(|c| {
-            let b = basename(c);
-            b.starts_with("innerwarden") || b == "iw" || b == "innerwarden"
-        })
-        .unwrap_or(false);
+        .is_some_and(is_guard_command);
     if !is_guard {
         return false;
     }
@@ -531,13 +518,29 @@ url = "https://example.com/mcp"
 
     #[test]
     fn recognizes_install_name_variants_as_wrapped() {
-        let mut d = "[mcp_servers.x]\ncommand = \"/opt/innerwarden-ctl\"\nargs = [\"proxy\", \"--\", \"npx\"]\n"
-            .parse::<DocumentMut>()
-            .unwrap();
+        let mut d =
+            "[mcp_servers.x]\ncommand = \"/opt/iw-guard\"\nargs = [\"proxy\", \"--\", \"npx\"]\n"
+                .parse::<DocumentMut>()
+                .unwrap();
         assert!(is_guarded_toml(&d));
         assert_eq!(guarded_mode_toml(&d), Some(WiringMode::Enforce));
         assert_eq!(wrap_toml(&mut d, "innerwarden", false, "codex"), 1);
         assert_eq!(wrap_toml(&mut d, "innerwarden", false, "codex"), 0);
+    }
+
+    /// A command that only begins with the guard's name is not the guard
+    /// (see `mcp_wire::is_guard_command`): a shim written as
+    /// `innerwarden-shim` is a server like any other, and connecting the
+    /// agent wraps it in the real proxy.
+    #[test]
+    fn a_command_that_only_begins_with_the_guards_name_is_not_the_guard() {
+        let mut d = "[mcp_servers.x]\ncommand = \"/home/u/.local/bin/innerwarden-shim\"\nargs = [\"proxy\", \"--mode\", \"guard\", \"--\", \"npx\"]\n"
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert!(!is_guarded_toml(&d));
+        assert_eq!(guarded_mode_toml(&d), None);
+        assert_eq!(wrap_toml(&mut d, "/abs/innerwarden", false, "codex"), 1);
+        assert_eq!(guarded_mode_toml(&d), Some(WiringMode::Enforce));
     }
 
     #[test]

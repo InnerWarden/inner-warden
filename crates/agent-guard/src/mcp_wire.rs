@@ -21,13 +21,18 @@ use serde_json::{json, Value};
 
 use crate::hook::is_agent_id;
 
-/// The basename of a command path, cross-platform (`/` and `\`), lowercased.
+/// The basename of a command path, cross-platform (`/` and `\`), lowercased,
+/// without a Windows `.exe`.
 fn basename(cmd: &str) -> String {
-    cmd.rsplit(['/', '\\'])
+    let name = cmd
+        .rsplit(['/', '\\'])
         .next()
         .unwrap_or(cmd)
-        .trim_end_matches(".exe")
-        .to_ascii_lowercase()
+        .to_ascii_lowercase();
+    match name.strip_suffix(".exe") {
+        Some(stem) => stem.to_string(),
+        None => name,
+    }
 }
 
 /// Effective enforcement of MCP servers wired through the local proxy.
@@ -38,15 +43,31 @@ pub enum WiringMode {
     Mixed,
 }
 
+/// The names the guard's binary is installed under: the binary itself and
+/// the installer's `iw` and `iw-guard` shortcuts.
+const GUARD_COMMAND_NAMES: &[&str] = &["innerwarden", "iw", "iw-guard"];
+
+/// Whether a wrapper's command names the guard's binary: its file name is one
+/// of [`GUARD_COMMAND_NAMES`], in any directory, with or without `.exe`.
+///
+/// Exactly those names. Any program whose name merely began with
+/// `innerwarden` used to count, so a script the agent's own account wrote as
+/// `innerwarden-shim`, given `proxy --mode guard -- <server>`, was listed as
+/// the guard in enforce mode while it ran the server unscreened. A command
+/// under another name is a server like any other: listed as not guarded, and
+/// wrapped by the real proxy when the agent is connected.
+///
+/// The configuration is read, the binary is not run: a program written under
+/// one of these names is still taken for the guard.
+pub(crate) fn is_guard_command(command: &str) -> bool {
+    GUARD_COMMAND_NAMES.contains(&basename(command).as_str())
+}
+
 fn has_proxy_prefix(server: &Value) -> bool {
     let is_guard = server
         .get("command")
         .and_then(|c| c.as_str())
-        .map(|c| {
-            let b = basename(c);
-            b.starts_with("innerwarden") || b == "iw" || b == "innerwarden"
-        })
-        .unwrap_or(false);
+        .is_some_and(is_guard_command);
     if !is_guard {
         return false;
     }
@@ -103,6 +124,9 @@ fn server_mode(server: &Value) -> Option<WiringMode> {
 ///
 /// `None` when the proxy does not run these options as they look:
 /// * a word that is not a string, or a `--mode` value the proxy refuses;
+/// * a word the proxy does not take as an option (`--verbose`, an empty
+///   word): it exits on it, so the server never starts and nothing is
+///   screened;
 /// * a flag that takes a value standing last, so the proxy takes the `--` for
 ///   that value and reads the words after it as more options. In
 ///   `--mode guard --label -- --mode advisory -- <child>` the proxy runs
@@ -112,7 +136,7 @@ pub(crate) fn wrapper_blocks(options: &[Option<&str>]) -> Option<bool> {
         return None;
     }
     let walk = walk_options(options);
-    if walk.takes_the_separator {
+    if walk.takes_the_separator || walk.refused_word {
         return None;
     }
     match walk.mode {
@@ -184,6 +208,8 @@ struct OptionWalk<'a> {
     /// The last option is a flag that takes a value, so the proxy takes the
     /// wrapper's `--` as that value.
     takes_the_separator: bool,
+    /// A word the proxy does not take as an option. It exits on it.
+    refused_word: bool,
 }
 
 fn walk_options<'a>(options: &[Option<&'a str>]) -> OptionWalk<'a> {
@@ -194,6 +220,7 @@ fn walk_options<'a>(options: &[Option<&'a str>]) -> OptionWalk<'a> {
         agent_words: Vec::new(),
         mode: None,
         takes_the_separator: false,
+        refused_word: false,
     };
     let mut i = 0usize;
     while i < options.len() {
@@ -233,7 +260,11 @@ fn walk_options<'a>(options: &[Option<&'a str>]) -> OptionWalk<'a> {
                 walk.agent_words.push(i);
                 i += 1;
             }
-            _ => i += 1,
+            Some("--error-response") => i += 1,
+            _ => {
+                walk.refused_word = true;
+                i += 1;
+            }
         }
     }
     walk
@@ -752,10 +783,11 @@ mod tests {
     fn recognizes_iw_and_iw_guard_aliases_as_wrapped() {
         for bin in [
             "/x/iw",
+            "/x/iw-guard",
             "/x/innerwarden",
             "innerwarden",
-            "/opt/innerwarden-ctl", // Active Defence dev binary / install-name variant
             "C:\\x\\innerwarden.exe",
+            "C:\\x\\IW-GUARD.EXE",
         ] {
             let (out, _) = wrap(
                 json!({"mcpServers":{"s":{"command":"npx","args":[]}}}),
@@ -768,6 +800,62 @@ mod tests {
                 "wrapped with {bin} should read as guarded"
             );
         }
+    }
+
+    /// Only the guard's own names are the guard. A command that merely
+    /// begins with `innerwarden` is another program: a script the agent's
+    /// account wrote, or Active Defence's `innerwarden-ctl`, whose proxy is
+    /// `agent proxy`, so `innerwarden-ctl proxy` never starts. Such a wrapper
+    /// is a server like any other: not guarded, and connecting the agent
+    /// wraps it in the real proxy.
+    ///
+    /// FAILS ON REVERT: accept any `innerwarden*` command again and the shim
+    /// reads guarded, `Enforce`.
+    #[test]
+    fn a_command_that_only_begins_with_the_guards_name_is_not_the_guard() {
+        for bin in [
+            "/home/u/.local/bin/innerwarden-shim",
+            "/opt/innerwarden-ctl",
+            "innerwardenx",
+            "/x/iwx",
+        ] {
+            let config = json!({"mcpServers":{"s":{"command": bin, "args":["proxy","--mode","guard","--","npx","fs"]}}});
+            assert!(!is_guarded(&config), "{bin}");
+            assert_eq!(guarded_mode(&config), None, "{bin}");
+            assert!(has_unguarded_stdio_server(&config), "{bin}");
+            let (wrapped, n) = wrap(config, "/abs/innerwarden", false, "cursor");
+            assert_eq!(n, 1, "{bin}: the real proxy wraps it");
+            let server = &wrapped["mcpServers"]["s"];
+            assert_eq!(server["command"], "/abs/innerwarden");
+            let args = server["args"].as_array().unwrap();
+            let separator = args.iter().position(|a| a == "--").unwrap();
+            assert_eq!(args[separator + 1], bin, "{bin}");
+            assert_eq!(guarded_mode(&wrapped), Some(WiringMode::Enforce));
+        }
+    }
+
+    /// A word the proxy does not take before `--` makes it exit with a usage
+    /// error, so the server never starts and nothing is screened: no mode is
+    /// reported for it. The options it does take still read.
+    ///
+    /// FAILS ON REVERT: step over unknown words again and the first case
+    /// reads `Some(true)`.
+    #[test]
+    fn a_word_the_proxy_refuses_leaves_no_mode_to_report() {
+        for options in [
+            &["--mode", "guard", "--verbose"][..],
+            &["--verbose"][..],
+            &["--mode", "guard", ""][..],
+            &["guard"][..],
+        ] {
+            let words: Vec<Option<&str>> = options.iter().map(|w| Some(*w)).collect();
+            assert_eq!(wrapper_blocks(&words), None, "{options:?}");
+        }
+        let words: Vec<Option<&str>> = ["--mode", "advisory", "--error-response", "--label=x"]
+            .iter()
+            .map(|w| Some(*w))
+            .collect();
+        assert_eq!(wrapper_blocks(&words), Some(false));
     }
 
     #[test]

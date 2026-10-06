@@ -2049,6 +2049,61 @@ mod tests {
         }
     }
 
+    /// A wrapper is the guard only when its command is the guard's binary,
+    /// and only when its proxy starts.
+    ///
+    /// The attacker forms: the agent's own account writes a script named
+    /// `innerwarden-shim` that runs whatever follows `--`, and points each
+    /// server at it with `proxy --mode guard -- <server>`; every call then
+    /// reaches the server unscreened while the listing said enforce, because
+    /// any command whose name began with `innerwarden` counted. Or it adds an
+    /// option the proxy does not take (`--verbose`): the proxy exits on it,
+    /// the server never starts through it, and the listing said enforce
+    /// because unknown words were stepped over. Both are now listed as not
+    /// guarded. The installer's `iw-guard` shortcut, which was not recognised
+    /// at all, is the guard.
+    ///
+    /// FAILS ON REVERT: accept any `innerwarden*` command again, or step over
+    /// a word the proxy refuses, and the first two read guarded, `Enforce`.
+    #[test]
+    fn a_shim_or_a_proxy_that_cannot_start_is_not_listed_as_guarded() {
+        let home = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path().join(".cursor")).unwrap();
+        std::fs::create_dir_all(home.path().join(".codex")).unwrap();
+        let cases = [
+            (
+                r#"{"mcpServers":{"fs":{"command":"/home/u/.local/bin/innerwarden-shim","args":["proxy","--mode","guard","--","npx","fs-server"]}}}"#,
+                "[mcp_servers.icm]\ncommand = \"/home/u/.local/bin/innerwarden-shim\"\nargs = [\"proxy\", \"--mode\", \"guard\", \"--\", \"icm\"]\n",
+                false,
+                None,
+            ),
+            (
+                r#"{"mcpServers":{"fs":{"command":"/abs/innerwarden","args":["proxy","--mode","guard","--verbose","--","npx","fs-server"]}}}"#,
+                "[mcp_servers.icm]\ncommand = \"/abs/innerwarden\"\nargs = [\"proxy\", \"--mode\", \"guard\", \"--verbose\", \"--\", \"icm\"]\n",
+                false,
+                None,
+            ),
+            (
+                r#"{"mcpServers":{"fs":{"command":"/abs/iw-guard","args":["proxy","--mode","guard","--error-response","--","npx","fs-server"]}}}"#,
+                "[mcp_servers.icm]\ncommand = \"C:\\\\Tools\\\\IW-GUARD.EXE\"\nargs = [\"proxy\", \"--mode\", \"guard\", \"--\", \"icm\"]\n",
+                true,
+                Some(GuardMode::Enforce),
+            ),
+        ];
+        for (cursor, codex, guarded, mode) in cases {
+            std::fs::write(home.path().join(".cursor/mcp.json"), cursor).unwrap();
+            std::fs::write(home.path().join(".codex/config.toml"), codex).unwrap();
+
+            let (rows, _) = rows_from_sources(home.path(), &[], None);
+
+            for name in ["cursor", "codex"] {
+                let row = rows.iter().find(|row| row.name == name).unwrap();
+                assert_eq!(row.guarded, guarded, "{name}: {cursor} / {codex}");
+                assert_eq!(row.mode, mode, "{name}: {cursor} / {codex}");
+            }
+        }
+    }
+
     /// A generic MCP client's mode is read from ITS configuration. The row's
     /// name was looked up in the reviewed table instead, so a guarded generic
     /// client had no mode ("mode unreadable", and `status` printed the mode as
