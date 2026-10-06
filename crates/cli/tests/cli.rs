@@ -558,7 +558,7 @@ fn a_sink_with_a_second_name_is_reported_not_silently_dropped() {
     std::fs::write(&sink, "").expect("sink");
     std::fs::hard_link(&sink, elsewhere.path().join("k")).expect("second name");
 
-    let mut child = Command::new(bin())
+    let mut child = cli()
         .args(["hook"])
         .env("IW_GRAPH_FILE", &graph)
         .stdin(Stdio::piped())
@@ -589,7 +589,7 @@ fn a_sink_with_a_second_name_is_reported_not_silently_dropped() {
         "nothing written"
     );
 
-    let stats = Command::new(bin())
+    let stats = cli()
         .args(["graph", "--stats"])
         .env("IW_GRAPH_FILE", &graph)
         .output()
