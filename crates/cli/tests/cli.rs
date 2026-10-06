@@ -426,6 +426,21 @@ fn proxy_monitor_only_records_a_loop_and_nothing_after_it() {
     assert_eq!(commands[3]["attrs"]["rules"], "AG-ASI09-BREAKER");
     assert_eq!(commands[3]["attrs"]["recommendation"], "deny");
     assert!(commands[4]["attrs"]["rules"].is_null());
+    // The loop is recorded under the risk classes it evidences, the ones its
+    // case shows, whatever its historical id says: never ASI09, never none.
+    let flagged = |command: &serde_json::Value| -> Vec<String> {
+        let mut classes: Vec<String> = graph["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["from"] == command["id"] && e["kind"] == "flags")
+            .map(|e| e["to"].as_str().unwrap().to_string())
+            .collect();
+        classes.sort();
+        classes
+    };
+    assert_eq!(flagged(commands[3]), ["asi:ASI02", "asi:ASI08"]);
+    assert!(flagged(commands[4]).is_empty());
 
     let events = std::fs::read_to_string(dir.path().join("guard-events.jsonl")).unwrap();
     let blocked: Vec<&str> = events

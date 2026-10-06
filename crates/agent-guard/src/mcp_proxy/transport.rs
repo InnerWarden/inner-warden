@@ -352,14 +352,18 @@ fn classify_client_line(
                     breaker.record(&sig, now_secs)
                 {
                     decision.verdict.allowed = false;
-                    decision
-                        .verdict
-                        .alerts
-                        .push(crate::mcp::VerdictAlert::builtin(
-                            "AG-ASI09-BREAKER",
-                            reason,
-                            true,
-                        ));
+                    let mut alert =
+                        crate::mcp::VerdictAlert::builtin("AG-ASI09-BREAKER", reason, true);
+                    // The id is historical (see `crate::breaker`); the risk
+                    // classes the record and the case show come from the
+                    // repo's own mapping.
+                    alert.owasp = Some(
+                        crate::asi::LOOP_BREAKER_ASI
+                            .iter()
+                            .map(|id| id.to_string())
+                            .collect(),
+                    );
+                    decision.verdict.alerts.push(alert);
                 }
             }
             let is_tool_call = decision.direction == Direction::ClientToServer.label()
@@ -1218,6 +1222,42 @@ mod tests {
                 );
             }
             other => panic!("guard must block the fourth identical call, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_breaker_trip_names_the_risk_classes_a_loop_evidences() {
+        // The finding's id says ASI09 for a historical reason, and it carried
+        // no class at all, so the case for a loop read "OWASP Agentic: none".
+        // A loop is tool misuse amplifying itself (ASI02, ASI08); ASI09 is
+        // human-agent trust exploitation, which a loop is not.
+        for mode in [ProxyMode::Advisory, ProxyMode::Guard] {
+            let mut map = IdRequestMap::new();
+            let mut taint = TaintTracker::new();
+            let mut breaker =
+                crate::breaker::Breaker::new(crate::breaker::BreakerConfig::default());
+            let mut last = None;
+            for t in 0..4 {
+                last = Some(decision_of(classify_client_line(
+                    CLEAN,
+                    &cfg(mode),
+                    None,
+                    &mut map,
+                    &mut taint,
+                    &mut breaker,
+                    t,
+                )));
+            }
+            let (_, looped) = last.unwrap();
+            let [alert] = looped.verdict.alerts.as_slice() else {
+                panic!("{mode:?}: one finding, the loop: {:?}", rules(&looped));
+            };
+            assert_eq!(alert.rule, "AG-ASI09-BREAKER", "{mode:?}");
+            assert_eq!(
+                alert.owasp.as_deref(),
+                Some(["ASI02".to_string(), "ASI08".to_string()].as_slice()),
+                "{mode:?}"
+            );
         }
     }
 

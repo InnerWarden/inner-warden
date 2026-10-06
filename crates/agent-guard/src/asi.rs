@@ -153,6 +153,14 @@ pub fn signal_to_asi(signal: &str) -> Option<&'static str> {
     })
 }
 
+/// The OWASP Agentic (2026) risk ids a loop-breaker trip evidences: an
+/// identical tool call repeated in a tight loop is a tool driven past its
+/// purpose (ASI02 Tool Misuse & Exploitation) and a fault amplifying itself
+/// (ASI08 Cascading Failures). Not ASI09, whatever the finding's historical id
+/// (`AG-ASI09-BREAKER`, see `crate::breaker`) says: a loop exploits no human's
+/// trust.
+pub const LOOP_BREAKER_ASI: [&str; 2] = ["ASI02", "ASI08"];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,6 +244,9 @@ mod tests {
             "obfuscated_command",
         ] {
             assert!(threat(signal_to_asi(s).unwrap()).is_some(), "signal {s}");
+        }
+        for id in LOOP_BREAKER_ASI {
+            assert!(threat(id).is_some(), "loop breaker {id}");
         }
         assert!(category_to_asi("not-a-real-category").is_none());
         assert!(signal_to_asi("not_a_signal").is_none());

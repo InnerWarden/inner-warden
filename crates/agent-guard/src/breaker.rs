@@ -33,7 +33,9 @@
 //! OWASP mapping: loop amplification is ASI02 (Tool Misuse & Exploitation) and
 //! ASI08 (Cascading Failures), see `OWASP-AGENTIC-TOP-10.md`. The finding the
 //! proxy raises keeps its original id, `AG-ASI09-BREAKER`, because recorded
-//! decisions already carry it.
+//! decisions, and any alert rule written against them, already carry it. The
+//! finding itself names ASI02 and ASI08 (`crate::asi::LOOP_BREAKER_ASI`), so
+//! the record and the case classify a loop by what it is, not by its id.
 
 use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, VecDeque};

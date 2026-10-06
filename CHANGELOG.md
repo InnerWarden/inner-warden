@@ -182,6 +182,12 @@ follows semantic versioning.
   the proxy takes that `--` as the value and runs the options written after
   it. A generic MCP client now shows the mode of its own configuration: it
   showed none, and one kept in `~/.claude/` showed Claude Code's.
+- **A loop-breaker finding names the risks a loop is.** `AG-ASI09-BREAKER`
+  carried no OWASP Agentic class, so its case read "OWASP Agentic: none",
+  and its id points at ASI09, human-agent trust exploitation, which a loop is
+  not. It now names ASI02 (tool misuse and exploitation) and ASI08
+  (cascading failures) in its record and on its case. The id is unchanged,
+  so an alert rule written against it keeps matching.
 
 ## 1.5.1 - 2026-09-30
 
