@@ -17,9 +17,9 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::observe::{
-    agent_field, asks_for_a_miner, attempt_line, bounded_field, guard_block_since,
-    needs_block_correlation, outcome, redact_and_bound, AskFindings, Decider, Departure, Leaving,
-    NoReply, Pending, PendingAsk, MAX_ASK_CHARS, PENDING_TTL_SECONDS,
+    agent_field, asks_for_a_miner, attempt_line, bounded_field, correlation_window, guard_window,
+    needs_block_correlation, outcome, redact_and_bound, AskFindings, Decider, Departure,
+    GuardWindow, Leaving, NoReply, Pending, PendingAsk, MAX_ASK_CHARS, PENDING_TTL_SECONDS,
     UNREPORTED_REPLY_WAIT_SECONDS,
 };
 
@@ -215,9 +215,13 @@ fn record(dir: &Path, leaving: Vec<Leaving>, at: u64) {
         String::new()
     };
     for leaving in leaving {
-        let blocked = needs_block_correlation(leaving.departure)
-            && guard_block_since(&tail, leaving.ask.asked_at);
-        let attempt = outcome(leaving, blocked, at);
+        let window = if needs_block_correlation(leaving.departure) {
+            let (from, until) = correlation_window(&leaving, at);
+            guard_window(&tail, &leaving.ask.agent, from, until)
+        } else {
+            GuardWindow::default()
+        };
+        let attempt = outcome(leaving, window, at);
         crate::graph_io::append_guard_event_at(dir, &attempt_line(&attempt));
     }
 }
@@ -335,11 +339,12 @@ fn scored_ask(rest: &[String], session: &str, text: &str, at: u64) -> Option<Pen
 /// `innerwarden observe reply` - the agent answered, so the attempt can be
 /// closed and recorded.
 ///
-/// The decider is established, not assumed. If the guard recorded a block since
-/// the ask arrived, a control refused something and the record says so.
-/// Otherwise nothing the guard screens ever ran, and the honest reading is that
-/// the model declined. The basis travels with the label so the reader is never
-/// invited to think the product proved more than it saw.
+/// The decider is established, not assumed. If the guard refused an action of
+/// this agent since the ask arrived, a control refused something and the
+/// record says so. If monitor mode let a flagged action run, nothing can be
+/// credited. Otherwise nothing the guard screens ever ran, and the honest
+/// reading is that the model declined. The basis travels with the label so the
+/// reader is never invited to think the product proved more than it saw.
 fn cmd_reply(rest: &[String]) -> std::process::ExitCode {
     let session = bounded_field(&flag(rest, "--session").unwrap_or_default(), 120);
     // Read and discard: the reply text settles the outcome, and storing the
@@ -372,7 +377,8 @@ fn cmd_reply(rest: &[String]) -> std::process::ExitCode {
 /// The hook calls this on a timer after a webchat message, because OpenClaw
 /// emits no event when a Control UI reply completes. The record says so
 /// (`channel_reports_no_reply`) and names no model decision: nothing here saw
-/// a reply. A guard block in the window still names the guard. A call before
+/// a reply. Nor does it name the guard: what the sink held in the window is
+/// the record's basis, never its decider (`observe::outcome`). A call before
 /// the wait is over leaves the ask alone, so the timer an older ask started can
 /// never close a newer one, and no caller can settle an ask early.
 fn cmd_settle(rest: &[String]) -> std::process::ExitCode {

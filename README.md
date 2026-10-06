@@ -92,7 +92,9 @@ only — no IP, no host data; set `INNERWARDEN_NO_TELEMETRY=1` to disable). A
   The record carries the rules' recommendation and risk score, on the same
   scale `innerwarden check` uses. Every record names who decided
   (`model_refused`, `guard_denied`, `kernel_denied`, or `undetermined` when
-  that could not be seen) and a model refusal is never reported as a block:
+  that could not be seen; `guard_denied` only for a refusal the guard made for
+  that agent in a turn whose reply was seen, never for an action monitor mode
+  let run) and a model refusal is never reported as a block:
   `innerwarden observe status` says whether this host sees them at all.
   OpenClaw today, via its message hooks.
 

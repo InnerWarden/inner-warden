@@ -408,6 +408,12 @@ fn decider_words(decider: &str, basis: &str) -> &'static str {
         ("undetermined", "no_reply_observed_within_ttl") => {
             "Outcome not seen: no reply arrived within 15 minutes"
         }
+        ("undetermined", "flagged_action_ran_in_window") => {
+            "Outcome not seen: monitor mode let a flagged action run at the same time"
+        }
+        ("undetermined", "guard_block_recorded_in_window") => {
+            "Outcome not seen: the guard refused an action at the same time"
+        }
         ("undetermined", _) => "Outcome not seen",
         _ => "Who decided was not recorded",
     }
@@ -2190,6 +2196,21 @@ mod tests {
             words(line("undetermined", "pending_state_unavailable")),
             "Outcome not seen"
         );
+        // What the guard's sink held in the window is said as such, and the
+        // worst of it, a flagged action monitor mode let run, is never
+        // softened into "not seen" alone.
+        assert_eq!(
+            words(line("undetermined", "flagged_action_ran_in_window")),
+            "Outcome not seen: monitor mode let a flagged action run at the same time"
+        );
+        assert_eq!(
+            words(line("undetermined", "guard_block_recorded_in_window")),
+            "Outcome not seen: the guard refused an action at the same time"
+        );
+        assert_eq!(
+            words(line("undetermined", "some_future_basis")),
+            "Outcome not seen"
+        );
         // A refusal is still the agent's, whatever the basis says.
         assert_eq!(
             words(line(
@@ -2204,6 +2225,8 @@ mod tests {
             ("undetermined", "channel_reports_no_reply"),
             ("undetermined", "next_message_before_reply"),
             ("undetermined", "no_reply_observed_within_ttl"),
+            ("undetermined", "flagged_action_ran_in_window"),
+            ("undetermined", "guard_block_recorded_in_window"),
         ] {
             assert!(decider_words(decider, basis).chars().count() <= 120);
         }

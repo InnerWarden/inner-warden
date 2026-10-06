@@ -44,23 +44,37 @@ actually refused the action.
 - what that conclusion rests on (`decider_basis`)
 - the timestamp, the channel the message arrived on, and the agent (`openclaw`)
 
-`model_refused` is only ever concluded from a reply that was observed. An ask
-that ends any other way is recorded as `undetermined`, or `guard_denied` when
-the guard recorded a block after it arrived:
+`model_refused` is only ever concluded from a reply that was observed, with
+nothing in that turn saying otherwise. `guard_denied` needs the same observed
+reply and a refusal the guard made in enforce mode, recorded after the ask, on
+a line that names this agent (`openclaw`). An ask that ends any other way is
+recorded as `undetermined`, with the reason:
 
 - the same conversation sent another dangerous message before any reply
   (`next_message_before_reply`); both asks are recorded
 - no reply arrived within 15 minutes (`no_reply_observed_within_ttl`)
 - the channel never reports the reply (`channel_reports_no_reply`, below)
+- monitor mode let an action the guard flagged run in the same turn
+  (`flagged_action_ran_in_window`). This outranks every other reason: it is
+  the one that says the attack may have worked
+- the guard refused an action in the same turn, but the record cannot rest on
+  it (`guard_block_recorded_in_window`): no reply was observed, or the refusal
+  names no agent. The refusal is a record of its own either way
+
+The guard's event file can be appended to by the agent's own account, so a line
+there never settles an ask that nothing answered, and a line stamped after the
+ask was recorded, or naming another agent, is not read at all.
 
 ## The Control UI chat (webchat)
 
 OpenClaw fires `message:received` for a Control UI message, but streams the
 reply back over the gateway connection and fires no `message:sent` for it, and
 no other hook event marks the end of a webchat turn. So a dangerous webchat ask
-is held for two minutes, long enough for a guard block in the same turn to be
-seen, and then recorded with `decider_basis: channel_reports_no_reply`. It
-never says the model declined there, because nothing here saw the reply. If the
+is held for two minutes, long enough for what the guard records in the same
+turn to be seen, and then recorded as `undetermined`, with
+`channel_reports_no_reply` or what the guard recorded in that turn as its
+basis. It never says the model declined there, because nothing here saw the
+reply, and it never says the guard stopped it either. If the
 gateway restarts inside those two minutes, the ask is recorded once it has
 waited 15 minutes, by the next message this hook sees.
 
