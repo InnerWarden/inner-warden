@@ -235,9 +235,24 @@ fn when_the_owner_cannot_be_restored(
 /// How many times a lock is re-opened when it is found replaced under us.
 const LOCK_ATTEMPTS: usize = 4;
 
-struct UpdateLock(File);
+struct UpdateLock {
+    file: File,
+    path: PathBuf,
+}
 
 impl UpdateLock {
+    /// Whether the lock this writer holds is still the file at its name.
+    ///
+    /// A writer that cannot open the lock at all replaces it (see
+    /// [`open_lock`]), and a holder of the old file goes on believing it holds
+    /// the lock. So the holder asks again right before it commits: a lock
+    /// replaced while it held it means another writer may now be inside the
+    /// same update, and the write is given up to be retried, rather than both
+    /// passing the compare-and-swap and the last rename winning.
+    fn still_named(&self) -> bool {
+        lock_still_names(&self.file, &self.path)
+    }
+
     fn acquire(path: &Path, ownership: Ownership) -> Result<Self, String> {
         let lock_path = sibling(path, "innerwarden.lock");
         for _ in 0..LOCK_ATTEMPTS {
@@ -251,7 +266,10 @@ impl UpdateLock {
             FileExt::lock(&file)
                 .map_err(|error| format!("locking {}: {error}", lock_path.display()))?;
             if lock_still_names(&file, &lock_path) {
-                return Ok(Self(file));
+                return Ok(Self {
+                    file,
+                    path: lock_path,
+                });
             }
         }
         Err(format!(
@@ -308,11 +326,29 @@ pub fn lock_still_names(file: &File, path: &Path) -> bool {
 ///    takes nothing from anyone: every member of the group may already rename
 ///    over any name in that directory. Root never gets here (it opens
 ///    anything), and a private directory never heals.
+/// 4. With `heal`, a lock this account CAN open that the group cannot (a
+///    `0600` lock an older release made as root) is made usable in place, when
+///    this account owns it or is root. Healing replaces the name, and a writer
+///    holding the old file then shares the update with the healer: a writer of
+///    this release that holds such a lock, root above all, mends it before it
+///    takes it, so nobody needs to heal it. What is left is the instant both
+///    meet, which the holder's check before its commit
+///    ([`UpdateLock::still_named`]) turns into a retry, and a writer of an
+///    older release that holds the old lock while another account heals it,
+///    which nothing here can reach: that write and the healer's may overlap,
+///    and the compare-and-swap catches the overlap unless both commit inside
+///    the same instant.
 fn open_lock(path: &Path, heal: bool) -> std::io::Result<File> {
     #[cfg(not(unix))]
     let _ = heal;
     match open_existing_lock(path) {
-        Ok(file) => return Ok(file),
+        Ok(file) => {
+            #[cfg(unix)]
+            if heal {
+                mend_shared_lock(&file, path);
+            }
+            return Ok(file);
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         #[cfg(unix)]
         Err(error) if heal && error.kind() == std::io::ErrorKind::PermissionDenied => {
@@ -344,6 +380,33 @@ fn open_lock(path: &Path, heal: bool) -> std::io::Result<File> {
         // Another writer created it first: use that one.
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => open_existing_lock(path),
         Err(error) => Err(error),
+    }
+}
+
+/// Whether a lock with `lock_mode` and `lock_gid` is one the group of a
+/// directory with `dir_mode` and `dir_gid` cannot open: the directory is
+/// shared, and the lock is not in its group or lacks the group's read bit.
+/// PURE: the modes and groups are handed in.
+#[cfg(unix)]
+fn lock_shuts_out_the_group(lock_mode: u32, lock_gid: u32, dir_mode: u32, dir_gid: u32) -> bool {
+    const GROUP_READ: u32 = 0o040;
+    is_shared_directory(dir_mode) && (lock_gid != dir_gid || lock_mode & GROUP_READ == 0)
+}
+
+/// Make a lock the shared directory's group cannot open usable to it, in
+/// place (see [`open_lock`], point 4). Best-effort: a lock this account does
+/// not own and cannot change stays as it is, and is still a lock.
+#[cfg(unix)]
+fn mend_shared_lock(file: &File, path: &Path) {
+    use std::os::unix::fs::MetadataExt;
+    let Some(directory) = path.parent() else {
+        return;
+    };
+    let (Ok(lock), Ok(dir)) = (file.metadata(), fs::metadata(directory)) else {
+        return;
+    };
+    if lock_shuts_out_the_group(lock.mode(), lock.gid(), dir.mode(), dir.gid()) {
+        let _ = apply_new_file_ownership(file, directory);
     }
 }
 
@@ -408,7 +471,7 @@ fn replace_unusable_lock(path: &Path, directory: &Path) -> std::io::Result<()> {
 
 impl Drop for UpdateLock {
     fn drop(&mut self) {
-        let _ = FileExt::unlock(&self.0);
+        let _ = FileExt::unlock(&self.file);
     }
 }
 
@@ -718,7 +781,7 @@ fn replace_inner_with(
         .ok_or_else(|| format!("{} has no parent directory", path.display()))?;
     fs::create_dir_all(parent)
         .map_err(|error| format!("creating {}: {error}", parent.display()))?;
-    let _lock = UpdateLock::acquire(&path, ownership)?;
+    let lock = UpdateLock::acquire(&path, ownership)?;
     if let Some(expected) = expected {
         let current = if follow_file_symlink {
             current_bytes(&path, limit)?
@@ -782,6 +845,14 @@ fn replace_inner_with(
                 trusted_root.ok_or_else(|| "missing automatic setup root".to_string())?,
                 &path,
             )?;
+        }
+        // A lock replaced while this writer held it lets another writer into
+        // the same update: give this one up to be retried (see `open_lock`).
+        if !lock.still_named() {
+            return Err(format!(
+                "the lock on {} was replaced while this write held it; retry",
+                requested_path.display()
+            ));
         }
         // Editors and agent processes do not participate in our advisory lock.
         // Narrow the compare/replace window by comparing again after the temp is
@@ -1743,6 +1814,112 @@ mod tests {
                 & 0o777,
             0o600
         );
+    }
+
+    /// Which locks shut the shared directory's group out: one in another
+    /// group, or without the group's read bit, and only in a shared
+    /// directory.
+    #[cfg(unix)]
+    #[test]
+    fn a_lock_shuts_the_group_out_only_in_a_shared_directory() {
+        assert!(lock_shuts_out_the_group(0o100600, 986, 0o42770, 986));
+        assert!(lock_shuts_out_the_group(0o100640, 0, 0o40770, 986));
+        assert!(!lock_shuts_out_the_group(0o100660, 986, 0o42770, 986));
+        assert!(!lock_shuts_out_the_group(0o100640, 986, 0o40770, 986));
+        assert!(
+            !lock_shuts_out_the_group(0o100600, 0, 0o40700, 986),
+            "private"
+        );
+        assert!(!lock_shuts_out_the_group(0o100600, 0, 0o41777, 0), "sticky");
+    }
+
+    /// A lock the group cannot open is mended in place by a writer that can
+    /// (its owner, or root), so no other writer has to replace it. Replacing
+    /// it is what lets a holder of the old file and the replacer into the
+    /// same update.
+    ///
+    /// FAILS ON REVERT: drop `mend_shared_lock` and the lock stays `0600`.
+    #[cfg(unix)]
+    #[test]
+    fn a_lock_the_group_cannot_open_is_mended_by_a_writer_that_can() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let (_dir, shared) = shared_dir_with_mode(0o770);
+        let path = shared.join("graph.json");
+        let lock = sibling(&path, "innerwarden.lock");
+        fs::write(&lock, b"").unwrap();
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o600)).unwrap();
+        let before = fs::metadata(&lock).unwrap().ino();
+
+        replace_owned_store_no_symlinks(&shared, &path, None, b"{}").expect("write");
+
+        let mended = fs::metadata(&lock).unwrap();
+        assert_eq!(mended.ino(), before, "mended in place, never replaced");
+        assert_eq!(mended.permissions().mode() & 0o777, 0o660);
+        assert_eq!(mended.gid(), fs::metadata(&shared).unwrap().gid());
+
+        // A private directory's lock is nobody else's business.
+        let private = tempfile::TempDir::new().unwrap();
+        fs::set_permissions(private.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let store = private.path().join("graph.json");
+        let own = sibling(&store, "innerwarden.lock");
+        fs::write(&own, b"").unwrap();
+        fs::set_permissions(&own, fs::Permissions::from_mode(0o600)).unwrap();
+        replace_owned_store_no_symlinks(private.path(), &store, None, b"{}").expect("write");
+        assert_eq!(
+            fs::metadata(&own).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    /// Where `restore_with_a_heal` replaces the lock, once.
+    #[cfg(unix)]
+    static HEAL_THE_LOCK_AT: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+    /// Restores nothing, and meanwhile does what a writer that could not open
+    /// the lock does: renames a fresh lock over its name.
+    #[cfg(unix)]
+    fn restore_with_a_heal(_file: &File, _uid: u32, _gid: u32) -> std::io::Result<()> {
+        if let Some(lock) = HEAL_THE_LOCK_AT.lock().unwrap().take() {
+            let fresh = lock.with_extension("healed");
+            fs::write(&fresh, b"")?;
+            fs::rename(&fresh, &lock)?;
+        }
+        Ok(())
+    }
+
+    /// A writer that holds a lock which another writer replaces (healing a
+    /// lock it could not open) no longer commits as if it still held it: both
+    /// would pass the compare-and-swap, and the last rename would win.
+    ///
+    /// FAILS ON REVERT: drop the `still_named` check and the write commits.
+    #[cfg(unix)]
+    #[test]
+    fn a_write_whose_lock_was_replaced_meanwhile_is_given_up() {
+        let (_dir, shared) = shared_dir_with_mode(0o770);
+        let path = shared.join("graph.json");
+        fs::write(&path, b"old").unwrap();
+        *HEAL_THE_LOCK_AT.lock().unwrap() = Some(sibling(&path, "innerwarden.lock"));
+
+        let written = replace_inner_with(
+            &path,
+            Some(Some(b"old")),
+            b"new",
+            false,
+            Some(&shared),
+            MAX_CONFIG_BYTES,
+            Ownership::SharedRecord,
+            restore_with_a_heal,
+        );
+
+        let error = written.expect_err("the lock was replaced under the write");
+        assert!(
+            error.contains("was replaced while this write held it"),
+            "{error}"
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"old", "nothing was committed");
+        // And the retry goes through under the lock now at the name.
+        replace_owned_store_no_symlinks(&shared, &path, Some(b"old"), b"new").expect("retry");
+        assert_eq!(fs::read(&path).unwrap(), b"new");
     }
 
     /// A lock this account cannot open AT ALL, left in the shared directory by
