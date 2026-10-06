@@ -185,7 +185,9 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
              With an agent named, remove only that agent's guard hook and leave every\n  \
              other setting untouched.\n  \
              With no agent named, remove InnerWarden entirely: the hook, the config\n  \
-             directory, and the binary.\n\
+             directory, the binary, and the `iw` and `iw-guard` shortcuts beside it\n  \
+             that lead to it. A binary npm, apt or dnf installed is left to that\n  \
+             package manager, and the command that removes it is printed.\n\
              \n  \
              --dry-run   print exactly what a full uninstall would remove, and change\n  \
              \x20           nothing\n  \

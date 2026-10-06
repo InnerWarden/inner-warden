@@ -66,7 +66,7 @@ fn as_an_npm_install(root: &Path) -> PathBuf {
 /// REGRESSION ANCHOR. A plain `innerwarden upgrade` from an npm-managed copy
 /// must refuse, exit 2, and download nothing.
 ///
-/// FAILS ON REVERT: remove the `npm_refusal_applies` gate from `upgrade::cmd`
+/// FAILS ON REVERT: remove the `managed_refusal_applies` gate from `upgrade::cmd`
 /// and this either replaces the binary or fails with a download error, and in
 /// both cases the exit code is not 2 and the npm advice never appears.
 #[test]

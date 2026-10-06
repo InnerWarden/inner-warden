@@ -17,7 +17,7 @@
 //! what was downloaded can be trusted.
 
 use std::io::Read as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use crate::release_verify;
@@ -52,9 +52,9 @@ pub enum Invocation {
     /// Download, verify, and replace.
     ///
     /// `forced` carries `--yes`/`-y`, which until now was accepted and did
-    /// nothing at all. It is the acknowledgement that overrides the npm refusal
-    /// below, and nothing else: it does not skip verification, and it cannot
-    /// turn a `--check` into an install.
+    /// nothing at all. It is the acknowledgement that overrides the refusal of
+    /// a copy npm, apt or dnf installed, and nothing else: it does not skip
+    /// verification, and it cannot turn a `--check` into an install.
     Upgrade { forced: bool },
 }
 
@@ -71,8 +71,119 @@ pub(crate) fn help_text(verb: &str) -> String {
          anything. Hooks and config are left untouched.\n\
          \n  \
          --check   report which version is published, and change nothing\n  \
-         --yes     replace an npm-managed copy anyway (see the refusal for why not)"
+         --yes     replace a copy npm, apt or dnf installed anyway (see the refusal\n  \
+         \x20         for why not)"
     )
+}
+
+/// What `upgrade` does once its arguments are understood, before any byte of
+/// the binary is fetched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Gate {
+    /// `--check`: report the published version and change nothing.
+    Report,
+    /// npm, apt or dnf installed this copy and `--yes` was not given.
+    RefuseManaged,
+    /// The probe could not write beside the binary. Carries the error.
+    CannotReplace(String),
+    /// Download, verify, replace.
+    Proceed,
+}
+
+/// Pure: decide from the invocation, who manages the copy, and a probe that is
+/// only run when the answer depends on it.
+///
+/// `--check` is decided FIRST and never probes. It used to come after the
+/// replace probe, so on a binary the user cannot write (`/usr/bin/innerwarden`
+/// from the `.deb` or `.rpm`, any root-owned copy) `innerwarden upgrade --check`
+/// failed with "Permission denied" before it reported anything, and the probe
+/// itself is a write beside the binary, which a read-only command must not make.
+/// A managed copy is refused before the probe for the same reason: nothing is
+/// written beside a file that belongs to a package manager.
+pub fn gate(
+    check_only: bool,
+    forced: bool,
+    managed: &upgrade_plan::Managed,
+    probe: impl FnOnce() -> std::io::Result<()>,
+) -> Gate {
+    if check_only {
+        return Gate::Report;
+    }
+    if upgrade_plan::managed_refusal_applies(managed, check_only, forced) {
+        return Gate::RefuseManaged;
+    }
+    match probe() {
+        Ok(()) => Gate::Proceed,
+        Err(e) => Gate::CannotReplace(e.to_string()),
+    }
+}
+
+/// The file this process runs from, every link resolved.
+///
+/// macOS reports the path the program was started by, so `iw upgrade` saw the
+/// `iw` link rather than the binary: it renamed a regular file over the link
+/// and left `innerwarden` on the old build, and `iw uninstall` unlinked the
+/// link and left the binary. Linux already reports the resolved file. Windows
+/// keeps the reported path: its installer lays copies, not links, and a
+/// canonical Windows path carries a `\\?\` prefix the messages would print.
+pub(crate) fn installed_binary() -> std::io::Result<PathBuf> {
+    resolve_installed(&std::env::current_exe()?)
+}
+
+#[cfg(unix)]
+fn resolve_installed(path: &Path) -> std::io::Result<PathBuf> {
+    std::fs::canonicalize(path)
+}
+
+#[cfg(not(unix))]
+fn resolve_installed(path: &Path) -> std::io::Result<PathBuf> {
+    Ok(path.to_path_buf())
+}
+
+/// The facts `upgrade_plan::managed_by` decides from: which system package, if
+/// any, records `target`.
+///
+/// Asks the package database rather than guessing from the path, because
+/// `/usr/bin/innerwarden` is also where `sudo IW_GUARD_DIR=/usr/bin` puts the
+/// installer's copy. The tools are named by absolute path so the answer cannot
+/// come from whatever a PATH entry calls itself. A tool that is missing, fails,
+/// or names no owner yields no owner, which is how every install was treated
+/// before. Linux only: nothing else ships the `.deb` or `.rpm`.
+pub(crate) fn package_owner(target: &Path) -> Option<upgrade_plan::PackageOwner> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    let path = target.as_os_str();
+    if let Some(out) = query_package_db("/usr/bin/dpkg-query", &["-S".as_ref(), path]) {
+        if let Some(package) = upgrade_plan::dpkg_owner(&out, target) {
+            return Some(upgrade_plan::PackageOwner::Dpkg { package });
+        }
+    }
+    let out = query_package_db(
+        "/usr/bin/rpm",
+        &[
+            "-qf".as_ref(),
+            "--queryformat".as_ref(),
+            "%{NAME}\n".as_ref(),
+            path,
+        ],
+    )?;
+    upgrade_plan::rpm_owner(&out).map(|package| upgrade_plan::PackageOwner::Rpm { package })
+}
+
+/// Run a package database query and return its stdout, or nothing when the
+/// tool is absent or does not answer with success.
+fn query_package_db(program: &str, args: &[&std::ffi::OsStr]) -> Option<String> {
+    let out = std::process::Command::new(program)
+        .args(args)
+        .env("LC_ALL", "C")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// Pure: what the arguments ask for.
@@ -128,14 +239,14 @@ pub fn cmd(rest: &[String]) -> ExitCode {
         );
         return ExitCode::from(1);
     };
-    let Ok(target) = std::env::current_exe() else {
+    let Ok(target) = installed_binary() else {
         eprintln!("innerwarden upgrade: could not locate the running binary.");
         return ExitCode::from(1);
     };
-    // A parked image from the previous Windows upgrade (see install_verified).
-    let _ = std::fs::remove_file(upgrade_plan::parked_path(&target));
+    let managed = upgrade_plan::managed_by(&target, package_owner(&target).as_ref());
+    let arch = std::env::consts::ARCH;
 
-    // An npm-managed copy must not be replaced by hand, and that has to be said
+    // A managed copy must not be replaced by hand, and that has to be said
     // BEFORE the download rather than after a failure.
     //
     // `upgrade_plan` already documented this hazard and `managed_by` already
@@ -146,36 +257,43 @@ pub fn cmd(rest: &[String]) -> ExitCode {
     // the replace SUCCEEDS. The user is told "Upgrade complete", npm goes on
     // believing it ships the old version, and the next `npm install -g` silently
     // puts the old binary back. The only case the advice existed for was the one
-    // case it was never shown in.
-    if upgrade_plan::npm_refusal_applies(&target, check_only, forced) {
-        eprintln!("innerwarden upgrade: REFUSED, this copy is managed by npm.");
-        eprintln!("  Nothing was downloaded. The installed binary is untouched.");
-        eprintln!();
-        for line in upgrade_plan::cannot_replace_advice(&target, running_as_root()) {
-            eprintln!("{line}");
-        }
-        eprintln!();
-        eprintln!("  To replace npm's file anyway, knowing the next `npm install -g`");
-        eprintln!("  will undo it:  innerwarden upgrade --yes");
-        return ExitCode::from(2);
-    }
-
-    // Prove we can replace the binary BEFORE downloading it.
+    // case it was never shown in. The `.deb` and `.rpm` are refused the same way.
     //
-    // The check used to happen implicitly, at the rename, after the download
-    // and both signature checks had already run. Someone whose CLI came from
-    // `npm install -g` therefore waited through the whole verified download to
-    // be told "could not replace the binary: Permission denied", with no
-    // indication that the fix is npm rather than sudo. Fail in the first second
-    // instead, and say which command to run.
-    if let Err(e) = can_replace(&target) {
-        eprintln!("innerwarden upgrade: cannot replace the installed binary ({e}).");
-        eprintln!("  Nothing was downloaded. The installed binary is untouched.");
-        eprintln!();
-        for line in upgrade_plan::cannot_replace_advice(&target, running_as_root()) {
-            eprintln!("{line}");
+    // Then prove we can replace the binary BEFORE downloading it. The check
+    // used to happen implicitly, at the rename, after the download and both
+    // signature checks had already run, so someone whose CLI came from
+    // `npm install -g` waited through the whole verified download to be told
+    // "Permission denied". Fail in the first second instead, and say which
+    // command to run. `--check` is decided before either: see `gate`.
+    match gate(check_only, forced, &managed, || can_replace(&target)) {
+        Gate::Report => {}
+        Gate::RefuseManaged => {
+            for line in upgrade_plan::managed_refusal_lines(
+                &target,
+                &managed,
+                running_as_root(),
+                std::env::consts::OS,
+                arch,
+            ) {
+                eprintln!("{line}");
+            }
+            return ExitCode::from(2);
         }
-        return ExitCode::from(1);
+        Gate::CannotReplace(e) => {
+            eprintln!("innerwarden upgrade: cannot replace the installed binary ({e}).");
+            eprintln!("  Nothing was downloaded. The installed binary is untouched.");
+            eprintln!();
+            for line in upgrade_plan::cannot_replace_advice(&target, &managed, running_as_root()) {
+                eprintln!("{line}");
+            }
+            return ExitCode::from(1);
+        }
+        Gate::Proceed => {
+            // A parked image from the previous Windows upgrade (see
+            // install_verified). Only on the path that replaces: `--check`
+            // changes nothing.
+            let _ = std::fs::remove_file(upgrade_plan::parked_path(&target));
+        }
     }
 
     if check_only {
@@ -202,7 +320,7 @@ pub fn cmd(rest: &[String]) -> ExitCode {
             }
         };
         let outcome = upgrade_plan::check_outcome(current, &manifest);
-        for line in upgrade_plan::check_lines(&outcome, &asset, upgrade_plan::managed_by(&target)) {
+        for line in upgrade_plan::check_lines(&outcome, &asset, &managed, arch) {
             println!("{line}");
         }
         // "Could not tell" is not success. Exiting 0 there would let a script
@@ -223,9 +341,7 @@ pub fn cmd(rest: &[String]) -> ExitCode {
         if let Ok(manifest) = fetch_text(&manifest_url) {
             let outcome = upgrade_plan::check_outcome(current, &manifest);
             if upgrade_plan::nothing_to_do(&outcome) {
-                for line in
-                    upgrade_plan::check_lines(&outcome, &asset, upgrade_plan::managed_by(&target))
-                {
+                for line in upgrade_plan::check_lines(&outcome, &asset, &managed, arch) {
                     println!("{line}");
                 }
                 return ExitCode::SUCCESS;
@@ -260,7 +376,7 @@ pub fn cmd(rest: &[String]) -> ExitCode {
         FetchOutcome::InstallFailed(e) => {
             eprintln!("innerwarden upgrade: verified, but could not replace the binary: {e}");
             eprintln!();
-            for line in upgrade_plan::cannot_replace_advice(&target, running_as_root()) {
+            for line in upgrade_plan::cannot_replace_advice(&target, &managed, running_as_root()) {
                 eprintln!("{line}");
             }
             ExitCode::from(1)
@@ -703,6 +819,103 @@ mod tests {
             Invocation::Upgrade { forced: false },
             "the only thing between --check and a replaced binary is this \
              distinction, and on 2026-08-21 it did not exist"
+        );
+    }
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::{gate, Gate};
+    use crate::upgrade_plan::{Managed, PackageOwner};
+
+    fn denied() -> std::io::Result<()> {
+        Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+    }
+
+    fn deb() -> Managed {
+        Managed::System(PackageOwner::Dpkg {
+            package: "innerwarden".into(),
+        })
+    }
+
+    /// REGRESSION ANCHOR (todo P23). `innerwarden upgrade --check` on a binary
+    /// the user cannot write failed with "Permission denied" before reporting
+    /// anything: the replace probe ran first. `--check` reports, whatever the
+    /// probe would say, and never runs it, because the probe writes beside the
+    /// binary and a check changes nothing.
+    ///
+    /// FAILS ON REVERT: probe before deciding `--check`, and this returns
+    /// `CannotReplace` (or panics on the probe that must not run).
+    #[test]
+    fn check_reports_on_a_binary_it_cannot_write() {
+        for managed in [Managed::Direct, Managed::Npm, deb()] {
+            assert_eq!(
+                gate(true, false, &managed, denied),
+                Gate::Report,
+                "{managed:?}"
+            );
+            assert_eq!(
+                gate(true, true, &managed, || panic!(
+                    "--check must not write beside the binary"
+                )),
+                Gate::Report,
+                "{managed:?}"
+            );
+        }
+    }
+
+    /// A packaged copy is refused before the probe writes anything beside a
+    /// file that belongs to the package manager, and `--yes` lets it through
+    /// to the probe like npm's.
+    #[test]
+    fn a_packaged_copy_is_refused_before_the_probe_and_yes_reaches_it() {
+        assert_eq!(
+            gate(false, false, &deb(), || panic!(
+                "nothing is written beside a package's file"
+            )),
+            Gate::RefuseManaged
+        );
+        assert_eq!(gate(false, true, &deb(), || Ok(())), Gate::Proceed);
+    }
+
+    /// The upgrade path still fails in the first second when the binary cannot
+    /// be replaced, with the reason, and proceeds when it can.
+    #[test]
+    fn an_upgrade_probes_and_names_why_it_cannot_replace() {
+        match gate(false, false, &Managed::Direct, denied) {
+            Gate::CannotReplace(why) => {
+                assert!(why.to_lowercase().contains("permission denied"), "{why}")
+            }
+            other => panic!("expected CannotReplace, got {other:?}"),
+        }
+        assert_eq!(
+            gate(false, false, &Managed::Direct, || Ok(())),
+            Gate::Proceed
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod installed_binary_tests {
+    /// `iw upgrade` on macOS reported the `iw` link as the running binary and
+    /// renamed a new file over the link, leaving `innerwarden` on the old
+    /// build. The path the upgrade replaces is the file the link leads to.
+    ///
+    /// FAILS ON REVERT: return the path unresolved and this is the link.
+    #[test]
+    fn a_shortcut_resolves_to_the_binary_it_links_to() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real = dir.path().join("innerwarden");
+        std::fs::write(&real, b"binary").expect("seed");
+        let link = dir.path().join("iw");
+        std::os::unix::fs::symlink("innerwarden", &link).expect("link");
+
+        let resolved = super::resolve_installed(&link).expect("resolve");
+        assert_eq!(resolved, std::fs::canonicalize(&real).unwrap());
+        assert_ne!(
+            resolved.file_name(),
+            link.file_name(),
+            "the link is not the binary"
         );
     }
 }

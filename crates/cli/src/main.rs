@@ -1136,7 +1136,7 @@ fn cmd_install(rest: &[String]) -> std::process::ExitCode {
 /// the user can `rm` it if they want it gone.
 fn cmd_uninstall(rest: &[String]) -> std::process::ExitCode {
     // Bare `uninstall` (or with --all / --purge) removes InnerWarden entirely:
-    // the agent hook, the config directory, and the binary. `uninstall
+    // the agent hook, the config directory, the binary and its shortcuts. `uninstall
     // claude-code` (a named agent) removes only that agent's hook.
     if uninstall_targets_whole_install(rest) {
         // Refuse what we do not understand, BEFORE removing anything. An
@@ -1284,23 +1284,25 @@ fn uninstall_plan_lines(home: &std::path::Path) -> Vec<String> {
     // removal the run will not perform. Listing the path unconditionally was the
     // dry-run's own version of the defect: on an npm install it named a file
     // that uninstall must not touch.
-    match std::env::current_exe() {
-        Ok(exe) => {
-            let plan = upgrade_plan::plan_binary_removal(
-                upgrade_plan::managed_by(&exe),
-                can_write_beside(&exe),
-            );
-            match plan {
+    match binary_verdict() {
+        Some(verdict) => {
+            match &verdict.removal {
                 upgrade_plan::BinaryRemoval::RemoveHere => {
-                    out.push(format!("  binary  : {}", exe.display()))
+                    out.push(format!("  binary  : {}", verdict.exe.display()))
                 }
                 other => {
-                    let (lines, _) = upgrade_plan::binary_removal_lines(&other, &exe);
+                    let (lines, _) = upgrade_plan::binary_removal_lines(other, &verdict.exe);
                     out.extend(lines);
                 }
             }
+            for alias in &verdict.aliases.remove {
+                out.push(format!("  alias   : {}", alias.display()));
+            }
+            for (alias, why) in &verdict.aliases.keep {
+                out.push(format!("  alias   : keeps {}: {why}", alias.display()));
+            }
         }
-        Err(_) => out.push("  binary  : could not resolve this executable's path".to_string()),
+        None => out.push("  binary  : could not resolve this executable's path".to_string()),
     }
     out.push(String::new());
     out.push("Nothing was changed. Re-run without --dry-run to do it.".into());
@@ -1332,14 +1334,11 @@ fn cmd_uninstall_self(purge: bool) -> std::process::ExitCode {
     // ("remove it with `rm ...`") needed the very root the run did not have, and
     // for an npm copy it is the move `upgrade_plan::cannot_replace_advice`
     // already tells people not to make.
-    let exe = std::env::current_exe().ok();
-    let removal = exe.as_deref().map(|exe| {
-        upgrade_plan::plan_binary_removal(upgrade_plan::managed_by(exe), can_write_beside(exe))
-    });
+    let verdict = binary_verdict();
     // Say it up front, while the machine is still intact and the answer can
     // change what the operator does.
-    if let (Some(plan), Some(exe)) = (removal.as_ref(), exe.as_deref()) {
-        let (lines, _) = upgrade_plan::binary_removal_lines(plan, exe);
+    if let Some(verdict) = verdict.as_ref() {
+        let (lines, _) = upgrade_plan::binary_removal_lines(&verdict.removal, &verdict.exe);
         for line in &lines {
             println!("{line}");
         }
@@ -1403,11 +1402,34 @@ fn cmd_uninstall_self(purge: bool) -> std::process::ExitCode {
     // file, so an initial `false` there is assigned and never read. Clippy calls
     // that out under `-D warnings` and it only appears on the Windows target,
     // which is a reminder that a green clippy on one OS is not a green clippy.
-    let left_behind = match (removal, exe.as_deref()) {
-        (Some(upgrade_plan::BinaryRemoval::RemoveHere), Some(exe)) => {
+    //
+    // The `iw` and `iw-guard` shortcuts go with it. Only this one file used to
+    // be removed, so the installer's two links were left pointing at nothing.
+    // A shortcut is removed only when it is provably this binary (see
+    // `upgrade_plan::plan_alias_removal`); a name that is anything else is
+    // left and said so.
+    let mut shortcut_left = false;
+    let binary_left = match verdict {
+        Some(BinaryVerdict {
+            removal: upgrade_plan::BinaryRemoval::RemoveHere,
+            exe,
+            aliases,
+        }) => {
+            for alias in &aliases.remove {
+                match std::fs::remove_file(alias) {
+                    Ok(()) => println!("  alias   : removed {}", alias.display()),
+                    Err(e) => {
+                        println!("  alias   : could not remove {} ({e})", alias.display());
+                        shortcut_left = true;
+                    }
+                }
+            }
+            for (alias, why) in &aliases.keep {
+                println!("  alias   : kept {}: {why}", alias.display());
+            }
             #[cfg(unix)]
             {
-                match std::fs::remove_file(exe) {
+                match std::fs::remove_file(&exe) {
                     Ok(()) => {
                         println!("  binary  : removed {}", exe.display());
                         false
@@ -1429,24 +1451,96 @@ fn cmd_uninstall_self(purge: bool) -> std::process::ExitCode {
             }
         }
         // Already announced up front, before anything was destroyed.
-        (Some(_), _) => true,
-        (None, _) => {
+        Some(_) => true,
+        None => {
             println!("  binary  : could not resolve this executable's path");
             true
         }
     };
 
     println!();
-    if left_behind {
+    if binary_left || shortcut_left {
         // Never say "removed" over a machine that still has it. The old code
         // returned SUCCESS unconditionally, so a half-uninstall reported clean
         // and the next `innerwarden` call announced the product was broken.
-        println!("{COMMUNITY_NAME} partly removed: the binary is still on this machine.");
+        let what = if binary_left {
+            "the binary is"
+        } else {
+            "a shortcut to the binary is"
+        };
+        println!("{COMMUNITY_NAME} partly removed: {what} still on this machine.");
         println!("Follow the line above to finish, then restart your agent.");
         return std::process::ExitCode::from(1);
     }
     println!("{COMMUNITY_NAME} removed. Restart your agent to drop the hook.");
     std::process::ExitCode::SUCCESS
+}
+
+/// What a full uninstall does about the binary and its shortcuts.
+struct BinaryVerdict {
+    /// The binary itself, every link resolved.
+    exe: std::path::PathBuf,
+    removal: upgrade_plan::BinaryRemoval,
+    /// Empty unless the binary is removed here: a binary left to npm, a
+    /// package manager or the operator keeps its shortcuts too.
+    aliases: upgrade_plan::AliasPlan,
+}
+
+/// Gather the facts and decide, once, for the preview and the real run alike,
+/// so `--dry-run` cannot promise what the run will not do.
+///
+/// Read before anything is removed: whether a shortcut leads to this binary
+/// can only be asked while the binary is still there.
+fn binary_verdict() -> Option<BinaryVerdict> {
+    let exe = upgrade::installed_binary().ok()?;
+    let managed = upgrade_plan::managed_by(&exe, upgrade::package_owner(&exe).as_ref());
+    let removal = upgrade_plan::plan_binary_removal(&managed, can_write_beside(&exe));
+    let aliases = if removal == upgrade_plan::BinaryRemoval::RemoveHere {
+        upgrade_plan::plan_alias_removal(&alias_facts(&exe), &exe)
+    } else {
+        upgrade_plan::AliasPlan::default()
+    };
+    Some(BinaryVerdict {
+        exe,
+        removal,
+        aliases,
+    })
+}
+
+/// What is at each installed name beside `exe` (`iw`, `iw-guard`, and
+/// `innerwarden` when run as one of those). Names that are not there are left
+/// out; a name that cannot be inspected is `Unreadable`, never "not there".
+fn alias_facts(exe: &std::path::Path) -> Vec<upgrade_plan::AliasFact> {
+    use upgrade_plan::{AliasEntry, AliasFact};
+    upgrade_plan::siblings_named(exe, std::env::consts::EXE_SUFFIX)
+        .into_iter()
+        .filter_map(|path| {
+            let entry = match std::fs::symlink_metadata(&path) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+                Err(_) => AliasEntry::Unreadable,
+                Ok(meta) if meta.file_type().is_symlink() => AliasEntry::Link {
+                    resolves_to: std::fs::canonicalize(&path).ok(),
+                },
+                Ok(meta) if meta.is_file() => AliasEntry::File {
+                    same_bytes: same_bytes(&path, exe),
+                },
+                Ok(_) => AliasEntry::Unreadable,
+            };
+            Some(AliasFact { path, entry })
+        })
+        .collect()
+}
+
+/// Do two files hold the same bytes? Any read failure answers no, which keeps
+/// the file.
+fn same_bytes(a: &std::path::Path, b: &std::path::Path) -> bool {
+    let (Ok(ma), Ok(mb)) = (std::fs::metadata(a), std::fs::metadata(b)) else {
+        return false;
+    };
+    if ma.len() != mb.len() {
+        return false;
+    }
+    matches!((std::fs::read(a), std::fs::read(b)), (Ok(x), Ok(y)) if x == y)
 }
 
 /// Can this process write in the directory the binary lives in?
@@ -1721,7 +1815,7 @@ fn help_text() -> String {
            {p} uninstall claude-code     remove that hook (leaves other settings untouched)\n  \
            {p} upgrade                   update to the latest signed release (verifies before replacing)\n  \
          {p} host <command>            run a command in the Active Defence host layer\n  \
-           {p} uninstall                 remove InnerWarden entirely: hook, config, and the binary\n  \
+           {p} uninstall                 remove InnerWarden entirely: hook, config, binary and its iw shortcuts\n  \
            {p} agents [connect [--monitor]|disconnect [--all|<name>]]\n  \
            \x20                                find AI agents on this machine + connect the guard\n  \
            {p} agents auto-connect [--monitor|--off|status]\n  \

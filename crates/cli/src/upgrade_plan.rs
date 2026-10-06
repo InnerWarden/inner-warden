@@ -132,12 +132,14 @@ pub fn nothing_to_do(outcome: &CheckOutcome) -> bool {
 ///
 /// `managed` is taken into account because telling an npm user to run
 /// `innerwarden upgrade` is the same lie in a different place: that command now
-/// refuses, so pointing them at it would waste the round trip.
-pub fn check_lines(outcome: &CheckOutcome, asset: &str, managed: Managed) -> Vec<String> {
-    let install_command = match managed {
-        Managed::Npm => "npm install -g innerwarden@latest",
-        Managed::Direct => "innerwarden upgrade",
-    };
+/// refuses, so pointing them at it would waste the round trip. The same goes
+/// for a copy the `.deb` or `.rpm` installed. `arch` names the package file.
+pub fn check_lines(
+    outcome: &CheckOutcome,
+    asset: &str,
+    managed: &Managed,
+    arch: &str,
+) -> Vec<String> {
     match outcome {
         CheckOutcome::UpToDate { version } => vec![
             format!("InnerWarden Community {version}"),
@@ -147,11 +149,30 @@ pub fn check_lines(outcome: &CheckOutcome, asset: &str, managed: Managed) -> Vec
         CheckOutcome::Available {
             published,
             installed,
-        } => vec![
-            format!("InnerWarden Community {installed}"),
-            format!("  The published release carries {published} ({asset})."),
-            format!("  Run `{install_command}` to install {published}."),
-        ],
+        } => {
+            let mut out = vec![
+                format!("InnerWarden Community {installed}"),
+                format!("  The published release carries {published} ({asset})."),
+            ];
+            match managed {
+                Managed::System(owner) => {
+                    out.push(format!(
+                        "  This copy came from {}, so upgrade it with the package:",
+                        owner.describe()
+                    ));
+                    out.extend(
+                        upgrade_commands(managed, arch)
+                            .into_iter()
+                            .map(|c| format!("      {c}")),
+                    );
+                }
+                Managed::Npm | Managed::Direct => out.push(format!(
+                    "  Run `{}` to install {published}.",
+                    upgrade_commands(managed, arch).join(" && ")
+                )),
+            }
+            out
+        }
         CheckOutcome::Undetermined => vec![
             "InnerWarden Community: could not determine the published version.".into(),
             "  The release answered but did not name a version, so there is nothing".into(),
@@ -181,19 +202,224 @@ pub fn parked_path(target: &Path) -> PathBuf {
     dir.join(format!("{file}.old"))
 }
 
+/// The names an install lays down for one binary, all in one directory: the
+/// `iw` and `iw-guard` shortcuts and `innerwarden` itself.
+///
+/// The shell installer links `iw` and `iw-guard` to `innerwarden` beside it
+/// (relative links, or copies where a link cannot be made); the Windows
+/// installer copies all three with an `.exe` suffix.
+const INSTALLED_NAMES: [&str; 3] = ["iw", "iw-guard", "innerwarden"];
+
+/// The other installed names beside `target`, with `suffix` appended (`.exe`
+/// on Windows, nothing elsewhere). The target's own name is excluded, so a
+/// binary run as `iw` lists `iw-guard` and `innerwarden`.
+pub fn siblings_named(target: &Path, suffix: &str) -> Vec<PathBuf> {
+    let dir = target.parent().unwrap_or_else(|| Path::new("."));
+    let own = target.file_name().map(|n| n.to_string_lossy().to_string());
+    INSTALLED_NAMES
+        .iter()
+        .map(|n| format!("{n}{suffix}"))
+        .filter(|n| own.as_deref() != Some(n.as_str()))
+        .map(|n| dir.join(n))
+        .collect()
+}
+
 /// The Windows installer lays `iw.exe` and `iw-guard.exe` beside
 /// `innerwarden.exe` as COPIES (Unix gets symlinks). An upgrade that replaced
 /// only the target left `iw --version` on the old build. These are the
 /// siblings to refresh after the target lands; the target itself is excluded.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn sibling_copies(target: &Path) -> Vec<PathBuf> {
-    let dir = target.parent().unwrap_or_else(|| Path::new("."));
-    let own = target.file_name().map(|n| n.to_string_lossy().to_string());
-    ["iw.exe", "iw-guard.exe", "innerwarden.exe"]
-        .iter()
-        .filter(|n| own.as_deref() != Some(n))
-        .map(|n| dir.join(n))
-        .collect()
+    siblings_named(target, ".exe")
+}
+
+/// What is at one of the installed names beside the binary, as the caller
+/// found it. Read once, before anything is removed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AliasEntry {
+    /// A symbolic link, and the canonical path it leads to (`None` when it
+    /// leads to nothing that exists).
+    Link { resolves_to: Option<PathBuf> },
+    /// A regular file, and whether its bytes are this binary's bytes.
+    File { same_bytes: bool },
+    /// It could not be read, or it is neither a link nor a regular file.
+    Unreadable,
+}
+
+/// One installed name that exists beside the binary. Names that are not there
+/// are not listed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AliasFact {
+    pub path: PathBuf,
+    pub entry: AliasEntry,
+}
+
+/// Which of the names beside the binary a full uninstall removes, and which it
+/// leaves, with the reason in words.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AliasPlan {
+    pub remove: Vec<PathBuf>,
+    pub keep: Vec<(PathBuf, &'static str)>,
+}
+
+/// Decide which shortcuts go with the binary.
+///
+/// Uninstall removed the one file it ran from and left `iw` and `iw-guard`
+/// behind, two links to a file that no longer existed. A name is removed only
+/// when it is provably this binary: a link that resolves to `exe` (canonical,
+/// resolved by the caller), or a regular file with `exe`'s exact bytes (the
+/// installer's copy where a link could not be made). Anything else carrying
+/// the name is somebody else's, or an older copy, and is left where it is: a
+/// link to another program, a dangling link, a file with other bytes, or
+/// something unreadable. Removing a link never touches what it points to.
+pub fn plan_alias_removal(facts: &[AliasFact], exe: &Path) -> AliasPlan {
+    let mut plan = AliasPlan::default();
+    for fact in facts {
+        if fact.path == exe {
+            // The binary is the binary's own removal, never an alias of itself.
+            continue;
+        }
+        match &fact.entry {
+            AliasEntry::Link {
+                resolves_to: Some(to),
+            } if to == exe => plan.remove.push(fact.path.clone()),
+            AliasEntry::Link {
+                resolves_to: Some(_),
+            } => plan
+                .keep
+                .push((fact.path.clone(), "it links to another program")),
+            AliasEntry::Link { resolves_to: None } => plan
+                .keep
+                .push((fact.path.clone(), "it links to nothing that exists")),
+            AliasEntry::File { same_bytes: true } => plan.remove.push(fact.path.clone()),
+            AliasEntry::File { same_bytes: false } => plan.keep.push((
+                fact.path.clone(),
+                "it is a different file, another program or an older copy",
+            )),
+            AliasEntry::Unreadable => plan.keep.push((fact.path.clone(), "it could not be read")),
+        }
+    }
+    plan
+}
+
+/// Which system package database records the installed file, as read by the
+/// caller from `dpkg-query -S` or `rpm -qf`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PackageOwner {
+    /// The `.deb`: dpkg records the file under this package.
+    Dpkg { package: String },
+    /// The `.rpm`: rpm records the file under this package.
+    Rpm { package: String },
+}
+
+impl PackageOwner {
+    fn package(&self) -> &str {
+        match self {
+            PackageOwner::Dpkg { package } | PackageOwner::Rpm { package } => package,
+        }
+    }
+
+    /// The front end the install page uses for this package type.
+    fn tool(&self) -> &'static str {
+        match self {
+            PackageOwner::Dpkg { .. } => "apt",
+            PackageOwner::Rpm { .. } => "dnf",
+        }
+    }
+
+    /// "the .deb package `innerwarden`".
+    fn describe(&self) -> String {
+        let kind = match self {
+            PackageOwner::Dpkg { .. } => ".deb",
+            PackageOwner::Rpm { .. } => ".rpm",
+        };
+        format!("the {kind} package `{}`", self.package())
+    }
+
+    fn remove_command(&self) -> String {
+        format!("sudo {} remove {}", self.tool(), self.package())
+    }
+}
+
+/// The package owner named by `dpkg-query -S <target>`, if one owns exactly
+/// `target`.
+///
+/// Lines read `pkg: /path`, `pkg:arch: /path` for a multi-arch package, or
+/// `a, b: /path` when several share it; a `diversion by` line is not ownership.
+/// Only a line naming `target` itself counts.
+pub fn dpkg_owner(stdout: &str, target: &Path) -> Option<String> {
+    let want = target.to_str()?;
+    stdout.lines().find_map(|line| {
+        if line.starts_with("diversion by") {
+            return None;
+        }
+        let (packages, path) = line.split_once(": ")?;
+        if path.trim_end() != want {
+            return None;
+        }
+        let first = packages.split(',').next()?.trim();
+        let name = first.split(':').next()?.trim();
+        package_name(name)
+    })
+}
+
+/// The package named by `rpm -qf --queryformat '%{NAME}\n' <target>`.
+pub fn rpm_owner(stdout: &str) -> Option<String> {
+    package_name(stdout.lines().map(str::trim).find(|l| !l.is_empty())?)
+}
+
+/// A package name is one token. Anything with a space in it is a message
+/// ("file ... is not owned by any package"), not a name.
+fn package_name(name: &str) -> Option<String> {
+    (!name.is_empty() && !name.contains(char::is_whitespace)).then(|| name.to_string())
+}
+
+/// The architecture as the `.deb` file names it on the release.
+fn deb_arch(arch: &str) -> Option<&'static str> {
+    match arch {
+        "x86_64" => Some("amd64"),
+        "aarch64" => Some("arm64"),
+        _ => None,
+    }
+}
+
+/// The architecture as the `.rpm` file names it on the release.
+fn rpm_arch(arch: &str) -> Option<&'static str> {
+    match arch {
+        "x86_64" => Some("x86_64"),
+        "aarch64" => Some("aarch64"),
+        _ => None,
+    }
+}
+
+/// The commands that upgrade this copy the way it was installed.
+///
+/// There is no apt or dnf repository: the `.deb` and `.rpm` are files on the
+/// release, installed by path, so `apt upgrade innerwarden` would answer that
+/// nothing is newer. The fixed-name packages on the rolling release always
+/// carry the current build, which is what the install page links.
+pub fn upgrade_commands(managed: &Managed, arch: &str) -> Vec<String> {
+    match managed {
+        Managed::Npm => vec!["npm install -g innerwarden@latest".into()],
+        Managed::Direct => vec!["innerwarden upgrade".into()],
+        Managed::System(PackageOwner::Dpkg { .. }) => match deb_arch(arch) {
+            Some(a) => vec![
+                format!("curl -fsSLO {RELEASE_BASE}/innerwarden_{a}.deb"),
+                format!("sudo apt install ./innerwarden_{a}.deb"),
+            ],
+            None => vec![format!(
+                "sudo apt install ./<the newer .deb for {arch}, from {RELEASE_BASE}>"
+            )],
+        },
+        Managed::System(PackageOwner::Rpm { .. }) => match rpm_arch(arch) {
+            Some(a) => vec![format!(
+                "sudo dnf install {RELEASE_BASE}/innerwarden.{a}.rpm"
+            )],
+            None => vec![format!(
+                "sudo dnf install <the newer .rpm for {arch}, from {RELEASE_BASE}>"
+            )],
+        },
+    }
 }
 
 pub fn staging_path(target: &Path) -> PathBuf {
@@ -210,20 +436,47 @@ pub fn staging_path(target: &Path) -> PathBuf {
 /// `upgrade` replaces the file it is running from. That is right for the
 /// installer's own copy and wrong for a copy another package manager put
 /// there: overwriting npm's file leaves npm believing it still ships the old
-/// version, and the next `npm install -g` silently reverts the upgrade.
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+/// version, and the next `npm install -g` silently reverts the upgrade. The
+/// `.deb` and `.rpm` are the same hazard one level down: dpkg or rpm goes on
+/// recording the old version over a file that is no longer it, and the next
+/// install of that package puts the old binary back.
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub enum Managed {
     /// Installed by `npm install -g innerwarden`.
     Npm,
+    /// Installed from the `.deb` or `.rpm`: the system package database
+    /// records this file.
+    System(PackageOwner),
     /// Installed by the shell installer, or built locally.
     Direct,
 }
 
-/// Classify an install from the path the binary runs from.
+impl Managed {
+    /// Who to name in a refusal: "npm", or "apt (the .deb package `x`)".
+    fn manager(&self) -> String {
+        match self {
+            Managed::Npm => "npm".into(),
+            Managed::System(owner) => format!("{} ({})", owner.tool(), owner.describe()),
+            Managed::Direct => "nothing but this binary".into(),
+        }
+    }
+}
+
+/// Classify an install from the path the binary runs from and from what the
+/// system package database said about that path.
 ///
-/// npm's global layout puts the real binary under `node_modules`, which is the
-/// one marker that is stable across npm versions, prefixes, and platforms.
-pub fn managed_by(target: &Path) -> Managed {
+/// `owner` is the package database's own answer, gathered by the caller
+/// (`dpkg-query -S`, `rpm -qf`), so the decision stays pure. It is consulted
+/// FIRST: a file a package records belongs to that package wherever it sits,
+/// and `/usr/bin/innerwarden`, where the `.deb` and `.rpm` put it, says nothing
+/// by itself (`sudo IW_GUARD_DIR=/usr/bin` puts the installer's copy there too).
+///
+/// Otherwise npm's global layout puts the real binary under `node_modules`,
+/// the one marker that is stable across npm versions, prefixes, and platforms.
+pub fn managed_by(target: &Path, owner: Option<&PackageOwner>) -> Managed {
+    if let Some(owner) = owner {
+        return Managed::System(owner.clone());
+    }
     if target.components().any(|c| c.as_os_str() == "node_modules") {
         Managed::Npm
     } else {
@@ -237,12 +490,49 @@ pub fn managed_by(target: &Path) -> Managed {
 /// `managed_by` had two callers and both were on the failure path, so the npm
 /// hazard was only ever announced to people whose upgrade had already failed for
 /// an unrelated reason. The case it was written for, a user-owned npm prefix,
-/// upgrades successfully and is reverted by the next `npm install -g`.
+/// upgrades successfully and is reverted by the next `npm install -g`. A copy
+/// the `.deb` or `.rpm` installed refuses for the same reason.
 ///
 /// `check_only` never refuses: reporting a version changes nothing, and the
-/// report names npm's own command instead. `forced` is the user saying they know.
-pub fn npm_refusal_applies(target: &Path, check_only: bool, forced: bool) -> bool {
-    !check_only && !forced && managed_by(target) == Managed::Npm
+/// report names the package manager's own command instead. `forced` is the user
+/// saying they know.
+pub fn managed_refusal_applies(managed: &Managed, check_only: bool, forced: bool) -> bool {
+    !check_only && !forced && *managed != Managed::Direct
+}
+
+/// Everything `upgrade` prints when it refuses a managed copy: why, the way
+/// it was installed, and the override for someone who knows what it costs.
+pub fn managed_refusal_lines(
+    target: &Path,
+    managed: &Managed,
+    is_root: bool,
+    os: &str,
+    arch: &str,
+) -> Vec<String> {
+    let mut out = vec![
+        format!(
+            "innerwarden upgrade: REFUSED, this copy is managed by {}.",
+            managed.manager()
+        ),
+        "  Nothing was downloaded. The installed binary is untouched.".into(),
+        String::new(),
+    ];
+    out.extend(cannot_replace_advice_on(target, managed, is_root, os, arch));
+    out.push(String::new());
+    match managed {
+        Managed::System(owner) => {
+            out.push(format!(
+                "  To replace the package's file anyway, knowing {} goes on recording",
+                owner.tool()
+            ));
+            out.push("  the old version:  sudo innerwarden upgrade --yes".into());
+        }
+        Managed::Npm | Managed::Direct => {
+            out.push("  To replace npm's file anyway, knowing the next `npm install -g`".into());
+            out.push("  will undo it:  innerwarden upgrade --yes".into());
+        }
+    }
+    out
 }
 
 /// What to tell someone whose binary could not be replaced.
@@ -254,17 +544,29 @@ pub fn npm_refusal_applies(target: &Path, check_only: bool, forced: bool) -> boo
 ///
 /// `is_root` is passed in rather than read here so the decision stays pure and
 /// the root case is testable on any host.
-pub fn cannot_replace_advice(target: &Path, is_root: bool) -> Vec<String> {
-    cannot_replace_advice_on(target, is_root, std::env::consts::OS)
+pub fn cannot_replace_advice(target: &Path, managed: &Managed, is_root: bool) -> Vec<String> {
+    cannot_replace_advice_on(
+        target,
+        managed,
+        is_root,
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+    )
 }
 
 /// The advice by platform. `sudo` is a Unix word: on Windows the usual reason
 /// is another InnerWarden process holding the file, or a folder that needs
 /// an elevated PowerShell. Read on a stock Windows Server 2022 on 2026-09-08,
 /// where a failed replace told the operator to run `sudo innerwarden upgrade`.
-pub fn cannot_replace_advice_on(target: &Path, is_root: bool, os: &str) -> Vec<String> {
+pub fn cannot_replace_advice_on(
+    target: &Path,
+    managed: &Managed,
+    is_root: bool,
+    os: &str,
+    arch: &str,
+) -> Vec<String> {
     let mut out = Vec::new();
-    if os == "windows" && managed_by(target) == Managed::Direct {
+    if os == "windows" && *managed == Managed::Direct {
         out.push(format!("{} could not be replaced.", target.display()));
         out.push(
             "Close every other InnerWarden process (a dashboard, an agent's hook still \
@@ -278,7 +580,7 @@ pub fn cannot_replace_advice_on(target: &Path, is_root: bool, os: &str) -> Vec<S
         );
         return out;
     }
-    match managed_by(target) {
+    match managed {
         Managed::Npm => {
             out.push(format!(
                 "This copy is managed by npm ({}).",
@@ -293,6 +595,24 @@ pub fn cannot_replace_advice_on(target: &Path, is_root: bool, os: &str) -> Vec<S
                  `npm install -g` puts the old one back."
                     .into(),
             );
+        }
+        Managed::System(owner) => {
+            out.push(format!(
+                "This copy came from {} ({}).",
+                owner.describe(),
+                target.display()
+            ));
+            out.push("Upgrade it the way it was installed:".into());
+            for command in upgrade_commands(managed, arch) {
+                out.push(format!("    {command}"));
+            }
+            out.push(String::new());
+            out.push(format!(
+                "Replacing the file by hand leaves {} recording the old version over \
+                 a file that is no longer it, and the next install of that package \
+                 puts the old binary back.",
+                owner.tool()
+            ));
         }
         Managed::Direct if !is_root => {
             out.push(format!(
@@ -332,6 +652,10 @@ pub enum BinaryRemoval {
     /// pointing at nothing while npm still believes it ships the version. The
     /// same reasoning `cannot_replace_advice` already applies to `upgrade`.
     LeaveToNpm,
+    /// The `.deb` or `.rpm` installed this file. Its package manager removes
+    /// it, and its record of it with it; unlinking it here, which root can do,
+    /// leaves dpkg or rpm recording a package whose file is gone.
+    LeaveToPackage(PackageOwner),
     /// We can write to it, so remove it here.
     RemoveHere,
     /// A direct install we cannot write to. Say so before touching anything else.
@@ -345,12 +669,15 @@ pub enum BinaryRemoval {
 /// a unit test on any host. `upgrade` gathers the same fact with a real write
 /// (`can_replace`), which is the only method that does not guess wrong under a
 /// read-only mount or an immutable flag.
-pub fn plan_binary_removal(managed: Managed, writable: bool) -> BinaryRemoval {
+pub fn plan_binary_removal(managed: &Managed, writable: bool) -> BinaryRemoval {
     match managed {
         // Checked FIRST and independently of `writable`. A user-owned npm prefix
         // IS writable, so a writability-first branch would delete npm's file
         // exactly in the case the product already documents as the wrong move.
         Managed::Npm => BinaryRemoval::LeaveToNpm,
+        // The same for a package: `sudo innerwarden uninstall` can write
+        // `/usr/bin`, and that is exactly when it must not unlink dpkg's file.
+        Managed::System(owner) => BinaryRemoval::LeaveToPackage(owner.clone()),
         Managed::Direct if writable => BinaryRemoval::RemoveHere,
         Managed::Direct => BinaryRemoval::CannotRemove,
     }
@@ -370,6 +697,22 @@ pub fn binary_removal_lines(plan: &BinaryRemoval, target: &Path) -> (Vec<String>
                 "            That also removes the `innerwarden` and `iw` launchers and".into(),
                 "            npm's record of them. Deleting the file by hand leaves all three."
                     .into(),
+            ],
+            true,
+        ),
+        BinaryRemoval::LeaveToPackage(owner) => (
+            vec![
+                format!(
+                    "  binary  : installed by {}, so {} removes it:",
+                    owner.describe(),
+                    owner.tool()
+                ),
+                format!("                {}", owner.remove_command()),
+                format!(
+                    "            Deleting the file by hand leaves {} recording a package",
+                    owner.tool()
+                ),
+                "            whose file is gone.".into(),
             ],
             true,
         ),
@@ -398,11 +741,11 @@ mod tests {
     #[test]
     fn an_npm_copy_is_left_to_npm_even_when_writable() {
         assert_eq!(
-            plan_binary_removal(Managed::Npm, true),
+            plan_binary_removal(&Managed::Npm, true),
             BinaryRemoval::LeaveToNpm
         );
         assert_eq!(
-            plan_binary_removal(Managed::Npm, false),
+            plan_binary_removal(&Managed::Npm, false),
             BinaryRemoval::LeaveToNpm
         );
     }
@@ -411,7 +754,7 @@ mod tests {
     /// install we own is still removed here, and still exits clean.
     #[test]
     fn a_writable_direct_install_is_removed_here_and_leaves_nothing() {
-        let plan = plan_binary_removal(Managed::Direct, true);
+        let plan = plan_binary_removal(&Managed::Direct, true);
         assert_eq!(plan, BinaryRemoval::RemoveHere);
         let (lines, left_behind) =
             binary_removal_lines(&plan, Path::new("/usr/local/bin/innerwarden"));
@@ -422,7 +765,7 @@ mod tests {
     #[test]
     fn an_unwritable_direct_install_cannot_be_removed() {
         assert_eq!(
-            plan_binary_removal(Managed::Direct, false),
+            plan_binary_removal(&Managed::Direct, false),
             BinaryRemoval::CannotRemove
         );
     }
@@ -475,8 +818,8 @@ mod tests {
         let p = Path::new(
             "/usr/local/lib/node_modules/innerwarden/node_modules/@innerwarden/cli-linux-x64/bin/innerwarden",
         );
-        assert_eq!(managed_by(p), Managed::Npm);
-        let advice = cannot_replace_advice(p, false).join("\n");
+        assert_eq!(managed_by(p, None), Managed::Npm);
+        let advice = cannot_replace_advice(p, &managed_by(p, None), false).join("\n");
         assert!(
             advice.contains("npm install -g innerwarden@latest"),
             "an npm install must be pointed at npm, got:\n{advice}"
@@ -491,7 +834,7 @@ mod tests {
     #[test]
     fn root_does_not_change_the_advice_for_an_npm_install() {
         let p = Path::new("/usr/lib/node_modules/innerwarden/bin/innerwarden");
-        let advice = cannot_replace_advice(p, true).join("\n");
+        let advice = cannot_replace_advice(p, &managed_by(p, None), true).join("\n");
         assert!(
             advice.contains("npm install -g innerwarden@latest"),
             "{advice}"
@@ -506,7 +849,7 @@ mod tests {
     #[test]
     fn a_direct_install_that_is_not_writable_asks_for_sudo() {
         let p = Path::new("/usr/local/bin/innerwarden");
-        let advice = cannot_replace_advice(p, false).join("\n");
+        let advice = cannot_replace_advice(p, &managed_by(p, None), false).join("\n");
         assert!(advice.contains("sudo innerwarden upgrade"), "{advice}");
         assert!(!advice.contains("npm install"), "{advice}");
     }
@@ -515,7 +858,7 @@ mod tests {
     #[test]
     fn a_direct_install_failing_as_root_does_not_suggest_sudo() {
         let p = Path::new("/usr/local/bin/innerwarden");
-        let advice = cannot_replace_advice(p, true).join("\n");
+        let advice = cannot_replace_advice(p, &managed_by(p, None), true).join("\n");
         assert!(
             !advice.contains("sudo innerwarden upgrade"),
             "telling root to use sudo sends them round the same loop:\n{advice}"
@@ -538,9 +881,9 @@ mod tests {
     #[test]
     fn an_npm_install_is_refused_before_anything_is_downloaded() {
         let npm = Path::new("/home/lab/.npm-global/lib/node_modules/innerwarden/bin/innerwarden");
-        assert_eq!(managed_by(npm), Managed::Npm, "precondition");
+        assert_eq!(managed_by(npm, None), Managed::Npm, "precondition");
         assert!(
-            npm_refusal_applies(npm, false, false),
+            managed_refusal_applies(&managed_by(npm, None), false, false),
             "a plain `innerwarden upgrade` on an npm copy must refuse"
         );
     }
@@ -553,19 +896,19 @@ mod tests {
         let direct = Path::new("/usr/local/bin/innerwarden");
 
         assert!(
-            !npm_refusal_applies(npm, true, false),
+            !managed_refusal_applies(&managed_by(npm, None), true, false),
             "--check changes nothing, so it reports rather than refusing"
         );
         assert!(
-            !npm_refusal_applies(npm, false, true),
+            !managed_refusal_applies(&managed_by(npm, None), false, true),
             "--yes is the user saying they know what it costs"
         );
         assert!(
-            !npm_refusal_applies(direct, false, false),
+            !managed_refusal_applies(&managed_by(direct, None), false, false),
             "an installer copy is exactly what upgrade is for"
         );
         assert!(
-            !npm_refusal_applies(direct, true, false),
+            !managed_refusal_applies(&managed_by(direct, None), true, false),
             "{}",
             direct.display()
         );
@@ -574,11 +917,11 @@ mod tests {
     #[test]
     fn a_plain_path_is_not_mistaken_for_npm() {
         assert_eq!(
-            managed_by(Path::new("/usr/local/bin/innerwarden")),
+            managed_by(Path::new("/usr/local/bin/innerwarden"), None),
             Managed::Direct
         );
         assert_eq!(
-            managed_by(Path::new("/home/lab/.local/bin/innerwarden")),
+            managed_by(Path::new("/home/lab/.local/bin/innerwarden"), None),
             Managed::Direct
         );
     }
@@ -660,7 +1003,13 @@ mod tests {
             "1.3.7 installed against 1.3.7 published is not an upgrade"
         );
 
-        let lines = check_lines(&outcome, "innerwarden-linux-x86_64", Managed::Direct).join("\n");
+        let lines = check_lines(
+            &outcome,
+            "innerwarden-linux-x86_64",
+            &Managed::Direct,
+            "x86_64",
+        )
+        .join("\n");
         assert!(
             lines.contains("Already on the latest build"),
             "the report must say so in words: {lines}"
@@ -684,7 +1033,13 @@ mod tests {
             }
         );
 
-        let lines = check_lines(&outcome, "innerwarden-linux-x86_64", Managed::Direct).join("\n");
+        let lines = check_lines(
+            &outcome,
+            "innerwarden-linux-x86_64",
+            &Managed::Direct,
+            "x86_64",
+        )
+        .join("\n");
         assert!(lines.contains("1.3.7"), "name what would arrive: {lines}");
         assert!(
             lines.contains("1.3.4"),
@@ -714,7 +1069,8 @@ mod tests {
         let lines = check_lines(
             &CheckOutcome::Undetermined,
             "innerwarden-linux-x86_64",
-            Managed::Direct,
+            &Managed::Direct,
+            "x86_64",
         )
         .join("\n");
         assert!(
@@ -729,7 +1085,13 @@ mod tests {
     #[test]
     fn a_check_on_an_npm_install_points_at_npm() {
         let outcome = check_outcome("1.3.4", REAL_MANIFEST);
-        let lines = check_lines(&outcome, "innerwarden-linux-x86_64", Managed::Npm).join("\n");
+        let lines = check_lines(
+            &outcome,
+            "innerwarden-linux-x86_64",
+            &Managed::Npm,
+            "x86_64",
+        )
+        .join("\n");
         assert!(
             lines.contains("npm install -g innerwarden@latest"),
             "{lines}"
@@ -843,11 +1205,353 @@ mod tests {
     #[test]
     fn the_cannot_replace_advice_speaks_the_platform() {
         let t = Path::new("/home/me/.local/bin/innerwarden");
-        let win = cannot_replace_advice_on(t, false, "windows").join("\n");
+        let win =
+            cannot_replace_advice_on(t, &Managed::Direct, false, "windows", "x86_64").join("\n");
         assert!(!win.contains("sudo"), "{win}");
         assert!(win.contains("Administrator"), "{win}");
         assert!(win.contains("other InnerWarden process"), "{win}");
-        let unix = cannot_replace_advice_on(t, false, "linux").join("\n");
+        let unix =
+            cannot_replace_advice_on(t, &Managed::Direct, false, "linux", "x86_64").join("\n");
         assert!(unix.contains("sudo innerwarden upgrade"), "{unix}");
+    }
+
+    // ── packages and shortcuts (todo P23) ──────────────────────────────────────
+
+    fn deb() -> PackageOwner {
+        PackageOwner::Dpkg {
+            package: "innerwarden".into(),
+        }
+    }
+
+    fn rpm() -> PackageOwner {
+        PackageOwner::Rpm {
+            package: "innerwarden".into(),
+        }
+    }
+
+    /// Where the `.deb` and `.rpm` put the binary (packaging/nfpm.yaml).
+    const PACKAGED: &str = "/usr/bin/innerwarden";
+
+    /// REGRESSION ANCHOR. Ownership comes from the package database's answer,
+    /// and the same path with no owner is the shell installer's copy
+    /// (`sudo IW_GUARD_DIR=/usr/bin`), which `upgrade` is exactly for.
+    ///
+    /// FAILS ON REVERT: ignore `owner` and a `.deb` install classifies as
+    /// `Direct`, so `upgrade` replaces dpkg's file and `uninstall` as root
+    /// unlinks it.
+    #[test]
+    fn a_file_the_package_database_records_is_managed_by_that_package() {
+        let p = Path::new(PACKAGED);
+        assert_eq!(managed_by(p, Some(&deb())), Managed::System(deb()));
+        assert_eq!(managed_by(p, Some(&rpm())), Managed::System(rpm()));
+        assert_eq!(managed_by(p, None), Managed::Direct);
+    }
+
+    /// `upgrade` refuses a packaged copy before anything is downloaded, as it
+    /// does npm's, and the same two things spare it: `--check` and `--yes`.
+    ///
+    /// FAILS ON REVERT: refuse only `Managed::Npm` and the packaged copy is
+    /// replaced, leaving dpkg or rpm recording the old version.
+    #[test]
+    fn a_packaged_copy_is_refused_like_npm_and_spared_by_check_and_yes() {
+        for owner in [deb(), rpm()] {
+            let m = Managed::System(owner);
+            assert!(managed_refusal_applies(&m, false, false), "{m:?}");
+            assert!(!managed_refusal_applies(&m, true, false), "{m:?}");
+            assert!(!managed_refusal_applies(&m, false, true), "{m:?}");
+        }
+    }
+
+    /// `--check` on a `.deb` install names the package file and apt. Never
+    /// `innerwarden upgrade`, which refuses there, and never `apt upgrade`:
+    /// there is no apt repository, so it would find nothing newer.
+    ///
+    /// FAILS ON REVERT: the old report said "Run `innerwarden upgrade`" for
+    /// every copy that was not npm's.
+    #[test]
+    fn a_check_on_a_deb_install_names_the_package_file_and_apt() {
+        let outcome = check_outcome("1.3.4", REAL_MANIFEST);
+        let lines = check_lines(
+            &outcome,
+            "innerwarden-linux-x86_64",
+            &Managed::System(deb()),
+            "x86_64",
+        )
+        .join("\n");
+        assert!(
+            lines.contains(&format!("curl -fsSLO {RELEASE_BASE}/innerwarden_amd64.deb")),
+            "{lines}"
+        );
+        assert!(
+            lines.contains("sudo apt install ./innerwarden_amd64.deb"),
+            "{lines}"
+        );
+        assert!(lines.contains("the .deb package `innerwarden`"), "{lines}");
+        assert!(
+            !lines.contains("innerwarden upgrade"),
+            "that command refuses a packaged copy: {lines}"
+        );
+        assert!(!lines.contains("apt upgrade"), "{lines}");
+    }
+
+    /// The `.rpm` names dnf and the release's fixed-name package for this
+    /// architecture, and an architecture the release has no package for gets
+    /// no invented file name.
+    #[test]
+    fn a_check_on_an_rpm_install_names_dnf_and_the_package_for_this_arch() {
+        let outcome = check_outcome("1.3.4", REAL_MANIFEST);
+        let lines = check_lines(
+            &outcome,
+            "innerwarden-linux-aarch64",
+            &Managed::System(rpm()),
+            "aarch64",
+        )
+        .join("\n");
+        assert!(
+            lines.contains(&format!(
+                "sudo dnf install {RELEASE_BASE}/innerwarden.aarch64.rpm"
+            )),
+            "{lines}"
+        );
+        assert!(!lines.contains("innerwarden upgrade"), "{lines}");
+
+        let unknown = upgrade_commands(&Managed::System(deb()), "riscv64").join("\n");
+        assert!(!unknown.contains("innerwarden_riscv64.deb"), "{unknown}");
+        assert!(unknown.contains("sudo apt install"), "{unknown}");
+    }
+
+    /// The package files the advice names are the fixed-name copies the
+    /// release workflow uploads, for every architecture the packages are built
+    /// for. A hand-written name that drifts from the workflow sends a packaged
+    /// install to a 404.
+    ///
+    /// FAILS ON DRIFT: rename a fixed-name copy in `linux-packages.yml`, or
+    /// spell an architecture differently here.
+    #[test]
+    fn the_package_files_named_are_the_ones_the_release_uploads() {
+        let workflow = include_str!("../../../.github/workflows/linux-packages.yml");
+        for arch in ["x86_64", "aarch64"] {
+            for owner in [deb(), rpm()] {
+                let commands = upgrade_commands(&Managed::System(owner.clone()), arch).join("\n");
+                let file = commands
+                    .split(&format!("{RELEASE_BASE}/"))
+                    .nth(1)
+                    .and_then(|rest| rest.split_whitespace().next())
+                    .unwrap_or_else(|| {
+                        panic!("no release file named for {owner:?}/{arch}:\n{commands}")
+                    });
+                assert!(
+                    workflow.contains(&format!(":{file}\"")),
+                    "{file} ({owner:?}, {arch}) is not a fixed-name copy linux-packages.yml uploads"
+                );
+            }
+        }
+    }
+
+    /// What `upgrade` prints when it refuses a packaged copy: who manages it,
+    /// the way it was installed, and the override.
+    #[test]
+    fn the_refusal_for_a_deb_names_apt_the_package_file_and_the_override() {
+        let lines = managed_refusal_lines(
+            Path::new(PACKAGED),
+            &Managed::System(deb()),
+            false,
+            "linux",
+            "aarch64",
+        )
+        .join("\n");
+        assert!(
+            lines.contains("REFUSED, this copy is managed by apt (the .deb package `innerwarden`)"),
+            "{lines}"
+        );
+        assert!(
+            lines.contains("sudo apt install ./innerwarden_arm64.deb"),
+            "{lines}"
+        );
+        assert!(lines.contains("sudo innerwarden upgrade --yes"), "{lines}");
+        assert!(!lines.contains("npm"), "nothing here is npm's: {lines}");
+    }
+
+    /// npm's refusal reads as it did; `tests/upgrade_npm_guard.rs` pins the
+    /// same words from outside, through the real binary.
+    #[test]
+    fn the_refusal_for_npm_still_names_npm_and_its_override() {
+        let p = Path::new("/usr/local/lib/node_modules/innerwarden/bin/innerwarden");
+        let lines =
+            managed_refusal_lines(p, &managed_by(p, None), false, "linux", "x86_64").join("\n");
+        assert!(
+            lines.contains("REFUSED, this copy is managed by npm."),
+            "{lines}"
+        );
+        assert!(
+            lines.contains("npm install -g innerwarden@latest"),
+            "{lines}"
+        );
+        assert!(lines.contains("innerwarden upgrade --yes"), "{lines}");
+    }
+
+    /// `uninstall` leaves a packaged binary to its package manager even when
+    /// it could unlink it, which as root it can.
+    ///
+    /// FAILS ON REVERT: classify the packaged copy by writability alone and
+    /// `sudo innerwarden uninstall` deletes dpkg's file.
+    #[test]
+    fn a_packaged_binary_is_left_to_its_package_manager_even_as_root() {
+        for (owner, remove) in [
+            (deb(), "sudo apt remove innerwarden"),
+            (rpm(), "sudo dnf remove innerwarden"),
+        ] {
+            let plan = plan_binary_removal(&Managed::System(owner.clone()), true);
+            assert_eq!(plan, BinaryRemoval::LeaveToPackage(owner));
+            let (lines, left) = binary_removal_lines(&plan, Path::new(PACKAGED));
+            let text = lines.join("\n");
+            assert!(text.contains(remove), "{text}");
+            assert!(!text.contains("rm "), "{text}");
+            assert!(left, "the binary is still there when we finish: {text}");
+        }
+    }
+
+    /// `dpkg-query -S` names the owner of exactly this path, and nothing else
+    /// it prints counts as ownership.
+    #[test]
+    fn dpkg_query_output_names_the_owner_of_exactly_this_path() {
+        let t = Path::new(PACKAGED);
+        assert_eq!(
+            dpkg_owner("innerwarden: /usr/bin/innerwarden\n", t).as_deref(),
+            Some("innerwarden")
+        );
+        assert_eq!(
+            dpkg_owner("innerwarden:amd64: /usr/bin/innerwarden\n", t).as_deref(),
+            Some("innerwarden"),
+            "a multi-arch name carries its architecture after a colon"
+        );
+        assert_eq!(
+            dpkg_owner("first, second: /usr/bin/innerwarden\n", t).as_deref(),
+            Some("first")
+        );
+        assert_eq!(
+            dpkg_owner(
+                "diversion by other from: /usr/bin/innerwarden\n\
+                 diversion by other to: /usr/bin/innerwarden.real\n",
+                t
+            ),
+            None,
+            "a diversion is not ownership"
+        );
+        assert_eq!(dpkg_owner("other: /usr/bin/innerwarden-ctl\n", t), None);
+        assert_eq!(dpkg_owner("", t), None);
+    }
+
+    /// `rpm -qf` prints a name on success; its "not owned" sentence is not one.
+    #[test]
+    fn rpm_query_output_is_a_name_or_nothing() {
+        assert_eq!(rpm_owner("innerwarden\n").as_deref(), Some("innerwarden"));
+        assert_eq!(
+            rpm_owner("file /usr/bin/innerwarden is not owned by any package\n"),
+            None
+        );
+        assert_eq!(rpm_owner(""), None);
+    }
+
+    /// The names the shell installer lays beside the binary, whichever of
+    /// them the binary was run as.
+    #[test]
+    fn the_names_beside_a_unix_binary_are_its_shortcuts() {
+        assert_eq!(
+            siblings_named(Path::new("/h/.local/bin/innerwarden"), ""),
+            vec![
+                PathBuf::from("/h/.local/bin/iw"),
+                PathBuf::from("/h/.local/bin/iw-guard")
+            ]
+        );
+        assert_eq!(
+            siblings_named(Path::new("/h/.local/bin/iw"), ""),
+            vec![
+                PathBuf::from("/h/.local/bin/iw-guard"),
+                PathBuf::from("/h/.local/bin/innerwarden")
+            ]
+        );
+    }
+
+    fn link(path: &str, to: Option<&str>) -> AliasFact {
+        AliasFact {
+            path: PathBuf::from(path),
+            entry: AliasEntry::Link {
+                resolves_to: to.map(PathBuf::from),
+            },
+        }
+    }
+
+    fn file(path: &str, same_bytes: bool) -> AliasFact {
+        AliasFact {
+            path: PathBuf::from(path),
+            entry: AliasEntry::File { same_bytes },
+        }
+    }
+
+    /// REGRESSION ANCHOR. `uninstall` removed the binary and left `iw` and
+    /// `iw-guard` as links to a file that no longer existed. The installer's
+    /// links, and its copies where a link could not be made, go with it.
+    ///
+    /// FAILS ON REVERT: an empty plan, which is what uninstall did.
+    #[test]
+    fn the_shortcuts_that_are_this_binary_go_with_it() {
+        let exe = "/h/.local/bin/innerwarden";
+        let plan = plan_alias_removal(
+            &[
+                link("/h/.local/bin/iw", Some(exe)),
+                file("/h/.local/bin/iw-guard", true),
+            ],
+            Path::new(exe),
+        );
+        assert_eq!(
+            plan.remove,
+            vec![
+                PathBuf::from("/h/.local/bin/iw"),
+                PathBuf::from("/h/.local/bin/iw-guard")
+            ]
+        );
+        assert!(plan.keep.is_empty(), "{:?}", plan.keep);
+    }
+
+    /// Never unlink a name that is somebody else's: a link to another program,
+    /// a link to nothing, a file with other bytes (another tool's `iw`, or an
+    /// older copy), or something that could not be read. Each is kept and says
+    /// why. And the binary is never its own alias.
+    ///
+    /// FAILS ON REVERT: remove every installed name that exists, and each of
+    /// these lands in `remove`.
+    #[test]
+    fn a_name_that_is_not_this_binary_is_left_where_it_is() {
+        let exe = "/h/.local/bin/innerwarden";
+        let facts = [
+            link("/h/.local/bin/iw", Some("/opt/other/bin/iw")),
+            link("/h/a/iw-guard", None),
+            file("/h/b/iw", false),
+            AliasFact {
+                path: PathBuf::from("/h/c/iw-guard"),
+                entry: AliasEntry::Unreadable,
+            },
+            file(exe, true),
+        ];
+        let plan = plan_alias_removal(&facts, Path::new(exe));
+        assert!(plan.remove.is_empty(), "{:?}", plan.remove);
+        let reasons: Vec<(&str, &str)> = plan
+            .keep
+            .iter()
+            .map(|(p, why)| (p.to_str().unwrap(), *why))
+            .collect();
+        assert_eq!(
+            reasons,
+            vec![
+                ("/h/.local/bin/iw", "it links to another program"),
+                ("/h/a/iw-guard", "it links to nothing that exists"),
+                (
+                    "/h/b/iw",
+                    "it is a different file, another program or an older copy"
+                ),
+                ("/h/c/iw-guard", "it could not be read"),
+            ]
+        );
     }
 }

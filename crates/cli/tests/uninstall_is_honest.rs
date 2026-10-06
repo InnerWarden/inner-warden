@@ -230,3 +230,165 @@ fn dry_run_previews_the_same_verdict_and_changes_nothing() {
         "--dry-run must not remove anything:\n{said}"
     );
 }
+
+// ── the shortcuts the installer lays beside the binary (todo P23) ────────────
+
+/// A direct install laid the way the shell installer lays it: the binary, and
+/// `iw` and `iw-guard` beside it as the relative links `ln -sf innerwarden`
+/// makes.
+#[cfg(unix)]
+fn as_an_installer_layout(root: &Path) -> PathBuf {
+    let exe = as_a_direct_install(root);
+    let dir = exe.parent().expect("the binary has a directory");
+    for alias in ["iw", "iw-guard"] {
+        std::os::unix::fs::symlink(exe.file_name().expect("a name"), dir.join(alias))
+            .expect("link a shortcut");
+    }
+    exe
+}
+
+/// Is anything at this path, a dangling link included?
+#[cfg(unix)]
+fn present(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
+}
+
+/// REGRESSION ANCHOR. `uninstall` removed the one file it ran from and left
+/// `iw` and `iw-guard` behind, two links to a file that no longer existed, and
+/// said "removed" over them.
+///
+/// FAILS ON REVERT: drop the shortcut removal from `cmd_uninstall_self` and
+/// both links are still present after a run that exits 0.
+#[cfg(unix)]
+#[test]
+fn the_installers_shortcuts_go_with_the_binary() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let home = tempfile::tempdir().expect("home");
+    seed_home(home.path());
+    let exe = as_an_installer_layout(root.path());
+    let dir = exe.parent().unwrap().to_path_buf();
+
+    let out = run_uninstall(&exe, home.path(), &[]);
+    let said = text(&out);
+
+    assert_eq!(out.status.code(), Some(0), "{said}");
+    for path in [exe.clone(), dir.join("iw"), dir.join("iw-guard")] {
+        assert!(
+            !present(&path),
+            "{} must go with the binary:\n{said}",
+            path.display()
+        );
+    }
+    assert!(said.contains("alias   : removed"), "{said}");
+}
+
+/// macOS reports the path a program was started by, so `iw uninstall` saw the
+/// `iw` link as the binary: it unlinked the link, said "removed", and left
+/// `innerwarden` and `iw-guard` on the machine. The binary removed is the file
+/// the link leads to. (Linux reports the resolved file already; this pins it
+/// on both.)
+///
+/// FAILS ON REVERT (macOS): use `current_exe` unresolved and `innerwarden` is
+/// removed as a copy while `iw-guard` is kept as a link to "another program".
+#[cfg(unix)]
+#[test]
+fn uninstalling_through_a_shortcut_removes_the_binary_it_leads_to() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let home = tempfile::tempdir().expect("home");
+    seed_home(home.path());
+    let exe = as_an_installer_layout(root.path());
+    let dir = exe.parent().unwrap().to_path_buf();
+
+    let out = run_uninstall(&dir.join("iw"), home.path(), &[]);
+    let said = text(&out);
+
+    assert_eq!(out.status.code(), Some(0), "{said}");
+    for path in [exe.clone(), dir.join("iw"), dir.join("iw-guard")] {
+        assert!(
+            !present(&path),
+            "{} must be gone after `iw uninstall`:\n{said}",
+            path.display()
+        );
+    }
+}
+
+/// A name the installer would use, carrying something that is not this
+/// binary, is somebody else's: a link to another program, or a file with other
+/// bytes. Both are left exactly as they were, and the run says why.
+///
+/// FAILS ON REVERT: remove every installed name that exists, and the other
+/// program's link and the unrelated file are gone.
+#[cfg(unix)]
+#[test]
+fn a_shortcut_name_that_is_another_program_is_left_alone() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let home = tempfile::tempdir().expect("home");
+    seed_home(home.path());
+    let exe = as_a_direct_install(root.path());
+    let dir = exe.parent().unwrap().to_path_buf();
+
+    let other_dir = root.path().join("opt").join("other").join("bin");
+    std::fs::create_dir_all(&other_dir).expect("another tool's dir");
+    let other = other_dir.join("iw");
+    std::fs::write(&other, b"#!/bin/sh\necho another tool\n").expect("another tool");
+    std::os::unix::fs::symlink(&other, dir.join("iw")).expect("its link");
+    std::fs::write(dir.join("iw-guard"), b"not innerwarden").expect("an unrelated file");
+
+    let out = run_uninstall(&exe, home.path(), &[]);
+    let said = text(&out);
+
+    assert!(
+        !present(&exe),
+        "the binary itself is still removed:\n{said}"
+    );
+    assert_eq!(
+        std::fs::read_link(dir.join("iw")).expect("the link is still there"),
+        other,
+        "{said}"
+    );
+    assert_eq!(
+        std::fs::read(&other).expect("the other program is untouched"),
+        b"#!/bin/sh\necho another tool\n"
+    );
+    assert_eq!(
+        std::fs::read(dir.join("iw-guard")).expect("the file is still there"),
+        b"not innerwarden"
+    );
+    assert!(said.contains("it links to another program"), "{said}");
+    assert!(
+        said.contains("it is a different file, another program or an older copy"),
+        "{said}"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "nothing of InnerWarden's is left, so this is a clean uninstall:\n{said}"
+    );
+}
+
+/// `--dry-run` names the shortcuts the run will remove, and removes nothing.
+#[cfg(unix)]
+#[test]
+fn dry_run_names_the_shortcuts_and_removes_nothing() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let home = tempfile::tempdir().expect("home");
+    seed_home(home.path());
+    let exe = as_an_installer_layout(root.path());
+    let dir = exe.parent().unwrap().to_path_buf();
+    // The run prints resolved paths (a macOS tempdir sits behind /var -> /private/var).
+    let resolved = std::fs::canonicalize(&dir).expect("resolve the dir");
+
+    let said = text(&run_uninstall(&exe, home.path(), &["--dry-run"]));
+
+    for alias in ["iw", "iw-guard"] {
+        assert!(
+            said.contains(&format!("alias   : {}", resolved.join(alias).display())),
+            "the preview must name {alias}:\n{said}"
+        );
+        assert!(
+            present(&dir.join(alias)),
+            "--dry-run removed {alias}:\n{said}"
+        );
+    }
+    assert!(exe.exists(), "--dry-run removed the binary:\n{said}");
+}

@@ -108,6 +108,16 @@ each of the seven packages, pointing at `InnerWarden/inner-warden` +
 - `.github/workflows/linux-packages.yml` rebuilds from the release binaries,
   **test-installs** the `.deb` on Ubuntu and the `.rpm` in a Rocky Linux
   container (`innerwarden --version`), and uploads the packages as artifacts.
+- A packaged copy belongs to its package manager. The binary asks dpkg
+  (`dpkg-query -S`) and rpm (`rpm -qf`) whether they record the file it runs
+  from: when one does, `innerwarden upgrade` refuses (as it does for npm) and
+  prints the commands that install the fixed-name package from the rolling
+  release, `upgrade --check` names those commands instead of `innerwarden
+  upgrade`, and `innerwarden uninstall` leaves the file
+  to `sudo apt remove innerwarden` / `sudo dnf remove innerwarden`. Replacing
+  or deleting it by hand would leave the package database recording a file
+  that is no longer it. If the fixed-name assets or the package name change,
+  `crates/cli/src/upgrade_plan.rs` (`upgrade_commands`) changes with them.
 
 ### Publishing a new version
 
