@@ -17,8 +17,8 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::observe::{
-    agent_field, attempt_line, bounded_field, dangerous, guard_block_since,
-    needs_block_correlation, outcome, redact_and_bound, signal_names, Decider, Departure, Leaving,
+    agent_field, asks_for_a_miner, attempt_line, bounded_field, guard_block_since,
+    needs_block_correlation, outcome, redact_and_bound, AskFindings, Decider, Departure, Leaving,
     NoReply, Pending, PendingAsk, MAX_ASK_CHARS, PENDING_TTL_SECONDS,
     UNREPORTED_REPLY_WAIT_SECONDS,
 };
@@ -252,7 +252,7 @@ fn sink_tail(dir: &Path) -> String {
 // ── inbound ──────────────────────────────────────────────────────────────────
 
 /// `innerwarden observe inbound` - score the user text and remember it if the
-/// guard's own rule engine calls it dangerous.
+/// guard's rules call it dangerous, or it asks for a cryptominer in plain words.
 ///
 /// Nothing is recorded for the new ask here while it can be held: the record
 /// is written when the outcome is known, so one attempt produces one line
@@ -299,24 +299,32 @@ fn cmd_inbound(rest: &[String]) -> std::process::ExitCode {
     std::process::ExitCode::SUCCESS
 }
 
-/// The ask to hold, when the guard's own rule engine calls the text dangerous.
+/// The ask to hold, when the text is dangerous by any of the three readings
+/// (`AskFindings`).
 fn scored_ask(rest: &[String], session: &str, text: &str, at: u64) -> Option<PendingAsk> {
     // Shell surface for the structural analyzer, LLM surface for the ATR
-    // prompt-injection rules. A conversation carries both shapes.
+    // prompt-injection rules, and the plain-language reading for a request
+    // neither covers. A conversation carries all three shapes.
     let shell = RuleEngine::load_embedded_for(AtrSource::ShellCommand);
     let analysis = analyze_command(text, Some(&shell));
     let injection = RuleEngine::load_embedded_for(AtrSource::LlmIo).check_user_input(text);
-    if !dangerous(&analysis, &injection) {
+    let findings = AskFindings {
+        analysis: &analysis,
+        injection: &injection,
+        mining_request: asks_for_a_miner(text),
+    };
+    if !findings.dangerous() {
         return None;
     }
+    let (recommendation, risk_score) = findings.risk();
     Some(PendingAsk {
         session: session.to_string(),
         channel: bounded_field(&flag(rest, "--channel").unwrap_or_default(), 64),
         sender: bounded_field(&flag(rest, "--sender").unwrap_or_default(), 64),
         ask: redact_and_bound(text, MAX_ASK_CHARS),
-        recommendation: analysis.recommendation.clone(),
-        risk_score: analysis.risk_score,
-        signals: signal_names(&analysis, &injection),
+        recommendation: recommendation.to_string(),
+        risk_score,
+        signals: findings.signals(),
         asked_at: at,
         agent: agent_field(flag(rest, "--agent").as_deref()),
     })

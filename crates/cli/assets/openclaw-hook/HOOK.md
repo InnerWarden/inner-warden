@@ -15,9 +15,10 @@ metadata:
 # InnerWarden conversation attempts
 
 Sends the inbound message text and the outbound reply notice to
-`innerwarden observe`, which scores the ask with the free guard's own rule
-engine and, when it is dangerous, appends one `guard.attempt` record to
-`guard-events.jsonl`.
+`innerwarden observe`, which scores the ask with the free guard's own rules
+(the command rules, the prompt-injection rules, and a short plain-language
+list for a cryptominer request) and, when it is dangerous, appends one
+`guard.attempt` record to `guard-events.jsonl`.
 
 ## Why this exists
 
@@ -38,6 +39,7 @@ actually refused the action.
 ## What it records
 
 - the ask, redacted through the guard's redaction path and bounded
+- the rules' recommendation and risk score, and the signals that fired
 - who decided: `model_refused`, `guard_denied`, `kernel_denied` or `undetermined`
 - what that conclusion rests on (`decider_basis`)
 - the timestamp, the channel the message arrived on, and the agent (`openclaw`)

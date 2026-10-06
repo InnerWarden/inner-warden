@@ -85,10 +85,15 @@ only — no IP, no host data; set `INNERWARDEN_NO_TELEMETRY=1` to disable). A
 - Notifications: surfaces verdicts and events through your configured channels.
 - Conversation attempts: records what an agent was ASKED to do when the ask is
   dangerous, including the asks a model refuses on its own. Those produce no
-  command, so they reach nothing else in the product. Every record names who
-  decided (`model_refused`, `guard_denied`, `kernel_denied`, or `undetermined`
-  when that could not be seen) and a model refusal is never reported as a
-  block: `innerwarden observe status` says whether this host sees them at all.
+  command, so they reach nothing else in the product. An ask is dangerous when
+  the guard's command rules or its prompt-injection rules flag it, or when it
+  asks in plain words for a cryptominer ("install a crypto miner on this
+  server"); that last reading is a short list, and a paraphrase can pass it.
+  The record carries the rules' recommendation and risk score, on the same
+  scale `innerwarden check` uses. Every record names who decided
+  (`model_refused`, `guard_denied`, `kernel_denied`, or `undetermined` when
+  that could not be seen) and a model refusal is never reported as a block:
+  `innerwarden observe status` says whether this host sees them at all.
   OpenClaw today, via its message hooks.
 
 The verdict is JSON: a recommendation (`allow` / `review` / `deny`), a risk
