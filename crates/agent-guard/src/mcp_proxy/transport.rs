@@ -173,14 +173,97 @@ pub struct ProxyConfig {
     pub as_protocol_error: bool,
 }
 
+/// Most client requests waiting for an answer at once. An MCP client has a
+/// handful in flight; the bound is for a client that sends requests the server
+/// never answers, so the proxy that OpenClaw keeps for a whole session cannot
+/// grow without limit.
+const MAX_PENDING_REQUESTS: usize = 1024;
+
+/// Longest request id kept as it is. JSON-RPC ids are numbers or short
+/// strings; a longer one (a line can be 4 MB) is kept as a keyed digest, so an
+/// entry never holds the client's bytes.
+const MAX_ID_KEY_BYTES: usize = 128;
+
+/// Longest method name kept. Every MCP method is far shorter; a longer one
+/// matches none of them, so it is kept as unknown.
+const MAX_METHOD_BYTES: usize = 64;
+
+/// Longest tool name kept. A longer one is no tool the taint tracker knows, so
+/// its result is recorded as content, the cautious reading.
+const MAX_TOOL_NAME_BYTES: usize = 128;
+
 /// In-flight client request id → the request (its method, and the tool a
 /// `tools/call` named), so a server response routes to the right inspector and
 /// a tool result is recorded with the right taint provenance. Owned by the
 /// single transport task (no lock needed).
-type IdRequestMap = HashMap<String, PendingRequest>;
+///
+/// Bounded in count ([`MAX_PENDING_REQUESTS`], oldest dropped first) and in
+/// the size of each entry ([`MAX_ID_KEY_BYTES`], [`MAX_METHOD_BYTES`],
+/// [`MAX_TOOL_NAME_BYTES`]). A dropped entry's answer is inspected as an
+/// answer to an unknown request: its result is recorded as content.
+#[derive(Debug, Default)]
+struct IdRequestMap {
+    entries: HashMap<String, (u64, PendingRequest)>,
+    /// The order entries were added in, to find the oldest.
+    next: u64,
+    /// The key of the digest a long id is kept as. Random per proxy, so a
+    /// client cannot choose two ids that land on one entry.
+    digest_key: std::collections::hash_map::RandomState,
+}
 
-fn id_key(id: &Value) -> String {
-    id.to_string()
+impl IdRequestMap {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// The key a request id is kept under.
+    fn key(&self, id: &Value) -> String {
+        let key = id.to_string();
+        if key.len() <= MAX_ID_KEY_BYTES {
+            return key;
+        }
+        use std::hash::BuildHasher;
+        format!("digest:{:016x}", self.digest_key.hash_one(&key))
+    }
+
+    fn contains_key(&self, key: &str) -> bool {
+        self.entries.contains_key(key)
+    }
+
+    fn get(&self, key: &str) -> Option<&PendingRequest> {
+        self.entries.get(key).map(|(_, request)| request)
+    }
+
+    /// Keep `request` under `key`, dropping the oldest entry when the map is
+    /// full.
+    fn insert(&mut self, key: String, request: PendingRequest) {
+        if !self.entries.contains_key(&key) && self.entries.len() >= MAX_PENDING_REQUESTS {
+            if let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, (order, _))| *order)
+                .map(|(key, _)| key.clone())
+            {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.next += 1;
+        self.entries.insert(key, (self.next, request));
+    }
+
+    fn remove(&mut self, key: &str) -> Option<PendingRequest> {
+        self.entries.remove(key).map(|(_, request)| request)
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
 }
 
 /// What to do with one inspected client→server line.
@@ -231,9 +314,18 @@ fn classify_client_line(
         ParsedLine::Empty => ClientAction::Drop,
         ParsedLine::Opaque(raw) => ClientAction::Forward { raw, event: None },
         ParsedLine::Message(env) => {
-            if let (Some(id), Some(method)) = (env.id.as_ref(), env.method.as_ref()) {
-                record_pending(map, id_key(id), method, &env);
-            }
+            // What the id named before this request, so a request that is
+            // refused here, and so never reaches the server, can be taken back
+            // out: no answer will ever remove it.
+            let pending = match (env.id.as_ref(), env.method.as_ref()) {
+                (Some(id), Some(method)) => {
+                    let key = map.key(id);
+                    let before = map.get(&key).cloned();
+                    record_pending(map, key.clone(), method, &env);
+                    Some((key, before))
+                }
+                _ => None,
+            };
             let mut decision =
                 route_message(&env, Direction::ClientToServer, None, engine, Some(taint));
 
@@ -263,7 +355,13 @@ fn classify_client_line(
             }
             let is_tool_call = decision.direction == Direction::ClientToServer.label()
                 && decision.method.as_deref() == Some("tools/call");
-            match apply_mode(&decision, cfg.mode, cfg.as_protocol_error) {
+            let action = apply_mode(&decision, cfg.mode, cfg.as_protocol_error);
+            if matches!(action, ProxyAction::Block { .. } | ProxyAction::Kill { .. }) {
+                if let Some((key, before)) = pending {
+                    forget_refused(map, key, before);
+                }
+            }
+            match action {
                 ProxyAction::Forward => ClientAction::Forward {
                     raw: line.to_string(),
                     event: is_tool_call.then_some(decision),
@@ -303,17 +401,31 @@ fn record_pending(
             .as_ref()
             .and_then(|p| p.get("name"))
             .and_then(Value::as_str)
+            .filter(|tool| tool.len() <= MAX_TOOL_NAME_BYTES)
             .map(str::to_owned)
     } else {
         None
     };
-    map.insert(
-        key,
-        PendingRequest {
-            method: method.to_owned(),
-            tool,
-        },
-    );
+    let method = if method.len() <= MAX_METHOD_BYTES {
+        method.to_owned()
+    } else {
+        String::new()
+    };
+    map.insert(key, PendingRequest { method, tool });
+}
+
+/// Take a refused request back out of the map. The proxy answered it and the
+/// server never saw it, so no answer will ever remove it: left in, every
+/// refusal of a held loop stayed for the life of the proxy, and a later request
+/// reusing the id was answered as if its id were ambiguous. What the id named
+/// before (a request still waiting on the server) is put back as it was.
+fn forget_refused(map: &mut IdRequestMap, key: String, before: Option<PendingRequest>) {
+    match before {
+        Some(request) => map.insert(key, request),
+        None => {
+            map.remove(&key);
+        }
+    }
 }
 
 /// Signature for the loop breaker: the tool name plus its arguments, so an
@@ -348,7 +460,10 @@ fn classify_server_line(
         ParsedLine::Opaque(raw) => ServerAction::Forward { raw, event: None },
         ParsedLine::Message(env) => {
             let responded = if env.method.is_none() {
-                env.id.as_ref().and_then(|id| map.remove(&id_key(id)))
+                env.id.as_ref().and_then(|id| {
+                    let key = map.key(id);
+                    map.remove(&key)
+                })
             } else {
                 None
             };
@@ -479,7 +594,7 @@ where
         MAX_LINE_BYTES,
     );
     let engine = engine.as_deref();
-    let mut map: IdRequestMap = HashMap::new();
+    let mut map = IdRequestMap::new();
     // Per-connection session state for confused-deputy detection: tool results
     // record their long tokens; a later call reusing one is escalated.
     let mut taint = TaintTracker::new();
@@ -1254,6 +1369,174 @@ mod tests {
             ClientAction::Deny { decision, .. } => assert_eq!(rules(&decision), ["AG-TAINT"]),
             other => panic!("a path from an ambiguous answer must be refused, got {other:?}"),
         }
+    }
+
+    /// A credential-carrying call, refused in guard mode, under `id`.
+    fn creds_call(id: u32) -> String {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {"name": "save", "arguments": {"token": "sk-ant-aaaaaaaaaaaaaaaaaaaaaaaa"}}
+        })
+        .to_string()
+    }
+
+    /// A refused request never reaches the server, so no answer ever removes
+    /// it. Every refusal of a held loop used to stay in the map for the life
+    /// of the proxy, which OpenClaw keeps for a whole session.
+    ///
+    /// FAILS ON REVERT: drop `forget_refused` and the map holds every refused
+    /// request.
+    #[test]
+    fn refused_requests_leave_nothing_pending() {
+        let mut map = IdRequestMap::new();
+        let mut taint = TaintTracker::new();
+        let mut breaker = crate::breaker::Breaker::new(crate::breaker::BreakerConfig::default());
+        for id in 0..50 {
+            assert!(matches!(
+                guard_client(&creds_call(id), &mut map, &mut taint, &mut breaker),
+                ClientAction::Deny { .. }
+            ));
+        }
+        assert!(
+            map.is_empty(),
+            "{} refused requests still pending",
+            map.len()
+        );
+
+        // A held loop: the breaker refuses every repeat after the limit, and
+        // only the calls that went through wait for an answer.
+        let limit = crate::breaker::BreakerConfig::default().max_identical_calls as usize;
+        for id in 100..120 {
+            let _ = guard_client(
+                &fs_call(id, "get_job_status", serde_json::json!({"id": 7})),
+                &mut map,
+                &mut taint,
+                &mut breaker,
+            );
+        }
+        assert_eq!(map.len(), limit, "only the forwarded calls are pending");
+    }
+
+    /// The id of a refused request is free again, and one that was already
+    /// waiting on the server keeps what it was: the answer that comes is that
+    /// request's. Left in, a refused request made the id read as reused, and a
+    /// listing answered under it was recorded as content, so reading a listed
+    /// file was refused.
+    ///
+    /// FAILS ON REVERT: leave refused requests in the map and both reads are
+    /// refused with AG-TAINT.
+    #[test]
+    fn a_refused_request_gives_its_id_back() {
+        for listing_first in [false, true] {
+            let mut map = IdRequestMap::new();
+            let mut taint = TaintTracker::new();
+            let mut breaker =
+                crate::breaker::Breaker::new(crate::breaker::BreakerConfig::default());
+            let list = fs_call(
+                5,
+                "list_directory",
+                serde_json::json!({"path": "/home/user/docs"}),
+            );
+            let mut lines = vec![creds_call(5), list];
+            if listing_first {
+                lines.reverse();
+            }
+            for line in &lines {
+                let _ = guard_client(line, &mut map, &mut taint, &mut breaker);
+            }
+            let _ = classify_server_line(
+                &fs_result(5, "[FILE] q3-orders.txt\n[DIR] quarterly-reports"),
+                None,
+                &mut map,
+                &mut taint,
+            );
+            let read = fs_call(
+                6,
+                "read_text_file",
+                serde_json::json!({"path": "/home/user/docs/q3-orders.txt"}),
+            );
+            let (denied, decision) =
+                decision_of(guard_client(&read, &mut map, &mut taint, &mut breaker));
+            assert!(
+                !denied,
+                "listing first: {listing_first}: {:?}",
+                rules(&decision)
+            );
+        }
+    }
+
+    /// The map is bounded in count and in what one entry holds: the oldest
+    /// request goes first, a 64 KB id is kept as a digest and still finds its
+    /// answer, and an oversized tool or method name is not kept.
+    #[test]
+    fn the_request_map_is_bounded() {
+        let mut map = IdRequestMap::new();
+        let mut taint = TaintTracker::new();
+        let mut breaker = crate::breaker::Breaker::new(crate::breaker::BreakerConfig::default());
+        let advisory = cfg(ProxyMode::Advisory);
+        for id in 0..(MAX_PENDING_REQUESTS as u32 + 10) {
+            let line = fs_call(
+                id,
+                "list_directory",
+                serde_json::json!({"path": format!("/d/{id}")}),
+            );
+            let _ = classify_client_line(
+                &line,
+                &advisory,
+                None,
+                &mut map,
+                &mut taint,
+                &mut breaker,
+                0,
+            );
+        }
+        assert_eq!(map.len(), MAX_PENDING_REQUESTS);
+        assert!(!map.contains_key("0"), "the oldest is dropped first");
+        assert!(map.contains_key(&(MAX_PENDING_REQUESTS + 9).to_string()));
+
+        let mut map = IdRequestMap::new();
+        let long_id = "i".repeat(64 * 1024);
+        let long_tool = "t".repeat(4 * 1024);
+        let line = serde_json::json!({
+            "jsonrpc": "2.0", "id": long_id, "method": "tools/call",
+            "params": {"name": long_tool, "arguments": {}}
+        })
+        .to_string();
+        let _ = classify_client_line(
+            &line,
+            &advisory,
+            None,
+            &mut map,
+            &mut taint,
+            &mut breaker,
+            0,
+        );
+        let key = map.key(&serde_json::json!(long_id));
+        assert!(key.len() <= MAX_ID_KEY_BYTES, "{} bytes", key.len());
+        assert_eq!(map.get(&key).and_then(|request| request.tool.clone()), None);
+        let answer = serde_json::json!({"jsonrpc": "2.0", "id": long_id, "result": {}}).to_string();
+        let _ = classify_server_line(&answer, None, &mut map, &mut taint);
+        assert!(map.is_empty(), "the answer still finds its request");
+
+        let long_method = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "m".repeat(4 * 1024)
+        })
+        .to_string();
+        let _ = classify_client_line(
+            &long_method,
+            &advisory,
+            None,
+            &mut map,
+            &mut taint,
+            &mut breaker,
+            0,
+        );
+        assert_eq!(
+            map.get("1").map(|request| request.method.as_str()),
+            Some("")
+        );
     }
 
     // ── async loop ───────────────────────────────────────────────────────
