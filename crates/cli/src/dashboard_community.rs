@@ -414,6 +414,12 @@ fn decider_words(decider: &str, basis: &str) -> &'static str {
         ("undetermined", "guard_block_recorded_in_window") => {
             "Outcome not seen: the guard refused an action at the same time"
         }
+        ("undetermined", "pending_limit_reached") => {
+            "Outcome not seen: too many chats were waiting for a reply at once"
+        }
+        ("undetermined", "pending_state_unavailable") => {
+            "Outcome not seen: InnerWarden could not hold the message to wait for the reply"
+        }
         ("undetermined", _) => "Outcome not seen",
         _ => "Who decided was not recorded",
     }
@@ -2194,7 +2200,7 @@ mod tests {
         );
         assert_eq!(
             words(line("undetermined", "pending_state_unavailable")),
-            "Outcome not seen"
+            "Outcome not seen: InnerWarden could not hold the message to wait for the reply"
         );
         // What the guard's sink held in the window is said as such, and the
         // worst of it, a flagged action monitor mode let run, is never
@@ -2227,6 +2233,8 @@ mod tests {
             ("undetermined", "no_reply_observed_within_ttl"),
             ("undetermined", "flagged_action_ran_in_window"),
             ("undetermined", "guard_block_recorded_in_window"),
+            ("undetermined", "pending_limit_reached"),
+            ("undetermined", "pending_state_unavailable"),
         ] {
             assert!(decider_words(decider, basis).chars().count() <= 120);
         }

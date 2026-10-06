@@ -283,12 +283,14 @@ fn cmd_inbound(rest: &[String]) -> std::process::ExitCode {
         None => Vec::new(),
     }) {
         Ok(leaving) => record(&dir, leaving, at),
-        Err(error) => {
-            eprintln!(
-                "innerwarden observe: the pending state could not be updated ({error}); \
-                 recording the ask now, with its outcome unknown"
-            );
-            if let Some(ask) = ask {
+        // Said only where it is true: an ordinary message has no ask to
+        // record.
+        Err(error) => match ask {
+            Some(ask) => {
+                eprintln!(
+                    "innerwarden observe: the pending state could not be updated ({error}); \
+                     recording the ask now, with its outcome unknown"
+                );
                 record(
                     &dir,
                     vec![Leaving {
@@ -298,7 +300,10 @@ fn cmd_inbound(rest: &[String]) -> std::process::ExitCode {
                     at,
                 );
             }
-        }
+            None => {
+                eprintln!("innerwarden observe: the pending state could not be updated ({error})")
+            }
+        },
     }
     std::process::ExitCode::SUCCESS
 }
@@ -558,6 +563,26 @@ pub(crate) fn installed() -> bool {
             .unwrap_or(false)
 }
 
+/// What `observe status` says about the pending state, from the error reading
+/// it the way every hook call does gave, if any. `None` when it reads.
+///
+/// The hook runs the CLI with its output discarded, so a pending state that
+/// cannot be read is otherwise said nowhere: every ask on every channel is
+/// then recorded the moment it arrives with its outcome unknown, a model that
+/// declined is never recorded as having declined, and nothing names the cause.
+fn pending_notice(path: &Path, read_error: Option<&str>) -> Option<String> {
+    let error = read_error?;
+    Some(format!(
+        "  The file the hook holds asks in while it waits for the reply cannot be read:\n  \
+         {error}\n  \
+         Until it can, every ask is recorded as it arrives with its outcome unknown,\n  \
+         so a refusal by your agent is never recorded as one. To fix it, remove the\n  \
+         file, or give it back to the account the gateway runs as:\n  \
+         {}",
+        path.display()
+    ))
+}
+
 /// Whether the installed handler is the one this binary ships. `observe
 /// install` writes it once and an upgrade does not touch it, so a fix to the
 /// handler reaches a host only when the operator runs install again, and
@@ -597,6 +622,13 @@ fn cmd_status() -> std::process::ExitCode {
              What it does not: it is not enforcement, and a model refusal is never a block.",
             directory.display()
         );
+        if let Some(dir) = crate::graph_io::sink_dir() {
+            let path = dir.join(PENDING_FILE);
+            let read_error = load_pending(&dir, &path).err();
+            if let Some(notice) = pending_notice(&path, read_error.as_deref()) {
+                println!("{notice}");
+            }
+        }
         let installed_handler = std::fs::read_to_string(directory.join("handler.js")).ok();
         if !hook_is_current(installed_handler.as_deref()) {
             println!(
@@ -789,6 +821,21 @@ mod tests {
         assert_eq!(recorded[0]["channel"], "webchat");
         let (left, _) = load_pending(dir.path(), &dir.path().join(PENDING_FILE)).expect("readable");
         assert!(left.asks.is_empty(), "taken out of the pending state");
+    }
+
+    /// A pending state that cannot be read is said in status, with the file
+    /// and what to do, and nothing is said when it reads.
+    #[test]
+    fn status_names_a_pending_state_it_cannot_read() {
+        let path = Path::new("/var/lib/innerwarden/guard/observe-pending.json");
+        assert_eq!(pending_notice(path, None), None);
+        let notice = pending_notice(path, Some("permission denied")).expect("a notice");
+        assert!(notice.contains("permission denied"), "{notice}");
+        assert!(notice.contains("outcome unknown"), "{notice}");
+        assert!(
+            notice.contains("/var/lib/innerwarden/guard/observe-pending.json"),
+            "{notice}"
+        );
     }
 
     /// The handler's settle timer and agent name are the CLI's to agree with.

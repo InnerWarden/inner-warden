@@ -644,6 +644,50 @@ fn status_names_a_hook_older_than_the_binary() {
     assert!(stale.contains("observe install"), "{stale}");
 }
 
+/// A pending state the hook cannot read sends every ask straight to the sink
+/// with its outcome unknown, and the hook discards the CLI's output, so status
+/// is where that has to be said, with the file and the fix.
+///
+/// FAILS ON REVERT: drop the pending probe from status and the planted link
+/// goes unmentioned while status reports the surface as working.
+#[cfg(unix)]
+#[test]
+fn status_names_a_pending_state_the_hook_cannot_read() {
+    let dir = tempfile::TempDir::new().expect("scratch dir");
+    let config = dir.path().join(".openclaw/openclaw.json");
+    std::fs::create_dir_all(config.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&config, "{}").expect("write config");
+    let graph = dir.path().join("record/graph.json");
+    std::fs::create_dir_all(graph.parent().expect("record dir")).expect("mkdir");
+    let run = |args: &[&str]| {
+        let out = Command::new(bin())
+            .args(args)
+            .env("HOME", dir.path())
+            .env("USERPROFILE", dir.path())
+            .env("IW_GRAPH_FILE", &graph)
+            .output()
+            .expect("run innerwarden");
+        assert_eq!(out.status.code(), Some(0), "{args:?}");
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+    run(&[
+        "observe",
+        "install",
+        "--home",
+        &dir.path().display().to_string(),
+    ]);
+    let healthy = run(&["observe", "status"]);
+    assert!(healthy.contains("ARE observed"), "{healthy}");
+    assert!(!healthy.contains("cannot be read"), "{healthy}");
+
+    let pending = dir.path().join("record/observe-pending.json");
+    std::os::unix::fs::symlink(dir.path().join("elsewhere"), &pending).expect("plant link");
+    let broken = run(&["observe", "status"]);
+    assert!(broken.contains("cannot be read"), "{broken}");
+    assert!(broken.contains("outcome unknown"), "{broken}");
+    assert!(broken.contains(&pending.display().to_string()), "{broken}");
+}
+
 /// Wiring OpenClaw is one command, and it must leave the rest of a config that
 /// holds auth profiles and channel tokens exactly as it found it.
 #[test]
