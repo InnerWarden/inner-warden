@@ -3884,25 +3884,66 @@ fn tee_write_targets(words: &[String]) -> Vec<String> {
     targets
 }
 
+/// A file the shell analyzer refuses to see a command overwrite, compared
+/// with the target as the command spells it, after [`normalize_command_target`]
+/// and in lowercase.
+#[derive(Clone, Copy)]
+enum ShellAuthTarget {
+    /// This path below any directory: the path itself, or any path ending in
+    /// `/` and it.
+    Named(&'static str),
+    /// This file.
+    File(&'static str),
+    /// Anything under this directory.
+    Under(&'static str),
+    /// Any path with a directory of this name in it.
+    InDirectory(&'static str),
+}
+
+/// What [`is_authentication_write_target`] refuses: login keys, the account
+/// database, the sudo rules, the SSH server's settings and stored keys. Kept
+/// as a list so the MCP surface's [`PRIVILEGED_WRITE_TARGETS`] can be held to
+/// hold every one of them, entry by entry.
+const AUTHENTICATION_WRITE_TARGETS: &[ShellAuthTarget] = &[
+    ShellAuthTarget::Named(".ssh/id_rsa"),
+    ShellAuthTarget::Named(".ssh/id_ed25519"),
+    ShellAuthTarget::Named(".ssh/id_ecdsa"),
+    ShellAuthTarget::Named(".ssh/id_dsa"),
+    ShellAuthTarget::Named(".ssh/authorized_keys"),
+    ShellAuthTarget::Named(".git-credentials"),
+    ShellAuthTarget::File("/etc/shadow"),
+    ShellAuthTarget::File("/etc/gshadow"),
+    ShellAuthTarget::File("/etc/sudoers"),
+    ShellAuthTarget::Under("/etc/sudoers.d"),
+    ShellAuthTarget::Under("/etc/ssh"),
+    ShellAuthTarget::InDirectory(".gnupg"),
+];
+
+impl ShellAuthTarget {
+    fn holds(self, target: &str) -> bool {
+        match self {
+            ShellAuthTarget::Named(path) => {
+                target == path
+                    || target
+                        .strip_suffix(path)
+                        .is_some_and(|rest| rest.ends_with('/'))
+            }
+            ShellAuthTarget::File(file) => target == file,
+            ShellAuthTarget::Under(dir) => target
+                .strip_prefix(dir)
+                .is_some_and(|rest| rest.starts_with('/')),
+            ShellAuthTarget::InDirectory(name) => target.match_indices(name).any(|(at, _)| {
+                target[..at].ends_with('/') && target[at + name.len()..].starts_with('/')
+            }),
+        }
+    }
+}
+
 fn is_authentication_write_target(target: &str) -> bool {
     let target = normalize_command_target(target).to_ascii_lowercase();
-    let authentication = [
-        ".ssh/id_rsa",
-        ".ssh/id_ed25519",
-        ".ssh/id_ecdsa",
-        ".ssh/id_dsa",
-        ".ssh/authorized_keys",
-        ".git-credentials",
-    ];
-    authentication
+    AUTHENTICATION_WRITE_TARGETS
         .iter()
-        .any(|path| target == *path || target.ends_with(&format!("/{path}")))
-        || target == "/etc/shadow"
-        || target == "/etc/gshadow"
-        || target == "/etc/sudoers"
-        || target.starts_with("/etc/sudoers.d/")
-        || target.starts_with("/etc/ssh/")
-        || target.contains("/.gnupg/")
+        .any(|entry| entry.holds(&target))
 }
 
 fn is_sensitive_download_target(target: &str) -> bool {
@@ -3989,7 +4030,7 @@ const fn group(what: &'static str, places: &'static [Place]) -> PrivilegedGroup 
 /// modules and settings (T1547.006), package manager hooks (T1546.016), the
 /// programs root runs (T1574), and the guard's own configuration and the
 /// agent settings that load it (T1562.001). It holds every file the shell
-/// analyzer refuses to see overwritten ([`is_authentication_write_target`]),
+/// analyzer refuses to see overwritten ([`AUTHENTICATION_WRITE_TARGETS`]),
 /// every agent configuration the guard wires ([`crate::agents::KNOWN`]) and
 /// every path of [`INNERWARDEN_SELF_PATHS`].
 ///
@@ -7998,7 +8039,10 @@ mod family_gate_tests {
 
 #[cfg(test)]
 mod privileged_write_target_tests {
-    use super::{is_authentication_write_target, privileged_write_target, INNERWARDEN_SELF_PATHS};
+    use super::{
+        is_authentication_write_target, privileged_write_target, ShellAuthTarget,
+        AUTHENTICATION_WRITE_TARGETS, INNERWARDEN_SELF_PATHS,
+    };
 
     const SUDO: &str = "the sudo rules, which decide who may run commands as root";
     const GUARD: &str = "the guard's own configuration, or the agent settings that load it";
@@ -8290,28 +8334,32 @@ mod privileged_write_target_tests {
         }
     }
 
+    /// One path each entry of the shell analyzer's list refuses.
+    fn example(entry: ShellAuthTarget) -> String {
+        match entry {
+            ShellAuthTarget::Named(path) => format!("/home/dev/{path}"),
+            ShellAuthTarget::File(file) => file.to_string(),
+            ShellAuthTarget::Under(dir) => format!("{dir}/agent"),
+            ShellAuthTarget::InDirectory(name) => format!("/home/dev/{name}/key"),
+        }
+    }
+
     /// The doc comment says every file the shell analyzer refuses to see
-    /// overwritten is on this list. Held here, so the two cannot drift: a
-    /// write the shell refuses is not let through on the MCP surface.
+    /// overwritten is on this list. Held here entry by entry, read from the
+    /// shell analyzer's own list, so the two cannot drift: a write the shell
+    /// refuses is not let through on the MCP surface.
     #[test]
     fn every_file_the_shell_refuses_to_overwrite_is_on_the_list() {
-        for path in [
-            "/home/dev/.ssh/id_rsa",
-            "/home/dev/.ssh/id_ed25519",
-            "/home/dev/.ssh/id_ecdsa",
-            "/home/dev/.ssh/id_dsa",
-            "/home/dev/.ssh/authorized_keys",
-            "/root/.ssh/authorized_keys",
-            "/home/dev/.git-credentials",
-            "/etc/shadow",
-            "/etc/gshadow",
-            "/etc/sudoers",
-            "/etc/sudoers.d/agent",
-            "/etc/ssh/sshd_config",
-            "/home/dev/.gnupg/private-keys-v1.d/key",
-        ] {
-            assert!(is_authentication_write_target(path), "{path}");
-            assert!(privileged_write_target(path).is_some(), "{path}");
+        assert!(AUTHENTICATION_WRITE_TARGETS.len() >= 12);
+        for entry in AUTHENTICATION_WRITE_TARGETS {
+            let path = example(*entry);
+            assert!(is_authentication_write_target(&path), "{path}");
+            assert!(privileged_write_target(&path).is_some(), "{path}");
         }
+        assert!(is_authentication_write_target(".ssh/authorized_keys"));
+        assert!(is_authentication_write_target("/root/.ssh/id_ed25519"));
+        assert!(!is_authentication_write_target("/home/dev/my.ssh/id_rsa"));
+        assert!(!is_authentication_write_target("/etc/sudoers.bak"));
+        assert!(!is_authentication_write_target("/home/dev/.gnupg"));
     }
 }
