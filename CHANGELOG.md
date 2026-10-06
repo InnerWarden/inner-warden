@@ -53,6 +53,18 @@ follows semantic versioning.
   `innerwarden graph` and the dashboard with the fix, instead of dropping lines
   silently.
 
+### Fixed
+
+- **A held lock no longer holds back the hook's verdict.** The hook records
+  each decision before it answers, and one of the locks that write takes was
+  waited for with no time limit, so any account able to open that lock (the
+  guarded agent's own included) could keep the hook from answering at all.
+  Every lock the record takes is now waited for at most 100 ms: the verdict is
+  returned as normal, and the skipped record is reported as a recording
+  outage, `graph_lock_timeout`. Agent configuration writes give up after 2 s
+  and say which lock was held. `innerwarden observe` gives up after 1 s, and
+  an ask it could not hold is recorded at once with its outcome unknown.
+
 ## 1.5.1 - 2026-09-30
 
 ### Fixed

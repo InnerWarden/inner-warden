@@ -10,6 +10,7 @@
 //! inside a chat gateway, and a telemetry surface that can fail a turn is worse
 //! than no telemetry surface.
 
+use innerwarden_agent_guard::file_update::ReplaceError;
 use innerwarden_agent_guard::mcp::analyze_command;
 use innerwarden_agent_guard::rules::{AtrSource, RuleEngine};
 use serde_json::Value;
@@ -44,6 +45,17 @@ const PENDING_FILE: &str = "observe-pending.json";
 /// (every message event is dispatched without waiting for the last), and a
 /// lost compare-and-swap used to be skipped, which lost the ask it carried.
 const PENDING_UPDATE_ATTEMPTS: usize = 4;
+
+/// How long one save of the pending state waits for another writer that holds
+/// its update lock.
+///
+/// A real writer is another hook call, which holds it for one small write.
+/// Anyone else who can open the lock beside the shared record (the agent's
+/// own account included) could hold it for as long as they liked, and the
+/// save waited the whole time, until the OpenClaw hook killed the call at its
+/// 4 s cap with the ask it carried unrecorded. Bounded well under that cap, a
+/// held lock costs one wait and the ask is still recorded.
+const PENDING_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 
 const HOOK_DOC: &str = include_str!("../assets/openclaw-hook/HOOK.md");
 const HOOK_HANDLER: &str = include_str!("../assets/openclaw-hook/handler.js");
@@ -154,12 +166,13 @@ fn save_pending(
     path: &Path,
     state: &Pending,
     expected: Option<&[u8]>,
-) -> Result<(), String> {
+) -> Result<(), ReplaceError> {
     innerwarden_agent_guard::file_update::replace_owned_store_no_symlinks(
         dir,
         path,
         expected,
         state.to_json().as_bytes(),
+        PENDING_LOCK_WAIT,
     )
 }
 
@@ -170,7 +183,9 @@ fn save_pending(
 /// exactly once: a call that cannot save records nothing it took, and the asks
 /// stay in the file for a later call. A save that lost a race to another hook
 /// call is retried from a fresh read, because the change is pure and can be
-/// applied again.
+/// applied again. A save that found the lock held for its whole wait is not:
+/// another attempt would only wait again, and the caller has a path for an
+/// ask it cannot hold.
 fn update_pending(
     dir: &Path,
     at: u64,
@@ -195,7 +210,8 @@ fn update_pending(
         }
         match save_pending(dir, &path, &state, expected.as_deref()) {
             Ok(()) => return Ok(leaving),
-            Err(error) => last_error = error,
+            Err(error @ ReplaceError::LockBusy { .. }) => return Err(error.to_string()),
+            Err(error) => last_error = error.to_string(),
         }
     }
     Err(last_error)
@@ -787,6 +803,55 @@ mod tests {
             sessions,
             vec!["agent:main:telegram:1", "agent:main:main"],
             "both asks are held: neither writer lost its change"
+        );
+    }
+
+    /// A pending state whose update lock somebody else holds costs ONE bounded
+    /// wait, not one per attempt: the retry is for a lost compare-and-swap,
+    /// and against a held lock it only waited again, four times over, in a
+    /// call the OpenClaw hook kills at 4 s.
+    ///
+    /// FAILS ON REVERT: let `update_pending` retry a `LockBusy` like any
+    /// other failure and the change is applied four times; take the lock with
+    /// a blocking `flock` again and the update never returns.
+    #[test]
+    fn a_held_pending_lock_costs_one_wait_and_is_named() {
+        use fs4::FileExt;
+        use std::sync::mpsc;
+
+        let dir = tempfile::TempDir::new().expect("scratch dir");
+        let lock = dir.path().join(format!(".{PENDING_FILE}.innerwarden.lock"));
+        let holder = innerwarden_agent_guard::file_update::open_shared_lock(&lock)
+            .expect("open the pending state's update lock");
+        FileExt::lock(&holder).expect("hold it, as any account that can open it may");
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let scratch = dir.path().to_path_buf();
+        std::thread::spawn(move || {
+            let mut calls = 0;
+            let updated = update_pending(&scratch, 1_000, |state| {
+                calls += 1;
+                state.remember(ask("agent:main:main", 1_000))
+            });
+            let _ = done_tx.send((updated.map(|_| ()), calls));
+        });
+        let (updated, calls) = done_rx
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .expect("still waiting for a lock somebody else holds: the wait is not bounded");
+
+        assert_eq!(calls, 1, "one attempt: a held lock is not retried");
+        assert_eq!(
+            updated,
+            Err(ReplaceError::LockBusy {
+                lock,
+                waited: PENDING_LOCK_WAIT,
+            }
+            .to_string()),
+            "refused for the held lock, and for nothing else"
+        );
+        assert!(
+            !dir.path().join(PENDING_FILE).exists(),
+            "nothing was written"
         );
     }
 

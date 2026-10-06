@@ -9,10 +9,68 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use fs4::FileExt;
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// How long a writer of an agent configuration waits for another writer that
+/// holds the same file's update lock.
+///
+/// The lock is advisory, and holding it takes nothing but a descriptor on the
+/// sibling lock file: any account that can open it can keep it for as long as
+/// it likes, and in a home directory that includes the guarded agent's own
+/// account. A writer that waited without a limit waited exactly as long as the
+/// holder chose. A real writer holds it for one read, compare, write and rename,
+/// which is milliseconds, so this is generous for every legitimate contender
+/// and still ends.
+const CONFIG_LOCK_WAIT: Duration = Duration::from_secs(2);
+
+/// How often a writer that found the update lock held tries it again.
+const LOCK_RETRY: Duration = Duration::from_millis(5);
+
+/// Why a replacement was not made.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplaceError {
+    /// Another process held the update lock for the whole wait. Nothing was
+    /// written, and trying again at once would only wait again.
+    LockBusy {
+        /// The sibling lock that was held.
+        lock: PathBuf,
+        /// How long this writer waited for it.
+        waited: Duration,
+    },
+    /// Anything else, in words.
+    Failed(String),
+}
+
+impl std::fmt::Display for ReplaceError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LockBusy { lock, waited } => write!(
+                formatter,
+                "{} was held by another process for {} ms; nothing was written, \
+                 retry once it is released",
+                lock.display(),
+                waited.as_millis()
+            ),
+            Self::Failed(why) => formatter.write_str(why),
+        }
+    }
+}
+
+impl From<String> for ReplaceError {
+    fn from(why: String) -> Self {
+        Self::Failed(why)
+    }
+}
+
+impl From<ReplaceError> for String {
+    fn from(error: ReplaceError) -> Self {
+        error.to_string()
+    }
+}
 
 /// Maximum size accepted when reading an agent CONFIGURATION file.
 ///
@@ -253,18 +311,34 @@ impl UpdateLock {
         lock_still_names(&self.file, &self.path)
     }
 
-    fn acquire(path: &Path, ownership: Ownership) -> Result<Self, String> {
+    /// Take the update lock of `path`, waiting at most `wait` for a writer
+    /// that holds it.
+    ///
+    /// BOUNDED, because the wait is the holder's to choose otherwise. This was
+    /// a blocking `flock`, and every account that can open the sibling lock
+    /// can take it: beside the record that includes the guarded agent's own
+    /// account. Held by that account, it stopped the hook inside its graph
+    /// write, before the hook returned its verdict, for as long as it was
+    /// held; a hook killed for not answering released the record lock to the
+    /// next one, which stopped the same way. A verdict that never arrives is
+    /// settled by the agent harness's timeout, not by the guard.
+    ///
+    /// The wait is counted once for the whole acquisition, re-opens of a lock
+    /// replaced underneath included.
+    fn acquire(path: &Path, ownership: Ownership, wait: Duration) -> Result<Self, ReplaceError> {
         let lock_path = sibling(path, "innerwarden.lock");
+        let started = Instant::now();
         for _ in 0..LOCK_ATTEMPTS {
             let file = open_lock(&lock_path, ownership == Ownership::SharedRecord)
                 .map_err(|error| format!("opening {}: {error}", lock_path.display()))?;
-            // BLOCKING exclusive lock. fs4 1.x renamed `lock_exclusive` to `lock`;
-            // both are `flock(LOCK_EX)` on Unix and `LockFileEx(EXCLUSIVE)` on
-            // Windows, so this still waits for the other writer instead of failing.
-            // Called through the trait so it can never silently resolve to the
-            // inherent `std::fs::File::lock` on newer toolchains.
-            FileExt::lock(&file)
+            let taken = take_lock_within(&file, started, wait)
                 .map_err(|error| format!("locking {}: {error}", lock_path.display()))?;
+            if !taken {
+                return Err(ReplaceError::LockBusy {
+                    lock: lock_path,
+                    waited: wait,
+                });
+            }
             if lock_still_names(&file, &lock_path) {
                 return Ok(Self {
                     file,
@@ -275,8 +349,38 @@ impl UpdateLock {
         Err(format!(
             "{} kept being replaced while waiting for it",
             lock_path.display()
-        ))
+        )
+        .into())
     }
+}
+
+/// Try the exclusive lock on `file` until it is taken (`true`) or `wait`,
+/// counted from `started`, is spent (`false`). A real I/O failure is returned
+/// at once and never retried.
+///
+/// NON-blocking attempts, deliberately: a blocking `flock(LOCK_EX)` /
+/// `LockFileEx` has no deadline. fs4 1.x reports contention as
+/// `TryLockError::WouldBlock`, apart from a genuine error. Called through the
+/// trait so it can never silently resolve to the inherent
+/// `std::fs::File::try_lock` on newer toolchains.
+fn take_lock_within(file: &File, started: Instant, wait: Duration) -> std::io::Result<bool> {
+    loop {
+        match FileExt::try_lock(file) {
+            Ok(()) => return Ok(true),
+            Err(fs4::TryLockError::WouldBlock) => match next_lock_retry(started.elapsed(), wait) {
+                Some(pause) => std::thread::sleep(pause),
+                None => return Ok(false),
+            },
+            Err(fs4::TryLockError::Error(error)) => return Err(error),
+        }
+    }
+}
+
+/// What a writer that found the update lock held does next, `elapsed` into a
+/// wait of `wait`: pause this long and try again, or give up (`None`). PURE:
+/// the clock reading is handed in.
+fn next_lock_retry(elapsed: Duration, wait: Duration) -> Option<Duration> {
+    (elapsed < wait).then(|| LOCK_RETRY.min(wait - elapsed))
 }
 
 /// Open the sibling lock for a store in a SHARED directory, the way every
@@ -644,7 +748,9 @@ pub fn replace(path: &Path, body: &[u8]) -> Result<(), String> {
         None,
         MAX_CONFIG_BYTES,
         Ownership::Preserve,
+        CONFIG_LOCK_WAIT,
     )
+    .map_err(String::from)
 }
 
 /// Compare-and-replace variant for read/modify/write operations. `expected`
@@ -664,7 +770,9 @@ pub fn replace_if_unchanged(
         None,
         MAX_CONFIG_BYTES,
         Ownership::Preserve,
+        CONFIG_LOCK_WAIT,
     )
+    .map_err(String::from)
 }
 
 /// Automatic/background variant. Unlike explicit commands, it rejects observed
@@ -685,24 +793,33 @@ pub fn replace_if_unchanged_no_symlinks(
         Some(trusted_root),
         MAX_CONFIG_BYTES,
         Ownership::Preserve,
+        CONFIG_LOCK_WAIT,
     )
+    .map_err(String::from)
 }
 
 /// Same guarantees as [`replace_if_unchanged_no_symlinks`], for a store this
 /// product writes itself rather than an agent's configuration file.
 ///
-/// The only difference is the size ceiling. The config ceiling exists to bound
-/// what a hostile or broken agent config can make us read; applying it to our
-/// own append-heavy graph meant that once the graph crossed 16 MiB every write
+/// The size ceiling differs. The config ceiling exists to bound what a hostile
+/// or broken agent config can make us read; applying it to our own
+/// append-heavy graph meant that once the graph crossed 16 MiB every write
 /// failed at the verification read, so the pruning that would have brought it
 /// back under the limit could never run. Recording stopped for six hours on a
 /// real install and said so only on stderr.
+///
+/// And the caller says how long the write may wait for the update lock,
+/// because these stores are written on the path of a decision (a hook, a
+/// gateway turn) that must answer whatever another process does with the lock.
+/// A lock held for the whole of `lock_wait` is [`ReplaceError::LockBusy`], and
+/// nothing is written.
 pub fn replace_owned_store_no_symlinks(
     trusted_root: &Path,
     path: &Path,
     expected: Option<&[u8]>,
     body: &[u8],
-) -> Result<(), String> {
+    lock_wait: Duration,
+) -> Result<(), ReplaceError> {
     replace_inner(
         path,
         Some(expected),
@@ -711,6 +828,7 @@ pub fn replace_owned_store_no_symlinks(
         Some(trusted_root),
         MAX_OWNED_STORE_BYTES,
         Ownership::SharedRecord,
+        lock_wait,
     )
 }
 
@@ -743,7 +861,8 @@ fn replace_inner(
     trusted_root: Option<&Path>,
     limit: u64,
     ownership: Ownership,
-) -> Result<(), String> {
+    lock_wait: Duration,
+) -> Result<(), ReplaceError> {
     replace_inner_with(
         requested_path,
         expected,
@@ -752,6 +871,7 @@ fn replace_inner(
         trusted_root,
         limit,
         ownership,
+        lock_wait,
         restore_owner,
     )
 }
@@ -765,8 +885,9 @@ fn replace_inner_with(
     trusted_root: Option<&Path>,
     limit: u64,
     ownership: Ownership,
+    lock_wait: Duration,
     restore_owner: RestoreOwner,
-) -> Result<(), String> {
+) -> Result<(), ReplaceError> {
     let path = if follow_file_symlink {
         resolve_target(requested_path)?
     } else {
@@ -781,7 +902,7 @@ fn replace_inner_with(
         .ok_or_else(|| format!("{} has no parent directory", path.display()))?;
     fs::create_dir_all(parent)
         .map_err(|error| format!("creating {}: {error}", parent.display()))?;
-    let lock = UpdateLock::acquire(&path, ownership)?;
+    let lock = UpdateLock::acquire(&path, ownership, lock_wait)?;
     if let Some(expected) = expected {
         let current = if follow_file_symlink {
             current_bytes(&path, limit)?
@@ -796,16 +917,17 @@ fn replace_inner_with(
             return Err(format!(
                 "{} changed while InnerWarden was preparing the update; retry",
                 requested_path.display()
-            ));
+            )
+            .into());
         }
     }
     let previous_metadata = match fs::metadata(&path) {
         Ok(metadata) => Some(metadata),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(format!("inspecting {}: {error}", path.display())),
+        Err(error) => return Err(format!("inspecting {}: {error}", path.display()).into()),
     };
     let temp = private_temp(&path);
-    let result = (|| {
+    let result = (|| -> Result<(), String> {
         let mut file = OpenOptions::new()
             .create_new(true)
             .write(true)
@@ -893,7 +1015,7 @@ fn replace_inner_with(
     if result.is_err() {
         let _ = fs::remove_file(&temp);
     }
-    result
+    result.map_err(ReplaceError::Failed)
 }
 
 #[cfg_attr(not(unix), allow(unused_variables))]
@@ -1076,6 +1198,11 @@ fn replace_windows(path: &Path, temp: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// A wait for writes that meet no other writer: long enough never to
+    /// expire on a loaded machine, so a test that is not about the lock never
+    /// fails on it.
+    const UNCONTENDED: Duration = Duration::from_secs(10);
+
     /// THE TEST THAT WOULD HAVE CAUGHT THE OTHER HALF of spec-052.
     ///
     /// The record both products share lives in `/var/lib/innerwarden/guard/`,
@@ -1101,7 +1228,8 @@ mod tests {
             std::fs::set_permissions(&shared, fs::Permissions::from_mode(directory_mode)).unwrap();
             let path = shared.join("graph.json");
 
-            replace_owned_store_no_symlinks(&shared, &path, None, b"{}").expect("first write");
+            replace_owned_store_no_symlinks(&shared, &path, None, b"{}", UNCONTENDED)
+                .expect("first write");
 
             let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(
@@ -1188,7 +1316,8 @@ mod tests {
         );
 
         let path = shared.join("graph.json");
-        replace_owned_store_no_symlinks(&shared, &path, None, b"{}").expect("first write");
+        replace_owned_store_no_symlinks(&shared, &path, None, b"{}", UNCONTENDED)
+            .expect("first write");
 
         let written = fs::metadata(&path).unwrap();
         assert_eq!(
@@ -1226,15 +1355,22 @@ mod tests {
         std::os::unix::fs::chown(&shared, None, Some(shared_group)).expect("chgrp the directory");
         std::fs::set_permissions(&shared, fs::Permissions::from_mode(0o770)).unwrap();
         let path = shared.join("graph.json");
-        replace_owned_store_no_symlinks(&shared, &path, None, b"{}").expect("first write");
+        replace_owned_store_no_symlinks(&shared, &path, None, b"{}", UNCONTENDED)
+            .expect("first write");
         assert_eq!(
             fs::metadata(&path).unwrap().gid(),
             shared_group,
             "precondition: the first write already put the store in the shared group"
         );
 
-        replace_owned_store_no_symlinks(&shared, &path, Some(b"{}"), b"{\"nodes\":[]}")
-            .expect("second write");
+        replace_owned_store_no_symlinks(
+            &shared,
+            &path,
+            Some(b"{}"),
+            b"{\"nodes\":[]}",
+            UNCONTENDED,
+        )
+        .expect("second write");
 
         let rewritten = fs::metadata(&path).unwrap();
         assert_eq!(
@@ -1287,8 +1423,14 @@ mod tests {
         fs::write(&path, b"{}").unwrap();
         std::fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
 
-        replace_owned_store_no_symlinks(dir.path(), &path, Some(b"{}"), b"{\"nodes\":[]}")
-            .expect("second write");
+        replace_owned_store_no_symlinks(
+            dir.path(),
+            &path,
+            Some(b"{}"),
+            b"{\"nodes\":[]}",
+            UNCONTENDED,
+        )
+        .expect("second write");
 
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
@@ -1312,7 +1454,7 @@ mod tests {
         // SAFETY: umask is per-process state with no memory safety implications;
         // it is restored below before any other test can observe it.
         let previous = unsafe { libc::umask(0o022) };
-        let written = replace_owned_store_no_symlinks(dir.path(), &path, None, b"{}");
+        let written = replace_owned_store_no_symlinks(dir.path(), &path, None, b"{}", UNCONTENDED);
         // SAFETY: as above, restoring the value this test replaced.
         unsafe { libc::umask(previous) };
         written.expect("write");
@@ -1426,32 +1568,34 @@ mod tests {
         let target = dir.path().join("other.lock");
         fs::write(&target, b"").unwrap();
         symlink(&target, &lock).unwrap();
-        assert!(UpdateLock::acquire(&config, Ownership::Preserve).is_err());
+        assert!(UpdateLock::acquire(&config, Ownership::Preserve, UNCONTENDED).is_err());
         fs::remove_file(&lock).unwrap();
 
         let fifo = CString::new(lock.as_os_str().as_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
-        assert!(UpdateLock::acquire(&config, Ownership::Preserve).is_err());
+        assert!(UpdateLock::acquire(&config, Ownership::Preserve, UNCONTENDED).is_err());
     }
 
     /// The serialization this module promises is only real if the sibling lock
-    /// actually EXCLUDES and actually BLOCKS. A migration that quietly turned it
-    /// into a shared lock, a try-lock, or a no-op would still compile and still
-    /// pass every other test here, while letting two writers interleave a
-    /// read/modify/replace on the same config.
+    /// actually EXCLUDES and actually WAITS for its holder. A migration that
+    /// quietly turned it into a shared lock, a single try-lock, or a no-op
+    /// would still compile and still pass every other test here, while letting
+    /// two writers interleave a read/modify/replace on the same config. The
+    /// wait is bounded (see the next test), and inside the bound a released
+    /// lock lets the waiter through.
     #[test]
-    fn update_lock_excludes_a_second_writer_and_blocks_until_release() {
+    fn update_lock_excludes_a_second_writer_and_waits_for_its_release() {
         use std::sync::mpsc;
-        use std::time::Duration;
 
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("settings.json");
-        let held = UpdateLock::acquire(&path, Ownership::Preserve).expect("first writer acquires");
+        let held = UpdateLock::acquire(&path, Ownership::Preserve, UNCONTENDED)
+            .expect("first writer acquires");
 
         let (acquired_tx, acquired_rx) = mpsc::channel();
         let contender_path = path.clone();
         let contender = std::thread::spawn(move || {
-            let lock = UpdateLock::acquire(&contender_path, Ownership::Preserve)
+            let lock = UpdateLock::acquire(&contender_path, Ownership::Preserve, UNCONTENDED)
                 .expect("second writer acquires");
             acquired_tx.send(()).unwrap();
             drop(lock);
@@ -1466,13 +1610,137 @@ mod tests {
             "second writer must not acquire while the lock is held"
         );
 
-        // Blocks rather than failing: releasing lets the waiter through instead
+        // Waits rather than failing at once: releasing lets the waiter through instead
         // of it having already returned an error.
         drop(held);
         acquired_rx
             .recv_timeout(Duration::from_secs(10))
             .expect("second writer must acquire once the lock is released");
         contender.join().unwrap();
+    }
+
+    /// Hold the update lock of `path` from a descriptor of its own, the way
+    /// another process (any account that can open the lock) holds it.
+    fn hold_update_lock(path: &Path) -> File {
+        let lock = sibling(path, "innerwarden.lock");
+        let holder = open_lock(&lock, false).expect("open the lock");
+        FileExt::lock(&holder).expect("hold the lock");
+        holder
+    }
+
+    /// THE ATTACKER FORM. Any account that can open a store's sibling lock can
+    /// hold it, and beside the shared record that is the guarded agent's own
+    /// account. The write took the lock with a blocking `flock`, so a hook
+    /// recording its decision stopped there, before it answered, for as long
+    /// as the holder liked. Now the write gives up once its wait is spent,
+    /// says the lock was the reason, and writes nothing.
+    ///
+    /// FAILS ON REVERT: take the lock with the blocking `FileExt::lock` in
+    /// `UpdateLock::acquire` again, and the write never returns while the lock
+    /// is held ("still waiting for a lock somebody else holds").
+    #[test]
+    fn a_held_update_lock_is_given_up_after_the_wait_and_nothing_is_written() {
+        use std::sync::mpsc;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().to_path_buf();
+        let path = root.join("graph.json");
+        fs::write(&path, b"old").unwrap();
+        let holder = hold_update_lock(&path);
+        let wait = Duration::from_millis(200);
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let (writer_root, writer_path) = (root.clone(), path.clone());
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let written = replace_owned_store_no_symlinks(
+                &writer_root,
+                &writer_path,
+                Some(b"old"),
+                b"new",
+                wait,
+            );
+            let _ = done_tx.send((written, started.elapsed()));
+        });
+        let (written, elapsed) = done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("still waiting for a lock somebody else holds: the wait is not bounded");
+
+        assert_eq!(
+            written,
+            Err(ReplaceError::LockBusy {
+                lock: sibling(&path, "innerwarden.lock"),
+                waited: wait,
+            }),
+            "refused for the held lock, and for nothing else"
+        );
+        assert!(elapsed >= wait, "it waited its bound first: {elapsed:?}");
+        assert_eq!(fs::read(&path).unwrap(), b"old", "nothing was written");
+
+        // The lock was the only obstacle: released, the same write lands.
+        drop(holder);
+        replace_owned_store_no_symlinks(&root, &path, Some(b"old"), b"new", wait)
+            .expect("the same write once the lock is released");
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+    }
+
+    /// An agent configuration writer is bounded too: `innerwarden enforce` or
+    /// the dashboard's background setup must not hang on a lock the agent's
+    /// account holds. It waits [`CONFIG_LOCK_WAIT`], then refuses with the
+    /// reason, and the configuration is left exactly as it was.
+    ///
+    /// FAILS ON REVERT: as above, the blocking lock never returns.
+    #[test]
+    fn a_configuration_writer_gives_up_on_a_held_lock_after_its_wait() {
+        use std::sync::mpsc;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("settings.json");
+        fs::write(&path, b"{}").unwrap();
+        let _holder = hold_update_lock(&path);
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let writer_path = path.clone();
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let written = replace_if_unchanged(&writer_path, Some(b"{}"), b"{\"hooks\":[]}");
+            let _ = done_tx.send((written, started.elapsed()));
+        });
+        let (written, elapsed) = done_rx
+            .recv_timeout(CONFIG_LOCK_WAIT + Duration::from_secs(10))
+            .expect("still waiting for a lock somebody else holds: the wait is not bounded");
+
+        assert_eq!(
+            written,
+            Err(ReplaceError::LockBusy {
+                lock: sibling(&path, "innerwarden.lock"),
+                waited: CONFIG_LOCK_WAIT,
+            }
+            .to_string()),
+            "refused for the held lock, and for nothing else"
+        );
+        assert!(elapsed >= CONFIG_LOCK_WAIT, "{elapsed:?}");
+        assert_eq!(fs::read(&path).unwrap(), b"{}");
+    }
+
+    /// The give-up decision: keep trying while the wait lasts, never sleep
+    /// past its end, and stop exactly when it is spent.
+    #[test]
+    fn a_waiting_writer_retries_inside_its_wait_and_stops_at_its_end() {
+        let wait = Duration::from_millis(100);
+        assert_eq!(next_lock_retry(Duration::ZERO, wait), Some(LOCK_RETRY));
+        assert_eq!(
+            next_lock_retry(Duration::from_millis(98), wait),
+            Some(Duration::from_millis(2)),
+            "the last pause ends with the wait"
+        );
+        assert_eq!(next_lock_retry(wait, wait), None, "spent: give up");
+        assert_eq!(next_lock_retry(Duration::from_secs(5), wait), None);
+        assert_eq!(
+            next_lock_retry(Duration::ZERO, Duration::ZERO),
+            None,
+            "no wait means one attempt and no more"
+        );
     }
 
     #[cfg(unix)]
@@ -1644,6 +1912,7 @@ mod tests {
             Some(&shared),
             MAX_OWNED_STORE_BYTES,
             Ownership::SharedRecord,
+            UNCONTENDED,
             restore_refused,
         )
         .expect("a shared record must still be written when its owner cannot be restored");
@@ -1686,9 +1955,11 @@ mod tests {
             Some(&shared),
             MAX_CONFIG_BYTES,
             Ownership::Preserve,
+            UNCONTENDED,
             restore_refused,
         )
-        .expect_err("a configuration keeps its owner or is not written");
+        .expect_err("a configuration keeps its owner or is not written")
+        .to_string();
         assert!(
             error.ends_with(&format!("({})", OwnerRefusal::ConfigurationOwnerIsKept)),
             "refused for the wrong reason: {error}"
@@ -1717,9 +1988,11 @@ mod tests {
                 Some(&shared),
                 MAX_OWNED_STORE_BYTES,
                 Ownership::SharedRecord,
+                UNCONTENDED,
                 restore_refused,
             )
-            .expect_err("only a shared directory hands a record to its writer");
+            .expect_err("only a shared directory hands a record to its writer")
+            .to_string();
             assert!(
                 error.ends_with(&format!("({reason})")),
                 "{mode:o}: refused for the wrong reason: {error}"
@@ -1758,7 +2031,8 @@ mod tests {
             );
 
             let written = if shared_record {
-                replace_owned_store_no_symlinks(root, &path, None, b"{}")
+                replace_owned_store_no_symlinks(root, &path, None, b"{}", UNCONTENDED)
+                    .map_err(String::from)
             } else {
                 replace_if_unchanged_no_symlinks(root, &path, None, b"{}")
             };
@@ -1774,7 +2048,7 @@ mod tests {
             } else {
                 Ownership::Preserve
             };
-            let held = UpdateLock::acquire(&path, ownership).expect("held");
+            let held = UpdateLock::acquire(&path, ownership, UNCONTENDED).expect("held");
             assert!(
                 FileExt::try_lock(&open_existing_lock(&lock).unwrap()).is_err(),
                 "and it still EXCLUDES: a second descriptor cannot take it"
@@ -1795,7 +2069,7 @@ mod tests {
         let (_dir, shared) = shared_dir_with_mode(0o770);
         let path = shared.join("graph.json");
 
-        replace_owned_store_no_symlinks(&shared, &path, None, b"{}").expect("write");
+        replace_owned_store_no_symlinks(&shared, &path, None, b"{}", UNCONTENDED).expect("write");
 
         let lock = fs::metadata(sibling(&path, "innerwarden.lock")).unwrap();
         assert_eq!(lock.permissions().mode() & 0o777, 0o660);
@@ -1850,7 +2124,7 @@ mod tests {
         fs::set_permissions(&lock, fs::Permissions::from_mode(0o600)).unwrap();
         let before = fs::metadata(&lock).unwrap().ino();
 
-        replace_owned_store_no_symlinks(&shared, &path, None, b"{}").expect("write");
+        replace_owned_store_no_symlinks(&shared, &path, None, b"{}", UNCONTENDED).expect("write");
 
         let mended = fs::metadata(&lock).unwrap();
         assert_eq!(mended.ino(), before, "mended in place, never replaced");
@@ -1864,7 +2138,8 @@ mod tests {
         let own = sibling(&store, "innerwarden.lock");
         fs::write(&own, b"").unwrap();
         fs::set_permissions(&own, fs::Permissions::from_mode(0o600)).unwrap();
-        replace_owned_store_no_symlinks(private.path(), &store, None, b"{}").expect("write");
+        replace_owned_store_no_symlinks(private.path(), &store, None, b"{}", UNCONTENDED)
+            .expect("write");
         assert_eq!(
             fs::metadata(&own).unwrap().permissions().mode() & 0o777,
             0o600
@@ -1908,17 +2183,21 @@ mod tests {
             Some(&shared),
             MAX_CONFIG_BYTES,
             Ownership::SharedRecord,
+            UNCONTENDED,
             restore_with_a_heal,
         );
 
-        let error = written.expect_err("the lock was replaced under the write");
+        let error = written
+            .expect_err("the lock was replaced under the write")
+            .to_string();
         assert!(
             error.contains("was replaced while this write held it"),
             "{error}"
         );
         assert_eq!(fs::read(&path).unwrap(), b"old", "nothing was committed");
         // And the retry goes through under the lock now at the name.
-        replace_owned_store_no_symlinks(&shared, &path, Some(b"old"), b"new").expect("retry");
+        replace_owned_store_no_symlinks(&shared, &path, Some(b"old"), b"new", UNCONTENDED)
+            .expect("retry");
         assert_eq!(fs::read(&path).unwrap(), b"new");
     }
 
@@ -1948,7 +2227,7 @@ mod tests {
 
         let (_dir, shared) = shared_dir_with_mode(0o770);
         let path = plant(&shared, "graph.json");
-        replace_owned_store_no_symlinks(&shared, &path, None, b"{}")
+        replace_owned_store_no_symlinks(&shared, &path, None, b"{}", UNCONTENDED)
             .expect("the shared record is written past an unusable legacy lock");
         assert_eq!(fs::read(&path).unwrap(), b"{}");
         assert_eq!(
@@ -1972,7 +2251,8 @@ mod tests {
         fs::set_permissions(private.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let store = plant(private.path(), "graph.json");
         assert!(
-            replace_owned_store_no_symlinks(private.path(), &store, None, b"{}").is_err(),
+            replace_owned_store_no_symlinks(private.path(), &store, None, b"{}", UNCONTENDED)
+                .is_err(),
             "a private directory never heals a lock"
         );
         assert!(!store.exists());

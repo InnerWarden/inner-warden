@@ -797,6 +797,9 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
     // Record EVERY screened command into the narrative graph (allow AND deny).
     // Persist recommendation and real outcome separately: monitor records a deny
     // as `would_block`; enforce records `blocked` only when this hook returns 2.
+    // The record is written BEFORE the verdict is returned, so nothing in it
+    // may wait without a bound: every lock it takes gives up after
+    // `GRAPH_LOCK_TIMEOUT` and the loss is reported as an outage.
     let would_block_under_policy = hook_blocks(&verdict, block_review);
     graph_io::record_hook(
         &command,
