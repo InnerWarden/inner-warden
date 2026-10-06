@@ -3923,41 +3923,89 @@ enum Place {
     File(&'static str),
     /// This directory and everything under it.
     Tree(&'static str),
-    /// Any path with a component of this name, wherever it is: a `.ssh`
-    /// directory is the same thing in every home.
-    Component(&'static str),
+    /// Any path holding these components in a row, wherever it is: a `.ssh`
+    /// directory, or `.claude/settings.json`, is the same thing in every home
+    /// and every project. The only kind of place a relative path or a `~/`
+    /// path is held to, since where those start is not known here.
+    Components(&'static str),
 }
 
 impl Place {
-    fn holds(self, path: &str) -> bool {
+    fn holds(self, named: &NamedPath) -> bool {
         match self {
-            Place::File(file) => path == file,
-            Place::Tree(dir) => path
-                .strip_prefix(dir)
-                .is_some_and(|rest| rest.is_empty() || rest.starts_with('/')),
-            Place::Component(name) => path.split('/').any(|part| part == name),
+            Place::File(file) => named.rooted && named.path == file,
+            Place::Tree(dir) => {
+                named.rooted
+                    && named
+                        .path
+                        .strip_prefix(dir)
+                        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+            }
+            Place::Components(row) => named.path.match_indices(row).any(|(at, _)| {
+                let rest = &named.path[at + row.len()..];
+                (at == 0 || named.path[..at].ends_with('/'))
+                    && (rest.is_empty() || rest.starts_with('/'))
+            }),
         }
     }
 }
 
-/// The files whose change hands over privilege or a login: each decides who
-/// may log in or act as root, or holds code that runs as root or inside every
-/// program. In MITRE ATT&CK terms: sudo and doas rules (T1548.003), accounts
-/// and groups (T1098), login authentication (T1556.003), SSH keys (T1098.004),
-/// the dynamic linker (T1574.006), scheduled jobs (T1053.003), boot and login
-/// services (T1543, T1037), kernel modules (T1547.006) and the programs root
-/// runs (T1574). It holds every file the shell analyzer refuses to see
-/// overwritten ([`is_authentication_write_target`]).
+/// A group of [`PRIVILEGED_WRITE_TARGETS`]: what changing one of its files
+/// hands over, in the words a person is shown, and where those files are.
+pub(crate) struct PrivilegedGroup {
+    /// What changing a file of the group hands over, as plain words.
+    pub(crate) what: &'static str,
+    places: &'static [Place],
+    /// Ordinary calls name these files without writing them: a run, build or
+    /// search tool names an interpreter, a `JAVA_HOME` or a search root among
+    /// the system's programs, and runs the guard's own. So a call is held to
+    /// this group only where it writes (see `crate::mcp`), not wherever it
+    /// names a path.
+    pub(crate) named_in_passing: bool,
+}
+
+/// A file a tool argument names that is one of [`PRIVILEGED_WRITE_TARGETS`].
+pub(crate) struct PrivilegedTarget {
+    pub(crate) group: &'static PrivilegedGroup,
+    /// The path as it was resolved, in lowercase.
+    pub(crate) path: String,
+}
+
+const fn group(what: &'static str, places: &'static [Place]) -> PrivilegedGroup {
+    PrivilegedGroup {
+        what,
+        places,
+        named_in_passing: false,
+    }
+}
+
+/// The files whose change hands over privilege or a login, or switches off
+/// the guard: each decides who may log in or act as root, holds code that
+/// runs as root, in every login or inside every program, or carries the
+/// guard itself. In MITRE ATT&CK terms: sudo and doas rules (T1548.003),
+/// accounts and groups (T1098), login authentication (T1556.003), SSH keys
+/// (T1098.004), the dynamic linker (T1574.006), scheduled jobs (T1053.003),
+/// boot and login services and scripts (T1543, T1037, T1546.004), kernel
+/// modules and settings (T1547.006), package manager hooks (T1546.016), the
+/// programs root runs (T1574), and the guard's own configuration and the
+/// agent settings that load it (T1562.001). It holds every file the shell
+/// analyzer refuses to see overwritten ([`is_authentication_write_target`]),
+/// every agent configuration the guard wires ([`crate::agents::KNOWN`]) and
+/// every path of [`INNERWARDEN_SELF_PATHS`].
 ///
 /// Written by an agent's tool, any of them hands the agent, or whoever steered
 /// it, more than the agent was given. A change to the agent's own shell
 /// startup files or to a project's `.git/hooks` runs code as the agent's own
 /// account, not as anyone more, and is not here.
 ///
+/// Not here either, and judged by the other rules only: the configuration of
+/// a program that runs as root without being one of these (a web server's, a
+/// container runtime's), which can lead to root's code too.
+///
 /// First match wins, so a specific place sits ahead of the tree that holds it
 /// (`/usr/lib/systemd/system` before `/usr/lib`).
-const PRIVILEGED_WRITE_TARGETS: &[(&str, &[Place])] = &[
-    (
+const PRIVILEGED_WRITE_TARGETS: &[PrivilegedGroup] = &[
+    group(
         "the sudo rules, which decide who may run commands as root",
         &[
             Place::File("/etc/sudoers"),
@@ -3966,7 +4014,7 @@ const PRIVILEGED_WRITE_TARGETS: &[(&str, &[Place])] = &[
             Place::File("/etc/doas.conf"),
         ],
     ),
-    (
+    group(
         "the account and group database",
         &[
             Place::File("/etc/passwd"),
@@ -3976,7 +4024,7 @@ const PRIVILEGED_WRITE_TARGETS: &[(&str, &[Place])] = &[
             Place::File("/etc/master.passwd"),
         ],
     ),
-    (
+    group(
         "the login authentication and security policy",
         &[
             Place::Tree("/etc/pam.d"),
@@ -3987,22 +4035,53 @@ const PRIVILEGED_WRITE_TARGETS: &[(&str, &[Place])] = &[
             Place::Tree("/library/security/securityagentplugins"),
         ],
     ),
-    (
+    group(
         "the SSH login keys and settings",
-        &[Place::Tree("/etc/ssh"), Place::Component(".ssh")],
+        &[Place::Tree("/etc/ssh"), Place::Components(".ssh")],
     ),
-    (
+    group(
         "the stored GnuPG keys and git credentials",
         &[
-            Place::Component(".gnupg"),
-            Place::Component(".git-credentials"),
+            Place::Components(".gnupg"),
+            Place::Components(".git-credentials"),
         ],
     ),
-    (
+    // The quiet way out of the guard: the shell side refuses the same
+    // rewrites ([`check_guard_self_disable`]). An agent that drops its own
+    // PreToolUse hook, or adds an MCP server that does not go through the
+    // proxy, is no longer screened, and nothing it does after says so.
+    group(
+        "the guard's own configuration, or the agent settings that load it",
+        &[
+            // The agent settings the guard is wired into (a project's own
+            // `.claude/settings.json` can switch every hook off).
+            Place::Components(".claude/settings.json"),
+            Place::Components(".claude/settings.local.json"),
+            Place::Components(".claude.json"),
+            Place::Components(".mcp.json"),
+            Place::Components("claude_desktop_config.json"),
+            Place::Components(".cursor/mcp.json"),
+            Place::Components(".codex/config.toml"),
+            Place::Components(".gemini/settings.json"),
+            Place::Components("openclaw.json"),
+            // The OpenClaw message hook and reply plugin `innerwarden observe
+            // install` lays down (`HOOK_NAME` and `PLUGIN_ID` in the CLI's
+            // observe_io.rs), in any OpenClaw profile.
+            Place::Components("hooks/innerwarden-attempts"),
+            Place::Components("extensions/innerwarden-replies"),
+            // The Community configuration, its allow rules and its record.
+            Place::Components(".config/innerwarden"),
+            // INNERWARDEN_SELF_PATHS, but for the binary, which is a program.
+            Place::Tree("/etc/innerwarden"),
+            Place::Tree("/var/lib/innerwarden"),
+            Place::Tree("/sys/fs/bpf/innerwarden"),
+        ],
+    ),
+    group(
         "root's home directory",
         &[Place::Tree("/root"), Place::Tree("/var/root")],
     ),
-    (
+    group(
         "the libraries loaded into every program",
         &[
             Place::File("/etc/ld.so.preload"),
@@ -4010,7 +4089,7 @@ const PRIVILEGED_WRITE_TARGETS: &[(&str, &[Place])] = &[
             Place::Tree("/etc/ld.so.conf.d"),
         ],
     ),
-    (
+    group(
         "the jobs the system runs on a schedule",
         &[
             Place::File("/etc/crontab"),
@@ -4021,29 +4100,72 @@ const PRIVILEGED_WRITE_TARGETS: &[(&str, &[Place])] = &[
             Place::Tree("/etc/cron.weekly"),
             Place::Tree("/etc/cron.monthly"),
             Place::Tree("/var/spool/cron"),
+            Place::Tree("/var/spool/at"),
             Place::Tree("/var/at"),
             Place::Tree("/etc/periodic"),
+            // Run daily as root; a `postrotate` script is root's code.
+            Place::File("/etc/logrotate.conf"),
+            Place::Tree("/etc/logrotate.d"),
         ],
     ),
-    (
+    group(
         "the services and scripts the system runs at boot or login",
         &[
             Place::Tree("/etc/systemd/system"),
             Place::Tree("/etc/systemd/user"),
+            // `DefaultEnvironment=` reaches every service.
+            Place::File("/etc/systemd/system.conf"),
+            Place::Tree("/etc/systemd/system.conf.d"),
+            Place::File("/etc/systemd/user.conf"),
+            Place::Tree("/etc/systemd/user.conf.d"),
+            Place::Tree("/etc/systemd/system-generators"),
+            Place::Tree("/etc/systemd/user-generators"),
+            Place::Tree("/etc/tmpfiles.d"),
             Place::Tree("/run/systemd/system"),
             Place::Tree("/lib/systemd/system"),
             Place::Tree("/usr/lib/systemd/system"),
+            Place::Tree("/usr/local/lib/systemd"),
             Place::Tree("/etc/init.d"),
             Place::Tree("/etc/init"),
             Place::Tree("/etc/rc.d"),
             Place::File("/etc/rc.local"),
             Place::Tree("/etc/update-motd.d"),
+            Place::Tree("/etc/xdg/autostart"),
             Place::Tree("/library/launchdaemons"),
             Place::Tree("/library/launchagents"),
             Place::Tree("/library/startupitems"),
         ],
     ),
-    (
+    group(
+        "the scripts every account's login shell runs",
+        &[
+            Place::File("/etc/profile"),
+            Place::Tree("/etc/profile.d"),
+            Place::File("/etc/environment"),
+            Place::File("/etc/bash.bashrc"),
+            Place::File("/etc/bashrc"),
+            Place::Tree("/etc/bash_completion.d"),
+            Place::File("/etc/zshrc"),
+            Place::File("/etc/zprofile"),
+            Place::File("/etc/zshenv"),
+            Place::File("/etc/zlogin"),
+            Place::File("/etc/zlogout"),
+            Place::Tree("/etc/zsh"),
+            Place::File("/etc/csh.cshrc"),
+            Place::File("/etc/csh.login"),
+        ],
+    ),
+    group(
+        "the scripts the system runs as root when the network changes",
+        &[
+            Place::Tree("/etc/networkmanager/dispatcher.d"),
+            Place::Tree("/etc/network/if-up.d"),
+            Place::Tree("/etc/network/if-down.d"),
+            Place::Tree("/etc/network/if-pre-up.d"),
+            Place::Tree("/etc/network/if-post-down.d"),
+        ],
+    ),
+    group(
         "the device rules, which run commands as root when hardware appears",
         &[
             Place::Tree("/etc/udev/rules.d"),
@@ -4051,7 +4173,7 @@ const PRIVILEGED_WRITE_TARGETS: &[(&str, &[Place])] = &[
             Place::Tree("/usr/lib/udev/rules.d"),
         ],
     ),
-    (
+    group(
         "the kernel module loading rules",
         &[
             Place::File("/etc/modules"),
@@ -4061,15 +4183,45 @@ const PRIVILEGED_WRITE_TARGETS: &[(&str, &[Place])] = &[
             Place::Tree("/usr/lib/modprobe.d"),
         ],
     ),
-    (
-        "the system's programs and libraries",
+    group(
+        "the kernel settings applied at boot, which can name a program the kernel runs as root",
         &[
+            Place::File("/etc/sysctl.conf"),
+            Place::Tree("/etc/sysctl.d"),
+            Place::Tree("/etc/binfmt.d"),
+        ],
+    ),
+    group(
+        "the package manager's hooks and install scripts, which run as root",
+        &[
+            Place::File("/etc/apt/apt.conf"),
+            Place::Tree("/etc/apt/apt.conf.d"),
+            Place::File("/etc/dpkg/dpkg.cfg"),
+            Place::Tree("/etc/dpkg/dpkg.cfg.d"),
+            Place::Tree("/var/lib/dpkg/info"),
+            Place::Tree("/etc/dnf/plugins"),
+            Place::Tree("/etc/yum/pluginconf.d"),
+        ],
+    ),
+    PrivilegedGroup {
+        what: "the guard's own program",
+        places: &[
+            Place::Components(".local/bin/innerwarden"),
+            Place::Components(".local/bin/iw"),
+            Place::Components(".local/bin/iw-guard"),
+        ],
+        named_in_passing: true,
+    },
+    PrivilegedGroup {
+        what: "the system's programs and libraries",
+        places: &[
             Place::Tree("/bin"),
             Place::Tree("/sbin"),
             Place::Tree("/usr/bin"),
             Place::Tree("/usr/sbin"),
             Place::Tree("/usr/local/bin"),
             Place::Tree("/usr/local/sbin"),
+            Place::Tree("/usr/local/lib"),
             Place::Tree("/lib"),
             Place::Tree("/lib32"),
             Place::Tree("/lib64"),
@@ -4079,12 +4231,13 @@ const PRIVILEGED_WRITE_TARGETS: &[(&str, &[Place])] = &[
             Place::Tree("/usr/libexec"),
             Place::Tree("/boot"),
         ],
-    ),
+        named_in_passing: true,
+    },
 ];
 
-/// What changing the file a tool argument names would hand over, as plain
-/// words, and the path as it was resolved; `None` when the file is not one of
-/// [`PRIVILEGED_WRITE_TARGETS`] or the argument is not an absolute path.
+/// The file a tool argument names, if it is one of
+/// [`PRIVILEGED_WRITE_TARGETS`], with what changing it hands over; `None`
+/// when it is not, or when the argument does not read as a path.
 ///
 /// The path is resolved the way the file system will resolve it, without
 /// touching the file system, so a spelling cannot step around the list:
@@ -4093,23 +4246,44 @@ const PRIVILEGED_WRITE_TARGETS: &[(&str, &[Place])] = &[
 /// macOS file system ignores case) and macOS's `/private/etc` and
 /// `/System/Volumes/Data` names for `/etc` all resolve to the file they write.
 ///
-/// A relative path is not judged: the server resolves it against its own
-/// allowed directories, which this function is not told. Neither is `~/`,
-/// the home of whichever account runs the server.
-pub(crate) fn privileged_write_target(argument: &str) -> Option<(&'static str, String)> {
-    let path = absolute_target_path(argument)?;
+/// A relative path, and a `~/` one (the home of whichever account runs the
+/// server), is held only to the places that are the same wherever they start
+/// ([`Place::Components`]: `.ssh`, `.claude/settings.json`, ...). Where it
+/// starts is not known here, so `etc/sudoers.d/x` sent to a server whose
+/// working directory is `/` is not taken for the sudo rules. A Windows path
+/// is not judged.
+pub(crate) fn privileged_write_target(argument: &str) -> Option<PrivilegedTarget> {
+    let named = named_path(argument)?;
     PRIVILEGED_WRITE_TARGETS
         .iter()
-        .find(|(_, places)| places.iter().any(|place| place.holds(&path)))
-        .map(|(what, _)| (*what, path))
+        .find(|group| group.places.iter().any(|place| place.holds(&named)))
+        .map(|group| PrivilegedTarget {
+            group,
+            path: named.path,
+        })
 }
 
-/// The absolute, lowercase, lexically resolved path a tool argument names, or
-/// `None` when it names no absolute path (see [`privileged_write_target`]).
-fn absolute_target_path(argument: &str) -> Option<String> {
+/// A tool argument read as the path it names: lexically resolved and in
+/// lowercase. `rooted` when it names where it starts (an absolute path, a
+/// `file:` URL, `~root`); otherwise it is relative to a directory, or to a
+/// home, that is not known here, and `path` keeps a `~/` it began with.
+struct NamedPath {
+    path: String,
+    rooted: bool,
+}
+
+/// No path is longer than this (Linux's `PATH_MAX`). A longer argument is
+/// text, and is not copied to be looked up.
+const MAX_PATH_BYTES: usize = 4096;
+
+/// The path a tool argument names (see [`privileged_write_target`]), or
+/// `None` when it names none.
+fn named_path(argument: &str) -> Option<NamedPath> {
     let trimmed = argument.trim().trim_matches(['"', '\'']);
-    // Most arguments are not paths at all: decide that before copying them.
-    let path: std::borrow::Cow<'_, str> = if trimmed
+    if trimmed.is_empty() || trimmed.len() > MAX_PATH_BYTES {
+        return None;
+    }
+    let (path, rooted): (std::borrow::Cow<'_, str>, bool) = if trimmed
         .get(..5)
         .is_some_and(|scheme| scheme.eq_ignore_ascii_case("file:"))
     {
@@ -4119,19 +4293,35 @@ fn absolute_target_path(argument: &str) -> Option<String> {
             Some(host) if host.eq_ignore_ascii_case("localhost") => &rest[9..],
             _ => rest,
         };
-        percent_decode(rest).into()
+        let decoded = percent_decode(rest);
+        if !decoded.starts_with('/') {
+            return None;
+        }
+        (decoded.into(), true)
     } else if let Some(rest) = trimmed
         .strip_prefix("~root")
         .filter(|rest| rest.is_empty() || rest.starts_with('/'))
     {
-        format!("/root{rest}").into()
+        (format!("/root{rest}").into(), true)
+    } else if let Some(rest) = trimmed.strip_prefix('~') {
+        // `~/x` or `~user/x`: under a home this cannot place. Kept with its
+        // `~` so it is shown as it was written.
+        let (user, rest) = rest.split_once('/').unwrap_or((rest, ""));
+        let rest = collapse_path(rest).to_lowercase();
+        return Some(NamedPath {
+            path: format!("~{user}/{rest}").to_lowercase(),
+            rooted: false,
+        });
     } else {
-        trimmed.into()
+        (trimmed.into(), trimmed.starts_with('/'))
     };
-    if !path.starts_with('/') {
-        return None;
-    }
     let mut resolved = collapse_path(&path).to_lowercase();
+    if !rooted {
+        return Some(NamedPath {
+            path: resolved,
+            rooted,
+        });
+    }
     // macOS: the data volume is mounted at `/System/Volumes/Data`, and `/etc`
     // and `/var` are links into `/private`.
     for alias in ["/system/volumes/data", "/private"] {
@@ -4145,7 +4335,10 @@ fn absolute_target_path(argument: &str) -> Option<String> {
             }
         }
     }
-    Some(resolved)
+    Some(NamedPath {
+        path: resolved,
+        rooted,
+    })
 }
 
 /// Decode `%XX` escapes, as a server taking a `file:` URL does before it
@@ -7805,9 +7998,14 @@ mod family_gate_tests {
 
 #[cfg(test)]
 mod privileged_write_target_tests {
-    use super::{is_authentication_write_target, privileged_write_target};
+    use super::{is_authentication_write_target, privileged_write_target, INNERWARDEN_SELF_PATHS};
 
     const SUDO: &str = "the sudo rules, which decide who may run commands as root";
+    const GUARD: &str = "the guard's own configuration, or the agent settings that load it";
+
+    fn what(path: &str) -> Option<&'static str> {
+        privileged_write_target(path).map(|found| found.group.what)
+    }
 
     /// The spellings a path takes on its way to the same file. The list is
     /// matched against the resolved path, so every one of these is the sudo
@@ -7838,7 +8036,7 @@ mod privileged_write_target_tests {
             ("/etc/doas.conf", "/etc/doas.conf"),
         ] {
             assert_eq!(
-                privileged_write_target(spelling),
+                privileged_write_target(spelling).map(|found| (found.group.what, found.path)),
                 Some((SUDO, file.to_string())),
                 "{spelling:?}"
             );
@@ -7846,10 +8044,16 @@ mod privileged_write_target_tests {
     }
 
     /// One file from each group, so a group whose entries stop matching is
-    /// seen here, with the words a person is shown for it.
+    /// seen here, with the words a person is shown for it. The login scripts,
+    /// logrotate, the package manager's hooks, kernel settings and the network
+    /// scripts are what an agent's filesystem server running as root could
+    /// change to run code as root, and each was missing from the list.
+    ///
+    /// FAILS ON REVERT: take any of those groups (or `/usr/local/lib`) out and
+    /// its file is `None` here.
     #[test]
     fn each_group_names_what_the_file_hands_over() {
-        for (path, what) in [
+        for (path, expected) in [
             ("/etc/group", "the account and group database"),
             ("/etc/master.passwd", "the account and group database"),
             (
@@ -7869,6 +8073,7 @@ mod privileged_write_target_tests {
                 "/home/dev/.gnupg/gpg-agent.conf",
                 "the stored GnuPG keys and git credentials",
             ),
+            ("/home/dev/.claude/settings.json", GUARD),
             ("~root/.bashrc", "root's home directory"),
             ("/var/root/.zshrc", "root's home directory"),
             (
@@ -7884,6 +8089,10 @@ mod privileged_write_target_tests {
                 "the jobs the system runs on a schedule",
             ),
             (
+                "/etc/logrotate.d/agent",
+                "the jobs the system runs on a schedule",
+            ),
+            (
                 "/etc/systemd/system/agent.service",
                 "the services and scripts the system runs at boot or login",
             ),
@@ -7892,8 +8101,38 @@ mod privileged_write_target_tests {
                 "the services and scripts the system runs at boot or login",
             ),
             (
+                "/usr/local/lib/systemd/system/agent.service",
+                "the services and scripts the system runs at boot or login",
+            ),
+            (
+                "/etc/systemd/system.conf",
+                "the services and scripts the system runs at boot or login",
+            ),
+            (
+                "/etc/xdg/autostart/agent.desktop",
+                "the services and scripts the system runs at boot or login",
+            ),
+            (
                 "/Library/LaunchDaemons/com.agent.plist",
                 "the services and scripts the system runs at boot or login",
+            ),
+            (
+                "/etc/profile.d/agent.sh",
+                "the scripts every account's login shell runs",
+            ),
+            ("/etc/profile", "the scripts every account's login shell runs"),
+            (
+                "/etc/bash.bashrc",
+                "the scripts every account's login shell runs",
+            ),
+            ("/etc/zshrc", "the scripts every account's login shell runs"),
+            (
+                "/etc/environment",
+                "the scripts every account's login shell runs",
+            ),
+            (
+                "/etc/NetworkManager/dispatcher.d/99-agent",
+                "the scripts the system runs as root when the network changes",
             ),
             (
                 "/etc/udev/rules.d/99-agent.rules",
@@ -7903,14 +8142,106 @@ mod privileged_write_target_tests {
                 "/etc/modprobe.d/agent.conf",
                 "the kernel module loading rules",
             ),
+            (
+                "/etc/sysctl.d/99-agent.conf",
+                "the kernel settings applied at boot, which can name a program the kernel runs as root",
+            ),
+            (
+                "/etc/apt/apt.conf.d/99agent",
+                "the package manager's hooks and install scripts, which run as root",
+            ),
+            (
+                "/var/lib/dpkg/info/agent.postinst",
+                "the package manager's hooks and install scripts, which run as root",
+            ),
+            ("/home/dev/.local/bin/innerwarden", "the guard's own program"),
             ("/usr/local/bin/sudo", "the system's programs and libraries"),
+            (
+                "/usr/local/lib/libagent.so",
+                "the system's programs and libraries",
+            ),
             ("/boot/grub/grub.cfg", "the system's programs and libraries"),
         ] {
-            assert_eq!(
-                privileged_write_target(path).map(|(found, _)| found),
-                Some(what),
-                "{path}"
-            );
+            assert_eq!(what(path), Some(expected), "{path}");
+        }
+    }
+
+    /// The configuration the guard is carried by, in every place an agent
+    /// writes it: a home, a project, a relative path, `~/`. Changing any of
+    /// these takes the agent out from under the guard (its hook dropped, an
+    /// MCP server added that does not go through the proxy, an allow rule
+    /// added) without a word, which the shell side already refuses
+    /// ([`super::check_guard_self_disable`]).
+    ///
+    /// FAILS ON REVERT: take the group out, or go back to judging only
+    /// absolute paths, and these are `None`.
+    #[test]
+    fn the_guards_own_wiring_is_privileged_wherever_it_is_named() {
+        for path in [
+            "/home/dev/.claude/settings.json",
+            "/home/dev/project/.claude/settings.json",
+            "/home/dev/project/.claude/settings.local.json",
+            "~/.claude/settings.json",
+            "~/.claude.json",
+            "/home/dev/project/.mcp.json",
+            "project/.mcp.json",
+            ".mcp.json",
+            "./.mcp.json",
+            "~/.cursor/mcp.json",
+            "/Users/dev/.codex/config.toml",
+            "~/.gemini/settings.json",
+            "/home/dev/Library/Application Support/Claude/claude_desktop_config.json",
+            "/home/dev/.openclaw/openclaw.json",
+            "/home/dev/.openclaw-work/openclaw.json",
+            "/home/dev/.openclaw/hooks/innerwarden-attempts/handler.js",
+            "~/.openclaw/extensions/innerwarden-replies/index.js",
+            "~/.config/innerwarden/agents.toml",
+            "/home/dev/.config/innerwarden/guard-events.jsonl",
+            "~/.CONFIG/InnerWarden/allow.toml",
+            "/etc/innerwarden/guard.toml",
+            "/var/lib/innerwarden/state.json",
+            "file:///home/dev/.claude/settings.json",
+        ] {
+            assert_eq!(what(path), Some(GUARD), "{path}");
+        }
+    }
+
+    /// Every agent configuration the guard wires (the hook's settings, each
+    /// wrapped MCP configuration, an OpenClaw profile's), read from the agent
+    /// table itself, so an agent added there is held here too.
+    ///
+    /// FAILS ON REVERT: drop one of those files from the group.
+    #[test]
+    fn every_agent_configuration_the_guard_wires_is_privileged() {
+        let mut wired = Vec::new();
+        for known in crate::agents::KNOWN {
+            if known.hookable {
+                wired.extend(known.config_files.iter().map(|(file, _)| file.to_string()));
+            }
+            wired.extend(known.mcp_json.map(str::to_string));
+            wired.extend(known.mcp_toml.map(str::to_string));
+            if let Some(profile) = known.profile_config {
+                wired.push(format!(
+                    "{}work/{}",
+                    profile.directory_prefix, profile.file_name
+                ));
+            }
+        }
+        assert!(wired.len() >= 6, "the agent table: {wired:?}");
+        for file in wired {
+            for path in [format!("/home/dev/{file}"), format!("~/{file}")] {
+                assert_eq!(what(&path), Some(GUARD), "{path}");
+            }
+        }
+    }
+
+    /// Every path the shell side treats as InnerWarden's own is held here
+    /// too, so the MCP surface does not let through what the shell refuses.
+    #[test]
+    fn every_path_of_the_guard_itself_is_privileged() {
+        for path in INNERWARDEN_SELF_PATHS {
+            assert!(what(path).is_some(), "{path}");
+            assert!(what(&format!("{path}/x")).is_some(), "{path}/x");
         }
     }
 
@@ -7923,7 +8254,8 @@ mod privileged_write_target_tests {
         for path in [
             "/etc/sudoers.bak",
             "/etc/sudoers.d.orig/agent",
-            "/etc/systemd/system.conf",
+            "/etc/systemd/journald.conf",
+            "/etc/profile.bak",
             "/etc/hosts",
             "/etc/nginx/nginx.conf",
             "/rootfs/etc/passwd",
@@ -7932,12 +8264,19 @@ mod privileged_write_target_tests {
             "/home/dev/project/bin/cli.js",
             "/home/dev/.bashrc",
             "/home/dev/project/.git/hooks/pre-commit",
+            "/home/dev/project/settings.json",
+            "/home/dev/project/mcp.json",
+            "/home/dev/.claude/projects/session.jsonl",
+            "/home/dev/.claude.json.bak",
+            "/home/dev/project/innerwarden/src/main.rs",
+            "/home/dev/.config/innerwarden-notes/x",
+            "/home/dev/.local/bin/iwctl",
             "/usr/local/share/doc/x",
             "/opt/homebrew/bin/tool",
             "/tmp/sudoers",
-            // A relative path is resolved by the server against its allowed
-            // directories, which this check is not told; `~/` is the home of
-            // whoever runs the server.
+            // A relative path, or `~/`, is held only to the places that are
+            // the same wherever they start: the server resolves it against a
+            // directory, or a home, that this check is not told.
             "etc/sudoers.d/agent",
             "lib/index.js",
             "../etc/passwd",
@@ -7947,7 +8286,7 @@ mod privileged_write_target_tests {
             "",
             "sudoers",
         ] {
-            assert_eq!(privileged_write_target(path), None, "{path}");
+            assert!(privileged_write_target(path).is_none(), "{path}");
         }
     }
 

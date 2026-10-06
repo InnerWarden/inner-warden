@@ -110,9 +110,9 @@ detection:
     # same server's `edit_file` and `move_file` were not matched. What a write
     # escalates through is the file it changes. The tool_args conditions below
     # still match /etc/sudoers, /etc/passwd, /etc/shadow and /root/ for any
-    # tool, and InnerWarden's built-in AG-PRIV-WRITE check refuses a write by
-    # any tool to a file that grants privilege or runs as root, after
-    # normalizing the path.
+    # tool, and InnerWarden's built-in AG-PRIV-WRITE check refuses a call
+    # that may write a file granting privilege, running as root or carrying
+    # the guard, after normalizing the path, whichever tool makes it.
     - field: tool_name
       operator: regex
       value: "(?i)(?:delete_file|rm\\s+-rf|remove_directory|format_disk|wipe)"

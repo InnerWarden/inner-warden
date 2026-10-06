@@ -104,7 +104,7 @@ use std::hash::BuildHasher;
 
 use serde_json::Value;
 
-use crate::mcp::{VerdictAlert, READ_ONLY_TOOLS};
+use crate::mcp::{ToolDeclaration, VerdictAlert, READ_ONLY_TOOLS};
 
 /// Minimum token length (in bytes) to track. Below this, a token is a common
 /// short word that would false-positive; at/above it, it is almost always a
@@ -137,6 +137,12 @@ const _: () = assert!(MAX_RESULT_COST <= RECENT_COST);
 
 /// No next slot in a chain of the index.
 const NO_SLOT: u32 = u32::MAX;
+
+/// The most tools whose declaration is kept. A server listing more is not
+/// believed about the rest, which are judged as undeclared.
+const MAX_DECLARED_TOOLS: usize = 1024;
+/// The longest tool name whose declaration is kept.
+const MAX_DECLARED_NAME_BYTES: usize = 128;
 
 /// The tools of the reference MCP filesystem server whose successful result is
 /// a list of names (entries, matches, allowed directories) rather than file
@@ -224,11 +230,50 @@ pub struct TaintTracker {
     /// Orders an older result's tokens for its sample. Drawn per proxy, so the
     /// author of a result cannot tell which of its tokens are kept.
     sample_key: RandomState,
+    /// What the server declared about its tools in its `tools/list` answers.
+    /// Not taint: it is kept here because this tracker is the one state the
+    /// proxy keeps per connection, and the router reads both.
+    declared: HashMap<Box<str>, ToolDeclaration>,
 }
 
 impl TaintTracker {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Remember what one `tools/list` result declares about each tool it
+    /// lists ([`ToolDeclaration::of`]). A later answer replaces an earlier
+    /// one's word for the same tool; a tool it lists without a declaration is
+    /// undeclared again. Bounded by [`MAX_DECLARED_TOOLS`] and
+    /// [`MAX_DECLARED_NAME_BYTES`]: a tool past either is left undeclared.
+    pub fn record_tools_list(&mut self, result: &Value) {
+        let Some(tools) = result.get("tools").and_then(Value::as_array) else {
+            return;
+        };
+        for tool in tools {
+            let Some(name) = tool.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            match ToolDeclaration::of(tool) {
+                ToolDeclaration::Unknown => {
+                    self.declared.remove(name);
+                }
+                declared => {
+                    if let Some(kept) = self.declared.get_mut(name) {
+                        *kept = declared;
+                    } else if name.len() <= MAX_DECLARED_NAME_BYTES
+                        && self.declared.len() < MAX_DECLARED_TOOLS
+                    {
+                        self.declared.insert(name.into(), declared);
+                    }
+                }
+            }
+        }
+    }
+
+    /// What the server declared about `tool`, as last heard.
+    pub(crate) fn declaration(&self, tool: &str) -> ToolDeclaration {
+        self.declared.get(tool).copied().unwrap_or_default()
     }
 
     /// Record the long tokens of one relayed tool-call result, all with the

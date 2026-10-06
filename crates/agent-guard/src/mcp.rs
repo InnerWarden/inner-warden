@@ -61,10 +61,54 @@ impl VerdictAlert {
     }
 }
 
+/// What a server said about one of its tools in its `tools/list` answer,
+/// through the tool's `annotations.readOnlyHint`.
+///
+/// Believed for one decision only, whether a call may change a privileged
+/// file ([`privileged_write_alert`]): a server that calls a writing tool
+/// read-only could write those files on its own anyway, so believing it gives
+/// the server nothing it did not have, and the agent cannot change what the
+/// server says.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ToolDeclaration {
+    /// The server said nothing about the tool, or was not heard.
+    #[default]
+    Unknown,
+    /// `readOnlyHint: true`: the tool does not change its environment.
+    ReadOnly,
+    /// `readOnlyHint: false`, said outright: the tool may change it.
+    Writes,
+}
+
+impl ToolDeclaration {
+    /// What one tool entry of a `tools/list` result declares.
+    pub(crate) fn of(tool: &serde_json::Value) -> Self {
+        match tool
+            .get("annotations")
+            .and_then(|annotations| annotations.get("readOnlyHint"))
+            .and_then(serde_json::Value::as_bool)
+        {
+            Some(true) => ToolDeclaration::ReadOnly,
+            Some(false) => ToolDeclaration::Writes,
+            None => ToolDeclaration::Unknown,
+        }
+    }
+}
+
 /// Inspect a tools/call request.
 pub fn inspect_tool_call(
     tool_name: &str,
     args: &serde_json::Value,
+    rule_engine: Option<&RuleEngine>,
+) -> Verdict {
+    inspect_declared_tool_call(tool_name, args, ToolDeclaration::Unknown, rule_engine)
+}
+
+/// [`inspect_tool_call`], knowing what the tool's server declared about it.
+pub(crate) fn inspect_declared_tool_call(
+    tool_name: &str,
+    args: &serde_json::Value,
+    declared: ToolDeclaration,
     rule_engine: Option<&RuleEngine>,
 ) -> Verdict {
     let mut alerts = Vec::new();
@@ -122,7 +166,7 @@ pub fn inspect_tool_call(
         ));
     }
 
-    if let Some(alert) = privileged_write_alert(tool_name, args) {
+    if let Some(alert) = privileged_write_alert(tool_name, args, declared) {
         alerts.push(alert);
     }
 
@@ -207,9 +251,10 @@ fn shell_command_argument<'a>(tool_name: &str, args: &'a serde_json::Value) -> O
 /// The tools of the reference MCP filesystem server that only read inside its
 /// allowed directories (annotated `readOnlyHint: true, openWorldHint: false`):
 /// the listing tools plus the file readers. The only calls a listing token may
-/// flow into without an alert (see [`crate::mcp_proxy::taint`]), and the only
-/// calls that may name a privileged file without being taken for a change to
-/// it (see [`privileged_write_alert`]).
+/// flow into without an alert (see [`crate::mcp_proxy::taint`]), and, with
+/// any tool its server declares read-only, the calls that may name a
+/// privileged file without being taken for a change to it (see
+/// [`privileged_write_alert`]).
 pub(crate) const READ_ONLY_TOOLS: &[&str] = &[
     "read_file",
     "read_text_file",
@@ -222,6 +267,12 @@ pub(crate) const READ_ONLY_TOOLS: &[&str] = &[
     "search_files",
     "list_allowed_directories",
 ];
+
+/// The tools of the reference MCP filesystem server that change files. Only
+/// a call to one of these, or to a tool its server says may change its
+/// environment, is told it "may change" a file; any other call is told what
+/// it names.
+const WRITE_TOOLS: &[&str] = &["write_file", "edit_file", "move_file", "create_directory"];
 
 /// Arguments that carry what is written rather than where: `write_file`'s
 /// `content`, `edit_file`'s `oldText` / `newText`, and the same values under
@@ -242,51 +293,180 @@ const CONTENT_ARGS: &[&str] = &[
     "file_text",
 ];
 
-/// Refuse a tool call that would change a file granting privilege or a login,
-/// or holding code that runs as root (`AG-PRIV-WRITE`).
+/// Argument names that say where a call writes, in the form
+/// [`is_target_arg`] compares: lower case, letters and digits only, so
+/// `file_path`, `filePath` and `FILEPATH` are one name. The reference
+/// server's `path`, `paths`, `source` and `destination` are here, with the
+/// names other servers give the same thing.
 ///
-/// Judged on the target, not on the tool's name: every absolute path the call
-/// names, as a value or as a key, at any depth, outside [`CONTENT_ARGS`], is
-/// resolved and looked up with [`threats::privileged_write_target`]. So
-/// `write_file`, `edit_file`, `move_file` (either end), `create_directory` and
-/// any other server's tool are held to the same files, however the path is
-/// spelled. Only the reference filesystem server's [`READ_ONLY_TOOLS`] may name
-/// such a file, since they cannot change it.
+/// A working directory (`cwd`, `workingDirectory`) is not: a process tool
+/// runs in it, it does not write it. Neither is an interpreter, a `JAVA_HOME`
+/// or a command line.
+const TARGET_ARGS: &[&str] = &[
+    "path",
+    "paths",
+    "file",
+    "files",
+    "filename",
+    "filenames",
+    "filepath",
+    "filepaths",
+    "source",
+    "sources",
+    "src",
+    "sourcepath",
+    "destination",
+    "destinations",
+    "dest",
+    "dst",
+    "destpath",
+    "destinationpath",
+    "target",
+    "targets",
+    "targetpath",
+    "targetfile",
+    "to",
+    "from",
+    "newpath",
+    "oldpath",
+    "uri",
+    "url",
+    "location",
+    "output",
+    "outputpath",
+    "outputfile",
+    "outfile",
+    "dir",
+    "directory",
+    "directories",
+    "dirpath",
+    "folder",
+    "folderpath",
+    "savepath",
+];
+
+fn is_target_arg(key: &str) -> bool {
+    let canonical: String = key
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    TARGET_ARGS.contains(&canonical.as_str())
+}
+
+/// Where in a tool call a string sits, for [`privileged_write_alert`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Named {
+    /// Under an argument that says where the call writes ([`TARGET_ARGS`]),
+    /// or a key of a map held there (`write_files`' `{"files": {path: text}}`).
+    Target,
+    /// Anywhere else: a command line, a search query, a note, an interpreter.
+    InPassing,
+}
+
+/// The privileged file a string of a tool call names, judged by where the
+/// string sits. Where the call writes, any path is judged, against every
+/// group. Anywhere else, only a single path token is, spelled as a path
+/// (`/`, `~`, `file:`), and never against a group that ordinary calls name
+/// without writing it (the system's programs, the guard's own program). Text
+/// with a space in it is a sentence or a command line, not a target.
+fn judged(text: &str, named: Named) -> Option<threats::PrivilegedTarget> {
+    match named {
+        Named::Target => threats::privileged_write_target(text),
+        Named::InPassing => {
+            let token = text.trim().trim_matches(['"', '\'']);
+            let spelled_as_path = token.starts_with('/')
+                || token.starts_with('~')
+                || token
+                    .get(..5)
+                    .is_some_and(|scheme| scheme.eq_ignore_ascii_case("file:"));
+            if !spelled_as_path || token.contains(char::is_whitespace) {
+                return None;
+            }
+            threats::privileged_write_target(token).filter(|found| !found.group.named_in_passing)
+        }
+    }
+}
+
+/// Refuse a tool call that would change a file granting privilege or a login,
+/// holding code that runs as root, or carrying the guard itself
+/// (`AG-PRIV-WRITE`).
+///
+/// Judged on the target, not on the tool's name. Every path under an
+/// argument that says where the call writes ([`TARGET_ARGS`]), at any depth,
+/// is resolved and looked up with [`threats::privileged_write_target`]. So
+/// `write_file`, `edit_file`, `move_file` (either end), `create_directory`
+/// and any other server's tool are held to the same files, however the path
+/// is spelled. A single path token anywhere else (an argv entry, an unusual
+/// argument name) is judged too, against the files no ordinary call names
+/// without writing them. Nothing under [`CONTENT_ARGS`] is a target.
+///
+/// A call that only reads may name such a file: the reference filesystem
+/// server's [`READ_ONLY_TOOLS`], and any tool its server declares read-only
+/// ([`ToolDeclaration::ReadOnly`]).
+///
+/// What this leaves open, by design: a write tool whose target argument has
+/// an unusual name ([`TARGET_ARGS`] does not hold it) is judged only as a
+/// path named in passing, so its write into the system's programs is not
+/// refused here. The sudo rules, PAM, cron, boot services, SSH keys, the
+/// guard's own configuration and the rest are still refused under any name.
 ///
 /// Before this, ATR-2026-040 refused `write_file` by name, which refused every
 /// ordinary write and let the same server's `edit_file` and `move_file` change
 /// `/etc//sudoers` or `/etc/cron.d/x` unchallenged.
-fn privileged_write_alert(tool_name: &str, args: &serde_json::Value) -> Option<VerdictAlert> {
-    if READ_ONLY_TOOLS.contains(&tool_name) {
+fn privileged_write_alert(
+    tool_name: &str,
+    args: &serde_json::Value,
+    declared: ToolDeclaration,
+) -> Option<VerdictAlert> {
+    let read_only = match declared {
+        ToolDeclaration::ReadOnly => true,
+        ToolDeclaration::Writes => false,
+        ToolDeclaration::Unknown => READ_ONLY_TOOLS.contains(&tool_name),
+    };
+    if read_only {
         return None;
     }
-    let mut pending = vec![args];
-    while let Some(value) = pending.pop() {
+    let mut pending = vec![(args, Named::InPassing)];
+    while let Some((value, named)) = pending.pop() {
         let found = match value {
-            serde_json::Value::String(s) => threats::privileged_write_target(s),
+            serde_json::Value::String(s) => judged(s, named),
             serde_json::Value::Array(items) => {
-                pending.extend(items);
+                pending.extend(items.iter().map(|item| (item, named)));
                 None
             }
             serde_json::Value::Object(map) => map.iter().find_map(|(key, value)| {
                 if !(value.is_string() && CONTENT_ARGS.contains(&key.as_str())) {
-                    pending.push(value);
+                    let at = if is_target_arg(key) {
+                        Named::Target
+                    } else {
+                        Named::InPassing
+                    };
+                    pending.push((value, at));
                 }
-                threats::privileged_write_target(key)
+                judged(key, named)
             }),
             _ => None,
         };
-        if let Some((what, path)) = found {
-            let shown: String = crate::redact::redact_secrets(&path)
+        if let Some(found) = found {
+            let shown: String = crate::redact::redact_secrets(&found.path)
                 .text
                 .chars()
                 .take(160)
                 .collect();
-            return Some(VerdictAlert::builtin(
-                "AG-PRIV-WRITE",
-                format!("may change `{shown}`, part of {what}"),
-                true,
-            ));
+            let what = found.group.what;
+            let writes = match declared {
+                ToolDeclaration::Writes => true,
+                _ => WRITE_TOOLS.contains(&tool_name),
+            };
+            let detail = if writes && named == Named::Target {
+                format!("may change `{shown}`, part of {what}")
+            } else {
+                format!(
+                    "names `{shown}`, part of {what}, and its server does not say this tool only reads"
+                )
+            };
+            return Some(VerdictAlert::builtin("AG-PRIV-WRITE", detail, true));
         }
     }
     None
@@ -1716,13 +1896,299 @@ mod tests {
             assert!(!v.allowed, "{tool} {args} was allowed: {:?}", v.alerts);
             let alert = priv_write(&v).unwrap_or_else(|| panic!("{tool} {args}: {:?}", v.alerts));
             assert!(alert.block, "{tool} {args}");
+            // Only the reference server's write tools are known to write; any
+            // other tool is told what it names, not that it changes it.
+            let verb = if WRITE_TOOLS.contains(&tool) {
+                "may change"
+            } else {
+                "names"
+            };
             assert!(
                 alert
                     .detail
-                    .starts_with(&format!("may change `{file}`, part of ")),
+                    .starts_with(&format!("{verb} `{file}`, part of ")),
                 "{tool} {args}: {}",
                 alert.detail
             );
+        }
+    }
+
+    /// The files an agent's filesystem server, running as root, could change
+    /// to run code as root at the next login, log rotation, package install,
+    /// boot or network change, and the guard's own wiring in any home or
+    /// project. At base every `write_file` was refused by name, so these were
+    /// too; taking the name out let each of them through.
+    ///
+    /// Checked with no rule engine, so the refusal is this check's own.
+    ///
+    /// FAILS ON REVERT: take the login scripts, logrotate, the package
+    /// manager's hooks, kernel settings or the guard's own configuration out
+    /// of `PRIVILEGED_WRITE_TARGETS`, or judge only absolute paths, and the
+    /// matching call is allowed.
+    #[test]
+    fn a_write_that_runs_code_as_root_or_unhooks_the_guard_is_refused() {
+        for (tool, args, file, what) in [
+            (
+                "write_file",
+                serde_json::json!({"path": "/etc/profile.d/agent.sh", "content": "id"}),
+                "/etc/profile.d/agent.sh",
+                "the scripts every account's login shell runs",
+            ),
+            (
+                "write_file",
+                serde_json::json!({"path": "/etc/logrotate.d/zz", "content": "postrotate id endscript"}),
+                "/etc/logrotate.d/zz",
+                "the jobs the system runs on a schedule",
+            ),
+            (
+                "write_file",
+                serde_json::json!({"path": "/etc/apt/apt.conf.d/99x", "content": "APT::Update::Pre-Invoke {\"id\"};"}),
+                "/etc/apt/apt.conf.d/99x",
+                "the package manager's hooks and install scripts, which run as root",
+            ),
+            (
+                "write_file",
+                serde_json::json!({"path": "/etc/sysctl.d/99-agent.conf", "content": "kernel.core_pattern=|/opt/agent/c"}),
+                "/etc/sysctl.d/99-agent.conf",
+                "the kernel settings applied at boot, which can name a program the kernel runs as root",
+            ),
+            (
+                "write_file",
+                serde_json::json!({"path": "/usr/local/lib/systemd/system/agent.service", "content": "[Service]"}),
+                "/usr/local/lib/systemd/system/agent.service",
+                "the services and scripts the system runs at boot or login",
+            ),
+            (
+                "write_file",
+                serde_json::json!({"path": "/home/dev/.claude/settings.json", "content": "{\"hooks\":{}}"}),
+                "/home/dev/.claude/settings.json",
+                "the guard's own configuration, or the agent settings that load it",
+            ),
+            (
+                "edit_file",
+                serde_json::json!({"path": "~/.claude/settings.json", "edits": [{"oldText": "PreToolUse", "newText": "Unused"}]}),
+                "~/.claude/settings.json",
+                "the guard's own configuration, or the agent settings that load it",
+            ),
+            (
+                "write_file",
+                serde_json::json!({"path": "/home/dev/project/.mcp.json", "content": "{\"mcpServers\":{\"x\":{\"command\":\"npx\"}}}"}),
+                "/home/dev/project/.mcp.json",
+                "the guard's own configuration, or the agent settings that load it",
+            ),
+            (
+                "write_file",
+                serde_json::json!({"path": ".mcp.json", "content": "{}"}),
+                ".mcp.json",
+                "the guard's own configuration, or the agent settings that load it",
+            ),
+            (
+                "write_file",
+                serde_json::json!({"path": "/etc/innerwarden/guard.toml", "content": ""}),
+                "/etc/innerwarden/guard.toml",
+                "the guard's own configuration, or the agent settings that load it",
+            ),
+            (
+                "write_file",
+                serde_json::json!({"path": "~/.config/innerwarden/x", "content": ""}),
+                "~/.config/innerwarden/x",
+                "the guard's own configuration, or the agent settings that load it",
+            ),
+            (
+                "move_file",
+                serde_json::json!({"source": "/home/dev/.cursor/mcp.json", "destination": "/tmp/x"}),
+                "/home/dev/.cursor/mcp.json",
+                "the guard's own configuration, or the agent settings that load it",
+            ),
+        ] {
+            let v = inspect_tool_call(tool, &args, None);
+            assert!(!v.allowed, "{tool} {args} was allowed: {:?}", v.alerts);
+            let alert = priv_write(&v).unwrap_or_else(|| panic!("{tool} {args}: {:?}", v.alerts));
+            assert_eq!(
+                alert.detail,
+                format!("may change `{file}`, part of {what}"),
+                "{tool} {args}"
+            );
+        }
+    }
+
+    /// REGRESSION ANCHOR, from probes of the lot that added AG-PRIV-WRITE:
+    /// every string that began with a system path was taken for a write
+    /// target, in any argument of any tool, so these ordinary calls, none of
+    /// which writes anything, were refused in guard mode with "may change
+    /// `/usr/bin/...`". Base let all of them through. A sentence, a search
+    /// query, a command line, an argv, an interpreter, a `JAVA_HOME` and a
+    /// working directory are not where a call writes.
+    ///
+    /// Run with the shipped rules, as the proxy loads them, so nothing else
+    /// refuses them either.
+    ///
+    /// What this opens, named: a write tool whose target argument has an
+    /// unusual name is judged only as a path named in passing, so it is not
+    /// held to the system's programs. The attacker forms that test pins
+    /// (`write_file /etc//sudoers`, `edit_file /etc/pam.d/sudo`, `move_file`
+    /// to `/etc/cron.d`, an argv that `tee`s into `/etc/sudoers.d`, a sudo
+    /// rule under an unusual name) still fire:
+    /// [`a_change_to_a_privileged_file_is_refused_by_any_tool_in_any_spelling`]
+    /// and [`a_privileged_file_named_in_passing_is_still_refused`].
+    ///
+    /// FAILS ON REVERT: judge every string again, as before, and each of
+    /// these is refused with AG-PRIV-WRITE.
+    #[test]
+    fn a_call_that_only_names_a_system_program_is_not_taken_for_a_write() {
+        let engine = RuleEngine::load_embedded();
+        for (tool, args) in [
+            (
+                "create_entities",
+                serde_json::json!({"entities": [{"name": "env", "observations": ["/usr/bin/python3 is the default interpreter"]}]}),
+            ),
+            (
+                "run_container",
+                serde_json::json!({"image": "alpine", "command": ["/bin/sh", "-c", "echo hi"]}),
+            ),
+            (
+                "web_search",
+                serde_json::json!({"query": "/usr/bin/ld: cannot find -lssl"}),
+            ),
+            (
+                "start_process",
+                serde_json::json!({"command": "/usr/bin/python3 app.py", "workingDirectory": "/usr/lib", "timeout_ms": 5000}),
+            ),
+            (
+                "search_code",
+                serde_json::json!({"q": "/usr/bin/env python3"}),
+            ),
+            (
+                "build",
+                serde_json::json!({"javaHome": "/usr/lib/jvm/java-17-openjdk"}),
+            ),
+            (
+                "notebook_start",
+                serde_json::json!({"interpreter": "/usr/bin/python3", "notebook": "analysis.ipynb"}),
+            ),
+        ] {
+            let v = inspect_tool_call(tool, &args, Some(&engine));
+            assert!(priv_write(&v).is_none(), "{tool} {args}: {:?}", v.alerts);
+            assert!(v.allowed, "{tool} {args}: {:?}", v.alerts);
+        }
+    }
+
+    /// A single path token outside a target argument is still judged, against
+    /// every file no ordinary call names without writing it: an argv that
+    /// pipes into the sudo rules, a write under an argument name the list
+    /// does not know, a map keyed by a cron file.
+    ///
+    /// FAILS ON REVERT: judge only target arguments and these pass.
+    #[test]
+    fn a_privileged_file_named_in_passing_is_still_refused() {
+        for (tool, args, file) in [
+            (
+                "run_process",
+                serde_json::json!({"argv": ["/usr/bin/tee", "/etc/sudoers.d/agent"]}),
+                "/etc/sudoers.d/agent",
+            ),
+            (
+                "save",
+                serde_json::json!({"saveLocation": "/etc//cron.d/agent", "body": "* * * * * root id"}),
+                "/etc/cron.d/agent",
+            ),
+            (
+                "store",
+                serde_json::json!({"entries": {"/etc/pam.d/sudo": "auth sufficient pam_permit.so"}}),
+                "/etc/pam.d/sudo",
+            ),
+            (
+                "save",
+                serde_json::json!({"name": "~/.claude/settings.json"}),
+                "~/.claude/settings.json",
+            ),
+        ] {
+            let v = inspect_tool_call(tool, &args, None);
+            assert!(!v.allowed, "{tool} {args}: {:?}", v.alerts);
+            let alert = priv_write(&v).unwrap_or_else(|| panic!("{tool} {args}: {:?}", v.alerts));
+            assert!(
+                alert
+                    .detail
+                    .starts_with(&format!("names `{file}`, part of ")),
+                "{tool} {args}: {}",
+                alert.detail
+            );
+            assert!(
+                alert
+                    .detail
+                    .ends_with(", and its server does not say this tool only reads"),
+                "{}",
+                alert.detail
+            );
+        }
+    }
+
+    /// A tool its server declares read-only (`readOnlyHint: true`) may name a
+    /// privileged file, as the reference server's readers may: a search
+    /// rooted in `/usr/lib` reads, it does not write. Undeclared, the same
+    /// call is refused and told only what it names; declared as writing, it
+    /// is told it may change the file.
+    ///
+    /// FAILS ON REVERT: ignore the declaration and the first call is refused.
+    #[test]
+    fn what_the_server_declares_about_a_tool_decides_how_its_target_is_read() {
+        let args = serde_json::json!({"path": "/usr/lib/python3", "pattern": "foo"});
+        let read_only =
+            inspect_declared_tool_call("start_search", &args, ToolDeclaration::ReadOnly, None);
+        assert!(priv_write(&read_only).is_none(), "{:?}", read_only.alerts);
+        assert!(read_only.allowed);
+
+        let unknown =
+            inspect_declared_tool_call("start_search", &args, ToolDeclaration::Unknown, None);
+        assert!(!unknown.allowed);
+        assert_eq!(
+            priv_write(&unknown).map(|a| a.detail.as_str()),
+            Some(
+                "names `/usr/lib/python3`, part of the system's programs and libraries, \
+                 and its server does not say this tool only reads"
+            )
+        );
+
+        let writes =
+            inspect_declared_tool_call("start_search", &args, ToolDeclaration::Writes, None);
+        assert_eq!(
+            priv_write(&writes).map(|a| a.detail.as_str()),
+            Some("may change `/usr/lib/python3`, part of the system's programs and libraries")
+        );
+
+        // A reader's name is not the server's word: a server that says its
+        // `read_file` writes is believed.
+        let said_to_write = inspect_declared_tool_call(
+            "read_file",
+            &serde_json::json!({"path": "/etc/sudoers"}),
+            ToolDeclaration::Writes,
+            None,
+        );
+        assert!(priv_write(&said_to_write).is_some());
+    }
+
+    #[test]
+    fn a_declaration_is_read_from_the_tools_annotations() {
+        for (tool, expected) in [
+            (
+                serde_json::json!({"name": "a", "annotations": {"readOnlyHint": true}}),
+                ToolDeclaration::ReadOnly,
+            ),
+            (
+                serde_json::json!({"name": "a", "annotations": {"readOnlyHint": false, "destructiveHint": true}}),
+                ToolDeclaration::Writes,
+            ),
+            (
+                serde_json::json!({"name": "a", "annotations": {"title": "A"}}),
+                ToolDeclaration::Unknown,
+            ),
+            (
+                serde_json::json!({"name": "a", "annotations": {"readOnlyHint": "true"}}),
+                ToolDeclaration::Unknown,
+            ),
+            (serde_json::json!({"name": "a"}), ToolDeclaration::Unknown),
+        ] {
+            assert_eq!(ToolDeclaration::of(&tool), expected, "{tool}");
         }
     }
 

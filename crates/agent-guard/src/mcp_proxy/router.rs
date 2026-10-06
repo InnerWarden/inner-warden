@@ -79,8 +79,10 @@ pub struct PendingRequest {
 /// tokens, with the [`Provenance`] its tool gives them; a client→server tool
 /// *call* whose argument is derived from a recorded result token is escalated
 /// (confused-deputy / indirect prompt injection), unless it is a read-only
-/// filesystem call reading back a name the server listed. Passing `None`
-/// disables taint tracking and leaves inspection deterministic.
+/// filesystem call reading back a name the server listed. A `tools/list`
+/// answer records what the server declares about each tool, which a later
+/// call to that tool is inspected with. Passing `None` disables both and
+/// leaves inspection deterministic.
 pub fn route_message(
     env: &JsonRpcEnvelope,
     dir: Direction,
@@ -101,7 +103,11 @@ fn route_client_to_server(
 ) -> ProxyDecision {
     if env.method.as_deref() == Some("tools/call") {
         let (name, args) = extract_tool_call(env);
-        let mut verdict = mcp::inspect_tool_call(&name, &args, engine);
+        let declared = taint
+            .as_deref()
+            .map(|t| t.declaration(&name))
+            .unwrap_or_default();
+        let mut verdict = mcp::inspect_declared_tool_call(&name, &args, declared, engine);
         // Confused-deputy: escalate a call whose argument was laundered from an
         // untrusted tool result relayed earlier this session.
         if let Some(t) = taint {
@@ -131,14 +137,22 @@ fn route_server_to_client(
 ) -> ProxyDecision {
     let dir = Direction::ServerToClient;
     match (responded.map(|r| r.method.as_str()), env.result.as_ref()) {
-        (Some("tools/list"), Some(result)) => ProxyDecision {
-            verdict: inspect_tools_list_result(result, engine),
-            direction: dir.label(),
-            method: Some("tools/list".into()),
-            tool_name: None,
-            tool_summary: None,
-            request_id: env.id.clone(),
-        },
+        (Some("tools/list"), Some(result)) => {
+            // What the server says each tool does, so a call to a tool it
+            // declares read-only is not taken for a write (see
+            // `mcp::ToolDeclaration`).
+            if let Some(t) = taint {
+                t.record_tools_list(result);
+            }
+            ProxyDecision {
+                verdict: inspect_tools_list_result(result, engine),
+                direction: dir.label(),
+                method: Some("tools/list".into()),
+                tool_name: None,
+                tool_summary: None,
+                request_id: env.id.clone(),
+            }
+        }
         (Some("tools/call"), Some(result)) => {
             // ASI07 (Memory Leakage): scrub secrets/PII from the untrusted tool
             // output before it enters the guard pipeline / the agent's context,
@@ -562,6 +576,102 @@ mod tests {
         );
         assert!(d2.verdict.allowed);
         assert!(d2.verdict.alerts.is_empty());
+    }
+
+    // ── what the server declares about its tools ────────────────────────
+
+    /// A search tool whose server declares it read-only may be rooted in a
+    /// system directory: the server's `tools/list` answer is heard, and the
+    /// call that follows is inspected with it. When a later answer lists the
+    /// tool without the declaration, the same call is judged as a possible
+    /// write again. A declaration for another tool, or a declaration the
+    /// proxy never heard, changes nothing.
+    ///
+    /// FAILS ON REVERT: stop recording `tools/list` (or inspect with
+    /// `inspect_tool_call`) and the first call is refused with AG-PRIV-WRITE.
+    #[test]
+    fn a_tool_declared_read_only_in_tools_list_may_search_a_system_directory() {
+        use crate::mcp_proxy::taint::TaintTracker;
+        let mut session = TaintTracker::new();
+        let list = |read_only: Option<bool>| {
+            let annotations = match read_only {
+                Some(hint) => serde_json::json!({"readOnlyHint": hint}),
+                None => serde_json::json!({"title": "Start Search"}),
+            };
+            msg(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {"tools": [
+                    {"name": "start_search", "description": "Search files", "annotations": annotations},
+                    {"name": "write_file", "description": "Write a file", "annotations": {"readOnlyHint": false}},
+                ]},
+            })
+            .to_string())
+        };
+        let search = msg(
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"start_search","arguments":{"path":"/usr/lib/python3","pattern":"foo"}}}"#,
+        );
+        let refused =
+            |d: &ProxyDecision| d.verdict.alerts.iter().any(|a| a.rule == "AG-PRIV-WRITE");
+
+        let unheard = route_message(
+            &search,
+            Direction::ClientToServer,
+            None,
+            None,
+            Some(&mut session),
+        );
+        assert!(refused(&unheard) && !unheard.verdict.allowed);
+
+        let _ = route_message(
+            &list(Some(true)),
+            Direction::ServerToClient,
+            Some(&pending("tools/list")),
+            None,
+            Some(&mut session),
+        );
+        let declared = route_message(
+            &search,
+            Direction::ClientToServer,
+            None,
+            None,
+            Some(&mut session),
+        );
+        assert!(declared.verdict.allowed, "{:?}", declared.verdict.alerts);
+        assert!(!refused(&declared));
+
+        // The same name in a result that was not a `tools/list` answer is
+        // not a declaration.
+        let mut other = TaintTracker::new();
+        let _ = route_message(
+            &list(Some(true)),
+            Direction::ServerToClient,
+            Some(&pending("tools/call")),
+            None,
+            Some(&mut other),
+        );
+        assert!(refused(&route_message(
+            &search,
+            Direction::ClientToServer,
+            None,
+            None,
+            Some(&mut other)
+        )));
+
+        let _ = route_message(
+            &list(None),
+            Direction::ServerToClient,
+            Some(&pending("tools/list")),
+            None,
+            Some(&mut session),
+        );
+        assert!(refused(&route_message(
+            &search,
+            Direction::ClientToServer,
+            None,
+            None,
+            Some(&mut session)
+        )));
     }
 
     // ── taint / confused-deputy ─────────────────────────────────────────

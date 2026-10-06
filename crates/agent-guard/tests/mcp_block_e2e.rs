@@ -212,6 +212,91 @@ fn guard_mode_with_the_shipped_rules_forwards_an_ordinary_write_and_stops_a_sudo
     );
 }
 
+/// The same, for files the first version of the target check left out: a
+/// login script every account runs (root's included), and the agent's own
+/// hook settings, which take the agent out from under the guard. Both were
+/// refused while ATR-2026-040 refused every `write_file`, and both reached
+/// the server once it no longer did. A container run whose argv starts with
+/// `/bin/sh` and a note naming an interpreter still pass: neither writes
+/// anything.
+///
+/// FAILS ON REVERT: take the login scripts or the guard's own configuration
+/// out of the privileged list and the write reaches the server; judge every
+/// string as a write target and the run and the note never do.
+#[test]
+fn guard_mode_with_the_shipped_rules_stops_a_login_script_and_an_unhooking_write() {
+    let engine = Arc::new(RuleEngine::load_embedded());
+    let login = "login-script-reached-the-server";
+    let unhook = "unhooking-write-reached-the-server";
+    let run = "run-reached-the-server";
+    let note = "note-reached-the-server";
+    let seen = run_through_proxy_with(
+        &[
+            fs_call(
+                31,
+                "write_file",
+                serde_json::json!({"path": "/etc/profile.d/agent.sh", "content": login}),
+            ),
+            fs_call(
+                32,
+                "write_file",
+                serde_json::json!({"path": "~/.claude/settings.json", "content": unhook}),
+            ),
+            fs_call(
+                33,
+                "run_container",
+                serde_json::json!({"image": "alpine", "command": ["/bin/sh", "-c", format!("echo {run}")]}),
+            ),
+            fs_call(
+                34,
+                "create_entities",
+                serde_json::json!({"entities": [{"name": note, "observations": ["/usr/bin/python3 is the default interpreter"]}]}),
+            ),
+        ],
+        ProxyMode::Guard,
+        Some(engine),
+    );
+    for (id, marker, file, what) in [
+        (
+            31,
+            login,
+            "/etc/profile.d/agent.sh",
+            "the scripts every account's login shell runs",
+        ),
+        (
+            32,
+            unhook,
+            "~/.claude/settings.json",
+            "the guard's own configuration, or the agent settings that load it",
+        ),
+    ] {
+        assert!(
+            !seen.contains(marker),
+            "call {id} reached the server and was echoed back:\n{seen}"
+        );
+        let refusal = seen
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("json line"))
+            .find(|reply| reply["id"] == id)
+            .unwrap_or_else(|| panic!("call {id} must be answered:\n{seen}"));
+        let text = refusal["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            text.contains(&format!(
+                "AG-PRIV-WRITE: may change `{file}`, part of {what}"
+            )),
+            "call {id}: {text}"
+        );
+    }
+    for marker in [run, note] {
+        assert!(
+            seen.contains(marker),
+            "{marker}: an ordinary call must reach the server:\n{seen}"
+        );
+    }
+}
+
 /// Advisory mode is explicitly NOT enforcement. It must forward everything,
 /// including the dangerous call, so the two modes cannot be confused for each
 /// other by a future refactor.

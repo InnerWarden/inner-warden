@@ -161,15 +161,37 @@ follows semantic versioning.
   a filesystem server was refused, an ordinary one inside its allowed
   directories included, while the same server's `edit_file` and `move_file`
   were not checked at all. The rule no longer looks at the name. A tool call
-  that may change a file granting privilege or a login, or holding code that
-  runs as root, is refused instead (`AG-PRIV-WRITE`), whichever tool makes it
-  and however the path is spelled (`/etc//sudoers`, `/tmp/../etc/cron.d/x`,
-  `/private/etc/...`, `file://`): the sudo, doas and polkit rules, PAM,
-  accounts and groups, SSH keys and server settings, root's home, the dynamic
-  linker's preload list, system cron jobs and boot services, udev and kernel
-  module rules, and the system's programs. Only the filesystem server's
-  read-only tools may name these files. A relative path is not judged: the
-  server resolves it against its allowed directories.
+  that may change a file granting privilege or a login, holding code that
+  runs as root, or carrying the guard itself, is refused instead
+  (`AG-PRIV-WRITE`), whichever tool makes it and however the path is spelled
+  (`/etc//sudoers`, `/tmp/../etc/cron.d/x`, `/private/etc/...`, `file://`):
+  the sudo, doas and polkit rules, PAM, accounts and groups, SSH keys and
+  server settings, root's home, the dynamic linker's preload list, system
+  cron jobs and logrotate, boot services and systemd's defaults, the login
+  scripts every account runs (`/etc/profile`, `/etc/profile.d`,
+  `/etc/bash.bashrc`, `/etc/environment`, ...), network dispatcher scripts,
+  udev and kernel module rules, kernel settings (`/etc/sysctl.d`), the
+  package manager's hooks and install scripts, the system's programs and
+  libraries, and the guard's own wiring: the agent settings that carry its
+  hook (`.claude/settings.json`), every MCP configuration it wraps
+  (`.claude.json`, a project's `.mcp.json`, `.cursor/mcp.json`,
+  `.codex/config.toml`, `.gemini/settings.json`, `openclaw.json`), the
+  OpenClaw hook and plugin `observe install` lays down, and its own
+  configuration (`~/.config/innerwarden`, `/etc/innerwarden`,
+  `/var/lib/innerwarden`). Only a path where the call writes (an argument
+  such as `path`, `source`, `destination`, `file`) is judged against every
+  one of these; a single path anywhere else (an argv entry, an unusual
+  argument name) is judged against all but the system's programs, and a
+  sentence, a search query or a command line is not taken for a target. The
+  filesystem server's read-only tools, and any tool its server declares
+  read-only (`readOnlyHint`), may name these files. What is left open: a
+  write tool whose target argument has an unusual name is not held to the
+  system's programs; a relative path (and `~/`) is held only to what is the
+  same in every directory (`.ssh`, the agent settings), so `etc/sudoers.d/x`
+  sent to a server working in `/` is not judged; Windows paths are not
+  judged; links are not followed; and the configuration of another program
+  that runs as root (a web server's, a container runtime's) is left to the
+  other rules.
 - **`innerwarden agents` and `status` report the mode each MCP proxy runs in.**
   The mode was guessed by searching the agent's configuration for the words
   `advisory`, `warn`, `guard` and `kill` anywhere in it, so a log level or a
