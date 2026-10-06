@@ -209,6 +209,11 @@ fn probe_writable(dir: &Path) -> bool {
 /// make a record fail at will by holding the graph lock. A new file takes the
 /// mode and group its directory implies, like every other file this product
 /// creates there, so whoever records next can update it.
+///
+/// The open refuses a symbolic link. A HARD link opens fine, so the file is
+/// truncated and rewritten only when its link count says this name is its only
+/// one; the existing file is opened without `O_TRUNC` so nothing is cut before
+/// that is known.
 fn write_health(path: &Path, body: &[u8]) {
     use std::io::Write;
     let mut create = std::fs::OpenOptions::new();
@@ -237,7 +242,7 @@ fn write_health(path: &Path, body: &[u8]) {
     };
     if !file
         .metadata()
-        .is_ok_and(|metadata| innerwarden_safe_io::is_regular_file(&metadata))
+        .is_ok_and(|metadata| innerwarden_safe_io::is_regular_file_with_one_name(&metadata))
     {
         return;
     }
@@ -569,6 +574,40 @@ mod tests {
             .unwrap()
             .file_type()
             .is_symlink());
+    }
+
+    /// A HARD link at the health record's name is not refused by the open, so
+    /// the link count decides: a file with a second name is never truncated or
+    /// rewritten, and an ordinary record still is.
+    ///
+    /// FAILS ON REVERT: check the handle with `is_regular_file` again and the
+    /// victim is truncated and rewritten.
+    #[cfg(unix)]
+    #[test]
+    fn a_hard_link_at_the_health_record_is_never_written_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let victim = elsewhere.path().join("sudoers");
+        std::fs::write(&victim, "root ALL=(ALL) ALL\n").unwrap();
+        let g = graph_in(&dir);
+        std::fs::hard_link(&victim, health_path(&g)).unwrap();
+
+        let _ = note_failure_at(&g, "graph_lock_timeout");
+
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "root ALL=(ALL) ALL\n",
+            "the file behind the second name was written"
+        );
+
+        // Not a refusal of every existing record: once the second name is gone
+        // the same file is this record's own again and is updated.
+        std::fs::remove_file(&victim).unwrap();
+        let _ = note_failure_at(&g, "graph_lock_timeout");
+        assert_eq!(
+            read_at(&g).expect("the record's own file is updated").code,
+            "graph_lock_timeout"
+        );
     }
 
     /// Same rule for the write probe, whose name is predictable.

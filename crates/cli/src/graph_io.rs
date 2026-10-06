@@ -737,17 +737,19 @@ fn append_guard_event_at(dir: &std::path::Path, line: &Value) {
     create_sink_with_directory_ownership(&path);
     let mut record = line.to_string();
     record.push('\n');
-    // Never through a link, never waiting on a FIFO, only into a plain file.
-    // The directory is shared with the guarded agent's uid, and this CLI is also
-    // run as root (`sudo`): appending through a name that uid had pointed at a
-    // root-owned file would have been root writing a line of its choosing there.
+    // Never through a link, never waiting on a FIFO, only into a plain file
+    // that has no other name. The directory is shared with the guarded agent's
+    // uid, and this CLI is also run as root (`sudo`): appending through a name
+    // that uid had pointed at a root-owned file would have been root writing a
+    // line of its choosing there. `harden` refuses a symbolic link at open; a
+    // HARD link opens fine and is only visible in the link count.
     let mut options = std::fs::OpenOptions::new();
     options.create(true).append(true);
     innerwarden_safe_io::harden(&mut options);
     if let Ok(mut file) = options.open(&path) {
         if file
             .metadata()
-            .is_ok_and(|metadata| innerwarden_safe_io::is_regular_file(&metadata))
+            .is_ok_and(|metadata| innerwarden_safe_io::is_regular_file_with_one_name(&metadata))
         {
             let _ = file.write_all(record.as_bytes());
         }
@@ -1968,6 +1970,39 @@ mod tests {
         append_guard_event_at(dir.path(), &json!({"kind": "guard.blocked"}));
 
         assert_eq!(std::fs::read_to_string(&victim).unwrap(), "# untouched\n");
+    }
+
+    /// The same for a HARD link, which `O_NOFOLLOW` does not refuse: the open
+    /// succeeds and the handle is a plain regular file. On macOS an ordinary
+    /// account can hard-link a root-owned file into a directory it writes.
+    ///
+    /// FAILS ON REVERT: check the handle with `is_regular_file` again and the
+    /// victim gains the line.
+    #[cfg(unix)]
+    #[test]
+    fn a_hard_link_at_the_guard_event_sink_is_never_appended_through() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let elsewhere = tempfile::TempDir::new().unwrap();
+        let victim = elsewhere.path().join("cron-job");
+        std::fs::write(&victim, "# untouched\n").unwrap();
+        std::fs::hard_link(&victim, dir.path().join("guard-events.jsonl")).unwrap();
+
+        append_guard_event_at(dir.path(), &json!({"kind": "guard.blocked"}));
+
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "# untouched\n",
+            "the file behind the second name was appended to"
+        );
+
+        // Not a refusal of every existing sink: once the second name is gone the
+        // same file is the sink's own again and is appended to.
+        std::fs::remove_file(&victim).unwrap();
+        append_guard_event_at(dir.path(), &json!({"kind": "guard.blocked"}));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("guard-events.jsonl")).unwrap(),
+            "# untouched\n{\"kind\":\"guard.blocked\"}\n"
+        );
     }
 
     #[test]
