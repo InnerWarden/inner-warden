@@ -46,8 +46,17 @@
 //! for the server's own exit with no bound, so behind a server that does not
 //! exit at the end of its input (a Node server built on the official SDK exits
 //! only once nothing else keeps it alive) every session the client closed left
-//! a proxy and its server running for good. The server is also spawned
-//! kill-on-drop, so a proxy whose future is dropped takes its server with it.
+//! a proxy and its server running for good. A proxy whose future is dropped
+//! takes its server with it too.
+//!
+//! On unix "the server" is the process group the spawned command leads, not
+//! its pid alone. A server is often started through a launcher (`npx -y ...`,
+//! `uvx`, `sh -c`), and the process that serves is the launcher's child.
+//! Signalling only the pid the proxy spawned stopped the launcher and left that
+//! child running, reparented to init: the same leak, one level down. Both
+//! signals go to the whole group, and the SIGKILL waits for nobody. A process
+//! that left the group on purpose (`setsid`, a daemon) is not the server and is
+//! not followed.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -573,15 +582,8 @@ where
         ));
     }
 
-    let mut child = Command::new(&cfg.server_cmd[0])
-        .args(&cfg.server_cmd[1..])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        // A proxy whose future is dropped (a caller's timeout, a cancelled
-        // task, a panic) must not leave its server running unwatched.
-        .kill_on_drop(true)
-        .spawn()?;
+    let mut server = Server::spawn(&cfg.server_cmd)?;
+    let child = &mut server.child;
 
     let mut child_stdin = Some(child.stdin.take().expect("child stdin piped"));
     let mut client_lines = CappedLines::new(BufReader::new(client_in), MAX_LINE_BYTES);
@@ -694,18 +696,136 @@ where
     drop(child_stdin);
     let status = match &ended {
         Ok(Ended::KillMode) => {
-            let _ = child.start_kill();
-            child.wait().await
+            server.kill();
+            server.wait().await
         }
         // It is on its way out: give it the grace to exit on its own.
-        Ok(Ended::ServerClosed) => stop_server(&mut child, STOP_GRACE).await,
+        Ok(Ended::ServerClosed) => stop_server(&mut server, STOP_GRACE).await,
         // It already had the drain window, or the session is over now.
         Ok(Ended::ClientLeft) | Ok(Ended::Stopped) | Err(_) => {
-            stop_server(&mut child, Duration::ZERO).await
+            stop_server(&mut server, Duration::ZERO).await
         }
     };
     ended?;
     Ok(status?.code().unwrap_or(0))
+}
+
+/// The spawned server: its process and, on unix, the process group it leads
+/// (see the module docs, "Lifetime").
+struct Server {
+    child: Child,
+    /// The id of the group the server leads, which is its pid.
+    #[cfg(unix)]
+    group: Option<libc::pid_t>,
+    /// Set once the server's own process has been reaped. Until then its pid,
+    /// and so the group id, cannot name anything else.
+    reaped: bool,
+}
+
+impl Server {
+    fn spawn(server_cmd: &[String]) -> std::io::Result<Self> {
+        let mut command = Command::new(&server_cmd[0]);
+        command
+            .args(&server_cmd[1..])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            // A proxy whose future is dropped (a caller's timeout, a cancelled
+            // task, a panic) must not leave its server running unwatched.
+            // This reaches the spawned process; `Drop` reaches its group.
+            .kill_on_drop(true);
+        // Its own group, so a launcher's children are stopped with it.
+        #[cfg(unix)]
+        command.process_group(0);
+        let child = command.spawn()?;
+        Ok(Self {
+            #[cfg(unix)]
+            group: child.id().and_then(|pid| libc::pid_t::try_from(pid).ok()),
+            child,
+            reaped: false,
+        })
+    }
+
+    async fn wait(&mut self) -> std::io::Result<ExitStatus> {
+        let status = self.child.wait().await;
+        self.reaped |= status.is_ok();
+        status
+    }
+
+    /// Ask the server to stop: SIGTERM to its whole group, so a launcher's
+    /// child can finish what it was writing too.
+    #[cfg(unix)]
+    fn ask_to_stop(&mut self) {
+        self.signal_group(libc::SIGTERM);
+    }
+
+    /// On Windows the server is terminated: a console process has no stop
+    /// request it can be sent reliably.
+    #[cfg(not(unix))]
+    fn ask_to_stop(&mut self) {
+        let _ = self.child.start_kill();
+    }
+
+    /// Kill the server and whatever is left of its group.
+    fn kill(&mut self) {
+        #[cfg(unix)]
+        self.signal_group(libc::SIGKILL);
+        let _ = self.child.start_kill();
+    }
+
+    /// Signal every process still in the server's group.
+    ///
+    /// The group id is the server's pid, which is ours until the server is
+    /// reaped. After that, POSIX keeps the id reserved for as long as the
+    /// group has a member, so a group that still answers is still the
+    /// server's. Once it is empty the id is free, so it is signalled only
+    /// while it answers.
+    #[cfg(unix)]
+    fn signal_group(&self, signo: libc::c_int) {
+        if let Some(group) = self.group {
+            if self.reaped && !group_has_members(group) {
+                return;
+            }
+            // SAFETY: killpg(2) takes no pointers; the group is the server's.
+            unsafe {
+                libc::killpg(group, signo);
+            }
+        }
+    }
+
+    /// Wait until nothing is left of the server's group, or `deadline`.
+    #[cfg(unix)]
+    async fn group_gone_by(&self, deadline: tokio::time::Instant) {
+        let Some(group) = self.group else {
+            return;
+        };
+        while group_has_members(group) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[cfg(not(unix))]
+    async fn group_gone_by(&self, _deadline: tokio::time::Instant) {}
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        // Dropped before it was reaped (a dropped proxy future): the spawned
+        // process is killed by `kill_on_drop`, and the rest of its group here.
+        #[cfg(unix)]
+        if !self.reaped {
+            self.signal_group(libc::SIGKILL);
+        }
+    }
+}
+
+/// Whether any process is left in `group`. Signal 0 delivers nothing. A
+/// member this account may not signal counts as none: nothing here could stop
+/// it anyway.
+#[cfg(unix)]
+fn group_has_members(group: libc::pid_t) -> bool {
+    // SAFETY: killpg(2) with signal 0 only checks the group.
+    unsafe { libc::killpg(group, 0) == 0 }
 }
 
 /// Wait until `deadline`, or forever when there is none.
@@ -717,40 +837,30 @@ async fn sleep_until_set(deadline: Option<tokio::time::Instant>) {
 }
 
 /// Stop the server and reap it, never waiting without bound: give it
-/// `wait_first` to exit on its own, then ask it to stop, then kill it
-/// [`STOP_GRACE`] later.
-async fn stop_server(child: &mut Child, wait_first: Duration) -> std::io::Result<ExitStatus> {
+/// `wait_first` to exit on its own, then ask its whole group to stop, then
+/// kill whatever of it is left [`STOP_GRACE`] later. A launcher that exits at
+/// once on SIGTERM does not cut its child's grace short: the wait is for the
+/// group, not for the launcher.
+async fn stop_server(server: &mut Server, wait_first: Duration) -> std::io::Result<ExitStatus> {
+    let mut exited = None;
     if !wait_first.is_zero() {
-        if let Ok(status) = tokio::time::timeout(wait_first, child.wait()).await {
-            return status;
+        if let Ok(status) = tokio::time::timeout(wait_first, server.wait()).await {
+            exited = Some(status);
         }
     }
-    ask_to_stop(child);
-    if let Ok(status) = tokio::time::timeout(STOP_GRACE, child.wait()).await {
-        return status;
-    }
-    let _ = child.start_kill();
-    child.wait().await
-}
-
-/// Ask the server to stop: SIGTERM, so it can finish what it was writing.
-#[cfg(unix)]
-fn ask_to_stop(child: &Child) {
-    // `id()` is None once the child was reaped; until then the pid is still
-    // ours (at worst a zombie), so it cannot name another process.
-    if let Some(pid) = child.id().and_then(|pid| libc::pid_t::try_from(pid).ok()) {
-        // SAFETY: kill(2) takes no pointers; it only signals our own child.
-        unsafe {
-            libc::kill(pid, libc::SIGTERM);
+    server.ask_to_stop();
+    let deadline = tokio::time::Instant::now() + STOP_GRACE;
+    if exited.is_none() {
+        if let Ok(status) = tokio::time::timeout_at(deadline, server.wait()).await {
+            exited = Some(status);
         }
     }
-}
-
-/// On Windows the server is terminated: a console process has no stop request
-/// it can be sent reliably.
-#[cfg(not(unix))]
-fn ask_to_stop(child: &mut Child) {
-    let _ = child.start_kill();
+    server.group_gone_by(deadline).await;
+    server.kill();
+    match exited {
+        Some(status) => status,
+        None => server.wait().await,
+    }
 }
 
 /// Resolves when the process is asked to stop: SIGTERM, SIGHUP or SIGINT.
@@ -1824,6 +1934,51 @@ mod tests {
         assert!(
             !is_running(pid),
             "the proxy returned and left its server running"
+        );
+    }
+
+    /// A server started through a launcher, the shape of `npx -y <server>`:
+    /// the launcher (`sh`) exits at once on SIGTERM, and the process that
+    /// serves is its child, which ignores SIGTERM. Only the launcher used to be
+    /// signalled, so it exited inside the grace, the proxy returned, and the
+    /// real server ran on, reparented to init.
+    ///
+    /// FAILS ON REVERT: signal the spawned pid alone (no process group) and
+    /// the launcher's child is still running after the proxy returned.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_server_behind_a_launcher_is_stopped_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("server.pid");
+        let script = r#"sh -c 'echo $$ > "$1"; trap "" TERM; exec sleep 60' sh "$1" & wait"#;
+        let (mut to_proxy, proxy_in) = duplex(16384);
+        let (proxy_out, _from_proxy) = duplex(16384);
+        let proxy = tokio::spawn(run_proxy_with_io(
+            proxy_in,
+            proxy_out,
+            advisory(vec![
+                "sh".into(),
+                "-c".into(),
+                script.into(),
+                "sh".into(),
+                pid_file.display().to_string(),
+            ]),
+            None,
+            |_d: &ProxyDecision| {},
+        ));
+        let served_by = server_pid(&pid_file).await;
+        assert!(
+            is_running(served_by),
+            "precondition: the launcher's child runs"
+        );
+
+        to_proxy.shutdown().await.unwrap();
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(15), proxy).await;
+        assert!(ended.is_ok(), "the client left and the proxy did not end");
+        ended.unwrap().unwrap().unwrap();
+        assert!(
+            stops_running_within(served_by, std::time::Duration::from_secs(3)).await,
+            "the proxy returned and left the launcher's child running"
         );
     }
 
