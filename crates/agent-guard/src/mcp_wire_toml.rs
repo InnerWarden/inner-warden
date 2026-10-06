@@ -10,8 +10,13 @@
 //! unrelated config in `config.toml` are left untouched, only `command`/`args`
 //! of each MCP server change. All logic here is pure/tested (operates on a parsed
 //! `DocumentMut`; the file read/write is the I/O layer's job).
+//!
+//! Every wrapper names the agent whose configuration it is in, exactly as
+//! [`crate::mcp_wire::naming`] describes for the JSON clients.
 
 use toml_edit::{value, Array, DocumentMut, Item, Table, Value};
+
+use crate::mcp_wire::{is_wrapper_name, naming, proxy_agent};
 
 /// The basename of a command path, cross-platform (`/` and `\`), lowercased.
 fn basename(cmd: &str) -> String {
@@ -135,7 +140,21 @@ fn servers_mut(doc: &mut DocumentMut) -> Option<&mut Table> {
     doc.get_mut("mcp_servers").and_then(Item::as_table_mut)
 }
 
-fn wrap_server(server: &mut Table, guard_bin: &str, monitor: bool) -> bool {
+/// An args array as its words, formatting aside. An array read from a file
+/// keeps the spacing it was written with and one built here has none, so
+/// comparing their text called every wrapper on disk changed: each connect
+/// rewrote the file and reported a change it had not made.
+fn words<'a>(values: impl Iterator<Item = &'a Value>) -> Vec<String> {
+    values
+        .map(|value| {
+            let mut value = value.clone();
+            value.decor_mut().clear();
+            value.to_string()
+        })
+        .collect()
+}
+
+fn wrap_server(server: &mut Table, guard_bin: &str, monitor: bool, agent: Option<&str>) -> bool {
     if !is_stdio_server(server) {
         return false;
     }
@@ -149,16 +168,16 @@ fn wrap_server(server: &mut Table, guard_bin: &str, monitor: bool) -> bool {
         .and_then(Item::as_array)
         .map(|a| a.iter().cloned().collect())
         .unwrap_or_default();
-    let current_args_text = server
+    let current_words = server
         .get("args")
         .and_then(Item::as_array)
-        .map(ToString::to_string)
+        .map(|args| words(args.iter()))
         .unwrap_or_default();
     let separator = wrapper_separator(server);
     if separator.is_none() && has_proxy_prefix(server) {
         return false;
     }
-    let (orig_cmd, orig_args, mut proxy_prefix) = if let Some(separator) = separator {
+    let (orig_cmd, orig_args, proxy_prefix) = if let Some(separator) = separator {
         if current_args.len() <= separator + 1 {
             return false;
         }
@@ -181,9 +200,17 @@ fn wrap_server(server: &mut Table, guard_bin: &str, monitor: bool) -> bool {
         return false;
     }
 
+    // `proxy_prefix[0]` is `proxy`; the options follow it.
+    let options: Vec<Option<&str>> = proxy_prefix[1..].iter().map(Value::as_str).collect();
+    let naming = naming(&options, agent);
     let mut new_args = Array::new();
-    for arg in proxy_prefix.drain(..) {
-        new_args.push_formatted(arg);
+    for (i, arg) in proxy_prefix.iter().enumerate() {
+        if i == 0 || !naming.drop.contains(&(i - 1)) {
+            new_args.push_formatted(arg.clone());
+        }
+    }
+    for word in naming.add {
+        new_args.push(word);
     }
     new_args.push("--mode");
     new_args.push(if monitor { "advisory" } else { "guard" });
@@ -192,7 +219,7 @@ fn wrap_server(server: &mut Table, guard_bin: &str, monitor: bool) -> bool {
     for a in orig_args {
         new_args.push_formatted(a);
     }
-    if current_command == guard_bin && current_args_text == new_args.to_string() {
+    if current_command == guard_bin && current_words == words(new_args.iter()) {
         return false;
     }
     server.insert("command", value(guard_bin));
@@ -259,10 +286,65 @@ fn counts(doc: &DocumentMut) -> (usize, usize) {
 }
 
 /// Route every stdio MCP server through `guard_bin proxy` in explicit advisory
-/// (`monitor=true`) or guard mode. Existing wrappers are reconfigured without
-/// nesting. Returns how many entries changed. Idempotent, format-preserving.
-pub fn wrap_toml(doc: &mut DocumentMut, guard_bin: &str, monitor: bool) -> usize {
-    for_each_server(doc, |s| wrap_server(s, guard_bin, monitor))
+/// (`monitor=true`) or guard mode, each wrapper naming `agent`, the agent whose
+/// configuration this is. Existing wrappers are reconfigured without nesting,
+/// and one written before wrappers named their agent gains the name. Returns
+/// how many entries changed. Idempotent, format-preserving.
+pub fn wrap_toml(doc: &mut DocumentMut, guard_bin: &str, monitor: bool, agent: &str) -> usize {
+    wrap_toml_naming(doc, guard_bin, monitor, Some(agent))
+}
+
+fn wrap_toml_naming(
+    doc: &mut DocumentMut,
+    guard_bin: &str,
+    monitor: bool,
+    agent: Option<&str>,
+) -> usize {
+    for_each_server(doc, |s| wrap_server(s, guard_bin, monitor, agent))
+}
+
+/// The TOML twin of [`crate::mcp_wire::unnamed_reconnect_flag`]: when some
+/// wrapper's proxy records no agent or another one, the mode flag a reconnect
+/// by hand with `guard_bin` needs so that it adds `agent`'s name and changes
+/// nothing else; `None` when every proxy records `agent` already or the
+/// reconnect would change more. Pure.
+pub fn unnamed_reconnect_flag_toml(
+    doc: &DocumentMut,
+    guard_bin: &str,
+    agent: &str,
+) -> Option<&'static str> {
+    if !is_wrapper_name(agent) || !is_guarded_toml(doc) {
+        return None;
+    }
+    let monitor = match guarded_mode_toml(doc)? {
+        WiringMode::Monitor => true,
+        WiringMode::Enforce => false,
+        WiringMode::Mixed => return None,
+    };
+    let unnamed = doc
+        .get("mcp_servers")
+        .and_then(Item::as_table)
+        .into_iter()
+        .flat_map(Table::iter)
+        .filter_map(|(_, item)| item.as_table())
+        .filter_map(wrapper_options)
+        .any(|options| proxy_agent(&options) != Some(agent));
+    let beyond_the_name = wrap_toml_naming(&mut doc.clone(), guard_bin, monitor, None);
+    (unnamed && beyond_the_name == 0).then_some(if monitor { " --monitor" } else { "" })
+}
+
+/// The proxy options of a wrapper (the words between `proxy` and its `--`),
+/// or `None` for a server that is not one.
+fn wrapper_options(server: &Table) -> Option<Vec<Option<&str>>> {
+    let separator = wrapper_separator(server)?;
+    let args = server.get("args").and_then(Item::as_array)?;
+    Some(
+        args.iter()
+            .skip(1)
+            .take(separator - 1)
+            .map(Value::as_str)
+            .collect(),
+    )
 }
 
 /// Undo `wrap_toml`. Returns how many servers were unwrapped.
@@ -378,7 +460,7 @@ url = "https://example.com/mcp"
         let mut d = doc();
         assert!(is_guardable_toml(&d));
         assert!(!is_guarded_toml(&d));
-        let n = wrap_toml(&mut d, "innerwarden", false);
+        let n = wrap_toml(&mut d, "innerwarden", false, "codex");
         assert_eq!(n, 2, "two stdio servers wrapped, remote_only left alone");
         // command rewritten, original preserved inside args
         let icm = d["mcp_servers"]["icm"].as_table().unwrap();
@@ -391,7 +473,19 @@ url = "https://example.com/mcp"
             .collect();
         assert_eq!(
             args,
-            vec!["proxy", "--mode", "guard", "--", "npx", "-y", "some-server"]
+            vec![
+                "proxy",
+                "--label",
+                "codex",
+                "--agent",
+                "codex",
+                "--mode",
+                "guard",
+                "--",
+                "npx",
+                "-y",
+                "some-server"
+            ]
         );
         // unrelated config + comment preserved
         let out = d.to_string();
@@ -422,9 +516,9 @@ url = "https://example.com/mcp"
     #[test]
     fn wrap_is_idempotent() {
         let mut d = doc();
-        assert_eq!(wrap_toml(&mut d, "innerwarden", false), 2);
+        assert_eq!(wrap_toml(&mut d, "innerwarden", false, "codex"), 2);
         assert_eq!(
-            wrap_toml(&mut d, "innerwarden", false),
+            wrap_toml(&mut d, "innerwarden", false, "codex"),
             0,
             "second wrap is a no-op"
         );
@@ -433,7 +527,7 @@ url = "https://example.com/mcp"
     #[test]
     fn unwrap_restores_the_original() {
         let mut d = doc();
-        wrap_toml(&mut d, "innerwarden", false);
+        wrap_toml(&mut d, "innerwarden", false, "codex");
         let n = unwrap_toml(&mut d);
         assert_eq!(n, 2);
         let icm = d["mcp_servers"]["icm"].as_table().unwrap();
@@ -455,15 +549,15 @@ url = "https://example.com/mcp"
             .unwrap();
         assert!(is_guarded_toml(&d));
         assert_eq!(guarded_mode_toml(&d), Some(WiringMode::Enforce));
-        assert_eq!(wrap_toml(&mut d, "innerwarden", false), 1);
-        assert_eq!(wrap_toml(&mut d, "innerwarden", false), 0);
+        assert_eq!(wrap_toml(&mut d, "innerwarden", false, "codex"), 1);
+        assert_eq!(wrap_toml(&mut d, "innerwarden", false, "codex"), 0);
     }
 
     #[test]
     fn switching_monitor_and_enforce_rewrites_without_nesting() {
         let original = doc();
         let mut d = original.clone();
-        assert_eq!(wrap_toml(&mut d, "innerwarden", true), 2);
+        assert_eq!(wrap_toml(&mut d, "innerwarden", true, "codex"), 2);
         assert_eq!(guarded_mode_toml(&d), Some(WiringMode::Monitor));
         let first = d["mcp_servers"]["icm"]["args"]
             .as_array()
@@ -475,6 +569,10 @@ url = "https://example.com/mcp"
             first,
             vec![
                 "proxy",
+                "--label",
+                "codex",
+                "--agent",
+                "codex",
                 "--mode",
                 "advisory",
                 "--",
@@ -484,7 +582,7 @@ url = "https://example.com/mcp"
             ]
         );
 
-        assert_eq!(wrap_toml(&mut d, "innerwarden", false), 2);
+        assert_eq!(wrap_toml(&mut d, "innerwarden", false, "codex"), 2);
         assert_eq!(guarded_mode_toml(&d), Some(WiringMode::Enforce));
         assert_eq!(unwrap_toml(&mut d), 2);
         assert_eq!(d.to_string(), original.to_string());
@@ -499,7 +597,7 @@ args = ["proxy", "--label", "codex-main", "--error-response", "--mode", "guard",
 "#
         .parse::<DocumentMut>()
         .unwrap();
-        assert_eq!(wrap_toml(&mut d, "innerwarden", true), 1);
+        assert_eq!(wrap_toml(&mut d, "innerwarden", true, "codex"), 1);
         let args = d["mcp_servers"]["x"]["args"].as_array().unwrap();
         let values: Vec<&str> = args.iter().map(|v| v.as_str().unwrap()).collect();
         assert_eq!(
@@ -509,6 +607,8 @@ args = ["proxy", "--label", "codex-main", "--error-response", "--mode", "guard",
                 "--label",
                 "codex-main",
                 "--error-response",
+                "--agent",
+                "codex",
                 "--mode",
                 "advisory",
                 "--",
@@ -516,7 +616,7 @@ args = ["proxy", "--label", "codex-main", "--error-response", "--mode", "guard",
                 "srv"
             ]
         );
-        assert_eq!(wrap_toml(&mut d, "innerwarden", false), 1);
+        assert_eq!(wrap_toml(&mut d, "innerwarden", false, "codex"), 1);
         assert_eq!(guarded_mode_toml(&d), Some(WiringMode::Enforce));
     }
 
@@ -524,7 +624,7 @@ args = ["proxy", "--label", "codex-main", "--error-response", "--mode", "guard",
     fn partial_and_invalid_wiring_are_reported_conservatively() {
         let mut partial = doc();
         // Wrap two, then add a new local server that is not wrapped yet.
-        wrap_toml(&mut partial, "innerwarden", false);
+        wrap_toml(&mut partial, "innerwarden", false, "codex");
         partial["mcp_servers"]["late"] = Item::Table({
             let mut table = Table::new();
             table.insert("command", value("python"));
@@ -549,7 +649,7 @@ args = ["proxy", "--label", "codex-main", "--error-response", "--mode", "guard",
             .parse::<DocumentMut>()
             .unwrap();
         let before = broken.to_string();
-        assert_eq!(wrap_toml(&mut broken, "innerwarden", true), 0);
+        assert_eq!(wrap_toml(&mut broken, "innerwarden", true, "codex"), 0);
         assert_eq!(
             broken.to_string(),
             before,
@@ -562,5 +662,251 @@ args = ["proxy", "--label", "codex-main", "--error-response", "--mode", "guard",
         let d = "model = \"x\"\n".parse::<DocumentMut>().unwrap();
         assert!(!is_guardable_toml(&d));
         assert!(!is_guarded_toml(&d));
+    }
+}
+
+#[cfg(test)]
+mod agent_naming_tests {
+    use super::*;
+
+    const BIN: &str = "/home/u/.local/bin/innerwarden";
+
+    fn parse(source: &str) -> DocumentMut {
+        source.parse::<DocumentMut>().unwrap()
+    }
+
+    fn args_of(doc: &DocumentMut, name: &str) -> Vec<String> {
+        doc["mcp_servers"][name]["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|arg| arg.as_str().unwrap().to_string())
+            .collect()
+    }
+
+    fn wrapper(command: &str, args: &str) -> DocumentMut {
+        parse(&format!(
+            "# the user's own note\nmodel = \"gpt-5\"\n\n[mcp_servers.icm]\ncommand = \"{command}\"\nargs = {args}\n[mcp_servers.icm.env]\nFOO = \"bar\"\n"
+        ))
+    }
+
+    /// REGRESSION ANCHOR, the Codex twin of
+    /// `mcp_wire::agent_naming_tests::wrap_names_the_agent_on_the_proxy`.
+    ///
+    /// FAILS ON REVERT: drop the naming from `wrap_server` and the args read
+    /// `proxy --mode advisory -- npx ...`.
+    #[test]
+    fn wrap_names_the_agent_on_the_proxy() {
+        let mut d = wrapper("npx", "[\"-y\", \"some-server\"]");
+        assert_eq!(wrap_toml(&mut d, BIN, true, "codex"), 1);
+        assert_eq!(
+            args_of(&d, "icm"),
+            [
+                "proxy",
+                "--label",
+                "codex",
+                "--agent",
+                "codex",
+                "--mode",
+                "advisory",
+                "--",
+                "npx",
+                "-y",
+                "some-server"
+            ]
+        );
+        assert_eq!(guarded_mode_toml(&d), Some(WiringMode::Monitor));
+        assert!(d.to_string().contains("# the user's own note"));
+    }
+
+    /// An operator's label is kept in either spelling; only the agent is
+    /// added beside it.
+    #[test]
+    fn an_operator_label_is_kept() {
+        for (options, expected) in [
+            (
+                "\"--label\", \"prod\"",
+                vec![
+                    "proxy", "--label", "prod", "--agent", "codex", "--mode", "guard", "--", "icm",
+                ],
+            ),
+            (
+                "\"--label=prod\"",
+                vec![
+                    "proxy",
+                    "--label=prod",
+                    "--agent",
+                    "codex",
+                    "--mode",
+                    "guard",
+                    "--",
+                    "icm",
+                ],
+            ),
+        ] {
+            let mut d = wrapper(
+                BIN,
+                &format!("[\"proxy\", {options}, \"--mode\", \"guard\", \"--\", \"icm\"]"),
+            );
+            assert_eq!(wrap_toml(&mut d, BIN, false, "codex"), 1, "{options}");
+            assert_eq!(args_of(&d, "icm"), expected, "{options}");
+        }
+    }
+
+    /// A wrapper an earlier release wrote gains the name and nothing else: the
+    /// mode, its other options, the server's own command line, the comment and
+    /// every other key stay as they were, and unwrapping still gives back the
+    /// server exactly as the user had it.
+    #[test]
+    fn a_wrapper_written_before_wrappers_named_their_agent_gains_the_name_and_nothing_else() {
+        let original = wrapper("npx", "[\"-y\", \"some-server\", \"--root\", \"/srv/a b\"]");
+        let mut before = original.clone();
+        // What 1.5.1 wrote: no label, no agent.
+        assert_eq!(wrap_toml_naming(&mut before, BIN, true, None), 1);
+        assert_eq!(
+            args_of(&before, "icm"),
+            [
+                "proxy",
+                "--mode",
+                "advisory",
+                "--",
+                "npx",
+                "-y",
+                "some-server",
+                "--root",
+                "/srv/a b"
+            ]
+        );
+
+        let mut after = before.clone();
+        assert_eq!(wrap_toml(&mut after, BIN, true, "codex"), 1);
+        assert_eq!(
+            args_of(&after, "icm"),
+            [
+                "proxy",
+                "--label",
+                "codex",
+                "--agent",
+                "codex",
+                "--mode",
+                "advisory",
+                "--",
+                "npx",
+                "-y",
+                "some-server",
+                "--root",
+                "/srv/a b"
+            ]
+        );
+        assert_eq!(after["mcp_servers"]["icm"]["command"].as_str(), Some(BIN));
+        assert_eq!(guarded_mode_toml(&after), guarded_mode_toml(&before));
+        assert_eq!(
+            after["mcp_servers"]["icm"]["env"].to_string(),
+            before["mcp_servers"]["icm"]["env"].to_string()
+        );
+        assert_eq!(wrap_toml(&mut after.clone(), BIN, true, "codex"), 0);
+        assert_eq!(unwrap_toml(&mut after), 1);
+        assert_eq!(after.to_string(), original.to_string());
+    }
+
+    #[test]
+    fn server_mode_reads_through_label_and_agent() {
+        for (args, mode) in [
+            (
+                "[\"proxy\", \"--label\", \"codex\", \"--agent\", \"codex\", \"--mode\", \"advisory\", \"--\", \"icm\"]",
+                WiringMode::Monitor,
+            ),
+            (
+                "[\"proxy\", \"--agent=codex\", \"--label=x\", \"--mode=guard\", \"--\", \"icm\"]",
+                WiringMode::Enforce,
+            ),
+            (
+                "[\"proxy\", \"--label\", \"codex\", \"--agent\", \"codex\", \"--\", \"icm\"]",
+                WiringMode::Enforce,
+            ),
+        ] {
+            let d = wrapper(BIN, args);
+            assert!(is_guarded_toml(&d), "{args}");
+            assert_eq!(guarded_mode_toml(&d), Some(mode), "{args}");
+        }
+    }
+
+    #[test]
+    fn a_name_that_is_not_a_plain_id_is_never_written() {
+        for agent in ["", "Codex", "my.app", "x; rm -rf /", "--mode"] {
+            let mut d = wrapper("npx", "[\"srv\"]");
+            wrap_toml(&mut d, BIN, false, agent);
+            assert_eq!(
+                args_of(&d, "icm"),
+                ["proxy", "--mode", "guard", "--", "npx", "srv"],
+                "{agent:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unnamed_wiring_is_offered_the_reconnect_that_names_it_in_its_own_mode() {
+        let mut monitor = wrapper("npx", "[\"srv\"]");
+        wrap_toml_naming(&mut monitor, BIN, true, None);
+        assert_eq!(
+            unnamed_reconnect_flag_toml(&monitor, BIN, "codex"),
+            Some(" --monitor")
+        );
+        let mut enforce = wrapper("npx", "[\"srv\"]");
+        wrap_toml_naming(&mut enforce, BIN, false, None);
+        assert_eq!(
+            unnamed_reconnect_flag_toml(&enforce, BIN, "codex"),
+            Some("")
+        );
+        let borrowed = wrapper(
+            BIN,
+            "[\"proxy\", \"--label\", \"cursor\", \"--agent\", \"cursor\", \"--mode\", \"guard\", \"--\", \"icm\"]",
+        );
+        assert_eq!(
+            unnamed_reconnect_flag_toml(&borrowed, BIN, "codex"),
+            Some("")
+        );
+
+        for (mut d, monitor) in [(monitor, true), (enforce, false), (borrowed, false)] {
+            let mode = guarded_mode_toml(&d);
+            assert_eq!(wrap_toml(&mut d, BIN, monitor, "codex"), 1);
+            assert_eq!(unnamed_reconnect_flag_toml(&d, BIN, "codex"), None);
+            assert_eq!(guarded_mode_toml(&d), mode);
+        }
+    }
+
+    #[test]
+    fn no_reconnect_is_offered_where_it_would_change_more_than_the_name() {
+        for args in [
+            // Named already, or its proxy records the agent already.
+            "[\"proxy\", \"--label\", \"codex\", \"--agent\", \"codex\", \"--mode\", \"guard\", \"--\", \"icm\"]",
+            "[\"proxy\", \"--agent\", \"codex\", \"--mode\", \"guard\", \"--\", \"icm\"]",
+            "[\"proxy\", \"--label\", \"prod\", \"--agent=codex\", \"--mode\", \"guard\", \"--\", \"icm\"]",
+            // The oldest layout: a reconnect would write a `--mode`.
+            "[\"proxy\", \"--\", \"icm\"]",
+        ] {
+            let d = wrapper(BIN, args);
+            assert_eq!(unnamed_reconnect_flag_toml(&d, BIN, "codex"), None, "{args}");
+        }
+        // Another copy of the CLI: the reconnect would move the wrapper to this one.
+        let elsewhere = wrapper(
+            "/opt/pinned/innerwarden",
+            "[\"proxy\", \"--mode\", \"guard\", \"--\", \"icm\"]",
+        );
+        assert_eq!(unnamed_reconnect_flag_toml(&elsewhere, BIN, "codex"), None);
+        // Two modes, or a server still open.
+        let mixed = parse(&format!(
+            "[mcp_servers.a]\ncommand = \"{BIN}\"\nargs = [\"proxy\", \"--mode\", \"advisory\", \"--\", \"a\"]\n\n[mcp_servers.b]\ncommand = \"{BIN}\"\nargs = [\"proxy\", \"--mode\", \"guard\", \"--\", \"b\"]\n"
+        ));
+        assert_eq!(guarded_mode_toml(&mixed), Some(WiringMode::Mixed));
+        assert_eq!(unnamed_reconnect_flag_toml(&mixed, BIN, "codex"), None);
+        let partial = parse(&format!(
+            "[mcp_servers.a]\ncommand = \"{BIN}\"\nargs = [\"proxy\", \"--mode\", \"guard\", \"--\", \"a\"]\n\n[mcp_servers.b]\ncommand = \"b\"\n"
+        ));
+        assert_eq!(unnamed_reconnect_flag_toml(&partial, BIN, "codex"), None);
+        // No plain id, no name to add.
+        let mut unnamed = wrapper("npx", "[\"srv\"]");
+        wrap_toml_naming(&mut unnamed, BIN, false, None);
+        assert_eq!(unnamed_reconnect_flag_toml(&unnamed, BIN, "my.app"), None);
     }
 }

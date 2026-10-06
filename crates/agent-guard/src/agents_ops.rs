@@ -971,7 +971,13 @@ fn connect_one_result_with_link_policy(
                 ),
             );
         }
-        let (wrapped, n) = mcp_wire::wrap(cfg, guard_bin, monitor);
+        // Every wrapper names this agent, so the decisions its proxy records
+        // say which agent asked (`--label`/`--agent`, see `mcp_wire::naming`).
+        // A wrapper an earlier release wrote gains the name here, on a connect
+        // a person ran. Automatic setup never reaches this for existing wiring
+        // (it stops at "existing MCP wiring left unchanged" above), exactly as
+        // it never adds a name to an existing hook.
+        let (wrapped, n) = mcp_wire::wrap(cfg, guard_bin, monitor, &r.name);
         let fully_guarded = mcp_wire::is_guarded(&wrapped);
         if !fully_guarded {
             return ConnectResult::new(
@@ -1054,7 +1060,7 @@ fn connect_one_result_with_link_policy(
                 ),
             );
         }
-        let n = mcp_wire_toml::wrap_toml(&mut doc, guard_bin, monitor);
+        let n = mcp_wire_toml::wrap_toml(&mut doc, guard_bin, monitor, &r.name);
         let fully_guarded = mcp_wire_toml::is_guarded_toml(&doc);
         if !fully_guarded {
             return ConnectResult::new(
@@ -2060,6 +2066,254 @@ mod tests {
             std::fs::read_to_string(home.path().join(".cursor/mcp.json")).unwrap(),
             existing
         );
+    }
+
+    fn known_row(home: &Path, name: &str) -> AgentStatus {
+        let (rows, _) = rows_from_sources(home, &[], None);
+        rows.into_iter().find(|row| row.name == name).unwrap()
+    }
+
+    fn openclaw_server_args(config: &Value, name: &str) -> Vec<String> {
+        config["mcp"]["servers"][name]["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|arg| arg.as_str().unwrap().to_string())
+            .collect()
+    }
+
+    fn read_openclaw(home: &Path) -> Value {
+        serde_json::from_slice(&std::fs::read(home.join(".openclaw/openclaw.json")).unwrap())
+            .unwrap()
+    }
+
+    /// REGRESSION ANCHOR. `agents connect openclaw` wrote `proxy --mode M --
+    /// <server>` and nothing else, so the proxy recorded every OpenClaw tool
+    /// call in the session `mcp:innerwarden` naming no agent, and its cases
+    /// said "An agent asked, through an MCP connection".
+    ///
+    /// FAILS ON REVERT: pass no agent to `mcp_wire::wrap` from
+    /// `connect_one_result_with_link_policy`, and every proxy reads
+    /// `proxy --mode advisory -- ...`.
+    #[test]
+    fn connect_openclaw_writes_its_id_on_every_proxy() {
+        let home = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path().join(".openclaw")).unwrap();
+        std::fs::write(
+            home.path().join(".openclaw/openclaw.json"),
+            r#"{"gateway":{"port":18789},"mcp":{"servers":{
+                "fs":{"command":"npx","args":["-y","fs-server"]},
+                "git":{"command":"uvx","args":["mcp-server-git"]},
+                "remote":{"url":"https://example.com/sse"}}}}"#,
+        )
+        .unwrap();
+        let row = known_row(home.path(), "openclaw");
+
+        let result = connect_one_result(home.path(), &row, "/abs/innerwarden", false, true);
+        assert_eq!(result.effect, ConnectEffect::Connected, "{}", result.line);
+
+        let config = read_openclaw(home.path());
+        for (name, child) in [
+            ("fs", vec!["npx", "-y", "fs-server"]),
+            ("git", vec!["uvx", "mcp-server-git"]),
+        ] {
+            let mut expected = vec![
+                "proxy", "--label", "openclaw", "--agent", "openclaw", "--mode", "advisory", "--",
+            ];
+            expected.extend(child);
+            assert_eq!(openclaw_server_args(&config, name), expected, "{name}");
+            assert_eq!(
+                config["mcp"]["servers"][name]["command"],
+                "/abs/innerwarden"
+            );
+        }
+        assert_eq!(
+            config["mcp"]["servers"]["remote"],
+            serde_json::json!({"url": "https://example.com/sse"})
+        );
+        assert_eq!(config["gateway"], serde_json::json!({"port": 18789}));
+    }
+
+    /// The Codex twin: its TOML wrappers name it too, in enforce here.
+    ///
+    /// FAILS ON REVERT: pass no agent to `mcp_wire_toml::wrap_toml`.
+    #[test]
+    fn connect_codex_writes_its_id_on_every_proxy() {
+        let home = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path().join(".codex")).unwrap();
+        std::fs::write(
+            home.path().join(".codex/config.toml"),
+            "model = \"gpt-5\"\n\n[mcp_servers.icm]\ncommand = \"icm\"\nargs = [\"serve\"]\n\n[mcp_servers.repl]\ncommand = \"node\"\n",
+        )
+        .unwrap();
+        let row = known_row(home.path(), "codex");
+
+        let result = connect_one_result(home.path(), &row, "/abs/innerwarden", false, false);
+        assert_eq!(result.effect, ConnectEffect::Connected, "{}", result.line);
+
+        let doc: toml_edit::DocumentMut =
+            std::fs::read_to_string(home.path().join(".codex/config.toml"))
+                .unwrap()
+                .parse()
+                .unwrap();
+        for (name, child) in [("icm", vec!["icm", "serve"]), ("repl", vec!["node"])] {
+            let args: Vec<&str> = doc["mcp_servers"][name]["args"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|arg| arg.as_str().unwrap())
+                .collect();
+            let mut expected = vec![
+                "proxy", "--label", "codex", "--agent", "codex", "--mode", "guard", "--",
+            ];
+            expected.extend(child);
+            assert_eq!(args, expected, "{name}");
+        }
+        assert_eq!(doc["model"].as_str(), Some("gpt-5"));
+    }
+
+    /// The Codex twin of the reconnect below, read back from the file the way
+    /// every later connect and the dashboard read it.
+    ///
+    /// A TOML array read from a file keeps the spacing it was written with, and
+    /// the wrapper compared that text against a freshly built array that has
+    /// none, so an identical wrapper always looked changed: every connect
+    /// rewrote `config.toml` and reported "connected", and the dashboard could
+    /// never tell that a reconnect would change only the name. Wrappers are now
+    /// compared word for word, formatting aside.
+    ///
+    /// FAILS ON REVERT: compare the arrays' text again, and the second connect
+    /// reports `Connected` and the step is never offered.
+    #[test]
+    fn reconnect_names_a_codex_wrapper_and_then_leaves_the_file_alone() {
+        const BIN: &str = "/abs/innerwarden";
+        let home = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path().join(".codex")).unwrap();
+        let path = home.path().join(".codex/config.toml");
+        let old = "# mine\nmodel = \"gpt-5\"\n\n[mcp_servers.icm]\ncommand = \"/abs/innerwarden\"\nargs = [\"proxy\", \"--mode\", \"guard\", \"--\", \"icm\", \"serve\"]\n";
+        std::fs::write(&path, old).unwrap();
+        let read = || -> toml_edit::DocumentMut {
+            std::fs::read_to_string(&path).unwrap().parse().unwrap()
+        };
+        let row = known_row(home.path(), "codex");
+
+        let automatic = connect_one_result_automatic(home.path(), &row, BIN, false, false);
+        assert_eq!(
+            automatic.effect,
+            ConnectEffect::Skipped,
+            "{}",
+            automatic.line
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), old);
+        assert_eq!(
+            mcp_wire_toml::unnamed_reconnect_flag_toml(&read(), BIN, "codex"),
+            Some("")
+        );
+
+        let manual = connect_one_result(home.path(), &row, BIN, false, false);
+        assert_eq!(manual.effect, ConnectEffect::Connected, "{}", manual.line);
+        let named = std::fs::read_to_string(&path).unwrap();
+        assert!(named.starts_with("# mine\nmodel = \"gpt-5\"\n"), "{named}");
+        let doc = read();
+        let args: Vec<&str> = doc["mcp_servers"]["icm"]["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|arg| arg.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "proxy", "--label", "codex", "--agent", "codex", "--mode", "guard", "--", "icm",
+                "serve"
+            ]
+        );
+        assert_eq!(
+            mcp_wire_toml::unnamed_reconnect_flag_toml(&doc, BIN, "codex"),
+            None
+        );
+
+        let again = connect_one_result(home.path(), &row, BIN, false, false);
+        assert_eq!(again.effect, ConnectEffect::Unchanged, "{}", again.line);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), named);
+    }
+
+    /// A host upgraded from a release whose wrappers named no agent.
+    ///
+    /// Automatic setup leaves that wiring exactly as it is: background setup
+    /// never rewrites existing wiring, as it never adds a name to an existing
+    /// hook. The dashboard offers the reconnect in the wiring's own mode, and
+    /// that connect, run by a person, adds the name and changes nothing else:
+    /// same program, same mode, the options it had, the server's own command
+    /// line, every key outside the wrapper. A second connect has nothing to do.
+    ///
+    /// FAILS ON REVERT: pass no agent to `mcp_wire::wrap`, and the connect
+    /// reports "already guarded" with the wrapper still unnamed.
+    #[test]
+    fn reconnect_adds_the_agent_to_a_label_less_wrapper_and_changes_nothing_else() {
+        const BIN: &str = "/abs/innerwarden";
+        let home = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path().join(".openclaw")).unwrap();
+        let old = r#"{"gateway":{"port":18789},"mcp":{"servers":{"fs":{"command":"/abs/innerwarden","args":["proxy","--error-response","--mode","advisory","--","npx","-y","fs-server","--root","/srv/a b"]}}}}"#;
+        std::fs::write(home.path().join(".openclaw/openclaw.json"), old).unwrap();
+        let before = read_openclaw(home.path());
+        let row = known_row(home.path(), "openclaw");
+
+        let automatic = connect_one_result_automatic(home.path(), &row, BIN, false, true);
+        assert_eq!(
+            automatic.effect,
+            ConnectEffect::Skipped,
+            "{}",
+            automatic.line
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.path().join(".openclaw/openclaw.json")).unwrap(),
+            old
+        );
+        assert_eq!(
+            mcp_wire::unnamed_reconnect_flag(&before, BIN, "openclaw"),
+            Some(" --monitor")
+        );
+
+        let manual = connect_one_result(home.path(), &row, BIN, false, true);
+        assert_eq!(manual.effect, ConnectEffect::Connected, "{}", manual.line);
+        let after = read_openclaw(home.path());
+        assert_eq!(
+            openclaw_server_args(&after, "fs"),
+            [
+                "proxy",
+                "--error-response",
+                "--label",
+                "openclaw",
+                "--agent",
+                "openclaw",
+                "--mode",
+                "advisory",
+                "--",
+                "npx",
+                "-y",
+                "fs-server",
+                "--root",
+                "/srv/a b"
+            ]
+        );
+        assert_eq!(after["mcp"]["servers"]["fs"]["command"], BIN);
+        assert_eq!(after["gateway"], before["gateway"]);
+        assert_eq!(
+            mcp_wire::guarded_mode(&after),
+            Some(mcp_wire::WiringMode::Monitor)
+        );
+        assert_eq!(
+            mcp_wire::unwrap(after.clone()).0,
+            mcp_wire::unwrap(before).0
+        );
+        assert_eq!(
+            mcp_wire::unnamed_reconnect_flag(&after, BIN, "openclaw"),
+            None
+        );
+
+        let again = connect_one_result(home.path(), &row, BIN, false, true);
+        assert_eq!(again.effect, ConnectEffect::Unchanged, "{}", again.line);
     }
 
     /// Wire Claude Code's hook at `bin` exactly as `install` writes it.
