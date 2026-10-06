@@ -58,8 +58,12 @@ follows semantic versioning.
   nothing said is `undetermined`, `turn_ended_without_reply`. A heartbeat or
   cron turn never closes an ask. A turn holding a message in a shape the
   plugin does not know is not reported, unless a tool call it recognises
-  makes it `tool_call_in_turn`, and the ask is recorded as not seen. The
-  plugin reads Control UI turns only.
+  makes it `tool_call_in_turn`, and the ask is recorded as not seen. Where
+  the plugin runs, the message hook's two-minute timer leaves an ask to the
+  end of its turn (at most 15 minutes), so a long turn is not recorded as
+  "this chat does not report your agent's reply", and what the guard
+  recorded late in it is in the record. The plugin reads Control UI turns
+  only.
   The gateway logs the plugin as one it cannot verify, because it was not
   installed through `openclaw plugins install`.
 - **A reply is no longer read as the model declining.** `observe reply`

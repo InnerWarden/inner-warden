@@ -379,14 +379,26 @@ impl Pending {
     /// least `wait_seconds`. A call that comes early leaves it in place, so a
     /// newer ask in the same session is never closed by the timer an older
     /// one started.
+    ///
+    /// `turn_end_reported`: the reply plugin runs on this host, so the end of
+    /// the turn an ask with a message id started will be reported
+    /// ([`Pending::take_for_run`]). Such an ask is left for that report, with
+    /// [`PENDING_TTL_SECONDS`] as the bound, instead of being closed with the
+    /// channel's silence as its reason: a turn longer than the wait would
+    /// otherwise be recorded as "this chat does not report the reply" on a
+    /// host whose plugin reports it, and what the guard recorded later in the
+    /// same turn would never reach the record.
     pub fn take_if_waited(
         &mut self,
         session: &str,
         now: u64,
         wait_seconds: u64,
+        turn_end_reported: bool,
     ) -> Option<PendingAsk> {
         let index = self.asks.iter().position(|ask| {
-            ask.session == session && now.saturating_sub(ask.asked_at) >= wait_seconds
+            ask.session == session
+                && now.saturating_sub(ask.asked_at) >= wait_seconds
+                && !(turn_end_reported && !ask.message.is_empty())
         })?;
         Some(self.asks.remove(index))
     }
@@ -2566,12 +2578,50 @@ mod tests {
         let mut state = Pending::default();
         state.remember(pending("s1", 1_000));
         let wait = UNREPORTED_REPLY_WAIT_SECONDS;
-        assert!(state.take_if_waited("s1", 1_000 + wait - 1, wait).is_none());
-        assert!(state.take_if_waited("s2", 1_000 + wait, wait).is_none());
+        assert!(state
+            .take_if_waited("s1", 1_000 + wait - 1, wait, false)
+            .is_none());
+        assert!(state
+            .take_if_waited("s2", 1_000 + wait, wait, false)
+            .is_none());
         assert_eq!(state.asks.len(), 1);
-        let taken = state.take_if_waited("s1", 1_000 + wait, wait).expect("due");
+        let taken = state
+            .take_if_waited("s1", 1_000 + wait, wait, false)
+            .expect("due");
         assert_eq!(taken.asked_at, 1_000);
         assert!(state.asks.is_empty());
+    }
+
+    /// Where the reply plugin runs, an ask whose message started a turn is
+    /// left for the report of that turn's end, however long the turn takes:
+    /// settling it at the wait would say the chat does not report the reply,
+    /// on a host whose plugin does. An ask with no message id, or a host
+    /// without the plugin, is settled at the wait as before.
+    ///
+    /// FAILS ON REVERT: ignore `turn_end_reported` and the first ask is taken
+    /// at the wait.
+    #[test]
+    fn where_the_plugin_reports_turns_an_ask_with_a_message_waits_for_its_turn() {
+        let wait = UNREPORTED_REPLY_WAIT_SECONDS;
+        let mut state = Pending::default();
+        state.remember(webchat("s1", "run-1", 1_000));
+        assert!(state
+            .take_if_waited("s1", 1_000 + wait * 5, wait, true)
+            .is_none());
+        assert_eq!(
+            state.take_for_run("s1", "run-1").map(|ask| ask.asked_at),
+            Some(1_000)
+        );
+
+        state.remember(pending("s2", 1_000));
+        assert!(state
+            .take_if_waited("s2", 1_000 + wait, wait, true)
+            .is_some());
+
+        state.remember(webchat("s3", "run-3", 1_000));
+        assert!(state
+            .take_if_waited("s3", 1_000 + wait, wait, false)
+            .is_some());
     }
 
     /// The record names the agent the hook was installed for, so a consumer

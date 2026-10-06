@@ -104,8 +104,11 @@ logs it as a plugin it cannot verify, because it was not installed through
 shows it. A heartbeat or cron turn never closes an ask.
 
 A reply with no tool call in the turn is recorded as answered without running
-anything (`replied_without_tool_call`), outcome `undetermined`. Where
-the plugin does not run, or its report cannot be matched to the ask, a
+anything (`replied_without_tool_call`), outcome `undetermined`. Where the
+plugin runs (installed, InnerWarden's own, and not kept off by the config), an
+ask whose message started a turn waits for that turn's end however long it
+takes, up to 15 minutes, so what the guard records late in a long turn is in
+the record. Where the plugin does not run, or the ask carries no message id, a
 dangerous webchat ask is held for two minutes, long enough for what the guard
 records in the same turn to be seen, and then recorded as `undetermined`, with
 `channel_reports_no_reply` or what the guard recorded in that turn as its

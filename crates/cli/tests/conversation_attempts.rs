@@ -161,6 +161,10 @@ impl Host {
         let mut child = Command::new(bin())
             .args(args)
             .env("IW_GRAPH_FILE", &self.graph)
+            // A home of its own: `observe` reads what OpenClaw has installed
+            // there, and the developer's own must not decide a test.
+            .env("HOME", self._dir.path())
+            .env("USERPROFILE", self._dir.path())
             // The guard's session label prefers this over the payload's, so
             // a value inherited from the shell would rename every session.
             .env_remove("IW_GUARD_SESSION")
@@ -206,6 +210,21 @@ impl Host {
             reply,
         );
         assert_eq!(outbound.status.code(), Some(0), "reply must never fail");
+    }
+
+    /// OpenClaw on this host, with what `observe install` adds: the message
+    /// hook and the reply plugin, enabled.
+    fn install_openclaw(&self) {
+        let openclaw = self._dir.path().join(".openclaw");
+        std::fs::create_dir_all(&openclaw).expect("openclaw dir");
+        std::fs::write(openclaw.join("openclaw.json"), "{}\n").expect("config");
+        let out = self.run(&["observe", "install"], "");
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     fn attempts(&self) -> Vec<Value> {
@@ -1018,6 +1037,73 @@ fn a_second_ask_in_one_session_records_both() {
         second["decider_basis"], "no_screened_execution_recorded_in_window",
         "the reply answers the latest ask: {second}"
     );
+}
+
+/// Where the reply plugin runs, a Control UI turn longer than the settle wait
+/// is closed by its own end, with what ran in it. The hook's timer fires at
+/// two minutes either way; it used to close the ask then, saying the chat
+/// does not report the reply (on a host whose plugin does), with the window
+/// cut at two minutes, so an action monitor mode let run at minute three
+/// never reached the record.
+///
+/// FAILS ON REVERT: settle every webchat ask at the wait, and the record says
+/// `channel_reports_no_reply` instead of the flagged action.
+#[test]
+fn where_the_reply_plugin_runs_a_long_control_ui_turn_is_closed_by_its_end() {
+    let host = Host::new();
+    host.install_openclaw();
+    let session = "agent:main:main";
+    let inbound = host.run(
+        &[
+            "observe",
+            "inbound",
+            "--session",
+            session,
+            "--channel",
+            "webchat",
+            "--agent",
+            "openclaw",
+            "--message",
+            "run-long",
+        ],
+        MINER_PROMPT,
+    );
+    assert_eq!(inbound.status.code(), Some(0));
+
+    // Three minutes into the turn, monitor mode lets a flagged action run,
+    // and the hook's settle timer has fired.
+    host.age(180);
+    let flagged = host.hook(&["--monitor", "--agent", "openclaw"], DENIED_TOOL_CALL);
+    assert_eq!(flagged.status.code(), Some(0), "monitor never refuses");
+    host.settle(session);
+    assert!(host.attempts().is_empty(), "{:?}", host.attempts());
+    assert_eq!(host.pending_sessions(), vec![session.to_string()]);
+
+    // The turn ends at minute four.
+    host.age(60);
+    let ended = host.run(
+        &[
+            "observe",
+            "ended",
+            "--session",
+            session,
+            "--run",
+            "run-long",
+            "--turn",
+            "replied",
+        ],
+        "",
+    );
+    assert_eq!(ended.status.code(), Some(0));
+    let attempts = host.attempts();
+    assert_eq!(attempts.len(), 1, "{attempts:?}");
+    assert_eq!(attempts[0]["decider"], "undetermined");
+    assert_eq!(
+        attempts[0]["decider_basis"], "flagged_action_ran_in_window",
+        "{}",
+        attempts[0]
+    );
+    assert!(host.pending_sessions().is_empty());
 }
 
 /// The record names the agent the hook declared, so a consumer can tell which

@@ -462,7 +462,10 @@ fn cmd_reply(rest: &[String]) -> std::process::ExitCode {
 /// The hook calls this on a timer after a webchat message, because OpenClaw
 /// emits no internal hook event when a Control UI reply completes. Where the
 /// reply plugin reported the turn's end first (`observe ended`), the ask is
-/// already closed and this finds nothing. Otherwise the record says so
+/// already closed and this finds nothing. Where the plugin runs on this host
+/// and the ask carries the id of the message that started its turn, the ask
+/// is left for that report however long the turn takes, with the pending TTL
+/// as the bound. Otherwise the record says so
 /// (`channel_reports_no_reply`) and names no model decision: nothing here saw
 /// a reply. Nor does it name the guard: what the sink held in the window is
 /// the record's basis, never its decider (`observe::outcome`). A call before
@@ -474,9 +477,17 @@ fn cmd_settle(rest: &[String]) -> std::process::ExitCode {
         return std::process::ExitCode::SUCCESS;
     };
     let at = now();
+    // Read once, outside the pending state's lock: whether the reply plugin
+    // will report how the ask's turn ended.
+    let turn_end_reported = observation().plugin_runs();
     settle_with(&dir, at, |state| {
         state
-            .take_if_waited(&session, at, UNREPORTED_REPLY_WAIT_SECONDS)
+            .take_if_waited(
+                &session,
+                at,
+                UNREPORTED_REPLY_WAIT_SECONDS,
+                turn_end_reported,
+            )
             .map(|ask| Leaving {
                 ask,
                 departure: Departure::Unanswered(NoReply::ChannelReportsNone),
@@ -1295,7 +1306,12 @@ mod tests {
         .expect("held");
         let early = update_pending(dir.path(), at - 1, |state| {
             state
-                .take_if_waited("agent:main:main", at - 1, UNREPORTED_REPLY_WAIT_SECONDS)
+                .take_if_waited(
+                    "agent:main:main",
+                    at - 1,
+                    UNREPORTED_REPLY_WAIT_SECONDS,
+                    false,
+                )
                 .map(|ask| Leaving {
                     ask,
                     departure: Departure::Unanswered(NoReply::ChannelReportsNone),
@@ -1308,7 +1324,7 @@ mod tests {
 
         settle_with(dir.path(), at, |state| {
             state
-                .take_if_waited("agent:main:main", at, UNREPORTED_REPLY_WAIT_SECONDS)
+                .take_if_waited("agent:main:main", at, UNREPORTED_REPLY_WAIT_SECONDS, false)
                 .map(|ask| Leaving {
                     ask,
                     departure: Departure::Unanswered(NoReply::ChannelReportsNone),
@@ -1388,7 +1404,7 @@ mod tests {
             ),
             (
                 "HOOK.md",
-                "8ce9212073467554d2ed6128230a27afab0ee8367986c86dba76480b9597271a",
+                "c3dbfe77aa256befd7937fd4fd56c3a682b328780cb510e707aee160fe16d6ab",
             ),
             (
                 "index.js",
