@@ -24,8 +24,8 @@
 //!
 //! # What is kept
 //!
-//! Memory is bounded, so something is forgotten in a long session. What is
-//! forgotten must not be the attacker's choice. Before, the store was one
+//! Memory is bounded, so something is forgotten in a long session. No result
+//! may decide what is forgotten of another. Before, the store was one
 //! queue of 4096 tokens or 64 KiB, emptied oldest first, so a single result
 //! cleared every earlier one: an image read through `read_media_file` is one
 //! 64 KiB base64 token, and a file of short distinct words is more than 4096
@@ -56,6 +56,15 @@
 //! clears none of them. Forgetting a short result takes the newest results
 //! kept whole plus 128 more of a full share each, all recorded after it. The
 //! store costs at most 1152 KiB, counted with [`TOKEN_OVERHEAD`] per token.
+//!
+//! Finding a kept token is one lookup of the token's keyed hash, and finding
+//! one inside an argument costs, at each position whose first
+//! [`MIN_TOKEN_LEN`] bytes start a kept token, one hash extended a byte at a
+//! time over the lengths kept for that start: never a walk over every token
+//! that shares the start, so a store full of names under one directory costs
+//! what one name does. The work for one call is bounded
+//! ([`MAX_SEARCH_STEPS`]); an argument that would take more is refused as
+//! unchecked rather than passed.
 //!
 //! # Where a token came from
 //!
@@ -100,7 +109,7 @@
 
 use std::collections::hash_map::RandomState;
 use std::collections::{BTreeMap, HashMap};
-use std::hash::BuildHasher;
+use std::hash::{BuildHasher, Hasher};
 
 use serde_json::Value;
 
@@ -135,8 +144,19 @@ const OLDER_SHARE: usize = 4 * 1024;
 // The result just recorded always fits whole.
 const _: () = assert!(MAX_RESULT_COST <= RECENT_COST);
 
+/// The most work one call's arguments may take to search: each byte hashed
+/// and each hash looked up is a step. About 0.1 to 0.3 s on a laptop in a
+/// release build; an argument that ordinary output leads to takes a few
+/// thousand steps per kilobyte. Past it, the call is refused as unchecked.
+const MAX_SEARCH_STEPS: usize = 16_000_000;
+
 /// No next slot in a chain of the index.
 const NO_SLOT: u32 = u32::MAX;
+
+/// Up to this many tokens with one start, a search at a position with that
+/// start compares each of them; past it, it hashes the bytes there over the
+/// lengths they span instead, so its work no longer grows with their number.
+const CHAIN_WALK_LIMIT: u32 = 16;
 
 /// The most tools whose declaration is kept. A server listing more is not
 /// believed about the rest, which are judged as undeclared.
@@ -203,6 +223,19 @@ struct Recorded {
     next: u32,
 }
 
+/// The kept tokens that start with one [`MIN_TOKEN_LEN`]-byte key.
+#[derive(Debug, Clone, Copy)]
+struct Start {
+    /// The newest slot with this start; the rest are chained through
+    /// [`Recorded::next`].
+    head: u32,
+    /// How many kept tokens have this start.
+    count: u32,
+    /// The lengths they span: the only lengths a search hashes.
+    shortest: u16,
+    longest: u16,
+}
+
 /// What happens to one result when the store is over its budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Fate {
@@ -217,10 +250,18 @@ enum Fate {
 pub struct TaintTracker {
     /// Kept tokens, in the order they were first recorded.
     tokens: Vec<Recorded>,
-    /// A token's first [`MIN_TOKEN_LEN`] bytes, to the last slot recorded with
-    /// that start (the rest are chained through [`Recorded::next`]), so a
-    /// lookup costs the argument's length, not the number of tokens kept.
-    index: HashMap<[u8; MIN_TOKEN_LEN], u32>,
+    /// A token's keyed hash ([`TaintTracker::hasher`]) to the slot that
+    /// holds it, so finding a token is one lookup, however many share its
+    /// start. Two tokens whose hashes collide keep the first here; the other
+    /// is found through its start's chain.
+    exact: HashMap<u64, u32>,
+    /// A token's first [`MIN_TOKEN_LEN`] bytes, to the tokens kept with that
+    /// start, so a search in an argument stops only at the positions where a
+    /// kept token starts.
+    starts: HashMap<[u8; MIN_TOKEN_LEN], Start>,
+    /// The key of the tokens' hashes. Drawn per proxy, so no result can make
+    /// its tokens collide.
+    hash_key: RandomState,
     /// Sum of [`cost_of`] over `tokens`.
     cost: usize,
     /// Sum of [`cost_of`] over the tokens each result holds, by result.
@@ -336,12 +377,13 @@ impl TaintTracker {
             return None;
         }
         let read_only = READ_ONLY_TOOLS.contains(&tool) && other_args_are_inert(args);
-        let mut hit: Option<usize> = None;
+        let mut steps = MAX_SEARCH_STEPS;
+        let mut hit: Result<Option<usize>, Unchecked> = Ok(None);
         walk_args(args, &mut |s, is_path_arg| {
-            if hit.is_some() {
+            if hit != Ok(None) {
                 return;
             }
-            hit = self.first_recorded_in(s, |rec| {
+            hit = self.first_recorded_in(s, &mut steps, |rec| {
                 !(read_only
                     && is_path_arg
                     && rec.provenance == Provenance::Listing
@@ -349,69 +391,160 @@ impl TaintTracker {
                     && names_whole_components(s, &rec.token))
             });
         });
-        hit.map(|slot| {
-            let shown: String = self.tokens[slot].token.chars().take(32).collect();
-            VerdictAlert::builtin(
+        match hit {
+            Ok(None) => None,
+            Ok(Some(slot)) => {
+                let shown: String = self.tokens[slot].token.chars().take(32).collect();
+                Some(VerdictAlert::builtin(
+                    "AG-TAINT",
+                    format!(
+                        "tool-call argument contains data derived from an untrusted tool result \
+                         (`{shown}…`), possible confused-deputy / indirect prompt injection"
+                    ),
+                    true,
+                ))
+            }
+            // Fail closed: an argument that cannot be checked in time is not
+            // passed as if it had been.
+            Err(Unchecked) => Some(VerdictAlert::builtin(
                 "AG-TAINT",
-                format!(
-                    "tool-call argument contains data derived from an untrusted tool result \
-                     (`{shown}…`), possible confused-deputy / indirect prompt injection"
-                ),
+                "tool-call argument could not be checked in time against what earlier tool \
+                 results returned, so it is refused rather than passed unchecked"
+                    .to_string(),
                 true,
-            )
+            )),
+        }
+    }
+
+    /// A hasher for a token or the bytes of an argument, under this proxy's
+    /// key. Fed byte by byte or all at once, the same bytes hash the same.
+    fn hasher(&self) -> std::collections::hash_map::DefaultHasher {
+        self.hash_key.build_hasher()
+    }
+
+    fn hash_of(&self, bytes: &[u8]) -> u64 {
+        let mut hasher = self.hasher();
+        hasher.write(bytes);
+        hasher.finish()
+    }
+
+    /// The slots in the chain of tokens that start like `start`, newest first.
+    fn chain(&self, start: &Start) -> impl Iterator<Item = usize> + '_ {
+        let mut slot = start.head;
+        std::iter::from_fn(move || {
+            (slot != NO_SLOT).then(|| {
+                let found = slot as usize;
+                slot = self.tokens[found].next;
+                found
+            })
         })
     }
 
-    /// The slot of the earliest recorded token that occurs in `s` and that
-    /// `counts` accepts. Every occurrence starts with a key of the index, so
-    /// each position of `s` is one lookup.
-    fn first_recorded_in(&self, s: &str, counts: impl Fn(&Recorded) -> bool) -> Option<usize> {
+    /// The earliest recorded token that `counts` accepts and occurs in `s`
+    /// at the first position where one does. At each position whose first
+    /// [`MIN_TOKEN_LEN`] bytes start a kept token, the few tokens with that
+    /// start are compared; when there are more than [`CHAIN_WALK_LIMIT`], the
+    /// bytes from there are hashed one at a time and looked up at each length
+    /// those tokens span. `steps` is what the search may still spend (see
+    /// [`MAX_SEARCH_STEPS`]); `Err` when it ran out first.
+    fn first_recorded_in(
+        &self,
+        s: &str,
+        steps: &mut usize,
+        counts: impl Fn(&Recorded) -> bool,
+    ) -> Result<Option<usize>, Unchecked> {
         let bytes = s.as_bytes();
-        let mut first: Option<usize> = None;
         for at in 0..(bytes.len() + 1).saturating_sub(MIN_TOKEN_LEN) {
-            let mut slot = self
-                .index
-                .get(&key_of(&bytes[at..]))
-                .copied()
-                .unwrap_or(NO_SLOT);
-            while slot != NO_SLOT {
-                let at_slot = slot as usize;
-                let rec = &self.tokens[at_slot];
-                if first.is_none_or(|f| at_slot < f)
-                    && bytes[at..].starts_with(rec.token.as_bytes())
+            let Some(start) = self.starts.get(&key_of(&bytes[at..])) else {
+                continue;
+            };
+            let here = &bytes[at..];
+            let mut first: Option<usize> = None;
+            let mut take = |slot: usize| {
+                let rec = &self.tokens[slot];
+                if first.is_none_or(|f| slot < f)
+                    && here.starts_with(rec.token.as_bytes())
                     && counts(rec)
                 {
-                    first = Some(at_slot);
+                    first = Some(slot);
                 }
-                slot = rec.next;
+            };
+            if start.count <= CHAIN_WALK_LIMIT {
+                *steps = steps.checked_sub(start.count as usize).ok_or(Unchecked)?;
+                self.chain(start).for_each(&mut take);
+            } else {
+                let longest = usize::from(start.longest).min(here.len());
+                let shortest = usize::from(start.shortest);
+                if shortest <= longest {
+                    *steps = steps
+                        .checked_sub(2 * longest - shortest + 1)
+                        .ok_or(Unchecked)?;
+                    let mut hasher = self.hasher();
+                    hasher.write(&here[..MIN_TOKEN_LEN]);
+                    for len in MIN_TOKEN_LEN..=longest {
+                        if len > MIN_TOKEN_LEN {
+                            hasher.write(&here[len - 1..len]);
+                        }
+                        if len < shortest {
+                            continue;
+                        }
+                        let Some(&slot) = self.exact.get(&hasher.finish()) else {
+                            continue;
+                        };
+                        if self.tokens[slot as usize].token.len() == len {
+                            take(slot as usize);
+                        }
+                        if !here.starts_with(self.tokens[slot as usize].token.as_bytes()) {
+                            // Another token has these bytes' hash: the one
+                            // with these bytes, if kept, is in the chain.
+                            *steps = steps.checked_sub(start.count as usize).ok_or(Unchecked)?;
+                            self.chain(start).for_each(&mut take);
+                        }
+                    }
+                }
+            }
+            if first.is_some() {
+                return Ok(first);
             }
         }
-        first
+        Ok(None)
     }
 
     /// The slot that holds `token`, if it is kept.
     fn find(&self, token: &str) -> Option<usize> {
-        let mut slot = self
-            .index
-            .get(&key_of(token.as_bytes()))
-            .copied()
-            .unwrap_or(NO_SLOT);
-        while slot != NO_SLOT {
-            let rec = &self.tokens[slot as usize];
-            if *rec.token == *token {
-                return Some(slot as usize);
-            }
-            slot = rec.next;
+        let slot = *self.exact.get(&self.hash_of(token.as_bytes()))? as usize;
+        if *self.tokens[slot].token == *token {
+            return Some(slot);
         }
-        None
+        // Another token has its hash: if kept, it is in its start's chain.
+        let start = self.starts.get(&key_of(token.as_bytes()))?;
+        self.chain(start)
+            .find(|&slot| *self.tokens[slot].token == *token)
+    }
+
+    /// Index the token in `slot`: by its hash, and at the head of its start's
+    /// chain.
+    fn index_slot(&mut self, slot: usize) {
+        let token = &self.tokens[slot].token;
+        let hash = self.hash_of(token.as_bytes());
+        let len = token.len() as u16;
+        let key = key_of(token.as_bytes());
+        self.exact.entry(hash).or_insert(slot as u32);
+        let start = self.starts.entry(key).or_insert(Start {
+            head: NO_SLOT,
+            count: 0,
+            shortest: len,
+            longest: len,
+        });
+        self.tokens[slot].next = start.head;
+        start.head = slot as u32;
+        start.count += 1;
+        start.shortest = start.shortest.min(len);
+        start.longest = start.longest.max(len);
     }
 
     /// Keep a new `token` as part of the newest result.
     fn insert(&mut self, token: &str, provenance: Provenance) {
-        let next = self
-            .index
-            .insert(key_of(token.as_bytes()), self.tokens.len() as u32)
-            .unwrap_or(NO_SLOT);
         let cost = cost_of(token);
         self.cost += cost;
         *self.result_cost.entry(self.results).or_default() += cost;
@@ -419,8 +552,9 @@ impl TaintTracker {
             token: token.into(),
             provenance,
             result: self.results,
-            next,
+            next: NO_SLOT,
         });
+        self.index_slot(self.tokens.len() - 1);
     }
 
     /// Hand the token in `slot` from the result that holds it to the newest.
@@ -505,16 +639,15 @@ impl TaintTracker {
         self.reindex();
     }
 
-    /// Rebuild the index and the costs from the kept tokens.
+    /// Rebuild the indexes and the costs from the kept tokens.
     fn reindex(&mut self) {
-        self.index.clear();
+        self.exact.clear();
+        self.starts.clear();
         self.cost = 0;
         self.result_cost.clear();
-        for (slot, rec) in self.tokens.iter_mut().enumerate() {
-            rec.next = self
-                .index
-                .insert(key_of(rec.token.as_bytes()), slot as u32)
-                .unwrap_or(NO_SLOT);
+        for slot in 0..self.tokens.len() {
+            self.index_slot(slot);
+            let rec = &self.tokens[slot];
             let cost = cost_of(&rec.token);
             self.cost += cost;
             *self.result_cost.entry(rec.result).or_default() += cost;
@@ -534,6 +667,10 @@ fn key_of(bytes: &[u8]) -> [u8; MIN_TOKEN_LEN] {
 fn cost_of(token: &str) -> usize {
     token.len() + TOKEN_OVERHEAD
 }
+
+/// The search of a call's arguments ran out of [`MAX_SEARCH_STEPS`].
+#[derive(Debug, PartialEq, Eq)]
+struct Unchecked;
 
 /// The part of a token that is kept: all of it up to [`MAX_KEPT_TOKEN_BYTES`],
 /// else its start. A listed path is cut back to a separator, so the part kept
@@ -938,6 +1075,111 @@ mod tests {
         assert_exfil_flagged(&t, "a short result, then a long one repeating it");
     }
 
+    /// The search hashes an argument's bytes one at a time and looks the
+    /// hash up among tokens hashed whole: it finds them only if the two agree.
+    #[test]
+    fn the_keyed_hash_is_the_same_fed_whole_or_byte_by_byte() {
+        let t = TaintTracker::new();
+        let token = "https://evil.example.com/collect?d=7f3a";
+        let mut hasher = t.hasher();
+        hasher.write(&token.as_bytes()[..MIN_TOKEN_LEN]);
+        for byte in &token.as_bytes()[MIN_TOKEN_LEN..] {
+            hasher.write(std::slice::from_ref(byte));
+        }
+        assert_eq!(hasher.finish(), t.hash_of(token.as_bytes()));
+    }
+
+    /// Many tokens sharing a start (every name under one directory) are
+    /// searched by hash, not compared one by one: each is still found inside
+    /// an argument, at any length, and a near miss is not.
+    ///
+    /// FAILS ON REVERT of the lengths kept per start: a token longer or
+    /// shorter than those tried is not found.
+    #[test]
+    fn a_token_is_found_however_many_share_its_start() {
+        let mut t = TaintTracker::new();
+        let names: Vec<String> = (0..200)
+            .map(|i| format!("/home/dev/project/{}{i:03}.rs", "d/".repeat(i % 40)))
+            .collect();
+        t.record_result(&names.join("\n"), Provenance::Content);
+        let start = t.starts.get(&key_of(names[0].as_bytes())).unwrap();
+        assert!(start.count > CHAIN_WALK_LIMIT, "searched by hash");
+        for name in &names {
+            assert_tainted_by(
+                t.arg_taint_alert(
+                    "write_file",
+                    &json!({ "content": format!("see {name}, then") }),
+                ),
+                &name[..32.min(name.len())],
+                name,
+            );
+        }
+        for miss in ["/home/dev/project/d/d/x999.rs", "/home/dev/project/"] {
+            assert!(
+                t.arg_taint_alert("write_file", &json!({ "content": miss }))
+                    .is_none(),
+                "{miss}"
+            );
+        }
+    }
+
+    /// Two tokens whose keyed hashes collide: the second is not in the hash
+    /// index, and is still found, through its start's chain.
+    #[test]
+    fn a_token_whose_hash_collides_is_still_found() {
+        let mut t = TaintTracker::new();
+        let names: Vec<String> = (0..40)
+            .map(|i| format!("/srv/shared/data/file-{i:04}.csv"))
+            .collect();
+        t.record_result(&names.join(" "), Provenance::Content);
+        let (first, second) = (&names[3], &names[7]);
+        let second_slot = t.find(second).unwrap();
+        // Make `second`'s hash name `first`'s slot, as a collision would.
+        let first_slot = t.find(first).unwrap() as u32;
+        let second_hash = t.hash_of(second.as_bytes());
+        t.exact.insert(second_hash, first_slot);
+        assert_eq!(t.find(second), Some(second_slot));
+        assert_tainted_by(
+            t.arg_taint_alert("fetch", &json!({ "q": format!("x{second}y") })),
+            second,
+            "a collided token",
+        );
+    }
+
+    /// The work one call's search may take is bounded, and an argument that
+    /// would take more is refused, not passed unchecked: a store whose tokens
+    /// all start with one repeated byte, then an argument of that byte
+    /// repeated, stops at every position.
+    ///
+    /// FAILS ON REVERT of the bound: the search runs to the end and the call
+    /// passes with no alert.
+    #[test]
+    fn an_argument_too_costly_to_search_is_refused_not_passed() {
+        let mut t = TaintTracker::new();
+        for r in 0..3u32 {
+            let words: Vec<String> = (0..2500u32)
+                .map(|i| {
+                    format!(
+                        "{}{:06}",
+                        "A".repeat(7 + (i % 240) as usize),
+                        i + r * 100_000
+                    )
+                })
+                .collect();
+            t.record_result(&words.join(" "), Provenance::Content);
+        }
+        let alert = t
+            .arg_taint_alert("fetch", &json!({ "q": "A".repeat(240_000) }))
+            .expect("refused");
+        assert_eq!(alert.rule, "AG-TAINT");
+        assert!(alert.block);
+        assert!(
+            alert.detail.contains("could not be checked in time"),
+            "{}",
+            alert.detail
+        );
+    }
+
     /// The store is bounded whatever the results look like, and its cost is
     /// what it holds.
     #[test]
@@ -952,7 +1194,15 @@ mod tests {
             }
             assert_eq!(t.result_cost, by_result, "{what}: each result's cost");
             assert!(t.cost <= RECENT_COST + OLDER_COST, "{what}: {}", t.cost);
-            assert!(t.index.len() <= t.tokens.len(), "{what}");
+            assert!(t.exact.len() <= t.tokens.len(), "{what}");
+            assert!(t.starts.len() <= t.tokens.len(), "{what}");
+            for (slot, rec) in t.tokens.iter().enumerate() {
+                assert_eq!(
+                    t.find(&rec.token),
+                    Some(slot),
+                    "{what}: every kept token is found"
+                );
+            }
             assert!(
                 t.tokens
                     .iter()
