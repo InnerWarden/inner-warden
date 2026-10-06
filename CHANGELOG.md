@@ -146,13 +146,18 @@ follows semantic versioning.
   carrying one is flagged (`AG-TAINT`). A single large result, such as an
   image read or a file of many short words, used to push out every value kept
   before it. The newest results are now kept whole; each older one keeps a
-  sample of up to 4 KiB, drawn by a key chosen per proxy; a value over 256
-  bytes is kept by its start, which still matches a call that carries all of
-  it. The store stays bounded, at about 1.1 MiB per proxy. A value is found
-  by its hash, so a session that lists thousands of names under one
-  directory no longer slows every message the proxy relays; the search of
-  one call is bounded, and a call whose arguments cannot be checked in that
-  bound is refused (`AG-TAINT`) rather than passed unchecked.
+  sample of up to 4 KiB, its network destinations (URLs, e-mail addresses,
+  `host:port`) first, then the rest drawn by a key chosen per proxy; a value
+  over 256 bytes is kept by its start, which still matches a call that
+  carries all of it. The store stays bounded, at about 1.1 MiB per proxy.
+  What a result's author still decides is how much of their own result
+  competes for its share: once the store is full, the next maximal result
+  the agent reads cuts a result to its share, and a page padded with other
+  destinations keeps only some of them. A value is found by its hash, so a
+  session that lists thousands of names under one directory no longer slows
+  every message the proxy relays; the search of one call is bounded, and a
+  call whose arguments cannot be checked in that bound is refused
+  (`AG-TAINT`) rather than passed unchecked.
 - **Each MCP proxy uses about half the memory.** A proxy compiled every rule
   in the shipped corpus as it started, about 47 MB before it had screened a
   message, half of it rules for model prompts that a proxy never applies.
