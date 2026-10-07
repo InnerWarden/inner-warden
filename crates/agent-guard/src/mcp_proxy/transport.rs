@@ -931,11 +931,9 @@ fn ignored_from_the_start(signo: libc::c_int) -> bool {
 /// Resolves on Ctrl-C (the only stop request a Windows console process can
 /// rely on receiving).
 #[cfg(not(unix))]
-fn stop_requested() -> impl Future<Output = ()> {
-    async {
-        if tokio::signal::ctrl_c().await.is_err() {
-            std::future::pending::<()>().await;
-        }
+async fn stop_requested() {
+    if tokio::signal::ctrl_c().await.is_err() {
+        std::future::pending::<()>().await;
     }
 }
 

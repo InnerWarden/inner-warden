@@ -432,7 +432,10 @@ jobs:
         # struggles with tests that fork and exec. This job failed twice with
         # `Error: "Test failed during run"` and no failing test named while the
         # config alone carried the engine key.
-        run: cargo tarpaulin --engine llvm --skip-clean --out Xml
+        # `--timeout 300`: the default is 60 seconds without a response from a
+        # test binary, and `conversation_attempts` spawns the CLI hundreds of
+        # times under instrumentation, so it ran past that on a healthy tree.
+        run: cargo tarpaulin --engine llvm --skip-clean --timeout 300 --out Xml
 
       - name: Upload coverage report
         if: always()
