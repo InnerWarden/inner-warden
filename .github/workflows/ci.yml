@@ -141,8 +141,15 @@ jobs:
 
       # Full suite (unit + integration) on Linux and macOS, the first-class
       # platforms.
+      #
+      # IW_REQUIRE_NODE: the OpenClaw hook handler is JavaScript, and its tests
+      # skip where node is missing so a contributor without node can still run
+      # the suite. Here a missing node is a failure instead: a gate that cannot
+      # run must not report green.
       - name: Test
         if: runner.os != 'Windows'
+        env:
+          IW_REQUIRE_NODE: "1"
         run: cargo test --workspace
 
       # Windows used to run fmt + clippy only, on the reasoning that the platform
@@ -269,6 +276,16 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      # `cargo deny` checks advisories in the Rust tree only, and Dependabot has
+      # no update surface for this directory, so nothing failed when an advisory
+      # landed here: GHSA-82fw-gwwq-j7x9 (vitest) stayed an open alert on this
+      # public repo for weeks after the patched release. This fails a pull
+      # request on a known advisory in this npm tree the way `cargo deny check`
+      # does for crates. Dev dependencies count: the test runner and the build
+      # tools run here and on every contributor's machine.
+      - name: No known advisory in the npm tree
+        run: npm audit --audit-level=moderate
 
       - name: Typecheck
         run: npx tsc -b
@@ -415,7 +432,10 @@ jobs:
         # struggles with tests that fork and exec. This job failed twice with
         # `Error: "Test failed during run"` and no failing test named while the
         # config alone carried the engine key.
-        run: cargo tarpaulin --engine llvm --skip-clean --out Xml
+        # `--timeout 300`: the default is 60 seconds without a response from a
+        # test binary, and `conversation_attempts` spawns the CLI hundreds of
+        # times under instrumentation, so it ran past that on a healthy tree.
+        run: cargo tarpaulin --engine llvm --skip-clean --timeout 300 --out Xml
 
       - name: Upload coverage report
         if: always()

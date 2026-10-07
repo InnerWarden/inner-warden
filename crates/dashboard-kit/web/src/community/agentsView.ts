@@ -21,8 +21,10 @@ export type AgentRow = {
   needsYou: boolean;
   next?: AgentNextStep;
   /**
-   * For a hook written before hooks named their agent: the reconnect, in the
-   * hook's own mode, that names it (the CLI's `identity_step`).
+   * For wiring whose decisions do not name this agent (a hook written before
+   * hooks named their agent, or MCP servers wrapped before wrappers did): the
+   * reconnect, in the wiring's own mode, that adds the name (the CLI's
+   * `identity_step`).
    */
   identity?: AgentNextStep;
   /** `null` where the platform does not check (macOS). */

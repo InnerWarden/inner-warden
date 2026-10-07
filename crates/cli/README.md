@@ -41,6 +41,26 @@ server that inspects every JSON-RPC message and, in `guard`/`kill` mode, refuses
 a disallowed `tools/call` before it reaches the server. stdout stays pure MCP
 traffic; alerts go to stderr.
 
+`--label L` names the proxy's session in the record (`mcp:L`, `innerwarden`
+when unset) and `--agent ID` names the agent whose calls these are (a plain id
+such as `openclaw`). `innerwarden agents connect <agent>` writes both into every
+server it wraps, so each decision says which agent asked; a label you set
+yourself is kept. The name is declared by the configuration it is written in,
+not proven. Wiring written by an earlier release names no agent: running the
+same `agents connect` again, in the same mode (`--monitor` if it only records),
+adds the name and changes nothing else. The dashboard's Agents page offers that
+command when it applies.
+
+The proxy lives as long as its client keeps the session, and is never cut for
+being idle. When the client closes the connection, the proxy relays the
+server's last output for up to 3 s, then stops the server (SIGTERM, then
+SIGKILL 1 s later). SIGTERM, SIGHUP or SIGINT sent to the proxy stops the server
+the same way before the proxy exits; a signal the client started it with
+ignored, as under `nohup`, stays ignored. A client that keeps sessions open
+keeps one proxy per session: OpenClaw, for one, keeps a session's MCP servers
+running between turns until the session ends, and its `mcp.sessionIdleTtlMs`
+setting retires idle ones.
+
 The verdict is JSON: `recommendation` (`allow` / `review` / `deny`),
 `risk_score`, `severity`, `signals`, `explanation`, `atr_matches`, and
 `asi_ids` (e.g. `["ASI02","ASI10"]`).

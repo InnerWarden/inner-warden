@@ -1,5 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
-import { CASE, expectHonestUpsell, fulfillJson, guardRoute, META } from "./support";
+import { CASE, expectHonestUpsell, FIXTURE_NOW_MS, fulfillJson, guardRoute, META } from "./support";
 
 /**
  * Community's Cases at a desk, 1440 x 900: the list and the open case side by
@@ -9,6 +9,13 @@ import { CASE, expectHonestUpsell, fulfillJson, guardRoute, META } from "./suppo
  */
 
 test.use({ viewport: { width: 1440, height: 900 } });
+
+// The fixture's cases are dated 2026-09-29. A row's time is relative for a
+// few days and an absolute date after that, and the absolute date is longer
+// and wraps the row, so a run weeks later measured a different page.
+test.beforeEach(async ({ page }) => {
+  await page.clock.setFixedTime(FIXTURE_NOW_MS);
+});
 
 async function openCase(page: Page, id: string) {
   await page.goto(`/?view=activity&decision=${encodeURIComponent(id)}`);

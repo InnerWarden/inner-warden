@@ -49,6 +49,11 @@ pub mod agents_ops;
 pub mod asi;
 pub mod benchmark;
 pub mod breaker;
+// Widened from the internal group for the conversation surface (`innerwarden
+// observe`), which reads a person's message for a plain-language request the
+// same way the injection scan reads text: invisible characters out, NFKC
+// folded, Tags-block and base64 payloads recovered.
+pub mod deobfuscate;
 pub mod file_update;
 pub mod hook;
 pub mod hook_targets;
@@ -62,7 +67,6 @@ pub mod threats;
 // ── 3. INTERNAL ──────────────────────────────────────────────────────────────
 // No consumer outside this crate. Kept private so a future caller has to make a
 // deliberate decision to widen the surface, rather than finding it already open.
-mod deobfuscate;
 mod shell;
 
 #[cfg(test)]
@@ -99,7 +103,6 @@ mod module_surface_tests {
     fn the_internal_group_is_reachable_only_from_inside() {
         // Compiles here (inside the crate) and would not compile from outside,
         // which is the property being asserted.
-        let _ = crate::deobfuscate::deobfuscate("echo hi");
         let _ = crate::shell::project("echo hi");
     }
 }

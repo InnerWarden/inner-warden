@@ -19,8 +19,14 @@ export const DECISION_OUTCOMES = [
 ] as const;
 export type DecisionOutcomeKey = (typeof DECISION_OUTCOMES)[number];
 
-/** What finally happened to one message someone sent the agent. */
-export const MESSAGE_OUTCOMES = ["stopped_by_innerwarden", "declined_by_agent", "answered", "unplaced"] as const;
+/**
+ * What finally happened to one message someone sent the agent. `not_seen` is
+ * an outcome the record could not see (a chat that does not report the
+ * agent's reply), never a recording fault, so it has its own words rather
+ * than borrowing a decision's "not recorded". `unplaced` is still read, from
+ * a CLI that predates `not_seen`.
+ */
+export const MESSAGE_OUTCOMES = ["stopped_by_innerwarden", "declined_by_agent", "answered", "not_seen", "unplaced"] as const;
 export type MessageOutcomeKey = (typeof MESSAGE_OUTCOMES)[number];
 
 export const OUTCOME_WORDS: Record<DecisionOutcomeKey | MessageOutcomeKey, string> = {
@@ -34,6 +40,7 @@ export const OUTCOME_WORDS: Record<DecisionOutcomeKey | MessageOutcomeKey, strin
   stopped_by_innerwarden: "Stopped by InnerWarden",
   declined_by_agent: "Declined by your agent",
   answered: "Answered",
+  not_seen: "Outcome not seen",
 };
 
 export function isDecisionOutcome(value: unknown): value is DecisionOutcomeKey {

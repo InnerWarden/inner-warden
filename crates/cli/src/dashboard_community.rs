@@ -243,6 +243,9 @@ pub(crate) struct Attempt {
     pub sender: Option<String>,
     pub surface: String,
     pub decider: String,
+    /// What the decider rests on (`decider_basis`), so an unknown outcome can
+    /// say why it is unknown.
+    pub basis: String,
     pub enforced: bool,
     pub recommendation: String,
     pub risk: Option<u64>,
@@ -347,6 +350,7 @@ pub(crate) fn parse_event_log(text: &str) -> EventLog {
                         .map(|sender| one_line(&revealed(sender), 64)),
                     surface: text("surface"),
                     decider: text("decider"),
+                    basis: text("decider_basis"),
                     enforced: record
                         .get("enforced")
                         .and_then(Value::as_bool)
@@ -365,13 +369,24 @@ pub(crate) fn parse_event_log(text: &str) -> EventLog {
     log
 }
 
-/// A message's outcome key, from who decided. A model that declined is the
-/// agent's own doing; only a control that refused is InnerWarden's.
+/// A message's outcome key, from who decided. Only a control that refused is
+/// InnerWarden's. A model that declined is the agent's own doing, and only a
+/// caller that knows it says so (`declared_by_caller`). A reply that was seen
+/// is `answered`: its words are never read, so it does not show the agent
+/// declined, and records an earlier version wrote as `model_refused` from a
+/// reply alone read the same way. Anything else is an outcome that could not
+/// be seen (`not_seen`), never "not recorded": a chat that does not report
+/// the agent's reply is a limit of the channel, not a fault in the record.
 fn attempt_outcome(attempt: &Attempt) -> &'static str {
-    match attempt.decider.as_str() {
-        "model_refused" => "declined_by_agent",
-        "guard_denied" | "kernel_denied" if attempt.enforced => "stopped_by_innerwarden",
-        _ => "unplaced",
+    match (attempt.decider.as_str(), attempt.basis.as_str()) {
+        ("guard_denied" | "kernel_denied", _) if attempt.enforced => "stopped_by_innerwarden",
+        ("model_refused", "declared_by_caller") => "declined_by_agent",
+        (
+            "model_refused" | "undetermined",
+            "no_screened_execution_recorded_in_window" | "replied_without_tool_call",
+        ) => "answered",
+        ("model_refused", _) => "declined_by_agent",
+        _ => "not_seen",
     }
 }
 
@@ -387,11 +402,48 @@ fn channel_words(channel: &str) -> String {
     }
 }
 
-fn decider_words(decider: &str) -> &'static str {
-    match decider {
-        "model_refused" => "Your agent declined on its own",
-        "guard_denied" => "The guard refused it",
-        "kernel_denied" => "The kernel refused it",
+/// Who decided, in words. An outcome that could not be seen says why, because
+/// "not recorded" on a chat that never reports the agent's reply reads like a
+/// recording fault when it is a limit of the channel.
+fn decider_words(decider: &str, basis: &str) -> &'static str {
+    match (decider, basis) {
+        ("model_refused" | "undetermined", "no_screened_execution_recorded_in_window") => {
+            "Your agent replied, and nothing the guard screens ran; a tool it does not screen would not show here"
+        }
+        ("undetermined", "replied_without_tool_call") => {
+            "Your agent answered without running anything; whether it declined is not seen"
+        }
+        ("model_refused", _) => "Your agent declined on its own",
+        ("guard_denied", _) => "The guard refused it",
+        ("kernel_denied", _) => "The kernel refused it",
+        ("undetermined", "channel_reports_no_reply") => {
+            "Outcome not seen: this chat does not report your agent's reply"
+        }
+        ("undetermined", "next_message_before_reply") => {
+            "Outcome not seen: another message arrived before any reply"
+        }
+        ("undetermined", "tool_call_in_turn") => {
+            "Outcome not seen: your agent used a tool while answering, so its reply does not show it declined"
+        }
+        ("undetermined", "turn_ended_without_reply") => {
+            "Outcome not seen: your agent's turn ended without a reply"
+        }
+        ("undetermined", "no_reply_observed_within_ttl") => {
+            "Outcome not seen: no reply arrived within 15 minutes"
+        }
+        ("undetermined", "flagged_action_ran_in_window") => {
+            "Outcome not seen: monitor mode let a flagged action run at the same time"
+        }
+        ("undetermined", "guard_block_recorded_in_window") => {
+            "Outcome not seen: the guard refused an action at the same time"
+        }
+        ("undetermined", "pending_limit_reached") => {
+            "Outcome not seen: too many chats were waiting for a reply at once"
+        }
+        ("undetermined", "pending_state_unavailable") => {
+            "Outcome not seen: InnerWarden could not hold the message to wait for the reply"
+        }
+        ("undetermined", _) => "Outcome not seen",
         _ => "Who decided was not recorded",
     }
 }
@@ -477,7 +529,10 @@ fn attempt_json(attempt: &Attempt) -> Value {
     );
     opt(&mut object, "sender", attempt.sender.clone());
     object.insert("surface".into(), json!(attempt.surface));
-    object.insert("decider".into(), json!(decider_words(&attempt.decider)));
+    object.insert(
+        "decider".into(),
+        json!(decider_words(&attempt.decider, &attempt.basis)),
+    );
     object.insert("decider_key".into(), json!(attempt.decider));
     object.insert("enforced".into(), json!(attempt.enforced));
     object.insert("recommendation".into(), json!(attempt.recommendation));
@@ -541,6 +596,11 @@ pub(crate) struct LaneFacts<'a> {
     /// has the guard in front of it.
     pub guard_mode: &'a str,
     pub observe_installed: bool,
+    /// What `observe install` left in OpenClaw (the message hook and the reply
+    /// plugin), judged against what this binary ships. It writes them once,
+    /// and a host keeps running an earlier version's until they are installed
+    /// again or an upgrade refreshes them.
+    pub observation: crate::observe_io::Observation,
     /// An OpenClaw config is on this machine: `innerwarden observe install`
     /// has something to install into. Without one it exits 1 and changes
     /// nothing, so it is never offered.
@@ -563,6 +623,7 @@ pub(crate) fn part_label(key: &str) -> &'static str {
         "stopped_by_innerwarden" => "Stopped by InnerWarden",
         "declined_by_agent" => "Declined by your agent",
         "answered" => "Answered",
+        "not_seen" => "Outcome not seen",
         _ => "Outcome not recorded",
     }
 }
@@ -689,7 +750,12 @@ fn agent_messages_lane(facts: &LaneFacts<'_>) -> Value {
         .filter(|attempt| attempt.ts >= window_start)
         .collect();
     let mut parts: Vec<(&'static str, usize)> = Vec::new();
-    for key in ["stopped_by_innerwarden", "declined_by_agent", "unplaced"] {
+    for key in [
+        "stopped_by_innerwarden",
+        "declined_by_agent",
+        "answered",
+        "not_seen",
+    ] {
         let count = recent
             .iter()
             .filter(|attempt| attempt_outcome(attempt) == key)
@@ -736,7 +802,65 @@ fn agent_messages_lane(facts: &LaneFacts<'_>) -> Value {
             }),
         );
     }
+    // This card's count is only as good as what feeds it: say so where the
+    // count is read, with the step that fixes it.
+    if facts.observe_installed {
+        if let Some((command, line)) = messages_step(&facts.observation, &recent) {
+            object.insert(
+                "next_step".into(),
+                json!({ "command": command, "line": line }),
+            );
+        }
+    }
     Value::Object(object)
+}
+
+/// The step the Messages card carries while the message hook is installed,
+/// if what `observe install` left needs one. PURE.
+///
+/// A file InnerWarden did not write comes first: what it records cannot be
+/// relied on. Then an earlier version's files, which an upgrade from a
+/// version that could not refresh them leaves in place. Then a reply plugin
+/// that does not run, but only once a Control UI ask in the window has been
+/// recorded without its outcome: a host that never uses that chat does not
+/// need the plugin, and a step it can never clear would be noise.
+fn messages_step(
+    observation: &crate::observe_io::Observation,
+    recent: &[&Attempt],
+) -> Option<(&'static str, &'static str)> {
+    use crate::observe::InstalledFiles;
+    let units = [observation.hook, observation.plugin];
+    if units
+        .iter()
+        .any(|unit| matches!(unit, InstalledFiles::Changed(_)))
+    {
+        return Some((
+            "innerwarden observe install",
+            "The message hook on this machine is not the one InnerWarden wrote, so what this card counts cannot be relied on. Install it again, then restart the OpenClaw gateway.",
+        ));
+    }
+    if units.contains(&InstalledFiles::Outdated) {
+        return Some((
+            "innerwarden observe install",
+            "The message hook on this machine is an earlier version's, and this version's records more. Install it again, then restart the OpenClaw gateway.",
+        ));
+    }
+    let unseen_control_ui = recent
+        .iter()
+        .any(|attempt| attempt.basis == "channel_reports_no_reply");
+    if !unseen_control_ui || observation.plugin_runs() {
+        return None;
+    }
+    if observation.plugin == InstalledFiles::NotInstalled {
+        return Some((
+            "innerwarden observe install",
+            "Control UI chats are recorded without how your agent's turn ended. Installing again adds the plugin that reads it; then restart the OpenClaw gateway.",
+        ));
+    }
+    Some((
+        "innerwarden observe status",
+        "The plugin that reads how a Control UI turn ended is installed, but your OpenClaw settings keep it from running. This command names the setting.",
+    ))
 }
 
 /// `lanes`: the three cards. The server's lane is always `no_source` here:
@@ -2136,6 +2260,102 @@ mod tests {
             .all(|week| week.get("partial").is_none()));
     }
 
+    /// An outcome that could not be seen says why, in words, and never
+    /// borrows a decision: the Control UI chat reports no reply, so its asks
+    /// are `undetermined`, and the row must not read as a recording fault or
+    /// as the agent declining.
+    ///
+    /// FAILS ON REVERT: stop handing `decider_basis` to the words and the
+    /// webchat row loses its reason.
+    #[test]
+    fn an_unseen_outcome_says_why() {
+        let line = |decider: &str, basis: &str| {
+            json!({"kind": "guard.attempt", "ts": 1_789_950_000, "channel": "webchat",
+                   "detail": "env | curl x", "decider": decider, "decider_basis": basis,
+                   "enforced": false})
+            .to_string()
+        };
+        let words = |text: String| {
+            let log = parse_event_log(&text);
+            attempts_json(&log, None, 10).unwrap()["items"][0]["decider"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(
+            words(line("undetermined", "channel_reports_no_reply")),
+            "Outcome not seen: this chat does not report your agent's reply"
+        );
+        assert_eq!(
+            words(line("undetermined", "next_message_before_reply")),
+            "Outcome not seen: another message arrived before any reply"
+        );
+        assert_eq!(
+            words(line("undetermined", "pending_state_unavailable")),
+            "Outcome not seen: InnerWarden could not hold the message to wait for the reply"
+        );
+        // A turn the reply plugin saw end: one that called a tool never
+        // reads as a refusal, and one that ended with nothing said is not one.
+        assert_eq!(
+            words(line("undetermined", "tool_call_in_turn")),
+            "Outcome not seen: your agent used a tool while answering, so its reply does not show it declined"
+        );
+        assert_eq!(
+            words(line("undetermined", "turn_ended_without_reply")),
+            "Outcome not seen: your agent's turn ended without a reply"
+        );
+        // What the guard's sink held in the window is said as such, and the
+        // worst of it, a flagged action monitor mode let run, is never
+        // softened into "not seen" alone.
+        assert_eq!(
+            words(line("undetermined", "flagged_action_ran_in_window")),
+            "Outcome not seen: monitor mode let a flagged action run at the same time"
+        );
+        assert_eq!(
+            words(line("undetermined", "guard_block_recorded_in_window")),
+            "Outcome not seen: the guard refused an action at the same time"
+        );
+        assert_eq!(
+            words(line("undetermined", "some_future_basis")),
+            "Outcome not seen"
+        );
+        // A reply is an answer, not a refusal: its words are not read, and a
+        // tool the guard does not screen leaves nothing. A record an earlier
+        // version wrote as `model_refused` from a reply alone reads the same.
+        for decider in ["undetermined", "model_refused"] {
+            assert_eq!(
+                words(line(decider, "no_screened_execution_recorded_in_window")),
+                "Your agent replied, and nothing the guard screens ran; a tool it does not screen would not show here"
+            );
+        }
+        assert_eq!(
+            words(line("undetermined", "replied_without_tool_call")),
+            "Your agent answered without running anything; whether it declined is not seen"
+        );
+        // A refusal a caller states is the agent's.
+        assert_eq!(
+            words(line("model_refused", "declared_by_caller")),
+            "Your agent declined on its own"
+        );
+        // A line that names no decider at all is the one that was not recorded.
+        assert_eq!(words(line("", "")), "Who decided was not recorded");
+        for (decider, basis) in [
+            ("undetermined", "channel_reports_no_reply"),
+            ("undetermined", "next_message_before_reply"),
+            ("undetermined", "no_reply_observed_within_ttl"),
+            ("undetermined", "flagged_action_ran_in_window"),
+            ("undetermined", "guard_block_recorded_in_window"),
+            ("undetermined", "pending_limit_reached"),
+            ("undetermined", "pending_state_unavailable"),
+            ("undetermined", "tool_call_in_turn"),
+            ("undetermined", "turn_ended_without_reply"),
+            ("undetermined", "replied_without_tool_call"),
+            ("undetermined", "no_screened_execution_recorded_in_window"),
+        ] {
+            assert!(decider_words(decider, basis).chars().count() <= 120);
+        }
+    }
+
     #[test]
     fn an_unknown_messages_cursor_is_an_error_not_page_one_again() {
         let log = parse_event_log(&log_text());
@@ -2430,6 +2650,7 @@ mod tests {
             record,
             guard_mode: mode,
             observe_installed: false,
+            observation: crate::observe_io::Observation::NONE,
             openclaw_present: true,
             log,
         }
@@ -2457,6 +2678,201 @@ mod tests {
             .contains("OpenClaw"));
     }
 
+    /// A hook an earlier version wrote keeps running after an upgrade, so
+    /// the Messages card read "nothing risky reached your agent" for a
+    /// Control UI ask for fifteen minutes, with nothing anywhere a customer
+    /// looks saying why. The card carries the step, and says which of the
+    /// two it is: an earlier version's hook, or one InnerWarden did not
+    /// write, whose count cannot be relied on at all.
+    ///
+    /// FAILS ON REVERT: drop the step and the out-of-date hook says nothing;
+    /// drop the changed arm and a hook InnerWarden did not write gets no step
+    /// at all.
+    #[test]
+    fn an_out_of_date_or_changed_message_hook_is_named_on_its_card() {
+        use crate::observe::InstalledFiles;
+        let g = Graph::new();
+        let tally = g.agent_actions_tally(0);
+        let record = g.record_span();
+        let log = EventLog::default();
+        let installed = |hook: InstalledFiles, plugin: InstalledFiles| {
+            lanes_json(&LaneFacts {
+                observe_installed: true,
+                observation: crate::observe_io::Observation {
+                    hook,
+                    plugin,
+                    plugin_blocker: None,
+                },
+                ..lane_facts(&tally, &record, "monitor", &log)
+            })
+        };
+        let line = |card: &Value| -> String {
+            assert_eq!(card["agent_messages"]["availability"], "available");
+            assert_eq!(
+                card["agent_messages"]["next_step"]["command"],
+                "innerwarden observe install"
+            );
+            let line = card["agent_messages"]["next_step"]["line"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            assert!(line.contains("restart the OpenClaw gateway"), "{line}");
+            assert!(line.chars().count() <= 300, "the page cuts a line past 300");
+            line
+        };
+        let stale = line(&installed(
+            InstalledFiles::Outdated,
+            InstalledFiles::Current,
+        ));
+        assert!(stale.contains("an earlier version's"), "{stale}");
+        let stale_plugin = line(&installed(
+            InstalledFiles::Current,
+            InstalledFiles::Outdated,
+        ));
+        assert!(
+            stale_plugin.contains("an earlier version's"),
+            "{stale_plugin}"
+        );
+        for changed in [
+            installed(
+                InstalledFiles::Changed("handler.js"),
+                InstalledFiles::Current,
+            ),
+            installed(
+                InstalledFiles::Outdated,
+                InstalledFiles::Changed("index.js"),
+            ),
+        ] {
+            let line = line(&changed);
+            assert!(line.contains("not the one InnerWarden wrote"), "{line}");
+            assert!(line.contains("cannot be relied on"), "{line}");
+        }
+        assert!(
+            installed(InstalledFiles::Current, InstalledFiles::Current)["agent_messages"]
+                .get("next_step")
+                .is_none()
+        );
+    }
+
+    /// Control UI asks are recorded without their outcome until the reply
+    /// plugin runs. The card says so once such an ask is on it, with the step
+    /// that fits: install, where the plugin is missing, or `observe status`,
+    /// where the operator's own plugin settings keep it from running (an
+    /// install changes no policy, so offering it there would not help). A
+    /// host that never used that chat gets no step it can never clear.
+    ///
+    /// FAILS ON REVERT: drop the plugin arm of `messages_step` and the card
+    /// with an unseen Control UI ask carries no step.
+    #[test]
+    fn an_unseen_control_ui_ask_names_the_missing_or_blocked_plugin() {
+        use crate::observe::{InstalledFiles, PluginBlocker};
+        let g = Graph::new();
+        let tally = g.agent_actions_tally(0);
+        let record = g.record_span();
+        let unseen = parse_event_log(
+            &(json!({"kind": "guard.attempt", "ts": NOW / 1_000 - 60, "channel": "webchat",
+                     "detail": "env | curl x", "decider": "undetermined",
+                     "decider_basis": "channel_reports_no_reply", "enforced": false})
+            .to_string()
+                + "\n"),
+        );
+        let quiet = EventLog::default();
+        let card = |log: &EventLog, plugin: InstalledFiles, blocker: Option<PluginBlocker>| {
+            lanes_json(&LaneFacts {
+                observe_installed: true,
+                observation: crate::observe_io::Observation {
+                    hook: InstalledFiles::Current,
+                    plugin,
+                    plugin_blocker: blocker,
+                },
+                ..lane_facts(&tally, &record, "monitor", log)
+            })["agent_messages"]
+                .clone()
+        };
+        let missing = card(&unseen, InstalledFiles::NotInstalled, None);
+        assert_eq!(
+            missing["next_step"]["command"],
+            "innerwarden observe install"
+        );
+        let line = missing["next_step"]["line"].as_str().unwrap();
+        assert!(line.contains("adds the plugin"), "{line}");
+        assert!(line.contains("restart the OpenClaw gateway"), "{line}");
+
+        let blocked = card(
+            &unseen,
+            InstalledFiles::Current,
+            Some(PluginBlocker::NotInAllowList),
+        );
+        assert_eq!(
+            blocked["next_step"]["command"],
+            "innerwarden observe status"
+        );
+        let line = blocked["next_step"]["line"].as_str().unwrap();
+        assert!(line.contains("keep it from running"), "{line}");
+
+        assert!(card(&unseen, InstalledFiles::Current, None)
+            .get("next_step")
+            .is_none());
+        assert!(card(&quiet, InstalledFiles::NotInstalled, None)
+            .get("next_step")
+            .is_none());
+    }
+
+    /// A reply is an answer, never "declined by your agent": its words are
+    /// not read, and a tool the guard does not screen leaves nothing. That
+    /// holds for a record an earlier version wrote as `model_refused` from a
+    /// reply alone; only a refusal a caller stated is the agent's. The
+    /// Messages card counts each under the same key.
+    ///
+    /// FAILS ON REVERT: map `model_refused` to `declined_by_agent` whatever
+    /// its basis and the old record is counted as declined.
+    #[test]
+    fn a_reply_is_counted_as_answered_and_only_a_stated_refusal_as_declined() {
+        let line = |decider: &str, basis: &str, ts: u64| {
+            json!({"kind": "guard.attempt", "ts": ts, "channel": "telegram",
+                   "detail": "nohup ./xmrig &", "decider": decider,
+                   "decider_basis": basis, "enforced": false})
+            .to_string()
+        };
+        let now_s = 1_789_950_000;
+        let text = [
+            line(
+                "model_refused",
+                "no_screened_execution_recorded_in_window",
+                now_s,
+            ),
+            line(
+                "undetermined",
+                "no_screened_execution_recorded_in_window",
+                now_s + 1,
+            ),
+            line("undetermined", "replied_without_tool_call", now_s + 2),
+            line("model_refused", "declared_by_caller", now_s + 3),
+            line("undetermined", "tool_call_in_turn", now_s + 4),
+        ]
+        .join("\n");
+        let log = parse_event_log(&text);
+        let keys: Vec<&str> = log.attempts.iter().map(attempt_outcome).collect();
+        assert_eq!(
+            keys,
+            [
+                "not_seen",
+                "declined_by_agent",
+                "answered",
+                "answered",
+                "answered"
+            ],
+            "newest first"
+        );
+        let attempts = attempts_json(&log, None, 10).unwrap();
+        assert_eq!(
+            attempts["items"][1]["decider"],
+            "Your agent declined on its own"
+        );
+        assert_eq!(attempts["items"][1]["outcome_key"], "declined_by_agent");
+        assert_eq!(attempts["items"][4]["outcome_key"], "answered");
+    }
+
     #[test]
     fn lane_part_labels_are_the_pages_outcome_words() {
         // The kit prints these keys with `OUTCOME_WORDS`; the Overview's card
@@ -2473,6 +2889,7 @@ mod tests {
             ("stopped_by_innerwarden", "Stopped by InnerWarden"),
             ("declined_by_agent", "Declined by your agent"),
             ("answered", "Answered"),
+            ("not_seen", "Outcome not seen"),
         ] {
             assert_eq!(part_label(key), words);
         }
@@ -2488,6 +2905,7 @@ mod tests {
             "stopped_by_innerwarden",
             "declined_by_agent",
             "answered",
+            "not_seen",
         ] {
             let line = format!("  {key}: \"{}\",", part_label(key));
             assert!(words.contains(&line), "words.ts has no `{line}`");
@@ -2630,6 +3048,29 @@ mod tests {
             .starts_with("Someone on Telegram"));
         // The sender stays out of the lane.
         assert!(!lanes.to_string().contains("12345"));
+
+        // A message whose outcome could not be seen is counted as NOT SEEN,
+        // never "not recorded", which reads as a recording fault when it is a
+        // limit of the chat. FAILS ON REVERT: key it `unplaced` again and the
+        // card reads "Outcome not recorded".
+        let unseen = EventLog {
+            attempts: vec![Attempt {
+                ts: NOW / 1_000 - 3_600,
+                decider: "undetermined".into(),
+                basis: "channel_reports_no_reply".into(),
+                ..stale.attempts[0].clone()
+            }],
+            ..stale.clone()
+        };
+        let lanes = lanes_json(&lane_facts(&tally, &record, "monitor", &unseen));
+        assert_eq!(
+            lanes["agent_messages"]["breakdown"][0],
+            json!({"key": "not_seen", "count": 1, "label": "Outcome not seen"})
+        );
+        assert_eq!(
+            attempts_json(&unseen, None, 10).unwrap()["items"][0]["outcome_key"],
+            "not_seen"
+        );
     }
 
     #[test]

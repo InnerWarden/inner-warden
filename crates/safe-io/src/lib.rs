@@ -86,6 +86,43 @@ pub fn is_regular_file(metadata: &std::fs::Metadata) -> bool {
     metadata.is_file() && !is_reparse_or_symlink(metadata)
 }
 
+/// Whether an already-open handle is a plain regular file that no other name
+/// points at, so writing to it IN PLACE (append, truncate and rewrite) can only
+/// change the file the caller named.
+///
+/// `O_NOFOLLOW` stops a symbolic link. It cannot stop a HARD link: that is not
+/// a link at open time but the same file under a second name, so the hardened
+/// open succeeds and [`is_regular_file`] says yes. On macOS an ordinary account
+/// may hard-link a file it does not own, root's included, into any directory it
+/// can write. On Linux `fs.protected_hardlinks = 1` refuses that, but it is a
+/// setting, not a guarantee. A writer that may run as root and writes in place
+/// into a directory another account writes therefore needs this check, not
+/// [`is_regular_file`]. A file reached by its only name has a link count of 1.
+/// A planted second name makes it at least 2 for as long as the original name
+/// exists, and the original of a file worth attacking sits in a directory the
+/// planter cannot remove it from.
+///
+/// Read paths do not need it: reading through a second name reads the same
+/// bytes the first name would. Writers that replace by `rename` do not need it
+/// either, since they never write into the existing file.
+///
+/// Unix only. Elsewhere this is [`is_regular_file`], because the link count is
+/// not something stable Rust reads on Windows.
+pub fn is_regular_file_with_one_name(metadata: &std::fs::Metadata) -> bool {
+    if !is_regular_file(metadata) {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        metadata.nlink() == 1
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
 /// Symlink on unix, reparse point on Windows.
 pub fn is_reparse_or_symlink(metadata: &std::fs::Metadata) -> bool {
     #[cfg(windows)]
@@ -173,6 +210,42 @@ mod tests {
             is_regular_file(&md),
             "this is the trap: the drifted copy asked this question of a handle \
              that had already followed the link, and got 'regular file' back"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A hard link is not refused by `O_NOFOLLOW`: the open succeeds and the
+    /// handle is a regular file. Only the link count shows that the file has
+    /// another name, and a writer that writes in place must ask that.
+    ///
+    /// FAILS ON REVERT: make `is_regular_file_with_one_name` answer what
+    /// `is_regular_file` answers and the second name is accepted.
+    #[cfg(unix)]
+    #[test]
+    fn a_second_name_is_seen_on_the_open_handle() {
+        let dir = tmpdir();
+        let elsewhere = dir.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).expect("dir");
+        let target = elsewhere.join("victim");
+        std::fs::File::create(&target).expect("create");
+        let own = dir.join("own.json");
+        std::fs::File::create(&own).expect("create");
+        assert!(
+            is_regular_file_with_one_name(&open_no_follow(&own).unwrap().metadata().unwrap()),
+            "a file reached by its only name is one this writer may write in place"
+        );
+
+        let planted = dir.join("record.json");
+        std::fs::hard_link(&target, &planted).expect("hard link");
+        let opened = open_no_follow(&planted).expect("O_NOFOLLOW does not refuse a hard link");
+        let metadata = opened.metadata().expect("metadata");
+        assert!(
+            is_regular_file(&metadata),
+            "this is the trap: through a second name the handle is a plain regular file"
+        );
+        assert!(
+            !is_regular_file_with_one_name(&metadata),
+            "a file with a second name must not be written in place"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

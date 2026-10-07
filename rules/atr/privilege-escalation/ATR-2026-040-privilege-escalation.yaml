@@ -1,3 +1,9 @@
+# From the Agent Threat Rules project (MIT, Copyright (c) 2026 ATR
+# Contributors; see NOTICE and LICENSE-MIT), MODIFIED by InnerWarden:
+# - 2026-07-15: the `kubectl exec` and `chmod` conditions were narrowed
+#   (comments at each condition);
+# - 2026-10-06: `write_file` was taken out of the tool-name condition for
+#   destructive file operations (comment at that condition).
 title: "Privilege Escalation and Admin Function Access"
 id: ATR-2026-040
 status: experimental
@@ -97,9 +103,19 @@ detection:
       operator: regex
       value: "(?i)(?:kubectl\\s+exec\\b.*(?:(?:-n|--namespace)[=\\s]+kube-|nsenter|chroot|--privileged|/host\\b|mount\\s)|kubectl\\s+(?:create|apply)\\s+.*(?:clusterrole|rolebinding)|kubectl\\s+auth\\s+can-i)"
       description: "Kubernetes privilege escalation commands (system-namespace or escape-primitive exec, RBAC binding, permission probe)"
+    # FP fix (2026-10-06): `write_file` was an alternative here, so every
+    # write through an MCP filesystem server was refused at critical severity,
+    # an ordinary write inside the server's allowed directories included. The
+    # name says nothing about the target, and it never stood in for one: the
+    # same server's `edit_file` and `move_file` were not matched. What a write
+    # escalates through is the file it changes. The tool_args conditions below
+    # still match /etc/sudoers, /etc/passwd, /etc/shadow and /root/ for any
+    # tool, and InnerWarden's built-in AG-PRIV-WRITE check refuses a call
+    # that may write a file granting privilege, running as root or carrying
+    # the guard, after normalizing the path, whichever tool makes it.
     - field: tool_name
       operator: regex
-      value: "(?i)(?:write_file|delete_file|rm\\s+-rf|remove_directory|format_disk|wipe)"
+      value: "(?i)(?:delete_file|rm\\s+-rf|remove_directory|format_disk|wipe)"
       description: "Destructive file system operations"
     # FP fix (deep-test 2026-07-15): the old world-writable alternative
     # `[0-7]{0,3}7[0-7]{0,2}` matched a 7 in ANY position, so a normal
@@ -164,7 +180,15 @@ test_cases:
       tool_args: '{"command": "kubectl exec -it -n kube-system etcd-master-0 -- /bin/sh"}'
       expected: triggered
       description: "Kubernetes privilege escalation via kubectl exec into a kube-system pod"
+    - tool_name: "write_file"
+      tool_args: '{"path": "/etc/sudoers.d/agent", "content": "agent ALL=(ALL) NOPASSWD: ALL"}'
+      expected: triggered
+      description: "File write that grants sudo (matched on the target, not the tool name)"
   true_negatives:
+    - tool_name: "write_file"
+      tool_args: '{"path": "/home/user/project/src/main.rs", "content": "fn main() {}"}'
+      expected: not_triggered
+      description: "Ordinary file write inside the filesystem server's allowed directories"
     # FP fix (deep-test 2026-07-15): benign developer commands that must NOT fire.
     - tool_name: "shell"
       tool_args: '{"command": "chmod 755 deploy.sh"}'

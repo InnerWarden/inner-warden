@@ -108,6 +108,18 @@ each of the seven packages, pointing at `InnerWarden/inner-warden` +
 - `.github/workflows/linux-packages.yml` rebuilds from the release binaries,
   **test-installs** the `.deb` on Ubuntu and the `.rpm` in a Rocky Linux
   container (`innerwarden --version`), and uploads the packages as artifacts.
+- A packaged copy belongs to its package manager. The binary asks dpkg
+  (`dpkg-query -S`) and rpm (`rpm -qf`) whether they record the file it runs
+  from: when one does, `innerwarden upgrade` refuses (as it does for npm) and
+  prints the commands that install the fixed-name package from the rolling
+  release (one command: fetch it and its `.sha256` into a `mktemp -d`
+  directory, `sha256sum -c`, then install it by path; never `dnf install
+  <URL>`), `upgrade --check` names those commands instead of `innerwarden
+  upgrade`, and `innerwarden uninstall` leaves the file
+  to `sudo apt remove innerwarden` / `sudo dnf remove innerwarden`. Replacing
+  or deleting it by hand would leave the package database recording a file
+  that is no longer it. If the fixed-name assets or the package name change,
+  `crates/cli/src/upgrade_plan.rs` (`upgrade_commands`) changes with them.
 
 ### Publishing a new version
 
@@ -136,7 +148,9 @@ Local one-off:
 - Every release binary ships `<asset>.sha256` (bare hash) and `<asset>.sig`
   (Ed25519 **over the SHA-256 digest** of the binary). The release publishes the
   public key as `innerwarden-release.pub` (PEM, `MCowBQYDK2VwAyEA...`).
-- The `.deb`/`.rpm` ship a standard-format `<file>.sha256`.
+- The `.deb`/`.rpm` ship a standard-format `<file>.sha256`. They are not
+  signed: the checksum proves a download arrived whole, not who published it.
+  Signing them with the release key is open work for this pipeline.
 - npm ships a signed **provenance** attestation (verify with
   `npm audit signatures`, or see it on the package page).
 - **Key rotated 2026-07-24.** The previous private key was lost, so the signing
@@ -148,7 +162,11 @@ Local one-off:
   **There are now three pin sites, not one.** A rotation must update all of them:
 
   1. `crates/cli/src/release_verify.rs` (`RELEASE_PUBLIC_KEY_B64`) - compiled
-     into every shipped binary and used by `innerwarden upgrade`.
+     into every shipped binary and used by `innerwarden upgrade`. It is also
+     how `upgrade` and `uninstall` recognise an earlier build left as an `iw` /
+     `iw-guard` copy beside the binary (`upgrade_plan::is_innerwarden_build`),
+     without running it. After a rotation, copies from before it are no longer
+     recognised: they are left in place as somebody else's file.
   2. `npm/scripts/verify-release-asset.mjs` (`RELEASE_PUBLIC_KEY_B64`) - used by
      the npm and `.deb`/`.rpm` packaging paths.
   3. `iw-guard-install.sh` in the distribution repo - the `curl | sh` pin.

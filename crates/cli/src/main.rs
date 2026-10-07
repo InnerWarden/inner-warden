@@ -376,9 +376,9 @@ fn cmd_check(rest: &[String]) -> std::process::ExitCode {
         return std::process::ExitCode::from(2);
     }
 
-    // Shell surface only: loading the whole corpus compiles 62 regexes
-    // (~130ms) that cannot match a command, on a process that runs per
-    // tool call. See `RuleEngine::load_embedded_for`.
+    // Shell surface only: an engine that holds just the rules a command can
+    // match, on a process that runs per tool call. See
+    // `RuleEngine::load_embedded_for`.
     let engine =
         RuleEngine::load_embedded_for(innerwarden_agent_guard::rules::AtrSource::ShellCommand);
     let rules = analyze(&command, &engine);
@@ -578,9 +578,9 @@ fn hook_verdict_for(command: &str) -> Option<(String, serde_json::Value)> {
     if command.trim().is_empty() {
         return None;
     }
-    // Shell surface only: loading the whole corpus compiles 62 regexes
-    // (~130ms) that cannot match a command, on a process that runs per
-    // tool call. See `RuleEngine::load_embedded_for`.
+    // Shell surface only: an engine that holds just the rules a command can
+    // match, on a process that runs per tool call. See
+    // `RuleEngine::load_embedded_for`.
     let engine =
         RuleEngine::load_embedded_for(innerwarden_agent_guard::rules::AtrSource::ShellCommand);
     Some((command.clone(), analyze(&command, &engine)))
@@ -797,6 +797,9 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
     // Record EVERY screened command into the narrative graph (allow AND deny).
     // Persist recommendation and real outcome separately: monitor records a deny
     // as `would_block`; enforce records `blocked` only when this hook returns 2.
+    // The record is written BEFORE the verdict is returned, so nothing in it
+    // may wait without a bound: every lock it takes gives up after
+    // `GRAPH_LOCK_TIMEOUT` and the loss is reported as an outage.
     let would_block_under_policy = hook_blocks(&verdict, block_review);
     graph_io::record_hook(
         &command,
@@ -1131,12 +1134,11 @@ fn cmd_install(rest: &[String]) -> std::process::ExitCode {
 /// `innerwarden uninstall [claude-code] [--settings PATH]` - the inverse of
 /// `install`: remove the innerwarden PreToolUse hook from the agent's settings,
 /// leaving every other setting and hook untouched. Safe to run when nothing is
-/// installed (removes 0). Does not delete the binary itself (a running process
-/// cannot reliably remove its own file cross-platform) - it prints where it is so
-/// the user can `rm` it if they want it gone.
+/// installed (removes 0). Does not delete the binary: it names the full
+/// `uninstall`, which decides whether the binary is this install's to delete.
 fn cmd_uninstall(rest: &[String]) -> std::process::ExitCode {
     // Bare `uninstall` (or with --all / --purge) removes InnerWarden entirely:
-    // the agent hook, the config directory, and the binary. `uninstall
+    // the agent hook, the config directory, the binary and its shortcuts. `uninstall
     // claude-code` (a named agent) removes only that agent's hook.
     if uninstall_targets_whole_install(rest) {
         // Refuse what we do not understand, BEFORE removing anything. An
@@ -1214,9 +1216,13 @@ fn cmd_uninstall(rest: &[String]) -> std::process::ExitCode {
                 println!();
                 println!("The innerwarden binary is still installed;");
             }
-            if let Ok(exe) = std::env::current_exe() {
-                println!("remove it with:  rm {}", exe.display());
-            }
+            // Never a bare `rm` of this file: it may be npm's, a package's, or
+            // a copy another program keeps. The full uninstall decides that,
+            // and says what it removes and what it leaves before it starts.
+            println!(
+                "to remove InnerWarden entirely:  {} uninstall   (preview: --dry-run)",
+                prog()
+            );
             std::process::ExitCode::SUCCESS
         }
         Err(e) => {
@@ -1284,23 +1290,25 @@ fn uninstall_plan_lines(home: &std::path::Path) -> Vec<String> {
     // removal the run will not perform. Listing the path unconditionally was the
     // dry-run's own version of the defect: on an npm install it named a file
     // that uninstall must not touch.
-    match std::env::current_exe() {
-        Ok(exe) => {
-            let plan = upgrade_plan::plan_binary_removal(
-                upgrade_plan::managed_by(&exe),
-                can_write_beside(&exe),
-            );
-            match plan {
+    match binary_verdict(home) {
+        Some(verdict) => {
+            match &verdict.removal {
                 upgrade_plan::BinaryRemoval::RemoveHere => {
-                    out.push(format!("  binary  : {}", exe.display()))
+                    out.push(format!("  binary  : {}", verdict.exe.display()))
                 }
                 other => {
-                    let (lines, _) = upgrade_plan::binary_removal_lines(&other, &exe);
+                    let (lines, _) = upgrade_plan::binary_removal_lines(other, &verdict.exe);
                     out.extend(lines);
                 }
             }
+            for alias in &verdict.aliases.remove {
+                out.push(format!("  alias   : {}", alias.display()));
+            }
+            for (alias, why) in &verdict.aliases.keep {
+                out.push(format!("  alias   : keeps {}: {why}", alias.display()));
+            }
         }
-        Err(_) => out.push("  binary  : could not resolve this executable's path".to_string()),
+        None => out.push("  binary  : could not resolve this executable's path".to_string()),
     }
     out.push(String::new());
     out.push("Nothing was changed. Re-run without --dry-run to do it.".into());
@@ -1332,14 +1340,11 @@ fn cmd_uninstall_self(purge: bool) -> std::process::ExitCode {
     // ("remove it with `rm ...`") needed the very root the run did not have, and
     // for an npm copy it is the move `upgrade_plan::cannot_replace_advice`
     // already tells people not to make.
-    let exe = std::env::current_exe().ok();
-    let removal = exe.as_deref().map(|exe| {
-        upgrade_plan::plan_binary_removal(upgrade_plan::managed_by(exe), can_write_beside(exe))
-    });
+    let verdict = binary_verdict(&home);
     // Say it up front, while the machine is still intact and the answer can
     // change what the operator does.
-    if let (Some(plan), Some(exe)) = (removal.as_ref(), exe.as_deref()) {
-        let (lines, _) = upgrade_plan::binary_removal_lines(plan, exe);
+    if let Some(verdict) = verdict.as_ref() {
+        let (lines, _) = upgrade_plan::binary_removal_lines(&verdict.removal, &verdict.exe);
         for line in &lines {
             println!("{line}");
         }
@@ -1403,19 +1408,43 @@ fn cmd_uninstall_self(purge: bool) -> std::process::ExitCode {
     // file, so an initial `false` there is assigned and never read. Clippy calls
     // that out under `-D warnings` and it only appears on the Windows target,
     // which is a reminder that a green clippy on one OS is not a green clippy.
-    let left_behind = match (removal, exe.as_deref()) {
-        (Some(upgrade_plan::BinaryRemoval::RemoveHere), Some(exe)) => {
+    //
+    // The `iw` and `iw-guard` shortcuts go with it. Only this one file used to
+    // be removed, so the installer's two links were left pointing at nothing.
+    // A shortcut is removed only when it is provably this binary (see
+    // `upgrade_plan::plan_alias_removal`); a name that is anything else is
+    // left and said so.
+    let mut shortcut_left = false;
+    let binary_left = match verdict {
+        Some(BinaryVerdict {
+            removal: upgrade_plan::BinaryRemoval::RemoveHere,
+            exe,
+            aliases,
+        }) => {
+            for alias in &aliases.remove {
+                match std::fs::remove_file(alias) {
+                    Ok(()) => println!("  alias   : removed {}", alias.display()),
+                    Err(e) => {
+                        println!("  alias   : could not remove {} ({e})", alias.display());
+                        shortcut_left = true;
+                    }
+                }
+            }
+            for (alias, why) in &aliases.keep {
+                println!("  alias   : kept {}: {why}", alias.display());
+            }
             #[cfg(unix)]
             {
-                match std::fs::remove_file(exe) {
+                match std::fs::remove_file(&exe) {
                     Ok(()) => {
                         println!("  binary  : removed {}", exe.display());
                         false
                     }
                     Err(e) => {
-                        // The probe said writable and the unlink still failed, so
-                        // something changed underneath us. Report it rather than
-                        // claiming a clean removal.
+                        // The metadata said deletable and the unlink still failed
+                        // (an append-only directory, or something changed
+                        // underneath us). Report it rather than claiming a clean
+                        // removal.
                         println!("  binary  : could not remove {} ({e})", exe.display());
                         true
                     }
@@ -1429,19 +1458,24 @@ fn cmd_uninstall_self(purge: bool) -> std::process::ExitCode {
             }
         }
         // Already announced up front, before anything was destroyed.
-        (Some(_), _) => true,
-        (None, _) => {
+        Some(_) => true,
+        None => {
             println!("  binary  : could not resolve this executable's path");
             true
         }
     };
 
     println!();
-    if left_behind {
+    if binary_left || shortcut_left {
         // Never say "removed" over a machine that still has it. The old code
         // returned SUCCESS unconditionally, so a half-uninstall reported clean
         // and the next `innerwarden` call announced the product was broken.
-        println!("{COMMUNITY_NAME} partly removed: the binary is still on this machine.");
+        let what = if binary_left {
+            "the binary is"
+        } else {
+            "a shortcut to the binary is"
+        };
+        println!("{COMMUNITY_NAME} partly removed: {what} still on this machine.");
         println!("Follow the line above to finish, then restart your agent.");
         return std::process::ExitCode::from(1);
     }
@@ -1449,22 +1483,115 @@ fn cmd_uninstall_self(purge: bool) -> std::process::ExitCode {
     std::process::ExitCode::SUCCESS
 }
 
-/// Can this process write in the directory the binary lives in?
+/// What a full uninstall does about the binary and its shortcuts.
+struct BinaryVerdict {
+    /// The binary itself, every link resolved.
+    exe: std::path::PathBuf,
+    removal: upgrade_plan::BinaryRemoval,
+    /// Empty unless the binary is removed here: a binary left to npm, a
+    /// package manager, its owner or the operator keeps its shortcuts too.
+    aliases: upgrade_plan::AliasPlan,
+}
+
+/// Gather the facts and decide, once, for the preview and the real run alike,
+/// so `--dry-run` cannot promise what the run will not do.
 ///
-/// Writes and removes a real file rather than reading mode bits, which is the
-/// only method that does not guess wrong under a read-only mount, an immutable
-/// flag or a full disk. `upgrade::can_replace` reaches the same answer the same
-/// way for the same reason; the staging path is shared so the two can never
-/// disagree about which file they mean.
-fn can_write_beside(target: &std::path::Path) -> bool {
-    let staged = upgrade_plan::staging_path(target);
-    match std::fs::write(&staged, b"") {
-        Ok(()) => {
-            let _ = std::fs::remove_file(&staged);
-            true
+/// Read before anything is removed: whether a shortcut leads to this binary
+/// can only be asked while the binary is still there. Nothing here writes, so
+/// the preview can ask it too: it used to find out whether the binary could
+/// be deleted by creating and deleting a file beside it.
+fn binary_verdict(home: &std::path::Path) -> Option<BinaryVerdict> {
+    let exe = upgrade::installed_binary().ok()?;
+    let managed = upgrade_plan::managed_by(&exe, upgrade::package_owner(&exe).as_ref());
+    // Whether a copy npm or a package owns could be deleted, or where it came
+    // from, does not change what is done with it, so nothing is read for one.
+    let (origin, facts) = if managed == upgrade_plan::Managed::Direct {
+        let facts = upgrade::alias_facts(&exe);
+        let origin = upgrade_plan::copy_origin(
+            &exe,
+            std::env::consts::EXE_SUFFIX,
+            in_installer_dir(&exe, home),
+            upgrade_plan::a_shortcut_is_this_binary(&facts, &exe),
+        );
+        (origin, facts)
+    } else {
+        (upgrade_plan::CopyOrigin::Unrecognised, Vec::new())
+    };
+    let writable = origin == upgrade_plan::CopyOrigin::Installer && can_unlink(&exe);
+    let removal = upgrade_plan::plan_binary_removal(&managed, &origin, writable);
+    let aliases = if removal == upgrade_plan::BinaryRemoval::RemoveHere {
+        upgrade_plan::plan_alias_removal(&facts, &exe)
+    } else {
+        upgrade_plan::AliasPlan::default()
+    };
+    Some(BinaryVerdict {
+        exe,
+        removal,
+        aliases,
+    })
+}
+
+/// Is `exe` in the directory the installer uses by default for this account:
+/// `~/.local/bin` (the shell installer), or `%LOCALAPPDATA%\Programs\InnerWarden`
+/// (the Windows one)? Both sides resolved, so a link in either path cannot
+/// make them differ; a directory that cannot be resolved is not it.
+fn in_installer_dir(exe: &std::path::Path, home: &std::path::Path) -> bool {
+    let default_dir = if cfg!(windows) {
+        match std::env::var_os("LOCALAPPDATA") {
+            Some(local) => std::path::PathBuf::from(local)
+                .join("Programs")
+                .join("InnerWarden"),
+            None => return false,
         }
-        Err(_) => false,
+    } else {
+        home.join(".local").join("bin")
+    };
+    let (Some(dir), Ok(default_dir)) = (exe.parent(), std::fs::canonicalize(&default_dir)) else {
+        return false;
+    };
+    std::fs::canonicalize(dir).is_ok_and(|dir| dir == default_dir)
+}
+
+/// Can this account delete the binary? Read from metadata, never by writing
+/// (see `upgrade_plan::unlink_permitted`).
+#[cfg(unix)]
+fn can_unlink(exe: &std::path::Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    // The kernel's own access check: it already answers no on a read-only
+    // mount and on an immutable inode. `access` asks for the real ids, which
+    // are the effective ones here, since this program is never setuid.
+    fn access(path: &std::path::Path, mode: libc::c_int) -> Result<(), Option<i32>> {
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| None)?;
+        match unsafe { libc::access(c.as_ptr(), mode) } {
+            0 => Ok(()),
+            _ => Err(std::io::Error::last_os_error().raw_os_error()),
+        }
     }
+    let Some(dir) = exe.parent() else {
+        return false;
+    };
+    let (Ok(dir_meta), Ok(file_meta)) = (std::fs::metadata(dir), std::fs::symlink_metadata(exe))
+    else {
+        return false;
+    };
+    upgrade_plan::unlink_permitted(&upgrade_plan::UnlinkFacts {
+        dir_writable: access(dir, libc::W_OK | libc::X_OK).is_ok(),
+        file_immutable: access(exe, libc::W_OK) == Err(Some(libc::EPERM)),
+        sticky_dir: dir_meta.mode() & 0o1000 != 0,
+        // geteuid takes no arguments, touches no memory, and cannot fail.
+        euid: unsafe { libc::geteuid() },
+        dir_uid: dir_meta.uid(),
+        file_uid: file_meta.uid(),
+    })
+}
+
+/// Windows never deletes the running binary (see `cmd_uninstall_self`), so
+/// this only decides whether it is named for removal by hand. A read-only
+/// file cannot be deleted there.
+#[cfg(not(unix))]
+fn can_unlink(exe: &std::path::Path) -> bool {
+    std::fs::metadata(exe).is_ok_and(|m| !m.permissions().readonly())
 }
 
 /// `innerwarden serve [--bind IP:PORT]` - expose the guardrail over plain HTTP on
@@ -1482,9 +1609,9 @@ fn cmd_serve(rest: &[String]) -> std::process::ExitCode {
         }
     }
 
-    // Shell surface only: loading the whole corpus compiles 62 regexes
-    // (~130ms) that cannot match a command, on a process that runs per
-    // tool call. See `RuleEngine::load_embedded_for`.
+    // Shell surface only: an engine that holds just the rules a command can
+    // match, on a process that runs per tool call. See
+    // `RuleEngine::load_embedded_for`.
     let engine =
         RuleEngine::load_embedded_for(innerwarden_agent_guard::rules::AtrSource::ShellCommand);
     let server = match tiny_http::Server::http(bind.as_str()) {
@@ -1654,7 +1781,10 @@ fn cmd_proxy(rest: &[String]) -> std::process::ExitCode {
         as_protocol_error: error_response,
     };
 
-    let rt = match tokio::runtime::Builder::new_multi_thread()
+    // One thread: the proxy is a single task by design (one writer to the
+    // client, no spawned pumps), so worker threads only sat idle, one per CPU,
+    // in every proxy an MCP client keeps open.
+    let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
     {
@@ -1673,7 +1803,13 @@ fn cmd_proxy(rest: &[String]) -> std::process::ExitCode {
             eprintln!("{}", format_alert(&label, d));
         }
     };
-    match rt.block_on(run_proxy(cfg, Some(engine), on_event)) {
+    let result = rt.block_on(run_proxy(cfg, Some(engine), on_event));
+    // The server is stopped and reaped by now. Dropping the runtime normally
+    // would wait for its blocking tasks, and the read on our stdin is one that
+    // cannot be cancelled: a proxy told to stop while its client was still
+    // connected would hang here until the client wrote or closed.
+    rt.shutdown_background();
+    match result {
         Ok(code) => std::process::ExitCode::from(code.clamp(0, 255) as u8),
         Err(e) => {
             eprintln!("innerwarden proxy: {e}");
@@ -1712,7 +1848,7 @@ fn help_text() -> String {
            {p} uninstall claude-code     remove that hook (leaves other settings untouched)\n  \
            {p} upgrade                   update to the latest signed release (verifies before replacing)\n  \
          {p} host <command>            run a command in the Active Defence host layer\n  \
-           {p} uninstall                 remove InnerWarden entirely: hook, config, and the binary\n  \
+           {p} uninstall                 remove InnerWarden entirely: hook, config, binary and its iw shortcuts\n  \
            {p} agents [connect [--monitor]|disconnect [--all|<name>]]\n  \
            \x20                                find AI agents on this machine + connect the guard\n  \
            {p} agents auto-connect [--monitor|--off|status]\n  \

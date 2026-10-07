@@ -3,6 +3,264 @@
 All notable changes to InnerWarden are documented here. This project
 follows semantic versioning.
 
+## 1.5.2 - 2026-10-07
+
+### Upgrade notes: what to do
+
+- **OpenClaw message hook: install it again, this once.**
+  `innerwarden observe install`, then restart the OpenClaw gateway. The hook
+  an earlier version wrote keeps running after an upgrade, and with it
+  Control UI chats are recorded only after 15 minutes and without the agent's
+  name. The install now also adds the reply plugin (below), and grants it the
+  conversation access OpenClaw requires before a plugin can read a turn; it
+  says so, and leaves alone an entry you turned off and your `plugins.allow`,
+  `plugins.deny` and `plugins.enabled`. From this version on, `upgrade` brings
+  the hook and the plugin up to the new version's itself (`observe refresh`).
+  `innerwarden observe status` and the dashboard's Messages card say when
+  either is an earlier version's, or is not what InnerWarden wrote.
+- **A copy installed from the `.deb` or `.rpm` is upgraded with the package.**
+  `innerwarden upgrade` refuses it and exits 2, so an unattended
+  `sudo innerwarden upgrade` on such a host now fails. Use the command it
+  prints (it fetches the package and its checksum into a private directory,
+  checks it, then installs it), or `--yes` to replace the file anyway.
+  `upgrade --check` reports on every kind of install.
+- **`innerwarden uninstall` on a packaged copy** removes the hooks, the
+  configuration and the `iw` / `iw-guard` shortcuts, leaves the binary to
+  `sudo apt remove innerwarden` or `sudo dnf remove innerwarden`, and exits 1
+  with "partly removed" until that is done.
+- **`innerwarden uninstall` removes only the installer's copy.** A binary
+  the installer did not lay down (installed with `cargo install`, with Scoop,
+  or a copy another program keeps for itself) is now left where it is, with
+  the command that removes it where there is one, and the run exits 1 with
+  "partly removed". After uninstalling a cargo or Scoop copy, finish with
+  `cargo uninstall innerwarden` or `scoop uninstall innerwarden`.
+- **Reconnect MCP agents to have them named.** `innerwarden agents connect`
+  now writes `--label` and `--agent` into each MCP wrapper, so its decisions
+  are recorded under the session `mcp:<agent>` instead of `mcp:innerwarden`.
+  Run it again for wrappers an earlier version wrote; history recorded before
+  that stays under the old session.
+
+### Changed
+
+- **A Control UI ask is recorded with how the turn ended.** OpenClaw reports
+  no reply from its Control UI chat to hooks, so an ask made there was
+  recorded after two minutes with the outcome not seen. `observe install`
+  now adds an OpenClaw plugin, `innerwarden-replies`, that reads the end of
+  each Control UI turn a person started (OpenClaw's typed `agent_end` hook)
+  and reports only its shape, a tool call, a reply, or neither, to the new
+  `innerwarden observe ended`. That closes the ask whose message started the
+  turn, and no other: a turn that replied with no tool call is recorded as
+  `undetermined` with `decider_basis: replied_without_tool_call` (the agent
+  ran nothing; the plugin never reads the words, so whether it declined is
+  not seen); one that called a tool is `undetermined`, `tool_call_in_turn`,
+  because a tool the guard does not screen leaves nothing in its record, and
+  a reply after it does not show the agent declined; one that ended with
+  nothing said is `undetermined`, `turn_ended_without_reply`. A heartbeat or
+  cron turn never closes an ask. A turn holding a message in a shape the
+  plugin does not know is not reported, unless a tool call it recognises
+  makes it `tool_call_in_turn`, and the ask is recorded as not seen. Where
+  the plugin runs, the message hook's two-minute timer leaves an ask to the
+  end of its turn (at most 15 minutes), so a long turn is not recorded as
+  "this chat does not report your agent's reply", and what the guard
+  recorded late in it is in the record. The plugin reads Control UI turns
+  only.
+  The gateway logs the plugin as one it cannot verify, because it was not
+  installed through `openclaw plugins install`.
+- **A reply is no longer read as the model declining.** `observe reply`
+  recorded a reply with nothing the guard screens in its window as
+  `model_refused`, and the dashboard said "Your agent declined on its own".
+  The reply's words are never read, and a tool the guard does not screen
+  (OpenClaw's own exec) leaves nothing in its record, so an ask the agent
+  carried out with such a tool, or answered by doing what was asked in
+  words, read the same. Such a reply is now `undetermined`, with
+  `decider_basis: no_screened_execution_recorded_in_window`, and the
+  dashboard says the agent replied and nothing the guard screens ran, under
+  the outcome "Answered". Records an earlier version wrote that way read the
+  same. `model_refused` is written only when a caller states it
+  (`observe reply --decider`).
+- **`upgrade` refreshes what `observe install` wrote.** After the binary is
+  replaced, the new binary's `innerwarden observe refresh` replaces the
+  message hook's and the reply plugin's files with the new version's where
+  they are exactly what an earlier release wrote. A file somebody changed is
+  left as it is and named, nothing that was not installed is added, and the
+  gateway is never restarted: the upgrade says to restart it.
+- **The MCP proxy ends with its session.** When the client closes, the proxy
+  relays the server's last output for 3 s, then stops the server: SIGTERM to
+  its whole process group, SIGKILL 1 s later, so a server started through
+  `npx`, `uvx` or `sh -c` is stopped with its launcher.
+- **The MCP loop breaker holds one call for one window.** An identical tool
+  call made more than 3 times within 60 s is refused (guard) or flagged
+  (advisory), that call only, and the refusal says when it is accepted again.
+  The cost ceiling is gone. Library users: `innerwarden_agent_guard::breaker`'s
+  `BreakerConfig` and `Breaker::record` changed.
+- **Conversation records claim less, and say why.** `guard_denied` is recorded
+  only for an observed reply and an enforce-mode refusal on a line naming the
+  agent that was asked and the session the ask arrived in. A refusal of the
+  same agent in another conversation, or under the MCP proxy's own session
+  (how OpenClaw is guarded), is recorded as `undetermined` with
+  `decider_basis: guard_block_recorded_in_window`; it used to stamp whatever
+  ask was waiting `guard_denied`, `enforced: true`. A monitor-mode
+  `would_block` in the window is recorded as `undetermined` with
+  `decider_basis: flagged_action_ran_in_window`, never as a refusal or as the
+  model declining. `guard.attempt` gains `agent` and
+  the bases `next_message_before_reply`, `channel_reports_no_reply`,
+  `pending_limit_reached`, `pending_state_unavailable` and
+  `flagged_action_ran_in_window`; `guard.blocked` gains `agent`.
+- **A guard event file that cannot be written is an outage.** A link, a second
+  name, something that is not a plain file, or a file this account cannot
+  append to, at `guard-events.jsonl` or `record-health.json`, is reported by
+  `innerwarden graph` and the dashboard with the fix, instead of dropping lines
+  silently.
+
+### Fixed
+
+- **`uninstall` no longer deletes a copy it did not install.** It decided
+  from npm, the `.deb`/`.rpm` database and whether the file could be deleted,
+  and as root every file can be, so `sudo innerwarden uninstall` run from a
+  copy another program keeps for itself deleted it. The binary is now removed
+  only when it is the installer's: named `innerwarden`, `iw` or `iw-guard`,
+  and either in the installer's directory for this account (`~/.local/bin`,
+  or `%LOCALAPPDATA%\Programs\InnerWarden` on Windows) or with an `iw` or
+  `iw-guard` beside it that links to it or is a copy of it. Anything else is
+  kept and named, and the hooks and configuration are still removed.
+- **`uninstall --dry-run` writes nothing.** The preview found out whether the
+  binary could be deleted by creating and deleting a file beside it. Both the
+  preview and the run now read that from the file system's own permission
+  check, without writing.
+- **`upgrade` refreshes the installer's `iw` and `iw-guard` copies.** Where
+  the shell installer cannot make a link it copies the binary instead, and on
+  Linux and macOS `upgrade` replaced only `innerwarden`, so `iw` went on
+  running the build first installed, and `uninstall` then kept both copies as
+  another program's. A copy is now replaced with the binary when it is this
+  build or any earlier one (recognised by the release key every build since
+  1.1.0 carries, without running it), and `uninstall` removes such a copy. A
+  link is left a link, and a file that is not InnerWarden is not touched.
+- **`upgrade` never writes through a link at its staging name.** The new
+  binary is staged beside the old one, and a link planted under that name, in
+  a directory another account can write, made `sudo innerwarden upgrade` write
+  the release (and its first check, an empty file) over whatever the link
+  pointed at. Whatever is at the staging name is now removed first and the
+  file is created afresh.
+- **Removing one agent's hook no longer prints `rm <path>`.** `innerwarden
+  uninstall <agent>` ended by handing out a bare `rm` of whatever copy was
+  running, an npm or package copy included. It now points at the full
+  `innerwarden uninstall`, which decides whether the binary is its to remove.
+- **A question about a miner is not an attack attempt.** The command rules
+  refuse a miner binary wherever its name appears, so a message such as "how
+  do I remove xmrig from this box?" was recorded as a conversation attempt,
+  deny 40. A name that is only talked about is now taken out before the rules
+  read the message: a plain word the sentence acts on right before it
+  ("remove xmrig", "kill the xmrig process", "we found minerd") or asks about
+  in the clause that holds it ("how do I remove xmrig", "is xmrig running"),
+  and `t-rex` unless the message is about mining. A message that asks for
+  anything, gives the miner as a command (`nohup xmrig`, `xmrig -o ...`), or
+  has a defence word only elsewhere in the sentence ("configure xmrig and
+  monitor the hashrate") is read as before. What is no longer recorded: a
+  request with no request verb, phrased as a question about the miner ("what
+  if xmrig ran on every core?") or with a defence or report word right
+  before its name ("now that we found xmrig, keep it going"). The command
+  such an ask leads to is still screened: a miner in a command an agent runs
+  is still refused.
+- **A held lock no longer holds back the hook's verdict.** The hook records
+  each decision before it answers, and one of the locks that write takes was
+  waited for with no time limit, so any account able to open that lock (the
+  guarded agent's own included) could keep the hook from answering at all.
+  Every lock the record takes is now waited for at most 100 ms: the verdict is
+  returned as normal, and the skipped record is reported as a recording
+  outage, `graph_lock_timeout`. Agent configuration writes give up after 2 s
+  and say which lock was held, and so does the agent-policy lock
+  (`~/.config/innerwarden/agents.lock`) after 5 s: `enforce`, `dry-run`,
+  `agents connect` and `disconnect`, `setup`, `upgrade`'s rewiring and the
+  dashboard's auto-connect all take it first, and a holder that never let go
+  kept each of them waiting for good. `innerwarden observe` gives up after 1 s, and
+  an ask it could not hold is recorded at once with its outcome unknown.
+- **One large tool result no longer clears what the MCP proxy remembers.**
+  The proxy keeps the long values of each tool result so that a later call
+  carrying one is flagged (`AG-TAINT`). A single large result, such as an
+  image read or a file of many short words, used to push out every value kept
+  before it. The newest results are now kept whole; each older one keeps a
+  sample of up to 4 KiB, its network destinations (URLs, e-mail addresses,
+  `host:port`) first, then the rest drawn by a key chosen per proxy; a value
+  over 256 bytes is kept by its start, which still matches a call that
+  carries all of it. The store stays bounded, at about 1.1 MiB per proxy.
+  What a result's author still decides is how much of their own result
+  competes for its share: once the store is full, the next maximal result
+  the agent reads cuts a result to its share, and a page padded with other
+  destinations keeps only some of them. A value is found by its hash, so a
+  session that lists thousands of names under one directory no longer slows
+  every message the proxy relays; the search of one call is bounded, and a
+  call whose arguments cannot be checked in that bound is refused
+  (`AG-TAINT`) rather than passed unchecked.
+- **Each MCP proxy uses about half the memory.** A proxy compiled every rule
+  in the shipped corpus as it started, about 47 MB before it had screened a
+  message, half of it rules for model prompts that a proxy never applies.
+  Each rule is now compiled the first time something it applies to is
+  screened, before that first verdict is given: a proxy starts at about 6 MB
+  and, once tool calls and results have passed through it, holds about 25 MB
+  where it held about 52 MB (Linux x86_64). The verdicts are unchanged.
+- **The MCP proxy no longer refuses every `write_file`.** ATR-2026-040 matched
+  the tool's name, so in guard mode (the proxy's default) every write through
+  a filesystem server was refused, an ordinary one inside its allowed
+  directories included, while the same server's `edit_file` and `move_file`
+  were not checked at all. The rule no longer looks at the name. A tool call
+  that may change a file granting privilege or a login, holding code that
+  runs as root, or carrying the guard itself, is refused instead
+  (`AG-PRIV-WRITE`), whichever tool makes it and however the path is spelled
+  (`/etc//sudoers`, `/tmp/../etc/cron.d/x`, `/private/etc/...`, `file://`):
+  the sudo, doas and polkit rules, PAM, accounts and groups, SSH keys and
+  server settings, root's home, the dynamic linker's preload list, system
+  cron jobs and logrotate, boot services and systemd's defaults, the login
+  scripts every account runs (`/etc/profile`, `/etc/profile.d`,
+  `/etc/bash.bashrc`, `/etc/environment`, ...), network dispatcher scripts,
+  udev and kernel module rules, kernel settings (`/etc/sysctl.d`), the
+  package manager's hooks and install scripts, the system's programs and
+  libraries, and the guard's own wiring: the agent settings that carry its
+  hook (`.claude/settings.json`), every MCP configuration it wraps
+  (`.claude.json`, a project's `.mcp.json`, `.cursor/mcp.json`,
+  `.codex/config.toml`, `.gemini/settings.json`, `openclaw.json`), the
+  OpenClaw hook and plugin `observe install` lays down, and its own
+  configuration (`~/.config/innerwarden`, `/etc/innerwarden`,
+  `/var/lib/innerwarden`). Only a path where the call writes (an argument
+  such as `path`, `source`, `destination`, `file`) is judged against every
+  one of these; a single path anywhere else (an argv entry, an unusual
+  argument name) is judged against all but the system's programs, and a
+  sentence, a search query or a command line is not taken for a target. The
+  filesystem server's read-only tools, and any tool its server declares
+  read-only (`readOnlyHint`), may name these files. What is left open: a
+  write tool whose target argument has an unusual name is not held to the
+  system's programs; a relative path (and `~/`) is held only to what is the
+  same in every directory (`.ssh`, the agent settings), so `etc/sudoers.d/x`
+  sent to a server working in `/` is not judged; Windows paths are not
+  judged; links are not followed; and the configuration of another program
+  that runs as root (a web server's, a container runtime's) is left to the
+  other rules.
+- **`innerwarden agents` and `status` report the mode each MCP proxy runs in.**
+  The mode was guessed by searching the agent's configuration for the words
+  `advisory`, `warn`, `guard` and `kill` anywhere in it, so a log level or a
+  server's own argument could decide it, and a wrapper set to
+  `--mode=advisory` beside any other `"guard"` was listed as enforce while it
+  only recorded. Each wrapper's arguments are now read the way the proxy reads
+  them, the way the dashboard already did, and a flag's value is never taken
+  for the mode (`--label --mode=guard` is a label). A wrapper whose last
+  option before `--` is a flag waiting for its value is listed as not guarded:
+  the proxy takes that `--` as the value and runs the options written after
+  it. A wrapper whose proxy refuses one of its words (`--verbose`) exits
+  before its server starts, and is listed as not guarded. Only a command
+  named `innerwarden`, `iw` or `iw-guard` is taken for the guard: any name
+  that began with `innerwarden` counted, so a script under such a name was
+  listed as the guard in enforce mode while it ran the server unscreened.
+  Such a server is now listed as not guarded, and connecting the agent wraps
+  it in the real proxy. The configuration is read, not the binary: a program
+  written under one of the guard's own names is still taken for it. A
+  generic MCP client now shows the mode of its own configuration: it showed
+  none, and one kept in `~/.claude/` showed Claude Code's.
+- **A loop-breaker finding names the risks a loop is.** `AG-ASI09-BREAKER`
+  carried no OWASP Agentic class, so its case read "OWASP Agentic: none",
+  and its id points at ASI09, human-agent trust exploitation, which a loop is
+  not. It now names ASI02 (tool misuse and exploitation) and ASI08
+  (cascading failures) in its record and on its case. The id is unchanged,
+  so an alert rule written against it keeps matching.
+
 ## 1.5.1 - 2026-09-30
 
 ### Fixed

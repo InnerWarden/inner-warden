@@ -17,7 +17,7 @@
 //! what was downloaded can be trusted.
 
 use std::io::Read as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use crate::release_verify;
@@ -52,9 +52,9 @@ pub enum Invocation {
     /// Download, verify, and replace.
     ///
     /// `forced` carries `--yes`/`-y`, which until now was accepted and did
-    /// nothing at all. It is the acknowledgement that overrides the npm refusal
-    /// below, and nothing else: it does not skip verification, and it cannot
-    /// turn a `--check` into an install.
+    /// nothing at all. It is the acknowledgement that overrides the refusal of
+    /// a copy npm, apt or dnf installed, and nothing else: it does not skip
+    /// verification, and it cannot turn a `--check` into an install.
     Upgrade { forced: bool },
 }
 
@@ -68,11 +68,123 @@ pub(crate) fn help_text(verb: &str) -> String {
          Update the InnerWarden Community binary in place to the latest signed\n  \
          release. It downloads the release asset and verifies its SHA-256 and its\n  \
          Ed25519 signature against the key compiled into this binary before replacing\n  \
-         anything. Hooks and config are left untouched.\n\
+         anything. The `iw` and `iw-guard` copies the installer laid beside it are\n  \
+         replaced too. Hooks and config are left untouched.\n\
          \n  \
          --check   report which version is published, and change nothing\n  \
-         --yes     replace an npm-managed copy anyway (see the refusal for why not)"
+         --yes     replace a copy npm, apt or dnf installed anyway (see the refusal\n  \
+         \x20         for why not)"
     )
+}
+
+/// What `upgrade` does once its arguments are understood, before any byte of
+/// the binary is fetched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Gate {
+    /// `--check`: report the published version and change nothing.
+    Report,
+    /// npm, apt or dnf installed this copy and `--yes` was not given.
+    RefuseManaged,
+    /// The probe could not write beside the binary. Carries the error.
+    CannotReplace(String),
+    /// Download, verify, replace.
+    Proceed,
+}
+
+/// Pure: decide from the invocation, who manages the copy, and a probe that is
+/// only run when the answer depends on it.
+///
+/// `--check` is decided FIRST and never probes. It used to come after the
+/// replace probe, so on a binary the user cannot write (`/usr/bin/innerwarden`
+/// from the `.deb` or `.rpm`, any root-owned copy) `innerwarden upgrade --check`
+/// failed with "Permission denied" before it reported anything, and the probe
+/// itself is a write beside the binary, which a read-only command must not make.
+/// A managed copy is refused before the probe for the same reason: nothing is
+/// written beside a file that belongs to a package manager.
+pub fn gate(
+    check_only: bool,
+    forced: bool,
+    managed: &upgrade_plan::Managed,
+    probe: impl FnOnce() -> std::io::Result<()>,
+) -> Gate {
+    if check_only {
+        return Gate::Report;
+    }
+    if upgrade_plan::managed_refusal_applies(managed, check_only, forced) {
+        return Gate::RefuseManaged;
+    }
+    match probe() {
+        Ok(()) => Gate::Proceed,
+        Err(e) => Gate::CannotReplace(e.to_string()),
+    }
+}
+
+/// The file this process runs from, every link resolved.
+///
+/// macOS reports the path the program was started by, so `iw upgrade` saw the
+/// `iw` link rather than the binary: it renamed a regular file over the link
+/// and left `innerwarden` on the old build, and `iw uninstall` unlinked the
+/// link and left the binary. Linux already reports the resolved file. Windows
+/// keeps the reported path: its installer lays copies, not links, and a
+/// canonical Windows path carries a `\\?\` prefix the messages would print.
+pub(crate) fn installed_binary() -> std::io::Result<PathBuf> {
+    resolve_installed(&std::env::current_exe()?)
+}
+
+#[cfg(unix)]
+fn resolve_installed(path: &Path) -> std::io::Result<PathBuf> {
+    std::fs::canonicalize(path)
+}
+
+#[cfg(not(unix))]
+fn resolve_installed(path: &Path) -> std::io::Result<PathBuf> {
+    Ok(path.to_path_buf())
+}
+
+/// The facts `upgrade_plan::managed_by` decides from: which system package, if
+/// any, records `target`.
+///
+/// Asks the package database rather than guessing from the path, because
+/// `/usr/bin/innerwarden` is also where `sudo IW_GUARD_DIR=/usr/bin` puts the
+/// installer's copy. The tools are named by absolute path so the answer cannot
+/// come from whatever a PATH entry calls itself. A tool that is missing, fails,
+/// or names no owner yields no owner, which is how every install was treated
+/// before. Linux only: nothing else ships the `.deb` or `.rpm`.
+pub(crate) fn package_owner(target: &Path) -> Option<upgrade_plan::PackageOwner> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    let path = target.as_os_str();
+    if let Some(out) = query_package_db("/usr/bin/dpkg-query", &["-S".as_ref(), path]) {
+        if let Some(package) = upgrade_plan::dpkg_owner(&out, target) {
+            return Some(upgrade_plan::PackageOwner::Dpkg { package });
+        }
+    }
+    let out = query_package_db(
+        "/usr/bin/rpm",
+        &[
+            "-qf".as_ref(),
+            "--queryformat".as_ref(),
+            "%{NAME}\n".as_ref(),
+            path,
+        ],
+    )?;
+    upgrade_plan::rpm_owner(&out).map(|package| upgrade_plan::PackageOwner::Rpm { package })
+}
+
+/// Run a package database query and return its stdout, or nothing when the
+/// tool is absent or does not answer with success.
+fn query_package_db(program: &str, args: &[&std::ffi::OsStr]) -> Option<String> {
+    let out = std::process::Command::new(program)
+        .args(args)
+        .env("LC_ALL", "C")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// Pure: what the arguments ask for.
@@ -128,14 +240,14 @@ pub fn cmd(rest: &[String]) -> ExitCode {
         );
         return ExitCode::from(1);
     };
-    let Ok(target) = std::env::current_exe() else {
+    let Ok(target) = installed_binary() else {
         eprintln!("innerwarden upgrade: could not locate the running binary.");
         return ExitCode::from(1);
     };
-    // A parked image from the previous Windows upgrade (see install_verified).
-    let _ = std::fs::remove_file(upgrade_plan::parked_path(&target));
+    let managed = upgrade_plan::managed_by(&target, package_owner(&target).as_ref());
+    let arch = std::env::consts::ARCH;
 
-    // An npm-managed copy must not be replaced by hand, and that has to be said
+    // A managed copy must not be replaced by hand, and that has to be said
     // BEFORE the download rather than after a failure.
     //
     // `upgrade_plan` already documented this hazard and `managed_by` already
@@ -146,36 +258,43 @@ pub fn cmd(rest: &[String]) -> ExitCode {
     // the replace SUCCEEDS. The user is told "Upgrade complete", npm goes on
     // believing it ships the old version, and the next `npm install -g` silently
     // puts the old binary back. The only case the advice existed for was the one
-    // case it was never shown in.
-    if upgrade_plan::npm_refusal_applies(&target, check_only, forced) {
-        eprintln!("innerwarden upgrade: REFUSED, this copy is managed by npm.");
-        eprintln!("  Nothing was downloaded. The installed binary is untouched.");
-        eprintln!();
-        for line in upgrade_plan::cannot_replace_advice(&target, running_as_root()) {
-            eprintln!("{line}");
-        }
-        eprintln!();
-        eprintln!("  To replace npm's file anyway, knowing the next `npm install -g`");
-        eprintln!("  will undo it:  innerwarden upgrade --yes");
-        return ExitCode::from(2);
-    }
-
-    // Prove we can replace the binary BEFORE downloading it.
+    // case it was never shown in. The `.deb` and `.rpm` are refused the same way.
     //
-    // The check used to happen implicitly, at the rename, after the download
-    // and both signature checks had already run. Someone whose CLI came from
-    // `npm install -g` therefore waited through the whole verified download to
-    // be told "could not replace the binary: Permission denied", with no
-    // indication that the fix is npm rather than sudo. Fail in the first second
-    // instead, and say which command to run.
-    if let Err(e) = can_replace(&target) {
-        eprintln!("innerwarden upgrade: cannot replace the installed binary ({e}).");
-        eprintln!("  Nothing was downloaded. The installed binary is untouched.");
-        eprintln!();
-        for line in upgrade_plan::cannot_replace_advice(&target, running_as_root()) {
-            eprintln!("{line}");
+    // Then prove we can replace the binary BEFORE downloading it. The check
+    // used to happen implicitly, at the rename, after the download and both
+    // signature checks had already run, so someone whose CLI came from
+    // `npm install -g` waited through the whole verified download to be told
+    // "Permission denied". Fail in the first second instead, and say which
+    // command to run. `--check` is decided before either: see `gate`.
+    match gate(check_only, forced, &managed, || can_replace(&target)) {
+        Gate::Report => {}
+        Gate::RefuseManaged => {
+            for line in upgrade_plan::managed_refusal_lines(
+                &target,
+                &managed,
+                running_as_root(),
+                std::env::consts::OS,
+                arch,
+            ) {
+                eprintln!("{line}");
+            }
+            return ExitCode::from(2);
         }
-        return ExitCode::from(1);
+        Gate::CannotReplace(e) => {
+            eprintln!("innerwarden upgrade: cannot replace the installed binary ({e}).");
+            eprintln!("  Nothing was downloaded. The installed binary is untouched.");
+            eprintln!();
+            for line in upgrade_plan::cannot_replace_advice(&target, &managed, running_as_root()) {
+                eprintln!("{line}");
+            }
+            return ExitCode::from(1);
+        }
+        Gate::Proceed => {
+            // A parked image from the previous Windows upgrade (see
+            // install_verified). Only on the path that replaces: `--check`
+            // changes nothing.
+            let _ = std::fs::remove_file(upgrade_plan::parked_path(&target));
+        }
     }
 
     if check_only {
@@ -202,7 +321,7 @@ pub fn cmd(rest: &[String]) -> ExitCode {
             }
         };
         let outcome = upgrade_plan::check_outcome(current, &manifest);
-        for line in upgrade_plan::check_lines(&outcome, &asset, upgrade_plan::managed_by(&target)) {
+        for line in upgrade_plan::check_lines(&outcome, &asset, &managed, arch) {
             println!("{line}");
         }
         // "Could not tell" is not success. Exiting 0 there would let a script
@@ -223,9 +342,7 @@ pub fn cmd(rest: &[String]) -> ExitCode {
         if let Ok(manifest) = fetch_text(&manifest_url) {
             let outcome = upgrade_plan::check_outcome(current, &manifest);
             if upgrade_plan::nothing_to_do(&outcome) {
-                for line in
-                    upgrade_plan::check_lines(&outcome, &asset, upgrade_plan::managed_by(&target))
-                {
+                for line in upgrade_plan::check_lines(&outcome, &asset, &managed, arch) {
                     println!("{line}");
                 }
                 return ExitCode::SUCCESS;
@@ -249,6 +366,9 @@ pub fn cmd(rest: &[String]) -> ExitCode {
             for line in closing_advice(dashboard_is_serving()) {
                 println!("{line}");
             }
+            for line in refresh_openclaw_files(&target) {
+                println!("{line}");
+            }
             ExitCode::SUCCESS
         }
         FetchOutcome::DownloadFailed(what) => fail(&format!("could not download the {what}")),
@@ -260,7 +380,7 @@ pub fn cmd(rest: &[String]) -> ExitCode {
         FetchOutcome::InstallFailed(e) => {
             eprintln!("innerwarden upgrade: verified, but could not replace the binary: {e}");
             eprintln!();
-            for line in upgrade_plan::cannot_replace_advice(&target, running_as_root()) {
+            for line in upgrade_plan::cannot_replace_advice(&target, &managed, running_as_root()) {
                 eprintln!("{line}");
             }
             ExitCode::from(1)
@@ -276,7 +396,7 @@ pub fn cmd(rest: &[String]) -> ExitCode {
 /// wrong under a read-only mount, an immutable flag, or a full disk.
 fn can_replace(target: &Path) -> std::io::Result<()> {
     let staged = upgrade_plan::staging_path(target);
-    std::fs::write(&staged, b"")?;
+    write_executable(&staged, b"")?;
     std::fs::remove_file(&staged)
 }
 
@@ -374,6 +494,72 @@ fn closing_advice(dashboard_running: bool) -> Vec<String> {
     ]
 }
 
+/// Bring what `observe install` wrote into OpenClaw (the message hook and the
+/// reply plugin) up to the new version's, after a successful replace.
+///
+/// `observe install` writes those files once, and replacing the binary does
+/// not touch them, so the gateway kept running whatever the previous version
+/// wrote until the operator installed them again. This process IS the
+/// previous version and cannot know what the new one ships, so it runs the
+/// new binary's `observe refresh`, which replaces a file only where it is
+/// exactly what some release wrote, names one somebody changed instead of
+/// overwriting it, installs nothing that was not installed, and never
+/// restarts the gateway. Nothing installed: nothing to say.
+fn refresh_openclaw_files(target: &Path) -> Vec<String> {
+    if !crate::observe_io::openclaw_files_present() {
+        return Vec::new();
+    }
+    let ran = std::process::Command::new(target)
+        .args(["observe", "refresh"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()
+        .map(|out| RefreshRun {
+            code: out.status.code(),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        });
+    refresh_report(ran.as_ref())
+}
+
+/// What the new binary's `observe refresh` did, as the upgrade saw it.
+struct RefreshRun {
+    code: Option<i32>,
+    stdout: String,
+    stderr: String,
+}
+
+/// What the upgrade prints for the refresh. PURE.
+///
+/// The refresh's own words when it ran, set off by a blank line. When it
+/// could not run at all, or answered as a binary that does not know the
+/// command (exit 2), the step by hand: the hook stays whatever the previous
+/// version wrote until somebody installs it again, and saying nothing is how
+/// that went unnoticed.
+fn refresh_report(ran: Option<&RefreshRun>) -> Vec<String> {
+    match ran {
+        Some(run) if run.code.is_some() && run.code != Some(2) => {
+            let mut lines: Vec<String> = run
+                .stdout
+                .lines()
+                .chain(run.stderr.lines())
+                .map(str::to_string)
+                .collect();
+            if !lines.is_empty() {
+                lines.insert(0, String::new());
+            }
+            lines
+        }
+        _ => vec![
+            String::new(),
+            "OpenClaw's message hook is still the one the previous version installed.".into(),
+            "To run this version's:  innerwarden observe install".into(),
+            "then restart the OpenClaw gateway. `innerwarden observe status` says".into(),
+            "whether the installed hook is current.".into(),
+        ],
+    }
+}
+
 fn fail(message: &str) -> ExitCode {
     eprintln!("innerwarden upgrade: {message}");
     ExitCode::from(1)
@@ -437,14 +623,120 @@ pub fn fetch_verify_install(base: &str, asset: &str, target: &Path) -> FetchOutc
 }
 
 fn install_verified(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    // Which of the names beside the binary are the installer's copies of it,
+    // read BEFORE it is replaced: afterwards "the same bytes" means the new
+    // ones. Windows refreshes its copies inside `land`.
+    #[cfg(not(windows))]
+    let copies = upgrade_plan::copies_to_refresh(&alias_facts(target), target);
     let staged = upgrade_plan::staging_path(target);
-    std::fs::write(&staged, bytes)?;
+    write_executable(&staged, bytes)?;
+    land(&staged, target)?;
+    #[cfg(not(windows))]
+    for copy in copies {
+        if let Err(e) = refresh_copy(&copy, bytes) {
+            eprintln!(
+                "innerwarden upgrade: {} was not refreshed ({e}); re-run the installer to update it",
+                copy.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Create `path` afresh and write `bytes` into it, executable.
+///
+/// Every staging name sits in the binary's directory, and that directory can
+/// be writable by an account other than the one upgrading: `sudo innerwarden
+/// upgrade` on a user's own install, whose agent runs as that user. A plain
+/// write follows a link planted under the staging name, so root wrote the
+/// release (or, for the probe, nothing: a truncation) over whatever the link
+/// pointed at, and the rename then put the link itself where the binary was.
+/// So whatever is at the name is removed first, which removes a link and not
+/// what it points at, and `create_new` refuses a link or a file planted in
+/// between. The mode is set on the open file, never through the path.
+fn write_executable(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(bytes)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o755))?;
     }
-    land(&staged, target)
+    Ok(())
+}
+
+/// Replace one of the installer's copies with the verified bytes, the same
+/// way the binary itself is replaced: staged beside it, then one rename.
+///
+/// The shell installer copies the binary to `iw` and `iw-guard` where it
+/// cannot make a link, and an upgrade used to replace only the binary, so
+/// both went on running the build first installed. Best effort and reported,
+/// never fatal: the binary itself is already the new one.
+#[cfg(not(windows))]
+fn refresh_copy(copy: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let staged = upgrade_plan::staging_path(copy);
+    let landed = write_executable(&staged, bytes).and_then(|()| std::fs::rename(&staged, copy));
+    if landed.is_err() {
+        let _ = std::fs::remove_file(&staged);
+    }
+    landed
+}
+
+/// Bound on a file `alias_facts` reads whole. Far above any build: a release
+/// is single digit MB, and an unoptimised Linux build with debug information
+/// is about 135 MB, beyond the download cap above.
+const MAX_BUILD_BYTES: u64 = 512 * 1024 * 1024;
+
+/// What is at each installed name beside `exe` (`iw`, `iw-guard`, and
+/// `innerwarden` when run as one of those). Names that are not there are left
+/// out; a name that cannot be inspected is `Unreadable`, never "not there".
+///
+/// Shared by `uninstall` (which shortcuts go with the binary, and whether the
+/// binary is the installer's at all) and `upgrade` (which copies follow it).
+pub(crate) fn alias_facts(exe: &Path) -> Vec<upgrade_plan::AliasFact> {
+    use upgrade_plan::{AliasEntry, AliasFact};
+    // Read once, and only when a regular file beside it needs comparing.
+    let mut exe_bytes: Option<Option<Vec<u8>>> = None;
+    upgrade_plan::siblings_named(exe, std::env::consts::EXE_SUFFIX)
+        .into_iter()
+        .filter_map(|path| {
+            let entry = match std::fs::symlink_metadata(&path) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+                Err(_) => AliasEntry::Unreadable,
+                Ok(meta) if meta.file_type().is_symlink() => AliasEntry::Link {
+                    resolves_to: std::fs::canonicalize(&path).ok(),
+                },
+                // Larger than any build could be: not one, and not worth reading.
+                Ok(meta) if meta.is_file() && meta.len() > MAX_BUILD_BYTES => AliasEntry::File {
+                    same_bytes: false,
+                    innerwarden_build: false,
+                },
+                Ok(meta) if meta.is_file() => match std::fs::read(&path) {
+                    Ok(bytes) => {
+                        let ours = exe_bytes.get_or_insert_with(|| std::fs::read(exe).ok());
+                        AliasEntry::File {
+                            same_bytes: ours.as_deref() == Some(bytes.as_slice()),
+                            innerwarden_build: upgrade_plan::is_innerwarden_build(
+                                &bytes,
+                                release_verify::RELEASE_PUBLIC_KEY_B64.as_bytes(),
+                            ),
+                        }
+                    }
+                    Err(_) => AliasEntry::Unreadable,
+                },
+                Ok(_) => AliasEntry::Unreadable,
+            };
+            Some(AliasFact { path, entry })
+        })
+        .collect()
 }
 
 /// Land the staged file on the target: one atomic rename, same directory.
@@ -467,6 +759,7 @@ fn land(staged: &Path, target: &Path) -> std::io::Result<()> {
 /// 2026-09-08: the plain rename failed and the operator was told to run
 /// `sudo`. The installer's copies beside the target must follow it, or
 /// `iw --version` stays on the old build: best effort, reported, not fatal.
+/// (Elsewhere `install_verified` refreshes them, after this lands.)
 #[cfg(windows)]
 fn land(staged: &Path, target: &Path) -> std::io::Result<()> {
     let parked = upgrade_plan::parked_path(target);
@@ -607,6 +900,135 @@ mod tests {
             "the staging file must be removed when the rename fails"
         );
     }
+
+    /// What an older release looks like to the upgrade: an executable that
+    /// carries the release key, with bytes other than the binary being
+    /// replaced.
+    #[cfg(unix)]
+    fn an_older_build() -> Vec<u8> {
+        let mut bytes = b"\x7fELF older build ".to_vec();
+        bytes.extend_from_slice(release_verify::RELEASE_PUBLIC_KEY_B64.as_bytes());
+        bytes
+    }
+
+    /// REGRESSION ANCHOR. Where the shell installer could not make a link it
+    /// copied the binary to `iw` and `iw-guard`, and `upgrade` replaced only
+    /// the binary: both copies went on running the build first installed, and
+    /// `uninstall` later kept them as "a different file". The copies follow
+    /// the binary now, including one an earlier upgrade already left behind,
+    /// and the installer's link stays a link.
+    ///
+    /// FAILS ON REVERT: drop the refresh from `install_verified` and `iw`
+    /// still reads "old binary".
+    #[cfg(unix)]
+    #[test]
+    fn the_installers_copies_follow_the_binary() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("innerwarden");
+        std::fs::write(&target, b"old binary").expect("seed");
+        std::fs::write(dir.path().join("iw"), b"old binary").expect("a copy of it");
+        std::fs::write(dir.path().join("iw-guard"), an_older_build()).expect("an older copy");
+
+        install_verified(&target, b"new binary").expect("install");
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"new binary");
+        for name in ["iw", "iw-guard"] {
+            let copy = dir.path().join(name);
+            assert_eq!(
+                std::fs::read(&copy).unwrap(),
+                b"new binary",
+                "{name} must follow the binary"
+            );
+            assert!(
+                !upgrade_plan::staging_path(&copy).exists(),
+                "{name}'s staging file must not survive"
+            );
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&copy).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o755, "{name} must stay executable");
+        }
+    }
+
+    /// A link planted under a staging name is never written through. The
+    /// binary's directory can be writable by an account other than the one
+    /// upgrading (`sudo innerwarden upgrade` on a user's install), and a plain
+    /// write followed the link: the release landed on whatever it pointed at,
+    /// and the probe truncated it.
+    ///
+    /// FAILS ON REVERT: write the staging names with `std::fs::write` and the
+    /// victim holds "new binary" (or nothing, after the probe).
+    #[cfg(unix)]
+    #[test]
+    fn a_link_planted_under_a_staging_name_is_not_written_through() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let elsewhere = tempfile::tempdir().expect("another directory");
+        let victim = elsewhere.path().join("victim");
+        std::fs::write(&victim, b"precious").expect("victim");
+        let target = dir.path().join("innerwarden");
+        std::fs::write(&target, b"old binary").expect("seed");
+        std::fs::write(dir.path().join("iw"), b"old binary").expect("a copy of it");
+        for name in ["innerwarden", "iw"] {
+            let staged = upgrade_plan::staging_path(&dir.path().join(name));
+            std::os::unix::fs::symlink(&victim, staged).expect("plant a link");
+        }
+
+        can_replace(&target).expect("the probe");
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"precious",
+            "the probe wrote through the link"
+        );
+        std::os::unix::fs::symlink(&victim, upgrade_plan::staging_path(&target))
+            .expect("plant it again");
+        install_verified(&target, b"new binary").expect("install");
+
+        assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
+        for name in ["innerwarden", "iw"] {
+            let path = dir.path().join(name);
+            assert!(
+                std::fs::symlink_metadata(&path)
+                    .unwrap()
+                    .file_type()
+                    .is_file(),
+                "{name} must be a regular file, not the planted link"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), b"new binary", "{name}");
+        }
+    }
+
+    /// A link already follows the binary and stays a link; a file under one of
+    /// the names that is not a build of this program is somebody else's and is
+    /// not overwritten.
+    ///
+    /// FAILS ON REVERT: refresh every regular file beside the binary and the
+    /// other tool's `iw-guard` is replaced by InnerWarden.
+    #[cfg(unix)]
+    #[test]
+    fn a_name_beside_the_binary_that_is_not_its_copy_is_not_overwritten() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("innerwarden");
+        std::fs::write(&target, b"old binary").expect("seed");
+        std::os::unix::fs::symlink("innerwarden", dir.path().join("iw")).expect("link");
+        let other = b"\x7fELF another program called iw-guard".to_vec();
+        std::fs::write(dir.path().join("iw-guard"), &other).expect("another tool");
+
+        install_verified(&target, b"new binary").expect("install");
+
+        let iw = dir.path().join("iw");
+        assert!(
+            std::fs::symlink_metadata(&iw)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the link must stay a link"
+        );
+        assert_eq!(std::fs::read(&iw).unwrap(), b"new binary");
+        assert_eq!(
+            std::fs::read(dir.path().join("iw-guard")).unwrap(),
+            other,
+            "another program's file must be left exactly as it was"
+        );
+    }
     /// An unknown flag refuses, and refuses BEFORE anything is fetched.
     ///
     /// The previous version of this test asserted the order of substrings in
@@ -708,8 +1130,176 @@ mod tests {
 }
 
 #[cfg(test)]
+mod gate_tests {
+    use super::{gate, Gate};
+    use crate::upgrade_plan::{Managed, PackageOwner};
+
+    fn denied() -> std::io::Result<()> {
+        Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+    }
+
+    fn deb() -> Managed {
+        Managed::System(PackageOwner::Dpkg {
+            package: "innerwarden".into(),
+        })
+    }
+
+    /// REGRESSION ANCHOR (todo P23). `innerwarden upgrade --check` on a binary
+    /// the user cannot write failed with "Permission denied" before reporting
+    /// anything: the replace probe ran first. `--check` reports, whatever the
+    /// probe would say, and never runs it, because the probe writes beside the
+    /// binary and a check changes nothing.
+    ///
+    /// FAILS ON REVERT: probe before deciding `--check`, and this returns
+    /// `CannotReplace` (or panics on the probe that must not run).
+    #[test]
+    fn check_reports_on_a_binary_it_cannot_write() {
+        for managed in [Managed::Direct, Managed::Npm, deb()] {
+            assert_eq!(
+                gate(true, false, &managed, denied),
+                Gate::Report,
+                "{managed:?}"
+            );
+            assert_eq!(
+                gate(true, true, &managed, || panic!(
+                    "--check must not write beside the binary"
+                )),
+                Gate::Report,
+                "{managed:?}"
+            );
+        }
+    }
+
+    /// A packaged copy is refused before the probe writes anything beside a
+    /// file that belongs to the package manager, and `--yes` lets it through
+    /// to the probe like npm's.
+    #[test]
+    fn a_packaged_copy_is_refused_before_the_probe_and_yes_reaches_it() {
+        assert_eq!(
+            gate(false, false, &deb(), || panic!(
+                "nothing is written beside a package's file"
+            )),
+            Gate::RefuseManaged
+        );
+        assert_eq!(gate(false, true, &deb(), || Ok(())), Gate::Proceed);
+    }
+
+    /// The upgrade path still fails in the first second when the binary cannot
+    /// be replaced, with the reason, and proceeds when it can.
+    #[test]
+    fn an_upgrade_probes_and_names_why_it_cannot_replace() {
+        match gate(false, false, &Managed::Direct, denied) {
+            Gate::CannotReplace(why) => {
+                assert!(why.to_lowercase().contains("permission denied"), "{why}")
+            }
+            other => panic!("expected CannotReplace, got {other:?}"),
+        }
+        assert_eq!(
+            gate(false, false, &Managed::Direct, || Ok(())),
+            Gate::Proceed
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod installed_binary_tests {
+    /// `iw upgrade` on macOS reported the `iw` link as the running binary and
+    /// renamed a new file over the link, leaving `innerwarden` on the old
+    /// build. The path the upgrade replaces is the file the link leads to.
+    ///
+    /// FAILS ON REVERT: return the path unresolved and this is the link.
+    #[test]
+    fn a_shortcut_resolves_to_the_binary_it_links_to() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real = dir.path().join("innerwarden");
+        std::fs::write(&real, b"binary").expect("seed");
+        let link = dir.path().join("iw");
+        std::os::unix::fs::symlink("innerwarden", &link).expect("link");
+
+        let resolved = super::resolve_installed(&link).expect("resolve");
+        assert_eq!(resolved, std::fs::canonicalize(&real).unwrap());
+        assert_ne!(
+            resolved.file_name(),
+            link.file_name(),
+            "the link is not the binary"
+        );
+    }
+}
+
+#[cfg(test)]
 mod closing_advice_tests {
-    use super::closing_advice;
+    use super::{closing_advice, refresh_report, RefreshRun};
+
+    fn ran(code: i32, stdout: &str, stderr: &str) -> RefreshRun {
+        RefreshRun {
+            code: Some(code),
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+        }
+    }
+
+    /// An upgrade left OpenClaw's message hook as the previous version wrote
+    /// it, and only said so. It now runs the NEW binary's `observe refresh`,
+    /// and prints what that did, set off from the lines above.
+    ///
+    /// FAILS ON REVERT: print the fixed advice again and the refresh's own
+    /// words never reach the operator.
+    #[test]
+    fn the_new_binarys_refresh_is_what_the_upgrade_prints() {
+        let updated = ran(
+            0,
+            "Updated OpenClaw's message hook to this version's.\nRestart the OpenClaw gateway to load it: nothing here restarts it.\n",
+            "",
+        );
+        assert_eq!(
+            refresh_report(Some(&updated)),
+            vec![
+                String::new(),
+                "Updated OpenClaw's message hook to this version's.".to_string(),
+                "Restart the OpenClaw gateway to load it: nothing here restarts it.".to_string(),
+            ]
+        );
+        // Current, or nothing installed: the refresh says nothing, and so
+        // does the upgrade.
+        assert!(refresh_report(Some(&ran(0, "", ""))).is_empty());
+        // A refresh that failed says why on its own lines, stderr included.
+        let failed = refresh_report(Some(&ran(
+            1,
+            "OpenClaw's message hook could not be updated (x).\n",
+            "",
+        )));
+        assert_eq!(
+            failed[1],
+            "OpenClaw's message hook could not be updated (x)."
+        );
+    }
+
+    /// A new binary that could not be run, or does not know the command
+    /// (exit 2), refreshed nothing: the hook is still the previous version's,
+    /// and the upgrade gives the step by hand rather than saying nothing.
+    ///
+    /// FAILS ON REVERT: print the refresh's (empty) output whatever its exit
+    /// code and an unknown command ends the upgrade in silence.
+    #[test]
+    fn a_refresh_that_could_not_run_gives_the_step_by_hand() {
+        for run in [
+            None,
+            Some(ran(2, "", "unknown subcommand `refresh`")),
+            Some(RefreshRun {
+                code: None,
+                stdout: String::new(),
+                stderr: String::new(),
+            }),
+        ] {
+            let advice = refresh_report(run.as_ref()).join("\n");
+            assert!(
+                advice.contains("still the one the previous version installed"),
+                "{advice}"
+            );
+            assert!(advice.contains("innerwarden observe install"), "{advice}");
+            assert!(advice.contains("restart the OpenClaw gateway"), "{advice}");
+        }
+    }
 
     /// Nothing listening: the upgrade ends exactly as it always did. A notice
     /// about a dashboard that is not running would be noise, and noise in a

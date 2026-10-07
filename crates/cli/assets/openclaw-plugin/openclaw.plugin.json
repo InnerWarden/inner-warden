@@ -1,0 +1,7 @@
+{
+  "id": "innerwarden-replies",
+  "name": "InnerWarden replies",
+  "description": "Tells innerwarden observe how a Control UI turn ended, so a dangerous ask made there is recorded with its outcome. Observes only; never changes a turn.",
+  "activation": { "onStartup": true },
+  "configSchema": { "type": "object", "additionalProperties": false, "properties": {} }
+}

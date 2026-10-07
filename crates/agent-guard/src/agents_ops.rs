@@ -768,7 +768,7 @@ fn rows_from_sources(
     // say "monitor" or "enforce" instead of only "guarded".
     for r in &mut rows {
         if r.guarded {
-            r.mode = read_guard_mode(home, &r.name);
+            r.mode = read_guard_mode(home, r);
         }
     }
     rows.sort_by(|a, b| a.name.cmp(&b.name));
@@ -971,7 +971,13 @@ fn connect_one_result_with_link_policy(
                 ),
             );
         }
-        let (wrapped, n) = mcp_wire::wrap(cfg, guard_bin, monitor);
+        // Every wrapper names this agent, so the decisions its proxy records
+        // say which agent asked (`--label`/`--agent`, see `mcp_wire::naming`).
+        // A wrapper an earlier release wrote gains the name here, on a connect
+        // a person ran. Automatic setup never reaches this for existing wiring
+        // (it stops at "existing MCP wiring left unchanged" above), exactly as
+        // it never adds a name to an existing hook.
+        let (wrapped, n) = mcp_wire::wrap(cfg, guard_bin, monitor, &r.name);
         let fully_guarded = mcp_wire::is_guarded(&wrapped);
         if !fully_guarded {
             return ConnectResult::new(
@@ -1054,7 +1060,7 @@ fn connect_one_result_with_link_policy(
                 ),
             );
         }
-        let n = mcp_wire_toml::wrap_toml(&mut doc, guard_bin, monitor);
+        let n = mcp_wire_toml::wrap_toml(&mut doc, guard_bin, monitor, &r.name);
         let fully_guarded = mcp_wire_toml::is_guarded_toml(&doc);
         if !fully_guarded {
             return ConnectResult::new(
@@ -1443,9 +1449,20 @@ pub fn run(home: &Path, args: &[String]) -> Vec<String> {
 ///
 /// `None` means wired but unreadable, which is reported as unknown rather than
 /// guessed at in either direction.
-fn read_guard_mode(home: &Path, agent: &str) -> Option<GuardMode> {
-    let k = canonical(agent)?;
-    if k.hookable {
+///
+/// The row's OWN wiring is read: the hook for a hook agent, and otherwise the
+/// MCP configuration the row was discovered from. Looking the row's name up in
+/// the reviewed table instead gave every generic MCP client no mode at all, and
+/// one whose directory is named like a reviewed agent's alias (`~/.claude/`,
+/// `~/.codex-cli/`) the mode of that other agent's wiring.
+///
+/// An MCP mode is the one each wrapper's proxy runs in, read from its own
+/// argument list ([`mcp_wire::guarded_mode`]). It used to be a search of the
+/// file's text for the words `"advisory"`, `"warn"`, `"guard"` and `"kill"`
+/// anywhere, so `--mode=advisory` (no quote before the word) beside any other
+/// `"guard"` in the file read as enforce while every call was let through.
+fn read_guard_mode(home: &Path, row: &AgentStatus) -> Option<GuardMode> {
+    if row.hookable {
         return read_json(&home.join(".claude/settings.json"))
             .and_then(|v| hook::effective_iwguard_hook_mode(&v))
             .map(|m| match m {
@@ -1454,23 +1471,25 @@ fn read_guard_mode(home: &Path, agent: &str) -> Option<GuardMode> {
                 hook::EffectiveHookMode::Mixed => GuardMode::Mixed,
             });
     }
-    // MCP wiring carries the mode as the proxy's `--mode` argument.
-    let rel = k.mcp_json.or(k.mcp_toml)?;
-    let text = std::fs::read_to_string(home.join(rel)).ok()?;
-    // `advisory` and `warn` pass everything through; `guard` and `kill` block.
-    let recording = text.contains("\"advisory\"") || text.contains("\"warn\"");
-    let blocking = text.contains("\"guard\"") || text.contains("\"kill\"");
-    match (recording, blocking) {
-        (true, false) => Some(GuardMode::Monitor),
-        (false, true) => Some(GuardMode::Enforce),
-        (true, true) => Some(GuardMode::Mixed),
-        // Wrapped by the proxy with no explicit `--mode`, so the proxy's own
-        // default applies. That default is `guard`, i.e. it BLOCKS. Reporting
-        // this as unknown would be the dangerous direction to be vague in: the
-        // whole point of showing the mode is so nobody believes they are only
-        // recording while the guard is refusing things.
-        (false, false) => Some(GuardMode::Enforce),
+    if let Some(rel) = &row.mcp_json {
+        return read_json(&home.join(rel))
+            .and_then(|config| mcp_wire::guarded_mode(&config))
+            .map(|m| match m {
+                mcp_wire::WiringMode::Monitor => GuardMode::Monitor,
+                mcp_wire::WiringMode::Enforce => GuardMode::Enforce,
+                mcp_wire::WiringMode::Mixed => GuardMode::Mixed,
+            });
     }
+    if let Some(rel) = &row.mcp_toml {
+        return read_toml(&home.join(rel))
+            .and_then(|config| mcp_wire_toml::guarded_mode_toml(&config))
+            .map(|m| match m {
+                mcp_wire_toml::WiringMode::Monitor => GuardMode::Monitor,
+                mcp_wire_toml::WiringMode::Enforce => GuardMode::Enforce,
+                mcp_wire_toml::WiringMode::Mixed => GuardMode::Mixed,
+            });
+    }
+    None
 }
 
 #[cfg(test)]
@@ -1984,6 +2003,143 @@ mod tests {
         assert!(!is_guarded(home.path(), "codex", None));
     }
 
+    /// The mode `agents` and `status` print for an MCP agent was a search of
+    /// the configuration's text for `"advisory"`, `"warn"`, `"guard"` and
+    /// `"kill"` anywhere. The words a configuration holds for other reasons
+    /// (a log level, a server's own argument) decided it, and the inline
+    /// `--mode=advisory` matched nothing.
+    ///
+    /// The attacker form is the first: whoever can edit the agent's own
+    /// configuration (the agent itself, under its user's account) turns every
+    /// wrapper to `--mode=advisory`, so the proxies only record, and the listing
+    /// kept saying enforce because another `"guard"` was in the file.
+    ///
+    /// FAILS ON REVERT: restore the text search in `read_guard_mode`; the
+    /// recording Cursor wiring reads `Some(Enforce)`.
+    #[test]
+    fn the_listed_mcp_mode_is_what_each_wrapper_runs_not_a_word_in_the_file() {
+        let home = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path().join(".cursor")).unwrap();
+        std::fs::create_dir_all(home.path().join(".codex")).unwrap();
+        let cases = [
+            (
+                // Records only; `"guard"` is a profile the server is given.
+                r#"{"mcpServers":{"fs":{"command":"/abs/innerwarden","args":["proxy","--label","cursor","--agent","cursor","--mode=advisory","--","npx","fs-server","--profile","guard"]}}}"#,
+                "[mcp_servers.icm]\ncommand = \"/abs/innerwarden\"\nargs = [\"proxy\", \"--mode=advisory\", \"--\", \"icm\"]\nenv = { ICM_POLICY = \"kill\" }\n",
+                GuardMode::Monitor,
+            ),
+            (
+                // Blocks; `"warn"` is the server's log level.
+                r#"{"mcpServers":{"fs":{"command":"/abs/innerwarden","args":["proxy","--mode","guard","--","npx","fs-server"],"env":{"LOG_LEVEL":"warn"}}}}"#,
+                "log_level = \"warn\"\n\n[mcp_servers.icm]\ncommand = \"/abs/innerwarden\"\nargs = [\"proxy\", \"--mode\", \"guard\", \"--\", \"icm\"]\n",
+                GuardMode::Enforce,
+            ),
+        ];
+        for (cursor, codex, mode) in cases {
+            std::fs::write(home.path().join(".cursor/mcp.json"), cursor).unwrap();
+            std::fs::write(home.path().join(".codex/config.toml"), codex).unwrap();
+
+            let (rows, _) = rows_from_sources(home.path(), &[], None);
+
+            for name in ["cursor", "codex"] {
+                let row = rows.iter().find(|row| row.name == name).unwrap();
+                assert!(row.guarded, "{name}: {cursor} / {codex}");
+                assert_eq!(row.mode, Some(mode), "{name}: {cursor} / {codex}");
+            }
+        }
+    }
+
+    /// A wrapper is the guard only when its command is the guard's binary,
+    /// and only when its proxy starts.
+    ///
+    /// The attacker forms: the agent's own account writes a script named
+    /// `innerwarden-shim` that runs whatever follows `--`, and points each
+    /// server at it with `proxy --mode guard -- <server>`; every call then
+    /// reaches the server unscreened while the listing said enforce, because
+    /// any command whose name began with `innerwarden` counted. Or it adds an
+    /// option the proxy does not take (`--verbose`): the proxy exits on it,
+    /// the server never starts through it, and the listing said enforce
+    /// because unknown words were stepped over. Both are now listed as not
+    /// guarded. The installer's `iw-guard` shortcut, which was not recognised
+    /// at all, is the guard.
+    ///
+    /// FAILS ON REVERT: accept any `innerwarden*` command again, or step over
+    /// a word the proxy refuses, and the first two read guarded, `Enforce`.
+    #[test]
+    fn a_shim_or_a_proxy_that_cannot_start_is_not_listed_as_guarded() {
+        let home = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path().join(".cursor")).unwrap();
+        std::fs::create_dir_all(home.path().join(".codex")).unwrap();
+        let cases = [
+            (
+                r#"{"mcpServers":{"fs":{"command":"/home/u/.local/bin/innerwarden-shim","args":["proxy","--mode","guard","--","npx","fs-server"]}}}"#,
+                "[mcp_servers.icm]\ncommand = \"/home/u/.local/bin/innerwarden-shim\"\nargs = [\"proxy\", \"--mode\", \"guard\", \"--\", \"icm\"]\n",
+                false,
+                None,
+            ),
+            (
+                r#"{"mcpServers":{"fs":{"command":"/abs/innerwarden","args":["proxy","--mode","guard","--verbose","--","npx","fs-server"]}}}"#,
+                "[mcp_servers.icm]\ncommand = \"/abs/innerwarden\"\nargs = [\"proxy\", \"--mode\", \"guard\", \"--verbose\", \"--\", \"icm\"]\n",
+                false,
+                None,
+            ),
+            (
+                r#"{"mcpServers":{"fs":{"command":"/abs/iw-guard","args":["proxy","--mode","guard","--error-response","--","npx","fs-server"]}}}"#,
+                "[mcp_servers.icm]\ncommand = \"C:\\\\Tools\\\\IW-GUARD.EXE\"\nargs = [\"proxy\", \"--mode\", \"guard\", \"--\", \"icm\"]\n",
+                true,
+                Some(GuardMode::Enforce),
+            ),
+        ];
+        for (cursor, codex, guarded, mode) in cases {
+            std::fs::write(home.path().join(".cursor/mcp.json"), cursor).unwrap();
+            std::fs::write(home.path().join(".codex/config.toml"), codex).unwrap();
+
+            let (rows, _) = rows_from_sources(home.path(), &[], None);
+
+            for name in ["cursor", "codex"] {
+                let row = rows.iter().find(|row| row.name == name).unwrap();
+                assert_eq!(row.guarded, guarded, "{name}: {cursor} / {codex}");
+                assert_eq!(row.mode, mode, "{name}: {cursor} / {codex}");
+            }
+        }
+    }
+
+    /// A generic MCP client's mode is read from ITS configuration. The row's
+    /// name was looked up in the reviewed table instead, so a guarded generic
+    /// client had no mode ("mode unreadable", and `status` printed the mode as
+    /// unknown for the whole host), and one in `~/.claude/`, which is named
+    /// `claude`, an alias of Claude Code, was given the Claude Code hook's mode.
+    ///
+    /// FAILS ON REVERT: look the row up by name again; `claude` reads
+    /// `Some(Enforce)` (the hook's) and `windsurf` reads `None`.
+    #[test]
+    fn a_generic_mcp_client_reports_the_mode_of_its_own_configuration() {
+        let home = tempfile::TempDir::new().unwrap();
+        let recording = r#"{"mcpServers":{"fs":{"command":"/abs/innerwarden","args":["proxy","--mode","advisory","--","npx","fs-server"]}}}"#;
+        for dir in [".claude", ".windsurf"] {
+            std::fs::create_dir_all(home.path().join(dir)).unwrap();
+            std::fs::write(home.path().join(dir).join("mcp.json"), recording).unwrap();
+        }
+        // Claude Code's own hook enforces.
+        std::fs::write(
+            home.path().join(".claude/settings.json"),
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"/abs/innerwarden hook"}]}]}}"#,
+        )
+        .unwrap();
+
+        let (rows, _) = rows_from_sources(home.path(), &[], None);
+
+        for name in ["claude", "windsurf"] {
+            let row = rows.iter().find(|row| row.name == name).unwrap();
+            assert_eq!(
+                row.mcp_json.as_deref(),
+                Some(format!(".{name}/mcp.json").as_str())
+            );
+            assert!(row.guarded, "{name}");
+            assert_eq!(row.mode, Some(GuardMode::Monitor), "{name}");
+        }
+    }
+
     #[test]
     fn unknown_connect_flag_fails_without_wiring_every_agent() {
         let home = tempfile::TempDir::new().unwrap();
@@ -2060,6 +2216,254 @@ mod tests {
             std::fs::read_to_string(home.path().join(".cursor/mcp.json")).unwrap(),
             existing
         );
+    }
+
+    fn known_row(home: &Path, name: &str) -> AgentStatus {
+        let (rows, _) = rows_from_sources(home, &[], None);
+        rows.into_iter().find(|row| row.name == name).unwrap()
+    }
+
+    fn openclaw_server_args(config: &Value, name: &str) -> Vec<String> {
+        config["mcp"]["servers"][name]["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|arg| arg.as_str().unwrap().to_string())
+            .collect()
+    }
+
+    fn read_openclaw(home: &Path) -> Value {
+        serde_json::from_slice(&std::fs::read(home.join(".openclaw/openclaw.json")).unwrap())
+            .unwrap()
+    }
+
+    /// REGRESSION ANCHOR. `agents connect openclaw` wrote `proxy --mode M --
+    /// <server>` and nothing else, so the proxy recorded every OpenClaw tool
+    /// call in the session `mcp:innerwarden` naming no agent, and its cases
+    /// said "An agent asked, through an MCP connection".
+    ///
+    /// FAILS ON REVERT: pass no agent to `mcp_wire::wrap` from
+    /// `connect_one_result_with_link_policy`, and every proxy reads
+    /// `proxy --mode advisory -- ...`.
+    #[test]
+    fn connect_openclaw_writes_its_id_on_every_proxy() {
+        let home = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path().join(".openclaw")).unwrap();
+        std::fs::write(
+            home.path().join(".openclaw/openclaw.json"),
+            r#"{"gateway":{"port":18789},"mcp":{"servers":{
+                "fs":{"command":"npx","args":["-y","fs-server"]},
+                "git":{"command":"uvx","args":["mcp-server-git"]},
+                "remote":{"url":"https://example.com/sse"}}}}"#,
+        )
+        .unwrap();
+        let row = known_row(home.path(), "openclaw");
+
+        let result = connect_one_result(home.path(), &row, "/abs/innerwarden", false, true);
+        assert_eq!(result.effect, ConnectEffect::Connected, "{}", result.line);
+
+        let config = read_openclaw(home.path());
+        for (name, child) in [
+            ("fs", vec!["npx", "-y", "fs-server"]),
+            ("git", vec!["uvx", "mcp-server-git"]),
+        ] {
+            let mut expected = vec![
+                "proxy", "--label", "openclaw", "--agent", "openclaw", "--mode", "advisory", "--",
+            ];
+            expected.extend(child);
+            assert_eq!(openclaw_server_args(&config, name), expected, "{name}");
+            assert_eq!(
+                config["mcp"]["servers"][name]["command"],
+                "/abs/innerwarden"
+            );
+        }
+        assert_eq!(
+            config["mcp"]["servers"]["remote"],
+            serde_json::json!({"url": "https://example.com/sse"})
+        );
+        assert_eq!(config["gateway"], serde_json::json!({"port": 18789}));
+    }
+
+    /// The Codex twin: its TOML wrappers name it too, in enforce here.
+    ///
+    /// FAILS ON REVERT: pass no agent to `mcp_wire_toml::wrap_toml`.
+    #[test]
+    fn connect_codex_writes_its_id_on_every_proxy() {
+        let home = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path().join(".codex")).unwrap();
+        std::fs::write(
+            home.path().join(".codex/config.toml"),
+            "model = \"gpt-5\"\n\n[mcp_servers.icm]\ncommand = \"icm\"\nargs = [\"serve\"]\n\n[mcp_servers.repl]\ncommand = \"node\"\n",
+        )
+        .unwrap();
+        let row = known_row(home.path(), "codex");
+
+        let result = connect_one_result(home.path(), &row, "/abs/innerwarden", false, false);
+        assert_eq!(result.effect, ConnectEffect::Connected, "{}", result.line);
+
+        let doc: toml_edit::DocumentMut =
+            std::fs::read_to_string(home.path().join(".codex/config.toml"))
+                .unwrap()
+                .parse()
+                .unwrap();
+        for (name, child) in [("icm", vec!["icm", "serve"]), ("repl", vec!["node"])] {
+            let args: Vec<&str> = doc["mcp_servers"][name]["args"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|arg| arg.as_str().unwrap())
+                .collect();
+            let mut expected = vec![
+                "proxy", "--label", "codex", "--agent", "codex", "--mode", "guard", "--",
+            ];
+            expected.extend(child);
+            assert_eq!(args, expected, "{name}");
+        }
+        assert_eq!(doc["model"].as_str(), Some("gpt-5"));
+    }
+
+    /// The Codex twin of the reconnect below, read back from the file the way
+    /// every later connect and the dashboard read it.
+    ///
+    /// A TOML array read from a file keeps the spacing it was written with, and
+    /// the wrapper compared that text against a freshly built array that has
+    /// none, so an identical wrapper always looked changed: every connect
+    /// rewrote `config.toml` and reported "connected", and the dashboard could
+    /// never tell that a reconnect would change only the name. Wrappers are now
+    /// compared word for word, formatting aside.
+    ///
+    /// FAILS ON REVERT: compare the arrays' text again, and the second connect
+    /// reports `Connected` and the step is never offered.
+    #[test]
+    fn reconnect_names_a_codex_wrapper_and_then_leaves_the_file_alone() {
+        const BIN: &str = "/abs/innerwarden";
+        let home = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path().join(".codex")).unwrap();
+        let path = home.path().join(".codex/config.toml");
+        let old = "# mine\nmodel = \"gpt-5\"\n\n[mcp_servers.icm]\ncommand = \"/abs/innerwarden\"\nargs = [\"proxy\", \"--mode\", \"guard\", \"--\", \"icm\", \"serve\"]\n";
+        std::fs::write(&path, old).unwrap();
+        let read = || -> toml_edit::DocumentMut {
+            std::fs::read_to_string(&path).unwrap().parse().unwrap()
+        };
+        let row = known_row(home.path(), "codex");
+
+        let automatic = connect_one_result_automatic(home.path(), &row, BIN, false, false);
+        assert_eq!(
+            automatic.effect,
+            ConnectEffect::Skipped,
+            "{}",
+            automatic.line
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), old);
+        assert_eq!(
+            mcp_wire_toml::unnamed_reconnect_flag_toml(&read(), BIN, "codex"),
+            Some("")
+        );
+
+        let manual = connect_one_result(home.path(), &row, BIN, false, false);
+        assert_eq!(manual.effect, ConnectEffect::Connected, "{}", manual.line);
+        let named = std::fs::read_to_string(&path).unwrap();
+        assert!(named.starts_with("# mine\nmodel = \"gpt-5\"\n"), "{named}");
+        let doc = read();
+        let args: Vec<&str> = doc["mcp_servers"]["icm"]["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|arg| arg.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "proxy", "--label", "codex", "--agent", "codex", "--mode", "guard", "--", "icm",
+                "serve"
+            ]
+        );
+        assert_eq!(
+            mcp_wire_toml::unnamed_reconnect_flag_toml(&doc, BIN, "codex"),
+            None
+        );
+
+        let again = connect_one_result(home.path(), &row, BIN, false, false);
+        assert_eq!(again.effect, ConnectEffect::Unchanged, "{}", again.line);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), named);
+    }
+
+    /// A host upgraded from a release whose wrappers named no agent.
+    ///
+    /// Automatic setup leaves that wiring exactly as it is: background setup
+    /// never rewrites existing wiring, as it never adds a name to an existing
+    /// hook. The dashboard offers the reconnect in the wiring's own mode, and
+    /// that connect, run by a person, adds the name and changes nothing else:
+    /// same program, same mode, the options it had, the server's own command
+    /// line, every key outside the wrapper. A second connect has nothing to do.
+    ///
+    /// FAILS ON REVERT: pass no agent to `mcp_wire::wrap`, and the connect
+    /// reports "already guarded" with the wrapper still unnamed.
+    #[test]
+    fn reconnect_adds_the_agent_to_a_label_less_wrapper_and_changes_nothing_else() {
+        const BIN: &str = "/abs/innerwarden";
+        let home = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path().join(".openclaw")).unwrap();
+        let old = r#"{"gateway":{"port":18789},"mcp":{"servers":{"fs":{"command":"/abs/innerwarden","args":["proxy","--error-response","--mode","advisory","--","npx","-y","fs-server","--root","/srv/a b"]}}}}"#;
+        std::fs::write(home.path().join(".openclaw/openclaw.json"), old).unwrap();
+        let before = read_openclaw(home.path());
+        let row = known_row(home.path(), "openclaw");
+
+        let automatic = connect_one_result_automatic(home.path(), &row, BIN, false, true);
+        assert_eq!(
+            automatic.effect,
+            ConnectEffect::Skipped,
+            "{}",
+            automatic.line
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.path().join(".openclaw/openclaw.json")).unwrap(),
+            old
+        );
+        assert_eq!(
+            mcp_wire::unnamed_reconnect_flag(&before, BIN, "openclaw"),
+            Some(" --monitor")
+        );
+
+        let manual = connect_one_result(home.path(), &row, BIN, false, true);
+        assert_eq!(manual.effect, ConnectEffect::Connected, "{}", manual.line);
+        let after = read_openclaw(home.path());
+        assert_eq!(
+            openclaw_server_args(&after, "fs"),
+            [
+                "proxy",
+                "--error-response",
+                "--label",
+                "openclaw",
+                "--agent",
+                "openclaw",
+                "--mode",
+                "advisory",
+                "--",
+                "npx",
+                "-y",
+                "fs-server",
+                "--root",
+                "/srv/a b"
+            ]
+        );
+        assert_eq!(after["mcp"]["servers"]["fs"]["command"], BIN);
+        assert_eq!(after["gateway"], before["gateway"]);
+        assert_eq!(
+            mcp_wire::guarded_mode(&after),
+            Some(mcp_wire::WiringMode::Monitor)
+        );
+        assert_eq!(
+            mcp_wire::unwrap(after.clone()).0,
+            mcp_wire::unwrap(before).0
+        );
+        assert_eq!(
+            mcp_wire::unnamed_reconnect_flag(&after, BIN, "openclaw"),
+            None
+        );
+
+        let again = connect_one_result(home.path(), &row, BIN, false, true);
+        assert_eq!(again.effect, ConnectEffect::Unchanged, "{}", again.line);
     }
 
     /// Wire Claude Code's hook at `bin` exactly as `install` writes it.

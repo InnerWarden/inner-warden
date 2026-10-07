@@ -17,11 +17,14 @@ cargo clippy --workspace -- -D warnings   # lint, warnings are errors
 
 Run all four locally and confirm they pass before you open a pull request.
 
-CI runs those four on Linux, macOS, and Windows, plus four gates the list above
+CI runs those four on Linux, macOS, and Windows, plus five gates the list above
 does not cover, so "all four pass" is not the same as "CI will be green":
 
 - `cargo deny check` (advisories, licences, bans, sources). Run it for any
   dependency change.
+- `npm audit --audit-level=moderate` in `crates/dashboard-kit/web`, the same
+  advisory check for the dashboard's npm tree, dev dependencies included. Run
+  it for any change to that `package.json` or `package-lock.json`.
 - The dashboard bundle: for any change under `crates/dashboard-kit/web`, run
   `npm ci && npm run build` there and commit the rebuilt `dist/`, or
   `npm run bundle:check` fails because the committed bundle no longer matches

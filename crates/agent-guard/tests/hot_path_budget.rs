@@ -100,21 +100,25 @@ fn screening_stays_within_its_budget() {
 /// REGRESSION ANCHOR for the fix that came out of PERF-05.
 ///
 /// `innerwarden hook` is a one-shot process: it loads the rule corpus, screens
-/// one command, and exits. Loading the FULL corpus compiles 62 regexes, which
-/// measured at ~130ms release and ~1.2s debug, and the hook paid it on every
-/// agent tool call while the screening itself cost ~40 microseconds.
+/// one command, and exits. Loading the FULL corpus used to compile 62 rules'
+/// regexes, which measured at ~130ms release and ~1.2s debug, and the hook
+/// paid it on every agent tool call while the screening itself cost ~40
+/// microseconds.
 ///
 /// None of those regexes could fire: no rule in the corpus declares the shell
 /// surface, so all 62 were compiled in order to be filtered out. Loading only
 /// what can match took one end-to-end hook invocation from **208ms to 73ms**.
+/// The embedded corpus has since moved to compiling each rule on first use
+/// (`rules::RuleConditions`), so a load is the YAML parse alone.
 ///
-/// FAILS ON REVERT: filter after compiling instead of before (which was the
-/// first attempt, and moved the hook from 208ms to 200ms), or point the hook
-/// back at the unfiltered loader.
+/// FAILS ON REVERT: a load that compiles what its surface cannot match, that
+/// is, the corpus compiled at load with the surface filter applied after the
+/// compile instead of before (the first attempt, which moved the hook from
+/// 208ms to 200ms).
 #[test]
 fn the_shell_surface_loads_only_what_can_match_it() {
-    // Generous against the measured near-zero cost, tight enough that loading
-    // the full corpus here (seconds in debug) cannot pass.
+    // Generous against the measured near-zero cost, tight enough that
+    // compiling the full corpus here (seconds in debug) cannot pass.
     const SHELL_LOAD_BUDGET_MICROS: u128 = 300_000;
 
     let start = Instant::now();
@@ -153,4 +157,105 @@ fn scoping_the_load_does_not_drop_a_rule_that_could_fire() {
         tool.rule_count() <= full.rule_count(),
         "a scoped load can never contain more than the whole corpus"
     );
+}
+
+/// A listing of `n`: about 64 KiB of names under one project directory, as
+/// the filesystem server returns a deep `directory_tree` or a large search.
+fn listing_under_one_root(n: usize) -> String {
+    let mut out = String::new();
+    let mut i = 0;
+    while out.len() < 64 * 1024 - 40 {
+        out.push_str(&format!("/home/dev/proj/m{n:02}/{i:05}\n"));
+        i += 1;
+    }
+    out
+}
+
+/// The MCP proxy relays every message from one task, so time spent in its
+/// taint store holds back every other call and result of the session.
+///
+/// Every name a filesystem server lists under one project shares its first
+/// 12 bytes, and the store found a token by walking every kept token with the
+/// same start: recording a listing cost (new names) x (kept names), 25 to 110
+/// ms per 64 KiB listing in a release build once the store filled, and an
+/// argument full of paths under the root walked the same chain at each one.
+/// A token is now found by its keyed hash, and a search stops only where a
+/// kept token starts, hashing over the lengths kept there.
+///
+/// Measured in debug on an arm64 laptop: the 60 listings take 0.64 s (8.6 s
+/// with the start-chain store) and the 240 KB argument 45 ms (0.4 s). The
+/// ceilings are about 5x and 20x the new figures.
+///
+/// FAILS ON REVERT: with the start-chain store the listings take about 9 s.
+#[cfg_attr(
+    tarpaulin,
+    ignore = "a perf ceiling under instrumentation measures the instrumentation"
+)]
+#[test]
+fn a_listing_heavy_mcp_session_stays_within_its_budget() {
+    use innerwarden_agent_guard::mcp_proxy::taint::{Provenance, TaintTracker};
+
+    let mut taint = TaintTracker::new();
+    let start = Instant::now();
+    for n in 0..60 {
+        taint.record_result(&listing_under_one_root(n), Provenance::Listing);
+    }
+    let recorded = start.elapsed();
+    assert!(
+        recorded.as_millis() <= 3_000,
+        "recording 60 listings under one directory took {recorded:?}"
+    );
+
+    let mut content = String::new();
+    while content.len() < 240_000 {
+        content.push_str("see /home/dev/proj/zz/other.rs for the rest\n");
+    }
+    let start = Instant::now();
+    let alert = taint.arg_taint_alert(
+        "write_file",
+        &serde_json::json!({"path": "/home/dev/project/NOTES.md", "content": content}),
+    );
+    let searched = start.elapsed();
+    assert!(alert.is_none(), "nothing listed is in it: {alert:?}");
+    assert!(
+        searched.as_millis() <= 1_000,
+        "searching a 240 KB argument full of paths under the root took {searched:?}"
+    );
+}
+
+/// The adversarial form: results whose tokens all share one 12-byte start,
+/// then an argument that repeats that start. The start-chain store compared
+/// every such token at every position (2 s for one call, release). Now each
+/// position costs one hash over the lengths kept for the start.
+///
+/// Measured in debug: about 0.1 s, and about 3.3 s with the start-chain
+/// store.
+///
+/// FAILS ON REVERT: with the start-chain store this call takes over 3 s.
+#[cfg_attr(
+    tarpaulin,
+    ignore = "a perf ceiling under instrumentation measures the instrumentation"
+)]
+#[test]
+fn tokens_sharing_a_start_do_not_slow_the_search_of_an_argument() {
+    use innerwarden_agent_guard::mcp_proxy::taint::{Provenance, TaintTracker};
+
+    let mut taint = TaintTracker::new();
+    for r in 0..3 {
+        let mut text = String::new();
+        let mut i = 0;
+        while text.len() < 64 * 1024 - 32 {
+            text.push_str(&format!("KEYKEYKEY123{i:06}{r} "));
+            i += 1;
+        }
+        taint.record_result(&text, Provenance::Content);
+    }
+    let start = Instant::now();
+    let alert = taint.arg_taint_alert(
+        "fetch",
+        &serde_json::json!({"q": "KEYKEYKEY123".repeat(40_000)}),
+    );
+    let searched = start.elapsed();
+    assert!(alert.is_none(), "no kept token is in it: {alert:?}");
+    assert!(searched.as_millis() <= 1_000, "searching took {searched:?}");
 }

@@ -1,5 +1,5 @@
 import type { Step } from "../components/viz";
-import { DECIDER_WORDS, type DecisionOutcomeKey } from "./words";
+import { DECIDER_WORDS, type DecisionOutcomeKey, type MessageOutcomeKey } from "./words";
 
 /**
  * How far InnerWarden got with one case, in the four stages every case on
@@ -61,15 +61,39 @@ export function caseLadder(input: LadderInput, seenCaption?: string): Step[] {
 }
 
 /**
- * The ladder of a message someone sent the agent: seen and decided (by the
- * agent itself, or by InnerWarden), never enforced, because observing a
- * conversation records it and does not block it.
+ * Who decided a message, in the ladder's words. An outcome the record could
+ * not see says so, never "not recorded": a chat that does not report the
+ * agent's reply is a limit of the channel, not a fault in the record.
  */
-export function messageLadder(declinedByAgent: boolean, seenCaption?: string): Step[] {
+function messageDecided(outcomeKey: MessageOutcomeKey): Stage {
+  switch (outcomeKey) {
+    case "declined_by_agent":
+      return { mark: "done", words: "your agent declined" };
+    case "stopped_by_innerwarden":
+      return { mark: "done", words: "the guard refused what your agent tried" };
+    case "answered":
+      return { mark: "done", words: "your agent answered" };
+    case "not_seen":
+    case "unplaced":
+      return { mark: "unknown", words: "who decided could not be seen" };
+  }
+}
+
+/**
+ * The ladder of a message someone sent the agent: seen and decided (by the
+ * agent itself, or by InnerWarden), and enforced only when the guard refused
+ * what the agent then tried: observing a conversation records it and does
+ * not block it.
+ */
+export function messageLadder(outcomeKey: MessageOutcomeKey, seenCaption?: string): Step[] {
+  const decided = messageDecided(outcomeKey);
+  const enforced: Stage = outcomeKey === "stopped_by_innerwarden"
+    ? { mark: "done", words: "the guard refused it" }
+    : { mark: "not_applicable", words: "observe records and does not block" };
   return [
     { key: "seen", label: "Seen", mark: "done", words: "on record", ...(seenCaption === undefined ? {} : { caption: seenCaption, captionWords: seenCaption }) },
-    { key: "decided", label: "Decided", mark: declinedByAgent ? "done" : "unknown", words: declinedByAgent ? "your agent declined" : "who decided was not recorded" },
-    { key: "enforced", label: "Enforced", mark: "not_applicable", words: "observe records and does not block" },
+    { key: "decided", label: "Decided", mark: decided.mark, words: decided.words },
+    { key: "enforced", label: "Enforced", mark: enforced.mark, words: enforced.words },
     { key: "verified", label: "Verified", mark: "not_applicable", words: "nothing to check" },
   ];
 }

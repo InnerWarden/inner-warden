@@ -29,6 +29,7 @@ use std::sync::{Arc, Mutex};
 
 use innerwarden_agent_guard::mcp_proxy::enforce::ProxyMode;
 use innerwarden_agent_guard::mcp_proxy::transport::{run_proxy_with_io, ProxyConfig};
+use innerwarden_agent_guard::rules::RuleEngine;
 
 /// A `tools/call` carrying a shell command, in the shape the proxy inspects.
 fn tool_call(id: u32, command: &str) -> String {
@@ -38,10 +39,30 @@ fn tool_call(id: u32, command: &str) -> String {
     )
 }
 
+/// A `tools/call` of a filesystem tool, in the shape an MCP client sends it.
+fn fs_call(id: u32, tool: &str, arguments: serde_json::Value) -> String {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "tools/call",
+        "params": {"name": tool, "arguments": arguments},
+    })
+    .to_string()
+}
+
 /// Drive the proxy over an in-memory client pipe with `cat` as the server.
 ///
 /// Returns everything the client saw.
 fn run_through_proxy(requests: &[String], mode: ProxyMode) -> String {
+    run_through_proxy_with(requests, mode, None)
+}
+
+/// [`run_through_proxy`] with a rule engine, as `innerwarden proxy` runs it.
+fn run_through_proxy_with(
+    requests: &[String],
+    mode: ProxyMode,
+    engine: Option<Arc<RuleEngine>>,
+) -> String {
     let input = format!("{}\n", requests.join("\n"));
     let out = Arc::new(Mutex::new(Vec::<u8>::new()));
 
@@ -69,7 +90,7 @@ fn run_through_proxy(requests: &[String], mode: ProxyMode) -> String {
         };
         let _ = tokio::time::timeout(
             std::time::Duration::from_secs(20),
-            run_proxy_with_io(client_in, writer, cfg, None, |_| {}),
+            run_proxy_with_io(client_in, writer, cfg, engine, |_| {}),
         )
         .await;
     });
@@ -137,6 +158,145 @@ fn guard_mode_still_forwards_a_benign_tool_call() {
     );
 }
 
+/// REGRESSION ANCHOR, from a live run behind the reference MCP filesystem
+/// server: in guard mode, with the rules `innerwarden proxy` loads, every
+/// `write_file` was refused, because ATR-2026-040 matched the tool's name. An
+/// ordinary write must reach the server; a write that grants sudo must not,
+/// here spelled `/etc//sudoers.d`, which no rule matching the raw text sees.
+///
+/// FAILS ON REVERT: put `write_file` back in ATR-2026-040's tool-name
+/// condition and the ordinary write never reaches the server; drop the
+/// `AG-PRIV-WRITE` check and the sudoers write does.
+#[test]
+fn guard_mode_with_the_shipped_rules_forwards_an_ordinary_write_and_stops_a_sudo_grant() {
+    let engine = Arc::new(RuleEngine::load_embedded());
+    let ordinary = "ordinary-write-reached-the-server";
+    let grant = "sudo-grant-reached-the-server";
+    let seen = run_through_proxy_with(
+        &[
+            fs_call(
+                21,
+                "write_file",
+                serde_json::json!({"path": "/home/dev/project/notes.md", "content": ordinary}),
+            ),
+            fs_call(
+                22,
+                "write_file",
+                serde_json::json!({"path": "/etc//sudoers.d/agent", "content": grant}),
+            ),
+        ],
+        ProxyMode::Guard,
+        Some(engine),
+    );
+
+    assert!(
+        seen.contains(ordinary),
+        "an ordinary write must reach the server and come back:\n{seen}"
+    );
+    assert!(
+        !seen.contains(grant),
+        "the sudo grant reached the server and was echoed back:\n{seen}"
+    );
+    let refusal = seen
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("json line"))
+        .find(|reply| reply["id"] == 22)
+        .unwrap_or_else(|| panic!("the sudo grant must be answered:\n{seen}"));
+    assert_eq!(refusal["result"]["isError"], true, "{refusal}");
+    let text = refusal["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        text.contains("AG-PRIV-WRITE: may change `/etc/sudoers.d/agent`, part of the sudo rules"),
+        "the refusal says which file and why: {text}"
+    );
+}
+
+/// The same, for files the first version of the target check left out: a
+/// login script every account runs (root's included), and the agent's own
+/// hook settings, which take the agent out from under the guard. Both were
+/// refused while ATR-2026-040 refused every `write_file`, and both reached
+/// the server once it no longer did. A container run whose argv starts with
+/// `/bin/sh` and a note naming an interpreter still pass: neither writes
+/// anything.
+///
+/// FAILS ON REVERT: take the login scripts or the guard's own configuration
+/// out of the privileged list and the write reaches the server; judge every
+/// string as a write target and the run and the note never do.
+#[test]
+fn guard_mode_with_the_shipped_rules_stops_a_login_script_and_an_unhooking_write() {
+    let engine = Arc::new(RuleEngine::load_embedded());
+    let login = "login-script-reached-the-server";
+    let unhook = "unhooking-write-reached-the-server";
+    let run = "run-reached-the-server";
+    let note = "note-reached-the-server";
+    let seen = run_through_proxy_with(
+        &[
+            fs_call(
+                31,
+                "write_file",
+                serde_json::json!({"path": "/etc/profile.d/agent.sh", "content": login}),
+            ),
+            fs_call(
+                32,
+                "write_file",
+                serde_json::json!({"path": "~/.claude/settings.json", "content": unhook}),
+            ),
+            fs_call(
+                33,
+                "run_container",
+                serde_json::json!({"image": "alpine", "command": ["/bin/sh", "-c", format!("echo {run}")]}),
+            ),
+            fs_call(
+                34,
+                "create_entities",
+                serde_json::json!({"entities": [{"name": note, "observations": ["/usr/bin/python3 is the default interpreter"]}]}),
+            ),
+        ],
+        ProxyMode::Guard,
+        Some(engine),
+    );
+    for (id, marker, file, what) in [
+        (
+            31,
+            login,
+            "/etc/profile.d/agent.sh",
+            "the scripts every account's login shell runs",
+        ),
+        (
+            32,
+            unhook,
+            "~/.claude/settings.json",
+            "the guard's own configuration, or the agent settings that load it",
+        ),
+    ] {
+        assert!(
+            !seen.contains(marker),
+            "call {id} reached the server and was echoed back:\n{seen}"
+        );
+        let refusal = seen
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("json line"))
+            .find(|reply| reply["id"] == id)
+            .unwrap_or_else(|| panic!("call {id} must be answered:\n{seen}"));
+        let text = refusal["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            text.contains(&format!(
+                "AG-PRIV-WRITE: may change `{file}`, part of {what}"
+            )),
+            "call {id}: {text}"
+        );
+    }
+    for marker in [run, note] {
+        assert!(
+            seen.contains(marker),
+            "{marker}: an ordinary call must reach the server:\n{seen}"
+        );
+    }
+}
+
 /// Advisory mode is explicitly NOT enforcement. It must forward everything,
 /// including the dangerous call, so the two modes cannot be confused for each
 /// other by a future refactor.
@@ -169,5 +329,53 @@ fn a_block_does_not_break_the_rest_of_the_session() {
     assert!(
         seen.contains(benign),
         "the session must survive a block and keep serving:\n{seen}"
+    );
+}
+
+/// A loop is held only while it loops, and only that call. Four identical calls
+/// in a burst: the fourth never reaches the server and the client is told why,
+/// and a different call right after it still goes through. The breaker used to
+/// stay tripped for every later call, whatever it was, for the life of the
+/// proxy, so one loop took every tool away from the agent.
+#[test]
+fn guard_mode_refuses_a_fast_repeat_and_nothing_else() {
+    let repeated = "git status --short";
+    let different = "git log --oneline -5";
+    let requests = [
+        tool_call(11, repeated),
+        tool_call(12, repeated),
+        tool_call(13, repeated),
+        tool_call(14, repeated),
+        tool_call(15, different),
+    ];
+    let seen = run_through_proxy(&requests, ProxyMode::Guard);
+
+    let mut reached_the_server = Vec::new();
+    let mut refused = Vec::new();
+    for line in seen.lines() {
+        let reply: serde_json::Value =
+            serde_json::from_str(line).unwrap_or_else(|e| panic!("{e}: {line}"));
+        let id = reply["id"].as_u64().expect("every line answers an id");
+        if reply["method"] == "tools/call" {
+            reached_the_server.push(id);
+        } else if reply["result"]["isError"] == true {
+            refused.push((id, line.to_string()));
+        }
+    }
+    reached_the_server.sort_unstable();
+    assert_eq!(
+        reached_the_server,
+        [11, 12, 13, 15],
+        "only the fast repeat is held back:\n{seen}"
+    );
+    assert_eq!(refused.len(), 1, "{seen}");
+    assert_eq!(refused[0].0, 14);
+    assert!(
+        refused[0].1.contains("AG-ASI09-BREAKER")
+            && refused[0]
+                .1
+                .contains("already made 3 times in the last 60 s"),
+        "the refusal says it was the loop breaker and why: {}",
+        refused[0].1
     );
 }

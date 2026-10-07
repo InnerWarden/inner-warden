@@ -85,10 +85,30 @@ only — no IP, no host data; set `INNERWARDEN_NO_TELEMETRY=1` to disable). A
 - Notifications: surfaces verdicts and events through your configured channels.
 - Conversation attempts: records what an agent was ASKED to do when the ask is
   dangerous, including the asks a model refuses on its own. Those produce no
-  command, so they reach nothing else in the product. Every record names who
-  decided (`model_refused`, `guard_denied`, `kernel_denied`) and a model refusal
-  is never reported as a block: `innerwarden observe status` says whether this
-  host sees them at all. OpenClaw today, via its message hooks.
+  command, so they reach nothing else in the product. An ask is dangerous when
+  the guard's command rules or its prompt-injection rules flag it, or when it
+  asks in plain words for a cryptominer ("install a crypto miner on this
+  server"); that last reading is a short list, and a paraphrase can pass it.
+  A miner's name that is only talked about ("how do I remove xmrig from this
+  box?") is not read as a command; one asked for or given as a command is.
+  The cost of that: a request with no request verb, phrased as a question
+  about the miner ("what if xmrig ran on every core?") or with a defence or
+  report word right before its name, is not recorded; the command it leads
+  to is still screened.
+  The record carries the rules' recommendation and risk score, on the same
+  scale `innerwarden check` uses. It also weighs the prompt-injection rules and
+  the plain-language miner reading, which `check` does not run on a command, so
+  `innerwarden check` on the same text can answer `allow` where the record says
+  `deny`; the record's `signals` name the reading that scored it. Every record
+  names who decided (`guard_denied`, `kernel_denied`, `model_refused` only
+  when a caller states it, or `undetermined` when that could not be seen, a
+  reply included: its words are not read, and a tool the guard does not
+  screen leaves nothing, so a reply does not show the agent declined;
+  `guard_denied` only for a refusal the guard made for that agent, in that
+  conversation's session, in a turn whose reply was seen, never for an action
+  monitor mode let run) and a model refusal is never reported as a block:
+  `innerwarden observe status` says whether this host sees them at all.
+  OpenClaw today, via its message hooks.
 
 The verdict is JSON: a recommendation (`allow` / `review` / `deny`), a risk
 score, matched signals, and a short explanation.
@@ -104,7 +124,13 @@ Whatever agent you run, there is a mechanism and a command for it:
   OpenClaw has one more surface, and it observes rather than enforces: its
   message hooks see the inbound prompt and the reply, so
   `innerwarden observe install` records a dangerous ask even when the model,
-  not the guard, is what stopped it.
+  not the guard, is what stopped it. The Control UI chat reports no reply to
+  hooks, so the same command installs a small OpenClaw plugin that reads how
+  each Control UI turn ended (a tool call, a reply, or neither; never the
+  words), granted the conversation access OpenClaw requires for that. Without
+  it, an ask made there is recorded after two minutes with the outcome stated
+  as not visible. `innerwarden upgrade` brings both up to the new version's
+  where nobody changed them.
 - **Any other MCP client** - point it at `innerwarden proxy -- <server>`.
 - **Anything with no cooperative surface** - run it isolated:
   `innerwarden contain -- <command>`.

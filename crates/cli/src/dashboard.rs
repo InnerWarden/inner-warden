@@ -111,9 +111,10 @@ struct AgentView {
     /// agent is already refusing, or cannot be connected.
     #[serde(skip_serializing_if = "Option::is_none")]
     next_step: Option<AgentNextStep>,
-    /// For a hook written before hooks named their agent: the reconnect, in
-    /// the hook's own mode, that adds the name. Its cases say "An agent"
-    /// until then, and the page says why.
+    /// For wiring whose decisions do not name this agent (a hook written
+    /// before hooks named their agent, or MCP servers wrapped before wrappers
+    /// did): the reconnect, in the wiring's own mode, that adds the name. Its
+    /// cases do not say it asked until then, and the page says why.
     #[serde(skip_serializing_if = "Option::is_none")]
     identity_step: Option<AgentNextStep>,
 }
@@ -127,6 +128,62 @@ fn identity_step(name: &str, settings: &serde_json::Value) -> Option<AgentNextSt
         command: format!("innerwarden agents connect {name}{flag}"),
         line: "Its hook was set up before hooks named their agent, so its cases say \"An agent\". Reconnecting in the same mode adds the name; nothing else changes.",
     })
+}
+
+/// The step that names an MCP agent whose proxies do not all record it, from
+/// the reconnect flag `mcp_wire::unnamed_reconnect_flag` (or its TOML twin)
+/// returned for its configuration.
+fn mcp_identity_step(name: &str, flag: &str) -> AgentNextStep {
+    AgentNextStep {
+        label: "To name it in its cases:",
+        command: format!("innerwarden agents connect {name}{flag}"),
+        line: "Not every one of its MCP servers carries its name, so the cases those record do not say it asked. Reconnecting in the same mode adds the name; nothing else changes.",
+    }
+}
+
+/// The identity step for one connected agent, from its own wiring: the
+/// hook's settings, or its MCP configuration and `guard_bin`, the CLI its
+/// wrappers must already run for a reconnect to change nothing but the name.
+/// `None` when that wiring names it, or cannot be read.
+fn agent_identity_step(
+    home: &std::path::Path,
+    agent: &innerwarden_agent_guard::agents::AgentStatus,
+    guard_bin: &str,
+) -> Option<AgentNextStep> {
+    let read = |rel: &str| {
+        innerwarden_agent_guard::file_update::read_config_no_symlinks(home, &home.join(rel))
+            .ok()
+            .flatten()
+    };
+    if agent.hookable {
+        return read(".claude/settings.json")
+            .and_then(|body| serde_json::from_slice::<serde_json::Value>(&body).ok())
+            .and_then(|settings| identity_step(&agent.name, &settings));
+    }
+    let flag = if let Some(rel) = &agent.mcp_json {
+        read(rel)
+            .and_then(|body| serde_json::from_slice::<serde_json::Value>(&body).ok())
+            .and_then(|config| {
+                innerwarden_agent_guard::mcp_wire::unnamed_reconnect_flag(
+                    &config,
+                    guard_bin,
+                    &agent.name,
+                )
+            })
+    } else if let Some(rel) = &agent.mcp_toml {
+        read(rel)
+            .and_then(|body| std::str::from_utf8(&body).ok()?.parse().ok())
+            .and_then(|config| {
+                innerwarden_agent_guard::mcp_wire_toml::unnamed_reconnect_flag_toml(
+                    &config,
+                    guard_bin,
+                    &agent.name,
+                )
+            })
+    } else {
+        None
+    };
+    flag.map(|flag| mcp_identity_step(&agent.name, flag))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -285,14 +342,21 @@ fn agents_json(
     home: &std::path::Path,
     rows: &[innerwarden_agent_guard::agents::AgentStatus],
 ) -> String {
-    agents_json_with_status(home, rows, false, None)
+    agents_json_with_status(home, rows, false, None, TEST_GUARD_BIN)
 }
 
+/// The CLI the agent wrappers in the test homes run.
+#[cfg(test)]
+const TEST_GUARD_BIN: &str = "/abs/innerwarden";
+
+/// `guard_bin` is the CLI this dashboard runs as, the one an MCP wrapper must
+/// already run for a reconnect to change nothing but its name.
 fn agents_json_with_status(
     home: &std::path::Path,
     rows: &[innerwarden_agent_guard::agents::AgentStatus],
     discovery_limited: bool,
     watcher: Option<&crate::agent_policy::SharedDashboardReconcilerStatus>,
+    guard_bin: &str,
 ) -> String {
     let (policy, policy_available) = match crate::agent_policy::load(home) {
         Ok(policy) => (policy, true),
@@ -347,13 +411,8 @@ fn agents_json_with_status(
                 auto_connect_eligible: policy_available
                     .then(|| crate::agent_policy::is_auto_connect_candidate(home, agent, &policy)),
                 next_step,
-                identity_step: if agent.hookable && effectively_guarded {
-                    let path = home.join(".claude/settings.json");
-                    innerwarden_agent_guard::file_update::read_config_no_symlinks(home, &path)
-                        .ok()
-                        .flatten()
-                        .and_then(|body| serde_json::from_slice::<serde_json::Value>(&body).ok())
-                        .and_then(|settings| identity_step(&agent.name, &settings))
+                identity_step: if effectively_guarded {
+                    agent_identity_step(home, agent, guard_bin)
                 } else {
                     None
                 },
@@ -412,11 +471,12 @@ fn agents_loading_json(
 fn build_agent_snapshot(
     home: &std::path::Path,
     watcher: Option<&crate::agent_policy::SharedDashboardReconcilerStatus>,
+    guard_bin: &str,
 ) -> AgentSnapshot {
     let (rows, discovery_limited) =
         innerwarden_agent_guard::agents_ops::rows_with_discovery_status(home);
     AgentSnapshot {
-        json: agents_json_with_status(home, &rows, discovery_limited, watcher),
+        json: agents_json_with_status(home, &rows, discovery_limited, watcher, guard_bin),
         guardrail: guardrail_status_from_rows(home, &rows),
         observed_at_ms: now_ms(),
     }
@@ -436,10 +496,11 @@ fn spawn_agent_refresher(
         observed_at_ms: now_ms(),
     }));
     let writer = std::sync::Arc::clone(&shared);
+    let guard_bin = innerwarden_agent_guard::agents_ops::guard_bin();
     std::thread::Builder::new()
         .name("iw-agent-visibility".into())
         .spawn(move || loop {
-            let next = build_agent_snapshot(&home, watcher.as_ref());
+            let next = build_agent_snapshot(&home, watcher.as_ref(), &guard_bin);
             match writer.write() {
                 Ok(mut snapshot) => *snapshot = next,
                 Err(poisoned) => *poisoned.into_inner() = next,
@@ -997,6 +1058,7 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
                         record: &record,
                         guard_mode: &guard_mode,
                         observe_installed: crate::observe_io::installed(),
+                        observation: crate::observe_io::observation(),
                         openclaw_present: crate::observe_io::openclaw_present(),
                         log: &log,
                     };
@@ -1757,6 +1819,83 @@ mod tests {
         .is_none());
     }
 
+    /// MCP agents connected before wrappers named their agent, as the Agents
+    /// page reads them: each is offered the reconnect in its own mode, JSON
+    /// and TOML alike. One whose proxies already record it is not, and
+    /// neither is one whose wrapper runs another copy of the CLI, since that
+    /// reconnect would move it as well as name it.
+    ///
+    /// FAILS ON REVERT: offer the identity step to hook agents only (the old
+    /// `agent.hookable && effectively_guarded`), and OpenClaw and Codex have
+    /// none, so their cases keep saying "An agent" with nothing saying why.
+    #[test]
+    fn an_unnamed_mcp_agent_is_offered_the_reconnect_that_names_it_in_its_own_mode() {
+        let home = tempfile::TempDir::new().unwrap();
+        let write = |rel: &str, body: String| {
+            let path = home.path().join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        };
+        let bin = TEST_GUARD_BIN;
+        write(
+            ".openclaw/openclaw.json",
+            format!(
+                r#"{{"mcp":{{"servers":{{"fs":{{"command":"{bin}","args":["proxy","--mode","advisory","--","npx"]}}}}}}}}"#
+            ),
+        );
+        write(
+            ".codex/config.toml",
+            format!(
+                "[mcp_servers.icm]\ncommand = \"{bin}\"\nargs = [\"proxy\", \"--mode\", \"guard\", \"--\", \"icm\"]\n"
+            ),
+        );
+        write(
+            ".cursor/mcp.json",
+            format!(
+                r#"{{"mcpServers":{{"s":{{"command":"{bin}","args":["proxy","--label","cursor","--agent","cursor","--mode","advisory","--","npx"]}}}}}}"#
+            ),
+        );
+        write(
+            ".gemini/settings.json",
+            r#"{"mcpServers":{"s":{"command":"/opt/pinned/innerwarden","args":["proxy","--mode","advisory","--","npx"]}}}"#.to_string(),
+        );
+
+        let rows = innerwarden_agent_guard::agents_ops::rows(home.path());
+        let payload: serde_json::Value =
+            serde_json::from_str(&agents_json(home.path(), &rows)).unwrap();
+        let agent = |id: &str| {
+            payload["agents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|agent| agent["id"] == id)
+                .unwrap_or_else(|| panic!("{id} row: {payload}"))
+                .clone()
+        };
+        let line = "Not every one of its MCP servers carries its name, so the cases those record do not say it asked. Reconnecting in the same mode adds the name; nothing else changes.";
+        for (id, command) in [
+            ("openclaw", "innerwarden agents connect openclaw --monitor"),
+            ("codex", "innerwarden agents connect codex"),
+        ] {
+            let row = agent(id);
+            assert_eq!(row["guardrail"]["mechanism"], "mcp_proxy", "{row}");
+            assert_eq!(
+                row["identity_step"],
+                serde_json::json!({
+                    "label": "To name it in its cases:",
+                    "command": command,
+                    "line": line,
+                }),
+                "{row}"
+            );
+        }
+        for id in ["cursor", "gemini"] {
+            let row = agent(id);
+            assert_ne!(row["guardrail"]["mode"], "not_configured", "{row}");
+            assert!(row.get("identity_step").is_none(), "{row}");
+        }
+    }
+
     #[test]
     fn an_unknown_messages_cursor_is_a_400() {
         let log = crate::dashboard_community::parse_event_log("");
@@ -2355,6 +2494,7 @@ mod tests {
             &rows,
             false,
             Some(&watcher),
+            TEST_GUARD_BIN,
         ))
         .unwrap();
 
@@ -2463,7 +2603,8 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         let rows = innerwarden_agent_guard::agents_ops::rows(home.path());
-        let stale = agents_json_with_status(home.path(), &rows, false, Some(&shared));
+        let stale =
+            agents_json_with_status(home.path(), &rows, false, Some(&shared), TEST_GUARD_BIN);
 
         crate::agent_policy::disable_auto_connect(home.path()).unwrap();
         while crate::agent_policy::read_dashboard_reconciler_status(&shared).policy_enabled

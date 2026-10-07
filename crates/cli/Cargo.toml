@@ -71,7 +71,7 @@ base64 = "0.23"
 tiny_http = "0.12"
 # Async runtime for the `proxy` mode (the enforcing MCP stdio guard, which pumps
 # the wrapped server's stdio via tokio::process). Windows-clean: no unix APIs.
-tokio = { version = "1", features = ["rt-multi-thread", "io-std", "time"] }
+tokio = { version = "1", features = ["rt", "io-std", "time"] }
 # Blocking HTTP client for the verdict notifications. rustls TLS = pure Rust, no
 # C deps, stays Windows-clean.
 ureq = { version = "3", features = ["json"] }
@@ -86,3 +86,10 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+
+# `cfg(tarpaulin)` is set by cargo-tarpaulin while instrumenting. Declared so a
+# test that opts out of a coverage run (tests/burst_does_not_block.rs) does not
+# trip the unexpected-cfg lint, which `-D warnings` turns into a build failure
+# under `cargo clippy --all-targets`.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tarpaulin)'] }

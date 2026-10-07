@@ -21,10 +21,85 @@
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
+/// The health record's file name, beside the graph.
+const HEALTH_FILE: &str = "record-health.json";
+
+/// The guard event sink's file name, beside the graph.
+const SINK_FILE: &str = "guard-events.jsonl";
+
 /// Sibling of the graph file. Never inside it: the write that failed is the one
 /// that would have carried the news.
 fn health_path(graph: &Path) -> PathBuf {
-    graph.with_file_name("record-health.json")
+    graph.with_file_name(HEALTH_FILE)
+}
+
+/// Why a file the recorder writes IN PLACE (the guard event sink, this health
+/// record) is refused, from the metadata of the name itself, never followed.
+/// PURE: the metadata is handed in.
+///
+/// The directory is shared with the guarded agent's account and this CLI also
+/// runs as root, so a writer refuses a link at the name, a file with a second
+/// name (a hard link: writing it would write the other name's file), and
+/// anything that is not a plain file. Each refusal drops the write, so it has
+/// to be reported, or one `ln` by the agent's account silences the sink for
+/// good while every surface reads as healthy.
+pub(crate) fn refusal(metadata: &std::fs::Metadata) -> Option<&'static str> {
+    if innerwarden_safe_io::is_reparse_or_symlink(metadata) {
+        Some("is_a_link")
+    } else if !innerwarden_safe_io::is_regular_file(metadata) {
+        Some("not_a_plain_file")
+    } else if !innerwarden_safe_io::is_regular_file_with_one_name(metadata) {
+        Some("has_a_second_name")
+    } else {
+        None
+    }
+}
+
+/// A [`refusal`] in words, after the file's name: "guard-events.jsonl has a
+/// second name (a hard link)".
+pub(crate) fn refusal_words(why: &str) -> &'static str {
+    match why {
+        "is_a_link" => "is a link",
+        "has_a_second_name" => "has a second name (a hard link)",
+        _ => "is not a plain file",
+    }
+}
+
+/// The outage a refused or unwritable sink or health record is, if either is.
+///
+/// A probe, not a marker: the health record may be the very file that is
+/// refused, and a sink refusal is noted on every append while the graph write
+/// that follows it succeeds and clears any marker. The condition lasts exactly
+/// as long as the file stands as it is, so asking is the accurate answer. Its
+/// age is the name's own modification time: a refused file is no longer
+/// written, so that is when the last write landed (or the link was made).
+fn refused_file(graph: &Path) -> Option<Outage> {
+    for (name, code) in [(SINK_FILE, "guard_events"), (HEALTH_FILE, "record_health")] {
+        let path = graph.with_file_name(name);
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        let why = refusal(&metadata).or_else(|| {
+            // A plain file this account cannot append to (one an older release
+            // created as root, `0644`) drops every line the same way.
+            let mut append = std::fs::OpenOptions::new();
+            append.append(true);
+            innerwarden_safe_io::harden(&mut append);
+            append.open(&path).err().map(|_| "not_writable")
+        });
+        if let Some(why) = why {
+            return Some(Outage {
+                code: format!("{code}_{why}"),
+                since_unix: metadata
+                    .modified()
+                    .ok()
+                    .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map_or_else(now_unix, |at| at.as_secs()),
+                lost: 0,
+            });
+        }
+    }
+    None
 }
 
 fn now_unix() -> u64 {
@@ -53,6 +128,25 @@ impl Outage {
         now_unix().saturating_sub(self.since_unix)
     }
 
+    /// What to do about an outage whose cause is a file standing wrong, in
+    /// words. `None` for a code that names no such file.
+    fn remedy(&self) -> Option<String> {
+        let (file, why) = [
+            ("guard_events_", SINK_FILE),
+            ("record_health_", HEALTH_FILE),
+        ]
+        .into_iter()
+        .find_map(|(prefix, file)| self.code.strip_prefix(prefix).map(|why| (file, why)))?;
+        let remedy = match why {
+            "is_a_link" => format!("A link stands where {file} should be, and nothing is written through it. Remove the link."),
+            "has_a_second_name" => format!("{file} has a second name (a hard link), and nothing is written to it while it does. Remove the other name, or move the file aside so a new one is made."),
+            "not_a_plain_file" => format!("{file} is not a plain file. Move it aside so a new one is made."),
+            "not_writable" => format!("This account cannot write {file}. Give it to the group of its folder with write for the group, or move it aside so a new one is made."),
+            _ => return None,
+        };
+        Some(remedy)
+    }
+
     /// One line, safe to print anywhere: no paths, no command text.
     pub fn summary(&self) -> String {
         let secs = self.seconds();
@@ -68,12 +162,19 @@ impl Outage {
         } else {
             format!("{} action(s) lost", self.lost)
         };
-        format!(
-            "InnerWarden has not recorded for {ago} ({lost}, {}). \
-             Screening still ran; only the local record is affected. \
-             Run `innerwarden graph --stats` after the next command to confirm recovery.",
-            self.code
-        )
+        match self.remedy() {
+            Some(remedy) => format!(
+                "InnerWarden has not recorded for {ago} ({lost}, {}). \
+                 Screening still ran; only the local record is affected. {remedy}",
+                self.code
+            ),
+            None => format!(
+                "InnerWarden has not recorded for {ago} ({lost}, {}). \
+                 Screening still ran; only the local record is affected. \
+                 Run `innerwarden graph --stats` after the next command to confirm recovery.",
+                self.code
+            ),
+        }
     }
 }
 
@@ -86,9 +187,18 @@ fn parse(bytes: &str) -> Option<Outage> {
     })
 }
 
-/// The persisted outage for this graph path, if any.
+/// The persisted outage for this graph path, if any. Never read through a link
+/// at the name: the directory is shared with the agent's account, and a root
+/// run would read whatever it points at.
 pub fn read_at(graph: &Path) -> Option<Outage> {
-    parse(&std::fs::read_to_string(health_path(graph)).ok()?)
+    use std::io::Read;
+    let mut body = String::new();
+    innerwarden_safe_io::open_no_follow(&health_path(graph))
+        .ok()?
+        .take(64 * 1024)
+        .read_to_string(&mut body)
+        .ok()?;
+    parse(&body)
 }
 
 /// The outage to REPORT for this graph path.
@@ -98,6 +208,11 @@ pub fn read_at(graph: &Path) -> Option<Outage> {
 /// no marker, probe. The graph's own mtime dates the episode, which is the
 /// precise fact the operator wanted ("the newest entry is six hours old").
 pub fn report_at(graph: &Path) -> Option<Outage> {
+    // First: the health record may itself be the refused file, and then what
+    // it holds is not to be believed.
+    if let Some(refused) = refused_file(graph) {
+        return Some(refused);
+    }
     if let Some(persisted) = read_at(graph) {
         return Some(persisted);
     }
@@ -180,14 +295,75 @@ fn nearest_existing_ancestor(dir: &Path) -> Option<&Path> {
 
 /// Write and remove a file in `dir`. The same permissions creating the store
 /// needs, exercised rather than inferred.
+///
+/// Created EXCLUSIVELY: the name is predictable and the directory may be one
+/// another account writes, so a link planted there must make the probe fail,
+/// never be followed. `std::fs::write` truncated whatever it pointed at, as
+/// whoever ran the CLI, root included.
 fn probe_writable(dir: &Path) -> bool {
     let probe = dir.join(format!(".iw-write-probe.{}", std::process::id()));
-    match std::fs::write(&probe, b"") {
-        Ok(()) => {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    innerwarden_safe_io::harden(&mut options);
+    match options.open(&probe) {
+        Ok(_) => {
             let _ = std::fs::remove_file(&probe);
             true
         }
         Err(_) => false,
+    }
+}
+
+/// Write the health record beside the graph without following a link.
+///
+/// The graph's directory is shared with the guarded agent's uid when Active
+/// Defence is installed, and this CLI also runs as root. `std::fs::write`
+/// opened the name with `O_CREAT|O_TRUNC` and followed whatever was there, so a
+/// link the agent's uid put at `record-health.json` made root truncate and
+/// rewrite its target the next time a record failed, and the guarded uid can
+/// make a record fail at will by holding the graph lock. A new file takes the
+/// mode and group its directory implies, like every other file this product
+/// creates there, so whoever records next can update it.
+///
+/// The open refuses a symbolic link. A HARD link opens fine, so the file is
+/// truncated and rewritten only when its link count says this name is its only
+/// one; the existing file is opened without `O_TRUNC` so nothing is cut before
+/// that is known.
+fn write_health(path: &Path, body: &[u8]) {
+    use std::io::Write;
+    let mut create = std::fs::OpenOptions::new();
+    create.write(true).create_new(true);
+    innerwarden_safe_io::harden(&mut create);
+    let file = match create.open(path) {
+        Ok(file) => {
+            #[cfg(unix)]
+            if let Some(directory) = path.parent() {
+                let _ = innerwarden_agent_guard::file_update::apply_new_file_ownership(
+                    &file, directory,
+                );
+            }
+            file
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let mut existing = std::fs::OpenOptions::new();
+            existing.write(true);
+            innerwarden_safe_io::harden(&mut existing);
+            match existing.open(path) {
+                Ok(file) => file,
+                Err(_) => return,
+            }
+        }
+        Err(_) => return,
+    };
+    if !file
+        .metadata()
+        .is_ok_and(|metadata| innerwarden_safe_io::is_regular_file_with_one_name(&metadata))
+    {
+        return;
+    }
+    let mut file = file;
+    if file.set_len(0).is_ok() {
+        let _ = file.write_all(body);
     }
 }
 
@@ -242,7 +418,7 @@ pub fn note_failure_at(graph: &Path, code: &str) -> Outage {
         "lost": outage.lost,
         "first_of_episode": first_of_episode,
     });
-    let _ = std::fs::write(health_path(graph), body.to_string());
+    write_health(&health_path(graph), body.to_string().as_bytes());
     outage
 }
 
@@ -482,5 +658,204 @@ mod tests {
         std::fs::write(health_path(&g), "{not json").unwrap();
         assert!(read_at(&g).is_none());
         assert!(!is_first_of_episode_at(&g));
+    }
+
+    /// The health record sits in a directory the guarded agent's uid writes,
+    /// and this CLI also runs as root. A link planted at its name must never
+    /// be written through: the guarded uid can make a record fail at will (it
+    /// only has to hold the graph lock), and `std::fs::write` then truncated
+    /// and rewrote whatever the link named, as root.
+    ///
+    /// FAILS ON REVERT: write it with `std::fs::write` again and the victim is
+    /// overwritten.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_at_the_health_record_is_never_written_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let victim = elsewhere.path().join("sudoers");
+        std::fs::write(&victim, "root ALL=(ALL) ALL\n").unwrap();
+        let g = graph_in(&dir);
+        std::os::unix::fs::symlink(&victim, health_path(&g)).unwrap();
+
+        let _ = note_failure_at(&g, "graph_lock_timeout");
+
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "root ALL=(ALL) ALL\n",
+            "the file the link named was written"
+        );
+        assert!(std::fs::symlink_metadata(health_path(&g))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    /// A HARD link at the health record's name is not refused by the open, so
+    /// the link count decides: a file with a second name is never truncated or
+    /// rewritten, and an ordinary record still is.
+    ///
+    /// FAILS ON REVERT: check the handle with `is_regular_file` again and the
+    /// victim is truncated and rewritten.
+    #[cfg(unix)]
+    #[test]
+    fn a_hard_link_at_the_health_record_is_never_written_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let victim = elsewhere.path().join("sudoers");
+        std::fs::write(&victim, "root ALL=(ALL) ALL\n").unwrap();
+        let g = graph_in(&dir);
+        std::fs::hard_link(&victim, health_path(&g)).unwrap();
+
+        let _ = note_failure_at(&g, "graph_lock_timeout");
+
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "root ALL=(ALL) ALL\n",
+            "the file behind the second name was written"
+        );
+
+        // Not a refusal of every existing record: once the second name is gone
+        // the same file is this record's own again and is updated.
+        std::fs::remove_file(&victim).unwrap();
+        let _ = note_failure_at(&g, "graph_lock_timeout");
+        assert_eq!(
+            read_at(&g).expect("the record's own file is updated").code,
+            "graph_lock_timeout"
+        );
+    }
+
+    /// Same rule for the write probe, whose name is predictable.
+    ///
+    /// FAILS ON REVERT: probe with `std::fs::write` and the victim is truncated.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_at_the_write_probe_is_never_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let victim = elsewhere.path().join("shadow");
+        std::fs::write(&victim, "root:x:0:0\n").unwrap();
+        let probe = dir
+            .path()
+            .join(format!(".iw-write-probe.{}", std::process::id()));
+        std::os::unix::fs::symlink(&victim, &probe).unwrap();
+
+        let _ = probe_writable(dir.path());
+
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "root:x:0:0\n");
+    }
+
+    /// A health record the first writer created in a shared directory is one
+    /// the next writer, another member of the group, can update.
+    #[cfg(unix)]
+    #[test]
+    fn a_new_health_record_in_a_shared_directory_takes_its_group_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o2770)).unwrap();
+        let g = graph_in(&dir);
+        let _ = note_failure_at(&g, "graph_write_failed");
+        assert_eq!(
+            std::fs::metadata(health_path(&g))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o660
+        );
+        assert_eq!(read_at(&g).expect("readable").code, "graph_write_failed");
+    }
+
+    /// A refused sink drops every guard event, and the drop used to be
+    /// silent: one `ln` by the guarded agent's account (which can write the
+    /// shared sink, so Linux's `protected_hardlinks` allows it) and every block
+    /// and attempt was discarded while the dashboard read as a quiet, healthy
+    /// host. Each way the sink can stand wrong is now an outage, with the fix.
+    ///
+    /// FAILS ON REVERT: drop the `refused_file` probe from `report_at` and a
+    /// hard-linked sink reports nothing.
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_guard_event_sink_is_an_outage() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let g = graph_in(&dir);
+        let sink = dir.path().join(SINK_FILE);
+        std::fs::write(&sink, "{}\n").unwrap();
+        assert_eq!(report_at(&g), None, "a plain sink is healthy");
+
+        let second = elsewhere.path().join("k");
+        std::fs::hard_link(&sink, &second).unwrap();
+        let outage = report_at(&g).expect("a sink with a second name is an outage");
+        assert_eq!(outage.code, "guard_events_has_a_second_name");
+        assert!(
+            outage.summary().contains("Remove the other name"),
+            "{}",
+            outage.summary()
+        );
+        std::fs::remove_file(&second).unwrap();
+        assert_eq!(
+            report_at(&g),
+            None,
+            "and it ends when the other name is gone"
+        );
+
+        std::fs::remove_file(&sink).unwrap();
+        std::os::unix::fs::symlink(elsewhere.path().join("victim"), &sink).unwrap();
+        assert_eq!(report_at(&g).unwrap().code, "guard_events_is_a_link");
+        std::fs::remove_file(&sink).unwrap();
+        std::fs::create_dir(&sink).unwrap();
+        assert_eq!(report_at(&g).unwrap().code, "guard_events_not_a_plain_file");
+    }
+
+    /// A sink this account cannot append to (an older release created it as
+    /// root, `0644`) drops every line the same way.
+    ///
+    /// FAILS ON REVERT: drop the append probe and it reads as healthy.
+    #[cfg(unix)]
+    #[test]
+    fn a_sink_this_account_cannot_write_is_an_outage() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: reads the process credentials, cannot fail.
+        assert_ne!(
+            unsafe { libc::geteuid() },
+            0,
+            "running as root, which writes any file, so the case cannot be constructed; \
+             run the suite as an ordinary account"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let sink = dir.path().join(SINK_FILE);
+        std::fs::write(&sink, "").unwrap();
+        std::fs::set_permissions(&sink, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let outage = report_at(&graph_in(&dir)).expect("an unwritable sink is an outage");
+        assert_eq!(outage.code, "guard_events_not_writable");
+        assert!(outage.summary().contains("cannot write guard-events.jsonl"));
+    }
+
+    /// The health record is the file that would carry the news, so a link at
+    /// its name reports itself, and what it points at is never read: a root
+    /// run would otherwise read a file the agent's account chose.
+    ///
+    /// FAILS ON REVERT: read the marker before the probe, through the link,
+    /// and the planted outage is reported instead.
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_health_record_reports_itself_and_is_never_read_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let g = graph_in(&dir);
+        let planted = elsewhere.path().join("planted.json");
+        std::fs::write(&planted, r#"{"code":"planted","since_unix":1}"#).unwrap();
+        std::os::unix::fs::symlink(&planted, dir.path().join(HEALTH_FILE)).unwrap();
+        assert_eq!(read_at(&g), None, "never read through a link");
+        assert_eq!(report_at(&g).unwrap().code, "record_health_is_a_link");
+
+        std::fs::remove_file(dir.path().join(HEALTH_FILE)).unwrap();
+        note_failure_at(&g, "write_failed");
+        std::fs::hard_link(dir.path().join(HEALTH_FILE), elsewhere.path().join("k")).unwrap();
+        assert_eq!(
+            report_at(&g).unwrap().code,
+            "record_health_has_a_second_name"
+        );
     }
 }

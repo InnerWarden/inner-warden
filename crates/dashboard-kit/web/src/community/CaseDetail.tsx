@@ -321,7 +321,7 @@ export function MessageDetail({ item, os, installed, hostMode = "unknown" }: { i
     title.current?.focus({ preventScroll: true });
   }, [item.id]);
   const declined = item.outcomeKey === "declined_by_agent";
-  const steps = withSeenTime(messageLadder(declined), item.at);
+  const steps = withSeenTime(messageLadder(item.outcomeKey), item.at);
   const offer = messageOffer(os, item.outcomeKey);
   const step = messageStep(item.outcomeKey, hostMode);
   return (

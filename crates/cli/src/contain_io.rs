@@ -282,7 +282,7 @@ fn resolve_backend(trusted: &[&str]) -> Option<PathBuf> {
 
 #[cfg(unix)]
 fn trusted_backend_candidate(path: &Path) -> bool {
-    trusted_backend_candidate_for_owner(path, 0)
+    backend_facts(path).is_some_and(|facts| backend_trusted(&facts))
 }
 
 #[cfg(not(unix))]
@@ -290,61 +290,93 @@ fn trusted_backend_candidate(_path: &Path) -> bool {
     false
 }
 
+/// One entry on a sandbox backend's path, as `symlink_metadata` reads it: a
+/// symlink is described, never followed.
 #[cfg(unix)]
-fn trusted_backend_candidate_for_owner(path: &Path, expected_uid: u32) -> bool {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-
-    if !path.is_absolute() {
-        return false;
-    }
-
-    // Reject a symlink in any reviewed component. We intentionally skip an
-    // usr-merged `/bin` candidate and accept the canonical `/usr/bin` candidate
-    // from the fixed list instead.
-    let mut component_path = PathBuf::new();
-    for component in path.components() {
-        component_path.push(component.as_os_str());
-        let Ok(metadata) = std::fs::symlink_metadata(&component_path) else {
-            return false;
-        };
-        if metadata.file_type().is_symlink() {
-            return false;
-        }
-    }
-
-    let Ok(canonical) = std::fs::canonicalize(path) else {
-        return false;
-    };
-    let mut current = Some(canonical.as_path());
-    let mut first = true;
-    while let Some(entry) = current {
-        let Ok(metadata) = std::fs::symlink_metadata(entry) else {
-            return false;
-        };
-        if metadata.file_type().is_symlink()
-            || (metadata.uid() != expected_uid && metadata.uid() != 0)
-            || metadata.permissions().mode() & 0o022 != 0
-        {
-            return false;
-        }
-        if first {
-            if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
-                return false;
-            }
-            first = false;
-        } else if !metadata.is_dir() {
-            return false;
-        }
-        current = entry.parent();
-    }
-    true
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PathEntry {
+    symlink: bool,
+    file: bool,
+    dir: bool,
+    uid: u32,
+    /// `st_mode`, so the permission bits are its low twelve.
+    mode: u32,
 }
 
-#[cfg(all(test, unix))]
-fn trusted_backend_candidate_for_test(path: &Path) -> bool {
-    // Test-only owner seam. It is not compiled into release binaries and cannot
-    // relax the production root-ownership invariant.
-    trusted_backend_candidate_for_owner(path, unsafe { libc::geteuid() })
+/// What [`backend_trusted`] decides from, read by [`backend_facts`].
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BackendFacts {
+    /// Each component of the path as the trusted list spells it, from `/`
+    /// down, ending at the first symlink if there is one.
+    components: Vec<PathEntry>,
+    /// The resolved executable, then each directory above it, up to `/`.
+    /// Empty when a component is a symlink: it is refused without being
+    /// followed.
+    chain: Vec<PathEntry>,
+}
+
+/// Read the facts about `path`. `None`, which refuses the backend, when the
+/// path is relative or any entry on it cannot be inspected.
+#[cfg(unix)]
+fn backend_facts(path: &Path) -> Option<BackendFacts> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let entry = |at: &Path| {
+        std::fs::symlink_metadata(at)
+            .ok()
+            .map(|metadata| PathEntry {
+                symlink: metadata.file_type().is_symlink(),
+                file: metadata.is_file(),
+                dir: metadata.is_dir(),
+                uid: metadata.uid(),
+                mode: metadata.permissions().mode(),
+            })
+    };
+    if !path.is_absolute() {
+        return None;
+    }
+    let mut components = Vec::new();
+    let mut prefix = PathBuf::new();
+    for component in path.components() {
+        prefix.push(component.as_os_str());
+        let read = entry(&prefix)?;
+        components.push(read);
+        if read.symlink {
+            return Some(BackendFacts {
+                components,
+                chain: Vec::new(),
+            });
+        }
+    }
+    let canonical = std::fs::canonicalize(path).ok()?;
+    let chain = canonical
+        .ancestors()
+        .map(entry)
+        .collect::<Option<Vec<_>>>()?;
+    Some(BackendFacts { components, chain })
+}
+
+/// Whether `contain` may run the backend these facts describe. PURE.
+///
+/// No component of the path as written may be a symlink (the usr-merged
+/// `/bin` candidate is skipped on purpose, and the canonical `/usr/bin` one
+/// from the same list is accepted instead). The resolved executable must be
+/// a regular file with an execute bit, and it and every directory above it
+/// must be owned by root and writable by no group and no other account:
+/// whoever can write any of them can replace the jail.
+#[cfg(unix)]
+fn backend_trusted(facts: &BackendFacts) -> bool {
+    let sound = |entry: &PathEntry| !entry.symlink && entry.uid == 0 && entry.mode & 0o022 == 0;
+    let Some((executable, directories)) = facts.chain.split_first() else {
+        return false;
+    };
+    !facts.components.is_empty()
+        && facts.components.iter().all(|entry| !entry.symlink)
+        && sound(executable)
+        && executable.file
+        && executable.mode & 0o111 != 0
+        && directories.iter().all(|entry| sound(entry) && entry.dir)
 }
 
 fn run_linux(input: &JailInputs) -> ExitCode {
@@ -496,47 +528,171 @@ fn print_plan_env(env: &[(String, String)]) {
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
-    fn test_backend() -> (tempfile::TempDir, PathBuf) {
-        use std::os::unix::fs::PermissionsExt;
+    // The trust decision is tested on facts handed in. It used to be tested
+    // on a file under the checkout, so its answer depended on every directory
+    // above the checkout: one group-writable or foreign-owned ancestor and the
+    // secure backend was refused, and the refusal tests passed whatever they
+    // changed.
 
-        let root = tempfile::Builder::new()
-            .prefix("iw-trusted-backend-")
-            .tempdir_in(std::env::current_dir().unwrap())
-            .unwrap();
-        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let backend = root.path().join("bwrap");
+    #[cfg(unix)]
+    fn dir(uid: u32, permissions: u32) -> PathEntry {
+        PathEntry {
+            symlink: false,
+            file: false,
+            dir: true,
+            uid,
+            mode: 0o040_000 | permissions,
+        }
+    }
+
+    #[cfg(unix)]
+    fn file(uid: u32, permissions: u32) -> PathEntry {
+        PathEntry {
+            symlink: false,
+            file: true,
+            dir: false,
+            uid,
+            mode: 0o100_000 | permissions,
+        }
+    }
+
+    #[cfg(unix)]
+    fn link() -> PathEntry {
+        PathEntry {
+            symlink: true,
+            file: false,
+            dir: false,
+            uid: 0,
+            mode: 0o120_777,
+        }
+    }
+
+    /// `/usr/bin/bwrap` as a distribution installs it: root's, 0755, under
+    /// root's 0755 directories.
+    #[cfg(unix)]
+    fn installed() -> BackendFacts {
+        BackendFacts {
+            components: vec![dir(0, 0o755), dir(0, 0o755), dir(0, 0o755), file(0, 0o755)],
+            chain: vec![file(0, 0o755), dir(0, 0o755), dir(0, 0o755), dir(0, 0o755)],
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_root_owned_backend_no_other_account_can_write_is_trusted() {
+        assert!(backend_trusted(&installed()));
+        let mut owner_only = installed();
+        owner_only.chain[0] = file(0, 0o700);
+        owner_only.components[3] = file(0, 0o700);
+        assert!(
+            backend_trusted(&owner_only),
+            "an execute bit for root is enough"
+        );
+    }
+
+    /// Each unsafe fact alone refuses the backend: every case is the trusted
+    /// install with exactly that one fact changed.
+    #[cfg(unix)]
+    #[test]
+    fn each_unsafe_fact_alone_refuses_the_backend() {
+        assert!(
+            backend_trusted(&installed()),
+            "the starting point is trusted"
+        );
+        // What is unsafe, and the change that makes it so.
+        type Case = (&'static str, fn(&mut BackendFacts));
+        let cases: &[Case] = &[
+            ("the executable has no execute bit", |f| {
+                f.chain[0] = file(0, 0o644)
+            }),
+            ("the executable is group-writable", |f| {
+                f.chain[0] = file(0, 0o775)
+            }),
+            ("the executable is writable by anyone", |f| {
+                f.chain[0] = file(0, 0o757)
+            }),
+            ("the executable is another account's", |f| {
+                f.chain[0] = file(1000, 0o755)
+            }),
+            ("the executable is a directory", |f| {
+                f.chain[0] = dir(0, 0o755)
+            }),
+            ("the executable is a symlink", |f| f.chain[0] = link()),
+            ("a directory above it is group-writable", |f| {
+                f.chain[1] = dir(0, 0o775)
+            }),
+            ("a directory above it is world-writable, sticky", |f| {
+                f.chain[2] = dir(0, 0o1777)
+            }),
+            ("a directory above it is another account's", |f| {
+                f.chain[1] = dir(1000, 0o755)
+            }),
+            ("`/` is another account's", |f| {
+                f.chain[3] = dir(1000, 0o755)
+            }),
+            ("an entry above it is not a directory", |f| {
+                f.chain[2] = file(0, 0o755)
+            }),
+            ("a component as written is a symlink", |f| {
+                f.components.truncate(2);
+                f.components[1] = link();
+                f.chain.clear();
+            }),
+            (
+                "a component as written is a symlink, chain read anyway",
+                |f| {
+                    f.components[1] = link();
+                },
+            ),
+            ("nothing was resolved", |f| f.chain.clear()),
+            ("no component was read", |f| f.components.clear()),
+        ];
+        for &(unsafe_fact, change) in cases {
+            let mut facts = installed();
+            change(&mut facts);
+            assert_ne!(
+                facts,
+                installed(),
+                "{unsafe_fact}: the case changes nothing"
+            );
+            assert!(!backend_trusted(&facts), "trusted although {unsafe_fact}");
+        }
+    }
+
+    /// The facts are read from the file system as it is, a symlink described
+    /// and not followed. Nothing here depends on the directories above the
+    /// temporary root: no test asks whether a real path is trusted.
+    #[cfg(unix)]
+    #[test]
+    fn backend_facts_read_each_entry_without_following_a_symlink() {
+        use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+
+        let root = tempfile::tempdir().unwrap();
+        // macOS puts the temporary directory under the `/var` symlink.
+        let root = std::fs::canonicalize(root.path()).unwrap();
+        let backend = root.join("bwrap");
         std::fs::write(&backend, b"#!/bin/sh\nexit 0\n").unwrap();
-        std::fs::set_permissions(&backend, std::fs::Permissions::from_mode(0o700)).unwrap();
-        (root, backend)
-    }
+        std::fs::set_permissions(&backend, std::fs::Permissions::from_mode(0o710)).unwrap();
+        let owner = std::fs::metadata(&backend).unwrap().uid();
 
-    #[cfg(unix)]
-    #[test]
-    fn backend_validator_accepts_only_secure_executables() {
-        use std::os::unix::fs::PermissionsExt;
+        let facts = backend_facts(&backend).expect("an existing absolute path is read");
+        assert_eq!(facts.components.len(), backend.components().count());
+        assert!(facts.components.iter().all(|entry| !entry.symlink));
+        assert_eq!(facts.chain.len(), backend.ancestors().count());
+        let executable = facts.chain[0];
+        assert!(executable.file && !executable.dir && !executable.symlink);
+        assert_eq!((executable.uid, executable.mode & 0o7777), (owner, 0o710));
+        assert_eq!(facts.components.last(), Some(&executable));
+        assert!(facts.chain[1..].iter().all(|entry| entry.dir));
 
-        let (_root, backend) = test_backend();
-        assert!(trusted_backend_candidate_for_test(&backend));
+        let link_path = root.join("bwrap-link");
+        symlink(&backend, &link_path).unwrap();
+        let facts = backend_facts(&link_path).expect("a symlink is read, not followed");
+        assert!(facts.components.last().unwrap().symlink);
+        assert!(facts.chain.is_empty(), "the symlink's target was read");
+        assert!(!backend_trusted(&facts));
 
-        std::fs::set_permissions(&backend, std::fs::Permissions::from_mode(0o600)).unwrap();
-        assert!(!trusted_backend_candidate_for_test(&backend));
-
-        std::fs::set_permissions(&backend, std::fs::Permissions::from_mode(0o722)).unwrap();
-        assert!(!trusted_backend_candidate_for_test(&backend));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn backend_validator_rejects_symlinks_and_writable_ancestors() {
-        use std::os::unix::fs::{symlink, PermissionsExt};
-
-        let (root, backend) = test_backend();
-        let link = root.path().join("bwrap-link");
-        symlink(&backend, &link).unwrap();
-        assert!(!trusted_backend_candidate_for_test(&link));
-
-        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
-        assert!(!trusted_backend_candidate_for_test(&backend));
+        assert_eq!(backend_facts(Path::new("bwrap")), None, "a relative path");
+        assert_eq!(backend_facts(&root.join("missing")), None, "a missing path");
     }
 }

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { caseLadder, messageLadder } from "./ladder";
-import { DECISION_OUTCOMES, type DecisionOutcomeKey } from "./words";
+import { DECISION_OUTCOMES, MESSAGE_OUTCOMES, type DecisionOutcomeKey } from "./words";
 
 function marks(outcomeKey: DecisionOutcomeKey, mode = "monitor") {
   return Object.fromEntries(caseLadder({ outcomeKey, mode, decidedBy: "rules" }).map((step) => [step.key, step.mark]));
@@ -40,15 +40,34 @@ describe("a case's four steps", () => {
         }
       }
     }
-    for (const step of [...messageLadder(true), ...messageLadder(false)]) {
-      expect(step.mark).not.toBe("verified");
-      expect(step.mark).not.toBe("waiting");
+    for (const outcomeKey of MESSAGE_OUTCOMES) {
+      for (const step of messageLadder(outcomeKey)) {
+        expect(step.mark, `${outcomeKey} ${step.key}`).not.toBe("verified");
+        expect(step.mark, `${outcomeKey} ${step.key}`).not.toBe("waiting");
+      }
     }
   });
 
   it("never enforces a message: observe records and does not block", () => {
-    const steps = messageLadder(true);
+    const steps = messageLadder("declined_by_agent");
     expect(steps.map((step) => step.mark)).toEqual(["done", "done", "not_applicable", "not_applicable"]);
-    expect(messageLadder(false)[1].mark).toBe("unknown");
+    expect(messageLadder("not_seen")[1].mark).toBe("unknown");
+  });
+
+  /**
+   * An outcome the record could not see is said as not seen, never "not
+   * recorded", which reads as a recording fault; and a refusal by the guard
+   * names who decided. FAILS ON REVERT: the old ladder printed "who decided
+   * was not recorded" for both.
+   */
+  it("says an unseen outcome was not seen and names the guard when it refused", () => {
+    for (const outcomeKey of ["not_seen", "unplaced"] as const) {
+      const decided = messageLadder(outcomeKey)[1];
+      expect(decided.words).toBe("who decided could not be seen");
+      expect(decided.words).not.toContain("recorded");
+    }
+    const stopped = messageLadder("stopped_by_innerwarden");
+    expect(stopped[1]).toMatchObject({ mark: "done", words: "the guard refused what your agent tried" });
+    expect(stopped[2]).toMatchObject({ mark: "done", words: "the guard refused it" });
   });
 });
