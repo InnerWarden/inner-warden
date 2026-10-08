@@ -473,6 +473,37 @@ jobs:
           files: dist/*
           fail_on_unmatched_files: true
 
+      # The published cut must be traceable to its source. 1.5.2 was published
+      # (binaries, npm, deb/rpm) from d98eabd by workflow_dispatch, and the
+      # `guard-v1.5.2` tag the runbook expects was never pushed to this repo,
+      # so nothing tied the artefacts to a commit. A dispatch run cannot push a
+      # tag (contents: read), so it says so, red, until a person does: the
+      # release itself is already out, this is the record of where it came from.
+      - name: The source carries guard-vX.Y.Z at the commit that was built
+        shell: bash
+        env:
+          VER: ${{ steps.version.outputs.guard_version }}
+          REPO: ${{ github.repository }}
+          BUILT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          tag="guard-v${VER}"
+          refs=$(git ls-remote "https://github.com/${REPO}.git" "refs/tags/${tag}" "refs/tags/${tag}^{}")
+          # An annotated tag lists the tag object and, peeled (^{}), the commit;
+          # a lightweight one lists the commit alone. Either way the last line
+          # names the commit.
+          commit=$(printf '%s\n' "$refs" | awk 'NF' | tail -n1 | cut -f1)
+          if [ -z "$commit" ]; then
+            echo "::error::$tag does not exist in ${REPO}. Push it at the built commit:"
+            echo "::error::  git tag -a $tag ${BUILT} -m 'InnerWarden Community ${VER}' && git push origin $tag"
+            exit 1
+          fi
+          if [ "$commit" != "$BUILT" ]; then
+            echo "::error::$tag in ${REPO} points at $commit, but ${BUILT} was built and published."
+            exit 1
+          fi
+          echo "$tag -> $commit, the commit that was built"
+
       - name: Commit updated installer, manifest, and key back to the releases repo
         shell: bash
         run: |

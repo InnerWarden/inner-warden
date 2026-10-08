@@ -111,3 +111,36 @@ fn the_published_version_is_measured_from_the_binary() {
          deriving its own"
     );
 }
+
+/// A published cut must be traceable to the commit it was built from.
+///
+/// 1.5.2 shipped binaries, npm and deb/rpm from d98eabd by `workflow_dispatch`
+/// and the `guard-v1.5.2` source tag was never pushed; nothing in the run
+/// noticed. The publish job now checks this repository for the tag at the
+/// built commit and ends red without it.
+///
+/// FAILS ON REVERT: remove the step and nothing compares the source tag with
+/// the built commit again.
+#[test]
+fn a_release_checks_its_source_tag_names_the_built_commit() {
+    let step = WORKFLOW
+        .split("- name: ")
+        .find(|s| s.starts_with("The source carries guard-vX.Y.Z at the commit that was built"))
+        .expect("no step checks the source tag of the published cut");
+    for needed in [
+        "git ls-remote",
+        "refs/tags/${tag}",
+        "refs/tags/${tag}^{}",
+        "github.sha",
+        "exit 1",
+    ] {
+        assert!(step.contains(needed), "the tag check lost `{needed}`:\n{step}");
+    }
+    let publish = WORKFLOW
+        .find("- name: Publish rolling iw-guard release")
+        .expect("rolling publish");
+    let check = WORKFLOW
+        .find("- name: The source carries guard-vX.Y.Z")
+        .expect("tag check");
+    assert!(check > publish, "the check runs once the cut is published");
+}
