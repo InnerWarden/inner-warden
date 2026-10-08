@@ -1,4 +1,5 @@
-import { expect, test, type Page } from "@playwright/test";
+import { expect, type Page } from "@playwright/test";
+import { test } from "./clock";
 import { FIXTURE_NOW_MS, fulfillJson, guardRoute } from "./support";
 
 /**

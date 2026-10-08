@@ -1,5 +1,6 @@
-import { expect, test } from "@playwright/test";
-import { expectHonestUpsell, fulfillJson, guardRoute, META } from "./support";
+import { expect } from "@playwright/test";
+import { test } from "./clock";
+import { expectHonestUpsell, FIXTURE_NOW_MS, fulfillJson, guardRoute, META } from "./support";
 
 /**
  * Where Community says what Active Defence adds: the card for attacks on this
@@ -81,7 +82,7 @@ test.describe("CJC-J006 the Active Defence card reads the host", () => {
    */
   test("the shell reads guard/meta once per poll, not once per reader", async ({ page }) => {
     let metaRequests = 0;
-    await page.clock.install();
+    await page.clock.install({ time: FIXTURE_NOW_MS });
     await page.route(guardRoute("meta"), (route) => {
       metaRequests += 1;
       return fulfillJson(route, META);
@@ -120,7 +121,7 @@ test.describe("CJC-J006 the Active Defence card reads the host", () => {
     let release!: () => void;
     const held = new Promise<void>((resolve) => { release = resolve; });
     let answered = 0;
-    await page.clock.install();
+    await page.clock.install({ time: FIXTURE_NOW_MS });
     await page.route(guardRoute("meta"), async (route) => {
       if (answered === 0) await held;
       answered += 1;
