@@ -3,6 +3,88 @@
 All notable changes to InnerWarden are documented here. This project
 follows semantic versioning.
 
+## Unreleased
+
+### Upgrade notes: what to do
+
+- **An agent can no longer install a package whose name is one letter off a
+  popular one.** `pip install reqeusts` or `npm install expresss` run by an
+  agent is now held for review and blocked under the default policy; run by
+  you with `innerwarden check` it is `review`, never `deny`. If a package you
+  really use is held, install it yourself, or allow it for the agent.
+- **`innerwarden status` counts only what your agents sent.** A check you ran
+  by hand (and every drill or verify run) is no longer counted as proof that
+  your agent's commands reach the guard, so an install whose agent has not
+  run a command since it was wired now says so instead of reading as on and
+  screening.
+
+### Added
+
+- **Look-alike package names are caught on install.** An install through
+  pip, pipx, uv, poetry, pipenv, npm, yarn, pnpm or bun that names a package
+  one edit away (a letter added, dropped, changed, or two swapped) from a
+  popular PyPI or npm package, and is not itself a known package, is flagged
+  `package_typosquat` and named with the package it imitates. This is how
+  typosquatted packages, and package names an AI agent made up, get
+  installed. Real packages that sit one letter from each other (scipy and
+  scapy, react and preact) are known and pass. Names shorter than five
+  letters are never compared. The list ships in the repository
+  (`crates/agent-guard/data/popular-packages.txt`).
+- **Library users: a connected agent's registry row keeps its systemd unit.**
+  `Registry::connect` records the system service the process runs in, read
+  only from the cgroup the kernel reports for it, so the row survives a
+  service restart that changes the pid. `ConnectedAgent`, `PersistedAgent`
+  and `AgentSummary` gain `systemd_unit`; `connect_with_facts_and_unit` is
+  new. Registry files written by an earlier version load unchanged, and a row
+  without a unit is written without the key.
+
+### Changed
+
+- **`innerwarden --version` names the paid release too.** With Active
+  Defence installed it adds, on stderr, that `innerwarden-ctl --version`
+  gives the host stack's release. stdout stays one line.
+- **`upgrade` names what is still running the old binary correctly.** Its
+  closing advice called whatever answered on 127.0.0.1:8787 "the dashboard".
+  It now names the Community dashboard on 8788 and an `innerwarden serve` on
+  8787 each by its own answer, and says nothing about anything else.
+
+### Fixed
+
+- **A download run in two steps is caught.** `f=$(curl -s URL) && echo "$f"
+  > /tmp/r.sh && sh /tmp/r.sh` was allowed, and so were the same steps with
+  `wget`, `printf`, `tee`, here-strings, heredocs, `cat >`, a copy of the
+  file, or `chmod +x` and `./r.sh`. A value fetched into a shell variable is
+  now followed into the file it is written to, and running that file is
+  screened like any other downloaded script (review, and blocked for an
+  agent; denied when the fetch has no TLS, a bare IP, a paste host or a
+  decoder). Feeding the variable to a shell's input (`sh <<<"$f"`) is denied.
+  Writing a fetched value to a file nobody runs (`echo "$f" > data.json`)
+  stays allowed.
+- **Sourcing a downloaded file with `.` is seen.** `curl -o r.sh URL && .
+  ./r.sh` was allowed while `source ./r.sh` was caught.
+- **An MCP wrapper whose proxy binary is gone is not reported as guarded.**
+  The agent list, the dashboard and `status` judged an MCP agent's wrapper by
+  its text, so a config pointing at a removed or moved `innerwarden` read
+  "guarded" while every one of its servers failed to start. It now says the
+  proxy program does not exist and offers `innerwarden agents connect <name>`
+  in the mode the wrappers had. Nothing is unwrapped.
+
+### Project
+
+- The benchmark gate holds the new cases: 153 attacks caught, every one
+  blocked for an agent, and 0 of 98 ordinary commands flagged.
+- The release job fails when the `guard-vX.Y.Z` source tag is missing or
+  names a different commit than the one it built.
+- A test pins that the `.deb` and `.rpm` ship `/usr/bin/innerwarden` and no
+  `iw` shortcut (`iw` is the Linux wireless tool's name).
+- The coverage job reads its configuration again (the engine name is
+  case-sensitive, so the 75% floor and the excludes were silently ignored)
+  and fails if the configuration is ever rejected.
+- Every dashboard journey test runs at a fixed clock, so the suite no longer
+  breaks when the calendar moves past its fixtures.
+- The CLI's tests are no longer answered by an `innerwarden-ctl` installed on
+  the machine running them.
+
 ## 1.5.2 - 2026-10-07
 
 ### Upgrade notes: what to do
