@@ -469,6 +469,12 @@ pub const PERSISTENCE_INDICATORS: &[&str] = &[
     "/etc/cron",
     ".bashrc",
     ".bash_profile",
+    ".bash_login",
+    ".zshrc",
+    ".zprofile",
+    ".zlogin",
+    ".zshenv",
+    "config.fish",
     ".profile",
     "/etc/profile",
     "/etc/rc.local",
@@ -3000,7 +3006,16 @@ pub fn check_persistence(content: &str) -> Option<(&'static str, u32)> {
             // independently (reverse shell, download/execute, tamper, etc.).
             let score = if matches!(
                 *indicator,
-                ".bashrc" | ".bash_profile" | ".profile" | "/etc/profile"
+                ".bashrc"
+                    | ".bash_profile"
+                    | ".bash_login"
+                    | ".zshrc"
+                    | ".zprofile"
+                    | ".zlogin"
+                    | ".zshenv"
+                    | "config.fish"
+                    | ".profile"
+                    | "/etc/profile"
             ) {
                 10
             } else {
@@ -3010,6 +3025,193 @@ pub fn check_persistence(content: &str) -> Option<(&'static str, u32)> {
         }
     }
     None
+}
+
+/// Whether `path` is a file a shell runs at login or start-up.
+fn is_shell_startup_file(path: &str) -> bool {
+    let path = path.trim_matches(['\'', '"']).to_ascii_lowercase();
+    [
+        ".bashrc",
+        ".bash_profile",
+        ".bash_login",
+        ".profile",
+        ".zshrc",
+        ".zprofile",
+        ".zlogin",
+        ".zshenv",
+        "/etc/profile",
+        "/etc/bash.bashrc",
+        ".config/fish/config.fish",
+    ]
+    .iter()
+    .any(|suffix| path.ends_with(suffix))
+        || path.contains("/etc/profile.d/")
+        || path.starts_with("/etc/zsh/")
+}
+
+/// The files a command's output redirections write: `> f`, `>> f`, `>>f`,
+/// `1>> f`.
+fn output_redirect_targets(words: &[String]) -> Vec<String> {
+    let mut targets = Vec::new();
+    let mut index = 0usize;
+    while let Some(word) = words.get(index) {
+        index += 1;
+        let rest = word.trim_start_matches(|c: char| c.is_ascii_digit());
+        if !rest.starts_with('>') || rest.starts_with(">&") || rest.starts_with(">(") {
+            continue;
+        }
+        let target = rest.trim_start_matches('>').trim_start_matches('|');
+        if target.is_empty() {
+            if let Some(next) = words.get(index) {
+                targets.push(next.clone());
+                index += 1;
+            }
+        } else {
+            targets.push(target.to_string());
+        }
+    }
+    targets
+}
+
+/// The text an `echo`/`printf` writes, or a here-string feeds: its arguments
+/// with redirections removed and `\n` read as a line break.
+fn written_text(words: &[String], command_index: usize) -> Option<String> {
+    let name = token_basename(&words[command_index]).to_ascii_lowercase();
+    let mut parts = Vec::new();
+    let mut index = command_index + 1;
+    while let Some(word) = words.get(index) {
+        index += 1;
+        let rest = word.trim_start_matches(|c: char| c.is_ascii_digit());
+        if rest.starts_with('>') || rest.starts_with('<') {
+            if let Some(here) = word.strip_prefix("<<<") {
+                if here.is_empty() {
+                    if let Some(next) = words.get(index) {
+                        parts.push(next.clone());
+                        index += 1;
+                    }
+                } else {
+                    parts.push(here.to_string());
+                }
+                continue;
+            }
+            if rest.trim_start_matches(['>', '<', '|']).is_empty() {
+                index += 1;
+            }
+            continue;
+        }
+        if matches!(name.as_str(), "echo" | "printf") {
+            if parts.is_empty()
+                && name == "echo"
+                && matches!(word.as_str(), "-e" | "-n" | "-E" | "-ne" | "-en")
+            {
+                continue;
+            }
+            parts.push(word.clone());
+        }
+    }
+    let text = parts.join(" ").replace("\\n", "\n");
+    (!text.trim().is_empty()).then_some(text)
+}
+
+/// Text a command writes into a shell startup file, with the file: what
+/// `echo`/`printf` redirect into it, what is piped or here-string-fed to a
+/// `tee` of it, and the body of a heredoc redirected into it. The caller
+/// analyses each text as the command it becomes at the next login.
+pub(crate) fn startup_file_payloads(content: &str) -> Vec<(String, String)> {
+    let mut payloads = Vec::new();
+    if !content.contains('>') && !content.to_ascii_lowercase().contains("tee") {
+        return payloads;
+    }
+    // Heredocs: `cat >> ~/.bashrc <<'EOF' ... EOF`, `tee -a f <<EOF ... EOF`.
+    static HEREDOC: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let heredoc = HEREDOC.get_or_init(|| {
+        regex::Regex::new(r#"<<-?\s*['"]?([A-Za-z_][A-Za-z0-9_]*)['"]?"#)
+            .expect("static heredoc regex")
+    });
+    let lines: Vec<&str> = content.lines().collect();
+    let mut line_index = 0usize;
+    while line_index < lines.len() {
+        let line = lines[line_index];
+        line_index += 1;
+        let Some(captures) = heredoc.captures(line).filter(|_| !line.contains("<<<")) else {
+            continue;
+        };
+        let tag = captures.get(1).map(|m| m.as_str()).unwrap_or_default();
+        let mut body = Vec::new();
+        while line_index < lines.len() {
+            let candidate = lines[line_index];
+            line_index += 1;
+            if candidate.trim() == tag {
+                break;
+            }
+            body.push(candidate);
+        }
+        let words = shell_tokens(line);
+        let file = output_redirect_targets(&words)
+            .into_iter()
+            .chain(tee_targets(&words))
+            .find(|target| is_shell_startup_file(target));
+        if let (Some(file), false) = (file, body.is_empty()) {
+            payloads.push((file, body.join("\n")));
+        }
+    }
+    // echo/printf redirected, or piped / here-string-fed to tee.
+    let segments = shell_command_segments(content);
+    for (index, segment) in segments.iter().enumerate() {
+        let words = shell_tokens(segment);
+        let Some(command_index) = effective_command_index(&words) else {
+            continue;
+        };
+        let name = token_basename(&words[command_index]).to_ascii_lowercase();
+        let file = if name == "tee" {
+            tee_targets(&words)
+                .into_iter()
+                .find(|t| is_shell_startup_file(t))
+        } else {
+            output_redirect_targets(&words)
+                .into_iter()
+                .find(|t| is_shell_startup_file(t))
+        };
+        let Some(file) = file else {
+            continue;
+        };
+        let text = written_text(&words, command_index).or_else(|| {
+            // `echo X | tee -a ~/.bashrc`: the text comes down the pipe.
+            let previous = *segments.get(index.checked_sub(1)?)?;
+            if !segments_are_piped(content, previous, segment) {
+                return None;
+            }
+            let words = shell_tokens(previous);
+            let command_index = effective_command_index(&words)?;
+            matches!(
+                token_basename(&words[command_index])
+                    .to_ascii_lowercase()
+                    .as_str(),
+                "echo" | "printf"
+            )
+            .then(|| written_text(&words, command_index))
+            .flatten()
+        });
+        if let Some(text) = text {
+            payloads.push((file, text));
+        }
+    }
+    payloads
+}
+
+/// The files a `tee` writes (its non-option arguments).
+fn tee_targets(words: &[String]) -> Vec<String> {
+    let Some(command_index) = effective_command_index(words) else {
+        return Vec::new();
+    };
+    if !token_basename(&words[command_index]).eq_ignore_ascii_case("tee") {
+        return Vec::new();
+    }
+    words[command_index + 1..]
+        .iter()
+        .filter(|word| !word.starts_with('-') && !word.starts_with(['<', '>']))
+        .cloned()
+        .collect()
 }
 
 /// Check for temp directory execution. Returns (dir, score).
@@ -3100,54 +3302,92 @@ fn mktemp_directory(text: &str) -> Option<String> {
 fn relative_execution_in_temp_directory(content: &str) -> Option<&'static str> {
     let mut cwd: Option<String> = None;
     let mut variables = std::collections::HashMap::new();
+    // A subshell's `cd` ends with it: the working directory each open `(`
+    // restores at its `)`. A `{ ...; }` group shares the shell, so it saves
+    // nothing.
+    let mut subshells: Vec<Option<String>> = Vec::new();
     for segment in shell_command_segments(content) {
+        // The tokenizer drops grouping characters, so read them from the
+        // segment text: leading `(` open subshells, trailing `)` close them
+        // (less any `$(`, `<(` or `(` opened inside the segment itself).
         let words = shell_tokens(segment);
-        record_literal_assignments(&words, &mut variables);
-        // `d=$(mktemp -d)`: the variable names a fresh temp directory.
-        if let Some((name, value)) = segment.trim_start().split_once('=') {
-            if is_environment_assignment(&format!("{name}=x"))
-                && !name.contains(char::is_whitespace)
-            {
-                if let Some(directory) = mktemp_directory(value) {
-                    variables.insert(name.to_string(), directory);
-                }
-            }
+        let head = segment.trim_start();
+        let lead: String = head
+            .chars()
+            .take_while(|c| matches!(c, '(' | '{' | ' ' | '\t'))
+            .collect();
+        let opens = lead.matches('(').count();
+        let body = &head[lead.len()..];
+        let tail: String = body
+            .chars()
+            .rev()
+            .take_while(|c| matches!(c, ')' | '}' | ' ' | '\t' | ';'))
+            .collect();
+        let closes = tail
+            .matches(')')
+            .count()
+            .saturating_sub(body.matches('(').count());
+        for _ in 0..opens {
+            subshells.push(cwd.clone());
         }
-        if let Some(command_index) = effective_command_index(&words) {
-            let name = token_basename(&words[command_index]).to_ascii_lowercase();
-            if matches!(name.as_str(), "cd" | "pushd") {
-                // `cd "$(mktemp -d)"`
-                if let Some(directory) = mktemp_directory(segment) {
-                    cwd = Some(directory);
-                    continue;
-                }
-                // `cd`, `cd -`, `cd ~/x`, `cd "$HOME"`: somewhere this command
-                // cannot name, and not one it resolves against the old cwd.
-                let target = words[command_index + 1..]
-                    .iter()
-                    .find(|argument| !argument.starts_with('-') || argument.as_str() == "-")
-                    .map(|argument| expand_literal_path(argument, &variables));
-                if target
-                    .as_deref()
-                    .is_none_or(|target| target == "-" || target.starts_with(['~', '$']))
-                {
-                    cwd = None;
-                    continue;
-                }
-            }
-        }
-        if let Some(next) = command_directory_change(&words, cwd.as_deref(), &variables) {
-            cwd = Some(next);
-            continue;
-        }
-        let Some(directory) = cwd.as_deref().and_then(temp_directory_of) else {
-            continue;
-        };
-        if runs_a_file_from_the_working_directory(&words) {
+        if let Some(directory) = segment_temp_execution(body, &words, &mut cwd, &mut variables) {
             return Some(directory);
+        }
+        for _ in 0..closes {
+            if let Some(saved) = subshells.pop() {
+                cwd = saved;
+            }
         }
     }
     None
+}
+
+/// One segment of [`relative_execution_in_temp_directory`]: update the working
+/// directory and variables, or report a relative execution inside a temp one.
+fn segment_temp_execution(
+    segment: &str,
+    words: &[String],
+    cwd: &mut Option<String>,
+    variables: &mut std::collections::HashMap<String, String>,
+) -> Option<&'static str> {
+    record_literal_assignments(words, variables);
+    // `d=$(mktemp -d)`: the variable names a fresh temp directory.
+    if let Some((name, value)) = segment.split_once('=') {
+        if is_environment_assignment(&format!("{name}=x")) && !name.contains(char::is_whitespace) {
+            if let Some(directory) = mktemp_directory(value) {
+                variables.insert(name.to_string(), directory);
+            }
+        }
+    }
+    if let Some(command_index) = effective_command_index(words) {
+        let name = token_basename(&words[command_index]).to_ascii_lowercase();
+        if matches!(name.as_str(), "cd" | "pushd") {
+            // `cd "$(mktemp -d)"`
+            if let Some(directory) = mktemp_directory(segment) {
+                *cwd = Some(directory);
+                return None;
+            }
+            // `cd`, `cd -`, `cd ~/x`, `cd "$HOME"`: somewhere this command
+            // cannot name, and not one it resolves against the old cwd.
+            let target = words[command_index + 1..]
+                .iter()
+                .find(|argument| !argument.starts_with('-') || argument.as_str() == "-")
+                .map(|argument| expand_literal_path(argument, variables));
+            if target
+                .as_deref()
+                .is_none_or(|target| target == "-" || target.starts_with(['~', '$']))
+            {
+                *cwd = None;
+                return None;
+            }
+        }
+    }
+    if let Some(next) = command_directory_change(words, cwd.as_deref(), variables) {
+        *cwd = Some(next);
+        return None;
+    }
+    let directory = cwd.as_deref().and_then(temp_directory_of)?;
+    runs_a_file_from_the_working_directory(words).then_some(directory)
 }
 
 /// Whether the command runs a program or script named by a path relative to
@@ -7247,6 +7487,11 @@ mod tests {
             ("cd `mktemp -d` && sh ./x", "/tmp/"),
             ("cd /tmp && sudo ./x", "/tmp/"),
             ("cd /tmp && . ./env.sh", "/tmp/"),
+            // A subshell or a brace group runs in the directory it moved to.
+            ("(cd /tmp && ./x)", "/tmp/"),
+            ("{ cd /tmp; ./x; }", "/tmp/"),
+            ("(cd /dev/shm; sh p)", "/dev/shm/"),
+            ("{ cd /tmp && ( ./x ); }", "/tmp/"),
         ] {
             assert_eq!(
                 check_tmp_execution(command),
@@ -7271,6 +7516,10 @@ mod tests {
             "d=$(mktemp -d -p /opt/build) && cd \"$d\" && ./configure",
             "cd ./tmp && ./x",
             "cd /tmpfiles && ./x",
+            // A subshell's cd ends with it.
+            "(cd /tmp && ls); ./build.sh",
+            "(cd /tmp && make); ./run.sh",
+            "{ cd /tmp; ls; }",
         ] {
             assert_eq!(
                 check_tmp_execution(command),
