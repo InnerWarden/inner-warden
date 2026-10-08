@@ -10,8 +10,16 @@ follows semantic versioning.
 - **An agent can no longer install a package whose name is one letter off a
   popular one.** `pip install reqeusts` or `npm install expresss` run by an
   agent is now held for review and blocked under the default policy; run by
-  you with `innerwarden check` it is `review`, never `deny`. If a package you
-  really use is held, install it yourself, or allow it for the agent.
+  you with `innerwarden check` it is `review`, never `deny`. The same holds
+  when the look-alike is run or downloaded (`npx expresss`, `uvx pytset`,
+  `pip download reqeusts`). If a package you really use is held, install it
+  yourself, or allow it for the agent.
+- **An agent command the guard cannot parse is held when it fetches and
+  runs.** A command that does not parse as shell and names both a download
+  (curl, wget, aria2c, axel, a Python or Node network one-liner) and a way to
+  run code (sh, bash, eval, source, `./file`, `chmod +x`, an interpreter) is
+  `review` and blocked for an agent. One that names only one of the two, or
+  neither, is unchanged.
 - **`innerwarden status` counts only what your agents sent.** A check you ran
   by hand (and every drill or verify run) is no longer counted as proof that
   your agent's commands reach the guard, so an install whose agent has not
@@ -30,6 +38,22 @@ follows semantic versioning.
   scapy, react and preact) are known and pass. Names shorter than five
   letters are never compared. The list ships in the repository
   (`crates/agent-guard/data/popular-packages.txt`).
+- **Look-alike names are caught when a package is run or downloaded, not
+  only installed.** `npx`, `npm exec`, `pnpm dlx`, `yarn dlx`, `bunx`,
+  `uvx`, `uv tool run`, `uv tool install`, `pipx run`, `pip download` and
+  `pip wheel` are read with the same list and rules, including the package
+  named by `npx -p`, `uvx --from`/`--with` and `pipx run --spec`. A run
+  executes the package the moment it lands, and a source download runs its
+  build code. Only the run's package is read: what follows it is that
+  package's own arguments, so `pipx run cowsay reqeusts` is no longer
+  flagged for its argument.
+- **A fetch-and-run the shell grammar cannot parse is held.** When the
+  parser rejected a command no structural check ran, and the fallback only
+  fired if a text rule had already recognised the shape, so
+  `aria2c URL -o r && chmod +x r && ./r )`, or a Python one-liner that saves
+  a payload followed by `bash r.sh )`, was allowed. An unparseable command
+  that names both a fetch and a way to run code is now `fetch_exec_unparsed`:
+  review, blocked for an agent.
 - **Library users: a connected agent's registry row keeps its systemd unit.**
   `Registry::connect` records the system service the process runs in, read
   only from the cgroup the kernel reports for it, so the row survives a
@@ -71,8 +95,10 @@ follows semantic versioning.
 
 ### Project
 
-- The benchmark gate holds the new cases: 153 attacks caught, every one
-  blocked for an agent, and 0 of 98 ordinary commands flagged.
+- The benchmark gate holds the new cases: 165 attacks caught, every command
+  attack blocked for an agent, and 0 of 109 ordinary commands flagged
+  (including unparseable ones that only fetch or only run, and `npx`/`uvx`
+  runs of real packages).
 - The release job fails when the `guard-vX.Y.Z` source tag is missing or
   names a different commit than the one it built.
 - A test pins that the `.deb` and `.rpm` ship `/usr/bin/innerwarden` and no
