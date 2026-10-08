@@ -3979,6 +3979,7 @@ pub fn check_download_execute_staged(content: &str) -> Option<u32> {
         String,
         Option<String>,
         std::collections::HashMap<String, String>,
+        bool,
     )>::new();
     let mut cwd = None;
     let mut variables = std::collections::HashMap::new();
@@ -3988,17 +3989,19 @@ pub fn check_download_execute_staged(content: &str) -> Option<u32> {
             cwd = Some(next);
             continue;
         }
+        let born_executable = remote_copy_keeps_mode(words);
         downloaded.extend(download_output_targets(words).into_iter().map(|target| {
             (
                 index,
                 resolve_command_target(&target, cwd.as_deref(), &variables),
                 cwd.clone(),
                 variables.clone(),
+                born_executable,
             )
         }));
     }
 
-    for (download_index, target, download_cwd, download_variables) in downloaded {
+    for (download_index, target, download_cwd, download_variables, born_executable) in downloaded {
         if !target.is_empty()
             && target_executes_after(
                 &tokenized,
@@ -4008,6 +4011,7 @@ pub fn check_download_execute_staged(content: &str) -> Option<u32> {
                 download_variables,
                 &joins,
                 &unreachable,
+                born_executable,
             )
         {
             return Some(25);
@@ -4052,6 +4056,7 @@ pub fn check_download_execute_staged(content: &str) -> Option<u32> {
                 variables,
                 &joins,
                 &unreachable,
+                false,
             )
         {
             return Some(25);
@@ -4194,6 +4199,7 @@ fn download_pipeline_dd_output_targets(content: &str) -> Vec<(usize, String)> {
         if command
             .as_deref()
             .is_some_and(|command| matches!(command, "curl" | "wget" | "fetch" | "aria2c"))
+            || command_index.is_some_and(|index| reads_remote_content(&words[index..]))
         {
             downloader_in_pipeline = true;
             continue;
@@ -4941,6 +4947,9 @@ enum TargetExecution {
     Direct,
 }
 
+// One more than clippy's limit since a remote copy that keeps the mode
+// (`rsync -a`) made the file executable before any `chmod` this follows.
+#[allow(clippy::too_many_arguments)]
 fn target_executes_after(
     commands: &[Vec<String>],
     start: usize,
@@ -4949,9 +4958,13 @@ fn target_executes_after(
     mut variables: std::collections::HashMap<String, String>,
     joins: &[ShellCommandJoin],
     unreachable: &std::collections::HashSet<usize>,
+    born_executable: bool,
 ) -> bool {
     let mut targets = std::collections::HashSet::from([target.to_owned()]);
     let mut executable_targets = std::collections::HashSet::new();
+    if born_executable {
+        executable_targets.insert(target.to_owned());
+    }
     // Follow the execution path where the producer succeeded and created the
     // target. A literal `false && ...` is a real reachability barrier; unknown
     // commands stay conservatively reachable.
@@ -6150,8 +6163,220 @@ pub(crate) fn other_download_output_targets(command: &str, args: &[String]) -> O
                     .collect(),
             )
         }
-        _ => interpreter_download_targets(command, args),
+        _ => remote_read_targets(command, args)
+            .or_else(|| interpreter_download_targets(command, args)),
     }
+}
+
+/// Where a reader of remote content writes it: `Some(files)` when `command
+/// args` reads an object store, a cluster, a container, a remote host or a
+/// remote git ref, with the local files it writes (empty when it writes only
+/// to stdout); `None` for anything else.
+///
+/// `aws s3 cp s3://b/k - | bash`, `kubectl get cm x -o jsonpath=... > r.sh;
+/// sh r.sh` and `scp host:/x r.sh && sh r.sh` run bytes from somewhere else
+/// exactly as a curl does, and were not seen as a fetch because only the
+/// HTTP downloaders were.
+fn remote_read_targets(command: &str, args: &[String]) -> Option<Vec<String>> {
+    let args: Vec<String> = args
+        .iter()
+        .map(|arg| arg.trim_matches(['\'', '"']).to_string())
+        .collect();
+    let lower: Vec<String> = args.iter().map(|arg| arg.to_ascii_lowercase()).collect();
+    let sub = |index: usize| lower.get(index).map(String::as_str);
+    let stdout = || Some(Vec::new());
+    // The local file a copy from `source` to `destination` writes.
+    let local = |source: &str, destination: &str| -> Option<Vec<String>> {
+        if destination == "-" {
+            return Some(Vec::new());
+        }
+        let name = source
+            .trim_end_matches('/')
+            .rsplit(['/', ':'])
+            .next()
+            .unwrap_or_default();
+        Some(vec![if destination.ends_with('/') || destination == "." {
+            format!("{}/{name}", destination.trim_end_matches('/'))
+        } else {
+            destination.to_string()
+        }])
+    };
+    // A copy whose source is remote: the first positional matching `remote`,
+    // and the positional after it.
+    let copy = |from: usize, remote: &dyn Fn(&str) -> bool| -> Option<Vec<String>> {
+        let positional: Vec<&String> = args[from.min(args.len())..]
+            .iter()
+            .filter(|arg| !arg.starts_with('-'))
+            .collect();
+        let index = positional.iter().position(|arg| remote(arg))?;
+        match positional.get(index + 1) {
+            Some(destination) => local(positional[index], destination),
+            None => Some(Vec::new()),
+        }
+    };
+    let has_option = |names: &[&str]| {
+        lower.iter().any(|arg| {
+            names
+                .iter()
+                .any(|name| arg == name || arg.starts_with(&format!("{name}=")))
+        }) || names.iter().any(|name| {
+            name.len() == 2
+                && lower
+                    .iter()
+                    .any(|arg| arg.starts_with(name) && !arg.starts_with("--"))
+        })
+    };
+    let host_path = |arg: &str| {
+        (arg.contains(':') && !arg.starts_with('/') && !arg.starts_with("./"))
+            || arg.starts_with("rsync://")
+    };
+    match command {
+        "aws" => match (sub(0), sub(1)) {
+            (Some("s3"), Some("cp" | "mv" | "sync")) => copy(2, &|arg: &str| {
+                arg.to_ascii_lowercase().starts_with("s3://")
+            }),
+            (Some("s3api"), Some("get-object")) => {
+                let positional: Vec<&String> = args[2..]
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, arg)| {
+                        !arg.starts_with('-')
+                            && !args[2..]
+                                .get(index.wrapping_sub(1))
+                                .is_some_and(|previous| previous.starts_with("--"))
+                    })
+                    .map(|(_, arg)| arg)
+                    .collect();
+                Some(
+                    positional
+                        .last()
+                        .map(|file| file.to_string())
+                        .into_iter()
+                        .collect(),
+                )
+            }
+            _ => None,
+        },
+        "gsutil" => match sub(0) {
+            Some("cat") => stdout(),
+            Some("cp" | "mv" | "rsync") => copy(1, &|arg: &str| {
+                arg.to_ascii_lowercase().starts_with("gs://")
+            }),
+            _ => None,
+        },
+        "gcloud" => match (sub(0), sub(1)) {
+            (Some("storage"), Some("cat")) => stdout(),
+            (Some("storage"), Some("cp" | "mv" | "rsync")) => copy(2, &|arg: &str| {
+                arg.to_ascii_lowercase().starts_with("gs://")
+            }),
+            _ => None,
+        },
+        "az" => (sub(0) == Some("storage") && sub(1) == Some("blob") && sub(2) == Some("download"))
+            .then(|| {
+                option_value(&args, &["-f"], &["--file"])
+                    .into_iter()
+                    .collect()
+            }),
+        "kubectl" | "oc" => match sub(0) {
+            Some("get") if has_option(&["-o", "--output", "--template"]) => stdout(),
+            Some("exec" | "logs" | "debug" | "run") => stdout(),
+            Some("cp") => copy(1, &|arg: &str| host_path(arg)),
+            _ => None,
+        },
+        "docker" | "podman" | "nerdctl" => match sub(0) {
+            Some("run" | "exec" | "logs") => stdout(),
+            Some("cp") => copy(1, &|arg: &str| host_path(arg)),
+            _ => None,
+        },
+        "rclone" => match sub(0) {
+            Some("cat") => stdout(),
+            Some("copy" | "copyto" | "move" | "moveto" | "sync") => {
+                copy(1, &|arg: &str| host_path(arg))
+            }
+            _ => None,
+        },
+        "scp" | "rsync" | "sftp" => {
+            let positional: Vec<&String> =
+                args.iter().filter(|arg| !arg.starts_with('-')).collect();
+            let (destination, sources) = positional.split_last()?;
+            let source = sources.iter().find(|arg| host_path(arg))?;
+            if host_path(destination) {
+                return None;
+            }
+            local(source, destination)
+        }
+        "git" => match sub(0) {
+            Some("show" | "cat-file") => args[1..]
+                .iter()
+                .any(|arg| {
+                    let reference = arg
+                        .split(':')
+                        .next()
+                        .unwrap_or_default()
+                        .to_ascii_lowercase();
+                    arg.contains(':')
+                        && (["origin/", "upstream/", "remotes/", "refs/remotes/"]
+                            .iter()
+                            .any(|prefix| reference.starts_with(prefix))
+                            || reference == "fetch_head")
+                })
+                .then(Vec::new),
+            Some("archive") if has_option(&["--remote"]) => Some(
+                option_value(&args, &["-o"], &["--output"])
+                    .into_iter()
+                    .collect(),
+            ),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Whether a remote copy keeps the source's mode, so the file it writes can
+/// be run as `./x` with no `chmod`: `rsync -a`/`-p`, `scp -p`, `kubectl cp`
+/// and `docker cp` (both carry the mode in their tar stream).
+fn remote_copy_keeps_mode(words: &[String]) -> bool {
+    let Some(index) = effective_command_index(words) else {
+        return false;
+    };
+    let command = token_basename(&words[index]).to_ascii_lowercase();
+    let args = &words[index + 1..];
+    let short_flag = |letter: char| {
+        args.iter()
+            .any(|arg| arg.starts_with('-') && !arg.starts_with("--") && arg[1..].contains(letter))
+    };
+    match command.as_str() {
+        "rsync" => {
+            short_flag('a')
+                || short_flag('p')
+                || args
+                    .iter()
+                    .any(|arg| matches!(arg.as_str(), "--archive" | "--perms" | "--executability"))
+        }
+        "scp" => short_flag('p'),
+        "kubectl" | "oc" | "docker" | "podman" | "nerdctl" => {
+            args.first().is_some_and(|sub| sub == "cp")
+        }
+        _ => false,
+    }
+}
+
+/// Whether `words` (a command and its arguments) reads remote content: an
+/// object store, a cluster, a container, a remote host or a remote git ref.
+pub(crate) fn reads_remote_content(words: &[String]) -> bool {
+    let Some((command, args)) = words.split_first() else {
+        return false;
+    };
+    let command = token_basename(command.trim_matches(['\'', '"'])).to_ascii_lowercase();
+    remote_read_targets(&command, args).is_some()
+}
+
+/// Whether any command in `text` reads remote content.
+pub(crate) fn text_reads_remote(text: &str) -> bool {
+    shell_command_segments(text).into_iter().any(|segment| {
+        let words = shell_tokens(segment);
+        effective_command_index(&words).is_some_and(|index| reads_remote_content(&words[index..]))
+    })
 }
 
 /// The inline code of an interpreter invocation (`python3 -c CODE`,
@@ -6332,6 +6557,68 @@ mod tests {
                 Some(25),
                 "must stage the fetched file: {command}"
             );
+        }
+    }
+
+    /// Bytes read from an object store, a cluster, a container, a remote host
+    /// or a remote git ref are fetched bytes. Each of these was `allow`.
+    #[test]
+    fn remote_content_readers_are_fetches() {
+        for command in [
+            "aws s3 cp s3://b/run.sh ./run.sh && bash run.sh",
+            "aws s3 cp s3://b/run.sh . && sh run.sh",
+            "gcloud storage cp gs://b/x.sh x.sh && bash x.sh",
+            "gsutil cp gs://b/x.sh /opt/x.sh && sh /opt/x.sh",
+            "az storage blob download --container-name c --name x.sh --file x.sh && bash x.sh",
+            "kubectl get cm boot -o jsonpath='{.data.run}' > r.sh && sh r.sh",
+            "kubectl cp ns/pod:/x.sh x.sh && bash x.sh",
+            "kubectl cp ns/pod:/bin/tool ./tool && ./tool",
+            "docker exec c cat /x.sh > x.sh && bash x.sh",
+            "rclone copyto remote:b/x.sh x.sh && sh x.sh",
+            "scp host:/srv/x.sh . && bash x.sh",
+            "rsync -az host:/srv/x.sh ./x.sh && ./x.sh",
+            "git archive --remote=git@host:r.git -o r.tar HEAD && tar xf r.tar && sh x.sh",
+        ] {
+            let staged = check_download_execute_staged(command);
+            if command.starts_with("git archive") {
+                // The archive is unpacked before the run: not a file this
+                // correlation follows, but it must still parse as a remote read.
+                let words = shell_tokens(command.split(" && ").next().unwrap());
+                assert!(reads_remote_content(&words), "{command}");
+                continue;
+            }
+            assert_eq!(staged, Some(25), "must stage the remote file: {command}");
+        }
+        for command in [
+            "aws s3 cp s3://b/k - | bash",
+            "gsutil cat gs://b/x.sh | sh",
+            "gcloud storage cat gs://b/x.sh | bash",
+            "kubectl exec pod -- cat /x.sh | bash",
+            "docker run --rm img cat /x.sh | sh",
+            "rclone cat remote:b/x.sh | bash",
+            "git show origin/main:install.sh | bash",
+        ] {
+            assert_eq!(
+                check_download_execute_pipe(command),
+                Some(25),
+                "must see the remote bytes piped to a shell: {command}"
+            );
+        }
+        for command in [
+            "aws s3 cp s3://b/k ./k",
+            "aws s3 cp ./build.zip s3://b/build.zip",
+            "gsutil cp gs://b/data.csv . && wc -l data.csv",
+            "kubectl get pods -o wide",
+            "kubectl get cm x -o yaml > cm.yaml",
+            "kubectl exec pod -- ls /",
+            "docker run --rm alpine echo hi",
+            "scp ./x.sh host:/srv/ && bash ./x.sh",
+            "rsync -az ./dist/ host:/srv/dist/",
+            "git show HEAD:install.sh | bash",
+            "git show origin/main:README.md | less",
+        ] {
+            assert_eq!(check_download_execute_staged(command), None, "{command}");
+            assert_eq!(check_download_execute_pipe(command), None, "{command}");
         }
     }
 

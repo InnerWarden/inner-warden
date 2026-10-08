@@ -158,9 +158,7 @@ pub(crate) fn has_executable_data_flow(source: &str) -> bool {
         {
             return true;
         }
-        if effective
-            .first()
-            .is_some_and(|name| is_downloader(&normalized_command_name(name)))
+        if produces_downloaded_bytes(effective)
             && command_writes_to_code_process(command, source.as_bytes())
         {
             return true;
@@ -828,6 +826,9 @@ fn plain_words(text: &str) -> Vec<String> {
 /// `/dev/tcp` socket, `gh api`/`gh gist`/`gh release`, or an interpreter
 /// one-liner that uses the network.
 fn text_fetches(text: &str) -> bool {
+    if crate::threats::text_reads_remote(text) {
+        return true;
+    }
     let lower = text.to_ascii_lowercase();
     if lower.contains("/dev/tcp/") || lower.contains("/dev/udp/") {
         return true;
@@ -951,8 +952,7 @@ fn assignment_contains_download_substitution(value: &str) -> bool {
         commands.into_iter().any(|nested| {
             command_words(nested, value.as_bytes())
                 .and_then(|words| effective_command_words(&words, 0).map(ToOwned::to_owned))
-                .and_then(|words| words.first().map(|name| normalized_command_name(name)))
-                .is_some_and(|name| is_downloader(&name))
+                .is_some_and(|words| produces_downloaded_bytes(&words))
         })
     })
 }
@@ -1301,7 +1301,7 @@ pub(crate) fn download_pipeline_output_targets(source: &str) -> Vec<(usize, Stri
             let name = effective
                 .and_then(|words| words.first())
                 .map(|name| normalized_command_name(name));
-            if name.as_deref().is_some_and(is_downloader) {
+            if effective.is_some_and(produces_downloaded_bytes) {
                 saw_downloader = true;
                 continue;
             }
@@ -1653,10 +1653,7 @@ fn pipeline_has_stdin_executor(
             continue;
         };
         let effective = effective_command_words(&words, 0);
-        let name = effective
-            .and_then(|words| words.first())
-            .map(|name| normalized_command_name(name));
-        if require_downloader && name.as_deref().is_some_and(is_downloader) {
+        if require_downloader && effective.is_some_and(produces_downloaded_bytes) {
             producer_seen = true;
             continue;
         }
@@ -1853,6 +1850,21 @@ fn command_words(command: tree_sitter::Node<'_>, source: &[u8]) -> Option<Vec<St
             .map(|argument| node_text(argument, source)),
     );
     Some(words)
+}
+
+/// Whether a command (its effective words) produces bytes from elsewhere: an
+/// HTTP downloader, or a reader of an object store, cluster, container,
+/// remote host or remote git ref (see `threats::reads_remote_content`).
+fn produces_downloaded_bytes(words: &[String]) -> bool {
+    words
+        .first()
+        .is_some_and(|name| is_downloader(&normalized_command_name(name)))
+        || crate::threats::reads_remote_content(
+            &words
+                .iter()
+                .map(|word| shell_word(word))
+                .collect::<Vec<_>>(),
+        )
 }
 
 fn is_downloader(name: &str) -> bool {
@@ -2229,8 +2241,7 @@ fn node_contains_download_substitution(node: tree_sitter::Node<'_>, source: &[u8
         commands.into_iter().any(|nested| {
             command_words(nested, source)
                 .and_then(|words| effective_command_words(&words, 0).map(ToOwned::to_owned))
-                .and_then(|words| words.first().map(|name| normalized_command_name(name)))
-                .is_some_and(|name| is_downloader(&name))
+                .is_some_and(|words| produces_downloaded_bytes(&words))
         })
     })
 }
