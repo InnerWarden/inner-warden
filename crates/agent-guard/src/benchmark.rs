@@ -493,8 +493,8 @@ mod tests {
         let results = run(&corpus, &engine);
         let s = Scoreboard::from_results(&results);
 
-        assert_eq!(s.malicious_total, 189, "malicious corpus contract changed");
-        assert_eq!(s.benign_total, 127, "benign corpus contract changed");
+        assert_eq!(s.malicious_total, 195, "malicious corpus contract changed");
+        assert_eq!(s.benign_total, 136, "benign corpus contract changed");
 
         // The benign set must keep covering the shape the rules are most aggressive
         // about. It previously held 0 benign fetch-and-execute cases against 93
@@ -564,7 +564,8 @@ mod tests {
             "bn-101", "bn-102", "bn-103", "bn-104", "bn-105", "bn-106", "bn-107", "bn-108",
             "bn-109", "bn-110", "bn-111", "bn-112", "bn-113", "bn-114", "bn-115", "bn-116",
             "bn-117", "bn-118", "bn-119", "bn-120", "bn-121", "bn-122", "bn-123", "bn-124",
-            "bn-125", "bn-126", "bn-127",
+            "bn-125", "bn-126", "bn-127", "bn-128", "bn-129", "bn-130", "bn-131", "bn-132",
+            "bn-133", "bn-134", "bn-135", "bn-136",
         ] {
             assert_eq!(
                 outcome(id),
@@ -601,7 +602,8 @@ mod tests {
             // an interpreter one-liner, in a command that parses.
             "dx-116", "dx-117", "dx-118", "dx-119", "dx-120", "dx-121", "dx-122", "dx-123",
             "dx-124", "dx-125", "dx-126", "dx-127", "dx-128", "dx-129", "dx-130", "dx-131",
-            "dx-132", "dx-133", "pe-004", "pe-005", "pe-006", "pe-007", "pe-008",
+            "dx-132", "dx-133", "pe-004", "pe-005", "pe-006", "pe-007", "pe-008", "dx-134",
+            "dx-135", "dx-136", "dx-137", "dx-138", "pe-009",
         ] {
             assert_eq!(outcome(id), Outcome::Caught, "{id} must be caught");
         }

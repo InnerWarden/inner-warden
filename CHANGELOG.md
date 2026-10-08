@@ -104,7 +104,19 @@ follows semantic versioning.
   login, and it scores what running it directly scores, plus the
   persistence. `export PATH=...` and `alias` lines analyse to nothing and
   stay allowed. A line that is itself flagged when run directly is flagged
-  when written too (for example `source <(kubectl completion bash)`).
+  when written too.
+- **A tool's own shell setup line is no longer refused as fetched code.**
+  `source <(kubectl completion bash)`, `source <(helm completion bash)`,
+  `eval "$(gh completion -s bash)"`, `source <(rustup completions bash)`,
+  `eval "$(pyenv init -)"`, `eval "$(direnv hook bash)"` and
+  `eval "$(starship init bash)"` were denied, run directly or written into
+  `~/.bashrc`: any substitution sourced or evaluated counted as fetched
+  code. One installed program printing its setup, in a command that fetches
+  nothing, is now allowed. A substitution that fetches, decodes, prints
+  code the command wrote itself (`echo`, `printf`, a heredoc, `python -c`),
+  runs a file from the working directory or a temp directory, or sits in a
+  command that fetches anything is still denied
+  (`source <(curl ...)`, `eval "$(curl ... | base64 -d)"`).
 - **Running a file after `cd` into a temp directory is seen.**
   `cd /tmp && ./x`, `cd /dev/shm; sh p`, `pushd /var/tmp`, and a `cd` into a
   directory the same command made with `mktemp -d` were allowed: the
@@ -126,10 +138,10 @@ follows semantic versioning.
 
 ### Project
 
-- The benchmark gate holds the new cases: 189 attacks caught, every command
+- The benchmark gate holds the new cases: 195 attacks caught, every command
   attack blocked for an agent, fetch-and-runs after `cd` into a temp
   directory denied, startup-file writes charged for what they write, and 0
-  of 127 ordinary commands flagged
+  of 136 ordinary commands flagged
   (including unparseable ones that only fetch or only run, `npx`/`uvx` runs
   of real packages, downloads through aria2c, axel and lwp-download that are
   not run, network one-liners that only print or save data, and `cd /tmp`
