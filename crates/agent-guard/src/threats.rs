@@ -3038,8 +3038,155 @@ pub fn check_tmp_execution(content: &str) -> Option<(&'static str, u32)> {
             .or_else(|| lower.contains("/private/tmp/").then_some("/private/tmp/"))
             .map(|dir| (dir, 30))
     } else {
-        None
+        relative_execution_in_temp_directory(content).map(|dir| (dir, 30))
     }
+}
+
+/// The world-writable directory `path` is in, if any.
+fn temp_directory_of(path: &str) -> Option<&'static str> {
+    let path = format!("{}/", path.trim_end_matches('/').to_ascii_lowercase());
+    TMP_EXECUTION_DIRS
+        .iter()
+        .copied()
+        .chain(std::iter::once("/private/tmp/"))
+        .find(|dir| path.starts_with(dir))
+}
+
+/// The directory a `mktemp -d` substitution creates: `-p DIR`/`--tmpdir=DIR`
+/// when given, otherwise the default temp directory. `None` when `text` holds
+/// no directory-creating `mktemp`.
+fn mktemp_directory(text: &str) -> Option<String> {
+    static MKTEMP: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let mktemp = MKTEMP.get_or_init(|| {
+        regex::Regex::new(r#"(?:\$\(|`)\s*mktemp\b([^)`]*)"#).expect("static mktemp regex")
+    });
+    let arguments: Vec<&str> = mktemp
+        .captures(text)?
+        .get(1)?
+        .as_str()
+        .split_whitespace()
+        .map(|word| word.trim_matches(['\'', '"']))
+        .collect();
+    if !arguments.iter().any(|word| {
+        *word == "--directory"
+            || (word.starts_with('-') && !word.starts_with("--") && word.contains('d'))
+    }) {
+        return None;
+    }
+    let parent = arguments.iter().enumerate().find_map(|(index, word)| {
+        if *word == "-p" || *word == "--tmpdir" {
+            arguments.get(index + 1).map(|dir| dir.to_string())
+        } else {
+            word.strip_prefix("--tmpdir=").map(str::to_string)
+        }
+    });
+    Some(format!(
+        "{}/mktemp.d",
+        parent
+            .unwrap_or_else(|| "/tmp".to_string())
+            .trim_end_matches('/')
+    ))
+}
+
+/// A relative program or script run after the command has moved into a
+/// world-writable directory: `cd /tmp && ./x`, `pushd /dev/shm; sh p`,
+/// `d=$(mktemp -d) && cd "$d" && ./x`.
+///
+/// The absolute-path patterns above only see `/tmp/x` written out, so the same
+/// execution one `cd` earlier read as `./x` and scored `allow`. Only a word
+/// that resolves against the working directory counts: `./x`, `bin/x`, or the
+/// script path given to a shell or interpreter. `cd /tmp && ls` runs nothing
+/// from there, and `python3 -m`, `bash -c` run no file from it either.
+fn relative_execution_in_temp_directory(content: &str) -> Option<&'static str> {
+    let mut cwd: Option<String> = None;
+    let mut variables = std::collections::HashMap::new();
+    for segment in shell_command_segments(content) {
+        let words = shell_tokens(segment);
+        record_literal_assignments(&words, &mut variables);
+        // `d=$(mktemp -d)`: the variable names a fresh temp directory.
+        if let Some((name, value)) = segment.trim_start().split_once('=') {
+            if is_environment_assignment(&format!("{name}=x"))
+                && !name.contains(char::is_whitespace)
+            {
+                if let Some(directory) = mktemp_directory(value) {
+                    variables.insert(name.to_string(), directory);
+                }
+            }
+        }
+        if let Some(command_index) = effective_command_index(&words) {
+            let name = token_basename(&words[command_index]).to_ascii_lowercase();
+            if matches!(name.as_str(), "cd" | "pushd") {
+                // `cd "$(mktemp -d)"`
+                if let Some(directory) = mktemp_directory(segment) {
+                    cwd = Some(directory);
+                    continue;
+                }
+                // `cd`, `cd -`, `cd ~/x`, `cd "$HOME"`: somewhere this command
+                // cannot name, and not one it resolves against the old cwd.
+                let target = words[command_index + 1..]
+                    .iter()
+                    .find(|argument| !argument.starts_with('-') || argument.as_str() == "-")
+                    .map(|argument| expand_literal_path(argument, &variables));
+                if target
+                    .as_deref()
+                    .is_none_or(|target| target == "-" || target.starts_with(['~', '$']))
+                {
+                    cwd = None;
+                    continue;
+                }
+            }
+        }
+        if let Some(next) = command_directory_change(&words, cwd.as_deref(), &variables) {
+            cwd = Some(next);
+            continue;
+        }
+        let Some(directory) = cwd.as_deref().and_then(temp_directory_of) else {
+            continue;
+        };
+        if runs_a_file_from_the_working_directory(&words) {
+            return Some(directory);
+        }
+    }
+    None
+}
+
+/// Whether the command runs a program or script named by a path relative to
+/// the working directory.
+fn runs_a_file_from_the_working_directory(words: &[String]) -> bool {
+    let Some(command_index) = effective_command_index(words) else {
+        return false;
+    };
+    let relative = |word: &str| {
+        let word = word.trim_matches(['\'', '"']);
+        !word.is_empty() && !word.starts_with(['/', '~', '$', '-'])
+    };
+    let command = words[command_index].trim_matches(['\'', '"']);
+    if relative(command) && command.contains('/') {
+        return true;
+    }
+    let base = token_basename(command).to_ascii_lowercase();
+    let base = strip_interpreter_version(&base);
+    if !(matches!(base, "source" | ".") || EXECUTORS.contains(&base)) {
+        return false;
+    }
+    let arguments = &words[command_index + 1..];
+    // Inline code or a module, not a file in the working directory.
+    if arguments.iter().any(|argument| {
+        matches!(
+            argument.as_str(),
+            "-c" | "-e" | "-E" | "-m" | "-r" | "--eval" | "--print" | "-p"
+        ) || (argument.starts_with('-')
+            && !argument.starts_with("--")
+            && argument.len() > 2
+            && argument[1..].chars().all(|c| c.is_ascii_alphabetic())
+            && argument.ends_with(['c', 'e']))
+    }) {
+        return false;
+    }
+    arguments
+        .iter()
+        .find(|argument| !argument.starts_with('-'))
+        .is_some_and(|script| relative(script))
 }
 
 fn decode_pipeline_reaches_executor(lower: &str) -> bool {
@@ -7082,6 +7229,55 @@ mod tests {
         }
         assert!(check_tmp_execution("bash /tmp/tool").is_some());
         assert!(check_tmp_execution("source /tmp/tool").is_some());
+    }
+
+    /// Each was `allow`: the absolute-path patterns only saw `/tmp/x` written
+    /// out, so the same execution one `cd` earlier was invisible.
+    #[test]
+    fn running_a_relative_file_after_moving_into_a_temp_directory_is_temp_execution() {
+        for (command, dir) in [
+            ("cd /tmp && ./x", "/tmp/"),
+            ("cd /dev/shm; chmod +x p; ./p", "/dev/shm/"),
+            ("cd /var/tmp && sh x", "/var/tmp/"),
+            ("pushd /tmp && bash ./run.sh", "/tmp/"),
+            ("cd /tmp/work && python3 stage.py", "/tmp/"),
+            ("cd /tmp && cd build && bin/tool", "/tmp/"),
+            ("d=$(mktemp -d) && cd \"$d\" && ./x", "/tmp/"),
+            ("cd \"$(mktemp -d)\" && ./x", "/tmp/"),
+            ("cd `mktemp -d` && sh ./x", "/tmp/"),
+            ("cd /tmp && sudo ./x", "/tmp/"),
+            ("cd /tmp && . ./env.sh", "/tmp/"),
+        ] {
+            assert_eq!(
+                check_tmp_execution(command),
+                Some((dir, 30)),
+                "must see the temp execution: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn moving_into_a_temp_directory_without_running_a_file_from_it_is_not() {
+        for command in [
+            "cd /tmp && ls",
+            "cd /tmp && cat x",
+            "cd /tmp && tar xzf release.tar.gz",
+            "cd /tmp && rm -rf build",
+            "cd /tmp && git clone https://github.com/example/repo",
+            "cd /tmp && python3 -m http.server 8000",
+            "cd /tmp && bash -c 'echo hi'",
+            "cd /tmp; cd ~/project && ./build.sh",
+            "cd /tmp && /usr/bin/make",
+            "d=$(mktemp -d -p /opt/build) && cd \"$d\" && ./configure",
+            "cd ./tmp && ./x",
+            "cd /tmpfiles && ./x",
+        ] {
+            assert_eq!(
+                check_tmp_execution(command),
+                None,
+                "must not flag: {command}"
+            );
+        }
     }
 
     #[test]
