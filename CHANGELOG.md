@@ -105,6 +105,35 @@ follows semantic versioning.
   persistence. `export PATH=...` and `alias` lines analyse to nothing and
   stay allowed. A line that is itself flagged when run directly is flagged
   when written too.
+- **More ways to fetch and run are caught.**
+  - `ssh host cat x | bash` and `ssh host cat x > f && sh f`; `aws ssm
+    get-parameter`, `aws secretsmanager get-secret-value` and `vault kv get`
+    piped to a shell; files fetched by `ftp`, `lftp`, `tftp` or `smbclient`
+    (`get`) and by `nc host port > f`, then run.
+  - Archives unpacked by `cpio -i`, `rpm2cpio | cpio`, `ar x`, `dpkg -x`,
+    `jar xf`, `unrar x` or `cabextract`, then run; `tar --to-command` on a
+    fetched archive.
+  - A fetched package installed: `pip install ./x.whl`,
+    `npm install ./x.tgz`, `dpkg -i x.deb`, `rpm -i x.rpm`,
+    `apk add --allow-untrusted x.apk` (install scripts run).
+  - PowerShell: `iwr|irm|Invoke-WebRequest|Invoke-RestMethod ... | iex`,
+    `iex (iwr ...)`, `DownloadString` with `IEX`, the same inside
+    `powershell -c "..."`, and an `-EncodedCommand` that decodes to it
+    (denied: a decoder).
+  Each scores like the curl form (review, blocked for an agent; denied with
+  the same aggravating evidence).
+- **Commands written into files that run later are scored as commands.**
+  Besides the shell startup files: `~/.bash_logout`, `~/.ssh/rc`, a
+  `PROMPT_COMMAND` value, git hooks, a desktop autostart `Exec=` line, a
+  systemd unit's `ExecStart=` lines (including a heredoc), `/etc/cron.d`
+  files and lines piped or heredoc-fed to `crontab -`. An inert value
+  (`PROMPT_COMMAND='history -a'`, an ordinary backup job) is unchanged.
+- **A clone that is built or run is recorded, and scored only with
+  hostile evidence.** `git clone URL && cd repo && make` (or `./install.sh`,
+  `npm install`, `pip install .`) gets a low `clone_and_run` signal and is
+  allowed, because developer agents clone and build all day. With no TLS, a
+  bare public IP, or a paste or short-link host it scores as a
+  download-and-run (deny).
 - **Running something from a fetched archive is caught.**
   `curl -LO URL/a.tgz && tar xzf a.tgz && ./a/run`,
   `curl -sL URL | tar xz && cd pkg && ./install.sh`,
@@ -163,10 +192,10 @@ follows semantic versioning.
 
 ### Project
 
-- The benchmark gate holds the new cases: 213 attacks caught, every command
+- The benchmark gate holds the new cases: 245 attacks caught, every command
   attack blocked for an agent, fetch-and-runs after `cd` into a temp
   directory denied, startup-file writes charged for what they write, and 0
-  of 148 ordinary commands flagged
+  of 160 ordinary commands flagged
   (including unparseable ones that only fetch or only run, `npx`/`uvx` runs
   of real packages, downloads through aria2c, axel and lwp-download that are
   not run, network one-liners that only print or save data, and `cd /tmp`
@@ -178,7 +207,9 @@ follows semantic versioning.
   bare IP, a paste or short-link host, a decoder, or fetched bytes reaching
   an interpreter by substitution, `eval` or a nested shell is deny; reverse
   shells are deny; an obfuscated payload is review and blocked for an agent;
-  a temp-dir executable alone is review and not blocked for an agent.
+  a temp-dir executable alone is review and not blocked for an agent. It
+  also says the guard judges one command at a time, and that a clone built
+  in the same command is allowed unless its source is hostile.
 - The same map's other rows now say only what the code does: ASI01 counts
   27 prompt-injection patterns (it said 24) and says an injected tool result
   is a review alert, not blocked; ASI02 says non-blocking dangerous-command

