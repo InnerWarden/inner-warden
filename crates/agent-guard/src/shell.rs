@@ -388,6 +388,15 @@ fn command_download_output_targets(command: tree_sitter::Node<'_>, source: &[u8]
         return Vec::new();
     };
     let name = normalized_command_name(&effective[0]);
+    // aria2c, axel, lwp-download and network one-liners: one definition of
+    // where they write, shared with the lexical staged correlation.
+    let arguments: Vec<String> = effective[1..]
+        .iter()
+        .map(|argument| shell_word(argument))
+        .collect();
+    if let Some(targets) = crate::threats::other_download_output_targets(&name, &arguments) {
+        return targets;
+    }
     let output_flag = match name.as_str() {
         "curl" | "fetch" => 'o',
         "wget" => 'O',

