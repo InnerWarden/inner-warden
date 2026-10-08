@@ -2651,9 +2651,28 @@ mod tests {
     fn aggregate_status_surfaces_partial_wiring_instead_of_hiding_it() {
         let home = tempfile::TempDir::new().unwrap();
         std::fs::create_dir_all(home.path().join(".cursor")).unwrap();
+        // The wrapper's binary must be there to start: a bare `innerwarden`
+        // passed only where the machine running the suite had one on PATH
+        // (a developer Mac did, the Linux build box did not). Off Unix the
+        // fixed path is not absolute and is judged unknown, never "off".
+        let guard = if cfg!(unix) {
+            let bin = home.path().join("bin/innerwarden");
+            std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+            std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            bin.display().to_string()
+        } else {
+            "/abs/innerwarden".to_string()
+        };
         std::fs::write(
             home.path().join(".cursor/mcp.json"),
-            r#"{"mcpServers":{"guarded":{"command":"innerwarden","args":["proxy","--mode","advisory","--","npx","one"]},"late":{"command":"npx","args":["two"]}}}"#,
+            format!(
+                r#"{{"mcpServers":{{"guarded":{{"command":"{guard}","args":["proxy","--mode","advisory","--","npx","one"]}},"late":{{"command":"npx","args":["two"]}}}}}}"#
+            ),
         )
         .unwrap();
         let rows = innerwarden_agent_guard::agents_ops::rows(home.path());
