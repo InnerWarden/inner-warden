@@ -79,6 +79,7 @@ const SHORT_WORDS: &[(&str, &str)] = &[
     ("fetch_exec_no_tls", "download without TLS run"),
     ("fetch_exec_shortened_source", "download from a short link"),
     ("fetch_exec_unanalyzable", "download run, not analysable"),
+    ("fetch_exec_unparsed", "fetch and run, not parsed"),
     ("guard_self_disable", "turning the guard off"),
     ("insecure_permissions", "world-writable permissions"),
     ("internal_network_target", "internal address"),

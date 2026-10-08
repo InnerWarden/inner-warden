@@ -69,6 +69,7 @@ pub mod threats;
 // deliberate decision to widen the surface, rather than finding it already open.
 mod shell;
 mod typosquat;
+mod unparsed;
 
 #[cfg(test)]
 mod module_surface_tests {

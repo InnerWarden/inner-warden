@@ -138,6 +138,7 @@ pub fn signal_to_asi(signal: &str) -> Option<&'static str> {
         | "fetch_exec_ephemeral_host"
         | "fetch_exec_shortened_source"
         | "fetch_exec_decoder"
+        | "fetch_exec_unparsed"
         | "reverse_shell" => "ASI05",
         // ASI02 Tool Misuse & Exploitation, the shell tool driven to a
         // dangerous call.
