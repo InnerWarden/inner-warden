@@ -105,6 +105,20 @@ follows semantic versioning.
   persistence. `export PATH=...` and `alias` lines analyse to nothing and
   stay allowed. A line that is itself flagged when run directly is flagged
   when written too.
+- **Code read from an object store, a cluster, a container or another host
+  is treated as fetched.** `aws s3 cp s3://b/k - | bash`,
+  `source <(aws s3 cp s3://b/k -)`, `gsutil cat`/`gcloud storage cat` piped
+  to a shell, `kubectl get ... -o jsonpath=... > r.sh && sh r.sh`,
+  `kubectl exec pod -- cat x | bash`, `docker run img cat x | sh`,
+  `rclone cat remote:x | bash`, `scp host:/x . && bash x`,
+  `rsync -a host:/x ./x && ./x`, `kubectl cp`/`docker cp` then run,
+  `az storage blob download --file x && bash x` and
+  `git show origin/main:x | bash` were allowed: only HTTP downloaders
+  counted as a fetch. They now score like the curl form (review, blocked for
+  an agent; deny when sourced or evaluated). A copy that keeps the source's
+  mode (`rsync -a`, `scp -p`, `kubectl cp`, `docker cp`) counts as already
+  executable. Copies nobody runs, uploads, `kubectl get -o yaml > f`,
+  `kubectl exec pod -- ls`, and `kubectl`/`helm completion` stay allowed.
 - **A tool's own shell setup line is no longer refused as fetched code.**
   `source <(kubectl completion bash)`, `source <(helm completion bash)`,
   `eval "$(gh completion -s bash)"`, `source <(rustup completions bash)`,
@@ -138,10 +152,10 @@ follows semantic versioning.
 
 ### Project
 
-- The benchmark gate holds the new cases: 195 attacks caught, every command
+- The benchmark gate holds the new cases: 207 attacks caught, every command
   attack blocked for an agent, fetch-and-runs after `cd` into a temp
   directory denied, startup-file writes charged for what they write, and 0
-  of 136 ordinary commands flagged
+  of 144 ordinary commands flagged
   (including unparseable ones that only fetch or only run, `npx`/`uvx` runs
   of real packages, downloads through aria2c, axel and lwp-download that are
   not run, network one-liners that only print or save data, and `cd /tmp`

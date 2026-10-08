@@ -493,8 +493,8 @@ mod tests {
         let results = run(&corpus, &engine);
         let s = Scoreboard::from_results(&results);
 
-        assert_eq!(s.malicious_total, 195, "malicious corpus contract changed");
-        assert_eq!(s.benign_total, 136, "benign corpus contract changed");
+        assert_eq!(s.malicious_total, 207, "malicious corpus contract changed");
+        assert_eq!(s.benign_total, 144, "benign corpus contract changed");
 
         // The benign set must keep covering the shape the rules are most aggressive
         // about. It previously held 0 benign fetch-and-execute cases against 93
@@ -565,7 +565,8 @@ mod tests {
             "bn-109", "bn-110", "bn-111", "bn-112", "bn-113", "bn-114", "bn-115", "bn-116",
             "bn-117", "bn-118", "bn-119", "bn-120", "bn-121", "bn-122", "bn-123", "bn-124",
             "bn-125", "bn-126", "bn-127", "bn-128", "bn-129", "bn-130", "bn-131", "bn-132",
-            "bn-133", "bn-134", "bn-135", "bn-136",
+            "bn-133", "bn-134", "bn-135", "bn-136", "bn-137", "bn-138", "bn-139", "bn-140",
+            "bn-141", "bn-142", "bn-143", "bn-144",
         ] {
             assert_eq!(
                 outcome(id),
@@ -604,6 +605,10 @@ mod tests {
             "dx-124", "dx-125", "dx-126", "dx-127", "dx-128", "dx-129", "dx-130", "dx-131",
             "dx-132", "dx-133", "pe-004", "pe-005", "pe-006", "pe-007", "pe-008", "dx-134",
             "dx-135", "dx-136", "dx-137", "dx-138", "pe-009",
+            // Remote-content readers: object stores, clusters, containers,
+            // remote hosts, remote git refs.
+            "dx-139", "dx-140", "dx-141", "dx-142", "dx-143", "dx-144", "dx-145", "dx-146",
+            "dx-147", "dx-148", "dx-149", "dx-150",
         ] {
             assert_eq!(outcome(id), Outcome::Caught, "{id} must be caught");
         }
