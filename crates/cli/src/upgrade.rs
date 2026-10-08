@@ -363,7 +363,11 @@ pub fn cmd(rest: &[String]) -> ExitCode {
             for line in rewire_agents_after_upgrade() {
                 println!("{line}");
             }
-            for line in closing_advice(dashboard_is_serving()) {
+            for line in closing_advice(
+                &still_running(crate::dashboard::DEFAULT_BIND, crate::SERVE_BIND),
+                crate::dashboard::DEFAULT_BIND,
+                crate::SERVE_BIND,
+            ) {
                 println!("{line}");
             }
             for line in refresh_openclaw_files(&target) {
@@ -411,17 +415,109 @@ fn running_as_root() -> bool {
     false
 }
 
-/// Is something answering on the dashboard's default address right now?
+/// What of this product was found still running after the replace, each
+/// recognised by what it says about itself, never by its port alone.
 ///
-/// Probed rather than assumed, and only the default bind is checked: an
-/// operator who moved it knows they did, and guessing at ports would be slower
-/// and no more correct. A short timeout, and any error means "no" — a failed
-/// probe must never turn a successful upgrade into a scary ending.
-fn dashboard_is_serving() -> bool {
-    crate::http_io::agent_with_timeout(std::time::Duration::from_millis(400))
-        .get("http://127.0.0.1:8787/api/guard/meta")
-        .call()
-        .is_ok()
+/// The old probe asked `127.0.0.1:8787/api/guard/meta` and called whatever
+/// answered "the dashboard". But the Community dashboard listens on 8788
+/// (`dashboard::DEFAULT_BIND`); 8787 is `serve` (`SERVE_BIND`) and the paid
+/// agent's port. So a running Community dashboard was never named, the paid
+/// agent was misnamed as "the dashboard", and a `serve` left on the deleted
+/// binary was never named at all.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct StillRunning {
+    /// The Community dashboard answered on its default bind; the version it
+    /// reports (empty when it named none).
+    dashboard: Option<String>,
+    /// The Community `serve` answered on its default bind.
+    serve: bool,
+}
+
+/// PURE. The version a `/api/guard/meta` body reports, when the body is the
+/// Community dashboard's (`edition: "community"`). Anything else, including
+/// the paid agent's own meta, is not ours to restart.
+fn community_dashboard_version(body: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    if v.get("edition")?.as_str()? != "community" {
+        return None;
+    }
+    Some(
+        v.get("version")
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .to_string(),
+    )
+}
+
+/// PURE. Are these two answers from the serve address the Community `serve`?
+/// It answers an empty check with `400 {"error":"missing command"}` and any
+/// other path with `404 not found`, over plain HTTP. Both are required: a
+/// stranger on 8787 that happens to answer one of them is not named.
+fn is_community_serve(
+    empty_check: Option<&(u16, String)>,
+    other_path: Option<&(u16, String)>,
+) -> bool {
+    let check_ok = empty_check.is_some_and(|(status, body)| {
+        *status == 400
+            && serde_json::from_str::<serde_json::Value>(body)
+                .ok()
+                .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string))
+                .as_deref()
+                == Some("missing command")
+    });
+    let other_ok =
+        other_path.is_some_and(|(status, body)| *status == 404 && body.trim() == "not found");
+    check_ok && other_ok
+}
+
+/// I/O. One plain-HTTP request to a loopback address; the status and body of
+/// whatever answered, `None` when nothing did. Short timeout: a failed probe
+/// must never turn a successful upgrade into a scary ending.
+fn probe(method: &str, url: &str, body: Option<&str>) -> Option<(u16, String)> {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_millis(400)))
+        .http_status_as_error(false)
+        .build()
+        .into();
+    let response = match (method, body) {
+        ("POST", Some(b)) => agent
+            .post(url)
+            .header("Content-Type", "application/json")
+            .send(b.as_bytes()),
+        _ => agent.get(url).call(),
+    };
+    let mut response = response.ok()?;
+    let status = response.status().as_u16();
+    let text = response
+        .body_mut()
+        .with_config()
+        .limit(64 * 1024)
+        .read_to_string()
+        .unwrap_or_default();
+    Some((status, text))
+}
+
+/// I/O. Ask the dashboard's and serve's default addresses who they are.
+fn still_running(dashboard_bind: &str, serve_bind: &str) -> StillRunning {
+    let dashboard = probe(
+        "GET",
+        &format!("http://{dashboard_bind}/api/guard/meta"),
+        None,
+    )
+    .filter(|(status, _)| *status == 200)
+    .and_then(|(_, body)| community_dashboard_version(&body));
+    let empty_check = probe(
+        "POST",
+        &format!("http://{serve_bind}/api/agent/check-command"),
+        Some(r#"{"command":""}"#),
+    );
+    let other = empty_check
+        .as_ref()
+        .and_then(|_| probe("GET", &format!("http://{serve_bind}/api/guard/meta"), None));
+    StillRunning {
+        dashboard,
+        serve: is_community_serve(empty_check.as_ref(), other.as_ref()),
+    }
 }
 
 /// Re-wire every connected agent after the binary is replaced.
@@ -477,21 +573,37 @@ fn dirs_home() -> Option<std::path::PathBuf> {
 /// version the moment the rename lands. A dashboard that was already running
 /// keeps the inode it started with and goes on serving the OLD one. On a real
 /// machine those two surfaces disagreed for nine days, and the closing line
-/// above sent the operator to the surface that agrees.
+/// above sent the operator to the surface that agrees. A `serve` left running
+/// is the same, and worse: it goes on screening commands with the old rules.
 ///
-/// So when something is answering on the dashboard's address, say so here.
-/// Pure, because the wording is the part worth pinning.
-fn closing_advice(dashboard_running: bool) -> Vec<String> {
-    if !dashboard_running {
-        return Vec::new();
+/// So name each one found running, where it is, and how to restart it. Text
+/// only: nothing here restarts anything. Pure, because the wording is the
+/// part worth pinning.
+fn closing_advice(seen: &StillRunning, dashboard_bind: &str, serve_bind: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(version) = &seen.dashboard {
+        let reports = if version.is_empty() {
+            String::new()
+        } else {
+            format!(" (it reports {version})")
+        };
+        lines.extend([
+            String::new(),
+            format!("The dashboard on {dashboard_bind} is still executing the previous binary{reports}:"),
+            "replacing a file does not change a process already running it.".into(),
+            "Restart it to serve this version: stop it, then run  innerwarden dashboard".into(),
+            "  (Its page will say so too, until you do.)".into(),
+        ]);
     }
-    vec![
-        String::new(),
-        "A dashboard is running on 127.0.0.1:8787 and is still executing the".into(),
-        "previous binary: replacing a file does not change a process already".into(),
-        "running it. Restart the dashboard to serve this version.".into(),
-        "  (Its page will say so too, until you do.)".into(),
-    ]
+    if seen.serve {
+        lines.extend([
+            String::new(),
+            format!("innerwarden serve on {serve_bind} is still executing the previous binary,"),
+            "so it screens commands with the previous version's rules.".into(),
+            "Restart it to screen with this version: stop it, then run  innerwarden serve".into(),
+        ]);
+    }
+    lines
 }
 
 /// Bring what `observe install` wrote into OpenClaw (the message hook and the
@@ -1228,7 +1340,10 @@ mod installed_binary_tests {
 
 #[cfg(test)]
 mod closing_advice_tests {
-    use super::{closing_advice, refresh_report, RefreshRun};
+    use super::{
+        closing_advice, community_dashboard_version, is_community_serve, refresh_report,
+        RefreshRun, StillRunning,
+    };
 
     fn ran(code: i32, stdout: &str, stderr: &str) -> RefreshRun {
         RefreshRun {
@@ -1306,7 +1421,9 @@ mod closing_advice_tests {
     /// success path is how people learn to skim past the line that matters.
     #[test]
     fn a_quiet_host_gets_no_extra_words() {
-        assert!(closing_advice(false).is_empty());
+        assert!(
+            closing_advice(&StillRunning::default(), "127.0.0.1:8788", "127.0.0.1:8787").is_empty()
+        );
     }
 
     /// The production case: a dashboard was left running for nine days, an
@@ -1315,11 +1432,20 @@ mod closing_advice_tests {
     /// line pointed at the surface that agreed.
     #[test]
     fn a_running_dashboard_is_named_with_what_to_do_about_it() {
-        let advice = closing_advice(true).join("\n");
+        let seen = StillRunning {
+            dashboard: Some("1.3.0".into()),
+            serve: false,
+        };
+        let advice = closing_advice(&seen, "127.0.0.1:8788", "127.0.0.1:8787").join("\n");
         assert!(
-            advice.contains("127.0.0.1:8787"),
-            "name where it is, so the operator does not have to hunt"
+            advice.contains("dashboard on 127.0.0.1:8788"),
+            "name where it is, so the operator does not have to hunt: {advice}"
         );
+        assert!(
+            !advice.contains("8787"),
+            "the serve port is not the dashboard: {advice}"
+        );
+        assert!(advice.contains("1.3.0"), "{advice}");
         assert!(
             advice.to_lowercase().contains("restart"),
             "say what to do, not merely that something is stale"
@@ -1328,6 +1454,191 @@ mod closing_advice_tests {
             advice.to_lowercase().contains("previous binary"),
             "say WHY, or it reads as a superstition about restarting things"
         );
+    }
+
+    /// A `serve` left running is named with its own restart, and only it.
+    #[test]
+    fn a_running_serve_is_named_on_its_own_port() {
+        let seen = StillRunning {
+            dashboard: None,
+            serve: true,
+        };
+        let advice = closing_advice(&seen, "127.0.0.1:8788", "127.0.0.1:8787").join("\n");
+        assert!(
+            advice.contains("innerwarden serve on 127.0.0.1:8787"),
+            "{advice}"
+        );
+        assert!(advice.contains("run  innerwarden serve"), "{advice}");
+        assert!(!advice.contains("dashboard"), "{advice}");
+    }
+
+    /// Only the Community dashboard's own meta is ours: the paid agent's meta,
+    /// or any JSON without the edition, is never named as "the dashboard".
+    #[test]
+    fn only_the_community_meta_is_the_dashboard() {
+        assert_eq!(
+            community_dashboard_version(r#"{"version":"1.5.2","edition":"community"}"#),
+            Some("1.5.2".into())
+        );
+        assert_eq!(
+            community_dashboard_version(r#"{"version":"0.16.72"}"#),
+            None
+        );
+        assert_eq!(
+            community_dashboard_version(r#"{"version":"0.16.72","edition":"enterprise"}"#),
+            None
+        );
+        assert_eq!(community_dashboard_version("<html>"), None);
+    }
+
+    /// `serve` is recognised by both of its answers, never by one alone.
+    #[test]
+    fn serve_is_recognised_by_both_of_its_answers() {
+        let missing = (400, r#"{"error":"missing command"}"#.to_string());
+        let not_found = (404, "not found".to_string());
+        assert!(is_community_serve(Some(&missing), Some(&not_found)));
+        assert!(!is_community_serve(Some(&missing), None));
+        assert!(!is_community_serve(None, Some(&not_found)));
+        assert!(!is_community_serve(
+            Some(&(200, "ok".into())),
+            Some(&(200, "ok".into()))
+        ));
+        assert!(!is_community_serve(
+            Some(&(400, r#"{"error":"bad"}"#.into())),
+            Some(&not_found)
+        ));
+    }
+}
+
+/// The probes against real loopback listeners: what answers where, and what
+/// the closing advice then says.
+#[cfg(test)]
+mod still_running_e2e {
+    use super::*;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::{TcpListener, TcpStream};
+
+    /// A listener that answers `respond(method, path)` to every request until
+    /// dropped. Its Drop wakes the accept loop so the thread ends: a blocked
+    /// thread left behind is fatal under coverage instrumentation (see
+    /// `e2e::FakeRelease`).
+    struct Listener {
+        addr: String,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Drop for Listener {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = TcpStream::connect(&self.addr);
+        }
+    }
+
+    fn listen(respond: fn(&str, &str) -> (u16, &'static str)) -> Listener {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr").to_string();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopped = std::sync::Arc::clone(&stop);
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                if stopped.load(std::sync::atomic::Ordering::SeqCst) {
+                    return;
+                }
+                let _ = answer(stream, respond);
+            }
+        });
+        Listener { addr, stop }
+    }
+
+    fn answer(
+        mut stream: TcpStream,
+        respond: fn(&str, &str) -> (u16, &'static str),
+    ) -> std::io::Result<()> {
+        let mut reader = BufReader::new(stream.try_clone()?);
+        let mut request_line = String::new();
+        reader.read_line(&mut request_line)?;
+        let mut length = 0usize;
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line)? == 0 || line.trim().is_empty() {
+                break;
+            }
+            if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                length = v.trim().parse().unwrap_or(0);
+            }
+        }
+        let mut body = vec![0u8; length];
+        reader.read_exact(&mut body)?;
+        let mut parts = request_line.split_whitespace();
+        let method = parts.next().unwrap_or("");
+        let path = parts.next().unwrap_or("/");
+        let (status, text) = respond(method, path);
+        write!(
+            stream,
+            "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
+            text.len()
+        )?;
+        stream.flush()
+    }
+
+    /// A port nothing listens on.
+    fn closed() -> String {
+        let l = TcpListener::bind("127.0.0.1:0").expect("bind");
+        l.local_addr().expect("addr").to_string()
+    }
+
+    fn community_dashboard(_: &str, path: &str) -> (u16, &'static str) {
+        if path == "/api/guard/meta" {
+            (200, r#"{"version":"1.5.1","edition":"community"}"#)
+        } else {
+            (404, "not found")
+        }
+    }
+
+    fn community_serve(method: &str, path: &str) -> (u16, &'static str) {
+        if method == "POST" && path == "/api/agent/check-command" {
+            (400, r#"{"error":"missing command"}"#)
+        } else {
+            (404, "not found")
+        }
+    }
+
+    fn stranger(_: &str, _: &str) -> (u16, &'static str) {
+        (200, "hello")
+    }
+
+    /// FAILS ON REVERT (the 8787 probe): the dashboard on its own port is
+    /// found and named there, and the serve port is not called a dashboard.
+    #[test]
+    fn a_dashboard_on_its_own_port_is_named_there() {
+        let dash_listener = listen(community_dashboard);
+        let dash = dash_listener.addr.clone();
+        let serve = closed();
+        let seen = still_running(&dash, &serve);
+        assert_eq!(seen.dashboard.as_deref(), Some("1.5.1"));
+        assert!(!seen.serve);
+        let advice = closing_advice(&seen, &dash, &serve).join("\n");
+        assert!(advice.contains(&format!("dashboard on {dash}")), "{advice}");
+    }
+
+    #[test]
+    fn a_running_serve_is_named() {
+        let dash = closed();
+        let serve_listener = listen(community_serve);
+        let seen = still_running(&dash, &serve_listener.addr);
+        assert_eq!(seen.dashboard, None);
+        assert!(seen.serve);
+    }
+
+    /// Something else on both ports (the paid agent, or anything at all) is
+    /// not ours: nothing is said about it.
+    #[test]
+    fn a_stranger_on_the_ports_gets_no_words() {
+        let dash = listen(stranger);
+        let serve = listen(stranger);
+        let seen = still_running(&dash.addr, &serve.addr);
+        assert_eq!(seen, StillRunning::default());
+        assert!(closing_advice(&seen, &dash.addr, &serve.addr).is_empty());
     }
 }
 
