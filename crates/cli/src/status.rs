@@ -47,6 +47,9 @@ pub struct HookTrouble {
     pub program: HookProgram,
     /// The command that rewrites the hook to a binary that is there.
     pub next: String,
+    /// The wiring is an MCP proxy wrapper, not a hook: its servers cannot
+    /// start rather than run unscreened, and the sentence says which.
+    pub via_proxy: bool,
 }
 
 /// PURE: a duration a person reads at a glance, in its largest whole unit.
@@ -269,15 +272,25 @@ pub fn assess(facts: &Facts) -> Vec<Finding> {
         match &trouble.program {
             HookProgram::Broken { problem, .. } => out.push(Finding::NotWorking {
                 what: format!(
-                    "{} is wired, but {problem}, so none of its commands are screened.",
-                    trouble.agent
+                    "{} is wired, but {problem}, so {}.",
+                    trouble.agent,
+                    if trouble.via_proxy {
+                        "its MCP servers cannot start"
+                    } else {
+                        "none of its commands are screened"
+                    }
                 ),
                 next: trouble.next.clone(),
             }),
             HookProgram::Unknown { why, .. } => out.push(Finding::Unknown {
                 what: format!(
-                    "{} is wired, but I could not confirm its hook can run.",
-                    trouble.agent
+                    "{} is wired, but I could not confirm its {} can run.",
+                    trouble.agent,
+                    if trouble.via_proxy {
+                        "MCP proxy"
+                    } else {
+                        "hook"
+                    }
                 ),
                 why: format!("{why}. If it does not, `{}` rewrites it.", trouble.next),
             }),
@@ -766,6 +779,7 @@ mod tests {
                     agent: "claude-code".into(),
                     program: verdict,
                     next: next.into(),
+                    via_proxy: false,
                 }];
             }
         }

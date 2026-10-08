@@ -1836,7 +1836,24 @@ mod tests {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, body).unwrap();
         };
-        let bin = TEST_GUARD_BIN;
+        // The CLI the wrappers run must be there to start: a wrapper whose
+        // binary is gone is not guarded at all. Off Unix the fixed path is not
+        // absolute and is judged unknown, which still counts as wired.
+        let installed = |rel: &str| -> String {
+            if !cfg!(unix) {
+                return format!("/{rel}");
+            }
+            let path = home.path().join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "#!/bin/sh\n").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            path.display().to_string()
+        };
+        let bin = installed("abs/innerwarden");
         write(
             ".openclaw/openclaw.json",
             format!(
@@ -1855,14 +1872,24 @@ mod tests {
                 r#"{{"mcpServers":{{"s":{{"command":"{bin}","args":["proxy","--label","cursor","--agent","cursor","--mode","advisory","--","npx"]}}}}}}"#
             ),
         );
+        // Another copy of the CLI, also there to start.
+        let other_copy = installed("opt/pinned/innerwarden");
         write(
             ".gemini/settings.json",
-            r#"{"mcpServers":{"s":{"command":"/opt/pinned/innerwarden","args":["proxy","--mode","advisory","--","npx"]}}}"#.to_string(),
+            format!(
+                r#"{{"mcpServers":{{"s":{{"command":"{other_copy}","args":["proxy","--mode","advisory","--","npx"]}}}}}}"#
+            ),
         );
 
         let rows = innerwarden_agent_guard::agents_ops::rows(home.path());
-        let payload: serde_json::Value =
-            serde_json::from_str(&agents_json(home.path(), &rows)).unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&agents_json_with_status(
+            home.path(),
+            &rows,
+            false,
+            None,
+            &bin,
+        ))
+        .unwrap();
         let agent = |id: &str| {
             payload["agents"]
                 .as_array()

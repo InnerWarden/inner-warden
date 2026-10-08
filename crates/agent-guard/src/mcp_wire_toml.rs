@@ -352,6 +352,23 @@ pub fn has_guard_wiring_toml(doc: &DocumentMut) -> bool {
         })
 }
 
+/// The program each InnerWarden proxy wrapper in this config runs, as
+/// written, in file order (see `mcp_wire::guard_wrapper_commands`).
+pub fn guard_wrapper_commands_toml(doc: &DocumentMut) -> Vec<String> {
+    doc.get("mcp_servers")
+        .and_then(Item::as_table)
+        .map(|servers| {
+            servers
+                .iter()
+                .filter_map(|(_, item)| item.as_table())
+                .filter(|server| has_proxy_prefix(server))
+                .filter_map(|server| server.get("command").and_then(Item::as_str))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Effective mode across every guarded stdio server. `None` means there is no
 /// fully guarded local server; differing modes are reported as `Mixed`.
 pub fn guarded_mode_toml(doc: &DocumentMut) -> Option<WiringMode> {

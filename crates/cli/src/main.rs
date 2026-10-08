@@ -103,13 +103,30 @@ fn status_io_cmd() -> std::process::ExitCode {
         .map(|home| {
             use innerwarden_agent_guard::{agents_ops, hook::HookProgram};
             rows.iter()
-                .filter_map(|r| match agents_ops::hook_program(home, r)? {
-                    HookProgram::Runs => None,
-                    program => Some(status::HookTrouble {
-                        agent: r.name.clone(),
-                        program,
-                        next: agents_ops::hook_repair_command(home, r),
-                    }),
+                .filter_map(|r| {
+                    if let Some(program) = agents_ops::hook_program(home, r) {
+                        return match program {
+                            HookProgram::Runs => None,
+                            program => Some(status::HookTrouble {
+                                agent: r.name.clone(),
+                                program,
+                                next: agents_ops::hook_repair_command(home, r),
+                                via_proxy: false,
+                            }),
+                        };
+                    }
+                    // An MCP agent whose proxy wrapper's binary is gone. Only
+                    // a known-broken one is trouble: an unknown one stays wired
+                    // ("could not tell" is never "off").
+                    match agents_ops::mcp_proxy_program(home, r)? {
+                        program @ HookProgram::Broken { .. } => Some(status::HookTrouble {
+                            agent: r.name.clone(),
+                            program,
+                            next: agents_ops::proxy_repair_command(home, r),
+                            via_proxy: true,
+                        }),
+                        _ => None,
+                    }
                 })
                 .collect()
         })
