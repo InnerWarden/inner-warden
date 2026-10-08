@@ -425,6 +425,20 @@ jobs:
         # Pinned to the major this config was measured against.
         run: cargo install cargo-tarpaulin --locked --version ^0.37
 
+      - name: The coverage config is read, not silently dropped
+        # tarpaulin does not fail on an invalid .tarpaulin.toml: it logs an
+        # ERROR and falls back to the command line. That is how `engine =
+        # "llvm"` (the enum is `Llvm`) left the floor and the excludes dead
+        # with this job green. A gate that cannot run must fail.
+        run: |
+          set -euo pipefail
+          out=$(cargo tarpaulin --print-rust-flags 2>&1)
+          echo "$out"
+          if grep -q "Invalid config file" <<<"$out"; then
+            echo "::error::.tarpaulin.toml does not parse; the floor and excludes would be ignored"
+            exit 1
+          fi
+
       - name: Measure, and fail under the floor
         # `--engine llvm` on the COMMAND LINE, not only in .tarpaulin.toml.
         # That is how the paid repo invokes it on the same runner image, and it
