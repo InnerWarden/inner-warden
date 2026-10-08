@@ -134,7 +134,10 @@ fn a_release_checks_its_source_tag_names_the_built_commit() {
         "github.sha",
         "exit 1",
     ] {
-        assert!(step.contains(needed), "the tag check lost `{needed}`:\n{step}");
+        assert!(
+            step.contains(needed),
+            "the tag check lost `{needed}`:\n{step}"
+        );
     }
     let publish = WORKFLOW
         .find("- name: Publish rolling iw-guard release")
@@ -143,4 +146,37 @@ fn a_release_checks_its_source_tag_names_the_built_commit() {
         .find("- name: The source carries guard-vX.Y.Z")
         .expect("tag check");
     assert!(check > publish, "the check runs once the cut is published");
+}
+
+const NFPM: &str = include_str!("../../../packaging/nfpm.yaml");
+
+/// The `.deb`/`.rpm` install `/usr/bin/innerwarden` and no shortcut.
+///
+/// `iw` is the name of the Linux wireless configuration tool (`/usr/sbin/iw`,
+/// package `iw`); a system package that put an `iw` of ours on PATH would
+/// shadow it, or collide with the distro's package outright. The shell
+/// installer's `iw`/`iw-guard` links and npm's `iw` live in the user's own
+/// directories; the system packages stay out of that name. The site once
+/// promised both shortcuts for every install method.
+///
+/// FAILS ON REVERT: add a `dst: /usr/bin/iw` entry and this names it.
+#[test]
+fn the_system_packages_install_innerwarden_and_no_iw() {
+    let dsts: Vec<&str> = NFPM
+        .lines()
+        .map(str::trim)
+        .filter_map(|l| l.strip_prefix("dst:"))
+        .map(str::trim)
+        .collect();
+    assert!(
+        dsts.contains(&"/usr/bin/innerwarden"),
+        "the packages must install the CLI: {dsts:?}"
+    );
+    for dst in &dsts {
+        let name = dst.rsplit('/').next().unwrap_or(dst);
+        assert!(
+            name != "iw" && name != "iw-guard",
+            "{dst}: a system package must not install a shortcut on PATH"
+        );
+    }
 }
