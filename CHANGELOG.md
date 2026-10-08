@@ -84,6 +84,17 @@ follows semantic versioning.
   decoder). Feeding the variable to a shell's input (`sh <<<"$f"`) is denied.
   Writing a fetched value to a file nobody runs (`echo "$f" > data.json`)
   stays allowed.
+- **A download through another tool, then run, is caught like curl's.**
+  `aria2c URL -o r && chmod +x r && ./r`, the same with `axel`,
+  `lwp-download URL r.sh && sh r.sh`, BSD `fetch URL && sh r.sh`, and a
+  Python, Node, Perl, Ruby or PHP one-liner that fetches and writes a file
+  (`urlretrieve`, `urlopen` or `requests.get` then `open(...).write`,
+  `fetch` then `writeFileSync`, LWP `getstore`/`mirror`, `open-uri` then
+  `File.write`, `file_get_contents` then `file_put_contents`) followed by
+  running that file were allowed while the curl and wget forms were held.
+  They now score the same: review, blocked for an agent, denied with the same
+  aggravating evidence. A one-liner that only prints, and a download nobody
+  runs, stay allowed.
 - **Sourcing a downloaded file with `.` is seen.** `curl -o r.sh URL && .
   ./r.sh` was allowed while `source ./r.sh` was caught.
 - **An MCP wrapper whose proxy binary is gone is not reported as guarded.**
@@ -95,10 +106,19 @@ follows semantic versioning.
 
 ### Project
 
-- The benchmark gate holds the new cases: 165 attacks caught, every command
-  attack blocked for an agent, and 0 of 109 ordinary commands flagged
-  (including unparseable ones that only fetch or only run, and `npx`/`uvx`
-  runs of real packages).
+- The benchmark gate holds the new cases: 177 attacks caught, every command
+  attack blocked for an agent, and 0 of 116 ordinary commands flagged
+  (including unparseable ones that only fetch or only run, `npx`/`uvx` runs
+  of real packages, downloads through aria2c, axel and lwp-download that are
+  not run, and network one-liners that only print or save data).
+- The OWASP Agentic map (`crates/agent-guard/OWASP-AGENTIC-TOP-10.md`) no
+  longer says every download-and-execute and temp-dir executable is denied.
+  Its ASI05 row now says what the benchmark measures: a plain fetch-and-run
+  over TLS from a named host is review and blocked for an agent; no TLS, a
+  bare IP, a paste or short-link host, a decoder, or fetched bytes reaching
+  an interpreter by substitution, `eval` or a nested shell is deny; reverse
+  shells are deny; an obfuscated payload is review and blocked for an agent;
+  a temp-dir executable alone is review and not blocked for an agent.
 - The release job fails when the `guard-vX.Y.Z` source tag is missing or
   names a different commit than the one it built.
 - A test pins that the `.deb` and `.rpm` ship `/usr/bin/innerwarden` and no

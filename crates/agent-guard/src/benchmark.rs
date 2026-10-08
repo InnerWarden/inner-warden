@@ -493,8 +493,8 @@ mod tests {
         let results = run(&corpus, &engine);
         let s = Scoreboard::from_results(&results);
 
-        assert_eq!(s.malicious_total, 165, "malicious corpus contract changed");
-        assert_eq!(s.benign_total, 109, "benign corpus contract changed");
+        assert_eq!(s.malicious_total, 177, "malicious corpus contract changed");
+        assert_eq!(s.benign_total, 116, "benign corpus contract changed");
 
         // The benign set must keep covering the shape the rules are most aggressive
         // about. It previously held 0 benign fetch-and-execute cases against 93
@@ -562,7 +562,7 @@ mod tests {
             "bn-070", "bn-071", "bn-087", "bn-088", "bn-089", "bn-090", "bn-091", "bn-092",
             "bn-093", "bn-094", "bn-095", "bn-096", "bn-097", "bn-098", "bn-099", "bn-100",
             "bn-101", "bn-102", "bn-103", "bn-104", "bn-105", "bn-106", "bn-107", "bn-108",
-            "bn-109",
+            "bn-109", "bn-110", "bn-111", "bn-112", "bn-113", "bn-114", "bn-115", "bn-116",
         ] {
             assert_eq!(
                 outcome(id),
@@ -594,7 +594,11 @@ mod tests {
             // An unparseable command naming a fetch and a way to run code, and a
             // look-alike fetched by a run (npx, uvx, pipx run) or a download.
             "dx-109", "dx-110", "dx-111", "dx-112", "dx-113", "dx-114", "ts-007", "ts-008",
-            "ts-009", "ts-010", "ts-011", "ts-012",
+            "ts-009", "ts-010", "ts-011", "ts-012", "dx-115",
+            // A fetch-then-run through aria2c, axel, lwp-download, BSD fetch or
+            // an interpreter one-liner, in a command that parses.
+            "dx-116", "dx-117", "dx-118", "dx-119", "dx-120", "dx-121", "dx-122", "dx-123",
+            "dx-124", "dx-125", "dx-126",
         ] {
             assert_eq!(outcome(id), Outcome::Caught, "{id} must be caught");
         }
@@ -602,8 +606,8 @@ mod tests {
         // still rejects them; a grammar that learns to parse one would move it to
         // the structural rules and leave the net unmeasured.
         for id in [
-            "dx-109", "dx-110", "dx-111", "dx-112", "dx-113", "dx-114", "bn-099", "bn-100",
-            "bn-101", "bn-102", "bn-103", "bn-104", "bn-105",
+            "dx-109", "dx-110", "dx-111", "dx-112", "dx-113", "dx-114", "dx-115", "bn-099",
+            "bn-100", "bn-101", "bn-102", "bn-103", "bn-104", "bn-105",
         ] {
             let case = corpus.cases.iter().find(|c| c.id == id).unwrap();
             assert!(
