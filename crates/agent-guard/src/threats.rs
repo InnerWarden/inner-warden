@@ -1690,7 +1690,7 @@ fn is_local_tool_eval_idiom(content: &str) -> bool {
             r#"(?ix)
             ^\s*eval\s+ ["']? (?:\$\( | `)? \s*
             (?:
-                  [\w.-]+ \s+ (?:completion|completions) (?:\s+[\w.-]+)?   # kubectl completion bash
+                  [\w.-]+ \s+ (?:completion|completions) (?:\s+[\w.-]+){0,3}   # kubectl completion bash, gh completion -s bash
                 | (?:direnv|starship|zoxide|mise|rbenv|pyenv|nodenv|jenv|fnm|atuin|navi|keychain)
                     \s+ (?:hook|init|env|activate|init-file) (?:\s+[\w.-]+)?   # direnv hook bash
                 | ssh-agent (?:\s+-s)?                                     # ssh-agent -s
@@ -6206,21 +6206,28 @@ fn interpreter_inline_code(interpreter: &str, args: &[String]) -> Option<String>
     None
 }
 
+/// Whether inline interpreter code reaches the network (a URL fetch, an HTTP
+/// client, a socket library).
+pub(crate) fn code_reaches_network(code: &str) -> bool {
+    static NETWORK: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    NETWORK
+        .get_or_init(|| {
+            regex::Regex::new(
+                r#"(?i)urlretrieve|urlopen|urllib|requests\.(?:get|post)\(|httpx\.|http\.client|fetch\(|\bhttps?\.get\(|require\(\s*['"]https?['"]\s*\)|axios|lwp|http::tiny|getstore|mirror\(\s*['"]https?:|open-uri|uri\.open|net::http|file_get_contents\(\s*['"]https?:|curl_exec|copy\(\s*['"]https?:|fopen\(\s*['"]https?:"#,
+            )
+            .expect("static one-liner network regex")
+        })
+        .is_match(code)
+}
+
 /// Files an interpreter one-liner writes what it fetched to. `None` when the
 /// invocation is not an inline one-liner that reaches the network.
 fn interpreter_download_targets(command: &str, args: &[String]) -> Option<Vec<String>> {
-    static NETWORK: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     static WRITES: std::sync::OnceLock<Vec<regex::Regex>> = std::sync::OnceLock::new();
     let interpreter =
         command.trim_end_matches(|character: char| character.is_ascii_digit() || character == '.');
     let code = interpreter_inline_code(interpreter, args)?;
-    let network = NETWORK.get_or_init(|| {
-        regex::Regex::new(
-            r#"(?i)urlretrieve|urlopen|urllib|requests\.(?:get|post)\(|httpx\.|http\.client|fetch\(|\bhttps?\.get\(|require\(\s*['"]https?['"]\s*\)|axios|lwp|http::tiny|getstore|mirror\(\s*['"]https?:|open-uri|uri\.open|net::http|file_get_contents\(\s*['"]https?:|curl_exec|copy\(\s*['"]https?:|fopen\(\s*['"]https?:"#,
-        )
-        .expect("static one-liner network regex")
-    });
-    if !network.is_match(&code) {
+    if !code_reaches_network(&code) {
         return None;
     }
     let writes = WRITES.get_or_init(|| {

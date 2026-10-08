@@ -185,7 +185,8 @@ pub(crate) fn has_executable_data_flow(source: &str) -> bool {
                 .get(1)
                 .map(|argument| shell_word(argument))
                 .is_some_and(|argument| {
-                    dynamic_code_argument(&argument)
+                    (dynamic_code_argument(&argument)
+                        && substitution_runs_untrusted_code(&argument, source))
                         || is_stdin_code_path(&argument)
                         || variable_code_argument_is_download_tainted(
                             command,
@@ -196,7 +197,8 @@ pub(crate) fn has_executable_data_flow(source: &str) -> bool {
         }
         match command_code_input(effective) {
             CodeInput::Argument(argument) => {
-                dynamic_code_argument(&argument)
+                (dynamic_code_argument(&argument)
+                    && substitution_runs_untrusted_code(&argument, source))
                     || (argument.len() < source.len() && has_executable_data_flow(&argument))
                     || embedded_system_payload_executes_download(&name, &argument)
                     || variable_code_argument_is_download_tainted(
@@ -704,6 +706,187 @@ fn dynamic_code_argument(argument: &str) -> bool {
         .iter()
         .any(|(prefix, suffix)| trimmed.starts_with(prefix) && trimmed.ends_with(suffix))
         || (trimmed.starts_with('`') && trimmed.ends_with('`') && trimmed.len() > 2)
+}
+
+/// Whether a substitution run as code (`source <(X)`, `eval "$(X)"`,
+/// `bash -c "$(X)"`) may run code nobody on this host wrote or that the
+/// command assembled itself.
+///
+/// Every substitution used to count. `source <(kubectl completion bash)`,
+/// `eval "$(pyenv init -)"` and `eval "$(direnv hook bash)"` are how those
+/// tools document their own setup, and they were denied as fetched code while
+/// they only run what an installed program prints. Only that shape is let
+/// through: one simple command (no pipe, list, redirect, expansion or
+/// heredoc), whose program is not a text tool or interpreter that could print
+/// code given to it (`echo`, `cat`, `printf`, `sed`, `python -c`, ...), that
+/// neither fetches nor decodes, in a command that fetches nothing anywhere
+/// (so it cannot be reading what a fetch left in a file or variable).
+fn substitution_runs_untrusted_code(argument: &str, whole: &str) -> bool {
+    let trimmed = argument.trim();
+    let inner = trimmed
+        .strip_prefix("$(")
+        .or_else(|| trimmed.strip_prefix("<("))
+        .or_else(|| trimmed.strip_prefix(">("))
+        .and_then(|rest| rest.strip_suffix(')'))
+        .or_else(|| {
+            trimmed
+                .strip_prefix('`')
+                .and_then(|rest| rest.strip_suffix('`'))
+        });
+    let Some(inner) = inner else {
+        return true;
+    };
+    !substitution_is_local_generator(inner) || text_fetches(whole)
+}
+
+/// One installed program printing its own shell setup: `kubectl completion
+/// bash`, `pyenv init -`, `direnv hook bash`. See
+/// [`substitution_runs_untrusted_code`].
+fn substitution_is_local_generator(inner: &str) -> bool {
+    const PRINTS_WHAT_IT_IS_GIVEN: &[&str] = &[
+        "echo", "printf", "cat", "tac", "rev", "tr", "sed", "awk", "gawk", "mawk", "head", "tail",
+        "cut", "paste", "base64", "xxd", "od", "dd", "tee", "sort", "uniq", "printenv", "env",
+        "read", "xargs", "eval", "source", ".", "exec", "command", "builtin", "sh", "bash", "zsh",
+        "dash", "ksh", "fish", "python", "perl", "ruby", "node", "nodejs", "php", "lua", "jq",
+        "yq", "sudo", "doas", "find", "openssl", "gzip", "zcat", "gunzip",
+    ];
+    let inner = inner.trim();
+    if inner.is_empty()
+        || inner.contains([
+            '|', ';', '&', '<', '>', '$', '`', '\n', '\\', '(', ')', '{', '}', '=',
+        ])
+    {
+        return false;
+    }
+    let Some(program) = inner.split_whitespace().next() else {
+        return false;
+    };
+    let program = program.trim_matches(['\'', '"']);
+    // An installed program: a bare name found on PATH, or an absolute path
+    // outside the world-writable directories. `./gen` or `/tmp/gen` is a file
+    // this session may have just written.
+    if program.contains('/')
+        && (!program.starts_with('/')
+            || [
+                "/tmp/",
+                "/var/tmp/",
+                "/dev/shm/",
+                "/run/shm/",
+                "/private/tmp/",
+            ]
+            .iter()
+            .any(|dir| program.starts_with(dir)))
+    {
+        return false;
+    }
+    let name = program
+        .rsplit('/')
+        .next()
+        .unwrap_or(program)
+        .to_ascii_lowercase();
+    !PRINTS_WHAT_IT_IS_GIVEN.contains(&versionless_interpreter_name(&name))
+        && !PRINTS_WHAT_IT_IS_GIVEN.contains(&name.as_str())
+        && !text_fetches(inner)
+        && !text_decodes(inner)
+}
+
+/// The words of `text`, lowercased basenames, split at shell punctuation.
+fn plain_words(text: &str) -> Vec<String> {
+    text.split(|c: char| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                ';' | '|'
+                    | '&'
+                    | '('
+                    | ')'
+                    | '{'
+                    | '}'
+                    | '<'
+                    | '>'
+                    | '"'
+                    | '\''
+                    | '`'
+                    | '$'
+                    | '='
+                    | ','
+            )
+    })
+    .filter(|word| !word.is_empty())
+    .map(|word| {
+        let word = word.to_ascii_lowercase();
+        if word.contains("://") {
+            word
+        } else {
+            word.rsplit('/').next().unwrap_or_default().to_string()
+        }
+    })
+    .collect()
+}
+
+/// Whether `text` fetches remote bytes: a downloader or remote shell, a
+/// `/dev/tcp` socket, `gh api`/`gh gist`/`gh release`, or an interpreter
+/// one-liner that uses the network.
+fn text_fetches(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("/dev/tcp/") || lower.contains("/dev/udp/") {
+        return true;
+    }
+    let words = plain_words(text);
+    words.iter().enumerate().any(|(index, word)| {
+        is_downloader(word)
+            || matches!(
+                word.as_str(),
+                "axel"
+                    | "lwp-download"
+                    | "lwp-request"
+                    | "http"
+                    | "https"
+                    | "httpie"
+                    | "nc"
+                    | "ncat"
+                    | "netcat"
+                    | "socat"
+                    | "telnet"
+                    | "ssh"
+            )
+            || (word == "gh"
+                && words
+                    .get(index + 1)
+                    .is_some_and(|next| matches!(next.as_str(), "api" | "gist" | "release")))
+            || (versionless_interpreter_name(word)
+                .strip_prefix("python")
+                .is_some_and(str::is_empty)
+                || matches!(word.as_str(), "node" | "nodejs" | "perl" | "ruby" | "php"))
+                && crate::threats::code_reaches_network(text)
+    })
+}
+
+/// Whether `text` decodes or decompresses before its output is used.
+fn text_decodes(text: &str) -> bool {
+    let words = plain_words(text);
+    let has = |flag: &str| words.iter().any(|word| word == flag);
+    words.iter().any(|word| {
+        matches!(
+            word.as_str(),
+            "gunzip"
+                | "zcat"
+                | "uudecode"
+                | "unxz"
+                | "xzcat"
+                | "bunzip2"
+                | "bzcat"
+                | "zstdcat"
+                | "unzstd"
+        ) || (word == "base64" && (has("-d") || has("--decode") || has("-D")))
+            || (word == "xxd" && (has("-r") || has("-revert")))
+            || (word == "openssl" && (has("-d") || has("base64")))
+            || (matches!(word.as_str(), "gzip" | "xz" | "bzip2" | "zstd")
+                && words.iter().any(|flag| {
+                    flag.starts_with('-') && !flag.starts_with("--") && flag.contains('d')
+                        || flag == "--decompress"
+                }))
+    })
 }
 
 fn variable_code_argument_is_download_tainted(
