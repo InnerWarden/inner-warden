@@ -30,17 +30,56 @@ where
         .find(|p| p.is_file())
 }
 
+/// A PATH-style list that REPLACES every place the host CLI is looked for
+/// (`PATH` and [`AD_INSTALL_DIRS`]); set and empty, nothing is searched.
+///
+/// Why it exists: the standard dirs are absolute, so this binary's own tests
+/// could not be isolated from the machine running them. On a host with Active
+/// Defence in `/usr/local/bin`, `innerwarden statsu` and `get --help` were
+/// delegated to the real `innerwarden-ctl` and two test files failed for a
+/// reason that had nothing to do with the code.
+///
+/// Not a trust boundary: `PATH`, which the same caller controls, is already
+/// searched first, so this lets a caller choose nothing it could not before.
+pub const AD_CLI_DIRS_ENV: &str = "IW_AD_CLI_DIRS";
+
+/// Where to look for the host CLI, in order. PURE: the environment is handed
+/// in, so the override is testable without touching the process environment.
+fn ad_cli_search_dirs(
+    override_dirs: Option<std::ffi::OsString>,
+    path: Option<std::ffi::OsString>,
+) -> Vec<std::path::PathBuf> {
+    if let Some(dirs) = override_dirs {
+        return std::env::split_paths(&dirs)
+            .filter(|d| !d.as_os_str().is_empty())
+            .collect();
+    }
+    path.map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+        .unwrap_or_default()
+        .into_iter()
+        .chain(AD_INSTALL_DIRS.iter().map(std::path::PathBuf::from))
+        .collect()
+}
+
 /// Locate the Active Defence host CLI (`innerwarden-ctl`) if it is installed: on
-/// PATH, or in a standard install dir. Its presence is how the Community binary knows
-/// Active Defence is on this machine.
+/// PATH, or in a standard install dir (or only where [`AD_CLI_DIRS_ENV`] says).
+/// Its presence is how the Community binary knows Active Defence is on this
+/// machine.
 fn find_ad_cli() -> Option<std::path::PathBuf> {
-    let on_path = std::env::var_os("PATH")
-        .map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
-        .unwrap_or_default();
-    find_ad_cli_in(
-        on_path
-            .into_iter()
-            .chain(AD_INSTALL_DIRS.iter().map(std::path::PathBuf::from)),
+    find_ad_cli_in(ad_cli_search_dirs(
+        std::env::var_os(AD_CLI_DIRS_ENV),
+        std::env::var_os("PATH"),
+    ))
+}
+
+/// The second line `innerwarden --version` prints, on stderr, when the host
+/// stack is installed. `innerwarden --version` is the FREE CLI's release, and
+/// the install docs once told paid operators it confirmed the release they
+/// had installed. stderr, so every script that reads the version from stdout
+/// still reads exactly one line.
+pub fn version_host_hint(ad_installed: bool) -> Option<&'static str> {
+    ad_installed.then_some(
+        "Active Defence is installed here; its host stack has its own release: innerwarden-ctl --version",
     )
 }
 
@@ -264,6 +303,38 @@ mod active_defence_detection_tests {
         let p = dir.join(name);
         std::fs::write(&p, b"#!/bin/sh\n").expect("write the fake binary");
         p
+    }
+
+    /// The override replaces BOTH `PATH` and the absolute install dirs: the
+    /// absolute dirs are what made this binary's tests fail on a machine with
+    /// Active Defence in `/usr/local/bin`.
+    ///
+    /// FAILS ON REVERT (the override ignored): the search still names
+    /// `/usr/local/bin` and the `PATH` entry.
+    #[test]
+    fn the_override_replaces_path_and_the_install_dirs() {
+        let only = ad_cli_search_dirs(Some("/x/a:/x/b".into()), Some("/on/path".into()));
+        assert_eq!(only, vec![PathBuf::from("/x/a"), PathBuf::from("/x/b")]);
+        let none = ad_cli_search_dirs(Some("".into()), Some("/on/path".into()));
+        assert!(none.is_empty(), "set and empty searches nowhere: {none:?}");
+        let default = ad_cli_search_dirs(None, Some("/on/path".into()));
+        assert_eq!(default.first(), Some(&PathBuf::from("/on/path")));
+        for d in AD_INSTALL_DIRS {
+            assert!(
+                default.contains(&PathBuf::from(d)),
+                "{d} searched by default"
+            );
+        }
+    }
+
+    /// `innerwarden --version` names the FREE release; with the host stack
+    /// installed it says where the paid release is read, and without it says
+    /// nothing about a product that is not there.
+    #[test]
+    fn the_version_points_at_the_host_release_only_when_it_is_installed() {
+        let hint = version_host_hint(true).expect("installed: a hint");
+        assert!(hint.contains("innerwarden-ctl --version"), "{hint}");
+        assert_eq!(version_host_hint(false), None);
     }
 
     #[test]

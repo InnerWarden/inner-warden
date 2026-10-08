@@ -33,6 +33,9 @@ fn run(home: &Path, args: &[&str]) -> Output {
         .args(args)
         .env("HOME", home)
         .env("USERPROFILE", home)
+        // Search nowhere for the Active Defence CLI: a machine that has it in
+        // /usr/local/bin would otherwise answer the host verbs below.
+        .env("IW_AD_CLI_DIRS", "")
         .env("IW_GRAPH_FILE", home.join("graph.json"))
         .env("IW_SUPPRESS_CONFIG", home.join("suppress.toml"))
         .env("IW_NOTIFY_CONFIG", home.join("notify.toml"))
@@ -46,6 +49,9 @@ fn run_with_stdin(home: &Path, args: &[&str], input: &[u8]) -> Output {
         .args(args)
         .env("HOME", home)
         .env("USERPROFILE", home)
+        // Search nowhere for the Active Defence CLI: a machine that has it in
+        // /usr/local/bin would otherwise answer the host verbs below.
+        .env("IW_AD_CLI_DIRS", "")
         .env("IW_GRAPH_FILE", home.join("graph.json"))
         .env("IW_SUPPRESS_CONFIG", home.join("suppress.toml"))
         .stdin(Stdio::piped())

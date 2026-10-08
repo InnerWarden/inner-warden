@@ -30,11 +30,31 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_innerwarden")
 }
 
+/// Isolated from whatever host CLI the machine running the test has: with
+/// Active Defence in `/usr/local/bin`, `statsu` was delegated to the real
+/// `innerwarden-ctl` and these tests failed for a reason that was not the code.
 fn run(args: &[&str]) -> Output {
+    run_searching(args, "")
+}
+
+/// `run` with the host CLI looked for only in `ad_dirs` (PATH-style).
+fn run_searching(args: &[&str], ad_dirs: &str) -> Output {
     Command::new(bin())
         .args(args)
+        .env("IW_AD_CLI_DIRS", ad_dirs)
         .output()
         .expect("run the binary")
+}
+
+/// A stand-in `innerwarden-ctl` that answers everything with a marker.
+#[cfg(unix)]
+fn fake_host_cli() -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ctl = dir.path().join("innerwarden-ctl");
+    std::fs::write(&ctl, "#!/bin/sh\necho FAKE-HOST-CTL \"$@\"\nexit 0\n").expect("write");
+    std::fs::set_permissions(&ctl, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    dir
 }
 
 fn stdout(o: &Output) -> String {
@@ -112,5 +132,56 @@ fn help_itself_is_still_the_full_help() {
         said.lines().count() > 20,
         "`--help` must still be the full help, got {} lines:\n{said}",
         said.lines().count()
+    );
+}
+
+/// The isolation itself: a host CLI on `PATH` (as on a machine with Active
+/// Defence installed) is not consulted once the search is pointed elsewhere,
+/// so the typo test above measures this binary and nothing else.
+///
+/// FAILS ON REVERT (`IW_AD_CLI_DIRS` ignored): `PATH` is searched, the stand-in
+/// answers `statsu`, and the exit is 0 with its marker on stdout.
+#[cfg(unix)]
+#[test]
+fn a_host_cli_on_path_does_not_answer_when_the_search_is_isolated() {
+    let fake = fake_host_cli();
+    let path = format!(
+        "{}:{}",
+        fake.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = Command::new(bin())
+        .arg("statsu")
+        .env("PATH", path)
+        .env("IW_AD_CLI_DIRS", "")
+        .output()
+        .expect("run");
+    assert_eq!(out.status.code(), Some(2), "{}", stdout(&out));
+    assert!(!stdout(&out).contains("FAKE-HOST-CTL"), "{}", stdout(&out));
+}
+
+/// `innerwarden --version` is the FREE CLI's release. With the host stack
+/// installed it adds, on stderr, where the paid release is read; stdout stays
+/// the one version line every script parses.
+///
+/// FAILS ON REVERT (no hint): stderr is empty with the host CLI present.
+#[cfg(unix)]
+#[test]
+fn the_version_names_the_host_cli_when_active_defence_is_installed() {
+    let fake = fake_host_cli();
+    let out = run_searching(&["--version"], &fake.path().display().to_string());
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(stdout(&out).lines().count(), 1, "{}", stdout(&out));
+    assert!(
+        stderr(&out).contains("innerwarden-ctl --version"),
+        "the paid release is one command away: {}",
+        stderr(&out)
+    );
+
+    let bare = run(&["--version"]);
+    assert_eq!(
+        stderr(&bare),
+        "",
+        "a free-only machine is told nothing about a product it does not have"
     );
 }
