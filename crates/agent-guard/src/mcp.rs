@@ -720,6 +720,11 @@ pub const AGENT_REVIEW_FLOOR: &[&str] = &[
     // the schedule persists, there is nothing left to review.
     "obfuscated_command",
     "persistence_attempt",
+    // An install whose name is one edit from a popular package. A person reads
+    // the name and decides; an agent that invented the name has nobody reading
+    // it before the package's install hook runs with the user's rights, which
+    // is the same terminal step as fetch-and-execute.
+    "package_typosquat",
 ];
 
 /// Whether an agent is blocked from running this under the DEFAULT policy: any
@@ -1054,6 +1059,17 @@ pub fn analyze_command_with(
             signal: "untrusted_software_source".into(),
             score: s,
             detail: what.to_string(),
+        });
+        score += s;
+    }
+
+    // A package one edit from a popular one: a typosquat, or a name an agent
+    // invented that someone registered. Review on its own; see typosquat.rs.
+    if let Some((what, s)) = crate::typosquat::check_package_typosquat(scan_cmd) {
+        signals.push(AnalysisSignal {
+            signal: "package_typosquat".into(),
+            score: s,
+            detail: what,
         });
         score += s;
     }

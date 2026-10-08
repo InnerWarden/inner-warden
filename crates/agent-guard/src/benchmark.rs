@@ -493,8 +493,8 @@ mod tests {
         let results = run(&corpus, &engine);
         let s = Scoreboard::from_results(&results);
 
-        assert_eq!(s.malicious_total, 133, "malicious corpus contract changed");
-        assert_eq!(s.benign_total, 86, "benign corpus contract changed");
+        assert_eq!(s.malicious_total, 153, "malicious corpus contract changed");
+        assert_eq!(s.benign_total, 98, "benign corpus contract changed");
 
         // The benign set must keep covering the shape the rules are most aggressive
         // about. It previously held 0 benign fetch-and-execute cases against 93
@@ -559,7 +559,8 @@ mod tests {
             "bn-046", "bn-047", "bn-048", "bn-049", "bn-050", "bn-051", "bn-052", "bn-053",
             "bn-054", "bn-055", "bn-056", "bn-057", "bn-058", "bn-059", "bn-060", "bn-061",
             "bn-062", "bn-063", "bn-064", "bn-065", "bn-066", "bn-067", "bn-068", "bn-069",
-            "bn-070", "bn-071",
+            "bn-070", "bn-071", "bn-087", "bn-088", "bn-089", "bn-090", "bn-091", "bn-092",
+            "bn-093", "bn-094", "bn-095", "bn-096", "bn-097", "bn-098",
         ] {
             assert_eq!(
                 outcome(id),
@@ -583,6 +584,11 @@ mod tests {
             "dx-081", "dx-082", "dx-083", "dx-084", "dx-085", "dx-086", "dx-087", "dx-088",
             "dx-089", "dx-090", "dx-091", "dx-092", "dx-093", "dx-094", "cr-006", "cr-007",
             "cr-008", "cr-009", "cr-010", "tp-002", "de-002", "de-003", "ii-002", "ob-003",
+            // cs-L2717: two-step fetch-then-run through a shell variable or a `.`
+            // source, and look-alike package installs.
+            "dx-095", "dx-096", "dx-097", "dx-098", "dx-099", "dx-100", "dx-101", "dx-102",
+            "dx-103", "dx-104", "dx-105", "dx-106", "dx-107", "dx-108", "ts-001", "ts-002",
+            "ts-003", "ts-004", "ts-005", "ts-006",
         ] {
             assert_eq!(outcome(id), Outcome::Caught, "{id} must be caught");
         }

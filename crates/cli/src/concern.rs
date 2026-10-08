@@ -89,6 +89,7 @@ const SHORT_WORDS: &[(&str, &str)] = &[
         "session or kernel tampering",
     ),
     ("obfuscated_command", "obfuscated command"),
+    ("package_typosquat", "look-alike package name"),
     ("persistence_attempt", "runs again later"),
     ("persistence_install", "runs again later"),
     ("protected_secret_read", "protected secret"),

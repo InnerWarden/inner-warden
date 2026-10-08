@@ -100,6 +100,19 @@ fn asi10_rogue_agent_signals_map() {
 }
 
 #[test]
+fn asi04_a_look_alike_package_install_is_surfaced_and_named() {
+    // Not provenance or registry validation (see the module doc): only that an
+    // install naming a package one edit from a popular one is surfaced, carries
+    // the supply-chain class, and is enforced for an agent.
+    let a = analyze_command("pip install reqeusts", None);
+    assert_eq!(a.recommendation, "review", "{}", a.explanation);
+    assert!(a.asi_ids.contains(&"ASI04".to_string()), "{:?}", a.asi_ids);
+    assert!(innerwarden_agent_guard::mcp::blocks_for_agent(&a));
+    let real = analyze_command("pip install requests", None);
+    assert_eq!(real.recommendation, "allow", "{}", real.explanation);
+}
+
+#[test]
 fn secret_and_pii_redaction_is_an_additional_data_protection_control() {
     // NOT an ASI04/ASI07 claim, in the 2026 framework ASI04 is supply-chain and
     // ASI07 is inter-agent communication. Redaction is a separate data-protection
