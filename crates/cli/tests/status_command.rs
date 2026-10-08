@@ -189,8 +189,34 @@ fn the_mode_line_tracks_what_the_wiring_actually_does() {
         "the mode IS something this command can see:\n{enforcing}"
     );
 
-    // One screened command, so the record has something honest to count.
+    // A check by hand is not the agent's command reaching the guard (rc1-F20):
+    // it is named, and it does not make the install read as screening.
     run(home.path(), &["check", "ls -la"]);
+    let checked = run(home.path(), &["status"]);
+    assert!(
+        checked.contains("only 1 check(s) run by hand"),
+        "a check by hand must be named for what it is:\n{checked}"
+    );
+    assert!(
+        !checked.contains("InnerWarden is on and screening."),
+        "a check by hand is not proof the agent's commands reach the guard:\n{checked}"
+    );
+
+    // One command through the agent's hook, so the record has something honest
+    // to count.
+    let mut hook = cli(home.path())
+        .args(["hook", "--agent", "claude-code"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn hook");
+    std::io::Write::write_all(
+        &mut hook.stdin.take().expect("hook stdin"),
+        br#"{"session_id":"status-test","tool_name":"Bash","tool_input":{"command":"ls -la"}}"#,
+    )
+    .expect("write hook payload");
+    hook.wait_with_output().expect("hook ran");
     let screening = run(home.path(), &["status"]);
     assert!(
         screening.contains("1 screening decision(s) recorded"),

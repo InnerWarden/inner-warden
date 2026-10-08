@@ -187,6 +187,17 @@ pub fn is_flagged_agent_action(node: &Node) -> bool {
 /// The prefix this CLI writes before an MCP tool call's summary.
 const MCP_LABEL_PREFIX: &str = "MCP · ";
 
+/// See [`Graph::screening_evidence`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScreeningEvidence {
+    /// Decisions an agent's hook or the MCP proxy recorded.
+    pub through_agents: u64,
+    /// When the newest of those was recorded, if any says.
+    pub newest_through_agents_ms: Option<u64>,
+    /// Checks run by hand, drills and verify runs included.
+    pub by_hand: u64,
+}
+
 /// The channel of a node: the one it recorded, or, for a node written before
 /// the field existed, the one this producer's own formats name. A check by
 /// hand records its mode; an MCP call records the proxy's session prefix and
@@ -699,6 +710,43 @@ impl Graph {
             .filter(|node| node.kind == "command")
             .filter_map(recorded_at_ms)
             .max()
+    }
+
+    /// What the record says about an agent's commands reaching the guard.
+    ///
+    /// `innerwarden status` read the whole record as that proof: "N screening
+    /// decision(s) recorded ... so commands really are reaching the guard". But
+    /// a check run by hand is recorded too, and so is every drill and verify run
+    /// (they screen through `innerwarden check`), so an install whose agent hook
+    /// had never fired reported itself working on the strength of the operator's
+    /// own checks (rc1-F20). Only a decision an agent's hook or the MCP proxy
+    /// recorded is that evidence; checks are counted apart so the status can
+    /// say why the count is zero.
+    ///
+    /// A node is a check when its channel says so or its mode does: a hook never
+    /// records the `check` mode, and either one alone is enough to keep the node
+    /// out of the agent count.
+    pub fn screening_evidence(&self) -> ScreeningEvidence {
+        let mut evidence = ScreeningEvidence::default();
+        for node in self.nodes.iter().filter(|node| node.kind == "command") {
+            let channel = channel_of(node);
+            if channel == "check" || attr(node, "mode_at_decision") == Some("check") {
+                evidence.by_hand += 1;
+                continue;
+            }
+            if channel != "hook" && channel != "mcp" {
+                continue;
+            }
+            evidence.through_agents += 1;
+            if let Some(ms) = recorded_at_ms(node) {
+                evidence.newest_through_agents_ms = Some(
+                    evidence
+                        .newest_through_agents_ms
+                        .map_or(ms, |newest| newest.max(ms)),
+                );
+            }
+        }
+        evidence
     }
 
     /// The newest decision each CHANNEL screened (`hook`, `mcp`), whether or
@@ -1645,6 +1693,69 @@ mod tests {
         let page = g.decisions_page(&DecisionQuery::default());
         assert_eq!(page.items[0].outcome_key, "unplaced");
         assert_eq!(page.items[0].recorded_at_ms, None);
+    }
+
+    #[test]
+    fn checks_by_hand_are_not_evidence_an_agent_reaches_the_guard() {
+        let mut g = Graph::new();
+        // A check by hand (and a drill or verify, which screen the same way),
+        // newer than anything an agent sent.
+        for seq in 0..3 {
+            g.ingest_verdict_with_origin(
+                "local",
+                seq,
+                "curl http://203.0.113.9/x",
+                &verdict("deny", "x"),
+                context(
+                    DecisionMode::Check,
+                    DecisionOutcome::Screened,
+                    50_000 + seq as u64,
+                ),
+                &DecisionOrigin {
+                    channel: Some(DecisionChannel::Check),
+                    ..DecisionOrigin::default()
+                },
+            );
+        }
+        assert_eq!(
+            g.screening_evidence(),
+            ScreeningEvidence {
+                through_agents: 0,
+                newest_through_agents_ms: None,
+                by_hand: 3
+            },
+            "an install whose hook never fired has no evidence"
+        );
+        g.ingest_verdict_with_origin(
+            "s1",
+            0,
+            "ls",
+            &verdict("allow", ""),
+            context(DecisionMode::Monitor, DecisionOutcome::Allowed, 7_000),
+            &origin(&[]),
+        );
+        g.ingest_verdict_with_context(
+            "mcp:innerwarden",
+            0,
+            "MCP · fs · {}",
+            &verdict("allow", ""),
+            context(DecisionMode::Monitor, DecisionOutcome::Allowed, 9_000),
+        );
+        // An old check node with no channel recorded is still a check.
+        g.ingest_verdict_with_context(
+            "local",
+            9,
+            "id",
+            &verdict("allow", ""),
+            context(DecisionMode::Check, DecisionOutcome::Screened, 60_000),
+        );
+        let evidence = g.screening_evidence();
+        assert_eq!(evidence.through_agents, 2);
+        assert_eq!(evidence.newest_through_agents_ms, Some(9_000));
+        assert_eq!(evidence.by_hand, 4);
+        // The fixture's check-mode node under a hook channel is a check too.
+        assert_eq!(record().screening_evidence().by_hand, 1);
+        assert_eq!(record().screening_evidence().through_agents, 6);
     }
 
     #[test]

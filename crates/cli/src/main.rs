@@ -161,18 +161,17 @@ fn status_io_cmd() -> std::process::ExitCode {
     //
     // The count alone never goes down, so it cannot say whether commands are
     // reaching the guard NOW. The time of the newest decision can.
-    let (decisions_recorded, newest_decision_ms) = match graph_io::load_graph_checked() {
-        Ok(graph) => (
-            Some(graph.stats().commands as u64),
-            graph.newest_decision_ms(),
-        ),
-        Err(_) => (None, None),
-    };
+    //
+    // Only what an agent's hook or the MCP proxy recorded is that evidence: a
+    // check by hand, a drill and a verify run are recorded too, and counting
+    // them let an install whose hook never fired read as working (rc1-F20).
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis() as u64)
         .unwrap_or(0);
-    let newest_decision_age_secs = newest_decision_ms.map(|ms| now_ms.saturating_sub(ms) / 1000);
+    let loaded = graph_io::load_graph_checked().ok();
+    let (decisions_recorded, newest_decision_age_secs, decisions_by_hand) =
+        status::decision_evidence(loaded.as_ref(), now_ms);
 
     // Absent everything is "not set up", not "unreadable". A fresh box is not a
     // broken one, and three diagnoses send a beginner hunting a fault that does
@@ -196,6 +195,7 @@ fn status_io_cmd() -> std::process::ExitCode {
         any_agent_seen,
         decisions_recorded,
         newest_decision_age_secs,
+        decisions_by_hand,
         dashboard_reachable,
     };
     print!("{}", status::render(&facts));
