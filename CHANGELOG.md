@@ -95,6 +95,14 @@ follows semantic versioning.
   They now score the same: review, blocked for an agent, denied with the same
   aggravating evidence. A one-liner that only prints, and a download nobody
   runs, stay allowed.
+- **Running a file after `cd` into a temp directory is seen.**
+  `cd /tmp && ./x`, `cd /dev/shm; sh p`, `pushd /var/tmp`, and a `cd` into a
+  directory the same command made with `mktemp -d` were allowed: the
+  temp-directory check only matched `/tmp/x` written out. The working
+  directory the command moves into is now followed, so running a relative
+  file from there is flagged like `/tmp/x` (review on its own, and a
+  fetch-and-run there is denied). `cd /tmp && ls` or `cat x` runs nothing
+  from it and stays allowed.
 - **Sourcing a downloaded file with `.` is seen.** `curl -o r.sh URL && .
   ./r.sh` was allowed while `source ./r.sh` was caught.
 - **An MCP wrapper whose proxy binary is gone is not reported as guarded.**
@@ -106,11 +114,13 @@ follows semantic versioning.
 
 ### Project
 
-- The benchmark gate holds the new cases: 177 attacks caught, every command
-  attack blocked for an agent, and 0 of 116 ordinary commands flagged
+- The benchmark gate holds the new cases: 182 attacks caught, every command
+  attack blocked for an agent, fetch-and-runs after `cd` into a temp
+  directory denied, and 0 of 121 ordinary commands flagged
   (including unparseable ones that only fetch or only run, `npx`/`uvx` runs
   of real packages, downloads through aria2c, axel and lwp-download that are
-  not run, and network one-liners that only print or save data).
+  not run, network one-liners that only print or save data, and `cd /tmp`
+  followed by commands that run nothing from it).
 - The OWASP Agentic map (`crates/agent-guard/OWASP-AGENTIC-TOP-10.md`) no
   longer says every download-and-execute and temp-dir executable is denied.
   Its ASI05 row now says what the benchmark measures: a plain fetch-and-run
@@ -119,6 +129,15 @@ follows semantic versioning.
   an interpreter by substitution, `eval` or a nested shell is deny; reverse
   shells are deny; an obfuscated payload is review and blocked for an agent;
   a temp-dir executable alone is review and not blocked for an agent.
+- The same map's other rows now say only what the code does: ASI01 counts
+  27 prompt-injection patterns (it said 24) and says an injected tool result
+  is a review alert, not blocked; ASI02 says non-blocking dangerous-command
+  patterns are review, not deny; ASI03 names the credential signals
+  Community actually emits (it listed `credential_access`, which no rule
+  emits, and Active Defence's privilege-provenance signals as Community's);
+  ASI10 states the measured split (destruction, tampering, miners and
+  reverse shells deny; scheduled tasks and services review and blocked for
+  an agent; a shell-profile write alone allowed).
 - The release job fails when the `guard-vX.Y.Z` source tag is missing or
   names a different commit than the one it built.
 - A test pins that the `.deb` and `.rpm` ship `/usr/bin/innerwarden` and no

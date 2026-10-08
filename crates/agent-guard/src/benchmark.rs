@@ -493,8 +493,8 @@ mod tests {
         let results = run(&corpus, &engine);
         let s = Scoreboard::from_results(&results);
 
-        assert_eq!(s.malicious_total, 177, "malicious corpus contract changed");
-        assert_eq!(s.benign_total, 116, "benign corpus contract changed");
+        assert_eq!(s.malicious_total, 182, "malicious corpus contract changed");
+        assert_eq!(s.benign_total, 121, "benign corpus contract changed");
 
         // The benign set must keep covering the shape the rules are most aggressive
         // about. It previously held 0 benign fetch-and-execute cases against 93
@@ -563,6 +563,7 @@ mod tests {
             "bn-093", "bn-094", "bn-095", "bn-096", "bn-097", "bn-098", "bn-099", "bn-100",
             "bn-101", "bn-102", "bn-103", "bn-104", "bn-105", "bn-106", "bn-107", "bn-108",
             "bn-109", "bn-110", "bn-111", "bn-112", "bn-113", "bn-114", "bn-115", "bn-116",
+            "bn-117", "bn-118", "bn-119", "bn-120", "bn-121",
         ] {
             assert_eq!(
                 outcome(id),
@@ -598,9 +599,21 @@ mod tests {
             // A fetch-then-run through aria2c, axel, lwp-download, BSD fetch or
             // an interpreter one-liner, in a command that parses.
             "dx-116", "dx-117", "dx-118", "dx-119", "dx-120", "dx-121", "dx-122", "dx-123",
-            "dx-124", "dx-125", "dx-126",
+            "dx-124", "dx-125", "dx-126", "dx-127", "dx-128", "dx-129", "dx-130", "dx-131",
         ] {
             assert_eq!(outcome(id), Outcome::Caught, "{id} must be caught");
+        }
+        // A fetch-and-run after `cd` into a world-writable directory carries the
+        // temp-directory evidence too, so it is denied, not left at the review
+        // a vendor installer gets. Caught alone would pass at review.
+        for id in ["dx-127", "dx-128", "dx-129", "dx-130", "dx-131"] {
+            let result = results.iter().find(|r| r.id == id).unwrap();
+            assert_eq!(result.recommendation, "deny", "{id} must be denied");
+            assert!(
+                result.charged_signals.iter().any(|s| s == "tmp_execution"),
+                "{id}: {:?}",
+                result.charged_signals
+            );
         }
         // The unparseable-net cases only measure that net while the grammar
         // still rejects them; a grammar that learns to parse one would move it to
