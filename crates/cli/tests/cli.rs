@@ -33,6 +33,10 @@ fn scratch_graph() -> &'static std::path::Path {
 fn cli() -> Command {
     let mut command = Command::new(bin());
     command.env("IW_GRAPH_FILE", scratch_graph());
+    // A proxy that refuses a call reports it to the local agent. Off here, so
+    // a developer running the suite on a host with an agent never gets the
+    // suite's fake attacks as cases; the one test of the report turns it on.
+    command.env("INNERWARDEN_AGENT_URL", "off");
     command
 }
 
@@ -261,6 +265,105 @@ fn run_proxy_fixture(
     }
     drop(child.stdin.take());
     child.wait_with_output().expect("wait for MCP proxy")
+}
+
+/// A request read to the end its `content-length` names.
+#[cfg(unix)]
+fn whole_request(seen: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(seen);
+    let Some((head, body)) = text.split_once("\r\n\r\n") else {
+        return false;
+    };
+    let length = head
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())?
+        })
+        .unwrap_or(0);
+    body.len() >= length
+}
+
+/// A guard proxy that refuses a call reports it to the agent route on this
+/// host's loopback, with the redacted summary and never the raw argument; the
+/// call it forwards in advisory is not reported.
+///
+/// FAILS ON REVERT of the wiring in `cmd_proxy`: nothing reaches the
+/// listener.
+#[cfg(unix)]
+#[test]
+fn a_guard_proxy_reports_the_call_it_refused_to_the_local_agent() {
+    use std::io::{Read, Write as _};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        // Bounded: a proxy that never reports must fail this test, not hang it.
+        listener.set_nonblocking(true).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(20))
+                }
+                Err(_) => return String::new(),
+            }
+        };
+        stream.set_nonblocking(false).unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        let mut seen = Vec::new();
+        let mut buf = [0u8; 4096];
+        while !whole_request(&seen) {
+            match stream.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => seen.extend_from_slice(&buf[..n]),
+            }
+        }
+        let _ = stream.write_all(b"HTTP/1.1 202 Accepted\r\ncontent-length: 2\r\n\r\n{}");
+        String::from_utf8_lossy(&seen).into_owned()
+    });
+    let dir = tempfile::TempDir::new().unwrap();
+    let secret = format!("sk-ant{}", "-FAKEfake1111fake2222fake3333value789");
+    let denied = serde_json::json!({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": {"name": "save", "arguments": {"token": secret}}
+    });
+    let mut child = cli()
+        .args(["proxy", "--mode", "guard", "--label", "e2e", "--", "cat"])
+        .env("IW_GRAPH_FILE", dir.path().join("graph.json"))
+        .env("INNERWARDEN_AGENT_URL", format!("http://127.0.0.1:{port}"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn MCP proxy");
+    writeln!(child.stdin.as_mut().unwrap(), "{denied}").unwrap();
+    drop(child.stdin.take());
+    let out = child.wait_with_output().expect("wait for MCP proxy");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let request = server.join().unwrap();
+    assert!(
+        request.starts_with("POST /api/agent/proxy-block "),
+        "{request}"
+    );
+    let (_, body) = request.split_once("\r\n\r\n").expect("a body");
+    let body: serde_json::Value = serde_json::from_str(body).expect("a JSON body");
+    assert_eq!(body["kind"], "mcp_proxy_block");
+    assert_eq!(body["mode"], "guard");
+    assert_eq!(body["agent_name"], "e2e");
+    assert_eq!(body["tool"], "save");
+    assert!(
+        !request.contains(&secret),
+        "the raw argument left the proxy: {request}"
+    );
 }
 
 #[cfg(unix)]

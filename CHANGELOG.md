@@ -56,6 +56,17 @@ follows semantic versioning.
   a payload followed by `bash r.sh )`, was allowed. An unparseable command
   that names both a fetch and a way to run code is now `fetch_exec_unparsed`:
   review, blocked for an agent.
+- **`innerwarden proxy` reports each refused tool call to a local
+  InnerWarden agent.** When a `guard` or `kill` proxy answers a `tools/call`
+  with a denial, it also sends one `POST /api/agent/proxy-block` to the agent
+  on this host (`https://127.0.0.1:8787` by default), so the refusal shows up
+  there as a case. The report carries what the proxy already records: its
+  label, the tool, the redacted summary of the call, the rule ids that fired
+  and the mode; never the raw arguments. It goes out from a thread of its
+  own and never delays an MCP message. With no agent, the proxy says so once
+  on stderr and nothing else changes. `INNERWARDEN_AGENT_URL` names another
+  address on this host's loopback (an address elsewhere is refused), and
+  `INNERWARDEN_AGENT_URL=off` turns reporting off.
 - **Library users: a connected agent's registry row keeps its systemd unit.**
   `Registry::connect` records the system service the process runs in, read
   only from the cgroup the kernel reports for it, so the row survives a
