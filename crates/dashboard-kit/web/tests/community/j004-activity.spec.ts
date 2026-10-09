@@ -1,5 +1,6 @@
-import { expect, test } from "@playwright/test";
-import { fixture, fulfillJson, guardRoute, installZero, ZERO_OVERVIEW } from "./support";
+import { expect } from "@playwright/test";
+import { test } from "./clock";
+import { fixture, FIXTURE_NOW_MS, fulfillJson, guardRoute, installZero, ZERO_OVERVIEW } from "./support";
 
 /**
  * CJC-090-J004. The Overview: a fresh install is onboarding, not an incident;
@@ -67,7 +68,7 @@ test.describe("CJC-090-J004 local decision overview", () => {
   test("keeps the last good answer and says so when a refresh fails", async ({ page }) => {
     let calls = 0;
     const overview = fixture("overview.json");
-    await page.clock.install();
+    await page.clock.install({ time: FIXTURE_NOW_MS });
     await page.route(guardRoute("overview"), async (route) => {
       calls += 1;
       if (calls > 1) {

@@ -1,5 +1,6 @@
-import { expect, test } from "@playwright/test";
-import { CASE, EMPTY_DECISIONS, fixture, fulfillJson, guardRoute } from "./support";
+import { expect } from "@playwright/test";
+import { test } from "./clock";
+import { CASE, EMPTY_DECISIONS, fixture, FIXTURE_NOW_MS, fulfillJson, guardRoute } from "./support";
 
 /**
  * CJC-090-J005. Cases: every filter is the server's (outcome, reason,
@@ -98,7 +99,7 @@ test.describe("CJC-090-J005 activity filters, pagination, and drilldown", () => 
   test("keeps the last page when a refresh fails, and says so", async ({ page }) => {
     let calls = 0;
     const firstPage = fixture("decisions-page-1.json");
-    await page.clock.install();
+    await page.clock.install({ time: FIXTURE_NOW_MS });
     await page.route(guardRoute("decisions"), (route) => {
       calls += 1;
       return calls > 1 ? fulfillJson(route, { error: "graph_refresh_failed" }, 503) : fulfillJson(route, firstPage);

@@ -1,4 +1,5 @@
-import { expect, test } from "@playwright/test";
+import { expect } from "@playwright/test";
+import { test } from "./clock";
 import { COMMUNITY_TABS } from "./support";
 
 test("Community works with every Enterprise producer absent", async ({ page }) => {

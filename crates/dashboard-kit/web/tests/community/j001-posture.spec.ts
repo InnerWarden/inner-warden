@@ -1,5 +1,6 @@
-import { expect, test } from "@playwright/test";
-import { COMMUNITY_TABS, fulfillJson, guardRoute, META } from "./support";
+import { expect } from "@playwright/test";
+import { test } from "./clock";
+import { COMMUNITY_TABS, FIXTURE_NOW_MS, fulfillJson, guardRoute, META } from "./support";
 
 /**
  * CJC-090-J001. The Community shell: five tabs (the `activity` route is the
@@ -46,7 +47,7 @@ test.describe("CJC-090-J001 Community shell and posture", () => {
 
   test("withdraws the mode when a refresh fails, and restores it only on a fresh answer", async ({ page }) => {
     let metaRequests = 0;
-    await page.clock.install();
+    await page.clock.install({ time: FIXTURE_NOW_MS });
     await page.route(guardRoute("meta"), async (route) => {
       metaRequests += 1;
       if (metaRequests === 2) {

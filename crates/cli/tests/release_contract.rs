@@ -111,3 +111,72 @@ fn the_published_version_is_measured_from_the_binary() {
          deriving its own"
     );
 }
+
+/// A published cut must be traceable to the commit it was built from.
+///
+/// 1.5.2 shipped binaries, npm and deb/rpm from d98eabd by `workflow_dispatch`
+/// and the `guard-v1.5.2` source tag was never pushed; nothing in the run
+/// noticed. The publish job now checks this repository for the tag at the
+/// built commit and ends red without it.
+///
+/// FAILS ON REVERT: remove the step and nothing compares the source tag with
+/// the built commit again.
+#[test]
+fn a_release_checks_its_source_tag_names_the_built_commit() {
+    let step = WORKFLOW
+        .split("- name: ")
+        .find(|s| s.starts_with("The source carries guard-vX.Y.Z at the commit that was built"))
+        .expect("no step checks the source tag of the published cut");
+    for needed in [
+        "git ls-remote",
+        "refs/tags/${tag}",
+        "refs/tags/${tag}^{}",
+        "github.sha",
+        "exit 1",
+    ] {
+        assert!(
+            step.contains(needed),
+            "the tag check lost `{needed}`:\n{step}"
+        );
+    }
+    let publish = WORKFLOW
+        .find("- name: Publish rolling iw-guard release")
+        .expect("rolling publish");
+    let check = WORKFLOW
+        .find("- name: The source carries guard-vX.Y.Z")
+        .expect("tag check");
+    assert!(check > publish, "the check runs once the cut is published");
+}
+
+const NFPM: &str = include_str!("../../../packaging/nfpm.yaml");
+
+/// The `.deb`/`.rpm` install `/usr/bin/innerwarden` and no shortcut.
+///
+/// `iw` is the name of the Linux wireless configuration tool (`/usr/sbin/iw`,
+/// package `iw`); a system package that put an `iw` of ours on PATH would
+/// shadow it, or collide with the distro's package outright. The shell
+/// installer's `iw`/`iw-guard` links and npm's `iw` live in the user's own
+/// directories; the system packages stay out of that name. The site once
+/// promised both shortcuts for every install method.
+///
+/// FAILS ON REVERT: add a `dst: /usr/bin/iw` entry and this names it.
+#[test]
+fn the_system_packages_install_innerwarden_and_no_iw() {
+    let dsts: Vec<&str> = NFPM
+        .lines()
+        .map(str::trim)
+        .filter_map(|l| l.strip_prefix("dst:"))
+        .map(str::trim)
+        .collect();
+    assert!(
+        dsts.contains(&"/usr/bin/innerwarden"),
+        "the packages must install the CLI: {dsts:?}"
+    );
+    for dst in &dsts {
+        let name = dst.rsplit('/').next().unwrap_or(dst);
+        assert!(
+            name != "iw" && name != "iw-guard",
+            "{dst}: a system package must not install a shortcut on PATH"
+        );
+    }
+}

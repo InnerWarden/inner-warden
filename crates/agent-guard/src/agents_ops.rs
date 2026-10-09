@@ -154,6 +154,137 @@ pub fn hook_program(home: &Path, agent: &AgentStatus) -> Option<hook::HookProgra
     })
 }
 
+/// PURE: judge one MCP proxy wrapper's program from what the caller found
+/// when it looked. The same facts and the same rule as a hook's program
+/// ([`hook::judge_hook_program`]), worded for what goes wrong: an MCP client
+/// that cannot start the wrapper cannot start the server behind it.
+pub fn judge_proxy_program(program: &str, fact: hook::ProgramFact) -> hook::HookProgram {
+    use hook::{HookProgram, ProgramFact};
+    let bare = !program.contains(['/', '\\']);
+    if !bare && !Path::new(program).is_absolute() {
+        return HookProgram::Unknown {
+            program: program.to_string(),
+            why: format!(
+                "its MCP proxy runs {program}, a path relative to wherever the agent starts, \
+                 so I cannot check it from here"
+            ),
+        };
+    }
+    let what = match (fact, bare) {
+        (ProgramFact::Executable, _) => return HookProgram::Runs,
+        (ProgramFact::Unreadable, _) => {
+            return HookProgram::Unknown {
+                program: program.to_string(),
+                why: format!(
+                    "its MCP proxy runs {program}, and I could not look to see if it is there"
+                ),
+            }
+        }
+        (ProgramFact::Missing | ProgramFact::NotExecutable, true) => {
+            format!("`{program}`, which is not on PATH")
+        }
+        (ProgramFact::Missing, false) => format!("{program}, which does not exist"),
+        (ProgramFact::NotExecutable, false) => {
+            format!("{program}, which is not an executable file")
+        }
+    };
+    HookProgram::Broken {
+        program: program.to_string(),
+        problem: format!("its MCP proxy runs {what}"),
+    }
+}
+
+/// PURE: across every wrapper in one config, as for hooks: one that runs is
+/// enough, short of that one that could not be checked makes it unknown
+/// ("could not tell" is never "off"), and only then is it broken. `None` when
+/// the config has no wrapper.
+fn judge_proxy_programs(
+    programs: &[String],
+    fact: impl Fn(&str) -> hook::ProgramFact,
+) -> Option<hook::HookProgram> {
+    let verdicts: Vec<hook::HookProgram> = programs
+        .iter()
+        .map(|program| judge_proxy_program(program, fact(program)))
+        .collect();
+    if verdicts.contains(&hook::HookProgram::Runs) {
+        return Some(hook::HookProgram::Runs);
+    }
+    verdicts
+        .iter()
+        .find(|verdict| matches!(verdict, hook::HookProgram::Unknown { .. }))
+        .or_else(|| verdicts.first())
+        .cloned()
+}
+
+/// The proxy wrappers' programs in one MCP config, read as written.
+fn mcp_wrapper_programs(
+    home: &Path,
+    mcp_json: Option<&str>,
+    mcp_toml: Option<&str>,
+) -> Vec<String> {
+    if let Some(relative) = mcp_json {
+        return read_json(&home.join(relative))
+            .map(|config| mcp_wire::guard_wrapper_commands(&config))
+            .unwrap_or_default();
+    }
+    if let Some(relative) = mcp_toml {
+        return read_toml(&home.join(relative))
+            .map(|document| mcp_wire_toml::guard_wrapper_commands_toml(&document))
+            .unwrap_or_default();
+    }
+    Vec::new()
+}
+
+/// Whether the proxy an MCP agent's servers are wrapped in is there to start.
+/// `None` for a hook agent, or one with no InnerWarden wrapper.
+///
+/// A wrapper is only text, like a hook. Its binary removed (an uninstalled
+/// or moved CLI), the agent's MCP servers fail to start: closed, not open,
+/// but the row went on reading "guarded" because only the text was judged.
+pub fn mcp_proxy_program(home: &Path, agent: &AgentStatus) -> Option<hook::HookProgram> {
+    if agent.hookable {
+        return None;
+    }
+    let path_env = std::env::var_os("PATH");
+    mcp_proxy_program_with(home, agent, path_env.as_deref())
+}
+
+fn mcp_proxy_program_with(
+    home: &Path,
+    agent: &AgentStatus,
+    path_env: Option<&OsStr>,
+) -> Option<hook::HookProgram> {
+    let programs = mcp_wrapper_programs(home, agent.mcp_json.as_deref(), agent.mcp_toml.as_deref());
+    judge_proxy_programs(&programs, |program| program_fact(program, path_env))
+}
+
+/// Whether wrappers that are all known to be unable to start leave this
+/// config's guard broken. Unknown and runs are not broken.
+fn proxy_is_broken(programs: &[String], path_env: Option<&OsStr>) -> bool {
+    matches!(
+        judge_proxy_programs(programs, |program| program_fact(program, path_env)),
+        Some(hook::HookProgram::Broken { .. })
+    )
+}
+
+/// The command that rewrites an MCP agent's wrappers to the binary the user
+/// runs it with, in the mode they already have. Never an unwrap: removing
+/// the wrappers because their binary is gone would silently take the guard
+/// off servers that now fail closed.
+pub fn proxy_repair_command(home: &Path, agent: &AgentStatus) -> String {
+    let monitor = match (agent.mcp_json.as_deref(), agent.mcp_toml.as_deref()) {
+        (Some(relative), _) => read_json(&home.join(relative))
+            .and_then(|config| mcp_wire::guarded_mode(&config))
+            .is_some_and(|mode| mode == mcp_wire::WiringMode::Monitor),
+        (None, Some(relative)) => read_toml(&home.join(relative))
+            .and_then(|document| mcp_wire_toml::guarded_mode_toml(&document))
+            .is_some_and(|mode| mode == mcp_wire_toml::WiringMode::Monitor),
+        (None, None) => false,
+    };
+    let flag = if monitor { " --monitor" } else { "" };
+    format!("innerwarden agents connect {}{flag}", agent.name)
+}
+
 /// The command that rewrites this agent's hook to point at the binary the user
 /// runs it with, in the mode the hook already has. It is the per-agent
 /// `install` command the CLI names everywhere else, never a second spelling.
@@ -589,12 +720,18 @@ fn is_guarded(home: &Path, agent: &str, path_env: Option<&OsStr>) -> bool {
     }
     if let Some(rel) = k.mcp_json {
         return read_json(&home.join(rel))
-            .map(|v| mcp_wire::is_guarded(&v))
+            .map(|v| {
+                mcp_wire::is_guarded(&v)
+                    && !proxy_is_broken(&mcp_wire::guard_wrapper_commands(&v), path_env)
+            })
             .unwrap_or(false);
     }
     if let Some(rel) = k.mcp_toml {
         return read_toml(&home.join(rel))
-            .map(|d| mcp_wire_toml::is_guarded_toml(&d))
+            .map(|d| {
+                mcp_wire_toml::is_guarded_toml(&d)
+                    && !proxy_is_broken(&mcp_wire_toml::guard_wrapper_commands_toml(&d), path_env)
+            })
             .unwrap_or(false);
     }
     false
@@ -697,6 +834,10 @@ pub fn status_is_effectively_guarded(home: &Path, agent: &AgentStatus) -> bool {
             .unwrap_or(false);
     }
     status_has_guard_wiring(home, agent)
+        && !matches!(
+            mcp_proxy_program(home, agent),
+            Some(hook::HookProgram::Broken { .. })
+        )
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -746,8 +887,9 @@ fn rows_from_sources(
         let Some(schema) = compatible_mcp_configuration(&config) else {
             continue;
         };
-        let guarded =
-            schema == CompatibleMcpSchema::ProxyWrappable && mcp_wire::is_guarded(&config);
+        let guarded = schema == CompatibleMcpSchema::ProxyWrappable
+            && mcp_wire::is_guarded(&config)
+            && !proxy_is_broken(&mcp_wire::guard_wrapper_commands(&config), path_env);
         let name = generic_mcp_name(&rel, &rows);
         rows.push(AgentStatus {
             name,
@@ -1215,10 +1357,18 @@ fn list_lines(home: &Path) -> Vec<String> {
                 (false, Some(hook::HookProgram::Broken { problem, .. })) => Some(problem),
                 _ => None,
             };
+            // The same for an MCP agent whose proxy wrapper's binary is gone:
+            // its servers cannot start, which is closed, but not guarded.
+            let proxy_broken = match (r.guarded, mcp_proxy_program(home, r)) {
+                (false, Some(hook::HookProgram::Broken { problem, .. })) => Some(problem),
+                _ => None,
+            };
             let guard = if !r.guardable() {
                 "detected (guard manually)".to_string()
             } else if broken.is_some() {
                 "✗ wired, but its hook cannot run".to_string()
+            } else if proxy_broken.is_some() {
+                "✗ wired, but its MCP proxy cannot run".to_string()
             } else if r.guarded {
                 // Name the MODE, not just the mechanism. "guarded (hook)" was the
                 // same string whether the hook records or blocks.
@@ -1250,6 +1400,13 @@ fn list_lines(home: &Path) -> Vec<String> {
                     "  {:<13} {problem}, so nothing is screened. Fix: {}",
                     "",
                     hook_repair_command(home, r)
+                ));
+            }
+            if let Some(problem) = proxy_broken {
+                out.push(format!(
+                    "  {:<13} {problem}, so its MCP servers cannot start. Fix: {}",
+                    "",
+                    proxy_repair_command(home, r)
                 ));
             }
         }
@@ -1762,8 +1919,9 @@ mod tests {
                 && row.evidence == vec![DiscoveryEvidence::CompatibleMcpConfiguration]
         }));
 
+        let guard = format!("{}innerwarden", installed_guard_dir(home.path()));
         for row in generic {
-            let line = connect_one(home.path(), row, "/abs/innerwarden", false, true);
+            let line = connect_one(home.path(), row, &guard, false, true);
             assert!(line.contains("connected"), "{line}");
         }
         let after = rows(home.path());
@@ -2036,8 +2194,17 @@ mod tests {
             ),
         ];
         for (cursor, codex, mode) in cases {
-            std::fs::write(home.path().join(".cursor/mcp.json"), cursor).unwrap();
-            std::fs::write(home.path().join(".codex/config.toml"), codex).unwrap();
+            let abs = installed_guard_dir(home.path());
+            std::fs::write(
+                home.path().join(".cursor/mcp.json"),
+                cursor.replace("/abs/", &abs),
+            )
+            .unwrap();
+            std::fs::write(
+                home.path().join(".codex/config.toml"),
+                codex.replace("/abs/", &abs),
+            )
+            .unwrap();
 
             let (rows, _) = rows_from_sources(home.path(), &[], None);
 
@@ -2091,8 +2258,17 @@ mod tests {
             ),
         ];
         for (cursor, codex, guarded, mode) in cases {
-            std::fs::write(home.path().join(".cursor/mcp.json"), cursor).unwrap();
-            std::fs::write(home.path().join(".codex/config.toml"), codex).unwrap();
+            let abs = installed_guard_dir(home.path());
+            std::fs::write(
+                home.path().join(".cursor/mcp.json"),
+                cursor.replace("/abs/", &abs),
+            )
+            .unwrap();
+            std::fs::write(
+                home.path().join(".codex/config.toml"),
+                codex.replace("/abs/", &abs),
+            )
+            .unwrap();
 
             let (rows, _) = rows_from_sources(home.path(), &[], None);
 
@@ -2115,10 +2291,11 @@ mod tests {
     #[test]
     fn a_generic_mcp_client_reports_the_mode_of_its_own_configuration() {
         let home = tempfile::TempDir::new().unwrap();
-        let recording = r#"{"mcpServers":{"fs":{"command":"/abs/innerwarden","args":["proxy","--mode","advisory","--","npx","fs-server"]}}}"#;
+        let recording = r#"{"mcpServers":{"fs":{"command":"/abs/innerwarden","args":["proxy","--mode","advisory","--","npx","fs-server"]}}}"#
+            .replace("/abs/", &installed_guard_dir(home.path()));
         for dir in [".claude", ".windsurf"] {
             std::fs::create_dir_all(home.path().join(dir)).unwrap();
-            std::fs::write(home.path().join(dir).join("mcp.json"), recording).unwrap();
+            std::fs::write(home.path().join(dir).join("mcp.json"), &recording).unwrap();
         }
         // Claude Code's own hook enforces.
         std::fs::write(
@@ -2172,15 +2349,10 @@ mod tests {
             .into_iter()
             .find(|agent| agent.name == "cursor")
             .unwrap();
-        assert!(
-            connect_one_result(home.path(), &row, "/abs/innerwarden", false, true).configured()
-        );
+        let guard = format!("{}innerwarden", installed_guard_dir(home.path()));
+        assert!(connect_one_result(home.path(), &row, &guard, false, true).configured());
 
-        let output = run_with_guard_bin(
-            home.path(),
-            &["disconnect".into(), "--al".into()],
-            "/abs/innerwarden",
-        );
+        let output = run_with_guard_bin(home.path(), &["disconnect".into(), "--al".into()], &guard);
         assert!(output.iter().any(|line| line.contains("failed:")));
         assert!(is_guarded(home.path(), "cursor", None));
     }
@@ -2216,6 +2388,157 @@ mod tests {
             std::fs::read_to_string(home.path().join(".cursor/mcp.json")).unwrap(),
             existing
         );
+    }
+
+    /// cs-L279. An MCP agent wired to a proxy whose binary is gone is not
+    /// guarded: its servers cannot start (closed, not open), and the row
+    /// says why and how to repair it, never by unwrapping the servers.
+    ///
+    /// FAILS ON REVERT (wrappers judged by their text alone): the row reads
+    /// guarded and the dashboard counts it as an effective guard.
+    #[cfg(unix)]
+    #[test]
+    fn an_mcp_agent_whose_proxy_binary_is_gone_is_not_guarded() {
+        let home = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path().join(".cursor")).unwrap();
+        std::fs::create_dir_all(home.path().join(".codex")).unwrap();
+        let gone = home.path().join("removed/innerwarden");
+        std::fs::write(
+            home.path().join(".cursor/mcp.json"),
+            format!(
+                r#"{{"mcpServers":{{"fs":{{"command":"{}","args":["proxy","--mode","advisory","--","npx","fs-server"]}}}}}}"#,
+                gone.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            home.path().join(".codex/config.toml"),
+            format!(
+                "[mcp_servers.icm]\ncommand = \"{}\"\nargs = [\"proxy\", \"--mode\", \"guard\", \"--\", \"icm\"]\n",
+                gone.display()
+            ),
+        )
+        .unwrap();
+
+        let (rows, _) = rows_from_sources(home.path(), &[], None);
+        for name in ["cursor", "codex"] {
+            let row = rows.iter().find(|row| row.name == name).unwrap();
+            assert!(
+                !row.guarded,
+                "{name}: a wrapper whose binary is gone guards nothing"
+            );
+            assert!(
+                !status_is_effectively_guarded(home.path(), row),
+                "{name}: the dashboard must not count it"
+            );
+            assert!(
+                status_has_guard_wiring(home.path(), row),
+                "{name}: still wired, for repair"
+            );
+            match mcp_proxy_program(home.path(), row) {
+                Some(hook::HookProgram::Broken { problem, .. }) => {
+                    assert!(problem.contains("does not exist"), "{problem}");
+                    assert!(problem.contains(&gone.display().to_string()), "{problem}");
+                }
+                other => panic!("{name}: expected broken, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            proxy_repair_command(
+                home.path(),
+                rows.iter().find(|r| r.name == "cursor").unwrap()
+            ),
+            "innerwarden agents connect cursor --monitor",
+            "the repair keeps the mode the wrappers had"
+        );
+        assert_eq!(
+            proxy_repair_command(
+                home.path(),
+                rows.iter().find(|r| r.name == "codex").unwrap()
+            ),
+            "innerwarden agents connect codex"
+        );
+
+        // The same wiring with its binary back is guarded again.
+        let abs = installed_guard_dir(home.path());
+        let back = format!("{abs}innerwarden");
+        for rel in [".cursor/mcp.json", ".codex/config.toml"] {
+            let text = std::fs::read_to_string(home.path().join(rel)).unwrap();
+            std::fs::write(
+                home.path().join(rel),
+                text.replace(&gone.display().to_string(), &back),
+            )
+            .unwrap();
+        }
+        let (rows, _) = rows_from_sources(home.path(), &[], None);
+        for name in ["cursor", "codex"] {
+            let row = rows.iter().find(|row| row.name == name).unwrap();
+            assert!(row.guarded, "{name}");
+            assert!(status_is_effectively_guarded(home.path(), row), "{name}");
+            assert_eq!(
+                mcp_proxy_program(home.path(), row),
+                Some(hook::HookProgram::Runs)
+            );
+        }
+    }
+
+    /// One wrapper that runs is enough; one that could not be checked is
+    /// unknown, never broken.
+    #[test]
+    fn proxy_programs_are_judged_like_hooks() {
+        use hook::{HookProgram, ProgramFact};
+        let abs = if cfg!(windows) {
+            r"C:\x\innerwarden.exe"
+        } else {
+            "/x/innerwarden"
+        };
+        let gone = vec![abs.to_string()];
+        assert!(matches!(
+            judge_proxy_programs(&gone, |_| ProgramFact::Missing),
+            Some(HookProgram::Broken { .. })
+        ));
+        assert!(matches!(
+            judge_proxy_programs(&gone, |_| ProgramFact::Unreadable),
+            Some(HookProgram::Unknown { .. })
+        ));
+        let two = vec![abs.to_string(), "innerwarden".to_string()];
+        assert_eq!(
+            judge_proxy_programs(&two, |p| if p == "innerwarden" {
+                ProgramFact::Executable
+            } else {
+                ProgramFact::Missing
+            }),
+            Some(HookProgram::Runs)
+        );
+        assert_eq!(judge_proxy_programs(&[], |_| ProgramFact::Missing), None);
+    }
+
+    /// A directory holding the guard's binaries (`innerwarden`, `iw-guard`)
+    /// as executable files, ending in a separator: the `/abs/` these tests
+    /// write wrappers with is replaced by it. A wrapper whose binary does not
+    /// exist is not guarded (its servers cannot start), so a wrapper that IS
+    /// guarded needs a binary that is there.
+    ///
+    /// Off Unix the fixed `/abs/` is kept: it is not an absolute path there,
+    /// so it is judged unknown, which is never "off".
+    fn installed_guard_dir(home: &Path) -> String {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = home.join("guard-bin");
+            std::fs::create_dir_all(&dir).unwrap();
+            for name in ["innerwarden", "iw-guard"] {
+                let bin = dir.join(name);
+                std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+                std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            format!("{}/", dir.display())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = home;
+            "/abs/".to_string()
+        }
     }
 
     fn known_row(home: &Path, name: &str) -> AgentStatus {

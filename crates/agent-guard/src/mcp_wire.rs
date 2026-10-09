@@ -586,6 +586,20 @@ pub fn has_guard_wiring(root: &Value) -> bool {
         .any(|path| table_at(root, path).is_some_and(|map| map.values().any(has_proxy_prefix)))
 }
 
+/// The program each InnerWarden proxy wrapper in this config runs, as
+/// written, in file order. Read, never run: whether each is there to start is
+/// the caller's question (`agents_ops::mcp_proxy_program`).
+pub fn guard_wrapper_commands(root: &Value) -> Vec<String> {
+    SERVER_TABLE_PATHS
+        .iter()
+        .filter_map(|path| table_at(root, path))
+        .flat_map(|map| map.values())
+        .filter(|server| has_proxy_prefix(server))
+        .filter_map(|server| server.get("command").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect()
+}
+
 /// Effective mode across every guarded stdio server. `None` means there is no
 /// fully guarded local server; differing modes are reported as `Mixed`.
 pub fn guarded_mode(root: &Value) -> Option<WiringMode> {

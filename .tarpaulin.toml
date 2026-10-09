@@ -43,7 +43,16 @@ fail-under = 75.0
 # The llvm engine, matching the paid repo. The ptrace engine reports differently
 # on the same tree, and two repos measuring the same thing differently is how a
 # number stops meaning anything across the seam.
-engine = "llvm"
+#
+# Spelled `Llvm`: tarpaulin's config enum is case-sensitive (`Auto`, `Ptrace`,
+# `Llvm`). This file said `llvm` from the day it was added, tarpaulin logged
+# "Invalid config file ... falling back to provided args", and so the floor
+# and the excludes above and below were NEVER applied; CI passed `--engine
+# llvm` on the command line and measured the whole tree with no floor. With
+# the file read, the same tree measured 85.27% (15,535 of 18,219 lines) on
+# 2026-10-08, above the 75 floor. The coverage job now fails if tarpaulin
+# reports the file invalid again.
+engine = "Llvm"
 
 exclude-files = [
     # Entry points. `main.rs` here is argv dispatch onto functions that ARE

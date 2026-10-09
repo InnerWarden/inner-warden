@@ -39,6 +39,31 @@ use std::fmt;
 /// without calling a working install stale.
 pub const EVIDENCE_STALE_AFTER_SECS: u64 = 7 * 24 * 60 * 60;
 
+/// PURE: the evidence facts from the decision record, as `main.rs` hands them
+/// over: `(decisions_recorded, newest_decision_age_secs, decisions_by_hand)`.
+///
+/// `None` for the record is a record that could not be read, which stays
+/// unknown. Only decisions an agent's hook or the MCP proxy recorded count as
+/// evidence; a check by hand was counted as well, so an install whose agent
+/// hook had never fired said its commands "really are reaching the guard"
+/// on the strength of the operator's own checks and drills (rc1-F20).
+pub fn decision_evidence(
+    record: Option<&innerwarden_graph::Graph>,
+    now_ms: u64,
+) -> (Option<u64>, Option<u64>, u64) {
+    let Some(graph) = record else {
+        return (None, None, 0);
+    };
+    let evidence = graph.screening_evidence();
+    (
+        Some(evidence.through_agents),
+        evidence
+            .newest_through_agents_ms
+            .map(|ms| now_ms.saturating_sub(ms) / 1000),
+        evidence.by_hand,
+    )
+}
+
 /// A wired agent whose hook is not known to run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HookTrouble {
@@ -47,6 +72,9 @@ pub struct HookTrouble {
     pub program: HookProgram,
     /// The command that rewrites the hook to a binary that is there.
     pub next: String,
+    /// The wiring is an MCP proxy wrapper, not a hook: its servers cannot
+    /// start rather than run unscreened, and the sentence says which.
+    pub via_proxy: bool,
 }
 
 /// PURE: a duration a person reads at a glance, in its largest whole unit.
@@ -178,13 +206,19 @@ pub struct Facts {
     pub hook_trouble: Vec<HookTrouble>,
     /// Whether ANY agent process was visible, regardless of wiring.
     pub any_agent_seen: Option<bool>,
-    /// Commands screened and recorded, allows included. `Some(0)` is a record
-    /// that exists with nothing in it yet; `None` is a record that could not be
-    /// read, which is a different sentence and must stay one.
+    /// Commands an agent's hook or the MCP proxy screened and recorded, allows
+    /// included. Checks run by hand are NOT here (see `decisions_by_hand`).
+    /// `Some(0)` is a record that exists with nothing an agent sent in it yet;
+    /// `None` is a record that could not be read, which is a different sentence
+    /// and must stay one.
     pub decisions_recorded: Option<u64>,
-    /// How long ago the newest decision was recorded. `None` when no decision
-    /// says when, which is "cannot tell", not "never".
+    /// How long ago the newest of those was recorded. `None` when none says
+    /// when, which is "cannot tell", not "never".
     pub newest_decision_age_secs: Option<u64>,
+    /// Checks run by hand (`innerwarden check`, and the drills and verify runs
+    /// that screen through it). They prove the guard answers, not that an
+    /// agent's commands reach it, so they only explain an empty count.
+    pub decisions_by_hand: u64,
     /// Whether the local dashboard answered. `None` when it was not probed.
     pub dashboard_reachable: Option<bool>,
 }
@@ -269,15 +303,25 @@ pub fn assess(facts: &Facts) -> Vec<Finding> {
         match &trouble.program {
             HookProgram::Broken { problem, .. } => out.push(Finding::NotWorking {
                 what: format!(
-                    "{} is wired, but {problem}, so none of its commands are screened.",
-                    trouble.agent
+                    "{} is wired, but {problem}, so {}.",
+                    trouble.agent,
+                    if trouble.via_proxy {
+                        "its MCP servers cannot start"
+                    } else {
+                        "none of its commands are screened"
+                    }
                 ),
                 next: trouble.next.clone(),
             }),
             HookProgram::Unknown { why, .. } => out.push(Finding::Unknown {
                 what: format!(
-                    "{} is wired, but I could not confirm its hook can run.",
-                    trouble.agent
+                    "{} is wired, but I could not confirm its {} can run.",
+                    trouble.agent,
+                    if trouble.via_proxy {
+                        "MCP proxy"
+                    } else {
+                        "hook"
+                    }
                 ),
                 why: format!("{why}. If it does not, `{}` rewrites it.", trouble.next),
             }),
@@ -315,6 +359,17 @@ pub fn assess(facts: &Facts) -> Vec<Finding> {
 
     // ── Evidence ────────────────────────────────────────────────────────────
     match facts.decisions_recorded {
+        Some(0) if facts.decisions_by_hand > 0 => out.push(Finding::Unknown {
+            what: format!(
+                "No screening decisions from an agent recorded yet, only {} check(s) run \
+                 by hand.",
+                facts.decisions_by_hand
+            ),
+            why: "A check by hand (a drill or a verify run is one too) shows the guard \
+                  answers, not that your agent's commands reach it. Run a command \
+                  through your agent and check again."
+                .into(),
+        }),
         Some(0) => out.push(Finding::Unknown {
             what: "No screening decisions recorded yet.".into(),
             why: "On a quiet machine that is normal; on a busy one it means \
@@ -472,6 +527,7 @@ mod tests {
             any_agent_seen: Some(true),
             decisions_recorded: Some(42),
             newest_decision_age_secs: Some(90),
+            decisions_by_hand: 0,
             dashboard_reachable: Some(true),
         }
     }
@@ -674,6 +730,7 @@ mod tests {
             any_agent_seen: None,
             decisions_recorded: None,
             newest_decision_age_secs: None,
+            decisions_by_hand: 0,
             dashboard_reachable: None,
         };
         for finding in assess(&facts) {
@@ -751,6 +808,60 @@ mod tests {
         )));
     }
 
+    /// rc1-F20: an install whose agent hook never fired, where the operator ran
+    /// checks (or a drill, or a verify) by hand, said "N screening decision(s)
+    /// recorded ... so commands really are reaching the guard".
+    ///
+    /// FAILS ON REVERT: count every decision in the record again and the checks
+    /// become a recent count that reads as `[on]`.
+    #[test]
+    fn checks_by_hand_never_say_an_agent_reaches_the_guard() {
+        let mut graph = innerwarden_graph::Graph::new();
+        for seq in 0..5 {
+            graph.ingest_verdict_with_origin(
+                "local",
+                seq,
+                "curl http://203.0.113.9/x",
+                &serde_json::json!({"recommendation": "deny", "explanation": "x"}),
+                innerwarden_graph::DecisionContext {
+                    mode: innerwarden_graph::DecisionMode::Check,
+                    outcome: innerwarden_graph::DecisionOutcome::Screened,
+                    recorded_at_ms: Some(1_000_000),
+                },
+                &innerwarden_graph::DecisionOrigin {
+                    channel: Some(innerwarden_graph::DecisionChannel::Check),
+                    ..Default::default()
+                },
+            );
+        }
+        let (recorded, age, by_hand) = decision_evidence(Some(&graph), 1_030_000);
+        assert_eq!((recorded, age, by_hand), (Some(0), None, 5));
+
+        let mut f = healthy();
+        f.decisions_recorded = recorded;
+        f.newest_decision_age_secs = age;
+        f.decisions_by_hand = by_hand;
+        let findings = assess(&f);
+        assert!(
+            !findings
+                .iter()
+                .any(|x| matches!(x, Finding::Working(what) if what.contains("reaching"))),
+            "{findings:?}"
+        );
+        assert!(
+            findings.iter().any(|x| matches!(
+                x,
+                Finding::Unknown { what, why }
+                    if what.contains("only 5 check(s) run by hand")
+                        && why.contains("not that your agent's commands reach it")
+            )),
+            "{findings:?}"
+        );
+        assert_ne!(headline(&findings), "InnerWarden is on and screening.");
+        // An unreadable record stays unknown, never zero.
+        assert_eq!(decision_evidence(None, 0), (None, None, 0));
+    }
+
     /// Facts for an install whose only agent is wired to a hook whose program
     /// the caller found in `fact`, as `main.rs` hands them over: an agent whose
     /// hook does not run is in `hook_trouble` and NOT in `wired_agents`, and
@@ -766,6 +877,7 @@ mod tests {
                     agent: "claude-code".into(),
                     program: verdict,
                     next: next.into(),
+                    via_proxy: false,
                 }];
             }
         }

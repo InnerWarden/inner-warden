@@ -41,10 +41,16 @@ export default defineConfig({
       stderr: "pipe",
     },
   ],
+  // Each project names its directory. A `testMatch` regex is applied to the
+  // ABSOLUTE path, so `/community\/.*\.spec\.ts/` matched every spec of a
+  // checkout that sits under any directory ending in "community" (a worktree
+  // named `...-community` ran the enterprise and acceptance specs in this
+  // project, against the wrong server).
   projects: [
     {
       name: "community-chromium",
-      testMatch: /community\/.*\.spec\.ts/,
+      testDir: "./tests/community",
+      testMatch: /\.spec\.ts$/,
       use: {
         ...devices["Desktop Chrome"],
         baseURL: "http://127.0.0.1:4173",
@@ -52,7 +58,8 @@ export default defineConfig({
     },
     {
       name: "enterprise-chromium",
-      testMatch: /enterprise\/.*\.spec\.ts/,
+      testDir: "./tests/enterprise",
+      testMatch: /\.spec\.ts$/,
       use: {
         ...devices["Desktop Chrome"],
         baseURL: "http://127.0.0.1:4174",
@@ -63,7 +70,8 @@ export default defineConfig({
       // community fixture server; each test page.route()s the exact API it needs
       // (community or enterprise), so it stays deterministic and fixture-only.
       name: "acceptance-chromium",
-      testMatch: /acceptance\/.*\.spec\.ts/,
+      testDir: "./tests/acceptance",
+      testMatch: /\.spec\.ts$/,
       use: {
         ...devices["Desktop Chrome"],
         baseURL: "http://127.0.0.1:4173",

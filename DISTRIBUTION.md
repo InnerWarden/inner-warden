@@ -214,6 +214,11 @@ When a new Community version ships:
    once to the immutable `guard-vX.Y.Z` tag, once to the rolling `iw-guard` tag.
    The version comes from the built binary, not from the tag. Republishing an
    existing `guard-vX.Y.Z` is refused: bump the version instead.
+   This repo must also carry the annotated `guard-vX.Y.Z` tag at the commit
+   that was built: a tag push cuts the release from it; a `workflow_dispatch`
+   run cannot push one, so its last step ends red until a person does
+   (`git tag -a guard-vX.Y.Z <sha> -m "InnerWarden Community X.Y.Z" && git push
+   origin guard-vX.Y.Z`). 1.5.2 shipped without it.
 ### Pinning and rollback
 
 The rolling `iw-guard` tag always carries the newest build, so its binaries are

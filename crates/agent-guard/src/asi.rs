@@ -138,6 +138,7 @@ pub fn signal_to_asi(signal: &str) -> Option<&'static str> {
         | "fetch_exec_ephemeral_host"
         | "fetch_exec_shortened_source"
         | "fetch_exec_decoder"
+        | "fetch_exec_unparsed"
         | "reverse_shell" => "ASI05",
         // ASI02 Tool Misuse & Exploitation, the shell tool driven to a
         // dangerous call.
@@ -149,6 +150,9 @@ pub fn signal_to_asi(signal: &str) -> Option<&'static str> {
         // ASI10 Rogue Agents, out-of-scope destructive/persistence behaviour
         // and tampering with the security layer to keep operating.
         "security_tooling_tamper" | "destructive_command" | "persistence_attempt" => "ASI10",
+        // ASI04 Agentic Supply Chain Vulnerabilities, installing a look-alike of
+        // a popular package (a typosquat, or a name the agent invented).
+        "package_typosquat" => "ASI04",
         _ => return None,
     })
 }
@@ -242,6 +246,7 @@ mod tests {
             "insecure_permissions",
             "security_tooling_tamper",
             "obfuscated_command",
+            "package_typosquat",
         ] {
             assert!(threat(signal_to_asi(s).unwrap()).is_some(), "signal {s}");
         }

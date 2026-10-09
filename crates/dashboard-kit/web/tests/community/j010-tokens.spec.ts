@@ -1,4 +1,5 @@
-import { expect, test } from "@playwright/test";
+import { expect } from "@playwright/test";
+import { test } from "./clock";
 import { FIXTURE_NOW_MS, fulfillJson, guardRoute, NO_TOKEN_HISTORY } from "./support";
 
 /**

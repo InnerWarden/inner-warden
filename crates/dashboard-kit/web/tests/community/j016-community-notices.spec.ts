@@ -1,4 +1,5 @@
-import { expect, test } from "@playwright/test";
+import { expect } from "@playwright/test";
+import { test } from "./clock";
 import { COMMUNITY_TABS, expectHonestUpsell, fulfillJson, guardRoute, META, PAGE_READY } from "./support";
 
 /**

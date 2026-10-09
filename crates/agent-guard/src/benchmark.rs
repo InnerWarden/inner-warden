@@ -493,8 +493,8 @@ mod tests {
         let results = run(&corpus, &engine);
         let s = Scoreboard::from_results(&results);
 
-        assert_eq!(s.malicious_total, 133, "malicious corpus contract changed");
-        assert_eq!(s.benign_total, 86, "benign corpus contract changed");
+        assert_eq!(s.malicious_total, 245, "malicious corpus contract changed");
+        assert_eq!(s.benign_total, 160, "benign corpus contract changed");
 
         // The benign set must keep covering the shape the rules are most aggressive
         // about. It previously held 0 benign fetch-and-execute cases against 93
@@ -559,7 +559,16 @@ mod tests {
             "bn-046", "bn-047", "bn-048", "bn-049", "bn-050", "bn-051", "bn-052", "bn-053",
             "bn-054", "bn-055", "bn-056", "bn-057", "bn-058", "bn-059", "bn-060", "bn-061",
             "bn-062", "bn-063", "bn-064", "bn-065", "bn-066", "bn-067", "bn-068", "bn-069",
-            "bn-070", "bn-071",
+            "bn-070", "bn-071", "bn-087", "bn-088", "bn-089", "bn-090", "bn-091", "bn-092",
+            "bn-093", "bn-094", "bn-095", "bn-096", "bn-097", "bn-098", "bn-099", "bn-100",
+            "bn-101", "bn-102", "bn-103", "bn-104", "bn-105", "bn-106", "bn-107", "bn-108",
+            "bn-109", "bn-110", "bn-111", "bn-112", "bn-113", "bn-114", "bn-115", "bn-116",
+            "bn-117", "bn-118", "bn-119", "bn-120", "bn-121", "bn-122", "bn-123", "bn-124",
+            "bn-125", "bn-126", "bn-127", "bn-128", "bn-129", "bn-130", "bn-131", "bn-132",
+            "bn-133", "bn-134", "bn-135", "bn-136", "bn-137", "bn-138", "bn-139", "bn-140",
+            "bn-141", "bn-142", "bn-143", "bn-144", "bn-145", "bn-146", "bn-147", "bn-148",
+            "bn-149", "bn-150", "bn-151", "bn-152", "bn-153", "bn-154", "bn-155", "bn-156",
+            "bn-157", "bn-158", "bn-159", "bn-160",
         ] {
             assert_eq!(
                 outcome(id),
@@ -583,8 +592,79 @@ mod tests {
             "dx-081", "dx-082", "dx-083", "dx-084", "dx-085", "dx-086", "dx-087", "dx-088",
             "dx-089", "dx-090", "dx-091", "dx-092", "dx-093", "dx-094", "cr-006", "cr-007",
             "cr-008", "cr-009", "cr-010", "tp-002", "de-002", "de-003", "ii-002", "ob-003",
+            // cs-L2717: two-step fetch-then-run through a shell variable or a `.`
+            // source, and look-alike package installs.
+            "dx-095", "dx-096", "dx-097", "dx-098", "dx-099", "dx-100", "dx-101", "dx-102",
+            "dx-103", "dx-104", "dx-105", "dx-106", "dx-107", "dx-108", "ts-001", "ts-002",
+            "ts-003", "ts-004", "ts-005", "ts-006",
+            // An unparseable command naming a fetch and a way to run code, and a
+            // look-alike fetched by a run (npx, uvx, pipx run) or a download.
+            "dx-109", "dx-110", "dx-111", "dx-112", "dx-113", "dx-114", "ts-007", "ts-008",
+            "ts-009", "ts-010", "ts-011", "ts-012", "dx-115",
+            // A fetch-then-run through aria2c, axel, lwp-download, BSD fetch or
+            // an interpreter one-liner, in a command that parses.
+            "dx-116", "dx-117", "dx-118", "dx-119", "dx-120", "dx-121", "dx-122", "dx-123",
+            "dx-124", "dx-125", "dx-126", "dx-127", "dx-128", "dx-129", "dx-130", "dx-131",
+            "dx-132", "dx-133", "pe-004", "pe-005", "pe-006", "pe-007", "pe-008", "dx-134",
+            "dx-135", "dx-136", "dx-137", "dx-138", "pe-009",
+            // Remote-content readers: object stores, clusters, containers,
+            // remote hosts, remote git refs.
+            "dx-139", "dx-140", "dx-141", "dx-142", "dx-143", "dx-144", "dx-145", "dx-146",
+            "dx-147", "dx-148", "dx-149", "dx-150",
+            // A fetched or remote-read archive unpacked, then something from it run.
+            "dx-151", "dx-152", "dx-153", "dx-154", "dx-155", "dx-156",
+            // Remote shells, secret stores, transfer clients, sockets, more
+            // unpackers, fetched packages installed, PowerShell, hostile clones,
+            // and other files that run later.
+            "dx-157", "dx-158", "dx-159", "dx-160", "dx-161", "dx-162", "dx-163", "dx-164",
+            "dx-165", "dx-166", "dx-167", "dx-168", "dx-169", "dx-170", "dx-171", "dx-172",
+            "dx-173", "dx-174", "dx-175", "dx-176", "dx-177", "dx-178", "dx-179", "dx-180",
+            "pe-010", "pe-011", "pe-012", "pe-013", "pe-014", "pe-015", "pe-016", "pe-017",
         ] {
             assert_eq!(outcome(id), Outcome::Caught, "{id} must be caught");
+        }
+        // A fetch-and-run after `cd` into a world-writable directory carries the
+        // temp-directory evidence too, so it is denied, not left at the review
+        // a vendor installer gets. Caught alone would pass at review.
+        for id in [
+            "dx-127", "dx-128", "dx-129", "dx-130", "dx-131", "dx-132", "dx-133",
+        ] {
+            let result = results.iter().find(|r| r.id == id).unwrap();
+            assert_eq!(result.recommendation, "deny", "{id} must be denied");
+            assert!(
+                result.charged_signals.iter().any(|s| s == "tmp_execution"),
+                "{id}: {:?}",
+                result.charged_signals
+            );
+        }
+        // A startup-file write is caught for what it writes, not only for
+        // touching the file: the written command's own signal is charged.
+        for (id, carried) in [
+            ("pe-004", "download_and_execute"),
+            ("pe-005", "download_and_execute"),
+            ("pe-006", "download_and_execute"),
+            ("pe-007", "reverse_shell"),
+            ("pe-008", "download_and_execute"),
+        ] {
+            let result = results.iter().find(|r| r.id == id).unwrap();
+            assert!(
+                result.charged_signals.iter().any(|s| s == carried),
+                "{id}: {:?}",
+                result.charged_signals
+            );
+        }
+        // The unparseable-net cases only measure that net while the grammar
+        // still rejects them; a grammar that learns to parse one would move it to
+        // the structural rules and leave the net unmeasured.
+        for id in [
+            "dx-109", "dx-110", "dx-111", "dx-112", "dx-113", "dx-114", "dx-115", "bn-099",
+            "bn-100", "bn-101", "bn-102", "bn-103", "bn-104", "bn-105",
+        ] {
+            let case = corpus.cases.iter().find(|c| c.id == id).unwrap();
+            assert!(
+                !crate::shell::project(&case.input).parsed,
+                "{id} must stay unparseable to measure the unparsed net"
+            );
         }
     }
 

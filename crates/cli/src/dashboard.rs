@@ -1836,7 +1836,24 @@ mod tests {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, body).unwrap();
         };
-        let bin = TEST_GUARD_BIN;
+        // The CLI the wrappers run must be there to start: a wrapper whose
+        // binary is gone is not guarded at all. Off Unix the fixed path is not
+        // absolute and is judged unknown, which still counts as wired.
+        let installed = |rel: &str| -> String {
+            if !cfg!(unix) {
+                return format!("/{rel}");
+            }
+            let path = home.path().join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "#!/bin/sh\n").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            path.display().to_string()
+        };
+        let bin = installed("abs/innerwarden");
         write(
             ".openclaw/openclaw.json",
             format!(
@@ -1855,14 +1872,24 @@ mod tests {
                 r#"{{"mcpServers":{{"s":{{"command":"{bin}","args":["proxy","--label","cursor","--agent","cursor","--mode","advisory","--","npx"]}}}}}}"#
             ),
         );
+        // Another copy of the CLI, also there to start.
+        let other_copy = installed("opt/pinned/innerwarden");
         write(
             ".gemini/settings.json",
-            r#"{"mcpServers":{"s":{"command":"/opt/pinned/innerwarden","args":["proxy","--mode","advisory","--","npx"]}}}"#.to_string(),
+            format!(
+                r#"{{"mcpServers":{{"s":{{"command":"{other_copy}","args":["proxy","--mode","advisory","--","npx"]}}}}}}"#
+            ),
         );
 
         let rows = innerwarden_agent_guard::agents_ops::rows(home.path());
-        let payload: serde_json::Value =
-            serde_json::from_str(&agents_json(home.path(), &rows)).unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&agents_json_with_status(
+            home.path(),
+            &rows,
+            false,
+            None,
+            &bin,
+        ))
+        .unwrap();
         let agent = |id: &str| {
             payload["agents"]
                 .as_array()
@@ -2624,9 +2651,28 @@ mod tests {
     fn aggregate_status_surfaces_partial_wiring_instead_of_hiding_it() {
         let home = tempfile::TempDir::new().unwrap();
         std::fs::create_dir_all(home.path().join(".cursor")).unwrap();
+        // The wrapper's binary must be there to start: a bare `innerwarden`
+        // passed only where the machine running the suite had one on PATH
+        // (a developer Mac did, the Linux build box did not). Off Unix the
+        // fixed path is not absolute and is judged unknown, never "off".
+        let guard = if cfg!(unix) {
+            let bin = home.path().join("bin/innerwarden");
+            std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+            std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            bin.display().to_string()
+        } else {
+            "/abs/innerwarden".to_string()
+        };
         std::fs::write(
             home.path().join(".cursor/mcp.json"),
-            r#"{"mcpServers":{"guarded":{"command":"innerwarden","args":["proxy","--mode","advisory","--","npx","one"]},"late":{"command":"npx","args":["two"]}}}"#,
+            format!(
+                r#"{{"mcpServers":{{"guarded":{{"command":"{guard}","args":["proxy","--mode","advisory","--","npx","one"]}},"late":{{"command":"npx","args":["two"]}}}}}}"#
+            ),
         )
         .unwrap();
         let rows = innerwarden_agent_guard::agents_ops::rows(home.path());

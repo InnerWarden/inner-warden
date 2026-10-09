@@ -72,6 +72,70 @@ fn capture_proc_facts(pid: u32) -> (Option<String>, Option<u32>, Option<String>)
     (exe_path, owner_uid, cmdline_fingerprint)
 }
 
+/// The systemd SYSTEM unit `pid` runs in, read from the cgroup the kernel
+/// reports for it in `/proc/<pid>/cgroup`. `None` when unreadable or when the
+/// process is not the payload of a system service (a login session scope, a
+/// container scope, anything under the per-user manager).
+///
+/// Why the registry keeps it (cs-L1317): it stored only the pid, so after a
+/// service restart the row was stale and every consumer had to rediscover
+/// the agent by reading unit drop-ins and asking systemd for `MainPID`.
+/// The unit survives restarts; the pid does not.
+///
+/// Trust boundary: the name comes ONLY from the kernel's cgroup report at
+/// connect, never from the caller, so a guarded process cannot point its row
+/// at another service by naming one. It is still a fact about the moment of
+/// connect: a consumer that resolves the unit's current `MainPID` must prove
+/// that process is the same program (`exe_path`, `cmdline_fingerprint`)
+/// before treating it as the agent.
+pub fn capture_systemd_unit(pid: u32) -> Option<String> {
+    let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+    systemd_unit_from_cgroup(&cgroup)
+}
+
+/// Parse the system service out of `/proc/<pid>/cgroup` text.
+///
+/// Reads the unified (`0::`) line, falling back to the cgroup v1
+/// `name=systemd` hierarchy. Walks down from the root through `.slice`
+/// components and takes the first `.service` component. `user.slice` stops
+/// the walk: everything under it is a session or the per-user manager, whose
+/// units `systemctl` (system) does not own. A sub-cgroup inside a delegated
+/// service (`/system.slice/x.service/worker`) still belongs to `x.service`.
+pub fn systemd_unit_from_cgroup(cgroup: &str) -> Option<String> {
+    let path = cgroup
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .or_else(|| {
+            cgroup.lines().find_map(|line| {
+                let mut fields = line.splitn(3, ':');
+                let _hierarchy = fields.next()?;
+                let controllers = fields.next()?;
+                let path = fields.next()?;
+                controllers
+                    .split(',')
+                    .any(|controller| controller == "name=systemd")
+                    .then_some(path)
+            })
+        })?;
+    for component in path.trim().split('/').filter(|c| !c.is_empty()) {
+        if component == "user.slice" {
+            return None;
+        }
+        if component.ends_with(".slice") {
+            continue;
+        }
+        let valid = component.len() <= 256
+            && component.len() > ".service".len()
+            && component.ends_with(".service")
+            && !component.starts_with('.')
+            && component.chars().all(|c| {
+                c.is_ascii_alphanumeric() || matches!(c, ':' | '_' | '.' | '@' | '-' | '\\')
+            });
+        return valid.then(|| component.to_string());
+    }
+    None
+}
+
 /// A connected agent instance.
 #[derive(Debug)]
 pub struct ConnectedAgent {
@@ -98,6 +162,10 @@ pub struct ConnectedAgent {
     /// Stable fingerprint of `/proc/<pid>/cmdline` at connect (interpreter +
     /// script path). `None` when unreadable.
     pub cmdline_fingerprint: Option<String>,
+    /// The systemd system unit the process ran in at connect, from the
+    /// kernel's cgroup report (see [`capture_systemd_unit`]). `None` for a
+    /// process that is not a system service's payload.
+    pub systemd_unit: Option<String>,
 }
 
 /// Policy applied to a connected agent.
@@ -167,14 +235,47 @@ impl Registry {
         instance_label: Option<&str>,
     ) -> Result<String, String> {
         let (exe_path, owner_uid, cmdline_fingerprint) = capture_proc_facts(pid);
-        self.connect_with_facts(
+        let id = self.connect_with_facts(
             name,
             pid,
             instance_label,
             exe_path,
             owner_uid,
             cmdline_fingerprint,
-        )
+        )?;
+        // Kernel fact only: the caller of `connect` cannot name the unit.
+        if let Some(agent) = self.agents.get_mut(&id) {
+            agent.systemd_unit = capture_systemd_unit(pid);
+        }
+        Ok(id)
+    }
+
+    /// [`Registry::connect_with_facts`] plus the systemd unit, for a caller
+    /// that read the cgroup itself (tests, or a daemon that already holds the
+    /// kernel's answer). Never feed this a name a client supplied.
+    #[allow(clippy::too_many_arguments)]
+    pub fn connect_with_facts_and_unit(
+        &mut self,
+        name: &str,
+        pid: u32,
+        instance_label: Option<&str>,
+        exe_path: Option<String>,
+        owner_uid: Option<u32>,
+        cmdline_fingerprint: Option<String>,
+        systemd_unit: Option<String>,
+    ) -> Result<String, String> {
+        let id = self.connect_with_facts(
+            name,
+            pid,
+            instance_label,
+            exe_path,
+            owner_uid,
+            cmdline_fingerprint,
+        )?;
+        if let Some(agent) = self.agents.get_mut(&id) {
+            agent.systemd_unit = systemd_unit;
+        }
+        Ok(id)
     }
 
     /// Connect with explicitly-supplied identity facts. Used by `connect()`
@@ -222,6 +323,7 @@ impl Registry {
             exe_path,
             owner_uid,
             cmdline_fingerprint,
+            systemd_unit: None,
         };
 
         tracing::info!(
@@ -285,6 +387,7 @@ impl Registry {
                 tool_calls: a.stats.tool_calls,
                 blocked: a.stats.blocked,
                 warnings: a.stats.warnings,
+                systemd_unit: a.systemd_unit.clone(),
             })
             .collect()
     }
@@ -345,6 +448,7 @@ impl Registry {
                 exe_path: a.exe_path.clone(),
                 owner_uid: a.owner_uid,
                 cmdline_fingerprint: a.cmdline_fingerprint.clone(),
+                systemd_unit: a.systemd_unit.clone(),
             })
             .collect();
         RegistrySnapshot {
@@ -419,6 +523,7 @@ impl Registry {
                     exe_path: p.exe_path,
                     owner_uid: p.owner_uid,
                     cmdline_fingerprint: p.cmdline_fingerprint,
+                    systemd_unit: p.systemd_unit,
                 },
             );
         }
@@ -462,6 +567,10 @@ pub struct PersistedAgent {
     pub owner_uid: Option<u32>,
     #[serde(default)]
     pub cmdline_fingerprint: Option<String>,
+    // cs-L1317, backward-compatible the same way: older snapshots have no
+    // unit and restore with None, and an older reader ignores the key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub systemd_unit: Option<String>,
 }
 
 // `AgentStats` needs `Deserialize` for the round-trip; the existing
@@ -513,6 +622,8 @@ pub struct AgentSummary {
     pub tool_calls: u64,
     pub blocked: u64,
     pub warnings: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub systemd_unit: Option<String>,
 }
 
 #[cfg(test)]
@@ -690,6 +801,7 @@ mod tests {
                 exe_path: None,
                 owner_uid: None,
                 cmdline_fingerprint: None,
+                systemd_unit: None,
             }],
         };
         std::fs::write(&path, serde_json::to_string(&snapshot).unwrap()).unwrap();
@@ -805,6 +917,111 @@ mod tests {
         assert_eq!(agent.exe_path, None);
         assert_eq!(agent.owner_uid, None);
         assert_eq!(agent.cmdline_fingerprint, None);
+        assert_eq!(agent.systemd_unit, None, "a pre-cs-L1317 row has no unit");
+    }
+
+    // -----------------------------------------------------------------
+    // cs-L1317: the systemd unit, from the kernel's cgroup report only.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn a_system_service_pid_carries_its_unit_and_a_session_pid_none() {
+        for (cgroup, unit) in [
+            (
+                "0::/system.slice/openclaw.service\n",
+                Some("openclaw.service"),
+            ),
+            (
+                "0::/system.slice/system-getty.slice/getty@tty1.service\n",
+                Some("getty@tty1.service"),
+            ),
+            // A sub-cgroup inside a delegated service still belongs to it.
+            (
+                "0::/system.slice/openclaw.service/worker\n",
+                Some("openclaw.service"),
+            ),
+            // A custom top-level slice is the system manager's too.
+            ("0::/apps.slice/agent.service\n", Some("agent.service")),
+            // cgroup v1: the named systemd hierarchy.
+            (
+                "12:memory:/x\n1:name=systemd:/system.slice/hermes.service\n",
+                Some("hermes.service"),
+            ),
+            // Login sessions and the per-user manager are not system units.
+            ("0::/user.slice/user-1000.slice/session-3.scope\n", None),
+            (
+                "0::/user.slice/user-1000.slice/user@1000.service/app.slice/openclaw.service\n",
+                None,
+            ),
+            // Containers and other scopes are not services.
+            ("0::/system.slice/docker-0123abcd.scope\n", None),
+            ("0::/\n", None),
+            ("0::/init.scope\n", None),
+            // Not a unit name.
+            ("0::/system.slice/bad name.service\n", None),
+            ("0::/system.slice/.service\n", None),
+            ("", None),
+        ] {
+            assert_eq!(
+                systemd_unit_from_cgroup(cgroup).as_deref(),
+                unit,
+                "cgroup {cgroup:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_unit_round_trips_and_is_absent_from_a_row_without_one() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("registry.json");
+        let with_unit = unique_pid();
+        let without_unit = with_unit.wrapping_add(7);
+        let mut reg = Registry::new();
+        reg.connect_with_facts_and_unit(
+            "OpenClaw",
+            with_unit,
+            Some("svc"),
+            None,
+            Some(0),
+            None,
+            Some("openclaw.service".to_string()),
+        )
+        .unwrap();
+        reg.connect_with_facts("claude", without_unit, None, None, Some(1000), None)
+            .unwrap();
+        reg.save_to(&path).unwrap();
+
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            body.matches("\"systemd_unit\"").count(),
+            1,
+            "only the service row carries the key: {body}"
+        );
+        let restored = Registry::restore_from(&path).unwrap();
+        assert_eq!(
+            restored.by_pid(with_unit).unwrap().systemd_unit.as_deref(),
+            Some("openclaw.service")
+        );
+        assert_eq!(restored.by_pid(without_unit).unwrap().systemd_unit, None);
+        let listed = restored.list();
+        assert!(listed
+            .iter()
+            .any(|a| a.pid == with_unit && a.systemd_unit.as_deref() == Some("openclaw.service")));
+    }
+
+    #[test]
+    fn connect_reads_the_unit_from_the_kernel_not_the_caller() {
+        // `connect` takes no unit argument at all; what it stores is whatever
+        // the kernel reports for the pid, so it matches a direct read of the
+        // same cgroup file (None off Linux, None for a missing pid).
+        let mut reg = Registry::new();
+        let pid = std::process::id();
+        let id = reg.connect("self", pid, None).unwrap();
+        assert_eq!(
+            reg.get_mut(&id).unwrap().systemd_unit,
+            capture_systemd_unit(pid)
+        );
+        assert_eq!(capture_systemd_unit(u32::MAX), None);
     }
 
     // -----------------------------------------------------------------
