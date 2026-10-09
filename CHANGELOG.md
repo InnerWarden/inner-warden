@@ -5,6 +5,8 @@ follows semantic versioning.
 
 ## Unreleased
 
+## 1.5.3 - 2026-10-09
+
 ### Upgrade notes: what to do
 
 - **An agent can no longer install a package whose name is one letter off a
