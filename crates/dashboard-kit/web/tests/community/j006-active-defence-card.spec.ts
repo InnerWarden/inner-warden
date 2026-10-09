@@ -94,8 +94,16 @@ test.describe("CJC-J006 the Active Defence card reads the host", () => {
 
     await page.clock.fastForward(5_000);
     await expect.poll(() => metaRequests).toBe(2);
-    await page.clock.fastForward(5_000);
-    await expect.poll(() => metaRequests).toBe(3);
+    // The route counts the second request before the page settles its answer,
+    // and the next one is asked 5 s after that settle, which can land after a
+    // single fast-forward returned. Step the clock until it is asked: a reader
+    // polling on its own would jump the count past 3 and fail the same check.
+    await expect
+      .poll(async () => {
+        await page.clock.runFor(1_000);
+        return metaRequests;
+      }, { timeout: 15_000 })
+      .toBe(3);
   });
 
   /**

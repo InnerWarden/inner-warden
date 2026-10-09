@@ -19,6 +19,7 @@ use innerwarden_agent_guard::render::{is_deny, render_verdict};
 use innerwarden_agent_guard::{hook, mcp::analyze_command, rules::RuleEngine};
 
 mod agent_policy;
+mod agent_report;
 mod agents_io;
 mod binary_freshness;
 mod concern;
@@ -1816,12 +1817,21 @@ fn cmd_proxy(rest: &[String]) -> std::process::ExitCode {
         }
     };
     let proxy_session = format!("mcp:{label}");
+    // A refused call is also reported to a local InnerWarden agent when one
+    // runs, from a thread of its own; with none, the proxy says so once and
+    // nothing else changes (`agent_report`).
+    let reporter = agent_report::BlockReporter::from_env();
+    let report_to = reporter.sender();
     let on_event = move |d: &ProxyDecision| {
         // The graph is an action timeline: persist every client tools/call,
         // including allows, but never persist a server response as a command.
         graph_io::record_mcp(d, mode, Some(&proxy_session), agent.as_deref());
         if !d.verdict.alerts.is_empty() {
             eprintln!("{}", format_alert(&label, d));
+        }
+        if let (Some(tx), Some(body)) = (&report_to, agent_report::block_report(&label, mode, d)) {
+            // Full: the agent is not keeping up; the local record stands.
+            let _ = tx.try_send(body);
         }
     };
     let result = rt.block_on(run_proxy(cfg, Some(engine), on_event));
@@ -1830,6 +1840,9 @@ fn cmd_proxy(rest: &[String]) -> std::process::ExitCode {
     // cannot be cancelled: a proxy told to stop while its client was still
     // connected would hang here until the client wrote or closed.
     rt.shutdown_background();
+    // The last refusal (a `kill` ends the session right after it) still
+    // reaches the agent, within a bound.
+    reporter.finish(agent_report::REPORT_DRAIN);
     match result {
         Ok(code) => std::process::ExitCode::from(code.clamp(0, 255) as u8),
         Err(e) => {
