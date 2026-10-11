@@ -299,6 +299,20 @@ jobs:
           cp public-releases/install.ps1 dist/install.ps1
           ls -lh dist/
 
+      # The installer creates ~/.local and ~/.local/bin and installs the binary
+      # with the caller's umask. Ubuntu and Debian log users in with 0002, which
+      # made all three group-writable (775), and the CLI's own screening
+      # refuses a binary whose path a group can write. The installer therefore
+      # sets its own umask, and a release that ships one without it is stopped.
+      # The installer lives in the distribution repo: its umask change has to
+      # be merged there before a release from here can pass this step.
+      - name: Installer sets its own umask
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -Eq '^[[:space:]]*umask 0{0,2}22([[:space:]]+#.*)?[[:space:]]*$' dist/iw-guard-install.sh \
+            || { echo "::error::iw-guard-install.sh does not set 'umask 022'; it would create group-writable paths under a 0002 login umask."; exit 1; }
+
       - name: Regenerate the Scoop manifest (fresh version + hashes)
         id: version
         shell: bash

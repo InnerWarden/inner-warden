@@ -150,9 +150,11 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
         "hook" => format!(
             "{p} hook [--block-review] [--monitor]\n  \
              The PreToolUse adapter: reads the agent's tool call as JSON on stdin and\n  \
-             screens the shell command inside it. Exit 2 blocks the call, exit 0 allows\n  \
-             it. A payload with no shell command always allows, so a non-Bash tool call\n  \
-             is never wedged.\n\
+             screens the shell command inside it. A file tool (Write, Edit, MultiEdit,\n  \
+             NotebookEdit) is judged on the file it changes: a privileged one (agent\n  \
+             settings, the guard's configuration, shell startup files, credentials) is\n  \
+             refused, any other passes at once. Exit 2 blocks the call, exit 0 allows\n  \
+             it. Any other tool call always allows, so it is never wedged.\n\
              \n  \
              --block-review   block `review` verdicts too (default: deny only)\n  \
              --monitor        record every command and never block"
@@ -169,8 +171,9 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
         "install" => format!(
             "{p} install [<agent>] [--settings PATH] [--block-review] [--monitor]\n  \
              Wire the guardrail into an agent as a blocking PreToolUse hook, so every\n  \
-             shell command it proposes is screened before it runs. Idempotent, and it\n  \
-             preserves the settings already there.\n  \
+             shell command it proposes is screened before it runs, and its file tools\n  \
+             cannot change a privileged file. Idempotent, and it preserves the settings\n  \
+             already there.\n  \
              With no agent named, the agent detected on this host is used; a host with\n  \
              none is refused rather than assumed.\n\
              \n  \

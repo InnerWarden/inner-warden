@@ -2,6 +2,7 @@ import type { TokenCounterSet, TokenIntelligence as TokenIntelligenceContract, T
 import { gridColumnsClass, gridSpanClass, joinClasses } from "../components/cardGrid";
 import { StatusBadge } from "../components/StatusBadge";
 import { formatAbsolute } from "../presentation";
+import { EMPTY_BODY_TIGHT, EYEBROW_CYAN, EYEBROW_CYAN_WIDE, EYEBROW_SLATE, LEAD, NOTE, ROW_BETWEEN, STAT_VALUE, TITLE_TRUNCATE } from "../components/classes";
 
 /** Provider cards are compact, so three across is comfortable; the shared fill
  * rule keeps the last row as full as the ones above it at every count. */
@@ -18,9 +19,9 @@ export function TokenIntelligence({ report, stale = false }: { report: TokenInte
     <div data-tour="tokens" className="space-y-6">
       <header className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
         <div>
-          <p className="text-xs font-semibold uppercase tracking-[0.16em] text-cyan-700">Local resource visibility</p>
+          <p className={EYEBROW_CYAN_WIDE}>Local resource visibility</p>
           <h1 className="mt-1 text-2xl font-semibold tracking-tight text-slate-950">Token intelligence</h1>
-          <p className="mt-2 max-w-3xl text-sm leading-6 text-slate-600">
+          <p className={LEAD}>
             How much your agents have consumed, read from the history each one keeps on this machine.
           </p>
         </div>
@@ -30,7 +31,7 @@ export function TokenIntelligence({ report, stale = false }: { report: TokenInte
       {report.totals ? <Totals counters={report.totals} /> : (
         <section className="rounded-2xl border border-dashed border-slate-300 bg-white px-5 py-10 text-center">
           <h2 className="font-semibold text-slate-900">No totals yet</h2>
-          <p className="mx-auto mt-1 max-w-xl text-sm leading-6 text-slate-600">
+          <p className={EMPTY_BODY_TIGHT}>
             No agent here has recorded a token history InnerWarden can read. A total appears once one does; nothing is estimated in the meantime.
           </p>
         </section>
@@ -39,8 +40,8 @@ export function TokenIntelligence({ report, stale = false }: { report: TokenInte
       {report.providers.length > 0 ? (
         <section aria-labelledby="token-providers-title">
           <div className="mb-3">
-            <p className="text-xs font-semibold uppercase tracking-[0.14em] text-cyan-700">Per agent</p>
-            <h2 id="token-providers-title" className="mt-1 text-lg font-semibold text-slate-950">Usage by agent</h2>
+            <p className={EYEBROW_CYAN}>Per agent</p>
+            <h2 id="token-providers-title" className={STAT_VALUE}>Usage by agent</h2>
           </div>
           <ul className={providerGridClass(report.providers.length)}>
             {report.providers.map((provider, index) => (
@@ -58,7 +59,7 @@ export function TokenIntelligence({ report, stale = false }: { report: TokenInte
       {/* Was a cyan "Privacy boundary" panel at the top of every load. The
           promise it makes is real and permanent, which is exactly why it does
           not need to be the second thing on the screen. */}
-      <p className="text-xs leading-5 text-slate-500">{PRIVACY_FOOTNOTE}</p>
+      <p className={NOTE}>{PRIVACY_FOOTNOTE}</p>
     </div>
   );
 }
@@ -69,8 +70,8 @@ export const PRIVACY_FOOTNOTE =
 function Totals({ counters }: { counters: TokenCounterSet }) {
   return (
     <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm" aria-labelledby="token-totals-title">
-      <p className="text-xs font-semibold uppercase tracking-[0.14em] text-slate-500">Available local history</p>
-      <h2 id="token-totals-title" className="mt-1 text-lg font-semibold text-slate-950">Observed totals</h2>
+      <p className={EYEBROW_SLATE}>Available local history</p>
+      <h2 id="token-totals-title" className={STAT_VALUE}>Observed totals</h2>
       <dl className="mt-4 grid grid-cols-2 gap-4 md:grid-cols-4">
         <Counter label="Total" value={counters.total} primary />
         <Counter label="Input" value={counters.input} />
@@ -88,9 +89,9 @@ function ProviderCard({ provider, stale, spanClass = "" }: { provider: TokenProv
   const hasCounters = Object.values(provider.counters).some((value) => value !== null);
   return (
     <li className={joinClasses("min-w-0 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm", spanClass)}>
-      <div className="flex min-w-0 flex-wrap items-start justify-between gap-3">
+      <div className={ROW_BETWEEN}>
         <div className="min-w-0">
-          <h3 className="truncate text-base font-semibold text-slate-950" title={provider.display_name}>{provider.display_name}</h3>
+          <h3 className={TITLE_TRUNCATE} title={provider.display_name}>{provider.display_name}</h3>
           <p className="mt-1 truncate text-xs text-slate-500" title={provider.agent_id}>{provider.agent_id}</p>
         </div>
         <StatusBadge status={stale ? "stale" : provider.availability} />

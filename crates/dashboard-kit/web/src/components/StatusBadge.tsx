@@ -1,3 +1,4 @@
+import { TONE_CYAN, TONE_EMERALD_DEEP } from "./classes";
 /**
  * `stopped` is InnerWarden (or the kernel) stopping something: the outcome
  * palette's accent, the colour the lane bars and the case rows draw a stop
@@ -119,12 +120,12 @@ export function StatusBadge({
 }) {
   const presentation = statusPresentation(status, label, tone);
   const classes: Record<StatusTone, string> = {
-    positive: "border-emerald-200 bg-emerald-50 text-emerald-800",
+    positive: TONE_EMERALD_DEEP,
     informational: "border-blue-200 bg-blue-50 text-blue-800",
     attention: "border-amber-200 bg-amber-50 text-amber-900",
     critical: "border-rose-200 bg-rose-50 text-rose-800",
     neutral: "border-slate-200 bg-slate-50 text-slate-700",
-    stopped: "border-cyan-200 bg-cyan-50 text-cyan-900",
+    stopped: TONE_CYAN,
   };
 
   return (

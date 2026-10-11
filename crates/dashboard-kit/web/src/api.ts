@@ -340,6 +340,8 @@ export type TokenAgent = {
   reasoning_output_tokens: string | null;
   sessions: number | null;
   last_observed_at_ms: number | null;
+  /** How much of the retained history the figures cover; absent for a row without counters. */
+  coverage?: { complete: boolean; files_read: number; files_found: number };
   provenance: {
     source: string;
     quality: string;

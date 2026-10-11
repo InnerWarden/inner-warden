@@ -280,3 +280,44 @@ fn a_hook_pointing_at_a_removed_build_is_not_reported_on() {
         "{out}"
     );
 }
+
+/// The row: `status` says which tool classes an agent's hook judges. A hook
+/// wired by an earlier version runs for shell commands only; `status` says
+/// so and names the command that adds the file tools, and after it, says
+/// they are judged.
+///
+/// FAILS ON REVERT: drop the file-tools merge from `install` and the second
+/// status still says only shell commands are judged.
+#[test]
+fn status_names_the_tool_classes_an_agent_hook_judges() {
+    let home = tempfile::TempDir::new().expect("temp home");
+    let command = format!("\"{}\" hook --agent claude-code", bin());
+    std::fs::create_dir_all(home.path().join(".claude")).expect("agent config dir");
+    std::fs::write(
+        home.path().join(".claude/settings.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({"hooks": {"PreToolUse": [{
+            "matcher": "Bash",
+            "hooks": [{"type": "command", "command": command}]
+        }]}}))
+        .expect("settings json"),
+    )
+    .expect("write settings");
+
+    let before = run(home.path(), &["status"]);
+    assert!(
+        before.contains("claude-code: only shell commands are judged"),
+        "{before}"
+    );
+    assert!(
+        before.contains("try: innerwarden install claude-code"),
+        "{before}"
+    );
+
+    run(home.path(), &["install", "claude-code"]);
+    let after = run(home.path(), &["status"]);
+    assert!(
+        after.contains("claude-code: judged before they run: shell commands, and file changes"),
+        "{after}"
+    );
+    assert!(!after.contains("only shell commands are judged"), "{after}");
+}

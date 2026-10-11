@@ -659,11 +659,6 @@ fn guard_self_disable_in(content: &str) -> Option<(&'static str, u32)> {
             "force-allows every command, which disables the guardrail entirely",
             60,
         );
-        add(
-            r#"(?i)\binnerwarden\b\s+(?:dry-run|mute)\b"#,
-            "puts the guard into a mode where it records but never refuses",
-            50,
-        );
         // Removing or rewriting the hook that carries the screening. Covers the
         // file being deleted, moved aside, or edited to drop the hook array.
         add(
@@ -749,6 +744,12 @@ fn guard_self_disable_in(content: &str) -> Option<(&'static str, u32)> {
             60,
         ));
     }
+    if mode_verb_text_outside_a_reader(content) {
+        return Some((
+            "puts the guard into a mode where it records but never refuses",
+            50,
+        ));
+    }
     if writes_guard_config(content, 0) {
         return Some((
             "writes into the guard's own configuration, which holds its allow and mute rules",
@@ -811,9 +812,35 @@ fn runs_guard_loosening_verb(content: &str, depth: u8) -> bool {
         return false;
     }
     let segments = shell_command_segments(content);
+    // `python3 <<EOF ... subprocess.run(["innerwarden", "mute", "x"]) ... EOF`:
+    // the body is code for the program that reads it, not shell commands.
+    if content.contains("<<")
+        && segments
+            .iter()
+            .any(|segment| segment_runs_code_runner(&shell_tokens(segment)))
+        && code_text_runs_guard_verb(content)
+    {
+        return true;
+    }
     for (index, segment) in segments.iter().enumerate() {
         let words = shell_tokens(segment);
         if words_run_guard_loosening_verb(&words, depth) {
+            return true;
+        }
+        // `echo "os.system('innerwarden mute x')" | python3`
+        let piped_into_runner = segments.get(index + 1).is_some_and(|next| {
+            segments_are_piped(content, segment, next)
+                && segment_runs_code_runner(&shell_tokens(next))
+        });
+        if piped_into_runner
+            && words.first().is_some_and(|word| {
+                matches!(
+                    token_basename(&word.to_ascii_lowercase()),
+                    "echo" | "printf" | "cat"
+                )
+            })
+            && code_text_runs_guard_verb(&words[1..].join(" "))
+        {
             return true;
         }
         // `echo 'innerwarden allow x' | sh`: the text is the command.
@@ -901,6 +928,12 @@ fn words_run_guard_loosening_verb_fed(words: &[String], depth: u8, mut fed: bool
             after_option = true;
             continue;
         }
+        // A program that runs code or a command line it is handed (an
+        // interpreter, a remote or container exec): the verb inside the text
+        // it is given is run by it, whatever the quoting.
+        if is_code_runner(base) {
+            return code_text_runs_guard_verb(&words[index + 1..].join(" "));
+        }
         let skippable = after_option
             || dollar
             || (in_substitution || word.starts_with('`')) && matches!(base, "echo" | "printf")
@@ -945,6 +978,253 @@ fn command_string_argument<'a>(runner: &str, arguments: &'a [String]) -> Option<
         }
     }
     None
+}
+
+/// Programs that run code, or a command line, that they are handed as text:
+/// interpreters, and the commands that run something elsewhere (a remote
+/// shell, a container, a multiplexer). The verb is looked for inside the text
+/// these are given, because their quoting is their own and the shell's reading
+/// of the line does not show what they will run.
+const CODE_RUNNERS: &[&str] = &[
+    "python",
+    "py",
+    "pypy",
+    "node",
+    "nodejs",
+    "deno",
+    "bun",
+    "ruby",
+    "perl",
+    "php",
+    "lua",
+    "luajit",
+    "awk",
+    "gawk",
+    "mawk",
+    "osascript",
+    "pwsh",
+    "powershell",
+    "tclsh",
+    "expect",
+    "groovy",
+    "julia",
+    "rscript",
+    "ssh",
+    "docker",
+    "podman",
+    "nerdctl",
+    "kubectl",
+    "lxc",
+    "incus",
+    "nsenter",
+    "machinectl",
+    "watch",
+    "tmux",
+    "screen",
+    "runuser",
+    "sg",
+    "chroot",
+    "busybox",
+    "at",
+];
+
+/// Whether `base` (a command word, lowercased and without its directory) is one
+/// of [`CODE_RUNNERS`], version suffix and `.exe` aside (`python3.12`).
+fn is_code_runner(base: &str) -> bool {
+    let base = base.strip_suffix(".exe").unwrap_or(base);
+    CODE_RUNNERS.contains(&base) || CODE_RUNNERS.contains(&strip_interpreter_version(base))
+}
+
+/// Whether the command of one simple command is one of [`CODE_RUNNERS`].
+fn segment_runs_code_runner(words: &[String]) -> bool {
+    effective_command_index(words)
+        .is_some_and(|at| is_code_runner(token_basename(&words[at].to_ascii_lowercase())))
+}
+
+/// Whether free text (the code or command line handed to a [`CODE_RUNNERS`]
+/// program) runs `innerwarden allow|mute|dry-run|monitor` in a way that widens
+/// what the guard lets through.
+///
+/// The name has to stand alone, the verb has to follow it (spaces, or the
+/// quotes and commas of an argument list: `['innerwarden', 'mute', 'x']`), and
+/// the arguments run up to the end of the call. `mute --list`, `--help` and
+/// `--remove` are reads or narrowing, as in [`guard_verb_loosens`].
+fn code_text_runs_guard_verb(text: &str) -> bool {
+    text_runs_guard_verb(text, &[])
+}
+
+/// [`code_text_runs_guard_verb`] for the verbs in `only` (every verb when it
+/// is empty).
+fn text_runs_guard_verb(text: &str, only: &[&str]) -> bool {
+    const NAME: &str = "innerwarden";
+    // Same byte offsets as `text`, which is what the slices below rely on.
+    let lower = text.to_ascii_lowercase();
+    let mut from = 0usize;
+    while let Some(found) = lower[from..].find(NAME) {
+        let start = from + found;
+        let after = start + NAME.len();
+        from = after;
+        // `$'x:\n\tinnerwarden ...'`: an escaped tab or newline before the
+        // name is a separator once the shell decodes it.
+        let escaped_space = ["\\t", "\\n", "\\r"]
+            .iter()
+            .any(|escape| lower[..start].ends_with(escape));
+        let before_is_name = !escaped_space
+            && lower[..start]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+        let after_is_separator = text[after..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_whitespace() || matches!(c, '\'' | '"' | ',' | ']' | ')'));
+        if before_is_name || !after_is_separator {
+            continue;
+        }
+        let tail = &text[after..];
+        let end = tail
+            .find([';', '|', '&', ')', ']', '\n'])
+            .unwrap_or(tail.len());
+        let arguments: Vec<String> = tail[..end]
+            // A `\` splits too: `'innerwarden dry-run\n'` in a `printf`
+            // or `$'...'` string ends the verb at the escape.
+            .split(|c: char| {
+                c.is_whitespace() || matches!(c, '\'' | '"' | ',' | '[' | '(' | '`' | '\\')
+            })
+            .filter(|token| !token.is_empty())
+            .map(str::to_string)
+            .collect();
+        let verb = arguments
+            .iter()
+            .find(|argument| *argument != "--")
+            .map(|verb| verb.to_ascii_lowercase());
+        let wanted = only.is_empty() || verb.as_deref().is_some_and(|verb| only.contains(&verb));
+        if wanted && guard_verb_loosens(&arguments) {
+            return true;
+        }
+    }
+    false
+}
+
+/// The verbs that switch the guard to recording only (`dry-run`, `monitor`)
+/// or silence its rules (`mute`). `dry-run` has no terminal check of its own,
+/// so the guard's reading of the agent's command is the only thing in its way.
+const MODE_VERBS: &[&str] = &["mute", "dry-run", "monitor"];
+
+/// Whether `innerwarden mute|dry-run|monitor`, with arguments that widen what
+/// is let through, appears in the command anywhere but in a simple command
+/// that only reads or prints text.
+///
+/// This is the backstop behind [`runs_guard_loosening_verb`], which finds the
+/// verb only where it knows the program that runs it. A launcher it does not
+/// know (`flock`, `strace`, `systemd-run`, `socat EXEC:`, a `git` alias, an
+/// editor's `!`, a file written and then run) still carries the verb in the
+/// text. So the text decides, and only a search, a commit message or an
+/// `echo` that goes nowhere is let through. Reading the lists and asking for
+/// help (`mute --list`, `--help`) are not a widening, wherever they appear.
+fn mode_verb_text_outside_a_reader(content: &str) -> bool {
+    if !text_runs_guard_verb(content, MODE_VERBS) {
+        return false;
+    }
+    let segments = shell_command_segments(content);
+    let mut seen_in_a_segment = false;
+    for (index, segment) in segments.iter().enumerate() {
+        if !text_runs_guard_verb(segment, MODE_VERBS) {
+            continue;
+        }
+        seen_in_a_segment = true;
+        if !segment_only_reads(content, &segments, index) {
+            return true;
+        }
+    }
+    // The verb is in the text but in no one command of it: the split did not
+    // show where it runs, so it is not taken for a read.
+    !seen_in_a_segment
+}
+
+/// Whether simple command `index` of `content`, and every command its output
+/// is piped into, only reads or prints text: its program is one that runs
+/// nothing it is handed, nothing in it is substituted or redirected to a
+/// file, and no variable is set in front of it.
+fn segment_only_reads(content: &str, segments: &[&str], index: usize) -> bool {
+    let segment = segments[index];
+    if ["$(", "`", "<(", ">("]
+        .iter()
+        .any(|substitution| segment.contains(substitution))
+        || segment_redirects_output(segment)
+        || !words_only_read(&shell_tokens(segment))
+    {
+        return false;
+    }
+    match segments.get(index + 1) {
+        Some(next) if segments_are_piped(content, segment, next) => {
+            segment_only_reads(content, segments, index + 1)
+        }
+        _ => true,
+    }
+}
+
+/// Programs that read or print text and run none of it, with the options
+/// that would make them run or write something ruled out. The command word
+/// must come first: `GIT_PAGER=... git log` or `env X=... grep` runs what the
+/// variable names.
+fn words_only_read(words: &[String]) -> bool {
+    let Some(first) = words.first() else {
+        return false;
+    };
+    let base = token_basename(&first.to_ascii_lowercase()).to_string();
+    match base.as_str() {
+        "grep" | "egrep" | "fgrep" | "cat" | "head" | "tail" | "wc" | "cut" | "tr" | "ls"
+        | "echo" => true,
+        // `rg --pre <command>` runs the command on every file.
+        "rg" => !words.iter().any(|word| word.starts_with("--pre")),
+        // `printf -v name ...` sets a variable a later command can run.
+        "printf" => !words.iter().skip(1).any(|word| word.starts_with("-v")),
+        // A message or a log read. `git -c alias.x='!cmd'` and other options
+        // before the subcommand, and `--output=<file>`, are not reads.
+        "git" => {
+            words.get(1).is_some_and(|subcommand| {
+                matches!(
+                    subcommand.as_str(),
+                    "commit" | "log" | "show" | "diff" | "blame"
+                )
+            }) && !words.iter().any(|word| word.starts_with("--output"))
+        }
+        _ => false,
+    }
+}
+
+/// Whether a simple command sends its output to a file. `/dev/null` is not a
+/// file; a descriptor copy (`2>&1`) is, since the command line split cut it.
+fn segment_redirects_output(segment: &str) -> bool {
+    let bytes = segment.as_bytes();
+    let mut index = 0usize;
+    let mut single_quoted = false;
+    let mut double_quoted = false;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'\\' && !single_quoted {
+            index += 2;
+            continue;
+        }
+        if byte == b'\'' && !double_quoted {
+            single_quoted = !single_quoted;
+        } else if byte == b'"' && !single_quoted {
+            double_quoted = !double_quoted;
+        } else if byte == b'>' && !single_quoted && !double_quoted {
+            let rest = segment[index + 1..].trim_start_matches(['>', '|']);
+            let target = rest
+                .trim_start()
+                .split(char::is_whitespace)
+                .next()
+                .unwrap_or("");
+            if target != "/dev/null" {
+                return true;
+            }
+        }
+        index += 1;
+    }
+    false
 }
 
 /// The arguments after `innerwarden`, when something before it adds more:
@@ -1188,7 +1468,6 @@ fn interpreter_code_writes_guard_config(interpreter: &str, arguments: &[String])
     }
     static NAMES: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     static WRITES: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    static RUNS: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let names = NAMES.get_or_init(|| {
         regex::Regex::new(r#"\.config\W{1,8}innerwarden|xdg_config_home\W{1,24}innerwarden"#)
             .expect("static config path regex")
@@ -1199,11 +1478,7 @@ fn interpreter_code_writes_guard_config(interpreter: &str, arguments: &[String])
         )
         .expect("static interpreter write regex")
     });
-    let runs = RUNS.get_or_init(|| {
-        regex::Regex::new(r#"\binnerwarden\b["']?\s*,?\s*["']?(?:allow|mute|dry-run|monitor)\b"#)
-            .expect("static interpreter subprocess regex")
-    });
-    (names.is_match(&code) && writes.is_match(&code)) || runs.is_match(&code)
+    (names.is_match(&code) && writes.is_match(&code)) || code_text_runs_guard_verb(&code)
 }
 
 /// Cheap literal gate in front of a regex family.
@@ -5941,6 +6216,11 @@ pub(crate) struct PrivilegedTarget {
     pub(crate) path: String,
 }
 
+/// What [`PRIVILEGED_WRITE_TARGETS`] calls root's home. A writer that runs as
+/// root has its own home there, so a caller that knows the writer's home (the
+/// file-tool hook) can tell its own work from a reach into root's.
+pub(crate) const ROOT_HOME: &str = "root's home directory";
+
 const fn group(what: &'static str, places: &'static [Place]) -> PrivilegedGroup {
     PrivilegedGroup {
         what,
@@ -6047,10 +6327,7 @@ const PRIVILEGED_WRITE_TARGETS: &[PrivilegedGroup] = &[
             Place::Tree("/sys/fs/bpf/innerwarden"),
         ],
     ),
-    group(
-        "root's home directory",
-        &[Place::Tree("/root"), Place::Tree("/var/root")],
-    ),
+    group(ROOT_HOME, &[Place::Tree("/root"), Place::Tree("/var/root")]),
     group(
         "the libraries loaded into every program",
         &[
@@ -10787,6 +11064,130 @@ mod brq_evaluation_tests {
             assert!(
                 check_guard_self_disable(cmd).is_none(),
                 "reading or naming the verb is not running it: {cmd}"
+            );
+        }
+    }
+
+    /// Reading the mute list, asking for help, and text that only names the
+    /// verb (a search, a commit message, a note) must keep running. A broad
+    /// pattern once denied all of them.
+    ///
+    /// FAILS ON REVERT: put the plain `innerwarden (dry-run|mute)` pattern
+    /// back into `guard_self_disable_in` and every line here is denied.
+    #[test]
+    fn reading_the_mute_list_or_naming_the_mode_verbs_is_not_a_bypass() {
+        for cmd in [
+            "innerwarden mute --list",
+            "innerwarden mute --help",
+            "innerwarden mute -h",
+            "innerwarden mute --remove ATR-1",
+            "innerwarden mute",
+            "innerwarden dry-run --help",
+            "innerwarden --help",
+            "grep -rn 'innerwarden mute' docs/",
+            "grep -rn \"innerwarden dry-run\" crates/",
+            "git commit -m 'innerwarden mute: needs a terminal'",
+            "git commit -m \"innerwarden dry-run is a mode\"",
+            "echo 'innerwarden dry-run records and never refuses'",
+            "sed -n '1,20p' notes-on-innerwarden-mute.md",
+            "python3 scripts/check_docs.py",
+            "python3 -c \"print('the innerwarden-mute notes')\"",
+            "python3 -c \"import subprocess;subprocess.run(['innerwarden','mute','--list'])\"",
+            "python3 -c \"import subprocess;subprocess.run(['innerwarden','dry-run','--help'])\"",
+            "ssh host innerwarden mute --list",
+            "docker exec box innerwarden mute --help",
+            "python3 <<'EOF'\nprint('innerwarden mute --list')\nEOF",
+            "grep -rn 'innerwarden mute' docs/ 2>/dev/null | head -5",
+            "cat CHANGELOG.md | grep -n 'innerwarden dry-run'",
+            "git log --oneline --grep='innerwarden dry-run'",
+            "rg -n 'innerwarden mute ATR' crates/ | wc -l",
+            "printf '%s\\n' 'innerwarden dry-run records only'",
+            "flock /tmp/l innerwarden mute --list",
+            "socat - EXEC:'innerwarden mute --help'",
+        ] {
+            assert!(
+                check_guard_self_disable(cmd).is_none(),
+                "reading or naming the verb is not running it: {cmd}"
+            );
+        }
+    }
+
+    /// The text of `mute`, `dry-run` or `monitor` is refused wherever a
+    /// program the parser does not know may run it, as 1.5.4 refused it. Only
+    /// a simple command that reads or prints (`grep`, `git commit -m`, an
+    /// `echo` that goes nowhere) is let through.
+    ///
+    /// FAILS ON REVERT: drop `mode_verb_text_outside_a_reader` from
+    /// `guard_self_disable_in` and every line here is `None`.
+    #[test]
+    fn a_mode_verb_behind_a_launcher_the_parser_does_not_know_is_a_bypass() {
+        for cmd in [
+            "flock /tmp/l innerwarden dry-run",
+            "strace -o /dev/null innerwarden dry-run",
+            "systemd-run --user --wait innerwarden dry-run",
+            "env -S 'innerwarden dry-run'",
+            "git -c alias.d='!innerwarden dry-run' d",
+            "vim -es -c '!innerwarden dry-run' -c q",
+            "parallel ::: 'innerwarden dry-run'",
+            "sh -s <<< 'innerwarden dry-run'",
+            "make -f - <<< $'x:\\n\\tinnerwarden dry-run'",
+            "sudo -E -u $USER innerwarden dry-run",
+            "printf 'innerwarden dry-run\\n' > /tmp/m.sh; sh /tmp/m.sh",
+            "socat - EXEC:'innerwarden mute ATR-1',pty",
+            "zsh -c 'zmodload zsh/zpty; zpty x innerwarden mute ATR-1'",
+            "echo 'innerwarden mute x' | xargs -I{} sh -c '{}'",
+            "printf 'innerwarden mute x' | tee /tmp/a.sh; sh /tmp/a.sh",
+            "echo $(innerwarden mute x)",
+            "git commit -m \"$(innerwarden dry-run)\"",
+            "GIT_PAGER='innerwarden dry-run' git log",
+            "printf -v c 'innerwarden dry-run'; $c",
+            "git log -1 --output=/tmp/x.sh --format='innerwarden dry-run'; sh /tmp/x.sh",
+            "rg --pre 'innerwarden dry-run' x",
+            "grep -r 'innerwarden mute x' . 2>&1 | sh",
+            "flock /tmp/l innerwarden monitor",
+        ] {
+            assert!(
+                check_guard_self_disable(cmd).is_some(),
+                "the verb can run here: {cmd}"
+            );
+        }
+    }
+
+    /// The verb handed to a program that runs it for the agent (an
+    /// interpreter, a remote or container exec, a heredoc, a pipe into one)
+    /// is still the bypass. The shell's own reading of the line does not show
+    /// it, so the text the program is given is read.
+    ///
+    /// FAILS ON REVERT: drop the `is_code_runner` branch, the heredoc check or
+    /// the pipe check from `runs_guard_loosening_verb` and the matching lines
+    /// are `None`.
+    #[test]
+    fn mute_and_dry_run_inside_a_program_that_runs_them_are_a_bypass() {
+        for cmd in [
+            "python3 -c \"import os; os.system('innerwarden mute x')\"",
+            "python3 -c \"import os; os.system('innerwarden dry-run')\"",
+            "python3 -c \"import subprocess;subprocess.run(['innerwarden','mute','x'])\"",
+            "python3 -c \"import subprocess;subprocess.run(['innerwarden', 'dry-run'])\"",
+            "python3.12 -c \"import os; os.system('innerwarden mute x')\"",
+            "node -e \"require('child_process').execSync('innerwarden dry-run')\"",
+            "perl -e 'system(\"innerwarden mute x\")'",
+            "ruby -e 'system(\"innerwarden mute x\")'",
+            "awk 'BEGIN{system(\"innerwarden mute x\")}'",
+            "ssh host 'innerwarden mute ATR-1'",
+            "ssh host innerwarden dry-run",
+            "docker exec box innerwarden mute ATR-1",
+            "kubectl exec pod -- innerwarden dry-run",
+            "watch -n 5 innerwarden dry-run",
+            "tmux send-keys 'innerwarden mute x' Enter",
+            "python3 <<'EOF'\nimport os\nos.system('innerwarden mute x')\nEOF",
+            "python3 - <<EOF\nimport subprocess\nsubprocess.run(['innerwarden','dry-run'])\nEOF",
+            "echo \"os.system('innerwarden dry-run')\" | python3",
+            "printf 'os.system(\"innerwarden mute x\")' | python3 -",
+            "cd /tmp && python3 -c \"import os; os.system('innerwarden mute x')\"",
+        ] {
+            assert!(
+                check_guard_self_disable(cmd).is_some(),
+                "a verb run through a program is still the agent running it: {cmd}"
             );
         }
     }

@@ -1,3 +1,4 @@
+import { TONE_CYAN, TONE_EMERALD, TONE_SLATE } from "./classes";
 /**
  * What happened to one screened command, as a chip, with what the word means
  * on hover.
@@ -14,7 +15,7 @@ export const OUTCOME_CHIPS: Record<string, { label: string; meaning: string; cla
     meaning: "The guardrail refused it before it ran.",
     // The outcome palette's accent: a refusal is a stop, not a bad thing
     // that happened (`outcomeTone`, `refused_before_run`).
-    className: "border-cyan-200 bg-cyan-50 text-cyan-900",
+    className: TONE_CYAN,
   },
   would_block: {
     label: "Would block",
@@ -24,12 +25,12 @@ export const OUTCOME_CHIPS: Record<string, { label: string; meaning: string; cla
   allowed: {
     label: "Allowed to run",
     meaning: "The guardrail let it run.",
-    className: "border-emerald-200 bg-emerald-50 text-emerald-700",
+    className: TONE_EMERALD,
   },
   screened: {
     label: "Checked only",
     meaning: "Judged by a one-off check. The guardrail did not run it or watch it run, so whether it ran is not in this record.",
-    className: "border-slate-200 bg-slate-50 text-slate-600",
+    className: TONE_SLATE,
   },
   unknown: {
     label: "Outcome unknown",

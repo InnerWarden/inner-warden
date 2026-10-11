@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { TechnicalDetailToggle, useTechnicalDetail } from "./TechnicalDetail";
 import logo from "../assets/logo.svg";
+import { TITLE_SM } from "./classes";
 
 /**
  * Where the tour's button goes: the header's own slot, inside the small-screen
@@ -122,7 +123,7 @@ export function Header<Route extends string>({
         >
           <img src={logo} alt="InnerWarden" className="h-7 w-auto sm:h-9" />
           <div className="flex min-w-0 items-baseline gap-2 border-l border-slate-200 pl-3 leading-tight">
-            <span className="text-sm font-semibold text-slate-900">{editionLabel}</span>
+            <span className={TITLE_SM}>{editionLabel}</span>
             {/* Below 400 px the version costs the header a row; it is one
                 click away in the product's own status. */}
             {version ? <span className="hidden text-[11px] font-medium text-slate-500 min-[400px]:inline" title={`v${version}`}>v{technical ? version : shortVersion(version)}</span> : null}

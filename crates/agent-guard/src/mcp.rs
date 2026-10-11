@@ -274,6 +274,66 @@ pub(crate) const READ_ONLY_TOOLS: &[&str] = &[
 /// it names.
 const WRITE_TOOLS: &[&str] = &["write_file", "edit_file", "move_file", "create_directory"];
 
+/// Verbs that name a change to a file, as a word of a tool's name.
+const WRITE_VERBS: &[&str] = &[
+    "write",
+    "edit",
+    "move",
+    "rename",
+    "create",
+    "delete",
+    "remove",
+    "append",
+    "replace",
+    "save",
+    "put",
+    "upload",
+    "patch",
+    "insert",
+    "copy",
+    "mkdir",
+    "chmod",
+    "chown",
+    "unlink",
+    "truncate",
+    "overwrite",
+    "upsert",
+];
+
+/// Whether a tool's name says it changes files: one of [`WRITE_TOOLS`], or a
+/// name with a word that is a [`WRITE_VERBS`] verb (`writeFile`, `fs_write`,
+/// `create_file`, `str_replace_editor`). Words are split at `_`, `-`, `.`,
+/// `/`, `:`, spaces and lower-to-upper case changes; a verb's agent form
+/// (`editor`, `writer`) and plural (`edits`) count, its past (`created`) does
+/// not.
+fn name_says_it_writes(tool_name: &str) -> bool {
+    if WRITE_TOOLS.contains(&tool_name) {
+        return true;
+    }
+    let mut words: Vec<String> = Vec::new();
+    let mut word = String::new();
+    let mut previous_lower = false;
+    for c in tool_name.chars() {
+        if !c.is_alphanumeric() {
+            words.extend((!word.is_empty()).then(|| std::mem::take(&mut word)));
+            previous_lower = false;
+            continue;
+        }
+        if c.is_uppercase() && previous_lower {
+            words.push(std::mem::take(&mut word));
+        }
+        previous_lower = c.is_lowercase() || c.is_ascii_digit();
+        word.extend(c.to_lowercase());
+    }
+    words.extend((!word.is_empty()).then_some(word));
+    words.iter().any(|word| {
+        WRITE_VERBS.iter().any(|verb| {
+            word.strip_prefix(verb)
+                .is_some_and(|rest| matches!(rest, "" | "s" | "r" | "or" | "er"))
+        })
+    })
+}
+
 /// Arguments that carry what is written rather than where: `write_file`'s
 /// `content`, `edit_file`'s `oldText` / `newText`, and the same values under
 /// the names other file-editing tools give them. A string under one of these
@@ -419,8 +479,12 @@ fn privileged_write_alert(
     args: &serde_json::Value,
     declared: ToolDeclaration,
 ) -> Option<VerdictAlert> {
+    // A server's `readOnlyHint` is believed for a tool of its own, never for
+    // one whose name says it writes: `write_file` declared read-only is a
+    // server mislabelling (or hiding) a writer, and the call is judged as the
+    // write it is.
     let read_only = match declared {
-        ToolDeclaration::ReadOnly => true,
+        ToolDeclaration::ReadOnly => !name_says_it_writes(tool_name),
         ToolDeclaration::Writes => false,
         ToolDeclaration::Unknown => READ_ONLY_TOOLS.contains(&tool_name),
     };
@@ -2500,6 +2564,97 @@ mod tests {
             None,
         );
         assert!(priv_write(&said_to_write).is_some());
+    }
+
+    /// A server that declares one of the reference writers read-only is not
+    /// believed: the call is still judged as the write its name says it is.
+    ///
+    /// FAILS ON REVERT: believe `ReadOnly` for every tool and each call here
+    /// passes without an alert.
+    #[test]
+    fn a_read_only_hint_never_hides_a_write_tool() {
+        for (tool, args) in [
+            (
+                "write_file",
+                serde_json::json!({"path": "/etc/sudoers.d/x", "content": "ALL ALL=(ALL) NOPASSWD: ALL"}),
+            ),
+            (
+                "edit_file",
+                serde_json::json!({"path": "/home/u/.claude/settings.json", "edits": []}),
+            ),
+            (
+                "move_file",
+                serde_json::json!({"source": "/tmp/k", "destination": "/root/.ssh/authorized_keys"}),
+            ),
+            (
+                "create_directory",
+                serde_json::json!({"path": "/etc/cron.d/job"}),
+            ),
+        ] {
+            let verdict = inspect_declared_tool_call(tool, &args, ToolDeclaration::ReadOnly, None);
+            let alert = priv_write(&verdict)
+                .unwrap_or_else(|| panic!("{tool} declared read-only must still be judged"));
+            assert!(
+                alert.detail.starts_with("may change"),
+                "{tool}: {}",
+                alert.detail
+            );
+            assert!(!verdict.allowed, "{tool}");
+        }
+        // A tool that is not a known writer keeps the server's word.
+        let read = inspect_declared_tool_call(
+            "start_search",
+            &serde_json::json!({"path": "/usr/lib/python3"}),
+            ToolDeclaration::ReadOnly,
+            None,
+        );
+        assert!(priv_write(&read).is_none());
+    }
+
+    /// A writer is known by the verb in its name, not by four exact names:
+    /// another server's `writeFile` declared read-only is still judged.
+    ///
+    /// FAILS ON REVERT: believe `readOnlyHint` for every name outside
+    /// `WRITE_TOOLS` and these are let through.
+    #[test]
+    fn a_read_only_hint_never_hides_a_writer_by_any_name() {
+        for tool in [
+            "writeFile",
+            "fs_write",
+            "create_file",
+            "str_replace_editor",
+            "FileEdit",
+            "save-note",
+            "apply_patch",
+        ] {
+            let verdict = inspect_declared_tool_call(
+                tool,
+                &serde_json::json!({"path": "/etc/sudoers.d/x", "content": "x"}),
+                ToolDeclaration::ReadOnly,
+                None,
+            );
+            assert!(
+                priv_write(&verdict).is_some(),
+                "{tool} declared read-only must still be judged"
+            );
+        }
+        // Readers keep the server's word, even when a word only looks like a
+        // verb (`output`, `created`).
+        for tool in [
+            "read_text_file",
+            "get_output",
+            "list_created_files",
+            "search_files",
+            "readFile",
+        ] {
+            let verdict = inspect_declared_tool_call(
+                tool,
+                &serde_json::json!({"path": "/home/u/.ssh/config"}),
+                ToolDeclaration::ReadOnly,
+                None,
+            );
+            assert!(priv_write(&verdict).is_none(), "{tool}");
+        }
     }
 
     #[test]

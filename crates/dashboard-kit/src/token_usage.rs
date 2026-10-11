@@ -5,8 +5,18 @@
 //! prompts, code, file paths, account data, process data, or parser errors.
 //! Local history is incomplete by nature, so these values are observability
 //! counters rather than a billing statement.
+//!
+//! The whole retained history is counted, not its newest tail. A long-lived
+//! [`TokenScanner`] keeps a small per-file index (length, time, how far the
+//! file was read) and reads only the bytes appended since the last pass; a
+//! file that shrank, was rewritten or removed is dropped and the index is
+//! rebuilt. Message and session identifiers are used only to deduplicate, as
+//! 64-bit digests held in memory, and never leave the process. When a cap
+//! still cuts the scan, every affected row carries a [`TokenCoverage`] saying
+//! so, and its figures are a sample of the newest history, not the total.
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
@@ -14,17 +24,22 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const MAX_FILES_PER_SOURCE: usize = 4_096;
-const MAX_DIRECTORIES_PER_SOURCE: usize = 8_192;
-const MAX_ENTRIES_PER_SOURCE: usize = 100_000;
-const MAX_BYTES_PER_SOURCE: u64 = 64 * 1024 * 1024;
-const MAX_BYTES_PER_FILE: u64 = 32 * 1024 * 1024;
-const MAX_CODEX_SESSION_PREFIX_BYTES: u64 = 64 * 1024;
+const MAX_FILES_PER_SOURCE: usize = 16_384;
+const MAX_DIRECTORIES_PER_SOURCE: usize = 32_768;
+const MAX_ENTRIES_PER_SOURCE: usize = 500_000;
+/// New bytes read per pass and per source. A larger history is caught up over
+/// several passes, newest files first; this bounds the cost of one refresh.
+const MAX_BYTES_PER_PASS: u64 = 1024 * 1024 * 1024;
 const MAX_BYTES_PER_LINE: usize = 2 * 1024 * 1024;
-const MAX_USAGE_RECORDS_PER_SOURCE: usize = 250_000;
+/// Distinct messages (or sessions) held for deduplication, about 100 MB.
+const MAX_USAGE_RECORDS_PER_SOURCE: usize = 2_000_000;
+/// Pause between passes while a large history is still being caught up.
+const CATCH_UP_PAUSE: Duration = Duration::from_secs(1);
 
 const RETAINED_HISTORY_NOTE: &str =
     "Provider-reported counters found in retained local history; partial and not a billing statement.";
+const SAMPLE_NOTE: &str =
+    "A sample of the newest retained local history, not the total; partial and not a billing statement.";
 const UNSUPPORTED_NOTE: &str =
     "No supported local token source is available; no billing estimate is inferred.";
 const LOADING_NOTE: &str =
@@ -107,6 +122,10 @@ pub struct AgentTokenUsage {
     pub reasoning_output_tokens: Option<u64>,
     pub sessions: Option<u64>,
     pub last_observed_at_ms: Option<u64>,
+    /// How much of the retained history the figures cover; absent for a row
+    /// with no counters.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<TokenCoverage>,
     pub provenance: TokenProvenance,
 }
 
@@ -252,6 +271,8 @@ struct Candidate {
 #[derive(Debug, Default)]
 struct Discovery {
     files: Vec<Candidate>,
+    /// History files found before the file cap cut the list.
+    found: usize,
     had_error: bool,
     truncated: bool,
 }
@@ -262,27 +283,429 @@ struct ScanSummary {
     last_observed_at_ms: Option<u64>,
     had_error: bool,
     truncated: bool,
+    coverage: Option<TokenCoverage>,
 }
 
-/// Collect numeric token counters from the exact Claude Code and Codex local
-/// history roots below `home`. Cursor is represented honestly as unsupported;
-/// no undocumented database or inferred billing data is read.
-pub fn collect(home: &Path) -> TokenIntelligence {
-    let claude = collect_claude(home);
-    let codex = collect_codex(home);
-    let cursor = unsupported_agent("cursor", "Cursor");
+/// Caps on one scan of one provider's history.
+///
+/// The caps bound memory and the work done per pass, not how much history is
+/// counted: a pass reads at most `bytes_per_pass` of new bytes, newest files
+/// first, and the next pass carries on from where it stopped. Only a cap that
+/// can never be caught up (files, entries, records) leaves the figures as a
+/// sample, and the report says so.
+#[derive(Debug, Clone, Copy)]
+struct ScanLimits {
+    files: usize,
+    directories: usize,
+    entries: usize,
+    bytes_per_pass: u64,
+    records: usize,
+}
 
-    let numeric_agents = [&claude, &codex]
-        .into_iter()
-        .filter_map(agent_counters)
-        .collect::<Vec<_>>();
-    let totals = if numeric_agents.is_empty() {
-        None
-    } else {
-        Some(
-            numeric_agents
-                .into_iter()
-                .fold(TokenCounters::default(), |mut total, counters| {
+impl Default for ScanLimits {
+    fn default() -> Self {
+        Self {
+            files: MAX_FILES_PER_SOURCE,
+            directories: MAX_DIRECTORIES_PER_SOURCE,
+            entries: MAX_ENTRIES_PER_SOURCE,
+            bytes_per_pass: MAX_BYTES_PER_PASS,
+            records: MAX_USAGE_RECORDS_PER_SOURCE,
+        }
+    }
+}
+
+/// How much of the retained history one agent's figures cover. Numbers only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct TokenCoverage {
+    /// False when a cap cut the scan: the figures are then a sample of the
+    /// newest history and must not be read as the total.
+    pub complete: bool,
+    /// History files whose content is counted.
+    pub files_read: u64,
+    /// History files found on this machine.
+    pub files_found: u64,
+}
+
+/// A 64-bit digest of an identifier. The index keeps these instead of the
+/// identifiers themselves, so no message or session id is held in memory.
+fn digest64(bytes: &[u8]) -> u64 {
+    let digest = Sha256::digest(bytes);
+    let mut head = [0u8; 8];
+    head.copy_from_slice(&digest.as_slice()[..8]);
+    u64::from_be_bytes(head)
+}
+
+/// The bytes before a resume point that are checked to still be what was read.
+const ANCHOR_BYTES: u64 = 32;
+
+/// A digest of the few bytes that end at `offset`, or `None` if they cannot be
+/// read. A history file that is rewritten in place, rather than appended to,
+/// no longer matches the digest taken when it was read.
+fn read_anchor(file: &mut File, offset: u64) -> Option<u64> {
+    let length = ANCHOR_BYTES.min(offset);
+    let mut buffer = [0u8; ANCHOR_BYTES as usize];
+    file.seek(SeekFrom::Start(offset - length)).ok()?;
+    file.read_exact(&mut buffer[..length as usize]).ok()?;
+    Some(digest64(&buffer[..length as usize]))
+}
+
+/// What differs between providers in the incremental index.
+trait Provider {
+    type Line: DeserializeOwned;
+    /// What one file contributes on its own.
+    type File: Default;
+    /// What is deduplicated across files.
+    type Global: Default;
+
+    /// Fold one record in. True when the record cap dropped something.
+    fn apply(
+        global: &mut Self::Global,
+        file: &mut Self::File,
+        line: Self::Line,
+        records: usize,
+    ) -> bool;
+
+    /// Called after a file has been read as far as it goes in this pass.
+    fn finish(_global: &mut Self::Global, _file: &Self::File, _records: usize) -> bool {
+        false
+    }
+}
+
+/// Where the last pass stopped in one history file.
+#[derive(Debug, Default)]
+struct Tracked<F> {
+    len: u64,
+    modified_ms: Option<u64>,
+    /// Offset just past the last record counted.
+    offset: u64,
+    anchor: u64,
+    /// The last pass ran out of byte budget inside this file.
+    cut: bool,
+    parse_error: bool,
+    skipped_oversized: bool,
+    state: F,
+}
+
+#[derive(Debug, Default)]
+struct PassOutcome {
+    files_found: usize,
+    files_read: usize,
+    budget_cut: bool,
+    discovery_truncated: bool,
+    had_error: bool,
+}
+
+/// An incremental index of one provider's history files.
+///
+/// History is append-only, so a file that grew is read from where the last
+/// pass stopped and a file that did not change is not opened. Anything else
+/// (a file that shrank, whose time moved back, whose already-read bytes
+/// changed, or that was removed) cannot be undone from the totals, so the
+/// index is dropped and rebuilt, which costs one full read of the history.
+struct Index<P: Provider> {
+    files: HashMap<PathBuf, Tracked<P::File>>,
+    global: P::Global,
+    /// A record was dropped because the record cap was full.
+    records_capped: bool,
+}
+
+impl<P: Provider> Index<P> {
+    fn new() -> Self {
+        Self {
+            files: HashMap::new(),
+            global: P::Global::default(),
+            records_capped: false,
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Self::new();
+    }
+
+    fn any_skipped_oversized(&self) -> bool {
+        self.files.values().any(|tracked| tracked.skipped_oversized)
+    }
+
+    fn any_parse_error(&self) -> bool {
+        self.files.values().any(|tracked| tracked.parse_error)
+    }
+
+    fn needs_rebuild(&self, discovery: &Discovery) -> bool {
+        let present: HashMap<&Path, &Candidate> = discovery
+            .files
+            .iter()
+            .map(|candidate| (candidate.path.as_path(), candidate))
+            .collect();
+        self.files
+            .iter()
+            .any(|(path, tracked)| match present.get(path.as_path()) {
+                // A cap-limited listing proves nothing about absence.
+                None => !discovery.truncated,
+                Some(candidate) => {
+                    candidate.len < tracked.len
+                        || matches!(
+                            (candidate.modified_ms, tracked.modified_ms),
+                            (Some(now), Some(before)) if now < before
+                        )
+                }
+            })
+    }
+
+    fn scan(&mut self, roots: &[PathBuf], limits: &ScanLimits) -> PassOutcome {
+        let discovery = discover_jsonl(roots, limits);
+        if self.needs_rebuild(&discovery) {
+            self.reset();
+        }
+        for _ in 0..2 {
+            if let Some(outcome) = self.read_pass(&discovery, limits) {
+                return outcome;
+            }
+            // Bytes already counted changed under us.
+            self.reset();
+        }
+        PassOutcome {
+            had_error: true,
+            ..PassOutcome::default()
+        }
+    }
+
+    /// One pass over the discovered files. `None` means a file's already-read
+    /// bytes no longer match, and the caller must rebuild from scratch.
+    fn read_pass(&mut self, discovery: &Discovery, limits: &ScanLimits) -> Option<PassOutcome> {
+        let Self {
+            files,
+            global,
+            records_capped,
+        } = self;
+        let mut remaining = limits.bytes_per_pass;
+        let mut outcome = PassOutcome {
+            files_found: discovery.found,
+            discovery_truncated: discovery.truncated,
+            had_error: discovery.had_error,
+            ..PassOutcome::default()
+        };
+
+        for candidate in &discovery.files {
+            let known = files.get(&candidate.path);
+            if known.is_some_and(|tracked| {
+                !tracked.cut
+                    && tracked.len == candidate.len
+                    && tracked.modified_ms == candidate.modified_ms
+            }) {
+                outcome.files_read += 1;
+                continue;
+            }
+            let start = known.map_or(0, |tracked| tracked.offset);
+            let wanted = candidate.len.saturating_sub(start);
+            if wanted == 0 {
+                let tracked = files.entry(candidate.path.clone()).or_default();
+                tracked.len = candidate.len;
+                tracked.modified_ms = candidate.modified_ms;
+                tracked.cut = false;
+                outcome.files_read += 1;
+                continue;
+            }
+            if remaining == 0 {
+                outcome.budget_cut = true;
+                if let Some(tracked) = files.get_mut(&candidate.path) {
+                    tracked.cut = true;
+                }
+                continue;
+            }
+            let Ok(mut file) = open_source_file(&candidate.path) else {
+                outcome.had_error = true;
+                continue;
+            };
+            if let Some(tracked) = known {
+                if tracked.offset > 0
+                    && read_anchor(&mut file, tracked.offset) != Some(tracked.anchor)
+                {
+                    return None;
+                }
+            }
+            let stop = start + wanted.min(remaining);
+            remaining -= stop - start;
+
+            let tracked = files.entry(candidate.path.clone()).or_default();
+            let range = for_each_json_line::<P::Line>(&mut file, start, stop, |line| {
+                if P::apply(global, &mut tracked.state, line, limits.records) {
+                    *records_capped = true;
+                }
+            });
+            if P::finish(global, &tracked.state, limits.records) {
+                *records_capped = true;
+            }
+            tracked.len = candidate.len;
+            tracked.modified_ms = candidate.modified_ms;
+            tracked.offset = range.end;
+            tracked.anchor = read_anchor(&mut file, range.end).unwrap_or(0);
+            tracked.parse_error |= range.had_error;
+            tracked.skipped_oversized |= range.skipped_oversized;
+            tracked.cut = stop < candidate.len;
+            if tracked.cut {
+                outcome.budget_cut = true;
+            } else {
+                outcome.files_read += 1;
+            }
+        }
+        Some(outcome)
+    }
+
+    /// The scan summary every provider shares.
+    fn summary(&self, pass: &PassOutcome) -> ScanSummary {
+        let incomplete = pass.budget_cut
+            || pass.discovery_truncated
+            || self.records_capped
+            || self.any_skipped_oversized();
+        ScanSummary {
+            sessions: 0,
+            last_observed_at_ms: None,
+            had_error: pass.had_error || self.any_parse_error(),
+            truncated: incomplete,
+            coverage: Some(TokenCoverage {
+                complete: !incomplete,
+                files_read: pass.files_read.try_into().unwrap_or(u64::MAX),
+                files_found: pass.files_found.try_into().unwrap_or(u64::MAX),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct ClaudeFile {
+    saw_usage: bool,
+}
+
+struct ClaudeProvider;
+
+impl Provider for ClaudeProvider {
+    type Line = ClaudeLine;
+    type File = ClaudeFile;
+    type Global = HashMap<u64, ClaudeUsage>;
+
+    fn apply(
+        global: &mut Self::Global,
+        file: &mut Self::File,
+        line: ClaudeLine,
+        records: usize,
+    ) -> bool {
+        let Some((message_id, usage)) = claude_usage(line) else {
+            return false;
+        };
+        file.saw_usage = true;
+        let key = digest64(message_id.as_bytes());
+        if let Some(existing) = global.get_mut(&key) {
+            existing.keep_larger_snapshot(&usage);
+            false
+        } else if global.len() < records {
+            global.insert(key, usage);
+            false
+        } else {
+            true
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct CodexFile {
+    session: Option<u64>,
+    cumulative: CodexUsage,
+    saw_usage: bool,
+}
+
+struct CodexProvider;
+
+impl Provider for CodexProvider {
+    type Line = CodexLine;
+    type File = CodexFile;
+    type Global = HashMap<u64, CodexUsage>;
+
+    fn apply(
+        _global: &mut Self::Global,
+        file: &mut Self::File,
+        line: CodexLine,
+        _records: usize,
+    ) -> bool {
+        if file.session.is_none() {
+            file.session = codex_session_id(&line).map(|id| digest64(id.as_bytes()));
+        }
+        if let Some(usage) = codex_usage(&line) {
+            file.saw_usage = true;
+            file.cumulative.keep_larger_snapshot(&usage);
+        }
+        false
+    }
+
+    fn finish(global: &mut Self::Global, file: &Self::File, records: usize) -> bool {
+        let (true, Some(session)) = (file.saw_usage, file.session) else {
+            return false;
+        };
+        if let Some(existing) = global.get_mut(&session) {
+            existing.keep_larger_snapshot(&file.cumulative);
+            false
+        } else if global.len() < records {
+            global.insert(session, file.cumulative.clone());
+            false
+        } else {
+            true
+        }
+    }
+}
+
+/// Collects numeric token counters across refreshes, reading only what was
+/// appended to the history since the last pass.
+pub struct TokenScanner {
+    claude: Index<ClaudeProvider>,
+    codex: Index<CodexProvider>,
+    limits: ScanLimits,
+    catching_up: bool,
+}
+
+impl Default for TokenScanner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TokenScanner {
+    pub fn new() -> Self {
+        Self::with_limits(ScanLimits::default())
+    }
+
+    fn with_limits(limits: ScanLimits) -> Self {
+        Self {
+            claude: Index::new(),
+            codex: Index::new(),
+            limits,
+            catching_up: false,
+        }
+    }
+
+    /// True when the last pass stopped on its byte budget before reaching all
+    /// the history, so another pass should follow without waiting.
+    pub fn catching_up(&self) -> bool {
+        self.catching_up
+    }
+
+    /// One pass over the history below `home`: the exact Claude Code and Codex
+    /// local roots. Cursor is represented honestly as unsupported; no undocumented
+    /// database or inferred billing data is read.
+    pub fn scan(&mut self, home: &Path) -> TokenIntelligence {
+        let (claude, claude_pending) = self.claude_report(home);
+        let (codex, codex_pending) = self.codex_report(home);
+        self.catching_up = claude_pending || codex_pending;
+        let cursor = unsupported_agent("cursor", "Cursor");
+
+        let numeric_agents = [&claude, &codex]
+            .into_iter()
+            .filter_map(agent_counters)
+            .collect::<Vec<_>>();
+        let totals = if numeric_agents.is_empty() {
+            None
+        } else {
+            Some(numeric_agents.into_iter().fold(
+                TokenCounters::default(),
+                |mut total, counters| {
                     total.total_tokens = total.total_tokens.saturating_add(counters.total_tokens);
                     total.input_tokens = total.input_tokens.saturating_add(counters.input_tokens);
                     total.output_tokens =
@@ -300,30 +723,159 @@ pub fn collect(home: &Path) -> TokenIntelligence {
                         .reasoning_output_tokens
                         .saturating_add(counters.reasoning_output_tokens);
                     total
-                }),
-        )
-    };
+                },
+            ))
+        };
 
-    // Retained local history is never claimed to be a complete provider ledger.
-    let availability = if totals.is_some() {
-        ReportAvailability::Partial
-    } else if [&claude, &codex]
-        .iter()
-        .any(|agent| agent.availability == AgentAvailability::Error)
-    {
-        ReportAvailability::Error
-    } else {
-        ReportAvailability::NoData
-    };
+        // Retained local history is never claimed to be a complete provider ledger.
+        let availability = if totals.is_some() {
+            ReportAvailability::Partial
+        } else if [&claude, &codex]
+            .iter()
+            .any(|agent| agent.availability == AgentAvailability::Error)
+        {
+            ReportAvailability::Error
+        } else {
+            ReportAvailability::NoData
+        };
 
-    TokenIntelligence {
-        schema_version: 1,
-        generated_at_ms: epoch_ms(SystemTime::now()).unwrap_or(0),
-        scope: "available_local_history",
-        availability,
-        totals,
-        agents: vec![claude, codex, cursor],
+        TokenIntelligence {
+            schema_version: 1,
+            generated_at_ms: epoch_ms(SystemTime::now()).unwrap_or(0),
+            scope: "available_local_history",
+            availability,
+            totals,
+            agents: vec![claude, codex, cursor],
+        }
     }
+
+    fn claude_report(&mut self, home: &Path) -> (AgentTokenUsage, bool) {
+        let Some(root) = safe_source_root(home, &[".claude", "projects"]) else {
+            self.claude.reset();
+            return (no_data_agent("claude", "Claude Code", false, false), false);
+        };
+        let pass = self.claude.scan(std::slice::from_ref(&root), &self.limits);
+        let mut scan = self.claude.summary(&pass);
+
+        let mut sessions: HashSet<PathBuf> = HashSet::new();
+        for (path, tracked) in &self.claude.files {
+            if tracked.state.saw_usage {
+                sessions.insert(claude_session_key(&root, path));
+                scan.last_observed_at_ms =
+                    max_option(scan.last_observed_at_ms, tracked.modified_ms);
+            }
+        }
+
+        if self.claude.global.is_empty() {
+            let failed = scan.had_error || scan.truncated;
+            return (
+                no_data_agent("claude", "Claude Code", failed, !failed),
+                pass.budget_cut,
+            );
+        }
+
+        let mut counters = TokenCounters::default();
+        for usage in self.claude.global.values() {
+            counters.total_tokens = counters.total_tokens.saturating_add(usage.total());
+            counters.input_tokens = counters.input_tokens.saturating_add(usage.input);
+            counters.output_tokens = counters.output_tokens.saturating_add(usage.output);
+            counters.cache_read_input_tokens = counters
+                .cache_read_input_tokens
+                .saturating_add(usage.cache_read);
+            counters.cache_creation_input_tokens = counters
+                .cache_creation_input_tokens
+                .saturating_add(usage.cache_creation);
+        }
+        scan.sessions = sessions.len().try_into().unwrap_or(u64::MAX);
+        (
+            available_agent(
+                "claude",
+                "Claude Code",
+                counters,
+                scan,
+                SupportedDimensions {
+                    cache_read: true,
+                    cached_input: false,
+                    cache_creation: true,
+                    reasoning_output: false,
+                },
+            ),
+            pass.budget_cut,
+        )
+    }
+
+    fn codex_report(&mut self, home: &Path) -> (AgentTokenUsage, bool) {
+        let roots = [
+            safe_source_root(home, &[".codex", "sessions"]),
+            safe_source_root(home, &[".codex", "archived_sessions"]),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        if roots.is_empty() {
+            self.codex.reset();
+            return (no_data_agent("codex", "Codex", false, false), false);
+        }
+        let pass = self.codex.scan(&roots, &self.limits);
+        let mut scan = self.codex.summary(&pass);
+        for tracked in self.codex.files.values() {
+            if !tracked.state.saw_usage {
+                continue;
+            }
+            if tracked.state.session.is_some() {
+                scan.last_observed_at_ms =
+                    max_option(scan.last_observed_at_ms, tracked.modified_ms);
+            } else {
+                // Without the provider's session ID, cumulative snapshots cannot
+                // be deduplicated safely, so fail closed instead of inflating use.
+                scan.had_error = true;
+            }
+        }
+
+        if self.codex.global.is_empty() {
+            let failed = scan.had_error || scan.truncated;
+            return (
+                no_data_agent("codex", "Codex", failed, !failed),
+                pass.budget_cut,
+            );
+        }
+
+        let mut counters = TokenCounters::default();
+        for usage in self.codex.global.values() {
+            counters.total_tokens = counters.total_tokens.saturating_add(usage.total);
+            counters.input_tokens = counters.input_tokens.saturating_add(usage.input);
+            counters.output_tokens = counters.output_tokens.saturating_add(usage.output);
+            // Both values are provider-reported subsets of input/output respectively.
+            counters.cached_input_tokens = counters
+                .cached_input_tokens
+                .saturating_add(usage.cached_input);
+            counters.reasoning_output_tokens = counters
+                .reasoning_output_tokens
+                .saturating_add(usage.reasoning_output);
+        }
+        scan.sessions = self.codex.global.len().try_into().unwrap_or(u64::MAX);
+        (
+            available_agent(
+                "codex",
+                "Codex",
+                counters,
+                scan,
+                SupportedDimensions {
+                    cache_read: false,
+                    cached_input: true,
+                    cache_creation: false,
+                    reasoning_output: true,
+                },
+            ),
+            pass.budget_cut,
+        )
+    }
+}
+/// Collect numeric token counters from the exact Claude Code and Codex local
+/// history roots below `home`, with a fresh index. A long-lived caller keeps a
+/// [`TokenScanner`] instead, so each refresh reads only what was appended.
+pub fn collect(home: &Path) -> TokenIntelligence {
+    TokenScanner::new().scan(home)
 }
 
 /// Start a background collector without delaying dashboard startup. The API
@@ -335,16 +887,23 @@ pub fn spawn_refresher(home: PathBuf, refresh_every: Duration) -> SharedTokenInt
     let writer = Arc::clone(&shared);
     let collector = std::thread::Builder::new()
         .name("iw-token-intelligence".into())
-        .spawn(move || loop {
-            let next = collect(&home);
-            match writer.write() {
-                Ok(mut report) => *report = next,
-                Err(poisoned) => *poisoned.into_inner() = next,
+        .spawn(move || {
+            let mut scanner = TokenScanner::new();
+            loop {
+                let next = scanner.scan(&home);
+                match writer.write() {
+                    Ok(mut report) => *report = next,
+                    Err(poisoned) => *poisoned.into_inner() = next,
+                }
+                if scanner.catching_up() {
+                    std::thread::sleep(CATCH_UP_PAUSE);
+                    continue;
+                }
+                if refresh_every.is_zero() {
+                    break;
+                }
+                std::thread::sleep(refresh_every);
             }
-            if refresh_every.is_zero() {
-                break;
-            }
-            std::thread::sleep(refresh_every);
         });
     if collector.is_err() {
         let failed = TokenIntelligence {
@@ -382,6 +941,7 @@ fn loading_report() -> TokenIntelligence {
             reasoning_output_tokens: None,
             sessions: None,
             last_observed_at_ms: None,
+            coverage: None,
             provenance: TokenProvenance {
                 source: "local_session_log",
                 quality: "loading",
@@ -419,203 +979,13 @@ pub fn unsupported_agent(agent_id: &'static str, display_name: &'static str) -> 
         reasoning_output_tokens: None,
         sessions: None,
         last_observed_at_ms: None,
+        coverage: None,
         provenance: TokenProvenance {
             source: "not_available",
             quality: "unsupported",
             note: UNSUPPORTED_NOTE,
         },
     }
-}
-
-fn collect_claude(home: &Path) -> AgentTokenUsage {
-    let Some(root) = safe_source_root(home, &[".claude", "projects"]) else {
-        return no_data_agent("claude", "Claude Code", false, false);
-    };
-    let discovery = discover_jsonl(std::slice::from_ref(&root));
-    let mut messages: HashMap<String, ClaudeUsage> = HashMap::new();
-    let mut sessions: HashSet<PathBuf> = HashSet::new();
-    let mut scan = ScanSummary {
-        had_error: discovery.had_error,
-        truncated: discovery.truncated,
-        ..ScanSummary::default()
-    };
-    let mut remaining = MAX_BYTES_PER_SOURCE;
-
-    for candidate in discovery.files {
-        if remaining == 0 {
-            scan.truncated = true;
-            break;
-        }
-        let allowance = candidate.len.min(MAX_BYTES_PER_FILE).min(remaining);
-        remaining = remaining.saturating_sub(allowance);
-        if allowance < candidate.len {
-            scan.truncated = true;
-        }
-
-        let mut saw_usage = false;
-        let mut record_limit_hit = false;
-        match open_source_file(&candidate.path) {
-            Ok(file) => {
-                let (error, truncated) =
-                    for_each_json_line::<ClaudeLine>(file, candidate.len, allowance, |line| {
-                        if let Some((message_id, usage)) = claude_usage(line) {
-                            saw_usage = true;
-                            if let Some(existing) = messages.get_mut(&message_id) {
-                                existing.keep_larger_snapshot(&usage);
-                            } else if messages.len() < MAX_USAGE_RECORDS_PER_SOURCE {
-                                messages.insert(message_id, usage);
-                            } else {
-                                record_limit_hit = true;
-                            }
-                        }
-                    });
-                scan.had_error |= error;
-                scan.truncated |= truncated || record_limit_hit;
-            }
-            Err(_) => scan.had_error = true,
-        }
-        if saw_usage {
-            sessions.insert(claude_session_key(&root, &candidate.path));
-            scan.last_observed_at_ms = max_option(scan.last_observed_at_ms, candidate.modified_ms);
-        }
-    }
-
-    if messages.is_empty() {
-        let failed = scan.had_error || scan.truncated;
-        return no_data_agent("claude", "Claude Code", failed, !failed);
-    }
-
-    let mut counters = TokenCounters::default();
-    for usage in messages.values() {
-        counters.total_tokens = counters.total_tokens.saturating_add(usage.total());
-        counters.input_tokens = counters.input_tokens.saturating_add(usage.input);
-        counters.output_tokens = counters.output_tokens.saturating_add(usage.output);
-        counters.cache_read_input_tokens = counters
-            .cache_read_input_tokens
-            .saturating_add(usage.cache_read);
-        counters.cache_creation_input_tokens = counters
-            .cache_creation_input_tokens
-            .saturating_add(usage.cache_creation);
-    }
-    scan.sessions = sessions.len().try_into().unwrap_or(u64::MAX);
-    available_agent(
-        "claude",
-        "Claude Code",
-        counters,
-        scan,
-        SupportedDimensions {
-            cache_read: true,
-            cached_input: false,
-            cache_creation: true,
-            reasoning_output: false,
-        },
-    )
-}
-
-fn collect_codex(home: &Path) -> AgentTokenUsage {
-    let roots = [
-        safe_source_root(home, &[".codex", "sessions"]),
-        safe_source_root(home, &[".codex", "archived_sessions"]),
-    ]
-    .into_iter()
-    .flatten()
-    .collect::<Vec<_>>();
-    if roots.is_empty() {
-        return no_data_agent("codex", "Codex", false, false);
-    }
-    let discovery = discover_jsonl(&roots);
-    let mut sessions: HashMap<String, CodexUsage> = HashMap::new();
-    let mut observed_files: HashMap<String, Option<u64>> = HashMap::new();
-    let mut scan = ScanSummary {
-        had_error: discovery.had_error,
-        truncated: discovery.truncated,
-        ..ScanSummary::default()
-    };
-    let mut remaining = MAX_BYTES_PER_SOURCE;
-
-    for candidate in discovery.files {
-        if remaining == 0 {
-            scan.truncated = true;
-            break;
-        }
-        let (prefix_allowance, allowance) = codex_file_budgets(candidate.len, remaining);
-        let file_budget = prefix_allowance.saturating_add(allowance);
-        remaining = remaining.saturating_sub(file_budget);
-        if file_budget < candidate.len {
-            scan.truncated = true;
-        }
-
-        let mut session_id = (prefix_allowance > 0)
-            .then(|| codex_session_id_from_prefix(&candidate.path, prefix_allowance))
-            .flatten();
-        let mut cumulative = CodexUsage::default();
-        let mut saw_usage = false;
-        match open_source_file(&candidate.path) {
-            Ok(file) => {
-                let (error, truncated) =
-                    for_each_json_line::<CodexLine>(file, candidate.len, allowance, |value| {
-                        if session_id.is_none() {
-                            session_id = codex_session_id(&value);
-                        }
-                        if let Some(usage) = codex_usage(&value) {
-                            saw_usage = true;
-                            cumulative.keep_larger_snapshot(&usage);
-                        }
-                    });
-                scan.had_error |= error;
-                scan.truncated |= truncated;
-            }
-            Err(_) => scan.had_error = true,
-        }
-
-        if saw_usage {
-            if let Some(id) = session_id {
-                sessions
-                    .entry(id.clone())
-                    .or_default()
-                    .keep_larger_snapshot(&cumulative);
-                let observed = observed_files.entry(id).or_insert(None);
-                *observed = max_option(*observed, candidate.modified_ms);
-            } else {
-                // Without the provider's session ID, cumulative snapshots cannot
-                // be deduplicated safely, so fail closed instead of inflating use.
-                scan.had_error = true;
-            }
-        }
-    }
-
-    if sessions.is_empty() {
-        let failed = scan.had_error || scan.truncated;
-        return no_data_agent("codex", "Codex", failed, !failed);
-    }
-
-    let mut counters = TokenCounters::default();
-    for usage in sessions.values() {
-        counters.total_tokens = counters.total_tokens.saturating_add(usage.total);
-        counters.input_tokens = counters.input_tokens.saturating_add(usage.input);
-        counters.output_tokens = counters.output_tokens.saturating_add(usage.output);
-        // Both values are provider-reported subsets of input/output respectively.
-        counters.cached_input_tokens = counters
-            .cached_input_tokens
-            .saturating_add(usage.cached_input);
-        counters.reasoning_output_tokens = counters
-            .reasoning_output_tokens
-            .saturating_add(usage.reasoning_output);
-    }
-    scan.sessions = sessions.len().try_into().unwrap_or(u64::MAX);
-    scan.last_observed_at_ms = observed_files.values().copied().flatten().max();
-    available_agent(
-        "codex",
-        "Codex",
-        counters,
-        scan,
-        SupportedDimensions {
-            cache_read: false,
-            cached_input: true,
-            cache_creation: false,
-            reasoning_output: true,
-        },
-    )
 }
 
 fn claude_session_key(root: &Path, path: &Path) -> PathBuf {
@@ -662,38 +1032,6 @@ fn codex_session_id(value: &CodexLine) -> Option<String> {
     }
     let id = value.payload.as_ref()?.id.as_deref()?;
     (!id.is_empty()).then(|| id.to_owned())
-}
-
-/// Split one Codex file's budget between recent cumulative snapshots and, only
-/// for a tail scan, a small prefix containing `session_meta`. Prefix I/O is part
-/// of the same per-file/per-source cap rather than an unaccounted extra read.
-fn codex_file_budgets(file_len: u64, remaining: u64) -> (u64, u64) {
-    let total = file_len.min(MAX_BYTES_PER_FILE).min(remaining);
-    if file_len <= total {
-        return (0, total);
-    }
-    let prefix = MAX_CODEX_SESSION_PREFIX_BYTES.min(total / 8);
-    (prefix, total.saturating_sub(prefix))
-}
-
-fn codex_session_id_from_prefix(path: &Path, allowance: u64) -> Option<String> {
-    let file = open_source_file(path).ok()?;
-    let mut reader = BufReader::new(file.take(allowance));
-    let mut line = Vec::new();
-    for _ in 0..8 {
-        match read_bounded_line(&mut reader, &mut line).ok()? {
-            None => break,
-            Some(true) => continue,
-            Some(false) => {
-                if let Ok(value) = serde_json::from_slice::<CodexLine>(&line) {
-                    if let Some(id) = codex_session_id(&value) {
-                        return Some(id);
-                    }
-                }
-            }
-        }
-    }
-    None
 }
 
 fn codex_usage(value: &CodexLine) -> Option<CodexUsage> {
@@ -746,6 +1084,7 @@ fn available_agent(
     scan: ScanSummary,
     supported: SupportedDimensions,
 ) -> AgentTokenUsage {
+    let sample = scan.coverage.is_some_and(|coverage| !coverage.complete);
     AgentTokenUsage {
         agent_id,
         display_name,
@@ -769,9 +1108,14 @@ fn available_agent(
         last_observed_at_ms: scan.last_observed_at_ms,
         provenance: TokenProvenance {
             source: "local_session_log",
-            quality: "partial",
-            note: RETAINED_HISTORY_NOTE,
+            quality: if sample { "sample" } else { "partial" },
+            note: if sample {
+                SAMPLE_NOTE
+            } else {
+                RETAINED_HISTORY_NOTE
+            },
         },
+        coverage: scan.coverage,
     }
 }
 
@@ -798,6 +1142,7 @@ fn no_data_agent(
         reasoning_output_tokens: None,
         sessions: scanned_empty.then_some(0),
         last_observed_at_ms: None,
+        coverage: None,
         provenance: TokenProvenance {
             source: "local_session_log",
             quality: if failed { "error" } else { "no_data" },
@@ -838,14 +1183,14 @@ fn safe_source_root(home: &Path, components: &[&str]) -> Option<PathBuf> {
     Some(root)
 }
 
-fn discover_jsonl(roots: &[PathBuf]) -> Discovery {
+fn discover_jsonl(roots: &[PathBuf], limits: &ScanLimits) -> Discovery {
     let mut result = Discovery::default();
     let mut stack = roots.to_vec();
     let mut directories = 0usize;
     let mut entries_seen = 0usize;
 
     while let Some(directory) = stack.pop() {
-        if directories >= MAX_DIRECTORIES_PER_SOURCE || entries_seen >= MAX_ENTRIES_PER_SOURCE {
+        if directories >= limits.directories || entries_seen >= limits.entries {
             result.truncated = true;
             break;
         }
@@ -858,7 +1203,7 @@ fn discover_jsonl(roots: &[PathBuf]) -> Discovery {
             }
         };
         for entry in entries {
-            if entries_seen >= MAX_ENTRIES_PER_SOURCE {
+            if entries_seen >= limits.entries {
                 result.truncated = true;
                 break;
             }
@@ -897,79 +1242,103 @@ fn discover_jsonl(roots: &[PathBuf]) -> Discovery {
             }
         }
     }
-
+    // Newest first, so that when a cap cuts it is the oldest history that is
+    // left out and a catch-up pass reads the most recent files before the rest.
     result.files.sort_unstable_by(|a, b| {
         b.modified_ms
             .cmp(&a.modified_ms)
             .then_with(|| a.path.cmp(&b.path))
     });
-    if result.files.len() > MAX_FILES_PER_SOURCE {
-        result.files.truncate(MAX_FILES_PER_SOURCE);
+    result.found = result.files.len();
+    if result.files.len() > limits.files {
+        result.files.truncate(limits.files);
         result.truncated = true;
     }
     result
 }
 
+/// What one bounded read of a byte range found.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RangeRead {
+    /// Offset just past the last record that was fully handled. A trailing
+    /// record that is still being written stays after it, to be read again.
+    end: u64,
+    had_error: bool,
+    /// A complete record over the line cap was skipped.
+    skipped_oversized: bool,
+}
+
+/// Visit every complete JSONL record in `start..stop`.
+///
+/// `start` must be the start of a record (offset 0, or an offset this function
+/// returned earlier). A final record with no newline is used only when it
+/// already parses as JSON, because a record cut off by a writer in mid-line
+/// cannot; otherwise it is left for the next read rather than counted as
+/// malformed.
 fn for_each_json_line<T: DeserializeOwned>(
-    mut file: File,
-    file_len: u64,
-    allowance: u64,
+    file: &mut File,
+    start: u64,
+    stop: u64,
     mut visit: impl FnMut(T),
-) -> (bool, bool) {
-    let start = file_len.saturating_sub(allowance);
-    let discard_partial = if start > 0 {
-        if file.seek(SeekFrom::Start(start - 1)).is_err() {
-            return (true, true);
-        }
-        let mut previous = [0u8; 1];
-        if file.read_exact(&mut previous).is_err() || file.seek(SeekFrom::Start(start)).is_err() {
-            return (true, true);
-        }
-        previous[0] != b'\n'
-    } else {
-        false
+) -> RangeRead {
+    let mut outcome = RangeRead {
+        end: start,
+        ..RangeRead::default()
     };
-    let mut reader = BufReader::new(file.take(allowance));
-    let mut line = Vec::new();
-    let mut had_error = false;
-    let mut truncated = start > 0;
-
-    // A tail scan normally starts in the middle of a JSONL record. Discard only
-    // that partial record; every complete recent record remains visible.
-    if discard_partial {
-        match read_bounded_line(&mut reader, &mut line) {
-            Ok(Some(oversized)) => truncated |= oversized,
-            Ok(None) => return (false, true),
-            Err(_) => return (true, true),
-        }
+    if stop <= start {
+        return outcome;
     }
-
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        outcome.had_error = true;
+        return outcome;
+    }
+    let mut reader = BufReader::new(file.take(stop - start));
+    let mut line = Vec::new();
     loop {
         match read_bounded_line(&mut reader, &mut line) {
             Ok(None) => break,
-            Ok(Some(true)) => {
-                truncated = true;
-                continue;
+            Ok(Some(read)) => {
+                if read.oversized {
+                    if !read.terminated {
+                        break;
+                    }
+                    outcome.skipped_oversized = true;
+                } else if read.terminated {
+                    if serde_json::from_slice::<T>(&line).map(&mut visit).is_err() {
+                        outcome.had_error = true;
+                    }
+                } else {
+                    match serde_json::from_slice::<T>(&line) {
+                        Ok(value) => visit(value),
+                        Err(_) => break,
+                    }
+                }
+                outcome.end += read.bytes;
             }
-            Ok(Some(false)) => match serde_json::from_slice::<T>(&line) {
-                Ok(value) => visit(value),
-                Err(_) => had_error = true,
-            },
             Err(_) => {
-                had_error = true;
+                outcome.had_error = true;
                 break;
             }
         }
     }
-    (had_error, truncated)
+    outcome
 }
 
-/// Read one JSONL record without ever allocating more than the line cap. The
-/// boolean is true when an oversized record was drained and should be skipped.
+/// One record read by [`read_bounded_line`].
+struct LineRead {
+    /// The record was over the line cap; its bytes were drained, not kept.
+    oversized: bool,
+    /// The record ended with a newline (it is not a half-written tail).
+    terminated: bool,
+    /// Bytes the record occupied in the file, newline included.
+    bytes: u64,
+}
+
+/// Read one JSONL record without ever allocating more than the line cap.
 fn read_bounded_line(
     reader: &mut impl BufRead,
     line: &mut Vec<u8>,
-) -> std::io::Result<Option<bool>> {
+) -> std::io::Result<Option<LineRead>> {
     line.clear();
     let read = {
         let mut limited = reader.take((MAX_BYTES_PER_LINE + 1) as u64);
@@ -979,26 +1348,37 @@ fn read_bounded_line(
         return Ok(None);
     }
     if line.len() <= MAX_BYTES_PER_LINE {
-        return Ok(Some(false));
+        return Ok(Some(LineRead {
+            oversized: false,
+            terminated: line.ends_with(b"\n"),
+            bytes: line.len() as u64,
+        }));
     }
 
     // The cap was reached before a newline. Drain the remainder in-place via
     // `fill_buf`/`consume`, so a malicious or corrupt giant line cannot force an
     // equally giant allocation.
-    while !line.ends_with(b"\n") {
+    let mut bytes = line.len() as u64;
+    let mut terminated = line.ends_with(b"\n");
+    while !terminated {
         let buffer = reader.fill_buf()?;
         if buffer.is_empty() {
             break;
         }
         let newline = buffer.iter().position(|byte| *byte == b'\n');
         let consumed = newline.map_or(buffer.len(), |index| index + 1);
-        let saw_newline = newline.is_some();
         reader.consume(consumed);
-        if saw_newline {
+        bytes += consumed as u64;
+        if newline.is_some() {
+            terminated = true;
             break;
         }
     }
-    Ok(Some(true))
+    Ok(Some(LineRead {
+        oversized: true,
+        terminated,
+        bytes,
+    }))
 }
 
 fn open_source_file(path: &Path) -> std::io::Result<File> {
@@ -1164,26 +1544,6 @@ mod tests {
     }
 
     #[test]
-    fn codex_prefix_scan_is_charged_to_the_shared_source_budget() {
-        let oversized = MAX_BYTES_PER_FILE.saturating_mul(2);
-        let mut remaining = MAX_BYTES_PER_SOURCE;
-        let mut spent = 0;
-        for _ in 0..MAX_FILES_PER_SOURCE {
-            let (prefix, tail) = codex_file_budgets(oversized, remaining);
-            assert!(prefix <= MAX_CODEX_SESSION_PREFIX_BYTES);
-            assert!(prefix.saturating_add(tail) <= MAX_BYTES_PER_FILE);
-            let file_spend = prefix.saturating_add(tail);
-            remaining = remaining.saturating_sub(file_spend);
-            spent += file_spend;
-            if remaining == 0 {
-                break;
-            }
-        }
-        assert_eq!(spent, MAX_BYTES_PER_SOURCE);
-        assert_eq!(remaining, 0);
-    }
-
-    #[test]
     fn unavailable_is_null_while_observed_zero_is_zero() {
         let home = tempfile::tempdir().unwrap();
         fs::create_dir_all(home.path().join(".claude/projects/empty")).unwrap();
@@ -1309,42 +1669,387 @@ mod tests {
         assert!(serialized.contains("\"total_tokens\":\"0\""));
         assert!(serialized.contains("\"cached_input_tokens\":null"));
         assert!(serialized.contains("not a billing statement"));
+        assert!(serialized
+            .contains("\"coverage\":{\"complete\":true,\"files_read\":1,\"files_found\":1}"));
+    }
+
+    fn msg(id: &str, input: u64, output: u64) -> String {
+        format!(
+            "{{\"type\":\"assistant\",\"message\":{{\"id\":\"{id}\",\"usage\":{{\"input_tokens\":{input},\"output_tokens\":{output}}}}}}}\n"
+        )
+    }
+
+    fn codex_meta(id: &str) -> String {
+        format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\"}}}}\n")
+    }
+
+    fn codex_count(input: u64, output: u64) -> String {
+        format!(
+            "{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"total_token_usage\":{{\"input_tokens\":{input},\"output_tokens\":{output},\"total_tokens\":{}}}}}}}}}\n",
+            input + output
+        )
+    }
+
+    fn set_mtime(path: &Path, seconds_ago: u64) {
+        let file = fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_modified(SystemTime::now() - Duration::from_secs(seconds_ago))
+            .unwrap();
+    }
+
+    fn append(path: &Path, text: &str) {
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
+        file.write_all(text.as_bytes()).unwrap();
+    }
+
+    fn claude_dir(home: &Path) -> PathBuf {
+        let dir = home.join(".claude/projects/p");
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn limits(files: usize, bytes_per_pass: u64, records: usize) -> ScanLimits {
+        ScanLimits {
+            files,
+            bytes_per_pass,
+            records,
+            ..ScanLimits::default()
+        }
     }
 
     #[test]
-    fn truncated_files_are_scanned_from_the_recent_tail() {
-        let old = concat!(
-            r#"{"type":"assistant","message":{"id":"old","usage":{"input_tokens":1}}}"#,
-            "\n"
+    fn history_larger_than_the_old_per_source_cap_is_counted_in_full() {
+        // The collector used to read only the newest 64 MB per source (and 32 MB
+        // per file) and presented that as the total.
+        let home = tempfile::tempdir().unwrap();
+        let dir = claude_dir(home.path());
+        let pad = "x".repeat(1024 * 1024);
+        let mut expected = 0;
+        for file in 0..2 {
+            let mut body = String::new();
+            for n in 0..40 {
+                let id = format!("m-{file}-{n}");
+                body.push_str(&format!(
+                    "{{\"type\":\"assistant\",\"pad\":\"{pad}\",\"message\":{{\"id\":\"{id}\",\"usage\":{{\"input_tokens\":3,\"output_tokens\":2}}}}}}\n"
+                ));
+                expected += 5;
+            }
+            fs::write(dir.join(format!("s{file}.jsonl")), body).unwrap();
+        }
+        let total: u64 = (0..2)
+            .map(|file| {
+                fs::metadata(dir.join(format!("s{file}.jsonl")))
+                    .unwrap()
+                    .len()
+            })
+            .sum();
+        assert!(total > 64 * 1024 * 1024, "fixture must exceed the old cap");
+
+        let report = collect(home.path());
+        let claude = agent(&report, "claude");
+        assert_eq!(claude.total_tokens, Some(expected));
+        assert_eq!(claude.sessions, Some(2));
+        assert_eq!(
+            claude.coverage,
+            Some(TokenCoverage {
+                complete: true,
+                files_read: 2,
+                files_found: 2
+            })
         );
-        let middle = concat!(
-            r#"{"type":"assistant","message":{"id":"middle","usage":{"input_tokens":2}}}"#,
-            "\n"
+        assert_eq!(claude.provenance.quality, "partial");
+    }
+
+    #[test]
+    fn a_later_pass_reads_only_the_bytes_appended() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = claude_dir(home.path());
+        let first = msg("a", 10, 1);
+        fs::write(dir.join("s.jsonl"), first.as_bytes()).unwrap();
+        let mut scanner = TokenScanner::new();
+        assert_eq!(
+            agent(&scanner.scan(home.path()), "claude").total_tokens,
+            Some(11)
         );
-        let recent = concat!(
-            r#"{"type":"assistant","message":{"id":"recent","usage":{"input_tokens":9}}}"#,
-            "\n"
+
+        let added = msg("b", 20, 2);
+        append(&dir.join("s.jsonl"), &added);
+        // A pass that re-read the whole file would not fit in this budget.
+        scanner.limits.bytes_per_pass = added.len() as u64 + 8;
+        let report = scanner.scan(home.path());
+        let claude = agent(&report, "claude");
+        assert_eq!(claude.total_tokens, Some(33));
+        assert_eq!(claude.coverage.map(|c| c.complete), Some(true));
+        assert!(!scanner.catching_up());
+    }
+
+    #[test]
+    fn a_repeated_message_id_across_passes_keeps_one_snapshot() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = claude_dir(home.path());
+        fs::write(dir.join("s.jsonl"), msg("same", 4, 5).as_bytes()).unwrap();
+        let mut scanner = TokenScanner::new();
+        scanner.scan(home.path());
+        append(&dir.join("s.jsonl"), &msg("same", 4, 9));
+        let report = scanner.scan(home.path());
+        assert_eq!(agent(&report, "claude").total_tokens, Some(13));
+    }
+
+    #[test]
+    fn a_resumed_session_copy_is_not_counted_twice_across_files() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = claude_dir(home.path());
+        fs::write(dir.join("parent.jsonl"), msg("shared", 7, 3).as_bytes()).unwrap();
+        let mut scanner = TokenScanner::new();
+        scanner.scan(home.path());
+        let mut copy = msg("shared", 7, 3);
+        copy.push_str(&msg("new", 1, 1));
+        fs::write(dir.join("resumed.jsonl"), copy.as_bytes()).unwrap();
+        let report = scanner.scan(home.path());
+        assert_eq!(agent(&report, "claude").total_tokens, Some(12));
+        assert_eq!(agent(&report, "claude").sessions, Some(2));
+    }
+
+    #[test]
+    fn a_record_still_being_written_is_read_once_it_completes() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = claude_dir(home.path());
+        let second = msg("two", 5, 5);
+        let (head, tail) = second.split_at(second.len() / 2);
+        let mut body = msg("one", 1, 1);
+        body.push_str(head);
+        fs::write(dir.join("s.jsonl"), body.as_bytes()).unwrap();
+        let mut scanner = TokenScanner::new();
+        let report = scanner.scan(home.path());
+        assert_eq!(agent(&report, "claude").total_tokens, Some(2));
+        // A half-written record is not a malformed one.
+        assert_eq!(
+            report.agents[0].coverage.map(|coverage| coverage.complete),
+            Some(true)
         );
-        let body = format!("{old}{middle}{recent}");
+        append(&dir.join("s.jsonl"), tail);
+        let report = scanner.scan(home.path());
+        assert_eq!(agent(&report, "claude").total_tokens, Some(12));
+    }
+
+    #[test]
+    fn a_file_that_shrank_is_dropped_from_the_totals() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = claude_dir(home.path());
+        let mut body = msg("a", 10, 0);
+        body.push_str(&msg("b", 20, 0));
+        fs::write(dir.join("s.jsonl"), body.as_bytes()).unwrap();
+        let mut scanner = TokenScanner::new();
+        assert_eq!(
+            agent(&scanner.scan(home.path()), "claude").total_tokens,
+            Some(30)
+        );
+        fs::write(dir.join("s.jsonl"), msg("a", 10, 0).as_bytes()).unwrap();
+        assert_eq!(
+            agent(&scanner.scan(home.path()), "claude").total_tokens,
+            Some(10)
+        );
+    }
+
+    #[test]
+    fn a_file_whose_time_moved_back_is_read_again() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = claude_dir(home.path());
+        let path = dir.join("s.jsonl");
+        fs::write(&path, msg("a", 10, 0).as_bytes()).unwrap();
+        let mut scanner = TokenScanner::new();
+        scanner.scan(home.path());
+        // Same length, different content, older time: a restored copy.
+        fs::write(&path, msg("b", 50, 0).as_bytes()).unwrap();
+        set_mtime(&path, 86_400);
+        assert_eq!(
+            agent(&scanner.scan(home.path()), "claude").total_tokens,
+            Some(50)
+        );
+    }
+
+    #[test]
+    fn bytes_rewritten_in_place_are_detected_even_when_the_file_grew() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = claude_dir(home.path());
+        let path = dir.join("s.jsonl");
+        fs::write(&path, msg("old", 10, 0).as_bytes()).unwrap();
+        let mut scanner = TokenScanner::new();
+        scanner.scan(home.path());
+        let mut rewritten = msg("new", 40, 0);
+        rewritten.push_str(&msg("more", 1, 0));
+        fs::write(&path, rewritten.as_bytes()).unwrap();
+        assert_eq!(
+            agent(&scanner.scan(home.path()), "claude").total_tokens,
+            Some(41)
+        );
+    }
+
+    #[test]
+    fn a_removed_file_leaves_the_totals() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = claude_dir(home.path());
+        fs::write(dir.join("a.jsonl"), msg("a", 10, 0).as_bytes()).unwrap();
+        fs::write(dir.join("b.jsonl"), msg("b", 5, 0).as_bytes()).unwrap();
+        let mut scanner = TokenScanner::new();
+        assert_eq!(
+            agent(&scanner.scan(home.path()), "claude").total_tokens,
+            Some(15)
+        );
+        fs::remove_file(dir.join("b.jsonl")).unwrap();
+        let report = scanner.scan(home.path());
+        assert_eq!(agent(&report, "claude").total_tokens, Some(10));
+        assert_eq!(agent(&report, "claude").sessions, Some(1));
+    }
+
+    #[test]
+    fn a_byte_budget_is_caught_up_over_passes_newest_files_first() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = claude_dir(home.path());
+        for (name, tokens, ago) in [("old", 1, 300), ("mid", 10, 200), ("new", 100, 100)] {
+            let path = dir.join(format!("{name}.jsonl"));
+            fs::write(&path, msg(name, tokens, 0).as_bytes()).unwrap();
+            set_mtime(&path, ago);
+        }
+        let one_file = msg("new", 100, 0).len() as u64;
+        let mut scanner = TokenScanner::with_limits(limits(100, one_file, 1000));
+
+        let first = scanner.scan(home.path());
+        let claude = agent(&first, "claude");
+        assert_eq!(claude.total_tokens, Some(100), "newest file comes first");
+        assert_eq!(claude.provenance.quality, "sample");
+        assert_eq!(
+            claude.coverage,
+            Some(TokenCoverage {
+                complete: false,
+                files_read: 1,
+                files_found: 3
+            })
+        );
+        assert!(scanner.catching_up());
+
+        let mut last = first;
+        for _ in 0..5 {
+            if !scanner.catching_up() {
+                break;
+            }
+            last = scanner.scan(home.path());
+        }
+        let claude = agent(&last, "claude");
+        assert_eq!(claude.total_tokens, Some(111));
+        assert_eq!(claude.provenance.quality, "partial");
+        assert_eq!(
+            claude.coverage.map(|coverage| coverage.complete),
+            Some(true)
+        );
+        assert!(!scanner.catching_up());
+    }
+
+    #[test]
+    fn a_file_cap_reports_a_sample_of_the_newest_files() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = claude_dir(home.path());
+        for (name, tokens, ago) in [("a", 1, 300), ("b", 10, 200), ("c", 100, 100)] {
+            let path = dir.join(format!("{name}.jsonl"));
+            fs::write(&path, msg(name, tokens, 0).as_bytes()).unwrap();
+            set_mtime(&path, ago);
+        }
+        let report = TokenScanner::with_limits(limits(2, u64::MAX, 1000)).scan(home.path());
+        let claude = agent(&report, "claude");
+        assert_eq!(claude.total_tokens, Some(110));
+        assert_eq!(claude.provenance.quality, "sample");
+        assert!(claude.provenance.note.contains("sample"));
+        assert_eq!(
+            claude.coverage,
+            Some(TokenCoverage {
+                complete: false,
+                files_read: 2,
+                files_found: 3
+            })
+        );
+    }
+
+    #[test]
+    fn a_full_record_store_reports_a_sample() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = claude_dir(home.path());
+        let mut body = String::new();
+        for n in 0..3 {
+            body.push_str(&msg(&format!("m{n}"), 1, 0));
+        }
+        fs::write(dir.join("s.jsonl"), body.as_bytes()).unwrap();
+        let report = TokenScanner::with_limits(limits(100, u64::MAX, 2)).scan(home.path());
+        let claude = agent(&report, "claude");
+        assert_eq!(claude.total_tokens, Some(2));
+        assert_eq!(
+            claude.coverage.map(|coverage| coverage.complete),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn codex_keeps_one_snapshot_per_session_across_passes_and_copies() {
+        let home = tempfile::tempdir().unwrap();
+        let live = home.path().join(".codex/sessions/2026");
+        let archived = home.path().join(".codex/archived_sessions");
+        fs::create_dir_all(&live).unwrap();
+        fs::create_dir_all(&archived).unwrap();
+        let path = live.join("a.jsonl");
+        let mut body = codex_meta("s1");
+        body.push_str(&codex_count(10, 5));
+        fs::write(&path, body.as_bytes()).unwrap();
+        let mut scanner = TokenScanner::new();
+        assert_eq!(
+            agent(&scanner.scan(home.path()), "codex").total_tokens,
+            Some(15)
+        );
+        // The session grows; the id is in the head, which is not read again.
+        append(&path, &codex_count(30, 10));
+        let mut copy = codex_meta("s1");
+        copy.push_str(&codex_count(12, 6));
+        fs::write(archived.join("a-copy.jsonl"), copy.as_bytes()).unwrap();
+        let report = scanner.scan(home.path());
+        let codex = agent(&report, "codex");
+        assert_eq!(codex.total_tokens, Some(40));
+        assert_eq!(codex.sessions, Some(1));
+        assert_eq!(codex.coverage.map(|coverage| coverage.files_found), Some(2));
+    }
+
+    #[test]
+    fn more_codex_sessions_than_the_old_cap_allowed_are_all_counted() {
+        // Reported live: 18 sessions shown for 201 history files.
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join(".codex/sessions");
+        fs::create_dir_all(&dir).unwrap();
+        for n in 0..201 {
+            let mut body = codex_meta(&format!("s{n}"));
+            body.push_str(&"x".repeat(0));
+            body.push_str(&codex_count(2, 1));
+            fs::write(dir.join(format!("{n}.jsonl")), body.as_bytes()).unwrap();
+        }
+        let report = collect(home.path());
+        let codex = agent(&report, "codex");
+        assert_eq!(codex.sessions, Some(201));
+        assert_eq!(codex.total_tokens, Some(603));
+    }
+
+    #[test]
+    fn range_reads_start_at_a_record_boundary_and_report_where_they_ended() {
+        let first = msg("one", 1, 0);
+        let second = msg("two", 2, 0);
         let file = tempfile::NamedTempFile::new().unwrap();
-        fs::write(file.path(), body.as_bytes()).unwrap();
-        let allowance = (middle.len() / 2 + recent.len()) as u64;
+        fs::write(file.path(), format!("{first}{second}")).unwrap();
         let mut ids = Vec::new();
-        let (error, truncated) = for_each_json_line::<ClaudeLine>(
-            open_source_file(file.path()).unwrap(),
-            body.len() as u64,
-            allowance,
-            |line| {
-                if let Some(message) = line.message {
-                    if let Some(id) = message.id {
-                        ids.push(id);
-                    }
-                }
-            },
+        let mut handle = open_source_file(file.path()).unwrap();
+        let outcome = for_each_json_line::<ClaudeLine>(
+            &mut handle,
+            first.len() as u64,
+            (first.len() + second.len()) as u64,
+            |line| ids.push(line.message.and_then(|message| message.id).unwrap()),
         );
-        assert!(!error);
-        assert!(truncated);
-        assert_eq!(ids, vec!["recent"]);
+        assert_eq!(ids, vec!["two"]);
+        assert_eq!(outcome.end, (first.len() + second.len()) as u64);
+        assert!(!outcome.had_error && !outcome.skipped_oversized);
     }
 
     #[test]
@@ -1354,16 +2059,30 @@ mod tests {
         body.extend_from_slice(b"{}\n");
         let mut reader = BufReader::new(std::io::Cursor::new(body));
         let mut line = Vec::new();
-        assert_eq!(
-            read_bounded_line(&mut reader, &mut line).unwrap(),
-            Some(true)
-        );
+        let read = read_bounded_line(&mut reader, &mut line).unwrap().unwrap();
+        assert!(read.oversized && read.terminated);
+        assert_eq!(read.bytes, (MAX_BYTES_PER_LINE + 101) as u64);
         assert!(line.len() <= MAX_BYTES_PER_LINE + 1);
+        let read = read_bounded_line(&mut reader, &mut line).unwrap().unwrap();
+        assert!(!read.oversized && read.terminated);
+        assert_eq!(line, b"{}\n");
+    }
+
+    #[test]
+    fn a_skipped_oversized_record_marks_the_figures_as_a_sample() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = claude_dir(home.path());
+        let mut body = "x".repeat(MAX_BYTES_PER_LINE + 10);
+        body.push('\n');
+        body.push_str(&msg("a", 4, 0));
+        fs::write(dir.join("s.jsonl"), body.as_bytes()).unwrap();
+        let report = collect(home.path());
+        let claude = agent(&report, "claude");
+        assert_eq!(claude.total_tokens, Some(4));
         assert_eq!(
-            read_bounded_line(&mut reader, &mut line).unwrap(),
+            claude.coverage.map(|coverage| coverage.complete),
             Some(false)
         );
-        assert_eq!(line, b"{}\n");
     }
 
     #[cfg(unix)]

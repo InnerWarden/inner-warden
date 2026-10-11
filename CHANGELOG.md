@@ -3,6 +3,144 @@
 All notable changes to InnerWarden are documented here. This project
 follows semantic versioning.
 
+## 1.5.5 - 2026-10-11
+
+### Upgrade notes: what to do
+
+- **`innerwarden dashboard` refuses what it does not understand.** A word such
+  as `tunnel` or `open`, or `--bind` with no address, used to be skipped: the
+  dashboard started on the default address and said nothing about the word.
+  It now prints what it did not understand and the usage, and exits 2. The
+  documented flags (`--bind IP:PORT`, `--expose`) are unchanged. A script that
+  passed an extra word will now stop at it; remove the word.
+- **`innerwarden status` prints the `[unknown]` explanation only under an
+  `[unknown]` line.** On a healthy machine the closing note about `[unknown]`
+  described a line that was not there.
+- **The agent can run `innerwarden mute --list` and `--help` again.** The
+  guard denied any command that contained `innerwarden mute` or
+  `innerwarden dry-run`, including reading the mute list, asking for help,
+  and text that only names the verb in a search or a commit message. Those
+  now pass: `mute --list`, `mute --remove <rule>`, a bare `mute`, `--help`
+  anywhere, and the verb inside a `grep`, `rg`, `git commit`/`log`/`show`, or
+  an `echo`/`printf` whose output goes nowhere but the screen. Everywhere
+  else the text `innerwarden mute <rule>`, `dry-run` or `monitor` is still
+  denied, as in 1.5.4, whatever program would run it (a launcher, a pty, an
+  interpreter, a heredoc, a file written and then run), and `monitor` is now
+  held to the same rule as `dry-run`. Run these from your own terminal. Two
+  details: the read-only words are judged in their documented order, so
+  `mute ATR-1 --remove` reads as muting `ATR-1` (write `mute --remove
+  ATR-1`); and a command that only prints the verb through `ssh` or `docker
+  run` (`ssh host grep 'innerwarden mute' f`) is still denied, because the
+  remote side runs that text.
+- **Releases are stopped if the installer does not set `umask 022`.** The
+  installer creates `~/.local/bin` and the binary with the caller's umask,
+  which is 0002 on Ubuntu and Debian, so they came out group-writable and the
+  CLI's own screening refused the binary. No change for installs that exist.
+  The installer lives in the distribution repository, so its change has to be
+  merged there before the next release can pass this check.
+- **The Tokens page counts the whole retained history.** It used to read only
+  the newest 64 MB of each agent's history and show that as the total, so a
+  machine with years of transcripts showed a small fraction of its real use.
+  Nothing to configure. The first scan after the dashboard starts reads the
+  whole history (up to 1 GiB per refresh, newest files first, then carries on
+  in the next pass), so the figures can start low and grow for a short while on
+  a very large history. Later refreshes read only what was appended.
+- **A capped scan says it is a sample.** When a limit still cuts the scan, the
+  row shows "A sample, not the total: the newest N of M history files." and the
+  Overview tile says "(a sample, not the total)". The JSON gains an additive
+  `coverage` object (`complete`, `files_read`, `files_found`; numbers only) on
+  each agent with counters, and `provenance.quality` is `sample` instead of
+  `partial`. Older readers ignore the new field.
+- **Claude Code's file tools are judged too.** The hook now also runs for
+  `Write`, `Edit`, `MultiEdit` and `NotebookEdit`, and refuses a change to a
+  privileged file: the agent's settings (`~/.claude/settings.json`, a
+  project's `.claude/settings.json` and `.claude/settings.local.json`, the
+  other agent configurations the guard wires), the guard's own configuration
+  (`~/.config/innerwarden`) and program, shell startup files (`.bashrc`,
+  `.zshrc`, `.profile`, ...), SSH keys, cron and the system's and your own
+  services, and stored credentials (`~/.aws`, `~/.docker/config.json`,
+  `~/.kube/config`, `~/.npmrc`, ...). Every other edit is allowed at once,
+  without a word and without a record. `innerwarden install claude-code` (or
+  `agents connect claude-code`) writes the new `PreToolUse` entry beside the
+  Bash one, in the mode the hook already has. With automatic setup on, the
+  dashboard and `innerwarden upgrade` add it for you without asking, by
+  rewriting `~/.claude/settings.json` once; on a hook that enforces, the agent's
+  edits of the files above (`~/.bashrc`, `~/.aws/...` and the rest) are refused
+  from then on, where they used to go through. Without automatic setup nothing
+  is rewritten, and `innerwarden status` reports `[off] only shell commands
+  are judged` (and the headline says the machine is not fully protected)
+  until you run `innerwarden install claude-code`. Either way, restart Claude
+  Code afterwards: it reads its hooks at startup. `innerwarden status` says
+  which tool classes each agent's wiring judges, and names the command when a
+  hook judges shell commands only or records file changes without refusing
+  them while its shell hook refuses.
+- **A privileged file is known by what it is, not only by its name.** A hard
+  link to one, the real file a home link points at (`~/.bashrc ->
+  ~/dotfiles/bashrc`: the agent's edit of `~/dotfiles/bashrc` is refused), a
+  new file in a privileged directory reached through a link, and the guard's
+  program under another name are refused as that file. If you keep your
+  dotfiles in a repository and let the agent work there, edits to the files
+  your home links to are now yours to make. A hook run without `HOME` judges
+  against the home the account database names.
+- **`uninstall` removes two entries.** It reports "removed 2 entries" where it
+  reported 1, the Bash hook and the file-tools hook. Uninstall with this
+  version: a 1.5.4 or earlier `innerwarden uninstall` does not know the
+  file-tools entry and leaves it behind, and with the program gone Claude Code
+  reports a hook error on every file edit until the entry is removed from
+  `~/.claude/settings.json`.
+- **Asking the agent to edit `~/.claude/settings.json` is now refused.** That
+  request was allowed before, and it is the same change an agent would make to
+  switch its own guard off, so the guard cannot tell the two apart. Edit the
+  file yourself: your own editor and shell are not screened. The same holds
+  for the other files above.
+- **The MCP proxy reads every line the way the server will.** A message is
+  parsed as JSON where the last of two equal keys wins, so a call that hid a
+  second `params` behind a first one is inspected as the call the server
+  runs, and forwarded in that form. A batch (a JSON array, which clients of
+  the 2025-03-26 protocol revision send) is judged element by element; in
+  `guard` mode a refused element is answered on its own and the rest of the
+  batch goes on, in `kill` mode none of it does. A message without
+  `"jsonrpc": "2.0"` is inspected rather than passed through. Blank lines are
+  still dropped.
+- **A client line that is not JSON is refused in `guard` and `kill` mode.** It
+  is not forwarded, and the client gets a JSON-RPC parse error (`-32700`,
+  `id: null`). So is JSON nested more than 128 levels deep, which the proxy
+  cannot read and used to forward unread. In `advisory` (the default) and
+  `warn`, which never block, the line is forwarded as before and an
+  `AG-MCP-PARSE` finding says it went uninspected. A protocol-conforming
+  client sends neither. An escaped lone surrogate (`"\ud800"`, which a
+  JavaScript client can produce) is read, not refused.
+- **A message with a repeated key is forwarded as it was inspected, both
+  ways.** Client and server lines that repeat a key (which no conforming peer
+  sends) are re-serialized with the last value, the one the proxy judged, so
+  a peer whose parser keeps the first value cannot be handed one the proxy
+  never saw. Lines without a repeated key keep their exact bytes.
+- **Server output that is not a message is treated as tool output.** Text a
+  server writes to its MCP stream that is not a JSON-RPC message still reaches
+  the client, and is now scanned for prompt injection and remembered by the
+  taint check, so a later call that reuses it is held. A server that prints a
+  banner or log lines to stdout (instead of stderr) can see such a call held
+  in `guard` mode; send its logs to stderr.
+- **`readOnlyHint` no longer hides a write tool.** A server that declares a
+  tool read-only is not believed for the privileged-file check when the
+  tool's name says it writes: `write_file`, `edit_file`, `move_file`,
+  `create_directory`, and any name with a word such as write, edit, create,
+  move, rename, delete, replace, save, patch or copy (`writeFile`,
+  `fs_write`, `str_replace_editor`). The call is judged as the write it is.
+  Other tools keep the server's word, as before.
+
+### Changed
+
+- Token history is indexed per file (length, time, how far it was read) and
+  only the bytes appended since the last refresh are read. A file that shrank,
+  was rewritten or was removed makes the index rebuild from scratch, so the
+  totals never keep tokens from history that is gone. Message and session ids
+  are kept only as 64-bit digests in memory for de-duplication and are never
+  written or served.
+- The dashboard JavaScript is 2.6 kB smaller (the shared part, which the paid
+  dashboard also builds from, is 3.1 kB smaller): class lists that were
+  repeated in many components are declared once.
+
 ## 1.5.4 - 2026-10-11
 
 ### Upgrade notes: what to do

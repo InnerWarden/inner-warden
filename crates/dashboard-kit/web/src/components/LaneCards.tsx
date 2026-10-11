@@ -8,6 +8,7 @@ import { When } from "./When";
 import { gridColumnsClass, gridSpanClass, joinClasses } from "./cardGrid";
 import { TechnicalOnly } from "./TechnicalDetail";
 import { Bar, Swatch, type Part } from "./viz";
+import { LEAD } from "./classes";
 
 /**
  * What happened to each command or message, as a colour with a job:
@@ -213,7 +214,7 @@ export function LaneCards({
       <h1 id="lanes-title" className="text-2xl font-semibold tracking-tight text-slate-950 sm:text-3xl">
         What is happening here
       </h1>
-      <p className="mt-2 max-w-3xl text-sm leading-6 text-slate-600">
+      <p className={LEAD}>
         {intro ?? lanesIntro(cards, everyCardLeads)}
       </p>
       {beforeCards === undefined || beforeCards === null ? null : <div className="mt-5">{beforeCards}</div>}

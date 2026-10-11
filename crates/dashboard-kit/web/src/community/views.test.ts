@@ -71,6 +71,18 @@ describe("tokens as bars", () => {
     expect(row.parts).toEqual([]);
   });
 
+  it("marks a capped scan as a sample, and only that", () => {
+    const covered = { complete: true, files_read: 9, files_found: 9 };
+    expect(tokenRow({ ...tokens.agents[0], coverage: covered }).sample).toBeUndefined();
+    expect(tokenRow({ ...tokens.agents[0] }).sample).toBeUndefined();
+    const cut = tokenRow({ ...tokens.agents[0], coverage: { complete: false, files_read: 4, files_found: 9 } });
+    expect(cut.sample).toBe("A sample, not the total: the newest 4 of 9 history files.");
+    const uncounted = tokenRow({ ...tokens.agents[0], coverage: { complete: false, files_read: 9, files_found: 9 } });
+    expect(uncounted.sample).toContain("could not be counted");
+    expect(tokenTotal([cut, tokenRow(tokens.agents[1])])?.sample).toBe(true);
+    expect(tokenTotal([tokenRow(tokens.agents[1])])?.sample).toBe(false);
+  });
+
   it("keeps counts past what a number holds exact", () => {
     const huge = "90071992547409930";
     const row = tokenRow({ ...tokens.agents[1], total_tokens: huge, input_tokens: huge, output_tokens: "0", parts_disjoint: false } as never);

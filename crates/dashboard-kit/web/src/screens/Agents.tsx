@@ -2,6 +2,7 @@ import type { AgentInventory, AgentSubject, IdentityConfidence } from "../api/v1
 import { gridColumnsClass, gridSpanClass, joinClasses } from "../components/cardGrid";
 import { StatusBadge } from "../components/StatusBadge";
 import { TruncatedId } from "../components/TruncatedId";
+import { EMPTY_BODY_TIGHT, EYEBROW_CYAN_WIDE, LEAD, NOTE } from "../components/classes";
 
 // ─────────────────────────── guardrail liveness ──────────────────────────────
 //
@@ -172,9 +173,9 @@ export function Agents({ inventory, stale = false, nowMs }: { inventory: AgentIn
     <div data-tour="agents" className="space-y-6">
       <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
         <div>
-          <p className="text-xs font-semibold uppercase tracking-[0.16em] text-cyan-700">Agents</p>
+          <p className={EYEBROW_CYAN_WIDE}>Agents</p>
           <h1 className="mt-1 text-2xl font-semibold tracking-tight text-slate-950">Connected agents</h1>
-          <p className="mt-2 max-w-3xl text-sm leading-6 text-slate-600">
+          <p className={LEAD}>
             Which agents are wired through the guardrail, and whether each guardrail has actually been seen running.
           </p>
         </div>
@@ -196,13 +197,13 @@ export function Agents({ inventory, stale = false, nowMs }: { inventory: AgentIn
       ) : (
         <div className="rounded-xl border border-dashed border-slate-300 bg-white px-5 py-10 text-center">
           <h2 className="font-semibold text-slate-900">{EMPTY_STATE.title}</h2>
-          <p className="mx-auto mt-1 max-w-xl text-sm leading-6 text-slate-600">
+          <p className={EMPTY_BODY_TIGHT}>
             Run <code className="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-xs text-slate-800">{EMPTY_STATE.command}</code> to put a guardrail on an agent.
           </p>
         </div>
       )}
 
-      {footnote ? <p className="text-xs leading-5 text-slate-500">{footnote.text}</p> : null}
+      {footnote ? <p className={NOTE}>{footnote.text}</p> : null}
     </div>
   );
 }

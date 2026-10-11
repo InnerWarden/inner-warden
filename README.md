@@ -117,7 +117,11 @@ score, matched signals, and a short explanation.
 
 Whatever agent you run, there is a mechanism and a command for it:
 
-- **Claude Code** - a PreToolUse hook: `innerwarden install claude-code`.
+- **Claude Code** - a PreToolUse hook: `innerwarden install claude-code`. It
+  judges every shell command, and every file change its own tools (`Write`,
+  `Edit`, `MultiEdit`, `NotebookEdit`) make to a privileged file: its settings,
+  the guard's configuration, shell startup files, SSH keys, scheduled jobs and
+  services, and stored credentials. Ordinary project edits are not judged.
 - **Cursor, Codex CLI, Gemini CLI, OpenClaw** - no pre-execution hook exists, so
   the guard wires their MCP configuration to run through its proxy:
   `innerwarden agents connect <agent>`. Reversible with `agents disconnect`.
