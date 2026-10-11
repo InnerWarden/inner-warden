@@ -229,7 +229,9 @@ pub fn privileged_file_write(path: &str, context: &WriteContext<'_>) -> Option<&
 
 /// Privileged files in the account's home, relative to it, outside
 /// [`HOME_PLACES`]: the ones [`crate::threats`] holds by name wherever they
-/// are. Compared by identity in [`same_as_a_privileged_file`].
+/// are. Compared by identity in [`same_as_a_privileged_file`] (Unix only:
+/// identity is a device and inode pair).
+#[cfg(unix)]
 const HOME_GUARD_FILES: &[&str] = &[
     ".claude/settings.json",
     ".claude/settings.local.json",
@@ -244,6 +246,7 @@ const HOME_GUARD_FILES: &[&str] = &[
 ];
 
 /// Privileged directories in the account's home outside [`HOME_PLACES`].
+#[cfg(unix)]
 const HOME_GUARD_TREES: &[&str] = &[".config/innerwarden", ".ssh", ".gnupg"];
 
 /// The account's home from the account database, for a hook run without
