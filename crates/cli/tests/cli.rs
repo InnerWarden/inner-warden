@@ -994,6 +994,63 @@ fn hook_allows_when_no_command() {
     assert_eq!(code, Some(0));
 }
 
+/// A Bash PreToolUse payload for `command`, JSON-escaped.
+fn bash_payload(command: &str) -> String {
+    serde_json::json!({"tool_name": "Bash", "tool_input": {"command": command}}).to_string()
+}
+
+/// FAILS ON REVERT (byte cut): 8191 bytes then a multi-byte character put the
+/// old cut of the obfuscation rewrite inside that character, and the hook
+/// panicked. A dangerous command behind it must be refused (2) and a benign
+/// one must run (0); a panic, whatever it exits with, fails one of the two.
+#[test]
+fn hook_judges_a_command_behind_a_multibyte_character_at_the_old_cut() {
+    let lead = format!("{}\u{e9}", "a".repeat(8191));
+    for tail in ["${x:-rm} -rf /", "cat ~/.ssh/id_rsa", "r''m -rf /"] {
+        let code = run_hook(&bash_payload(&format!("{lead}; {tail}")));
+        assert_eq!(code, Some(2), "must be refused: {tail}");
+    }
+    for tail in [
+        "rm -rf ./build",
+        "rm -rf ~/.cache/x",
+        "cd build && rm -rf ./*",
+    ] {
+        let code = run_hook(&bash_payload(&format!("{lead}; {tail}")));
+        assert_eq!(code, Some(0), "must run: {tail}");
+    }
+}
+
+/// A long heredoc that writes an ordinary file runs; only a dangerous command
+/// at the end of a long command is refused.
+#[test]
+fn hook_allows_a_long_benign_heredoc_and_refuses_a_padded_wipe() {
+    let mut body = String::new();
+    while body.len() < 9000 {
+        body.push_str("Ordinary prose about the build, the tests and the release notes.\n");
+    }
+    let heredoc = format!("cat > NOTES.md <<'EOF'\n{body}EOF");
+    assert_eq!(run_hook(&bash_payload(&heredoc)), Some(0));
+
+    let padded = format!("echo {}; ${{x:-rm}} -rf /", "a".repeat(9000));
+    assert_eq!(run_hook(&bash_payload(&padded)), Some(2));
+}
+
+/// FAILS ON REVERT (byte cut): command lengths around the old cut, with a
+/// character of every UTF-8 width at the boundary. The hook never dies: a
+/// benign command always runs and a dangerous one is always refused.
+#[test]
+fn hook_input_lengths_around_the_old_cut_never_break_the_verdict() {
+    for wide in ['\u{e9}', '\u{20ac}', '\u{1f600}'] {
+        for lead in 8187..=8193 {
+            let prefix = format!("{}{wide}", "a".repeat(lead));
+            let benign = run_hook(&bash_payload(&format!("{prefix}; echo ok")));
+            assert_eq!(benign, Some(0), "lead {lead} {wide:?}: benign");
+            let dangerous = run_hook(&bash_payload(&format!("{prefix}; ${{x:-rm}} -rf /")));
+            assert_eq!(dangerous, Some(2), "lead {lead} {wide:?}: dangerous");
+        }
+    }
+}
+
 #[test]
 fn install_writes_pretooluse_hook() {
     let dir = tempfile::TempDir::new().unwrap();

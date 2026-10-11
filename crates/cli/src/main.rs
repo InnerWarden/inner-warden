@@ -406,7 +406,7 @@ fn cmd_check(rest: &[String]) -> std::process::ExitCode {
     let rules = analyze(&command, &engine);
     // User suppression first (a command the user trusts neither escalates nor
     // alerts); then, for a still-ambiguous case, an optional LLM second opinion.
-    let value = suppress_io::consider(&command, &rules)
+    let value = suppress_io::consider_reporting(&command, &rules)
         .or_else(|| second_opinion_io::consider(&command, &rules))
         .unwrap_or(rules);
     println!("{}", render_verdict(&command, &value, as_json));
@@ -512,6 +512,59 @@ fn hook_unreadable(why: &str, monitor: bool) -> std::process::ExitCode {
     std::process::ExitCode::from(unreadable_exit_code(monitor))
 }
 
+/// A panic while the hook screens a tool call must never let that call run.
+///
+/// Why a panic hook and not `catch_unwind`: the release profile builds with
+/// `panic = "abort"` (smaller binaries, and no thread or lock can be left
+/// half-unwound). Under abort `catch_unwind` catches nothing, and the process
+/// ends on a signal, which an agent reads like any exit other than 2: "show
+/// stderr, carry on", so the command that caused the panic would run.
+/// Switching the profile to unwind would grow every binary and change what a
+/// panic on any other thread means. A panic hook runs before the abort under
+/// either strategy, so it decides the exit code: 2 in enforce (the call is
+/// refused, as for a call the hook could not read), 1 in monitor (it never
+/// blocks, and says the call went unscreened).
+fn install_hook_panic_guard(monitor: bool) {
+    let message = if monitor {
+        "InnerWarden hook: an internal error stopped the screening of this tool call; it \
+         was NOT screened (monitor mode never blocks).\n"
+    } else {
+        "InnerWarden hook: an internal error stopped the screening of this tool call; \
+         refusing it rather than letting it run unscreened.\n"
+    };
+    exit_on_panic(message, unreadable_exit_code(monitor));
+}
+
+/// The MCP proxy's panic guard. A panic while a call is screened must never
+/// let that call reach the server, and must not end as a bare signal: the
+/// process says what happened and exits 1, which an MCP client reports as a
+/// failed server. Exiting stops every task at once, so nothing the panicking
+/// call was carrying is forwarded. Under `panic = "abort"` the session cannot
+/// be kept alive past a panic; what this decides is how it ends.
+fn install_proxy_panic_guard() {
+    exit_on_panic(
+        "innerwarden proxy: an internal error stopped the screening of a tool call; the call \
+         was not forwarded and the proxy is exiting.\n",
+        PROXY_PANIC_EXIT,
+    );
+}
+
+/// The exit code of a proxy stopped by an internal error.
+const PROXY_PANIC_EXIT: u8 = 1;
+
+/// After the default panic report, write `message` and exit with `code`.
+fn exit_on_panic(message: &'static str, code: u8) {
+    let report = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // The default report first: where it failed is what a bug report needs.
+        report(info);
+        // Never `eprintln!` here: it panics when stderr is gone, and a panic
+        // inside the panic hook aborts, which is the outcome this prevents.
+        let _ = std::io::Write::write_all(&mut std::io::stderr(), message.as_bytes());
+        std::process::exit(i32::from(code));
+    }));
+}
+
 #[cfg(test)]
 fn hook_command(payload: &str) -> String {
     serde_json::from_str::<serde_json::Value>(payload)
@@ -591,11 +644,15 @@ fn hook_event_id(payload: &str) -> Option<String> {
 /// so EVERY screened command is recorded, not only the blocked ones.
 #[cfg(test)]
 fn hook_verdict(payload: &str) -> Option<(String, serde_json::Value)> {
-    hook_verdict_for(&hook_command(payload))
+    hook_verdict_for(&hook_command(payload), hook_context(payload).as_ref())
 }
 
-/// The verdict for one command string (the payload already read).
-fn hook_verdict_for(command: &str) -> Option<(String, serde_json::Value)> {
+/// The verdict for one command string (the payload already read), judged in
+/// the place it runs when that is known (see [`hook_context`]).
+fn hook_verdict_for(
+    command: &str,
+    context: Option<&innerwarden_agent_guard::mcp::WorkingContext>,
+) -> Option<(String, serde_json::Value)> {
     let command = command.to_string();
     if command.trim().is_empty() {
         return None;
@@ -605,7 +662,27 @@ fn hook_verdict_for(command: &str) -> Option<(String, serde_json::Value)> {
     // `RuleEngine::load_embedded_for`.
     let engine =
         RuleEngine::load_embedded_for(innerwarden_agent_guard::rules::AtrSource::ShellCommand);
-    Some((command.clone(), analyze(&command, &engine)))
+    let analysis =
+        innerwarden_agent_guard::mcp::analyze_command_in(&command, Some(&engine), context);
+    let verdict = serde_json::to_value(&analysis).unwrap_or(serde_json::Value::Null);
+    Some((command, verdict))
+}
+
+/// Where the hooked command runs: the payload's `cwd` (the hook process's own
+/// directory when the payload has none, which is where the agent starts it),
+/// the user's home, and the project that directory belongs to. `rm -rf *` and
+/// `cat ../.env` mean different things in different places, and only the hook
+/// knows the place.
+fn hook_context(payload: &str) -> Option<innerwarden_agent_guard::mcp::WorkingContext> {
+    let cwd = hook_cwd(payload).or_else(|| {
+        std::env::current_dir()
+            .ok()
+            .map(|dir| dir.to_string_lossy().into_owned())
+    })?;
+    let home = hook::home_dir()
+        .ok()
+        .map(|home| home.to_string_lossy().into_owned());
+    innerwarden_agent_guard::mcp::WorkingContext::discover(&cwd, home.as_deref())
 }
 
 /// Whether a verdict must block per Claude Code's hook contract: `deny` always,
@@ -771,6 +848,7 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
     // blocks. A dev gets the live dashboard/narrative without the guardrail denying
     // day-to-day commands. Overrides --block-review.
     let monitor = rest.iter().any(|a| a == "--monitor");
+    install_hook_panic_guard(monitor);
 
     let mut buf = String::new();
     if std::io::stdin().read_to_string(&mut buf).is_err() {
@@ -792,7 +870,7 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
         HookInput::NotAShellCall => return std::process::ExitCode::SUCCESS,
         HookInput::Unreadable(why) => return hook_unreadable(why, monitor),
     };
-    let Some((command, rules)) = hook_verdict_for(&command) else {
+    let Some((command, rules)) = hook_verdict_for(&command, hook_context(&buf).as_ref()) else {
         return std::process::ExitCode::SUCCESS;
     };
     // User suppression first, then an optional LLM second opinion for the rest.
@@ -867,18 +945,25 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
         // obvious move, which is to remove the guard, and that is the outcome this
         // control exists to avoid. The remedy is deliberately a decision the PERSON
         // makes, in their own shell, and never something the agent can grant itself.
-        eprintln!(
-            "  To authorise it deliberately: innerwarden allow '{}'",
-            command.replace('\'', "'\\''")
-        );
-        eprintln!(
-            "  Screening covers this agent's tool calls, not your own shell; running \
-             the command yourself is not blocked."
-        );
+        //
+        // So it is addressed to the person and is not a command line. This text
+        // reaches the agent first, and a ready-to-run `innerwarden allow '<cmd>'`
+        // here was an instruction the agent could follow to lift its own block.
+        eprintln!("{}", hook_block_remedy());
         std::process::ExitCode::from(2)
     } else {
         std::process::ExitCode::SUCCESS
     }
+}
+
+/// What the hook tells the person after a block: only they can authorise it,
+/// from their own terminal. Not a command to copy, since the agent reads it
+/// first.
+fn hook_block_remedy() -> &'static str {
+    "  For the person supervising this agent: only you can authorise a blocked \
+     command, from your own terminal (see `innerwarden allow --help`). An agent \
+     cannot authorise it and should ask you instead of retrying. Your own shell \
+     is not screened."
 }
 
 /// `innerwarden enforce` / `innerwarden dry-run` - flip every guarded agent
@@ -1792,6 +1877,7 @@ fn cmd_proxy(rest: &[String]) -> std::process::ExitCode {
         return std::process::ExitCode::from(2);
     }
 
+    install_proxy_panic_guard();
     let engine = Arc::new(RuleEngine::load_embedded());
     eprintln!(
         "innerwarden: proxy mode={mode_label} label={label} rules={} server={server_cmd:?}",
@@ -2256,6 +2342,37 @@ mod tests {
         assert!(hook_verdict("not json").is_none());
     }
 
+    /// FAILS ON REVERT (hook context): the hook judges a command in the
+    /// directory its payload names. The same `rm -rf *` is a cleanup in a
+    /// build folder and a wipe from `/`; the same `.env` read is the
+    /// project's own from inside the repository and blocks from outside it.
+    #[test]
+    fn the_hook_judges_a_command_where_it_runs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).expect("git dir");
+        std::fs::create_dir_all(repo.join("pkg/build")).expect("pkg dir");
+        let pkg = repo.join("pkg").to_string_lossy().into_owned();
+        let payload = |cwd: &str, command: &str| {
+            serde_json::json!({"cwd": cwd, "tool_input": {"command": command}}).to_string()
+        };
+        let blocks = |cwd: &str, command: &str| {
+            let (_, verdict) = hook_verdict(&payload(cwd, command)).expect("verdict");
+            hook_blocks(&verdict, false)
+        };
+
+        assert!(blocks("/", "rm -rf *"), "a wipe from the root");
+        assert!(blocks("/", "rm -rf ./*"), "a wipe from the root");
+        assert!(!blocks(&pkg, "rm -rf *"), "a cleanup in the package");
+        assert!(!blocks(&pkg, "cd build && rm -rf ./*"), "a scoped cleanup");
+        assert!(!blocks(&pkg, "rm -rf ./build"), "a scoped cleanup");
+
+        assert!(!blocks(&pkg, "cat ../.env"), "the repository's own .env");
+        assert!(!blocks(&pkg, "cat .env"), "the package's own .env");
+        assert!(blocks(&pkg, "cat /srv/other/.env"), "another tree's .env");
+        assert!(blocks(&pkg, "cat ../../.env"), "above the repository");
+    }
+
     #[test]
     fn hook_blocks_respects_block_review() {
         let review = serde_json::json!({"recommendation": "review"});
@@ -2623,5 +2740,49 @@ mod install_target_tests {
     fn an_unreadable_call_is_refused_in_enforce_and_loud_in_monitor() {
         assert_eq!(unreadable_exit_code(false), 2);
         assert_eq!(unreadable_exit_code(true), 1);
+    }
+
+    /// A panic during screening refuses the call (2) in enforce and is loud
+    /// (1) in monitor, under the guard the hook installs. Proven in a child
+    /// process, the only way to observe an exit code: this test re-runs itself
+    /// with the variable set, and the child installs the guard and panics.
+    /// Without the guard the child exits 101 (unwind) or on a signal (abort),
+    /// both of which an agent treats as "carry on".
+    #[test]
+    fn a_panic_while_screening_refuses_the_call() {
+        const CHILD: &str = "INNERWARDEN_TEST_PANIC_GUARD_CHILD";
+        if let Ok(mode) = std::env::var(CHILD) {
+            if mode == "proxy" {
+                install_proxy_panic_guard();
+            } else {
+                install_hook_panic_guard(mode == "monitor");
+            }
+            panic!("simulated failure while screening");
+        }
+        for (mode, expected) in [
+            ("enforce", 2),
+            ("monitor", 1),
+            ("proxy", i32::from(PROXY_PANIC_EXIT)),
+        ] {
+            let out = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    "install_target_tests::a_panic_while_screening_refuses_the_call",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, mode)
+                .stdin(std::process::Stdio::null())
+                .output()
+                .expect("run the child");
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(out.status.code(), Some(expected), "{mode}: {stderr}");
+            let said = match mode {
+                "monitor" => "it was NOT screened",
+                "proxy" => "the call was not forwarded",
+                _ => "refusing it rather than letting it run unscreened",
+            };
+            assert!(stderr.contains(said), "{mode}: {stderr}");
+        }
     }
 }
