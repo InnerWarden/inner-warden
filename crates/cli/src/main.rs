@@ -139,6 +139,33 @@ fn status_io_cmd() -> std::process::ExitCode {
         .map(|r| r.name.clone())
         .collect();
 
+    // What each wired agent's wiring judges before a call runs: a hook says
+    // whether it covers the agent's own file tools, which wiring written by an
+    // earlier version does not.
+    let tool_classes: Vec<status::ToolClasses> = home
+        .as_deref()
+        .map(|home| {
+            rows.iter()
+                .filter(|r| wired_agents.contains(&r.name))
+                .filter_map(|r| {
+                    if !r.hookable {
+                        return Some(status::ToolClasses::Proxy {
+                            agent: r.name.clone(),
+                        });
+                    }
+                    let settings = std::fs::read(home.join(".claude/settings.json"))
+                        .ok()
+                        .and_then(|body| serde_json::from_slice::<serde_json::Value>(&body).ok())?;
+                    Some(status::ToolClasses::Hook {
+                        agent: r.name.clone(),
+                        file_tools: hook::iwguard_judges_file_tools(&settings),
+                        next: innerwarden_agent_guard::agents_ops::hook_repair_command(home, r),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     // Seen at all, wired or not. `None` when we could not look, which the
     // report renders as unknown rather than as "no agent".
     let any_agent_seen = home.as_ref().map(|_| !rows.is_empty());
@@ -193,6 +220,7 @@ fn status_io_cmd() -> std::process::ExitCode {
         mode,
         wired_agents,
         hook_trouble,
+        tool_classes,
         any_agent_seen,
         decisions_recorded,
         newest_decision_age_secs,
@@ -864,6 +892,13 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
         return std::process::ExitCode::SUCCESS;
     }
 
+    // The agent's own file tools never pass through the shell. Judged on
+    // where they write, before anything else: a project edit leaves here at
+    // once, without loading the rule engine or touching the record.
+    if let Some(exit) = screen_file_tool(&buf, rest, monitor) {
+        return exit;
+    }
+
     let command = match classify_hook_input(&buf) {
         HookInput::Command(command) => command,
         // A well-formed call for a tool with no command: never wedge it.
@@ -955,6 +990,69 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
         std::process::ExitCode::SUCCESS
     }
 }
+
+/// Screen a `Write`, `Edit`, `MultiEdit` or `NotebookEdit` call (see
+/// `innerwarden_agent_guard::file_tools`). `None` when the payload is not one
+/// of those tools, so the shell path decides.
+///
+/// Only a write to a privileged file is refused, recorded and alerted on;
+/// every other file edit exits 0 at once and records nothing, because an
+/// agent edits project files all day and a record of each would bury the
+/// decisions that matter.
+fn screen_file_tool(buf: &str, rest: &[String], monitor: bool) -> Option<std::process::ExitCode> {
+    use innerwarden_agent_guard::file_tools::{self, FileToolCall};
+    let payload = serde_json::from_str::<serde_json::Value>(buf).ok()?;
+    let (tool, paths) = match file_tools::file_tool_call(&payload) {
+        FileToolCall::NotAFileTool => return None,
+        FileToolCall::Unreadable(why) => return Some(hook_unreadable(why, monitor)),
+        FileToolCall::Writes { tool, paths } => (tool, paths),
+    };
+    let cwd = hook_cwd(buf)
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::current_dir().ok());
+    let home = hook::home_dir().ok();
+    let guard_program = std::env::current_exe().ok();
+    let context = file_tools::WriteContext {
+        cwd: cwd.as_deref(),
+        home: home.as_deref(),
+        guard_program: guard_program.as_deref(),
+    };
+    let Some((path, what)) = paths.iter().find_map(|path| {
+        file_tools::privileged_file_write(path, &context).map(|what| (path, what))
+    }) else {
+        return Some(std::process::ExitCode::SUCCESS);
+    };
+    let verdict = file_tools::refusal_verdict(&tool, path, what);
+    let command = format!("{tool} {}", path.trim());
+    graph_io::record_hook(
+        &command,
+        &verdict,
+        monitor,
+        true,
+        hook_session(buf).as_deref(),
+        hook_event_id(buf).as_deref(),
+        agent_flag(rest).as_deref(),
+        hook_cwd(buf).as_deref(),
+    );
+    notify_io::fire(&command, &verdict);
+    if monitor {
+        return Some(std::process::ExitCode::SUCCESS);
+    }
+    eprintln!(
+        "InnerWarden blocked this file change (recommendation=deny): {}",
+        file_tools::refusal_explanation(&tool, path, what)
+    );
+    eprintln!("{}", FILE_BLOCK_REMEDY);
+    Some(std::process::ExitCode::from(2))
+}
+
+/// What the hook tells the person after it refuses a file change. There is
+/// no allow rule for one: the file decides who runs, logs in or screens, so
+/// the change is theirs to make, and the agent is told to ask.
+const FILE_BLOCK_REMEDY: &str =
+    "  For the person supervising this agent: make this change yourself, \
+     in your own editor or shell, which are not screened. An agent cannot authorise it and \
+     should ask you instead of retrying.";
 
 /// What the hook tells the person after a block: only they can authorise it,
 /// from their own terminal. Not a command to copy, since the agent reads it

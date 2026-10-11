@@ -21,6 +21,7 @@ import type { LaneOpenOptions } from "./components/LaneCards";
 import { Agents } from "./screens/Agents";
 import { Posture } from "./screens/Posture";
 import { TokenIntelligence } from "./screens/TokenIntelligence";
+import { EMPTY_BODY } from "./components/classes";
 
 /**
  * The routes this repository builds. A contributed screen widens the type but
@@ -969,7 +970,7 @@ function DashboardContractState({ resource }: { resource: DashboardResource<Dash
       <h1 className="mt-4 text-xl font-semibold text-slate-950">
         {loading ? "Connecting to InnerWarden on this machine" : auth ? "Sign in to continue" : "InnerWarden is not answering"}
       </h1>
-      <p className="mx-auto mt-2 max-w-xl text-sm leading-6 text-slate-600">
+      <p className={EMPTY_BODY}>
         {loading
           ? "Asking the local process which edition is running before showing anything."
           : auth

@@ -471,6 +471,7 @@ fn tokens() -> Value {
                 reasoning_output_tokens: None,
                 sessions: Some(18),
                 last_observed_at_ms: Some(NOW - 2 * MINUTE),
+                coverage: None,
                 provenance: provenance.clone(),
             },
             AgentTokenUsage {
@@ -486,6 +487,7 @@ fn tokens() -> Value {
                 reasoning_output_tokens: Some(844_960),
                 sessions: Some(17),
                 last_observed_at_ms: Some(NOW - DAY),
+                coverage: None,
                 provenance: provenance.clone(),
             },
             innerwarden_dashboard_kit::token_usage::unsupported_agent("cursor", "Cursor"),

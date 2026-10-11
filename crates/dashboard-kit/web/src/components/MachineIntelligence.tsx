@@ -11,6 +11,7 @@ import {
 } from "../api";
 import { gridColumnsClass, gridSpanClass, joinClasses } from "./cardGrid";
 import { formatAbsolute, formatCount, formatDay } from "../presentation";
+import { EMPTY_BODY_TIGHT, EYEBROW_CYAN, NOTE, PANEL, ROW_BETWEEN, SECTION_HEAD, STAT_VALUE, TITLE_TRUNCATE, TONE_AMBER, TONE_BLUE, TONE_EMERALD, TONE_SLATE } from "./classes";
 
 type PollState<T> = {
   data?: T;
@@ -325,13 +326,13 @@ function AgentsPanel({ state, edition }: { state: PollState<AgentsResponse>; edi
           {(data.discovery_limited || !autoConnectKnown) && (
             <div className="border-t border-slate-100 px-4 py-2.5 sm:px-5">
               {data.discovery_limited && (
-                <details className="text-xs leading-5 text-slate-500">
+                <details className={NOTE}>
                   <summary className="cursor-pointer font-medium hover:text-slate-700">{DISCOVERY_LIMIT_DISCLOSURE.summary}</summary>
                   <p className="mt-1">{DISCOVERY_LIMIT_DISCLOSURE.body}</p>
                 </details>
               )}
               {!autoConnectKnown && (
-                <p className="text-xs leading-5 text-slate-500">{AUTO_SETUP_UNKNOWN_FOOTNOTE}</p>
+                <p className={NOTE}>{AUTO_SETUP_UNKNOWN_FOOTNOTE}</p>
               )}
             </div>
           )}
@@ -392,9 +393,9 @@ function AgentCard({ agent, spanClass = "" }: { agent: LocalAgent; spanClass?: s
   const view = guardrailView(agent.guardrail);
   return (
     <li className={`min-w-0 bg-white p-4 sm:p-5 ${spanClass}`}>
-      <div className="flex min-w-0 flex-wrap items-start justify-between gap-3">
+      <div className={ROW_BETWEEN}>
         <div className="min-w-0">
-          <h3 className="truncate text-base font-semibold text-slate-950" title={agent.display_name}>{agent.display_name}</h3>
+          <h3 className={TITLE_TRUNCATE} title={agent.display_name}>{agent.display_name}</h3>
           <p className="mt-1 text-xs text-slate-500">{agentPresence(agent)}</p>
         </div>
         {/* A neutral panel leaves out a badge that says only that nothing was
@@ -750,10 +751,10 @@ function TokenCard({ agent, spanClass = "" }: { agent: TokenAgent; spanClass?: s
   ] as const;
 
   return (
-    <li className={joinClasses("min-w-0 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm sm:p-5", spanClass)}>
-      <div className="flex min-w-0 flex-wrap items-start justify-between gap-3">
+    <li className={joinClasses(PANEL, spanClass)}>
+      <div className={ROW_BETWEEN}>
         <div className="min-w-0">
-          <h3 className="truncate text-base font-semibold text-slate-950" title={agent.display_name}>{agent.display_name}</h3>
+          <h3 className={TITLE_TRUNCATE} title={agent.display_name}>{agent.display_name}</h3>
           <p className="mt-1 text-xs text-slate-500">
             {unsupported ? "No supported local token source" : `Last observed: ${scanning ? "Scanning…" : formatObservedAt(agent.last_observed_at_ms)}`}
           </p>
@@ -812,10 +813,10 @@ function TokenCard({ agent, spanClass = "" }: { agent: TokenAgent; spanClass?: s
 function SectionHeading({ eyebrow, title, description, aside }: { eyebrow: string; title: string; description: string; aside?: ReactNode }) {
   const id = title === "Agents on this machine" ? "local-agents-title" : "token-intelligence-title";
   return (
-    <div className="mb-3 flex flex-col items-start gap-2 sm:flex-row sm:items-end sm:justify-between sm:gap-4">
+    <div className={SECTION_HEAD}>
       <div className="min-w-0">
-        <p className="text-xs font-semibold uppercase tracking-[0.14em] text-cyan-700">{eyebrow}</p>
-        <h2 id={id} className="mt-1 text-lg font-semibold text-slate-950">{title}</h2>
+        <p className={EYEBROW_CYAN}>{eyebrow}</p>
+        <h2 id={id} className={STAT_VALUE}>{title}</h2>
         <p className="mt-1 max-w-3xl text-sm leading-5 text-slate-600">{description}</p>
       </div>
       {aside && <div className="shrink-0">{aside}</div>}
@@ -838,12 +839,12 @@ function AvailabilityBadge({ value }: { value: string }) {
   const cls = normalised.includes("error") || normalised.includes("failed")
     ? "border-red-200 bg-red-50 text-red-700"
     : normalised.includes("loading")
-      ? "border-blue-200 bg-blue-50 text-blue-700"
+      ? TONE_BLUE
       : normalised.includes("partial") || normalised.includes("estimated")
-    ? "border-amber-200 bg-amber-50 text-amber-800"
+    ? TONE_AMBER
     : normalised.includes("available") && !normalised.includes("unavailable")
-      ? "border-emerald-200 bg-emerald-50 text-emerald-700"
-      : "border-slate-200 bg-slate-50 text-slate-600";
+      ? TONE_EMERALD
+      : TONE_SLATE;
   return <span className={`inline-flex rounded-full border px-2.5 py-1 text-xs font-semibold ${tone(cls)}`}>{humanise(value)}</span>;
 }
 
@@ -877,7 +878,7 @@ function EmptyPanel({ title, body }: { title: string; body: string }) {
   return (
     <div className="rounded-2xl border border-dashed border-slate-300 bg-white px-4 py-6 text-center sm:px-6">
       <h3 className="font-semibold text-slate-900">{title}</h3>
-      <p className="mx-auto mt-1 max-w-xl text-sm leading-6 text-slate-600">{body}</p>
+      <p className={EMPTY_BODY_TIGHT}>{body}</p>
     </div>
   );
 }
@@ -893,9 +894,9 @@ function UnavailablePanel({ title, body }: { title: string; body: string }) {
 }
 
 function runningStatus(value: boolean | null): { label: string; cls: string } {
-  if (value === true) return { label: "Running", cls: "border-emerald-200 bg-emerald-50 text-emerald-700" };
-  if (value === false) return { label: "Not running", cls: "border-slate-200 bg-slate-50 text-slate-600" };
-  return { label: "Runtime not confirmed", cls: "border-slate-200 bg-slate-50 text-slate-600" };
+  if (value === true) return { label: "Running", cls: TONE_EMERALD };
+  if (value === false) return { label: "Not running", cls: TONE_SLATE };
+  return { label: "Runtime not confirmed", cls: TONE_SLATE };
 }
 
 function humanise(value: string): string {

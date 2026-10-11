@@ -22,6 +22,7 @@ import { LANE_WINDOW_PHRASE, type AgentCommands } from "../lanes";
 import { formatClock, formatCount, freshnessLabel, timeTitle } from "../presentation";
 import { layerAssuranceLabel, type LayerAssuranceLabel } from "../posture/assurance";
 import { POSTURE_REFRESH_MS } from "../posture/refresh";
+import { EYEBROW_CYAN_WIDE, LABEL_SLATE, NOTE, TONE_CYAN, TONE_EMERALD_DEEP, TONE_SLATE } from "../components/classes";
 
 // ─────────────────────────── user-facing projections ─────────────────────────
 //
@@ -958,8 +959,8 @@ export function latestCheck(layers: readonly Pick<ProtectionLayer, "freshness">[
 
 const COUNT_CHIP: Record<StateCount["key"], string> = {
   proven: "border-emerald-200 bg-emerald-50 text-emerald-900",
-  softened: "border-cyan-200 bg-cyan-50 text-cyan-900",
-  working: "border-cyan-200 bg-cyan-50 text-cyan-900",
+  softened: TONE_CYAN,
+  working: TONE_CYAN,
   not_enabled: "border-slate-200 bg-slate-50 text-slate-700",
   cannot_verify: "border-dashed border-slate-400 bg-white text-slate-700",
   needs_operator: "border-slate-200 bg-white text-slate-600",
@@ -1133,7 +1134,7 @@ export function Posture({
     <div className="space-y-6">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
-          <p className="text-xs font-semibold uppercase tracking-[0.16em] text-cyan-700">Protection posture</p>
+          <p className={EYEBROW_CYAN_WIDE}>Protection posture</p>
           <h2 className="mt-1 text-xl font-semibold tracking-tight text-slate-950">Host controls</h2>
           <p className="mt-1 max-w-3xl text-sm leading-6 text-slate-600">
             What is enforcing, what is watching, and where the gaps are.
@@ -1362,7 +1363,7 @@ function SectionFigures({ rows }: { rows: SectionRow[] }) {
         // sits behind the switch. It is never a zero standing in for a figure.
         <TechnicalOnly>
           <div className="mt-3">
-            <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-500">Not measured</h3>
+            <h3 className={LABEL_SLATE}>Not measured</h3>
             <ul className="mt-2 space-y-1">
               {notMeasured.map((row) => (
                 <li key={row.reason} className="text-xs leading-5 text-slate-600">{row.reason}</li>
@@ -1510,7 +1511,7 @@ function AgentLayerSection({ report, commands }: { report: AgentLayerReport; com
       <TechnicalOnly>
         {report.sessions.length > 0 ? (
           <div className="mt-4">
-            <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-500">Agent sessions in the record</h3>
+            <h3 className={LABEL_SLATE}>Agent sessions in the record</h3>
             <ul className="mt-2 flex flex-wrap gap-2" aria-label="Agent sessions in the record">
               {report.sessions.map((session) => (
                 <li key={session} className="[overflow-wrap:anywhere] rounded-lg border border-slate-200 bg-white px-2.5 py-1 font-mono text-[11px] text-slate-700">{session}</li>
@@ -1662,14 +1663,14 @@ function ControlRow({
             </span>
           </div>
           <div>
-            <h4 className="text-xs font-semibold uppercase tracking-wide text-slate-500">Effective scope</h4>
+            <h4 className={LABEL_SLATE}>Effective scope</h4>
             <p className="mt-1 [overflow-wrap:anywhere] text-sm text-slate-700">{scopeDetail(layer.effective_scope)}</p>
             {layer.covered_action_classes.length > 0 ? (
               <p className="mt-1 text-xs text-slate-500">Covered actions: {layer.covered_action_classes.map(humanize).join(", ")}</p>
             ) : null}
           </div>
           <div>
-            <h4 className="text-xs font-semibold uppercase tracking-wide text-slate-500">Declared capabilities</h4>
+            <h4 className={LABEL_SLATE}>Declared capabilities</h4>
             {relevantCapabilities.length > 0 ? (
               <ul className="mt-2 space-y-2">
                 {relevantCapabilities.map((capability) => (
@@ -1684,7 +1685,7 @@ function ControlRow({
           {verificationGaps.length > 0 ? (
             <ul className="space-y-1">
               {verificationGaps.map((gap) => (
-                <li key={gap.id} className="text-xs leading-5 text-slate-500">Verification pending: {gap.next_step}</li>
+                <li key={gap.id} className={NOTE}>Verification pending: {gap.next_step}</li>
               ))}
             </ul>
           ) : null}
@@ -1701,12 +1702,12 @@ function ControlRow({
  * outline for one this page cannot confirm.
  */
 const CONTROL_BADGE: Record<LayerDisposition | "stale", string> = {
-  proven: "border-emerald-200 bg-emerald-50 text-emerald-800",
+  proven: TONE_EMERALD_DEEP,
   working_as_configured: "border-cyan-200 bg-cyan-50 text-cyan-800",
   needs_operator: "border-amber-200 bg-amber-50 text-amber-900",
   cannot_verify: "border-dashed border-slate-400 bg-white text-slate-700",
   not_enabled: "border-slate-200 bg-slate-50 text-slate-700",
-  stale: "border-slate-200 bg-slate-50 text-slate-600",
+  stale: TONE_SLATE,
 };
 
 function ControlBadge({ status, label }: { status: LayerDisposition | "stale"; label: string }) {

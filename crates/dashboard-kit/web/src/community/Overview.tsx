@@ -326,7 +326,7 @@ function OnThisMachine({
   /** Commands the agent card counts as "would have been refused" (monitor mode). */
   wouldHaveRefused: number;
   wouldSpan: string;
-  tokens?: { total: bigint; agents: number };
+  tokens?: { total: bigint; agents: number; sample: boolean };
   tokensFailed: boolean;
   /** The history was read and holds no counters: said, never left "reading". */
   tokensRead: boolean;
@@ -437,6 +437,7 @@ function OnThisMachine({
               </p>
               <p className="mt-1 text-xs leading-5 text-slate-600">
                 {tokens.agents === 1 ? "From 1 agent's own history" : `From ${tokens.agents} agents' own history`}
+                {tokens.sample ? " (a sample, not the total)" : ""}
               </p>
             </>
           )}

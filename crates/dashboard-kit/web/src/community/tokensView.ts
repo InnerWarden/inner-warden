@@ -24,11 +24,21 @@ export type TokenRow = {
   total: bigint | null;
   sessions: number | null;
   lastUsedAt?: number;
+  /** Set when the figures are a sample of the newest history, not the total. */
+  sample?: string;
   /** Stacked in the bar; they add up to `total` or the bar is not drawn. */
   parts: TokenPart[];
   /** Everything the provider reported, in the legend, exact. */
   lines: TokenLine[];
 };
+
+/** What to say when a cap cut the scan; `undefined` when the history is covered. */
+function sampleNote(coverage: TokenAgent["coverage"]): string | undefined {
+  if (coverage === undefined || coverage.complete) return undefined;
+  return coverage.files_read < coverage.files_found
+    ? `A sample, not the total: the newest ${coverage.files_read} of ${coverage.files_found} history files.`
+    : "A sample, not the total: part of this history could not be counted.";
+}
 
 function big(value: string | null): bigint | null {
   return value === null || !/^(0|[1-9]\d*)$/.test(value) ? null : BigInt(value);
@@ -73,6 +83,7 @@ export function tokenRow(agent: TokenAgent & { parts_disjoint?: unknown }): Toke
     total,
     sessions: agent.sessions,
     ...(agent.last_observed_at_ms === null ? {} : { lastUsedAt: agent.last_observed_at_ms }),
+    ...(sampleNote(agent.coverage) === undefined ? {} : { sample: sampleNote(agent.coverage) }),
     parts,
     lines: lines.filter((line) => line.value !== null || line.key === "cache_write" || line.key === "input" || line.key === "output"),
   };
@@ -83,10 +94,14 @@ export function tokenRows(report: TokenIntelligenceResponse | undefined): TokenR
 }
 
 /** Every available agent's total, exact, and how many agents it covers. */
-export function tokenTotal(rows: readonly TokenRow[]): { total: bigint; agents: number } | undefined {
+export function tokenTotal(rows: readonly TokenRow[]): { total: bigint; agents: number; sample: boolean } | undefined {
   const counted = rows.filter((row) => row.total !== null && row.available);
   if (counted.length === 0) return undefined;
-  return { total: counted.reduce((sum, row) => sum + (row.total ?? 0n), 0n), agents: counted.length };
+  return {
+    total: counted.reduce((sum, row) => sum + (row.total ?? 0n), 0n),
+    agents: counted.length,
+    sample: counted.some((row) => row.sample !== undefined),
+  };
 }
 
 /** A bigint scaled to a share of `whole` for a bar width; exact enough for pixels. */

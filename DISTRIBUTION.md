@@ -224,6 +224,9 @@ When a new Community version ships:
    run cannot push one, so its last step ends red until a person does
    (`git tag -a guard-vX.Y.Z <sha> -m "InnerWarden Community X.Y.Z" && git push
    origin guard-vX.Y.Z`). 1.5.2 shipped without it.
+   The run also stops if `iw-guard-install.sh` in the distribution repo does
+   not set `umask 022` (step "Installer sets its own umask"): merge an
+   installer change there before cutting a release that depends on it.
 ### Pinning and rollback
 
 The rolling `iw-guard` tag always carries the newest build, so its binaries are

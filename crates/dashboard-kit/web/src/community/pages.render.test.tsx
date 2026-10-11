@@ -734,5 +734,20 @@ describe("Protection, Agents and Tokens", () => {
     expect(html).toContain("1.0 billion");
     expect(html).toContain("Keeps no token history InnerWarden can read.");
     expect(links(html)).toEqual([]);
+    // A fully covered history is not called a sample.
+    expect(html).not.toContain("A sample, not the total");
+  });
+
+  it("says plainly that a capped scan is a sample of the newest history, never the total", () => {
+    const sampled = {
+      ...tokensFixture,
+      agents: tokensFixture.agents.map((agent) =>
+        agent.agent_id === "claude" ? { ...agent, coverage: { complete: false, files_read: 40, files_found: 1879 } } : agent,
+      ),
+    };
+    answers.set("tokens", sampled);
+    const html = render(<CommunityTokens />);
+    expect(html).toContain("A sample, not the total: the newest 40 of 1879 history files.");
+    expect(html.match(/A sample, not the total/g)?.length).toBe(1);
   });
 });

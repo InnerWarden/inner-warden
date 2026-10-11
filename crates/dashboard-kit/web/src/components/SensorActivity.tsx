@@ -23,6 +23,7 @@ import {
   type SensorChart,
 } from "../sensors/chart";
 import { formatCount } from "../presentation";
+import { EYEBROW_CYAN, PANEL, SECTION_HEAD, STAT_VALUE, TITLE_SM, TONE_AMBER, TONE_EMERALD_DEEP, TONE_SLATE } from "./classes";
 
 const PLOT_WIDTH = 960;
 const PLOT_HEIGHT = 240;
@@ -50,10 +51,10 @@ export function SensorActivity() {
 
   return (
     <section data-tour="overview-sensor" aria-labelledby="sensor-activity-title" className="min-w-0">
-      <div className="mb-3 flex flex-col items-start gap-2 sm:flex-row sm:items-end sm:justify-between sm:gap-4">
+      <div className={SECTION_HEAD}>
         <div className="min-w-0">
-          <p className="text-xs font-semibold uppercase tracking-[0.14em] text-cyan-700">Host sensor</p>
-          <h2 id="sensor-activity-title" className="mt-1 text-lg font-semibold text-slate-950">Sensor activity</h2>
+          <p className={EYEBROW_CYAN}>Host sensor</p>
+          <h2 id="sensor-activity-title" className={STAT_VALUE}>Sensor activity</h2>
           <p className="mt-1 max-w-3xl text-sm leading-5 text-slate-600">
             Events per collector across today, and below it what each collector reports about itself. A collector is only
             shown as running when the sensor attests it or events were observed; being configured is not evidence of either.
@@ -140,9 +141,9 @@ function useSensorFeed(): SensorFeed {
 function TimelineCard({ activity, chart }: { activity: SensorActivityPayload; chart: SensorChart }) {
   const summary = chartSummary(chart);
   return (
-    <div className="min-w-0 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm sm:p-5">
+    <div className={PANEL}>
       <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
-        <h3 className="text-sm font-semibold text-slate-900">Events per collector</h3>
+        <h3 className={TITLE_SM}>Events per collector</h3>
         <p className="text-xs tabular-nums text-slate-500">
           {activity.total_events == null ? "Total not reported" : `${formatCount(activity.total_events)} events`}
           <span aria-hidden="true" className="px-1.5 text-slate-300">·</span>
@@ -378,9 +379,9 @@ function ColumnReadoutStrip({
  */
 function BoardCard({ rows, groups }: { rows: CollectorRow[]; groups: CollectorGroup[] }) {
   return (
-    <div className="min-w-0 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm sm:p-5">
+    <div className={PANEL}>
       <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
-        <h3 className="text-sm font-semibold text-slate-900">Collector status</h3>
+        <h3 className={TITLE_SM}>Collector status</h3>
         <p className="text-xs leading-5 text-slate-600">{boardSummary(rows)}</p>
       </div>
       {groups.length === 0 ? (
@@ -441,10 +442,10 @@ const TONE_TEXT: Record<CollectorTone, string> = {
 
 const TONE_PILL: Record<CollectorTone, string> = {
   warning: "border-red-200 bg-red-50 text-red-800",
-  attention: "border-amber-200 bg-amber-50 text-amber-800",
-  positive: "border-emerald-200 bg-emerald-50 text-emerald-800",
+  attention: TONE_AMBER,
+  positive: TONE_EMERALD_DEEP,
   informational: "border-cyan-200 bg-cyan-50 text-cyan-800",
-  neutral: "border-slate-200 bg-slate-50 text-slate-600",
+  neutral: TONE_SLATE,
 };
 
 function Row({ row }: { row: CollectorRow }) {

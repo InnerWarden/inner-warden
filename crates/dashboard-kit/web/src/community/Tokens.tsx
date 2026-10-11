@@ -73,6 +73,7 @@ function TokenRowView({ row, largest }: { row: TokenRow; largest: bigint }) {
         <p className="text-sm text-slate-700"><span className="font-semibold text-slate-950">{compactCount(whole)}</span> tokens</p>
         <p className="text-xs text-slate-500">{meta.join(" · ")}</p>
       </div>
+      {row.sample === undefined ? null : <p className="mt-1 text-xs text-amber-800">{row.sample}</p>}
       {row.parts.length === 0 ? null : (
         <div className="mt-2 flex h-3 w-full overflow-hidden rounded bg-slate-100" role="img" aria-label={`${row.name}: ${row.parts.map((part) => `${part.label} ${formatCount(part.value)}`).join(", ")}`}>
           <div className="flex h-full gap-[2px]" style={{ width: `${width * 100}%` }}>

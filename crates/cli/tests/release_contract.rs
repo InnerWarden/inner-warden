@@ -224,3 +224,68 @@ fn the_installers_ship_signed_sidecars_of_the_stamped_bytes() {
         );
     }
 }
+
+/// The installer creates `~/.local/bin` and the binary with the caller's
+/// umask; under a 0002 login umask they came out group-writable and the CLI
+/// refused its own binary. A release whose installer does not set `umask 022`
+/// is stopped, before the installer is stamped and signed.
+///
+/// FAILS ON REVERT: drop the step, or move it after the stamp, and an
+/// installer without the umask publishes.
+#[test]
+fn a_release_stops_an_installer_that_does_not_set_its_umask() {
+    let step = WORKFLOW
+        .find("- name: Installer sets its own umask")
+        .expect("no step checks that the installer sets its own umask");
+    let stamp = WORKFLOW
+        .find("sed -i \"s|\\${IW_GUARD_PUBKEY:-")
+        .expect("the step that stamps the pinned key into the installer is gone");
+    assert!(
+        step < stamp,
+        "the umask is checked after the installer is stamped"
+    );
+    let body = &WORKFLOW[step..];
+    let end = body[1..].find("- name:").map_or(body.len(), |at| at + 1);
+    let body = &body[..end];
+    assert!(
+        body.contains("dist/iw-guard-install.sh") && body.contains("exit 1"),
+        "the umask step does not fail the release: {body}"
+    );
+}
+
+/// The pattern the umask step greps for matches the ways the installer may
+/// write the line, and not a comment or another umask.
+#[cfg(unix)]
+#[test]
+fn the_umask_pattern_matches_the_installer_line() {
+    let start = WORKFLOW
+        .find("grep -Eq '")
+        .expect("the umask step greps the installer")
+        + "grep -Eq '".len();
+    let pattern = &WORKFLOW[start..start + WORKFLOW[start..].find('\'').unwrap()];
+    assert!(pattern.contains("umask"), "{pattern}");
+    let matches = |line: &str| {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("install.sh");
+        std::fs::write(&file, format!("#!/bin/sh\nset -eu\n{line}\necho done\n")).unwrap();
+        std::process::Command::new("grep")
+            .arg("-Eq")
+            .arg(pattern)
+            .arg(&file)
+            .stdin(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    };
+    for line in [
+        "umask 022",
+        "umask 0022",
+        "  umask 022",
+        "umask 022 # every path 0755",
+    ] {
+        assert!(matches(line), "{line:?} must pass the release step");
+    }
+    for line in ["# umask 022", "umask 002", "umask 0027", "echo umask 022"] {
+        assert!(!matches(line), "{line:?} must not pass the release step");
+    }
+}

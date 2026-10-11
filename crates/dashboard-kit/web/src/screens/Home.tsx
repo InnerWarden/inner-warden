@@ -23,6 +23,7 @@ import { hasControlCharacters, humanizeToken, normaliseMode, formatCount } from 
 import { When } from "../components/When";
 import { isCaseListWindow, WINDOW_WORDS } from "../windows";
 import { countWords } from "../readCount";
+import { EMPTY_BODY, EYEBROW_CYAN, EYEBROW_SLATE, SECTION_HEAD, STAT_VALUE, TITLE_SM, TONE_AMBER, TONE_BLUE } from "../components/classes";
 
 type ActivityLink = { id?: string; session?: string; verdict?: string; action?: string };
 
@@ -517,8 +518,8 @@ function LanesOverview({
       <TechnicalOnly>
         <section aria-labelledby="overview-technical-title" className="space-y-6 border-t border-slate-200 pt-6 sm:space-y-8">
           <div>
-            <p className="text-xs font-semibold uppercase tracking-[0.14em] text-cyan-700">Technical detail</p>
-            <h2 id="overview-technical-title" className="mt-1 text-lg font-semibold text-slate-950">The records behind these cards</h2>
+            <p className={EYEBROW_CYAN}>Technical detail</p>
+            <h2 id="overview-technical-title" className={STAT_VALUE}>The records behind these cards</h2>
           </div>
           <PostureHero
             mode={mode}
@@ -674,15 +675,15 @@ function DecisionRecordSection({
   return (
     <>
       <section aria-labelledby="decision-summary-title">
-        <div className="mb-3 flex flex-col items-start gap-2 sm:flex-row sm:items-end sm:justify-between sm:gap-4">
+        <div className={SECTION_HEAD}>
           <div>
-            <p className="text-xs font-semibold uppercase tracking-[0.14em] text-cyan-700">Decision record</p>
+            <p className={EYEBROW_CYAN}>Decision record</p>
             {/* THE ANSWER FIRST, the counters underneath as its evidence.
               * Five numbers and no conclusion left the reader to work out
               * whether they were safe, and the pairing of "252 classified
               * as unsafe" with "3 blocked before execution" reads as a
               * confession unless something explains monitor mode. */}
-            <h2 id="decision-summary-title" className="mt-1 text-lg font-semibold text-slate-950">{summary.answer}</h2>
+            <h2 id="decision-summary-title" className={STAT_VALUE}>{summary.answer}</h2>
             {summary.next ? (
               <p className="mt-1 text-sm text-slate-600">{summary.next}</p>
             ) : null}
@@ -801,21 +802,21 @@ export const POSTURES: Record<GuardrailMode, { label: string; title: string; bod
     label: "Monitor configured",
     title: "Build confidence before you turn on blocking.",
     body: "Once an agent reloads this wiring, the integrations you configured screen its activity without blocking any of it. Review the local evidence before enforcing.",
-    badge: "border-blue-200 bg-blue-50 text-blue-700",
+    badge: TONE_BLUE,
     panel: "border-blue-200 from-blue-50 to-white",
   },
   enforce: {
     label: "Enforce configured",
     title: "Blocking is configured for screened agent actions.",
     body: "After agents reload this wiring, enforce-capable hooks and request/response MCP calls refuse deny decisions before execution. Outcomes show what actually happened.",
-    badge: "border-blue-200 bg-blue-50 text-blue-700",
+    badge: TONE_BLUE,
     panel: "border-blue-200 from-blue-50 to-white",
   },
   mixed: {
     label: "Mixed configuration",
     title: "Some integrations monitor; others are configured to enforce.",
     body: "Restart changed agents, then use per-decision outcomes to distinguish observed risk from actions actually blocked.",
-    badge: "border-amber-200 bg-amber-50 text-amber-800",
+    badge: TONE_AMBER,
     panel: "border-amber-200 from-amber-50 to-white",
   },
   partial: {
@@ -1021,7 +1022,7 @@ function OperationalEvidence({ overview }: { overview: Overview }) {
               heading on every load. Which integrations are new is our
               bookkeeping; the four labels beside it already say what each
               number counts. */}
-          <h2 id="outcome-evidence-title" className="text-sm font-semibold text-slate-900">What the guardrail actually did</h2>
+          <h2 id="outcome-evidence-title" className={TITLE_SM}>What the guardrail actually did</h2>
         </div>
         {items.map((item) => (
           <div key={item.label} className="min-w-28">
@@ -1044,8 +1045,8 @@ export function RecentActivity({ items, edition, onOpen, onOpenCase }: {
   return (
     <section className="min-w-0" aria-labelledby="recent-activity-title">
       <div className="mb-3">
-        <p className="text-xs font-semibold uppercase tracking-[0.14em] text-cyan-700">Evidence</p>
-        <h2 id="recent-activity-title" className="mt-1 text-lg font-semibold text-slate-950">Recent activity</h2>
+        <p className={EYEBROW_CYAN}>Evidence</p>
+        <h2 id="recent-activity-title" className={STAT_VALUE}>Recent activity</h2>
       </div>
       {items.length === 0 ? (
         <div className="rounded-xl border border-slate-200 bg-white p-5 text-sm text-slate-600">No recent decisions are available yet.</div>
@@ -1631,8 +1632,8 @@ function RiskSignals({ items, sent, max }: { items: Overview["top_categories"]; 
   return (
     <section className="min-w-0" aria-labelledby="risk-signals-title">
       <div className="mb-3">
-        <p className="text-xs font-semibold uppercase tracking-[0.14em] text-cyan-700">Patterns</p>
-        <h2 id="risk-signals-title" className="mt-1 text-lg font-semibold text-slate-950">Risk signals</h2>
+        <p className={EYEBROW_CYAN}>Patterns</p>
+        <h2 id="risk-signals-title" className={STAT_VALUE}>Risk signals</h2>
       </div>
       <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
         {items.length === 0 ? (
@@ -1702,7 +1703,7 @@ function ZeroState({ guardedAgents, edition }: { guardedAgents?: number; edition
       <div className="mx-auto max-w-3xl text-center">
         <div className="mx-auto flex h-11 w-11 items-center justify-center rounded-xl bg-cyan-50 text-lg font-bold text-cyan-800" aria-hidden="true">IW</div>
         <h2 id="zero-state-title" className="mt-4 text-xl font-semibold text-slate-950">No agent guardrail decisions recorded yet</h2>
-        <p className="mx-auto mt-2 max-w-xl text-sm leading-6 text-slate-600">
+        <p className={EMPTY_BODY}>
           {hasConfiguredAgent
             ? "The guardrail is configured. Captured shell actions, MCP tool calls and one-off checks appear here as a local activity record."
             : "Connect a detected agent in monitor mode to build a local decision record without blocking its work."}
@@ -1835,7 +1836,7 @@ function ActiveDefenceCard({ installed }: { installed: boolean }) {
         aria-labelledby="active-defence-title"
       >
         <div className="flex flex-wrap items-center gap-2">
-          <p className="text-xs font-semibold uppercase tracking-[0.14em] text-slate-500">InnerWarden Active Defence</p>
+          <p className={EYEBROW_SLATE}>InnerWarden Active Defence</p>
           <span className="rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[10px] font-semibold text-slate-600">{copy.badge}</span>
         </div>
         <h2 id="active-defence-title" className="mt-2 text-lg font-semibold text-slate-950">{copy.title}</h2>
@@ -1849,7 +1850,7 @@ function ActiveDefenceCard({ installed }: { installed: boolean }) {
       <div className="flex flex-col gap-4 sm:flex-row sm:items-center">
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2">
-            <p className="text-xs font-semibold uppercase tracking-[0.14em] text-slate-500">InnerWarden Active Defence</p>
+            <p className={EYEBROW_SLATE}>InnerWarden Active Defence</p>
             <span className="rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[10px] font-semibold text-slate-600">{ACTIVE_DEFENCE_COPY.offer.badge}</span>
           </div>
           <h2 id="active-defence-title" className="mt-2 text-lg font-semibold text-slate-950">{ACTIVE_DEFENCE_COPY.offer.title}</h2>

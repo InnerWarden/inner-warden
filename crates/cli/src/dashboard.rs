@@ -881,22 +881,44 @@ pub(crate) fn help_text() -> String {
     )
 }
 
-/// `innerwarden dashboard [--bind IP:PORT]` - serve local visibility + read-only APIs.
-pub fn cmd(rest: &[String]) -> std::process::ExitCode {
+/// Reads the arguments of `dashboard`. Anything it does not know is an error:
+/// a word such as `tunnel` or `open` used to be skipped, which started a
+/// server on the default address and printed nothing about the word.
+fn parse_args(rest: &[String]) -> Result<(String, bool), String> {
     let mut bind = DEFAULT_BIND.to_string();
     let mut expose = false;
     let mut it = rest.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
-            "--bind" => {
-                if let Some(v) = it.next() {
-                    bind = v.clone();
-                }
-            }
+            "--bind" => match it.next() {
+                Some(v) if !v.starts_with("--") => bind = v.clone(),
+                _ => return Err("--bind needs an address, for example --bind 127.0.0.1:8788".into()),
+            },
             "--expose" => expose = true,
-            _ => {}
+            other => {
+                return Err(format!(
+                    "unknown argument '{other}'. This command starts the local dashboard and takes no subcommand"
+                ))
+            }
         }
     }
+    Ok((bind, expose))
+}
+
+/// `innerwarden dashboard [--bind IP:PORT]` - serve local visibility + read-only APIs.
+pub fn cmd(rest: &[String]) -> std::process::ExitCode {
+    let (bind, expose) = match parse_args(rest) {
+        Ok(parsed) => parsed,
+        Err(why) => {
+            eprintln!(
+                "{}: {why}\n  Usage: {} dashboard [--bind IP:PORT] [--expose]   (see `{} dashboard --help`)",
+                crate::prog(),
+                crate::prog(),
+                crate::prog()
+            );
+            return std::process::ExitCode::from(2);
+        }
+    };
 
     // Refuse a non-loopback bind unless the user explicitly opted in: the UI is
     // unauthenticated + unencrypted, so binding it to the network by accident would
@@ -1604,6 +1626,34 @@ mod fixtures;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_subcommand_word_is_refused_not_skipped() {
+        for word in ["tunnel", "open", "status"] {
+            let err = parse_args(&args(&[word])).unwrap_err();
+            assert!(err.contains(word), "{err}");
+        }
+        assert!(parse_args(&args(&["--bind", "127.0.0.1:9", "tunnel"])).is_err());
+    }
+
+    #[test]
+    fn a_bind_without_an_address_is_refused() {
+        assert!(parse_args(&args(&["--bind"])).is_err());
+        assert!(parse_args(&args(&["--bind", "--expose"])).is_err());
+    }
+
+    #[test]
+    fn the_documented_flags_still_parse() {
+        assert_eq!(parse_args(&[]).unwrap(), (DEFAULT_BIND.to_string(), false));
+        assert_eq!(
+            parse_args(&args(&["--bind", "0.0.0.0:1", "--expose"])).unwrap(),
+            ("0.0.0.0:1".to_string(), true)
+        );
+    }
 
     #[test]
     fn asset_path_maps_root_and_strips_slash() {

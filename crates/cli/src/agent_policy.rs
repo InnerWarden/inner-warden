@@ -958,27 +958,47 @@ mod tests {
     /// machine (installed 1.4.4). Reproduced against a copy of that machine's
     /// configuration with this build: the first pass repaired a real path
     /// difference and every later pass left the file alone, so the loop does
-    /// not reproduce here. This pins the property it broke, for both shapes a
-    /// correct hook takes: the one `install` writes today (both halves, naming
-    /// its agent) and an older one (the screening half only, naming none).
+    /// not reproduce here. This pins the property it broke: the wiring
+    /// `install` writes today (both PreToolUse halves and the PostToolUse
+    /// half, naming its agent) is never rewritten, and an older one (the
+    /// shell half only, naming none) gains the file-tools half once, keeps its
+    /// shell hook exactly as it was, and is left alone after that.
     #[test]
     fn a_correct_hook_is_not_rewritten_by_the_reconciler() {
         let guard_bin = "/abs/innerwarden";
+        let unnamed = "\"/abs/innerwarden\" hook --monitor";
+        let named = "\"/abs/innerwarden\" hook --monitor --agent claude-code";
         let pre_only = serde_json::json!({"hooks": {"PreToolUse": [{
             "matcher": "Bash",
-            "hooks": [{"type": "command", "command": "\"/abs/innerwarden\" hook --monitor"}]
+            "hooks": [{"type": "command", "command": unnamed}]
         }]}});
         let installed = serde_json::json!({"hooks": {
-            "PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "\"/abs/innerwarden\" hook --monitor --agent claude-code"}]}],
-            "PostToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": "\"/abs/innerwarden\" hook --monitor --agent claude-code"}]}]
+            "PreToolUse": [
+                {"matcher": "Bash", "hooks": [{"type": "command", "command": named}]},
+                {"matcher": "Write|Edit|MultiEdit|NotebookEdit", "hooks": [{"type": "command", "command": named}]}
+            ],
+            "PostToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": named}]}]
         }});
-        for settings in [pre_only, installed] {
+        for (settings, upgraded_once) in [(pre_only, true), (installed, false)] {
             let home = tempfile::TempDir::new().unwrap();
             let path = home.path().join(".claude/settings.json");
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            let body = serde_json::to_vec_pretty(&settings).unwrap();
-            std::fs::write(&path, &body).unwrap();
+            std::fs::write(&path, serde_json::to_vec_pretty(&settings).unwrap()).unwrap();
             let policy = persisted_enabled_policy(home.path());
+            if upgraded_once {
+                let report = reconcile(home.path(), guard_bin, &policy);
+                assert_eq!(report.connected, 1, "the file-tools half is added once");
+                let now: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                assert_eq!(
+                    now["hooks"]["PreToolUse"][0], settings["hooks"]["PreToolUse"][0],
+                    "the shell hook is kept exactly as it was"
+                );
+                assert!(innerwarden_agent_guard::hook::iwguard_judges_file_tools(
+                    &now
+                ));
+            }
+            let body = std::fs::read(&path).unwrap();
             for pass in 0..3 {
                 let report = reconcile(home.path(), guard_bin, &policy);
                 assert_eq!(
@@ -1215,9 +1235,10 @@ mod tests {
         };
         let mut logged = BTreeMap::new();
         let (lines, status) = watcher_pass(home.path(), DELETED, &fact, &mut logged);
+        // The Bash hook, and the file-tools hook beside it.
         assert_eq!(
             pre_tool_use_commands(&path),
-            vec![format!("\"{UPGRADED}\" hook --monitor --agent claude-code")]
+            vec![format!("\"{UPGRADED}\" hook --monitor --agent claude-code"); 2]
         );
         assert!(!std::fs::read_to_string(&path)
             .unwrap()
@@ -1279,9 +1300,10 @@ mod tests {
         assert!(lines.contains(
             &"  dashboard binary - recovered: the last pass completed without error".to_string()
         ));
+        // The Bash hook, and the file-tools hook beside it.
         assert_eq!(
             pre_tool_use_commands(&path),
-            vec![format!("\"{UPGRADED}\" hook --monitor --agent claude-code")]
+            vec![format!("\"{UPGRADED}\" hook --monitor --agent claude-code"); 2]
         );
     }
 
@@ -1668,12 +1690,13 @@ mod tests {
             })
             .filter_map(|hook| hook.get("command").and_then(serde_json::Value::as_str))
             .collect();
+        // Once for Bash, once for the file tools.
         assert_eq!(
             commands
                 .iter()
                 .filter(|command| **command == expected_command)
                 .count(),
-            1
+            2
         );
         assert!(!commands.iter().any(|command| command.contains("/old/")));
         let installed = entries

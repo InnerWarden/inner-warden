@@ -54,6 +54,7 @@ pub mod breaker;
 // same way the injection scan reads text: invisible characters out, NFKC
 // folded, Tags-block and base64 payloads recovered.
 pub mod deobfuscate;
+pub mod file_tools;
 pub mod file_update;
 pub mod hook;
 pub mod hook_targets;

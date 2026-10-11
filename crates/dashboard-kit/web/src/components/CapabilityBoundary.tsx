@@ -2,6 +2,7 @@ import type { ReactNode } from "react";
 import type { DashboardResource } from "../api/client";
 import type { CapabilityStatus } from "../api/v1";
 import { StatusBadge } from "./StatusBadge";
+import { EMPTY_BODY } from "./classes";
 
 type BoundaryState = DashboardResource<unknown>["state"] | "adapter_absent";
 
@@ -129,7 +130,7 @@ function BoundaryPanel({ title, body, status }: { title: string; body: string; s
     >
       <div className="flex justify-center"><StatusBadge status={status} /></div>
       <h1 className="mt-4 text-xl font-semibold text-slate-950">{title}</h1>
-      <p className="mx-auto mt-2 max-w-xl text-sm leading-6 text-slate-600">{body}</p>
+      <p className={EMPTY_BODY}>{body}</p>
     </section>
   );
 }

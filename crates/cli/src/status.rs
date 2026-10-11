@@ -77,6 +77,58 @@ pub struct HookTrouble {
     pub via_proxy: bool,
 }
 
+/// Which tool calls of a wired agent are judged before they run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolClasses {
+    /// Wired through a settings hook. `file_tools` is whether the hook also
+    /// runs for the agent's own file tools; wiring from before they were
+    /// judged runs for shell commands only, and `next` rewrites it.
+    Hook {
+        agent: String,
+        file_tools: bool,
+        next: String,
+    },
+    /// Wired through the MCP proxy: calls to its wrapped servers.
+    Proxy { agent: String },
+}
+
+/// The agent's own file tools, as `status` names them.
+pub const FILE_TOOL_NAMES: &str = "Write, Edit, MultiEdit, NotebookEdit";
+
+/// PURE: the line `status` prints for what one agent's wiring judges.
+pub fn tool_classes_finding(classes: &ToolClasses) -> Finding {
+    match classes {
+        ToolClasses::Hook {
+            agent,
+            file_tools: true,
+            ..
+        } => Finding::Working(format!(
+            "{agent}: judged before they run: shell commands, and file changes \
+             ({FILE_TOOL_NAMES}) to privileged files such as its settings, the guard's \
+             configuration and your shell startup files. Its other tools are recorded \
+             after they run."
+        )),
+        ToolClasses::Hook {
+            agent,
+            file_tools: false,
+            next,
+        } => Finding::NotWorking {
+            what: format!(
+                "{agent}: only shell commands are judged. Its own file tools \
+                 ({FILE_TOOL_NAMES}) can change its settings, the guard's configuration \
+                 or your shell startup files unchecked: its hook was wired before they \
+                 were judged, or records them without refusing while its shell hook \
+                 refuses."
+            ),
+            next: next.clone(),
+        },
+        ToolClasses::Proxy { agent } => Finding::Working(format!(
+            "{agent}: judged before they run: calls to its MCP servers. Its built-in \
+             tools are not screened by this edition."
+        )),
+    }
+}
+
 /// PURE: a duration a person reads at a glance, in its largest whole unit.
 pub fn age_words(secs: u64) -> String {
     let (n, unit) = match secs {
@@ -204,6 +256,10 @@ pub struct Facts {
     /// (or could not be checked). Never also in `wired_agents`: a hook that
     /// cannot start screens nothing, whatever its text says.
     pub hook_trouble: Vec<HookTrouble>,
+    /// What each wired agent's wiring judges before a call runs, in the order
+    /// of `wired_agents`. An agent whose settings could not be read back is
+    /// left out: "could not tell" is never "off".
+    pub tool_classes: Vec<ToolClasses>,
     /// Whether ANY agent process was visible, regardless of wiring.
     pub any_agent_seen: Option<bool>,
     /// Commands an agent's hook or the MCP proxy screened and recorded, allows
@@ -334,6 +390,7 @@ pub fn assess(facts: &Facts) -> Vec<Finding> {
             facts.wired_agents.len(),
             facts.wired_agents.join(", ")
         )));
+        out.extend(facts.tool_classes.iter().map(tool_classes_finding));
     } else if facts.hook_trouble.is_empty() {
         match facts.any_agent_seen {
             Some(true) => out.push(Finding::NotWorking {
@@ -472,10 +529,17 @@ pub fn render(facts: &Facts) -> String {
     for f in &findings {
         out.push_str(&format!("{f}\n"));
     }
-    out.push_str(
-        "\n  [unknown] never means off. It means I could not establish it, and\n\
-         \x20 saying otherwise would send you to fix the wrong thing.\n",
-    );
+    // The explanation belongs under an `[unknown]` line. Printed on its own it
+    // describes something the reader cannot see.
+    if findings
+        .iter()
+        .any(|f| matches!(f, Finding::Unknown { .. }))
+    {
+        out.push_str(
+            "\n  [unknown] never means off. It means I could not establish it, and\n\
+             \x20 saying otherwise would send you to fix the wrong thing.\n",
+        );
+    }
     out
 }
 
@@ -507,6 +571,51 @@ mod tests {
         );
     }
 
+    /// The row: `status` says which tool classes are judged before they run,
+    /// and a hook wired before the file tools were judged is named with the
+    /// command that adds them.
+    ///
+    /// FAILS ON REVERT: drop the `tool_classes` line from `assess` and neither
+    /// sentence is printed.
+    #[test]
+    fn status_says_which_tool_classes_are_judged() {
+        let mut facts = healthy();
+        facts.tool_classes = vec![
+            ToolClasses::Hook {
+                agent: "claude-code".into(),
+                file_tools: true,
+                next: "innerwarden install claude-code".into(),
+            },
+            ToolClasses::Proxy {
+                agent: "codex".into(),
+            },
+        ];
+        let report = render(&facts);
+        assert!(
+            report
+                .contains("claude-code: judged before they run: shell commands, and file changes"),
+            "{report}"
+        );
+        assert!(report.contains(FILE_TOOL_NAMES), "{report}");
+        assert!(
+            report.contains("codex: judged before they run: calls to its MCP servers"),
+            "{report}"
+        );
+
+        facts.tool_classes = vec![ToolClasses::Hook {
+            agent: "claude-code".into(),
+            file_tools: false,
+            next: "innerwarden install claude-code --monitor".into(),
+        }];
+        let findings = assess(&facts);
+        assert!(findings.iter().any(|finding| matches!(
+            finding,
+            Finding::NotWorking { what, next }
+                if what.contains("only shell commands are judged")
+                    && next == "innerwarden install claude-code --monitor"
+        )));
+    }
+
     /// The short-circuit must not swallow a real problem: once anything IS
     /// configured, every check runs again.
     #[test]
@@ -524,6 +633,7 @@ mod tests {
             mode: Some("enforce".into()),
             wired_agents: vec!["claude-code".into()],
             hook_trouble: vec![],
+            tool_classes: vec![],
             any_agent_seen: Some(true),
             decisions_recorded: Some(42),
             newest_decision_age_secs: Some(90),
@@ -727,6 +837,7 @@ mod tests {
             mode: None,
             wired_agents: vec![],
             hook_trouble: vec![],
+            tool_classes: vec![],
             any_agent_seen: None,
             decisions_recorded: None,
             newest_decision_age_secs: None,
@@ -1137,5 +1248,19 @@ mod tests {
         let text = render(&Facts::default());
         assert!(text.contains("never means off"));
         assert!(text.contains("fix the wrong thing"));
+    }
+
+    /// The footer explains an `[unknown]` line, so it is printed only under one.
+    #[test]
+    fn the_unknown_footer_appears_only_with_an_unknown_line() {
+        let healthy_report = render(&healthy());
+        assert!(!healthy_report.contains("[unknown]"), "{healthy_report}");
+        assert!(
+            !healthy_report.contains("never means off"),
+            "a footer with nothing above it to explain:\n{healthy_report}"
+        );
+        let unknown_report = render(&Facts::default());
+        assert!(unknown_report.contains("  [unknown] "), "{unknown_report}");
+        assert!(unknown_report.contains("never means off"));
     }
 }
