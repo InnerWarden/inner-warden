@@ -4,7 +4,8 @@
 
 use serde_json::Value;
 
-use crate::suppress::{apply, SuppressConfig};
+use crate::suppress::{apply, is_universal_pattern, SuppressConfig};
+use innerwarden_agent_guard::threats::GUARD_OPERATOR_FLAG;
 
 /// The suppression config path: env `IW_SUPPRESS_CONFIG`, else
 /// `~/.config/innerwarden/suppress.toml`.
@@ -21,10 +22,28 @@ fn config_path() -> Option<std::path::PathBuf> {
 }
 
 fn load() -> SuppressConfig {
-    config_path()
+    load_reporting(false)
+}
+
+/// The config as it is applied. With `warn`, what the load refused or holds
+/// with a caveat is said on stderr, once per process (every caller is a
+/// one-shot command or a hook call).
+fn load_reporting(warn: bool) -> SuppressConfig {
+    let Some((cfg, warnings)) = config_path()
         .and_then(|p| std::fs::read_to_string(p).ok())
-        .map(|s| SuppressConfig::from_toml(&s))
-        .unwrap_or_default()
+        .map(|s| SuppressConfig::load(&s))
+    else {
+        return SuppressConfig::default();
+    };
+    if warn {
+        for warning in warnings {
+            let _ = std::io::Write::write_all(
+                &mut std::io::stderr(),
+                format!("innerwarden: {warning}\n").as_bytes(),
+            );
+        }
+    }
+    cfg
 }
 
 /// Write the config, and report what changed to the guard event stream.
@@ -108,14 +127,78 @@ pub(crate) fn current() -> SuppressConfig {
 
 /// Apply user suppression to a rules verdict (best-effort). Returns an overriding
 /// verdict when the command is allowed/muted, else `None`.
+///
+/// Silent: this runs on every hook call, and what the hook writes to stderr
+/// on a block is read by the agent first. The load warnings belong to the
+/// person, from `innerwarden check` and the `allow` / `mute` verbs.
 pub fn consider(command: &str, verdict: &Value) -> Option<Value> {
-    apply(command, verdict, &load())
+    apply(command, verdict, &load_reporting(false))
+}
+
+/// [`consider`], saying on stderr what the load refused or holds with a
+/// caveat. For `innerwarden check`, which a person runs.
+pub fn consider_reporting(command: &str, verdict: &Value) -> Option<Value> {
+    apply(command, verdict, &load_reporting(true))
+}
+
+/// Environment variables an AI coding agent sets in the shell it runs
+/// commands in. Any of them set (non-empty) means the caller is, or was
+/// started by, such an agent.
+const AGENT_SHELL_MARKERS: &[&str] = &[
+    "CLAUDECODE",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CODEX_SANDBOX",
+    "CODEX_SANDBOX_NETWORK_DISABLED",
+    "GEMINI_CLI",
+];
+
+/// Whether this process runs in an AI agent's shell, by its markers.
+fn in_agent_shell() -> bool {
+    AGENT_SHELL_MARKERS
+        .iter()
+        .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()))
+}
+
+/// Whether a change that WIDENS what the guard lets through may run here: in
+/// a terminal, or from an operator's script that says so with
+/// [`GUARD_OPERATOR_FLAG`] and runs outside an AI agent's shell.
+///
+/// An AI agent's shell has no terminal, and sets a marker. The guard already
+/// refuses the agent running these verbs; this holds where the guard cannot
+/// see the call (a renamed copy of the binary, a script the agent wrote). A
+/// same-user agent can still allocate a terminal or unset its markers, so
+/// this raises the cost, it does not close the route.
+fn may_widen(operator_flag: bool) -> bool {
+    std::io::IsTerminal::is_terminal(&std::io::stdin()) || (operator_flag && !in_agent_shell())
+}
+
+/// The refusal, addressed to the person. It names no way past itself: the
+/// caller it stops is the agent, which reads it first.
+fn refuse_without_terminal(verb: &str) -> std::process::ExitCode {
+    eprintln!(
+        "innerwarden {verb}: refused, no terminal. Allowing or muting widens what the guard \
+         lets an AI agent run, so it is done by a person at their own terminal. Nothing was \
+         changed."
+    );
+    std::process::ExitCode::from(1)
+}
+
+/// The arguments with the operator flag taken out, and whether it was there.
+fn split_operator_flag(rest: &[String]) -> (Vec<String>, bool) {
+    let operator = rest.iter().any(|a| a == GUARD_OPERATOR_FLAG);
+    let args = rest
+        .iter()
+        .filter(|a| *a != GUARD_OPERATOR_FLAG)
+        .cloned()
+        .collect();
+    (args, operator)
 }
 
 /// `innerwarden allow [<glob> | --list | --remove <glob>]` - force-allow a command
 /// pattern the user trusts (the "stop bugging me about this" list).
 pub fn cmd_allow(rest: &[String]) -> std::process::ExitCode {
-    let mut cfg = load();
+    let (rest, operator) = split_operator_flag(rest);
+    let mut cfg = load_reporting(true);
     match rest.first().map(String::as_str) {
         None | Some("--list") => {
             if cfg.allow.is_empty() {
@@ -142,8 +225,18 @@ pub fn cmd_allow(rest: &[String]) -> std::process::ExitCode {
             persist_or_fail(&cfg, &format!("removed allow: {pat}"))
         }
         Some(_) => {
+            if !may_widen(operator) {
+                return refuse_without_terminal("allow");
+            }
             // Join so a multi-word pattern given without quotes still works.
             let pat = rest.join(" ");
+            if is_universal_pattern(&pat) {
+                eprintln!(
+                    "innerwarden allow: refused, {pat:?} matches every command and would switch \
+                     screening off. To stop blocking, use `innerwarden dry-run`."
+                );
+                return std::process::ExitCode::from(1);
+            }
             if cfg.allow.iter().any(|p| p == &pat) {
                 println!("innerwarden allow - already allowed: {pat}");
                 return std::process::ExitCode::SUCCESS;
@@ -157,7 +250,8 @@ pub fn cmd_allow(rest: &[String]) -> std::process::ExitCode {
 /// `innerwarden mute [<rule-id|category> | --list | --remove <x>]` - stop a specific
 /// ATR rule or category from counting against a command.
 pub fn cmd_mute(rest: &[String]) -> std::process::ExitCode {
-    let mut cfg = load();
+    let (rest, operator) = split_operator_flag(rest);
+    let mut cfg = load_reporting(true);
     let is_rule = |s: &str| s.to_ascii_uppercase().starts_with("ATR-");
     match rest.first().map(String::as_str) {
         None | Some("--list") => {
@@ -186,6 +280,9 @@ pub fn cmd_mute(rest: &[String]) -> std::process::ExitCode {
             persist_or_fail(&cfg, &format!("unmuted: {x}"))
         }
         Some(x) => {
+            if !may_widen(operator) {
+                return refuse_without_terminal("mute");
+            }
             let target = if is_rule(x) {
                 &mut cfg.mute_rules
             } else {

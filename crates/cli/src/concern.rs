@@ -33,6 +33,7 @@ impl Concern {
 /// Rules that fire only when a command reads, or searches for, a credential.
 const CREDENTIAL_READ: &[&str] = &[
     "sensitive_credential_read",
+    "credential_read_outside_project",
     "credential_hunt",
     "protected_secret_read",
 ];
@@ -68,6 +69,10 @@ const SHORT_WORDS: &[(&str, &str)] = &[
     ("cloud_control_plane", "cloud control plane"),
     ("credential_exposure", "a secret in the command"),
     ("credential_hunt", "search for credentials"),
+    (
+        "credential_read_outside_project",
+        "secret outside the project",
+    ),
     ("dangerous_command", "dangerous command"),
     ("data_destruction", "destroys data"),
     ("destructive_command", "destructive command"),
@@ -144,6 +149,10 @@ const WORDING: &[(&str, &str)] = &[
         "destructive_command",
     ),
     (
+        "recursive removal of a home directory",
+        "destructive_command",
+    ),
+    (
         "disabling or tampering with security monitoring: ",
         "security_tooling_tamper",
     ),
@@ -152,6 +161,10 @@ const WORDING: &[(&str, &str)] = &[
         "sensitive_credential_read",
     ),
     ("searches the filesystem for credentials", "credential_hunt"),
+    (
+        "reads a secrets file outside the project: ",
+        "credential_read_outside_project",
+    ),
     ("dangerous command: ", "dangerous_command"),
     (
         "structure of a fetch-and-execute could not be analysed",

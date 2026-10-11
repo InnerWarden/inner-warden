@@ -146,7 +146,10 @@ pub fn signal_to_asi(signal: &str) -> Option<&'static str> {
         // ASI03 Identity & Privilege Abuse, loosening permissions on a system
         // path (the credential-read side is carried by the ATR
         // `credential-exposure` category, not a command signal).
-        "insecure_permissions" | "sensitive_credential_read" | "protected_secret_read" => "ASI03",
+        "insecure_permissions"
+        | "sensitive_credential_read"
+        | "credential_read_outside_project"
+        | "protected_secret_read" => "ASI03",
         // ASI10 Rogue Agents, out-of-scope destructive/persistence behaviour
         // and tampering with the security layer to keep operating.
         "security_tooling_tamper" | "destructive_command" | "persistence_attempt" => "ASI10",

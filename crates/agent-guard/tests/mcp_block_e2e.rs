@@ -332,6 +332,33 @@ fn a_block_does_not_break_the_rest_of_the_session() {
     );
 }
 
+/// FAILS ON REVERT (byte cut in the obfuscation rewrite): a command with a
+/// multi-byte character across the old 8 KB cut panicked the screening, and
+/// with it the whole proxy session. Now the call is judged and refused, never
+/// forwarded, and the session keeps serving the next call.
+#[test]
+fn a_padded_payload_is_refused_and_the_session_keeps_serving() {
+    let padded = format!("{}\u{e9}; ${{x:-rm}} -rf /", "a".repeat(8191));
+    let benign = "cargo build --release";
+    let seen = run_through_proxy(
+        &[tool_call(7, &padded), tool_call(8, benign)],
+        ProxyMode::Guard,
+    );
+
+    assert!(
+        !seen.contains("x:-rm"),
+        "the padded payload must not reach the server:\n{seen}"
+    );
+    assert!(
+        seen.contains(r#""id":7"#),
+        "the padded call must get an answer, not silence:\n{seen}"
+    );
+    assert!(
+        seen.contains(benign),
+        "the session must survive the padded call and keep serving:\n{seen}"
+    );
+}
+
 /// A loop is held only while it loops, and only that call. Four identical calls
 /// in a burst: the fourth never reaches the server and the client is told why,
 /// and a different call right after it still goes through. The breaker used to

@@ -237,23 +237,36 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
              Takes no arguments. The opposite is `{p} enforce`."
         ),
         "allow" => format!(
-            "{p} allow \"<glob>\"\n\
+            "{p} allow [--operator] \"<glob>\"\n\
              {p} allow --list\n\
              {p} allow --remove \"<glob>\"\n\
              \n  \
              Force-allow the commands matching <glob>: they are neither escalated nor\n  \
              alerted on. This is a deliberate BYPASS of your own guardrail, so every\n  \
              change is recorded to the guard event stream.\n  \
+             Adding a pattern needs a terminal, and the guard refuses an agent that\n  \
+             runs it. That keeps an agent from widening its own guard by accident or\n  \
+             on its own initiative; it does not stop one set on doing it. A pattern\n  \
+             that is only `*` is refused (use `{p} dry-run` to stop blocking). A\n  \
+             pattern whose first word holds a `*` lifts only a command held for\n  \
+             review, never a refused one; write the command's first word out.\n\
+             \n  \
+             --operator   your own script, run with no terminal\n  \
              Printing this help writes nothing."
         ),
         "mute" => format!(
-            "{p} mute <ATR-rule-id|category>\n\
+            "{p} mute [--operator] <ATR-rule-id|category>\n\
              {p} mute --list\n\
              {p} mute --remove <ATR-rule-id|category>\n\
              \n  \
              Stop one ATR rule, or a whole category, from counting against a command.\n  \
              An id starting with `ATR-` mutes that rule; anything else is taken as a\n  \
              CATEGORY, which suppresses every rule in it, against every command.\n  \
+             Muting needs a terminal, and the guard refuses an agent that runs it.\n  \
+             That keeps an agent from muting its own guard by accident or on its own\n  \
+             initiative; it does not stop one set on doing it.\n\
+             \n  \
+             --operator   your own script, run with no terminal\n  \
              Printing this help writes nothing."
         ),
         "notify" => format!(

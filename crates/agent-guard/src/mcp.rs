@@ -729,6 +729,11 @@ pub const AGENT_REVIEW_FLOOR: &[&str] = &[
     // the same terminal step as fetch-and-execute, with nothing analysed to
     // show it is not one.
     "fetch_exec_unparsed",
+    // A secrets file read from outside the project the agent works in. The
+    // project's own `.env` stays an ordinary `review`; one in the home or in
+    // another project's tree is not the agent's to read, and once read its
+    // contents are in the agent's context with nothing left to review.
+    "credential_read_outside_project",
 ];
 
 /// Whether an agent is blocked from running this under the DEFAULT policy: any
@@ -878,7 +883,148 @@ pub fn analyze_command_with(
     rule_engine: Option<&RuleEngine>,
     protected_reads: &[String],
 ) -> CommandAnalysis {
-    analyze_command_at(command, rule_engine, protected_reads, 0)
+    analyze_command_at(command, rule_engine, protected_reads, None, 0)
+}
+
+/// Where a screened command runs, as far as the caller knows it: the directory
+/// it runs in, the user's home, and the project that directory belongs to.
+///
+/// The command text alone cannot say whether `rm -rf *` empties a build
+/// folder or the home, or whether `cat .env` is the project's own file. A
+/// caller that knows the directory (the agent hook, from its payload) passes
+/// it, and those two questions are answered; without it the verdict is the
+/// one the text alone earns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkingContext {
+    /// Absolute directory the command runs in.
+    pub cwd: String,
+    /// The user's home directory, when known.
+    pub home: Option<String>,
+    /// The project root: the nearest ancestor of `cwd` (or `cwd` itself) that
+    /// holds a `.git` entry, else `cwd`.
+    pub project_root: String,
+    /// Checkouts the project belongs to as well: for a git worktree, the main
+    /// checkout; for a submodule, its superproject. Copying the main
+    /// checkout's `.env` into a worktree is setting the worktree up, not
+    /// reaching outside the work.
+    pub related_roots: Vec<String>,
+    /// With no repository, the directories above `cwd` (below the home and
+    /// never `/` or the home itself) whose own files count as the project's:
+    /// a project that is not under git, opened in a subdirectory, keeps its
+    /// `.env` one level up. Empty inside a repository, whose root is the
+    /// boundary.
+    pub enclosing_dirs: Vec<String>,
+}
+
+impl WorkingContext {
+    /// Build the context for a command run in `cwd`, finding its project with
+    /// [`project_root_of`]. `None` when `cwd` is not an absolute path.
+    pub fn discover(cwd: &str, home: Option<&str>) -> Option<Self> {
+        let path = std::path::Path::new(cwd);
+        if !path.is_absolute() {
+            return None;
+        }
+        let project_root = project_root_of(path);
+        let in_repository = project_root.join(".git").symlink_metadata().is_ok();
+        let home_path = home.map(std::path::Path::new);
+        let enclosing_dirs = if in_repository {
+            Vec::new()
+        } else {
+            path.ancestors()
+                .skip(1)
+                .take_while(|dir| dir.parent().is_some() && Some(*dir) != home_path)
+                .take_while(|dir| home_path.is_none_or(|home| !home.starts_with(dir)))
+                .map(|dir| dir.to_string_lossy().into_owned())
+                .collect()
+        };
+        Some(Self {
+            enclosing_dirs,
+            cwd: cwd.to_string(),
+            home: home
+                .filter(|home| std::path::Path::new(home).is_absolute())
+                .map(str::to_string),
+            related_roots: related_roots_of(&project_root)
+                .into_iter()
+                .map(|root| root.to_string_lossy().into_owned())
+                .collect(),
+            project_root: project_root.to_string_lossy().into_owned(),
+        })
+    }
+}
+
+/// The checkouts a project at `root` belongs to besides itself, read from a
+/// `.git` FILE (`gitdir: <path>`): a worktree's points into
+/// `<main>/.git/worktrees/<name>`, a submodule's into
+/// `<superproject>/.git/modules/<name>`. The directory holding that `.git` is
+/// the related checkout. A `.git` directory, or one that cannot be read, has
+/// none. Only files are read; git is never run.
+pub fn related_roots_of(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let Ok(text) = std::fs::read_to_string(root.join(".git")) else {
+        return Vec::new();
+    };
+    let Some(gitdir) = text
+        .lines()
+        .find_map(|line| line.strip_prefix("gitdir:"))
+        .map(str::trim)
+        .filter(|dir| !dir.is_empty())
+    else {
+        return Vec::new();
+    };
+    let gitdir = root.join(gitdir);
+    let mut roots = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    // A submodule of a submodule sits under several `.git` directories; each
+    // enclosing checkout is related.
+    for dir in gitdir.ancestors() {
+        if dir.file_name().is_some_and(|name| name == ".git") {
+            if let Some(checkout) = dir.parent() {
+                let checkout = normalize_lexically(checkout);
+                if checkout.as_path() != root && seen.insert(checkout.clone()) {
+                    roots.push(checkout);
+                }
+            }
+        }
+    }
+    roots
+}
+
+/// `.` and `..` folded out of an absolute path, without the filesystem.
+fn normalize_lexically(path: &std::path::Path) -> std::path::PathBuf {
+    let mut out = std::path::PathBuf::new();
+    for part in path.components() {
+        match part {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// The project a directory belongs to: the nearest ancestor (or the directory
+/// itself) holding a `.git` entry, a directory for a clone and a file for a
+/// worktree or submodule, so a monorepo subdirectory belongs to the whole
+/// repository. With no repository above it, the directory itself. Only
+/// directory entries are looked at; git is never run.
+pub fn project_root_of(cwd: &std::path::Path) -> std::path::PathBuf {
+    cwd.ancestors()
+        .find(|dir| dir.join(".git").symlink_metadata().is_ok())
+        .unwrap_or(cwd)
+        .to_path_buf()
+}
+
+/// Like [`analyze_command`], for a command whose working context is known.
+/// `rm -rf *` from the home or from `/` is a wipe, and a `.env`-class file
+/// read from outside the project is on the agent floor; see
+/// [`WorkingContext`].
+pub fn analyze_command_in(
+    command: &str,
+    rule_engine: Option<&RuleEngine>,
+    context: Option<&WorkingContext>,
+) -> CommandAnalysis {
+    analyze_command_at(command, rule_engine, &[], context, 0)
 }
 
 /// How many startup-file payloads deep [`analyze_command_at`] follows: a
@@ -889,6 +1035,7 @@ fn analyze_command_at(
     command: &str,
     rule_engine: Option<&RuleEngine>,
     protected_reads: &[String],
+    context: Option<&WorkingContext>,
     depth: u8,
 ) -> CommandAnalysis {
     let cmd = command.trim();
@@ -1226,7 +1373,7 @@ fn analyze_command_at(
     // `echo 'export PATH=...' >> ~/.bashrc` analyses to nothing and adds nothing.
     if depth < STARTUP_PAYLOAD_DEPTH {
         for (file, payload) in threats::startup_file_payloads(cmd) {
-            let inner = analyze_command_at(&payload, rule_engine, protected_reads, depth + 1);
+            let inner = analyze_command_at(&payload, rule_engine, protected_reads, None, depth + 1);
             // The write is persistence whatever file it is (a unit, a hook, an
             // autostart entry); say so once when what it writes is flagged.
             if inner.signals.iter().any(|s| s.score > 0)
@@ -1283,6 +1430,34 @@ fn analyze_command_at(
                 signal: "destructive_command".into(),
                 score: 50,
                 detail: "recursive removal of a root / system directory".into(),
+            });
+            score += 50;
+        } else if crate::threats::destructive_rm_home(&lower) || {
+            // The same home wipe behind a rewrite the shell undoes
+            // (`${x:-rm} -rf ~`, `$(echo rm) -rf ~`, `rm -rf ${x:-~}`), as the
+            // root wipe is caught through `check_command`.
+            let normalized = threats::normalize_command(&lower);
+            normalized != lower && crate::threats::destructive_rm_home(&normalized)
+        } {
+            // The home itself, never a path under it: `rm -rf ~/.cache/x` is
+            // a cleanup, `rm -rf ~` is everything the user has.
+            signals.push(AnalysisSignal {
+                signal: "destructive_command".into(),
+                score: 50,
+                detail: "recursive removal of a home directory".into(),
+            });
+            score += 50;
+        } else if context.is_some_and(|place| {
+            crate::threats::destructive_rm_in_place(scan_cmd, &place.cwd, place.home.as_deref())
+        }) {
+            // `rm -rf *`, `.`, `./*`, `..` are a wipe only where they run: from
+            // the home or from `/`. Anywhere else they keep the verdict above.
+            signals.push(AnalysisSignal {
+                signal: "destructive_command".into(),
+                score: 50,
+                detail: "recursive removal of a home directory or the filesystem root, \
+                         resolved from the working directory"
+                    .into(),
             });
             score += 50;
         }
@@ -1358,6 +1533,31 @@ fn analyze_command_at(
             detail: format!("reads sensitive credential path: `{path}`"),
         });
         score += s;
+    }
+
+    // The same kind of read, of a file outside the project the agent works in.
+    // Additional to the read above, not instead of it: the read keeps its own
+    // score and name, and this records where it reached, which is what puts it
+    // on the agent floor (`AGENT_REVIEW_FLOOR`).
+    if let Some(place) = context {
+        let roots: Vec<&str> = std::iter::once(place.project_root.as_str())
+            .chain(place.related_roots.iter().map(String::as_str))
+            .collect();
+        let enclosing: Vec<&str> = place.enclosing_dirs.iter().map(String::as_str).collect();
+        if let Some(path) = threats::env_read_outside_project(
+            scan_cmd,
+            &place.cwd,
+            place.home.as_deref(),
+            &roots,
+            &enclosing,
+        ) {
+            signals.push(AnalysisSignal {
+                signal: "credential_read_outside_project".into(),
+                score: 10,
+                detail: format!("reads a secrets file outside the project: `{path}`"),
+            });
+            score += 10;
+        }
     }
 
     // The step BEFORE reading a known secret: sweeping the filesystem for one.

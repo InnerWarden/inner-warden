@@ -3,7 +3,61 @@
 All notable changes to InnerWarden are documented here. This project
 follows semantic versioning.
 
-## Unreleased
+## 1.5.4 - 2026-10-11
+
+### Upgrade notes: what to do
+
+- **Scripts that add allow or mute entries need `--operator`.** `innerwarden
+  allow <pattern>` and `innerwarden mute <rule>` now run only in a terminal.
+  A script of yours that runs them with no terminal (CI, provisioning,
+  dotfiles) must pass `--operator`; it is not honoured inside an AI agent's
+  shell. `--list`, `--remove` and help need nothing. The refusal exits 1 and
+  changes nothing.
+- **`allow = ["*"]` is ignored.** A pattern that is only `*` would switch
+  screening off; it is dropped at load with a warning, and `innerwarden
+  allow '*'` is refused. Use `innerwarden dry-run` to stop blocking.
+- **A pattern whose first word holds a `*` lifts only a review.** An allow
+  pattern such as `* | bash` or `c*` still loads (with a warning from
+  `innerwarden check` and `allow --list`) and still lifts a command held for
+  review, but no longer lifts a refused command, a fetch-and-run, an
+  obfuscated command, a persistence write or a look-alike package. Write the
+  command's first word out (`curl -fsSL https://sh.rustup.rs*`) to lift those.
+- **Removing a home is refused.** `rm -rf ~`, `~/`, `~/*`, `~user`, `$HOME`,
+  `"${HOME}"`, `/home/<user>`, `/Users/<user>` and `/root` are a deny. So are
+  `rm -rf *`, `.`, `./*` and `..` when the agent runs them from the home or
+  from `/`. A path under the home (`rm -rf ~/.cache/x`, `rm -rf
+  "$HOME/.cache/x"`) is scoped work and is no longer refused as a hidden
+  target.
+- **An agent reading a secrets file outside its project is blocked.** A
+  `.env`-class file read from outside the repository the agent works in
+  (`cat ~/secret.env`, `cat /srv/other/.env`) stays `review` and is now
+  blocked for an agent. The project's own `.env`, from anywhere in the
+  repository (`cat ../.env` in a monorepo package), and the main checkout's
+  from one of its worktrees or submodules, are unchanged; so is a `.env` in a
+  directory above a project that is not under git. A session started in the
+  home or in `/` keeps the old verdict.
+
+### Fixed
+
+- **A long command is judged whole.** The rewrite that exposes obfuscated
+  commands kept only the first 8 KB, cut by byte: a multi-byte character
+  across the cut stopped the screening, and what followed the first 8 KB was
+  never rewritten. It now rewrites the whole command piece by piece. A long
+  benign heredoc or generated script keeps its verdict.
+- **A failure while screening refuses the call.** If the hook stops on an
+  internal error it exits 2 in enforce (the call is refused) and 1 in
+  monitor. The MCP proxy exits 1 and never forwards the call it was
+  screening.
+- **The advice after a block is for the person.** It no longer prints a
+  ready-to-run `innerwarden allow '<command>'`, which the agent reads first.
+- **The agent cannot widen its own guard from the shell.** `innerwarden
+  allow` / `mute` / `dry-run` run by the agent (through a path, quotes, a
+  launcher, `sh -c`, `eval`, `xargs`, `find -exec`) and a shell write or link
+  into `~/.config/innerwarden/` are refused, and no allow rule lifts that.
+  This raises the cost for an agent; it does not stop one that sets out to
+  change its own user's files by a route the hook does not see.
+- **A subshell's `cd` ends with the subshell.** `(cd ~ && git pull); rm -rf
+  ./*` is judged where the command started.
 
 ## 1.5.3 - 2026-10-09
 
