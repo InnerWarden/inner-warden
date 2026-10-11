@@ -180,3 +180,47 @@ fn the_system_packages_install_innerwarden_and_no_iw() {
         );
     }
 }
+
+/// The installers are signed like the binaries, and after the pinned key is
+/// stamped into them.
+///
+/// The key pinned inside `iw-guard-install.sh` lets it refuse a swapped binary,
+/// but nothing vouched for the installer itself: it shipped with no checksum
+/// and no signature, so a person could not check the script before piping it
+/// to a shell. Signing it BEFORE the stamp would sign bytes nobody downloads.
+///
+/// FAILS ON REVERT: drop the signing loop, move it above the stamp, or drop the
+/// installers from the manifest check.
+#[test]
+fn the_installers_ship_signed_sidecars_of_the_stamped_bytes() {
+    let stamp = WORKFLOW
+        .find("sed -i \"s|\\${IW_GUARD_PUBKEY:-")
+        .expect("the step that stamps the pinned key into the installer is gone");
+    let sign = WORKFLOW
+        .find("for installer in dist/iw-guard-install.sh dist/install.ps1; do")
+        .expect("no step signs the installers");
+    assert!(
+        sign > stamp,
+        "the installers are signed before the key is stamped in, so the \
+         published sidecars cover bytes nobody downloads"
+    );
+    let loop_body = &WORKFLOW[sign..];
+    let loop_body = &loop_body[..loop_body.find("done").expect("unterminated loop")];
+    for sidecar in ["\"${installer}.sha256\"", "\"${installer}.sig\""] {
+        assert!(
+            loop_body.contains(sidecar),
+            "the installer loop does not write {sidecar}"
+        );
+    }
+    let manifest = WORKFLOW
+        .find("for name in iw-guard-install.sh install.ps1; do")
+        .expect("the asset manifest no longer requires the installers");
+    let manifest_body = &WORKFLOW[manifest..];
+    let manifest_body = &manifest_body[..manifest_body.find("done").expect("unterminated loop")];
+    for sidecar in ["${name}.sha256", "${name}.sig"] {
+        assert!(
+            manifest_body.contains(sidecar),
+            "a release missing an installer's {sidecar} would still publish"
+        );
+    }
+}

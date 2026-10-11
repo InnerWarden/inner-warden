@@ -365,6 +365,17 @@ jobs:
           sed -i "s|\${IW_GUARD_PUBKEY:-[A-Za-z0-9+/=]*}|\${IW_GUARD_PUBKEY:-$rawb64}|" dist/iw-guard-install.sh
           grep -q "IW_GUARD_PUBKEY:-$rawb64}" dist/iw-guard-install.sh \
             || { echo "::error::failed to stamp the pinned public key into the installer"; exit 1; }
+          # The installers get the same sidecars as the binaries, signed AFTER
+          # the key is stamped in, so they cover the bytes a person downloads.
+          # The key pinned inside an installer cannot vouch for the installer
+          # itself: these let someone check it before handing it to a shell.
+          for installer in dist/iw-guard-install.sh dist/install.ps1; do
+            echo "signing $(basename "$installer")..."
+            sha256sum "$installer" | awk '{print $1}' > "${installer}.sha256"
+            openssl dgst -sha256 -binary "$installer" > /tmp/sign-digest.bin
+            openssl pkeyutl -sign -inkey /tmp/sign-key.pem -rawin -in /tmp/sign-digest.bin \
+              | base64 -w 0 > "${installer}.sig"
+          done
           ls dist/*.sig dist/*.pub
 
       - name: Verify the asset manifest
@@ -383,11 +394,14 @@ jobs:
             [ -s "dist/${name}.sig" ]    || { echo "MISSING: ${name}.sig"; missing=1; }
           done
           [ -s dist/innerwarden-release.pub ] || { echo "MISSING: innerwarden-release.pub"; missing=1; }
-          [ -s dist/iw-guard-install.sh ]     || { echo "MISSING: iw-guard-install.sh"; missing=1; }
-          [ -s dist/install.ps1 ]             || { echo "MISSING: install.ps1"; missing=1; }
+          for name in iw-guard-install.sh install.ps1; do
+            [ -s "dist/$name" ]          || { echo "MISSING: $name"; missing=1; }
+            [ -s "dist/${name}.sha256" ] || { echo "MISSING: ${name}.sha256"; missing=1; }
+            [ -s "dist/${name}.sig" ]    || { echo "MISSING: ${name}.sig"; missing=1; }
+          done
           [ -s dist/innerwarden.json ]        || { echo "MISSING: innerwarden.json (scoop)"; missing=1; }
           [ "$missing" -eq 0 ] || { echo "asset manifest verification failed."; exit 1; }
-          echo "All 6 binaries + sha256 + Ed25519 sigs + public key + installers + scoop manifest present."
+          echo "All 6 binaries + both installers, each with sha256 + Ed25519 sig, + public key + scoop manifest present."
 
       # ── Immutable versioned release (DD audit S3) ────────────────────────
       #

@@ -148,6 +148,11 @@ Local one-off:
 - Every release binary ships `<asset>.sha256` (bare hash) and `<asset>.sig`
   (Ed25519 **over the SHA-256 digest** of the binary). The release publishes the
   public key as `innerwarden-release.pub` (PEM, `MCowBQYDK2VwAyEA...`).
+- The two installers (`iw-guard-install.sh`, `install.ps1`) ship the same
+  `.sha256` and `.sig`, made after the pinned key is stamped into them, so
+  they cover the published bytes. The key inside an installer cannot vouch for
+  the installer; these sidecars let a person check it before running it (same
+  commands as below, with `asset=iw-guard-install.sh`).
 - The `.deb`/`.rpm` ship a standard-format `<file>.sha256`. They are not
   signed: the checksum proves a download arrived whole, not who published it.
   Signing them with the release key is open work for this pipeline.
