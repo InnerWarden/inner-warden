@@ -1051,18 +1051,24 @@ export function RecentActivity({ items, edition, onOpen, onOpenCase }: {
       {items.length === 0 ? (
         <div className="rounded-xl border border-slate-200 bg-white p-5 text-sm text-slate-600">No recent decisions are available yet.</div>
       ) : (
-        <ul className="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm">
+        // From `sm` up the list is ONE grid and every row borrows its columns
+        // (subgrid), so the first column is as wide as the widest chip in the
+        // list, on one line, in whatever font the reader's system has, and the
+        // commands start at the same x in every row. A fixed width could only
+        // be right for the font it was measured in. On a phone each row keeps
+        // its own two columns and the chip wraps inside the first.
+        <ul className="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm sm:grid sm:grid-cols-[max-content_minmax(0,1fr)_auto]">
           {items.map((item, index) => {
             const recommendation = item.recommendation ?? "unknown";
             const link = decisionEntryLink(item.case_id, edition, onOpenCase !== undefined);
             const body = <RecentActivityEntry item={item} clickable={link.kind !== "none"} />;
             return (
-              <li key={item.id ?? `${item.session}-${item.command}-${index}`} className="border-b border-slate-100 last:border-0">
+              <li key={item.id ?? `${item.session}-${item.command}-${index}`} className="border-b border-slate-100 last:border-0 sm:col-span-3 sm:grid sm:grid-cols-subgrid">
                 {link.kind === "none" ? (
                   // No case to open: plain text, no hover, no affordance. A row
                   // that looks clickable and lands nowhere is worse than one
                   // that says it is a record.
-                  <div className="grid w-full min-w-0 grid-cols-[7rem_minmax(0,1fr)] items-start gap-x-3 gap-y-2 px-3 py-3 text-left sm:grid-cols-[7rem_minmax(0,1fr)_auto] sm:px-4">
+                  <div className="grid w-full min-w-0 grid-cols-[7rem_minmax(0,1fr)] items-start gap-x-3 gap-y-2 px-3 py-3 text-left sm:col-span-3 sm:grid-cols-subgrid sm:px-4">
                     {body}
                   </div>
                 ) : (
@@ -1073,7 +1079,7 @@ export function RecentActivity({ items, edition, onOpen, onOpenCase }: {
                         ? onOpenCase?.(link.caseId)
                         : onOpen({ id: item.id, session: item.session, verdict: recommendation, action: item.command })
                     }
-                    className="group grid w-full min-w-0 grid-cols-[7rem_minmax(0,1fr)] items-start gap-x-3 gap-y-2 px-3 py-3 text-left transition-colors hover:bg-slate-50 focus-visible:-outline-offset-2 sm:grid-cols-[7rem_minmax(0,1fr)_auto] sm:px-4"
+                    className="group grid w-full min-w-0 grid-cols-[7rem_minmax(0,1fr)] items-start gap-x-3 gap-y-2 px-3 py-3 text-left transition-colors hover:bg-slate-50 focus-visible:-outline-offset-2 sm:col-span-3 sm:grid-cols-subgrid sm:px-4"
                     aria-label={
                       link.kind === "case"
                         ? `Open the case for ${item.command}`
@@ -1157,7 +1163,7 @@ function RecentActivityEntry({ item, clickable }: { item: DecisionSummary; click
   return (
     <>
       {stopped === undefined ? (
-        <Verdict rec={recommendation} reviewLabel={REVIEW_VERDICT_CHIP} />
+        <Verdict rec={recommendation} reviewLabel={REVIEW_VERDICT_CHIP} contained />
       ) : (
         // One final outcome for the row. The verdict before it is in the
         // line under the command, never a green pill beside a refusal.
@@ -1166,7 +1172,7 @@ function RecentActivityEntry({ item, clickable }: { item: DecisionSummary; click
         // bad thing that happened.
         <span
           data-final-outcome="kernel_stopped"
-          className="inline-flex shrink-0 self-start justify-self-start items-center gap-1.5 rounded-lg border border-cyan-200 bg-cyan-50 px-2.5 py-0.5 text-xs font-semibold leading-5 text-cyan-900"
+          className="inline-flex max-w-full shrink-0 self-start justify-self-start items-center gap-1.5 whitespace-normal rounded-lg border border-cyan-200 bg-cyan-50 px-2.5 py-0.5 text-xs font-semibold leading-5 text-cyan-900 sm:whitespace-nowrap"
         >
           <span className="h-1.5 w-1.5 shrink-0 rounded-full" style={{ background: TONE_HEX[outcomeTone("kernel_stopped").tone] }} aria-hidden="true" />
           {KERNEL_STOPPED_OUTCOME}

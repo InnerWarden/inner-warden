@@ -61,4 +61,19 @@ describe("a review chip on the Overview", () => {
   it("keeps the shared label elsewhere", () => {
     expect(renderToStaticMarkup(<Verdict rec="review" />)).toContain("Needs review");
   });
+
+  /**
+   * The list's first column is as wide as its widest chip from `sm` up, and a
+   * fixed 7rem on a phone: its chips may wrap there and never outgrow it. A
+   * chip anywhere else keeps its one line. The browser test measures the
+   * result (`tests/enterprise/recent-activity-chips.spec.ts`).
+   */
+  it("lets only this list's chips wrap inside their column on a phone", () => {
+    expect(renderToStaticMarkup(<Verdict rec="allow" />)).toContain("whitespace-nowrap");
+    expect(renderToStaticMarkup(<Verdict rec="allow" />)).not.toContain("max-w-full");
+    // The verdict chip and the kernel's chip, one row each.
+    const html = render([review, { ...review, id: "d-kernel", kernel_stopped: "/usr/bin/sudo" }], "enterprise");
+    expect(html.match(/ whitespace-normal /g)).toHaveLength(2);
+    expect(html.match(/ sm:whitespace-nowrap/g)).toHaveLength(2);
+  });
 });
