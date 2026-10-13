@@ -10,7 +10,15 @@
 # A known advisory fails the build. An exception must be written down here with
 # a reason, so the decision is reviewable instead of implicit.
 yanked = "deny"
-ignore = []
+ignore = [
+  # RUSTSEC-2024-0449: unsafe-libyaml is unmaintained. This is a notice that
+  # the crate gets no more fixes, not a known vulnerability. It arrives only
+  # under serde_yaml, itself archived upstream, which agent-guard and the
+  # dashboard kit use to read YAML files. Moving them to a maintained parser
+  # is tracked as its own change; drop this entry when it lands. Only this ID
+  # is waived: a vulnerability advisory against either crate still fails here.
+  "RUSTSEC-2024-0449",
+]
 
 [licenses]
 # Apache-2.0 is what this repo publishes under, so an incompatible dependency
