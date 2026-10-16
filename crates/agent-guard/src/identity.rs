@@ -632,6 +632,8 @@ pub enum Reason {
     HostNamespaceRecorded,
     OwnNamespaceUnreadable,
     NamespaceMismatch,
+    /// The record names another kind of agent than the hook line was wired for.
+    AgentMismatch,
 }
 
 impl Reason {
@@ -647,6 +649,7 @@ impl Reason {
             Reason::HostNamespaceRecorded => "host_namespace_recorded",
             Reason::OwnNamespaceUnreadable => "own_namespace_unreadable",
             Reason::NamespaceMismatch => "namespace_mismatch",
+            Reason::AgentMismatch => "agent_mismatch",
         }
     }
 }
@@ -718,6 +721,27 @@ pub fn judge_trust_in_jail(facts: InJailFacts<'_>) -> (Trust, Reason) {
         return (Trust::Observed, Reason::NoScope);
     }
     (Trust::Confined, Reason::ConfinedByNamespace)
+}
+
+/// Hold a level to the agent the hook line was wired for.
+///
+/// The hook line (`--agent <id>`) and the record both name a kind of agent. When
+/// the line names one and the record names another, one of the two is not what
+/// it says, and neither is evidence: the level drops to `declared` with
+/// [`Reason::AgentMismatch`]. A line that names no agent leaves the level
+/// alone, and so does a level that is already `declared`, whose first reason
+/// stays the one reported.
+pub fn judge_agent_claim(
+    judged: (Trust, Reason),
+    record_agent: &str,
+    hook_agent: Option<&str>,
+) -> (Trust, Reason) {
+    match hook_agent {
+        Some(wired) if judged.0 > Trust::Declared && wired != record_agent => {
+            (Trust::Declared, Reason::AgentMismatch)
+        }
+        _ => judged,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1748,12 +1772,36 @@ mod tests {
             Reason::HostNamespaceRecorded,
             Reason::OwnNamespaceUnreadable,
             Reason::NamespaceMismatch,
+            Reason::AgentMismatch,
         ] {
             assert_eq!(
                 serde_json::to_value(reason).unwrap(),
                 json!(reason.as_str())
             );
         }
+    }
+
+    #[test]
+    fn a_hook_wired_for_another_agent_drops_the_level_to_declared() {
+        let confined = (Trust::Confined, Reason::ConfinedByNamespace);
+        let observed = (Trust::Observed, Reason::NoScope);
+        for judged in [confined, observed] {
+            assert_eq!(
+                judge_agent_claim(judged, "claude-code", Some("cursor")),
+                (Trust::Declared, Reason::AgentMismatch)
+            );
+            assert_eq!(
+                judge_agent_claim(judged, "claude-code", Some("claude-code")),
+                judged
+            );
+            assert_eq!(judge_agent_claim(judged, "claude-code", None), judged);
+        }
+        // Already declared: the first reason stays.
+        let first = (Trust::Declared, Reason::NamespaceMismatch);
+        assert_eq!(
+            judge_agent_claim(first, "claude-code", Some("cursor")),
+            first
+        );
     }
 
     // -- the layers ---------------------------------------------------------

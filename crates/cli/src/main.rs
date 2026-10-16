@@ -30,6 +30,7 @@ mod dashboard_community;
 mod first_run;
 mod graph_io;
 mod help;
+mod hook_identity;
 mod http_io;
 mod notify_io;
 mod observe;
@@ -888,7 +889,11 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
     // `tool_input` that produced it, and screening that again would record the
     // same command twice.
     if let Some((tool, result)) = hook_tool_result(&buf) {
-        session_store::record_tool_result(hook_session(&buf).as_deref(), &tool, &result);
+        let payload_session = hook_session(&buf);
+        let identity =
+            hook_identity::current(agent_flag(rest).as_deref(), payload_session.as_deref());
+        let key = hook_identity::behaviour_key(identity.as_ref(), payload_session.as_deref());
+        session_store::record_tool_result(key.as_deref(), &tool, &result);
         return std::process::ExitCode::SUCCESS;
     }
 
@@ -914,6 +919,10 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
         .unwrap_or(rules);
     let source_session = hook_session(&buf);
     let source_event_id = hook_event_id(&buf);
+    // Inside an identified jail the hook knows more about who is calling; with
+    // no record there this is `None` and nothing below changes.
+    let identity = hook_identity::current(agent_flag(rest).as_deref(), source_session.as_deref());
+    let window_key = hook_identity::behaviour_key(identity.as_ref(), source_session.as_deref());
 
     // Behavioural layer: a burst of calls, or repeated sensitive reads, is only
     // visible ACROSS invocations. `agent-guard` has always had the logic; this
@@ -925,7 +934,7 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
     // burst AND whether an argument arrived in an earlier tool result. They were
     // two reads, which doubled the work on the hot path of every tool call.
     let (behaviour, tainted) =
-        session_store::record_call_and_taint(source_session.as_deref(), &command);
+        session_store::record_call_and_taint(window_key.as_deref(), &command);
     let verdict = apply_behaviour(verdict, behaviour.as_ref());
     let verdict = apply_taint(verdict, tainted.as_ref());
 
@@ -945,6 +954,7 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
         source_event_id.as_deref(),
         agent_flag(rest).as_deref(),
         hook_cwd(&buf).as_deref(),
+        identity.as_ref(),
     );
     if would_block_under_policy {
         // In monitor mode this is a would-block alert; in enforce it accompanies
@@ -1024,15 +1034,18 @@ fn screen_file_tool(buf: &str, rest: &[String], monitor: bool) -> Option<std::pr
     };
     let verdict = file_tools::refusal_verdict(&tool, path, what);
     let command = format!("{tool} {}", path.trim());
+    let payload_session = hook_session(buf);
+    let identity = hook_identity::current(agent_flag(rest).as_deref(), payload_session.as_deref());
     graph_io::record_hook(
         &command,
         &verdict,
         monitor,
         true,
-        hook_session(buf).as_deref(),
+        payload_session.as_deref(),
         hook_event_id(buf).as_deref(),
         agent_flag(rest).as_deref(),
         hook_cwd(buf).as_deref(),
+        identity.as_ref(),
     );
     notify_io::fire(&command, &verdict);
     if monitor {
@@ -2005,15 +2018,27 @@ fn cmd_proxy(rest: &[String]) -> std::process::ExitCode {
     // runs, from a thread of its own; with none, the proxy says so once and
     // nothing else changes (`agent_report`).
     let reporter = agent_report::BlockReporter::from_env();
+    // The proxy runs where the agent's tools run, so it reads the same record
+    // the hook does; with none there it is `None` and nothing changes.
+    let identity = hook_identity::current(agent.as_deref(), None);
     let report_to = reporter.sender();
     let on_event = move |d: &ProxyDecision| {
         // The graph is an action timeline: persist every client tools/call,
         // including allows, but never persist a server response as a command.
-        graph_io::record_mcp(d, mode, Some(&proxy_session), agent.as_deref());
+        graph_io::record_mcp(
+            d,
+            mode,
+            Some(&proxy_session),
+            agent.as_deref(),
+            identity.as_ref(),
+        );
         if !d.verdict.alerts.is_empty() {
             eprintln!("{}", format_alert(&label, d));
         }
-        if let (Some(tx), Some(body)) = (&report_to, agent_report::block_report(&label, mode, d)) {
+        if let (Some(tx), Some(body)) = (
+            &report_to,
+            agent_report::block_report(&label, mode, d, identity.as_ref()),
+        ) {
             // Full: the agent is not keeping up; the local record stands.
             let _ = tx.try_send(body);
         }

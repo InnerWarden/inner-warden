@@ -1,0 +1,461 @@
+//! The hook's view of the instance it runs in.
+//!
+//! Inside a jail started with `contain --identity`, the launcher mounts a
+//! record read-only at a fixed place. This module reads it (one open, no link
+//! followed, bounded, owner checked), reads the hook's own PID namespace, asks
+//! the pure judge in `agent-guard` what level that earns, and returns LABELS
+//! for the decision record: instance id, the session id the agent sent, the
+//! level and the reason for it.
+//!
+//! With no record there, the answer is `None` and the hook is exactly what it
+//! was: no field is added anywhere. A record that is there and cannot be used
+//! is `declared` with a reason; a failed read never stops a tool call.
+//!
+//! The labels are labels. The level is the hook's own opinion from inside the
+//! jail, and a reader that needs more than that has to find it elsewhere.
+
+// The jail record exists on Linux only; the decisions and their tests run everywhere.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+
+use innerwarden_agent_guard::identity::{
+    judge_agent_claim, judge_trust_in_jail, parse_launch_record, InJailFacts, Reason, RecordRead,
+    Trust,
+};
+
+/// What the hook found at the record's place, before it is parsed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RawRecord {
+    /// Nothing there that could be a record.
+    Absent,
+    /// Something there, and not usable: a link, not a regular file, not the
+    /// user's, too large, unreadable.
+    Unreadable,
+    Bytes {
+        bytes: Vec<u8>,
+        /// The file sits on a read-only mount.
+        read_only: bool,
+    },
+}
+
+/// Everything the decision reads, handed in by whoever read it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JailFacts {
+    pub record: RawRecord,
+    /// Inode of the hook's own PID namespace.
+    pub own_pid_ns: Option<u64>,
+}
+
+/// The labels a decision gets when a record was found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Identity {
+    /// Set only when the hook's own namespace is the recorded one. A record
+    /// copied from another jail, or one that cannot be used, names no instance.
+    pub instance_id: Option<String>,
+    /// The session id the agent put in its payload. The agent chose it.
+    pub session_id: Option<String>,
+    pub trust: Trust,
+    pub reason: Reason,
+}
+
+impl Identity {
+    /// The key the behavioural window is kept under. For a confined instance
+    /// it is the instance, so a session id the agent invents cannot start a
+    /// fresh window; otherwise it is the session id, as before.
+    pub fn behaviour_key(&self, payload_session: Option<&str>) -> Option<String> {
+        match (&self.instance_id, self.trust) {
+            (Some(id), Trust::Confined) => Some(format!("instance:{id}")),
+            _ => payload_session.map(str::to_string),
+        }
+    }
+
+    /// Put the labels on a decision's origin.
+    pub fn apply(&self, origin: &mut innerwarden_graph::DecisionOrigin) {
+        origin.instance_id = self.instance_id.clone();
+        origin.session_id = self.session_id.clone();
+        origin.trust = Some(self.trust.as_str().to_string());
+        origin.trust_reason = Some(self.reason.as_str().to_string());
+    }
+
+    /// The `instance` and `trust` fields of a block report to the local agent.
+    pub fn report_fields(&self) -> (Option<&str>, &'static str) {
+        (self.instance_id.as_deref(), self.trust.as_str())
+    }
+}
+
+/// The key for the behavioural window: the instance when confined, else the
+/// session id the payload carried.
+pub fn behaviour_key(identity: Option<&Identity>, payload_session: Option<&str>) -> Option<String> {
+    match identity {
+        Some(identity) => identity.behaviour_key(payload_session),
+        None => payload_session.map(str::to_string),
+    }
+}
+
+/// PURE. The labels for `facts`, or `None` when there is no record.
+///
+/// `hook_agent` is the agent the hook line was wired for; `payload_session`
+/// the session id the agent sent.
+pub fn resolve(
+    facts: &JailFacts,
+    hook_agent: Option<&str>,
+    payload_session: Option<&str>,
+) -> Option<Identity> {
+    let session_id = payload_session
+        .map(crate::graph_io::bounded_session)
+        .filter(|s| !s.is_empty());
+    let (bytes, read_only) = match &facts.record {
+        RawRecord::Absent => return None,
+        RawRecord::Unreadable => {
+            return Some(Identity {
+                instance_id: None,
+                session_id,
+                trust: Trust::Declared,
+                reason: Reason::RecordUnreadable,
+            })
+        }
+        RawRecord::Bytes { bytes, read_only } => (bytes, *read_only),
+    };
+    let Ok(record) = parse_launch_record(bytes) else {
+        return Some(Identity {
+            instance_id: None,
+            session_id,
+            trust: Trust::Declared,
+            reason: Reason::RecordUnreadable,
+        });
+    };
+    let judged = judge_trust_in_jail(InJailFacts {
+        record: RecordRead::Present {
+            record: &record,
+            read_only,
+        },
+        own_pid_ns: facts.own_pid_ns,
+    });
+    let (trust, reason) = judge_agent_claim(judged, &record.agent_type, hook_agent);
+    Some(Identity {
+        instance_id: (trust > Trust::Declared).then(|| record.instance_id.clone()),
+        session_id,
+        trust,
+        reason,
+    })
+}
+
+/// Read the facts at `path` and from `/proc/self`.
+#[cfg(target_os = "linux")]
+pub fn read_facts(path: &std::path::Path) -> JailFacts {
+    JailFacts {
+        record: read_raw(path),
+        own_pid_ns: std::fs::read_link("/proc/self/ns/pid")
+            .ok()
+            .and_then(|link| crate::contain::launch::parse_ns_link(&link.to_string_lossy())),
+    }
+}
+
+/// One open of the record: no link followed, no wait on a pipe, the facts read
+/// from the open descriptor, no more than the cap read.
+///
+/// A path that cannot be opened for any reason but a planted link is `Absent`:
+/// on a host that has a folder of that name for another purpose, the hook must
+/// not start reporting.
+#[cfg(target_os = "linux")]
+fn read_raw(path: &std::path::Path) -> RawRecord {
+    use innerwarden_agent_guard::identity::MAX_RECORD_BYTES;
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+
+    let file = match innerwarden_safe_io::open_no_follow(path) {
+        Ok(file) => file,
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return RawRecord::Unreadable,
+        Err(_) => return RawRecord::Absent,
+    };
+    let Ok(meta) = file.metadata() else {
+        return RawRecord::Unreadable;
+    };
+    // SAFETY: geteuid takes no arguments and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    if !innerwarden_safe_io::is_regular_file(&meta)
+        || meta.uid() != euid
+        || meta.len() > MAX_RECORD_BYTES as u64
+    {
+        return RawRecord::Unreadable;
+    }
+    // SAFETY: an all-zero statvfs is a valid value for the kernel to fill, and
+    // the descriptor stays open for the call.
+    let read_only = unsafe {
+        let mut st: libc::statvfs = std::mem::zeroed();
+        libc::fstatvfs(file.as_raw_fd(), &mut st) == 0
+            && (st.f_flag as u64) & (libc::ST_RDONLY as u64) != 0
+    };
+    let mut bytes = Vec::new();
+    if file
+        .take(MAX_RECORD_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .is_err()
+        || bytes.len() > MAX_RECORD_BYTES
+    {
+        return RawRecord::Unreadable;
+    }
+    RawRecord::Bytes { bytes, read_only }
+}
+
+/// The hook's labels from the real record and the real `/proc`. Other systems
+/// have no jail record: `None`.
+pub fn current(hook_agent: Option<&str>, payload_session: Option<&str>) -> Option<Identity> {
+    #[cfg(target_os = "linux")]
+    {
+        let path = std::path::Path::new(innerwarden_agent_guard::identity::JAIL_RECORD_PATH);
+        resolve(&read_facts(path), hook_agent, payload_session)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (hook_agent, payload_session);
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const OWN_NS: u64 = 4026532871;
+
+    const RECORD: &str = r#"{
+  "schema": 1,
+  "instance_id": "7f3a9c1e-42",
+  "agent_type": "claude-code",
+  "launcher": { "path": "/usr/local/bin/innerwarden", "version": "1.6.0", "root_owned": true },
+  "uid": 1000,
+  "project": "my-app",
+  "mode": "enforce",
+  "started_at": "2026-10-16T09:30:00Z",
+  "jail": { "backend": "bwrap", "pid": 48211, "start_ticks": 9120344, "pid_ns": 4026532871 },
+  "scope": {
+    "user": {
+      "unit": "innerwarden-contain-7f3a9c1e-42.scope",
+      "cgroup_path": "/user.slice/user-1000.slice/user@1000.service/app.slice/innerwarden-contain-7f3a9c1e-42.scope"
+    }
+  }
+}"#;
+
+    fn facts(record: &str, read_only: bool, own: Option<u64>) -> JailFacts {
+        JailFacts {
+            record: RawRecord::Bytes {
+                bytes: record.as_bytes().to_vec(),
+                read_only,
+            },
+            own_pid_ns: own,
+        }
+    }
+
+    #[test]
+    fn no_record_means_no_labels_at_all() {
+        let none = JailFacts {
+            record: RawRecord::Absent,
+            own_pid_ns: Some(OWN_NS),
+        };
+        assert_eq!(resolve(&none, Some("claude-code"), Some("abc")), None);
+    }
+
+    #[test]
+    fn the_recorded_namespace_on_a_read_only_record_is_confined() {
+        let id = resolve(
+            &facts(RECORD, true, Some(OWN_NS)),
+            Some("claude-code"),
+            Some("payload-session"),
+        )
+        .unwrap();
+        assert_eq!(id.trust, Trust::Confined);
+        assert_eq!(id.reason, Reason::ConfinedByNamespace);
+        assert_eq!(id.instance_id.as_deref(), Some("7f3a9c1e-42"));
+        assert_eq!(id.session_id.as_deref(), Some("payload-session"));
+    }
+
+    /// A record carried into another jail (or copied by the agent) is not this
+    /// process's record.
+    ///
+    /// FAILS ON REVERT: grant `Confined` without comparing the namespace and
+    /// this sees `Confined` and the instance id.
+    #[test]
+    fn a_record_of_another_jail_is_declared_and_names_no_instance() {
+        let id = resolve(
+            &facts(RECORD, true, Some(OWN_NS + 1)),
+            Some("claude-code"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(id.trust, Trust::Declared);
+        assert_eq!(id.reason, Reason::NamespaceMismatch);
+        assert_eq!(id.instance_id, None);
+    }
+
+    #[test]
+    fn a_record_the_agent_could_write_is_declared() {
+        let id = resolve(&facts(RECORD, false, Some(OWN_NS)), None, None).unwrap();
+        assert_eq!(
+            (id.trust, id.reason),
+            (Trust::Declared, Reason::RecordWritable)
+        );
+        assert_eq!(id.instance_id, None);
+    }
+
+    #[test]
+    fn a_record_that_cannot_be_used_is_declared_with_the_reason() {
+        for raw in [
+            RawRecord::Unreadable,
+            RawRecord::Bytes {
+                bytes: b"not json".to_vec(),
+                read_only: true,
+            },
+        ] {
+            let id = resolve(
+                &JailFacts {
+                    record: raw,
+                    own_pid_ns: Some(OWN_NS),
+                },
+                None,
+                Some("s"),
+            )
+            .unwrap();
+            assert_eq!(
+                (id.trust, id.reason, id.instance_id),
+                (Trust::Declared, Reason::RecordUnreadable, None)
+            );
+        }
+    }
+
+    /// The hook line and the record must agree on the kind of agent.
+    ///
+    /// FAILS ON REVERT: skip `judge_agent_claim` and this sees `Confined`.
+    #[test]
+    fn a_hook_wired_for_another_agent_than_the_record_is_declared() {
+        let id = resolve(&facts(RECORD, true, Some(OWN_NS)), Some("cursor"), None).unwrap();
+        assert_eq!(
+            (id.trust, id.reason),
+            (Trust::Declared, Reason::AgentMismatch)
+        );
+        assert_eq!(id.instance_id, None);
+    }
+
+    #[test]
+    fn a_per_user_launcher_is_observed_at_most() {
+        let user_install = RECORD.replace("\"root_owned\": true", "\"root_owned\": false");
+        let id = resolve(&facts(&user_install, true, Some(OWN_NS)), None, None).unwrap();
+        assert_eq!(
+            (id.trust, id.reason),
+            (Trust::Observed, Reason::LauncherNotTrusted)
+        );
+        assert_eq!(id.instance_id.as_deref(), Some("7f3a9c1e-42"));
+    }
+
+    /// A session id the agent invents must not start a fresh behavioural
+    /// window for a confined instance.
+    ///
+    /// FAILS ON REVERT: key by the payload session always and the two keys
+    /// differ.
+    #[test]
+    fn a_confined_instance_keeps_one_window_whatever_session_it_claims() {
+        let id = resolve(&facts(RECORD, true, Some(OWN_NS)), None, Some("a")).unwrap();
+        assert_eq!(
+            behaviour_key(Some(&id), Some("a")),
+            behaviour_key(Some(&id), Some("a-forged-new-one"))
+        );
+        assert_eq!(
+            behaviour_key(Some(&id), None).as_deref(),
+            Some("instance:7f3a9c1e-42")
+        );
+    }
+
+    #[test]
+    fn below_confined_and_without_a_record_the_window_keys_as_before() {
+        let declared = resolve(&facts(RECORD, false, Some(OWN_NS)), None, None).unwrap();
+        assert_eq!(
+            behaviour_key(Some(&declared), Some("s")).as_deref(),
+            Some("s")
+        );
+        assert_eq!(behaviour_key(Some(&declared), None), None);
+        assert_eq!(behaviour_key(None, Some("s")).as_deref(), Some("s"));
+        let user_install = RECORD.replace("\"root_owned\": true", "\"root_owned\": false");
+        let observed = resolve(&facts(&user_install, true, Some(OWN_NS)), None, None).unwrap();
+        assert_eq!(
+            behaviour_key(Some(&observed), Some("s")).as_deref(),
+            Some("s")
+        );
+    }
+
+    #[test]
+    fn a_session_id_is_bounded_and_empty_is_dropped() {
+        let long = "x".repeat(500);
+        let id = resolve(&facts(RECORD, true, Some(OWN_NS)), None, Some(&long)).unwrap();
+        assert_eq!(id.session_id.unwrap().chars().count(), 120);
+        let id = resolve(&facts(RECORD, true, Some(OWN_NS)), None, Some("   ")).unwrap();
+        assert_eq!(id.session_id, None);
+    }
+
+    // -- the reads, on a real folder (Linux) ---------------------------------
+
+    #[cfg(target_os = "linux")]
+    mod io {
+        use super::super::*;
+        use std::os::unix::fs::symlink;
+
+        #[test]
+        fn a_missing_file_or_folder_is_absent_and_nothing_is_created() {
+            let dir = tempfile::tempdir().unwrap();
+            assert_eq!(
+                read_raw(&dir.path().join("nope/instance.json")),
+                RawRecord::Absent
+            );
+            assert_eq!(
+                read_raw(&dir.path().join("instance.json")),
+                RawRecord::Absent
+            );
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        }
+
+        #[test]
+        fn a_planted_link_is_refused_and_not_followed() {
+            let dir = tempfile::tempdir().unwrap();
+            let real = dir.path().join("real.json");
+            std::fs::write(&real, super::RECORD).unwrap();
+            let link = dir.path().join("instance.json");
+            symlink(&real, &link).unwrap();
+            assert_eq!(read_raw(&link), RawRecord::Unreadable);
+        }
+
+        #[test]
+        fn a_folder_or_an_oversize_file_is_refused() {
+            let dir = tempfile::tempdir().unwrap();
+            let folder = dir.path().join("instance.json");
+            std::fs::create_dir(&folder).unwrap();
+            assert_eq!(read_raw(&folder), RawRecord::Unreadable);
+            let big = dir.path().join("big.json");
+            std::fs::write(&big, vec![b' '; 16 * 1024 + 1]).unwrap();
+            assert_eq!(read_raw(&big), RawRecord::Unreadable);
+        }
+
+        #[test]
+        fn a_fifo_does_not_hang_the_hook() {
+            let dir = tempfile::tempdir().unwrap();
+            let fifo = dir.path().join("instance.json");
+            let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+            assert_eq!(read_raw(&fifo), RawRecord::Unreadable);
+        }
+
+        /// A record on an ordinary folder is read and is NOT on a read-only
+        /// mount, so it can never be `confined`.
+        #[test]
+        fn a_file_on_a_writable_folder_is_not_read_only() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("instance.json");
+            std::fs::write(&path, super::RECORD).unwrap();
+            match read_raw(&path) {
+                RawRecord::Bytes { bytes, read_only } => {
+                    assert_eq!(bytes, super::RECORD.as_bytes());
+                    assert!(!read_only);
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+}

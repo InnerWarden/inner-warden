@@ -67,7 +67,12 @@ fn report_name(raw: &str) -> String {
 /// PURE. The report for a decision the proxy REFUSED (answered with a denial,
 /// never passed to the server), or `None`. Decided by `apply_mode`, the same
 /// function the proxy's transport acts on.
-pub fn block_report(label: &str, mode: ProxyMode, d: &ProxyDecision) -> Option<Value> {
+pub fn block_report(
+    label: &str,
+    mode: ProxyMode,
+    d: &ProxyDecision,
+    identity: Option<&crate::hook_identity::Identity>,
+) -> Option<Value> {
     let refused = matches!(
         apply_mode(d, mode, false),
         ProxyAction::Block { .. } | ProxyAction::Kill { .. }
@@ -100,14 +105,23 @@ pub fn block_report(label: &str, mode: ProxyMode, d: &ProxyDecision) -> Option<V
         .filter(|r| !r.is_empty())
         .take(16)
         .collect();
-    Some(json!({
+    let mut body = json!({
         "kind": "mcp_proxy_block",
         "agent_name": label,
         "command": summary,
         "tool": tool,
         "rule_ids": rules,
         "mode": if mode == ProxyMode::Kill { "kill" } else { "guard" },
-    }))
+    });
+    // Labels from the proxy's own view, never proof; absent without a record.
+    if let Some(identity) = identity {
+        let (instance, trust) = identity.report_fields();
+        if let Some(instance) = instance {
+            body["instance"] = json!(instance);
+        }
+        body["trust"] = json!(trust);
+    }
+    Some(body)
 }
 
 /// Is `url` on this host's loopback?
@@ -290,6 +304,49 @@ mod tests {
 
     const CRED_CALL: &str = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"save","arguments":{"token":"sk-ant-aaaaaaaaaaaaaaaaaaaaaaaa"}}}"#;
 
+    /// The report names the instance and the level only when the proxy found a
+    /// record; without one it is the body it always was.
+    ///
+    /// FAILS ON REVERT: add the fields unconditionally and the no-record body
+    /// grows two keys.
+    #[test]
+    fn a_report_carries_instance_and_trust_only_with_a_record() {
+        use crate::hook_identity::Identity;
+        use innerwarden_agent_guard::identity::{Reason, Trust};
+        let cred = routed(CRED_CALL);
+        let plain = block_report("l", ProxyMode::Guard, &cred, None).unwrap();
+        let mut keys: Vec<&str> = plain
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["agent_name", "command", "kind", "mode", "rule_ids", "tool"]
+        );
+        let id = Identity {
+            instance_id: Some("7f3a9c1e-42".into()),
+            session_id: None,
+            trust: Trust::Confined,
+            reason: Reason::ConfinedByNamespace,
+        };
+        let labelled = block_report("l", ProxyMode::Guard, &cred, Some(&id)).unwrap();
+        assert_eq!(labelled["instance"], "7f3a9c1e-42");
+        assert_eq!(labelled["trust"], "confined");
+        // A record that named no instance still says its level, never an instance.
+        let declared = Identity {
+            instance_id: None,
+            trust: Trust::Declared,
+            reason: Reason::NamespaceMismatch,
+            ..id
+        };
+        let body = block_report("l", ProxyMode::Guard, &cred, Some(&declared)).unwrap();
+        assert!(body.get("instance").is_none());
+        assert_eq!(body["trust"], "declared");
+    }
+
     /// Only a call the proxy refused is reported, and never with its raw
     /// arguments.
     ///
@@ -299,7 +356,8 @@ mod tests {
     fn only_a_refused_call_is_reported_and_without_its_raw_arguments() {
         let cred = routed(CRED_CALL);
         assert!(!cred.verdict.allowed);
-        let body = block_report("my proxy", ProxyMode::Guard, &cred).expect("refused in guard");
+        let body =
+            block_report("my proxy", ProxyMode::Guard, &cred, None).expect("refused in guard");
         assert_eq!(body["kind"], "mcp_proxy_block");
         assert_eq!(body["mode"], "guard");
         assert_eq!(body["agent_name"], "my-proxy");
@@ -311,16 +369,16 @@ mod tests {
             .any(|r| r == "AG-CRED"));
         assert!(!body.to_string().contains("sk-ant-aaaa"), "{body}");
         assert_eq!(
-            block_report("l", ProxyMode::Kill, &cred).unwrap()["mode"],
+            block_report("l", ProxyMode::Kill, &cred, None).unwrap()["mode"],
             "kill"
         );
         for forwarding in [ProxyMode::Advisory, ProxyMode::Warn] {
-            assert_eq!(block_report("l", forwarding, &cred), None);
+            assert_eq!(block_report("l", forwarding, &cred, None), None);
         }
         let clean = routed(
             r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_directory","arguments":{"path":"/tmp"}}}"#,
         );
-        assert_eq!(block_report("l", ProxyMode::Guard, &clean), None);
+        assert_eq!(block_report("l", ProxyMode::Guard, &clean, None), None);
     }
 
     /// Reports only ever go to this host's loopback; `off` turns them off.
@@ -427,7 +485,7 @@ mod tests {
                 .unwrap();
             String::from_utf8_lossy(&seen).into_owned()
         });
-        let body = block_report("l", ProxyMode::Guard, &routed(CRED_CALL)).unwrap();
+        let body = block_report("l", ProxyMode::Guard, &routed(CRED_CALL), None).unwrap();
         send_report(&format!("http://127.0.0.1:{port}{PROXY_BLOCK_PATH}"), &body).unwrap();
         let request = server.join().unwrap();
         assert!(

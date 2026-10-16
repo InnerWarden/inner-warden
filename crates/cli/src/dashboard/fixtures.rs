@@ -75,24 +75,28 @@ fn origin_for(session: &str, rules: &[&'static str]) -> DecisionOrigin {
             agent: Some("claude-code".into()),
             project: Some("my-app".into()),
             rules,
+            ..DecisionOrigin::default()
         },
         S_INFRA => DecisionOrigin {
             channel: Some(DecisionChannel::Hook),
             agent: Some("claude-code".into()),
             project: Some("infra".into()),
             rules,
+            ..DecisionOrigin::default()
         },
         S_MCP => DecisionOrigin {
             channel: Some(DecisionChannel::Mcp),
             agent: Some("cursor".into()),
             project: None,
             rules,
+            ..DecisionOrigin::default()
         },
         _ => DecisionOrigin {
             channel: Some(DecisionChannel::Check),
             agent: None,
             project: None,
             rules,
+            ..DecisionOrigin::default()
         },
     }
 }
