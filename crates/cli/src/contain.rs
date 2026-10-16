@@ -763,6 +763,27 @@ mod tests {
         }
     }
 
+    /// The whole bwrap argument vector of today's jail, one token per line.
+    /// Written before the identity flag existed: a jail launched without the
+    /// flag must stay byte for byte this.
+    #[test]
+    fn golden_argv_of_the_jail_without_any_identity_flag() {
+        let plan = build_linux_jail(&inputs(&["claude", "--print"])).unwrap();
+        assert_eq!(plan.bwrap_args.join("\n"), GOLDEN_ARGV_PLAIN);
+        let mut rich = inputs(&["/bin/sh", "-c", "true"]);
+        rich.stdin_is_tty = false;
+        rich.agent_binary = Some(ResolvedBinary {
+            link: PathBuf::from("/home/dev/.local/bin/claude"),
+            target_dir: PathBuf::from("/home/dev/.local/share/claude/v1"),
+        });
+        rich.worktree = Some(Worktree {
+            git_dir: PathBuf::from("/home/dev/repo/.git/worktrees/w"),
+            common_dir: PathBuf::from("/home/dev/repo/.git"),
+        });
+        let plan = build_linux_jail(&rich).unwrap();
+        assert_eq!(plan.bwrap_args.join("\n"), GOLDEN_ARGV_RICH);
+    }
+
     #[test]
     fn parse_defaults_and_child_capture() {
         let a =
@@ -1127,4 +1148,191 @@ mod tests {
             .join("\n")
             .contains("profile bwrap /usr/local/bin/bwrap"));
     }
+
+    const GOLDEN_ARGV_PLAIN: &str = "\
+        --ro-bind\n\
+        /usr\n\
+        /usr\n\
+        --ro-bind\n\
+        /etc\n\
+        /etc\n\
+        --ro-bind\n\
+        /sys\n\
+        /sys\n\
+        --symlink\n\
+        usr/bin\n\
+        /bin\n\
+        --symlink\n\
+        usr/lib\n\
+        /lib\n\
+        --symlink\n\
+        usr/lib64\n\
+        /lib64\n\
+        --symlink\n\
+        usr/sbin\n\
+        /sbin\n\
+        --dev\n\
+        /dev\n\
+        --proc\n\
+        /proc\n\
+        --tmpfs\n\
+        /tmp\n\
+        --tmpfs\n\
+        /run\n\
+        --tmpfs\n\
+        /home/dev\n\
+        --bind\n\
+        /home/dev/.claude\n\
+        /home/dev/.claude\n\
+        --bind\n\
+        /home/dev/.config\n\
+        /home/dev/.config\n\
+        --bind\n\
+        /home/dev/.cache\n\
+        /home/dev/.cache\n\
+        --tmpfs\n\
+        /home/dev/.config/innerwarden\n\
+        --ro-bind\n\
+        /home/dev/.gitconfig\n\
+        /home/dev/.gitconfig\n\
+        --ro-bind\n\
+        /home/dev/.local/bin/innerwarden\n\
+        /home/dev/.local/bin/innerwarden\n\
+        --bind\n\
+        /home/dev/proj\n\
+        /home/dev/proj\n\
+        --chdir\n\
+        /home/dev/proj\n\
+        --tmpfs\n\
+        /home/dev/.aws\n\
+        --tmpfs\n\
+        /home/dev/.config/innerwarden\n\
+        --tmpfs\n\
+        /home/dev/.gnupg\n\
+        --tmpfs\n\
+        /home/dev/.mozilla\n\
+        --tmpfs\n\
+        /home/dev/.ssh\n\
+        --tmpfs\n\
+        /home/dev/.thunderbird\n\
+        --tmpfs\n\
+        /home/dev/Library/Mail\n\
+        --tmpfs\n\
+        /home/dev/Library/Messages\n\
+        --tmpfs\n\
+        /home/dev/Library/Safari\n\
+        --ro-bind\n\
+        /dev/null\n\
+        /home/dev/proj/.env\n\
+        --tmpfs\n\
+        /home/dev/proj/secrets\n\
+        --die-with-parent\n\
+        --unshare-pid\n\
+        --unshare-uts\n\
+        --unshare-ipc\n\
+        --hostname\n\
+        ai-sandbox\n\
+        --\n\
+        claude\n\
+        --print";
+    const GOLDEN_ARGV_RICH: &str = "\
+        --ro-bind\n\
+        /usr\n\
+        /usr\n\
+        --ro-bind\n\
+        /etc\n\
+        /etc\n\
+        --ro-bind\n\
+        /sys\n\
+        /sys\n\
+        --symlink\n\
+        usr/bin\n\
+        /bin\n\
+        --symlink\n\
+        usr/lib\n\
+        /lib\n\
+        --symlink\n\
+        usr/lib64\n\
+        /lib64\n\
+        --symlink\n\
+        usr/sbin\n\
+        /sbin\n\
+        --dev\n\
+        /dev\n\
+        --proc\n\
+        /proc\n\
+        --tmpfs\n\
+        /tmp\n\
+        --tmpfs\n\
+        /run\n\
+        --tmpfs\n\
+        /home/dev\n\
+        --bind\n\
+        /home/dev/.claude\n\
+        /home/dev/.claude\n\
+        --bind\n\
+        /home/dev/.config\n\
+        /home/dev/.config\n\
+        --bind\n\
+        /home/dev/.cache\n\
+        /home/dev/.cache\n\
+        --tmpfs\n\
+        /home/dev/.config/innerwarden\n\
+        --ro-bind\n\
+        /home/dev/.gitconfig\n\
+        /home/dev/.gitconfig\n\
+        --ro-bind\n\
+        /home/dev/.local/bin/claude\n\
+        /home/dev/.local/bin/claude\n\
+        --ro-bind\n\
+        /home/dev/.local/share/claude/v1\n\
+        /home/dev/.local/share/claude/v1\n\
+        --ro-bind\n\
+        /home/dev/.local/bin/innerwarden\n\
+        /home/dev/.local/bin/innerwarden\n\
+        --bind\n\
+        /home/dev/proj\n\
+        /home/dev/proj\n\
+        --chdir\n\
+        /home/dev/proj\n\
+        --bind\n\
+        /home/dev/repo/.git/worktrees/w\n\
+        /home/dev/repo/.git/worktrees/w\n\
+        --bind\n\
+        /home/dev/repo/.git\n\
+        /home/dev/repo/.git\n\
+        --tmpfs\n\
+        /home/dev/.aws\n\
+        --tmpfs\n\
+        /home/dev/.config/innerwarden\n\
+        --tmpfs\n\
+        /home/dev/.gnupg\n\
+        --tmpfs\n\
+        /home/dev/.mozilla\n\
+        --tmpfs\n\
+        /home/dev/.ssh\n\
+        --tmpfs\n\
+        /home/dev/.thunderbird\n\
+        --tmpfs\n\
+        /home/dev/Library/Mail\n\
+        --tmpfs\n\
+        /home/dev/Library/Messages\n\
+        --tmpfs\n\
+        /home/dev/Library/Safari\n\
+        --ro-bind\n\
+        /dev/null\n\
+        /home/dev/proj/.env\n\
+        --tmpfs\n\
+        /home/dev/proj/secrets\n\
+        --die-with-parent\n\
+        --unshare-pid\n\
+        --unshare-uts\n\
+        --unshare-ipc\n\
+        --hostname\n\
+        ai-sandbox\n\
+        --new-session\n\
+        --\n\
+        /bin/sh\n\
+        -c\n\
+        true";
 }
