@@ -626,6 +626,7 @@ fn launch_identified(
         }
     };
     let (program, args) = launch_argv(bwrap, &plan.bwrap_args, scope);
+    let started_ms = now_ms();
     let spawned = Command::new(&program)
         .args(&args)
         .envs(plan.env.iter().cloned())
@@ -652,12 +653,14 @@ fn launch_identified(
         InfoRead::Failed(why) => Err(why),
         InfoRead::Got(info) => identify(input, instance_id, unit, scope, info),
     };
+    let mut identified = false;
     match record {
         Ok(json) => {
             // The jail reads this to its end before it builds its root.
             if let Err(e) = record_writer.write_all(&json) {
                 eprintln!("innerwarden contain: the jail did not take its record: {e}");
             } else {
+                identified = true;
                 eprintln!(
                     "  inside the jail: {} (read-only)",
                     innerwarden_agent_guard::identity::JAIL_RECORD_PATH
@@ -669,7 +672,125 @@ fn launch_identified(
         ),
     }
     drop(record_writer);
-    Attempt::Done(exit_from(child.wait()))
+    let code = exit_from(child.wait());
+    if identified {
+        report_contained_run(input, instance_id, started_ms, now_ms());
+    }
+    Attempt::Done(code)
+}
+
+/// The launcher's clock, in ms since the epoch.
+#[cfg(target_os = "linux")]
+fn now_ms() -> u64 {
+    u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0)
+}
+
+/// Tell the local Active Defence agent, best effort, what the ended jail's
+/// hook screened: counts and times, `declared`. Only where Active Defence is
+/// installed and its route is on; the jail's graph is read only then.
+#[cfg(target_os = "linux")]
+fn report_contained_run(input: &JailInputs, instance_id: &str, started_ms: u64, ended_ms: u64) {
+    use crate::agent_report::{agent_route, send_report, AGENT_URL_VAR};
+    use crate::contain::launch::{contained_run_report_for, JailGraph};
+    use innerwarden_agent_guard::identity::CONTAINED_RUN_ROUTE;
+
+    if !crate::upsell_io::active_defence_installed() {
+        return;
+    }
+    let Some(url) = agent_route(
+        std::env::var(AGENT_URL_VAR).ok().as_deref(),
+        CONTAINED_RUN_ROUTE,
+    ) else {
+        return;
+    };
+    // SAFETY: getuid takes no arguments and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    let Some(body) =
+        contained_run_report_for(&input.args, instance_id, started_ms, ended_ms, || {
+            let read = read_jail_graph(&input.args.project, uid);
+            if let JailGraph::Unreadable(why) = &read {
+                eprintln!("innerwarden contain: the jail's graph was not read ({why})");
+            }
+            read
+        })
+    else {
+        return;
+    };
+    match send_report(&url, &body) {
+        Ok(()) if body["graph"] == "read" => eprintln!(
+            "innerwarden contain: {} command(s) screened in the jail, reported to the local agent as declared",
+            body["commands"]
+        ),
+        Ok(()) => eprintln!(
+            "innerwarden contain: the run was reported to the local agent with no count (the jail's graph is {})",
+            body["graph"].as_str().unwrap_or("unknown")
+        ),
+        Err(why) => {
+            eprintln!("innerwarden contain: the local agent did not take the run's report: {why}")
+        }
+    }
+}
+
+/// Read the jail's graph from the project once the jail has ended.
+///
+/// Everything in the project is the agent's to write, so this read is
+/// hardened like any read of a file someone else prepared: the graph folder
+/// must be a real folder of `uid` (not followed if it is a link), the file is
+/// opened once without following a link and without waiting on a FIFO, its
+/// facts come from that open, and no more than a graph's cap is read.
+#[cfg(unix)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn read_jail_graph(project: &Path, uid: u32) -> crate::contain::launch::JailGraph {
+    use crate::contain::launch::{
+        parse_jail_graph, vet_jail_graph_dir, vet_jail_graph_file, GraphEntry, JailGraph,
+        MAX_JAIL_GRAPH_BYTES,
+    };
+    use crate::contain::{jail_graph_dir, JAIL_GRAPH_NAME};
+    use std::io::Read;
+    use std::os::unix::fs::MetadataExt;
+
+    let entry = |m: &std::fs::Metadata| GraphEntry {
+        symlink: m.file_type().is_symlink(),
+        dir: m.is_dir(),
+        regular: innerwarden_safe_io::is_regular_file(m),
+        uid: m.uid(),
+        len: m.len(),
+    };
+    let dir = jail_graph_dir(project);
+    match std::fs::symlink_metadata(&dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return JailGraph::Absent,
+        Err(_) => return JailGraph::Unreadable("graph_dir_unreadable"),
+        Ok(m) => {
+            if let Err(why) = vet_jail_graph_dir(&entry(&m), uid) {
+                return JailGraph::Unreadable(why);
+            }
+        }
+    }
+    let file = match innerwarden_safe_io::open_no_follow(&dir.join(JAIL_GRAPH_NAME)) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return JailGraph::Absent,
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+            return JailGraph::Unreadable("graph_not_a_regular_file")
+        }
+        Err(_) => return JailGraph::Unreadable("graph_unreadable"),
+    };
+    match file.metadata() {
+        Ok(m) => {
+            if let Err(why) = vet_jail_graph_file(&entry(&m), uid) {
+                return JailGraph::Unreadable(why);
+            }
+        }
+        Err(_) => return JailGraph::Unreadable("graph_unreadable"),
+    }
+    let mut bytes = Vec::new();
+    if file
+        .take(MAX_JAIL_GRAPH_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .is_err()
+    {
+        return JailGraph::Unreadable("graph_unreadable");
+    }
+    parse_jail_graph(&bytes)
 }
 
 /// Read the facts about the jail from the host, make the record, write the
@@ -1293,5 +1414,86 @@ mod tests {
         symlink(&victim, guarded.join(format!(".{id}.tmp"))).unwrap();
         assert!(write_launch_record(&guarded, id, b"{}", me()).is_err());
         assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+    }
+
+    /// The jail's graph is read from a real folder and file of the user, and
+    /// whatever else the agent may have left there is refused without being
+    /// followed or waited on.
+    #[cfg(unix)]
+    #[test]
+    fn the_jails_graph_is_read_only_from_a_real_file_of_the_user() {
+        use crate::contain::launch::JailGraph;
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("proj");
+        std::fs::create_dir(&project).unwrap();
+        assert_eq!(read_jail_graph(&project, me()), JailGraph::Absent);
+
+        let dir = project.join(".innerwarden");
+        std::fs::create_dir(&dir).unwrap();
+        assert_eq!(read_jail_graph(&project, me()), JailGraph::Absent);
+
+        let graph = dir.join("graph.json");
+        std::fs::write(&graph, br#"{"nodes":[],"edges":[]}"#).unwrap();
+        assert_eq!(
+            read_jail_graph(&project, me()),
+            JailGraph::Read(innerwarden_graph::Graph::default())
+        );
+        assert_eq!(
+            read_jail_graph(&project, me() + 1),
+            JailGraph::Unreadable("graph_dir_not_owned"),
+            "another user's folder"
+        );
+
+        std::fs::write(&graph, b"{not a graph").unwrap();
+        assert_eq!(
+            read_jail_graph(&project, me()),
+            JailGraph::Unreadable("graph_malformed")
+        );
+
+        // the file is a link to another file of the user's
+        let elsewhere = root.path().join("elsewhere.json");
+        std::fs::write(&elsewhere, br#"{"nodes":[],"edges":[]}"#).unwrap();
+        std::fs::remove_file(&graph).unwrap();
+        symlink(&elsewhere, &graph).unwrap();
+        assert_eq!(
+            read_jail_graph(&project, me()),
+            JailGraph::Unreadable("graph_not_a_regular_file")
+        );
+
+        // a FIFO: refused at once, never waited on
+        std::fs::remove_file(&graph).unwrap();
+        let made = std::process::Command::new("mkfifo")
+            .arg(&graph)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let started = std::time::Instant::now();
+        assert_eq!(
+            read_jail_graph(&project, me()),
+            JailGraph::Unreadable("graph_not_a_regular_file")
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+
+        // a folder in the file's place
+        std::fs::remove_file(&graph).unwrap();
+        std::fs::create_dir(&graph).unwrap();
+        assert_eq!(
+            read_jail_graph(&project, me()),
+            JailGraph::Unreadable("graph_not_a_regular_file")
+        );
+
+        // the folder itself is a link to a folder with a good graph in it
+        let real = root.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::write(real.join("graph.json"), br#"{"nodes":[],"edges":[]}"#).unwrap();
+        std::fs::remove_dir(&graph).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+        symlink(&real, &dir).unwrap();
+        assert_eq!(
+            read_jail_graph(&project, me()),
+            JailGraph::Unreadable("graph_dir_is_a_symlink")
+        );
     }
 }

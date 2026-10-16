@@ -245,8 +245,22 @@ impl JailInputs {
     }
     /// The graph file the in-jail hook writes to (project-local, writable).
     fn jail_graph_file(&self) -> PathBuf {
-        self.args.project.join(".innerwarden/graph.json")
+        jail_graph_dir(&self.args.project).join(JAIL_GRAPH_NAME)
     }
+}
+
+/// The folder, inside the project, where the jail's hook keeps its graph.
+pub const JAIL_GRAPH_DIR: &str = ".innerwarden";
+
+/// The jail's graph file, in [`JAIL_GRAPH_DIR`].
+pub const JAIL_GRAPH_NAME: &str = "graph.json";
+
+/// The session everything screened inside the jail is grouped under.
+pub const JAIL_SESSION: &str = "contain";
+
+/// [`JAIL_GRAPH_DIR`] of `project`.
+pub fn jail_graph_dir(project: &Path) -> PathBuf {
+    project.join(JAIL_GRAPH_DIR)
 }
 
 /// The dotdirs re-bound read-write after the HOME tmpfs (tool + agent state).
@@ -733,7 +747,7 @@ pub fn compute_jail_env(input: &JailInputs) -> Vec<(String, String)> {
         ),
         ("IW_LLM_CONFIG".to_string(), String::new()),
         ("IW_NOTIFY_CONFIG".to_string(), String::new()),
-        ("IW_GUARD_SESSION".to_string(), "contain".to_string()),
+        ("IW_GUARD_SESSION".to_string(), JAIL_SESSION.to_string()),
     ]
 }
 
@@ -1234,6 +1248,162 @@ pub mod launch {
         };
         record.validate().map_err(AssembleError::Record)?;
         Ok(record)
+    }
+
+    // -- after the jail: what its hook screened ------------------------------
+    //
+    // The hook inside the jail writes its graph into the project, which the
+    // agent can write too, so everything read from it is the jail's own word.
+    // The launcher reads it only once the jail has ended: the jail's PID
+    // namespace is gone then, so no process of the jail is left to change the
+    // file while it is read. It counts, and sends counts; it copies nothing,
+    // and it never writes the host's shared graph.
+
+    /// The most bytes of the jail's graph read: the cap every writer of a
+    /// graph prunes to.
+    pub const MAX_JAIL_GRAPH_BYTES: u64 = innerwarden_graph::Graph::MAX_BYTES as u64;
+
+    /// One entry on the way to the jail's graph, described without following
+    /// a link.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct GraphEntry {
+        pub symlink: bool,
+        pub dir: bool,
+        pub regular: bool,
+        pub uid: u32,
+        pub len: u64,
+    }
+
+    /// What the launcher found where the jail's hook keeps its graph.
+    #[derive(Debug, Clone, PartialEq)]
+    pub enum JailGraph {
+        Absent,
+        /// There, and refused, with a stable reason code.
+        Unreadable(&'static str),
+        Read(innerwarden_graph::Graph),
+    }
+
+    /// The project's graph folder may be read only if it is a real folder of
+    /// the launching user: a link there could aim the read at another file.
+    pub fn vet_jail_graph_dir(entry: &GraphEntry, uid: u32) -> Result<(), &'static str> {
+        if entry.symlink {
+            return Err("graph_dir_is_a_symlink");
+        }
+        if !entry.dir {
+            return Err("graph_dir_not_a_directory");
+        }
+        if entry.uid != uid {
+            return Err("graph_dir_not_owned");
+        }
+        Ok(())
+    }
+
+    /// The graph file, as opened (no link followed): a regular file of the
+    /// launching user, no larger than a graph can be.
+    pub fn vet_jail_graph_file(entry: &GraphEntry, uid: u32) -> Result<(), &'static str> {
+        if entry.symlink || !entry.regular {
+            return Err("graph_not_a_regular_file");
+        }
+        if entry.uid != uid {
+            return Err("graph_not_owned");
+        }
+        if entry.len > MAX_JAIL_GRAPH_BYTES {
+            return Err("graph_too_large");
+        }
+        Ok(())
+    }
+
+    /// The graph in `bytes`. An empty file is an empty graph; anything that
+    /// is not a graph is refused, never read as zero.
+    pub fn parse_jail_graph(bytes: &[u8]) -> JailGraph {
+        if bytes.len() as u64 > MAX_JAIL_GRAPH_BYTES {
+            return JailGraph::Unreadable("graph_too_large");
+        }
+        if bytes.iter().all(u8::is_ascii_whitespace) {
+            return JailGraph::Read(innerwarden_graph::Graph::default());
+        }
+        std::str::from_utf8(bytes)
+            .ok()
+            .and_then(|json| innerwarden_graph::Graph::from_json(json).ok())
+            .map(JailGraph::Read)
+            .unwrap_or(JailGraph::Unreadable("graph_malformed"))
+    }
+
+    /// The commands of this instance in the jail's graph, and the newest.
+    ///
+    /// A command counts when it was recorded inside the launch window and is
+    /// this instance's: it carries this instance's `instance_id`, or it
+    /// carries none and the jail's session ran it. A command labelled with
+    /// another instance never counts, and neither does one with no time.
+    pub fn count_contained_run(
+        graph: &innerwarden_graph::Graph,
+        instance_id: &str,
+        started_ms: u64,
+        ended_ms: u64,
+    ) -> (u32, Option<u64>) {
+        let session = format!("session:{}", super::JAIL_SESSION);
+        let ran: std::collections::HashSet<&str> = graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == "ran" && e.from == session)
+            .map(|e| e.to.as_str())
+            .collect();
+        let mut commands: u32 = 0;
+        let mut last: Option<u64> = None;
+        for node in graph.nodes.iter().filter(|n| n.kind == "command") {
+            let ours = match node.attrs.get("instance_id") {
+                Some(labelled) => labelled == instance_id,
+                None => ran.contains(node.id.as_str()),
+            };
+            let Some(at) = node
+                .attrs
+                .get("recorded_at_ms")
+                .and_then(|ms| ms.parse::<u64>().ok())
+            else {
+                continue;
+            };
+            if !ours || at < started_ms || at > ended_ms {
+                continue;
+            }
+            commands = commands.saturating_add(1);
+            last = Some(last.map_or(at, |l| l.max(at)));
+        }
+        (commands, last)
+    }
+
+    /// The report of an ended identified run, or `None`.
+    ///
+    /// Without `--identity` this is `None` and `read_graph` is never called:
+    /// a jail launched without the flag reads no new file and sends nothing.
+    pub fn contained_run_report_for(
+        args: &super::ContainArgs,
+        instance_id: &str,
+        started_ms: u64,
+        ended_ms: u64,
+        read_graph: impl FnOnce() -> JailGraph,
+    ) -> Option<serde_json::Value> {
+        use innerwarden_agent_guard::identity::{
+            contained_run_report, ContainedRun, JailGraphState,
+        };
+        if !args.identity {
+            return None;
+        }
+        let (graph, (commands, last_ms)) = match read_graph() {
+            JailGraph::Absent => (JailGraphState::Absent, (0, None)),
+            JailGraph::Unreadable(_) => (JailGraphState::Unreadable, (0, None)),
+            JailGraph::Read(g) => (
+                JailGraphState::Read,
+                count_contained_run(&g, instance_id, started_ms, ended_ms),
+            ),
+        };
+        contained_run_report(&ContainedRun {
+            instance_id,
+            started_ms,
+            ended_ms,
+            graph,
+            commands,
+            last_ms,
+        })
     }
 }
 
@@ -2295,6 +2465,253 @@ mod tests {
         ] {
             assert!(no_scope_sentence(why).contains(why.why()), "{why:?}");
         }
+    }
+
+    // -- after the jail ------------------------------------------------------
+
+    const OURS: &str = "0123456789abcdef0123456789abcdef";
+    const OTHER: &str = "fedcba9876543210fedcba9876543210";
+
+    fn command(id: &str, at: Option<u64>, instance: Option<&str>) -> innerwarden_graph::Node {
+        let mut attrs = std::collections::BTreeMap::new();
+        if let Some(at) = at {
+            attrs.insert("recorded_at_ms".to_string(), at.to_string());
+        }
+        if let Some(instance) = instance {
+            attrs.insert("instance_id".to_string(), instance.to_string());
+        }
+        innerwarden_graph::Node {
+            id: id.to_string(),
+            kind: "command".to_string(),
+            label: "ls".to_string(),
+            attrs,
+        }
+    }
+
+    fn ran(from: &str, to: &str) -> innerwarden_graph::Edge {
+        innerwarden_graph::Edge {
+            from: from.to_string(),
+            to: to.to_string(),
+            kind: "ran".to_string(),
+        }
+    }
+
+    /// A jail graph of runs in the window 1000..=9000 and around it.
+    fn jail_graph() -> innerwarden_graph::Graph {
+        let mut labelled_elsewhere = command("cmd:x:1", Some(6_000), Some(OURS));
+        labelled_elsewhere.kind = "category".to_string();
+        innerwarden_graph::Graph {
+            nodes: vec![
+                // counts: the jail's session ran it inside the window
+                command("cmd:contain:1", Some(5_000), None),
+                // counts: labelled with this instance, whatever the session
+                command("cmd:labelled:1", Some(7_000), Some(OURS)),
+                // the edges of the window count too
+                command("cmd:contain:2", Some(1_000), None),
+                command("cmd:contain:3", Some(9_000), None),
+                // does not count: before and after the window
+                command("cmd:contain:4", Some(999), None),
+                command("cmd:contain:5", Some(9_001), None),
+                // does not count: no time
+                command("cmd:contain:6", None, None),
+                // does not count: labelled with another instance
+                command("cmd:contain:7", Some(5_000), Some(OTHER)),
+                // does not count: another session ran it, no label
+                command("cmd:local:1", Some(5_000), None),
+                // does not count: not a command
+                labelled_elsewhere,
+            ],
+            edges: vec![
+                ran("session:contain", "cmd:contain:1"),
+                ran("session:contain", "cmd:contain:2"),
+                ran("session:contain", "cmd:contain:3"),
+                ran("session:contain", "cmd:contain:4"),
+                ran("session:contain", "cmd:contain:5"),
+                ran("session:contain", "cmd:contain:6"),
+                ran("session:contain", "cmd:contain:7"),
+                ran("session:local", "cmd:local:1"),
+                ran("session:x", "cmd:labelled:1"),
+            ],
+        }
+    }
+
+    /// Only this instance's commands, inside its window, count.
+    ///
+    /// FAILS ON REVERT: drop the window and the commands of earlier runs in
+    /// the same project count; take any label for the session's own and
+    /// another instance's commands count.
+    #[test]
+    fn a_contained_run_counts_only_this_instance_inside_its_window() {
+        use launch::count_contained_run;
+        assert_eq!(
+            count_contained_run(&jail_graph(), OURS, 1_000, 9_000),
+            (4, Some(9_000))
+        );
+        assert_eq!(
+            count_contained_run(&jail_graph(), OURS, 4_000, 6_000),
+            (1, Some(5_000))
+        );
+        assert_eq!(
+            count_contained_run(&jail_graph(), OTHER, 4_000, 6_000),
+            (2, Some(5_000)),
+            "the other instance's own label, and the session's unlabelled command"
+        );
+        assert_eq!(
+            count_contained_run(&innerwarden_graph::Graph::default(), OURS, 0, u64::MAX),
+            (0, None)
+        );
+        assert_eq!(JAIL_SESSION, "contain");
+    }
+
+    /// Without `--identity` the jail's graph is never read and nothing is
+    /// reported; with it, it is read once.
+    ///
+    /// FAILS ON REVERT: drop the flag check and a jail launched without the
+    /// flag reads the project graph and builds a report.
+    #[test]
+    fn without_identity_the_jails_graph_is_not_read_and_nothing_is_reported() {
+        use launch::{contained_run_report_for, JailGraph};
+        let reads = std::cell::Cell::new(0);
+        let read = || {
+            reads.set(reads.get() + 1);
+            JailGraph::Read(jail_graph())
+        };
+        let off = args(&["claude"]);
+        assert!(!off.identity);
+        assert_eq!(
+            contained_run_report_for(&off, OURS, 1_000, 9_000, read),
+            None
+        );
+        assert_eq!(reads.get(), 0, "the graph was read without --identity");
+
+        let on = ContainArgs {
+            identity: true,
+            ..args(&["claude"])
+        };
+        let body = contained_run_report_for(&on, OURS, 1_000, 9_000, || {
+            reads.set(reads.get() + 1);
+            JailGraph::Read(jail_graph())
+        })
+        .expect("a report");
+        assert_eq!(reads.get(), 1);
+        assert_eq!(body["commands"], 4);
+        assert_eq!(body["last_ms"], 9_000);
+        assert_eq!(body["trust"], "declared");
+        assert_eq!(body["graph"], "read");
+    }
+
+    /// A graph that is not there or not readable is said, with no count.
+    #[test]
+    fn a_jail_graph_that_was_not_read_reports_no_count() {
+        use launch::{contained_run_report_for, JailGraph};
+        let on = ContainArgs {
+            identity: true,
+            ..args(&["claude"])
+        };
+        for (read, state) in [
+            (JailGraph::Absent, "absent"),
+            (JailGraph::Unreadable("graph_malformed"), "unreadable"),
+        ] {
+            let body = contained_run_report_for(&on, OURS, 1_000, 9_000, || read).unwrap();
+            assert_eq!(body["graph"], state);
+            assert_eq!(body["commands"], 0);
+            assert_eq!(body["last_ms"], serde_json::Value::Null);
+            assert_eq!(body["trust"], "declared");
+        }
+    }
+
+    fn entry(symlink: bool, dir: bool, regular: bool, uid: u32, len: u64) -> launch::GraphEntry {
+        launch::GraphEntry {
+            symlink,
+            dir,
+            regular,
+            uid,
+            len,
+        }
+    }
+
+    /// The graph folder and file must be the launching user's, real, and
+    /// bounded: each case is a good one with one fact changed.
+    ///
+    /// FAILS ON REVERT: drop a check and its case is read.
+    #[test]
+    fn the_jail_graph_folder_and_file_are_vetted() {
+        use launch::{vet_jail_graph_dir, vet_jail_graph_file, MAX_JAIL_GRAPH_BYTES};
+        assert_eq!(
+            vet_jail_graph_dir(&entry(false, true, false, 1000, 0), 1000),
+            Ok(())
+        );
+        for (dir, why) in [
+            (entry(true, false, false, 1000, 0), "graph_dir_is_a_symlink"),
+            (
+                entry(false, false, true, 1000, 0),
+                "graph_dir_not_a_directory",
+            ),
+            (entry(false, true, false, 0, 0), "graph_dir_not_owned"),
+        ] {
+            assert_eq!(vet_jail_graph_dir(&dir, 1000), Err(why));
+        }
+        let good = entry(false, false, true, 1000, MAX_JAIL_GRAPH_BYTES);
+        assert_eq!(vet_jail_graph_file(&good, 1000), Ok(()));
+        for (file, why) in [
+            (
+                entry(true, false, false, 1000, 10),
+                "graph_not_a_regular_file",
+            ),
+            (
+                entry(false, true, false, 1000, 10),
+                "graph_not_a_regular_file",
+            ),
+            (entry(false, false, true, 1001, 10), "graph_not_owned"),
+            (
+                entry(false, false, true, 1000, MAX_JAIL_GRAPH_BYTES + 1),
+                "graph_too_large",
+            ),
+        ] {
+            assert_eq!(vet_jail_graph_file(&file, 1000), Err(why));
+        }
+    }
+
+    /// What is not a graph is refused, never read as an empty one.
+    #[test]
+    fn a_jail_graph_is_parsed_or_refused() {
+        use launch::{parse_jail_graph, JailGraph};
+        assert_eq!(
+            parse_jail_graph(b"  \n"),
+            JailGraph::Read(innerwarden_graph::Graph::default())
+        );
+        let json = jail_graph().to_json();
+        assert_eq!(
+            parse_jail_graph(json.as_bytes()),
+            JailGraph::Read(jail_graph())
+        );
+        for bad in [&b"not json"[..], b"[1,2]", b"\xff\xfe{}"] {
+            assert_eq!(
+                parse_jail_graph(bad),
+                JailGraph::Unreadable("graph_malformed"),
+                "{bad:?}"
+            );
+        }
+    }
+
+    /// The identity flag adds no variable to the jail: its environment is the
+    /// same with and without it.
+    #[test]
+    fn identity_adds_nothing_to_the_jails_environment() {
+        let plain = build_linux_jail(&inputs(&["claude"])).unwrap().env;
+        let mut identified = inputs(&["claude"]);
+        identified.args.identity = true;
+        assert_eq!(build_linux_jail(&identified).unwrap().env, plain);
+        assert_eq!(
+            plain,
+            [
+                ("IW_GRAPH_FILE", "/home/dev/proj/.innerwarden/graph.json"),
+                ("IW_LLM_CONFIG", ""),
+                ("IW_NOTIFY_CONFIG", ""),
+                ("IW_GUARD_SESSION", "contain"),
+            ]
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+        );
     }
 
     const GOLDEN_ARGV_PLAIN: &str = "\

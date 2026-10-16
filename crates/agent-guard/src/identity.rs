@@ -108,6 +108,90 @@ pub fn system_scope_request(instance_id: &str) -> Option<serde_json::Value> {
     is_instance_id(instance_id).then(|| serde_json::json!({ "instance": instance_id }))
 }
 
+/// The local route a launcher calls, best effort, once an identified jail has
+/// ended, to tell the Active Defence agent on the same host what the jail's
+/// hook screened.
+///
+/// The hook inside the jail keeps its record in the project, a folder the
+/// agent can write, so what the launcher reads there is the jail's own word.
+/// The report therefore says `declared` and nothing else can make it say more:
+/// [`contained_run_report`] has no trust to pass in. It carries counts and
+/// times only, never a command, so a forged project graph can change two
+/// numbers in it and nothing else. The launcher never writes the host's
+/// shared graph for the jail.
+pub const CONTAINED_RUN_ROUTE: &str = "/api/agent/contain-run";
+
+/// Where a [`contained_run_report`]'s counts come from.
+pub const CONTAINED_RUN_SOURCE: &str = "project_graph";
+
+/// What the launcher found where the jail's hook keeps its graph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JailGraphState {
+    /// Read and parsed: the counts are what it holds.
+    Read,
+    /// Nothing there: the hook recorded nothing.
+    Absent,
+    /// There and refused (a link, not a regular file, not the user's, too
+    /// large, not a graph): no count can be given, which is not zero.
+    Unreadable,
+}
+
+impl JailGraphState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            JailGraphState::Read => "read",
+            JailGraphState::Absent => "absent",
+            JailGraphState::Unreadable => "unreadable",
+        }
+    }
+}
+
+/// One ended run of an identified jail, as the launcher counted it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContainedRun<'a> {
+    pub instance_id: &'a str,
+    /// The launcher's clock just before the jail was started, in ms.
+    pub started_ms: u64,
+    /// The launcher's clock once the jail had ended, in ms.
+    pub ended_ms: u64,
+    pub graph: JailGraphState,
+    /// Commands the hook recorded for this instance, inside the window.
+    pub commands: u32,
+    /// The newest of them, in ms.
+    pub last_ms: Option<u64>,
+}
+
+/// The body of a report to [`CONTAINED_RUN_ROUTE`], or `None` when the run
+/// does not describe itself consistently: an id that is not an id, a window
+/// that ends before it starts, a newest command outside the window, or a
+/// count for a graph that was not read.
+///
+/// ```json
+/// {"instance": "<id>", "source": "project_graph", "trust": "declared",
+///  "graph": "read", "commands": 3, "last_ms": 1760000000000,
+///  "started_ms": 1759999990000, "ended_ms": 1760000005000}
+/// ```
+pub fn contained_run_report(run: &ContainedRun<'_>) -> Option<serde_json::Value> {
+    let window = run.started_ms..=run.ended_ms;
+    let consistent = is_instance_id(run.instance_id)
+        && run.started_ms <= run.ended_ms
+        && run.last_ms.is_none_or(|ms| window.contains(&ms))
+        && (run.commands == 0) == run.last_ms.is_none()
+        && (run.graph == JailGraphState::Read || run.commands == 0);
+    consistent.then(|| {
+        serde_json::json!({
+            "instance": run.instance_id,
+            "source": CONTAINED_RUN_SOURCE,
+            "trust": Trust::Declared.as_str(),
+            "graph": run.graph.as_str(),
+            "commands": run.commands,
+            "last_ms": run.last_ms,
+            "started_ms": run.started_ms,
+            "ended_ms": run.ended_ms,
+        })
+    })
+}
+
 // ---------------------------------------------------------------------------
 // The two axes
 // ---------------------------------------------------------------------------
@@ -1286,6 +1370,125 @@ mod tests {
             system_scope_request("7f3a9c1e-42").unwrap(),
             json!({ "instance": "7f3a9c1e-42" })
         );
+    }
+
+    fn ended_run(commands: u32, last_ms: Option<u64>) -> ContainedRun<'static> {
+        ContainedRun {
+            instance_id: "0123456789abcdef0123456789abcdef",
+            started_ms: 1_000,
+            ended_ms: 9_000,
+            graph: JailGraphState::Read,
+            commands,
+            last_ms,
+        }
+    }
+
+    /// The report of an ended run says `declared` whatever it counts, and
+    /// carries counts and times, never a command.
+    #[test]
+    fn a_contained_run_report_is_declared_whatever_it_counts() {
+        assert_eq!(CONTAINED_RUN_ROUTE, "/api/agent/contain-run");
+        assert_eq!(
+            contained_run_report(&ended_run(3, Some(8_000))).unwrap(),
+            json!({
+                "instance": "0123456789abcdef0123456789abcdef",
+                "source": "project_graph",
+                "trust": "declared",
+                "graph": "read",
+                "commands": 3,
+                "last_ms": 8_000,
+                "started_ms": 1_000,
+                "ended_ms": 9_000,
+            })
+        );
+        for run in [
+            ended_run(0, None),
+            ended_run(u32::MAX, Some(9_000)),
+            ended_run(1, Some(1_000)),
+            ContainedRun {
+                graph: JailGraphState::Absent,
+                ..ended_run(0, None)
+            },
+            ContainedRun {
+                graph: JailGraphState::Unreadable,
+                ..ended_run(0, None)
+            },
+        ] {
+            let body = contained_run_report(&run).expect("a consistent run");
+            assert_eq!(body["trust"], "declared", "{body}");
+            assert_eq!(body["source"], "project_graph", "{body}");
+            assert_eq!(body["graph"], run.graph.as_str(), "{body}");
+            let keys: Vec<&str> = body
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            assert_eq!(
+                keys,
+                [
+                    "commands",
+                    "ended_ms",
+                    "graph",
+                    "instance",
+                    "last_ms",
+                    "source",
+                    "started_ms",
+                    "trust"
+                ]
+            );
+        }
+    }
+
+    /// A run that does not describe itself consistently is not reported:
+    /// each case is a consistent run with exactly one thing wrong.
+    ///
+    /// FAILS ON REVERT: drop any clause of the check and its case is sent.
+    #[test]
+    fn an_inconsistent_run_makes_no_report() {
+        let cases: [(&str, ContainedRun<'static>); 8] = [
+            (
+                "the id is a path",
+                ContainedRun {
+                    instance_id: "../x",
+                    ..ended_run(0, None)
+                },
+            ),
+            (
+                "the window ends before it starts",
+                ContainedRun {
+                    started_ms: 9_001,
+                    ..ended_run(0, None)
+                },
+            ),
+            (
+                "the newest command is after the end",
+                ended_run(1, Some(9_001)),
+            ),
+            (
+                "the newest command is before the start",
+                ended_run(1, Some(999)),
+            ),
+            ("commands without a newest one", ended_run(2, None)),
+            ("a newest one without commands", ended_run(0, Some(5_000))),
+            (
+                "a count from a graph that was refused",
+                ContainedRun {
+                    graph: JailGraphState::Unreadable,
+                    ..ended_run(1, Some(5_000))
+                },
+            ),
+            (
+                "a count from a graph that was not there",
+                ContainedRun {
+                    graph: JailGraphState::Absent,
+                    ..ended_run(1, Some(5_000))
+                },
+            ),
+        ];
+        for (wrong, run) in cases {
+            assert_eq!(contained_run_report(&run), None, "{wrong}");
+        }
     }
 
     /// A backend with no PID namespace cannot claim one.
