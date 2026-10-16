@@ -192,6 +192,7 @@ fn resolve_inputs(args: ContainArgs, home: PathBuf, iw_binary: PathBuf) -> JailI
         existing_paths,
         iw_config_real,
         deny_paths,
+        info_fd: None,
     }
 }
 
@@ -380,7 +381,18 @@ fn backend_trusted(facts: &BackendFacts) -> bool {
 }
 
 fn run_linux(input: &JailInputs) -> ExitCode {
-    let plan = match build_linux_jail(input) {
+    // A dry run with `--identity` shows the argument the real run adds.
+    let dry_identity;
+    let planned = if input.args.identity && input.args.dry_run {
+        dry_identity = JailInputs {
+            info_fd: Some(crate::contain::launch::DRY_RUN_INFO_FD),
+            ..input.clone()
+        };
+        &dry_identity
+    } else {
+        input
+    };
+    let plan = match build_linux_jail(planned) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("innerwarden contain: {e}");
@@ -417,12 +429,234 @@ fn run_linux(input: &JailInputs) -> ExitCode {
         }
         return ExitCode::from(1);
     }
+    #[cfg(target_os = "linux")]
+    if input.args.identity {
+        return run_linux_identified(input, &bwrap);
+    }
     announce(input);
     let status = Command::new(bwrap)
         .args(&plan.bwrap_args)
         .envs(plan.env.iter().cloned())
         .status();
     exit_from(status)
+}
+
+// ---------------------------------------------------------------------------
+// `contain --identity`: the thin I/O around the pure record parts in
+// `contain::launch`.
+// ---------------------------------------------------------------------------
+
+/// Write one launch record under `dir`, readable by its owner only.
+///
+/// The directory is the launcher's own: created `0700` if missing, and refused
+/// if it is a symlink, someone else's, or writable by anyone but its owner. The
+/// record goes to a temp name opened `O_EXCL | O_NOFOLLOW` at `0600`, is synced,
+/// then renamed into place, so a reader sees either no record or a whole one.
+#[cfg(unix)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn write_launch_record(
+    dir: &Path,
+    instance_id: &str,
+    json: &[u8],
+    owner_uid: u32,
+) -> std::io::Result<PathBuf> {
+    use std::io::{Error, ErrorKind, Write};
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+
+    let target = crate::contain::launch::record_path(dir, instance_id)
+        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "not an instance id"))?;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    // symlink_metadata: a symlinked directory is described, not followed.
+    let meta = std::fs::symlink_metadata(dir)?;
+    if !meta.is_dir() || meta.uid() != owner_uid || meta.mode() & 0o022 != 0 {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            format!(
+                "{} is not a directory of its own that only its owner can write",
+                dir.display()
+            ),
+        ));
+    }
+    let temp = dir.join(format!(".{instance_id}.tmp"));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true).mode(0o600);
+    innerwarden_safe_io::harden(&mut options);
+    let mut file = options.open(&temp)?;
+    let written = file
+        .write_all(json)
+        .and_then(|()| file.sync_all())
+        .and_then(|()| std::fs::rename(&temp, &target));
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&temp);
+        return Err(e);
+    }
+    Ok(target)
+}
+
+/// Run the jail with `--identity`: bwrap reports the jail's first process
+/// through a pipe, the launcher reads that process's start time and PID
+/// namespace from the host's `/proc`, and writes the record. The jail itself is
+/// built exactly as without the flag, plus `--info-fd`.
+///
+/// A record that cannot be made is said, not hidden, and the jail still runs:
+/// an instance with no record is an unidentified one, which is what every
+/// instance was before.
+#[cfg(target_os = "linux")]
+fn run_linux_identified(input: &JailInputs, bwrap: &Path) -> ExitCode {
+    use std::os::fd::AsRawFd;
+
+    let (mut reader, writer) = match std::io::pipe() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("innerwarden contain: cannot open the info pipe: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    // The write end must survive the exec of bwrap; std opens both ends close-on-exec.
+    // SAFETY: fcntl on a descriptor this function owns.
+    let inheritable = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_SETFD, 0) } == 0;
+    if !inheritable {
+        eprintln!("innerwarden contain: cannot hand the info pipe to bwrap");
+        return ExitCode::from(1);
+    }
+    let mut identified = input.clone();
+    identified.info_fd = Some(writer.as_raw_fd());
+    let plan = match build_linux_jail(&identified) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("innerwarden contain: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    announce(input);
+    let mut child = match Command::new(bwrap)
+        .args(&plan.bwrap_args)
+        .envs(plan.env.iter().cloned())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => return exit_from(Err(e)),
+    };
+    // Ours must close, or the read below never sees the end of the stream.
+    drop(writer);
+    match record_the_instance(input, &mut reader) {
+        Ok(path) => eprintln!("innerwarden contain - instance record: {}", path.display()),
+        Err(why) => eprintln!(
+            "innerwarden contain: no instance record written ({why}); the jail runs, unidentified"
+        ),
+    }
+    drop(reader);
+    exit_from(child.wait())
+}
+
+#[cfg(target_os = "linux")]
+fn record_the_instance(
+    input: &JailInputs,
+    reader: &mut std::io::PipeReader,
+) -> Result<PathBuf, String> {
+    use crate::contain::launch::{
+        assemble_record, instance_id_from, parse_ns_link, parse_start_ticks, records_dir,
+        LaunchFacts,
+    };
+
+    let info = read_info(reader)?;
+    let pid = info.child_pid;
+    // Start time before and after the namespace: the same process both times,
+    // or the pid was reused and nothing here describes the jail.
+    let stat = |pid: u32| std::fs::read_to_string(format!("/proc/{pid}/stat"));
+    let before = stat(pid)
+        .ok()
+        .and_then(|s| parse_start_ticks(&s))
+        .ok_or("the jail process is gone or its start time is unreadable")?;
+    let pid_ns = std::fs::read_link(format!("/proc/{pid}/ns/pid"))
+        .ok()
+        .and_then(|l| parse_ns_link(&l.to_string_lossy()))
+        .ok_or("the jail's PID namespace is unreadable")?;
+    let after = stat(pid).ok().and_then(|s| parse_start_ticks(&s));
+    if after != Some(before) {
+        return Err("the jail process changed while it was read".into());
+    }
+
+    let mut random = [0u8; 16];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut random))
+        .map_err(|e| format!("no randomness for the instance id: {e}"))?;
+    let launcher_root_owned =
+        backend_facts(&input.iw_binary).is_some_and(|facts| backend_trusted(&facts));
+    // SAFETY: getuid takes no arguments and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    let facts = LaunchFacts {
+        instance_id: instance_id_from(random),
+        agent_type: &input.args.agent,
+        launcher_path: &input.iw_binary,
+        launcher_version: env!("CARGO_PKG_VERSION"),
+        launcher_root_owned,
+        uid,
+        project: &input.args.project,
+        mode: &input.args.mode,
+        started_at: chrono::Utc::now(),
+        info,
+        start_ticks: before,
+        pid_ns,
+    };
+    let record = assemble_record(facts).map_err(|e| e.to_string())?;
+    let json = serde_json::to_vec(&record).map_err(|e| e.to_string())?;
+    let dir = records_dir(std::env::var("XDG_STATE_HOME").ok().as_deref(), &input.home);
+    write_launch_record(&dir, &record.instance_id, &json, uid).map_err(|e| e.to_string())
+}
+
+/// Read bwrap's report: until it parses, the stream ends, or ten seconds pass.
+#[cfg(target_os = "linux")]
+fn read_info(reader: &mut std::io::PipeReader) -> Result<crate::contain::launch::InfoFd, String> {
+    use crate::contain::launch::{parse_info_fd, InfoError, MAX_INFO_BYTES};
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    use std::time::{Duration, Instant};
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut got: Vec<u8> = Vec::new();
+    loop {
+        match parse_info_fd(&got) {
+            Ok(info) => return Ok(info),
+            Err(InfoError::TooLarge) => return Err(InfoError::TooLarge.to_string()),
+            Err(_) => {}
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err("bwrap did not report the jail in time".into());
+        }
+        let mut poll = libc::pollfd {
+            fd: reader.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let millis = i32::try_from(left.as_millis()).unwrap_or(i32::MAX);
+        // SAFETY: one valid pollfd, count 1.
+        let ready = unsafe { libc::poll(&mut poll, 1, millis) };
+        if ready < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return Err("waiting for bwrap failed".into());
+        }
+        if ready <= 0 {
+            continue;
+        }
+        let mut chunk = [0u8; 512];
+        match reader.read(&mut chunk) {
+            Ok(0) => {
+                return parse_info_fd(&got).map_err(|e| e.to_string());
+            }
+            Ok(n) => {
+                got.extend_from_slice(&chunk[..n]);
+                if got.len() > MAX_INFO_BYTES {
+                    return Err(InfoError::TooLarge.to_string());
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(format!("reading bwrap's report failed: {e}")),
+        }
+    }
 }
 
 fn run_macos(input: &JailInputs) -> ExitCode {
@@ -449,6 +683,11 @@ fn run_macos(input: &JailInputs) -> ExitCode {
         eprintln!("innerwarden contain: /usr/bin/sandbox-exec not found (expected on macOS)");
         return ExitCode::from(1);
     };
+    if input.args.identity {
+        eprintln!(
+            "innerwarden contain: --identity needs a PID namespace, which sandbox-exec does not have; no instance record is written"
+        );
+    }
     announce(input);
     // argv = [sandbox-exec, -p, <profile>, --, child...]; run argv[1..] under the
     // resolved binary.
@@ -694,5 +933,80 @@ mod tests {
 
         assert_eq!(backend_facts(Path::new("bwrap")), None, "a relative path");
         assert_eq!(backend_facts(&root.join("missing")), None, "a missing path");
+    }
+
+    #[cfg(unix)]
+    fn me() -> u32 {
+        use std::os::unix::fs::MetadataExt;
+        let probe = tempfile::tempdir().unwrap();
+        std::fs::metadata(probe.path()).unwrap().uid()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_launch_record_is_written_private_whole_and_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("state/innerwarden/instances");
+        let id = "0123456789abcdef0123456789abcdef";
+        let path = write_launch_record(&dir, id, b"{\"a\":1}", me()).unwrap();
+        assert_eq!(path, dir.join(format!("{id}.json")));
+        assert_eq!(std::fs::read(&path).unwrap(), b"{\"a\":1}");
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(&dir), 0o700);
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from(format!("{id}.json"))]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_launch_record_is_not_written_through_a_bad_directory_or_name() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let root = tempfile::tempdir().unwrap();
+        let id = "0123456789abcdef0123456789abcdef";
+
+        // a name that is not an id never becomes a path
+        let dir = root.path().join("ok");
+        for bad in ["../evil", "a/b", "", "UPPER", "x.json"] {
+            assert!(
+                write_launch_record(&dir, bad, b"{}", me()).is_err(),
+                "{bad}"
+            );
+        }
+
+        // the directory is a symlink to somewhere else: refused, nothing lands there
+        let elsewhere = root.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        let link = root.path().join("link");
+        symlink(&elsewhere, &link).unwrap();
+        assert!(write_launch_record(&link, id, b"{}", me()).is_err());
+        assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
+
+        // the directory belongs to someone else
+        let foreign = root.path().join("foreign");
+        std::fs::create_dir(&foreign).unwrap();
+        std::fs::set_permissions(&foreign, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(write_launch_record(&foreign, id, b"{}", me() + 1).is_err());
+
+        // anyone but the owner can write the directory
+        let open = root.path().join("open");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o775)).unwrap();
+        assert!(write_launch_record(&open, id, b"{}", me()).is_err());
+        assert_eq!(std::fs::read_dir(&open).unwrap().count(), 0);
+
+        // a planted symlink at the temp name is not followed
+        let guarded = root.path().join("guarded");
+        std::fs::create_dir(&guarded).unwrap();
+        std::fs::set_permissions(&guarded, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let victim = root.path().join("victim");
+        std::fs::write(&victim, b"keep").unwrap();
+        symlink(&victim, guarded.join(format!(".{id}.tmp"))).unwrap();
+        assert!(write_launch_record(&guarded, id, b"{}", me()).is_err());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
     }
 }

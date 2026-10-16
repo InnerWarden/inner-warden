@@ -62,6 +62,9 @@ pub struct ContainArgs {
     pub extra_rw: Vec<PathBuf>,
     pub extra_ro: Vec<PathBuf>,
     pub deny_read: Vec<String>,
+    /// `--identity`: write a launch record for this instance. OFF by default;
+    /// off, the jail and its argv are exactly what they were before the flag.
+    pub identity: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -101,6 +104,7 @@ pub fn parse_contain_args(argv: &[String]) -> Result<ContainArgs, ContainError> 
     let mut project = PathBuf::from(".");
     let mut dry_run = false;
     let mut setup_only = false;
+    let mut identity = false;
     let mut deny_read: Vec<String> = DEFAULT_DENY_READ.iter().map(|s| s.to_string()).collect();
     let extra_rw: Vec<PathBuf> = Vec::new();
     let extra_ro: Vec<PathBuf> = Vec::new();
@@ -137,6 +141,7 @@ pub fn parse_contain_args(argv: &[String]) -> Result<ContainArgs, ContainError> 
             }
             "--dry-run" => dry_run = true,
             "--setup" => setup_only = true,
+            innerwarden_agent_guard::identity::IDENTITY_FLAG => identity = true,
             other if other.starts_with('-') => {
                 return Err(ContainError::UnknownFlag(other.to_string()))
             }
@@ -168,6 +173,7 @@ pub fn parse_contain_args(argv: &[String]) -> Result<ContainArgs, ContainError> 
         extra_rw,
         extra_ro,
         deny_read,
+        identity,
     })
 }
 
@@ -218,6 +224,9 @@ pub struct JailInputs {
     pub iw_config_real: PathBuf,
     /// The project secrets to mask (glob-expanded + statted by the I/O layer).
     pub deny_paths: Vec<DenyPath>,
+    /// The descriptor bwrap writes its start-up facts to (`--info-fd`). `None`
+    /// unless the launch asked for an identity record.
+    pub info_fd: Option<i32>,
 }
 
 impl JailInputs {
@@ -426,6 +435,11 @@ pub fn build_linux_jail(input: &JailInputs) -> Result<LinuxJailPlan, ContainErro
     push(&["--hostname", "ai-sandbox"]);
     if !input.stdin_is_tty {
         push(&["--new-session"]);
+    }
+    // Only an identified launch asks bwrap to report the jail's pid. Last before
+    // the terminator, so no earlier option depends on it and none is moved.
+    if let Some(fd) = input.info_fd {
+        push(&["--info-fd", &fd.to_string()]);
     }
     // NO --unshare-net (agent/hook/git need it in v1); NO --clearenv.
 
@@ -710,6 +724,251 @@ pub fn userns_restriction_advice(
     ])
 }
 
+/// The pure half of `contain --identity`: read what bwrap reported, read what
+/// the host says about the jail process, and put the facts into a
+/// [`LaunchRecord`]. Nothing here opens a file or a process; the thin adapter
+/// in `contain_io` reads the facts and hands them in.
+///
+/// The record is a LABEL file (agent type, project) plus the facts the launcher
+/// saw. It never says how much to trust the instance: that is decided by whoever
+/// reads it, from the kernel's word (`identity::judge_trust_in_jail`).
+pub mod launch {
+    // The adapter that calls these is Linux-only; the tests run everywhere.
+    #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+
+    use std::path::{Path, PathBuf};
+
+    use chrono::{DateTime, Utc};
+    use innerwarden_agent_guard::identity::{
+        instance_record_file, Jail, JailBackend, LaunchMode, LaunchRecord, Launcher, RecordError,
+        INITIAL_PID_NS_INODE, LAUNCHER_RECORD_DIR, LAUNCH_SCHEMA,
+    };
+    use serde::Deserialize;
+
+    use super::Mode;
+
+    /// The most bytes read from the info descriptor. bwrap writes one short
+    /// JSON object; anything near this is not that.
+    pub const MAX_INFO_BYTES: usize = 4096;
+
+    /// The descriptor number a dry run shows. A real run uses the pipe's own.
+    pub const DRY_RUN_INFO_FD: i32 = 9;
+
+    /// What bwrap reports through `--info-fd`. Fields it adds later are ignored.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct InfoFd {
+        /// The jail's first process, as a pid in the launcher's namespace.
+        pub child_pid: u32,
+        /// bwrap's own word for the jail's PID namespace inode, if it gave one.
+        pub pid_namespace: Option<u64>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum InfoError {
+        Empty,
+        TooLarge,
+        Malformed(String),
+        /// No `child-pid`, or zero, or more than a pid can be.
+        NoChildPid,
+    }
+
+    impl std::fmt::Display for InfoError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                InfoError::Empty => write!(f, "bwrap reported nothing on the info descriptor"),
+                InfoError::TooLarge => {
+                    write!(f, "bwrap's info is larger than {MAX_INFO_BYTES} bytes")
+                }
+                InfoError::Malformed(why) => write!(f, "bwrap's info is not JSON: {why}"),
+                InfoError::NoChildPid => write!(f, "bwrap's info has no usable child-pid"),
+            }
+        }
+    }
+
+    /// Parse the JSON bwrap writes to `--info-fd`, for example
+    /// `{"child-pid": 2778, "mnt-namespace": 4026532218, "pid-namespace": 4026532220}`.
+    pub fn parse_info_fd(bytes: &[u8]) -> Result<InfoFd, InfoError> {
+        if bytes.iter().all(u8::is_ascii_whitespace) {
+            return Err(InfoError::Empty);
+        }
+        if bytes.len() > MAX_INFO_BYTES {
+            return Err(InfoError::TooLarge);
+        }
+        #[derive(Deserialize)]
+        struct Wire {
+            #[serde(rename = "child-pid")]
+            child_pid: Option<u64>,
+            #[serde(rename = "pid-namespace")]
+            pid_namespace: Option<u64>,
+        }
+        let wire: Wire =
+            serde_json::from_slice(bytes).map_err(|e| InfoError::Malformed(e.to_string()))?;
+        let child_pid = wire
+            .child_pid
+            .and_then(|p| u32::try_from(p).ok())
+            .filter(|p| *p != 0)
+            .ok_or(InfoError::NoChildPid)?;
+        Ok(InfoFd {
+            child_pid,
+            pid_namespace: wire.pid_namespace,
+        })
+    }
+
+    /// Field 22 of `/proc/<pid>/stat` (start time in clock ticks since boot).
+    /// The process name in field 2 is in parentheses and may hold spaces and
+    /// parentheses, so the fields are counted from the LAST `)`.
+    pub fn parse_start_ticks(stat: &str) -> Option<u64> {
+        let after_name = &stat[stat.rfind(')')? + 1..];
+        // after_name starts at field 3 (state); field 22 is its 20th token.
+        after_name.split_ascii_whitespace().nth(19)?.parse().ok()
+    }
+
+    /// The inode in a namespace link such as `pid:[4026532222]`.
+    pub fn parse_ns_link(link: &str) -> Option<u64> {
+        let rest = link.trim().strip_prefix("pid:[")?.strip_suffix(']')?;
+        if rest.is_empty() || !rest.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        rest.parse().ok()
+    }
+
+    /// An instance id from 16 random bytes: 32 lowercase hex characters.
+    pub fn instance_id_from(bytes: [u8; 16]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// The directory that holds the launcher's records:
+    /// `$XDG_STATE_HOME/innerwarden/instances`, or
+    /// `~/.local/state/innerwarden/instances` when the variable is unset, empty
+    /// or not an absolute path (the XDG rule: a relative value is ignored).
+    pub fn records_dir(xdg_state_home: Option<&str>, home: &Path) -> PathBuf {
+        match xdg_state_home {
+            Some(dir) if Path::new(dir).is_absolute() => Path::new(dir).join(LAUNCHER_RECORD_DIR),
+            _ => home.join(".local/state").join(LAUNCHER_RECORD_DIR),
+        }
+    }
+
+    /// Where one record lives, or `None` for an id that is not an id.
+    pub fn record_path(dir: &Path, instance_id: &str) -> Option<PathBuf> {
+        Some(dir.join(instance_record_file(instance_id)?))
+    }
+
+    pub fn launch_mode(mode: &Mode) -> LaunchMode {
+        match mode {
+            Mode::Monitor => LaunchMode::Monitor,
+            Mode::Enforce => LaunchMode::Enforce,
+            Mode::BlockReview => LaunchMode::BlockReview,
+        }
+    }
+
+    /// Every fact the record is made from, all read by the caller.
+    #[derive(Debug, Clone)]
+    pub struct LaunchFacts<'a> {
+        pub instance_id: String,
+        pub agent_type: &'a str,
+        pub launcher_path: &'a Path,
+        pub launcher_version: &'a str,
+        /// The launcher binary is a file only root can replace: the answer of
+        /// `contain_io::backend_trusted`, the one definition of a trusted file.
+        pub launcher_root_owned: bool,
+        pub uid: u32,
+        /// The project directory; only its last component is recorded.
+        pub project: &'a Path,
+        pub mode: &'a Mode,
+        pub started_at: DateTime<Utc>,
+        pub info: InfoFd,
+        /// `/proc/<child-pid>/stat` field 22, read by the launcher.
+        pub start_ticks: u64,
+        /// `/proc/<child-pid>/ns/pid`, read by the launcher.
+        pub pid_ns: u64,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum AssembleError {
+        /// The jail process shares the launcher's own PID namespace, so there
+        /// is no boundary to record.
+        NoPidNamespace,
+        /// bwrap and the host disagree about the jail's namespace.
+        NamespaceDisagrees,
+        /// The launcher path is not valid UTF-8.
+        LauncherPathNotUtf8,
+        /// The project has no folder name to record.
+        NoProjectName,
+        /// A value is outside what its record field may hold.
+        Record(RecordError),
+    }
+
+    impl std::fmt::Display for AssembleError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                AssembleError::NoPidNamespace => {
+                    write!(f, "the jail process is in the launcher's own PID namespace")
+                }
+                AssembleError::NamespaceDisagrees => {
+                    write!(
+                        f,
+                        "bwrap and the host disagree about the jail's PID namespace"
+                    )
+                }
+                AssembleError::LauncherPathNotUtf8 => write!(f, "the launcher path is not UTF-8"),
+                AssembleError::NoProjectName => write!(f, "the project has no folder name"),
+                AssembleError::Record(e) => write!(f, "{e}"),
+            }
+        }
+    }
+
+    /// Put the delivered facts into a record, or say why they make none.
+    ///
+    /// A record is never produced for a jail that has no PID namespace of its
+    /// own: writing one would claim a boundary that is not there.
+    pub fn assemble_record(facts: LaunchFacts<'_>) -> Result<LaunchRecord, AssembleError> {
+        if facts.pid_ns == 0 || facts.pid_ns == INITIAL_PID_NS_INODE {
+            return Err(AssembleError::NoPidNamespace);
+        }
+        if facts
+            .info
+            .pid_namespace
+            .is_some_and(|ns| ns != facts.pid_ns)
+        {
+            return Err(AssembleError::NamespaceDisagrees);
+        }
+        let launcher_path = facts
+            .launcher_path
+            .to_str()
+            .ok_or(AssembleError::LauncherPathNotUtf8)?
+            .to_string();
+        let project = facts
+            .project
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or(AssembleError::NoProjectName)?
+            .to_string();
+        let record = LaunchRecord {
+            schema: LAUNCH_SCHEMA,
+            instance_id: facts.instance_id,
+            agent_type: facts.agent_type.to_string(),
+            launcher: Launcher {
+                path: launcher_path,
+                version: facts.launcher_version.to_string(),
+                root_owned: facts.launcher_root_owned,
+            },
+            uid: facts.uid,
+            project,
+            mode: launch_mode(facts.mode),
+            started_at: facts.started_at,
+            jail: Jail {
+                backend: JailBackend::Bwrap,
+                pid: facts.info.child_pid,
+                start_ticks: facts.start_ticks,
+                pid_ns: facts.pid_ns,
+            },
+            scope: None,
+        };
+        record.validate().map_err(AssembleError::Record)?;
+        Ok(record)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -726,6 +985,7 @@ mod tests {
             extra_rw: vec![],
             extra_ro: vec![],
             deny_read: DEFAULT_DENY_READ.iter().map(|s| s.to_string()).collect(),
+            identity: false,
         }
     }
 
@@ -760,6 +1020,7 @@ mod tests {
                     is_dir: true,
                 },
             ],
+            info_fd: None,
         }
     }
 
@@ -1147,6 +1408,264 @@ mod tests {
         assert!(other
             .join("\n")
             .contains("profile bwrap /usr/local/bin/bwrap"));
+    }
+
+    // ---- `--identity`: argv, flag parse, the pure record parts ----
+
+    #[test]
+    fn identity_flag_is_off_unless_asked_for() {
+        let off = parse_contain_args(&["--".into(), "x".into()]).unwrap();
+        assert!(!off.identity);
+        let on = parse_contain_args(&["--identity".into(), "--".into(), "x".into()]).unwrap();
+        assert!(on.identity);
+        // The flag is not the child's: after `--` it belongs to the child.
+        let child = parse_contain_args(&["--".into(), "--identity".into()]).unwrap();
+        assert!(!child.identity);
+        assert_eq!(child.child, vec!["--identity"]);
+    }
+
+    #[test]
+    fn info_fd_goes_before_the_terminator_and_moves_nothing_else() {
+        let plain = build_linux_jail(&inputs(&["claude", "--print"]))
+            .unwrap()
+            .bwrap_args;
+        let mut with = inputs(&["claude", "--print"]);
+        with.info_fd = Some(7);
+        let got = build_linux_jail(&with).unwrap().bwrap_args;
+        let at = got
+            .iter()
+            .position(|a| a == "--info-fd")
+            .expect("--info-fd");
+        assert_eq!(got[at + 1], "7");
+        let terminator = got.iter().position(|a| a == "--").expect("--");
+        assert!(at + 1 < terminator, "--info-fd must come before `--`");
+        // Removing the two tokens gives exactly today's vector.
+        let mut without = got.clone();
+        without.drain(at..at + 2);
+        assert_eq!(without, plain);
+        assert_eq!(plain.join("\n"), GOLDEN_ARGV_PLAIN);
+    }
+
+    #[test]
+    fn info_fd_json_is_read_and_bounded() {
+        use launch::*;
+        let real =
+            br#"{"child-pid": 2778, "mnt-namespace": 4026532218, "pid-namespace": 4026532220}"#;
+        assert_eq!(
+            parse_info_fd(real).unwrap(),
+            InfoFd {
+                child_pid: 2778,
+                pid_namespace: Some(4026532220)
+            }
+        );
+        // newer bwrap fields are ignored, the namespace is optional
+        let more = br#"{"child-pid": 5, "cgroup-namespace": 1, "future": [1,2]}"#;
+        let got = parse_info_fd(more).unwrap();
+        assert_eq!((got.child_pid, got.pid_namespace), (5, None));
+        assert_eq!(parse_info_fd(b""), Err(InfoError::Empty));
+        assert_eq!(parse_info_fd(b" \n"), Err(InfoError::Empty));
+        assert_eq!(parse_info_fd(b"{}"), Err(InfoError::NoChildPid));
+        assert_eq!(
+            parse_info_fd(br#"{"child-pid": 0}"#),
+            Err(InfoError::NoChildPid)
+        );
+        assert_eq!(
+            parse_info_fd(br#"{"child-pid": 99999999999}"#),
+            Err(InfoError::NoChildPid)
+        );
+        assert!(matches!(
+            parse_info_fd(br#"{"child-pid": -3}"#),
+            Err(InfoError::Malformed(_))
+        ));
+        assert!(matches!(
+            parse_info_fd(b"not json"),
+            Err(InfoError::Malformed(_))
+        ));
+        let mut big = br#"{"child-pid": 5, "pad": ""#.to_vec();
+        big.extend(std::iter::repeat_n(b'a', MAX_INFO_BYTES));
+        big.extend(br#""}"#);
+        assert_eq!(parse_info_fd(&big), Err(InfoError::TooLarge));
+    }
+
+    #[test]
+    fn start_ticks_are_counted_from_the_last_parenthesis() {
+        use launch::parse_start_ticks;
+        // 52 fields as the kernel writes them; field 22 is 123456.
+        let tail = "S 1 2778 2778 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 123456 9999 99 18446744073709551615";
+        for comm in ["bash", "ba sh", "a) S 1 (b", "(", ")"] {
+            let stat = format!("2778 ({comm}) {tail}");
+            assert_eq!(parse_start_ticks(&stat), Some(123456), "comm {comm:?}");
+        }
+        assert_eq!(parse_start_ticks("2778 (bash) S 1 2"), None);
+        assert_eq!(parse_start_ticks("no parenthesis"), None);
+        assert_eq!(parse_start_ticks(""), None);
+    }
+
+    #[test]
+    fn pid_namespace_link_is_parsed_strictly() {
+        use launch::parse_ns_link;
+        assert_eq!(parse_ns_link("pid:[4026532222]"), Some(4026532222));
+        assert_eq!(parse_ns_link("pid:[4026532222]\n"), Some(4026532222));
+        for bad in [
+            "",
+            "pid:[]",
+            "pid:[12x]",
+            "net:[1]",
+            "pid:[1",
+            "[1]",
+            "pid:[-1]",
+        ] {
+            assert_eq!(parse_ns_link(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn instance_id_is_thirty_two_lowercase_hex_and_a_valid_name() {
+        use launch::*;
+        let id = instance_id_from([0xab; 16]);
+        assert_eq!(id, "abababababababababababababababab");
+        let id = instance_id_from([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 255]);
+        assert_eq!(id.len(), 32);
+        assert!(id
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()));
+        assert!(record_path(Path::new("/s"), &id).is_some());
+        assert_eq!(record_path(Path::new("/s"), "../x"), None);
+        assert_eq!(
+            record_path(Path::new("/s"), "ab").unwrap(),
+            PathBuf::from("/s/ab.json")
+        );
+    }
+
+    #[test]
+    fn records_live_under_the_state_home_and_a_relative_one_is_ignored() {
+        use launch::records_dir;
+        let home = Path::new("/home/dev");
+        assert_eq!(
+            records_dir(Some("/var/state"), home),
+            PathBuf::from("/var/state/innerwarden/instances")
+        );
+        let fallback = PathBuf::from("/home/dev/.local/state/innerwarden/instances");
+        assert_eq!(records_dir(None, home), fallback);
+        assert_eq!(records_dir(Some(""), home), fallback);
+        assert_eq!(records_dir(Some("relative/state"), home), fallback);
+    }
+
+    fn launch_facts<'a>(
+        mode: &'a Mode,
+        launcher: &'a Path,
+        project: &'a Path,
+    ) -> launch::LaunchFacts<'a> {
+        launch::LaunchFacts {
+            instance_id: launch::instance_id_from([7; 16]),
+            agent_type: "claude-code",
+            launcher_path: launcher,
+            launcher_version: "1.5.5",
+            launcher_root_owned: true,
+            uid: 1000,
+            project,
+            mode,
+            started_at: "2026-10-16T12:00:00Z".parse().unwrap(),
+            info: launch::InfoFd {
+                child_pid: 2778,
+                pid_namespace: Some(4026532220),
+            },
+            start_ticks: 123456,
+            pid_ns: 4026532220,
+        }
+    }
+
+    #[test]
+    fn record_is_assembled_from_delivered_facts_only() {
+        use innerwarden_agent_guard::identity::{parse_launch_record, JailBackend, LaunchMode};
+        let (mode, launcher, project) = (
+            Mode::Enforce,
+            Path::new("/usr/local/bin/innerwarden"),
+            Path::new("/home/dev/work/my project"),
+        );
+        let record = launch::assemble_record(launch_facts(&mode, launcher, project)).unwrap();
+        assert_eq!(record.project, "my project", "a folder NAME, never a path");
+        assert_eq!(record.mode, LaunchMode::Enforce);
+        assert_eq!(record.agent_type, "claude-code");
+        assert_eq!(record.uid, 1000);
+        assert_eq!(record.launcher.path, "/usr/local/bin/innerwarden");
+        assert!(record.launcher.root_owned);
+        assert_eq!(record.jail.backend, JailBackend::Bwrap);
+        assert_eq!(
+            (record.jail.pid, record.jail.start_ticks, record.jail.pid_ns),
+            (2778, 123456, 4026532220)
+        );
+        assert!(
+            record.scope.is_none(),
+            "no scope until the launcher makes one"
+        );
+        // what is written is what a reader accepts, and it carries no secret
+        let json = serde_json::to_vec(&record).unwrap();
+        assert_eq!(parse_launch_record(&json).unwrap(), record);
+        let text = String::from_utf8(json).unwrap();
+        assert!(
+            !text.contains("/home/dev"),
+            "no path of the project: {text}"
+        );
+        // the launcher's trust is a fact handed in, not assumed
+        let mut per_user = launch_facts(&mode, launcher, project);
+        per_user.launcher_root_owned = false;
+        assert!(
+            !launch::assemble_record(per_user)
+                .unwrap()
+                .launcher
+                .root_owned
+        );
+    }
+
+    #[test]
+    fn no_record_is_made_for_a_jail_without_a_namespace_of_its_own() {
+        use innerwarden_agent_guard::identity::INITIAL_PID_NS_INODE;
+        use launch::AssembleError;
+        let (mode, launcher, project) = (
+            Mode::Monitor,
+            Path::new("/usr/local/bin/innerwarden"),
+            Path::new("/home/dev/proj"),
+        );
+        // the host's own namespace: a record would claim a boundary that is not there
+        let mut host = launch_facts(&mode, launcher, project);
+        host.pid_ns = INITIAL_PID_NS_INODE;
+        host.info.pid_namespace = None;
+        assert_eq!(
+            launch::assemble_record(host),
+            Err(AssembleError::NoPidNamespace)
+        );
+        let mut zero = launch_facts(&mode, launcher, project);
+        zero.pid_ns = 0;
+        zero.info.pid_namespace = None;
+        assert_eq!(
+            launch::assemble_record(zero),
+            Err(AssembleError::NoPidNamespace)
+        );
+        // bwrap and the host name two different namespaces: trust neither
+        let mut split = launch_facts(&mode, launcher, project);
+        split.info.pid_namespace = Some(4026532999);
+        assert_eq!(
+            launch::assemble_record(split),
+            Err(AssembleError::NamespaceDisagrees)
+        );
+        // facts that make an invalid record are refused, not written
+        let mut no_time = launch_facts(&mode, launcher, project);
+        no_time.start_ticks = 0;
+        assert!(matches!(
+            launch::assemble_record(no_time),
+            Err(AssembleError::Record(_))
+        ));
+        let root_project = launch_facts(&mode, launcher, Path::new("/"));
+        assert_eq!(
+            launch::assemble_record(root_project),
+            Err(AssembleError::NoProjectName)
+        );
+        let relative = launch_facts(&mode, Path::new("innerwarden"), project);
+        assert!(matches!(
+            launch::assemble_record(relative),
+            Err(AssembleError::Record(_))
+        ));
     }
 
     const GOLDEN_ARGV_PLAIN: &str = "\
