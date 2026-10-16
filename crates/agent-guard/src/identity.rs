@@ -34,8 +34,8 @@
 //! declare itself the most permissive one. A rule that TIGHTENS is honoured at
 //! any trust level, since an agent gains nothing by being held to more.
 //!
-//! This module is not wired into anything yet. Behaviour of the binary is
-//! unchanged.
+//! Only `innerwarden contain --identity` (off by default) uses it today: the
+//! launcher writes the record. Nothing yet reads it to decide.
 
 use std::fmt;
 use std::path::{Component, Path};
@@ -65,6 +65,47 @@ pub const LAUNCHER_RECORD_DIR: &str = "innerwarden/instances";
 /// caller does not control, and it is checked before it can become a path.
 pub fn instance_record_file(instance_id: &str) -> Option<String> {
     is_instance_id(instance_id).then(|| format!("{instance_id}.json"))
+}
+
+/// Every scope the launcher puts an instance in is named
+/// `innerwarden-contain-<instance_id>.scope`, user scope and system scope alike.
+pub const SCOPE_UNIT_PREFIX: &str = "innerwarden-contain-";
+
+/// The unit name of an instance's scope, or `None` if `instance_id` is not a
+/// well-formed id.
+pub fn scope_unit_name(instance_id: &str) -> Option<String> {
+    is_instance_id(instance_id).then(|| format!("{SCOPE_UNIT_PREFIX}{instance_id}.scope"))
+}
+
+/// The cgroup a system scope of `unit` has: directly under the system slice,
+/// where only root can create it or move a process into it.
+pub fn system_scope_cgroup(unit: &str) -> String {
+    format!("/system.slice/{unit}")
+}
+
+/// Whether `cgroup_path` is the cgroup of the user scope `unit` of `uid`: a
+/// leaf named `unit` somewhere under that user's own manager,
+/// `/user.slice/user-<uid>.slice/user@<uid>.service/`.
+pub fn is_user_scope_cgroup(cgroup_path: &str, unit: &str, uid: u32) -> bool {
+    let manager = format!("/user.slice/user-{uid}.slice/user@{uid}.service/");
+    is_absolute_path(cgroup_path)
+        && cgroup_path.starts_with(&manager)
+        && cgroup_path.ends_with(&format!("/{unit}"))
+}
+
+/// The local route a launcher calls, best effort, to ask the Active Defence
+/// agent on the same host for a system scope around a new instance.
+///
+/// The request names the instance and nothing else (no pid, no path, no
+/// cgroup): [`system_scope_request`]. Whatever the answer, the launcher
+/// records a system scope only when the kernel shows the jail in
+/// [`system_scope_cgroup`]; the reply is never taken as that fact.
+pub const SYSTEM_SCOPE_ROUTE: &str = "/api/agent/contain-scope";
+
+/// The body of a request to [`SYSTEM_SCOPE_ROUTE`]: `{"instance": "<id>"}`, or
+/// `None` if `instance_id` is not a well-formed id.
+pub fn system_scope_request(instance_id: &str) -> Option<serde_json::Value> {
+    is_instance_id(instance_id).then(|| serde_json::json!({ "instance": instance_id }))
 }
 
 // ---------------------------------------------------------------------------
@@ -185,12 +226,38 @@ pub struct Jail {
     pub pid_ns: u64,
 }
 
-/// A dedicated scope the launcher put the jail in, when it could.
+/// A dedicated scope the jail was in, as the launcher read it from the kernel
+/// (`/proc/<jail pid>/cgroup`) before the jail started.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Scope {
+    /// Always [`scope_unit_name`] of the record's instance.
     pub unit: String,
     pub cgroup_path: String,
+}
+
+/// The scopes of an instance. At least one is present, or the record carries
+/// no `scope` at all.
+///
+/// * `user`: made by the user's own service manager around the jail. It names
+///   the instance for whoever joins events to it, and inside the jail there is
+///   no way out of it; outside the jail, any program of the same user can move
+///   a process out of it. A label and a join key, never a guard boundary.
+/// * `system`: made by root under the system slice. The user cannot create it,
+///   move a process into it or out of it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Scopes {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<Scope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system: Option<Scope>,
+}
+
+impl Scopes {
+    pub fn is_empty(&self) -> bool {
+        self.user.is_none() && self.system.is_none()
+    }
 }
 
 /// What the launcher knows about an instance it started, written by the
@@ -216,7 +283,7 @@ pub struct LaunchRecord {
     pub started_at: DateTime<Utc>,
     pub jail: Jail,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scope: Option<Scope>,
+    pub scope: Option<Scopes>,
 }
 
 /// Why bytes were not accepted as a record.
@@ -334,12 +401,34 @@ impl LaunchRecord {
             }
             _ => {}
         }
-        if let Some(scope) = &self.scope {
-            if !is_unit_name(&scope.unit) {
-                return Err(RecordError::Invalid("scope.unit"));
+        if let Some(scopes) = &self.scope {
+            self.validate_scopes(scopes)?;
+        }
+        Ok(())
+    }
+
+    /// A scope belongs to THIS instance: its unit is the instance's name and
+    /// its cgroup is where that unit lives. A record cannot borrow another
+    /// instance's scope, or call a user scope a system one.
+    fn validate_scopes(&self, scopes: &Scopes) -> Result<(), RecordError> {
+        if scopes.is_empty() {
+            return Err(RecordError::Invalid("scope has neither user nor system"));
+        }
+        let unit = scope_unit_name(&self.instance_id).ok_or(RecordError::Invalid("instance_id"))?;
+        if let Some(user) = &scopes.user {
+            if !is_unit_name(&user.unit) || user.unit != unit {
+                return Err(RecordError::Invalid("scope.user.unit"));
             }
-            if !is_absolute_path(&scope.cgroup_path) {
-                return Err(RecordError::Invalid("scope.cgroup_path"));
+            if !is_user_scope_cgroup(&user.cgroup_path, &unit, self.uid) {
+                return Err(RecordError::Invalid("scope.user.cgroup_path"));
+            }
+        }
+        if let Some(system) = &scopes.system {
+            if !is_unit_name(&system.unit) || system.unit != unit {
+                return Err(RecordError::Invalid("scope.system.unit"));
+            }
+            if system.cgroup_path != system_scope_cgroup(&unit) {
+                return Err(RecordError::Invalid("scope.system.cgroup_path"));
             }
         }
         Ok(())
@@ -447,6 +536,9 @@ pub enum Reason {
     /// Same namespace as the record, but the launcher is a file its user could
     /// have replaced (a per-user install).
     LauncherNotTrusted,
+    /// Same namespace, trusted launcher, but the jail was not in a dedicated
+    /// scope: a namespace the agent cannot leave, a cgroup nobody named.
+    NoScope,
     NoRecord,
     RecordUnreadable,
     RecordWritable,
@@ -463,6 +555,7 @@ impl Reason {
         match self {
             Reason::ConfinedByNamespace => "confined_by_namespace",
             Reason::LauncherNotTrusted => "launcher_not_trusted",
+            Reason::NoScope => "no_scope",
             Reason::NoRecord => "no_record",
             Reason::RecordUnreadable => "record_unreadable",
             Reason::RecordWritable => "record_writable",
@@ -488,7 +581,8 @@ impl Reason {
 /// | 6 | own namespace unreadable | declared | `OwnNamespaceUnreadable` |
 /// | 7 | own namespace is not the recorded one | declared | `NamespaceMismatch` |
 /// | 8 | same namespace, launcher not root-owned | observed | `LauncherNotTrusted` |
-/// | 9 | same namespace, launcher root-owned | confined | `ConfinedByNamespace` |
+/// | 9 | same namespace, launcher root-owned, no scope recorded | observed | `NoScope` |
+/// | 10 | same namespace, launcher root-owned, a scope recorded | confined | `ConfinedByNamespace` |
 ///
 /// Why each row is the way it is:
 ///
@@ -501,6 +595,10 @@ impl Reason {
 /// * 8 is a ceiling, not a bonus: with a launcher the user's own programs can
 ///   replace, the record proves where this process runs and not who built the
 ///   boundary. Nothing here reaches `confined` from a per-user install.
+/// * 9: `confined` is a PID namespace AND a cgroup the agent cannot leave. A
+///   launch on a host with no user service manager runs with no dedicated
+///   scope, and its launcher says on screen that the instance is `observed` at
+///   most; this row is what makes that sentence true.
 ///
 /// This is the in-jail view and only that. It reads no `/proc` and takes no
 /// word from the environment; a stronger level needs a witness outside the
@@ -531,6 +629,9 @@ pub fn judge_trust_in_jail(facts: InJailFacts<'_>) -> (Trust, Reason) {
     }
     if !record.launcher.root_owned {
         return (Trust::Observed, Reason::LauncherNotTrusted);
+    }
+    if record.scope.as_ref().is_none_or(Scopes::is_empty) {
+        return (Trust::Observed, Reason::NoScope);
     }
     (Trust::Confined, Reason::ConfinedByNamespace)
 }
@@ -766,8 +867,14 @@ mod tests {
   "started_at": "2026-10-16T09:30:00Z",
   "jail": { "backend": "bwrap", "pid": 48211, "start_ticks": 9120344, "pid_ns": 4026532871 },
   "scope": {
-    "unit": "innerwarden-contain-7f3a9c1e-42.scope",
-    "cgroup_path": "/user.slice/user-1000.slice/user@1000.service/app.slice/innerwarden-contain-7f3a9c1e-42.scope"
+    "user": {
+      "unit": "innerwarden-contain-7f3a9c1e-42.scope",
+      "cgroup_path": "/user.slice/user-1000.slice/user@1000.service/app.slice/innerwarden-contain-7f3a9c1e-42.scope"
+    },
+    "system": {
+      "unit": "innerwarden-contain-7f3a9c1e-42.scope",
+      "cgroup_path": "/system.slice/innerwarden-contain-7f3a9c1e-42.scope"
+    }
   }
 }"#;
 
@@ -835,7 +942,9 @@ mod tests {
             keys(&value["jail"]),
             ["backend", "pid", "pid_ns", "start_ticks"]
         );
-        assert_eq!(keys(&value["scope"]), ["cgroup_path", "unit"]);
+        assert_eq!(keys(&value["scope"]), ["system", "user"]);
+        assert_eq!(keys(&value["scope"]["user"]), ["cgroup_path", "unit"]);
+        assert_eq!(keys(&value["scope"]["system"]), ["cgroup_path", "unit"]);
         // And no trust field: the file cannot say what level it earns.
         for banned in ["trust", "confined", "level", "token", "env", "argv", "key"] {
             assert!(value.get(banned).is_none(), "{banned}");
@@ -883,7 +992,14 @@ mod tests {
     /// Same schema number, same field set: an extra field is not tolerated.
     #[test]
     fn an_unknown_field_is_refused_at_every_level() {
-        for path in [vec![], vec!["launcher"], vec!["jail"], vec!["scope"]] {
+        for path in [
+            vec![],
+            vec!["launcher"],
+            vec!["jail"],
+            vec!["scope"],
+            vec!["scope", "user"],
+            vec!["scope", "system"],
+        ] {
             let mut value = golden_json();
             let mut at = &mut value;
             for step in &path {
@@ -1002,17 +1118,31 @@ mod tests {
             ("jail.pid", vec!["jail", "pid"], json!(0)),
             ("jail.start_ticks", vec!["jail", "start_ticks"], json!(0)),
             ("jail.pid_ns", vec!["jail", "pid_ns"], json!(0)),
-            ("scope.unit", vec!["scope", "unit"], json!("a/b.scope")),
-            ("scope.unit", vec!["scope", "unit"], json!("")),
             (
-                "scope.cgroup_path",
-                vec!["scope", "cgroup_path"],
+                "scope.user.unit",
+                vec!["scope", "user", "unit"],
+                json!("a/b.scope"),
+            ),
+            ("scope.user.unit", vec!["scope", "user", "unit"], json!("")),
+            (
+                "scope.user.cgroup_path",
+                vec!["scope", "user", "cgroup_path"],
                 json!("user.slice/x"),
             ),
             (
-                "scope.cgroup_path",
-                vec!["scope", "cgroup_path"],
+                "scope.user.cgroup_path",
+                vec!["scope", "user", "cgroup_path"],
                 json!("/a/../b"),
+            ),
+            (
+                "scope.system.unit",
+                vec!["scope", "system", "unit"],
+                json!(""),
+            ),
+            (
+                "scope.system.cgroup_path",
+                vec!["scope", "system", "cgroup_path"],
+                json!("system.slice/innerwarden-contain-7f3a9c1e-42.scope"),
             ),
         ];
         for (field, path, bad) in cases {
@@ -1031,6 +1161,131 @@ mod tests {
                 "{field} = {bad}"
             );
         }
+    }
+
+    /// Either scope alone is a valid record, and writes only itself.
+    #[test]
+    fn either_scope_alone_is_a_valid_record() {
+        for (keep, drop) in [("user", "system"), ("system", "user")] {
+            let mut value = golden_json();
+            value["scope"].as_object_mut().unwrap().remove(drop);
+            let record = parse_value(&value).unwrap();
+            let scopes = record.scope.as_ref().unwrap();
+            assert_eq!(scopes.user.is_some(), keep == "user");
+            assert_eq!(scopes.system.is_some(), keep == "system");
+            let written = serde_json::to_value(&record).unwrap();
+            assert_eq!(written["scope"], value["scope"], "{keep}");
+        }
+    }
+
+    /// `"scope": {}` names no scope; a reader could take it for one.
+    #[test]
+    fn a_scope_with_neither_user_nor_system_is_refused() {
+        let mut value = golden_json();
+        value["scope"] = json!({});
+        assert_eq!(
+            parse_value(&value),
+            Err(RecordError::Invalid("scope has neither user nor system"))
+        );
+    }
+
+    /// A record cannot borrow another instance's scope, another user's, or a
+    /// cgroup the user made and named like a system one.
+    #[test]
+    fn a_scope_belongs_to_its_own_instance_and_user() {
+        let other = "innerwarden-contain-0000aaaa-42.scope";
+        let user = |cgroup: &str| -> Value {
+            json!({ "unit": "innerwarden-contain-7f3a9c1e-42.scope", "cgroup_path": cgroup })
+        };
+        let cases: Vec<(&str, &str, Value)> = vec![
+            (
+                "user",
+                "scope.user.unit",
+                json!({ "unit": other, "cgroup_path": format!("/user.slice/user-1000.slice/user@1000.service/app.slice/{other}") }),
+            ),
+            (
+                "user",
+                "scope.user.cgroup_path",
+                user("/user.slice/user-1001.slice/user@1001.service/app.slice/innerwarden-contain-7f3a9c1e-42.scope"),
+            ),
+            (
+                "user",
+                "scope.user.cgroup_path",
+                user(&format!(
+                    "/user.slice/user-1000.slice/user@1000.service/app.slice/{other}"
+                )),
+            ),
+            (
+                "user",
+                "scope.user.cgroup_path",
+                user("/system.slice/innerwarden-contain-7f3a9c1e-42.scope"),
+            ),
+            (
+                "user",
+                "scope.user.cgroup_path",
+                user("/user.slice/user-1000.slice/session-3.scope/innerwarden-contain-7f3a9c1e-42.scope"),
+            ),
+            (
+                "system",
+                "scope.system.unit",
+                json!({ "unit": other, "cgroup_path": format!("/system.slice/{other}") }),
+            ),
+            (
+                "system",
+                "scope.system.cgroup_path",
+                user("/user.slice/user-1000.slice/user@1000.service/app.slice/system.slice/innerwarden-contain-7f3a9c1e-42.scope"),
+            ),
+            (
+                "system",
+                "scope.system.cgroup_path",
+                user("/system.slice/nested.slice/innerwarden-contain-7f3a9c1e-42.scope"),
+            ),
+        ];
+        for (which, field, bad) in cases {
+            let mut value = golden_json();
+            value["scope"][which] = bad.clone();
+            assert_eq!(
+                parse_value(&value),
+                Err(RecordError::Invalid(field)),
+                "{which} = {bad}"
+            );
+        }
+        // The shapes a real manager produces are accepted: with and without
+        // an `app.slice` between the manager and the scope.
+        let unit = "innerwarden-contain-7f3a9c1e-42.scope";
+        assert!(is_user_scope_cgroup(
+            &format!("/user.slice/user-1000.slice/user@1000.service/{unit}"),
+            unit,
+            1000
+        ));
+        assert!(is_user_scope_cgroup(
+            &format!("/user.slice/user-1000.slice/user@1000.service/app.slice/{unit}"),
+            unit,
+            1000
+        ));
+    }
+
+    #[test]
+    fn the_scope_names_and_the_request_are_the_ones_launcher_and_host_share() {
+        assert_eq!(SCOPE_UNIT_PREFIX, "innerwarden-contain-");
+        assert_eq!(
+            scope_unit_name("7f3a9c1e-42").as_deref(),
+            Some("innerwarden-contain-7f3a9c1e-42.scope")
+        );
+        for bad in ["", "../x", "A", "a.b", "a/b"] {
+            assert_eq!(scope_unit_name(bad), None, "{bad:?}");
+            assert_eq!(system_scope_request(bad), None, "{bad:?}");
+        }
+        assert_eq!(
+            system_scope_cgroup("innerwarden-contain-7f3a9c1e-42.scope"),
+            "/system.slice/innerwarden-contain-7f3a9c1e-42.scope"
+        );
+        assert_eq!(SYSTEM_SCOPE_ROUTE, "/api/agent/contain-scope");
+        // The request names the instance and nothing else: no pid to move.
+        assert_eq!(
+            system_scope_request("7f3a9c1e-42").unwrap(),
+            json!({ "instance": "7f3a9c1e-42" })
+        );
     }
 
     /// A backend with no PID namespace cannot claim one.
@@ -1080,13 +1335,46 @@ mod tests {
         }
     }
 
-    /// Row 9: the only way to `confined`.
+    /// Row 10: the only way to `confined`.
     #[test]
-    fn row_9_same_namespace_read_only_record_and_root_owned_launcher_is_confined() {
+    fn row_10_same_namespace_read_only_record_root_owned_launcher_and_a_scope_is_confined() {
         let record = golden();
         assert_eq!(
             judge_trust_in_jail(facts(&record, true, Some(OWN_NS))),
             (Trust::Confined, Reason::ConfinedByNamespace)
+        );
+        // Either scope on its own is a cgroup the instance was put in.
+        for drop_user in [false, true] {
+            let mut record = golden();
+            let scopes = record.scope.as_mut().unwrap();
+            if drop_user {
+                scopes.user = None;
+            } else {
+                scopes.system = None;
+            }
+            assert_eq!(
+                judge_trust_in_jail(facts(&record, true, Some(OWN_NS))),
+                (Trust::Confined, Reason::ConfinedByNamespace)
+            );
+        }
+    }
+
+    /// Row 9: a launch with no dedicated scope (no user service manager) is
+    /// `observed` at most, however well everything else matches. The launcher
+    /// says so on screen; this is what keeps that sentence true.
+    #[test]
+    fn row_9_a_jail_in_no_scope_is_observed_at_most() {
+        let mut record = golden();
+        record.scope = None;
+        assert_eq!(
+            judge_trust_in_jail(facts(&record, true, Some(OWN_NS))),
+            (Trust::Observed, Reason::NoScope)
+        );
+        // An empty scope set is refused by the reader as unreadable.
+        record.scope = Some(Scopes::default());
+        assert_eq!(
+            judge_trust_in_jail(facts(&record, true, Some(OWN_NS))),
+            (Trust::Declared, Reason::RecordUnreadable)
         );
     }
 
@@ -1201,7 +1489,8 @@ mod tests {
         );
     }
 
-    /// Of every combination of the inputs, exactly one reaches `confined`.
+    /// Of every combination of the inputs, exactly one reaches `confined`
+    /// (counted once per scope shape that names a scope).
     #[test]
     fn confined_is_reached_by_exactly_one_combination() {
         let mut confined = 0;
@@ -1214,18 +1503,27 @@ mod tests {
                     Some(INITIAL_PID_NS_INODE),
                 ] {
                     for backend_bwrap in [false, true] {
-                        let mut record = golden();
-                        record.launcher.root_owned = root_owned;
-                        if !backend_bwrap {
-                            record.jail.backend = JailBackend::SandboxExec;
-                            record.jail.pid_ns = 0;
-                        }
-                        if judge_trust_in_jail(facts(&record, read_only, own)).0 == Trust::Confined
-                        {
-                            confined += 1;
-                            assert!(
-                                root_owned && read_only && backend_bwrap && own == Some(OWN_NS)
-                            );
+                        for scoped in [false, true] {
+                            let mut record = golden();
+                            record.launcher.root_owned = root_owned;
+                            if !backend_bwrap {
+                                record.jail.backend = JailBackend::SandboxExec;
+                                record.jail.pid_ns = 0;
+                            }
+                            if !scoped {
+                                record.scope = None;
+                            }
+                            let judged = judge_trust_in_jail(facts(&record, read_only, own)).0;
+                            if judged == Trust::Confined {
+                                confined += 1;
+                                assert!(
+                                    root_owned
+                                        && read_only
+                                        && backend_bwrap
+                                        && scoped
+                                        && own == Some(OWN_NS)
+                                );
+                            }
                         }
                     }
                 }
@@ -1239,6 +1537,7 @@ mod tests {
         for reason in [
             Reason::ConfinedByNamespace,
             Reason::LauncherNotTrusted,
+            Reason::NoScope,
             Reason::NoRecord,
             Reason::RecordUnreadable,
             Reason::RecordWritable,
