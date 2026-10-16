@@ -113,15 +113,21 @@ fn require_bwrap() {
     );
 }
 
-/// The in-jail script of the identity cases: print the PID namespace the
-/// jailed process is in, then stay alive until the launcher has written the
-/// record (it reads the jail from the host's /proc, so the jail must outlive
-/// that read). `~/.local` is re-bound read-write, so the record is visible.
+/// The in-jail script of the identity case: print the PID namespace the
+/// jailed process is in, the record the launcher mounted, and whether the
+/// agent can rewrite, remove or replace that record. The jail starts only
+/// after the launcher handed the record in, so it is there from the first
+/// line.
 #[cfg(target_os = "linux")]
-const WAIT_FOR_RECORD: &str = "readlink /proc/self/ns/pid; \
-    i=0; while [ $i -lt 50 ]; do \
-    ls \"$HOME\"/.local/state/innerwarden/instances/*.json >/dev/null 2>&1 && exit 0; \
-    sleep 0.2; i=$((i+1)); done; exit 0";
+const READ_THE_RECORD: &str = "readlink /proc/self/ns/pid; \
+    cat /run/innerwarden/instance.json; echo; \
+    if ( : > /run/innerwarden/instance.json ) 2>/dev/null; then echo RECORD-WRITTEN; fi; \
+    if rm -f /run/innerwarden/instance.json 2>/dev/null; then echo RECORD-REMOVED; fi; \
+    if mv /run/innerwarden/instance.json /run/innerwarden/x 2>/dev/null; then echo RECORD-MOVED; fi; \
+    if ( echo '{}' > /run/innerwarden/other.json ) 2>/dev/null \
+        && mv -f /run/innerwarden/other.json /run/innerwarden/instance.json 2>/dev/null; \
+        then echo RECORD-REPLACED; fi; \
+    exit 0";
 
 #[cfg(target_os = "linux")]
 fn state_home() -> tempfile::TempDir {
@@ -130,14 +136,27 @@ fn state_home() -> tempfile::TempDir {
     home
 }
 
+/// No user service manager (the CI runner has none, and this removes the
+/// variable that names one) and no Active Defence: the fallback path, which
+/// is the one CI can prove. The scope itself is proven on a lab host by
+/// `scripts/tests/contain-identity-escape.sh`.
+#[cfg(target_os = "linux")]
+fn identified_without_a_scope(command: &mut Command) -> &mut Command {
+    command
+        .env_remove("XDG_RUNTIME_DIR")
+        .env_remove("XDG_STATE_HOME")
+        .env("IW_AD_CLI_DIRS", "")
+}
+
 #[cfg(target_os = "linux")]
 #[test]
-fn identity_flag_writes_a_private_record_whose_namespace_is_the_jails() {
+fn identity_flag_mounts_the_record_read_only_inside_and_keeps_a_private_copy() {
     use std::os::unix::fs::PermissionsExt;
     require_bwrap();
     let home = state_home();
     let project = tempfile::TempDir::new().unwrap();
-    let output = cli()
+    let mut command = cli();
+    command
         .args([
             "contain",
             "--identity",
@@ -146,16 +165,18 @@ fn identity_flag_writes_a_private_record_whose_namespace_is_the_jails() {
             "--",
             "/bin/sh",
             "-c",
-            WAIT_FOR_RECORD,
+            READ_THE_RECORD,
         ])
-        .env("HOME", home.path())
-        .env_remove("XDG_STATE_HOME")
+        .env("HOME", home.path());
+    let output = identified_without_a_scope(&mut command)
         .output()
         .expect("run Linux AI Jail with --identity");
     let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success(), "AI Jail failed: {stderr}");
     assert!(stderr.contains("instance record:"), "{stderr}");
 
+    // The launcher's copy: one private file, no temp left behind.
     let dir = home.path().join(".local/state/innerwarden/instances");
     let records: Vec<_> = std::fs::read_dir(&dir)
         .expect("records dir")
@@ -171,8 +192,27 @@ fn identity_flag_writes_a_private_record_whose_namespace_is_the_jails() {
         std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
         0o700
     );
+    let outside = std::fs::read(path).unwrap();
 
-    let record: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    // The jail's copy is the same bytes, and the agent can change none of it.
+    let mut lines = stdout.lines();
+    let ns_line = lines.next().unwrap_or_default().to_string();
+    let inside_record = lines.next().unwrap_or_default().to_string();
+    assert_eq!(
+        inside_record.as_bytes(),
+        outside.as_slice(),
+        "the record inside the jail is the launcher's: {stdout}"
+    );
+    for tampered in [
+        "RECORD-WRITTEN",
+        "RECORD-REMOVED",
+        "RECORD-MOVED",
+        "RECORD-REPLACED",
+    ] {
+        assert!(!stdout.contains(tampered), "{tampered}: {stdout}");
+    }
+
+    let record: serde_json::Value = serde_json::from_slice(&outside).unwrap();
     assert_eq!(record["schema"], 1);
     assert_eq!(record["agent_type"], "claude-code");
     assert_eq!(record["mode"], "monitor");
@@ -181,18 +221,23 @@ fn identity_flag_writes_a_private_record_whose_namespace_is_the_jails() {
         project.path().file_name().unwrap().to_str().unwrap(),
         "a folder name, not a path"
     );
-    assert!(record.get("scope").is_none(), "no scope in this phase");
     assert_eq!(
         path.file_stem().unwrap().to_str().unwrap(),
         record["instance_id"].as_str().unwrap()
     );
+    // No manager, no scope, and the launcher says what that costs.
+    assert!(record.get("scope").is_none(), "{record}");
+    assert!(stderr.contains("identity is at most observed"), "{stderr}");
+    assert!(
+        !stderr.contains("system scope"),
+        "no Active Defence, no request: {stderr}"
+    );
     // The namespace the launcher recorded is the one the jailed process saw.
-    let seen = String::from_utf8_lossy(&output.stdout);
-    let inside: u64 = seen
+    let inside: u64 = ns_line
         .trim()
         .strip_prefix("pid:[")
         .and_then(|r| r.strip_suffix(']'))
-        .unwrap_or_else(|| panic!("namespace link in stdout: {seen:?}"))
+        .unwrap_or_else(|| panic!("namespace link in stdout: {stdout:?}"))
         .parse()
         .unwrap();
     assert_eq!(record["jail"]["pid_ns"].as_u64().unwrap(), inside);
@@ -231,7 +276,12 @@ fn without_the_identity_flag_no_record_is_written_and_nothing_changes() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(!String::from_utf8_lossy(&output.stderr).contains("instance record"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("instance record"), "{stderr}");
+    assert!(
+        !stderr.contains("scope"),
+        "flag off: no scope, no word of one: {stderr}"
+    );
     assert!(
         !home.path().join(".local/state/innerwarden").exists(),
         "flag off: no directory, no record"
@@ -240,7 +290,7 @@ fn without_the_identity_flag_no_record_is_written_and_nothing_changes() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn dry_run_shows_the_info_descriptor_only_with_the_identity_flag() {
+fn dry_run_shows_the_record_and_info_descriptors_only_with_the_identity_flag() {
     let home = tempfile::TempDir::new().unwrap();
     let project = tempfile::TempDir::new().unwrap();
     let dry = |identity: bool| {
@@ -257,6 +307,7 @@ fn dry_run_shows_the_info_descriptor_only_with_the_identity_flag() {
         let out = cli()
             .args(args)
             .env("HOME", home.path())
+            .env_remove("XDG_RUNTIME_DIR")
             .output()
             .expect("dry run");
         assert!(out.status.success());
@@ -265,15 +316,35 @@ fn dry_run_shows_the_info_descriptor_only_with_the_identity_flag() {
     let plain = dry(false);
     let identified = dry(true);
     assert!(!plain.contains("--info-fd"), "{plain}");
+    assert!(!plain.contains("--ro-bind-data"), "{plain}");
+    assert!(!plain.contains("scope"), "{plain}");
+    assert!(
+        identified.contains(" --ro-bind-data 10 /run/innerwarden/instance.json --die-with-parent "),
+        "the record is the last mount: {identified}"
+    );
     assert!(
         identified.contains("--info-fd 9 -- /bin/true"),
         "{identified}"
     );
-    assert_eq!(
-        identified.replace(" --info-fd 9", ""),
-        plain,
-        "the flag adds the descriptor and nothing else"
+    // No manager named (or no systemd-run at all): the dry run says the real
+    // run would have no scope, and what that costs.
+    let scope_lines: Vec<&str> = identified
+        .lines()
+        .filter(|l| l.starts_with("# innerwarden contain: no scope ("))
+        .collect();
+    assert_eq!(scope_lines.len(), 1, "{identified}");
+    assert!(
+        scope_lines[0].ends_with("): identity is at most observed"),
+        "{identified}"
     );
+    let without: String = identified
+        .replace(" --ro-bind-data 10 /run/innerwarden/instance.json", "")
+        .replace(" --info-fd 9", "")
+        .lines()
+        .filter(|l| !l.starts_with("# innerwarden contain: no scope"))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    assert_eq!(without, plain, "the flag adds these and nothing else");
     assert!(
         !home.path().join(".local/state/innerwarden").exists(),
         "a dry run writes no record"

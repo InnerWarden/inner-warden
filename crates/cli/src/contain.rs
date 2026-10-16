@@ -227,6 +227,12 @@ pub struct JailInputs {
     /// The descriptor bwrap writes its start-up facts to (`--info-fd`). `None`
     /// unless the launch asked for an identity record.
     pub info_fd: Option<i32>,
+    /// The descriptor bwrap reads the launch record from and mounts, read-only,
+    /// at [`JAIL_RECORD_PATH`] (`--ro-bind-data`). `None` unless the launch
+    /// asked for an identity record.
+    ///
+    /// [`JAIL_RECORD_PATH`]: innerwarden_agent_guard::identity::JAIL_RECORD_PATH
+    pub record_fd: Option<i32>,
 }
 
 impl JailInputs {
@@ -304,6 +310,45 @@ pub fn validate_jail_inputs(input: &JailInputs) -> Result<(), ContainError> {
     for path in &input.args.extra_rw {
         validate_bind("extra writable", path)?;
     }
+    if input.args.identity {
+        validate_sealed(input)?;
+    }
+    Ok(())
+}
+
+/// The host trees an identified jail must never see from the host: `/run`
+/// holds the user's service manager and bus (a way to start a unit outside the
+/// scope), `/sys` the cgroup files (a way to move a process out of it). The
+/// jail replaces both (`/run` is a tmpfs, `/sys` is read-only), and a writable
+/// bind of the project there would put the host's copy back.
+const IDENTITY_SEALED: &[&str] = &["/run", "/sys"];
+
+/// With `--identity`, refuse a writable bind that overlaps a sealed tree.
+/// Without the flag nothing here runs, so a jail is what it was before.
+fn validate_sealed(input: &JailInputs) -> Result<(), ContainError> {
+    let mut writable: Vec<(&str, &Path)> = vec![("project", &input.args.project)];
+    if let Some(worktree) = &input.worktree {
+        writable.push(("worktree git", &worktree.git_dir));
+        writable.push(("worktree common", &worktree.common_dir));
+    }
+    writable.extend(
+        input
+            .args
+            .extra_rw
+            .iter()
+            .map(|p| ("extra writable", p.as_path())),
+    );
+    for (kind, path) in writable {
+        if let Some(sealed) = IDENTITY_SEALED
+            .iter()
+            .find(|sealed| paths_overlap(path, Path::new(sealed)))
+        {
+            return Err(ContainError::Unsupported(format!(
+                "unsafe {kind} path '{}' for --identity: it overlaps {sealed}, which the jail keeps closed",
+                path.display()
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -317,8 +362,8 @@ pub struct LinuxJailPlan {
 /// Build the ordered bwrap argument vector. Order is load-bearing (bwrap is
 /// last-wins): system RO → dev/proc/tmpfs → HOME tmpfs → dotdir re-binds → shadow
 /// innerwarden → binary binds → project (late) → worktree → nested secret masks →
-/// namespaces → child. `DOTDIR_DENY` entries are never emitted, so they vanish
-/// under the HOME tmpfs.
+/// launch record (`--identity` only) → namespaces → child. `DOTDIR_DENY`
+/// entries are never emitted, so they vanish under the HOME tmpfs.
 pub fn build_linux_jail(input: &JailInputs) -> Result<LinuxJailPlan, ContainError> {
     validate_jail_inputs(input)?;
     let home = input.home.to_string_lossy().to_string();
@@ -427,6 +472,21 @@ pub fn build_linux_jail(input: &JailInputs) -> Result<LinuxJailPlan, ContainErro
         } else {
             push(&["--ro-bind", "/dev/null", &dest]);
         }
+    }
+
+    // --- the launch record, read-only, LAST of the mounts. It lands on the
+    // `/run` tmpfs above (bwrap makes `/run/innerwarden`), and no later option
+    // can mount over it, so last-wins keeps it the launcher's. bwrap copies
+    // the descriptor's bytes into a file of its own outside the new root and
+    // binds that read-only: the agent has no writable path to it. bwrap reads
+    // the descriptor after it reports the jail's pid, so the launcher can
+    // write a record that names the jail it is read into. ---
+    if let Some(fd) = input.record_fd {
+        push(&[
+            "--ro-bind-data",
+            &fd.to_string(),
+            innerwarden_agent_guard::identity::JAIL_RECORD_PATH,
+        ]);
     }
 
     // --- namespaces / lifecycle ---
@@ -740,8 +800,9 @@ pub mod launch {
 
     use chrono::{DateTime, Utc};
     use innerwarden_agent_guard::identity::{
-        instance_record_file, Jail, JailBackend, LaunchMode, LaunchRecord, Launcher, RecordError,
-        INITIAL_PID_NS_INODE, LAUNCHER_RECORD_DIR, LAUNCH_SCHEMA,
+        instance_record_file, is_user_scope_cgroup, system_scope_cgroup, Jail, JailBackend,
+        LaunchMode, LaunchRecord, Launcher, RecordError, Scope, Scopes, INITIAL_PID_NS_INODE,
+        LAUNCHER_RECORD_DIR, LAUNCH_SCHEMA,
     };
     use serde::Deserialize;
 
@@ -753,6 +814,210 @@ pub mod launch {
 
     /// The descriptor number a dry run shows. A real run uses the pipe's own.
     pub const DRY_RUN_INFO_FD: i32 = 9;
+
+    /// The record descriptor a dry run shows. A real run uses the pipe's own.
+    pub const DRY_RUN_RECORD_FD: i32 = 10;
+
+    // -- the user scope ------------------------------------------------------
+    //
+    // The order a launch runs in, and why it is this order:
+    //
+    // 1. `systemd-run --user --scope` asks the user's manager for the scope,
+    //    waits until it exists, and becomes bwrap (exec, same pid, same
+    //    terminal). The scope is made OUTSIDE the jail, by the launcher.
+    // 2. bwrap clones the jail's first process; the jail's user, PID and mount
+    //    namespaces are made by that clone. bwrap reports the pid.
+    // 3. The jail's first process waits: it reads the launch record from the
+    //    launcher before it builds the jail's root, so nothing of the agent
+    //    has run yet.
+    // 4. The launcher reads the pid's start time, namespace and cgroup from
+    //    the host, asks for a system scope where Active Defence runs, and
+    //    hands the record in. The jail continues.
+    //
+    // A host policy that restricts new user namespaces, applied to the
+    // instance's scope, therefore never sees bwrap's own namespaces (made at
+    // 2, before any placement at 4) and does see any the agent tries later.
+    // A bwrap option that makes a SECOND user namespace after step 3
+    // (`--disable-userns`, or `--uid`/`--gid` other than the caller's) would
+    // be refused by such a policy and kill the jail: moving this order is a
+    // change to make with that in view. Nothing here arms anything. On Ubuntu
+    // 24.04 bwrap itself needs the AppArmor profile that grants it `userns`
+    // (`userns_restriction_advice`, `flags=(unconfined)`).
+
+    /// The first systemd whose `systemd-run` has `--expand-environment=`, the
+    /// switch that turns `$NAME` expansion of the command line on and off.
+    /// With `--scope`, systemd 257 was measured NOT to expand by default; the
+    /// jail's arguments and the agent's own command line must reach bwrap as
+    /// typed whatever another version's default is, so from this version on
+    /// `--expand-environment=no` is passed. An older systemd has neither the
+    /// switch nor the expansion.
+    pub const EXPAND_ENVIRONMENT_SWITCH_SINCE: u32 = 254;
+
+    /// What decides whether a launch gets a user scope. Read by the caller.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct ScopeFacts {
+        /// `systemd-run`, resolved like the jail backend: a root-owned file at
+        /// a fixed path no other account can write, never `$PATH`.
+        pub systemd_run: Option<PathBuf>,
+        /// The major version the first line of `systemd-run --version` gave.
+        pub systemd_version: Option<u32>,
+        /// The user's service manager has its socket at
+        /// `$XDG_RUNTIME_DIR/systemd/private`, a socket this user owns.
+        pub user_manager: bool,
+    }
+
+    /// Why a launch runs without a user scope.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum NoScope {
+        NoSystemdRun,
+        /// No manager for this session: no login session, `env -i`, a cron or
+        /// CI job without lingering.
+        NoUserManager,
+        /// `systemd-run --version` gave nothing this build reads, so whether it
+        /// takes the switch that keeps `$NAME` in the agent's command as typed
+        /// is unknown.
+        UnknownSystemd,
+        /// systemd-run was tried and the jail never started under it.
+        ScopeNotStarted,
+        /// The jail started, and the kernel does not show it in its scope.
+        NotSeenInScope,
+    }
+
+    impl NoScope {
+        pub fn why(self) -> &'static str {
+            match self {
+                NoScope::NoSystemdRun => "systemd-run is not installed at a root-owned path",
+                NoScope::NoUserManager => "no user service manager in this session",
+                NoScope::UnknownSystemd => "the systemd version is unknown",
+                NoScope::ScopeNotStarted => "systemd-run did not start the jail in a scope",
+                NoScope::NotSeenInScope => "the kernel does not show the jail in its scope",
+            }
+        }
+    }
+
+    /// The line `contain --identity` prints when the instance has no scope.
+    pub fn no_scope_sentence(why: NoScope) -> String {
+        format!(
+            "innerwarden contain: no scope ({}): identity is at most observed",
+            why.why()
+        )
+    }
+
+    /// How the jail is launched: in a user scope, or directly.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum ScopePlan {
+        User {
+            systemd_run: PathBuf,
+            /// `innerwarden-contain-<instance_id>.scope`.
+            unit: String,
+            /// Pass `--expand-environment=no`.
+            no_expand: bool,
+        },
+        None(NoScope),
+    }
+
+    /// Decide the scope from the facts. `unit` is the instance's
+    /// `identity::scope_unit_name`.
+    pub fn plan_scope(facts: &ScopeFacts, unit: &str) -> ScopePlan {
+        let Some(systemd_run) = facts.systemd_run.clone() else {
+            return ScopePlan::None(NoScope::NoSystemdRun);
+        };
+        if !facts.user_manager {
+            return ScopePlan::None(NoScope::NoUserManager);
+        }
+        let Some(version) = facts.systemd_version else {
+            return ScopePlan::None(NoScope::UnknownSystemd);
+        };
+        ScopePlan::User {
+            systemd_run,
+            unit: unit.to_string(),
+            no_expand: version >= EXPAND_ENVIRONMENT_SWITCH_SINCE,
+        }
+    }
+
+    /// Where the user's manager listens, from `$XDG_RUNTIME_DIR`. A relative or
+    /// empty value names nothing (the XDG rule).
+    pub fn user_manager_socket(xdg_runtime_dir: Option<&str>) -> Option<PathBuf> {
+        let dir = Path::new(xdg_runtime_dir?);
+        dir.is_absolute().then(|| dir.join("systemd/private"))
+    }
+
+    /// The major version in `systemd-run --version`, whose first line is
+    /// `systemd 255 (255.4-1ubuntu8.17)`.
+    pub fn parse_systemd_version(text: &str) -> Option<u32> {
+        let first = text.lines().next()?;
+        let rest = first.strip_prefix("systemd ")?;
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        if digits.is_empty() || digits.len() > 6 {
+            return None;
+        }
+        digits.parse().ok()
+    }
+
+    /// The program and arguments that start the jail. Without a scope it is
+    /// bwrap and the plan's arguments, untouched.
+    pub fn launch_argv(
+        bwrap: &Path,
+        bwrap_args: &[String],
+        scope: &ScopePlan,
+    ) -> (PathBuf, Vec<String>) {
+        match scope {
+            ScopePlan::None(_) => (bwrap.to_path_buf(), bwrap_args.to_vec()),
+            ScopePlan::User {
+                systemd_run,
+                unit,
+                no_expand,
+            } => {
+                let mut args: Vec<String> = ["--user", "--scope", "--quiet", "--unit"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect();
+                args.push(unit.clone());
+                if *no_expand {
+                    args.push("--expand-environment=no".to_string());
+                }
+                args.push("--".to_string());
+                args.push(bwrap.to_string_lossy().into_owned());
+                args.extend(bwrap_args.iter().cloned());
+                (systemd_run.clone(), args)
+            }
+        }
+    }
+
+    /// The cgroup in `/proc/<pid>/cgroup`: the unified line `0::<path>`, or on
+    /// a hybrid host systemd's own `name=systemd` line. `None` for anything
+    /// else, including a path that is not absolute.
+    pub fn parse_proc_cgroup(text: &str) -> Option<String> {
+        let unified = text.lines().find_map(|l| l.strip_prefix("0::"));
+        let named = || {
+            text.lines().find_map(|l| {
+                let mut parts = l.splitn(3, ':');
+                let (_, controllers, path) = (parts.next()?, parts.next()?, parts.next()?);
+                (controllers == "name=systemd").then_some(path)
+            })
+        };
+        let path = unified.or_else(named)?.trim_end();
+        (path.starts_with('/') && !path.chars().any(char::is_control)).then(|| path.to_string())
+    }
+
+    /// The user scope the jail is in, if the kernel's word for its cgroup is
+    /// the instance's unit under this user's own manager.
+    pub fn user_scope_seen(cgroup: &str, unit: &str, uid: u32) -> Option<Scope> {
+        is_user_scope_cgroup(cgroup, unit, uid).then(|| Scope {
+            unit: unit.to_string(),
+            cgroup_path: cgroup.to_string(),
+        })
+    }
+
+    /// The system scope the jail is in, if the kernel's word for its cgroup is
+    /// exactly the instance's unit under the system slice, which only root
+    /// can make.
+    pub fn system_scope_seen(cgroup: &str, unit: &str) -> Option<Scope> {
+        (cgroup == system_scope_cgroup(unit)).then(|| Scope {
+            unit: unit.to_string(),
+            cgroup_path: cgroup.to_string(),
+        })
+    }
 
     /// What bwrap reports through `--info-fd`. Fields it adds later are ignored.
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -881,6 +1146,9 @@ pub mod launch {
         pub start_ticks: u64,
         /// `/proc/<child-pid>/ns/pid`, read by the launcher.
         pub pid_ns: u64,
+        /// The scopes the kernel showed the jail in ([`user_scope_seen`],
+        /// [`system_scope_seen`]); empty for none.
+        pub scope: Scopes,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -962,7 +1230,7 @@ pub mod launch {
                 start_ticks: facts.start_ticks,
                 pid_ns: facts.pid_ns,
             },
-            scope: None,
+            scope: (!facts.scope.is_empty()).then_some(facts.scope),
         };
         record.validate().map_err(AssembleError::Record)?;
         Ok(record)
@@ -1021,6 +1289,7 @@ mod tests {
                 },
             ],
             info_fd: None,
+            record_fd: None,
         }
     }
 
@@ -1572,6 +1841,7 @@ mod tests {
             },
             start_ticks: 123456,
             pid_ns: 4026532220,
+            scope: Default::default(),
         }
     }
 
@@ -1597,7 +1867,7 @@ mod tests {
         );
         assert!(
             record.scope.is_none(),
-            "no scope until the launcher makes one"
+            "no scope when the kernel showed the jail in none"
         );
         // what is written is what a reader accepts, and it carries no secret
         let json = serde_json::to_vec(&record).unwrap();
@@ -1666,6 +1936,365 @@ mod tests {
             launch::assemble_record(relative),
             Err(AssembleError::Record(_))
         ));
+    }
+
+    // ---- `--identity`: the record mount, the sealed trees, the scope ----
+
+    /// The record, mounted where the hook looks for it.
+    fn record_mount(fd: &str) -> Vec<String> {
+        vec![
+            "--ro-bind-data".into(),
+            fd.into(),
+            innerwarden_agent_guard::identity::JAIL_RECORD_PATH.into(),
+        ]
+    }
+
+    /// The options that may follow the record: none of them mounts anything.
+    const AFTER_THE_RECORD: &[&str] = &[
+        "--die-with-parent",
+        "--unshare-pid",
+        "--unshare-uts",
+        "--unshare-ipc",
+        "--hostname",
+        "--new-session",
+        "--info-fd",
+    ];
+
+    /// The record is mounted read-only, after the `/run` tmpfs it lands on,
+    /// and LAST of all mounts, so no later option can cover it (bwrap is
+    /// last-wins). Removing it and the info descriptor gives today's jail.
+    ///
+    /// FAILS ON REVERT: mount it with `--bind-data` (writable by the agent),
+    /// or before `--tmpfs /run` (which then hides it), or before the project
+    /// and the masks (a later mount could cover it).
+    #[test]
+    fn the_record_is_mounted_read_only_after_the_run_tmpfs_and_last_of_all_mounts() {
+        let mut rich = inputs(&["/bin/sh", "-c", "true"]);
+        rich.stdin_is_tty = false;
+        rich.agent_binary = Some(ResolvedBinary {
+            link: PathBuf::from("/home/dev/.local/bin/claude"),
+            target_dir: PathBuf::from("/home/dev/.local/share/claude/v1"),
+        });
+        rich.worktree = Some(Worktree {
+            git_dir: PathBuf::from("/home/dev/repo/.git/worktrees/w"),
+            common_dir: PathBuf::from("/home/dev/repo/.git"),
+        });
+        for (mut input, golden) in [
+            (inputs(&["claude", "--print"]), GOLDEN_ARGV_PLAIN),
+            (rich, GOLDEN_ARGV_RICH),
+        ] {
+            input.args.identity = true;
+            input.info_fd = Some(7);
+            input.record_fd = Some(8);
+            let got = build_linux_jail(&input).unwrap().bwrap_args;
+            let mount = record_mount("8");
+            let at = got
+                .windows(3)
+                .position(|w| w == mount.as_slice())
+                .expect("the record is mounted");
+            assert!(
+                !got.iter().any(|a| a == "--bind-data"),
+                "never a writable copy"
+            );
+            let run_tmpfs = got
+                .windows(2)
+                .position(|w| w[0] == "--tmpfs" && w[1] == "/run")
+                .expect("--tmpfs /run");
+            assert!(run_tmpfs < at, "the record lands on the /run tmpfs");
+            let terminator = got.iter().position(|a| a == "--").expect("--");
+            for option in got[at + 3..terminator]
+                .iter()
+                .filter(|a| a.starts_with("--"))
+            {
+                assert!(
+                    AFTER_THE_RECORD.contains(&option.as_str()),
+                    "{option} comes after the record and may cover it"
+                );
+            }
+            // Without its two additions the jail is exactly today's.
+            let mut without = got.clone();
+            without.drain(at..at + 3);
+            let info = without.iter().position(|a| a == "--info-fd").unwrap();
+            without.drain(info..info + 2);
+            assert_eq!(without.join("\n"), golden);
+        }
+    }
+
+    /// With `--identity` a writable bind may not bring the host's `/run` (the
+    /// user's manager and bus) or `/sys` (the cgroup files) back into the
+    /// jail. Without the flag nothing changes.
+    ///
+    /// FAILS ON REVERT: drop the check and a project under `/run` opens the
+    /// user bus inside an identified jail.
+    #[test]
+    fn identity_refuses_a_writable_bind_over_run_or_sys_and_nothing_changes_without_it() {
+        let identified = |project: &str| {
+            let mut input = inputs(&["claude"]);
+            input.args.project = PathBuf::from(project);
+            input.args.identity = true;
+            input
+        };
+        for unsafe_project in ["/run/user/1000/proj", "/run", "/sys/fs/cgroup/x", "/sys"] {
+            let input = identified(unsafe_project);
+            assert!(
+                matches!(validate_jail_inputs(&input), Err(ContainError::Unsupported(ref m)) if m.contains("--identity")),
+                "{unsafe_project}"
+            );
+            assert!(build_linux_jail(&input).is_err(), "{unsafe_project}");
+            // the same project without the flag is what it was before
+            let mut plain = input.clone();
+            plain.args.identity = false;
+            assert!(validate_jail_inputs(&plain).is_ok(), "{unsafe_project}");
+        }
+        let mut worktree = identified("/home/dev/proj");
+        worktree.worktree = Some(Worktree {
+            git_dir: PathBuf::from("/run/user/1000/repo/.git/worktrees/w"),
+            common_dir: PathBuf::from("/home/dev/repo/.git"),
+        });
+        assert!(validate_jail_inputs(&worktree).is_err());
+        let mut extra = identified("/home/dev/proj");
+        extra.args.extra_rw = vec![PathBuf::from("/sys/fs/cgroup")];
+        assert!(validate_jail_inputs(&extra).is_err());
+        for fine in ["/home/dev/proj", "/tmp/proj", "/srv/run", "/runner/proj"] {
+            assert!(validate_jail_inputs(&identified(fine)).is_ok(), "{fine}");
+        }
+    }
+
+    fn facts(systemd_run: Option<&str>, version: Option<u32>, manager: bool) -> launch::ScopeFacts {
+        launch::ScopeFacts {
+            systemd_run: systemd_run.map(PathBuf::from),
+            systemd_version: version,
+            user_manager: manager,
+        }
+    }
+
+    const UNIT: &str = "innerwarden-contain-0123456789abcdef0123456789abcdef.scope";
+
+    #[test]
+    fn the_scope_plan_follows_the_facts() {
+        use launch::{plan_scope, NoScope, ScopePlan};
+        let run = Some("/usr/bin/systemd-run");
+        assert_eq!(
+            plan_scope(&facts(None, Some(255), true), UNIT),
+            ScopePlan::None(NoScope::NoSystemdRun)
+        );
+        assert_eq!(
+            plan_scope(&facts(run, Some(255), false), UNIT),
+            ScopePlan::None(NoScope::NoUserManager)
+        );
+        assert_eq!(
+            plan_scope(&facts(run, None, true), UNIT),
+            ScopePlan::None(NoScope::UnknownSystemd)
+        );
+        for (version, no_expand) in [(252, false), (253, false), (254, true), (255, true)] {
+            assert_eq!(
+                plan_scope(&facts(run, Some(version), true), UNIT),
+                ScopePlan::User {
+                    systemd_run: PathBuf::from("/usr/bin/systemd-run"),
+                    unit: UNIT.into(),
+                    no_expand,
+                },
+                "systemd {version}"
+            );
+        }
+    }
+
+    /// Without a scope the jail is started as it is today: bwrap, its
+    /// arguments, nothing in front. In a scope, systemd-run is in front and
+    /// bwrap's arguments, the agent's command among them, reach it as typed.
+    ///
+    /// FAILS ON REVERT: wrap every launch (flag-off argv changes), or drop
+    /// `--expand-environment=no` (then the agent's command line reaches bwrap
+    /// as typed only where that systemd's default happens not to expand).
+    #[test]
+    fn a_scope_puts_systemd_run_in_front_and_changes_nothing_behind_it() {
+        use launch::{launch_argv, NoScope, ScopePlan};
+        let bwrap = Path::new("/usr/bin/bwrap");
+        let args: Vec<String> = ["--unshare-pid", "--", "sh", "-c", "echo $HOME ${USER}"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        for why in [NoScope::NoSystemdRun, NoScope::NoUserManager] {
+            assert_eq!(
+                launch_argv(bwrap, &args, &ScopePlan::None(why)),
+                (bwrap.to_path_buf(), args.clone())
+            );
+        }
+        let scoped = |no_expand| ScopePlan::User {
+            systemd_run: PathBuf::from("/usr/bin/systemd-run"),
+            unit: UNIT.into(),
+            no_expand,
+        };
+        let (program, got) = launch_argv(bwrap, &args, &scoped(true));
+        assert_eq!(program, PathBuf::from("/usr/bin/systemd-run"));
+        let mut want: Vec<String> = [
+            "--user",
+            "--scope",
+            "--quiet",
+            "--unit",
+            UNIT,
+            "--expand-environment=no",
+            "--",
+            "/usr/bin/bwrap",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        want.extend(args.iter().cloned());
+        assert_eq!(got, want);
+        // An older systemd has no such switch and no expansion to stop.
+        let (_, old) = launch_argv(bwrap, &args, &scoped(false));
+        assert!(!old.iter().any(|a| a.starts_with("--expand-environment")));
+        let behind = old.iter().position(|a| a == "--").unwrap();
+        assert_eq!(old[behind + 1], "/usr/bin/bwrap");
+        assert_eq!(&old[behind + 2..], args.as_slice());
+    }
+
+    #[test]
+    fn the_user_manager_socket_and_the_systemd_version_are_read_strictly() {
+        use launch::{parse_systemd_version, user_manager_socket};
+        assert_eq!(
+            user_manager_socket(Some("/run/user/1000")),
+            Some(PathBuf::from("/run/user/1000/systemd/private"))
+        );
+        for no in [None, Some(""), Some("run/user/1000")] {
+            assert_eq!(user_manager_socket(no), None, "{no:?}");
+        }
+        assert_eq!(
+            parse_systemd_version("systemd 255 (255.4-1ubuntu8.17)\n+PAM +AUDIT\n"),
+            Some(255)
+        );
+        assert_eq!(
+            parse_systemd_version("systemd 252 (252-55.el9_7.8.rocky.0.1)\n"),
+            Some(252)
+        );
+        for bad in [
+            "",
+            "systemd",
+            "systemd x",
+            "foo 255",
+            " systemd 255",
+            "systemd 9999999",
+        ] {
+            assert_eq!(parse_systemd_version(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_cgroup_is_the_kernels_unified_line_or_systemds_own() {
+        use launch::parse_proc_cgroup;
+        let user = "/user.slice/user-1000.slice/user@1000.service/app.slice/x.scope";
+        assert_eq!(parse_proc_cgroup(&format!("0::{user}\n")).unwrap(), user);
+        // hybrid: the unified line wins over the named one
+        let hybrid = format!("12:pids:/user.slice\n1:name=systemd:/elsewhere\n0::{user}\n");
+        assert_eq!(parse_proc_cgroup(&hybrid).unwrap(), user);
+        let legacy = format!("4:memory:/user.slice\n1:name=systemd:{user}\n");
+        assert_eq!(parse_proc_cgroup(&legacy).unwrap(), user);
+        for bad in [
+            "",
+            "0::relative/x\n",
+            "4:memory:/user.slice\n",
+            "0::/a\u{7}b\n",
+        ] {
+            assert_eq!(parse_proc_cgroup(bad), None, "{bad:?}");
+        }
+    }
+
+    /// A scope is recorded only when the kernel's word for the jail's cgroup
+    /// is THIS instance's unit, under this user's manager (user) or directly
+    /// under the system slice (system).
+    ///
+    /// FAILS ON REVERT: accept any cgroup ending in the unit name and a
+    /// user-made `.../system.slice/<unit>` is recorded as a system scope.
+    #[test]
+    fn a_scope_is_recorded_only_from_the_instances_own_cgroup() {
+        use launch::{system_scope_seen, user_scope_seen};
+        let user = format!("/user.slice/user-1000.slice/user@1000.service/app.slice/{UNIT}");
+        assert_eq!(
+            user_scope_seen(&user, UNIT, 1000).unwrap().cgroup_path,
+            user
+        );
+        assert!(user_scope_seen(&user, UNIT, 1001).is_none(), "another user");
+        let other = user.replace("0123456789abcdef0123", "ffffffffffffffffffff");
+        assert!(
+            user_scope_seen(&other, UNIT, 1000).is_none(),
+            "another unit"
+        );
+        let session = format!("/user.slice/user-1000.slice/session-2.scope/{UNIT}");
+        assert!(
+            user_scope_seen(&session, UNIT, 1000).is_none(),
+            "not the manager's"
+        );
+
+        let system = format!("/system.slice/{UNIT}");
+        assert_eq!(
+            system_scope_seen(&system, UNIT).unwrap().cgroup_path,
+            system
+        );
+        for not_root in [
+            format!("/user.slice/user-1000.slice/user@1000.service/app.slice/system.slice/{UNIT}"),
+            format!("/system.slice/nested.slice/{UNIT}"),
+            user.clone(),
+            "/system.slice".to_string(),
+        ] {
+            assert!(system_scope_seen(&not_root, UNIT).is_none(), "{not_root}");
+        }
+    }
+
+    #[test]
+    fn the_record_carries_the_scopes_the_kernel_showed() {
+        use innerwarden_agent_guard::identity::{parse_launch_record, Scope, Scopes};
+        use launch::{system_scope_seen, user_scope_seen};
+        let (mode, launcher, project) = (
+            Mode::Monitor,
+            Path::new("/usr/local/bin/innerwarden"),
+            Path::new("/home/dev/proj"),
+        );
+        let mut both = launch_facts(&mode, launcher, project);
+        let unit = format!("innerwarden-contain-{}.scope", both.instance_id);
+        let user = format!("/user.slice/user-1000.slice/user@1000.service/app.slice/{unit}");
+        both.scope = Scopes {
+            user: user_scope_seen(&user, &unit, 1000),
+            system: system_scope_seen(&format!("/system.slice/{unit}"), &unit),
+        };
+        let record = launch::assemble_record(both).unwrap();
+        let scopes = record.scope.clone().expect("scopes recorded");
+        assert_eq!(scopes.user.unwrap().cgroup_path, user);
+        assert_eq!(
+            scopes.system.unwrap().cgroup_path,
+            format!("/system.slice/{unit}")
+        );
+        let json = serde_json::to_vec(&record).unwrap();
+        assert_eq!(parse_launch_record(&json).unwrap(), record);
+
+        // A scope that is not this instance's makes no record at all.
+        let mut borrowed = launch_facts(&mode, launcher, project);
+        borrowed.scope.system = Some(Scope {
+            unit: UNIT.into(),
+            cgroup_path: format!("/system.slice/{UNIT}"),
+        });
+        assert!(matches!(
+            launch::assemble_record(borrowed),
+            Err(launch::AssembleError::Record(_))
+        ));
+    }
+
+    #[test]
+    fn a_launch_without_a_scope_says_identity_is_at_most_observed() {
+        use launch::{no_scope_sentence, NoScope};
+        assert_eq!(
+            no_scope_sentence(NoScope::NoUserManager),
+            "innerwarden contain: no scope (no user service manager in this session): identity is at most observed"
+        );
+        for why in [
+            NoScope::NoSystemdRun,
+            NoScope::NoUserManager,
+            NoScope::UnknownSystemd,
+            NoScope::ScopeNotStarted,
+            NoScope::NotSeenInScope,
+        ] {
+            assert!(no_scope_sentence(why).contains(why.why()), "{why:?}");
+        }
     }
 
     const GOLDEN_ARGV_PLAIN: &str = "\

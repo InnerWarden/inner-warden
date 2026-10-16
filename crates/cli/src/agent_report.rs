@@ -143,6 +143,21 @@ pub fn report_url(var: Option<&str>) -> Result<String, String> {
     }
 }
 
+/// PURE. The full URL of another of the local agent's routes, under the same
+/// rule as [`report_url`]: the default loopback address, another loopback
+/// address the variable names, or `None` when it says `off` or names a host
+/// that is not this one.
+// Its caller, `contain --identity`, is Linux-only; the test runs everywhere.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn agent_route(var: Option<&str>, path: &str) -> Option<String> {
+    match var.map(str::trim).filter(|v| !v.is_empty()) {
+        None => Some(format!("{DEFAULT_AGENT_URL}{path}")),
+        Some(v) if v.eq_ignore_ascii_case("off") => None,
+        Some(v) if is_loopback_url(v) => Some(format!("{}{path}", v.trim_end_matches('/'))),
+        Some(_) => None,
+    }
+}
+
 /// POST one report; `Err` says why it was not taken.
 pub fn send_report(url: &str, body: &Value) -> Result<(), String> {
     let mut config = ureq::Agent::config_builder()
@@ -334,6 +349,36 @@ mod tests {
                 report_url(Some(elsewhere)).is_err_and(|why| !why.is_empty()),
                 "{elsewhere}"
             );
+        }
+    }
+
+    /// Another route of the agent follows the same rule: loopback or nowhere.
+    ///
+    /// FAILS ON REVERT: accept any URL the variable names and a launcher
+    /// sends its request off the host.
+    #[test]
+    fn another_agent_route_is_loopback_or_nowhere() {
+        let path = "/api/agent/contain-scope";
+        assert_eq!(
+            agent_route(None, path).unwrap(),
+            "https://127.0.0.1:8787/api/agent/contain-scope"
+        );
+        assert_eq!(
+            agent_route(Some(" "), path).unwrap(),
+            "https://127.0.0.1:8787/api/agent/contain-scope"
+        );
+        assert_eq!(
+            agent_route(Some("https://localhost:9443/"), path).unwrap(),
+            "https://localhost:9443/api/agent/contain-scope"
+        );
+        assert_eq!(agent_route(Some("OFF"), path), None);
+        for elsewhere in [
+            "https://10.0.0.5:8787",
+            "https://127.0.0.1.evil.example",
+            "https://localhost.evil.example:8787",
+            "ftp://127.0.0.1",
+        ] {
+            assert_eq!(agent_route(Some(elsewhere), path), None, "{elsewhere}");
         }
     }
 

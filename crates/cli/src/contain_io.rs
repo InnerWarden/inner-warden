@@ -193,6 +193,7 @@ fn resolve_inputs(args: ContainArgs, home: PathBuf, iw_binary: PathBuf) -> JailI
         iw_config_real,
         deny_paths,
         info_fd: None,
+        record_fd: None,
     }
 }
 
@@ -381,11 +382,12 @@ fn backend_trusted(facts: &BackendFacts) -> bool {
 }
 
 fn run_linux(input: &JailInputs) -> ExitCode {
-    // A dry run with `--identity` shows the argument the real run adds.
+    // A dry run with `--identity` shows the arguments the real run adds.
     let dry_identity;
     let planned = if input.args.identity && input.args.dry_run {
         dry_identity = JailInputs {
             info_fd: Some(crate::contain::launch::DRY_RUN_INFO_FD),
+            record_fd: Some(crate::contain::launch::DRY_RUN_RECORD_FD),
             ..input.clone()
         };
         &dry_identity
@@ -402,6 +404,10 @@ fn run_linux(input: &JailInputs) -> ExitCode {
     if input.args.dry_run {
         println!("# innerwarden contain - DRY RUN (Linux / bubblewrap)");
         print_plan_env(&plan.env);
+        #[cfg(target_os = "linux")]
+        if input.args.identity {
+            println!("# {}", dry_run_scope_line());
+        }
         println!("bwrap \\");
         println!("  {}", plan.bwrap_args.join(" "));
         return ExitCode::SUCCESS;
@@ -434,6 +440,11 @@ fn run_linux(input: &JailInputs) -> ExitCode {
         return run_linux_identified(input, &bwrap);
     }
     announce(input);
+    run_plain(&bwrap, &plan)
+}
+
+/// The jail as it runs without `--identity`: bwrap, its arguments, waited for.
+fn run_plain(bwrap: &Path, plan: &crate::contain::LinuxJailPlan) -> ExitCode {
     let status = Command::new(bwrap)
         .args(&plan.bwrap_args)
         .envs(plan.env.iter().cloned())
@@ -496,100 +507,227 @@ fn write_launch_record(
     Ok(target)
 }
 
-/// Run the jail with `--identity`: bwrap reports the jail's first process
-/// through a pipe, the launcher reads that process's start time and PID
-/// namespace from the host's `/proc`, and writes the record. The jail itself is
-/// built exactly as without the flag, plus `--info-fd`.
+/// Run the jail with `--identity`.
 ///
-/// A record that cannot be made is said, not hidden, and the jail still runs:
-/// an instance with no record is an unidentified one, which is what every
-/// instance was before.
+/// The order is in `contain::launch` (the comment above `ScopePlan`): the user
+/// scope is made around bwrap, bwrap reports the jail's first process through
+/// one pipe, that process waits for the record on a second pipe, and the
+/// launcher reads the jail from the host's `/proc`, asks for a system scope
+/// where Active Defence runs, and hands the record in. The jail itself is
+/// built exactly as without the flag, plus `--ro-bind-data` and `--info-fd`.
+///
+/// A record that cannot be made is said, not hidden, and the jail still runs
+/// with an empty record (unreadable inside, so `declared`): an instance with no
+/// record is an unidentified one, which is what every instance was before.
 #[cfg(target_os = "linux")]
 fn run_linux_identified(input: &JailInputs, bwrap: &Path) -> ExitCode {
-    use std::os::fd::AsRawFd;
+    use crate::contain::launch::{no_scope_sentence, plan_scope, NoScope, ScopePlan};
+    use innerwarden_agent_guard::identity::scope_unit_name;
 
-    let (mut reader, writer) = match std::io::pipe() {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("innerwarden contain: cannot open the info pipe: {e}");
-            return ExitCode::from(1);
+    let named = new_instance_id().and_then(|id| {
+        let unit = scope_unit_name(&id).ok_or("the instance id is not a name")?;
+        Ok((id, unit))
+    });
+    let (instance_id, unit) = match named {
+        Ok(named) => named,
+        Err(why) => {
+            eprintln!(
+                "innerwarden contain: no instance record written ({why}); the jail runs, unidentified"
+            );
+            announce(input);
+            return match build_linux_jail(input) {
+                Ok(plan) => run_plain(bwrap, &plan),
+                Err(e) => {
+                    eprintln!("innerwarden contain: {e}");
+                    ExitCode::from(2)
+                }
+            };
         }
     };
-    // The write end must survive the exec of bwrap; std opens both ends close-on-exec.
-    // SAFETY: fcntl on a descriptor this function owns.
-    let inheritable = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_SETFD, 0) } == 0;
-    if !inheritable {
-        eprintln!("innerwarden contain: cannot hand the info pipe to bwrap");
-        return ExitCode::from(1);
+    let mut scope = plan_scope(&scope_facts(), &unit);
+    if let ScopePlan::None(why) = scope {
+        eprintln!("{}", no_scope_sentence(why));
     }
-    let mut identified = input.clone();
-    identified.info_fd = Some(writer.as_raw_fd());
-    let plan = match build_linux_jail(&identified) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("innerwarden contain: {e}");
-            return ExitCode::from(2);
-        }
-    };
     announce(input);
-    let mut child = match Command::new(bwrap)
-        .args(&plan.bwrap_args)
-        .envs(plan.env.iter().cloned())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => return exit_from(Err(e)),
-    };
-    // Ours must close, or the read below never sees the end of the stream.
-    drop(writer);
-    match record_the_instance(input, &mut reader) {
-        Ok(path) => eprintln!("innerwarden contain - instance record: {}", path.display()),
-        Err(why) => eprintln!(
-            "innerwarden contain: no instance record written ({why}); the jail runs, unidentified"
-        ),
+    loop {
+        match launch_identified(input, bwrap, &instance_id, &unit, &scope) {
+            Attempt::Done(code) => return code,
+            // Nothing of the jail ran: bwrap never reported a pid, and the
+            // jail cannot pass the record it never got. Only the scope was
+            // new, so run once more without it.
+            Attempt::NeverStarted(_) if matches!(scope, ScopePlan::User { .. }) => {
+                eprintln!("{}", no_scope_sentence(NoScope::ScopeNotStarted));
+                scope = ScopePlan::None(NoScope::ScopeNotStarted);
+            }
+            Attempt::NeverStarted(status) => return exit_from(status),
+        }
     }
-    drop(reader);
-    exit_from(child.wait())
 }
 
 #[cfg(target_os = "linux")]
-fn record_the_instance(
-    input: &JailInputs,
-    reader: &mut std::io::PipeReader,
-) -> Result<PathBuf, String> {
-    use crate::contain::launch::{
-        assemble_record, instance_id_from, parse_ns_link, parse_start_ticks, records_dir,
-        LaunchFacts,
-    };
+enum Attempt {
+    Done(ExitCode),
+    /// The jail never started: no pid was reported and the launch ended.
+    NeverStarted(std::io::Result<std::process::ExitStatus>),
+}
 
-    let info = read_info(reader)?;
-    let pid = info.child_pid;
-    // Start time before and after the namespace: the same process both times,
-    // or the pid was reused and nothing here describes the jail.
-    let stat = |pid: u32| std::fs::read_to_string(format!("/proc/{pid}/stat"));
-    let before = stat(pid)
-        .ok()
-        .and_then(|s| parse_start_ticks(&s))
-        .ok_or("the jail process is gone or its start time is unreadable")?;
-    let pid_ns = std::fs::read_link(format!("/proc/{pid}/ns/pid"))
-        .ok()
-        .and_then(|l| parse_ns_link(&l.to_string_lossy()))
-        .ok_or("the jail's PID namespace is unreadable")?;
-    let after = stat(pid).ok().and_then(|s| parse_start_ticks(&s));
-    if after != Some(before) {
-        return Err("the jail process changed while it was read".into());
-    }
-
+/// 16 random bytes from the kernel, as an instance id.
+#[cfg(target_os = "linux")]
+fn new_instance_id() -> Result<String, String> {
     let mut random = [0u8; 16];
     std::fs::File::open("/dev/urandom")
         .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut random))
         .map_err(|e| format!("no randomness for the instance id: {e}"))?;
-    let launcher_root_owned =
-        backend_facts(&input.iw_binary).is_some_and(|facts| backend_trusted(&facts));
+    Ok(crate::contain::launch::instance_id_from(random))
+}
+
+/// Clear close-on-exec on a descriptor bwrap must inherit. `std` opens both
+/// ends of a pipe close-on-exec; only bwrap's end is cleared, so the launcher's
+/// ends never reach the jail.
+#[cfg(target_os = "linux")]
+fn hand_to_child(fd: &impl std::os::fd::AsRawFd) -> bool {
+    // SAFETY: fcntl on a descriptor the caller owns.
+    unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, 0) == 0 }
+}
+
+/// One launch of the identified jail.
+#[cfg(target_os = "linux")]
+fn launch_identified(
+    input: &JailInputs,
+    bwrap: &Path,
+    instance_id: &str,
+    unit: &str,
+    scope: &crate::contain::launch::ScopePlan,
+) -> Attempt {
+    use crate::contain::launch::{launch_argv, ScopePlan};
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+
+    let pipes = std::io::pipe().and_then(|info| Ok((info, std::io::pipe()?)));
+    let ((mut info_reader, info_writer), (record_reader, mut record_writer)) = match pipes {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("innerwarden contain: cannot open the jail's pipes: {e}");
+            return Attempt::Done(ExitCode::from(1));
+        }
+    };
+    if !hand_to_child(&info_writer) || !hand_to_child(&record_reader) {
+        eprintln!("innerwarden contain: cannot hand the jail's pipes to bwrap");
+        return Attempt::Done(ExitCode::from(1));
+    }
+    let mut identified = input.clone();
+    identified.info_fd = Some(info_writer.as_raw_fd());
+    identified.record_fd = Some(record_reader.as_raw_fd());
+    let plan = match build_linux_jail(&identified) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("innerwarden contain: {e}");
+            return Attempt::Done(ExitCode::from(2));
+        }
+    };
+    let (program, args) = launch_argv(bwrap, &plan.bwrap_args, scope);
+    let spawned = Command::new(&program)
+        .args(&args)
+        .envs(plan.env.iter().cloned())
+        .spawn();
+    // Ours must close, or the read below never ends and the jail never sees
+    // the end of its record.
+    drop(info_writer);
+    drop(record_reader);
+    let mut child = match spawned {
+        Ok(c) => c,
+        Err(e) if matches!(scope, ScopePlan::User { .. }) => return Attempt::NeverStarted(Err(e)),
+        Err(e) => return Attempt::Done(exit_from(Err(e))),
+    };
+    let info = read_info(&mut info_reader);
+    drop(info_reader);
+    let record = match info {
+        InfoRead::Nothing => {
+            drop(record_writer);
+            return match child.wait() {
+                Ok(status) if status.success() => Attempt::Done(exit_from(Ok(status))),
+                status => Attempt::NeverStarted(status),
+            };
+        }
+        InfoRead::Failed(why) => Err(why),
+        InfoRead::Got(info) => identify(input, instance_id, unit, scope, info),
+    };
+    match record {
+        Ok(json) => {
+            // The jail reads this to its end before it builds its root.
+            if let Err(e) = record_writer.write_all(&json) {
+                eprintln!("innerwarden contain: the jail did not take its record: {e}");
+            } else {
+                eprintln!(
+                    "  inside the jail: {} (read-only)",
+                    innerwarden_agent_guard::identity::JAIL_RECORD_PATH
+                );
+            }
+        }
+        Err(why) => eprintln!(
+            "innerwarden contain: no instance record written ({why}); the jail runs, unidentified"
+        ),
+    }
+    drop(record_writer);
+    Attempt::Done(exit_from(child.wait()))
+}
+
+/// Read the facts about the jail from the host, make the record, write the
+/// launcher's copy, and return the bytes for the jail's copy.
+#[cfg(target_os = "linux")]
+fn identify(
+    input: &JailInputs,
+    instance_id: &str,
+    unit: &str,
+    scope: &crate::contain::launch::ScopePlan,
+    info: crate::contain::launch::InfoFd,
+) -> Result<Vec<u8>, String> {
+    use crate::contain::launch::{
+        assemble_record, no_scope_sentence, parse_ns_link, records_dir, user_scope_seen,
+        LaunchFacts, NoScope, ScopePlan,
+    };
+    use innerwarden_agent_guard::identity::Scopes;
+
+    let pid = info.child_pid;
+    // Start time before the namespace and the cgroups and after them: the
+    // same process both times, or the pid was reused and nothing here
+    // describes the jail.
+    let before =
+        start_ticks(pid).ok_or("the jail process is gone or its start time is unreadable")?;
+    let pid_ns = std::fs::read_link(format!("/proc/{pid}/ns/pid"))
+        .ok()
+        .and_then(|l| parse_ns_link(&l.to_string_lossy()))
+        .ok_or("the jail's PID namespace is unreadable")?;
     // SAFETY: getuid takes no arguments and cannot fail.
     let uid = unsafe { libc::getuid() };
+
+    let mut scopes = Scopes::default();
+    if let ScopePlan::User { .. } = scope {
+        let cgroup = proc_cgroup(pid);
+        scopes.user = cgroup
+            .as_deref()
+            .and_then(|c| user_scope_seen(c, unit, uid));
+        if scopes.user.is_none() {
+            eprintln!(
+                "innerwarden contain: the jail is not in its user scope (the kernel says {})",
+                cgroup.as_deref().unwrap_or("nothing")
+            );
+        }
+    }
+    if crate::upsell_io::active_defence_installed() {
+        scopes.system = request_system_scope(instance_id, unit, pid);
+    }
+    if scopes.is_empty() && matches!(scope, ScopePlan::User { .. }) {
+        eprintln!("{}", no_scope_sentence(NoScope::NotSeenInScope));
+    }
+    if start_ticks(pid) != Some(before) {
+        return Err("the jail process changed while it was read".into());
+    }
+
+    let launcher_root_owned =
+        backend_facts(&input.iw_binary).is_some_and(|facts| backend_trusted(&facts));
     let facts = LaunchFacts {
-        instance_id: instance_id_from(random),
+        instance_id: instance_id.to_string(),
         agent_type: &input.args.agent,
         launcher_path: &input.iw_binary,
         launcher_version: env!("CARGO_PKG_VERSION"),
@@ -601,16 +739,159 @@ fn record_the_instance(
         info,
         start_ticks: before,
         pid_ns,
+        scope: scopes,
     };
     let record = assemble_record(facts).map_err(|e| e.to_string())?;
     let json = serde_json::to_vec(&record).map_err(|e| e.to_string())?;
     let dir = records_dir(std::env::var("XDG_STATE_HOME").ok().as_deref(), &input.home);
-    write_launch_record(&dir, &record.instance_id, &json, uid).map_err(|e| e.to_string())
+    match write_launch_record(&dir, &record.instance_id, &json, uid) {
+        Ok(path) => eprintln!("innerwarden contain - instance record: {}", path.display()),
+        Err(e) => eprintln!(
+            "innerwarden contain: the launcher's copy of the record was not written ({e})"
+        ),
+    }
+    Ok(json)
+}
+
+/// `/proc/<pid>/stat` field 22.
+#[cfg(target_os = "linux")]
+fn start_ticks(pid: u32) -> Option<u64> {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|s| crate::contain::launch::parse_start_ticks(&s))
+}
+
+/// The cgroup of `pid` as the kernel reports it.
+#[cfg(target_os = "linux")]
+fn proc_cgroup(pid: u32) -> Option<String> {
+    use std::io::Read;
+    let mut text = String::new();
+    std::fs::File::open(format!("/proc/{pid}/cgroup"))
+        .ok()?
+        .take(64 * 1024)
+        .read_to_string(&mut text)
+        .ok()?;
+    crate::contain::launch::parse_proc_cgroup(&text)
+}
+
+/// How long the launcher waits for the kernel to show the jail in its system
+/// scope once the request was taken. Placing a pid takes a systemd job, which
+/// was measured to show in `/proc/<pid>/cgroup` about one second later.
+#[cfg(target_os = "linux")]
+const SYSTEM_SCOPE_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Ask the local Active Defence agent, best effort, for a system scope around
+/// the instance, and return it only if the KERNEL then shows the jail in it.
+///
+/// The request names the instance and nothing else; it gives no process to
+/// move. The answer is never the fact: a system scope is recorded only when
+/// `/proc/<pid>/cgroup` reads exactly `/system.slice/<unit>`, a cgroup only
+/// root can make or move a process into.
+#[cfg(target_os = "linux")]
+fn request_system_scope(
+    instance_id: &str,
+    unit: &str,
+    pid: u32,
+) -> Option<innerwarden_agent_guard::identity::Scope> {
+    use crate::agent_report::{agent_route, send_report, AGENT_URL_VAR};
+    use crate::contain::launch::system_scope_seen;
+    use innerwarden_agent_guard::identity::{system_scope_request, SYSTEM_SCOPE_ROUTE};
+
+    let said = |why: &str| eprintln!("innerwarden contain: no system scope ({why})");
+    let Some(url) = agent_route(
+        std::env::var(AGENT_URL_VAR).ok().as_deref(),
+        SYSTEM_SCOPE_ROUTE,
+    ) else {
+        said("the local agent route is off");
+        return None;
+    };
+    let body = system_scope_request(instance_id)?;
+    if let Err(why) = send_report(&url, &body) {
+        said(&format!("the local agent did not take the request: {why}"));
+        return None;
+    }
+    let deadline = std::time::Instant::now() + SYSTEM_SCOPE_WAIT;
+    loop {
+        if let Some(seen) = proc_cgroup(pid).and_then(|c| system_scope_seen(&c, unit)) {
+            eprintln!("  system scope: {}", seen.cgroup_path);
+            return Some(seen);
+        }
+        if std::time::Instant::now() >= deadline {
+            said("the kernel does not show the jail in it");
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// What decides the user scope, read from this host.
+#[cfg(target_os = "linux")]
+fn scope_facts() -> crate::contain::launch::ScopeFacts {
+    use crate::contain::launch::{parse_systemd_version, user_manager_socket, ScopeFacts};
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    let systemd_run = resolve_backend(&["/usr/bin/systemd-run", "/bin/systemd-run"]);
+    // SAFETY: getuid takes no arguments and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    let user_manager = user_manager_socket(std::env::var("XDG_RUNTIME_DIR").ok().as_deref())
+        .and_then(|socket| std::fs::symlink_metadata(socket).ok())
+        .is_some_and(|m| m.file_type().is_socket() && m.uid() == uid);
+    // Only asked when it could matter: the answer decides one switch.
+    let systemd_version = match (&systemd_run, user_manager) {
+        (Some(run), true) => Command::new(run)
+            .arg("--version")
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .and_then(|out| parse_systemd_version(&String::from_utf8_lossy(&out.stdout))),
+        _ => None,
+    };
+    ScopeFacts {
+        systemd_run,
+        systemd_version,
+        user_manager,
+    }
+}
+
+/// The scope a dry run would get, as one line.
+#[cfg(target_os = "linux")]
+fn dry_run_scope_line() -> String {
+    use crate::contain::launch::{no_scope_sentence, plan_scope, ScopePlan};
+    use innerwarden_agent_guard::identity::SCOPE_UNIT_PREFIX;
+    let unit = format!("{SCOPE_UNIT_PREFIX}<instance-id>.scope");
+    match plan_scope(&scope_facts(), &unit) {
+        ScopePlan::User {
+            systemd_run,
+            unit,
+            no_expand,
+        } => format!(
+            "scope: {} --user --scope --quiet --unit {unit}{} -- (a new instance id at each launch)",
+            systemd_run.display(),
+            if no_expand {
+                " --expand-environment=no"
+            } else {
+                ""
+            }
+        ),
+        ScopePlan::None(why) => no_scope_sentence(why),
+    }
+}
+
+/// What bwrap reported on the info descriptor.
+#[cfg(target_os = "linux")]
+enum InfoRead {
+    Got(crate::contain::launch::InfoFd),
+    /// The descriptor closed with nothing written: bwrap never reached the
+    /// point where the jail has a pid.
+    Nothing,
+    Failed(String),
 }
 
 /// Read bwrap's report: until it parses, the stream ends, or ten seconds pass.
 #[cfg(target_os = "linux")]
-fn read_info(reader: &mut std::io::PipeReader) -> Result<crate::contain::launch::InfoFd, String> {
+fn read_info(reader: &mut std::io::PipeReader) -> InfoRead {
     use crate::contain::launch::{parse_info_fd, InfoError, MAX_INFO_BYTES};
     use std::io::Read;
     use std::os::fd::AsRawFd;
@@ -620,13 +901,13 @@ fn read_info(reader: &mut std::io::PipeReader) -> Result<crate::contain::launch:
     let mut got: Vec<u8> = Vec::new();
     loop {
         match parse_info_fd(&got) {
-            Ok(info) => return Ok(info),
-            Err(InfoError::TooLarge) => return Err(InfoError::TooLarge.to_string()),
+            Ok(info) => return InfoRead::Got(info),
+            Err(InfoError::TooLarge) => return InfoRead::Failed(InfoError::TooLarge.to_string()),
             Err(_) => {}
         }
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
-            return Err("bwrap did not report the jail in time".into());
+            return InfoRead::Failed("bwrap did not report the jail in time".into());
         }
         let mut poll = libc::pollfd {
             fd: reader.as_raw_fd(),
@@ -637,24 +918,28 @@ fn read_info(reader: &mut std::io::PipeReader) -> Result<crate::contain::launch:
         // SAFETY: one valid pollfd, count 1.
         let ready = unsafe { libc::poll(&mut poll, 1, millis) };
         if ready < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
-            return Err("waiting for bwrap failed".into());
+            return InfoRead::Failed("waiting for bwrap failed".into());
         }
         if ready <= 0 {
             continue;
         }
         let mut chunk = [0u8; 512];
         match reader.read(&mut chunk) {
+            Ok(0) if got.is_empty() => return InfoRead::Nothing,
             Ok(0) => {
-                return parse_info_fd(&got).map_err(|e| e.to_string());
+                return match parse_info_fd(&got) {
+                    Ok(info) => InfoRead::Got(info),
+                    Err(e) => InfoRead::Failed(e.to_string()),
+                };
             }
             Ok(n) => {
                 got.extend_from_slice(&chunk[..n]);
                 if got.len() > MAX_INFO_BYTES {
-                    return Err(InfoError::TooLarge.to_string());
+                    return InfoRead::Failed(InfoError::TooLarge.to_string());
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(format!("reading bwrap's report failed: {e}")),
+            Err(e) => return InfoRead::Failed(format!("reading bwrap's report failed: {e}")),
         }
     }
 }
