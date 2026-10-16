@@ -58,6 +58,8 @@ pub mod file_tools;
 pub mod file_update;
 pub mod hook;
 pub mod hook_targets;
+// Contract types and pure decisions for agent identity. No caller yet.
+pub mod identity;
 pub mod mcp_wire;
 pub mod mcp_wire_toml;
 pub mod redact;
