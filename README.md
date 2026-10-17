@@ -76,6 +76,9 @@ only — no IP, no host data; set `INNERWARDEN_NO_TELEMETRY=1` to disable). A
   is stopped rather than merely flagged. Linux (bubblewrap) and macOS
   (sandbox-exec) only; `contain` exits with an explicit error on Windows rather
   than pretending to isolate.
+- Agent identity (off by default, Linux): `innerwarden contain --identity --
+  <command>` records the run as an instance, so its hook and the dashboard can
+  tell one agent's runs apart. See [Agent identity and trust](#agent-identity-and-trust).
 - Agent discovery: finds AI agents and agent tooling on the machine so you can
   see what is running and wire the guardrail into it.
 - Local dashboard: a read-only view on loopback at `http://127.0.0.1:8788`
@@ -142,6 +145,39 @@ Whatever agent you run, there is a mechanism and a command for it:
 `innerwarden install` with no argument detects what is on the machine and prints
 the mechanism for each. Any agent with a pre-execution wrapper can also gate on
 the exit code directly: `innerwarden` exits non-zero on a deny.
+
+## Agent identity and trust
+
+An agent names itself: the `--agent` flag its hook was wired with, its
+environment and its session id are all its own to choose. So the guard keeps
+two separate questions apart: how far that name is backed (trust), and what
+you decided about that kind of agent (`innerwarden agents approve`, `profile`,
+`allow`, `revoke`).
+
+Trust has three levels, and in Community the highest one is never reached:
+
+- `declared`: only the agent's own word says what it is. Every agent started
+  without `contain --identity` is here.
+- `observed`: the agent runs in a jail started by `innerwarden contain
+  --identity`, and its hook, reading from inside the jail, found what the
+  launcher recorded (the same process and mount namespaces, a record it
+  cannot rewrite). This is the most a reading from inside the jail can give.
+  Everything it compares is something the agent's own process could set up
+  for itself, so it never proves the jail. A launcher installed in your home
+  folder, or a jail with no scope of its own, is `observed` too, and the
+  dashboard says why.
+- `host_verified` (shown as confined): the instance runs in a boundary it
+  cannot leave, confirmed by a witness outside the agent. Community has no such
+  witness; it exists only where InnerWarden Active Defence is installed on the
+  same host and confirms the instance from outside the jail. The Community
+  dashboard never shows an instance as confined, whatever a label in a graph
+  or a record says.
+
+A rule in an agent profile or an instance exception that RELAXES your general
+rules applies only to a confined instance. With Community alone, such a
+relaxation is recorded in `agent-profiles.toml` and is not applied: your
+general rules keep deciding, and a decision says when a profile would have
+allowed it. A rule that TIGHTENS (refuses more) applies at every trust level.
 
 ## Build from source
 

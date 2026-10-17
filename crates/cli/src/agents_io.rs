@@ -126,7 +126,10 @@ pub(crate) fn help_text() -> String {
          approve, profile, allow and revoke record your decisions about a type of\n  \
          agent in agent-profiles.toml, confirmed at your terminal. Only\n  \
          /etc/innerwarden/agent-profiles.toml (--system, as root) may relax a rule,\n  \
-         and a relaxation applies only to an instance that runs confined.",
+         and a relaxation applies only to an instance that runs confined. Confined\n  \
+         needs a witness outside the jail (Active Defence): read from inside the\n  \
+         jail an instance is at most observed, so with Community alone a relaxation\n  \
+         is recorded and your general rules keep deciding.",
         decisions = crate::agent_decisions::usage()
     )
 }

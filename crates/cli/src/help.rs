@@ -214,7 +214,8 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
         }
         "contain" => format!(
             "{p} contain [--monitor|--enforce|--block-review] [--project DIR]\n  \
-             \x20              [--deny-read GLOB] [--dry-run] [--setup] -- <command...>\n  \
+             \x20              [--deny-read GLOB] [--dry-run] [--setup] [--identity]\n  \
+             \x20              -- <command...>\n  \
              Run <command> inside a filesystem/namespace JAIL with the guard hook armed\n  \
              INSIDE it (Linux bwrap, macOS sandbox-exec). Your API key and the project's\n  \
              secrets stay outside what the jailed command can read.\n\
@@ -222,7 +223,13 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
              --project DIR     the directory the jailed command may write (default: cwd)\n  \
              --deny-read GLOB  one more path the jail must not expose\n  \
              --dry-run         print the jail that would be built and run nothing\n  \
-             --setup           arm the in-jail hook only\n\
+             --setup           arm the in-jail hook only\n  \
+             --identity        (Linux) record the run as an identified instance\n\
+             \n  \
+             With --identity the hook inside the jail tells this instance apart from\n  \
+             the agent's other runs. Read from inside the jail, the instance is at most\n  \
+             `observed`: confined needs a witness outside the jail (Active Defence), so\n  \
+             a profile rule that relaxes your general rules does not apply here.\n\
              \n  \
              Everything after `--` is the jailed command line, including its own\n  \
              `--help`."

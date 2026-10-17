@@ -85,7 +85,10 @@
 //! at any trust, since an agent gains nothing by being held to more; it is
 //! keyed by the name the agent declares, so an agent outside a jail escapes
 //! it by declaring another name and lands on the general policy, never below
-//! it.
+//! it. `confined` is never what a hook reads from inside its own jail: that
+//! reading tops at `observed` ([`crate::identity::judge_trust_in_jail`]), so
+//! with nothing but the guard on the host a relaxation is recorded and never
+//! honoured. It takes a witness outside the agent.
 //!
 //! `mode = "enforce"` on a hook line that blocks on review lets a review run
 //! (a relaxation: confined only); `mode = "block-review"` makes a review block
