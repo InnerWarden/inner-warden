@@ -28,6 +28,7 @@ pub(crate) enum Owner {
     Me,
     /// The user's file of another account, read by root for it: that
     /// account (or root).
+    #[cfg_attr(not(unix), allow(dead_code))]
     Account(u32),
 }
 

@@ -388,6 +388,7 @@ fn user_file() -> Option<(PathBuf, Owner)> {
     agent_profiles_io::user_path().map(|path| (path, Owner::Me))
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 fn sudo_uid() -> Option<u32> {
     std::env::var("SUDO_UID").ok().and_then(|v| v.parse().ok())
 }

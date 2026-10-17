@@ -178,11 +178,22 @@ fn identity_flag_mounts_the_record_read_only_inside_and_keeps_a_private_copy() {
 
     // The launcher's copy: one private file, no temp left behind.
     let dir = home.path().join(".local/state/innerwarden/instances");
-    let records: Vec<_> = std::fs::read_dir(&dir)
+    let entries: Vec<_> = std::fs::read_dir(&dir)
         .expect("records dir")
         .map(|e| e.unwrap().path())
         .collect();
-    assert_eq!(records.len(), 1, "one record and no temp file: {records:?}");
+    // The record, and the note naming the project beside it; no temp file.
+    let records: Vec<_> = entries
+        .iter()
+        .filter(|p| p.extension().is_some_and(|e| e == "json"))
+        .cloned()
+        .collect();
+    assert_eq!(
+        entries.len(),
+        2,
+        "one record, one project note, no temp file: {entries:?}"
+    );
+    assert_eq!(records.len(), 1, "one record and no temp file: {entries:?}");
     let path = &records[0];
     assert_eq!(
         std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
@@ -340,6 +351,15 @@ fn dry_run_shows_the_record_and_info_descriptors_only_with_the_identity_flag() {
     let without: String = identified
         .replace(" --ro-bind-data 10 /run/innerwarden/instance.json", "")
         .replace(" --info-fd 9", "")
+        .replace(
+            &format!(
+                " --tmpfs {}",
+                home.path()
+                    .join(".local/state/innerwarden/instances")
+                    .display()
+            ),
+            "",
+        )
         .lines()
         .filter(|l| !l.starts_with("# innerwarden contain: no scope"))
         .map(|l| format!("{l}\n"))
@@ -407,11 +427,17 @@ fn identity_hides_the_launchers_records_and_names_the_jails_mount_namespace() {
     assert!(output.status.success(), "AI Jail failed: {stderr}");
 
     let dir = home.path().join(".local/state/innerwarden/instances");
-    let records: Vec<_> = std::fs::read_dir(&dir)
+    let entries: Vec<_> = std::fs::read_dir(&dir)
         .expect("records dir")
         .map(|e| e.unwrap().path())
         .collect();
-    assert_eq!(records.len(), 1, "nothing written in the jail: {records:?}");
+    let records: Vec<_> = entries
+        .iter()
+        .filter(|p| p.extension().is_some_and(|e| e == "json"))
+        .cloned()
+        .collect();
+    assert_eq!(entries.len(), 2, "nothing written in the jail: {entries:?}");
+    assert_eq!(records.len(), 1, "nothing written in the jail: {entries:?}");
     let outside = std::fs::read(&records[0]).unwrap();
     assert!(!outside.is_empty(), "the record was not truncated");
     let record: serde_json::Value = serde_json::from_slice(&outside).unwrap();
