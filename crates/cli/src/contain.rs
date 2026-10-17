@@ -1290,6 +1290,51 @@ pub mod launch {
         UsernsFact::Closed
     }
 
+    /// What a dry run of an identified launch says about user namespaces.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum DryRunUserns {
+        /// The host restricts unprivileged user namespaces and bwrap has no
+        /// profile that grants it one ([`super::userns_restriction_advice`]):
+        /// the real run stops there with this advice, so the dry run says it.
+        /// The probe, which could only fail for that same reason, is not run.
+        Advice(Vec<String>),
+        /// What the real run would do.
+        Fact(UsernsFact),
+    }
+
+    impl DryRunUserns {
+        pub fn close_userns(&self) -> bool {
+            matches!(self, DryRunUserns::Fact(UsernsFact::Closed))
+        }
+
+        /// The comment lines the dry run prints, none when the option is used.
+        pub fn lines(&self) -> Vec<String> {
+            match self {
+                DryRunUserns::Advice(lines) => lines
+                    .iter()
+                    .map(|line| format!("# {line}").trim_end().to_string())
+                    .collect(),
+                DryRunUserns::Fact(UsernsFact::Open(why)) => {
+                    vec![format!("# {}", userns_open_sentence(*why))]
+                }
+                DryRunUserns::Fact(_) => Vec::new(),
+            }
+        }
+    }
+
+    /// PURE. The restriction's advice first: where it applies, the dry run says
+    /// that and never starts the probe, whose failure would name a cause that
+    /// is not the one. Otherwise what the probe and the bwrap facts decide.
+    pub fn dry_run_userns(
+        advice: Option<Vec<String>>,
+        fact: impl FnOnce() -> UsernsFact,
+    ) -> DryRunUserns {
+        match advice {
+            Some(lines) => DryRunUserns::Advice(lines),
+            None => DryRunUserns::Fact(fact()),
+        }
+    }
+
     /// The version in `bwrap --version`, whose output is `bubblewrap 0.9.0`.
     /// A suffix after the patch number (`0.8.0-rc1`) is ignored.
     pub fn parse_bwrap_version(text: &str) -> Option<(u32, u32, u32)> {
@@ -2930,6 +2975,46 @@ mod tests {
             let entry = format!("  {word}: \"{sentence}\",");
             assert!(words.contains(&entry), "words.ts has no `{entry}`");
         }
+    }
+
+    /// On a host whose kernel restricts unprivileged user namespaces, with no
+    /// profile for bwrap, a dry run of an identified launch says the real
+    /// cause (the advice the real run stops with) and never starts the probe,
+    /// which there could only fail and name `userns_probe_failed` instead.
+    ///
+    /// FAILS ON REVERT: run the probe before the advice is looked at.
+    #[test]
+    fn a_dry_run_says_the_restriction_and_never_probes_where_it_applies() {
+        use launch::{dry_run_userns, DryRunUserns, UsernsFact, UsernsWhy};
+        let advice = userns_restriction_advice(Some("1\n"), false, Path::new("/usr/bin/bwrap"));
+        let said = dry_run_userns(advice.clone(), || {
+            panic!("the probe is not started where the advice applies")
+        });
+        assert_eq!(said, DryRunUserns::Advice(advice.clone().unwrap()));
+        assert!(!said.close_userns());
+        let lines = said.lines();
+        assert_eq!(lines.len(), advice.unwrap().len());
+        assert!(lines.iter().all(|line| line.starts_with('#')), "{lines:?}");
+        assert!(lines[0].starts_with(
+            "# innerwarden contain: this kernel restricts unprivileged user namespaces"
+        ));
+        assert!(!lines
+            .iter()
+            .any(|line| line.contains("userns_probe_failed")));
+
+        // No restriction: what the probe and the facts say, as before.
+        let open = dry_run_userns(None, || UsernsFact::Open(UsernsWhy::ProbeFailed));
+        assert_eq!(
+            open.lines(),
+            [format!(
+                "# {}",
+                launch::userns_open_sentence(UsernsWhy::ProbeFailed)
+            )]
+        );
+        assert!(!open.close_userns());
+        let closed = dry_run_userns(None, || UsernsFact::Closed);
+        assert!(closed.close_userns());
+        assert!(closed.lines().is_empty());
     }
 
     /// The start-up probe asks for the namespaces the jail unshares, with the

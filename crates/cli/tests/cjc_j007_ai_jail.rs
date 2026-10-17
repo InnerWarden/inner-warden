@@ -113,6 +113,103 @@ fn require_bwrap() {
     );
 }
 
+/// The bwrap `contain` runs: the first of its trusted paths with no symbolic
+/// link on the way to it (`/bin` is one on a usr-merged host).
+#[cfg(target_os = "linux")]
+fn jail_bwrap() -> Option<std::path::PathBuf> {
+    ["/usr/bin/bwrap", "/bin/bwrap", "/usr/local/bin/bwrap"]
+        .iter()
+        .map(std::path::Path::new)
+        .find(|path| {
+            path.is_file()
+                && path.ancestors().all(|at| {
+                    std::fs::symlink_metadata(at).is_ok_and(|m| !m.file_type().is_symlink())
+                })
+        })
+        .map(std::path::Path::to_path_buf)
+}
+
+/// What an identified launch on this host does about user namespaces, from
+/// the facts the launcher reads, computed here so each test asserts exactly
+/// one branch.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UsernsHere {
+    /// No bwrap: a dry run says nothing about them.
+    NoBwrap,
+    /// The kernel restricts unprivileged user namespaces and bwrap has no
+    /// profile: the real run stops with the advice, a dry run says it.
+    Restricted,
+    /// bwrap 0.8 or later, not setuid, and the throwaway jail with the
+    /// option exits 0: the option is used, the record is schema 2.
+    Closed,
+    /// Any other host: no option, the line that says why, schema 1.
+    Open,
+}
+
+#[cfg(target_os = "linux")]
+fn userns_here() -> UsernsHere {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(bwrap) = jail_bwrap() else {
+        return UsernsHere::NoBwrap;
+    };
+    let restricted =
+        std::fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
+            .is_ok_and(|v| v.trim() == "1");
+    let profile = std::path::Path::new("/etc/apparmor.d/bwrap").exists()
+        || std::path::Path::new("/etc/apparmor.d/usr.bin.bwrap").exists();
+    if restricted && !profile {
+        return UsernsHere::Restricted;
+    }
+    let version = Command::new(&bwrap)
+        .arg("--version")
+        .output()
+        .ok()
+        .and_then(|out| {
+            let text = String::from_utf8_lossy(&out.stdout).into_owned();
+            let number = text.trim().strip_prefix("bubblewrap ")?.to_string();
+            let mut parts = number.split('.').map(|p| {
+                p.chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect::<String>()
+                    .parse::<u32>()
+                    .ok()
+            });
+            Some((
+                parts.next()??,
+                parts.next()??,
+                parts.next().flatten().unwrap_or(0),
+            ))
+        });
+    let setuid = std::fs::metadata(&bwrap)
+        .map(|m| m.permissions().mode() & 0o4000 != 0)
+        .unwrap_or(true);
+    let probe = || {
+        Command::new(&bwrap)
+            .args([
+                "--unshare-user",
+                "--disable-userns",
+                "--unshare-pid",
+                "--unshare-uts",
+                "--unshare-ipc",
+                "--ro-bind",
+                "/",
+                "/",
+                "true",
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    };
+    if version.is_some_and(|v| v >= (0, 8, 0)) && !setuid && probe() {
+        UsernsHere::Closed
+    } else {
+        UsernsHere::Open
+    }
+}
+
 /// The in-jail script of the identity case: print the PID namespace the
 /// jailed process is in, the record the launcher mounted, and whether the
 /// agent can rewrite, remove or replace that record. The jail starts only
@@ -229,14 +326,24 @@ fn identity_flag_mounts_the_record_read_only_inside_and_keeps_a_private_copy() {
     }
 
     let record: serde_json::Value = serde_json::from_slice(&outside).unwrap();
-    // Schema 2 exactly when the jail was started with user namespaces closed
-    // (a bwrap that takes the option, on a host that lets it): then, and only
-    // then, the record says so. Any other jail writes the schema 1 it always
-    // wrote, without the field.
-    match record["schema"].as_u64() {
-        Some(1) => assert!(record["jail"].get("userns_closed").is_none(), "{record}"),
-        Some(2) => assert_eq!(record["jail"]["userns_closed"], true, "{record}"),
-        other => panic!("schema {other:?}: {record}"),
+    // Schema 2 exactly when this host's bwrap takes the option (0.8 or later,
+    // not setuid, the throwaway jail exits 0): then, and only then, the record
+    // says so. Any other host writes the schema 1 it always wrote, without
+    // the field.
+    match userns_here() {
+        UsernsHere::Closed => {
+            assert_eq!(record["schema"], 2, "{record}");
+            assert_eq!(record["jail"]["userns_closed"], true, "{record}");
+        }
+        UsernsHere::Open => {
+            assert_eq!(record["schema"], 1, "{record}");
+            assert!(record["jail"].get("userns_closed").is_none(), "{record}");
+            assert!(
+                stderr.contains("innerwarden contain: user namespaces stay open ("),
+                "{stderr}"
+            );
+        }
+        other => panic!("the jail ran on a host where {other:?}: {record}"),
     }
     assert_eq!(record["agent_type"], "claude-code");
     assert_eq!(record["mode"], "monitor");
@@ -401,20 +508,33 @@ fn dry_run_shows_the_record_and_info_descriptors_only_with_the_identity_flag() {
         .filter(|l| !l.starts_with("#   IW_HOOK_AGENT="))
         .map(|l| format!("{l}\n"))
         .collect();
-    // The two ways the dry run speaks of user namespaces: the option in the
-    // argument list, or the line that says why it is not there. Never both,
-    // and the plain run says neither.
+    // The ways the dry run speaks of user namespaces: the option in the
+    // argument list, the line that says why it is not there, or, where the
+    // kernel's restriction stops the real run first, its advice. Exactly the
+    // one this host's facts give, and the plain run says none.
     let option = " --unshare-user --disable-userns";
     let said = "# innerwarden contain: user namespaces stay open (";
+    let advice = "# innerwarden contain: this kernel restricts unprivileged user namespaces";
     assert!(
-        !plain.contains("--disable-userns") && !plain.contains(said),
+        !plain.contains("--disable-userns") && !plain.contains(said) && !plain.contains(advice),
         "{plain}"
     );
-    assert!(
-        !(identified.contains(option) && identified.contains(said)),
-        "the option and its absence are not both said: {identified}"
+    let here = userns_here();
+    assert_eq!(
+        (
+            identified.contains(option),
+            identified.contains(said),
+            identified.contains(advice)
+        ),
+        match here {
+            UsernsHere::NoBwrap => (false, false, false),
+            UsernsHere::Restricted => (false, false, true),
+            UsernsHere::Closed => (true, false, false),
+            UsernsHere::Open => (false, true, false),
+        },
+        "{here:?}: {identified}"
     );
-    if identified.contains(option) {
+    if here == UsernsHere::Closed {
         assert_eq!(
             identified.matches("--disable-userns").count(),
             1,
@@ -425,6 +545,27 @@ fn dry_run_shows_the_record_and_info_descriptors_only_with_the_identity_flag() {
             "the option follows the namespaces: {identified}"
         );
     }
+    if here == UsernsHere::Open {
+        assert!(
+            identified
+                .lines()
+                .filter(|l| l.starts_with(said))
+                .all(|l| l.contains("(bwrap_too_old)")
+                    || l.contains("(bwrap_setuid)")
+                    || l.contains("(userns_probe_failed)")),
+            "{identified}"
+        );
+    }
+    // The advice block is the real run's refusal, said as comments.
+    let advice_lines: Vec<&str> = if here == UsernsHere::Restricted {
+        identified
+            .lines()
+            .skip_while(|l| !l.starts_with(advice))
+            .take_while(|l| l.starts_with('#'))
+            .collect()
+    } else {
+        Vec::new()
+    };
     let without: String = identified
         .replace(" --ro-bind-data 10 /run/innerwarden/instance.json", "")
         .replace(key, "")
@@ -440,7 +581,11 @@ fn dry_run_shows_the_record_and_info_descriptors_only_with_the_identity_flag() {
             "",
         )
         .lines()
-        .filter(|l| !l.starts_with("# innerwarden contain: no scope") && !l.starts_with(said))
+        .filter(|l| {
+            !l.starts_with("# innerwarden contain: no scope")
+                && !l.starts_with(said)
+                && !advice_lines.contains(l)
+        })
         .map(|l| format!("{l}\n"))
         .collect();
     assert_eq!(without, plain, "the flag adds these and nothing else");

@@ -531,12 +531,19 @@ fn run_linux(input: &JailInputs) -> ExitCode {
     // A dry run with `--identity` shows the arguments the real run adds.
     let dry_identity;
     // What a real run would do about user namespaces in the jail, asked of the
-    // bwrap it would use. A host with no bwrap says nothing here: the real run
+    // bwrap it would use: first whether the host's restriction stops the real
+    // run before any jail (then that is what is said, and nothing is probed),
+    // then the probe. A host with no bwrap says nothing here: the real run
     // says it has none.
     let userns = (input.args.identity && input.args.dry_run)
         .then(|| {
-            resolve_backend(&["/usr/bin/bwrap", "/bin/bwrap", "/usr/local/bin/bwrap"])
-                .map(|bwrap| userns_fact(&bwrap))
+            resolve_backend(&["/usr/bin/bwrap", "/bin/bwrap", "/usr/local/bin/bwrap"]).map(
+                |bwrap| {
+                    crate::contain::launch::dry_run_userns(restriction_advice(&bwrap), || {
+                        userns_fact(&bwrap)
+                    })
+                },
+            )
         })
         .flatten();
     let planned = if input.args.identity && input.args.dry_run {
@@ -548,7 +555,9 @@ fn run_linux(input: &JailInputs) -> ExitCode {
             key_fd: host_key()
                 .is_some()
                 .then_some(crate::contain::launch::DRY_RUN_KEY_FD),
-            close_userns: userns.is_some_and(crate::contain::launch::UsernsFact::close_userns),
+            close_userns: userns
+                .as_ref()
+                .is_some_and(crate::contain::launch::DryRunUserns::close_userns),
             ..input.clone()
         };
         &dry_identity
@@ -568,8 +577,8 @@ fn run_linux(input: &JailInputs) -> ExitCode {
         #[cfg(target_os = "linux")]
         if input.args.identity {
             println!("# {}", dry_run_scope_line());
-            if let Some(crate::contain::launch::UsernsFact::Open(why)) = userns {
-                println!("# {}", crate::contain::launch::userns_open_sentence(why));
+            for line in userns.iter().flat_map(|userns| userns.lines()) {
+                println!("{line}");
             }
         }
         println!("bwrap \\");
@@ -584,16 +593,8 @@ fn run_linux(input: &JailInputs) -> ExitCode {
         return ExitCode::from(1);
     };
     // Say why the jail cannot be built BEFORE bwrap dies with an error that
-    // names neither the cause nor the fix. The sysctl file exists only on
-    // kernels that carry the restriction; the profile check is on disk because
-    // the loaded-profiles list is root-only.
-    let sysctl =
-        std::fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns").ok();
-    let profile_on_disk = Path::new("/etc/apparmor.d/bwrap").exists()
-        || Path::new("/etc/apparmor.d/usr.bin.bwrap").exists();
-    if let Some(lines) =
-        crate::contain::userns_restriction_advice(sysctl.as_deref(), profile_on_disk, &bwrap)
-    {
+    // names neither the cause nor the fix.
+    if let Some(lines) = restriction_advice(&bwrap) {
         for line in lines {
             eprintln!("{line}");
         }
@@ -605,6 +606,18 @@ fn run_linux(input: &JailInputs) -> ExitCode {
     }
     announce(input);
     run_plain(&bwrap, &plan)
+}
+
+/// What to say, and stop on, when this kernel restricts unprivileged user
+/// namespaces and `bwrap` has no AppArmor profile that grants it one. The
+/// sysctl file exists only on kernels that carry the restriction; the profile
+/// check is on disk because the loaded-profiles list is root-only.
+fn restriction_advice(bwrap: &Path) -> Option<Vec<String>> {
+    let sysctl =
+        std::fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns").ok();
+    let profile_on_disk = Path::new("/etc/apparmor.d/bwrap").exists()
+        || Path::new("/etc/apparmor.d/usr.bin.bwrap").exists();
+    crate::contain::userns_restriction_advice(sysctl.as_deref(), profile_on_disk, bwrap)
 }
 
 /// The key of Active Defence on this host, read from its file with the
