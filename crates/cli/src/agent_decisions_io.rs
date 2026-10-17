@@ -545,6 +545,7 @@ pub(crate) fn local_records(dir: &Path, uid: u32) -> Vec<InstanceFacts> {
             record,
             user: None,
             project_dir,
+            userns_gap: crate::contain_io::host_userns_gap(),
         });
     }
     out.sort_by(|a, b| a.record.instance_id.cmp(&b.record.instance_id));

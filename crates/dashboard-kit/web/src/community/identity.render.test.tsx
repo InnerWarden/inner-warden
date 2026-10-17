@@ -274,6 +274,50 @@ describe("the Agents page with identity data", () => {
   });
 });
 
+/** `withIdentity()` with user-namespace facts added to the technical block of each live instance. */
+function withUserns(technicalFor: (id: string) => Record<string, unknown>): AgentsResponse {
+  type Row = { instances?: { instance_id: string; technical?: object }[] };
+  const base = withIdentity();
+  return {
+    ...base,
+    agents: base.agents.map((agent) => ({
+      ...agent,
+      instances: ((agent as unknown as Row).instances ?? []).map((item) => ({ ...item, technical: { ...item.technical, ...technicalFor(item.instance_id) } })),
+    })),
+  } as unknown as AgentsResponse;
+}
+
+describe("user namespaces inside the jail, in the technical view", () => {
+  const USERNS_A = { userns_closed: true };
+  const USERNS_B = { userns_open_reason: "bwrap_too_old" };
+
+  it("says they were closed, or why this host cannot close them, and nothing else", () => {
+    const agents = withUserns((id) => (id === ID_A ? USERNS_A : USERNS_B));
+    seed(agents);
+    setTechnicalDetail(true);
+    const text = textOf(render(<CommunityAgents context={context()} />, agents));
+    expect(text).toContain("User namespaces closed inside the jail");
+    expect(text).toContain("Bubblewrap here is older than 0.8, so programs in the jail can still make user namespaces.");
+    // Only the two codes the CLI sends have words; any other is not shown.
+    const strange = withUserns(() => ({ userns_open_reason: "<b>x</b>", userns_closed: "yes" }));
+    seed(strange);
+    const other = textOf(render(<CommunityAgents context={context()} />, strange));
+    expect(other).not.toContain("User namespaces closed");
+    expect(other).not.toContain("Bubblewrap here");
+  });
+
+  it("is not a reason: the plain view, the trust and the reasons are what they were", () => {
+    const base = withIdentity();
+    seed(base);
+    const before = render(<CommunityAgents context={context()} />, base);
+    const agents = withUserns((id) => (id === ID_A ? USERNS_A : USERNS_B));
+    seed(agents);
+    const after = render(<CommunityAgents context={context()} />, agents);
+    expect(after).toBe(before);
+    expect(textOf(after)).not.toContain("namespaces");
+  });
+});
+
 describe("the Overview with identity data", () => {
   it("says how far the agents are backed in one sentence, and counts the ones waiting", () => {
     const agents = withIdentity();

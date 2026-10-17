@@ -304,6 +304,12 @@ pub struct JailInputs {
     /// jail, handed to the jail's command as they were ([`launch_env`]).
     /// Empty unless the launch asked for an identity record.
     pub child_env: Vec<(String, String)>,
+    /// Start the jail so its programs cannot make user namespaces of their own
+    /// (`--unshare-user --disable-userns`). Decided by the launcher before the
+    /// jail is built ([`launch::userns_decision`]); `false` unless the launch
+    /// asked for an identity record, and a `true` without `--identity` adds
+    /// nothing to the argv.
+    pub close_userns: bool,
 }
 
 impl JailInputs {
@@ -459,6 +465,15 @@ pub struct LinuxJailPlan {
     pub rlimit_nofile: u64,
 }
 
+/// The namespaces the jail unshares. The start-up probe of
+/// [`launch::userns_probe_argv`] asks for the same ones.
+pub const JAIL_NAMESPACES: [&str; 3] = ["--unshare-pid", "--unshare-uts", "--unshare-ipc"];
+
+/// What closes user namespaces inside the jail. `--disable-userns` needs the
+/// jail to have a user namespace of its own, so the jail asks for it by name
+/// instead of leaving it to what bwrap does when it is not installed setuid.
+pub const USERNS_CLOSED: [&str; 2] = ["--unshare-user", "--disable-userns"];
+
 /// Build the ordered bwrap argument vector. Order is load-bearing (bwrap is
 /// last-wins): system RO → dev/proc/tmpfs → HOME tmpfs → dotdir re-binds → shadow
 /// innerwarden → binary binds → project (late) → worktree → nested secret masks →
@@ -611,7 +626,14 @@ pub fn build_linux_jail(input: &JailInputs) -> Result<LinuxJailPlan, ContainErro
 
     // --- namespaces / lifecycle ---
     push(&["--die-with-parent"]);
-    push(&["--unshare-pid", "--unshare-uts", "--unshare-ipc"]);
+    push(&JAIL_NAMESPACES);
+    // After the record and every mount, like the rest of this block, and only
+    // for an identified launch whose host takes the option: the jail cannot
+    // make a user namespace of its own, so it cannot rebuild what it was
+    // refused. A defence in depth; it never changes the trust of the instance.
+    if input.args.identity && input.close_userns {
+        push(&USERNS_CLOSED);
+    }
     push(&["--hostname", "ai-sandbox"]);
     if !input.stdin_is_tty {
         push(&["--new-session"]);
@@ -984,7 +1006,7 @@ pub mod launch {
     use innerwarden_agent_guard::identity::{
         instance_record_file, is_instance_id, is_user_scope_cgroup, system_scope_cgroup, Jail,
         JailBackend, LaunchMode, LaunchRecord, Launcher, RecordError, Scope, Scopes,
-        INITIAL_PID_NS_INODE, LAUNCHER_RECORD_DIR, LAUNCH_SCHEMA,
+        INITIAL_PID_NS_INODE, LAUNCHER_RECORD_DIR, LAUNCH_SCHEMA, LAUNCH_SCHEMA_V1,
     };
     use serde::Deserialize;
 
@@ -1022,7 +1044,10 @@ pub mod launch {
     // A bwrap option that makes a SECOND user namespace after step 3
     // (`--disable-userns`, or `--uid`/`--gid` other than the caller's) would
     // be refused by such a policy and kill the jail: moving this order is a
-    // change to make with that in view. Nothing here arms anything. On Ubuntu
+    // change to make with that in view. `--disable-userns` is used all the
+    // same, only where a throwaway jail started with it before step 1
+    // (`userns_decision`), and never started over: a refusal at step 3 comes
+    // after the jail reported its pid. Nothing here arms anything. On Ubuntu
     // 24.04 bwrap itself needs the AppArmor profile that grants it `userns`
     // (`userns_restriction_advice`, `flags=(unconfined)`).
 
@@ -1134,6 +1159,143 @@ pub mod launch {
             return None;
         }
         digits.parse().ok()
+    }
+
+    // -- user namespaces inside the jail -------------------------------------
+    //
+    // `bwrap --disable-userns` (bubblewrap 0.8.0) stops the jail's programs
+    // from making user namespaces of their own. It needs a bwrap that is not
+    // installed setuid, and on a host that restricts new user namespaces it
+    // can be refused. That is learned BEFORE the jail is built, by starting a
+    // throwaway jail with the option: the option makes a second user
+    // namespace after the jail has reported its pid, so a refusal there would
+    // kill a jail whose record was already handed in, and a launch that
+    // started over would not help the one case it was for. A host that
+    // cannot take the option runs the jail exactly as today.
+
+    /// The first bubblewrap that has `--disable-userns`.
+    pub const DISABLE_USERNS_SINCE: (u32, u32, u32) = (0, 8, 0);
+
+    /// What `bwrap --version` and the file's mode say.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct BwrapFacts {
+        /// `None` when `bwrap --version` gave nothing this build reads.
+        pub version: Option<(u32, u32, u32)>,
+        /// The set-user-id bit is on the file bwrap runs from.
+        pub setuid: bool,
+    }
+
+    /// Why a launch keeps user namespaces open in the jail.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum UsernsWhy {
+        BwrapTooOld,
+        BwrapSetuid,
+        ProbeFailed,
+    }
+
+    impl UsernsWhy {
+        /// The word the dry run, the launcher and the dashboard share.
+        pub fn word(self) -> &'static str {
+            match self {
+                UsernsWhy::BwrapTooOld => "bwrap_too_old",
+                UsernsWhy::BwrapSetuid => "bwrap_setuid",
+                UsernsWhy::ProbeFailed => "userns_probe_failed",
+            }
+        }
+
+        pub fn sentence(self) -> &'static str {
+            match self {
+                UsernsWhy::BwrapTooOld => "Bubblewrap here is older than 0.8, so programs in the jail can still make user namespaces.",
+                UsernsWhy::BwrapSetuid => "Bubblewrap here runs setuid, so user namespaces stay open in the jail.",
+                UsernsWhy::ProbeFailed => "Bubblewrap here could not start a jail with user namespaces closed, so the jail runs without that.",
+            }
+        }
+    }
+
+    /// The line `contain --identity` prints (and a dry run shows) when user
+    /// namespaces stay open.
+    pub fn userns_open_sentence(why: UsernsWhy) -> String {
+        format!(
+            "innerwarden contain: user namespaces stay open ({}): {}",
+            why.word(),
+            why.sentence()
+        )
+    }
+
+    /// What the launch does about user namespaces in the jail.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum UsernsFact {
+        /// No `--identity`: nothing is asked, nothing is probed.
+        NotAsked,
+        Closed,
+        Open(UsernsWhy),
+    }
+
+    impl UsernsFact {
+        /// The fact the jail inputs carry: true only when the option is used.
+        pub fn close_userns(self) -> bool {
+            self == UsernsFact::Closed
+        }
+    }
+
+    /// PURE. Close user namespaces in the jail only for an identified launch,
+    /// on a bwrap that is at least [`DISABLE_USERNS_SINCE`], not setuid, and
+    /// that started a throwaway jail with the option (`probe`, asked last and
+    /// only when everything before it holds, since it starts a process). A
+    /// version that is not known counts as too old: nothing says it has the
+    /// option.
+    pub fn userns_decision(
+        identity: bool,
+        facts: &BwrapFacts,
+        probe: impl FnOnce() -> bool,
+    ) -> UsernsFact {
+        if !identity {
+            return UsernsFact::NotAsked;
+        }
+        match facts.version {
+            Some(version) if version >= DISABLE_USERNS_SINCE => {}
+            _ => return UsernsFact::Open(UsernsWhy::BwrapTooOld),
+        }
+        if facts.setuid {
+            return UsernsFact::Open(UsernsWhy::BwrapSetuid);
+        }
+        if !probe() {
+            return UsernsFact::Open(UsernsWhy::ProbeFailed);
+        }
+        UsernsFact::Closed
+    }
+
+    /// The version in `bwrap --version`, whose output is `bubblewrap 0.9.0`.
+    /// A suffix after the patch number (`0.8.0-rc1`) is ignored.
+    pub fn parse_bwrap_version(text: &str) -> Option<(u32, u32, u32)> {
+        let rest = text.lines().next()?.trim().strip_prefix("bubblewrap ")?;
+        let mut parts = rest.split_whitespace().next()?.split('.');
+        let number = |part: &str| -> Option<u32> {
+            let digits: String = part.chars().take_while(char::is_ascii_digit).collect();
+            if digits.is_empty() || digits.len() > 6 {
+                return None;
+            }
+            digits.parse().ok()
+        };
+        let whole = |part: &str| -> Option<u32> {
+            part.bytes()
+                .all(|b| b.is_ascii_digit())
+                .then(|| number(part))?
+        };
+        let major = whole(parts.next()?)?;
+        let minor = whole(parts.next()?)?;
+        let patch = parts.next().map_or(Some(0), number)?;
+        Some((major, minor, patch))
+    }
+
+    /// The arguments of the throwaway jail that tells whether the host takes
+    /// the option: the namespaces the real jail unshares, the option, the
+    /// host's root read-only, and a command that does nothing.
+    pub fn userns_probe_argv() -> Vec<String> {
+        let mut argv: Vec<String> = super::USERNS_CLOSED.iter().map(|s| s.to_string()).collect();
+        argv.extend(super::JAIL_NAMESPACES.iter().map(|s| s.to_string()));
+        argv.extend(["--ro-bind", "/", "/", "true"].map(String::from));
+        argv
     }
 
     /// The program and arguments that start the jail. Without a scope it is
@@ -1395,6 +1557,10 @@ pub mod launch {
         /// The scopes the kernel showed the jail in ([`user_scope_seen`],
         /// [`system_scope_seen`]); empty for none.
         pub scope: Scopes,
+        /// The jail was started with user namespaces closed
+        /// (`JailInputs::close_userns`). Writes schema 2; `false` writes the
+        /// record an earlier build wrote.
+        pub userns_closed: bool,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1483,7 +1649,12 @@ pub mod launch {
             .ok_or(AssembleError::NoProjectName)?
             .to_string();
         let record = LaunchRecord {
-            schema: LAUNCH_SCHEMA,
+            // The newest schema only when the record needs what it added.
+            schema: if facts.userns_closed {
+                LAUNCH_SCHEMA
+            } else {
+                LAUNCH_SCHEMA_V1
+            },
             instance_id: facts.instance_id,
             agent_type: facts.agent_type.to_string(),
             launcher: Launcher {
@@ -1501,6 +1672,7 @@ pub mod launch {
                 start_ticks: facts.start_ticks,
                 pid_ns: facts.pid_ns,
                 mnt_ns: facts.mnt_ns,
+                userns_closed: facts.userns_closed.then_some(true),
             },
             scope: (!facts.scope.is_empty()).then_some(facts.scope),
         };
@@ -1781,6 +1953,7 @@ mod tests {
             record_fd: None,
             records_dirs: vec![],
             child_env: vec![],
+            close_userns: false,
         }
     }
 
@@ -2405,6 +2578,7 @@ mod tests {
             mnt_ns: 4026532218,
             launcher_mnt_ns: Some(4026531841),
             scope: Default::default(),
+            userns_closed: false,
         }
     }
 
@@ -2530,6 +2704,262 @@ mod tests {
         ));
     }
 
+    // ---- `--identity`: user namespaces closed inside the jail ----
+
+    #[test]
+    fn bwrap_versions_are_read_from_the_first_line() {
+        use launch::parse_bwrap_version as parse;
+        assert_eq!(parse("bubblewrap 0.6.3\n"), Some((0, 6, 3)));
+        assert_eq!(parse("bubblewrap 0.8.0\n"), Some((0, 8, 0)));
+        assert_eq!(parse("bubblewrap 0.9.0"), Some((0, 9, 0)));
+        assert_eq!(parse("bubblewrap 0.11.2\nsecond line\n"), Some((0, 11, 2)));
+        assert_eq!(parse("bubblewrap 0.8.0-rc1"), Some((0, 8, 0)));
+        assert_eq!(parse("bubblewrap 0.8"), Some((0, 8, 0)));
+        for junk in [
+            "",
+            "\n",
+            "bubblewrap",
+            "bubblewrap ",
+            "bubblewrap x.y.z",
+            "bubblewrap 0.x.1",
+            "bubblewrap 1234567.0.0",
+            "systemd 255 (255.4)",
+            "0.9.0",
+            "\u{fffd}\u{fffd}",
+        ] {
+            assert_eq!(parse(junk), None, "{junk:?}");
+        }
+    }
+
+    fn bwrap_facts(version: Option<(u32, u32, u32)>, setuid: bool) -> launch::BwrapFacts {
+        launch::BwrapFacts { version, setuid }
+    }
+
+    /// `close_userns` needs `--identity`, a bwrap at 0.8.0 or later, a bwrap
+    /// that is not setuid, and a start-up probe that exited 0. The probe is
+    /// asked last, and only when every fact before it holds.
+    ///
+    /// FAILS ON REVERT: drop the version, the setuid or the probe check from
+    /// `userns_decision`, or let it answer without `--identity`.
+    #[test]
+    fn user_namespaces_close_only_when_every_fact_allows_it() {
+        use launch::{userns_decision, UsernsFact, UsernsWhy};
+        let asked = std::cell::Cell::new(0);
+        let probe = |ok: bool| {
+            let asked = &asked;
+            move || {
+                asked.set(asked.get() + 1);
+                ok
+            }
+        };
+        let good = bwrap_facts(Some((0, 9, 0)), false);
+        assert_eq!(
+            userns_decision(true, &good, probe(true)),
+            UsernsFact::Closed
+        );
+        assert!(UsernsFact::Closed.close_userns());
+        assert_eq!(asked.get(), 1);
+        assert_eq!(
+            userns_decision(true, &bwrap_facts(Some((0, 8, 0)), false), probe(true)),
+            UsernsFact::Closed,
+            "0.8.0 is the first with the option"
+        );
+        asked.set(0);
+        for (facts, why) in [
+            (bwrap_facts(Some((0, 6, 3)), false), UsernsWhy::BwrapTooOld),
+            (bwrap_facts(Some((0, 7, 9)), false), UsernsWhy::BwrapTooOld),
+            (bwrap_facts(None, false), UsernsWhy::BwrapTooOld),
+            (bwrap_facts(Some((0, 9, 0)), true), UsernsWhy::BwrapSetuid),
+            (bwrap_facts(Some((0, 6, 3)), true), UsernsWhy::BwrapTooOld),
+        ] {
+            let fact = userns_decision(true, &facts, probe(true));
+            assert_eq!(fact, UsernsFact::Open(why), "{facts:?}");
+            assert!(!fact.close_userns());
+        }
+        assert_eq!(asked.get(), 0, "no probe runs when a fact already says no");
+        let failed = userns_decision(true, &good, probe(false));
+        assert_eq!(failed, UsernsFact::Open(UsernsWhy::ProbeFailed));
+        assert!(!failed.close_userns());
+        assert_eq!(asked.get(), 1);
+        // No `--identity`: nothing asked, nothing probed, whatever bwrap is.
+        asked.set(0);
+        assert_eq!(
+            userns_decision(false, &good, probe(true)),
+            UsernsFact::NotAsked
+        );
+        assert!(!UsernsFact::NotAsked.close_userns());
+        assert_eq!(asked.get(), 0);
+    }
+
+    /// The three sentences the launcher, the dry run and the dashboard say,
+    /// word for word, and the dashboard's copy of them.
+    #[test]
+    fn the_userns_words_are_the_closed_table_and_the_dashboard_has_them() {
+        use launch::{userns_open_sentence, UsernsWhy};
+        let table = [
+            (
+                UsernsWhy::BwrapTooOld,
+                "bwrap_too_old",
+                "Bubblewrap here is older than 0.8, so programs in the jail can still make user namespaces.",
+            ),
+            (
+                UsernsWhy::BwrapSetuid,
+                "bwrap_setuid",
+                "Bubblewrap here runs setuid, so user namespaces stay open in the jail.",
+            ),
+            (
+                UsernsWhy::ProbeFailed,
+                "userns_probe_failed",
+                "Bubblewrap here could not start a jail with user namespaces closed, so the jail runs without that.",
+            ),
+        ];
+        let words = include_str!("../../dashboard-kit/web/src/community/words.ts");
+        for (why, word, sentence) in table {
+            assert_eq!(why.word(), word);
+            assert_eq!(why.sentence(), sentence);
+            let line = userns_open_sentence(why);
+            assert!(line.contains(word) && line.contains(sentence), "{line}");
+            assert!(!line.contains('\u{2014}'), "{line}");
+            let entry = format!("  {word}: \"{sentence}\",");
+            assert!(words.contains(&entry), "words.ts has no `{entry}`");
+        }
+    }
+
+    /// The start-up probe asks for the namespaces the jail unshares, with the
+    /// option, and runs nothing.
+    ///
+    /// FAILS ON REVERT: probe without `--unshare-user` or drop a namespace from
+    /// `JAIL_NAMESPACES`' use in the probe.
+    #[test]
+    fn the_probe_starts_a_jail_with_the_option_and_the_jails_namespaces() {
+        let argv = launch::userns_probe_argv();
+        assert_eq!(&argv[..2], USERNS_CLOSED);
+        assert_eq!(&argv[2..5], JAIL_NAMESPACES);
+        assert_eq!(&argv[5..], ["--ro-bind", "/", "/", "true"]);
+        let mut input = identified_inputs();
+        input.close_userns = true;
+        let jail = build_linux_jail(&input).unwrap().bwrap_args;
+        let at = jail
+            .windows(JAIL_NAMESPACES.len())
+            .position(|w| w == JAIL_NAMESPACES)
+            .expect("the jail unshares these");
+        assert_eq!(&jail[at + 3..at + 5], USERNS_CLOSED);
+    }
+
+    /// With `--identity` and the fact, the option follows the namespaces
+    /// (`--unshare-user` names the user namespace `--disable-userns` needs).
+    #[test]
+    fn golden_argv_of_an_identified_jail_with_user_namespaces_closed() {
+        let mut input = identified_inputs();
+        input.close_userns = true;
+        let got = build_linux_jail(&input).unwrap().bwrap_args.join("\n");
+        assert_eq!(
+            got,
+            GOLDEN_ARGV_IDENTIFIED.replace(
+                "--unshare-ipc\n",
+                "--unshare-ipc\n--unshare-user\n--disable-userns\n"
+            )
+        );
+        assert_ne!(got, GOLDEN_ARGV_IDENTIFIED);
+    }
+
+    /// The fact asks for nothing without `--identity`: the argv is what it
+    /// was, and an identified jail whose host cannot take the option is what
+    /// it was too.
+    ///
+    /// FAILS ON REVERT: emit the option for `close_userns` without checking
+    /// `--identity`.
+    #[test]
+    fn the_option_needs_identity_and_the_fact_and_otherwise_the_argv_is_todays() {
+        let mut plain = inputs(&["claude", "--print"]);
+        plain.close_userns = true;
+        assert_eq!(
+            build_linux_jail(&plain).unwrap().bwrap_args.join("\n"),
+            GOLDEN_ARGV_PLAIN
+        );
+        let mut rich = inputs(&["/bin/sh", "-c", "true"]);
+        rich.close_userns = true;
+        assert!(!build_linux_jail(&rich)
+            .unwrap()
+            .bwrap_args
+            .iter()
+            .any(|a| a == "--disable-userns" || a == "--unshare-user"));
+        // Identified, the host took no option (an old or setuid bwrap, or a
+        // probe that failed): byte for byte the jail the previous build made.
+        let mut old = identified_inputs();
+        old.close_userns = false;
+        assert_eq!(
+            build_linux_jail(&old).unwrap().bwrap_args.join("\n"),
+            GOLDEN_ARGV_IDENTIFIED
+        );
+    }
+
+    /// The record names `userns_closed` only when the option was used, and
+    /// then is schema 2. Every other record is the schema 1 an earlier build
+    /// wrote, to the byte.
+    ///
+    /// FAILS ON REVERT: write schema 2 always, or write the field without the
+    /// fact.
+    #[test]
+    fn a_record_says_userns_closed_only_when_the_option_was_used() {
+        use innerwarden_agent_guard::identity::parse_launch_record;
+        let (mode, launcher, project) = (
+            Mode::Enforce,
+            Path::new("/usr/local/bin/innerwarden"),
+            Path::new("/home/dev/work/my-app"),
+        );
+        let old = launch::assemble_record(launch_facts(&mode, launcher, project)).unwrap();
+        assert_eq!(old.schema, 1);
+        assert_eq!(old.jail.userns_closed, None);
+        let json = String::from_utf8(serde_json::to_vec(&old).unwrap()).unwrap();
+        assert_eq!(
+            json,
+            r#"{"schema":1,"instance_id":"07070707070707070707070707070707","agent_type":"claude-code","launcher":{"path":"/usr/local/bin/innerwarden","version":"1.5.5","root_owned":true},"uid":1000,"project":"my-app","mode":"enforce","started_at":"2026-10-16T12:00:00Z","jail":{"backend":"bwrap","pid":2778,"start_ticks":123456,"pid_ns":4026532220,"mnt_ns":4026532218}}"#,
+            "the record an earlier build wrote, to the byte"
+        );
+        let mut closed_facts = launch_facts(&mode, launcher, project);
+        closed_facts.userns_closed = true;
+        let closed = launch::assemble_record(closed_facts).unwrap();
+        assert_eq!(closed.schema, 2);
+        assert_eq!(closed.jail.userns_closed, Some(true));
+        let json2 = String::from_utf8(serde_json::to_vec(&closed).unwrap()).unwrap();
+        assert_eq!(
+            json2,
+            json.replacen(r#""schema":1"#, r#""schema":2"#, 1).replacen(
+                r#""mnt_ns":4026532218}"#,
+                r#""mnt_ns":4026532218,"userns_closed":true}"#,
+                1
+            )
+        );
+        assert_eq!(parse_launch_record(json2.as_bytes()).unwrap(), closed);
+        assert_eq!(parse_launch_record(json.as_bytes()).unwrap(), old);
+    }
+
+    /// What this build assembles without the option is a record this build's
+    /// own reader (and the writer's `validate`) accepts: a reader that took
+    /// only the newest schema would refuse every record the build still
+    /// writes at 1.
+    ///
+    /// FAILS ON REVERT: make `validate` compare the schema to `LAUNCH_SCHEMA`
+    /// again.
+    #[test]
+    fn a_v1_assembled_by_this_build_validates() {
+        let (mode, launcher, project) = (
+            Mode::Monitor,
+            Path::new("/usr/local/bin/innerwarden"),
+            Path::new("/home/dev/work/my-app"),
+        );
+        let record = launch::assemble_record(launch_facts(&mode, launcher, project)).unwrap();
+        assert_eq!(
+            record.schema,
+            innerwarden_agent_guard::identity::LAUNCH_SCHEMA_V1
+        );
+        assert!(record.validate().is_ok());
+        let mut v2 = launch_facts(&mode, launcher, project);
+        v2.userns_closed = true;
+        assert!(launch::assemble_record(v2).unwrap().validate().is_ok());
+    }
+
     // ---- `--identity`: the record mount, the sealed trees, the scope ----
 
     /// The record, mounted where the hook looks for it.
@@ -2547,6 +2977,8 @@ mod tests {
         "--unshare-pid",
         "--unshare-uts",
         "--unshare-ipc",
+        "--unshare-user",
+        "--disable-userns",
         "--hostname",
         "--new-session",
         "--setenv",
@@ -2572,11 +3004,21 @@ mod tests {
             git_dir: PathBuf::from("/home/dev/repo/.git/worktrees/w"),
             common_dir: PathBuf::from("/home/dev/repo/.git"),
         });
-        for (mut input, golden) in [
+        // Each jail twice: with the facts an identified launch has by default
+        // (the option not taken) and with `close_userns`. The default never
+        // sees the option, so only the second proves where it goes.
+        let mut cases = Vec::new();
+        for (input, golden) in [
             (inputs(&["claude", "--print"]), GOLDEN_ARGV_PLAIN),
             (rich, GOLDEN_ARGV_RICH),
         ] {
+            for close in [false, true] {
+                cases.push((input.clone(), golden, close));
+            }
+        }
+        for (mut input, golden, close) in cases {
             input.args.identity = true;
+            input.close_userns = close;
             input.info_fd = Some(7);
             input.record_fd = Some(8);
             let got = build_linux_jail(&input).unwrap().bwrap_args;
@@ -2604,11 +3046,30 @@ mod tests {
                     "{option} comes after the record and may cover it"
                 );
             }
-            // Without its two additions the jail is exactly today's.
+            // Without its additions the jail is exactly today's.
             let mut without = got.clone();
             without.drain(at..at + 3);
             let info = without.iter().position(|a| a == "--info-fd").unwrap();
             without.drain(info..info + 2);
+            if close {
+                // The option comes after the record and every mount, and
+                // only with the fact.
+                let userns = got
+                    .windows(2)
+                    .position(|w| w == USERNS_CLOSED)
+                    .expect("--unshare-user --disable-userns");
+                assert!(at + 3 <= userns, "the option follows the record");
+                assert!(
+                    got[userns + 2..terminator]
+                        .iter()
+                        .all(|a| a != "--bind" && a != "--ro-bind" && a != "--tmpfs"),
+                    "no mount follows the option"
+                );
+                let at_without = without.iter().position(|a| a == USERNS_CLOSED[0]).unwrap();
+                without.drain(at_without..at_without + 2);
+            } else {
+                assert!(!got.iter().any(|a| a == "--disable-userns"));
+            }
             assert_eq!(without.join("\n"), golden);
         }
     }

@@ -280,6 +280,27 @@ export function reasonWords(reason: unknown): string {
   return isReasonCode(reason) ? REASON_WORDS[reason] : UNKNOWN_REASON_WORDS;
 }
 
+/**
+ * The technical view's line about user namespaces inside the jail. A fact
+ * about how the jail was built, shown as it is: it is not a reason code, and
+ * it never changes a trust, a badge or a reason.
+ */
+export const USERNS_CLOSED_WORDS = "User namespaces closed inside the jail";
+
+/** Why a host's bubblewrap cannot close them, by the word the CLI sends. */
+export const USERNS_OPEN_CODES = ["bwrap_too_old", "bwrap_setuid", "userns_probe_failed"] as const;
+export type UsernsOpenCode = (typeof USERNS_OPEN_CODES)[number];
+
+export const USERNS_OPEN_WORDS: Record<UsernsOpenCode, string> = {
+  bwrap_too_old: "Bubblewrap here is older than 0.8, so programs in the jail can still make user namespaces.",
+  bwrap_setuid: "Bubblewrap here runs setuid, so user namespaces stay open in the jail.",
+  userns_probe_failed: "Bubblewrap here could not start a jail with user namespaces closed, so the jail runs without that.",
+};
+
+export function asUsernsOpenCode(value: unknown): UsernsOpenCode | undefined {
+  return typeof value === "string" && (USERNS_OPEN_CODES as readonly string[]).includes(value) ? (value as UsernsOpenCode) : undefined;
+}
+
 /** The second axis: what the person decided about a type of agent. */
 export const LIFECYCLES = ["discovered", "approved", "revoked"] as const;
 export type Lifecycle = (typeof LIFECYCLES)[number];

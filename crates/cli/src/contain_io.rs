@@ -251,6 +251,7 @@ fn resolve_inputs(args: ContainArgs, home: PathBuf, iw_binary: PathBuf) -> JailI
         record_fd: None,
         records_dirs,
         child_env,
+        close_userns: false,
     }
 }
 
@@ -481,10 +482,20 @@ fn sound_root_file<'a>(
 fn run_linux(input: &JailInputs) -> ExitCode {
     // A dry run with `--identity` shows the arguments the real run adds.
     let dry_identity;
+    // What a real run would do about user namespaces in the jail, asked of the
+    // bwrap it would use. A host with no bwrap says nothing here: the real run
+    // says it has none.
+    let userns = (input.args.identity && input.args.dry_run)
+        .then(|| {
+            resolve_backend(&["/usr/bin/bwrap", "/bin/bwrap", "/usr/local/bin/bwrap"])
+                .map(|bwrap| userns_fact(&bwrap))
+        })
+        .flatten();
     let planned = if input.args.identity && input.args.dry_run {
         dry_identity = JailInputs {
             info_fd: Some(crate::contain::launch::DRY_RUN_INFO_FD),
             record_fd: Some(crate::contain::launch::DRY_RUN_RECORD_FD),
+            close_userns: userns.is_some_and(crate::contain::launch::UsernsFact::close_userns),
             ..input.clone()
         };
         &dry_identity
@@ -504,6 +515,9 @@ fn run_linux(input: &JailInputs) -> ExitCode {
         #[cfg(target_os = "linux")]
         if input.args.identity {
             println!("# {}", dry_run_scope_line());
+            if let Some(crate::contain::launch::UsernsFact::Open(why)) = userns {
+                println!("# {}", crate::contain::launch::userns_open_sentence(why));
+            }
         }
         println!("bwrap \\");
         println!("  {}", plan.bwrap_args.join(" "));
@@ -718,6 +732,14 @@ fn run_linux_identified(input: &JailInputs, bwrap: &Path) -> ExitCode {
     // SAFETY: getuid takes no arguments and cannot fail.
     let uid = unsafe { libc::getuid() };
     let mut input = input.clone();
+    // Once, before the jail is built: whether this host takes the option that
+    // keeps the jail's programs from making user namespaces. A host that does
+    // not runs the jail as it always did, and says why.
+    let userns = userns_fact(bwrap);
+    if let crate::contain::launch::UsernsFact::Open(why) = userns {
+        eprintln!("{}", crate::contain::launch::userns_open_sentence(why));
+    }
+    input.close_userns = userns.close_userns();
     if let Some(dir) = input.records_dirs.first() {
         if let Err(e) = own_records_dir(dir, uid) {
             eprintln!("innerwarden contain: the launcher's records folder is not usable ({e})");
@@ -1053,6 +1075,7 @@ fn identify(
         mnt_ns,
         launcher_mnt_ns,
         scope: scopes,
+        userns_closed: input.close_userns,
     };
     let record = assemble_record(facts).map_err(|e| e.to_string())?;
     let json = serde_json::to_vec(&record).map_err(|e| e.to_string())?;
@@ -1178,6 +1201,107 @@ fn helper_env(command: &mut Command) {
         command.env_remove(name);
     }
     command.env("PATH", crate::contain::HELPER_PATH);
+}
+
+/// Whether bwrap runs from a file with the set-user-id bit, read from the same
+/// entry [`backend_trusted`] reads. A file that could not be read counts as
+/// setuid: nothing says it is not.
+#[cfg(unix)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn backend_setuid(facts: Option<&BackendFacts>) -> bool {
+    facts
+        .and_then(|facts| facts.chain.first())
+        .is_none_or(|executable| executable.mode & 0o4000 != 0)
+}
+
+/// What `bwrap --version` and the file's mode say about the bwrap at `bwrap`.
+#[cfg(target_os = "linux")]
+fn bwrap_facts(bwrap: &Path) -> crate::contain::launch::BwrapFacts {
+    let mut command = Command::new(bwrap);
+    helper_env(&mut command);
+    let version = command
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| {
+            crate::contain::launch::parse_bwrap_version(&String::from_utf8_lossy(&out.stdout))
+        });
+    crate::contain::launch::BwrapFacts {
+        version,
+        setuid: backend_setuid(backend_facts(bwrap).as_ref()),
+    }
+}
+
+/// Start the throwaway jail that tells whether this host takes the option:
+/// `true` only when it ran and exited 0 within five seconds.
+#[cfg(target_os = "linux")]
+fn userns_probe(bwrap: &Path) -> bool {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let mut command = Command::new(bwrap);
+    command
+        .args(crate::contain::launch::userns_probe_argv())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    helper_env(&mut command);
+    let Ok(mut child) = command.spawn() else {
+        return false;
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+}
+
+/// What an identified launch does about user namespaces in the jail, on this
+/// host's bwrap. Starts one process to read the version and, only if
+/// everything before it holds, one throwaway jail.
+#[cfg(target_os = "linux")]
+fn userns_fact(bwrap: &Path) -> crate::contain::launch::UsernsFact {
+    crate::contain::launch::userns_decision(true, &bwrap_facts(bwrap), || userns_probe(bwrap))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn userns_fact(_bwrap: &Path) -> crate::contain::launch::UsernsFact {
+    crate::contain::launch::UsernsFact::NotAsked
+}
+
+/// Why this host's bwrap cannot close user namespaces in a jail, if the file
+/// itself says so (too old, setuid): the word the dashboard shows for a jail
+/// that did not close them. The start-up probe is not run here, so a host that
+/// refused only that says nothing. Read once.
+pub(crate) fn host_userns_gap() -> Option<&'static str> {
+    #[cfg(target_os = "linux")]
+    {
+        use crate::contain::launch::{userns_decision, UsernsFact, UsernsWhy};
+        static GAP: std::sync::OnceLock<Option<&'static str>> = std::sync::OnceLock::new();
+        *GAP.get_or_init(|| {
+            let bwrap = resolve_backend(&["/usr/bin/bwrap", "/bin/bwrap", "/usr/local/bin/bwrap"])?;
+            match userns_decision(true, &bwrap_facts(&bwrap), || true) {
+                UsernsFact::Open(why @ (UsernsWhy::BwrapTooOld | UsernsWhy::BwrapSetuid)) => {
+                    Some(why.word())
+                }
+                _ => None,
+            }
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
 }
 
 /// What decides the user scope, read from this host.
@@ -1411,6 +1535,34 @@ fn print_plan_env(env: &[(String, String)]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Whether bwrap is setuid is read from the mode of the file it runs from;
+    /// a file that could not be read counts as setuid.
+    ///
+    /// FAILS ON REVERT: test another bit than the set-user-id one, or call an
+    /// unreadable file not setuid.
+    #[cfg(unix)]
+    #[test]
+    fn a_setuid_bwrap_is_told_by_its_mode() {
+        let at = |mode: u32| BackendFacts {
+            components: Vec::new(),
+            chain: vec![PathEntry {
+                symlink: false,
+                file: true,
+                dir: false,
+                uid: 0,
+                mode,
+            }],
+        };
+        assert!(backend_setuid(Some(&at(0o104755))), "setuid");
+        assert!(!backend_setuid(Some(&at(0o100755))), "plain");
+        assert!(!backend_setuid(Some(&at(0o102755))), "setgid is not setuid");
+        assert!(backend_setuid(Some(&BackendFacts {
+            components: Vec::new(),
+            chain: Vec::new(),
+        })));
+        assert!(backend_setuid(None));
+    }
 
     /// One loopback listener that answers its first request with `status`.
     #[cfg(unix)]

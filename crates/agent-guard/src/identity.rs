@@ -635,13 +635,18 @@ impl Lifecycle {
 // The launch record
 // ---------------------------------------------------------------------------
 
-/// The schema number this build writes.
-pub const LAUNCH_SCHEMA: u32 = 1;
+/// The newest schema number this build writes. It writes the newest only when
+/// a record needs a field that version added (schema 2: `jail.userns_closed`);
+/// every other record is [`LAUNCH_SCHEMA_V1`], byte for byte what an earlier
+/// build wrote.
+pub const LAUNCH_SCHEMA: u32 = 2;
 
-/// The schema numbers this build reads: its own and the one before. Today there
-/// is only one, so this is `[1]`; when a version 2 exists this lists both, and
-/// the golden test for version 1 keeps proving the old one still parses.
-pub const READABLE_SCHEMAS: &[u32] = &[1];
+/// The first schema: the field set of a record with nothing added.
+pub const LAUNCH_SCHEMA_V1: u32 = 1;
+
+/// The schema numbers this build reads: its own and the one before. The golden
+/// test for version 1 keeps proving the old one still parses.
+pub const READABLE_SCHEMAS: &[u32] = &[1, 2];
 
 /// The largest record read. A record is a few hundred bytes; anything near this
 /// is not one, and a reader that took more would let a writer cost it memory.
@@ -704,6 +709,12 @@ pub struct Jail {
     /// `0` when the backend has none. A process in the jail that sees another
     /// mount namespace sees a filesystem the launcher did not build.
     pub mnt_ns: u64,
+    /// Schema 2 only, and then always `true`: the jail was started so that its
+    /// programs cannot make user namespaces of their own. A fact about how the
+    /// jail was built, which the agent can read and forge like the rest of the
+    /// record; it never raises trust ([`judge_trust_in_jail`] does not read it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub userns_closed: Option<bool>,
 }
 
 /// A dedicated scope the jail was in, as the launcher read it from the kernel
@@ -811,6 +822,18 @@ impl std::error::Error for RecordError {}
 /// and a number this build does not know is refused rather than guessed, so an
 /// older reader never reads a newer record as if it were its own.
 pub fn parse_launch_record(bytes: &[u8]) -> Result<LaunchRecord, RecordError> {
+    parse_launch_record_as(bytes, READABLE_SCHEMAS, LAUNCH_SCHEMA)
+}
+
+/// [`parse_launch_record`] for a reader that reads `readable` and whose newest
+/// schema is `newest`. The build's own reader is `(READABLE_SCHEMAS,
+/// LAUNCH_SCHEMA)`; a test passes an older build's pair to prove that build
+/// refuses a newer record instead of reading it as its own.
+fn parse_launch_record_as(
+    bytes: &[u8],
+    readable: &[u32],
+    newest: u32,
+) -> Result<LaunchRecord, RecordError> {
     if bytes.len() > MAX_RECORD_BYTES {
         return Err(RecordError::TooLarge);
     }
@@ -821,18 +844,18 @@ pub fn parse_launch_record(bytes: &[u8]) -> Result<LaunchRecord, RecordError> {
     let probe: Probe =
         serde_json::from_slice(bytes).map_err(|e| RecordError::Malformed(e.to_string()))?;
     let schema = probe.schema.ok_or(RecordError::NoSchema)?;
-    let readable = u32::try_from(schema)
+    let known = u32::try_from(schema)
         .ok()
-        .is_some_and(|n| READABLE_SCHEMAS.contains(&n));
-    if !readable {
-        return Err(if schema > u64::from(LAUNCH_SCHEMA) {
+        .is_some_and(|n| readable.contains(&n));
+    if !known {
+        return Err(if schema > u64::from(newest) {
             RecordError::NewerSchema(schema)
         } else {
             RecordError::UnsupportedSchema(schema)
         });
     }
-    // Only schema 1 exists. A version 2 adds its own arm here, and keeps this
-    // one for the records already written.
+    // One decoder serves every readable schema; `validate` holds each to its
+    // own field set.
     let record: LaunchRecord =
         serde_json::from_slice(bytes).map_err(|e| RecordError::Malformed(e.to_string()))?;
     record.validate()?;
@@ -842,10 +865,26 @@ pub fn parse_launch_record(bytes: &[u8]) -> Result<LaunchRecord, RecordError> {
 impl LaunchRecord {
     /// Whether every value is inside what its field may hold.
     pub fn validate(&self) -> Result<(), RecordError> {
-        if self.schema != LAUNCH_SCHEMA {
-            return Err(RecordError::Invalid(
-                "schema is not the one this build writes",
-            ));
+        // The same number means the same field set. Schema 1 has no
+        // `userns_closed`; schema 2 exists to carry it, and only as `true`.
+        match self.schema {
+            LAUNCH_SCHEMA_V1 => {
+                if self.jail.userns_closed.is_some() {
+                    return Err(RecordError::Malformed(
+                        "jail.userns_closed is not a field of schema 1".to_string(),
+                    ));
+                }
+            }
+            2 => {
+                if self.jail.userns_closed != Some(true) {
+                    return Err(RecordError::Invalid(
+                        "schema 2 carries jail.userns_closed, and only as true",
+                    ));
+                }
+            }
+            _ => {
+                return Err(RecordError::Invalid("schema is not one this build reads"));
+            }
         }
         if !is_instance_id(&self.instance_id) {
             return Err(RecordError::Invalid("instance_id"));
@@ -1454,6 +1493,133 @@ mod tests {
         parse_launch_record(value.to_string().as_bytes())
     }
 
+    /// A version 2 record exactly as a launcher writes it when it closed user
+    /// namespaces in the jail: the version 1 field set plus `jail.userns_closed`.
+    /// Like [`GOLDEN_V1`] this text never changes.
+    const GOLDEN_V2: &str = r#"{
+  "schema": 2,
+  "instance_id": "7f3a9c1e42b84d0e9a6c5f1b2d3e4a59",
+  "agent_type": "claude-code",
+  "launcher": { "path": "/usr/local/bin/innerwarden", "version": "1.6.0", "root_owned": true },
+  "uid": 1000,
+  "project": "my-app",
+  "mode": "enforce",
+  "started_at": "2026-10-16T09:30:00Z",
+  "jail": { "backend": "bwrap", "pid": 48211, "start_ticks": 9120344, "pid_ns": 4026532871, "mnt_ns": 4026532869, "userns_closed": true },
+  "scope": {
+    "user": {
+      "unit": "innerwarden-contain-7f3a9c1e42b84d0e9a6c5f1b2d3e4a59.scope",
+      "cgroup_path": "/user.slice/user-1000.slice/user@1000.service/app.slice/innerwarden-contain-7f3a9c1e42b84d0e9a6c5f1b2d3e4a59.scope"
+    }
+  }
+}"#;
+
+    fn golden_v2_json() -> Value {
+        serde_json::from_str(GOLDEN_V2).unwrap()
+    }
+
+    #[test]
+    fn the_golden_v2_record_parses_and_round_trips() {
+        let record =
+            parse_launch_record(GOLDEN_V2.as_bytes()).expect("the golden v2 record parses");
+        assert_eq!(record.schema, 2);
+        assert_eq!(record.jail.userns_closed, Some(true));
+        assert_eq!(serde_json::to_value(&record).unwrap(), golden_v2_json());
+        // And the version 1 golden still parses, with the field absent and
+        // written back absent.
+        let v1 = golden();
+        assert_eq!(v1.schema, 1);
+        assert_eq!(v1.jail.userns_closed, None);
+        assert!(serde_json::to_value(&v1).unwrap()["jail"]
+            .get("userns_closed")
+            .is_none());
+    }
+
+    /// Schema 1 has no `userns_closed`: a version 1 record that carries it,
+    /// true or false, is not a version 1 record.
+    ///
+    /// FAILS ON REVERT: drop the schema 1 arm of `validate` and the version 1
+    /// record with the field parses.
+    #[test]
+    fn v1_with_userns_closed_is_refused() {
+        for value in [json!(true), json!(false)] {
+            let mut record = golden_json();
+            record["jail"]["userns_closed"] = value;
+            assert!(
+                matches!(parse_value(&record), Err(RecordError::Malformed(_))),
+                "{record}"
+            );
+        }
+    }
+
+    /// Schema 2 exists to carry the field, and only as `true`.
+    ///
+    /// FAILS ON REVERT: drop the schema 2 arm of `validate` and a version 2
+    /// record with no field, or with `false`, parses.
+    #[test]
+    fn v2_without_userns_closed_true_is_refused() {
+        let mut absent = golden_v2_json();
+        absent["jail"]
+            .as_object_mut()
+            .unwrap()
+            .remove("userns_closed");
+        assert!(matches!(parse_value(&absent), Err(RecordError::Invalid(_))));
+        let mut off = golden_v2_json();
+        off["jail"]["userns_closed"] = json!(false);
+        assert!(matches!(parse_value(&off), Err(RecordError::Invalid(_))));
+        let mut null = golden_v2_json();
+        null["jail"]["userns_closed"] = json!(null);
+        assert!(matches!(parse_value(&null), Err(RecordError::Invalid(_))));
+    }
+
+    /// A reader of the previous build (reads `[1]`, writes 1) meets a version
+    /// 2 record and refuses it as newer: it degrades to an unreadable record,
+    /// never to a level above what it read.
+    ///
+    /// FAILS ON REVERT: let `parse_launch_record_as` ignore its `readable`
+    /// list and the old reader reads the version 2 record.
+    #[test]
+    fn an_older_reader_refuses_a_v2_record() {
+        assert_eq!(
+            parse_launch_record_as(GOLDEN_V2.as_bytes(), &[1], 1),
+            Err(RecordError::NewerSchema(2))
+        );
+        assert!(parse_launch_record_as(GOLDEN_V1.as_bytes(), &[1], 1).is_ok());
+        assert!(
+            parse_launch_record_as(GOLDEN_V2.as_bytes(), READABLE_SCHEMAS, LAUNCH_SCHEMA).is_ok()
+        );
+    }
+
+    /// That user namespaces were closed is a fact the agent can write into a
+    /// record of its own, so it moves nothing: the same facts judge the same
+    /// with the field and without it, in every row a record reaches.
+    ///
+    /// FAILS ON REVERT: let `judge_trust_in_jail` return `confined` for a
+    /// record that says `userns_closed` and this sees `confined`.
+    #[test]
+    fn userns_closed_never_raises_trust() {
+        let without = golden();
+        let mut with = golden();
+        with.schema = 2;
+        with.jail.userns_closed = Some(true);
+        for read_only in [true, false] {
+            for own in [Some(OWN_NS), Some(1), None] {
+                assert_eq!(
+                    judge_trust_in_jail(facts(&with, read_only, own)),
+                    judge_trust_in_jail(facts(&without, read_only, own)),
+                    "read_only={read_only} own={own:?}"
+                );
+            }
+        }
+        assert_eq!(
+            judge_trust_in_jail(facts(&with, true, Some(OWN_NS))),
+            (Trust::Observed, Reason::ConfinedByNamespace)
+        );
+        // A record forged by the agent, field and all, reads the same too.
+        let forged = parse_launch_record(GOLDEN_V2.as_bytes()).unwrap();
+        assert!(judge_trust_in_jail(facts(&forged, true, Some(OWN_NS))).0 < Trust::Confined);
+    }
+
     #[test]
     fn the_golden_v1_record_parses_and_round_trips() {
         let record = golden();
@@ -1519,8 +1685,8 @@ mod tests {
     #[test]
     fn a_newer_schema_is_refused_not_guessed() {
         let mut value = golden_json();
-        value["schema"] = json!(2);
-        assert_eq!(parse_value(&value), Err(RecordError::NewerSchema(2)));
+        value["schema"] = json!(3);
+        assert_eq!(parse_value(&value), Err(RecordError::NewerSchema(3)));
         value["schema"] = json!(4_000_000_000u64);
         assert_eq!(
             parse_value(&value),

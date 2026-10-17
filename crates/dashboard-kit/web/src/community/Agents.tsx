@@ -9,7 +9,7 @@ import { OfferLine } from "./Offer";
 import { agentsOffer } from "./offers";
 import { CARD, Chip, CopyCommand, PageHeader, Skeleton, StaleLine, Unreadable, type ChipTone } from "./parts";
 import { usePolled } from "./poll";
-import { LAUNCH_MODE_WORDS, LIFECYCLE_WORDS, reasonWords, STATE_WORDS, trustWord, type AgentState, type Trust, type TrustSource } from "./words";
+import { LAUNCH_MODE_WORDS, LIFECYCLE_WORDS, reasonWords, STATE_WORDS, trustWord, USERNS_CLOSED_WORDS, USERNS_OPEN_WORDS, type AgentState, type Trust, type TrustSource } from "./words";
 
 export const AGENTS_PAGE_POLL_MS = 30_000;
 
@@ -280,6 +280,11 @@ function InstanceRow({ instance, profileLabel, context }: { instance: LocalInsta
               Launcher {instance.technical.launcherPath}
               {instance.technical.launcherRootOwned === undefined ? "" : `, owned by root: ${instance.technical.launcherRootOwned ? "yes" : "no"}`}
             </div>
+          )}
+          {instance.technical.usernsClosed === true ? (
+            <div>{USERNS_CLOSED_WORDS}</div>
+          ) : instance.technical.usernsOpenReason === undefined ? null : (
+            <div>{USERNS_OPEN_WORDS[instance.technical.usernsOpenReason]}</div>
           )}
           <div>Trust decided by: the hook inside the jail ({instance.trustReason === "" ? "no reason recorded" : instance.trustReason})</div>
         </dl>

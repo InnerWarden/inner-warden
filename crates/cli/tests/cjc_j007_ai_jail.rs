@@ -224,7 +224,15 @@ fn identity_flag_mounts_the_record_read_only_inside_and_keeps_a_private_copy() {
     }
 
     let record: serde_json::Value = serde_json::from_slice(&outside).unwrap();
-    assert_eq!(record["schema"], 1);
+    // Schema 2 exactly when the jail was started with user namespaces closed
+    // (a bwrap that takes the option, on a host that lets it): then, and only
+    // then, the record says so. Any other jail writes the schema 1 it always
+    // wrote, without the field.
+    match record["schema"].as_u64() {
+        Some(1) => assert!(record["jail"].get("userns_closed").is_none(), "{record}"),
+        Some(2) => assert_eq!(record["jail"]["userns_closed"], true, "{record}"),
+        other => panic!("schema {other:?}: {record}"),
+    }
     assert_eq!(record["agent_type"], "claude-code");
     assert_eq!(record["mode"], "monitor");
     assert_eq!(
@@ -373,8 +381,33 @@ fn dry_run_shows_the_record_and_info_descriptors_only_with_the_identity_flag() {
         .filter(|l| !l.starts_with("#   IW_HOOK_AGENT="))
         .map(|l| format!("{l}\n"))
         .collect();
+    // The two ways the dry run speaks of user namespaces: the option in the
+    // argument list, or the line that says why it is not there. Never both,
+    // and the plain run says neither.
+    let option = " --unshare-user --disable-userns";
+    let said = "# innerwarden contain: user namespaces stay open (";
+    assert!(
+        !plain.contains("--disable-userns") && !plain.contains(said),
+        "{plain}"
+    );
+    assert!(
+        !(identified.contains(option) && identified.contains(said)),
+        "the option and its absence are not both said: {identified}"
+    );
+    if identified.contains(option) {
+        assert_eq!(
+            identified.matches("--disable-userns").count(),
+            1,
+            "{identified}"
+        );
+        assert!(
+            identified.contains(&format!(" --unshare-ipc{option} --hostname ai-sandbox ")),
+            "the option follows the namespaces: {identified}"
+        );
+    }
     let without: String = identified
         .replace(" --ro-bind-data 10 /run/innerwarden/instance.json", "")
+        .replace(option, "")
         .replace(" --info-fd 9", "")
         .replace(
             &format!(
@@ -386,7 +419,7 @@ fn dry_run_shows_the_record_and_info_descriptors_only_with_the_identity_flag() {
             "",
         )
         .lines()
-        .filter(|l| !l.starts_with("# innerwarden contain: no scope"))
+        .filter(|l| !l.starts_with("# innerwarden contain: no scope") && !l.starts_with(said))
         .map(|l| format!("{l}\n"))
         .collect();
     assert_eq!(without, plain, "the flag adds these and nothing else");
