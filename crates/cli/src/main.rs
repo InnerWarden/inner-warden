@@ -1112,7 +1112,7 @@ fn hook_profiles_invalid(why: &str) -> std::process::ExitCode {
     eprintln!(
         "InnerWarden hook: the agent profiles cannot be used ({why}); refusing this call rather \
          than screening it against a policy that is not the one written.\n  For the person \
-         supervising this agent: fix or remove the file. An agent cannot change it."
+         supervising this agent: fix or remove the file named above."
     );
     std::process::ExitCode::from(2)
 }
