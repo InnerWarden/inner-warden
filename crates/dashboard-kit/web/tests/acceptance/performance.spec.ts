@@ -94,15 +94,24 @@ const distAssets = join(webRoot, "dist", "assets");
 // assets. No line moves. The CSS has 592B of headroom under its 60,000B
 // line: the next change that adds utilities trims first (reuse what the
 // bundle has), or moves this line by measurement here.
+//
+// Re-measured 2026-10-17 after the agent identity screens of the paid edition
+// (the trust layer on the Overview, the instances on the agent card, the
+// identity block and the profile and exception steps in a case, the four
+// decision actions): the Enterprise bundle is 860,621B of JS, 59,500B of CSS
+// and 920,664B of assets. The JS and single-asset lines move to the measured
+// bundle plus 16,000B, rounded up to the next 5,000B: 880,000B; the asset
+// total the same way: 940,000B. The CSS line stays: 500B of headroom, so the
+// next change that adds utilities trims first.
 const FIRST_MEANINGFUL_CONTENT_BUDGET_MS = 4_000;
 const POLL_MIN_GAP_MS = 4_000; // the shell polls on a 5s interval; allow scheduling slack
 const POLL_MAX_REQUESTS_IN_WINDOW = 3; // over a ~7.5s observation window
 const MAX_CASES_PER_PAGE = 50; // a page must stay bounded regardless of the backend
 const MAX_COMMUNITY_CASES_PAGE_BYTES = 40_000; // one page of 25 flagged decisions, with their words and next steps
-const MAX_TOTAL_JS_BYTES = 830_000;
+const MAX_TOTAL_JS_BYTES = 880_000;
 const MAX_TOTAL_CSS_BYTES = 60_000;
-const MAX_SINGLE_ASSET_BYTES = 830_000;
-const MAX_TOTAL_ASSET_BYTES = 890_000;
+const MAX_SINGLE_ASSET_BYTES = 880_000;
+const MAX_TOTAL_ASSET_BYTES = 940_000;
 
 const COMMUNITY_META = {
   version: "0.16.4-fixture",
