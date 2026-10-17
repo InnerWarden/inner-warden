@@ -1,0 +1,514 @@
+{
+  "cmd:contain:0": {
+    "around": {
+      "after": [
+        {
+          "command": "curl http://203.0.113.9/health",
+          "flagged": false,
+          "id": "cmd:contain:1",
+          "outcome_key": "allowed",
+          "recorded_at": "2026-09-29T13:30:00Z"
+        }
+      ],
+      "before": []
+    },
+    "item": {
+      "agent": "Claude Code",
+      "agent_id": "claude-code",
+      "allowed_by_you": false,
+      "asi": [],
+      "categories": [],
+      "channel": "hook",
+      "command": "npm test",
+      "command_whole": true,
+      "concern": "other",
+      "decided_by": "rules",
+      "explanation": "no rule matched",
+      "id": "cmd:contain:0",
+      "identity": {
+        "deciding_layer": "general",
+        "instance_id": "5c1e0a7700004000800000000000c0f1",
+        "profile": "claude-code",
+        "relaxation_withheld": false,
+        "session_id": "5c1e0a77-demo-4000-8000-00000000000a",
+        "trust": "host_verified",
+        "trust_reason": "confined_by_namespace"
+      },
+      "mode_at_decision": "enforce",
+      "next": [],
+      "outcome": "allowed",
+      "outcome_key": "allowed",
+      "project": "my-app",
+      "reason": {
+        "key": "text:35c96f4add023f10",
+        "short": "no rule matched",
+        "words": "no rule matched"
+      },
+      "reasons_more": 0,
+      "recommendation": "allow",
+      "recorded_at": "2026-09-29T13:25:00Z",
+      "rules": [],
+      "seq": 0,
+      "session": "contain",
+      "story": {
+        "did": "The rules allowed it, so it ran.",
+        "happened": [
+          {
+            "kind": "text",
+            "text": "Claude Code asked to run this"
+          },
+          {
+            "kind": "text",
+            "text": " in the folder "
+          },
+          {
+            "kind": "code",
+            "text": "my-app"
+          },
+          {
+            "kind": "text",
+            "text": " on "
+          },
+          {
+            "at": "2026-09-29T13:25:00Z",
+            "kind": "time"
+          },
+          {
+            "kind": "text",
+            "text": ". The guard allowed it."
+          }
+        ]
+      }
+    },
+    "schema_version": 1,
+    "session": {
+      "agent": "Claude Code",
+      "channel": "hook",
+      "decisions": 5,
+      "first_at": "2026-09-28T14:05:00Z",
+      "flagged": 1,
+      "last_at": "2026-09-29T13:53:00Z",
+      "project": "my-app"
+    }
+  },
+  "cmd:contain:1": {
+    "around": {
+      "after": [
+        {
+          "command": "curl http://203.0.113.9/health",
+          "flagged": true,
+          "id": "cmd:contain:2",
+          "outcome_key": "refused_before_run",
+          "recorded_at": "2026-09-29T13:45:00Z"
+        }
+      ],
+      "before": [
+        {
+          "command": "npm test",
+          "flagged": false,
+          "id": "cmd:contain:0",
+          "outcome_key": "allowed",
+          "recorded_at": "2026-09-29T13:25:00Z"
+        }
+      ]
+    },
+    "item": {
+      "agent": "Claude Code",
+      "agent_id": "claude-code",
+      "allowed_by_you": false,
+      "asi": [],
+      "categories": [],
+      "channel": "hook",
+      "command": "curl http://203.0.113.9/health",
+      "command_whole": true,
+      "concern": "other",
+      "decided_by": "rules",
+      "explanation": "no rule matched",
+      "id": "cmd:contain:1",
+      "identity": {
+        "deciding_layer": "agent_type",
+        "instance_id": "5c1e0a7700004000800000000000c0f1",
+        "profile": "claude-code",
+        "relaxation_withheld": false,
+        "session_id": "5c1e0a77-demo-4000-8000-00000000000a",
+        "trust": "host_verified",
+        "trust_reason": "confined_by_namespace"
+      },
+      "mode_at_decision": "enforce",
+      "next": [],
+      "outcome": "allowed",
+      "outcome_key": "allowed",
+      "project": "my-app",
+      "reason": {
+        "key": "text:35c96f4add023f10",
+        "short": "no rule matched",
+        "words": "no rule matched"
+      },
+      "reasons_more": 0,
+      "recommendation": "allow",
+      "recorded_at": "2026-09-29T13:30:00Z",
+      "rules": [],
+      "seq": 1,
+      "session": "contain",
+      "story": {
+        "did": "The rules allowed it, so it ran.",
+        "happened": [
+          {
+            "kind": "text",
+            "text": "Claude Code asked to run this"
+          },
+          {
+            "kind": "text",
+            "text": " in the folder "
+          },
+          {
+            "kind": "code",
+            "text": "my-app"
+          },
+          {
+            "kind": "text",
+            "text": " on "
+          },
+          {
+            "at": "2026-09-29T13:30:00Z",
+            "kind": "time"
+          },
+          {
+            "kind": "text",
+            "text": ". The guard allowed it."
+          }
+        ]
+      }
+    },
+    "schema_version": 1,
+    "session": {
+      "agent": "Claude Code",
+      "channel": "hook",
+      "decisions": 5,
+      "first_at": "2026-09-28T14:05:00Z",
+      "flagged": 1,
+      "last_at": "2026-09-29T13:53:00Z",
+      "project": "my-app"
+    }
+  },
+  "cmd:contain:2": {
+    "around": {
+      "after": [
+        {
+          "command": "git status",
+          "flagged": false,
+          "id": "cmd:contain:3",
+          "outcome_key": "allowed",
+          "recorded_at": "2026-09-29T13:53:00Z"
+        }
+      ],
+      "before": [
+        {
+          "command": "npm test",
+          "flagged": false,
+          "id": "cmd:contain:0",
+          "outcome_key": "allowed",
+          "recorded_at": "2026-09-29T13:25:00Z"
+        },
+        {
+          "command": "curl http://203.0.113.9/health",
+          "flagged": false,
+          "id": "cmd:contain:1",
+          "outcome_key": "allowed",
+          "recorded_at": "2026-09-29T13:30:00Z"
+        }
+      ]
+    },
+    "item": {
+      "agent": "Claude Code",
+      "agent_id": "claude-code",
+      "allowed_by_you": false,
+      "asi": [],
+      "categories": [],
+      "channel": "hook",
+      "command": "curl http://203.0.113.9/health",
+      "command_whole": true,
+      "concern": "other",
+      "decided_by": "rules",
+      "explanation": "fetch from a bare IP",
+      "id": "cmd:contain:2",
+      "identity": {
+        "deciding_layer": "general",
+        "instance_id": "9d2f41b800004000800000000000ab52",
+        "profile": "claude-code",
+        "relaxation_withheld": true,
+        "session_id": "9d2f41b8-demo-4000-8000-00000000000b",
+        "trust": "observed",
+        "trust_reason": "launcher_not_trusted"
+      },
+      "mode_at_decision": "enforce",
+      "next": [
+        {
+          "label": "Nothing to do.",
+          "line": "The guard refused it before it ran."
+        }
+      ],
+      "outcome": "blocked",
+      "outcome_key": "refused_before_run",
+      "project": "my-app",
+      "reason": {
+        "key": "rule:bare_ip_fetch",
+        "short": "fetch from a bare IP address",
+        "words": "fetch from a bare IP"
+      },
+      "reasons_more": 0,
+      "recommendation": "review",
+      "recorded_at": "2026-09-29T13:45:00Z",
+      "rules": [
+        "bare_ip_fetch"
+      ],
+      "seq": 2,
+      "session": "contain",
+      "story": {
+        "did": "The rules asked for a review, and the guard refused it before it ran, as set up.",
+        "happened": [
+          {
+            "kind": "text",
+            "text": "Claude Code asked to run this"
+          },
+          {
+            "kind": "text",
+            "text": " in the folder "
+          },
+          {
+            "kind": "code",
+            "text": "my-app"
+          },
+          {
+            "kind": "text",
+            "text": " on "
+          },
+          {
+            "at": "2026-09-29T13:45:00Z",
+            "kind": "time"
+          },
+          {
+            "kind": "text",
+            "text": ". The guard flagged it: fetch from a bare IP."
+          }
+        ]
+      }
+    },
+    "schema_version": 1,
+    "session": {
+      "agent": "Claude Code",
+      "channel": "hook",
+      "decisions": 5,
+      "first_at": "2026-09-28T14:05:00Z",
+      "flagged": 1,
+      "last_at": "2026-09-29T13:53:00Z",
+      "project": "my-app"
+    }
+  },
+  "cmd:contain:3": {
+    "around": {
+      "after": [
+        {
+          "command": "cargo build",
+          "flagged": false,
+          "id": "cmd:contain:4",
+          "outcome_key": "allowed",
+          "recorded_at": "2026-09-28T14:05:00Z"
+        }
+      ],
+      "before": [
+        {
+          "command": "curl http://203.0.113.9/health",
+          "flagged": false,
+          "id": "cmd:contain:1",
+          "outcome_key": "allowed",
+          "recorded_at": "2026-09-29T13:30:00Z"
+        },
+        {
+          "command": "curl http://203.0.113.9/health",
+          "flagged": true,
+          "id": "cmd:contain:2",
+          "outcome_key": "refused_before_run",
+          "recorded_at": "2026-09-29T13:45:00Z"
+        }
+      ]
+    },
+    "item": {
+      "agent": "Claude Code",
+      "agent_id": "claude-code",
+      "allowed_by_you": false,
+      "asi": [],
+      "categories": [],
+      "channel": "hook",
+      "command": "git status",
+      "command_whole": true,
+      "concern": "other",
+      "decided_by": "rules",
+      "explanation": "no rule matched",
+      "id": "cmd:contain:3",
+      "identity": {
+        "deciding_layer": "general",
+        "instance_id": "9d2f41b800004000800000000000ab52",
+        "profile": "claude-code",
+        "relaxation_withheld": false,
+        "session_id": "9d2f41b8-demo-4000-8000-00000000000b",
+        "trust": "observed",
+        "trust_reason": "launcher_not_trusted"
+      },
+      "mode_at_decision": "enforce",
+      "next": [],
+      "outcome": "allowed",
+      "outcome_key": "allowed",
+      "project": "my-app",
+      "reason": {
+        "key": "text:35c96f4add023f10",
+        "short": "no rule matched",
+        "words": "no rule matched"
+      },
+      "reasons_more": 0,
+      "recommendation": "allow",
+      "recorded_at": "2026-09-29T13:53:00Z",
+      "rules": [],
+      "seq": 3,
+      "session": "contain",
+      "story": {
+        "did": "The rules allowed it, so it ran.",
+        "happened": [
+          {
+            "kind": "text",
+            "text": "Claude Code asked to run this"
+          },
+          {
+            "kind": "text",
+            "text": " in the folder "
+          },
+          {
+            "kind": "code",
+            "text": "my-app"
+          },
+          {
+            "kind": "text",
+            "text": " on "
+          },
+          {
+            "at": "2026-09-29T13:53:00Z",
+            "kind": "time"
+          },
+          {
+            "kind": "text",
+            "text": ". The guard allowed it."
+          }
+        ]
+      }
+    },
+    "schema_version": 1,
+    "session": {
+      "agent": "Claude Code",
+      "channel": "hook",
+      "decisions": 5,
+      "first_at": "2026-09-28T14:05:00Z",
+      "flagged": 1,
+      "last_at": "2026-09-29T13:53:00Z",
+      "project": "my-app"
+    }
+  },
+  "cmd:contain:4": {
+    "around": {
+      "after": [],
+      "before": [
+        {
+          "command": "curl http://203.0.113.9/health",
+          "flagged": true,
+          "id": "cmd:contain:2",
+          "outcome_key": "refused_before_run",
+          "recorded_at": "2026-09-29T13:45:00Z"
+        },
+        {
+          "command": "git status",
+          "flagged": false,
+          "id": "cmd:contain:3",
+          "outcome_key": "allowed",
+          "recorded_at": "2026-09-29T13:53:00Z"
+        }
+      ]
+    },
+    "item": {
+      "agent": "Claude Code",
+      "agent_id": "claude-code",
+      "allowed_by_you": false,
+      "asi": [],
+      "categories": [],
+      "channel": "hook",
+      "command": "cargo build",
+      "command_whole": true,
+      "concern": "other",
+      "decided_by": "rules",
+      "explanation": "no rule matched",
+      "id": "cmd:contain:4",
+      "identity": {
+        "deciding_layer": "general",
+        "instance_id": "17a3c9e000004000800000000000e4d0",
+        "profile": "claude-code",
+        "relaxation_withheld": false,
+        "session_id": "17a3c9e0-demo-4000-8000-00000000000c",
+        "trust": "host_verified",
+        "trust_reason": "confined_by_namespace"
+      },
+      "mode_at_decision": "enforce",
+      "next": [],
+      "outcome": "allowed",
+      "outcome_key": "allowed",
+      "project": "my-app",
+      "reason": {
+        "key": "text:35c96f4add023f10",
+        "short": "no rule matched",
+        "words": "no rule matched"
+      },
+      "reasons_more": 0,
+      "recommendation": "allow",
+      "recorded_at": "2026-09-28T14:05:00Z",
+      "rules": [],
+      "seq": 4,
+      "session": "contain",
+      "story": {
+        "did": "The rules allowed it, so it ran.",
+        "happened": [
+          {
+            "kind": "text",
+            "text": "Claude Code asked to run this"
+          },
+          {
+            "kind": "text",
+            "text": " in the folder "
+          },
+          {
+            "kind": "code",
+            "text": "my-app"
+          },
+          {
+            "kind": "text",
+            "text": " on "
+          },
+          {
+            "at": "2026-09-28T14:05:00Z",
+            "kind": "time"
+          },
+          {
+            "kind": "text",
+            "text": ". The guard allowed it."
+          }
+        ]
+      }
+    },
+    "schema_version": 1,
+    "session": {
+      "agent": "Claude Code",
+      "channel": "hook",
+      "decisions": 5,
+      "first_at": "2026-09-28T14:05:00Z",
+      "flagged": 1,
+      "last_at": "2026-09-29T13:53:00Z",
+      "project": "my-app"
+    }
+  }
+}

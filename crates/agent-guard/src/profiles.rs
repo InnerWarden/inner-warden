@@ -1202,6 +1202,9 @@ pub struct ShellOutcome {
     /// say, for the record and the agent; `None` when the general verdict
     /// stands as it was.
     pub note: Option<String>,
+    /// The profile or the exception would have allowed it, the instance did
+    /// not run confined, and the general rules decided.
+    pub relaxation_withheld: bool,
 }
 
 fn verdict_word(verdict: Verdict) -> &'static str {
@@ -1267,15 +1270,14 @@ pub fn decide_shell_in(
         .exception
         .and_then(|exception| exception_command_rule(exception, call.charged))
         .filter(|_| !call.tainted);
-    let decision = decide(
-        Layers {
-            hard_refused: call.names_llm_key || hard_signal || record.revoked.is_some(),
-            general: call.general,
-            agent_type,
-            instance,
-        },
-        trust,
-    );
+    let layers = Layers {
+        hard_refused: call.names_llm_key || hard_signal || record.revoked.is_some(),
+        general: call.general,
+        agent_type,
+        instance,
+    };
+    let decision = decide(layers, trust);
+    let relaxation_withheld = relaxation_withheld(layers, trust, decision);
     let review = review_blocks(line_block_review, profile.and_then(|(_, p)| p.mode), trust);
     let blocks = match decision.verdict {
         Verdict::Deny => true,
@@ -1322,7 +1324,24 @@ pub fn decide_shell_in(
         decision,
         blocks,
         note,
+        relaxation_withheld,
     }
+}
+
+/// Whether the profile or the instance's exception would have allowed what
+/// the general rules decided, had the instance run confined: the case the
+/// screen words as "would allow this, but this instance does not run
+/// confined". Computed beside [`decide`], which is left as it is.
+pub fn relaxation_withheld(layers: Layers, trust: Trust, decision: Decision) -> bool {
+    if trust == Trust::Confined || decision.deciding_layer != crate::identity::RuleLayer::General {
+        return false;
+    }
+    let confined = decide(layers, Trust::Confined);
+    confined.verdict == Verdict::Allow
+        && matches!(
+            confined.deciding_layer,
+            crate::identity::RuleLayer::AgentType | crate::identity::RuleLayer::Instance
+        )
 }
 
 /// The word a decision's verdict is recorded with (`allow`, `review`,
@@ -2089,6 +2108,50 @@ net = true
             assert!(out.blocks, "the line blocks reviews: {trust:?}");
             assert_eq!(out.note, None);
         }
+    }
+
+    /// The relaxation a profile would have made is reported as withheld only
+    /// for an instance that does not run confined, only when the general
+    /// rules decided, and never when nothing would have allowed it.
+    ///
+    /// FAILS ON REVERT: drop the trust and deciding-layer check from
+    /// `relaxation_withheld` (report what the profile would allow, whatever
+    /// decided) and the confined row reports a withheld relaxation.
+    #[test]
+    fn a_relaxation_is_withheld_only_from_an_instance_that_is_not_confined() {
+        let permissive = profile(&["bare_ip_fetch", "tmp_execution"], &[]);
+        let review = shell(Verdict::Review, &["bare_ip_fetch", "tmp_execution"], true);
+        for trust in [Trust::Declared, Trust::Observed] {
+            let out = decide_shell(&review, Some(("claude-code", &permissive)), true, trust);
+            assert!(out.relaxation_withheld, "{trust:?}");
+        }
+        let confined = decide_shell(
+            &review,
+            Some(("claude-code", &permissive)),
+            true,
+            Trust::Confined,
+        );
+        assert!(!confined.relaxation_withheld);
+        // A general deny is never relaxed, so nothing was withheld.
+        let deny = shell(Verdict::Deny, &["bare_ip_fetch"], true);
+        let out = decide_shell(
+            &deny,
+            Some(("claude-code", &permissive)),
+            true,
+            Trust::Observed,
+        );
+        assert!(!out.relaxation_withheld);
+        // No profile, or one that allows nothing charged: nothing withheld.
+        let out = decide_shell(&review, None, true, Trust::Observed);
+        assert!(!out.relaxation_withheld);
+        let narrow = profile(&["bare_ip_fetch"], &[]);
+        let out = decide_shell(
+            &review,
+            Some(("claude-code", &narrow)),
+            true,
+            Trust::Observed,
+        );
+        assert!(!out.relaxation_withheld);
     }
 
     #[test]

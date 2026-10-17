@@ -23,6 +23,7 @@ use crate::agent_decisions::{
 };
 use crate::agent_profiles::{FileRead, ProfilesState};
 use crate::agent_profiles_io::{self, Owner};
+use crate::dashboard_identity::InstanceFacts;
 
 /// The most records read from the launcher's directory.
 const MAX_RECORDS: usize = 256;
@@ -449,12 +450,52 @@ fn home_of(uid: u32) -> Option<PathBuf> {
     dir.is_absolute().then(|| dir.to_path_buf())
 }
 
-/// The instances recorded in `dir`: each `<instance id>.json` that is a
-/// regular file owned by `uid`, not a link, no larger than a record, that
-/// parses, names `uid` and its own id. Live means the jail's pid runs with
-/// the start time recorded (a pid is never enough). A missing directory is
-/// one `stat` and an empty list.
+/// The instances recorded in `dir`, as the verbs and the dashboard count
+/// them. See [`local_records`].
 pub(crate) fn local_instances(dir: &Path, uid: u32) -> Vec<LocalInstance> {
+    local_records(dir, uid)
+        .into_iter()
+        .map(|facts| LocalInstance {
+            instance_id: facts.record.instance_id,
+            agent_type: facts.record.agent_type,
+            live: facts.live,
+            trust: facts.judged.map_or(Trust::Declared, |(trust, _)| trust),
+        })
+        .collect()
+}
+
+/// Whether `dir` is a directory of `uid`'s own, not a link: the launcher's
+/// records are read only from there.
+fn own_directory(dir: &Path, uid: u32) -> bool {
+    let Ok(metadata) = std::fs::symlink_metadata(dir) else {
+        return false;
+    };
+    if !metadata.is_dir() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        metadata.uid() == uid
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = uid;
+        true
+    }
+}
+
+/// The records in `dir`: each `<instance id>.json` that is a regular file
+/// owned by `uid`, not a link, no larger than a record, that parses, names
+/// `uid` and its own id, in a directory of `uid`'s own that is not a link.
+/// Live means the jail's pid runs with the start time recorded (a pid is
+/// never enough); for a live jail the judgment is what the hook inside it
+/// would make of the record and the jail's namespaces. A missing directory
+/// is one `stat` and an empty list.
+pub(crate) fn local_records(dir: &Path, uid: u32) -> Vec<InstanceFacts> {
+    if !own_directory(dir, uid) {
+        return Vec::new();
+    }
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -477,9 +518,7 @@ pub(crate) fn local_instances(dir: &Path, uid: u32) -> Vec<LocalInstance> {
             continue;
         }
         let jail_ns = jail_namespace(record.jail.pid, record.jail.start_ticks);
-        let live = jail_ns.is_some();
-        let trust = if live {
-            let (own_pid_ns, own_mnt_ns) = jail_ns.unwrap_or_default();
+        let judged = jail_ns.map(|(own_pid_ns, own_mnt_ns)| {
             judge_trust_in_jail(InJailFacts {
                 record: RecordRead::Present {
                     record: &record,
@@ -488,19 +527,49 @@ pub(crate) fn local_instances(dir: &Path, uid: u32) -> Vec<LocalInstance> {
                 own_pid_ns,
                 own_mnt_ns,
             })
-            .0
-        } else {
-            Trust::Declared
-        };
-        out.push(LocalInstance {
-            instance_id: record.instance_id.clone(),
-            agent_type: record.agent_type.clone(),
-            live,
-            trust,
+        });
+        out.push(InstanceFacts {
+            live: jail_ns.is_some(),
+            judged,
+            record,
+            user: None,
         });
     }
-    out.sort_by(|a, b| a.instance_id.cmp(&b.instance_id));
+    out.sort_by(|a, b| a.record.instance_id.cmp(&b.record.instance_id));
     out
+}
+
+/// The account name of `uid`, from the account database.
+#[cfg(unix)]
+fn user_name(uid: u32) -> Option<String> {
+    use std::ffi::CStr;
+    let mut buffer = vec![0 as libc::c_char; 16 * 1024];
+    // SAFETY: a zeroed passwd is a valid out-parameter for getpwuid_r.
+    let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut found: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: every pointer is to memory owned here and sized as passed; the
+    // result is read only when the call says it filled `entry`.
+    let status = unsafe {
+        libc::getpwuid_r(
+            uid,
+            &mut entry,
+            buffer.as_mut_ptr(),
+            buffer.len(),
+            &mut found,
+        )
+    };
+    if status != 0 || found.is_null() || entry.pw_name.is_null() {
+        return None;
+    }
+    // SAFETY: `pw_name` points into `buffer`, NUL-terminated by the call.
+    let name = unsafe { CStr::from_ptr(entry.pw_name) };
+    let name = name.to_str().ok()?;
+    (!name.is_empty() && name.len() <= 64).then(|| name.to_string())
+}
+
+#[cfg(not(unix))]
+fn user_name(_uid: u32) -> Option<String> {
+    None
 }
 
 fn read_record(path: &Path, uid: u32) -> Option<Vec<u8>> {
@@ -561,17 +630,26 @@ fn jail_namespace(_pid: u32, _ticks: u64) -> Option<(Option<u64>, Option<u64>)> 
 // The dashboard
 // ---------------------------------------------------------------------------
 
-/// What the dashboard shows of the decisions, or `None` when the identity
-/// features are off here: no profiles file, and no instance ever started in
-/// a jail (the launcher's directory is not there, one `stat`). A file that
-/// cannot be used is `None` too: what was decided cannot be read from it.
+/// What the dashboard shows of the decisions and the instances, or `None`
+/// when the identity features are off here: no profiles file, and no
+/// instance ever started in a jail (the launcher's directory is not there,
+/// one `stat`). A file that cannot be used turns them on with its problem:
+/// the hook refuses every call while it is, and that is never silence.
 pub fn dashboard_facts(home: &Path) -> Option<DashboardFacts> {
     let dir =
         crate::contain::launch::records_dir(std::env::var("XDG_STATE_HOME").ok().as_deref(), home);
+    let uid = real_uid();
     facts_from(
         agent_profiles_io::state(),
         || std::fs::symlink_metadata(&dir).is_ok(),
-        || local_instances(&dir, real_uid()),
+        || {
+            let user = user_name(uid);
+            let mut records = local_records(&dir, uid);
+            for facts in &mut records {
+                facts.user = user.clone();
+            }
+            records
+        },
     )
 }
 
@@ -581,17 +659,30 @@ pub fn dashboard_facts(home: &Path) -> Option<DashboardFacts> {
 fn facts_from(
     state: ProfilesState,
     records_dir_exists: impl FnOnce() -> bool,
-    instances: impl FnOnce() -> Vec<LocalInstance>,
+    records: impl FnOnce() -> Vec<InstanceFacts>,
 ) -> Option<DashboardFacts> {
-    let profiles = match state {
-        ProfilesState::On(profiles) => profiles,
-        ProfilesState::Invalid(_) => return None,
+    let (profiles, profiles_problem) = match state {
+        ProfilesState::On(profiles) => (profiles, None),
+        ProfilesState::Invalid(why) => (AgentProfiles::default(), Some(why)),
         ProfilesState::Off if !records_dir_exists() => return None,
-        ProfilesState::Off => AgentProfiles::default(),
+        ProfilesState::Off => (AgentProfiles::default(), None),
     };
+    let records = records();
+    let instances = records
+        .iter()
+        .map(|facts| LocalInstance {
+            instance_id: facts.record.instance_id.clone(),
+            agent_type: facts.record.agent_type.clone(),
+            live: facts.live,
+            trust: facts.judged.map_or(Trust::Declared, |(trust, _)| trust),
+        })
+        .collect();
     Some(DashboardFacts {
         profiles,
-        instances: instances(),
+        instances,
+        records,
+        activity: std::collections::BTreeMap::new(),
+        profiles_problem,
     })
 }
 
@@ -726,8 +817,12 @@ mod facts_tests {
     /// With no profiles file and no launcher's directory the dashboard reads
     /// nothing more (no record is listed) and shows nothing new.
     ///
+    /// A file that cannot be used turns them on with its problem: the hook
+    /// refuses every call while it is, and the page says so.
+    ///
     /// FAILS ON REVERT: return `Some` for `Off` without asking about the
-    /// directory and the first row is `Some`.
+    /// directory and the first row is `Some`; return `None` for `Invalid`
+    /// and the unusable file is silence.
     #[test]
     fn with_the_features_off_the_dashboard_reads_and_shows_nothing_new() {
         let listed = std::cell::Cell::new(false);
@@ -741,10 +836,9 @@ mod facts_tests {
             facts_from(ProfilesState::Off, || true, Vec::new),
             Some(DashboardFacts::default())
         );
-        assert_eq!(
-            facts_from(ProfilesState::Invalid("x".into()), || true, Vec::new),
-            None
-        );
+        let invalid = facts_from(ProfilesState::Invalid("x".into()), || false, Vec::new)
+            .expect("an unusable file is said, never silence");
+        assert_eq!(invalid.profiles_problem.as_deref(), Some("x"));
         assert!(facts_from(
             ProfilesState::On(AgentProfiles::default()),
             || false,
@@ -847,5 +941,30 @@ mod tests {
         assert!(!got[0].live, "pid 999999999 does not run");
         assert_eq!(got[0].trust, Trust::Declared);
         assert!(local_instances(&dir.path().join("none"), me()).is_empty());
+        let facts = local_records(dir.path(), me());
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].judged, None, "an ended jail is not judged");
+    }
+
+    /// The records directory itself is read only when it is a directory of
+    /// the user's own: a link to one elsewhere lists nothing.
+    ///
+    /// FAILS ON REVERT: drop the `own_directory` check and the linked
+    /// directory's record is listed.
+    #[test]
+    fn a_records_directory_that_is_a_link_lists_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let id = "3f9a0c1e5b7d42a8c6e1f0b2d4a69c87";
+        std::fs::write(real.join(format!("{id}.json")), record(id, me())).unwrap();
+        assert_eq!(local_records(&real, me()).len(), 1);
+        let link = dir.path().join("instances");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(local_records(&link, me()).is_empty());
+        assert!(
+            local_records(&real, me() + 1).is_empty(),
+            "another user's directory"
+        );
     }
 }

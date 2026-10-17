@@ -755,12 +755,24 @@ pub struct DecisionStep {
 pub struct DashboardFacts {
     pub profiles: AgentProfiles,
     pub instances: Vec<LocalInstance>,
+    /// The launcher's records, as the dashboard read them.
+    pub records: Vec<crate::dashboard_identity::InstanceFacts>,
+    /// What the record holds about each instance id, filled by the caller
+    /// that read the record.
+    pub activity: std::collections::BTreeMap<String, innerwarden_graph::InstanceActivity>,
+    /// A profiles file is there and cannot be used, and why. What was
+    /// decided cannot be read from it, so no row says it.
+    pub profiles_problem: Option<String>,
 }
 
 /// The identity fields of one agent row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RowIdentity {
     pub lifecycle: &'static str,
+    /// Who made the last lifecycle change, and when (as the file has it).
+    pub lifecycle_by: Option<String>,
+    pub lifecycle_at: Option<String>,
+    pub owner: Option<String>,
     pub profile: ProfileView,
     pub decision_steps: Vec<DecisionStep>,
 }
@@ -808,8 +820,17 @@ pub fn row_identity(facts: &DashboardFacts, id: &str) -> RowIdentity {
                    file: to reach the instances in one, add --system and run it with sudo.",
         });
     }
+    let record = facts.profiles.record(id);
+    let (by, at) = match (lifecycle, record) {
+        (Lifecycle::Approved, Some(r)) => (r.approved_by.clone(), r.approved_at.clone()),
+        (Lifecycle::Revoked, Some(r)) => (r.revoked_by.clone(), r.revoked_at.clone()),
+        _ => (None, None),
+    };
     RowIdentity {
         lifecycle: lifecycle.as_str(),
+        lifecycle_by: by,
+        lifecycle_at: at,
+        owner: record.and_then(|r| r.owner.clone()),
         profile: ProfileView {
             label: profile_label(name.as_deref()),
             name,
@@ -1174,5 +1195,36 @@ mod tests {
         let revoked = row_identity(&facts, "claude-code");
         assert_eq!(revoked.lifecycle, "revoked");
         assert!(revoked.decision_steps.is_empty());
+    }
+
+    /// Who approved or revoked, when, and the owner come from the file as
+    /// written; a type nobody decided about has none of them.
+    #[test]
+    fn a_rows_lifecycle_names_who_changed_it_and_the_owner() {
+        let mut facts = DashboardFacts::default();
+        let fresh = row_identity(&facts, "claude-code");
+        assert_eq!(
+            (fresh.lifecycle_by, fresh.lifecycle_at, fresh.owner),
+            (None, None, None)
+        );
+        facts.profiles = checked(
+            "schema_version = 1\n[agent.claude-code]\nlifecycle = \"approved\"\nowner = \"maria\"\napproved_by = \"dev\"\napproved_at = \"2026-10-16T09:00:00Z\"\n",
+        );
+        let approved = row_identity(&facts, "claude-code");
+        assert_eq!(approved.lifecycle_by.as_deref(), Some("dev"));
+        assert_eq!(
+            approved.lifecycle_at.as_deref(),
+            Some("2026-10-16T09:00:00Z")
+        );
+        assert_eq!(approved.owner.as_deref(), Some("maria"));
+        facts.profiles = checked(
+            "schema_version = 1\n[agent.claude-code]\nlifecycle = \"revoked\"\napproved_by = \"dev\"\nrevoked_by = \"ops\"\nrevoked_at = \"2026-10-17T10:00:00Z\"\n",
+        );
+        let revoked = row_identity(&facts, "claude-code");
+        assert_eq!(revoked.lifecycle_by.as_deref(), Some("ops"));
+        assert_eq!(
+            revoked.lifecycle_at.as_deref(),
+            Some("2026-10-17T10:00:00Z")
+        );
     }
 }

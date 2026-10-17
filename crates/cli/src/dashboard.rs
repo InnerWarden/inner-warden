@@ -86,6 +86,10 @@ struct AgentsPayload {
     discovery_limited: bool,
     auto_connect: AutoConnectView,
     agents: Vec<AgentView>,
+    /// A profiles file is there and cannot be used. Absent otherwise, so a
+    /// host without one sends the payload it always sent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    profiles_file: Option<crate::dashboard_identity::ProfilesFileView>,
 }
 
 #[derive(Serialize)]
@@ -129,6 +133,29 @@ struct AgentView {
     /// to this row now, built by the CLI (the page never builds one).
     #[serde(skip_serializing_if = "Option::is_none")]
     decision_steps: Option<Vec<crate::agent_decisions::DecisionStep>>,
+    /// Who made the last lifecycle change and when, and the owner chosen at
+    /// approval, as the profiles file has them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lifecycle_by: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lifecycle_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    owner: Option<String>,
+    /// How far its own word is backed: its worst live instance in a jail
+    /// (`host_verified`, `observed`, `declared`), and why. These fields, the
+    /// step and the instances exist only where a profiles file or a
+    /// launcher's record does (`dashboard_identity`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trust: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trust_reason: Option<String>,
+    /// The command that would back its word further, built by the CLI.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    confine_step: Option<crate::agent_decisions::DecisionStep>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instances: Option<Vec<crate::dashboard_identity::LocalInstanceView>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    more_instances: Option<usize>,
 }
 
 /// The step that names an agent whose hook does not, from the hook's own
@@ -432,12 +459,17 @@ fn agents_json_with_status(
                 lifecycle: None,
                 profile: None,
                 decision_steps: None,
+                lifecycle_by: None,
+                lifecycle_at: None,
+                owner: None,
+                trust: None,
+                trust_reason: None,
+                confine_step: None,
+                instances: None,
+                more_instances: None,
             };
             if let Some(facts) = identity {
-                let decided = crate::agent_decisions::row_identity(facts, &agent.name);
-                view.lifecycle = Some(decided.lifecycle);
-                view.profile = Some(decided.profile);
-                view.decision_steps = Some(decided.decision_steps);
+                with_identity(&mut view, facts, cfg!(target_os = "linux"));
             }
             view
         })
@@ -465,8 +497,37 @@ fn agents_json_with_status(
                 .unwrap_or_else(crate::agent_policy::DashboardReconcilerStatus::unavailable),
         },
         agents,
+        profiles_file: identity
+            .and_then(|facts| facts.profiles_problem.as_deref())
+            .map(crate::dashboard_identity::profiles_file_view),
     })
     .unwrap_or_else(|_| "{}".into())
+}
+
+/// The identity fields of one row, from what the dashboard read. With an
+/// unusable profiles file nothing decided is said (it cannot be read); the
+/// instances and how far they are backed still are.
+fn with_identity(
+    view: &mut AgentView,
+    facts: &crate::agent_decisions::DashboardFacts,
+    linux: bool,
+) {
+    if facts.profiles_problem.is_none() {
+        let decided = crate::agent_decisions::row_identity(facts, &view.id);
+        view.lifecycle = Some(decided.lifecycle);
+        view.lifecycle_by = decided.lifecycle_by;
+        view.lifecycle_at = decided.lifecycle_at;
+        view.owner = decided.owner;
+        view.profile = Some(decided.profile);
+        view.decision_steps = Some(decided.decision_steps);
+    }
+    let row =
+        crate::dashboard_identity::row_trust(&view.id, &facts.records, &facts.activity, linux);
+    view.trust = Some(row.trust);
+    view.trust_reason = Some(row.trust_reason);
+    view.confine_step = row.confine_step;
+    view.instances = Some(row.instances);
+    view.more_instances = (row.more_instances > 0).then_some(row.more_instances);
 }
 
 fn agents_loading_json(
@@ -487,6 +548,7 @@ fn agents_loading_json(
                 .unwrap_or_else(crate::agent_policy::DashboardReconcilerStatus::unavailable),
         },
         agents: Vec::new(),
+        profiles_file: None,
     })
     .unwrap_or_else(|_| "{}".into())
 }
@@ -498,7 +560,14 @@ fn build_agent_snapshot(
 ) -> AgentSnapshot {
     let (rows, discovery_limited) =
         innerwarden_agent_guard::agents_ops::rows_with_discovery_status(home);
-    let identity = crate::agent_decisions_io::dashboard_facts(home);
+    // The record is read for the hook's labels only where the identity
+    // features are on: with them off, nothing more is read than before.
+    let identity = crate::agent_decisions_io::dashboard_facts(home).map(|mut facts| {
+        if let Ok(graph) = graph_io::load_graph_checked() {
+            facts.activity = graph.instance_activity(crate::dashboard_identity::MAX_SESSIONS);
+        }
+        facts
+    });
     AgentSnapshot {
         json: agents_json_with_status(
             home,
@@ -2094,6 +2163,117 @@ mod tests {
             claude["decision_steps"][0]["command"],
             "innerwarden agents approve claude-code"
         );
+        assert_eq!(claude["trust"], "declared");
+        assert_eq!(claude["trust_reason"], "no_instance");
+        assert_eq!(claude["instances"], serde_json::json!([]));
+        assert!(claude.get("more_instances").is_none());
+        let top: Vec<&String> = off.as_object().unwrap().keys().collect();
+        assert_eq!(
+            top,
+            [
+                "agents",
+                "auto_connect",
+                "availability",
+                "discovery_limited",
+                "generated_at_ms",
+                "schema_version"
+            ],
+            "no new top-level field with the features off"
+        );
+    }
+
+    /// With the features off the payload is byte for byte what it was: the
+    /// same bytes whether the identity code ran or not, for rows that carry
+    /// every field today's rows can carry.
+    ///
+    /// FAILS ON REVERT: drop `skip_serializing_if` from any new field (for
+    /// example `trust`) and the bytes differ by `"trust":null`.
+    #[test]
+    fn with_the_features_off_the_agents_payload_is_byte_for_byte_today() {
+        let fixture = super::fixtures::fixtures()
+            .into_iter()
+            .find(|(name, _)| *name == "agents.json")
+            .map(|(_, value)| value)
+            .unwrap();
+        let on_disk = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../dashboard-kit/web/tests/fixtures/community/agents.json"),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_string_pretty(&fixture).unwrap() + "\n",
+            on_disk,
+            "the plain agents fixture, written before the identity fields, is unchanged"
+        );
+        let today = serde_json::to_string(&AgentView {
+            id: "claude-code".into(),
+            display_name: "Claude Code".into(),
+            installed: true,
+            running: Some(true),
+            detected_by: vec!["executable_on_path"],
+            guardrail: AgentGuardrailView {
+                mode: "monitor".into(),
+                mechanism: Some("pretooluse_hook"),
+                setup_support: "automatic",
+            },
+            auto_connect_eligible: Some(true),
+            next_step: None,
+            identity_step: None,
+            lifecycle: None,
+            profile: None,
+            decision_steps: None,
+            lifecycle_by: None,
+            lifecycle_at: None,
+            owner: None,
+            trust: None,
+            trust_reason: None,
+            confine_step: None,
+            instances: None,
+            more_instances: None,
+        })
+        .unwrap();
+        assert_eq!(
+            today,
+            r#"{"id":"claude-code","display_name":"Claude Code","installed":true,"running":true,"detected_by":["executable_on_path"],"guardrail":{"mode":"monitor","mechanism":"pretooluse_hook","setup_support":"automatic"},"auto_connect_eligible":true}"#
+        );
+    }
+
+    /// An unusable profiles file is said at the top of the payload, and no
+    /// row says what was decided (it cannot be read); the instances and how
+    /// far they are backed still are.
+    ///
+    /// FAILS ON REVERT: make `with_identity` serve `row_identity` with a
+    /// problem and the row carries a lifecycle.
+    #[test]
+    fn an_unusable_profiles_file_is_said_and_no_decision_is_guessed() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+        std::fs::write(home.path().join(".claude/settings.json"), "{}").unwrap();
+        let rows = innerwarden_agent_guard::agents_ops::rows(home.path());
+        let facts = crate::agent_decisions::DashboardFacts {
+            profiles_problem: Some("/etc/innerwarden/agent-profiles.toml: not valid".into()),
+            ..crate::agent_decisions::DashboardFacts::default()
+        };
+        let on: serde_json::Value = serde_json::from_str(&agents_json_with_status(
+            home.path(),
+            &rows,
+            false,
+            None,
+            TEST_GUARD_BIN,
+            Some(&facts),
+        ))
+        .unwrap();
+        assert_eq!(on["profiles_file"]["state"], "invalid");
+        assert!(on["profiles_file"]["sentence"]
+            .as_str()
+            .unwrap()
+            .contains("agent-profiles.toml: not valid"));
+        for agent in on["agents"].as_array().unwrap() {
+            for key in ["lifecycle", "profile", "decision_steps", "owner"] {
+                assert!(agent.get(key).is_none(), "{key} in {agent}");
+            }
+            assert_eq!(agent["trust"], "declared");
+        }
     }
 
     #[test]

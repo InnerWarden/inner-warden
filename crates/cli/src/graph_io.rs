@@ -367,22 +367,53 @@ fn check_origin(verdict: &Value) -> DecisionOrigin {
     }
 }
 
+/// What the rule layers did with one hook decision, where per-agent
+/// profiles are in force: the layer that decided, the profile in force for
+/// the caller's type, and whether a relaxation was withheld from an instance
+/// that does not run confined.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LayerLabel {
+    pub layer: RuleLayer,
+    pub profile: Option<String>,
+    pub relaxation_withheld: bool,
+}
+
+impl From<RuleLayer> for LayerLabel {
+    fn from(layer: RuleLayer) -> Self {
+        Self {
+            layer,
+            profile: None,
+            relaxation_withheld: false,
+        }
+    }
+}
+
 /// Where a hook decision came from: the agent the hook line names (never a
 /// guess from the payload) and the basename of the folder it ran in. The
-/// deciding layer is there only where per-agent profiles are in force.
+/// layer's labels are there only where per-agent profiles are in force.
 fn hook_origin(
     verdict: &Value,
     agent: Option<&str>,
     cwd: Option<&str>,
     identity: Option<&Identity>,
-    deciding_layer: Option<RuleLayer>,
+    layer: Option<LayerLabel>,
 ) -> DecisionOrigin {
+    let (deciding_layer, profile, relaxation_withheld) = match layer {
+        Some(label) => (
+            Some(label.layer.as_str().to_string()),
+            label.profile,
+            label.relaxation_withheld,
+        ),
+        None => (None, None, false),
+    };
     let mut origin = DecisionOrigin {
         channel: Some(DecisionChannel::Hook),
         agent: agent.map(str::to_string),
         project: cwd.and_then(project_name),
         rules: verdict_rules(verdict),
-        deciding_layer: deciding_layer.map(|layer| layer.as_str().to_string()),
+        deciding_layer,
+        profile,
+        relaxation_withheld,
         ..DecisionOrigin::default()
     };
     if let Some(identity) = identity {
@@ -485,7 +516,7 @@ pub fn record_hook(
     agent: Option<&str>,
     cwd: Option<&str>,
     identity: Option<&Identity>,
-    deciding_layer: Option<RuleLayer>,
+    layer: Option<LayerLabel>,
 ) {
     let (mode, outcome) = if monitor {
         (
@@ -513,7 +544,7 @@ pub fn record_hook(
         outcome,
         source_session,
         source_event_id,
-        hook_origin(verdict, agent, cwd, identity, deciding_layer),
+        hook_origin(verdict, agent, cwd, identity, layer),
     );
 }
 
@@ -956,6 +987,10 @@ fn guard_blocked_line(
     }
     if let Some(trust) = origin.trust_label() {
         line["trust"] = json!(trust);
+    }
+    // Only where per-agent profiles are in force; a known word or nothing.
+    if let Some(layer) = origin.layer_label() {
+        line["layer"] = json!(layer);
     }
     line
 }
@@ -1954,13 +1989,50 @@ mod tests {
             Some("claude-code"),
             Some("/w/app"),
             None,
-            Some(RuleLayer::AgentType),
+            Some(RuleLayer::AgentType.into()),
         );
         assert_eq!(command_attrs(&hook)["deciding_layer"], "agent_type");
         let mut refused = decision(false, vec![]);
         refused.deciding_layer = Some(RuleLayer::Hard);
         let mcp = mcp_origin(&refused, Some("claude-code"), None);
         assert_eq!(command_attrs(&mcp)["deciding_layer"], "hard");
+    }
+
+    /// The hook's layer labels (the profile in force and a withheld
+    /// relaxation) reach the command node with the layer, and the
+    /// guard.blocked line names the layer only when profiles are in force.
+    ///
+    /// FAILS ON REVERT: leave `layer` out of `guard_blocked_line` and the
+    /// first line has no layer; drop `profile` from `hook_origin` and the
+    /// node has none.
+    #[test]
+    fn the_layer_labels_reach_the_record_and_the_blocked_line() {
+        let verdict = json!({"recommendation": "review", "risk_score": 40});
+        let hook = hook_origin(
+            &verdict,
+            Some("claude-code"),
+            Some("/w/app"),
+            None,
+            Some(LayerLabel {
+                layer: RuleLayer::General,
+                profile: Some("claude-code".into()),
+                relaxation_withheld: true,
+            }),
+        );
+        let attrs = command_attrs(&hook);
+        assert_eq!(attrs["deciding_layer"], "general");
+        assert_eq!(attrs["profile"], "claude-code");
+        assert_eq!(attrs["relaxation_withheld"], "true");
+        let context = DecisionContextParts {
+            mode: DecisionMode::Enforce,
+            outcome: DecisionOutcome::Blocked,
+        };
+        let line = guard_blocked_line(5, "x", &verdict, context, "s", &hook);
+        assert_eq!(line["layer"], "general");
+        let off = hook_origin(&verdict, Some("claude-code"), None, None, None);
+        assert!(!command_attrs(&off).contains_key("profile"));
+        let line = guard_blocked_line(5, "x", &verdict, context, "s", &off);
+        assert!(line.get("layer").is_none(), "{line}");
     }
 
     /// A label that does not have the shape of one is dropped, not repaired.

@@ -1,0 +1,265 @@
+{
+  "agents": [
+    {
+      "auto_connect_eligible": false,
+      "confine_step": {
+        "command": "sudo npm install -g innerwarden",
+        "label": "Install InnerWarden system-wide",
+        "line": "Root then owns the launcher, so no program you run can replace it. Remove the copy in ~/.local/bin so your shell finds the system one, and start the agent again."
+      },
+      "decision_steps": [
+        {
+          "command": "sudo innerwarden agents profile claude-code general --system",
+          "label": "To hold it to your general rules only:",
+          "line": "Its profile stops applying from its next action; your general rules stay."
+        },
+        {
+          "command": "innerwarden agents revoke claude-code",
+          "label": "To revoke it:",
+          "line": "No new actions from it, and its history stays. An agent that gives another name is held to your general rules, not stopped. A jail reads only the system file: to reach the instances in one, add --system and run it with sudo."
+        }
+      ],
+      "detected_by": [
+        "executable_on_path",
+        "configuration_file"
+      ],
+      "display_name": "Claude Code",
+      "guardrail": {
+        "last_observed_at": "2026-09-29T13:53:00Z",
+        "mechanism": "pretooluse_hook",
+        "mode": "enforce",
+        "setup_support": "automatic"
+      },
+      "id": "claude-code",
+      "installed": true,
+      "instances": [
+        {
+          "instance_id": "9d2f41b800004000800000000000ab52",
+          "last_activity_at": "2026-09-29T13:53:00Z",
+          "live": true,
+          "mode": "enforce",
+          "project": "my-app",
+          "sessions": [
+            {
+              "case_id": "cmd:contain:2",
+              "first_at": "2026-09-29T13:45:00Z",
+              "last_at": "2026-09-29T13:53:00Z",
+              "session": "9d2f41b8"
+            }
+          ],
+          "started_at": "2026-09-29T13:30:00Z",
+          "technical": {
+            "jail_pid": 3104,
+            "jail_start_ticks": 1003104,
+            "launcher_path": "/home/dev/.local/bin/innerwarden",
+            "launcher_root_owned": false,
+            "pid_ns": 4026535104,
+            "scope_unit": "innerwarden-contain-9d2f41b800004000800000000000ab52.scope"
+          },
+          "trust": "observed",
+          "trust_reason": "launcher_not_trusted",
+          "trust_source": "jail",
+          "uid": 1000,
+          "user": "dev"
+        },
+        {
+          "instance_id": "5c1e0a7700004000800000000000c0f1",
+          "last_activity_at": "2026-09-29T13:30:00Z",
+          "live": true,
+          "mode": "enforce",
+          "project": "my-app",
+          "sessions": [
+            {
+              "case_id": null,
+              "first_at": "2026-09-29T13:25:00Z",
+              "last_at": "2026-09-29T13:30:00Z",
+              "session": "5c1e0a77"
+            }
+          ],
+          "started_at": "2026-09-29T13:00:00Z",
+          "technical": {
+            "jail_pid": 2778,
+            "jail_start_ticks": 1002778,
+            "launcher_path": "/usr/local/bin/innerwarden",
+            "launcher_root_owned": true,
+            "pid_ns": 4026534778,
+            "scope_unit": "innerwarden-contain-5c1e0a7700004000800000000000c0f1.scope"
+          },
+          "trust": "host_verified",
+          "trust_reason": "confined_by_namespace",
+          "trust_source": "jail",
+          "uid": 1000,
+          "user": "dev"
+        },
+        {
+          "instance_id": "17a3c9e000004000800000000000e4d0",
+          "last_activity_at": "2026-09-28T14:05:00Z",
+          "live": false,
+          "mode": "enforce",
+          "project": "my-app",
+          "sessions": [
+            {
+              "case_id": null,
+              "first_at": "2026-09-28T14:05:00Z",
+              "last_at": "2026-09-28T14:05:00Z",
+              "session": "17a3c9e0"
+            }
+          ],
+          "started_at": "2026-09-28T10:00:00Z",
+          "technical": {
+            "jail_pid": 1980,
+            "jail_start_ticks": 1001980,
+            "launcher_path": "/usr/local/bin/innerwarden",
+            "launcher_root_owned": true,
+            "pid_ns": 4026533980,
+            "scope_unit": "innerwarden-contain-17a3c9e000004000800000000000e4d0.scope"
+          },
+          "trust": "host_verified",
+          "trust_reason": "confined_by_namespace",
+          "trust_source": "jail",
+          "uid": 1000,
+          "user": "dev"
+        }
+      ],
+      "lifecycle": "approved",
+      "lifecycle_at": "2026-09-29T09:00:00Z",
+      "lifecycle_by": "dev",
+      "owner": "maria",
+      "profile": {
+        "applies_from": "now",
+        "confined_instances": 1,
+        "label": "claude-code",
+        "name": "claude-code",
+        "other_instances": 1,
+        "source": "system"
+      },
+      "running": null,
+      "trust": "observed",
+      "trust_reason": "launcher_not_trusted"
+    },
+    {
+      "auto_connect_eligible": false,
+      "decision_steps": [
+        {
+          "command": "innerwarden agents approve codex",
+          "label": "To approve it:",
+          "line": "You choose an owner and a profile. Approving does not change how far it is trusted: that comes from how it runs."
+        },
+        {
+          "command": "innerwarden agents revoke codex",
+          "label": "To revoke it:",
+          "line": "No new actions from it, and its history stays. An agent that gives another name is held to your general rules, not stopped. A jail reads only the system file: to reach the instances in one, add --system and run it with sudo."
+        }
+      ],
+      "detected_by": [
+        "executable_on_path",
+        "configuration_file"
+      ],
+      "display_name": "Codex",
+      "guardrail": {
+        "mechanism": "mcp_proxy",
+        "mode": "enforce",
+        "setup_support": "automatic"
+      },
+      "id": "codex",
+      "installed": true,
+      "instances": [
+        {
+          "instance_id": "2b8e6f1100004000800000000000c0de",
+          "live": true,
+          "mode": "enforce",
+          "project": "my-app",
+          "sessions": [],
+          "started_at": "2026-09-29T14:00:00Z",
+          "technical": {
+            "jail_pid": 4410,
+            "jail_start_ticks": 1004410,
+            "launcher_path": "/usr/local/bin/innerwarden",
+            "launcher_root_owned": true,
+            "pid_ns": 4026536410,
+            "scope_unit": "innerwarden-contain-2b8e6f1100004000800000000000c0de.scope"
+          },
+          "trust": "declared",
+          "trust_reason": "not_checked_yet",
+          "trust_source": "jail",
+          "uid": 1000,
+          "user": "dev"
+        }
+      ],
+      "lifecycle": "discovered",
+      "profile": {
+        "applies_from": "now",
+        "confined_instances": 1,
+        "label": "General rules",
+        "name": null,
+        "other_instances": 0,
+        "source": null
+      },
+      "running": null,
+      "trust": "declared",
+      "trust_reason": "not_checked_yet"
+    },
+    {
+      "auto_connect_eligible": false,
+      "decision_steps": [
+        {
+          "command": "innerwarden agents approve cursor",
+          "label": "To approve it:",
+          "line": "You choose an owner and a profile. Approving does not change how far it is trusted: that comes from how it runs."
+        },
+        {
+          "command": "innerwarden agents revoke cursor",
+          "label": "To revoke it:",
+          "line": "No new actions from it, and its history stays. An agent that gives another name is held to your general rules, not stopped. A jail reads only the system file: to reach the instances in one, add --system and run it with sudo."
+        }
+      ],
+      "detected_by": [
+        "executable_on_path",
+        "configuration_file"
+      ],
+      "display_name": "Cursor",
+      "guardrail": {
+        "mechanism": "mcp_proxy",
+        "mode": "enforce",
+        "setup_support": "automatic"
+      },
+      "id": "cursor",
+      "installed": true,
+      "instances": [],
+      "lifecycle": "discovered",
+      "profile": {
+        "applies_from": "now",
+        "confined_instances": 0,
+        "label": "General rules",
+        "name": null,
+        "other_instances": 0,
+        "source": null
+      },
+      "running": null,
+      "trust": "declared",
+      "trust_reason": "no_instance"
+    }
+  ],
+  "auto_connect": {
+    "enabled": true,
+    "mode": "monitor",
+    "refresh_interval_secs": 60,
+    "status": "available",
+    "watcher": {
+      "effective_policy_mode": null,
+      "last_reconcile_at_ms": null,
+      "lifecycle": "unavailable",
+      "policy_available": false,
+      "policy_enabled": null,
+      "reason_code": "watcher_unavailable"
+    }
+  },
+  "availability": "available",
+  "discovery_limited": false,
+  "generated_at_ms": 1790690700000,
+  "schema_version": 2,
+  "screened_by_channel": {
+    "hook": "2026-09-29T13:53:00Z"
+  },
+  "unnamed_by_channel": {}
+}

@@ -78,6 +78,13 @@ pub struct DecisionOrigin {
     /// `agent_type`, `instance`). Written only where per-agent profiles are
     /// in force; only a known word is kept.
     pub deciding_layer: Option<String>,
+    /// The profile in force for the caller's agent type when the decision
+    /// was made, by name. Written only beside a deciding layer.
+    pub profile: Option<String>,
+    /// The profile or the instance's exception would have allowed this, the
+    /// instance did not run confined, and the general rules decided. Written
+    /// only beside a deciding layer, and only when true.
+    pub relaxation_withheld: bool,
 }
 
 const MAX_AGENT_CHARS: usize = 64;
@@ -211,8 +218,85 @@ impl DecisionOrigin {
         }
         if let Some(layer) = self.layer_label() {
             attrs.insert("deciding_layer".into(), layer.into());
+            if let Some(profile) = self.profile.as_deref().filter(|p| valid_agent(p)) {
+                attrs.insert("profile".into(), profile.into());
+            }
+            if self.relaxation_withheld {
+                attrs.insert("relaxation_withheld".into(), "true".into());
+            }
         }
     }
+}
+
+/// Which instance asked and which layer decided, as a command node recorded
+/// it: every field re-checked on the way out, the way it was on the way in.
+/// The instance, session and trust are LABELS the hook wrote; they prove
+/// nothing by themselves.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct DecisionIdentity {
+    pub instance_id: Option<String>,
+    pub session_id: Option<String>,
+    /// `declared`, `observed` or `confined`.
+    pub trust: Option<String>,
+    pub trust_reason: Option<String>,
+    pub deciding_layer: Option<String>,
+    pub profile: Option<String>,
+    pub relaxation_withheld: bool,
+}
+
+/// The identity labels of one command node, or `None` when it holds none
+/// (every node written without a jail and without profiles).
+fn identity_of(node: &Node) -> Option<DecisionIdentity> {
+    let trust = attr(node, "trust").filter(|word| TRUST_WORDS.contains(word));
+    let layer = attr(node, "deciding_layer").filter(|word| LAYER_WORDS.contains(word));
+    let identity = DecisionIdentity {
+        instance_id: attr(node, "instance_id")
+            .filter(|id| valid_instance(id))
+            .map(str::to_string),
+        session_id: attr(node, "session_id")
+            .filter(|session| valid_session(session))
+            .map(str::to_string),
+        trust: trust.map(str::to_string),
+        trust_reason: trust
+            .and(attr(node, "trust_reason"))
+            .filter(|reason| valid_reason(reason))
+            .map(str::to_string),
+        deciding_layer: layer.map(str::to_string),
+        profile: layer
+            .and(attr(node, "profile"))
+            .filter(|profile| valid_agent(profile))
+            .map(str::to_string),
+        relaxation_withheld: layer.is_some() && attr(node, "relaxation_withheld") == Some("true"),
+    };
+    (identity.instance_id.is_some()
+        || identity.session_id.is_some()
+        || identity.trust.is_some()
+        || identity.deciding_layer.is_some())
+    .then_some(identity)
+}
+
+/// One session an instance's hook named, as its commands recorded it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct InstanceSession {
+    /// The session id the agent put in its own payload. A label.
+    pub session_id: String,
+    pub first_at_ms: Option<u64>,
+    pub last_at_ms: Option<u64>,
+    /// The newest decision of this session the guard flagged, by id.
+    pub case_id: Option<String>,
+}
+
+/// What the record holds about one instance id: the hook's newest label
+/// and the sessions it named. Every value is a label the hook wrote.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InstanceActivity {
+    /// The trust word of the newest command that carried one.
+    pub trust: Option<String>,
+    pub trust_reason: Option<String>,
+    /// The newest command recorded for the instance.
+    pub last_at_ms: Option<u64>,
+    /// Newest first.
+    pub sessions: Vec<InstanceSession>,
 }
 
 /// What finally happened to a decision, as one key. The same keys the lane
@@ -490,6 +574,10 @@ pub struct DecisionRecord {
     pub asi: Vec<String>,
     pub explanation: String,
     pub flagged: bool,
+    /// Which instance asked and which layer decided, where the node holds
+    /// it. Absent on every record written without a jail or profiles.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity: Option<DecisionIdentity>,
 }
 
 /// A neighbour of a case in its session, for "Around it".
@@ -716,7 +804,80 @@ impl Graph {
             asi: linked("asi"),
             explanation: explanation_of(node).to_string(),
             flagged: is_flagged(node),
+            identity: identity_of(node),
         }
+    }
+
+    /// What the record holds about each instance id its commands named: the
+    /// hook's newest trust label, the newest command, and up to
+    /// `max_sessions` sessions, newest first. Only an id of the right shape
+    /// is a key; nothing here is proof of anything.
+    pub fn instance_activity(&self, max_sessions: usize) -> BTreeMap<String, InstanceActivity> {
+        struct Seen<'a> {
+            activity: InstanceActivity,
+            trust_key: Option<OrderKey>,
+            sessions: BTreeMap<&'a str, (InstanceSession, Option<OrderKey>)>,
+        }
+        let mut seen: BTreeMap<String, Seen<'_>> = BTreeMap::new();
+        for row in self.command_rows() {
+            let Some(id) = attr(row.node, "instance_id").filter(|id| valid_instance(id)) else {
+                continue;
+            };
+            let entry = seen.entry(id.to_string()).or_insert_with(|| Seen {
+                activity: InstanceActivity::default(),
+                trust_key: None,
+                sessions: BTreeMap::new(),
+            });
+            let ms = recorded_at_ms(row.node);
+            if let Some(ms) = ms {
+                entry.activity.last_at_ms =
+                    Some(entry.activity.last_at_ms.map_or(ms, |last| last.max(ms)));
+            }
+            if let Some(trust) = attr(row.node, "trust").filter(|word| TRUST_WORDS.contains(word)) {
+                if entry.trust_key.as_ref().is_none_or(|key| row.key > *key) {
+                    entry.trust_key = Some(row.key.clone());
+                    entry.activity.trust = Some(trust.to_string());
+                    entry.activity.trust_reason = attr(row.node, "trust_reason")
+                        .filter(|reason| valid_reason(reason))
+                        .map(str::to_string);
+                }
+            }
+            let Some(session) = attr(row.node, "session_id").filter(|s| valid_session(s)) else {
+                continue;
+            };
+            let (facts, case_key) = entry.sessions.entry(session).or_insert_with(|| {
+                (
+                    InstanceSession {
+                        session_id: session.to_string(),
+                        ..InstanceSession::default()
+                    },
+                    None,
+                )
+            });
+            if let Some(ms) = ms {
+                facts.first_at_ms = Some(facts.first_at_ms.map_or(ms, |first| first.min(ms)));
+                facts.last_at_ms = Some(facts.last_at_ms.map_or(ms, |last| last.max(ms)));
+            }
+            if is_flagged_agent_action(row.node) && case_key.as_ref().is_none_or(|k| row.key > *k) {
+                *case_key = Some(row.key.clone());
+                facts.case_id = Some(row.node.id.clone());
+            }
+        }
+        seen.into_iter()
+            .map(|(id, seen)| {
+                let mut activity = seen.activity;
+                let mut sessions: Vec<InstanceSession> =
+                    seen.sessions.into_values().map(|(s, _)| s).collect();
+                sessions.sort_by(|a, b| {
+                    b.last_at_ms
+                        .cmp(&a.last_at_ms)
+                        .then_with(|| a.session_id.cmp(&b.session_id))
+                });
+                sessions.truncate(max_sessions);
+                activity.sessions = sessions;
+                (id, activity)
+            })
+            .collect()
     }
 
     /// Out-edges to categories and OWASP ids, by command id. Built once per
@@ -1302,6 +1463,185 @@ mod tests {
             );
         }
         g
+    }
+
+    /// The profile and the withheld relaxation are written only beside a
+    /// deciding layer, the profile only in the shape of a name, and the
+    /// withheld flag only when true.
+    ///
+    /// FAILS ON REVERT: write `profile` outside the `layer_label` branch and
+    /// the origin with no layer carries it.
+    #[test]
+    fn the_profile_and_a_withheld_relaxation_ride_only_with_a_layer() {
+        let mut with = BTreeMap::new();
+        DecisionOrigin {
+            deciding_layer: Some("general".into()),
+            profile: Some("claude-code".into()),
+            relaxation_withheld: true,
+            ..DecisionOrigin::default()
+        }
+        .write_attrs(&mut with);
+        assert_eq!(with["profile"], "claude-code");
+        assert_eq!(with["relaxation_withheld"], "true");
+        let mut without_layer = BTreeMap::new();
+        DecisionOrigin {
+            profile: Some("claude-code".into()),
+            relaxation_withheld: true,
+            ..DecisionOrigin::default()
+        }
+        .write_attrs(&mut without_layer);
+        assert!(without_layer.is_empty(), "{without_layer:?}");
+        let mut not_withheld = BTreeMap::new();
+        DecisionOrigin {
+            deciding_layer: Some("agent_type".into()),
+            profile: Some("Bad Name".into()),
+            ..DecisionOrigin::default()
+        }
+        .write_attrs(&mut not_withheld);
+        assert!(!not_withheld.contains_key("profile"));
+        assert!(!not_withheld.contains_key("relaxation_withheld"));
+    }
+
+    fn labelled(
+        g: &mut Graph,
+        session: &str,
+        seq: usize,
+        rec: &str,
+        origin: &DecisionOrigin,
+        ms: u64,
+    ) {
+        let outcome = if rec == "allow" {
+            DecisionOutcome::Allowed
+        } else {
+            DecisionOutcome::Blocked
+        };
+        g.ingest_verdict_with_origin(
+            session,
+            seq,
+            &format!("cmd {seq}"),
+            &verdict(rec, "why"),
+            context(DecisionMode::Enforce, outcome, ms),
+            origin,
+        );
+    }
+
+    /// A decision serves the labels its node holds, re-checked; a decision
+    /// written with none serves no identity at all, and its JSON has no key.
+    ///
+    /// FAILS ON REVERT: make `identity_of` return `Some` unconditionally and
+    /// the plain decision serialises an `identity` key.
+    #[test]
+    fn a_decision_serves_its_identity_labels_and_none_without_them() {
+        let mut g = Graph::new();
+        let id = "3f9a0c1e5b7d42a8c6e1f0b2d4a69c87";
+        labelled(
+            &mut g,
+            "contain",
+            0,
+            "deny",
+            &DecisionOrigin {
+                instance_id: Some(id.into()),
+                session_id: Some("a1b2c3d4-session".into()),
+                trust: Some("confined".into()),
+                trust_reason: Some("confined_by_namespace".into()),
+                deciding_layer: Some("general".into()),
+                profile: Some("claude-code".into()),
+                relaxation_withheld: true,
+                ..origin(&[])
+            },
+            10,
+        );
+        labelled(&mut g, "s2", 0, "deny", &origin(&[]), 20);
+        let page = g.decisions_page(&DecisionQuery::default());
+        let labelled = page
+            .items
+            .iter()
+            .find(|item| item.session == "contain")
+            .unwrap();
+        assert_eq!(
+            labelled.identity,
+            Some(DecisionIdentity {
+                instance_id: Some(id.into()),
+                session_id: Some("a1b2c3d4-session".into()),
+                trust: Some("confined".into()),
+                trust_reason: Some("confined_by_namespace".into()),
+                deciding_layer: Some("general".into()),
+                profile: Some("claude-code".into()),
+                relaxation_withheld: true,
+            })
+        );
+        let plain = page.items.iter().find(|item| item.session == "s2").unwrap();
+        assert_eq!(plain.identity, None);
+        let json = serde_json::to_value(plain).unwrap();
+        assert!(json.get("identity").is_none(), "{json}");
+    }
+
+    /// Per instance: the newest trust label wins, sessions are newest first
+    /// and capped, and a session's case is its newest flagged decision. A
+    /// node with no instance id, or one of the wrong shape, adds nothing.
+    ///
+    /// FAILS ON REVERT: drop the `row.key > *key` check and the older label
+    /// (observed) overwrites the newer one when it is read later.
+    #[test]
+    fn instance_activity_keeps_the_newest_label_and_the_sessions() {
+        let mut g = Graph::new();
+        let id = "3f9a0c1e5b7d42a8c6e1f0b2d4a69c87";
+        let with = |session: &str, trust: &str, reason: &str| DecisionOrigin {
+            instance_id: Some(id.into()),
+            session_id: Some(session.into()),
+            trust: Some(trust.into()),
+            trust_reason: Some(reason.into()),
+            ..origin(&[])
+        };
+        labelled(
+            &mut g,
+            "contain",
+            2,
+            "allow",
+            &with("sess-b", "confined", "confined_by_namespace"),
+            300,
+        );
+        labelled(
+            &mut g,
+            "contain",
+            0,
+            "deny",
+            &with("sess-a", "observed", "launcher_not_trusted"),
+            100,
+        );
+        labelled(
+            &mut g,
+            "contain",
+            1,
+            "allow",
+            &with("sess-a", "observed", "launcher_not_trusted"),
+            200,
+        );
+        labelled(&mut g, "s9", 0, "deny", &origin(&[]), 400);
+        labelled(
+            &mut g,
+            "s8",
+            0,
+            "deny",
+            &DecisionOrigin {
+                instance_id: Some("Not/An/Id".into()),
+                ..origin(&[])
+            },
+            500,
+        );
+        let activity = g.instance_activity(5);
+        assert_eq!(activity.len(), 1, "{activity:?}");
+        let one = &activity[id];
+        assert_eq!(one.trust.as_deref(), Some("confined"));
+        assert_eq!(one.trust_reason.as_deref(), Some("confined_by_namespace"));
+        assert_eq!(one.last_at_ms, Some(300));
+        let ids: Vec<&str> = one.sessions.iter().map(|s| s.session_id.as_str()).collect();
+        assert_eq!(ids, ["sess-b", "sess-a"]);
+        assert_eq!(one.sessions[1].first_at_ms, Some(100));
+        assert_eq!(one.sessions[1].last_at_ms, Some(200));
+        assert_eq!(one.sessions[1].case_id.as_deref(), Some("cmd:contain:0"));
+        assert_eq!(one.sessions[0].case_id, None);
+        assert_eq!(g.instance_activity(1)[id].sessions.len(), 1);
     }
 
     #[test]

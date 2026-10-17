@@ -125,6 +125,12 @@ pub struct HookDecision {
     /// The hook refuses the command (outside monitor).
     pub blocks: bool,
     pub deciding_layer: RuleLayer,
+    /// The profile in force for the caller's type, by name (`None`: the
+    /// general rules).
+    pub profile: Option<String>,
+    /// The profile or the exception would have allowed it, the instance does
+    /// not run confined, and the general rules decided.
+    pub relaxation_withheld: bool,
 }
 
 /// The facts of one shell command, as the hook has them after the general
@@ -196,6 +202,8 @@ pub fn decide_hook(
         verdict,
         blocks: outcome.blocks,
         deciding_layer: outcome.decision.deciding_layer,
+        profile: agent_type.and_then(|name| crate::agent_decisions::profile_name(profiles, name)),
+        relaxation_withheld: outcome.relaxation_withheld,
     }
 }
 
@@ -405,6 +413,8 @@ mod tests {
             assert!(out.blocks, "{trust:?}");
             assert_eq!(out.deciding_layer, RuleLayer::General);
             assert_eq!(out.verdict, verdict, "the verdict is not touched");
+            assert!(out.relaxation_withheld, "{trust:?}");
+            assert_eq!(out.profile.as_deref(), Some("claude-code"));
         }
         let out = decide_hook(
             &facts,
@@ -415,6 +425,7 @@ mod tests {
         );
         assert!(!out.blocks);
         assert_eq!(out.deciding_layer, RuleLayer::AgentType);
+        assert!(!out.relaxation_withheld);
         assert_eq!(out.verdict["recommendation"], "allow");
         assert!(out.verdict["explanation"].as_str().unwrap().ends_with(
             "[the `claude-code` agent profile allows bare_ip_fetch for this confined instance]"
@@ -450,6 +461,8 @@ mod tests {
         let other = decide_hook(&facts, &profiles, Some("cursor"), None, Trust::Declared);
         assert!(!other.blocks);
         assert_eq!(other.verdict, verdict);
+        assert_eq!(other.profile, None);
+        assert!(!other.relaxation_withheld);
     }
 
     #[test]

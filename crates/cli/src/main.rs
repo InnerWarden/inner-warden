@@ -31,6 +31,7 @@ mod contain;
 mod contain_io;
 mod dashboard;
 mod dashboard_community;
+mod dashboard_identity;
 mod first_run;
 mod graph_io;
 mod help;
@@ -975,7 +976,11 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
             (
                 decided.verdict,
                 decided.blocks,
-                Some(decided.deciding_layer),
+                Some(graph_io::LayerLabel {
+                    layer: decided.deciding_layer,
+                    profile: decided.profile,
+                    relaxation_withheld: decided.relaxation_withheld,
+                }),
             )
         }
     };
@@ -1085,7 +1090,7 @@ fn screen_file_tool(buf: &str, rest: &[String], monitor: bool) -> Option<std::pr
     // about it. Where profiles are in force the record says which layer.
     let deciding_layer = match agent_profiles_io::load() {
         agent_profiles::ProfilesState::Off => None,
-        _ => Some(innerwarden_agent_guard::identity::RuleLayer::Hard),
+        _ => Some(innerwarden_agent_guard::identity::RuleLayer::Hard.into()),
     };
     graph_io::record_hook(
         &command,
@@ -1154,7 +1159,7 @@ fn file_tool_revoked(
         hook_agent.as_deref(),
         hook_cwd(buf).as_deref(),
         identity.as_ref(),
-        Some(innerwarden_agent_guard::identity::RuleLayer::Hard),
+        Some(innerwarden_agent_guard::identity::RuleLayer::Hard.into()),
     );
     if monitor {
         return std::process::ExitCode::SUCCESS;

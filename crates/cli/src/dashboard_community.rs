@@ -269,6 +269,9 @@ pub(crate) struct EventLog {
     /// Newest first.
     pub attempts: Vec<Attempt>,
     pub suppression_changes: usize,
+    /// What people decided about agents (`guard.agent_decision`), as served,
+    /// newest first. Empty on every log written without the verbs.
+    pub agent_decisions: Vec<Value>,
 }
 
 impl EventLog {
@@ -303,6 +306,7 @@ pub(crate) fn parse_event_log(text: &str) -> EventLog {
         ..EventLog::default()
     };
     let mut copies: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    let mut decisions: Vec<(u64, Value)> = Vec::new();
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -331,6 +335,11 @@ pub(crate) fn parse_event_log(text: &str) -> EventLog {
                 _ => {}
             },
             Some("guard.suppression_changed") => log.suppression_changes += 1,
+            Some("guard.agent_decision") => {
+                if let Some(line) = agent_decision_line(&record, ts) {
+                    decisions.push((ts, line));
+                }
+            }
             Some("guard.attempt") => {
                 let detail = innerwarden_agent_guard::redact::redact_secrets(&text("detail")).text;
                 // Revealed BEFORE the text is flattened to one line: a `\r`
@@ -366,7 +375,79 @@ pub(crate) fn parse_event_log(text: &str) -> EventLog {
     }
     log.attempts
         .sort_by(|a, b| b.ts.cmp(&a.ts).then_with(|| b.id.cmp(&a.id)));
+    // Newest first; of two in the same second, the one written later.
+    decisions.reverse();
+    decisions.sort_by_key(|(ts, _)| std::cmp::Reverse(*ts));
+    log.agent_decisions = decisions
+        .into_iter()
+        .take(MAX_AGENT_DECISIONS)
+        .map(|(_, line)| line)
+        .collect();
     log
+}
+
+/// The most `guard.agent_decision` lines the history serves.
+const MAX_AGENT_DECISIONS: usize = 50;
+
+/// The actions a `guard.agent_decision` line may name.
+const AGENT_DECISION_ACTIONS: [&str; 4] = [
+    "agent_approve",
+    "agent_profile",
+    "agent_allow",
+    "agent_revoke",
+];
+
+/// One `guard.agent_decision` line as the history serves it, or `None` for
+/// one that does not have the shape the verbs write. Every string is one
+/// line, bounded, with any hidden character shown; the instance id is kept
+/// only in its own shape. The log is the user's to write, so nothing here
+/// is more than what the line says.
+fn agent_decision_line(record: &Map<String, Value>, ts: u64) -> Option<Value> {
+    let text = |key: &str, max: usize| -> Option<String> {
+        let value = record.get(key)?.as_str()?.trim();
+        (!value.is_empty()).then(|| one_line(&revealed(value), max))
+    };
+    let action = record
+        .get("action")
+        .and_then(Value::as_str)
+        .filter(|action| AGENT_DECISION_ACTIONS.contains(action))?;
+    let agent = record
+        .get("agent")
+        .and_then(Value::as_str)
+        .filter(|agent| innerwarden_agent_guard::hook::is_agent_id(agent))?;
+    let by = text("by", 64)?;
+    let result = text("result", 120)?;
+    let mut object = Map::new();
+    object.insert("ts".into(), json!(rfc3339(ts.saturating_mul(1_000))));
+    object.insert("action".into(), json!(action));
+    object.insert("agent".into(), json!(agent));
+    if let Some(id) = record
+        .get("instance_id")
+        .and_then(Value::as_str)
+        .filter(|id| innerwarden_agent_guard::identity::is_instance_id(id))
+    {
+        object.insert("instance_id".into(), json!(id));
+    }
+    opt(&mut object, "owner", text("owner", 64));
+    let rule = match record.get("rule") {
+        Some(Value::String(_)) => text("rule", 120),
+        Some(Value::Object(rule)) => rule
+            .get("value")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| one_line(&revealed(value), 120)),
+        _ => None,
+    };
+    opt(&mut object, "rule", rule);
+    opt(&mut object, "profile_before", text("profile_before", 80));
+    opt(&mut object, "profile_after", text("profile_after", 80));
+    for key in ["confined_instances", "other_instances"] {
+        opt(&mut object, key, record.get(key).and_then(Value::as_u64));
+    }
+    object.insert("by".into(), json!(by));
+    object.insert("result".into(), json!(result));
+    Some(Value::Object(object))
 }
 
 /// A message's outcome key, from who decided. Only a control that refused is
@@ -515,6 +596,10 @@ pub(crate) fn history_json(log: &EventLog, now_ms: u64) -> Value {
     );
     object.insert("messages".into(), Value::Object(messages));
     object.insert("suppression_changes".into(), json!(log.suppression_changes));
+    // Only where the log holds one: a history without them is what it was.
+    if !log.agent_decisions.is_empty() {
+        object.insert("agent_decisions".into(), json!(log.agent_decisions));
+    }
     Value::Object(object)
 }
 
@@ -1387,6 +1472,50 @@ pub(crate) fn decision_view(record: &DecisionRecord, suppress: &SuppressConfig) 
             .iter()
             .any(|pattern| glob_match(pattern, &record.command));
     object.insert("allowed_by_you".into(), json!(allowed_by_you));
+    if let Some(identity) = &record.identity {
+        object.insert("identity".into(), decision_identity_json(identity));
+    }
+    Value::Object(object)
+}
+
+/// Which instance asked and which layer decided, in the wire words (spec
+/// 104 C). The trust is the hook's label, never above what its reason
+/// supports; a decision with a layer and no label was made with no jail
+/// record, which is `declared`, `no_record`.
+fn decision_identity_json(identity: &innerwarden_graph::DecisionIdentity) -> Value {
+    let mut object = Map::new();
+    opt(&mut object, "instance_id", identity.instance_id.clone());
+    opt(
+        &mut object,
+        "session_id",
+        identity.session_id.as_deref().map(revealed),
+    );
+    let (trust, reason) = match identity.trust.as_deref() {
+        Some(word) => (
+            crate::dashboard_identity::capped_label(word, identity.trust_reason.as_deref())
+                .unwrap_or(innerwarden_agent_guard::identity::Trust::Declared),
+            identity.trust_reason.clone(),
+        ),
+        None => (
+            innerwarden_agent_guard::identity::Trust::Declared,
+            Some("no_record".to_string()),
+        ),
+    };
+    object.insert(
+        "trust".into(),
+        json!(crate::dashboard_identity::wire_trust(trust)),
+    );
+    opt(&mut object, "trust_reason", reason);
+    opt(
+        &mut object,
+        "deciding_layer",
+        identity.deciding_layer.clone(),
+    );
+    object.insert("profile".into(), json!(identity.profile));
+    object.insert(
+        "relaxation_withheld".into(),
+        json!(identity.relaxation_withheld),
+    );
     Value::Object(object)
 }
 
@@ -1868,6 +1997,136 @@ mod tests {
                 ..DecisionOrigin::default()
             },
         );
+    }
+
+    /// The history serves what people decided about agents, newest first,
+    /// in the shape the page reads (RFC 3339 `ts`, the action's skill id),
+    /// and drops a line that does not have the shape the verbs write. A log
+    /// with none serves no key at all.
+    ///
+    /// FAILS ON REVERT: insert `agent_decisions` unconditionally and the
+    /// plain history carries an empty list.
+    #[test]
+    fn the_history_serves_the_agent_decisions_and_nothing_without_them() {
+        let id = "3f9a0c1e5b7d42a8c6e1f0b2d4a69c87";
+        let lines = [
+            json!({"kind": "guard.agent_decision", "ts": 1_790_000_000u64, "action": "agent_approve", "agent": "claude-code", "by": "dev", "owner": "maria", "result": "success", "profile_before": "General rules", "profile_after": "claude-code", "confined_instances": 1, "other_instances": 2}),
+            json!({"kind": "guard.agent_decision", "ts": 1_790_000_100u64, "action": "agent_allow", "agent": "claude-code", "by": "dev", "instance_id": id, "rule": {"kind": "category", "value": "bare_ip_fetch"}, "result": "failure: not_confined"}),
+            json!({"kind": "guard.agent_decision", "ts": 1_790_000_100u64, "action": "agent_revoke", "agent": "claude-code", "by": "dev", "instance_id": "../Not An Id", "result": "success"}),
+            // Not the shape the verbs write: dropped.
+            json!({"kind": "guard.agent_decision", "ts": 1_790_000_200u64, "action": "agent_delete", "agent": "claude-code", "by": "dev", "result": "success"}),
+            json!({"kind": "guard.agent_decision", "ts": 1_790_000_200u64, "action": "agent_revoke", "agent": "Claude Code", "by": "dev", "result": "success"}),
+            json!({"kind": "guard.agent_decision", "ts": 1_790_000_200u64, "action": "agent_revoke", "agent": "claude-code", "result": "success"}),
+        ];
+        let text = lines
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let history = history_json(&parse_event_log(&text), NOW);
+        let served = history["agent_decisions"].as_array().unwrap();
+        assert_eq!(served.len(), 3, "{served:?}");
+        assert_eq!(
+            served[0]["action"], "agent_revoke",
+            "the later line of the same second first"
+        );
+        assert!(
+            served[0].get("instance_id").is_none(),
+            "an id of the wrong shape is dropped"
+        );
+        assert_eq!(served[1]["ts"], "2026-09-21T14:15:00Z");
+        assert_eq!(served[1]["instance_id"], id);
+        assert_eq!(served[1]["rule"], "bare_ip_fetch");
+        assert_eq!(served[1]["result"], "failure: not_confined");
+        assert_eq!(served[2]["owner"], "maria");
+        assert_eq!(served[2]["confined_instances"], 1);
+        let plain = history_json(&parse_event_log(&log_text()), NOW);
+        assert!(plain.get("agent_decisions").is_none(), "{plain}");
+        let many = (0..60)
+            .map(|n| {
+                json!({"kind": "guard.agent_decision", "ts": 1_790_000_000u64 + n, "action": "agent_revoke", "agent": "claude-code", "by": "dev", "result": "success"})
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let capped = history_json(&parse_event_log(&many), NOW);
+        assert_eq!(capped["agent_decisions"].as_array().unwrap().len(), 50);
+        assert_eq!(
+            capped["agent_decisions"][0]["ts"],
+            rfc3339((1_790_000_000 + 59) * 1_000)
+        );
+    }
+
+    /// A decision serves its identity in the wire words, never above what
+    /// the label's reason supports, and one written without labels serves
+    /// none: its JSON is what it was.
+    ///
+    /// FAILS ON REVERT: serve the hook's word without `capped_label` and
+    /// the forged pairing reads `host_verified`.
+    #[test]
+    fn a_decision_serves_its_identity_in_wire_words_and_none_without_labels() {
+        let id = "3f9a0c1e5b7d42a8c6e1f0b2d4a69c87";
+        let view = |origin: DecisionOrigin| {
+            let mut g = Graph::new();
+            g.ingest_verdict_with_origin(
+                "contain",
+                0,
+                "curl http://203.0.113.9/x",
+                &json!({"recommendation": "review", "explanation": "fetch from a bare IP"}),
+                DecisionContext {
+                    mode: DecisionMode::Enforce,
+                    outcome: DecisionOutcome::Blocked,
+                    recorded_at_ms: Some(NOW),
+                },
+                &origin,
+            );
+            let page = g.decisions_page(&DecisionQuery::default());
+            decision_view(&page.items[0], &SuppressConfig::default())
+        };
+        let labelled = view(DecisionOrigin {
+            channel: Some(DecisionChannel::Hook),
+            agent: Some("claude-code".into()),
+            instance_id: Some(id.into()),
+            session_id: Some("a1b2c3d4-session".into()),
+            trust: Some("observed".into()),
+            trust_reason: Some("launcher_not_trusted".into()),
+            deciding_layer: Some("general".into()),
+            profile: Some("claude-code".into()),
+            relaxation_withheld: true,
+            ..DecisionOrigin::default()
+        });
+        assert_eq!(
+            labelled["identity"],
+            json!({
+                "instance_id": id,
+                "session_id": "a1b2c3d4-session",
+                "trust": "observed",
+                "trust_reason": "launcher_not_trusted",
+                "deciding_layer": "general",
+                "profile": "claude-code",
+                "relaxation_withheld": true,
+            })
+        );
+        let forged = view(DecisionOrigin {
+            instance_id: Some(id.into()),
+            trust: Some("confined".into()),
+            trust_reason: Some("no_record".into()),
+            ..DecisionOrigin::default()
+        });
+        assert_eq!(forged["identity"]["trust"], "declared");
+        let layer_only = view(DecisionOrigin {
+            deciding_layer: Some("hard".into()),
+            ..DecisionOrigin::default()
+        });
+        assert_eq!(layer_only["identity"]["trust"], "declared");
+        assert_eq!(layer_only["identity"]["trust_reason"], "no_record");
+        assert_eq!(layer_only["identity"]["profile"], Value::Null);
+        let plain = view(DecisionOrigin {
+            channel: Some(DecisionChannel::Hook),
+            agent: Some("claude-code".into()),
+            ..DecisionOrigin::default()
+        });
+        assert!(plain.get("identity").is_none(), "{plain}");
     }
 
     fn one(
