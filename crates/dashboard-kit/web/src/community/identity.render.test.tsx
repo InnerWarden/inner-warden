@@ -280,7 +280,10 @@ describe("the Overview with identity data", () => {
     seed(agents);
     const html = render(<CommunityOverview context={context()} />, agents);
     const text = textOf(html);
-    expect(text).toContain("3 agents on this Mac. 1 runs confined; 1 runs in a jail whose launcher could be replaced; 1 runs as you, and only its own word says what it is.");
+    // The CLI's payload claims host_verified for one instance; a reading from
+    // inside the jail is shown at observed, so nothing here runs confined.
+    expect(text).toContain("3 agents on this Mac. 2 run in a jail nothing outside it has confirmed; 1 runs as you, and only its own word says what it is.");
+    expect(text).not.toContain("runs confined");
     expect(text).toContain("1 new agent waits for your approval.");
     const waiting = html.slice(html.indexOf("data-agents-waiting") - 80);
     expect(waiting.slice(0, 200)).toContain("data-needs-you");
@@ -317,14 +320,15 @@ describe("a case with identity", () => {
   it("words a product rule as one nothing changes", () => {
     const text = textOf(html({ instance_id: ID_A, trust: "host_verified", trust_reason: "confined_by_namespace", deciding_layer: "hard", relaxation_withheld: false }, "deny"));
     expect(text).toContain("Refused by a product rule no setting changes. Nothing to change here.");
-    expect(text).toContain("Confined");
+    expect(text).toContain("Observed");
+    expect(text).not.toContain("Confined");
   });
 
   it("does not word an allowance by a profile for an instance that is not confined", () => {
     const out = html({ instance_id: ID_A, trust: "host_verified", trust_reason: "no_record", deciding_layer: "agent_type", profile: "engineering", relaxation_withheld: false }, "allow");
     const text = textOf(out);
     expect(out).toContain("data-identity-conflict");
-    expect(text).toContain("could not be confirmed from inside");
+    expect(text).toContain("nothing outside its jail confirmed the jail");
     expect(text).not.toContain("because this instance runs confined");
     expect(text).not.toContain("Confined");
   });

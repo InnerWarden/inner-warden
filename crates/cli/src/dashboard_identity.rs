@@ -14,7 +14,12 @@
 //!   pairs `confined` with a reason that proves nothing reads as `declared`;
 //! * for a jail that still runs, the label is capped by what the dashboard
 //!   itself reads of that jail (the record against the jail's namespaces),
-//!   so a forged label in the record cannot raise a live instance.
+//!   so a forged label in the record cannot raise a live instance;
+//! * nothing this dashboard reads is a witness from outside the jail (the
+//!   hook's label, the launcher's record and the jail's namespaces are all
+//!   facts the agent's own process can produce), so no instance is ever
+//!   served above `observed`: `host_verified` is only for a witness outside
+//!   the agent, which the Community dashboard is not.
 
 use std::collections::BTreeMap;
 
@@ -70,11 +75,13 @@ fn trust_word(word: &str) -> Option<Trust> {
 }
 
 /// The most a reason code can support. A code this build does not know
-/// supports nothing above `declared`.
+/// supports nothing above `declared`, and none supports more than
+/// `observed`: every code here is a reading from inside the jail, and a
+/// reading from inside the jail tops at `observed` (`judge_trust_in_jail`,
+/// row 10), `confined_by_namespace` included.
 pub fn reason_ceiling(reason: &str) -> Trust {
     match reason {
-        "confined_by_namespace" => Trust::Confined,
-        "launcher_not_trusted" | "no_scope" => Trust::Observed,
+        "confined_by_namespace" | "launcher_not_trusted" | "no_scope" => Trust::Observed,
         _ => Trust::Declared,
     }
 }
@@ -390,6 +397,59 @@ mod tests {
         }
     }
 
+    /// Nothing the Community dashboard reads is a witness from outside the
+    /// jail, so no instance and no row is ever served as `host_verified`:
+    /// not a live one, not an ENDED one whose label in the agent-writable
+    /// project graph says `confined`, whatever reason it pairs that with.
+    ///
+    /// FAILS ON REVERT: map `confined_by_namespace` to `Confined` in
+    /// `reason_ceiling` again and the ended instance labelled
+    /// `confined`/`confined_by_namespace` is served as `host_verified`.
+    #[test]
+    fn the_community_dashboard_never_serves_host_verified() {
+        let mut reasons: Vec<&str> = [
+            Reason::ConfinedByNamespace,
+            Reason::LauncherNotTrusted,
+            Reason::NoScope,
+            Reason::NoRecord,
+            Reason::RecordUnreadable,
+            Reason::RecordWritable,
+            Reason::NoNamespaceOnBackend,
+            Reason::HostNamespaceRecorded,
+            Reason::OwnNamespaceUnreadable,
+            Reason::NamespaceMismatch,
+            Reason::OwnMountNamespaceUnreadable,
+            Reason::MountNamespaceMismatch,
+            Reason::AgentMismatch,
+            Reason::AgentNotNamed,
+        ]
+        .iter()
+        .map(|r| r.as_str())
+        .collect();
+        reasons.extend(["sensor_confirmed", "host_verified", "", "made_up"]);
+        for reason in reasons {
+            assert!(reason_ceiling(reason) <= Trust::Observed, "{reason}");
+            for live in [false, true] {
+                let judged = live.then_some((Trust::Observed, Reason::ConfinedByNamespace));
+                let view =
+                    instance_view(&facts(ID, live, judged), Some(&label("confined", reason)));
+                assert_ne!(view.trust, "host_verified", "{reason} live={live}");
+                let mut activity = BTreeMap::new();
+                activity.insert(ID.to_string(), label("confined", reason));
+                let row = row_trust("claude-code", &[facts(ID, live, judged)], &activity, true);
+                assert_ne!(row.trust, "host_verified", "{reason} live={live}");
+            }
+        }
+        let ended = instance_view(
+            &facts(ID, false, None),
+            Some(&label("confined", "confined_by_namespace")),
+        );
+        assert_eq!(
+            (ended.trust, ended.trust_reason.as_str()),
+            ("observed", "confined_by_namespace")
+        );
+    }
+
     #[test]
     fn the_wire_words_are_the_closed_table() {
         assert_eq!(wire_trust(Trust::Confined), "host_verified");
@@ -401,13 +461,13 @@ mod tests {
     /// whatever its record says.
     ///
     /// FAILS ON REVERT: return the dashboard's own judgment when no label
-    /// exists and the live, confined-looking instance reads `confined`.
+    /// exists and the live instance whose reading held reads `observed`.
     #[test]
     fn an_instance_with_no_label_is_not_checked_yet() {
         let live = facts(
             ID,
             true,
-            Some((Trust::Confined, Reason::ConfinedByNamespace)),
+            Some((Trust::Observed, Reason::ConfinedByNamespace)),
         );
         assert_eq!(
             instance_trust(&live, None),
@@ -438,7 +498,7 @@ mod tests {
         let live_ok = facts(
             ID,
             true,
-            Some((Trust::Confined, Reason::ConfinedByNamespace)),
+            Some((Trust::Observed, Reason::ConfinedByNamespace)),
         );
         assert_eq!(
             instance_trust(&live_ok, Some(&label("confined", "no_record"))).0,
@@ -447,7 +507,7 @@ mod tests {
         );
         assert_eq!(
             instance_trust(&live_ok, Some(&label("confined", "confined_by_namespace"))),
-            (Trust::Confined, "confined_by_namespace".to_string())
+            (Trust::Observed, "confined_by_namespace".to_string())
         );
         assert_eq!(
             instance_trust(&live_ok, Some(&label("observed", "launcher_not_trusted"))).0,
@@ -458,7 +518,7 @@ mod tests {
         let ended = facts(ID, false, None);
         assert_eq!(
             instance_trust(&ended, Some(&label("confined", "confined_by_namespace"))).0,
-            Trust::Confined
+            Trust::Observed
         );
         assert_eq!(
             instance_trust(&ended, Some(&label("root", "confined_by_namespace"))).0,
@@ -475,7 +535,7 @@ mod tests {
             facts(
                 ID,
                 true,
-                Some((Trust::Confined, Reason::ConfinedByNamespace)),
+                Some((Trust::Observed, Reason::ConfinedByNamespace)),
             ),
             facts(
                 OTHER,
@@ -580,11 +640,11 @@ mod tests {
         let live = facts(
             ID,
             true,
-            Some((Trust::Confined, Reason::ConfinedByNamespace)),
+            Some((Trust::Observed, Reason::ConfinedByNamespace)),
         );
         let view = instance_view(&live, Some(&label("confined", "confined_by_namespace")));
         let json = serde_json::to_value(&view).unwrap();
-        assert_eq!(json["trust"], "host_verified");
+        assert_eq!(json["trust"], "observed");
         assert_eq!(json["trust_source"], "jail");
         assert_eq!(json["project"], "payments-api");
         assert_eq!(json["mode"], "enforce");

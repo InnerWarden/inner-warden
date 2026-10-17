@@ -85,7 +85,7 @@
             "pid_ns": 4026534778,
             "scope_unit": "innerwarden-contain-5c1e0a7700004000800000000000c0f1.scope"
           },
-          "trust": "host_verified",
+          "trust": "observed",
           "trust_reason": "confined_by_namespace",
           "trust_source": "jail",
           "uid": 1000,
@@ -114,7 +114,7 @@
             "pid_ns": 4026533980,
             "scope_unit": "innerwarden-contain-17a3c9e000004000800000000000e4d0.scope"
           },
-          "trust": "host_verified",
+          "trust": "observed",
           "trust_reason": "confined_by_namespace",
           "trust_source": "jail",
           "uid": 1000,
@@ -127,10 +127,10 @@
       "owner": "maria",
       "profile": {
         "applies_from": "now",
-        "confined_instances": 1,
+        "confined_instances": 0,
         "label": "claude-code",
         "name": "claude-code",
-        "other_instances": 1,
+        "other_instances": 2,
         "source": "system"
       },
       "running": null,
@@ -189,10 +189,10 @@
       "lifecycle": "discovered",
       "profile": {
         "applies_from": "now",
-        "confined_instances": 1,
+        "confined_instances": 0,
         "label": "General rules",
         "name": null,
-        "other_instances": 0,
+        "other_instances": 1,
         "source": null
       },
       "running": null,

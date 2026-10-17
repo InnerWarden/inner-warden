@@ -134,9 +134,13 @@ export function shortSession(label: string): string {
 
 /**
  * How much stands behind who an agent says it is. One set of words on every
- * screen: `host_verified` (a jail it cannot leave, checked from inside the
- * jail), `observed` (in a jail whose launcher could be replaced) and
- * `declared` (only its own word).
+ * screen: `host_verified` (a jail it cannot leave, confirmed by a witness
+ * outside the jail), `observed` (in a jail, as read from inside it, or with a
+ * launcher that could be replaced) and `declared` (only its own word).
+ *
+ * Everything this page reads is a reading from inside the jail, which an
+ * agent could stage for itself, so every reason code here tops at
+ * `observed`: this page never shows `host_verified`.
  */
 export const TRUSTS = ["declared", "observed", "host_verified"] as const;
 export type Trust = (typeof TRUSTS)[number];
@@ -149,21 +153,23 @@ export function worseTrust(a: Trust, b: Trust): Trust {
 export type TrustWord = { label: string; tooltip: string; tone: "watch" };
 
 /**
- * Keyed `${trust}:${source}`. This page checks from inside the jail, so its
+ * Keyed `${trust}:${source}`. This page reads from inside the jail, so its
  * source is always `jail`; `declared` has the same words from any source.
  * Typed as a `Record` over the keys: a key with no words fails the build.
+ * `host_verified:jail` is there for the type only: no reason code lets a
+ * jail reading reach it (`REASON_TRUST`).
  */
 export type TrustWordKey = "host_verified:jail" | "observed:jail" | "declared:jail" | "declared:sensor";
 
 export const TRUST_WORDS: Record<TrustWordKey, TrustWord> = {
   "host_verified:jail": {
     label: "Confined",
-    tooltip: "Runs inside a jail it cannot leave, checked from inside the jail.",
+    tooltip: "Runs inside a jail it cannot leave, confirmed by a witness outside the jail.",
     tone: "watch",
   },
   "observed:jail": {
     label: "Observed",
-    tooltip: "Runs in a jail, but its launcher could be replaced.",
+    tooltip: "Runs in a jail, as read from inside it: nothing outside the jail has confirmed it.",
     tone: "watch",
   },
   "declared:jail": { label: "Declared only", tooltip: "Only its own word says what it is.", tone: "watch" },
@@ -197,7 +203,7 @@ export const REASON_CODES = [
 export type ReasonCode = (typeof REASON_CODES)[number];
 
 export const REASON_TRUST: Record<ReasonCode, Trust> = {
-  confined_by_namespace: "host_verified",
+  confined_by_namespace: "observed",
   launcher_not_trusted: "observed",
   no_record: "declared",
   record_unreadable: "declared",
@@ -216,7 +222,7 @@ export const REASON_TRUST: Record<ReasonCode, Trust> = {
 };
 
 export const REASON_WORDS: Record<ReasonCode, string> = {
-  confined_by_namespace: "Runs in a jail it cannot leave, checked from inside the jail.",
+  confined_by_namespace: "Runs in the jail its launcher recorded, as read from inside the jail. An agent could stage that reading for itself, so it counts as observed until a witness outside the jail confirms it.",
   launcher_not_trusted: "The launcher is installed in your home folder, so any program you run could replace it: install it system-wide.",
   no_record: "Started without a jail: only its own word says what it is.",
   record_unreadable: "Its jail record could not be read, so it counts as unverified.",
@@ -340,7 +346,7 @@ export function agentTrustSentence(counts: TrustCounts, place: string): string {
   const parts: string[] = [];
   if (counts.confined > 0) parts.push(`${counts.confined} ${plural(counts.confined, "runs", "run")} confined`);
   if (counts.observed > 0) {
-    parts.push(`${counts.observed} ${plural(counts.observed, "runs", "run")} in a jail whose launcher could be replaced`);
+    parts.push(`${counts.observed} ${plural(counts.observed, "runs", "run")} in a jail nothing outside it has confirmed`);
   }
   if (counts.declared > 0) {
     const its = counts.declared === 1 ? "its" : "their";
@@ -351,7 +357,7 @@ export function agentTrustSentence(counts: TrustCounts, place: string): string {
 }
 
 export const CONFLICT_WORDS =
-  "Its hook says the {agent} profile allowed this, but its jail could not be confirmed from inside, so this is not taken as an allowance.";
+  "Its hook says the {agent} profile allowed this, but nothing outside its jail confirmed the jail, so this is not taken as an allowance.";
 
 /**
  * The "Decided by" line of a case. A layer that allows only because an

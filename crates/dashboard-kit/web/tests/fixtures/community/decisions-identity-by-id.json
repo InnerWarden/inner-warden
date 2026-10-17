@@ -31,7 +31,7 @@
         "profile": "claude-code",
         "relaxation_withheld": false,
         "session_id": "5c1e0a77-demo-4000-8000-00000000000a",
-        "trust": "host_verified",
+        "trust": "observed",
         "trust_reason": "confined_by_namespace"
       },
       "mode_at_decision": "enforce",
@@ -131,7 +131,7 @@
         "profile": "claude-code",
         "relaxation_withheld": false,
         "session_id": "5c1e0a77-demo-4000-8000-00000000000a",
-        "trust": "host_verified",
+        "trust": "observed",
         "trust_reason": "confined_by_namespace"
       },
       "mode_at_decision": "enforce",
@@ -451,7 +451,7 @@
         "profile": "claude-code",
         "relaxation_withheld": false,
         "session_id": "17a3c9e0-demo-4000-8000-00000000000c",
-        "trust": "host_verified",
+        "trust": "observed",
         "trust_reason": "confined_by_namespace"
       },
       "mode_at_decision": "enforce",

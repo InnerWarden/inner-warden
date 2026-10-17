@@ -687,7 +687,7 @@ fn identity_facts(graph: &Graph) -> crate::agent_decisions::DashboardFacts {
         2778,
     );
     confined.live = true;
-    confined.judged = Some((Trust::Confined, Reason::ConfinedByNamespace));
+    confined.judged = Some((Trust::Observed, Reason::ConfinedByNamespace));
     let mut observed = identity_record_json(
         I_OBSERVED,
         "claude-code",
@@ -709,7 +709,7 @@ fn identity_facts(graph: &Graph) -> crate::agent_decisions::DashboardFacts {
     let mut codex =
         identity_record_json(I_CODEX, "codex", root, true, "2026-09-29T14:00:00Z", 4410);
     codex.live = true;
-    codex.judged = Some((Trust::Confined, Reason::ConfinedByNamespace));
+    codex.judged = Some((Trust::Observed, Reason::ConfinedByNamespace));
     let records = vec![confined, observed, ended, codex];
     let instances = records
         .iter()
@@ -752,7 +752,7 @@ fn identity_record() -> Graph {
         (
             S_CONFINED,
             I_CONFINED,
-            "confined",
+            "observed",
             "confined_by_namespace",
             "npm test",
             "allow",
@@ -764,7 +764,7 @@ fn identity_record() -> Graph {
         (
             S_CONFINED,
             I_CONFINED,
-            "confined",
+            "observed",
             "confined_by_namespace",
             "curl http://203.0.113.9/health",
             "allow",
@@ -797,6 +797,8 @@ fn identity_record() -> Graph {
             DecisionOutcome::Allowed,
             12 * MINUTE,
         ),
+        // A label in the agent-writable graph that says more than a reading
+        // from inside the jail can: served capped, at `observed`.
         (
             S_ENDED,
             I_ENDED,

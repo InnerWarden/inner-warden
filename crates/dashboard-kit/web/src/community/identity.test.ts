@@ -33,7 +33,9 @@ describe("trust never rises above its reason", () => {
     expect(effectiveTrust("host_verified", "no_record")).toBe("declared");
     expect(effectiveTrust("host_verified", "launcher_not_trusted")).toBe("observed");
     expect(effectiveTrust("observed", "no_record")).toBe("declared");
-    expect(effectiveTrust("host_verified", "confined_by_namespace")).toBe("host_verified");
+    // A reading from inside the jail tops at observed, whatever it found.
+    expect(effectiveTrust("host_verified", "confined_by_namespace")).toBe("observed");
+    for (const code of REASON_CODES) expect(REASON_TRUST[code], code).not.toBe("host_verified");
     // A claim can be lowered by its reason, never raised by it.
     expect(effectiveTrust("declared", "confined_by_namespace")).toBe("declared");
   });
@@ -91,16 +93,16 @@ describe("the identity fields of an agent row", () => {
       id: "x",
       trust: "host_verified",
       trust_reason: "confined_by_namespace",
-      instances: [instance(), instance({ instance_id: other, trust: "observed", trust_reason: "launcher_not_trusted" })],
+      instances: [instance(), instance({ instance_id: other, trust: "declared", trust_reason: "no_record" })],
     });
-    expect(read?.trust).toBe("observed");
-    expect(read?.trustReason).toBe("launcher_not_trusted");
+    expect(read?.trust).toBe("declared");
+    expect(read?.trustReason).toBe("no_record");
   });
 
   it("does not let an ended instance lower or raise the trust of a live one", () => {
     const other = "7a1b2c3d4e5f60718293a4b5c6d7e8f9";
     const read = readAgentIdentity({ id: "x", instances: [instance(), instance({ instance_id: other, trust: "declared", trust_reason: "no_record", live: false })] });
-    expect(read?.trust).toBe("host_verified");
+    expect(read?.trust).toBe("observed");
   });
 
   it("counts a live instance by its trust and an active agent without one as declared", () => {
@@ -112,7 +114,7 @@ describe("the identity fields of an agent row", () => {
         { ...agents.agents[2], running: false },
       ],
     } as unknown as AgentsResponse);
-    expect(trustCounts(rows, Date.parse("2026-10-17T00:00:00Z"))).toEqual({ total: 2, confined: 1, observed: 0, declared: 1 });
+    expect(trustCounts(rows, Date.parse("2026-10-17T00:00:00Z"))).toEqual({ total: 2, confined: 0, observed: 1, declared: 1 });
   });
 
   it("counts nothing when no instance exists anywhere", () => {
@@ -134,7 +136,7 @@ describe("the Overview sentence", () => {
       "1 agent on this Mac. 1 runs as you, and only its own word says what it is.",
     );
     expect(agentTrustSentence({ total: 2, confined: 0, observed: 2, declared: 0 }, "this machine")).toBe(
-      "2 agents on this machine. 2 run in a jail whose launcher could be replaced.",
+      "2 agents on this machine. 2 run in a jail nothing outside it has confirmed.",
     );
   });
 });
@@ -201,7 +203,10 @@ describe("the CLI's identity fixtures read as written", () => {
     const claude = rows.find((row) => row.id === "claude-code");
     expect(claude?.who?.trust).toBe("observed");
     expect(claude?.who?.confine?.command).toBe("sudo npm install -g innerwarden");
-    expect(claude?.who?.instances.map((i) => i.trust)).toEqual(["observed", "host_verified", "host_verified"]);
+    // The ended instance's label in the graph says confined: it is served,
+    // and read, at observed.
+    expect(claude?.who?.instances.map((i) => i.trust)).toEqual(["observed", "observed", "observed"]);
+    expect(JSON.stringify(identityAgents)).not.toContain("host_verified");
     expect(claude?.who?.owner).toBe("maria");
     expect(claude?.who?.lifecycleBy).toBe("dev");
     const codex = rows.find((row) => row.id === "codex");

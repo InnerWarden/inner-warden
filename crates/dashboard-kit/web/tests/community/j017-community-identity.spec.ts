@@ -41,7 +41,8 @@ test("each agent says how far its word is backed, why, and what would back it fu
   const claude = row(page, "claude-code");
   await expect(claude.locator("[data-agent-identity]")).toBeVisible();
 
-  // The row is its worst live instance: one whose launcher could be replaced.
+  // The row is its worst live instance: one whose launcher could be replaced
+  // (both live ones are observed, and the newer one gives the reason).
   await expect(claude.locator("[data-trust]").first()).toHaveAttribute("data-trust", "observed");
   await expect(claude.locator("[data-trust-reason]")).toHaveText(
     "The launcher is installed in your home folder, so any program you run could replace it: install it system-wide.",
@@ -58,8 +59,13 @@ test("each agent says how far its word is backed, why, and what would back it fu
   await expect(instances.nth(0)).toHaveAttribute("data-instance", OBSERVED);
   await expect(instances.nth(0)).toHaveAttribute("data-instance-trust", "observed");
   await expect(instances.nth(1)).toHaveAttribute("data-instance", CONFINED);
-  await expect(instances.nth(1)).toHaveAttribute("data-instance-trust", "host_verified");
-  await expect(instances.nth(1)).toContainText("Confined");
+  // A reading from inside the jail tops at observed, even where everything
+  // it can check held: the page never calls a Community instance confined.
+  await expect(instances.nth(1)).toHaveAttribute("data-instance-trust", "observed");
+  await expect(instances.nth(1)).toContainText("Observed");
+  await expect(instances.nth(1)).not.toContainText("Confined");
+  // The ended instance's graph label says confined; it is shown at observed.
+  await expect(instances.nth(2)).toHaveAttribute("data-instance-trust", "observed");
   await expect(instances.nth(2)).toHaveAttribute("data-instance", ENDED);
   await expect(instances.nth(2)).toHaveAttribute("data-live", "false");
   await expect(instances.nth(2)).toContainText("Ended");
