@@ -34,8 +34,9 @@
 //! declare itself the most permissive one. A rule that TIGHTENS is honoured at
 //! any trust level, since an agent gains nothing by being held to more.
 //!
-//! Only `innerwarden contain --identity` (off by default) uses it today: the
-//! launcher writes the record. Nothing yet reads it to decide.
+//! `innerwarden contain --identity` (off by default) writes the record; the
+//! hook reads it for its labels; the per-agent profiles ([`crate::profiles`],
+//! read only where a profiles file exists) decide with [`decide`].
 
 use std::fmt;
 use std::path::{Component, Path};
@@ -883,7 +884,8 @@ pub fn decide(layers: Layers, trust: Trust) -> Decision {
 ///   the like.
 ///
 /// The LLM key has no signal of its own (the jail hides the file), so it joins
-/// the hard layer where a profile is applied, not here.
+/// the hard layer where a profile is applied, as a path rule
+/// ([`crate::threats::names_guard_llm_key`], used by [`crate::profiles`]).
 const EXTRA_HARD_SIGNALS: &[&str] = &[
     "guard_self_disable",
     "security_tooling_tamper",

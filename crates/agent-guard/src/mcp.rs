@@ -201,7 +201,10 @@ pub(crate) fn inspect_declared_tool_call(
     }
 }
 
-fn shell_command_argument<'a>(tool_name: &str, args: &'a serde_json::Value) -> Option<&'a str> {
+pub(crate) fn shell_command_argument<'a>(
+    tool_name: &str,
+    args: &'a serde_json::Value,
+) -> Option<&'a str> {
     let canonical: String = tool_name
         .to_ascii_lowercase()
         .chars()
@@ -815,6 +818,51 @@ pub fn blocks_for_agent(analysis: &CommandAnalysis) -> bool {
             .iter()
             .any(|s| s.score > 0 && AGENT_REVIEW_FLOOR.contains(&s.signal.as_str()))
 }
+
+/// Every signal name [`analyze_command`] raises from its own checks, sorted.
+///
+/// This is the vocabulary a per-agent profile names categories in
+/// (`allow_categories`, `deny_categories`), so a name a profile uses is a name
+/// this engine can actually raise. Not in it: the `atr:<category>` labels (the
+/// ATR corpus is a separate namespace, muted with `innerwarden mute`) and the
+/// aggravating factors of a fetch-and-execute, which only ever ride along with
+/// a floor signal. A test reads this file and fails when a check here raises a
+/// name the list does not have, or the list keeps one nothing raises.
+pub const SIGNAL_NAMES: &[&str] = &[
+    "anti_forensics",
+    "bare_ip_fetch",
+    "clone_and_run",
+    "cloud_control_plane",
+    "credential_exposure",
+    "credential_hunt",
+    "credential_read_outside_project",
+    "dangerous_command",
+    "data_destruction",
+    "destructive_command",
+    "download_and_execute",
+    "download_chmod_execute",
+    "dynamic_code_execution",
+    "fetch_exec_unanalyzable",
+    "fetch_exec_unparsed",
+    "guard_self_disable",
+    "insecure_permissions",
+    "internal_network_target",
+    "kubernetes_escalation",
+    "kubernetes_secret_read",
+    "local_credential_or_kernel_tamper",
+    "obfuscated_command",
+    "package_typosquat",
+    "persistence_attempt",
+    "persistence_install",
+    "protected_secret_read",
+    "reverse_shell",
+    "security_tooling_tamper",
+    "sensitive_credential_read",
+    "sensitive_file_overwrite",
+    "tls_verification_disabled",
+    "tmp_execution",
+    "untrusted_software_source",
+];
 
 /// Push a signal only if its label is not already present, so several
 /// distinct rules that map to the same category render once. The caller
@@ -1905,6 +1953,36 @@ fn check_shell_internal_target(command: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The profile vocabulary is the set of names the checks in this file
+    /// raise, read from the source itself, so a new check cannot be added
+    /// without a profile being able to name it, and a removed one cannot stay
+    /// in the list matching nothing.
+    ///
+    /// FAILS ON REVERT: drop a name from [`SIGNAL_NAMES`], or add one nothing
+    /// raises, and the two sets differ.
+    #[test]
+    fn signal_names_are_exactly_the_names_the_checks_raise() {
+        let source = include_str!("mcp.rs");
+        let production = &source[..source.find("#[cfg(test)]").expect("a test module")];
+        let mut raised: Vec<&str> = production
+            .match_indices("signal: \"")
+            .filter_map(|(at, marker)| {
+                let rest = &production[at + marker.len()..];
+                rest.find('"').map(|end| &rest[..end])
+            })
+            .collect();
+        raised.sort_unstable();
+        raised.dedup();
+        let mut listed: Vec<&str> = SIGNAL_NAMES.to_vec();
+        listed.sort_unstable();
+        listed.dedup();
+        assert_eq!(listed.len(), SIGNAL_NAMES.len(), "a name is listed twice");
+        assert_eq!(raised, listed);
+        for floor in AGENT_REVIEW_FLOOR {
+            assert!(SIGNAL_NAMES.contains(floor), "{floor}");
+        }
+    }
 
     /// The weight and the thresholds are exported so a score built outside
     /// the analyzer (the conversation surface) lands on the same scale. Pinned

@@ -55,6 +55,9 @@ pub struct Identity {
     pub session_id: Option<String>,
     pub trust: Trust,
     pub reason: Reason,
+    /// The kind of agent the record names, set with `instance_id` only: the
+    /// type whose profile a confined instance gets.
+    pub agent_type: Option<String>,
 }
 
 impl Identity {
@@ -111,6 +114,7 @@ pub fn resolve(
                 session_id,
                 trust: Trust::Declared,
                 reason: Reason::RecordUnreadable,
+                agent_type: None,
             })
         }
         RawRecord::Bytes { bytes, read_only } => (bytes, *read_only),
@@ -121,6 +125,7 @@ pub fn resolve(
             session_id,
             trust: Trust::Declared,
             reason: Reason::RecordUnreadable,
+            agent_type: None,
         });
     };
     let judged = judge_trust_in_jail(InJailFacts {
@@ -131,11 +136,13 @@ pub fn resolve(
         own_pid_ns: facts.own_pid_ns,
     });
     let (trust, reason) = judge_agent_claim(judged, &record.agent_type, hook_agent);
+    let matched = trust > Trust::Declared;
     Some(Identity {
-        instance_id: (trust > Trust::Declared).then(|| record.instance_id.clone()),
+        instance_id: matched.then(|| record.instance_id.clone()),
         session_id,
         trust,
         reason,
+        agent_type: matched.then(|| record.agent_type.clone()),
     })
 }
 
@@ -268,6 +275,7 @@ mod tests {
         assert_eq!(id.reason, Reason::ConfinedByNamespace);
         assert_eq!(id.instance_id.as_deref(), Some("7f3a9c1e-42"));
         assert_eq!(id.session_id.as_deref(), Some("payload-session"));
+        assert_eq!(id.agent_type.as_deref(), Some("claude-code"));
     }
 
     /// A record carried into another jail (or copied by the agent) is not this
@@ -286,6 +294,10 @@ mod tests {
         assert_eq!(id.trust, Trust::Declared);
         assert_eq!(id.reason, Reason::NamespaceMismatch);
         assert_eq!(id.instance_id, None);
+        assert_eq!(
+            id.agent_type, None,
+            "a record of another jail names no type"
+        );
     }
 
     #[test]

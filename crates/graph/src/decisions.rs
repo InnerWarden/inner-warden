@@ -74,6 +74,10 @@ pub struct DecisionOrigin {
     pub trust: Option<String>,
     /// Why the hook gave that level (a short snake_case word).
     pub trust_reason: Option<String>,
+    /// The rule layer that made the decision (`hard`, `general`,
+    /// `agent_type`, `instance`). Written only where per-agent profiles are
+    /// in force; only a known word is kept.
+    pub deciding_layer: Option<String>,
 }
 
 const MAX_AGENT_CHARS: usize = 64;
@@ -86,6 +90,9 @@ const MAX_REASON_CHARS: usize = 64;
 
 /// The words a trust label may hold.
 const TRUST_WORDS: [&str; 3] = ["declared", "observed", "confined"];
+
+/// The words a deciding layer may hold.
+const LAYER_WORDS: [&str; 4] = ["hard", "general", "agent_type", "instance"];
 
 fn valid_instance(id: &str) -> bool {
     !id.is_empty()
@@ -147,6 +154,13 @@ impl DecisionOrigin {
             .filter(|word| TRUST_WORDS.contains(word))
     }
 
+    /// The deciding layer, if it is one of the known four.
+    pub fn layer_label(&self) -> Option<&str> {
+        self.deciding_layer
+            .as_deref()
+            .filter(|word| LAYER_WORDS.contains(word))
+    }
+
     /// Write the fields this origin carries onto a command node's attributes.
     /// A field that fails its shape check is dropped, never repaired: a record
     /// with no agent is honest, one with a guessed agent is not.
@@ -194,6 +208,9 @@ impl DecisionOrigin {
             if let Some(reason) = self.trust_reason.as_deref().filter(|r| valid_reason(r)) {
                 attrs.insert("trust_reason".into(), reason.into());
             }
+        }
+        if let Some(layer) = self.layer_label() {
+            attrs.insert("deciding_layer".into(), layer.into());
         }
     }
 }
@@ -1122,6 +1139,35 @@ mod tests {
             };
             assert_eq!(o.trust_label(), None, "{bad:?}");
         }
+    }
+
+    /// A deciding layer is one of four words; anything else is dropped, and
+    /// with none the attribute is not written at all.
+    #[test]
+    fn a_deciding_layer_is_written_only_as_a_known_word() {
+        use super::DecisionOrigin;
+        use std::collections::BTreeMap;
+        for word in ["hard", "general", "agent_type", "instance"] {
+            let mut attrs = BTreeMap::new();
+            DecisionOrigin {
+                deciding_layer: Some(word.into()),
+                ..DecisionOrigin::default()
+            }
+            .write_attrs(&mut attrs);
+            assert_eq!(attrs.get("deciding_layer").map(String::as_str), Some(word));
+        }
+        for bad in ["", "Hard", "profile", "agent-type", "general "] {
+            let mut attrs = BTreeMap::new();
+            DecisionOrigin {
+                deciding_layer: Some(bad.into()),
+                ..DecisionOrigin::default()
+            }
+            .write_attrs(&mut attrs);
+            assert!(!attrs.contains_key("deciding_layer"), "{bad:?}");
+        }
+        let mut attrs = BTreeMap::new();
+        DecisionOrigin::default().write_attrs(&mut attrs);
+        assert!(attrs.is_empty());
     }
 
     use super::*;

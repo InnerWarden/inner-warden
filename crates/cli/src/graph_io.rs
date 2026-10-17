@@ -11,6 +11,7 @@
 
 use crate::hook_identity::Identity;
 use innerwarden_agent_guard::file_update::ReplaceError;
+use innerwarden_agent_guard::identity::RuleLayer;
 use innerwarden_agent_guard::mcp_proxy::enforce::ProxyMode;
 use innerwarden_agent_guard::mcp_proxy::router::ProxyDecision;
 use innerwarden_graph::{
@@ -367,18 +368,21 @@ fn check_origin(verdict: &Value) -> DecisionOrigin {
 }
 
 /// Where a hook decision came from: the agent the hook line names (never a
-/// guess from the payload) and the basename of the folder it ran in.
+/// guess from the payload) and the basename of the folder it ran in. The
+/// deciding layer is there only where per-agent profiles are in force.
 fn hook_origin(
     verdict: &Value,
     agent: Option<&str>,
     cwd: Option<&str>,
     identity: Option<&Identity>,
+    deciding_layer: Option<RuleLayer>,
 ) -> DecisionOrigin {
     let mut origin = DecisionOrigin {
         channel: Some(DecisionChannel::Hook),
         agent: agent.map(str::to_string),
         project: cwd.and_then(project_name),
         rules: verdict_rules(verdict),
+        deciding_layer: deciding_layer.map(|layer| layer.as_str().to_string()),
         ..DecisionOrigin::default()
     };
     if let Some(identity) = identity {
@@ -405,6 +409,9 @@ fn mcp_origin(
         agent: agent.map(str::to_string),
         project: None,
         rules,
+        deciding_layer: decision
+            .deciding_layer
+            .map(|layer| layer.as_str().to_string()),
         ..DecisionOrigin::default()
     };
     if let Some(identity) = identity {
@@ -478,6 +485,7 @@ pub fn record_hook(
     agent: Option<&str>,
     cwd: Option<&str>,
     identity: Option<&Identity>,
+    deciding_layer: Option<RuleLayer>,
 ) {
     let (mode, outcome) = if monitor {
         (
@@ -505,7 +513,7 @@ pub fn record_hook(
         outcome,
         source_session,
         source_event_id,
-        hook_origin(verdict, agent, cwd, identity),
+        hook_origin(verdict, agent, cwd, identity, deciding_layer),
     );
 }
 
@@ -730,6 +738,39 @@ pub fn record_suppression_change(action: &str, pattern: &str, counts: (usize, us
         "session": session_id(None),
     });
     append_guard_event(&line);
+}
+
+/// Append one rule-layer change to `guard-events.jsonl`: a profile for a type
+/// of agent edited (`layer` = `agent_type`), and the same line for an
+/// exception for one instance (`instance`). The same discipline as
+/// [`record_suppression_change`]: best-effort, the value redacted, additions
+/// and removals both, so the stream says what was in force at any moment.
+pub fn record_rule_change(
+    layer: RuleLayer,
+    change: &innerwarden_agent_guard::profiles::ProfileChange,
+) {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    append_guard_event(&rule_change_line(ts, layer, change));
+}
+
+/// The `guard.profile_changed` line for one change.
+fn rule_change_line(
+    ts: u64,
+    layer: RuleLayer,
+    change: &innerwarden_agent_guard::profiles::ProfileChange,
+) -> Value {
+    serde_json::json!({
+        "kind": "guard.profile_changed",
+        "ts": ts,
+        "layer": layer.as_str(),
+        "action": change.action,
+        "agent_type": change.agent_type,
+        "value": innerwarden_agent_guard::redact::redact_secrets(&change.value).text,
+        "session": session_id(None),
+    })
 }
 
 /// The directory the local record lives in: the graph, the guard event sink and
@@ -1787,6 +1828,7 @@ mod tests {
             Some("claude-code"),
             Some("/home/dev/my-app"),
             None,
+            None,
         );
         assert_eq!(hook.channel, Some(DecisionChannel::Hook));
         assert_eq!(hook.agent.as_deref(), Some("claude-code"));
@@ -1816,6 +1858,7 @@ mod tests {
             session_id: Some("payload-session".into()),
             trust: innerwarden_agent_guard::identity::Trust::Confined,
             reason: innerwarden_agent_guard::identity::Reason::ConfinedByNamespace,
+            agent_type: Some("claude-code".into()),
         }
     }
 
@@ -1847,7 +1890,7 @@ mod tests {
     #[test]
     fn without_an_identity_a_decision_carries_no_identity_field() {
         let verdict = json!({"recommendation": "deny"});
-        let plain = hook_origin(&verdict, Some("claude-code"), Some("/w/app"), None);
+        let plain = hook_origin(&verdict, Some("claude-code"), Some("/w/app"), None, None);
         assert_eq!(
             plain,
             DecisionOrigin {
@@ -1859,7 +1902,13 @@ mod tests {
             }
         );
         let attrs = command_attrs(&plain);
-        for key in ["instance_id", "session_id", "trust", "trust_reason"] {
+        for key in [
+            "instance_id",
+            "session_id",
+            "trust",
+            "trust_reason",
+            "deciding_layer",
+        ] {
             assert!(!attrs.contains_key(key), "{key}");
         }
         let mcp = mcp_origin(&decision(false, vec![]), Some("claude-code"), None);
@@ -1875,7 +1924,13 @@ mod tests {
     fn the_shell_file_and_mcp_paths_carry_the_identity_labels() {
         let id = confined_identity();
         let verdict = json!({"recommendation": "deny"});
-        let hook = hook_origin(&verdict, Some("claude-code"), Some("/w/app"), Some(&id));
+        let hook = hook_origin(
+            &verdict,
+            Some("claude-code"),
+            Some("/w/app"),
+            Some(&id),
+            None,
+        );
         let mcp = mcp_origin(&decision(false, vec![]), Some("claude-code"), Some(&id));
         for origin in [&hook, &mcp] {
             let attrs = command_attrs(origin);
@@ -1884,6 +1939,28 @@ mod tests {
             assert_eq!(attrs["trust"], "confined");
             assert_eq!(attrs["trust_reason"], "confined_by_namespace");
         }
+    }
+
+    /// With profiles in force, the layer that decided is on the command node
+    /// from both the hook and the proxy.
+    ///
+    /// FAILS ON REVERT: leave `deciding_layer` off the origin and the key is
+    /// missing.
+    #[test]
+    fn the_deciding_layer_reaches_the_record_from_the_hook_and_the_proxy() {
+        let verdict = json!({"recommendation": "deny"});
+        let hook = hook_origin(
+            &verdict,
+            Some("claude-code"),
+            Some("/w/app"),
+            None,
+            Some(RuleLayer::AgentType),
+        );
+        assert_eq!(command_attrs(&hook)["deciding_layer"], "agent_type");
+        let mut refused = decision(false, vec![]);
+        refused.deciding_layer = Some(RuleLayer::Hard);
+        let mcp = mcp_origin(&refused, Some("claude-code"), None);
+        assert_eq!(command_attrs(&mcp)["deciding_layer"], "hard");
     }
 
     /// A label that does not have the shape of one is dropped, not repaired.
@@ -1938,7 +2015,7 @@ mod tests {
 
     #[test]
     fn agent_is_absent_without_the_flag() {
-        let origin = hook_origin(&json!({"recommendation": "allow"}), None, None, None);
+        let origin = hook_origin(&json!({"recommendation": "allow"}), None, None, None, None);
         assert_eq!(origin.agent, None);
         assert_eq!(origin.project, None);
         let mut graph = Graph::new();
@@ -2315,6 +2392,7 @@ mod tests {
             tool_name: Some("test".into()),
             tool_summary: Some("MCP · test · {}".into()),
             request_id: Some(json!(1)),
+            deciding_layer: None,
         }
     }
 

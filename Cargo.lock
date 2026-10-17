@@ -845,6 +845,7 @@ dependencies = [
  "serde_yaml",
  "tempfile",
  "tokio",
+ "toml",
  "toml_edit",
  "tracing",
  "tree-sitter",

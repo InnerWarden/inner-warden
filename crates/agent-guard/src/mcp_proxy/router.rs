@@ -51,6 +51,11 @@ pub struct ProxyDecision {
     pub tool_summary: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<Value>,
+    /// The rule layer that decided a client `tools/call`, set only when
+    /// per-agent profiles are in force ([`crate::profiles`]); `None`, and not
+    /// serialized, everywhere else.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deciding_layer: Option<crate::identity::RuleLayer>,
 }
 
 const MAX_TOOL_SUMMARY_CHARS: usize = 240;
@@ -124,6 +129,7 @@ fn route_client_to_server(
             tool_summary: Some(tool_call_summary(&name, &args)),
             tool_name: Some(safe_name),
             request_id: env.id.clone(),
+            deciding_layer: None,
         };
     }
     pass_through(Direction::ClientToServer)
@@ -151,6 +157,7 @@ fn route_server_to_client(
                 tool_name: None,
                 tool_summary: None,
                 request_id: env.id.clone(),
+                deciding_layer: None,
             }
         }
         (Some("tools/call"), Some(result)) => {
@@ -175,6 +182,7 @@ fn route_server_to_client(
                 tool_name: None,
                 tool_summary: None,
                 request_id: env.id.clone(),
+                deciding_layer: None,
             }
         }
         _ => pass_through(dir),
@@ -192,6 +200,7 @@ fn pass_through(dir: Direction) -> ProxyDecision {
         tool_name: None,
         tool_summary: None,
         request_id: None,
+        deciding_layer: None,
     }
 }
 
@@ -233,7 +242,7 @@ fn safe_tool_name(name: &str) -> String {
 
 /// Extract `(name, arguments)` from a `tools/call` request's params.
 /// Missing name → empty string; missing arguments → JSON null (never panics).
-fn extract_tool_call(env: &JsonRpcEnvelope) -> (String, Value) {
+pub(crate) fn extract_tool_call(env: &JsonRpcEnvelope) -> (String, Value) {
     let params = env.params.as_ref();
     let name = params
         .and_then(|p| p.get("name"))

@@ -331,6 +331,7 @@ mod tests {
             session_id: None,
             trust: Trust::Confined,
             reason: Reason::ConfinedByNamespace,
+            agent_type: Some("claude-code".into()),
         };
         let labelled = block_report("l", ProxyMode::Guard, &cred, Some(&id)).unwrap();
         assert_eq!(labelled["instance"], "7f3a9c1e-42");
