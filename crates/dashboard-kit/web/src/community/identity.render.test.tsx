@@ -269,7 +269,8 @@ describe("the Agents page with identity data", () => {
     const text = textOf(render(<CommunityAgents context={context()} />, withIdentity()));
     expect(text).toContain(`Instance ${ID_A}`);
     expect(text).toContain("Jail pid 2778, started at tick 1234567");
-    expect(text).toContain("Trust decided by: the hook inside the jail (launcher_not_trusted)");
+    expect(text).toContain("Trust read by: the hook inside the jail (launcher_not_trusted)");
+    expect(text).not.toContain("Trust decided by");
     expect(text).toContain("Launcher /home/dev/.local/bin/innerwarden, owned by root: no");
   });
 });
@@ -368,10 +369,20 @@ describe("a case with identity", () => {
       "Per-agent relaxations apply on Linux with Active Defence, for an agent started with innerwarden contain --identity.",
     );
     expect(textOf(html(withheld, "review", "linux", true))).toContain("Active Defence on this host did not decide this command, so your general rules decided.");
-    const kept = { ...withheld, trust_source: "host", host_decision: "0f1e2d3c4b5a69788796a5b4c3d2e1f0", host_withheld: "no_system_scope" };
+    const kept = { ...withheld, trust_source: "host", host_decision: "0f1e2d3c4b5a69788796a5b4c3d2e1f0", host_withheld: "a_word_never_heard" };
     const text = textOf(html(kept, "review", "linux", true));
     expect(text).toContain("Active Defence on this host kept your general rules for this command.");
-    expect(text).not.toContain("no_system_scope.");
+    expect(text).not.toContain("a_word_never_heard");
+    // The technical view names who read the trust and who decided the rules,
+    // and still never the host's word: the one sentence is all it says.
+    setTechnicalDetail(true);
+    const technical = textOf(html(kept, "review", "linux", true));
+    expect(technical).toContain("Trust read by: the hook inside the jail (confined_by_namespace).");
+    expect(technical).toContain("Rules decided by: Active Defence on this host (decision 0f1e2d3c4b5a69788796a5b4c3d2e1f0).");
+    expect(technical).not.toContain("Trust decided by");
+    expect(technical).not.toContain("a_word_never_heard");
+    expect(technical).not.toContain("Host word");
+    setTechnicalDetail(false);
     const none = { ...withheld, relaxation_withheld: false };
     expect(html(none, "review", "linux", true)).not.toContain("data-relaxation-withheld");
   });

@@ -194,7 +194,7 @@ Where a per-agent relaxation applies:
 - the agent was started with `innerwarden contain --identity`;
 - InnerWarden Active Defence runs on the same host with agent identity turned
   on and an active licence, and it placed the jail in a scope of its own;
-- the kernel lets Active Defence tell which scope the asking process runs in;
+- Active Defence can tell which jail the asking process belongs to;
 - shell commands your general rules sent to review (never MCP tools or file
   edits);
 - the `innerwarden` inside the jail is a version that asks the host.
@@ -203,6 +203,10 @@ Anywhere else the relaxation is recorded and not applied. Applies to shell
 commands only; MCP tools and file edits keep your general rules. A profile
 applies to any program started in a jail under its agent's name: the type is
 the name given at launch.
+
+Limits: this is not yet proven on RHEL 9 or Rocky 9, and where bubblewrap is
+older than 0.8 (or installed setuid) programs in the jail can still create user
+namespaces.
 
 ## Build from source
 

@@ -286,7 +286,7 @@ function InstanceRow({ instance, profileLabel, context }: { instance: LocalInsta
           ) : instance.technical.usernsOpenReason === undefined ? null : (
             <div>{USERNS_OPEN_WORDS[instance.technical.usernsOpenReason]}</div>
           )}
-          <div>Trust decided by: the hook inside the jail ({instance.trustReason === "" ? "no reason recorded" : instance.trustReason})</div>
+          <div>Trust read by: the hook inside the jail ({instance.trustReason === "" ? "no reason recorded" : instance.trustReason})</div>
         </dl>
       </TechnicalOnly>
     </li>
