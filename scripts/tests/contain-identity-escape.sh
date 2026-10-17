@@ -13,12 +13,14 @@
 #
 # The run FAILS (exit 1) when any of a, b or c works, when the jail's cgroup
 # changed, when the record is missing, writable from inside, or not the
-# launcher's own copy, when the PID namespace inside is not the one the record
-# names, when the agent's command line or the jail's environment did not reach
+# launcher's own copy, when the PID or mount namespace inside is not the one
+# the record names, when the launcher's records folder is visible inside, when
+# the hook is not told the agent, when the agent's command line or the jail's environment did not reach
 # the jail as the launcher set them, or when the instance has no user scope
 # (set IW_ESCAPE_ALLOW_NO_SCOPE=1 on a host with no user service manager, where
 # that is the expected fallback).
-# d) /run inside and f) abstract sockets visible inside are printed, not judged.
+# d) /run inside, f) abstract sockets visible inside and g) whether the jail
+# can make a user namespace of its own are printed, not judged.
 #
 # Usage:
 #   scripts/tests/contain-identity-escape.sh [path/to/innerwarden]
@@ -50,6 +52,12 @@ mkdir -p "$project"
 cat >"$project/probe.sh" <<'PROBE'
 rec=/run/innerwarden/instance.json
 echo "ns=$(readlink /proc/self/ns/pid)"
+echo "mnt=$(readlink /proc/self/ns/mnt)"
+echo "hook_agent=${IW_HOOK_AGENT:-}"
+state="${XDG_STATE_HOME:-}"
+case "$state" in /*) ;; *) state="$HOME/.local/state" ;; esac
+echo "records_seen=$(ls -A "$state/innerwarden/instances" 2>/dev/null | wc -l | tr -d ' ')"
+if unshare -Urm true >/dev/null 2>&1; then echo "g_nested_userns=1"; else echo "g_nested_userns=0"; fi
 before=$(sed -n 's/^0:://p' /proc/self/cgroup)
 echo "cgroup_before=$before"
 if [ -r "$rec" ]; then echo "record=$(cat "$rec")"; else echo "record="; fi
@@ -126,6 +134,15 @@ recorded_ns="$(printf '%s' "$record" | sed -n 's/.*"pid_ns":\([0-9]*\).*/\1/p')"
 check "pid_ns inside = record" "$([ -n "$ns" ] && [ "$ns" = "$recorded_ns" ] && echo 0 || echo 1)" "inside ${ns:-none}, record ${recorded_ns:-none}"
 host_ns="$(readlink /proc/self/ns/pid | sed -n 's/^pid:\[\([0-9]*\)\]$/\1/p')"
 check "pid_ns inside != host" "$([ -n "$ns" ] && [ "$ns" != "$host_ns" ] && echo 0 || echo 1)" "host $host_ns"
+mnt="$(value mnt | sed -n 's/^mnt:\[\([0-9]*\)\]$/\1/p')"
+recorded_mnt="$(printf '%s' "$record" | sed -n 's/.*"mnt_ns":\([0-9]*\).*/\1/p')"
+check "mnt_ns inside = record" "$([ -n "$mnt" ] && [ "$mnt" = "$recorded_mnt" ] && echo 0 || echo 1)" "inside ${mnt:-none}, record ${recorded_mnt:-none}"
+host_mnt="$(readlink /proc/self/ns/mnt | sed -n 's/^mnt:\[\([0-9]*\)\]$/\1/p')"
+check "mnt_ns inside != host" "$([ -n "$mnt" ] && [ "$mnt" != "$host_mnt" ] && echo 0 || echo 1)" "host $host_mnt"
+seen_records="$(value records_seen)"
+check "launcher records hidden inside" "$([ "$seen_records" = "0" ] && echo 0 || echo 1)" "entries=${seen_records:-none}"
+hook_agent="$(value hook_agent)"
+check "hook told the agent" "$([ "$hook_agent" = "claude-code" ] && echo 0 || echo 1)" "IW_HOOK_AGENT=${hook_agent:-unset}"
 
 w="$(value record_writable)"
 check "record read-only inside" "$([ "$w" = "0" ] && echo 0 || echo 1)" "writable=${w:-none}"
@@ -160,6 +177,7 @@ fi
 echo
 echo "INFO  d) /run inside: $(value d_run_entries)"
 echo "INFO  f) abstract unix sockets visible inside: $(value f_abstract_sockets)"
+echo "INFO  g) jail can make its own user namespace (unshare -Urm): $(value g_nested_userns)"
 echo "INFO  systemd: $(systemd-run --version 2>/dev/null | head -n 1) / bwrap: $(bwrap --version 2>/dev/null)"
 echo "INFO  kernel: $(uname -r)"
 

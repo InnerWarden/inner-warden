@@ -57,6 +57,11 @@ pub const IDENTITY_FLAG: &str = "--identity";
 /// the launcher, so the agent inside cannot rewrite it.
 pub const JAIL_RECORD_PATH: &str = "/run/innerwarden/instance.json";
 
+/// The variable the launcher sets inside an identified jail to the agent it
+/// started the jail for. The hook holds the record's type to it, as it holds
+/// it to its own line's `--agent`: a label that can only lower a level.
+pub const HOOK_AGENT_ENV: &str = "IW_HOOK_AGENT";
+
 /// The directory, under the user's state home, where the launcher keeps one
 /// record per instance OUTSIDE the jail (`<state home>/innerwarden/instances`).
 pub const LAUNCHER_RECORD_DIR: &str = "innerwarden/instances";
@@ -309,6 +314,10 @@ pub struct Jail {
     pub start_ticks: u64,
     /// Inode of the jail's PID namespace. `0` when the backend has none.
     pub pid_ns: u64,
+    /// Inode of the jail's mount namespace, the one its root is built in.
+    /// `0` when the backend has none. A process in the jail that sees another
+    /// mount namespace sees a filesystem the launcher did not build.
+    pub mnt_ns: u64,
 }
 
 /// A dedicated scope the jail was in, as the launcher read it from the kernel
@@ -486,6 +495,19 @@ impl LaunchRecord {
             }
             _ => {}
         }
+        match self.jail.backend {
+            JailBackend::Bwrap if self.jail.mnt_ns == 0 => {
+                return Err(RecordError::Invalid(
+                    "jail.mnt_ns is missing for a namespace backend",
+                ));
+            }
+            JailBackend::SandboxExec if self.jail.mnt_ns != 0 => {
+                return Err(RecordError::Invalid(
+                    "jail.mnt_ns set for a backend with no namespace",
+                ));
+            }
+            _ => {}
+        }
         if let Some(scopes) = &self.scope {
             self.validate_scopes(scopes)?;
         }
@@ -610,6 +632,9 @@ pub struct InJailFacts<'a> {
     /// Inode of the hook's own PID namespace (`/proc/self/ns/pid`), `None` if it
     /// could not be read.
     pub own_pid_ns: Option<u64>,
+    /// Inode of the hook's own mount namespace (`/proc/self/ns/mnt`), `None` if
+    /// it could not be read.
+    pub own_mnt_ns: Option<u64>,
 }
 
 /// Why [`judge_trust_in_jail`] gave the level it gave.
@@ -633,8 +658,17 @@ pub enum Reason {
     HostNamespaceRecorded,
     OwnNamespaceUnreadable,
     NamespaceMismatch,
+    OwnMountNamespaceUnreadable,
+    /// Same PID namespace, another mount namespace: the process sees a
+    /// filesystem the launcher did not build. A program in the jail that makes
+    /// a mount namespace of its own, for whatever reason, is here too: what it
+    /// sees at the record's place is no longer the launcher's word.
+    MountNamespaceMismatch,
     /// The record names another kind of agent than the hook line was wired for.
     AgentMismatch,
+    /// Neither the hook line nor the launcher named the agent the hook serves,
+    /// so nothing holds the record's type to the hook that reads it.
+    AgentNotNamed,
 }
 
 impl Reason {
@@ -650,7 +684,10 @@ impl Reason {
             Reason::HostNamespaceRecorded => "host_namespace_recorded",
             Reason::OwnNamespaceUnreadable => "own_namespace_unreadable",
             Reason::NamespaceMismatch => "namespace_mismatch",
+            Reason::OwnMountNamespaceUnreadable => "own_mount_namespace_unreadable",
+            Reason::MountNamespaceMismatch => "mount_namespace_mismatch",
             Reason::AgentMismatch => "agent_mismatch",
+            Reason::AgentNotNamed => "agent_not_named",
         }
     }
 }
@@ -668,9 +705,11 @@ impl Reason {
 /// | 5 | record names the initial PID namespace | declared | `HostNamespaceRecorded` |
 /// | 6 | own namespace unreadable | declared | `OwnNamespaceUnreadable` |
 /// | 7 | own namespace is not the recorded one | declared | `NamespaceMismatch` |
-/// | 8 | same namespace, launcher not root-owned | observed | `LauncherNotTrusted` |
-/// | 9 | same namespace, launcher root-owned, no scope recorded | observed | `NoScope` |
-/// | 10 | same namespace, launcher root-owned, a scope recorded | confined | `ConfinedByNamespace` |
+/// | 7a | own mount namespace unreadable | declared | `OwnMountNamespaceUnreadable` |
+/// | 7b | own mount namespace is not the recorded one | declared | `MountNamespaceMismatch` |
+/// | 8 | same namespaces, launcher not root-owned | observed | `LauncherNotTrusted` |
+/// | 9 | same namespaces, launcher root-owned, no scope recorded | observed | `NoScope` |
+/// | 10 | same namespaces, launcher root-owned, a scope recorded | confined | `ConfinedByNamespace` |
 ///
 /// Why each row is the way it is:
 ///
@@ -680,6 +719,11 @@ impl Reason {
 ///   otherwise make every process on the machine "match".
 /// * 7: a record copied into a place the launcher never put it describes
 ///   another process's jail.
+/// * 7a, 7b: the record sits on a mount of the jail's root. A process in a
+///   mount namespace other than the jail's sees whatever that namespace put
+///   there, even with the PID namespace unchanged; a child that legitimately
+///   makes its own (a nested sandbox, a build tool) is in that case too, and
+///   is reported as not the launcher's jail rather than guessed to be.
 /// * 8 is a ceiling, not a bonus: with a launcher the user's own programs can
 ///   replace, the record proves where this process runs and not who built the
 ///   boundary. Nothing here reaches `confined` from a per-user install.
@@ -715,6 +759,12 @@ pub fn judge_trust_in_jail(facts: InJailFacts<'_>) -> (Trust, Reason) {
     if own != record.jail.pid_ns {
         return (Trust::Declared, Reason::NamespaceMismatch);
     }
+    let Some(own_mnt) = facts.own_mnt_ns else {
+        return (Trust::Declared, Reason::OwnMountNamespaceUnreadable);
+    };
+    if own_mnt != record.jail.mnt_ns {
+        return (Trust::Declared, Reason::MountNamespaceMismatch);
+    }
     if !record.launcher.root_owned {
         return (Trust::Observed, Reason::LauncherNotTrusted);
     }
@@ -726,22 +776,25 @@ pub fn judge_trust_in_jail(facts: InJailFacts<'_>) -> (Trust, Reason) {
 
 /// Hold a level to the agent the hook line was wired for.
 ///
-/// The hook line (`--agent <id>`) and the record both name a kind of agent. When
-/// the line names one and the record names another, one of the two is not what
-/// it says, and neither is evidence: the level drops to `declared` with
-/// [`Reason::AgentMismatch`]. A line that names no agent leaves the level
-/// alone, and so does a level that is already `declared`, whose first reason
-/// stays the one reported.
+/// The hook (its line's `--agent <id>`, or the launcher's word for the agent
+/// it started) and the record both name a kind of agent. When they name two,
+/// one of the two is not what it says, and neither is evidence: the level drops
+/// to `declared` with [`Reason::AgentMismatch`]. When the hook names none,
+/// nothing ties the record's type to this hook, and the level drops to
+/// `declared` with [`Reason::AgentNotNamed`]. A level that is already
+/// `declared` keeps its first reason.
 pub fn judge_agent_claim(
     judged: (Trust, Reason),
     record_agent: &str,
     hook_agent: Option<&str>,
 ) -> (Trust, Reason) {
+    if judged.0 == Trust::Declared {
+        return judged;
+    }
     match hook_agent {
-        Some(wired) if judged.0 > Trust::Declared && wired != record_agent => {
-            (Trust::Declared, Reason::AgentMismatch)
-        }
-        _ => judged,
+        Some(wired) if wired == record_agent => judged,
+        Some(_) => (Trust::Declared, Reason::AgentMismatch),
+        None => (Trust::Declared, Reason::AgentNotNamed),
     }
 }
 
@@ -975,7 +1028,7 @@ mod tests {
   "project": "my-app",
   "mode": "enforce",
   "started_at": "2026-10-16T09:30:00Z",
-  "jail": { "backend": "bwrap", "pid": 48211, "start_ticks": 9120344, "pid_ns": 4026532871 },
+  "jail": { "backend": "bwrap", "pid": 48211, "start_ticks": 9120344, "pid_ns": 4026532871, "mnt_ns": 4026532869 },
   "scope": {
     "user": {
       "unit": "innerwarden-contain-7f3a9c1e-42.scope",
@@ -1005,6 +1058,7 @@ mod tests {
         let record = golden();
         assert_eq!(record.agent_type, "claude-code");
         assert_eq!(record.jail.pid_ns, 4026532871);
+        assert_eq!(record.jail.mnt_ns, 4026532869);
         assert!(record.launcher.root_owned);
         assert_eq!(serde_json::to_value(&record).unwrap(), golden_json());
     }
@@ -1050,7 +1104,7 @@ mod tests {
         assert_eq!(keys(&value["launcher"]), ["path", "root_owned", "version"]);
         assert_eq!(
             keys(&value["jail"]),
-            ["backend", "pid", "pid_ns", "start_ticks"]
+            ["backend", "mnt_ns", "pid", "pid_ns", "start_ticks"]
         );
         assert_eq!(keys(&value["scope"]), ["system", "user"]);
         assert_eq!(keys(&value["scope"]["user"]), ["cgroup_path", "unit"]);
@@ -1228,6 +1282,7 @@ mod tests {
             ("jail.pid", vec!["jail", "pid"], json!(0)),
             ("jail.start_ticks", vec!["jail", "start_ticks"], json!(0)),
             ("jail.pid_ns", vec!["jail", "pid_ns"], json!(0)),
+            ("jail.mnt_ns", vec!["jail", "mnt_ns"], json!(0)),
             (
                 "scope.user.unit",
                 vec!["scope", "user", "unit"],
@@ -1266,6 +1321,7 @@ mod tests {
                 parse_value(&value),
                 Err(RecordError::Invalid(match field {
                     "jail.pid_ns" => "jail.pid_ns is missing for a PID namespace backend",
+                    "jail.mnt_ns" => "jail.mnt_ns is missing for a namespace backend",
                     other => other,
                 })),
                 "{field} = {bad}"
@@ -1524,6 +1580,8 @@ mod tests {
         value["jail"]["backend"] = json!("sandbox-exec");
         assert!(matches!(parse_value(&value), Err(RecordError::Invalid(_))));
         value["jail"]["pid_ns"] = json!(0);
+        assert!(matches!(parse_value(&value), Err(RecordError::Invalid(_))));
+        value["jail"]["mnt_ns"] = json!(0);
         assert!(parse_value(&value).is_ok());
     }
 
@@ -1551,16 +1609,19 @@ mod tests {
         assert_eq!(IDENTITY_FLAG, "--identity");
         assert_eq!(JAIL_RECORD_PATH, "/run/innerwarden/instance.json");
         assert_eq!(LAUNCHER_RECORD_DIR, "innerwarden/instances");
+        assert_eq!(HOOK_AGENT_ENV, "IW_HOOK_AGENT");
     }
 
     // -- trust inside the jail ---------------------------------------------
 
     const OWN_NS: u64 = 4026532871;
+    const OWN_MNT: u64 = 4026532869;
 
     fn facts<'a>(record: &'a LaunchRecord, read_only: bool, own: Option<u64>) -> InJailFacts<'a> {
         InJailFacts {
             record: RecordRead::Present { record, read_only },
             own_pid_ns: own,
+            own_mnt_ns: Some(OWN_MNT),
         }
     }
 
@@ -1612,6 +1673,7 @@ mod tests {
         let judged = judge_trust_in_jail(InJailFacts {
             record: RecordRead::Absent,
             own_pid_ns: Some(OWN_NS),
+            own_mnt_ns: Some(OWN_MNT),
         });
         assert_eq!(judged, (Trust::Declared, Reason::NoRecord));
     }
@@ -1621,6 +1683,7 @@ mod tests {
         let judged = judge_trust_in_jail(InJailFacts {
             record: RecordRead::Unreadable,
             own_pid_ns: Some(OWN_NS),
+            own_mnt_ns: Some(OWN_MNT),
         });
         assert_eq!(judged, (Trust::Declared, Reason::RecordUnreadable));
     }
@@ -1651,6 +1714,7 @@ mod tests {
         let mut record = golden();
         record.jail.backend = JailBackend::SandboxExec;
         record.jail.pid_ns = 0;
+        record.jail.mnt_ns = 0;
         assert_eq!(
             judge_trust_in_jail(facts(&record, true, Some(OWN_NS))),
             (Trust::Declared, Reason::NoNamespaceOnBackend)
@@ -1689,6 +1753,56 @@ mod tests {
             assert_eq!(
                 judge_trust_in_jail(facts(&record, true, Some(other))),
                 (Trust::Declared, Reason::NamespaceMismatch),
+                "{other}"
+            );
+        }
+    }
+
+    /// Row 7 for a nested PID namespace: a process that made its own (for
+    /// example `unshare -Upf`) reads a namespace that is not the recorded one.
+    #[test]
+    fn row_7_a_nested_pid_namespace_is_not_the_recorded_one() {
+        let record = golden();
+        let nested = OWN_NS + 7;
+        let mut facts = facts(&record, true, Some(nested));
+        facts.own_mnt_ns = Some(OWN_MNT);
+        assert_eq!(
+            judge_trust_in_jail(facts),
+            (Trust::Declared, Reason::NamespaceMismatch)
+        );
+    }
+
+    /// Row 7a: the namespace that holds the record's mount cannot be read.
+    ///
+    /// FAILS ON REVERT: drop the mount namespace rows from
+    /// `judge_trust_in_jail` and this is `confined`.
+    #[test]
+    fn row_7a_an_unreadable_own_mount_namespace_is_declared() {
+        let record = golden();
+        let mut facts = facts(&record, true, Some(OWN_NS));
+        facts.own_mnt_ns = None;
+        assert_eq!(
+            judge_trust_in_jail(facts),
+            (Trust::Declared, Reason::OwnMountNamespaceUnreadable)
+        );
+    }
+
+    /// Row 7b: same PID namespace, another mount namespace. A process in the
+    /// jail that made a mount namespace of its own (`unshare -Urm`, a nested
+    /// sandbox) sees a filesystem the launcher did not build, and whatever is
+    /// at the record's place there is not the launcher's word.
+    ///
+    /// FAILS ON REVERT: drop the mount namespace rows from
+    /// `judge_trust_in_jail` and every case here is `confined`.
+    #[test]
+    fn row_7b_another_mount_namespace_in_the_same_pid_namespace_is_declared() {
+        let record = golden();
+        for other in [OWN_MNT + 1, OWN_MNT - 1, 1, OWN_NS] {
+            let mut facts = facts(&record, true, Some(OWN_NS));
+            facts.own_mnt_ns = Some(other);
+            assert_eq!(
+                judge_trust_in_jail(facts),
+                (Trust::Declared, Reason::MountNamespaceMismatch),
                 "{other}"
             );
         }
@@ -1733,25 +1847,31 @@ mod tests {
                 ] {
                     for backend_bwrap in [false, true] {
                         for scoped in [false, true] {
-                            let mut record = golden();
-                            record.launcher.root_owned = root_owned;
-                            if !backend_bwrap {
-                                record.jail.backend = JailBackend::SandboxExec;
-                                record.jail.pid_ns = 0;
-                            }
-                            if !scoped {
-                                record.scope = None;
-                            }
-                            let judged = judge_trust_in_jail(facts(&record, read_only, own)).0;
-                            if judged == Trust::Confined {
-                                confined += 1;
-                                assert!(
-                                    root_owned
-                                        && read_only
-                                        && backend_bwrap
-                                        && scoped
-                                        && own == Some(OWN_NS)
-                                );
+                            for own_mnt in [None, Some(OWN_MNT), Some(OWN_MNT + 1)] {
+                                let mut record = golden();
+                                record.launcher.root_owned = root_owned;
+                                if !backend_bwrap {
+                                    record.jail.backend = JailBackend::SandboxExec;
+                                    record.jail.pid_ns = 0;
+                                    record.jail.mnt_ns = 0;
+                                }
+                                if !scoped {
+                                    record.scope = None;
+                                }
+                                let mut facts = facts(&record, read_only, own);
+                                facts.own_mnt_ns = own_mnt;
+                                let judged = judge_trust_in_jail(facts).0;
+                                if judged == Trust::Confined {
+                                    confined += 1;
+                                    assert!(
+                                        root_owned
+                                            && read_only
+                                            && backend_bwrap
+                                            && scoped
+                                            && own == Some(OWN_NS)
+                                            && own_mnt == Some(OWN_MNT)
+                                    );
+                                }
                             }
                         }
                     }
@@ -1774,7 +1894,10 @@ mod tests {
             Reason::HostNamespaceRecorded,
             Reason::OwnNamespaceUnreadable,
             Reason::NamespaceMismatch,
+            Reason::OwnMountNamespaceUnreadable,
+            Reason::MountNamespaceMismatch,
             Reason::AgentMismatch,
+            Reason::AgentNotNamed,
         ] {
             assert_eq!(
                 serde_json::to_value(reason).unwrap(),
@@ -1796,7 +1919,6 @@ mod tests {
                 judge_agent_claim(judged, "claude-code", Some("claude-code")),
                 judged
             );
-            assert_eq!(judge_agent_claim(judged, "claude-code", None), judged);
         }
         // Already declared: the first reason stays.
         let first = (Trust::Declared, Reason::NamespaceMismatch);
@@ -1804,6 +1926,27 @@ mod tests {
             judge_agent_claim(first, "claude-code", Some("cursor")),
             first
         );
+    }
+
+    /// A hook that names no agent cannot be held to the record's type, so it
+    /// earns nothing above `declared` from the record.
+    ///
+    /// FAILS ON REVERT: let `judge_agent_claim` leave the level alone when
+    /// `hook_agent` is `None`, and the confined and observed cases keep their
+    /// level.
+    #[test]
+    fn a_hook_that_names_no_agent_is_declared() {
+        for judged in [
+            (Trust::Confined, Reason::ConfinedByNamespace),
+            (Trust::Observed, Reason::NoScope),
+        ] {
+            assert_eq!(
+                judge_agent_claim(judged, "claude-code", None),
+                (Trust::Declared, Reason::AgentNotNamed)
+            );
+        }
+        let first = (Trust::Declared, Reason::RecordWritable);
+        assert_eq!(judge_agent_claim(first, "claude-code", None), first);
     }
 
     // -- the layers ---------------------------------------------------------

@@ -296,6 +296,14 @@ pub struct JailInputs {
     ///
     /// [`JAIL_RECORD_PATH`]: innerwarden_agent_guard::identity::JAIL_RECORD_PATH
     pub record_fd: Option<i32>,
+    /// The launcher's own records directory, as named and as resolved, hidden
+    /// inside an identified jail: the agent works in a home that holds it.
+    /// Empty unless the launch asked for an identity record.
+    pub records_dirs: Vec<PathBuf>,
+    /// Variables the launcher keeps out of the programs it runs to start the
+    /// jail, handed to the jail's command as they were ([`launch_env`]).
+    /// Empty unless the launch asked for an identity record.
+    pub child_env: Vec<(String, String)>,
 }
 
 impl JailInputs {
@@ -561,6 +569,17 @@ pub fn build_linux_jail(input: &JailInputs) -> Result<LinuxJailPlan, ContainErro
         push(&["--tmpfs", &dest]);
     }
 
+    // --- the launcher's records directory, hidden (`--identity` only). It is
+    // under the home's `.local`, which the agent may write, and it holds the
+    // record the launcher keeps of every instance. After every writable bind,
+    // so none of them brings it back. ---
+    if input.args.identity {
+        for dir in &input.records_dirs {
+            let dest = dir.to_string_lossy().to_string();
+            push(&["--tmpfs", &dest]);
+        }
+    }
+
     // --- nested project-secret masks, AFTER the project bind (last-wins). The I/O
     // layer glob-expanded + statted `deny_read` into `deny_paths`. A DIRECTORY is
     // masked with a tmpfs; a FILE is masked by binding /dev/null over it - a tmpfs
@@ -596,6 +615,13 @@ pub fn build_linux_jail(input: &JailInputs) -> Result<LinuxJailPlan, ContainErro
     push(&["--hostname", "ai-sandbox"]);
     if !input.stdin_is_tty {
         push(&["--new-session"]);
+    }
+    // The command's own `PATH` and loader variables, which the launcher kept
+    // out of the programs that start the jail (`--identity` only).
+    if input.args.identity {
+        for (name, value) in &input.child_env {
+            push(&["--setenv", name, value]);
+        }
     }
     // Only an identified launch asks bwrap to report the jail's pid. Last before
     // the terminator, so no earlier option depends on it and none is moved.
@@ -826,8 +852,12 @@ pub fn build_macos_profile(input: &JailInputs) -> Result<MacosJailPlan, ContainE
 /// DISABLE the LLM second-opinion + notify inside the jail (their config lives in
 /// the shadowed `~/.config/innerwarden`, so they must not be reached - blocking
 /// still works from the embedded rules). `IW_GUARD_SESSION` groups the narrative.
+///
+/// With `--identity` the hook is also told the agent the jail was started for
+/// (`IW_HOOK_AGENT`), so a hook wired for another agent, or for none, is not
+/// held to the record of this one.
 pub fn compute_jail_env(input: &JailInputs) -> Vec<(String, String)> {
-    vec![
+    let mut env = vec![
         (
             "IW_GRAPH_FILE".to_string(),
             input.jail_graph_file().to_string_lossy().to_string(),
@@ -835,7 +865,58 @@ pub fn compute_jail_env(input: &JailInputs) -> Vec<(String, String)> {
         ("IW_LLM_CONFIG".to_string(), String::new()),
         ("IW_NOTIFY_CONFIG".to_string(), String::new()),
         ("IW_GUARD_SESSION".to_string(), JAIL_SESSION.to_string()),
-    ]
+    ];
+    if input.args.identity {
+        env.push((
+            innerwarden_agent_guard::identity::HOOK_AGENT_ENV.to_string(),
+            input.args.agent.clone(),
+        ));
+    }
+    env
+}
+
+/// The `PATH` of the programs the launcher runs to start an identified jail
+/// (`systemd-run`, bwrap). Each is run by an absolute path already; a fixed
+/// `PATH` of root-owned directories keeps a folder the user can write from
+/// deciding anything they run on the way.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub const HELPER_PATH: &str = "/usr/bin:/bin";
+
+/// What [`launch_env`] decided about the launcher's environment.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LaunchEnv {
+    /// Taken out of the helpers' environment: every dynamic loader variable
+    /// (`LD_*`), which would load the user's code into a root-owned helper.
+    pub helper_remove: Vec<std::ffi::OsString>,
+    /// Handed to the jail's command as it was (`--setenv`), so the agent runs
+    /// in the environment it was started with: `PATH` and the loader
+    /// variables. A value that is not text cannot be passed on an argument
+    /// line and is left out.
+    pub child_env: Vec<(String, String)>,
+}
+
+/// PURE. Split the launcher's environment for an identified launch: the
+/// helpers get [`HELPER_PATH`] and no loader variable; the jail's command gets
+/// back exactly the `PATH` and loader variables the launcher was given.
+pub fn launch_env<I>(vars: I) -> LaunchEnv
+where
+    I: IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+{
+    let mut out = LaunchEnv::default();
+    for (name, value) in vars {
+        let loader = name.as_encoded_bytes().starts_with(b"LD_");
+        if loader {
+            out.helper_remove.push(name.clone());
+        }
+        if loader || name == "PATH" {
+            if let (Some(name), Some(value)) = (name.to_str(), value.to_str()) {
+                out.child_env.push((name.to_string(), value.to_string()));
+            }
+        }
+    }
+    out.helper_remove.sort();
+    out.child_env.sort();
+    out
 }
 
 /// Ubuntu 24.04 and later restrict unprivileged user namespaces
@@ -1127,6 +1208,8 @@ pub mod launch {
         pub child_pid: u32,
         /// bwrap's own word for the jail's PID namespace inode, if it gave one.
         pub pid_namespace: Option<u64>,
+        /// bwrap's own word for the jail's mount namespace inode, if it gave one.
+        pub mnt_namespace: Option<u64>,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1166,6 +1249,8 @@ pub mod launch {
             child_pid: Option<u64>,
             #[serde(rename = "pid-namespace")]
             pid_namespace: Option<u64>,
+            #[serde(rename = "mnt-namespace")]
+            mnt_namespace: Option<u64>,
         }
         let wire: Wire =
             serde_json::from_slice(bytes).map_err(|e| InfoError::Malformed(e.to_string()))?;
@@ -1177,6 +1262,7 @@ pub mod launch {
         Ok(InfoFd {
             child_pid,
             pid_namespace: wire.pid_namespace,
+            mnt_namespace: wire.mnt_namespace,
         })
     }
 
@@ -1191,7 +1277,22 @@ pub mod launch {
 
     /// The inode in a namespace link such as `pid:[4026532222]`.
     pub fn parse_ns_link(link: &str) -> Option<u64> {
-        let rest = link.trim().strip_prefix("pid:[")?.strip_suffix(']')?;
+        parse_ns_link_of("pid", link)
+    }
+
+    /// The inode in a mount namespace link such as `mnt:[4026532218]`.
+    pub fn parse_mnt_ns_link(link: &str) -> Option<u64> {
+        parse_ns_link_of("mnt", link)
+    }
+
+    /// The inode in a `<kind>:[<inode>]` link. Another kind of namespace's
+    /// link is not this one.
+    fn parse_ns_link_of(kind: &str, link: &str) -> Option<u64> {
+        let rest = link
+            .trim()
+            .strip_prefix(kind)?
+            .strip_prefix(":[")?
+            .strip_suffix(']')?;
         if rest.is_empty() || !rest.bytes().all(|b| b.is_ascii_digit()) {
             return None;
         }
@@ -1247,6 +1348,10 @@ pub mod launch {
         pub start_ticks: u64,
         /// `/proc/<child-pid>/ns/pid`, read by the launcher.
         pub pid_ns: u64,
+        /// `/proc/<child-pid>/ns/mnt`, read by the launcher.
+        pub mnt_ns: u64,
+        /// `/proc/self/ns/mnt` of the launcher, `None` if it could not be read.
+        pub launcher_mnt_ns: Option<u64>,
         /// The scopes the kernel showed the jail in ([`user_scope_seen`],
         /// [`system_scope_seen`]); empty for none.
         pub scope: Scopes,
@@ -1259,6 +1364,11 @@ pub mod launch {
         NoPidNamespace,
         /// bwrap and the host disagree about the jail's namespace.
         NamespaceDisagrees,
+        /// The jail process has no mount namespace of its own, or it could not
+        /// be told apart from the launcher's.
+        NoMountNamespace,
+        /// bwrap and the host disagree about the jail's mount namespace.
+        MountNamespaceDisagrees,
         /// The launcher path is not valid UTF-8.
         LauncherPathNotUtf8,
         /// The project has no folder name to record.
@@ -1279,6 +1389,13 @@ pub mod launch {
                         "bwrap and the host disagree about the jail's PID namespace"
                     )
                 }
+                AssembleError::NoMountNamespace => {
+                    write!(f, "the jail process is not in a mount namespace of its own")
+                }
+                AssembleError::MountNamespaceDisagrees => write!(
+                    f,
+                    "bwrap and the host disagree about the jail's mount namespace"
+                ),
                 AssembleError::LauncherPathNotUtf8 => write!(f, "the launcher path is not UTF-8"),
                 AssembleError::NoProjectName => write!(f, "the project has no folder name"),
                 AssembleError::Record(e) => write!(f, "{e}"),
@@ -1300,6 +1417,19 @@ pub mod launch {
             .is_some_and(|ns| ns != facts.pid_ns)
         {
             return Err(AssembleError::NamespaceDisagrees);
+        }
+        // The launcher's own mount namespace must be known to be another one:
+        // otherwise the jail's root is the launcher's filesystem, not one it
+        // built.
+        if facts.mnt_ns == 0 || facts.launcher_mnt_ns.is_none_or(|own| own == facts.mnt_ns) {
+            return Err(AssembleError::NoMountNamespace);
+        }
+        if facts
+            .info
+            .mnt_namespace
+            .is_some_and(|ns| ns != facts.mnt_ns)
+        {
+            return Err(AssembleError::MountNamespaceDisagrees);
         }
         let launcher_path = facts
             .launcher_path
@@ -1330,6 +1460,7 @@ pub mod launch {
                 pid: facts.info.child_pid,
                 start_ticks: facts.start_ticks,
                 pid_ns: facts.pid_ns,
+                mnt_ns: facts.mnt_ns,
             },
             scope: (!facts.scope.is_empty()).then_some(facts.scope),
         };
@@ -1547,6 +1678,8 @@ mod tests {
             ],
             info_fd: None,
             record_fd: None,
+            records_dirs: vec![],
+            child_env: vec![],
         }
     }
 
@@ -1981,13 +2114,17 @@ mod tests {
             parse_info_fd(real).unwrap(),
             InfoFd {
                 child_pid: 2778,
-                pid_namespace: Some(4026532220)
+                pid_namespace: Some(4026532220),
+                mnt_namespace: Some(4026532218),
             }
         );
-        // newer bwrap fields are ignored, the namespace is optional
+        // newer bwrap fields are ignored, the namespaces are optional
         let more = br#"{"child-pid": 5, "cgroup-namespace": 1, "future": [1,2]}"#;
         let got = parse_info_fd(more).unwrap();
-        assert_eq!((got.child_pid, got.pid_namespace), (5, None));
+        assert_eq!(
+            (got.child_pid, got.pid_namespace, got.mnt_namespace),
+            (5, None, None)
+        );
         assert_eq!(parse_info_fd(b""), Err(InfoError::Empty));
         assert_eq!(parse_info_fd(b" \n"), Err(InfoError::Empty));
         assert_eq!(parse_info_fd(b"{}"), Err(InfoError::NoChildPid));
@@ -2046,6 +2183,24 @@ mod tests {
     }
 
     #[test]
+    fn mount_namespace_link_is_parsed_strictly() {
+        use launch::parse_mnt_ns_link;
+        assert_eq!(parse_mnt_ns_link("mnt:[4026532218]"), Some(4026532218));
+        assert_eq!(parse_mnt_ns_link("mnt:[4026532218]\n"), Some(4026532218));
+        for bad in [
+            "",
+            "mnt:[]",
+            "mnt:[12x]",
+            "pid:[4026532218]",
+            "mntx:[1]",
+            "mnt:[1",
+            "mnt:[-1]",
+        ] {
+            assert_eq!(parse_mnt_ns_link(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
     fn instance_id_is_thirty_two_lowercase_hex_and_a_valid_name() {
         use launch::*;
         let id = instance_id_from([0xab; 16]);
@@ -2095,9 +2250,12 @@ mod tests {
             info: launch::InfoFd {
                 child_pid: 2778,
                 pid_namespace: Some(4026532220),
+                mnt_namespace: Some(4026532218),
             },
             start_ticks: 123456,
             pid_ns: 4026532220,
+            mnt_ns: 4026532218,
+            launcher_mnt_ns: Some(4026531841),
             scope: Default::default(),
         }
     }
@@ -2119,8 +2277,13 @@ mod tests {
         assert!(record.launcher.root_owned);
         assert_eq!(record.jail.backend, JailBackend::Bwrap);
         assert_eq!(
-            (record.jail.pid, record.jail.start_ticks, record.jail.pid_ns),
-            (2778, 123456, 4026532220)
+            (
+                record.jail.pid,
+                record.jail.start_ticks,
+                record.jail.pid_ns,
+                record.jail.mnt_ns
+            ),
+            (2778, 123456, 4026532220, 4026532218)
         );
         assert!(
             record.scope.is_none(),
@@ -2176,6 +2339,30 @@ mod tests {
             launch::assemble_record(split),
             Err(AssembleError::NamespaceDisagrees)
         );
+        // the jail's mount namespace is the launcher's own, unknown, or not
+        // the one bwrap named: no record names a root the launcher did not
+        // build
+        for (jail, launcher_ns) in [
+            (4026531841, Some(4026531841)),
+            (0, Some(4026531841)),
+            (4026532218, None),
+        ] {
+            let mut shared = launch_facts(&mode, launcher, project);
+            shared.mnt_ns = jail;
+            shared.info.mnt_namespace = None;
+            shared.launcher_mnt_ns = launcher_ns;
+            assert_eq!(
+                launch::assemble_record(shared),
+                Err(AssembleError::NoMountNamespace),
+                "{jail} {launcher_ns:?}"
+            );
+        }
+        let mut split_mnt = launch_facts(&mode, launcher, project);
+        split_mnt.info.mnt_namespace = Some(4026532999);
+        assert_eq!(
+            launch::assemble_record(split_mnt),
+            Err(AssembleError::MountNamespaceDisagrees)
+        );
         // facts that make an invalid record are refused, not written
         let mut no_time = launch_facts(&mode, launcher, project);
         no_time.start_ticks = 0;
@@ -2214,6 +2401,7 @@ mod tests {
         "--unshare-ipc",
         "--hostname",
         "--new-session",
+        "--setenv",
         "--info-fd",
     ];
 
@@ -2275,6 +2463,117 @@ mod tests {
             without.drain(info..info + 2);
             assert_eq!(without.join("\n"), golden);
         }
+    }
+
+    /// An identified jail as the launcher builds it: the records folder, as
+    /// named and as resolved, hidden after every writable bind; the command's
+    /// own `PATH` and loader variables handed back after the namespaces; the
+    /// record last of the mounts.
+    fn identified_inputs() -> JailInputs {
+        let mut input = inputs(&["claude", "--print"]);
+        input.args.identity = true;
+        input.existing_paths.push(PathBuf::from("/home/dev/.local"));
+        input.info_fd = Some(7);
+        input.record_fd = Some(8);
+        input.records_dirs = vec![
+            PathBuf::from("/home/dev/.local/state/innerwarden/instances"),
+            PathBuf::from("/data/dev/state/innerwarden/instances"),
+        ];
+        input.child_env = vec![
+            ("LD_LIBRARY_PATH".into(), "/home/dev/lib".into()),
+            ("PATH".into(), "/home/dev/.local/bin:/usr/bin".into()),
+        ];
+        input
+    }
+
+    /// The whole argv of an identified jail, one token per line.
+    ///
+    /// FAILS ON REVERT: drop the records folder `--tmpfs` (the agent can
+    /// rewrite the launcher's records through the `.local` bind), or move it
+    /// before the project and dotdir binds, or drop the `--setenv` lines.
+    #[test]
+    fn golden_argv_of_an_identified_jail() {
+        let plan = build_linux_jail(&identified_inputs()).unwrap();
+        assert_eq!(plan.bwrap_args.join("\n"), GOLDEN_ARGV_IDENTIFIED);
+    }
+
+    /// The records folder is hidden after the last writable bind that could
+    /// show it (`.local`, the project), so none of them brings it back, and
+    /// before the record, which stays last of the mounts.
+    #[test]
+    fn the_records_folder_is_hidden_after_every_writable_bind() {
+        let got = build_linux_jail(&identified_inputs()).unwrap().bwrap_args;
+        let shadow = |dir: &str| {
+            got.windows(2)
+                .position(|w| w[0] == "--tmpfs" && w[1] == dir)
+                .unwrap_or_else(|| panic!("{dir} is hidden"))
+        };
+        let named = shadow("/home/dev/.local/state/innerwarden/instances");
+        let resolved = shadow("/data/dev/state/innerwarden/instances");
+        let last_bind = got
+            .iter()
+            .rposition(|a| a == "--bind")
+            .expect("a writable bind");
+        assert!(last_bind < named && last_bind < resolved);
+        let record = got.iter().position(|a| a == "--ro-bind-data").unwrap();
+        assert!(named < record && resolved < record);
+    }
+
+    /// Without `--identity` neither the records folder nor the command's
+    /// variables reach the argv, whatever the inputs carry.
+    #[test]
+    fn without_identity_the_records_folder_and_variables_change_nothing() {
+        let mut off = identified_inputs();
+        off.args.identity = false;
+        off.info_fd = None;
+        off.record_fd = None;
+        off.existing_paths.pop();
+        assert_eq!(
+            build_linux_jail(&off).unwrap().bwrap_args.join("\n"),
+            GOLDEN_ARGV_PLAIN
+        );
+        assert!(!compute_jail_env(&off)
+            .iter()
+            .any(|(k, _)| k == "IW_HOOK_AGENT"));
+    }
+
+    /// The helpers get no loader variable; the command gets `PATH` and every
+    /// loader variable back as it was, and nothing else is moved.
+    ///
+    /// FAILS ON REVERT: let `launch_env` keep `LD_*` in the helpers.
+    #[test]
+    fn the_launchers_helpers_lose_the_loader_variables_and_the_command_keeps_them() {
+        use std::ffi::OsString;
+        let vars = [
+            ("PATH", "/home/dev/.local/bin:/usr/bin"),
+            ("LD_PRELOAD", "/home/dev/hook.so"),
+            ("LD_LIBRARY_PATH", "/home/dev/lib"),
+            ("HOME", "/home/dev"),
+            ("ANTHROPIC_API_KEY", "secret"),
+            ("OLD_LD_PRELOAD", "x"),
+        ]
+        .map(|(k, v)| (OsString::from(k), OsString::from(v)));
+        let env = launch_env(vars);
+        assert_eq!(
+            env.helper_remove,
+            [
+                OsString::from("LD_LIBRARY_PATH"),
+                OsString::from("LD_PRELOAD")
+            ]
+        );
+        assert_eq!(
+            env.child_env,
+            [
+                ("LD_LIBRARY_PATH", "/home/dev/lib"),
+                ("LD_PRELOAD", "/home/dev/hook.so"),
+                ("PATH", "/home/dev/.local/bin:/usr/bin"),
+            ]
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+        );
+        assert_eq!(HELPER_PATH, "/usr/bin:/bin");
+        // no PATH and no loader variable: nothing to hand back
+        let bare = launch_env([(OsString::from("HOME"), OsString::from("/h"))]);
+        assert_eq!(bare, LaunchEnv::default());
     }
 
     /// With `--identity` a writable bind may not bring the host's `/run` (the
@@ -2915,14 +3214,21 @@ mod tests {
         }
     }
 
-    /// The identity flag adds no variable to the jail: its environment is the
-    /// same with and without it.
+    /// The identity flag adds one variable to the jail, the agent the jail was
+    /// started for, so the hook can hold the record's type to it; without the
+    /// flag the environment is exactly today's.
+    ///
+    /// FAILS ON REVERT: drop the `HOOK_AGENT_ENV` push from
+    /// `compute_jail_env` and the identified environment has no agent.
     #[test]
-    fn identity_adds_nothing_to_the_jails_environment() {
+    fn identity_adds_only_the_agent_to_the_jails_environment() {
         let plain = build_linux_jail(&inputs(&["claude"])).unwrap().env;
         let mut identified = inputs(&["claude"]);
         identified.args.identity = true;
-        assert_eq!(build_linux_jail(&identified).unwrap().env, plain);
+        let mut expected = plain.clone();
+        expected.push(("IW_HOOK_AGENT".to_string(), "claude-code".to_string()));
+        assert_eq!(build_linux_jail(&identified).unwrap().env, expected);
+        assert_eq!(compute_jail_env(&identified), expected, "macOS too");
         assert_eq!(
             plain,
             [
@@ -2934,6 +3240,111 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v.to_string()))
         );
     }
+
+    const GOLDEN_ARGV_IDENTIFIED: &str = "\
+        --ro-bind\n\
+        /usr\n\
+        /usr\n\
+        --ro-bind\n\
+        /etc\n\
+        /etc\n\
+        --ro-bind\n\
+        /sys\n\
+        /sys\n\
+        --symlink\n\
+        usr/bin\n\
+        /bin\n\
+        --symlink\n\
+        usr/lib\n\
+        /lib\n\
+        --symlink\n\
+        usr/lib64\n\
+        /lib64\n\
+        --symlink\n\
+        usr/sbin\n\
+        /sbin\n\
+        --dev\n\
+        /dev\n\
+        --proc\n\
+        /proc\n\
+        --tmpfs\n\
+        /tmp\n\
+        --tmpfs\n\
+        /run\n\
+        --tmpfs\n\
+        /home/dev\n\
+        --bind\n\
+        /home/dev/.claude\n\
+        /home/dev/.claude\n\
+        --bind\n\
+        /home/dev/.config\n\
+        /home/dev/.config\n\
+        --bind\n\
+        /home/dev/.cache\n\
+        /home/dev/.cache\n\
+        --bind\n\
+        /home/dev/.local\n\
+        /home/dev/.local\n\
+        --tmpfs\n\
+        /home/dev/.config/innerwarden\n\
+        --ro-bind\n\
+        /home/dev/.gitconfig\n\
+        /home/dev/.gitconfig\n\
+        --ro-bind\n\
+        /home/dev/.local/bin/innerwarden\n\
+        /home/dev/.local/bin/innerwarden\n\
+        --bind\n\
+        /home/dev/proj\n\
+        /home/dev/proj\n\
+        --chdir\n\
+        /home/dev/proj\n\
+        --tmpfs\n\
+        /home/dev/.aws\n\
+        --tmpfs\n\
+        /home/dev/.config/innerwarden\n\
+        --tmpfs\n\
+        /home/dev/.gnupg\n\
+        --tmpfs\n\
+        /home/dev/.mozilla\n\
+        --tmpfs\n\
+        /home/dev/.ssh\n\
+        --tmpfs\n\
+        /home/dev/.thunderbird\n\
+        --tmpfs\n\
+        /home/dev/Library/Mail\n\
+        --tmpfs\n\
+        /home/dev/Library/Messages\n\
+        --tmpfs\n\
+        /home/dev/Library/Safari\n\
+        --tmpfs\n\
+        /home/dev/.local/state/innerwarden/instances\n\
+        --tmpfs\n\
+        /data/dev/state/innerwarden/instances\n\
+        --ro-bind\n\
+        /dev/null\n\
+        /home/dev/proj/.env\n\
+        --tmpfs\n\
+        /home/dev/proj/secrets\n\
+        --ro-bind-data\n\
+        8\n\
+        /run/innerwarden/instance.json\n\
+        --die-with-parent\n\
+        --unshare-pid\n\
+        --unshare-uts\n\
+        --unshare-ipc\n\
+        --hostname\n\
+        ai-sandbox\n\
+        --setenv\n\
+        LD_LIBRARY_PATH\n\
+        /home/dev/lib\n\
+        --setenv\n\
+        PATH\n\
+        /home/dev/.local/bin:/usr/bin\n\
+        --info-fd\n\
+        7\n\
+        --\n\
+        claude\n\
+        --print";
 
     const GOLDEN_ARGV_PLAIN: &str = "\
         --ro-bind\n\

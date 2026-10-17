@@ -479,12 +479,14 @@ pub(crate) fn local_instances(dir: &Path, uid: u32) -> Vec<LocalInstance> {
         let jail_ns = jail_namespace(record.jail.pid, record.jail.start_ticks);
         let live = jail_ns.is_some();
         let trust = if live {
+            let (own_pid_ns, own_mnt_ns) = jail_ns.unwrap_or_default();
             judge_trust_in_jail(InJailFacts {
                 record: RecordRead::Present {
                     record: &record,
                     read_only: true,
                 },
-                own_pid_ns: jail_ns.flatten(),
+                own_pid_ns,
+                own_mnt_ns,
             })
             .0
         } else {
@@ -528,10 +530,10 @@ fn read_record(path: &Path, uid: u32) -> Option<Vec<u8>> {
 
 /// `Some` when the jail process `pid` runs with start time `ticks` (read
 /// before and after its namespace, so a reused pid is not taken for it):
-/// `Some(Some(inode))` with its PID namespace, `Some(None)` when that could
-/// not be read.
+/// `Some((pid, mnt))` with its PID and mount namespaces, each `None` when it
+/// could not be read.
 #[cfg(target_os = "linux")]
-fn jail_namespace(pid: u32, ticks: u64) -> Option<Option<u64>> {
+fn jail_namespace(pid: u32, ticks: u64) -> Option<(Option<u64>, Option<u64>)> {
     let start = || {
         std::fs::read_to_string(format!("/proc/{pid}/stat"))
             .ok()
@@ -543,12 +545,15 @@ fn jail_namespace(pid: u32, ticks: u64) -> Option<Option<u64>> {
     let ns = std::fs::read_link(format!("/proc/{pid}/ns/pid"))
         .ok()
         .and_then(|link| crate::contain::launch::parse_ns_link(&link.to_string_lossy()));
-    (start() == Some(ticks)).then_some(ns)
+    let mnt = std::fs::read_link(format!("/proc/{pid}/ns/mnt"))
+        .ok()
+        .and_then(|link| crate::contain::launch::parse_mnt_ns_link(&link.to_string_lossy()));
+    (start() == Some(ticks)).then_some((ns, mnt))
 }
 
 /// No `/proc` to check a jail against: nothing is live.
 #[cfg(not(target_os = "linux"))]
-fn jail_namespace(_pid: u32, _ticks: u64) -> Option<Option<u64>> {
+fn jail_namespace(_pid: u32, _ticks: u64) -> Option<(Option<u64>, Option<u64>)> {
     None
 }
 
@@ -810,7 +815,7 @@ mod tests {
 
     fn record(id: &str, uid: u32) -> String {
         format!(
-            r#"{{"schema":1,"instance_id":"{id}","agent_type":"claude-code","launcher":{{"path":"/usr/local/bin/innerwarden","version":"1","root_owned":true}},"uid":{uid},"project":"p","mode":"enforce","started_at":"2026-10-17T09:00:00Z","jail":{{"backend":"bwrap","pid":999999999,"start_ticks":1,"pid_ns":4026532220}}}}"#
+            r#"{{"schema":1,"instance_id":"{id}","agent_type":"claude-code","launcher":{{"path":"/usr/local/bin/innerwarden","version":"1","root_owned":true}},"uid":{uid},"project":"p","mode":"enforce","started_at":"2026-10-17T09:00:00Z","jail":{{"backend":"bwrap","pid":999999999,"start_ticks":1,"pid_ns":4026532220,"mnt_ns":4026532218}}}}"#
         )
     }
 

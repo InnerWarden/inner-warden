@@ -215,6 +215,26 @@ fn resolve_inputs(args: ContainArgs, home: PathBuf, iw_binary: PathBuf) -> JailI
     // builder knows file-vs-dir (Linux masks a file with /dev/null, a dir with tmpfs).
     let deny_paths = expand_deny_paths(&args.project, &args.deny_read);
 
+    // Only an identified launch hides the launcher's records and keeps its
+    // helpers' environment apart; without the flag none of this is read.
+    let (records_dirs, child_env) = if args.identity {
+        let nominal = crate::contain::launch::records_dir(
+            std::env::var("XDG_STATE_HOME").ok().as_deref(),
+            &home,
+        );
+        let real = resolved_through_existing(&nominal);
+        let mut dirs = vec![nominal];
+        if real != dirs[0] {
+            dirs.push(real);
+        }
+        (
+            dirs,
+            crate::contain::launch_env(std::env::vars_os()).child_env,
+        )
+    } else {
+        (Vec::new(), Vec::new())
+    };
+
     JailInputs {
         args,
         home,
@@ -229,6 +249,31 @@ fn resolve_inputs(args: ContainArgs, home: PathBuf, iw_binary: PathBuf) -> JailI
         deny_paths,
         info_fd: None,
         record_fd: None,
+        records_dirs,
+        child_env,
+    }
+}
+
+/// `path` with its longest existing ancestor symlink-resolved and the rest kept
+/// as written, so a folder that does not exist yet is named where it will be.
+fn resolved_through_existing(path: &Path) -> PathBuf {
+    let mut rest: Vec<std::ffi::OsString> = Vec::new();
+    let mut at = path.to_path_buf();
+    loop {
+        if let Ok(real) = std::fs::canonicalize(&at) {
+            let mut out = real;
+            for name in rest.iter().rev() {
+                out.push(name);
+            }
+            return out;
+        }
+        match (at.file_name().map(|n| n.to_os_string()), at.parent()) {
+            (Some(name), Some(parent)) => {
+                rest.push(name);
+                at = parent.to_path_buf();
+            }
+            _ => return path.to_path_buf(),
+        }
     }
 }
 
@@ -507,10 +552,36 @@ fn write_launch_record(
     owner_uid: u32,
 ) -> std::io::Result<PathBuf> {
     use std::io::{Error, ErrorKind, Write};
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+    use std::os::unix::fs::OpenOptionsExt;
 
     let target = crate::contain::launch::record_path(dir, instance_id)
         .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "not an instance id"))?;
+    own_records_dir(dir, owner_uid)?;
+    let temp = dir.join(format!(".{instance_id}.tmp"));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true).mode(0o600);
+    innerwarden_safe_io::harden(&mut options);
+    let mut file = options.open(&temp)?;
+    let written = file
+        .write_all(json)
+        .and_then(|()| file.sync_all())
+        .and_then(|()| std::fs::rename(&temp, &target));
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&temp);
+        return Err(e);
+    }
+    Ok(target)
+}
+
+/// Make the launcher's records directory if it is missing (`0700`), and
+/// refuse it if it is a symlink, someone else's, or writable by anyone but its
+/// owner.
+#[cfg(unix)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn own_records_dir(dir: &Path, owner_uid: u32) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
@@ -526,20 +597,7 @@ fn write_launch_record(
             ),
         ));
     }
-    let temp = dir.join(format!(".{instance_id}.tmp"));
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true).mode(0o600);
-    innerwarden_safe_io::harden(&mut options);
-    let mut file = options.open(&temp)?;
-    let written = file
-        .write_all(json)
-        .and_then(|()| file.sync_all())
-        .and_then(|()| std::fs::rename(&temp, &target));
-    if let Err(e) = written {
-        let _ = std::fs::remove_file(&temp);
-        return Err(e);
-    }
-    Ok(target)
+    Ok(())
 }
 
 /// Run the jail with `--identity`.
@@ -579,6 +637,21 @@ fn run_linux_identified(input: &JailInputs, bwrap: &Path) -> ExitCode {
             };
         }
     };
+    // The records directory exists before the jail does, so the jail hides a
+    // folder of the launcher's and bwrap makes none on the host. One that
+    // cannot be made, and is not there, is not hidden: nothing can be in it.
+    // SAFETY: getuid takes no arguments and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    let mut input = input.clone();
+    if let Some(dir) = input.records_dirs.first() {
+        if let Err(e) = own_records_dir(dir, uid) {
+            eprintln!("innerwarden contain: the launcher's records folder is not usable ({e})");
+        }
+    }
+    input
+        .records_dirs
+        .retain(|dir| std::fs::symlink_metadata(dir).is_ok());
+    let input = &input;
     let mut scope = plan_scope(&scope_facts(), &unit);
     if let ScopePlan::None(why) = scope {
         eprintln!("{}", no_scope_sentence(why));
@@ -662,10 +735,10 @@ fn launch_identified(
     };
     let (program, args) = launch_argv(bwrap, &plan.bwrap_args, scope);
     let started_ms = now_ms();
-    let spawned = Command::new(&program)
-        .args(&args)
-        .envs(plan.env.iter().cloned())
-        .spawn();
+    let mut command = Command::new(&program);
+    command.args(&args).envs(plan.env.iter().cloned());
+    helper_env(&mut command);
+    let spawned = command.spawn();
     // Ours must close, or the read below never ends and the jail never sees
     // the end of its record.
     drop(info_writer);
@@ -839,8 +912,8 @@ fn identify(
     info: crate::contain::launch::InfoFd,
 ) -> Result<Vec<u8>, String> {
     use crate::contain::launch::{
-        assemble_record, no_scope_sentence, parse_ns_link, records_dir, user_scope_seen,
-        LaunchFacts, NoScope, ScopePlan,
+        assemble_record, no_scope_sentence, parse_mnt_ns_link, parse_ns_link, records_dir,
+        user_scope_seen, LaunchFacts, NoScope, ScopePlan,
     };
     use innerwarden_agent_guard::identity::Scopes;
 
@@ -854,6 +927,13 @@ fn identify(
         .ok()
         .and_then(|l| parse_ns_link(&l.to_string_lossy()))
         .ok_or("the jail's PID namespace is unreadable")?;
+    let mnt_ns = std::fs::read_link(format!("/proc/{pid}/ns/mnt"))
+        .ok()
+        .and_then(|l| parse_mnt_ns_link(&l.to_string_lossy()))
+        .ok_or("the jail's mount namespace is unreadable")?;
+    let launcher_mnt_ns = std::fs::read_link("/proc/self/ns/mnt")
+        .ok()
+        .and_then(|l| parse_mnt_ns_link(&l.to_string_lossy()));
     // SAFETY: getuid takes no arguments and cannot fail.
     let uid = unsafe { libc::getuid() };
 
@@ -895,6 +975,8 @@ fn identify(
         info,
         start_ticks: before,
         pid_ns,
+        mnt_ns,
+        launcher_mnt_ns,
         scope: scopes,
     };
     let record = assemble_record(facts).map_err(|e| e.to_string())?;
@@ -962,15 +1044,37 @@ fn request_system_scope(
         return None;
     };
     let body = system_scope_request(instance_id)?;
-    if let Err(why) = send_report(&url, &body) {
+    let seen = await_system_scope(
+        send_report(&url, &body),
+        SYSTEM_SCOPE_WAIT,
+        || proc_cgroup(pid).and_then(|c| system_scope_seen(&c, unit)),
+        said,
+    )?;
+    eprintln!("  system scope: {}", seen.cgroup_path);
+    Some(seen)
+}
+
+/// Wait up to `wait` for `seen` to find the jail in its system scope, and only
+/// once the request was taken. A route that is not there answers at once (no
+/// listener, `404`, `401`), and a request that was not taken is not waited
+/// for: the launch goes on with no system scope, which is what an instance
+/// without one is (observed at most, from inside the jail's view of it).
+#[cfg(unix)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn await_system_scope<T>(
+    sent: Result<(), String>,
+    wait: std::time::Duration,
+    mut seen: impl FnMut() -> Option<T>,
+    said: impl Fn(&str),
+) -> Option<T> {
+    if let Err(why) = sent {
         said(&format!("the local agent did not take the request: {why}"));
         return None;
     }
-    let deadline = std::time::Instant::now() + SYSTEM_SCOPE_WAIT;
+    let deadline = std::time::Instant::now() + wait;
     loop {
-        if let Some(seen) = proc_cgroup(pid).and_then(|c| system_scope_seen(&c, unit)) {
-            eprintln!("  system scope: {}", seen.cgroup_path);
-            return Some(seen);
+        if let Some(found) = seen() {
+            return Some(found);
         }
         if std::time::Instant::now() >= deadline {
             said("the kernel does not show the jail in it");
@@ -978,6 +1082,17 @@ fn request_system_scope(
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
+}
+
+/// The environment of a program the launcher runs to start an identified
+/// jail: [`crate::contain::HELPER_PATH`] and no dynamic loader variable. The
+/// jail's command gets its own back through bwrap ([`JailInputs::child_env`]).
+#[cfg(target_os = "linux")]
+fn helper_env(command: &mut Command) {
+    for name in crate::contain::launch_env(std::env::vars_os()).helper_remove {
+        command.env_remove(name);
+    }
+    command.env("PATH", crate::contain::HELPER_PATH);
 }
 
 /// What decides the user scope, read from this host.
@@ -994,14 +1109,18 @@ fn scope_facts() -> crate::contain::launch::ScopeFacts {
         .is_some_and(|m| m.file_type().is_socket() && m.uid() == uid);
     // Only asked when it could matter: the answer decides one switch.
     let systemd_version = match (&systemd_run, user_manager) {
-        (Some(run), true) => Command::new(run)
-            .arg("--version")
-            .stdin(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .output()
-            .ok()
-            .filter(|out| out.status.success())
-            .and_then(|out| parse_systemd_version(&String::from_utf8_lossy(&out.stdout))),
+        (Some(run), true) => {
+            let mut command = Command::new(run);
+            helper_env(&mut command);
+            command
+                .arg("--version")
+                .stdin(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .output()
+                .ok()
+                .filter(|out| out.status.success())
+                .and_then(|out| parse_systemd_version(&String::from_utf8_lossy(&out.stdout)))
+        }
         _ => None,
     };
     ScopeFacts {
@@ -1207,6 +1326,83 @@ fn print_plan_env(env: &[(String, String)]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One loopback listener that answers its first request with `status`.
+    #[cfg(unix)]
+    fn answering(status: &'static str) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+            }
+        });
+        format!("http://127.0.0.1:{port}/api/agent/contain-scope")
+    }
+
+    /// Where Active Defence is installed but its agent has no such route (an
+    /// older release, the route off, no session), the request is refused at
+    /// once and the launch does not wait for a scope that cannot come. The
+    /// wait is only for a request the agent took.
+    ///
+    /// FAILS ON REVERT: wait whatever `send_report` answered and the probe is
+    /// called and the launch waits the whole wait.
+    #[cfg(unix)]
+    #[test]
+    fn a_system_scope_is_waited_for_only_when_the_request_was_taken() {
+        use std::cell::Cell;
+        use std::time::{Duration, Instant};
+        let body = serde_json::json!({ "instance": "abc" });
+        let closed = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            drop(listener);
+            format!("http://127.0.0.1:{port}/api/agent/contain-scope")
+        };
+        for url in [
+            answering("404 Not Found"),
+            answering("401 Unauthorized"),
+            answering("405 Method Not Allowed"),
+            closed,
+        ] {
+            let probes = Cell::new(0);
+            let started = Instant::now();
+            let got = await_system_scope(
+                crate::agent_report::send_report(&url, &body),
+                Duration::from_secs(3),
+                || {
+                    probes.set(probes.get() + 1);
+                    None::<()>
+                },
+                |_| {},
+            );
+            assert_eq!(got, None, "{url}");
+            assert_eq!(probes.get(), 0, "{url}: nothing to wait for");
+            assert!(started.elapsed() < Duration::from_secs(2), "{url}");
+        }
+        // Taken: the kernel is asked until it shows the jail, or the wait ends.
+        let probes = Cell::new(0);
+        let got = await_system_scope(
+            crate::agent_report::send_report(&answering("200 OK"), &body),
+            Duration::from_secs(3),
+            || {
+                probes.set(probes.get() + 1);
+                (probes.get() == 2).then_some("seen")
+            },
+            |_| {},
+        );
+        assert_eq!((got, probes.get()), (Some("seen"), 2));
+        let started = Instant::now();
+        let never = await_system_scope(Ok(()), Duration::from_millis(250), || None::<()>, |_| {});
+        assert_eq!(never, None);
+        assert!(started.elapsed() >= Duration::from_millis(250));
+    }
 
     // The trust decision is tested on facts handed in. It used to be tested
     // on a file under the checkout, so its answer depended on every directory

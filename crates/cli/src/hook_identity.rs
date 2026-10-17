@@ -2,7 +2,8 @@
 //!
 //! Inside a jail started with `contain --identity`, the launcher mounts a
 //! record read-only at a fixed place. This module reads it (one open, no link
-//! followed, bounded, owner checked), reads the hook's own PID namespace, asks
+//! followed, bounded, owner checked), reads the hook's own PID and mount
+//! namespaces and the agent the launcher started the jail for, asks
 //! the pure judge in `agent-guard` what level that earns, and returns LABELS
 //! for the decision record: instance id, the session id the agent sent, the
 //! level and the reason for it.
@@ -43,6 +44,14 @@ pub struct JailFacts {
     pub record: RawRecord,
     /// Inode of the hook's own PID namespace.
     pub own_pid_ns: Option<u64>,
+    /// Inode of the hook's own mount namespace.
+    pub own_mnt_ns: Option<u64>,
+    /// The agent the launcher started the jail for, from its environment
+    /// ([`HOOK_AGENT_ENV`]). A label, like the hook line's `--agent`: it can
+    /// only hold a record's type to the hook, never raise a level.
+    ///
+    /// [`HOOK_AGENT_ENV`]: innerwarden_agent_guard::identity::HOOK_AGENT_ENV
+    pub launcher_agent: Option<String>,
 }
 
 /// The labels a decision gets when a record was found.
@@ -134,8 +143,23 @@ pub fn resolve(
             read_only,
         },
         own_pid_ns: facts.own_pid_ns,
+        own_mnt_ns: facts.own_mnt_ns,
     });
-    let (trust, reason) = judge_agent_claim(judged, &record.agent_type, hook_agent);
+    // The hook line and the launcher may both name the agent: two names for
+    // one hook are no name, and the line is never let to pick the record's.
+    let launcher_agent = facts.launcher_agent.as_deref();
+    let (trust, reason) = match (hook_agent, launcher_agent) {
+        (Some(line), Some(launcher)) if line != launcher => {
+            let by_line = judge_agent_claim(judged, &record.agent_type, Some(line));
+            let by_launcher = judge_agent_claim(judged, &record.agent_type, Some(launcher));
+            if by_line.0 <= by_launcher.0 {
+                by_line
+            } else {
+                by_launcher
+            }
+        }
+        (line, launcher) => judge_agent_claim(judged, &record.agent_type, line.or(launcher)),
+    };
     let matched = trust > Trust::Declared;
     Some(Identity {
         instance_id: matched.then(|| record.instance_id.clone()),
@@ -146,14 +170,44 @@ pub fn resolve(
     })
 }
 
-/// Read the facts at `path` and from `/proc/self`.
+/// Read the facts at `path`, from `/proc/self` and from the environment.
 #[cfg(target_os = "linux")]
 pub fn read_facts(path: &std::path::Path) -> JailFacts {
+    let record = read_raw(path);
+    // Without a record nothing else is read: the hook is what it was.
+    if record == RawRecord::Absent {
+        return JailFacts {
+            record,
+            own_pid_ns: None,
+            own_mnt_ns: None,
+            launcher_agent: None,
+        };
+    }
     JailFacts {
-        record: read_raw(path),
+        record,
         own_pid_ns: std::fs::read_link("/proc/self/ns/pid")
             .ok()
             .and_then(|link| crate::contain::launch::parse_ns_link(&link.to_string_lossy())),
+        own_mnt_ns: std::fs::read_link("/proc/self/ns/mnt")
+            .ok()
+            .and_then(|link| crate::contain::launch::parse_mnt_ns_link(&link.to_string_lossy())),
+        launcher_agent: launcher_agent(
+            std::env::var(innerwarden_agent_guard::identity::HOOK_AGENT_ENV)
+                .ok()
+                .as_deref(),
+        ),
+    }
+}
+
+/// PURE. The launcher's word for the agent, if it is a plain agent id. A value
+/// that is not one is kept as a name no record carries, so it can only ever
+/// lower a level.
+pub fn launcher_agent(value: Option<&str>) -> Option<String> {
+    let value = value?;
+    if innerwarden_agent_guard::hook::is_agent_id(value) {
+        Some(value.to_string())
+    } else {
+        Some(String::new())
     }
 }
 
@@ -187,7 +241,9 @@ fn read_raw(path: &std::path::Path) -> RawRecord {
         return RawRecord::Unreadable;
     }
     // SAFETY: an all-zero statvfs is a valid value for the kernel to fill, and
-    // the descriptor stays open for the call.
+    // the descriptor stays open for the call. The two fields have different
+    // integer types on different libcs, hence the casts.
+    #[allow(clippy::unnecessary_cast)]
     let read_only = unsafe {
         let mut st: libc::statvfs = std::mem::zeroed();
         libc::fstatvfs(file.as_raw_fd(), &mut st) == 0
@@ -225,6 +281,7 @@ mod tests {
     use super::*;
 
     const OWN_NS: u64 = 4026532871;
+    const OWN_MNT: u64 = 4026532869;
 
     const RECORD: &str = r#"{
   "schema": 1,
@@ -235,7 +292,7 @@ mod tests {
   "project": "my-app",
   "mode": "enforce",
   "started_at": "2026-10-16T09:30:00Z",
-  "jail": { "backend": "bwrap", "pid": 48211, "start_ticks": 9120344, "pid_ns": 4026532871 },
+  "jail": { "backend": "bwrap", "pid": 48211, "start_ticks": 9120344, "pid_ns": 4026532871, "mnt_ns": 4026532869 },
   "scope": {
     "user": {
       "unit": "innerwarden-contain-7f3a9c1e-42.scope",
@@ -244,6 +301,7 @@ mod tests {
   }
 }"#;
 
+    /// The facts of a hook in a jail the launcher started for `claude-code`.
     fn facts(record: &str, read_only: bool, own: Option<u64>) -> JailFacts {
         JailFacts {
             record: RawRecord::Bytes {
@@ -251,6 +309,8 @@ mod tests {
                 read_only,
             },
             own_pid_ns: own,
+            own_mnt_ns: Some(OWN_MNT),
+            launcher_agent: Some("claude-code".into()),
         }
     }
 
@@ -259,6 +319,8 @@ mod tests {
         let none = JailFacts {
             record: RawRecord::Absent,
             own_pid_ns: Some(OWN_NS),
+            own_mnt_ns: Some(OWN_MNT),
+            launcher_agent: Some("claude-code".into()),
         };
         assert_eq!(resolve(&none, Some("claude-code"), Some("abc")), None);
     }
@@ -323,6 +385,8 @@ mod tests {
                 &JailFacts {
                     record: raw,
                     own_pid_ns: Some(OWN_NS),
+                    own_mnt_ns: Some(OWN_MNT),
+                    launcher_agent: None,
                 },
                 None,
                 Some("s"),
@@ -346,6 +410,121 @@ mod tests {
             (Trust::Declared, Reason::AgentMismatch)
         );
         assert_eq!(id.instance_id, None);
+    }
+
+    /// A process in the jail's PID namespace that made a mount namespace of its
+    /// own (`unshare -Urm`, then a record of its choosing mounted read-only at
+    /// the record's place) is not in the launcher's jail.
+    ///
+    /// FAILS ON REVERT: hand `own_mnt_ns` to the judge as the recorded one (or
+    /// drop the mount namespace rows) and this sees `Confined`.
+    #[test]
+    fn a_hook_in_another_mount_namespace_is_declared_and_names_no_instance() {
+        let mut nested = facts(RECORD, true, Some(OWN_NS));
+        nested.own_mnt_ns = Some(OWN_MNT + 3);
+        let id = resolve(&nested, Some("claude-code"), None).unwrap();
+        assert_eq!(
+            (id.trust, id.reason),
+            (Trust::Declared, Reason::MountNamespaceMismatch)
+        );
+        assert_eq!((id.instance_id, id.agent_type), (None, None));
+        nested.own_mnt_ns = None;
+        let id = resolve(&nested, Some("claude-code"), None).unwrap();
+        assert_eq!(
+            (id.trust, id.reason),
+            (Trust::Declared, Reason::OwnMountNamespaceUnreadable)
+        );
+    }
+
+    /// A nested PID namespace (`unshare -Upf`) reads another PID namespace
+    /// than the recorded one, even with the jail's mount namespace.
+    #[test]
+    fn a_hook_in_a_nested_pid_namespace_is_declared() {
+        let id = resolve(
+            &facts(RECORD, true, Some(OWN_NS + 11)),
+            Some("claude-code"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            (id.trust, id.reason),
+            (Trust::Declared, Reason::NamespaceMismatch)
+        );
+    }
+
+    /// The launcher's word for the agent holds the record's type to the hook:
+    /// a line wired for another agent, a launcher word for another, or two
+    /// different names are `declared`; with no name at all nothing ties the
+    /// record to this hook.
+    ///
+    /// FAILS ON REVERT: ignore `launcher_agent` in `resolve` and the second
+    /// and third cases see `Confined`.
+    #[test]
+    fn the_launchers_agent_must_be_the_records_type() {
+        let mut other = facts(RECORD, true, Some(OWN_NS));
+        other.launcher_agent = Some("cursor".into());
+        let cases = [
+            (other.clone(), None, Reason::AgentMismatch),
+            (other.clone(), Some("claude-code"), Reason::AgentMismatch),
+            (
+                facts(RECORD, true, Some(OWN_NS)),
+                Some("cursor"),
+                Reason::AgentMismatch,
+            ),
+            (
+                JailFacts {
+                    launcher_agent: Some(String::new()),
+                    ..facts(RECORD, true, Some(OWN_NS))
+                },
+                None,
+                Reason::AgentMismatch,
+            ),
+            (
+                JailFacts {
+                    launcher_agent: None,
+                    ..facts(RECORD, true, Some(OWN_NS))
+                },
+                None,
+                Reason::AgentNotNamed,
+            ),
+        ];
+        for (facts, line, reason) in cases {
+            let id = resolve(&facts, line, None).unwrap();
+            assert_eq!(
+                (id.trust, id.reason, id.instance_id.as_deref()),
+                (Trust::Declared, reason, None),
+                "{:?} {line:?}",
+                facts.launcher_agent
+            );
+        }
+        // The launcher's word alone, or with the same line, keeps the level.
+        for line in [None, Some("claude-code")] {
+            let id = resolve(&facts(RECORD, true, Some(OWN_NS)), line, None).unwrap();
+            assert_eq!(id.trust, Trust::Confined, "{line:?}");
+        }
+        // A hook line alone, with the launcher's word absent, still holds.
+        let line_only = JailFacts {
+            launcher_agent: None,
+            ..facts(RECORD, true, Some(OWN_NS))
+        };
+        assert_eq!(
+            resolve(&line_only, Some("claude-code"), None)
+                .unwrap()
+                .trust,
+            Trust::Confined
+        );
+    }
+
+    #[test]
+    fn the_launchers_agent_is_read_as_an_agent_id_or_as_no_type() {
+        assert_eq!(launcher_agent(None), None);
+        assert_eq!(
+            launcher_agent(Some("claude-code")).as_deref(),
+            Some("claude-code")
+        );
+        for bad in ["", "Claude", "a b", "../x"] {
+            assert_eq!(launcher_agent(Some(bad)).as_deref(), Some(""), "{bad:?}");
+        }
     }
 
     #[test]

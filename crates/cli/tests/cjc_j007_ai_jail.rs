@@ -363,3 +363,78 @@ fn unsupported_platform_fails_without_claiming_a_jail() {
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stderr).contains("not supported"));
 }
+
+/// Inside an identified jail: the mount namespace, the agent the launcher
+/// named, `PATH`, and what is left of the launcher's records folder.
+#[cfg(target_os = "linux")]
+const LOOK_AT_THE_LAUNCHER: &str = "readlink /proc/self/ns/mnt; \
+    echo \"agent=$IW_HOOK_AGENT\"; \
+    echo \"path=$PATH\"; \
+    d=\"$HOME/.local/state/innerwarden/instances\"; \
+    echo \"seen=$(ls -A \"$d\" 2>/dev/null | wc -l | tr -d ' ')\"; \
+    ( echo forged > \"$d/forged.json\" ) 2>/dev/null; \
+    for f in \"$d\"/*.json; do [ -f \"$f\" ] && ( : > \"$f\" ) 2>/dev/null; done; \
+    exit 0";
+
+/// The launcher's records folder is under `~/.local`, which the jail binds
+/// read-write. With `--identity` the jail sees it empty and nothing written
+/// there reaches the host; the record names the mount namespace the jailed
+/// process is in; the hook is told the agent; the command keeps its `PATH`.
+#[cfg(target_os = "linux")]
+#[test]
+fn identity_hides_the_launchers_records_and_names_the_jails_mount_namespace() {
+    require_bwrap();
+    let home = state_home();
+    let project = tempfile::TempDir::new().unwrap();
+    let mut command = cli();
+    command
+        .args([
+            "contain",
+            "--identity",
+            "--project",
+            project.path().to_str().unwrap(),
+            "--",
+            "/bin/sh",
+            "-c",
+            LOOK_AT_THE_LAUNCHER,
+        ])
+        .env("HOME", home.path());
+    let output = identified_without_a_scope(&mut command)
+        .output()
+        .expect("run Linux AI Jail with --identity");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "AI Jail failed: {stderr}");
+
+    let dir = home.path().join(".local/state/innerwarden/instances");
+    let records: Vec<_> = std::fs::read_dir(&dir)
+        .expect("records dir")
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(records.len(), 1, "nothing written in the jail: {records:?}");
+    let outside = std::fs::read(&records[0]).unwrap();
+    assert!(!outside.is_empty(), "the record was not truncated");
+    let record: serde_json::Value = serde_json::from_slice(&outside).unwrap();
+
+    let mut lines = stdout.lines();
+    let mnt: u64 = lines
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .strip_prefix("mnt:[")
+        .and_then(|r| r.strip_suffix(']'))
+        .unwrap_or_else(|| panic!("mount namespace link in stdout: {stdout:?}"))
+        .parse()
+        .unwrap();
+    assert_eq!(record["jail"]["mnt_ns"].as_u64().unwrap(), mnt, "{stdout}");
+    let host = std::fs::read_link("/proc/self/ns/mnt").unwrap();
+    assert_ne!(format!("mnt:[{mnt}]"), host.to_string_lossy());
+    assert_eq!(lines.next(), Some("agent=claude-code"), "{stdout}");
+    let path = std::env::var("PATH").unwrap_or_default();
+    assert_eq!(
+        lines.next(),
+        Some(format!("path={path}").as_str()),
+        "{stdout}"
+    );
+    assert_eq!(lines.next(), Some("seen=0"), "{stdout}");
+}
