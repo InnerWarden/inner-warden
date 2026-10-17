@@ -228,8 +228,12 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
              \n  \
              With --identity the hook inside the jail tells this instance apart from\n  \
              the agent's other runs. Read from inside the jail, the instance is at most\n  \
-             `observed`: confined needs a witness outside the jail (Active Defence), so\n  \
-             a profile rule that relaxes your general rules does not apply here.\n\
+             `observed`: confined needs a witness outside the jail. On Linux, where\n  \
+             Active Defence runs on the same host, the hook asks it about a shell\n  \
+             command sent to review and the host decides whether a profile rule that\n  \
+             relaxes your general rules applies; the stricter verdict wins. Without it\n  \
+             the relaxation is recorded and not applied. MCP tools and file edits keep\n  \
+             your general rules.\n\
              \n  \
              Everything after `--` is the jailed command line, including its own\n  \
              `--help`."

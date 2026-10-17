@@ -666,6 +666,7 @@ fn identity_record_json(
         judged: None,
         user: Some("dev".into()),
         project_dir: None,
+        userns_gap: None,
     }
 }
 
@@ -850,6 +851,7 @@ fn identity_record() -> Graph {
                 deciding_layer: layer.map(str::to_string),
                 profile: Some("claude-code".into()),
                 relaxation_withheld: withheld,
+                ..DecisionOrigin::default()
             },
         );
     }

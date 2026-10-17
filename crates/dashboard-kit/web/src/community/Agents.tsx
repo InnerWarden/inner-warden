@@ -9,7 +9,7 @@ import { OfferLine } from "./Offer";
 import { agentsOffer } from "./offers";
 import { CARD, Chip, CopyCommand, PageHeader, Skeleton, StaleLine, Unreadable, type ChipTone } from "./parts";
 import { usePolled } from "./poll";
-import { LAUNCH_MODE_WORDS, LIFECYCLE_WORDS, reasonWords, STATE_WORDS, TRUST_WORDS, type AgentState, type Trust } from "./words";
+import { LAUNCH_MODE_WORDS, LIFECYCLE_WORDS, reasonWords, STATE_WORDS, trustWord, USERNS_CLOSED_WORDS, USERNS_OPEN_WORDS, type AgentState, type Trust, type TrustSource } from "./words";
 
 export const AGENTS_PAGE_POLL_MS = 30_000;
 
@@ -164,8 +164,8 @@ export function CommunityAgents({ context }: { context?: CommunityScreenContext 
 }
 
 /** The trust chip: the words and the tooltip are the closed table's, the tone the page's grey. */
-function TrustChip({ trust }: { trust: Trust }) {
-  const word = TRUST_WORDS[`${trust}:jail`];
+function TrustChip({ trust, source }: { trust: Trust; source?: TrustSource }) {
+  const word = trustWord(trust, source);
   return (
     <span data-trust={trust} title={word.tooltip}>
       <Chip tone={word.tone} label={word.label} />
@@ -239,7 +239,7 @@ function InstanceRow({ instance, profileLabel, context }: { instance: LocalInsta
   return (
     <li data-instance={instance.instanceId} data-instance-trust={instance.trust} data-live={instance.live === undefined ? undefined : String(instance.live)} className="px-3 py-2">
       <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-slate-600">
-        <TrustChip trust={instance.trust} />
+        <TrustChip trust={instance.trust} source={instance.trustSource} />
         {place === undefined ? null : <span>{place}</span>}
         {instance.mode === undefined ? null : <span>· {LAUNCH_MODE_WORDS[instance.mode]}</span>}
         {profileLabel === undefined ? null : <span>· {profileLabel}</span>}
@@ -281,7 +281,12 @@ function InstanceRow({ instance, profileLabel, context }: { instance: LocalInsta
               {instance.technical.launcherRootOwned === undefined ? "" : `, owned by root: ${instance.technical.launcherRootOwned ? "yes" : "no"}`}
             </div>
           )}
-          <div>Trust decided by: the hook inside the jail ({instance.trustReason === "" ? "no reason recorded" : instance.trustReason})</div>
+          {instance.technical.usernsClosed === true ? (
+            <div>{USERNS_CLOSED_WORDS}</div>
+          ) : instance.technical.usernsOpenReason === undefined ? null : (
+            <div>{USERNS_OPEN_WORDS[instance.technical.usernsOpenReason]}</div>
+          )}
+          <div>Trust read by: the hook inside the jail ({instance.trustReason === "" ? "no reason recorded" : instance.trustReason})</div>
         </dl>
       </TechnicalOnly>
     </li>

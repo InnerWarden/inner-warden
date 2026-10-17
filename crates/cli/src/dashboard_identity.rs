@@ -57,6 +57,11 @@ pub struct InstanceFacts {
     /// it wrote none or it was not a plain path of the record's project.
     /// Where the jail's hook keeps its graph.
     pub project_dir: Option<std::path::PathBuf>,
+    /// Why this host's bwrap cannot close user namespaces in a jail (the word
+    /// of `contain::launch::UsernsWhy`), `None` when the file says nothing
+    /// against it. Read from the host now, not from the record, which does not
+    /// say why a jail left them open; only shown for a jail that did.
+    pub userns_gap: Option<&'static str>,
 }
 
 /// PURE. Add what the graph in an instance's project holds about it, only
@@ -105,11 +110,30 @@ fn trust_word(word: &str) -> Option<Trust> {
 /// supports nothing above `declared`, and none supports more than
 /// `observed`: every code here is a reading from inside the jail, and a
 /// reading from inside the jail tops at `observed` (`judge_trust_in_jail`,
-/// row 10), `confined_by_namespace` included.
+/// row 10), `confined_by_namespace` included. `host_decided` too: the hook
+/// wrote that the host's rules decided, which is its word, not the host's.
 pub fn reason_ceiling(reason: &str) -> Trust {
     match reason {
-        "confined_by_namespace" | "launcher_not_trusted" | "no_scope" => Trust::Observed,
+        "confined_by_namespace" | "launcher_not_trusted" | "no_scope" | HOST_DECIDED => {
+            Trust::Observed
+        }
         _ => Trust::Declared,
+    }
+}
+
+/// The reason a hook records when Active Defence on its host decided the
+/// rules ([`crate::graph_io::HOST_DECIDED`]).
+const HOST_DECIDED: &str = crate::graph_io::HOST_DECIDED;
+
+/// Where an instance's shown reason comes from: `host` when it is the one a
+/// hook records after Active Defence on its host decided its rules, `jail`
+/// otherwise. A label, never a level: the trust beside it is capped all the
+/// same.
+pub fn trust_source_of(reason: &str) -> &'static str {
+    if reason == HOST_DECIDED {
+        "host"
+    } else {
+        "jail"
     }
 }
 
@@ -171,6 +195,16 @@ pub struct TechnicalView {
     pub scope_unit: Option<String>,
     pub launcher_path: String,
     pub launcher_root_owned: bool,
+    /// `true` when the record says the jail was started with user namespaces
+    /// closed; absent otherwise. A fact about how the jail was built, shown
+    /// as it is: it never changes the trust, its badge or its reason.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub userns_closed: Option<bool>,
+    /// For a jail that did not close them: the word for why this host's bwrap
+    /// cannot (`bwrap_too_old`, `bwrap_setuid`). Absent when the jail did, and
+    /// when the host's bwrap says nothing against it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub userns_open_reason: Option<&'static str>,
 }
 
 /// One instance, as `/api/agents` lists it under its agent.
@@ -225,11 +259,12 @@ pub fn instance_view(
         .as_ref()
         .and_then(|s| s.system.as_ref().or(s.user.as_ref()))
         .map(|scope| shown(&scope.unit));
+    let trust_source = trust_source_of(&trust_reason);
     LocalInstanceView {
         instance_id: record.instance_id.clone(),
         trust: wire_trust(trust),
         trust_reason,
-        trust_source: "jail",
+        trust_source,
         user: facts.user.as_deref().map(shown),
         uid: record.uid,
         project: shown(&record.project),
@@ -245,6 +280,12 @@ pub fn instance_view(
             scope_unit,
             launcher_path: shown(&record.launcher.path),
             launcher_root_owned: record.launcher.root_owned,
+            userns_closed: (record.jail.userns_closed == Some(true)).then_some(true),
+            userns_open_reason: if record.jail.userns_closed == Some(true) {
+                None
+            } else {
+                facts.userns_gap
+            },
         },
     }
 }
@@ -408,6 +449,7 @@ mod tests {
             judged,
             user: Some("dev".into()),
             project_dir: None,
+            userns_gap: None,
         }
     }
 
@@ -423,6 +465,53 @@ mod tests {
                 case_id: Some("cmd:contain:3".into()),
             }],
         }
+    }
+
+    /// The technical view says whether the jail was started with user
+    /// namespaces closed (from the record) or why this host's bwrap cannot
+    /// close them (from the host, only for a jail that did not), and it moves
+    /// no trust, badge or reason.
+    ///
+    /// FAILS ON REVERT: let the view raise or change the trust for the fact,
+    /// show the host's reason for a jail that closed them, or drop the field.
+    #[test]
+    fn user_namespaces_are_shown_in_the_technical_view_and_move_nothing() {
+        let label = label("observed", "launcher_not_trusted");
+        let base = facts(
+            ID,
+            true,
+            Some((Trust::Observed, Reason::LauncherNotTrusted)),
+        );
+        let plain = instance_view(&base, Some(&label));
+        assert_eq!(plain.technical.userns_closed, None);
+        assert_eq!(plain.technical.userns_open_reason, None);
+
+        let mut closed = base.clone();
+        closed.record.schema = 2;
+        closed.record.jail.userns_closed = Some(true);
+        closed.userns_gap = Some("bwrap_too_old");
+        let shown = instance_view(&closed, Some(&label));
+        assert_eq!(shown.technical.userns_closed, Some(true));
+        assert_eq!(
+            shown.technical.userns_open_reason, None,
+            "a jail that closed them has no reason to give"
+        );
+        assert_eq!(
+            (shown.trust, &shown.trust_reason, shown.trust_source),
+            (plain.trust, &plain.trust_reason, plain.trust_source)
+        );
+
+        let mut open = base.clone();
+        open.userns_gap = Some("bwrap_setuid");
+        let shown = instance_view(&open, Some(&label));
+        assert_eq!(shown.technical.userns_closed, None);
+        assert_eq!(shown.technical.userns_open_reason, Some("bwrap_setuid"));
+        assert_eq!(shown.trust, plain.trust);
+
+        let wire = serde_json::to_value(&instance_view(&base, Some(&label)).technical).unwrap();
+        assert!(wire.get("userns_closed").is_none() && wire.get("userns_open_reason").is_none());
+        let wire = serde_json::to_value(&instance_view(&closed, Some(&label)).technical).unwrap();
+        assert_eq!(wire["userns_closed"], true);
     }
 
     /// Nothing the Community dashboard reads is a witness from outside the
@@ -476,6 +565,30 @@ mod tests {
             (ended.trust, ended.trust_reason.as_str()),
             ("observed", "confined_by_namespace")
         );
+    }
+
+    /// A hook that says Active Defence on its host decided its rules is
+    /// shown `observed` with that reason, from the `host` source; a label
+    /// that claims `confined` beside it is capped all the same.
+    ///
+    /// FAILS ON REVERT: leave `host_decided` out of `reason_ceiling` and the
+    /// instance reads `declared`.
+    #[test]
+    fn a_host_decided_label_is_observed_from_the_host_source() {
+        assert_eq!(reason_ceiling("host_decided"), Trust::Observed);
+        let view = instance_view(
+            &facts(ID, false, None),
+            Some(&label("confined", "host_decided")),
+        );
+        assert_eq!(
+            (view.trust, view.trust_reason.as_str(), view.trust_source),
+            ("observed", "host_decided", "host")
+        );
+        let plain = instance_view(
+            &facts(ID, false, None),
+            Some(&label("observed", "confined_by_namespace")),
+        );
+        assert_eq!(plain.trust_source, "jail");
     }
 
     /// What the project's graph holds about an instance shows only where
@@ -624,6 +737,7 @@ mod tests {
             judged: None,
             user: None,
             project_dir: None,
+            userns_gap: None,
         });
         let mut activity = BTreeMap::new();
         activity.insert(ID.to_string(), label("confined", "confined_by_namespace"));
@@ -667,6 +781,7 @@ mod tests {
                 judged: None,
                 user: None,
                 project_dir: None,
+                userns_gap: None,
             })
             .collect();
         let row = row_trust("claude-code", &many, &BTreeMap::new(), true);

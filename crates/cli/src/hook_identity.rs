@@ -318,6 +318,39 @@ mod tests {
         }
     }
 
+    /// A forged version 2 record, field and all, reads exactly as the version
+    /// 1 record: `observed`, never more. A record of a version this build does
+    /// not know reads as unreadable (`declared`), not as anything above.
+    ///
+    /// FAILS ON REVERT: let the hook's reading use `userns_closed` to raise
+    /// the level, or read a schema it does not know.
+    #[test]
+    fn a_record_that_says_user_namespaces_are_closed_is_still_only_observed() {
+        let v2 = RECORD.replace("\"schema\": 1", "\"schema\": 2").replace(
+            "\"mnt_ns\": 4026532869 }",
+            "\"mnt_ns\": 4026532869, \"userns_closed\": true }",
+        );
+        assert_ne!(v2, RECORD);
+        let read = |record: &str| {
+            resolve(
+                &facts(record, true, Some(OWN_NS)),
+                Some("claude-code"),
+                None,
+            )
+            .unwrap()
+        };
+        let (with, without) = (read(&v2), read(RECORD));
+        assert_eq!((with.trust, with.reason), (without.trust, without.reason));
+        assert_eq!(with.trust, Trust::Observed);
+        let newer = v2.replace("\"schema\": 2", "\"schema\": 3");
+        let unknown = read(&newer);
+        assert_eq!(
+            (unknown.trust, unknown.reason),
+            (Trust::Declared, Reason::RecordUnreadable)
+        );
+        assert_eq!(unknown.instance_id, None);
+    }
+
     #[test]
     fn no_record_means_no_labels_at_all() {
         let none = JailFacts {

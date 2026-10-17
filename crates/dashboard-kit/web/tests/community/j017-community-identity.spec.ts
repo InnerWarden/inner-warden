@@ -11,8 +11,10 @@ import { expectHonestUpsell } from "./support";
  * - P1/P2: each agent says how far its own word is backed, why, and the one
  *   command that would back it further; its instances are listed, live first.
  * - P3/P4: an instance's session opens its case, which names the instance and
- *   the layer that decided, and says a relaxation was withheld because the
- *   instance does not run confined.
+ *   the layer that decided, and says once, below it, why the relaxation was
+ *   not applied: the sentence chosen when the page renders, for where it runs
+ *   (the fixture's platform is no Linux and no macOS, and Active Defence is
+ *   not installed, so the Linux sentence without Active Defence).
  * - P6: what people decided about agents is listed under Changes.
  *
  * Nothing on these screens says Protected or Protecting.
@@ -102,7 +104,11 @@ test("an instance's session opens its case, which says which layer decided and w
   await expect(identity.locator("[data-trust]")).toHaveAttribute("data-trust", "observed");
   const decided = card.locator("[data-decided-by-layer]");
   await expect(decided).toHaveAttribute("data-decided-by-layer", "general");
-  await expect(decided).toContainText("Sent for review by your general rules.");
-  await expect(decided).toContainText("but this instance does not run confined, so your general rules decided.");
+  await expect(decided).toHaveText("Sent for review by your general rules.");
+  const withheld = card.locator("[data-relaxation-withheld]");
+  await expect(withheld).toHaveCount(1);
+  await expect(withheld).toHaveText(
+    "Per-agent relaxations apply on Linux with Active Defence, for an agent started with innerwarden contain --identity.",
+  );
   await noProtectedWords(page);
 });

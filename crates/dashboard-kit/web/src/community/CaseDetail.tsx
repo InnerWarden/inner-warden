@@ -11,7 +11,7 @@ import { caseLadder, messageLadder } from "./ladder";
 import { OfferLine } from "./Offer";
 import { caseOffer, messageOffer } from "./offers";
 import { Ago, CARD, Chip, CopyCommand, Eyebrow, HiddenChip, OutcomeDot, tokenWrap } from "./parts";
-import { asVerdict, CHANNEL_WORDS, DECIDER_WORDS, layerLine, OUTCOME_WORDS, reasonWords, shortSession, TRUST_WORDS, type PlatformOs } from "./words";
+import { asVerdict, CHANNEL_WORDS, DECIDER_WORDS, layerLine, OUTCOME_WORDS, reasonWords, shortSession, trustWord, withheldWords, type PlatformOs } from "./words";
 
 /** A CLI sentence, printed as sent: text as text, a folder as code, a time through the page's clock. */
 export function Segments({ segments }: { segments: readonly Segment[] }) {
@@ -141,9 +141,15 @@ export function CaseDetail({
   const steps = withSeenTime(caseLadder({ outcomeKey: item.outcomeKey, mode: item.mode, decidedBy: item.decidedBy }), item.recordedAt);
   const notWhole = notWholeWords(item);
   const verdict = asVerdict(item.recommendation);
-  const layered = item.identity?.layer === undefined || verdict === undefined
+  const identity = item.identity;
+  const hostDecided = identity?.trustSource === "host" && identity.hostDecision !== undefined;
+  const layered = identity?.layer === undefined || verdict === undefined
     ? undefined
-    : layerLine(item.identity.layer, verdict, item.identity.trust, item.agent ?? item.agentId ?? "this agent", item.identity.relaxationWithheld);
+    : layerLine(identity.layer, verdict, identity.trust, item.agent ?? item.agentId ?? "this agent", hostDecided);
+  // Why a relaxation did not apply, worded for this page: once, grey, no link.
+  const withheld = identity !== undefined && (identity.relaxationWithheld || identity.hostWithheld !== undefined)
+    ? withheldWords(os, installed, identity.hostWithheld !== undefined)
+    : undefined;
   return (
     <div className="min-w-0 space-y-4">
       <section aria-labelledby="case-title" data-case={item.id} data-outcome-key={item.outcomeKey} className={CARD}>
@@ -180,6 +186,7 @@ export function CaseDetail({
           {layered === undefined ? null : (
             <Row term="Decided by">
               <p data-decided-by-layer={item.identity?.layer} data-identity-conflict={layered.conflict ? "" : undefined}>{layered.text}</p>
+              {withheld === undefined ? null : <p data-relaxation-withheld className="mt-1 text-xs text-slate-500">{withheld}</p>}
             </Row>
           )}
           <Row term="What you can do">
@@ -202,7 +209,7 @@ export function CaseDetail({
 function CaseIdentity({ item }: { item: Decision }) {
   const identity = item.identity;
   if (identity === undefined) return null;
-  const word = TRUST_WORDS[`${identity.trust}:jail`];
+  const word = trustWord(identity.trust, identity.trustSource);
   const who = item.agent ?? item.agentId ?? "This agent";
   const session = identity.sessionId ?? item.session;
   return (
@@ -220,8 +227,9 @@ function CaseIdentity({ item }: { item: Decision }) {
       </p>
       <TechnicalOnly>
         <p className="font-mono text-[11px] text-slate-500 [overflow-wrap:anywhere]">
-          {identity.instanceId === undefined ? "No instance on record" : `Instance ${identity.instanceId}`}. Trust decided by: the hook inside the jail ({identity.trustReason === "" ? "no reason recorded" : identity.trustReason}).
+          {identity.instanceId === undefined ? "No instance on record" : `Instance ${identity.instanceId}`}. Trust read by: the hook inside the jail ({identity.trustReason === "" ? "no reason recorded" : identity.trustReason}).
           {identity.layer === undefined ? "" : ` Deciding layer: ${identity.layer}${identity.profile === undefined ? "" : `, profile ${identity.profile}`}.`}
+          {identity.trustSource === "host" ? ` Rules decided by: Active Defence on this host${identity.hostDecision === undefined ? "" : ` (decision ${identity.hostDecision})`}.` : ""}
         </p>
       </TechnicalOnly>
     </div>

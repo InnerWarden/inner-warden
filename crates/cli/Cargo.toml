@@ -77,6 +77,11 @@ tokio = { version = "1", features = ["rt", "io-std", "time"] }
 # Blocking HTTP client for the verdict notifications. rustls TLS = pure Rust, no
 # C deps, stays Windows-clean.
 ureq = { version = "3", features = ["json"] }
+# The hook's one request to the Active Defence agent on its host is held to the
+# key that agent publishes, which ureq has no place for: the same rustls (with
+# ring) and webpki ureq already builds, used directly.
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["alloc"] }
 # Arrow-key first-run wizard (`innerwarden setup`): MultiSelect + Input + Password.
 # Same version the Active Defence ctl uses; default-features off keeps it lean + Windows-clean.
 dialoguer = { version = "0.12.0", default-features = false, features = ["password"] }
@@ -88,6 +93,8 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+# A certificate for the TLS server a test of that request talks to.
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
 
 # `cfg(tarpaulin)` is set by cargo-tarpaulin while instrumenting. Declared so a
 # test that opts out of a coverage run (tests/burst_does_not_block.rs) does not

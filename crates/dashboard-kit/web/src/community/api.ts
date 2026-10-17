@@ -7,6 +7,8 @@ import {
   asLayer,
   asLifecycle,
   asPlatform,
+  asTrustSource,
+  asUsernsOpenCode,
   asVerdict,
   effectiveTrust,
   isDecisionOutcome,
@@ -22,6 +24,8 @@ import {
   type MessageOutcomeKey,
   type PlatformOs,
   type Trust,
+  type TrustSource,
+  type UsernsOpenCode,
   type Verdict,
 } from "./words";
 
@@ -730,6 +734,8 @@ export type LocalInstance = {
   instanceId: string;
   trust: Trust;
   trustReason: string;
+  /** Who the label says decided its rules: the jail's own reading, or the host. */
+  trustSource?: TrustSource;
   user?: string;
   uid?: number;
   project?: string;
@@ -746,6 +752,10 @@ export type LocalInstance = {
     scopeUnit?: string;
     launcherPath?: string;
     launcherRootOwned?: boolean;
+    /** `true` when the jail was started with user namespaces closed; absent is "not said". */
+    usernsClosed?: boolean;
+    /** Why this host's bubblewrap cannot close them, for a jail that did not. */
+    usernsOpenReason?: UsernsOpenCode;
   };
 };
 
@@ -794,7 +804,8 @@ function readInstance(value: unknown): LocalInstance | undefined {
   const reason = plain(item.trust_reason, 64) ?? "";
   // The reason is the ceiling: a trust above what it supports is never shown,
   // and an instance whose label names another source is not a jail's word.
-  const claimed = item.trust_source === undefined || item.trust_source === "jail" ? (readTrust(item.trust) ?? "declared") : "declared";
+  const source = item.trust_source === undefined ? "jail" : asTrustSource(item.trust_source);
+  const claimed = source !== undefined ? (readTrust(item.trust) ?? "declared") : "declared";
   const sessions = Array.isArray(item.sessions)
     ? item.sessions.slice(0, MAX_SESSIONS).flatMap((entry): InstanceSession[] => {
         const session = record(entry);
@@ -809,6 +820,7 @@ function readInstance(value: unknown): LocalInstance | undefined {
     instanceId: id,
     trust: effectiveTrust(claimed, reason),
     trustReason: reason,
+    trustSource: source,
     user: plain(item.user, 64),
     uid: count(item.uid),
     project: plain(item.project, 120),
@@ -824,6 +836,8 @@ function readInstance(value: unknown): LocalInstance | undefined {
       scopeUnit: plain(technical?.scope_unit, 200),
       launcherPath: plain(technical?.launcher_path, 300),
       launcherRootOwned: bool(technical?.launcher_root_owned),
+      usernsClosed: technical?.userns_closed === true ? true : undefined,
+      usernsOpenReason: asUsernsOpenCode(technical?.userns_open_reason),
     }),
   });
 }
@@ -905,6 +919,12 @@ export type DecisionIdentity = {
   layer?: Layer;
   profile?: string;
   relaxationWithheld: boolean;
+  /** `host` when the hook asked Active Defence on its host and recorded its answer. */
+  trustSource?: TrustSource;
+  /** The host's id for its decision, as the hook recorded it. */
+  hostDecision?: string;
+  /** The host's word for not relaxing, kept without being read. */
+  hostWithheld?: string;
 };
 
 export function readDecisionIdentity(value: unknown): DecisionIdentity | undefined {
@@ -920,8 +940,16 @@ export function readDecisionIdentity(value: unknown): DecisionIdentity | undefin
     layer: asLayer(item.deciding_layer),
     profile: plain(item.profile, 64),
     relaxationWithheld: item.relaxation_withheld === true,
+    trustSource: asTrustSource(item.trust_source),
+    hostDecision: typeof item.host_decision === "string" && DECISION_ID.test(item.host_decision) ? item.host_decision : undefined,
+    hostWithheld: typeof item.host_withheld === "string" && WITHHELD_WORD.test(item.host_withheld) ? item.host_withheld : undefined,
   });
 }
+
+/** A host decision id as the hook records it: 32 lowercase hex characters. */
+const DECISION_ID = /^[0-9a-f]{32}$/;
+/** A host's word for not relaxing: 1 to 48 of `[a-z_]`. */
+const WITHHELD_WORD = /^[a-z_]{1,48}$/;
 
 /** The verdict a decision's recommendation names, for the layer's words. */
 export function decisionVerdict(recommendation: string): Verdict | undefined {

@@ -69,6 +69,24 @@ pub fn cmd(rest: &[String]) -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
+    // Before anything is installed or started: a jail reads the host's agent
+    // profiles through its own view of `/etc`, where the owners cannot be
+    // told apart, so the launcher proves here, with the real owners, that the
+    // way to that file is root's alone: always for an identified jail, and
+    // for a plain one where the file exists. A plain jail on a host without
+    // the file checks nothing and is the jail it always was.
+    #[cfg(target_os = "linux")]
+    let marks =
+        match crate::contain::launch::profiles_chain(args.identity, &system_profiles_entries()) {
+            crate::contain::launch::ProfilesChain::Refused(why) => {
+                eprintln!("{why}");
+                return ExitCode::from(2);
+            }
+            chain => chain.marks(),
+        };
+    #[cfg(not(target_os = "linux"))]
+    let marks = false;
+
     // An identified launch takes its jail settings from the agent type's
     // profile, where a profiles file exists; a flag given here still wins.
     // Without `--identity` no profile is read and the jail is what it was.
@@ -144,7 +162,7 @@ pub fn cmd(rest: &[String]) -> ExitCode {
     }
 
     if cfg!(target_os = "linux") {
-        run_linux(&input)
+        run_linux(&input, marks)
     } else if cfg!(target_os = "macos") {
         run_macos(&input)
     } else {
@@ -153,6 +171,39 @@ pub fn cmd(rest: &[String]) -> ExitCode {
         );
         ExitCode::from(2)
     }
+}
+
+/// Each entry on the way to the system profiles file, as the host shows it:
+/// `symlink_metadata`, never followed. A path that is not there, or that sits
+/// in a folder closed to this user, is absent.
+#[cfg(target_os = "linux")]
+fn system_profiles_entries() -> Vec<(PathBuf, crate::contain::launch::HostEntry)> {
+    use crate::contain::launch::{system_profiles_chain, HostEntry};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    system_profiles_chain()
+        .into_iter()
+        .map(|path| {
+            let entry = match std::fs::symlink_metadata(&path) {
+                Ok(meta) => HostEntry::Found {
+                    symlink: meta.file_type().is_symlink(),
+                    dir: meta.is_dir(),
+                    file: innerwarden_safe_io::is_regular_file(&meta),
+                    uid: meta.uid(),
+                    mode: meta.permissions().mode(),
+                },
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+                    ) || e.raw_os_error() == Some(libc::ENOTDIR) =>
+                {
+                    HostEntry::Absent
+                }
+                Err(_) => HostEntry::Unreadable,
+            };
+            (path, entry)
+        })
+        .collect()
 }
 
 fn mode_label(a: &ContainArgs) -> &'static str {
@@ -249,8 +300,11 @@ fn resolve_inputs(args: ContainArgs, home: PathBuf, iw_binary: PathBuf) -> JailI
         deny_paths,
         info_fd: None,
         record_fd: None,
+        key_fd: None,
+        profiles_marker_fd: None,
         records_dirs,
         child_env,
+        close_userns: false,
     }
 }
 
@@ -388,7 +442,7 @@ struct PathEntry {
 /// What [`backend_trusted`] decides from, read by [`backend_facts`].
 #[cfg(unix)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct BackendFacts {
+pub(crate) struct BackendFacts {
     /// Each component of the path as the trusted list spells it, from `/`
     /// down, ending at the first symlink if there is one.
     components: Vec<PathEntry>,
@@ -401,7 +455,7 @@ struct BackendFacts {
 /// Read the facts about `path`. `None`, which refuses the backend, when the
 /// path is relative or any entry on it cannot be inspected.
 #[cfg(unix)]
-fn backend_facts(path: &Path) -> Option<BackendFacts> {
+pub(crate) fn backend_facts(path: &Path) -> Option<BackendFacts> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     let entry = |at: &Path| {
@@ -449,28 +503,79 @@ fn backend_facts(path: &Path) -> Option<BackendFacts> {
 /// whoever can write any of them can replace the jail.
 #[cfg(unix)]
 fn backend_trusted(facts: &BackendFacts) -> bool {
-    let sound = |entry: &PathEntry| !entry.symlink && entry.uid == 0 && entry.mode & 0o022 == 0;
-    let Some((executable, directories)) = facts.chain.split_first() else {
-        return false;
-    };
-    !facts.components.is_empty()
-        && facts.components.iter().all(|entry| !entry.symlink)
-        && sound(executable)
-        && executable.file
-        && executable.mode & 0o111 != 0
-        && directories.iter().all(|entry| sound(entry) && entry.dir)
+    sound_root_file(facts, &|uid| uid == 0).is_some_and(|executable| executable.mode & 0o111 != 0)
 }
 
-fn run_linux(input: &JailInputs) -> ExitCode {
+/// Whether a file of root's these facts describe may be believed: the rules of
+/// [`backend_trusted`] for every entry on its path, with `root` saying which
+/// owner is root where the reader runs, and no execute bit asked for. PURE.
+#[cfg(unix)]
+pub(crate) fn root_file_trusted(facts: &BackendFacts, root: &dyn Fn(u32) -> bool) -> bool {
+    sound_root_file(facts, root).is_some()
+}
+
+/// The file the facts end at, when no entry on its path is a symlink, it is a
+/// regular file, and it and every directory above it are root's (`root`) and
+/// writable by no group and no other account.
+#[cfg(unix)]
+fn sound_root_file<'a>(
+    facts: &'a BackendFacts,
+    root: &dyn Fn(u32) -> bool,
+) -> Option<&'a PathEntry> {
+    let sound = |entry: &PathEntry| !entry.symlink && root(entry.uid) && entry.mode & 0o022 == 0;
+    let (file, directories) = facts.chain.split_first()?;
+    (!facts.components.is_empty()
+        && facts.components.iter().all(|entry| !entry.symlink)
+        && sound(file)
+        && file.file
+        && directories.iter().all(|entry| sound(entry) && entry.dir))
+    .then_some(file)
+}
+
+/// `marks`: the launcher proved the way to the system profiles file root's
+/// and the file is there, so a jail with no record gets the marker.
+fn run_linux(input: &JailInputs, marks: bool) -> ExitCode {
     // A dry run with `--identity` shows the arguments the real run adds.
     let dry_identity;
+    let dry_plain;
+    // What a real run would do about user namespaces in the jail, asked of the
+    // bwrap it would use: first whether the host's restriction stops the real
+    // run before any jail (then that is what is said, and nothing is probed),
+    // then the probe. A host with no bwrap says nothing here: the real run
+    // says it has none.
+    let userns = (input.args.identity && input.args.dry_run)
+        .then(|| {
+            resolve_backend(&["/usr/bin/bwrap", "/bin/bwrap", "/usr/local/bin/bwrap"]).map(
+                |bwrap| {
+                    crate::contain::launch::dry_run_userns(restriction_advice(&bwrap), || {
+                        userns_fact(&bwrap)
+                    })
+                },
+            )
+        })
+        .flatten();
     let planned = if input.args.identity && input.args.dry_run {
         dry_identity = JailInputs {
             info_fd: Some(crate::contain::launch::DRY_RUN_INFO_FD),
             record_fd: Some(crate::contain::launch::DRY_RUN_RECORD_FD),
+            // The key is handed in only when the host has one this launcher
+            // believes, as the real run does.
+            key_fd: host_key()
+                .is_some()
+                .then_some(crate::contain::launch::DRY_RUN_KEY_FD),
+            close_userns: userns
+                .as_ref()
+                .is_some_and(crate::contain::launch::DryRunUserns::close_userns),
             ..input.clone()
         };
         &dry_identity
+    } else if input.args.dry_run && marks {
+        // A plain jail shows the marker the real run hands in.
+        dry_plain = JailInputs {
+            profiles_marker_fd: Some(crate::contain::launch::DRY_RUN_MARKER_FD),
+            ..input.clone()
+        };
+        &dry_plain
     } else {
         input
     };
@@ -487,6 +592,9 @@ fn run_linux(input: &JailInputs) -> ExitCode {
         #[cfg(target_os = "linux")]
         if input.args.identity {
             println!("# {}", dry_run_scope_line());
+            for line in userns.iter().flat_map(|userns| userns.lines()) {
+                println!("{line}");
+            }
         }
         println!("bwrap \\");
         println!("  {}", plan.bwrap_args.join(" "));
@@ -500,16 +608,8 @@ fn run_linux(input: &JailInputs) -> ExitCode {
         return ExitCode::from(1);
     };
     // Say why the jail cannot be built BEFORE bwrap dies with an error that
-    // names neither the cause nor the fix. The sysctl file exists only on
-    // kernels that carry the restriction; the profile check is on disk because
-    // the loaded-profiles list is root-only.
-    let sysctl =
-        std::fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns").ok();
-    let profile_on_disk = Path::new("/etc/apparmor.d/bwrap").exists()
-        || Path::new("/etc/apparmor.d/usr.bin.bwrap").exists();
-    if let Some(lines) =
-        crate::contain::userns_restriction_advice(sysctl.as_deref(), profile_on_disk, &bwrap)
-    {
+    // names neither the cause nor the fix.
+    if let Some(lines) = restriction_advice(&bwrap) {
         for line in lines {
             eprintln!("{line}");
         }
@@ -517,10 +617,82 @@ fn run_linux(input: &JailInputs) -> ExitCode {
     }
     #[cfg(target_os = "linux")]
     if input.args.identity {
-        return run_linux_identified(input, &bwrap);
+        return run_linux_identified(input, &bwrap, marks);
     }
     announce(input);
+    if marks {
+        return run_unrecorded(&bwrap, input, marks);
+    }
     run_plain(&bwrap, &plan)
+}
+
+/// A jail with no launch record, as it runs: with the marker that the way to
+/// the system profiles file was proven root's when `marks`. A marker that
+/// cannot be handed in is none: the jail's hook then reads the file as it did
+/// before.
+fn run_unrecorded(bwrap: &Path, input: &JailInputs, marks: bool) -> ExitCode {
+    #[cfg(target_os = "linux")]
+    let marker = marks.then(marker_pipe).flatten();
+    #[cfg(target_os = "linux")]
+    let input = &JailInputs {
+        profiles_marker_fd: marker.as_ref().map(std::os::fd::AsRawFd::as_raw_fd),
+        ..input.clone()
+    };
+    #[cfg(not(target_os = "linux"))]
+    let _ = marks;
+    let code = match build_linux_jail(input) {
+        Ok(plan) => run_plain(bwrap, &plan),
+        Err(e) => {
+            eprintln!("innerwarden contain: {e}");
+            ExitCode::from(2)
+        }
+    };
+    // Ours closes only once bwrap has read it.
+    #[cfg(target_os = "linux")]
+    drop(marker);
+    code
+}
+
+/// A pipe that holds the marker whole, its write end closed so bwrap reads
+/// it to its end, its read end handed to bwrap.
+#[cfg(target_os = "linux")]
+fn marker_pipe() -> Option<std::io::PipeReader> {
+    use std::io::Write;
+    let (reader, mut writer) = std::io::pipe().ok()?;
+    writer
+        .write_all(crate::agent_profiles::SYSTEM_PROFILES_MARKER)
+        .ok()?;
+    drop(writer);
+    hand_to_child(&reader).then_some(reader)
+}
+
+/// What to say, and stop on, when this kernel restricts unprivileged user
+/// namespaces and `bwrap` has no AppArmor profile that grants it one. The
+/// sysctl file exists only on kernels that carry the restriction; the profile
+/// check is on disk because the loaded-profiles list is root-only.
+fn restriction_advice(bwrap: &Path) -> Option<Vec<String>> {
+    let sysctl =
+        std::fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns").ok();
+    let profile_on_disk = Path::new("/etc/apparmor.d/bwrap").exists()
+        || Path::new("/etc/apparmor.d/usr.bin.bwrap").exists();
+    crate::contain::userns_restriction_advice(sysctl.as_deref(), profile_on_disk, bwrap)
+}
+
+/// The key of Active Defence on this host, read from its file with the
+/// host's real owners (root's, in folders only root can write), for the
+/// launcher to hand into an identified jail. A file that is there and not
+/// believed is said once; with none, nothing is said and nothing is handed in.
+fn host_key() -> Option<[u8; 32]> {
+    let path = Path::new(innerwarden_agent_guard::identity::AGENT_TLS_SPKI_PATH);
+    let key = crate::host_decide_io::read_pin(path);
+    if key.is_none() && std::fs::symlink_metadata(path).is_ok() {
+        eprintln!(
+            "innerwarden contain: {} is not a key this launcher believes (it must be root's, in \
+             folders only root can write), so the jail's hook will not ask Active Defence",
+            path.display()
+        );
+    }
+    key
 }
 
 /// The jail as it runs without `--identity`: bwrap, its arguments, waited for.
@@ -671,7 +843,7 @@ fn own_records_dir(dir: &Path, owner_uid: u32) -> std::io::Result<()> {
 /// with an empty record (unreadable inside, so `declared`): an instance with no
 /// record is an unidentified one, which is what every instance was before.
 #[cfg(target_os = "linux")]
-fn run_linux_identified(input: &JailInputs, bwrap: &Path) -> ExitCode {
+fn run_linux_identified(input: &JailInputs, bwrap: &Path, marks: bool) -> ExitCode {
     use crate::contain::launch::{no_scope_sentence, plan_scope, NoScope, ScopePlan};
     use innerwarden_agent_guard::identity::scope_unit_name;
 
@@ -686,13 +858,9 @@ fn run_linux_identified(input: &JailInputs, bwrap: &Path) -> ExitCode {
                 "innerwarden contain: no instance record written ({why}); the jail runs, unidentified"
             );
             announce(input);
-            return match build_linux_jail(input) {
-                Ok(plan) => run_plain(bwrap, &plan),
-                Err(e) => {
-                    eprintln!("innerwarden contain: {e}");
-                    ExitCode::from(2)
-                }
-            };
+            // No record to say the way to the system profiles file was
+            // proven: the marker says it.
+            return run_unrecorded(bwrap, input, marks);
         }
     };
     // The records directory exists before the jail does, so the jail hides a
@@ -701,6 +869,14 @@ fn run_linux_identified(input: &JailInputs, bwrap: &Path) -> ExitCode {
     // SAFETY: getuid takes no arguments and cannot fail.
     let uid = unsafe { libc::getuid() };
     let mut input = input.clone();
+    // Once, before the jail is built: whether this host takes the option that
+    // keeps the jail's programs from making user namespaces. A host that does
+    // not runs the jail as it always did, and says why.
+    let userns = userns_fact(bwrap);
+    if let crate::contain::launch::UsernsFact::Open(why) = userns {
+        eprintln!("{}", crate::contain::launch::userns_open_sentence(why));
+    }
+    input.close_userns = userns.close_userns();
     if let Some(dir) = input.records_dirs.first() {
         if let Err(e) = own_records_dir(dir, uid) {
             eprintln!("innerwarden contain: the launcher's records folder is not usable ({e})");
@@ -710,13 +886,16 @@ fn run_linux_identified(input: &JailInputs, bwrap: &Path) -> ExitCode {
         .records_dirs
         .retain(|dir| std::fs::symlink_metadata(dir).is_ok());
     let input = &input;
+    // Read once, outside the jail, with the host's real owners: inside it the
+    // owners cannot be told apart, so the hook there reads only this copy.
+    let key = host_key();
     let mut scope = plan_scope(&scope_facts(), &unit);
     if let ScopePlan::None(why) = scope {
         eprintln!("{}", no_scope_sentence(why));
     }
     announce(input);
     loop {
-        match launch_identified(input, bwrap, &instance_id, &unit, &scope) {
+        match launch_identified(input, bwrap, &instance_id, &unit, &scope, key.as_ref()) {
             Attempt::Done(code) => return code,
             // Nothing of the jail ran: bwrap never reported a pid, and the
             // jail cannot pass the record it never got. Only the scope was
@@ -764,6 +943,7 @@ fn launch_identified(
     instance_id: &str,
     unit: &str,
     scope: &crate::contain::launch::ScopePlan,
+    key: Option<&[u8; 32]>,
 ) -> Attempt {
     use crate::contain::launch::{launch_argv, ScopePlan};
     use std::io::Write;
@@ -781,9 +961,21 @@ fn launch_identified(
         eprintln!("innerwarden contain: cannot hand the jail's pipes to bwrap");
         return Attempt::Done(ExitCode::from(1));
     }
+    // The key goes in whole before bwrap starts: one line, far below a pipe's
+    // buffer, and the launcher's end is closed so bwrap reads it to its end.
+    // A key that cannot be handed in is no key: the hook then never asks.
+    let key_reader = key.and_then(|key| {
+        let (reader, mut writer) = std::io::pipe().ok()?;
+        writer
+            .write_all(innerwarden_agent_guard::identity::spki_pin_line(key).as_bytes())
+            .ok()?;
+        drop(writer);
+        hand_to_child(&reader).then_some(reader)
+    });
     let mut identified = input.clone();
     identified.info_fd = Some(info_writer.as_raw_fd());
     identified.record_fd = Some(record_reader.as_raw_fd());
+    identified.key_fd = key_reader.as_ref().map(AsRawFd::as_raw_fd);
     let plan = match build_linux_jail(&identified) {
         Ok(p) => p,
         Err(e) => {
@@ -801,6 +993,7 @@ fn launch_identified(
     // the end of its record.
     drop(info_writer);
     drop(record_reader);
+    drop(key_reader);
     let mut child = match spawned {
         Ok(c) => c,
         Err(e) if matches!(scope, ScopePlan::User { .. }) => return Attempt::NeverStarted(Err(e)),
@@ -1036,6 +1229,7 @@ fn identify(
         mnt_ns,
         launcher_mnt_ns,
         scope: scopes,
+        userns_closed: input.close_userns,
     };
     let record = assemble_record(facts).map_err(|e| e.to_string())?;
     let json = serde_json::to_vec(&record).map_err(|e| e.to_string())?;
@@ -1161,6 +1355,107 @@ fn helper_env(command: &mut Command) {
         command.env_remove(name);
     }
     command.env("PATH", crate::contain::HELPER_PATH);
+}
+
+/// Whether bwrap runs from a file with the set-user-id bit, read from the same
+/// entry [`backend_trusted`] reads. A file that could not be read counts as
+/// setuid: nothing says it is not.
+#[cfg(unix)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn backend_setuid(facts: Option<&BackendFacts>) -> bool {
+    facts
+        .and_then(|facts| facts.chain.first())
+        .is_none_or(|executable| executable.mode & 0o4000 != 0)
+}
+
+/// What `bwrap --version` and the file's mode say about the bwrap at `bwrap`.
+#[cfg(target_os = "linux")]
+fn bwrap_facts(bwrap: &Path) -> crate::contain::launch::BwrapFacts {
+    let mut command = Command::new(bwrap);
+    helper_env(&mut command);
+    let version = command
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| {
+            crate::contain::launch::parse_bwrap_version(&String::from_utf8_lossy(&out.stdout))
+        });
+    crate::contain::launch::BwrapFacts {
+        version,
+        setuid: backend_setuid(backend_facts(bwrap).as_ref()),
+    }
+}
+
+/// Start the throwaway jail that tells whether this host takes the option:
+/// `true` only when it ran and exited 0 within five seconds.
+#[cfg(target_os = "linux")]
+fn userns_probe(bwrap: &Path) -> bool {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let mut command = Command::new(bwrap);
+    command
+        .args(crate::contain::launch::userns_probe_argv())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    helper_env(&mut command);
+    let Ok(mut child) = command.spawn() else {
+        return false;
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+}
+
+/// What an identified launch does about user namespaces in the jail, on this
+/// host's bwrap. Starts one process to read the version and, only if
+/// everything before it holds, one throwaway jail.
+#[cfg(target_os = "linux")]
+fn userns_fact(bwrap: &Path) -> crate::contain::launch::UsernsFact {
+    crate::contain::launch::userns_decision(true, &bwrap_facts(bwrap), || userns_probe(bwrap))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn userns_fact(_bwrap: &Path) -> crate::contain::launch::UsernsFact {
+    crate::contain::launch::UsernsFact::NotAsked
+}
+
+/// Why this host's bwrap cannot close user namespaces in a jail, if the file
+/// itself says so (too old, setuid): the word the dashboard shows for a jail
+/// that did not close them. The start-up probe is not run here, so a host that
+/// refused only that says nothing. Read once.
+pub(crate) fn host_userns_gap() -> Option<&'static str> {
+    #[cfg(target_os = "linux")]
+    {
+        use crate::contain::launch::{userns_decision, UsernsFact, UsernsWhy};
+        static GAP: std::sync::OnceLock<Option<&'static str>> = std::sync::OnceLock::new();
+        *GAP.get_or_init(|| {
+            let bwrap = resolve_backend(&["/usr/bin/bwrap", "/bin/bwrap", "/usr/local/bin/bwrap"])?;
+            match userns_decision(true, &bwrap_facts(&bwrap), || true) {
+                UsernsFact::Open(why @ (UsernsWhy::BwrapTooOld | UsernsWhy::BwrapSetuid)) => {
+                    Some(why.word())
+                }
+                _ => None,
+            }
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
 }
 
 /// What decides the user scope, read from this host.
@@ -1395,6 +1690,34 @@ fn print_plan_env(env: &[(String, String)]) {
 mod tests {
     use super::*;
 
+    /// Whether bwrap is setuid is read from the mode of the file it runs from;
+    /// a file that could not be read counts as setuid.
+    ///
+    /// FAILS ON REVERT: test another bit than the set-user-id one, or call an
+    /// unreadable file not setuid.
+    #[cfg(unix)]
+    #[test]
+    fn a_setuid_bwrap_is_told_by_its_mode() {
+        let at = |mode: u32| BackendFacts {
+            components: Vec::new(),
+            chain: vec![PathEntry {
+                symlink: false,
+                file: true,
+                dir: false,
+                uid: 0,
+                mode,
+            }],
+        };
+        assert!(backend_setuid(Some(&at(0o104755))), "setuid");
+        assert!(!backend_setuid(Some(&at(0o100755))), "plain");
+        assert!(!backend_setuid(Some(&at(0o102755))), "setgid is not setuid");
+        assert!(backend_setuid(Some(&BackendFacts {
+            components: Vec::new(),
+            chain: Vec::new(),
+        })));
+        assert!(backend_setuid(None));
+    }
+
     /// One loopback listener that answers its first request with `status`.
     #[cfg(unix)]
     fn answering(status: &'static str) -> String {
@@ -1626,6 +1949,61 @@ mod tests {
                 "{unsafe_fact}: the case changes nothing"
             );
             assert!(!backend_trusted(&facts), "trusted although {unsafe_fact}");
+        }
+    }
+
+    /// A file of root's that is read, not run (the key the hook holds the
+    /// host's answer to), is held to the backend's rules without an execute
+    /// bit, with root as the reader sees it.
+    ///
+    /// FAILS ON REVERT: drop the owner check from `sound_root_file` and the
+    /// file of another account is believed.
+    #[cfg(unix)]
+    #[test]
+    fn a_root_file_is_held_to_the_backends_rules_without_an_execute_bit() {
+        let mut key = installed();
+        key.chain[0] = file(0, 0o644);
+        key.components[3] = file(0, 0o644);
+        let root = |uid: u32| uid == 0;
+        assert!(root_file_trusted(&key, &root));
+        assert!(
+            !backend_trusted(&key),
+            "a backend still needs its execute bit"
+        );
+        let mut seen = key.clone();
+        for entry in seen.chain.iter_mut().chain(seen.components.iter_mut()) {
+            entry.uid = 65534;
+        }
+        assert!(!root_file_trusted(&seen, &root));
+        assert!(root_file_trusted(&seen, &|uid| uid == 65534));
+        type Case = (&'static str, fn(&mut BackendFacts));
+        let cases: &[Case] = &[
+            ("the file is another account's", |f| {
+                f.chain[0] = file(1000, 0o644)
+            }),
+            ("the file is group-writable", |f| {
+                f.chain[0] = file(0, 0o664)
+            }),
+            ("the file is a directory", |f| f.chain[0] = dir(0, 0o755)),
+            ("the file is a symlink", |f| f.chain[0] = link()),
+            ("a directory above it is world-writable", |f| {
+                f.chain[1] = dir(0, 0o757)
+            }),
+            ("a directory above it is another account's", |f| {
+                f.chain[2] = dir(1000, 0o755)
+            }),
+            ("a component as written is a symlink", |f| {
+                f.components[1] = link()
+            }),
+            ("nothing was resolved", |f| f.chain.clear()),
+        ];
+        for &(unsafe_fact, change) in cases {
+            let mut facts = key.clone();
+            change(&mut facts);
+            assert!(
+                !root_file_trusted(&facts, &root),
+                "trusted although {unsafe_fact}"
+            );
         }
     }
 

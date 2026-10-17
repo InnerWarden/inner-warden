@@ -179,6 +179,35 @@ relaxation is recorded in `agent-profiles.toml` and is not applied: your
 general rules keep deciding, and a decision says when a profile would have
 allowed it. A rule that TIGHTENS (refuses more) applies at every trust level.
 
+The hook in a jail never applies a relaxation on its own word. When your
+general rules send a shell command of an identified instance to review, the
+hook asks InnerWarden Active Defence on the same host, if it runs there, and
+the host decides. The hook keeps the stricter of its own decision and the
+host's, so a deny, your suppressions and your own profiles file still win, and
+the trust it records stays its own reading from inside the jail.
+
+Where a per-agent relaxation applies:
+
+- Linux;
+- the `innerwarden` that starts the jail is installed system-wide and owned by
+  root (for example `/usr/local/bin/innerwarden`), not in your home folder;
+- the agent was started with `innerwarden contain --identity`;
+- InnerWarden Active Defence runs on the same host with agent identity turned
+  on and an active licence, and it placed the jail in a scope of its own;
+- Active Defence can tell which jail the asking process belongs to;
+- shell commands your general rules sent to review (never MCP tools or file
+  edits);
+- the `innerwarden` inside the jail is a version that asks the host.
+
+Anywhere else the relaxation is recorded and not applied. Applies to shell
+commands only; MCP tools and file edits keep your general rules. A profile
+applies to any program started in a jail under its agent's name: the type is
+the name given at launch.
+
+Limits: this is not yet proven on RHEL 9 or Rocky 9, and where bubblewrap is
+older than 0.8 (or installed setuid) programs in the jail can still create user
+namespaces.
+
 ## Build from source
 
 Requires a stable Rust toolchain.

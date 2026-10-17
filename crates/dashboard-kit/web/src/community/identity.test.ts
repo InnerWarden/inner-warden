@@ -9,6 +9,8 @@ import { OFFER_KEYS } from "./dismiss";
 import {
   agentTrustSentence,
   effectiveTrust,
+  HOST_LAYER_WORDS,
+  HOST_WITHHELD_WORDS,
   LAYER_WORDS,
   layerLine,
   LAYERS,
@@ -19,9 +21,14 @@ import {
   REASON_WORDS,
   reasonWords,
   TRUST_WORDS,
+  trustWord,
   TRUSTS,
   UNKNOWN_REASON_WORDS,
+  USERNS_OPEN_CODES,
+  USERNS_OPEN_WORDS,
   VERDICTS,
+  WITHHELD_WORDS,
+  withheldWords,
 } from "./words";
 
 const ID = "3f9a0c1e5b7d42a8c6e1f0b2d4a69c87";
@@ -58,6 +65,32 @@ describe("trust never rises above its reason", () => {
     expect(row?.instances[0].trust).toBe("declared");
   });
 
+  it("reads a label from the host at the reason's ceiling, never as host verified", () => {
+    const row = readAgentIdentity({ id: "x", instances: [instance({ trust_source: "host", trust_reason: "host_decided" })] });
+    expect(row?.instances[0]).toMatchObject({ trust: "observed", trustReason: "host_decided", trustSource: "host" });
+    expect(REASON_TRUST.host_decided).toBe("observed");
+    expect(reasonWords("host_decided")).toBe("Active Defence on this host decided its rules.");
+    expect(trustWord("observed", "host")).toEqual({
+      label: "Observed",
+      tooltip: "Read from inside the jail; Active Defence on this host decided its rules.",
+      tone: "watch",
+    });
+    // A pair with no words of its own reads as the jail's.
+    expect(trustWord("declared", "host")).toEqual(TRUST_WORDS["declared:jail"]);
+    const decision = readDecisionIdentity({
+      trust: "host_verified",
+      trust_reason: "host_decided",
+      trust_source: "host",
+      host_decision: "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+      host_withheld: "a_word_never_heard",
+    });
+    expect(decision).toMatchObject({ trust: "observed", trustSource: "host", hostDecision: "0f1e2d3c4b5a69788796a5b4c3d2e1f0", hostWithheld: "a_word_never_heard" });
+    const odd = readDecisionIdentity({ trust: "observed", trust_reason: "x", trust_source: "kernel", host_decision: "ABC", host_withheld: "Kept, because" });
+    expect(odd?.trustSource).toBeUndefined();
+    expect(odd?.hostDecision).toBeUndefined();
+    expect(odd?.hostWithheld).toBeUndefined();
+  });
+
   it("has words, a trust and a sentence for every reason code, and every mode, layer and verdict", () => {
     for (const code of REASON_CODES) {
       expect(REASON_WORDS[code].length, code).toBeGreaterThan(10);
@@ -65,11 +98,18 @@ describe("trust never rises above its reason", () => {
     }
     for (const mode of LAUNCH_MODES) expect(LAUNCH_MODE_WORDS[mode]).toBeTruthy();
     for (const layer of LAYERS) expect(VERDICTS.some((verdict) => (LAYER_WORDS as Record<string, string>)[`${layer}:${verdict}`] !== undefined), layer).toBe(true);
-    expect(Object.keys(TRUST_WORDS).sort()).toEqual(["declared:jail", "declared:sensor", "host_verified:jail", "observed:jail"]);
+    expect(Object.keys(TRUST_WORDS).sort()).toEqual(["declared:jail", "declared:sensor", "host_verified:jail", "observed:host", "observed:jail"]);
   });
 
   it("keeps the kit's public words free of the other side's verification and of 'protect'", () => {
-    const all = [...Object.values(REASON_WORDS), ...Object.values(LAYER_WORDS), ...Object.values(TRUST_WORDS).flatMap((w) => [w.label, w.tooltip])].join(" ");
+    const all = [
+      ...Object.values(REASON_WORDS),
+      ...Object.values(LAYER_WORDS),
+      ...Object.values(HOST_LAYER_WORDS),
+      ...Object.values(WITHHELD_WORDS),
+      HOST_WITHHELD_WORDS,
+      ...Object.values(TRUST_WORDS).flatMap((w) => [w.label, w.tooltip]),
+    ].join(" ");
     expect(all).not.toMatch(/\bProtect(ed|ing)\b|sensor|kernel/i);
   });
 });
@@ -143,16 +183,42 @@ describe("the Overview sentence", () => {
 
 describe("the layer that decided", () => {
   it("words each layer and verdict, with the agent's name", () => {
-    expect(layerLine("agent_type", "allow", "host_verified", "Claude Code", false)?.text).toBe("Allowed by the Claude Code profile, because this instance runs confined.");
-    expect(layerLine("instance", "deny", "host_verified", "Claude Code", false)?.text).toBe("Refused by an exception for this instance.");
-    expect(layerLine("general", "allow", "declared", "Claude Code", true)?.text).toContain("The Claude Code profile would allow this, but this instance does not run confined");
-    expect(layerLine("hard", "review", "declared", "Claude Code", false)).toBeUndefined();
+    expect(layerLine("agent_type", "allow", "host_verified", "Claude Code")?.text).toBe("Allowed by the Claude Code profile, because this instance runs confined.");
+    expect(layerLine("instance", "deny", "host_verified", "Claude Code")?.text).toBe("Refused by an exception for this instance.");
+    expect(layerLine("general", "review", "observed", "Claude Code")?.text).toBe("Sent for review by your general rules.");
+    expect(layerLine("hard", "review", "declared", "Claude Code")).toBeUndefined();
+  });
+
+  it("words a profile's allowance the host decided neutrally, as what was recorded", () => {
+    expect(layerLine("agent_type", "allow", "observed", "Claude Code", true)).toEqual({
+      text: "Allowed by the Claude Code profile, decided by Active Defence on this host.",
+      conflict: false,
+    });
+    expect(layerLine("instance", "allow", "observed", "Claude Code", true)?.text).toBe(
+      "Allowed by an exception for this instance, decided by Active Defence on this host.",
+    );
+    expect(layerLine("agent_type", "deny", "observed", "Claude Code", true)?.text).toBe("Refused by the Claude Code profile.");
+  });
+
+  it("chooses why a relaxation did not apply when the page renders", () => {
+    expect(withheldWords("linux", false, false)).toBe(
+      "Per-agent relaxations apply on Linux with Active Defence, for an agent started with innerwarden contain --identity.",
+    );
+    expect(withheldWords("linux", true, false)).toBe("Active Defence on this host did not decide this command, so your general rules decided.");
+    expect(withheldWords("macos", false, false)).toBe(
+      "Per-agent relaxations do not apply on macOS: a jail there has no boundary a witness outside it can check.",
+    );
+    expect(withheldWords("macos", true, false)).toBe(WITHHELD_WORDS.macos);
+    for (const os of ["linux", "macos", "windows", "other"] as const) {
+      expect(withheldWords(os, true, true)).toBe("Active Defence on this host kept your general rules for this command.");
+    }
+    expect(withheldWords("windows", false, false)).toBe(WITHHELD_WORDS.linux);
   });
 
   it("never words an allowance by confinement for an instance that does not run confined", () => {
     for (const trust of ["declared", "observed"] as const) {
       for (const layer of ["agent_type", "instance"] as const) {
-        const line = layerLine(layer, "allow", trust, "Claude Code", false);
+        const line = layerLine(layer, "allow", trust, "Claude Code");
         expect(line?.conflict).toBe(true);
         expect(line?.text).not.toContain("runs confined");
       }
@@ -242,5 +308,25 @@ describe("the CLI's identity fixtures read as written", () => {
       sentence: "The agent profiles file cannot be used (x).",
     });
     expect(readProfilesFile({ ...agents, profiles_file: { state: "valid", sentence: "x" } })).toBeUndefined();
+  });
+});
+
+describe("user namespaces inside the jail are a fact, not a reason", () => {
+  it("none of their words is a reason code, and every code has its sentence", () => {
+    for (const code of USERNS_OPEN_CODES) {
+      expect((REASON_CODES as readonly string[]).includes(code), code).toBe(false);
+      expect(USERNS_OPEN_WORDS[code].length, code).toBeGreaterThan(20);
+      expect(effectiveTrust("host_verified", code), code).toBe("declared");
+    }
+  });
+
+  it("is read only as a closed jail or a known reason, and moves no trust", () => {
+    const read = (technical: Record<string, unknown>) => readAgentIdentity({ instances: [instance({ technical })] });
+    const first = (r: ReturnType<typeof read>) => r?.instances[0];
+    expect(first(read({ userns_closed: true }))?.technical.usernsClosed).toBe(true);
+    expect(first(read({ userns_closed: "true" }))?.technical.usernsClosed).toBeUndefined();
+    expect(first(read({ userns_open_reason: "bwrap_setuid" }))?.technical.usernsOpenReason).toBe("bwrap_setuid");
+    expect(first(read({ userns_open_reason: "confined" }))?.technical.usernsOpenReason).toBeUndefined();
+    expect(first(read({ userns_closed: true }))?.trust).toBe(first(read({}))?.trust);
   });
 });

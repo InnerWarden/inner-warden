@@ -269,8 +269,53 @@ describe("the Agents page with identity data", () => {
     const text = textOf(render(<CommunityAgents context={context()} />, withIdentity()));
     expect(text).toContain(`Instance ${ID_A}`);
     expect(text).toContain("Jail pid 2778, started at tick 1234567");
-    expect(text).toContain("Trust decided by: the hook inside the jail (launcher_not_trusted)");
+    expect(text).toContain("Trust read by: the hook inside the jail (launcher_not_trusted)");
+    expect(text).not.toContain("Trust decided by");
     expect(text).toContain("Launcher /home/dev/.local/bin/innerwarden, owned by root: no");
+  });
+});
+
+/** `withIdentity()` with user-namespace facts added to the technical block of each live instance. */
+function withUserns(technicalFor: (id: string) => Record<string, unknown>): AgentsResponse {
+  type Row = { instances?: { instance_id: string; technical?: object }[] };
+  const base = withIdentity();
+  return {
+    ...base,
+    agents: base.agents.map((agent) => ({
+      ...agent,
+      instances: ((agent as unknown as Row).instances ?? []).map((item) => ({ ...item, technical: { ...item.technical, ...technicalFor(item.instance_id) } })),
+    })),
+  } as unknown as AgentsResponse;
+}
+
+describe("user namespaces inside the jail, in the technical view", () => {
+  const USERNS_A = { userns_closed: true };
+  const USERNS_B = { userns_open_reason: "bwrap_too_old" };
+
+  it("says they were closed, or why this host cannot close them, and nothing else", () => {
+    const agents = withUserns((id) => (id === ID_A ? USERNS_A : USERNS_B));
+    seed(agents);
+    setTechnicalDetail(true);
+    const text = textOf(render(<CommunityAgents context={context()} />, agents));
+    expect(text).toContain("User namespaces closed inside the jail");
+    expect(text).toContain("Bubblewrap here is older than 0.8, so programs in the jail can still make user namespaces.");
+    // Only the two codes the CLI sends have words; any other is not shown.
+    const strange = withUserns(() => ({ userns_open_reason: "<b>x</b>", userns_closed: "yes" }));
+    seed(strange);
+    const other = textOf(render(<CommunityAgents context={context()} />, strange));
+    expect(other).not.toContain("User namespaces closed");
+    expect(other).not.toContain("Bubblewrap here");
+  });
+
+  it("is not a reason: the plain view, the trust and the reasons are what they were", () => {
+    const base = withIdentity();
+    seed(base);
+    const before = render(<CommunityAgents context={context()} />, base);
+    const agents = withUserns((id) => (id === ID_A ? USERNS_A : USERNS_B));
+    seed(agents);
+    const after = render(<CommunityAgents context={context()} />, agents);
+    expect(after).toBe(before);
+    expect(textOf(after)).not.toContain("namespaces");
   });
 });
 
@@ -302,9 +347,9 @@ describe("a case with identity", () => {
     const entry = Object.values(byId as Record<string, { item: { recommendation: string; agent?: string } }>).find((e) => e.item.recommendation === recommendation)!;
     return readDecisionDetail({ ...entry, item: { ...entry.item, identity } });
   }
-  const html = (identity: Record<string, unknown>, recommendation: string) => {
+  const html = (identity: Record<string, unknown>, recommendation: string, os: "macos" | "linux" = "macos", installed = false) => {
     const detail = detailWith(identity, recommendation);
-    return render(<CaseDetail item={detail.item} before={[]} after={[]} os="macos" installed={false} onOpen={() => undefined} onSession={() => undefined} />);
+    return render(<CaseDetail item={detail.item} before={[]} after={[]} os={os} installed={installed} onOpen={() => undefined} onSession={() => undefined} />);
   };
 
   it("names the instance and session, the trust and why, and the layer that decided", () => {
@@ -314,7 +359,55 @@ describe("a case with identity", () => {
     expect(text).toContain("Observed");
     expect(text).toContain("install it system-wide");
     expect(text).toContain("Sent for review by your general rules.");
-    expect(text).toContain("profile would allow this, but this instance does not run confined, so your general rules decided.");
+    expect(text).toContain("Per-agent relaxations do not apply on macOS: a jail there has no boundary a witness outside it can check.");
+    expect(out.match(/data-relaxation-withheld/g)?.length).toBe(1);
+  });
+
+  it("says why a relaxation did not apply in the words of the page it is on", () => {
+    const withheld = { instance_id: ID_A, trust: "observed", trust_reason: "confined_by_namespace", deciding_layer: "general", profile: "claude-code", relaxation_withheld: true };
+    expect(textOf(html(withheld, "review", "linux", false))).toContain(
+      "Per-agent relaxations apply on Linux with Active Defence, for an agent started with innerwarden contain --identity.",
+    );
+    expect(textOf(html(withheld, "review", "linux", true))).toContain("Active Defence on this host did not decide this command, so your general rules decided.");
+    const kept = { ...withheld, trust_source: "host", host_decision: "0f1e2d3c4b5a69788796a5b4c3d2e1f0", host_withheld: "a_word_never_heard" };
+    const text = textOf(html(kept, "review", "linux", true));
+    expect(text).toContain("Active Defence on this host kept your general rules for this command.");
+    expect(text).not.toContain("a_word_never_heard");
+    // The technical view names who read the trust and who decided the rules,
+    // and still never the host's word: the one sentence is all it says.
+    setTechnicalDetail(true);
+    const technical = textOf(html(kept, "review", "linux", true));
+    expect(technical).toContain("Trust read by: the hook inside the jail (confined_by_namespace).");
+    expect(technical).toContain("Rules decided by: Active Defence on this host (decision 0f1e2d3c4b5a69788796a5b4c3d2e1f0).");
+    expect(technical).not.toContain("Trust decided by");
+    expect(technical).not.toContain("a_word_never_heard");
+    expect(technical).not.toContain("Host word");
+    setTechnicalDetail(false);
+    const none = { ...withheld, relaxation_withheld: false };
+    expect(html(none, "review", "linux", true)).not.toContain("data-relaxation-withheld");
+  });
+
+  it("words an allowance the host decided neutrally, at observed, with no green badge", () => {
+    const decided = {
+      instance_id: ID_A,
+      trust: "host_verified",
+      trust_reason: "host_decided",
+      trust_source: "host",
+      host_decision: "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+      deciding_layer: "agent_type",
+      profile: "claude-code",
+      relaxation_withheld: false,
+    };
+    const out = html(decided, "allow", "linux", true);
+    const text = textOf(out);
+    expect(text).toContain("decided by Active Defence on this host.");
+    expect(out).not.toContain("data-identity-conflict");
+    expect(text).toContain("Observed");
+    expect(text).not.toContain("Confined");
+    expect(out).toContain('title="Read from inside the jail; Active Defence on this host decided its rules."');
+    // A host label without the host's decision is not taken as one.
+    const bare = { ...decided, host_decision: undefined };
+    expect(html(bare, "allow", "linux", true)).toContain("data-identity-conflict");
   });
 
   it("words a product rule as one nothing changes", () => {
