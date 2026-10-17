@@ -966,13 +966,33 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
             let agent_type = agent_profiles::agent_type(hook_agent.as_deref(), identity.as_ref());
             let instance_id = identity.as_ref().and_then(|id| id.instance_id.as_deref());
             let inside = agent_profiles::trust(identity.as_ref());
-            // A review of an instance is asked of the host where Active
+            let facts = agent_profiles::HookFacts {
+                command: &command,
+                verdict: &verdict,
+                blocks_today,
+                tainted: tainted.is_some(),
+                line_block_review: block_review,
+            };
+            let decide_at = |trust| {
+                agent_profiles::decide_hook(
+                    &facts,
+                    profiles,
+                    agent_type.as_deref(),
+                    instance_id,
+                    trust,
+                )
+            };
+            // The hook's own decision first, at its own reading: only a
+            // review by the general rules is one the host could relax.
+            let own = decide_at(inside);
+            // That review, for an instance, is asked of the host where Active
             // Defence runs; nothing else is, and without a 200 nothing changes.
             let url = host_decide::instance_decide_url(
                 std::env::var(agent_report::AGENT_URL_VAR).ok().as_deref(),
             );
             let asked = host_decide::should_ask(
                 agent_profiles::general_verdict(&verdict),
+                own.deciding_layer,
                 identity.as_ref(),
                 &profiles_state,
                 upsell_io::active_defence_installed,
@@ -1001,19 +1021,13 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
                 _ => None,
             };
             let reply = host_decide::read_reply(reply, instance_id);
-            let local = agent_profiles::decide_hook(
-                &agent_profiles::HookFacts {
-                    command: &command,
-                    verdict: &verdict,
-                    blocks_today,
-                    tainted: tainted.is_some(),
-                    line_block_review: block_review,
-                },
-                profiles,
-                agent_type.as_deref(),
-                instance_id,
-                host_decide::decision_trust(inside, &reply),
-            );
+            // Decided again only when the host's answer moves the trust.
+            let trust = host_decide::decision_trust(inside, &reply);
+            let local = if trust == inside {
+                own
+            } else {
+                decide_at(trust)
+            };
             let (decided, host) = host_decide::settle(
                 local,
                 &reply,
