@@ -108,13 +108,50 @@
 //! why), until the file is fixed or removed. A monitoring hook and an
 //! advisory proxy say so and let the call run. `contain --identity` refuses to
 //! start.
+//!
+//! # What the person decided about a type of agent
+//!
+//! `[agent.<agent type>]` holds the decisions the `innerwarden agents
+//! approve|profile|allow|revoke` verbs write (they edit the file in place and
+//! keep its comments; see [`edit_approve`] and its neighbours):
+//!
+//! ```toml
+//! [agent.claude-code]
+//! lifecycle = "approved"                   # or "revoked"; absent = discovered
+//! owner = "maria"
+//! profile = "engineering"                  # a [profile.<name>] of THIS file, or "general"
+//! approved_by = "maria"
+//! approved_at = "2026-10-17T09:00:00Z"
+//! revoked_instances = ["3f9a0c1e5b7d42a8c6e1f0b2d4a69c87"]
+//! allow_categories = ["bare_ip_fetch"]     # allowed from a case, confined instances only
+//! mcp_tools_allow = ["read_file"]
+//!
+//! [[agent.claude-code.exception]]          # one instance only, confined only
+//! instance_id = "3f9a0c1e5b7d42a8c6e1f0b2d4a69c87"
+//! category = "tmp_execution"               # or mcp_tool = "..."
+//! ```
+//!
+//! * `profile` picks the rules a type gets: another table of the same file,
+//!   or `general` for the general rules alone. With no `profile`, a type gets
+//!   `[profile.<agent type>]` when there is one, as before.
+//! * `allow_categories` and `mcp_tools_allow` here add to the type's profile;
+//!   an `exception` is the fourth layer, one instance's own allowance. Both
+//!   are relaxations: honoured only for a confined instance, refused at load
+//!   in the user's file, and never a hard signal.
+//! * A revoked type, or a revoked instance, is refused by the hard layer:
+//!   "Refused: this agent was revoked." The entry stays, with who approved it
+//!   and who revoked it, and nothing recorded about it is removed. The name
+//!   is the one the agent declares, so an agent outside a jail that gives
+//!   another name lands on the general rules, not on a refusal.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::identity::{decide, is_hard_signal, Decision, LayerRule, Layers, Trust, Verdict};
+use crate::identity::{
+    decide, is_hard_signal, is_instance_id, Decision, LayerRule, Layers, Lifecycle, Trust, Verdict,
+};
 use crate::mcp::SIGNAL_NAMES;
 
 /// The file's name, in both places.
@@ -132,11 +169,19 @@ pub const PROFILES_SCHEMA: u32 = 1;
 /// The largest file read. A file of profiles is a few kilobytes.
 pub const MAX_PROFILES_BYTES: usize = 64 * 1024;
 
+/// The `profile` an `[agent.<type>]` table names for the general rules alone.
+/// No `[profile.general]` table may exist.
+pub const GENERAL_PROFILE: &str = "general";
+
+/// The longest owner or operator name.
+pub const MAX_PERSON_NAME_CHARS: usize = 64;
+
 const MAX_TYPES: usize = 64;
 const MAX_ENTRIES: usize = 128;
 const MAX_TOOL_NAME_BYTES: usize = 128;
 const MAX_PATH_BYTES: usize = 4096;
 const MAX_GLOB_BYTES: usize = 255;
+const MAX_TIME_BYTES: usize = 64;
 
 // ---------------------------------------------------------------------------
 // The file as written
@@ -149,6 +194,49 @@ pub struct ProfilesFile {
     pub schema_version: u32,
     #[serde(default)]
     pub profile: BTreeMap<String, ProfileEntry>,
+    #[serde(default)]
+    pub agent: BTreeMap<String, AgentEntry>,
+}
+
+/// One `[agent.<agent type>]` table as written: what the person decided
+/// about that type.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentEntry {
+    #[serde(default)]
+    pub lifecycle: Option<String>,
+    #[serde(default)]
+    pub owner: Option<String>,
+    #[serde(default)]
+    pub profile: Option<String>,
+    #[serde(default)]
+    pub approved_by: Option<String>,
+    #[serde(default)]
+    pub approved_at: Option<String>,
+    #[serde(default)]
+    pub revoked_by: Option<String>,
+    #[serde(default)]
+    pub revoked_at: Option<String>,
+    #[serde(default)]
+    pub revoked_instances: Vec<String>,
+    #[serde(default)]
+    pub allow_categories: Vec<String>,
+    #[serde(default)]
+    pub mcp_tools_allow: Vec<String>,
+    #[serde(default)]
+    pub exception: Vec<ExceptionEntry>,
+}
+
+/// One `[[agent.<agent type>.exception]]` entry as written: one allowance
+/// for one instance.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExceptionEntry {
+    pub instance_id: String,
+    #[serde(default)]
+    pub category: Option<String>,
+    #[serde(default)]
+    pub mcp_tool: Option<String>,
 }
 
 /// One `[profile.<agent type>]` table as written.
@@ -220,6 +308,25 @@ pub struct JailProfile {
     pub deny_read: Vec<String>,
 }
 
+/// Which file a profile came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProfileSource {
+    /// [`SYSTEM_PROFILES_PATH`].
+    System,
+    /// The user's own file.
+    User,
+}
+
+impl ProfileSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProfileSource::System => "system",
+            ProfileSource::User => "user",
+        }
+    }
+}
+
 /// One type's profile, checked. Every list is sorted and has no repeats.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentProfile {
@@ -229,18 +336,135 @@ pub struct AgentProfile {
     pub mcp_tools_allow: Vec<String>,
     pub mcp_tools_deny: Vec<String>,
     pub jail: JailProfile,
+    /// The file it came from, once [`merge`] has put the two together (the
+    /// system file when both have it). `None` straight out of [`validate`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<ProfileSource>,
 }
 
-/// Every type's profile, checked, by agent type.
+/// One instance's own allowances (the fourth layer), checked and sorted.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstanceException {
+    pub categories: Vec<String>,
+    pub mcp_tools: Vec<String>,
+}
+
+/// What the person decided about one type of agent, checked. Lists sorted,
+/// no repeats.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentRecord {
+    /// `None` until someone approves or revokes it: discovered.
+    pub lifecycle: Option<Lifecycle>,
+    pub owner: Option<String>,
+    /// The profile assigned to the type: a profile's name, or
+    /// [`GENERAL_PROFILE`]. `None`: the type's own `[profile.<type>]`, if any.
+    pub profile: Option<String>,
+    pub approved_by: Option<String>,
+    pub approved_at: Option<String>,
+    pub revoked_by: Option<String>,
+    pub revoked_at: Option<String>,
+    pub revoked_instances: Vec<String>,
+    pub allow_categories: Vec<String>,
+    pub mcp_tools_allow: Vec<String>,
+    /// By instance id.
+    pub exceptions: BTreeMap<String, InstanceException>,
+}
+
+impl AgentRecord {
+    /// The lifecycle the record gives its type.
+    pub fn lifecycle(&self) -> Lifecycle {
+        self.lifecycle.unwrap_or(Lifecycle::Discovered)
+    }
+}
+
+/// Every type's profile, checked, by agent type, and what the person decided
+/// about each type.
+///
+/// Out of [`validate`], `types` are the file's tables as written; out of
+/// [`merge`], each type's rules as they apply (its assigned profile and the
+/// allowances added to it).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentProfiles {
     pub types: BTreeMap<String, AgentProfile>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub agents: BTreeMap<String, AgentRecord>,
+}
+
+/// Why a call is refused for a revocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Revocation {
+    /// The whole type was revoked.
+    AgentType,
+    /// The calling instance was.
+    Instance,
+}
+
+impl Revocation {
+    /// The sentence the refusal carries.
+    pub fn sentence(self) -> &'static str {
+        match self {
+            Revocation::AgentType => "Refused: this agent was revoked.",
+            Revocation::Instance => "Refused: this instance was revoked.",
+        }
+    }
+}
+
+/// What the person's decisions say about one call: the facts the hard and
+/// instance layers need, looked up once.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RecordFacts<'a> {
+    pub revoked: Option<Revocation>,
+    /// The calling instance's own allowances.
+    pub exception: Option<&'a InstanceException>,
 }
 
 impl AgentProfiles {
     /// The profile for `agent_type`, if there is one.
     pub fn get(&self, agent_type: &str) -> Option<&AgentProfile> {
         self.types.get(agent_type)
+    }
+
+    /// The decisions recorded about `agent_type`, if any.
+    pub fn record(&self, agent_type: &str) -> Option<&AgentRecord> {
+        self.agents.get(agent_type)
+    }
+
+    /// The lifecycle of `agent_type`: discovered when nothing was decided.
+    pub fn lifecycle(&self, agent_type: &str) -> Lifecycle {
+        self.record(agent_type)
+            .map(AgentRecord::lifecycle)
+            .unwrap_or(Lifecycle::Discovered)
+    }
+
+    /// Whether a call from `agent_type` (the name it declares, or the one its
+    /// record names) and `instance_id` (set only when the hook's namespace
+    /// matched its record) is refused for a revocation. An instance revoked
+    /// under any type is refused under every type.
+    pub fn revocation(
+        &self,
+        agent_type: Option<&str>,
+        instance_id: Option<&str>,
+    ) -> Option<Revocation> {
+        if agent_type.is_some_and(|name| self.lifecycle(name) == Lifecycle::Revoked) {
+            return Some(Revocation::AgentType);
+        }
+        let id = instance_id?;
+        self.agents
+            .values()
+            .any(|record| record.revoked_instances.iter().any(|r| r == id))
+            .then_some(Revocation::Instance)
+    }
+
+    /// The facts [`decide_shell_in`] and [`decide_tool_call_in`] take for one
+    /// call.
+    pub fn facts(&self, agent_type: Option<&str>, instance_id: Option<&str>) -> RecordFacts<'_> {
+        let exception = agent_type
+            .zip(instance_id)
+            .and_then(|(name, id)| self.record(name)?.exceptions.get(id));
+        RecordFacts {
+            revoked: self.revocation(agent_type, instance_id),
+            exception,
+        }
     }
 }
 
@@ -296,6 +520,13 @@ pub fn validate(file: ProfilesFile) -> Result<AgentProfiles, ProfileError> {
             file.profile.len()
         )));
     }
+    if file.agent.len() > MAX_TYPES {
+        return Err(ProfileError(format!(
+            "{} agent tables, more than the {MAX_TYPES} a file may hold",
+            file.agent.len()
+        )));
+    }
+    let names: BTreeSet<String> = file.profile.keys().cloned().collect();
     let mut types = BTreeMap::new();
     for (agent_type, entry) in file.profile {
         if !crate::hook::is_agent_id(&agent_type) {
@@ -304,10 +535,193 @@ pub fn validate(file: ProfilesFile) -> Result<AgentProfiles, ProfileError> {
                  at most 64"
             )));
         }
+        if agent_type == GENERAL_PROFILE {
+            return Err(ProfileError(format!(
+                "`[profile.{GENERAL_PROFILE}]`: `{GENERAL_PROFILE}` names your general rules, \
+                 so no profile may take that name"
+            )));
+        }
         let profile = validate_entry(&agent_type, entry)?;
         types.insert(agent_type, profile);
     }
-    Ok(AgentProfiles { types })
+    let mut agents = BTreeMap::new();
+    for (agent_type, entry) in file.agent {
+        if !crate::hook::is_agent_id(&agent_type) {
+            return Err(ProfileError(format!(
+                "`[agent.{agent_type}]`: not an agent type: lowercase letters, digits, `-` and \
+                 `_`, at most 64"
+            )));
+        }
+        let record = validate_agent(&agent_type, entry, &names)?;
+        agents.insert(agent_type, record);
+    }
+    Ok(AgentProfiles { types, agents })
+}
+
+fn agent_error(agent_type: &str, field: &str, why: impl fmt::Display) -> ProfileError {
+    ProfileError(format!("agent `{agent_type}`: {field}: {why}"))
+}
+
+/// A person's name as the file keeps it: 1 to 64 characters, no control
+/// character.
+pub fn is_person_name(name: &str) -> bool {
+    !name.trim().is_empty()
+        && name.chars().count() <= MAX_PERSON_NAME_CHARS
+        && !name.chars().any(char::is_control)
+}
+
+fn person(
+    agent_type: &str,
+    field: &str,
+    value: Option<String>,
+) -> Result<Option<String>, ProfileError> {
+    match value {
+        Some(name) if !is_person_name(&name) => Err(agent_error(
+            agent_type,
+            field,
+            format!("{name:?} is not a name (1 to {MAX_PERSON_NAME_CHARS} characters, no control character)"),
+        )),
+        other => Ok(other),
+    }
+}
+
+fn moment(
+    agent_type: &str,
+    field: &str,
+    value: Option<String>,
+) -> Result<Option<String>, ProfileError> {
+    match value {
+        Some(at)
+            if at.len() > MAX_TIME_BYTES || chrono::DateTime::parse_from_rfc3339(&at).is_err() =>
+        {
+            Err(agent_error(
+                agent_type,
+                field,
+                format!("{at:?} is not an RFC 3339 time"),
+            ))
+        }
+        other => Ok(other),
+    }
+}
+
+fn allowed_categories(
+    agent_type: &str,
+    field: &str,
+    list: Vec<String>,
+) -> Result<Vec<String>, ProfileError> {
+    let list = categories(agent_type, field, list)?;
+    if let Some(hard) = list.iter().find(|c| is_hard_signal(c)) {
+        return Err(error_at(
+            agent_type,
+            field,
+            format!("`{hard}` is a hard rule: nothing relaxes it"),
+        ));
+    }
+    Ok(list)
+}
+
+fn validate_agent(
+    agent_type: &str,
+    entry: AgentEntry,
+    profiles: &BTreeSet<String>,
+) -> Result<AgentRecord, ProfileError> {
+    let lifecycle = match entry.lifecycle.as_deref() {
+        None => None,
+        Some("approved") => Some(Lifecycle::Approved),
+        Some("revoked") => Some(Lifecycle::Revoked),
+        Some(other) => {
+            return Err(agent_error(
+                agent_type,
+                "lifecycle",
+                format!("unknown lifecycle `{other}` (use `approved` or `revoked`; a type nobody decided about has none)"),
+            ))
+        }
+    };
+    if let Some(name) = &entry.profile {
+        if name != GENERAL_PROFILE && !profiles.contains(name) {
+            return Err(agent_error(
+                agent_type,
+                "profile",
+                format!(
+                    "`{name}` names no [profile.{name}] in this file (use `{GENERAL_PROFILE}` for \
+                     the general rules)"
+                ),
+            ));
+        }
+    }
+    bounded(agent_type, "revoked_instances", &entry.revoked_instances)?;
+    if let Some(id) = entry
+        .revoked_instances
+        .iter()
+        .find(|id| !is_instance_id(id))
+    {
+        return Err(agent_error(
+            agent_type,
+            "revoked_instances",
+            format!("{id:?} is not an instance id"),
+        ));
+    }
+    let allow_categories =
+        allowed_categories(agent_type, "allow_categories", entry.allow_categories)?;
+    let mcp_tools_allow = tools(agent_type, "mcp_tools_allow", entry.mcp_tools_allow)?;
+    bounded_entries(agent_type, "exception", entry.exception.len())?;
+    let mut exceptions: BTreeMap<String, InstanceException> = BTreeMap::new();
+    for exception in entry.exception {
+        if !is_instance_id(&exception.instance_id) {
+            return Err(agent_error(
+                agent_type,
+                "exception.instance_id",
+                format!("{:?} is not an instance id", exception.instance_id),
+            ));
+        }
+        let slot = exceptions.entry(exception.instance_id).or_default();
+        match (exception.category, exception.mcp_tool) {
+            (Some(category), None) => {
+                let mut checked =
+                    allowed_categories(agent_type, "exception.category", vec![category])?;
+                slot.categories.append(&mut checked);
+            }
+            (None, Some(tool)) => {
+                let mut checked = tools(agent_type, "exception.mcp_tool", vec![tool])?;
+                slot.mcp_tools.append(&mut checked);
+            }
+            _ => {
+                return Err(agent_error(
+                    agent_type,
+                    "exception",
+                    "each exception names exactly one `category` or one `mcp_tool`",
+                ))
+            }
+        }
+    }
+    for slot in exceptions.values_mut() {
+        slot.categories = sorted(std::mem::take(&mut slot.categories));
+        slot.mcp_tools = sorted(std::mem::take(&mut slot.mcp_tools));
+    }
+    Ok(AgentRecord {
+        lifecycle,
+        owner: person(agent_type, "owner", entry.owner)?,
+        profile: entry.profile,
+        approved_by: person(agent_type, "approved_by", entry.approved_by)?,
+        approved_at: moment(agent_type, "approved_at", entry.approved_at)?,
+        revoked_by: person(agent_type, "revoked_by", entry.revoked_by)?,
+        revoked_at: moment(agent_type, "revoked_at", entry.revoked_at)?,
+        revoked_instances: sorted(entry.revoked_instances),
+        allow_categories,
+        mcp_tools_allow,
+        exceptions,
+    })
+}
+
+fn bounded_entries(agent_type: &str, field: &str, len: usize) -> Result<(), ProfileError> {
+    if len > MAX_ENTRIES {
+        return Err(agent_error(
+            agent_type,
+            field,
+            format!("{len} entries, more than {MAX_ENTRIES}"),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_entry(agent_type: &str, entry: ProfileEntry) -> Result<AgentProfile, ProfileError> {
@@ -370,6 +784,7 @@ fn validate_entry(agent_type: &str, entry: ProfileEntry) -> Result<AgentProfile,
         mcp_tools_allow,
         mcp_tools_deny,
         jail,
+        source: None,
     })
 }
 
@@ -508,8 +923,30 @@ fn validate_jail(agent_type: &str, jail: JailEntry) -> Result<JailProfile, Profi
 }
 
 /// Refuse a relaxation in the user's file (see the module notes): an
-/// `allow_categories` or `mcp_tools_allow` entry, or `mode = "enforce"`.
+/// `allow_categories` or `mcp_tools_allow` entry, `mode = "enforce"`, or, in
+/// an `[agent.<type>]` table, an allowance or an instance exception. A
+/// profile the user's file assigns is one of its own tables, so it cannot
+/// relax either.
 pub fn check_user_file(profiles: &AgentProfiles) -> Result<(), ProfileError> {
+    for (agent_type, record) in &profiles.agents {
+        let field = if !record.allow_categories.is_empty() {
+            "allow_categories"
+        } else if !record.mcp_tools_allow.is_empty() {
+            "mcp_tools_allow"
+        } else if !record.exceptions.is_empty() {
+            "exception"
+        } else {
+            continue;
+        };
+        return Err(agent_error(
+            agent_type,
+            field,
+            format!(
+                "only {SYSTEM_PROFILES_PATH} may relax a rule; the user's file can approve, \
+                 revoke, and assign a profile of its own"
+            ),
+        ));
+    }
     for (agent_type, profile) in &profiles.types {
         let field = if !profile.allow_categories.is_empty() {
             "allow_categories"
@@ -540,11 +977,28 @@ pub fn check_user_file(profiles: &AgentProfiles) -> Result<(), ProfileError> {
 /// file only ([`check_user_file`] refuses them in the other), and a category
 /// the system file allows and the user's file denies is denied when a
 /// decision is made. The project is the user's file's when it names one.
+///
+/// Each file is first resolved on its own ([`resolved_types`]): a type's
+/// assigned profile replaces its own table, and the allowances its
+/// `[agent.<type>]` table adds are put on it. A user's file that assigns
+/// `general` therefore cannot take away what the system file gives: it adds
+/// nothing, and the system file's rules for the type stand.
+///
+/// What was decided about a type is merged too: revoked if either file says
+/// so, approved if either does, the system file's names and times first,
+/// every revoked instance and every exception of both.
 pub fn merge(system: Option<&AgentProfiles>, user: Option<&AgentProfiles>) -> AgentProfiles {
     let mut types: BTreeMap<String, AgentProfile> = BTreeMap::new();
-    for profiles in [system, user].into_iter().flatten() {
-        for (agent_type, profile) in &profiles.types {
+    let sides = [
+        system.map(|p| resolved_types(p, ProfileSource::System)),
+        user.map(|p| resolved_types(p, ProfileSource::User)),
+    ];
+    for resolved in sides.iter().flatten() {
+        for (agent_type, profile) in resolved {
             let merged = types.entry(agent_type.clone()).or_default();
+            if merged.source.is_none() {
+                merged.source = profile.source;
+            }
             merged.mode = merged.mode.max(profile.mode);
             let union = |left: &[String], right: &[String]| {
                 sorted(left.iter().chain(right).cloned().collect())
@@ -560,7 +1014,98 @@ pub fn merge(system: Option<&AgentProfiles>, user: Option<&AgentProfiles>) -> Ag
             merged.jail.deny_read = union(&merged.jail.deny_read, &profile.jail.deny_read);
         }
     }
-    AgentProfiles { types }
+    let mut agents: BTreeMap<String, AgentRecord> = BTreeMap::new();
+    for profiles in [system, user].into_iter().flatten() {
+        for (agent_type, record) in &profiles.agents {
+            let merged = agents.entry(agent_type.clone()).or_default();
+            merge_record(merged, record);
+        }
+    }
+    AgentProfiles { types, agents }
+}
+
+/// Fold `next` (the user's file's record, after the system file's) into
+/// `merged`.
+fn merge_record(merged: &mut AgentRecord, next: &AgentRecord) {
+    let union = |left: &[String], right: &[String]| -> Vec<String> {
+        sorted(left.iter().chain(right).cloned().collect())
+    };
+    merged.lifecycle = match (merged.lifecycle, next.lifecycle) {
+        (Some(Lifecycle::Revoked), _) | (_, Some(Lifecycle::Revoked)) => Some(Lifecycle::Revoked),
+        (Some(Lifecycle::Approved), _) | (_, Some(Lifecycle::Approved)) => {
+            Some(Lifecycle::Approved)
+        }
+        _ => None,
+    };
+    let first = |left: &mut Option<String>, right: &Option<String>| {
+        if left.is_none() {
+            left.clone_from(right);
+        }
+    };
+    first(&mut merged.owner, &next.owner);
+    first(&mut merged.profile, &next.profile);
+    first(&mut merged.approved_by, &next.approved_by);
+    first(&mut merged.approved_at, &next.approved_at);
+    if merged.revoked_by.is_none() && merged.revoked_at.is_none() {
+        merged.revoked_by.clone_from(&next.revoked_by);
+        merged.revoked_at.clone_from(&next.revoked_at);
+    }
+    merged.revoked_instances = union(&merged.revoked_instances, &next.revoked_instances);
+    merged.allow_categories = union(&merged.allow_categories, &next.allow_categories);
+    merged.mcp_tools_allow = union(&merged.mcp_tools_allow, &next.mcp_tools_allow);
+    for (id, exception) in &next.exceptions {
+        let slot = merged.exceptions.entry(id.clone()).or_default();
+        slot.categories = union(&slot.categories, &exception.categories);
+        slot.mcp_tools = union(&slot.mcp_tools, &exception.mcp_tools);
+    }
+}
+
+/// One file's rules by type, as they apply: a type's assigned profile in
+/// place of its own table (none for [`GENERAL_PROFILE`]), and the allowances
+/// of its `[agent.<type>]` table added. Every profile is marked with `source`.
+pub fn resolved_types(
+    profiles: &AgentProfiles,
+    source: ProfileSource,
+) -> BTreeMap<String, AgentProfile> {
+    let mut types = profiles.types.clone();
+    for (agent_type, record) in &profiles.agents {
+        let mut base = match record.profile.as_deref() {
+            None => profiles.types.get(agent_type).cloned(),
+            Some(GENERAL_PROFILE) => None,
+            Some(name) => profiles.types.get(name).cloned(),
+        };
+        if !record.allow_categories.is_empty() || !record.mcp_tools_allow.is_empty() {
+            let profile = base.get_or_insert_with(AgentProfile::default);
+            profile.allow_categories = sorted(
+                profile
+                    .allow_categories
+                    .iter()
+                    .chain(&record.allow_categories)
+                    .cloned()
+                    .collect(),
+            );
+            profile.mcp_tools_allow = sorted(
+                profile
+                    .mcp_tools_allow
+                    .iter()
+                    .chain(&record.mcp_tools_allow)
+                    .cloned()
+                    .collect(),
+            );
+        }
+        match base {
+            Some(profile) => {
+                types.insert(agent_type.clone(), profile);
+            }
+            None => {
+                types.remove(agent_type);
+            }
+        }
+    }
+    for profile in types.values_mut() {
+        profile.source = Some(source);
+    }
+    types
 }
 
 // ---------------------------------------------------------------------------
@@ -680,16 +1225,54 @@ pub fn decide_shell(
     line_block_review: bool,
     trust: Trust,
 ) -> ShellOutcome {
+    decide_shell_in(
+        call,
+        profile,
+        RecordFacts::default(),
+        line_block_review,
+        trust,
+    )
+}
+
+/// What an instance's exception says about a screened command: `allow` when
+/// it carries at least one signal and the exception lists every one, as for
+/// a profile's `allow_categories`. An exception never denies.
+pub fn exception_command_rule(
+    exception: &InstanceException,
+    charged: &[&str],
+) -> Option<LayerRule> {
+    (!charged.is_empty()
+        && charged
+            .iter()
+            .all(|name| exception.categories.iter().any(|entry| entry == name)))
+    .then_some(LayerRule::Allow)
+}
+
+/// [`decide_shell`] with the person's decisions about the caller: a
+/// revocation is a hard refusal, and the calling instance's exception is the
+/// instance layer (an allowance, so [`decide`] honours it for a confined
+/// instance only).
+pub fn decide_shell_in(
+    call: &ShellCall<'_>,
+    profile: Option<(&str, &AgentProfile)>,
+    record: RecordFacts<'_>,
+    line_block_review: bool,
+    trust: Trust,
+) -> ShellOutcome {
     let hard_signal = call.blocks_today && call.charged.iter().any(|s| is_hard_signal(s));
     let agent_type = profile
         .and_then(|(_, p)| command_rule(p, call.charged))
         .filter(|rule| !(call.tainted && *rule == LayerRule::Allow));
+    let instance = record
+        .exception
+        .and_then(|exception| exception_command_rule(exception, call.charged))
+        .filter(|_| !call.tainted);
     let decision = decide(
         Layers {
-            hard_refused: call.names_llm_key || hard_signal,
+            hard_refused: call.names_llm_key || hard_signal || record.revoked.is_some(),
             general: call.general,
             agent_type,
-            instance: None,
+            instance,
         },
         trust,
     );
@@ -701,9 +1284,16 @@ pub fn decide_shell(
     };
     let name = profile.map(|(name, _)| name).unwrap_or("");
     let note = match (decision.deciding_layer, decision.verdict) {
+        (crate::identity::RuleLayer::Hard, _) if record.revoked.is_some() && !hard_signal => {
+            record.revoked.map(|r| r.sentence().to_string())
+        }
         (crate::identity::RuleLayer::Hard, _) if call.names_llm_key && !hard_signal => {
             Some("hard rule: the command reaches the guard's own LLM key".to_string())
         }
+        (crate::identity::RuleLayer::Instance, Verdict::Allow) => Some(format!(
+            "an exception for this confined instance allows {}",
+            call.charged.join(", ")
+        )),
         (crate::identity::RuleLayer::AgentType, Verdict::Deny) => {
             let denied = profile
                 .map(|(_, p)| {
@@ -767,6 +1357,18 @@ pub fn decide_tool_call(
     profile: Option<(&str, &AgentProfile)>,
     trust: Trust,
 ) -> (Decision, Option<String>) {
+    decide_tool_call_in(call, profile, None, trust)
+}
+
+/// [`decide_tool_call`] with a revocation of the caller, which is a hard
+/// refusal. The proxy has no review to relax, so an instance's exception
+/// changes nothing there and is not taken.
+pub fn decide_tool_call_in(
+    call: &ToolCallFacts<'_>,
+    profile: Option<(&str, &AgentProfile)>,
+    revoked: Option<Revocation>,
+    trust: Trust,
+) -> (Decision, Option<String>) {
     let general = if !call.allowed {
         Verdict::Deny
     } else if call.has_alerts {
@@ -779,7 +1381,7 @@ pub fn decide_tool_call(
     let agent_type = profile.and_then(|(_, p)| tool_rule(p, call.tool, call.charged));
     let decision = decide(
         Layers {
-            hard_refused: call.names_llm_key || hard_rule,
+            hard_refused: call.names_llm_key || hard_rule || revoked.is_some(),
             general,
             agent_type,
             instance: None,
@@ -788,6 +1390,9 @@ pub fn decide_tool_call(
     );
     let name = profile.map(|(name, _)| name).unwrap_or("");
     let note = match (decision.deciding_layer, decision.verdict) {
+        (crate::identity::RuleLayer::Hard, _) if revoked.is_some() && !hard_rule => {
+            revoked.map(|r| r.sentence().to_string())
+        }
         (crate::identity::RuleLayer::Hard, _) if call.names_llm_key && !hard_rule => {
             Some("hard rule: the call reaches the guard's own LLM key".to_string())
         }
@@ -810,6 +1415,9 @@ pub enum ProxyProfile {
         agent_type: Option<String>,
         profile: Option<AgentProfile>,
         trust: Trust,
+        /// The type or the instance was revoked when the proxy started:
+        /// every tool call is refused by the hard layer.
+        revoked: Option<Revocation>,
     },
     /// A file of profiles is there and cannot be used: every tool call is
     /// refused with this reason, which the proxy's mode then applies.
@@ -824,9 +1432,25 @@ pub enum ProxyProfile {
 /// the value it happened to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProfileChange {
+    /// The layer the change is to: `agent_type` for a profile, a type's
+    /// lifecycle or its assignment, `instance` for one instance's exception
+    /// or revocation.
+    pub layer: crate::identity::RuleLayer,
     pub action: String,
     pub agent_type: String,
     pub value: String,
+}
+
+impl ProfileChange {
+    /// A change to a type's profile.
+    pub fn to_type(action: &str, agent_type: &str, value: &str) -> Self {
+        ProfileChange {
+            layer: crate::identity::RuleLayer::AgentType,
+            action: action.to_string(),
+            agent_type: agent_type.to_string(),
+            value: value.to_string(),
+        }
+    }
 }
 
 /// Every change from `before` to `after`, additions and removals both, so the
@@ -835,11 +1459,7 @@ pub fn changes(before: &AgentProfiles, after: &AgentProfiles) -> Vec<ProfileChan
     let mut out = Vec::new();
     let empty = AgentProfile::default();
     let mut push = |action: &str, agent_type: &str, value: &str| {
-        out.push(ProfileChange {
-            action: action.to_string(),
-            agent_type: agent_type.to_string(),
-            value: value.to_string(),
-        });
+        out.push(ProfileChange::to_type(action, agent_type, value));
     };
     let mut names: Vec<&String> = before.types.keys().chain(after.types.keys()).collect();
     names.sort();
@@ -887,7 +1507,335 @@ pub fn changes(before: &AgentProfiles, after: &AgentProfiles) -> Vec<ProfileChan
             }
         }
     }
+    record_changes(before, after, &mut out);
     out
+}
+
+/// The changes to what was decided about each type: its lifecycle and its
+/// assignment (layer `agent_type`), and each instance's revocation and
+/// exceptions (layer `instance`, the value `<instance id> <what>`).
+fn record_changes(before: &AgentProfiles, after: &AgentProfiles, out: &mut Vec<ProfileChange>) {
+    use crate::identity::RuleLayer;
+    let empty = AgentRecord::default();
+    let mut names: Vec<&String> = before.agents.keys().chain(after.agents.keys()).collect();
+    names.sort();
+    names.dedup();
+    for name in names {
+        let old = before.agents.get(name).unwrap_or(&empty);
+        let new = after.agents.get(name).unwrap_or(&empty);
+        let mut push = |layer: RuleLayer, action: &str, value: &str| {
+            out.push(ProfileChange {
+                layer,
+                action: action.to_string(),
+                agent_type: name.clone(),
+                value: value.to_string(),
+            });
+        };
+        if old.lifecycle() != new.lifecycle() {
+            push(
+                RuleLayer::AgentType,
+                "lifecycle_changed",
+                new.lifecycle().as_str(),
+            );
+        }
+        if old.profile != new.profile {
+            push(
+                RuleLayer::AgentType,
+                "profile_assigned",
+                new.profile.as_deref().unwrap_or(""),
+            );
+        }
+        for id in new
+            .revoked_instances
+            .iter()
+            .filter(|id| !old.revoked_instances.contains(id))
+        {
+            push(RuleLayer::Instance, "instance_revoked", id);
+        }
+        for id in old
+            .revoked_instances
+            .iter()
+            .filter(|id| !new.revoked_instances.contains(id))
+        {
+            push(RuleLayer::Instance, "instance_revocation_removed", id);
+        }
+        let none = InstanceException::default();
+        let mut ids: Vec<&String> = old.exceptions.keys().chain(new.exceptions.keys()).collect();
+        ids.sort();
+        ids.dedup();
+        for id in ids {
+            let was = old.exceptions.get(id).unwrap_or(&none);
+            let is = new.exceptions.get(id).unwrap_or(&none);
+            for (label, was, is) in [
+                ("category", &was.categories, &is.categories),
+                ("mcp_tool", &was.mcp_tools, &is.mcp_tools),
+            ] {
+                for added in is.iter().filter(|v| !was.contains(v)) {
+                    push(
+                        RuleLayer::Instance,
+                        &format!("exception_{label}_added"),
+                        &format!("{id} {added}"),
+                    );
+                }
+                for removed in was.iter().filter(|v| !is.contains(v)) {
+                    push(
+                        RuleLayer::Instance,
+                        &format!("exception_{label}_removed"),
+                        &format!("{id} {removed}"),
+                    );
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// What a profile says, and whether a change widens it
+// ---------------------------------------------------------------------------
+
+/// The profile's rules as short sentences, for a person choosing one. `None`
+/// is the general rules alone.
+pub fn describe(profile: Option<&AgentProfile>) -> Vec<String> {
+    let Some(profile) = profile else {
+        return vec!["Your general rules, nothing added.".to_string()];
+    };
+    let mut out = Vec::new();
+    let list = |out: &mut Vec<String>, label: &str, items: &[String]| {
+        if !items.is_empty() {
+            out.push(format!("{label}: {}.", items.join(", ")));
+        }
+    };
+    list(
+        &mut out,
+        "Runs without review, when confined",
+        &profile.allow_categories,
+    );
+    list(&mut out, "Refused", &profile.deny_categories);
+    list(
+        &mut out,
+        "MCP tools let through, when confined",
+        &profile.mcp_tools_allow,
+    );
+    list(&mut out, "MCP tools refused", &profile.mcp_tools_deny);
+    match profile.mode {
+        Some(ProfileMode::BlockReview) => out.push("A review is refused too.".to_string()),
+        Some(ProfileMode::Enforce) => {
+            out.push("A review runs, when confined.".to_string());
+        }
+        None => {}
+    }
+    if let Some(project) = &profile.jail.project_rw {
+        out.push(format!("Project folder read-write in the jail: {project}."));
+    }
+    list(&mut out, "Read-only in the jail", &profile.jail.extra_ro);
+    list(&mut out, "Hidden in the jail", &profile.jail.deny_read);
+    if out.is_empty() {
+        out.push("Your general rules, nothing added.".to_string());
+    }
+    out
+}
+
+/// How strict a mode is: a review refused, the line's own, a review run.
+fn mode_strictness(mode: Option<ProfileMode>) -> u8 {
+    match mode {
+        Some(ProfileMode::BlockReview) => 2,
+        None => 1,
+        Some(ProfileMode::Enforce) => 0,
+    }
+}
+
+/// Whether going from `before` to `after` (`None`: the general rules) lets
+/// the agent do anything it could not: an allowance added, a refusal or a
+/// hidden path taken away, a looser mode, more read-only paths in the jail,
+/// another project folder.
+pub fn relaxes(before: Option<&AgentProfile>, after: Option<&AgentProfile>) -> bool {
+    let empty = AgentProfile::default();
+    let (before, after) = (before.unwrap_or(&empty), after.unwrap_or(&empty));
+    let gains = |old: &[String], new: &[String]| new.iter().any(|v| !old.contains(v));
+    gains(&before.allow_categories, &after.allow_categories)
+        || gains(&before.mcp_tools_allow, &after.mcp_tools_allow)
+        || gains(&after.deny_categories, &before.deny_categories)
+        || gains(&after.mcp_tools_deny, &before.mcp_tools_deny)
+        || mode_strictness(after.mode) < mode_strictness(before.mode)
+        || gains(&before.jail.extra_ro, &after.jail.extra_ro)
+        || gains(&after.jail.deny_read, &before.jail.deny_read)
+        || (after.jail.project_rw.is_some() && after.jail.project_rw != before.jail.project_rw)
+}
+
+// ---------------------------------------------------------------------------
+// Writing a decision into the file
+// ---------------------------------------------------------------------------
+
+/// Who made a change and when (RFC 3339), as the file records it.
+#[derive(Debug, Clone, Copy)]
+pub struct Stamp<'a> {
+    pub by: &'a str,
+    pub at: &'a str,
+}
+
+/// One allowance a case can add: a signal name, or an MCP tool.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum AllowRule {
+    Category(String),
+    McpTool(String),
+}
+
+impl AllowRule {
+    pub fn value(&self) -> &str {
+        match self {
+            AllowRule::Category(value) | AllowRule::McpTool(value) => value,
+        }
+    }
+
+    pub fn kind(&self) -> &'static str {
+        match self {
+            AllowRule::Category(_) => "category",
+            AllowRule::McpTool(_) => "mcp_tool",
+        }
+    }
+}
+
+fn edit_error(why: impl fmt::Display) -> ProfileError {
+    ProfileError(format!("the file cannot be edited: {why}"))
+}
+
+/// The file's text as an editable document; an absent or empty file is a new
+/// one with this build's schema.
+fn document(text: &str) -> Result<toml_edit::DocumentMut, ProfileError> {
+    if text.trim().is_empty() {
+        let mut doc = toml_edit::DocumentMut::new();
+        doc["schema_version"] = toml_edit::value(i64::from(PROFILES_SCHEMA));
+        return Ok(doc);
+    }
+    text.parse::<toml_edit::DocumentMut>().map_err(edit_error)
+}
+
+/// The `[agent.<agent_type>]` table, made when missing.
+fn agent_table<'d>(
+    doc: &'d mut toml_edit::DocumentMut,
+    agent_type: &str,
+) -> Result<&'d mut toml_edit::Table, ProfileError> {
+    if !crate::hook::is_agent_id(agent_type) {
+        return Err(edit_error(format!("`{agent_type}` is not an agent type")));
+    }
+    let agents = doc.entry("agent").or_insert_with(|| {
+        let mut table = toml_edit::Table::new();
+        table.set_implicit(true);
+        toml_edit::Item::Table(table)
+    });
+    let agents = agents
+        .as_table_mut()
+        .ok_or_else(|| edit_error("`agent` is not written as tables"))?;
+    agents
+        .entry(agent_type)
+        .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()))
+        .as_table_mut()
+        .ok_or_else(|| edit_error(format!("`agent.{agent_type}` is not written as a table")))
+}
+
+/// Add `value` to the array `key` of `table` unless it is there already.
+fn push_unique(table: &mut toml_edit::Table, key: &str, value: &str) -> Result<(), ProfileError> {
+    let item = table
+        .entry(key)
+        .or_insert_with(|| toml_edit::value(toml_edit::Array::new()));
+    let array = item
+        .as_array_mut()
+        .ok_or_else(|| edit_error(format!("`{key}` is not a list")))?;
+    if !array.iter().any(|v| v.as_str() == Some(value)) {
+        array.push(value);
+    }
+    Ok(())
+}
+
+/// Approve `agent_type`: its lifecycle, who approved it and when, and the
+/// owner and profile when given (`Some(GENERAL_PROFILE)` for the general
+/// rules). Returns the file's new text; nothing else in it changes. The
+/// caller checks the result with [`parse`] before writing it.
+pub fn edit_approve(
+    text: &str,
+    agent_type: &str,
+    owner: Option<&str>,
+    profile: Option<&str>,
+    stamp: Stamp<'_>,
+) -> Result<String, ProfileError> {
+    let mut doc = document(text)?;
+    let table = agent_table(&mut doc, agent_type)?;
+    table["lifecycle"] = toml_edit::value("approved");
+    if let Some(owner) = owner {
+        table["owner"] = toml_edit::value(owner);
+    }
+    if let Some(profile) = profile {
+        table["profile"] = toml_edit::value(profile);
+    }
+    table["approved_by"] = toml_edit::value(stamp.by);
+    table["approved_at"] = toml_edit::value(stamp.at);
+    Ok(doc.to_string())
+}
+
+/// Assign `profile` (a profile's name, or [`GENERAL_PROFILE`]) to
+/// `agent_type`.
+pub fn set_assignment(text: &str, agent_type: &str, profile: &str) -> Result<String, ProfileError> {
+    let mut doc = document(text)?;
+    agent_table(&mut doc, agent_type)?["profile"] = toml_edit::value(profile);
+    Ok(doc.to_string())
+}
+
+/// Add one allowance: to the type (`instance` `None`), or as an exception
+/// for one instance.
+pub fn add_allow(
+    text: &str,
+    agent_type: &str,
+    rule: &AllowRule,
+    instance: Option<&str>,
+) -> Result<String, ProfileError> {
+    let mut doc = document(text)?;
+    let table = agent_table(&mut doc, agent_type)?;
+    let Some(id) = instance else {
+        let key = match rule {
+            AllowRule::Category(_) => "allow_categories",
+            AllowRule::McpTool(_) => "mcp_tools_allow",
+        };
+        push_unique(table, key, rule.value())?;
+        return Ok(doc.to_string());
+    };
+    let exceptions = table
+        .entry("exception")
+        .or_insert_with(|| toml_edit::Item::ArrayOfTables(toml_edit::ArrayOfTables::new()))
+        .as_array_of_tables_mut()
+        .ok_or_else(|| edit_error("`exception` is not a list of tables"))?;
+    let exists = exceptions.iter().any(|entry| {
+        entry.get("instance_id").and_then(|v| v.as_str()) == Some(id)
+            && entry.get(rule.kind()).and_then(|v| v.as_str()) == Some(rule.value())
+    });
+    if !exists {
+        let mut entry = toml_edit::Table::new();
+        entry["instance_id"] = toml_edit::value(id);
+        entry[rule.kind()] = toml_edit::value(rule.value());
+        exceptions.push(entry);
+    }
+    Ok(doc.to_string())
+}
+
+/// Revoke the type (`instance` `None`), keeping who approved it, its owner,
+/// profile and exceptions; or add one instance to its revoked instances.
+pub fn revoke(
+    text: &str,
+    agent_type: &str,
+    instance: Option<&str>,
+    stamp: Stamp<'_>,
+) -> Result<String, ProfileError> {
+    let mut doc = document(text)?;
+    let table = agent_table(&mut doc, agent_type)?;
+    match instance {
+        Some(id) => push_unique(table, "revoked_instances", id)?,
+        None => {
+            table["lifecycle"] = toml_edit::value("revoked");
+            table["revoked_by"] = toml_edit::value(stamp.by);
+            table["revoked_at"] = toml_edit::value(stamp.at);
+        }
+    }
+    Ok(doc.to_string())
 }
 
 #[cfg(test)]
@@ -1426,5 +2374,509 @@ net = true
             .collect();
         assert_eq!(got, want);
         assert!(changes(&after, &after).is_empty());
+    }
+
+    // -- what the person decided -------------------------------------------
+
+    const ID: &str = "3f9a0c1e5b7d42a8c6e1f0b2d4a69c87";
+    const OTHER_ID: &str = "0000000000000000000000000000beef";
+
+    fn checked(text: &str) -> AgentProfiles {
+        parse(text.as_bytes()).unwrap_or_else(|e| panic!("{e}\n{text}"))
+    }
+
+    fn system(text: &str) -> AgentProfiles {
+        merge(Some(&checked(text)), None)
+    }
+
+    #[test]
+    fn an_agent_table_validates_into_a_record() {
+        let p = checked(&format!(
+            r#"
+schema_version = 1
+[profile.engineering]
+allow_categories = ["tmp_execution"]
+[agent.claude-code]
+lifecycle = "approved"
+owner = "maria"
+profile = "engineering"
+approved_by = "maria"
+approved_at = "2026-10-17T09:00:00Z"
+revoked_instances = ["{ID}"]
+allow_categories = ["bare_ip_fetch"]
+mcp_tools_allow = ["read_file"]
+[[agent.claude-code.exception]]
+instance_id = "{ID}"
+category = "tmp_execution"
+[[agent.claude-code.exception]]
+instance_id = "{ID}"
+mcp_tool = "save"
+"#
+        ));
+        let r = p.record("claude-code").unwrap();
+        assert_eq!(r.lifecycle(), Lifecycle::Approved);
+        assert_eq!(r.owner.as_deref(), Some("maria"));
+        assert_eq!(r.profile.as_deref(), Some("engineering"));
+        assert_eq!(r.revoked_instances, [ID]);
+        assert_eq!(r.allow_categories, ["bare_ip_fetch"]);
+        let e = &r.exceptions[ID];
+        assert_eq!(e.categories, ["tmp_execution"]);
+        assert_eq!(e.mcp_tools, ["save"]);
+        assert_eq!(p.lifecycle("cursor"), Lifecycle::Discovered);
+    }
+
+    #[test]
+    fn an_agent_table_that_cannot_mean_one_thing_is_refused() {
+        for (body, says) in [
+            ("lifecycle = \"discovered\"", "unknown lifecycle"),
+            ("profile = \"nope\"", "names no [profile.nope]"),
+            ("owner = \"\"", "is not a name"),
+            ("owner = \"a\\nb\"", "is not a name"),
+            ("approved_at = \"yesterday\"", "not an RFC 3339 time"),
+            ("revoked_instances = [\"../x\"]", "not an instance id"),
+            ("allow_categories = [\"nope\"]", "not a signal name"),
+            ("mcp_tools_allow = [\"two words\"]", "not a tool name"),
+            ("color = \"red\"", "not a profiles file"),
+        ] {
+            let err =
+                parse(format!("schema_version = 1\n[agent.claude-code]\n{body}\n").as_bytes())
+                    .unwrap_err()
+                    .to_string();
+            assert!(err.contains(says), "{body}: {err}");
+        }
+        for (exception, says) in [
+            (format!("instance_id = \"{ID}\""), "exactly one"),
+            (
+                format!("instance_id = \"{ID}\"\ncategory = \"tmp_execution\"\nmcp_tool = \"x\""),
+                "exactly one",
+            ),
+            (
+                "instance_id = \"BAD\"\ncategory = \"tmp_execution\"".to_string(),
+                "not an instance id",
+            ),
+        ] {
+            let text = format!(
+                "schema_version = 1\n[agent.claude-code]\n[[agent.claude-code.exception]]\n{exception}\n"
+            );
+            let err = parse(text.as_bytes()).unwrap_err().to_string();
+            assert!(err.contains(says), "{text}: {err}");
+        }
+        let err = parse(b"schema_version = 1\n[profile.general]\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("names your general rules"), "{err}");
+    }
+
+    /// An allow, by profile, by type or by instance, never reaches the hard
+    /// layer: refused at load wherever it is written.
+    ///
+    /// FAILS ON REVERT: drop the hard check from `allowed_categories` and the
+    /// agent table and the exception load.
+    #[test]
+    fn an_allow_of_a_hard_signal_is_refused_in_an_agent_table_and_an_exception() {
+        for hard in [
+            "download_and_execute",
+            "guard_self_disable",
+            "sensitive_credential_read",
+        ] {
+            for text in [
+                format!("schema_version = 1\n[agent.claude-code]\nallow_categories = [\"{hard}\"]\n"),
+                format!(
+                    "schema_version = 1\n[agent.claude-code]\n[[agent.claude-code.exception]]\ninstance_id = \"{ID}\"\ncategory = \"{hard}\"\n"
+                ),
+            ] {
+                let err = parse(text.as_bytes()).unwrap_err().to_string();
+                assert!(err.contains("is a hard rule"), "{text}: {err}");
+            }
+        }
+    }
+
+    /// FAILS ON REVERT: skip the `[agent]` loop in `check_user_file` and the
+    /// user's file relaxes through it.
+    #[test]
+    fn the_users_file_can_decide_but_never_relax_through_an_agent_table() {
+        for body in [
+            "allow_categories = [\"bare_ip_fetch\"]".to_string(),
+            "mcp_tools_allow = [\"read_file\"]".to_string(),
+            format!("[[agent.claude-code.exception]]\ninstance_id = \"{ID}\"\ncategory = \"bare_ip_fetch\""),
+        ] {
+            let user = checked(&format!("schema_version = 1\n[agent.claude-code]\n{body}\n"));
+            let err = check_user_file(&user).unwrap_err().to_string();
+            assert!(err.contains("only /etc/innerwarden"), "{body}: {err}");
+        }
+        let deciding = checked(&format!(
+            "schema_version = 1\n[profile.strict]\ndeny_categories = [\"bare_ip_fetch\"]\n[agent.claude-code]\nlifecycle = \"revoked\"\nprofile = \"strict\"\nrevoked_instances = [\"{ID}\"]\n"
+        ));
+        assert_eq!(check_user_file(&deciding), Ok(()));
+    }
+
+    #[test]
+    fn an_assignment_replaces_the_types_own_table_and_general_takes_it_away() {
+        let text = |assignment: &str| {
+            format!(
+                "schema_version = 1\n[profile.claude-code]\nallow_categories = [\"tmp_execution\"]\n[profile.engineering]\nallow_categories = [\"bare_ip_fetch\"]\n[agent.claude-code]\n{assignment}\n"
+            )
+        };
+        let own = system(&text(""));
+        assert_eq!(
+            own.get("claude-code").unwrap().allow_categories,
+            ["tmp_execution"]
+        );
+        assert_eq!(
+            own.get("claude-code").unwrap().source,
+            Some(ProfileSource::System)
+        );
+        let assigned = system(&text("profile = \"engineering\""));
+        assert_eq!(
+            assigned.get("claude-code").unwrap().allow_categories,
+            ["bare_ip_fetch"]
+        );
+        assert!(system(&text("profile = \"general\""))
+            .get("claude-code")
+            .is_none());
+        // An allowance from a case is added to whatever the type gets.
+        let added = system(&text(
+            "profile = \"general\"\nallow_categories = [\"tmp_execution\"]\nmcp_tools_allow = [\"save\"]",
+        ));
+        let p = added.get("claude-code").unwrap();
+        assert_eq!(p.allow_categories, ["tmp_execution"]);
+        assert_eq!(p.mcp_tools_allow, ["save"]);
+    }
+
+    /// The user's file cannot take away what the system file gives, and its
+    /// decisions merge with the system's without losing a revocation.
+    #[test]
+    fn the_users_assignment_adds_nothing_and_a_revocation_in_either_file_holds() {
+        let sys = checked(
+            "schema_version = 1\n[profile.engineering]\nallow_categories = [\"bare_ip_fetch\"]\n[agent.claude-code]\nlifecycle = \"approved\"\nowner = \"ops\"\nprofile = \"engineering\"\n",
+        );
+        let user = checked(&format!(
+            "schema_version = 1\n[agent.claude-code]\nlifecycle = \"revoked\"\nowner = \"dev\"\nprofile = \"general\"\nrevoked_by = \"dev\"\nrevoked_at = \"2026-10-17T10:00:00Z\"\nrevoked_instances = [\"{ID}\"]\n"
+        ));
+        let merged = merge(Some(&sys), Some(&user));
+        assert_eq!(
+            merged.get("claude-code").unwrap().allow_categories,
+            ["bare_ip_fetch"]
+        );
+        let r = merged.record("claude-code").unwrap();
+        assert_eq!(r.lifecycle(), Lifecycle::Revoked);
+        assert_eq!(
+            r.owner.as_deref(),
+            Some("ops"),
+            "the system file's names first"
+        );
+        assert_eq!(r.revoked_by.as_deref(), Some("dev"));
+        assert_eq!(r.revoked_instances, [ID]);
+    }
+
+    /// Revoked: refused by the hard layer at every trust and on every line,
+    /// whatever the profile allows. A revoked instance is refused under any
+    /// type it names.
+    ///
+    /// FAILS ON REVERT: leave `record.revoked` out of `hard_refused` and the
+    /// allowed review runs for the confined instance.
+    #[test]
+    fn a_revoked_type_or_instance_is_refused_by_the_hard_layer() {
+        let p = system(&format!(
+            "schema_version = 1\n[profile.claude-code]\nallow_categories = [\"bare_ip_fetch\"]\n[agent.claude-code]\nlifecycle = \"revoked\"\n[agent.cursor]\nrevoked_instances = [\"{ID}\"]\n"
+        ));
+        let call = shell(Verdict::Review, &["bare_ip_fetch"], false);
+        let quiet = shell(Verdict::Allow, &[], false);
+        for trust in ALL_TRUST {
+            for line_block_review in [false, true] {
+                for c in [&call, &quiet] {
+                    let named = Some(("claude-code", p.get("claude-code").unwrap()));
+                    let out = decide_shell_in(
+                        c,
+                        named,
+                        p.facts(Some("claude-code"), None),
+                        line_block_review,
+                        trust,
+                    );
+                    assert_eq!(
+                        (out.decision.verdict, out.decision.deciding_layer),
+                        (Verdict::Deny, RuleLayer::Hard),
+                        "{trust:?}"
+                    );
+                    assert!(out.blocks);
+                    assert_eq!(
+                        out.note.as_deref(),
+                        Some("Refused: this agent was revoked.")
+                    );
+                }
+            }
+            let out = decide_shell_in(&quiet, None, p.facts(Some("aider"), Some(ID)), false, trust);
+            assert_eq!(out.decision.deciding_layer, RuleLayer::Hard);
+            assert_eq!(
+                out.note.as_deref(),
+                Some("Refused: this instance was revoked.")
+            );
+        }
+        assert_eq!(p.revocation(Some("cursor"), Some(OTHER_ID)), None);
+        assert_eq!(p.revocation(None, None), None);
+        let (d, note) = decide_tool_call_in(
+            &ToolCallFacts {
+                tool: "weather",
+                allowed: true,
+                has_alerts: false,
+                charged: &[],
+                hard_alert: false,
+                names_llm_key: false,
+            },
+            None,
+            Some(Revocation::AgentType),
+            Trust::Confined,
+        );
+        assert_eq!(
+            (d.verdict, d.deciding_layer),
+            (Verdict::Deny, RuleLayer::Hard)
+        );
+        assert_eq!(note.as_deref(), Some("Refused: this agent was revoked."));
+    }
+
+    /// An exception is one instance's, and only a confined one's: the same
+    /// instance id from a declared or observed caller gets the general
+    /// policy, and another instance gets nothing.
+    ///
+    /// FAILS ON REVERT: relax the instance layer for `Observed` in
+    /// `identity::decide` and the observed row turns `allow`.
+    #[test]
+    fn an_exception_relaxes_only_its_confined_instance() {
+        let p = system(&format!(
+            "schema_version = 1\n[[agent.claude-code.exception]]\ninstance_id = \"{ID}\"\ncategory = \"bare_ip_fetch\"\n"
+        ));
+        let call = shell(Verdict::Review, &["bare_ip_fetch"], true);
+        let facts = p.facts(Some("claude-code"), Some(ID));
+        assert!(facts.exception.is_some());
+        let out = decide_shell_in(&call, None, facts, true, Trust::Confined);
+        assert_eq!(
+            (out.decision.verdict, out.decision.deciding_layer),
+            (Verdict::Allow, RuleLayer::Instance)
+        );
+        assert!(!out.blocks);
+        assert!(out
+            .note
+            .unwrap()
+            .contains("exception for this confined instance"));
+        for trust in [Trust::Declared, Trust::Observed] {
+            let out = decide_shell_in(&call, None, facts, true, trust);
+            assert_eq!(
+                (out.decision.verdict, out.decision.deciding_layer),
+                (Verdict::Review, RuleLayer::General),
+                "{trust:?}"
+            );
+            assert!(out.blocks);
+        }
+        let other = p.facts(Some("claude-code"), Some(OTHER_ID));
+        assert_eq!(other.exception, None);
+        // An argument from a tool result is not relaxed, and a general deny
+        // is never lifted.
+        let mut tainted = call;
+        tainted.tainted = true;
+        assert!(decide_shell_in(&tainted, None, facts, true, Trust::Confined).blocks);
+        let deny = shell(Verdict::Deny, &["bare_ip_fetch"], true);
+        assert!(decide_shell_in(&deny, None, facts, false, Trust::Confined).blocks);
+    }
+
+    // -- writing a decision --------------------------------------------------
+
+    const STAMP: Stamp<'static> = Stamp {
+        by: "maria",
+        at: "2026-10-17T09:00:00Z",
+    };
+
+    #[test]
+    fn an_approval_is_written_into_a_new_or_existing_file_keeping_its_comments() {
+        let fresh = edit_approve("", "claude-code", Some("maria"), Some("general"), STAMP).unwrap();
+        let p = checked(&fresh);
+        let r = p.record("claude-code").unwrap();
+        assert_eq!(r.lifecycle(), Lifecycle::Approved);
+        assert_eq!(r.approved_by.as_deref(), Some("maria"));
+        assert_eq!(r.profile.as_deref(), Some("general"));
+
+        let hand = "# ours, keep this\nschema_version = 1\n\n[profile.claude-code] # note\ndeny_categories = [\"bare_ip_fetch\"]\n";
+        let edited = edit_approve(hand, "claude-code", None, None, STAMP).unwrap();
+        assert!(edited.contains("# ours, keep this"), "{edited}");
+        assert!(edited.contains("# note"), "{edited}");
+        let p = checked(&edited);
+        assert_eq!(p.lifecycle("claude-code"), Lifecycle::Approved);
+        assert_eq!(p.types["claude-code"].deny_categories, ["bare_ip_fetch"]);
+    }
+
+    /// Revoking keeps the history: who approved it, its owner and profile
+    /// stay, and an instance revocation adds to the list.
+    #[test]
+    fn a_revocation_keeps_what_was_decided_before() {
+        let approved =
+            edit_approve("", "claude-code", Some("ops"), Some("general"), STAMP).unwrap();
+        let revoked = revoke(
+            &approved,
+            "claude-code",
+            None,
+            Stamp {
+                by: "dev",
+                at: "2026-10-18T09:00:00Z",
+            },
+        )
+        .unwrap();
+        let revoked = revoke(&revoked, "claude-code", Some(ID), STAMP).unwrap();
+        let revoked = revoke(&revoked, "claude-code", Some(ID), STAMP).unwrap();
+        let p = checked(&revoked);
+        let r = p.record("claude-code").unwrap();
+        assert_eq!(r.lifecycle(), Lifecycle::Revoked);
+        assert_eq!(r.owner.as_deref(), Some("ops"));
+        assert_eq!(r.approved_by.as_deref(), Some("maria"));
+        assert_eq!(r.approved_at.as_deref(), Some("2026-10-17T09:00:00Z"));
+        assert_eq!(r.revoked_by.as_deref(), Some("dev"));
+        assert_eq!(r.profile.as_deref(), Some("general"));
+        assert_eq!(r.revoked_instances, [ID], "added once");
+    }
+
+    #[test]
+    fn an_allow_is_added_to_the_type_or_as_an_exception_once() {
+        let rule = AllowRule::Category("bare_ip_fetch".into());
+        let typed = add_allow("", "claude-code", &rule, None).unwrap();
+        let typed = add_allow(&typed, "claude-code", &rule, None).unwrap();
+        let typed = add_allow(
+            &typed,
+            "claude-code",
+            &AllowRule::McpTool("save".into()),
+            None,
+        )
+        .unwrap();
+        let p = checked(&typed);
+        assert_eq!(
+            p.record("claude-code").unwrap().allow_categories,
+            ["bare_ip_fetch"]
+        );
+        assert_eq!(p.record("claude-code").unwrap().mcp_tools_allow, ["save"]);
+        let one = add_allow("", "claude-code", &rule, Some(ID)).unwrap();
+        let one = add_allow(&one, "claude-code", &rule, Some(ID)).unwrap();
+        assert_eq!(
+            one.matches("[[agent.claude-code.exception]]").count(),
+            1,
+            "{one}"
+        );
+        assert_eq!(
+            checked(&one).record("claude-code").unwrap().exceptions[ID].categories,
+            ["bare_ip_fetch"]
+        );
+        let assigned = set_assignment(&typed, "claude-code", "general").unwrap();
+        assert_eq!(
+            checked(&assigned)
+                .record("claude-code")
+                .unwrap()
+                .profile
+                .as_deref(),
+            Some("general")
+        );
+    }
+
+    /// An edit never writes what the loader would refuse unnoticed: an allow
+    /// of a hard signal edits the text, and the result does not load.
+    #[test]
+    fn an_edited_hard_allow_does_not_load() {
+        for instance in [None, Some(ID)] {
+            let text = add_allow(
+                "",
+                "claude-code",
+                &AllowRule::Category("guard_self_disable".into()),
+                instance,
+            )
+            .unwrap();
+            assert!(parse(text.as_bytes())
+                .unwrap_err()
+                .to_string()
+                .contains("is a hard rule"));
+        }
+        assert!(edit_approve("", "Not An Id", None, None, STAMP).is_err());
+        assert!(edit_approve("agent = 3\nschema_version = 1\n", "x", None, None, STAMP).is_err());
+    }
+
+    #[test]
+    fn relaxes_names_every_widening_and_no_tightening() {
+        let base = profile(&["bare_ip_fetch"], &["tmp_execution"]);
+        let widen = |f: &dyn Fn(&mut AgentProfile)| {
+            let mut p = base.clone();
+            f(&mut p);
+            relaxes(Some(&base), Some(&p))
+        };
+        assert!(widen(&|p| p.allow_categories.push("x".into())));
+        assert!(widen(&|p| p.mcp_tools_allow.push("x".into())));
+        assert!(widen(&|p| p.deny_categories.clear()));
+        assert!(widen(&|p| p.mode = Some(ProfileMode::Enforce)));
+        assert!(widen(&|p| p.jail.extra_ro.push("/opt".into())));
+        assert!(widen(&|p| p.jail.project_rw = Some("/srv".into())));
+        assert!(!widen(&|p| p.deny_categories.push("x".into())));
+        assert!(!widen(&|p| p.allow_categories.clear()));
+        assert!(!widen(&|p| p.mode = Some(ProfileMode::BlockReview)));
+        assert!(!widen(&|p| p.jail.deny_read.push("x".into())));
+        assert!(
+            relaxes(None, Some(&base)),
+            "an allow over the general rules"
+        );
+        assert!(
+            relaxes(Some(&base), None),
+            "back to the general rules drops a refusal"
+        );
+        assert!(
+            !relaxes(Some(&profile(&["bare_ip_fetch"], &[])), None),
+            "back to the general rules from an allow only"
+        );
+        assert!(!relaxes(None, Some(&profile(&[], &["x"]))));
+    }
+
+    #[test]
+    fn describe_says_each_rule_in_a_line() {
+        assert_eq!(describe(None), ["Your general rules, nothing added."]);
+        let mut p = profile(&["bare_ip_fetch"], &["tmp_execution"]);
+        p.mode = Some(ProfileMode::BlockReview);
+        assert_eq!(
+            describe(Some(&p)),
+            [
+                "Runs without review, when confined: bare_ip_fetch.",
+                "Refused: tmp_execution.",
+                "A review is refused too.",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_change_to_a_decision_is_reported_on_its_layer() {
+        let before = checked(&format!(
+            "schema_version = 1\n[agent.claude-code]\nlifecycle = \"approved\"\n[[agent.claude-code.exception]]\ninstance_id = \"{ID}\"\ncategory = \"bare_ip_fetch\"\n"
+        ));
+        let after = checked(&format!(
+            "schema_version = 1\n[agent.claude-code]\nlifecycle = \"revoked\"\nprofile = \"general\"\nrevoked_instances = [\"{ID}\"]\n"
+        ));
+        let got: Vec<(RuleLayer, String, String)> = changes(&before, &after)
+            .into_iter()
+            .map(|c| (c.layer, c.action, c.value))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (
+                    RuleLayer::AgentType,
+                    "lifecycle_changed".to_string(),
+                    "revoked".to_string()
+                ),
+                (
+                    RuleLayer::AgentType,
+                    "profile_assigned".to_string(),
+                    "general".to_string()
+                ),
+                (
+                    RuleLayer::Instance,
+                    "instance_revoked".to_string(),
+                    ID.to_string()
+                ),
+                (
+                    RuleLayer::Instance,
+                    "exception_category_removed".to_string(),
+                    format!("{ID} bare_ip_fetch")
+                ),
+            ]
+        );
     }
 }

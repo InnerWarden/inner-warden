@@ -522,7 +522,7 @@ impl LaunchRecord {
 
 /// `[a-z0-9-]`, 1 to 64 bytes. It becomes a file name and a unit name, so no
 /// dot, slash or case.
-fn is_instance_id(id: &str) -> bool {
+pub fn is_instance_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= MAX_ID_LEN
         && id

@@ -739,8 +739,9 @@ fn guard_self_disable_in(content: &str) -> Option<(&'static str, u32)> {
     }
     if runs_guard_loosening_verb(content, 0) {
         return Some((
-            "runs the guard's own allow, mute or monitor command, which only the person \
-             supervising the agent may run, from their own terminal",
+            "runs the guard's own allow, mute or monitor command, or one of its agent \
+             decisions (approve, profile, allow, revoke), which only the person supervising \
+             the agent may run, from their own terminal",
             60,
         ));
     }
@@ -1270,9 +1271,21 @@ fn guard_verb_loosens(arguments: &[String]) -> bool {
                     .is_some_and(|first| !matches!(*first, "--list" | "--remove"))
         }
         "dry-run" | "monitor" => !asks_for_help,
+        // `innerwarden agents approve|profile|allow|revoke`: the decisions
+        // about an agent are the person's, every one of them. Listing the
+        // agents, connecting them and asking for help are not decisions.
+        "agents" => {
+            !asks_for_help
+                && rest.first().is_some_and(|first| {
+                    AGENT_DECISION_VERBS.contains(&first.to_ascii_lowercase().as_str())
+                })
+        }
         _ => false,
     }
 }
+
+/// The `innerwarden agents` verbs that decide about an agent.
+pub const AGENT_DECISION_VERBS: &[&str] = &["approve", "profile", "allow", "revoke"];
 
 /// Whether a command line writes into the guard's own configuration directory
 /// (`~/.config/innerwarden/`), which holds its allow and mute rules, its agent
@@ -12330,5 +12343,44 @@ mod privileged_write_target_tests {
         assert!(!is_authentication_write_target("/home/dev/my.ssh/id_rsa"));
         assert!(!is_authentication_write_target("/etc/sudoers.bak"));
         assert!(!is_authentication_write_target("/home/dev/.gnupg"));
+    }
+
+    /// The decisions about an agent are the person's: an agent that runs
+    /// `innerwarden agents approve|profile|allow|revoke` is refused by the
+    /// hard layer, however it spells or launches the verb. Listing,
+    /// connecting and asking for help are not decisions.
+    ///
+    /// FAILS ON REVERT: drop the `"agents"` arm of `guard_verb_loosens` and
+    /// every line of the first list is `None`.
+    #[test]
+    fn an_agent_running_an_agent_decision_verb_is_refused() {
+        for cmd in [
+            "innerwarden agents approve claude-code --yes",
+            "innerwarden agents profile claude-code engineering",
+            "innerwarden agents allow claude-code --category bare_ip_fetch",
+            "innerwarden agents revoke cursor --yes",
+            "sudo innerwarden agents allow claude-code --mcp-tool save --system",
+            "/usr/local/bin/innerwarden agents Revoke x",
+            "env A=1 innerwarden agents approve x",
+            "bash -lc 'innerwarden agents approve claude-code --yes'",
+            "python3 -c \"import subprocess; subprocess.run(['innerwarden', 'agents', 'approve', 'x'])\"",
+            "npx innerwarden agents revoke x --yes",
+        ] {
+            let hit = super::check_guard_self_disable(cmd);
+            assert!(hit.is_some(), "an agent decision: {cmd}");
+            assert_eq!(hit.unwrap().1, 60, "{cmd}");
+        }
+        for cmd in [
+            "innerwarden agents",
+            "innerwarden agents list",
+            "innerwarden agents connect claude-code --monitor",
+            "innerwarden agents approve --help",
+            "grep 'innerwarden agents approve' docs/README.md",
+        ] {
+            assert!(
+                super::check_guard_self_disable(cmd).is_none(),
+                "not a decision: {cmd}"
+            );
+        }
     }
 }

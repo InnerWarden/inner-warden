@@ -1306,6 +1306,7 @@ mod tests {
                 ..AgentProfile::default()
             }),
             trust: crate::identity::Trust::Declared,
+            revoked: None,
         };
         let line = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"weather","arguments":{"location":"NYC"}}}"#;
         let run = |line: &str, profile: Option<&ProxyProfile>, map: &mut IdRequestMap| {

@@ -119,6 +119,9 @@ pub const LLM_KEY_RULE: &str = "AG-HARD-LLM-KEY";
 /// be used.
 pub const PROFILES_INVALID_RULE: &str = "AG-PROFILES-INVALID";
 
+/// The rule every tool call of a revoked agent or instance is refused under.
+pub const REVOKED_RULE: &str = "AG-HARD-REVOKED";
+
 /// Apply the per-agent profile layers to one inspected client `tools/call`,
 /// then [`apply_mode`].
 ///
@@ -151,14 +154,14 @@ fn apply_profile(
 ) {
     use crate::identity::{RuleLayer, Verdict};
     use crate::mcp::VerdictAlert;
-    use crate::profiles::{decide_tool_call, ProxyProfile, ToolCallFacts};
+    use crate::profiles::{decide_tool_call_in, ProxyProfile, ToolCallFacts};
 
     if d.direction != super::router::Direction::ClientToServer.label()
         || d.method.as_deref() != Some("tools/call")
     {
         return;
     }
-    let (agent_type, profile, trust) = match profile {
+    let (agent_type, profile, trust, revoked) = match profile {
         ProxyProfile::Invalid { why } => {
             d.verdict.allowed = false;
             d.verdict.alerts.push(VerdictAlert::builtin(
@@ -175,7 +178,8 @@ fn apply_profile(
             agent_type,
             profile,
             trust,
-        } => (agent_type, profile, *trust),
+            revoked,
+        } => (agent_type, profile, *trust, *revoked),
     };
     let (tool, args) = super::router::extract_tool_call(env);
     let command = crate::mcp::shell_command_argument(&tool, &args);
@@ -202,9 +206,11 @@ fn apply_profile(
         names_llm_key: crate::threats::names_guard_llm_key(&text),
     };
     let named = agent_type.as_deref().zip(profile.as_ref());
-    let (decision, note) = decide_tool_call(&facts, named, trust);
+    let (decision, note) = decide_tool_call_in(&facts, named, revoked, trust);
     if decision.verdict == Verdict::Deny && d.verdict.allowed {
-        let rule = if decision.deciding_layer == RuleLayer::Hard {
+        let rule = if decision.deciding_layer == RuleLayer::Hard && revoked.is_some() {
+            REVOKED_RULE
+        } else if decision.deciding_layer == RuleLayer::Hard {
             LLM_KEY_RULE
         } else {
             PROFILE_DENY_RULE
@@ -445,6 +451,7 @@ mod tests {
             agent_type: Some("claude-code".into()),
             profile: Some(profile),
             trust,
+            revoked: None,
         }
     }
 
@@ -539,6 +546,7 @@ mod tests {
                 agent_type: None,
                 profile: None,
                 trust: Trust::Declared,
+                revoked: None,
             },
         ] {
             let (mut d, e) = call(READ_LLM_KEY);
@@ -549,6 +557,36 @@ mod tests {
             assert!(response_line.contains(LLM_KEY_RULE), "{response_line}");
             assert_eq!(d.deciding_layer, Some(RuleLayer::Hard));
         }
+    }
+
+    /// A revoked agent's tool calls are refused by the hard layer under their
+    /// own rule; the mode still decides what a refusal does, so an advisory
+    /// proxy forwards it and says why.
+    ///
+    /// FAILS ON REVERT: pass `None` for `revoked` to `decide_tool_call_in`
+    /// and the call is forwarded in guard.
+    #[test]
+    fn a_revoked_agent_is_refused_by_the_hard_layer() {
+        let revoked = ProxyProfile::Active {
+            agent_type: Some("claude-code".into()),
+            profile: None,
+            trust: Trust::Confined,
+            revoked: Some(crate::profiles::Revocation::AgentType),
+        };
+        let (mut d, e) = call(WEATHER);
+        let action = apply_layers(&mut d, &e, Some(&revoked), None, ProxyMode::Guard, false);
+        let ProxyAction::Block { response_line } = action else {
+            panic!("{action:?}");
+        };
+        assert!(response_line.contains(REVOKED_RULE), "{response_line}");
+        assert!(
+            response_line.contains("this agent was revoked"),
+            "{response_line}"
+        );
+        assert_eq!(d.deciding_layer, Some(RuleLayer::Hard));
+        let (mut d, e) = call(WEATHER);
+        let action = apply_layers(&mut d, &e, Some(&revoked), None, ProxyMode::Advisory, false);
+        assert!(!matches!(action, ProxyAction::Block { .. }), "{action:?}");
     }
 
     /// A file that cannot be used refuses every tool call, which the mode
