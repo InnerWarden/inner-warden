@@ -27,6 +27,8 @@ use crate::dashboard_identity::InstanceFacts;
 
 /// The most records read from the launcher's directory.
 const MAX_RECORDS: usize = 256;
+/// The most entries looked at in it: a record and the project path beside it.
+const MAX_RECORD_ENTRIES: usize = 2 * MAX_RECORDS;
 
 /// Run one verb. `rest` starts with the verb.
 pub fn cmd(rest: &[String]) -> ExitCode {
@@ -500,7 +502,10 @@ pub(crate) fn local_records(dir: &Path, uid: u32) -> Vec<InstanceFacts> {
         return Vec::new();
     };
     let mut out = Vec::new();
-    for entry in entries.flatten().take(MAX_RECORDS) {
+    for entry in entries.flatten().take(MAX_RECORD_ENTRIES) {
+        if out.len() == MAX_RECORDS {
+            break;
+        }
         let name = entry.file_name();
         let Some(id) = name.to_str().and_then(|n| n.strip_suffix(".json")) else {
             continue;
@@ -528,11 +533,17 @@ pub(crate) fn local_records(dir: &Path, uid: u32) -> Vec<InstanceFacts> {
                 own_mnt_ns,
             })
         });
+        // The project path beside the record, read with the record's care
+        // and taken only as a plain path of the record's own project.
+        let project_dir = crate::contain::launch::project_path_file(id)
+            .and_then(|name| read_record(&dir.join(name), uid))
+            .and_then(|bytes| crate::contain::launch::parse_project_path(&bytes, &record.project));
         out.push(InstanceFacts {
             live: jail_ns.is_some(),
             judged,
             record,
             user: None,
+            project_dir,
         });
     }
     out.sort_by(|a, b| a.record.instance_id.cmp(&b.record.instance_id));
@@ -651,6 +662,61 @@ pub fn dashboard_facts(home: &Path) -> Option<DashboardFacts> {
             records
         },
     )
+}
+
+/// Add, for each instance whose launcher wrote its project path, what the
+/// graph the jail's hook keeps in that project holds about it (sessions, the
+/// newest activity, the hook's label), where the user's graph holds nothing
+/// for it. Each project's graph is read once, with the same hardened read as
+/// the launcher's own after a run: a real folder and file of this user, one
+/// open that follows no link and waits on no FIFO, no more than a graph's cap,
+/// read only. Nothing is copied from it but that summary, and a graph that
+/// is missing or refused adds nothing.
+pub fn add_project_activity(facts: &mut DashboardFacts) {
+    let uid = real_uid();
+    let mut graphs: std::collections::BTreeMap<
+        PathBuf,
+        Option<std::collections::BTreeMap<String, innerwarden_graph::InstanceActivity>>,
+    > = std::collections::BTreeMap::new();
+    for record in &facts.records {
+        let id = &record.record.instance_id;
+        let Some(dir) = &record.project_dir else {
+            continue;
+        };
+        if facts.activity.contains_key(id) {
+            continue;
+        }
+        let found = graphs
+            .entry(dir.clone())
+            .or_insert_with(|| project_graph_activity(dir, uid))
+            .as_mut()
+            .and_then(|by_id| by_id.remove(id));
+        crate::dashboard_identity::merge_project_activity(&mut facts.activity, id, found);
+    }
+}
+
+/// What the graph in `project` holds about each instance, or `None` when it
+/// is missing or refused.
+#[cfg(unix)]
+fn project_graph_activity(
+    project: &Path,
+    uid: u32,
+) -> Option<std::collections::BTreeMap<String, innerwarden_graph::InstanceActivity>> {
+    match crate::contain_io::read_jail_graph(project, uid) {
+        crate::contain::launch::JailGraph::Read(graph) => {
+            Some(graph.instance_activity(crate::dashboard_identity::MAX_SESSIONS))
+        }
+        _ => None,
+    }
+}
+
+/// No jail on this platform keeps a graph to read.
+#[cfg(not(unix))]
+fn project_graph_activity(
+    _project: &Path,
+    _uid: u32,
+) -> Option<std::collections::BTreeMap<String, innerwarden_graph::InstanceActivity>> {
+    None
 }
 
 /// [`dashboard_facts`] from what was found: the profiles, whether the
@@ -944,6 +1010,133 @@ mod tests {
         let facts = local_records(dir.path(), me());
         assert_eq!(facts.len(), 1);
         assert_eq!(facts[0].judged, None, "an ended jail is not judged");
+    }
+
+    /// A graph the jail's hook kept in a project, with one labelled command
+    /// for each `(instance, session)`.
+    fn project_graph(project: &Path, runs: &[(&str, &str)]) {
+        use innerwarden_graph::{
+            DecisionChannel, DecisionContext, DecisionMode, DecisionOrigin, DecisionOutcome, Graph,
+        };
+        let mut graph = Graph::new();
+        for (seq, &(id, session)) in runs.iter().enumerate() {
+            graph.ingest_verdict_with_origin(
+                "contain",
+                seq,
+                "git status",
+                &serde_json::json!({"recommendation": "allow", "explanation": "no rule matched"}),
+                DecisionContext {
+                    mode: DecisionMode::Enforce,
+                    outcome: DecisionOutcome::Allowed,
+                    recorded_at_ms: Some(1_760_607_651_000),
+                },
+                &DecisionOrigin {
+                    channel: Some(DecisionChannel::Hook),
+                    agent: Some("claude-code".into()),
+                    instance_id: Some(id.into()),
+                    session_id: Some(session.into()),
+                    trust: Some("confined".into()),
+                    trust_reason: Some("confined_by_namespace".into()),
+                    ..DecisionOrigin::default()
+                },
+            );
+        }
+        let dir = crate::contain::jail_graph_dir(project);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(crate::contain::JAIL_GRAPH_NAME), graph.to_json()).unwrap();
+    }
+
+    /// An instance whose launcher wrote its project path shows the sessions
+    /// and the newest activity the jail's hook kept in that project's graph,
+    /// read as a label (its `confined` reads `observed`). A record with no
+    /// project path, a path of another folder, or a project graph that is a
+    /// link adds nothing.
+    ///
+    /// FAILS ON REVERT: skip `add_project_activity` (or read no
+    /// `.project` file) and the instance has no session.
+    #[test]
+    fn an_instance_shows_the_sessions_its_projects_graph_holds() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("instances");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let project = root.path().join("p");
+        let id = "3f9a0c1e5b7d42a8c6e1f0b2d4a69c87";
+        let bare = "0000000000000000000000000000beef";
+        let other = "1111111111111111111111111111aaaa";
+        let linked = "2222222222222222222222222222bbbb";
+        for each in [id, bare, other, linked] {
+            std::fs::write(dir.join(format!("{each}.json")), record(each, me())).unwrap();
+        }
+        std::fs::write(
+            dir.join(format!("{id}.project")),
+            format!("{}\n", project.display()),
+        )
+        .unwrap();
+        // Another folder's path, beside a record of project `p`: not taken.
+        std::fs::write(
+            dir.join(format!("{other}.project")),
+            format!("{}\n", root.path().join("q").display()),
+        )
+        .unwrap();
+        project_graph(
+            &project,
+            &[(id, "a1b2c3d4e5f6-session"), (other, "ffff0000-session")],
+        );
+        project_graph(&root.path().join("q"), &[(other, "ffff0000-session")]);
+        // A project whose graph folder is a link: refused, never followed.
+        let elsewhere = root.path().join("elsewhere");
+        project_graph(&elsewhere, &[(linked, "eeee0000-session")]);
+        let linked_project = root.path().join("lp");
+        std::fs::create_dir(&linked_project).unwrap();
+        std::os::unix::fs::symlink(
+            crate::contain::jail_graph_dir(&elsewhere),
+            crate::contain::jail_graph_dir(&linked_project),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(format!("{linked}.project")),
+            format!("{}\n", root.path().join("p").display()),
+        )
+        .unwrap();
+        let mut records = local_records(&dir, me());
+        // `linked` names the project `p` by its folder; point it at the link.
+        for facts in &mut records {
+            if facts.record.instance_id == linked {
+                facts.project_dir = Some(linked_project.clone());
+            }
+        }
+        let by_id = |records: &[InstanceFacts], want: &str| {
+            records
+                .iter()
+                .find(|f| f.record.instance_id == want)
+                .and_then(|f| f.project_dir.clone())
+        };
+        assert_eq!(by_id(&records, id), Some(project.clone()));
+        assert_eq!(by_id(&records, bare), None, "no .project file");
+        assert_eq!(by_id(&records, other), None, "another folder's path");
+        let mut facts = DashboardFacts {
+            records,
+            ..DashboardFacts::default()
+        };
+        add_project_activity(&mut facts);
+        assert_eq!(
+            facts.activity.keys().collect::<Vec<_>>(),
+            vec![id],
+            "{:?}",
+            facts.activity
+        );
+        let seen = &facts.activity[id];
+        assert_eq!(seen.last_at_ms, Some(1_760_607_651_000));
+        assert_eq!(seen.sessions[0].session_id, "a1b2c3d4e5f6-session");
+        let record = facts
+            .records
+            .iter()
+            .find(|f| f.record.instance_id == id)
+            .unwrap();
+        let view = crate::dashboard_identity::instance_view(record, Some(seen));
+        assert_eq!(view.trust, "observed");
+        assert_eq!(view.sessions.len(), 1);
     }
 
     /// The records directory itself is read only when it is a directory of

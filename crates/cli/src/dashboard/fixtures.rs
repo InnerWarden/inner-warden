@@ -665,6 +665,7 @@ fn identity_record_json(
         live: false,
         judged: None,
         user: Some("dev".into()),
+        project_dir: None,
     }
 }
 

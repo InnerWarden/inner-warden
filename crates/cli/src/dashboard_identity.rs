@@ -53,6 +53,33 @@ pub struct InstanceFacts {
     pub judged: Option<(Trust, Reason)>,
     /// The account name of the record's uid, `None` when it does not resolve.
     pub user: Option<String>,
+    /// The project folder the launcher wrote beside the record, `None` when
+    /// it wrote none or it was not a plain path of the record's project.
+    /// Where the jail's hook keeps its graph.
+    pub project_dir: Option<std::path::PathBuf>,
+}
+
+/// PURE. Add what the graph in an instance's project holds about it, only
+/// where the user's own graph holds nothing for that id. That graph is the
+/// jail's to write, so it is the jail's own word: its label meets the same
+/// ceilings as any (never above `observed`, never above the dashboard's own
+/// reading of a live jail), and no session keeps a case id, since the case
+/// is in the project's graph and not one this dashboard serves.
+pub fn merge_project_activity(
+    activity: &mut BTreeMap<String, InstanceActivity>,
+    instance_id: &str,
+    found: Option<InstanceActivity>,
+) {
+    let Some(mut found) = found else {
+        return;
+    };
+    if activity.contains_key(instance_id) {
+        return;
+    }
+    for session in &mut found.sessions {
+        session.case_id = None;
+    }
+    activity.insert(instance_id.to_string(), found);
 }
 
 /// The wire word for a trust level (spec 104 D1): one vocabulary on every
@@ -380,6 +407,7 @@ mod tests {
             live,
             judged,
             user: Some("dev".into()),
+            project_dir: None,
         }
     }
 
@@ -447,6 +475,48 @@ mod tests {
         assert_eq!(
             (ended.trust, ended.trust_reason.as_str()),
             ("observed", "confined_by_namespace")
+        );
+    }
+
+    /// What the project's graph holds about an instance shows only where
+    /// the user's graph holds nothing for it, with no case id, and its label
+    /// is held to the same ceilings: an ended instance labelled `confined`
+    /// there reads `observed`.
+    ///
+    /// FAILS ON REVERT: keep the case ids and the session links a case the
+    /// dashboard does not serve; drop the `contains_key` guard and the
+    /// user's graph is overwritten.
+    #[test]
+    fn the_project_graph_adds_sessions_only_where_the_users_graph_has_none() {
+        let mut activity = BTreeMap::new();
+        merge_project_activity(&mut activity, ID, None);
+        assert!(activity.is_empty());
+        merge_project_activity(
+            &mut activity,
+            ID,
+            Some(label("confined", "confined_by_namespace")),
+        );
+        let added = activity.get(ID).expect("added");
+        assert_eq!(added.sessions[0].case_id, None);
+        assert_eq!(added.last_at_ms, Some(1_760_607_651_000));
+        let view = instance_view(&facts(ID, false, None), Some(added));
+        assert_eq!(view.trust, "observed");
+        assert_eq!(view.sessions[0].session, "a1b2c3d4");
+        assert_eq!(view.sessions[0].case_id, None);
+        let mut users = BTreeMap::new();
+        users.insert(ID.to_string(), label("observed", "launcher_not_trusted"));
+        merge_project_activity(
+            &mut users,
+            ID,
+            Some(label("confined", "confined_by_namespace")),
+        );
+        assert_eq!(
+            users[ID].trust_reason.as_deref(),
+            Some("launcher_not_trusted")
+        );
+        assert_eq!(
+            users[ID].sessions[0].case_id.as_deref(),
+            Some("cmd:contain:3")
         );
     }
 
@@ -553,6 +623,7 @@ mod tests {
             live: false,
             judged: None,
             user: None,
+            project_dir: None,
         });
         let mut activity = BTreeMap::new();
         activity.insert(ID.to_string(), label("confined", "confined_by_namespace"));
@@ -595,6 +666,7 @@ mod tests {
                 live: false,
                 judged: None,
                 user: None,
+                project_dir: None,
             })
             .collect();
         let row = row_trust("claude-code", &many, &BTreeMap::new(), true);

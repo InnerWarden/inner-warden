@@ -562,10 +562,14 @@ fn build_agent_snapshot(
         innerwarden_agent_guard::agents_ops::rows_with_discovery_status(home);
     // The record is read for the hook's labels only where the identity
     // features are on: with them off, nothing more is read than before.
+    // A contained run's hook writes to its project's graph, not the user's:
+    // that graph is read too, for the instances the user's graph says
+    // nothing about, and only for a record whose launcher named its project.
     let identity = crate::agent_decisions_io::dashboard_facts(home).map(|mut facts| {
         if let Ok(graph) = graph_io::load_graph_checked() {
             facts.activity = graph.instance_activity(crate::dashboard_identity::MAX_SESSIONS);
         }
+        crate::agent_decisions_io::add_project_activity(&mut facts);
         facts
     });
     AgentSnapshot {

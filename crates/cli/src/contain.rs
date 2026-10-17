@@ -982,9 +982,9 @@ pub mod launch {
 
     use chrono::{DateTime, Utc};
     use innerwarden_agent_guard::identity::{
-        instance_record_file, is_user_scope_cgroup, system_scope_cgroup, Jail, JailBackend,
-        LaunchMode, LaunchRecord, Launcher, RecordError, Scope, Scopes, INITIAL_PID_NS_INODE,
-        LAUNCHER_RECORD_DIR, LAUNCH_SCHEMA,
+        instance_record_file, is_instance_id, is_user_scope_cgroup, system_scope_cgroup, Jail,
+        JailBackend, LaunchMode, LaunchRecord, Launcher, RecordError, Scope, Scopes,
+        INITIAL_PID_NS_INODE, LAUNCHER_RECORD_DIR, LAUNCH_SCHEMA,
     };
     use serde::Deserialize;
 
@@ -1318,6 +1318,46 @@ pub mod launch {
     /// Where one record lives, or `None` for an id that is not an id.
     pub fn record_path(dir: &Path, instance_id: &str) -> Option<PathBuf> {
         Some(dir.join(instance_record_file(instance_id)?))
+    }
+
+    /// The name of the file, beside an instance's record, that holds the
+    /// absolute path of its project: `<instance id>.project`, or `None` for
+    /// an id that is not an id.
+    ///
+    /// It lives only in the launcher's records directory, never in the jail:
+    /// the record shown inside the jail names the project by its folder name
+    /// alone. The local dashboard reads it to find the graph the jail's hook
+    /// writes (`<project>/.innerwarden/graph.json`).
+    pub fn project_path_file(instance_id: &str) -> Option<String> {
+        is_instance_id(instance_id).then(|| format!("{instance_id}.project"))
+    }
+
+    /// The longest project path a `.project` file may hold.
+    pub const MAX_PROJECT_PATH_BYTES: usize = 4096;
+
+    /// The project path a `.project` file holds, or `None` unless it is one
+    /// line of UTF-8 naming an absolute path, bounded, with no control
+    /// character, no `.` or `..` step, whose folder name is `project` (the
+    /// record's own label): a file copied from another instance's record
+    /// names another folder and is not taken.
+    pub fn parse_project_path(bytes: &[u8], project: &str) -> Option<PathBuf> {
+        let text = std::str::from_utf8(bytes).ok()?;
+        let text = text.strip_suffix('\n').unwrap_or(text);
+        if text.is_empty()
+            || text.len() > MAX_PROJECT_PATH_BYTES
+            || !text.starts_with('/')
+            || text.chars().any(char::is_control)
+        {
+            return None;
+        }
+        // Read step by step on the text: `Path::components` would drop a `.`
+        // step and an empty one before they could be refused.
+        let plain = text[1..]
+            .split('/')
+            .all(|step| !step.is_empty() && step != "." && step != "..");
+        let path = Path::new(text);
+        (plain && path.file_name().and_then(|n| n.to_str()) == Some(project))
+            .then(|| path.to_path_buf())
     }
 
     pub fn launch_mode(mode: &Mode) -> LaunchMode {
@@ -2217,6 +2257,52 @@ mod tests {
             record_path(Path::new("/s"), &id).unwrap(),
             PathBuf::from(format!("/s/{id}.json"))
         );
+    }
+
+    /// The project path beside a record is taken only as one plain absolute
+    /// path whose folder is the record's project: a relative path, a `..`
+    /// step, a control character, another folder's name or an id that is not
+    /// an id gives none.
+    ///
+    /// FAILS ON REVERT: drop the folder name check and a `.project` file
+    /// copied from another instance (naming another folder) is taken.
+    #[test]
+    fn a_project_path_is_one_plain_absolute_path_of_the_records_project() {
+        use launch::*;
+        let id = instance_id_from([0xab; 16]);
+        assert_eq!(project_path_file(&id), Some(format!("{id}.project")));
+        assert_eq!(project_path_file("../x"), None);
+        assert_eq!(
+            parse_project_path(b"/home/dev/my-app\n", "my-app"),
+            Some(PathBuf::from("/home/dev/my-app"))
+        );
+        assert_eq!(
+            parse_project_path(b"/home/dev/my-app", "my-app"),
+            Some(PathBuf::from("/home/dev/my-app"))
+        );
+        let long = format!("/{}/my-app", "a".repeat(MAX_PROJECT_PATH_BYTES));
+        for bad in [
+            &b""[..],
+            b"\n",
+            b"home/dev/my-app",
+            b"/home/dev/other",
+            b"/home/dev/../dev/my-app",
+            b"/home/./dev/my-app",
+            b"/home//dev/my-app",
+            b"/",
+            b"/home/dev/my-app\n\n",
+            b"/home/dev\x1b/my-app",
+            b"/home/dev/my-app\r",
+            b"\xff/my-app",
+            long.as_bytes(),
+        ] {
+            assert_eq!(
+                parse_project_path(bad, "my-app"),
+                None,
+                "{:?}",
+                String::from_utf8_lossy(bad)
+            );
+        }
     }
 
     #[test]

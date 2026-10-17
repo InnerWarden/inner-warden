@@ -551,13 +551,71 @@ fn write_launch_record(
     json: &[u8],
     owner_uid: u32,
 ) -> std::io::Result<PathBuf> {
-    use std::io::{Error, ErrorKind, Write};
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::io::{Error, ErrorKind};
 
     let target = crate::contain::launch::record_path(dir, instance_id)
         .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "not an instance id"))?;
+    write_private_file(
+        dir,
+        &target,
+        &format!(".{instance_id}.tmp"),
+        json,
+        owner_uid,
+    )
+}
+
+/// Write, beside an instance's record, the absolute path of its project
+/// (`<id>.project`, one line), with the record's own care. The dashboard
+/// reads it to find the graph the jail's hook keeps in the project; the jail
+/// never sees it (the records directory is hidden inside the jail).
+#[cfg(unix)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn write_project_path(
+    dir: &Path,
+    instance_id: &str,
+    project: &Path,
+    owner_uid: u32,
+) -> std::io::Result<PathBuf> {
+    use std::io::{Error, ErrorKind};
+
+    let name = crate::contain::launch::project_path_file(instance_id)
+        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "not an instance id"))?;
+    let text = project
+        .to_str()
+        .filter(|text| {
+            project
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|folder| {
+                    crate::contain::launch::parse_project_path(text.as_bytes(), folder).is_some()
+                })
+        })
+        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "not a plain absolute project path"))?;
+    write_private_file(
+        dir,
+        &dir.join(&name),
+        &format!(".{name}.tmp"),
+        format!("{text}\n").as_bytes(),
+        owner_uid,
+    )
+}
+
+/// Put `bytes` at `target` in the launcher's own `dir`: a temp name opened
+/// `O_EXCL | O_NOFOLLOW` at `0600`, synced, renamed into place.
+#[cfg(unix)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn write_private_file(
+    dir: &Path,
+    target: &Path,
+    temp_name: &str,
+    json: &[u8],
+    owner_uid: u32,
+) -> std::io::Result<PathBuf> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
     own_records_dir(dir, owner_uid)?;
-    let temp = dir.join(format!(".{instance_id}.tmp"));
+    let temp = dir.join(temp_name);
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true).mode(0o600);
     innerwarden_safe_io::harden(&mut options);
@@ -565,12 +623,12 @@ fn write_launch_record(
     let written = file
         .write_all(json)
         .and_then(|()| file.sync_all())
-        .and_then(|()| std::fs::rename(&temp, &target));
+        .and_then(|()| std::fs::rename(&temp, target));
     if let Err(e) = written {
         let _ = std::fs::remove_file(&temp);
         return Err(e);
     }
-    Ok(target)
+    Ok(target.to_path_buf())
 }
 
 /// Make the launcher's records directory if it is missing (`0700`), and
@@ -848,7 +906,7 @@ fn report_contained_run(input: &JailInputs, instance_id: &str, started_ms: u64, 
 /// facts come from that open, and no more than a graph's cap is read.
 #[cfg(unix)]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn read_jail_graph(project: &Path, uid: u32) -> crate::contain::launch::JailGraph {
+pub(crate) fn read_jail_graph(project: &Path, uid: u32) -> crate::contain::launch::JailGraph {
     use crate::contain::launch::{
         parse_jail_graph, vet_jail_graph_dir, vet_jail_graph_file, GraphEntry, JailGraph,
         MAX_JAIL_GRAPH_BYTES,
@@ -983,7 +1041,17 @@ fn identify(
     let json = serde_json::to_vec(&record).map_err(|e| e.to_string())?;
     let dir = records_dir(std::env::var("XDG_STATE_HOME").ok().as_deref(), &input.home);
     match write_launch_record(&dir, &record.instance_id, &json, uid) {
-        Ok(path) => eprintln!("innerwarden contain - instance record: {}", path.display()),
+        Ok(path) => {
+            eprintln!("innerwarden contain - instance record: {}", path.display());
+            // Best effort: without it the dashboard lists the instance and
+            // no sessions, as for a record written before it existed.
+            if let Err(e) = write_project_path(&dir, &record.instance_id, &input.args.project, uid)
+            {
+                eprintln!(
+                    "innerwarden contain: the project path beside the record was not written ({e})"
+                );
+            }
+        }
         Err(e) => eprintln!(
             "innerwarden contain: the launcher's copy of the record was not written ({e})"
         ),
@@ -1644,6 +1712,40 @@ mod tests {
         std::fs::write(&victim, b"keep").unwrap();
         symlink(&victim, guarded.join(format!(".{id}.tmp"))).unwrap();
         assert!(write_launch_record(&guarded, id, b"{}", me()).is_err());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+    }
+
+    /// The project path beside a record is written like the record (private,
+    /// whole, never through a planted link) and only as a plain absolute path
+    /// that the dashboard's reader takes back.
+    #[cfg(unix)]
+    #[test]
+    fn a_project_path_is_written_beside_the_record_as_one_line() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("instances");
+        let id = "0123456789abcdef0123456789abcdef";
+        let project = root.path().join("my-app");
+        let path = write_project_path(&dir, id, &project, me()).unwrap();
+        assert_eq!(path, dir.join(format!("{id}.project")));
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(
+            crate::contain::launch::parse_project_path(&bytes, "my-app"),
+            Some(project.clone())
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(write_project_path(&dir, "../x", &project, me()).is_err());
+        assert!(write_project_path(&dir, id, Path::new("rel/my-app"), me()).is_err());
+        let guarded = root.path().join("guarded");
+        std::fs::create_dir(&guarded).unwrap();
+        std::fs::set_permissions(&guarded, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let victim = root.path().join("victim");
+        std::fs::write(&victim, b"keep").unwrap();
+        symlink(&victim, guarded.join(format!(".{id}.project.tmp"))).unwrap();
+        assert!(write_project_path(&guarded, id, &project, me()).is_err());
         assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
     }
 
