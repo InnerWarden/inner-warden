@@ -1676,7 +1676,7 @@ mod tests {
             trust_reason: Some("host_decided".into()),
             trust_source: Some("host".into()),
             host_decision: Some("0f1e2d3c4b5a69788796a5b4c3d2e1f0".into()),
-            host_withheld: Some("no_system_scope".into()),
+            host_withheld: Some("a_word_never_heard".into()),
             deciding_layer: Some("agent_type".into()),
             ..DecisionOrigin::default()
         };
@@ -1684,7 +1684,7 @@ mod tests {
         host.write_attrs(&mut attrs);
         assert_eq!(attrs["trust_source"], "host");
         assert_eq!(attrs["host_decision"], "0f1e2d3c4b5a69788796a5b4c3d2e1f0");
-        assert_eq!(attrs["host_withheld"], "no_system_scope");
+        assert_eq!(attrs["host_withheld"], "a_word_never_heard");
         assert_eq!(attrs["trust_reason"], "host_decided");
 
         let mut without_trust = BTreeMap::new();
@@ -1721,7 +1721,7 @@ mod tests {
             read.host_decision.as_deref(),
             Some("0f1e2d3c4b5a69788796a5b4c3d2e1f0")
         );
-        assert_eq!(read.host_withheld.as_deref(), Some("no_system_scope"));
+        assert_eq!(read.host_withheld.as_deref(), Some("a_word_never_heard"));
     }
 
     /// Per instance: the newest trust label wins, sessions are newest first

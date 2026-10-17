@@ -2157,7 +2157,7 @@ mod tests {
         let kept = crate::host_decide::HostLabel {
             answered: true,
             decision: Some("0f1e2d3c4b5a69788796a5b4c3d2e1f0".into()),
-            withheld: Some("no_system_scope".into()),
+            withheld: Some("a_word_never_heard".into()),
             decided: false,
         };
         let origin = hook_origin(
@@ -2170,7 +2170,7 @@ mod tests {
         let attrs = command_attrs(&origin);
         assert_eq!(attrs["trust"], "observed");
         assert_eq!(attrs["trust_reason"], "confined_by_namespace");
-        assert_eq!(attrs["host_withheld"], "no_system_scope");
+        assert_eq!(attrs["host_withheld"], "a_word_never_heard");
         assert_eq!(attrs["relaxation_withheld"], "true");
     }
 

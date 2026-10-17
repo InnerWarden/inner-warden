@@ -82,9 +82,9 @@ describe("trust never rises above its reason", () => {
       trust_reason: "host_decided",
       trust_source: "host",
       host_decision: "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
-      host_withheld: "no_system_scope",
+      host_withheld: "a_word_never_heard",
     });
-    expect(decision).toMatchObject({ trust: "observed", trustSource: "host", hostDecision: "0f1e2d3c4b5a69788796a5b4c3d2e1f0", hostWithheld: "no_system_scope" });
+    expect(decision).toMatchObject({ trust: "observed", trustSource: "host", hostDecision: "0f1e2d3c4b5a69788796a5b4c3d2e1f0", hostWithheld: "a_word_never_heard" });
     const odd = readDecisionIdentity({ trust: "observed", trust_reason: "x", trust_source: "kernel", host_decision: "ABC", host_withheld: "Kept, because" });
     expect(odd?.trustSource).toBeUndefined();
     expect(odd?.hostDecision).toBeUndefined();

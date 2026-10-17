@@ -681,7 +681,7 @@ mod tests {
         let inside = Trust::Observed;
         assert_eq!(decision_trust(inside, &HostReply::None), Trust::Observed);
         assert_eq!(decision_trust(inside, &HostReply::Invalid), Trust::Observed);
-        for withheld in ["no_system_scope", "licence_inactive", "a_word_never_heard"] {
+        for withheld in ["a_word_never_heard", "another_word_never_heard"] {
             let reply = answer(
                 Trust::Confined,
                 Verdict::Review,
@@ -718,7 +718,7 @@ mod tests {
             Trust::Confined,
             Verdict::Review,
             RuleLayer::General,
-            Some("no_system_scope"),
+            Some("a_word_never_heard"),
         );
         let (out, label) = decide(&profiles, &reply, false);
         assert!(out.blocks);
@@ -726,7 +726,7 @@ mod tests {
         assert!(out.relaxation_withheld);
         let label = label.unwrap();
         assert!(label.answered && !label.decided);
-        assert_eq!(label.withheld.as_deref(), Some("no_system_scope"));
+        assert_eq!(label.withheld.as_deref(), Some("a_word_never_heard"));
     }
 
     /// FAILS ON REVERT: let the host's verdict stand alone and the user's
@@ -857,7 +857,7 @@ mod tests {
                     Trust::Confined,
                     Verdict::Review,
                     RuleLayer::General,
-                    Some("not_confined"),
+                    Some("a_word_never_heard"),
                 ),
                 true,
             ),

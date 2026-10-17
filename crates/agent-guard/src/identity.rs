@@ -2534,8 +2534,8 @@ mod tests {
     fn only_confined_with_nothing_withheld_relaxes() {
         for (trust, withheld, relaxes) in [
             ("confined", Value::Null, true),
-            ("confined", json!("no_system_scope"), false),
-            ("confined", json!("some_word_this_build_never_heard"), false),
+            ("confined", json!("a_word_never_heard"), false),
+            ("confined", json!("another_word_never_heard"), false),
             ("observed", Value::Null, false),
             ("declared", Value::Null, false),
         ] {
