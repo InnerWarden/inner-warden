@@ -369,13 +369,16 @@ fn check_origin(verdict: &Value) -> DecisionOrigin {
 
 /// What the rule layers did with one hook decision, where per-agent
 /// profiles are in force: the layer that decided, the profile in force for
-/// the caller's type, and whether a relaxation was withheld from an instance
-/// that does not run confined.
+/// the caller's type, whether a relaxation was withheld from an instance
+/// that does not run confined, and what the host answered when the hook
+/// asked it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LayerLabel {
     pub layer: RuleLayer,
     pub profile: Option<String>,
     pub relaxation_withheld: bool,
+    /// `None` unless the hook asked the host and a 200 came back.
+    pub host: Option<crate::host_decide::HostLabel>,
 }
 
 impl From<RuleLayer> for LayerLabel {
@@ -384,6 +387,7 @@ impl From<RuleLayer> for LayerLabel {
             layer,
             profile: None,
             relaxation_withheld: false,
+            host: None,
         }
     }
 }
@@ -398,13 +402,14 @@ fn hook_origin(
     identity: Option<&Identity>,
     layer: Option<LayerLabel>,
 ) -> DecisionOrigin {
-    let (deciding_layer, profile, relaxation_withheld) = match layer {
+    let (deciding_layer, profile, relaxation_withheld, host) = match layer {
         Some(label) => (
             Some(label.layer.as_str().to_string()),
             label.profile,
             label.relaxation_withheld,
+            label.host,
         ),
-        None => (None, None, false),
+        None => (None, None, false, None),
     };
     let mut origin = DecisionOrigin {
         channel: Some(DecisionChannel::Hook),
@@ -419,8 +424,25 @@ fn hook_origin(
     if let Some(identity) = identity {
         identity.apply(&mut origin);
     }
+    // What the host said rides beside the hook's own labels and never
+    // replaces its trust: only the reason says the host's rules decided.
+    if let Some(host) = host {
+        if host.answered {
+            origin.trust_source =
+                Some(innerwarden_agent_guard::identity::HOST_TRUST_SOURCE.to_string());
+        }
+        origin.host_decision = host.decision;
+        origin.host_withheld = host.withheld;
+        if host.decided {
+            origin.trust_reason = Some(HOST_DECIDED.to_string());
+        }
+    }
     origin
 }
+
+/// The reason a decision records when the host's relaxation is what decided.
+/// The trust beside it stays the hook's own reading.
+pub const HOST_DECIDED: &str = "host_decided";
 
 /// Where an MCP tool call came from: the agent the proxy line names, and the
 /// rules its inspector raised.
@@ -2017,6 +2039,7 @@ mod tests {
                 layer: RuleLayer::General,
                 profile: Some("claude-code".into()),
                 relaxation_withheld: true,
+                host: None,
             }),
         );
         let attrs = command_attrs(&hook);
@@ -2033,6 +2056,152 @@ mod tests {
         assert!(!command_attrs(&off).contains_key("profile"));
         let line = guard_blocked_line(5, "x", &verdict, context, "s", &off);
         assert!(line.get("layer").is_none(), "{line}");
+    }
+
+    /// The hook's reading of a jail its launcher built, at its best.
+    fn observed_identity() -> Identity {
+        Identity {
+            trust: innerwarden_agent_guard::identity::Trust::Observed,
+            ..confined_identity()
+        }
+    }
+
+    fn general_review_label(host: Option<crate::host_decide::HostLabel>) -> LayerLabel {
+        LayerLabel {
+            layer: RuleLayer::General,
+            profile: Some("claude-code".into()),
+            relaxation_withheld: true,
+            host,
+        }
+    }
+
+    /// Without a 200 from the host, the record is the one written before the
+    /// hook could ask: the same keys, the same values.
+    ///
+    /// FAILS ON REVERT: write `trust_source=jail` on every labelled decision
+    /// and a key appears.
+    #[test]
+    fn without_a_host_answer_the_record_is_todays() {
+        let verdict = json!({"recommendation": "review"});
+        let origin = hook_origin(
+            &verdict,
+            Some("claude-code"),
+            Some("/w/app"),
+            Some(&observed_identity()),
+            Some(general_review_label(None)),
+        );
+        let attrs = command_attrs(&origin);
+        let keys: Vec<&str> = attrs.keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            [
+                "agent",
+                "channel",
+                "decided_by",
+                "deciding_layer",
+                "instance_id",
+                "profile",
+                "project",
+                "recommendation",
+                "relaxation_withheld",
+                "risk",
+                "seq",
+                "session_id",
+                "source",
+                "trust",
+                "trust_reason",
+            ]
+        );
+        for key in ["trust_source", "host_decision", "host_withheld"] {
+            assert!(!attrs.contains_key(key), "{key}");
+        }
+        assert_eq!(attrs["trust"], "observed");
+        assert_eq!(attrs["trust_reason"], "confined_by_namespace");
+    }
+
+    /// Whatever the host answered, the `trust` recorded is the hook's own
+    /// reading, `observed` at most; what the host said rides beside it.
+    ///
+    /// FAILS ON REVERT: take the answer's trust onto the origin and the node
+    /// says `confined`.
+    #[test]
+    fn the_recorded_trust_never_passes_observed_with_any_answer() {
+        let verdict = json!({"recommendation": "allow"});
+        let decided = crate::host_decide::HostLabel {
+            answered: true,
+            decision: Some("0f1e2d3c4b5a69788796a5b4c3d2e1f0".into()),
+            withheld: None,
+            decided: true,
+        };
+        let origin = hook_origin(
+            &verdict,
+            Some("claude-code"),
+            Some("/w/app"),
+            Some(&observed_identity()),
+            Some(LayerLabel {
+                layer: RuleLayer::AgentType,
+                profile: Some("claude-code".into()),
+                relaxation_withheld: false,
+                host: Some(decided),
+            }),
+        );
+        let attrs = command_attrs(&origin);
+        assert_eq!(attrs["trust"], "observed");
+        assert_eq!(attrs["trust_source"], "host");
+        assert_eq!(attrs["trust_reason"], "host_decided");
+        assert_eq!(attrs["host_decision"], "0f1e2d3c4b5a69788796a5b4c3d2e1f0");
+        assert_eq!(attrs["deciding_layer"], "agent_type");
+        assert!(!attrs.contains_key("relaxation_withheld"));
+        assert!(!attrs.contains_key("host_withheld"));
+
+        let kept = crate::host_decide::HostLabel {
+            answered: true,
+            decision: Some("0f1e2d3c4b5a69788796a5b4c3d2e1f0".into()),
+            withheld: Some("no_system_scope".into()),
+            decided: false,
+        };
+        let origin = hook_origin(
+            &verdict,
+            Some("claude-code"),
+            Some("/w/app"),
+            Some(&observed_identity()),
+            Some(general_review_label(Some(kept))),
+        );
+        let attrs = command_attrs(&origin);
+        assert_eq!(attrs["trust"], "observed");
+        assert_eq!(attrs["trust_reason"], "confined_by_namespace");
+        assert_eq!(attrs["host_withheld"], "no_system_scope");
+        assert_eq!(attrs["relaxation_withheld"], "true");
+    }
+
+    /// A 200 out of the contract's shape leaves only its word beside the
+    /// labels of today.
+    #[test]
+    fn an_invalid_answer_records_only_its_word() {
+        let verdict = json!({"recommendation": "review"});
+        let today = command_attrs(&hook_origin(
+            &verdict,
+            Some("claude-code"),
+            Some("/w/app"),
+            Some(&observed_identity()),
+            Some(general_review_label(None)),
+        ));
+        let invalid = crate::host_decide::HostLabel {
+            withheld: Some("host_answer_invalid".into()),
+            ..Default::default()
+        };
+        let mut attrs = command_attrs(&hook_origin(
+            &verdict,
+            Some("claude-code"),
+            Some("/w/app"),
+            Some(&observed_identity()),
+            Some(general_review_label(Some(invalid))),
+        ));
+        assert_eq!(
+            attrs.remove("host_withheld").as_deref(),
+            Some("host_answer_invalid")
+        );
+        assert_eq!(attrs, today);
     }
 
     /// A label that does not have the shape of one is dropped, not repaired.

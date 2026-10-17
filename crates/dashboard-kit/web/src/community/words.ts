@@ -159,7 +159,7 @@ export type TrustWord = { label: string; tooltip: string; tone: "watch" };
  * `host_verified:jail` is there for the type only: no reason code lets a
  * jail reading reach it (`REASON_TRUST`).
  */
-export type TrustWordKey = "host_verified:jail" | "observed:jail" | "declared:jail" | "declared:sensor";
+export type TrustWordKey = "host_verified:jail" | "observed:jail" | "observed:host" | "declared:jail" | "declared:sensor";
 
 export const TRUST_WORDS: Record<TrustWordKey, TrustWord> = {
   "host_verified:jail": {
@@ -172,9 +172,31 @@ export const TRUST_WORDS: Record<TrustWordKey, TrustWord> = {
     tooltip: "Runs in a jail, as read from inside it: nothing outside the jail has confirmed it.",
     tone: "watch",
   },
+  "observed:host": {
+    label: "Observed",
+    tooltip: "Read from inside the jail; Active Defence on this host decided its rules.",
+    tone: "watch",
+  },
   "declared:jail": { label: "Declared only", tooltip: "Only its own word says what it is.", tone: "watch" },
   "declared:sensor": { label: "Declared only", tooltip: "Only its own word says what it is.", tone: "watch" },
 };
+
+/**
+ * Who a label says was asked: the hook's own reading of its jail, or
+ * Active Defence on its host. A label the hook wrote, never a level: the
+ * trust beside it is capped by its reason all the same.
+ */
+export type TrustSource = "jail" | "host";
+
+export function asTrustSource(value: unknown): TrustSource | undefined {
+  return value === "jail" || value === "host" ? value : undefined;
+}
+
+/** The words for a trust from a source; a pair with no words of its own reads as the jail's. */
+export function trustWord(trust: Trust, source: TrustSource | undefined): TrustWord {
+  const own = (TRUST_WORDS as Record<string, TrustWord | undefined>)[`${trust}:${source ?? "jail"}`];
+  return own ?? TRUST_WORDS[`${trust}:jail`];
+}
 
 /**
  * Why an instance has the trust it has, by the code the hook wrote. The
@@ -199,6 +221,7 @@ export const REASON_CODES = [
   "mount_namespace_mismatch",
   "agent_mismatch",
   "agent_not_named",
+  "host_decided",
 ] as const;
 export type ReasonCode = (typeof REASON_CODES)[number];
 
@@ -219,6 +242,7 @@ export const REASON_TRUST: Record<ReasonCode, Trust> = {
   mount_namespace_mismatch: "declared",
   agent_mismatch: "declared",
   agent_not_named: "declared",
+  host_decided: "observed",
 };
 
 export const REASON_WORDS: Record<ReasonCode, string> = {
@@ -238,6 +262,7 @@ export const REASON_WORDS: Record<ReasonCode, string> = {
   mount_namespace_mismatch: "It sees a filesystem its launcher did not build, so its jail record proves nothing.",
   agent_mismatch: "Its jail record names another kind of agent than its hook serves.",
   agent_not_named: "Neither its hook nor its launcher named the agent, so its jail record proves nothing about it.",
+  host_decided: "Active Defence on this host decided its rules.",
 };
 
 export const UNKNOWN_REASON_WORDS = "Why it is unverified was not recorded.";
@@ -312,15 +337,36 @@ export const LAYER_WORDS: Record<LayerKey, string> = {
   "instance:deny": "Refused by an exception for this instance.",
 };
 
-export const WITHHELD_WORDS =
-  "The {agent} profile would allow this, but this instance does not run confined, so your general rules decided.";
+/**
+ * Why a relaxation was not applied, chosen when the page renders (never when
+ * the hook ran): by where the page runs and whether Active Defence is
+ * installed there.
+ */
+export const WITHHELD_WORDS = {
+  linux: "Per-agent relaxations apply on Linux with Active Defence, for an agent started with innerwarden contain --identity.",
+  linuxWithActiveDefence: "Active Defence on this host did not decide this command, so your general rules decided.",
+  macos: "Per-agent relaxations do not apply on macOS: a jail there has no boundary a witness outside it can check.",
+} as const;
 
-export function layerWords(layer: Layer, verdict: Verdict, agent: string, withheld: boolean): string | undefined {
-  const base = (LAYER_WORDS as Record<string, string | undefined>)[`${layer}:${verdict}`];
-  if (base === undefined) return undefined;
-  const text = base.replace("{agent}", agent);
-  return withheld ? `${text} ${WITHHELD_WORDS.replace("{agent}", agent)}` : text;
+/** Any word the host recorded for not relaxing, whatever it is: one sentence. */
+export const HOST_WITHHELD_WORDS = "Active Defence on this host kept your general rules for this command.";
+
+export function withheldWords(os: PlatformOs, activeDefenceInstalled: boolean, hostWithheld: boolean): string {
+  if (hostWithheld) return HOST_WITHHELD_WORDS;
+  if (os === "macos") return WITHHELD_WORDS.macos;
+  return activeDefenceInstalled ? WITHHELD_WORDS.linuxWithActiveDefence : WITHHELD_WORDS.linux;
 }
+
+export function layerWords(layer: Layer, verdict: Verdict, agent: string): string | undefined {
+  const base = (LAYER_WORDS as Record<string, string | undefined>)[`${layer}:${verdict}`];
+  return base === undefined ? undefined : base.replace("{agent}", agent);
+}
+
+/** An allowance a per-agent layer gave where Active Defence on the host decided the rules. */
+export const HOST_LAYER_WORDS: Record<"agent_type" | "instance", string> = {
+  agent_type: "Allowed by the {agent} profile, decided by Active Defence on this host.",
+  instance: "Allowed by an exception for this instance, decided by Active Defence on this host.",
+};
 
 /** One line in the Changes list (P6), by what was done. */
 export const AGENT_DECISION_ACTIONS = ["approve", "profile", "allow", "revoke"] as const;
@@ -362,18 +408,21 @@ export const CONFLICT_WORDS =
 /**
  * The "Decided by" line of a case. A layer that allows only because an
  * instance runs confined is never worded as such for an instance that does
- * not: the label is untrusted, so the line says it could not be confirmed.
+ * not: the label is untrusted, so the line says it could not be confirmed,
+ * unless the hook recorded that Active Defence on its host decided the rules
+ * (`hostDecided`), which the line says, neutrally, as what was recorded.
  */
 export function layerLine(
   layer: Layer,
   verdict: Verdict,
   trust: Trust,
   agent: string,
-  withheld: boolean,
+  hostDecided = false,
 ): { text: string; conflict: boolean } | undefined {
   if ((layer === "agent_type" || layer === "instance") && verdict === "allow" && trust !== "host_verified") {
+    if (hostDecided) return { text: HOST_LAYER_WORDS[layer].replace("{agent}", agent), conflict: false };
     return { text: CONFLICT_WORDS.replace("{agent}", agent), conflict: true };
   }
-  const text = layerWords(layer, verdict, agent, withheld);
+  const text = layerWords(layer, verdict, agent);
   return text === undefined ? undefined : { text, conflict: false };
 }

@@ -1629,6 +1629,64 @@ pub mod launch {
         (commands, last)
     }
 
+    /// Of the commands [`count_contained_run`] counts, the ones the hook
+    /// recorded as allowed by a per-agent rule the host decided: labelled
+    /// `trust_source=host` with a host decision, recommended `allow`, decided
+    /// by the type or the instance layer (a profile's deny decides there too,
+    /// and is not one). Their number, and each (decision, command hash) pair
+    /// once, sorted, at most `MAX_HOST_DECISIONS`. The hash is of the text the
+    /// node holds for the command.
+    pub fn host_allowances_in(
+        graph: &innerwarden_graph::Graph,
+        instance_id: &str,
+        started_ms: u64,
+        ended_ms: u64,
+    ) -> (
+        u32,
+        Vec<innerwarden_agent_guard::identity::HostDecisionClaim>,
+    ) {
+        use innerwarden_agent_guard::identity::{
+            is_decision_id, HostDecisionClaim, HOST_TRUST_SOURCE, MAX_HOST_DECISIONS,
+        };
+        use sha2::{Digest, Sha256};
+        let session = format!("session:{}", super::JAIL_SESSION);
+        let ran: std::collections::HashSet<&str> = graph
+            .edges
+            .iter()
+            .filter(|e| e.kind == "ran" && e.from == session)
+            .map(|e| e.to.as_str())
+            .collect();
+        let mut allowances: u32 = 0;
+        let mut claims = std::collections::BTreeSet::new();
+        for node in graph.nodes.iter().filter(|n| n.kind == "command") {
+            let attr = |key: &str| node.attrs.get(key).map(String::as_str);
+            let ours = match attr("instance_id") {
+                Some(labelled) => labelled == instance_id,
+                None => ran.contains(node.id.as_str()),
+            };
+            let in_window = attr("recorded_at_ms")
+                .and_then(|ms| ms.parse::<u64>().ok())
+                .is_some_and(|at| (started_ms..=ended_ms).contains(&at));
+            let Some(decision) = attr("host_decision").filter(|id| is_decision_id(id)) else {
+                continue;
+            };
+            let allowed = attr("trust_source") == Some(HOST_TRUST_SOURCE)
+                && attr("recommendation") == Some("allow")
+                && matches!(attr("deciding_layer"), Some("agent_type" | "instance"));
+            if !ours || !in_window || !allowed {
+                continue;
+            }
+            allowances = allowances.saturating_add(1);
+            let digest = Sha256::digest(node.label.as_bytes());
+            claims.insert(HostDecisionClaim {
+                decision_id: decision.to_string(),
+                command_sha256: digest.iter().map(|b| format!("{b:02x}")).collect(),
+            });
+        }
+        let claims: Vec<HostDecisionClaim> = claims.into_iter().take(MAX_HOST_DECISIONS).collect();
+        (allowances, claims)
+    }
+
     /// The report of an ended identified run, or `None`.
     ///
     /// Without `--identity` this is `None` and `read_graph` is never called:
@@ -1646,12 +1704,13 @@ pub mod launch {
         if !args.identity {
             return None;
         }
-        let (graph, (commands, last_ms)) = match read_graph() {
-            JailGraph::Absent => (JailGraphState::Absent, (0, None)),
-            JailGraph::Unreadable(_) => (JailGraphState::Unreadable, (0, None)),
+        let (graph, (commands, last_ms), (host_allowances, host_decisions)) = match read_graph() {
+            JailGraph::Absent => (JailGraphState::Absent, (0, None), (0, Vec::new())),
+            JailGraph::Unreadable(_) => (JailGraphState::Unreadable, (0, None), (0, Vec::new())),
             JailGraph::Read(g) => (
                 JailGraphState::Read,
                 count_contained_run(&g, instance_id, started_ms, ended_ms),
+                host_allowances_in(&g, instance_id, started_ms, ended_ms),
             ),
         };
         contained_run_report(&ContainedRun {
@@ -1661,6 +1720,8 @@ pub mod launch {
             graph,
             commands,
             last_ms,
+            host_allowances,
+            host_decisions: &host_decisions,
         })
     }
 }
@@ -3225,6 +3286,107 @@ mod tests {
             assert_eq!(body["last_ms"], serde_json::Value::Null);
             assert_eq!(body["trust"], "declared");
         }
+    }
+
+    const HOST_DECISION: &str = "0f1e2d3c4b5a69788796a5b4c3d2e1f0";
+
+    fn sha_hex(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    /// A command of this instance the hook recorded with the host's labels.
+    fn host_labelled(
+        id: &str,
+        at: u64,
+        recommendation: &str,
+        layer: &str,
+    ) -> innerwarden_graph::Node {
+        let mut node = command(id, Some(at), Some(OURS));
+        for (key, value) in [
+            ("trust_source", "host"),
+            ("host_decision", HOST_DECISION),
+            ("recommendation", recommendation),
+            ("deciding_layer", layer),
+        ] {
+            node.attrs.insert(key.to_string(), value.to_string());
+        }
+        node
+    }
+
+    /// A profile's deny decides at the type layer too, and claims no
+    /// allowance; neither does a general decision, an allow without the
+    /// host's labels, another instance's, or one outside the window.
+    ///
+    /// FAILS ON REVERT: count every node with a host decision and the deny
+    /// is claimed as an allowance.
+    #[test]
+    fn a_profile_deny_in_the_jail_is_not_an_allowance_claim() {
+        use launch::host_allowances_in;
+        let mut graph = jail_graph();
+        graph
+            .nodes
+            .push(host_labelled("cmd:h:1", 5_000, "allow", "agent_type"));
+        graph
+            .nodes
+            .push(host_labelled("cmd:h:2", 5_100, "allow", "instance"));
+        graph
+            .nodes
+            .push(host_labelled("cmd:h:3", 5_200, "deny", "agent_type"));
+        graph
+            .nodes
+            .push(host_labelled("cmd:h:4", 5_300, "review", "general"));
+        graph
+            .nodes
+            .push(host_labelled("cmd:h:5", 9_500, "allow", "agent_type"));
+        let mut other = host_labelled("cmd:h:6", 5_400, "allow", "agent_type");
+        other.attrs.insert("instance_id".into(), OTHER.into());
+        graph.nodes.push(other);
+        let mut no_source = host_labelled("cmd:h:7", 5_500, "allow", "agent_type");
+        no_source.attrs.remove("trust_source");
+        graph.nodes.push(no_source);
+        let (count, claims) = host_allowances_in(&graph, OURS, 1_000, 9_000);
+        assert_eq!(count, 2);
+        assert_eq!(
+            claims.len(),
+            1,
+            "the two allowances name one decision for one text"
+        );
+        assert_eq!(claims[0].decision_id, HOST_DECISION);
+        // Every node of the fixture holds the text `ls`.
+        assert_eq!(
+            claims[0].command_sha256,
+            sha_hex(b"ls"),
+            "the hash of the text the node holds"
+        );
+        let on = ContainArgs {
+            identity: true,
+            ..args(&["claude"])
+        };
+        let body = launch::contained_run_report_for(&on, OURS, 1_000, 9_000, || {
+            launch::JailGraph::Read(graph.clone())
+        })
+        .expect("a report");
+        assert_eq!(body["host_allowances"], 2);
+        assert_eq!(body["host_decisions"][0]["decision_id"], HOST_DECISION);
+    }
+
+    /// A jail graph without host labels reports the body it always did.
+    #[test]
+    fn a_jail_graph_without_host_labels_reports_no_host_keys() {
+        let on = ContainArgs {
+            identity: true,
+            ..args(&["claude"])
+        };
+        let body = launch::contained_run_report_for(&on, OURS, 1_000, 9_000, || {
+            launch::JailGraph::Read(jail_graph())
+        })
+        .unwrap();
+        assert!(body.get("host_allowances").is_none(), "{body}");
+        assert!(body.get("host_decisions").is_none(), "{body}");
     }
 
     fn entry(symlink: bool, dir: bool, regular: bool, uid: u32, len: u64) -> launch::GraphEntry {

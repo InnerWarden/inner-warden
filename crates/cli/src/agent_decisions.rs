@@ -516,12 +516,23 @@ fn instances_word(n: usize) -> &'static str {
     }
 }
 
+/// What a relaxation for `agent` covers: any program started under that name
+/// in a jail on this host, shell commands only.
+pub fn covers_sentence(agent: &str) -> String {
+    format!(
+        "Applies to any program started as {agent} in a jail on this host: the type is the \
+         name given at launch. Applies to shell commands only; MCP tools and file edits keep \
+         your general rules."
+    )
+}
+
 /// The sentence every relaxation carries.
-pub fn applies_sentence(confined: usize, other: usize) -> String {
+pub fn applies_sentence(agent: &str, confined: usize, other: usize) -> String {
     format!(
         "Applies only to instances that run confined; the others keep your general rules. \
-         {confined} confined and {other} other {} today.",
-        instances_word(other)
+         {confined} confined and {other} other {} today. {}",
+        instances_word(other),
+        covers_sentence(agent)
     )
 }
 
@@ -544,7 +555,7 @@ pub fn effect(
     let profile_after = profile_name(after, agent);
     let label_before = profile_label(profile_before.as_deref());
     let label_after = profile_label(profile_after.as_deref());
-    let applies = applies_sentence(confined, other);
+    let applies = applies_sentence(agent, confined, other);
     let target = |instance: &Option<String>| match instance {
         Some(id) => format!("instance {}", short(id)),
         None => agent.to_string(),
@@ -588,8 +599,10 @@ pub fn effect(
             (
                 format!(
                     "Allow {} for {agent} ({whom}). Applies only to instances that run \
-                     confined; the others keep your general rules. {confined} run confined now.",
-                    rule.value()
+                     confined; the others keep your general rules. {confined} run confined now. \
+                     {}",
+                    rule.value(),
+                    covers_sentence(agent)
                 ),
                 format!("{by} allowed {} for {agent} ({whom}).", rule.value()),
                 if instance.is_some() {
@@ -1116,6 +1129,18 @@ mod tests {
             e.done,
             "dev allowed bare_ip_fetch for claude-code (confined instances)."
         );
+        // Every relaxation says what it covers: any program started under the
+        // name, and shell commands only.
+        for text in [&widen.before, &e.before] {
+            assert!(
+                text.ends_with(
+                    "Applies to any program started as claude-code in a jail on this host: the \
+                     type is the name given at launch. Applies to shell commands only; MCP tools \
+                     and file edits keep your general rules."
+                ),
+                "{text}"
+            );
+        }
     }
 
     #[test]

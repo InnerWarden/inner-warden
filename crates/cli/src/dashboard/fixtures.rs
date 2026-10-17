@@ -850,6 +850,7 @@ fn identity_record() -> Graph {
                 deciding_layer: layer.map(str::to_string),
                 profile: Some("claude-code".into()),
                 relaxation_withheld: withheld,
+                ..DecisionOrigin::default()
             },
         );
     }

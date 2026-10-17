@@ -36,6 +36,8 @@ mod first_run;
 mod graph_io;
 mod help;
 mod hook_identity;
+mod host_decide;
+mod host_decide_io;
 mod http_io;
 mod notify_io;
 mod observe;
@@ -946,10 +948,11 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
     // Per-agent profiles, only where a profiles file exists. With none the
     // state is `Off` and the decision is the hook's own, as it always was.
     let blocks_today = hook_blocks(&verdict, block_review);
-    let (verdict, would_block_under_policy, deciding_layer) = match agent_profiles_io::load() {
+    let profiles_state = agent_profiles_io::load();
+    let (verdict, would_block_under_policy, deciding_layer) = match &profiles_state {
         agent_profiles::ProfilesState::Off => (verdict, blocks_today, None),
         agent_profiles::ProfilesState::Invalid(why) if !monitor => {
-            return hook_profiles_invalid(&why);
+            return hook_profiles_invalid(why);
         }
         agent_profiles::ProfilesState::Invalid(why) => {
             eprintln!(
@@ -960,7 +963,43 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
         }
         agent_profiles::ProfilesState::On(profiles) => {
             let hook_agent = agent_flag(rest);
-            let decided = agent_profiles::decide_hook(
+            let agent_type = agent_profiles::agent_type(hook_agent.as_deref(), identity.as_ref());
+            let instance_id = identity.as_ref().and_then(|id| id.instance_id.as_deref());
+            let inside = agent_profiles::trust(identity.as_ref());
+            // A review of an instance is asked of the host where Active
+            // Defence runs; nothing else is, and without a 200 nothing changes.
+            let url = host_decide::instance_decide_url(
+                std::env::var(agent_report::AGENT_URL_VAR).ok().as_deref(),
+            );
+            let asked = host_decide::should_ask(
+                agent_profiles::general_verdict(&verdict),
+                identity.as_ref(),
+                &profiles_state,
+                upsell_io::active_defence_installed,
+                url.as_deref(),
+            );
+            let reply = match (asked, identity.as_ref(), url.as_deref()) {
+                (true, Some(id), Some(url)) => host_decide::request_for(
+                    id,
+                    agent_type.as_deref(),
+                    &command,
+                    &verdict,
+                    tainted.is_some(),
+                )
+                .and_then(|request| {
+                    host_decide_io::consult(
+                        url,
+                        &request,
+                        std::path::Path::new(
+                            innerwarden_agent_guard::identity::AGENT_TLS_SPKI_PATH,
+                        ),
+                        host_decide::ASK_TIMEOUT,
+                    )
+                }),
+                _ => None,
+            };
+            let reply = host_decide::read_reply(reply, instance_id);
+            let local = agent_profiles::decide_hook(
                 &agent_profiles::HookFacts {
                     command: &command,
                     verdict: &verdict,
@@ -968,10 +1007,23 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
                     tainted: tainted.is_some(),
                     line_block_review: block_review,
                 },
-                &profiles,
-                agent_profiles::agent_type(hook_agent.as_deref(), identity.as_ref()).as_deref(),
-                identity.as_ref().and_then(|id| id.instance_id.as_deref()),
-                agent_profiles::trust(identity.as_ref()),
+                profiles,
+                agent_type.as_deref(),
+                instance_id,
+                host_decide::decision_trust(inside, &reply),
+            );
+            let (decided, host) = host_decide::settle(
+                local,
+                &reply,
+                host_decide::SettleFacts {
+                    general: &verdict,
+                    line_block_review: block_review,
+                    mode: agent_type
+                        .as_deref()
+                        .and_then(|name| profiles.get(name))
+                        .and_then(|profile| profile.mode),
+                    inside,
+                },
             );
             (
                 decided.verdict,
@@ -980,6 +1032,7 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
                     layer: decided.deciding_layer,
                     profile: decided.profile,
                     relaxation_withheld: decided.relaxation_withheld,
+                    host,
                 }),
             )
         }

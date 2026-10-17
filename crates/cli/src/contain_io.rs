@@ -388,7 +388,7 @@ struct PathEntry {
 /// What [`backend_trusted`] decides from, read by [`backend_facts`].
 #[cfg(unix)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct BackendFacts {
+pub(crate) struct BackendFacts {
     /// Each component of the path as the trusted list spells it, from `/`
     /// down, ending at the first symlink if there is one.
     components: Vec<PathEntry>,
@@ -401,7 +401,7 @@ struct BackendFacts {
 /// Read the facts about `path`. `None`, which refuses the backend, when the
 /// path is relative or any entry on it cannot be inspected.
 #[cfg(unix)]
-fn backend_facts(path: &Path) -> Option<BackendFacts> {
+pub(crate) fn backend_facts(path: &Path) -> Option<BackendFacts> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     let entry = |at: &Path| {
@@ -449,16 +449,33 @@ fn backend_facts(path: &Path) -> Option<BackendFacts> {
 /// whoever can write any of them can replace the jail.
 #[cfg(unix)]
 fn backend_trusted(facts: &BackendFacts) -> bool {
-    let sound = |entry: &PathEntry| !entry.symlink && entry.uid == 0 && entry.mode & 0o022 == 0;
-    let Some((executable, directories)) = facts.chain.split_first() else {
-        return false;
-    };
-    !facts.components.is_empty()
+    sound_root_file(facts, &|uid| uid == 0).is_some_and(|executable| executable.mode & 0o111 != 0)
+}
+
+/// Whether a file of root's these facts describe may be believed: the rules of
+/// [`backend_trusted`] for every entry on its path, with `root` saying which
+/// owner is root where the reader runs, and no execute bit asked for. PURE.
+#[cfg(unix)]
+pub(crate) fn root_file_trusted(facts: &BackendFacts, root: &dyn Fn(u32) -> bool) -> bool {
+    sound_root_file(facts, root).is_some()
+}
+
+/// The file the facts end at, when no entry on its path is a symlink, it is a
+/// regular file, and it and every directory above it are root's (`root`) and
+/// writable by no group and no other account.
+#[cfg(unix)]
+fn sound_root_file<'a>(
+    facts: &'a BackendFacts,
+    root: &dyn Fn(u32) -> bool,
+) -> Option<&'a PathEntry> {
+    let sound = |entry: &PathEntry| !entry.symlink && root(entry.uid) && entry.mode & 0o022 == 0;
+    let (file, directories) = facts.chain.split_first()?;
+    (!facts.components.is_empty()
         && facts.components.iter().all(|entry| !entry.symlink)
-        && sound(executable)
-        && executable.file
-        && executable.mode & 0o111 != 0
-        && directories.iter().all(|entry| sound(entry) && entry.dir)
+        && sound(file)
+        && file.file
+        && directories.iter().all(|entry| sound(entry) && entry.dir))
+    .then_some(file)
 }
 
 fn run_linux(input: &JailInputs) -> ExitCode {
@@ -1626,6 +1643,61 @@ mod tests {
                 "{unsafe_fact}: the case changes nothing"
             );
             assert!(!backend_trusted(&facts), "trusted although {unsafe_fact}");
+        }
+    }
+
+    /// A file of root's that is read, not run (the key the hook holds the
+    /// host's answer to), is held to the backend's rules without an execute
+    /// bit, with root as the reader sees it.
+    ///
+    /// FAILS ON REVERT: drop the owner check from `sound_root_file` and the
+    /// file of another account is believed.
+    #[cfg(unix)]
+    #[test]
+    fn a_root_file_is_held_to_the_backends_rules_without_an_execute_bit() {
+        let mut key = installed();
+        key.chain[0] = file(0, 0o644);
+        key.components[3] = file(0, 0o644);
+        let root = |uid: u32| uid == 0;
+        assert!(root_file_trusted(&key, &root));
+        assert!(
+            !backend_trusted(&key),
+            "a backend still needs its execute bit"
+        );
+        let mut seen = key.clone();
+        for entry in seen.chain.iter_mut().chain(seen.components.iter_mut()) {
+            entry.uid = 65534;
+        }
+        assert!(!root_file_trusted(&seen, &root));
+        assert!(root_file_trusted(&seen, &|uid| uid == 65534));
+        type Case = (&'static str, fn(&mut BackendFacts));
+        let cases: &[Case] = &[
+            ("the file is another account's", |f| {
+                f.chain[0] = file(1000, 0o644)
+            }),
+            ("the file is group-writable", |f| {
+                f.chain[0] = file(0, 0o664)
+            }),
+            ("the file is a directory", |f| f.chain[0] = dir(0, 0o755)),
+            ("the file is a symlink", |f| f.chain[0] = link()),
+            ("a directory above it is world-writable", |f| {
+                f.chain[1] = dir(0, 0o757)
+            }),
+            ("a directory above it is another account's", |f| {
+                f.chain[2] = dir(1000, 0o755)
+            }),
+            ("a component as written is a symlink", |f| {
+                f.components[1] = link()
+            }),
+            ("nothing was resolved", |f| f.chain.clear()),
+        ];
+        for &(unsafe_fact, change) in cases {
+            let mut facts = key.clone();
+            change(&mut facts);
+            assert!(
+                !root_file_trusted(&facts, &root),
+                "trusted although {unsafe_fact}"
+            );
         }
     }
 

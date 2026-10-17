@@ -105,11 +105,30 @@ fn trust_word(word: &str) -> Option<Trust> {
 /// supports nothing above `declared`, and none supports more than
 /// `observed`: every code here is a reading from inside the jail, and a
 /// reading from inside the jail tops at `observed` (`judge_trust_in_jail`,
-/// row 10), `confined_by_namespace` included.
+/// row 10), `confined_by_namespace` included. `host_decided` too: the hook
+/// wrote that the host's rules decided, which is its word, not the host's.
 pub fn reason_ceiling(reason: &str) -> Trust {
     match reason {
-        "confined_by_namespace" | "launcher_not_trusted" | "no_scope" => Trust::Observed,
+        "confined_by_namespace" | "launcher_not_trusted" | "no_scope" | HOST_DECIDED => {
+            Trust::Observed
+        }
         _ => Trust::Declared,
+    }
+}
+
+/// The reason a hook records when Active Defence on its host decided the
+/// rules ([`crate::graph_io::HOST_DECIDED`]).
+const HOST_DECIDED: &str = crate::graph_io::HOST_DECIDED;
+
+/// Where an instance's shown reason comes from: `host` when it is the one a
+/// hook records after Active Defence on its host decided its rules, `jail`
+/// otherwise. A label, never a level: the trust beside it is capped all the
+/// same.
+pub fn trust_source_of(reason: &str) -> &'static str {
+    if reason == HOST_DECIDED {
+        "host"
+    } else {
+        "jail"
     }
 }
 
@@ -225,11 +244,12 @@ pub fn instance_view(
         .as_ref()
         .and_then(|s| s.system.as_ref().or(s.user.as_ref()))
         .map(|scope| shown(&scope.unit));
+    let trust_source = trust_source_of(&trust_reason);
     LocalInstanceView {
         instance_id: record.instance_id.clone(),
         trust: wire_trust(trust),
         trust_reason,
-        trust_source: "jail",
+        trust_source,
         user: facts.user.as_deref().map(shown),
         uid: record.uid,
         project: shown(&record.project),
@@ -476,6 +496,30 @@ mod tests {
             (ended.trust, ended.trust_reason.as_str()),
             ("observed", "confined_by_namespace")
         );
+    }
+
+    /// A hook that says Active Defence on its host decided its rules is
+    /// shown `observed` with that reason, from the `host` source; a label
+    /// that claims `confined` beside it is capped all the same.
+    ///
+    /// FAILS ON REVERT: leave `host_decided` out of `reason_ceiling` and the
+    /// instance reads `declared`.
+    #[test]
+    fn a_host_decided_label_is_observed_from_the_host_source() {
+        assert_eq!(reason_ceiling("host_decided"), Trust::Observed);
+        let view = instance_view(
+            &facts(ID, false, None),
+            Some(&label("confined", "host_decided")),
+        );
+        assert_eq!(
+            (view.trust, view.trust_reason.as_str(), view.trust_source),
+            ("observed", "host_decided", "host")
+        );
+        let plain = instance_view(
+            &facts(ID, false, None),
+            Some(&label("observed", "confined_by_namespace")),
+        );
+        assert_eq!(plain.trust_source, "jail");
     }
 
     /// What the project's graph holds about an instance shows only where

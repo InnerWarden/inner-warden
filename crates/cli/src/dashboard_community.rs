@@ -1525,6 +1525,11 @@ fn decision_identity_json(identity: &innerwarden_graph::DecisionIdentity) -> Val
         "relaxation_withheld".into(),
         json!(identity.relaxation_withheld),
     );
+    // What the host answered, when the hook asked it: labels the hook wrote,
+    // shown as such. Absent on every decision the host was not asked about.
+    opt(&mut object, "trust_source", identity.trust_source.clone());
+    opt(&mut object, "host_decision", identity.host_decision.clone());
+    opt(&mut object, "host_withheld", identity.host_withheld.clone());
     Value::Object(object)
 }
 
@@ -2214,6 +2219,26 @@ mod tests {
             ..DecisionOrigin::default()
         });
         assert!(plain.get("identity").is_none(), "{plain}");
+        // What the host answered is served as the hook wrote it, and the
+        // trust beside it stays capped by its reason.
+        let host = view(DecisionOrigin {
+            channel: Some(DecisionChannel::Hook),
+            instance_id: Some(id.into()),
+            trust: Some("confined".into()),
+            trust_reason: Some("host_decided".into()),
+            trust_source: Some("host".into()),
+            host_decision: Some("0f1e2d3c4b5a69788796a5b4c3d2e1f0".into()),
+            deciding_layer: Some("agent_type".into()),
+            ..DecisionOrigin::default()
+        });
+        assert_eq!(host["identity"]["trust"], "observed");
+        assert_eq!(host["identity"]["trust_reason"], "host_decided");
+        assert_eq!(host["identity"]["trust_source"], "host");
+        assert_eq!(
+            host["identity"]["host_decision"],
+            "0f1e2d3c4b5a69788796a5b4c3d2e1f0"
+        );
+        assert!(host["identity"].get("host_withheld").is_none());
     }
 
     fn one(

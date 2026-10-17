@@ -27,6 +27,13 @@
 //! write must never be able to loosen what that agent is held to. The user's
 //! file can tighten, and can give `contain --identity` its jail settings.
 //!
+//! No reading from inside a jail is `confined`, so the hook decides a shell
+//! command at `confined` only when the Active Defence agent on its host
+//! answered that a relaxation applies ([`crate::identity::INSTANCE_DECIDE_ROUTE`]),
+//! and then keeps the stricter of its own decision and the host's. The MCP
+//! proxy and the file tools do not ask: there a relaxation is recorded and
+//! not applied.
+//!
 //! ```toml
 //! schema_version = 1
 //!

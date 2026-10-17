@@ -85,6 +85,18 @@ pub struct DecisionOrigin {
     /// instance did not run confined, and the general rules decided. Written
     /// only beside a deciding layer, and only when true.
     pub relaxation_withheld: bool,
+    /// Who was asked about the rules for this decision: `host` when the hook
+    /// asked the Active Defence agent on its host and got the contract's
+    /// answer (`jail` is the hook's own reading). A LABEL the hook wrote.
+    /// Written only beside a known trust; only a known word is kept.
+    pub trust_source: Option<String>,
+    /// The host's id for its decision (32 lowercase hex characters), from
+    /// its answer. Written only beside a known trust.
+    pub host_decision: Option<String>,
+    /// The host's word for not relaxing, as it came (1 to 48 of `[a-z_]`),
+    /// or `host_answer_invalid` when its answer was not the contract's.
+    /// Written only beside a known trust.
+    pub host_withheld: Option<String>,
 }
 
 const MAX_AGENT_CHARS: usize = 64;
@@ -100,6 +112,22 @@ const TRUST_WORDS: [&str; 3] = ["declared", "observed", "confined"];
 
 /// The words a deciding layer may hold.
 const LAYER_WORDS: [&str; 4] = ["hard", "general", "agent_type", "instance"];
+
+/// The words a trust source may hold.
+const TRUST_SOURCE_WORDS: [&str; 2] = ["jail", "host"];
+
+/// A host decision id: 32 lowercase hex characters.
+fn valid_host_decision(id: &str) -> bool {
+    valid_instance(id)
+}
+
+/// A host's word for not relaxing, kept without being read: 1 to 48 of
+/// `[a-z_]`.
+fn valid_host_withheld(word: &str) -> bool {
+    !word.is_empty()
+        && word.len() <= 48
+        && word.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
+}
 
 /// An instance id is 32 lowercase hex characters (the launcher's 16 random
 /// bytes), the same shape `agent_guard::identity::is_instance_id` accepts.
@@ -216,6 +244,27 @@ impl DecisionOrigin {
             if let Some(reason) = self.trust_reason.as_deref().filter(|r| valid_reason(r)) {
                 attrs.insert("trust_reason".into(), reason.into());
             }
+            if let Some(source) = self
+                .trust_source
+                .as_deref()
+                .filter(|word| TRUST_SOURCE_WORDS.contains(word))
+            {
+                attrs.insert("trust_source".into(), source.into());
+            }
+            if let Some(id) = self
+                .host_decision
+                .as_deref()
+                .filter(|id| valid_host_decision(id))
+            {
+                attrs.insert("host_decision".into(), id.into());
+            }
+            if let Some(word) = self
+                .host_withheld
+                .as_deref()
+                .filter(|word| valid_host_withheld(word))
+            {
+                attrs.insert("host_withheld".into(), word.into());
+            }
         }
         if let Some(layer) = self.layer_label() {
             attrs.insert("deciding_layer".into(), layer.into());
@@ -243,6 +292,13 @@ pub struct DecisionIdentity {
     pub deciding_layer: Option<String>,
     pub profile: Option<String>,
     pub relaxation_withheld: bool,
+    /// `jail` or `host`, beside a trust.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trust_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_decision: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_withheld: Option<String>,
 }
 
 /// The identity labels of one command node, or `None` when it holds none
@@ -250,6 +306,12 @@ pub struct DecisionIdentity {
 fn identity_of(node: &Node) -> Option<DecisionIdentity> {
     let trust = attr(node, "trust").filter(|word| TRUST_WORDS.contains(word));
     let layer = attr(node, "deciding_layer").filter(|word| LAYER_WORDS.contains(word));
+    let beside_trust = |key: &str, valid: fn(&str) -> bool| {
+        trust
+            .and(attr(node, key))
+            .filter(|value| valid(value))
+            .map(str::to_string)
+    };
     let identity = DecisionIdentity {
         instance_id: attr(node, "instance_id")
             .filter(|id| valid_instance(id))
@@ -268,6 +330,9 @@ fn identity_of(node: &Node) -> Option<DecisionIdentity> {
             .filter(|profile| valid_agent(profile))
             .map(str::to_string),
         relaxation_withheld: layer.is_some() && attr(node, "relaxation_withheld") == Some("true"),
+        trust_source: beside_trust("trust_source", |word| TRUST_SOURCE_WORDS.contains(&word)),
+        host_decision: beside_trust("host_decision", valid_host_decision),
+        host_withheld: beside_trust("host_withheld", valid_host_withheld),
     };
     (identity.instance_id.is_some()
         || identity.session_id.is_some()
@@ -1584,12 +1649,79 @@ mod tests {
                 deciding_layer: Some("general".into()),
                 profile: Some("claude-code".into()),
                 relaxation_withheld: true,
+                ..DecisionIdentity::default()
             })
         );
         let plain = page.items.iter().find(|item| item.session == "s2").unwrap();
         assert_eq!(plain.identity, None);
         let json = serde_json::to_value(plain).unwrap();
         assert!(json.get("identity").is_none(), "{json}");
+        // A decision the host was not asked about serves no host key.
+        let json = serde_json::to_value(labelled).unwrap();
+        for key in ["trust_source", "host_decision", "host_withheld"] {
+            assert!(json["identity"].get(key).is_none(), "{key}: {json}");
+        }
+    }
+
+    /// What the host answered rides only beside a trust, each value in its
+    /// shape, and is read back the same way.
+    ///
+    /// FAILS ON REVERT: write `trust_source` outside the trust branch and the
+    /// origin with no trust carries it; drop a shape filter and its bad value
+    /// is written.
+    #[test]
+    fn the_host_labels_ride_only_beside_a_trust_and_in_their_shape() {
+        let host = DecisionOrigin {
+            trust: Some("observed".into()),
+            trust_reason: Some("host_decided".into()),
+            trust_source: Some("host".into()),
+            host_decision: Some("0f1e2d3c4b5a69788796a5b4c3d2e1f0".into()),
+            host_withheld: Some("no_system_scope".into()),
+            deciding_layer: Some("agent_type".into()),
+            ..DecisionOrigin::default()
+        };
+        let mut attrs = BTreeMap::new();
+        host.write_attrs(&mut attrs);
+        assert_eq!(attrs["trust_source"], "host");
+        assert_eq!(attrs["host_decision"], "0f1e2d3c4b5a69788796a5b4c3d2e1f0");
+        assert_eq!(attrs["host_withheld"], "no_system_scope");
+        assert_eq!(attrs["trust_reason"], "host_decided");
+
+        let mut without_trust = BTreeMap::new();
+        DecisionOrigin {
+            trust: None,
+            ..host.clone()
+        }
+        .write_attrs(&mut without_trust);
+        for key in ["trust_source", "host_decision", "host_withheld"] {
+            assert!(!without_trust.contains_key(key), "{key}");
+        }
+
+        let mut bad = BTreeMap::new();
+        DecisionOrigin {
+            trust_source: Some("kernel".into()),
+            host_decision: Some("0F1E2D3C4B5A69788796A5B4C3D2E1F0".into()),
+            host_withheld: Some("Kept, because".into()),
+            ..host.clone()
+        }
+        .write_attrs(&mut bad);
+        for key in ["trust_source", "host_decision", "host_withheld"] {
+            assert!(!bad.contains_key(key), "{key}: {bad:?}");
+        }
+
+        let mut g = Graph::new();
+        labelled(&mut g, "contain", 0, "allow", &host, 10);
+        let page = g.decisions_page(&DecisionQuery {
+            flagged_only: false,
+            ..DecisionQuery::default()
+        });
+        let read = page.items[0].identity.clone().expect("identity");
+        assert_eq!(read.trust_source.as_deref(), Some("host"));
+        assert_eq!(
+            read.host_decision.as_deref(),
+            Some("0f1e2d3c4b5a69788796a5b4c3d2e1f0")
+        );
+        assert_eq!(read.host_withheld.as_deref(), Some("no_system_scope"));
     }
 
     /// Per instance: the newest trust label wins, sessions are newest first

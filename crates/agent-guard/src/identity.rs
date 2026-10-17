@@ -37,6 +37,19 @@
 //! `innerwarden contain --identity` (off by default) writes the record; the
 //! hook reads it for its labels; the per-agent profiles ([`crate::profiles`],
 //! read only where a profiles file exists) decide with [`decide`].
+//!
+//! # Who decides that a relaxation applies
+//!
+//! No reading from inside the jail reaches `confined`, so the hook alone never
+//! applies a relaxation. Where InnerWarden Active Defence runs on the same
+//! host, the hook ASKS it ([`INSTANCE_DECIDE_ROUTE`]) when its general rules
+//! sent a shell command of an instance to review, and the host decides. The
+//! hook takes `confined` as the input of [`decide`] only from an answer that
+//! says so ([`InstanceDecideAnswer::relaxes`]), keeps the stricter of its own
+//! decision and the host's verdict, and never records the answer's word as
+//! the instance's trust: the answer is something the agent's process could
+//! also have been shown, and the label it leaves says only that the host was
+//! asked ([`HOST_TRUST_SOURCE`]).
 
 use std::fmt;
 use std::path::{Component, Path};
@@ -165,27 +178,69 @@ pub struct ContainedRun<'a> {
     pub commands: u32,
     /// The newest of them, in ms.
     pub last_ms: Option<u64>,
+    /// Of those commands, the ones the hook recorded as allowed by a
+    /// per-agent rule the host decided: an `allow` from the type or the
+    /// instance layer, labelled with [`HOST_TRUST_SOURCE`] and a host
+    /// decision. The jail's own word, like the other counts.
+    pub host_allowances: u32,
+    /// The host decisions those commands name, each pair once, at most
+    /// [`MAX_HOST_DECISIONS`].
+    pub host_decisions: &'a [HostDecisionClaim],
+}
+
+/// The most host decisions one [`contained_run_report`] names.
+pub const MAX_HOST_DECISIONS: usize = 256;
+
+/// One command a jail's hook recorded as allowed by the host: the host
+/// decision it names and the SHA-256, in lowercase hex, of the command text
+/// the record holds for it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostDecisionClaim {
+    pub decision_id: String,
+    pub command_sha256: String,
+}
+
+impl HostDecisionClaim {
+    /// Both values have their shape: a [`is_decision_id`] and 64 lowercase
+    /// hex characters.
+    pub fn is_valid(&self) -> bool {
+        is_decision_id(&self.decision_id) && is_lower_hex(&self.command_sha256, 64)
+    }
 }
 
 /// The body of a report to [`CONTAINED_RUN_ROUTE`], or `None` when the run
 /// does not describe itself consistently: an id that is not an id, a window
-/// that ends before it starts, a newest command outside the window, or a
-/// count for a graph that was not read.
+/// that ends before it starts, a newest command outside the window, a count
+/// for a graph that was not read, or host allowances that are not a part of
+/// the commands counted or do not name their decisions.
 ///
 /// ```json
 /// {"instance": "<id>", "source": "project_graph", "trust": "declared",
 ///  "graph": "read", "commands": 3, "last_ms": 1760000000000,
 ///  "started_ms": 1759999990000, "ended_ms": 1760000005000}
 /// ```
+///
+/// `host_allowances` and `host_decisions` are added only when the run has
+/// any, so the report of a run without them is the body it always was.
 pub fn contained_run_report(run: &ContainedRun<'_>) -> Option<serde_json::Value> {
     let window = run.started_ms..=run.ended_ms;
+    let mut pairs: Vec<&HostDecisionClaim> = run.host_decisions.iter().collect();
+    pairs.sort_unstable();
+    pairs.dedup();
     let consistent = is_instance_id(run.instance_id)
         && run.started_ms <= run.ended_ms
         && run.last_ms.is_none_or(|ms| window.contains(&ms))
         && (run.commands == 0) == run.last_ms.is_none()
-        && (run.graph == JailGraphState::Read || run.commands == 0);
+        && (run.graph == JailGraphState::Read || run.commands == 0)
+        && run.host_allowances <= run.commands
+        && (run.host_allowances == 0) == run.host_decisions.is_empty()
+        && run.host_decisions.len() <= MAX_HOST_DECISIONS
+        && run.host_decisions.len() <= run.host_allowances as usize
+        && pairs.len() == run.host_decisions.len()
+        && run.host_decisions.iter().all(HostDecisionClaim::is_valid);
     consistent.then(|| {
-        serde_json::json!({
+        let mut body = serde_json::json!({
             "instance": run.instance_id,
             "source": CONTAINED_RUN_SOURCE,
             "trust": Trust::Declared.as_str(),
@@ -194,8 +249,336 @@ pub fn contained_run_report(run: &ContainedRun<'_>) -> Option<serde_json::Value>
             "last_ms": run.last_ms,
             "started_ms": run.started_ms,
             "ended_ms": run.ended_ms,
-        })
+        });
+        if run.host_allowances > 0 {
+            body["host_allowances"] = serde_json::json!(run.host_allowances);
+            body["host_decisions"] = serde_json::json!(run.host_decisions);
+        }
+        body
     })
+}
+
+// ---------------------------------------------------------------------------
+// Asking the host
+// ---------------------------------------------------------------------------
+
+/// The local route a hook in an identified jail calls, at most once per
+/// screened shell command and within a short bound, to ask the Active
+/// Defence agent on the same host whether a per-agent relaxation applies to
+/// a command its general rules sent to review.
+///
+/// The request is an [`InstanceDecideRequest`] and it carries the command's
+/// RAW text: the host judges the command again with its own copy of the
+/// engine, and a redacted text would be another command. It goes only to
+/// this host's loopback and is never written anywhere by the hook. The answer
+/// is an [`InstanceDecideAnswer`]; [`read_host_answer`] says what the hook may
+/// take from it. Without an answer that is exactly the contract's, the hook
+/// decides as it did before it asked.
+pub const INSTANCE_DECIDE_ROUTE: &str = "/api/agent/instance-decide";
+
+/// The only version of the request and of the answer.
+pub const INSTANCE_DECIDE_VERSION: u32 = 1;
+
+/// The most signal names one request carries.
+pub const MAX_HOOK_SIGNALS: usize = 64;
+
+/// The most bytes of an answer the hook reads.
+pub const MAX_INSTANCE_ANSWER_BYTES: usize = 4096;
+
+/// The `trust_source` of every answer, and the label a decision the host
+/// answered for carries.
+pub const HOST_TRUST_SOURCE: &str = "host";
+
+/// The word the hook records when the host answered 200 with a body that is
+/// not the contract's. The hook's own word: it never comes from the wire.
+pub const HOST_ANSWER_INVALID: &str = "host_answer_invalid";
+
+/// Where the Active Defence agent publishes the key its local dashboard
+/// answers with (see [`parse_spki_pin`]), for the hook to hold the answer's
+/// connection to.
+pub const AGENT_TLS_SPKI_PATH: &str = "/etc/innerwarden/agent-tls.spki";
+
+/// The most bytes the key file holds: 64 hex characters and a newline.
+pub const MAX_SPKI_PIN_BYTES: usize = 65;
+
+/// The key in [`AGENT_TLS_SPKI_PATH`]: the SHA-256 of the DER
+/// `SubjectPublicKeyInfo` (outer `SEQUENCE` included) of the certificate the
+/// agent's local dashboard presents, as 64 lowercase hex characters,
+/// optionally followed by one newline. Anything else is no key.
+pub fn parse_spki_pin(bytes: &[u8]) -> Option<[u8; 32]> {
+    let text = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+    let text = std::str::from_utf8(text).ok()?;
+    if !is_lower_hex(text, 64) {
+        return None;
+    }
+    let mut pin = [0u8; 32];
+    for (index, byte) in pin.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&text[index * 2..index * 2 + 2], 16).ok()?;
+    }
+    Some(pin)
+}
+
+/// The line [`parse_spki_pin`] reads for `digest`.
+pub fn spki_pin_line(digest: &[u8; 32]) -> String {
+    let mut line: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    line.push('\n');
+    line
+}
+
+/// Exactly `len` lowercase hex characters.
+fn is_lower_hex(text: &str, len: usize) -> bool {
+    text.len() == len
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// A host decision id: 32 lowercase hex characters (128 random bits).
+pub fn is_decision_id(id: &str) -> bool {
+    is_lower_hex(id, 32)
+}
+
+/// A session id a request may carry: 1 to 128 of `[A-Za-z0-9_-]`. Any other
+/// session the hook has is sent as `null`.
+pub fn is_session_label(session: &str) -> bool {
+    !session.is_empty()
+        && session.len() <= 128
+        && session
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// A word an answer may hold in `withheld`: 1 to 48 of `[a-z_]`. The hook
+/// keeps it as it came, without knowing what it means.
+pub fn is_withheld_word(word: &str) -> bool {
+    !word.is_empty()
+        && word.len() <= 48
+        && word.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
+}
+
+/// A signal name a request may carry: a name the engine raises
+/// ([`crate::mcp::SIGNAL_NAMES`]), an aggravating factor
+/// ([`crate::mcp::AGGRAVATING_SIGNAL_NAMES`]), or `atr:<category>` with a
+/// category of 1 to 64 of `[a-z0-9_-]`.
+pub fn is_hook_signal(name: &str) -> bool {
+    if crate::mcp::SIGNAL_NAMES.contains(&name)
+        || crate::mcp::AGGRAVATING_SIGNAL_NAMES.contains(&name)
+    {
+        return true;
+    }
+    name.strip_prefix("atr:").is_some_and(|category| {
+        !category.is_empty()
+            && category.len() <= 64
+            && category
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+    })
+}
+
+/// A field that must be present and may be `null`. Without this, serde reads
+/// a missing `Option` as `None`, and an answer that left out `withheld` would
+/// read as one that withheld nothing.
+fn nullable<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+
+/// The body of a request to [`INSTANCE_DECIDE_ROUTE`]. Every field is
+/// required and none other is read (`deny_unknown_fields`).
+///
+/// ```json
+/// {"v":1,"instance_id":"<id>","claimed_agent_type":"claude-code",
+///  "session_id":"<id>","command":"curl http://203.0.113.9/x",
+///  "hook_signals":["bare_ip_fetch"],"tainted":false,
+///  "hook_verdict":"review","hook_layer":"general"}
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstanceDecideRequest {
+    /// [`INSTANCE_DECIDE_VERSION`].
+    pub v: u32,
+    /// The instance the hook's own record names.
+    pub instance_id: String,
+    /// The agent type the hook would apply a profile for. A claim the host
+    /// compares, never one it uses.
+    #[serde(deserialize_with = "nullable")]
+    pub claimed_agent_type: Option<String>,
+    /// The session id the agent sent, when it has the shape of
+    /// [`is_session_label`]. Only recorded.
+    #[serde(deserialize_with = "nullable")]
+    pub session_id: Option<String>,
+    /// The command as the agent asked to run it, raw.
+    pub command: String,
+    /// The signals the hook's general verdict charged, each once, sorted.
+    pub hook_signals: Vec<String>,
+    /// An argument of the command came from an earlier tool result.
+    pub tainted: bool,
+    /// Always [`Verdict::Review`]: the hook asks about nothing else.
+    pub hook_verdict: Verdict,
+    /// Always [`RuleLayer::General`].
+    pub hook_layer: RuleLayer,
+}
+
+impl InstanceDecideRequest {
+    /// Whether every field holds what the contract lets it hold.
+    pub fn is_valid(&self) -> bool {
+        self.v == INSTANCE_DECIDE_VERSION
+            && is_instance_id(&self.instance_id)
+            && self
+                .claimed_agent_type
+                .as_deref()
+                .is_none_or(is_agent_label)
+            && self.session_id.as_deref().is_none_or(is_session_label)
+            && !self.command.is_empty()
+            && self.hook_signals.len() <= MAX_HOOK_SIGNALS
+            && self.hook_signals.iter().all(|s| is_hook_signal(s))
+            && self.hook_signals.windows(2).all(|pair| pair[0] < pair[1])
+            && self.hook_verdict == Verdict::Review
+            && self.hook_layer == RuleLayer::General
+    }
+}
+
+/// PURE. The request a hook sends about one command its general rules sent
+/// to review, or `None` when `instance_id` is not an id or the command is
+/// empty.
+///
+/// `claimed_agent_type` is sent only when it is an agent label, and
+/// `session_id` only when it has the shape of [`is_session_label`]; either is
+/// `null` otherwise. Of `charged`, only the names [`is_hook_signal`] accepts
+/// are sent, each once, sorted, at most [`MAX_HOOK_SIGNALS`].
+pub fn instance_decide_request(
+    instance_id: &str,
+    claimed_agent_type: Option<&str>,
+    session_id: Option<&str>,
+    command: &str,
+    charged: &[&str],
+    tainted: bool,
+) -> Option<InstanceDecideRequest> {
+    if !is_instance_id(instance_id) || command.is_empty() {
+        return None;
+    }
+    let signals: std::collections::BTreeSet<&str> = charged
+        .iter()
+        .copied()
+        .filter(|name| is_hook_signal(name))
+        .collect();
+    Some(InstanceDecideRequest {
+        v: INSTANCE_DECIDE_VERSION,
+        instance_id: instance_id.to_string(),
+        claimed_agent_type: claimed_agent_type
+            .filter(|label| is_agent_label(label))
+            .map(str::to_string),
+        session_id: session_id
+            .filter(|session| is_session_label(session))
+            .map(str::to_string),
+        command: command.to_string(),
+        hook_signals: signals
+            .into_iter()
+            .take(MAX_HOOK_SIGNALS)
+            .map(str::to_string)
+            .collect(),
+        tainted,
+        hook_verdict: Verdict::Review,
+        hook_layer: RuleLayer::General,
+    })
+}
+
+/// The body of a 200 from [`INSTANCE_DECIDE_ROUTE`]. Every field is required
+/// (a `null` where it may be one) and none other is accepted
+/// (`deny_unknown_fields`).
+///
+/// ```json
+/// {"v":1,"instance_id":"<id>","agent_type":"claude-code","trust":"confined",
+///  "trust_source":"host","verdict":"allow","deciding_layer":"agent_type",
+///  "profile":"claude-code","decision_id":"<32 hex>","withheld":null,
+///  "signals_mismatch":false,"conflict":false,"incident_id":null}
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstanceDecideAnswer {
+    /// [`INSTANCE_DECIDE_VERSION`].
+    pub v: u32,
+    /// The instance the host answered for.
+    pub instance_id: String,
+    /// The agent type the host holds for the instance.
+    #[serde(deserialize_with = "nullable")]
+    pub agent_type: Option<String>,
+    /// The host's word for the instance.
+    pub trust: Trust,
+    /// Always [`HOST_TRUST_SOURCE`].
+    pub trust_source: String,
+    /// The host's verdict on the command.
+    pub verdict: Verdict,
+    /// The layer that made the host's verdict.
+    pub deciding_layer: RuleLayer,
+    /// The profile, when a per-agent layer decided.
+    #[serde(deserialize_with = "nullable")]
+    pub profile: Option<String>,
+    /// The host's key for this decision ([`is_decision_id`]).
+    pub decision_id: String,
+    /// `null` only when a relaxation applied; otherwise a word
+    /// ([`is_withheld_word`]) the hook records without reading it.
+    #[serde(deserialize_with = "nullable")]
+    pub withheld: Option<String>,
+    /// The host read other signals than the hook sent. Only recorded.
+    pub signals_mismatch: bool,
+    /// The host found the request in conflict with what it holds.
+    pub conflict: bool,
+    /// The incident the host opened about it, if any.
+    #[serde(deserialize_with = "nullable")]
+    pub incident_id: Option<String>,
+}
+
+impl InstanceDecideAnswer {
+    /// Whether the host let a relaxation apply: it says `confined` and
+    /// withheld nothing. The only case in which the hook decides at
+    /// `confined`.
+    pub fn relaxes(&self) -> bool {
+        self.trust == Trust::Confined && self.withheld.is_none()
+    }
+}
+
+/// What the hook makes of a 200 from [`INSTANCE_DECIDE_ROUTE`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostAnswer {
+    /// The contract's answer, about this instance.
+    Answer(InstanceDecideAnswer),
+    /// Anything else: the hook decides as it would have without asking, and
+    /// records [`HOST_ANSWER_INVALID`].
+    Withheld,
+}
+
+/// PURE. Read the body of a 200 from [`INSTANCE_DECIDE_ROUTE`], for the hook
+/// of `own_instance_id`. Only an answer of exactly the contract's shape
+/// counts: no field missing, none more, `v` 1, the hook's own instance,
+/// `trust_source` `host`, a decision id, and every word of the shape its
+/// field allows. Everything else is [`HostAnswer::Withheld`].
+pub fn read_host_answer(bytes: &[u8], own_instance_id: &str) -> HostAnswer {
+    if bytes.len() > MAX_INSTANCE_ANSWER_BYTES {
+        return HostAnswer::Withheld;
+    }
+    let Ok(answer) = serde_json::from_slice::<InstanceDecideAnswer>(bytes) else {
+        return HostAnswer::Withheld;
+    };
+    let sound = answer.v == INSTANCE_DECIDE_VERSION
+        && is_instance_id(own_instance_id)
+        && answer.instance_id == own_instance_id
+        && answer.trust_source == HOST_TRUST_SOURCE
+        && is_decision_id(&answer.decision_id)
+        && answer.agent_type.as_deref().is_none_or(is_agent_label)
+        && answer.profile.as_deref().is_none_or(is_agent_label)
+        && answer.withheld.as_deref().is_none_or(is_withheld_word)
+        && answer.incident_id.as_deref().is_none_or(|id| {
+            !id.is_empty() && id.len() <= 256 && !id.chars().any(char::is_control)
+        });
+    if sound {
+        HostAnswer::Answer(answer)
+    } else {
+        HostAnswer::Withheld
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -557,8 +940,9 @@ pub fn is_instance_id(id: &str) -> bool {
 }
 
 /// The same shape as the agent id a decision records: lowercase, digits, `-`
-/// and `_`, up to 64 bytes.
-fn is_agent_label(label: &str) -> bool {
+/// and `_`, up to 64 bytes. The rule a `claimed_agent_type` meets
+/// ([`InstanceDecideRequest`]).
+pub fn is_agent_label(label: &str) -> bool {
     !label.is_empty()
         && label.len() <= MAX_LABEL_LEN
         && label
@@ -1479,6 +1863,8 @@ mod tests {
             graph: JailGraphState::Read,
             commands,
             last_ms,
+            host_allowances: 0,
+            host_decisions: &[],
         }
     }
 
@@ -1587,6 +1973,418 @@ mod tests {
         ];
         for (wrong, run) in cases {
             assert_eq!(contained_run_report(&run), None, "{wrong}");
+        }
+    }
+
+    const DECISION: &str = "0f1e2d3c4b5a69788796a5b4c3d2e1f0";
+    const SHA: &str = "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b";
+
+    fn claim(decision_id: &str) -> HostDecisionClaim {
+        HostDecisionClaim {
+            decision_id: decision_id.into(),
+            command_sha256: SHA.into(),
+        }
+    }
+
+    /// A run with no host allowance reports the very bytes it reported
+    /// before allowances were counted.
+    ///
+    /// FAILS ON REVERT: write the two keys unconditionally and the body
+    /// grows `host_allowances: 0` and `host_decisions: []`.
+    #[test]
+    fn a_report_without_host_allowances_is_the_body_of_today() {
+        let body = contained_run_report(&ended_run(3, Some(8_000))).unwrap();
+        assert_eq!(
+            serde_json::to_string(&body).unwrap(),
+            r#"{"commands":3,"ended_ms":9000,"graph":"read","instance":"0123456789abcdef0123456789abcdef","last_ms":8000,"source":"project_graph","started_ms":1000,"trust":"declared"}"#
+        );
+    }
+
+    /// Host allowances are a part of the commands counted, and each names
+    /// the decision and the command it claims.
+    #[test]
+    fn a_report_with_host_allowances_names_each_decision_once() {
+        let claims = [claim(DECISION)];
+        let body = contained_run_report(&ContainedRun {
+            host_allowances: 2,
+            host_decisions: &claims,
+            ..ended_run(3, Some(8_000))
+        })
+        .unwrap();
+        assert_eq!(body["host_allowances"], 2);
+        assert_eq!(
+            body["host_decisions"],
+            json!([{"decision_id": DECISION, "command_sha256": SHA}])
+        );
+        assert_eq!(body["trust"], "declared", "the jail's own word still");
+    }
+
+    /// FAILS ON REVERT: drop any of the host clauses of the check and its
+    /// case is sent.
+    #[test]
+    fn host_allowances_that_do_not_add_up_make_no_report() {
+        let one = [claim(DECISION)];
+        let twice = [claim(DECISION), claim(DECISION)];
+        let bad = [claim("not-a-decision")];
+        let mut bad_sha = [claim(DECISION)];
+        bad_sha[0].command_sha256 = "ABC".into();
+        let cases: [(&str, ContainedRun<'_>); 6] = [
+            (
+                "more allowances than commands",
+                ContainedRun {
+                    host_allowances: 4,
+                    host_decisions: &one,
+                    ..ended_run(3, Some(8_000))
+                },
+            ),
+            (
+                "allowances without decisions",
+                ContainedRun {
+                    host_allowances: 1,
+                    ..ended_run(3, Some(8_000))
+                },
+            ),
+            (
+                "decisions without allowances",
+                ContainedRun {
+                    host_decisions: &one,
+                    ..ended_run(3, Some(8_000))
+                },
+            ),
+            (
+                "the same pair twice",
+                ContainedRun {
+                    host_allowances: 2,
+                    host_decisions: &twice,
+                    ..ended_run(3, Some(8_000))
+                },
+            ),
+            (
+                "a decision id that is not one",
+                ContainedRun {
+                    host_allowances: 1,
+                    host_decisions: &bad,
+                    ..ended_run(3, Some(8_000))
+                },
+            ),
+            (
+                "a hash that is not one",
+                ContainedRun {
+                    host_allowances: 1,
+                    host_decisions: &bad_sha,
+                    ..ended_run(3, Some(8_000))
+                },
+            ),
+        ];
+        for (wrong, run) in cases {
+            assert_eq!(contained_run_report(&run), None, "{wrong}");
+        }
+    }
+
+    // -- asking the host ------------------------------------------------------
+
+    const OWN: &str = "7f3a9c1e42b84d0e9a6c5f1b2d3e4a59";
+
+    #[test]
+    fn the_route_and_the_key_file_are_pinned() {
+        assert_eq!(INSTANCE_DECIDE_ROUTE, "/api/agent/instance-decide");
+        assert_eq!(AGENT_TLS_SPKI_PATH, "/etc/innerwarden/agent-tls.spki");
+        assert_eq!(HOST_TRUST_SOURCE, "host");
+        assert_eq!(HOST_ANSWER_INVALID, "host_answer_invalid");
+        assert!(is_withheld_word(HOST_ANSWER_INVALID));
+    }
+
+    /// An `atr:` label is a signal the request carries, not a reason to
+    /// refuse building it.
+    ///
+    /// FAILS ON REVERT: accept only the profile vocabulary in
+    /// `is_hook_signal` and the label is dropped.
+    #[test]
+    fn a_review_with_an_atr_signal_is_sent_not_refused() {
+        let request = instance_decide_request(
+            OWN,
+            Some("claude-code"),
+            Some("s-1"),
+            "curl http://203.0.113.9/x",
+            &["atr:tool-poisoning", "bare_ip_fetch"],
+            false,
+        )
+        .expect("a request");
+        assert_eq!(
+            request.hook_signals,
+            ["atr:tool-poisoning", "bare_ip_fetch"]
+        );
+        assert!(request.is_valid());
+        assert_eq!(
+            serde_json::to_value(&request).unwrap(),
+            json!({
+                "v": 1,
+                "instance_id": OWN,
+                "claimed_agent_type": "claude-code",
+                "session_id": "s-1",
+                "command": "curl http://203.0.113.9/x",
+                "hook_signals": ["atr:tool-poisoning", "bare_ip_fetch"],
+                "tainted": false,
+                "hook_verdict": "review",
+                "hook_layer": "general",
+            })
+        );
+    }
+
+    /// A session id or a type out of shape is sent as `null`, never cut or
+    /// repaired; an id that is not one, or no command, sends nothing.
+    #[test]
+    fn a_session_id_out_of_shape_is_sent_as_null() {
+        for session in ["", "a b", "x".repeat(129).as_str(), "s…", "[REDACTED]"] {
+            let request =
+                instance_decide_request(OWN, Some("claude-code"), Some(session), "ls", &[], true)
+                    .unwrap();
+            assert_eq!(request.session_id, None, "{session:?}");
+            assert!(request.tainted);
+            assert!(request.is_valid());
+        }
+        let long = "A-z_9".repeat(25);
+        let request = instance_decide_request(OWN, None, Some(&long), "ls", &[], false).unwrap();
+        assert_eq!(request.session_id.as_deref(), Some(long.as_str()));
+        let odd =
+            instance_decide_request(OWN, Some("Claude Code"), None, "ls", &[], false).unwrap();
+        assert_eq!(odd.claimed_agent_type, None);
+        assert_eq!(
+            instance_decide_request("../x", None, None, "ls", &[], false),
+            None
+        );
+        assert_eq!(
+            instance_decide_request(OWN, None, None, "", &[], false),
+            None
+        );
+    }
+
+    /// The signals go sorted and once each; a name the contract does not
+    /// carry is left out; never more than the cap.
+    #[test]
+    fn the_signals_are_sorted_and_sent_once() {
+        let request = instance_decide_request(
+            OWN,
+            None,
+            None,
+            "x",
+            &[
+                "fetch_exec_no_tls",
+                "bare_ip_fetch",
+                "fetch_exec_no_tls",
+                "atr:BAD",
+                "made_up",
+                "download_and_execute",
+            ],
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            request.hook_signals,
+            ["bare_ip_fetch", "download_and_execute", "fetch_exec_no_tls"]
+        );
+        let many: Vec<String> = (0..100).map(|i| format!("atr:c{i:03}")).collect();
+        let many: Vec<&str> = many.iter().map(String::as_str).collect();
+        let capped = instance_decide_request(OWN, None, None, "x", &many, false).unwrap();
+        assert_eq!(capped.hook_signals.len(), MAX_HOOK_SIGNALS);
+        assert!(capped.is_valid());
+    }
+
+    #[test]
+    fn a_hook_signal_is_a_profile_name_a_factor_or_an_atr_label() {
+        for good in [
+            "bare_ip_fetch",
+            "fetch_exec_decoder",
+            "atr:tool-poisoning",
+            "atr:a_1",
+        ] {
+            assert!(is_hook_signal(good), "{good}");
+        }
+        for bad in [
+            "",
+            "atr:",
+            "atr:Tool",
+            "atr:a b",
+            "nope",
+            &format!("atr:{}", "a".repeat(65)),
+        ] {
+            assert!(!is_hook_signal(bad), "{bad}");
+        }
+    }
+
+    /// The host reads a request with every field present and nothing more:
+    /// a `trust` the hook added is refused, and so is a missing nullable.
+    #[test]
+    fn a_request_is_read_with_its_fields_and_no_other() {
+        let good = json!({
+            "v": 1, "instance_id": OWN, "claimed_agent_type": null, "session_id": null,
+            "command": "ls", "hook_signals": [], "tainted": false,
+            "hook_verdict": "review", "hook_layer": "general",
+        });
+        let read: InstanceDecideRequest = serde_json::from_value(good.clone()).unwrap();
+        assert!(read.is_valid());
+        let mut extra = good.clone();
+        extra["trust"] = json!("confined");
+        assert!(serde_json::from_value::<InstanceDecideRequest>(extra).is_err());
+        let mut missing = good.clone();
+        missing.as_object_mut().unwrap().remove("session_id");
+        assert!(serde_json::from_value::<InstanceDecideRequest>(missing).is_err());
+        for (field, value) in [
+            ("v", json!(2)),
+            ("hook_verdict", json!("allow")),
+            ("hook_layer", json!("agent_type")),
+            ("command", json!("")),
+            (
+                "hook_signals",
+                json!(["download_and_execute", "bare_ip_fetch"]),
+            ),
+            ("hook_signals", json!(["made_up"])),
+            ("instance_id", json!("../x")),
+            ("claimed_agent_type", json!("Claude Code")),
+            ("session_id", json!("a b")),
+            ("hook_signals", json!(["bare_ip_fetch", "bare_ip_fetch"])),
+        ] {
+            let mut wrong = good.clone();
+            wrong[field] = value;
+            let accepted = serde_json::from_value::<InstanceDecideRequest>(wrong.clone())
+                .is_ok_and(|request| request.is_valid());
+            assert!(!accepted, "{wrong}");
+        }
+    }
+
+    fn answer() -> Value {
+        json!({
+            "v": 1, "instance_id": OWN, "agent_type": "claude-code", "trust": "confined",
+            "trust_source": "host", "verdict": "allow", "deciding_layer": "agent_type",
+            "profile": "claude-code", "decision_id": DECISION, "withheld": null,
+            "signals_mismatch": false, "conflict": false, "incident_id": null,
+        })
+    }
+
+    fn read(value: &Value) -> HostAnswer {
+        read_host_answer(&serde_json::to_vec(value).unwrap(), OWN)
+    }
+
+    #[test]
+    fn the_contracts_answer_is_read_and_relaxes() {
+        let HostAnswer::Answer(read) = read(&answer()) else {
+            panic!("the contract's answer")
+        };
+        assert!(read.relaxes());
+        assert_eq!(read.verdict, Verdict::Allow);
+        assert_eq!(read.deciding_layer, RuleLayer::AgentType);
+        assert_eq!(read.decision_id, DECISION);
+    }
+
+    /// FAILS ON REVERT: accept an answer without comparing `instance_id` and
+    /// another instance's allow is read as this one's.
+    #[test]
+    fn an_answer_for_another_instance_is_withheld() {
+        let mut other = answer();
+        other["instance_id"] = json!("fedcba9876543210fedcba9876543210");
+        assert_eq!(read(&other), HostAnswer::Withheld);
+        assert_eq!(
+            read_host_answer(&serde_json::to_vec(&answer()).unwrap(), "../x"),
+            HostAnswer::Withheld
+        );
+    }
+
+    /// FAILS ON REVERT: drop `deny_unknown_fields` from
+    /// `InstanceDecideAnswer` and the answer with a field more is read.
+    #[test]
+    fn an_answer_with_an_extra_field_is_withheld() {
+        let mut extra = answer();
+        extra["blocks"] = json!(false);
+        assert_eq!(read(&extra), HostAnswer::Withheld);
+    }
+
+    /// Every field must be there and hold its shape: one wrong at a time.
+    #[test]
+    fn an_answer_out_of_shape_is_withheld() {
+        let mut cases: Vec<(&str, Value)> = Vec::new();
+        for field in [
+            "v",
+            "instance_id",
+            "agent_type",
+            "trust",
+            "trust_source",
+            "verdict",
+            "deciding_layer",
+            "profile",
+            "decision_id",
+            "withheld",
+            "signals_mismatch",
+            "conflict",
+            "incident_id",
+        ] {
+            let mut missing = answer();
+            missing.as_object_mut().unwrap().remove(field);
+            cases.push((field, missing));
+        }
+        for (field, value) in [
+            ("v", json!(2)),
+            ("trust", json!("host_verified")),
+            ("trust_source", json!("jail")),
+            ("verdict", json!("maybe")),
+            ("deciding_layer", json!("person")),
+            ("decision_id", json!("0F1E2D3C4B5A69788796A5B4C3D2E1F0")),
+            ("decision_id", json!("short")),
+            ("withheld", json!("Not Confined")),
+            ("withheld", json!("")),
+            ("withheld", json!("a".repeat(49))),
+            ("agent_type", json!("Claude Code")),
+            ("profile", json!("../x")),
+            ("incident_id", json!("")),
+        ] {
+            let mut wrong = answer();
+            wrong[field] = value;
+            cases.push((field, wrong));
+        }
+        for (field, case) in cases {
+            assert_eq!(read(&case), HostAnswer::Withheld, "{field}: {case}");
+        }
+        assert_eq!(read_host_answer(b"not json", OWN), HostAnswer::Withheld);
+        let mut padded = serde_json::to_vec(&answer()).unwrap();
+        padded.resize(MAX_INSTANCE_ANSWER_BYTES + 1, b' ');
+        assert_eq!(read_host_answer(&padded, OWN), HostAnswer::Withheld);
+    }
+
+    /// Only `confined` with nothing withheld relaxes; a word, whatever it
+    /// is, or another trust, does not.
+    #[test]
+    fn only_confined_with_nothing_withheld_relaxes() {
+        for (trust, withheld, relaxes) in [
+            ("confined", Value::Null, true),
+            ("confined", json!("no_system_scope"), false),
+            ("confined", json!("some_word_this_build_never_heard"), false),
+            ("observed", Value::Null, false),
+            ("declared", Value::Null, false),
+        ] {
+            let mut case = answer();
+            case["trust"] = json!(trust);
+            case["withheld"] = withheld.clone();
+            let HostAnswer::Answer(read) = read(&case) else {
+                panic!("{case}")
+            };
+            assert_eq!(read.relaxes(), relaxes, "{trust} {withheld}");
+        }
+    }
+
+    #[test]
+    fn the_key_file_holds_one_hex_digest() {
+        let digest: [u8; 32] = core::array::from_fn(|i| (i * 7) as u8);
+        let line = spki_pin_line(&digest);
+        assert_eq!(line.len(), MAX_SPKI_PIN_BYTES);
+        assert_eq!(parse_spki_pin(line.as_bytes()), Some(digest));
+        assert_eq!(parse_spki_pin(line.trim_end().as_bytes()), Some(digest));
+        for bad in [
+            line.to_uppercase(),
+            format!("{line}\n"),
+            format!(" {line}"),
+            line[..63].to_string(),
+            String::new(),
+        ] {
+            assert_eq!(parse_spki_pin(bad.as_bytes()), None, "{bad:?}");
         }
     }
 
