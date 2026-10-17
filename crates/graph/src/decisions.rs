@@ -91,7 +91,7 @@ const MAX_AGENT_CHARS: usize = 64;
 const MAX_PROJECT_CHARS: usize = 120;
 const MAX_RULES: usize = 16;
 const MAX_RULE_CHARS: usize = 64;
-const MAX_INSTANCE_CHARS: usize = 64;
+const INSTANCE_ID_CHARS: usize = 32;
 const MAX_SESSION_CHARS: usize = 120;
 const MAX_REASON_CHARS: usize = 64;
 
@@ -101,12 +101,13 @@ const TRUST_WORDS: [&str; 3] = ["declared", "observed", "confined"];
 /// The words a deciding layer may hold.
 const LAYER_WORDS: [&str; 4] = ["hard", "general", "agent_type", "instance"];
 
+/// An instance id is 32 lowercase hex characters (the launcher's 16 random
+/// bytes), the same shape `agent_guard::identity::is_instance_id` accepts.
 fn valid_instance(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= MAX_INSTANCE_CHARS
+    id.len() == INSTANCE_ID_CHARS
         && id
             .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 fn valid_session(session: &str) -> bool {
@@ -1280,13 +1281,28 @@ mod tests {
     fn identity_labels_are_kept_only_in_their_own_shape() {
         use super::DecisionOrigin;
         let good = DecisionOrigin {
-            instance_id: Some("7f3a9c1e-42".into()),
+            instance_id: Some("7f3a9c1e42b84d0e9a6c5f1b2d3e4a59".into()),
             trust: Some("confined".into()),
             ..DecisionOrigin::default()
         };
-        assert_eq!(good.instance_label(), Some("7f3a9c1e-42"));
+        assert_eq!(
+            good.instance_label(),
+            Some("7f3a9c1e42b84d0e9a6c5f1b2d3e4a59")
+        );
         assert_eq!(good.trust_label(), Some("confined"));
-        for bad in ["", "A", "a/b", "a b", &"a".repeat(65)] {
+        // The launcher's shape only: 32 lowercase hex. FAILS ON REVERT of the
+        // strict check: the dashed, short and non-hex ids are kept.
+        for bad in [
+            "",
+            "A",
+            "a/b",
+            "a b",
+            &"a".repeat(65),
+            "7f3a9c1e-42",
+            &"a".repeat(31),
+            &"z".repeat(32),
+            "7f3a9c1e-2b84d0e9a6c5f1b2d3e4a59",
+        ] {
             let o = DecisionOrigin {
                 instance_id: Some(bad.into()),
                 ..DecisionOrigin::default()

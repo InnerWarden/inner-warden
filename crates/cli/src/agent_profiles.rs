@@ -289,7 +289,8 @@ mod tests {
 
     fn identity(trust: Trust) -> Identity {
         Identity {
-            instance_id: (trust > Trust::Declared).then(|| "7f3a9c1e-42".into()),
+            instance_id: (trust > Trust::Declared)
+                .then(|| "7f3a9c1e42b84d0e9a6c5f1b2d3e4a59".into()),
             session_id: None,
             trust,
             reason: Reason::ConfinedByNamespace,

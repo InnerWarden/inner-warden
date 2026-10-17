@@ -2212,9 +2212,10 @@ mod tests {
             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()));
         assert!(record_path(Path::new("/s"), &id).is_some());
         assert_eq!(record_path(Path::new("/s"), "../x"), None);
+        assert_eq!(record_path(Path::new("/s"), "ab"), None, "too short");
         assert_eq!(
-            record_path(Path::new("/s"), "ab").unwrap(),
-            PathBuf::from("/s/ab.json")
+            record_path(Path::new("/s"), &id).unwrap(),
+            PathBuf::from(format!("/s/{id}.json"))
         );
     }
 

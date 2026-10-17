@@ -1889,7 +1889,7 @@ mod tests {
 
     fn confined_identity() -> Identity {
         Identity {
-            instance_id: Some("7f3a9c1e-42".into()),
+            instance_id: Some("7f3a9c1e42b84d0e9a6c5f1b2d3e4a59".into()),
             session_id: Some("payload-session".into()),
             trust: innerwarden_agent_guard::identity::Trust::Confined,
             reason: innerwarden_agent_guard::identity::Reason::ConfinedByNamespace,
@@ -1969,7 +1969,7 @@ mod tests {
         let mcp = mcp_origin(&decision(false, vec![]), Some("claude-code"), Some(&id));
         for origin in [&hook, &mcp] {
             let attrs = command_attrs(origin);
-            assert_eq!(attrs["instance_id"], "7f3a9c1e-42");
+            assert_eq!(attrs["instance_id"], "7f3a9c1e42b84d0e9a6c5f1b2d3e4a59");
             assert_eq!(attrs["session_id"], "payload-session");
             assert_eq!(attrs["trust"], "confined");
             assert_eq!(attrs["trust_reason"], "confined_by_namespace");
@@ -2066,7 +2066,7 @@ mod tests {
         let mut with = origin_of_agent(Some("claude-code"));
         confined_identity().apply(&mut with);
         let line = guard_blocked_line(5, "x", &verdict, context, "session:contain", &with);
-        assert_eq!(line["instance"], "7f3a9c1e-42");
+        assert_eq!(line["instance"], "7f3a9c1e42b84d0e9a6c5f1b2d3e4a59");
         assert_eq!(line["trust"], "confined");
         assert_eq!(line["session"], "session:contain");
         let plain = guard_blocked_line(

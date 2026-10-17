@@ -289,7 +289,7 @@ mod tests {
 
     const RECORD: &str = r#"{
   "schema": 1,
-  "instance_id": "7f3a9c1e-42",
+  "instance_id": "7f3a9c1e42b84d0e9a6c5f1b2d3e4a59",
   "agent_type": "claude-code",
   "launcher": { "path": "/usr/local/bin/innerwarden", "version": "1.6.0", "root_owned": true },
   "uid": 1000,
@@ -299,8 +299,8 @@ mod tests {
   "jail": { "backend": "bwrap", "pid": 48211, "start_ticks": 9120344, "pid_ns": 4026532871, "mnt_ns": 4026532869 },
   "scope": {
     "user": {
-      "unit": "innerwarden-contain-7f3a9c1e-42.scope",
-      "cgroup_path": "/user.slice/user-1000.slice/user@1000.service/app.slice/innerwarden-contain-7f3a9c1e-42.scope"
+      "unit": "innerwarden-contain-7f3a9c1e42b84d0e9a6c5f1b2d3e4a59.scope",
+      "cgroup_path": "/user.slice/user-1000.slice/user@1000.service/app.slice/innerwarden-contain-7f3a9c1e42b84d0e9a6c5f1b2d3e4a59.scope"
     }
   }
 }"#;
@@ -341,7 +341,10 @@ mod tests {
         .unwrap();
         assert_eq!(id.trust, Trust::Observed);
         assert_eq!(id.reason, Reason::ConfinedByNamespace);
-        assert_eq!(id.instance_id.as_deref(), Some("7f3a9c1e-42"));
+        assert_eq!(
+            id.instance_id.as_deref(),
+            Some("7f3a9c1e42b84d0e9a6c5f1b2d3e4a59")
+        );
         assert_eq!(id.session_id.as_deref(), Some("payload-session"));
         assert_eq!(id.agent_type.as_deref(), Some("claude-code"));
     }
@@ -545,7 +548,10 @@ mod tests {
             (id.trust, id.reason),
             (Trust::Observed, Reason::LauncherNotTrusted)
         );
-        assert_eq!(id.instance_id.as_deref(), Some("7f3a9c1e-42"));
+        assert_eq!(
+            id.instance_id.as_deref(),
+            Some("7f3a9c1e42b84d0e9a6c5f1b2d3e4a59")
+        );
     }
 
     /// A session id the agent invents must not start a fresh behavioural
@@ -562,7 +568,7 @@ mod tests {
         );
         assert_eq!(
             behaviour_key(Some(&id), None).as_deref(),
-            Some("instance:7f3a9c1e-42")
+            Some("instance:7f3a9c1e42b84d0e9a6c5f1b2d3e4a59")
         );
     }
 

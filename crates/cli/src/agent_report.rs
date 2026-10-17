@@ -327,14 +327,14 @@ mod tests {
             ["agent_name", "command", "kind", "mode", "rule_ids", "tool"]
         );
         let id = Identity {
-            instance_id: Some("7f3a9c1e-42".into()),
+            instance_id: Some("7f3a9c1e42b84d0e9a6c5f1b2d3e4a59".into()),
             session_id: None,
             trust: Trust::Confined,
             reason: Reason::ConfinedByNamespace,
             agent_type: Some("claude-code".into()),
         };
         let labelled = block_report("l", ProxyMode::Guard, &cred, Some(&id)).unwrap();
-        assert_eq!(labelled["instance"], "7f3a9c1e-42");
+        assert_eq!(labelled["instance"], "7f3a9c1e42b84d0e9a6c5f1b2d3e4a59");
         assert_eq!(labelled["trust"], "confined");
         // A record that named no instance still says its level, never an instance.
         let declared = Identity {

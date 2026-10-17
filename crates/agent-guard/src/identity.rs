@@ -264,7 +264,8 @@ pub const READABLE_SCHEMAS: &[u32] = &[1];
 /// is not one, and a reader that took more would let a writer cost it memory.
 pub const MAX_RECORD_BYTES: usize = 16 * 1024;
 
-const MAX_ID_LEN: usize = 64;
+/// The length of an instance id: 16 bytes in lowercase hex.
+pub const INSTANCE_ID_LEN: usize = 32;
 const MAX_LABEL_LEN: usize = 64;
 const MAX_PROJECT_CHARS: usize = 120;
 const MAX_VERSION_LEN: usize = 64;
@@ -544,14 +545,15 @@ impl LaunchRecord {
     }
 }
 
-/// `[a-z0-9-]`, 1 to 64 bytes. It becomes a file name and a unit name, so no
-/// dot, slash or case.
+/// Exactly [`INSTANCE_ID_LEN`] lowercase hex characters: the only shape the
+/// launcher makes (16 random bytes), and the one every reader and the
+/// dashboard accept. It becomes a file name and a unit name, so no dot, slash,
+/// dash or case.
 pub fn is_instance_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= MAX_ID_LEN
+    id.len() == INSTANCE_ID_LEN
         && id
             .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// The same shape as the agent id a decision records: lowercase, digits, `-`
@@ -1036,7 +1038,7 @@ mod tests {
     /// (N reads N-1).
     const GOLDEN_V1: &str = r#"{
   "schema": 1,
-  "instance_id": "7f3a9c1e-42",
+  "instance_id": "7f3a9c1e42b84d0e9a6c5f1b2d3e4a59",
   "agent_type": "claude-code",
   "launcher": { "path": "/usr/local/bin/innerwarden", "version": "1.6.0", "root_owned": true },
   "uid": 1000,
@@ -1046,12 +1048,12 @@ mod tests {
   "jail": { "backend": "bwrap", "pid": 48211, "start_ticks": 9120344, "pid_ns": 4026532871, "mnt_ns": 4026532869 },
   "scope": {
     "user": {
-      "unit": "innerwarden-contain-7f3a9c1e-42.scope",
-      "cgroup_path": "/user.slice/user-1000.slice/user@1000.service/app.slice/innerwarden-contain-7f3a9c1e-42.scope"
+      "unit": "innerwarden-contain-7f3a9c1e42b84d0e9a6c5f1b2d3e4a59.scope",
+      "cgroup_path": "/user.slice/user-1000.slice/user@1000.service/app.slice/innerwarden-contain-7f3a9c1e42b84d0e9a6c5f1b2d3e4a59.scope"
     },
     "system": {
-      "unit": "innerwarden-contain-7f3a9c1e-42.scope",
-      "cgroup_path": "/system.slice/innerwarden-contain-7f3a9c1e-42.scope"
+      "unit": "innerwarden-contain-7f3a9c1e42b84d0e9a6c5f1b2d3e4a59.scope",
+      "cgroup_path": "/system.slice/innerwarden-contain-7f3a9c1e42b84d0e9a6c5f1b2d3e4a59.scope"
     }
   }
 }"#;
@@ -1322,7 +1324,7 @@ mod tests {
             (
                 "scope.system.cgroup_path",
                 vec!["scope", "system", "cgroup_path"],
-                json!("system.slice/innerwarden-contain-7f3a9c1e-42.scope"),
+                json!("system.slice/innerwarden-contain-7f3a9c1e42b84d0e9a6c5f1b2d3e4a59.scope"),
             ),
         ];
         for (field, path, bad) in cases {
@@ -1376,7 +1378,7 @@ mod tests {
     fn a_scope_belongs_to_its_own_instance_and_user() {
         let other = "innerwarden-contain-0000aaaa-42.scope";
         let user = |cgroup: &str| -> Value {
-            json!({ "unit": "innerwarden-contain-7f3a9c1e-42.scope", "cgroup_path": cgroup })
+            json!({ "unit": "innerwarden-contain-7f3a9c1e42b84d0e9a6c5f1b2d3e4a59.scope", "cgroup_path": cgroup })
         };
         let cases: Vec<(&str, &str, Value)> = vec![
             (
@@ -1387,7 +1389,7 @@ mod tests {
             (
                 "user",
                 "scope.user.cgroup_path",
-                user("/user.slice/user-1001.slice/user@1001.service/app.slice/innerwarden-contain-7f3a9c1e-42.scope"),
+                user("/user.slice/user-1001.slice/user@1001.service/app.slice/innerwarden-contain-7f3a9c1e42b84d0e9a6c5f1b2d3e4a59.scope"),
             ),
             (
                 "user",
@@ -1399,12 +1401,12 @@ mod tests {
             (
                 "user",
                 "scope.user.cgroup_path",
-                user("/system.slice/innerwarden-contain-7f3a9c1e-42.scope"),
+                user("/system.slice/innerwarden-contain-7f3a9c1e42b84d0e9a6c5f1b2d3e4a59.scope"),
             ),
             (
                 "user",
                 "scope.user.cgroup_path",
-                user("/user.slice/user-1000.slice/session-3.scope/innerwarden-contain-7f3a9c1e-42.scope"),
+                user("/user.slice/user-1000.slice/session-3.scope/innerwarden-contain-7f3a9c1e42b84d0e9a6c5f1b2d3e4a59.scope"),
             ),
             (
                 "system",
@@ -1414,12 +1416,12 @@ mod tests {
             (
                 "system",
                 "scope.system.cgroup_path",
-                user("/user.slice/user-1000.slice/user@1000.service/app.slice/system.slice/innerwarden-contain-7f3a9c1e-42.scope"),
+                user("/user.slice/user-1000.slice/user@1000.service/app.slice/system.slice/innerwarden-contain-7f3a9c1e42b84d0e9a6c5f1b2d3e4a59.scope"),
             ),
             (
                 "system",
                 "scope.system.cgroup_path",
-                user("/system.slice/nested.slice/innerwarden-contain-7f3a9c1e-42.scope"),
+                user("/system.slice/nested.slice/innerwarden-contain-7f3a9c1e42b84d0e9a6c5f1b2d3e4a59.scope"),
             ),
         ];
         for (which, field, bad) in cases {
@@ -1433,7 +1435,7 @@ mod tests {
         }
         // The shapes a real manager produces are accepted: with and without
         // an `app.slice` between the manager and the scope.
-        let unit = "innerwarden-contain-7f3a9c1e-42.scope";
+        let unit = "innerwarden-contain-7f3a9c1e42b84d0e9a6c5f1b2d3e4a59.scope";
         assert!(is_user_scope_cgroup(
             &format!("/user.slice/user-1000.slice/user@1000.service/{unit}"),
             unit,
@@ -1450,22 +1452,22 @@ mod tests {
     fn the_scope_names_and_the_request_are_the_ones_launcher_and_host_share() {
         assert_eq!(SCOPE_UNIT_PREFIX, "innerwarden-contain-");
         assert_eq!(
-            scope_unit_name("7f3a9c1e-42").as_deref(),
-            Some("innerwarden-contain-7f3a9c1e-42.scope")
+            scope_unit_name("7f3a9c1e42b84d0e9a6c5f1b2d3e4a59").as_deref(),
+            Some("innerwarden-contain-7f3a9c1e42b84d0e9a6c5f1b2d3e4a59.scope")
         );
         for bad in ["", "../x", "A", "a.b", "a/b"] {
             assert_eq!(scope_unit_name(bad), None, "{bad:?}");
             assert_eq!(system_scope_request(bad), None, "{bad:?}");
         }
         assert_eq!(
-            system_scope_cgroup("innerwarden-contain-7f3a9c1e-42.scope"),
-            "/system.slice/innerwarden-contain-7f3a9c1e-42.scope"
+            system_scope_cgroup("innerwarden-contain-7f3a9c1e42b84d0e9a6c5f1b2d3e4a59.scope"),
+            "/system.slice/innerwarden-contain-7f3a9c1e42b84d0e9a6c5f1b2d3e4a59.scope"
         );
         assert_eq!(SYSTEM_SCOPE_ROUTE, "/api/agent/contain-scope");
         // The request names the instance and nothing else: no pid to move.
         assert_eq!(
-            system_scope_request("7f3a9c1e-42").unwrap(),
-            json!({ "instance": "7f3a9c1e-42" })
+            system_scope_request("7f3a9c1e42b84d0e9a6c5f1b2d3e4a59").unwrap(),
+            json!({ "instance": "7f3a9c1e42b84d0e9a6c5f1b2d3e4a59" })
         );
     }
 
@@ -1603,8 +1605,8 @@ mod tests {
     #[test]
     fn a_record_file_name_comes_only_from_a_well_formed_id() {
         assert_eq!(
-            instance_record_file("7f3a9c1e-42").as_deref(),
-            Some("7f3a9c1e-42.json")
+            instance_record_file("7f3a9c1e42b84d0e9a6c5f1b2d3e4a59").as_deref(),
+            Some("7f3a9c1e42b84d0e9a6c5f1b2d3e4a59.json")
         );
         for bad in [
             "",
@@ -1616,6 +1618,34 @@ mod tests {
             &"a".repeat(65),
         ] {
             assert_eq!(instance_record_file(bad), None, "{bad:?}");
+        }
+    }
+
+    /// An instance id is the launcher's shape and only that: 32 lowercase
+    /// hex characters. A dash, a letter past `f`, upper case, or any other
+    /// length is not an id, so it never becomes a file, a unit or a key the
+    /// dashboard serves.
+    ///
+    /// FAILS ON REVERT: accept `[a-z0-9-]{1,64}` again and the short, dashed
+    /// and non-hex ids below pass.
+    #[test]
+    fn an_instance_id_is_exactly_32_lowercase_hex() {
+        assert_eq!(INSTANCE_ID_LEN, 32);
+        assert!(is_instance_id("7f3a9c1e42b84d0e9a6c5f1b2d3e4a59"));
+        assert!(is_instance_id(&"0".repeat(32)));
+        for bad in [
+            "7f3a9c1e-42",
+            "7f3a9c1e42b84d0e9a6c5f1b2d3e4a5",
+            "7f3a9c1e42b84d0e9a6c5f1b2d3e4a590",
+            "7f3a9c1e42b84d0e9a6c5f1b2d3e4a5g",
+            "7F3A9C1E42B84D0E9A6C5F1B2D3E4A59",
+            "7f3a9c1e-2b84d0e9a6c5f1b2d3e4a59",
+            &"z".repeat(32),
+            &"a".repeat(64),
+        ] {
+            assert!(!is_instance_id(bad), "{bad:?}");
+            assert_eq!(scope_unit_name(bad), None, "{bad:?}");
+            assert_eq!(system_scope_request(bad), None, "{bad:?}");
         }
     }
 
@@ -1683,7 +1713,7 @@ mod tests {
         const FORGED_PID: u64 = 4026533001;
         const FORGED_MNT: u64 = 4026533002;
         let forged = parse_launch_record(
-            br#"{"schema":1,"instance_id":"x1","agent_type":"permissive","launcher":{"path":"/usr/local/bin/innerwarden","version":"1","root_owned":true},"uid":1000,"project":"p","mode":"enforce","started_at":"2026-10-16T09:30:00Z","jail":{"backend":"bwrap","pid":1,"start_ticks":1,"pid_ns":4026533001,"mnt_ns":4026533002},"scope":{"user":{"unit":"innerwarden-contain-x1.scope","cgroup_path":"/user.slice/user-1000.slice/user@1000.service/app.slice/innerwarden-contain-x1.scope"}}}"#,
+            br#"{"schema":1,"instance_id":"000000000000000000000000000000a1","agent_type":"permissive","launcher":{"path":"/usr/local/bin/innerwarden","version":"1","root_owned":true},"uid":1000,"project":"p","mode":"enforce","started_at":"2026-10-16T09:30:00Z","jail":{"backend":"bwrap","pid":1,"start_ticks":1,"pid_ns":4026533001,"mnt_ns":4026533002},"scope":{"user":{"unit":"innerwarden-contain-000000000000000000000000000000a1.scope","cgroup_path":"/user.slice/user-1000.slice/user@1000.service/app.slice/innerwarden-contain-000000000000000000000000000000a1.scope"}}}"#,
         )
         .expect("a well-formed record");
         let judged = judge_trust_in_jail(InJailFacts {
