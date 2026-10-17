@@ -13,7 +13,7 @@
 
 use innerwarden_agent_guard::identity::{RuleLayer, Trust, Verdict};
 use innerwarden_agent_guard::profiles::{
-    self, decide_shell, AgentProfile, AgentProfiles, ProfileChange, ShellCall,
+    self, AgentProfile, AgentProfiles, ProfileChange, ShellCall,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -150,6 +150,7 @@ pub fn decide_hook(
     facts: &HookFacts<'_>,
     profiles: &AgentProfiles,
     agent_type: Option<&str>,
+    instance_id: Option<&str>,
     trust: Trust,
 ) -> HookDecision {
     let charged = charged_signals(facts.verdict);
@@ -164,7 +165,13 @@ pub fn decide_hook(
     };
     let named: Option<(&str, &AgentProfile)> =
         agent_type.and_then(|name| profiles.get(name).map(|profile| (name, profile)));
-    let outcome = decide_shell(&call, named, facts.line_block_review, trust);
+    let outcome = profiles::decide_shell_in(
+        &call,
+        named,
+        profiles.facts(agent_type, instance_id),
+        facts.line_block_review,
+        trust,
+    );
     let mut verdict = facts.verdict.clone();
     if let Some(obj) = verdict.as_object_mut() {
         if outcome.decision.verdict != general {
@@ -222,14 +229,7 @@ pub fn audit_step(
         ProfilesState::On(current) => {
             let mut changes = profiles::changes(&before.profiles, current);
             if before.rejected.is_some() {
-                changes.insert(
-                    0,
-                    ProfileChange {
-                        action: "profiles_accepted".into(),
-                        agent_type: String::new(),
-                        value: String::new(),
-                    },
-                );
+                changes.insert(0, ProfileChange::to_type("profiles_accepted", "", ""));
             }
             (
                 Snapshot {
@@ -248,11 +248,7 @@ pub fn audit_step(
                     profiles: before.profiles.clone(),
                     rejected: Some(why.clone()),
                 },
-                vec![ProfileChange {
-                    action: "profiles_rejected".into(),
-                    agent_type: String::new(),
-                    value: why.clone(),
-                }],
+                vec![ProfileChange::to_type("profiles_rejected", "", why)],
             )
         }
     };
@@ -405,12 +401,18 @@ mod tests {
             line_block_review: true,
         };
         for trust in [Trust::Declared, Trust::Observed] {
-            let out = decide_hook(&facts, &profiles, Some("claude-code"), trust);
+            let out = decide_hook(&facts, &profiles, Some("claude-code"), None, trust);
             assert!(out.blocks, "{trust:?}");
             assert_eq!(out.deciding_layer, RuleLayer::General);
             assert_eq!(out.verdict, verdict, "the verdict is not touched");
         }
-        let out = decide_hook(&facts, &profiles, Some("claude-code"), Trust::Confined);
+        let out = decide_hook(
+            &facts,
+            &profiles,
+            Some("claude-code"),
+            None,
+            Trust::Confined,
+        );
         assert!(!out.blocks);
         assert_eq!(out.deciding_layer, RuleLayer::AgentType);
         assert_eq!(out.verdict["recommendation"], "allow");
@@ -430,7 +432,13 @@ mod tests {
             tainted: false,
             line_block_review: false,
         };
-        let out = decide_hook(&facts, &profiles, Some("claude-code"), Trust::Declared);
+        let out = decide_hook(
+            &facts,
+            &profiles,
+            Some("claude-code"),
+            None,
+            Trust::Declared,
+        );
         assert!(out.blocks);
         assert_eq!(out.deciding_layer, RuleLayer::AgentType);
         assert_eq!(out.verdict["recommendation"], "deny");
@@ -439,7 +447,7 @@ mod tests {
             .unwrap()
             .contains("denies bare_ip_fetch"));
         // Another type has no profile: the general layer, untouched.
-        let other = decide_hook(&facts, &profiles, Some("cursor"), Trust::Declared);
+        let other = decide_hook(&facts, &profiles, Some("cursor"), None, Trust::Declared);
         assert!(!other.blocks);
         assert_eq!(other.verdict, verdict);
     }
@@ -457,7 +465,7 @@ mod tests {
             line_block_review: false,
         };
         for agent in [Some("claude-code"), Some("cursor"), None] {
-            let out = decide_hook(&facts, &profiles, agent, Trust::Confined);
+            let out = decide_hook(&facts, &profiles, agent, None, Trust::Confined);
             assert!(out.blocks, "{agent:?}");
             assert_eq!(out.deciding_layer, RuleLayer::Hard);
             assert_eq!(out.verdict["recommendation"], "deny");

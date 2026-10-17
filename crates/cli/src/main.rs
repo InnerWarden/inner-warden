@@ -18,6 +18,8 @@ use innerwarden_agent_guard::mcp_proxy::transport::{run_proxy_with_profile, Prox
 use innerwarden_agent_guard::render::{is_deny, render_verdict};
 use innerwarden_agent_guard::{hook, mcp::analyze_command, rules::RuleEngine};
 
+mod agent_decisions;
+mod agent_decisions_io;
 mod agent_policy;
 mod agent_profiles;
 mod agent_profiles_io;
@@ -967,6 +969,7 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
                 },
                 &profiles,
                 agent_profiles::agent_type(hook_agent.as_deref(), identity.as_ref()).as_deref(),
+                identity.as_ref().and_then(|id| id.instance_id.as_deref()),
                 agent_profiles::trust(identity.as_ref()),
             );
             (
@@ -1069,7 +1072,10 @@ fn screen_file_tool(buf: &str, rest: &[String], monitor: bool) -> Option<std::pr
     let Some((path, what)) = paths.iter().find_map(|path| {
         file_tools::privileged_file_write(path, &context).map(|what| (path, what))
     }) else {
-        return Some(std::process::ExitCode::SUCCESS);
+        // A revoked agent is refused every file change too, where profiles
+        // are in force. With no profiles file this is one failed open of
+        // each file and the edit goes through, as before.
+        return Some(file_tool_revoked(buf, rest, monitor, &tool, &paths));
     };
     let verdict = file_tools::refusal_verdict(&tool, path, what);
     let command = format!("{tool} {}", path.trim());
@@ -1103,6 +1109,62 @@ fn screen_file_tool(buf: &str, rest: &[String], monitor: bool) -> Option<std::pr
     );
     eprintln!("{}", FILE_BLOCK_REMEDY);
     Some(std::process::ExitCode::from(2))
+}
+
+/// A file change that is not to a privileged file: refused (outside monitor)
+/// only when the profiles in force revoked the agent or its instance, and
+/// then recorded like any refusal, by the hard layer. Otherwise exit 0 and
+/// nothing recorded, as before.
+fn file_tool_revoked(
+    buf: &str,
+    rest: &[String],
+    monitor: bool,
+    tool: &str,
+    paths: &[String],
+) -> std::process::ExitCode {
+    let agent_profiles::ProfilesState::On(profiles) = agent_profiles_io::load() else {
+        return std::process::ExitCode::SUCCESS;
+    };
+    let payload_session = hook_session(buf);
+    let hook_agent = agent_flag(rest);
+    let identity = hook_identity::current(hook_agent.as_deref(), payload_session.as_deref());
+    let agent_type = agent_profiles::agent_type(hook_agent.as_deref(), identity.as_ref());
+    let Some(revoked) = profiles.revocation(
+        agent_type.as_deref(),
+        identity.as_ref().and_then(|id| id.instance_id.as_deref()),
+    ) else {
+        return std::process::ExitCode::SUCCESS;
+    };
+    let path = paths.first().map(|p| p.trim()).unwrap_or("");
+    let command = format!("{tool} {path}");
+    let verdict = serde_json::json!({
+        "recommendation": "deny",
+        "risk_score": 100,
+        "severity": "high",
+        "explanation": revoked.sentence(),
+        "signals": [],
+    });
+    graph_io::record_hook(
+        &command,
+        &verdict,
+        monitor,
+        true,
+        payload_session.as_deref(),
+        hook_event_id(buf).as_deref(),
+        hook_agent.as_deref(),
+        hook_cwd(buf).as_deref(),
+        identity.as_ref(),
+        Some(innerwarden_agent_guard::identity::RuleLayer::Hard),
+    );
+    if monitor {
+        return std::process::ExitCode::SUCCESS;
+    }
+    eprintln!(
+        "InnerWarden blocked this file change (recommendation=deny): {}",
+        revoked.sentence()
+    );
+    eprintln!("{}", FILE_BLOCK_REMEDY);
+    std::process::ExitCode::from(2)
 }
 
 /// A profiles file that cannot be used, in enforce: the call is refused, as a
@@ -2096,10 +2158,15 @@ fn cmd_proxy(rest: &[String]) -> std::process::ExitCode {
                 .as_deref()
                 .and_then(|name| profiles.get(name))
                 .cloned();
+            let revoked = profiles.revocation(
+                agent_type.as_deref(),
+                identity.as_ref().and_then(|id| id.instance_id.as_deref()),
+            );
             Some(innerwarden_agent_guard::profiles::ProxyProfile::Active {
                 agent_type,
                 profile,
                 trust: agent_profiles::trust(identity.as_ref()),
+                revoked,
             })
         }
     };

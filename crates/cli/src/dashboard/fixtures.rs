@@ -413,6 +413,9 @@ fn agents() -> Value {
             auto_connect_eligible: Some(false),
             next_step: next,
             identity_step: None,
+            lifecycle: None,
+            profile: None,
+            decision_steps: None,
         };
     let payload = AgentsPayload {
         schema_version: AGENTS_SCHEMA_VERSION,

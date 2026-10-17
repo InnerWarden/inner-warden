@@ -7,7 +7,6 @@
 
 use std::path::{Path, PathBuf};
 
-use innerwarden_agent_guard::identity::RuleLayer;
 use innerwarden_agent_guard::profiles::{
     MAX_PROFILES_BYTES, SYSTEM_PROFILES_PATH, USER_PROFILES_PATH,
 };
@@ -22,15 +21,18 @@ const MAX_SNAPSHOT_BYTES: u64 = 256 * 1024;
 
 /// Who must own a file of profiles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Owner {
+pub(crate) enum Owner {
     /// The system file: root.
     Root,
     /// The user's file: this process's user (or root).
     Me,
+    /// The user's file of another account, read by root for it: that
+    /// account (or root).
+    Account(u32),
 }
 
 /// The user's file, under the home this process runs with.
-fn user_path() -> Option<PathBuf> {
+pub(crate) fn user_path() -> Option<PathBuf> {
     innerwarden_agent_guard::hook::home_dir()
         .ok()
         .filter(|home| home.is_absolute())
@@ -40,25 +42,32 @@ fn user_path() -> Option<PathBuf> {
 /// The profiles in force on this host, from both files, with the change (if
 /// any) reported to the guard event stream.
 pub fn load() -> ProfilesState {
+    let state = state();
+    audit(&state);
+    state
+}
+
+/// The profiles in force on this host, from both files, reporting nothing:
+/// for a reader that shows them (the dashboard) rather than applies them.
+pub fn state() -> ProfilesState {
+    let (system, (user_label, user)) = read_both();
+    state_from((SYSTEM_PROFILES_PATH, system), (&user_label, user))
+}
+
+/// The two files as found: the system file, and the user's with the path it
+/// is named by.
+fn read_both() -> (FileRead, (String, FileRead)) {
     let user = user_path();
     let user_label = user
         .as_ref()
         .map(|path| path.to_string_lossy().into_owned())
         .unwrap_or_else(|| format!("~/{USER_PROFILES_PATH}"));
-    let state = state_from(
-        (
-            SYSTEM_PROFILES_PATH,
-            read(Path::new(SYSTEM_PROFILES_PATH), Owner::Root),
-        ),
-        (
-            &user_label,
-            user.as_deref()
-                .map(|path| read(path, Owner::Me))
-                .unwrap_or(FileRead::Absent),
-        ),
-    );
-    audit(&state);
-    state
+    let system = read(Path::new(SYSTEM_PROFILES_PATH), Owner::Root);
+    let user = user
+        .as_deref()
+        .map(|path| read(path, Owner::Me))
+        .unwrap_or(FileRead::Absent);
+    (system, (user_label, user))
 }
 
 /// One open of `path`: no link followed, no wait on a FIFO, a regular file
@@ -66,7 +75,7 @@ pub fn load() -> ProfilesState {
 /// the cap read. A path that does not exist, or that this user cannot even
 /// look up (a directory closed to it), is absent: a file this user cannot
 /// see is not one that governs it. A file it can see and not read is refused.
-fn read(path: &Path, owner: Owner) -> FileRead {
+pub(crate) fn read(path: &Path, owner: Owner) -> FileRead {
     use std::io::Read;
 
     let file = match innerwarden_safe_io::open_no_follow(path) {
@@ -138,11 +147,13 @@ fn owner_refusal(metadata: &std::fs::Metadata, owner: Owner) -> Option<String> {
     let owned = match owner {
         Owner::Root => uid == 0,
         Owner::Me => uid == euid || uid == 0,
+        Owner::Account(account) => uid == account || uid == 0,
     };
     if !owned {
         return Some(match owner {
             Owner::Root => format!("is owned by uid {uid}, not root"),
             Owner::Me => format!("is owned by uid {uid}, not by this user ({euid})"),
+            Owner::Account(account) => format!("is owned by uid {uid}, not by uid {account}"),
         });
     }
     if metadata.permissions().mode() & 0o022 != 0 {
@@ -183,7 +194,7 @@ fn audit(state: &ProfilesState) {
         return;
     }
     for change in &changes {
-        crate::graph_io::record_rule_change(RuleLayer::AgentType, change);
+        crate::graph_io::record_rule_change(change.layer, change);
     }
 }
 

@@ -117,6 +117,18 @@ struct AgentView {
     /// cases do not say it asked until then, and the page says why.
     #[serde(skip_serializing_if = "Option::is_none")]
     identity_step: Option<AgentNextStep>,
+    /// What the person decided about this type: `discovered`, `approved` or
+    /// `revoked`. These three fields exist only where a profiles file or a
+    /// launcher's record does (`agent_decisions_io::dashboard_facts`); with
+    /// neither the row is what it was.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lifecycle: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    profile: Option<crate::agent_decisions::ProfileView>,
+    /// The `innerwarden agents approve|profile|revoke` commands that apply
+    /// to this row now, built by the CLI (the page never builds one).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    decision_steps: Option<Vec<crate::agent_decisions::DecisionStep>>,
 }
 
 /// The step that names an agent whose hook does not, from the hook's own
@@ -342,7 +354,7 @@ fn agents_json(
     home: &std::path::Path,
     rows: &[innerwarden_agent_guard::agents::AgentStatus],
 ) -> String {
-    agents_json_with_status(home, rows, false, None, TEST_GUARD_BIN)
+    agents_json_with_status(home, rows, false, None, TEST_GUARD_BIN, None)
 }
 
 /// The CLI the agent wrappers in the test homes run.
@@ -357,6 +369,7 @@ fn agents_json_with_status(
     discovery_limited: bool,
     watcher: Option<&crate::agent_policy::SharedDashboardReconcilerStatus>,
     guard_bin: &str,
+    identity: Option<&crate::agent_decisions::DashboardFacts>,
 ) -> String {
     let (policy, policy_available) = match crate::agent_policy::load(home) {
         Ok(policy) => (policy, true),
@@ -393,7 +406,7 @@ fn agents_json_with_status(
                 &host_mode,
                 mode == "partial" && agent_wired_monitor(home, agent),
             );
-            AgentView {
+            let mut view = AgentView {
                 id: agent.name.clone(),
                 display_name: display_agent_name(&agent.name),
                 installed: agent.installed,
@@ -416,7 +429,17 @@ fn agents_json_with_status(
                 } else {
                     None
                 },
+                lifecycle: None,
+                profile: None,
+                decision_steps: None,
+            };
+            if let Some(facts) = identity {
+                let decided = crate::agent_decisions::row_identity(facts, &agent.name);
+                view.lifecycle = Some(decided.lifecycle);
+                view.profile = Some(decided.profile);
+                view.decision_steps = Some(decided.decision_steps);
             }
+            view
         })
         .collect();
     serde_json::to_string(&AgentsPayload {
@@ -475,8 +498,16 @@ fn build_agent_snapshot(
 ) -> AgentSnapshot {
     let (rows, discovery_limited) =
         innerwarden_agent_guard::agents_ops::rows_with_discovery_status(home);
+    let identity = crate::agent_decisions_io::dashboard_facts(home);
     AgentSnapshot {
-        json: agents_json_with_status(home, &rows, discovery_limited, watcher, guard_bin),
+        json: agents_json_with_status(
+            home,
+            &rows,
+            discovery_limited,
+            watcher,
+            guard_bin,
+            identity.as_ref(),
+        ),
         guardrail: guardrail_status_from_rows(home, &rows),
         observed_at_ms: now_ms(),
     }
@@ -1938,6 +1969,7 @@ mod tests {
             false,
             None,
             &bin,
+            None,
         ))
         .unwrap();
         let agent = |id: &str| {
@@ -1981,6 +2013,87 @@ mod tests {
         assert!(body.contains("cursor_invalid"));
         assert_eq!(history_body(&log, "kind=attempt", 0).0, 200);
         assert_eq!(history_body(&log, "", 0).0, 200);
+    }
+
+    /// The decisions about an agent are terminal verbs: the local dashboard
+    /// has no route that takes one, with the identity features on or off.
+    #[test]
+    fn no_agent_decision_route_exists_on_the_local_dashboard() {
+        for path in [
+            "/api/action/agent-approve",
+            "/api/action/agent-profile",
+            "/api/action/agent-allow",
+            "/api/action/agent-revoke",
+            "/api/agents",
+        ] {
+            for method in [
+                tiny_http::Method::Post,
+                tiny_http::Method::Put,
+                tiny_http::Method::Delete,
+                tiny_http::Method::Patch,
+            ] {
+                assert!(!api_method_is_allowed(path, &method), "{path} {method:?}");
+            }
+        }
+    }
+
+    /// No profiles file and no launcher's record: every agent row has the
+    /// fields it always had and no other. With them, the three decision
+    /// fields appear, built from the files.
+    ///
+    /// FAILS ON REVERT: set the decision fields whatever `identity` is and
+    /// the first loop sees `lifecycle`.
+    #[test]
+    fn agent_rows_gain_decision_fields_only_with_the_identity_features() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+        std::fs::write(home.path().join(".claude/settings.json"), "{}").unwrap();
+        let rows = innerwarden_agent_guard::agents_ops::rows(home.path());
+        assert!(!rows.is_empty());
+        let today = [
+            "id",
+            "display_name",
+            "installed",
+            "running",
+            "detected_by",
+            "guardrail",
+            "auto_connect_eligible",
+            "next_step",
+            "identity_step",
+        ];
+        let off: serde_json::Value =
+            serde_json::from_str(&agents_json(home.path(), &rows)).unwrap();
+        for agent in off["agents"].as_array().unwrap() {
+            for key in agent.as_object().unwrap().keys() {
+                assert!(
+                    today.contains(&key.as_str()),
+                    "new field {key} with the features off"
+                );
+            }
+        }
+        let facts = crate::agent_decisions::DashboardFacts::default();
+        let on: serde_json::Value = serde_json::from_str(&agents_json_with_status(
+            home.path(),
+            &rows,
+            false,
+            None,
+            TEST_GUARD_BIN,
+            Some(&facts),
+        ))
+        .unwrap();
+        let claude = on["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["id"] == "claude-code")
+            .expect("claude-code row");
+        assert_eq!(claude["lifecycle"], "discovered");
+        assert_eq!(claude["profile"]["label"], "General rules");
+        assert_eq!(claude["profile"]["applies_from"], "now");
+        assert_eq!(
+            claude["decision_steps"][0]["command"],
+            "innerwarden agents approve claude-code"
+        );
     }
 
     #[test]
@@ -2572,6 +2685,7 @@ mod tests {
             false,
             Some(&watcher),
             TEST_GUARD_BIN,
+            None,
         ))
         .unwrap();
 
@@ -2680,8 +2794,14 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         let rows = innerwarden_agent_guard::agents_ops::rows(home.path());
-        let stale =
-            agents_json_with_status(home.path(), &rows, false, Some(&shared), TEST_GUARD_BIN);
+        let stale = agents_json_with_status(
+            home.path(),
+            &rows,
+            false,
+            Some(&shared),
+            TEST_GUARD_BIN,
+            None,
+        );
 
         crate::agent_policy::disable_auto_connect(home.path()).unwrap();
         while crate::agent_policy::read_dashboard_reconciler_status(&shared).policy_enabled

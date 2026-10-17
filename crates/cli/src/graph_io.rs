@@ -153,7 +153,7 @@ pub(crate) fn graph_path() -> Option<std::path::PathBuf> {
 /// The session the narrative groups under. An explicit environment override wins;
 /// otherwise hooks contribute their session id and MCP proxies their configured
 /// label. The value is bounded and redacted before it becomes a graph id.
-fn session_id(source_session: Option<&str>) -> String {
+pub(crate) fn session_id(source_session: Option<&str>) -> String {
     let raw = std::env::var("IW_GUARD_SESSION")
         .ok()
         .filter(|s| !s.trim().is_empty())

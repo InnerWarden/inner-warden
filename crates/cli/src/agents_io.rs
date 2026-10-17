@@ -7,6 +7,13 @@ use crate::agent_policy::{self, DesiredMode};
 
 /// `innerwarden agents [connect|disconnect [--all|<name>]]` - discover + connect.
 pub fn cmd(rest: &[String]) -> std::process::ExitCode {
+    // The person's decisions about an agent (approve, profile, allow,
+    // revoke): verbs of their own, never part of discovery or wiring.
+    if rest.first().is_some_and(|verb| {
+        innerwarden_agent_guard::threats::AGENT_DECISION_VERBS.contains(&verb.as_str())
+    }) {
+        return crate::agent_decisions_io::cmd(rest);
+    }
     if rest.first().map(String::as_str) != Some("auto-connect") {
         if let Err(error) = agents_ops::validate_args(rest) {
             eprintln!("innerwarden agents: {error}");
@@ -111,10 +118,16 @@ pub(crate) fn help_text() -> String {
          {p} agents connect [<name>|--all] [--monitor|--strict]\n\
          {p} agents disconnect [<name>|--all]\n\
          {p} agents auto-connect [--monitor|--off|status]\n\
+         {decisions}\n\
          \n  \
          Find the AI agents on this machine and wire the guard into them.\n  \
          Automatic setup is opt-in and monitor-only; unknown flags fail without\n  \
-         changing anything."
+         changing anything.\n  \
+         approve, profile, allow and revoke record your decisions about a type of\n  \
+         agent in agent-profiles.toml, confirmed at your terminal. Only\n  \
+         /etc/innerwarden/agent-profiles.toml (--system, as root) may relax a rule,\n  \
+         and a relaxation applies only to an instance that runs confined.",
+        decisions = crate::agent_decisions::usage()
     )
 }
 
