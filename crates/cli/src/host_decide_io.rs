@@ -61,8 +61,33 @@ pub fn consult(
 /// server whose key hashes to `pin`. The status and up to
 /// [`MAX_INSTANCE_ANSWER_BYTES`] + 1 bytes of the body (more than the most an
 /// answer may be, so a longer one is seen to be longer), or `None`.
+///
+/// The bound is on the request as a whole. A timeout on each socket call is
+/// not one: the TLS library reads the handshake and each record in a loop of
+/// its own, and a server that sends one byte at a time, each inside the
+/// timeout, would hold that loop for as long as it liked. So the exchange
+/// runs on a thread of its own and is waited for until the deadline only;
+/// past it the hook goes on without an answer, and the thread, still held to
+/// its socket timeouts, ends with the process (the hook runs once per call).
 pub fn ask(url: &str, body: &[u8], timeout: Duration, pin: &[u8; 32]) -> Option<(u16, Vec<u8>)> {
     let deadline = Instant::now() + timeout;
+    let (url, body, pin) = (url.to_string(), body.to_vec(), *pin);
+    let (answered, answer) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("host-decide".into())
+        .spawn(move || {
+            let _ = answered.send(exchange(&url, &body, deadline, &pin));
+        })
+        .ok()?;
+    answer
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .ok()
+        .flatten()
+}
+
+/// The request itself, each socket call held to what is left before
+/// `deadline`. [`ask`] holds the whole of it to the deadline.
+fn exchange(url: &str, body: &[u8], deadline: Instant, pin: &[u8; 32]) -> Option<(u16, Vec<u8>)> {
     let remaining = || {
         deadline
             .checked_duration_since(Instant::now())
@@ -233,7 +258,10 @@ fn dechunk(mut body: &[u8], cap: usize) -> Option<(Vec<u8>, bool)> {
         if size == 0 {
             return Some((out, true));
         }
-        if data.len() < size + 2 {
+        // The size and its line end: a size near the top of `usize` is not a
+        // body this reads, and is never added to unchecked.
+        let whole = size.checked_add(2)?;
+        if data.len() < whole {
             out.extend_from_slice(&data[..data.len().min(size)]);
             out.truncate(cap);
             return Some((out, false));
@@ -243,7 +271,7 @@ fn dechunk(mut body: &[u8], cap: usize) -> Option<(Vec<u8>, bool)> {
             out.truncate(cap);
             return Some((out, false));
         }
-        body = &data[size + 2..];
+        body = &data[whole..];
     }
 }
 
@@ -586,6 +614,109 @@ mod tests {
         let _ = server.join();
     }
 
+    /// How long a dripping server keeps a connection going, and its pace:
+    /// each byte comes well inside the bound, the whole far outside it.
+    const DRIP_EVERY: Duration = Duration::from_millis(100);
+    const DRIP_FOR: Duration = Duration::from_millis(3_000);
+
+    /// Send `bytes` one at a time at [`DRIP_EVERY`], for [`DRIP_FOR`] at most.
+    fn drip(tcp: &mut std::net::TcpStream, bytes: impl IntoIterator<Item = u8>) {
+        let started = Instant::now();
+        for byte in bytes {
+            if started.elapsed() > DRIP_FOR || tcp.write_all(&[byte]).is_err() {
+                return;
+            }
+            let _ = tcp.flush();
+            std::thread::sleep(DRIP_EVERY);
+        }
+    }
+
+    /// A process of the host that took the port, without the key, answers
+    /// the client's hello with a record header and then one byte at a time,
+    /// each inside the bound: the hook gives no answer within the bound, as
+    /// a whole, before any certificate is even seen.
+    ///
+    /// FAILS ON REVERT: bound each socket call instead of the request, and
+    /// the handshake is held for as long as the server drips.
+    #[test]
+    fn a_server_that_drips_its_hello_is_withheld_within_the_bound() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut tcp, _) = listener.accept().ok()?;
+            let mut hello = [0u8; 4096];
+            let _ = tcp.read(&mut hello).ok()?;
+            // A handshake record that says 16 KiB follow, then its body.
+            drip(
+                &mut tcp,
+                [0x16, 0x03, 0x03, 0x40, 0x00]
+                    .into_iter()
+                    .chain(std::iter::repeat(0)),
+            );
+            Some(())
+        });
+        let (_, _, pin) = certificate();
+        let url = format!("https://127.0.0.1:{port}/api/agent/instance-decide");
+        let started = Instant::now();
+        let reply = ask(&url, br#"{}"#, Duration::from_millis(400), &pin);
+        let took = started.elapsed();
+        assert_eq!(reply, None);
+        assert!(took < Duration::from_millis(1_000), "{took:?}");
+    }
+
+    /// The server with the published key drips its answer, one encrypted
+    /// byte at a time, each inside the bound: the answer is not waited for
+    /// past the bound.
+    ///
+    /// FAILS ON REVERT: bound each socket call instead of the request.
+    #[test]
+    fn a_server_that_drips_its_answer_is_withheld_within_the_bound() {
+        let (cert, key, pin) = certificate();
+        let config = Arc::new(
+            rustls::ServerConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .unwrap(),
+        );
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let response = ok_json(&answer_for(ID));
+        std::thread::spawn(move || {
+            let (mut tcp, _) = listener.accept().ok()?;
+            tcp.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+            let mut connection = rustls::ServerConnection::new(config).ok()?;
+            let mut seen = Vec::new();
+            let mut buf = [0u8; 4096];
+            {
+                let mut stream = rustls::Stream::new(&mut connection, &mut tcp);
+                while !whole_request(&seen) {
+                    let n = stream.read(&mut buf).ok()?;
+                    if n == 0 {
+                        return None;
+                    }
+                    seen.extend_from_slice(&buf[..n]);
+                }
+            }
+            connection.writer().write_all(&response).ok()?;
+            let mut sealed = Vec::new();
+            while connection.wants_write() {
+                connection.write_tls(&mut sealed).ok()?;
+            }
+            drip(&mut tcp, sealed);
+            Some(())
+        });
+        let url = format!("https://127.0.0.1:{port}/api/agent/instance-decide");
+        let started = Instant::now();
+        let reply = ask(&url, br#"{}"#, Duration::from_millis(400), &pin);
+        let took = started.elapsed();
+        assert_eq!(reply, None);
+        assert!(took < Duration::from_millis(1_000), "{took:?}");
+    }
+
     /// A `serve` of Community, or an older Active Defence, has no such route:
     /// its 404 is a status, and no answer.
     #[test]
@@ -759,6 +890,36 @@ mod tests {
             Parsed::Done(200, body) => assert_eq!(body.len(), MAX_INSTANCE_ANSWER_BYTES + 1),
             other => panic!("{other:?}"),
         }
+    }
+
+    /// A chunk size near the top of `usize` is not added to: the body is
+    /// broken or read to the cap, and the hook never aborts on it.
+    ///
+    /// FAILS ON REVERT: add 2 to the size unchecked, and the size overflows
+    /// (a panic here; in a release build, an abort of the hook).
+    #[test]
+    fn a_chunk_size_at_the_top_of_usize_is_no_answer_and_no_abort() {
+        let head = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+        for size in ["ffffffffffffffff", "fffffffffffffffe"] {
+            let mut seen = head.to_vec();
+            seen.extend_from_slice(format!("{size}\r\nx").as_bytes());
+            for eof in [false, true] {
+                assert_eq!(parse_response(&seen, eof), Parsed::Broken, "{size} {eof}");
+            }
+        }
+        // Larger than an answer may be and still addable: read to the cap,
+        // and an answer that long is no answer.
+        let mut seen = head.to_vec();
+        seen.extend_from_slice(b"fffffffffffffffd\r\n");
+        seen.extend(std::iter::repeat_n(b'a', MAX_INSTANCE_ANSWER_BYTES + 10));
+        match parse_response(&seen, false) {
+            Parsed::Done(200, body) => assert_eq!(body.len(), MAX_INSTANCE_ANSWER_BYTES + 1),
+            other => panic!("{other:?}"),
+        }
+        // More digits than a size can hold is not a size.
+        let mut seen = head.to_vec();
+        seen.extend_from_slice(b"1ffffffffffffffff\r\nx");
+        assert_eq!(parse_response(&seen, true), Parsed::Broken);
     }
 
     #[test]
