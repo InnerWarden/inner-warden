@@ -1403,8 +1403,34 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
             if let Ok((mut stream, _)) = listener.accept() {
+                // The whole request first, headers and body: answering and
+                // closing with the body unread resets the connection on Linux
+                // and the client sees an error instead of the status.
+                let mut request = Vec::new();
                 let mut buf = [0u8; 4096];
-                let _ = stream.read(&mut buf);
+                let (mut head_end, mut length) = (None, 0usize);
+                loop {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => request.extend_from_slice(&buf[..n]),
+                    }
+                    if head_end.is_none() {
+                        if let Some(at) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                            head_end = Some(at + 4);
+                            length = String::from_utf8_lossy(&request[..at])
+                                .lines()
+                                .find_map(|l| {
+                                    l.to_ascii_lowercase()
+                                        .strip_prefix("content-length:")
+                                        .and_then(|v| v.trim().parse().ok())
+                                })
+                                .unwrap_or(0);
+                        }
+                    }
+                    if head_end.is_some_and(|end| request.len() >= end + length) {
+                        break;
+                    }
+                }
                 let _ = write!(
                     stream,
                     "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"

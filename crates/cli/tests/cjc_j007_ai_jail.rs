@@ -348,6 +348,31 @@ fn dry_run_shows_the_record_and_info_descriptors_only_with_the_identity_flag() {
         scope_lines[0].ends_with("): identity is at most observed"),
         "{identified}"
     );
+    // The command gets its own PATH and loader variables back through bwrap,
+    // because the launcher's helpers run with a fixed PATH: those pairs, and
+    // the agent name the hook is told, are the flag's other additions.
+    let identified = {
+        let mut tokens = identified.split(' ').peekable();
+        let mut kept: Vec<&str> = Vec::new();
+        while let Some(token) = tokens.next() {
+            if token == "--setenv" {
+                let name = tokens.next().unwrap_or("");
+                let value = tokens.next().unwrap_or("");
+                if name == "PATH" || name.starts_with("LD_") {
+                    continue;
+                }
+                kept.extend(["--setenv", name, value]);
+            } else {
+                kept.push(token);
+            }
+        }
+        kept.join(" ")
+    };
+    let identified: String = identified
+        .lines()
+        .filter(|l| !l.starts_with("#   IW_HOOK_AGENT="))
+        .map(|l| format!("{l}\n"))
+        .collect();
     let without: String = identified
         .replace(" --ro-bind-data 10 /run/innerwarden/instance.json", "")
         .replace(" --info-fd 9", "")
