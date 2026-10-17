@@ -432,6 +432,63 @@ mod tests {
         ));
     }
 
+    /// The hook's own reading of the jail it runs in, with every fact
+    /// matching (the same facts a record the agent made for itself, in a
+    /// namespace of its own, would give), is decided at a level that unlocks
+    /// no relaxation: the profile's allow and an exception for the instance
+    /// are withheld and the general review stands.
+    ///
+    /// FAILS ON REVERT: return `confined` from row 10 of
+    /// `identity::judge_trust_in_jail` and the call is let through by the
+    /// exception.
+    #[test]
+    fn the_hooks_own_reading_of_its_jail_unlocks_no_relaxation() {
+        const NS: u64 = 4026533001;
+        const MNT: u64 = 4026533002;
+        const ID: &str = "3f9a0c1e5b7d42a8c6e1f0b2d4a69c87";
+        let record = format!(
+            r#"{{"schema":1,"instance_id":"{ID}","agent_type":"claude-code","launcher":{{"path":"/usr/local/bin/innerwarden","version":"1","root_owned":true}},"uid":1000,"project":"p","mode":"enforce","started_at":"2026-10-16T09:30:00Z","jail":{{"backend":"bwrap","pid":1,"start_ticks":1,"pid_ns":{NS},"mnt_ns":{MNT}}},"scope":{{"user":{{"unit":"innerwarden-contain-{ID}.scope","cgroup_path":"/user.slice/user-1000.slice/user@1000.service/app.slice/innerwarden-contain-{ID}.scope"}}}}}}"#
+        );
+        let read = crate::hook_identity::resolve(
+            &crate::hook_identity::JailFacts {
+                record: crate::hook_identity::RawRecord::Bytes {
+                    bytes: record.into_bytes(),
+                    read_only: true,
+                },
+                own_pid_ns: Some(NS),
+                own_mnt_ns: Some(MNT),
+                launcher_agent: Some("claude-code".into()),
+            },
+            None,
+            None,
+        )
+        .expect("a record was there");
+        assert_eq!(read.instance_id.as_deref(), Some(ID));
+        assert_eq!(read.reason, Reason::ConfinedByNamespace);
+        let profiles = on(&format!(
+            "{PERMISSIVE}[[agent.claude-code.exception]]\ninstance_id = \"{ID}\"\ncategory = \"bare_ip_fetch\"\n"
+        ));
+        let verdict = review("bare_ip_fetch");
+        let facts = HookFacts {
+            command: "curl http://203.0.113.9/x",
+            verdict: &verdict,
+            blocks_today: true,
+            tainted: false,
+            line_block_review: true,
+        };
+        let out = decide_hook(
+            &facts,
+            &profiles,
+            agent_type(None, Some(&read)).as_deref(),
+            read.instance_id.as_deref(),
+            trust(Some(&read)),
+        );
+        assert!(out.blocks);
+        assert_eq!(out.deciding_layer, RuleLayer::General);
+        assert_eq!(out.verdict, verdict, "the verdict is not touched");
+        assert!(out.relaxation_withheld);
+    }
+
     #[test]
     fn a_profile_deny_is_written_onto_the_verdict() {
         let profiles = on(STRICT);

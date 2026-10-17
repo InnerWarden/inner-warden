@@ -13,7 +13,8 @@
 //! is `declared` with a reason; a failed read never stops a tool call.
 //!
 //! The labels are labels. The level is the hook's own opinion from inside the
-//! jail, and a reader that needs more than that has to find it elsewhere.
+//! jail, never above `observed` (the agent can build what the hook reads), and
+//! a reader that needs more than that has to find it elsewhere.
 
 // The jail record exists on Linux only; the decisions and their tests run everywhere.
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -70,12 +71,15 @@ pub struct Identity {
 }
 
 impl Identity {
-    /// The key the behavioural window is kept under. For a confined instance
-    /// it is the instance, so a session id the agent invents cannot start a
-    /// fresh window; otherwise it is the session id, as before.
+    /// The key the behavioural window is kept under. For an instance whose
+    /// jail reading held in full ([`Reason::ConfinedByNamespace`]) it is the
+    /// instance, so a session id the agent invents cannot start a fresh
+    /// window; otherwise it is the session id, as before. Keying by the
+    /// instance only ever joins calls into one window, so a record the agent
+    /// wrote for itself gains nothing from it.
     pub fn behaviour_key(&self, payload_session: Option<&str>) -> Option<String> {
-        match (&self.instance_id, self.trust) {
-            (Some(id), Trust::Confined) => Some(format!("instance:{id}")),
+        match (&self.instance_id, self.reason) {
+            (Some(id), Reason::ConfinedByNamespace) => Some(format!("instance:{id}")),
             _ => payload_session.map(str::to_string),
         }
     }
@@ -94,8 +98,8 @@ impl Identity {
     }
 }
 
-/// The key for the behavioural window: the instance when confined, else the
-/// session id the payload carried.
+/// The key for the behavioural window: the instance when its jail reading
+/// held in full, else the session id the payload carried.
 pub fn behaviour_key(identity: Option<&Identity>, payload_session: Option<&str>) -> Option<String> {
     match identity {
         Some(identity) => identity.behaviour_key(payload_session),
@@ -325,15 +329,17 @@ mod tests {
         assert_eq!(resolve(&none, Some("claude-code"), Some("abc")), None);
     }
 
+    /// The launcher's jail, read from inside, as well as a reading can go:
+    /// `observed`, the instance named.
     #[test]
-    fn the_recorded_namespace_on_a_read_only_record_is_confined() {
+    fn the_recorded_namespace_on_a_read_only_record_is_observed() {
         let id = resolve(
             &facts(RECORD, true, Some(OWN_NS)),
             Some("claude-code"),
             Some("payload-session"),
         )
         .unwrap();
-        assert_eq!(id.trust, Trust::Confined);
+        assert_eq!(id.trust, Trust::Observed);
         assert_eq!(id.reason, Reason::ConfinedByNamespace);
         assert_eq!(id.instance_id.as_deref(), Some("7f3a9c1e-42"));
         assert_eq!(id.session_id.as_deref(), Some("payload-session"));
@@ -343,8 +349,8 @@ mod tests {
     /// A record carried into another jail (or copied by the agent) is not this
     /// process's record.
     ///
-    /// FAILS ON REVERT: grant `Confined` without comparing the namespace and
-    /// this sees `Confined` and the instance id.
+    /// FAILS ON REVERT: skip comparing the namespace and this sees `observed`
+    /// and the instance id.
     #[test]
     fn a_record_of_another_jail_is_declared_and_names_no_instance() {
         let id = resolve(
@@ -401,7 +407,7 @@ mod tests {
 
     /// The hook line and the record must agree on the kind of agent.
     ///
-    /// FAILS ON REVERT: skip `judge_agent_claim` and this sees `Confined`.
+    /// FAILS ON REVERT: skip `judge_agent_claim` and this sees `observed`.
     #[test]
     fn a_hook_wired_for_another_agent_than_the_record_is_declared() {
         let id = resolve(&facts(RECORD, true, Some(OWN_NS)), Some("cursor"), None).unwrap();
@@ -417,7 +423,7 @@ mod tests {
     /// the record's place) is not in the launcher's jail.
     ///
     /// FAILS ON REVERT: hand `own_mnt_ns` to the judge as the recorded one (or
-    /// drop the mount namespace rows) and this sees `Confined`.
+    /// drop the mount namespace rows) and this sees `observed`.
     #[test]
     fn a_hook_in_another_mount_namespace_is_declared_and_names_no_instance() {
         let mut nested = facts(RECORD, true, Some(OWN_NS));
@@ -458,7 +464,7 @@ mod tests {
     /// record to this hook.
     ///
     /// FAILS ON REVERT: ignore `launcher_agent` in `resolve` and the second
-    /// and third cases see `Confined`.
+    /// and third cases see `observed`.
     #[test]
     fn the_launchers_agent_must_be_the_records_type() {
         let mut other = facts(RECORD, true, Some(OWN_NS));
@@ -500,7 +506,11 @@ mod tests {
         // The launcher's word alone, or with the same line, keeps the level.
         for line in [None, Some("claude-code")] {
             let id = resolve(&facts(RECORD, true, Some(OWN_NS)), line, None).unwrap();
-            assert_eq!(id.trust, Trust::Confined, "{line:?}");
+            assert_eq!(
+                (id.trust, id.reason),
+                (Trust::Observed, Reason::ConfinedByNamespace),
+                "{line:?}"
+            );
         }
         // A hook line alone, with the launcher's word absent, still holds.
         let line_only = JailFacts {
@@ -510,8 +520,8 @@ mod tests {
         assert_eq!(
             resolve(&line_only, Some("claude-code"), None)
                 .unwrap()
-                .trust,
-            Trust::Confined
+                .reason,
+            Reason::ConfinedByNamespace
         );
     }
 
@@ -539,12 +549,12 @@ mod tests {
     }
 
     /// A session id the agent invents must not start a fresh behavioural
-    /// window for a confined instance.
+    /// window for an instance whose jail reading held.
     ///
     /// FAILS ON REVERT: key by the payload session always and the two keys
     /// differ.
     #[test]
-    fn a_confined_instance_keeps_one_window_whatever_session_it_claims() {
+    fn a_jailed_instance_keeps_one_window_whatever_session_it_claims() {
         let id = resolve(&facts(RECORD, true, Some(OWN_NS)), None, Some("a")).unwrap();
         assert_eq!(
             behaviour_key(Some(&id), Some("a")),
@@ -557,7 +567,7 @@ mod tests {
     }
 
     #[test]
-    fn below_confined_and_without_a_record_the_window_keys_as_before() {
+    fn a_partial_reading_and_no_record_key_the_window_as_before() {
         let declared = resolve(&facts(RECORD, false, Some(OWN_NS)), None, None).unwrap();
         assert_eq!(
             behaviour_key(Some(&declared), Some("s")).as_deref(),
@@ -634,7 +644,7 @@ mod tests {
         }
 
         /// A record on an ordinary folder is read and is NOT on a read-only
-        /// mount, so it can never be `confined`.
+        /// mount, so it can never be more than `declared`.
         #[test]
         fn a_file_on_a_writable_folder_is_not_read_only() {
             let dir = tempfile::tempdir().unwrap();

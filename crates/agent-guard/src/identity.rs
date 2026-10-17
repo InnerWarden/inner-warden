@@ -211,6 +211,8 @@ pub enum Trust {
     /// Something outside the agent's control saw the process and who started it.
     Observed,
     /// It runs inside a boundary it cannot leave, built by a trusted launcher.
+    /// A witness outside the agent says so: no reading from inside the jail
+    /// ([`judge_trust_in_jail`]) reaches this level.
     Confined,
 }
 
@@ -641,7 +643,10 @@ pub struct InJailFacts<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Reason {
-    /// Same namespace as the record, read-only record, trusted launcher.
+    /// Same namespaces as the record, read-only record, trusted launcher, a
+    /// scope: everything a reading from inside the jail can check holds. The
+    /// level it earns is still `observed` (see [`judge_trust_in_jail`], row
+    /// 10); the code names what was found, not what it proves.
     ConfinedByNamespace,
     /// Same namespace as the record, but the launcher is a file its user could
     /// have replaced (a per-user install).
@@ -709,9 +714,9 @@ impl Reason {
 /// | 7b | own mount namespace is not the recorded one | declared | `MountNamespaceMismatch` |
 /// | 8 | same namespaces, launcher not root-owned | observed | `LauncherNotTrusted` |
 /// | 9 | same namespaces, launcher root-owned, no scope recorded | observed | `NoScope` |
-/// | 10 | same namespaces, launcher root-owned, a scope recorded | confined | `ConfinedByNamespace` |
+/// | 10 | same namespaces, launcher root-owned, a scope recorded | observed | `ConfinedByNamespace` |
 ///
-/// Why each row is the way it is:
+/// No row reaches `confined`. Why each row is the way it is:
 ///
 /// * 3: the namespace is readable by the agent, so a record it can write is a
 ///   record it can make say anything.
@@ -731,6 +736,16 @@ impl Reason {
 ///   launch on a host with no user service manager runs with no dedicated
 ///   scope, and its launcher says on screen that the instance is `observed` at
 ///   most; this row is what makes that sentence true.
+/// * 10 is a ceiling too. Every fact the rows compare is one the agent's own
+///   process can produce: on a host where an unprivileged process may make a
+///   user namespace, the agent can make a mount namespace of its own, put a
+///   record of its own on a read-only mount there (naming its own namespaces,
+///   a root-owned launcher, a scope and any type of agent), and run a hook in
+///   it. That hook sees exactly what a hook in the launcher's jail sees. So a
+///   reading from inside the jail is never more than `observed`, and
+///   `observed` unlocks no per-agent relaxation ([`decide`]): what is
+///   relaxed for `confined` needs a witness outside the agent, never this
+///   reading.
 ///
 /// This is the in-jail view and only that. It reads no `/proc` and takes no
 /// word from the environment; a stronger level needs a witness outside the
@@ -771,7 +786,7 @@ pub fn judge_trust_in_jail(facts: InJailFacts<'_>) -> (Trust, Reason) {
     if record.scope.as_ref().is_none_or(Scopes::is_empty) {
         return (Trust::Observed, Reason::NoScope);
     }
-    (Trust::Confined, Reason::ConfinedByNamespace)
+    (Trust::Observed, Reason::ConfinedByNamespace)
 }
 
 /// Hold a level to the agent the hook line was wired for.
@@ -1625,13 +1640,17 @@ mod tests {
         }
     }
 
-    /// Row 10: the only way to `confined`.
+    /// Row 10: everything the reading checks holds, and it is still
+    /// `observed`.
+    ///
+    /// FAILS ON REVERT: return `confined` from row 10 and every case here
+    /// sees `confined`.
     #[test]
-    fn row_10_same_namespace_read_only_record_root_owned_launcher_and_a_scope_is_confined() {
+    fn row_10_same_namespace_read_only_record_root_owned_launcher_and_a_scope_is_observed() {
         let record = golden();
         assert_eq!(
             judge_trust_in_jail(facts(&record, true, Some(OWN_NS))),
-            (Trust::Confined, Reason::ConfinedByNamespace)
+            (Trust::Observed, Reason::ConfinedByNamespace)
         );
         // Either scope on its own is a cgroup the instance was put in.
         for drop_user in [false, true] {
@@ -1644,9 +1663,52 @@ mod tests {
             }
             assert_eq!(
                 judge_trust_in_jail(facts(&record, true, Some(OWN_NS))),
-                (Trust::Confined, Reason::ConfinedByNamespace)
+                (Trust::Observed, Reason::ConfinedByNamespace)
             );
         }
+    }
+
+    /// The record an agent writes for itself, in a user and mount namespace
+    /// it made: its own namespace inodes, a root-owned launcher, a scope named
+    /// for an id it chose, the type it wants, on a mount it remounted
+    /// read-only. Every fact matches, so the reading cannot tell it from the
+    /// launcher's, and it earns no level that unlocks a relaxation: under a
+    /// profile and an exception that allow the call, the general review
+    /// stands.
+    ///
+    /// FAILS ON REVERT: return `confined` from row 10 and the exception lets
+    /// the forged instance through.
+    #[test]
+    fn a_record_the_agent_made_for_itself_unlocks_no_relaxation() {
+        const FORGED_PID: u64 = 4026533001;
+        const FORGED_MNT: u64 = 4026533002;
+        let forged = parse_launch_record(
+            br#"{"schema":1,"instance_id":"x1","agent_type":"permissive","launcher":{"path":"/usr/local/bin/innerwarden","version":"1","root_owned":true},"uid":1000,"project":"p","mode":"enforce","started_at":"2026-10-16T09:30:00Z","jail":{"backend":"bwrap","pid":1,"start_ticks":1,"pid_ns":4026533001,"mnt_ns":4026533002},"scope":{"user":{"unit":"innerwarden-contain-x1.scope","cgroup_path":"/user.slice/user-1000.slice/user@1000.service/app.slice/innerwarden-contain-x1.scope"}}}"#,
+        )
+        .expect("a well-formed record");
+        let judged = judge_trust_in_jail(InJailFacts {
+            record: RecordRead::Present {
+                record: &forged,
+                read_only: true,
+            },
+            own_pid_ns: Some(FORGED_PID),
+            own_mnt_ns: Some(FORGED_MNT),
+        });
+        let (trust, _) = judge_agent_claim(judged, &forged.agent_type, Some("permissive"));
+        assert_eq!(trust, Trust::Observed);
+        let allowed_by_profile = Layers {
+            hard_refused: false,
+            general: Verdict::Review,
+            agent_type: Some(LayerRule::Allow),
+            instance: Some(LayerRule::Allow),
+        };
+        assert_eq!(
+            decide(allowed_by_profile, trust),
+            Decision {
+                verdict: Verdict::Review,
+                deciding_layer: RuleLayer::General,
+            }
+        );
     }
 
     /// Row 9: a launch with no dedicated scope (no user service manager) is
@@ -1832,11 +1894,14 @@ mod tests {
         );
     }
 
-    /// Of every combination of the inputs, exactly one reaches `confined`
-    /// (counted once per scope shape that names a scope).
+    /// Of every combination of the inputs, none reaches `confined`, and
+    /// exactly one is row 10 (counted once per scope shape that names a
+    /// scope).
+    ///
+    /// FAILS ON REVERT: return `confined` from row 10.
     #[test]
-    fn confined_is_reached_by_exactly_one_combination() {
-        let mut confined = 0;
+    fn no_reading_reaches_confined_and_row_10_is_exactly_one_combination() {
+        let mut row_10 = 0;
         for root_owned in [false, true] {
             for read_only in [false, true] {
                 for own in [
@@ -1860,9 +1925,10 @@ mod tests {
                                 }
                                 let mut facts = facts(&record, read_only, own);
                                 facts.own_mnt_ns = own_mnt;
-                                let judged = judge_trust_in_jail(facts).0;
-                                if judged == Trust::Confined {
-                                    confined += 1;
+                                let (judged, reason) = judge_trust_in_jail(facts);
+                                assert!(judged <= Trust::Observed, "{judged:?} {reason:?}");
+                                if reason == Reason::ConfinedByNamespace {
+                                    row_10 += 1;
                                     assert!(
                                         root_owned
                                             && read_only
@@ -1878,7 +1944,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(confined, 1);
+        assert_eq!(row_10, 1);
     }
 
     #[test]

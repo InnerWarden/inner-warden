@@ -78,3 +78,60 @@ fn without_a_record_the_hook_writes_no_identity_field_anywhere() {
     let keys: Vec<&String> = store["sessions"].as_object().unwrap().keys().collect();
     assert_eq!(keys, ["payload-session-1"]);
 }
+
+/// Every path under `dir`, relative to it.
+fn tree(dir: &std::path::Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut todo = vec![dir.to_path_buf()];
+    while let Some(next) = todo.pop() {
+        for entry in std::fs::read_dir(&next).unwrap() {
+            let path = entry.unwrap().path();
+            out.push(
+                path.strip_prefix(dir)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+            if path.is_dir() {
+                todo.push(path);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// With no profiles file and no launcher record, what the identity and the
+/// profiles cost a tool call is a failed lookup of each file: nothing new is
+/// written, no snapshot of the profiles, no folder of instances, no folder
+/// for the profiles. The files a hook call leaves are the ones it always left.
+#[test]
+fn without_a_profiles_file_or_a_record_the_hook_writes_nothing_new() {
+    if std::path::Path::new("/run/innerwarden/instance.json").exists()
+        || std::path::Path::new("/etc/innerwarden/agent-profiles.toml").exists()
+    {
+        return; // a real record or profiles file on this machine
+    }
+    let dir = tempfile::TempDir::new().unwrap();
+    let payload = serde_json::json!({
+        "session_id": "payload-session-2",
+        "hook_event_name": "PreToolUse",
+        "cwd": dir.path(),
+        "tool_name": "Bash",
+        "tool_input": { "command": "curl http://203.0.113.9/x" },
+    })
+    .to_string();
+    run_hook(dir.path(), &payload);
+    let left = tree(dir.path());
+    for path in &left {
+        assert!(
+            !path.contains("agent-profiles") && !path.contains("instances"),
+            "{path} in {left:?}"
+        );
+    }
+    assert!(!dir.path().join(".config/innerwarden").exists(), "{left:?}");
+    assert!(
+        !dir.path().join(".local/state/innerwarden").exists(),
+        "{left:?}"
+    );
+}
