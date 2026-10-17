@@ -682,6 +682,17 @@ export function readUnnamedByChannel(value: unknown): { hook?: string; mcp?: str
   return item === undefined ? undefined : defined({ hook: time(item.hook), mcp: time(item.mcp) });
 }
 
+/**
+ * The CLI's sentence about a profiles file that is there and cannot be used
+ * (`profiles_file`), or `undefined` when there is none, which is every
+ * payload of a host without one.
+ */
+export function readProfilesFile(value: unknown): { sentence: string } | undefined {
+  const item = record(record(value)?.profiles_file);
+  const sentence = plain(item?.sentence, 1_024);
+  return item?.state === "invalid" && sentence !== undefined ? { sentence } : undefined;
+}
+
 /** The one command the CLI says fixes an agent, printed as sent. */
 export type AgentNextStep = { label: string; command: string; line: string };
 

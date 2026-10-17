@@ -188,6 +188,11 @@ export const REASON_CODES = [
   "namespace_mismatch",
   "no_instance",
   "not_checked_yet",
+  "no_scope",
+  "own_mount_namespace_unreadable",
+  "mount_namespace_mismatch",
+  "agent_mismatch",
+  "agent_not_named",
 ] as const;
 export type ReasonCode = (typeof REASON_CODES)[number];
 
@@ -203,6 +208,11 @@ export const REASON_TRUST: Record<ReasonCode, Trust> = {
   namespace_mismatch: "declared",
   no_instance: "declared",
   not_checked_yet: "declared",
+  no_scope: "observed",
+  own_mount_namespace_unreadable: "declared",
+  mount_namespace_mismatch: "declared",
+  agent_mismatch: "declared",
+  agent_not_named: "declared",
 };
 
 export const REASON_WORDS: Record<ReasonCode, string> = {
@@ -217,6 +227,11 @@ export const REASON_WORDS: Record<ReasonCode, string> = {
   namespace_mismatch: "Its jail record belongs to another jail.",
   no_instance: "Started without a jail: only its own word says what it is.",
   not_checked_yet: "Not checked yet: nothing was screened since it started.",
+  no_scope: "The jail runs without a scope of its own: start it from a terminal login, where your user session can create one.",
+  own_mount_namespace_unreadable: "The hook could not read its own mount namespace, so it counts as unverified.",
+  mount_namespace_mismatch: "It sees a filesystem its launcher did not build, so its jail record proves nothing.",
+  agent_mismatch: "Its jail record names another kind of agent than its hook serves.",
+  agent_not_named: "Neither its hook nor its launcher named the agent, so its jail record proves nothing about it.",
 };
 
 export const UNKNOWN_REASON_WORDS = "Why it is unverified was not recorded.";

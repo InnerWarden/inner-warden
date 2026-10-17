@@ -4,7 +4,7 @@ import { MachineIntelligence } from "../components/MachineIntelligence";
 import { TechnicalOnly } from "../components/TechnicalDetail";
 import { When } from "../components/When";
 import { agentRows, decisionSentence, type AgentRow } from "./agentsView";
-import { fetchHistory, readUnnamedByChannel, type AgentNextStep, type LocalInstance } from "./api";
+import { fetchHistory, readProfilesFile, readUnnamedByChannel, type AgentNextStep, type LocalInstance } from "./api";
 import { OfferLine } from "./Offer";
 import { agentsOffer } from "./offers";
 import { CARD, Chip, CopyCommand, PageHeader, Skeleton, StaleLine, Unreadable, type ChipTone } from "./parts";
@@ -67,6 +67,7 @@ export function CommunityAgents({ context }: { context?: CommunityScreenContext 
   const rows = agentRows(agents.data);
   const auto = autoConnectLine(agents.data);
   const unnamed = readUnnamedByChannel(agents.data);
+  const profilesFile = readProfilesFile(agents.data);
   return (
     <div className="min-w-0 space-y-5" data-tour="agents">
       <PageHeader
@@ -82,6 +83,12 @@ export function CommunityAgents({ context }: { context?: CommunityScreenContext 
         </div>
       )}
       {agents.stale ? <StaleLine onRetry={agents.refresh} /> : null}
+      {profilesFile === undefined ? null : (
+        <div data-profiles-invalid className={CARD}>
+          <Chip tone="needs" label="Invalid profiles file" />
+          <p className="mt-2 text-sm leading-6 text-slate-700">{profilesFile.sentence}</p>
+        </div>
+      )}
       {agents.data === undefined ? (
         agents.error === undefined ? <Skeleton className="h-48" /> : <Unreadable title="Agents did not answer" onRetry={agents.refresh} />
       ) : agents.data.availability === "loading" ? (

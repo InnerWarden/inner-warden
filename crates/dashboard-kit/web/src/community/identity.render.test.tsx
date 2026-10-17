@@ -165,6 +165,8 @@ const NEW_MARKERS = [
   "Waits for your approval",
   "Profile:",
   "contain --identity",
+  "data-profiles-invalid",
+  "Invalid profiles file",
 ];
 
 describe("with no identity data the screens are what they were", () => {
@@ -325,5 +327,21 @@ describe("a case with identity", () => {
     expect(text).toContain("could not be confirmed from inside");
     expect(text).not.toContain("because this instance runs confined");
     expect(text).not.toContain("Confined");
+  });
+});
+
+describe("an unusable profiles file is never silence", () => {
+  it("says the file cannot be used, in the CLI's words, and guesses no decision", () => {
+    const agents = {
+      ...(agentsFixture as unknown as AgentsResponse),
+      profiles_file: { state: "invalid", sentence: "The agent profiles file cannot be used (/etc/innerwarden/agent-profiles.toml: bad key)." },
+    };
+    seed(agents);
+    const out = render(<CommunityAgents context={context()} />, agents);
+    expect(out).toContain("data-profiles-invalid");
+    const text = textOf(out);
+    expect(text).toContain("Invalid profiles file");
+    expect(text).toContain("The agent profiles file cannot be used (/etc/innerwarden/agent-profiles.toml: bad key).");
+    expect(out).not.toContain("data-lifecycle");
   });
 });

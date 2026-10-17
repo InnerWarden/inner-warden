@@ -193,3 +193,41 @@ describe("the one Active Defence line", () => {
     expect(new Set(Object.values(OFFER_KEYS)).size).toBe(Object.keys(OFFER_KEYS).length);
   });
 });
+
+describe("the CLI's identity fixtures read as written", () => {
+  it("reads every row and instance the CLI serves, and every hook reason has words", async () => {
+    const identityAgents = (await import("../../tests/fixtures/community/agents-identity.json")).default as unknown as AgentsResponse;
+    const rows = agentRows(identityAgents);
+    const claude = rows.find((row) => row.id === "claude-code");
+    expect(claude?.who?.trust).toBe("observed");
+    expect(claude?.who?.confine?.command).toBe("sudo npm install -g innerwarden");
+    expect(claude?.who?.instances.map((i) => i.trust)).toEqual(["observed", "host_verified", "host_verified"]);
+    expect(claude?.who?.owner).toBe("maria");
+    expect(claude?.who?.lifecycleBy).toBe("dev");
+    const codex = rows.find((row) => row.id === "codex");
+    expect(codex?.who?.instances[0]?.trustReason).toBe("not_checked_yet");
+    expect(rows.find((row) => row.id === "cursor")?.who?.trustReason).toBe("no_instance");
+    for (const code of ["no_scope", "own_mount_namespace_unreadable", "mount_namespace_mismatch", "agent_mismatch", "agent_not_named"]) {
+      expect(reasonWords(code)).not.toBe(UNKNOWN_REASON_WORDS);
+    }
+    expect(effectiveTrust("host_verified", "no_scope")).toBe("observed");
+  });
+
+  it("reads the decisions and the changes the CLI serves", async () => {
+    const history = readHistory((await import("../../tests/fixtures/community/history-identity.json")).default);
+    expect(history.agentDecisions?.map((line) => line.action)).toEqual(["allow", "approve"]);
+    expect(history.agentDecisions?.[0]?.rule).toBe("bare_ip_fetch");
+    const byId = (await import("../../tests/fixtures/community/decisions-identity-by-id.json")).default as Record<string, { item: { identity?: unknown } }>;
+    const withheld = readDecisionIdentity(byId["cmd:contain:2"]?.item.identity);
+    expect(withheld).toMatchObject({ trust: "observed", layer: "general", relaxationWithheld: true, profile: "claude-code" });
+  });
+
+  it("says an unusable profiles file and nothing without one", async () => {
+    const { readProfilesFile } = await import("./api");
+    expect(readProfilesFile(agents)).toBeUndefined();
+    expect(readProfilesFile({ ...agents, profiles_file: { state: "invalid", sentence: "The agent profiles file cannot be used (x)." } })).toEqual({
+      sentence: "The agent profiles file cannot be used (x).",
+    });
+    expect(readProfilesFile({ ...agents, profiles_file: { state: "valid", sentence: "x" } })).toBeUndefined();
+  });
+});
