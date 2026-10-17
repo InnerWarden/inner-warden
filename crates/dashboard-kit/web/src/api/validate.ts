@@ -491,7 +491,7 @@ function agentSession(value: unknown, path: string): AgentSessionRef {
     session_id: text(item.session_id, `${path}.session_id`),
     started_at: item.started_at === undefined ? undefined : nullableText(item.started_at, `${path}.started_at`),
     ended_at: item.ended_at === undefined ? undefined : nullableText(item.ended_at, `${path}.ended_at`),
-    identity_confidence: oneOf(item.identity_confidence, ["host_verified", "configured", "declared", "conflicting", "unattributed"] as const, `${path}.identity_confidence`),
+    identity_confidence: oneOf(item.identity_confidence, ["host_verified", "observed", "configured", "declared", "conflicting", "unattributed"] as const, `${path}.identity_confidence`),
     evidence: array(item.evidence, `${path}.evidence`, evidence),
   };
 }
@@ -527,7 +527,7 @@ function agentSubject(value: unknown, path: string): AgentSubject {
     agent_class: oneOf(item.agent_class, ["coding", "autonomous", "mcp_based", "custom", "unknown"] as const, `${path}.agent_class`),
     runtime: nullableText(item.runtime, `${path}.runtime`),
     model: nullableText(item.model, `${path}.model`),
-    identity_confidence: oneOf(item.identity_confidence, ["host_verified", "configured", "declared", "conflicting", "unattributed"] as const, `${path}.identity_confidence`),
+    identity_confidence: oneOf(item.identity_confidence, ["host_verified", "observed", "configured", "declared", "conflicting", "unattributed"] as const, `${path}.identity_confidence`),
     identity_evidence: array(item.identity_evidence, `${path}.identity_evidence`, evidence),
     sessions: array(item.sessions, `${path}.sessions`, agentSession),
     capabilities: array(item.capabilities, `${path}.capabilities`, agentCapability),

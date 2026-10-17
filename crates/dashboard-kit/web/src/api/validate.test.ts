@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseDashboardBootstrap, parseDashboardPosture } from "./validate";
+import { parseAgentInventory, parseDashboardBootstrap, parseDashboardPosture } from "./validate";
 
 function bootstrapWithSourceKind(kind: unknown): unknown {
   const stage = { state: "unknown", evidence: [], reason_code: "not_observed" };
@@ -422,5 +422,43 @@ describe("the agent's command tally survives validation", () => {
       expect(parsed.agent_commands, JSON.stringify(bad)).toBeUndefined();
       expect(parsed.layers).toHaveLength(1);
     }
+  });
+});
+
+describe("agent identity confidence 'observed'", () => {
+  const subject = (confidence: string) => ({
+    agent_id: "claude-code",
+    principal: null,
+    product: "Claude Code",
+    provider: null,
+    agent_class: "coding",
+    runtime: null,
+    model: null,
+    identity_confidence: confidence,
+    identity_evidence: [],
+    sessions: [{ session_id: "s1", identity_confidence: confidence, evidence: [] }],
+    capabilities: [],
+  });
+  const inventory = (confidence: string) => ({
+    schema_version: "innerwarden.dashboard.v1",
+    generated_at: "2026-10-16T09:00:00Z",
+    availability: "available",
+    discovery_limited: false,
+    subjects: [subject(confidence)],
+  });
+
+  /**
+   * A producer that starts to send `observed` must not take the whole Agents
+   * screen down: the validator throws on a value it does not know.
+   */
+  it("reads observed on a subject and on a session without evidence", () => {
+    const parsed = parseAgentInventory(inventory("observed"));
+    expect(parsed.subjects[0].identity_confidence).toBe("observed");
+    expect(parsed.subjects[0].sessions[0].identity_confidence).toBe("observed");
+  });
+
+  it("still refuses a word it does not know, and host verified without verified evidence", () => {
+    expect(() => parseAgentInventory(inventory("trusted"))).toThrow(/identity_confidence/);
+    expect(() => parseAgentInventory(inventory("host_verified"))).toThrow(/verified evidence/);
   });
 });

@@ -38,6 +38,17 @@ describe("statusPresentation", () => {
     expect(statusPresentation("unattributed")).toMatchObject({ label: "Unattributed", symbol: "?" });
   });
 
+  /**
+   * Trust and lifecycle words: seen by the kernel is informational (never
+   * emerald, which is a confirmed read back), and only a lifecycle that waits
+   * on a person is amber.
+   */
+  it("words the observed trust and the lifecycle states", () => {
+    expect(statusPresentation("observed")).toEqual({ label: "Seen by the kernel", symbol: "i", tone: "informational" });
+    expect(statusPresentation("discovered")).toMatchObject({ label: "Waits for your approval", tone: "attention" });
+    expect(statusPresentation("revoked")).toMatchObject({ label: "Revoked", tone: "neutral" });
+  });
+
   it("keeps arbitrary future labels readable and neutral", () => {
     expect(statusPresentation("custom_extremely_long_status_label")).toEqual({
       label: "Custom extremely long status label",
