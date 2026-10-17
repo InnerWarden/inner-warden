@@ -69,6 +69,42 @@ pub fn cmd(rest: &[String]) -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
+    // An identified launch takes its jail settings from the agent type's
+    // profile, where a profiles file exists; a flag given here still wins.
+    // Without `--identity` no profile is read and the jail is what it was.
+    let mut args = args;
+    if args.identity {
+        match crate::agent_profiles_io::load() {
+            crate::agent_profiles::ProfilesState::Off => {}
+            crate::agent_profiles::ProfilesState::Invalid(why) => {
+                eprintln!("innerwarden contain: the agent profiles cannot be used: {why}");
+                return ExitCode::from(2);
+            }
+            crate::agent_profiles::ProfilesState::On(profiles) => {
+                if let Some(profile) = profiles.get(&args.agent) {
+                    crate::contain::apply_jail_profile(
+                        &mut args,
+                        &profile.jail,
+                        crate::contain::jail_flags_given(rest),
+                        &home,
+                    );
+                    // Links resolved, so the check of what may be shown read-only
+                    // is made on the place the bind would really show. A path
+                    // that is not there is dropped (bwrap would skip it).
+                    args.extra_ro = args
+                        .extra_ro
+                        .iter()
+                        .filter_map(|path| std::fs::canonicalize(path).ok())
+                        .collect();
+                    eprintln!(
+                        "innerwarden contain: jail settings from the `{}` agent profile",
+                        args.agent
+                    );
+                }
+            }
+        }
+    }
+
     // Resolve the project dir (default cwd), canonicalized so binds are absolute.
     let project = resolve_project(&args.project);
     if !project.is_dir() {
@@ -78,7 +114,6 @@ pub fn cmd(rest: &[String]) -> ExitCode {
         );
         return ExitCode::from(2);
     }
-    let mut args = args;
     args.project = project;
 
     let input = resolve_inputs(args, home, iw_binary);

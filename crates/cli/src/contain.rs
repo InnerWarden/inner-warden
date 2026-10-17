@@ -177,6 +177,69 @@ pub fn parse_contain_args(argv: &[String]) -> Result<ContainArgs, ContainError> 
     })
 }
 
+/// Which of the jail settings a profile also sets were given on the command
+/// line: those win over the profile.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct JailFlagsGiven {
+    pub project: bool,
+}
+
+/// PURE. Which jail flags `argv` (the `contain` arguments) gives before the
+/// command starts.
+pub fn jail_flags_given(argv: &[String]) -> JailFlagsGiven {
+    let mut given = JailFlagsGiven::default();
+    let mut it = argv.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--" => break,
+            "--project" => given.project = true,
+            // Flags that take a value: skip it, it is not a flag.
+            "--agent" | "--deny-read" => {
+                it.next();
+            }
+            other if !other.starts_with('-') => break,
+            _ => {}
+        }
+    }
+    given
+}
+
+/// PURE. Apply a type's jail profile to parsed `contain --identity` arguments.
+///
+/// The profile's project is used only when `--project` was not given; its
+/// read-only paths are added; its hidden globs are added to the defaults and
+/// to any `--deny-read` (hiding more is never undone by a flag). A `~/` path
+/// is under `home`. The I/O layer resolves links in the read-only paths
+/// before the jail is built, so a link cannot put a protected directory
+/// behind an allowed name.
+pub fn apply_jail_profile(
+    args: &mut ContainArgs,
+    jail: &innerwarden_agent_guard::profiles::JailProfile,
+    given: JailFlagsGiven,
+    home: &Path,
+) {
+    let place = |path: &str| match path.strip_prefix("~/") {
+        Some(rest) => home.join(rest),
+        None => PathBuf::from(path),
+    };
+    if !given.project {
+        if let Some(project) = &jail.project_rw {
+            args.project = place(project);
+        }
+    }
+    for path in &jail.extra_ro {
+        let path = place(path);
+        if !args.extra_ro.contains(&path) {
+            args.extra_ro.push(path);
+        }
+    }
+    for glob in &jail.deny_read {
+        if !args.deny_read.contains(glob) {
+            args.deny_read.push(glob.clone());
+        }
+    }
+}
+
 /// A binary resolved to live under `$HOME` (so it must be re-bound after the HOME
 /// tmpfs on Linux): the symlink/launcher path and the real directory it points to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -324,6 +387,12 @@ pub fn validate_jail_inputs(input: &JailInputs) -> Result<(), ContainError> {
     for path in &input.args.extra_rw {
         validate_bind("extra writable", path)?;
     }
+    // A read-only bind exposes the same as a writable one to a reader, so it
+    // is held to the same places: never the home, an ancestor of it, or a
+    // protected directory (the masks are re-applied after it anyway).
+    for path in &input.args.extra_ro {
+        validate_bind("extra read-only", path)?;
+    }
     if input.args.identity {
         validate_sealed(input)?;
     }
@@ -351,6 +420,15 @@ fn validate_sealed(input: &JailInputs) -> Result<(), ContainError> {
             .extra_rw
             .iter()
             .map(|p| ("extra writable", p.as_path())),
+    );
+    // Read-only is not enough here: a socket on a read-only mount still
+    // accepts a connection, so the host's `/run` read-only is its bus.
+    writable.extend(
+        input
+            .args
+            .extra_ro
+            .iter()
+            .map(|p| ("extra read-only", p.as_path())),
     );
     for (kind, path) in writable {
         if let Some(sealed) = IDENTITY_SEALED
@@ -451,6 +529,15 @@ pub fn build_linux_jail(input: &JailInputs) -> Result<LinuxJailPlan, ContainErro
     }
     let iw = input.iw_binary.to_string_lossy().to_string();
     push(&["--ro-bind", &iw, &iw]);
+
+    // --- extra read-only paths (a jail profile's `extra_ro`), before the
+    // project and before the protected masks are re-applied, so neither can
+    // be undone by them. `-try`: a path that is gone is skipped. Empty unless
+    // a profile named some, so a jail without one is what it was. ---
+    for p in &input.args.extra_ro {
+        let s = p.to_string_lossy().to_string();
+        push(&["--ro-bind-try", &s, &s]);
+    }
 
     // --- project (rw, same path), LATE so it wins over the HOME tmpfs ---
     let proj = input.args.project.to_string_lossy().to_string();
@@ -2228,6 +2315,140 @@ mod tests {
         for fine in ["/home/dev/proj", "/tmp/proj", "/srv/run", "/runner/proj"] {
             assert!(validate_jail_inputs(&identified(fine)).is_ok(), "{fine}");
         }
+    }
+
+    // -- a jail profile (`contain --identity` with a profiles file) ----------
+
+    fn jail_profile(
+        project: Option<&str>,
+        extra_ro: &[&str],
+        deny_read: &[&str],
+    ) -> innerwarden_agent_guard::profiles::JailProfile {
+        innerwarden_agent_guard::profiles::JailProfile {
+            project_rw: project.map(str::to_string),
+            extra_ro: extra_ro.iter().map(|s| s.to_string()).collect(),
+            deny_read: deny_read.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    fn argv(words: &[&str]) -> Vec<String> {
+        words.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn only_a_project_flag_before_the_command_counts_as_given() {
+        assert!(jail_flags_given(&argv(&["--project", "/x", "--", "claude"])).project);
+        assert!(
+            !jail_flags_given(&argv(&["--identity", "--", "claude", "--project", "/x"])).project
+        );
+        assert!(!jail_flags_given(&argv(&["claude", "--project", "/x"])).project);
+        assert!(!jail_flags_given(&argv(&["--deny-read", "--project", "--", "x"])).project);
+        assert!(!jail_flags_given(&argv(&["--identity"])).project);
+    }
+
+    /// The profile fills what the command line left out; an explicit flag
+    /// wins, and hiding more is never undone.
+    ///
+    /// FAILS ON REVERT: apply `project_rw` even when `--project` was given and
+    /// the explicit project is replaced.
+    #[test]
+    fn a_jail_profile_fills_the_gaps_and_an_explicit_flag_wins() {
+        let home = Path::new("/home/dev");
+        let profile = jail_profile(
+            Some("~/work/app"),
+            &["/opt/sdk", "~/tools"],
+            &["config/prod.yaml", ".env"],
+        );
+        let mut defaulted = args(&["claude"]);
+        apply_jail_profile(&mut defaulted, &profile, JailFlagsGiven::default(), home);
+        assert_eq!(defaulted.project, PathBuf::from("/home/dev/work/app"));
+        assert_eq!(
+            defaulted.extra_ro,
+            [PathBuf::from("/opt/sdk"), PathBuf::from("/home/dev/tools")]
+        );
+        assert_eq!(
+            defaulted.deny_read,
+            [".env", ".env.*", "secrets/**", "config/prod.yaml"]
+        );
+        let mut explicit = args(&["claude"]);
+        apply_jail_profile(
+            &mut explicit,
+            &profile,
+            JailFlagsGiven { project: true },
+            home,
+        );
+        assert_eq!(explicit.project, PathBuf::from("/home/dev/proj"));
+        // An empty profile changes nothing.
+        let mut plain = args(&["claude"]);
+        apply_jail_profile(
+            &mut plain,
+            &jail_profile(None, &[], &[]),
+            JailFlagsGiven::default(),
+            home,
+        );
+        assert_eq!(plain, args(&["claude"]));
+    }
+
+    /// A read-only path from a profile is bound before the project and before
+    /// the protected masks are laid again, so neither can be undone by it.
+    #[test]
+    fn an_extra_read_only_path_is_bound_before_the_project_and_the_masks() {
+        let mut input = inputs(&["claude"]);
+        input.args.extra_ro = vec![PathBuf::from("/opt/sdk")];
+        let a = build_linux_jail(&input).unwrap().bwrap_args;
+        let bind = a
+            .windows(3)
+            .position(|w| w[0] == "--ro-bind-try" && w[1] == "/opt/sdk" && w[2] == "/opt/sdk")
+            .expect("the read-only bind");
+        let project = a
+            .windows(3)
+            .position(|w| w[0] == "--bind" && w[1] == "/home/dev/proj")
+            .unwrap();
+        let last_mask = a
+            .windows(2)
+            .rposition(|w| w[0] == "--tmpfs" && w[1] == "/home/dev/.ssh")
+            .unwrap();
+        assert!(bind < project && bind < last_mask);
+        // Without one there is no such bind (the golden test pins the whole
+        // argv of that jail).
+        assert!(!build_linux_jail(&inputs(&["claude"]))
+            .unwrap()
+            .bwrap_args
+            .iter()
+            .any(|w| w == "--ro-bind-try"));
+    }
+
+    /// A read-only bind shows a reader what is there: the home, an ancestor
+    /// of it, a protected directory, and (with `--identity`) the host's
+    /// `/run` and `/sys` are refused.
+    ///
+    /// FAILS ON REVERT: drop the `extra_ro` loop from `validate_jail_inputs`
+    /// and the home is bound read-only.
+    #[test]
+    fn an_extra_read_only_path_is_held_to_the_writable_rules() {
+        for bad in [
+            "/home/dev",
+            "/home",
+            "/",
+            "/home/dev/.ssh",
+            "/home/dev/.config",
+            "/home/dev/.config/innerwarden/llm-key",
+            "relative/path",
+        ] {
+            let mut input = inputs(&["claude"]);
+            input.args.extra_ro = vec![PathBuf::from(bad)];
+            assert!(validate_jail_inputs(&input).is_err(), "{bad}");
+        }
+        for sealed in ["/run/user/1000", "/sys/fs/cgroup"] {
+            let mut input = inputs(&["claude"]);
+            input.args.identity = true;
+            input.args.extra_ro = vec![PathBuf::from(sealed)];
+            assert!(validate_jail_inputs(&input).is_err(), "{sealed}");
+        }
+        let mut fine = inputs(&["claude"]);
+        fine.args.identity = true;
+        fine.args.extra_ro = vec![PathBuf::from("/opt/sdk"), PathBuf::from("/home/dev/tools")];
+        assert!(validate_jail_inputs(&fine).is_ok());
     }
 
     fn facts(systemd_run: Option<&str>, version: Option<u32>, manager: bool) -> launch::ScopeFacts {
