@@ -269,11 +269,16 @@ fn a_decision_without_the_person_at_a_terminal_changes_nothing() {
     let unconfirmed = host.agents("approve claude-code");
     assert_eq!(unconfirmed.code, Some(2), "{}", unconfirmed.stderr);
     assert!(unconfirmed.stderr.contains("needs you at a terminal"));
-    // An agent's shell: --yes is not the person's word.
-    let mut agent = host.command(&["agents", "revoke", "claude-code", "--yes"]);
-    agent.env("CLAUDECODE", "1");
-    let from_agent = host.run(agent, "");
-    assert_eq!(from_agent.code, Some(2), "{}", from_agent.stderr);
+    // An agent's shell: --yes is not the person's word, for any verb.
+    for verb in [
+        &["agents", "revoke", "claude-code", "--yes"][..],
+        &["agents", "approve", "claude-code", "--yes"][..],
+    ] {
+        let mut agent = host.command(verb);
+        agent.env("CLAUDECODE", "1");
+        let from_agent = host.run(agent, "y\n");
+        assert_eq!(from_agent.code, Some(2), "{verb:?}: {}", from_agent.stderr);
+    }
     assert!(!host.profiles_path().exists(), "nothing was written");
     // A tightening the person wrote and now takes back is a relaxation: it
     // asks for the agent's name at a terminal, and there is none.

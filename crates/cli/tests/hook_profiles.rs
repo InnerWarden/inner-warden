@@ -342,3 +342,55 @@ fn the_proxy_refuses_a_tool_the_profile_denies_and_forwards_it_without_one() {
     );
     assert_eq!(host.last_command_attrs()["deciding_layer"], "agent_type");
 }
+
+/// The profiles files are the person's: a file tool writing either one is
+/// refused for every agent, with or without a profiles file in force, and
+/// whatever agent the hook line or the launcher names. The file is not
+/// changed.
+#[test]
+fn a_file_tool_writing_the_profiles_is_refused_for_every_agent() {
+    if system_file_present() {
+        return;
+    }
+    let host = Host::new();
+    let user_file = host.home().join(".config/innerwarden/agent-profiles.toml");
+    let write = |path: &Path, tool: &str| {
+        serde_json::json!({
+            "session_id": "s-profiles",
+            "hook_event_name": "PreToolUse",
+            "cwd": host.home().join("proj"),
+            "tool_name": tool,
+            "tool_input": {
+                "file_path": path,
+                "content": "schema_version = 1\n",
+                "old_string": "a",
+                "new_string": "b",
+            },
+        })
+        .to_string()
+    };
+    for with_profiles in [false, true] {
+        if with_profiles {
+            host.profiles("schema_version = 1\n");
+        }
+        let before = std::fs::read(&user_file).ok();
+        for flags in [
+            &["--agent", "claude-code"][..],
+            &["--agent", "cursor"][..],
+            &[][..],
+        ] {
+            for path in [user_file.as_path(), Path::new(SYSTEM_FILE)] {
+                for tool in ["Write", "Edit"] {
+                    let (code, stderr) = host.hook(flags, &write(path, tool));
+                    assert_eq!(
+                        code,
+                        Some(2),
+                        "{tool} {} {flags:?} profiles={with_profiles}: {stderr}",
+                        path.display()
+                    );
+                }
+            }
+        }
+        assert_eq!(std::fs::read(&user_file).ok(), before, "nothing written");
+    }
+}
