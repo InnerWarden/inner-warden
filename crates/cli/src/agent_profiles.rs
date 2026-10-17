@@ -73,6 +73,16 @@ pub fn state_from(system: (&str, FileRead), user: (&str, FileRead)) -> ProfilesS
     ProfilesState::On(profiles::merge(parsed[0].as_ref(), parsed[1].as_ref()))
 }
 
+/// Where a launcher that proved the way to the system profiles file root's
+/// mounts a marker that says so, read-only, in a jail that has no launch
+/// record (`contain` without `--identity`). An identified jail's record says
+/// the same: its launcher always checks that way first.
+pub const SYSTEM_PROFILES_MARKER_PATH: &str = "/run/innerwarden/system-profiles-root";
+
+/// What the marker holds. Only its presence is read.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub const SYSTEM_PROFILES_MARKER: &[u8] = b"root\n";
+
 /// What a reader knows about who root is where it runs, for the system file.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[cfg_attr(not(unix), allow(dead_code))]
@@ -82,21 +92,42 @@ pub struct RootView {
     pub maps_root: Option<bool>,
     /// The uid the kernel shows for an owner the namespace does not map.
     pub overflow_uid: Option<u32>,
-    /// The process runs in a jail its launcher identified (the launcher's
-    /// record is mounted at its place).
-    pub identified_jail: bool,
+    /// The process runs in a jail whose launcher proved, with the host's real
+    /// owners, that the way to the system profiles file is root's alone
+    /// ([`launcher_proved`]).
+    pub launcher_proved: bool,
+}
+
+/// PURE. Whether the jail's launcher proved the way to the system profiles
+/// file root's: the launch record of an identified jail is mounted (its
+/// launcher checks that way before every identified jail), or the marker a
+/// plain jail's launcher mounts once it checked it
+/// ([`SYSTEM_PROFILES_MARKER_PATH`]).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn launcher_proved(record_mounted: bool, marker_mounted: bool) -> bool {
+    record_mounted || marker_mounted
 }
 
 /// PURE. Whether a system profiles file owned by `uid` is root's as this
 /// process sees it.
 ///
-/// uid 0 always is. Inside an identified jail, whose user namespace maps only
-/// the user, root's files show with the overflow uid; so does any other
-/// account's, which is why that uid counts only there: before an identified
-/// jail is started its launcher proves, with the host's real owners, that the
-/// file and every folder above it are root's and that no other account can
-/// write them, so what shows there with the overflow uid is root's. In a jail
-/// started without `--identity`, and outside a jail, only uid 0 is root.
+/// uid 0 always is. Inside a jail whose user namespace maps only the user
+/// (bwrap not installed setuid), root's files show with the overflow uid; so
+/// does any other account's, which is why that uid counts only where the
+/// jail's launcher proved, with the host's real owners and before the jail
+/// started, that the file and every folder above it are root's and that no
+/// other account can write them (`view.launcher_proved`): there what shows
+/// with the overflow uid is root's, and a revocation written on the host
+/// reaches the running jail. Outside a jail, and in a jail whose launcher
+/// proved nothing, only uid 0 is root.
+///
+/// The record and the marker are the launcher's word, read inside the jail.
+/// An agent that makes a user namespace of its own can mount a marker there
+/// and so have its own hook take some other account's file as root's; it
+/// could already show that hook any file as root's in such a namespace (map
+/// uid 0 and mount over `/etc`), and where the launcher handed the marker in,
+/// the host's way to the file was proven root's. It gains nothing.
+///
 /// `view` is read only for a file that uid 0 does not own.
 #[cfg_attr(not(unix), allow(dead_code))]
 pub fn system_owner_is_root(uid: u32, view: impl FnOnce() -> RootView) -> bool {
@@ -104,7 +135,7 @@ pub fn system_owner_is_root(uid: u32, view: impl FnOnce() -> RootView) -> bool {
         return true;
     }
     let view = view();
-    view.identified_jail && view.maps_root == Some(false) && view.overflow_uid == Some(uid)
+    view.launcher_proved && view.maps_root == Some(false) && view.overflow_uid == Some(uid)
 }
 
 /// PURE. Whether a process whose `/proc/self/uid_map` reads `map` sees
@@ -659,7 +690,7 @@ mod tests {
         let jail = RootView {
             maps_root: Some(false),
             overflow_uid: Some(65534),
-            identified_jail: true,
+            launcher_proved: true,
         };
         assert!(system_owner_is_root(65534, || jail));
         assert!(system_owner_is_root(0, || jail));
@@ -667,22 +698,23 @@ mod tests {
     }
 
     /// The overflow uid is root only where the launcher proved the chain:
-    /// not in a jail started without `--identity`, not where the namespace
-    /// maps root (outside a jail), not where the map cannot be read. With a
-    /// file of uid 0 nothing else is looked at.
+    /// not in a jail whose launcher handed in neither a record nor the
+    /// marker, not where the namespace maps root (outside a jail), not where
+    /// the map cannot be read. With a file of uid 0 nothing else is looked
+    /// at.
     ///
-    /// FAILS ON REVERT: drop the `identified_jail` condition and a plain
-    /// jail believes a file the launcher never checked.
+    /// FAILS ON REVERT: drop the `launcher_proved` condition and a jail
+    /// believes a file its launcher never checked.
     #[test]
-    fn the_overflow_uid_is_root_only_in_an_identified_jail() {
+    fn the_overflow_uid_is_root_only_where_the_launcher_proved_the_chain() {
         let jail = RootView {
             maps_root: Some(false),
             overflow_uid: Some(65534),
-            identified_jail: true,
+            launcher_proved: true,
         };
         for other in [
             RootView {
-                identified_jail: false,
+                launcher_proved: false,
                 ..jail
             },
             RootView {
@@ -704,6 +736,37 @@ mod tests {
         assert!(system_owner_is_root(0, || panic!(
             "not read for root's file"
         )));
+    }
+
+    /// A jail started without `--identity` has no record; where its
+    /// launcher proved the way to the system file root's, the marker it
+    /// mounted counts as the record does, so the file the host has is in
+    /// force there and not refused.
+    ///
+    /// FAILS ON REVERT: read only the record (`launcher_proved` ignoring the
+    /// marker), and every call in such a jail is refused while the host has a
+    /// profiles file.
+    #[test]
+    fn a_plain_jail_with_the_launchers_marker_sees_the_system_file_as_roots() {
+        assert!(launcher_proved(true, false), "an identified jail");
+        assert!(launcher_proved(false, true), "a plain jail, marked");
+        assert!(!launcher_proved(false, false), "no word of the launcher's");
+        let plain = RootView {
+            maps_root: Some(false),
+            overflow_uid: Some(65534),
+            launcher_proved: launcher_proved(false, true),
+        };
+        assert!(system_owner_is_root(65534, || plain));
+        assert!(!system_owner_is_root(1000, || plain));
+        assert_eq!(
+            SYSTEM_PROFILES_MARKER_PATH,
+            "/run/innerwarden/system-profiles-root"
+        );
+        assert_eq!(
+            std::path::Path::new(SYSTEM_PROFILES_MARKER_PATH).parent(),
+            std::path::Path::new(innerwarden_agent_guard::identity::JAIL_RECORD_PATH).parent(),
+            "beside the record, on the jail's /run"
+        );
     }
 
     #[test]

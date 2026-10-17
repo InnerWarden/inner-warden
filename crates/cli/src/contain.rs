@@ -305,6 +305,15 @@ pub struct JailInputs {
     ///
     /// [`JAIL_SPKI_PIN_PATH`]: innerwarden_agent_guard::identity::JAIL_SPKI_PIN_PATH
     pub key_fd: Option<i32>,
+    /// The descriptor bwrap reads the launcher's marker from and mounts,
+    /// read-only, at [`SYSTEM_PROFILES_MARKER_PATH`] (`--ro-bind-data`): the
+    /// launcher proved, with the host's real owners, that the way to the
+    /// system profiles file is root's alone. Only for a jail with no launch
+    /// record, and only when that file exists; `None` otherwise, so a host
+    /// without the file runs the jail it always did.
+    ///
+    /// [`SYSTEM_PROFILES_MARKER_PATH`]: crate::agent_profiles::SYSTEM_PROFILES_MARKER_PATH
+    pub profiles_marker_fd: Option<i32>,
     /// The launcher's own records directory, as named and as resolved, hidden
     /// inside an identified jail: the agent works in a home that holds it.
     /// Empty unless the launch asked for an identity record.
@@ -616,6 +625,18 @@ pub fn build_linux_jail(input: &JailInputs) -> Result<LinuxJailPlan, ContainErro
         } else {
             push(&["--ro-bind", "/dev/null", &dest]);
         }
+    }
+
+    // --- the launcher's marker that the way to the system profiles file is
+    // root's, read-only (a jail with no record, on a host with that file).
+    // It lands on the `/run` tmpfs, among the last mounts, so nothing the
+    // agent can write covers it. ---
+    if let Some(fd) = input.profiles_marker_fd {
+        push(&[
+            "--ro-bind-data",
+            &fd.to_string(),
+            crate::agent_profiles::SYSTEM_PROFILES_MARKER_PATH,
+        ]);
     }
 
     // --- the key of Active Defence on this host, read-only, just before the
@@ -1047,6 +1068,10 @@ pub mod launch {
     /// launcher believes. A real run uses the pipe's own.
     pub const DRY_RUN_KEY_FD: i32 = 11;
 
+    /// The profiles marker descriptor a dry run of a plain jail shows, when
+    /// the host has a system profiles file. A real run uses the pipe's own.
+    pub const DRY_RUN_MARKER_FD: i32 = 12;
+
     // -- the user scope ------------------------------------------------------
     //
     // The order a launch runs in, and why it is this order:
@@ -1375,10 +1400,13 @@ pub mod launch {
     // every other account's show with the one overflow uid. The hook still
     // reads the system profiles file live, through the jail's read-only
     // `/etc`, so a revocation written on the host reaches a running jail, and
-    // in an identified jail it takes that uid as root's
-    // (`agent_profiles::system_owner_is_root`). That is sound only for a way
-    // to the file the launcher proved root's, with the real owners, before
-    // the jail started: this check, which refuses the launch otherwise.
+    // where the launcher proved the way to it takes that uid as root's
+    // (`agent_profiles::system_owner_is_root`): an identified jail's record,
+    // or the marker a plain jail gets. That is sound only for a way to the
+    // file the launcher proved root's, with the real owners, before the jail
+    // started: this check, which refuses the launch otherwise. Before every
+    // identified jail, and before a plain one where the file exists; a plain
+    // jail on a host without the file checks nothing and is today's.
 
     /// One entry on the way from `/` to the system profiles file, as the
     /// launcher reads it on the host (`symlink_metadata`: never followed).
@@ -1410,7 +1438,43 @@ pub mod launch {
         chain
     }
 
-    /// PURE. The one sentence that refuses an identified launch when the way
+    /// What the launcher does about the system profiles file before a jail.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum ProfilesChain {
+        /// A plain jail on a host without the file: nothing is checked and
+        /// nothing handed in, the jail is today's.
+        NotAsked,
+        /// The way to the file is root's alone; `file`: the file is there.
+        Proven { file: bool },
+        /// The launch stops, with this sentence.
+        Refused(String),
+    }
+
+    impl ProfilesChain {
+        /// A jail with no record gets the marker: the file is there and the
+        /// way to it was proven.
+        pub fn marks(&self) -> bool {
+            matches!(self, ProfilesChain::Proven { file: true })
+        }
+    }
+
+    /// PURE. What the launcher does about the way to the system profiles file
+    /// ([`system_profiles_chain`], read on the host). An identified launch
+    /// always checks it; a plain one only where the file is there (an entry
+    /// that could not be inspected counts as there), so without the file a
+    /// plain jail is what it always was.
+    pub fn profiles_chain(identity: bool, chain: &[(PathBuf, HostEntry)]) -> ProfilesChain {
+        let file = !matches!(chain.last(), None | Some((_, HostEntry::Absent)));
+        if !identity && !file {
+            return ProfilesChain::NotAsked;
+        }
+        match system_profiles_refusal(chain) {
+            Some(why) => ProfilesChain::Refused(why),
+            None => ProfilesChain::Proven { file },
+        }
+    }
+
+    /// PURE. The one sentence that refuses a launch when the way
     /// to the system profiles file is not root's alone, or `None`. `chain` is
     /// each entry from `/` down to the file ([`system_profiles_chain`]). The
     /// walk ends at the first entry that is absent: only the owner of the
@@ -1442,8 +1506,8 @@ pub mod launch {
                 HostEntry::Found { .. } => continue,
             };
             return Some(format!(
-                "innerwarden contain: {what}, and an identified jail reads this host's agent \
-                 profiles through it, so nothing was started."
+                "innerwarden contain: {what}, and a jail reads this host's agent profiles \
+                 through it, so nothing was started."
             ));
         }
         None
@@ -2103,6 +2167,7 @@ mod tests {
             info_fd: None,
             record_fd: None,
             key_fd: None,
+            profiles_marker_fd: None,
             records_dirs: vec![],
             child_env: vec![],
             close_userns: false,
@@ -3359,6 +3424,132 @@ mod tests {
             ]
             .map(PathBuf::from)
         );
+    }
+
+    /// The marker mount, as a plain jail gets it.
+    const MARKER_MOUNT: &str = "--ro-bind-data\n12\n/run/innerwarden/system-profiles-root\n";
+
+    /// A plain jail on a host with a system profiles file whose way the
+    /// launcher proved root's gets the marker, read-only, after the `/run`
+    /// tmpfs and last of the mounts; without the file (no descriptor) the
+    /// jail is today's, byte for byte, plain and rich.
+    ///
+    /// FAILS ON REVERT: drop the marker mount (every call in a plain jail on
+    /// a host whose bwrap is not setuid is refused while the file exists), or
+    /// mount it with `--bind-data`.
+    #[test]
+    fn golden_argv_of_a_plain_jail_with_and_without_the_system_profiles_file() {
+        let mut rich = inputs(&["/bin/sh", "-c", "true"]);
+        rich.stdin_is_tty = false;
+        rich.agent_binary = Some(ResolvedBinary {
+            link: PathBuf::from("/home/dev/.local/bin/claude"),
+            target_dir: PathBuf::from("/home/dev/.local/share/claude/v1"),
+        });
+        rich.worktree = Some(Worktree {
+            git_dir: PathBuf::from("/home/dev/repo/.git/worktrees/w"),
+            common_dir: PathBuf::from("/home/dev/repo/.git"),
+        });
+        for (mut input, golden) in [
+            (inputs(&["claude", "--print"]), GOLDEN_ARGV_PLAIN),
+            (rich, GOLDEN_ARGV_RICH),
+        ] {
+            // Without the file: no descriptor, today's jail.
+            assert_eq!(
+                build_linux_jail(&input).unwrap().bwrap_args.join("\n"),
+                golden
+            );
+            // With it: the marker, just before the namespaces.
+            input.profiles_marker_fd = Some(launch::DRY_RUN_MARKER_FD);
+            let got = build_linux_jail(&input).unwrap().bwrap_args;
+            assert_eq!(
+                got.join("\n"),
+                golden.replacen(
+                    "\n--die-with-parent\n",
+                    &format!("\n{MARKER_MOUNT}--die-with-parent\n"),
+                    1
+                )
+            );
+            let marker = [
+                "--ro-bind-data".to_string(),
+                "12".to_string(),
+                crate::agent_profiles::SYSTEM_PROFILES_MARKER_PATH.to_string(),
+            ];
+            let at = got
+                .windows(3)
+                .position(|w| w == marker.as_slice())
+                .expect("the marker is mounted");
+            let run_tmpfs = got
+                .windows(2)
+                .position(|w| w[0] == "--tmpfs" && w[1] == "/run")
+                .unwrap();
+            assert!(run_tmpfs < at, "the marker lands on the /run tmpfs");
+            assert!(!got.iter().any(|a| a == "--bind-data"));
+            let terminator = got.iter().position(|a| a == "--").unwrap();
+            for option in got[at + 3..terminator]
+                .iter()
+                .filter(|a| a.starts_with("--"))
+            {
+                assert!(
+                    AFTER_THE_RECORD.contains(&option.as_str()),
+                    "{option} comes after the marker and may cover it"
+                );
+            }
+        }
+    }
+
+    fn entries(file: launch::HostEntry, dir_uid: u32) -> Vec<(PathBuf, launch::HostEntry)> {
+        chain([
+            found(0, 0o40755, true),
+            found(0, 0o40755, true),
+            found(dir_uid, 0o40755, true),
+            file,
+        ])
+    }
+
+    /// A plain launch checks the way to the system profiles file only where
+    /// the file is there, and marks the jail only then; an identified one
+    /// always checks it and never needs the marker (its record says the
+    /// same). Without the file a plain launch checks nothing, so a host
+    /// without one is today's.
+    ///
+    /// FAILS ON REVERT: let a plain launch skip the check where the file is
+    /// there, and a jail believes a file another account could have written.
+    #[test]
+    fn a_plain_launch_checks_the_way_to_the_profiles_only_where_the_file_is() {
+        use launch::{profiles_chain, HostEntry, ProfilesChain};
+        let file = found(0, 0o100644, false);
+        // A plain jail, no file: nothing, even under a folder of another's.
+        for dir_uid in [0, 1001] {
+            assert_eq!(
+                profiles_chain(false, &entries(HostEntry::Absent, dir_uid)),
+                ProfilesChain::NotAsked
+            );
+        }
+        // A plain jail, the file there: checked, and marked when proven.
+        let proven = profiles_chain(false, &entries(file, 0));
+        assert_eq!(proven, ProfilesChain::Proven { file: true });
+        assert!(proven.marks());
+        assert!(matches!(
+            profiles_chain(false, &entries(file, 1001)),
+            ProfilesChain::Refused(why) if why.starts_with("innerwarden contain: /etc/innerwarden is owned by uid 1001, not root, ")
+        ));
+        assert!(matches!(
+            profiles_chain(false, &entries(found(1001, 0o100644, false), 0)),
+            ProfilesChain::Refused(_)
+        ));
+        assert!(matches!(
+            profiles_chain(false, &entries(HostEntry::Unreadable, 0)),
+            ProfilesChain::Refused(_)
+        ));
+        // Identified: always checked; proven without the file marks nothing.
+        let identified = profiles_chain(true, &entries(HostEntry::Absent, 0));
+        assert_eq!(identified, ProfilesChain::Proven { file: false });
+        assert!(!identified.marks());
+        assert!(matches!(
+            profiles_chain(true, &entries(HostEntry::Absent, 1001)),
+            ProfilesChain::Refused(_)
+        ));
+        assert!(profiles_chain(true, &entries(file, 0)).marks());
     }
 
     /// A way to the system profiles file that is root's alone starts the

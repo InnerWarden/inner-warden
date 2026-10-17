@@ -225,6 +225,7 @@ const READ_THE_RECORD: &str = "readlink /proc/self/ns/pid; \
         && mv -f /run/innerwarden/other.json /run/innerwarden/instance.json 2>/dev/null; \
         then echo RECORD-REPLACED; fi; \
     if [ -e /run/innerwarden/agent-tls.spki ]; then echo KEY-HANDED-IN; fi; \
+    if [ -e /run/innerwarden/system-profiles-root ]; then echo PROFILES-MARKED; fi; \
     exit 0";
 
 #[cfg(target_os = "linux")]
@@ -320,10 +321,12 @@ fn identity_flag_mounts_the_record_read_only_inside_and_keeps_a_private_copy() {
     ] {
         assert!(!stdout.contains(tampered), "{tampered}: {stdout}");
     }
-    // A host with no key file hands no key in.
+    // A host with no key file hands no key in; an identified jail's record
+    // says what the plain jail's marker says, so it gets no marker.
     if !std::path::Path::new("/etc/innerwarden/agent-tls.spki").exists() {
         assert!(!stdout.contains("KEY-HANDED-IN"), "{stdout}");
     }
+    assert!(!stdout.contains("PROFILES-MARKED"), "{stdout}");
 
     let record: serde_json::Value = serde_json::from_slice(&outside).unwrap();
     // Schema 2 exactly when this host's bwrap takes the option (0.8 or later,
@@ -396,7 +399,8 @@ fn without_the_identity_flag_no_record_is_written_and_nothing_changes() {
             "--",
             "/bin/sh",
             "-c",
-            "readlink /proc/self/ns/pid",
+            "readlink /proc/self/ns/pid; \
+             if [ -e /run/innerwarden/system-profiles-root ]; then echo PROFILES-MARKED; fi",
         ])
         .env("HOME", home.path())
         .env_remove("XDG_STATE_HOME")
@@ -417,7 +421,19 @@ fn without_the_identity_flag_no_record_is_written_and_nothing_changes() {
         !home.path().join(".local/state/innerwarden").exists(),
         "flag off: no directory, no record"
     );
+    // The launcher's marker that the way to the system profiles file is
+    // root's: only where the host has that file.
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).contains("PROFILES-MARKED"),
+        std::path::Path::new(SYSTEM_PROFILES).exists(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
 }
+
+/// The host's system profiles file.
+#[cfg(target_os = "linux")]
+const SYSTEM_PROFILES: &str = "/etc/innerwarden/agent-profiles.toml";
 
 #[cfg(target_os = "linux")]
 #[test]
@@ -447,7 +463,15 @@ fn dry_run_shows_the_record_and_info_descriptors_only_with_the_identity_flag() {
     let plain = dry(false);
     let identified = dry(true);
     assert!(!plain.contains("--info-fd"), "{plain}");
-    assert!(!plain.contains("--ro-bind-data"), "{plain}");
+    assert!(
+        !plain
+            .replace(
+                " --ro-bind-data 12 /run/innerwarden/system-profiles-root",
+                ""
+            )
+            .contains("--ro-bind-data"),
+        "{plain}"
+    );
     assert!(!plain.contains("scope"), "{plain}");
     assert!(
         identified.contains(" --ro-bind-data 10 /run/innerwarden/instance.json --die-with-parent "),
@@ -462,6 +486,17 @@ fn dry_run_shows_the_record_and_info_descriptors_only_with_the_identity_flag() {
     // is no mount, and the plain run never has one.
     let key = " --ro-bind-data 11 /run/innerwarden/agent-tls.spki";
     assert!(!plain.contains("agent-tls.spki"), "{plain}");
+    // A plain jail gets the marker that the way to the system profiles file
+    // is root's only where the host has that file; an identified jail never
+    // does (its record says the same). Without the file both are today's.
+    let marker = " --ro-bind-data 12 /run/innerwarden/system-profiles-root";
+    assert_eq!(
+        plain.contains(marker),
+        std::path::Path::new(SYSTEM_PROFILES).exists(),
+        "{plain}"
+    );
+    assert!(!identified.contains("system-profiles-root"), "{identified}");
+    let plain = plain.replace(marker, "");
     if !std::path::Path::new("/etc/innerwarden/agent-tls.spki").exists() {
         assert!(!identified.contains("agent-tls.spki"), "{identified}");
     } else if identified.contains(key) {

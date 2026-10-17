@@ -170,13 +170,16 @@ fn owner_refusal(_metadata: &std::fs::Metadata, _owner: Owner) -> Option<String>
 
 /// Who root is where this process runs, read only for a system file uid 0
 /// does not own: the user namespace's map, the kernel's overflow uid, and
-/// whether the launcher's record is mounted at its place (an identified
-/// jail, whose launcher proved the system file's folders root's before it
-/// started it). Elsewhere than Linux: nothing, so only uid 0 is root.
+/// whether the jail's launcher proved the way to the system file root's (its
+/// launch record, or the marker a plain jail's launcher mounts, at its
+/// place). Elsewhere than Linux: nothing, so only uid 0 is root.
 #[cfg(unix)]
 fn root_view() -> crate::agent_profiles::RootView {
     #[cfg(target_os = "linux")]
     {
+        let mounted = |path: &str| {
+            std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_file())
+        };
         crate::agent_profiles::RootView {
             maps_root: std::fs::read_to_string("/proc/self/uid_map")
                 .ok()
@@ -184,10 +187,10 @@ fn root_view() -> crate::agent_profiles::RootView {
             overflow_uid: std::fs::read_to_string("/proc/sys/kernel/overflowuid")
                 .ok()
                 .and_then(|text| text.trim().parse::<u32>().ok()),
-            identified_jail: std::fs::symlink_metadata(
-                innerwarden_agent_guard::identity::JAIL_RECORD_PATH,
-            )
-            .is_ok_and(|meta| meta.file_type().is_file()),
+            launcher_proved: crate::agent_profiles::launcher_proved(
+                mounted(innerwarden_agent_guard::identity::JAIL_RECORD_PATH),
+                mounted(crate::agent_profiles::SYSTEM_PROFILES_MARKER_PATH),
+            ),
         }
     }
     #[cfg(not(target_os = "linux"))]

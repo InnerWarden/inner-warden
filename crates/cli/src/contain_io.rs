@@ -69,19 +69,23 @@ pub fn cmd(rest: &[String]) -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    // Before anything is installed or started: an identified jail reads the
-    // host's agent profiles through its own view of `/etc`, where the owners
-    // cannot be told apart, so the launcher proves here, with the real
-    // owners, that the way to that file is root's alone.
+    // Before anything is installed or started: a jail reads the host's agent
+    // profiles through its own view of `/etc`, where the owners cannot be
+    // told apart, so the launcher proves here, with the real owners, that the
+    // way to that file is root's alone: always for an identified jail, and
+    // for a plain one where the file exists. A plain jail on a host without
+    // the file checks nothing and is the jail it always was.
     #[cfg(target_os = "linux")]
-    if args.identity {
-        if let Some(why) =
-            crate::contain::launch::system_profiles_refusal(&system_profiles_entries())
-        {
-            eprintln!("{why}");
-            return ExitCode::from(2);
-        }
-    }
+    let marks =
+        match crate::contain::launch::profiles_chain(args.identity, &system_profiles_entries()) {
+            crate::contain::launch::ProfilesChain::Refused(why) => {
+                eprintln!("{why}");
+                return ExitCode::from(2);
+            }
+            chain => chain.marks(),
+        };
+    #[cfg(not(target_os = "linux"))]
+    let marks = false;
 
     // An identified launch takes its jail settings from the agent type's
     // profile, where a profiles file exists; a flag given here still wins.
@@ -158,7 +162,7 @@ pub fn cmd(rest: &[String]) -> ExitCode {
     }
 
     if cfg!(target_os = "linux") {
-        run_linux(&input)
+        run_linux(&input, marks)
     } else if cfg!(target_os = "macos") {
         run_macos(&input)
     } else {
@@ -297,6 +301,7 @@ fn resolve_inputs(args: ContainArgs, home: PathBuf, iw_binary: PathBuf) -> JailI
         info_fd: None,
         record_fd: None,
         key_fd: None,
+        profiles_marker_fd: None,
         records_dirs,
         child_env,
         close_userns: false,
@@ -527,9 +532,12 @@ fn sound_root_file<'a>(
     .then_some(file)
 }
 
-fn run_linux(input: &JailInputs) -> ExitCode {
+/// `marks`: the launcher proved the way to the system profiles file root's
+/// and the file is there, so a jail with no record gets the marker.
+fn run_linux(input: &JailInputs, marks: bool) -> ExitCode {
     // A dry run with `--identity` shows the arguments the real run adds.
     let dry_identity;
+    let dry_plain;
     // What a real run would do about user namespaces in the jail, asked of the
     // bwrap it would use: first whether the host's restriction stops the real
     // run before any jail (then that is what is said, and nothing is probed),
@@ -561,6 +569,13 @@ fn run_linux(input: &JailInputs) -> ExitCode {
             ..input.clone()
         };
         &dry_identity
+    } else if input.args.dry_run && marks {
+        // A plain jail shows the marker the real run hands in.
+        dry_plain = JailInputs {
+            profiles_marker_fd: Some(crate::contain::launch::DRY_RUN_MARKER_FD),
+            ..input.clone()
+        };
+        &dry_plain
     } else {
         input
     };
@@ -602,10 +617,53 @@ fn run_linux(input: &JailInputs) -> ExitCode {
     }
     #[cfg(target_os = "linux")]
     if input.args.identity {
-        return run_linux_identified(input, &bwrap);
+        return run_linux_identified(input, &bwrap, marks);
     }
     announce(input);
+    if marks {
+        return run_unrecorded(&bwrap, input, marks);
+    }
     run_plain(&bwrap, &plan)
+}
+
+/// A jail with no launch record, as it runs: with the marker that the way to
+/// the system profiles file was proven root's when `marks`. A marker that
+/// cannot be handed in is none: the jail's hook then reads the file as it did
+/// before.
+fn run_unrecorded(bwrap: &Path, input: &JailInputs, marks: bool) -> ExitCode {
+    #[cfg(target_os = "linux")]
+    let marker = marks.then(marker_pipe).flatten();
+    #[cfg(target_os = "linux")]
+    let input = &JailInputs {
+        profiles_marker_fd: marker.as_ref().map(std::os::fd::AsRawFd::as_raw_fd),
+        ..input.clone()
+    };
+    #[cfg(not(target_os = "linux"))]
+    let _ = marks;
+    let code = match build_linux_jail(input) {
+        Ok(plan) => run_plain(bwrap, &plan),
+        Err(e) => {
+            eprintln!("innerwarden contain: {e}");
+            ExitCode::from(2)
+        }
+    };
+    // Ours closes only once bwrap has read it.
+    #[cfg(target_os = "linux")]
+    drop(marker);
+    code
+}
+
+/// A pipe that holds the marker whole, its write end closed so bwrap reads
+/// it to its end, its read end handed to bwrap.
+#[cfg(target_os = "linux")]
+fn marker_pipe() -> Option<std::io::PipeReader> {
+    use std::io::Write;
+    let (reader, mut writer) = std::io::pipe().ok()?;
+    writer
+        .write_all(crate::agent_profiles::SYSTEM_PROFILES_MARKER)
+        .ok()?;
+    drop(writer);
+    hand_to_child(&reader).then_some(reader)
 }
 
 /// What to say, and stop on, when this kernel restricts unprivileged user
@@ -785,7 +843,7 @@ fn own_records_dir(dir: &Path, owner_uid: u32) -> std::io::Result<()> {
 /// with an empty record (unreadable inside, so `declared`): an instance with no
 /// record is an unidentified one, which is what every instance was before.
 #[cfg(target_os = "linux")]
-fn run_linux_identified(input: &JailInputs, bwrap: &Path) -> ExitCode {
+fn run_linux_identified(input: &JailInputs, bwrap: &Path, marks: bool) -> ExitCode {
     use crate::contain::launch::{no_scope_sentence, plan_scope, NoScope, ScopePlan};
     use innerwarden_agent_guard::identity::scope_unit_name;
 
@@ -800,13 +858,9 @@ fn run_linux_identified(input: &JailInputs, bwrap: &Path) -> ExitCode {
                 "innerwarden contain: no instance record written ({why}); the jail runs, unidentified"
             );
             announce(input);
-            return match build_linux_jail(input) {
-                Ok(plan) => run_plain(bwrap, &plan),
-                Err(e) => {
-                    eprintln!("innerwarden contain: {e}");
-                    ExitCode::from(2)
-                }
-            };
+            // No record to say the way to the system profiles file was
+            // proven: the marker says it.
+            return run_unrecorded(bwrap, input, marks);
         }
     };
     // The records directory exists before the jail does, so the jail hides a
