@@ -963,7 +963,9 @@ function readAgentDecisions(value: unknown): AgentDecisionLine[] | undefined {
         instanceId: id !== undefined && INSTANCE_ID.test(id) ? id : undefined,
         by,
         owner: plain(item.owner, 64),
-        rule: plain(item.rule, 120) ?? plain(rule?.value, 120),
+        // `{ kind, value }`, as the verbs write it and the CLI serves it
+        // (spec 104 5b.1); any other shape names no rule.
+        rule: rule !== undefined && (rule.kind === "category" || rule.kind === "mcp_tool") ? plain(rule.value, 120) : undefined,
         profileBefore: plain(item.profile_before, 80),
         profileAfter: plain(item.profile_after, 80),
         confined: count(item.confined_instances),

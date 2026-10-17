@@ -6,7 +6,10 @@
       "by": "dev",
       "instance_id": "9d2f41b800004000800000000000ab52",
       "result": "failure: not_confined",
-      "rule": "bare_ip_fetch",
+      "rule": {
+        "kind": "category",
+        "value": "bare_ip_fetch"
+      },
       "ts": "2026-09-29T12:00:00Z"
     },
     {

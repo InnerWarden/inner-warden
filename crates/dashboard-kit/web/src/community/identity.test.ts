@@ -219,9 +219,17 @@ describe("the CLI's identity fixtures read as written", () => {
   });
 
   it("reads the decisions and the changes the CLI serves", async () => {
-    const history = readHistory((await import("../../tests/fixtures/community/history-identity.json")).default);
+    const served = (await import("../../tests/fixtures/community/history-identity.json")).default;
+    const history = readHistory(served);
     expect(history.agentDecisions?.map((line) => line.action)).toEqual(["allow", "approve"]);
     expect(history.agentDecisions?.[0]?.rule).toBe("bare_ip_fetch");
+    // The rule is `{ kind, value }` on the wire; a bare string or an unknown
+    // kind names no rule.
+    const line = { ts: "2026-10-16T09:00:00Z", action: "agent_allow", agent: "claude-code", by: "dev", result: "success" };
+    const ruleOf = (rule: unknown) => readHistory({ ...served, agent_decisions: [{ ...line, rule }] }).agentDecisions?.[0]?.rule;
+    expect(ruleOf({ kind: "mcp_tool", value: "save" })).toBe("save");
+    expect(ruleOf("bare_ip_fetch")).toBeUndefined();
+    expect(ruleOf({ kind: "shell", value: "rm" })).toBeUndefined();
     const byId = (await import("../../tests/fixtures/community/decisions-identity-by-id.json")).default as Record<string, { item: { identity?: unknown } }>;
     const withheld = readDecisionIdentity(byId["cmd:contain:2"]?.item.identity);
     expect(withheld).toMatchObject({ trust: "observed", layer: "general", relaxationWithheld: true, profile: "claude-code" });

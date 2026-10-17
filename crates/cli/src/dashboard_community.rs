@@ -397,6 +397,9 @@ const AGENT_DECISION_ACTIONS: [&str; 4] = [
     "agent_revoke",
 ];
 
+/// The kinds a `guard.agent_decision` rule may name.
+const AGENT_RULE_KINDS: [&str; 2] = ["category", "mcp_tool"];
+
 /// One `guard.agent_decision` line as the history serves it, or `None` for
 /// one that does not have the shape the verbs write. Every string is one
 /// line, bounded, with any hidden character shown; the instance id is kept
@@ -429,16 +432,22 @@ fn agent_decision_line(record: &Map<String, Value>, ts: u64) -> Option<Value> {
         object.insert("instance_id".into(), json!(id));
     }
     opt(&mut object, "owner", text("owner", 64));
-    let rule = match record.get("rule") {
-        Some(Value::String(_)) => text("rule", 120),
-        Some(Value::Object(rule)) => rule
-            .get("value")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(|value| one_line(&revealed(value), 120)),
-        _ => None,
-    };
+    // The verbs write `rule` as `{kind, value}` (spec 104 5b.1, the same
+    // shape as the Enterprise offer and the allow request), and it is served
+    // in that shape: a kind outside the two, a value that is empty, or any
+    // other shape is not the line the verbs write, and no rule is served.
+    let rule = record
+        .get("rule")
+        .and_then(Value::as_object)
+        .and_then(|rule| {
+            let kind = rule
+                .get("kind")
+                .and_then(Value::as_str)
+                .filter(|kind| AGENT_RULE_KINDS.contains(kind))?;
+            let value = rule.get("value")?.as_str()?.trim();
+            (!value.is_empty())
+                .then(|| json!({ "kind": kind, "value": one_line(&revealed(value), 120) }))
+        });
     opt(&mut object, "rule", rule);
     opt(&mut object, "profile_before", text("profile_before", 80));
     opt(&mut object, "profile_after", text("profile_after", 80));
@@ -2036,7 +2045,10 @@ mod tests {
         );
         assert_eq!(served[1]["ts"], "2026-09-21T14:15:00Z");
         assert_eq!(served[1]["instance_id"], id);
-        assert_eq!(served[1]["rule"], "bare_ip_fetch");
+        assert_eq!(
+            served[1]["rule"],
+            json!({"kind": "category", "value": "bare_ip_fetch"})
+        );
         assert_eq!(served[1]["result"], "failure: not_confined");
         assert_eq!(served[2]["owner"], "maria");
         assert_eq!(served[2]["confined_instances"], 1);
@@ -2055,6 +2067,81 @@ mod tests {
             capped["agent_decisions"][0]["ts"],
             rfc3339((1_790_000_000 + 59) * 1_000)
         );
+    }
+
+    /// The `rule` of a `guard.agent_decision` line has one shape, written
+    /// and served: `{kind, value}` with kind `category` or `mcp_tool` (spec
+    /// 104 5b.1). What the `allow` verb writes is what the history serves,
+    /// and a rule in any other shape (a bare string, an unknown kind, an
+    /// empty value) is not served at all.
+    ///
+    /// FAILS ON REVERT: serve `rule.value` as a string again and the served
+    /// rule is not the object the verb wrote.
+    #[test]
+    fn the_rule_the_allow_verb_writes_is_the_rule_the_history_serves() {
+        use crate::agent_decisions::{audit_line, parse};
+        let id = "3f9a0c1e5b7d42a8c6e1f0b2d4a69c87";
+        let mut lines = Vec::new();
+        for (n, args) in [
+            vec![
+                "allow",
+                "claude-code",
+                "--category",
+                "bare_ip_fetch",
+                "--instance",
+                id,
+            ],
+            vec!["allow", "claude-code", "--mcp-tool", "save"],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let args: Vec<String> = args.into_iter().map(str::to_string).collect();
+            let request = parse(&args).expect("an allow request");
+            let line = audit_line(
+                1_790_000_000 + n as u64,
+                &request,
+                "dev",
+                None,
+                "failure: not_confined",
+                None,
+            );
+            lines.push(line);
+        }
+        let written: Vec<Value> = lines.iter().map(|line| line["rule"].clone()).collect();
+        assert_eq!(
+            written,
+            [
+                json!({"kind": "category", "value": "bare_ip_fetch"}),
+                json!({"kind": "mcp_tool", "value": "save"}),
+            ]
+        );
+        for bad in [
+            json!("bare_ip_fetch"),
+            json!({"kind": "shell", "value": "rm"}),
+            json!({"kind": "category", "value": "  "}),
+            json!({"kind": "category"}),
+            json!(["category", "bare_ip_fetch"]),
+        ] {
+            lines.push(json!({"kind": "guard.agent_decision", "ts": 1_789_000_000u64, "action": "agent_allow", "agent": "claude-code", "by": "dev", "rule": bad, "result": "success"}));
+        }
+        let text = lines
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let history = history_json(&parse_event_log(&text), NOW);
+        let served = history["agent_decisions"].as_array().unwrap();
+        assert_eq!(served.len(), 7, "{served:?}");
+        let served_rules: Vec<Value> = served[..2]
+            .iter()
+            .rev()
+            .map(|line| line["rule"].clone())
+            .collect();
+        assert_eq!(served_rules, written, "written and served agree");
+        for line in &served[2..] {
+            assert!(line.get("rule").is_none(), "{line}");
+        }
     }
 
     /// A decision serves its identity in the wire words, never above what
