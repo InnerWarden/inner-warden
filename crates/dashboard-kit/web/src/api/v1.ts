@@ -52,7 +52,7 @@ export type SecurityOutcome =
   | "reverted"
   | "not_observed"
   | "unknown";
-export type IdentityConfidence = "host_verified" | "configured" | "declared" | "conflicting" | "unattributed";
+export type IdentityConfidence = "host_verified" | "observed" | "configured" | "declared" | "conflicting" | "unattributed";
 export type SourceKind =
   | "runtime_probe"
   | "sqlite"

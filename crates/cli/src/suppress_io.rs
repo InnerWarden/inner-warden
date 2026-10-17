@@ -153,7 +153,7 @@ const AGENT_SHELL_MARKERS: &[&str] = &[
 ];
 
 /// Whether this process runs in an AI agent's shell, by its markers.
-fn in_agent_shell() -> bool {
+pub(crate) fn in_agent_shell() -> bool {
     AGENT_SHELL_MARKERS
         .iter()
         .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()))

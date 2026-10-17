@@ -11,6 +11,7 @@ export const OFFER_KEYS = {
   server: "iw-community-offer-v1:server",
   case: "iw-community-offer-v1:case",
   protection: "iw-community-offer-v1:protection",
+  agents: "iw-community-offer-v1:agents",
 } as const;
 
 export type OfferSlot = keyof typeof OFFER_KEYS;

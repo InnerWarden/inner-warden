@@ -2,13 +2,27 @@ import { getJson } from "../api";
 import { hasControlCharacters } from "../presentation";
 import {
   asChannel,
+  asDecisionAction,
+  asLaunchMode,
+  asLayer,
+  asLifecycle,
   asPlatform,
+  asVerdict,
+  effectiveTrust,
   isDecisionOutcome,
   isMessageOutcome,
+  TRUSTS,
+  worseTrust,
+  type AgentDecisionAction,
   type Channel,
   type DecisionOutcomeKey,
+  type LaunchMode,
+  type Layer,
+  type Lifecycle,
   type MessageOutcomeKey,
   type PlatformOs,
+  type Trust,
+  type Verdict,
 } from "./words";
 
 /**
@@ -140,6 +154,8 @@ export type Decision = {
   did: string;
   next: NextStep[];
   allowedByYou: boolean;
+  /** Which instance asked and which layer decided; absent where the record holds none. */
+  identity?: DecisionIdentity;
 };
 
 export type SessionFacts = {
@@ -270,6 +286,7 @@ export function readDecision(value: unknown): Decision | undefined {
     did,
     next: readNext(item.next),
     allowedByYou: bool(item.allowed_by_you) ?? false,
+    identity: readDecisionIdentity(item.identity),
   });
 }
 
@@ -458,6 +475,8 @@ export type History = {
   refusals: { blocked: number; wouldBlock: number; weeks: RefusalWeek[] };
   messages: { recorded: number; last7d: number; latest?: { at: string; detail: string } };
   suppressionChanges: number;
+  /** What people decided about agents, most recent first; absent where the log holds none. */
+  agentDecisions?: AgentDecisionLine[];
 };
 
 export function readHistory(value: unknown): History {
@@ -494,6 +513,7 @@ export function readHistory(value: unknown): History {
       latest: latestAt !== undefined && latestDetail !== undefined ? { at: latestAt, detail: latestDetail } : undefined,
     }),
     suppressionChanges: count(body.suppression_changes) ?? 0,
+    agentDecisions: readAgentDecisions(body.agent_decisions),
   });
 }
 
@@ -662,6 +682,17 @@ export function readUnnamedByChannel(value: unknown): { hook?: string; mcp?: str
   return item === undefined ? undefined : defined({ hook: time(item.hook), mcp: time(item.mcp) });
 }
 
+/**
+ * The CLI's sentence about a profiles file that is there and cannot be used
+ * (`profiles_file`), or `undefined` when there is none, which is every
+ * payload of a host without one.
+ */
+export function readProfilesFile(value: unknown): { sentence: string } | undefined {
+  const item = record(record(value)?.profiles_file);
+  const sentence = plain(item?.sentence, 1_024);
+  return item?.state === "invalid" && sentence !== undefined ? { sentence } : undefined;
+}
+
 /** The one command the CLI says fixes an agent, printed as sent. */
 export type AgentNextStep = { label: string; command: string; line: string };
 
@@ -671,6 +702,278 @@ export function readAgentNextStep(value: unknown): AgentNextStep | undefined {
   const command = plain(item?.command, 200);
   const line = plain(item?.line, 300);
   return label === undefined || command === undefined || line === undefined ? undefined : { label, command, line };
+}
+
+// ---------------------------------------------------------------------------
+// Agent identity, as the CLI sends it (only where it exists)
+// ---------------------------------------------------------------------------
+
+const INSTANCE_ID = /^[0-9a-f]{32}$/;
+/** Most instances one agent row lists; the CLI counts the rest in `more_instances`. */
+export const MAX_INSTANCES = 20;
+const MAX_SESSIONS = 5;
+const MAX_AGENT_DECISIONS = 50;
+
+export type AgentProfile = {
+  /** `undefined` is the general rules. */
+  name?: string;
+  label: string;
+  source?: "builtin" | "system" | "user";
+  confined: number;
+  other: number;
+  appliesFrom: "now" | "next_start";
+};
+
+export type InstanceSession = { session: string; firstAt?: string; lastAt?: string; caseId?: string };
+
+export type LocalInstance = {
+  instanceId: string;
+  trust: Trust;
+  trustReason: string;
+  user?: string;
+  uid?: number;
+  project?: string;
+  mode?: LaunchMode;
+  startedAt?: string;
+  lastActivityAt?: string;
+  /** `false` is "ended"; absent is "not said", never "ended". */
+  live?: boolean;
+  sessions: InstanceSession[];
+  technical: {
+    jailPid?: number;
+    jailStartTicks?: number;
+    pidNs?: number;
+    scopeUnit?: string;
+    launcherPath?: string;
+    launcherRootOwned?: boolean;
+  };
+};
+
+/**
+ * What the CLI says about who an agent is and what was decided about it. Every
+ * field is optional: a CLI without the identity flag sends none of them, and
+ * `readAgentIdentity` then returns `undefined`, so the row is what it was.
+ */
+export type AgentIdentity = {
+  trust?: Trust;
+  trustReason?: string;
+  lifecycle?: Lifecycle;
+  lifecycleBy?: string;
+  lifecycleAt?: string;
+  owner?: string;
+  profile?: AgentProfile;
+  confine?: AgentNextStep;
+  decisionSteps: AgentNextStep[];
+  instances: LocalInstance[];
+  moreInstances: number;
+};
+
+function readTrust(value: unknown): Trust | undefined {
+  return typeof value === "string" && (TRUSTS as readonly string[]).includes(value) ? (value as Trust) : undefined;
+}
+
+function readProfile(value: unknown): AgentProfile | undefined {
+  const item = record(value);
+  const label = plain(item?.label, 80);
+  if (item === undefined || label === undefined) return undefined;
+  const source: AgentProfile["source"] = item.source === "builtin" || item.source === "system" || item.source === "user" ? item.source : undefined;
+  return defined({
+    name: plain(item.name, 64),
+    label,
+    source,
+    confined: count(item.confined_instances) ?? 0,
+    other: count(item.other_instances) ?? 0,
+    appliesFrom: item.applies_from === "next_start" ? ("next_start" as const) : ("now" as const),
+  });
+}
+
+function readInstance(value: unknown): LocalInstance | undefined {
+  const item = record(value);
+  const id = plain(item?.instance_id, 64);
+  if (item === undefined || id === undefined || !INSTANCE_ID.test(id)) return undefined;
+  const reason = plain(item.trust_reason, 64) ?? "";
+  // The reason is the ceiling: a trust above what it supports is never shown,
+  // and an instance whose label names another source is not a jail's word.
+  const claimed = item.trust_source === undefined || item.trust_source === "jail" ? (readTrust(item.trust) ?? "declared") : "declared";
+  const sessions = Array.isArray(item.sessions)
+    ? item.sessions.slice(0, MAX_SESSIONS).flatMap((entry): InstanceSession[] => {
+        const session = record(entry);
+        const label = plain(session?.session, 64);
+        return session === undefined || label === undefined
+          ? []
+          : [defined({ session: label, firstAt: time(session.first_at), lastAt: time(session.last_at), caseId: plain(session.case_id, 256) })];
+      })
+    : [];
+  const technical = record(item.technical);
+  return defined({
+    instanceId: id,
+    trust: effectiveTrust(claimed, reason),
+    trustReason: reason,
+    user: plain(item.user, 64),
+    uid: count(item.uid),
+    project: plain(item.project, 120),
+    mode: asLaunchMode(item.mode),
+    startedAt: time(item.started_at),
+    lastActivityAt: time(item.last_activity_at),
+    live: bool(item.live),
+    sessions,
+    technical: defined({
+      jailPid: count(technical?.jail_pid),
+      jailStartTicks: count(technical?.jail_start_ticks),
+      pidNs: count(technical?.pid_ns),
+      scopeUnit: plain(technical?.scope_unit, 200),
+      launcherPath: plain(technical?.launcher_path, 300),
+      launcherRootOwned: bool(technical?.launcher_root_owned),
+    }),
+  });
+}
+
+/** Worst trust of the live instances, or of all of them where none says it is live. */
+export function worstTrust(instances: readonly LocalInstance[]): Trust | undefined {
+  const live = instances.filter((instance) => instance.live !== false);
+  const pool = live.length > 0 ? live : instances;
+  return pool.length === 0 ? undefined : pool.map((instance) => instance.trust).reduce(worseTrust);
+}
+
+/**
+ * The identity fields of one `guard/agents` row, or `undefined` when the row
+ * carries none of them (which is the whole payload of a CLI without them).
+ */
+export function readAgentIdentity(agent: unknown): AgentIdentity | undefined {
+  const item = record(agent);
+  if (item === undefined) return undefined;
+  const instances = Array.isArray(item.instances)
+    ? item.instances.slice(0, MAX_INSTANCES).flatMap((entry) => {
+        const read = readInstance(entry);
+        return read === undefined ? [] : [read];
+      })
+    : [];
+  const lifecycle = asLifecycle(item.lifecycle);
+  const profile = readProfile(item.profile);
+  const confine = readAgentNextStep(item.confine_step);
+  const decisionSteps = Array.isArray(item.decision_steps)
+    ? item.decision_steps.flatMap((step) => {
+        const read = readAgentNextStep(step);
+        return read === undefined ? [] : [read];
+      })
+    : [];
+  const claimed = readTrust(item.trust);
+  const reason = plain(item.trust_reason, 64);
+  if (
+    lifecycle === undefined
+    && profile === undefined
+    && confine === undefined
+    && decisionSteps.length === 0
+    && instances.length === 0
+    && claimed === undefined
+  ) {
+    return undefined;
+  }
+  // The row's trust is its own label when it sent one, never above what its
+  // reason supports and never above its worst live instance; the reason shown
+  // is the one that belongs to the trust shown.
+  const own = claimed === undefined ? undefined : effectiveTrust(claimed, reason ?? "");
+  const worst = worstTrust(instances);
+  let trust = own;
+  let trustReason = own === undefined ? undefined : (reason ?? "");
+  if (worst !== undefined && (own === undefined || TRUSTS.indexOf(worst) < TRUSTS.indexOf(own))) {
+    trust = worst;
+    trustReason = instances.find((instance) => instance.trust === worst && instance.live !== false)?.trustReason
+      ?? instances.find((instance) => instance.trust === worst)?.trustReason;
+  }
+  return defined({
+    trust,
+    trustReason,
+    lifecycle,
+    lifecycleBy: plain(item.lifecycle_by, 64),
+    lifecycleAt: time(item.lifecycle_at),
+    owner: plain(item.owner, 64),
+    profile,
+    confine,
+    decisionSteps,
+    instances,
+    moreInstances: count(item.more_instances) ?? 0,
+  });
+}
+
+/** Which instance asked, and which layer decided (`guard/decision`'s `identity`). */
+export type DecisionIdentity = {
+  instanceId?: string;
+  sessionId?: string;
+  trust: Trust;
+  trustReason: string;
+  layer?: Layer;
+  profile?: string;
+  relaxationWithheld: boolean;
+};
+
+export function readDecisionIdentity(value: unknown): DecisionIdentity | undefined {
+  const item = record(value);
+  if (item === undefined) return undefined;
+  const reason = plain(item.trust_reason, 64) ?? "";
+  const id = plain(item.instance_id, 64);
+  return defined({
+    instanceId: id !== undefined && INSTANCE_ID.test(id) ? id : undefined,
+    sessionId: plain(item.session_id, 256),
+    trust: effectiveTrust(readTrust(item.trust) ?? "declared", reason),
+    trustReason: reason,
+    layer: asLayer(item.deciding_layer),
+    profile: plain(item.profile, 64),
+    relaxationWithheld: item.relaxation_withheld === true,
+  });
+}
+
+/** The verdict a decision's recommendation names, for the layer's words. */
+export function decisionVerdict(recommendation: string): Verdict | undefined {
+  return asVerdict(recommendation);
+}
+
+/** One line of what people decided about agents (`guard.agent_decision`). */
+export type AgentDecisionLine = {
+  at: string;
+  action: AgentDecisionAction;
+  agent: string;
+  instanceId?: string;
+  by: string;
+  owner?: string;
+  rule?: string;
+  profileBefore?: string;
+  profileAfter?: string;
+  confined?: number;
+  result: string;
+};
+
+function readAgentDecisions(value: unknown): AgentDecisionLine[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const lines = value.slice(0, MAX_AGENT_DECISIONS).flatMap((entry): AgentDecisionLine[] => {
+    const item = record(entry);
+    const at = time(item?.ts);
+    const action = asDecisionAction(typeof item?.action === "string" ? item.action.replace(/^agent_/, "") : undefined);
+    const agent = plain(item?.agent, 64);
+    const by = plain(item?.by, 64);
+    const result = plain(item?.result, 120);
+    if (item === undefined || at === undefined || action === undefined || agent === undefined || by === undefined || result === undefined) return [];
+    const rule = record(item.rule);
+    const id = plain(item.instance_id, 64);
+    return [
+      defined({
+        at,
+        action,
+        agent,
+        instanceId: id !== undefined && INSTANCE_ID.test(id) ? id : undefined,
+        by,
+        owner: plain(item.owner, 64),
+        // `{ kind, value }`, as the verbs write it and the CLI serves it
+        // (spec 104 5b.1); any other shape names no rule.
+        rule: rule !== undefined && (rule.kind === "category" || rule.kind === "mcp_tool") ? plain(rule.value, 120) : undefined,
+        profileBefore: plain(item.profile_before, 80),
+        profileAfter: plain(item.profile_after, 80),
+        confined: count(item.confined_instances),
+        result,
+      }),
+    ];
+  });
+  return lines.length === 0 ? undefined : lines;
 }
 
 /** A lane card's own command, sent beside a `no_source` lane. */

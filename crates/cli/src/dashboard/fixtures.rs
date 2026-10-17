@@ -75,24 +75,28 @@ fn origin_for(session: &str, rules: &[&'static str]) -> DecisionOrigin {
             agent: Some("claude-code".into()),
             project: Some("my-app".into()),
             rules,
+            ..DecisionOrigin::default()
         },
         S_INFRA => DecisionOrigin {
             channel: Some(DecisionChannel::Hook),
             agent: Some("claude-code".into()),
             project: Some("infra".into()),
             rules,
+            ..DecisionOrigin::default()
         },
         S_MCP => DecisionOrigin {
             channel: Some(DecisionChannel::Mcp),
             agent: Some("cursor".into()),
             project: None,
             rules,
+            ..DecisionOrigin::default()
         },
         _ => DecisionOrigin {
             channel: Some(DecisionChannel::Check),
             agent: None,
             project: None,
             rules,
+            ..DecisionOrigin::default()
         },
     }
 }
@@ -409,6 +413,17 @@ fn agents() -> Value {
             auto_connect_eligible: Some(false),
             next_step: next,
             identity_step: None,
+            lifecycle: None,
+            profile: None,
+            decision_steps: None,
+            lifecycle_by: None,
+            lifecycle_at: None,
+            owner: None,
+            trust: None,
+            trust_reason: None,
+            confine_step: None,
+            instances: None,
+            more_instances: None,
         };
     let payload = AgentsPayload {
         schema_version: AGENTS_SCHEMA_VERSION,
@@ -438,6 +453,7 @@ fn agents() -> Value {
             agent("cursor", "enforce", "mcp_proxy", None),
             agent("gemini", "enforce", "mcp_proxy", None),
         ],
+        profiles_file: None,
     };
     serde_json::to_value(payload).expect("agents fixture")
 }
@@ -603,6 +619,341 @@ pub(super) fn fixtures() -> Vec<(&'static str, Value)> {
             .expect("agents fixture"),
         ),
         ("token-intelligence.json", tokens()),
+    ]
+    .into_iter()
+    .chain(identity_fixtures())
+    .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Agent identity: the same screens with a profiles file and a launcher's
+// records. The kit's fixture server serves these instead of the plain files
+// when the request carries the cookie `iw-fixture=identity`.
+// ---------------------------------------------------------------------------
+
+/// The instances of the identity fixture: a confined one, one whose launcher
+/// the user could replace, one that ended yesterday, and a Codex jail whose
+/// hook has not reported yet.
+const I_CONFINED: &str = "5c1e0a7700004000800000000000c0f1";
+const I_OBSERVED: &str = "9d2f41b800004000800000000000ab52";
+const I_ENDED: &str = "17a3c9e000004000800000000000e4d0";
+const I_CODEX: &str = "2b8e6f1100004000800000000000c0de";
+const S_CONFINED: &str = "5c1e0a77-demo-4000-8000-00000000000a";
+const S_OBSERVED: &str = "9d2f41b8-demo-4000-8000-00000000000b";
+const S_ENDED: &str = "17a3c9e0-demo-4000-8000-00000000000c";
+
+fn identity_record_json(
+    id: &str,
+    agent: &str,
+    launcher: &str,
+    root_owned: bool,
+    started: &str,
+    pid: u32,
+) -> crate::dashboard_identity::InstanceFacts {
+    let record = innerwarden_agent_guard::identity::parse_launch_record(
+        format!(
+            r#"{{"schema":1,"instance_id":"{id}","agent_type":"{agent}","launcher":{{"path":"{launcher}","version":"1.6.0","root_owned":{root_owned}}},"uid":1000,"project":"my-app","mode":"enforce","started_at":"{started}","jail":{{"backend":"bwrap","pid":{pid},"start_ticks":{ticks},"pid_ns":{ns},"mnt_ns":{mnt}}},"scope":{{"user":{{"unit":"innerwarden-contain-{id}.scope","cgroup_path":"/user.slice/user-1000.slice/user@1000.service/app.slice/innerwarden-contain-{id}.scope"}}}}}}"#,
+            ticks = 1_000_000 + u64::from(pid),
+            ns = 4_026_532_000u64 + u64::from(pid),
+            mnt = 4_026_531_000u64 + u64::from(pid),
+        )
+        .as_bytes(),
+    )
+    .expect("identity fixture record");
+    crate::dashboard_identity::InstanceFacts {
+        record,
+        live: false,
+        judged: None,
+        user: Some("dev".into()),
+        project_dir: None,
+    }
+}
+
+/// What the dashboard read for the identity fixture, with the record's
+/// labels added.
+fn identity_facts(graph: &Graph) -> crate::agent_decisions::DashboardFacts {
+    use innerwarden_agent_guard::identity::{Reason, Trust};
+    let system = innerwarden_agent_guard::profiles::parse(
+        b"schema_version = 1\n[profile.claude-code]\nallow_categories = [\"bare_ip_fetch\"]\n[agent.claude-code]\nlifecycle = \"approved\"\nowner = \"maria\"\napproved_by = \"dev\"\napproved_at = \"2026-09-29T09:00:00Z\"\n",
+    )
+    .expect("identity fixture profiles");
+    let profiles = innerwarden_agent_guard::profiles::merge(Some(&system), None);
+    let root = "/usr/local/bin/innerwarden";
+    let mut confined = identity_record_json(
+        I_CONFINED,
+        "claude-code",
+        root,
+        true,
+        "2026-09-29T13:00:00Z",
+        2778,
+    );
+    confined.live = true;
+    confined.judged = Some((Trust::Observed, Reason::ConfinedByNamespace));
+    let mut observed = identity_record_json(
+        I_OBSERVED,
+        "claude-code",
+        "/home/dev/.local/bin/innerwarden",
+        false,
+        "2026-09-29T13:30:00Z",
+        3104,
+    );
+    observed.live = true;
+    observed.judged = Some((Trust::Observed, Reason::LauncherNotTrusted));
+    let ended = identity_record_json(
+        I_ENDED,
+        "claude-code",
+        root,
+        true,
+        "2026-09-28T10:00:00Z",
+        1980,
+    );
+    let mut codex =
+        identity_record_json(I_CODEX, "codex", root, true, "2026-09-29T14:00:00Z", 4410);
+    codex.live = true;
+    codex.judged = Some((Trust::Observed, Reason::ConfinedByNamespace));
+    let records = vec![confined, observed, ended, codex];
+    let instances = records
+        .iter()
+        .map(|facts| crate::agent_decisions::LocalInstance {
+            instance_id: facts.record.instance_id.clone(),
+            agent_type: facts.record.agent_type.clone(),
+            live: facts.live,
+            trust: facts.judged.map_or(Trust::Declared, |(trust, _)| trust),
+        })
+        .collect();
+    crate::agent_decisions::DashboardFacts {
+        profiles,
+        instances,
+        records,
+        activity: graph.instance_activity(crate::dashboard_identity::MAX_SESSIONS),
+        profiles_problem: None,
+    }
+}
+
+/// One labelled decision of the identity fixture: session, instance, trust,
+/// reason, command, recommendation, deciding layer, relaxation withheld,
+/// outcome, and how long before `NOW`.
+type IdentityRow = (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    Option<&'static str>,
+    bool,
+    DecisionOutcome,
+    u64,
+);
+
+/// The decisions the hooks in those jails recorded, with their labels.
+fn identity_record() -> Graph {
+    let mut graph = Graph::new();
+    let rows: [IdentityRow; 5] = [
+        (
+            S_CONFINED,
+            I_CONFINED,
+            "observed",
+            "confined_by_namespace",
+            "npm test",
+            "allow",
+            Some("general"),
+            false,
+            DecisionOutcome::Allowed,
+            40 * MINUTE,
+        ),
+        (
+            S_CONFINED,
+            I_CONFINED,
+            "observed",
+            "confined_by_namespace",
+            "curl http://203.0.113.9/health",
+            "allow",
+            Some("agent_type"),
+            false,
+            DecisionOutcome::Allowed,
+            35 * MINUTE,
+        ),
+        (
+            S_OBSERVED,
+            I_OBSERVED,
+            "observed",
+            "launcher_not_trusted",
+            "curl http://203.0.113.9/health",
+            "review",
+            Some("general"),
+            true,
+            DecisionOutcome::Blocked,
+            20 * MINUTE,
+        ),
+        (
+            S_OBSERVED,
+            I_OBSERVED,
+            "observed",
+            "launcher_not_trusted",
+            "git status",
+            "allow",
+            Some("general"),
+            false,
+            DecisionOutcome::Allowed,
+            12 * MINUTE,
+        ),
+        // A label in the agent-writable graph that says more than a reading
+        // from inside the jail can: served capped, at `observed`.
+        (
+            S_ENDED,
+            I_ENDED,
+            "confined",
+            "confined_by_namespace",
+            "cargo build",
+            "allow",
+            Some("general"),
+            false,
+            DecisionOutcome::Allowed,
+            DAY,
+        ),
+    ];
+    for (
+        seq,
+        (session, instance, trust, reason, command, recommendation, layer, withheld, outcome, ago),
+    ) in rows.into_iter().enumerate()
+    {
+        let explanation = if recommendation == "allow" {
+            "no rule matched"
+        } else {
+            "fetch from a bare IP"
+        };
+        let rules: Vec<String> = if recommendation == "allow" {
+            Vec::new()
+        } else {
+            vec!["bare_ip_fetch".into()]
+        };
+        graph.ingest_verdict_with_origin(
+            "contain",
+            seq,
+            command,
+            &json!({"recommendation": recommendation, "explanation": explanation}),
+            innerwarden_graph::DecisionContext {
+                mode: DecisionMode::Enforce,
+                outcome,
+                recorded_at_ms: Some(NOW - ago),
+            },
+            &DecisionOrigin {
+                channel: Some(DecisionChannel::Hook),
+                agent: Some("claude-code".into()),
+                project: Some("my-app".into()),
+                rules,
+                instance_id: Some(instance.into()),
+                session_id: Some(session.into()),
+                trust: Some(trust.into()),
+                trust_reason: Some(reason.into()),
+                deciding_layer: layer.map(str::to_string),
+                profile: Some("claude-code".into()),
+                relaxation_withheld: withheld,
+            },
+        );
+    }
+    graph
+}
+
+/// The plain event log, with what people decided about the agents.
+fn identity_event_log_text() -> String {
+    let decisions = [
+        json!({"kind": "guard.agent_decision", "ts": 1_790_672_400u64, "action": "agent_approve", "agent": "claude-code", "by": "dev", "file": "system", "owner": "maria", "profile": "claude-code", "scope": "agent_type", "profile_before": "General rules", "profile_after": "claude-code", "confined_instances": 1, "other_instances": 1, "result": "success", "session": "local"}),
+        json!({"kind": "guard.agent_decision", "ts": 1_790_683_200u64, "action": "agent_allow", "agent": "claude-code", "by": "dev", "file": "system", "instance_id": I_OBSERVED, "rule": {"kind": "category", "value": "bare_ip_fetch"}, "result": "failure: not_confined", "session": "local"}),
+    ];
+    let mut text = event_log_text();
+    for line in decisions {
+        text.push('\n');
+        text.push_str(&line.to_string());
+    }
+    text
+}
+
+/// The identity fixtures, by file name.
+fn identity_fixtures() -> Vec<(&'static str, Value)> {
+    let graph = identity_record();
+    let facts = identity_facts(&graph);
+    let mut rows: Vec<AgentView> = ["claude-code", "codex", "cursor"]
+        .into_iter()
+        .map(|id| AgentView {
+            id: id.into(),
+            display_name: display_agent_name(id),
+            installed: true,
+            running: None,
+            detected_by: vec!["executable_on_path", "configuration_file"],
+            guardrail: AgentGuardrailView {
+                mode: "enforce".into(),
+                mechanism: Some(if id == "claude-code" {
+                    "pretooluse_hook"
+                } else {
+                    "mcp_proxy"
+                }),
+                setup_support: "automatic",
+            },
+            auto_connect_eligible: Some(false),
+            next_step: None,
+            identity_step: None,
+            lifecycle: None,
+            profile: None,
+            decision_steps: None,
+            lifecycle_by: None,
+            lifecycle_at: None,
+            owner: None,
+            trust: None,
+            trust_reason: None,
+            confine_step: None,
+            instances: None,
+            more_instances: None,
+        })
+        .collect();
+    for row in &mut rows {
+        with_identity(row, &facts, true);
+    }
+    let identity_agents = AgentsPayload {
+        schema_version: AGENTS_SCHEMA_VERSION,
+        generated_at_ms: NOW,
+        availability: "available",
+        discovery_limited: false,
+        auto_connect: AutoConnectView {
+            status: "available",
+            enabled: Some(true),
+            mode: Some("monitor"),
+            refresh_interval_secs: crate::agent_policy::RECONCILE_INTERVAL_SECS,
+            watcher: crate::agent_policy::DashboardReconcilerStatus::unavailable(),
+        },
+        agents: rows,
+        profiles_file: None,
+    };
+    let agents_json = serde_json::to_string(&identity_agents).expect("identity agents");
+    let mut by_id = serde_json::Map::new();
+    let page = graph.decisions_page(&DecisionQuery {
+        flagged_only: false,
+        limit: innerwarden_graph::MAX_DECISIONS_PAGE,
+        ..DecisionQuery::default()
+    });
+    for item in &page.items {
+        if let Some(detail) = graph.decision(&item.id) {
+            by_id.insert(
+                item.id.clone(),
+                community::decision_json(&detail, &suppress()),
+            );
+        }
+    }
+    let log = community::parse_event_log(&identity_event_log_text());
+    vec![
+        (
+            "agents-identity.json",
+            serde_json::from_str(&community::agents_with_last_screened(
+                &agents_json,
+                &graph.agents_last_seen(),
+                &graph.channels_last_seen(),
+                &graph.unnamed_channels_last_seen(),
+            ))
+            .expect("identity agents fixture"),
+        ),
+        ("decisions-identity-by-id.json", Value::Object(by_id)),
+        ("history-identity.json", community::history_json(&log, NOW)),
     ]
 }
 

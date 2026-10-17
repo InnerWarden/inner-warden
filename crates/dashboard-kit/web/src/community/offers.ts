@@ -108,6 +108,20 @@ export function messageOffer(os: PlatformOs, outcomeKey: MessageOutcomeKey = "de
   };
 }
 
+/**
+ * The Agents page's one offer, shown only where a contained agent is on the
+ * page. It names the capability and claims nothing about this machine.
+ */
+export function agentsOffer(): Offer {
+  return {
+    slot: "agents",
+    key: "agent_kernel",
+    body: "Contained agents are checked by the kernel with Active Defence.",
+    action: "See Active Defence",
+    href: PRICING_URL,
+  };
+}
+
 /** The foot of Protection's "Not in Community". */
 export function protectionOffer(): Offer {
   return {

@@ -16,6 +16,9 @@ serde_json = "1"
 # Format-preserving TOML editing for Codex's ~/.codex/config.toml [mcp_servers.*]
 # (wrap each MCP server through the guard proxy without wrecking the user's file).
 toml_edit = "0.25"
+# Parse the per-agent profiles file (`profiles`), the same crate the CLI
+# parses its other configuration with.
+toml = "1.1"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 regex = "1"

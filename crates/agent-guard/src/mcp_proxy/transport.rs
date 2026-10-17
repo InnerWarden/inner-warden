@@ -68,12 +68,13 @@ use serde_json::Value;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 
-use super::enforce::{apply_mode, ProxyAction, ProxyMode};
+use super::enforce::{apply_layers, ProxyAction, ProxyMode};
 use super::jsonrpc::{
     envelope_of, has_duplicate_keys, parse_line, parse_value, JsonRpcEnvelope, ParsedLine,
 };
 use super::router::{route_message, Direction, PendingRequest, ProxyDecision};
 use super::taint::TaintTracker;
+use crate::profiles::ProxyProfile;
 use crate::rules::RuleEngine;
 
 /// Max bytes for a single newline-delimited MCP message. JSON-RPC lines are
@@ -354,6 +355,7 @@ fn not_json_decision(refused: bool) -> ProxyDecision {
         tool_name: None,
         tool_summary: None,
         request_id: None,
+        deciding_layer: None,
     }
 }
 
@@ -370,13 +372,31 @@ fn as_inspected(line: &str) -> String {
         .unwrap_or_else(|_| line.to_string())
 }
 
+/// [`classify_client_line_in`] with no per-agent profile: the proxy as it is
+/// on a host with no profiles file.
+#[cfg(test)]
+fn classify_client_line(
+    line: &str,
+    cfg: &ProxyConfig,
+    engine: Option<&RuleEngine>,
+    map: &mut IdRequestMap,
+    taint: &mut TaintTracker,
+    breaker: &mut crate::breaker::Breaker,
+    now_secs: u64,
+) -> ClientAction {
+    classify_client_line_in(line, cfg, None, engine, map, taint, breaker, now_secs)
+}
+
 /// Pure: classify a client→server line. Mutates the id→request map for requests,
 /// consults the session [`TaintTracker`] to escalate confused-deputy calls, and
 /// records each `tools/call` in the session loop breaker at `now_secs` (seconds
 /// since the proxy started, handed in so the decision never reads a clock).
-fn classify_client_line(
+/// `profile` is the per-agent profile in force, `None` with no profiles file.
+#[allow(clippy::too_many_arguments)]
+fn classify_client_line_in(
     line: &str,
     cfg: &ProxyConfig,
+    profile: Option<&ProxyProfile>,
     engine: Option<&RuleEngine>,
     map: &mut IdRequestMap,
     taint: &mut TaintTracker,
@@ -400,15 +420,16 @@ fn classify_client_line(
             &env,
             as_inspected(line),
             cfg,
+            profile,
             engine,
             map,
             taint,
             breaker,
             now_secs,
         ),
-        ParsedLine::Batch(items) => {
-            classify_client_batch(line, items, cfg, engine, map, taint, breaker, now_secs)
-        }
+        ParsedLine::Batch(items) => classify_client_batch(
+            line, items, cfg, profile, engine, map, taint, breaker, now_secs,
+        ),
     }
 }
 
@@ -421,6 +442,7 @@ fn classify_client_batch(
     line: &str,
     items: Vec<Value>,
     cfg: &ProxyConfig,
+    profile: Option<&ProxyProfile>,
     engine: Option<&RuleEngine>,
     map: &mut IdRequestMap,
     taint: &mut TaintTracker,
@@ -442,6 +464,7 @@ fn classify_client_batch(
             &env,
             String::new(),
             cfg,
+            profile,
             engine,
             map,
             taint,
@@ -488,6 +511,7 @@ fn classify_client_message(
     env: &JsonRpcEnvelope,
     raw: String,
     cfg: &ProxyConfig,
+    profile: Option<&ProxyProfile>,
     engine: Option<&RuleEngine>,
     map: &mut IdRequestMap,
     taint: &mut TaintTracker,
@@ -535,7 +559,16 @@ fn classify_client_message(
     }
     let is_tool_call = decision.direction == Direction::ClientToServer.label()
         && decision.method.as_deref() == Some("tools/call");
-    let action = apply_mode(&decision, cfg.mode, cfg.as_protocol_error);
+    // The per-agent profile, when profiles are in force, then the mode: a
+    // refusal the profile adds still only blocks in `guard` and `kill`.
+    let action = apply_layers(
+        &mut decision,
+        env,
+        profile,
+        engine,
+        cfg.mode,
+        cfg.as_protocol_error,
+    );
     if matches!(action, ProxyAction::Block { .. } | ProxyAction::Kill { .. }) {
         if let Some((key, before)) = pending {
             forget_refused(map, key, before);
@@ -678,6 +711,7 @@ fn inspect_opaque_server_text(
         tool_name: None,
         tool_summary: None,
         request_id: None,
+        deciding_layer: None,
     })
 }
 
@@ -730,6 +764,21 @@ pub async fn run_proxy<F>(
 where
     F: Fn(&ProxyDecision),
 {
+    run_proxy_with_profile(cfg, engine, None, on_event).await
+}
+
+/// [`run_proxy`] with the per-agent profile in force on this host
+/// ([`crate::profiles`]). `None`, a host with no profiles file, is
+/// [`run_proxy`] exactly.
+pub async fn run_proxy_with_profile<F>(
+    cfg: ProxyConfig,
+    engine: Option<Arc<RuleEngine>>,
+    profile: Option<ProxyProfile>,
+    on_event: F,
+) -> std::io::Result<i32>
+where
+    F: Fn(&ProxyDecision),
+{
     // Registered before the server is spawned, so a stop request that arrives
     // while it starts is not lost.
     let stop = stop_requested();
@@ -738,6 +787,7 @@ where
         tokio::io::stdout(),
         cfg,
         engine,
+        profile,
         on_event,
         stop,
     )
@@ -767,6 +817,7 @@ where
         client_out,
         cfg,
         engine,
+        None,
         on_event,
         std::future::pending(),
     )
@@ -780,6 +831,7 @@ async fn run_proxy_until<R, W, F, S>(
     mut client_out: W,
     cfg: ProxyConfig,
     engine: Option<Arc<RuleEngine>>,
+    profile: Option<ProxyProfile>,
     on_event: F,
     stop: S,
 ) -> std::io::Result<i32>
@@ -840,7 +892,7 @@ where
                     }
                     Ok(Some(line)) => {
                         let now_secs = started.elapsed().as_secs();
-                        match classify_client_line(&line, &cfg, engine, &mut map, &mut taint, &mut breaker, now_secs) {
+                        match classify_client_line_in(&line, &cfg, profile.as_ref(), engine, &mut map, &mut taint, &mut breaker, now_secs) {
                             ClientAction::Drop => {}
                             ClientAction::Forward { raw, event } => {
                                 if let Some(ci) = child_stdin.as_mut() {
@@ -1238,6 +1290,79 @@ mod tests {
     }
 
     // ── pure classify_client_line ────────────────────────────────────────
+
+    /// The profile reaches the decision on the proxy's own path: a tool the
+    /// profile denies is refused in `guard` (and the id is taken back, since
+    /// no answer will come), and the same line with no profile is forwarded,
+    /// as on a host with no profiles file. A batch is judged element by
+    /// element with the same profile.
+    #[test]
+    fn classify_client_applies_the_profile_in_force() {
+        use crate::profiles::{AgentProfile, ProxyProfile};
+        let profile = ProxyProfile::Active {
+            agent_type: Some("claude-code".into()),
+            profile: Some(AgentProfile {
+                mcp_tools_deny: vec!["weather".into()],
+                ..AgentProfile::default()
+            }),
+            trust: crate::identity::Trust::Declared,
+            revoked: None,
+        };
+        let line = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"weather","arguments":{"location":"NYC"}}}"#;
+        let run = |line: &str, profile: Option<&ProxyProfile>, map: &mut IdRequestMap| {
+            classify_client_line_in(
+                line,
+                &cfg(ProxyMode::Guard),
+                profile,
+                None,
+                map,
+                &mut TaintTracker::new(),
+                &mut crate::breaker::Breaker::new(crate::breaker::BreakerConfig::default()),
+                0,
+            )
+        };
+        let mut m = IdRequestMap::new();
+        match run(line, Some(&profile), &mut m) {
+            ClientAction::Deny { decision, kill, .. } => {
+                assert!(!kill);
+                assert_eq!(
+                    decision.deciding_layer,
+                    Some(crate::identity::RuleLayer::AgentType)
+                );
+            }
+            other => panic!("the profile's deny must refuse the call: {other:?}"),
+        }
+        assert!(m.is_empty(), "a refused request is not left waiting");
+        let mut m = IdRequestMap::new();
+        assert!(matches!(
+            run(line, None, &mut m),
+            ClientAction::Forward {
+                event: Some(ProxyDecision {
+                    deciding_layer: None,
+                    ..
+                }),
+                ..
+            }
+        ));
+        let batch = format!(
+            "[{line},{}]",
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"time","arguments":{}}}"#
+        );
+        match run(&batch, Some(&profile), &mut IdRequestMap::new()) {
+            ClientAction::Batch {
+                forward: Some(kept),
+                replies,
+                ..
+            } => {
+                assert_eq!(replies.len(), 1);
+                assert!(
+                    kept.contains("\"time\"") && !kept.contains("\"weather\""),
+                    "{kept}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
 
     #[test]
     fn classify_client_drops_blank() {
@@ -2406,6 +2531,7 @@ mod tests {
             proxy_in,
             proxy_out,
             advisory(stubborn_server(&pid_file)),
+            None,
             None,
             |_d: &ProxyDecision| {},
             async {

@@ -62,6 +62,8 @@ fs4 = { version = "1.1", features = ["sync"] }
 # token collector shared with the authenticated Active Defence server.
 innerwarden-dashboard-kit = { path = "../dashboard-kit" }
 serde_json = "1"
+# The launch record carries a timestamp (identity record of `contain --identity`).
+chrono = { version = "0.4", features = ["serde"] }
 # One-way hook event fingerprints make repeated delivery idempotent without
 # persisting provider tool-use identifiers in the local decision graph.
 sha2 = "0.11"

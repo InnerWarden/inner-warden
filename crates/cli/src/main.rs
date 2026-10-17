@@ -14,11 +14,15 @@ use std::sync::Arc;
 
 use innerwarden_agent_guard::mcp_proxy::enforce::ProxyMode;
 use innerwarden_agent_guard::mcp_proxy::router::ProxyDecision;
-use innerwarden_agent_guard::mcp_proxy::transport::{run_proxy, ProxyConfig};
+use innerwarden_agent_guard::mcp_proxy::transport::{run_proxy_with_profile, ProxyConfig};
 use innerwarden_agent_guard::render::{is_deny, render_verdict};
 use innerwarden_agent_guard::{hook, mcp::analyze_command, rules::RuleEngine};
 
+mod agent_decisions;
+mod agent_decisions_io;
 mod agent_policy;
+mod agent_profiles;
+mod agent_profiles_io;
 mod agent_report;
 mod agents_io;
 mod binary_freshness;
@@ -27,9 +31,11 @@ mod contain;
 mod contain_io;
 mod dashboard;
 mod dashboard_community;
+mod dashboard_identity;
 mod first_run;
 mod graph_io;
 mod help;
+mod hook_identity;
 mod http_io;
 mod notify_io;
 mod observe;
@@ -888,7 +894,11 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
     // `tool_input` that produced it, and screening that again would record the
     // same command twice.
     if let Some((tool, result)) = hook_tool_result(&buf) {
-        session_store::record_tool_result(hook_session(&buf).as_deref(), &tool, &result);
+        let payload_session = hook_session(&buf);
+        let identity =
+            hook_identity::current(agent_flag(rest).as_deref(), payload_session.as_deref());
+        let key = hook_identity::behaviour_key(identity.as_ref(), payload_session.as_deref());
+        session_store::record_tool_result(key.as_deref(), &tool, &result);
         return std::process::ExitCode::SUCCESS;
     }
 
@@ -914,6 +924,10 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
         .unwrap_or(rules);
     let source_session = hook_session(&buf);
     let source_event_id = hook_event_id(&buf);
+    // Inside an identified jail the hook knows more about who is calling; with
+    // no record there this is `None` and nothing below changes.
+    let identity = hook_identity::current(agent_flag(rest).as_deref(), source_session.as_deref());
+    let window_key = hook_identity::behaviour_key(identity.as_ref(), source_session.as_deref());
 
     // Behavioural layer: a burst of calls, or repeated sensitive reads, is only
     // visible ACROSS invocations. `agent-guard` has always had the logic; this
@@ -925,9 +939,51 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
     // burst AND whether an argument arrived in an earlier tool result. They were
     // two reads, which doubled the work on the hot path of every tool call.
     let (behaviour, tainted) =
-        session_store::record_call_and_taint(source_session.as_deref(), &command);
+        session_store::record_call_and_taint(window_key.as_deref(), &command);
     let verdict = apply_behaviour(verdict, behaviour.as_ref());
     let verdict = apply_taint(verdict, tainted.as_ref());
+
+    // Per-agent profiles, only where a profiles file exists. With none the
+    // state is `Off` and the decision is the hook's own, as it always was.
+    let blocks_today = hook_blocks(&verdict, block_review);
+    let (verdict, would_block_under_policy, deciding_layer) = match agent_profiles_io::load() {
+        agent_profiles::ProfilesState::Off => (verdict, blocks_today, None),
+        agent_profiles::ProfilesState::Invalid(why) if !monitor => {
+            return hook_profiles_invalid(&why);
+        }
+        agent_profiles::ProfilesState::Invalid(why) => {
+            eprintln!(
+                "InnerWarden hook: the agent profiles were not applied ({why}); this call was \
+                 screened by the general policy (monitor mode never blocks)."
+            );
+            (verdict, blocks_today, None)
+        }
+        agent_profiles::ProfilesState::On(profiles) => {
+            let hook_agent = agent_flag(rest);
+            let decided = agent_profiles::decide_hook(
+                &agent_profiles::HookFacts {
+                    command: &command,
+                    verdict: &verdict,
+                    blocks_today,
+                    tainted: tainted.is_some(),
+                    line_block_review: block_review,
+                },
+                &profiles,
+                agent_profiles::agent_type(hook_agent.as_deref(), identity.as_ref()).as_deref(),
+                identity.as_ref().and_then(|id| id.instance_id.as_deref()),
+                agent_profiles::trust(identity.as_ref()),
+            );
+            (
+                decided.verdict,
+                decided.blocks,
+                Some(graph_io::LayerLabel {
+                    layer: decided.deciding_layer,
+                    profile: decided.profile,
+                    relaxation_withheld: decided.relaxation_withheld,
+                }),
+            )
+        }
+    };
 
     // Record EVERY screened command into the narrative graph (allow AND deny).
     // Persist recommendation and real outcome separately: monitor records a deny
@@ -935,7 +991,6 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
     // The record is written BEFORE the verdict is returned, so nothing in it
     // may wait without a bound: every lock it takes gives up after
     // `GRAPH_LOCK_TIMEOUT` and the loss is reported as an outage.
-    let would_block_under_policy = hook_blocks(&verdict, block_review);
     graph_io::record_hook(
         &command,
         &verdict,
@@ -945,6 +1000,8 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
         source_event_id.as_deref(),
         agent_flag(rest).as_deref(),
         hook_cwd(&buf).as_deref(),
+        identity.as_ref(),
+        deciding_layer,
     );
     if would_block_under_policy {
         // In monitor mode this is a would-block alert; in enforce it accompanies
@@ -1020,19 +1077,32 @@ fn screen_file_tool(buf: &str, rest: &[String], monitor: bool) -> Option<std::pr
     let Some((path, what)) = paths.iter().find_map(|path| {
         file_tools::privileged_file_write(path, &context).map(|what| (path, what))
     }) else {
-        return Some(std::process::ExitCode::SUCCESS);
+        // A revoked agent is refused every file change too, where profiles
+        // are in force. With no profiles file this is one failed open of
+        // each file and the edit goes through, as before.
+        return Some(file_tool_revoked(buf, rest, monitor, &tool, &paths));
     };
     let verdict = file_tools::refusal_verdict(&tool, path, what);
     let command = format!("{tool} {}", path.trim());
+    let payload_session = hook_session(buf);
+    let identity = hook_identity::current(agent_flag(rest).as_deref(), payload_session.as_deref());
+    // A change to a privileged file is a hard rule: no profile has a word
+    // about it. Where profiles are in force the record says which layer.
+    let deciding_layer = match agent_profiles_io::load() {
+        agent_profiles::ProfilesState::Off => None,
+        _ => Some(innerwarden_agent_guard::identity::RuleLayer::Hard.into()),
+    };
     graph_io::record_hook(
         &command,
         &verdict,
         monitor,
         true,
-        hook_session(buf).as_deref(),
+        payload_session.as_deref(),
         hook_event_id(buf).as_deref(),
         agent_flag(rest).as_deref(),
         hook_cwd(buf).as_deref(),
+        identity.as_ref(),
+        deciding_layer,
     );
     notify_io::fire(&command, &verdict);
     if monitor {
@@ -1044,6 +1114,74 @@ fn screen_file_tool(buf: &str, rest: &[String], monitor: bool) -> Option<std::pr
     );
     eprintln!("{}", FILE_BLOCK_REMEDY);
     Some(std::process::ExitCode::from(2))
+}
+
+/// A file change that is not to a privileged file: refused (outside monitor)
+/// only when the profiles in force revoked the agent or its instance, and
+/// then recorded like any refusal, by the hard layer. Otherwise exit 0 and
+/// nothing recorded, as before.
+fn file_tool_revoked(
+    buf: &str,
+    rest: &[String],
+    monitor: bool,
+    tool: &str,
+    paths: &[String],
+) -> std::process::ExitCode {
+    let agent_profiles::ProfilesState::On(profiles) = agent_profiles_io::load() else {
+        return std::process::ExitCode::SUCCESS;
+    };
+    let payload_session = hook_session(buf);
+    let hook_agent = agent_flag(rest);
+    let identity = hook_identity::current(hook_agent.as_deref(), payload_session.as_deref());
+    let agent_type = agent_profiles::agent_type(hook_agent.as_deref(), identity.as_ref());
+    let Some(revoked) = profiles.revocation(
+        agent_type.as_deref(),
+        identity.as_ref().and_then(|id| id.instance_id.as_deref()),
+    ) else {
+        return std::process::ExitCode::SUCCESS;
+    };
+    let path = paths.first().map(|p| p.trim()).unwrap_or("");
+    let command = format!("{tool} {path}");
+    let verdict = serde_json::json!({
+        "recommendation": "deny",
+        "risk_score": 100,
+        "severity": "high",
+        "explanation": revoked.sentence(),
+        "signals": [],
+    });
+    graph_io::record_hook(
+        &command,
+        &verdict,
+        monitor,
+        true,
+        payload_session.as_deref(),
+        hook_event_id(buf).as_deref(),
+        hook_agent.as_deref(),
+        hook_cwd(buf).as_deref(),
+        identity.as_ref(),
+        Some(innerwarden_agent_guard::identity::RuleLayer::Hard.into()),
+    );
+    if monitor {
+        return std::process::ExitCode::SUCCESS;
+    }
+    eprintln!(
+        "InnerWarden blocked this file change (recommendation=deny): {}",
+        revoked.sentence()
+    );
+    eprintln!("{}", FILE_BLOCK_REMEDY);
+    std::process::ExitCode::from(2)
+}
+
+/// A profiles file that cannot be used, in enforce: the call is refused, as a
+/// call the hook could not read is, and the reason is said. A policy the
+/// person wrote is never applied with part of it missing.
+fn hook_profiles_invalid(why: &str) -> std::process::ExitCode {
+    eprintln!(
+        "InnerWarden hook: the agent profiles cannot be used ({why}); refusing this call rather \
+         than screening it against a policy that is not the one written.\n  For the person \
+         supervising this agent: fix or remove the file named above."
+    );
+    std::process::ExitCode::from(2)
 }
 
 /// What the hook tells the person after it refuses a file change. There is
@@ -2005,20 +2143,61 @@ fn cmd_proxy(rest: &[String]) -> std::process::ExitCode {
     // runs, from a thread of its own; with none, the proxy says so once and
     // nothing else changes (`agent_report`).
     let reporter = agent_report::BlockReporter::from_env();
+    // The proxy runs where the agent's tools run, so it reads the same record
+    // the hook does; with none there it is `None` and nothing changes.
+    let identity = hook_identity::current(agent.as_deref(), None);
+    // Per-agent profiles, read once: the proxy is a long-lived process. With
+    // no profiles file this is `None` and the proxy is what it was.
+    let profile = match agent_profiles_io::load() {
+        agent_profiles::ProfilesState::Off => None,
+        agent_profiles::ProfilesState::Invalid(why) => {
+            eprintln!(
+                "innerwarden proxy: the agent profiles cannot be used ({why}); every tool call is \
+                 refused in guard and kill mode until the file is fixed or removed"
+            );
+            Some(innerwarden_agent_guard::profiles::ProxyProfile::Invalid { why })
+        }
+        agent_profiles::ProfilesState::On(profiles) => {
+            let agent_type = agent_profiles::agent_type(agent.as_deref(), identity.as_ref());
+            let profile = agent_type
+                .as_deref()
+                .and_then(|name| profiles.get(name))
+                .cloned();
+            let revoked = profiles.revocation(
+                agent_type.as_deref(),
+                identity.as_ref().and_then(|id| id.instance_id.as_deref()),
+            );
+            Some(innerwarden_agent_guard::profiles::ProxyProfile::Active {
+                agent_type,
+                profile,
+                trust: agent_profiles::trust(identity.as_ref()),
+                revoked,
+            })
+        }
+    };
     let report_to = reporter.sender();
     let on_event = move |d: &ProxyDecision| {
         // The graph is an action timeline: persist every client tools/call,
         // including allows, but never persist a server response as a command.
-        graph_io::record_mcp(d, mode, Some(&proxy_session), agent.as_deref());
+        graph_io::record_mcp(
+            d,
+            mode,
+            Some(&proxy_session),
+            agent.as_deref(),
+            identity.as_ref(),
+        );
         if !d.verdict.alerts.is_empty() {
             eprintln!("{}", format_alert(&label, d));
         }
-        if let (Some(tx), Some(body)) = (&report_to, agent_report::block_report(&label, mode, d)) {
+        if let (Some(tx), Some(body)) = (
+            &report_to,
+            agent_report::block_report(&label, mode, d, identity.as_ref()),
+        ) {
             // Full: the agent is not keeping up; the local record stands.
             let _ = tx.try_send(body);
         }
     };
-    let result = rt.block_on(run_proxy(cfg, Some(engine), on_event));
+    let result = rt.block_on(run_proxy_with_profile(cfg, Some(engine), profile, on_event));
     // The server is stopped and reaped by now. Dropping the runtime normally
     // would wait for its blocking tasks, and the read on our stdin is one that
     // cannot be cancelled: a proxy told to stop while its client was still

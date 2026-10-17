@@ -572,6 +572,46 @@ mod tests {
         );
     }
 
+    /// The per-agent profiles, the user's and the system's, are the person's:
+    /// a file tool writing either one is refused however it is spelled. The
+    /// refusal reads the path only, so no level of trust and no profile can
+    /// change it.
+    ///
+    /// FAILS ON REVERT: drop `.config/innerwarden` and `/etc/innerwarden`
+    /// from the privileged places and these are allowed.
+    #[test]
+    fn the_agent_profiles_files_are_refused_to_every_file_tool() {
+        let home = Path::new("/home/dev");
+        let cwd = Path::new("/home/dev/proj");
+        let ctx = context(home, cwd);
+        for path in [
+            "/home/dev/.config/innerwarden/agent-profiles.toml",
+            "~/.config/innerwarden/agent-profiles.toml",
+            "../.config/innerwarden/agent-profiles.toml",
+            "/home/dev/proj/../.config/innerwarden/./agent-profiles.toml",
+            "/etc/innerwarden/agent-profiles.toml",
+            "/etc//innerwarden/agent-profiles.toml",
+            "/ETC/innerwarden/AGENT-PROFILES.TOML",
+        ] {
+            assert!(
+                privileged_file_write(path, &ctx).is_some(),
+                "{path} must be refused"
+            );
+        }
+        let root = context(Path::new("/root"), Path::new("/root/proj"));
+        for path in [
+            "/root/.config/innerwarden/agent-profiles.toml",
+            "/etc/innerwarden/agent-profiles.toml",
+        ] {
+            assert!(privileged_file_write(path, &root).is_some(), "{path}");
+        }
+        // A file of the same name in the project is the project's.
+        assert_eq!(
+            privileged_file_write("/home/dev/proj/agent-profiles.toml", &ctx),
+            None
+        );
+    }
+
     /// The row's proof: the agent's settings, the guard's configuration, shell
     /// startup files, SSH keys, the account's own services and credential
     /// stores are refused, however the path is spelled.

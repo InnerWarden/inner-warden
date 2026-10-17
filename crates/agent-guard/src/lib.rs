@@ -58,8 +58,13 @@ pub mod file_tools;
 pub mod file_update;
 pub mod hook;
 pub mod hook_targets;
+// Contract types and pure decisions for agent identity.
+pub mod identity;
 pub mod mcp_wire;
 pub mod mcp_wire_toml;
+// Profiles per type of agent: the layer between the general policy and an
+// instance. Read only where a profiles file exists.
+pub mod profiles;
 pub mod redact;
 pub mod render;
 pub mod session;

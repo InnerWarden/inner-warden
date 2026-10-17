@@ -92,6 +92,27 @@ const server = createServer(async (request, response) => {
     // fixture writer rendered (`community_fixtures_match_what_the_cli_serves`).
     if (fixture === "community") {
       const json = "application/json; charset=utf-8";
+      // The identity screens: a journey that sets the cookie
+      // `iw-fixture=identity` is served what the CLI answers with a profiles
+      // file and a launcher's records (the `*-identity` files); every other
+      // request gets the plain files, as before.
+      const identity = (request.headers.cookie ?? "").split(";").some((part) => part.trim() === "iw-fixture=identity");
+      if (identity && path === "/api/guard/agents") {
+        write(response, 200, json, await regularFile(join(fixtureRoot, "agents-identity.json")));
+        return;
+      }
+      if (identity && path === "/api/guard/history" && address.searchParams.get("kind") !== "attempt") {
+        write(response, 200, json, await regularFile(join(fixtureRoot, "history-identity.json")));
+        return;
+      }
+      if (identity && path === "/api/guard/decision") {
+        const all = JSON.parse(await readFile(join(fixtureRoot, "decisions-identity-by-id.json"), "utf8"));
+        const found = all[address.searchParams.get("id") ?? ""];
+        if (found !== undefined) {
+          write(response, 200, json, JSON.stringify(found));
+          return;
+        }
+      }
       if (path === "/api/guard/decisions") {
         const file = address.searchParams.has("cursor") ? "decisions-page-2.json" : "decisions-page-1.json";
         const page = JSON.parse(await readFile(join(fixtureRoot, file), "utf8"));

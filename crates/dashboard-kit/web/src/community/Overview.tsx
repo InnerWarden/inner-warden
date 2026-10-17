@@ -8,7 +8,7 @@ import { When } from "../components/When";
 import { Ring, type Part } from "../components/viz";
 import { overviewLaneCards, type LaneCard } from "../lanes";
 import { compactCount, formatCount, formatDay, humanizeToken, normaliseMode } from "../presentation";
-import { agentRows, agentsSummary, modeLine, modeWord, nameList, type AgentRow } from "./agentsView";
+import { agentRows, agentsSummary, awaitingApproval, modeLine, modeWord, nameList, trustCounts, type AgentRow } from "./agentsView";
 import { fetchDecisions, fetchHistory, fetchRecordHealth, readLaneNextStep, readOverviewRecord, type Decision, type DecisionsPage, type History, type Reason, type RecordSpan } from "./api";
 import { CaseRow } from "./CaseRow";
 import { OfferBox } from "./Offer";
@@ -17,7 +17,7 @@ import { CARD, CopyCommand, Go, Skeleton, StaleLine, Unreadable } from "./parts"
 import { usePolled } from "./poll";
 import { rowRuns, type Run } from "./rows";
 import { tokenRows, tokenTotal } from "./tokensView";
-import { asPlatform, MODE_WORDS, OUTCOME_WORDS, type PlatformOs } from "./words";
+import { agentTrustSentence, asPlatform, MODE_WORDS, OUTCOME_WORDS, PLATFORM_WORDS, type PlatformOs } from "./words";
 
 export const OVERVIEW_POLL_MS = 10_000;
 export const AGENTS_POLL_MS = 30_000;
@@ -332,6 +332,8 @@ function OnThisMachine({
   tokensRead: boolean;
 }) {
   const summary = agentsSummary(rows);
+  const trust = trustCounts(rows, Date.now());
+  const waiting = awaitingApproval(rows);
   const connected = summary.refusing + summary.watching;
   const ringParts: Part[] = [
     { key: "refusing", value: summary.refusing, tone: "accent", label: `Refusing: ${summary.refusing}` },
@@ -379,6 +381,17 @@ function OnThisMachine({
                   </p>
                 ) : (
                   <p className="mt-0.5 text-xs leading-5 text-slate-600">Every agent found is connected.</p>
+                )}
+                {trust === undefined ? null : (
+                  <p data-agent-trust className="mt-1 text-xs leading-5 text-slate-600">
+                    {agentTrustSentence(trust, PLATFORM_WORDS[asPlatform(context.bootstrap?.platform.os)])}
+                  </p>
+                )}
+                {waiting.length === 0 ? null : (
+                  <p data-needs-you="" data-agents-waiting className="mt-1 text-xs font-semibold leading-5 text-amber-900">
+                    <span aria-hidden="true">! </span>
+                    {waiting.length} new {waiting.length === 1 ? "agent waits" : "agents wait"} for your approval.
+                  </p>
                 )}
               </div>
             </div>
