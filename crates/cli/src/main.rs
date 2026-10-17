@@ -987,12 +987,14 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
                     tainted.is_some(),
                 )
                 .and_then(|request| {
+                    // The hook found its jail's record, so the key is the
+                    // copy the launcher handed in, and only that.
+                    let key = host_decide::key_file(identity.is_some());
                     host_decide_io::consult(
                         url,
                         &request,
-                        std::path::Path::new(
-                            innerwarden_agent_guard::identity::AGENT_TLS_SPKI_PATH,
-                        ),
+                        key,
+                        std::path::Path::new(key.path()),
                         host_decide::ASK_TIMEOUT,
                     )
                 }),

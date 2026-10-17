@@ -298,6 +298,13 @@ pub const HOST_ANSWER_INVALID: &str = "host_answer_invalid";
 /// connection to.
 pub const AGENT_TLS_SPKI_PATH: &str = "/etc/innerwarden/agent-tls.spki";
 
+/// Where the key appears INSIDE an identified jail. Inside the jail's user
+/// namespace the host's owners cannot be told apart (every account but the
+/// user's shows as one uid), so the launcher reads [`AGENT_TLS_SPKI_PATH`]
+/// outside, with the real owners, and mounts what it read here read-only,
+/// beside [`JAIL_RECORD_PATH`]. No key there, no request.
+pub const JAIL_SPKI_PIN_PATH: &str = "/run/innerwarden/agent-tls.spki";
+
 /// The most bytes the key file holds: 64 hex characters and a newline.
 pub const MAX_SPKI_PIN_BYTES: usize = 65;
 
@@ -2255,6 +2262,12 @@ mod tests {
     fn the_route_and_the_key_file_are_pinned() {
         assert_eq!(INSTANCE_DECIDE_ROUTE, "/api/agent/instance-decide");
         assert_eq!(AGENT_TLS_SPKI_PATH, "/etc/innerwarden/agent-tls.spki");
+        assert_eq!(JAIL_SPKI_PIN_PATH, "/run/innerwarden/agent-tls.spki");
+        assert_eq!(
+            Path::new(JAIL_SPKI_PIN_PATH).parent(),
+            Path::new(JAIL_RECORD_PATH).parent(),
+            "the key lands beside the record"
+        );
         assert_eq!(HOST_TRUST_SOURCE, "host");
         assert_eq!(HOST_ANSWER_INVALID, "host_answer_invalid");
         assert!(is_withheld_word(HOST_ANSWER_INVALID));

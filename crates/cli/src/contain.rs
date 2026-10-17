@@ -296,6 +296,15 @@ pub struct JailInputs {
     ///
     /// [`JAIL_RECORD_PATH`]: innerwarden_agent_guard::identity::JAIL_RECORD_PATH
     pub record_fd: Option<i32>,
+    /// The descriptor bwrap reads the key of Active Defence on this host from
+    /// and mounts, read-only, at [`JAIL_SPKI_PIN_PATH`] (`--ro-bind-data`).
+    /// The launcher read it from the host's file with the host's real owners;
+    /// inside the jail's user namespace the owners cannot be told apart.
+    /// `None` without a key the launcher believes, and unless the launch asked
+    /// for an identity record.
+    ///
+    /// [`JAIL_SPKI_PIN_PATH`]: innerwarden_agent_guard::identity::JAIL_SPKI_PIN_PATH
+    pub key_fd: Option<i32>,
     /// The launcher's own records directory, as named and as resolved, hidden
     /// inside an identified jail: the agent works in a home that holds it.
     /// Empty unless the launch asked for an identity record.
@@ -477,7 +486,7 @@ pub const USERNS_CLOSED: [&str; 2] = ["--unshare-user", "--disable-userns"];
 /// Build the ordered bwrap argument vector. Order is load-bearing (bwrap is
 /// last-wins): system RO → dev/proc/tmpfs → HOME tmpfs → dotdir re-binds → shadow
 /// innerwarden → binary binds → project (late) → worktree → nested secret masks →
-/// launch record (`--identity` only) → namespaces → child. `DOTDIR_DENY`
+/// the host's key and the launch record (`--identity` only) → namespaces → child. `DOTDIR_DENY`
 /// entries are never emitted, so they vanish under the HOME tmpfs.
 pub fn build_linux_jail(input: &JailInputs) -> Result<LinuxJailPlan, ContainError> {
     validate_jail_inputs(input)?;
@@ -607,6 +616,18 @@ pub fn build_linux_jail(input: &JailInputs) -> Result<LinuxJailPlan, ContainErro
         } else {
             push(&["--ro-bind", "/dev/null", &dest]);
         }
+    }
+
+    // --- the key of Active Defence on this host, read-only, just before the
+    // record (`--identity` and a key only). Like the record it lands on the
+    // `/run` tmpfs and no later option mounts anything, so it stays the
+    // launcher's copy of the host's file. ---
+    if let (true, Some(fd)) = (input.args.identity, input.key_fd) {
+        push(&[
+            "--ro-bind-data",
+            &fd.to_string(),
+            innerwarden_agent_guard::identity::JAIL_SPKI_PIN_PATH,
+        ]);
     }
 
     // --- the launch record, read-only, LAST of the mounts. It lands on the
@@ -1022,6 +1043,10 @@ pub mod launch {
     /// The record descriptor a dry run shows. A real run uses the pipe's own.
     pub const DRY_RUN_RECORD_FD: i32 = 10;
 
+    /// The key descriptor a dry run shows, when the host has a key the
+    /// launcher believes. A real run uses the pipe's own.
+    pub const DRY_RUN_KEY_FD: i32 = 11;
+
     // -- the user scope ------------------------------------------------------
     //
     // The order a launch runs in, and why it is this order:
@@ -1296,6 +1321,87 @@ pub mod launch {
         argv.extend(super::JAIL_NAMESPACES.iter().map(|s| s.to_string()));
         argv.extend(["--ro-bind", "/", "/", "true"].map(String::from));
         argv
+    }
+
+    // -- the host's agent profiles, as the jail sees them --------------------
+    //
+    // Inside the jail's user namespace (a bwrap that is not setuid maps only
+    // the user) the host's owners cannot be told apart: root's files and
+    // every other account's show with the one overflow uid. The hook still
+    // reads the system profiles file live, through the jail's read-only
+    // `/etc`, so a revocation written on the host reaches a running jail, and
+    // in an identified jail it takes that uid as root's
+    // (`agent_profiles::system_owner_is_root`). That is sound only for a way
+    // to the file the launcher proved root's, with the real owners, before
+    // the jail started: this check, which refuses the launch otherwise.
+
+    /// One entry on the way from `/` to the system profiles file, as the
+    /// launcher reads it on the host (`symlink_metadata`: never followed).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum HostEntry {
+        /// Not there, or in a folder closed to this user (the hook inside
+        /// cannot look it up either).
+        Absent,
+        /// There, and its facts could not be read.
+        Unreadable,
+        Found {
+            symlink: bool,
+            dir: bool,
+            file: bool,
+            uid: u32,
+            /// `st_mode`, so the permission bits are its low twelve.
+            mode: u32,
+        },
+    }
+
+    /// The way to the system profiles file, from `/` down to the file.
+    pub fn system_profiles_chain() -> Vec<PathBuf> {
+        let mut chain: Vec<PathBuf> =
+            Path::new(innerwarden_agent_guard::profiles::SYSTEM_PROFILES_PATH)
+                .ancestors()
+                .map(Path::to_path_buf)
+                .collect();
+        chain.reverse();
+        chain
+    }
+
+    /// PURE. The one sentence that refuses an identified launch when the way
+    /// to the system profiles file is not root's alone, or `None`. `chain` is
+    /// each entry from `/` down to the file ([`system_profiles_chain`]). The
+    /// walk ends at the first entry that is absent: only the owner of the
+    /// folder above can make it, and that folder was root's.
+    pub fn system_profiles_refusal(chain: &[(PathBuf, HostEntry)]) -> Option<String> {
+        let last = chain.len().checked_sub(1)?;
+        for (index, (path, entry)) in chain.iter().enumerate() {
+            let path = path.display();
+            let what = match *entry {
+                HostEntry::Absent => return None,
+                HostEntry::Unreadable => format!("{path} could not be inspected"),
+                HostEntry::Found {
+                    symlink: true, uid, ..
+                } => {
+                    format!("{path} is a symbolic link (owned by uid {uid})")
+                }
+                HostEntry::Found { uid, .. } if uid != 0 => {
+                    format!("{path} is owned by uid {uid}, not root")
+                }
+                HostEntry::Found { mode, uid, .. } if mode & 0o022 != 0 => {
+                    format!("{path} (owned by uid {uid}) can be written by its group or by others")
+                }
+                HostEntry::Found { file, uid, .. } if index == last && !file => {
+                    format!("{path} (owned by uid {uid}) is not a regular file")
+                }
+                HostEntry::Found { dir, uid, .. } if index < last && !dir => {
+                    format!("{path} (owned by uid {uid}) is not a folder")
+                }
+                HostEntry::Found { .. } => continue,
+            };
+            return Some(format!(
+                "innerwarden contain: {what}, and an identified jail reads this host's agent \
+                 profiles through it, so nothing was started."
+            ));
+        }
+        None
     }
 
     /// The program and arguments that start the jail. Without a scope it is
@@ -1951,6 +2057,7 @@ mod tests {
             ],
             info_fd: None,
             record_fd: None,
+            key_fd: None,
             records_dirs: vec![],
             child_env: vec![],
             close_userns: false,
@@ -3071,6 +3178,217 @@ mod tests {
                 assert!(!got.iter().any(|a| a == "--disable-userns"));
             }
             assert_eq!(without.join("\n"), golden);
+        }
+    }
+
+    /// The key the launcher read on the host is mounted read-only beside the
+    /// record: after the `/run` tmpfs, just before the record, which stays
+    /// last of the mounts. Only with `--identity` and a key: without a key the
+    /// argv is today's identified jail, byte for byte, and without the flag a
+    /// descriptor changes nothing.
+    ///
+    /// FAILS ON REVERT: drop the key mount (the hook in a jail whose bwrap is
+    /// not setuid has no key it may believe, so it never asks), or mount it
+    /// with `--bind-data`, or after the record.
+    #[test]
+    fn the_key_is_mounted_read_only_beside_the_record_only_with_identity_and_a_key() {
+        let mut keyed = identified_inputs();
+        keyed.key_fd = Some(11);
+        let got = build_linux_jail(&keyed).unwrap().bwrap_args;
+        let key = [
+            "--ro-bind-data".to_string(),
+            "11".to_string(),
+            innerwarden_agent_guard::identity::JAIL_SPKI_PIN_PATH.to_string(),
+        ];
+        let at = got
+            .windows(3)
+            .position(|w| w == key.as_slice())
+            .expect("the key is mounted");
+        let record = got
+            .windows(3)
+            .position(|w| w == record_mount("8").as_slice())
+            .expect("the record is mounted");
+        let run_tmpfs = got
+            .windows(2)
+            .position(|w| w[0] == "--tmpfs" && w[1] == "/run")
+            .unwrap();
+        assert!(run_tmpfs < at, "the key lands on the /run tmpfs");
+        assert_eq!(at + 3, record, "the key is just before the record");
+        assert!(!got.iter().any(|a| a == "--bind-data"));
+        assert_eq!(
+            got.join("\n"),
+            GOLDEN_ARGV_IDENTIFIED.replace(
+                "--ro-bind-data\n8\n",
+                "--ro-bind-data\n11\n/run/innerwarden/agent-tls.spki\n--ro-bind-data\n8\n"
+            )
+        );
+
+        // No key: today's identified jail.
+        assert_eq!(
+            build_linux_jail(&identified_inputs())
+                .unwrap()
+                .bwrap_args
+                .join("\n"),
+            GOLDEN_ARGV_IDENTIFIED
+        );
+        // No flag: a descriptor changes nothing.
+        let mut off = identified_inputs();
+        off.args.identity = false;
+        off.info_fd = None;
+        off.record_fd = None;
+        off.key_fd = Some(11);
+        off.existing_paths.pop();
+        assert_eq!(
+            build_linux_jail(&off).unwrap().bwrap_args.join("\n"),
+            GOLDEN_ARGV_PLAIN
+        );
+    }
+
+    fn found(uid: u32, mode: u32, dir: bool) -> launch::HostEntry {
+        launch::HostEntry::Found {
+            symlink: false,
+            dir,
+            file: !dir,
+            uid,
+            mode,
+        }
+    }
+
+    /// The way to the system profiles file, as the launcher reads it.
+    fn chain(entries: [launch::HostEntry; 4]) -> Vec<(PathBuf, launch::HostEntry)> {
+        launch::system_profiles_chain()
+            .into_iter()
+            .zip(entries)
+            .collect()
+    }
+
+    #[test]
+    fn the_way_to_the_system_profiles_file_is_slash_etc_and_its_folder() {
+        assert_eq!(
+            launch::system_profiles_chain(),
+            [
+                "/",
+                "/etc",
+                "/etc/innerwarden",
+                "/etc/innerwarden/agent-profiles.toml"
+            ]
+            .map(PathBuf::from)
+        );
+    }
+
+    /// A way to the system profiles file that is root's alone starts the
+    /// jail: the file there or not, its folder there or not.
+    #[test]
+    fn a_root_chain_to_the_system_profiles_starts_the_jail() {
+        let dir = |uid| found(uid, 0o40755, true);
+        assert_eq!(
+            launch::system_profiles_refusal(&chain([
+                dir(0),
+                dir(0),
+                dir(0),
+                found(0, 0o100644, false)
+            ])),
+            None
+        );
+        assert_eq!(
+            launch::system_profiles_refusal(&chain([
+                dir(0),
+                dir(0),
+                dir(0),
+                launch::HostEntry::Absent
+            ])),
+            None
+        );
+        // No folder: only root can make one in a root `/etc`.
+        assert_eq!(
+            launch::system_profiles_refusal(&chain([
+                dir(0),
+                dir(0),
+                launch::HostEntry::Absent,
+                launch::HostEntry::Absent
+            ])),
+            None
+        );
+    }
+
+    /// Inside the jail every account's file shows with one uid, so a folder
+    /// or a file of another account there would read as root's. The launcher
+    /// sees the real owner and refuses, naming the path and the owner.
+    ///
+    /// FAILS ON REVERT: let `system_profiles_refusal` pass any chain, and the
+    /// jail believes profiles another account wrote.
+    #[test]
+    fn a_chain_another_account_owns_or_can_write_refuses_the_launch() {
+        let dir = |uid, mode| found(uid, mode, true);
+        let file = found(0, 0o100644, false);
+        let cases = [
+            (
+                chain([dir(0, 0o40755), dir(0, 0o40755), dir(1001, 0o40755), file]),
+                "/etc/innerwarden is owned by uid 1001, not root",
+            ),
+            (
+                chain([
+                    dir(0, 0o40755),
+                    dir(0, 0o40755),
+                    dir(0, 0o40755),
+                    found(1001, 0o100644, false),
+                ]),
+                "/etc/innerwarden/agent-profiles.toml is owned by uid 1001, not root",
+            ),
+            (
+                chain([dir(0, 0o40755), dir(0, 0o40755), dir(0, 0o40775), file]),
+                "/etc/innerwarden (owned by uid 0) can be written by its group or by others",
+            ),
+            (
+                chain([
+                    dir(0, 0o40755),
+                    dir(0, 0o40755),
+                    dir(0, 0o40755),
+                    found(0, 0o100666, false),
+                ]),
+                "/etc/innerwarden/agent-profiles.toml (owned by uid 0) can be written by its group or by others",
+            ),
+            (
+                chain([
+                    dir(0, 0o40755),
+                    dir(0, 0o40755),
+                    launch::HostEntry::Found {
+                        symlink: true,
+                        dir: false,
+                        file: false,
+                        uid: 0,
+                        mode: 0o120777,
+                    },
+                    launch::HostEntry::Absent,
+                ]),
+                "/etc/innerwarden is a symbolic link (owned by uid 0)",
+            ),
+            (
+                chain([dir(0, 0o40755), dir(0, 0o40755), dir(0, 0o40755), dir(0, 0o40755)]),
+                "/etc/innerwarden/agent-profiles.toml (owned by uid 0) is not a regular file",
+            ),
+            (
+                chain([dir(0, 0o40755), dir(0, 0o40755), file, launch::HostEntry::Absent]),
+                "/etc/innerwarden (owned by uid 0) is not a folder",
+            ),
+            (
+                chain([dir(0, 0o40755), dir(0, 0o40755), launch::HostEntry::Unreadable, file]),
+                "/etc/innerwarden could not be inspected",
+            ),
+            (
+                chain([dir(0, 0o40755), dir(1000, 0o40755), dir(0, 0o40755), file]),
+                "/etc is owned by uid 1000, not root",
+            ),
+        ];
+        for (entries, said) in cases {
+            let why = launch::system_profiles_refusal(&entries)
+                .unwrap_or_else(|| panic!("refused: {said}"));
+            assert!(
+                why.starts_with(&format!("innerwarden contain: {said}, ")),
+                "{why}"
+            );
+            assert!(why.ends_with("so nothing was started."), "{why}");
+            assert_eq!(why.matches(". ").count(), 0, "one sentence: {why}");
         }
     }
 

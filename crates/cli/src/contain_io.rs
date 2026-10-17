@@ -69,6 +69,20 @@ pub fn cmd(rest: &[String]) -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
+    // Before anything is installed or started: an identified jail reads the
+    // host's agent profiles through its own view of `/etc`, where the owners
+    // cannot be told apart, so the launcher proves here, with the real
+    // owners, that the way to that file is root's alone.
+    #[cfg(target_os = "linux")]
+    if args.identity {
+        if let Some(why) =
+            crate::contain::launch::system_profiles_refusal(&system_profiles_entries())
+        {
+            eprintln!("{why}");
+            return ExitCode::from(2);
+        }
+    }
+
     // An identified launch takes its jail settings from the agent type's
     // profile, where a profiles file exists; a flag given here still wins.
     // Without `--identity` no profile is read and the jail is what it was.
@@ -153,6 +167,39 @@ pub fn cmd(rest: &[String]) -> ExitCode {
         );
         ExitCode::from(2)
     }
+}
+
+/// Each entry on the way to the system profiles file, as the host shows it:
+/// `symlink_metadata`, never followed. A path that is not there, or that sits
+/// in a folder closed to this user, is absent.
+#[cfg(target_os = "linux")]
+fn system_profiles_entries() -> Vec<(PathBuf, crate::contain::launch::HostEntry)> {
+    use crate::contain::launch::{system_profiles_chain, HostEntry};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    system_profiles_chain()
+        .into_iter()
+        .map(|path| {
+            let entry = match std::fs::symlink_metadata(&path) {
+                Ok(meta) => HostEntry::Found {
+                    symlink: meta.file_type().is_symlink(),
+                    dir: meta.is_dir(),
+                    file: innerwarden_safe_io::is_regular_file(&meta),
+                    uid: meta.uid(),
+                    mode: meta.permissions().mode(),
+                },
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+                    ) || e.raw_os_error() == Some(libc::ENOTDIR) =>
+                {
+                    HostEntry::Absent
+                }
+                Err(_) => HostEntry::Unreadable,
+            };
+            (path, entry)
+        })
+        .collect()
 }
 
 fn mode_label(a: &ContainArgs) -> &'static str {
@@ -249,6 +296,7 @@ fn resolve_inputs(args: ContainArgs, home: PathBuf, iw_binary: PathBuf) -> JailI
         deny_paths,
         info_fd: None,
         record_fd: None,
+        key_fd: None,
         records_dirs,
         child_env,
         close_userns: false,
@@ -495,6 +543,11 @@ fn run_linux(input: &JailInputs) -> ExitCode {
         dry_identity = JailInputs {
             info_fd: Some(crate::contain::launch::DRY_RUN_INFO_FD),
             record_fd: Some(crate::contain::launch::DRY_RUN_RECORD_FD),
+            // The key is handed in only when the host has one this launcher
+            // believes, as the real run does.
+            key_fd: host_key()
+                .is_some()
+                .then_some(crate::contain::launch::DRY_RUN_KEY_FD),
             close_userns: userns.is_some_and(crate::contain::launch::UsernsFact::close_userns),
             ..input.clone()
         };
@@ -552,6 +605,23 @@ fn run_linux(input: &JailInputs) -> ExitCode {
     }
     announce(input);
     run_plain(&bwrap, &plan)
+}
+
+/// The key of Active Defence on this host, read from its file with the
+/// host's real owners (root's, in folders only root can write), for the
+/// launcher to hand into an identified jail. A file that is there and not
+/// believed is said once; with none, nothing is said and nothing is handed in.
+fn host_key() -> Option<[u8; 32]> {
+    let path = Path::new(innerwarden_agent_guard::identity::AGENT_TLS_SPKI_PATH);
+    let key = crate::host_decide_io::read_pin(path);
+    if key.is_none() && std::fs::symlink_metadata(path).is_ok() {
+        eprintln!(
+            "innerwarden contain: {} is not a key this launcher believes (it must be root's, in \
+             folders only root can write), so the jail's hook will not ask Active Defence",
+            path.display()
+        );
+    }
+    key
 }
 
 /// The jail as it runs without `--identity`: bwrap, its arguments, waited for.
@@ -749,13 +819,16 @@ fn run_linux_identified(input: &JailInputs, bwrap: &Path) -> ExitCode {
         .records_dirs
         .retain(|dir| std::fs::symlink_metadata(dir).is_ok());
     let input = &input;
+    // Read once, outside the jail, with the host's real owners: inside it the
+    // owners cannot be told apart, so the hook there reads only this copy.
+    let key = host_key();
     let mut scope = plan_scope(&scope_facts(), &unit);
     if let ScopePlan::None(why) = scope {
         eprintln!("{}", no_scope_sentence(why));
     }
     announce(input);
     loop {
-        match launch_identified(input, bwrap, &instance_id, &unit, &scope) {
+        match launch_identified(input, bwrap, &instance_id, &unit, &scope, key.as_ref()) {
             Attempt::Done(code) => return code,
             // Nothing of the jail ran: bwrap never reported a pid, and the
             // jail cannot pass the record it never got. Only the scope was
@@ -803,6 +876,7 @@ fn launch_identified(
     instance_id: &str,
     unit: &str,
     scope: &crate::contain::launch::ScopePlan,
+    key: Option<&[u8; 32]>,
 ) -> Attempt {
     use crate::contain::launch::{launch_argv, ScopePlan};
     use std::io::Write;
@@ -820,9 +894,21 @@ fn launch_identified(
         eprintln!("innerwarden contain: cannot hand the jail's pipes to bwrap");
         return Attempt::Done(ExitCode::from(1));
     }
+    // The key goes in whole before bwrap starts: one line, far below a pipe's
+    // buffer, and the launcher's end is closed so bwrap reads it to its end.
+    // A key that cannot be handed in is no key: the hook then never asks.
+    let key_reader = key.and_then(|key| {
+        let (reader, mut writer) = std::io::pipe().ok()?;
+        writer
+            .write_all(innerwarden_agent_guard::identity::spki_pin_line(key).as_bytes())
+            .ok()?;
+        drop(writer);
+        hand_to_child(&reader).then_some(reader)
+    });
     let mut identified = input.clone();
     identified.info_fd = Some(info_writer.as_raw_fd());
     identified.record_fd = Some(record_reader.as_raw_fd());
+    identified.key_fd = key_reader.as_ref().map(AsRawFd::as_raw_fd);
     let plan = match build_linux_jail(&identified) {
         Ok(p) => p,
         Err(e) => {
@@ -840,6 +926,7 @@ fn launch_identified(
     // the end of its record.
     drop(info_writer);
     drop(record_reader);
+    drop(key_reader);
     let mut child = match spawned {
         Ok(c) => c,
         Err(e) if matches!(scope, ScopePlan::User { .. }) => return Attempt::NeverStarted(Err(e)),

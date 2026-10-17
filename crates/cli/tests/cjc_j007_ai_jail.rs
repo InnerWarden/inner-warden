@@ -127,6 +127,7 @@ const READ_THE_RECORD: &str = "readlink /proc/self/ns/pid; \
     if ( echo '{}' > /run/innerwarden/other.json ) 2>/dev/null \
         && mv -f /run/innerwarden/other.json /run/innerwarden/instance.json 2>/dev/null; \
         then echo RECORD-REPLACED; fi; \
+    if [ -e /run/innerwarden/agent-tls.spki ]; then echo KEY-HANDED-IN; fi; \
     exit 0";
 
 #[cfg(target_os = "linux")]
@@ -221,6 +222,10 @@ fn identity_flag_mounts_the_record_read_only_inside_and_keeps_a_private_copy() {
         "RECORD-REPLACED",
     ] {
         assert!(!stdout.contains(tampered), "{tampered}: {stdout}");
+    }
+    // A host with no key file hands no key in.
+    if !std::path::Path::new("/etc/innerwarden/agent-tls.spki").exists() {
+        assert!(!stdout.contains("KEY-HANDED-IN"), "{stdout}");
     }
 
     let record: serde_json::Value = serde_json::from_slice(&outside).unwrap();
@@ -345,6 +350,21 @@ fn dry_run_shows_the_record_and_info_descriptors_only_with_the_identity_flag() {
         identified.contains("--info-fd 9 -- /bin/true"),
         "{identified}"
     );
+    // The key of Active Defence is handed in, just before the record, only
+    // where the host has a key the launcher believes; with no key file there
+    // is no mount, and the plain run never has one.
+    let key = " --ro-bind-data 11 /run/innerwarden/agent-tls.spki";
+    assert!(!plain.contains("agent-tls.spki"), "{plain}");
+    if !std::path::Path::new("/etc/innerwarden/agent-tls.spki").exists() {
+        assert!(!identified.contains("agent-tls.spki"), "{identified}");
+    } else if identified.contains(key) {
+        assert!(
+            identified.contains(&format!(
+                "{key} --ro-bind-data 10 /run/innerwarden/instance.json "
+            )),
+            "the key is just before the record: {identified}"
+        );
+    }
     // No manager named (or no systemd-run at all): the dry run says the real
     // run would have no scope, and what that costs.
     let scope_lines: Vec<&str> = identified
@@ -407,6 +427,7 @@ fn dry_run_shows_the_record_and_info_descriptors_only_with_the_identity_flag() {
     }
     let without: String = identified
         .replace(" --ro-bind-data 10 /run/innerwarden/instance.json", "")
+        .replace(key, "")
         .replace(option, "")
         .replace(" --info-fd 9", "")
         .replace(

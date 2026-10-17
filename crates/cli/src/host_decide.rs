@@ -35,7 +35,7 @@ use std::time::Duration;
 
 use innerwarden_agent_guard::identity::{
     self, HostAnswer, InstanceDecideAnswer, InstanceDecideRequest, RuleLayer, Trust, Verdict,
-    HOST_ANSWER_INVALID, INSTANCE_DECIDE_ROUTE,
+    AGENT_TLS_SPKI_PATH, HOST_ANSWER_INVALID, INSTANCE_DECIDE_ROUTE, JAIL_SPKI_PIN_PATH,
 };
 use innerwarden_agent_guard::profiles::{self, ProfileMode};
 use serde_json::{json, Value};
@@ -258,24 +258,37 @@ pub fn settle(
     (settled, Some(label))
 }
 
-/// PURE. Whether a process whose `/proc/self/uid_map` reads `map` sees
-/// root's own uid: some line maps inside uid 0. Where none does (a user
-/// namespace like the jail's), every file root owns is shown with the
-/// kernel's overflow uid.
-pub fn uid_map_maps_root(map: &str) -> bool {
-    map.lines().any(|line| {
-        let mut fields = line.split_whitespace();
-        let inside = fields.next().and_then(|f| f.parse::<u32>().ok());
-        let _outside = fields.next();
-        let count = fields.next().and_then(|f| f.parse::<u32>().ok());
-        inside == Some(0) && count.is_some_and(|c| c > 0)
-    })
+/// Where the hook takes the key it holds the host's answer to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyFile {
+    /// Inside a jail: only the copy its launcher read with the host's real
+    /// owners and handed in read-only ([`JAIL_SPKI_PIN_PATH`]). No owner is
+    /// judged there: it is the launcher's word, like the record beside it.
+    Jail,
+    /// Outside a jail: the agent's own file ([`AGENT_TLS_SPKI_PATH`]),
+    /// believed only as root's, in folders only root can write.
+    Host,
 }
 
-/// PURE. Whether `uid` is root as this process sees it: 0, or the overflow
-/// uid where this process's user namespace does not map root.
-pub fn is_root_as_seen(uid: u32, maps_root: Option<bool>, overflow_uid: Option<u32>) -> bool {
-    uid == 0 || (maps_root == Some(false) && overflow_uid == Some(uid))
+impl KeyFile {
+    pub fn path(self) -> &'static str {
+        match self {
+            KeyFile::Jail => JAIL_SPKI_PIN_PATH,
+            KeyFile::Host => AGENT_TLS_SPKI_PATH,
+        }
+    }
+}
+
+/// PURE. Where the key is read from: the launcher's copy when the hook found
+/// its jail's record, the host's file otherwise. Inside the jail the host's
+/// file is never read: there every account but the user's shows as one uid,
+/// so its owner says nothing.
+pub fn key_file(in_jail: bool) -> KeyFile {
+    if in_jail {
+        KeyFile::Jail
+    } else {
+        KeyFile::Host
+    }
 }
 
 #[cfg(test)]
@@ -785,16 +798,16 @@ mod tests {
         assert!(!relaxed.blocks);
     }
 
+    /// Inside a jail the key is only the launcher's copy, never the host's
+    /// file seen through the jail (where any account's file shows with the
+    /// one uid every account but the user's has there).
+    ///
+    /// FAILS ON REVERT: read the host's file in the jail too.
     #[test]
-    fn root_is_zero_or_the_overflow_uid_where_root_is_not_mapped() {
-        assert!(uid_map_maps_root("         0          0 4294967295\n"));
-        assert!(!uid_map_maps_root("      1000       1000          1\n"));
-        assert!(!uid_map_maps_root("         0       1000          0\n"));
-        assert!(!uid_map_maps_root(""));
-        assert!(is_root_as_seen(0, Some(true), Some(65534)));
-        assert!(is_root_as_seen(65534, Some(false), Some(65534)));
-        assert!(!is_root_as_seen(65534, Some(true), Some(65534)));
-        assert!(!is_root_as_seen(65534, None, Some(65534)));
-        assert!(!is_root_as_seen(1000, Some(false), Some(65534)));
+    fn inside_a_jail_the_key_is_only_the_launchers_copy() {
+        assert_eq!(key_file(true), KeyFile::Jail);
+        assert_eq!(key_file(true).path(), "/run/innerwarden/agent-tls.spki");
+        assert_eq!(key_file(false), KeyFile::Host);
+        assert_eq!(key_file(false).path(), "/etc/innerwarden/agent-tls.spki");
     }
 }

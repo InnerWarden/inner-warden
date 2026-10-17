@@ -3,13 +3,19 @@
 //! whole, held to the key the agent publishes.
 //!
 //! The connection is believed only when the certificate the server presents
-//! carries the public key whose SHA-256 is in [`AGENT_TLS_SPKI_PATH`], a file
-//! of root's that no other account can write, and the server proves it holds
-//! that key in the handshake. No certificate authority is consulted. With no
-//! key file, or one that cannot be believed, nothing is sent. Against another
-//! account on the host that takes the port while the agent is down, this is
-//! the defence; the agent inside the jail controls what the hook reads, and a
-//! key it sees proves nothing about it.
+//! carries the public key whose SHA-256 is in the key file, and the server
+//! proves it holds that key in the handshake. No certificate authority is
+//! consulted. Outside a jail the key file is [`AGENT_TLS_SPKI_PATH`], a file
+//! of root's that no other account can write; inside one it is only the copy
+//! the launcher read from there with the host's real owners and handed in
+//! read-only ([`JAIL_SPKI_PIN_PATH`]). With no key, or one that cannot be
+//! believed, nothing is sent. Against another account on the host that takes
+//! the port while the agent is down, this is the defence; the agent inside
+//! the jail controls what the hook reads, and a key it sees proves nothing
+//! about it.
+//!
+//! [`AGENT_TLS_SPKI_PATH`]: innerwarden_agent_guard::identity::AGENT_TLS_SPKI_PATH
+//! [`JAIL_SPKI_PIN_PATH`]: innerwarden_agent_guard::identity::JAIL_SPKI_PIN_PATH
 //!
 //! A failure of any kind (no key, no connection, a key that does not match,
 //! a slow server, a broken answer) returns `None`, and the hook decides as it
@@ -21,9 +27,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-#[cfg(unix)]
-use innerwarden_agent_guard::identity::{parse_spki_pin, MAX_SPKI_PIN_BYTES};
-use innerwarden_agent_guard::identity::{InstanceDecideRequest, MAX_INSTANCE_ANSWER_BYTES};
+use innerwarden_agent_guard::identity::{
+    parse_spki_pin, InstanceDecideRequest, MAX_INSTANCE_ANSWER_BYTES, MAX_SPKI_PIN_BYTES,
+};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, CryptoProvider};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -33,15 +39,19 @@ use sha2::{Digest, Sha256};
 /// The most bytes of a response head read.
 const MAX_HEAD_BYTES: usize = 8 * 1024;
 
-/// Ask the host about one command: the key from `pin_path`, then [`ask`].
-/// `None` with no key: no request is made.
+/// Ask the host about one command: the key from `key` at `path`, then
+/// [`ask`]. `None` with no key: no request is made.
 pub fn consult(
     url: &str,
     request: &InstanceDecideRequest,
-    pin_path: &Path,
+    key: crate::host_decide::KeyFile,
+    path: &Path,
     timeout: Duration,
 ) -> Option<(u16, Vec<u8>)> {
-    let pin = read_pin(pin_path)?;
+    let pin = match key {
+        crate::host_decide::KeyFile::Jail => read_jail_pin(path),
+        crate::host_decide::KeyFile::Host => read_pin(path),
+    }?;
     let body = serde_json::to_vec(request).ok()?;
     ask(url, &body, timeout, &pin)
 }
@@ -331,15 +341,15 @@ fn client_config(pin: [u8; 32]) -> Option<rustls::ClientConfig> {
     )
 }
 
-/// The key in `path`, when the file is root's, as this process sees root,
-/// and neither it nor a directory above it can be written by another account
-/// (the rule `contain` holds its sandbox backend to, without the execute
-/// bit). Inside the jail root's files are shown with the overflow uid, so
-/// that uid counts as root there, and only there.
+/// The key in `path`, when the file is root's (uid 0, as the host's real
+/// owners are seen outside a jail) and neither it nor a directory above it
+/// can be written by another account (the rule `contain` holds its sandbox
+/// backend to, without the execute bit). The launcher reads the key with this
+/// before it hands it into a jail.
 #[cfg(unix)]
 pub fn read_pin(path: &Path) -> Option<[u8; 32]> {
     use std::os::unix::fs::MetadataExt;
-    let root = root_as_seen();
+    let root = |uid: u32| uid == 0;
     let facts = crate::contain_io::backend_facts(path)?;
     if !crate::contain_io::root_file_trusted(&facts, &root) {
         return None;
@@ -353,11 +363,7 @@ pub fn read_pin(path: &Path) -> Option<[u8; 32]> {
     {
         return None;
     }
-    let mut bytes = Vec::new();
-    file.take(MAX_SPKI_PIN_BYTES as u64 + 1)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    parse_spki_pin(&bytes)
+    read_key_bytes(file)
 }
 
 #[cfg(not(unix))]
@@ -365,22 +371,27 @@ pub fn read_pin(_path: &Path) -> Option<[u8; 32]> {
     None
 }
 
-/// Who is root as this process sees it: uid 0, and, where this process's
-/// user namespace does not map root, the kernel's overflow uid.
-#[cfg(unix)]
-fn root_as_seen() -> impl Fn(u32) -> bool {
-    #[cfg(target_os = "linux")]
-    let (maps_root, overflow) = (
-        std::fs::read_to_string("/proc/self/uid_map")
-            .ok()
-            .map(|map| crate::host_decide::uid_map_maps_root(&map)),
-        std::fs::read_to_string("/proc/sys/kernel/overflowuid")
-            .ok()
-            .and_then(|text| text.trim().parse::<u32>().ok()),
-    );
-    #[cfg(not(target_os = "linux"))]
-    let (maps_root, overflow): (Option<bool>, Option<u32>) = (None, None);
-    move |uid| crate::host_decide::is_root_as_seen(uid, maps_root, overflow)
+/// The key the launcher handed into the jail at `path`: one open, no link
+/// followed, no wait on a FIFO, a regular file, no more than a key's bytes.
+/// No owner is judged: inside the jail it is the launcher's word, as the
+/// record beside it is, and the host's answer is still held to it in the
+/// handshake.
+pub fn read_jail_pin(path: &Path) -> Option<[u8; 32]> {
+    let file = innerwarden_safe_io::open_no_follow(path).ok()?;
+    let meta = file.metadata().ok()?;
+    if !innerwarden_safe_io::is_regular_file(&meta) || meta.len() > MAX_SPKI_PIN_BYTES as u64 {
+        return None;
+    }
+    read_key_bytes(file)
+}
+
+/// At most one byte more than a key, from an open file, as a key.
+fn read_key_bytes(file: std::fs::File) -> Option<[u8; 32]> {
+    let mut bytes = Vec::new();
+    file.take(MAX_SPKI_PIN_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    parse_spki_pin(&bytes)
 }
 
 #[cfg(test)]
@@ -600,13 +611,19 @@ mod tests {
         listener.set_nonblocking(true).unwrap();
         let port = listener.local_addr().unwrap().port();
         let dir = tempfile::tempdir().unwrap();
-        let reply = consult(
-            &format!("https://127.0.0.1:{port}/api/agent/instance-decide"),
-            &request(),
-            &dir.path().join("agent-tls.spki"),
-            Duration::from_millis(400),
-        );
-        assert_eq!(reply, None);
+        for key in [
+            crate::host_decide::KeyFile::Jail,
+            crate::host_decide::KeyFile::Host,
+        ] {
+            let reply = consult(
+                &format!("https://127.0.0.1:{port}/api/agent/instance-decide"),
+                &request(),
+                key,
+                &dir.path().join("agent-tls.spki"),
+                Duration::from_millis(400),
+            );
+            assert_eq!(reply, None);
+        }
         let accepted = AtomicUsize::new(0);
         if listener.accept().is_ok() {
             accepted.fetch_add(1, Ordering::SeqCst);
@@ -636,6 +653,51 @@ mod tests {
         )
         .unwrap();
         assert_eq!(read_pin(&path), None);
+    }
+
+    /// Inside the jail the launcher's copy is read with the record's rules:
+    /// one open, no link, a regular file, bounded, and no owner judged (in
+    /// the jail's user namespace an owner says nothing). The host's rule
+    /// still refuses the same file.
+    ///
+    /// FAILS ON REVERT: hold the jail's copy to the host's owner rule, and
+    /// a jail on a host whose bwrap is not setuid never asks.
+    #[cfg(unix)]
+    #[test]
+    fn the_jails_copy_of_the_key_is_read_as_the_record_is() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let dir = std::fs::canonicalize(dir.path()).unwrap();
+        let pin = [7u8; 32];
+        let path = dir.join("agent-tls.spki");
+        std::fs::write(
+            &path,
+            innerwarden_agent_guard::identity::spki_pin_line(&pin),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        assert_eq!(read_jail_pin(&path), Some(pin));
+        // SAFETY: geteuid takes no arguments and cannot fail.
+        if unsafe { libc::geteuid() } != 0 {
+            assert_eq!(read_pin(&path), None, "the host's file must be root's");
+        }
+
+        let link = dir.join("link.spki");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert_eq!(read_jail_pin(&link), None, "a link is not followed");
+        let fifo = dir.join("fifo.spki");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        // SAFETY: a valid C string and a mode.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        assert_eq!(read_jail_pin(&fifo), None, "a FIFO is not waited on");
+        let long = dir.join("long.spki");
+        std::fs::write(&long, "a".repeat(MAX_SPKI_PIN_BYTES + 1)).unwrap();
+        assert_eq!(read_jail_pin(&long), None);
+        let garbage = dir.join("garbage.spki");
+        std::fs::write(&garbage, "not a key\n").unwrap();
+        assert_eq!(read_jail_pin(&garbage), None);
+        assert_eq!(read_jail_pin(&dir.join("absent.spki")), None);
+        assert_eq!(read_jail_pin(&dir), None, "a folder is no key");
     }
 
     #[test]

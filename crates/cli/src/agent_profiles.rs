@@ -73,6 +73,55 @@ pub fn state_from(system: (&str, FileRead), user: (&str, FileRead)) -> ProfilesS
     ProfilesState::On(profiles::merge(parsed[0].as_ref(), parsed[1].as_ref()))
 }
 
+/// What a reader knows about who root is where it runs, for the system file.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(not(unix), allow(dead_code))]
+pub struct RootView {
+    /// Whether this process's user namespace maps root (`/proc/self/uid_map`);
+    /// `None` where that cannot be read.
+    pub maps_root: Option<bool>,
+    /// The uid the kernel shows for an owner the namespace does not map.
+    pub overflow_uid: Option<u32>,
+    /// The process runs in a jail its launcher identified (the launcher's
+    /// record is mounted at its place).
+    pub identified_jail: bool,
+}
+
+/// PURE. Whether a system profiles file owned by `uid` is root's as this
+/// process sees it.
+///
+/// uid 0 always is. Inside an identified jail, whose user namespace maps only
+/// the user, root's files show with the overflow uid; so does any other
+/// account's, which is why that uid counts only there: before an identified
+/// jail is started its launcher proves, with the host's real owners, that the
+/// file and every folder above it are root's and that no other account can
+/// write them, so what shows there with the overflow uid is root's. In a jail
+/// started without `--identity`, and outside a jail, only uid 0 is root.
+/// `view` is read only for a file that uid 0 does not own.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub fn system_owner_is_root(uid: u32, view: impl FnOnce() -> RootView) -> bool {
+    if uid == 0 {
+        return true;
+    }
+    let view = view();
+    view.identified_jail && view.maps_root == Some(false) && view.overflow_uid == Some(uid)
+}
+
+/// PURE. Whether a process whose `/proc/self/uid_map` reads `map` sees
+/// root's own uid: some line maps inside uid 0. Where none does (a user
+/// namespace like the jail's), every file root owns is shown with the
+/// kernel's overflow uid.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn uid_map_maps_root(map: &str) -> bool {
+    map.lines().any(|line| {
+        let mut fields = line.split_whitespace();
+        let inside = fields.next().and_then(|f| f.parse::<u32>().ok());
+        let _outside = fields.next();
+        let count = fields.next().and_then(|f| f.parse::<u32>().ok());
+        inside == Some(0) && count.is_some_and(|c| c > 0)
+    })
+}
+
 /// The agent type whose profile a call gets: the one the hook line names,
 /// else, for an instance whose own namespace matched its record, the one the
 /// record names. With neither, none (the hard and general layers still hold).
@@ -596,5 +645,72 @@ mod tests {
         // A snapshot that is not one is read as none.
         let garbage = audit_step(Some(b"not json"), &ProfilesState::On(on(STRICT))).unwrap();
         assert_eq!(garbage.1.len(), 2);
+    }
+
+    /// Inside an identified jail (bwrap not setuid: the user namespace maps
+    /// only the user) root's system file shows with the overflow uid, and it
+    /// is root's there, so a revocation written on the host reaches the
+    /// running jail. Anywhere else only uid 0 is root.
+    ///
+    /// FAILS ON REVERT: hold the system file to uid 0 alone, and every call
+    /// in such a jail is refused for a file that is not the one written.
+    #[test]
+    fn the_system_file_is_roots_as_an_identified_jail_sees_root() {
+        let jail = RootView {
+            maps_root: Some(false),
+            overflow_uid: Some(65534),
+            identified_jail: true,
+        };
+        assert!(system_owner_is_root(65534, || jail));
+        assert!(system_owner_is_root(0, || jail));
+        assert!(!system_owner_is_root(1000, || jail));
+    }
+
+    /// The overflow uid is root only where the launcher proved the chain:
+    /// not in a jail started without `--identity`, not where the namespace
+    /// maps root (outside a jail), not where the map cannot be read. With a
+    /// file of uid 0 nothing else is looked at.
+    ///
+    /// FAILS ON REVERT: drop the `identified_jail` condition and a plain
+    /// jail believes a file the launcher never checked.
+    #[test]
+    fn the_overflow_uid_is_root_only_in_an_identified_jail() {
+        let jail = RootView {
+            maps_root: Some(false),
+            overflow_uid: Some(65534),
+            identified_jail: true,
+        };
+        for other in [
+            RootView {
+                identified_jail: false,
+                ..jail
+            },
+            RootView {
+                maps_root: Some(true),
+                ..jail
+            },
+            RootView {
+                maps_root: None,
+                ..jail
+            },
+            RootView {
+                overflow_uid: None,
+                ..jail
+            },
+            RootView::default(),
+        ] {
+            assert!(!system_owner_is_root(65534, || other), "{other:?}");
+        }
+        assert!(system_owner_is_root(0, || panic!(
+            "not read for root's file"
+        )));
+    }
+
+    #[test]
+    fn a_uid_map_maps_root_only_with_a_line_for_uid_0() {
+        assert!(uid_map_maps_root("         0          0 4294967295\n"));
+        assert!(!uid_map_maps_root("      1000       1000          1\n"));
+        assert!(!uid_map_maps_root("         0       1000          0\n"));
+        assert!(!uid_map_maps_root(""));
     }
 }
