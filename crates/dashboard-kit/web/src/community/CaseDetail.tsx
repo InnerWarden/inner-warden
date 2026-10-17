@@ -10,8 +10,8 @@ import { CHANNEL_GLYPH } from "./CaseRow";
 import { caseLadder, messageLadder } from "./ladder";
 import { OfferLine } from "./Offer";
 import { caseOffer, messageOffer } from "./offers";
-import { Ago, CARD, CopyCommand, Eyebrow, HiddenChip, OutcomeDot, tokenWrap } from "./parts";
-import { CHANNEL_WORDS, DECIDER_WORDS, OUTCOME_WORDS, shortSession, type PlatformOs } from "./words";
+import { Ago, CARD, Chip, CopyCommand, Eyebrow, HiddenChip, OutcomeDot, tokenWrap } from "./parts";
+import { asVerdict, CHANNEL_WORDS, DECIDER_WORDS, layerLine, OUTCOME_WORDS, reasonWords, shortSession, TRUST_WORDS, type PlatformOs } from "./words";
 
 /** A CLI sentence, printed as sent: text as text, a folder as code, a time through the page's clock. */
 export function Segments({ segments }: { segments: readonly Segment[] }) {
@@ -140,6 +140,10 @@ export function CaseDetail({
   const offer = caseOffer(item, os);
   const steps = withSeenTime(caseLadder({ outcomeKey: item.outcomeKey, mode: item.mode, decidedBy: item.decidedBy }), item.recordedAt);
   const notWhole = notWholeWords(item);
+  const verdict = asVerdict(item.recommendation);
+  const layered = item.identity?.layer === undefined || verdict === undefined
+    ? undefined
+    : layerLine(item.identity.layer, verdict, item.identity.trust, item.agent ?? item.agentId ?? "this agent", item.identity.relaxationWithheld);
   return (
     <div className="min-w-0 space-y-4">
       <section aria-labelledby="case-title" data-case={item.id} data-outcome-key={item.outcomeKey} className={CARD}>
@@ -162,6 +166,7 @@ export function CaseDetail({
             {notWhole === undefined ? null : <span data-not-whole>{notWhole}</span>}
           </p>
         ) : null}
+        {item.identity === undefined ? null : <CaseIdentity item={item} />}
         <dl className="mt-3 space-y-3">
           <Row term="What happened">
             <Segments segments={item.happened} />
@@ -172,6 +177,11 @@ export function CaseDetail({
               <Steps steps={steps} label="How far InnerWarden got with this case" captions compact className="w-full" />
             </div>
           </Row>
+          {layered === undefined ? null : (
+            <Row term="Decided by">
+              <p data-decided-by-layer={item.identity?.layer} data-identity-conflict={layered.conflict ? "" : undefined}>{layered.text}</p>
+            </Row>
+          )}
           <Row term="What you can do">
             <NextSteps steps={item.next} reason={item.reason} onHideReason={onHideReason} />
           </Row>
@@ -180,6 +190,40 @@ export function CaseDetail({
       {offer === undefined ? null : <OfferLine offer={offer} installed={installed} />}
       <AroundIt item={item} before={before} after={after} session={session} onOpen={onOpen} onSession={onSession} />
       <InvestigatorDetails item={item} />
+    </div>
+  );
+}
+
+/**
+ * Who asked, from the instance's own record: its name, the instance and
+ * session, and how far its word is backed. Drawn only where the decision
+ * carries identity, so a case without it is what it always was.
+ */
+function CaseIdentity({ item }: { item: Decision }) {
+  const identity = item.identity;
+  if (identity === undefined) return null;
+  const word = TRUST_WORDS[`${identity.trust}:jail`];
+  const who = item.agent ?? item.agentId ?? "This agent";
+  const session = identity.sessionId ?? item.session;
+  return (
+    <div data-case-identity className="mt-3 space-y-1 text-sm leading-6 text-slate-700">
+      <p>
+        {who}
+        {identity.instanceId === undefined ? "" : `, instance ${identity.instanceId.slice(0, 8)}`}
+        {session === "" ? "" : `, session ${shortSession(session)}`}
+      </p>
+      <p className="flex flex-wrap items-center gap-x-2 gap-y-1">
+        <span data-trust={identity.trust} title={word.tooltip}>
+          <Chip tone={word.tone} label={word.label} />
+        </span>
+        {identity.trust === "host_verified" ? null : <span className="text-xs text-slate-600">{reasonWords(identity.trustReason)}</span>}
+      </p>
+      <TechnicalOnly>
+        <p className="font-mono text-[11px] text-slate-500 [overflow-wrap:anywhere]">
+          {identity.instanceId === undefined ? "No instance on record" : `Instance ${identity.instanceId}`}. Trust decided by: the hook inside the jail ({identity.trustReason === "" ? "no reason recorded" : identity.trustReason}).
+          {identity.layer === undefined ? "" : ` Deciding layer: ${identity.layer}${identity.profile === undefined ? "" : `, profile ${identity.profile}`}.`}
+        </p>
+      </TechnicalOnly>
     </div>
   );
 }

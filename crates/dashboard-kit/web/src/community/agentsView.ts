@@ -1,7 +1,7 @@
 import type { AgentsResponse, LocalAgent } from "../api";
 import { guardrailIsConfiguredButUnobserved } from "../components/MachineIntelligence";
-import { readAgentNextStep, type AgentNextStep } from "./api";
-import type { AgentState } from "./words";
+import { readAgentIdentity, readAgentNextStep, type AgentDecisionLine, type AgentIdentity, type AgentNextStep } from "./api";
+import type { AgentState, TrustCounts } from "./words";
 
 /**
  * One agent as a row: its state in one word, how the guard is wired to it,
@@ -30,6 +30,11 @@ export type AgentRow = {
   /** `null` where the platform does not check (macOS). */
   running: boolean | null;
   lastScreenedAt?: string;
+  /**
+   * Who this agent is and what was decided about it. Absent unless the CLI
+   * sent identity fields for it, and then the row is what it always was.
+   */
+  who?: AgentIdentity;
 };
 
 export function agentState(agent: LocalAgent): AgentState {
@@ -65,6 +70,7 @@ export function agentRows(response: AgentsResponse | undefined): AgentRow[] {
     const next = readAgentNextStep((agent as LocalAgent & { next_step?: unknown }).next_step);
     const identity = readAgentNextStep((agent as LocalAgent & { identity_step?: unknown }).identity_step);
     const lastScreened = (agent.guardrail as { last_observed_at?: unknown }).last_observed_at;
+    const who = readAgentIdentity(agent);
     return {
       id: agent.id,
       name: agent.display_name,
@@ -75,6 +81,7 @@ export function agentRows(response: AgentsResponse | undefined): AgentRow[] {
       ...(identity === undefined ? {} : { identity }),
       running: agent.running,
       ...(typeof lastScreened === "string" && Number.isFinite(Date.parse(lastScreened)) ? { lastScreenedAt: lastScreened } : {}),
+      ...(who === undefined ? {} : { who }),
     };
   });
 }
@@ -139,4 +146,76 @@ export function modeLine(rows: readonly AgentRow[]): string | undefined {
   if (refusing.length === 0) return "Every command is recorded; nothing is refused.";
   if (watching.length === 0) return `${nameList(refusing)} ${refusing.length === 1 ? "refuses" : "refuse"} a deny before it runs.`;
   return `${nameList(watching)} ${watching.length === 1 ? "watches" : "watch"} only; ${nameList(refusing)} ${refusing.length === 1 ? "refuses" : "refuse"}.`;
+}
+
+const DAY_MS = 86_400_000;
+
+/**
+ * How far the agents on this machine are backed, counted: one for each live
+ * instance, and one for each agent with none that ran or was screened in the
+ * last 24 hours (it counts as declared: only its own word says what it is).
+ * `undefined` unless some agent has an instance at all, so a CLI that sends
+ * no instances adds nothing to the Overview.
+ */
+export function trustCounts(rows: readonly AgentRow[], now: number): TrustCounts | undefined {
+  if (!rows.some((row) => (row.who?.instances.length ?? 0) > 0)) return undefined;
+  const counts: TrustCounts = { total: 0, confined: 0, observed: 0, declared: 0 };
+  for (const row of rows) {
+    const live = (row.who?.instances ?? []).filter((instance) => instance.live === true);
+    for (const instance of live) {
+      counts.total += 1;
+      if (instance.trust === "host_verified") counts.confined += 1;
+      else if (instance.trust === "observed") counts.observed += 1;
+      else counts.declared += 1;
+    }
+    const active = row.running === true
+      || (row.lastScreenedAt !== undefined && now - Date.parse(row.lastScreenedAt) <= DAY_MS);
+    if (live.length === 0 && active) {
+      counts.total += 1;
+      counts.declared += 1;
+    }
+  }
+  return counts.total === 0 ? undefined : counts;
+}
+
+/** Agents the person has not decided about yet, when the CLI says so. */
+export function awaitingApproval(rows: readonly AgentRow[]): AgentRow[] {
+  return rows.filter((row) => row.who?.lifecycle === "discovered");
+}
+
+function instances(n: number | undefined): string {
+  return n === undefined ? "" : ` ${n === 1 ? "instance" : "instances"}`;
+}
+
+/**
+ * One line of the Changes list, in words, from what the CLI wrote down. `name`
+ * is the agent as the page shows it. A refused change is a line too.
+ */
+export function decisionSentence(line: AgentDecisionLine, name: string): string {
+  const target = line.instanceId === undefined ? name : `instance ${line.instanceId.slice(0, 8)}`;
+  if (line.result !== "success") {
+    const code = line.result.replace(/^failure:\s*/, "") || "unknown";
+    const did = {
+      approve: `approve ${name}`,
+      profile: `change the ${name} profile`,
+      allow: `allow ${line.rule ?? "a rule"} for ${name}`,
+      revoke: `revoke ${target}`,
+    }[line.action];
+    return `${line.by} tried to ${did}. Refused: ${code.replace(/_/g, " ")}.`;
+  }
+  switch (line.action) {
+    case "approve":
+      return `${line.by} approved ${name}${line.owner === undefined ? "" : `, owner ${line.owner}`}${line.profileAfter === undefined ? "" : `, profile ${line.profileAfter}`}.`;
+    case "profile": {
+      const change = line.profileBefore === undefined || line.profileAfter === undefined
+        ? `changed the ${name} profile`
+        : `changed the ${name} profile from ${line.profileBefore} to ${line.profileAfter}`;
+      const applies = line.confined === undefined ? "" : ` Applies to ${line.confined} confined${instances(line.confined)}.`;
+      return `${line.by} ${change}.${applies}`;
+    }
+    case "allow":
+      return `${line.by} allowed ${line.rule ?? "a rule"} for ${name} (${line.instanceId === undefined ? "confined instances" : "this instance only"}).`;
+    case "revoke":
+      return `${line.by} revoked ${target}. Its history stays.`;
+  }
 }

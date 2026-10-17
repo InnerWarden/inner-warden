@@ -55,7 +55,7 @@ export const COMMUNITY_SHELL: CommunityShell = {
     { route: "overview", label: "Overview", render: (context) => <Page context={context}><CommunityOverview context={context} /></Page> },
     { route: "posture", label: PROTECTION_LABEL, render: (context) => <Page context={context}><CommunityProtection context={context} /></Page> },
     { route: "activity", label: "Cases", render: (context) => <Page context={context}><CommunityCases context={context} /></Page> },
-    { route: "agents", label: "Agents", render: (context) => <Page context={context}><CommunityAgents /></Page> },
+    { route: "agents", label: "Agents", render: (context) => <Page context={context}><CommunityAgents context={context} /></Page> },
     { route: "tokens", label: "Tokens", render: (context) => <Page context={context}><CommunityTokens /></Page> },
   ],
   status: (meta, metaStatus) => <HeaderStatus meta={meta} metaStatus={metaStatus} />,
