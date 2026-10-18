@@ -3,6 +3,7 @@ import {
   DASHBOARD_SCHEMA_VERSION,
   type AgentCapabilityState,
   type AgentInventory,
+  type AgentKernel,
   type AgentLayerReport,
   type AgentSessionRef,
   type AgentSubject,
@@ -517,6 +518,74 @@ function agentCapability(value: unknown, path: string): AgentCapabilityState {
   return parsed;
 }
 
+const KERNEL_MODES = ["off", "observe", "enforce"] as const;
+const KERNEL_KEY = /^[a-z][a-z0-9_]{0,31}$/;
+const KERNEL_WORDS_MAX = 200;
+const KERNEL_LIST_MAX = 16;
+
+function kernelKey(value: unknown, path: string): string {
+  const key = text(value, path);
+  if (!KERNEL_KEY.test(key)) throw new Error(`${path}: expected a key of [a-z0-9_], at most 32`);
+  return key;
+}
+
+function kernelWords(value: unknown, path: string): string {
+  const words = text(value, path);
+  if (words.length === 0 || words.length > KERNEL_WORDS_MAX) throw new Error(`${path}: expected 1 to ${KERNEL_WORDS_MAX} characters`);
+  return words;
+}
+
+function bounded<T>(value: unknown, path: string, parse: (item: unknown, path: string) => T): T[] {
+  const items = array(value, path, parse);
+  if (items.length > KERNEL_LIST_MAX) throw new Error(`${path}: more than ${KERNEL_LIST_MAX}`);
+  return items;
+}
+
+/**
+ * The host's kernel protection over one type of agent, checked for its
+ * shape only: the part keys are the host's. Throws on anything else; the
+ * caller drops the field, never the subject.
+ */
+function agentKernel(value: unknown, path: string): AgentKernel {
+  const item = record(value, path);
+  const watch = record(item.watch, `${path}.watch`);
+  const parsed: AgentKernel = {
+    mode: oneOf(item.mode, KERNEL_MODES, `${path}.mode`),
+    strict: bool(item.strict, `${path}.strict`),
+    parts: bounded(item.parts, `${path}.parts`, (part, at) => {
+      const entry = record(part, at);
+      return {
+        key: kernelKey(entry.key, `${at}.key`),
+        effective: oneOf(entry.effective, KERNEL_MODES, `${at}.effective`),
+        ...(entry.why === undefined ? {} : { why: kernelWords(entry.why, `${at}.why`) }),
+      };
+    }),
+    watch: {
+      since: nullableText(watch.since, `${path}.watch.since`),
+      sessions: integer(watch.sessions, `${path}.watch.sessions`),
+      agent_starts: integer(watch.agent_starts, `${path}.watch.agent_starts`),
+      would_refuse: bounded(watch.would_refuse, `${path}.watch.would_refuse`, (entry, at) => {
+        const refusal = record(entry, at);
+        return { key: kernelKey(refusal.key, `${at}.key`), n: integer(refusal.n, `${at}.n`) };
+      }),
+    },
+    ready: bool(item.ready, `${path}.ready`),
+    blockers: bounded(item.blockers, `${path}.blockers`, kernelWords),
+    ...(item.checked_at === undefined ? {} : { checked_at: nullableText(item.checked_at, `${path}.checked_at`) }),
+  };
+  return parsed;
+}
+
+/** `kernel` when it is there and holds its shape; nothing otherwise. */
+function agentKernelOf(value: unknown, path: string): Pick<AgentSubject, "kernel"> {
+  if (value === undefined) return {};
+  try {
+    return { kernel: agentKernel(value, path) };
+  } catch {
+    return {};
+  }
+}
+
 function agentSubject(value: unknown, path: string): AgentSubject {
   const item = record(value, path);
   const parsed: AgentSubject = {
@@ -538,6 +607,7 @@ function agentSubject(value: unknown, path: string): AgentSubject {
     guardrail_configured_at: item.guardrail_configured_at === undefined ? null : nullableText(item.guardrail_configured_at, `${path}.guardrail_configured_at`),
     guardrail_recorded_activity: item.guardrail_recorded_activity === undefined ? null : nullableInteger(item.guardrail_recorded_activity, `${path}.guardrail_recorded_activity`),
     guardrail_last_observed_at: item.guardrail_last_observed_at === undefined ? null : nullableText(item.guardrail_last_observed_at, `${path}.guardrail_last_observed_at`),
+    ...agentKernelOf(item.kernel, `${path}.kernel`),
   };
   if (parsed.identity_confidence === "host_verified"
     && !parsed.identity_evidence.some((entry) => entry.integrity === "verified")) {
