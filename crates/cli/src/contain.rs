@@ -293,24 +293,140 @@ pub struct DenyPath {
     pub is_dir: bool,
 }
 
-/// PURE. The home paths a jail profile hides ([`ContainArgs::hide_home`]) that
-/// `stat` finds (`Some(is_dir)`), each once, in the order given. A path that
-/// is not there is not mounted over: bwrap would make it, and an empty
-/// folder where the host has none is not hiding anything.
-pub fn hidden_home_paths(paths: &[PathBuf], stat: impl Fn(&Path) -> Option<bool>) -> Vec<DenyPath> {
-    let mut out: Vec<DenyPath> = Vec::new();
-    for path in paths {
-        if out.iter().any(|seen| &seen.abs == path) {
-            continue;
+/// A home path a jail profile hides ([`ContainArgs::hide_home`]), as the
+/// launcher found it on the host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HiddenHomePath {
+    /// The path as the profile names it, joined to the home.
+    pub nominal: PathBuf,
+    /// Where it leads with every link followed, when something is there.
+    pub real: Option<PathBuf>,
+    /// Where it leads with every link on the way that exists followed, the
+    /// rest as written: `real` when something is there, and otherwise the
+    /// place a later file would be made.
+    pub resolved: PathBuf,
+    /// What is there is a folder.
+    pub is_dir: bool,
+    /// A link on the way leads to nothing: where a file made through it
+    /// would land is not known before it is made.
+    pub dangling_link: bool,
+}
+
+/// What the jail hides of the home ([`plan_hidden_home`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HiddenPlan {
+    /// Linux: each path as the jail sees it, covered by an empty mount.
+    pub masks: Vec<DenyPath>,
+    /// macOS: each path the sandbox denies, as named and as it resolves
+    /// (the sandbox matches the resolved path).
+    pub denies: Vec<PathBuf>,
+}
+
+/// PURE. Plan the home paths a jail profile hides.
+///
+/// A link anywhere on the way is followed: what is hidden is the place the
+/// path leads to (`real`), never a link, so bwrap never mounts on a link
+/// and the sandbox denies the path it matches. On Linux it is covered where
+/// the jail shows it: `shown` lists each host folder the jail shows, as the
+/// jail sees it and as its host path resolves, and a place none of them
+/// shows is not in the jail at all (the jail's home is empty), so nothing
+/// is laid there. On macOS both the path as named and where it leads are
+/// denied, and a path that is not there yet is denied too.
+///
+/// A path that leads outside the home is refused: a link the agent planted
+/// in a folder it can write would otherwise move the mask onto anything the
+/// jail shows (`/etc/innerwarden`). What a path leads to that the jail
+/// needs (the project, the guard, the agent's own settings) is refused by
+/// [`validate_jail_inputs`].
+pub fn plan_hidden_home(
+    paths: &[HiddenHomePath],
+    home: &Path,
+    shown: &[(PathBuf, PathBuf)],
+) -> Result<HiddenPlan, ContainError> {
+    let mut plan = HiddenPlan::default();
+    let deny = |path: &Path, plan: &mut HiddenPlan| {
+        if !plan.denies.iter().any(|seen| seen == path) {
+            plan.denies.push(path.to_path_buf());
         }
-        if let Some(is_dir) = stat(path) {
-            out.push(DenyPath {
-                abs: path.clone(),
-                is_dir,
-            });
+    };
+    for path in paths {
+        if path.dangling_link {
+            return Err(ContainError::Unsupported(format!(
+                "the hidden home path '{}' goes through a link that leads to nothing: \
+                 remove the link, or name the path it should lead to in hide_home",
+                path.nominal.display()
+            )));
+        }
+        let leads_to = path.real.as_ref().unwrap_or(&path.resolved);
+        if !leads_to.starts_with(home) {
+            return Err(ContainError::Unsupported(format!(
+                "the hidden home path '{}' leads to '{}', outside the home: name a path \
+                 inside the home in hide_home, or remove the link",
+                path.nominal.display(),
+                leads_to.display()
+            )));
+        }
+        deny(&path.nominal, &mut plan);
+        deny(leads_to, &mut plan);
+        let Some(real) = &path.real else {
+            continue;
+        };
+        let jail_view = shown
+            .iter()
+            .filter(|(_, host)| real.starts_with(host))
+            .max_by_key(|(_, host)| host.components().count())
+            .and_then(|(jail, host)| real.strip_prefix(host).ok().map(|rest| jail.join(rest)));
+        if let Some(abs) = jail_view {
+            if !plan.masks.iter().any(|seen| seen.abs == abs) {
+                plan.masks.push(DenyPath {
+                    abs,
+                    is_dir: path.is_dir,
+                });
+            }
         }
     }
-    out
+    Ok(plan)
+}
+
+/// PURE. The host folders (and files) a jail shows under their own names,
+/// each as `(where the jail shows it, where its host path resolves)`: the
+/// home's dotdirs and dotfiles it binds that exist (`existing`), the
+/// project, the worktree's folders and the read-only paths. `real`
+/// resolves a host path's links.
+pub fn shown_host_folders(
+    input: &ContainArgs,
+    home: &Path,
+    worktree: Option<&Worktree>,
+    existing: &[PathBuf],
+    real: impl Fn(&Path) -> PathBuf,
+) -> Vec<(PathBuf, PathBuf)> {
+    let mut shown: Vec<(PathBuf, PathBuf)> = DOTDIR_RW
+        .iter()
+        .chain(DOTFILE_RO)
+        .filter(|name| !DOTDIR_DENY.contains(name))
+        .map(|name| home.join(name))
+        .filter(|path| existing.contains(path))
+        .map(|path| {
+            let host = real(&path);
+            (path, host)
+        })
+        .collect();
+    let mut same = vec![input.project.clone()];
+    if let Some(worktree) = worktree {
+        same.push(worktree.git_dir.clone());
+        same.push(worktree.common_dir.clone());
+    }
+    same.extend(input.extra_ro.iter().cloned());
+    shown.extend(same.into_iter().map(|path| (path.clone(), path)));
+    shown
+}
+
+/// The home's folders a jail binds read-write, where a hidden path that is
+/// not there yet is made (empty, 0700) before the jail starts, so what a
+/// host program makes there later is under the mask too.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn writable_home_dirs() -> &'static [&'static str] {
+    DOTDIR_RW
 }
 
 /// Host facts the pure builders need, resolved by `contain_io` and injected so the
@@ -384,11 +500,15 @@ pub struct JailInputs {
     /// launcher's start-up probe found this host cannot start a jail with
     /// either, and the jail then runs as it did before the filter.
     pub seccomp_fd: Option<i32>,
-    /// The home paths a jail profile hides that exist, each as the jail
-    /// sees it and whether it is a folder ([`ContainArgs::hide_home`],
-    /// statted by the I/O layer): covered by an empty mount after every
-    /// writable bind. Empty without such a profile.
+    /// The home paths a jail profile hides, each as the jail sees it and
+    /// whether it is a folder ([`HiddenPlan::masks`]): covered by an empty
+    /// mount after every writable bind (Linux). Empty without such a
+    /// profile.
     pub hide_paths: Vec<DenyPath>,
+    /// The same paths as the sandbox denies them, as named and as they
+    /// resolve ([`HiddenPlan::denies`], macOS). Empty without such a
+    /// profile.
+    pub hide_denies: Vec<PathBuf>,
     /// The file `/etc/resolv.conf` names where it is a link into `/run`
     /// ([`launch::resolv_conf_target`]), bound read-only at that same place
     /// over the jail's empty `/run`, so the host's name resolution works in
@@ -437,6 +557,8 @@ const DOTDIR_RW: &[&str] = &[
 ];
 /// Read-only git identity re-binds.
 const DOTFILE_RO: &[&str] = &[".gitconfig"];
+/// The agent's own settings under the home, which carry the guard's hook.
+const AGENT_SETTINGS: &[&str] = &[".claude", ".claude.json"];
 /// Dotdirs that must stay INVISIBLE (never re-bound → absent under the HOME tmpfs).
 const DOTDIR_DENY: &[&str] = &[".ssh", ".gnupg", ".aws", ".mozilla", ".thunderbird"];
 const MACOS_HOME_DENY: &[&str] = &["Library/Mail", "Library/Messages", "Library/Safari"];
@@ -497,14 +619,37 @@ pub fn validate_jail_inputs(input: &JailInputs) -> Result<(), ContainError> {
     for path in &input.args.extra_ro {
         validate_bind("extra read-only", path)?;
     }
-    // A hidden home path covers what is under it: never the project, nor
-    // a folder that holds it, or the agent would work in an empty folder.
-    for hidden in &input.hide_paths {
-        if input.args.project.starts_with(&hidden.abs) {
+    // A hidden home path covers what is under it: never what the jail
+    // needs. Not the project, or the agent would work in an empty folder;
+    // not the guard's binary, whose hook would then fail to run and every
+    // command go unscreened; not a read-only path the profile shows; not
+    // the agent's own settings, which carry the hook.
+    let needed = std::iter::once(("the project", input.args.project.clone()))
+        .chain(std::iter::once(("the guard", input.iw_binary.clone())))
+        .chain(
+            input
+                .args
+                .extra_ro
+                .iter()
+                .map(|path| ("a read-only path", path.clone())),
+        )
+        .chain(
+            AGENT_SETTINGS
+                .iter()
+                .map(|name| ("the agent's settings", input.home.join(name))),
+        );
+    for (what, path) in needed {
+        let covered = input
+            .hide_paths
+            .iter()
+            .map(|hidden| hidden.abs.as_path())
+            .chain(input.hide_denies.iter().map(PathBuf::as_path))
+            .find(|hidden| path.starts_with(hidden));
+        if let Some(hidden) = covered {
             return Err(ContainError::Unsupported(format!(
-                "the hidden home path '{}' holds the project '{}'",
-                hidden.abs.display(),
-                input.args.project.display()
+                "the hidden home path '{}' holds {what} '{}'",
+                hidden.display(),
+                path.display()
             )));
         }
     }
@@ -945,11 +1090,16 @@ pub fn build_macos_profile(input: &JailInputs) -> Result<MacosJailPlan, ContainE
         ));
     }
     // project secrets (glob-expanded + statted by the I/O layer into deny_paths),
-    // and the home paths a jail profile hides that exist:
-    for d in input.deny_paths.iter().chain(&input.hide_paths) {
+    // and the home paths a jail profile hides, as named and as they resolve:
+    for path in input
+        .deny_paths
+        .iter()
+        .map(|d| d.abs.as_path())
+        .chain(input.hide_denies.iter().map(PathBuf::as_path))
+    {
         p.push_str(&format!(
             "(deny file-read* (subpath \"{}\"))\n",
-            e(&d.abs.to_string_lossy())
+            e(&path.to_string_lossy())
         ));
     }
     p.push('\n');
@@ -1019,10 +1169,15 @@ pub fn build_macos_profile(input: &JailInputs) -> Result<MacosJailPlan, ContainE
             e(&iw_cfg_real)
         ));
     }
-    for d in input.deny_paths.iter().chain(&input.hide_paths) {
+    for path in input
+        .deny_paths
+        .iter()
+        .map(|d| d.abs.as_path())
+        .chain(input.hide_denies.iter().map(PathBuf::as_path))
+    {
         p.push_str(&format!(
             "(deny file-write* (subpath \"{}\"))\n",
-            e(&d.abs.to_string_lossy())
+            e(&path.to_string_lossy())
         ));
     }
 
@@ -2669,6 +2824,7 @@ mod tests {
             // A plain jail on a host that takes the terminal filter.
             seccomp_fd: Some(launch::DRY_RUN_SECCOMP_FD),
             hide_paths: vec![],
+            hide_denies: vec![],
             // A host whose `/etc/resolv.conf` is a file of its own.
             resolv_conf: None,
             gate_instance: None,
@@ -4941,79 +5097,115 @@ mod tests {
         assert_eq!(launch.start, JailStart::OnlyWhenAdmitted);
     }
 
-    /// Only a hidden home path that exists is mounted over: a folder by an
-    /// empty tmpfs, a file by /dev/null, after every writable bind so none
-    /// brings it back. One that is not there gets nothing (bwrap would make
-    /// it), and a jail without such a profile is the jail it was.
-    ///
-    /// FAILS ON REVERT: keep the paths `stat` does not find in
-    /// `hidden_home_paths` and the missing one is mounted over; move the
-    /// masks before the dotdir binds and the read-write `.cache` bind brings
-    /// the folder back.
-    #[test]
-    fn hide_home_masks_only_existing_paths() {
-        let folder = PathBuf::from("/home/dev/.cache/git/credential");
-        let file = PathBuf::from("/home/dev/.config/app/token");
-        let missing = PathBuf::from("/home/dev/.cache/nothing-here");
-        let found = hidden_home_paths(
-            &[
-                folder.clone(),
-                missing.clone(),
-                file.clone(),
-                folder.clone(),
-            ],
+    /// A hidden home path, as found on the host.
+    fn hidden(nominal: &str, real: Option<&str>, is_dir: bool) -> HiddenHomePath {
+        HiddenHomePath {
+            nominal: PathBuf::from(nominal),
+            real: real.map(PathBuf::from),
+            resolved: PathBuf::from(real.unwrap_or(nominal)),
+            is_dir,
+            dangling_link: false,
+        }
+    }
+
+    /// The host folders `identified_inputs` shows, with `.config` a link
+    /// into a dotfiles folder.
+    fn shown_with_linked_config() -> Vec<(PathBuf, PathBuf)> {
+        let input = identified_inputs();
+        shown_host_folders(
+            &input.args,
+            &input.home,
+            None,
+            &input.existing_paths,
             |path| {
-                if path == folder {
-                    Some(true)
-                } else if path == file {
-                    Some(false)
+                if path == Path::new("/home/dev/.config") {
+                    PathBuf::from("/home/dev/dotfiles/config")
                 } else {
-                    None
+                    path.to_path_buf()
                 }
             },
+        )
+    }
+
+    /// A hidden home path is covered where the jail shows what it leads to:
+    /// a folder by an empty tmpfs, a file by /dev/null, after every writable
+    /// bind so none brings it back. A path that is not there gets no mount
+    /// (bwrap would make it); the sandbox denies it anyway, so a file made
+    /// there later is denied too. A jail without such a profile is the jail
+    /// it was.
+    ///
+    /// FAILS ON REVERT: mount a path that is not there in
+    /// `plan_hidden_home`, and the missing one is mounted over; deny only
+    /// what is there and the missing one is not denied; move the masks
+    /// before the dotdir binds and the read-write `.cache` bind brings the
+    /// folder back.
+    #[test]
+    fn hide_home_masks_what_is_there_and_denies_what_may_come() {
+        let folder = "/home/dev/.cache/git/credential";
+        let file = "/home/dev/.config/app/token";
+        let missing = "/home/dev/.cache/nothing-here";
+        let mut input = identified_inputs();
+        let shown = shown_host_folders(
+            &input.args,
+            &input.home,
+            None,
+            &input.existing_paths,
+            Path::to_path_buf,
         );
+        let plan = plan_hidden_home(
+            &[
+                hidden(folder, Some(folder), true),
+                hidden(missing, None, false),
+                hidden(file, Some(file), false),
+                hidden(folder, Some(folder), true),
+            ],
+            &input.home,
+            &shown,
+        )
+        .unwrap();
         assert_eq!(
-            found,
+            plan.masks,
             [
                 DenyPath {
-                    abs: folder.clone(),
+                    abs: PathBuf::from(folder),
                     is_dir: true
                 },
                 DenyPath {
-                    abs: file.clone(),
+                    abs: PathBuf::from(file),
                     is_dir: false
                 },
             ]
         );
-        let mut input = identified_inputs();
-        input.hide_paths = found;
+        assert_eq!(
+            plan.denies,
+            [folder, missing, file].map(PathBuf::from).to_vec()
+        );
+        input.hide_paths = plan.masks;
+        input.hide_denies = plan.denies;
         let a = build_linux_jail(&input).unwrap().bwrap_args;
         let tmpfs = a
             .windows(2)
-            .position(|w| w[0] == "--tmpfs" && w[1] == folder.to_str().unwrap())
+            .position(|w| w[0] == "--tmpfs" && w[1] == folder)
             .expect("the folder under an empty tmpfs");
         let null = a
             .windows(3)
-            .position(|w| {
-                w[0] == "--ro-bind" && w[1] == "/dev/null" && w[2] == file.to_str().unwrap()
-            })
+            .position(|w| w[0] == "--ro-bind" && w[1] == "/dev/null" && w[2] == file)
             .expect("the file under /dev/null");
-        assert!(!a.iter().any(|w| w == missing.to_str().unwrap()));
+        assert!(!a.iter().any(|w| w == missing));
         let last_writable = a
             .windows(2)
             .rposition(|w| w[0] == "--bind")
             .expect("writable binds");
         assert!(tmpfs > last_writable && null > last_writable);
-        // macOS has no mount to lay: the same paths are denied, read and
-        // write, as a project secret is.
+        // macOS has no mount to lay: the paths are denied, read and write,
+        // as a project secret is, the missing one too.
         let profile = build_macos_profile(&input).unwrap().profile;
-        for path in [&folder, &file] {
+        for path in [folder, file, missing] {
             for access in ["read", "write"] {
-                let rule = format!("(deny file-{access}* (subpath \"{}\"))", path.display());
+                let rule = format!("(deny file-{access}* (subpath \"{path}\"))");
                 assert!(profile.contains(&rule), "{rule}");
             }
         }
-        assert!(!profile.contains(missing.to_str().unwrap()));
         // None: the identified golden, byte for byte.
         assert_eq!(
             build_linux_jail(&identified_inputs())
@@ -5022,6 +5214,169 @@ mod tests {
                 .join("\n"),
             GOLDEN_ARGV_IDENTIFIED
         );
+    }
+
+    /// A link on the way of a hidden home path is followed, never mounted
+    /// on. Measured with bwrap 0.9.0 and 0.12.0: a mount on a link aborts
+    /// the jail ("Can't mount tmpfs on ... No such file or directory"), and
+    /// sandbox-exec denies only the path a link resolves to.
+    /// - `.config/gh` a link to `~/dotfiles/gh`, which the jail does not
+    ///   show: nothing is mounted (the link dangles in the jail); macOS
+    ///   denies both paths.
+    /// - `.config/gh3` a link to `~/.local/share/gh3`, which the jail shows
+    ///   through `.local`: that is covered.
+    /// - `.config` itself a link to `~/dotfiles/config`: the jail shows it
+    ///   at `~/.config`, so `~/.config/gh` is covered there, and macOS
+    ///   denies `~/dotfiles/config/gh`, the path it matches.
+    ///
+    /// FAILS ON REVERT: mount the path as named (the plan before this one)
+    /// and the first line mounts on a link; deny only the path as named and
+    /// macOS leaves the real one readable.
+    #[test]
+    fn a_link_on_the_way_of_a_hidden_home_path_is_followed() {
+        let input = identified_inputs();
+        let shown = shown_with_linked_config();
+        let plan = plan_hidden_home(
+            &[
+                hidden("/home/dev/.config/gh", Some("/home/dev/dotfiles/gh"), true),
+                hidden(
+                    "/home/dev/.config/gh3",
+                    Some("/home/dev/.local/share/gh3"),
+                    true,
+                ),
+                hidden(
+                    "/home/dev/.config/token",
+                    Some("/home/dev/dotfiles/config/token"),
+                    false,
+                ),
+            ],
+            &input.home,
+            &shown,
+        )
+        .unwrap();
+        assert_eq!(
+            plan.masks,
+            [
+                DenyPath {
+                    abs: PathBuf::from("/home/dev/.local/share/gh3"),
+                    is_dir: true
+                },
+                DenyPath {
+                    abs: PathBuf::from("/home/dev/.config/token"),
+                    is_dir: false
+                },
+            ]
+        );
+        for denied in [
+            "/home/dev/.config/gh",
+            "/home/dev/dotfiles/gh",
+            "/home/dev/.config/gh3",
+            "/home/dev/.local/share/gh3",
+            "/home/dev/.config/token",
+            "/home/dev/dotfiles/config/token",
+        ] {
+            assert!(
+                plan.denies.contains(&PathBuf::from(denied)),
+                "{denied}: {:?}",
+                plan.denies
+            );
+        }
+    }
+
+    /// A hidden home path that leads outside the home is refused, whatever
+    /// the link is: one the agent planted in a folder it can write would
+    /// otherwise move the empty mount onto anything the jail shows. What it
+    /// leads to inside the home that the jail needs is refused by the
+    /// inputs' check ([`validate_jail_inputs`]).
+    ///
+    /// FAILS ON REVERT: drop the home check in `plan_hidden_home` and the
+    /// jail's `/etc/innerwarden` is emptied.
+    #[test]
+    fn a_hidden_home_path_that_leads_outside_the_home_is_refused() {
+        let input = identified_inputs();
+        let shown = shown_with_linked_config();
+        for (real, exists) in [("/etc/innerwarden", true), ("/srv/other/secret", false)] {
+            let path = HiddenHomePath {
+                nominal: PathBuf::from("/home/dev/.cache/git/credential"),
+                real: exists.then(|| PathBuf::from(real)),
+                resolved: PathBuf::from(real),
+                is_dir: true,
+                dangling_link: false,
+            };
+            let refused = plan_hidden_home(&[path], &input.home, &shown).unwrap_err();
+            assert!(
+                refused.to_string().contains("outside the home"),
+                "{refused}"
+            );
+        }
+        // A link that leads to nothing is refused: where a file made
+        // through it would land is not known.
+        let mut dangling = hidden("/home/dev/.cache/git/credential", None, false);
+        dangling.dangling_link = true;
+        assert!(plan_hidden_home(&[dangling], &input.home, &shown)
+            .unwrap_err()
+            .to_string()
+            .contains("leads to nothing"));
+        // A planted link to the project is planned, then refused before
+        // anything is installed or started.
+        let plan = plan_hidden_home(
+            &[hidden(
+                "/home/dev/.cache/git/credential",
+                Some("/home/dev/proj"),
+                true,
+            )],
+            &input.home,
+            &shown,
+        )
+        .unwrap();
+        let mut planted = identified_inputs();
+        planted.hide_paths = plan.masks;
+        planted.hide_denies = plan.denies;
+        assert!(validate_jail_inputs(&planted)
+            .unwrap_err()
+            .to_string()
+            .contains("holds the project"));
+    }
+
+    /// A hidden home path never covers what the jail needs: the guard's
+    /// binary (its hook would fail and every command go unscreened), a
+    /// read-only path the profile shows (the agent's own runtime), the
+    /// agent's settings that carry the hook. A path beside them is fine.
+    ///
+    /// FAILS ON REVERT: check only the project in `validate_jail_inputs`
+    /// and each line here but the last is taken.
+    #[test]
+    fn a_hidden_home_path_never_covers_what_the_jail_needs() {
+        for (hide, what) in [
+            ("/home/dev/.local", "the guard"),
+            ("/home/dev/.local/bin", "the guard"),
+            ("/home/dev/.local/share", "a read-only path"),
+            ("/home/dev/.claude", "the agent's settings"),
+            ("/home/dev/.claude.json", "the agent's settings"),
+        ] {
+            for denies in [false, true] {
+                let mut input = identified_inputs();
+                input.args.extra_ro = vec![PathBuf::from("/home/dev/.local/share/claude/versions")];
+                if denies {
+                    input.hide_denies = vec![PathBuf::from(hide)];
+                } else {
+                    input.hide_paths = vec![DenyPath {
+                        abs: PathBuf::from(hide),
+                        is_dir: true,
+                    }];
+                }
+                let refused = validate_jail_inputs(&input).unwrap_err().to_string();
+                assert!(refused.contains(what), "{hide}: {refused}");
+            }
+        }
+        let mut fine = identified_inputs();
+        fine.args.extra_ro = vec![PathBuf::from("/home/dev/.local/share/claude/versions")];
+        fine.hide_paths = vec![DenyPath {
+            abs: PathBuf::from("/home/dev/.cache/git/credential"),
+            is_dir: true,
+        }];
+        fine.hide_denies = vec![PathBuf::from("/home/dev/.local/share/gh")];
+        assert!(validate_jail_inputs(&fine).is_ok());
     }
 
     /// A hidden home path never holds the project: the agent would work in

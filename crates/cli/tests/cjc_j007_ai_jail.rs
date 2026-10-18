@@ -1066,3 +1066,194 @@ fn a_launcher_that_dies_before_the_host_answers_starts_nothing() {
         processes_naming(&marker)
     );
 }
+
+/// A home whose own profile hides `paths` in the claude-code jail.
+#[cfg(target_os = "linux")]
+fn home_that_hides(paths: &[&str]) -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt;
+    let home = state_home();
+    let dir = home.path().join(".config/innerwarden");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("agent-profiles.toml");
+    let list = paths
+        .iter()
+        .map(|path| format!("\"{path}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    std::fs::write(
+        &file,
+        format!("schema_version = 2\n[profile.claude-code.jail]\nhide_home = [{list}]\n"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    home
+}
+
+/// brk-1: a hidden home path that is a link (a dotfiles manager's
+/// `~/.config/gh -> ../dotfiles/gh`) does not stop the jail: bwrap is never
+/// asked to mount on a link, and the token stays out of reach. A link to a
+/// folder the jail shows (`~/.config/gh3 -> ~/.local/share/gh3`) is covered
+/// where it leads.
+///
+/// FAILS ON REVERT: mount the path as named (`plan_hidden_home` before this
+/// fix) and bwrap aborts: "Can't mount tmpfs on .../.config/gh".
+#[cfg(target_os = "linux")]
+#[test]
+fn a_hidden_home_path_behind_a_link_hides_what_it_leads_to() {
+    require_bwrap();
+    let home = home_that_hides(&[".config/gh", ".config/gh3"]);
+    let h = home.path();
+    std::fs::create_dir_all(h.join("dotfiles/gh")).unwrap();
+    std::fs::write(h.join("dotfiles/gh/hosts.yml"), "TOKEN-GH").unwrap();
+    std::os::unix::fs::symlink("../dotfiles/gh", h.join(".config/gh")).unwrap();
+    std::fs::create_dir_all(h.join(".local/share/gh3")).unwrap();
+    std::fs::write(h.join(".local/share/gh3/hosts.yml"), "TOKEN-GH3").unwrap();
+    std::os::unix::fs::symlink(h.join(".local/share/gh3"), h.join(".config/gh3")).unwrap();
+    let project = tempfile::TempDir::new().unwrap();
+    let script = format!(
+        "cat '{0}/.config/gh/hosts.yml' '{0}/.config/gh3/hosts.yml' \
+         '{0}/.local/share/gh3/hosts.yml' 2>/dev/null; echo DONE",
+        h.display()
+    );
+    let mut command = cli();
+    command
+        .args([
+            "contain",
+            "--identity",
+            "--project",
+            project.path().to_str().unwrap(),
+            "--",
+            "/bin/sh",
+            "-c",
+            &script,
+        ])
+        .env("HOME", h);
+    let output = identified_without_a_scope(&mut command)
+        .output()
+        .expect("run Linux AI Jail with --identity");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "the jail did not start: {stderr}");
+    assert!(stdout.contains("DONE"), "{stdout} {stderr}");
+    assert!(
+        !stdout.contains("TOKEN"),
+        "a hidden token was read: {stdout}"
+    );
+}
+
+/// F3: a hidden home path that is not there when the jail starts
+/// (`.cache/git/credential` on an account that never used git's credential
+/// cache) is made, empty and 0700, before the jail starts, and covered; what
+/// a host program makes there while the jail runs stays out of it.
+///
+/// FAILS ON REVERT: skip `make_hidden_folder` and the file the host makes
+/// during the run is listed inside the jail.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_hidden_home_path_made_after_the_jail_started_stays_hidden() {
+    use std::os::unix::fs::PermissionsExt;
+    require_bwrap();
+    let home = home_that_hides(&[".cache/git/credential"]);
+    let h = home.path();
+    std::fs::create_dir_all(h.join(".cache")).unwrap();
+    let credential = h.join(".cache/git/credential");
+    assert!(!credential.exists());
+    let project = tempfile::TempDir::new().unwrap();
+    let ready = project.path().join("READY");
+    let script = format!(
+        "touch '{}'; i=0; while [ $i -lt 50 ] && [ ! -e '{}/GO' ]; do sleep 0.1; i=$((i+1)); done; \
+         ls -A '{}'; echo DONE",
+        ready.display(),
+        project.path().display(),
+        credential.display()
+    );
+    let mut command = cli();
+    command
+        .args([
+            "contain",
+            "--identity",
+            "--project",
+            project.path().to_str().unwrap(),
+            "--",
+            "/bin/sh",
+            "-c",
+            &script,
+        ])
+        .env("HOME", h)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let child = identified_without_a_scope(&mut command)
+        .spawn()
+        .expect("run Linux AI Jail with --identity");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !ready.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    // The host's git makes its socket in the folder while the jail runs.
+    std::fs::create_dir_all(&credential).unwrap();
+    std::fs::write(credential.join("socket"), "").unwrap();
+    std::fs::write(project.path().join("GO"), "").unwrap();
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(stdout.contains("DONE"), "{stdout} {stderr}");
+    assert!(
+        !stdout.contains("socket"),
+        "the host's socket is in the jail: {stdout}"
+    );
+    let mode = std::fs::metadata(&credential).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700, "made as git wants it");
+}
+
+/// F2: a link planted where a hidden home path will be (the agent can write
+/// `~/.cache`) never moves the mask: one that leads to the project, or
+/// outside the home, stops the launch before anything runs.
+///
+/// FAILS ON REVERT (measured): drop the home check in `plan_hidden_home`
+/// and the launch goes on with the link to `/etc/apt`; drop the check of
+/// what the jail needs in `validate_jail_inputs` and the jail starts with
+/// its project under an empty mount.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_planted_link_never_moves_a_hidden_home_path() {
+    require_bwrap();
+    for target in ["project", "/etc/apt"] {
+        let home = home_that_hides(&[".cache/git/credential"]);
+        let h = home.path();
+        let project = tempfile::TempDir::new_in(h).unwrap();
+        std::fs::write(project.path().join("main.rs"), "fn main() {}").unwrap();
+        std::fs::create_dir_all(h.join(".cache/git")).unwrap();
+        let to = if target == "project" {
+            project.path().to_path_buf()
+        } else {
+            std::path::PathBuf::from(target)
+        };
+        std::os::unix::fs::symlink(&to, h.join(".cache/git/credential")).unwrap();
+        let marker = project.path().join("COMMAND-RAN");
+        let script = format!("touch '{}'", marker.display());
+        let mut command = cli();
+        command
+            .args([
+                "contain",
+                "--identity",
+                "--project",
+                project.path().to_str().unwrap(),
+                "--",
+                "/bin/sh",
+                "-c",
+                &script,
+            ])
+            .env("HOME", h);
+        let output = identified_without_a_scope(&mut command)
+            .output()
+            .expect("run Linux AI Jail with --identity");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{target}: {stderr}");
+        assert!(
+            stderr.contains("holds the project") || stderr.contains("outside the home"),
+            "{target}: {stderr}"
+        );
+        assert!(!marker.exists(), "{target}: the command ran");
+    }
+}

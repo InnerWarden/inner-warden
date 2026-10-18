@@ -134,7 +134,13 @@ pub fn cmd(rest: &[String]) -> ExitCode {
     }
     args.project = project;
 
-    let input = resolve_inputs(args, home, iw_binary);
+    let input = match resolve_inputs(args, home, iw_binary) {
+        Ok(input) => input,
+        Err(error) => {
+            eprintln!("innerwarden contain: {error}");
+            return ExitCode::from(2);
+        }
+    };
     if let Err(error) = validate_jail_inputs(&input) {
         eprintln!("innerwarden contain: {error}");
         return ExitCode::from(2);
@@ -262,7 +268,11 @@ fn resolve_project(p: &Path) -> PathBuf {
     std::fs::canonicalize(&base).unwrap_or(base)
 }
 
-fn resolve_inputs(args: ContainArgs, home: PathBuf, iw_binary: PathBuf) -> JailInputs {
+fn resolve_inputs(
+    args: ContainArgs,
+    home: PathBuf,
+    iw_binary: PathBuf,
+) -> Result<JailInputs, crate::contain::ContainError> {
     // Canonicalize TMPDIR too (macOS $TMPDIR is under the /var symlink) so the
     // writable-set rule matches the resolved path.
     let tmpdir = std::env::var_os("TMPDIR")
@@ -305,12 +315,22 @@ fn resolve_inputs(args: ContainArgs, home: PathBuf, iw_binary: PathBuf) -> JailI
     // builder knows file-vs-dir (Linux masks a file with /dev/null, a dir with tmpfs).
     let deny_paths = expand_deny_paths(&args.project, &args.deny_read);
 
-    // The home paths a jail profile hides, as the jail sees them: each that
-    // exists, and whether it is a folder (a file is covered by /dev/null).
-    // Without such a profile nothing is read.
-    let hide_paths = crate::contain::hidden_home_paths(&args.hide_home, |path| {
-        std::fs::metadata(path).ok().map(|meta| meta.is_dir())
-    });
+    // The home paths a jail profile hides: where each leads, every link
+    // followed, covered where the jail shows it (Linux) and denied as named
+    // and as resolved (macOS). Without such a profile nothing is read.
+    let hidden = if args.hide_home.is_empty() {
+        crate::contain::HiddenPlan::default()
+    } else {
+        let found = hidden_home_facts(&home, &args.hide_home);
+        let shown = crate::contain::shown_host_folders(
+            &args,
+            &home,
+            worktree.as_ref(),
+            &existing_paths,
+            |path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()),
+        );
+        crate::contain::plan_hidden_home(&found, &home, &shown)?
+    };
 
     // Every Linux jail, `--identity` or not: where `/etc/resolv.conf` is a
     // link into `/run`, the file it names, if that is a file.
@@ -343,7 +363,7 @@ fn resolve_inputs(args: ContainArgs, home: PathBuf, iw_binary: PathBuf) -> JailI
         (Vec::new(), Vec::new())
     };
 
-    JailInputs {
+    Ok(JailInputs {
         args,
         home,
         tmpdir,
@@ -363,9 +383,100 @@ fn resolve_inputs(args: ContainArgs, home: PathBuf, iw_binary: PathBuf) -> JailI
         child_env,
         close_userns: false,
         seccomp_fd: None,
-        hide_paths,
+        hide_paths: hidden.masks,
+        hide_denies: hidden.denies,
         resolv_conf,
         gate_instance: None,
+    })
+}
+
+/// Each home path a jail profile hides, as found on the host: where it
+/// leads with every link followed, where a file would be made when nothing
+/// is there, whether it is a folder, and whether a link on the way leads to
+/// nothing. On Linux a path that is not there yet, in a folder of the home
+/// the jail writes, is first made as an empty folder ([`make_hidden_folder`]).
+fn hidden_home_facts(home: &Path, paths: &[PathBuf]) -> Vec<crate::contain::HiddenHomePath> {
+    paths
+        .iter()
+        .map(|nominal| {
+            #[cfg(target_os = "linux")]
+            if std::fs::symlink_metadata(nominal).is_err() {
+                make_hidden_folder(home, nominal);
+            }
+            let real = std::fs::canonicalize(nominal).ok();
+            let resolved = real
+                .clone()
+                .unwrap_or_else(|| resolved_through_existing(nominal));
+            let is_dir = real
+                .as_ref()
+                .is_some_and(|path| std::fs::metadata(path).is_ok_and(|meta| meta.is_dir()));
+            crate::contain::HiddenHomePath {
+                nominal: nominal.clone(),
+                real,
+                resolved,
+                is_dir,
+                dangling_link: link_on_the_way_dangles(home, nominal),
+            }
+        })
+        .collect()
+}
+
+/// Whether a step of `path` below `home` is a link that leads to nothing.
+fn link_on_the_way_dangles(home: &Path, path: &Path) -> bool {
+    let Ok(rest) = path.strip_prefix(home) else {
+        return false;
+    };
+    let mut at = home.to_path_buf();
+    for part in rest.components() {
+        at.push(part);
+        match std::fs::symlink_metadata(&at) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                if std::fs::canonicalize(&at).is_err() {
+                    return true;
+                }
+            }
+            Ok(_) => {}
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
+/// Make a hidden home path that is not there yet as an empty folder, mode
+/// 0700, and each missing folder on the way the same, when it is in a
+/// folder of the home the jail binds read-write: a host program that makes
+/// it later (git's credential cache makes its socket folder 0700 on first
+/// use) then makes it under the jail's mask, never beside it. Nothing is
+/// made through a link or a file on the way, nor outside those folders.
+#[cfg(target_os = "linux")]
+pub(crate) fn make_hidden_folder(home: &Path, nominal: &Path) {
+    use std::os::unix::fs::DirBuilderExt;
+    let Ok(rest) = nominal.strip_prefix(home) else {
+        return;
+    };
+    let mut parts = rest.components();
+    let Some(first) = parts.next() else {
+        return;
+    };
+    let writable = crate::contain::writable_home_dirs()
+        .iter()
+        .any(|dir| first.as_os_str() == *dir);
+    let mut at = home.join(first);
+    if !writable || !at.is_dir() {
+        return;
+    }
+    for part in parts {
+        at.push(part);
+        match std::fs::symlink_metadata(&at) {
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => return,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if std::fs::DirBuilder::new().mode(0o700).create(&at).is_err() {
+                    return;
+                }
+            }
+            Err(_) => return,
+        }
     }
 }
 
