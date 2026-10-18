@@ -61,6 +61,7 @@ export const DECIDER_WORDS: Record<string, string> = {
   warden: "the local model",
   llm: "your model's second opinion",
   user: "you",
+  host: "Active Defence on this host",
 };
 
 export const CHANNELS = ["hook", "mcp", "check", "unknown"] as const;
@@ -359,6 +360,17 @@ export const WITHHELD_WORDS = {
 
 /** Any word the host recorded for not relaxing, whatever it is: one sentence. */
 export const HOST_WITHHELD_WORDS = "Active Defence on this host kept your general rules for this command.";
+
+/**
+ * A refusal of the host's own that stood: the hook recorded the host's answer
+ * and that the host decided the refusal (`decided_by: host`). Never worded as
+ * one of the general rules, which may have allowed the command.
+ */
+export const HOST_REFUSED_WORDS = "Refused by Active Defence on this host.";
+
+export function hostRefused(trustSource: TrustSource | undefined, decidedBy: string, verdict: Verdict | undefined): boolean {
+  return trustSource === "host" && decidedBy === "host" && verdict === "deny";
+}
 
 export function withheldWords(os: PlatformOs, activeDefenceInstalled: boolean, hostWithheld: boolean): string {
   if (hostWithheld) return HOST_WITHHELD_WORDS;

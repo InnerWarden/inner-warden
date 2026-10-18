@@ -344,14 +344,43 @@ describe("the Overview with identity data", () => {
 });
 
 describe("a case with identity", () => {
-  function detailWith(identity: Record<string, unknown>, recommendation: string) {
+  function detailWith(identity: Record<string, unknown>, recommendation: string, more: Record<string, unknown> = {}) {
     const entry = Object.values(byId as Record<string, { item: { recommendation: string; agent?: string } }>).find((e) => e.item.recommendation === recommendation)!;
-    return readDecisionDetail({ ...entry, item: { ...entry.item, identity } });
+    return readDecisionDetail({ ...entry, item: { ...entry.item, ...more, identity } });
   }
-  const html = (identity: Record<string, unknown>, recommendation: string, os: "macos" | "linux" = "macos", installed = false) => {
-    const detail = detailWith(identity, recommendation);
+  const html = (identity: Record<string, unknown>, recommendation: string, os: "macos" | "linux" = "macos", installed = false, more: Record<string, unknown> = {}) => {
+    const detail = detailWith(identity, recommendation, more);
     return render(<CaseDetail item={detail.item} before={[]} after={[]} os={os} installed={installed} onOpen={() => undefined} onSession={() => undefined} />);
   };
+
+  // FAILS ON REVERT: word the "Decided by" line from the recorded layer
+  // alone, and a command the general rules allowed reads as refused by them,
+  // with the host said to have kept them.
+  it("words a refusal of the host's own as the host's, never as the general rules'", () => {
+    const refused = {
+      instance_id: ID_A,
+      trust: "observed",
+      trust_reason: "confined_by_namespace",
+      trust_source: "host",
+      host_decision: "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+      host_withheld: "kernel_a_word_never_heard",
+      deciding_layer: "general",
+      profile: "claude-code",
+      relaxation_withheld: false,
+    };
+    const out = html(refused, "deny", "linux", true, { decided_by: "host" });
+    const text = textOf(out);
+    expect(text).toContain("Refused by Active Defence on this host.");
+    expect(text).toContain("decided by Active Defence on this host");
+    expect(text).not.toContain("Refused by your general rules.");
+    expect(text).not.toContain("kept your general rules");
+    expect(text).not.toContain("kernel_a_word_never_heard");
+    expect(out).not.toContain("data-relaxation-withheld");
+    // The same record decided by the general rules keeps their words.
+    const rules = textOf(html(refused, "deny", "linux", true, { decided_by: "rules" }));
+    expect(rules).toContain("Refused by your general rules.");
+    expect(rules).not.toContain("Refused by Active Defence on this host.");
+  });
 
   it("names the instance and session, the trust and why, and the layer that decided", () => {
     const out = html({ instance_id: ID_A, session_id: "a1b2c3d4-0000", trust: "observed", trust_reason: "launcher_not_trusted", deciding_layer: "general", profile: null, relaxation_withheld: true }, "review");
