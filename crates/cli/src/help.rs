@@ -239,6 +239,17 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
              too, and only a refusal of the host's own makes an allowed command\n  \
              stricter. A command the hook refuses is never asked about.\n\
              \n  \
+             A profile of schema 2, in either file, can say when its jail starts and\n  \
+             what of the home it hides. start = \"only_when_admitted\": the agent\n  \
+             starts only once Active Defence on the host admitted the jail; otherwise\n  \
+             contain says what to check and exits 2, having started nothing (a launcher\n  \
+             stopped while it waits starts nothing either). hide_home: home paths the\n  \
+             jail covers with an empty mount, or denies on macOS; a path that leads\n  \
+             outside the home, or over what the jail needs, stops the launch. A note\n  \
+             from the host about the jail is printed as `innerwarden contain: <note>`.\n  \
+             A Linux jail shows the host's resolver file read-only, so names resolve as\n  \
+             on the host.\n\
+             \n  \
              On Linux, where the host takes it, every jail starts its programs under\n  \
              a seccomp filter in the style of Flatpak that refuses TIOCSTI and\n  \
              TIOCLINUX, the terminal commands that push input into your terminal;\n  \
@@ -469,6 +480,38 @@ mod tests {
             assert!(readme.contains(said), "README lacks {said:?}");
         }
         assert!(!readme.contains("your suppressions and your own profiles file still win"));
+    }
+
+    /// The contain help and the README say what a jail profile of schema 2
+    /// adds: when the jail starts (and the exit 2 with nothing started),
+    /// what of the home it hides, the host's note, and the resolver file
+    /// every Linux jail shows, with its limit.
+    ///
+    /// FAILS ON REVERT: drop any of these from the contain help or the
+    /// README and the line that names it fails.
+    #[test]
+    fn the_contain_help_and_the_readme_say_when_a_jail_starts_and_what_it_hides() {
+        let flat = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let help = flat(&usage("contain", &[]).expect("contain has usage"));
+        for said in [
+            "start = \"only_when_admitted\": the agent starts only once Active Defence on the host admitted the jail",
+            "contain says what to check and exits 2, having started nothing",
+            "hide_home: home paths the jail covers with an empty mount, or denies on macOS",
+            "is printed as `innerwarden contain: <note>`",
+            "A Linux jail shows the host's resolver file read-only",
+        ] {
+            assert!(help.contains(said), "contain --help lacks {said:?}: {help}");
+        }
+        let readme = flat(include_str!("../../../README.md"));
+        for said in [
+            "`start = \"only_when_admitted\"`: `contain --identity` starts the agent only once Active Defence on the host has admitted the jail",
+            "and exits 2 with nothing started",
+            "`hide_home = [\".cache/git/credential\"]`: home paths the jail covers",
+            "it prints it as `innerwarden contain: <note>`",
+            "a jail keeps the resolver file it started with until the agent is restarted",
+        ] {
+            assert!(readme.contains(said), "README lacks {said:?}");
+        }
     }
 
     /// A wrapped child's flags are not ours. `contain -- claude --help` must run

@@ -208,6 +208,38 @@ before you write one: an older `innerwarden` refuses a file of schema 2, and
 so does an older Active Defence on the host, which reads the same file.
 Update both first.
 
+A profile of schema 2, in either file, can also say when its jail starts and
+what of the home it hides, under `[profile.<type>.jail]`:
+
+- `start = "only_when_admitted"`: `contain --identity` starts the agent only
+  once Active Defence on the host has admitted the jail. Otherwise it says
+  "Active Defence on this host did not admit this jail, and its profile
+  starts it only when admitted.", says what to check and which file asks for
+  it, and exits 2 with nothing started. Inside the jail the command starts
+  through `innerwarden contain-gate`, which will not start it without the
+  record of that admission, so a launcher stopped while it waits (a Ctrl-C,
+  killed) starts nothing either. On macOS such a profile never starts.
+- `hide_home = [".cache/git/credential"]`: home paths the jail covers with an
+  empty mount on Linux, or denies on macOS. A link on the way is followed and
+  the place it leads to is hidden. A path that leads outside the home, or
+  that would cover the project, the guard, a read-only path or the agent's
+  own settings, stops the launch. On Linux a path that is not there yet, in
+  a folder the jail writes, is made empty (mode 0700) first, so what a
+  program makes there later stays hidden too.
+
+The user's file can only tighten these: the stricter `start` and every hidden
+path of both files hold. When Active Defence sends a note about the jail (for
+example, whether kernel protection is in effect for the session), it prints
+it as `innerwarden contain: <note>`.
+
+Every Linux jail keeps the host's name resolution working: where
+`/etc/resolv.conf` is a link into `/run`, the file it leads to is shown
+read-only in the jail, and nothing else of the host's `/run`. Where that file
+sits in a folder of resolver data alone (resolvconf), the folder is shown, so
+the jail follows the host when the network changes. Elsewhere
+(systemd-resolved, NetworkManager) a jail keeps the resolver file it started
+with until the agent is restarted.
+
 Where a per-agent relaxation applies:
 
 - Linux;
