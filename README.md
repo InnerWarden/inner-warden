@@ -285,8 +285,12 @@ jail's filter gets that one, and `contain` says user namespaces stay open,
 joining other namespaces too, and that a 32-bit program runs in it; the
 terminal rule and the subvolume rule still hold.
 
-Limits: the filter covers those commands only. The jail shares the
-host's network, so a program in it can still reach any abstract unix socket,
+Limits: the filter covers those commands only. It refuses only new
+subvolumes and snapshots: a snapshot made before the jail started, in a folder
+the jail shows, still holds the files the jail hides (`.env`, `secrets/`, each
+`--deny-read` path), and a program in the jail can read them there. Keep such
+snapshots out of the project and out of the folders the jail shows. The jail
+shares the host's network, so a program in it can still reach any abstract unix socket,
 a desktop's X server among them, and through X type into another window. On
 a kernel older than 4.8, a program in the jail that traces another can change
 a call after the filter has seen it: there an identified jail does not close

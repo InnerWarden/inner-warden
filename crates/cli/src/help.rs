@@ -255,6 +255,8 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
              TIOCLINUX, the terminal commands that push input into your terminal,\n  \
              and new btrfs or bcachefs subvolumes or snapshots, which would show the\n  \
              files the jail hides; contain says so when the host does not take it.\n  \
+             A snapshot made before the jail started, in a folder the jail shows,\n  \
+             still holds the files it hides: only new ones are refused.\n  \
              With --identity it also refuses new user namespaces and joining other\n  \
              namespaces, ends a 32-bit program, and drops every capability: turn the\n  \
              agent's own sandbox off inside the jail. The jail shares the host's\n  \
@@ -418,13 +420,15 @@ mod tests {
     /// subvolumes and snapshots in every jail, only where the host takes
     /// it, the identified jail's capability drop and its end of 32-bit
     /// programs, the plain jail's rules on those programs, what a jail that
-    /// falls back says, the X server left reachable, and the kernels before
-    /// 4.8.
+    /// falls back says, that a snapshot made before the jail started still
+    /// holds the files it hides, the X server left reachable, and the kernels
+    /// before 4.8.
     ///
     /// FAILS ON REVERT: say again that every jail refuses injecting
     /// keystrokes, or that a plain jail gets only the keystroke rule or only
     /// the terminal rule, put the subvolume refusal back under `--identity`
-    /// alone, or drop the bcachefs words or what a fallback says.
+    /// alone, drop the bcachefs words or what a fallback says, or drop the
+    /// limit on snapshots made before the jail started.
     #[test]
     fn the_contain_help_and_the_readme_say_what_the_filter_covers() {
         let flat = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -433,6 +437,7 @@ mod tests {
             "where the host takes it",
             "every jail starts its programs under a seccomp filter in the style of Flatpak that refuses TIOCSTI and TIOCLINUX, the terminal commands that push input into your terminal, and new btrfs or bcachefs subvolumes or snapshots, which would show the files the jail hides;",
             "contain says so when the host does not take it",
+            "A snapshot made before the jail started, in a folder the jail shows, still holds the files it hides: only new ones are refused.",
             "ends a 32-bit program, and drops every capability",
             "With --identity it also refuses new user namespaces and joining other namespaces,",
             "The jail shares the host's network, so an X server's abstract socket stays reachable",
@@ -451,6 +456,7 @@ mod tests {
             "naming the keystrokes and the snapshots its programs can then make",
             "`contain` says user namespaces stay open, joining other namespaces too, and that a 32-bit program runs in it; the terminal rule and the subvolume rule still hold.",
             "Limits: the filter covers those commands only.",
+            "It refuses only new subvolumes and snapshots: a snapshot made before the jail started, in a folder the jail shows, still holds the files the jail hides (`.env`, `secrets/`, each `--deny-read` path), and a program in the jail can read them there.",
             "a desktop's X server among them",
             "On a kernel older than 4.8",
         ] {
