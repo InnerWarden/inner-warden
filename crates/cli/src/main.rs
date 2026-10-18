@@ -964,8 +964,6 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
         agent_profiles::ProfilesState::On(profiles) => {
             let hook_agent = agent_flag(rest);
             let agent_type = agent_profiles::agent_type(hook_agent.as_deref(), identity.as_ref());
-            let instance_id = identity.as_ref().and_then(|id| id.instance_id.as_deref());
-            let inside = agent_profiles::trust(identity.as_ref());
             let facts = agent_profiles::HookFacts {
                 command: &command,
                 verdict: &verdict,
@@ -973,78 +971,32 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
                 tainted: tainted.is_some(),
                 line_block_review: block_review,
             };
-            let decide_at = |trust| {
-                agent_profiles::decide_hook(
-                    &facts,
-                    profiles,
-                    agent_type.as_deref(),
-                    instance_id,
-                    trust,
-                )
-            };
-            // The hook's own decision first, at its own reading: only a
-            // review by the general rules is one the host could relax.
-            let own = decide_at(inside);
-            // That review, for an instance, is asked of the host where Active
-            // Defence runs; an allow too where the system profile asks about
-            // every command. A refusal of the hook's never is, and without a
-            // 200 nothing changes.
+            // The hook's own decision first, at its own reading. A review of
+            // an instance is asked of the host where Active Defence runs; an
+            // allow too where the system profile asks about every command. A
+            // refusal of the hook's never is, and without a 200 nothing
+            // changes.
             let url = host_decide::instance_decide_url(
                 std::env::var(agent_report::AGENT_URL_VAR).ok().as_deref(),
             );
-            let ask = host_decide::ask_for(&profiles_state, agent_type.as_deref());
-            let asked = host_decide::should_ask(
-                agent_profiles::general_verdict(&verdict),
-                own.deciding_layer,
-                ask,
-                identity.as_ref(),
-                &profiles_state,
+            let (decided, host) = host_decide::decide_with_host(
+                host_decide::ShellFacts {
+                    hook: &facts,
+                    state: &profiles_state,
+                    profiles,
+                    agent_type: agent_type.as_deref(),
+                    identity: identity.as_ref(),
+                    url: url.as_deref(),
+                },
                 upsell_io::active_defence_installed,
-                url.as_deref(),
-            );
-            let reply = match (asked, identity.as_ref(), url.as_deref()) {
-                (true, Some(id), Some(url)) => host_decide::request_for(
-                    id,
-                    agent_type.as_deref(),
-                    &command,
-                    &verdict,
-                    tainted.is_some(),
-                    ask,
-                )
-                .and_then(|request| {
-                    // The hook found its jail's record, so the key is the
-                    // copy the launcher handed in, and only that.
-                    let key = host_decide::key_file(identity.is_some());
+                |url, request, key| {
                     host_decide_io::consult(
                         url,
-                        &request,
+                        request,
                         key,
                         std::path::Path::new(key.path()),
                         host_decide::ASK_TIMEOUT,
                     )
-                }),
-                _ => None,
-            };
-            let reply = host_decide::read_reply(reply, instance_id);
-            // Decided again only when the host's answer moves the trust.
-            let trust = host_decide::decision_trust(inside, &reply);
-            let local = if trust == inside {
-                own
-            } else {
-                decide_at(trust)
-            };
-            let (decided, host) = host_decide::settle(
-                local,
-                &reply,
-                host_decide::SettleFacts {
-                    general: &verdict,
-                    line_block_review: block_review,
-                    mode: agent_type
-                        .as_deref()
-                        .and_then(|name| profiles.get(name))
-                        .and_then(|profile| profile.mode),
-                    inside,
-                    ask,
                 },
             );
             (
