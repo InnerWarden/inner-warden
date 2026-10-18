@@ -51,6 +51,24 @@
 //! net = true                               # the only value this version has
 //! ```
 //!
+//! A file of `schema_version = 2` reads as one of schema 1 and adds one key
+//! that only the system file may hold (see [`AskHost`]):
+//!
+//! ```toml
+//! schema_version = 2
+//!
+//! [profile.claude-code]
+//! ask_host = "every_command"               # or "review", the default
+//! ```
+//!
+//! `ask_host` says when the hook of an identified instance of the type asks
+//! Active Defence on its host about a shell command: `review` (only a command
+//! the general rules sent to review, what the hook always did) or
+//! `every_command` (every command the hook does not refuse itself). The
+//! user's file never says it, and a file of schema 1 that says it is refused:
+//! a build that reads only schema 1 refuses the whole file, so `ask_host` is
+//! never quietly dropped.
+//!
 //! A category is one of the signal names the engine raises
 //! ([`crate::mcp::SIGNAL_NAMES`]). ATR categories are another namespace (they
 //! are muted with `innerwarden mute`) and are refused here, as is any name
@@ -173,8 +191,17 @@ pub const SYSTEM_PROFILES_PATH: &str = "/etc/innerwarden/agent-profiles.toml";
 /// The user's file, relative to the home.
 pub const USER_PROFILES_PATH: &str = ".config/innerwarden/agent-profiles.toml";
 
-/// The schema this build reads.
+/// The schema a new file is written with: a file the verbs create, or one a
+/// build that reads only this schema can read.
 pub const PROFILES_SCHEMA: u32 = 1;
+
+/// The schema that adds what only the system file says about a type: when its
+/// hook asks the host ([`AskHost`]).
+pub const PROFILES_SCHEMA_2: u32 = 2;
+
+/// Every schema this build reads. A file of schema 1 reads as it always did,
+/// and a key schema 2 added is refused in it.
+pub const READABLE_PROFILES_SCHEMAS: [u32; 2] = [PROFILES_SCHEMA, PROFILES_SCHEMA_2];
 
 /// The largest file read. A file of profiles is a few kilobytes.
 pub const MAX_PROFILES_BYTES: usize = 64 * 1024;
@@ -265,6 +292,9 @@ pub struct ProfileEntry {
     pub mcp_tools_deny: Vec<String>,
     #[serde(default)]
     pub jail: Option<JailEntry>,
+    /// Schema 2, system file only.
+    #[serde(default)]
+    pub ask_host: Option<String>,
 }
 
 /// One `[profile.<agent type>.jail]` table as written.
@@ -301,6 +331,37 @@ impl ProfileMode {
         match self {
             ProfileMode::Enforce => "enforce",
             ProfileMode::BlockReview => "block-review",
+        }
+    }
+}
+
+/// When the hook of a type's identified instance asks Active Defence on its
+/// host about a shell command ([`crate::identity::INSTANCE_DECIDE_ROUTE`]).
+/// Said by `ask_host` in a profile of the system file, schema 2.
+///
+/// Whatever it says, a command the hook refuses itself (a hard rule, a
+/// refusal of the general rules, a profile's own refusal) is never asked
+/// about, and the hook keeps the stricter of its own verdict and the host's.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+pub enum AskHost {
+    /// Only a command the general rules sent to review: what the hook always
+    /// did, and what a profile without `ask_host` means.
+    #[default]
+    #[serde(rename = "review")]
+    Review,
+    /// Every shell command the hook does not refuse itself, an `allow` of the
+    /// general rules too.
+    #[serde(rename = "every_command")]
+    EveryCommand,
+}
+
+impl AskHost {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AskHost::Review => "review",
+            AskHost::EveryCommand => "every_command",
         }
     }
 }
@@ -346,6 +407,10 @@ pub struct AgentProfile {
     pub mcp_tools_allow: Vec<String>,
     pub mcp_tools_deny: Vec<String>,
     pub jail: JailProfile,
+    /// When the hook asks the host ([`AskHost`]); `None` is
+    /// [`AskHost::Review`]. Out of [`merge`], only ever the system file's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ask_host: Option<AskHost>,
     /// The file it came from, once [`merge`] has put the two together (the
     /// system file when both have it). `None` straight out of [`validate`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -434,6 +499,16 @@ impl AgentProfiles {
         self.types.get(agent_type)
     }
 
+    /// When the hook asks the host about a shell command of `agent_type`:
+    /// what the profile in force for it says, [`AskHost::Review`] when it
+    /// says nothing or there is none.
+    pub fn ask_host(&self, agent_type: Option<&str>) -> AskHost {
+        agent_type
+            .and_then(|name| self.get(name))
+            .and_then(|profile| profile.ask_host)
+            .unwrap_or_default()
+    }
+
     /// The decisions recorded about `agent_type`, if any.
     pub fn record(&self, agent_type: &str) -> Option<&AgentRecord> {
         self.agents.get(agent_type)
@@ -512,15 +587,17 @@ pub fn parse(bytes: &[u8]) -> Result<AgentProfiles, ProfileError> {
 
 /// Check a parsed file and turn it into the profiles it applies.
 ///
-/// Refused, with the reason: another schema, an agent type that is not an
-/// agent id, a mode other than `enforce` or `block-review`, a category that is
-/// not a signal name, an allowed category that is a hard rule, a category or
-/// a tool both allowed and denied, a tool name or a path that is not one, and
-/// `net = false`.
+/// Refused, with the reason: a schema this build does not read, an agent type
+/// that is not an agent id, a mode other than `enforce` or `block-review`, a
+/// category that is not a signal name, an allowed category that is a hard
+/// rule, a category or a tool both allowed and denied, a tool name or a path
+/// that is not one, `net = false`, and a key of schema 2 in a file of schema
+/// 1.
 pub fn validate(file: ProfilesFile) -> Result<AgentProfiles, ProfileError> {
-    if file.schema_version != PROFILES_SCHEMA {
+    if !READABLE_PROFILES_SCHEMAS.contains(&file.schema_version) {
         return Err(ProfileError(format!(
-            "unsupported schema_version {} (this version reads {PROFILES_SCHEMA})",
+            "unsupported schema_version {} (this version reads {PROFILES_SCHEMA} and \
+             {PROFILES_SCHEMA_2})",
             file.schema_version
         )));
     }
@@ -551,7 +628,7 @@ pub fn validate(file: ProfilesFile) -> Result<AgentProfiles, ProfileError> {
                  so no profile may take that name"
             )));
         }
-        let profile = validate_entry(&agent_type, entry)?;
+        let profile = validate_entry(&agent_type, entry, file.schema_version)?;
         types.insert(agent_type, profile);
     }
     let mut agents = BTreeMap::new();
@@ -734,7 +811,40 @@ fn bounded_entries(agent_type: &str, field: &str, len: usize) -> Result<(), Prof
     Ok(())
 }
 
-fn validate_entry(agent_type: &str, entry: ProfileEntry) -> Result<AgentProfile, ProfileError> {
+/// `ask_host`, from a file of `schema`: refused in a file of schema 1, one of
+/// the two words in one of schema 2.
+fn validate_ask_host(
+    agent_type: &str,
+    value: Option<&str>,
+    schema: u32,
+) -> Result<Option<AskHost>, ProfileError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if schema < PROFILES_SCHEMA_2 {
+        return Err(error_at(
+            agent_type,
+            "ask_host",
+            format!("needs schema_version = {PROFILES_SCHEMA_2}"),
+        ));
+    }
+    match value {
+        "review" => Ok(Some(AskHost::Review)),
+        "every_command" => Ok(Some(AskHost::EveryCommand)),
+        other => Err(error_at(
+            agent_type,
+            "ask_host",
+            format!("unknown value `{other}` (use `review` or `every_command`)"),
+        )),
+    }
+}
+
+fn validate_entry(
+    agent_type: &str,
+    entry: ProfileEntry,
+    schema: u32,
+) -> Result<AgentProfile, ProfileError> {
+    let ask_host = validate_ask_host(agent_type, entry.ask_host.as_deref(), schema)?;
     let mode = match entry.mode.as_deref() {
         None => None,
         Some("enforce") => Some(ProfileMode::Enforce),
@@ -794,6 +904,7 @@ fn validate_entry(agent_type: &str, entry: ProfileEntry) -> Result<AgentProfile,
         mcp_tools_allow,
         mcp_tools_deny,
         jail,
+        ask_host,
         source: None,
     })
 }
@@ -937,7 +1048,22 @@ fn validate_jail(agent_type: &str, jail: JailEntry) -> Result<JailProfile, Profi
 /// an `[agent.<type>]` table, an allowance or an instance exception. A
 /// profile the user's file assigns is one of its own tables, so it cannot
 /// relax either.
+///
+/// `ask_host` is refused there whatever it says: when the hook asks the host
+/// is the system file's to say, and inside the jail the user's file is one
+/// the agent can write.
 pub fn check_user_file(profiles: &AgentProfiles) -> Result<(), ProfileError> {
+    if let Some(agent_type) = profiles
+        .types
+        .iter()
+        .find_map(|(name, profile)| profile.ask_host.map(|_| name))
+    {
+        return Err(error_at(
+            agent_type,
+            "ask_host",
+            format!("only {SYSTEM_PROFILES_PATH} says when the hook asks the host"),
+        ));
+    }
     for (agent_type, record) in &profiles.agents {
         let field = if !record.allow_categories.is_empty() {
             "allow_categories"
@@ -997,6 +1123,9 @@ pub fn check_user_file(profiles: &AgentProfiles) -> Result<(), ProfileError> {
 /// What was decided about a type is merged too: revoked if either file says
 /// so, approved if either does, the system file's names and times first,
 /// every revoked instance and every exception of both.
+///
+/// `ask_host` is the system file's alone: one in the user's file (which
+/// [`check_user_file`] refuses) is never taken.
 pub fn merge(system: Option<&AgentProfiles>, user: Option<&AgentProfiles>) -> AgentProfiles {
     let mut types: BTreeMap<String, AgentProfile> = BTreeMap::new();
     let sides = [
@@ -1022,6 +1151,9 @@ pub fn merge(system: Option<&AgentProfiles>, user: Option<&AgentProfiles>) -> Ag
             }
             merged.jail.extra_ro = union(&merged.jail.extra_ro, &profile.jail.extra_ro);
             merged.jail.deny_read = union(&merged.jail.deny_read, &profile.jail.deny_read);
+            if profile.source == Some(ProfileSource::System) {
+                merged.ask_host = profile.ask_host;
+            }
         }
     }
     let mut agents: BTreeMap<String, AgentRecord> = BTreeMap::new();
@@ -1515,6 +1647,13 @@ pub fn changes(before: &AgentProfiles, after: &AgentProfiles) -> Vec<ProfileChan
                 new.jail.project_rw.as_deref().unwrap_or(""),
             );
         }
+        if old.ask_host != new.ask_host {
+            push(
+                "ask_host_changed",
+                name,
+                new.ask_host.map(AskHost::as_str).unwrap_or(""),
+            );
+        }
         let lists: [(&str, &[String], &[String]); 6] = [
             (
                 "allow_category",
@@ -1658,6 +1797,13 @@ pub fn describe(profile: Option<&AgentProfile>) -> Vec<String> {
     }
     list(&mut out, "Read-only in the jail", &profile.jail.extra_ro);
     list(&mut out, "Hidden in the jail", &profile.jail.deny_read);
+    if profile.ask_host == Some(AskHost::EveryCommand) {
+        out.push(
+            "In a jail, Active Defence on this host is asked about every shell command, not \
+             only a review."
+                .to_string(),
+        );
+    }
     if out.is_empty() {
         out.push("Your general rules, nothing added.".to_string());
     }
@@ -1676,7 +1822,9 @@ fn mode_strictness(mode: Option<ProfileMode>) -> u8 {
 /// Whether going from `before` to `after` (`None`: the general rules) lets
 /// the agent do anything it could not: an allowance added, a refusal or a
 /// hidden path taken away, a looser mode, more read-only paths in the jail,
-/// another project folder.
+/// another project folder, or the host asked about every command where it
+/// was not (the host then decides commands it was never asked about, and it
+/// may allow what it is asked).
 pub fn relaxes(before: Option<&AgentProfile>, after: Option<&AgentProfile>) -> bool {
     let empty = AgentProfile::default();
     let (before, after) = (before.unwrap_or(&empty), after.unwrap_or(&empty));
@@ -1689,6 +1837,8 @@ pub fn relaxes(before: Option<&AgentProfile>, after: Option<&AgentProfile>) -> b
         || gains(&before.jail.extra_ro, &after.jail.extra_ro)
         || gains(&after.jail.deny_read, &before.jail.deny_read)
         || (after.jail.project_rw.is_some() && after.jail.project_rw != before.jail.project_rw)
+        || (after.ask_host == Some(AskHost::EveryCommand)
+            && before.ask_host != Some(AskHost::EveryCommand))
 }
 
 // ---------------------------------------------------------------------------
@@ -1984,7 +2134,8 @@ net = true
     #[test]
     fn a_file_that_cannot_mean_one_thing_is_refused() {
         for (text, says) in [
-            ("schema_version = 2\n", "unsupported schema_version 2"),
+            ("schema_version = 3\n", "unsupported schema_version 3"),
+            ("schema_version = 0\n", "unsupported schema_version 0"),
             (
                 "schema_version = 1\n[profile.Claude]\n",
                 "is not an agent type",
@@ -2099,6 +2250,217 @@ net = true
         ))
         .unwrap();
         assert_eq!(check_user_file(&tightening), Ok(()));
+    }
+
+    // -- schema 2: when the hook asks the host ------------------------------
+
+    const EVERY: &str = "schema_version = 2\n[profile.claude-code]\nask_host = \"every_command\"\n";
+
+    #[test]
+    fn a_schema_2_file_is_read_with_ask_host() {
+        let checked = parse(EVERY.as_bytes()).unwrap();
+        assert_eq!(
+            checked.get("claude-code").unwrap().ask_host,
+            Some(AskHost::EveryCommand)
+        );
+        let merged = merge(Some(&checked), None);
+        assert_eq!(merged.ask_host(Some("claude-code")), AskHost::EveryCommand);
+        assert_eq!(merged.ask_host(Some("cursor")), AskHost::Review);
+        assert_eq!(merged.ask_host(None), AskHost::Review);
+        let review = parse(
+            b"schema_version = 2\n[profile.claude-code]\nask_host = \"review\"\n[profile.cursor]\n",
+        )
+        .unwrap();
+        let review = merge(Some(&review), None);
+        assert_eq!(review.ask_host(Some("claude-code")), AskHost::Review);
+        assert_eq!(review.ask_host(Some("cursor")), AskHost::Review);
+        // A type assigned to a named profile gets that profile's ask_host;
+        // one assigned the general rules gets the default.
+        let assigned = merge(
+            Some(
+                &parse(
+                    b"schema_version = 2\n[profile.kernel]\nask_host = \"every_command\"\n\
+                      [agent.claude-code]\nprofile = \"kernel\"\n[agent.codex]\nprofile = \"general\"\n",
+                )
+                .unwrap(),
+            ),
+            None,
+        );
+        assert_eq!(
+            assigned.ask_host(Some("claude-code")),
+            AskHost::EveryCommand
+        );
+        assert_eq!(assigned.ask_host(Some("codex")), AskHost::Review);
+        // Without the key, a file of schema 2 reads as the same file of
+        // schema 1.
+        let body =
+            "[profile.claude-code]\nmode = \"enforce\"\nallow_categories = [\"bare_ip_fetch\"]\n";
+        assert_eq!(
+            parse(format!("schema_version = 2\n{body}").as_bytes()).unwrap(),
+            parse(format!("schema_version = 1\n{body}").as_bytes()).unwrap()
+        );
+    }
+
+    /// A build that reads only schema 1 refuses a file of schema 2 whole, so
+    /// the key must never be read in a file that claims schema 1: there an
+    /// older build and this one would read the same file two ways.
+    ///
+    /// FAILS ON REVERT: drop the schema check from `validate_ask_host` and the
+    /// first case loads.
+    #[test]
+    fn ask_host_in_a_schema_1_file_is_refused() {
+        for (text, says) in [
+            (
+                "schema_version = 1\n[profile.claude-code]\nask_host = \"every_command\"\n",
+                "needs schema_version = 2",
+            ),
+            (
+                "schema_version = 1\n[profile.claude-code]\nask_host = \"review\"\n",
+                "needs schema_version = 2",
+            ),
+            (
+                "schema_version = 2\n[profile.claude-code]\nask_host = \"always\"\n",
+                "unknown value `always`",
+            ),
+            (
+                "schema_version = 2\n[profile.claude-code]\nask_host = \"Every_Command\"\n",
+                "unknown value",
+            ),
+        ] {
+            let err = parse(text.as_bytes()).unwrap_err().to_string();
+            assert!(err.contains(says), "{text}: {err}");
+            assert!(err.contains("ask_host"), "{text}: {err}");
+        }
+    }
+
+    /// Inside the jail the user's file is one the agent can write, and the
+    /// host deciding every command is the system file's to ask for.
+    ///
+    /// FAILS ON REVERT: drop the `ask_host` check from `check_user_file` and
+    /// both values load in the user's file.
+    #[test]
+    fn the_users_file_never_says_when_the_hook_asks() {
+        for value in ["every_command", "review"] {
+            let user = parse(
+                format!("schema_version = 2\n[profile.claude-code]\nask_host = \"{value}\"\n")
+                    .as_bytes(),
+            )
+            .unwrap();
+            let err = check_user_file(&user).unwrap_err().to_string();
+            assert!(
+                err.contains("ask_host") && err.contains("only /etc/innerwarden"),
+                "{value}: {err}"
+            );
+        }
+        let tightening = parse(
+            b"schema_version = 2\n[profile.claude-code]\ndeny_categories = [\"bare_ip_fetch\"]\n",
+        )
+        .unwrap();
+        assert_eq!(check_user_file(&tightening), Ok(()));
+    }
+
+    /// Even handed a user's side that says it (the reader refuses one), the
+    /// merge takes `ask_host` from the system file alone.
+    ///
+    /// FAILS ON REVERT: take `ask_host` from either side in `merge` and the
+    /// user's `every_command` stands.
+    #[test]
+    fn merge_takes_ask_host_from_the_system_file_only() {
+        let system = parse(b"schema_version = 2\n[profile.claude-code]\n").unwrap();
+        let user = parse(EVERY.as_bytes()).unwrap();
+        let merged = merge(Some(&system), Some(&user));
+        assert_eq!(merged.get("claude-code").unwrap().ask_host, None);
+        assert_eq!(merged.ask_host(Some("claude-code")), AskHost::Review);
+        assert_eq!(
+            merge(None, Some(&user)).ask_host(Some("claude-code")),
+            AskHost::Review
+        );
+        let review =
+            parse(b"schema_version = 2\n[profile.claude-code]\nask_host = \"review\"\n").unwrap();
+        let both = merge(Some(&user), Some(&review));
+        assert_eq!(both.ask_host(Some("claude-code")), AskHost::EveryCommand);
+    }
+
+    /// Profiles from a file of schema 1 serialise exactly as before the key
+    /// existed: no `ask_host`, the same bytes, and a copy saved before reads
+    /// back.
+    #[test]
+    fn a_schema_1_file_serialises_and_reads_as_before() {
+        let merged = merge(
+            Some(
+                &parse(
+                    b"schema_version = 1\n[profile.claude-code]\nmode = \"enforce\"\nallow_categories = [\"bare_ip_fetch\"]\n",
+                )
+                .unwrap(),
+            ),
+            None,
+        );
+        let golden = r#"{"types":{"claude-code":{"mode":"enforce","allow_categories":["bare_ip_fetch"],"deny_categories":[],"mcp_tools_allow":[],"mcp_tools_deny":[],"jail":{"project_rw":null,"extra_ro":[],"deny_read":[]},"source":"system"}}}"#;
+        assert_eq!(serde_json::to_string(&merged).unwrap(), golden);
+        let read: AgentProfiles = serde_json::from_str(golden).unwrap();
+        assert_eq!(read, merged);
+        assert_eq!(read.ask_host(Some("claude-code")), AskHost::Review);
+        let every = merge(Some(&parse(EVERY.as_bytes()).unwrap()), None);
+        let text = serde_json::to_string(&every).unwrap();
+        assert!(text.contains(r#""ask_host":"every_command""#), "{text}");
+        assert_eq!(serde_json::from_str::<AgentProfiles>(&text).unwrap(), every);
+    }
+
+    #[test]
+    fn asking_about_every_command_is_said_changed_and_a_relaxation() {
+        let plain = merge(
+            Some(&parse(b"schema_version = 1\n[profile.claude-code]\n").unwrap()),
+            None,
+        );
+        let every = merge(Some(&parse(EVERY.as_bytes()).unwrap()), None);
+        let (before, after) = (plain.get("claude-code"), every.get("claude-code"));
+        assert!(relaxes(before, after));
+        assert!(!relaxes(after, before), "asking less is not a relaxation");
+        assert!(relaxes(None, after));
+        assert!(!relaxes(after, after));
+        assert_eq!(
+            changes(&plain, &every),
+            [ProfileChange::to_type(
+                "ask_host_changed",
+                "claude-code",
+                "every_command"
+            )]
+        );
+        assert_eq!(
+            changes(&every, &plain),
+            [ProfileChange::to_type(
+                "ask_host_changed",
+                "claude-code",
+                ""
+            )]
+        );
+        assert_eq!(
+            describe(after),
+            [
+                "In a jail, Active Defence on this host is asked about every shell command, \
+                 not only a review."
+            ]
+        );
+        assert_eq!(describe(before), ["Your general rules, nothing added."]);
+    }
+
+    /// A verb that edits a file of schema 2 keeps its schema and its key; a
+    /// file the verbs create is of schema 1, as before.
+    #[test]
+    fn an_edit_keeps_the_schema_it_found() {
+        let stamp = Stamp {
+            by: "maria",
+            at: "2026-10-18T09:00:00Z",
+        };
+        let edited = edit_approve(EVERY, "claude-code", None, None, stamp).unwrap();
+        let read = parse(edited.as_bytes()).unwrap();
+        assert_eq!(
+            read.get("claude-code").unwrap().ask_host,
+            Some(AskHost::EveryCommand)
+        );
+        assert!(edited.starts_with("schema_version = 2\n"), "{edited}");
+        let fresh = edit_approve("", "claude-code", None, None, stamp).unwrap();
+        assert!(fresh.starts_with("schema_version = 1\n"), "{fresh}");
     }
 
     // -- the decisions ----------------------------------------------------

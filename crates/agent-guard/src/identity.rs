@@ -43,7 +43,9 @@
 //! No reading from inside the jail reaches `confined`, so the hook alone never
 //! applies a relaxation. Where InnerWarden Active Defence runs on the same
 //! host, the hook ASKS it ([`INSTANCE_DECIDE_ROUTE`]) when its general rules
-//! sent a shell command of an instance to review, and the host decides. The
+//! sent a shell command of an instance to review (or about every shell
+//! command it does not refuse itself, where the system profiles file asks for
+//! that: [`crate::profiles::AskHost`]), and the host decides. The
 //! hook takes `confined` as the input of [`decide`] only from an answer that
 //! says so ([`InstanceDecideAnswer::relaxes`]), keeps the stricter of its own
 //! decision and the host's verdict, and never records the answer's word as
@@ -265,7 +267,11 @@ pub fn contained_run_report(run: &ContainedRun<'_>) -> Option<serde_json::Value>
 /// The local route a hook in an identified jail calls, at most once per
 /// screened shell command and within a short bound, to ask the Active
 /// Defence agent on the same host whether a per-agent relaxation applies to
-/// a command its general rules sent to review.
+/// a command its general rules sent to review. Where the system profiles
+/// file asks for it (`ask_host = "every_command"`, see
+/// [`crate::profiles::AskHost`]), the hook also asks about a command its
+/// general rules allow, with a request of
+/// [`INSTANCE_DECIDE_EVERY_COMMAND_VERSION`].
 ///
 /// The request is an [`InstanceDecideRequest`] and it carries the command's
 /// RAW text: the host judges the command again with its own copy of the
@@ -276,8 +282,17 @@ pub fn contained_run_report(run: &ContainedRun<'_>) -> Option<serde_json::Value>
 /// decides as it did before it asked.
 pub const INSTANCE_DECIDE_ROUTE: &str = "/api/agent/instance-decide";
 
-/// The only version of the request and of the answer.
+/// The version of every answer, and of a request about a review under the
+/// default ask ([`crate::profiles::AskHost::Review`]): the request every hook
+/// before schema 2 of the profiles file sent, unchanged.
 pub const INSTANCE_DECIDE_VERSION: u32 = 1;
+
+/// The version of a request a hook sends under a profile that asks the host
+/// about every shell command ([`crate::profiles::AskHost::EveryCommand`]):
+/// the same fields, and `hook_verdict` is `allow` or `review`. The answer
+/// keeps [`INSTANCE_DECIDE_VERSION`] and its shape: what the host decided is
+/// said by its `verdict` and `withheld`.
+pub const INSTANCE_DECIDE_EVERY_COMMAND_VERSION: u32 = 2;
 
 /// The most signal names one request carries.
 pub const MAX_HOOK_SIGNALS: usize = 64;
@@ -402,10 +417,14 @@ where
 ///  "hook_signals":["bare_ip_fetch"],"tainted":false,
 ///  "hook_verdict":"review","hook_layer":"general"}
 /// ```
+///
+/// Under a profile that asks about every command the same body goes with
+/// `"v":2`, and `hook_verdict` is the general verdict, `allow` or `review`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InstanceDecideRequest {
-    /// [`INSTANCE_DECIDE_VERSION`].
+    /// [`INSTANCE_DECIDE_VERSION`], or [`INSTANCE_DECIDE_EVERY_COMMAND_VERSION`]
+    /// under a profile that asks about every command.
     pub v: u32,
     /// The instance the hook's own record names.
     pub instance_id: String,
@@ -423,7 +442,10 @@ pub struct InstanceDecideRequest {
     pub hook_signals: Vec<String>,
     /// An argument of the command came from an earlier tool result.
     pub tainted: bool,
-    /// Always [`Verdict::Review`]: the hook asks about nothing else.
+    /// The general verdict the hook asks about: always [`Verdict::Review`] in
+    /// a request of [`INSTANCE_DECIDE_VERSION`]; [`Verdict::Allow`] or
+    /// [`Verdict::Review`] in one of [`INSTANCE_DECIDE_EVERY_COMMAND_VERSION`].
+    /// Never [`Verdict::Deny`]: a refusal of the hook's stays the hook's.
     pub hook_verdict: Verdict,
     /// Always [`RuleLayer::General`].
     pub hook_layer: RuleLayer,
@@ -432,7 +454,14 @@ pub struct InstanceDecideRequest {
 impl InstanceDecideRequest {
     /// Whether every field holds what the contract lets it hold.
     pub fn is_valid(&self) -> bool {
-        self.v == INSTANCE_DECIDE_VERSION
+        let asked = match self.v {
+            INSTANCE_DECIDE_VERSION => self.hook_verdict == Verdict::Review,
+            INSTANCE_DECIDE_EVERY_COMMAND_VERSION => {
+                matches!(self.hook_verdict, Verdict::Allow | Verdict::Review)
+            }
+            _ => false,
+        };
+        asked
             && is_instance_id(&self.instance_id)
             && self
                 .claimed_agent_type
@@ -443,7 +472,6 @@ impl InstanceDecideRequest {
             && self.hook_signals.len() <= MAX_HOOK_SIGNALS
             && self.hook_signals.iter().all(|s| is_hook_signal(s))
             && self.hook_signals.windows(2).all(|pair| pair[0] < pair[1])
-            && self.hook_verdict == Verdict::Review
             && self.hook_layer == RuleLayer::General
     }
 }
@@ -464,6 +492,74 @@ pub fn instance_decide_request(
     charged: &[&str],
     tainted: bool,
 ) -> Option<InstanceDecideRequest> {
+    build_instance_decide_request(
+        INSTANCE_DECIDE_VERSION,
+        Verdict::Review,
+        RequestFacts {
+            instance_id,
+            claimed_agent_type,
+            session_id,
+            command,
+            charged,
+            tainted,
+        },
+    )
+}
+
+/// PURE. The request a hook sends under a profile that asks the host about
+/// every shell command ([`INSTANCE_DECIDE_EVERY_COMMAND_VERSION`]), about one
+/// command its general rules gave `hook_verdict`. As
+/// [`instance_decide_request`], and `None` for a [`Verdict::Deny`] too: a
+/// refusal of the hook's is never asked about.
+pub fn instance_decide_request_v2(
+    instance_id: &str,
+    claimed_agent_type: Option<&str>,
+    session_id: Option<&str>,
+    command: &str,
+    charged: &[&str],
+    tainted: bool,
+    hook_verdict: Verdict,
+) -> Option<InstanceDecideRequest> {
+    if hook_verdict == Verdict::Deny {
+        return None;
+    }
+    build_instance_decide_request(
+        INSTANCE_DECIDE_EVERY_COMMAND_VERSION,
+        hook_verdict,
+        RequestFacts {
+            instance_id,
+            claimed_agent_type,
+            session_id,
+            command,
+            charged,
+            tainted,
+        },
+    )
+}
+
+/// What a request says about the command, whatever its version.
+struct RequestFacts<'a> {
+    instance_id: &'a str,
+    claimed_agent_type: Option<&'a str>,
+    session_id: Option<&'a str>,
+    command: &'a str,
+    charged: &'a [&'a str],
+    tainted: bool,
+}
+
+fn build_instance_decide_request(
+    v: u32,
+    hook_verdict: Verdict,
+    facts: RequestFacts<'_>,
+) -> Option<InstanceDecideRequest> {
+    let RequestFacts {
+        instance_id,
+        claimed_agent_type,
+        session_id,
+        command,
+        charged,
+        tainted,
+    } = facts;
     if !is_instance_id(instance_id) || command.is_empty() {
         return None;
     }
@@ -473,7 +569,7 @@ pub fn instance_decide_request(
         .filter(|name| is_hook_signal(name))
         .collect();
     Some(InstanceDecideRequest {
-        v: INSTANCE_DECIDE_VERSION,
+        v,
         instance_id: instance_id.to_string(),
         claimed_agent_type: claimed_agent_type
             .filter(|label| is_agent_label(label))
@@ -488,7 +584,7 @@ pub fn instance_decide_request(
             .map(str::to_string)
             .collect(),
         tainted,
-        hook_verdict: Verdict::Review,
+        hook_verdict,
         hook_layer: RuleLayer::General,
     })
 }
@@ -2409,8 +2505,10 @@ mod tests {
         missing.as_object_mut().unwrap().remove("session_id");
         assert!(serde_json::from_value::<InstanceDecideRequest>(missing).is_err());
         for (field, value) in [
-            ("v", json!(2)),
+            ("v", json!(0)),
+            ("v", json!(3)),
             ("hook_verdict", json!("allow")),
+            ("hook_verdict", json!("deny")),
             ("hook_layer", json!("agent_type")),
             ("command", json!("")),
             (
@@ -2429,6 +2527,98 @@ mod tests {
                 .is_ok_and(|request| request.is_valid());
             assert!(!accepted, "{wrong}");
         }
+    }
+
+    /// The request of version 1 is byte for byte the one every hook sent
+    /// before version 2 existed.
+    #[test]
+    fn a_request_of_version_1_is_the_bytes_of_before() {
+        let request = instance_decide_request(
+            OWN,
+            Some("claude-code"),
+            Some("s-1"),
+            "curl http://203.0.113.9/x",
+            &["bare_ip_fetch"],
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_string(&request).unwrap(),
+            format!(
+                "{{\"v\":1,\"instance_id\":\"{OWN}\",\"claimed_agent_type\":\"claude-code\",\
+                 \"session_id\":\"s-1\",\"command\":\"curl http://203.0.113.9/x\",\
+                 \"hook_signals\":[\"bare_ip_fetch\"],\"tainted\":false,\
+                 \"hook_verdict\":\"review\",\"hook_layer\":\"general\"}}"
+            )
+        );
+        assert_eq!(INSTANCE_DECIDE_VERSION, 1);
+        assert_eq!(INSTANCE_DECIDE_EVERY_COMMAND_VERSION, 2);
+    }
+
+    /// Under a profile that asks about every command the request is of
+    /// version 2 and says the general verdict, `allow` or `review`; a refusal
+    /// is never sent.
+    #[test]
+    fn a_request_of_version_2_says_allow_or_review() {
+        for (verdict, word) in [(Verdict::Allow, "allow"), (Verdict::Review, "review")] {
+            let request = instance_decide_request_v2(
+                OWN,
+                Some("claude-code"),
+                Some("s-1"),
+                "curl https://example.com",
+                &[],
+                false,
+                verdict,
+            )
+            .unwrap();
+            assert!(request.is_valid(), "{word}");
+            assert_eq!(
+                serde_json::to_value(&request).unwrap(),
+                json!({
+                    "v": 2,
+                    "instance_id": OWN,
+                    "claimed_agent_type": "claude-code",
+                    "session_id": "s-1",
+                    "command": "curl https://example.com",
+                    "hook_signals": [],
+                    "tainted": false,
+                    "hook_verdict": word,
+                    "hook_layer": "general",
+                })
+            );
+            let read: InstanceDecideRequest =
+                serde_json::from_value(serde_json::to_value(&request).unwrap()).unwrap();
+            assert_eq!(read, request);
+        }
+        assert_eq!(
+            instance_decide_request_v2(OWN, None, None, "rm -rf /", &[], false, Verdict::Deny),
+            None
+        );
+        assert_eq!(
+            instance_decide_request_v2("../x", None, None, "ls", &[], false, Verdict::Allow),
+            None
+        );
+    }
+
+    /// FAILS ON REVERT: let `is_valid` take any verdict under version 2 and
+    /// a request about a refusal reads as one the contract allows.
+    #[test]
+    fn a_request_of_version_2_about_a_refusal_is_not_the_contracts() {
+        let good = json!({
+            "v": 2, "instance_id": OWN, "claimed_agent_type": null, "session_id": null,
+            "command": "ls", "hook_signals": [], "tainted": false,
+            "hook_verdict": "allow", "hook_layer": "general",
+        });
+        let read: InstanceDecideRequest = serde_json::from_value(good.clone()).unwrap();
+        assert!(read.is_valid());
+        let mut deny = good.clone();
+        deny["hook_verdict"] = json!("deny");
+        let read: InstanceDecideRequest = serde_json::from_value(deny).unwrap();
+        assert!(!read.is_valid());
+        let mut layer = good;
+        layer["hook_layer"] = json!("agent_type");
+        let read: InstanceDecideRequest = serde_json::from_value(layer).unwrap();
+        assert!(!read.is_valid());
     }
 
     fn answer() -> Value {
