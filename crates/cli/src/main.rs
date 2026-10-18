@@ -302,6 +302,8 @@ fn main() -> std::process::ExitCode {
         Some("status") => status_io_cmd(),
         Some("agents") => agents_io::cmd(&args[1..]),
         Some("contain") => contain_io::cmd(&args[1..]),
+        // Run by `contain` inside a jail that starts only once admitted.
+        Some(crate::contain::launch::GATE_VERB) => contain_io::cmd_gate(&args[1..]),
         Some("enforce") => cmd_mode(&args[1..], false),
         Some("dry-run") | Some("monitor") => cmd_mode(&args[1..], true),
         Some("allow") => suppress_io::cmd_allow(&args[1..]),

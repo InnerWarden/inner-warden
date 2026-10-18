@@ -856,3 +856,213 @@ fn identity_hides_the_launchers_records_and_names_the_jails_mount_namespace() {
     );
     assert_eq!(lines.next(), Some("seen=0"), "{stdout}");
 }
+
+/// A home whose own profile starts the claude-code jail only once Active
+/// Defence on the host admitted it.
+#[cfg(target_os = "linux")]
+fn home_that_starts_only_once_admitted() -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt;
+    let home = state_home();
+    let dir = home.path().join(".config/innerwarden");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("agent-profiles.toml");
+    std::fs::write(
+        &file,
+        "schema_version = 2\n[profile.claude-code.jail]\nstart = \"only_when_admitted\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    home
+}
+
+/// The processes whose command line names `marker`: a jail left behind.
+#[cfg(target_os = "linux")]
+fn processes_naming(marker: &std::path::Path) -> Vec<String> {
+    let needle = marker.to_string_lossy().into_owned();
+    std::fs::read_dir("/proc")
+        .unwrap()
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().parse::<u32>().is_ok())
+        .filter_map(|entry| std::fs::read(entry.path().join("cmdline")).ok())
+        .map(|bytes| String::from_utf8_lossy(&bytes).replace('\0', " "))
+        .filter(|line| line.contains(&needle))
+        .collect()
+}
+
+/// What the launcher's child wrote on stderr, read to its end on a thread,
+/// so a process that outlived the launcher is waited for, up to a bound.
+#[cfg(target_os = "linux")]
+fn stderr_to_end(child: &mut std::process::Child) -> std::sync::mpsc::Receiver<String> {
+    let mut stderr = child.stderr.take().expect("stderr piped");
+    let (send, receive) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = std::io::Read::read_to_string(&mut stderr, &mut text);
+        let _ = send.send(text);
+    });
+    receive
+}
+
+/// F17-cw: a jail whose profile starts it only once the host admitted it,
+/// on a host with no Active Defence, never runs its command. The launcher
+/// says why and exits 2, its own record of the instance is removed, and no
+/// process of the jail is left. The jail's first process is ended while it
+/// waits for its record, so not even the gate runs.
+///
+/// FAILS ON REVERT: hand the record in whatever the host said (drop the
+/// `starts` check in `launch_identified`) and the command runs; end only
+/// bwrap in `end_jail` (before 11908c7) and the jail's first process reads
+/// the closed pipe and runs the gate, whose refusal is then on stderr.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_jail_the_host_did_not_admit_never_runs_its_command() {
+    require_bwrap();
+    let home = home_that_starts_only_once_admitted();
+    let project = tempfile::TempDir::new().unwrap();
+    let marker = project.path().join("COMMAND-RAN");
+    let script = format!("touch '{}'", marker.display());
+    let mut command = cli();
+    command
+        .args([
+            "contain",
+            "--identity",
+            "--project",
+            project.path().to_str().unwrap(),
+            "--",
+            "/bin/sh",
+            "-c",
+            &script,
+        ])
+        .env("HOME", home.path())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    let mut child = identified_without_a_scope(&mut command)
+        .spawn()
+        .expect("run Linux AI Jail with --identity");
+    let stderr = stderr_to_end(&mut child);
+    let status = child.wait().unwrap();
+    let stderr = stderr
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("every process of the jail ended");
+    assert_eq!(status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains(
+            "innerwarden contain: Active Defence on this host did not admit this jail, and its \
+             profile starts it only when admitted."
+        ),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("holds no record that the host admitted it"),
+        "the jail's first process was ended before it read its record: {stderr}"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert!(!marker.exists(), "the command ran: {stderr}");
+    assert!(
+        processes_naming(&marker).is_empty(),
+        "a process of the jail is left: {:?}",
+        processes_naming(&marker)
+    );
+    let dir = home.path().join(".local/state/innerwarden/instances");
+    let records: Vec<_> = std::fs::read_dir(&dir)
+        .map(|entries| entries.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default();
+    assert!(
+        records.is_empty(),
+        "no record of an instance that never ran: {records:?}"
+    );
+}
+
+/// SEC-4: a launcher that dies while it waits for the host's answer (killed,
+/// a Ctrl-C, the OOM killer) leaves its jail an empty record, and the jail
+/// does not start its command: the gate refuses it.
+///
+/// The host here is a listener that takes the request and never answers;
+/// the launcher is SIGKILLed the moment the request arrives, after bwrap
+/// reported the jail's first process and before the launcher decided.
+///
+/// FAILS ON REVERT: hand the jail its command without the gate (drop
+/// `gate_instance` in `build_linux_jail`, as before this fix) and the
+/// command runs once the launcher is gone.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_launcher_that_dies_before_the_host_answers_starts_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+    require_bwrap();
+    let home = home_that_starts_only_once_admitted();
+    let project = tempfile::TempDir::new().unwrap();
+    let marker = project.path().join("COMMAND-RAN");
+    let script = format!("touch '{}'", marker.display());
+    // Active Defence is "installed" (its ctl is found), and its agent is a
+    // listener that takes the request and answers nothing.
+    let ad = tempfile::TempDir::new().unwrap();
+    let ctl = ad.path().join("innerwarden-ctl");
+    std::fs::write(&ctl, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&ctl, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+
+    let mut command = cli();
+    command
+        .args([
+            "contain",
+            "--identity",
+            "--project",
+            project.path().to_str().unwrap(),
+            "--",
+            "/bin/sh",
+            "-c",
+            &script,
+        ])
+        .env("HOME", home.path())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    let mut child = identified_without_a_scope(&mut command)
+        .env("IW_AD_CLI_DIRS", ad.path())
+        .env("INNERWARDEN_AGENT_URL", &url)
+        .spawn()
+        .expect("run Linux AI Jail with --identity");
+    let stderr = stderr_to_end(&mut child);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let held = loop {
+        match listener.accept() {
+            Ok((stream, _)) => break stream,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if std::time::Instant::now() > deadline || child.try_wait().unwrap().is_some() {
+                    let _ = child.kill();
+                    panic!(
+                        "the launcher never asked the host: {}",
+                        stderr
+                            .recv_timeout(std::time::Duration::from_secs(5))
+                            .unwrap_or_default()
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(e) => panic!("accept: {e}"),
+        }
+    };
+    child.kill().expect("SIGKILL the launcher");
+    child.wait().unwrap();
+    let stderr = stderr
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("every process of the jail ended");
+    drop(held);
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert!(
+        !marker.exists(),
+        "the command ran without an admission: {stderr}"
+    );
+    assert!(
+        stderr.contains("innerwarden contain: this jail holds no record that the host admitted it"),
+        "the gate refused it: {stderr}"
+    );
+    assert!(
+        processes_naming(&marker).is_empty(),
+        "a process of the jail is left: {:?}",
+        processes_naming(&marker)
+    );
+}

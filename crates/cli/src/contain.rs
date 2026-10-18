@@ -395,6 +395,11 @@ pub struct JailInputs {
     /// the jail and nothing else of the host's `/run` is shown. `None` where
     /// `/etc/resolv.conf` is a file of its own, or names nothing there.
     pub resolv_conf: Option<PathBuf>,
+    /// The instance whose record the jail must hold before its command
+    /// starts ([`launch::gated_child`]): set by the launcher only under a
+    /// profile that starts the jail once the host admitted it. `None`
+    /// otherwise, and the command is the jail's child as it always was.
+    pub gate_instance: Option<String>,
 }
 
 impl JailInputs {
@@ -810,9 +815,18 @@ pub fn build_linux_jail(input: &JailInputs) -> Result<LinuxJailPlan, ContainErro
     }
     // NO --unshare-net (agent/hook/git need it in v1); NO --clearenv.
 
-    // --- terminator + child ---
+    // --- terminator + child: through the gate where the jail starts only
+    // once admitted, so the jail itself refuses to start its command
+    // without the record the launcher hands in after the admission ---
     push(&["--"]);
-    a.extend(input.args.child.iter().cloned());
+    match &input.gate_instance {
+        Some(instance) => a.extend(launch::gated_child(
+            &input.iw_binary,
+            instance,
+            &input.args.child,
+        )),
+        None => a.extend(input.args.child.iter().cloned()),
+    }
 
     Ok(LinuxJailPlan {
         bwrap_args: a,
@@ -1949,6 +1963,91 @@ pub mod launch {
         }
     }
 
+    /// The verb the jail's command starts through under a profile that
+    /// starts the jail only once the host admitted it ([`gated_child`]).
+    pub const GATE_VERB: &str = "contain-gate";
+
+    /// What the gate says, and exits 2 on, when the jail holds no record of
+    /// its admission.
+    pub const GATE_REFUSED: &str = "this jail holds no record that the host admitted it, so \
+         its command does not start.";
+
+    /// PURE. The instance whose record the jail must hold before its command
+    /// starts: only under a profile that starts the jail once the host
+    /// admitted it ([`JailStart::OnlyWhenAdmitted`]).
+    ///
+    /// [`JailStart::OnlyWhenAdmitted`]: innerwarden_agent_guard::profiles::JailStart::OnlyWhenAdmitted
+    pub fn gate_for(
+        start: innerwarden_agent_guard::profiles::JailStart,
+        instance_id: &str,
+    ) -> Option<String> {
+        (start == innerwarden_agent_guard::profiles::JailStart::OnlyWhenAdmitted)
+            .then(|| instance_id.to_string())
+    }
+
+    /// PURE. The jail's command line through the gate: the launcher's own
+    /// binary, bound read-only in the jail, starts the command only when
+    /// the jail holds a record naming this instance ([`gate_opens`]). The
+    /// launcher hands the record in only after the host admitted the jail,
+    /// so a launcher that ends the jail, or dies (killed, Ctrl-C, the OOM
+    /// killer) before the host answered, leaves an empty record, and the
+    /// command never starts.
+    pub fn gated_child(iw_binary: &Path, instance_id: &str, child: &[String]) -> Vec<String> {
+        let mut argv = vec![
+            iw_binary.to_string_lossy().into_owned(),
+            GATE_VERB.to_string(),
+            "--instance".to_string(),
+            instance_id.to_string(),
+            "--".to_string(),
+        ];
+        argv.extend(child.iter().cloned());
+        argv
+    }
+
+    /// PURE. The gate's arguments, `--instance <id> -- <command...>`: the
+    /// instance and the command, or `None` for anything else.
+    pub fn parse_gate_args(args: &[String]) -> Option<(&str, &[String])> {
+        match args {
+            [flag, instance, end, command @ ..]
+                if flag == "--instance" && end == "--" && !instance.is_empty() =>
+            {
+                (!command.is_empty()).then_some((instance.as_str(), command))
+            }
+            _ => None,
+        }
+    }
+
+    /// PURE. Whether the gate starts the command: the record the jail holds
+    /// reads as a launch record of this build and names `instance_id`. An
+    /// empty record is the launcher's word that the host did not admit the
+    /// jail, or that the launcher is gone.
+    pub fn gate_opens(record: &[u8], instance_id: &str) -> bool {
+        innerwarden_agent_guard::identity::parse_launch_record(record)
+            .is_ok_and(|record| record.instance_id == instance_id)
+    }
+
+    /// PURE. The processes to end with a jail whose command must not run,
+    /// in order: the jail's first process as bwrap reported it
+    /// (`reported`), then those `/proc` lists as bwrap's (`listed`), each
+    /// once and only while its parent is still `bwrap`. The reported one
+    /// does not depend on the kernel listing children
+    /// (`CONFIG_PROC_CHILDREN`), which a kernel built without
+    /// `CHECKPOINT_RESTORE` does not.
+    pub fn jail_processes_to_end(
+        bwrap: u32,
+        reported: Option<u32>,
+        listed: &[u32],
+        parent_of: impl Fn(u32) -> Option<u32>,
+    ) -> Vec<u32> {
+        let mut out = Vec::new();
+        for pid in reported.into_iter().chain(listed.iter().copied()) {
+            if !out.contains(&pid) && parent_of(pid) == Some(bwrap) {
+                out.push(pid);
+            }
+        }
+        out
+    }
+
     /// PURE. The file `/etc/resolv.conf` names when it is a link into
     /// `/run` (`link` is what the link holds, as `readlink` reads it): the
     /// path it names, made absolute against `/etc` with its `.` and `..`
@@ -2572,6 +2671,7 @@ mod tests {
             hide_paths: vec![],
             // A host whose `/etc/resolv.conf` is a file of its own.
             resolv_conf: None,
+            gate_instance: None,
         }
     }
 
@@ -4996,6 +5096,139 @@ mod tests {
                 .start,
             JailStart::Always
         );
+    }
+
+    /// Under a profile that starts the jail only once the host admitted it,
+    /// the jail's command starts through the gate: the launcher's own
+    /// binary, bound read-only, with the instance it waits for. Without such
+    /// a profile the argv is the golden, byte for byte.
+    ///
+    /// FAILS ON REVERT: hand the child to bwrap as it is in
+    /// `build_linux_jail`, or return the instance for `always` in
+    /// `gate_for`, and the lines below that say otherwise fail.
+    #[test]
+    fn a_jail_that_starts_only_once_admitted_runs_its_command_through_the_gate() {
+        use innerwarden_agent_guard::profiles::JailStart;
+        let instance = launch::instance_id_from([7; 16]);
+        assert_eq!(launch::gate_for(JailStart::Always, &instance), None);
+        assert_eq!(
+            launch::gate_for(JailStart::OnlyWhenAdmitted, &instance),
+            Some(instance.clone())
+        );
+        let mut input = identified_inputs();
+        input.gate_instance = launch::gate_for(JailStart::OnlyWhenAdmitted, &instance);
+        let a = build_linux_jail(&input).unwrap().bwrap_args;
+        let end = a.iter().rposition(|w| w == "--").unwrap();
+        let iw = input.iw_binary.to_string_lossy().to_string();
+        let child = &a[a.iter().position(|w| w == "--").unwrap() + 1..];
+        let mut expected = vec![
+            iw.clone(),
+            launch::GATE_VERB.to_string(),
+            "--instance".to_string(),
+            instance.clone(),
+            "--".to_string(),
+        ];
+        expected.extend(input.args.child.iter().cloned());
+        assert_eq!(child, expected.as_slice());
+        assert_eq!(a[end + 1..], input.args.child[..]);
+        // The gate is the launcher's own binary, bound read-only.
+        assert!(a
+            .windows(3)
+            .any(|w| w[0] == "--ro-bind" && w[1] == iw && w[2] == iw));
+        assert_eq!(
+            build_linux_jail(&identified_inputs())
+                .unwrap()
+                .bwrap_args
+                .join("\n"),
+            GOLDEN_ARGV_IDENTIFIED
+        );
+        assert_eq!(
+            launch::parse_gate_args(&expected[2..]),
+            Some((instance.as_str(), &input.args.child[..]))
+        );
+        for bad in [
+            vec![],
+            vec!["--instance".to_string(), instance.clone(), "--".to_string()],
+            vec![
+                "--instance".to_string(),
+                String::new(),
+                "--".to_string(),
+                "x".to_string(),
+            ],
+            vec![
+                "--other".to_string(),
+                instance.clone(),
+                "--".to_string(),
+                "x".to_string(),
+            ],
+            vec!["--instance".to_string(), instance.clone(), "x".to_string()],
+        ] {
+            assert_eq!(launch::parse_gate_args(&bad), None, "{bad:?}");
+        }
+    }
+
+    /// The gate starts the command only on a record that names its own
+    /// instance. An empty record (the launcher ended the jail, or died
+    /// before the host answered), one that is not a record, and one of
+    /// another instance keep the command from starting.
+    ///
+    /// FAILS ON REVERT: open on any record, or on a record of any instance,
+    /// in `gate_opens`, and the empty or the other-instance line opens.
+    #[test]
+    fn the_gate_starts_the_command_only_on_a_record_naming_its_instance() {
+        let (mode, launcher, project) = (
+            Mode::Monitor,
+            Path::new("/usr/local/bin/innerwarden"),
+            Path::new("/home/dev/proj"),
+        );
+        let record = launch::assemble_record(launch_facts(&mode, launcher, project)).unwrap();
+        let json = serde_json::to_vec(&record).unwrap();
+        assert!(launch::gate_opens(&json, &record.instance_id));
+        let other = launch::instance_id_from([8; 16]);
+        assert!(!launch::gate_opens(&json, &other));
+        for refused in [
+            &b""[..],
+            b"   ",
+            b"{}",
+            b"not json",
+            &json[..json.len() / 2],
+        ] {
+            assert!(
+                !launch::gate_opens(refused, &record.instance_id),
+                "{:?}",
+                String::from_utf8_lossy(refused)
+            );
+        }
+        assert_eq!(
+            launch::GATE_REFUSED,
+            "this jail holds no record that the host admitted it, so its command does not start."
+        );
+    }
+
+    /// A jail is ended by the pid bwrap reported for its first process,
+    /// whether or not the kernel lists bwrap's children (a kernel built
+    /// without `CHECKPOINT_RESTORE` has no `/proc/<pid>/task/*/children`).
+    /// Each pid once, and only while its parent is still bwrap.
+    ///
+    /// FAILS ON REVERT: end only the listed children in
+    /// `jail_processes_to_end` and the first line, a kernel that lists none,
+    /// ends nothing.
+    #[test]
+    fn a_jail_is_ended_by_the_pid_bwrap_reported_even_where_proc_lists_no_children() {
+        use launch::jail_processes_to_end;
+        let parent = |pid: u32| match pid {
+            101 | 102 => Some(100),
+            201 => Some(1),
+            _ => None,
+        };
+        assert_eq!(jail_processes_to_end(100, Some(101), &[], parent), [101]);
+        assert_eq!(
+            jail_processes_to_end(100, Some(101), &[101, 102], parent),
+            [101, 102]
+        );
+        assert_eq!(jail_processes_to_end(100, None, &[102], parent), [102]);
+        // A pid that ended and was handed to someone else is not signalled.
+        assert!(jail_processes_to_end(100, Some(201), &[201, 999], parent).is_empty());
     }
 
     /// Where `/etc/resolv.conf` is a link into `/run`, the jail gets the

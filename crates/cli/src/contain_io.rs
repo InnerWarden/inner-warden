@@ -173,6 +173,45 @@ pub fn cmd(rest: &[String]) -> ExitCode {
     }
 }
 
+/// `innerwarden contain-gate --instance <id> -- <command...>`: run inside a
+/// jail whose profile starts it only once the host admitted it, as the jail's
+/// command ([`crate::contain::launch::gated_child`]). It starts `command`
+/// only when the record mounted in the jail names `id`; otherwise it says so
+/// and exits 2, and nothing else runs.
+pub fn cmd_gate(rest: &[String]) -> ExitCode {
+    use crate::contain::launch::{gate_opens, parse_gate_args, GATE_REFUSED};
+    let Some((instance, command)) = parse_gate_args(rest) else {
+        eprintln!("innerwarden contain: the gate takes --instance <id> -- <command>");
+        return ExitCode::from(2);
+    };
+    let opens =
+        crate::hook_identity::mounted_record().is_some_and(|record| gate_opens(&record, instance));
+    if !opens {
+        eprintln!("innerwarden contain: {GATE_REFUSED}");
+        return ExitCode::from(2);
+    }
+    run_in_place(command)
+}
+
+/// Replace this process with `command`, as the jail's own child would have
+/// been started. Returns only when it could not be.
+#[cfg(unix)]
+fn run_in_place(command: &[String]) -> ExitCode {
+    use std::os::unix::process::CommandExt;
+    let error = Command::new(&command[0]).args(&command[1..]).exec();
+    eprintln!("innerwarden contain: cannot run {}: {error}", command[0]);
+    ExitCode::from(if error.kind() == std::io::ErrorKind::NotFound {
+        127
+    } else {
+        126
+    })
+}
+
+#[cfg(not(unix))]
+fn run_in_place(_command: &[String]) -> ExitCode {
+    ExitCode::from(2)
+}
+
 /// Each entry on the way to the system profiles file, as the host shows it:
 /// `symlink_metadata`, never followed. A path that is not there, or that sits
 /// in a folder closed to this user, is absent.
@@ -326,6 +365,7 @@ fn resolve_inputs(args: ContainArgs, home: PathBuf, iw_binary: PathBuf) -> JailI
         seccomp_fd: None,
         hide_paths,
         resolv_conf,
+        gate_instance: None,
     }
 }
 
@@ -1066,6 +1106,11 @@ fn launch_identified(
     identified.close_userns = input.close_userns
         && filter == Some(innerwarden_agent_guard::seccomp::Rules::Identified)
         && filter_reader.is_some();
+    // Under a profile that starts the jail only once the host admitted it,
+    // the jail's command starts through the gate, which needs the record
+    // the launcher writes only after the admission: a launcher that dies
+    // before the host answered leaves the jail an empty record.
+    identified.gate_instance = crate::contain::launch::gate_for(input.args.start, instance_id);
     let plan = match build_linux_jail(&identified) {
         Ok(p) => p,
         Err(e) => {
@@ -1092,6 +1137,10 @@ fn launch_identified(
     };
     let info = read_info(&mut info_reader);
     drop(info_reader);
+    let reported = match &info {
+        InfoRead::Got(info) => Some(info.child_pid),
+        _ => None,
+    };
     let record = match info {
         InfoRead::Nothing => {
             drop(record_writer);
@@ -1118,7 +1167,7 @@ fn launch_identified(
             "innerwarden contain: {}",
             crate::contain::launch::NOT_ADMITTED
         );
-        end_jail(&mut child);
+        end_jail(&mut child, reported);
         drop(record_writer);
         // The launcher's own copy of a record it never handed in, and the
         // project path beside it: no instance of it ever ran.
@@ -1154,23 +1203,29 @@ fn launch_identified(
 }
 
 /// End a jail whose command must not run, while its first process is still
-/// waiting for the record: SIGKILL to each process bwrap started, then to
-/// bwrap. Killing bwrap alone is not enough: measured with bwrap 0.9.0, its
-/// child waiting on the record outlives it (`--die-with-parent` is not in
-/// force yet at that point), reads the end of the closed pipe, and runs the
-/// command. A process SIGKILLed while it waits never runs another
-/// instruction of its own, so the record pipe may close once this returns.
+/// waiting for the record: SIGSTOP to bwrap, so it starts nothing more while
+/// its processes are read, then SIGKILL to each process bwrap started (the
+/// one it reported on its info descriptor first, then those `/proc` lists),
+/// then to bwrap. Killing bwrap alone is not enough: measured with bwrap
+/// 0.9.0, its child waiting on the record outlives it (`--die-with-parent`
+/// is not in force yet at that point), reads the end of the closed pipe,
+/// and runs the command. A process SIGKILLed while it waits never runs
+/// another instruction of its own. One this misses still runs nothing but
+/// the gate, which refuses an empty record ([`crate::contain::launch::gate_opens`]).
 #[cfg(target_os = "linux")]
-fn end_jail(child: &mut std::process::Child) {
+fn end_jail(child: &mut std::process::Child, reported: Option<u32>) {
     let bwrap = child.id();
-    for pid in proc_children(bwrap) {
-        // Only a process whose parent is still this bwrap: a pid that
-        // ended and was handed to someone else is not ours to signal.
-        if proc_parent(pid) == Some(bwrap) {
-            if let Ok(pid) = libc::pid_t::try_from(pid) {
-                // SAFETY: kill on a pid this launcher's own child started.
-                unsafe { libc::kill(pid, libc::SIGKILL) };
-            }
+    if let Ok(pid) = libc::pid_t::try_from(bwrap) {
+        // SAFETY: kill on the pid of this launcher's own child.
+        unsafe { libc::kill(pid, libc::SIGSTOP) };
+    }
+    let listed = proc_children(bwrap);
+    for pid in crate::contain::launch::jail_processes_to_end(bwrap, reported, &listed, proc_parent)
+    {
+        if let Ok(pid) = libc::pid_t::try_from(pid) {
+            // SAFETY: kill on a pid this launcher's own child started, whose
+            // parent is still that child.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
         }
     }
     let _ = child.kill();
