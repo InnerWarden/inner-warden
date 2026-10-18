@@ -185,22 +185,28 @@ The hook in a jail never applies a relaxation on its own word. When your
 general rules send a shell command of an identified instance to review, the
 hook asks InnerWarden Active Defence on the same host, if it runs there, and
 the host decides. The hook keeps the stricter of its own decision and the
-host's, so a deny, your suppressions and your own profiles file still win, and
-the trust it records stays its own reading from inside the jail.
+host's, so a deny and your own profiles file still win, and the trust it
+records stays its own reading from inside the jail. A review the hook would
+block on its line is still asked about, because the host may relax it; the
+host lets nothing of it run that the hook does not keep. When the host
+refuses a command on its own (it will not start a program in it), the hook
+says: "Active Defence on this host will not start a program in this command."
+and records the block as the host's.
 
 A profile in the system file (`/etc/innerwarden/agent-profiles.toml`,
 `schema_version = 2`) can ask for more: with `ask_host = "every_command"`
 the hook asks the host about every shell command of that type's identified
-instances that it does not refuse itself, including the ones your general
-rules allow. For a command they allow, the host's answer can only make the
-decision stricter, and a command the hook refuses is never asked about. It
-costs a request to the host on every command, bounded like the others. When
-a refusal of the host's
-is what stands, the hook says: "Active Defence on this host will not start a
-program in this command." Only the system file says `ask_host`; the user's
-file never does, and a file of schema 1 that says it is refused. An older
-`innerwarden` refuses a file of schema 2, so update it wherever the file is
-read before you write one.
+instances, confined or not, that it does not refuse itself, including the
+ones your general rules allow. A command they allow, your suppressions
+included, is made stricter only by a refusal of the host's own: the host's
+reading of your general rules does not override your suppressions. A command
+the hook refuses is never asked about. It costs a request to the host on
+every command, bounded like the others. Only the system file says
+`ask_host`; the user's file never does, and a file of schema 1 that says it
+is refused. Every program that reads the system file must read schema 2
+before you write one: an older `innerwarden` refuses a file of schema 2, and
+so does an older Active Defence on the host, which reads the same file.
+Update both first.
 
 Where a per-agent relaxation applies:
 

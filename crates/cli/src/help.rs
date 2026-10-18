@@ -233,7 +233,11 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
              command sent to review and the host decides whether a profile rule that\n  \
              relaxes your general rules applies; the stricter verdict wins. Without it\n  \
              the relaxation is recorded and not applied. MCP tools and file edits keep\n  \
-             your general rules.\n\
+             your general rules. A profile of the system file (schema 2) can say\n  \
+             ask_host = \"every_command\": the hook then asks the host about every\n  \
+             shell command it does not refuse itself, one your general rules allow\n  \
+             too, and only a refusal of the host's own makes an allowed command\n  \
+             stricter. A command the hook refuses is never asked about.\n\
              \n  \
              On Linux, where the host takes it, every jail starts its programs under\n  \
              a seccomp filter in the style of Flatpak that refuses TIOCSTI and\n  \
@@ -435,6 +439,36 @@ mod tests {
             assert!(!text.contains("refuses injecting keystrokes"));
             assert!(!text.contains("gets only the keystroke rule"));
         }
+    }
+
+    /// The contain help and the README say what `ask_host = "every_command"`
+    /// asks, what may make an allowed command stricter, and that the host
+    /// reads the system file too.
+    ///
+    /// FAILS ON REVERT: drop the `ask_host` sentence from the contain help,
+    /// or put back the README's "your suppressions ... still win" and its
+    /// warning about an older `innerwarden` alone.
+    #[test]
+    fn the_contain_help_and_the_readme_say_what_every_command_asks() {
+        let flat = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let help = flat(&usage("contain", &[]).expect("contain has usage"));
+        for said in [
+            "A profile of the system file (schema 2) can say ask_host = \"every_command\"",
+            "asks the host about every shell command it does not refuse itself, one your general rules allow too",
+            "only a refusal of the host's own makes an allowed command stricter",
+            "A command the hook refuses is never asked about.",
+        ] {
+            assert!(help.contains(said), "contain --help lacks {said:?}: {help}");
+        }
+        let readme = flat(include_str!("../../../README.md"));
+        for said in [
+            "A review the hook would block on its line is still asked about, because the host may relax it",
+            "your suppressions included, is made stricter only by a refusal of the host's own",
+            "and so does an older Active Defence on the host, which reads the same file",
+        ] {
+            assert!(readme.contains(said), "README lacks {said:?}");
+        }
+        assert!(!readme.contains("your suppressions and your own profiles file still win"));
     }
 
     /// A wrapped child's flags are not ours. `contain -- claude --help` must run
