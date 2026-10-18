@@ -129,6 +129,82 @@ pub fn system_scope_request(instance_id: &str) -> Option<serde_json::Value> {
     is_instance_id(instance_id).then(|| serde_json::json!({ "instance": instance_id }))
 }
 
+/// The status of an answer from [`SYSTEM_SCOPE_ROUTE`] that took the
+/// request. Any other status is no answer: [`SystemScopeAdmission::NONE`].
+pub const SYSTEM_SCOPE_TAKEN: u16 = 202;
+
+/// The most bytes of a [`SYSTEM_SCOPE_TAKEN`] answer's body the launcher
+/// reads. A longer body is read as none.
+pub const MAX_SYSTEM_SCOPE_ANSWER_BYTES: usize = 1024;
+
+/// The most characters of an answer's `note`.
+pub const MAX_SYSTEM_SCOPE_NOTE_CHARS: usize = 200;
+
+/// What a [`SYSTEM_SCOPE_TAKEN`] answer says to the launcher, besides what
+/// else its body holds (the host may say more; the launcher reads these two
+/// keys only):
+///
+/// ```json
+/// {"admitted": true}
+/// {"admitted": false, "note": "<one sentence for the person>"}
+/// ```
+///
+/// * `admitted`: the host admitted the jail, so whatever it keeps over a
+///   jail of the agent's type holds for this one from its start. Only a
+///   JSON `true` is an admission; anything else, or no `admitted` at all
+///   (a host that predates it), is none.
+/// * `note`: a sentence the launcher prints as it came, after
+///   `innerwarden contain: `. 1 to [`MAX_SYSTEM_SCOPE_NOTE_CHARS`] printable
+///   ASCII characters; anything else is dropped and the rest of the answer
+///   still read.
+///
+/// The launcher believes an answer only over a connection held to the key
+/// the host publishes ([`AGENT_TLS_SPKI_PATH`]): with no such connection it
+/// reads no body, and nothing is admitted. Whatever the answer, the system
+/// scope is a fact only once the kernel shows the jail in it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SystemScopeAdmission {
+    pub admitted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+impl SystemScopeAdmission {
+    /// No admission and nothing to say: no answer, or none believed.
+    pub const NONE: SystemScopeAdmission = SystemScopeAdmission {
+        admitted: false,
+        note: None,
+    };
+
+    /// PURE. What the body of a [`SYSTEM_SCOPE_TAKEN`] answer says (see the
+    /// type): nothing from a body longer than
+    /// [`MAX_SYSTEM_SCOPE_ANSWER_BYTES`] or that is not a JSON object.
+    pub fn read(body: &[u8]) -> SystemScopeAdmission {
+        if body.len() > MAX_SYSTEM_SCOPE_ANSWER_BYTES {
+            return SystemScopeAdmission::NONE;
+        }
+        let Ok(serde_json::Value::Object(fields)) = serde_json::from_slice(body) else {
+            return SystemScopeAdmission::NONE;
+        };
+        SystemScopeAdmission {
+            admitted: fields.get("admitted") == Some(&serde_json::Value::Bool(true)),
+            note: fields
+                .get("note")
+                .and_then(serde_json::Value::as_str)
+                .filter(|note| is_system_scope_note(note))
+                .map(str::to_string),
+        }
+    }
+}
+
+/// A note an answer may carry: 1 to [`MAX_SYSTEM_SCOPE_NOTE_CHARS`]
+/// printable ASCII characters, not all of them spaces.
+pub fn is_system_scope_note(note: &str) -> bool {
+    !note.trim().is_empty()
+        && note.len() <= MAX_SYSTEM_SCOPE_NOTE_CHARS
+        && note.bytes().all(|b| (0x20..=0x7e).contains(&b))
+}
+
 /// The local route a launcher calls, best effort, once an identified jail has
 /// ended, to tell the Active Defence agent on the same host what the jail's
 /// hook screened.
@@ -2216,6 +2292,122 @@ mod tests {
         assert_eq!(
             system_scope_request("7f3a9c1e42b84d0e9a6c5f1b2d3e4a59").unwrap(),
             json!({ "instance": "7f3a9c1e42b84d0e9a6c5f1b2d3e4a59" })
+        );
+    }
+
+    /// The launcher takes an admission only from a JSON `true`, within its
+    /// bound; a host that predates the key, or says anything else, admitted
+    /// nothing. What else the body holds is not read.
+    ///
+    /// FAILS ON REVERT: read `admitted` as any truthy value, or without the
+    /// bound, and the lines that say otherwise read as an admission.
+    #[test]
+    fn only_a_json_true_within_the_bound_is_an_admission() {
+        let read = |body: &str| SystemScopeAdmission::read(body.as_bytes());
+        assert_eq!(SYSTEM_SCOPE_TAKEN, 202);
+        assert_eq!(MAX_SYSTEM_SCOPE_ANSWER_BYTES, 1024);
+        assert!(read(r#"{"admitted":true}"#).admitted);
+        assert!(read(r#"{"placed":true,"unit":"u","admitted":true,"more":[1,2]}"#).admitted);
+        for not_admitted in [
+            "",
+            "{}",
+            "null",
+            "[true]",
+            "true",
+            r#"{"placed":true,"unit":"innerwarden-contain-x.scope"}"#,
+            r#"{"admitted":false}"#,
+            r#"{"admitted":"true"}"#,
+            r#"{"admitted":1}"#,
+            r#"{"admitted":null}"#,
+            r#"{"Admitted":true}"#,
+            r#"{"admitted":true"#,
+        ] {
+            assert_eq!(
+                read(not_admitted),
+                SystemScopeAdmission::NONE,
+                "{not_admitted:?}"
+            );
+        }
+        let pad = "x".repeat(MAX_SYSTEM_SCOPE_ANSWER_BYTES);
+        let long = format!(r#"{{"admitted":true,"pad":"{pad}"}}"#);
+        assert_eq!(read(&long), SystemScopeAdmission::NONE);
+        let shell = r#"{"admitted":true,"pad":""}"#.len();
+        let edge = format!(
+            r#"{{"admitted":true,"pad":"{}"}}"#,
+            "x".repeat(MAX_SYSTEM_SCOPE_ANSWER_BYTES - shell)
+        );
+        assert_eq!(edge.len(), MAX_SYSTEM_SCOPE_ANSWER_BYTES);
+        assert!(read(&edge).admitted);
+    }
+
+    /// A note is printed as it came, so only one a terminal shows as text is
+    /// kept: printable ASCII, 1 to 200 characters. A note that is not one is
+    /// dropped and the admission still read.
+    ///
+    /// FAILS ON REVERT: keep any string and the control, escape, bidi and
+    /// overlong notes are printed.
+    #[test]
+    fn a_note_is_kept_only_as_printable_text_within_its_bound() {
+        let note = "Kernel protection for claude-code is not in effect for this session: \
+                    the host could not check it.";
+        let answer = SystemScopeAdmission::read(
+            json!({ "admitted": false, "note": note })
+                .to_string()
+                .as_bytes(),
+        );
+        assert_eq!(
+            answer,
+            SystemScopeAdmission {
+                admitted: false,
+                note: Some(note.to_string())
+            }
+        );
+        assert!(is_system_scope_note(
+            &"a".repeat(MAX_SYSTEM_SCOPE_NOTE_CHARS)
+        ));
+        for bad in [
+            String::new(),
+            "   ".to_string(),
+            "a".repeat(MAX_SYSTEM_SCOPE_NOTE_CHARS + 1),
+            "line\nbreak".to_string(),
+            "tab\there".to_string(),
+            "\u{1b}[2Jcleared".to_string(),
+            "right\u{202e}to left".to_string(),
+            "caf\u{e9}".to_string(),
+        ] {
+            assert!(!is_system_scope_note(&bad), "{bad:?}");
+            let answer = SystemScopeAdmission::read(
+                json!({ "admitted": true, "note": bad })
+                    .to_string()
+                    .as_bytes(),
+            );
+            assert_eq!(
+                answer,
+                SystemScopeAdmission {
+                    admitted: true,
+                    note: None
+                },
+                "{bad:?}"
+            );
+        }
+        let answer = SystemScopeAdmission::read(br#"{"admitted":true,"note":7}"#);
+        assert_eq!(answer.note, None);
+        // What the host writes reads back as it was.
+        let written = SystemScopeAdmission {
+            admitted: false,
+            note: Some(note.to_string()),
+        };
+        assert_eq!(
+            SystemScopeAdmission::read(&serde_json::to_vec(&written).unwrap()),
+            written
+        );
+        assert_eq!(
+            serde_json::to_value(SystemScopeAdmission {
+                admitted: true,
+                note: None
+            })
+            .unwrap(),
+            json!({ "admitted": true })
         );
     }
 
