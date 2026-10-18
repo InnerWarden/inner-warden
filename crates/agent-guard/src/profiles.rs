@@ -1729,6 +1729,9 @@ pub fn decide_tool_call_in(
 }
 
 /// What the MCP proxy applies, set once when it starts.
+// One value per proxy run, never held in a collection: the size of a profile
+// in it costs nothing worth a box at every place that builds or matches it.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProxyProfile {
     /// Profiles are in force. `profile` is the one for the proxy's agent type

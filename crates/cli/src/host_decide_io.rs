@@ -70,13 +70,44 @@ pub fn consult(
 /// past it the hook goes on without an answer, and the thread, still held to
 /// its socket timeouts, ends with the process (the hook runs once per call).
 pub fn ask(url: &str, body: &[u8], timeout: Duration, pin: &[u8; 32]) -> Option<(u16, Vec<u8>)> {
+    post(
+        url,
+        body,
+        timeout,
+        pin,
+        Wanted {
+            status: 200,
+            cap: MAX_INSTANCE_ANSWER_BYTES + 1,
+        },
+    )
+}
+
+/// Which answer's body a request reads: the one of `status`, up to `cap`
+/// bytes. Any other status is done once its head is read, with no body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Wanted {
+    pub status: u16,
+    pub cap: usize,
+}
+
+/// [`ask`] for any route of the agent: POST `body` as JSON to `url`
+/// (`https://127.0.0.1:<port><path>` only) within `timeout`, believing only
+/// a server whose key hashes to `pin`, and read the body of the answer
+/// `wanted` names. The launcher asks for a system scope with it.
+pub fn post(
+    url: &str,
+    body: &[u8],
+    timeout: Duration,
+    pin: &[u8; 32],
+    wanted: Wanted,
+) -> Option<(u16, Vec<u8>)> {
     let deadline = Instant::now() + timeout;
     let (url, body, pin) = (url.to_string(), body.to_vec(), *pin);
     let (answered, answer) = std::sync::mpsc::sync_channel(1);
     std::thread::Builder::new()
         .name("host-decide".into())
         .spawn(move || {
-            let _ = answered.send(exchange(&url, &body, deadline, &pin));
+            let _ = answered.send(exchange(&url, &body, deadline, &pin, wanted));
         })
         .ok()?;
     answer
@@ -87,7 +118,13 @@ pub fn ask(url: &str, body: &[u8], timeout: Duration, pin: &[u8; 32]) -> Option<
 
 /// The request itself, each socket call held to what is left before
 /// `deadline`. [`ask`] holds the whole of it to the deadline.
-fn exchange(url: &str, body: &[u8], deadline: Instant, pin: &[u8; 32]) -> Option<(u16, Vec<u8>)> {
+fn exchange(
+    url: &str,
+    body: &[u8],
+    deadline: Instant,
+    pin: &[u8; 32],
+    wanted: Wanted,
+) -> Option<(u16, Vec<u8>)> {
     let remaining = || {
         deadline
             .checked_duration_since(Instant::now())
@@ -115,7 +152,7 @@ fn exchange(url: &str, body: &[u8], deadline: Instant, pin: &[u8; 32]) -> Option
     let mut seen = Vec::new();
     let mut chunk = [0u8; 2048];
     loop {
-        if let Parsed::Done(status, body) = parse_response(&seen, false) {
+        if let Parsed::Done(status, body) = parse_response(&seen, false, wanted) {
             return Some((status, body));
         }
         stream.sock.set_read_timeout(Some(remaining()?)).ok()?;
@@ -130,18 +167,25 @@ fn exchange(url: &str, body: &[u8], deadline: Instant, pin: &[u8; 32]) -> Option
             Err(_) => return None,
         };
         if eof {
-            return match parse_response(&seen, true) {
+            return match parse_response(&seen, true, wanted) {
                 Parsed::Done(status, body) => Some((status, body)),
                 _ => None,
             };
         }
-        if seen.len() > MAX_HEAD_BYTES + MAX_INSTANCE_ANSWER_BYTES + 64 {
-            return match parse_response(&seen, true) {
+        if seen.len() > MAX_HEAD_BYTES + wanted.cap + 64 {
+            return match parse_response(&seen, true, wanted) {
                 Parsed::Done(status, body) => Some((status, body)),
                 _ => None,
             };
         }
     }
+}
+
+/// Whether [`post`] can reach `url`: `https://127.0.0.1:<port><path>`.
+// Its caller, `contain --identity`, is Linux-only; the test runs everywhere.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn pinnable(url: &str) -> bool {
+    loopback_target(url).is_some()
 }
 
 /// `https://127.0.0.1:<port><path>` and nothing else: the address and the
@@ -171,11 +215,12 @@ enum Parsed {
 }
 
 /// PURE. Read an HTTP/1.1 response from `seen` (`eof`: nothing more will
-/// come). Any status but 200 is done as soon as the head is read, with no
-/// body. A 200's body is read by its `Content-Length`, its chunks, or to the
-/// end, and kept up to one byte more than an answer may hold.
-fn parse_response(seen: &[u8], eof: bool) -> Parsed {
-    let cap = MAX_INSTANCE_ANSWER_BYTES + 1;
+/// come). Any status but the one `wanted` names is done as soon as the head
+/// is read, with no body. That one's body is read by its `Content-Length`,
+/// its chunks, or to the end, and kept up to `wanted.cap` bytes (one more
+/// than an answer may hold, so a longer one is seen to be longer).
+fn parse_response(seen: &[u8], eof: bool, wanted: Wanted) -> Parsed {
+    let cap = wanted.cap;
     let Some(head_end) = find(seen, b"\r\n\r\n") else {
         return if eof || seen.len() > MAX_HEAD_BYTES {
             Parsed::Broken
@@ -201,7 +246,7 @@ fn parse_response(seen: &[u8], eof: bool) -> Parsed {
     let Some(status) = status else {
         return Parsed::Broken;
     };
-    if status != 200 {
+    if status != wanted.status {
         return Parsed::Done(status, Vec::new());
     }
     let mut length: Option<usize> = None;
@@ -223,22 +268,22 @@ fn parse_response(seen: &[u8], eof: bool) -> Parsed {
     let body = &seen[head_end + 4..];
     if chunked {
         return match dechunk(body, cap) {
-            Some((decoded, true)) => Parsed::Done(200, decoded),
+            Some((decoded, true)) => Parsed::Done(status, decoded),
             Some((decoded, false)) if eof || decoded.len() >= cap => {
                 let mut decoded = decoded;
                 decoded.truncate(cap);
-                Parsed::Done(200, decoded)
+                Parsed::Done(status, decoded)
             }
             Some(_) => Parsed::Incomplete,
             None => Parsed::Broken,
         };
     }
-    let wanted = length.map_or(cap, |n| n.min(cap));
-    if body.len() >= wanted {
-        return Parsed::Done(200, body[..wanted].to_vec());
+    let wanted_len = length.map_or(cap, |n| n.min(cap));
+    if body.len() >= wanted_len {
+        return Parsed::Done(status, body[..wanted_len].to_vec());
     }
     if eof {
-        return Parsed::Done(200, body.to_vec());
+        return Parsed::Done(status, body.to_vec());
     }
     Parsed::Incomplete
 }
@@ -432,6 +477,18 @@ mod tests {
 
     const ID: &str = "7f3a9c1e42b84d0e9a6c5f1b2d3e4a59";
 
+    /// What the hook's request reads: a 200's body, to one byte more than an
+    /// answer may hold.
+    const HOOK: Wanted = Wanted {
+        status: 200,
+        cap: MAX_INSTANCE_ANSWER_BYTES + 1,
+    };
+
+    /// [`super::parse_response`] for the hook's request.
+    fn parse_response(seen: &[u8], eof: bool) -> Parsed {
+        super::parse_response(seen, eof, HOOK)
+    }
+
     /// A certificate for 127.0.0.1 and its key, made for the test.
     fn certificate() -> (CertificateDer<'static>, PrivateKeyDer<'static>, [u8; 32]) {
         let made = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
@@ -623,6 +680,60 @@ mod tests {
             crate::host_decide::read_reply(reply, Some(ID)),
             crate::host_decide::HostReply::Invalid
         );
+    }
+
+    /// The launcher's request for a system scope, over the same connection
+    /// held to the host's key: the 202's body is read to its bound and says
+    /// the admission; a server holding another key gets nothing through, so
+    /// nothing is admitted.
+    ///
+    /// FAILS ON REVERT: read the body of a 200 only (the hook's `Wanted`) and
+    /// the admission is never read.
+    #[test]
+    fn the_answer_of_a_scope_request_is_read_from_its_202_over_the_key() {
+        use innerwarden_agent_guard::identity::{
+            system_scope_request, SystemScopeAdmission, MAX_SYSTEM_SCOPE_ANSWER_BYTES,
+            SYSTEM_SCOPE_TAKEN,
+        };
+        let body = br#"{"placed":true,"unit":"u","admitted":true,"note":"Kernel protection is on for this session."}"#;
+        let mut answer = format!(
+            "HTTP/1.1 202 Accepted\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        answer.extend_from_slice(body);
+        let wanted = Wanted {
+            status: SYSTEM_SCOPE_TAKEN,
+            cap: MAX_SYSTEM_SCOPE_ANSWER_BYTES + 1,
+        };
+        let request = serde_json::to_vec(&system_scope_request(ID).unwrap()).unwrap();
+        let (url, pin, taken) = server(answer.clone(), Duration::ZERO);
+        let (status, read) = post(&url, &request, Duration::from_secs(5), &pin, wanted).unwrap();
+        let seen = taken.join().unwrap().expect("a request");
+        let sent: serde_json::Value =
+            serde_json::from_slice(&seen[find(&seen, b"\r\n\r\n").unwrap() + 4..]).unwrap();
+        assert_eq!(
+            sent,
+            serde_json::json!({ "instance": ID }),
+            "the request is unchanged"
+        );
+        assert_eq!(status, 202);
+        let admission = SystemScopeAdmission::read(&read);
+        assert!(admission.admitted);
+        assert_eq!(
+            admission.note.as_deref(),
+            Some("Kernel protection is on for this session.")
+        );
+        // Another key: no request goes through and nothing is read.
+        let (url, _pin, refused) = server(answer, Duration::ZERO);
+        let (_, _, other) = certificate();
+        assert_eq!(
+            post(&url, &request, Duration::from_secs(5), &other, wanted),
+            None
+        );
+        let _ = refused.join();
+        assert!(pinnable("https://127.0.0.1:8787/api/agent/contain-scope"));
+        assert!(!pinnable("https://localhost:8787/api/agent/contain-scope"));
     }
 
     /// A server whose key is not the published one gets no request through
@@ -935,6 +1046,57 @@ mod tests {
             Parsed::Done(200, body) => assert_eq!(body.len(), MAX_INSTANCE_ANSWER_BYTES + 1),
             other => panic!("{other:?}"),
         }
+    }
+
+    /// Another route reads the body of the status it names, to its own cap,
+    /// and no other: the launcher's request for a system scope reads a
+    /// 202's body, and a 200 there is no answer of that route.
+    #[test]
+    fn another_route_reads_the_body_of_its_own_status_only() {
+        let taken = Wanted {
+            status: 202,
+            cap: 8,
+        };
+        assert_eq!(
+            super::parse_response(
+                b"HTTP/1.1 202 Accepted\r\nContent-Length: 2\r\n\r\n{}",
+                false,
+                taken
+            ),
+            Parsed::Done(202, b"{}".to_vec())
+        );
+        assert_eq!(
+            super::parse_response(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}",
+                false,
+                taken
+            ),
+            Parsed::Done(200, Vec::new())
+        );
+        match super::parse_response(
+            b"HTTP/1.1 202 Accepted\r\nContent-Length: 20\r\n\r\n0123456789abcdefghij",
+            false,
+            taken,
+        ) {
+            Parsed::Done(202, body) => assert_eq!(body, b"01234567"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            super::parse_response(
+                b"HTTP/1.1 202 Accepted\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n\r\n",
+                false,
+                taken
+            ),
+            Parsed::Done(202, b"{}".to_vec())
+        );
+        // The hook's request is what it was: a 202 there has no body.
+        assert_eq!(
+            parse_response(
+                b"HTTP/1.1 202 Accepted\r\nContent-Length: 2\r\n\r\n{}",
+                false
+            ),
+            Parsed::Done(202, Vec::new())
+        );
     }
 
     /// A chunk size near the top of `usize` is not added to: the body is

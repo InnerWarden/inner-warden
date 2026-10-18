@@ -266,6 +266,24 @@ fn resolve_inputs(args: ContainArgs, home: PathBuf, iw_binary: PathBuf) -> JailI
     // builder knows file-vs-dir (Linux masks a file with /dev/null, a dir with tmpfs).
     let deny_paths = expand_deny_paths(&args.project, &args.deny_read);
 
+    // The home paths a jail profile hides, as the jail sees them: each that
+    // exists, and whether it is a folder (a file is covered by /dev/null).
+    // Without such a profile nothing is read.
+    let hide_paths = crate::contain::hidden_home_paths(&args.hide_home, |path| {
+        std::fs::metadata(path).ok().map(|meta| meta.is_dir())
+    });
+
+    // Every Linux jail, `--identity` or not: where `/etc/resolv.conf` is a
+    // link into `/run`, the file it names, if that is a file.
+    let resolv_conf = if cfg!(target_os = "linux") {
+        std::fs::read_link("/etc/resolv.conf")
+            .ok()
+            .and_then(|link| crate::contain::launch::resolv_conf_target(&link))
+            .filter(|target| std::fs::metadata(target).is_ok_and(|m| m.is_file()))
+    } else {
+        None
+    };
+
     // Only an identified launch hides the launcher's records and keeps its
     // helpers' environment apart; without the flag none of this is read.
     let (records_dirs, child_env) = if args.identity {
@@ -306,6 +324,8 @@ fn resolve_inputs(args: ContainArgs, home: PathBuf, iw_binary: PathBuf) -> JailI
         child_env,
         close_userns: false,
         seccomp_fd: None,
+        hide_paths,
+        resolv_conf,
     }
 }
 
@@ -907,6 +927,15 @@ fn run_linux_identified(input: &JailInputs, bwrap: &Path, marks: bool) -> ExitCo
     });
     let (instance_id, unit) = match named {
         Ok(named) => named,
+        Err(why) if !crate::contain::launch::starts(input.args.start, false) => {
+            // No instance, so nothing the host could admit.
+            eprintln!("innerwarden contain: no instance record written ({why})");
+            eprintln!(
+                "innerwarden contain: {}",
+                crate::contain::launch::NOT_ADMITTED
+            );
+            return ExitCode::from(2);
+        }
         Err(why) => {
             eprintln!(
                 "innerwarden contain: no instance record written ({why}); the jail runs, unidentified"
@@ -1073,10 +1102,34 @@ fn launch_identified(
         }
         InfoRead::Failed(why) => Err(why),
         // The record says what this launch handed in, filter included.
-        InfoRead::Got(info) => identify(&identified, instance_id, unit, scope, info),
+        InfoRead::Got(info) => identify(&identified, instance_id, unit, scope, info, key),
     };
+    // Under a profile that starts the jail only once the host admitted it,
+    // a jail the host did not admit (no answer, a record that could not be
+    // made, a scope the kernel does not show) is ended here, before its
+    // command can run: the record is never handed in, and bwrap holds the
+    // jail at that point.
+    let admitted = record.as_ref().is_ok_and(|(_, admitted)| *admitted);
+    if !crate::contain::launch::starts(input.args.start, admitted) {
+        if let Err(why) = &record {
+            eprintln!("innerwarden contain: no instance record written ({why})");
+        }
+        eprintln!(
+            "innerwarden contain: {}",
+            crate::contain::launch::NOT_ADMITTED
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+        drop(record_writer);
+        // The launcher's own copy of a record it never handed in, and the
+        // project path beside it: no instance of it ever ran.
+        if record.is_ok() {
+            forget_instance(input, instance_id);
+        }
+        return Attempt::Done(ExitCode::from(2));
+    }
     let mut identified = false;
-    match record {
+    match record.map(|(json, _)| json) {
         Ok(json) => {
             // The jail reads this to its end before it builds its root.
             if let Err(e) = record_writer.write_all(&json) {
@@ -1099,6 +1152,21 @@ fn launch_identified(
         report_contained_run(input, instance_id, started_ms, now_ms());
     }
     Attempt::Done(code)
+}
+
+/// Remove the launcher's record of `instance_id` and the project path beside
+/// it, best effort: the jail was ended before its command ran.
+#[cfg(target_os = "linux")]
+fn forget_instance(input: &JailInputs, instance_id: &str) {
+    use crate::contain::launch::{project_path_file, record_path, records_dir};
+    let dir = records_dir(std::env::var("XDG_STATE_HOME").ok().as_deref(), &input.home);
+    let files = [
+        record_path(&dir, instance_id),
+        project_path_file(instance_id).map(|name| dir.join(name)),
+    ];
+    for file in files.into_iter().flatten() {
+        let _ = std::fs::remove_file(file);
+    }
 }
 
 /// The launcher's clock, in ms since the epoch.
@@ -1217,6 +1285,10 @@ pub(crate) fn read_jail_graph(project: &Path, uid: u32) -> crate::contain::launc
 
 /// Read the facts about the jail from the host, make the record, write the
 /// launcher's copy, and return the bytes for the jail's copy.
+///
+/// Also whether the host admitted the jail
+/// ([`crate::contain::launch::admitted_here`]), asked only where Active
+/// Defence is installed and believed only over a connection held to `key`.
 #[cfg(target_os = "linux")]
 fn identify(
     input: &JailInputs,
@@ -1224,7 +1296,8 @@ fn identify(
     unit: &str,
     scope: &crate::contain::launch::ScopePlan,
     info: crate::contain::launch::InfoFd,
-) -> Result<Vec<u8>, String> {
+    key: Option<&[u8; 32]>,
+) -> Result<(Vec<u8>, bool), String> {
     use crate::contain::launch::{
         assemble_record, no_scope_sentence, parse_mnt_ns_link, parse_ns_link, records_dir,
         user_scope_seen, LaunchFacts, NoScope, ScopePlan,
@@ -1264,9 +1337,11 @@ fn identify(
             );
         }
     }
+    let mut answer = innerwarden_agent_guard::identity::SystemScopeAdmission::NONE;
     if crate::upsell_io::active_defence_installed() {
-        scopes.system = request_system_scope(instance_id, unit, pid);
+        (scopes.system, answer) = request_system_scope(instance_id, unit, pid, key);
     }
+    let admitted = crate::contain::launch::admitted_here(&answer, scopes.system.as_ref());
     if scopes.is_empty() && matches!(scope, ScopePlan::User { .. }) {
         eprintln!("{}", no_scope_sentence(NoScope::NotSeenInScope));
     }
@@ -1313,7 +1388,7 @@ fn identify(
             "innerwarden contain: the launcher's copy of the record was not written ({e})"
         ),
     }
-    Ok(json)
+    Ok((json, admitted))
 }
 
 /// `/proc/<pid>/stat` field 22.
@@ -1343,22 +1418,42 @@ fn proc_cgroup(pid: u32) -> Option<String> {
 #[cfg(target_os = "linux")]
 const SYSTEM_SCOPE_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// How long the launcher waits for the answer to its request for a system
+/// scope, connect to the end of the answer: the host places the jail and
+/// decides its admission before it answers.
+#[cfg(target_os = "linux")]
+const SYSTEM_SCOPE_ANSWER_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// Ask the local Active Defence agent, best effort, for a system scope around
-/// the instance, and return it only if the KERNEL then shows the jail in it.
+/// the instance, and return it only if the KERNEL then shows the jail in it,
+/// with what the host's answer says of its admission of the jail.
 ///
 /// The request names the instance and nothing else; it gives no process to
 /// move. The answer is never the fact: a system scope is recorded only when
 /// `/proc/<pid>/cgroup` reads exactly `/system.slice/<unit>`, a cgroup only
 /// root can make or move a process into.
+///
+/// With the key the host publishes (`key`), the request goes over a
+/// connection held to it ([`crate::host_decide_io::post`]), and the body of
+/// its 202 is read: an admission and a note, the note printed as it came.
+/// Without one, the request goes as it always did and its body is not read:
+/// a server that took the port while the agent was away could say anything
+/// there, so nothing is admitted.
 #[cfg(target_os = "linux")]
 fn request_system_scope(
     instance_id: &str,
     unit: &str,
     pid: u32,
-) -> Option<innerwarden_agent_guard::identity::Scope> {
-    use crate::agent_report::{agent_route, send_report, AGENT_URL_VAR};
+    key: Option<&[u8; 32]>,
+) -> (
+    Option<innerwarden_agent_guard::identity::Scope>,
+    innerwarden_agent_guard::identity::SystemScopeAdmission,
+) {
+    use crate::agent_report::{agent_route, AGENT_URL_VAR};
     use crate::contain::launch::system_scope_seen;
-    use innerwarden_agent_guard::identity::{system_scope_request, SYSTEM_SCOPE_ROUTE};
+    use innerwarden_agent_guard::identity::{
+        system_scope_request, SystemScopeAdmission, SYSTEM_SCOPE_ROUTE,
+    };
 
     let said = |why: &str| eprintln!("innerwarden contain: no system scope ({why})");
     let Some(url) = agent_route(
@@ -1366,17 +1461,67 @@ fn request_system_scope(
         SYSTEM_SCOPE_ROUTE,
     ) else {
         said("the local agent route is off");
-        return None;
+        return (None, SystemScopeAdmission::NONE);
     };
-    let body = system_scope_request(instance_id)?;
+    let Some(body) = system_scope_request(instance_id) else {
+        return (None, SystemScopeAdmission::NONE);
+    };
+    let (sent, answer) = send_scope_request(&url, &body, key);
+    if let Some(note) = &answer.note {
+        eprintln!("innerwarden contain: {note}");
+    }
     let seen = await_system_scope(
-        send_report(&url, &body),
+        sent,
         SYSTEM_SCOPE_WAIT,
         || proc_cgroup(pid).and_then(|c| system_scope_seen(&c, unit)),
         said,
-    )?;
-    eprintln!("  system scope: {}", seen.cgroup_path);
-    Some(seen)
+    );
+    if let Some(seen) = &seen {
+        eprintln!("  system scope: {}", seen.cgroup_path);
+    }
+    (seen, answer)
+}
+
+/// The request for a system scope, sent: whether the host took it, and what
+/// its answer says of the admission ([`request_system_scope`]).
+#[cfg(target_os = "linux")]
+fn send_scope_request(
+    url: &str,
+    body: &serde_json::Value,
+    key: Option<&[u8; 32]>,
+) -> (
+    Result<(), String>,
+    innerwarden_agent_guard::identity::SystemScopeAdmission,
+) {
+    use crate::host_decide_io::{pinnable, post, Wanted};
+    use innerwarden_agent_guard::identity::{
+        SystemScopeAdmission, MAX_SYSTEM_SCOPE_ANSWER_BYTES, SYSTEM_SCOPE_TAKEN,
+    };
+    let Some(pin) = key.filter(|_| pinnable(url)) else {
+        return (
+            crate::agent_report::send_report(url, body),
+            SystemScopeAdmission::NONE,
+        );
+    };
+    let Ok(bytes) = serde_json::to_vec(body) else {
+        return (
+            Err("the request could not be written".into()),
+            SystemScopeAdmission::NONE,
+        );
+    };
+    let wanted = Wanted {
+        status: SYSTEM_SCOPE_TAKEN,
+        cap: MAX_SYSTEM_SCOPE_ANSWER_BYTES + 1,
+    };
+    match post(url, &bytes, SYSTEM_SCOPE_ANSWER_WAIT, pin, wanted) {
+        Some((SYSTEM_SCOPE_TAKEN, answer)) => (Ok(()), SystemScopeAdmission::read(&answer)),
+        Some((status, _)) if (200..300).contains(&status) => (Ok(()), SystemScopeAdmission::NONE),
+        Some((status, _)) => (Err(format!("HTTP {status}")), SystemScopeAdmission::NONE),
+        None => (
+            Err("no answer over a connection held to the host's key".into()),
+            SystemScopeAdmission::NONE,
+        ),
+    }
 }
 
 /// Wait up to `wait` for `seen` to find the jail in its system scope, and only
@@ -1703,6 +1848,14 @@ fn run_macos(input: &JailInputs) -> ExitCode {
         eprintln!(
             "innerwarden contain: --identity needs a PID namespace, which sandbox-exec does not have; no instance record is written"
         );
+    }
+    // No record, so nothing the host could admit.
+    if !crate::contain::launch::starts(input.args.start, false) {
+        eprintln!(
+            "innerwarden contain: {}",
+            crate::contain::launch::NOT_ADMITTED
+        );
+        return ExitCode::from(2);
     }
     announce(input);
     // argv = [sandbox-exec, -p, <profile>, --, child...]; run argv[1..] under the

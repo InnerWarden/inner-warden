@@ -74,6 +74,14 @@ pub struct ContainArgs {
     /// `--identity`: write a launch record for this instance. OFF by default;
     /// off, the jail and its argv are exactly what they were before the flag.
     pub identity: bool,
+    /// When an identified jail starts its command: a jail profile's `start`
+    /// ([`apply_jail_profile`]); [`JailStart::Always`] without one.
+    ///
+    /// [`JailStart::Always`]: innerwarden_agent_guard::profiles::JailStart::Always
+    pub start: innerwarden_agent_guard::profiles::JailStart,
+    /// Paths under the home a jail profile hides (`hide_home`), joined to the
+    /// home. Empty without one.
+    pub hide_home: Vec<PathBuf>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -183,6 +191,8 @@ pub fn parse_contain_args(argv: &[String]) -> Result<ContainArgs, ContainError> 
         extra_ro,
         deny_read,
         identity,
+        start: innerwarden_agent_guard::profiles::JailStart::Always,
+        hide_home: Vec::new(),
     })
 }
 
@@ -217,8 +227,9 @@ pub fn jail_flags_given(argv: &[String]) -> JailFlagsGiven {
 ///
 /// The profile's project is used only when `--project` was not given; its
 /// read-only paths are added; its hidden globs are added to the defaults and
-/// to any `--deny-read` (hiding more is never undone by a flag). A `~/` path
-/// is under `home`. The I/O layer resolves links in the read-only paths
+/// to any `--deny-read` (hiding more is never undone by a flag); its hidden
+/// home paths are joined to `home`; and it says when the jail starts. A `~/`
+/// path is under `home`. The I/O layer resolves links in the read-only paths
 /// before the jail is built, so a link cannot put a protected directory
 /// behind an allowed name.
 pub fn apply_jail_profile(
@@ -247,6 +258,13 @@ pub fn apply_jail_profile(
             args.deny_read.push(glob.clone());
         }
     }
+    for path in &jail.hide_home {
+        let path = home.join(path);
+        if !args.hide_home.contains(&path) {
+            args.hide_home.push(path);
+        }
+    }
+    args.start = args.start.max(jail.start());
 }
 
 /// A binary resolved to live under `$HOME` (so it must be re-bound after the HOME
@@ -273,6 +291,26 @@ pub struct DenyPath {
     /// Absolute path inside the jail (same as on the host - binds are identity).
     pub abs: PathBuf,
     pub is_dir: bool,
+}
+
+/// PURE. The home paths a jail profile hides ([`ContainArgs::hide_home`]) that
+/// `stat` finds (`Some(is_dir)`), each once, in the order given. A path that
+/// is not there is not mounted over: bwrap would make it, and an empty
+/// folder where the host has none is not hiding anything.
+pub fn hidden_home_paths(paths: &[PathBuf], stat: impl Fn(&Path) -> Option<bool>) -> Vec<DenyPath> {
+    let mut out: Vec<DenyPath> = Vec::new();
+    for path in paths {
+        if out.iter().any(|seen| &seen.abs == path) {
+            continue;
+        }
+        if let Some(is_dir) = stat(path) {
+            out.push(DenyPath {
+                abs: path.clone(),
+                is_dir,
+            });
+        }
+    }
+    out
 }
 
 /// Host facts the pure builders need, resolved by `contain_io` and injected so the
@@ -346,6 +384,17 @@ pub struct JailInputs {
     /// launcher's start-up probe found this host cannot start a jail with
     /// either, and the jail then runs as it did before the filter.
     pub seccomp_fd: Option<i32>,
+    /// The home paths a jail profile hides that exist, each as the jail
+    /// sees it and whether it is a folder ([`ContainArgs::hide_home`],
+    /// statted by the I/O layer): covered by an empty mount after every
+    /// writable bind. Empty without such a profile.
+    pub hide_paths: Vec<DenyPath>,
+    /// The file `/etc/resolv.conf` names where it is a link into `/run`
+    /// ([`launch::resolv_conf_target`]), bound read-only at that same place
+    /// over the jail's empty `/run`, so the host's name resolution works in
+    /// the jail and nothing else of the host's `/run` is shown. `None` where
+    /// `/etc/resolv.conf` is a file of its own, or names nothing there.
+    pub resolv_conf: Option<PathBuf>,
 }
 
 impl JailInputs {
@@ -442,6 +491,17 @@ pub fn validate_jail_inputs(input: &JailInputs) -> Result<(), ContainError> {
     // protected directory (the masks are re-applied after it anyway).
     for path in &input.args.extra_ro {
         validate_bind("extra read-only", path)?;
+    }
+    // A hidden home path covers what is under it: never the project, nor
+    // a folder that holds it, or the agent would work in an empty folder.
+    for hidden in &input.hide_paths {
+        if input.args.project.starts_with(&hidden.abs) {
+            return Err(ContainError::Unsupported(format!(
+                "the hidden home path '{}' holds the project '{}'",
+                hidden.abs.display(),
+                input.args.project.display()
+            )));
+        }
     }
     if input.args.identity {
         validate_sealed(input)?;
@@ -550,6 +610,15 @@ pub fn build_linux_jail(input: &JailInputs) -> Result<LinuxJailPlan, ContainErro
     push(&["--proc", "/proc"]);
     push(&["--tmpfs", "/tmp"]);
     push(&["--tmpfs", "/run"]);
+    // Where `/etc/resolv.conf` is a link into `/run` (systemd-resolved), the
+    // file it names, alone, read-only at its own place: the host's name
+    // resolution keeps working in the jail and the rest of the host's
+    // `/run`, its sockets included, stays out. Never a file of the jail's
+    // own: the jail resolves names exactly as the host does.
+    if let Some(target) = &input.resolv_conf {
+        let target = target.to_string_lossy().to_string();
+        push(&["--ro-bind-try", &target, &target]);
+    }
 
     // --- HOME: tmpfs, then selective re-bind of what exists ---
     push(&["--tmpfs", &home]);
@@ -635,6 +704,19 @@ pub fn build_linux_jail(input: &JailInputs) -> Result<LinuxJailPlan, ContainErro
         for dir in &input.records_dirs {
             let dest = dir.to_string_lossy().to_string();
             push(&["--tmpfs", &dest]);
+        }
+    }
+
+    // --- the home paths a jail profile hides that exist (`hide_home`),
+    // after every writable bind, so none of them brings one back: a folder
+    // under an empty tmpfs, a file under /dev/null. Empty unless a profile
+    // names some. ---
+    for hidden in &input.hide_paths {
+        let dest = hidden.abs.to_string_lossy().to_string();
+        if hidden.is_dir {
+            push(&["--tmpfs", &dest]);
+        } else {
+            push(&["--ro-bind", "/dev/null", &dest]);
         }
     }
 
@@ -848,8 +930,9 @@ pub fn build_macos_profile(input: &JailInputs) -> Result<MacosJailPlan, ContainE
             e(&iw_cfg_real)
         ));
     }
-    // project secrets (glob-expanded + statted by the I/O layer into deny_paths):
-    for d in &input.deny_paths {
+    // project secrets (glob-expanded + statted by the I/O layer into deny_paths),
+    // and the home paths a jail profile hides that exist:
+    for d in input.deny_paths.iter().chain(&input.hide_paths) {
         p.push_str(&format!(
             "(deny file-read* (subpath \"{}\"))\n",
             e(&d.abs.to_string_lossy())
@@ -922,7 +1005,7 @@ pub fn build_macos_profile(input: &JailInputs) -> Result<MacosJailPlan, ContainE
             e(&iw_cfg_real)
         ));
     }
-    for d in &input.deny_paths {
+    for d in input.deny_paths.iter().chain(&input.hide_paths) {
         p.push_str(&format!(
             "(deny file-write* (subpath \"{}\"))\n",
             e(&d.abs.to_string_lossy())
@@ -1822,6 +1905,63 @@ pub mod launch {
         })
     }
 
+    /// What the launcher says, and exits 2 on, when a profile starts the
+    /// jail only once the host has admitted it and the host has not.
+    pub const NOT_ADMITTED: &str = "Active Defence on this host did not admit this jail, and \
+         its profile starts it only when admitted.";
+
+    /// PURE. Whether Active Defence on this host admitted the jail: its
+    /// answer, as the launcher believed it (no answer, or one not held to
+    /// the host's key, is [`SystemScopeAdmission::NONE`]), says so, and the
+    /// kernel shows the jail in its system scope. The answer alone is a
+    /// claim; the scope is the fact the admission was made over.
+    ///
+    /// [`SystemScopeAdmission::NONE`]: innerwarden_agent_guard::identity::SystemScopeAdmission::NONE
+    pub fn admitted_here(
+        answer: &innerwarden_agent_guard::identity::SystemScopeAdmission,
+        system_scope: Option<&Scope>,
+    ) -> bool {
+        answer.admitted && system_scope.is_some()
+    }
+
+    /// PURE. Whether the launcher hands the jail its record and lets the
+    /// command start: always, unless the profile starts the jail only when
+    /// admitted ([`JailStart::OnlyWhenAdmitted`]); then only when
+    /// `admitted` ([`admitted_here`]). A jail it does not start is ended
+    /// before the command runs, and the launcher exits 2 ([`NOT_ADMITTED`]).
+    ///
+    /// [`JailStart::OnlyWhenAdmitted`]: innerwarden_agent_guard::profiles::JailStart::OnlyWhenAdmitted
+    pub fn starts(start: innerwarden_agent_guard::profiles::JailStart, admitted: bool) -> bool {
+        use innerwarden_agent_guard::profiles::JailStart;
+        match start {
+            JailStart::Always => true,
+            JailStart::OnlyWhenAdmitted => admitted,
+        }
+    }
+
+    /// PURE. The file `/etc/resolv.conf` names when it is a link into
+    /// `/run` (`link` is what the link holds, as `readlink` reads it): the
+    /// path it names, made absolute against `/etc` with its `.` and `..`
+    /// steps worked out, when that is below `/run`. `None` for any other
+    /// target: the jail's `/run` is empty, and only a file there would be
+    /// lost.
+    pub fn resolv_conf_target(link: &Path) -> Option<PathBuf> {
+        use std::path::Component;
+        let mut out = PathBuf::from("/");
+        let joined = Path::new("/etc").join(link);
+        for component in joined.components() {
+            match component {
+                Component::RootDir | Component::CurDir => {}
+                Component::ParentDir => {
+                    out.pop();
+                }
+                Component::Normal(name) => out.push(name),
+                Component::Prefix(_) => return None,
+            }
+        }
+        (out.starts_with("/run") && out != Path::new("/run")).then_some(out)
+    }
+
     /// What bwrap reports through `--info-fd`. Fields it adds later are ignored.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct InfoFd {
@@ -2374,6 +2514,8 @@ mod tests {
             extra_ro: vec![],
             deny_read: DEFAULT_DENY_READ.iter().map(|s| s.to_string()).collect(),
             identity: false,
+            start: innerwarden_agent_guard::profiles::JailStart::Always,
+            hide_home: vec![],
         }
     }
 
@@ -2417,6 +2559,9 @@ mod tests {
             close_userns: false,
             // A plain jail on a host that takes the terminal filter.
             seccomp_fd: Some(launch::DRY_RUN_SECCOMP_FD),
+            hide_paths: vec![],
+            // A host whose `/etc/resolv.conf` is a file of its own.
+            resolv_conf: None,
         }
     }
 
@@ -4582,6 +4727,356 @@ mod tests {
         fine.args.identity = true;
         fine.args.extra_ro = vec![PathBuf::from("/opt/sdk"), PathBuf::from("/home/dev/tools")];
         assert!(validate_jail_inputs(&fine).is_ok());
+    }
+
+    /// A path the account was trusted to run from, inside a folder of the
+    /// home the jail may write (`~/.local`), is read-only in the jail: its
+    /// read-only bind comes after the read-write bind of that folder, and no
+    /// later bind or mount covers it.
+    ///
+    /// FAILS ON REVERT: move the `extra_ro` binds before the dotdir binds and
+    /// the read-write `.local` bind covers the versions again.
+    #[test]
+    fn an_extra_ro_path_inside_a_rw_dotdir_is_read_only() {
+        let versions = "/home/dev/.local/share/claude/versions";
+        let mut input = identified_inputs();
+        let mut args = input.args.clone();
+        apply_jail_profile(
+            &mut args,
+            &jail_profile(
+                None,
+                &[innerwarden_agent_guard::profiles::runtime_versions_dir("claude-code").unwrap()],
+                &[],
+            ),
+            JailFlagsGiven::default(),
+            Path::new("/home/dev"),
+        );
+        assert_eq!(args.extra_ro, [PathBuf::from(versions)]);
+        input.args = args;
+        assert!(validate_jail_inputs(&input).is_ok());
+        let a = build_linux_jail(&input).unwrap().bwrap_args;
+        let local = a
+            .windows(3)
+            .position(|w| {
+                w[0] == "--bind" && w[1] == "/home/dev/.local" && w[2] == "/home/dev/.local"
+            })
+            .expect("the read-write .local bind");
+        let ro = a
+            .windows(3)
+            .position(|w| w[0] == "--ro-bind-try" && w[1] == versions && w[2] == versions)
+            .expect("the read-only bind of the versions");
+        assert!(
+            local < ro,
+            "the read-only bind must come after the read-write one"
+        );
+        // Nothing after it mounts over the versions or a folder above them.
+        for (at, w) in a.windows(3).enumerate().skip(ro + 1) {
+            if matches!(
+                w[0].as_str(),
+                "--bind" | "--tmpfs" | "--ro-bind" | "--bind-try"
+            ) {
+                let dest = if w[0] == "--tmpfs" { &w[1] } else { &w[2] };
+                assert!(
+                    !Path::new(versions).starts_with(dest),
+                    "{} at {at} covers the versions",
+                    w[0]
+                );
+            }
+        }
+    }
+
+    /// A profile's hidden home paths are joined to the home, and its `start`
+    /// is the stricter of what the launch had and what it says.
+    #[test]
+    fn a_jail_profile_says_when_the_jail_starts_and_what_of_the_home_it_hides() {
+        use innerwarden_agent_guard::profiles::JailStart;
+        let home = Path::new("/home/dev");
+        let profile = innerwarden_agent_guard::profiles::JailProfile {
+            start: Some(JailStart::OnlyWhenAdmitted),
+            hide_home: vec![".cache/git/credential".into()],
+            ..Default::default()
+        };
+        let mut launch = args(&["claude"]);
+        assert_eq!(launch.start, JailStart::Always);
+        apply_jail_profile(&mut launch, &profile, JailFlagsGiven::default(), home);
+        assert_eq!(launch.start, JailStart::OnlyWhenAdmitted);
+        assert_eq!(
+            launch.hide_home,
+            [PathBuf::from("/home/dev/.cache/git/credential")]
+        );
+        // Applied twice, nothing is added twice; a profile that says
+        // `always` does not open what another one closed.
+        apply_jail_profile(&mut launch, &profile, JailFlagsGiven::default(), home);
+        assert_eq!(launch.hide_home.len(), 1);
+        let always = innerwarden_agent_guard::profiles::JailProfile {
+            start: Some(JailStart::Always),
+            ..Default::default()
+        };
+        apply_jail_profile(&mut launch, &always, JailFlagsGiven::default(), home);
+        assert_eq!(launch.start, JailStart::OnlyWhenAdmitted);
+    }
+
+    /// Only a hidden home path that exists is mounted over: a folder by an
+    /// empty tmpfs, a file by /dev/null, after every writable bind so none
+    /// brings it back. One that is not there gets nothing (bwrap would make
+    /// it), and a jail without such a profile is the jail it was.
+    ///
+    /// FAILS ON REVERT: keep the paths `stat` does not find in
+    /// `hidden_home_paths` and the missing one is mounted over; move the
+    /// masks before the dotdir binds and the read-write `.cache` bind brings
+    /// the folder back.
+    #[test]
+    fn hide_home_masks_only_existing_paths() {
+        let folder = PathBuf::from("/home/dev/.cache/git/credential");
+        let file = PathBuf::from("/home/dev/.config/app/token");
+        let missing = PathBuf::from("/home/dev/.cache/nothing-here");
+        let found = hidden_home_paths(
+            &[
+                folder.clone(),
+                missing.clone(),
+                file.clone(),
+                folder.clone(),
+            ],
+            |path| {
+                if path == folder {
+                    Some(true)
+                } else if path == file {
+                    Some(false)
+                } else {
+                    None
+                }
+            },
+        );
+        assert_eq!(
+            found,
+            [
+                DenyPath {
+                    abs: folder.clone(),
+                    is_dir: true
+                },
+                DenyPath {
+                    abs: file.clone(),
+                    is_dir: false
+                },
+            ]
+        );
+        let mut input = identified_inputs();
+        input.hide_paths = found;
+        let a = build_linux_jail(&input).unwrap().bwrap_args;
+        let tmpfs = a
+            .windows(2)
+            .position(|w| w[0] == "--tmpfs" && w[1] == folder.to_str().unwrap())
+            .expect("the folder under an empty tmpfs");
+        let null = a
+            .windows(3)
+            .position(|w| {
+                w[0] == "--ro-bind" && w[1] == "/dev/null" && w[2] == file.to_str().unwrap()
+            })
+            .expect("the file under /dev/null");
+        assert!(!a.iter().any(|w| w == missing.to_str().unwrap()));
+        let last_writable = a
+            .windows(2)
+            .rposition(|w| w[0] == "--bind")
+            .expect("writable binds");
+        assert!(tmpfs > last_writable && null > last_writable);
+        // macOS has no mount to lay: the same paths are denied, read and
+        // write, as a project secret is.
+        let profile = build_macos_profile(&input).unwrap().profile;
+        for path in [&folder, &file] {
+            for access in ["read", "write"] {
+                let rule = format!("(deny file-{access}* (subpath \"{}\"))", path.display());
+                assert!(profile.contains(&rule), "{rule}");
+            }
+        }
+        assert!(!profile.contains(missing.to_str().unwrap()));
+        // None: the identified golden, byte for byte.
+        assert_eq!(
+            build_linux_jail(&identified_inputs())
+                .unwrap()
+                .bwrap_args
+                .join("\n"),
+            GOLDEN_ARGV_IDENTIFIED
+        );
+    }
+
+    /// A hidden home path never holds the project: the agent would work in
+    /// an empty folder.
+    #[test]
+    fn a_hidden_home_path_that_holds_the_project_is_refused() {
+        for holds in ["/home/dev/proj", "/home/dev"] {
+            let mut input = identified_inputs();
+            input.hide_paths = vec![DenyPath {
+                abs: PathBuf::from(holds),
+                is_dir: true,
+            }];
+            assert!(validate_jail_inputs(&input).is_err(), "{holds}");
+        }
+        let mut inside = identified_inputs();
+        inside.hide_paths = vec![DenyPath {
+            abs: PathBuf::from("/home/dev/proj/cache"),
+            is_dir: true,
+        }];
+        assert!(validate_jail_inputs(&inside).is_ok());
+    }
+
+    /// The launcher starts the command of a jail whose profile starts it only
+    /// when admitted only once the host said it admitted the jail AND the
+    /// kernel shows the jail in its system scope. No answer, an answer that
+    /// admitted nothing, or an admission without the scope: not started. A
+    /// jail with no such profile starts as it always did.
+    ///
+    /// FAILS ON REVERT: start whatever `admitted` says in `starts`, or take
+    /// the answer alone in `admitted_here`, and a jail the host did not
+    /// admit starts.
+    #[test]
+    fn only_when_admitted_refuses_without_the_host() {
+        use innerwarden_agent_guard::identity::SystemScopeAdmission;
+        use innerwarden_agent_guard::profiles::JailStart;
+        use launch::{admitted_here, starts, NOT_ADMITTED};
+        let scope = innerwarden_agent_guard::identity::Scope {
+            unit: UNIT.to_string(),
+            cgroup_path: format!("/system.slice/{UNIT}"),
+        };
+        let yes = SystemScopeAdmission {
+            admitted: true,
+            note: None,
+        };
+        let no = SystemScopeAdmission {
+            admitted: false,
+            note: Some("Kernel protection is not in effect for this session.".into()),
+        };
+        assert!(admitted_here(&yes, Some(&scope)));
+        for (answer, seen) in [
+            (&SystemScopeAdmission::NONE, Some(&scope)),
+            (&SystemScopeAdmission::NONE, None),
+            (&no, Some(&scope)),
+            (&yes, None),
+        ] {
+            let admitted = admitted_here(answer, seen);
+            assert!(!admitted, "{answer:?} {seen:?}");
+            assert!(!starts(JailStart::OnlyWhenAdmitted, admitted));
+            assert!(starts(JailStart::Always, admitted));
+        }
+        assert!(starts(JailStart::OnlyWhenAdmitted, true));
+        assert_eq!(
+            NOT_ADMITTED,
+            "Active Defence on this host did not admit this jail, and its profile starts it \
+             only when admitted."
+        );
+        // A launch with no profile starts as it always did.
+        assert_eq!(args(&["claude"]).start, JailStart::Always);
+        assert_eq!(
+            parse_contain_args(&["--identity".into(), "claude".into()])
+                .unwrap()
+                .start,
+            JailStart::Always
+        );
+    }
+
+    /// Where `/etc/resolv.conf` is a link into `/run`, the jail gets the
+    /// file it names, read-only, at the same place, and nothing else of the
+    /// host's `/run`: never the folder that holds the resolver's sockets,
+    /// never a file of the jail's own, never one that names another
+    /// resolver. Any other link, or none, changes nothing.
+    ///
+    /// FAILS ON REVERT: bind the link target's folder, or keep a target
+    /// outside `/run`, and the lines below that say otherwise fail.
+    #[test]
+    fn the_jail_never_points_at_a_private_resolver() {
+        use launch::resolv_conf_target;
+        for (link, target) in [
+            (
+                "../run/systemd/resolve/stub-resolv.conf",
+                "/run/systemd/resolve/stub-resolv.conf",
+            ),
+            (
+                "/run/systemd/resolve/resolv.conf",
+                "/run/systemd/resolve/resolv.conf",
+            ),
+            ("/run/resolvconf/resolv.conf", "/run/resolvconf/resolv.conf"),
+            (
+                "./../run/./NetworkManager/resolv.conf",
+                "/run/NetworkManager/resolv.conf",
+            ),
+        ] {
+            assert_eq!(
+                resolv_conf_target(Path::new(link)),
+                Some(PathBuf::from(target)),
+                "{link}"
+            );
+        }
+        for elsewhere in [
+            "/run",
+            "../run",
+            "/etc/resolvconf/run/resolv.conf",
+            "resolv.conf.real",
+            "/var/run/NetworkManager/resolv.conf",
+            "../run/../etc/shadow",
+            "/runner/resolv.conf",
+        ] {
+            assert_eq!(
+                resolv_conf_target(Path::new(elsewhere)),
+                None,
+                "{elsewhere}"
+            );
+        }
+        let stub = "/run/systemd/resolve/stub-resolv.conf";
+        for identity in [false, true] {
+            let mut input = if identity {
+                identified_inputs()
+            } else {
+                inputs(&["claude", "--print"])
+            };
+            input.resolv_conf =
+                resolv_conf_target(Path::new("../run/systemd/resolve/stub-resolv.conf"));
+            let a = build_linux_jail(&input).unwrap().bwrap_args;
+            let run = a
+                .windows(2)
+                .position(|w| w[0] == "--tmpfs" && w[1] == "/run")
+                .unwrap();
+            let bind = a
+                .windows(3)
+                .position(|w| w[0] == "--ro-bind-try" && w[1] == stub && w[2] == stub)
+                .expect("the host's own file, at its own place");
+            assert_eq!(bind, run + 2, "right over the jail's empty /run");
+            assert!(
+                !a.iter()
+                    .any(|w| w == "/run/systemd/resolve" || w == "/run/systemd"),
+                "the folder of the resolver's sockets is never shown"
+            );
+            assert!(
+                !a.iter().any(|w| w.ends_with("resolv.conf") && w != stub),
+                "no other resolver file, and none of the jail's own"
+            );
+            assert!(!a.iter().any(|w| w == "/etc/resolv.conf"));
+        }
+    }
+
+    /// O15, the one deliberate change to the plain jail's argv beside its
+    /// filter: on a host whose `/etc/resolv.conf` is a link into `/run`, one
+    /// read-only bind of the file it names, right after the jail's `/run`.
+    /// On any other host the plain jail is its golden, byte for byte.
+    #[test]
+    fn the_plain_jail_moved_only_by_the_resolver_file_on_a_resolved_host() {
+        let mut input = inputs(&["claude", "--print"]);
+        input.resolv_conf = Some(PathBuf::from("/run/systemd/resolve/stub-resolv.conf"));
+        let got = build_linux_jail(&input).unwrap().bwrap_args.join("\n");
+        assert_eq!(
+            got,
+            GOLDEN_ARGV_PLAIN.replace(
+                "--tmpfs\n/run\n",
+                "--tmpfs\n/run\n--ro-bind-try\n/run/systemd/resolve/stub-resolv.conf\n\
+                 /run/systemd/resolve/stub-resolv.conf\n"
+            )
+        );
+        assert_ne!(got, GOLDEN_ARGV_PLAIN);
+        assert_eq!(
+            build_linux_jail(&inputs(&["claude", "--print"]))
+                .unwrap()
+                .bwrap_args
+                .join("\n"),
+            GOLDEN_ARGV_PLAIN
+        );
     }
 
     fn facts(systemd_run: Option<&str>, version: Option<u32>, manager: bool) -> launch::ScopeFacts {
