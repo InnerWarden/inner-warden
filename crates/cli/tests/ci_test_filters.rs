@@ -188,11 +188,14 @@ fn run_gate(min: &str, fake_out: &str, fake_status: u8) -> std::process::Output 
 
 /// The gate passes a run whose binaries passed at least MIN tests in all,
 /// and fails one that passed fewer (a filter that matched nothing above
-/// all), a run cargo failed, and a MIN that would let no test run.
+/// all), a run cargo failed, and a MIN that would let no test run. A count
+/// too large for the shell's `[` to compare refuses: a comparison that
+/// errors is never read as a pass.
 ///
 /// FAILS ON REVERT: let the gate pass "0 passed" (the libtest answer to a
-/// filter that matched nothing), count one binary only, or swallow cargo's
-/// failure.
+/// filter that matched nothing), count one binary only, swallow cargo's
+/// failure, or write a check as `if [ a -lt b ]` (the MIN of 20 digits and
+/// the count of 21 then pass).
 #[cfg(unix)]
 #[test]
 fn the_gate_fails_a_filtered_run_that_passed_too_few() {
@@ -222,7 +225,14 @@ fn the_gate_fails_a_filtered_run_that_passed_too_few() {
     let failed = "test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s";
     assert_eq!(run_gate("1", failed, 101).status.code(), Some(101));
 
-    for bad in ["0", "", "x", "-1"] {
+    let too_many = "test result: ok. 99999999999999999999 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n\
+                    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s";
+    let out = run_gate("3", too_many, 0);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("REFUSED"), "{stderr}");
+
+    for bad in ["0", "", "x", "-1", "99999999999999999999", "1000000000"] {
         let out = run_gate(bad, two_binaries, 0);
         assert_eq!(out.status.code(), Some(2), "MIN {bad:?}");
         assert!(

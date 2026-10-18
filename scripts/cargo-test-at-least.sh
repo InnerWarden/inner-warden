@@ -13,21 +13,24 @@
 # kept the job alive. A gate that cannot run must fail, so this one counts.
 #
 # Usage: cargo-test-at-least.sh MIN [cargo test arguments...]
-#   MIN  the fewest tests that must pass, a whole number of at least 1. Set
-#        it to what the filter runs today: a test that goes away fails the
-#        step until MIN is lowered on purpose.
+#   MIN  the fewest tests that must pass, a whole number of at least 1 and
+#        at most 9 digits. Set it to what the filter runs today: a test that
+#        goes away fails the step until MIN is lowered on purpose.
+#
+# Each count is compared as `if ! [ ... -ge ... ]`: a comparison that `[`
+# cannot make (a number too large for it) refuses, never passes.
 
 set -uo pipefail
 
 min="${1:-}"
 case "$min" in
-  '' | *[!0-9]*)
-    echo "REFUSED: MIN must be a whole number, got '${min}'." >&2
+  '' | *[!0-9]* | ??????????*)
+    echo "REFUSED: MIN must be a whole number of at most 9 digits, got '${min}'." >&2
     echo "Usage: cargo-test-at-least.sh MIN [cargo test arguments...]" >&2
     exit 2
     ;;
 esac
-if [ "$min" -lt 1 ]; then
+if ! [ "$min" -ge 1 ]; then
   echo "REFUSED: MIN is ${min}. A step that may run no test checks nothing." >&2
   exit 2
 fi
@@ -46,7 +49,7 @@ fi
 passed="$(sed -n 's/^test result: ok\. \([0-9][0-9]*\) passed;.*/\1/p' "$out" |
   awk '{ total += $1 } END { print total + 0 }')"
 
-if [ "$passed" -lt "$min" ]; then
+if ! [ "$passed" -ge "$min" ]; then
   {
     echo "REFUSED: cargo test $* passed ${passed} test(s); at least ${min} must run."
     echo
