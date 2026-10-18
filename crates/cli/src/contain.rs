@@ -1870,6 +1870,16 @@ pub mod launch {
         }
     }
 
+    /// PURE. The parent pid in a `/proc/<pid>/stat` line: the field after
+    /// the state, read after the last `)` (the command name may hold any
+    /// byte, a `)` included).
+    pub fn parse_parent_pid(stat: &str) -> Option<u32> {
+        let (_, rest) = stat.rsplit_once(')')?;
+        let mut fields = rest.split_whitespace();
+        fields.next()?;
+        fields.next()?.parse().ok()
+    }
+
     /// The cgroup in `/proc/<pid>/cgroup`: the unified line `0::<path>`, or on
     /// a hybrid host systemd's own `name=systemd` line. `None` for anything
     /// else, including a path that is not absolute.
@@ -3046,6 +3056,21 @@ mod tests {
         assert_eq!(parse_start_ticks("2778 (bash) S 1 2"), None);
         assert_eq!(parse_start_ticks("no parenthesis"), None);
         assert_eq!(parse_start_ticks(""), None);
+    }
+
+    /// The parent is read after the last `)`, so a command name that holds
+    /// one cannot name another parent: the launcher signals only a process
+    /// whose parent is its own bwrap.
+    #[test]
+    fn the_parent_pid_is_read_after_the_last_parenthesis() {
+        use launch::parse_parent_pid;
+        for comm in ["bwrap", "b) S 1 (x", ") R 4242", "("] {
+            let stat = format!("2779 ({comm}) S 2778 2779 2779 0 -1");
+            assert_eq!(parse_parent_pid(&stat), Some(2778), "comm {comm:?}");
+        }
+        assert_eq!(parse_parent_pid("2779 (bwrap) S"), None);
+        assert_eq!(parse_parent_pid("2779 (bwrap) S x"), None);
+        assert_eq!(parse_parent_pid("no parenthesis"), None);
     }
 
     #[test]

@@ -1107,8 +1107,8 @@ fn launch_identified(
     // Under a profile that starts the jail only once the host admitted it,
     // a jail the host did not admit (no answer, a record that could not be
     // made, a scope the kernel does not show) is ended here, before its
-    // command can run: the record is never handed in, and bwrap holds the
-    // jail at that point.
+    // command can run: its first process is still waiting for the record,
+    // and the record is never handed in.
     let admitted = record.as_ref().is_ok_and(|(_, admitted)| *admitted);
     if !crate::contain::launch::starts(input.args.start, admitted) {
         if let Err(why) = &record {
@@ -1118,8 +1118,7 @@ fn launch_identified(
             "innerwarden contain: {}",
             crate::contain::launch::NOT_ADMITTED
         );
-        let _ = child.kill();
-        let _ = child.wait();
+        end_jail(&mut child);
         drop(record_writer);
         // The launcher's own copy of a record it never handed in, and the
         // project path beside it: no instance of it ever ran.
@@ -1152,6 +1151,58 @@ fn launch_identified(
         report_contained_run(input, instance_id, started_ms, now_ms());
     }
     Attempt::Done(code)
+}
+
+/// End a jail whose command must not run, while its first process is still
+/// waiting for the record: SIGKILL to each process bwrap started, then to
+/// bwrap. Killing bwrap alone is not enough: measured with bwrap 0.9.0, its
+/// child waiting on the record outlives it (`--die-with-parent` is not in
+/// force yet at that point), reads the end of the closed pipe, and runs the
+/// command. A process SIGKILLed while it waits never runs another
+/// instruction of its own, so the record pipe may close once this returns.
+#[cfg(target_os = "linux")]
+fn end_jail(child: &mut std::process::Child) {
+    let bwrap = child.id();
+    for pid in proc_children(bwrap) {
+        // Only a process whose parent is still this bwrap: a pid that
+        // ended and was handed to someone else is not ours to signal.
+        if proc_parent(pid) == Some(bwrap) {
+            if let Ok(pid) = libc::pid_t::try_from(pid) {
+                // SAFETY: kill on a pid this launcher's own child started.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// The processes `pid` started, as `/proc/<pid>/task/<tid>/children` lists
+/// them for each of its threads.
+#[cfg(target_os = "linux")]
+fn proc_children(pid: u32) -> Vec<u32> {
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for task in tasks.flatten() {
+        if let Ok(text) = std::fs::read_to_string(task.path().join("children")) {
+            out.extend(
+                text.split_whitespace()
+                    .filter_map(|p| p.parse::<u32>().ok()),
+            );
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// The parent of `pid`: field 4 of `/proc/<pid>/stat`.
+#[cfg(target_os = "linux")]
+fn proc_parent(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    crate::contain::launch::parse_parent_pid(&stat)
 }
 
 /// Remove the launcher's record of `instance_id` and the project path beside
