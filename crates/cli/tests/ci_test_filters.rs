@@ -41,25 +41,49 @@ const TAKES_A_VALUE: &[&str] = &[
     "-Z",
 ];
 
+/// The libtest options (after `--`) that take the next word as their value.
+/// `--skip`'s value only takes tests away, so it is no name filter either.
+const LIBTEST_TAKES_A_VALUE: &[&str] = &[
+    "--skip",
+    "--test-threads",
+    "--format",
+    "--color",
+    "--logfile",
+    "--shuffle-seed",
+    "-Z",
+];
+
 /// The name filters in the words after `cargo test` (or after the gate's
-/// MIN): every word before `--` that is neither an option nor an option's
-/// value, up to the end of the command.
+/// MIN): every word that is neither an option nor an option's value, up to
+/// the end of the command. Before `--` the options are cargo's; after it
+/// they are libtest's, and a bare word there (`-- seccomp`) is a name filter
+/// as much as one before it.
 fn name_filters<'a>(words: impl Iterator<Item = &'a str>) -> Vec<&'a str> {
     let mut filters = Vec::new();
     let mut value_next = false;
+    let mut libtest = false;
     for word in words {
-        if matches!(word, "--" | "|" | "||" | "&&" | ";") {
+        if matches!(word, "|" | "||" | "&&" | ";") {
             break;
         }
         if value_next {
             value_next = false;
             continue;
         }
+        if word == "--" && !libtest {
+            libtest = true;
+            continue;
+        }
         if word.starts_with('<') || word.starts_with('>') || word.starts_with("2>") {
             continue;
         }
         if word.starts_with('-') {
-            value_next = TAKES_A_VALUE.contains(&word);
+            let takes_a_value = if libtest {
+                LIBTEST_TAKES_A_VALUE
+            } else {
+                TAKES_A_VALUE
+            };
+            value_next = takes_a_value.contains(&word);
             continue;
         }
         filters.push(word);
@@ -137,7 +161,12 @@ fn every_filtered_test_run_in_ci_counts_what_it_ran() {
     }
 }
 
-/// The reader of a command line finds a name filter, and only a filter.
+/// The reader of a command line finds a name filter, and only a filter:
+/// before `--` and after it, where libtest takes it the same way.
+///
+/// FAILS ON REVERT: stop reading at `--` (`-- seccomp` is then no filter,
+/// and a workflow could run it straight, passing on 0 tests), or read a
+/// libtest option's value as a filter.
 #[test]
 fn a_name_filter_is_told_from_options_and_their_values() {
     let filters = |line: &str| -> Vec<String> {
@@ -149,7 +178,16 @@ fn a_name_filter_is_told_from_options_and_their_values() {
     assert!(filters("--workspace").is_empty());
     assert!(filters("-p innerwarden --test cjc_j007_ai_jail </dev/null").is_empty());
     assert!(filters("-p a --test hot_path_budget -- --nocapture").is_empty());
+    assert!(filters("-p a --test t -- --nocapture").is_empty());
+    assert!(filters("-p a -- --test-threads 1 --skip slow --format terse").is_empty());
     assert_eq!(filters("-p a --lib seccomp </dev/null"), ["seccomp"]);
+    assert_eq!(filters("-p a --lib -- seccomp"), ["seccomp"]);
+    assert_eq!(
+        filters("-p a --lib -- --exact seccomp::x </dev/null"),
+        ["seccomp::x"]
+    );
+    assert_eq!(filters("-p a --lib one -- --nocapture two"), ["one", "two"]);
+    assert!(filters("-p a -- --nocapture && echo done").is_empty());
     assert_eq!(
         filters("-p innerwarden --bin innerwarden the_launcher_hands_bwrap"),
         ["the_launcher_hands_bwrap"]
