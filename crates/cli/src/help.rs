@@ -252,13 +252,13 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
              \n  \
              On Linux, where the host takes it, every jail starts its programs under\n  \
              a seccomp filter in the style of Flatpak that refuses TIOCSTI and\n  \
-             TIOCLINUX, the terminal commands that push input into your terminal;\n  \
-             contain says so when the host does not take it. With --identity it also\n  \
-             refuses new user namespaces, joining other namespaces, and new btrfs\n  \
-             subvolumes or snapshots, ends a 32-bit program, and drops every\n  \
-             capability: turn the agent's own sandbox off inside the jail. The jail\n  \
-             shares the host's network, so an X server's abstract socket stays\n  \
-             reachable from it.\n\
+             TIOCLINUX, the terminal commands that push input into your terminal,\n  \
+             and new btrfs or bcachefs subvolumes or snapshots, which would show the\n  \
+             files the jail hides; contain says so when the host does not take it.\n  \
+             With --identity it also refuses new user namespaces and joining other\n  \
+             namespaces, ends a 32-bit program, and drops every capability: turn the\n  \
+             agent's own sandbox off inside the jail. The jail shares the host's\n  \
+             network, so an X server's abstract socket stays reachable from it.\n\
              \n  \
              Everything after `--` is the jailed command line, including its own\n  \
              `--help`."
@@ -414,38 +414,43 @@ mod tests {
 
     /// The public words for the jail's seccomp filter say what it covers and
     /// where it stops, in `contain --help` and in the README alike: the two
-    /// terminal commands by name, only where the host takes it, the
-    /// identified jail's capability drop, its end of 32-bit programs and its
-    /// refusal of new btrfs subvolumes and snapshots, the plain jail's rule
-    /// on those programs, the X server left reachable, and the kernels before
+    /// terminal commands by name and the refusal of new btrfs and bcachefs
+    /// subvolumes and snapshots in every jail, only where the host takes
+    /// it, the identified jail's capability drop and its end of 32-bit
+    /// programs, the plain jail's rules on those programs, what a jail that
+    /// falls back says, the X server left reachable, and the kernels before
     /// 4.8.
     ///
     /// FAILS ON REVERT: say again that every jail refuses injecting
-    /// keystrokes, or that a plain jail gets only the keystroke rule, or drop
-    /// the btrfs words from either.
+    /// keystrokes, or that a plain jail gets only the keystroke rule or only
+    /// the terminal rule, put the subvolume refusal back under `--identity`
+    /// alone, or drop the bcachefs words or what a fallback says.
     #[test]
     fn the_contain_help_and_the_readme_say_what_the_filter_covers() {
         let flat = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
         let help = flat(&usage("contain", &[]).expect("contain has usage"));
         for said in [
             "where the host takes it",
-            "refuses TIOCSTI and TIOCLINUX, the terminal commands that push input",
+            "every jail starts its programs under a seccomp filter in the style of Flatpak that refuses TIOCSTI and TIOCLINUX, the terminal commands that push input into your terminal, and new btrfs or bcachefs subvolumes or snapshots, which would show the files the jail hides;",
             "contain says so when the host does not take it",
             "ends a 32-bit program, and drops every capability",
-            "With --identity it also refuses new user namespaces, joining other namespaces, and new btrfs subvolumes or snapshots",
+            "With --identity it also refuses new user namespaces and joining other namespaces,",
             "The jail shares the host's network, so an X server's abstract socket stays reachable",
         ] {
             assert!(help.contains(said), "contain --help lacks {said:?}: {help}");
         }
         let readme = flat(include_str!("../../../README.md"));
         for said in [
-            "On Linux, where the host takes it, every jail starts its programs under a seccomp filter that refuses `TIOCSTI` and `TIOCLINUX`",
+            "On Linux, where the host takes it, every jail starts its programs under a seccomp filter that refuses `TIOCSTI` and `TIOCLINUX`, the terminal commands that push input into your terminal, and new btrfs or bcachefs subvolumes and snapshots.",
             "Its programs run with no capability, also when `contain` itself runs as root.",
-            "in the style of Flatpak: no new user namespaces, no joining other namespaces, no new btrfs subvolumes or snapshots,",
+            "in the style of Flatpak: no new user namespaces, no joining other namespaces, no new btrfs or bcachefs subvolumes or snapshots,",
             "is ended at its first call in an identified jail",
-            "gets only the terminal rule, and applies it to 32-bit programs too",
+            "gets only the terminal rule and the subvolume rule, and applies them to 32-bit programs too",
+            "Every jail refuses new subvolumes and snapshots because a snapshot of the project would show the files the jail hides in it",
             "a build for an architecture other than x86_64 or aarch64",
-            "Limits: the filter covers those terminal commands only.",
+            "naming the keystrokes and the snapshots its programs can then make",
+            "`contain` says user namespaces stay open, joining other namespaces too, and that a 32-bit program runs in it; the terminal rule and the subvolume rule still hold.",
+            "Limits: the filter covers those commands only.",
             "a desktop's X server among them",
             "On a kernel older than 4.8",
         ] {
@@ -454,6 +459,9 @@ mod tests {
         for text in [&help, &readme] {
             assert!(!text.contains("refuses injecting keystrokes"));
             assert!(!text.contains("gets only the keystroke rule"));
+            assert!(!text.contains("gets only the terminal rule,"));
+            assert!(!text.contains("joining other namespaces, and new btrfs"));
+            assert!(!text.contains("covers those terminal commands only"));
         }
     }
 

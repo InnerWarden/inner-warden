@@ -77,7 +77,8 @@ only — no IP, no host data; set `INNERWARDEN_NO_TELEMETRY=1` to disable). A
   (sandbox-exec) only; `contain` exits with an explicit error on Windows rather
   than pretending to isolate. On Linux, where the host takes it, every jail
   starts its programs under a seccomp filter that refuses `TIOCSTI` and
-  `TIOCLINUX`, the terminal commands that push input into your terminal.
+  `TIOCLINUX`, the terminal commands that push input into your terminal, and
+  new btrfs or bcachefs subvolumes and snapshots.
 - Agent identity (off by default, Linux): `innerwarden contain --identity --
   <command>` records the run as an instance, so its hook and the dashboard can
   tell one agent's runs apart. See [Agent identity and trust](#agent-identity-and-trust).
@@ -261,30 +262,35 @@ applies to any program started in a jail under its agent's name: the type is
 the name given at launch.
 
 An identified jail starts its programs under a seccomp filter, in the style of
-Flatpak: no new user namespaces, no joining other namespaces, no new btrfs
-subvolumes or snapshots, and no `TIOCSTI` or `TIOCLINUX`, the terminal
-commands that push input into your terminal. Its
+Flatpak: no new user namespaces, no joining other namespaces, no new btrfs or
+bcachefs subvolumes or snapshots, and no `TIOCSTI` or `TIOCLINUX`, the
+terminal commands that push input into your terminal. Its
 programs run with no capability, also when `contain` itself runs as root.
 Programs that need their own user namespace (Chromium's sandbox, rootless
 containers, an agent's own bubblewrap sandbox) do not work inside it; turn the
 agent's own sandbox off inside `innerwarden contain`. A 32-bit program (i386
 or x32 on x86_64, arm on aarch64) is ended at its first call in an identified
-jail. A jail started without `--identity` gets only the terminal rule, and
-applies it to 32-bit programs too, which run in it as before.
+jail. A jail started without `--identity` gets only the terminal rule and the
+subvolume rule, and applies them to 32-bit programs too, which run in it as
+before. Every jail refuses new subvolumes and snapshots because a snapshot of
+the project would show the files the jail hides in it (`.env`, `secrets/`,
+each `--deny-read` path).
 
 Where the host cannot start a jail with the filter (a kernel without seccomp
 filters, a binary run under another architecture's emulation, a build for an
 architecture other than x86_64 or aarch64), the jail runs without it and
-`contain` says so when it starts. An identified jail whose host takes only
-the terminal filter gets that one, and `contain` says user namespaces stay
-open.
+`contain` says so when it starts, naming the keystrokes and the snapshots its
+programs can then make. An identified jail whose host takes only the plain
+jail's filter gets that one, and `contain` says user namespaces stay open,
+joining other namespaces too, and that a 32-bit program runs in it; the
+terminal rule and the subvolume rule still hold.
 
-Limits: the filter covers those terminal commands only. The jail shares the
+Limits: the filter covers those commands only. The jail shares the
 host's network, so a program in it can still reach any abstract unix socket,
 a desktop's X server among them, and through X type into another window. On
 a kernel older than 4.8, a program in the jail that traces another can change
 a call after the filter has seen it: there an identified jail does not close
-user namespaces, and `contain` says the terminal rule is weaker. This is not
+user namespaces, and `contain` says the filter is weaker. This is not
 yet proven on RHEL 9 or Rocky 9.
 
 ## Build from source

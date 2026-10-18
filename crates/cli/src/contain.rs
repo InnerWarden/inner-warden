@@ -26,11 +26,11 @@
 //!     layer, never `$PATH`.
 //!   * On Linux every jail starts its programs under a seccomp filter
 //!     (`innerwarden_agent_guard::seccomp`) where the host takes it: no
-//!     `TIOCSTI` or `TIOCLINUX` into a terminal, and with `--identity` no new
-//!     user namespace, no joining one, and no new btrfs subvolume or
-//!     snapshot. A host that does not take it is
-//!     told by a throwaway jail first, and the jail then runs without it and
-//!     says so.
+//!     `TIOCSTI` or `TIOCLINUX` into a terminal, no new btrfs or bcachefs
+//!     subvolume or snapshot (one would copy the files the jail hides), and
+//!     with `--identity` no new user namespace and no joining one. A host
+//!     that does not take it is told by a throwaway jail first, and the jail
+//!     then runs without it and says what it runs without.
 //!   * An identified jail drops every capability (`--cap-drop ALL`): a
 //!     launcher run as root would otherwise hand its programs root's
 //!     capabilities in the host's user namespace.
@@ -960,10 +960,11 @@ pub fn build_linux_jail(input: &JailInputs) -> Result<LinuxJailPlan, ContainErro
     // After the record and every mount, like the rest of this block: the
     // seccomp filter bwrap applies to the jail's programs before the command
     // runs, where the launcher's start-up probe found the host takes it. In
-    // every jail it refuses keystroke injection into a terminal; with
-    // `--identity` also new user namespaces and joining one, so the jail
-    // cannot rebuild what it was refused. A defence in depth; it never
-    // changes the trust of the instance.
+    // every jail it refuses keystroke injection into a terminal and new
+    // btrfs or bcachefs subvolumes and snapshots; with `--identity` also new
+    // user namespaces and joining one, so the jail cannot rebuild what it was
+    // refused. A defence in depth; it never changes the trust of the
+    // instance.
     if let Some(fd) = input.seccomp_fd {
         push(&[SECCOMP_OPTION, &fd.to_string()]);
     }
@@ -1645,11 +1646,20 @@ pub mod launch {
         }
     }
 
+    /// What else an identified jail runs without when its filter is not the
+    /// identified one: the identified filter adds the namespace rules and
+    /// the end of 32-bit programs to the plain jail's, and nothing more
+    /// (a test of `innerwarden_agent_guard::seccomp` holds it), so with the
+    /// user namespace line this names all it loses.
+    pub const USERNS_OPEN_ALSO: &str =
+        "Joining other namespaces stays open too, and a 32-bit program runs in the jail.";
+
     /// The line `contain --identity` prints (and a dry run shows) when user
-    /// namespaces stay open.
+    /// namespaces stay open, with the rest of what the identified filter
+    /// would have refused ([`USERNS_OPEN_ALSO`]).
     pub fn userns_open_sentence(why: UsernsWhy) -> String {
         format!(
-            "innerwarden contain: user namespaces stay open ({}): {}",
+            "innerwarden contain: user namespaces stay open ({}): {} {USERNS_OPEN_ALSO}",
             why.word(),
             why.sentence()
         )
@@ -1690,17 +1700,18 @@ pub mod launch {
 
         pub fn sentence(self) -> &'static str {
             match self {
-                FilterWhy::ProbeFailed => "Bubblewrap here could not start a jail with the sandbox filter, so programs in the jail can still inject keystrokes into your terminal.",
-                FilterWhy::NotBuilt => "This build has no sandbox filter for this architecture, so programs in the jail can still inject keystrokes into your terminal.",
-                FilterWhy::KernelTooOld => "This kernel is older than 4.8, where a program that traces another can get a call past the filter, so programs in the jail may still inject keystrokes into your terminal.",
-                FilterWhy::KernelUnknown => "This kernel's release could not be read as a version (it is not one, or there is no /proc and a personality such as setarch --uname-2.6 hides it from uname), so it is taken as older than 4.8, where a program that traces another can get a call past the filter: programs in the jail may still inject keystrokes into your terminal.",
-                FilterWhy::NotHanded => "The launcher could not hand the sandbox filter to bubblewrap, so programs in the jail can still inject keystrokes into your terminal.",
+                FilterWhy::ProbeFailed => "Bubblewrap here could not start a jail with the sandbox filter, so programs in the jail can still inject keystrokes into your terminal and make new btrfs or bcachefs subvolumes or snapshots (a snapshot shows the files the jail hides).",
+                FilterWhy::NotBuilt => "This build has no sandbox filter for this architecture, so programs in the jail can still inject keystrokes into your terminal and make new btrfs or bcachefs subvolumes or snapshots (a snapshot shows the files the jail hides).",
+                FilterWhy::KernelTooOld => "This kernel is older than 4.8, where a program that traces another can get a call past the filter, so programs in the jail may still inject keystrokes into your terminal or make new btrfs or bcachefs subvolumes or snapshots (a snapshot shows the files the jail hides).",
+                FilterWhy::KernelUnknown => "This kernel's release could not be read as a version (it is not one, or there is no /proc and a personality such as setarch --uname-2.6 hides it from uname), so it is taken as older than 4.8, where a program that traces another can get a call past the filter: programs in the jail may still inject keystrokes into your terminal or make new btrfs or bcachefs subvolumes or snapshots (a snapshot shows the files the jail hides).",
+                FilterWhy::NotHanded => "The launcher could not hand the sandbox filter to bubblewrap, so programs in the jail can still inject keystrokes into your terminal and make new btrfs or bcachefs subvolumes or snapshots (a snapshot shows the files the jail hides).",
             }
         }
     }
 
     /// The line a launch prints (and its dry run shows) when its jail runs
-    /// without the terminal rule, or with a weaker one.
+    /// without the plain jail's filter (the terminal rule and the subvolume
+    /// one), or with a weaker one.
     pub fn filter_sentence(why: FilterWhy) -> String {
         let what = match why {
             FilterWhy::ProbeFailed | FilterWhy::NotBuilt | FilterWhy::NotHanded => {
@@ -3908,6 +3919,85 @@ mod tests {
         }
     }
 
+    /// Whoever turns a rule off says so. An identified launch that falls back
+    /// from the identified filter, for any cause, names everything that
+    /// filter adds to the plain one (`seccomp` holds that it adds nothing
+    /// else): user namespaces, joining other namespaces and the end of
+    /// 32-bit programs. A launch whose jail runs without the plain filter,
+    /// or with a weaker one, names both of its rules: keystrokes into the
+    /// terminal, and new btrfs or bcachefs subvolumes and snapshots.
+    ///
+    /// FAILS ON REVERT: drop [`launch::USERNS_OPEN_ALSO`] from the user
+    /// namespace line, or the subvolume words from any line of a jail that
+    /// runs without the plain filter.
+    #[test]
+    fn every_fallback_line_names_all_the_jail_runs_without() {
+        use innerwarden_agent_guard::seccomp::Rules;
+        use launch::{FilterHost, ProbeAnswer, TracerOrder};
+        let hosts = [
+            (true, TracerOrder::After),
+            (true, TracerOrder::Before),
+            (true, TracerOrder::Unknown),
+            (false, TracerOrder::After),
+        ];
+        let answers = [
+            ProbeAnswer::Ran,
+            ProbeAnswer::Failed,
+            ProbeAnswer::NotHanded,
+        ];
+        let mut fallbacks = 0;
+        for (built, tracer) in hosts {
+            for identified in answers {
+                for terminal in answers {
+                    for identity in [true, false] {
+                        let plan =
+                            launch::filter_plan(identity, FilterHost { built, tracer }, |rules| {
+                                if rules == Rules::Identified {
+                                    identified
+                                } else {
+                                    terminal
+                                }
+                            });
+                        let mut said = plan.said.clone();
+                        if let Some(rules) = plan.filter {
+                            said.extend(launch::filter_lost_sentences(rules));
+                        }
+                        for line in &said {
+                            if line.contains("user namespaces stay open") {
+                                fallbacks += 1;
+                                assert!(identity, "{line}");
+                                for words in [
+                                    "Joining other namespaces stays open too",
+                                    "a 32-bit program runs in the jail",
+                                ] {
+                                    assert!(line.contains(words), "{words:?}: {line}");
+                                }
+                            } else {
+                                assert!(line.contains("sandbox filter ("), "{line}");
+                                for words in [
+                                    "inject keystrokes into your terminal",
+                                    "make new btrfs or bcachefs subvolumes or snapshots",
+                                    "a snapshot shows the files the jail hides",
+                                ] {
+                                    assert!(line.contains(words), "{words:?}: {line}");
+                                }
+                            }
+                        }
+                        if identity && plan.filter != Some(Rules::Identified) {
+                            assert!(
+                                plan.said
+                                    .iter()
+                                    .any(|l| l.contains("user namespaces stay open")),
+                                "{plan:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(fallbacks > 20, "{fallbacks}");
+    }
+
     /// Two causes a launch names as what they are, not as another one. A
     /// kernel release that does not read as a version is taken as older
     /// than 4.8 (the terminal filter, said weaker; user namespaces left
@@ -4069,43 +4159,43 @@ mod tests {
         );
         assert_eq!(
             userns_open_sentence(why),
-            "innerwarden contain: user namespaces stay open (userns_probe_failed): Bubblewrap here could not start a jail with user namespaces closed, so the jail runs without that."
+            "innerwarden contain: user namespaces stay open (userns_probe_failed): Bubblewrap here could not start a jail with user namespaces closed, so the jail runs without that. Joining other namespaces stays open too, and a 32-bit program runs in the jail."
         );
         assert_eq!(
             userns_open_sentence(UsernsWhy::KernelTooOld),
-            "innerwarden contain: user namespaces stay open (userns_kernel_too_old): This kernel is older than 4.8, where a program that traces another could get a call past the filter, so the jail runs without closing them."
+            "innerwarden contain: user namespaces stay open (userns_kernel_too_old): This kernel is older than 4.8, where a program that traces another could get a call past the filter, so the jail runs without closing them. Joining other namespaces stays open too, and a 32-bit program runs in the jail."
         );
         assert_eq!(
             userns_open_sentence(UsernsWhy::NotBuilt),
-            "innerwarden contain: user namespaces stay open (userns_filter_not_built): This build has no sandbox filter for this architecture, so the jail runs without closing them."
+            "innerwarden contain: user namespaces stay open (userns_filter_not_built): This build has no sandbox filter for this architecture, so the jail runs without closing them. Joining other namespaces stays open too, and a 32-bit program runs in the jail."
         );
         assert_eq!(
             userns_open_sentence(UsernsWhy::KernelUnknown),
-            "innerwarden contain: user namespaces stay open (userns_kernel_unknown): This kernel's release could not be read as a version (it is not one, or there is no /proc and a personality such as setarch --uname-2.6 hides it from uname), so it is taken as older than 4.8 and the jail runs without closing them."
+            "innerwarden contain: user namespaces stay open (userns_kernel_unknown): This kernel's release could not be read as a version (it is not one, or there is no /proc and a personality such as setarch --uname-2.6 hides it from uname), so it is taken as older than 4.8 and the jail runs without closing them. Joining other namespaces stays open too, and a 32-bit program runs in the jail."
         );
         assert_eq!(
             userns_open_sentence(UsernsWhy::NotHanded),
-            "innerwarden contain: user namespaces stay open (userns_filter_not_handed): The launcher could not hand the sandbox filter to bubblewrap, so the jail runs without closing them."
+            "innerwarden contain: user namespaces stay open (userns_filter_not_handed): The launcher could not hand the sandbox filter to bubblewrap, so the jail runs without closing them. Joining other namespaces stays open too, and a 32-bit program runs in the jail."
         );
         assert_eq!(
             filter_sentence(FilterWhy::ProbeFailed),
-            "innerwarden contain: no sandbox filter (filter_probe_failed): Bubblewrap here could not start a jail with the sandbox filter, so programs in the jail can still inject keystrokes into your terminal."
+            "innerwarden contain: no sandbox filter (filter_probe_failed): Bubblewrap here could not start a jail with the sandbox filter, so programs in the jail can still inject keystrokes into your terminal and make new btrfs or bcachefs subvolumes or snapshots (a snapshot shows the files the jail hides)."
         );
         assert_eq!(
             filter_sentence(FilterWhy::NotBuilt),
-            "innerwarden contain: no sandbox filter (filter_not_built): This build has no sandbox filter for this architecture, so programs in the jail can still inject keystrokes into your terminal."
+            "innerwarden contain: no sandbox filter (filter_not_built): This build has no sandbox filter for this architecture, so programs in the jail can still inject keystrokes into your terminal and make new btrfs or bcachefs subvolumes or snapshots (a snapshot shows the files the jail hides)."
         );
         assert_eq!(
             filter_sentence(FilterWhy::KernelTooOld),
-            "innerwarden contain: a weaker sandbox filter (filter_kernel_too_old): This kernel is older than 4.8, where a program that traces another can get a call past the filter, so programs in the jail may still inject keystrokes into your terminal."
+            "innerwarden contain: a weaker sandbox filter (filter_kernel_too_old): This kernel is older than 4.8, where a program that traces another can get a call past the filter, so programs in the jail may still inject keystrokes into your terminal or make new btrfs or bcachefs subvolumes or snapshots (a snapshot shows the files the jail hides)."
         );
         assert_eq!(
             filter_sentence(FilterWhy::KernelUnknown),
-            "innerwarden contain: a weaker sandbox filter (filter_kernel_unknown): This kernel's release could not be read as a version (it is not one, or there is no /proc and a personality such as setarch --uname-2.6 hides it from uname), so it is taken as older than 4.8, where a program that traces another can get a call past the filter: programs in the jail may still inject keystrokes into your terminal."
+            "innerwarden contain: a weaker sandbox filter (filter_kernel_unknown): This kernel's release could not be read as a version (it is not one, or there is no /proc and a personality such as setarch --uname-2.6 hides it from uname), so it is taken as older than 4.8, where a program that traces another can get a call past the filter: programs in the jail may still inject keystrokes into your terminal or make new btrfs or bcachefs subvolumes or snapshots (a snapshot shows the files the jail hides)."
         );
         assert_eq!(
             filter_sentence(FilterWhy::NotHanded),
-            "innerwarden contain: no sandbox filter (filter_not_handed): The launcher could not hand the sandbox filter to bubblewrap, so programs in the jail can still inject keystrokes into your terminal."
+            "innerwarden contain: no sandbox filter (filter_not_handed): The launcher could not hand the sandbox filter to bubblewrap, so programs in the jail can still inject keystrokes into your terminal and make new btrfs or bcachefs subvolumes or snapshots (a snapshot shows the files the jail hides)."
         );
         let words = include_str!("../../dashboard-kit/web/src/community/words.ts");
         assert!(words.contains(
