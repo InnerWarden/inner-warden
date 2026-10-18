@@ -734,6 +734,9 @@ fn guard_self_disable_in(content: &str) -> Option<(&'static str, u32)> {
     if let Some((_, what, score)) = res.iter().find(|(re, _, _)| re.is_match(content)) {
         return Some((*what, *score));
     }
+    if changes_kernel_protection(content) {
+        return Some(("changes the kernel protection that contains it", 60));
+    }
     if !content.to_ascii_lowercase().contains("innerwarden") {
         return None;
     }
@@ -758,6 +761,147 @@ fn guard_self_disable_in(content: &str) -> Option<(&'static str, u32)> {
         ));
     }
     None
+}
+
+/// The words after `agent kernel` that only read what the kernel protection
+/// of agents on this host is: `status`, and the flags that ask for more of it
+/// or for help. Nothing after `kernel` at all reads it too.
+const KERNEL_PROTECTION_READS: &[&str] = &["status", "--technical", "--json", "--help", "-h"];
+
+/// Whether a command line changes the kernel protection Active Defence keeps
+/// over agents on this host: its command line's `agent kernel` with any word
+/// after it but a read ([`KERNEL_PROTECTION_READS`]), whether it is run as
+/// `innerwarden-ctl`, as `innerwarden host`, or as `innerwarden` (which hands
+/// a verb it does not know to Active Defence). Turning it off, watching,
+/// turning it on, trusting a file or a name and refusing one all change it,
+/// and only the person supervising the agent may, from their own terminal.
+///
+/// Read off the text, so a quote, an escape, an expansion or a word handed
+/// in by what runs the command (`xargs`, `find -exec`, `parallel`) is not a
+/// read: the command is refused. An `agent kernel` that only reads may
+/// redirect what it prints to a plain path.
+fn changes_kernel_protection(content: &str) -> bool {
+    static NAME: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static VERB: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let name = NAME.get_or_init(|| {
+        regex::Regex::new(r"(?i)\binnerwarden(?:-ctl)?\b").expect("a valid pattern")
+    });
+    let verb = VERB.get_or_init(|| {
+        regex::Regex::new(r"(?is)\bagent\b.*?\bkernel\b").expect("a valid pattern")
+    });
+    name.find_iter(content).any(|found| {
+        let before = &content[..found.start()];
+        let rest = &content[found.end()..];
+        let rest = &rest[..command_end(rest)];
+        verb.find(rest).is_some_and(|kernel| {
+            hands_in_words(&before[command_start(before)..])
+                || !only_reads_kernel_protection(&rest[kernel.end()..])
+        })
+    })
+}
+
+/// Where the command at the start of `text` ends: at the first `|`, `;`, newline or
+/// `&` that is not part of a redirection (`>&1`, `<&0`, `&>`). Quotes are not
+/// read: a boundary inside one ends the text early and leaves the quote
+/// behind, which no read is.
+fn command_end(text: &str) -> usize {
+    let bytes = text.as_bytes();
+    for (index, &byte) in bytes.iter().enumerate() {
+        match byte {
+            b'|' | b';' | b'\n' | b'\r' => return index,
+            b'&' => {
+                let redirect = (index > 0 && matches!(bytes[index - 1], b'>' | b'<'))
+                    || bytes.get(index + 1) == Some(&b'>');
+                if !redirect {
+                    return index;
+                }
+            }
+            _ => {}
+        }
+    }
+    bytes.len()
+}
+
+/// Where the command that ends `text` starts: after its last `|`, `;`,
+/// newline or `&` that is not part of a redirection.
+fn command_start(text: &str) -> usize {
+    let bytes = text.as_bytes();
+    for index in (0..bytes.len()).rev() {
+        match bytes[index] {
+            b'|' | b';' | b'\n' | b'\r' => return index + 1,
+            b'&' => {
+                let redirect = (index > 0 && matches!(bytes[index - 1], b'>' | b'<'))
+                    || bytes.get(index + 1) == Some(&b'>');
+                if !redirect {
+                    return index + 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    0
+}
+
+/// Whether the words before the command name are a program that adds
+/// words of its own to it: what it runs then gets more than the text says.
+fn hands_in_words(before: &str) -> bool {
+    before.split_whitespace().any(|word| {
+        let word = word.rsplit('/').next().unwrap_or(word);
+        matches!(
+            word,
+            "xargs" | "parallel" | "-exec" | "-execdir" | "-ok" | "-okdir"
+        )
+    })
+}
+
+/// Whether the words after `agent kernel` only read: each a read
+/// ([`KERNEL_PROTECTION_READS`], bare or whole in one pair of quotes), or a
+/// redirection of the output to a plain path.
+fn only_reads_kernel_protection(tail: &str) -> bool {
+    let mut words = tail.split_whitespace();
+    while let Some(word) = words.next() {
+        let bare = ['\'', '"']
+            .iter()
+            .find_map(|quote| {
+                word.strip_prefix(*quote)
+                    .and_then(|inner| inner.strip_suffix(*quote))
+            })
+            .unwrap_or(word);
+        if KERNEL_PROTECTION_READS.contains(&bare) {
+            continue;
+        }
+        let Some(target) = redirection_target(word) else {
+            return false;
+        };
+        let target = if target.is_empty() {
+            // `2>&1` was cut at its `&`, or the path is the next word.
+            words.next().unwrap_or("")
+        } else {
+            target
+        };
+        if !target.is_empty() && !is_plain_path(target) {
+            return false;
+        }
+    }
+    true
+}
+
+/// What a redirection word (`>`, `>>`, `2>`, `<`, `>out.txt`, `&>`) names,
+/// or `None` when the word is not one.
+fn redirection_target(word: &str) -> Option<&str> {
+    let rest = word.trim_start_matches(|c: char| c.is_ascii_digit());
+    let rest = rest.strip_prefix('&').unwrap_or(rest);
+    let rest = rest
+        .strip_prefix(">>")
+        .or_else(|| rest.strip_prefix('>'))
+        .or_else(|| rest.strip_prefix('<'))?;
+    Some(rest.strip_prefix('&').unwrap_or(rest))
+}
+
+/// A path written as is: no expansion, quote, escape, glob or substitution.
+fn is_plain_path(path: &str) -> bool {
+    path.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-'))
 }
 
 /// The flag an operator's own script passes to `innerwarden allow` / `mute`
@@ -11096,6 +11240,152 @@ mod quote_tracking_tests {
             super::check_sensitive_read(&cmd).is_none(),
             "choosing a credential-shaped delimiter is not reading a credential"
         );
+    }
+}
+
+#[cfg(test)]
+mod kernel_protection_tests {
+    use super::*;
+
+    const REASON: &str = "changes the kernel protection that contains it";
+
+    /// An agent never changes the kernel protection Active Defence keeps
+    /// over it: not through `innerwarden-ctl`, not through `innerwarden host`
+    /// or `innerwarden` (both hand the verb to Active Defence), and in no
+    /// spelling the shell would run. Each verb but a read changes it, `off`
+    /// first of all.
+    ///
+    /// FAILS ON REVERT: drop the `changes_kernel_protection` call from
+    /// `guard_self_disable_in` and every line here but the `disarm` ones is
+    /// `None`.
+    #[test]
+    fn an_agent_cannot_turn_its_kernel_protection_off() {
+        for verb in [
+            "claude-code off",
+            "claude-code watch",
+            "claude-code on",
+            "claude-code on --strict",
+            "claude-code on --apply-now",
+            "claude-code review",
+            "claude-code trust /home/dev/.local/bin/tool",
+            "claude-code allow-read /home/dev/.config/gh/hosts.yml",
+            "claude-code allow-name example.com",
+            "claude-code refuse example.com",
+            "arm",
+            "check",
+            "workspace",
+            "observe claude-code",
+            "enforce claude-code",
+            "rehearse claude-code",
+            "--strict claude-code on",
+            "--technical claude-code off",
+        ] {
+            for form in [
+                format!("innerwarden-ctl agent kernel {verb}"),
+                format!("sudo innerwarden-ctl agent kernel {verb}"),
+                format!("/usr/local/sbin/innerwarden-ctl agent kernel {verb}"),
+                format!("innerwarden host agent kernel {verb}"),
+                format!("innerwarden agent kernel {verb}"),
+                format!("innerwarden-ctl --config /etc/x agent --json kernel {verb}"),
+            ] {
+                assert_eq!(
+                    check_guard_self_disable(&form),
+                    Some((REASON, 60)),
+                    "{form}"
+                );
+            }
+        }
+    }
+
+    /// Every way to hand the command words the text does not show is refused
+    /// too: an expansion, a quote, an escape, another command after a
+    /// redirection, a program that adds words (`xargs`, `find -exec`), an
+    /// interpreter, a shell string.
+    ///
+    /// FAILS ON REVERT: drop the `changes_kernel_protection` call and each is
+    /// `None`; take `hands_in_words` out of it and the two `xargs` lines are
+    /// `None`; read `&` as the end of the command inside a redirection and
+    /// the `2>&1` and `&>` lines are `None`.
+    #[test]
+    fn no_spelling_hides_a_change_of_the_kernel_protection() {
+        for cmd in [
+            "innerwarden-ctl agent kernel $VERB",
+            "innerwarden-ctl agent kernel ${IFS}claude-code${IFS}off",
+            "innerwarden-ctl agent kernel \"$@\"",
+            "innerwarden-ctl agent kernel $(echo claude-code off)",
+            "innerwarden-ctl agent kernel `echo claude-code off`",
+            "innerwarden-ctl agent kernel 'claude-code' 'off'",
+            "innerwarden-ctl 'agent' \"kernel\" claude-code off",
+            "innerwarden-ctl agent kernel \\; claude-code off",
+            "innerwarden-ctl agent kernel ';' claude-code off",
+            "innerwarden-ctl agent kernel 2>&1 claude-code off",
+            "innerwarden-ctl agent kernel >/dev/null 2>&1 claude-code off",
+            "innerwarden-ctl agent kernel &>/dev/null claude-code off",
+            "innerwarden-ctl agent kernel status $(innerwarden-ctl agent kernel claude-code off)",
+            "echo claude-code off | xargs innerwarden-ctl agent kernel",
+            "xargs -a /tmp/words innerwarden-ctl agent kernel",
+            "find /tmp -name x -exec innerwarden-ctl agent kernel {} \\;",
+            "parallel innerwarden-ctl agent kernel ::: off",
+            "sh -c 'innerwarden-ctl agent kernel claude-code off'",
+            "bash -lc \"innerwarden host agent kernel claude-code off\"",
+            "true && innerwarden-ctl agent kernel claude-code off",
+            "x=1; innerwarden-ctl agent kernel claude-code off",
+            "python3 -c \"import subprocess;subprocess.run(['innerwarden-ctl','agent','kernel','claude-code','off'])\"",
+            "alias k='innerwarden-ctl agent kernel'",
+            "K='innerwarden-ctl agent kernel'",
+            "inner''warden-ctl agent kernel claude-code off",
+            "inner\\warden-ctl agent kernel claude-code off",
+        ] {
+            assert!(check_guard_self_disable(cmd).is_some(), "{cmd}");
+        }
+    }
+
+    /// Reading the kernel protection is not changing it: `agent kernel`
+    /// alone, `status`, the flags that ask for more or for help, with what
+    /// it prints sent to a plain path or piped to a reader. Nor is a
+    /// command that only names the words.
+    #[test]
+    fn reading_the_kernel_protection_is_not_a_change() {
+        for cmd in [
+            "innerwarden-ctl agent kernel",
+            "innerwarden-ctl agent kernel status",
+            "sudo innerwarden-ctl agent kernel status",
+            "innerwarden host agent kernel",
+            "innerwarden agent kernel status",
+            "innerwarden-ctl agent kernel --technical",
+            "innerwarden-ctl agent kernel --technical status",
+            "innerwarden-ctl agent kernel status --json",
+            "innerwarden-ctl agent kernel --help",
+            "innerwarden-ctl agent kernel 'status'",
+            "innerwarden-ctl agent kernel status 2>&1 | head -20",
+            "innerwarden-ctl agent kernel status > /tmp/kernel.txt",
+            "innerwarden-ctl agent kernel status >/tmp/kernel.txt 2>/dev/null",
+            "innerwarden-ctl agent kernel; echo done",
+            "innerwarden-ctl agent kernel status && echo ok",
+            "innerwarden agents list",
+            "systemctl status innerwarden-agent",
+            "grep -n kernel /var/log/innerwarden/agent.log",
+            "uname -r",
+        ] {
+            assert_eq!(check_guard_self_disable(cmd), None, "{cmd}");
+        }
+    }
+
+    /// The refusal is a hard one: through the engine it is the
+    /// `guard_self_disable` signal at a deny's score, which no profile and
+    /// no host relaxes.
+    #[test]
+    fn changing_the_kernel_protection_is_refused_by_the_hard_layer() {
+        let analysis =
+            crate::mcp::analyze_command("innerwarden-ctl agent kernel claude-code off", None);
+        assert_eq!(analysis.recommendation, "deny", "{analysis:?}");
+        assert!(crate::identity::hits_hard_layer(&analysis), "{analysis:?}");
+        let signal = analysis
+            .signals
+            .iter()
+            .find(|s| s.signal == "guard_self_disable")
+            .expect("the signal");
+        assert_eq!(signal.detail, REASON);
     }
 }
 
