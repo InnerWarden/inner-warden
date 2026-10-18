@@ -292,7 +292,25 @@ pub const INSTANCE_DECIDE_VERSION: u32 = 1;
 /// the same fields, and `hook_verdict` is `allow` or `review`. The answer
 /// keeps [`INSTANCE_DECIDE_VERSION`] and its shape: what the host decided is
 /// said by its `verdict` and `withheld`.
+///
+/// Two rules hold for an answer to either version:
+///
+/// * the hook's general verdict is the ceiling of what the host lets run
+///   ([`InstanceDecideRequest::host_may_grant`]): an `allow` of the host's
+///   over a review it did not relax lets nothing start, because the hook
+///   keeps that review and a line that blocks reviews refuses it;
+/// * only a refusal of the host's own
+///   ([`InstanceDecideAnswer::refuses_on_its_own`]) makes a command the
+///   hook's general rules allow stricter: the host's own reading of the
+///   general rules is not the hook's (it holds none of the person's
+///   suppressions), and the hook's stands.
 pub const INSTANCE_DECIDE_EVERY_COMMAND_VERSION: u32 = 2;
+
+/// The start of every word ([`is_withheld_word`]) the host answers a `deny`
+/// with when the refusal is its own: it will not start a program in the
+/// command, whatever the hook's rules say. See
+/// [`InstanceDecideAnswer::refuses_on_its_own`].
+pub const HOST_REFUSAL_PREFIX: &str = "kernel_";
 
 /// The most signal names one request carries.
 pub const MAX_HOOK_SIGNALS: usize = 64;
@@ -474,6 +492,23 @@ impl InstanceDecideRequest {
             && self.hook_signals.windows(2).all(|pair| pair[0] < pair[1])
             && self.hook_layer == RuleLayer::General
     }
+
+    /// PURE. Whether the host may let a program of this command start on
+    /// the strength of `answer`, beyond the answer itself (an allowance it
+    /// holds for the exact command, say). The hook's verdict is the ceiling:
+    /// only an `allow` the hook keeps. That is the host's `allow` over a
+    /// command the hook's general rules allow, or over a review the host
+    /// relaxed itself ([`InstanceDecideAnswer::relaxes`]), and never for a
+    /// command with an argument from a tool result, which the hook does not
+    /// relax. An `allow` of the host's over a review it did not relax grants
+    /// nothing: the hook keeps that review, and a line that blocks reviews
+    /// refuses the command.
+    pub fn host_may_grant(&self, answer: &InstanceDecideAnswer) -> bool {
+        self.is_valid()
+            && !self.tainted
+            && answer.verdict == Verdict::Allow
+            && (self.hook_verdict == Verdict::Allow || answer.relaxes())
+    }
 }
 
 /// PURE. The request a hook sends about one command its general rules sent
@@ -641,6 +676,17 @@ impl InstanceDecideAnswer {
     /// `confined`.
     pub fn relaxes(&self) -> bool {
         self.trust == Trust::Confined && self.withheld.is_none()
+    }
+
+    /// Whether the host refuses the command on its own: a `deny` whose word
+    /// starts with [`HOST_REFUSAL_PREFIX`]. The only answer that makes a
+    /// command the hook's general rules allow stricter.
+    pub fn refuses_on_its_own(&self) -> bool {
+        self.verdict == Verdict::Deny
+            && self
+                .withheld
+                .as_deref()
+                .is_some_and(|word| word.starts_with(HOST_REFUSAL_PREFIX))
     }
 }
 
@@ -2643,6 +2689,96 @@ mod tests {
         assert_eq!(read.verdict, Verdict::Allow);
         assert_eq!(read.deciding_layer, RuleLayer::AgentType);
         assert_eq!(read.decision_id, DECISION);
+    }
+
+    /// The answer, read, with `verdict`, `trust` and `withheld` as given.
+    fn answer_with(verdict: &str, trust: &str, withheld: Option<&str>) -> InstanceDecideAnswer {
+        let mut value = answer();
+        value["verdict"] = json!(verdict);
+        value["trust"] = json!(trust);
+        value["withheld"] = json!(withheld);
+        if withheld.is_some() {
+            value["deciding_layer"] = json!("general");
+            value["profile"] = Value::Null;
+        }
+        let HostAnswer::Answer(read) = read(&value) else {
+            panic!("the contract's answer: {value}")
+        };
+        read
+    }
+
+    /// Only a `deny` with a word of the host's own refusal is one: another
+    /// word, another verdict or no word is the host's reading of the rules.
+    ///
+    /// FAILS ON REVERT: take any `deny` of the host's as its own refusal (drop
+    /// the prefix check) and its reading of the general rules is one.
+    #[test]
+    fn only_a_deny_with_a_word_of_its_own_is_the_hosts_refusal() {
+        assert_eq!(HOST_REFUSAL_PREFIX, "kernel_");
+        let own = answer_with("deny", "confined", Some("kernel_a_word_never_heard"));
+        assert!(own.refuses_on_its_own());
+        for (verdict, withheld) in [
+            ("deny", Some("not_review")),
+            ("deny", Some("a_kernel_word_never_heard")),
+            ("deny", None),
+            ("review", Some("kernel_a_word_never_heard")),
+            ("allow", Some("kernel_a_word_never_heard")),
+        ] {
+            let other = answer_with(verdict, "confined", withheld);
+            assert!(!other.refuses_on_its_own(), "{verdict} {withheld:?}");
+        }
+    }
+
+    /// The hook's general verdict is the ceiling of what the host lets run:
+    /// its `allow` over an `allow`, or over a review it relaxed itself; never
+    /// over a review it did not relax, which the hook keeps and may block on
+    /// its line, nor for an argument from a tool result.
+    ///
+    /// FAILS ON REVERT: let the host grant on its own `allow` whatever the
+    /// hook's verdict (drop the `hook_verdict` check) and the review the hook
+    /// blocks leaves a grant behind for the exact command.
+    #[test]
+    fn the_hooks_verdict_is_the_ceiling_of_what_the_host_grants() {
+        let request = |verdict: Verdict, tainted: bool| {
+            instance_decide_request_v2(
+                OWN,
+                Some("claude-code"),
+                None,
+                "curl https://x.example/p",
+                &[],
+                tainted,
+                verdict,
+            )
+            .unwrap()
+        };
+        let kept_general = answer_with("allow", "observed", Some("not_review"));
+        let relaxed = answer_with("allow", "confined", None);
+        let refused = answer_with("deny", "confined", Some("kernel_a_word_never_heard"));
+        let held = answer_with("review", "confined", Some("nothing_to_relax"));
+        // The hook's allow, kept by the host: a grant.
+        assert!(request(Verdict::Allow, false).host_may_grant(&kept_general));
+        // The hook's review, which the host did not relax: none.
+        assert!(!request(Verdict::Review, false).host_may_grant(&kept_general));
+        // The hook's review, relaxed by the host: a grant, unless tainted.
+        assert!(request(Verdict::Review, false).host_may_grant(&relaxed));
+        assert!(!request(Verdict::Review, true).host_may_grant(&relaxed));
+        // A request of version 1 is about a review: only a relaxation grants.
+        let v1 = instance_decide_request(OWN, None, None, "curl x", &[], false).unwrap();
+        assert!(v1.host_may_grant(&relaxed));
+        assert!(!v1.host_may_grant(&kept_general));
+        // The host's refusal or review grants nothing, whatever the hook said.
+        for answer in [&refused, &held] {
+            for verdict in [Verdict::Allow, Verdict::Review] {
+                assert!(
+                    !request(verdict, false).host_may_grant(answer),
+                    "{answer:?}"
+                );
+            }
+        }
+        // A request out of the contract grants nothing.
+        let mut odd = request(Verdict::Allow, false);
+        odd.v = 1;
+        assert!(!odd.host_may_grant(&kept_general));
     }
 
     /// FAILS ON REVERT: accept an answer without comparing `instance_id` and

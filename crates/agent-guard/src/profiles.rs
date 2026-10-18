@@ -67,7 +67,9 @@
 //! `every_command` (every command the hook does not refuse itself). The
 //! user's file never says it, and a file of schema 1 that says it is refused:
 //! a build that reads only schema 1 refuses the whole file, so `ask_host` is
-//! never quietly dropped.
+//! never quietly dropped. Active Defence on the host reads the same file, so
+//! every reader, it included, must be a version that reads schema 2 before a
+//! file of schema 2 is written.
 //!
 //! A category is one of the signal names the engine raises
 //! ([`crate::mcp::SIGNAL_NAMES`]). ATR categories are another namespace (they
@@ -342,6 +344,9 @@ impl ProfileMode {
 /// Whatever it says, a command the hook refuses itself (a hard rule, a
 /// refusal of the general rules, a profile's own refusal) is never asked
 /// about, and the hook keeps the stricter of its own verdict and the host's.
+/// A command the general rules allow (by a suppression too) is made stricter
+/// only by a refusal of the host's own
+/// ([`crate::identity::InstanceDecideAnswer::refuses_on_its_own`]).
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
 )]
