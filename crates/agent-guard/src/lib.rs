@@ -78,6 +78,7 @@ pub mod threats;
 // No consumer outside this crate. Kept private so a future caller has to make a
 // deliberate decision to widen the surface, rather than finding it already open.
 mod shell;
+mod shell_words;
 mod typosquat;
 mod unparsed;
 

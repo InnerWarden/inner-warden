@@ -1285,7 +1285,15 @@ fn analyze_command_at(
     // The agent trying to weaken the thing screening it. Scored to deny: every
     // route here is a deliberate act against the control boundary, and the
     // operator keeps all of them from their own terminal.
-    if let Some((what, s)) = threats::check_guard_self_disable(scan_cmd) {
+    // The no-op collapse above turns `\x69` into `x69`, which also undoes a
+    // `$'\x69...'` the shell decodes into a name; the projection as the
+    // shell reads it gets its own look, so the collapse only adds.
+    let self_disable = threats::check_guard_self_disable(scan_cmd).or_else(|| {
+        (raw_scan != scan_cmd)
+            .then(|| threats::check_guard_self_disable(raw_scan))
+            .flatten()
+    });
+    if let Some((what, s)) = self_disable {
         signals.push(AnalysisSignal {
             signal: "guard_self_disable".into(),
             score: s,
