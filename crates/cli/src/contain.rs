@@ -4460,6 +4460,7 @@ mod tests {
             project_rw: project.map(str::to_string),
             extra_ro: extra_ro.iter().map(|s| s.to_string()).collect(),
             deny_read: deny_read.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
         }
     }
 
