@@ -8,17 +8,23 @@
 //! Every jail refuses the two terminal commands that push input into a
 //! terminal (`TIOCSTI`, `TIOCLINUX`): a jail run from your terminal shares it,
 //! and a program could otherwise queue input your shell reads after the jail
-//! ends. A plain jail applies that rule to every ABI the kernel runs for its
-//! architecture, each by its own numbers (on x86_64 the native, x32 and i386
-//! ones, on aarch64 the native and 32-bit arm ones), and lets every other call
-//! through, so a 32-bit program runs in it as it did before the filter.
+//! ends. Every jail also refuses the btrfs and bcachefs commands that make a
+//! new subvolume or a snapshot: a snapshot of a folder the jail shows is a
+//! copy of what that folder holds on disk, made past the empty files and
+//! folders the jail mounts over the paths it hides, so the hidden files
+//! could be read in the copy. A plain jail applies these rules to every ABI
+//! the kernel runs for its architecture, each by its own numbers (on x86_64
+//! the native, x32 and i386 ones, on aarch64 the native and 32-bit arm
+//! ones), and lets every other call through, so a 32-bit program runs in it
+//! as it did before the filter.
 //!
 //! An identified jail (`--identity`) also refuses new user namespaces and
 //! joining other namespaces, so nothing in it can build a namespace of its
-//! own, and the btrfs commands that make a new subvolume or a snapshot of
-//! one, so nothing in it makes a new subvolume or snapshot. It ends a call
-//! made through any other ABI (another architecture's, or x32): the numbers
-//! it names would not name the same calls there.
+//! own. It ends a call made through any other ABI (another architecture's,
+//! or x32): the numbers it names would not name the same calls there. That
+//! is all it adds to the plain jail's rules, a test holds it, so a jail that
+//! falls back to the plain filter loses the namespace rules and nothing
+//! else.
 //!
 //! PURE, and the one definition of these programs: [`filter`] gives the exact
 //! bytes the launcher hands to bubblewrap, for either architecture, on any
@@ -116,13 +122,39 @@ const BTRFS_IOC_SUBVOL_CREATE: u32 = iow(BTRFS_IOCTL_MAGIC, 14, BTRFS_VOL_ARGS_S
 const BTRFS_IOC_SNAP_CREATE_V2: u32 = iow(BTRFS_IOCTL_MAGIC, 23, BTRFS_VOL_ARGS_V2_SIZE);
 const BTRFS_IOC_SUBVOL_CREATE_V2: u32 = iow(BTRFS_IOCTL_MAGIC, 24, BTRFS_VOL_ARGS_V2_SIZE);
 
-/// The commands an identified jail refuses besides the terminal ones, in the
-/// order the program compares them: no new btrfs subvolume or snapshot.
-const BTRFS_NEW_SUBVOLUME: [u32; 4] = [
+/// The type of every bcachefs command (`fs/bcachefs/bcachefs_ioctl.h`).
+const BCACHEFS_IOCTL_MAGIC: u32 = 0xbc;
+
+/// `sizeof(struct bch_ioctl_subvolume)`: `__u32 flags`, `__u32 dirfd`,
+/// `__u16 mode`, `__u16 pad[3]`, `__u64 dst_ptr` and `__u64 src_ptr`. No
+/// padding on either architecture, nor on their 32-bit ABIs.
+const BCH_SUBVOLUME_SIZE: u32 = 4 + 4 + 2 + 3 * 2 + 8 + 8;
+
+/// `sizeof(struct bch_ioctl_subvolume_v2)`: the same fields, then `struct
+/// bch_ioctl_err_msg` (`__u64 msg_ptr`, `__u32 msg_len`, `__u32 pad`).
+const BCH_SUBVOLUME_V2_SIZE: u32 = BCH_SUBVOLUME_SIZE + 8 + 4 + 4;
+
+/// The two bcachefs commands that make a new subvolume, or a snapshot of one
+/// (the same command with `BCH_SUBVOL_SNAPSHOT_CREATE` in its flags):
+/// `BCH_IOCTL_SUBVOLUME_CREATE` (`_IOW(0xbc, 16, struct
+/// bch_ioctl_subvolume)`, in Linux 6.7 to 6.17) and
+/// `BCH_IOCTL_SUBVOLUME_CREATE_v2` (`_IOW(0xbc, 29, struct
+/// bch_ioctl_subvolume_v2)`, in the bcachefs module built outside the
+/// kernel since). The same numbers on both architectures; a test holds each
+/// to its value written out.
+const BCH_IOCTL_SUBVOLUME_CREATE: u32 = iow(BCACHEFS_IOCTL_MAGIC, 16, BCH_SUBVOLUME_SIZE);
+const BCH_IOCTL_SUBVOLUME_CREATE_V2: u32 = iow(BCACHEFS_IOCTL_MAGIC, 29, BCH_SUBVOLUME_V2_SIZE);
+
+/// The commands every jail refuses besides the terminal ones, in the order
+/// the program compares them: no new btrfs or bcachefs subvolume or
+/// snapshot.
+const NEW_SUBVOLUME: [u32; 6] = [
     BTRFS_IOC_SNAP_CREATE,
     BTRFS_IOC_SUBVOL_CREATE,
     BTRFS_IOC_SNAP_CREATE_V2,
     BTRFS_IOC_SUBVOL_CREATE_V2,
+    BCH_IOCTL_SUBVOLUME_CREATE,
+    BCH_IOCTL_SUBVOLUME_CREATE_V2,
 ];
 
 /// `EPERM`, the same on both architectures.
@@ -249,12 +281,12 @@ impl Arch {
 /// Which jail the filter is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rules {
-    /// Every jail: no keystrokes pushed into a terminal, by any ABI the
-    /// kernel runs; every other call allowed.
+    /// Every jail: no keystrokes pushed into a terminal and no new btrfs or
+    /// bcachefs subvolume or snapshot, by any ABI the kernel runs; every
+    /// other call allowed.
     Terminal,
-    /// An identified jail (`--identity`): the terminal rule, no new user
-    /// namespace, no joining a namespace, no new btrfs subvolume or
-    /// snapshot, and no call through another ABI.
+    /// An identified jail (`--identity`): the terminal rules, no new user
+    /// namespace, no joining a namespace, and no call through another ABI.
     Identified,
 }
 
@@ -299,9 +331,9 @@ fn jeq(k: u32, yes: To, no: To) -> Step {
 /// the architecture; the number; on x86_64 an x32 number; `clone3` answers
 /// `ENOSYS`; `setns` `EPERM`; `unshare` and `clone` with `CLONE_NEWUSER` in
 /// the low word of their flags `EPERM`; `ioctl` (on x86_64 also 514, see
-/// [`X32_IOCTL`]) with `TIOCSTI` or `TIOCLINUX` in the low word of its
-/// command `EPERM`, and with the identified rules also one of
-/// [`BTRFS_NEW_SUBVOLUME`]; every other call is allowed. The low word, as
+/// [`X32_IOCTL`]) with `TIOCSTI`, `TIOCLINUX` or one of [`NEW_SUBVOLUME`]
+/// in the low word of its command `EPERM`; every other call is allowed.
+/// The `ioctl` rules are the same for both. The low word, as
 /// the kernel reads it: `ioctl` takes its command as an `unsigned int`, so
 /// the high 32 bits a caller sets never reach the command, and a command
 /// with them set is refused like the same command without them.
@@ -377,10 +409,8 @@ fn steps(arch: Arch, rules: Rules) -> Vec<Step> {
     s.push(Step::Load(OFFSET_ARG1_LOW));
     s.push(jeq(TIOCSTI, To::At(Eperm), To::Next));
     s.push(jeq(TIOCLINUX, To::At(Eperm), To::Next));
-    if identified {
-        for command in BTRFS_NEW_SUBVOLUME {
-            s.push(jeq(command, To::At(Eperm), To::Next));
-        }
+    for command in NEW_SUBVOLUME {
+        s.push(jeq(command, To::At(Eperm), To::Next));
     }
     s.extend([
         Step::Mark(Allow),
@@ -676,79 +706,138 @@ mod tests {
         }
     }
 
-    /// The btrfs commands that make a new subvolume or a snapshot of one, by
-    /// their values in `include/uapi/linux/btrfs.h`, written out here and
-    /// never taken from the constants the program uses.
-    const BTRFS_COMMANDS: [(&str, u64); 4] = [
+    /// The btrfs and bcachefs commands that make a new subvolume or a
+    /// snapshot of one, by their values in `include/uapi/linux/btrfs.h` and
+    /// `fs/bcachefs/bcachefs_ioctl.h` (the bcachefs ones also as `strace`
+    /// shows the `bcachefs` tool's call), written out here and never taken
+    /// from the constants the program uses.
+    const NEW_SUBVOLUME_COMMANDS: [(&str, u64); 6] = [
         ("BTRFS_IOC_SNAP_CREATE", 0x5000_9401),
         ("BTRFS_IOC_SUBVOL_CREATE", 0x5000_940E),
         ("BTRFS_IOC_SNAP_CREATE_V2", 0x5000_9417),
         ("BTRFS_IOC_SUBVOL_CREATE_V2", 0x5000_9418),
+        ("BCH_IOCTL_SUBVOLUME_CREATE", 0x4020_BC10),
+        ("BCH_IOCTL_SUBVOLUME_CREATE_v2", 0x4030_BC1D),
     ];
 
-    /// An identified jail makes no new btrfs subvolume and no snapshot: each
-    /// of the four commands that make one answers EPERM, on both
-    /// architectures, by the low word of the command as the terminal ones
-    /// are (the kernel takes the command as a 32-bit `unsigned int`, so a
-    /// caller's high bits never reach it), and on x86_64 also by 514. The
-    /// other btrfs commands (deleting a snapshot, defragmenting) and a
-    /// command with one of the four only in its high word pass. The plain
-    /// jail lets all four through, by every ABI.
+    /// No jail makes a new btrfs or bcachefs subvolume, and no snapshot: in
+    /// the plain jail and the identified one alike, each of the six commands
+    /// that make one answers EPERM, on both architectures, by the low word of
+    /// the command as the terminal ones are (the kernel takes the command as
+    /// a 32-bit `unsigned int`, so a caller's high bits never reach it), and
+    /// on x86_64 also by 514. The plain jail refuses them by its 32-bit and
+    /// x32 `ioctl` too. The commands that make nothing (deleting a snapshot
+    /// or a subvolume, defragmenting) and a command with one of the six only
+    /// in its high word pass.
     ///
-    /// FAILS ON REVERT: take the btrfs commands out of the identified filter
-    /// (each passes), compare all 64 bits of the command (the variants with
-    /// high bits pass), or give them to the terminal filter too (the plain
-    /// jail refuses them).
+    /// FAILS ON REVERT: refuse the commands in the identified filter alone
+    /// (the plain jail snapshots a folder past the paths it hides), drop the
+    /// bcachefs ones (each passes), or compare all 64 bits of the command
+    /// (the variants with high bits pass).
     #[test]
-    fn an_identified_jail_never_snapshots_a_btrfs_subvolume() {
+    fn no_jail_makes_a_new_subvolume_or_snapshot() {
         for arch in ARCHES {
             let n = arch.numbers();
             let mut ioctls = vec![n.ioctl];
             if arch == Arch::X86_64 {
                 ioctls.push(X32_IOCTL);
             }
-            for (name, command) in BTRFS_COMMANDS {
-                for nr in &ioctls {
-                    for (bits, value) in [
-                        ("", command),
-                        (" with bit 32", 0x1_0000_0000 | command),
-                        (" with the high word set", 0xffff_ffff_0000_0000 | command),
-                    ] {
+            for (name, command) in NEW_SUBVOLUME_COMMANDS {
+                for rules in [Rules::Identified, Rules::Terminal] {
+                    let p = program(arch, rules);
+                    for nr in &ioctls {
+                        for (bits, value) in [
+                            ("", command),
+                            (" with bit 32", 0x1_0000_0000 | command),
+                            (" with the high word set", 0xffff_ffff_0000_0000 | command),
+                        ] {
+                            assert_eq!(
+                                run(&p, &Call::new(arch, *nr, &[3, value])),
+                                Verdict::Errno(EPERM),
+                                "{rules:?} {arch:?} ioctl {nr} {name}{bits}"
+                            );
+                        }
+                    }
+                    assert_eq!(
+                        run(&p, &Call::new(arch, n.ioctl, &[3, command << 32])),
+                        Verdict::Allow,
+                        "{rules:?} {arch:?} {name} only in the high word"
+                    );
+                }
+                let plain = program(arch, Rules::Terminal);
+                assert_eq!(
+                    run(&plain, &foreign_call(arch, COMPAT_IOCTL, &[3, command])),
+                    Verdict::Errno(EPERM),
+                    "{arch:?} plain jail 32-bit ioctl {name}"
+                );
+                if arch == Arch::X86_64 {
+                    for nr in [X32_SYSCALL_BIT | X32_IOCTL, X32_SYSCALL_BIT | 16] {
                         assert_eq!(
-                            identified(arch, *nr, &[3, value]),
+                            run(&plain, &Call::new(arch, nr, &[3, command])),
                             Verdict::Errno(EPERM),
-                            "{arch:?} ioctl {nr} {name}{bits}"
-                        );
-                        assert_eq!(
-                            terminal(arch, *nr, &[3, value]),
-                            Verdict::Allow,
-                            "{arch:?} plain jail ioctl {nr} {name}{bits}"
+                            "plain jail x32 ioctl {nr:#x} {name}"
                         );
                     }
                 }
-                assert_eq!(
-                    identified(arch, n.ioctl, &[3, command << 32]),
-                    Verdict::Allow,
-                    "{arch:?} {name} only in the high word"
-                );
-                assert_eq!(
-                    run(
-                        &program(arch, Rules::Terminal),
-                        &foreign_call(arch, COMPAT_IOCTL, &[3, command])
-                    ),
-                    Verdict::Allow,
-                    "{arch:?} plain jail 32-bit ioctl {name}"
-                );
             }
             // `BTRFS_IOC_SNAP_DESTROY` (15) and `BTRFS_IOC_DEFRAG` (2), both
-            // `_IOW(0x94, nr, struct btrfs_ioctl_vol_args)`: they make nothing.
-            for other in [0x5000_940F, 0x5000_9402] {
-                assert_eq!(
-                    identified(arch, n.ioctl, &[3, other]),
-                    Verdict::Allow,
-                    "{arch:?} {other:#x}"
-                );
+            // `_IOW(0x94, nr, struct btrfs_ioctl_vol_args)`, and
+            // `BCH_IOCTL_SUBVOLUME_DESTROY` (17, `struct bch_ioctl_subvolume`)
+            // and its `_v2` (30): they make nothing.
+            for other in [0x5000_940F, 0x5000_9402, 0x4020_BC11, 0x4030_BC1E] {
+                for rules in [Rules::Identified, Rules::Terminal] {
+                    assert_eq!(
+                        run(
+                            &program(arch, rules),
+                            &Call::new(arch, n.ioctl, &[3, other])
+                        ),
+                        Verdict::Allow,
+                        "{rules:?} {arch:?} {other:#x}"
+                    );
+                }
             }
+        }
+    }
+
+    /// What the identified filter adds to the plain jail's is the namespace
+    /// rules and the end of another ABI's calls, and nothing else: on the
+    /// native ABI of each architecture, every call other than `clone`,
+    /// `clone3`, `unshare` and `setns` gets the same answer from both, over
+    /// every number up to 1023 and every `ioctl` command either filter
+    /// names. So an identified jail that falls back to the plain filter
+    /// loses what `contain` then says (user namespaces, joining other
+    /// namespaces, the end of 32-bit programs) and keeps every other rule.
+    ///
+    /// FAILS ON REVERT: refuse the subvolume commands in the identified
+    /// filter alone (an identified jail that falls back would make
+    /// snapshots, and nothing would say so), or the terminal commands.
+    #[test]
+    fn the_identified_filter_adds_only_the_namespace_rules_to_the_plain_one() {
+        let commands: Vec<u64> = [u64::from(TIOCSTI), u64::from(TIOCLINUX), TCGETS, 0]
+            .into_iter()
+            .chain(NEW_SUBVOLUME_COMMANDS.map(|(_, command)| command))
+            .chain([0x5000_940F, 0x4020_BC11])
+            .collect();
+        for arch in ARCHES {
+            let n = arch.numbers();
+            let namespace = [n.clone, n.clone3, n.unshare, n.setns];
+            let (plain, identified) = (
+                program(arch, Rules::Terminal),
+                program(arch, Rules::Identified),
+            );
+            let mut compared = 0;
+            for nr in (0..1024).filter(|nr| !namespace.contains(nr)) {
+                for command in &commands {
+                    let call = Call::new(arch, nr, &[3, *command]);
+                    assert_eq!(
+                        run(&identified, &call),
+                        run(&plain, &call),
+                        "{arch:?} call {nr} with {command:#x}"
+                    );
+                    compared += 1;
+                }
+            }
+            assert!(compared > 1000 * commands.len(), "{arch:?} {compared}");
         }
     }
 
@@ -947,16 +1036,24 @@ mod tests {
     }
 
     /// The terminal rules, which every jail gets, plain ones included: of
-    /// the native calls only the two terminal commands are refused. A plain
-    /// jail keeps what it could do before, user namespaces included (the
-    /// test above holds the 32-bit ABIs to the same).
+    /// the native calls only the two terminal commands and the commands
+    /// that make a new subvolume or snapshot are refused. A plain jail keeps
+    /// what else it could do before, user namespaces included (the test
+    /// above holds the 32-bit ABIs to the same).
     ///
-    /// FAILS ON REVERT: give the plain jail the identified rules.
+    /// FAILS ON REVERT: give the plain jail the identified rules, or take
+    /// the subvolume commands out of it (`BTRFS_IOC_SNAP_CREATE_V2` passes).
     #[test]
-    fn the_terminal_filter_refuses_only_keystroke_injection() {
+    fn the_terminal_filter_refuses_only_keystrokes_and_new_subvolumes() {
         for arch in ARCHES {
             let n = arch.numbers();
-            for command in [u64::from(TIOCSTI), u64::from(TIOCLINUX), 0x1_0000_5412] {
+            for command in [
+                u64::from(TIOCSTI),
+                u64::from(TIOCLINUX),
+                0x1_0000_5412,
+                0x5000_9417,
+                0x4020_BC10,
+            ] {
                 assert_eq!(
                     terminal(arch, n.ioctl, &[1, command]),
                     Verdict::Errno(EPERM),
@@ -978,9 +1075,9 @@ mod tests {
                 ("clone3", n.clone3, vec![0, 88]),
                 ("ioctl(TCGETS)", n.ioctl, vec![0, TCGETS]),
                 (
-                    "ioctl(BTRFS_IOC_SNAP_CREATE_V2)",
+                    "ioctl(BTRFS_IOC_SNAP_DESTROY)",
                     n.ioctl,
-                    vec![3, 0x5000_9417],
+                    vec![3, 0x5000_940F],
                 ),
             ] {
                 assert_eq!(terminal(arch, nr, &args), Verdict::Allow, "{arch:?} {what}");
@@ -994,10 +1091,10 @@ mod tests {
 
     /// The four programs, byte for byte, as [`filter`] gives them: what
     /// bubblewrap reads. Any change to the program shows here first, and the
-    /// tests above say whether it still does what it says. The terminal
-    /// programs are the same bytes as when the builder lived in the
-    /// `innerwarden` binary; the identified ones have since grown the four
-    /// btrfs compares, one instruction each, after `TIOCLINUX`.
+    /// tests above say whether it still does what it says. Since the builder
+    /// lived in the `innerwarden` binary, all four programs have grown the
+    /// six subvolume compares (four btrfs, two bcachefs), one instruction
+    /// each, after `TIOCLINUX`, and nothing else.
     #[test]
     fn golden_bytes_of_each_filter() {
         let golden = [
@@ -1103,9 +1200,9 @@ mod tests {
             "sizeof btrfs_ioctl_vol_args and _v2"
         );
         assert_eq!(
-            BTRFS_NEW_SUBVOLUME.map(u64::from),
-            BTRFS_COMMANDS.map(|(_, command)| command),
-            "btrfs.h"
+            NEW_SUBVOLUME.map(u64::from).to_vec(),
+            NEW_SUBVOLUME_COMMANDS.map(|(_, command)| command).to_vec(),
+            "btrfs.h and bcachefs_ioctl.h"
         );
         assert_eq!(
             [
@@ -1116,6 +1213,18 @@ mod tests {
             ],
             [0x5000_9401, 0x5000_940E, 0x5000_9417, 0x5000_9418],
             "each name its own value"
+        );
+        // `fs/bcachefs/bcachefs_ioctl.h`: `struct bch_ioctl_subvolume` is 32
+        // bytes and `_v2` adds a 16-byte `struct bch_ioctl_err_msg`.
+        assert_eq!(
+            (BCH_SUBVOLUME_SIZE, BCH_SUBVOLUME_V2_SIZE),
+            (32, 48),
+            "sizeof bch_ioctl_subvolume and _v2"
+        );
+        assert_eq!(
+            (BCH_IOCTL_SUBVOLUME_CREATE, BCH_IOCTL_SUBVOLUME_CREATE_V2),
+            (0x4020_BC10, 0x4030_BC1D),
+            "_IOW(0xbc, 16, 32) and _IOW(0xbc, 29, 48)"
         );
         // The encoding on a command of another family:
         // `TIOCSPTLCK` is `_IOW('T', 0x31, int)`, 0x40045431, in
@@ -1210,14 +1319,17 @@ mod tests {
     #[cfg(target_os = "linux")]
     const CHILD_VAR: &str = "IW_SECCOMP_FILTER_CHILD";
 
-    /// The answers of a child's btrfs commands ([`child_answers`]).
+    /// The answers of a child's subvolume commands ([`child_answers`]).
     #[cfg(target_os = "linux")]
-    const BTRFS_KEYS: [&str; 5] = [
+    const SUBVOLUME_KEYS: [&str; 8] = [
         "btrfs_snap_create",
         "btrfs_subvol_create",
         "btrfs_snap_create_v2",
         "btrfs_subvol_create_v2",
         "btrfs_high",
+        "bcachefs_subvolume_create",
+        "bcachefs_subvolume_create_v2",
+        "bcachefs_high",
     ];
 
     /// The value of [`CHILD_VAR`] for a child under `rules`, or under no
@@ -1323,10 +1435,11 @@ mod tests {
                 answer(libc::syscall(libc::SYS_ioctl, slave, 0x1_0000_5412u64, at))
             ));
         }
-        // Each btrfs command that makes a subvolume or a snapshot, and one with
-        // high bits set, on no descriptor: the kernel answers a bad
-        // descriptor before it reads the command's struct, so an EPERM is
-        // the filter's, and no disk of any kind is needed.
+        // Each btrfs and bcachefs command that makes a subvolume or a
+        // snapshot, and one of each with high bits set, on no descriptor: the
+        // kernel answers a bad descriptor before it reads the command's
+        // struct, so an EPERM is the filter's, and no disk of any kind is
+        // needed.
         let no_descriptor: libc::c_int = -1;
         for (key, command) in [
             ("btrfs_snap_create", 0x5000_9401u64),
@@ -1334,6 +1447,9 @@ mod tests {
             ("btrfs_snap_create_v2", 0x5000_9417),
             ("btrfs_subvol_create_v2", 0x5000_9418),
             ("btrfs_high", 0xffff_ffff_5000_9418),
+            ("bcachefs_subvolume_create", 0x4020_BC10),
+            ("bcachefs_subvolume_create_v2", 0x4030_BC1D),
+            ("bcachefs_high", 0x1_4020_BC10),
         ] {
             // SAFETY: `ioctl` on no descriptor, with a null pointer the
             // kernel never reads (it answers EBADF first).
@@ -1454,9 +1570,9 @@ mod tests {
     /// EPERM, raw `clone3` answers ENOSYS, threads and child processes still
     /// start (glibc falls back to `clone`), TIOCSTI on the child's own
     /// controlling terminal is refused, high bits or not, and so is each
-    /// btrfs command that makes a subvolume or a snapshot. The same child
-    /// without the filter shows the kernel's own answers, so each refusal
-    /// above is the filter's.
+    /// btrfs and bcachefs command that makes a subvolume or a snapshot. The
+    /// same child without the filter shows the kernel's own answers, so each
+    /// refusal above is the filter's.
     ///
     /// Where this test already runs under a filter of its own (a default
     /// Docker container refuses `setns`), the control child answers that
@@ -1468,8 +1584,8 @@ mod tests {
     /// command fail on glibc 2.34 and later), compare all 64 bits of the
     /// `ioctl` command (`tiocsti_high` and `btrfs_high` reach the kernel),
     /// drop the `JSET`, name the wrong `clone` number (`clone_newuser` is
-    /// made), take the btrfs commands out of the identified filter (each
-    /// answers EBADF).
+    /// made), take the subvolume commands out of the filter (each answers
+    /// EBADF).
     #[cfg(target_os = "linux")]
     #[test]
     fn a_child_under_the_filter_is_refused_what_it_says() {
@@ -1495,14 +1611,14 @@ mod tests {
         assert_eq!(filtered["command"], 0, "a command starts: {filtered:?}");
         assert_eq!(filtered["tiocsti"], eperm, "{filtered:?}");
         assert_eq!(filtered["tiocsti_high"], eperm, "{filtered:?}");
-        for key in BTRFS_KEYS {
+        for key in SUBVOLUME_KEYS {
             assert_eq!(filtered[key], eperm, "{key}: {filtered:?}");
         }
         // Without the filter the kernel answers otherwise: a bad descriptor,
         // and TIOCSTI taken (or EIO where legacy TIOCSTI is off).
         if the_control_answers_as_the_kernel("the identified child test") {
             assert_eq!(control["setns"], libc::EBADF, "{control:?}");
-            for key in BTRFS_KEYS {
+            for key in SUBVOLUME_KEYS {
                 assert_eq!(control[key], libc::EBADF, "{key}: {control:?}");
             }
         }
@@ -1517,13 +1633,14 @@ mod tests {
 
     /// The terminal filter, which every jail gets (a plain one included), on
     /// a real kernel in a child process: TIOCSTI on the child's own
-    /// controlling terminal is refused, high bits or not, and nothing the
-    /// identified filter adds is: a new user namespace (by `unshare` and by a
-    /// raw `clone`), joining one, raw `clone3` and the btrfs commands that
-    /// make a subvolume or a snapshot answer exactly what the same child
-    /// answers without a filter, and threads and child processes
-    /// start. So the kernel loads the terminal program and runs it as the
-    /// interpreter does, and a plain jail keeps what it could do before.
+    /// controlling terminal is refused, high bits or not, and so is each
+    /// btrfs and bcachefs command that makes a subvolume or a snapshot. What
+    /// only the identified filter adds is not: a new user namespace (by
+    /// `unshare` and by a raw `clone`), joining one and raw `clone3` answer
+    /// exactly what the same child answers without a filter, and threads and
+    /// child processes start. So the kernel loads the terminal program and
+    /// runs it as the interpreter does, and a plain jail keeps what else it
+    /// could do before.
     ///
     /// The control's `setns` must be the kernel's own answer (a bad
     /// descriptor), or the equal answers prove nothing: under an outer
@@ -1532,26 +1649,29 @@ mod tests {
     /// `IW_REQUIRE_SECCOMP=1` the test fails.
     ///
     /// FAILS ON REVERT: give the terminal rules the identified program
-    /// (`setns` and `clone_newuser` are refused by the filter) or the btrfs
-    /// commands (each is refused by the filter), drop the
+    /// (`setns` and `clone_newuser` are refused by the filter), take the
+    /// subvolume commands out of them (each answers EBADF), drop the
     /// terminal program's `ioctl` check (`tiocsti` reaches the kernel), or
     /// compare all 64 bits of the command (`tiocsti_high` does).
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_child_under_the_terminal_filter_is_refused_only_keystrokes() {
+    fn a_child_under_the_terminal_filter_is_refused_only_keystrokes_and_subvolumes() {
         let eperm = libc::EPERM;
         let terminal = answers_of_a_child(Some(Rules::Terminal));
         let control = answers_of_a_child(None);
         eprintln!("terminal: {terminal:?}\ncontrol: {control:?}");
         assert_eq!(terminal["tiocsti"], eperm, "{terminal:?}");
         assert_eq!(terminal["tiocsti_high"], eperm, "{terminal:?}");
+        for key in SUBVOLUME_KEYS {
+            assert_eq!(terminal[key], eperm, "{key}: {terminal:?}");
+        }
         if the_control_answers_as_the_kernel("the terminal child test") {
             assert_eq!(control["setns"], libc::EBADF, "{control:?}");
+            for key in SUBVOLUME_KEYS {
+                assert_eq!(control[key], libc::EBADF, "{key}: {control:?}");
+            }
         }
-        for key in ["unshare_newuser", "clone_newuser", "setns", "clone3"]
-            .into_iter()
-            .chain(BTRFS_KEYS)
-        {
+        for key in ["unshare_newuser", "clone_newuser", "setns", "clone3"] {
             assert_eq!(
                 terminal[key], control[key],
                 "{key}: the terminal filter answers what the kernel does"
@@ -1570,47 +1690,51 @@ mod tests {
     // Each instruction is `code(2) jt jf k(4)`, little endian, one per line.
     const GOLDEN_X86_64_IDENTIFIED: &str = "
         2000000004000000
-        150000153e0000c0
+        150000173e0000c0
         2000000000000000
-        15001000ffffffff
-        3500120000000040
-        15001000b3010000
-        15000e0034010000
+        15001200ffffffff
+        3500140000000040
+        15001200b3010000
+        1500100034010000
         1500030010010000
         1500020038000000
         1500030010000000
-        1500020902020000
+        1500020b02020000
         2000000010000000
-        4500080700000010
+        45000a0900000010
         2000000018000000
-        1500060012540000
-        150005001c540000
-        1500040001940050
-        150003000e940050
-        1500020017940050
-        1500010018940050
+        1500080012540000
+        150007001c540000
+        1500060001940050
+        150005000e940050
+        1500040017940050
+        1500030018940050
+        1500020010bc2040
+        150001001dbc3040
         060000000000ff7f
         0600000001000500
         0600000026000500
         0600000000000080";
     const GOLDEN_AARCH64_IDENTIFIED: &str = "
         2000000004000000
-        15000012b70000c0
+        15000014b70000c0
         2000000000000000
-        15000f00b3010000
-        15000d000c010000
+        15001100b3010000
+        15000f000c010000
         1500020061000000
         15000100dc000000
-        150002091d000000
+        1500020b1d000000
         2000000010000000
-        4500080700000010
+        45000a0900000010
         2000000018000000
-        1500060012540000
-        150005001c540000
-        1500040001940050
-        150003000e940050
-        1500020017940050
-        1500010018940050
+        1500080012540000
+        150007001c540000
+        1500060001940050
+        150005000e940050
+        1500040017940050
+        1500030018940050
+        1500020010bc2040
+        150001001dbc3040
         060000000000ff7f
         0600000001000500
         0600000026000500
@@ -1619,18 +1743,24 @@ mod tests {
         2000000004000000
         150000073e0000c0
         2000000000000000
-        15000b00ffffffff
+        15001100ffffffff
         3500020000000040
         1500060010000000
-        1500050802020000
+        1500050e02020000
         1500040002020040
-        1500030610000040
-        1500000703000040
+        1500030c10000040
+        1500000d03000040
         2000000000000000
-        1500000336000000
+        1500000936000000
         2000000018000000
-        1500020012540000
-        150001001c540000
+        1500080012540000
+        150007001c540000
+        1500060001940050
+        150005000e940050
+        1500040017940050
+        1500030018940050
+        1500020010bc2040
+        150001001dbc3040
         060000000000ff7f
         0600000001000500
         0600000000000080";
@@ -1638,13 +1768,19 @@ mod tests {
         2000000004000000
         15000002b70000c0
         2000000000000000
-        150003061d000000
-        1500000728000040
+        1500030c1d000000
+        1500000d28000040
         2000000000000000
-        1500000336000000
+        1500000936000000
         2000000018000000
-        1500020012540000
-        150001001c540000
+        1500080012540000
+        150007001c540000
+        1500060001940050
+        150005000e940050
+        1500040017940050
+        1500030018940050
+        1500020010bc2040
+        150001001dbc3040
         060000000000ff7f
         0600000001000500
         0600000000000080";

@@ -359,7 +359,8 @@ fn identity_flag_mounts_the_record_read_only_inside_and_keeps_a_private_copy() {
             assert_eq!(record["schema"], 1, "{record}");
             assert!(record["jail"].get("userns_closed").is_none(), "{record}");
             // Each thing the jail runs without is said: user namespaces,
-            // and the keystroke rule the identified filter also carried.
+            // and the plain jail's rules (keystrokes, new subvolumes) the
+            // identified filter also carried.
             assert!(
                 stderr.contains(
                     "innerwarden contain: user namespaces stay open (userns_probe_failed)"
@@ -704,7 +705,7 @@ fn dry_run_shows_the_record_and_info_descriptors_only_with_the_identity_flag() {
                 .all(|l| l.contains("(userns_probe_failed)")),
             "{identified}"
         );
-        // The keystroke rule went with the identified filter: said too.
+        // The plain jail's rules went with the identified filter: said too.
         assert!(
             identified.lines().any(|l| l.starts_with(plain_said)),
             "{identified}"
@@ -1330,7 +1331,7 @@ fn a_planted_link_never_moves_a_hidden_home_path() {
     }
 }
 
-/// What `on_a_btrfs_disk_an_identified_jail_makes_no_subvolume_or_snapshot`
+/// What the btrfs side of [`no_jail_on_this_disk_makes_a_subvolume_or_snapshot`]
 /// runs, in a folder (`$1`) that holds a subvolume `src` of this user's,
 /// with the `btrfs` tool at `$2`: the tool's `subvolume create` and
 /// `subvolume snapshot`, then each of the four btrfs commands that make a
@@ -1338,7 +1339,7 @@ fn a_planted_link_never_moves_a_hidden_home_path() {
 /// line each: the tool's exit code, or the command's errno (0 when it made
 /// what it names).
 #[cfg(target_os = "linux")]
-const MAKE_SUBVOLUMES: &str = r#"cd "$1" || exit 90
+const MAKE_BTRFS_SUBVOLUMES: &str = r#"cd "$1" || exit 90
 "$2" subvolume create tool-subvol >/dev/null 2>err; echo "tool_subvolume=$?"; cat err >&2
 "$2" subvolume snapshot src tool-snap >/dev/null 2>err; echo "tool_snapshot=$?"; cat err >&2
 rm -f err
@@ -1364,18 +1365,58 @@ for key, command, arg in (
 PY
 "#;
 
-/// What [`MAKE_SUBVOLUMES`] makes when nothing refuses it, by key.
+/// The bcachefs side of [`MAKE_BTRFS_SUBVOLUMES`], with the `bcachefs` tool
+/// at `$2`: the tool's `subvolume create` and `subvolume snapshot`, then
+/// each of the two bcachefs commands, as a new subvolume and as a snapshot
+/// of `src`, by its number, from `python3`. `struct bch_ioctl_subvolume`
+/// is `flags`, `dirfd`, `mode`, 6 bytes of padding and the two paths'
+/// addresses; `_v2` adds 16 bytes for an error message, left empty.
 #[cfg(target_os = "linux")]
-const MADE_BY: [(&str, &str); 6] = [
-    ("tool_subvolume", "tool-subvol"),
-    ("tool_snapshot", "tool-snap"),
-    ("snap_create", "v1-snap"),
-    ("subvol_create", "v1-subvol"),
-    ("snap_create_v2", "v2-snap"),
-    ("subvol_create_v2", "v2-subvol"),
-];
+const MAKE_BCACHEFS_SUBVOLUMES: &str = r#"cd "$1" || exit 90
+"$2" subvolume create tool-subvol >/dev/null 2>err; echo "tool_subvolume=$?"; cat err >&2
+"$2" subvolume snapshot src tool-snap >/dev/null 2>err; echo "tool_snapshot=$?"; cat err >&2
+rm -f err
+python3 - <<'PY'
+import ctypes, fcntl, os, struct
+here = os.open(".", os.O_RDONLY | os.O_DIRECTORY)
+keep = []
+def at(name):
+    if name is None:
+        return 0
+    buf = ctypes.create_string_buffer(name)
+    keep.append(buf)
+    return ctypes.addressof(buf)
+def v1(flags, dst, src):
+    return bytearray(struct.pack("=IIH6xQQ", flags, here, 0o755, at(dst), at(src)))
+def v2(flags, dst, src):
+    return v1(flags, dst, src) + bytearray(16)
+for key, command, arg in (
+    ("subvolume_create", 0x4020BC10, v1(0, b"v1-subvol", None)),
+    ("snapshot_create", 0x4020BC10, v1(1, b"v1-snap", b"src")),
+    ("subvolume_create_v2", 0x4030BC1D, v2(0, b"v2-subvol", None)),
+    ("snapshot_create_v2", 0x4030BC1D, v2(1, b"v2-snap", b"src")),
+):
+    try:
+        fcntl.ioctl(here, command, arg)
+        print(f"{key}=0")
+    except OSError as e:
+        print(f"{key}={e.errno}")
+PY
+"#;
 
-/// The `key=value` lines of a run of [`MAKE_SUBVOLUMES`].
+/// What [`no_jail_on_this_disk_makes_a_subvolume_or_snapshot`] runs in a
+/// project (`$1`) that is a subvolume of this user's holding `.env` and
+/// `secrets/key`, with the tool at `$2`: what each secret holds, a
+/// snapshot of the project into it, and what the copy of each holds.
+#[cfg(target_os = "linux")]
+const SNAPSHOT_THE_PROJECT: &str = r#"cd "$1" || exit 90
+cat .env secrets/key 2>/dev/null | sed 's/^/before: /'
+"$2" subvolume snapshot . snap >/dev/null 2>err; echo "project_snapshot=$?"; cat err >&2
+rm -f err
+cat snap/.env snap/secrets/key 2>/dev/null | sed 's/^/copy: /'
+"#;
+
+/// The `key=value` lines of a run of one of the scripts above.
 #[cfg(target_os = "linux")]
 fn subvolume_answers(stdout: &[u8]) -> std::collections::BTreeMap<String, i32> {
     String::from_utf8_lossy(stdout)
@@ -1385,50 +1426,70 @@ fn subvolume_answers(stdout: &[u8]) -> std::collections::BTreeMap<String, i32> {
         .collect()
 }
 
-/// On a real btrfs disk an identified jail makes no new subvolume and no
-/// snapshot: `btrfs subvolume create` and `btrfs subvolume snapshot` fail
-/// with EPERM, and so does each of the four btrfs commands that make one,
-/// called by its number. The same user, on the same disk, makes every one
-/// of them outside any jail and in a plain jail: so each refusal is the
-/// identified filter's, and each number is one the kernel's btrfs takes.
-///
-/// Needs a folder this user owns on a btrfs disk in `IW_BTRFS_DIR`, the
-/// `btrfs` tool and `python3`, and a host that starts a jail under the
-/// filter. CI has no btrfs disk, so it runs on a lab host (a loop-mounted
-/// btrfs will do): `IW_BTRFS_DIR=<folder> cargo test -p innerwarden --test
-/// cjc_j007_ai_jail -- --ignored on_a_btrfs_disk </dev/null`. Run without
-/// any of them, it fails: it never passes having proved nothing.
-///
-/// FAILS ON REVERT (measured): take the btrfs commands out of the
-/// identified filter, and the identified jail makes each subvolume and
-/// snapshot.
+/// A disk kind [`no_jail_on_this_disk_makes_a_subvolume_or_snapshot`]
+/// runs on.
 #[cfg(target_os = "linux")]
-#[test]
-#[ignore = "needs a btrfs folder in IW_BTRFS_DIR, the btrfs tool and python3: a lab host runs it with --ignored"]
-fn on_a_btrfs_disk_an_identified_jail_makes_no_subvolume_or_snapshot() {
-    let disk = std::env::var_os("IW_BTRFS_DIR")
+struct SubvolumeDisk {
+    /// Its name.
+    kind: &'static str,
+    /// Its magic number, as `stat -f -c %t` gives it (coreutils before 9.5
+    /// has no name for bcachefs's).
+    magic: &'static str,
+    /// The variable that names a folder this user owns on one.
+    var: &'static str,
+    /// The tool that makes subvolumes there.
+    tool: &'static str,
+    /// The script that makes them, by the tool and by number.
+    script: &'static str,
+    /// What the script makes when nothing refuses it, by key.
+    made_by: &'static [(&'static str, &'static str)],
+    /// The keys of commands a kernel of that disk may not have yet: outside
+    /// any jail they answer `ENOTTY` there, and in a jail always `EPERM`.
+    newer: &'static [&'static str],
+}
+
+/// On a real btrfs or bcachefs disk no jail makes a new subvolume or a
+/// snapshot, plain or identified: the tool's `subvolume create` and
+/// `subvolume snapshot` fail with EPERM, and so does each command that makes
+/// one, called by its number. The same user, on the same disk, makes every
+/// one of them outside any jail: so each refusal is the filter's, and each
+/// number is one the kernel's file system takes. And the project, a
+/// subvolume of this user's holding `.env` and `secrets/key`: outside any
+/// jail a snapshot of it shows both, and in each jail both are hidden and
+/// no snapshot shows them.
+///
+/// Needs a folder this user owns on such a disk in the disk's variable,
+/// its tool and `python3`, and a host that starts a jail under the filter.
+/// CI has no such disk, so it runs on a lab host (a loop-mounted disk will
+/// do). Run without any of them, it fails: it never passes having proved
+/// nothing.
+#[cfg(target_os = "linux")]
+fn no_jail_on_this_disk_makes_a_subvolume_or_snapshot(disk: &SubvolumeDisk) {
+    let folder = std::env::var_os(disk.var)
         .map(std::path::PathBuf::from)
-        .expect("IW_BTRFS_DIR: a folder this user owns on a btrfs disk");
-    let kind = Command::new("stat")
-        .args(["-f", "-c", "%T"])
-        .arg(&disk)
+        .unwrap_or_else(|| {
+            panic!(
+                "{}: a folder this user owns on a {} disk",
+                disk.var, disk.kind
+            )
+        });
+    let magic = Command::new("stat")
+        .args(["-f", "-c", "%t"])
+        .arg(&folder)
         .output()
         .expect("stat the folder's file system");
     assert_eq!(
-        String::from_utf8_lossy(&kind.stdout).trim(),
-        "btrfs",
-        "IW_BTRFS_DIR is not on a btrfs disk"
+        String::from_utf8_lossy(&magic.stdout).trim(),
+        disk.magic,
+        "{} is not on a {} disk",
+        disk.var,
+        disk.kind
     );
-    let btrfs = [
-        "/usr/bin/btrfs",
-        "/bin/btrfs",
-        "/usr/sbin/btrfs",
-        "/sbin/btrfs",
-    ]
-    .into_iter()
-    .map(std::path::Path::new)
-    .find(|p| p.is_file())
-    .expect("the btrfs tool (btrfs-progs)");
+    let tool = ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+        .into_iter()
+        .map(|dir| std::path::Path::new(dir).join(disk.tool))
+        .find(|p| p.is_file())
+        .unwrap_or_else(|| panic!("the {} tool", disk.tool));
     assert!(
         Command::new("python3")
             .arg("--version")
@@ -1444,15 +1505,12 @@ fn on_a_btrfs_disk_an_identified_jail_makes_no_subvolume_or_snapshot() {
         "this host must start a jail under the filter"
     );
 
-    let work = tempfile::TempDir::new_in(&disk).unwrap();
-    // One folder per place, each with a subvolume of this user's to
-    // snapshot, made outside any jail.
-    let folder = |name: &str| {
-        let at = work.path().join(name);
-        std::fs::create_dir(&at).unwrap();
-        let made = Command::new(btrfs)
+    let work = tempfile::TempDir::new_in(&folder).unwrap();
+    // A subvolume of this user's, made outside any jail.
+    let subvolume = |at: &std::path::Path| {
+        let made = Command::new(&tool)
             .args(["subvolume", "create"])
-            .arg(at.join("src"))
+            .arg(at)
             .stdin(std::process::Stdio::null())
             .output()
             .unwrap();
@@ -1461,19 +1519,30 @@ fn on_a_btrfs_disk_an_identified_jail_makes_no_subvolume_or_snapshot() {
             "this user makes a subvolume outside the jail: {}",
             String::from_utf8_lossy(&made.stderr)
         );
-        at
     };
-    let script = |at: &std::path::Path| -> Vec<String> {
+    let script = |text: &str, at: &std::path::Path| -> Vec<String> {
         vec![
             "/bin/sh".into(),
             "-c".into(),
-            MAKE_SUBVOLUMES.into(),
+            text.into(),
             "sh".into(),
             at.to_str().unwrap().into(),
-            btrfs.to_str().unwrap().into(),
+            tool.to_str().unwrap().into(),
         ]
     };
-    let jailed = |at: &std::path::Path, identity: bool| {
+    let outside = |text: &str, at: &std::path::Path| {
+        let args = script(text, at);
+        let output = Command::new(&args[0])
+            .args(&args[1..])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        (
+            output.stdout.clone(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    };
+    let jailed = |text: &str, at: &std::path::Path, identity: bool| {
         let home = state_home();
         let mut command = cli();
         command.arg("contain");
@@ -1482,7 +1551,7 @@ fn on_a_btrfs_disk_an_identified_jail_makes_no_subvolume_or_snapshot() {
         }
         command
             .args(["--project", at.to_str().unwrap(), "--"])
-            .args(script(at))
+            .args(script(text, at))
             .env("HOME", home.path())
             .stdin(std::process::Stdio::null());
         let output = identified_without_a_scope(&mut command)
@@ -1494,62 +1563,166 @@ fn on_a_btrfs_disk_an_identified_jail_makes_no_subvolume_or_snapshot() {
             String::from_utf8_lossy(&output.stderr)
         );
         (
-            subvolume_answers(&output.stdout),
+            output.stdout.clone(),
             String::from_utf8_lossy(&output.stderr).into_owned(),
         )
     };
 
-    let outside_at = folder("outside");
-    let args = script(&outside_at);
-    let outside = Command::new(&args[0])
-        .args(&args[1..])
-        .stdin(std::process::Stdio::null())
-        .output()
-        .unwrap();
-    let outside_answers = subvolume_answers(&outside.stdout);
-    let plain_at = folder("plain");
-    let (plain, plain_err) = jailed(&plain_at, false);
-    let identified_at = folder("identified");
-    let (identified, identified_err) = jailed(&identified_at, true);
-    eprintln!("outside: {outside_answers:?}\nplain: {plain:?}\nidentified: {identified:?}");
-
-    for (key, name) in MADE_BY {
-        assert_eq!(
-            outside_answers.get(key),
-            Some(&0),
-            "{key} outside any jail: {}",
-            String::from_utf8_lossy(&outside.stderr)
-        );
+    // One folder per place, each with a subvolume `src` to snapshot.
+    let place = |name: &str| {
+        let at = work.path().join(name);
+        std::fs::create_dir(&at).unwrap();
+        subvolume(&at.join("src"));
+        at
+    };
+    let outside_at = place("outside");
+    let (outside_out, outside_err) = outside(disk.script, &outside_at);
+    let outside_answers = subvolume_answers(&outside_out);
+    eprintln!("outside: {outside_answers:?}");
+    for (key, name) in disk.made_by {
+        let answer = outside_answers.get(*key).copied();
+        if disk.newer.contains(key) && answer == Some(libc::ENOTTY) {
+            eprintln!("{key}: this kernel's {} has no such command", disk.kind);
+            continue;
+        }
+        assert_eq!(answer, Some(0), "{key} outside any jail: {outside_err}");
         assert!(outside_at.join(name).is_dir(), "{name} outside");
-        assert_eq!(
-            plain.get(key),
-            Some(&0),
-            "{key} in a plain jail: {plain_err}"
-        );
-        assert!(plain_at.join(name).is_dir(), "{name} in a plain jail");
+    }
+    for identity in [false, true] {
+        let at = place(if identity { "identified" } else { "plain" });
+        let (out, err) = jailed(disk.script, &at, identity);
+        let answers = subvolume_answers(&out);
+        eprintln!("identity {identity}: {answers:?}");
+        for (key, name) in disk.made_by {
+            assert!(!at.join(name).exists(), "{name} made, identity {identity}");
+            let answer = answers.get(*key).copied();
+            if key.starts_with("tool_") {
+                assert!(
+                    answer.is_some_and(|a| a != 0),
+                    "{key} identity {identity}: {err}"
+                );
+            } else {
+                assert_eq!(
+                    answer,
+                    Some(libc::EPERM),
+                    "{key} identity {identity}: {err}"
+                );
+            }
+        }
         assert!(
-            !identified_at.join(name).exists(),
-            "{name} made in an identified jail"
+            err.contains("Operation not permitted"),
+            "the tool says why, identity {identity}: {err}"
         );
     }
-    for key in ["tool_subvolume", "tool_snapshot"] {
-        assert_ne!(identified.get(key), Some(&0), "{key}: {identified_err}");
-        assert!(identified.contains_key(key), "{key}: {identified_err}");
-    }
-    assert!(
-        identified_err.contains("Operation not permitted"),
-        "the tool says why: {identified_err}"
+
+    // The project is a subvolume holding the secrets the jail hides.
+    let project = |name: &str| {
+        let at = work.path().join(name);
+        subvolume(&at);
+        std::fs::write(at.join(".env"), "SECRET_DOTENV=hunter2\n").unwrap();
+        std::fs::create_dir(at.join("secrets")).unwrap();
+        std::fs::write(at.join("secrets/key"), "SECRET_KEY_FILE\n").unwrap();
+        // On disk before any snapshot: bcachefs in Linux 6.12 can lose a
+        // file written just before one, and then goes read-only.
+        let synced = Command::new("sync")
+            .stdin(std::process::Stdio::null())
+            .status();
+        assert!(synced.is_ok_and(|s| s.success()), "sync");
+        at
+    };
+    let at = project("project-outside");
+    let (out, err) = outside(SNAPSHOT_THE_PROJECT, &at);
+    let text = String::from_utf8_lossy(&out);
+    assert_eq!(
+        subvolume_answers(&out).get("project_snapshot"),
+        Some(&0),
+        "a snapshot of the project outside any jail: {err}"
     );
-    for key in [
-        "snap_create",
-        "subvol_create",
-        "snap_create_v2",
-        "subvol_create_v2",
+    for line in [
+        "before: SECRET_DOTENV=hunter2",
+        "before: SECRET_KEY_FILE",
+        "copy: SECRET_DOTENV=hunter2",
+        "copy: SECRET_KEY_FILE",
     ] {
-        assert_eq!(
-            identified.get(key),
-            Some(&libc::EPERM),
-            "{key}: {identified_err}"
-        );
+        assert!(text.contains(line), "outside any jail: {line:?}: {text}");
     }
+    for identity in [false, true] {
+        let at = project(if identity {
+            "project-identified"
+        } else {
+            "project-plain"
+        });
+        let (out, err) = jailed(SNAPSHOT_THE_PROJECT, &at, identity);
+        let text = String::from_utf8_lossy(&out);
+        let answers = subvolume_answers(&out);
+        assert!(
+            answers.get("project_snapshot").is_some_and(|a| *a != 0),
+            "a snapshot of the project, identity {identity}: {text} {err}"
+        );
+        // Hidden in the jail, and in no copy of the project.
+        assert!(!text.contains("SECRET_"), "identity {identity}: {text}");
+        assert!(!at.join("snap").exists(), "identity {identity}");
+    }
+}
+
+/// [`no_jail_on_this_disk_makes_a_subvolume_or_snapshot`] on btrfs: the
+/// four commands, and the `btrfs` tool's create and snapshot.
+/// `IW_BTRFS_DIR=<folder> cargo test -p innerwarden --test cjc_j007_ai_jail
+/// -- --ignored on_a_btrfs_disk </dev/null`.
+///
+/// FAILS ON REVERT (measured): refuse the btrfs commands in the identified
+/// filter alone, and the plain jail makes each subvolume and snapshot, and
+/// its snapshot of the project shows `.env` and `secrets/key`.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "needs a btrfs folder in IW_BTRFS_DIR, the btrfs tool and python3: a lab host runs it with --ignored"]
+fn on_a_btrfs_disk_no_jail_makes_a_subvolume_or_snapshot() {
+    no_jail_on_this_disk_makes_a_subvolume_or_snapshot(&SubvolumeDisk {
+        kind: "btrfs",
+        magic: "9123683e",
+        var: "IW_BTRFS_DIR",
+        tool: "btrfs",
+        script: MAKE_BTRFS_SUBVOLUMES,
+        made_by: &[
+            ("tool_subvolume", "tool-subvol"),
+            ("tool_snapshot", "tool-snap"),
+            ("snap_create", "v1-snap"),
+            ("subvol_create", "v1-subvol"),
+            ("snap_create_v2", "v2-snap"),
+            ("subvol_create_v2", "v2-subvol"),
+        ],
+        newer: &[],
+    });
+}
+
+/// [`no_jail_on_this_disk_makes_a_subvolume_or_snapshot`] on bcachefs: both
+/// commands, each as a new subvolume and as a snapshot, and the `bcachefs`
+/// tool's create and snapshot. A kernel whose bcachefs has no `_v2`
+/// command answers it `ENOTTY` outside any jail, and the jail still refuses
+/// it. `IW_BCACHEFS_DIR=<folder> cargo test -p innerwarden --test
+/// cjc_j007_ai_jail -- --ignored on_a_bcachefs_disk </dev/null`.
+///
+/// FAILS ON REVERT (measured): drop the bcachefs commands from the filter,
+/// and each jail makes each subvolume and snapshot, and its snapshot of the
+/// project shows `.env` and `secrets/key`.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "needs a bcachefs folder in IW_BCACHEFS_DIR, the bcachefs tool and python3: a lab host runs it with --ignored"]
+fn on_a_bcachefs_disk_no_jail_makes_a_subvolume_or_snapshot() {
+    no_jail_on_this_disk_makes_a_subvolume_or_snapshot(&SubvolumeDisk {
+        kind: "bcachefs",
+        magic: "ca451a4e",
+        var: "IW_BCACHEFS_DIR",
+        tool: "bcachefs",
+        script: MAKE_BCACHEFS_SUBVOLUMES,
+        made_by: &[
+            ("tool_subvolume", "tool-subvol"),
+            ("tool_snapshot", "tool-snap"),
+            ("subvolume_create", "v1-subvol"),
+            ("snapshot_create", "v1-snap"),
+            ("subvolume_create_v2", "v2-subvol"),
+            ("snapshot_create_v2", "v2-snap"),
+        ],
+        newer: &["subvolume_create_v2", "snapshot_create_v2"],
+    });
 }
