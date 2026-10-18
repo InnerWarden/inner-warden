@@ -25,10 +25,11 @@
 //!   * The backend binary is resolved from trusted absolute paths by the I/O
 //!     layer, never `$PATH`.
 //!   * On Linux every jail starts its programs under a seccomp filter
-//!     (`contain_seccomp`) where the host takes it: no `TIOCSTI` or
-//!     `TIOCLINUX` into a terminal, and with `--identity` no new user
-//!     namespace and no joining one. A host that does not take it is told by
-//!     a throwaway jail first, and the jail then runs without it and says so.
+//!     (`innerwarden_agent_guard::seccomp`) where the host takes it: no
+//!     `TIOCSTI` or `TIOCLINUX` into a terminal, and with `--identity` no new
+//!     user namespace and no joining one. A host that does not take it is
+//!     told by a throwaway jail first, and the jail then runs without it and
+//!     says so.
 //!   * An identified jail drops every capability (`--cap-drop ALL`): a
 //!     launcher run as root would otherwise hand its programs root's
 //!     capabilities in the host's user namespace.
@@ -339,11 +340,11 @@ pub struct JailInputs {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub close_userns: bool,
     /// The descriptor bwrap reads the jail's seccomp filter from
-    /// (`--seccomp`, [`crate::contain_seccomp`]): the terminal filter for a
-    /// plain jail, the identified one with `--identity` (or the terminal one
-    /// where the host takes only that). `None` where the launcher's start-up
-    /// probe found this host cannot start a jail with either, and the jail
-    /// then runs as it did before the filter.
+    /// (`--seccomp`, [`innerwarden_agent_guard::seccomp`]): the terminal
+    /// filter for a plain jail, the identified one with `--identity` (or the
+    /// terminal one where the host takes only that). `None` where the
+    /// launcher's start-up probe found this host cannot start a jail with
+    /// either, and the jail then runs as it did before the filter.
     pub seccomp_fd: Option<i32>,
 }
 
@@ -1252,19 +1253,19 @@ pub mod launch {
     // -- the seccomp filter of the jail ---------------------------------------
     //
     // Every jail starts its programs under a seccomp filter
-    // (`crate::contain_seccomp`): the terminal one, and with `--identity` the
-    // identified one, which also closes user namespaces. bwrap has taken a
-    // filter on a descriptor (`--seccomp`) since its first releases, sets
-    // `no_new_privs` itself and applies the filter after it built the jail,
-    // a setuid bwrap included. What can still stop it is the host: a kernel
-    // without seccomp filters, a binary run under another architecture's
-    // emulation (the filter would kill the jail's first call), or a build
-    // for an architecture this one has no numbers for. That is learned
-    // BEFORE the jail is built, by starting a throwaway jail with the filter,
-    // and a launch is never started over. A host that cannot take it runs the
-    // jail as it did before the filter, and says so. An identified launch
-    // whose host does not take the identified filter falls back to the
-    // terminal one, and says what it lost.
+    // (`innerwarden_agent_guard::seccomp`): the terminal one, and with
+    // `--identity` the identified one, which also closes user namespaces.
+    // bwrap has taken a filter on a descriptor (`--seccomp`) since its first
+    // releases, sets `no_new_privs` itself and applies the filter after it
+    // built the jail, a setuid bwrap included. What can still stop it is the
+    // host: a kernel without seccomp filters, a binary run under another
+    // architecture's emulation (the filter would kill the jail's first
+    // call), or a build for an architecture this one has no numbers for.
+    // That is learned BEFORE the jail is built, by starting a throwaway jail
+    // with the filter, and a launch is never started over. A host that cannot
+    // take it runs the jail as it did before the filter, and says so. An
+    // identified launch whose host does not take the identified filter falls
+    // back to the terminal one, and says what it lost.
     //
     // Before Linux 4.8 the kernel ran the filter before a tracer could change
     // the call it was about to run: a program in the jail that traces another
@@ -1396,7 +1397,7 @@ pub mod launch {
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct FilterPlan {
         /// `None`: the jail runs without a filter.
-        pub filter: Option<crate::contain_seccomp::Rules>,
+        pub filter: Option<innerwarden_agent_guard::seccomp::Rules>,
         /// What the launch says (and its dry run shows as comments), in
         /// order: the user namespace line, then the terminal one.
         pub said: Vec<String>,
@@ -1406,7 +1407,7 @@ pub mod launch {
         /// The record may say the jail's user namespaces are closed: only
         /// under the identified filter.
         pub fn close_userns(&self) -> bool {
-            self.filter == Some(crate::contain_seccomp::Rules::Identified)
+            self.filter == Some(innerwarden_agent_guard::seccomp::Rules::Identified)
         }
     }
 
@@ -1423,9 +1424,9 @@ pub mod launch {
     pub fn filter_plan(
         identity: bool,
         host: FilterHost,
-        mut probe: impl FnMut(crate::contain_seccomp::Rules) -> bool,
+        mut probe: impl FnMut(innerwarden_agent_guard::seccomp::Rules) -> bool,
     ) -> FilterPlan {
-        use crate::contain_seccomp::Rules;
+        use innerwarden_agent_guard::seccomp::Rules;
         let mut said = Vec::new();
         if identity {
             let why = if !host.built {
@@ -1460,9 +1461,9 @@ pub mod launch {
     /// The lines a launch says when the filter it planned could not be
     /// handed in after all (its pipe could not be made): the jail then runs
     /// without one.
-    pub fn filter_lost_sentences(planned: crate::contain_seccomp::Rules) -> Vec<String> {
+    pub fn filter_lost_sentences(planned: innerwarden_agent_guard::seccomp::Rules) -> Vec<String> {
         let mut said = Vec::new();
-        if planned == crate::contain_seccomp::Rules::Identified {
+        if planned == innerwarden_agent_guard::seccomp::Rules::Identified {
             said.push(userns_open_sentence(UsernsWhy::ProbeFailed));
         }
         said.push(filter_sentence(FilterWhy::ProbeFailed));
@@ -1484,7 +1485,7 @@ pub mod launch {
 
     impl DryRunFilter {
         /// The filter the dry run shows in the argument list.
-        pub fn filter(&self) -> Option<crate::contain_seccomp::Rules> {
+        pub fn filter(&self) -> Option<innerwarden_agent_guard::seccomp::Rules> {
             match self {
                 DryRunFilter::Restricted(_) => None,
                 DryRunFilter::Plan(plan) => plan.filter,
@@ -3080,8 +3081,11 @@ mod tests {
     fn plan_with(
         identity: bool,
         host: launch::FilterHost,
-        takes: &[crate::contain_seccomp::Rules],
-    ) -> (launch::FilterPlan, Vec<crate::contain_seccomp::Rules>) {
+        takes: &[innerwarden_agent_guard::seccomp::Rules],
+    ) -> (
+        launch::FilterPlan,
+        Vec<innerwarden_agent_guard::seccomp::Rules>,
+    ) {
         let mut asked = Vec::new();
         let plan = launch::filter_plan(identity, host, |rules| {
             asked.push(rules);
@@ -3102,7 +3106,7 @@ mod tests {
     /// `--identity`.
     #[test]
     fn user_namespaces_close_only_with_identity_a_safe_kernel_and_a_probe_that_passed() {
-        use crate::contain_seccomp::Rules::{Identified, Terminal};
+        use innerwarden_agent_guard::seccomp::Rules::{Identified, Terminal};
         let (plan, asked) = plan_with(true, WHOLE_HOST, &[Identified, Terminal]);
         assert_eq!(plan.filter, Some(Identified));
         assert!(plan.close_userns());
@@ -3137,7 +3141,7 @@ mod tests {
     /// launch, or blame bubblewrap for a build with no numbers.
     #[test]
     fn a_launch_says_each_thing_its_jail_runs_without() {
-        use crate::contain_seccomp::Rules::{Identified, Terminal};
+        use innerwarden_agent_guard::seccomp::Rules::{Identified, Terminal};
         use launch::{filter_sentence, userns_open_sentence, FilterHost, FilterWhy, UsernsWhy};
 
         let (fallback, asked) = plan_with(true, WHOLE_HOST, &[Terminal]);
@@ -3321,7 +3325,7 @@ mod tests {
     /// FAILS ON REVERT: run the probe before the advice is looked at.
     #[test]
     fn a_dry_run_says_the_restriction_and_never_probes_where_it_applies() {
-        use crate::contain_seccomp::Rules::{Identified, Terminal};
+        use innerwarden_agent_guard::seccomp::Rules::{Identified, Terminal};
         use launch::{dry_run_filter, DryRunFilter};
         let advice = userns_restriction_advice(Some("1\n"), false, Path::new("/usr/bin/bwrap"));
         let said = dry_run_filter(advice.clone(), || {

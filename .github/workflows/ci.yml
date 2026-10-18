@@ -302,7 +302,8 @@ jobs:
         env:
           IW_REQUIRE_SECCOMP: "1"
         run: |
-          cargo test -p innerwarden --bin innerwarden contain_seccomp </dev/null
+          cargo test -p innerwarden-agent-guard --lib seccomp </dev/null
+          cargo test -p innerwarden --bin innerwarden the_launcher_hands_bwrap </dev/null
           cargo test -p innerwarden --test cjc_j007_ai_jail </dev/null
 
   # The Community dashboard bundle. Nothing ran the web suite or checked the

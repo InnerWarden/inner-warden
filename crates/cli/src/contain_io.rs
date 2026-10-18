@@ -537,7 +537,7 @@ fn sound_root_file<'a>(
 /// and the file is there, so a jail with no record gets the marker.
 fn run_linux(input: &JailInputs, marks: bool) -> ExitCode {
     use crate::contain::launch::{dry_run_filter, DryRunFilter};
-    use crate::contain_seccomp::Rules;
+    use innerwarden_agent_guard::seccomp::Rules;
     // A dry run with `--identity` shows the arguments the real run adds.
     let dry_identity;
     let dry_plain;
@@ -681,7 +681,9 @@ fn unrecorded_filter(bwrap: &Path, identity: bool) -> Option<std::io::PipeReader
 /// none, and the lines that say so are printed: the jail then runs as it did
 /// before the filter.
 #[cfg(target_os = "linux")]
-fn handed_filter(planned: Option<crate::contain_seccomp::Rules>) -> Option<std::io::PipeReader> {
+fn handed_filter(
+    planned: Option<innerwarden_agent_guard::seccomp::Rules>,
+) -> Option<std::io::PipeReader> {
     let rules = planned?;
     let filter = filter_pipe(rules);
     if filter.is_none() {
@@ -714,8 +716,8 @@ fn marker_pipe() -> Option<std::io::PipeReader> {
 /// build has no filter for the architecture it runs as, or the pipe cannot
 /// be made.
 #[cfg(target_os = "linux")]
-fn filter_pipe(rules: crate::contain_seccomp::Rules) -> Option<std::io::PipeReader> {
-    data_pipe(&crate::contain_seccomp::native_filter(rules)?)
+fn filter_pipe(rules: innerwarden_agent_guard::seccomp::Rules) -> Option<std::io::PipeReader> {
+    data_pipe(&innerwarden_agent_guard::seccomp::native_filter(rules)?)
 }
 
 /// What to say, and stop on, when this kernel restricts unprivileged user
@@ -998,7 +1000,7 @@ fn launch_identified(
     (instance_id, unit): (&str, &str),
     scope: &crate::contain::launch::ScopePlan,
     key: Option<&[u8; 32]>,
-    filter: Option<crate::contain_seccomp::Rules>,
+    filter: Option<innerwarden_agent_guard::seccomp::Rules>,
 ) -> Attempt {
     use crate::contain::launch::{launch_argv, ScopePlan};
     use std::io::Write;
@@ -1033,7 +1035,7 @@ fn launch_identified(
     identified.key_fd = key_reader.as_ref().map(AsRawFd::as_raw_fd);
     identified.seccomp_fd = filter_reader.as_ref().map(AsRawFd::as_raw_fd);
     identified.close_userns = input.close_userns
-        && filter == Some(crate::contain_seccomp::Rules::Identified)
+        && filter == Some(innerwarden_agent_guard::seccomp::Rules::Identified)
         && filter_reader.is_some();
     let plan = match build_linux_jail(&identified) {
         Ok(p) => p,
@@ -1425,7 +1427,11 @@ fn helper_env(command: &mut Command) {
 /// not the kernel's (a binary under emulation), fails here and never in the
 /// jail.
 #[cfg(target_os = "linux")]
-fn filter_probe(bwrap: &Path, rules: crate::contain_seccomp::Rules, identity: bool) -> bool {
+fn filter_probe(
+    bwrap: &Path,
+    rules: innerwarden_agent_guard::seccomp::Rules,
+    identity: bool,
+) -> bool {
     use std::os::fd::AsRawFd;
     use std::process::Stdio;
     use std::time::{Duration, Instant};
@@ -1472,7 +1478,7 @@ fn filter_plan_here(bwrap: &Path, identity: bool) -> crate::contain::launch::Fil
     use crate::contain::launch::{filter_plan, kernel_runs_the_filter_after_a_tracer, FilterHost};
     let release = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
     let host = FilterHost {
-        built: crate::contain_seccomp::Arch::native().is_some(),
+        built: innerwarden_agent_guard::seccomp::Arch::native().is_some(),
         tracer_safe: kernel_runs_the_filter_after_a_tracer(&release),
     };
     filter_plan(identity, host, |rules| filter_probe(bwrap, rules, identity))
@@ -1717,6 +1723,31 @@ fn print_plan_env(env: &[(String, String)]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What the launcher puts on bwrap's pipe is the library's filter
+    /// (`innerwarden_agent_guard::seccomp`), byte for byte, for each set of
+    /// rules: the bytes end where the program does, and the end bwrap reads
+    /// is inherited across its `exec`.
+    ///
+    /// FAILS ON REVERT: put any other bytes on the pipe (the other rules, or
+    /// a program built here instead of by the library).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_launcher_hands_bwrap_the_librarys_filter_bytes() {
+        use innerwarden_agent_guard::seccomp::{filter, Arch, Rules};
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+        let arch = Arch::native().expect("a Linux build the filter knows");
+        for rules in [Rules::Identified, Rules::Terminal] {
+            let mut reader = filter_pipe(rules).expect("the filter's pipe");
+            // SAFETY: F_GETFD on a descriptor this test owns.
+            let flags = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_GETFD) };
+            assert_eq!(flags & libc::FD_CLOEXEC, 0, "{rules:?} inherited");
+            let mut got = Vec::new();
+            reader.read_to_end(&mut got).unwrap();
+            assert_eq!(got, filter(arch, rules), "{rules:?}");
+        }
+    }
 
     /// One loopback listener that answers its first request with `status`.
     #[cfg(unix)]

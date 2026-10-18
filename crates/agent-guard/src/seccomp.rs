@@ -18,68 +18,72 @@
 //! own. It ends a call made through any other ABI (another architecture's, or
 //! x32): the numbers it names would not name the same calls there.
 //!
-//! PURE: the program and its bytes are built for either architecture on any
-//! host, so the tests run them through a small interpreter everywhere. The
-//! I/O layer (`contain_io`) hands the bytes to bubblewrap.
-
-// The I/O that uses this is Linux-only; the tests run everywhere.
-#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+//! PURE, and the one definition of these programs: [`filter`] gives the exact
+//! bytes the launcher hands to bubblewrap, for either architecture, on any
+//! host. So the programs are built and checked the same everywhere, and the
+//! tests run them through a small interpreter on every OS. The launcher's I/O
+//! (`contain_io` in the `innerwarden` binary) only puts the bytes on a pipe.
+//!
+//! The surface is small on purpose: [`Arch`] (with [`Arch::native`] and
+//! [`Arch::host`]), [`Rules`], [`filter`] and [`native_filter`]. The
+//! instructions behind them are private, so a change to the program shows
+//! in the golden bytes below and nowhere else.
 
 /// `AUDIT_ARCH_X86_64` (`EM_X86_64 | __AUDIT_ARCH_64BIT | __AUDIT_ARCH_LE`).
 /// The libc crate does not define it.
-pub const AUDIT_ARCH_X86_64: u32 = 0xC000_003E;
+const AUDIT_ARCH_X86_64: u32 = 0xC000_003E;
 
 /// `AUDIT_ARCH_AARCH64` (`EM_AARCH64 | __AUDIT_ARCH_64BIT | __AUDIT_ARCH_LE`).
 /// The libc crate does not define it.
-pub const AUDIT_ARCH_AARCH64: u32 = 0xC000_00B7;
+const AUDIT_ARCH_AARCH64: u32 = 0xC000_00B7;
 
 /// `AUDIT_ARCH_I386` (`EM_386 | __AUDIT_ARCH_LE`): a call an x86_64 kernel
 /// runs through its i386 ABI (`int 0x80`, a 32-bit program).
-pub const AUDIT_ARCH_I386: u32 = 0x4000_0003;
+const AUDIT_ARCH_I386: u32 = 0x4000_0003;
 
 /// `AUDIT_ARCH_ARM` (`EM_ARM | __AUDIT_ARCH_LE`): a call an aarch64 kernel
 /// runs for a 32-bit arm program.
-pub const AUDIT_ARCH_ARM: u32 = 0x4000_0028;
+const AUDIT_ARCH_ARM: u32 = 0x4000_0028;
 
 /// The bit an x32 call sets in its number on x86_64 (`__X32_SYSCALL_BIT`).
-pub const X32_SYSCALL_BIT: u32 = 0x4000_0000;
+const X32_SYSCALL_BIT: u32 = 0x4000_0000;
 
 /// x32's `ioctl` (514, with [`X32_SYSCALL_BIT`] set). Before Linux 5.4 the
 /// native and x32 calls were run from one table: a native call of 514 ran
 /// x32's `ioctl`, and an x32 call of 16 the native one. So on x86_64 every
 /// filter takes 514 as an `ioctl` too.
-pub const X32_IOCTL: u32 = 514;
+const X32_IOCTL: u32 = 514;
 
 /// `ioctl` in the i386 and the 32-bit arm tables alike.
-pub const COMPAT_IOCTL: u32 = 54;
+const COMPAT_IOCTL: u32 = 54;
 
 /// The number a tracer writes over a call it skips (strace's fault injection,
 /// a debugger). The kernel runs the filter on it and then returns `ENOSYS`
 /// without calling anything, so it is let through rather than killed as the
 /// x32 number it would otherwise look like.
-pub const SKIPPED_CALL: u32 = u32::MAX;
+const SKIPPED_CALL: u32 = u32::MAX;
 
 /// `CLONE_NEWUSER`, in the low word of the flags of `clone` and `unshare`.
-pub const CLONE_NEWUSER: u32 = 0x1000_0000;
+const CLONE_NEWUSER: u32 = 0x1000_0000;
 
 /// `TIOCSTI`: push a byte into a terminal's input queue.
-pub const TIOCSTI: u32 = 0x5412;
+const TIOCSTI: u32 = 0x5412;
 
 /// `TIOCLINUX`: the Linux console's subcommands, one of which pastes the
 /// selection into the console's input.
-pub const TIOCLINUX: u32 = 0x541C;
+const TIOCLINUX: u32 = 0x541C;
 
 /// `EPERM`, the same on both architectures.
-pub const EPERM: u32 = 1;
+const EPERM: u32 = 1;
 
 /// `ENOSYS`, the same on both architectures. `clone3` answers this, never
 /// `EPERM`: glibc 2.34 and later tries `clone3` first for every thread and
 /// every child and falls back to `clone` only on `ENOSYS`.
-pub const ENOSYS: u32 = 38;
+const ENOSYS: u32 = 38;
 
-pub const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
-pub const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
-pub const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
+const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
+const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
+const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
 
 // Offsets in `struct seccomp_data`: `int nr`, `__u32 arch`, `__u64
 // instruction_pointer`, `__u64 args[6]`. Both architectures are little
@@ -102,14 +106,14 @@ const BPF_RET_K: u16 = 0x06;
 /// Linux test holds the two to the same layout.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Insn {
-    pub code: u16,
-    pub jt: u8,
-    pub jf: u8,
-    pub k: u32,
+struct Insn {
+    code: u16,
+    jt: u8,
+    jf: u8,
+    k: u32,
 }
 
-/// The architectures this build has the call numbers of.
+/// The architectures this module has the call numbers of.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Arch {
     X86_64,
@@ -118,17 +122,18 @@ pub enum Arch {
 
 /// The call numbers the filter names, per architecture (libc 0.2.190).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Numbers {
-    pub clone: u32,
-    pub unshare: u32,
-    pub setns: u32,
-    pub clone3: u32,
-    pub ioctl: u32,
+struct Numbers {
+    clone: u32,
+    unshare: u32,
+    setns: u32,
+    clone3: u32,
+    ioctl: u32,
 }
 
 impl Arch {
-    /// The architecture this binary runs as, when it is one of these and
-    /// little endian. Elsewhere there is no filter to hand in.
+    /// The architecture this build runs as, when it is one of these and
+    /// little endian. Elsewhere there is no filter to hand in. This is the
+    /// one the launcher builds its filter for.
     pub fn native() -> Option<Arch> {
         if cfg!(target_endian = "little") && cfg!(target_arch = "x86_64") {
             Some(Arch::X86_64)
@@ -139,8 +144,48 @@ impl Arch {
         }
     }
 
+    /// The architecture of the Linux kernel this runs on, as `uname` gives
+    /// its machine, when it is one of these. It differs from [`Arch::native`]
+    /// only for a build run under another architecture's emulation, where a
+    /// jail runs without a filter (its start-up probe fails). `None` off
+    /// Linux, where there is no seccomp.
+    pub fn host() -> Option<Arch> {
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: `uname` fills the struct it is given, which lives until
+            // it returns; `machine` is then a NUL-terminated string inside it.
+            let machine = unsafe {
+                let mut names: libc::utsname = std::mem::zeroed();
+                if libc::uname(&mut names) != 0 {
+                    return None;
+                }
+                std::ffi::CStr::from_ptr(names.machine.as_ptr())
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            Arch::from_machine(&machine)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
+    }
+
+    /// PURE. The architecture a Linux kernel's machine name (`uname -m`)
+    /// names, when it is one of these: `x86_64`, and `aarch64` (or `arm64`,
+    /// as some tools print it). A 32-bit kernel (`i686`, `armv7l`) is none
+    /// of them.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    fn from_machine(machine: &str) -> Option<Arch> {
+        match machine.trim() {
+            "x86_64" => Some(Arch::X86_64),
+            "aarch64" | "arm64" => Some(Arch::Aarch64),
+            _ => None,
+        }
+    }
+
     /// The `arch` the kernel puts in `seccomp_data` for a call of this
-    /// architecture.
+    /// architecture (its `AUDIT_ARCH_*` value).
     pub fn audit(self) -> u32 {
         match self {
             Arch::X86_64 => AUDIT_ARCH_X86_64,
@@ -150,14 +195,14 @@ impl Arch {
 
     /// The `arch` of a call this architecture's kernel runs for a 32-bit
     /// program, and that ABI's `ioctl` number.
-    pub fn compat(self) -> (u32, u32) {
+    fn compat(self) -> (u32, u32) {
         match self {
             Arch::X86_64 => (AUDIT_ARCH_I386, COMPAT_IOCTL),
             Arch::Aarch64 => (AUDIT_ARCH_ARM, COMPAT_IOCTL),
         }
     }
 
-    pub fn numbers(self) -> Numbers {
+    fn numbers(self) -> Numbers {
         match self {
             Arch::X86_64 => Numbers {
                 clone: 56,
@@ -368,14 +413,14 @@ fn assemble(steps: &[Step]) -> Vec<Insn> {
     out
 }
 
-/// The filter for `arch` and `rules`.
-pub fn program(arch: Arch, rules: Rules) -> Vec<Insn> {
+/// The instructions of the filter for `arch` and `rules`.
+fn program(arch: Arch, rules: Rules) -> Vec<Insn> {
     assemble(&steps(arch, rules))
 }
 
 /// The program as bubblewrap reads it from its descriptor: each instruction's
-/// 8 bytes of `struct sock_filter`, in the host's (little endian) order.
-pub fn to_bytes(program: &[Insn]) -> Vec<u8> {
+/// 8 bytes of `struct sock_filter`, little endian (both architectures are).
+fn to_bytes(program: &[Insn]) -> Vec<u8> {
     let mut out = Vec::with_capacity(program.len() * 8);
     for insn in program {
         out.extend_from_slice(&insn.code.to_le_bytes());
@@ -386,34 +431,42 @@ pub fn to_bytes(program: &[Insn]) -> Vec<u8> {
     out
 }
 
-/// The bytes of this build's filter with `rules`, `None` where this build has
-/// no numbers for the architecture it runs as.
+/// PURE. The exact bytes of the filter for `arch` with `rules`: a whole
+/// number of 8-byte `struct sock_filter` instructions, the program the
+/// launcher hands to bubblewrap on a host of that architecture, and the
+/// program as the kernel then holds it for the jail. The same on any host.
+pub fn filter(arch: Arch, rules: Rules) -> Vec<u8> {
+    to_bytes(&program(arch, rules))
+}
+
+/// The bytes of this build's filter with `rules` ([`filter`] for
+/// [`Arch::native`]), `None` where this module has no numbers for the
+/// architecture the build runs as.
 pub fn native_filter(rules: Rules) -> Option<Vec<u8>> {
-    let arch = Arch::native()?;
-    Some(to_bytes(&program(arch, rules)))
+    Some(filter(Arch::native()?, rules))
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use super::*;
 
     /// What the program answered.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub(crate) enum Verdict {
+    enum Verdict {
         Allow,
         Errno(u32),
         Kill,
     }
 
     /// One call as the kernel describes it to a filter.
-    pub(crate) struct Call {
-        pub arch: u32,
-        pub nr: u32,
-        pub args: [u64; 6],
+    struct Call {
+        arch: u32,
+        nr: u32,
+        args: [u64; 6],
     }
 
     impl Call {
-        pub(crate) fn new(arch: Arch, nr: u32, args: &[u64]) -> Call {
+        fn new(arch: Arch, nr: u32, args: &[u64]) -> Call {
             let mut all = [0u64; 6];
             all[..args.len()].copy_from_slice(args);
             Call {
@@ -441,7 +494,7 @@ pub(crate) mod tests {
     /// `seccomp_data`, jumps forward and inside the program, the last
     /// instruction a return. An instruction it does not know fails the test,
     /// so the program cannot grow an operation the tests never ran.
-    pub(crate) fn run(program: &[Insn], call: &Call) -> Verdict {
+    fn run(program: &[Insn], call: &Call) -> Verdict {
         const SECCOMP_RET_DATA: u32 = 0x0000_ffff;
         assert!(!program.is_empty() && program.len() <= 4096);
         assert_eq!(program.last().unwrap().code, BPF_RET_K, "ends in a return");
@@ -820,9 +873,10 @@ pub(crate) mod tests {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
     }
 
-    /// The four programs, byte for byte: what bubblewrap reads. Any change to
-    /// the program shows here first, and the tests above say whether it
-    /// still does what it says.
+    /// The four programs, byte for byte, as [`filter`] gives them: what
+    /// bubblewrap reads. Any change to the program shows here first, and the
+    /// tests above say whether it still does what it says. These bytes are
+    /// the same as when the builder lived in the `innerwarden` binary.
     #[test]
     fn golden_bytes_of_each_filter() {
         let golden = [
@@ -833,7 +887,8 @@ pub(crate) mod tests {
         ];
         let mut wrong = Vec::new();
         for (arch, rules, expected) in golden {
-            let bytes = to_bytes(&program(arch, rules));
+            let bytes = filter(arch, rules);
+            assert_eq!(bytes, to_bytes(&program(arch, rules)));
             assert_eq!(bytes.len() % 8, 0);
             let got = hex(&bytes);
             if got != expected.replace(char::is_whitespace, "") {
@@ -874,9 +929,12 @@ pub(crate) mod tests {
     /// and x32), `include/uapi/asm-generic/unistd.h` (aarch64),
     /// `arch/x86/entry/syscalls/syscall_32.tbl` (i386) and
     /// `arch/arm/tools/syscall.tbl` (arm), and `include/uapi/linux/audit.h`
-    /// with `include/uapi/linux/elf-em.h` for the `arch` values. The CI
-    /// tests run on x86_64 only, and the golden bytes are printed when they
-    /// change, so this is what keeps a wrong aarch64 number from shipping.
+    /// with `include/uapi/linux/elf-em.h` for the `arch` values. CI runs the
+    /// filter on a real kernel of each architecture (the Linux build job on
+    /// x86_64, the arm64 job on aarch64: the child test below and the
+    /// libc check); this test holds the numbers on every host, macOS and
+    /// Windows included, where no kernel runs them, and for the architecture
+    /// a host is not.
     ///
     /// FAILS ON REVERT: change any number in [`Arch::numbers`] (aarch64's
     /// `clone` to 120, its arm32 number, say), or either `arch` value.
@@ -911,6 +969,45 @@ pub(crate) mod tests {
             (CLONE_NEWUSER, TIOCSTI, TIOCLINUX, EPERM, ENOSYS),
             (0x1000_0000, 0x5412, 0x541C, 1, 38)
         );
+    }
+
+    /// A kernel's machine name names one of the two architectures or none:
+    /// a 32-bit kernel, or another architecture, has no filter here.
+    ///
+    /// FAILS ON REVERT: read `arm64` as none (what macOS and some tools
+    /// print for aarch64), or take a 32-bit machine as one of the two.
+    #[test]
+    fn a_machine_name_is_one_of_the_two_architectures_or_none() {
+        for (machine, arch) in [
+            ("x86_64", Some(Arch::X86_64)),
+            ("x86_64\n", Some(Arch::X86_64)),
+            ("aarch64", Some(Arch::Aarch64)),
+            ("arm64", Some(Arch::Aarch64)),
+            ("i686", None),
+            ("i386", None),
+            ("armv7l", None),
+            ("aarch64_be", None),
+            ("riscv64", None),
+            ("x86-64", None),
+            ("", None),
+        ] {
+            assert_eq!(Arch::from_machine(machine), arch, "{machine:?}");
+        }
+    }
+
+    /// On Linux the host's architecture is what `uname -m` prints, and a
+    /// build that is not emulated runs as it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_host_is_the_kernels_own_machine() {
+        let printed = std::process::Command::new("uname")
+            .arg("-m")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("uname -m");
+        let machine = String::from_utf8_lossy(&printed.stdout);
+        assert_eq!(Arch::host(), Arch::from_machine(&machine), "{machine:?}");
+        assert!(Arch::host().is_some(), "a Linux host this filter knows");
     }
 
     /// The numbers and the layout are libc's for the architecture this test
