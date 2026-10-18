@@ -1077,22 +1077,34 @@ mod tests {
         assert_eq!(to_bytes(&[insn]), ours);
     }
 
-    /// The variable that tells a re-run of this test binary which side of the
-    /// child-process test it is.
+    /// The variable that tells a re-run of this test binary which child it
+    /// is ([`child_side`]).
     #[cfg(target_os = "linux")]
     const CHILD_VAR: &str = "IW_SECCOMP_FILTER_CHILD";
 
-    /// The answers of one child, as `name=value` lines: `0` for a call that
-    /// succeeded, the errno for one that failed.
+    /// The value of [`CHILD_VAR`] for a child under `rules`, or under no
+    /// filter (the control).
     #[cfg(target_os = "linux")]
-    fn child_answers(filtered: bool) -> Vec<String> {
+    fn child_side(rules: Option<Rules>) -> &'static str {
+        match rules {
+            Some(Rules::Identified) => "identified",
+            Some(Rules::Terminal) => "terminal",
+            None => "control",
+        }
+    }
+
+    /// The answers of one child, as `name=value` lines: `0` for a call that
+    /// succeeded, the errno for one that failed. `rules`: the filter it
+    /// installs first, if any.
+    #[cfg(target_os = "linux")]
+    fn child_answers(rules: Option<Rules>) -> Vec<String> {
         use std::ffi::CStr;
 
         let errno = || std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
         let answer = |rc: libc::c_long| if rc == -1 { errno() } else { 0 };
         let mut out = Vec::new();
-        if filtered {
-            let bytes = native_filter(Rules::Identified).expect("a filter for this build");
+        if let Some(rules) = rules {
+            let bytes = native_filter(rules).expect("a filter for this build");
             let (chunks, rest) = bytes.as_chunks::<8>();
             assert!(rest.is_empty());
             let filter: Vec<libc::sock_filter> = chunks
@@ -1222,17 +1234,19 @@ mod tests {
         })
     }
 
-    /// Run this test again in a child process (never a fork of the test
-    /// harness): `filtered` installs the identified filter first.
+    /// Run this test binary again as a child process (never a fork of the
+    /// test harness) that installs the filter with `rules` first, or none.
+    /// Every child runs in [`a_child_under_the_filter_is_refused_what_it_says`],
+    /// which answers as the child when [`CHILD_VAR`] is set.
     #[cfg(target_os = "linux")]
-    fn answers_of_a_child(filtered: bool) -> std::collections::BTreeMap<String, i32> {
+    fn answers_of_a_child(rules: Option<Rules>) -> std::collections::BTreeMap<String, i32> {
         let name = module_path!()
             .split_once("::")
             .map(|(_, rest)| format!("{rest}::a_child_under_the_filter_is_refused_what_it_says"))
             .unwrap();
         let out = std::process::Command::new(std::env::current_exe().unwrap())
             .args([name.as_str(), "--exact", "--nocapture", "--test-threads=1"])
-            .env(CHILD_VAR, if filtered { "filtered" } else { "control" })
+            .env(CHILD_VAR, child_side(rules))
             .stdin(std::process::Stdio::null())
             .output()
             .expect("run the child");
@@ -1275,14 +1289,18 @@ mod tests {
     #[test]
     fn a_child_under_the_filter_is_refused_what_it_says() {
         if let Ok(side) = std::env::var(CHILD_VAR) {
-            for line in child_answers(side == "filtered") {
+            let rules = [Some(Rules::Identified), Some(Rules::Terminal), None]
+                .into_iter()
+                .find(|rules| child_side(*rules) == side)
+                .expect("a child this test knows");
+            for line in child_answers(rules) {
                 println!("answer {line}");
             }
             return;
         }
         let eperm = libc::EPERM;
-        let filtered = answers_of_a_child(true);
-        let control = answers_of_a_child(false);
+        let filtered = answers_of_a_child(Some(Rules::Identified));
+        let control = answers_of_a_child(None);
         eprintln!("filtered: {filtered:?}\ncontrol: {control:?}");
         assert_eq!(filtered["unshare_newuser"], eperm, "{filtered:?}");
         assert_eq!(filtered["clone_newuser"], eperm, "{filtered:?}");
@@ -1309,6 +1327,44 @@ mod tests {
             );
         }
         assert_eq!((control["thread"], control["command"]), (0, 0));
+    }
+
+    /// The terminal filter, which every jail gets (a plain one included), on
+    /// a real kernel in a child process: TIOCSTI on the child's own
+    /// controlling terminal is refused, high bits or not, and nothing the
+    /// identified filter adds is: a new user namespace (by `unshare` and by a
+    /// raw `clone`), joining one and raw `clone3` answer exactly what the
+    /// same child answers without a filter, and threads and child processes
+    /// start. So the kernel loads the terminal program and runs it as the
+    /// interpreter does, and a plain jail keeps what it could do before.
+    ///
+    /// FAILS ON REVERT: give the terminal rules the identified program
+    /// (`setns` and `clone_newuser` are refused by the filter), drop the
+    /// terminal program's `ioctl` check (`tiocsti` reaches the kernel), or
+    /// compare all 64 bits of the command (`tiocsti_high` does).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_child_under_the_terminal_filter_is_refused_only_keystrokes() {
+        let eperm = libc::EPERM;
+        let terminal = answers_of_a_child(Some(Rules::Terminal));
+        let control = answers_of_a_child(None);
+        eprintln!("terminal: {terminal:?}\ncontrol: {control:?}");
+        assert_eq!(terminal["tiocsti"], eperm, "{terminal:?}");
+        assert_eq!(terminal["tiocsti_high"], eperm, "{terminal:?}");
+        for key in ["unshare_newuser", "clone_newuser", "setns", "clone3"] {
+            assert_eq!(
+                terminal[key], control[key],
+                "{key}: the terminal filter answers what the kernel does"
+            );
+        }
+        assert_eq!(terminal["thread"], 0, "a thread starts: {terminal:?}");
+        assert_eq!(terminal["command"], 0, "a command starts: {terminal:?}");
+        for key in ["tiocsti", "tiocsti_high"] {
+            assert!(
+                control[key] == 0 || control[key] == libc::EIO,
+                "{key} without the filter: {control:?}"
+            );
+        }
     }
 
     // Each instruction is `code(2) jt jf k(4)`, little endian, one per line.
