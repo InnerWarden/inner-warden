@@ -1068,7 +1068,7 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
         // So it is addressed to the person and is not a command line. This text
         // reaches the agent first, and a ready-to-run `innerwarden allow '<cmd>'`
         // here was an instruction the agent could follow to lift its own block.
-        eprintln!("{}", hook_block_remedy());
+        eprintln!("{}", hook_block_remedy(&verdict));
         std::process::ExitCode::from(2)
     } else {
         std::process::ExitCode::SUCCESS
@@ -1221,13 +1221,25 @@ const FILE_BLOCK_REMEDY: &str =
 
 /// What the hook tells the person after a block: only they can authorise it,
 /// from their own terminal. Not a command to copy, since the agent reads it
-/// first.
-fn hook_block_remedy() -> &'static str {
+/// first. A refusal of Active Defence's own on the host (recorded as decided
+/// by the host) is one `innerwarden allow` does not lift, so it is not
+/// offered there.
+fn hook_block_remedy(verdict: &serde_json::Value) -> &'static str {
+    if verdict.get("decided_by").and_then(|d| d.as_str()) == Some(host_decide::HOST_DECIDED_BY) {
+        return HOST_BLOCK_REMEDY;
+    }
     "  For the person supervising this agent: only you can authorise a blocked \
      command, from your own terminal (see `innerwarden allow --help`). An agent \
      cannot authorise it and should ask you instead of retrying. Your own shell \
      is not screened."
 }
+
+/// The remedy after a refusal of Active Defence's own on the host.
+const HOST_BLOCK_REMEDY: &str =
+    "  For the person supervising this agent: Active Defence on this host refused \
+     this command on its own, and `innerwarden allow` does not lift that; its settings \
+     on this host decide. An agent cannot authorise it and should ask you instead of \
+     retrying.";
 
 /// `innerwarden enforce` / `innerwarden dry-run` - flip every guarded agent
 /// integration between BLOCK (enforce) and observe-only (monitor). Native hooks
@@ -2380,6 +2392,31 @@ mod unknown_command_tests {
 
 #[cfg(test)]
 mod tests {
+    /// A refusal of Active Defence's own on the host is not one a rule of the
+    /// person's lifts: the remedy does not send them to `innerwarden allow`.
+    /// Every other block still does.
+    ///
+    /// FAILS ON REVERT: give every block the same remedy and a host refusal
+    /// points the person to a rule that does not lift it.
+    #[test]
+    fn a_host_refusal_does_not_offer_innerwarden_allow() {
+        let host = serde_json::json!({"recommendation": "deny", "decided_by": "host"});
+        let said = super::hook_block_remedy(&host);
+        assert!(!said.contains("innerwarden allow --help"), "{said}");
+        assert!(
+            said.contains("Active Defence on this host refused this command on its own"),
+            "{said}"
+        );
+        for other in [
+            serde_json::json!({"recommendation": "deny"}),
+            serde_json::json!({"recommendation": "review", "decided_by": "user"}),
+            serde_json::json!({"recommendation": "deny", "decided_by": "rules"}),
+        ] {
+            let said = super::hook_block_remedy(&other);
+            assert!(said.contains("innerwarden allow --help"), "{other}: {said}");
+        }
+    }
+
     /// A full uninstall must unwire EVERY agent before it deletes the binary.
     ///
     /// It removed claude-code's hook only, on a comment that said "claude-code
