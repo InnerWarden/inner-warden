@@ -147,8 +147,25 @@ enum FilterHere {
     NotTaken,
 }
 
+/// What a launch on this host does about the filter. With
+/// `IW_REQUIRE_SECCOMP=1` (CI and the release gate set it) anything but
+/// [`FilterHere::Taken`] fails the test: a runner whose bwrap stopped taking
+/// a filter would otherwise prove only the jail without one, and stay green.
 #[cfg(target_os = "linux")]
 fn filter_here() -> FilterHere {
+    let here = filter_here_unchecked();
+    if std::env::var_os("IW_REQUIRE_SECCOMP").is_some_and(|v| v == "1") {
+        assert_eq!(
+            here,
+            FilterHere::Taken,
+            "IW_REQUIRE_SECCOMP=1: this host must start a jail under a seccomp filter"
+        );
+    }
+    here
+}
+
+#[cfg(target_os = "linux")]
+fn filter_here_unchecked() -> FilterHere {
     let Some(bwrap) = jail_bwrap() else {
         return FilterHere::NoBwrap;
     };
@@ -215,8 +232,12 @@ const READ_THE_RECORD: &str = "readlink /proc/self/ns/pid; \
     if [ -e /run/innerwarden/agent-tls.spki ]; then echo KEY-HANDED-IN; fi; \
     if [ -e /run/innerwarden/system-profiles-root ]; then echo PROFILES-MARKED; fi; \
     grep -E '^Seccomp(_filters)?:' /proc/self/status; \
+    grep -E '^CapEff:' /proc/self/status; \
     if ! command -v unshare >/dev/null; then echo NO-UNSHARE; \
-    elif unshare -U true 2>/dev/null; then echo NESTED-USERNS; else echo NESTED-REFUSED; fi; \
+    else \
+        if unshare -n true 2>/dev/null; then echo NET-UNSHARED; else echo NET-REFUSED; fi; \
+        if unshare -U true 2>/dev/null; then echo NESTED-USERNS; else echo NESTED-REFUSED; fi; \
+    fi; \
     exit 0";
 
 #[cfg(target_os = "linux")]
@@ -337,14 +358,27 @@ fn identity_flag_mounts_the_record_read_only_inside_and_keeps_a_private_copy() {
         FilterHere::NotTaken => {
             assert_eq!(record["schema"], 1, "{record}");
             assert!(record["jail"].get("userns_closed").is_none(), "{record}");
+            // Each thing the jail runs without is said: user namespaces,
+            // and the keystroke rule the identified filter also carried.
             assert!(
                 stderr.contains(
                     "innerwarden contain: user namespaces stay open (userns_probe_failed)"
                 ),
                 "{stderr}"
             );
+            assert!(
+                stderr.contains("innerwarden contain: no sandbox filter (filter_probe_failed)"),
+                "{stderr}"
+            );
         }
         other => panic!("the jail ran on a host where {other:?}: {record}"),
+    }
+    // No capability inside, filter or not, whoever runs the launcher: as
+    // root bwrap would otherwise keep every one of root's, in the host's user
+    // namespace, and a new network or mount namespace would follow.
+    assert!(stdout.contains("CapEff:\t0000000000000000"), "{stdout}");
+    if !stdout.contains("NO-UNSHARE") {
+        assert!(stdout.contains("NET-REFUSED"), "{stdout}");
     }
     assert_eq!(record["agent_type"], "claude-code");
     assert_eq!(record["mode"], "monitor");
@@ -430,8 +464,10 @@ fn without_the_identity_flag_no_record_is_written_and_nothing_changes() {
         std::path::Path::new(SYSTEM_PROFILES).exists(),
         "{stdout}"
     );
-    // The one change without the flag, on purpose: the jail's programs run under the terminal filter where the host takes it, which
-    // refuses keystroke injection and nothing a plain jail could do before,
+    // The one change without the flag, on purpose: the jail's programs run
+    // under the terminal filter where the host takes it, which refuses the
+    // two terminal commands that push input (by every ABI the kernel runs,
+    // 32-bit ones included) and nothing else a plain jail could do before,
     // user namespaces included.
     match filter_here() {
         FilterHere::Taken => {
@@ -622,7 +658,8 @@ fn dry_run_shows_the_record_and_info_descriptors_only_with_the_identity_flag() {
     // restriction stops the real run first, its advice. Exactly the one this
     // host's facts give; the plain run shows the same filter (its own, the
     // terminal one) and never the advice.
-    let option = " --unshare-ipc --seccomp 13 --hostname ai-sandbox ";
+    let option = " --unshare-ipc --seccomp 13 --cap-drop ALL --hostname ai-sandbox ";
+    let plain_option = " --unshare-ipc --seccomp 13 --hostname ai-sandbox ";
     let said = "# innerwarden contain: user namespaces stay open (";
     let plain_said = "# innerwarden contain: no sandbox filter (filter_probe_failed): ";
     let advice = "# innerwarden contain: this kernel restricts unprivileged user namespaces";
@@ -650,7 +687,7 @@ fn dry_run_shows_the_record_and_info_descriptors_only_with_the_identity_flag() {
         "{here:?}: {identified}"
     );
     assert_eq!(
-        (plain.contains(option), plain.contains(plain_said)),
+        (plain.contains(plain_option), plain.contains(plain_said)),
         match here {
             FilterHere::NoBwrap | FilterHere::Restricted => (false, false),
             FilterHere::Taken => (true, false),
@@ -667,7 +704,20 @@ fn dry_run_shows_the_record_and_info_descriptors_only_with_the_identity_flag() {
                 .all(|l| l.contains("(userns_probe_failed)")),
             "{identified}"
         );
+        // The keystroke rule went with the identified filter: said too.
+        assert!(
+            identified.lines().any(|l| l.starts_with(plain_said)),
+            "{identified}"
+        );
     }
+    // Every identified jail drops every capability, filter or not; the plain
+    // one never asks.
+    assert_eq!(
+        identified.matches(" --cap-drop ALL ").count(),
+        1,
+        "{identified}"
+    );
+    assert!(!plain.contains("--cap-drop"), "{plain}");
     // The advice block is the real run's refusal, said as comments.
     let advice_lines: Vec<&str> = if here == FilterHere::Restricted {
         identified
@@ -687,6 +737,7 @@ fn dry_run_shows_the_record_and_info_descriptors_only_with_the_identity_flag() {
         .replace(" --ro-bind-data 10 /run/innerwarden/instance.json", "")
         .replace(key, "")
         .replace(" --info-fd 9", "")
+        .replace(" --cap-drop ALL", "")
         .replace(
             &format!(
                 " --tmpfs {}",
@@ -700,6 +751,7 @@ fn dry_run_shows_the_record_and_info_descriptors_only_with_the_identity_flag() {
         .filter(|l| {
             !l.starts_with("# innerwarden contain: no scope")
                 && !l.starts_with(said)
+                && !l.starts_with(plain_said)
                 && !advice_lines.contains(l)
         })
         .map(|l| format!("{l}\n"))

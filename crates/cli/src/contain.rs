@@ -25,10 +25,13 @@
 //!   * The backend binary is resolved from trusted absolute paths by the I/O
 //!     layer, never `$PATH`.
 //!   * On Linux every jail starts its programs under a seccomp filter
-//!     (`contain_seccomp`) where the host takes it: no keystrokes injected
-//!     into a terminal, and with `--identity` no new user namespace and no
-//!     joining one. A host that does not take it is told by a throwaway jail
-//!     first, and the jail then runs without it and says so.
+//!     (`contain_seccomp`) where the host takes it: no `TIOCSTI` or
+//!     `TIOCLINUX` into a terminal, and with `--identity` no new user
+//!     namespace and no joining one. A host that does not take it is told by
+//!     a throwaway jail first, and the jail then runs without it and says so.
+//!   * An identified jail drops every capability (`--cap-drop ALL`): a
+//!     launcher run as root would otherwise hand its programs root's
+//!     capabilities in the host's user namespace.
 
 use std::path::{Path, PathBuf};
 
@@ -330,16 +333,17 @@ pub struct JailInputs {
     /// The jail was started under the identified filter, so its programs
     /// cannot make user namespaces of their own: the fact the launch record
     /// carries (`jail.userns_closed`). Decided by the launcher before the jail
-    /// is built ([`launch::userns_decision`]); `false` unless the launch asked
+    /// is built ([`launch::filter_plan`]); `false` unless the launch asked
     /// for an identity record. It puts nothing in the argv: the filter is
     /// [`JailInputs::seccomp_fd`]. Read by the Linux launcher only.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub close_userns: bool,
     /// The descriptor bwrap reads the jail's seccomp filter from
     /// (`--seccomp`, [`crate::contain_seccomp`]): the terminal filter for a
-    /// plain jail, the identified one with `--identity`. `None` where the
-    /// launcher's start-up probe found this host cannot start a jail with it,
-    /// and the jail then runs as it did before the filter.
+    /// plain jail, the identified one with `--identity` (or the terminal one
+    /// where the host takes only that). `None` where the launcher's start-up
+    /// probe found this host cannot start a jail with either, and the jail
+    /// then runs as it did before the filter.
     pub seccomp_fd: Option<i32>,
 }
 
@@ -502,6 +506,14 @@ pub const JAIL_NAMESPACES: [&str; 3] = ["--unshare-pid", "--unshare-uts", "--uns
 
 /// The bwrap option that hands it the jail's seccomp filter on a descriptor.
 pub const SECCOMP_OPTION: &str = "--seccomp";
+
+/// What an identified jail asks bwrap for after the filter: no capability at
+/// all for its programs. bwrap keeps every capability of a caller whose uid
+/// is 0 unless told otherwise, and it runs such a jail in the host's user
+/// namespace, where those capabilities make namespaces and mounts the filter
+/// does not refuse. For any other caller bwrap drops them anyway, so this
+/// changes nothing there. In every bwrap since 0.2.0.
+pub const CAP_DROP_ALL: [&str; 2] = ["--cap-drop", "ALL"];
 
 /// Build the ordered bwrap argument vector. Order is load-bearing (bwrap is
 /// last-wins): system RO → dev/proc/tmpfs → HOME tmpfs → dotdir re-binds → shadow
@@ -690,6 +702,12 @@ pub fn build_linux_jail(input: &JailInputs) -> Result<LinuxJailPlan, ContainErro
     // changes the trust of the instance.
     if let Some(fd) = input.seccomp_fd {
         push(&[SECCOMP_OPTION, &fd.to_string()]);
+    }
+    // An identified jail, filter or not: no capability for its programs, so
+    // a launcher run as root does not hand them root's (`CAP_DROP_ALL`).
+    // The plain jail is left as it was.
+    if input.args.identity {
+        push(&CAP_DROP_ALL);
     }
     push(&["--hostname", "ai-sandbox"]);
     if !input.stdin_is_tty {
@@ -1239,18 +1257,54 @@ pub mod launch {
     // filter on a descriptor (`--seccomp`) since its first releases, sets
     // `no_new_privs` itself and applies the filter after it built the jail,
     // a setuid bwrap included. What can still stop it is the host: a kernel
-    // without seccomp filters, or a binary run under another architecture's
-    // emulation (the filter would kill the jail's first call). That is learned
+    // without seccomp filters, a binary run under another architecture's
+    // emulation (the filter would kill the jail's first call), or a build
+    // for an architecture this one has no numbers for. That is learned
     // BEFORE the jail is built, by starting a throwaway jail with the filter,
     // and a launch is never started over. A host that cannot take it runs the
-    // jail as it did before the filter, and says so.
+    // jail as it did before the filter, and says so. An identified launch
+    // whose host does not take the identified filter falls back to the
+    // terminal one, and says what it lost.
+    //
+    // Before Linux 4.8 the kernel ran the filter before a tracer could change
+    // the call it was about to run: a program in the jail that traces another
+    // (which the jail allows) could turn an allowed call into one the filter
+    // refuses. On such a kernel the identified filter is never used, so no
+    // record says user namespaces are closed, and the terminal one is said
+    // to be weaker.
+
+    /// The first kernel that runs the filter after a tracer's change of a
+    /// call (`seccomp: run after ptrace`, 4.8, on x86_64 and aarch64 alike).
+    pub const TRACER_SAFE_KERNEL: (u32, u32) = (4, 8);
+
+    /// PURE. Whether a kernel release (`/proc/sys/kernel/osrelease`, as
+    /// `6.12.10-orbstack` or `3.10.0-1160.el7.x86_64`) is
+    /// [`TRACER_SAFE_KERNEL`] or later. A release this does not read is
+    /// taken as older: the answer that claims nothing.
+    pub fn kernel_runs_the_filter_after_a_tracer(release: &str) -> bool {
+        let mut parts = release.trim().split(['.', '-']);
+        let number = |part: Option<&str>| -> Option<u32> {
+            let part = part?;
+            if part.is_empty() || part.len() > 6 || !part.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            part.parse().ok()
+        };
+        match (number(parts.next()), number(parts.next())) {
+            (Some(major), Some(minor)) => (major, minor) >= TRACER_SAFE_KERNEL,
+            _ => false,
+        }
+    }
 
     /// Why an identified launch keeps user namespaces open in the jail.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum UsernsWhy {
-        /// The throwaway jail with the identified filter did not exit 0, or
-        /// this build has no filter for the architecture it runs as.
+        /// The throwaway jail with the identified filter did not exit 0.
         ProbeFailed,
+        /// The kernel is older than [`TRACER_SAFE_KERNEL`].
+        KernelTooOld,
+        /// This build has no filter for the architecture it runs as.
+        NotBuilt,
     }
 
     impl UsernsWhy {
@@ -1258,12 +1312,16 @@ pub mod launch {
         pub fn word(self) -> &'static str {
             match self {
                 UsernsWhy::ProbeFailed => "userns_probe_failed",
+                UsernsWhy::KernelTooOld => "userns_kernel_too_old",
+                UsernsWhy::NotBuilt => "userns_filter_not_built",
             }
         }
 
         pub fn sentence(self) -> &'static str {
             match self {
                 UsernsWhy::ProbeFailed => "Bubblewrap here could not start a jail with user namespaces closed, so the jail runs without that.",
+                UsernsWhy::KernelTooOld => "This kernel is older than 4.8, where a program that traces another could get a call past the filter, so the jail runs without closing them.",
+                UsernsWhy::NotBuilt => "This build has no sandbox filter for this architecture, so the jail runs without closing them.",
             }
         }
     }
@@ -1278,113 +1336,202 @@ pub mod launch {
         )
     }
 
-    /// What the launch does about user namespaces in the jail.
+    /// Why a jail runs without the terminal filter, or with a weaker one.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum UsernsFact {
-        /// No `--identity`: nothing is asked, nothing is probed.
-        NotAsked,
-        Closed,
-        Open(UsernsWhy),
+    pub enum FilterWhy {
+        /// The throwaway jail with the terminal filter did not exit 0: no
+        /// filter.
+        ProbeFailed,
+        /// This build has no filter for the architecture it runs as: no
+        /// filter.
+        NotBuilt,
+        /// The filter is in, and the kernel is older than
+        /// [`TRACER_SAFE_KERNEL`].
+        KernelTooOld,
     }
 
-    impl UsernsFact {
-        /// The fact the jail inputs carry: true only when the identified
-        /// filter is used.
-        pub fn close_userns(self) -> bool {
-            self == UsernsFact::Closed
-        }
-    }
-
-    /// PURE. Close user namespaces in the jail only for an identified launch
-    /// whose host started a throwaway jail under the identified filter
-    /// (`probe`, asked only with `--identity`, since it starts a process).
-    pub fn userns_decision(identity: bool, probe: impl FnOnce() -> bool) -> UsernsFact {
-        if !identity {
-            return UsernsFact::NotAsked;
-        }
-        if !probe() {
-            return UsernsFact::Open(UsernsWhy::ProbeFailed);
-        }
-        UsernsFact::Closed
-    }
-
-    /// The word and sentence of a plain jail (no `--identity`) whose host
-    /// could not start a jail under the terminal filter.
-    pub const TERMINAL_FILTER_OFF: (&str, &str) = (
-        "filter_probe_failed",
-        "Bubblewrap here could not start a jail with the sandbox filter, so programs in the jail can still inject keystrokes into your terminal.",
-    );
-
-    /// The line a plain launch prints (and its dry run shows) when the jail
-    /// runs without the terminal filter.
-    pub fn terminal_filter_off_sentence() -> String {
-        format!(
-            "innerwarden contain: no sandbox filter ({}): {}",
-            TERMINAL_FILTER_OFF.0, TERMINAL_FILTER_OFF.1
-        )
-    }
-
-    /// What a dry run of an identified launch says about user namespaces.
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    pub enum DryRunUserns {
-        /// The host restricts unprivileged user namespaces and bwrap has no
-        /// profile that grants it one ([`super::userns_restriction_advice`]):
-        /// the real run stops there with this advice, so the dry run says it.
-        /// The probe, which could only fail for that same reason, is not run.
-        Advice(Vec<String>),
-        /// What the real run would do.
-        Fact(UsernsFact),
-    }
-
-    impl DryRunUserns {
-        pub fn close_userns(&self) -> bool {
-            matches!(self, DryRunUserns::Fact(UsernsFact::Closed))
-        }
-
-        /// The comment lines the dry run prints, none when the filter is used.
-        pub fn lines(&self) -> Vec<String> {
+    impl FilterWhy {
+        pub fn word(self) -> &'static str {
             match self {
-                DryRunUserns::Advice(lines) => lines
-                    .iter()
-                    .map(|line| format!("# {line}").trim_end().to_string())
-                    .collect(),
-                DryRunUserns::Fact(UsernsFact::Open(why)) => {
-                    vec![format!("# {}", userns_open_sentence(*why))]
-                }
-                DryRunUserns::Fact(_) => Vec::new(),
+                FilterWhy::ProbeFailed => "filter_probe_failed",
+                FilterWhy::NotBuilt => "filter_not_built",
+                FilterWhy::KernelTooOld => "filter_kernel_too_old",
+            }
+        }
+
+        pub fn sentence(self) -> &'static str {
+            match self {
+                FilterWhy::ProbeFailed => "Bubblewrap here could not start a jail with the sandbox filter, so programs in the jail can still inject keystrokes into your terminal.",
+                FilterWhy::NotBuilt => "This build has no sandbox filter for this architecture, so programs in the jail can still inject keystrokes into your terminal.",
+                FilterWhy::KernelTooOld => "This kernel is older than 4.8, where a program that traces another can get a call past the filter, so programs in the jail may still inject keystrokes into your terminal.",
             }
         }
     }
 
-    /// PURE. The restriction's advice first: where it applies, the dry run says
-    /// that and never starts the probe, whose failure would name a cause that
-    /// is not the one. Otherwise what the probe and the bwrap facts decide.
-    pub fn dry_run_userns(
-        advice: Option<Vec<String>>,
-        fact: impl FnOnce() -> UsernsFact,
-    ) -> DryRunUserns {
-        match advice {
-            Some(lines) => DryRunUserns::Advice(lines),
-            None => DryRunUserns::Fact(fact()),
+    /// The line a launch prints (and its dry run shows) when its jail runs
+    /// without the terminal rule, or with a weaker one.
+    pub fn filter_sentence(why: FilterWhy) -> String {
+        let what = match why {
+            FilterWhy::ProbeFailed | FilterWhy::NotBuilt => "no sandbox filter",
+            FilterWhy::KernelTooOld => "a weaker sandbox filter",
+        };
+        format!(
+            "innerwarden contain: {what} ({}): {}",
+            why.word(),
+            why.sentence()
+        )
+    }
+
+    /// What the launcher reads of the host before it plans the filter.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct FilterHost {
+        /// This build has the call numbers of the architecture it runs as.
+        pub built: bool,
+        /// The kernel is [`TRACER_SAFE_KERNEL`] or later
+        /// ([`kernel_runs_the_filter_after_a_tracer`]).
+        pub tracer_safe: bool,
+    }
+
+    /// The filter a launch hands bwrap, and the lines it says about it.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct FilterPlan {
+        /// `None`: the jail runs without a filter.
+        pub filter: Option<crate::contain_seccomp::Rules>,
+        /// What the launch says (and its dry run shows as comments), in
+        /// order: the user namespace line, then the terminal one.
+        pub said: Vec<String>,
+    }
+
+    impl FilterPlan {
+        /// The record may say the jail's user namespaces are closed: only
+        /// under the identified filter.
+        pub fn close_userns(&self) -> bool {
+            self.filter == Some(crate::contain_seccomp::Rules::Identified)
         }
     }
 
-    /// PURE. What a plain dry run (no `--identity`) shows of the terminal
-    /// filter: `None` where the host's restriction stops the real run before
-    /// any jail (the probe could only fail for that reason, so it is not
-    /// run), otherwise whether the throwaway jail under the filter started.
-    pub fn dry_run_terminal(restricted: bool, probe: impl FnOnce() -> bool) -> Option<bool> {
-        (!restricted).then(probe)
+    /// PURE. The filter of a launch, from the host's facts and a throwaway
+    /// jail under a filter (`probe`, which starts a process, so it is asked
+    /// only where its answer decides something).
+    ///
+    /// * No numbers for this architecture: no filter, and no probe.
+    /// * `--identity`: the identified filter, where the kernel is
+    ///   [`TRACER_SAFE_KERNEL`] or later and its probe passed. Otherwise the
+    ///   user namespace line, and the terminal filter as below.
+    /// * The terminal filter where its probe passed (said to be weaker on a
+    ///   kernel before 4.8), no filter otherwise, and the line that says it.
+    pub fn filter_plan(
+        identity: bool,
+        host: FilterHost,
+        mut probe: impl FnMut(crate::contain_seccomp::Rules) -> bool,
+    ) -> FilterPlan {
+        use crate::contain_seccomp::Rules;
+        let mut said = Vec::new();
+        if identity {
+            let why = if !host.built {
+                UsernsWhy::NotBuilt
+            } else if !host.tracer_safe {
+                UsernsWhy::KernelTooOld
+            } else if probe(Rules::Identified) {
+                return FilterPlan {
+                    filter: Some(Rules::Identified),
+                    said,
+                };
+            } else {
+                UsernsWhy::ProbeFailed
+            };
+            said.push(userns_open_sentence(why));
+        }
+        let filter = if !host.built {
+            said.push(filter_sentence(FilterWhy::NotBuilt));
+            None
+        } else if probe(Rules::Terminal) {
+            if !host.tracer_safe {
+                said.push(filter_sentence(FilterWhy::KernelTooOld));
+            }
+            Some(Rules::Terminal)
+        } else {
+            said.push(filter_sentence(FilterWhy::ProbeFailed));
+            None
+        };
+        FilterPlan { filter, said }
+    }
+
+    /// The lines a launch says when the filter it planned could not be
+    /// handed in after all (its pipe could not be made): the jail then runs
+    /// without one.
+    pub fn filter_lost_sentences(planned: crate::contain_seccomp::Rules) -> Vec<String> {
+        let mut said = Vec::new();
+        if planned == crate::contain_seccomp::Rules::Identified {
+            said.push(userns_open_sentence(UsernsWhy::ProbeFailed));
+        }
+        said.push(filter_sentence(FilterWhy::ProbeFailed));
+        said
+    }
+
+    /// What a dry run says about the jail's filter.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum DryRunFilter {
+        /// The host restricts unprivileged user namespaces and bwrap has no
+        /// profile that grants it one ([`super::userns_restriction_advice`]):
+        /// the real run stops there with this advice, so an identified dry
+        /// run says it and a plain one says nothing. The probe, which could
+        /// only fail for that same reason, is not run.
+        Restricted(Vec<String>),
+        /// What the real run would do.
+        Plan(FilterPlan),
+    }
+
+    impl DryRunFilter {
+        /// The filter the dry run shows in the argument list.
+        pub fn filter(&self) -> Option<crate::contain_seccomp::Rules> {
+            match self {
+                DryRunFilter::Restricted(_) => None,
+                DryRunFilter::Plan(plan) => plan.filter,
+            }
+        }
+
+        /// The comment lines the dry run prints, none when the filter it
+        /// would use is the one asked for, on a kernel that keeps it whole.
+        pub fn lines(&self, identity: bool) -> Vec<String> {
+            match self {
+                DryRunFilter::Restricted(lines) if identity => lines
+                    .iter()
+                    .map(|line| format!("# {line}").trim_end().to_string())
+                    .collect(),
+                DryRunFilter::Restricted(_) => Vec::new(),
+                DryRunFilter::Plan(plan) => {
+                    plan.said.iter().map(|line| format!("# {line}")).collect()
+                }
+            }
+        }
+    }
+
+    /// PURE. The restriction's advice first: where it applies, the dry run
+    /// says that (or, without `--identity`, nothing) and never starts the
+    /// probe, whose failure would name a cause that is not the one.
+    /// Otherwise what the plan decides.
+    pub fn dry_run_filter(
+        advice: Option<Vec<String>>,
+        plan: impl FnOnce() -> FilterPlan,
+    ) -> DryRunFilter {
+        match advice {
+            Some(lines) => DryRunFilter::Restricted(lines),
+            None => DryRunFilter::Plan(plan()),
+        }
     }
 
     /// The arguments of the throwaway jail that tells whether the host takes
     /// the filter on descriptor `fd`: the filter, the namespaces the real
-    /// jail unshares, the host's root read-only, and a command that does
-    /// nothing (run under the filter, so a filter that kills its first call
-    /// fails the probe).
-    pub fn filter_probe_argv(fd: i32) -> Vec<String> {
+    /// jail unshares, for an identified launch the capabilities it drops,
+    /// the host's root read-only, and a command that does nothing (run under
+    /// the filter, so a filter that kills its first call fails the probe).
+    pub fn filter_probe_argv(fd: i32, identity: bool) -> Vec<String> {
         let mut argv = vec![super::SECCOMP_OPTION.to_string(), fd.to_string()];
         argv.extend(super::JAIL_NAMESPACES.iter().map(|s| s.to_string()));
+        if identity {
+            argv.extend(super::CAP_DROP_ALL.iter().map(|s| s.to_string()));
+        }
         argv.extend(["--ro-bind", "/", "/", "true"].map(String::from));
         argv
     }
@@ -2923,34 +3070,178 @@ mod tests {
 
     // ---- the seccomp filter: user namespaces and the terminal ----
 
-    /// `close_userns` needs `--identity` and a throwaway jail under the
-    /// identified filter that exited 0; without `--identity` nothing is
-    /// probed. No version or mode of the bwrap file is read: every bwrap
-    /// takes a filter on a descriptor, a setuid one included.
+    /// A host that has every fact the identified filter needs.
+    const WHOLE_HOST: launch::FilterHost = launch::FilterHost {
+        built: true,
+        tracer_safe: true,
+    };
+
+    /// The probes a plan asked, in order, answering from `takes`.
+    fn plan_with(
+        identity: bool,
+        host: launch::FilterHost,
+        takes: &[crate::contain_seccomp::Rules],
+    ) -> (launch::FilterPlan, Vec<crate::contain_seccomp::Rules>) {
+        let mut asked = Vec::new();
+        let plan = launch::filter_plan(identity, host, |rules| {
+            asked.push(rules);
+            takes.contains(&rules)
+        });
+        (plan, asked)
+    }
+
+    /// The identified filter, and with it `close_userns`, needs
+    /// `--identity`, a build for this architecture, a kernel that runs the
+    /// filter after a tracer, and a throwaway jail under it that exited 0.
+    /// No version or mode of the bwrap file is read: every bwrap takes a
+    /// filter on a descriptor, a setuid one included. A plain launch never
+    /// probes the identified filter.
     ///
-    /// FAILS ON REVERT: let `userns_decision` answer without the probe, or
-    /// probe without `--identity`.
+    /// FAILS ON REVERT: let the plan answer without the probe, use the
+    /// identified filter on a kernel before 4.8, or probe it without
+    /// `--identity`.
     #[test]
-    fn user_namespaces_close_only_with_identity_and_a_probe_that_passed() {
-        use launch::{userns_decision, UsernsFact, UsernsWhy};
-        let asked = std::cell::Cell::new(0);
-        let probe = |ok: bool| {
-            let asked = &asked;
-            move || {
-                asked.set(asked.get() + 1);
-                ok
-            }
+    fn user_namespaces_close_only_with_identity_a_safe_kernel_and_a_probe_that_passed() {
+        use crate::contain_seccomp::Rules::{Identified, Terminal};
+        let (plan, asked) = plan_with(true, WHOLE_HOST, &[Identified, Terminal]);
+        assert_eq!(plan.filter, Some(Identified));
+        assert!(plan.close_userns());
+        assert!(plan.said.is_empty(), "{:?}", plan.said);
+        assert_eq!(asked, [Identified]);
+
+        let (plain, asked) = plan_with(false, WHOLE_HOST, &[Identified, Terminal]);
+        assert_eq!(plain.filter, Some(Terminal));
+        assert!(!plain.close_userns());
+        assert!(plain.said.is_empty());
+        assert_eq!(asked, [Terminal], "no identified probe without --identity");
+
+        let old_kernel = launch::FilterHost {
+            built: true,
+            tracer_safe: false,
         };
-        assert_eq!(userns_decision(true, probe(true)), UsernsFact::Closed);
-        assert!(UsernsFact::Closed.close_userns());
-        assert_eq!(asked.get(), 1);
-        let failed = userns_decision(true, probe(false));
-        assert_eq!(failed, UsernsFact::Open(UsernsWhy::ProbeFailed));
-        assert!(!failed.close_userns());
-        assert_eq!(asked.get(), 2);
-        assert_eq!(userns_decision(false, probe(true)), UsernsFact::NotAsked);
-        assert!(!UsernsFact::NotAsked.close_userns());
-        assert_eq!(asked.get(), 2, "no probe without --identity");
+        let (old, asked) = plan_with(true, old_kernel, &[Identified, Terminal]);
+        assert_eq!(old.filter, Some(Terminal));
+        assert!(!old.close_userns());
+        assert_eq!(asked, [Terminal], "the identified probe is never asked");
+    }
+
+    /// An identified launch whose host does not take the identified filter
+    /// keeps the keystroke rule where the host takes the terminal one, and
+    /// says each thing it runs without: the user namespace line, then the
+    /// keystroke line when no filter is left. A plain launch says only its
+    /// own line. A build with no filter for its architecture probes nothing
+    /// and says that, not that bubblewrap failed.
+    ///
+    /// FAILS ON REVERT: run an identified jail with no filter where the
+    /// terminal one is taken, drop the keystroke line from an identified
+    /// launch, or blame bubblewrap for a build with no numbers.
+    #[test]
+    fn a_launch_says_each_thing_its_jail_runs_without() {
+        use crate::contain_seccomp::Rules::{Identified, Terminal};
+        use launch::{filter_sentence, userns_open_sentence, FilterHost, FilterWhy, UsernsWhy};
+
+        let (fallback, asked) = plan_with(true, WHOLE_HOST, &[Terminal]);
+        assert_eq!(fallback.filter, Some(Terminal));
+        assert!(!fallback.close_userns());
+        assert_eq!(asked, [Identified, Terminal]);
+        assert_eq!(
+            fallback.said,
+            [userns_open_sentence(UsernsWhy::ProbeFailed)]
+        );
+
+        let (none, _) = plan_with(true, WHOLE_HOST, &[]);
+        assert_eq!(none.filter, None);
+        assert_eq!(
+            none.said,
+            [
+                userns_open_sentence(UsernsWhy::ProbeFailed),
+                filter_sentence(FilterWhy::ProbeFailed)
+            ]
+        );
+        let (plain_none, _) = plan_with(false, WHOLE_HOST, &[]);
+        assert_eq!(plain_none.filter, None);
+        assert_eq!(plain_none.said, [filter_sentence(FilterWhy::ProbeFailed)]);
+
+        let old_kernel = FilterHost {
+            built: true,
+            tracer_safe: false,
+        };
+        let (old, _) = plan_with(true, old_kernel, &[Identified, Terminal]);
+        assert_eq!(
+            old.said,
+            [
+                userns_open_sentence(UsernsWhy::KernelTooOld),
+                filter_sentence(FilterWhy::KernelTooOld)
+            ]
+        );
+        let (old_plain, _) = plan_with(false, old_kernel, &[Terminal]);
+        assert_eq!(old_plain.filter, Some(Terminal));
+        assert_eq!(old_plain.said, [filter_sentence(FilterWhy::KernelTooOld)]);
+
+        let unbuilt = FilterHost {
+            built: false,
+            tracer_safe: true,
+        };
+        for identity in [true, false] {
+            let (plan, asked) = plan_with(identity, unbuilt, &[Identified, Terminal]);
+            assert_eq!(plan.filter, None);
+            assert!(asked.is_empty(), "nothing to probe: {asked:?}");
+            let mut said = Vec::new();
+            if identity {
+                said.push(userns_open_sentence(UsernsWhy::NotBuilt));
+            }
+            said.push(filter_sentence(FilterWhy::NotBuilt));
+            assert_eq!(plan.said, said);
+            assert!(plan.said.iter().all(|l| !l.contains("Bubblewrap")));
+        }
+
+        // A planned filter whose pipe could not be made: both losses for an
+        // identified one, the keystroke one for the terminal one.
+        assert_eq!(
+            launch::filter_lost_sentences(Identified),
+            none.said,
+            "the same two lines"
+        );
+        assert_eq!(
+            launch::filter_lost_sentences(Terminal),
+            [filter_sentence(FilterWhy::ProbeFailed)]
+        );
+    }
+
+    /// The kernel's release, as `/proc/sys/kernel/osrelease` gives it: 4.8 or
+    /// later runs the filter after a tracer changed the call. Anything not
+    /// read is taken as older.
+    ///
+    /// FAILS ON REVERT: compare the major number alone (4.4 passes), or take
+    /// a release that does not read as safe.
+    #[test]
+    fn a_kernel_from_4_8_runs_the_filter_after_a_tracer() {
+        use launch::kernel_runs_the_filter_after_a_tracer as safe;
+        for release in [
+            "4.8.0",
+            "4.8",
+            "4.15.0-20-generic",
+            "5.4.0-42-generic\n",
+            "6.12.10-orbstack-00297-gf8f6e015b993",
+            "7.0.0-1011-azure",
+            "10.0.1",
+        ] {
+            assert!(safe(release), "{release}");
+        }
+        for release in [
+            "4.7.10",
+            "4.4.0-210-generic",
+            "3.10.0-1160.el7.x86_64",
+            "2.6.32",
+            "",
+            "4",
+            "v6.1",
+            "6.x",
+            "99999999.1",
+            "-6.1",
+        ] {
+            assert!(!safe(release), "{release}");
+        }
     }
 
     /// The sentences the launcher and the dry run say, word for word; the
@@ -2958,7 +3249,7 @@ mod tests {
     /// word of the bwrap version or mode is left anywhere.
     #[test]
     fn the_filter_words_are_the_closed_table() {
-        use launch::{terminal_filter_off_sentence, userns_open_sentence, UsernsWhy};
+        use launch::{filter_sentence, userns_open_sentence, FilterWhy, UsernsWhy};
         let why = UsernsWhy::ProbeFailed;
         assert_eq!(why.word(), "userns_probe_failed");
         assert_eq!(
@@ -2970,8 +3261,24 @@ mod tests {
             "innerwarden contain: user namespaces stay open (userns_probe_failed): Bubblewrap here could not start a jail with user namespaces closed, so the jail runs without that."
         );
         assert_eq!(
-            terminal_filter_off_sentence(),
+            userns_open_sentence(UsernsWhy::KernelTooOld),
+            "innerwarden contain: user namespaces stay open (userns_kernel_too_old): This kernel is older than 4.8, where a program that traces another could get a call past the filter, so the jail runs without closing them."
+        );
+        assert_eq!(
+            userns_open_sentence(UsernsWhy::NotBuilt),
+            "innerwarden contain: user namespaces stay open (userns_filter_not_built): This build has no sandbox filter for this architecture, so the jail runs without closing them."
+        );
+        assert_eq!(
+            filter_sentence(FilterWhy::ProbeFailed),
             "innerwarden contain: no sandbox filter (filter_probe_failed): Bubblewrap here could not start a jail with the sandbox filter, so programs in the jail can still inject keystrokes into your terminal."
+        );
+        assert_eq!(
+            filter_sentence(FilterWhy::NotBuilt),
+            "innerwarden contain: no sandbox filter (filter_not_built): This build has no sandbox filter for this architecture, so programs in the jail can still inject keystrokes into your terminal."
+        );
+        assert_eq!(
+            filter_sentence(FilterWhy::KernelTooOld),
+            "innerwarden contain: a weaker sandbox filter (filter_kernel_too_old): This kernel is older than 4.8, where a program that traces another can get a call past the filter, so programs in the jail may still inject keystrokes into your terminal."
         );
         let words = include_str!("../../dashboard-kit/web/src/community/words.ts");
         assert!(words.contains(
@@ -2985,7 +3292,22 @@ mod tests {
         ] {
             assert!(!words.contains(gone), "words.ts still says {gone}");
         }
-        for line in [userns_open_sentence(why), terminal_filter_off_sentence()] {
+        let lines = [
+            UsernsWhy::ProbeFailed,
+            UsernsWhy::KernelTooOld,
+            UsernsWhy::NotBuilt,
+        ]
+        .map(userns_open_sentence)
+        .into_iter()
+        .chain(
+            [
+                FilterWhy::ProbeFailed,
+                FilterWhy::NotBuilt,
+                FilterWhy::KernelTooOld,
+            ]
+            .map(filter_sentence),
+        );
+        for line in lines {
             assert!(!line.contains('\u{2014}'), "{line}");
         }
     }
@@ -2994,19 +3316,20 @@ mod tests {
     /// profile for bwrap, a dry run of an identified launch says the real
     /// cause (the advice the real run stops with) and never starts the probe,
     /// which there could only fail and name `userns_probe_failed` instead. A
-    /// plain dry run probes nothing there either.
+    /// plain dry run probes nothing there either, and says nothing.
     ///
     /// FAILS ON REVERT: run the probe before the advice is looked at.
     #[test]
     fn a_dry_run_says_the_restriction_and_never_probes_where_it_applies() {
-        use launch::{dry_run_terminal, dry_run_userns, DryRunUserns, UsernsFact, UsernsWhy};
+        use crate::contain_seccomp::Rules::{Identified, Terminal};
+        use launch::{dry_run_filter, DryRunFilter};
         let advice = userns_restriction_advice(Some("1\n"), false, Path::new("/usr/bin/bwrap"));
-        let said = dry_run_userns(advice.clone(), || {
+        let said = dry_run_filter(advice.clone(), || {
             panic!("the probe is not started where the advice applies")
         });
-        assert_eq!(said, DryRunUserns::Advice(advice.clone().unwrap()));
-        assert!(!said.close_userns());
-        let lines = said.lines();
+        assert_eq!(said, DryRunFilter::Restricted(advice.clone().unwrap()));
+        assert_eq!(said.filter(), None);
+        let lines = said.lines(true);
         assert_eq!(lines.len(), advice.unwrap().len());
         assert!(lines.iter().all(|line| line.starts_with('#')), "{lines:?}");
         assert!(lines[0].starts_with(
@@ -3015,43 +3338,46 @@ mod tests {
         assert!(!lines
             .iter()
             .any(|line| line.contains("userns_probe_failed")));
+        assert!(said.lines(false).is_empty(), "a plain dry run says nothing");
 
-        // No restriction: what the probe says, as before.
-        let open = dry_run_userns(None, || UsernsFact::Open(UsernsWhy::ProbeFailed));
+        // No restriction: what the plan says, as comments.
+        let (plan, _) = plan_with(true, WHOLE_HOST, &[]);
+        let open = dry_run_filter(None, || plan.clone());
         assert_eq!(
-            open.lines(),
-            [format!(
-                "# {}",
-                launch::userns_open_sentence(UsernsWhy::ProbeFailed)
-            )]
+            open.lines(true),
+            plan.said
+                .iter()
+                .map(|l| format!("# {l}"))
+                .collect::<Vec<_>>()
         );
-        assert!(!open.close_userns());
-        let closed = dry_run_userns(None, || UsernsFact::Closed);
-        assert!(closed.close_userns());
-        assert!(closed.lines().is_empty());
-
-        // The plain dry run: nothing probed under the restriction, the
-        // probe's answer otherwise.
-        assert_eq!(
-            dry_run_terminal(true, || panic!("no probe where the advice applies")),
-            None
-        );
-        assert_eq!(dry_run_terminal(false, || true), Some(true));
-        assert_eq!(dry_run_terminal(false, || false), Some(false));
+        assert_eq!(open.lines(true).len(), 2);
+        assert_eq!(open.filter(), None);
+        let (taken, _) = plan_with(true, WHOLE_HOST, &[Identified]);
+        let closed = dry_run_filter(None, || taken);
+        assert_eq!(closed.filter(), Some(Identified));
+        assert!(closed.lines(true).is_empty());
+        let (terminal, _) = plan_with(false, WHOLE_HOST, &[Terminal]);
+        assert_eq!(dry_run_filter(None, || terminal).filter(), Some(Terminal));
     }
 
     /// The start-up probe starts a jail under the filter on its descriptor,
-    /// with the namespaces the jail unshares, and runs nothing; the jail puts
-    /// the filter right after those namespaces.
+    /// with the namespaces the jail unshares, for an identified launch with
+    /// the capabilities dropped as its jail drops them, and runs nothing; the
+    /// jail puts the filter right after those namespaces.
     ///
     /// FAILS ON REVERT: probe without the filter, or drop a namespace from
-    /// `JAIL_NAMESPACES`' use in the probe.
+    /// `JAIL_NAMESPACES`' use in the probe, or probe an identified launch
+    /// without its capability drop.
     #[test]
     fn the_probe_starts_a_jail_under_the_filter_with_the_jails_namespaces() {
-        let argv = launch::filter_probe_argv(21);
+        let argv = launch::filter_probe_argv(21, false);
         assert_eq!(&argv[..2], ["--seccomp", "21"]);
         assert_eq!(&argv[2..5], JAIL_NAMESPACES);
         assert_eq!(&argv[5..], ["--ro-bind", "/", "/", "true"]);
+        let identified = launch::filter_probe_argv(21, true);
+        assert_eq!(&identified[..5], &argv[..5]);
+        assert_eq!(&identified[5..7], CAP_DROP_ALL);
+        assert_eq!(&identified[7..], &argv[5..]);
         for mut input in [inputs(&["claude", "--print"]), identified_inputs()] {
             input.seccomp_fd = Some(21);
             let jail = build_linux_jail(&input).unwrap().bwrap_args;
@@ -3064,9 +3390,49 @@ mod tests {
         }
     }
 
+    /// Every identified jail drops every capability, under a filter or not,
+    /// so a launcher run as root hands its programs none of root's (bwrap
+    /// keeps them for uid 0 and runs that jail in the host's user
+    /// namespace). A plain jail never asks for it: it moved by its terminal
+    /// filter only.
+    ///
+    /// FAILS ON REVERT: drop `--cap-drop ALL` from the identified jail (as
+    /// root, `unshare -n` and a mount over the record then work inside it),
+    /// or emit it in the plain one.
+    #[test]
+    fn every_identified_jail_drops_every_capability_and_no_plain_one_does() {
+        let mut cases = Vec::new();
+        for filter in [None, Some(launch::DRY_RUN_SECCOMP_FD)] {
+            let mut identified = identified_inputs();
+            identified.seccomp_fd = filter;
+            identified.close_userns = filter.is_some();
+            cases.push((identified, true));
+            let mut plain = inputs(&["claude", "--print"]);
+            plain.seccomp_fd = filter;
+            cases.push((plain, false));
+        }
+        for (input, identity) in cases {
+            let got = build_linux_jail(&input).unwrap().bwrap_args;
+            let drops = got.windows(2).filter(|w| w == &CAP_DROP_ALL).count();
+            assert_eq!(drops, usize::from(identity), "{got:?}");
+            assert_eq!(
+                got.iter().filter(|a| *a == "--cap-drop").count(),
+                usize::from(identity)
+            );
+            assert!(!got.iter().any(|a| a == "--cap-add"));
+            if identity {
+                let at = got.windows(2).position(|w| w == CAP_DROP_ALL).unwrap();
+                let terminator = got.iter().position(|a| a == "--").unwrap();
+                assert!(at < terminator, "before the command");
+            }
+        }
+        assert_eq!(CAP_DROP_ALL, ["--cap-drop", "ALL"]);
+    }
+
     /// With `--identity` and a host that takes the identified filter, the
-    /// filter follows the namespaces, and nothing of the user namespace
-    /// option that came before it is left: no second user namespace.
+    /// filter follows the namespaces, then the capability drop, and nothing
+    /// of the user namespace option that came before it is left: no second
+    /// user namespace.
     ///
     /// FAILS ON REVERT: emit `--unshare-user --disable-userns` again.
     #[test]
@@ -3079,17 +3445,20 @@ mod tests {
             got,
             GOLDEN_ARGV_IDENTIFIED.replace("--unshare-ipc\n", "--unshare-ipc\n--seccomp\n13\n")
         );
+        assert!(got.contains("--unshare-ipc\n--seccomp\n13\n--cap-drop\nALL\n--hostname\n"));
         assert_ne!(got, GOLDEN_ARGV_IDENTIFIED);
         assert!(!got.contains("--disable-userns") && !got.contains("--unshare-user"));
     }
 
     /// `close_userns` is the record's fact and puts nothing in the argv; the
     /// filter is the descriptor. An identified jail whose host did not take
-    /// the filter is the jail the previous build made with its probe failing,
-    /// byte for byte, and so is a plain one without the filter.
+    /// the filter is the jail the previous build made with its probe
+    /// failing, plus the capability drop and nothing else (the hash is of the
+    /// golden at 4ded5fea), and a plain one without the filter is that
+    /// build's, byte for byte.
     ///
     /// FAILS ON REVERT: emit anything for `close_userns`, or emit the filter
-    /// without a descriptor.
+    /// without a descriptor, or move anything else in the identified jail.
     #[test]
     fn the_filter_needs_its_descriptor_and_otherwise_the_argv_is_the_previous_builds() {
         use crate::observe::sha256_hex;
@@ -3099,12 +3468,14 @@ mod tests {
             build_linux_jail(&plain).unwrap().bwrap_args.join("\n"),
             GOLDEN_ARGV_PLAIN
         );
-        // Identified, the probe failed: the 4ded5fea golden, to the byte.
+        // Identified, the probe failed: the 4ded5fea golden and the drop.
         let old = identified_inputs();
         let got = build_linux_jail(&old).unwrap().bwrap_args.join("\n");
         assert_eq!(got, GOLDEN_ARGV_IDENTIFIED);
+        assert_eq!(got.matches("--cap-drop\nALL\n").count(), 1);
+        let before = got.replacen("--unshare-ipc\n--cap-drop\nALL\n", "--unshare-ipc\n", 1);
         assert_eq!(
-            sha256_hex(got.as_bytes()),
+            sha256_hex(before.as_bytes()),
             "648f991ed81d228baa0f4c080f5eb53c6fe864d6e4c5be6f3660da6bffbb5044"
         );
         let mut said_closed = identified_inputs();
@@ -3244,6 +3615,7 @@ mod tests {
         "--unshare-uts",
         "--unshare-ipc",
         "--seccomp",
+        "--cap-drop",
         "--hostname",
         "--new-session",
         "--setenv",
@@ -3336,11 +3708,16 @@ mod tests {
             assert!(!got
                 .iter()
                 .any(|a| a == "--disable-userns" || a == "--unshare-user"));
-            // Without the record, its descriptor and the filter, the jail
-            // is the plain one without its filter.
+            // Without the record, its descriptor, the filter and the
+            // capability drop, the jail is the plain one without its filter.
             if let Some(at_filter) = without.iter().position(|a| a == "--seccomp") {
                 without.drain(at_filter..at_filter + 2);
             }
+            let drop = without
+                .windows(2)
+                .position(|w| w == CAP_DROP_ALL)
+                .expect("an identified jail drops every capability");
+            without.drain(drop..drop + 2);
             assert_eq!(
                 without.join("\n"),
                 golden.replacen("\n--seccomp\n13\n", "\n", 1)
@@ -4660,6 +5037,8 @@ mod tests {
         --unshare-pid\n\
         --unshare-uts\n\
         --unshare-ipc\n\
+        --cap-drop\n\
+        ALL\n\
         --hostname\n\
         ai-sandbox\n\
         --setenv\n\

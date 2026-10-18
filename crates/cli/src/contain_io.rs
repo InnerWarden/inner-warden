@@ -536,7 +536,8 @@ fn sound_root_file<'a>(
 /// `marks`: the launcher proved the way to the system profiles file root's
 /// and the file is there, so a jail with no record gets the marker.
 fn run_linux(input: &JailInputs, marks: bool) -> ExitCode {
-    use crate::contain::launch::{dry_run_terminal, dry_run_userns, DryRunUserns};
+    use crate::contain::launch::{dry_run_filter, DryRunFilter};
+    use crate::contain_seccomp::Rules;
     // A dry run with `--identity` shows the arguments the real run adds.
     let dry_identity;
     let dry_plain;
@@ -550,26 +551,14 @@ fn run_linux(input: &JailInputs, marks: bool) -> ExitCode {
         .dry_run
         .then(|| resolve_backend(&["/usr/bin/bwrap", "/bin/bwrap", "/usr/local/bin/bwrap"]))
         .flatten();
-    let userns = input
-        .args
-        .identity
-        .then(|| {
-            dry_bwrap
-                .as_ref()
-                .map(|bwrap| dry_run_userns(restriction_advice(bwrap), || userns_fact(bwrap)))
+    let dry_filter = dry_bwrap.as_ref().map(|bwrap| {
+        dry_run_filter(restriction_advice(bwrap), || {
+            filter_plan_here(bwrap, input.args.identity)
         })
-        .flatten();
-    let terminal = (!input.args.identity)
-        .then(|| {
-            dry_bwrap.as_ref().and_then(|bwrap| {
-                dry_run_terminal(restriction_advice(bwrap).is_some(), || {
-                    terminal_filter_taken(bwrap)
-                })
-            })
-        })
-        .flatten();
+    });
+    let dry_rules = dry_filter.as_ref().and_then(DryRunFilter::filter);
+    let dry_seccomp = dry_rules.map(|_| crate::contain::launch::DRY_RUN_SECCOMP_FD);
     let planned = if input.args.identity && input.args.dry_run {
-        let close_userns = userns.as_ref().is_some_and(DryRunUserns::close_userns);
         dry_identity = JailInputs {
             info_fd: Some(crate::contain::launch::DRY_RUN_INFO_FD),
             record_fd: Some(crate::contain::launch::DRY_RUN_RECORD_FD),
@@ -578,8 +567,8 @@ fn run_linux(input: &JailInputs, marks: bool) -> ExitCode {
             key_fd: host_key()
                 .is_some()
                 .then_some(crate::contain::launch::DRY_RUN_KEY_FD),
-            close_userns,
-            seccomp_fd: close_userns.then_some(crate::contain::launch::DRY_RUN_SECCOMP_FD),
+            close_userns: dry_rules == Some(Rules::Identified),
+            seccomp_fd: dry_seccomp,
             ..input.clone()
         };
         &dry_identity
@@ -588,8 +577,7 @@ fn run_linux(input: &JailInputs, marks: bool) -> ExitCode {
         // terminal filter where the host takes it.
         dry_plain = JailInputs {
             profiles_marker_fd: marks.then_some(crate::contain::launch::DRY_RUN_MARKER_FD),
-            seccomp_fd: (terminal == Some(true))
-                .then_some(crate::contain::launch::DRY_RUN_SECCOMP_FD),
+            seccomp_fd: dry_seccomp,
             ..input.clone()
         };
         &dry_plain
@@ -609,15 +597,12 @@ fn run_linux(input: &JailInputs, marks: bool) -> ExitCode {
         #[cfg(target_os = "linux")]
         if input.args.identity {
             println!("# {}", dry_run_scope_line());
-            for line in userns.iter().flat_map(|userns| userns.lines()) {
-                println!("{line}");
-            }
         }
-        if terminal == Some(false) {
-            println!(
-                "# {}",
-                crate::contain::launch::terminal_filter_off_sentence()
-            );
+        for line in dry_filter
+            .iter()
+            .flat_map(|filter| filter.lines(input.args.identity))
+        {
+            println!("{line}");
         }
         println!("bwrap \\");
         println!("  {}", plan.bwrap_args.join(" "));
@@ -679,24 +664,29 @@ fn run_unrecorded(bwrap: &Path, input: &JailInputs, marks: bool) -> ExitCode {
 }
 
 /// The filter of a jail with no record, on a pipe for bwrap: the terminal
-/// one, or the identified one for an `--identity` launch that could not make
-/// its record. `None`, said once, where the throwaway jail under it did not
-/// start or the pipe could not be made.
+/// one, or for an `--identity` launch that could not make its record the
+/// identified one (the terminal one where the host takes only that). What
+/// it lost is said once; `None` where the host took neither or the pipe
+/// could not be made.
 #[cfg(target_os = "linux")]
 fn unrecorded_filter(bwrap: &Path, identity: bool) -> Option<std::io::PipeReader> {
-    let filter = filter_probe(bwrap, identity)
-        .then(|| filter_pipe(identity))
-        .flatten();
+    let plan = filter_plan_here(bwrap, identity);
+    for line in &plan.said {
+        eprintln!("{line}");
+    }
+    handed_filter(plan.filter)
+}
+
+/// The planned filter on a pipe for bwrap. One whose pipe cannot be made is
+/// none, and the lines that say so are printed: the jail then runs as it did
+/// before the filter.
+#[cfg(target_os = "linux")]
+fn handed_filter(planned: Option<crate::contain_seccomp::Rules>) -> Option<std::io::PipeReader> {
+    let rules = planned?;
+    let filter = filter_pipe(rules);
     if filter.is_none() {
-        if identity {
-            eprintln!(
-                "{}",
-                crate::contain::launch::userns_open_sentence(
-                    crate::contain::launch::UsernsWhy::ProbeFailed
-                )
-            );
-        } else {
-            eprintln!("{}", crate::contain::launch::terminal_filter_off_sentence());
+        for line in crate::contain::launch::filter_lost_sentences(rules) {
+            eprintln!("{line}");
         }
     }
     filter
@@ -720,12 +710,12 @@ fn marker_pipe() -> Option<std::io::PipeReader> {
     data_pipe(crate::agent_profiles::SYSTEM_PROFILES_MARKER)
 }
 
-/// This build's filter for a launch (the identified one with `identity`, the
-/// terminal one otherwise) on a pipe for bwrap. `None` where this build has
-/// no filter for the architecture it runs as, or the pipe cannot be made.
+/// This build's filter with `rules` on a pipe for bwrap. `None` where this
+/// build has no filter for the architecture it runs as, or the pipe cannot
+/// be made.
 #[cfg(target_os = "linux")]
-fn filter_pipe(identity: bool) -> Option<std::io::PipeReader> {
-    data_pipe(&crate::contain_seccomp::native_filter(identity)?)
+fn filter_pipe(rules: crate::contain_seccomp::Rules) -> Option<std::io::PipeReader> {
+    data_pipe(&crate::contain_seccomp::native_filter(rules)?)
 }
 
 /// What to say, and stop on, when this kernel restricts unprivileged user
@@ -933,13 +923,14 @@ fn run_linux_identified(input: &JailInputs, bwrap: &Path, marks: bool) -> ExitCo
     let mut input = input.clone();
     // Once, before the jail is built: whether this host takes the identified
     // filter, which also keeps the jail's programs from making user
-    // namespaces. A host that does not runs the jail as it did before the
-    // filter, and says why.
-    let userns = userns_fact(bwrap);
-    if let crate::contain::launch::UsernsFact::Open(why) = userns {
-        eprintln!("{}", crate::contain::launch::userns_open_sentence(why));
+    // namespaces. A host that does not gets the terminal filter where it
+    // takes that, or runs the jail as it did before the filter, and says
+    // what the jail runs without.
+    let plan = filter_plan_here(bwrap, true);
+    for line in &plan.said {
+        eprintln!("{line}");
     }
-    input.close_userns = userns.close_userns();
+    input.close_userns = plan.close_userns();
     if let Some(dir) = input.records_dirs.first() {
         if let Err(e) = own_records_dir(dir, uid) {
             eprintln!("innerwarden contain: the launcher's records folder is not usable ({e})");
@@ -958,7 +949,8 @@ fn run_linux_identified(input: &JailInputs, bwrap: &Path, marks: bool) -> ExitCo
     }
     announce(input);
     loop {
-        match launch_identified(input, bwrap, &instance_id, &unit, &scope, key.as_ref()) {
+        let ids = (instance_id.as_str(), unit.as_str());
+        match launch_identified(input, bwrap, ids, &scope, key.as_ref(), plan.filter) {
             Attempt::Done(code) => return code,
             // Nothing of the jail ran: bwrap never reported a pid, and the
             // jail cannot pass the record it never got. Only the scope was
@@ -1003,16 +995,14 @@ fn hand_to_child(fd: &impl std::os::fd::AsRawFd) -> bool {
 fn launch_identified(
     input: &JailInputs,
     bwrap: &Path,
-    instance_id: &str,
-    unit: &str,
+    (instance_id, unit): (&str, &str),
     scope: &crate::contain::launch::ScopePlan,
     key: Option<&[u8; 32]>,
+    filter: Option<crate::contain_seccomp::Rules>,
 ) -> Attempt {
     use crate::contain::launch::{launch_argv, ScopePlan};
     use std::io::Write;
     use std::os::fd::AsRawFd;
-
-    use crate::contain::launch::{userns_open_sentence, UsernsWhy};
 
     let pipes = std::io::pipe().and_then(|info| Ok((info, std::io::pipe()?)));
     let ((mut info_reader, info_writer), (record_reader, mut record_writer)) = match pipes {
@@ -1032,20 +1022,19 @@ fn launch_identified(
     let key_reader = key.and_then(|key| {
         data_pipe(innerwarden_agent_guard::identity::spki_pin_line(key).as_bytes())
     });
-    // The identified filter the same way, where the host took it before the
-    // launch. One that cannot be handed in is none: the jail then runs as it
-    // did before the filter, its record says nothing of user namespaces, and
-    // the launcher says so.
-    let filter_reader = input.close_userns.then(|| filter_pipe(true)).flatten();
-    if input.close_userns && filter_reader.is_none() {
-        eprintln!("{}", userns_open_sentence(UsernsWhy::ProbeFailed));
-    }
+    // The filter the same way, the one the host took before the launch. One
+    // that cannot be handed in is none: the jail then runs as it did before
+    // the filter, its record says nothing of user namespaces, and the
+    // launcher says so.
+    let filter_reader = handed_filter(filter);
     let mut identified = input.clone();
     identified.info_fd = Some(info_writer.as_raw_fd());
     identified.record_fd = Some(record_reader.as_raw_fd());
     identified.key_fd = key_reader.as_ref().map(AsRawFd::as_raw_fd);
     identified.seccomp_fd = filter_reader.as_ref().map(AsRawFd::as_raw_fd);
-    identified.close_userns = filter_reader.is_some();
+    identified.close_userns = input.close_userns
+        && filter == Some(crate::contain_seccomp::Rules::Identified)
+        && filter_reader.is_some();
     let plan = match build_linux_jail(&identified) {
         Ok(p) => p,
         Err(e) => {
@@ -1429,25 +1418,26 @@ fn helper_env(command: &mut Command) {
     command.env("PATH", crate::contain::HELPER_PATH);
 }
 
-/// Start the throwaway jail under this build's filter for a launch (the
-/// identified one with `identity`, the terminal one otherwise): `true` only
+/// Start the throwaway jail under this build's filter with `rules`, shaped
+/// as the launch's jail (`identity`: its capabilities dropped): `true` only
 /// when it ran and exited 0 within five seconds. Its `true` runs under the
 /// filter, so a filter this kernel cannot load, or one whose architecture is
 /// not the kernel's (a binary under emulation), fails here and never in the
 /// jail.
 #[cfg(target_os = "linux")]
-fn filter_probe(bwrap: &Path, identity: bool) -> bool {
+fn filter_probe(bwrap: &Path, rules: crate::contain_seccomp::Rules, identity: bool) -> bool {
     use std::os::fd::AsRawFd;
     use std::process::Stdio;
     use std::time::{Duration, Instant};
 
-    let Some(filter) = filter_pipe(identity) else {
+    let Some(filter) = filter_pipe(rules) else {
         return false;
     };
     let mut command = Command::new(bwrap);
     command
         .args(crate::contain::launch::filter_probe_argv(
             filter.as_raw_fd(),
+            identity,
         ))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -1473,27 +1463,27 @@ fn filter_probe(bwrap: &Path, identity: bool) -> bool {
     }
 }
 
-/// What an identified launch does about user namespaces in the jail, on this
-/// host's bwrap: one throwaway jail under the identified filter.
+/// The filter a launch hands this host's bwrap, and what it says about it:
+/// from this build's architecture, the kernel's release, and one throwaway
+/// jail under a filter (two for an identified launch whose host does not take
+/// the identified one).
 #[cfg(target_os = "linux")]
-fn userns_fact(bwrap: &Path) -> crate::contain::launch::UsernsFact {
-    crate::contain::launch::userns_decision(true, || filter_probe(bwrap, true))
+fn filter_plan_here(bwrap: &Path, identity: bool) -> crate::contain::launch::FilterPlan {
+    use crate::contain::launch::{filter_plan, kernel_runs_the_filter_after_a_tracer, FilterHost};
+    let release = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
+    let host = FilterHost {
+        built: crate::contain_seccomp::Arch::native().is_some(),
+        tracer_safe: kernel_runs_the_filter_after_a_tracer(&release),
+    };
+    filter_plan(identity, host, |rules| filter_probe(bwrap, rules, identity))
 }
 
 #[cfg(not(target_os = "linux"))]
-fn userns_fact(_bwrap: &Path) -> crate::contain::launch::UsernsFact {
-    crate::contain::launch::UsernsFact::NotAsked
-}
-
-/// Whether this host's bwrap starts a jail under the terminal filter.
-#[cfg(target_os = "linux")]
-fn terminal_filter_taken(bwrap: &Path) -> bool {
-    filter_probe(bwrap, false)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn terminal_filter_taken(_bwrap: &Path) -> bool {
-    false
+fn filter_plan_here(_bwrap: &Path, _identity: bool) -> crate::contain::launch::FilterPlan {
+    crate::contain::launch::FilterPlan {
+        filter: None,
+        said: Vec::new(),
+    }
 }
 
 /// What decides the user scope, read from this host.

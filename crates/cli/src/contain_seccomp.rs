@@ -5,13 +5,18 @@
 //! first process and to the command, before the command runs; nothing in the
 //! jail runs without it.
 //!
-//! Every jail refuses keystroke injection into a terminal (`TIOCSTI`,
-//! `TIOCLINUX`): a jail run from your terminal shares it, and a program could
-//! otherwise queue input your shell reads after the jail ends. An identified
-//! jail (`--identity`) also refuses new user namespaces and joining other
-//! namespaces, so nothing in it can build a namespace of its own. A call made
-//! with another architecture's numbers, or through the x32 ABI, kills the
-//! process: the numbers below would not name the same calls there.
+//! Every jail refuses the two terminal commands that push input into a
+//! terminal (`TIOCSTI`, `TIOCLINUX`): a jail run from your terminal shares it,
+//! and a program could otherwise queue input your shell reads after the jail
+//! ends. A plain jail applies that rule to every ABI the kernel runs for its
+//! architecture, each by its own numbers (on x86_64 the native, x32 and i386
+//! ones, on aarch64 the native and 32-bit arm ones), and lets every other call
+//! through, so a 32-bit program runs in it as it did before the filter.
+//!
+//! An identified jail (`--identity`) also refuses new user namespaces and
+//! joining other namespaces, so nothing in it can build a namespace of its
+//! own. It ends a call made through any other ABI (another architecture's, or
+//! x32): the numbers it names would not name the same calls there.
 //!
 //! PURE: the program and its bytes are built for either architecture on any
 //! host, so the tests run them through a small interpreter everywhere. The
@@ -28,8 +33,25 @@ pub const AUDIT_ARCH_X86_64: u32 = 0xC000_003E;
 /// The libc crate does not define it.
 pub const AUDIT_ARCH_AARCH64: u32 = 0xC000_00B7;
 
+/// `AUDIT_ARCH_I386` (`EM_386 | __AUDIT_ARCH_LE`): a call an x86_64 kernel
+/// runs through its i386 ABI (`int 0x80`, a 32-bit program).
+pub const AUDIT_ARCH_I386: u32 = 0x4000_0003;
+
+/// `AUDIT_ARCH_ARM` (`EM_ARM | __AUDIT_ARCH_LE`): a call an aarch64 kernel
+/// runs for a 32-bit arm program.
+pub const AUDIT_ARCH_ARM: u32 = 0x4000_0028;
+
 /// The bit an x32 call sets in its number on x86_64 (`__X32_SYSCALL_BIT`).
 pub const X32_SYSCALL_BIT: u32 = 0x4000_0000;
+
+/// x32's `ioctl` (514, with [`X32_SYSCALL_BIT`] set). Before Linux 5.4 the
+/// native and x32 calls were run from one table: a native call of 514 ran
+/// x32's `ioctl`, and an x32 call of 16 the native one. So on x86_64 every
+/// filter takes 514 as an `ioctl` too.
+pub const X32_IOCTL: u32 = 514;
+
+/// `ioctl` in the i386 and the 32-bit arm tables alike.
+pub const COMPAT_IOCTL: u32 = 54;
 
 /// The number a tracer writes over a call it skips (strace's fault injection,
 /// a debugger). The kernel runs the filter on it and then returns `ENOSYS`
@@ -126,6 +148,15 @@ impl Arch {
         }
     }
 
+    /// The `arch` of a call this architecture's kernel runs for a 32-bit
+    /// program, and that ABI's `ioctl` number.
+    pub fn compat(self) -> (u32, u32) {
+        match self {
+            Arch::X86_64 => (AUDIT_ARCH_I386, COMPAT_IOCTL),
+            Arch::Aarch64 => (AUDIT_ARCH_ARM, COMPAT_IOCTL),
+        }
+    }
+
     pub fn numbers(self) -> Numbers {
         match self {
             Arch::X86_64 => Numbers {
@@ -149,23 +180,12 @@ impl Arch {
 /// Which jail the filter is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rules {
-    /// Every jail: no keystrokes pushed into a terminal.
+    /// Every jail: no keystrokes pushed into a terminal, by any ABI the
+    /// kernel runs; every other call allowed.
     Terminal,
     /// An identified jail (`--identity`): the terminal rule, no new user
-    /// namespace, no joining a namespace.
+    /// namespace, no joining a namespace, and no call through another ABI.
     Identified,
-}
-
-impl Rules {
-    /// The filter a launch gets: the identified one with `--identity`, the
-    /// terminal one otherwise.
-    pub fn for_launch(identity: bool) -> Rules {
-        if identity {
-            Rules::Identified
-        } else {
-            Rules::Terminal
-        }
-    }
 }
 
 /// Where a jump lands.
@@ -178,6 +198,8 @@ enum To {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Label {
     Flags,
+    X32,
+    Compat,
     Ioctl,
     Allow,
     Eperm,
@@ -204,36 +226,53 @@ fn jeq(k: u32, yes: To, no: To) -> Step {
 }
 
 /// The steps of the program, in the order the spec of the jail gives them:
-/// the architecture or KILL; the number; on x86_64 an x32 number KILLs;
-/// `clone3` answers `ENOSYS`; `setns` `EPERM`; `unshare` and `clone` with
-/// `CLONE_NEWUSER` in the low word of their flags `EPERM`; `ioctl` with
-/// `TIOCSTI` or `TIOCLINUX` in the low word of its command `EPERM`; every
-/// other call is allowed. The terminal rules keep only the `ioctl` check.
+/// the architecture; the number; on x86_64 an x32 number; `clone3` answers
+/// `ENOSYS`; `setns` `EPERM`; `unshare` and `clone` with `CLONE_NEWUSER` in
+/// the low word of their flags `EPERM`; `ioctl` (on x86_64 also 514, see
+/// [`X32_IOCTL`]) with `TIOCSTI` or `TIOCLINUX` in the low word of its
+/// command `EPERM`; every other call is allowed.
+///
+/// The identified rules KILL a call of another architecture and an x32 one.
+/// The terminal rules keep only the `ioctl` check, and run it on every ABI
+/// the kernel has for the architecture, by that ABI's numbers: x32's
+/// `ioctl` (and 16, which older kernels ran as the native one), and the
+/// 32-bit `ioctl` of i386 or arm. Any other `arch` is KILLed.
 fn steps(arch: Arch, rules: Rules) -> Vec<Step> {
     use Label::*;
     let n = arch.numbers();
+    let identified = rules == Rules::Identified;
+    let x86 = arch == Arch::X86_64;
     let mut s = vec![
         Step::Load(OFFSET_ARCH),
-        jeq(arch.audit(), To::Next, To::At(Kill)),
+        jeq(
+            arch.audit(),
+            To::Next,
+            To::At(if identified { Kill } else { Compat }),
+        ),
         Step::Load(OFFSET_NR),
     ];
-    if arch == Arch::X86_64 {
+    if x86 {
         s.push(jeq(SKIPPED_CALL, To::At(Allow), To::Next));
         s.push(Step::Jump {
             code: BPF_JMP_JGE_K,
             k: X32_SYSCALL_BIT,
-            yes: To::At(Kill),
+            yes: To::At(if identified { Kill } else { X32 }),
             no: To::Next,
         });
     }
-    if rules == Rules::Identified {
+    if identified {
         s.push(jeq(n.clone3, To::At(Enosys), To::Next));
         s.push(jeq(n.setns, To::At(Eperm), To::Next));
         s.push(jeq(n.unshare, To::At(Flags), To::Next));
         s.push(jeq(n.clone, To::At(Flags), To::Next));
     }
-    s.push(jeq(n.ioctl, To::At(Ioctl), To::At(Allow)));
-    if rules == Rules::Identified {
+    if x86 {
+        s.push(jeq(n.ioctl, To::At(Ioctl), To::Next));
+        s.push(jeq(X32_IOCTL, To::At(Ioctl), To::At(Allow)));
+    } else {
+        s.push(jeq(n.ioctl, To::At(Ioctl), To::At(Allow)));
+    }
+    if identified {
         s.push(Step::Mark(Flags));
         s.push(Step::Load(OFFSET_ARG0_LOW));
         s.push(Step::Jump {
@@ -242,6 +281,19 @@ fn steps(arch: Arch, rules: Rules) -> Vec<Step> {
             yes: To::At(Eperm),
             no: To::At(Allow),
         });
+    } else {
+        if x86 {
+            // The number is still in the accumulator.
+            s.push(Step::Mark(X32));
+            s.push(jeq(X32_SYSCALL_BIT | X32_IOCTL, To::At(Ioctl), To::Next));
+            s.push(jeq(X32_SYSCALL_BIT | n.ioctl, To::At(Ioctl), To::At(Allow)));
+        }
+        // The `arch` is still in the accumulator.
+        let (compat, compat_ioctl) = arch.compat();
+        s.push(Step::Mark(Compat));
+        s.push(jeq(compat, To::Next, To::At(Kill)));
+        s.push(Step::Load(OFFSET_NR));
+        s.push(jeq(compat_ioctl, To::At(Ioctl), To::At(Allow)));
     }
     s.extend([
         Step::Mark(Ioctl),
@@ -334,11 +386,11 @@ pub fn to_bytes(program: &[Insn]) -> Vec<u8> {
     out
 }
 
-/// The bytes of this build's filter for a launch, `None` where this build has
+/// The bytes of this build's filter with `rules`, `None` where this build has
 /// no numbers for the architecture it runs as.
-pub fn native_filter(identity: bool) -> Option<Vec<u8>> {
+pub fn native_filter(rules: Rules) -> Option<Vec<u8>> {
     let arch = Arch::native()?;
-    Some(to_bytes(&program(arch, Rules::for_launch(identity))))
+    Some(to_bytes(&program(arch, rules)))
 }
 
 #[cfg(test)]
@@ -549,50 +601,188 @@ pub(crate) mod tests {
         }
     }
 
-    /// A call made with another architecture's numbers is killed: on x86_64
-    /// the i386 ABI (`int 0x80`) and on aarch64 the 32-bit arm one name other
-    /// calls by the same numbers. So is an x32 call on x86_64. The number a
-    /// tracer writes over a skipped call is not one of these.
+    /// A call one of these architectures' kernels makes with another ABI's
+    /// numbers: the i386 one (`int 0x80`) and x32 on x86_64, the 32-bit arm
+    /// one on aarch64.
+    fn foreign_call(arch: Arch, nr: u32, args: &[u64]) -> Call {
+        let mut call = Call::new(arch, nr, args);
+        call.arch = arch.compat().0;
+        call
+    }
+
+    /// The identified jail ends a call made with another ABI's numbers: on
+    /// x86_64 the i386 one and on aarch64 the 32-bit arm one name other calls
+    /// by the same numbers, and so does x32. Each filter also ends a call of
+    /// an architecture its kernel has no ABI for. The number a tracer writes
+    /// over a skipped call is not one of these.
     ///
     /// FAILS ON REVERT: drop the architecture check (i386's `ioctl` passes),
     /// or the x32 check.
     #[test]
-    fn another_architecture_and_x32_are_killed() {
-        const AUDIT_ARCH_I386: u32 = 0x4000_0003;
-        const AUDIT_ARCH_ARM: u32 = 0x4000_0028;
+    fn the_identified_filter_ends_a_call_of_another_abi() {
+        for (arch, foreign) in [
+            (Arch::X86_64, AUDIT_ARCH_I386),
+            (Arch::X86_64, AUDIT_ARCH_AARCH64),
+            (Arch::Aarch64, AUDIT_ARCH_ARM),
+            (Arch::Aarch64, AUDIT_ARCH_X86_64),
+        ] {
+            for nr in [0, COMPAT_IOCTL, 120, arch.numbers().ioctl] {
+                let call = Call {
+                    arch: foreign,
+                    nr,
+                    args: [0, u64::from(TIOCSTI), 0, 0, 0, 0],
+                };
+                assert_eq!(
+                    run(&program(arch, Rules::Identified), &call),
+                    Verdict::Kill,
+                    "{arch:?} {foreign:#x} {nr}"
+                );
+            }
+        }
+        let x86 = Arch::X86_64;
+        for nr in [
+            X32_SYSCALL_BIT,
+            X32_SYSCALL_BIT | 16,
+            X32_SYSCALL_BIT | 272,
+            X32_SYSCALL_BIT | X32_IOCTL,
+        ] {
+            let call = Call::new(x86, nr, &[u64::from(CLONE_NEWUSER), u64::from(TIOCSTI)]);
+            assert_eq!(
+                run(&program(x86, Rules::Identified), &call),
+                Verdict::Kill,
+                "{nr:#x}"
+            );
+        }
+        // An architecture neither kernel runs a program of: no filter here
+        // has its numbers.
         for rules in [Rules::Identified, Rules::Terminal] {
             for (arch, foreign) in [
-                (Arch::X86_64, AUDIT_ARCH_I386),
                 (Arch::X86_64, AUDIT_ARCH_AARCH64),
-                (Arch::Aarch64, AUDIT_ARCH_ARM),
+                (Arch::X86_64, AUDIT_ARCH_ARM),
                 (Arch::Aarch64, AUDIT_ARCH_X86_64),
+                (Arch::Aarch64, AUDIT_ARCH_I386),
+                (Arch::Aarch64, 0),
             ] {
-                for nr in [0, 54, arch.numbers().ioctl] {
-                    let call = Call {
-                        arch: foreign,
-                        nr,
-                        args: [0, u64::from(TIOCSTI), 0, 0, 0, 0],
-                    };
-                    assert_eq!(
-                        run(&program(arch, rules), &call),
-                        Verdict::Kill,
-                        "{rules:?} {arch:?} {foreign:#x} {nr}"
-                    );
-                }
-            }
-            let x86 = Arch::X86_64;
-            for nr in [X32_SYSCALL_BIT, X32_SYSCALL_BIT | 16, X32_SYSCALL_BIT | 272] {
-                let call = Call::new(x86, nr, &[u64::from(CLONE_NEWUSER), u64::from(TIOCSTI)]);
-                assert_eq!(run(&program(x86, rules), &call), Verdict::Kill, "{nr:#x}");
+                let call = Call {
+                    arch: foreign,
+                    nr: 0,
+                    args: [0; 6],
+                };
+                assert_eq!(
+                    run(&program(arch, rules), &call),
+                    Verdict::Kill,
+                    "{rules:?} {arch:?} {foreign:#x}"
+                );
             }
             let skipped = Call::new(x86, SKIPPED_CALL, &[]);
             assert_eq!(run(&program(x86, rules), &skipped), Verdict::Allow);
         }
     }
 
-    /// The terminal rules, which every jail gets, plain ones included: only
-    /// the two terminal commands are refused. A plain jail keeps what it
-    /// could do before, user namespaces included.
+    /// The plain jail's rule holds on every ABI its kernel runs, and nothing
+    /// else of a 32-bit program is touched: on x86_64 an i386 or x32
+    /// `ioctl` with either terminal command is refused (x32's by its own
+    /// number and by 16, which a kernel before 5.4 ran as the native one), on
+    /// aarch64 a 32-bit arm one; their other calls, user namespaces
+    /// included, are let through, so a 32-bit program runs as it did before
+    /// the filter.
+    ///
+    /// FAILS ON REVERT: KILL another ABI in the terminal filter (i386's
+    /// `getpid` is ended), or drop its `ioctl` check (i386's `TIOCSTI`
+    /// passes), or drop either x32 number.
+    #[test]
+    fn the_terminal_filter_runs_32_bit_programs_under_the_keystroke_rule() {
+        let refused = [u64::from(TIOCSTI), u64::from(TIOCLINUX), 0x1_0000_5412];
+        for arch in ARCHES {
+            let p = program(arch, Rules::Terminal);
+            for command in refused {
+                assert_eq!(
+                    run(&p, &foreign_call(arch, COMPAT_IOCTL, &[0, command])),
+                    Verdict::Errno(EPERM),
+                    "{arch:?} 32-bit ioctl {command:#x}"
+                );
+            }
+            // i386 and arm: 20 getpid, 11 execve, 120 clone, 310 / 337
+            // unshare, 346 / 375 setns, 435 clone3; 16 is not their ioctl.
+            for (nr, args) in [
+                (COMPAT_IOCTL, vec![0, TCGETS]),
+                (20, vec![]),
+                (11, vec![]),
+                (120, vec![u64::from(CLONE_NEWUSER) | SIGCHLD]),
+                (310, vec![u64::from(CLONE_NEWUSER)]),
+                (337, vec![u64::from(CLONE_NEWUSER)]),
+                (346, vec![3, 0]),
+                (375, vec![3, 0]),
+                (435, vec![0, 88]),
+                (16, vec![0, u64::from(TIOCSTI)]),
+                (29, vec![0, u64::from(TIOCSTI)]),
+                (SKIPPED_CALL, vec![]),
+            ] {
+                assert_eq!(
+                    run(&p, &foreign_call(arch, nr, &args)),
+                    Verdict::Allow,
+                    "{arch:?} 32-bit call {nr}"
+                );
+            }
+        }
+        let x86 = program(Arch::X86_64, Rules::Terminal);
+        for nr in [X32_SYSCALL_BIT | X32_IOCTL, X32_SYSCALL_BIT | 16] {
+            for command in refused {
+                assert_eq!(
+                    run(&x86, &Call::new(Arch::X86_64, nr, &[0, command])),
+                    Verdict::Errno(EPERM),
+                    "x32 {nr:#x} {command:#x}"
+                );
+            }
+            assert_eq!(
+                run(&x86, &Call::new(Arch::X86_64, nr, &[0, TCGETS])),
+                Verdict::Allow
+            );
+        }
+        for nr in [
+            X32_SYSCALL_BIT,
+            X32_SYSCALL_BIT | 39,
+            X32_SYSCALL_BIT | 272,
+            X32_SYSCALL_BIT | 56,
+        ] {
+            let call = Call::new(
+                Arch::X86_64,
+                nr,
+                &[u64::from(CLONE_NEWUSER), u64::from(TIOCSTI)],
+            );
+            assert_eq!(run(&x86, &call), Verdict::Allow, "x32 {nr:#x}");
+        }
+    }
+
+    /// On x86_64 a native call of 514 is an `ioctl` to both filters: a kernel
+    /// before 5.4 runs it as x32's `ioctl`, so `TIOCSTI` by 514 is refused
+    /// like `TIOCSTI` by 16. Any other command by 514 is let through (a newer
+    /// kernel answers it `ENOSYS`).
+    ///
+    /// FAILS ON REVERT: drop the 514 check (`TIOCSTI` by 514 passes).
+    #[test]
+    fn call_514_is_an_ioctl_to_both_filters_on_x86_64() {
+        for rules in [Rules::Identified, Rules::Terminal] {
+            let p = program(Arch::X86_64, rules);
+            for command in [u64::from(TIOCSTI), u64::from(TIOCLINUX), 0x1_0000_5412] {
+                assert_eq!(
+                    run(&p, &Call::new(Arch::X86_64, X32_IOCTL, &[0, command])),
+                    Verdict::Errno(EPERM),
+                    "{rules:?} {command:#x}"
+                );
+            }
+            assert_eq!(
+                run(&p, &Call::new(Arch::X86_64, X32_IOCTL, &[0, TCGETS])),
+                Verdict::Allow,
+                "{rules:?}"
+            );
+        }
+    }
+
+    /// The terminal rules, which every jail gets, plain ones included: of
+    /// the native calls only the two terminal commands are refused. A plain
+    /// jail keeps what it could do before, user namespaces included (the
+    /// test above holds the 32-bit ABIs to the same).
     ///
     /// FAILS ON REVERT: give the plain jail the identified rules.
     #[test]
@@ -624,8 +814,6 @@ pub(crate) mod tests {
                 assert_eq!(terminal(arch, nr, &args), Verdict::Allow, "{arch:?} {what}");
             }
         }
-        assert_eq!(Rules::for_launch(false), Rules::Terminal);
-        assert_eq!(Rules::for_launch(true), Rules::Identified);
     }
 
     fn hex(bytes: &[u8]) -> String {
@@ -678,6 +866,51 @@ pub(crate) mod tests {
                 }
             }
         }
+    }
+
+    /// Every number the filters name, for both architectures, against the
+    /// kernel's own tables, written out here and never computed from
+    /// [`Arch::numbers`]: `arch/x86/entry/syscalls/syscall_64.tbl` (x86_64
+    /// and x32), `include/uapi/asm-generic/unistd.h` (aarch64),
+    /// `arch/x86/entry/syscalls/syscall_32.tbl` (i386) and
+    /// `arch/arm/tools/syscall.tbl` (arm), and `include/uapi/linux/audit.h`
+    /// with `include/uapi/linux/elf-em.h` for the `arch` values. The CI
+    /// tests run on x86_64 only, and the golden bytes are printed when they
+    /// change, so this is what keeps a wrong aarch64 number from shipping.
+    ///
+    /// FAILS ON REVERT: change any number in [`Arch::numbers`] (aarch64's
+    /// `clone` to 120, its arm32 number, say), or either `arch` value.
+    #[test]
+    fn the_numbers_are_the_kernels_own_tables() {
+        let x86 = Arch::X86_64.numbers();
+        assert_eq!(
+            (x86.clone, x86.unshare, x86.setns, x86.clone3, x86.ioctl),
+            (56, 272, 308, 435, 16),
+            "syscall_64.tbl"
+        );
+        let a64 = Arch::Aarch64.numbers();
+        assert_eq!(
+            (a64.clone, a64.unshare, a64.setns, a64.clone3, a64.ioctl),
+            (220, 97, 268, 435, 29),
+            "asm-generic/unistd.h"
+        );
+        assert_eq!((X32_SYSCALL_BIT, X32_IOCTL), (0x4000_0000, 514), "x32");
+        assert_eq!(Arch::X86_64.compat(), (0x4000_0003, 54), "syscall_32.tbl");
+        assert_eq!(Arch::Aarch64.compat(), (0x4000_0028, 54), "arm syscall.tbl");
+        assert_eq!(
+            Arch::X86_64.audit(),
+            0xC000_003E,
+            "EM_X86_64 62, 64-bit, LE"
+        );
+        assert_eq!(
+            Arch::Aarch64.audit(),
+            0xC000_00B7,
+            "EM_AARCH64 183, 64-bit, LE"
+        );
+        assert_eq!(
+            (CLONE_NEWUSER, TIOCSTI, TIOCLINUX, EPERM, ENOSYS),
+            (0x1000_0000, 0x5412, 0x541C, 1, 38)
+        );
     }
 
     /// The numbers and the layout are libc's for the architecture this test
@@ -762,7 +995,7 @@ pub(crate) mod tests {
         let answer = |rc: libc::c_long| if rc == -1 { errno() } else { 0 };
         let mut out = Vec::new();
         if filtered {
-            let bytes = native_filter(true).expect("a filter for this build");
+            let bytes = native_filter(Rules::Identified).expect("a filter for this build");
             let (chunks, rest) = bytes.as_chunks::<8>();
             assert!(rest.is_empty());
             let filter: Vec<libc::sock_filter> = chunks
@@ -844,8 +1077,10 @@ pub(crate) mod tests {
             ));
         }
         // SAFETY: each call takes plain integers or a null pointer the kernel
-        // rejects. The new user namespace goes last: where it is not refused,
-        // nothing after it runs in it.
+        // rejects. The raw `clone` has no stack of its own, so a child it
+        // makes goes on as a copy of this process (as after `fork`) and only
+        // calls `_exit`. The new user namespace goes last: where it is not
+        // refused, nothing after it runs in it.
         unsafe {
             out.push(format!(
                 "setns={}",
@@ -859,12 +1094,35 @@ pub(crate) mod tests {
                     0usize
                 ))
             ));
+            let flags = libc::c_long::from(libc::CLONE_NEWUSER | libc::SIGCHLD);
+            let pid = libc::syscall(libc::SYS_clone, flags, 0usize, 0usize, 0usize, 0usize);
+            if pid == 0 {
+                libc::_exit(0);
+            }
+            out.push(format!("clone_newuser={}", answer(pid)));
+            if pid > 0 {
+                let mut status = 0;
+                libc::waitpid(pid as libc::pid_t, &mut status, 0);
+            }
             out.push(format!(
                 "unshare_newuser={}",
                 answer(libc::c_long::from(libc::unshare(libc::CLONE_NEWUSER)))
             ));
         }
         out
+    }
+
+    /// Whether this test process already runs under a seccomp filter (a
+    /// container's, an emulator's): the control child then answers what
+    /// that filter decides, not what the kernel does.
+    #[cfg(target_os = "linux")]
+    fn under_an_outer_filter() -> bool {
+        std::fs::read_to_string("/proc/self/status").is_ok_and(|status| {
+            status.lines().any(|l| {
+                l.split_once(':')
+                    .is_some_and(|(k, v)| k == "Seccomp" && v.trim() == "2")
+            })
+        })
     }
 
     /// Run this test again in a child process (never a fork of the test
@@ -898,16 +1156,24 @@ pub(crate) mod tests {
     }
 
     /// The filter on a real kernel, in a child process: after
-    /// `no_new_privs` and the identified filter, a new user namespace and
-    /// joining one are refused with EPERM, raw `clone3` answers ENOSYS,
-    /// threads and child processes still start (glibc falls back to `clone`),
-    /// and TIOCSTI on the child's own controlling terminal is refused, high
-    /// bits or not. The same child without the filter shows the kernel's own
-    /// answers, so each refusal above is the filter's.
+    /// `no_new_privs` and the identified filter, a new user namespace (by
+    /// `unshare` and by a raw `clone`) and joining one are refused with
+    /// EPERM, raw `clone3` answers ENOSYS, threads and child processes still
+    /// start (glibc falls back to `clone`), and TIOCSTI on the child's own
+    /// controlling terminal is refused, high bits or not. The same child
+    /// without the filter shows the kernel's own answers, so each refusal
+    /// above is the filter's.
+    ///
+    /// Where this test already runs under a filter of its own (a default
+    /// Docker container refuses `setns`), the control child answers that
+    /// filter, so the comparison with the kernel's answer for `setns` is
+    /// skipped and said; the terminal one, which no such filter refuses,
+    /// still holds.
     ///
     /// FAILS ON REVERT: answer `clone3` with EPERM (the thread and the
     /// command fail on glibc 2.34 and later), compare all 64 bits of the
-    /// `ioctl` command (`tiocsti_high` reaches the kernel), drop the `JSET`.
+    /// `ioctl` command (`tiocsti_high` reaches the kernel), drop the `JSET`,
+    /// name the wrong `clone` number (`clone_newuser` is made).
     #[cfg(target_os = "linux")]
     #[test]
     fn a_child_under_the_filter_is_refused_what_it_says() {
@@ -922,6 +1188,7 @@ pub(crate) mod tests {
         let control = answers_of_a_child(false);
         eprintln!("filtered: {filtered:?}\ncontrol: {control:?}");
         assert_eq!(filtered["unshare_newuser"], eperm, "{filtered:?}");
+        assert_eq!(filtered["clone_newuser"], eperm, "{filtered:?}");
         assert_eq!(filtered["setns"], eperm, "{filtered:?}");
         assert_eq!(filtered["clone3"], libc::ENOSYS, "{filtered:?}");
         assert_eq!(filtered["thread"], 0, "a thread starts: {filtered:?}");
@@ -930,7 +1197,14 @@ pub(crate) mod tests {
         assert_eq!(filtered["tiocsti_high"], eperm, "{filtered:?}");
         // Without the filter the kernel answers otherwise: a bad descriptor,
         // and TIOCSTI taken (or EIO where legacy TIOCSTI is off).
-        assert_eq!(control["setns"], libc::EBADF, "{control:?}");
+        if under_an_outer_filter() {
+            eprintln!(
+                "this test runs under a seccomp filter of its own: the control's setns answer ({}) is that filter's, not compared with the kernel's",
+                control["setns"]
+            );
+        } else {
+            assert_eq!(control["setns"], libc::EBADF, "{control:?}");
+        }
         for key in ["tiocsti", "tiocsti_high"] {
             assert!(
                 control[key] == 0 || control[key] == libc::EIO,
@@ -943,15 +1217,16 @@ pub(crate) mod tests {
     // Each instruction is `code(2) jt jf k(4)`, little endian, one per line.
     const GOLDEN_X86_64_IDENTIFIED: &str = "
         2000000004000000
-        150000103e0000c0
+        150000113e0000c0
         2000000000000000
-        15000b00ffffffff
-        35000d0000000040
-        15000b00b3010000
-        1500090034010000
-        1500020010010000
-        1500010038000000
-        1500020510000000
+        15000c00ffffffff
+        35000e0000000040
+        15000c00b3010000
+        15000a0034010000
+        1500030010010000
+        1500020038000000
+        1500030010000000
+        1500020502020000
         2000000010000000
         4500040300000010
         2000000018000000
@@ -981,11 +1256,17 @@ pub(crate) mod tests {
         0600000000000080";
     const GOLDEN_X86_64_TERMINAL: &str = "
         2000000004000000
-        150000093e0000c0
+        150000073e0000c0
         2000000000000000
-        15000500ffffffff
-        3500060000000040
-        1500000310000000
+        15000b00ffffffff
+        3500020000000040
+        1500060010000000
+        1500050802020000
+        1500040002020040
+        1500030610000040
+        1500000703000040
+        2000000000000000
+        1500000336000000
         2000000018000000
         1500020012540000
         150001001c540000
@@ -994,9 +1275,12 @@ pub(crate) mod tests {
         0600000000000080";
     const GOLDEN_AARCH64_TERMINAL: &str = "
         2000000004000000
-        15000007b70000c0
+        15000002b70000c0
         2000000000000000
-        150000031d000000
+        150003061d000000
+        1500000728000040
+        2000000000000000
+        1500000336000000
         2000000018000000
         1500020012540000
         150001001c540000
