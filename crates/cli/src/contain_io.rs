@@ -1421,23 +1421,25 @@ fn helper_env(command: &mut Command) {
 }
 
 /// Start the throwaway jail under this build's filter with `rules`, shaped
-/// as the launch's jail (`identity`: its capabilities dropped): `true` only
+/// as the launch's jail (`identity`: its capabilities dropped): `Ran` only
 /// when it ran and exited 0 within five seconds. Its `true` runs under the
 /// filter, so a filter this kernel cannot load, or one whose architecture is
 /// not the kernel's (a binary under emulation), fails here and never in the
-/// jail.
+/// jail. A filter whose pipe cannot be made (the launcher is out of
+/// descriptors) starts no bwrap and answers `NotHanded`.
 #[cfg(target_os = "linux")]
 fn filter_probe(
     bwrap: &Path,
     rules: innerwarden_agent_guard::seccomp::Rules,
     identity: bool,
-) -> bool {
+) -> crate::contain::launch::ProbeAnswer {
+    use crate::contain::launch::ProbeAnswer;
     use std::os::fd::AsRawFd;
     use std::process::Stdio;
     use std::time::{Duration, Instant};
 
     let Some(filter) = filter_pipe(rules) else {
-        return false;
+        return ProbeAnswer::NotHanded;
     };
     let mut command = Command::new(bwrap);
     command
@@ -1453,28 +1455,54 @@ fn filter_probe(
     // Ours closes once bwrap has its own.
     drop(filter);
     let Ok(mut child) = spawned else {
-        return false;
+        return ProbeAnswer::Failed;
     };
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return status.success(),
+            Ok(Some(status)) if status.success() => return ProbeAnswer::Ran,
+            Ok(Some(_)) => return ProbeAnswer::Failed,
             Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return false;
+                return ProbeAnswer::Failed;
             }
         }
     }
 }
 
-/// The kernel's release, as `uname -r` prints it, from the `uname` call:
-/// unlike `/proc/sys/kernel/osrelease` it is there in a chroot or a
-/// container with no `/proc`. Empty in the one case `uname` fails (a bad
-/// pointer, never here), which reads as an unknown release.
+/// The kernel's own file for its release.
 #[cfg(target_os = "linux")]
-fn kernel_release() -> String {
+const OSRELEASE: &str = "/proc/sys/kernel/osrelease";
+
+/// `UNAME26` (`include/uapi/linux/personality.h`). A process under this
+/// personality (`setarch --uname-2.6`, inherited across `exec`) gets any
+/// 3.x or later kernel's release from `uname` as `2.6.<minor + 60>`; the
+/// kernel's own file still says the real one.
+#[cfg(target_os = "linux")]
+const UNAME26: libc::c_int = 0x0002_0000;
+
+/// The kernel's release, as `uname -r` prints it. First from `osrelease`
+/// (the kernel's own file), which no personality rewrites. Where that file
+/// cannot be read or is empty (a chroot or a container with no `/proc`),
+/// from the `uname` call, except under [`UNAME26`], whose `uname` names an
+/// older kernel than the one running. Empty where neither tells it, which
+/// reads as an unknown release: never as an older kernel.
+#[cfg(target_os = "linux")]
+fn kernel_release(osrelease: &Path) -> String {
+    if let Ok(release) = std::fs::read_to_string(osrelease) {
+        let release = release.trim();
+        if !release.is_empty() {
+            return release.to_string();
+        }
+    }
+    // SAFETY: `personality(0xffffffff)` only reads this process's
+    // personality and changes nothing.
+    let personality = unsafe { libc::personality(0xffff_ffff) };
+    if personality == -1 || personality & UNAME26 != 0 {
+        return String::new();
+    }
     // SAFETY: `uname` fills the struct it is given, which lives until it
     // returns; `release` is then a NUL-terminated string inside it.
     unsafe {
@@ -1488,18 +1516,28 @@ fn kernel_release() -> String {
     }
 }
 
+/// What the filter plan reads of this host: whether this build has the
+/// filter for the architecture it runs as, and the kernel's release from
+/// `osrelease` ([`kernel_release`]).
+#[cfg(target_os = "linux")]
+fn filter_host_here(osrelease: &Path) -> crate::contain::launch::FilterHost {
+    use crate::contain::launch::{tracer_order, FilterHost};
+    FilterHost {
+        built: innerwarden_agent_guard::seccomp::Arch::native().is_some(),
+        tracer: tracer_order(&kernel_release(osrelease)),
+    }
+}
+
 /// The filter a launch hands this host's bwrap, and what it says about it:
 /// from this build's architecture, the kernel's release, and one throwaway
 /// jail under a filter (two for an identified launch whose host does not take
 /// the identified one).
 #[cfg(target_os = "linux")]
 fn filter_plan_here(bwrap: &Path, identity: bool) -> crate::contain::launch::FilterPlan {
-    use crate::contain::launch::{filter_plan, tracer_order, FilterHost};
-    let host = FilterHost {
-        built: innerwarden_agent_guard::seccomp::Arch::native().is_some(),
-        tracer: tracer_order(&kernel_release()),
-    };
-    filter_plan(identity, host, |rules| filter_probe(bwrap, rules, identity))
+    let host = filter_host_here(Path::new(OSRELEASE));
+    crate::contain::launch::filter_plan(identity, host, |rules| {
+        filter_probe(bwrap, rules, identity)
+    })
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1742,22 +1780,189 @@ fn print_plan_env(env: &[(String, String)]) {
 mod tests {
     use super::*;
 
-    /// The kernel's release is read from `uname`, so a host with no `/proc`
-    /// still reads it: it is what `/proc/sys/kernel/osrelease` says where
-    /// that is readable, and every kernel CI and the labs run reads as 4.8
-    /// or later.
+    /// Set in a child these tests start: what it answers.
+    #[cfg(target_os = "linux")]
+    const CHILD_VAR: &str = "IW_CONTAIN_IO_TEST_CHILD";
+
+    /// A path where no `osrelease` is: the plan's read of a host with no
+    /// `/proc`.
+    #[cfg(target_os = "linux")]
+    const NO_OSRELEASE: &str = "/nonexistent/proc/sys/kernel/osrelease";
+
+    /// What a child these tests start answers, one `key=value` per line.
+    #[cfg(target_os = "linux")]
+    fn child_side(side: &str) -> Vec<String> {
+        use crate::contain::launch::TracerOrder;
+        let order = |tracer: TracerOrder| format!("{tracer:?}");
+        match side {
+            "release" => {
+                // SAFETY: as in `kernel_release`.
+                let uname = unsafe {
+                    let mut names: libc::utsname = std::mem::zeroed();
+                    assert_eq!(libc::uname(&mut names), 0);
+                    std::ffi::CStr::from_ptr(names.release.as_ptr())
+                        .to_string_lossy()
+                        .into_owned()
+                };
+                vec![
+                    format!("uname={uname}"),
+                    format!(
+                        "proc={}",
+                        order(filter_host_here(Path::new(OSRELEASE)).tracer)
+                    ),
+                    format!(
+                        "no_proc={}",
+                        order(filter_host_here(Path::new(NO_OSRELEASE)).tracer)
+                    ),
+                ]
+            }
+            "no_descriptors" => {
+                // No descriptor left to open: the probe's pipe cannot be
+                // made, so no bwrap may be started for it.
+                let mut limit = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                // SAFETY: getrlimit fills the struct it is given and
+                // setrlimit reads it; the hard limit is kept, so an
+                // unprivileged child may lower the soft one to 0.
+                let lowered = unsafe {
+                    assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit), 0);
+                    limit.rlim_cur = 0;
+                    libc::setrlimit(libc::RLIMIT_NOFILE, &limit)
+                };
+                assert_eq!(lowered, 0, "{}", std::io::Error::last_os_error());
+                let mut answers = Vec::new();
+                for rules in [
+                    innerwarden_agent_guard::seccomp::Rules::Identified,
+                    innerwarden_agent_guard::seccomp::Rules::Terminal,
+                ] {
+                    let answer = filter_probe(Path::new("/bin/true"), rules, true);
+                    answers.push(format!("{rules:?}={answer:?}"));
+                }
+                answers
+            }
+            other => panic!("a child these tests do not know: {other}"),
+        }
+    }
+
+    /// Run this test binary again as a child (never a fork of the harness)
+    /// that answers `side`, under the `UNAME26` personality or with it
+    /// cleared, as a launcher started from such a shell inherits it. Every
+    /// child runs in [`the_plan_reads_the_running_kernel_without_proc`].
+    #[cfg(target_os = "linux")]
+    fn answers_of_a_child(side: &str, uname26: bool) -> std::collections::BTreeMap<String, String> {
+        use std::os::unix::process::CommandExt;
+        let name = module_path!()
+            .split_once("::")
+            .map(|(_, rest)| format!("{rest}::the_plan_reads_the_running_kernel_without_proc"))
+            .unwrap();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([name.as_str(), "--exact", "--nocapture", "--test-threads=1"])
+            .env(CHILD_VAR, side)
+            .stdin(std::process::Stdio::null());
+        // SAFETY: `personality` is one system call on this process's own
+        // state, safe between `fork` and `exec`.
+        unsafe {
+            command.pre_exec(move || {
+                let current = libc::personality(0xffff_ffff);
+                if current == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let wanted = if uname26 {
+                    current | UNAME26
+                } else {
+                    current & !UNAME26
+                };
+                if libc::personality(wanted as u32 as libc::c_ulong) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let out = command.output().expect("run the child");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "child failed: {stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // libtest may print the test's name on the line the first answer
+        // starts, so an answer is found anywhere on its line.
+        stdout
+            .lines()
+            .filter_map(|l| l.split_once("answer ").map(|(_, answer)| answer))
+            .filter_map(|l| l.split_once('='))
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// The plan reads the running kernel's release where `/proc` cannot be
+    /// read (a chroot, a container with no `/proc`): `uname` tells it there.
+    /// Where `/proc` is readable the plan reads it. Every kernel CI and the
+    /// labs run reads as 4.8 or later either way. Run in a child with the
+    /// `UNAME26` personality cleared, so the shell that runs the tests does
+    /// not decide the answer.
     ///
-    /// FAILS ON REVERT: hand the plan an empty release, as the old read of
-    /// a missing `/proc` did (it reads as `Unknown`).
+    /// FAILS ON REVERT: drop the `uname` fallback (a host with no `/proc`
+    /// reads as `Unknown`, and an identified jail leaves user namespaces
+    /// open on a modern kernel), or read the release from `/proc` alone.
     #[cfg(target_os = "linux")]
     #[test]
-    fn the_kernel_release_is_the_running_kernels_without_proc() {
-        use crate::contain::launch::{tracer_order, TracerOrder};
-        let release = kernel_release();
-        if let Ok(proc) = std::fs::read_to_string("/proc/sys/kernel/osrelease") {
-            assert_eq!(release, proc.trim(), "uname and /proc agree");
+    fn the_plan_reads_the_running_kernel_without_proc() {
+        if let Ok(side) = std::env::var(CHILD_VAR) {
+            for line in child_side(&side) {
+                println!("answer {line}");
+            }
+            return;
         }
-        assert_eq!(tracer_order(&release), TracerOrder::After, "{release:?}");
+        let proc = std::fs::read_to_string(OSRELEASE).expect("this test host has /proc");
+        assert_eq!(kernel_release(Path::new(OSRELEASE)), proc.trim());
+        let plain = answers_of_a_child("release", false);
+        assert_eq!(
+            plain["uname"],
+            proc.trim(),
+            "uname and /proc agree: {plain:?}"
+        );
+        assert_eq!(plain["proc"], "After", "{plain:?}");
+        assert_eq!(plain["no_proc"], "After", "{plain:?}");
+    }
+
+    /// A launcher started under the `UNAME26` personality (`setarch
+    /// --uname-2.6`, which a shell passes to everything it runs) gets a 2.6
+    /// release from `uname` on any modern kernel. The plan still reads the
+    /// running kernel from `/proc`, and where `/proc` cannot be read it says
+    /// the release is unknown: never that the kernel is older than 4.8.
+    ///
+    /// FAILS ON REVERT: read `uname` before `/proc` (`proc` reads `Before`,
+    /// and an identified jail says `userns_kernel_too_old` on a 6.x
+    /// kernel), or take `uname`'s answer under `UNAME26` (`no_proc` reads
+    /// `Before`).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn under_uname26_the_plan_never_reads_an_older_kernel() {
+        let old = answers_of_a_child("release", true);
+        assert!(
+            old["uname"].starts_with("2.6."),
+            "the child runs under UNAME26: {old:?}"
+        );
+        assert_eq!(old["proc"], "After", "{old:?}");
+        assert_eq!(old["no_proc"], "Unknown", "{old:?}");
+    }
+
+    /// A start-up probe whose filter pipe cannot be made (the launcher is
+    /// out of descriptors) starts no bwrap and answers that the filter was
+    /// not handed in, which the plan says as the launcher's failure, never
+    /// as bubblewrap's.
+    ///
+    /// FAILS ON REVERT: answer a lost pipe as a failed probe (`Failed`).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_probe_whose_pipe_cannot_be_made_says_it_was_not_handed() {
+        let answers = answers_of_a_child("no_descriptors", false);
+        assert_eq!(answers["Identified"], "NotHanded", "{answers:?}");
+        assert_eq!(answers["Terminal"], "NotHanded", "{answers:?}");
     }
 
     /// What the launcher puts on bwrap's pipe is the library's filter

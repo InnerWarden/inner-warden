@@ -1325,8 +1325,9 @@ pub mod launch {
         KernelUnknown,
         /// This build has no filter for the architecture it runs as.
         NotBuilt,
-        /// The host took the filter, and the launcher could not then hand
-        /// it to bubblewrap (its pipe could not be made).
+        /// The launcher could not make the pipe that hands the filter to
+        /// bubblewrap, for its start-up probe or after it: no bwrap ran
+        /// under it.
         NotHanded,
     }
 
@@ -1378,8 +1379,8 @@ pub mod launch {
         /// The filter is in, and the kernel's release does not read as a
         /// version: taken as older.
         KernelUnknown,
-        /// The host took the filter, and the launcher could not then hand
-        /// it to bubblewrap: no filter.
+        /// The launcher could not make the pipe that hands the filter to
+        /// bubblewrap, for its start-up probe or after it: no filter.
         NotHanded,
     }
 
@@ -1421,6 +1422,18 @@ pub mod launch {
         )
     }
 
+    /// What a throwaway jail under a filter (the start-up probe) answered.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ProbeAnswer {
+        /// It ran under the filter and exited 0.
+        Ran,
+        /// bwrap did not start it, or it did not exit 0 in time.
+        Failed,
+        /// The launcher could not make the pipe that hands the filter in,
+        /// so it started no bwrap: the launcher's failure, not bubblewrap's.
+        NotHanded,
+    }
+
     /// What the launcher reads of the host before it plans the filter.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct FilterHost {
@@ -1459,10 +1472,12 @@ pub mod launch {
     ///   user namespace line, and the terminal filter as below.
     /// * The terminal filter where its probe passed (said to be weaker on a
     ///   kernel before 4.8), no filter otherwise, and the line that says it.
+    /// * A probe whose filter could not be handed in started no bwrap: its
+    ///   lines name the launcher (`NotHanded`), never bubblewrap.
     pub fn filter_plan(
         identity: bool,
         host: FilterHost,
-        mut probe: impl FnMut(innerwarden_agent_guard::seccomp::Rules) -> bool,
+        mut probe: impl FnMut(innerwarden_agent_guard::seccomp::Rules) -> ProbeAnswer,
     ) -> FilterPlan {
         use innerwarden_agent_guard::seccomp::Rules;
         let mut said = Vec::new();
@@ -1473,29 +1488,44 @@ pub mod launch {
                 UsernsWhy::KernelTooOld
             } else if host.tracer == TracerOrder::Unknown {
                 UsernsWhy::KernelUnknown
-            } else if probe(Rules::Identified) {
-                return FilterPlan {
-                    filter: Some(Rules::Identified),
-                    said,
-                };
             } else {
-                UsernsWhy::ProbeFailed
+                match probe(Rules::Identified) {
+                    ProbeAnswer::Ran => {
+                        return FilterPlan {
+                            filter: Some(Rules::Identified),
+                            said,
+                        }
+                    }
+                    ProbeAnswer::Failed => UsernsWhy::ProbeFailed,
+                    ProbeAnswer::NotHanded => UsernsWhy::NotHanded,
+                }
             };
             said.push(userns_open_sentence(why));
         }
         let filter = if !host.built {
             said.push(filter_sentence(FilterWhy::NotBuilt));
             None
-        } else if probe(Rules::Terminal) {
-            match host.tracer {
-                TracerOrder::After => {}
-                TracerOrder::Before => said.push(filter_sentence(FilterWhy::KernelTooOld)),
-                TracerOrder::Unknown => said.push(filter_sentence(FilterWhy::KernelUnknown)),
-            }
-            Some(Rules::Terminal)
         } else {
-            said.push(filter_sentence(FilterWhy::ProbeFailed));
-            None
+            match probe(Rules::Terminal) {
+                ProbeAnswer::Ran => {
+                    match host.tracer {
+                        TracerOrder::After => {}
+                        TracerOrder::Before => said.push(filter_sentence(FilterWhy::KernelTooOld)),
+                        TracerOrder::Unknown => {
+                            said.push(filter_sentence(FilterWhy::KernelUnknown))
+                        }
+                    }
+                    Some(Rules::Terminal)
+                }
+                ProbeAnswer::Failed => {
+                    said.push(filter_sentence(FilterWhy::ProbeFailed));
+                    None
+                }
+                ProbeAnswer::NotHanded => {
+                    said.push(filter_sentence(FilterWhy::NotHanded));
+                    None
+                }
+            }
         };
         FilterPlan { filter, said }
     }
@@ -3132,7 +3162,11 @@ mod tests {
         let mut asked = Vec::new();
         let plan = launch::filter_plan(identity, host, |rules| {
             asked.push(rules);
-            takes.contains(&rules)
+            if takes.contains(&rules) {
+                launch::ProbeAnswer::Ran
+            } else {
+                launch::ProbeAnswer::Failed
+            }
         });
         (plan, asked)
     }
@@ -3252,11 +3286,12 @@ mod tests {
     /// filter whose pipe could not be made, after bubblewrap had just
     /// started a jail under it, is the launcher's failure, never
     /// bubblewrap's: both losses for an identified one, the keystroke one
-    /// for the terminal one.
+    /// for the terminal one. So is the same pipe lost for the start-up
+    /// probe, which then started no bwrap.
     ///
     /// FAILS ON REVERT: take an unread release as an older kernel's words
     /// (`userns_kernel_too_old`), or say `filter_probe_failed` for a lost
-    /// pipe.
+    /// pipe, after the probe or for it.
     #[test]
     fn a_launch_names_an_unread_kernel_and_a_lost_pipe_as_what_they_are() {
         use innerwarden_agent_guard::seccomp::Rules::{Identified, Terminal};
@@ -3302,6 +3337,33 @@ mod tests {
             assert!(!line.contains("Bubblewrap here could not"), "{line}");
             assert!(!line.contains("_probe_failed"), "{line}");
             assert!(line.contains("The launcher could not hand"), "{line}");
+        }
+
+        // The same pipe lost for the start-up probe: no bwrap ran, so the
+        // probe answers `NotHanded`, and the lines are the launcher's.
+        for identity in [true, false] {
+            let mut asked = Vec::new();
+            let plan = launch::filter_plan(identity, WHOLE_HOST, |rules| {
+                asked.push(rules);
+                launch::ProbeAnswer::NotHanded
+            });
+            assert_eq!(plan.filter, None);
+            let mut said = Vec::new();
+            if identity {
+                said.push(userns_open_sentence(UsernsWhy::NotHanded));
+            }
+            said.push(filter_sentence(FilterWhy::NotHanded));
+            assert_eq!(plan.said, said, "identity {identity}");
+            let probes: &[_] = if identity {
+                &[Identified, Terminal]
+            } else {
+                &[Terminal]
+            };
+            assert_eq!(asked, probes);
+            for line in &plan.said {
+                assert!(!line.contains("Bubblewrap here could not"), "{line}");
+                assert!(!line.contains("_probe_failed"), "{line}");
+            }
         }
     }
 
