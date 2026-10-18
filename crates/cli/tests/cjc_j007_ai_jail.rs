@@ -1217,6 +1217,67 @@ fn a_hidden_home_path_made_after_the_jail_started_stays_hidden() {
     assert_eq!(mode, 0o700, "made as git wants it");
 }
 
+/// A person's own home folder that the jail writes is a link to a folder
+/// outside the home (`~/.cache` on another disk): a hidden path below it is
+/// made (empty, 0700) and hidden where the folder leads, as the jail binds
+/// it, and the jail starts. Measured before this: the launch stopped with
+/// "outside the home", having first made the folders through the link.
+///
+/// FAILS ON REVERT: take only the home for the jail's home in
+/// `plan_hidden_home` and the launch stops "outside the home".
+#[cfg(target_os = "linux")]
+#[test]
+fn a_home_folder_linked_outside_the_home_hides_where_it_leads() {
+    use std::os::unix::fs::PermissionsExt;
+    require_bwrap();
+    let home = home_that_hides(&[".cache/git/credential", ".cache/gh"]);
+    let h = home.path();
+    let elsewhere = tempfile::TempDir::new().unwrap();
+    let cache = elsewhere.path().join("cache");
+    std::fs::create_dir_all(cache.join("gh")).unwrap();
+    std::fs::write(cache.join("gh/hosts.yml"), "TOKEN-GH").unwrap();
+    std::os::unix::fs::symlink(&cache, h.join(".cache")).unwrap();
+    let project = tempfile::TempDir::new().unwrap();
+    let script = format!(
+        "cat '{0}/.cache/gh/hosts.yml' 2>/dev/null; ls -A '{0}/.cache/git/credential'; echo DONE",
+        h.display()
+    );
+    let mut command = cli();
+    command
+        .args([
+            "contain",
+            "--identity",
+            "--project",
+            project.path().to_str().unwrap(),
+            "--",
+            "/bin/sh",
+            "-c",
+            &script,
+        ])
+        .env("HOME", h);
+    let output = identified_without_a_scope(&mut command)
+        .output()
+        .expect("run Linux AI Jail with --identity");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "the jail did not start: {stderr}");
+    assert!(stdout.contains("DONE"), "{stdout} {stderr}");
+    assert!(
+        !stdout.contains("TOKEN"),
+        "a hidden token was read: {stdout}"
+    );
+    let made = cache.join("git/credential");
+    let mode = std::fs::metadata(&made).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700, "made where the folder leads, as git wants it");
+    assert!(
+        std::fs::symlink_metadata(h.join(".cache"))
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the person's link is left as it was"
+    );
+}
+
 /// F2: a link planted where a hidden home path will be (the agent can write
 /// `~/.cache`) never moves the mask: one that leads to the project, or
 /// outside the home, stops the launch before anything runs.

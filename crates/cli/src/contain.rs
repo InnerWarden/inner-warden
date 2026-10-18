@@ -335,8 +335,12 @@ pub struct HiddenPlan {
 ///
 /// A path that leads outside the home is refused: a link the agent planted
 /// in a folder it can write would otherwise move the mask onto anything the
-/// jail shows (`/etc/innerwarden`). What a path leads to that the jail
-/// needs (the project, the guard, the agent's own settings) is refused by
+/// jail shows (`/etc/innerwarden`). A home folder the jail binds read-write
+/// is taken where it leads, as the jail binds it: below `~/.cache` linked to
+/// `/data/cache`, the jail's home is `/data/cache`, and only a link below it
+/// that leaves it is refused (the agent cannot replace the folder itself,
+/// a mount point in the jail). What a path leads to that the jail needs
+/// (the project, the guard, the agent's own settings) is refused by
 /// [`validate_jail_inputs`].
 pub fn plan_hidden_home(
     paths: &[HiddenHomePath],
@@ -358,7 +362,9 @@ pub fn plan_hidden_home(
             )));
         }
         let leads_to = path.real.as_ref().unwrap_or(&path.resolved);
-        if !leads_to.starts_with(home) {
+        let in_its_folder = writable_folder_target(&path.nominal, home, shown)
+            .is_some_and(|folder| leads_to.starts_with(folder));
+        if !leads_to.starts_with(home) && !in_its_folder {
             return Err(ContainError::Unsupported(format!(
                 "the hidden home path '{}' leads to '{}', outside the home: name a path \
                  inside the home in hide_home, or remove the link",
@@ -386,6 +392,27 @@ pub fn plan_hidden_home(
         }
     }
     Ok(plan)
+}
+
+/// Where the home folder a hidden path is in leads on the host, when the
+/// jail binds that folder read-write ([`writable_home_dirs`]) and shows it
+/// (`shown`, [`shown_host_folders`]): what is below that place is what the
+/// jail shows below the folder.
+fn writable_folder_target<'a>(
+    nominal: &Path,
+    home: &Path,
+    shown: &'a [(PathBuf, PathBuf)],
+) -> Option<&'a Path> {
+    let first = nominal.strip_prefix(home).ok()?.components().next()?;
+    let name = first.as_os_str().to_str()?;
+    if !DOTDIR_RW.contains(&name) || DOTDIR_DENY.contains(&name) {
+        return None;
+    }
+    let folder = home.join(name);
+    shown
+        .iter()
+        .find(|(jail, _)| *jail == folder)
+        .map(|(_, host)| host.as_path())
 }
 
 /// PURE. The host folders (and files) a jail shows under their own names,
@@ -5484,6 +5511,114 @@ mod tests {
             is_dir: true,
         }];
         assert!(validate_jail_inputs(&inside).is_ok());
+    }
+
+    /// A home folder the jail binds read-write is taken where it leads, as
+    /// the jail binds it: with `~/.cache` a link to `/data/cache` (a person's
+    /// own, which the agent cannot replace in the jail, where it is a mount
+    /// point), `~/.cache/git/credential` is planned at
+    /// `/data/cache/git/credential` and covered where the jail shows it, at
+    /// `~/.cache/git/credential`. A link below the folder that leaves where
+    /// it leads is still refused, and so is a folder the jail does not bind
+    /// read-write.
+    ///
+    /// FAILS ON REVERT: take only the home for the jail's home in
+    /// `plan_hidden_home` (the check before this one) and the first plan is
+    /// refused "outside the home", so every jail whose profile hides
+    /// `.cache/git/credential` never starts for this person.
+    #[test]
+    fn a_home_folder_linked_outside_the_home_is_taken_where_it_leads() {
+        let input = identified_inputs();
+        let shown = shown_host_folders(
+            &input.args,
+            &input.home,
+            None,
+            &input.existing_paths,
+            |path| {
+                if path == Path::new("/home/dev/.cache") {
+                    PathBuf::from("/data/cache")
+                } else {
+                    path.to_path_buf()
+                }
+            },
+        );
+        let plan = plan_hidden_home(
+            &[
+                hidden(
+                    "/home/dev/.cache/git/credential",
+                    Some("/data/cache/git/credential"),
+                    true,
+                ),
+                hidden("/home/dev/.cache/nothing-here", None, false),
+            ],
+            &input.home,
+            &shown,
+        )
+        .unwrap();
+        assert_eq!(
+            plan.masks,
+            [DenyPath {
+                abs: PathBuf::from("/home/dev/.cache/git/credential"),
+                is_dir: true
+            }]
+        );
+        for denied in [
+            "/home/dev/.cache/git/credential",
+            "/data/cache/git/credential",
+            "/home/dev/.cache/nothing-here",
+        ] {
+            assert!(
+                plan.denies.contains(&PathBuf::from(denied)),
+                "{denied}: {:?}",
+                plan.denies
+            );
+        }
+        // A link below the folder that leaves where the folder leads: the
+        // mask would move onto what the jail shows elsewhere.
+        for real in ["/data/other/secret", "/etc/innerwarden", "/data/cachex/x"] {
+            let refused = plan_hidden_home(
+                &[hidden("/home/dev/.cache/git/credential", Some(real), true)],
+                &input.home,
+                &shown,
+            )
+            .unwrap_err();
+            assert!(
+                refused.to_string().contains("outside the home"),
+                "{real}: {refused}"
+            );
+        }
+        // A path in another folder leads into `/data/cache`: that folder's
+        // place, not its own.
+        assert!(plan_hidden_home(
+            &[hidden("/home/dev/.config/gh", Some("/data/cache/gh"), true)],
+            &input.home,
+            &shown,
+        )
+        .is_err());
+        // A home folder the jail does not bind read-write is not the jail's.
+        let ssh_linked = shown_host_folders(
+            &input.args,
+            &input.home,
+            None,
+            &[
+                input.existing_paths.clone(),
+                vec![PathBuf::from("/home/dev/.ssh")],
+            ]
+            .concat(),
+            |path| {
+                if path == Path::new("/home/dev/.ssh") {
+                    PathBuf::from("/data/ssh")
+                } else {
+                    path.to_path_buf()
+                }
+            },
+        );
+        assert!(plan_hidden_home(
+            &[hidden("/home/dev/.ssh/key", Some("/data/ssh/key"), false)],
+            &input.home,
+            &ssh_linked,
+        )
+        .is_err());
     }
 
     /// The launcher starts the command of a jail whose profile starts it only

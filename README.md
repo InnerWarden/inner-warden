@@ -223,9 +223,11 @@ what of the home it hides, under `[profile.<type>.jail]`:
   empty mount on Linux, or denies on macOS. A link on the way is followed and
   the place it leads to is hidden. A path that leads outside the home, or
   that would cover the project, the guard, a read-only path or the agent's
-  own settings, stops the launch. On Linux a path that is not there yet, in
-  a folder the jail writes, is made empty (mode 0700) first, so what a
-  program makes there later stays hidden too.
+  own settings, stops the launch; a home folder the jail writes that is
+  itself a link (`~/.cache` on another disk) counts as the home where it
+  leads. On Linux a path that is not there yet, in a folder the jail writes,
+  is made empty (mode 0700) first, so what a program makes there later stays
+  hidden too.
 
 The user's file can only tighten these: the stricter `start` and every hidden
 path of both files hold. When Active Defence sends a note about the jail (for

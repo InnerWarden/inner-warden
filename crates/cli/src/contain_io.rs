@@ -448,8 +448,10 @@ fn link_on_the_way_dangles(home: &Path, path: &Path) -> bool {
 /// 0700, and each missing folder on the way the same, when it is in a
 /// folder of the home the jail binds read-write: a host program that makes
 /// it later (git's credential cache makes its socket folder 0700 on first
-/// use) then makes it under the jail's mask, never beside it. Nothing is
-/// made through a link or a file on the way, nor outside those folders.
+/// use) then makes it under the jail's mask, never beside it. That folder
+/// is taken where it leads, as the jail binds it (`~/.cache` linked to
+/// `/data/cache`: under `/data/cache`); nothing is made through a link or a
+/// file below it, nor outside those folders.
 #[cfg(target_os = "linux")]
 pub(crate) fn make_hidden_folder(home: &Path, nominal: &Path) {
     use std::os::unix::fs::DirBuilderExt;
@@ -463,8 +465,13 @@ pub(crate) fn make_hidden_folder(home: &Path, nominal: &Path) {
     let writable = crate::contain::writable_home_dirs()
         .iter()
         .any(|dir| first.as_os_str() == *dir);
-    let mut at = home.join(first);
-    if !writable || !at.is_dir() {
+    if !writable {
+        return;
+    }
+    let Ok(mut at) = std::fs::canonicalize(home.join(first)) else {
+        return;
+    };
+    if !std::fs::metadata(&at).is_ok_and(|meta| meta.is_dir()) {
         return;
     }
     for part in parts {
