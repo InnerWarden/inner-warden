@@ -27,7 +27,8 @@
 //!   * On Linux every jail starts its programs under a seccomp filter
 //!     (`innerwarden_agent_guard::seccomp`) where the host takes it: no
 //!     `TIOCSTI` or `TIOCLINUX` into a terminal, and with `--identity` no new
-//!     user namespace and no joining one. A host that does not take it is
+//!     user namespace, no joining one, and no new btrfs subvolume or
+//!     snapshot. A host that does not take it is
 //!     told by a throwaway jail first, and the jail then runs without it and
 //!     says so.
 //!   * An identified jail drops every capability (`--cap-drop ALL`): a

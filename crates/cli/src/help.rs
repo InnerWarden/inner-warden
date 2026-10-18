@@ -254,10 +254,11 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
              a seccomp filter in the style of Flatpak that refuses TIOCSTI and\n  \
              TIOCLINUX, the terminal commands that push input into your terminal;\n  \
              contain says so when the host does not take it. With --identity it also\n  \
-             refuses new user namespaces and joining other namespaces, ends a 32-bit\n  \
-             program, and drops every capability: turn the agent's own sandbox off\n  \
-             inside the jail. The jail shares the host's network, so an X server's\n  \
-             abstract socket stays reachable from it.\n\
+             refuses new user namespaces, joining other namespaces, and new btrfs\n  \
+             subvolumes or snapshots, ends a 32-bit program, and drops every\n  \
+             capability: turn the agent's own sandbox off inside the jail. The jail\n  \
+             shares the host's network, so an X server's abstract socket stays\n  \
+             reachable from it.\n\
              \n  \
              Everything after `--` is the jailed command line, including its own\n  \
              `--help`."
@@ -414,12 +415,14 @@ mod tests {
     /// The public words for the jail's seccomp filter say what it covers and
     /// where it stops, in `contain --help` and in the README alike: the two
     /// terminal commands by name, only where the host takes it, the
-    /// identified jail's capability drop and its end of 32-bit programs, the
-    /// plain jail's rule on those programs, the X server left reachable, and
-    /// the kernels before 4.8.
+    /// identified jail's capability drop, its end of 32-bit programs and its
+    /// refusal of new btrfs subvolumes and snapshots, the plain jail's rule
+    /// on those programs, the X server left reachable, and the kernels before
+    /// 4.8.
     ///
     /// FAILS ON REVERT: say again that every jail refuses injecting
-    /// keystrokes, or that a plain jail gets only the keystroke rule.
+    /// keystrokes, or that a plain jail gets only the keystroke rule, or drop
+    /// the btrfs words from either.
     #[test]
     fn the_contain_help_and_the_readme_say_what_the_filter_covers() {
         let flat = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -429,6 +432,7 @@ mod tests {
             "refuses TIOCSTI and TIOCLINUX, the terminal commands that push input",
             "contain says so when the host does not take it",
             "ends a 32-bit program, and drops every capability",
+            "With --identity it also refuses new user namespaces, joining other namespaces, and new btrfs subvolumes or snapshots",
             "The jail shares the host's network, so an X server's abstract socket stays reachable",
         ] {
             assert!(help.contains(said), "contain --help lacks {said:?}: {help}");
@@ -437,6 +441,7 @@ mod tests {
         for said in [
             "On Linux, where the host takes it, every jail starts its programs under a seccomp filter that refuses `TIOCSTI` and `TIOCLINUX`",
             "Its programs run with no capability, also when `contain` itself runs as root.",
+            "in the style of Flatpak: no new user namespaces, no joining other namespaces, no new btrfs subvolumes or snapshots,",
             "is ended at its first call in an identified jail",
             "gets only the terminal rule, and applies it to 32-bit programs too",
             "a build for an architecture other than x86_64 or aarch64",

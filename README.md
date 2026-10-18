@@ -261,8 +261,9 @@ applies to any program started in a jail under its agent's name: the type is
 the name given at launch.
 
 An identified jail starts its programs under a seccomp filter, in the style of
-Flatpak: no new user namespaces, no joining other namespaces, and no `TIOCSTI`
-or `TIOCLINUX`, the terminal commands that push input into your terminal. Its
+Flatpak: no new user namespaces, no joining other namespaces, no new btrfs
+subvolumes or snapshots, and no `TIOCSTI` or `TIOCLINUX`, the terminal
+commands that push input into your terminal. Its
 programs run with no capability, also when `contain` itself runs as root.
 Programs that need their own user namespace (Chromium's sandbox, rootless
 containers, an agent's own bubblewrap sandbox) do not work inside it; turn the
