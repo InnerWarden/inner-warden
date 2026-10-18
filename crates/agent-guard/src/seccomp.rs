@@ -24,10 +24,10 @@
 //! tests run them through a small interpreter on every OS. The launcher's I/O
 //! (`contain_io` in the `innerwarden` binary) only puts the bytes on a pipe.
 //!
-//! The surface is small on purpose: [`Arch`] (with [`Arch::native`] and
-//! [`Arch::host`]), [`Rules`], [`filter`] and [`native_filter`]. The
-//! instructions behind them are private, so a change to the program shows
-//! in the golden bytes below and nowhere else.
+//! The surface is small on purpose: [`Arch`] (with [`Arch::native`], the one
+//! architecture the launcher builds its filter for), [`Rules`], [`filter`]
+//! and [`native_filter`]. The instructions behind them are private, so a
+//! change to the program shows in the golden bytes below and nowhere else.
 
 /// `AUDIT_ARCH_X86_64` (`EM_X86_64 | __AUDIT_ARCH_64BIT | __AUDIT_ARCH_LE`).
 /// The libc crate does not define it.
@@ -85,6 +85,13 @@ const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
 const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
 const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
 
+// The two errno returns: `SECCOMP_RET_ERRNO` with the errno in its 16 data
+// bits, which are zero in `SECCOMP_RET_ERRNO`. Added, not OR'd: the two give
+// the same bytes, and so would an `^` in place of an `|`, a change that a
+// mutation test makes and no test can tell apart.
+const RET_EPERM: u32 = SECCOMP_RET_ERRNO + EPERM;
+const RET_ENOSYS: u32 = SECCOMP_RET_ERRNO + ENOSYS;
+
 // Offsets in `struct seccomp_data`: `int nr`, `__u32 arch`, `__u64
 // instruction_pointer`, `__u64 args[6]`. Both architectures are little
 // endian, so the low word of an argument is at its own offset.
@@ -133,54 +140,19 @@ struct Numbers {
 impl Arch {
     /// The architecture this build runs as, when it is one of these and
     /// little endian. Elsewhere there is no filter to hand in. This is the
-    /// one the launcher builds its filter for.
+    /// one the launcher builds its filter for. The build decides it, not the
+    /// kernel: a build run under another architecture's emulation answers
+    /// the architecture it was built for.
     pub fn native() -> Option<Arch> {
-        if cfg!(target_endian = "little") && cfg!(target_arch = "x86_64") {
+        // One `cfg!` per architecture: the answer is fixed by the build, with
+        // no `&&` that a mutation test could turn into an `||` giving the
+        // same answer on the host it runs on.
+        if cfg!(all(target_endian = "little", target_arch = "x86_64")) {
             Some(Arch::X86_64)
-        } else if cfg!(target_endian = "little") && cfg!(target_arch = "aarch64") {
+        } else if cfg!(all(target_endian = "little", target_arch = "aarch64")) {
             Some(Arch::Aarch64)
         } else {
             None
-        }
-    }
-
-    /// The architecture of the Linux kernel this runs on, as `uname` gives
-    /// its machine, when it is one of these. It differs from [`Arch::native`]
-    /// only for a build run under another architecture's emulation, where a
-    /// jail runs without a filter (its start-up probe fails). `None` off
-    /// Linux, where there is no seccomp.
-    pub fn host() -> Option<Arch> {
-        #[cfg(target_os = "linux")]
-        {
-            // SAFETY: `uname` fills the struct it is given, which lives until
-            // it returns; `machine` is then a NUL-terminated string inside it.
-            let machine = unsafe {
-                let mut names: libc::utsname = std::mem::zeroed();
-                if libc::uname(&mut names) != 0 {
-                    return None;
-                }
-                std::ffi::CStr::from_ptr(names.machine.as_ptr())
-                    .to_string_lossy()
-                    .into_owned()
-            };
-            Arch::from_machine(&machine)
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            None
-        }
-    }
-
-    /// PURE. The architecture a Linux kernel's machine name (`uname -m`)
-    /// names, when it is one of these: `x86_64`, and `aarch64` (or `arm64`,
-    /// as some tools print it). A 32-bit kernel (`i686`, `armv7l`) is none
-    /// of them.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    fn from_machine(machine: &str) -> Option<Arch> {
-        match machine.trim() {
-            "x86_64" => Some(Arch::X86_64),
-            "aarch64" | "arm64" => Some(Arch::Aarch64),
-            _ => None,
         }
     }
 
@@ -330,8 +302,10 @@ fn steps(arch: Arch, rules: Rules) -> Vec<Step> {
         if x86 {
             // The number is still in the accumulator.
             s.push(Step::Mark(X32));
-            s.push(jeq(X32_SYSCALL_BIT | X32_IOCTL, To::At(Ioctl), To::Next));
-            s.push(jeq(X32_SYSCALL_BIT | n.ioctl, To::At(Ioctl), To::At(Allow)));
+            // x32 numbers as the kernel spells them, `__X32_SYSCALL_BIT + nr`
+            // (no bit of `nr` is the x32 bit, so it is the same as `|`).
+            s.push(jeq(X32_SYSCALL_BIT + X32_IOCTL, To::At(Ioctl), To::Next));
+            s.push(jeq(X32_SYSCALL_BIT + n.ioctl, To::At(Ioctl), To::At(Allow)));
         }
         // The `arch` is still in the accumulator.
         let (compat, compat_ioctl) = arch.compat();
@@ -348,11 +322,11 @@ fn steps(arch: Arch, rules: Rules) -> Vec<Step> {
         Step::Mark(Allow),
         Step::Ret(SECCOMP_RET_ALLOW),
         Step::Mark(Eperm),
-        Step::Ret(SECCOMP_RET_ERRNO | EPERM),
+        Step::Ret(RET_EPERM),
     ]);
     if rules == Rules::Identified {
         s.push(Step::Mark(Enosys));
-        s.push(Step::Ret(SECCOMP_RET_ERRNO | ENOSYS));
+        s.push(Step::Ret(RET_ENOSYS));
     }
     s.push(Step::Mark(Kill));
     s.push(Step::Ret(SECCOMP_RET_KILL_PROCESS));
@@ -433,8 +407,8 @@ fn to_bytes(program: &[Insn]) -> Vec<u8> {
 
 /// PURE. The exact bytes of the filter for `arch` with `rules`: a whole
 /// number of 8-byte `struct sock_filter` instructions, the program the
-/// launcher hands to bubblewrap on a host of that architecture, and the
-/// program as the kernel then holds it for the jail. The same on any host.
+/// launcher hands to bubblewrap on a host of that architecture. The same on
+/// any host.
 pub fn filter(arch: Arch, rules: Rules) -> Vec<u8> {
     to_bytes(&program(arch, rules))
 }
@@ -969,45 +943,26 @@ mod tests {
             (CLONE_NEWUSER, TIOCSTI, TIOCLINUX, EPERM, ENOSYS),
             (0x1000_0000, 0x5412, 0x541C, 1, 38)
         );
+        assert_eq!(
+            (RET_EPERM, RET_ENOSYS),
+            (0x0005_0001, 0x0005_0026),
+            "SECCOMP_RET_ERRNO | errno"
+        );
     }
 
-    /// A kernel's machine name names one of the two architectures or none:
-    /// a 32-bit kernel, or another architecture, has no filter here.
+    /// The architecture this build has a filter for is the one it was built
+    /// for, read here from the standard library's own name for it.
     ///
-    /// FAILS ON REVERT: read `arm64` as none (what macOS and some tools
-    /// print for aarch64), or take a 32-bit machine as one of the two.
+    /// FAILS ON REVERT: answer `None` (no jail would get a filter), or the
+    /// other architecture.
     #[test]
-    fn a_machine_name_is_one_of_the_two_architectures_or_none() {
-        for (machine, arch) in [
-            ("x86_64", Some(Arch::X86_64)),
-            ("x86_64\n", Some(Arch::X86_64)),
-            ("aarch64", Some(Arch::Aarch64)),
-            ("arm64", Some(Arch::Aarch64)),
-            ("i686", None),
-            ("i386", None),
-            ("armv7l", None),
-            ("aarch64_be", None),
-            ("riscv64", None),
-            ("x86-64", None),
-            ("", None),
-        ] {
-            assert_eq!(Arch::from_machine(machine), arch, "{machine:?}");
-        }
-    }
-
-    /// On Linux the host's architecture is what `uname -m` prints, and a
-    /// build that is not emulated runs as it.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn the_host_is_the_kernels_own_machine() {
-        let printed = std::process::Command::new("uname")
-            .arg("-m")
-            .stdin(std::process::Stdio::null())
-            .output()
-            .expect("uname -m");
-        let machine = String::from_utf8_lossy(&printed.stdout);
-        assert_eq!(Arch::host(), Arch::from_machine(&machine), "{machine:?}");
-        assert!(Arch::host().is_some(), "a Linux host this filter knows");
+    fn the_native_architecture_is_the_builds_own() {
+        let expected = match std::env::consts::ARCH {
+            "x86_64" => Some(Arch::X86_64),
+            "aarch64" if cfg!(target_endian = "little") => Some(Arch::Aarch64),
+            _ => None,
+        };
+        assert_eq!(Arch::native(), expected, "{}", std::env::consts::ARCH);
     }
 
     /// The numbers and the layout are libc's for the architecture this test
@@ -1221,6 +1176,26 @@ mod tests {
         out
     }
 
+    /// Whether the control child answers the kernel's own way. Under an
+    /// outer filter (a container's, an emulator's) it answers what that
+    /// filter decides, so a comparison with it proves nothing about this
+    /// module's filter: said here, and a failure where `IW_REQUIRE_SECCOMP=1`
+    /// (CI, the release gate) asks for a host where it proves something.
+    #[cfg(target_os = "linux")]
+    fn the_control_answers_as_the_kernel(test: &str) -> bool {
+        if !under_an_outer_filter() {
+            return true;
+        }
+        assert!(
+            std::env::var_os("IW_REQUIRE_SECCOMP").is_none_or(|v| v != "1"),
+            "IW_REQUIRE_SECCOMP=1: {test} runs under a seccomp filter of its own, so its control child answers that filter, not the kernel"
+        );
+        eprintln!(
+            "{test}: this test runs under a seccomp filter of its own: the control child answers that filter, and the comparisons with it prove nothing about this module's filter"
+        );
+        false
+    }
+
     /// Whether this test process already runs under a seccomp filter (a
     /// container's, an emulator's): the control child then answers what
     /// that filter decides, not what the kernel does.
@@ -1278,8 +1253,8 @@ mod tests {
     /// Where this test already runs under a filter of its own (a default
     /// Docker container refuses `setns`), the control child answers that
     /// filter, so the comparison with the kernel's answer for `setns` is
-    /// skipped and said; the terminal one, which no such filter refuses,
-    /// still holds.
+    /// skipped and said (and fails with `IW_REQUIRE_SECCOMP=1`); the
+    /// terminal one, which no such filter refuses, still holds.
     ///
     /// FAILS ON REVERT: answer `clone3` with EPERM (the thread and the
     /// command fail on glibc 2.34 and later), compare all 64 bits of the
@@ -1312,12 +1287,7 @@ mod tests {
         assert_eq!(filtered["tiocsti_high"], eperm, "{filtered:?}");
         // Without the filter the kernel answers otherwise: a bad descriptor,
         // and TIOCSTI taken (or EIO where legacy TIOCSTI is off).
-        if under_an_outer_filter() {
-            eprintln!(
-                "this test runs under a seccomp filter of its own: the control's setns answer ({}) is that filter's, not compared with the kernel's",
-                control["setns"]
-            );
-        } else {
+        if the_control_answers_as_the_kernel("the identified child test") {
             assert_eq!(control["setns"], libc::EBADF, "{control:?}");
         }
         for key in ["tiocsti", "tiocsti_high"] {
@@ -1338,6 +1308,12 @@ mod tests {
     /// start. So the kernel loads the terminal program and runs it as the
     /// interpreter does, and a plain jail keeps what it could do before.
     ///
+    /// The control's `setns` must be the kernel's own answer (a bad
+    /// descriptor), or the equal answers prove nothing: under an outer
+    /// filter (a default Docker container refuses `setns` and new user
+    /// namespaces for both children) that is said, and with
+    /// `IW_REQUIRE_SECCOMP=1` the test fails.
+    ///
     /// FAILS ON REVERT: give the terminal rules the identified program
     /// (`setns` and `clone_newuser` are refused by the filter), drop the
     /// terminal program's `ioctl` check (`tiocsti` reaches the kernel), or
@@ -1351,6 +1327,9 @@ mod tests {
         eprintln!("terminal: {terminal:?}\ncontrol: {control:?}");
         assert_eq!(terminal["tiocsti"], eperm, "{terminal:?}");
         assert_eq!(terminal["tiocsti_high"], eperm, "{terminal:?}");
+        if the_control_answers_as_the_kernel("the terminal child test") {
+            assert_eq!(control["setns"], libc::EBADF, "{control:?}");
+        }
         for key in ["unshare_newuser", "clone_newuser", "setns", "clone3"] {
             assert_eq!(
                 terminal[key], control[key],

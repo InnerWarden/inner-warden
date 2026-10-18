@@ -1,18 +1,18 @@
 //! The public surface of `innerwarden_agent_guard::seccomp`, called from
-//! outside the crate as any other program calls it. An integration test is
-//! its own crate, so a name made private, or a signature changed, fails to
-//! compile here; a test inside the module would still reach it.
+//! outside the crate, as the launcher in the `innerwarden` binary calls it.
+//! An integration test is its own crate, so a name made private, or a
+//! signature changed, fails to compile here; a test inside the module would
+//! still reach it.
 //!
-//! FAILS ON REVERT: make `filter`, `native_filter`, `Arch::native`,
-//! `Arch::host` or `Arch::audit` private (or change one's signature), or
-//! hand out bytes that are not whole 8-byte instructions.
+//! FAILS ON REVERT: make `filter`, `native_filter`, `Arch::native` or
+//! `Arch::audit` private (or change one's signature), or hand out bytes that
+//! are not whole 8-byte instructions.
 
 use innerwarden_agent_guard::seccomp::{filter, native_filter, Arch, Rules};
 
 #[test]
 fn the_filter_surface_is_reachable_from_outside_the_crate() {
     let _: fn() -> Option<Arch> = Arch::native;
-    let _: fn() -> Option<Arch> = Arch::host;
     let _: fn(Arch) -> u32 = Arch::audit;
     let _: fn(Arch, Rules) -> Vec<u8> = filter;
     let _: fn(Rules) -> Option<Vec<u8>> = native_filter;
@@ -46,10 +46,5 @@ fn the_filter_surface_is_reachable_from_outside_the_crate() {
             }
         }
         None => assert_eq!(native_filter(Rules::Terminal), None),
-    }
-    if cfg!(target_os = "linux") {
-        assert!(Arch::host().is_some(), "a Linux host this filter knows");
-    } else {
-        assert_eq!(Arch::host(), None, "no seccomp off Linux");
     }
 }
