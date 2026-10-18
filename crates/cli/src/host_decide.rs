@@ -5,9 +5,12 @@
 //! the jail is never more than `observed`, so a per-agent relaxation is never
 //! the hook's to apply. Where Active Defence runs on the same host, the hook
 //! asks it ([`INSTANCE_DECIDE_ROUTE`]) when its general rules sent a command
-//! of an instance to review, and the host decides. This module is the pure
-//! part: whether to ask ([`should_ask`]), where ([`instance_decide_url`]),
-//! what to send ([`request_for`]), the trust the profiles decide at
+//! of an instance to review, and the host decides. A profile of the system
+//! file can ask for more (`ask_host = "every_command"`, [`AskHost`]): then
+//! the hook asks about every shell command it does not refuse itself, an
+//! `allow` of its general rules too. This module is the pure part: when to
+//! ask ([`ask_for`], [`should_ask`]), where ([`instance_decide_url`]), what to
+//! send ([`request_for`]), the trust the profiles decide at
 //! ([`decision_trust`]) and the decision that stands once both have spoken
 //! ([`settle`]). The request itself is in `host_decide_io`.
 //!
@@ -16,6 +19,8 @@
 //! * `confined` reaches the profiles only from an answer that is exactly the
 //!   contract's, for this instance, that says `confined` and withholds
 //!   nothing;
+//! * a command the hook refuses itself is never asked about, under any
+//!   `ask_host`: a refusal of the hook's stays the hook's;
 //! * the verdict that stands is the stricter of the hook's own and the
 //!   host's (`deny` over `review` over `allow`), so a tightening the hook
 //!   knows of (a general deny, a suppression, the user's profiles file, a
@@ -37,7 +42,7 @@ use innerwarden_agent_guard::identity::{
     self, HostAnswer, InstanceDecideAnswer, InstanceDecideRequest, RuleLayer, Trust, Verdict,
     AGENT_TLS_SPKI_PATH, HOST_ANSWER_INVALID, INSTANCE_DECIDE_ROUTE, JAIL_SPKI_PIN_PATH,
 };
-use innerwarden_agent_guard::profiles::{self, ProfileMode};
+use innerwarden_agent_guard::profiles::{self, AskHost, ProfileMode};
 use serde_json::{json, Value};
 
 use crate::agent_profiles::{self, HookDecision, ProfilesState};
@@ -61,25 +66,44 @@ pub fn instance_decide_url(var: Option<&str>) -> Option<String> {
     }
 }
 
-/// PURE. Whether the hook asks about this shell command: its general rules
-/// sent it to review and the hook's own decision, made first at its own
-/// reading of the instance, was decided by them (`own_layer`), so it is a
-/// review a host's relaxation could change (a hard rule or a profile's
-/// refusal stands whatever the host says); the hook's reading named an
-/// instance, the profiles are in force, there is a URL, and Active Defence
-/// is installed (asked last, and only when the rest holds).
+/// PURE. When the hook asks the host about a shell command of `agent_type`
+/// (the type it applies a profile for): what the profile in force for it
+/// says, which only the system file can say. [`AskHost::Review`], what the
+/// hook always did, with no profiles in force or nothing said.
+pub fn ask_for(profiles: &ProfilesState, agent_type: Option<&str>) -> AskHost {
+    match profiles {
+        ProfilesState::On(profiles) => profiles.ask_host(agent_type),
+        ProfilesState::Off | ProfilesState::Invalid(_) => AskHost::Review,
+    }
+}
+
+/// PURE. Whether the hook asks about this shell command.
+///
+/// Its general rules sent it to review, or, under `ask` =
+/// [`AskHost::EveryCommand`], allowed it; and the hook's own decision, made
+/// first at its own reading of the instance, was decided by them
+/// (`own_layer`), so it is not a refusal of the hook's (a hard rule or a
+/// profile's refusal stands whatever the host says: a local deny stays
+/// local). Then the hook's reading named an instance, the profiles are in
+/// force, there is a URL, and Active Defence is installed (asked last, and
+/// only when the rest holds).
 ///
 /// A hook whose line or launcher named another agent than the record names no
 /// instance, so it never asks, and no answer can bring that claim back.
 pub fn should_ask(
     general: Verdict,
     own_layer: RuleLayer,
+    ask: AskHost,
     identity: Option<&Identity>,
     profiles: &ProfilesState,
     ad_installed: impl FnOnce() -> bool,
     url: Option<&str>,
 ) -> bool {
-    general == Verdict::Review
+    let asked_about = match ask {
+        AskHost::Review => general == Verdict::Review,
+        AskHost::EveryCommand => matches!(general, Verdict::Allow | Verdict::Review),
+    };
+    asked_about
         && own_layer == RuleLayer::General
         && identity.is_some_and(|id| id.instance_id.is_some())
         && matches!(profiles, ProfilesState::On(_))
@@ -88,26 +112,41 @@ pub fn should_ask(
 }
 
 /// PURE. The request about `command`, from the hook's reading of its
-/// instance, the agent type it applies a profile for, the general verdict and
-/// the taint of the call. `None` without an instance.
+/// instance, the agent type it applies a profile for, the general verdict,
+/// the taint of the call and when the profile asks (`ask`). `None` without an
+/// instance.
+///
+/// Under [`AskHost::Review`] it is the request of
+/// [`identity::INSTANCE_DECIDE_VERSION`], byte for byte the one of before;
+/// under [`AskHost::EveryCommand`] the one of
+/// [`identity::INSTANCE_DECIDE_EVERY_COMMAND_VERSION`], which says the
+/// general verdict.
 pub fn request_for(
     identity: &Identity,
     agent_type: Option<&str>,
     command: &str,
     verdict: &Value,
     tainted: bool,
+    ask: AskHost,
 ) -> Option<InstanceDecideRequest> {
     let instance = identity.instance_id.as_deref()?;
     let charged = agent_profiles::charged_signals(verdict);
     let charged: Vec<&str> = charged.iter().map(String::as_str).collect();
-    identity::instance_decide_request(
-        instance,
-        agent_type,
-        identity.session_id.as_deref(),
-        command,
-        &charged,
-        tainted,
-    )
+    let session = identity.session_id.as_deref();
+    match ask {
+        AskHost::Review => identity::instance_decide_request(
+            instance, agent_type, session, command, &charged, tainted,
+        ),
+        AskHost::EveryCommand => identity::instance_decide_request_v2(
+            instance,
+            agent_type,
+            session,
+            command,
+            &charged,
+            tainted,
+            agent_profiles::general_verdict(verdict),
+        ),
+    }
 }
 
 /// What came back from the host, as the hook reads it.
@@ -179,6 +218,13 @@ fn relaxed(verdict: Verdict, layer: RuleLayer) -> bool {
     verdict == Verdict::Allow && matches!(layer, RuleLayer::AgentType | RuleLayer::Instance)
 }
 
+/// The reason a refusal says when it is the host's and it stands, where the
+/// hook asked the host about every command ([`AskHost::EveryCommand`]). The
+/// host's own reason is its word in `withheld`, recorded and never read
+/// here, so the sentence is the same for every refusal of the host's.
+pub const HOST_DENY_SENTENCE: &str =
+    "Active Defence on this host will not start a program in this command.";
+
 /// The facts [`settle`] needs besides the two decisions.
 #[derive(Debug, Clone, Copy)]
 pub struct SettleFacts<'a> {
@@ -190,6 +236,8 @@ pub struct SettleFacts<'a> {
     pub mode: Option<ProfileMode>,
     /// The hook's own reading of its instance.
     pub inside: Trust,
+    /// When the profile in force asks the host ([`ask_for`]).
+    pub ask: AskHost,
 }
 
 /// PURE. The decision that stands, from the hook's own (`local`, made at
@@ -203,6 +251,11 @@ pub struct SettleFacts<'a> {
 /// one with the host's word, it blocks as a decision of that word blocks on
 /// this line, and a relaxation the hook would have applied is recorded as
 /// withheld. A relaxation is withheld in the end unless it is what stands.
+///
+/// Where the hook asked about every command, a refusal of the host's that
+/// stands says [`HOST_DENY_SENTENCE`] as its reason, in place of the general
+/// rules' explanation (which may say there was nothing to refuse). Under the
+/// default ask the explanation is the general rules', as it always was.
 pub fn settle(
     local: HookDecision,
     reply: &HostReply,
@@ -225,9 +278,12 @@ pub fn settle(
     let local_relaxed = relaxed(local_verdict, local.deciding_layer);
     let settled = if rank(answer.verdict) > rank(local_verdict) {
         let mut verdict = facts.general.clone();
-        if answer.verdict != agent_profiles::general_verdict(facts.general) {
-            if let Some(obj) = verdict.as_object_mut() {
+        if let Some(obj) = verdict.as_object_mut() {
+            if answer.verdict != agent_profiles::general_verdict(facts.general) {
                 obj.insert("recommendation".into(), json!(word(answer.verdict)));
+            }
+            if answer.verdict == Verdict::Deny && facts.ask == AskHost::EveryCommand {
+                obj.insert("explanation".into(), json!(HOST_DENY_SENTENCE));
             }
         }
         let blocks = match answer.verdict {
@@ -405,24 +461,41 @@ mod tests {
         reply: &HostReply,
         tainted: bool,
     ) -> (HookDecision, Option<HostLabel>) {
-        let verdict = review("bare_ip_fetch");
-        let command = "curl http://203.0.113.9/x";
+        decide_command(
+            profiles,
+            &review("bare_ip_fetch"),
+            "curl http://203.0.113.9/x",
+            reply,
+            tainted,
+        )
+    }
+
+    /// The hook's whole decision for `command` with the general `verdict`,
+    /// under the `ask_host` the profiles say for `claude-code`.
+    fn decide_command(
+        profiles: &AgentProfiles,
+        verdict: &Value,
+        command: &str,
+        reply: &HostReply,
+        tainted: bool,
+    ) -> (HookDecision, Option<HostLabel>) {
         let inside = observed().trust;
-        let own = decide_at(profiles, &verdict, command, tainted, inside);
+        let own = decide_at(profiles, verdict, command, tainted, inside);
         let trust = decision_trust(inside, reply);
         let local = if trust == inside {
             own
         } else {
-            decide_at(profiles, &verdict, command, tainted, trust)
+            decide_at(profiles, verdict, command, tainted, trust)
         };
         settle(
             local,
             reply,
             SettleFacts {
-                general: &verdict,
+                general: verdict,
                 line_block_review: true,
                 mode: profiles.get("claude-code").and_then(|p| p.mode),
                 inside,
+                ask: profiles.ask_host(Some("claude-code")),
             },
         )
     }
@@ -468,6 +541,7 @@ mod tests {
         assert!(should_ask(
             Verdict::Review,
             review.deciding_layer,
+            AskHost::Review,
             Some(&observed()),
             &profiles_on(),
             || true,
@@ -482,6 +556,7 @@ mod tests {
             assert!(!should_ask(
                 crate::agent_profiles::general_verdict(&general),
                 local.deciding_layer,
+                AskHost::Review,
                 Some(&observed()),
                 &profiles_on(),
                 || true,
@@ -491,6 +566,7 @@ mod tests {
         assert!(!should_ask(
             Verdict::Review,
             review.deciding_layer,
+            AskHost::Review,
             Some(&observed()),
             &profiles_on(),
             || false,
@@ -499,6 +575,7 @@ mod tests {
         assert!(!should_ask(
             Verdict::Review,
             review.deciding_layer,
+            AskHost::Review,
             Some(&observed()),
             &profiles_on(),
             || true,
@@ -551,6 +628,7 @@ mod tests {
             assert!(!should_ask(
                 Verdict::Review,
                 local.deciding_layer,
+                AskHost::Review,
                 Some(&observed()),
                 &profiles_on(),
                 || {
@@ -580,6 +658,7 @@ mod tests {
             assert!(!should_ask(
                 Verdict::Review,
                 own_review().deciding_layer,
+                AskHost::Review,
                 identity,
                 &profiles_on(),
                 || {
@@ -605,6 +684,7 @@ mod tests {
             assert!(!should_ask(
                 Verdict::Review,
                 own_review().deciding_layer,
+                AskHost::Review,
                 Some(&observed()),
                 &state,
                 || true,
@@ -621,8 +701,15 @@ mod tests {
             {"signal": "download_and_execute", "score": 0},
             {"signal": "atr:tool-poisoning"},
         ]});
-        let request =
-            request_for(&observed(), Some("claude-code"), "curl x", &verdict, true).unwrap();
+        let request = request_for(
+            &observed(),
+            Some("claude-code"),
+            "curl x",
+            &verdict,
+            true,
+            AskHost::Review,
+        )
+        .unwrap();
         assert_eq!(
             request.hook_signals,
             ["atr:tool-poisoning", "bare_ip_fetch"]
@@ -635,7 +722,10 @@ mod tests {
             instance_id: None,
             ..observed()
         };
-        assert_eq!(request_for(&none, None, "curl x", &verdict, false), None);
+        assert_eq!(
+            request_for(&none, None, "curl x", &verdict, false, AskHost::Review),
+            None
+        );
     }
 
     #[test]
@@ -782,6 +872,7 @@ mod tests {
                     line_block_review: true,
                     mode: None,
                     inside: Trust::Observed,
+                    ask: AskHost::Review,
                 },
             );
             assert!(out.blocks, "{command}");
@@ -918,5 +1009,312 @@ mod tests {
         assert_eq!(key_file(true).path(), "/run/innerwarden/agent-tls.spki");
         assert_eq!(key_file(false), KeyFile::Host);
         assert_eq!(key_file(false).path(), "/etc/innerwarden/agent-tls.spki");
+    }
+
+    // -- ask_host = "every_command" ------------------------------------------
+
+    /// A system file of schema 2 whose `claude-code` profile asks the host
+    /// about every command, and allows a fetch from a bare IP.
+    const EVERY: &str = "schema_version = 2\n[profile.claude-code]\nask_host = \"every_command\"\n\
+                         allow_categories = [\"bare_ip_fetch\"]\n";
+
+    fn every() -> ProfilesState {
+        ProfilesState::On(on(EVERY, None))
+    }
+
+    fn allow() -> Value {
+        json!({"recommendation": "allow", "risk_score": 0, "explanation": "No risk signals.",
+            "signals": []})
+    }
+
+    #[test]
+    fn the_profile_in_force_says_when_to_ask() {
+        assert_eq!(
+            ask_for(&every(), Some("claude-code")),
+            AskHost::EveryCommand
+        );
+        assert_eq!(ask_for(&every(), Some("cursor")), AskHost::Review);
+        assert_eq!(ask_for(&every(), None), AskHost::Review);
+        assert_eq!(
+            ask_for(&profiles_on(), Some("claude-code")),
+            AskHost::Review
+        );
+        for state in [ProfilesState::Off, ProfilesState::Invalid("bad".into())] {
+            assert_eq!(ask_for(&state, Some("claude-code")), AskHost::Review);
+        }
+        // The user's file never says it: the reader refuses the whole state.
+        let user = ProfilesState::Invalid("~/x".into());
+        assert!(matches!(
+            state_from(
+                ("/etc/x", FileRead::Absent),
+                ("~/x", FileRead::Bytes(EVERY.as_bytes().to_vec()))
+            ),
+            ProfilesState::Invalid(why) if why.contains("ask_host")
+        ));
+        assert_eq!(ask_for(&user, Some("claude-code")), AskHost::Review);
+    }
+
+    /// Under `every_command` an allow of the general rules is asked about
+    /// too; under the default ask it never is.
+    ///
+    /// FAILS ON REVERT: ask about an allow whatever `ask` says, and the
+    /// default ask makes a request for every allowed command.
+    #[test]
+    fn an_allow_is_asked_about_only_under_every_command() {
+        let url = instance_decide_url(None);
+        let profiles = on(EVERY, None);
+        let local = own(&profiles, &allow(), "curl https://example.com");
+        assert_eq!(local.deciding_layer, RuleLayer::General);
+        assert!(!local.blocks);
+        assert!(should_ask(
+            Verdict::Allow,
+            local.deciding_layer,
+            AskHost::EveryCommand,
+            Some(&observed()),
+            &every(),
+            || true,
+            url.as_deref()
+        ));
+        assert!(should_ask(
+            Verdict::Review,
+            own_review().deciding_layer,
+            AskHost::EveryCommand,
+            Some(&observed()),
+            &every(),
+            || true,
+            url.as_deref()
+        ));
+        let mut looked_up = false;
+        assert!(!should_ask(
+            Verdict::Allow,
+            local.deciding_layer,
+            AskHost::Review,
+            Some(&observed()),
+            &every(),
+            || {
+                looked_up = true;
+                true
+            },
+            url.as_deref()
+        ));
+        assert!(!looked_up);
+        // The rest still holds: an instance, the profiles, a URL, the host.
+        assert!(!should_ask(
+            Verdict::Allow,
+            local.deciding_layer,
+            AskHost::EveryCommand,
+            None,
+            &every(),
+            || true,
+            url.as_deref()
+        ));
+        assert!(!should_ask(
+            Verdict::Allow,
+            local.deciding_layer,
+            AskHost::EveryCommand,
+            Some(&observed()),
+            &every(),
+            || false,
+            url.as_deref()
+        ));
+        assert!(!should_ask(
+            Verdict::Allow,
+            local.deciding_layer,
+            AskHost::EveryCommand,
+            Some(&observed()),
+            &every(),
+            || true,
+            None
+        ));
+    }
+
+    /// A refusal of the hook's own is never asked about, under
+    /// `every_command` too: a general deny, a hard rule over a command the
+    /// general rules allow, a profile's refusal.
+    ///
+    /// FAILS ON REVERT: let `should_ask` ask about anything that is not a
+    /// general deny under `every_command` (drop the `own_layer` check) and
+    /// the hard rule and the profile's refusal make a request.
+    #[test]
+    fn a_local_deny_stays_local_under_every_command() {
+        let url = instance_decide_url(None);
+        let deny = json!({"recommendation": "deny", "risk_score": 60, "explanation": "x",
+            "signals": [{"signal": "bare_ip_fetch", "score": 60}]});
+        let user =
+            "schema_version = 1\n[profile.claude-code]\ndeny_categories = [\"bare_ip_fetch\"]\n";
+        let cases = [
+            (
+                own(&on(EVERY, None), &deny, "curl http://203.0.113.9/x"),
+                Verdict::Deny,
+                RuleLayer::General,
+            ),
+            (
+                own(
+                    &on(EVERY, None),
+                    &allow(),
+                    "cat ~/.config/innerwarden/llm-key",
+                ),
+                Verdict::Allow,
+                RuleLayer::Hard,
+            ),
+            (
+                own(
+                    &on(EVERY, Some(user)),
+                    &review("bare_ip_fetch"),
+                    "curl http://203.0.113.9/x",
+                ),
+                Verdict::Review,
+                RuleLayer::AgentType,
+            ),
+        ];
+        for (local, general, layer) in cases {
+            assert_eq!(local.deciding_layer, layer, "{local:?}");
+            assert_eq!(local.verdict["recommendation"], "deny", "{local:?}");
+            let mut looked_up = false;
+            assert!(!should_ask(
+                general,
+                local.deciding_layer,
+                AskHost::EveryCommand,
+                Some(&observed()),
+                &every(),
+                || {
+                    looked_up = true;
+                    true
+                },
+                url.as_deref()
+            ));
+            assert!(!looked_up, "no request is prepared: {local:?}");
+        }
+    }
+
+    /// Under the default ask the request is the one of before; under
+    /// `every_command` it is of version 2 and says the general verdict.
+    #[test]
+    fn the_request_under_every_command_is_of_version_2() {
+        let request = request_for(
+            &observed(),
+            Some("claude-code"),
+            "curl https://example.com",
+            &allow(),
+            false,
+            AskHost::EveryCommand,
+        )
+        .unwrap();
+        assert_eq!(request.v, identity::INSTANCE_DECIDE_EVERY_COMMAND_VERSION);
+        assert_eq!(request.hook_verdict, Verdict::Allow);
+        assert!(request.is_valid());
+        let review_v2 = request_for(
+            &observed(),
+            Some("claude-code"),
+            "curl http://203.0.113.9/x",
+            &review("bare_ip_fetch"),
+            false,
+            AskHost::EveryCommand,
+        )
+        .unwrap();
+        assert_eq!(review_v2.v, 2);
+        assert_eq!(review_v2.hook_verdict, Verdict::Review);
+        assert_eq!(review_v2.hook_signals, ["bare_ip_fetch"]);
+        let review_v1 = request_for(
+            &observed(),
+            Some("claude-code"),
+            "curl http://203.0.113.9/x",
+            &review("bare_ip_fetch"),
+            false,
+            AskHost::Review,
+        )
+        .unwrap();
+        assert_eq!(
+            review_v1,
+            identity::instance_decide_request(
+                ID,
+                Some("claude-code"),
+                Some("s-1"),
+                "curl http://203.0.113.9/x",
+                &["bare_ip_fetch"],
+                false,
+            )
+            .unwrap()
+        );
+        assert_eq!(review_v1.v, 1);
+    }
+
+    /// A refusal of the host's over a command the general rules allow says
+    /// the generic sentence, never the general rules' "nothing to refuse".
+    ///
+    /// FAILS ON REVERT: leave the general explanation in place and the
+    /// refusal says "No risk signals.".
+    #[test]
+    fn a_host_deny_under_every_command_says_the_generic_sentence() {
+        let profiles = on(EVERY, None);
+        for (verdict, command) in [
+            (allow(), "curl https://example.com"),
+            (review("bare_ip_fetch"), "curl http://203.0.113.9/x"),
+        ] {
+            let reply = answer(
+                Trust::Confined,
+                Verdict::Deny,
+                RuleLayer::General,
+                Some("a_word_never_heard"),
+            );
+            let (out, label) = decide_command(&profiles, &verdict, command, &reply, false);
+            assert!(out.blocks, "{command}");
+            assert_eq!(out.verdict["recommendation"], "deny", "{command}");
+            assert_eq!(out.verdict["explanation"], HOST_DENY_SENTENCE, "{command}");
+            let label = label.unwrap();
+            assert!(label.answered && !label.decided);
+            assert_eq!(label.withheld.as_deref(), Some("a_word_never_heard"));
+        }
+        assert_eq!(
+            HOST_DENY_SENTENCE,
+            "Active Defence on this host will not start a program in this command."
+        );
+    }
+
+    /// Without a profile that asks about every command, a refusal of the
+    /// host's keeps the general rules' explanation, as it always did.
+    ///
+    /// FAILS ON REVERT: say the sentence under any ask and this explanation
+    /// changes.
+    #[test]
+    fn under_the_default_ask_a_host_deny_keeps_the_explanation_of_before() {
+        let profiles = on("schema_version = 1\n[profile.claude-code]\n", None);
+        let reply = answer(
+            Trust::Confined,
+            Verdict::Deny,
+            RuleLayer::AgentType,
+            Some("x"),
+        );
+        let (out, _) = decide(&profiles, &reply, false);
+        assert!(out.blocks);
+        assert_eq!(out.verdict["recommendation"], "deny");
+        assert_eq!(out.verdict["explanation"], "fetch from a bare IP");
+    }
+
+    /// The host's allow or a review over an allow it does not refuse: the
+    /// stricter stands, as for a review.
+    #[test]
+    fn an_allow_asked_about_takes_the_stricter_of_the_two() {
+        let profiles = on(EVERY, None);
+        let command = "curl https://example.com";
+        let kept = answer(
+            Trust::Confined,
+            Verdict::Allow,
+            RuleLayer::General,
+            Some("a_word_never_heard"),
+        );
+        let (out, label) = decide_command(&profiles, &allow(), command, &kept, false);
+        assert!(!out.blocks);
+        assert_eq!(out, own(&profiles, &allow(), command), "nothing moves");
+        let label = label.unwrap();
+        assert!(label.answered && !label.decided);
+        let held = answer(Trust::Confined, Verdict::Review, RuleLayer::General, None);
+        let (out, _) = decide_command(&profiles, &allow(), command, &held, false);
+        assert!(out.blocks, "a review on a line that blocks reviews");
+        assert_eq!(out.verdict["recommendation"], "review");
+        assert_eq!(out.verdict["explanation"], "No risk signals.");
+        let (none, label) = decide_command(&profiles, &allow(), command, &HostReply::None, false);
+        assert_eq!(label, None);
+        assert_eq!(none, own(&profiles, &allow(), command));
     }
 }

@@ -188,6 +188,20 @@ the host decides. The hook keeps the stricter of its own decision and the
 host's, so a deny, your suppressions and your own profiles file still win, and
 the trust it records stays its own reading from inside the jail.
 
+A profile in the system file (`/etc/innerwarden/agent-profiles.toml`,
+`schema_version = 2`) can ask for more: with `ask_host = "every_command"`
+the hook asks the host about every shell command of that type's identified
+instances that it does not refuse itself, including the ones your general
+rules allow. For a command they allow, the host's answer can only make the
+decision stricter, and a command the hook refuses is never asked about. It
+costs a request to the host on every command, bounded like the others. When
+a refusal of the host's
+is what stands, the hook says: "Active Defence on this host will not start a
+program in this command." Only the system file says `ask_host`; the user's
+file never does, and a file of schema 1 that says it is refused. An older
+`innerwarden` refuses a file of schema 2, so update it wherever the file is
+read before you write one.
+
 Where a per-agent relaxation applies:
 
 - Linux;

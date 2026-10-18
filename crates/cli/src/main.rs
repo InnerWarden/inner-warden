@@ -986,13 +986,17 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
             // review by the general rules is one the host could relax.
             let own = decide_at(inside);
             // That review, for an instance, is asked of the host where Active
-            // Defence runs; nothing else is, and without a 200 nothing changes.
+            // Defence runs; an allow too where the system profile asks about
+            // every command. A refusal of the hook's never is, and without a
+            // 200 nothing changes.
             let url = host_decide::instance_decide_url(
                 std::env::var(agent_report::AGENT_URL_VAR).ok().as_deref(),
             );
+            let ask = host_decide::ask_for(&profiles_state, agent_type.as_deref());
             let asked = host_decide::should_ask(
                 agent_profiles::general_verdict(&verdict),
                 own.deciding_layer,
+                ask,
                 identity.as_ref(),
                 &profiles_state,
                 upsell_io::active_defence_installed,
@@ -1005,6 +1009,7 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
                     &command,
                     &verdict,
                     tainted.is_some(),
+                    ask,
                 )
                 .and_then(|request| {
                     // The hook found its jail's record, so the key is the
@@ -1039,6 +1044,7 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
                         .and_then(|name| profiles.get(name))
                         .and_then(|profile| profile.mode),
                     inside,
+                    ask,
                 },
             );
             (

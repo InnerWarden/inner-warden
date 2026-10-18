@@ -564,6 +564,51 @@ mod tests {
         );
     }
 
+    /// Under a profile that asks about every command, the request about an
+    /// allow goes whole as version 2, and the host's refusal comes back in an
+    /// answer of the same shape as ever.
+    #[test]
+    fn an_allow_asked_about_goes_as_version_2_and_a_refusal_reads() {
+        let mut refusal = answer_for(ID);
+        refusal["verdict"] = serde_json::json!("deny");
+        refusal["deciding_layer"] = serde_json::json!("general");
+        refusal["profile"] = serde_json::Value::Null;
+        refusal["withheld"] = serde_json::json!("a_word_never_heard");
+        let (url, pin, server) = server(ok_json(&refusal), Duration::ZERO);
+        let request = innerwarden_agent_guard::identity::instance_decide_request_v2(
+            ID,
+            Some("claude-code"),
+            Some("s-1"),
+            "curl https://example.com",
+            &[],
+            false,
+            innerwarden_agent_guard::identity::Verdict::Allow,
+        )
+        .unwrap();
+        let body = serde_json::to_vec(&request).unwrap();
+        let reply = ask(&url, &body, Duration::from_secs(5), &pin);
+        let seen = server.join().unwrap().expect("a request");
+        let sent: serde_json::Value =
+            serde_json::from_slice(&seen[find(&seen, b"\r\n\r\n").unwrap() + 4..]).unwrap();
+        assert_eq!(sent["v"], 2);
+        assert_eq!(sent["hook_verdict"], "allow");
+        assert_eq!(
+            serde_json::from_value::<InstanceDecideRequest>(sent).unwrap(),
+            request
+        );
+        let crate::host_decide::HostReply::Answer(answer) =
+            crate::host_decide::read_reply(reply, Some(ID))
+        else {
+            panic!("the contract's answer");
+        };
+        assert_eq!(answer.v, 1, "the answer keeps its version");
+        assert_eq!(
+            answer.verdict,
+            innerwarden_agent_guard::identity::Verdict::Deny
+        );
+        assert_eq!(answer.withheld.as_deref(), Some("a_word_never_heard"));
+    }
+
     /// A server of the agent's own that holds the right key would still have
     /// to answer for this instance: an allow for another is not taken.
     #[test]
