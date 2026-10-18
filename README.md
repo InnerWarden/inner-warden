@@ -75,8 +75,9 @@ only — no IP, no host data; set `INNERWARDEN_NO_TELEMETRY=1` to disable). A
 - AI Jail: run an agent in a constrained profile so a screened-and-denied action
   is stopped rather than merely flagged. Linux (bubblewrap) and macOS
   (sandbox-exec) only; `contain` exits with an explicit error on Windows rather
-  than pretending to isolate. On Linux every jail starts its programs under a
-  seccomp filter that refuses injecting keystrokes into your terminal.
+  than pretending to isolate. On Linux, where the host takes it, every jail
+  starts its programs under a seccomp filter that refuses `TIOCSTI` and
+  `TIOCLINUX`, the terminal commands that push input into your terminal.
 - Agent identity (off by default, Linux): `innerwarden contain --identity --
   <command>` records the run as an instance, so its hook and the dashboard can
   tell one agent's runs apart. See [Agent identity and trust](#agent-identity-and-trust).
@@ -206,16 +207,30 @@ applies to any program started in a jail under its agent's name: the type is
 the name given at launch.
 
 An identified jail starts its programs under a seccomp filter, in the style of
-Flatpak: no new user namespaces, no joining other namespaces, no injecting
-keystrokes into your terminal. Programs that need their own user namespace
-(Chromium's sandbox, rootless containers, an agent's own bubblewrap sandbox)
-do not work inside it; turn the agent's own sandbox off inside `innerwarden
-contain`. A jail started without `--identity` gets only the keystroke rule.
-Where the host cannot start a jail with the filter (a kernel without seccomp
-filters, a binary run under another architecture's emulation), the jail runs
-without it and `contain` says so when it starts.
+Flatpak: no new user namespaces, no joining other namespaces, and no `TIOCSTI`
+or `TIOCLINUX`, the terminal commands that push input into your terminal. Its
+programs run with no capability, also when `contain` itself runs as root.
+Programs that need their own user namespace (Chromium's sandbox, rootless
+containers, an agent's own bubblewrap sandbox) do not work inside it; turn the
+agent's own sandbox off inside `innerwarden contain`. A 32-bit program (i386
+or x32 on x86_64, arm on aarch64) is ended at its first call in an identified
+jail. A jail started without `--identity` gets only the terminal rule, and
+applies it to 32-bit programs too, which run in it as before.
 
-Limits: this is not yet proven on RHEL 9 or Rocky 9.
+Where the host cannot start a jail with the filter (a kernel without seccomp
+filters, a binary run under another architecture's emulation, a build for an
+architecture other than x86_64 or aarch64), the jail runs without it and
+`contain` says so when it starts. An identified jail whose host takes only
+the terminal filter gets that one, and `contain` says user namespaces stay
+open.
+
+Limits: the filter covers those terminal commands only. The jail shares the
+host's network, so a program in it can still reach any abstract unix socket,
+a desktop's X server among them, and through X type into another window. On
+a kernel older than 4.8, a program in the jail that traces another can change
+a call after the filter has seen it: there an identified jail does not close
+user namespaces, and `contain` says the terminal rule is weaker. This is not
+yet proven on RHEL 9 or Rocky 9.
 
 ## Build from source
 
