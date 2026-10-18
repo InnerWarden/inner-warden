@@ -1127,7 +1127,8 @@ fn run_linux_identified(input: &JailInputs, bwrap: &Path, marks: bool) -> ExitCo
             eprintln!(
                 "innerwarden contain: {}",
                 crate::contain::launch::not_admitted_remedy(
-                    &crate::agent_profiles_io::files_that_wait_for_the_host(&input.args.agent)
+                    &crate::agent_profiles_io::files_that_wait_for_the_host(&input.args.agent),
+                    None
                 )
             );
             return ExitCode::from(2);
@@ -1322,6 +1323,29 @@ fn launch_identified(
         if let Err(why) = &record {
             eprintln!("innerwarden contain: no instance record written ({why})");
         }
+        // The host was asked, but without its key its answer was never
+        // read: say so, rather than send the person to check a host that
+        // may well be running.
+        let unbelieved = (record.is_ok() && crate::upsell_io::active_defence_installed())
+            .then(|| {
+                crate::contain::launch::answer_unbelieved(
+                    key.is_some(),
+                    crate::agent_report::agent_route(
+                        std::env::var(crate::agent_report::AGENT_URL_VAR)
+                            .ok()
+                            .as_deref(),
+                        innerwarden_agent_guard::identity::SYSTEM_SCOPE_ROUTE,
+                    )
+                    .as_deref(),
+                )
+            })
+            .flatten();
+        if let Some(why) = &unbelieved {
+            eprintln!(
+                "innerwarden contain: {}",
+                crate::contain::launch::unbelieved_sentence(why)
+            );
+        }
         eprintln!(
             "innerwarden contain: {}",
             crate::contain::launch::NOT_ADMITTED
@@ -1329,7 +1353,8 @@ fn launch_identified(
         eprintln!(
             "innerwarden contain: {}",
             crate::contain::launch::not_admitted_remedy(
-                &crate::agent_profiles_io::files_that_wait_for_the_host(&input.args.agent)
+                &crate::agent_profiles_io::files_that_wait_for_the_host(&input.args.agent),
+                unbelieved.as_ref()
             )
         );
         end_jail(&mut child, reported);

@@ -2184,10 +2184,55 @@ pub mod launch {
         }
     }
 
+    /// Why the launcher could not believe what the host answered about the
+    /// jail ([`answer_unbelieved`]).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum Unbelieved {
+        /// It holds no key of Active Defence on this host.
+        NoKey,
+        /// The local agent's address (`url`) is not one a connection is held
+        /// to the host's key over.
+        Address(String),
+    }
+
+    /// PURE. Why the launcher could not believe the host's answer to its
+    /// request for a system scope, or `None` when it could: it holds the
+    /// host's key (`key_held`) and the local agent's address (`url`, `None`
+    /// when the route is off and nothing was asked) is one a connection is
+    /// held to it over. Without both, the answer's body is never read and
+    /// nothing is admitted.
+    pub fn answer_unbelieved(key_held: bool, url: Option<&str>) -> Option<Unbelieved> {
+        let url = url?;
+        if !key_held {
+            return Some(Unbelieved::NoKey);
+        }
+        (!crate::host_decide_io::pinnable(url)).then(|| Unbelieved::Address(url.to_string()))
+    }
+
+    /// PURE. The line the launcher says, before [`NOT_ADMITTED`], when it
+    /// could not believe the host's answer.
+    pub fn unbelieved_sentence(why: &Unbelieved) -> String {
+        match why {
+            Unbelieved::NoKey => format!(
+                "the host's answer about this jail cannot be believed without its key, and this \
+                 launcher holds none ({} is not there, or not root's in folders only root can \
+                 write)",
+                innerwarden_agent_guard::identity::AGENT_TLS_SPKI_PATH
+            ),
+            Unbelieved::Address(url) => format!(
+                "the host's answer about this jail cannot be believed: it is held to the host's \
+                 key only at https://127.0.0.1, and the local agent's address is {url}"
+            ),
+        }
+    }
+
     /// PURE. What the launcher says after [`NOT_ADMITTED`]: what to check,
     /// and which file makes the jail wait for the host (`files`, by path;
-    /// both places when it could not tell).
-    pub fn not_admitted_remedy(files: &[String]) -> String {
+    /// both places when it could not tell). `unbelieved`: the launcher
+    /// could not believe the host's answer ([`answer_unbelieved`]), so
+    /// what to check is its key or the agent's address, not whether Active
+    /// Defence runs.
+    pub fn not_admitted_remedy(files: &[String], unbelieved: Option<&Unbelieved>) -> String {
         let place = if files.is_empty() {
             format!(
                 "{} or ~/{}",
@@ -2197,10 +2242,22 @@ pub mod launch {
         } else {
             files.join(" and ")
         };
+        let check = match unbelieved {
+            None => "Check that Active Defence is running (systemctl status innerwarden-agent)"
+                .to_string(),
+            Some(Unbelieved::NoKey) => format!(
+                "Check that Active Defence on this host publishes its key at {}, root's, in \
+                 folders only root can write (an older Active Defence does not)",
+                innerwarden_agent_guard::identity::AGENT_TLS_SPKI_PATH
+            ),
+            Some(Unbelieved::Address(_)) => format!(
+                "Unset {}, or point it at https://127.0.0.1",
+                crate::agent_report::AGENT_URL_VAR
+            ),
+        };
         format!(
-            "Check that Active Defence is running (systemctl status innerwarden-agent), then \
-             try again. The jail waits for it because of start = \"only_when_admitted\" in \
-             {place}."
+            "{check}, then try again. The jail waits for it because of start = \
+             \"only_when_admitted\" in {place}."
         )
     }
 
@@ -5734,16 +5791,71 @@ mod tests {
         assert!(!admission.admitted);
         assert!(taken.unwrap_err().contains("Active Defence is not running"));
         assert_eq!(
-            launch::not_admitted_remedy(&[
-                "/home/dev/.config/innerwarden/agent-profiles.toml".into()
-            ]),
+            launch::not_admitted_remedy(
+                &["/home/dev/.config/innerwarden/agent-profiles.toml".into()],
+                None
+            ),
             "Check that Active Defence is running (systemctl status innerwarden-agent), then try \
              again. The jail waits for it because of start = \"only_when_admitted\" in \
              /home/dev/.config/innerwarden/agent-profiles.toml."
         );
-        assert!(launch::not_admitted_remedy(&[]).ends_with(
+        assert!(launch::not_admitted_remedy(&[], None).ends_with(
             "in /etc/innerwarden/agent-profiles.toml or ~/.config/innerwarden/agent-profiles.toml."
         ));
+    }
+
+    /// A launcher that holds no key of the host's (an older Active Defence
+    /// that publishes none), or that asks the host at an address its key
+    /// is not held over, never reads the answer, so nothing is admitted.
+    /// It says so, naming the key's file or the address, and its remedy is
+    /// that, not "check that Active Defence is running": the same launch
+    /// has just printed the system scope Active Defence placed the jail in.
+    ///
+    /// FAILS ON REVERT: answer `None` in `answer_unbelieved` (the launcher
+    /// before this one) and a launcher with no key says nothing of it and
+    /// sends the person to check that Active Defence runs.
+    #[test]
+    fn a_launcher_that_cannot_believe_the_host_says_why() {
+        use launch::{answer_unbelieved, not_admitted_remedy, unbelieved_sentence, Unbelieved};
+        let pinned = "https://127.0.0.1:8787/api/agent/contain-scope";
+        assert_eq!(answer_unbelieved(true, Some(pinned)), None);
+        // Nothing was asked: nothing to believe or not.
+        assert_eq!(answer_unbelieved(false, None), None);
+        assert_eq!(
+            answer_unbelieved(false, Some(pinned)),
+            Some(Unbelieved::NoKey)
+        );
+        let elsewhere = "http://127.0.0.1:8787/api/agent/contain-scope";
+        assert_eq!(
+            answer_unbelieved(true, Some(elsewhere)),
+            Some(Unbelieved::Address(elsewhere.into()))
+        );
+        let no_key = unbelieved_sentence(&Unbelieved::NoKey);
+        assert!(
+            no_key.contains("cannot be believed without its key"),
+            "{no_key}"
+        );
+        assert!(
+            no_key.contains(innerwarden_agent_guard::identity::AGENT_TLS_SPKI_PATH),
+            "{no_key}"
+        );
+        let remedy = not_admitted_remedy(&[], Some(&Unbelieved::NoKey));
+        assert!(
+            remedy.starts_with("Check that Active Defence on this host publishes its key at "),
+            "{remedy}"
+        );
+        assert!(!remedy.contains("systemctl status"), "{remedy}");
+        assert!(
+            remedy.contains("start = \"only_when_admitted\""),
+            "{remedy}"
+        );
+        let address = unbelieved_sentence(&Unbelieved::Address(elsewhere.into()));
+        assert!(address.contains(elsewhere), "{address}");
+        let remedy = not_admitted_remedy(&[], Some(&Unbelieved::Address(elsewhere.into())));
+        assert!(
+            remedy.starts_with("Unset INNERWARDEN_AGENT_URL"),
+            "{remedy}"
+        );
     }
 
     /// Under a profile that starts the jail only once the host admitted it,
