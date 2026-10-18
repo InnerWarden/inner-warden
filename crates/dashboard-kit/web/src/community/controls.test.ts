@@ -5,7 +5,7 @@ import agentsFixture from "../../tests/fixtures/community/agents.json";
 import protectionFixture from "../../tests/fixtures/community/protection.json";
 import { agentRows } from "./agentsView";
 import { readProtection } from "./api";
-import { communityControls, controlCounts, someRefuse } from "./controls";
+import { JAIL_ALIAS_WORDS, communityControls, controlCounts, someRefuse } from "./controls";
 import { legendWords } from "./Protection";
 
 const NOW = Date.parse("2026-09-29T14:05:00Z");
@@ -62,6 +62,26 @@ describe("Seen working", () => {
 
 describe("the other controls", () => {
   const protection = readProtection(protectionFixture);
+
+  /**
+   * The alias that starts Claude Code in the jail every time is offered,
+   * never applied: only where Claude Code is here and the jail is ready.
+   *
+   * FAILS ON REVERT: drop the alias from the AI Jail's line.
+   */
+  it("offers the alias that starts Claude Code in the jail, only where Claude Code is here", () => {
+    const rows = agentRows(agents);
+    expect(rows.some((row) => row.id === "claude-code")).toBe(true);
+    const jail = communityControls({ agents: rows, protection, now: NOW }).find((control) => control.key === "ai_jail")!;
+    expect(jail.line).toContain(JAIL_ALIAS_WORDS);
+    expect(JAIL_ALIAS_WORDS).toContain("alias claude='innerwarden contain --identity -- claude'");
+    const others = rows.filter((row) => row.id !== "claude-code");
+    const without = communityControls({ agents: others, protection, now: NOW }).find((control) => control.key === "ai_jail")!;
+    expect(without.line).not.toContain("alias claude");
+    const unavailable = communityControls({ agents: rows, protection: { ...protection, jail: { ...protection.jail, available: false } }, now: NOW })
+      .find((control) => control.key === "ai_jail")!;
+    expect(unavailable.line).not.toContain("alias claude");
+  });
 
   it("offers a template, never a command to copy as it is, where the reader must fill something in", () => {
     const controls = communityControls({ agents: agentRows(agents), protection, now: NOW });

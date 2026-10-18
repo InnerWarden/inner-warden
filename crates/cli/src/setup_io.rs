@@ -205,6 +205,25 @@ pub fn cmd(_rest: &[String]) -> ExitCode {
         }
     }
 
+    // ── 4. Claude Code in the AI Jail every time (optional, default no) ──────
+    let claude_here = detected.iter().any(|agent| {
+        innerwarden_agent_guard::agents::canonical(&agent.name)
+            .is_some_and(|known| known.name == "claude-code")
+    });
+    if claude_here && crate::contain_io::jail_backend().is_some() {
+        println!();
+        let want_jail = Confirm::with_theme(&theme)
+            .with_prompt(
+                "  Start Claude Code in the AI Jail every time? (adds one alias line to your shell)",
+            )
+            .default(false)
+            .interact()
+            .unwrap_or(false);
+        if want_jail {
+            add_jail_alias(&home);
+        }
+    }
+
     // ── Done + how to leave dry run ──────────────────────────────────────────
     if configured_in_monitor {
         println!("\n  ✓ Setup done - integrations are configured for DRY RUN.");
@@ -225,6 +244,52 @@ pub fn cmd(_rest: &[String]) -> ExitCode {
         );
     }
     ExitCode::SUCCESS
+}
+
+/// Add the AI Jail alias to the shell's startup file the person uses, once,
+/// and say what was done; for a shell this does not know, show the line.
+fn add_jail_alias(home: &std::path::Path) {
+    let shell = std::env::var("SHELL").ok();
+    let Some(file) = setup::jail_alias_file(shell.as_deref(), home, cfg!(target_os = "macos"))
+    else {
+        println!("  Add this line to your shell's startup file:");
+        println!("        {}", setup::JAIL_ALIAS_LINE);
+        return;
+    };
+    let existing = match std::fs::read_to_string(&file) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            eprintln!("  Could not read {}: {error}", file.display());
+            println!(
+                "  Add this line to it yourself:  {}",
+                setup::JAIL_ALIAS_LINE
+            );
+            return;
+        }
+    };
+    match setup::with_jail_alias(&existing) {
+        None => println!(
+            "  – {} already defines `claude`; left as it is.",
+            file.display()
+        ),
+        Some(text) => {
+            match std::fs::write(&file, text) {
+                Ok(()) => {
+                    println!("  ✓ Added to {}:", file.display());
+                    println!("        {}", setup::JAIL_ALIAS_LINE);
+                    println!("    Open a new terminal for it to take effect; remove the two lines to stop.");
+                }
+                Err(error) => {
+                    eprintln!("  Could not write {}: {error}", file.display());
+                    println!(
+                        "  Add this line to it yourself:  {}",
+                        setup::JAIL_ALIAS_LINE
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// What Telegram said when we asked which chat this bot can talk to.
