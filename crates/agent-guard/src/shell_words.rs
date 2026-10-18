@@ -18,7 +18,8 @@ pub(crate) enum Mark {
     /// Handed to the program as written: plain, quoted or escaped.
     Plain,
     /// An unquoted pattern character the shell may still act on: a glob's
-    /// `*`, `?` and `[`, and a brace expansion's `{`, `}`, `,` and `..`.
+    /// `*` and `?`, a bracket expression whole (`[`, its members and its
+    /// `]`), and a brace expansion's `{`, `}`, `,` and `..`.
     Pattern,
     /// Text the shell replaces when it runs the line: a parameter, a command
     /// or process substitution, arithmetic, or a quote that never closes.
@@ -283,7 +284,23 @@ impl Lexer {
             }
             '$' => self.dollar(false),
             '`' => self.backtick(),
-            '*' | '?' | '[' => {
+            // A bracket expression matches one character with the whole of
+            // it, its members and its `]` included: none of them is handed
+            // to the program as written.
+            '[' => match bracket_end(&self.chars, self.at) {
+                Some(end) => {
+                    for at in self.at..=end {
+                        let member = self.chars[at];
+                        self.word().push(member, Mark::Pattern);
+                    }
+                    self.at = end + 1;
+                }
+                None => {
+                    self.word().push(c, Mark::Pattern);
+                    self.at += 1;
+                }
+            },
+            '*' | '?' => {
                 self.word().push(c, Mark::Pattern);
                 self.at += 1;
             }
@@ -580,6 +597,54 @@ impl Lexer {
     }
 }
 
+/// The `]` that closes the bracket expression whose `[` is at `open`: an
+/// optional `!` or `^`, a first member that may be `]`, then members up to
+/// the next `]`, all in the same word and none of them quoted, escaped or
+/// expanded. `None` when there is no such `]`: the `[` is then a character
+/// of its own.
+fn bracket_end(chars: &[char], open: usize) -> Option<usize> {
+    let mut at = open + 1;
+    if matches!(chars.get(at), Some('!' | '^')) {
+        at += 1;
+    }
+    if chars.get(at) == Some(&']') {
+        at += 1;
+    }
+    while let Some(&c) = chars.get(at) {
+        match c {
+            ']' => return Some(at),
+            ' ' | '\t' | '\n' | ';' | '&' | '|' | '(' | ')' | '<' | '>' | '\'' | '"' | '\\'
+            | '$' | '`' => return None,
+            _ => at += 1,
+        }
+    }
+    None
+}
+
+/// The characters of a word as written and how the shell treats each of
+/// them, read as a glob: `*`, `?` and a whole bracket expression are
+/// patterns, every other character is taken as written.
+pub(crate) fn glob_marks(text: &str) -> (Vec<char>, Vec<Mark>) {
+    let chars: Vec<char> = text.chars().collect();
+    let mut marks = vec![Mark::Plain; chars.len()];
+    let mut at = 0;
+    while at < chars.len() {
+        match chars[at] {
+            '*' | '?' => marks[at] = Mark::Pattern,
+            '[' => {
+                let end = bracket_end(&chars, at).unwrap_or(at);
+                for mark in &mut marks[at..=end] {
+                    *mark = Mark::Pattern;
+                }
+                at = end;
+            }
+            _ => {}
+        }
+        at += 1;
+    }
+    (chars, marks)
+}
+
 /// A quote that never closes: the shell refuses the line or waits for
 /// more, so nothing read since `start` is taken as written.
 fn never_closed(word: &mut Word, start: usize, quote: char) {
@@ -824,6 +889,50 @@ mod tests {
         assert_eq!(line.nested, ["Y", "w", "v"]);
         // A quote that never closes is not taken as written.
         assert!(!read_line("a 'agent").commands[0].words[1].is_plain());
+    }
+
+    /// A bracket expression is a pattern whole: its members and its `]`
+    /// are not handed to the program as written, so what is left as
+    /// written of `innerwarden-ct[l]` is `innerwarden-ct`. A `[` with no
+    /// `]` in its word (`test`'s `[`) is the only pattern character.
+    ///
+    /// FAILS ON REVERT: mark only the `[` as a pattern and the `l]`, the
+    /// `w]` and the `a-z]` read as written.
+    #[test]
+    fn a_bracket_expression_is_a_pattern_whole() {
+        use super::Mark::{Pattern, Plain};
+        let line = read_line("innerwarden-ct[l] inner[w]arden [a-z]nner [!x]y [ -f x ] a[]b]c");
+        let w = &line.commands[0].words;
+        let pattern_chars = |word: &Word| -> String {
+            word.text
+                .chars()
+                .zip(&word.marks)
+                .filter(|(_, mark)| **mark == Pattern)
+                .map(|(c, _)| c)
+                .collect()
+        };
+        assert_eq!(pattern_chars(&w[0]), "[l]");
+        assert_eq!(pattern_chars(&w[1]), "[w]");
+        assert_eq!(pattern_chars(&w[2]), "[a-z]");
+        assert_eq!(pattern_chars(&w[3]), "[!x]");
+        assert_eq!(pattern_chars(&w[4]), "[");
+        assert!(w[7].is_plain() && w[7].text == "]");
+        assert_eq!(pattern_chars(&w[8]), "[]b]");
+        // Quoted, it is text.
+        assert!(read_line("'inner[w]arden'").commands[0].words[0].is_plain());
+        // The same reading of a word already split from its line.
+        let (chars, marks) = glob_marks("inner[w]arden");
+        assert_eq!(chars.len(), marks.len());
+        assert_eq!(
+            marks,
+            [
+                [Plain; 5].as_slice(),
+                [Pattern; 3].as_slice(),
+                [Plain; 5].as_slice()
+            ]
+            .concat()
+        );
+        assert_eq!(glob_marks("a[b").1, [Plain, Pattern, Plain]);
     }
 
     /// Substitutions are command lines of their own, found wherever they

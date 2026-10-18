@@ -622,9 +622,17 @@ pub fn check_guard_self_disable(content: &str) -> Option<(&'static str, u32)> {
         // from a pattern (`inner*-ctl`, `inner{w..w}arden`) only reads as
         // one once the shell's reading is applied. Without an expansion, a
         // quote, an escape or a pattern there is nothing to assemble, so
-        // the rewrite is skipped.
+        // the rewrite is skipped. A guard program under a name of its own
+        // (a copy, a link, a build run by name) still takes `agent kernel`.
         if !content.contains(['$', '`', '\'', '"', '\\', '{', '*', '?', '[']) {
-            return None;
+            let renamed = mentions_any(content, &["kernel"]) && changes_kernel_protection(content);
+            return renamed.then_some((KERNEL_PROTECTION_CHANGE, 60));
+        }
+        if guard_words_in(content, 0, false, true, Look::ExecGate) {
+            return Some((EXEC_GATE_AUTHORISED, 60));
+        }
+        if guard_words_in(content, 0, false, true, Look::Disarm) {
+            return Some((GUARD_DISARMED, 60));
         }
         if changes_kernel_protection(content) {
             return Some((KERNEL_PROTECTION_CHANGE, 60));
@@ -653,6 +661,15 @@ pub fn check_guard_self_disable(content: &str) -> Option<(&'static str, u32)> {
 /// What [`check_guard_self_disable`] says of a change of the kernel
 /// protection ([`changes_kernel_protection`]).
 const KERNEL_PROTECTION_CHANGE: &str = "changes the kernel protection that contains it";
+
+/// What [`check_guard_self_disable`] says of the guard's `exec-gate` run to
+/// authorise or disarm.
+const EXEC_GATE_AUTHORISED: &str =
+    "authorises or disarms the kernel execution gate that is containing it";
+
+/// What [`check_guard_self_disable`] says of the guard's `disarm` and its
+/// `--self-approve`.
+const GUARD_DISARMED: &str = "disarms the guard, or asks it to authorise itself";
 
 /// What [`check_guard_self_disable`] says of the guard's own loosening
 /// verbs ([`runs_guard_loosening_verb`]).
@@ -706,7 +723,7 @@ fn guard_self_disable_in(content: &str) -> Option<(&'static str, u32)> {
         // Authorising the kernel gate from inside the thing the gate contains.
         add(
             r#"(?i)\b(?:innerwarden(?:-ctl)?|iw(?:-guard)?)\b[^|;&]*\bexec-gate\b[^|;&]*\b(?:allow|approve|disarm)\b"#,
-            "authorises or disarms the kernel execution gate that is containing it",
+            EXEC_GATE_AUTHORISED,
             60,
         );
         // Round two of the same evaluation found these, all of which reach the
@@ -747,13 +764,22 @@ fn guard_self_disable_in(content: &str) -> Option<(&'static str, u32)> {
         );
         add(
             r#"(?i)\b(?:innerwarden(?:-ctl)?|iw(?:-guard)?)\b[^|;&]*\b(?:disarm|--self-approve)\b"#,
-            "disarms the guard, or asks it to authorise itself",
+            GUARD_DISARMED,
             60,
         );
         v
     });
     if let Some((_, what, score)) = res.iter().find(|(re, _, _)| re.is_match(content)) {
         return Some((*what, *score));
+    }
+    // The same two refusals on the words the shell hands the program: a
+    // guard program named by a glob, a bracket expression or a value the
+    // line assigned (`/usr/local/sbin/inner*-ctl exec-gate disarm`).
+    if guard_words_in(content, 0, false, true, Look::ExecGate) {
+        return Some((EXEC_GATE_AUTHORISED, 60));
+    }
+    if guard_words_in(content, 0, false, true, Look::Disarm) {
+        return Some((GUARD_DISARMED, 60));
     }
     if changes_kernel_protection(content) {
         return Some((KERNEL_PROTECTION_CHANGE, 60));
@@ -830,81 +856,232 @@ const KERNEL_TEXT_DEPTH: u8 = 4;
 /// `parallel`), a program named by a pattern or an expansion, and text that
 /// is run later (a shell's string, an interpreter's code, an alias, a
 /// variable, an array, a here-document) are each refused.
+///
+/// A program whatever its name counts where the shell runs the line as
+/// written (the line itself, a substitution, a shell's string): `agent`
+/// and `kernel` right after it, then a word that is not a read, is the
+/// guard's own verb under a name the text does not show to be the guard's
+/// (a copy or a link of it, a build of it run by name). A copy or a link
+/// the same line makes of a guard program is that program under its new
+/// name wherever the line reads.
 fn changes_kernel_protection(content: &str) -> bool {
-    kernel_protection_changed_in(content, 0, false)
+    guard_words_in(content, 0, false, true, Look::Kernel)
 }
 
-/// [`changes_kernel_protection`] on text read `depth` levels in. `later`:
-/// the text is kept to be run later (an alias, a variable, an array), so
-/// more words may follow what it shows.
-fn kernel_protection_changed_in(text: &str, depth: u8, later: bool) -> bool {
+/// What a reading of a command line's words looks for
+/// ([`guard_words_in`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Look {
+    /// A change of the kernel protection ([`changes_kernel_protection`]).
+    Kernel,
+    /// The guard's `exec-gate`, run to authorise or disarm the kernel
+    /// execution gate.
+    ExecGate,
+    /// The guard's `disarm`, or its `--self-approve`.
+    Disarm,
+}
+
+impl Look {
+    /// Whether a word that runs a program of this kind (`program`), with
+    /// the words after it (`arguments`), is what is looked for. `fed`: a
+    /// program before it adds words of its own; `later`: the text is kept
+    /// to be run later; `runs`: the shell runs the text as written.
+    fn found(
+        self,
+        program: GuardProgram,
+        arguments: &[crate::shell_words::Word],
+        fed: bool,
+        later: bool,
+        runs: bool,
+    ) -> bool {
+        let says = |word: &crate::shell_words::Word, verb: &str| {
+            word.is_plain() && word.text.eq_ignore_ascii_case(verb)
+        };
+        match (self, program) {
+            (Look::Kernel, GuardProgram::Is) => kernel_arguments_change(arguments, fed, later),
+            (Look::Kernel, GuardProgram::Maybe) => {
+                kernel_verb_changes(arguments, fed, later).unwrap_or(false)
+            }
+            (Look::Kernel, GuardProgram::Not) => {
+                runs && !later && guard_verbs_after_any_program(arguments)
+            }
+            (Look::ExecGate, GuardProgram::Is | GuardProgram::Maybe) => arguments
+                .iter()
+                .position(|word| says(word, "exec-gate"))
+                .is_some_and(|gate| {
+                    arguments[gate + 1..].iter().any(|word| {
+                        ["allow", "approve", "disarm"]
+                            .iter()
+                            .any(|verb| says(word, verb))
+                    })
+                }),
+            (Look::Disarm, GuardProgram::Is) => arguments
+                .iter()
+                .any(|word| says(word, "disarm") || says(word, "--self-approve")),
+            (Look::Disarm, GuardProgram::Maybe) => {
+                arguments.iter().any(|word| says(word, "--self-approve"))
+            }
+            (Look::ExecGate | Look::Disarm, GuardProgram::Not) => false,
+        }
+    }
+
+    /// Whether code (an interpreter's, or text run as code) holds it.
+    fn in_code(self, text: &str) -> bool {
+        self == Look::Kernel && code_changes_kernel_protection(text)
+    }
+
+    /// What text read deeper than [`KERNEL_TEXT_DEPTH`] is taken for.
+    fn too_deep(self, text: &str) -> bool {
+        self == Look::Kernel && names_a_guard_program(text)
+    }
+}
+
+/// Whether the words of `text`, read `depth` levels in, hold what `look`
+/// looks for. `later`: the text is kept to be run later (an alias, a
+/// variable, an array), so more words may follow what it shows. `runs`: the
+/// shell runs the text as written.
+fn guard_words_in(text: &str, depth: u8, later: bool, runs: bool, look: Look) -> bool {
     use crate::shell_words::read_line;
     if depth > KERNEL_TEXT_DEPTH {
-        return names_a_guard_program(text);
+        return look.too_deep(text);
     }
     let line = read_line(text);
     let names = names_given_a_guard_program(&line);
-    let run_as_text = |inner: &str, later: bool| {
-        kernel_protection_changed_in(inner, depth + 1, later)
-            || code_changes_kernel_protection(inner)
+    let assigned = values_assigned(&line);
+    let run_as_text = |inner: &str, later: bool, runs: bool| {
+        guard_words_in(inner, depth + 1, later, runs, look) || look.in_code(inner)
     };
-    for (index, command) in line.commands.iter().enumerate() {
-        if command_only_shows_text(&line.commands, index) {
-            continue;
-        }
-        let words = &command.words;
-        if words_change_kernel_protection(words, &names, later) {
-            return true;
-        }
-        // What a substitution prints becomes words of this command.
-        if words.iter().any(|word| !word.substitutions.is_empty()) {
-            let shown = words_with_substitutions_shown(words);
-            if words_change_kernel_protection(&shown, &names, later) {
+    // A word that holds text the shell or a program may run: an
+    // assignment's value, a word shaped like a command line, the value of
+    // an option given with it.
+    let runs_text_of = |word: &crate::shell_words::Word, later: bool, runs: bool| {
+        if let Some((_, value)) = assignment_parts(word) {
+            if guard_words_in(value, depth + 1, true, false, look) {
                 return true;
             }
         }
-        for word in words {
-            if let Some((_, value)) = assignment_parts(word) {
-                if kernel_protection_changed_in(value, depth + 1, true) {
+        may_be_a_command_line(word)
+            && (run_as_text(&word.text, later, runs)
+                || attached_option_values(word)
+                    .iter()
+                    .any(|value| run_as_text(value, later, false)))
+    };
+    for (index, command) in line.commands.iter().enumerate() {
+        let words = &command.words;
+        if command_only_shows_text(&line.commands, index) {
+            // What it shows runs nothing, but a variable set in front of it
+            // may name a program it runs (`GIT_EXTERNAL_DIFF=`, `LESSOPEN=`,
+            // `GIT_EDITOR=`, `GH_BROWSER=`).
+            let in_front = words
+                .iter()
+                .take_while(|word| assignment_parts(word).is_some());
+            for word in in_front {
+                if runs_text_of(word, later, false) {
                     return true;
                 }
             }
-            if may_be_a_command_line(word) && run_as_text(&word.text, later) {
+            continue;
+        }
+        let runs_here = runs && !later;
+        let found_in = |words: &[crate::shell_words::Word]| {
+            words.iter().enumerate().any(|(at, word)| {
+                look.found(
+                    guard_program(word, &names, &assigned),
+                    &words[at + 1..],
+                    words_are_fed(&words[..at]),
+                    later,
+                    runs_here,
+                )
+            })
+        };
+        if found_in(words) {
+            return true;
+        }
+        // What a substitution prints becomes words of this command.
+        if words.iter().any(|word| !word.substitutions.is_empty())
+            && found_in(&words_with_substitutions_shown(words))
+        {
+            return true;
+        }
+        // Text handed to a shell is run as written.
+        let to_a_shell = runs_here && hands_its_text_to_a_shell(words);
+        for word in words {
+            if runs_text_of(word, later, to_a_shell) {
                 return true;
             }
         }
-        if command.inputs.iter().any(|input| run_as_text(input, later)) {
+        if command
+            .inputs
+            .iter()
+            .any(|input| run_as_text(input, later, to_a_shell))
+        {
             return true;
         }
     }
     line.nested
         .iter()
-        .any(|inner| kernel_protection_changed_in(inner, depth + 1, later))
+        .any(|inner| guard_words_in(inner, depth + 1, later, runs, look))
         || line
             .arrays
             .iter()
-            .any(|list| kernel_protection_changed_in(list, depth + 1, true))
+            .any(|list| guard_words_in(list, depth + 1, true, false, look))
 }
 
-/// Whether one of the words of a simple command is a guard program run with
-/// words that change the kernel protection.
-fn words_change_kernel_protection(
-    words: &[crate::shell_words::Word],
-    names: &[String],
-    later: bool,
-) -> bool {
-    words.iter().enumerate().any(|(at, word)| {
-        let arguments = &words[at + 1..];
-        match guard_program(word, names) {
-            GuardProgram::Is => {
-                kernel_arguments_change(arguments, words_are_fed(&words[..at]), later)
-            }
-            GuardProgram::Maybe => {
-                kernel_verb_changes(arguments, words_are_fed(&words[..at]), later).unwrap_or(false)
-            }
-            GuardProgram::Not => false,
-        }
+/// `agent` and `kernel` as written right after a program (options, and a
+/// `host` before `agent`, aside), then a word that is not a read
+/// ([`KERNEL_PROTECTION_READS`]): the guard's own verb under a name the text
+/// does not show to be the guard's.
+fn guard_verbs_after_any_program(arguments: &[crate::shell_words::Word]) -> bool {
+    let says = |word: &crate::shell_words::Word, verb: &str| {
+        word.is_plain() && word.text.eq_ignore_ascii_case(verb)
+    };
+    let option = |word: &crate::shell_words::Word| {
+        word.is_plain() && word.text.len() > 1 && word.text.starts_with('-')
+    };
+    let mut rest = arguments
+        .iter()
+        .skip_while(|word| option(word) || says(word, "host"));
+    if !rest.next().is_some_and(|word| says(word, "agent")) {
+        return false;
+    }
+    let mut rest = rest.skip_while(|word| option(word));
+    if !rest.next().is_some_and(|word| says(word, "kernel")) {
+        return false;
+    }
+    rest.any(|word| !(word.is_plain() && KERNEL_PROTECTION_READS.contains(&word.text.as_str())))
+}
+
+/// Whether a simple command hands text of its own to a shell that runs
+/// it: one of its words is a shell ([`SHELLS`]) or `eval`.
+fn hands_its_text_to_a_shell(words: &[crate::shell_words::Word]) -> bool {
+    words.iter().any(|word| {
+        let lower = word.text.to_ascii_lowercase();
+        let program = token_basename(&lower);
+        word.is_plain() && (SHELLS.contains(&program) || program == "eval")
     })
+}
+
+/// What an option given with its value hands a program, when the word may
+/// be a command line: the value of `--name=value`, and each ending of
+/// `-xvalue` after one to four option letters (`-O<command>`,
+/// `-nO<command>`).
+fn attached_option_values(word: &crate::shell_words::Word) -> Vec<&str> {
+    let text = word.text.as_str();
+    if let Some(long) = text.strip_prefix("--") {
+        return long
+            .split_once('=')
+            .map(|(_, value)| vec![value])
+            .unwrap_or_default();
+    }
+    if !text.starts_with('-') {
+        return Vec::new();
+    }
+    let letters = text[1..]
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric())
+        .count()
+        .min(4);
+    (2..=letters + 1).map(|cut| &text[cut..]).collect()
 }
 
 /// What a word says of the program it runs.
@@ -918,7 +1095,15 @@ enum GuardProgram {
     Not,
 }
 
-fn guard_program(word: &crate::shell_words::Word, names: &[String]) -> GuardProgram {
+/// What `word` runs. `names`: the names the line gave a guard program
+/// ([`names_given_a_guard_program`]); `assigned`: the values the line
+/// assigned ([`values_assigned`]), put in place of a `$NAME` or `${NAME}`
+/// in the word.
+fn guard_program(
+    word: &crate::shell_words::Word,
+    names: &[String],
+    assigned: &[(String, crate::shell_words::Word)],
+) -> GuardProgram {
     use crate::shell_words::Mark;
     let (last, marks) = word.last_component();
     if marks.iter().all(|mark| *mark == Mark::Plain) {
@@ -935,7 +1120,14 @@ fn guard_program(word: &crate::shell_words::Word, names: &[String]) -> GuardProg
             let text = word.text.to_ascii_lowercase();
             text == format!("${name}") || text == format!("${{{name}}}")
         });
-        return if named || runs_a_guard_program_by_name(&word.text) {
+        let spelled = || {
+            with_values_assigned(word, assigned).is_some_and(|words| {
+                words
+                    .iter()
+                    .any(|word| matches!(guard_program(word, names, &[]), GuardProgram::Is))
+            })
+        };
+        return if named || runs_a_guard_program_by_name(&word.text) || spelled() {
             GuardProgram::Is
         } else {
             GuardProgram::Maybe
@@ -1084,7 +1276,9 @@ fn words_with_substitutions_shown(
 
 /// The names a line gives a guard program: `alias k=...`, `IW=...`,
 /// `export IW=...`, each lowercase, so a later `k ...` or `$IW ...` is the
-/// program it names.
+/// program it names; and the name a copy or a link of one is made under
+/// (`cp /usr/local/bin/innerwarden-ctl ./k`, `ln -s ... ~/bin/k`), so a
+/// later `./k ...` or `k ...` is that program.
 fn names_given_a_guard_program(line: &crate::shell_words::Line) -> Vec<String> {
     let mut names = Vec::new();
     for word in line.commands.iter().flat_map(|command| &command.words) {
@@ -1095,12 +1289,155 @@ fn names_given_a_guard_program(line: &crate::shell_words::Line) -> Vec<String> {
             .commands
             .iter()
             .flat_map(|command| &command.words)
-            .any(|word| matches!(guard_program(word, &[]), GuardProgram::Is));
+            .any(|word| matches!(guard_program(word, &[], &[]), GuardProgram::Is));
         if names_one {
             names.push(name.to_ascii_lowercase());
         }
     }
+    for command in &line.commands {
+        let words = &command.words;
+        let Some(at) = words.iter().position(|word| {
+            word.is_plain()
+                && FILE_COPIERS.contains(&token_basename(&word.text.to_ascii_lowercase()))
+        }) else {
+            continue;
+        };
+        let Some((target, sources)) = words[at + 1..].split_last() else {
+            continue;
+        };
+        let copies_one = sources
+            .iter()
+            .any(|word| matches!(guard_program(word, &[], &[]), GuardProgram::Is));
+        if copies_one && target.is_plain() {
+            let lower = target.text.trim_end_matches('/').to_ascii_lowercase();
+            let name = token_basename(&lower);
+            if !name.is_empty() && !names.iter().any(|seen| seen == name) {
+                names.push(name.to_string());
+            }
+        }
+    }
     names
+}
+
+/// Programs that put a file under a name the command line chooses: a copy,
+/// a link or a move of a guard program is that program under its new name.
+const FILE_COPIERS: &[&str] = &[
+    "cp", "gcp", "ln", "gln", "install", "ginstall", "mv", "gmv", "rsync", "ditto",
+];
+
+/// The values a line assigns as written (`NAME=value`), each name with the
+/// value's characters and how the shell treats them: what a later `$NAME`
+/// or `${NAME}` on the line stands for. A value appended to (`NAME+=`) is
+/// left out: what the name holds is not shown. A value's `*`, `?` and
+/// bracket expression are taken as patterns, as an unquoted `$NAME` makes
+/// them.
+fn values_assigned(line: &crate::shell_words::Line) -> Vec<(String, crate::shell_words::Word)> {
+    use crate::shell_words::{glob_marks, Mark, Word};
+    let mut assigned = Vec::new();
+    for word in line.commands.iter().flat_map(|command| &command.words) {
+        let Some((name, value)) = assignment_parts(word) else {
+            continue;
+        };
+        if word.text[name.len()..].starts_with("+=") {
+            continue;
+        }
+        let from = name.chars().count() + 1;
+        let (_, globs) = glob_marks(value);
+        let marks = word.marks[from..]
+            .iter()
+            .zip(globs)
+            .map(
+                |(mark, glob)| {
+                    if *mark == Mark::Plain {
+                        glob
+                    } else {
+                        *mark
+                    }
+                },
+            )
+            .collect();
+        assigned.push((
+            name.to_string(),
+            Word {
+                text: value.to_string(),
+                marks,
+                ..Word::default()
+            },
+        ));
+    }
+    assigned
+}
+
+/// How many words [`with_values_assigned`] makes at most.
+const MAX_ASSIGNED_SPELLINGS: usize = 16;
+
+/// `word` with each `$NAME` and `${NAME}` in it replaced by a value the
+/// line assigned that name ([`values_assigned`]): one word per way the
+/// values combine. `None` when an expansion in it is anything else, names
+/// a name the line did not assign, or the ways are too many.
+fn with_values_assigned(
+    word: &crate::shell_words::Word,
+    assigned: &[(String, crate::shell_words::Word)],
+) -> Option<Vec<crate::shell_words::Word>> {
+    use crate::shell_words::{Mark, Word};
+    let chars: Vec<char> = word.text.chars().collect();
+    let mut spellings = vec![Word::default()];
+    let mut at = 0;
+    while at < chars.len() {
+        if word.marks[at] != Mark::Expansion {
+            for spelling in &mut spellings {
+                spelling.text.push(chars[at]);
+                spelling.marks.push(word.marks[at]);
+            }
+            at += 1;
+            continue;
+        }
+        if chars[at] != '$' {
+            return None;
+        }
+        let (name, end) = if chars.get(at + 1) == Some(&'{') {
+            let close = (at + 2..chars.len()).find(|&i| chars[i] == '}')?;
+            (chars[at + 2..close].iter().collect::<String>(), close + 1)
+        } else {
+            let end = (at + 1..chars.len())
+                .find(|&i| !(chars[i] == '_' || chars[i].is_ascii_alphanumeric()))
+                .unwrap_or(chars.len());
+            (chars[at + 1..end].iter().collect::<String>(), end)
+        };
+        let valid = name
+            .chars()
+            .next()
+            .is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
+            && name.chars().all(|c| c == '_' || c.is_ascii_alphanumeric());
+        if !valid
+            || word.marks[at..end]
+                .iter()
+                .any(|mark| *mark != Mark::Expansion)
+        {
+            return None;
+        }
+        let values: Vec<&Word> = assigned
+            .iter()
+            .filter(|(assigned_name, _)| *assigned_name == name)
+            .map(|(_, value)| value)
+            .collect();
+        if values.is_empty() || spellings.len() * values.len() > MAX_ASSIGNED_SPELLINGS {
+            return None;
+        }
+        spellings = spellings
+            .iter()
+            .flat_map(|spelling| {
+                values.iter().map(move |value| {
+                    let mut spelling = spelling.clone();
+                    spelling.text.push_str(&value.text);
+                    spelling.marks.extend(&value.marks);
+                    spelling
+                })
+            })
+            .collect();
+        at = end;
+    }
+    Some(spellings)
 }
 
 /// `name=value` (or `name+=value`) with the name as written: the name and
@@ -1131,7 +1468,10 @@ fn may_be_a_command_line(word: &crate::shell_words::Word) -> bool {
 /// words and its input included, and what it prints goes to no program nor
 /// file: a message (`echo`, `printf`, a commit's, a pull request's), a
 /// search (`grep`, `rg`, `journalctl`) or a reader (`cat`, `head`). Its
-/// words and its here-document name what they name; they run nothing.
+/// words and its here-document name what they name; they run nothing. An
+/// option that names a command it runs (`rg --pre`, `ack --pager`, a
+/// `less` start-up command, git's below) makes it no reader. A variable set
+/// in front of it is read by the caller ([`guard_words_in`]).
 fn command_only_shows_text(commands: &[crate::shell_words::Command], index: usize) -> bool {
     let command = &commands[index];
     let Some(at) = command
@@ -1151,11 +1491,17 @@ fn command_only_shows_text(commands: &[crate::shell_words::Command], index: usiz
         "printf" => {
             !command.writes_file && !arguments.iter().any(|word| word.text.starts_with("-v"))
         }
-        "grep" | "egrep" | "fgrep" | "ag" | "ack" | "journalctl" => true,
-        "cat" | "head" | "tail" | "less" | "more" | "wc" | "sort" | "uniq" | "nl" | "column" => {
-            !command.writes_file
+        "grep" | "egrep" | "fgrep" | "journalctl" => true,
+        "ag" | "ack" => !arguments
+            .iter()
+            .any(|word| word.text.starts_with("--pager")),
+        "less" | "more" => {
+            !command.writes_file && !arguments.iter().any(|word| word.text.starts_with('+'))
         }
-        "rg" => !arguments.iter().any(|word| word.text.starts_with("--pre")),
+        "cat" | "head" | "tail" | "wc" | "sort" | "uniq" | "nl" | "column" => !command.writes_file,
+        "rg" => !arguments
+            .iter()
+            .any(|word| word.text.starts_with("--pre") || word.text.starts_with("--hostname-bin")),
         "git" => git_only_shows_text(arguments),
         "gh" | "glab" => arguments
             .iter()
@@ -1168,7 +1514,9 @@ fn command_only_shows_text(commands: &[crate::shell_words::Command], index: usiz
 
 /// `git` with a message or a search: `commit`, `tag`, `notes`, `log`,
 /// `show`, `diff`, `blame`, `grep`, `shortlog`. Not with `-c`, which can
-/// name a command git runs.
+/// name a command git runs, nor with an option of the subcommand that runs
+/// one: `git grep -O<command>` (`--open-files-in-pager`), a diff's
+/// `--ext-diff` and `--textconv`, however git lets them be shortened.
 fn git_only_shows_text(arguments: &[crate::shell_words::Word]) -> bool {
     let mut words = arguments.iter();
     while let Some(word) = words.next() {
@@ -1180,7 +1528,7 @@ fn git_only_shows_text(arguments: &[crate::shell_words::Word]) -> bool {
             }
             text if text.starts_with('-') => {}
             subcommand => {
-                return matches!(
+                let reads = matches!(
                     subcommand,
                     "commit"
                         | "tag"
@@ -1191,11 +1539,34 @@ fn git_only_shows_text(arguments: &[crate::shell_words::Word]) -> bool {
                         | "blame"
                         | "grep"
                         | "shortlog"
-                )
+                );
+                return reads
+                    && !words.any(|option| git_option_runs_a_command(subcommand, &option.text));
             }
         }
     }
     false
+}
+
+/// Whether an option of git's `subcommand` runs a command: `-O` in a
+/// cluster of `git grep`'s short options (`-O<command>`, `-nO`), and a
+/// long option git takes for `--open-files-in-pager`, `--ext-diff` or
+/// `--textconv` (any start of the name it takes for the whole).
+fn git_option_runs_a_command(subcommand: &str, option: &str) -> bool {
+    if let Some(long) = option.strip_prefix("--") {
+        let name = long.split('=').next().unwrap_or(long);
+        return name.len() >= 2
+            && ["open-files-in-pager", "ext-diff", "textconv"]
+                .iter()
+                .any(|full| full.starts_with(name));
+    }
+    subcommand == "grep"
+        && option.strip_prefix('-').is_some_and(|short| {
+            short
+                .chars()
+                .take_while(char::is_ascii_alphanumeric)
+                .any(|c| c == 'O')
+        })
 }
 
 /// Whether what command `index` prints reaches a program through pipes
@@ -1653,26 +2024,16 @@ const ARGUMENT_FEEDERS: &[&str] = &["xargs", "parallel"];
 
 /// Whether a command word (lowercase, no folder) runs the Community CLI:
 /// `innerwarden`, the installer's copies of it (`iw`, `iw-guard`), or a
-/// glob that spells enough of `innerwarden` to match it (`inner*arden`).
+/// glob that spells enough of `innerwarden` to match it (`inner*arden`,
+/// `inner[w]arden`, `[i]nnerwarden`).
 fn is_guard_cli_name(base: &str) -> bool {
-    use crate::shell_words::Mark;
     if matches!(base, "innerwarden" | "iw" | "iw-guard") {
         return true;
     }
     if !base.contains(['*', '?', '[']) {
         return false;
     }
-    let chars: Vec<char> = base.chars().collect();
-    let marks: Vec<Mark> = chars
-        .iter()
-        .map(|c| {
-            if matches!(c, '*' | '?' | '[') {
-                Mark::Pattern
-            } else {
-                Mark::Plain
-            }
-        })
-        .collect();
+    let (chars, marks) = crate::shell_words::glob_marks(base);
     pattern_could_be(&chars, &marks, "innerwarden")
         && pattern_spells_out(&chars, &marks, "innerwarden")
 }
@@ -12134,7 +12495,22 @@ mod kernel_protection_tests {
     ///   empty `FD_EXEC_OPTIONS`: the `fd -X` line;
     /// - never read a pattern as a guard program's name in `guard_program`:
     ///   the two glob names (the brace names stay refused through
-    ///   `expand_braces`).
+    ///   `expand_braces`);
+    /// - mark only a bracket expression's `[` as a pattern in `shell_words`
+    ///   (its members and `]` as written): the four lines that name the
+    ///   program with one and hand it no `agent kernel` as written (the
+    ///   `echo ... > ~/w` line stays refused through its `echo`, whose words
+    ///   are the verbs after a program);
+    /// - never put a value the line assigned in place of `$NAME` in
+    ///   `guard_program`: the `${P}l` line;
+    /// - skip a reader without its variables in front in `guard_words_in`:
+    ///   the `GIT_EXTERNAL_DIFF`, `GIT_EDITOR`, `LESSOPEN`, `LESS` and
+    ///   `GH_BROWSER` lines;
+    /// - never take git's `-O` and `--open-files-in-pager` for options that
+    ///   run a command in `git_option_runs_a_command`: the four `git grep`
+    ///   lines; never read an option's attached value in `guard_words_in`
+    ///   (`attached_option_values`): the `-O` and `-nO` lines;
+    /// - read `less +...` and `ack --pager` as readers: those two lines.
     #[test]
     fn no_spelling_hides_a_change_of_the_kernel_protection() {
         let commands = [
@@ -12207,6 +12583,27 @@ mod kernel_protection_tests {
             "/usr/local/sbin/inner*-ctl agent kernel claude-code off",
             "sudo /usr/local/sbin/inner?arden-ctl agent kernel claude-code off",
             "innerwarden-ctl agent kerne? claude-code off",
+            // A bracket expression in the name, the verb hidden; a name
+            // split across a value the line assigned and a letter.
+            "W=\"agent kernel claude-code off\"; sudo /usr/local/bin/innerwarden-ct[l] $W",
+            "echo agent kernel claude-code off > ~/w; sudo /usr/local/bin/innerwarden-ct[l] $(<~/w)",
+            "sudo /usr/local/bin/innerwarden-ct[l] $(<~/w)",
+            "inner[w]arden-ctl $(cat /tmp/w)",
+            "/usr/local/bin/[a-z]nnerwarden-ctl $W",
+            "P=/usr/local/bin/innerwarden-ct; W=\"agent kernel claude-code off\"; ${P}l $W",
+            // A reader that runs a command it is handed: a variable in
+            // front of it, or an option of its own.
+            "GIT_EXTERNAL_DIFF='innerwarden-ctl agent kernel claude-code off;:' git diff",
+            "GIT_EDITOR='innerwarden-ctl agent kernel claude-code off;:' git commit --allow-empty -e -m x",
+            "LESSOPEN='|innerwarden-ctl agent kernel claude-code off %s' less /etc/hosts",
+            "LESS='+!innerwarden-ctl agent kernel claude-code off' less /etc/hosts",
+            "GH_BROWSER='sh -c \"innerwarden-ctl agent kernel claude-code off\"' gh pr view 1 --web",
+            "git grep -O'innerwarden-ctl agent kernel claude-code off;:' kernel",
+            "git grep -nO'innerwarden-ctl agent kernel claude-code off;:' kernel",
+            "git grep --open-files-in-pager='innerwarden-ctl agent kernel claude-code off;:' kernel",
+            "git grep --open='innerwarden-ctl agent kernel claude-code off;:' kernel",
+            "less '+!innerwarden-ctl agent kernel claude-code off' /etc/hosts",
+            "ack --pager='innerwarden-ctl agent kernel claude-code off' kernel",
             // Text a shell or a program reads as commands.
             "echo 'innerwarden-ctl agent kernel claude-code off' | sh",
             "bash <<< 'innerwarden-ctl agent kernel claude-code off'",
@@ -12284,6 +12681,19 @@ mod kernel_protection_tests {
             "iw dev wlan0 link",
             "sudo iw dev wlan0 set type monitor",
             "iw list",
+            // A variable in front of a reader that names no change, an
+            // option that runs nothing, a reader's own words.
+            "GIT_PAGER=cat git log --grep 'innerwarden-ctl agent kernel claude-code off'",
+            "LC_ALL=C grep -rn 'innerwarden-ctl agent kernel claude-code off' docs/",
+            "git grep -n 'innerwarden-ctl agent kernel claude-code off' docs/",
+            "git diff -Oorder.txt",
+            "less +F /var/log/innerwarden/agent.log",
+            // Words that only mention the kernel protection, as a renamed
+            // guard program would never be run.
+            "./k agent kernel status",
+            "./k agent kernel",
+            "MSG=\"feat: agent kernel protection\"; git commit -m \"$MSG\"",
+            "cat > notes.md <<'EOF'\nThe agent kernel protection is off by default.\nEOF",
         ];
         let refused: Vec<(&&str, Option<(&str, u32)>)> = commands
             .iter()
@@ -12294,14 +12704,22 @@ mod kernel_protection_tests {
     }
 
     /// The installer's copies of the CLI take its verbs, so the refusals of
-    /// the guard's own verbs hold for them; a brace expansion or a glob in
-    /// the name or the verb does not hide one.
+    /// the guard's own verbs hold for them; a brace expansion, a glob or a
+    /// bracket expression in the name or the verb does not hide one, nor a
+    /// name split across a value the line assigned. The `exec-gate`,
+    /// `disarm` and `--self-approve` refusals read the words the shell
+    /// hands the program, as the kernel one does, and say what they always
+    /// said.
     ///
     /// FAILS ON REVERT (each measured on the branch): take `iw` out of the
     /// three self-disable patterns and of `is_guard_cli_name` and the five
     /// `iw` lines before the kernel one are allowed; drop `expand_braces`
     /// from `normalize_block` and the two brace lines are; drop the pattern
-    /// branch of `is_guard_cli_name` and the glob line is.
+    /// branch of `is_guard_cli_name` and the glob line is; answer `false`
+    /// for `Look::ExecGate` and `Look::Disarm` in `Look::found` and the six
+    /// lines from `inner*-ctl exec-gate disarm` to `${P}l exec-gate disarm`
+    /// are; mark only the `[` as a pattern in `is_guard_cli_name` and the
+    /// three bracket loosening lines are.
     #[test]
     fn the_short_names_and_patterns_reach_the_guards_own_verbs() {
         let commands = [
@@ -12314,6 +12732,72 @@ mod kernel_protection_tests {
             "inner{w..w}arden allow \"*\"",
             "innerwarden-ctl exec-gate dis{a..a}rm",
             "/usr/local/bin/inner*arden mute every-rule",
+            "/usr/local/sbin/inner*-ctl exec-gate disarm",
+            "/usr/local/sbin/inner*-ctl disarm",
+            "/usr/local/sbin/inner*-ctl exec-gate allow /tmp/x",
+            "/usr/local/sbin/inner*-ctl host exec-gate disarm",
+            "/usr/local/bin/inner*arden-ctl --self-approve",
+            "P=/usr/local/sbin/innerwarden-ct; ${P}l exec-gate disarm",
+            "inner[w]arden allow '*'",
+            "[i]nnerwarden allow '*'",
+            "/usr/local/bin/[i]nnerwarden mute every-rule",
+        ];
+        let allowed: Vec<&&str> = commands
+            .iter()
+            .filter(|cmd| check_guard_self_disable(cmd).is_none())
+            .collect();
+        assert!(allowed.is_empty(), "allowed: {allowed:#?}");
+        for (cmd, said) in [
+            (
+                "/usr/local/sbin/inner*-ctl exec-gate disarm",
+                EXEC_GATE_AUTHORISED,
+            ),
+            ("/usr/local/sbin/[i]nnerwarden-ctl disarm", GUARD_DISARMED),
+            (
+                "/usr/local/bin/inner*arden-ctl --self-approve",
+                GUARD_DISARMED,
+            ),
+        ] {
+            assert_eq!(check_guard_self_disable(cmd), Some((said, 60)), "{cmd}");
+        }
+        // A bare pattern says too little to be a guard program: a word
+        // after it is the program's own.
+        for cmd in [
+            "cp * disarm",
+            "mv *.log exec-gate-allow/",
+            "ls [a-z]* disarm",
+        ] {
+            assert_eq!(check_guard_self_disable(cmd), None, "{cmd}");
+        }
+    }
+
+    /// A copy or a link the line makes of a guard program is that program
+    /// under its new name, wherever the line reads (a script it writes
+    /// too). Where the shell runs a line as written, `agent kernel` and a
+    /// word that is not a read right after any program is a change: the
+    /// guard under a name the text does not show (a copy made in an earlier
+    /// command, a build of it run by name). Words that only mention the
+    /// kernel protection stay allowed (see
+    /// `reading_the_kernel_protection_is_not_a_change`).
+    ///
+    /// FAILS ON REVERT (each measured on the branch): never take a copy's
+    /// or a link's name in `names_given_a_guard_program` and the script
+    /// line is allowed; answer `false` for `GuardProgram::Not` in
+    /// `Look::found` and the `./k`, `~/bin/k`, `--bin ctl`, `bash -c` and
+    /// substitution lines are.
+    #[test]
+    fn a_copy_or_a_link_of_the_guard_is_the_guard() {
+        let commands = [
+            "cp /usr/local/bin/innerwarden-ctl ./k && ./k agent kernel claude-code off",
+            "ln -s /usr/local/bin/innerwarden-ctl ~/bin/k && k agent kernel claude-code off",
+            "cp /usr/local/bin/innerwarden-ctl /tmp/k; /tmp/k agent kernel claude-code off",
+            "cat > /tmp/k.sh <<'EOF'\ncp /usr/local/sbin/innerwarden-ctl ./k\n./k agent kernel claude-code off\nEOF",
+            "./k agent kernel claude-code off",
+            "~/bin/k host agent --json kernel claude-code watch",
+            "cargo run --bin ctl -- agent kernel claude-code off",
+            "cargo run -p innerwarden-ctl -- agent kernel claude-code off",
+            "bash -c './k agent kernel claude-code off'",
+            "x=$(./k agent kernel claude-code off)",
         ];
         let allowed: Vec<&&str> = commands
             .iter()
