@@ -1469,17 +1469,35 @@ fn filter_probe(
     }
 }
 
+/// The kernel's release, as `uname -r` prints it, from the `uname` call:
+/// unlike `/proc/sys/kernel/osrelease` it is there in a chroot or a
+/// container with no `/proc`. Empty in the one case `uname` fails (a bad
+/// pointer, never here), which reads as an unknown release.
+#[cfg(target_os = "linux")]
+fn kernel_release() -> String {
+    // SAFETY: `uname` fills the struct it is given, which lives until it
+    // returns; `release` is then a NUL-terminated string inside it.
+    unsafe {
+        let mut names: libc::utsname = std::mem::zeroed();
+        if libc::uname(&mut names) != 0 {
+            return String::new();
+        }
+        std::ffi::CStr::from_ptr(names.release.as_ptr())
+            .to_string_lossy()
+            .into_owned()
+    }
+}
+
 /// The filter a launch hands this host's bwrap, and what it says about it:
 /// from this build's architecture, the kernel's release, and one throwaway
 /// jail under a filter (two for an identified launch whose host does not take
 /// the identified one).
 #[cfg(target_os = "linux")]
 fn filter_plan_here(bwrap: &Path, identity: bool) -> crate::contain::launch::FilterPlan {
-    use crate::contain::launch::{filter_plan, kernel_runs_the_filter_after_a_tracer, FilterHost};
-    let release = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
+    use crate::contain::launch::{filter_plan, tracer_order, FilterHost};
     let host = FilterHost {
         built: innerwarden_agent_guard::seccomp::Arch::native().is_some(),
-        tracer_safe: kernel_runs_the_filter_after_a_tracer(&release),
+        tracer: tracer_order(&kernel_release()),
     };
     filter_plan(identity, host, |rules| filter_probe(bwrap, rules, identity))
 }
@@ -1723,6 +1741,24 @@ fn print_plan_env(env: &[(String, String)]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The kernel's release is read from `uname`, so a host with no `/proc`
+    /// still reads it: it is what `/proc/sys/kernel/osrelease` says where
+    /// that is readable, and every kernel CI and the labs run reads as 4.8
+    /// or later.
+    ///
+    /// FAILS ON REVERT: hand the plan an empty release, as the old read of
+    /// a missing `/proc` did (it reads as `Unknown`).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_kernel_release_is_the_running_kernels_without_proc() {
+        use crate::contain::launch::{tracer_order, TracerOrder};
+        let release = kernel_release();
+        if let Ok(proc) = std::fs::read_to_string("/proc/sys/kernel/osrelease") {
+            assert_eq!(release, proc.trim(), "uname and /proc agree");
+        }
+        assert_eq!(tracer_order(&release), TracerOrder::After, "{release:?}");
+    }
 
     /// What the launcher puts on bwrap's pipe is the library's filter
     /// (`innerwarden_agent_guard::seccomp`), byte for byte, for each set of

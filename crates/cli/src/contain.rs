@@ -1272,17 +1272,31 @@ pub mod launch {
     // (which the jail allows) could turn an allowed call into one the filter
     // refuses. On such a kernel the identified filter is never used, so no
     // record says user namespaces are closed, and the terminal one is said
-    // to be weaker.
+    // to be weaker. A release that does not read as a version is taken the
+    // same way, and said as unknown rather than as older.
 
     /// The first kernel that runs the filter after a tracer's change of a
     /// call (`seccomp: run after ptrace`, 4.8, on x86_64 and aarch64 alike).
     pub const TRACER_SAFE_KERNEL: (u32, u32) = (4, 8);
 
-    /// PURE. Whether a kernel release (`/proc/sys/kernel/osrelease`, as
-    /// `6.12.10-orbstack` or `3.10.0-1160.el7.x86_64`) is
-    /// [`TRACER_SAFE_KERNEL`] or later. A release this does not read is
-    /// taken as older: the answer that claims nothing.
-    pub fn kernel_runs_the_filter_after_a_tracer(release: &str) -> bool {
+    /// What a kernel's release says of the order of the filter and a
+    /// tracer's change of a call.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum TracerOrder {
+        /// [`TRACER_SAFE_KERNEL`] or later: the filter runs after it.
+        After,
+        /// Older: the filter runs before it.
+        Before,
+        /// The release does not read as a version. Taken as [`Before`], the
+        /// answer that claims nothing, and said as unknown.
+        ///
+        /// [`Before`]: TracerOrder::Before
+        Unknown,
+    }
+
+    /// PURE. The order a kernel release (`uname -r`, as `6.12.10-orbstack`
+    /// or `3.10.0-1160.el7.x86_64`) runs the filter and a tracer in.
+    pub fn tracer_order(release: &str) -> TracerOrder {
         let mut parts = release.trim().split(['.', '-']);
         let number = |part: Option<&str>| -> Option<u32> {
             let part = part?;
@@ -1292,8 +1306,11 @@ pub mod launch {
             part.parse().ok()
         };
         match (number(parts.next()), number(parts.next())) {
-            (Some(major), Some(minor)) => (major, minor) >= TRACER_SAFE_KERNEL,
-            _ => false,
+            (Some(major), Some(minor)) if (major, minor) >= TRACER_SAFE_KERNEL => {
+                TracerOrder::After
+            }
+            (Some(_), Some(_)) => TracerOrder::Before,
+            _ => TracerOrder::Unknown,
         }
     }
 
@@ -1304,8 +1321,13 @@ pub mod launch {
         ProbeFailed,
         /// The kernel is older than [`TRACER_SAFE_KERNEL`].
         KernelTooOld,
+        /// The kernel's release does not read as a version.
+        KernelUnknown,
         /// This build has no filter for the architecture it runs as.
         NotBuilt,
+        /// The host took the filter, and the launcher could not then hand
+        /// it to bubblewrap (its pipe could not be made).
+        NotHanded,
     }
 
     impl UsernsWhy {
@@ -1314,7 +1336,9 @@ pub mod launch {
             match self {
                 UsernsWhy::ProbeFailed => "userns_probe_failed",
                 UsernsWhy::KernelTooOld => "userns_kernel_too_old",
+                UsernsWhy::KernelUnknown => "userns_kernel_unknown",
                 UsernsWhy::NotBuilt => "userns_filter_not_built",
+                UsernsWhy::NotHanded => "userns_filter_not_handed",
             }
         }
 
@@ -1322,7 +1346,9 @@ pub mod launch {
             match self {
                 UsernsWhy::ProbeFailed => "Bubblewrap here could not start a jail with user namespaces closed, so the jail runs without that.",
                 UsernsWhy::KernelTooOld => "This kernel is older than 4.8, where a program that traces another could get a call past the filter, so the jail runs without closing them.",
+                UsernsWhy::KernelUnknown => "This kernel's release does not read as a version, so it is taken as older than 4.8 and the jail runs without closing them.",
                 UsernsWhy::NotBuilt => "This build has no sandbox filter for this architecture, so the jail runs without closing them.",
+                UsernsWhy::NotHanded => "The launcher could not hand the sandbox filter to bubblewrap, so the jail runs without closing them.",
             }
         }
     }
@@ -1349,6 +1375,12 @@ pub mod launch {
         /// The filter is in, and the kernel is older than
         /// [`TRACER_SAFE_KERNEL`].
         KernelTooOld,
+        /// The filter is in, and the kernel's release does not read as a
+        /// version: taken as older.
+        KernelUnknown,
+        /// The host took the filter, and the launcher could not then hand
+        /// it to bubblewrap: no filter.
+        NotHanded,
     }
 
     impl FilterWhy {
@@ -1357,6 +1389,8 @@ pub mod launch {
                 FilterWhy::ProbeFailed => "filter_probe_failed",
                 FilterWhy::NotBuilt => "filter_not_built",
                 FilterWhy::KernelTooOld => "filter_kernel_too_old",
+                FilterWhy::KernelUnknown => "filter_kernel_unknown",
+                FilterWhy::NotHanded => "filter_not_handed",
             }
         }
 
@@ -1365,6 +1399,8 @@ pub mod launch {
                 FilterWhy::ProbeFailed => "Bubblewrap here could not start a jail with the sandbox filter, so programs in the jail can still inject keystrokes into your terminal.",
                 FilterWhy::NotBuilt => "This build has no sandbox filter for this architecture, so programs in the jail can still inject keystrokes into your terminal.",
                 FilterWhy::KernelTooOld => "This kernel is older than 4.8, where a program that traces another can get a call past the filter, so programs in the jail may still inject keystrokes into your terminal.",
+                FilterWhy::KernelUnknown => "This kernel's release does not read as a version, so it is taken as older than 4.8, where a program that traces another can get a call past the filter: programs in the jail may still inject keystrokes into your terminal.",
+                FilterWhy::NotHanded => "The launcher could not hand the sandbox filter to bubblewrap, so programs in the jail can still inject keystrokes into your terminal.",
             }
         }
     }
@@ -1373,8 +1409,10 @@ pub mod launch {
     /// without the terminal rule, or with a weaker one.
     pub fn filter_sentence(why: FilterWhy) -> String {
         let what = match why {
-            FilterWhy::ProbeFailed | FilterWhy::NotBuilt => "no sandbox filter",
-            FilterWhy::KernelTooOld => "a weaker sandbox filter",
+            FilterWhy::ProbeFailed | FilterWhy::NotBuilt | FilterWhy::NotHanded => {
+                "no sandbox filter"
+            }
+            FilterWhy::KernelTooOld | FilterWhy::KernelUnknown => "a weaker sandbox filter",
         };
         format!(
             "innerwarden contain: {what} ({}): {}",
@@ -1388,9 +1426,9 @@ pub mod launch {
     pub struct FilterHost {
         /// This build has the call numbers of the architecture it runs as.
         pub built: bool,
-        /// The kernel is [`TRACER_SAFE_KERNEL`] or later
-        /// ([`kernel_runs_the_filter_after_a_tracer`]).
-        pub tracer_safe: bool,
+        /// The order the kernel runs the filter and a tracer in
+        /// ([`tracer_order`]).
+        pub tracer: TracerOrder,
     }
 
     /// The filter a launch hands bwrap, and the lines it says about it.
@@ -1431,8 +1469,10 @@ pub mod launch {
         if identity {
             let why = if !host.built {
                 UsernsWhy::NotBuilt
-            } else if !host.tracer_safe {
+            } else if host.tracer == TracerOrder::Before {
                 UsernsWhy::KernelTooOld
+            } else if host.tracer == TracerOrder::Unknown {
+                UsernsWhy::KernelUnknown
             } else if probe(Rules::Identified) {
                 return FilterPlan {
                     filter: Some(Rules::Identified),
@@ -1447,8 +1487,10 @@ pub mod launch {
             said.push(filter_sentence(FilterWhy::NotBuilt));
             None
         } else if probe(Rules::Terminal) {
-            if !host.tracer_safe {
-                said.push(filter_sentence(FilterWhy::KernelTooOld));
+            match host.tracer {
+                TracerOrder::After => {}
+                TracerOrder::Before => said.push(filter_sentence(FilterWhy::KernelTooOld)),
+                TracerOrder::Unknown => said.push(filter_sentence(FilterWhy::KernelUnknown)),
             }
             Some(Rules::Terminal)
         } else {
@@ -1460,13 +1502,14 @@ pub mod launch {
 
     /// The lines a launch says when the filter it planned could not be
     /// handed in after all (its pipe could not be made): the jail then runs
-    /// without one.
+    /// without one. The cause is the launcher's, not bubblewrap's: the host
+    /// had just started a jail under that filter.
     pub fn filter_lost_sentences(planned: innerwarden_agent_guard::seccomp::Rules) -> Vec<String> {
         let mut said = Vec::new();
         if planned == innerwarden_agent_guard::seccomp::Rules::Identified {
-            said.push(userns_open_sentence(UsernsWhy::ProbeFailed));
+            said.push(userns_open_sentence(UsernsWhy::NotHanded));
         }
-        said.push(filter_sentence(FilterWhy::ProbeFailed));
+        said.push(filter_sentence(FilterWhy::NotHanded));
         said
     }
 
@@ -3074,7 +3117,7 @@ mod tests {
     /// A host that has every fact the identified filter needs.
     const WHOLE_HOST: launch::FilterHost = launch::FilterHost {
         built: true,
-        tracer_safe: true,
+        tracer: launch::TracerOrder::After,
     };
 
     /// The probes a plan asked, in order, answering from `takes`.
@@ -3121,7 +3164,7 @@ mod tests {
 
         let old_kernel = launch::FilterHost {
             built: true,
-            tracer_safe: false,
+            tracer: launch::TracerOrder::Before,
         };
         let (old, asked) = plan_with(true, old_kernel, &[Identified, Terminal]);
         assert_eq!(old.filter, Some(Terminal));
@@ -3142,7 +3185,9 @@ mod tests {
     #[test]
     fn a_launch_says_each_thing_its_jail_runs_without() {
         use innerwarden_agent_guard::seccomp::Rules::{Identified, Terminal};
-        use launch::{filter_sentence, userns_open_sentence, FilterHost, FilterWhy, UsernsWhy};
+        use launch::{
+            filter_sentence, userns_open_sentence, FilterHost, FilterWhy, TracerOrder, UsernsWhy,
+        };
 
         let (fallback, asked) = plan_with(true, WHOLE_HOST, &[Terminal]);
         assert_eq!(fallback.filter, Some(Terminal));
@@ -3168,7 +3213,7 @@ mod tests {
 
         let old_kernel = FilterHost {
             built: true,
-            tracer_safe: false,
+            tracer: TracerOrder::Before,
         };
         let (old, _) = plan_with(true, old_kernel, &[Identified, Terminal]);
         assert_eq!(
@@ -3184,7 +3229,7 @@ mod tests {
 
         let unbuilt = FilterHost {
             built: false,
-            tracer_safe: true,
+            tracer: TracerOrder::After,
         };
         for identity in [true, false] {
             let (plan, asked) = plan_with(identity, unbuilt, &[Identified, Terminal]);
@@ -3198,29 +3243,78 @@ mod tests {
             assert_eq!(plan.said, said);
             assert!(plan.said.iter().all(|l| !l.contains("Bubblewrap")));
         }
+    }
 
-        // A planned filter whose pipe could not be made: both losses for an
-        // identified one, the keystroke one for the terminal one.
+    /// Two causes a launch names as what they are, not as another one. A
+    /// kernel release that does not read as a version is taken as older
+    /// than 4.8 (the terminal filter, said weaker; user namespaces left
+    /// open) and said as unknown, never as "older than 4.8". A planned
+    /// filter whose pipe could not be made, after bubblewrap had just
+    /// started a jail under it, is the launcher's failure, never
+    /// bubblewrap's: both losses for an identified one, the keystroke one
+    /// for the terminal one.
+    ///
+    /// FAILS ON REVERT: take an unread release as an older kernel's words
+    /// (`userns_kernel_too_old`), or say `filter_probe_failed` for a lost
+    /// pipe.
+    #[test]
+    fn a_launch_names_an_unread_kernel_and_a_lost_pipe_as_what_they_are() {
+        use innerwarden_agent_guard::seccomp::Rules::{Identified, Terminal};
+        use launch::{
+            filter_sentence, userns_open_sentence, FilterHost, FilterWhy, TracerOrder, UsernsWhy,
+        };
+        let unknown = FilterHost {
+            built: true,
+            tracer: TracerOrder::Unknown,
+        };
+        let (plan, asked) = plan_with(true, unknown, &[Identified, Terminal]);
+        assert_eq!(plan.filter, Some(Terminal));
+        assert!(!plan.close_userns());
+        assert_eq!(asked, [Terminal], "the identified probe is never asked");
         assert_eq!(
-            launch::filter_lost_sentences(Identified),
-            none.said,
-            "the same two lines"
+            plan.said,
+            [
+                userns_open_sentence(UsernsWhy::KernelUnknown),
+                filter_sentence(FilterWhy::KernelUnknown)
+            ]
+        );
+        let (plain, _) = plan_with(false, unknown, &[Terminal]);
+        assert_eq!(plain.filter, Some(Terminal));
+        assert_eq!(plain.said, [filter_sentence(FilterWhy::KernelUnknown)]);
+        for line in plan.said.iter().chain(&plain.said) {
+            assert!(!line.contains("This kernel is older"), "{line}");
+            assert!(line.contains("_kernel_unknown)"), "{line}");
+        }
+
+        let lost = launch::filter_lost_sentences(Identified);
+        assert_eq!(
+            lost,
+            [
+                userns_open_sentence(UsernsWhy::NotHanded),
+                filter_sentence(FilterWhy::NotHanded)
+            ]
         );
         assert_eq!(
             launch::filter_lost_sentences(Terminal),
-            [filter_sentence(FilterWhy::ProbeFailed)]
+            [filter_sentence(FilterWhy::NotHanded)]
         );
+        for line in &lost {
+            assert!(!line.contains("Bubblewrap here could not"), "{line}");
+            assert!(!line.contains("_probe_failed"), "{line}");
+            assert!(line.contains("The launcher could not hand"), "{line}");
+        }
     }
 
-    /// The kernel's release, as `/proc/sys/kernel/osrelease` gives it: 4.8 or
-    /// later runs the filter after a tracer changed the call. Anything not
-    /// read is taken as older.
+    /// The kernel's release, as `uname -r` gives it: 4.8 or later runs the
+    /// filter after a tracer changed the call, an older one before it, and
+    /// a release that does not read as a version is unknown (taken as
+    /// older, said as unknown).
     ///
-    /// FAILS ON REVERT: compare the major number alone (4.4 passes), or take
-    /// a release that does not read as safe.
+    /// FAILS ON REVERT: compare the major number alone (4.4 passes), take
+    /// a release that does not read as safe, or as an older kernel.
     #[test]
     fn a_kernel_from_4_8_runs_the_filter_after_a_tracer() {
-        use launch::kernel_runs_the_filter_after_a_tracer as safe;
+        use launch::{tracer_order, TracerOrder};
         for release in [
             "4.8.0",
             "4.8",
@@ -3230,21 +3324,18 @@ mod tests {
             "7.0.0-1011-azure",
             "10.0.1",
         ] {
-            assert!(safe(release), "{release}");
+            assert_eq!(tracer_order(release), TracerOrder::After, "{release}");
         }
         for release in [
             "4.7.10",
             "4.4.0-210-generic",
             "3.10.0-1160.el7.x86_64",
             "2.6.32",
-            "",
-            "4",
-            "v6.1",
-            "6.x",
-            "99999999.1",
-            "-6.1",
         ] {
-            assert!(!safe(release), "{release}");
+            assert_eq!(tracer_order(release), TracerOrder::Before, "{release}");
+        }
+        for release in ["", "4", "v6.1", "6.x", "99999999.1", "-6.1", "\n"] {
+            assert_eq!(tracer_order(release), TracerOrder::Unknown, "{release:?}");
         }
     }
 
@@ -3273,6 +3364,14 @@ mod tests {
             "innerwarden contain: user namespaces stay open (userns_filter_not_built): This build has no sandbox filter for this architecture, so the jail runs without closing them."
         );
         assert_eq!(
+            userns_open_sentence(UsernsWhy::KernelUnknown),
+            "innerwarden contain: user namespaces stay open (userns_kernel_unknown): This kernel's release does not read as a version, so it is taken as older than 4.8 and the jail runs without closing them."
+        );
+        assert_eq!(
+            userns_open_sentence(UsernsWhy::NotHanded),
+            "innerwarden contain: user namespaces stay open (userns_filter_not_handed): The launcher could not hand the sandbox filter to bubblewrap, so the jail runs without closing them."
+        );
+        assert_eq!(
             filter_sentence(FilterWhy::ProbeFailed),
             "innerwarden contain: no sandbox filter (filter_probe_failed): Bubblewrap here could not start a jail with the sandbox filter, so programs in the jail can still inject keystrokes into your terminal."
         );
@@ -3283,6 +3382,14 @@ mod tests {
         assert_eq!(
             filter_sentence(FilterWhy::KernelTooOld),
             "innerwarden contain: a weaker sandbox filter (filter_kernel_too_old): This kernel is older than 4.8, where a program that traces another can get a call past the filter, so programs in the jail may still inject keystrokes into your terminal."
+        );
+        assert_eq!(
+            filter_sentence(FilterWhy::KernelUnknown),
+            "innerwarden contain: a weaker sandbox filter (filter_kernel_unknown): This kernel's release does not read as a version, so it is taken as older than 4.8, where a program that traces another can get a call past the filter: programs in the jail may still inject keystrokes into your terminal."
+        );
+        assert_eq!(
+            filter_sentence(FilterWhy::NotHanded),
+            "innerwarden contain: no sandbox filter (filter_not_handed): The launcher could not hand the sandbox filter to bubblewrap, so programs in the jail can still inject keystrokes into your terminal."
         );
         let words = include_str!("../../dashboard-kit/web/src/community/words.ts");
         assert!(words.contains(
@@ -3299,7 +3406,9 @@ mod tests {
         let lines = [
             UsernsWhy::ProbeFailed,
             UsernsWhy::KernelTooOld,
+            UsernsWhy::KernelUnknown,
             UsernsWhy::NotBuilt,
+            UsernsWhy::NotHanded,
         ]
         .map(userns_open_sentence)
         .into_iter()
@@ -3308,6 +3417,8 @@ mod tests {
                 FilterWhy::ProbeFailed,
                 FilterWhy::NotBuilt,
                 FilterWhy::KernelTooOld,
+                FilterWhy::KernelUnknown,
+                FilterWhy::NotHanded,
             ]
             .map(filter_sentence),
         );
