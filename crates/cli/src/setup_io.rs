@@ -210,18 +210,29 @@ pub fn cmd(_rest: &[String]) -> ExitCode {
         innerwarden_agent_guard::agents::canonical(&agent.name)
             .is_some_and(|known| known.name == "claude-code")
     });
-    if claude_here && crate::contain_io::jail_backend().is_some() {
-        println!();
-        let want_jail = Confirm::with_theme(&theme)
-            .with_prompt(
-                "  Start Claude Code in the AI Jail every time? (adds one alias line to your shell)",
-            )
-            .default(false)
-            .interact()
-            .unwrap_or(false);
-        if want_jail {
-            add_jail_alias(&home);
+    // Asked only where a jail starts, by the check `contain` runs before it
+    // builds one; where it does not yet, setup says why and shows the line.
+    match setup::jail_alias_offer(claude_here, crate::contain_io::jail_start_here()) {
+        setup::JailAliasOffer::Ask => {
+            println!();
+            let want_jail = Confirm::with_theme(&theme)
+                .with_prompt(
+                    "  Start Claude Code in the AI Jail every time? (adds one alias line to your shell)",
+                )
+                .default(false)
+                .interact()
+                .unwrap_or(false);
+            if want_jail {
+                add_jail_alias(&home);
+            }
         }
+        setup::JailAliasOffer::NotYet(lines) => {
+            println!();
+            for line in lines {
+                println!("  {line}");
+            }
+        }
+        setup::JailAliasOffer::Nothing => {}
     }
 
     // ── Done + how to leave dry run ──────────────────────────────────────────

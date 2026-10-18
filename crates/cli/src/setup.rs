@@ -84,6 +84,47 @@ pub fn with_jail_alias(existing: &str) -> Option<String> {
     Some(out)
 }
 
+/// What setup does about the AI Jail extra.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JailAliasOffer {
+    /// Ask the person (default No).
+    Ask,
+    /// A jail does not start on this machine yet: say why, what to do, and
+    /// the line to add once it does. Nothing is asked and nothing written.
+    NotYet(Vec<String>),
+    /// Say nothing: Claude Code is not here, or no jail backend is.
+    Nothing,
+}
+
+/// PURE. What setup does about the AI Jail extra, from whether Claude Code
+/// is here and what `contain` would do on this machine before it builds a
+/// jail (`jail_here`: `None` without a backend it trusts; otherwise
+/// whether a jail starts, or the lines `contain` says when it does not, the
+/// last of which tells the person to run `contain` again).
+pub fn jail_alias_offer(
+    claude_here: bool,
+    jail_here: Option<Result<(), Vec<String>>>,
+) -> JailAliasOffer {
+    match (claude_here, jail_here) {
+        (true, Some(Ok(()))) => JailAliasOffer::Ask,
+        (true, Some(Err(why))) => {
+            let mut lines =
+                vec!["The AI Jail does not start on this machine yet, so Claude Code is not set to start in it:".to_string()];
+            lines.extend(
+                why.into_iter()
+                    .filter(|line| line.as_str() != crate::contain::RESTRICTION_ADVICE_END),
+            );
+            lines.push(
+                "  Then, to start Claude Code in the AI Jail every time, add this line to your shell's startup file:"
+                    .to_string(),
+            );
+            lines.push(format!("    {JAIL_ALIAS_LINE}"));
+            JailAliasOffer::NotYet(lines)
+        }
+        _ => JailAliasOffer::Nothing,
+    }
+}
+
 /// The listing printed when there is no terminal to prompt on (a piped
 /// `curl | sh`, CI): how to inspect all detected agents and guard integrations
 /// with reviewed configuration support. `prog` is the invoked name so examples match.
@@ -165,6 +206,43 @@ mod tests {
             JAIL_ALIAS_LINE,
             "alias claude='innerwarden contain --identity -- claude'"
         );
+    }
+
+    /// The AI Jail extra is asked about only where a jail starts: on a host
+    /// whose kernel restricts user namespaces and whose bwrap has no
+    /// profile (stock Ubuntu 24.04), every `claude` after a yes would stop
+    /// with the advice. There setup says why, what to do, and the line to
+    /// add once it is done, and asks nothing.
+    ///
+    /// FAILS ON REVERT: ask wherever a backend is (`jail_backend().is_some()`,
+    /// the check before this one) and the restricted host is asked.
+    #[test]
+    fn the_jail_alias_is_offered_only_where_a_jail_starts() {
+        assert_eq!(jail_alias_offer(true, Some(Ok(()))), JailAliasOffer::Ask);
+        assert_eq!(jail_alias_offer(true, None), JailAliasOffer::Nothing);
+        assert_eq!(
+            jail_alias_offer(false, Some(Ok(()))),
+            JailAliasOffer::Nothing
+        );
+        let advice = crate::contain::userns_restriction_advice(
+            Some("1\n"),
+            false,
+            std::path::Path::new("/usr/bin/bwrap"),
+        )
+        .expect("a restricted host");
+        assert_eq!(
+            jail_alias_offer(false, Some(Err(advice.clone()))),
+            JailAliasOffer::Nothing
+        );
+        let JailAliasOffer::NotYet(lines) = jail_alias_offer(true, Some(Err(advice))) else {
+            panic!("a restricted host is not asked");
+        };
+        let said = lines.join("\n");
+        assert!(lines[0].starts_with("The AI Jail does not start on this machine yet"));
+        assert!(said.contains("kernel.apparmor_restrict_unprivileged_userns = 1"));
+        assert!(said.contains("sudo apparmor_parser -r /etc/apparmor.d/bwrap"));
+        assert!(!said.contains("Then run this command again"), "{said}");
+        assert_eq!(lines.last().unwrap().trim(), JAIL_ALIAS_LINE);
     }
 
     #[test]

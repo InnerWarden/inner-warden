@@ -616,6 +616,20 @@ pub(crate) fn jail_backend() -> Option<&'static str> {
     }
 }
 
+/// Whether a jail starts on this machine, by the checks `contain` runs
+/// before it builds one: `None` without a backend it trusts (as
+/// [`jail_backend`]); otherwise `Ok`, or the lines `contain` says and stops
+/// on (on Linux, a kernel that restricts unprivileged user namespaces and
+/// a bwrap with no profile that grants it one).
+pub(crate) fn jail_start_here() -> Option<Result<(), Vec<String>>> {
+    if cfg!(target_os = "linux") {
+        let bwrap = resolve_backend(&["/usr/bin/bwrap", "/bin/bwrap", "/usr/local/bin/bwrap"])?;
+        Some(restriction_advice(&bwrap).map_or(Ok(()), Err))
+    } else {
+        jail_backend().map(|_| Ok(()))
+    }
+}
+
 /// Resolve a sandbox backend from a compile-time list of trusted absolute paths.
 /// Release builds have no environment/PATH override. On Unix the executable and
 /// every path component must be root-owned, not group/world-writable, and not a

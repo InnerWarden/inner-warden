@@ -1342,9 +1342,13 @@ pub fn userns_restriction_advice(
         "    EOF".into(),
         "    sudo apparmor_parser -r /etc/apparmor.d/bwrap".into(),
         "".into(),
-        "  Then run this command again. Nothing was run.".into(),
+        RESTRICTION_ADVICE_END.into(),
     ])
 }
+
+/// The last line of [`userns_restriction_advice`]: what `contain` says to
+/// do once the profile is in place.
+pub const RESTRICTION_ADVICE_END: &str = "  Then run this command again. Nothing was run.";
 
 /// The pure half of `contain --identity`: read what bwrap reported, read what
 /// the host says about the jail process, and put the facts into a
