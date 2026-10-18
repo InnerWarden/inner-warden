@@ -1325,9 +1325,10 @@ pub mod launch {
         KernelUnknown,
         /// This build has no filter for the architecture it runs as.
         NotBuilt,
-        /// The launcher could not make the pipe that hands the filter to
-        /// bubblewrap, for its start-up probe or after it: no bwrap ran
-        /// under it.
+        /// The launcher could not hand the filter to bubblewrap, for its
+        /// start-up probe or after it: it could not make the pipe, or start
+        /// bwrap for want of its own descriptors, processes or memory
+        /// ([`spawn_failed_answer`]). No bwrap ran under it.
         NotHanded,
     }
 
@@ -1379,8 +1380,10 @@ pub mod launch {
         /// The filter is in, and the kernel's release does not read as a
         /// version: taken as older.
         KernelUnknown,
-        /// The launcher could not make the pipe that hands the filter to
-        /// bubblewrap, for its start-up probe or after it: no filter.
+        /// The launcher could not hand the filter to bubblewrap, for its
+        /// start-up probe or after it: it could not make the pipe, or start
+        /// bwrap for want of its own descriptors, processes or memory
+        /// ([`spawn_failed_answer`]). No filter.
         NotHanded,
     }
 
@@ -1430,8 +1433,28 @@ pub mod launch {
         /// bwrap did not start it, or it did not exit 0 in time.
         Failed,
         /// The launcher could not make the pipe that hands the filter in,
-        /// so it started no bwrap: the launcher's failure, not bubblewrap's.
+        /// or could not start bwrap for want of its own descriptors,
+        /// processes or memory ([`spawn_failed_answer`]): no bwrap ran, the
+        /// launcher's failure, not bubblewrap's.
         NotHanded,
+    }
+
+    /// PURE. What a start-up probe answers when the launcher could not
+    /// start bwrap at all. Out of descriptors (`EMFILE`, `ENFILE`: the
+    /// launcher opens `/dev/null` and a pipe of its own to start a
+    /// program), of processes (`EAGAIN`) or of memory (`ENOMEM`), the
+    /// launcher is what failed, and bwrap never ran: `NotHanded`. Any other
+    /// error (bwrap not found, not permitted, not a program this kernel
+    /// runs) is bubblewrap's side: `Failed`. Only the words differ: the
+    /// jail runs without the filter either way.
+    #[cfg(unix)]
+    pub fn spawn_failed_answer(error: &std::io::Error) -> ProbeAnswer {
+        match error.raw_os_error() {
+            Some(libc::EMFILE | libc::ENFILE | libc::EAGAIN | libc::ENOMEM) => {
+                ProbeAnswer::NotHanded
+            }
+            _ => ProbeAnswer::Failed,
+        }
     }
 
     /// What the launcher reads of the host before it plans the filter.
@@ -1472,8 +1495,9 @@ pub mod launch {
     ///   user namespace line, and the terminal filter as below.
     /// * The terminal filter where its probe passed (said to be weaker on a
     ///   kernel before 4.8), no filter otherwise, and the line that says it.
-    /// * A probe whose filter could not be handed in started no bwrap: its
-    ///   lines name the launcher (`NotHanded`), never bubblewrap.
+    /// * A probe whose filter could not be handed in, or whose bwrap the
+    ///   launcher had not the means to start, ran no bwrap: its lines name
+    ///   the launcher (`NotHanded`), never bubblewrap.
     pub fn filter_plan(
         identity: bool,
         host: FilterHost,
@@ -3365,6 +3389,31 @@ mod tests {
                 assert!(!line.contains("_probe_failed"), "{line}");
             }
         }
+    }
+
+    /// A bwrap the launcher could not start for want of its own means (out
+    /// of descriptors, processes or memory) never ran, so the probe answers
+    /// as the launcher's failure; one that is not there, not permitted or
+    /// not a program is bubblewrap's side, as is an error with no number.
+    ///
+    /// FAILS ON REVERT: answer every failed start `Failed` (an `EMFILE`
+    /// start is then said as "Bubblewrap here could not start a jail"), or
+    /// every one `NotHanded` (a missing bwrap is said as the launcher's).
+    #[cfg(unix)]
+    #[test]
+    fn a_bwrap_the_launcher_could_not_start_is_said_as_the_launchers() {
+        use launch::{spawn_failed_answer, ProbeAnswer};
+        let answer = |errno| spawn_failed_answer(&std::io::Error::from_raw_os_error(errno));
+        for errno in [libc::EMFILE, libc::ENFILE, libc::EAGAIN, libc::ENOMEM] {
+            assert_eq!(answer(errno), ProbeAnswer::NotHanded, "errno {errno}");
+        }
+        for errno in [libc::ENOENT, libc::EACCES, libc::ENOEXEC, libc::ETXTBSY] {
+            assert_eq!(answer(errno), ProbeAnswer::Failed, "errno {errno}");
+        }
+        assert_eq!(
+            spawn_failed_answer(&std::io::Error::other("no number")),
+            ProbeAnswer::Failed
+        );
     }
 
     /// The kernel's release, as `uname -r` gives it: 4.8 or later runs the

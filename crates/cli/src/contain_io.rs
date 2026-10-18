@@ -1425,8 +1425,10 @@ fn helper_env(command: &mut Command) {
 /// when it ran and exited 0 within five seconds. Its `true` runs under the
 /// filter, so a filter this kernel cannot load, or one whose architecture is
 /// not the kernel's (a binary under emulation), fails here and never in the
-/// jail. A filter whose pipe cannot be made (the launcher is out of
-/// descriptors) starts no bwrap and answers `NotHanded`.
+/// jail. A filter whose pipe cannot be made, or a bwrap the launcher has not
+/// the means to start (out of descriptors, processes or memory:
+/// [`crate::contain::launch::spawn_failed_answer`]), runs no bwrap and
+/// answers `NotHanded`.
 #[cfg(target_os = "linux")]
 fn filter_probe(
     bwrap: &Path,
@@ -1454,8 +1456,9 @@ fn filter_probe(
     let spawned = command.spawn();
     // Ours closes once bwrap has its own.
     drop(filter);
-    let Ok(mut child) = spawned else {
-        return ProbeAnswer::Failed;
+    let mut child = match spawned {
+        Ok(child) => child,
+        Err(error) => return crate::contain::launch::spawn_failed_answer(&error),
     };
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -1819,31 +1822,82 @@ mod tests {
             "no_descriptors" => {
                 // No descriptor left to open: the probe's pipe cannot be
                 // made, so no bwrap may be started for it.
-                let mut limit = libc::rlimit {
-                    rlim_cur: 0,
-                    rlim_max: 0,
-                };
-                // SAFETY: getrlimit fills the struct it is given and
-                // setrlimit reads it; the hard limit is kept, so an
-                // unprivileged child may lower the soft one to 0.
-                let lowered = unsafe {
-                    assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit), 0);
-                    limit.rlim_cur = 0;
-                    libc::setrlimit(libc::RLIMIT_NOFILE, &limit)
-                };
-                assert_eq!(lowered, 0, "{}", std::io::Error::last_os_error());
-                let mut answers = Vec::new();
-                for rules in [
-                    innerwarden_agent_guard::seccomp::Rules::Identified,
-                    innerwarden_agent_guard::seccomp::Rules::Terminal,
-                ] {
-                    let answer = filter_probe(Path::new("/bin/true"), rules, true);
-                    answers.push(format!("{rules:?}={answer:?}"));
-                }
+                probe_answers_under_nofile(0)
+            }
+            "two_descriptors" => {
+                // Two descriptors left: the probe's pipe is made, its writer
+                // closed, and then starting bwrap (which opens `/dev/null`
+                // for each of its three standard streams) runs out.
+                let limit = limit_leaving_free_descriptors(2);
+                let mut answers = vec![format!("limit={limit}")];
+                answers.extend(probe_answers_under_nofile(limit));
                 answers
             }
             other => panic!("a child these tests do not know: {other}"),
         }
+    }
+
+    /// Each start-up probe's answer, with `/bin/true` as bwrap: a probe that
+    /// starts it answers `Ran`.
+    #[cfg(target_os = "linux")]
+    fn probe_answers() -> Vec<String> {
+        [
+            innerwarden_agent_guard::seccomp::Rules::Identified,
+            innerwarden_agent_guard::seccomp::Rules::Terminal,
+        ]
+        .into_iter()
+        .map(|rules| {
+            let answer = filter_probe(Path::new("/bin/true"), rules, true);
+            format!("{rules:?}={answer:?}")
+        })
+        .collect()
+    }
+
+    /// The soft descriptor limit under which exactly `free` descriptor
+    /// numbers are left unused below it, from the ones open now.
+    #[cfg(target_os = "linux")]
+    fn limit_leaving_free_descriptors(free: usize) -> u64 {
+        let listed: Vec<libc::c_int> = std::fs::read_dir("/proc/self/fd")
+            .expect("this test host has /proc")
+            .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
+            .collect();
+        // The listing's own descriptor is closed by now: keep only the open.
+        // SAFETY: F_GETFD only reads a descriptor's flags.
+        let open: std::collections::BTreeSet<libc::c_int> = listed
+            .into_iter()
+            .filter(|fd| unsafe { libc::fcntl(*fd, libc::F_GETFD) } != -1)
+            .collect();
+        let mut left = free;
+        let mut fd: libc::c_int = 0;
+        loop {
+            if !open.contains(&fd) {
+                left -= 1;
+                if left == 0 {
+                    return fd as u64 + 1;
+                }
+            }
+            fd += 1;
+        }
+    }
+
+    /// [`probe_answers`] with the soft descriptor limit lowered to `limit`
+    /// (the hard one kept, so an unprivileged child may lower the soft one
+    /// as far as 0).
+    #[cfg(target_os = "linux")]
+    fn probe_answers_under_nofile(limit: u64) -> Vec<String> {
+        let mut current = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit fills the struct it is given and setrlimit reads
+        // it.
+        let lowered = unsafe {
+            assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut current), 0);
+            current.rlim_cur = limit as libc::rlim_t;
+            libc::setrlimit(libc::RLIMIT_NOFILE, &current)
+        };
+        assert_eq!(lowered, 0, "{}", std::io::Error::last_os_error());
+        probe_answers()
     }
 
     /// Run this test binary again as a child (never a fork of the harness)
@@ -1961,6 +2015,21 @@ mod tests {
     #[test]
     fn a_probe_whose_pipe_cannot_be_made_says_it_was_not_handed() {
         let answers = answers_of_a_child("no_descriptors", false);
+        assert_eq!(answers["Identified"], "NotHanded", "{answers:?}");
+        assert_eq!(answers["Terminal"], "NotHanded", "{answers:?}");
+    }
+
+    /// A start-up probe whose pipe was made, but whose bwrap the launcher
+    /// could not start (two descriptors left: the pipe takes them, and
+    /// starting a program needs `/dev/null` three times) never ran bwrap:
+    /// it answers that the filter was not handed in, the launcher's words,
+    /// never that bubblewrap could not start a jail.
+    ///
+    /// FAILS ON REVERT: answer a failed start `Failed` whatever its cause.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_probe_whose_bwrap_cannot_be_started_says_it_was_not_handed() {
+        let answers = answers_of_a_child("two_descriptors", false);
         assert_eq!(answers["Identified"], "NotHanded", "{answers:?}");
         assert_eq!(answers["Terminal"], "NotHanded", "{answers:?}");
     }
