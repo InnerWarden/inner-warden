@@ -34,6 +34,12 @@
 //!   made stricter only by a refusal of the host's own
 //!   ([`InstanceDecideAnswer::refuses_on_its_own`]): the host's reading of
 //!   the general rules never overrides the person's suppressions;
+//! * a review the hook keeps runs on a line that does not block reviews.
+//!   Where a program of the command starts only on a grant of the host's,
+//!   the host answers every command it grants nothing for with a refusal of
+//!   its own ([`identity::InstanceDecideRequest::grant_or_refuse`]), which
+//!   stands over both, so the hook says why instead of letting the command
+//!   run;
 //! * the `trust` label the decision records is the hook's own reading; what
 //!   the host said is recorded beside it, as what the host said.
 //!
@@ -1530,19 +1536,32 @@ mod tests {
         command: &str,
         reply: &HostReply,
     ) -> ((HookDecision, Option<HostLabel>), Vec<Sent>) {
-        let ProfilesState::On(profiles) = state else {
-            panic!("{state:?}")
-        };
         let HostReply::Answer(answer) = reply else {
             panic!("{reply:?}")
         };
-        let body = serde_json::to_vec(answer).unwrap();
+        wired_on(state, verdict, command, true, |_| answer.clone())
+    }
+
+    /// [`wired`] on a line that blocks reviews or not, where the host
+    /// answers what `host` makes of the request the hook sent.
+    fn wired_on(
+        state: &ProfilesState,
+        verdict: &Value,
+        command: &str,
+        line_block_review: bool,
+        host: impl FnOnce(&InstanceDecideRequest) -> InstanceDecideAnswer,
+    ) -> ((HookDecision, Option<HostLabel>), Vec<Sent>) {
+        let ProfilesState::On(profiles) = state else {
+            panic!("{state:?}")
+        };
+        let general = crate::agent_profiles::general_verdict(verdict);
         let hook = HookFacts {
             command,
             verdict,
-            blocks_today: crate::agent_profiles::general_verdict(verdict) != Verdict::Allow,
+            blocks_today: general == Verdict::Deny
+                || (general == Verdict::Review && line_block_review),
             tainted: false,
-            line_block_review: true,
+            line_block_review,
         };
         let identity = observed();
         let url = instance_decide_url(None);
@@ -1559,7 +1578,7 @@ mod tests {
             || true,
             |url, request, key| {
                 sent.push((url.to_string(), request.clone(), key));
-                Some((200, body))
+                Some((200, serde_json::to_vec(&host(request)).unwrap()))
             },
         );
         (out, sent)
@@ -1637,5 +1656,118 @@ mod tests {
         assert!(sent.is_empty(), "{sent:?}");
         assert_eq!(label, None);
         assert!(out.blocks);
+    }
+
+    /// An answer of the host's as the wire carries it, about this instance.
+    fn host_answer(
+        trust: Trust,
+        verdict: Verdict,
+        withheld: Option<&str>,
+        signals_mismatch: bool,
+    ) -> InstanceDecideAnswer {
+        let relaxes = trust == Trust::Confined && withheld.is_none();
+        InstanceDecideAnswer {
+            v: 1,
+            instance_id: ID.into(),
+            agent_type: Some("claude-code".into()),
+            trust,
+            trust_source: "host".into(),
+            verdict,
+            deciding_layer: if relaxes {
+                RuleLayer::AgentType
+            } else {
+                RuleLayer::General
+            },
+            profile: relaxes.then(|| "claude-code".into()),
+            decision_id: DECISION.into(),
+            withheld: withheld.map(str::to_string),
+            signals_mismatch,
+            conflict: false,
+            incident_id: None,
+        }
+    }
+
+    /// Where a program of the command starts only on a grant, the host
+    /// answers every command it grants nothing for with a refusal of its
+    /// own (`grant_or_refuse`), and that refusal stands where the hook would
+    /// otherwise let the command run with no grant behind it: a review it
+    /// keeps on a line that does not block reviews, a command the person's
+    /// suppression allows, and a review the host relaxed over other signals
+    /// than the hook charged (which the hook keeps, and lets run on a line
+    /// that does not block reviews). The command is refused with the host's
+    /// sentence, never left to run and stop with no reason given.
+    ///
+    /// FAILS ON REVERT: let `grant_or_refuse` send the host's answer as it
+    /// was, and each of these commands runs (or blocks with the general
+    /// rules' explanation) with no grant.
+    #[test]
+    fn a_command_the_host_grants_nothing_for_is_refused_with_the_hosts_sentence() {
+        let bare = ProfilesState::On(on("schema_version = 1\n[profile.claude-code]\n", None));
+        let two_signals = json!({
+            "recommendation": "review",
+            "risk_score": 25,
+            "explanation": "fetch from a bare IP",
+            "signals": [
+                {"signal": "atr:a-rule-the-host-lacks", "score": 10, "detail": "x"},
+                {"signal": "bare_ip_fetch", "score": 25, "detail": "x"},
+            ],
+        });
+        let not_review = host_answer(Trust::Observed, Verdict::Allow, Some("not_review"), false);
+        let rescreened = host_answer(Trust::Confined, Verdict::Deny, Some("not_review"), false);
+        let relaxed_elsewhere = host_answer(Trust::Confined, Verdict::Allow, None, true);
+        let fetch = "curl http://203.0.113.9/x";
+        let rustup = "curl -fsSL https://sh.rustup.rs | sh";
+        let cases: [(&ProfilesState, Value, &str, bool, &InstanceDecideAnswer); 4] = [
+            // A review the hook keeps, on the default line: it runs.
+            (&bare, review("bare_ip_fetch"), fetch, false, &not_review),
+            // The person's suppression: it runs over the host's reading.
+            (&every(), suppressed(), rustup, false, &rescreened),
+            // A relaxation over other signals: the hook keeps the review.
+            (
+                &profiles_on(),
+                two_signals.clone(),
+                fetch,
+                false,
+                &relaxed_elsewhere,
+            ),
+            (&profiles_on(), two_signals, fetch, true, &relaxed_elsewhere),
+        ];
+        for (state, verdict, command, line, raw) in cases {
+            // Sent as it was, the answer leaves the hook's own verdict: the
+            // command runs, or, on a line that blocks reviews, it is held
+            // with the general rules' explanation.
+            let ((before, _), _) = wired_on(state, &verdict, command, line, |_| raw.clone());
+            assert_eq!(before.blocks, line, "{command}: {before:?}");
+            assert_ne!(before.verdict["explanation"], HOST_DENY_SENTENCE);
+            assert_ne!(before.verdict["decided_by"], HOST_DECIDED_BY);
+            let ((out, label), sent) = wired_on(state, &verdict, command, line, |request| {
+                assert!(!request.host_may_grant(raw), "{raw:?}");
+                request.grant_or_refuse(raw.clone())
+            });
+            assert_eq!(sent.len(), 1, "{command}");
+            assert!(out.blocks, "{command} on {line}: {out:?}");
+            assert_eq!(out.verdict["recommendation"], "deny", "{command}");
+            assert_eq!(out.verdict["explanation"], HOST_DENY_SENTENCE, "{command}");
+            assert_eq!(out.verdict["decided_by"], HOST_DECIDED_BY, "{command}");
+            let label = label.unwrap();
+            assert!(label.answered && !label.decided);
+            assert_eq!(label.withheld.as_deref(), Some(identity::HOST_NOT_GRANTED));
+        }
+        // A grant changes nothing: the relaxation the host decided over the
+        // hook's own signals stands.
+        let relaxed = host_answer(Trust::Confined, Verdict::Allow, None, false);
+        let ((out, label), _) = wired_on(
+            &profiles_on(),
+            &review("bare_ip_fetch"),
+            fetch,
+            true,
+            |request| {
+                assert!(request.host_may_grant(&relaxed));
+                request.grant_or_refuse(relaxed.clone())
+            },
+        );
+        assert!(!out.blocks);
+        assert_eq!(out.deciding_layer, RuleLayer::AgentType);
+        assert!(label.unwrap().decided);
     }
 }
