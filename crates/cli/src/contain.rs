@@ -24,6 +24,11 @@
 //!     exposed. Deny rules are emitted LAST (last-wins on both backends).
 //!   * The backend binary is resolved from trusted absolute paths by the I/O
 //!     layer, never `$PATH`.
+//!   * On Linux every jail starts its programs under a seccomp filter
+//!     (`contain_seccomp`) where the host takes it: no keystrokes injected
+//!     into a terminal, and with `--identity` no new user namespace and no
+//!     joining one. A host that does not take it is told by a throwaway jail
+//!     first, and the jail then runs without it and says so.
 
 use std::path::{Path, PathBuf};
 
@@ -322,12 +327,20 @@ pub struct JailInputs {
     /// jail, handed to the jail's command as they were ([`launch_env`]).
     /// Empty unless the launch asked for an identity record.
     pub child_env: Vec<(String, String)>,
-    /// Start the jail so its programs cannot make user namespaces of their own
-    /// (`--unshare-user --disable-userns`). Decided by the launcher before the
-    /// jail is built ([`launch::userns_decision`]); `false` unless the launch
-    /// asked for an identity record, and a `true` without `--identity` adds
-    /// nothing to the argv.
+    /// The jail was started under the identified filter, so its programs
+    /// cannot make user namespaces of their own: the fact the launch record
+    /// carries (`jail.userns_closed`). Decided by the launcher before the jail
+    /// is built ([`launch::userns_decision`]); `false` unless the launch asked
+    /// for an identity record. It puts nothing in the argv: the filter is
+    /// [`JailInputs::seccomp_fd`]. Read by the Linux launcher only.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub close_userns: bool,
+    /// The descriptor bwrap reads the jail's seccomp filter from
+    /// (`--seccomp`, [`crate::contain_seccomp`]): the terminal filter for a
+    /// plain jail, the identified one with `--identity`. `None` where the
+    /// launcher's start-up probe found this host cannot start a jail with it,
+    /// and the jail then runs as it did before the filter.
+    pub seccomp_fd: Option<i32>,
 }
 
 impl JailInputs {
@@ -484,18 +497,17 @@ pub struct LinuxJailPlan {
 }
 
 /// The namespaces the jail unshares. The start-up probe of
-/// [`launch::userns_probe_argv`] asks for the same ones.
+/// [`launch::filter_probe_argv`] asks for the same ones.
 pub const JAIL_NAMESPACES: [&str; 3] = ["--unshare-pid", "--unshare-uts", "--unshare-ipc"];
 
-/// What closes user namespaces inside the jail. `--disable-userns` needs the
-/// jail to have a user namespace of its own, so the jail asks for it by name
-/// instead of leaving it to what bwrap does when it is not installed setuid.
-pub const USERNS_CLOSED: [&str; 2] = ["--unshare-user", "--disable-userns"];
+/// The bwrap option that hands it the jail's seccomp filter on a descriptor.
+pub const SECCOMP_OPTION: &str = "--seccomp";
 
 /// Build the ordered bwrap argument vector. Order is load-bearing (bwrap is
 /// last-wins): system RO → dev/proc/tmpfs → HOME tmpfs → dotdir re-binds → shadow
 /// innerwarden → binary binds → project (late) → worktree → nested secret masks →
-/// the host's key and the launch record (`--identity` only) → namespaces → child. `DOTDIR_DENY`
+/// the host's key and the launch record (`--identity` only) → namespaces and the
+/// seccomp filter → child. `DOTDIR_DENY`
 /// entries are never emitted, so they vanish under the HOME tmpfs.
 pub fn build_linux_jail(input: &JailInputs) -> Result<LinuxJailPlan, ContainError> {
     validate_jail_inputs(input)?;
@@ -669,12 +681,15 @@ pub fn build_linux_jail(input: &JailInputs) -> Result<LinuxJailPlan, ContainErro
     // --- namespaces / lifecycle ---
     push(&["--die-with-parent"]);
     push(&JAIL_NAMESPACES);
-    // After the record and every mount, like the rest of this block, and only
-    // for an identified launch whose host takes the option: the jail cannot
-    // make a user namespace of its own, so it cannot rebuild what it was
-    // refused. A defence in depth; it never changes the trust of the instance.
-    if input.args.identity && input.close_userns {
-        push(&USERNS_CLOSED);
+    // After the record and every mount, like the rest of this block: the
+    // seccomp filter bwrap applies to the jail's programs before the command
+    // runs, where the launcher's start-up probe found the host takes it. In
+    // every jail it refuses keystroke injection into a terminal; with
+    // `--identity` also new user namespaces and joining one, so the jail
+    // cannot rebuild what it was refused. A defence in depth; it never
+    // changes the trust of the instance.
+    if let Some(fd) = input.seccomp_fd {
+        push(&[SECCOMP_OPTION, &fd.to_string()]);
     }
     push(&["--hostname", "ai-sandbox"]);
     if !input.stdin_is_tty {
@@ -1072,6 +1087,10 @@ pub mod launch {
     /// the host has a system profiles file. A real run uses the pipe's own.
     pub const DRY_RUN_MARKER_FD: i32 = 12;
 
+    /// The seccomp filter descriptor a dry run shows, when the host takes the
+    /// filter. A real run uses the pipe's own.
+    pub const DRY_RUN_SECCOMP_FD: i32 = 13;
+
     // -- the user scope ------------------------------------------------------
     //
     // The order a launch runs in, and why it is this order:
@@ -1093,13 +1112,14 @@ pub mod launch {
     // 2, before any placement at 4) and does see any the agent tries later.
     // A bwrap option that makes a SECOND user namespace after step 3
     // (`--disable-userns`, or `--uid`/`--gid` other than the caller's) would
-    // be refused by such a policy and kill the jail: moving this order is a
-    // change to make with that in view. `--disable-userns` is used all the
-    // same, only where a throwaway jail started with it before step 1
-    // (`userns_decision`), and never started over: a refusal at step 3 comes
-    // after the jail reported its pid. Nothing here arms anything. On Ubuntu
-    // 24.04 bwrap itself needs the AppArmor profile that grants it `userns`
-    // (`userns_restriction_advice`, `flags=(unconfined)`).
+    // be refused by such a policy and kill the jail, so the jail uses none:
+    // its seccomp filter (`--seccomp`, applied by bwrap after it built the
+    // root, before the command runs) makes no namespace at all. Whether the
+    // host takes the filter is learned before step 1, by a throwaway jail
+    // (`filter_probe_argv`), and a launch is never started over: a failure at
+    // step 3 comes after the jail reported its pid. Nothing here arms
+    // anything. On Ubuntu 24.04 bwrap itself needs the AppArmor profile that
+    // grants it `userns` (`userns_restriction_advice`, `flags=(unconfined)`).
 
     /// The first systemd whose `systemd-run` has `--expand-environment=`, the
     /// switch that turns `$NAME` expansion of the command line on and off.
@@ -1211,52 +1231,38 @@ pub mod launch {
         digits.parse().ok()
     }
 
-    // -- user namespaces inside the jail -------------------------------------
+    // -- the seccomp filter of the jail ---------------------------------------
     //
-    // `bwrap --disable-userns` (bubblewrap 0.8.0) stops the jail's programs
-    // from making user namespaces of their own. It needs a bwrap that is not
-    // installed setuid, and on a host that restricts new user namespaces it
-    // can be refused. That is learned BEFORE the jail is built, by starting a
-    // throwaway jail with the option: the option makes a second user
-    // namespace after the jail has reported its pid, so a refusal there would
-    // kill a jail whose record was already handed in, and a launch that
-    // started over would not help the one case it was for. A host that
-    // cannot take the option runs the jail exactly as today.
+    // Every jail starts its programs under a seccomp filter
+    // (`crate::contain_seccomp`): the terminal one, and with `--identity` the
+    // identified one, which also closes user namespaces. bwrap has taken a
+    // filter on a descriptor (`--seccomp`) since its first releases, sets
+    // `no_new_privs` itself and applies the filter after it built the jail,
+    // a setuid bwrap included. What can still stop it is the host: a kernel
+    // without seccomp filters, or a binary run under another architecture's
+    // emulation (the filter would kill the jail's first call). That is learned
+    // BEFORE the jail is built, by starting a throwaway jail with the filter,
+    // and a launch is never started over. A host that cannot take it runs the
+    // jail as it did before the filter, and says so.
 
-    /// The first bubblewrap that has `--disable-userns`.
-    pub const DISABLE_USERNS_SINCE: (u32, u32, u32) = (0, 8, 0);
-
-    /// What `bwrap --version` and the file's mode say.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub struct BwrapFacts {
-        /// `None` when `bwrap --version` gave nothing this build reads.
-        pub version: Option<(u32, u32, u32)>,
-        /// The set-user-id bit is on the file bwrap runs from.
-        pub setuid: bool,
-    }
-
-    /// Why a launch keeps user namespaces open in the jail.
+    /// Why an identified launch keeps user namespaces open in the jail.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum UsernsWhy {
-        BwrapTooOld,
-        BwrapSetuid,
+        /// The throwaway jail with the identified filter did not exit 0, or
+        /// this build has no filter for the architecture it runs as.
         ProbeFailed,
     }
 
     impl UsernsWhy {
-        /// The word the dry run, the launcher and the dashboard share.
+        /// The word the dry run and the launcher share.
         pub fn word(self) -> &'static str {
             match self {
-                UsernsWhy::BwrapTooOld => "bwrap_too_old",
-                UsernsWhy::BwrapSetuid => "bwrap_setuid",
                 UsernsWhy::ProbeFailed => "userns_probe_failed",
             }
         }
 
         pub fn sentence(self) -> &'static str {
             match self {
-                UsernsWhy::BwrapTooOld => "Bubblewrap here is older than 0.8, so programs in the jail can still make user namespaces.",
-                UsernsWhy::BwrapSetuid => "Bubblewrap here runs setuid, so user namespaces stay open in the jail.",
                 UsernsWhy::ProbeFailed => "Bubblewrap here could not start a jail with user namespaces closed, so the jail runs without that.",
             }
         }
@@ -1282,37 +1288,40 @@ pub mod launch {
     }
 
     impl UsernsFact {
-        /// The fact the jail inputs carry: true only when the option is used.
+        /// The fact the jail inputs carry: true only when the identified
+        /// filter is used.
         pub fn close_userns(self) -> bool {
             self == UsernsFact::Closed
         }
     }
 
-    /// PURE. Close user namespaces in the jail only for an identified launch,
-    /// on a bwrap that is at least [`DISABLE_USERNS_SINCE`], not setuid, and
-    /// that started a throwaway jail with the option (`probe`, asked last and
-    /// only when everything before it holds, since it starts a process). A
-    /// version that is not known counts as too old: nothing says it has the
-    /// option.
-    pub fn userns_decision(
-        identity: bool,
-        facts: &BwrapFacts,
-        probe: impl FnOnce() -> bool,
-    ) -> UsernsFact {
+    /// PURE. Close user namespaces in the jail only for an identified launch
+    /// whose host started a throwaway jail under the identified filter
+    /// (`probe`, asked only with `--identity`, since it starts a process).
+    pub fn userns_decision(identity: bool, probe: impl FnOnce() -> bool) -> UsernsFact {
         if !identity {
             return UsernsFact::NotAsked;
-        }
-        match facts.version {
-            Some(version) if version >= DISABLE_USERNS_SINCE => {}
-            _ => return UsernsFact::Open(UsernsWhy::BwrapTooOld),
-        }
-        if facts.setuid {
-            return UsernsFact::Open(UsernsWhy::BwrapSetuid);
         }
         if !probe() {
             return UsernsFact::Open(UsernsWhy::ProbeFailed);
         }
         UsernsFact::Closed
+    }
+
+    /// The word and sentence of a plain jail (no `--identity`) whose host
+    /// could not start a jail under the terminal filter.
+    pub const TERMINAL_FILTER_OFF: (&str, &str) = (
+        "filter_probe_failed",
+        "Bubblewrap here could not start a jail with the sandbox filter, so programs in the jail can still inject keystrokes into your terminal.",
+    );
+
+    /// The line a plain launch prints (and its dry run shows) when the jail
+    /// runs without the terminal filter.
+    pub fn terminal_filter_off_sentence() -> String {
+        format!(
+            "innerwarden contain: no sandbox filter ({}): {}",
+            TERMINAL_FILTER_OFF.0, TERMINAL_FILTER_OFF.1
+        )
     }
 
     /// What a dry run of an identified launch says about user namespaces.
@@ -1332,7 +1341,7 @@ pub mod launch {
             matches!(self, DryRunUserns::Fact(UsernsFact::Closed))
         }
 
-        /// The comment lines the dry run prints, none when the option is used.
+        /// The comment lines the dry run prints, none when the filter is used.
         pub fn lines(&self) -> Vec<String> {
             match self {
                 DryRunUserns::Advice(lines) => lines
@@ -1360,34 +1369,21 @@ pub mod launch {
         }
     }
 
-    /// The version in `bwrap --version`, whose output is `bubblewrap 0.9.0`.
-    /// A suffix after the patch number (`0.8.0-rc1`) is ignored.
-    pub fn parse_bwrap_version(text: &str) -> Option<(u32, u32, u32)> {
-        let rest = text.lines().next()?.trim().strip_prefix("bubblewrap ")?;
-        let mut parts = rest.split_whitespace().next()?.split('.');
-        let number = |part: &str| -> Option<u32> {
-            let digits: String = part.chars().take_while(char::is_ascii_digit).collect();
-            if digits.is_empty() || digits.len() > 6 {
-                return None;
-            }
-            digits.parse().ok()
-        };
-        let whole = |part: &str| -> Option<u32> {
-            part.bytes()
-                .all(|b| b.is_ascii_digit())
-                .then(|| number(part))?
-        };
-        let major = whole(parts.next()?)?;
-        let minor = whole(parts.next()?)?;
-        let patch = parts.next().map_or(Some(0), number)?;
-        Some((major, minor, patch))
+    /// PURE. What a plain dry run (no `--identity`) shows of the terminal
+    /// filter: `None` where the host's restriction stops the real run before
+    /// any jail (the probe could only fail for that reason, so it is not
+    /// run), otherwise whether the throwaway jail under the filter started.
+    pub fn dry_run_terminal(restricted: bool, probe: impl FnOnce() -> bool) -> Option<bool> {
+        (!restricted).then(probe)
     }
 
     /// The arguments of the throwaway jail that tells whether the host takes
-    /// the option: the namespaces the real jail unshares, the option, the
-    /// host's root read-only, and a command that does nothing.
-    pub fn userns_probe_argv() -> Vec<String> {
-        let mut argv: Vec<String> = super::USERNS_CLOSED.iter().map(|s| s.to_string()).collect();
+    /// the filter on descriptor `fd`: the filter, the namespaces the real
+    /// jail unshares, the host's root read-only, and a command that does
+    /// nothing (run under the filter, so a filter that kills its first call
+    /// fails the probe).
+    pub fn filter_probe_argv(fd: i32) -> Vec<String> {
+        let mut argv = vec![super::SECCOMP_OPTION.to_string(), fd.to_string()];
         argv.extend(super::JAIL_NAMESPACES.iter().map(|s| s.to_string()));
         argv.extend(["--ro-bind", "/", "/", "true"].map(String::from));
         argv
@@ -2171,12 +2167,16 @@ mod tests {
             records_dirs: vec![],
             child_env: vec![],
             close_userns: false,
+            // A plain jail on a host that takes the terminal filter.
+            seccomp_fd: Some(launch::DRY_RUN_SECCOMP_FD),
         }
     }
 
     /// The whole bwrap argument vector of today's jail, one token per line.
     /// Written before the identity flag existed: a jail launched without the
-    /// flag must stay byte for byte this.
+    /// flag must stay byte for byte this. One change since, on purpose: the
+    /// terminal filter every jail starts under (`--seccomp`), pinned by
+    /// [`the_plain_jail_moved_only_by_its_terminal_filter`].
     #[test]
     fn golden_argv_of_the_jail_without_any_identity_flag() {
         let plan = build_linux_jail(&inputs(&["claude", "--print"])).unwrap();
@@ -2921,45 +2921,17 @@ mod tests {
         ));
     }
 
-    // ---- `--identity`: user namespaces closed inside the jail ----
+    // ---- the seccomp filter: user namespaces and the terminal ----
 
-    #[test]
-    fn bwrap_versions_are_read_from_the_first_line() {
-        use launch::parse_bwrap_version as parse;
-        assert_eq!(parse("bubblewrap 0.6.3\n"), Some((0, 6, 3)));
-        assert_eq!(parse("bubblewrap 0.8.0\n"), Some((0, 8, 0)));
-        assert_eq!(parse("bubblewrap 0.9.0"), Some((0, 9, 0)));
-        assert_eq!(parse("bubblewrap 0.11.2\nsecond line\n"), Some((0, 11, 2)));
-        assert_eq!(parse("bubblewrap 0.8.0-rc1"), Some((0, 8, 0)));
-        assert_eq!(parse("bubblewrap 0.8"), Some((0, 8, 0)));
-        for junk in [
-            "",
-            "\n",
-            "bubblewrap",
-            "bubblewrap ",
-            "bubblewrap x.y.z",
-            "bubblewrap 0.x.1",
-            "bubblewrap 1234567.0.0",
-            "systemd 255 (255.4)",
-            "0.9.0",
-            "\u{fffd}\u{fffd}",
-        ] {
-            assert_eq!(parse(junk), None, "{junk:?}");
-        }
-    }
-
-    fn bwrap_facts(version: Option<(u32, u32, u32)>, setuid: bool) -> launch::BwrapFacts {
-        launch::BwrapFacts { version, setuid }
-    }
-
-    /// `close_userns` needs `--identity`, a bwrap at 0.8.0 or later, a bwrap
-    /// that is not setuid, and a start-up probe that exited 0. The probe is
-    /// asked last, and only when every fact before it holds.
+    /// `close_userns` needs `--identity` and a throwaway jail under the
+    /// identified filter that exited 0; without `--identity` nothing is
+    /// probed. No version or mode of the bwrap file is read: every bwrap
+    /// takes a filter on a descriptor, a setuid one included.
     ///
-    /// FAILS ON REVERT: drop the version, the setuid or the probe check from
-    /// `userns_decision`, or let it answer without `--identity`.
+    /// FAILS ON REVERT: let `userns_decision` answer without the probe, or
+    /// probe without `--identity`.
     #[test]
-    fn user_namespaces_close_only_when_every_fact_allows_it() {
+    fn user_namespaces_close_only_with_identity_and_a_probe_that_passed() {
         use launch::{userns_decision, UsernsFact, UsernsWhy};
         let asked = std::cell::Cell::new(0);
         let probe = |ok: bool| {
@@ -2969,88 +2941,65 @@ mod tests {
                 ok
             }
         };
-        let good = bwrap_facts(Some((0, 9, 0)), false);
-        assert_eq!(
-            userns_decision(true, &good, probe(true)),
-            UsernsFact::Closed
-        );
+        assert_eq!(userns_decision(true, probe(true)), UsernsFact::Closed);
         assert!(UsernsFact::Closed.close_userns());
         assert_eq!(asked.get(), 1);
-        assert_eq!(
-            userns_decision(true, &bwrap_facts(Some((0, 8, 0)), false), probe(true)),
-            UsernsFact::Closed,
-            "0.8.0 is the first with the option"
-        );
-        asked.set(0);
-        for (facts, why) in [
-            (bwrap_facts(Some((0, 6, 3)), false), UsernsWhy::BwrapTooOld),
-            (bwrap_facts(Some((0, 7, 9)), false), UsernsWhy::BwrapTooOld),
-            (bwrap_facts(None, false), UsernsWhy::BwrapTooOld),
-            (bwrap_facts(Some((0, 9, 0)), true), UsernsWhy::BwrapSetuid),
-            (bwrap_facts(Some((0, 6, 3)), true), UsernsWhy::BwrapTooOld),
-        ] {
-            let fact = userns_decision(true, &facts, probe(true));
-            assert_eq!(fact, UsernsFact::Open(why), "{facts:?}");
-            assert!(!fact.close_userns());
-        }
-        assert_eq!(asked.get(), 0, "no probe runs when a fact already says no");
-        let failed = userns_decision(true, &good, probe(false));
+        let failed = userns_decision(true, probe(false));
         assert_eq!(failed, UsernsFact::Open(UsernsWhy::ProbeFailed));
         assert!(!failed.close_userns());
-        assert_eq!(asked.get(), 1);
-        // No `--identity`: nothing asked, nothing probed, whatever bwrap is.
-        asked.set(0);
-        assert_eq!(
-            userns_decision(false, &good, probe(true)),
-            UsernsFact::NotAsked
-        );
+        assert_eq!(asked.get(), 2);
+        assert_eq!(userns_decision(false, probe(true)), UsernsFact::NotAsked);
         assert!(!UsernsFact::NotAsked.close_userns());
-        assert_eq!(asked.get(), 0);
+        assert_eq!(asked.get(), 2, "no probe without --identity");
     }
 
-    /// The three sentences the launcher, the dry run and the dashboard say,
-    /// word for word, and the dashboard's copy of them.
+    /// The sentences the launcher and the dry run say, word for word; the
+    /// dashboard's line for a jail that closed them names the filter, and no
+    /// word of the bwrap version or mode is left anywhere.
     #[test]
-    fn the_userns_words_are_the_closed_table_and_the_dashboard_has_them() {
-        use launch::{userns_open_sentence, UsernsWhy};
-        let table = [
-            (
-                UsernsWhy::BwrapTooOld,
-                "bwrap_too_old",
-                "Bubblewrap here is older than 0.8, so programs in the jail can still make user namespaces.",
-            ),
-            (
-                UsernsWhy::BwrapSetuid,
-                "bwrap_setuid",
-                "Bubblewrap here runs setuid, so user namespaces stay open in the jail.",
-            ),
-            (
-                UsernsWhy::ProbeFailed,
-                "userns_probe_failed",
-                "Bubblewrap here could not start a jail with user namespaces closed, so the jail runs without that.",
-            ),
-        ];
+    fn the_filter_words_are_the_closed_table() {
+        use launch::{terminal_filter_off_sentence, userns_open_sentence, UsernsWhy};
+        let why = UsernsWhy::ProbeFailed;
+        assert_eq!(why.word(), "userns_probe_failed");
+        assert_eq!(
+            why.sentence(),
+            "Bubblewrap here could not start a jail with user namespaces closed, so the jail runs without that."
+        );
+        assert_eq!(
+            userns_open_sentence(why),
+            "innerwarden contain: user namespaces stay open (userns_probe_failed): Bubblewrap here could not start a jail with user namespaces closed, so the jail runs without that."
+        );
+        assert_eq!(
+            terminal_filter_off_sentence(),
+            "innerwarden contain: no sandbox filter (filter_probe_failed): Bubblewrap here could not start a jail with the sandbox filter, so programs in the jail can still inject keystrokes into your terminal."
+        );
         let words = include_str!("../../dashboard-kit/web/src/community/words.ts");
-        for (why, word, sentence) in table {
-            assert_eq!(why.word(), word);
-            assert_eq!(why.sentence(), sentence);
-            let line = userns_open_sentence(why);
-            assert!(line.contains(word) && line.contains(sentence), "{line}");
+        assert!(words.contains(
+            "export const USERNS_CLOSED_WORDS = \"User namespaces closed inside the jail (sandbox filter).\";"
+        ));
+        for gone in [
+            "bwrap_too_old",
+            "bwrap_setuid",
+            "older than 0.8",
+            "runs setuid",
+        ] {
+            assert!(!words.contains(gone), "words.ts still says {gone}");
+        }
+        for line in [userns_open_sentence(why), terminal_filter_off_sentence()] {
             assert!(!line.contains('\u{2014}'), "{line}");
-            let entry = format!("  {word}: \"{sentence}\",");
-            assert!(words.contains(&entry), "words.ts has no `{entry}`");
         }
     }
 
     /// On a host whose kernel restricts unprivileged user namespaces, with no
     /// profile for bwrap, a dry run of an identified launch says the real
     /// cause (the advice the real run stops with) and never starts the probe,
-    /// which there could only fail and name `userns_probe_failed` instead.
+    /// which there could only fail and name `userns_probe_failed` instead. A
+    /// plain dry run probes nothing there either.
     ///
     /// FAILS ON REVERT: run the probe before the advice is looked at.
     #[test]
     fn a_dry_run_says_the_restriction_and_never_probes_where_it_applies() {
-        use launch::{dry_run_userns, DryRunUserns, UsernsFact, UsernsWhy};
+        use launch::{dry_run_terminal, dry_run_userns, DryRunUserns, UsernsFact, UsernsWhy};
         let advice = userns_restriction_advice(Some("1\n"), false, Path::new("/usr/bin/bwrap"));
         let said = dry_run_userns(advice.clone(), || {
             panic!("the probe is not started where the advice applies")
@@ -3067,7 +3016,7 @@ mod tests {
             .iter()
             .any(|line| line.contains("userns_probe_failed")));
 
-        // No restriction: what the probe and the facts say, as before.
+        // No restriction: what the probe says, as before.
         let open = dry_run_userns(None, || UsernsFact::Open(UsernsWhy::ProbeFailed));
         assert_eq!(
             open.lines(),
@@ -3080,75 +3029,135 @@ mod tests {
         let closed = dry_run_userns(None, || UsernsFact::Closed);
         assert!(closed.close_userns());
         assert!(closed.lines().is_empty());
+
+        // The plain dry run: nothing probed under the restriction, the
+        // probe's answer otherwise.
+        assert_eq!(
+            dry_run_terminal(true, || panic!("no probe where the advice applies")),
+            None
+        );
+        assert_eq!(dry_run_terminal(false, || true), Some(true));
+        assert_eq!(dry_run_terminal(false, || false), Some(false));
     }
 
-    /// The start-up probe asks for the namespaces the jail unshares, with the
-    /// option, and runs nothing.
+    /// The start-up probe starts a jail under the filter on its descriptor,
+    /// with the namespaces the jail unshares, and runs nothing; the jail puts
+    /// the filter right after those namespaces.
     ///
-    /// FAILS ON REVERT: probe without `--unshare-user` or drop a namespace from
+    /// FAILS ON REVERT: probe without the filter, or drop a namespace from
     /// `JAIL_NAMESPACES`' use in the probe.
     #[test]
-    fn the_probe_starts_a_jail_with_the_option_and_the_jails_namespaces() {
-        let argv = launch::userns_probe_argv();
-        assert_eq!(&argv[..2], USERNS_CLOSED);
+    fn the_probe_starts_a_jail_under_the_filter_with_the_jails_namespaces() {
+        let argv = launch::filter_probe_argv(21);
+        assert_eq!(&argv[..2], ["--seccomp", "21"]);
         assert_eq!(&argv[2..5], JAIL_NAMESPACES);
         assert_eq!(&argv[5..], ["--ro-bind", "/", "/", "true"]);
-        let mut input = identified_inputs();
-        input.close_userns = true;
-        let jail = build_linux_jail(&input).unwrap().bwrap_args;
-        let at = jail
-            .windows(JAIL_NAMESPACES.len())
-            .position(|w| w == JAIL_NAMESPACES)
-            .expect("the jail unshares these");
-        assert_eq!(&jail[at + 3..at + 5], USERNS_CLOSED);
+        for mut input in [inputs(&["claude", "--print"]), identified_inputs()] {
+            input.seccomp_fd = Some(21);
+            let jail = build_linux_jail(&input).unwrap().bwrap_args;
+            let at = jail
+                .windows(JAIL_NAMESPACES.len())
+                .position(|w| w == JAIL_NAMESPACES)
+                .expect("the jail unshares these");
+            assert_eq!(&jail[at + 3..at + 5], ["--seccomp", "21"]);
+            assert_eq!(jail.iter().filter(|a| *a == "--seccomp").count(), 1);
+        }
     }
 
-    /// With `--identity` and the fact, the option follows the namespaces
-    /// (`--unshare-user` names the user namespace `--disable-userns` needs).
+    /// With `--identity` and a host that takes the identified filter, the
+    /// filter follows the namespaces, and nothing of the user namespace
+    /// option that came before it is left: no second user namespace.
+    ///
+    /// FAILS ON REVERT: emit `--unshare-user --disable-userns` again.
     #[test]
     fn golden_argv_of_an_identified_jail_with_user_namespaces_closed() {
         let mut input = identified_inputs();
         input.close_userns = true;
+        input.seccomp_fd = Some(launch::DRY_RUN_SECCOMP_FD);
         let got = build_linux_jail(&input).unwrap().bwrap_args.join("\n");
         assert_eq!(
             got,
-            GOLDEN_ARGV_IDENTIFIED.replace(
-                "--unshare-ipc\n",
-                "--unshare-ipc\n--unshare-user\n--disable-userns\n"
-            )
+            GOLDEN_ARGV_IDENTIFIED.replace("--unshare-ipc\n", "--unshare-ipc\n--seccomp\n13\n")
         );
         assert_ne!(got, GOLDEN_ARGV_IDENTIFIED);
+        assert!(!got.contains("--disable-userns") && !got.contains("--unshare-user"));
     }
 
-    /// The fact asks for nothing without `--identity`: the argv is what it
-    /// was, and an identified jail whose host cannot take the option is what
-    /// it was too.
+    /// `close_userns` is the record's fact and puts nothing in the argv; the
+    /// filter is the descriptor. An identified jail whose host did not take
+    /// the filter is the jail the previous build made with its probe failing,
+    /// byte for byte, and so is a plain one without the filter.
     ///
-    /// FAILS ON REVERT: emit the option for `close_userns` without checking
-    /// `--identity`.
+    /// FAILS ON REVERT: emit anything for `close_userns`, or emit the filter
+    /// without a descriptor.
     #[test]
-    fn the_option_needs_identity_and_the_fact_and_otherwise_the_argv_is_todays() {
+    fn the_filter_needs_its_descriptor_and_otherwise_the_argv_is_the_previous_builds() {
+        use crate::observe::sha256_hex;
         let mut plain = inputs(&["claude", "--print"]);
         plain.close_userns = true;
         assert_eq!(
             build_linux_jail(&plain).unwrap().bwrap_args.join("\n"),
             GOLDEN_ARGV_PLAIN
         );
-        let mut rich = inputs(&["/bin/sh", "-c", "true"]);
-        rich.close_userns = true;
-        assert!(!build_linux_jail(&rich)
-            .unwrap()
-            .bwrap_args
-            .iter()
-            .any(|a| a == "--disable-userns" || a == "--unshare-user"));
-        // Identified, the host took no option (an old or setuid bwrap, or a
-        // probe that failed): byte for byte the jail the previous build made.
-        let mut old = identified_inputs();
-        old.close_userns = false;
+        // Identified, the probe failed: the 4ded5fea golden, to the byte.
+        let old = identified_inputs();
+        let got = build_linux_jail(&old).unwrap().bwrap_args.join("\n");
+        assert_eq!(got, GOLDEN_ARGV_IDENTIFIED);
         assert_eq!(
-            build_linux_jail(&old).unwrap().bwrap_args.join("\n"),
+            sha256_hex(got.as_bytes()),
+            "648f991ed81d228baa0f4c080f5eb53c6fe864d6e4c5be6f3660da6bffbb5044"
+        );
+        let mut said_closed = identified_inputs();
+        said_closed.close_userns = true;
+        assert_eq!(
+            build_linux_jail(&said_closed)
+                .unwrap()
+                .bwrap_args
+                .join("\n"),
             GOLDEN_ARGV_IDENTIFIED
         );
+    }
+
+    /// The plain jail's argument vector moved by one pair since the build
+    /// before the filter, the terminal filter, on purpose, and by nothing
+    /// else. Without the filter (a host whose probe failed) it is
+    /// that build's, to the byte (the hashes are of the goldens at 4ded5fea).
+    ///
+    /// FAILS ON REVERT: move or add anything else in the plain jail.
+    #[test]
+    fn the_plain_jail_moved_only_by_its_terminal_filter() {
+        use crate::observe::sha256_hex;
+        let mut rich = inputs(&["/bin/sh", "-c", "true"]);
+        rich.stdin_is_tty = false;
+        rich.agent_binary = Some(ResolvedBinary {
+            link: PathBuf::from("/home/dev/.local/bin/claude"),
+            target_dir: PathBuf::from("/home/dev/.local/share/claude/v1"),
+        });
+        rich.worktree = Some(Worktree {
+            git_dir: PathBuf::from("/home/dev/repo/.git/worktrees/w"),
+            common_dir: PathBuf::from("/home/dev/repo/.git"),
+        });
+        for (mut input, golden, before) in [
+            (
+                inputs(&["claude", "--print"]),
+                GOLDEN_ARGV_PLAIN,
+                "d431bc2766d7a4d45b4bd7cd773e64ba5990b9f6b7967e99165f527f5316dff1",
+            ),
+            (
+                rich,
+                GOLDEN_ARGV_RICH,
+                "0aa4fbb5a6c3452d3d68997c66f488e545c70e767268c6cfa5c37fe9fade3200",
+            ),
+        ] {
+            assert_eq!(golden.matches("--seccomp").count(), 1);
+            let without = golden.replacen("\n--seccomp\n13\n", "\n", 1);
+            assert_eq!(sha256_hex(without.as_bytes()), before);
+            input.seccomp_fd = None;
+            assert_eq!(
+                build_linux_jail(&input).unwrap().bwrap_args.join("\n"),
+                without
+            );
+        }
     }
 
     /// The record names `userns_closed` only when the option was used, and
@@ -3234,8 +3243,7 @@ mod tests {
         "--unshare-pid",
         "--unshare-uts",
         "--unshare-ipc",
-        "--unshare-user",
-        "--disable-userns",
+        "--seccomp",
         "--hostname",
         "--new-session",
         "--setenv",
@@ -3261,9 +3269,8 @@ mod tests {
             git_dir: PathBuf::from("/home/dev/repo/.git/worktrees/w"),
             common_dir: PathBuf::from("/home/dev/repo/.git"),
         });
-        // Each jail twice: with the facts an identified launch has by default
-        // (the option not taken) and with `close_userns`. The default never
-        // sees the option, so only the second proves where it goes.
+        // Each jail twice: without the filter (a host whose probe failed) and
+        // with the identified one. Only the second proves where it goes.
         let mut cases = Vec::new();
         for (input, golden) in [
             (inputs(&["claude", "--print"]), GOLDEN_ARGV_PLAIN),
@@ -3276,6 +3283,7 @@ mod tests {
         for (mut input, golden, close) in cases {
             input.args.identity = true;
             input.close_userns = close;
+            input.seccomp_fd = close.then_some(launch::DRY_RUN_SECCOMP_FD);
             input.info_fd = Some(7);
             input.record_fd = Some(8);
             let got = build_linux_jail(&input).unwrap().bwrap_args;
@@ -3309,25 +3317,34 @@ mod tests {
             let info = without.iter().position(|a| a == "--info-fd").unwrap();
             without.drain(info..info + 2);
             if close {
-                // The option comes after the record and every mount, and
-                // only with the fact.
-                let userns = got
+                // The filter comes after the record and every mount, and
+                // only with its descriptor.
+                let filter = got
                     .windows(2)
-                    .position(|w| w == USERNS_CLOSED)
-                    .expect("--unshare-user --disable-userns");
-                assert!(at + 3 <= userns, "the option follows the record");
+                    .position(|w| w[0] == "--seccomp" && w[1] == "13")
+                    .expect("--seccomp 13");
+                assert!(at + 3 <= filter, "the filter follows the record");
                 assert!(
-                    got[userns + 2..terminator]
+                    got[filter + 2..terminator]
                         .iter()
                         .all(|a| a != "--bind" && a != "--ro-bind" && a != "--tmpfs"),
-                    "no mount follows the option"
+                    "no mount follows the filter"
                 );
-                let at_without = without.iter().position(|a| a == USERNS_CLOSED[0]).unwrap();
-                without.drain(at_without..at_without + 2);
             } else {
-                assert!(!got.iter().any(|a| a == "--disable-userns"));
+                assert!(!got.iter().any(|a| a == "--seccomp"));
             }
-            assert_eq!(without.join("\n"), golden);
+            assert!(!got
+                .iter()
+                .any(|a| a == "--disable-userns" || a == "--unshare-user"));
+            // Without the record, its descriptor and the filter, the jail
+            // is the plain one without its filter.
+            if let Some(at_filter) = without.iter().position(|a| a == "--seccomp") {
+                without.drain(at_filter..at_filter + 2);
+            }
+            assert_eq!(
+                without.join("\n"),
+                golden.replacen("\n--seccomp\n13\n", "\n", 1)
+            );
         }
     }
 
@@ -3388,6 +3405,7 @@ mod tests {
         off.record_fd = None;
         off.key_fd = Some(11);
         off.existing_paths.pop();
+        off.seccomp_fd = Some(launch::DRY_RUN_SECCOMP_FD);
         assert_eq!(
             build_linux_jail(&off).unwrap().bwrap_args.join("\n"),
             GOLDEN_ARGV_PLAIN
@@ -3686,6 +3704,11 @@ mod tests {
             ("LD_LIBRARY_PATH".into(), "/home/dev/lib".into()),
             ("PATH".into(), "/home/dev/.local/bin:/usr/bin".into()),
         ];
+        // A host whose throwaway jail under the identified filter failed:
+        // the jail an identified launch made before the filter, byte for
+        // byte. The filter's own case sets these two.
+        input.seccomp_fd = None;
+        input.close_userns = false;
         input
     }
 
@@ -3731,6 +3754,7 @@ mod tests {
         off.info_fd = None;
         off.record_fd = None;
         off.existing_paths.pop();
+        off.seccomp_fd = Some(launch::DRY_RUN_SECCOMP_FD);
         assert_eq!(
             build_linux_jail(&off).unwrap().bwrap_args.join("\n"),
             GOLDEN_ARGV_PLAIN
@@ -4731,6 +4755,8 @@ mod tests {
         --unshare-pid\n\
         --unshare-uts\n\
         --unshare-ipc\n\
+        --seccomp\n\
+        13\n\
         --hostname\n\
         ai-sandbox\n\
         --\n\
@@ -4829,6 +4855,8 @@ mod tests {
         --unshare-pid\n\
         --unshare-uts\n\
         --unshare-ipc\n\
+        --seccomp\n\
+        13\n\
         --hostname\n\
         ai-sandbox\n\
         --new-session\n\

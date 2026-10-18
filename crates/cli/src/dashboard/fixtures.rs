@@ -666,7 +666,6 @@ fn identity_record_json(
         judged: None,
         user: Some("dev".into()),
         project_dir: None,
-        userns_gap: None,
     }
 }
 

@@ -129,29 +129,28 @@ fn jail_bwrap() -> Option<std::path::PathBuf> {
         .map(std::path::Path::to_path_buf)
 }
 
-/// What an identified launch on this host does about user namespaces, from
-/// the facts the launcher reads, computed here so each test asserts exactly
-/// one branch.
+/// What a launch on this host does about the jail's seccomp filter, from the
+/// facts the launcher reads, computed here so each test asserts exactly one
+/// branch.
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum UsernsHere {
-    /// No bwrap: a dry run says nothing about them.
+enum FilterHere {
+    /// No bwrap: a dry run says nothing about it.
     NoBwrap,
     /// The kernel restricts unprivileged user namespaces and bwrap has no
     /// profile: the real run stops with the advice, a dry run says it.
     Restricted,
-    /// bwrap 0.8 or later, not setuid, and the throwaway jail with the
-    /// option exits 0: the option is used, the record is schema 2.
-    Closed,
-    /// Any other host: no option, the line that says why, schema 1.
-    Open,
+    /// A throwaway jail under a filter exits 0: every jail gets its filter,
+    /// and an identified one's record is schema 2.
+    Taken,
+    /// Any other host: no filter, the line that says why, schema 1.
+    NotTaken,
 }
 
 #[cfg(target_os = "linux")]
-fn userns_here() -> UsernsHere {
-    use std::os::unix::fs::PermissionsExt;
+fn filter_here() -> FilterHere {
     let Some(bwrap) = jail_bwrap() else {
-        return UsernsHere::NoBwrap;
+        return FilterHere::NoBwrap;
     };
     let restricted =
         std::fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
@@ -159,54 +158,43 @@ fn userns_here() -> UsernsHere {
     let profile = std::path::Path::new("/etc/apparmor.d/bwrap").exists()
         || std::path::Path::new("/etc/apparmor.d/usr.bin.bwrap").exists();
     if restricted && !profile {
-        return UsernsHere::Restricted;
+        return FilterHere::Restricted;
     }
-    let version = Command::new(&bwrap)
-        .arg("--version")
-        .output()
-        .ok()
-        .and_then(|out| {
-            let text = String::from_utf8_lossy(&out.stdout).into_owned();
-            let number = text.trim().strip_prefix("bubblewrap ")?.to_string();
-            let mut parts = number.split('.').map(|p| {
-                p.chars()
-                    .take_while(char::is_ascii_digit)
-                    .collect::<String>()
-                    .parse::<u32>()
-                    .ok()
-            });
-            Some((
-                parts.next()??,
-                parts.next()??,
-                parts.next().flatten().unwrap_or(0),
-            ))
-        });
-    let setuid = std::fs::metadata(&bwrap)
-        .map(|m| m.permissions().mode() & 0o4000 != 0)
-        .unwrap_or(true);
-    let probe = || {
-        Command::new(&bwrap)
-            .args([
-                "--unshare-user",
-                "--disable-userns",
-                "--unshare-pid",
-                "--unshare-uts",
-                "--unshare-ipc",
-                "--ro-bind",
-                "/",
-                "/",
-                "true",
-            ])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success())
-    };
-    if version.is_some_and(|v| v >= (0, 8, 0)) && !setuid && probe() {
-        UsernsHere::Closed
+    // This test's own probe, independent of the launcher's: a filter that
+    // allows every call of this build's architecture and kills any other
+    // (so a binary under another architecture's emulation is told apart, as
+    // the launcher's filter tells it), on a descriptor, under the namespaces
+    // the jail unshares.
+    let audit_arch: [u8; 4] = if cfg!(target_arch = "x86_64") {
+        0xC000_003Eu32.to_le_bytes()
     } else {
-        UsernsHere::Open
+        0xC000_00B7u32.to_le_bytes()
+    };
+    let mut program = vec![0x20, 0, 0, 0, 4, 0, 0, 0, 0x15, 0, 0, 1];
+    program.extend(audit_arch);
+    program.extend([
+        0x06, 0, 0, 0, 0, 0, 0xff, 0x7f, 0x06, 0, 0, 0, 0, 0, 0, 0x80,
+    ]);
+    let dir = tempfile::TempDir::new().unwrap();
+    let filter = dir.path().join("native.bpf");
+    std::fs::write(&filter, program).unwrap();
+    let taken = Command::new("/bin/sh")
+        .args([
+            "-c",
+            "exec \"$0\" --seccomp 3 --unshare-pid --unshare-uts --unshare-ipc \
+             --ro-bind / / true 3<\"$1\"",
+        ])
+        .arg(&bwrap)
+        .arg(&filter)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    if taken {
+        FilterHere::Taken
+    } else {
+        FilterHere::NotTaken
     }
 }
 
@@ -226,6 +214,9 @@ const READ_THE_RECORD: &str = "readlink /proc/self/ns/pid; \
         then echo RECORD-REPLACED; fi; \
     if [ -e /run/innerwarden/agent-tls.spki ]; then echo KEY-HANDED-IN; fi; \
     if [ -e /run/innerwarden/system-profiles-root ]; then echo PROFILES-MARKED; fi; \
+    grep -E '^Seccomp(_filters)?:' /proc/self/status; \
+    if ! command -v unshare >/dev/null; then echo NO-UNSHARE; \
+    elif unshare -U true 2>/dev/null; then echo NESTED-USERNS; else echo NESTED-REFUSED; fi; \
     exit 0";
 
 #[cfg(target_os = "linux")]
@@ -329,20 +320,27 @@ fn identity_flag_mounts_the_record_read_only_inside_and_keeps_a_private_copy() {
     assert!(!stdout.contains("PROFILES-MARKED"), "{stdout}");
 
     let record: serde_json::Value = serde_json::from_slice(&outside).unwrap();
-    // Schema 2 exactly when this host's bwrap takes the option (0.8 or later,
-    // not setuid, the throwaway jail exits 0): then, and only then, the record
-    // says so. Any other host writes the schema 1 it always wrote, without
-    // the field.
-    match userns_here() {
-        UsernsHere::Closed => {
+    // Schema 2 exactly when this host takes the filter (the throwaway jail
+    // under it exits 0): then, and only then, the record says so, the jail's
+    // programs run under it and cannot make a user namespace. Any other host
+    // writes the schema 1 it always wrote, without the field.
+    match filter_here() {
+        FilterHere::Taken => {
             assert_eq!(record["schema"], 2, "{record}");
             assert_eq!(record["jail"]["userns_closed"], true, "{record}");
+            assert!(runs_under_one_more_filter(&stdout, true), "{stdout}");
+            assert!(!stdout.contains("NESTED-USERNS"), "{stdout}");
+            if !stdout.contains("NO-UNSHARE") {
+                assert!(stdout.contains("NESTED-REFUSED"), "{stdout}");
+            }
         }
-        UsernsHere::Open => {
+        FilterHere::NotTaken => {
             assert_eq!(record["schema"], 1, "{record}");
             assert!(record["jail"].get("userns_closed").is_none(), "{record}");
             assert!(
-                stderr.contains("innerwarden contain: user namespaces stay open ("),
+                stderr.contains(
+                    "innerwarden contain: user namespaces stay open (userns_probe_failed)"
+                ),
                 "{stderr}"
             );
         }
@@ -400,7 +398,10 @@ fn without_the_identity_flag_no_record_is_written_and_nothing_changes() {
             "/bin/sh",
             "-c",
             "readlink /proc/self/ns/pid; \
-             if [ -e /run/innerwarden/system-profiles-root ]; then echo PROFILES-MARKED; fi",
+             if [ -e /run/innerwarden/system-profiles-root ]; then echo PROFILES-MARKED; fi; \
+             grep -E '^Seccomp(_filters)?:' /proc/self/status; \
+             if ! command -v unshare >/dev/null; then echo NO-UNSHARE; \
+             elif unshare -U true 2>/dev/null; then echo NESTED-USERNS; else echo NESTED-REFUSED; fi",
         ])
         .env("HOME", home.path())
         .env_remove("XDG_STATE_HOME")
@@ -423,12 +424,85 @@ fn without_the_identity_flag_no_record_is_written_and_nothing_changes() {
     );
     // The launcher's marker that the way to the system profiles file is
     // root's: only where the host has that file.
+    let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(
-        String::from_utf8_lossy(&output.stdout).contains("PROFILES-MARKED"),
+        stdout.contains("PROFILES-MARKED"),
         std::path::Path::new(SYSTEM_PROFILES).exists(),
-        "{}",
-        String::from_utf8_lossy(&output.stdout)
+        "{stdout}"
     );
+    // The one change without the flag, on purpose: the jail's programs run under the terminal filter where the host takes it, which
+    // refuses keystroke injection and nothing a plain jail could do before,
+    // user namespaces included.
+    match filter_here() {
+        FilterHere::Taken => {
+            assert!(runs_under_one_more_filter(&stdout, true), "{stdout}");
+            assert!(!stderr.contains("no sandbox filter"), "{stderr}");
+            if !stdout.contains("NO-UNSHARE") && unshare_works_here() {
+                assert!(stdout.contains("NESTED-USERNS"), "{stdout}");
+            }
+        }
+        FilterHere::NotTaken => {
+            assert!(
+                stderr.contains("innerwarden contain: no sandbox filter (filter_probe_failed)"),
+                "{stderr}"
+            );
+            assert!(runs_under_one_more_filter(&stdout, false), "{stdout}");
+        }
+        other => panic!("the jail ran on a host where {other:?}: {stdout}"),
+    }
+}
+
+/// The `Seccomp_filters:` count of a `/proc/<pid>/status` text.
+#[cfg(target_os = "linux")]
+fn seccomp_filters(status: &str) -> Option<u32> {
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("Seccomp_filters:"))
+        .and_then(|n| n.trim().parse().ok())
+}
+
+/// Whether the jail's programs (their `/proc/self/status` lines in
+/// `inside`) run under exactly one filter more than this test does when
+/// `filtered`, and under the same ones otherwise. The count, not the mode:
+/// a test that already runs under a filter (a container's, an emulator's)
+/// shows mode 2 inside any jail. A kernel too old to count filters (before
+/// 5.9) is judged by the mode alone, and only where the jail has one.
+#[cfg(target_os = "linux")]
+fn runs_under_one_more_filter(inside: &str, filtered: bool) -> bool {
+    let own = std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .as_deref()
+        .and_then(seccomp_filters);
+    match (own, seccomp_filters(inside)) {
+        (Some(own), Some(jail)) => jail == own + u32::from(filtered),
+        _ => !filtered || inside.contains("Seccomp:\t2"),
+    }
+}
+
+/// Whether a jail without any filter can make a user namespace here: the
+/// host's own answer, so the plain jail is held to what it could do before.
+#[cfg(target_os = "linux")]
+fn unshare_works_here() -> bool {
+    let Some(bwrap) = jail_bwrap() else {
+        return false;
+    };
+    Command::new(bwrap)
+        .args([
+            "--unshare-pid",
+            "--unshare-uts",
+            "--unshare-ipc",
+            "--ro-bind",
+            "/",
+            "/",
+            "unshare",
+            "-U",
+            "true",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 /// The host's system profiles file.
@@ -543,18 +617,24 @@ fn dry_run_shows_the_record_and_info_descriptors_only_with_the_identity_flag() {
         .filter(|l| !l.starts_with("#   IW_HOOK_AGENT="))
         .map(|l| format!("{l}\n"))
         .collect();
-    // The ways the dry run speaks of user namespaces: the option in the
-    // argument list, the line that says why it is not there, or, where the
-    // kernel's restriction stops the real run first, its advice. Exactly the
-    // one this host's facts give, and the plain run says none.
-    let option = " --unshare-user --disable-userns";
+    // The ways the dry run speaks of the filter: the filter in the argument
+    // list, the line that says why it is not there, or, where the kernel's
+    // restriction stops the real run first, its advice. Exactly the one this
+    // host's facts give; the plain run shows the same filter (its own, the
+    // terminal one) and never the advice.
+    let option = " --unshare-ipc --seccomp 13 --hostname ai-sandbox ";
     let said = "# innerwarden contain: user namespaces stay open (";
+    let plain_said = "# innerwarden contain: no sandbox filter (filter_probe_failed): ";
     let advice = "# innerwarden contain: this kernel restricts unprivileged user namespaces";
     assert!(
-        !plain.contains("--disable-userns") && !plain.contains(said) && !plain.contains(advice),
+        !plain.contains("--disable-userns")
+            && !identified.contains("--disable-userns")
+            && !identified.contains("--unshare-user")
+            && !plain.contains(said)
+            && !plain.contains(advice),
         "{plain}"
     );
-    let here = userns_here();
+    let here = filter_here();
     assert_eq!(
         (
             identified.contains(option),
@@ -562,37 +642,34 @@ fn dry_run_shows_the_record_and_info_descriptors_only_with_the_identity_flag() {
             identified.contains(advice)
         ),
         match here {
-            UsernsHere::NoBwrap => (false, false, false),
-            UsernsHere::Restricted => (false, false, true),
-            UsernsHere::Closed => (true, false, false),
-            UsernsHere::Open => (false, true, false),
+            FilterHere::NoBwrap => (false, false, false),
+            FilterHere::Restricted => (false, false, true),
+            FilterHere::Taken => (true, false, false),
+            FilterHere::NotTaken => (false, true, false),
         },
         "{here:?}: {identified}"
     );
-    if here == UsernsHere::Closed {
-        assert_eq!(
-            identified.matches("--disable-userns").count(),
-            1,
-            "{identified}"
-        );
-        assert!(
-            identified.contains(&format!(" --unshare-ipc{option} --hostname ai-sandbox ")),
-            "the option follows the namespaces: {identified}"
-        );
-    }
-    if here == UsernsHere::Open {
+    assert_eq!(
+        (plain.contains(option), plain.contains(plain_said)),
+        match here {
+            FilterHere::NoBwrap | FilterHere::Restricted => (false, false),
+            FilterHere::Taken => (true, false),
+            FilterHere::NotTaken => (false, true),
+        },
+        "{here:?}: {plain}"
+    );
+    assert!(identified.matches("--seccomp").count() <= 1, "{identified}");
+    if here == FilterHere::NotTaken {
         assert!(
             identified
                 .lines()
                 .filter(|l| l.starts_with(said))
-                .all(|l| l.contains("(bwrap_too_old)")
-                    || l.contains("(bwrap_setuid)")
-                    || l.contains("(userns_probe_failed)")),
+                .all(|l| l.contains("(userns_probe_failed)")),
             "{identified}"
         );
     }
     // The advice block is the real run's refusal, said as comments.
-    let advice_lines: Vec<&str> = if here == UsernsHere::Restricted {
+    let advice_lines: Vec<&str> = if here == FilterHere::Restricted {
         identified
             .lines()
             .skip_while(|l| !l.starts_with(advice))
@@ -601,10 +678,14 @@ fn dry_run_shows_the_record_and_info_descriptors_only_with_the_identity_flag() {
     } else {
         Vec::new()
     };
+    let plain: String = plain
+        .lines()
+        .filter(|l| !l.starts_with(plain_said))
+        .map(|l| format!("{l}\n"))
+        .collect();
     let without: String = identified
         .replace(" --ro-bind-data 10 /run/innerwarden/instance.json", "")
         .replace(key, "")
-        .replace(option, "")
         .replace(" --info-fd 9", "")
         .replace(
             &format!(

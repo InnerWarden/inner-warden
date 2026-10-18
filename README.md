@@ -75,7 +75,8 @@ only — no IP, no host data; set `INNERWARDEN_NO_TELEMETRY=1` to disable). A
 - AI Jail: run an agent in a constrained profile so a screened-and-denied action
   is stopped rather than merely flagged. Linux (bubblewrap) and macOS
   (sandbox-exec) only; `contain` exits with an explicit error on Windows rather
-  than pretending to isolate.
+  than pretending to isolate. On Linux every jail starts its programs under a
+  seccomp filter that refuses injecting keystrokes into your terminal.
 - Agent identity (off by default, Linux): `innerwarden contain --identity --
   <command>` records the run as an instance, so its hook and the dashboard can
   tell one agent's runs apart. See [Agent identity and trust](#agent-identity-and-trust).
@@ -204,9 +205,17 @@ commands only; MCP tools and file edits keep your general rules. A profile
 applies to any program started in a jail under its agent's name: the type is
 the name given at launch.
 
-Limits: this is not yet proven on RHEL 9 or Rocky 9, and where bubblewrap is
-older than 0.8 (or installed setuid) programs in the jail can still create user
-namespaces.
+An identified jail starts its programs under a seccomp filter, in the style of
+Flatpak: no new user namespaces, no joining other namespaces, no injecting
+keystrokes into your terminal. Programs that need their own user namespace
+(Chromium's sandbox, rootless containers, an agent's own bubblewrap sandbox)
+do not work inside it; turn the agent's own sandbox off inside `innerwarden
+contain`. A jail started without `--identity` gets only the keystroke rule.
+Where the host cannot start a jail with the filter (a kernel without seccomp
+filters, a binary run under another architecture's emulation), the jail runs
+without it and `contain` says so when it starts.
+
+Limits: this is not yet proven on RHEL 9 or Rocky 9.
 
 ## Build from source
 

@@ -235,6 +235,11 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
              the relaxation is recorded and not applied. MCP tools and file edits keep\n  \
              your general rules.\n\
              \n  \
+             On Linux every jail starts its programs under a seccomp filter, in the\n  \
+             style of Flatpak, that refuses injecting keystrokes into your terminal.\n  \
+             With --identity it also refuses new user namespaces and joining other\n  \
+             namespaces: turn the agent's own sandbox off inside the jail.\n\
+             \n  \
              Everything after `--` is the jailed command line, including its own\n  \
              `--help`."
         ),

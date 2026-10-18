@@ -29,6 +29,7 @@ mod binary_freshness;
 mod concern;
 mod contain;
 mod contain_io;
+mod contain_seccomp;
 mod dashboard;
 mod dashboard_community;
 mod dashboard_identity;

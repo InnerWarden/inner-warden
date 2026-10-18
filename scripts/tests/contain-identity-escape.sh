@@ -19,8 +19,10 @@
 # the jail as the launcher set them, or when the instance has no user scope
 # (set IW_ESCAPE_ALLOW_NO_SCOPE=1 on a host with no user service manager, where
 # that is the expected fallback).
-# d) /run inside, f) abstract sockets visible inside and g) whether the jail
-# can make a user namespace of its own are printed, not judged.
+# d) /run inside and f) abstract sockets visible inside are printed, not
+# judged; g) whether the jail can make a user namespace of its own is judged
+# only where the record says the jail was started with them closed (its
+# sandbox filter), and printed otherwise.
 #
 # Usage:
 #   scripts/tests/contain-identity-escape.sh [path/to/innerwarden]
@@ -58,6 +60,7 @@ state="${XDG_STATE_HOME:-}"
 case "$state" in /*) ;; *) state="$HOME/.local/state" ;; esac
 echo "records_seen=$(ls -A "$state/innerwarden/instances" 2>/dev/null | wc -l | tr -d ' ')"
 if unshare -Urm true >/dev/null 2>&1; then echo "g_nested_userns=1"; else echo "g_nested_userns=0"; fi
+echo "seccomp=$(sed -n 's/^Seccomp:[[:space:]]*//p' /proc/self/status)"
 before=$(sed -n 's/^0:://p' /proc/self/cgroup)
 echo "cgroup_before=$before"
 if [ -r "$rec" ]; then echo "record=$(cat "$rec")"; else echo "record="; fi
@@ -144,6 +147,15 @@ check "launcher records hidden inside" "$([ "$seen_records" = "0" ] && echo 0 ||
 hook_agent="$(value hook_agent)"
 check "hook told the agent" "$([ "$hook_agent" = "claude-code" ] && echo 0 || echo 1)" "IW_HOOK_AGENT=${hook_agent:-unset}"
 
+closed_in_record=1
+case "$record" in *'"userns_closed":true'*) closed_in_record=0 ;; esac
+if [ "$closed_in_record" = "0" ]; then
+    g="$(value g_nested_userns)"
+    check "g) no user namespace inside" "$([ "$g" = "0" ] && echo 0 || echo 1)" "nested=${g:-none}"
+    sc="$(value seccomp)"
+    check "jail runs under its filter" "$([ "$sc" = "2" ] && echo 0 || echo 1)" "Seccomp=${sc:-none}"
+fi
+
 w="$(value record_writable)"
 check "record read-only inside" "$([ "$w" = "0" ] && echo 0 || echo 1)" "writable=${w:-none}"
 
@@ -178,6 +190,7 @@ echo
 echo "INFO  d) /run inside: $(value d_run_entries)"
 echo "INFO  f) abstract unix sockets visible inside: $(value f_abstract_sockets)"
 echo "INFO  g) jail can make its own user namespace (unshare -Urm): $(value g_nested_userns)"
+echo "INFO  seccomp mode inside: $(value seccomp)"
 echo "INFO  systemd: $(systemd-run --version 2>/dev/null | head -n 1) / bwrap: $(bwrap --version 2>/dev/null)"
 echo "INFO  kernel: $(uname -r)"
 

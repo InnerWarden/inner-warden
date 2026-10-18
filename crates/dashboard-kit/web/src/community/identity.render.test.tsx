@@ -292,14 +292,15 @@ describe("user namespaces inside the jail, in the technical view", () => {
   const USERNS_A = { userns_closed: true };
   const USERNS_B = { userns_open_reason: "bwrap_too_old" };
 
-  it("says they were closed, or why this host cannot close them, and nothing else", () => {
+  it("says they were closed by the sandbox filter, and nothing for a jail that did not", () => {
     const agents = withUserns((id) => (id === ID_A ? USERNS_A : USERNS_B));
     seed(agents);
     setTechnicalDetail(true);
     const text = textOf(render(<CommunityAgents context={context()} />, agents));
-    expect(text).toContain("User namespaces closed inside the jail");
-    expect(text).toContain("Bubblewrap here is older than 0.8, so programs in the jail can still make user namespaces.");
-    // Only the two codes the CLI sends have words; any other is not shown.
+    expect(text).toContain("User namespaces closed inside the jail (sandbox filter).");
+    expect(text.match(/User namespaces closed/g)?.length).toBe(1);
+    expect(text).not.toContain("Bubblewrap here");
+    // A value that is not `true` is not shown.
     const strange = withUserns(() => ({ userns_open_reason: "<b>x</b>", userns_closed: "yes" }));
     seed(strange);
     const other = textOf(render(<CommunityAgents context={context()} />, strange));
