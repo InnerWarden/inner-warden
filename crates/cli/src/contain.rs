@@ -1272,8 +1272,9 @@ pub mod launch {
     // (which the jail allows) could turn an allowed call into one the filter
     // refuses. On such a kernel the identified filter is never used, so no
     // record says user namespaces are closed, and the terminal one is said
-    // to be weaker. A release that does not read as a version is taken the
-    // same way, and said as unknown rather than as older.
+    // to be weaker. A release that does not read as a version, or that could
+    // not be read at all, is taken the same way, and said as unknown rather
+    // than as older.
 
     /// The first kernel that runs the filter after a tracer's change of a
     /// call (`seccomp: run after ptrace`, 4.8, on x86_64 and aarch64 alike).
@@ -1321,7 +1322,9 @@ pub mod launch {
         ProbeFailed,
         /// The kernel is older than [`TRACER_SAFE_KERNEL`].
         KernelTooOld,
-        /// The kernel's release does not read as a version.
+        /// The kernel's release could not be read as a version: it is not
+        /// one, or it was hidden (no `/proc`, and a `UNAME26` personality
+        /// that rewrites `uname`).
         KernelUnknown,
         /// This build has no filter for the architecture it runs as.
         NotBuilt,
@@ -1348,7 +1351,7 @@ pub mod launch {
             match self {
                 UsernsWhy::ProbeFailed => "Bubblewrap here could not start a jail with user namespaces closed, so the jail runs without that.",
                 UsernsWhy::KernelTooOld => "This kernel is older than 4.8, where a program that traces another could get a call past the filter, so the jail runs without closing them.",
-                UsernsWhy::KernelUnknown => "This kernel's release does not read as a version, so it is taken as older than 4.8 and the jail runs without closing them.",
+                UsernsWhy::KernelUnknown => "This kernel's release could not be read as a version (it is not one, or there is no /proc and a personality such as setarch --uname-2.6 hides it from uname), so it is taken as older than 4.8 and the jail runs without closing them.",
                 UsernsWhy::NotBuilt => "This build has no sandbox filter for this architecture, so the jail runs without closing them.",
                 UsernsWhy::NotHanded => "The launcher could not hand the sandbox filter to bubblewrap, so the jail runs without closing them.",
             }
@@ -1377,8 +1380,8 @@ pub mod launch {
         /// The filter is in, and the kernel is older than
         /// [`TRACER_SAFE_KERNEL`].
         KernelTooOld,
-        /// The filter is in, and the kernel's release does not read as a
-        /// version: taken as older.
+        /// The filter is in, and the kernel's release could not be read as
+        /// a version (as [`UsernsWhy::KernelUnknown`]): taken as older.
         KernelUnknown,
         /// The launcher could not hand the filter to bubblewrap, for its
         /// start-up probe or after it: it could not make the pipe, or start
@@ -1403,7 +1406,7 @@ pub mod launch {
                 FilterWhy::ProbeFailed => "Bubblewrap here could not start a jail with the sandbox filter, so programs in the jail can still inject keystrokes into your terminal.",
                 FilterWhy::NotBuilt => "This build has no sandbox filter for this architecture, so programs in the jail can still inject keystrokes into your terminal.",
                 FilterWhy::KernelTooOld => "This kernel is older than 4.8, where a program that traces another can get a call past the filter, so programs in the jail may still inject keystrokes into your terminal.",
-                FilterWhy::KernelUnknown => "This kernel's release does not read as a version, so it is taken as older than 4.8, where a program that traces another can get a call past the filter: programs in the jail may still inject keystrokes into your terminal.",
+                FilterWhy::KernelUnknown => "This kernel's release could not be read as a version (it is not one, or there is no /proc and a personality such as setarch --uname-2.6 hides it from uname), so it is taken as older than 4.8, where a program that traces another can get a call past the filter: programs in the jail may still inject keystrokes into your terminal.",
                 FilterWhy::NotHanded => "The launcher could not hand the sandbox filter to bubblewrap, so programs in the jail can still inject keystrokes into your terminal.",
             }
         }
@@ -3476,7 +3479,7 @@ mod tests {
         );
         assert_eq!(
             userns_open_sentence(UsernsWhy::KernelUnknown),
-            "innerwarden contain: user namespaces stay open (userns_kernel_unknown): This kernel's release does not read as a version, so it is taken as older than 4.8 and the jail runs without closing them."
+            "innerwarden contain: user namespaces stay open (userns_kernel_unknown): This kernel's release could not be read as a version (it is not one, or there is no /proc and a personality such as setarch --uname-2.6 hides it from uname), so it is taken as older than 4.8 and the jail runs without closing them."
         );
         assert_eq!(
             userns_open_sentence(UsernsWhy::NotHanded),
@@ -3496,7 +3499,7 @@ mod tests {
         );
         assert_eq!(
             filter_sentence(FilterWhy::KernelUnknown),
-            "innerwarden contain: a weaker sandbox filter (filter_kernel_unknown): This kernel's release does not read as a version, so it is taken as older than 4.8, where a program that traces another can get a call past the filter: programs in the jail may still inject keystrokes into your terminal."
+            "innerwarden contain: a weaker sandbox filter (filter_kernel_unknown): This kernel's release could not be read as a version (it is not one, or there is no /proc and a personality such as setarch --uname-2.6 hides it from uname), so it is taken as older than 4.8, where a program that traces another can get a call past the filter: programs in the jail may still inject keystrokes into your terminal."
         );
         assert_eq!(
             filter_sentence(FilterWhy::NotHanded),

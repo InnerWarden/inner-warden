@@ -1817,6 +1817,18 @@ mod tests {
                         "no_proc={}",
                         order(filter_host_here(Path::new(NO_OSRELEASE)).tracer)
                     ),
+                    // What an identified launch says there, its probes
+                    // passing.
+                    format!(
+                        "no_proc_said={}",
+                        crate::contain::launch::filter_plan(
+                            true,
+                            filter_host_here(Path::new(NO_OSRELEASE)),
+                            |_| crate::contain::launch::ProbeAnswer::Ran,
+                        )
+                        .said
+                        .join(" | ")
+                    ),
                 ]
             }
             "no_descriptors" => {
@@ -1981,18 +1993,22 @@ mod tests {
         );
         assert_eq!(plain["proc"], "After", "{plain:?}");
         assert_eq!(plain["no_proc"], "After", "{plain:?}");
+        assert_eq!(plain["no_proc_said"], "", "{plain:?}");
     }
 
     /// A launcher started under the `UNAME26` personality (`setarch
     /// --uname-2.6`, which a shell passes to everything it runs) gets a 2.6
     /// release from `uname` on any modern kernel. The plan still reads the
     /// running kernel from `/proc`, and where `/proc` cannot be read it says
-    /// the release is unknown: never that the kernel is older than 4.8.
+    /// the release is unknown: never that the kernel is older than 4.8. Its
+    /// words name what hid it (no `/proc`, and the personality), never a
+    /// release that is not a version alone.
     ///
     /// FAILS ON REVERT: read `uname` before `/proc` (`proc` reads `Before`,
     /// and an identified jail says `userns_kernel_too_old` on a 6.x
-    /// kernel), or take `uname`'s answer under `UNAME26` (`no_proc` reads
-    /// `Before`).
+    /// kernel), take `uname`'s answer under `UNAME26` (`no_proc` reads
+    /// `Before`), or say the unread release as one that "does not read as a
+    /// version".
     #[cfg(target_os = "linux")]
     #[test]
     fn under_uname26_the_plan_never_reads_an_older_kernel() {
@@ -2003,6 +2019,18 @@ mod tests {
         );
         assert_eq!(old["proc"], "After", "{old:?}");
         assert_eq!(old["no_proc"], "Unknown", "{old:?}");
+        let said: Vec<&str> = old["no_proc_said"].split(" | ").collect();
+        assert_eq!(said.len(), 2, "{said:?}");
+        assert!(said[0].contains("(userns_kernel_unknown)"), "{said:?}");
+        assert!(said[1].contains("(filter_kernel_unknown)"), "{said:?}");
+        for line in said {
+            assert!(
+                line.contains("no /proc and a personality such as setarch --uname-2.6"),
+                "{line}"
+            );
+            assert!(!line.contains("does not read as a version"), "{line}");
+            assert!(!line.contains("This kernel is older"), "{line}");
+        }
     }
 
     /// A start-up probe whose filter pipe cannot be made (the launcher is
