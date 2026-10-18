@@ -509,11 +509,13 @@ pub struct JailInputs {
     /// resolve ([`HiddenPlan::denies`], macOS). Empty without such a
     /// profile.
     pub hide_denies: Vec<PathBuf>,
-    /// The file `/etc/resolv.conf` names where it is a link into `/run`
-    /// ([`launch::resolv_conf_target`]), bound read-only at that same place
-    /// over the jail's empty `/run`, so the host's name resolution works in
-    /// the jail and nothing else of the host's `/run` is shown. `None` where
-    /// `/etc/resolv.conf` is a file of its own, or names nothing there.
+    /// What of the host's resolver `/etc/resolv.conf` leads to where it is a
+    /// link into `/run` ([`launch::resolv_conf_target`]): the file, or a
+    /// folder of resolver data alone ([`launch::resolv_conf_bind`]), bound
+    /// read-only at that same place over the jail's empty `/run`, so the
+    /// host's name resolution works in the jail and nothing else of the
+    /// host's `/run` is shown. `None` where `/etc/resolv.conf` is a file of
+    /// its own, or names nothing there.
     pub resolv_conf: Option<PathBuf>,
     /// The instance whose record the jail must hold before its command
     /// starts ([`launch::gated_child`]): set by the launcher only under a
@@ -761,10 +763,11 @@ pub fn build_linux_jail(input: &JailInputs) -> Result<LinuxJailPlan, ContainErro
     push(&["--tmpfs", "/tmp"]);
     push(&["--tmpfs", "/run"]);
     // Where `/etc/resolv.conf` is a link into `/run` (systemd-resolved), the
-    // file it names, alone, read-only at its own place: the host's name
-    // resolution keeps working in the jail and the rest of the host's
-    // `/run`, its sockets included, stays out. Never a file of the jail's
-    // own: the jail resolves names exactly as the host does.
+    // file it names, alone, read-only at its own place (or the folder of
+    // resolver data alone that holds it, `launch::resolv_conf_bind`): the
+    // host's name resolution keeps working in the jail and the rest of the
+    // host's `/run`, its sockets included, stays out. Never a file of the
+    // jail's own: the jail resolves names exactly as the host does.
     if let Some(target) = &input.resolv_conf {
         let target = target.to_string_lossy().to_string();
         push(&["--ro-bind-try", &target, &target]);
@@ -2280,6 +2283,34 @@ pub mod launch {
             }
         }
         (out.starts_with("/run") && out != Path::new("/run")).then_some(out)
+    }
+
+    /// The folders under `/run` that hold a resolver file and nothing but
+    /// resolver data: bound whole, so a file the resolver writes anew (by
+    /// rename, as resolvconf does) reaches a running jail. Bound only while
+    /// they hold no socket ([`resolv_conf_bind`]).
+    pub const RESOLVER_ONLY_FOLDERS: &[&str] = &["/run/resolvconf"];
+
+    /// PURE. What the jail binds read-only for the resolver file `target`
+    /// ([`resolv_conf_target`]): its folder, where that is one of
+    /// [`RESOLVER_ONLY_FOLDERS`] and `holds_sockets` says it holds no socket,
+    /// so the jail follows the host's file when it is replaced; otherwise the
+    /// file alone. A file bind keeps the file the jail started with: a
+    /// resolver that replaces it (systemd-resolved, NetworkManager, whose
+    /// folders hold sockets or connection files the jail must not see)
+    /// leaves the jail with the names it had until the agent is restarted.
+    pub fn resolv_conf_bind(target: &Path, holds_sockets: impl Fn(&Path) -> bool) -> PathBuf {
+        match target.parent() {
+            Some(folder)
+                if RESOLVER_ONLY_FOLDERS
+                    .iter()
+                    .any(|only| folder == Path::new(only))
+                    && !holds_sockets(folder) =>
+            {
+                folder.to_path_buf()
+            }
+            _ => target.to_path_buf(),
+        }
     }
 
     /// What bwrap reports through `--info-fd`. Fields it adds later are ignored.
@@ -5719,8 +5750,9 @@ mod tests {
     /// never a file of the jail's own, never one that names another
     /// resolver. Any other link, or none, changes nothing.
     ///
-    /// FAILS ON REVERT: bind the link target's folder, or keep a target
-    /// outside `/run`, and the lines below that say otherwise fail.
+    /// FAILS ON REVERT: bind the link target's folder where it holds
+    /// sockets (systemd-resolved's), or keep a target outside `/run`, and
+    /// the lines below that say otherwise fail.
     #[test]
     fn the_jail_never_points_at_a_private_resolver() {
         use launch::resolv_conf_target;
@@ -5790,6 +5822,61 @@ mod tests {
             );
             assert!(!a.iter().any(|w| w == "/etc/resolv.conf"));
         }
+    }
+
+    /// The resolver file a jail binds goes stale when the host replaces it
+    /// by rename (a bind holds the file it started with). Where it lives in
+    /// a folder of resolver data alone (resolvconf's), with no socket in it,
+    /// the folder is bound instead, so the jail follows the host. Any other
+    /// folder (systemd-resolved's sockets, NetworkManager's connection
+    /// files), or one that holds a socket, keeps the file alone.
+    ///
+    /// FAILS ON REVERT: bind the file alone in `resolv_conf_bind` and
+    /// resolvconf's line binds the file; bind every folder and the stub's
+    /// and NetworkManager's lines bind theirs.
+    #[test]
+    fn a_resolver_folder_of_data_alone_is_bound_whole() {
+        use launch::resolv_conf_bind;
+        let no_socket = |_: &Path| false;
+        let socket = |_: &Path| true;
+        for (target, bound) in [
+            ("/run/resolvconf/resolv.conf", "/run/resolvconf"),
+            (
+                "/run/systemd/resolve/stub-resolv.conf",
+                "/run/systemd/resolve/stub-resolv.conf",
+            ),
+            (
+                "/run/systemd/resolve/resolv.conf",
+                "/run/systemd/resolve/resolv.conf",
+            ),
+            (
+                "/run/NetworkManager/resolv.conf",
+                "/run/NetworkManager/resolv.conf",
+            ),
+            (
+                "/run/resolvconf/interface/eth0",
+                "/run/resolvconf/interface/eth0",
+            ),
+        ] {
+            assert_eq!(
+                resolv_conf_bind(Path::new(target), no_socket),
+                PathBuf::from(bound),
+                "{target}"
+            );
+        }
+        assert_eq!(
+            resolv_conf_bind(Path::new("/run/resolvconf/resolv.conf"), socket),
+            PathBuf::from("/run/resolvconf/resolv.conf")
+        );
+        let mut input = inputs(&["claude", "--print"]);
+        input.resolv_conf = Some(resolv_conf_bind(
+            Path::new("/run/resolvconf/resolv.conf"),
+            no_socket,
+        ));
+        let a = build_linux_jail(&input).unwrap().bwrap_args;
+        assert!(a.windows(3).any(|w| w[0] == "--ro-bind-try"
+            && w[1] == "/run/resolvconf"
+            && w[2] == "/run/resolvconf"));
     }
 
     /// O15, the one deliberate change to the plain jail's argv beside its

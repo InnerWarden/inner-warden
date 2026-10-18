@@ -333,12 +333,14 @@ fn resolve_inputs(
     };
 
     // Every Linux jail, `--identity` or not: where `/etc/resolv.conf` is a
-    // link into `/run`, the file it names, if that is a file.
+    // link into `/run`, the file it names, if that is a file, or the folder
+    // of resolver data alone that holds it.
     let resolv_conf = if cfg!(target_os = "linux") {
         std::fs::read_link("/etc/resolv.conf")
             .ok()
             .and_then(|link| crate::contain::launch::resolv_conf_target(&link))
             .filter(|target| std::fs::metadata(target).is_ok_and(|m| m.is_file()))
+            .map(|target| crate::contain::launch::resolv_conf_bind(&target, holds_a_socket))
     } else {
         None
     };
@@ -477,6 +479,36 @@ pub(crate) fn make_hidden_folder(home: &Path, nominal: &Path) {
             }
             Err(_) => return,
         }
+    }
+}
+
+/// Whether a folder, or a folder in it, holds a socket (or cannot be read
+/// through): a folder bound into a jail must not hand it a service.
+fn holds_a_socket(folder: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        let Ok(entries) = std::fs::read_dir(folder) else {
+            return true;
+        };
+        for entry in entries.take(256) {
+            let Ok(kind) = entry.and_then(|entry| {
+                let kind = entry.file_type()?;
+                Ok((entry.path(), kind))
+            }) else {
+                return true;
+            };
+            let (path, kind) = kind;
+            if kind.is_socket() || (kind.is_dir() && holds_a_socket(&path)) {
+                return true;
+            }
+        }
+        false
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = folder;
+        true
     }
 }
 
