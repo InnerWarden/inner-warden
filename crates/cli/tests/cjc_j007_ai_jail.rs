@@ -954,6 +954,17 @@ fn a_jail_the_host_did_not_admit_never_runs_its_command() {
         "{stderr}"
     );
     assert!(
+        stderr.contains(&format!(
+            "innerwarden contain: Check that Active Defence is running (systemctl status \
+             innerwarden-agent), then try again. The jail waits for it because of start = \
+             \"only_when_admitted\" in {}.",
+            home.path()
+                .join(".config/innerwarden/agent-profiles.toml")
+                .display()
+        )),
+        "{stderr}"
+    );
+    assert!(
         !stderr.contains("holds no record that the host admitted it"),
         "the jail's first process was ended before it read its record: {stderr}"
     );

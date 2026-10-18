@@ -1085,6 +1085,12 @@ fn run_linux_identified(input: &JailInputs, bwrap: &Path, marks: bool) -> ExitCo
                 "innerwarden contain: {}",
                 crate::contain::launch::NOT_ADMITTED
             );
+            eprintln!(
+                "innerwarden contain: {}",
+                crate::contain::launch::not_admitted_remedy(
+                    &crate::agent_profiles_io::files_that_wait_for_the_host(&input.args.agent)
+                )
+            );
             return ExitCode::from(2);
         }
         Err(why) => {
@@ -1269,14 +1275,23 @@ fn launch_identified(
     // made, a scope the kernel does not show) is ended here, before its
     // command can run: its first process is still waiting for the record,
     // and the record is never handed in.
-    let admitted = record.as_ref().is_ok_and(|(_, admitted)| *admitted);
-    if !crate::contain::launch::starts(input.args.start, admitted) {
+    let made = record
+        .as_ref()
+        .ok()
+        .map(|(_, answer, scope)| (answer, scope.as_ref()));
+    if !crate::contain::launch::launch_starts(input.args.start, made) {
         if let Err(why) = &record {
             eprintln!("innerwarden contain: no instance record written ({why})");
         }
         eprintln!(
             "innerwarden contain: {}",
             crate::contain::launch::NOT_ADMITTED
+        );
+        eprintln!(
+            "innerwarden contain: {}",
+            crate::contain::launch::not_admitted_remedy(
+                &crate::agent_profiles_io::files_that_wait_for_the_host(&input.args.agent)
+            )
         );
         end_jail(&mut child, reported);
         drop(record_writer);
@@ -1288,7 +1303,7 @@ fn launch_identified(
         return Attempt::Done(ExitCode::from(2));
     }
     let mut identified = false;
-    match record.map(|(json, _)| json) {
+    match record.map(|(json, _, _)| json) {
         Ok(json) => {
             // The jail reads this to its end before it builds its root.
             if let Err(e) = record_writer.write_all(&json) {
@@ -1500,12 +1515,22 @@ pub(crate) fn read_jail_graph(project: &Path, uid: u32) -> crate::contain::launc
     parse_jail_graph(&bytes)
 }
 
+/// The bytes of a jail's record, what the host answered of its admission,
+/// and the system scope the kernel showed it in.
+#[cfg(target_os = "linux")]
+type IdentifiedJail = (
+    Vec<u8>,
+    innerwarden_agent_guard::identity::SystemScopeAdmission,
+    Option<innerwarden_agent_guard::identity::Scope>,
+);
+
 /// Read the facts about the jail from the host, make the record, write the
 /// launcher's copy, and return the bytes for the jail's copy.
 ///
-/// Also whether the host admitted the jail
-/// ([`crate::contain::launch::admitted_here`]), asked only where Active
-/// Defence is installed and believed only over a connection held to `key`.
+/// Also what the host answered of its admission of the jail and the system
+/// scope the kernel showed it in ([`crate::contain::launch::launch_starts`]
+/// decides), asked only where Active Defence is installed and believed only
+/// over a connection held to `key`.
 #[cfg(target_os = "linux")]
 fn identify(
     input: &JailInputs,
@@ -1514,7 +1539,7 @@ fn identify(
     scope: &crate::contain::launch::ScopePlan,
     info: crate::contain::launch::InfoFd,
     key: Option<&[u8; 32]>,
-) -> Result<(Vec<u8>, bool), String> {
+) -> Result<IdentifiedJail, String> {
     use crate::contain::launch::{
         assemble_record, no_scope_sentence, parse_mnt_ns_link, parse_ns_link, records_dir,
         user_scope_seen, LaunchFacts, NoScope, ScopePlan,
@@ -1558,7 +1583,7 @@ fn identify(
     if crate::upsell_io::active_defence_installed() {
         (scopes.system, answer) = request_system_scope(instance_id, unit, pid, key);
     }
-    let admitted = crate::contain::launch::admitted_here(&answer, scopes.system.as_ref());
+    let system_scope = scopes.system.clone();
     if scopes.is_empty() && matches!(scope, ScopePlan::User { .. }) {
         eprintln!("{}", no_scope_sentence(NoScope::NotSeenInScope));
     }
@@ -1605,7 +1630,7 @@ fn identify(
             "innerwarden contain: the launcher's copy of the record was not written ({e})"
         ),
     }
-    Ok((json, admitted))
+    Ok((json, answer, system_scope))
 }
 
 /// `/proc/<pid>/stat` field 22.
@@ -1710,10 +1735,8 @@ fn send_scope_request(
     Result<(), String>,
     innerwarden_agent_guard::identity::SystemScopeAdmission,
 ) {
-    use crate::host_decide_io::{pinnable, post, Wanted};
-    use innerwarden_agent_guard::identity::{
-        SystemScopeAdmission, MAX_SYSTEM_SCOPE_ANSWER_BYTES, SYSTEM_SCOPE_TAKEN,
-    };
+    use crate::host_decide_io::{pinnable, post, system_scope_wanted};
+    use innerwarden_agent_guard::identity::SystemScopeAdmission;
     let Some(pin) = key.filter(|_| pinnable(url)) else {
         return (
             crate::agent_report::send_report(url, body),
@@ -1726,19 +1749,13 @@ fn send_scope_request(
             SystemScopeAdmission::NONE,
         );
     };
-    let wanted = Wanted {
-        status: SYSTEM_SCOPE_TAKEN,
-        cap: MAX_SYSTEM_SCOPE_ANSWER_BYTES + 1,
-    };
-    match post(url, &bytes, SYSTEM_SCOPE_ANSWER_WAIT, pin, wanted) {
-        Some((SYSTEM_SCOPE_TAKEN, answer)) => (Ok(()), SystemScopeAdmission::read(&answer)),
-        Some((status, _)) if (200..300).contains(&status) => (Ok(()), SystemScopeAdmission::NONE),
-        Some((status, _)) => (Err(format!("HTTP {status}")), SystemScopeAdmission::NONE),
-        None => (
-            Err("no answer over a connection held to the host's key".into()),
-            SystemScopeAdmission::NONE,
-        ),
-    }
+    crate::contain::launch::scope_answer(post(
+        url,
+        &bytes,
+        SYSTEM_SCOPE_ANSWER_WAIT,
+        pin,
+        system_scope_wanted(),
+    ))
 }
 
 /// Wait up to `wait` for `seen` to find the jail in its system scope, and only

@@ -80,6 +80,65 @@ pub fn ask(url: &str, body: &[u8], timeout: Duration, pin: &[u8; 32]) -> Option<
             cap: MAX_INSTANCE_ANSWER_BYTES + 1,
         },
     )
+    .ok()
+}
+
+/// Why [`post`] got no answer, said so a person can act on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoAnswer {
+    /// The address is not `https://127.0.0.1:<port><path>`.
+    NotLoopback,
+    /// Nothing listens there: the agent is not running, or restarting.
+    Refused,
+    /// The connection could not be made for another reason.
+    Unreachable,
+    /// A server answered there with a key that is not the host's.
+    WrongKey,
+    /// The connection was made and then failed.
+    Failed,
+    /// No whole answer before the deadline.
+    TimedOut,
+    /// What came back is not an HTTP answer.
+    Broken,
+}
+
+impl std::fmt::Display for NoAnswer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            NoAnswer::NotLoopback => "the agent's address is not this host's loopback",
+            NoAnswer::Refused => {
+                "nothing listens at the agent's address: Active Defence is not running"
+            }
+            NoAnswer::Unreachable => "the agent's address cannot be reached",
+            NoAnswer::WrongKey => "the server at the agent's address does not hold the host's key",
+            NoAnswer::Failed => "the connection to the agent failed",
+            NoAnswer::TimedOut => "the agent did not answer in time",
+            NoAnswer::Broken => "the agent's answer could not be read",
+        })
+    }
+}
+
+/// What a failed socket call says of the exchange: a TLS refusal of the
+/// server's key, a deadline, or another failure.
+fn no_answer(error: &std::io::Error) -> NoAnswer {
+    let tls = error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<rustls::Error>());
+    match (tls, error.kind()) {
+        (Some(rustls::Error::InvalidCertificate(_)), _) => NoAnswer::WrongKey,
+        (_, std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => NoAnswer::TimedOut,
+        _ => NoAnswer::Failed,
+    }
+}
+
+/// The answer the launcher reads of its request for a system scope: the
+/// body of a `202`, up to one byte more than an answer may hold.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn system_scope_wanted() -> Wanted {
+    Wanted {
+        status: innerwarden_agent_guard::identity::SYSTEM_SCOPE_TAKEN,
+        cap: innerwarden_agent_guard::identity::MAX_SYSTEM_SCOPE_ANSWER_BYTES + 1,
+    }
 }
 
 /// Which answer's body a request reads: the one of `status`, up to `cap`
@@ -100,7 +159,7 @@ pub fn post(
     timeout: Duration,
     pin: &[u8; 32],
     wanted: Wanted,
-) -> Option<(u16, Vec<u8>)> {
+) -> Result<(u16, Vec<u8>), NoAnswer> {
     let deadline = Instant::now() + timeout;
     let (url, body, pin) = (url.to_string(), body.to_vec(), *pin);
     let (answered, answer) = std::sync::mpsc::sync_channel(1);
@@ -109,11 +168,10 @@ pub fn post(
         .spawn(move || {
             let _ = answered.send(exchange(&url, &body, deadline, &pin, wanted));
         })
-        .ok()?;
+        .map_err(|_| NoAnswer::Failed)?;
     answer
         .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-        .ok()
-        .flatten()
+        .map_err(|_| NoAnswer::TimedOut)?
 }
 
 /// The request itself, each socket call held to what is left before
@@ -124,38 +182,57 @@ fn exchange(
     deadline: Instant,
     pin: &[u8; 32],
     wanted: Wanted,
-) -> Option<(u16, Vec<u8>)> {
+) -> Result<(u16, Vec<u8>), NoAnswer> {
     let remaining = || {
         deadline
             .checked_duration_since(Instant::now())
             .filter(|left| !left.is_zero())
+            .ok_or(NoAnswer::TimedOut)
     };
-    let (addr, path) = loopback_target(url)?;
-    let tcp = TcpStream::connect_timeout(&addr, remaining()?).ok()?;
+    let (addr, path) = loopback_target(url).ok_or(NoAnswer::NotLoopback)?;
+    let tcp = TcpStream::connect_timeout(&addr, remaining()?).map_err(|e| match e.kind() {
+        std::io::ErrorKind::ConnectionRefused => NoAnswer::Refused,
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => NoAnswer::TimedOut,
+        _ => NoAnswer::Unreachable,
+    })?;
     let _ = tcp.set_nodelay(true);
     let connection = rustls::ClientConnection::new(
-        Arc::new(client_config(*pin)?),
+        Arc::new(client_config(*pin).ok_or(NoAnswer::Failed)?),
         ServerName::IpAddress(addr.ip().into()),
     )
-    .ok()?;
+    .map_err(|_| NoAnswer::Failed)?;
     let mut stream = rustls::StreamOwned::new(connection, tcp);
     let head = format!(
         "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
          Accept: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
-    stream.sock.set_write_timeout(Some(remaining()?)).ok()?;
-    stream.sock.set_read_timeout(Some(remaining()?)).ok()?;
-    stream.write_all(head.as_bytes()).ok()?;
-    stream.write_all(body).ok()?;
-    stream.flush().ok()?;
+    let failed = |e: std::io::Error| no_answer(&e);
+    stream
+        .sock
+        .set_write_timeout(Some(remaining()?))
+        .map_err(failed)?;
+    stream
+        .sock
+        .set_read_timeout(Some(remaining()?))
+        .map_err(failed)?;
+    stream.write_all(head.as_bytes()).map_err(failed)?;
+    stream.write_all(body).map_err(failed)?;
+    stream.flush().map_err(failed)?;
     let mut seen = Vec::new();
     let mut chunk = [0u8; 2048];
+    let done = |seen: &[u8]| match parse_response(seen, true, wanted) {
+        Parsed::Done(status, body) => Ok((status, body)),
+        _ => Err(NoAnswer::Broken),
+    };
     loop {
         if let Parsed::Done(status, body) = parse_response(&seen, false, wanted) {
-            return Some((status, body));
+            return Ok((status, body));
         }
-        stream.sock.set_read_timeout(Some(remaining()?)).ok()?;
+        stream
+            .sock
+            .set_read_timeout(Some(remaining()?))
+            .map_err(failed)?;
         let eof = match stream.read(&mut chunk) {
             Ok(0) => true,
             Ok(n) => {
@@ -164,19 +241,10 @@ fn exchange(
             }
             // A server that closes without saying so still ended its answer.
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => true,
-            Err(_) => return None,
+            Err(e) => return Err(no_answer(&e)),
         };
-        if eof {
-            return match parse_response(&seen, true, wanted) {
-                Parsed::Done(status, body) => Some((status, body)),
-                _ => None,
-            };
-        }
-        if seen.len() > MAX_HEAD_BYTES + wanted.cap + 64 {
-            return match parse_response(&seen, true, wanted) {
-                Parsed::Done(status, body) => Some((status, body)),
-                _ => None,
-            };
+        if eof || seen.len() > MAX_HEAD_BYTES + wanted.cap + 64 {
+            return done(&seen);
         }
     }
 }
@@ -706,6 +774,8 @@ mod tests {
             status: SYSTEM_SCOPE_TAKEN,
             cap: MAX_SYSTEM_SCOPE_ANSWER_BYTES + 1,
         };
+        // What the launcher asks for is this.
+        assert_eq!(system_scope_wanted(), wanted);
         let request = serde_json::to_vec(&system_scope_request(ID).unwrap()).unwrap();
         let (url, pin, taken) = server(answer.clone(), Duration::ZERO);
         let (status, read) = post(&url, &request, Duration::from_secs(5), &pin, wanted).unwrap();
@@ -729,11 +799,73 @@ mod tests {
         let (_, _, other) = certificate();
         assert_eq!(
             post(&url, &request, Duration::from_secs(5), &other, wanted),
-            None
+            Err(NoAnswer::WrongKey)
         );
         let _ = refused.join();
         assert!(pinnable("https://127.0.0.1:8787/api/agent/contain-scope"));
         assert!(!pinnable("https://localhost:8787/api/agent/contain-scope"));
+    }
+
+    /// A request that gets no answer says why, in words a person can act
+    /// on: nothing listening (the agent is down or restarting), a server
+    /// with another key, no answer in time, an answer that is not HTTP, an
+    /// address that is not the loopback. The launcher prints it, and the
+    /// launch admits nothing.
+    ///
+    /// FAILS ON REVERT: map every failure to one kind in `exchange` (the
+    /// one sentence the launcher printed before) and the lines below that
+    /// say otherwise fail.
+    #[test]
+    fn a_request_that_gets_no_answer_says_why() {
+        let wanted = system_scope_wanted();
+        let request = br#"{"instance":"x"}"#;
+        let free = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let (_, _, pin) = certificate();
+        assert_eq!(
+            post(
+                &format!("https://127.0.0.1:{free}/api/agent/contain-scope"),
+                request,
+                Duration::from_secs(5),
+                &pin,
+                wanted
+            ),
+            Err(NoAnswer::Refused)
+        );
+        assert_eq!(
+            post(
+                "https://localhost:8787/x",
+                request,
+                Duration::from_secs(5),
+                &pin,
+                wanted
+            ),
+            Err(NoAnswer::NotLoopback)
+        );
+        let (url, pin, slow) = server(
+            b"HTTP/1.1 202 Accepted\r\n\r\n".to_vec(),
+            Duration::from_secs(1),
+        );
+        assert_eq!(
+            post(&url, request, Duration::from_millis(300), &pin, wanted),
+            Err(NoAnswer::TimedOut)
+        );
+        let _ = slow.join();
+        let (url, pin, broken) = server(b"not http at all".to_vec(), Duration::ZERO);
+        assert_eq!(
+            post(&url, request, Duration::from_secs(5), &pin, wanted),
+            Err(NoAnswer::Broken)
+        );
+        let _ = broken.join();
+        for (why, said) in [
+            (NoAnswer::Refused, "Active Defence is not running"),
+            (NoAnswer::WrongKey, "does not hold the host's key"),
+            (NoAnswer::TimedOut, "did not answer in time"),
+        ] {
+            assert!(why.to_string().contains(said), "{why:?}");
+        }
     }
 
     /// A server whose key is not the published one gets no request through

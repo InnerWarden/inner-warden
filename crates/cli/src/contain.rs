@@ -2118,6 +2118,62 @@ pub mod launch {
         }
     }
 
+    /// PURE. Whether the launcher hands the jail its record and lets its
+    /// command start, from what it learned of the jail: for a record it
+    /// made, the host's answer and the system scope the kernel showed;
+    /// `None` when no record was made ([`starts`] of [`admitted_here`]).
+    pub fn launch_starts(
+        start: innerwarden_agent_guard::profiles::JailStart,
+        made: Option<(
+            &innerwarden_agent_guard::identity::SystemScopeAdmission,
+            Option<&Scope>,
+        )>,
+    ) -> bool {
+        starts(
+            start,
+            made.is_some_and(|(answer, scope)| admitted_here(answer, scope)),
+        )
+    }
+
+    /// PURE. What the launcher reads of the answer to its request for a
+    /// system scope held to the host's key: whether the host took it (and,
+    /// when not, why, in words a person can act on), and the admission a
+    /// `202` says. Any other answer admits nothing.
+    pub fn scope_answer(
+        result: Result<(u16, Vec<u8>), crate::host_decide_io::NoAnswer>,
+    ) -> (
+        Result<(), String>,
+        innerwarden_agent_guard::identity::SystemScopeAdmission,
+    ) {
+        use innerwarden_agent_guard::identity::{SystemScopeAdmission, SYSTEM_SCOPE_TAKEN};
+        match result {
+            Ok((SYSTEM_SCOPE_TAKEN, answer)) => (Ok(()), SystemScopeAdmission::read(&answer)),
+            Ok((status, _)) if (200..300).contains(&status) => (Ok(()), SystemScopeAdmission::NONE),
+            Ok((status, _)) => (Err(format!("HTTP {status}")), SystemScopeAdmission::NONE),
+            Err(why) => (Err(why.to_string()), SystemScopeAdmission::NONE),
+        }
+    }
+
+    /// PURE. What the launcher says after [`NOT_ADMITTED`]: what to check,
+    /// and which file makes the jail wait for the host (`files`, by path;
+    /// both places when it could not tell).
+    pub fn not_admitted_remedy(files: &[String]) -> String {
+        let place = if files.is_empty() {
+            format!(
+                "{} or ~/{}",
+                innerwarden_agent_guard::profiles::SYSTEM_PROFILES_PATH,
+                innerwarden_agent_guard::profiles::USER_PROFILES_PATH
+            )
+        } else {
+            files.join(" and ")
+        };
+        format!(
+            "Check that Active Defence is running (systemctl status innerwarden-agent), then \
+             try again. The jail waits for it because of start = \"only_when_admitted\" in \
+             {place}."
+        )
+    }
+
     /// The verb the jail's command starts through under a profile that
     /// starts the jail only once the host admitted it ([`gated_child`]).
     pub const GATE_VERB: &str = "contain-gate";
@@ -5451,6 +5507,77 @@ mod tests {
                 .start,
             JailStart::Always
         );
+    }
+
+    /// The launcher's decision is one pure function of what it learned: the
+    /// record it made, the host's answer and the system scope the kernel
+    /// showed. A host that placed the jail and said it did not admit it
+    /// does not start it; neither does an admission without the scope, nor
+    /// a record that could not be made.
+    ///
+    /// FAILS ON REVERT: take the scope alone for the admission in
+    /// `launch_starts` (the reading before the answer was read) and the
+    /// placed-but-not-admitted line starts.
+    #[test]
+    fn the_launch_starts_only_on_an_admission_over_the_scope() {
+        use innerwarden_agent_guard::identity::SystemScopeAdmission;
+        use innerwarden_agent_guard::profiles::JailStart;
+        use launch::launch_starts;
+        let scope = innerwarden_agent_guard::identity::Scope {
+            unit: UNIT.to_string(),
+            cgroup_path: format!("/system.slice/{UNIT}"),
+        };
+        let yes = SystemScopeAdmission {
+            admitted: true,
+            note: None,
+        };
+        let no = SystemScopeAdmission {
+            admitted: false,
+            note: Some("Kernel protection is not in effect for this session.".into()),
+        };
+        let wait = JailStart::OnlyWhenAdmitted;
+        assert!(launch_starts(wait, Some((&yes, Some(&scope)))));
+        assert!(!launch_starts(wait, Some((&no, Some(&scope)))));
+        assert!(!launch_starts(wait, Some((&yes, None))));
+        assert!(!launch_starts(
+            wait,
+            Some((&SystemScopeAdmission::NONE, Some(&scope)))
+        ));
+        assert!(!launch_starts(wait, None));
+        for made in [None, Some((&no, None)), Some((&yes, Some(&scope)))] {
+            assert!(launch_starts(JailStart::Always, made));
+        }
+    }
+
+    /// The answer to the request for a system scope: a `202` is read for the
+    /// admission, any other success admits nothing, and a request that got
+    /// no answer says why. After "did not admit", the launcher says what to
+    /// check and which file makes the jail wait.
+    #[test]
+    fn the_launcher_says_why_the_host_did_not_admit_and_what_to_do() {
+        use crate::host_decide_io::NoAnswer;
+        let (taken, admission) = launch::scope_answer(Ok((202, br#"{"admitted":true}"#.to_vec())));
+        assert!(taken.is_ok() && admission.admitted);
+        let (taken, admission) = launch::scope_answer(Ok((200, br#"{"admitted":true}"#.to_vec())));
+        assert!(taken.is_ok() && !admission.admitted);
+        assert_eq!(
+            launch::scope_answer(Ok((500, Vec::new()))).0,
+            Err("HTTP 500".into())
+        );
+        let (taken, admission) = launch::scope_answer(Err(NoAnswer::Refused));
+        assert!(!admission.admitted);
+        assert!(taken.unwrap_err().contains("Active Defence is not running"));
+        assert_eq!(
+            launch::not_admitted_remedy(&[
+                "/home/dev/.config/innerwarden/agent-profiles.toml".into()
+            ]),
+            "Check that Active Defence is running (systemctl status innerwarden-agent), then try \
+             again. The jail waits for it because of start = \"only_when_admitted\" in \
+             /home/dev/.config/innerwarden/agent-profiles.toml."
+        );
+        assert!(launch::not_admitted_remedy(&[]).ends_with(
+            "in /etc/innerwarden/agent-profiles.toml or ~/.config/innerwarden/agent-profiles.toml."
+        ));
     }
 
     /// Under a profile that starts the jail only once the host admitted it,
