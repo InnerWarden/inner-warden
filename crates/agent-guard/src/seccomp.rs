@@ -672,7 +672,9 @@ mod tests {
     /// What the identified jail lets through: other namespaces (the kernel
     /// then asks for a capability the jail does not have), threads and
     /// children by `clone` without `CLONE_NEWUSER`, other terminal commands,
-    /// a command whose low word is not one of the two, and calls it does not
+    /// a command whose low word is not one of the eight it refuses (the two
+    /// terminal commands and the six subvolume commands of
+    /// `no_jail_makes_a_new_subvolume_or_snapshot`), and calls it does not
     /// name.
     #[test]
     fn the_identified_filter_lets_everything_else_through() {
@@ -935,13 +937,15 @@ mod tests {
         }
     }
 
-    /// The plain jail's rule holds on every ABI its kernel runs, and nothing
+    /// The plain jail's rules hold on every ABI its kernel runs, and nothing
     /// else of a 32-bit program is touched: on x86_64 an i386 or x32
     /// `ioctl` with either terminal command is refused (x32's by its own
     /// number and by 16, which a kernel before 5.4 ran as the native one), on
     /// aarch64 a 32-bit arm one; their other calls, user namespaces
     /// included, are let through, so a 32-bit program runs as it did before
-    /// the filter.
+    /// the filter. The same 32-bit and x32 `ioctl` also refuses the six
+    /// subvolume commands: `no_jail_makes_a_new_subvolume_or_snapshot` holds
+    /// those cases, so this test covers the two terminal commands only.
     ///
     /// FAILS ON REVERT: KILL another ABI in the terminal filter (i386's
     /// `getpid` is ended), or drop its `ioctl` check (i386's `TIOCSTI`
