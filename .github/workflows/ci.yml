@@ -311,12 +311,16 @@ jobs:
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
           sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
 
+      # The first two runs pick their tests by name, and libtest passes a name
+      # that matches no test. So they go through cargo-test-at-least.sh, which
+      # fails a run that passed fewer tests than it does today: a renamed test
+      # or a moved module fails this step instead of leaving it green.
       - name: The filter and the jail on arm64
         env:
           IW_REQUIRE_SECCOMP: "1"
         run: |
-          cargo test -p innerwarden-agent-guard --lib seccomp </dev/null
-          cargo test -p innerwarden --bin innerwarden the_launcher_hands_bwrap </dev/null
+          bash scripts/cargo-test-at-least.sh 14 -p innerwarden-agent-guard --lib seccomp
+          bash scripts/cargo-test-at-least.sh 1 -p innerwarden --bin innerwarden the_launcher_hands_bwrap
           cargo test -p innerwarden --test cjc_j007_ai_jail </dev/null
 
       - name: Clippy, every target, Linux arm64
