@@ -302,6 +302,8 @@ fn main() -> std::process::ExitCode {
         Some("status") => status_io_cmd(),
         Some("agents") => agents_io::cmd(&args[1..]),
         Some("contain") => contain_io::cmd(&args[1..]),
+        // Run by `contain` inside a jail that starts only once admitted.
+        Some(crate::contain::launch::GATE_VERB) => contain_io::cmd_gate(&args[1..]),
         Some("enforce") => cmd_mode(&args[1..], false),
         Some("dry-run") | Some("monitor") => cmd_mode(&args[1..], true),
         Some("allow") => suppress_io::cmd_allow(&args[1..]),
@@ -964,8 +966,6 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
         agent_profiles::ProfilesState::On(profiles) => {
             let hook_agent = agent_flag(rest);
             let agent_type = agent_profiles::agent_type(hook_agent.as_deref(), identity.as_ref());
-            let instance_id = identity.as_ref().and_then(|id| id.instance_id.as_deref());
-            let inside = agent_profiles::trust(identity.as_ref());
             let facts = agent_profiles::HookFacts {
                 command: &command,
                 verdict: &verdict,
@@ -973,72 +973,32 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
                 tainted: tainted.is_some(),
                 line_block_review: block_review,
             };
-            let decide_at = |trust| {
-                agent_profiles::decide_hook(
-                    &facts,
-                    profiles,
-                    agent_type.as_deref(),
-                    instance_id,
-                    trust,
-                )
-            };
-            // The hook's own decision first, at its own reading: only a
-            // review by the general rules is one the host could relax.
-            let own = decide_at(inside);
-            // That review, for an instance, is asked of the host where Active
-            // Defence runs; nothing else is, and without a 200 nothing changes.
+            // The hook's own decision first, at its own reading. A review of
+            // an instance is asked of the host where Active Defence runs; an
+            // allow too where the system profile asks about every command. A
+            // refusal of the hook's never is, and without a 200 nothing
+            // changes.
             let url = host_decide::instance_decide_url(
                 std::env::var(agent_report::AGENT_URL_VAR).ok().as_deref(),
             );
-            let asked = host_decide::should_ask(
-                agent_profiles::general_verdict(&verdict),
-                own.deciding_layer,
-                identity.as_ref(),
-                &profiles_state,
+            let (decided, host) = host_decide::decide_with_host(
+                host_decide::ShellFacts {
+                    hook: &facts,
+                    state: &profiles_state,
+                    profiles,
+                    agent_type: agent_type.as_deref(),
+                    identity: identity.as_ref(),
+                    url: url.as_deref(),
+                },
                 upsell_io::active_defence_installed,
-                url.as_deref(),
-            );
-            let reply = match (asked, identity.as_ref(), url.as_deref()) {
-                (true, Some(id), Some(url)) => host_decide::request_for(
-                    id,
-                    agent_type.as_deref(),
-                    &command,
-                    &verdict,
-                    tainted.is_some(),
-                )
-                .and_then(|request| {
-                    // The hook found its jail's record, so the key is the
-                    // copy the launcher handed in, and only that.
-                    let key = host_decide::key_file(identity.is_some());
+                |url, request, key| {
                     host_decide_io::consult(
                         url,
-                        &request,
+                        request,
                         key,
                         std::path::Path::new(key.path()),
                         host_decide::ASK_TIMEOUT,
                     )
-                }),
-                _ => None,
-            };
-            let reply = host_decide::read_reply(reply, instance_id);
-            // Decided again only when the host's answer moves the trust.
-            let trust = host_decide::decision_trust(inside, &reply);
-            let local = if trust == inside {
-                own
-            } else {
-                decide_at(trust)
-            };
-            let (decided, host) = host_decide::settle(
-                local,
-                &reply,
-                host_decide::SettleFacts {
-                    general: &verdict,
-                    line_block_review: block_review,
-                    mode: agent_type
-                        .as_deref()
-                        .and_then(|name| profiles.get(name))
-                        .and_then(|profile| profile.mode),
-                    inside,
                 },
             );
             (
@@ -1110,7 +1070,7 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
         // So it is addressed to the person and is not a command line. This text
         // reaches the agent first, and a ready-to-run `innerwarden allow '<cmd>'`
         // here was an instruction the agent could follow to lift its own block.
-        eprintln!("{}", hook_block_remedy());
+        eprintln!("{}", hook_block_remedy(&verdict));
         std::process::ExitCode::from(2)
     } else {
         std::process::ExitCode::SUCCESS
@@ -1263,13 +1223,25 @@ const FILE_BLOCK_REMEDY: &str =
 
 /// What the hook tells the person after a block: only they can authorise it,
 /// from their own terminal. Not a command to copy, since the agent reads it
-/// first.
-fn hook_block_remedy() -> &'static str {
+/// first. A refusal of Active Defence's own on the host (recorded as decided
+/// by the host) is one `innerwarden allow` does not lift, so it is not
+/// offered there.
+fn hook_block_remedy(verdict: &serde_json::Value) -> &'static str {
+    if verdict.get("decided_by").and_then(|d| d.as_str()) == Some(host_decide::HOST_DECIDED_BY) {
+        return HOST_BLOCK_REMEDY;
+    }
     "  For the person supervising this agent: only you can authorise a blocked \
      command, from your own terminal (see `innerwarden allow --help`). An agent \
      cannot authorise it and should ask you instead of retrying. Your own shell \
      is not screened."
 }
+
+/// The remedy after a refusal of Active Defence's own on the host.
+const HOST_BLOCK_REMEDY: &str =
+    "  For the person supervising this agent: Active Defence on this host refused \
+     this command on its own, and `innerwarden allow` does not lift that; its settings \
+     on this host decide. An agent cannot authorise it and should ask you instead of \
+     retrying.";
 
 /// `innerwarden enforce` / `innerwarden dry-run` - flip every guarded agent
 /// integration between BLOCK (enforce) and observe-only (monitor). Native hooks
@@ -2422,6 +2394,31 @@ mod unknown_command_tests {
 
 #[cfg(test)]
 mod tests {
+    /// A refusal of Active Defence's own on the host is not one a rule of the
+    /// person's lifts: the remedy does not send them to `innerwarden allow`.
+    /// Every other block still does.
+    ///
+    /// FAILS ON REVERT: give every block the same remedy and a host refusal
+    /// points the person to a rule that does not lift it.
+    #[test]
+    fn a_host_refusal_does_not_offer_innerwarden_allow() {
+        let host = serde_json::json!({"recommendation": "deny", "decided_by": "host"});
+        let said = super::hook_block_remedy(&host);
+        assert!(!said.contains("innerwarden allow --help"), "{said}");
+        assert!(
+            said.contains("Active Defence on this host refused this command on its own"),
+            "{said}"
+        );
+        for other in [
+            serde_json::json!({"recommendation": "deny"}),
+            serde_json::json!({"recommendation": "review", "decided_by": "user"}),
+            serde_json::json!({"recommendation": "deny", "decided_by": "rules"}),
+        ] {
+            let said = super::hook_block_remedy(&other);
+            assert!(said.contains("innerwarden allow --help"), "{other}: {said}");
+        }
+    }
+
     /// A full uninstall must unwire EVERY agent before it deletes the binary.
     ///
     /// It removed claude-code's hook only, on a comment that said "claude-code

@@ -51,6 +51,39 @@
 //! net = true                               # the only value this version has
 //! ```
 //!
+//! A file of `schema_version = 2` reads as one of schema 1 and adds one key
+//! that only the system file may hold (see [`AskHost`]), and two jail
+//! settings that either file may hold and the user's file can only tighten
+//! (see [`JailStart`]):
+//!
+//! ```toml
+//! schema_version = 2
+//!
+//! [profile.claude-code]
+//! ask_host = "every_command"               # or "review", the default
+//!
+//! [profile.claude-code.jail]
+//! start = "only_when_admitted"             # or "always", the default
+//! hide_home = [".cache/git/credential"]    # home paths covered by an empty mount
+//! ```
+//!
+//! `start` says when `contain --identity` starts the agent: `always`, or
+//! `only_when_admitted`, only once Active Defence on this host has admitted
+//! the jail (the launcher otherwise exits 2 and starts nothing). `hide_home`
+//! names paths under the home, without `..`, that the jail covers with an
+//! empty mount where they exist. Merged, the stricter `start` and every
+//! hidden path of both files hold.
+//!
+//! `ask_host` says when the hook of an identified instance of the type asks
+//! Active Defence on its host about a shell command: `review` (only a command
+//! the general rules sent to review, what the hook always did) or
+//! `every_command` (every command the hook does not refuse itself). The
+//! user's file never says it, and a file of schema 1 that says it is refused:
+//! a build that reads only schema 1 refuses the whole file, so `ask_host` is
+//! never quietly dropped. Active Defence on the host reads the same file, so
+//! every reader, it included, must be a version that reads schema 2 before a
+//! file of schema 2 is written.
+//!
 //! A category is one of the signal names the engine raises
 //! ([`crate::mcp::SIGNAL_NAMES`]). ATR categories are another namespace (they
 //! are muted with `innerwarden mute`) and are refused here, as is any name
@@ -173,8 +206,18 @@ pub const SYSTEM_PROFILES_PATH: &str = "/etc/innerwarden/agent-profiles.toml";
 /// The user's file, relative to the home.
 pub const USER_PROFILES_PATH: &str = ".config/innerwarden/agent-profiles.toml";
 
-/// The schema this build reads.
+/// The schema a new file is written with: a file the verbs create, or one a
+/// build that reads only this schema can read.
 pub const PROFILES_SCHEMA: u32 = 1;
+
+/// The schema that adds what only the system file says about a type, when its
+/// hook asks the host ([`AskHost`]), and two jail settings: when the jail
+/// starts ([`JailStart`]) and what of the home it hides.
+pub const PROFILES_SCHEMA_2: u32 = 2;
+
+/// Every schema this build reads. A file of schema 1 reads as it always did,
+/// and a key schema 2 added is refused in it.
+pub const READABLE_PROFILES_SCHEMAS: [u32; 2] = [PROFILES_SCHEMA, PROFILES_SCHEMA_2];
 
 /// The largest file read. A file of profiles is a few kilobytes.
 pub const MAX_PROFILES_BYTES: usize = 64 * 1024;
@@ -192,6 +235,10 @@ const MAX_TOOL_NAME_BYTES: usize = 128;
 const MAX_PATH_BYTES: usize = 4096;
 const MAX_GLOB_BYTES: usize = 255;
 const MAX_TIME_BYTES: usize = 64;
+
+/// The most home paths one profile hides, and the longest one.
+pub const MAX_HIDE_HOME: usize = 32;
+const MAX_HIDE_HOME_BYTES: usize = 255;
 
 // ---------------------------------------------------------------------------
 // The file as written
@@ -265,6 +312,9 @@ pub struct ProfileEntry {
     pub mcp_tools_deny: Vec<String>,
     #[serde(default)]
     pub jail: Option<JailEntry>,
+    /// Schema 2, system file only.
+    #[serde(default)]
+    pub ask_host: Option<String>,
 }
 
 /// One `[profile.<agent type>.jail]` table as written.
@@ -279,6 +329,12 @@ pub struct JailEntry {
     pub deny_read: Vec<String>,
     #[serde(default)]
     pub net: Option<bool>,
+    /// Schema 2.
+    #[serde(default)]
+    pub start: Option<String>,
+    /// Schema 2.
+    #[serde(default)]
+    pub hide_home: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -305,6 +361,67 @@ impl ProfileMode {
     }
 }
 
+/// When the hook of a type's identified instance asks Active Defence on its
+/// host about a shell command ([`crate::identity::INSTANCE_DECIDE_ROUTE`]).
+/// Said by `ask_host` in a profile of the system file, schema 2.
+///
+/// Whatever it says, a command the hook refuses itself (a hard rule, a
+/// refusal of the general rules, a profile's own refusal) is never asked
+/// about, and the hook keeps the stricter of its own verdict and the host's.
+/// A command the general rules allow (by a suppression too) is made stricter
+/// only by a refusal of the host's own
+/// ([`crate::identity::InstanceDecideAnswer::refuses_on_its_own`]).
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+pub enum AskHost {
+    /// Only a command the general rules sent to review: what the hook always
+    /// did, and what a profile without `ask_host` means.
+    #[default]
+    #[serde(rename = "review")]
+    Review,
+    /// Every shell command the hook does not refuse itself, an `allow` of the
+    /// general rules too.
+    #[serde(rename = "every_command")]
+    EveryCommand,
+}
+
+impl AskHost {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AskHost::Review => "review",
+            AskHost::EveryCommand => "every_command",
+        }
+    }
+}
+
+/// When `contain --identity` starts the agent in its jail. Said by `start`
+/// in a profile's jail table, schema 2.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+pub enum JailStart {
+    /// Whatever the host said: what the launcher always did, and what a
+    /// profile without `start` means.
+    #[default]
+    #[serde(rename = "always")]
+    Always,
+    /// Only once Active Defence on this host has admitted the jail. Without
+    /// that admission the launcher starts nothing and exits 2. The stricter
+    /// of the two: merged, it holds over `always`.
+    #[serde(rename = "only_when_admitted")]
+    OnlyWhenAdmitted,
+}
+
+impl JailStart {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            JailStart::Always => "always",
+            JailStart::OnlyWhenAdmitted => "only_when_admitted",
+        }
+    }
+}
+
 /// The jail settings a profile gives `contain --identity`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JailProfile {
@@ -316,6 +433,20 @@ pub struct JailProfile {
     /// More project-relative globs hidden inside the jail, on top of the
     /// defaults and any `--deny-read`.
     pub deny_read: Vec<String>,
+    /// When the jail starts; `None` is [`JailStart::Always`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start: Option<JailStart>,
+    /// Paths under the home, relative to it, covered inside the jail by an
+    /// empty mount where they exist.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hide_home: Vec<String>,
+}
+
+impl JailProfile {
+    /// When the jail starts: [`JailStart::Always`] unless the profile says.
+    pub fn start(&self) -> JailStart {
+        self.start.unwrap_or_default()
+    }
 }
 
 /// Which file a profile came from.
@@ -346,6 +477,10 @@ pub struct AgentProfile {
     pub mcp_tools_allow: Vec<String>,
     pub mcp_tools_deny: Vec<String>,
     pub jail: JailProfile,
+    /// When the hook asks the host ([`AskHost`]); `None` is
+    /// [`AskHost::Review`]. Out of [`merge`], only ever the system file's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ask_host: Option<AskHost>,
     /// The file it came from, once [`merge`] has put the two together (the
     /// system file when both have it). `None` straight out of [`validate`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -434,6 +569,16 @@ impl AgentProfiles {
         self.types.get(agent_type)
     }
 
+    /// When the hook asks the host about a shell command of `agent_type`:
+    /// what the profile in force for it says, [`AskHost::Review`] when it
+    /// says nothing or there is none.
+    pub fn ask_host(&self, agent_type: Option<&str>) -> AskHost {
+        agent_type
+            .and_then(|name| self.get(name))
+            .and_then(|profile| profile.ask_host)
+            .unwrap_or_default()
+    }
+
     /// The decisions recorded about `agent_type`, if any.
     pub fn record(&self, agent_type: &str) -> Option<&AgentRecord> {
         self.agents.get(agent_type)
@@ -512,15 +657,17 @@ pub fn parse(bytes: &[u8]) -> Result<AgentProfiles, ProfileError> {
 
 /// Check a parsed file and turn it into the profiles it applies.
 ///
-/// Refused, with the reason: another schema, an agent type that is not an
-/// agent id, a mode other than `enforce` or `block-review`, a category that is
-/// not a signal name, an allowed category that is a hard rule, a category or
-/// a tool both allowed and denied, a tool name or a path that is not one, and
-/// `net = false`.
+/// Refused, with the reason: a schema this build does not read, an agent type
+/// that is not an agent id, a mode other than `enforce` or `block-review`, a
+/// category that is not a signal name, an allowed category that is a hard
+/// rule, a category or a tool both allowed and denied, a tool name or a path
+/// that is not one, `net = false`, and a key of schema 2 in a file of schema
+/// 1.
 pub fn validate(file: ProfilesFile) -> Result<AgentProfiles, ProfileError> {
-    if file.schema_version != PROFILES_SCHEMA {
+    if !READABLE_PROFILES_SCHEMAS.contains(&file.schema_version) {
         return Err(ProfileError(format!(
-            "unsupported schema_version {} (this version reads {PROFILES_SCHEMA})",
+            "unsupported schema_version {} (this version reads {PROFILES_SCHEMA} and \
+             {PROFILES_SCHEMA_2})",
             file.schema_version
         )));
     }
@@ -551,7 +698,7 @@ pub fn validate(file: ProfilesFile) -> Result<AgentProfiles, ProfileError> {
                  so no profile may take that name"
             )));
         }
-        let profile = validate_entry(&agent_type, entry)?;
+        let profile = validate_entry(&agent_type, entry, file.schema_version)?;
         types.insert(agent_type, profile);
     }
     let mut agents = BTreeMap::new();
@@ -734,7 +881,40 @@ fn bounded_entries(agent_type: &str, field: &str, len: usize) -> Result<(), Prof
     Ok(())
 }
 
-fn validate_entry(agent_type: &str, entry: ProfileEntry) -> Result<AgentProfile, ProfileError> {
+/// `ask_host`, from a file of `schema`: refused in a file of schema 1, one of
+/// the two words in one of schema 2.
+fn validate_ask_host(
+    agent_type: &str,
+    value: Option<&str>,
+    schema: u32,
+) -> Result<Option<AskHost>, ProfileError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if schema < PROFILES_SCHEMA_2 {
+        return Err(error_at(
+            agent_type,
+            "ask_host",
+            format!("needs schema_version = {PROFILES_SCHEMA_2}"),
+        ));
+    }
+    match value {
+        "review" => Ok(Some(AskHost::Review)),
+        "every_command" => Ok(Some(AskHost::EveryCommand)),
+        other => Err(error_at(
+            agent_type,
+            "ask_host",
+            format!("unknown value `{other}` (use `review` or `every_command`)"),
+        )),
+    }
+}
+
+fn validate_entry(
+    agent_type: &str,
+    entry: ProfileEntry,
+    schema: u32,
+) -> Result<AgentProfile, ProfileError> {
+    let ask_host = validate_ask_host(agent_type, entry.ask_host.as_deref(), schema)?;
     let mode = match entry.mode.as_deref() {
         None => None,
         Some("enforce") => Some(ProfileMode::Enforce),
@@ -785,7 +965,7 @@ fn validate_entry(agent_type: &str, entry: ProfileEntry) -> Result<AgentProfile,
     }
     let jail = match entry.jail {
         None => JailProfile::default(),
-        Some(jail) => validate_jail(agent_type, jail)?,
+        Some(jail) => validate_jail(agent_type, jail, schema)?,
     };
     Ok(AgentProfile {
         mode,
@@ -794,6 +974,7 @@ fn validate_entry(agent_type: &str, entry: ProfileEntry) -> Result<AgentProfile,
         mcp_tools_allow,
         mcp_tools_deny,
         jail,
+        ask_host,
         source: None,
     })
 }
@@ -883,6 +1064,85 @@ fn is_jail_path(path: &str) -> bool {
             .all(|step| step != "." && step != "..")
 }
 
+/// A path under the home, relative to it: one or more plain steps (no `.`,
+/// `..` or empty step, no glob), no control character, at most 255 bytes.
+fn is_home_path(path: &str) -> bool {
+    !path.is_empty()
+        && path.len() <= MAX_HIDE_HOME_BYTES
+        && !path.starts_with(['/', '~'])
+        && !path
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '*' | '?' | '[' | ']'))
+        && path
+            .split('/')
+            .all(|step| !step.is_empty() && step != "." && step != "..")
+}
+
+/// `start`, from a file of `schema`: refused in a file of schema 1, one of
+/// the two words in one of schema 2.
+fn validate_jail_start(
+    agent_type: &str,
+    value: Option<&str>,
+    schema: u32,
+) -> Result<Option<JailStart>, ProfileError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if schema < PROFILES_SCHEMA_2 {
+        return Err(error_at(
+            agent_type,
+            "jail.start",
+            format!("needs schema_version = {PROFILES_SCHEMA_2}"),
+        ));
+    }
+    match value {
+        "always" => Ok(Some(JailStart::Always)),
+        "only_when_admitted" => Ok(Some(JailStart::OnlyWhenAdmitted)),
+        other => Err(error_at(
+            agent_type,
+            "jail.start",
+            format!("unknown value `{other}` (use `always` or `only_when_admitted`)"),
+        )),
+    }
+}
+
+/// `hide_home`, from a file of `schema`: refused in a file of schema 1;
+/// at most [`MAX_HIDE_HOME`] paths under the home ([`is_home_path`]).
+fn validate_hide_home(
+    agent_type: &str,
+    list: Vec<String>,
+    schema: u32,
+) -> Result<Vec<String>, ProfileError> {
+    if list.is_empty() {
+        return Ok(list);
+    }
+    if schema < PROFILES_SCHEMA_2 {
+        return Err(error_at(
+            agent_type,
+            "jail.hide_home",
+            format!("needs schema_version = {PROFILES_SCHEMA_2}"),
+        ));
+    }
+    if list.len() > MAX_HIDE_HOME {
+        return Err(error_at(
+            agent_type,
+            "jail.hide_home",
+            format!("{} entries, more than {MAX_HIDE_HOME}", list.len()),
+        ));
+    }
+    if let Some(path) = list.iter().find(|p| !is_home_path(p)) {
+        return Err(error_at(
+            agent_type,
+            "jail.hide_home",
+            format!(
+                "{path:?} is not a path under the home: written relative to it, without `.`, \
+                 `..`, an empty step or a glob, at most {MAX_HIDE_HOME_BYTES} bytes"
+            ),
+        ));
+    }
+    Ok(sorted(list))
+}
+
 /// A glob relative to the project, with no `..` step.
 fn is_project_glob(glob: &str) -> bool {
     !glob.is_empty()
@@ -892,7 +1152,13 @@ fn is_project_glob(glob: &str) -> bool {
         && glob.split('/').all(|step| step != "..")
 }
 
-fn validate_jail(agent_type: &str, jail: JailEntry) -> Result<JailProfile, ProfileError> {
+fn validate_jail(
+    agent_type: &str,
+    jail: JailEntry,
+    schema: u32,
+) -> Result<JailProfile, ProfileError> {
+    let start = validate_jail_start(agent_type, jail.start.as_deref(), schema)?;
+    let hide_home = validate_hide_home(agent_type, jail.hide_home, schema)?;
     if jail.net == Some(false) {
         return Err(error_at(
             agent_type,
@@ -929,6 +1195,8 @@ fn validate_jail(agent_type: &str, jail: JailEntry) -> Result<JailProfile, Profi
         project_rw: jail.project_rw,
         extra_ro: sorted(jail.extra_ro),
         deny_read: sorted(jail.deny_read),
+        start,
+        hide_home,
     })
 }
 
@@ -937,7 +1205,24 @@ fn validate_jail(agent_type: &str, jail: JailEntry) -> Result<JailProfile, Profi
 /// an `[agent.<type>]` table, an allowance or an instance exception. A
 /// profile the user's file assigns is one of its own tables, so it cannot
 /// relax either.
+///
+/// `ask_host` is refused there whatever it says: when the hook asks the host
+/// is the system file's to say, and inside the jail the user's file is one
+/// the agent can write. The jail's `start` and `hide_home` are taken from
+/// it: [`merge`] keeps the stricter `start` and every hidden path, so the
+/// user's file can only tighten them.
 pub fn check_user_file(profiles: &AgentProfiles) -> Result<(), ProfileError> {
+    if let Some(agent_type) = profiles
+        .types
+        .iter()
+        .find_map(|(name, profile)| profile.ask_host.map(|_| name))
+    {
+        return Err(error_at(
+            agent_type,
+            "ask_host",
+            format!("only {SYSTEM_PROFILES_PATH} says when the hook asks the host"),
+        ));
+    }
     for (agent_type, record) in &profiles.agents {
         let field = if !record.allow_categories.is_empty() {
             "allow_categories"
@@ -997,6 +1282,10 @@ pub fn check_user_file(profiles: &AgentProfiles) -> Result<(), ProfileError> {
 /// What was decided about a type is merged too: revoked if either file says
 /// so, approved if either does, the system file's names and times first,
 /// every revoked instance and every exception of both.
+///
+/// `ask_host` is the system file's alone: one in the user's file (which
+/// [`check_user_file`] refuses) is never taken. The jail's `start` is the
+/// stricter of the two files' and its hidden home paths those of both.
 pub fn merge(system: Option<&AgentProfiles>, user: Option<&AgentProfiles>) -> AgentProfiles {
     let mut types: BTreeMap<String, AgentProfile> = BTreeMap::new();
     let sides = [
@@ -1022,6 +1311,11 @@ pub fn merge(system: Option<&AgentProfiles>, user: Option<&AgentProfiles>) -> Ag
             }
             merged.jail.extra_ro = union(&merged.jail.extra_ro, &profile.jail.extra_ro);
             merged.jail.deny_read = union(&merged.jail.deny_read, &profile.jail.deny_read);
+            merged.jail.hide_home = union(&merged.jail.hide_home, &profile.jail.hide_home);
+            merged.jail.start = merged.jail.start.max(profile.jail.start);
+            if profile.source == Some(ProfileSource::System) {
+                merged.ask_host = profile.ask_host;
+            }
         }
     }
     let mut agents: BTreeMap<String, AgentRecord> = BTreeMap::new();
@@ -1435,6 +1729,9 @@ pub fn decide_tool_call_in(
 }
 
 /// What the MCP proxy applies, set once when it starts.
+// One value per proxy run, never held in a collection: the size of a profile
+// in it costs nothing worth a box at every place that builds or matches it.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProxyProfile {
     /// Profiles are in force. `profile` is the one for the proxy's agent type
@@ -1515,7 +1812,21 @@ pub fn changes(before: &AgentProfiles, after: &AgentProfiles) -> Vec<ProfileChan
                 new.jail.project_rw.as_deref().unwrap_or(""),
             );
         }
-        let lists: [(&str, &[String], &[String]); 6] = [
+        if old.ask_host != new.ask_host {
+            push(
+                "ask_host_changed",
+                name,
+                new.ask_host.map(AskHost::as_str).unwrap_or(""),
+            );
+        }
+        if old.jail.start != new.jail.start {
+            push(
+                "jail_start_changed",
+                name,
+                new.jail.start.map(JailStart::as_str).unwrap_or(""),
+            );
+        }
+        let lists: [(&str, &[String], &[String]); 7] = [
             (
                 "allow_category",
                 &old.allow_categories,
@@ -1526,6 +1837,7 @@ pub fn changes(before: &AgentProfiles, after: &AgentProfiles) -> Vec<ProfileChan
             ("mcp_tool_deny", &old.mcp_tools_deny, &new.mcp_tools_deny),
             ("jail_extra_ro", &old.jail.extra_ro, &new.jail.extra_ro),
             ("jail_deny_read", &old.jail.deny_read, &new.jail.deny_read),
+            ("jail_hide_home", &old.jail.hide_home, &new.jail.hide_home),
         ];
         for (label, old, new) in lists {
             for added in new.iter().filter(|v| !old.contains(v)) {
@@ -1658,6 +1970,21 @@ pub fn describe(profile: Option<&AgentProfile>) -> Vec<String> {
     }
     list(&mut out, "Read-only in the jail", &profile.jail.extra_ro);
     list(&mut out, "Hidden in the jail", &profile.jail.deny_read);
+    list(
+        &mut out,
+        "Hidden from the home in the jail",
+        &profile.jail.hide_home,
+    );
+    if profile.jail.start() == JailStart::OnlyWhenAdmitted {
+        out.push("The jail starts only when Active Defence on this host admits it.".to_string());
+    }
+    if profile.ask_host == Some(AskHost::EveryCommand) {
+        out.push(
+            "In a jail, Active Defence on this host is asked about every shell command, not \
+             only a review."
+                .to_string(),
+        );
+    }
     if out.is_empty() {
         out.push("Your general rules, nothing added.".to_string());
     }
@@ -1675,8 +2002,11 @@ fn mode_strictness(mode: Option<ProfileMode>) -> u8 {
 
 /// Whether going from `before` to `after` (`None`: the general rules) lets
 /// the agent do anything it could not: an allowance added, a refusal or a
-/// hidden path taken away, a looser mode, more read-only paths in the jail,
-/// another project folder.
+/// hidden path taken away (of the project or of the home), a looser mode,
+/// more read-only paths in the jail, another project folder, a jail that
+/// starts without the host's admission where it did not, or the host asked
+/// about every command where it was not (the host then decides commands it
+/// was never asked about, and it may allow what it is asked).
 pub fn relaxes(before: Option<&AgentProfile>, after: Option<&AgentProfile>) -> bool {
     let empty = AgentProfile::default();
     let (before, after) = (before.unwrap_or(&empty), after.unwrap_or(&empty));
@@ -1688,7 +2018,11 @@ pub fn relaxes(before: Option<&AgentProfile>, after: Option<&AgentProfile>) -> b
         || mode_strictness(after.mode) < mode_strictness(before.mode)
         || gains(&before.jail.extra_ro, &after.jail.extra_ro)
         || gains(&after.jail.deny_read, &before.jail.deny_read)
+        || gains(&after.jail.hide_home, &before.jail.hide_home)
+        || after.jail.start() < before.jail.start()
         || (after.jail.project_rw.is_some() && after.jail.project_rw != before.jail.project_rw)
+        || (after.ask_host == Some(AskHost::EveryCommand)
+            && before.ask_host != Some(AskHost::EveryCommand))
 }
 
 // ---------------------------------------------------------------------------
@@ -1867,6 +2201,148 @@ pub fn revoke(
     Ok(doc.to_string())
 }
 
+/// The folder under the home where an agent type's own installer keeps the
+/// versions of the agent it runs, written as a profile writes a jail path.
+/// A profile that holds the jail to the versions as they were installed
+/// names it in `extra_ro`, so the jail sees them read-only even inside a
+/// folder the jail may write. `None` for a type whose installer keeps none
+/// there.
+pub fn runtime_versions_dir(agent_type: &str) -> Option<&'static str> {
+    match agent_type {
+        "claude-code" => Some("~/.local/share/claude/versions"),
+        _ => None,
+    }
+}
+
+/// A list of a profile's jail table that [`set_jail_path`] edits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JailList {
+    /// `extra_ro`: an absolute path or one under `~/`.
+    ExtraRo,
+    /// `hide_home`: a path under the home, relative to it (schema 2).
+    HideHome,
+}
+
+impl JailList {
+    fn key(self) -> &'static str {
+        match self {
+            JailList::ExtraRo => "extra_ro",
+            JailList::HideHome => "hide_home",
+        }
+    }
+}
+
+/// The `[profile.<agent_type>.jail]` table, made when missing. Refused when
+/// `[agent.<agent_type>]` assigns the type another profile: that profile's
+/// rules apply to it, and an edit of its own table would change nothing.
+fn jail_table<'d>(
+    doc: &'d mut toml_edit::DocumentMut,
+    agent_type: &str,
+) -> Result<&'d mut toml_edit::Table, ProfileError> {
+    if !crate::hook::is_agent_id(agent_type) {
+        return Err(edit_error(format!("`{agent_type}` is not an agent type")));
+    }
+    let assigned = doc
+        .get("agent")
+        .and_then(|agents| agents.get(agent_type))
+        .and_then(|table| table.get("profile"))
+        .and_then(|profile| profile.as_str())
+        .filter(|profile| *profile != agent_type)
+        .map(str::to_string);
+    if let Some(profile) = assigned {
+        return Err(edit_error(format!(
+            "`agent.{agent_type}` assigns the profile `{profile}`, whose rules apply to it; \
+             edit that profile"
+        )));
+    }
+    let implicit = || {
+        let mut table = toml_edit::Table::new();
+        table.set_implicit(true);
+        toml_edit::Item::Table(table)
+    };
+    let profiles = doc
+        .entry("profile")
+        .or_insert_with(implicit)
+        .as_table_mut()
+        .ok_or_else(|| edit_error("`profile` is not written as tables"))?;
+    profiles
+        .entry(agent_type)
+        .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()))
+        .as_table_mut()
+        .ok_or_else(|| edit_error(format!("`profile.{agent_type}` is not written as a table")))?
+        .entry("jail")
+        .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()))
+        .as_table_mut()
+        .ok_or_else(|| {
+            edit_error(format!(
+                "`profile.{agent_type}.jail` is not written as a table"
+            ))
+        })
+}
+
+/// Raise the file to [`PROFILES_SCHEMA_2`] when it is of an older schema:
+/// the keys it adds are refused in a file of schema 1.
+fn at_least_schema_2(doc: &mut toml_edit::DocumentMut) {
+    let schema = doc
+        .get("schema_version")
+        .and_then(|v| v.as_integer())
+        .unwrap_or(0);
+    if schema < i64::from(PROFILES_SCHEMA_2) {
+        doc["schema_version"] = toml_edit::value(i64::from(PROFILES_SCHEMA_2));
+    }
+}
+
+/// Set when `agent_type`'s jail starts (`start`), raising the file to
+/// schema 2 when it is older. Nothing else in it changes. The caller checks
+/// the result with [`parse`] before writing it.
+pub fn set_jail_start(
+    text: &str,
+    agent_type: &str,
+    start: JailStart,
+) -> Result<String, ProfileError> {
+    let mut doc = document(text)?;
+    jail_table(&mut doc, agent_type)?["start"] = toml_edit::value(start.as_str());
+    at_least_schema_2(&mut doc);
+    Ok(doc.to_string())
+}
+
+/// Add `path` to `agent_type`'s jail `list` (`present`) or take it out of it,
+/// raising the file to schema 2 for a hidden home path. A path that is not
+/// one the list takes is refused. Nothing else in the file changes. The
+/// caller checks the result with [`parse`] before writing it.
+pub fn set_jail_path(
+    text: &str,
+    agent_type: &str,
+    list: JailList,
+    path: &str,
+    present: bool,
+) -> Result<String, ProfileError> {
+    let fits = match list {
+        JailList::ExtraRo => is_jail_path(path),
+        JailList::HideHome => is_home_path(path),
+    };
+    if !fits {
+        return Err(edit_error(format!(
+            "{path:?} is not a path `{}` takes",
+            list.key()
+        )));
+    }
+    let mut doc = document(text)?;
+    let table = jail_table(&mut doc, agent_type)?;
+    if present {
+        push_unique(table, list.key(), path)?;
+    } else if let Some(item) = table.get_mut(list.key()) {
+        let array = item
+            .as_array_mut()
+            .ok_or_else(|| edit_error(format!("`{}` is not a list", list.key())))?;
+        array.retain(|v| v.as_str() != Some(path));
+    }
+    if list == JailList::HideHome {
+        at_least_schema_2(&mut doc);
+    }
+    Ok(doc.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1984,7 +2460,8 @@ net = true
     #[test]
     fn a_file_that_cannot_mean_one_thing_is_refused() {
         for (text, says) in [
-            ("schema_version = 2\n", "unsupported schema_version 2"),
+            ("schema_version = 3\n", "unsupported schema_version 3"),
+            ("schema_version = 0\n", "unsupported schema_version 0"),
             (
                 "schema_version = 1\n[profile.Claude]\n",
                 "is not an agent type",
@@ -2099,6 +2576,560 @@ net = true
         ))
         .unwrap();
         assert_eq!(check_user_file(&tightening), Ok(()));
+    }
+
+    // -- schema 2: when the hook asks the host ------------------------------
+
+    const EVERY: &str = "schema_version = 2\n[profile.claude-code]\nask_host = \"every_command\"\n";
+
+    #[test]
+    fn a_schema_2_file_is_read_with_ask_host() {
+        let checked = parse(EVERY.as_bytes()).unwrap();
+        assert_eq!(
+            checked.get("claude-code").unwrap().ask_host,
+            Some(AskHost::EveryCommand)
+        );
+        let merged = merge(Some(&checked), None);
+        assert_eq!(merged.ask_host(Some("claude-code")), AskHost::EveryCommand);
+        assert_eq!(merged.ask_host(Some("cursor")), AskHost::Review);
+        assert_eq!(merged.ask_host(None), AskHost::Review);
+        let review = parse(
+            b"schema_version = 2\n[profile.claude-code]\nask_host = \"review\"\n[profile.cursor]\n",
+        )
+        .unwrap();
+        let review = merge(Some(&review), None);
+        assert_eq!(review.ask_host(Some("claude-code")), AskHost::Review);
+        assert_eq!(review.ask_host(Some("cursor")), AskHost::Review);
+        // A type assigned to a named profile gets that profile's ask_host;
+        // one assigned the general rules gets the default.
+        let assigned = merge(
+            Some(
+                &parse(
+                    b"schema_version = 2\n[profile.kernel]\nask_host = \"every_command\"\n\
+                      [agent.claude-code]\nprofile = \"kernel\"\n[agent.codex]\nprofile = \"general\"\n",
+                )
+                .unwrap(),
+            ),
+            None,
+        );
+        assert_eq!(
+            assigned.ask_host(Some("claude-code")),
+            AskHost::EveryCommand
+        );
+        assert_eq!(assigned.ask_host(Some("codex")), AskHost::Review);
+        // Without the key, a file of schema 2 reads as the same file of
+        // schema 1.
+        let body =
+            "[profile.claude-code]\nmode = \"enforce\"\nallow_categories = [\"bare_ip_fetch\"]\n";
+        assert_eq!(
+            parse(format!("schema_version = 2\n{body}").as_bytes()).unwrap(),
+            parse(format!("schema_version = 1\n{body}").as_bytes()).unwrap()
+        );
+    }
+
+    /// A build that reads only schema 1 refuses a file of schema 2 whole, so
+    /// the key must never be read in a file that claims schema 1: there an
+    /// older build and this one would read the same file two ways.
+    ///
+    /// FAILS ON REVERT: drop the schema check from `validate_ask_host` and the
+    /// first case loads.
+    #[test]
+    fn ask_host_in_a_schema_1_file_is_refused() {
+        for (text, says) in [
+            (
+                "schema_version = 1\n[profile.claude-code]\nask_host = \"every_command\"\n",
+                "needs schema_version = 2",
+            ),
+            (
+                "schema_version = 1\n[profile.claude-code]\nask_host = \"review\"\n",
+                "needs schema_version = 2",
+            ),
+            (
+                "schema_version = 2\n[profile.claude-code]\nask_host = \"always\"\n",
+                "unknown value `always`",
+            ),
+            (
+                "schema_version = 2\n[profile.claude-code]\nask_host = \"Every_Command\"\n",
+                "unknown value",
+            ),
+        ] {
+            let err = parse(text.as_bytes()).unwrap_err().to_string();
+            assert!(err.contains(says), "{text}: {err}");
+            assert!(err.contains("ask_host"), "{text}: {err}");
+        }
+    }
+
+    /// Inside the jail the user's file is one the agent can write, and the
+    /// host deciding every command is the system file's to ask for.
+    ///
+    /// FAILS ON REVERT: drop the `ask_host` check from `check_user_file` and
+    /// both values load in the user's file.
+    #[test]
+    fn the_users_file_never_says_when_the_hook_asks() {
+        for value in ["every_command", "review"] {
+            let user = parse(
+                format!("schema_version = 2\n[profile.claude-code]\nask_host = \"{value}\"\n")
+                    .as_bytes(),
+            )
+            .unwrap();
+            let err = check_user_file(&user).unwrap_err().to_string();
+            assert!(
+                err.contains("ask_host") && err.contains("only /etc/innerwarden"),
+                "{value}: {err}"
+            );
+        }
+        let tightening = parse(
+            b"schema_version = 2\n[profile.claude-code]\ndeny_categories = [\"bare_ip_fetch\"]\n",
+        )
+        .unwrap();
+        assert_eq!(check_user_file(&tightening), Ok(()));
+    }
+
+    /// Even handed a user's side that says it (the reader refuses one), the
+    /// merge takes `ask_host` from the system file alone.
+    ///
+    /// FAILS ON REVERT: take `ask_host` from either side in `merge` and the
+    /// user's `every_command` stands.
+    #[test]
+    fn merge_takes_ask_host_from_the_system_file_only() {
+        let system = parse(b"schema_version = 2\n[profile.claude-code]\n").unwrap();
+        let user = parse(EVERY.as_bytes()).unwrap();
+        let merged = merge(Some(&system), Some(&user));
+        assert_eq!(merged.get("claude-code").unwrap().ask_host, None);
+        assert_eq!(merged.ask_host(Some("claude-code")), AskHost::Review);
+        assert_eq!(
+            merge(None, Some(&user)).ask_host(Some("claude-code")),
+            AskHost::Review
+        );
+        let review =
+            parse(b"schema_version = 2\n[profile.claude-code]\nask_host = \"review\"\n").unwrap();
+        let both = merge(Some(&user), Some(&review));
+        assert_eq!(both.ask_host(Some("claude-code")), AskHost::EveryCommand);
+    }
+
+    /// Profiles from a file of schema 1 serialise exactly as before the key
+    /// existed: no `ask_host`, the same bytes, and a copy saved before reads
+    /// back.
+    #[test]
+    fn a_schema_1_file_serialises_and_reads_as_before() {
+        let merged = merge(
+            Some(
+                &parse(
+                    b"schema_version = 1\n[profile.claude-code]\nmode = \"enforce\"\nallow_categories = [\"bare_ip_fetch\"]\n",
+                )
+                .unwrap(),
+            ),
+            None,
+        );
+        let golden = r#"{"types":{"claude-code":{"mode":"enforce","allow_categories":["bare_ip_fetch"],"deny_categories":[],"mcp_tools_allow":[],"mcp_tools_deny":[],"jail":{"project_rw":null,"extra_ro":[],"deny_read":[]},"source":"system"}}}"#;
+        assert_eq!(serde_json::to_string(&merged).unwrap(), golden);
+        let read: AgentProfiles = serde_json::from_str(golden).unwrap();
+        assert_eq!(read, merged);
+        assert_eq!(read.ask_host(Some("claude-code")), AskHost::Review);
+        let every = merge(Some(&parse(EVERY.as_bytes()).unwrap()), None);
+        let text = serde_json::to_string(&every).unwrap();
+        assert!(text.contains(r#""ask_host":"every_command""#), "{text}");
+        assert_eq!(serde_json::from_str::<AgentProfiles>(&text).unwrap(), every);
+    }
+
+    #[test]
+    fn asking_about_every_command_is_said_changed_and_a_relaxation() {
+        let plain = merge(
+            Some(&parse(b"schema_version = 1\n[profile.claude-code]\n").unwrap()),
+            None,
+        );
+        let every = merge(Some(&parse(EVERY.as_bytes()).unwrap()), None);
+        let (before, after) = (plain.get("claude-code"), every.get("claude-code"));
+        assert!(relaxes(before, after));
+        assert!(!relaxes(after, before), "asking less is not a relaxation");
+        assert!(relaxes(None, after));
+        assert!(!relaxes(after, after));
+        assert_eq!(
+            changes(&plain, &every),
+            [ProfileChange::to_type(
+                "ask_host_changed",
+                "claude-code",
+                "every_command"
+            )]
+        );
+        assert_eq!(
+            changes(&every, &plain),
+            [ProfileChange::to_type(
+                "ask_host_changed",
+                "claude-code",
+                ""
+            )]
+        );
+        assert_eq!(
+            describe(after),
+            [
+                "In a jail, Active Defence on this host is asked about every shell command, \
+                 not only a review."
+            ]
+        );
+        assert_eq!(describe(before), ["Your general rules, nothing added."]);
+    }
+
+    /// A verb that edits a file of schema 2 keeps its schema and its key; a
+    /// file the verbs create is of schema 1, as before.
+    #[test]
+    fn an_edit_keeps_the_schema_it_found() {
+        let stamp = Stamp {
+            by: "maria",
+            at: "2026-10-18T09:00:00Z",
+        };
+        let edited = edit_approve(EVERY, "claude-code", None, None, stamp).unwrap();
+        let read = parse(edited.as_bytes()).unwrap();
+        assert_eq!(
+            read.get("claude-code").unwrap().ask_host,
+            Some(AskHost::EveryCommand)
+        );
+        assert!(edited.starts_with("schema_version = 2\n"), "{edited}");
+        let fresh = edit_approve("", "claude-code", None, None, stamp).unwrap();
+        assert!(fresh.starts_with("schema_version = 1\n"), "{fresh}");
+    }
+
+    // -- when the jail starts, and what of the home it hides ---------------
+
+    const STRICT: &str = "schema_version = 2\n[profile.claude-code.jail]\n\
+        start = \"only_when_admitted\"\nhide_home = [\".cache/git/credential\"]\n";
+
+    #[test]
+    fn a_schema_2_jail_says_when_it_starts_and_what_it_hides() {
+        let read = parse(STRICT.as_bytes()).unwrap();
+        let jail = &read.get("claude-code").unwrap().jail;
+        assert_eq!(jail.start, Some(JailStart::OnlyWhenAdmitted));
+        assert_eq!(jail.start(), JailStart::OnlyWhenAdmitted);
+        assert_eq!(jail.hide_home, [".cache/git/credential"]);
+        let always =
+            parse(b"schema_version = 2\n[profile.claude-code.jail]\nstart = \"always\"\n").unwrap();
+        assert_eq!(
+            always.get("claude-code").unwrap().jail.start(),
+            JailStart::Always
+        );
+        // No `start`: the jail starts as it always did.
+        let plain = parse(b"schema_version = 2\n[profile.claude-code.jail]\n").unwrap();
+        assert_eq!(plain.get("claude-code").unwrap().jail.start, None);
+        assert_eq!(
+            plain.get("claude-code").unwrap().jail.start(),
+            JailStart::Always
+        );
+        assert!(JailStart::OnlyWhenAdmitted > JailStart::Always);
+    }
+
+    /// Both keys are schema 2's: a build that reads only schema 1 refuses
+    /// the whole file, so neither is ever quietly dropped.
+    ///
+    /// FAILS ON REVERT: drop the schema check from `validate_jail_start` or
+    /// from `validate_hide_home` and its line parses.
+    #[test]
+    fn start_and_hide_home_in_a_schema_1_file_are_refused() {
+        for (text, key) in [
+            (
+                "schema_version = 1\n[profile.claude-code.jail]\nstart = \"only_when_admitted\"\n",
+                "jail.start",
+            ),
+            (
+                "schema_version = 1\n[profile.claude-code.jail]\nstart = \"always\"\n",
+                "jail.start",
+            ),
+            (
+                "schema_version = 1\n[profile.claude-code.jail]\nhide_home = [\".cache/git/credential\"]\n",
+                "jail.hide_home",
+            ),
+            (
+                "schema_version = 2\n[profile.claude-code.jail]\nstart = \"when_admitted\"\n",
+                "jail.start",
+            ),
+            (
+                "schema_version = 2\n[profile.claude-code.jail]\nstart = \"Only_When_Admitted\"\n",
+                "jail.start",
+            ),
+        ] {
+            let err = parse(text.as_bytes()).unwrap_err().to_string();
+            assert!(err.contains(key), "{text}: {err}");
+        }
+    }
+
+    /// A hidden home path is a path under the home: written relative to it,
+    /// with no step that leaves it or names nothing, no glob, and bounded.
+    ///
+    /// FAILS ON REVERT: accept any string in `is_home_path` and each line
+    /// here parses.
+    #[test]
+    fn a_hidden_home_path_stays_under_the_home() {
+        for bad in [
+            "",
+            "/etc/shadow",
+            "~/.ssh",
+            "..",
+            "../other",
+            ".cache/../../etc",
+            "./.cache",
+            ".cache//git",
+            ".cache/",
+            ".cache/*",
+            ".cache/git?",
+            ".cache/[ab]",
+            ".cache/\u{7}bell",
+        ] {
+            let text = format!(
+                "schema_version = 2\n[profile.claude-code.jail]\nhide_home = [{}]\n",
+                toml_edit::Value::from(bad)
+            );
+            let err = parse(text.as_bytes()).unwrap_err().to_string();
+            assert!(err.contains("jail.hide_home"), "{bad:?}: {err}");
+        }
+        let long = "a".repeat(256);
+        let text =
+            format!("schema_version = 2\n[profile.claude-code.jail]\nhide_home = [\"{long}\"]\n");
+        assert!(parse(text.as_bytes()).is_err());
+        let many: Vec<String> = (0..=MAX_HIDE_HOME).map(|i| format!("\"d{i}\"")).collect();
+        let text = format!(
+            "schema_version = 2\n[profile.claude-code.jail]\nhide_home = [{}]\n",
+            many.join(",")
+        );
+        assert!(parse(text.as_bytes()).is_err());
+        for good in [".cache/git/credential", "notes", ".config/some tool/state"] {
+            let text = format!(
+                "schema_version = 2\n[profile.claude-code.jail]\nhide_home = [{}]\n",
+                toml_edit::Value::from(good)
+            );
+            assert!(parse(text.as_bytes()).is_ok(), "{good:?}");
+        }
+    }
+
+    /// The user's file may say when the jail starts and what it hides, and
+    /// can only tighten both: merged, the stricter `start` and every hidden
+    /// path of both files hold.
+    ///
+    /// FAILS ON REVERT: take the user's `start` as it is in `merge` (or drop
+    /// the union of `hide_home`) and the user's `always` opens a jail the
+    /// system file starts only when admitted (or a system path is shown).
+    #[test]
+    fn the_users_file_only_tightens_when_the_jail_starts_and_what_it_hides() {
+        let system = checked(STRICT);
+        let user = checked(
+            "schema_version = 2\n[profile.claude-code.jail]\nstart = \"always\"\n\
+             hide_home = [\".local/share/keyrings\"]\n",
+        );
+        assert_eq!(check_user_file(&user), Ok(()));
+        let merged = merge(Some(&system), Some(&user));
+        let jail = &merged.get("claude-code").unwrap().jail;
+        assert_eq!(jail.start(), JailStart::OnlyWhenAdmitted);
+        assert_eq!(
+            jail.hide_home,
+            [".cache/git/credential", ".local/share/keyrings"]
+        );
+        let tightening = checked(
+            "schema_version = 2\n[profile.claude-code.jail]\nstart = \"only_when_admitted\"\n",
+        );
+        assert_eq!(check_user_file(&tightening), Ok(()));
+        let open = checked("schema_version = 1\n[profile.claude-code]\n");
+        let merged = merge(Some(&open), Some(&tightening));
+        assert_eq!(
+            merged.get("claude-code").unwrap().jail.start(),
+            JailStart::OnlyWhenAdmitted
+        );
+        assert_eq!(
+            merge(Some(&tightening), None)
+                .get("claude-code")
+                .unwrap()
+                .jail
+                .start(),
+            JailStart::OnlyWhenAdmitted
+        );
+    }
+
+    /// Starting without the host's admission, and showing a hidden home
+    /// path again, are relaxations; the other way is not. Each change is
+    /// said, and the profile says both in words.
+    ///
+    /// FAILS ON REVERT: drop either line from `relaxes` and its case is not
+    /// a relaxation.
+    #[test]
+    fn starting_without_admission_or_showing_a_hidden_path_is_a_relaxation() {
+        let strict = merge(Some(&checked(STRICT)), None);
+        let plain = merge(
+            Some(&checked("schema_version = 2\n[profile.claude-code.jail]\n")),
+            None,
+        );
+        let (strict_p, plain_p) = (strict.get("claude-code"), plain.get("claude-code"));
+        assert!(relaxes(strict_p, plain_p));
+        assert!(
+            !relaxes(plain_p, strict_p),
+            "starting only when admitted tightens"
+        );
+        let only_start = merge(
+            Some(&checked(
+                "schema_version = 2\n[profile.claude-code.jail]\nstart = \"only_when_admitted\"\n",
+            )),
+            None,
+        );
+        assert!(relaxes(only_start.get("claude-code"), plain_p));
+        assert!(
+            relaxes(strict_p, only_start.get("claude-code")),
+            "a path shown again"
+        );
+        assert_eq!(
+            changes(&plain, &strict),
+            [
+                ProfileChange::to_type("jail_start_changed", "claude-code", "only_when_admitted"),
+                ProfileChange::to_type(
+                    "jail_hide_home_added",
+                    "claude-code",
+                    ".cache/git/credential"
+                ),
+            ]
+        );
+        assert_eq!(
+            changes(&strict, &plain),
+            [
+                ProfileChange::to_type("jail_start_changed", "claude-code", ""),
+                ProfileChange::to_type(
+                    "jail_hide_home_removed",
+                    "claude-code",
+                    ".cache/git/credential"
+                ),
+            ]
+        );
+        assert_eq!(
+            describe(strict_p),
+            [
+                "Hidden from the home in the jail: .cache/git/credential.",
+                "The jail starts only when Active Defence on this host admits it.",
+            ]
+        );
+    }
+
+    /// A file of schema 1 serialises as before the two keys existed, and
+    /// one of schema 2 that says them reads back.
+    #[test]
+    fn a_jail_without_the_new_keys_serialises_as_before() {
+        let merged = merge(Some(&checked(STRICT)), None);
+        let text = serde_json::to_string(&merged).unwrap();
+        assert!(
+            text.contains(r#""start":"only_when_admitted","hide_home":[".cache/git/credential"]"#),
+            "{text}"
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentProfiles>(&text).unwrap(),
+            merged
+        );
+        let plain = merge(
+            Some(&checked("schema_version = 1\n[profile.claude-code]\n")),
+            None,
+        );
+        let text = serde_json::to_string(&plain).unwrap();
+        assert!(
+            !text.contains("start") && !text.contains("hide_home"),
+            "{text}"
+        );
+    }
+
+    /// The host writes the jail's settings through the same editors the
+    /// verbs use: in place, keeping the rest of the file, raised to schema 2
+    /// where a key needs it, and read back by `parse`.
+    #[test]
+    fn the_jail_editors_write_what_parse_reads_and_keep_the_rest() {
+        let text = "# kept\nschema_version = 1\n\n[profile.claude-code]\n\
+                    deny_categories = [\"bare_ip_fetch\"] # kept too\n";
+        let started = set_jail_start(text, "claude-code", JailStart::OnlyWhenAdmitted).unwrap();
+        assert!(started.contains("# kept\n"), "{started}");
+        assert!(started.contains("# kept too"), "{started}");
+        assert!(started.contains("schema_version = 2"), "{started}");
+        let read = parse(started.as_bytes()).unwrap();
+        let profile = read.get("claude-code").unwrap();
+        assert_eq!(profile.jail.start(), JailStart::OnlyWhenAdmitted);
+        assert_eq!(profile.deny_categories, ["bare_ip_fetch"]);
+        let versions = runtime_versions_dir("claude-code").unwrap();
+        assert_eq!(versions, "~/.local/share/claude/versions");
+        assert_eq!(runtime_versions_dir("cursor"), None);
+        let with_ro =
+            set_jail_path(&started, "claude-code", JailList::ExtraRo, versions, true).unwrap();
+        let hidden = set_jail_path(
+            &with_ro,
+            "claude-code",
+            JailList::HideHome,
+            ".cache/git/credential",
+            true,
+        )
+        .unwrap();
+        let again = set_jail_path(
+            &hidden,
+            "claude-code",
+            JailList::HideHome,
+            ".cache/git/credential",
+            true,
+        )
+        .unwrap();
+        assert_eq!(again, hidden, "adding twice adds once");
+        let jail = parse(hidden.as_bytes())
+            .unwrap()
+            .get("claude-code")
+            .unwrap()
+            .jail
+            .clone();
+        assert_eq!(jail.extra_ro, [versions]);
+        assert_eq!(jail.hide_home, [".cache/git/credential"]);
+        let shown = set_jail_path(
+            &hidden,
+            "claude-code",
+            JailList::HideHome,
+            ".cache/git/credential",
+            false,
+        )
+        .unwrap();
+        let back = set_jail_start(&shown, "claude-code", JailStart::Always).unwrap();
+        let jail = parse(back.as_bytes())
+            .unwrap()
+            .get("claude-code")
+            .unwrap()
+            .jail
+            .clone();
+        assert!(jail.hide_home.is_empty());
+        assert_eq!(jail.start, Some(JailStart::Always));
+        // A new file is made of schema 2 for a key of schema 2.
+        let fresh = set_jail_start("", "cursor", JailStart::OnlyWhenAdmitted).unwrap();
+        assert!(fresh.starts_with("schema_version = 2\n"), "{fresh}");
+        assert!(parse(fresh.as_bytes()).is_ok(), "{fresh}");
+        // An extra read-only path keeps the schema it found.
+        let ro_only = set_jail_path(
+            "schema_version = 1\n",
+            "claude-code",
+            JailList::ExtraRo,
+            versions,
+            true,
+        )
+        .unwrap();
+        assert!(ro_only.starts_with("schema_version = 1\n"), "{ro_only}");
+    }
+
+    /// An editor refuses what the file could not hold, and a type whose
+    /// rules come from another profile: its own table would change nothing.
+    #[test]
+    fn the_jail_editors_refuse_what_would_not_apply() {
+        for (list, path) in [
+            (JailList::HideHome, "/etc/shadow"),
+            (JailList::HideHome, "../x"),
+            (JailList::ExtraRo, "relative/path"),
+            (JailList::ExtraRo, "/opt/../etc"),
+        ] {
+            assert!(
+                set_jail_path("", "claude-code", list, path, true).is_err(),
+                "{list:?} {path}"
+            );
+        }
+        assert!(set_jail_start("", "Not An Id", JailStart::Always).is_err());
+        for assigned in ["engineering", GENERAL_PROFILE] {
+            let text = format!(
+                "schema_version = 1\n[profile.engineering]\n[agent.claude-code]\nprofile = \"{assigned}\"\n"
+            );
+            let err = set_jail_start(&text, "claude-code", JailStart::OnlyWhenAdmitted)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(assigned), "{err}");
+        }
     }
 
     // -- the decisions ----------------------------------------------------

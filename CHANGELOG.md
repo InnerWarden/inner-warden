@@ -3,6 +3,30 @@
 All notable changes to InnerWarden are documented here. This project
 follows semantic versioning.
 
+## Unreleased
+
+### Upgrade notes: what to do
+
+- **A program in `innerwarden contain` can no longer make a btrfs or bcachefs
+  subvolume or snapshot.** It gets "Operation not permitted". A tool that
+  needs one (a container runtime on btrfs, `btrfs subvolume create`) has to
+  run outside the jail.
+
+### Security
+
+- **No jail makes a new btrfs or bcachefs subvolume or snapshot.** In 1.5.5
+  and earlier, on a btrfs or bcachefs disk where the project, or a folder the
+  jail shows, is a subvolume, a program in the jail could snapshot it, and
+  the snapshot held in full the files the jail hides there (`.env`,
+  `secrets/`, each `--deny-read` path): the jail covers those paths with
+  empty mounts, and a snapshot copies what the disk holds under them. On
+  Linux, where the host takes the jail's seccomp filter, every jail now
+  refuses the four btrfs commands and the two bcachefs ones that make a
+  subvolume or a snapshot, on every ABI the filter runs. A snapshot made
+  before the jail started, in a folder the jail shows, still holds those
+  files: only new ones are refused, so keep such snapshots out of the
+  project.
+
 ## 1.5.5 - 2026-10-11
 
 ### Upgrade notes: what to do

@@ -265,6 +265,27 @@ fn read_raw(path: &std::path::Path) -> RawRecord {
     RawRecord::Bytes { bytes, read_only }
 }
 
+/// The record the launcher mounted in this jail, as it mounted it: a
+/// read-only regular file of this user, no larger than the cap. `None`
+/// where there is no such file, and on every other system.
+pub fn mounted_record() -> Option<Vec<u8>> {
+    #[cfg(target_os = "linux")]
+    {
+        let path = std::path::Path::new(innerwarden_agent_guard::identity::JAIL_RECORD_PATH);
+        match read_raw(path) {
+            RawRecord::Bytes {
+                bytes,
+                read_only: true,
+            } => Some(bytes),
+            _ => None,
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
 /// The hook's labels from the real record and the real `/proc`. Other systems
 /// have no jail record: `None`.
 pub fn current(hook_agent: Option<&str>, payload_session: Option<&str>) -> Option<Identity> {

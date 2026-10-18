@@ -151,6 +151,14 @@ export type ControlsInput = {
   now: number;
 };
 
+/**
+ * The AI Jail's optional extra, off unless the person adds it: the alias that
+ * starts Claude Code in the jail every time (the same line `innerwarden setup`
+ * offers).
+ */
+export const JAIL_ALIAS_WORDS =
+  "To start Claude Code in it every time, add alias claude='innerwarden contain --identity -- claude' to your shell.";
+
 export function communityControls(input: ControlsInput): Control[] {
   const { agents, protection, health, now } = input;
   // An agent found here with no connection at all has no mechanism to sort it
@@ -175,6 +183,7 @@ export function communityControls(input: ControlsInput): Control[] {
         : `${input.record.decisions.toLocaleString("en-GB")} decisions${input.sinceWords === undefined ? "" : ` since ${input.sinceWords}`}. It keeps the newest and drops the oldest.`,
   });
   if (protection !== undefined) {
+    const claudeHere = agents.some((row) => row.id === "claude-code");
     controls.push({
       key: "ai_jail",
       glyph: "cage",
@@ -182,7 +191,8 @@ export function communityControls(input: ControlsInput): Control[] {
       status: protection.jail.available ? "Ready" : "Not available here",
       state: protection.jail.available ? "on" : "off",
       line: protection.jail.available
-        ? "Runs an agent in a jail when you ask for one, with the guard inside it for Claude Code; other agents get the walls."
+        ? "Runs an agent in a jail when you ask for one, with the guard inside it for Claude Code; other agents get the walls." +
+          (claudeHere ? ` ${JAIL_ALIAS_WORDS}` : "")
         : "This machine has no sandbox the jail trusts.",
       ...(protection.jail.available
         ? { command: { label: "To start one, with your agent's own command in place of <command>:", command: "innerwarden contain -- <command>", template: true } }

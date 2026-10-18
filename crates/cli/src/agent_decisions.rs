@@ -536,6 +536,24 @@ pub fn applies_sentence(agent: &str, confined: usize, other: usize) -> String {
     )
 }
 
+/// The sentence a change that turns on `ask_host = "every_command"` carries.
+/// It is not a relaxation for confined instances only: the hook of every
+/// identified instance asks, confined or not.
+pub fn ask_host_sentence(agent: &str, confined: usize, other: usize) -> String {
+    let all = confined + other;
+    format!(
+        "From its next action, Active Defence on this host is asked about every shell command \
+         of {agent}'s identified instances, confined or not, and may refuse one your general \
+         rules allow. {all} identified {} today.",
+        instances_word(all)
+    )
+}
+
+/// The profile asks the host about every command.
+fn asks_every_command(profile: Option<&AgentProfile>) -> bool {
+    profile.and_then(|p| p.ask_host) == Some(profiles::AskHost::EveryCommand)
+}
+
 /// PURE. The effect of `edit`, from what is in force before and after it.
 /// A change that lets the agent do more is a relaxation and is confirmed by
 /// typing the agent's name.
@@ -550,12 +568,54 @@ pub fn effect(
     let agent = request.agent.as_str();
     let (confined, other) = count(instances, agent);
     let rules = |p: &AgentProfiles| -> Option<AgentProfile> { p.get(agent).cloned() };
-    let relaxes = profiles::relaxes(rules(before).as_ref(), rules(after).as_ref());
+    let (rules_before, rules_after) = (rules(before), rules(after));
+    let relaxes = profiles::relaxes(rules_before.as_ref(), rules_after.as_ref());
+    // Asking the host about every command counts as a relaxation, and it
+    // reaches every identified instance, not only the confined ones: said
+    // apart from what relaxes for confined instances only.
+    let asks_more =
+        asks_every_command(rules_after.as_ref()) && !asks_every_command(rules_before.as_ref());
+    let relaxes_for_confined = if asks_more {
+        let mut same_ask = rules_after.clone().unwrap_or_default();
+        same_ask.ask_host = rules_before.as_ref().and_then(|p| p.ask_host);
+        profiles::relaxes(rules_before.as_ref(), Some(&same_ask))
+    } else {
+        relaxes
+    };
     let profile_before = profile_name(before, agent);
     let profile_after = profile_name(after, agent);
     let label_before = profile_label(profile_before.as_deref());
     let label_after = profile_label(profile_after.as_deref());
-    let applies = applies_sentence(agent, confined, other);
+    let applies = match (relaxes_for_confined, asks_more) {
+        (true, true) => format!(
+            "{} {}",
+            applies_sentence(agent, confined, other),
+            ask_host_sentence(agent, confined, other)
+        ),
+        (false, true) => ask_host_sentence(agent, confined, other),
+        _ => applies_sentence(agent, confined, other),
+    };
+    let applies_done = if asks_more {
+        let all = confined + other;
+        let asked = format!(
+            "Active Defence on this host is asked about every shell command of its {all} \
+             identified {}.",
+            instances_word(all)
+        );
+        if relaxes_for_confined {
+            format!(
+                "Applies to {confined} confined {}. {asked}",
+                instances_word(confined)
+            )
+        } else {
+            asked
+        }
+    } else {
+        format!(
+            "Applies to {confined} confined {}.",
+            instances_word(confined)
+        )
+    };
     let target = |instance: &Option<String>| match instance {
         Some(id) => format!("instance {}", short(id)),
         None => agent.to_string(),
@@ -585,8 +645,7 @@ pub fn effect(
             ),
             format!(
                 "{by} changed the {agent} profile from {label_before} to {label_after}. \
-                 Applies to {confined} confined {}.",
-                instances_word(confined)
+                 {applies_done}"
             ),
             "agent_type",
         ),
@@ -1141,6 +1200,90 @@ mod tests {
                 "{text}"
             );
         }
+    }
+
+    /// A profile that only asks the host about every command is not worded
+    /// as a relaxation for confined instances only: the hook of every
+    /// identified instance asks, confined or not, and the host may refuse
+    /// what the general rules allow. It is still confirmed by the name.
+    ///
+    /// FAILS ON REVERT: word it with the sentence of a relaxation, and the
+    /// person reads that the other instances keep the general rules.
+    #[test]
+    fn asking_the_host_about_every_command_is_said_for_every_identified_instance() {
+        let general = AgentProfiles::default();
+        let asks = profiles::merge(
+            Some(&checked(
+                "schema_version = 2\n[profile.kernel]\nask_host = \"every_command\"\n\
+                 [agent.claude-code]\nprofile = \"kernel\"\n",
+            )),
+            None,
+        );
+        let list = [
+            instance(Trust::Confined, true),
+            instance(Trust::Observed, true),
+        ];
+        let assign = parse(&args("profile claude-code kernel --system")).unwrap();
+        let e = effect(
+            &assign,
+            &Edit::Assign("kernel".into()),
+            &general,
+            &asks,
+            &list,
+            "maria",
+        );
+        assert!(e.relaxes);
+        assert_eq!(e.confirm, Confirm::TypedName);
+        assert!(
+            !e.before.contains("the others keep your general rules"),
+            "{}",
+            e.before
+        );
+        assert_eq!(
+            e.before,
+            "Change the claude-code profile from General rules to kernel. From its next action, \
+             Active Defence on this host is asked about every shell command of claude-code's \
+             identified instances, confined or not, and may refuse one your general rules \
+             allow. 2 identified instances today."
+        );
+        assert_eq!(
+            e.done,
+            "maria changed the claude-code profile from General rules to kernel. Active Defence \
+             on this host is asked about every shell command of its 2 identified instances."
+        );
+        // With an allowance too, both are said.
+        let both = profiles::merge(
+            Some(&checked(
+                "schema_version = 2\n[profile.kernel]\nask_host = \"every_command\"\n\
+                 allow_categories = [\"bare_ip_fetch\"]\n[agent.claude-code]\nprofile = \"kernel\"\n",
+            )),
+            None,
+        );
+        let e = effect(
+            &assign,
+            &Edit::Assign("kernel".into()),
+            &general,
+            &both,
+            &list,
+            "maria",
+        );
+        assert!(
+            e.before
+                .contains("Applies only to instances that run confined"),
+            "{}",
+            e.before
+        );
+        assert!(
+            e.before.contains("confined or not, and may refuse one"),
+            "{}",
+            e.before
+        );
+        assert_eq!(
+            e.done,
+            "maria changed the claude-code profile from General rules to kernel. Applies to 1 \
+             confined instance. Active Defence on this host is asked about every shell command \
+             of its 2 identified instances."
+        );
     }
 
     #[test]

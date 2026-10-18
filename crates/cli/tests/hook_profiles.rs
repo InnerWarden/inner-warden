@@ -212,6 +212,48 @@ fn a_relaxation_in_the_users_file_is_refused_and_said() {
     assert!(stderr.contains("may relax a rule"), "{stderr}");
 }
 
+/// When the hook asks the host is the system file's to say: `ask_host` in the
+/// user's file is refused at load, said, and the hook refuses rather than run
+/// half a policy. A user's file of schema 2 without it is read as the same
+/// file of schema 1, and one of a schema this build does not read is refused.
+#[test]
+fn ask_host_in_the_users_file_is_refused_and_schema_2_reads_as_1() {
+    if system_file_present() {
+        return;
+    }
+    let host = Host::new();
+    host.profiles("schema_version = 2\n[profile.claude-code]\nask_host = \"every_command\"\n");
+    let (code, stderr) = host.hook(&["--agent", "claude-code"], &host.bash("ls"));
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(stderr.contains("ask_host"), "{stderr}");
+    assert!(
+        stderr.contains("says when the hook asks the host"),
+        "{stderr}"
+    );
+
+    let host = Host::new();
+    host.profiles(
+        "schema_version = 2\n[profile.claude-code]\ndeny_categories = [\"bare_ip_fetch\"]\n",
+    );
+    let (code, stderr) = host.hook(&["--agent", "claude-code"], &host.bash(REVIEW));
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(
+        stderr.contains("agent profile denies bare_ip_fetch"),
+        "{stderr}"
+    );
+    assert_eq!(host.last_command_attrs()["deciding_layer"], "agent_type");
+    assert_eq!(
+        host.hook(&["--agent", "claude-code"], &host.bash("ls")).0,
+        Some(0)
+    );
+
+    let host = Host::new();
+    host.profiles("schema_version = 3\n");
+    let (code, stderr) = host.hook(&["--agent", "claude-code"], &host.bash("ls"));
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(stderr.contains("unsupported schema_version 3"), "{stderr}");
+}
+
 /// The hard layer refuses the guard's LLM key for every agent once profiles
 /// are in force, whatever the type's profile allows.
 #[test]

@@ -134,7 +134,13 @@ pub fn cmd(rest: &[String]) -> ExitCode {
     }
     args.project = project;
 
-    let input = resolve_inputs(args, home, iw_binary);
+    let input = match resolve_inputs(args, home, iw_binary) {
+        Ok(input) => input,
+        Err(error) => {
+            eprintln!("innerwarden contain: {error}");
+            return ExitCode::from(2);
+        }
+    };
     if let Err(error) = validate_jail_inputs(&input) {
         eprintln!("innerwarden contain: {error}");
         return ExitCode::from(2);
@@ -171,6 +177,45 @@ pub fn cmd(rest: &[String]) -> ExitCode {
         );
         ExitCode::from(2)
     }
+}
+
+/// `innerwarden contain-gate --instance <id> -- <command...>`: run inside a
+/// jail whose profile starts it only once the host admitted it, as the jail's
+/// command ([`crate::contain::launch::gated_child`]). It starts `command`
+/// only when the record mounted in the jail names `id`; otherwise it says so
+/// and exits 2, and nothing else runs.
+pub fn cmd_gate(rest: &[String]) -> ExitCode {
+    use crate::contain::launch::{gate_opens, parse_gate_args, GATE_REFUSED};
+    let Some((instance, command)) = parse_gate_args(rest) else {
+        eprintln!("innerwarden contain: the gate takes --instance <id> -- <command>");
+        return ExitCode::from(2);
+    };
+    let opens =
+        crate::hook_identity::mounted_record().is_some_and(|record| gate_opens(&record, instance));
+    if !opens {
+        eprintln!("innerwarden contain: {GATE_REFUSED}");
+        return ExitCode::from(2);
+    }
+    run_in_place(command)
+}
+
+/// Replace this process with `command`, as the jail's own child would have
+/// been started. Returns only when it could not be.
+#[cfg(unix)]
+fn run_in_place(command: &[String]) -> ExitCode {
+    use std::os::unix::process::CommandExt;
+    let error = Command::new(&command[0]).args(&command[1..]).exec();
+    eprintln!("innerwarden contain: cannot run {}: {error}", command[0]);
+    ExitCode::from(if error.kind() == std::io::ErrorKind::NotFound {
+        127
+    } else {
+        126
+    })
+}
+
+#[cfg(not(unix))]
+fn run_in_place(_command: &[String]) -> ExitCode {
+    ExitCode::from(2)
 }
 
 /// Each entry on the way to the system profiles file, as the host shows it:
@@ -223,7 +268,11 @@ fn resolve_project(p: &Path) -> PathBuf {
     std::fs::canonicalize(&base).unwrap_or(base)
 }
 
-fn resolve_inputs(args: ContainArgs, home: PathBuf, iw_binary: PathBuf) -> JailInputs {
+fn resolve_inputs(
+    args: ContainArgs,
+    home: PathBuf,
+    iw_binary: PathBuf,
+) -> Result<JailInputs, crate::contain::ContainError> {
     // Canonicalize TMPDIR too (macOS $TMPDIR is under the /var symlink) so the
     // writable-set rule matches the resolved path.
     let tmpdir = std::env::var_os("TMPDIR")
@@ -266,6 +315,36 @@ fn resolve_inputs(args: ContainArgs, home: PathBuf, iw_binary: PathBuf) -> JailI
     // builder knows file-vs-dir (Linux masks a file with /dev/null, a dir with tmpfs).
     let deny_paths = expand_deny_paths(&args.project, &args.deny_read);
 
+    // The home paths a jail profile hides: where each leads, every link
+    // followed, covered where the jail shows it (Linux) and denied as named
+    // and as resolved (macOS). Without such a profile nothing is read.
+    let hidden = if args.hide_home.is_empty() {
+        crate::contain::HiddenPlan::default()
+    } else {
+        let found = hidden_home_facts(&home, &args.hide_home);
+        let shown = crate::contain::shown_host_folders(
+            &args,
+            &home,
+            worktree.as_ref(),
+            &existing_paths,
+            |path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()),
+        );
+        crate::contain::plan_hidden_home(&found, &home, &shown)?
+    };
+
+    // Every Linux jail, `--identity` or not: where `/etc/resolv.conf` is a
+    // link into `/run`, the file it names, if that is a file, or the folder
+    // of resolver data alone that holds it.
+    let resolv_conf = if cfg!(target_os = "linux") {
+        std::fs::read_link("/etc/resolv.conf")
+            .ok()
+            .and_then(|link| crate::contain::launch::resolv_conf_target(&link))
+            .filter(|target| std::fs::metadata(target).is_ok_and(|m| m.is_file()))
+            .map(|target| crate::contain::launch::resolv_conf_bind(&target, holds_a_socket))
+    } else {
+        None
+    };
+
     // Only an identified launch hides the launcher's records and keeps its
     // helpers' environment apart; without the flag none of this is read.
     let (records_dirs, child_env) = if args.identity {
@@ -286,7 +365,7 @@ fn resolve_inputs(args: ContainArgs, home: PathBuf, iw_binary: PathBuf) -> JailI
         (Vec::new(), Vec::new())
     };
 
-    JailInputs {
+    Ok(JailInputs {
         args,
         home,
         tmpdir,
@@ -305,6 +384,138 @@ fn resolve_inputs(args: ContainArgs, home: PathBuf, iw_binary: PathBuf) -> JailI
         records_dirs,
         child_env,
         close_userns: false,
+        seccomp_fd: None,
+        hide_paths: hidden.masks,
+        hide_denies: hidden.denies,
+        resolv_conf,
+        gate_instance: None,
+    })
+}
+
+/// Each home path a jail profile hides, as found on the host: where it
+/// leads with every link followed, where a file would be made when nothing
+/// is there, whether it is a folder, and whether a link on the way leads to
+/// nothing. On Linux a path that is not there yet, in a folder of the home
+/// the jail writes, is first made as an empty folder ([`make_hidden_folder`]).
+fn hidden_home_facts(home: &Path, paths: &[PathBuf]) -> Vec<crate::contain::HiddenHomePath> {
+    paths
+        .iter()
+        .map(|nominal| {
+            #[cfg(target_os = "linux")]
+            if std::fs::symlink_metadata(nominal).is_err() {
+                make_hidden_folder(home, nominal);
+            }
+            let real = std::fs::canonicalize(nominal).ok();
+            let resolved = real
+                .clone()
+                .unwrap_or_else(|| resolved_through_existing(nominal));
+            let is_dir = real
+                .as_ref()
+                .is_some_and(|path| std::fs::metadata(path).is_ok_and(|meta| meta.is_dir()));
+            crate::contain::HiddenHomePath {
+                nominal: nominal.clone(),
+                real,
+                resolved,
+                is_dir,
+                dangling_link: link_on_the_way_dangles(home, nominal),
+            }
+        })
+        .collect()
+}
+
+/// Whether a step of `path` below `home` is a link that leads to nothing.
+fn link_on_the_way_dangles(home: &Path, path: &Path) -> bool {
+    let Ok(rest) = path.strip_prefix(home) else {
+        return false;
+    };
+    let mut at = home.to_path_buf();
+    for part in rest.components() {
+        at.push(part);
+        match std::fs::symlink_metadata(&at) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                if std::fs::canonicalize(&at).is_err() {
+                    return true;
+                }
+            }
+            Ok(_) => {}
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
+/// Make a hidden home path that is not there yet as an empty folder, mode
+/// 0700, and each missing folder on the way the same, when it is in a
+/// folder of the home the jail binds read-write: a host program that makes
+/// it later (git's credential cache makes its socket folder 0700 on first
+/// use) then makes it under the jail's mask, never beside it. That folder
+/// is taken where it leads, as the jail binds it (`~/.cache` linked to
+/// `/data/cache`: under `/data/cache`); nothing is made through a link or a
+/// file below it, nor outside those folders.
+#[cfg(target_os = "linux")]
+pub(crate) fn make_hidden_folder(home: &Path, nominal: &Path) {
+    use std::os::unix::fs::DirBuilderExt;
+    let Ok(rest) = nominal.strip_prefix(home) else {
+        return;
+    };
+    let mut parts = rest.components();
+    let Some(first) = parts.next() else {
+        return;
+    };
+    let writable = crate::contain::writable_home_dirs()
+        .iter()
+        .any(|dir| first.as_os_str() == *dir);
+    if !writable {
+        return;
+    }
+    let Ok(mut at) = std::fs::canonicalize(home.join(first)) else {
+        return;
+    };
+    if !std::fs::metadata(&at).is_ok_and(|meta| meta.is_dir()) {
+        return;
+    }
+    for part in parts {
+        at.push(part);
+        match std::fs::symlink_metadata(&at) {
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => return,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if std::fs::DirBuilder::new().mode(0o700).create(&at).is_err() {
+                    return;
+                }
+            }
+            Err(_) => return,
+        }
+    }
+}
+
+/// Whether a folder, or a folder in it, holds a socket (or cannot be read
+/// through): a folder bound into a jail must not hand it a service.
+fn holds_a_socket(folder: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        let Ok(entries) = std::fs::read_dir(folder) else {
+            return true;
+        };
+        for entry in entries.take(256) {
+            let Ok(kind) = entry.and_then(|entry| {
+                let kind = entry.file_type()?;
+                Ok((entry.path(), kind))
+            }) else {
+                return true;
+            };
+            let (path, kind) = kind;
+            if kind.is_socket() || (kind.is_dir() && holds_a_socket(&path)) {
+                return true;
+            }
+        }
+        false
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = folder;
+        true
     }
 }
 
@@ -402,6 +613,20 @@ pub(crate) fn jail_backend() -> Option<&'static str> {
         resolve_backend(&["/usr/bin/sandbox-exec"]).map(|_| "sandbox-exec")
     } else {
         None
+    }
+}
+
+/// Whether a jail starts on this machine, by the checks `contain` runs
+/// before it builds one: `None` without a backend it trusts (as
+/// [`jail_backend`]); otherwise `Ok`, or the lines `contain` says and stops
+/// on (on Linux, a kernel that restricts unprivileged user namespaces and
+/// a bwrap with no profile that grants it one).
+pub(crate) fn jail_start_here() -> Option<Result<(), Vec<String>>> {
+    if cfg!(target_os = "linux") {
+        let bwrap = resolve_backend(&["/usr/bin/bwrap", "/bin/bwrap", "/usr/local/bin/bwrap"])?;
+        Some(restriction_advice(&bwrap).map_or(Ok(()), Err))
+    } else {
+        jail_backend().map(|_| Ok(()))
     }
 }
 
@@ -535,25 +760,28 @@ fn sound_root_file<'a>(
 /// `marks`: the launcher proved the way to the system profiles file root's
 /// and the file is there, so a jail with no record gets the marker.
 fn run_linux(input: &JailInputs, marks: bool) -> ExitCode {
+    use crate::contain::launch::{dry_run_filter, DryRunFilter};
+    use innerwarden_agent_guard::seccomp::Rules;
     // A dry run with `--identity` shows the arguments the real run adds.
     let dry_identity;
     let dry_plain;
-    // What a real run would do about user namespaces in the jail, asked of the
-    // bwrap it would use: first whether the host's restriction stops the real
-    // run before any jail (then that is what is said, and nothing is probed),
+    // What a real run would do about the jail's filter, asked of the bwrap it
+    // would use: first whether the host's restriction stops the real run
+    // before any jail (then that is what is said, and nothing is probed),
     // then the probe. A host with no bwrap says nothing here: the real run
     // says it has none.
-    let userns = (input.args.identity && input.args.dry_run)
-        .then(|| {
-            resolve_backend(&["/usr/bin/bwrap", "/bin/bwrap", "/usr/local/bin/bwrap"]).map(
-                |bwrap| {
-                    crate::contain::launch::dry_run_userns(restriction_advice(&bwrap), || {
-                        userns_fact(&bwrap)
-                    })
-                },
-            )
-        })
+    let dry_bwrap = input
+        .args
+        .dry_run
+        .then(|| resolve_backend(&["/usr/bin/bwrap", "/bin/bwrap", "/usr/local/bin/bwrap"]))
         .flatten();
+    let dry_filter = dry_bwrap.as_ref().map(|bwrap| {
+        dry_run_filter(restriction_advice(bwrap), || {
+            filter_plan_here(bwrap, input.args.identity)
+        })
+    });
+    let dry_rules = dry_filter.as_ref().and_then(DryRunFilter::filter);
+    let dry_seccomp = dry_rules.map(|_| crate::contain::launch::DRY_RUN_SECCOMP_FD);
     let planned = if input.args.identity && input.args.dry_run {
         dry_identity = JailInputs {
             info_fd: Some(crate::contain::launch::DRY_RUN_INFO_FD),
@@ -563,16 +791,17 @@ fn run_linux(input: &JailInputs, marks: bool) -> ExitCode {
             key_fd: host_key()
                 .is_some()
                 .then_some(crate::contain::launch::DRY_RUN_KEY_FD),
-            close_userns: userns
-                .as_ref()
-                .is_some_and(crate::contain::launch::DryRunUserns::close_userns),
+            close_userns: dry_rules == Some(Rules::Identified),
+            seccomp_fd: dry_seccomp,
             ..input.clone()
         };
         &dry_identity
-    } else if input.args.dry_run && marks {
-        // A plain jail shows the marker the real run hands in.
+    } else if input.args.dry_run {
+        // A plain jail shows the marker the real run hands in, and the
+        // terminal filter where the host takes it.
         dry_plain = JailInputs {
-            profiles_marker_fd: Some(crate::contain::launch::DRY_RUN_MARKER_FD),
+            profiles_marker_fd: marks.then_some(crate::contain::launch::DRY_RUN_MARKER_FD),
+            seccomp_fd: dry_seccomp,
             ..input.clone()
         };
         &dry_plain
@@ -592,9 +821,12 @@ fn run_linux(input: &JailInputs, marks: bool) -> ExitCode {
         #[cfg(target_os = "linux")]
         if input.args.identity {
             println!("# {}", dry_run_scope_line());
-            for line in userns.iter().flat_map(|userns| userns.lines()) {
-                println!("{line}");
-            }
+        }
+        for line in dry_filter
+            .iter()
+            .flat_map(|filter| filter.lines(input.args.identity))
+        {
+            println!("{line}");
         }
         println!("bwrap \\");
         println!("  {}", plan.bwrap_args.join(" "));
@@ -620,22 +852,24 @@ fn run_linux(input: &JailInputs, marks: bool) -> ExitCode {
         return run_linux_identified(input, &bwrap, marks);
     }
     announce(input);
-    if marks {
-        return run_unrecorded(&bwrap, input, marks);
-    }
-    run_plain(&bwrap, &plan)
+    run_unrecorded(&bwrap, input, marks)
 }
 
-/// A jail with no launch record, as it runs: with the marker that the way to
-/// the system profiles file was proven root's when `marks`. A marker that
-/// cannot be handed in is none: the jail's hook then reads the file as it did
-/// before.
+/// A jail with no launch record, as it runs: under the jail's seccomp filter
+/// where the host takes it, and with the marker that the way to the system
+/// profiles file was proven root's when `marks`. A marker that cannot be
+/// handed in is none: the jail's hook then reads the file as it did before.
+/// A filter that cannot be handed in is none too, said once: the jail then
+/// runs as it did before the filter.
 fn run_unrecorded(bwrap: &Path, input: &JailInputs, marks: bool) -> ExitCode {
     #[cfg(target_os = "linux")]
     let marker = marks.then(marker_pipe).flatten();
     #[cfg(target_os = "linux")]
+    let filter = unrecorded_filter(bwrap, input.args.identity);
+    #[cfg(target_os = "linux")]
     let input = &JailInputs {
         profiles_marker_fd: marker.as_ref().map(std::os::fd::AsRawFd::as_raw_fd),
+        seccomp_fd: filter.as_ref().map(std::os::fd::AsRawFd::as_raw_fd),
         ..input.clone()
     };
     #[cfg(not(target_os = "linux"))]
@@ -647,23 +881,67 @@ fn run_unrecorded(bwrap: &Path, input: &JailInputs, marks: bool) -> ExitCode {
             ExitCode::from(2)
         }
     };
-    // Ours closes only once bwrap has read it.
+    // Ours close only once bwrap has read them.
     #[cfg(target_os = "linux")]
-    drop(marker);
+    drop((marker, filter));
     code
 }
 
-/// A pipe that holds the marker whole, its write end closed so bwrap reads
-/// it to its end, its read end handed to bwrap.
+/// The filter of a jail with no record, on a pipe for bwrap: the terminal
+/// one, or for an `--identity` launch that could not make its record the
+/// identified one (the terminal one where the host takes only that). What
+/// it lost is said once; `None` where the host took neither or the pipe
+/// could not be made.
 #[cfg(target_os = "linux")]
-fn marker_pipe() -> Option<std::io::PipeReader> {
+fn unrecorded_filter(bwrap: &Path, identity: bool) -> Option<std::io::PipeReader> {
+    let plan = filter_plan_here(bwrap, identity);
+    for line in &plan.said {
+        eprintln!("{line}");
+    }
+    handed_filter(plan.filter)
+}
+
+/// The planned filter on a pipe for bwrap. One whose pipe cannot be made is
+/// none, and the lines that say so are printed: the jail then runs as it did
+/// before the filter.
+#[cfg(target_os = "linux")]
+fn handed_filter(
+    planned: Option<innerwarden_agent_guard::seccomp::Rules>,
+) -> Option<std::io::PipeReader> {
+    let rules = planned?;
+    let filter = filter_pipe(rules);
+    if filter.is_none() {
+        for line in crate::contain::launch::filter_lost_sentences(rules) {
+            eprintln!("{line}");
+        }
+    }
+    filter
+}
+
+/// A pipe that holds `bytes` whole, its write end closed so bwrap reads them
+/// to their end, its read end handed to bwrap. Each use here is far below a
+/// pipe's buffer, so the write never waits for a reader.
+#[cfg(target_os = "linux")]
+fn data_pipe(bytes: &[u8]) -> Option<std::io::PipeReader> {
     use std::io::Write;
     let (reader, mut writer) = std::io::pipe().ok()?;
-    writer
-        .write_all(crate::agent_profiles::SYSTEM_PROFILES_MARKER)
-        .ok()?;
+    writer.write_all(bytes).ok()?;
     drop(writer);
     hand_to_child(&reader).then_some(reader)
+}
+
+/// The marker on a pipe for bwrap.
+#[cfg(target_os = "linux")]
+fn marker_pipe() -> Option<std::io::PipeReader> {
+    data_pipe(crate::agent_profiles::SYSTEM_PROFILES_MARKER)
+}
+
+/// This build's filter with `rules` on a pipe for bwrap. `None` where this
+/// build has no filter for the architecture it runs as, or the pipe cannot
+/// be made.
+#[cfg(target_os = "linux")]
+fn filter_pipe(rules: innerwarden_agent_guard::seccomp::Rules) -> Option<std::io::PipeReader> {
+    data_pipe(&innerwarden_agent_guard::seccomp::native_filter(rules)?)
 }
 
 /// What to say, and stop on, when this kernel restricts unprivileged user
@@ -853,6 +1131,22 @@ fn run_linux_identified(input: &JailInputs, bwrap: &Path, marks: bool) -> ExitCo
     });
     let (instance_id, unit) = match named {
         Ok(named) => named,
+        Err(why) if !crate::contain::launch::starts(input.args.start, false) => {
+            // No instance, so nothing the host could admit.
+            eprintln!("innerwarden contain: no instance record written ({why})");
+            eprintln!(
+                "innerwarden contain: {}",
+                crate::contain::launch::NOT_ADMITTED
+            );
+            eprintln!(
+                "innerwarden contain: {}",
+                crate::contain::launch::not_admitted_remedy(
+                    &crate::agent_profiles_io::files_that_wait_for_the_host(&input.args.agent),
+                    None
+                )
+            );
+            return ExitCode::from(2);
+        }
         Err(why) => {
             eprintln!(
                 "innerwarden contain: no instance record written ({why}); the jail runs, unidentified"
@@ -869,14 +1163,16 @@ fn run_linux_identified(input: &JailInputs, bwrap: &Path, marks: bool) -> ExitCo
     // SAFETY: getuid takes no arguments and cannot fail.
     let uid = unsafe { libc::getuid() };
     let mut input = input.clone();
-    // Once, before the jail is built: whether this host takes the option that
-    // keeps the jail's programs from making user namespaces. A host that does
-    // not runs the jail as it always did, and says why.
-    let userns = userns_fact(bwrap);
-    if let crate::contain::launch::UsernsFact::Open(why) = userns {
-        eprintln!("{}", crate::contain::launch::userns_open_sentence(why));
+    // Once, before the jail is built: whether this host takes the identified
+    // filter, which also keeps the jail's programs from making user
+    // namespaces. A host that does not gets the terminal filter where it
+    // takes that, or runs the jail as it did before the filter, and says
+    // what the jail runs without.
+    let plan = filter_plan_here(bwrap, true);
+    for line in &plan.said {
+        eprintln!("{line}");
     }
-    input.close_userns = userns.close_userns();
+    input.close_userns = plan.close_userns();
     if let Some(dir) = input.records_dirs.first() {
         if let Err(e) = own_records_dir(dir, uid) {
             eprintln!("innerwarden contain: the launcher's records folder is not usable ({e})");
@@ -895,7 +1191,8 @@ fn run_linux_identified(input: &JailInputs, bwrap: &Path, marks: bool) -> ExitCo
     }
     announce(input);
     loop {
-        match launch_identified(input, bwrap, &instance_id, &unit, &scope, key.as_ref()) {
+        let ids = (instance_id.as_str(), unit.as_str());
+        match launch_identified(input, bwrap, ids, &scope, key.as_ref(), plan.filter) {
             Attempt::Done(code) => return code,
             // Nothing of the jail ran: bwrap never reported a pid, and the
             // jail cannot pass the record it never got. Only the scope was
@@ -940,10 +1237,10 @@ fn hand_to_child(fd: &impl std::os::fd::AsRawFd) -> bool {
 fn launch_identified(
     input: &JailInputs,
     bwrap: &Path,
-    instance_id: &str,
-    unit: &str,
+    (instance_id, unit): (&str, &str),
     scope: &crate::contain::launch::ScopePlan,
     key: Option<&[u8; 32]>,
+    filter: Option<innerwarden_agent_guard::seccomp::Rules>,
 ) -> Attempt {
     use crate::contain::launch::{launch_argv, ScopePlan};
     use std::io::Write;
@@ -965,17 +1262,26 @@ fn launch_identified(
     // buffer, and the launcher's end is closed so bwrap reads it to its end.
     // A key that cannot be handed in is no key: the hook then never asks.
     let key_reader = key.and_then(|key| {
-        let (reader, mut writer) = std::io::pipe().ok()?;
-        writer
-            .write_all(innerwarden_agent_guard::identity::spki_pin_line(key).as_bytes())
-            .ok()?;
-        drop(writer);
-        hand_to_child(&reader).then_some(reader)
+        data_pipe(innerwarden_agent_guard::identity::spki_pin_line(key).as_bytes())
     });
+    // The filter the same way, the one the host took before the launch. One
+    // that cannot be handed in is none: the jail then runs as it did before
+    // the filter, its record says nothing of user namespaces, and the
+    // launcher says so.
+    let filter_reader = handed_filter(filter);
     let mut identified = input.clone();
     identified.info_fd = Some(info_writer.as_raw_fd());
     identified.record_fd = Some(record_reader.as_raw_fd());
     identified.key_fd = key_reader.as_ref().map(AsRawFd::as_raw_fd);
+    identified.seccomp_fd = filter_reader.as_ref().map(AsRawFd::as_raw_fd);
+    identified.close_userns = input.close_userns
+        && filter == Some(innerwarden_agent_guard::seccomp::Rules::Identified)
+        && filter_reader.is_some();
+    // Under a profile that starts the jail only once the host admitted it,
+    // the jail's command starts through the gate, which needs the record
+    // the launcher writes only after the admission: a launcher that dies
+    // before the host answered leaves the jail an empty record.
+    identified.gate_instance = crate::contain::launch::gate_for(input.args.start, instance_id);
     let plan = match build_linux_jail(&identified) {
         Ok(p) => p,
         Err(e) => {
@@ -994,6 +1300,7 @@ fn launch_identified(
     drop(info_writer);
     drop(record_reader);
     drop(key_reader);
+    drop(filter_reader);
     let mut child = match spawned {
         Ok(c) => c,
         Err(e) if matches!(scope, ScopePlan::User { .. }) => return Attempt::NeverStarted(Err(e)),
@@ -1001,6 +1308,10 @@ fn launch_identified(
     };
     let info = read_info(&mut info_reader);
     drop(info_reader);
+    let reported = match &info {
+        InfoRead::Got(info) => Some(info.child_pid),
+        _ => None,
+    };
     let record = match info {
         InfoRead::Nothing => {
             drop(record_writer);
@@ -1010,10 +1321,67 @@ fn launch_identified(
             };
         }
         InfoRead::Failed(why) => Err(why),
-        InfoRead::Got(info) => identify(input, instance_id, unit, scope, info),
+        // The record says what this launch handed in, filter included.
+        InfoRead::Got(info) => identify(&identified, instance_id, unit, scope, info, key),
     };
+    // Under a profile that starts the jail only once the host admitted it,
+    // a jail the host did not admit (no answer, a record that could not be
+    // made, a scope the kernel does not show) is ended here, before its
+    // command can run: its first process is still waiting for the record,
+    // and the record is never handed in.
+    let made = record
+        .as_ref()
+        .ok()
+        .map(|(_, answer, scope)| (answer, scope.as_ref()));
+    if !crate::contain::launch::launch_starts(input.args.start, made) {
+        if let Err(why) = &record {
+            eprintln!("innerwarden contain: no instance record written ({why})");
+        }
+        // The host was asked, but without its key its answer was never
+        // read: say so, rather than send the person to check a host that
+        // may well be running.
+        let unbelieved = (record.is_ok() && crate::upsell_io::active_defence_installed())
+            .then(|| {
+                crate::contain::launch::answer_unbelieved(
+                    key.is_some(),
+                    crate::agent_report::agent_route(
+                        std::env::var(crate::agent_report::AGENT_URL_VAR)
+                            .ok()
+                            .as_deref(),
+                        innerwarden_agent_guard::identity::SYSTEM_SCOPE_ROUTE,
+                    )
+                    .as_deref(),
+                )
+            })
+            .flatten();
+        if let Some(why) = &unbelieved {
+            eprintln!(
+                "innerwarden contain: {}",
+                crate::contain::launch::unbelieved_sentence(why)
+            );
+        }
+        eprintln!(
+            "innerwarden contain: {}",
+            crate::contain::launch::NOT_ADMITTED
+        );
+        eprintln!(
+            "innerwarden contain: {}",
+            crate::contain::launch::not_admitted_remedy(
+                &crate::agent_profiles_io::files_that_wait_for_the_host(&input.args.agent),
+                unbelieved.as_ref()
+            )
+        );
+        end_jail(&mut child, reported);
+        drop(record_writer);
+        // The launcher's own copy of a record it never handed in, and the
+        // project path beside it: no instance of it ever ran.
+        if record.is_ok() {
+            forget_instance(input, instance_id);
+        }
+        return Attempt::Done(ExitCode::from(2));
+    }
     let mut identified = false;
-    match record {
+    match record.map(|(json, _, _)| json) {
         Ok(json) => {
             // The jail reads this to its end before it builds its root.
             if let Err(e) = record_writer.write_all(&json) {
@@ -1036,6 +1404,79 @@ fn launch_identified(
         report_contained_run(input, instance_id, started_ms, now_ms());
     }
     Attempt::Done(code)
+}
+
+/// End a jail whose command must not run, while its first process is still
+/// waiting for the record: SIGSTOP to bwrap, so it starts nothing more while
+/// its processes are read, then SIGKILL to each process bwrap started (the
+/// one it reported on its info descriptor first, then those `/proc` lists),
+/// then to bwrap. Killing bwrap alone is not enough: measured with bwrap
+/// 0.9.0, its child waiting on the record outlives it (`--die-with-parent`
+/// is not in force yet at that point), reads the end of the closed pipe,
+/// and runs the command. A process SIGKILLed while it waits never runs
+/// another instruction of its own. One this misses still runs nothing but
+/// the gate, which refuses an empty record ([`crate::contain::launch::gate_opens`]).
+#[cfg(target_os = "linux")]
+fn end_jail(child: &mut std::process::Child, reported: Option<u32>) {
+    let bwrap = child.id();
+    if let Ok(pid) = libc::pid_t::try_from(bwrap) {
+        // SAFETY: kill on the pid of this launcher's own child.
+        unsafe { libc::kill(pid, libc::SIGSTOP) };
+    }
+    let listed = proc_children(bwrap);
+    for pid in crate::contain::launch::jail_processes_to_end(bwrap, reported, &listed, proc_parent)
+    {
+        if let Ok(pid) = libc::pid_t::try_from(pid) {
+            // SAFETY: kill on a pid this launcher's own child started, whose
+            // parent is still that child.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// The processes `pid` started, as `/proc/<pid>/task/<tid>/children` lists
+/// them for each of its threads.
+#[cfg(target_os = "linux")]
+fn proc_children(pid: u32) -> Vec<u32> {
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for task in tasks.flatten() {
+        if let Ok(text) = std::fs::read_to_string(task.path().join("children")) {
+            out.extend(
+                text.split_whitespace()
+                    .filter_map(|p| p.parse::<u32>().ok()),
+            );
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// The parent of `pid`: field 4 of `/proc/<pid>/stat`.
+#[cfg(target_os = "linux")]
+fn proc_parent(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    crate::contain::launch::parse_parent_pid(&stat)
+}
+
+/// Remove the launcher's record of `instance_id` and the project path beside
+/// it, best effort: the jail was ended before its command ran.
+#[cfg(target_os = "linux")]
+fn forget_instance(input: &JailInputs, instance_id: &str) {
+    use crate::contain::launch::{project_path_file, record_path, records_dir};
+    let dir = records_dir(std::env::var("XDG_STATE_HOME").ok().as_deref(), &input.home);
+    let files = [
+        record_path(&dir, instance_id),
+        project_path_file(instance_id).map(|name| dir.join(name)),
+    ];
+    for file in files.into_iter().flatten() {
+        let _ = std::fs::remove_file(file);
+    }
 }
 
 /// The launcher's clock, in ms since the epoch.
@@ -1152,8 +1593,22 @@ pub(crate) fn read_jail_graph(project: &Path, uid: u32) -> crate::contain::launc
     parse_jail_graph(&bytes)
 }
 
+/// The bytes of a jail's record, what the host answered of its admission,
+/// and the system scope the kernel showed it in.
+#[cfg(target_os = "linux")]
+type IdentifiedJail = (
+    Vec<u8>,
+    innerwarden_agent_guard::identity::SystemScopeAdmission,
+    Option<innerwarden_agent_guard::identity::Scope>,
+);
+
 /// Read the facts about the jail from the host, make the record, write the
 /// launcher's copy, and return the bytes for the jail's copy.
+///
+/// Also what the host answered of its admission of the jail and the system
+/// scope the kernel showed it in ([`crate::contain::launch::launch_starts`]
+/// decides), asked only where Active Defence is installed and believed only
+/// over a connection held to `key`.
 #[cfg(target_os = "linux")]
 fn identify(
     input: &JailInputs,
@@ -1161,7 +1616,8 @@ fn identify(
     unit: &str,
     scope: &crate::contain::launch::ScopePlan,
     info: crate::contain::launch::InfoFd,
-) -> Result<Vec<u8>, String> {
+    key: Option<&[u8; 32]>,
+) -> Result<IdentifiedJail, String> {
     use crate::contain::launch::{
         assemble_record, no_scope_sentence, parse_mnt_ns_link, parse_ns_link, records_dir,
         user_scope_seen, LaunchFacts, NoScope, ScopePlan,
@@ -1201,9 +1657,11 @@ fn identify(
             );
         }
     }
+    let mut answer = innerwarden_agent_guard::identity::SystemScopeAdmission::NONE;
     if crate::upsell_io::active_defence_installed() {
-        scopes.system = request_system_scope(instance_id, unit, pid);
+        (scopes.system, answer) = request_system_scope(instance_id, unit, pid, key);
     }
+    let system_scope = scopes.system.clone();
     if scopes.is_empty() && matches!(scope, ScopePlan::User { .. }) {
         eprintln!("{}", no_scope_sentence(NoScope::NotSeenInScope));
     }
@@ -1250,7 +1708,7 @@ fn identify(
             "innerwarden contain: the launcher's copy of the record was not written ({e})"
         ),
     }
-    Ok(json)
+    Ok((json, answer, system_scope))
 }
 
 /// `/proc/<pid>/stat` field 22.
@@ -1280,22 +1738,42 @@ fn proc_cgroup(pid: u32) -> Option<String> {
 #[cfg(target_os = "linux")]
 const SYSTEM_SCOPE_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// How long the launcher waits for the answer to its request for a system
+/// scope, connect to the end of the answer: the host places the jail and
+/// decides its admission before it answers.
+#[cfg(target_os = "linux")]
+const SYSTEM_SCOPE_ANSWER_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// Ask the local Active Defence agent, best effort, for a system scope around
-/// the instance, and return it only if the KERNEL then shows the jail in it.
+/// the instance, and return it only if the KERNEL then shows the jail in it,
+/// with what the host's answer says of its admission of the jail.
 ///
 /// The request names the instance and nothing else; it gives no process to
 /// move. The answer is never the fact: a system scope is recorded only when
 /// `/proc/<pid>/cgroup` reads exactly `/system.slice/<unit>`, a cgroup only
 /// root can make or move a process into.
+///
+/// With the key the host publishes (`key`), the request goes over a
+/// connection held to it ([`crate::host_decide_io::post`]), and the body of
+/// its 202 is read: an admission and a note, the note printed as it came.
+/// Without one, the request goes as it always did and its body is not read:
+/// a server that took the port while the agent was away could say anything
+/// there, so nothing is admitted.
 #[cfg(target_os = "linux")]
 fn request_system_scope(
     instance_id: &str,
     unit: &str,
     pid: u32,
-) -> Option<innerwarden_agent_guard::identity::Scope> {
-    use crate::agent_report::{agent_route, send_report, AGENT_URL_VAR};
+    key: Option<&[u8; 32]>,
+) -> (
+    Option<innerwarden_agent_guard::identity::Scope>,
+    innerwarden_agent_guard::identity::SystemScopeAdmission,
+) {
+    use crate::agent_report::{agent_route, AGENT_URL_VAR};
     use crate::contain::launch::system_scope_seen;
-    use innerwarden_agent_guard::identity::{system_scope_request, SYSTEM_SCOPE_ROUTE};
+    use innerwarden_agent_guard::identity::{
+        system_scope_request, SystemScopeAdmission, SYSTEM_SCOPE_ROUTE,
+    };
 
     let said = |why: &str| eprintln!("innerwarden contain: no system scope ({why})");
     let Some(url) = agent_route(
@@ -1303,17 +1781,59 @@ fn request_system_scope(
         SYSTEM_SCOPE_ROUTE,
     ) else {
         said("the local agent route is off");
-        return None;
+        return (None, SystemScopeAdmission::NONE);
     };
-    let body = system_scope_request(instance_id)?;
+    let Some(body) = system_scope_request(instance_id) else {
+        return (None, SystemScopeAdmission::NONE);
+    };
+    let (sent, answer) = send_scope_request(&url, &body, key);
+    if let Some(note) = &answer.note {
+        eprintln!("innerwarden contain: {note}");
+    }
     let seen = await_system_scope(
-        send_report(&url, &body),
+        sent,
         SYSTEM_SCOPE_WAIT,
         || proc_cgroup(pid).and_then(|c| system_scope_seen(&c, unit)),
         said,
-    )?;
-    eprintln!("  system scope: {}", seen.cgroup_path);
-    Some(seen)
+    );
+    if let Some(seen) = &seen {
+        eprintln!("  system scope: {}", seen.cgroup_path);
+    }
+    (seen, answer)
+}
+
+/// The request for a system scope, sent: whether the host took it, and what
+/// its answer says of the admission ([`request_system_scope`]).
+#[cfg(target_os = "linux")]
+fn send_scope_request(
+    url: &str,
+    body: &serde_json::Value,
+    key: Option<&[u8; 32]>,
+) -> (
+    Result<(), String>,
+    innerwarden_agent_guard::identity::SystemScopeAdmission,
+) {
+    use crate::host_decide_io::{pinnable, post, system_scope_wanted};
+    use innerwarden_agent_guard::identity::SystemScopeAdmission;
+    let Some(pin) = key.filter(|_| pinnable(url)) else {
+        return (
+            crate::agent_report::send_report(url, body),
+            SystemScopeAdmission::NONE,
+        );
+    };
+    let Ok(bytes) = serde_json::to_vec(body) else {
+        return (
+            Err("the request could not be written".into()),
+            SystemScopeAdmission::NONE,
+        );
+    };
+    crate::contain::launch::scope_answer(post(
+        url,
+        &bytes,
+        SYSTEM_SCOPE_ANSWER_WAIT,
+        pin,
+        system_scope_wanted(),
+    ))
 }
 
 /// Wait up to `wait` for `seen` to find the jail in its system scope, and only
@@ -1357,104 +1877,134 @@ fn helper_env(command: &mut Command) {
     command.env("PATH", crate::contain::HELPER_PATH);
 }
 
-/// Whether bwrap runs from a file with the set-user-id bit, read from the same
-/// entry [`backend_trusted`] reads. A file that could not be read counts as
-/// setuid: nothing says it is not.
-#[cfg(unix)]
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn backend_setuid(facts: Option<&BackendFacts>) -> bool {
-    facts
-        .and_then(|facts| facts.chain.first())
-        .is_none_or(|executable| executable.mode & 0o4000 != 0)
-}
-
-/// What `bwrap --version` and the file's mode say about the bwrap at `bwrap`.
+/// Start the throwaway jail under this build's filter with `rules`, shaped
+/// as the launch's jail (`identity`: its capabilities dropped): `Ran` only
+/// when it ran and exited 0 within five seconds. Its `true` runs under the
+/// filter, so a filter this kernel cannot load, or one whose architecture is
+/// not the kernel's (a binary under emulation), fails here and never in the
+/// jail. A filter whose pipe cannot be made, or a bwrap the launcher has not
+/// the means to start (out of descriptors, processes or memory:
+/// [`crate::contain::launch::spawn_failed_answer`]), runs no bwrap and
+/// answers `NotHanded`.
 #[cfg(target_os = "linux")]
-fn bwrap_facts(bwrap: &Path) -> crate::contain::launch::BwrapFacts {
-    let mut command = Command::new(bwrap);
-    helper_env(&mut command);
-    let version = command
-        .arg("--version")
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()
-        .filter(|out| out.status.success())
-        .and_then(|out| {
-            crate::contain::launch::parse_bwrap_version(&String::from_utf8_lossy(&out.stdout))
-        });
-    crate::contain::launch::BwrapFacts {
-        version,
-        setuid: backend_setuid(backend_facts(bwrap).as_ref()),
-    }
-}
-
-/// Start the throwaway jail that tells whether this host takes the option:
-/// `true` only when it ran and exited 0 within five seconds.
-#[cfg(target_os = "linux")]
-fn userns_probe(bwrap: &Path) -> bool {
+fn filter_probe(
+    bwrap: &Path,
+    rules: innerwarden_agent_guard::seccomp::Rules,
+    identity: bool,
+) -> crate::contain::launch::ProbeAnswer {
+    use crate::contain::launch::ProbeAnswer;
+    use std::os::fd::AsRawFd;
     use std::process::Stdio;
     use std::time::{Duration, Instant};
 
+    let Some(filter) = filter_pipe(rules) else {
+        return ProbeAnswer::NotHanded;
+    };
     let mut command = Command::new(bwrap);
     command
-        .args(crate::contain::launch::userns_probe_argv())
+        .args(crate::contain::launch::filter_probe_argv(
+            filter.as_raw_fd(),
+            identity,
+        ))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     helper_env(&mut command);
-    let Ok(mut child) = command.spawn() else {
-        return false;
+    let spawned = command.spawn();
+    // Ours closes once bwrap has its own.
+    drop(filter);
+    let mut child = match spawned {
+        Ok(child) => child,
+        Err(error) => return crate::contain::launch::spawn_failed_answer(&error),
     };
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return status.success(),
+            Ok(Some(status)) if status.success() => return ProbeAnswer::Ran,
+            Ok(Some(_)) => return ProbeAnswer::Failed,
             Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return false;
+                return ProbeAnswer::Failed;
             }
         }
     }
 }
 
-/// What an identified launch does about user namespaces in the jail, on this
-/// host's bwrap. Starts one process to read the version and, only if
-/// everything before it holds, one throwaway jail.
+/// The kernel's own file for its release.
 #[cfg(target_os = "linux")]
-fn userns_fact(bwrap: &Path) -> crate::contain::launch::UsernsFact {
-    crate::contain::launch::userns_decision(true, &bwrap_facts(bwrap), || userns_probe(bwrap))
+const OSRELEASE: &str = "/proc/sys/kernel/osrelease";
+
+/// `UNAME26` (`include/uapi/linux/personality.h`). A process under this
+/// personality (`setarch --uname-2.6`, inherited across `exec`) gets any
+/// 3.x or later kernel's release from `uname` as `2.6.<minor + 60>`; the
+/// kernel's own file still says the real one.
+#[cfg(target_os = "linux")]
+const UNAME26: libc::c_int = 0x0002_0000;
+
+/// The kernel's release, as `uname -r` prints it. First from `osrelease`
+/// (the kernel's own file), which no personality rewrites. Where that file
+/// cannot be read or is empty (a chroot or a container with no `/proc`),
+/// from the `uname` call, except under [`UNAME26`], whose `uname` names an
+/// older kernel than the one running. Empty where neither tells it, which
+/// reads as an unknown release: never as an older kernel.
+#[cfg(target_os = "linux")]
+fn kernel_release(osrelease: &Path) -> String {
+    if let Ok(release) = std::fs::read_to_string(osrelease) {
+        let release = release.trim();
+        if !release.is_empty() {
+            return release.to_string();
+        }
+    }
+    // SAFETY: `personality(0xffffffff)` only reads this process's
+    // personality and changes nothing.
+    let personality = unsafe { libc::personality(0xffff_ffff) };
+    if personality == -1 || personality & UNAME26 != 0 {
+        return String::new();
+    }
+    // SAFETY: `uname` fills the struct it is given, which lives until it
+    // returns; `release` is then a NUL-terminated string inside it.
+    unsafe {
+        let mut names: libc::utsname = std::mem::zeroed();
+        if libc::uname(&mut names) != 0 {
+            return String::new();
+        }
+        std::ffi::CStr::from_ptr(names.release.as_ptr())
+            .to_string_lossy()
+            .into_owned()
+    }
+}
+
+/// What the filter plan reads of this host: whether this build has the
+/// filter for the architecture it runs as, and the kernel's release from
+/// `osrelease` ([`kernel_release`]).
+#[cfg(target_os = "linux")]
+fn filter_host_here(osrelease: &Path) -> crate::contain::launch::FilterHost {
+    use crate::contain::launch::{tracer_order, FilterHost};
+    FilterHost {
+        built: innerwarden_agent_guard::seccomp::Arch::native().is_some(),
+        tracer: tracer_order(&kernel_release(osrelease)),
+    }
+}
+
+/// The filter a launch hands this host's bwrap, and what it says about it:
+/// from this build's architecture, the kernel's release, and one throwaway
+/// jail under a filter (two for an identified launch whose host does not take
+/// the identified one).
+#[cfg(target_os = "linux")]
+fn filter_plan_here(bwrap: &Path, identity: bool) -> crate::contain::launch::FilterPlan {
+    let host = filter_host_here(Path::new(OSRELEASE));
+    crate::contain::launch::filter_plan(identity, host, |rules| {
+        filter_probe(bwrap, rules, identity)
+    })
 }
 
 #[cfg(not(target_os = "linux"))]
-fn userns_fact(_bwrap: &Path) -> crate::contain::launch::UsernsFact {
-    crate::contain::launch::UsernsFact::NotAsked
-}
-
-/// Why this host's bwrap cannot close user namespaces in a jail, if the file
-/// itself says so (too old, setuid): the word the dashboard shows for a jail
-/// that did not close them. The start-up probe is not run here, so a host that
-/// refused only that says nothing. Read once.
-pub(crate) fn host_userns_gap() -> Option<&'static str> {
-    #[cfg(target_os = "linux")]
-    {
-        use crate::contain::launch::{userns_decision, UsernsFact, UsernsWhy};
-        static GAP: std::sync::OnceLock<Option<&'static str>> = std::sync::OnceLock::new();
-        *GAP.get_or_init(|| {
-            let bwrap = resolve_backend(&["/usr/bin/bwrap", "/bin/bwrap", "/usr/local/bin/bwrap"])?;
-            match userns_decision(true, &bwrap_facts(&bwrap), || true) {
-                UsernsFact::Open(why @ (UsernsWhy::BwrapTooOld | UsernsWhy::BwrapSetuid)) => {
-                    Some(why.word())
-                }
-                _ => None,
-            }
-        })
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        None
+fn filter_plan_here(_bwrap: &Path, _identity: bool) -> crate::contain::launch::FilterPlan {
+    crate::contain::launch::FilterPlan {
+        filter: None,
+        said: Vec::new(),
     }
 }
 
@@ -1611,6 +2161,14 @@ fn run_macos(input: &JailInputs) -> ExitCode {
             "innerwarden contain: --identity needs a PID namespace, which sandbox-exec does not have; no instance record is written"
         );
     }
+    // No record, so nothing the host could admit.
+    if !crate::contain::launch::starts(input.args.start, false) {
+        eprintln!(
+            "innerwarden contain: {}",
+            crate::contain::launch::NOT_ADMITTED
+        );
+        return ExitCode::from(2);
+    }
     announce(input);
     // argv = [sandbox-exec, -p, <profile>, --, child...]; run argv[1..] under the
     // resolved binary.
@@ -1690,32 +2248,308 @@ fn print_plan_env(env: &[(String, String)]) {
 mod tests {
     use super::*;
 
-    /// Whether bwrap is setuid is read from the mode of the file it runs from;
-    /// a file that could not be read counts as setuid.
-    ///
-    /// FAILS ON REVERT: test another bit than the set-user-id one, or call an
-    /// unreadable file not setuid.
-    #[cfg(unix)]
-    #[test]
-    fn a_setuid_bwrap_is_told_by_its_mode() {
-        let at = |mode: u32| BackendFacts {
-            components: Vec::new(),
-            chain: vec![PathEntry {
-                symlink: false,
-                file: true,
-                dir: false,
-                uid: 0,
-                mode,
-            }],
+    /// Set in a child these tests start: what it answers.
+    #[cfg(target_os = "linux")]
+    const CHILD_VAR: &str = "IW_CONTAIN_IO_TEST_CHILD";
+
+    /// A path where no `osrelease` is: the plan's read of a host with no
+    /// `/proc`.
+    #[cfg(target_os = "linux")]
+    const NO_OSRELEASE: &str = "/nonexistent/proc/sys/kernel/osrelease";
+
+    /// What a child these tests start answers, one `key=value` per line.
+    #[cfg(target_os = "linux")]
+    fn child_side(side: &str) -> Vec<String> {
+        use crate::contain::launch::TracerOrder;
+        let order = |tracer: TracerOrder| format!("{tracer:?}");
+        match side {
+            "release" => {
+                // SAFETY: as in `kernel_release`.
+                let uname = unsafe {
+                    let mut names: libc::utsname = std::mem::zeroed();
+                    assert_eq!(libc::uname(&mut names), 0);
+                    std::ffi::CStr::from_ptr(names.release.as_ptr())
+                        .to_string_lossy()
+                        .into_owned()
+                };
+                vec![
+                    format!("uname={uname}"),
+                    format!(
+                        "proc={}",
+                        order(filter_host_here(Path::new(OSRELEASE)).tracer)
+                    ),
+                    format!(
+                        "no_proc={}",
+                        order(filter_host_here(Path::new(NO_OSRELEASE)).tracer)
+                    ),
+                    // What an identified launch says there, its probes
+                    // passing.
+                    format!(
+                        "no_proc_said={}",
+                        crate::contain::launch::filter_plan(
+                            true,
+                            filter_host_here(Path::new(NO_OSRELEASE)),
+                            |_| crate::contain::launch::ProbeAnswer::Ran,
+                        )
+                        .said
+                        .join(" | ")
+                    ),
+                ]
+            }
+            "no_descriptors" => {
+                // No descriptor left to open: the probe's pipe cannot be
+                // made, so no bwrap may be started for it.
+                probe_answers_under_nofile(0)
+            }
+            "two_descriptors" => {
+                // Two descriptors left: the probe's pipe is made, its writer
+                // closed, and then starting bwrap (which opens `/dev/null`
+                // for each of its three standard streams) runs out.
+                let limit = limit_leaving_free_descriptors(2);
+                let mut answers = vec![format!("limit={limit}")];
+                answers.extend(probe_answers_under_nofile(limit));
+                answers
+            }
+            other => panic!("a child these tests do not know: {other}"),
+        }
+    }
+
+    /// Each start-up probe's answer, with `/bin/true` as bwrap: a probe that
+    /// starts it answers `Ran`.
+    #[cfg(target_os = "linux")]
+    fn probe_answers() -> Vec<String> {
+        [
+            innerwarden_agent_guard::seccomp::Rules::Identified,
+            innerwarden_agent_guard::seccomp::Rules::Terminal,
+        ]
+        .into_iter()
+        .map(|rules| {
+            let answer = filter_probe(Path::new("/bin/true"), rules, true);
+            format!("{rules:?}={answer:?}")
+        })
+        .collect()
+    }
+
+    /// The soft descriptor limit under which exactly `free` descriptor
+    /// numbers are left unused below it, from the ones open now.
+    #[cfg(target_os = "linux")]
+    fn limit_leaving_free_descriptors(free: usize) -> u64 {
+        let listed: Vec<libc::c_int> = std::fs::read_dir("/proc/self/fd")
+            .expect("this test host has /proc")
+            .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
+            .collect();
+        // The listing's own descriptor is closed by now: keep only the open.
+        // SAFETY: F_GETFD only reads a descriptor's flags.
+        let open: std::collections::BTreeSet<libc::c_int> = listed
+            .into_iter()
+            .filter(|fd| unsafe { libc::fcntl(*fd, libc::F_GETFD) } != -1)
+            .collect();
+        let mut left = free;
+        let mut fd: libc::c_int = 0;
+        loop {
+            if !open.contains(&fd) {
+                left -= 1;
+                if left == 0 {
+                    return fd as u64 + 1;
+                }
+            }
+            fd += 1;
+        }
+    }
+
+    /// [`probe_answers`] with the soft descriptor limit lowered to `limit`
+    /// (the hard one kept, so an unprivileged child may lower the soft one
+    /// as far as 0).
+    #[cfg(target_os = "linux")]
+    fn probe_answers_under_nofile(limit: u64) -> Vec<String> {
+        let mut current = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
         };
-        assert!(backend_setuid(Some(&at(0o104755))), "setuid");
-        assert!(!backend_setuid(Some(&at(0o100755))), "plain");
-        assert!(!backend_setuid(Some(&at(0o102755))), "setgid is not setuid");
-        assert!(backend_setuid(Some(&BackendFacts {
-            components: Vec::new(),
-            chain: Vec::new(),
-        })));
-        assert!(backend_setuid(None));
+        // SAFETY: getrlimit fills the struct it is given and setrlimit reads
+        // it.
+        let lowered = unsafe {
+            assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut current), 0);
+            current.rlim_cur = limit as libc::rlim_t;
+            libc::setrlimit(libc::RLIMIT_NOFILE, &current)
+        };
+        assert_eq!(lowered, 0, "{}", std::io::Error::last_os_error());
+        probe_answers()
+    }
+
+    /// Run this test binary again as a child (never a fork of the harness)
+    /// that answers `side`, under the `UNAME26` personality or with it
+    /// cleared, as a launcher started from such a shell inherits it. Every
+    /// child runs in [`the_plan_reads_the_running_kernel_without_proc`].
+    #[cfg(target_os = "linux")]
+    fn answers_of_a_child(side: &str, uname26: bool) -> std::collections::BTreeMap<String, String> {
+        use std::os::unix::process::CommandExt;
+        let name = module_path!()
+            .split_once("::")
+            .map(|(_, rest)| format!("{rest}::the_plan_reads_the_running_kernel_without_proc"))
+            .unwrap();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([name.as_str(), "--exact", "--nocapture", "--test-threads=1"])
+            .env(CHILD_VAR, side)
+            .stdin(std::process::Stdio::null());
+        // SAFETY: `personality` is one system call on this process's own
+        // state, safe between `fork` and `exec`.
+        unsafe {
+            command.pre_exec(move || {
+                let current = libc::personality(0xffff_ffff);
+                if current == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let wanted = if uname26 {
+                    current | UNAME26
+                } else {
+                    current & !UNAME26
+                };
+                if libc::personality(wanted as u32 as libc::c_ulong) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let out = command.output().expect("run the child");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "child failed: {stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // libtest may print the test's name on the line the first answer
+        // starts, so an answer is found anywhere on its line.
+        stdout
+            .lines()
+            .filter_map(|l| l.split_once("answer ").map(|(_, answer)| answer))
+            .filter_map(|l| l.split_once('='))
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// The plan reads the running kernel's release where `/proc` cannot be
+    /// read (a chroot, a container with no `/proc`): `uname` tells it there.
+    /// Where `/proc` is readable the plan reads it. Every kernel CI and the
+    /// labs run reads as 4.8 or later either way. Run in a child with the
+    /// `UNAME26` personality cleared, so the shell that runs the tests does
+    /// not decide the answer.
+    ///
+    /// FAILS ON REVERT: drop the `uname` fallback (a host with no `/proc`
+    /// reads as `Unknown`, and an identified jail leaves user namespaces
+    /// open on a modern kernel), or read the release from `/proc` alone.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_plan_reads_the_running_kernel_without_proc() {
+        if let Ok(side) = std::env::var(CHILD_VAR) {
+            for line in child_side(&side) {
+                println!("answer {line}");
+            }
+            return;
+        }
+        let proc = std::fs::read_to_string(OSRELEASE).expect("this test host has /proc");
+        assert_eq!(kernel_release(Path::new(OSRELEASE)), proc.trim());
+        let plain = answers_of_a_child("release", false);
+        assert_eq!(
+            plain["uname"],
+            proc.trim(),
+            "uname and /proc agree: {plain:?}"
+        );
+        assert_eq!(plain["proc"], "After", "{plain:?}");
+        assert_eq!(plain["no_proc"], "After", "{plain:?}");
+        assert_eq!(plain["no_proc_said"], "", "{plain:?}");
+    }
+
+    /// A launcher started under the `UNAME26` personality (`setarch
+    /// --uname-2.6`, which a shell passes to everything it runs) gets a 2.6
+    /// release from `uname` on any modern kernel. The plan still reads the
+    /// running kernel from `/proc`, and where `/proc` cannot be read it says
+    /// the release is unknown: never that the kernel is older than 4.8. Its
+    /// words name what hid it (no `/proc`, and the personality), never a
+    /// release that is not a version alone.
+    ///
+    /// FAILS ON REVERT: read `uname` before `/proc` (`proc` reads `Before`,
+    /// and an identified jail says `userns_kernel_too_old` on a 6.x
+    /// kernel), take `uname`'s answer under `UNAME26` (`no_proc` reads
+    /// `Before`), or say the unread release as one that "does not read as a
+    /// version".
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn under_uname26_the_plan_never_reads_an_older_kernel() {
+        let old = answers_of_a_child("release", true);
+        assert!(
+            old["uname"].starts_with("2.6."),
+            "the child runs under UNAME26: {old:?}"
+        );
+        assert_eq!(old["proc"], "After", "{old:?}");
+        assert_eq!(old["no_proc"], "Unknown", "{old:?}");
+        let said: Vec<&str> = old["no_proc_said"].split(" | ").collect();
+        assert_eq!(said.len(), 2, "{said:?}");
+        assert!(said[0].contains("(userns_kernel_unknown)"), "{said:?}");
+        assert!(said[1].contains("(filter_kernel_unknown)"), "{said:?}");
+        for line in said {
+            assert!(
+                line.contains("no /proc and a personality such as setarch --uname-2.6"),
+                "{line}"
+            );
+            assert!(!line.contains("does not read as a version"), "{line}");
+            assert!(!line.contains("This kernel is older"), "{line}");
+        }
+    }
+
+    /// A start-up probe whose filter pipe cannot be made (the launcher is
+    /// out of descriptors) starts no bwrap and answers that the filter was
+    /// not handed in, which the plan says as the launcher's failure, never
+    /// as bubblewrap's.
+    ///
+    /// FAILS ON REVERT: answer a lost pipe as a failed probe (`Failed`).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_probe_whose_pipe_cannot_be_made_says_it_was_not_handed() {
+        let answers = answers_of_a_child("no_descriptors", false);
+        assert_eq!(answers["Identified"], "NotHanded", "{answers:?}");
+        assert_eq!(answers["Terminal"], "NotHanded", "{answers:?}");
+    }
+
+    /// A start-up probe whose pipe was made, but whose bwrap the launcher
+    /// could not start (two descriptors left: the pipe takes them, and
+    /// starting a program needs `/dev/null` three times) never ran bwrap:
+    /// it answers that the filter was not handed in, the launcher's words,
+    /// never that bubblewrap could not start a jail.
+    ///
+    /// FAILS ON REVERT: answer a failed start `Failed` whatever its cause.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_probe_whose_bwrap_cannot_be_started_says_it_was_not_handed() {
+        let answers = answers_of_a_child("two_descriptors", false);
+        assert_eq!(answers["Identified"], "NotHanded", "{answers:?}");
+        assert_eq!(answers["Terminal"], "NotHanded", "{answers:?}");
+    }
+
+    /// What the launcher puts on bwrap's pipe is the library's filter
+    /// (`innerwarden_agent_guard::seccomp`), byte for byte, for each set of
+    /// rules: the bytes end where the program does, and the end bwrap reads
+    /// is inherited across its `exec`.
+    ///
+    /// FAILS ON REVERT: put any other bytes on the pipe (the other rules, or
+    /// a program built here instead of by the library).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_launcher_hands_bwrap_the_librarys_filter_bytes() {
+        use innerwarden_agent_guard::seccomp::{filter, Arch, Rules};
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+        let arch = Arch::native().expect("a Linux build the filter knows");
+        for rules in [Rules::Identified, Rules::Terminal] {
+            let mut reader = filter_pipe(rules).expect("the filter's pipe");
+            // SAFETY: F_GETFD on a descriptor this test owns.
+            let flags = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_GETFD) };
+            assert_eq!(flags & libc::FD_CLOEXEC, 0, "{rules:?} inherited");
+            let mut got = Vec::new();
+            reader.read_to_end(&mut got).unwrap();
+            assert_eq!(got, filter(arch, rules), "{rules:?}");
+        }
     }
 
     /// One loopback listener that answers its first request with `status`.

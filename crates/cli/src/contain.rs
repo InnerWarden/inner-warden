@@ -24,6 +24,17 @@
 //!     exposed. Deny rules are emitted LAST (last-wins on both backends).
 //!   * The backend binary is resolved from trusted absolute paths by the I/O
 //!     layer, never `$PATH`.
+//!   * On Linux every jail starts its programs under a seccomp filter
+//!     (`innerwarden_agent_guard::seccomp`) where the host takes it: no
+//!     `TIOCSTI` or `TIOCLINUX` into a terminal, no new btrfs or bcachefs
+//!     subvolume or snapshot (one would copy the files the jail hides; one
+//!     made before the jail started, in a folder it shows, still holds them),
+//!     and with `--identity` no new user namespace and no joining one. A host
+//!     that does not take it is told by a throwaway jail first, and the jail
+//!     then runs without it and says what it runs without.
+//!   * An identified jail drops every capability (`--cap-drop ALL`): a
+//!     launcher run as root would otherwise hand its programs root's
+//!     capabilities in the host's user namespace.
 
 use std::path::{Path, PathBuf};
 
@@ -65,6 +76,14 @@ pub struct ContainArgs {
     /// `--identity`: write a launch record for this instance. OFF by default;
     /// off, the jail and its argv are exactly what they were before the flag.
     pub identity: bool,
+    /// When an identified jail starts its command: a jail profile's `start`
+    /// ([`apply_jail_profile`]); [`JailStart::Always`] without one.
+    ///
+    /// [`JailStart::Always`]: innerwarden_agent_guard::profiles::JailStart::Always
+    pub start: innerwarden_agent_guard::profiles::JailStart,
+    /// Paths under the home a jail profile hides (`hide_home`), joined to the
+    /// home. Empty without one.
+    pub hide_home: Vec<PathBuf>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -174,6 +193,8 @@ pub fn parse_contain_args(argv: &[String]) -> Result<ContainArgs, ContainError> 
         extra_ro,
         deny_read,
         identity,
+        start: innerwarden_agent_guard::profiles::JailStart::Always,
+        hide_home: Vec::new(),
     })
 }
 
@@ -208,8 +229,9 @@ pub fn jail_flags_given(argv: &[String]) -> JailFlagsGiven {
 ///
 /// The profile's project is used only when `--project` was not given; its
 /// read-only paths are added; its hidden globs are added to the defaults and
-/// to any `--deny-read` (hiding more is never undone by a flag). A `~/` path
-/// is under `home`. The I/O layer resolves links in the read-only paths
+/// to any `--deny-read` (hiding more is never undone by a flag); its hidden
+/// home paths are joined to `home`; and it says when the jail starts. A `~/`
+/// path is under `home`. The I/O layer resolves links in the read-only paths
 /// before the jail is built, so a link cannot put a protected directory
 /// behind an allowed name.
 pub fn apply_jail_profile(
@@ -238,6 +260,13 @@ pub fn apply_jail_profile(
             args.deny_read.push(glob.clone());
         }
     }
+    for path in &jail.hide_home {
+        let path = home.join(path);
+        if !args.hide_home.contains(&path) {
+            args.hide_home.push(path);
+        }
+    }
+    args.start = args.start.max(jail.start());
 }
 
 /// A binary resolved to live under `$HOME` (so it must be re-bound after the HOME
@@ -264,6 +293,169 @@ pub struct DenyPath {
     /// Absolute path inside the jail (same as on the host - binds are identity).
     pub abs: PathBuf,
     pub is_dir: bool,
+}
+
+/// A home path a jail profile hides ([`ContainArgs::hide_home`]), as the
+/// launcher found it on the host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HiddenHomePath {
+    /// The path as the profile names it, joined to the home.
+    pub nominal: PathBuf,
+    /// Where it leads with every link followed, when something is there.
+    pub real: Option<PathBuf>,
+    /// Where it leads with every link on the way that exists followed, the
+    /// rest as written: `real` when something is there, and otherwise the
+    /// place a later file would be made.
+    pub resolved: PathBuf,
+    /// What is there is a folder.
+    pub is_dir: bool,
+    /// A link on the way leads to nothing: where a file made through it
+    /// would land is not known before it is made.
+    pub dangling_link: bool,
+}
+
+/// What the jail hides of the home ([`plan_hidden_home`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HiddenPlan {
+    /// Linux: each path as the jail sees it, covered by an empty mount.
+    pub masks: Vec<DenyPath>,
+    /// macOS: each path the sandbox denies, as named and as it resolves
+    /// (the sandbox matches the resolved path).
+    pub denies: Vec<PathBuf>,
+}
+
+/// PURE. Plan the home paths a jail profile hides.
+///
+/// A link anywhere on the way is followed: what is hidden is the place the
+/// path leads to (`real`), never a link, so bwrap never mounts on a link
+/// and the sandbox denies the path it matches. On Linux it is covered where
+/// the jail shows it: `shown` lists each host folder the jail shows, as the
+/// jail sees it and as its host path resolves, and a place none of them
+/// shows is not in the jail at all (the jail's home is empty), so nothing
+/// is laid there. On macOS both the path as named and where it leads are
+/// denied, and a path that is not there yet is denied too.
+///
+/// A path that leads outside the home is refused: a link the agent planted
+/// in a folder it can write would otherwise move the mask onto anything the
+/// jail shows (`/etc/innerwarden`). A home folder the jail binds read-write
+/// is taken where it leads, as the jail binds it: below `~/.cache` linked to
+/// `/data/cache`, the jail's home is `/data/cache`, and only a link below it
+/// that leaves it is refused (the agent cannot replace the folder itself,
+/// a mount point in the jail). What a path leads to that the jail needs
+/// (the project, the guard, the agent's own settings) is refused by
+/// [`validate_jail_inputs`].
+pub fn plan_hidden_home(
+    paths: &[HiddenHomePath],
+    home: &Path,
+    shown: &[(PathBuf, PathBuf)],
+) -> Result<HiddenPlan, ContainError> {
+    let mut plan = HiddenPlan::default();
+    let deny = |path: &Path, plan: &mut HiddenPlan| {
+        if !plan.denies.iter().any(|seen| seen == path) {
+            plan.denies.push(path.to_path_buf());
+        }
+    };
+    for path in paths {
+        if path.dangling_link {
+            return Err(ContainError::Unsupported(format!(
+                "the hidden home path '{}' goes through a link that leads to nothing: \
+                 remove the link, or name the path it should lead to in hide_home",
+                path.nominal.display()
+            )));
+        }
+        let leads_to = path.real.as_ref().unwrap_or(&path.resolved);
+        let in_its_folder = writable_folder_target(&path.nominal, home, shown)
+            .is_some_and(|folder| leads_to.starts_with(folder));
+        if !leads_to.starts_with(home) && !in_its_folder {
+            return Err(ContainError::Unsupported(format!(
+                "the hidden home path '{}' leads to '{}', outside the home: name a path \
+                 inside the home in hide_home, or remove the link",
+                path.nominal.display(),
+                leads_to.display()
+            )));
+        }
+        deny(&path.nominal, &mut plan);
+        deny(leads_to, &mut plan);
+        let Some(real) = &path.real else {
+            continue;
+        };
+        let jail_view = shown
+            .iter()
+            .filter(|(_, host)| real.starts_with(host))
+            .max_by_key(|(_, host)| host.components().count())
+            .and_then(|(jail, host)| real.strip_prefix(host).ok().map(|rest| jail.join(rest)));
+        if let Some(abs) = jail_view {
+            if !plan.masks.iter().any(|seen| seen.abs == abs) {
+                plan.masks.push(DenyPath {
+                    abs,
+                    is_dir: path.is_dir,
+                });
+            }
+        }
+    }
+    Ok(plan)
+}
+
+/// Where the home folder a hidden path is in leads on the host, when the
+/// jail binds that folder read-write ([`writable_home_dirs`]) and shows it
+/// (`shown`, [`shown_host_folders`]): what is below that place is what the
+/// jail shows below the folder.
+fn writable_folder_target<'a>(
+    nominal: &Path,
+    home: &Path,
+    shown: &'a [(PathBuf, PathBuf)],
+) -> Option<&'a Path> {
+    let first = nominal.strip_prefix(home).ok()?.components().next()?;
+    let name = first.as_os_str().to_str()?;
+    if !DOTDIR_RW.contains(&name) || DOTDIR_DENY.contains(&name) {
+        return None;
+    }
+    let folder = home.join(name);
+    shown
+        .iter()
+        .find(|(jail, _)| *jail == folder)
+        .map(|(_, host)| host.as_path())
+}
+
+/// PURE. The host folders (and files) a jail shows under their own names,
+/// each as `(where the jail shows it, where its host path resolves)`: the
+/// home's dotdirs and dotfiles it binds that exist (`existing`), the
+/// project, the worktree's folders and the read-only paths. `real`
+/// resolves a host path's links.
+pub fn shown_host_folders(
+    input: &ContainArgs,
+    home: &Path,
+    worktree: Option<&Worktree>,
+    existing: &[PathBuf],
+    real: impl Fn(&Path) -> PathBuf,
+) -> Vec<(PathBuf, PathBuf)> {
+    let mut shown: Vec<(PathBuf, PathBuf)> = DOTDIR_RW
+        .iter()
+        .chain(DOTFILE_RO)
+        .filter(|name| !DOTDIR_DENY.contains(name))
+        .map(|name| home.join(name))
+        .filter(|path| existing.contains(path))
+        .map(|path| {
+            let host = real(&path);
+            (path, host)
+        })
+        .collect();
+    let mut same = vec![input.project.clone()];
+    if let Some(worktree) = worktree {
+        same.push(worktree.git_dir.clone());
+        same.push(worktree.common_dir.clone());
+    }
+    same.extend(input.extra_ro.iter().cloned());
+    shown.extend(same.into_iter().map(|path| (path.clone(), path)));
+    shown
+}
+
+/// The home's folders a jail binds read-write, where a hidden path that is
+/// not there yet is made (empty, 0700) before the jail starts, so what a
+/// host program makes there later is under the mask too.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn writable_home_dirs() -> &'static [&'static str] {
+    DOTDIR_RW
 }
 
 /// Host facts the pure builders need, resolved by `contain_io` and injected so the
@@ -322,12 +514,43 @@ pub struct JailInputs {
     /// jail, handed to the jail's command as they were ([`launch_env`]).
     /// Empty unless the launch asked for an identity record.
     pub child_env: Vec<(String, String)>,
-    /// Start the jail so its programs cannot make user namespaces of their own
-    /// (`--unshare-user --disable-userns`). Decided by the launcher before the
-    /// jail is built ([`launch::userns_decision`]); `false` unless the launch
-    /// asked for an identity record, and a `true` without `--identity` adds
-    /// nothing to the argv.
+    /// The jail was started under the identified filter, so its programs
+    /// cannot make user namespaces of their own: the fact the launch record
+    /// carries (`jail.userns_closed`). Decided by the launcher before the jail
+    /// is built ([`launch::filter_plan`]); `false` unless the launch asked
+    /// for an identity record. It puts nothing in the argv: the filter is
+    /// [`JailInputs::seccomp_fd`]. Read by the Linux launcher only.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub close_userns: bool,
+    /// The descriptor bwrap reads the jail's seccomp filter from
+    /// (`--seccomp`, [`innerwarden_agent_guard::seccomp`]): the terminal
+    /// filter for a plain jail, the identified one with `--identity` (or the
+    /// terminal one where the host takes only that). `None` where the
+    /// launcher's start-up probe found this host cannot start a jail with
+    /// either, and the jail then runs as it did before the filter.
+    pub seccomp_fd: Option<i32>,
+    /// The home paths a jail profile hides, each as the jail sees it and
+    /// whether it is a folder ([`HiddenPlan::masks`]): covered by an empty
+    /// mount after every writable bind (Linux). Empty without such a
+    /// profile.
+    pub hide_paths: Vec<DenyPath>,
+    /// The same paths as the sandbox denies them, as named and as they
+    /// resolve ([`HiddenPlan::denies`], macOS). Empty without such a
+    /// profile.
+    pub hide_denies: Vec<PathBuf>,
+    /// What of the host's resolver `/etc/resolv.conf` leads to where it is a
+    /// link into `/run` ([`launch::resolv_conf_target`]): the file, or a
+    /// folder of resolver data alone ([`launch::resolv_conf_bind`]), bound
+    /// read-only at that same place over the jail's empty `/run`, so the
+    /// host's name resolution works in the jail and nothing else of the
+    /// host's `/run` is shown. `None` where `/etc/resolv.conf` is a file of
+    /// its own, or names nothing there.
+    pub resolv_conf: Option<PathBuf>,
+    /// The instance whose record the jail must hold before its command
+    /// starts ([`launch::gated_child`]): set by the launcher only under a
+    /// profile that starts the jail once the host admitted it. `None`
+    /// otherwise, and the command is the jail's child as it always was.
+    pub gate_instance: Option<String>,
 }
 
 impl JailInputs {
@@ -365,6 +588,8 @@ const DOTDIR_RW: &[&str] = &[
 ];
 /// Read-only git identity re-binds.
 const DOTFILE_RO: &[&str] = &[".gitconfig"];
+/// The agent's own settings under the home, which carry the guard's hook.
+const AGENT_SETTINGS: &[&str] = &[".claude", ".claude.json"];
 /// Dotdirs that must stay INVISIBLE (never re-bound → absent under the HOME tmpfs).
 const DOTDIR_DENY: &[&str] = &[".ssh", ".gnupg", ".aws", ".mozilla", ".thunderbird"];
 const MACOS_HOME_DENY: &[&str] = &["Library/Mail", "Library/Messages", "Library/Safari"];
@@ -425,6 +650,40 @@ pub fn validate_jail_inputs(input: &JailInputs) -> Result<(), ContainError> {
     for path in &input.args.extra_ro {
         validate_bind("extra read-only", path)?;
     }
+    // A hidden home path covers what is under it: never what the jail
+    // needs. Not the project, or the agent would work in an empty folder;
+    // not the guard's binary, whose hook would then fail to run and every
+    // command go unscreened; not a read-only path the profile shows; not
+    // the agent's own settings, which carry the hook.
+    let needed = std::iter::once(("the project", input.args.project.clone()))
+        .chain(std::iter::once(("the guard", input.iw_binary.clone())))
+        .chain(
+            input
+                .args
+                .extra_ro
+                .iter()
+                .map(|path| ("a read-only path", path.clone())),
+        )
+        .chain(
+            AGENT_SETTINGS
+                .iter()
+                .map(|name| ("the agent's settings", input.home.join(name))),
+        );
+    for (what, path) in needed {
+        let covered = input
+            .hide_paths
+            .iter()
+            .map(|hidden| hidden.abs.as_path())
+            .chain(input.hide_denies.iter().map(PathBuf::as_path))
+            .find(|hidden| path.starts_with(hidden));
+        if let Some(hidden) = covered {
+            return Err(ContainError::Unsupported(format!(
+                "the hidden home path '{}' holds {what} '{}'",
+                hidden.display(),
+                path.display()
+            )));
+        }
+    }
     if input.args.identity {
         validate_sealed(input)?;
     }
@@ -484,18 +743,25 @@ pub struct LinuxJailPlan {
 }
 
 /// The namespaces the jail unshares. The start-up probe of
-/// [`launch::userns_probe_argv`] asks for the same ones.
+/// [`launch::filter_probe_argv`] asks for the same ones.
 pub const JAIL_NAMESPACES: [&str; 3] = ["--unshare-pid", "--unshare-uts", "--unshare-ipc"];
 
-/// What closes user namespaces inside the jail. `--disable-userns` needs the
-/// jail to have a user namespace of its own, so the jail asks for it by name
-/// instead of leaving it to what bwrap does when it is not installed setuid.
-pub const USERNS_CLOSED: [&str; 2] = ["--unshare-user", "--disable-userns"];
+/// The bwrap option that hands it the jail's seccomp filter on a descriptor.
+pub const SECCOMP_OPTION: &str = "--seccomp";
+
+/// What an identified jail asks bwrap for after the filter: no capability at
+/// all for its programs. bwrap keeps every capability of a caller whose uid
+/// is 0 unless told otherwise, and it runs such a jail in the host's user
+/// namespace, where those capabilities make namespaces and mounts the filter
+/// does not refuse. For any other caller bwrap drops them anyway, so this
+/// changes nothing there. In every bwrap since 0.2.0.
+pub const CAP_DROP_ALL: [&str; 2] = ["--cap-drop", "ALL"];
 
 /// Build the ordered bwrap argument vector. Order is load-bearing (bwrap is
 /// last-wins): system RO → dev/proc/tmpfs → HOME tmpfs → dotdir re-binds → shadow
 /// innerwarden → binary binds → project (late) → worktree → nested secret masks →
-/// the host's key and the launch record (`--identity` only) → namespaces → child. `DOTDIR_DENY`
+/// the host's key and the launch record (`--identity` only) → namespaces and the
+/// seccomp filter → child. `DOTDIR_DENY`
 /// entries are never emitted, so they vanish under the HOME tmpfs.
 pub fn build_linux_jail(input: &JailInputs) -> Result<LinuxJailPlan, ContainError> {
     validate_jail_inputs(input)?;
@@ -525,6 +791,16 @@ pub fn build_linux_jail(input: &JailInputs) -> Result<LinuxJailPlan, ContainErro
     push(&["--proc", "/proc"]);
     push(&["--tmpfs", "/tmp"]);
     push(&["--tmpfs", "/run"]);
+    // Where `/etc/resolv.conf` is a link into `/run` (systemd-resolved), the
+    // file it names, alone, read-only at its own place (or the folder of
+    // resolver data alone that holds it, `launch::resolv_conf_bind`): the
+    // host's name resolution keeps working in the jail and the rest of the
+    // host's `/run`, its sockets included, stays out. Never a file of the
+    // jail's own: the jail resolves names exactly as the host does.
+    if let Some(target) = &input.resolv_conf {
+        let target = target.to_string_lossy().to_string();
+        push(&["--ro-bind-try", &target, &target]);
+    }
 
     // --- HOME: tmpfs, then selective re-bind of what exists ---
     push(&["--tmpfs", &home]);
@@ -613,6 +889,19 @@ pub fn build_linux_jail(input: &JailInputs) -> Result<LinuxJailPlan, ContainErro
         }
     }
 
+    // --- the home paths a jail profile hides that exist (`hide_home`),
+    // after every writable bind, so none of them brings one back: a folder
+    // under an empty tmpfs, a file under /dev/null. Empty unless a profile
+    // names some. ---
+    for hidden in &input.hide_paths {
+        let dest = hidden.abs.to_string_lossy().to_string();
+        if hidden.is_dir {
+            push(&["--tmpfs", &dest]);
+        } else {
+            push(&["--ro-bind", "/dev/null", &dest]);
+        }
+    }
+
     // --- nested project-secret masks, AFTER the project bind (last-wins). The I/O
     // layer glob-expanded + statted `deny_read` into `deny_paths`. A DIRECTORY is
     // masked with a tmpfs; a FILE is masked by binding /dev/null over it - a tmpfs
@@ -669,12 +958,22 @@ pub fn build_linux_jail(input: &JailInputs) -> Result<LinuxJailPlan, ContainErro
     // --- namespaces / lifecycle ---
     push(&["--die-with-parent"]);
     push(&JAIL_NAMESPACES);
-    // After the record and every mount, like the rest of this block, and only
-    // for an identified launch whose host takes the option: the jail cannot
-    // make a user namespace of its own, so it cannot rebuild what it was
-    // refused. A defence in depth; it never changes the trust of the instance.
-    if input.args.identity && input.close_userns {
-        push(&USERNS_CLOSED);
+    // After the record and every mount, like the rest of this block: the
+    // seccomp filter bwrap applies to the jail's programs before the command
+    // runs, where the launcher's start-up probe found the host takes it. In
+    // every jail it refuses keystroke injection into a terminal and new
+    // btrfs or bcachefs subvolumes and snapshots; with `--identity` also new
+    // user namespaces and joining one, so the jail cannot rebuild what it was
+    // refused. A defence in depth; it never changes the trust of the
+    // instance.
+    if let Some(fd) = input.seccomp_fd {
+        push(&[SECCOMP_OPTION, &fd.to_string()]);
+    }
+    // An identified jail, filter or not: no capability for its programs, so
+    // a launcher run as root does not hand them root's (`CAP_DROP_ALL`).
+    // The plain jail is left as it was.
+    if input.args.identity {
+        push(&CAP_DROP_ALL);
     }
     push(&["--hostname", "ai-sandbox"]);
     if !input.stdin_is_tty {
@@ -694,9 +993,18 @@ pub fn build_linux_jail(input: &JailInputs) -> Result<LinuxJailPlan, ContainErro
     }
     // NO --unshare-net (agent/hook/git need it in v1); NO --clearenv.
 
-    // --- terminator + child ---
+    // --- terminator + child: through the gate where the jail starts only
+    // once admitted, so the jail itself refuses to start its command
+    // without the record the launcher hands in after the admission ---
     push(&["--"]);
-    a.extend(input.args.child.iter().cloned());
+    match &input.gate_instance {
+        Some(instance) => a.extend(launch::gated_child(
+            &input.iw_binary,
+            instance,
+            &input.args.child,
+        )),
+        None => a.extend(input.args.child.iter().cloned()),
+    }
 
     Ok(LinuxJailPlan {
         bwrap_args: a,
@@ -814,11 +1122,17 @@ pub fn build_macos_profile(input: &JailInputs) -> Result<MacosJailPlan, ContainE
             e(&iw_cfg_real)
         ));
     }
-    // project secrets (glob-expanded + statted by the I/O layer into deny_paths):
-    for d in &input.deny_paths {
+    // project secrets (glob-expanded + statted by the I/O layer into deny_paths),
+    // and the home paths a jail profile hides, as named and as they resolve:
+    for path in input
+        .deny_paths
+        .iter()
+        .map(|d| d.abs.as_path())
+        .chain(input.hide_denies.iter().map(PathBuf::as_path))
+    {
         p.push_str(&format!(
             "(deny file-read* (subpath \"{}\"))\n",
-            e(&d.abs.to_string_lossy())
+            e(&path.to_string_lossy())
         ));
     }
     p.push('\n');
@@ -888,10 +1202,15 @@ pub fn build_macos_profile(input: &JailInputs) -> Result<MacosJailPlan, ContainE
             e(&iw_cfg_real)
         ));
     }
-    for d in &input.deny_paths {
+    for path in input
+        .deny_paths
+        .iter()
+        .map(|d| d.abs.as_path())
+        .chain(input.hide_denies.iter().map(PathBuf::as_path))
+    {
         p.push_str(&format!(
             "(deny file-write* (subpath \"{}\"))\n",
-            e(&d.abs.to_string_lossy())
+            e(&path.to_string_lossy())
         ));
     }
 
@@ -1026,9 +1345,13 @@ pub fn userns_restriction_advice(
         "    EOF".into(),
         "    sudo apparmor_parser -r /etc/apparmor.d/bwrap".into(),
         "".into(),
-        "  Then run this command again. Nothing was run.".into(),
+        RESTRICTION_ADVICE_END.into(),
     ])
 }
+
+/// The last line of [`userns_restriction_advice`]: what `contain` says to
+/// do once the profile is in place.
+pub const RESTRICTION_ADVICE_END: &str = "  Then run this command again. Nothing was run.";
 
 /// The pure half of `contain --identity`: read what bwrap reported, read what
 /// the host says about the jail process, and put the facts into a
@@ -1072,6 +1395,10 @@ pub mod launch {
     /// the host has a system profiles file. A real run uses the pipe's own.
     pub const DRY_RUN_MARKER_FD: i32 = 12;
 
+    /// The seccomp filter descriptor a dry run shows, when the host takes the
+    /// filter. A real run uses the pipe's own.
+    pub const DRY_RUN_SECCOMP_FD: i32 = 13;
+
     // -- the user scope ------------------------------------------------------
     //
     // The order a launch runs in, and why it is this order:
@@ -1093,13 +1420,14 @@ pub mod launch {
     // 2, before any placement at 4) and does see any the agent tries later.
     // A bwrap option that makes a SECOND user namespace after step 3
     // (`--disable-userns`, or `--uid`/`--gid` other than the caller's) would
-    // be refused by such a policy and kill the jail: moving this order is a
-    // change to make with that in view. `--disable-userns` is used all the
-    // same, only where a throwaway jail started with it before step 1
-    // (`userns_decision`), and never started over: a refusal at step 3 comes
-    // after the jail reported its pid. Nothing here arms anything. On Ubuntu
-    // 24.04 bwrap itself needs the AppArmor profile that grants it `userns`
-    // (`userns_restriction_advice`, `flags=(unconfined)`).
+    // be refused by such a policy and kill the jail, so the jail uses none:
+    // its seccomp filter (`--seccomp`, applied by bwrap after it built the
+    // root, before the command runs) makes no namespace at all. Whether the
+    // host takes the filter is learned before step 1, by a throwaway jail
+    // (`filter_probe_argv`), and a launch is never started over: a failure at
+    // step 3 comes after the jail reported its pid. Nothing here arms
+    // anything. On Ubuntu 24.04 bwrap itself needs the AppArmor profile that
+    // grants it `userns` (`userns_restriction_advice`, `flags=(unconfined)`).
 
     /// The first systemd whose `systemd-run` has `--expand-environment=`, the
     /// switch that turns `$NAME` expansion of the command line on and off.
@@ -1211,184 +1539,399 @@ pub mod launch {
         digits.parse().ok()
     }
 
-    // -- user namespaces inside the jail -------------------------------------
+    // -- the seccomp filter of the jail ---------------------------------------
     //
-    // `bwrap --disable-userns` (bubblewrap 0.8.0) stops the jail's programs
-    // from making user namespaces of their own. It needs a bwrap that is not
-    // installed setuid, and on a host that restricts new user namespaces it
-    // can be refused. That is learned BEFORE the jail is built, by starting a
-    // throwaway jail with the option: the option makes a second user
-    // namespace after the jail has reported its pid, so a refusal there would
-    // kill a jail whose record was already handed in, and a launch that
-    // started over would not help the one case it was for. A host that
-    // cannot take the option runs the jail exactly as today.
+    // Every jail starts its programs under a seccomp filter
+    // (`innerwarden_agent_guard::seccomp`): the terminal one, and with
+    // `--identity` the identified one, which also closes user namespaces.
+    // bwrap has taken a filter on a descriptor (`--seccomp`) since its first
+    // releases, sets `no_new_privs` itself and applies the filter after it
+    // built the jail, a setuid bwrap included. What can still stop it is the
+    // host: a kernel without seccomp filters, a binary run under another
+    // architecture's emulation (the filter would kill the jail's first
+    // call), or a build for an architecture this one has no numbers for.
+    // That is learned BEFORE the jail is built, by starting a throwaway jail
+    // with the filter, and a launch is never started over. A host that cannot
+    // take it runs the jail as it did before the filter, and says so. An
+    // identified launch whose host does not take the identified filter falls
+    // back to the terminal one, and says what it lost.
+    //
+    // Before Linux 4.8 the kernel ran the filter before a tracer could change
+    // the call it was about to run: a program in the jail that traces another
+    // (which the jail allows) could turn an allowed call into one the filter
+    // refuses. On such a kernel the identified filter is never used, so no
+    // record says user namespaces are closed, and the terminal one is said
+    // to be weaker. A release that does not read as a version, or that could
+    // not be read at all, is taken the same way, and said as unknown rather
+    // than as older.
 
-    /// The first bubblewrap that has `--disable-userns`.
-    pub const DISABLE_USERNS_SINCE: (u32, u32, u32) = (0, 8, 0);
+    /// The first kernel that runs the filter after a tracer's change of a
+    /// call (`seccomp: run after ptrace`, 4.8, on x86_64 and aarch64 alike).
+    pub const TRACER_SAFE_KERNEL: (u32, u32) = (4, 8);
 
-    /// What `bwrap --version` and the file's mode say.
+    /// What a kernel's release says of the order of the filter and a
+    /// tracer's change of a call.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub struct BwrapFacts {
-        /// `None` when `bwrap --version` gave nothing this build reads.
-        pub version: Option<(u32, u32, u32)>,
-        /// The set-user-id bit is on the file bwrap runs from.
-        pub setuid: bool,
+    pub enum TracerOrder {
+        /// [`TRACER_SAFE_KERNEL`] or later: the filter runs after it.
+        After,
+        /// Older: the filter runs before it.
+        Before,
+        /// The release does not read as a version. Taken as [`Before`], the
+        /// answer that claims nothing, and said as unknown.
+        ///
+        /// [`Before`]: TracerOrder::Before
+        Unknown,
     }
 
-    /// Why a launch keeps user namespaces open in the jail.
+    /// PURE. The order a kernel release (`uname -r`, as `6.12.10-orbstack`
+    /// or `3.10.0-1160.el7.x86_64`) runs the filter and a tracer in.
+    pub fn tracer_order(release: &str) -> TracerOrder {
+        let mut parts = release.trim().split(['.', '-']);
+        let number = |part: Option<&str>| -> Option<u32> {
+            let part = part?;
+            if part.is_empty() || part.len() > 6 || !part.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            part.parse().ok()
+        };
+        match (number(parts.next()), number(parts.next())) {
+            (Some(major), Some(minor)) if (major, minor) >= TRACER_SAFE_KERNEL => {
+                TracerOrder::After
+            }
+            (Some(_), Some(_)) => TracerOrder::Before,
+            _ => TracerOrder::Unknown,
+        }
+    }
+
+    /// Why an identified launch keeps user namespaces open in the jail.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum UsernsWhy {
-        BwrapTooOld,
-        BwrapSetuid,
+        /// The throwaway jail with the identified filter did not exit 0.
         ProbeFailed,
+        /// The kernel is older than [`TRACER_SAFE_KERNEL`].
+        KernelTooOld,
+        /// The kernel's release could not be read as a version: it is not
+        /// one, or it was hidden (no `/proc`, and a `UNAME26` personality
+        /// that rewrites `uname`).
+        KernelUnknown,
+        /// This build has no filter for the architecture it runs as.
+        NotBuilt,
+        /// The launcher could not hand the filter to bubblewrap, for its
+        /// start-up probe or after it: it could not make the pipe, or start
+        /// bwrap for want of its own descriptors, processes or memory
+        /// ([`spawn_failed_answer`]). No bwrap ran under it.
+        NotHanded,
     }
 
     impl UsernsWhy {
-        /// The word the dry run, the launcher and the dashboard share.
+        /// The word the dry run and the launcher share.
         pub fn word(self) -> &'static str {
             match self {
-                UsernsWhy::BwrapTooOld => "bwrap_too_old",
-                UsernsWhy::BwrapSetuid => "bwrap_setuid",
                 UsernsWhy::ProbeFailed => "userns_probe_failed",
+                UsernsWhy::KernelTooOld => "userns_kernel_too_old",
+                UsernsWhy::KernelUnknown => "userns_kernel_unknown",
+                UsernsWhy::NotBuilt => "userns_filter_not_built",
+                UsernsWhy::NotHanded => "userns_filter_not_handed",
             }
         }
 
         pub fn sentence(self) -> &'static str {
             match self {
-                UsernsWhy::BwrapTooOld => "Bubblewrap here is older than 0.8, so programs in the jail can still make user namespaces.",
-                UsernsWhy::BwrapSetuid => "Bubblewrap here runs setuid, so user namespaces stay open in the jail.",
                 UsernsWhy::ProbeFailed => "Bubblewrap here could not start a jail with user namespaces closed, so the jail runs without that.",
+                UsernsWhy::KernelTooOld => "This kernel is older than 4.8, where a program that traces another could get a call past the filter, so the jail runs without closing them.",
+                UsernsWhy::KernelUnknown => "This kernel's release could not be read as a version (it is not one, or there is no /proc and a personality such as setarch --uname-2.6 hides it from uname), so it is taken as older than 4.8 and the jail runs without closing them.",
+                UsernsWhy::NotBuilt => "This build has no sandbox filter for this architecture, so the jail runs without closing them.",
+                UsernsWhy::NotHanded => "The launcher could not hand the sandbox filter to bubblewrap, so the jail runs without closing them.",
             }
         }
     }
 
+    /// What else an identified jail runs without when its filter is not the
+    /// identified one: the identified filter adds the namespace rules and
+    /// the end of 32-bit programs to the plain jail's, and nothing more
+    /// (a test of `innerwarden_agent_guard::seccomp` holds it), so with the
+    /// user namespace line this names all it loses.
+    pub const USERNS_OPEN_ALSO: &str =
+        "Joining other namespaces stays open too, and a 32-bit program runs in the jail.";
+
     /// The line `contain --identity` prints (and a dry run shows) when user
-    /// namespaces stay open.
+    /// namespaces stay open, with the rest of what the identified filter
+    /// would have refused ([`USERNS_OPEN_ALSO`]).
     pub fn userns_open_sentence(why: UsernsWhy) -> String {
         format!(
-            "innerwarden contain: user namespaces stay open ({}): {}",
+            "innerwarden contain: user namespaces stay open ({}): {} {USERNS_OPEN_ALSO}",
             why.word(),
             why.sentence()
         )
     }
 
-    /// What the launch does about user namespaces in the jail.
+    /// Why a jail runs without the terminal filter, or with a weaker one.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum UsernsFact {
-        /// No `--identity`: nothing is asked, nothing is probed.
-        NotAsked,
-        Closed,
-        Open(UsernsWhy),
+    pub enum FilterWhy {
+        /// The throwaway jail with the terminal filter did not exit 0: no
+        /// filter.
+        ProbeFailed,
+        /// This build has no filter for the architecture it runs as: no
+        /// filter.
+        NotBuilt,
+        /// The filter is in, and the kernel is older than
+        /// [`TRACER_SAFE_KERNEL`].
+        KernelTooOld,
+        /// The filter is in, and the kernel's release could not be read as
+        /// a version (as [`UsernsWhy::KernelUnknown`]): taken as older.
+        KernelUnknown,
+        /// The launcher could not hand the filter to bubblewrap, for its
+        /// start-up probe or after it: it could not make the pipe, or start
+        /// bwrap for want of its own descriptors, processes or memory
+        /// ([`spawn_failed_answer`]). No filter.
+        NotHanded,
     }
 
-    impl UsernsFact {
-        /// The fact the jail inputs carry: true only when the option is used.
-        pub fn close_userns(self) -> bool {
-            self == UsernsFact::Closed
+    impl FilterWhy {
+        pub fn word(self) -> &'static str {
+            match self {
+                FilterWhy::ProbeFailed => "filter_probe_failed",
+                FilterWhy::NotBuilt => "filter_not_built",
+                FilterWhy::KernelTooOld => "filter_kernel_too_old",
+                FilterWhy::KernelUnknown => "filter_kernel_unknown",
+                FilterWhy::NotHanded => "filter_not_handed",
+            }
+        }
+
+        pub fn sentence(self) -> &'static str {
+            match self {
+                FilterWhy::ProbeFailed => "Bubblewrap here could not start a jail with the sandbox filter, so programs in the jail can still inject keystrokes into your terminal and make new btrfs or bcachefs subvolumes or snapshots (a snapshot shows the files the jail hides).",
+                FilterWhy::NotBuilt => "This build has no sandbox filter for this architecture, so programs in the jail can still inject keystrokes into your terminal and make new btrfs or bcachefs subvolumes or snapshots (a snapshot shows the files the jail hides).",
+                FilterWhy::KernelTooOld => "This kernel is older than 4.8, where a program that traces another can get a call past the filter, so programs in the jail may still inject keystrokes into your terminal or make new btrfs or bcachefs subvolumes or snapshots (a snapshot shows the files the jail hides).",
+                FilterWhy::KernelUnknown => "This kernel's release could not be read as a version (it is not one, or there is no /proc and a personality such as setarch --uname-2.6 hides it from uname), so it is taken as older than 4.8, where a program that traces another can get a call past the filter: programs in the jail may still inject keystrokes into your terminal or make new btrfs or bcachefs subvolumes or snapshots (a snapshot shows the files the jail hides).",
+                FilterWhy::NotHanded => "The launcher could not hand the sandbox filter to bubblewrap, so programs in the jail can still inject keystrokes into your terminal and make new btrfs or bcachefs subvolumes or snapshots (a snapshot shows the files the jail hides).",
+            }
         }
     }
 
-    /// PURE. Close user namespaces in the jail only for an identified launch,
-    /// on a bwrap that is at least [`DISABLE_USERNS_SINCE`], not setuid, and
-    /// that started a throwaway jail with the option (`probe`, asked last and
-    /// only when everything before it holds, since it starts a process). A
-    /// version that is not known counts as too old: nothing says it has the
-    /// option.
-    pub fn userns_decision(
-        identity: bool,
-        facts: &BwrapFacts,
-        probe: impl FnOnce() -> bool,
-    ) -> UsernsFact {
-        if !identity {
-            return UsernsFact::NotAsked;
-        }
-        match facts.version {
-            Some(version) if version >= DISABLE_USERNS_SINCE => {}
-            _ => return UsernsFact::Open(UsernsWhy::BwrapTooOld),
-        }
-        if facts.setuid {
-            return UsernsFact::Open(UsernsWhy::BwrapSetuid);
-        }
-        if !probe() {
-            return UsernsFact::Open(UsernsWhy::ProbeFailed);
-        }
-        UsernsFact::Closed
+    /// The line a launch prints (and its dry run shows) when its jail runs
+    /// without the plain jail's filter (the terminal rule and the subvolume
+    /// one), or with a weaker one.
+    pub fn filter_sentence(why: FilterWhy) -> String {
+        let what = match why {
+            FilterWhy::ProbeFailed | FilterWhy::NotBuilt | FilterWhy::NotHanded => {
+                "no sandbox filter"
+            }
+            FilterWhy::KernelTooOld | FilterWhy::KernelUnknown => "a weaker sandbox filter",
+        };
+        format!(
+            "innerwarden contain: {what} ({}): {}",
+            why.word(),
+            why.sentence()
+        )
     }
 
-    /// What a dry run of an identified launch says about user namespaces.
+    /// What a throwaway jail under a filter (the start-up probe) answered.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ProbeAnswer {
+        /// It ran under the filter and exited 0.
+        Ran,
+        /// bwrap did not start it, or it did not exit 0 in time.
+        Failed,
+        /// The launcher could not make the pipe that hands the filter in,
+        /// or could not start bwrap for want of its own descriptors,
+        /// processes or memory ([`spawn_failed_answer`]): no bwrap ran, the
+        /// launcher's failure, not bubblewrap's.
+        NotHanded,
+    }
+
+    /// PURE. What a start-up probe answers when the launcher could not
+    /// start bwrap at all. Out of descriptors (`EMFILE`, `ENFILE`: the
+    /// launcher opens `/dev/null` and a pipe of its own to start a
+    /// program), of processes (`EAGAIN`) or of memory (`ENOMEM`), the
+    /// launcher is what failed, and bwrap never ran: `NotHanded`. Any other
+    /// error (bwrap not found, not permitted, not a program this kernel
+    /// runs) is bubblewrap's side: `Failed`. Only the words differ: the
+    /// jail runs without the filter either way.
+    #[cfg(unix)]
+    pub fn spawn_failed_answer(error: &std::io::Error) -> ProbeAnswer {
+        match error.raw_os_error() {
+            Some(libc::EMFILE | libc::ENFILE | libc::EAGAIN | libc::ENOMEM) => {
+                ProbeAnswer::NotHanded
+            }
+            _ => ProbeAnswer::Failed,
+        }
+    }
+
+    /// What the launcher reads of the host before it plans the filter.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct FilterHost {
+        /// This build has the call numbers of the architecture it runs as.
+        pub built: bool,
+        /// The order the kernel runs the filter and a tracer in
+        /// ([`tracer_order`]).
+        pub tracer: TracerOrder,
+    }
+
+    /// The filter a launch hands bwrap, and the lines it says about it.
     #[derive(Debug, Clone, PartialEq, Eq)]
-    pub enum DryRunUserns {
+    pub struct FilterPlan {
+        /// `None`: the jail runs without a filter.
+        pub filter: Option<innerwarden_agent_guard::seccomp::Rules>,
+        /// What the launch says (and its dry run shows as comments), in
+        /// order: the user namespace line, then the terminal one.
+        pub said: Vec<String>,
+    }
+
+    impl FilterPlan {
+        /// The record may say the jail's user namespaces are closed: only
+        /// under the identified filter.
+        pub fn close_userns(&self) -> bool {
+            self.filter == Some(innerwarden_agent_guard::seccomp::Rules::Identified)
+        }
+    }
+
+    /// PURE. The filter of a launch, from the host's facts and a throwaway
+    /// jail under a filter (`probe`, which starts a process, so it is asked
+    /// only where its answer decides something).
+    ///
+    /// * No numbers for this architecture: no filter, and no probe.
+    /// * `--identity`: the identified filter, where the kernel is
+    ///   [`TRACER_SAFE_KERNEL`] or later and its probe passed. Otherwise the
+    ///   user namespace line, and the terminal filter as below.
+    /// * The terminal filter where its probe passed (said to be weaker on a
+    ///   kernel before 4.8), no filter otherwise, and the line that says it.
+    /// * A probe whose filter could not be handed in, or whose bwrap the
+    ///   launcher had not the means to start, ran no bwrap: its lines name
+    ///   the launcher (`NotHanded`), never bubblewrap.
+    pub fn filter_plan(
+        identity: bool,
+        host: FilterHost,
+        mut probe: impl FnMut(innerwarden_agent_guard::seccomp::Rules) -> ProbeAnswer,
+    ) -> FilterPlan {
+        use innerwarden_agent_guard::seccomp::Rules;
+        let mut said = Vec::new();
+        if identity {
+            let why = if !host.built {
+                UsernsWhy::NotBuilt
+            } else if host.tracer == TracerOrder::Before {
+                UsernsWhy::KernelTooOld
+            } else if host.tracer == TracerOrder::Unknown {
+                UsernsWhy::KernelUnknown
+            } else {
+                match probe(Rules::Identified) {
+                    ProbeAnswer::Ran => {
+                        return FilterPlan {
+                            filter: Some(Rules::Identified),
+                            said,
+                        }
+                    }
+                    ProbeAnswer::Failed => UsernsWhy::ProbeFailed,
+                    ProbeAnswer::NotHanded => UsernsWhy::NotHanded,
+                }
+            };
+            said.push(userns_open_sentence(why));
+        }
+        let filter = if !host.built {
+            said.push(filter_sentence(FilterWhy::NotBuilt));
+            None
+        } else {
+            match probe(Rules::Terminal) {
+                ProbeAnswer::Ran => {
+                    match host.tracer {
+                        TracerOrder::After => {}
+                        TracerOrder::Before => said.push(filter_sentence(FilterWhy::KernelTooOld)),
+                        TracerOrder::Unknown => {
+                            said.push(filter_sentence(FilterWhy::KernelUnknown))
+                        }
+                    }
+                    Some(Rules::Terminal)
+                }
+                ProbeAnswer::Failed => {
+                    said.push(filter_sentence(FilterWhy::ProbeFailed));
+                    None
+                }
+                ProbeAnswer::NotHanded => {
+                    said.push(filter_sentence(FilterWhy::NotHanded));
+                    None
+                }
+            }
+        };
+        FilterPlan { filter, said }
+    }
+
+    /// The lines a launch says when the filter it planned could not be
+    /// handed in after all (its pipe could not be made): the jail then runs
+    /// without one. The cause is the launcher's, not bubblewrap's: the host
+    /// had just started a jail under that filter.
+    pub fn filter_lost_sentences(planned: innerwarden_agent_guard::seccomp::Rules) -> Vec<String> {
+        let mut said = Vec::new();
+        if planned == innerwarden_agent_guard::seccomp::Rules::Identified {
+            said.push(userns_open_sentence(UsernsWhy::NotHanded));
+        }
+        said.push(filter_sentence(FilterWhy::NotHanded));
+        said
+    }
+
+    /// What a dry run says about the jail's filter.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum DryRunFilter {
         /// The host restricts unprivileged user namespaces and bwrap has no
         /// profile that grants it one ([`super::userns_restriction_advice`]):
-        /// the real run stops there with this advice, so the dry run says it.
-        /// The probe, which could only fail for that same reason, is not run.
-        Advice(Vec<String>),
+        /// the real run stops there with this advice, so an identified dry
+        /// run says it and a plain one says nothing. The probe, which could
+        /// only fail for that same reason, is not run.
+        Restricted(Vec<String>),
         /// What the real run would do.
-        Fact(UsernsFact),
+        Plan(FilterPlan),
     }
 
-    impl DryRunUserns {
-        pub fn close_userns(&self) -> bool {
-            matches!(self, DryRunUserns::Fact(UsernsFact::Closed))
+    impl DryRunFilter {
+        /// The filter the dry run shows in the argument list.
+        pub fn filter(&self) -> Option<innerwarden_agent_guard::seccomp::Rules> {
+            match self {
+                DryRunFilter::Restricted(_) => None,
+                DryRunFilter::Plan(plan) => plan.filter,
+            }
         }
 
-        /// The comment lines the dry run prints, none when the option is used.
-        pub fn lines(&self) -> Vec<String> {
+        /// The comment lines the dry run prints, none when the filter it
+        /// would use is the one asked for, on a kernel that keeps it whole.
+        pub fn lines(&self, identity: bool) -> Vec<String> {
             match self {
-                DryRunUserns::Advice(lines) => lines
+                DryRunFilter::Restricted(lines) if identity => lines
                     .iter()
                     .map(|line| format!("# {line}").trim_end().to_string())
                     .collect(),
-                DryRunUserns::Fact(UsernsFact::Open(why)) => {
-                    vec![format!("# {}", userns_open_sentence(*why))]
+                DryRunFilter::Restricted(_) => Vec::new(),
+                DryRunFilter::Plan(plan) => {
+                    plan.said.iter().map(|line| format!("# {line}")).collect()
                 }
-                DryRunUserns::Fact(_) => Vec::new(),
             }
         }
     }
 
-    /// PURE. The restriction's advice first: where it applies, the dry run says
-    /// that and never starts the probe, whose failure would name a cause that
-    /// is not the one. Otherwise what the probe and the bwrap facts decide.
-    pub fn dry_run_userns(
+    /// PURE. The restriction's advice first: where it applies, the dry run
+    /// says that (or, without `--identity`, nothing) and never starts the
+    /// probe, whose failure would name a cause that is not the one.
+    /// Otherwise what the plan decides.
+    pub fn dry_run_filter(
         advice: Option<Vec<String>>,
-        fact: impl FnOnce() -> UsernsFact,
-    ) -> DryRunUserns {
+        plan: impl FnOnce() -> FilterPlan,
+    ) -> DryRunFilter {
         match advice {
-            Some(lines) => DryRunUserns::Advice(lines),
-            None => DryRunUserns::Fact(fact()),
+            Some(lines) => DryRunFilter::Restricted(lines),
+            None => DryRunFilter::Plan(plan()),
         }
-    }
-
-    /// The version in `bwrap --version`, whose output is `bubblewrap 0.9.0`.
-    /// A suffix after the patch number (`0.8.0-rc1`) is ignored.
-    pub fn parse_bwrap_version(text: &str) -> Option<(u32, u32, u32)> {
-        let rest = text.lines().next()?.trim().strip_prefix("bubblewrap ")?;
-        let mut parts = rest.split_whitespace().next()?.split('.');
-        let number = |part: &str| -> Option<u32> {
-            let digits: String = part.chars().take_while(char::is_ascii_digit).collect();
-            if digits.is_empty() || digits.len() > 6 {
-                return None;
-            }
-            digits.parse().ok()
-        };
-        let whole = |part: &str| -> Option<u32> {
-            part.bytes()
-                .all(|b| b.is_ascii_digit())
-                .then(|| number(part))?
-        };
-        let major = whole(parts.next()?)?;
-        let minor = whole(parts.next()?)?;
-        let patch = parts.next().map_or(Some(0), number)?;
-        Some((major, minor, patch))
     }
 
     /// The arguments of the throwaway jail that tells whether the host takes
-    /// the option: the namespaces the real jail unshares, the option, the
-    /// host's root read-only, and a command that does nothing.
-    pub fn userns_probe_argv() -> Vec<String> {
-        let mut argv: Vec<String> = super::USERNS_CLOSED.iter().map(|s| s.to_string()).collect();
+    /// the filter on descriptor `fd`: the filter, the namespaces the real
+    /// jail unshares, for an identified launch the capabilities it drops,
+    /// the host's root read-only, and a command that does nothing (run under
+    /// the filter, so a filter that kills its first call fails the probe).
+    pub fn filter_probe_argv(fd: i32, identity: bool) -> Vec<String> {
+        let mut argv = vec![super::SECCOMP_OPTION.to_string(), fd.to_string()];
         argv.extend(super::JAIL_NAMESPACES.iter().map(|s| s.to_string()));
+        if identity {
+            argv.extend(super::CAP_DROP_ALL.iter().map(|s| s.to_string()));
+        }
         argv.extend(["--ro-bind", "/", "/", "true"].map(String::from));
         argv
     }
@@ -1543,6 +2086,16 @@ pub mod launch {
         }
     }
 
+    /// PURE. The parent pid in a `/proc/<pid>/stat` line: the field after
+    /// the state, read after the last `)` (the command name may hold any
+    /// byte, a `)` included).
+    pub fn parse_parent_pid(stat: &str) -> Option<u32> {
+        let (_, rest) = stat.rsplit_once(')')?;
+        let mut fields = rest.split_whitespace();
+        fields.next()?;
+        fields.next()?.parse().ok()
+    }
+
     /// The cgroup in `/proc/<pid>/cgroup`: the unified line `0::<path>`, or on
     /// a hybrid host systemd's own `name=systemd` line. `None` for anything
     /// else, including a path that is not absolute.
@@ -1576,6 +2129,289 @@ pub mod launch {
             unit: unit.to_string(),
             cgroup_path: cgroup.to_string(),
         })
+    }
+
+    /// What the launcher says, and exits 2 on, when a profile starts the
+    /// jail only once the host has admitted it and the host has not.
+    pub const NOT_ADMITTED: &str = "Active Defence on this host did not admit this jail, and \
+         its profile starts it only when admitted.";
+
+    /// PURE. Whether Active Defence on this host admitted the jail: its
+    /// answer, as the launcher believed it (no answer, or one not held to
+    /// the host's key, is [`SystemScopeAdmission::NONE`]), says so, and the
+    /// kernel shows the jail in its system scope. The answer alone is a
+    /// claim; the scope is the fact the admission was made over.
+    ///
+    /// [`SystemScopeAdmission::NONE`]: innerwarden_agent_guard::identity::SystemScopeAdmission::NONE
+    pub fn admitted_here(
+        answer: &innerwarden_agent_guard::identity::SystemScopeAdmission,
+        system_scope: Option<&Scope>,
+    ) -> bool {
+        answer.admitted && system_scope.is_some()
+    }
+
+    /// PURE. Whether the launcher hands the jail its record and lets the
+    /// command start: always, unless the profile starts the jail only when
+    /// admitted ([`JailStart::OnlyWhenAdmitted`]); then only when
+    /// `admitted` ([`admitted_here`]). A jail it does not start is ended
+    /// before the command runs, and the launcher exits 2 ([`NOT_ADMITTED`]).
+    ///
+    /// [`JailStart::OnlyWhenAdmitted`]: innerwarden_agent_guard::profiles::JailStart::OnlyWhenAdmitted
+    pub fn starts(start: innerwarden_agent_guard::profiles::JailStart, admitted: bool) -> bool {
+        use innerwarden_agent_guard::profiles::JailStart;
+        match start {
+            JailStart::Always => true,
+            JailStart::OnlyWhenAdmitted => admitted,
+        }
+    }
+
+    /// PURE. Whether the launcher hands the jail its record and lets its
+    /// command start, from what it learned of the jail: for a record it
+    /// made, the host's answer and the system scope the kernel showed;
+    /// `None` when no record was made ([`starts`] of [`admitted_here`]).
+    pub fn launch_starts(
+        start: innerwarden_agent_guard::profiles::JailStart,
+        made: Option<(
+            &innerwarden_agent_guard::identity::SystemScopeAdmission,
+            Option<&Scope>,
+        )>,
+    ) -> bool {
+        starts(
+            start,
+            made.is_some_and(|(answer, scope)| admitted_here(answer, scope)),
+        )
+    }
+
+    /// PURE. What the launcher reads of the answer to its request for a
+    /// system scope held to the host's key: whether the host took it (and,
+    /// when not, why, in words a person can act on), and the admission a
+    /// `202` says. Any other answer admits nothing.
+    pub fn scope_answer(
+        result: Result<(u16, Vec<u8>), crate::host_decide_io::NoAnswer>,
+    ) -> (
+        Result<(), String>,
+        innerwarden_agent_guard::identity::SystemScopeAdmission,
+    ) {
+        use innerwarden_agent_guard::identity::{SystemScopeAdmission, SYSTEM_SCOPE_TAKEN};
+        match result {
+            Ok((SYSTEM_SCOPE_TAKEN, answer)) => (Ok(()), SystemScopeAdmission::read(&answer)),
+            Ok((status, _)) if (200..300).contains(&status) => (Ok(()), SystemScopeAdmission::NONE),
+            Ok((status, _)) => (Err(format!("HTTP {status}")), SystemScopeAdmission::NONE),
+            Err(why) => (Err(why.to_string()), SystemScopeAdmission::NONE),
+        }
+    }
+
+    /// Why the launcher could not believe what the host answered about the
+    /// jail ([`answer_unbelieved`]).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum Unbelieved {
+        /// It holds no key of Active Defence on this host.
+        NoKey,
+        /// The local agent's address (`url`) is not one a connection is held
+        /// to the host's key over.
+        Address(String),
+    }
+
+    /// PURE. Why the launcher could not believe the host's answer to its
+    /// request for a system scope, or `None` when it could: it holds the
+    /// host's key (`key_held`) and the local agent's address (`url`, `None`
+    /// when the route is off and nothing was asked) is one a connection is
+    /// held to it over. Without both, the answer's body is never read and
+    /// nothing is admitted.
+    pub fn answer_unbelieved(key_held: bool, url: Option<&str>) -> Option<Unbelieved> {
+        let url = url?;
+        if !key_held {
+            return Some(Unbelieved::NoKey);
+        }
+        (!crate::host_decide_io::pinnable(url)).then(|| Unbelieved::Address(url.to_string()))
+    }
+
+    /// PURE. The line the launcher says, before [`NOT_ADMITTED`], when it
+    /// could not believe the host's answer.
+    pub fn unbelieved_sentence(why: &Unbelieved) -> String {
+        match why {
+            Unbelieved::NoKey => format!(
+                "the host's answer about this jail cannot be believed without its key, and this \
+                 launcher holds none ({} is not there, or not root's in folders only root can \
+                 write)",
+                innerwarden_agent_guard::identity::AGENT_TLS_SPKI_PATH
+            ),
+            Unbelieved::Address(url) => format!(
+                "the host's answer about this jail cannot be believed: it is held to the host's \
+                 key only at https://127.0.0.1, and the local agent's address is {url}"
+            ),
+        }
+    }
+
+    /// PURE. What the launcher says after [`NOT_ADMITTED`]: what to check,
+    /// and which file makes the jail wait for the host (`files`, by path;
+    /// both places when it could not tell). `unbelieved`: the launcher
+    /// could not believe the host's answer ([`answer_unbelieved`]), so
+    /// what to check is its key or the agent's address, not whether Active
+    /// Defence runs.
+    pub fn not_admitted_remedy(files: &[String], unbelieved: Option<&Unbelieved>) -> String {
+        let place = if files.is_empty() {
+            format!(
+                "{} or ~/{}",
+                innerwarden_agent_guard::profiles::SYSTEM_PROFILES_PATH,
+                innerwarden_agent_guard::profiles::USER_PROFILES_PATH
+            )
+        } else {
+            files.join(" and ")
+        };
+        let check = match unbelieved {
+            None => "Check that Active Defence is running (systemctl status innerwarden-agent)"
+                .to_string(),
+            Some(Unbelieved::NoKey) => format!(
+                "Check that Active Defence on this host publishes its key at {}, root's, in \
+                 folders only root can write (an older Active Defence does not)",
+                innerwarden_agent_guard::identity::AGENT_TLS_SPKI_PATH
+            ),
+            Some(Unbelieved::Address(_)) => format!(
+                "Unset {}, or point it at https://127.0.0.1",
+                crate::agent_report::AGENT_URL_VAR
+            ),
+        };
+        format!(
+            "{check}, then try again. The jail waits for it because of start = \
+             \"only_when_admitted\" in {place}."
+        )
+    }
+
+    /// The verb the jail's command starts through under a profile that
+    /// starts the jail only once the host admitted it ([`gated_child`]).
+    pub const GATE_VERB: &str = "contain-gate";
+
+    /// What the gate says, and exits 2 on, when the jail holds no record of
+    /// its admission.
+    pub const GATE_REFUSED: &str = "this jail holds no record that the host admitted it, so \
+         its command does not start.";
+
+    /// PURE. The instance whose record the jail must hold before its command
+    /// starts: only under a profile that starts the jail once the host
+    /// admitted it ([`JailStart::OnlyWhenAdmitted`]).
+    ///
+    /// [`JailStart::OnlyWhenAdmitted`]: innerwarden_agent_guard::profiles::JailStart::OnlyWhenAdmitted
+    pub fn gate_for(
+        start: innerwarden_agent_guard::profiles::JailStart,
+        instance_id: &str,
+    ) -> Option<String> {
+        (start == innerwarden_agent_guard::profiles::JailStart::OnlyWhenAdmitted)
+            .then(|| instance_id.to_string())
+    }
+
+    /// PURE. The jail's command line through the gate: the launcher's own
+    /// binary, bound read-only in the jail, starts the command only when
+    /// the jail holds a record naming this instance ([`gate_opens`]). The
+    /// launcher hands the record in only after the host admitted the jail,
+    /// so a launcher that ends the jail, or dies (killed, Ctrl-C, the OOM
+    /// killer) before the host answered, leaves an empty record, and the
+    /// command never starts.
+    pub fn gated_child(iw_binary: &Path, instance_id: &str, child: &[String]) -> Vec<String> {
+        let mut argv = vec![
+            iw_binary.to_string_lossy().into_owned(),
+            GATE_VERB.to_string(),
+            "--instance".to_string(),
+            instance_id.to_string(),
+            "--".to_string(),
+        ];
+        argv.extend(child.iter().cloned());
+        argv
+    }
+
+    /// PURE. The gate's arguments, `--instance <id> -- <command...>`: the
+    /// instance and the command, or `None` for anything else.
+    pub fn parse_gate_args(args: &[String]) -> Option<(&str, &[String])> {
+        match args {
+            [flag, instance, end, command @ ..]
+                if flag == "--instance" && end == "--" && !instance.is_empty() =>
+            {
+                (!command.is_empty()).then_some((instance.as_str(), command))
+            }
+            _ => None,
+        }
+    }
+
+    /// PURE. Whether the gate starts the command: the record the jail holds
+    /// reads as a launch record of this build and names `instance_id`. An
+    /// empty record is the launcher's word that the host did not admit the
+    /// jail, or that the launcher is gone.
+    pub fn gate_opens(record: &[u8], instance_id: &str) -> bool {
+        innerwarden_agent_guard::identity::parse_launch_record(record)
+            .is_ok_and(|record| record.instance_id == instance_id)
+    }
+
+    /// PURE. The processes to end with a jail whose command must not run,
+    /// in order: the jail's first process as bwrap reported it
+    /// (`reported`), then those `/proc` lists as bwrap's (`listed`), each
+    /// once and only while its parent is still `bwrap`. The reported one
+    /// does not depend on the kernel listing children
+    /// (`CONFIG_PROC_CHILDREN`), which a kernel built without
+    /// `CHECKPOINT_RESTORE` does not.
+    pub fn jail_processes_to_end(
+        bwrap: u32,
+        reported: Option<u32>,
+        listed: &[u32],
+        parent_of: impl Fn(u32) -> Option<u32>,
+    ) -> Vec<u32> {
+        let mut out = Vec::new();
+        for pid in reported.into_iter().chain(listed.iter().copied()) {
+            if !out.contains(&pid) && parent_of(pid) == Some(bwrap) {
+                out.push(pid);
+            }
+        }
+        out
+    }
+
+    /// PURE. The file `/etc/resolv.conf` names when it is a link into
+    /// `/run` (`link` is what the link holds, as `readlink` reads it): the
+    /// path it names, made absolute against `/etc` with its `.` and `..`
+    /// steps worked out, when that is below `/run`. `None` for any other
+    /// target: the jail's `/run` is empty, and only a file there would be
+    /// lost.
+    pub fn resolv_conf_target(link: &Path) -> Option<PathBuf> {
+        use std::path::Component;
+        let mut out = PathBuf::from("/");
+        let joined = Path::new("/etc").join(link);
+        for component in joined.components() {
+            match component {
+                Component::RootDir | Component::CurDir => {}
+                Component::ParentDir => {
+                    out.pop();
+                }
+                Component::Normal(name) => out.push(name),
+                Component::Prefix(_) => return None,
+            }
+        }
+        (out.starts_with("/run") && out != Path::new("/run")).then_some(out)
+    }
+
+    /// The folders under `/run` that hold a resolver file and nothing but
+    /// resolver data: bound whole, so a file the resolver writes anew (by
+    /// rename, as resolvconf does) reaches a running jail. Bound only while
+    /// they hold no socket ([`resolv_conf_bind`]).
+    pub const RESOLVER_ONLY_FOLDERS: &[&str] = &["/run/resolvconf"];
+
+    /// PURE. What the jail binds read-only for the resolver file `target`
+    /// ([`resolv_conf_target`]): its folder, where that is one of
+    /// [`RESOLVER_ONLY_FOLDERS`] and `holds_sockets` says it holds no socket,
+    /// so the jail follows the host's file when it is replaced; otherwise the
+    /// file alone. A file bind keeps the file the jail started with: a
+    /// resolver that replaces it (systemd-resolved, NetworkManager, whose
+    /// folders hold sockets or connection files the jail must not see)
+    /// leaves the jail with the names it had until the agent is restarted.
+    pub fn resolv_conf_bind(target: &Path, holds_sockets: impl Fn(&Path) -> bool) -> PathBuf {
+        match target.parent() {
+            Some(folder)
+                if RESOLVER_ONLY_FOLDERS
+                    .iter()
+                    .any(|only| folder == Path::new(only))
+                    && !holds_sockets(folder) =>
+            {
+                folder.to_path_buf()
+            }
+            _ => target.to_path_buf(),
+        }
     }
 
     /// What bwrap reports through `--info-fd`. Fields it adds later are ignored.
@@ -2130,6 +2966,8 @@ mod tests {
             extra_ro: vec![],
             deny_read: DEFAULT_DENY_READ.iter().map(|s| s.to_string()).collect(),
             identity: false,
+            start: innerwarden_agent_guard::profiles::JailStart::Always,
+            hide_home: vec![],
         }
     }
 
@@ -2171,12 +3009,21 @@ mod tests {
             records_dirs: vec![],
             child_env: vec![],
             close_userns: false,
+            // A plain jail on a host that takes the terminal filter.
+            seccomp_fd: Some(launch::DRY_RUN_SECCOMP_FD),
+            hide_paths: vec![],
+            hide_denies: vec![],
+            // A host whose `/etc/resolv.conf` is a file of its own.
+            resolv_conf: None,
+            gate_instance: None,
         }
     }
 
     /// The whole bwrap argument vector of today's jail, one token per line.
     /// Written before the identity flag existed: a jail launched without the
-    /// flag must stay byte for byte this.
+    /// flag must stay byte for byte this. One change since, on purpose: the
+    /// terminal filter every jail starts under (`--seccomp`), pinned by
+    /// [`the_plain_jail_moved_only_by_its_terminal_filter`].
     #[test]
     fn golden_argv_of_the_jail_without_any_identity_flag() {
         let plan = build_linux_jail(&inputs(&["claude", "--print"])).unwrap();
@@ -2655,6 +3502,21 @@ mod tests {
         assert_eq!(parse_start_ticks(""), None);
     }
 
+    /// The parent is read after the last `)`, so a command name that holds
+    /// one cannot name another parent: the launcher signals only a process
+    /// whose parent is its own bwrap.
+    #[test]
+    fn the_parent_pid_is_read_after_the_last_parenthesis() {
+        use launch::parse_parent_pid;
+        for comm in ["bwrap", "b) S 1 (x", ") R 4242", "("] {
+            let stat = format!("2779 ({comm}) S 2778 2779 2779 0 -1");
+            assert_eq!(parse_parent_pid(&stat), Some(2778), "comm {comm:?}");
+        }
+        assert_eq!(parse_parent_pid("2779 (bwrap) S"), None);
+        assert_eq!(parse_parent_pid("2779 (bwrap) S x"), None);
+        assert_eq!(parse_parent_pid("no parenthesis"), None);
+    }
+
     #[test]
     fn pid_namespace_link_is_parsed_strictly() {
         use launch::parse_ns_link;
@@ -2921,143 +3783,475 @@ mod tests {
         ));
     }
 
-    // ---- `--identity`: user namespaces closed inside the jail ----
+    // ---- the seccomp filter: user namespaces and the terminal ----
 
-    #[test]
-    fn bwrap_versions_are_read_from_the_first_line() {
-        use launch::parse_bwrap_version as parse;
-        assert_eq!(parse("bubblewrap 0.6.3\n"), Some((0, 6, 3)));
-        assert_eq!(parse("bubblewrap 0.8.0\n"), Some((0, 8, 0)));
-        assert_eq!(parse("bubblewrap 0.9.0"), Some((0, 9, 0)));
-        assert_eq!(parse("bubblewrap 0.11.2\nsecond line\n"), Some((0, 11, 2)));
-        assert_eq!(parse("bubblewrap 0.8.0-rc1"), Some((0, 8, 0)));
-        assert_eq!(parse("bubblewrap 0.8"), Some((0, 8, 0)));
-        for junk in [
-            "",
-            "\n",
-            "bubblewrap",
-            "bubblewrap ",
-            "bubblewrap x.y.z",
-            "bubblewrap 0.x.1",
-            "bubblewrap 1234567.0.0",
-            "systemd 255 (255.4)",
-            "0.9.0",
-            "\u{fffd}\u{fffd}",
-        ] {
-            assert_eq!(parse(junk), None, "{junk:?}");
-        }
-    }
+    /// A host that has every fact the identified filter needs.
+    const WHOLE_HOST: launch::FilterHost = launch::FilterHost {
+        built: true,
+        tracer: launch::TracerOrder::After,
+    };
 
-    fn bwrap_facts(version: Option<(u32, u32, u32)>, setuid: bool) -> launch::BwrapFacts {
-        launch::BwrapFacts { version, setuid }
-    }
-
-    /// `close_userns` needs `--identity`, a bwrap at 0.8.0 or later, a bwrap
-    /// that is not setuid, and a start-up probe that exited 0. The probe is
-    /// asked last, and only when every fact before it holds.
-    ///
-    /// FAILS ON REVERT: drop the version, the setuid or the probe check from
-    /// `userns_decision`, or let it answer without `--identity`.
-    #[test]
-    fn user_namespaces_close_only_when_every_fact_allows_it() {
-        use launch::{userns_decision, UsernsFact, UsernsWhy};
-        let asked = std::cell::Cell::new(0);
-        let probe = |ok: bool| {
-            let asked = &asked;
-            move || {
-                asked.set(asked.get() + 1);
-                ok
+    /// The probes a plan asked, in order, answering from `takes`.
+    fn plan_with(
+        identity: bool,
+        host: launch::FilterHost,
+        takes: &[innerwarden_agent_guard::seccomp::Rules],
+    ) -> (
+        launch::FilterPlan,
+        Vec<innerwarden_agent_guard::seccomp::Rules>,
+    ) {
+        let mut asked = Vec::new();
+        let plan = launch::filter_plan(identity, host, |rules| {
+            asked.push(rules);
+            if takes.contains(&rules) {
+                launch::ProbeAnswer::Ran
+            } else {
+                launch::ProbeAnswer::Failed
             }
-        };
-        let good = bwrap_facts(Some((0, 9, 0)), false);
-        assert_eq!(
-            userns_decision(true, &good, probe(true)),
-            UsernsFact::Closed
-        );
-        assert!(UsernsFact::Closed.close_userns());
-        assert_eq!(asked.get(), 1);
-        assert_eq!(
-            userns_decision(true, &bwrap_facts(Some((0, 8, 0)), false), probe(true)),
-            UsernsFact::Closed,
-            "0.8.0 is the first with the option"
-        );
-        asked.set(0);
-        for (facts, why) in [
-            (bwrap_facts(Some((0, 6, 3)), false), UsernsWhy::BwrapTooOld),
-            (bwrap_facts(Some((0, 7, 9)), false), UsernsWhy::BwrapTooOld),
-            (bwrap_facts(None, false), UsernsWhy::BwrapTooOld),
-            (bwrap_facts(Some((0, 9, 0)), true), UsernsWhy::BwrapSetuid),
-            (bwrap_facts(Some((0, 6, 3)), true), UsernsWhy::BwrapTooOld),
-        ] {
-            let fact = userns_decision(true, &facts, probe(true));
-            assert_eq!(fact, UsernsFact::Open(why), "{facts:?}");
-            assert!(!fact.close_userns());
-        }
-        assert_eq!(asked.get(), 0, "no probe runs when a fact already says no");
-        let failed = userns_decision(true, &good, probe(false));
-        assert_eq!(failed, UsernsFact::Open(UsernsWhy::ProbeFailed));
-        assert!(!failed.close_userns());
-        assert_eq!(asked.get(), 1);
-        // No `--identity`: nothing asked, nothing probed, whatever bwrap is.
-        asked.set(0);
-        assert_eq!(
-            userns_decision(false, &good, probe(true)),
-            UsernsFact::NotAsked
-        );
-        assert!(!UsernsFact::NotAsked.close_userns());
-        assert_eq!(asked.get(), 0);
+        });
+        (plan, asked)
     }
 
-    /// The three sentences the launcher, the dry run and the dashboard say,
-    /// word for word, and the dashboard's copy of them.
+    /// The identified filter, and with it `close_userns`, needs
+    /// `--identity`, a build for this architecture, a kernel that runs the
+    /// filter after a tracer, and a throwaway jail under it that exited 0.
+    /// No version or mode of the bwrap file is read: every bwrap takes a
+    /// filter on a descriptor, a setuid one included. A plain launch never
+    /// probes the identified filter.
+    ///
+    /// FAILS ON REVERT: let the plan answer without the probe, use the
+    /// identified filter on a kernel before 4.8, or probe it without
+    /// `--identity`.
     #[test]
-    fn the_userns_words_are_the_closed_table_and_the_dashboard_has_them() {
-        use launch::{userns_open_sentence, UsernsWhy};
-        let table = [
-            (
-                UsernsWhy::BwrapTooOld,
-                "bwrap_too_old",
-                "Bubblewrap here is older than 0.8, so programs in the jail can still make user namespaces.",
-            ),
-            (
-                UsernsWhy::BwrapSetuid,
-                "bwrap_setuid",
-                "Bubblewrap here runs setuid, so user namespaces stay open in the jail.",
-            ),
-            (
-                UsernsWhy::ProbeFailed,
-                "userns_probe_failed",
-                "Bubblewrap here could not start a jail with user namespaces closed, so the jail runs without that.",
-            ),
+    fn user_namespaces_close_only_with_identity_a_safe_kernel_and_a_probe_that_passed() {
+        use innerwarden_agent_guard::seccomp::Rules::{Identified, Terminal};
+        let (plan, asked) = plan_with(true, WHOLE_HOST, &[Identified, Terminal]);
+        assert_eq!(plan.filter, Some(Identified));
+        assert!(plan.close_userns());
+        assert!(plan.said.is_empty(), "{:?}", plan.said);
+        assert_eq!(asked, [Identified]);
+
+        let (plain, asked) = plan_with(false, WHOLE_HOST, &[Identified, Terminal]);
+        assert_eq!(plain.filter, Some(Terminal));
+        assert!(!plain.close_userns());
+        assert!(plain.said.is_empty());
+        assert_eq!(asked, [Terminal], "no identified probe without --identity");
+
+        let old_kernel = launch::FilterHost {
+            built: true,
+            tracer: launch::TracerOrder::Before,
+        };
+        let (old, asked) = plan_with(true, old_kernel, &[Identified, Terminal]);
+        assert_eq!(old.filter, Some(Terminal));
+        assert!(!old.close_userns());
+        assert_eq!(asked, [Terminal], "the identified probe is never asked");
+    }
+
+    /// An identified launch whose host does not take the identified filter
+    /// keeps the keystroke rule where the host takes the terminal one, and
+    /// says each thing it runs without: the user namespace line, then the
+    /// keystroke line when no filter is left. A plain launch says only its
+    /// own line. A build with no filter for its architecture probes nothing
+    /// and says that, not that bubblewrap failed.
+    ///
+    /// FAILS ON REVERT: run an identified jail with no filter where the
+    /// terminal one is taken, drop the keystroke line from an identified
+    /// launch, or blame bubblewrap for a build with no numbers.
+    #[test]
+    fn a_launch_says_each_thing_its_jail_runs_without() {
+        use innerwarden_agent_guard::seccomp::Rules::{Identified, Terminal};
+        use launch::{
+            filter_sentence, userns_open_sentence, FilterHost, FilterWhy, TracerOrder, UsernsWhy,
+        };
+
+        let (fallback, asked) = plan_with(true, WHOLE_HOST, &[Terminal]);
+        assert_eq!(fallback.filter, Some(Terminal));
+        assert!(!fallback.close_userns());
+        assert_eq!(asked, [Identified, Terminal]);
+        assert_eq!(
+            fallback.said,
+            [userns_open_sentence(UsernsWhy::ProbeFailed)]
+        );
+
+        let (none, _) = plan_with(true, WHOLE_HOST, &[]);
+        assert_eq!(none.filter, None);
+        assert_eq!(
+            none.said,
+            [
+                userns_open_sentence(UsernsWhy::ProbeFailed),
+                filter_sentence(FilterWhy::ProbeFailed)
+            ]
+        );
+        let (plain_none, _) = plan_with(false, WHOLE_HOST, &[]);
+        assert_eq!(plain_none.filter, None);
+        assert_eq!(plain_none.said, [filter_sentence(FilterWhy::ProbeFailed)]);
+
+        let old_kernel = FilterHost {
+            built: true,
+            tracer: TracerOrder::Before,
+        };
+        let (old, _) = plan_with(true, old_kernel, &[Identified, Terminal]);
+        assert_eq!(
+            old.said,
+            [
+                userns_open_sentence(UsernsWhy::KernelTooOld),
+                filter_sentence(FilterWhy::KernelTooOld)
+            ]
+        );
+        let (old_plain, _) = plan_with(false, old_kernel, &[Terminal]);
+        assert_eq!(old_plain.filter, Some(Terminal));
+        assert_eq!(old_plain.said, [filter_sentence(FilterWhy::KernelTooOld)]);
+
+        let unbuilt = FilterHost {
+            built: false,
+            tracer: TracerOrder::After,
+        };
+        for identity in [true, false] {
+            let (plan, asked) = plan_with(identity, unbuilt, &[Identified, Terminal]);
+            assert_eq!(plan.filter, None);
+            assert!(asked.is_empty(), "nothing to probe: {asked:?}");
+            let mut said = Vec::new();
+            if identity {
+                said.push(userns_open_sentence(UsernsWhy::NotBuilt));
+            }
+            said.push(filter_sentence(FilterWhy::NotBuilt));
+            assert_eq!(plan.said, said);
+            assert!(plan.said.iter().all(|l| !l.contains("Bubblewrap")));
+        }
+    }
+
+    /// Whoever turns a rule off says so. An identified launch that falls back
+    /// from the identified filter, for any cause, names everything that
+    /// filter adds to the plain one (`seccomp` holds that it adds nothing
+    /// else): user namespaces, joining other namespaces and the end of
+    /// 32-bit programs. A launch whose jail runs without the plain filter,
+    /// or with a weaker one, names both of its rules: keystrokes into the
+    /// terminal, and new btrfs or bcachefs subvolumes and snapshots.
+    ///
+    /// FAILS ON REVERT: drop [`launch::USERNS_OPEN_ALSO`] from the user
+    /// namespace line, or the subvolume words from any line of a jail that
+    /// runs without the plain filter.
+    #[test]
+    fn every_fallback_line_names_all_the_jail_runs_without() {
+        use innerwarden_agent_guard::seccomp::Rules;
+        use launch::{FilterHost, ProbeAnswer, TracerOrder};
+        let hosts = [
+            (true, TracerOrder::After),
+            (true, TracerOrder::Before),
+            (true, TracerOrder::Unknown),
+            (false, TracerOrder::After),
         ];
+        let answers = [
+            ProbeAnswer::Ran,
+            ProbeAnswer::Failed,
+            ProbeAnswer::NotHanded,
+        ];
+        let mut fallbacks = 0;
+        for (built, tracer) in hosts {
+            for identified in answers {
+                for terminal in answers {
+                    for identity in [true, false] {
+                        let plan =
+                            launch::filter_plan(identity, FilterHost { built, tracer }, |rules| {
+                                if rules == Rules::Identified {
+                                    identified
+                                } else {
+                                    terminal
+                                }
+                            });
+                        let mut said = plan.said.clone();
+                        if let Some(rules) = plan.filter {
+                            said.extend(launch::filter_lost_sentences(rules));
+                        }
+                        for line in &said {
+                            if line.contains("user namespaces stay open") {
+                                fallbacks += 1;
+                                assert!(identity, "{line}");
+                                for words in [
+                                    "Joining other namespaces stays open too",
+                                    "a 32-bit program runs in the jail",
+                                ] {
+                                    assert!(line.contains(words), "{words:?}: {line}");
+                                }
+                            } else {
+                                assert!(line.contains("sandbox filter ("), "{line}");
+                                for words in [
+                                    "inject keystrokes into your terminal",
+                                    "make new btrfs or bcachefs subvolumes or snapshots",
+                                    "a snapshot shows the files the jail hides",
+                                ] {
+                                    assert!(line.contains(words), "{words:?}: {line}");
+                                }
+                            }
+                        }
+                        if identity && plan.filter != Some(Rules::Identified) {
+                            assert!(
+                                plan.said
+                                    .iter()
+                                    .any(|l| l.contains("user namespaces stay open")),
+                                "{plan:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(fallbacks > 20, "{fallbacks}");
+    }
+
+    /// Two causes a launch names as what they are, not as another one. A
+    /// kernel release that does not read as a version is taken as older
+    /// than 4.8 (the terminal filter, said weaker; user namespaces left
+    /// open) and said as unknown, never as "older than 4.8". A planned
+    /// filter whose pipe could not be made, after bubblewrap had just
+    /// started a jail under it, is the launcher's failure, never
+    /// bubblewrap's: both losses for an identified one, the keystroke one
+    /// for the terminal one. So is the same pipe lost for the start-up
+    /// probe, which then started no bwrap.
+    ///
+    /// FAILS ON REVERT: take an unread release as an older kernel's words
+    /// (`userns_kernel_too_old`), or say `filter_probe_failed` for a lost
+    /// pipe, after the probe or for it.
+    #[test]
+    fn a_launch_names_an_unread_kernel_and_a_lost_pipe_as_what_they_are() {
+        use innerwarden_agent_guard::seccomp::Rules::{Identified, Terminal};
+        use launch::{
+            filter_sentence, userns_open_sentence, FilterHost, FilterWhy, TracerOrder, UsernsWhy,
+        };
+        let unknown = FilterHost {
+            built: true,
+            tracer: TracerOrder::Unknown,
+        };
+        let (plan, asked) = plan_with(true, unknown, &[Identified, Terminal]);
+        assert_eq!(plan.filter, Some(Terminal));
+        assert!(!plan.close_userns());
+        assert_eq!(asked, [Terminal], "the identified probe is never asked");
+        assert_eq!(
+            plan.said,
+            [
+                userns_open_sentence(UsernsWhy::KernelUnknown),
+                filter_sentence(FilterWhy::KernelUnknown)
+            ]
+        );
+        let (plain, _) = plan_with(false, unknown, &[Terminal]);
+        assert_eq!(plain.filter, Some(Terminal));
+        assert_eq!(plain.said, [filter_sentence(FilterWhy::KernelUnknown)]);
+        for line in plan.said.iter().chain(&plain.said) {
+            assert!(!line.contains("This kernel is older"), "{line}");
+            assert!(line.contains("_kernel_unknown)"), "{line}");
+        }
+
+        let lost = launch::filter_lost_sentences(Identified);
+        assert_eq!(
+            lost,
+            [
+                userns_open_sentence(UsernsWhy::NotHanded),
+                filter_sentence(FilterWhy::NotHanded)
+            ]
+        );
+        assert_eq!(
+            launch::filter_lost_sentences(Terminal),
+            [filter_sentence(FilterWhy::NotHanded)]
+        );
+        for line in &lost {
+            assert!(!line.contains("Bubblewrap here could not"), "{line}");
+            assert!(!line.contains("_probe_failed"), "{line}");
+            assert!(line.contains("The launcher could not hand"), "{line}");
+        }
+
+        // The same pipe lost for the start-up probe: no bwrap ran, so the
+        // probe answers `NotHanded`, and the lines are the launcher's.
+        for identity in [true, false] {
+            let mut asked = Vec::new();
+            let plan = launch::filter_plan(identity, WHOLE_HOST, |rules| {
+                asked.push(rules);
+                launch::ProbeAnswer::NotHanded
+            });
+            assert_eq!(plan.filter, None);
+            let mut said = Vec::new();
+            if identity {
+                said.push(userns_open_sentence(UsernsWhy::NotHanded));
+            }
+            said.push(filter_sentence(FilterWhy::NotHanded));
+            assert_eq!(plan.said, said, "identity {identity}");
+            let probes: &[_] = if identity {
+                &[Identified, Terminal]
+            } else {
+                &[Terminal]
+            };
+            assert_eq!(asked, probes);
+            for line in &plan.said {
+                assert!(!line.contains("Bubblewrap here could not"), "{line}");
+                assert!(!line.contains("_probe_failed"), "{line}");
+            }
+        }
+    }
+
+    /// A bwrap the launcher could not start for want of its own means (out
+    /// of descriptors, processes or memory) never ran, so the probe answers
+    /// as the launcher's failure; one that is not there, not permitted or
+    /// not a program is bubblewrap's side, as is an error with no number.
+    ///
+    /// FAILS ON REVERT: answer every failed start `Failed` (an `EMFILE`
+    /// start is then said as "Bubblewrap here could not start a jail"), or
+    /// every one `NotHanded` (a missing bwrap is said as the launcher's).
+    #[cfg(unix)]
+    #[test]
+    fn a_bwrap_the_launcher_could_not_start_is_said_as_the_launchers() {
+        use launch::{spawn_failed_answer, ProbeAnswer};
+        let answer = |errno| spawn_failed_answer(&std::io::Error::from_raw_os_error(errno));
+        for errno in [libc::EMFILE, libc::ENFILE, libc::EAGAIN, libc::ENOMEM] {
+            assert_eq!(answer(errno), ProbeAnswer::NotHanded, "errno {errno}");
+        }
+        for errno in [libc::ENOENT, libc::EACCES, libc::ENOEXEC, libc::ETXTBSY] {
+            assert_eq!(answer(errno), ProbeAnswer::Failed, "errno {errno}");
+        }
+        assert_eq!(
+            spawn_failed_answer(&std::io::Error::other("no number")),
+            ProbeAnswer::Failed
+        );
+    }
+
+    /// The kernel's release, as `uname -r` gives it: 4.8 or later runs the
+    /// filter after a tracer changed the call, an older one before it, and
+    /// a release that does not read as a version is unknown (taken as
+    /// older, said as unknown).
+    ///
+    /// FAILS ON REVERT: compare the major number alone (4.4 passes), take
+    /// a release that does not read as safe, or as an older kernel.
+    #[test]
+    fn a_kernel_from_4_8_runs_the_filter_after_a_tracer() {
+        use launch::{tracer_order, TracerOrder};
+        for release in [
+            "4.8.0",
+            "4.8",
+            "4.15.0-20-generic",
+            "5.4.0-42-generic\n",
+            "6.12.10-orbstack-00297-gf8f6e015b993",
+            "7.0.0-1011-azure",
+            "10.0.1",
+        ] {
+            assert_eq!(tracer_order(release), TracerOrder::After, "{release}");
+        }
+        for release in [
+            "4.7.10",
+            "4.4.0-210-generic",
+            "3.10.0-1160.el7.x86_64",
+            "2.6.32",
+        ] {
+            assert_eq!(tracer_order(release), TracerOrder::Before, "{release}");
+        }
+        for release in ["", "4", "v6.1", "6.x", "99999999.1", "-6.1", "\n"] {
+            assert_eq!(tracer_order(release), TracerOrder::Unknown, "{release:?}");
+        }
+    }
+
+    /// The sentences the launcher and the dry run say, word for word; the
+    /// dashboard's line for a jail that closed them names the filter, and no
+    /// word of the bwrap version or mode is left anywhere.
+    #[test]
+    fn the_filter_words_are_the_closed_table() {
+        use launch::{filter_sentence, userns_open_sentence, FilterWhy, UsernsWhy};
+        let why = UsernsWhy::ProbeFailed;
+        assert_eq!(why.word(), "userns_probe_failed");
+        assert_eq!(
+            why.sentence(),
+            "Bubblewrap here could not start a jail with user namespaces closed, so the jail runs without that."
+        );
+        assert_eq!(
+            userns_open_sentence(why),
+            "innerwarden contain: user namespaces stay open (userns_probe_failed): Bubblewrap here could not start a jail with user namespaces closed, so the jail runs without that. Joining other namespaces stays open too, and a 32-bit program runs in the jail."
+        );
+        assert_eq!(
+            userns_open_sentence(UsernsWhy::KernelTooOld),
+            "innerwarden contain: user namespaces stay open (userns_kernel_too_old): This kernel is older than 4.8, where a program that traces another could get a call past the filter, so the jail runs without closing them. Joining other namespaces stays open too, and a 32-bit program runs in the jail."
+        );
+        assert_eq!(
+            userns_open_sentence(UsernsWhy::NotBuilt),
+            "innerwarden contain: user namespaces stay open (userns_filter_not_built): This build has no sandbox filter for this architecture, so the jail runs without closing them. Joining other namespaces stays open too, and a 32-bit program runs in the jail."
+        );
+        assert_eq!(
+            userns_open_sentence(UsernsWhy::KernelUnknown),
+            "innerwarden contain: user namespaces stay open (userns_kernel_unknown): This kernel's release could not be read as a version (it is not one, or there is no /proc and a personality such as setarch --uname-2.6 hides it from uname), so it is taken as older than 4.8 and the jail runs without closing them. Joining other namespaces stays open too, and a 32-bit program runs in the jail."
+        );
+        assert_eq!(
+            userns_open_sentence(UsernsWhy::NotHanded),
+            "innerwarden contain: user namespaces stay open (userns_filter_not_handed): The launcher could not hand the sandbox filter to bubblewrap, so the jail runs without closing them. Joining other namespaces stays open too, and a 32-bit program runs in the jail."
+        );
+        assert_eq!(
+            filter_sentence(FilterWhy::ProbeFailed),
+            "innerwarden contain: no sandbox filter (filter_probe_failed): Bubblewrap here could not start a jail with the sandbox filter, so programs in the jail can still inject keystrokes into your terminal and make new btrfs or bcachefs subvolumes or snapshots (a snapshot shows the files the jail hides)."
+        );
+        assert_eq!(
+            filter_sentence(FilterWhy::NotBuilt),
+            "innerwarden contain: no sandbox filter (filter_not_built): This build has no sandbox filter for this architecture, so programs in the jail can still inject keystrokes into your terminal and make new btrfs or bcachefs subvolumes or snapshots (a snapshot shows the files the jail hides)."
+        );
+        assert_eq!(
+            filter_sentence(FilterWhy::KernelTooOld),
+            "innerwarden contain: a weaker sandbox filter (filter_kernel_too_old): This kernel is older than 4.8, where a program that traces another can get a call past the filter, so programs in the jail may still inject keystrokes into your terminal or make new btrfs or bcachefs subvolumes or snapshots (a snapshot shows the files the jail hides)."
+        );
+        assert_eq!(
+            filter_sentence(FilterWhy::KernelUnknown),
+            "innerwarden contain: a weaker sandbox filter (filter_kernel_unknown): This kernel's release could not be read as a version (it is not one, or there is no /proc and a personality such as setarch --uname-2.6 hides it from uname), so it is taken as older than 4.8, where a program that traces another can get a call past the filter: programs in the jail may still inject keystrokes into your terminal or make new btrfs or bcachefs subvolumes or snapshots (a snapshot shows the files the jail hides)."
+        );
+        assert_eq!(
+            filter_sentence(FilterWhy::NotHanded),
+            "innerwarden contain: no sandbox filter (filter_not_handed): The launcher could not hand the sandbox filter to bubblewrap, so programs in the jail can still inject keystrokes into your terminal and make new btrfs or bcachefs subvolumes or snapshots (a snapshot shows the files the jail hides)."
+        );
         let words = include_str!("../../dashboard-kit/web/src/community/words.ts");
-        for (why, word, sentence) in table {
-            assert_eq!(why.word(), word);
-            assert_eq!(why.sentence(), sentence);
-            let line = userns_open_sentence(why);
-            assert!(line.contains(word) && line.contains(sentence), "{line}");
+        assert!(words.contains(
+            "export const USERNS_CLOSED_WORDS = \"User namespaces closed inside the jail (sandbox filter).\";"
+        ));
+        for gone in [
+            "bwrap_too_old",
+            "bwrap_setuid",
+            "older than 0.8",
+            "runs setuid",
+        ] {
+            assert!(!words.contains(gone), "words.ts still says {gone}");
+        }
+        let lines = [
+            UsernsWhy::ProbeFailed,
+            UsernsWhy::KernelTooOld,
+            UsernsWhy::KernelUnknown,
+            UsernsWhy::NotBuilt,
+            UsernsWhy::NotHanded,
+        ]
+        .map(userns_open_sentence)
+        .into_iter()
+        .chain(
+            [
+                FilterWhy::ProbeFailed,
+                FilterWhy::NotBuilt,
+                FilterWhy::KernelTooOld,
+                FilterWhy::KernelUnknown,
+                FilterWhy::NotHanded,
+            ]
+            .map(filter_sentence),
+        );
+        for line in lines {
             assert!(!line.contains('\u{2014}'), "{line}");
-            let entry = format!("  {word}: \"{sentence}\",");
-            assert!(words.contains(&entry), "words.ts has no `{entry}`");
         }
     }
 
     /// On a host whose kernel restricts unprivileged user namespaces, with no
     /// profile for bwrap, a dry run of an identified launch says the real
     /// cause (the advice the real run stops with) and never starts the probe,
-    /// which there could only fail and name `userns_probe_failed` instead.
+    /// which there could only fail and name `userns_probe_failed` instead. A
+    /// plain dry run probes nothing there either, and says nothing.
     ///
     /// FAILS ON REVERT: run the probe before the advice is looked at.
     #[test]
     fn a_dry_run_says_the_restriction_and_never_probes_where_it_applies() {
-        use launch::{dry_run_userns, DryRunUserns, UsernsFact, UsernsWhy};
+        use innerwarden_agent_guard::seccomp::Rules::{Identified, Terminal};
+        use launch::{dry_run_filter, DryRunFilter};
         let advice = userns_restriction_advice(Some("1\n"), false, Path::new("/usr/bin/bwrap"));
-        let said = dry_run_userns(advice.clone(), || {
+        let said = dry_run_filter(advice.clone(), || {
             panic!("the probe is not started where the advice applies")
         });
-        assert_eq!(said, DryRunUserns::Advice(advice.clone().unwrap()));
-        assert!(!said.close_userns());
-        let lines = said.lines();
+        assert_eq!(said, DryRunFilter::Restricted(advice.clone().unwrap()));
+        assert_eq!(said.filter(), None);
+        let lines = said.lines(true);
         assert_eq!(lines.len(), advice.unwrap().len());
         assert!(lines.iter().all(|line| line.starts_with('#')), "{lines:?}");
         assert!(lines[0].starts_with(
@@ -3066,89 +4260,197 @@ mod tests {
         assert!(!lines
             .iter()
             .any(|line| line.contains("userns_probe_failed")));
+        assert!(said.lines(false).is_empty(), "a plain dry run says nothing");
 
-        // No restriction: what the probe and the facts say, as before.
-        let open = dry_run_userns(None, || UsernsFact::Open(UsernsWhy::ProbeFailed));
+        // No restriction: what the plan says, as comments.
+        let (plan, _) = plan_with(true, WHOLE_HOST, &[]);
+        let open = dry_run_filter(None, || plan.clone());
         assert_eq!(
-            open.lines(),
-            [format!(
-                "# {}",
-                launch::userns_open_sentence(UsernsWhy::ProbeFailed)
-            )]
+            open.lines(true),
+            plan.said
+                .iter()
+                .map(|l| format!("# {l}"))
+                .collect::<Vec<_>>()
         );
-        assert!(!open.close_userns());
-        let closed = dry_run_userns(None, || UsernsFact::Closed);
-        assert!(closed.close_userns());
-        assert!(closed.lines().is_empty());
+        assert_eq!(open.lines(true).len(), 2);
+        assert_eq!(open.filter(), None);
+        let (taken, _) = plan_with(true, WHOLE_HOST, &[Identified]);
+        let closed = dry_run_filter(None, || taken);
+        assert_eq!(closed.filter(), Some(Identified));
+        assert!(closed.lines(true).is_empty());
+        let (terminal, _) = plan_with(false, WHOLE_HOST, &[Terminal]);
+        assert_eq!(dry_run_filter(None, || terminal).filter(), Some(Terminal));
     }
 
-    /// The start-up probe asks for the namespaces the jail unshares, with the
-    /// option, and runs nothing.
+    /// The start-up probe starts a jail under the filter on its descriptor,
+    /// with the namespaces the jail unshares, for an identified launch with
+    /// the capabilities dropped as its jail drops them, and runs nothing; the
+    /// jail puts the filter right after those namespaces.
     ///
-    /// FAILS ON REVERT: probe without `--unshare-user` or drop a namespace from
-    /// `JAIL_NAMESPACES`' use in the probe.
+    /// FAILS ON REVERT: probe without the filter, or drop a namespace from
+    /// `JAIL_NAMESPACES`' use in the probe, or probe an identified launch
+    /// without its capability drop.
     #[test]
-    fn the_probe_starts_a_jail_with_the_option_and_the_jails_namespaces() {
-        let argv = launch::userns_probe_argv();
-        assert_eq!(&argv[..2], USERNS_CLOSED);
+    fn the_probe_starts_a_jail_under_the_filter_with_the_jails_namespaces() {
+        let argv = launch::filter_probe_argv(21, false);
+        assert_eq!(&argv[..2], ["--seccomp", "21"]);
         assert_eq!(&argv[2..5], JAIL_NAMESPACES);
         assert_eq!(&argv[5..], ["--ro-bind", "/", "/", "true"]);
-        let mut input = identified_inputs();
-        input.close_userns = true;
-        let jail = build_linux_jail(&input).unwrap().bwrap_args;
-        let at = jail
-            .windows(JAIL_NAMESPACES.len())
-            .position(|w| w == JAIL_NAMESPACES)
-            .expect("the jail unshares these");
-        assert_eq!(&jail[at + 3..at + 5], USERNS_CLOSED);
+        let identified = launch::filter_probe_argv(21, true);
+        assert_eq!(&identified[..5], &argv[..5]);
+        assert_eq!(&identified[5..7], CAP_DROP_ALL);
+        assert_eq!(&identified[7..], &argv[5..]);
+        for mut input in [inputs(&["claude", "--print"]), identified_inputs()] {
+            input.seccomp_fd = Some(21);
+            let jail = build_linux_jail(&input).unwrap().bwrap_args;
+            let at = jail
+                .windows(JAIL_NAMESPACES.len())
+                .position(|w| w == JAIL_NAMESPACES)
+                .expect("the jail unshares these");
+            assert_eq!(&jail[at + 3..at + 5], ["--seccomp", "21"]);
+            assert_eq!(jail.iter().filter(|a| *a == "--seccomp").count(), 1);
+        }
     }
 
-    /// With `--identity` and the fact, the option follows the namespaces
-    /// (`--unshare-user` names the user namespace `--disable-userns` needs).
+    /// Every identified jail drops every capability, under a filter or not,
+    /// so a launcher run as root hands its programs none of root's (bwrap
+    /// keeps them for uid 0 and runs that jail in the host's user
+    /// namespace). A plain jail never asks for it: it moved by its terminal
+    /// filter only.
+    ///
+    /// FAILS ON REVERT: drop `--cap-drop ALL` from the identified jail (as
+    /// root, `unshare -n` and a mount over the record then work inside it),
+    /// or emit it in the plain one.
+    #[test]
+    fn every_identified_jail_drops_every_capability_and_no_plain_one_does() {
+        let mut cases = Vec::new();
+        for filter in [None, Some(launch::DRY_RUN_SECCOMP_FD)] {
+            let mut identified = identified_inputs();
+            identified.seccomp_fd = filter;
+            identified.close_userns = filter.is_some();
+            cases.push((identified, true));
+            let mut plain = inputs(&["claude", "--print"]);
+            plain.seccomp_fd = filter;
+            cases.push((plain, false));
+        }
+        for (input, identity) in cases {
+            let got = build_linux_jail(&input).unwrap().bwrap_args;
+            let drops = got.windows(2).filter(|w| w == &CAP_DROP_ALL).count();
+            assert_eq!(drops, usize::from(identity), "{got:?}");
+            assert_eq!(
+                got.iter().filter(|a| *a == "--cap-drop").count(),
+                usize::from(identity)
+            );
+            assert!(!got.iter().any(|a| a == "--cap-add"));
+            if identity {
+                let at = got.windows(2).position(|w| w == CAP_DROP_ALL).unwrap();
+                let terminator = got.iter().position(|a| a == "--").unwrap();
+                assert!(at < terminator, "before the command");
+            }
+        }
+        assert_eq!(CAP_DROP_ALL, ["--cap-drop", "ALL"]);
+    }
+
+    /// With `--identity` and a host that takes the identified filter, the
+    /// filter follows the namespaces, then the capability drop, and nothing
+    /// of the user namespace option that came before it is left: no second
+    /// user namespace.
+    ///
+    /// FAILS ON REVERT: emit `--unshare-user --disable-userns` again.
     #[test]
     fn golden_argv_of_an_identified_jail_with_user_namespaces_closed() {
         let mut input = identified_inputs();
         input.close_userns = true;
+        input.seccomp_fd = Some(launch::DRY_RUN_SECCOMP_FD);
         let got = build_linux_jail(&input).unwrap().bwrap_args.join("\n");
         assert_eq!(
             got,
-            GOLDEN_ARGV_IDENTIFIED.replace(
-                "--unshare-ipc\n",
-                "--unshare-ipc\n--unshare-user\n--disable-userns\n"
-            )
+            GOLDEN_ARGV_IDENTIFIED.replace("--unshare-ipc\n", "--unshare-ipc\n--seccomp\n13\n")
         );
+        assert!(got.contains("--unshare-ipc\n--seccomp\n13\n--cap-drop\nALL\n--hostname\n"));
         assert_ne!(got, GOLDEN_ARGV_IDENTIFIED);
+        assert!(!got.contains("--disable-userns") && !got.contains("--unshare-user"));
     }
 
-    /// The fact asks for nothing without `--identity`: the argv is what it
-    /// was, and an identified jail whose host cannot take the option is what
-    /// it was too.
+    /// `close_userns` is the record's fact and puts nothing in the argv; the
+    /// filter is the descriptor. An identified jail whose host did not take
+    /// the filter is the jail the previous build made with its probe
+    /// failing, plus the capability drop and nothing else (the hash is of the
+    /// golden at 4ded5fea), and a plain one without the filter is that
+    /// build's, byte for byte.
     ///
-    /// FAILS ON REVERT: emit the option for `close_userns` without checking
-    /// `--identity`.
+    /// FAILS ON REVERT: emit anything for `close_userns`, or emit the filter
+    /// without a descriptor, or move anything else in the identified jail.
     #[test]
-    fn the_option_needs_identity_and_the_fact_and_otherwise_the_argv_is_todays() {
+    fn the_filter_needs_its_descriptor_and_otherwise_the_argv_is_the_previous_builds() {
+        use crate::observe::sha256_hex;
         let mut plain = inputs(&["claude", "--print"]);
         plain.close_userns = true;
         assert_eq!(
             build_linux_jail(&plain).unwrap().bwrap_args.join("\n"),
             GOLDEN_ARGV_PLAIN
         );
-        let mut rich = inputs(&["/bin/sh", "-c", "true"]);
-        rich.close_userns = true;
-        assert!(!build_linux_jail(&rich)
-            .unwrap()
-            .bwrap_args
-            .iter()
-            .any(|a| a == "--disable-userns" || a == "--unshare-user"));
-        // Identified, the host took no option (an old or setuid bwrap, or a
-        // probe that failed): byte for byte the jail the previous build made.
-        let mut old = identified_inputs();
-        old.close_userns = false;
+        // Identified, the probe failed: the 4ded5fea golden and the drop.
+        let old = identified_inputs();
+        let got = build_linux_jail(&old).unwrap().bwrap_args.join("\n");
+        assert_eq!(got, GOLDEN_ARGV_IDENTIFIED);
+        assert_eq!(got.matches("--cap-drop\nALL\n").count(), 1);
+        let before = got.replacen("--unshare-ipc\n--cap-drop\nALL\n", "--unshare-ipc\n", 1);
         assert_eq!(
-            build_linux_jail(&old).unwrap().bwrap_args.join("\n"),
+            sha256_hex(before.as_bytes()),
+            "648f991ed81d228baa0f4c080f5eb53c6fe864d6e4c5be6f3660da6bffbb5044"
+        );
+        let mut said_closed = identified_inputs();
+        said_closed.close_userns = true;
+        assert_eq!(
+            build_linux_jail(&said_closed)
+                .unwrap()
+                .bwrap_args
+                .join("\n"),
             GOLDEN_ARGV_IDENTIFIED
         );
+    }
+
+    /// The plain jail's argument vector moved by one pair since the build
+    /// before the filter, the terminal filter, on purpose, and by nothing
+    /// else. Without the filter (a host whose probe failed) it is
+    /// that build's, to the byte (the hashes are of the goldens at 4ded5fea).
+    ///
+    /// FAILS ON REVERT: move or add anything else in the plain jail.
+    #[test]
+    fn the_plain_jail_moved_only_by_its_terminal_filter() {
+        use crate::observe::sha256_hex;
+        let mut rich = inputs(&["/bin/sh", "-c", "true"]);
+        rich.stdin_is_tty = false;
+        rich.agent_binary = Some(ResolvedBinary {
+            link: PathBuf::from("/home/dev/.local/bin/claude"),
+            target_dir: PathBuf::from("/home/dev/.local/share/claude/v1"),
+        });
+        rich.worktree = Some(Worktree {
+            git_dir: PathBuf::from("/home/dev/repo/.git/worktrees/w"),
+            common_dir: PathBuf::from("/home/dev/repo/.git"),
+        });
+        for (mut input, golden, before) in [
+            (
+                inputs(&["claude", "--print"]),
+                GOLDEN_ARGV_PLAIN,
+                "d431bc2766d7a4d45b4bd7cd773e64ba5990b9f6b7967e99165f527f5316dff1",
+            ),
+            (
+                rich,
+                GOLDEN_ARGV_RICH,
+                "0aa4fbb5a6c3452d3d68997c66f488e545c70e767268c6cfa5c37fe9fade3200",
+            ),
+        ] {
+            assert_eq!(golden.matches("--seccomp").count(), 1);
+            let without = golden.replacen("\n--seccomp\n13\n", "\n", 1);
+            assert_eq!(sha256_hex(without.as_bytes()), before);
+            input.seccomp_fd = None;
+            assert_eq!(
+                build_linux_jail(&input).unwrap().bwrap_args.join("\n"),
+                without
+            );
+        }
     }
 
     /// The record names `userns_closed` only when the option was used, and
@@ -3234,8 +4536,8 @@ mod tests {
         "--unshare-pid",
         "--unshare-uts",
         "--unshare-ipc",
-        "--unshare-user",
-        "--disable-userns",
+        "--seccomp",
+        "--cap-drop",
         "--hostname",
         "--new-session",
         "--setenv",
@@ -3261,9 +4563,8 @@ mod tests {
             git_dir: PathBuf::from("/home/dev/repo/.git/worktrees/w"),
             common_dir: PathBuf::from("/home/dev/repo/.git"),
         });
-        // Each jail twice: with the facts an identified launch has by default
-        // (the option not taken) and with `close_userns`. The default never
-        // sees the option, so only the second proves where it goes.
+        // Each jail twice: without the filter (a host whose probe failed) and
+        // with the identified one. Only the second proves where it goes.
         let mut cases = Vec::new();
         for (input, golden) in [
             (inputs(&["claude", "--print"]), GOLDEN_ARGV_PLAIN),
@@ -3276,6 +4577,7 @@ mod tests {
         for (mut input, golden, close) in cases {
             input.args.identity = true;
             input.close_userns = close;
+            input.seccomp_fd = close.then_some(launch::DRY_RUN_SECCOMP_FD);
             input.info_fd = Some(7);
             input.record_fd = Some(8);
             let got = build_linux_jail(&input).unwrap().bwrap_args;
@@ -3309,25 +4611,39 @@ mod tests {
             let info = without.iter().position(|a| a == "--info-fd").unwrap();
             without.drain(info..info + 2);
             if close {
-                // The option comes after the record and every mount, and
-                // only with the fact.
-                let userns = got
+                // The filter comes after the record and every mount, and
+                // only with its descriptor.
+                let filter = got
                     .windows(2)
-                    .position(|w| w == USERNS_CLOSED)
-                    .expect("--unshare-user --disable-userns");
-                assert!(at + 3 <= userns, "the option follows the record");
+                    .position(|w| w[0] == "--seccomp" && w[1] == "13")
+                    .expect("--seccomp 13");
+                assert!(at + 3 <= filter, "the filter follows the record");
                 assert!(
-                    got[userns + 2..terminator]
+                    got[filter + 2..terminator]
                         .iter()
                         .all(|a| a != "--bind" && a != "--ro-bind" && a != "--tmpfs"),
-                    "no mount follows the option"
+                    "no mount follows the filter"
                 );
-                let at_without = without.iter().position(|a| a == USERNS_CLOSED[0]).unwrap();
-                without.drain(at_without..at_without + 2);
             } else {
-                assert!(!got.iter().any(|a| a == "--disable-userns"));
+                assert!(!got.iter().any(|a| a == "--seccomp"));
             }
-            assert_eq!(without.join("\n"), golden);
+            assert!(!got
+                .iter()
+                .any(|a| a == "--disable-userns" || a == "--unshare-user"));
+            // Without the record, its descriptor, the filter and the
+            // capability drop, the jail is the plain one without its filter.
+            if let Some(at_filter) = without.iter().position(|a| a == "--seccomp") {
+                without.drain(at_filter..at_filter + 2);
+            }
+            let drop = without
+                .windows(2)
+                .position(|w| w == CAP_DROP_ALL)
+                .expect("an identified jail drops every capability");
+            without.drain(drop..drop + 2);
+            assert_eq!(
+                without.join("\n"),
+                golden.replacen("\n--seccomp\n13\n", "\n", 1)
+            );
         }
     }
 
@@ -3388,6 +4704,7 @@ mod tests {
         off.record_fd = None;
         off.key_fd = Some(11);
         off.existing_paths.pop();
+        off.seccomp_fd = Some(launch::DRY_RUN_SECCOMP_FD);
         assert_eq!(
             build_linux_jail(&off).unwrap().bwrap_args.join("\n"),
             GOLDEN_ARGV_PLAIN
@@ -3686,6 +5003,11 @@ mod tests {
             ("LD_LIBRARY_PATH".into(), "/home/dev/lib".into()),
             ("PATH".into(), "/home/dev/.local/bin:/usr/bin".into()),
         ];
+        // A host whose throwaway jail under the identified filter failed:
+        // the jail an identified launch made before the filter, byte for
+        // byte. The filter's own case sets these two.
+        input.seccomp_fd = None;
+        input.close_userns = false;
         input
     }
 
@@ -3731,6 +5053,7 @@ mod tests {
         off.info_fd = None;
         off.record_fd = None;
         off.existing_paths.pop();
+        off.seccomp_fd = Some(launch::DRY_RUN_SECCOMP_FD);
         assert_eq!(
             build_linux_jail(&off).unwrap().bwrap_args.join("\n"),
             GOLDEN_ARGV_PLAIN
@@ -3830,6 +5153,7 @@ mod tests {
             project_rw: project.map(str::to_string),
             extra_ro: extra_ro.iter().map(|s| s.to_string()).collect(),
             deny_read: deny_read.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
         }
     }
 
@@ -3951,6 +5275,978 @@ mod tests {
         fine.args.identity = true;
         fine.args.extra_ro = vec![PathBuf::from("/opt/sdk"), PathBuf::from("/home/dev/tools")];
         assert!(validate_jail_inputs(&fine).is_ok());
+    }
+
+    /// A path the account was trusted to run from, inside a folder of the
+    /// home the jail may write (`~/.local`), is read-only in the jail: its
+    /// read-only bind comes after the read-write bind of that folder, and no
+    /// later bind or mount covers it.
+    ///
+    /// FAILS ON REVERT: move the `extra_ro` binds before the dotdir binds and
+    /// the read-write `.local` bind covers the versions again.
+    #[test]
+    fn an_extra_ro_path_inside_a_rw_dotdir_is_read_only() {
+        let versions = "/home/dev/.local/share/claude/versions";
+        let mut input = identified_inputs();
+        let mut args = input.args.clone();
+        apply_jail_profile(
+            &mut args,
+            &jail_profile(
+                None,
+                &[innerwarden_agent_guard::profiles::runtime_versions_dir("claude-code").unwrap()],
+                &[],
+            ),
+            JailFlagsGiven::default(),
+            Path::new("/home/dev"),
+        );
+        assert_eq!(args.extra_ro, [PathBuf::from(versions)]);
+        input.args = args;
+        assert!(validate_jail_inputs(&input).is_ok());
+        let a = build_linux_jail(&input).unwrap().bwrap_args;
+        let local = a
+            .windows(3)
+            .position(|w| {
+                w[0] == "--bind" && w[1] == "/home/dev/.local" && w[2] == "/home/dev/.local"
+            })
+            .expect("the read-write .local bind");
+        let ro = a
+            .windows(3)
+            .position(|w| w[0] == "--ro-bind-try" && w[1] == versions && w[2] == versions)
+            .expect("the read-only bind of the versions");
+        assert!(
+            local < ro,
+            "the read-only bind must come after the read-write one"
+        );
+        // Nothing after it mounts over the versions or a folder above them.
+        for (at, w) in a.windows(3).enumerate().skip(ro + 1) {
+            if matches!(
+                w[0].as_str(),
+                "--bind" | "--tmpfs" | "--ro-bind" | "--bind-try"
+            ) {
+                let dest = if w[0] == "--tmpfs" { &w[1] } else { &w[2] };
+                assert!(
+                    !Path::new(versions).starts_with(dest),
+                    "{} at {at} covers the versions",
+                    w[0]
+                );
+            }
+        }
+    }
+
+    /// A profile's hidden home paths are joined to the home, and its `start`
+    /// is the stricter of what the launch had and what it says.
+    #[test]
+    fn a_jail_profile_says_when_the_jail_starts_and_what_of_the_home_it_hides() {
+        use innerwarden_agent_guard::profiles::JailStart;
+        let home = Path::new("/home/dev");
+        let profile = innerwarden_agent_guard::profiles::JailProfile {
+            start: Some(JailStart::OnlyWhenAdmitted),
+            hide_home: vec![".cache/git/credential".into()],
+            ..Default::default()
+        };
+        let mut launch = args(&["claude"]);
+        assert_eq!(launch.start, JailStart::Always);
+        apply_jail_profile(&mut launch, &profile, JailFlagsGiven::default(), home);
+        assert_eq!(launch.start, JailStart::OnlyWhenAdmitted);
+        assert_eq!(
+            launch.hide_home,
+            [PathBuf::from("/home/dev/.cache/git/credential")]
+        );
+        // Applied twice, nothing is added twice; a profile that says
+        // `always` does not open what another one closed.
+        apply_jail_profile(&mut launch, &profile, JailFlagsGiven::default(), home);
+        assert_eq!(launch.hide_home.len(), 1);
+        let always = innerwarden_agent_guard::profiles::JailProfile {
+            start: Some(JailStart::Always),
+            ..Default::default()
+        };
+        apply_jail_profile(&mut launch, &always, JailFlagsGiven::default(), home);
+        assert_eq!(launch.start, JailStart::OnlyWhenAdmitted);
+    }
+
+    /// A hidden home path, as found on the host.
+    fn hidden(nominal: &str, real: Option<&str>, is_dir: bool) -> HiddenHomePath {
+        HiddenHomePath {
+            nominal: PathBuf::from(nominal),
+            real: real.map(PathBuf::from),
+            resolved: PathBuf::from(real.unwrap_or(nominal)),
+            is_dir,
+            dangling_link: false,
+        }
+    }
+
+    /// The host folders `identified_inputs` shows, with `.config` a link
+    /// into a dotfiles folder.
+    fn shown_with_linked_config() -> Vec<(PathBuf, PathBuf)> {
+        let input = identified_inputs();
+        shown_host_folders(
+            &input.args,
+            &input.home,
+            None,
+            &input.existing_paths,
+            |path| {
+                if path == Path::new("/home/dev/.config") {
+                    PathBuf::from("/home/dev/dotfiles/config")
+                } else {
+                    path.to_path_buf()
+                }
+            },
+        )
+    }
+
+    /// A hidden home path is covered where the jail shows what it leads to:
+    /// a folder by an empty tmpfs, a file by /dev/null, after every writable
+    /// bind so none brings it back. A path that is not there gets no mount
+    /// (bwrap would make it); the sandbox denies it anyway, so a file made
+    /// there later is denied too. A jail without such a profile is the jail
+    /// it was.
+    ///
+    /// FAILS ON REVERT: mount a path that is not there in
+    /// `plan_hidden_home`, and the missing one is mounted over; deny only
+    /// what is there and the missing one is not denied; move the masks
+    /// before the dotdir binds and the read-write `.cache` bind brings the
+    /// folder back.
+    #[test]
+    fn hide_home_masks_what_is_there_and_denies_what_may_come() {
+        let folder = "/home/dev/.cache/git/credential";
+        let file = "/home/dev/.config/app/token";
+        let missing = "/home/dev/.cache/nothing-here";
+        let mut input = identified_inputs();
+        let shown = shown_host_folders(
+            &input.args,
+            &input.home,
+            None,
+            &input.existing_paths,
+            Path::to_path_buf,
+        );
+        let plan = plan_hidden_home(
+            &[
+                hidden(folder, Some(folder), true),
+                hidden(missing, None, false),
+                hidden(file, Some(file), false),
+                hidden(folder, Some(folder), true),
+            ],
+            &input.home,
+            &shown,
+        )
+        .unwrap();
+        assert_eq!(
+            plan.masks,
+            [
+                DenyPath {
+                    abs: PathBuf::from(folder),
+                    is_dir: true
+                },
+                DenyPath {
+                    abs: PathBuf::from(file),
+                    is_dir: false
+                },
+            ]
+        );
+        assert_eq!(
+            plan.denies,
+            [folder, missing, file].map(PathBuf::from).to_vec()
+        );
+        input.hide_paths = plan.masks;
+        input.hide_denies = plan.denies;
+        let a = build_linux_jail(&input).unwrap().bwrap_args;
+        let tmpfs = a
+            .windows(2)
+            .position(|w| w[0] == "--tmpfs" && w[1] == folder)
+            .expect("the folder under an empty tmpfs");
+        let null = a
+            .windows(3)
+            .position(|w| w[0] == "--ro-bind" && w[1] == "/dev/null" && w[2] == file)
+            .expect("the file under /dev/null");
+        assert!(!a.iter().any(|w| w == missing));
+        let last_writable = a
+            .windows(2)
+            .rposition(|w| w[0] == "--bind")
+            .expect("writable binds");
+        assert!(tmpfs > last_writable && null > last_writable);
+        // macOS has no mount to lay: the paths are denied, read and write,
+        // as a project secret is, the missing one too.
+        let profile = build_macos_profile(&input).unwrap().profile;
+        for path in [folder, file, missing] {
+            for access in ["read", "write"] {
+                let rule = format!("(deny file-{access}* (subpath \"{path}\"))");
+                assert!(profile.contains(&rule), "{rule}");
+            }
+        }
+        // None: the identified golden, byte for byte.
+        assert_eq!(
+            build_linux_jail(&identified_inputs())
+                .unwrap()
+                .bwrap_args
+                .join("\n"),
+            GOLDEN_ARGV_IDENTIFIED
+        );
+    }
+
+    /// A link on the way of a hidden home path is followed, never mounted
+    /// on. Measured with bwrap 0.9.0 and 0.12.0: a mount on a link aborts
+    /// the jail ("Can't mount tmpfs on ... No such file or directory"), and
+    /// sandbox-exec denies only the path a link resolves to.
+    /// - `.config/gh` a link to `~/dotfiles/gh`, which the jail does not
+    ///   show: nothing is mounted (the link dangles in the jail); macOS
+    ///   denies both paths.
+    /// - `.config/gh3` a link to `~/.local/share/gh3`, which the jail shows
+    ///   through `.local`: that is covered.
+    /// - `.config` itself a link to `~/dotfiles/config`: the jail shows it
+    ///   at `~/.config`, so `~/.config/gh` is covered there, and macOS
+    ///   denies `~/dotfiles/config/gh`, the path it matches.
+    ///
+    /// FAILS ON REVERT: mount the path as named (the plan before this one)
+    /// and the first line mounts on a link; deny only the path as named and
+    /// macOS leaves the real one readable.
+    #[test]
+    fn a_link_on_the_way_of_a_hidden_home_path_is_followed() {
+        let input = identified_inputs();
+        let shown = shown_with_linked_config();
+        let plan = plan_hidden_home(
+            &[
+                hidden("/home/dev/.config/gh", Some("/home/dev/dotfiles/gh"), true),
+                hidden(
+                    "/home/dev/.config/gh3",
+                    Some("/home/dev/.local/share/gh3"),
+                    true,
+                ),
+                hidden(
+                    "/home/dev/.config/token",
+                    Some("/home/dev/dotfiles/config/token"),
+                    false,
+                ),
+            ],
+            &input.home,
+            &shown,
+        )
+        .unwrap();
+        assert_eq!(
+            plan.masks,
+            [
+                DenyPath {
+                    abs: PathBuf::from("/home/dev/.local/share/gh3"),
+                    is_dir: true
+                },
+                DenyPath {
+                    abs: PathBuf::from("/home/dev/.config/token"),
+                    is_dir: false
+                },
+            ]
+        );
+        for denied in [
+            "/home/dev/.config/gh",
+            "/home/dev/dotfiles/gh",
+            "/home/dev/.config/gh3",
+            "/home/dev/.local/share/gh3",
+            "/home/dev/.config/token",
+            "/home/dev/dotfiles/config/token",
+        ] {
+            assert!(
+                plan.denies.contains(&PathBuf::from(denied)),
+                "{denied}: {:?}",
+                plan.denies
+            );
+        }
+    }
+
+    /// A hidden home path that leads outside the home is refused, whatever
+    /// the link is: one the agent planted in a folder it can write would
+    /// otherwise move the empty mount onto anything the jail shows. What it
+    /// leads to inside the home that the jail needs is refused by the
+    /// inputs' check ([`validate_jail_inputs`]).
+    ///
+    /// FAILS ON REVERT: drop the home check in `plan_hidden_home` and the
+    /// jail's `/etc/innerwarden` is emptied.
+    #[test]
+    fn a_hidden_home_path_that_leads_outside_the_home_is_refused() {
+        let input = identified_inputs();
+        let shown = shown_with_linked_config();
+        for (real, exists) in [("/etc/innerwarden", true), ("/srv/other/secret", false)] {
+            let path = HiddenHomePath {
+                nominal: PathBuf::from("/home/dev/.cache/git/credential"),
+                real: exists.then(|| PathBuf::from(real)),
+                resolved: PathBuf::from(real),
+                is_dir: true,
+                dangling_link: false,
+            };
+            let refused = plan_hidden_home(&[path], &input.home, &shown).unwrap_err();
+            assert!(
+                refused.to_string().contains("outside the home"),
+                "{refused}"
+            );
+        }
+        // A link that leads to nothing is refused: where a file made
+        // through it would land is not known.
+        let mut dangling = hidden("/home/dev/.cache/git/credential", None, false);
+        dangling.dangling_link = true;
+        assert!(plan_hidden_home(&[dangling], &input.home, &shown)
+            .unwrap_err()
+            .to_string()
+            .contains("leads to nothing"));
+        // A planted link to the project is planned, then refused before
+        // anything is installed or started.
+        let plan = plan_hidden_home(
+            &[hidden(
+                "/home/dev/.cache/git/credential",
+                Some("/home/dev/proj"),
+                true,
+            )],
+            &input.home,
+            &shown,
+        )
+        .unwrap();
+        let mut planted = identified_inputs();
+        planted.hide_paths = plan.masks;
+        planted.hide_denies = plan.denies;
+        assert!(validate_jail_inputs(&planted)
+            .unwrap_err()
+            .to_string()
+            .contains("holds the project"));
+    }
+
+    /// A hidden home path never covers what the jail needs: the guard's
+    /// binary (its hook would fail and every command go unscreened), a
+    /// read-only path the profile shows (the agent's own runtime), the
+    /// agent's settings that carry the hook. A path beside them is fine.
+    ///
+    /// FAILS ON REVERT: check only the project in `validate_jail_inputs`
+    /// and each line here but the last is taken.
+    #[test]
+    fn a_hidden_home_path_never_covers_what_the_jail_needs() {
+        for (hide, what) in [
+            ("/home/dev/.local", "the guard"),
+            ("/home/dev/.local/bin", "the guard"),
+            ("/home/dev/.local/share", "a read-only path"),
+            ("/home/dev/.claude", "the agent's settings"),
+            ("/home/dev/.claude.json", "the agent's settings"),
+        ] {
+            for denies in [false, true] {
+                let mut input = identified_inputs();
+                input.args.extra_ro = vec![PathBuf::from("/home/dev/.local/share/claude/versions")];
+                if denies {
+                    input.hide_denies = vec![PathBuf::from(hide)];
+                } else {
+                    input.hide_paths = vec![DenyPath {
+                        abs: PathBuf::from(hide),
+                        is_dir: true,
+                    }];
+                }
+                let refused = validate_jail_inputs(&input).unwrap_err().to_string();
+                assert!(refused.contains(what), "{hide}: {refused}");
+            }
+        }
+        let mut fine = identified_inputs();
+        fine.args.extra_ro = vec![PathBuf::from("/home/dev/.local/share/claude/versions")];
+        fine.hide_paths = vec![DenyPath {
+            abs: PathBuf::from("/home/dev/.cache/git/credential"),
+            is_dir: true,
+        }];
+        fine.hide_denies = vec![PathBuf::from("/home/dev/.local/share/gh")];
+        assert!(validate_jail_inputs(&fine).is_ok());
+    }
+
+    /// A hidden home path never holds the project: the agent would work in
+    /// an empty folder.
+    #[test]
+    fn a_hidden_home_path_that_holds_the_project_is_refused() {
+        for holds in ["/home/dev/proj", "/home/dev"] {
+            let mut input = identified_inputs();
+            input.hide_paths = vec![DenyPath {
+                abs: PathBuf::from(holds),
+                is_dir: true,
+            }];
+            assert!(validate_jail_inputs(&input).is_err(), "{holds}");
+        }
+        let mut inside = identified_inputs();
+        inside.hide_paths = vec![DenyPath {
+            abs: PathBuf::from("/home/dev/proj/cache"),
+            is_dir: true,
+        }];
+        assert!(validate_jail_inputs(&inside).is_ok());
+    }
+
+    /// A home folder the jail binds read-write is taken where it leads, as
+    /// the jail binds it: with `~/.cache` a link to `/data/cache` (a person's
+    /// own, which the agent cannot replace in the jail, where it is a mount
+    /// point), `~/.cache/git/credential` is planned at
+    /// `/data/cache/git/credential` and covered where the jail shows it, at
+    /// `~/.cache/git/credential`. A link below the folder that leaves where
+    /// it leads is still refused, and so is a folder the jail does not bind
+    /// read-write.
+    ///
+    /// FAILS ON REVERT: take only the home for the jail's home in
+    /// `plan_hidden_home` (the check before this one) and the first plan is
+    /// refused "outside the home", so every jail whose profile hides
+    /// `.cache/git/credential` never starts for this person.
+    #[test]
+    fn a_home_folder_linked_outside_the_home_is_taken_where_it_leads() {
+        let input = identified_inputs();
+        let shown = shown_host_folders(
+            &input.args,
+            &input.home,
+            None,
+            &input.existing_paths,
+            |path| {
+                if path == Path::new("/home/dev/.cache") {
+                    PathBuf::from("/data/cache")
+                } else {
+                    path.to_path_buf()
+                }
+            },
+        );
+        let plan = plan_hidden_home(
+            &[
+                hidden(
+                    "/home/dev/.cache/git/credential",
+                    Some("/data/cache/git/credential"),
+                    true,
+                ),
+                hidden("/home/dev/.cache/nothing-here", None, false),
+            ],
+            &input.home,
+            &shown,
+        )
+        .unwrap();
+        assert_eq!(
+            plan.masks,
+            [DenyPath {
+                abs: PathBuf::from("/home/dev/.cache/git/credential"),
+                is_dir: true
+            }]
+        );
+        for denied in [
+            "/home/dev/.cache/git/credential",
+            "/data/cache/git/credential",
+            "/home/dev/.cache/nothing-here",
+        ] {
+            assert!(
+                plan.denies.contains(&PathBuf::from(denied)),
+                "{denied}: {:?}",
+                plan.denies
+            );
+        }
+        // A link below the folder that leaves where the folder leads: the
+        // mask would move onto what the jail shows elsewhere.
+        for real in ["/data/other/secret", "/etc/innerwarden", "/data/cachex/x"] {
+            let refused = plan_hidden_home(
+                &[hidden("/home/dev/.cache/git/credential", Some(real), true)],
+                &input.home,
+                &shown,
+            )
+            .unwrap_err();
+            assert!(
+                refused.to_string().contains("outside the home"),
+                "{real}: {refused}"
+            );
+        }
+        // A path in another folder leads into `/data/cache`: that folder's
+        // place, not its own.
+        assert!(plan_hidden_home(
+            &[hidden("/home/dev/.config/gh", Some("/data/cache/gh"), true)],
+            &input.home,
+            &shown,
+        )
+        .is_err());
+        // A home folder the jail does not bind read-write is not the jail's.
+        let ssh_linked = shown_host_folders(
+            &input.args,
+            &input.home,
+            None,
+            &[
+                input.existing_paths.clone(),
+                vec![PathBuf::from("/home/dev/.ssh")],
+            ]
+            .concat(),
+            |path| {
+                if path == Path::new("/home/dev/.ssh") {
+                    PathBuf::from("/data/ssh")
+                } else {
+                    path.to_path_buf()
+                }
+            },
+        );
+        assert!(plan_hidden_home(
+            &[hidden("/home/dev/.ssh/key", Some("/data/ssh/key"), false)],
+            &input.home,
+            &ssh_linked,
+        )
+        .is_err());
+    }
+
+    /// The launcher starts the command of a jail whose profile starts it only
+    /// when admitted only once the host said it admitted the jail AND the
+    /// kernel shows the jail in its system scope. No answer, an answer that
+    /// admitted nothing, or an admission without the scope: not started. A
+    /// jail with no such profile starts as it always did.
+    ///
+    /// FAILS ON REVERT: start whatever `admitted` says in `starts`, or take
+    /// the answer alone in `admitted_here`, and a jail the host did not
+    /// admit starts.
+    #[test]
+    fn only_when_admitted_refuses_without_the_host() {
+        use innerwarden_agent_guard::identity::SystemScopeAdmission;
+        use innerwarden_agent_guard::profiles::JailStart;
+        use launch::{admitted_here, starts, NOT_ADMITTED};
+        let scope = innerwarden_agent_guard::identity::Scope {
+            unit: UNIT.to_string(),
+            cgroup_path: format!("/system.slice/{UNIT}"),
+        };
+        let yes = SystemScopeAdmission {
+            admitted: true,
+            note: None,
+        };
+        let no = SystemScopeAdmission {
+            admitted: false,
+            note: Some("Kernel protection is not in effect for this session.".into()),
+        };
+        assert!(admitted_here(&yes, Some(&scope)));
+        for (answer, seen) in [
+            (&SystemScopeAdmission::NONE, Some(&scope)),
+            (&SystemScopeAdmission::NONE, None),
+            (&no, Some(&scope)),
+            (&yes, None),
+        ] {
+            let admitted = admitted_here(answer, seen);
+            assert!(!admitted, "{answer:?} {seen:?}");
+            assert!(!starts(JailStart::OnlyWhenAdmitted, admitted));
+            assert!(starts(JailStart::Always, admitted));
+        }
+        assert!(starts(JailStart::OnlyWhenAdmitted, true));
+        assert_eq!(
+            NOT_ADMITTED,
+            "Active Defence on this host did not admit this jail, and its profile starts it \
+             only when admitted."
+        );
+        // A launch with no profile starts as it always did.
+        assert_eq!(args(&["claude"]).start, JailStart::Always);
+        assert_eq!(
+            parse_contain_args(&["--identity".into(), "claude".into()])
+                .unwrap()
+                .start,
+            JailStart::Always
+        );
+    }
+
+    /// The launcher's decision is one pure function of what it learned: the
+    /// record it made, the host's answer and the system scope the kernel
+    /// showed. A host that placed the jail and said it did not admit it
+    /// does not start it; neither does an admission without the scope, nor
+    /// a record that could not be made.
+    ///
+    /// FAILS ON REVERT: take the scope alone for the admission in
+    /// `launch_starts` (the reading before the answer was read) and the
+    /// placed-but-not-admitted line starts.
+    #[test]
+    fn the_launch_starts_only_on_an_admission_over_the_scope() {
+        use innerwarden_agent_guard::identity::SystemScopeAdmission;
+        use innerwarden_agent_guard::profiles::JailStart;
+        use launch::launch_starts;
+        let scope = innerwarden_agent_guard::identity::Scope {
+            unit: UNIT.to_string(),
+            cgroup_path: format!("/system.slice/{UNIT}"),
+        };
+        let yes = SystemScopeAdmission {
+            admitted: true,
+            note: None,
+        };
+        let no = SystemScopeAdmission {
+            admitted: false,
+            note: Some("Kernel protection is not in effect for this session.".into()),
+        };
+        let wait = JailStart::OnlyWhenAdmitted;
+        assert!(launch_starts(wait, Some((&yes, Some(&scope)))));
+        assert!(!launch_starts(wait, Some((&no, Some(&scope)))));
+        assert!(!launch_starts(wait, Some((&yes, None))));
+        assert!(!launch_starts(
+            wait,
+            Some((&SystemScopeAdmission::NONE, Some(&scope)))
+        ));
+        assert!(!launch_starts(wait, None));
+        for made in [None, Some((&no, None)), Some((&yes, Some(&scope)))] {
+            assert!(launch_starts(JailStart::Always, made));
+        }
+    }
+
+    /// The answer to the request for a system scope: a `202` is read for the
+    /// admission, any other success admits nothing, and a request that got
+    /// no answer says why. After "did not admit", the launcher says what to
+    /// check and which file makes the jail wait.
+    #[test]
+    fn the_launcher_says_why_the_host_did_not_admit_and_what_to_do() {
+        use crate::host_decide_io::NoAnswer;
+        let (taken, admission) = launch::scope_answer(Ok((202, br#"{"admitted":true}"#.to_vec())));
+        assert!(taken.is_ok() && admission.admitted);
+        let (taken, admission) = launch::scope_answer(Ok((200, br#"{"admitted":true}"#.to_vec())));
+        assert!(taken.is_ok() && !admission.admitted);
+        assert_eq!(
+            launch::scope_answer(Ok((500, Vec::new()))).0,
+            Err("HTTP 500".into())
+        );
+        let (taken, admission) = launch::scope_answer(Err(NoAnswer::Refused));
+        assert!(!admission.admitted);
+        assert!(taken.unwrap_err().contains("Active Defence is not running"));
+        assert_eq!(
+            launch::not_admitted_remedy(
+                &["/home/dev/.config/innerwarden/agent-profiles.toml".into()],
+                None
+            ),
+            "Check that Active Defence is running (systemctl status innerwarden-agent), then try \
+             again. The jail waits for it because of start = \"only_when_admitted\" in \
+             /home/dev/.config/innerwarden/agent-profiles.toml."
+        );
+        assert!(launch::not_admitted_remedy(&[], None).ends_with(
+            "in /etc/innerwarden/agent-profiles.toml or ~/.config/innerwarden/agent-profiles.toml."
+        ));
+    }
+
+    /// A launcher that holds no key of the host's (an older Active Defence
+    /// that publishes none), or that asks the host at an address its key
+    /// is not held over, never reads the answer, so nothing is admitted.
+    /// It says so, naming the key's file or the address, and its remedy is
+    /// that, not "check that Active Defence is running": the same launch
+    /// has just printed the system scope Active Defence placed the jail in.
+    ///
+    /// FAILS ON REVERT: answer `None` in `answer_unbelieved` (the launcher
+    /// before this one) and a launcher with no key says nothing of it and
+    /// sends the person to check that Active Defence runs.
+    #[test]
+    fn a_launcher_that_cannot_believe_the_host_says_why() {
+        use launch::{answer_unbelieved, not_admitted_remedy, unbelieved_sentence, Unbelieved};
+        let pinned = "https://127.0.0.1:8787/api/agent/contain-scope";
+        assert_eq!(answer_unbelieved(true, Some(pinned)), None);
+        // Nothing was asked: nothing to believe or not.
+        assert_eq!(answer_unbelieved(false, None), None);
+        assert_eq!(
+            answer_unbelieved(false, Some(pinned)),
+            Some(Unbelieved::NoKey)
+        );
+        let elsewhere = "http://127.0.0.1:8787/api/agent/contain-scope";
+        assert_eq!(
+            answer_unbelieved(true, Some(elsewhere)),
+            Some(Unbelieved::Address(elsewhere.into()))
+        );
+        let no_key = unbelieved_sentence(&Unbelieved::NoKey);
+        assert!(
+            no_key.contains("cannot be believed without its key"),
+            "{no_key}"
+        );
+        assert!(
+            no_key.contains(innerwarden_agent_guard::identity::AGENT_TLS_SPKI_PATH),
+            "{no_key}"
+        );
+        let remedy = not_admitted_remedy(&[], Some(&Unbelieved::NoKey));
+        assert!(
+            remedy.starts_with("Check that Active Defence on this host publishes its key at "),
+            "{remedy}"
+        );
+        assert!(!remedy.contains("systemctl status"), "{remedy}");
+        assert!(
+            remedy.contains("start = \"only_when_admitted\""),
+            "{remedy}"
+        );
+        let address = unbelieved_sentence(&Unbelieved::Address(elsewhere.into()));
+        assert!(address.contains(elsewhere), "{address}");
+        let remedy = not_admitted_remedy(&[], Some(&Unbelieved::Address(elsewhere.into())));
+        assert!(
+            remedy.starts_with("Unset INNERWARDEN_AGENT_URL"),
+            "{remedy}"
+        );
+    }
+
+    /// Under a profile that starts the jail only once the host admitted it,
+    /// the jail's command starts through the gate: the launcher's own
+    /// binary, bound read-only, with the instance it waits for. Without such
+    /// a profile the argv is the golden, byte for byte.
+    ///
+    /// FAILS ON REVERT: hand the child to bwrap as it is in
+    /// `build_linux_jail`, or return the instance for `always` in
+    /// `gate_for`, and the lines below that say otherwise fail.
+    #[test]
+    fn a_jail_that_starts_only_once_admitted_runs_its_command_through_the_gate() {
+        use innerwarden_agent_guard::profiles::JailStart;
+        let instance = launch::instance_id_from([7; 16]);
+        assert_eq!(launch::gate_for(JailStart::Always, &instance), None);
+        assert_eq!(
+            launch::gate_for(JailStart::OnlyWhenAdmitted, &instance),
+            Some(instance.clone())
+        );
+        let mut input = identified_inputs();
+        input.gate_instance = launch::gate_for(JailStart::OnlyWhenAdmitted, &instance);
+        let a = build_linux_jail(&input).unwrap().bwrap_args;
+        let end = a.iter().rposition(|w| w == "--").unwrap();
+        let iw = input.iw_binary.to_string_lossy().to_string();
+        let child = &a[a.iter().position(|w| w == "--").unwrap() + 1..];
+        let mut expected = vec![
+            iw.clone(),
+            launch::GATE_VERB.to_string(),
+            "--instance".to_string(),
+            instance.clone(),
+            "--".to_string(),
+        ];
+        expected.extend(input.args.child.iter().cloned());
+        assert_eq!(child, expected.as_slice());
+        assert_eq!(a[end + 1..], input.args.child[..]);
+        // The gate is the launcher's own binary, bound read-only.
+        assert!(a
+            .windows(3)
+            .any(|w| w[0] == "--ro-bind" && w[1] == iw && w[2] == iw));
+        assert_eq!(
+            build_linux_jail(&identified_inputs())
+                .unwrap()
+                .bwrap_args
+                .join("\n"),
+            GOLDEN_ARGV_IDENTIFIED
+        );
+        assert_eq!(
+            launch::parse_gate_args(&expected[2..]),
+            Some((instance.as_str(), &input.args.child[..]))
+        );
+        for bad in [
+            vec![],
+            vec!["--instance".to_string(), instance.clone(), "--".to_string()],
+            vec![
+                "--instance".to_string(),
+                String::new(),
+                "--".to_string(),
+                "x".to_string(),
+            ],
+            vec![
+                "--other".to_string(),
+                instance.clone(),
+                "--".to_string(),
+                "x".to_string(),
+            ],
+            vec!["--instance".to_string(), instance.clone(), "x".to_string()],
+        ] {
+            assert_eq!(launch::parse_gate_args(&bad), None, "{bad:?}");
+        }
+    }
+
+    /// The gate starts the command only on a record that names its own
+    /// instance. An empty record (the launcher ended the jail, or died
+    /// before the host answered), one that is not a record, and one of
+    /// another instance keep the command from starting.
+    ///
+    /// FAILS ON REVERT: open on any record, or on a record of any instance,
+    /// in `gate_opens`, and the empty or the other-instance line opens.
+    #[test]
+    fn the_gate_starts_the_command_only_on_a_record_naming_its_instance() {
+        let (mode, launcher, project) = (
+            Mode::Monitor,
+            Path::new("/usr/local/bin/innerwarden"),
+            Path::new("/home/dev/proj"),
+        );
+        let record = launch::assemble_record(launch_facts(&mode, launcher, project)).unwrap();
+        let json = serde_json::to_vec(&record).unwrap();
+        assert!(launch::gate_opens(&json, &record.instance_id));
+        let other = launch::instance_id_from([8; 16]);
+        assert!(!launch::gate_opens(&json, &other));
+        for refused in [
+            &b""[..],
+            b"   ",
+            b"{}",
+            b"not json",
+            &json[..json.len() / 2],
+        ] {
+            assert!(
+                !launch::gate_opens(refused, &record.instance_id),
+                "{:?}",
+                String::from_utf8_lossy(refused)
+            );
+        }
+        assert_eq!(
+            launch::GATE_REFUSED,
+            "this jail holds no record that the host admitted it, so its command does not start."
+        );
+    }
+
+    /// A jail is ended by the pid bwrap reported for its first process,
+    /// whether or not the kernel lists bwrap's children (a kernel built
+    /// without `CHECKPOINT_RESTORE` has no `/proc/<pid>/task/*/children`).
+    /// Each pid once, and only while its parent is still bwrap.
+    ///
+    /// FAILS ON REVERT: end only the listed children in
+    /// `jail_processes_to_end` and the first line, a kernel that lists none,
+    /// ends nothing.
+    #[test]
+    fn a_jail_is_ended_by_the_pid_bwrap_reported_even_where_proc_lists_no_children() {
+        use launch::jail_processes_to_end;
+        let parent = |pid: u32| match pid {
+            101 | 102 => Some(100),
+            201 => Some(1),
+            _ => None,
+        };
+        assert_eq!(jail_processes_to_end(100, Some(101), &[], parent), [101]);
+        assert_eq!(
+            jail_processes_to_end(100, Some(101), &[101, 102], parent),
+            [101, 102]
+        );
+        assert_eq!(jail_processes_to_end(100, None, &[102], parent), [102]);
+        // A pid that ended and was handed to someone else is not signalled.
+        assert!(jail_processes_to_end(100, Some(201), &[201, 999], parent).is_empty());
+    }
+
+    /// Where `/etc/resolv.conf` is a link into `/run`, the jail gets the
+    /// file it names, read-only, at the same place, and nothing else of the
+    /// host's `/run`: never the folder that holds the resolver's sockets,
+    /// never a file of the jail's own, never one that names another
+    /// resolver. Any other link, or none, changes nothing.
+    ///
+    /// FAILS ON REVERT: bind the link target's folder where it holds
+    /// sockets (systemd-resolved's), or keep a target outside `/run`, and
+    /// the lines below that say otherwise fail.
+    #[test]
+    fn the_jail_never_points_at_a_private_resolver() {
+        use launch::resolv_conf_target;
+        for (link, target) in [
+            (
+                "../run/systemd/resolve/stub-resolv.conf",
+                "/run/systemd/resolve/stub-resolv.conf",
+            ),
+            (
+                "/run/systemd/resolve/resolv.conf",
+                "/run/systemd/resolve/resolv.conf",
+            ),
+            ("/run/resolvconf/resolv.conf", "/run/resolvconf/resolv.conf"),
+            (
+                "./../run/./NetworkManager/resolv.conf",
+                "/run/NetworkManager/resolv.conf",
+            ),
+        ] {
+            assert_eq!(
+                resolv_conf_target(Path::new(link)),
+                Some(PathBuf::from(target)),
+                "{link}"
+            );
+        }
+        for elsewhere in [
+            "/run",
+            "../run",
+            "/etc/resolvconf/run/resolv.conf",
+            "resolv.conf.real",
+            "/var/run/NetworkManager/resolv.conf",
+            "../run/../etc/shadow",
+            "/runner/resolv.conf",
+        ] {
+            assert_eq!(
+                resolv_conf_target(Path::new(elsewhere)),
+                None,
+                "{elsewhere}"
+            );
+        }
+        let stub = "/run/systemd/resolve/stub-resolv.conf";
+        for identity in [false, true] {
+            let mut input = if identity {
+                identified_inputs()
+            } else {
+                inputs(&["claude", "--print"])
+            };
+            input.resolv_conf =
+                resolv_conf_target(Path::new("../run/systemd/resolve/stub-resolv.conf"));
+            let a = build_linux_jail(&input).unwrap().bwrap_args;
+            let run = a
+                .windows(2)
+                .position(|w| w[0] == "--tmpfs" && w[1] == "/run")
+                .unwrap();
+            let bind = a
+                .windows(3)
+                .position(|w| w[0] == "--ro-bind-try" && w[1] == stub && w[2] == stub)
+                .expect("the host's own file, at its own place");
+            assert_eq!(bind, run + 2, "right over the jail's empty /run");
+            assert!(
+                !a.iter()
+                    .any(|w| w == "/run/systemd/resolve" || w == "/run/systemd"),
+                "the folder of the resolver's sockets is never shown"
+            );
+            assert!(
+                !a.iter().any(|w| w.ends_with("resolv.conf") && w != stub),
+                "no other resolver file, and none of the jail's own"
+            );
+            assert!(!a.iter().any(|w| w == "/etc/resolv.conf"));
+        }
+    }
+
+    /// The resolver file a jail binds goes stale when the host replaces it
+    /// by rename (a bind holds the file it started with). Where it lives in
+    /// a folder of resolver data alone (resolvconf's), with no socket in it,
+    /// the folder is bound instead, so the jail follows the host. Any other
+    /// folder (systemd-resolved's sockets, NetworkManager's connection
+    /// files), or one that holds a socket, keeps the file alone.
+    ///
+    /// FAILS ON REVERT: bind the file alone in `resolv_conf_bind` and
+    /// resolvconf's line binds the file; bind every folder and the stub's
+    /// and NetworkManager's lines bind theirs.
+    #[test]
+    fn a_resolver_folder_of_data_alone_is_bound_whole() {
+        use launch::resolv_conf_bind;
+        let no_socket = |_: &Path| false;
+        let socket = |_: &Path| true;
+        for (target, bound) in [
+            ("/run/resolvconf/resolv.conf", "/run/resolvconf"),
+            (
+                "/run/systemd/resolve/stub-resolv.conf",
+                "/run/systemd/resolve/stub-resolv.conf",
+            ),
+            (
+                "/run/systemd/resolve/resolv.conf",
+                "/run/systemd/resolve/resolv.conf",
+            ),
+            (
+                "/run/NetworkManager/resolv.conf",
+                "/run/NetworkManager/resolv.conf",
+            ),
+            (
+                "/run/resolvconf/interface/eth0",
+                "/run/resolvconf/interface/eth0",
+            ),
+        ] {
+            assert_eq!(
+                resolv_conf_bind(Path::new(target), no_socket),
+                PathBuf::from(bound),
+                "{target}"
+            );
+        }
+        assert_eq!(
+            resolv_conf_bind(Path::new("/run/resolvconf/resolv.conf"), socket),
+            PathBuf::from("/run/resolvconf/resolv.conf")
+        );
+        let mut input = inputs(&["claude", "--print"]);
+        input.resolv_conf = Some(resolv_conf_bind(
+            Path::new("/run/resolvconf/resolv.conf"),
+            no_socket,
+        ));
+        let a = build_linux_jail(&input).unwrap().bwrap_args;
+        assert!(a.windows(3).any(|w| w[0] == "--ro-bind-try"
+            && w[1] == "/run/resolvconf"
+            && w[2] == "/run/resolvconf"));
+    }
+
+    /// O15, the one deliberate change to the plain jail's argv beside its
+    /// filter: on a host whose `/etc/resolv.conf` is a link into `/run`, one
+    /// read-only bind of the file it names, right after the jail's `/run`.
+    /// On any other host the plain jail is its golden, byte for byte.
+    #[test]
+    fn the_plain_jail_moved_only_by_the_resolver_file_on_a_resolved_host() {
+        let mut input = inputs(&["claude", "--print"]);
+        input.resolv_conf = Some(PathBuf::from("/run/systemd/resolve/stub-resolv.conf"));
+        let got = build_linux_jail(&input).unwrap().bwrap_args.join("\n");
+        assert_eq!(
+            got,
+            GOLDEN_ARGV_PLAIN.replace(
+                "--tmpfs\n/run\n",
+                "--tmpfs\n/run\n--ro-bind-try\n/run/systemd/resolve/stub-resolv.conf\n\
+                 /run/systemd/resolve/stub-resolv.conf\n"
+            )
+        );
+        assert_ne!(got, GOLDEN_ARGV_PLAIN);
+        assert_eq!(
+            build_linux_jail(&inputs(&["claude", "--print"]))
+                .unwrap()
+                .bwrap_args
+                .join("\n"),
+            GOLDEN_ARGV_PLAIN
+        );
     }
 
     fn facts(systemd_run: Option<&str>, version: Option<u32>, manager: bool) -> launch::ScopeFacts {
@@ -4636,6 +6932,8 @@ mod tests {
         --unshare-pid\n\
         --unshare-uts\n\
         --unshare-ipc\n\
+        --cap-drop\n\
+        ALL\n\
         --hostname\n\
         ai-sandbox\n\
         --setenv\n\
@@ -4731,6 +7029,8 @@ mod tests {
         --unshare-pid\n\
         --unshare-uts\n\
         --unshare-ipc\n\
+        --seccomp\n\
+        13\n\
         --hostname\n\
         ai-sandbox\n\
         --\n\
@@ -4829,6 +7129,8 @@ mod tests {
         --unshare-pid\n\
         --unshare-uts\n\
         --unshare-ipc\n\
+        --seccomp\n\
+        13\n\
         --hostname\n\
         ai-sandbox\n\
         --new-session\n\

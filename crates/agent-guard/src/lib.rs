@@ -67,6 +67,10 @@ pub mod mcp_wire_toml;
 pub mod profiles;
 pub mod redact;
 pub mod render;
+// The seccomp filter a Linux jail of `innerwarden contain` starts under, in
+// the style of Flatpak. Pure, and the one definition of its bytes for each
+// architecture, so they are built and checked the same on every host.
+pub mod seccomp;
 pub mod session;
 pub mod threats;
 
@@ -74,6 +78,7 @@ pub mod threats;
 // No consumer outside this crate. Kept private so a future caller has to make a
 // deliberate decision to widen the surface, rather than finding it already open.
 mod shell;
+mod shell_words;
 mod typosquat;
 mod unparsed;
 

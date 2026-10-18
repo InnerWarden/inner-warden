@@ -61,6 +61,7 @@ export const DECIDER_WORDS: Record<string, string> = {
   warden: "the local model",
   llm: "your model's second opinion",
   user: "you",
+  host: "Active Defence on this host",
 };
 
 export const CHANNELS = ["hook", "mcp", "check", "unknown"] as const;
@@ -281,25 +282,13 @@ export function reasonWords(reason: unknown): string {
 }
 
 /**
- * The technical view's line about user namespaces inside the jail. A fact
- * about how the jail was built, shown as it is: it is not a reason code, and
- * it never changes a trust, a badge or a reason.
+ * The technical view's line for a jail started with user namespaces closed
+ * (the identified jail's sandbox filter). A fact about how the jail was
+ * built, shown as it is: it is not a reason code, and it never changes a
+ * trust, a badge or a reason. A jail that did not close them shows nothing:
+ * the launcher said why when it started it.
  */
-export const USERNS_CLOSED_WORDS = "User namespaces closed inside the jail";
-
-/** Why a host's bubblewrap cannot close them, by the word the CLI sends. */
-export const USERNS_OPEN_CODES = ["bwrap_too_old", "bwrap_setuid", "userns_probe_failed"] as const;
-export type UsernsOpenCode = (typeof USERNS_OPEN_CODES)[number];
-
-export const USERNS_OPEN_WORDS: Record<UsernsOpenCode, string> = {
-  bwrap_too_old: "Bubblewrap here is older than 0.8, so programs in the jail can still make user namespaces.",
-  bwrap_setuid: "Bubblewrap here runs setuid, so user namespaces stay open in the jail.",
-  userns_probe_failed: "Bubblewrap here could not start a jail with user namespaces closed, so the jail runs without that.",
-};
-
-export function asUsernsOpenCode(value: unknown): UsernsOpenCode | undefined {
-  return typeof value === "string" && (USERNS_OPEN_CODES as readonly string[]).includes(value) ? (value as UsernsOpenCode) : undefined;
-}
+export const USERNS_CLOSED_WORDS = "User namespaces closed inside the jail (sandbox filter).";
 
 /** The second axis: what the person decided about a type of agent. */
 export const LIFECYCLES = ["discovered", "approved", "revoked"] as const;
@@ -371,6 +360,17 @@ export const WITHHELD_WORDS = {
 
 /** Any word the host recorded for not relaxing, whatever it is: one sentence. */
 export const HOST_WITHHELD_WORDS = "Active Defence on this host kept your general rules for this command.";
+
+/**
+ * A refusal of the host's own that stood: the hook recorded the host's answer
+ * and that the host decided the refusal (`decided_by: host`). Never worded as
+ * one of the general rules, which may have allowed the command.
+ */
+export const HOST_REFUSED_WORDS = "Refused by Active Defence on this host.";
+
+export function hostRefused(trustSource: TrustSource | undefined, decidedBy: string, verdict: Verdict | undefined): boolean {
+  return trustSource === "host" && decidedBy === "host" && verdict === "deny";
+}
 
 export function withheldWords(os: PlatformOs, activeDefenceInstalled: boolean, hostWithheld: boolean): string {
   if (hostWithheld) return HOST_WITHHELD_WORDS;

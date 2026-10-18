@@ -462,3 +462,86 @@ describe("agent identity confidence 'observed'", () => {
     expect(() => parseAgentInventory(inventory("host_verified"))).toThrow(/verified evidence/);
   });
 });
+
+describe("the host's kernel protection on an agent subject", () => {
+  const subject = (extra: Record<string, unknown> = {}) => ({
+    agent_id: "claude-code",
+    principal: null,
+    product: "Claude Code",
+    provider: null,
+    agent_class: "coding",
+    runtime: null,
+    model: null,
+    identity_confidence: "observed",
+    identity_evidence: [],
+    sessions: [],
+    capabilities: [],
+    ...extra,
+  });
+  const inventory = (extra: Record<string, unknown> = {}) => ({
+    schema_version: "innerwarden.dashboard.v1",
+    generated_at: "2026-10-18T09:00:00Z",
+    availability: "available",
+    discovery_limited: false,
+    subjects: [subject(extra)],
+  });
+  const kernel = {
+    mode: "observe",
+    strict: false,
+    parts: [
+      { key: "programs", effective: "observe" },
+      { key: "a_part_this_kit_never_heard_of", effective: "off", why: "This host cannot do it." },
+    ],
+    watch: { since: "2026-10-18T08:00:00Z", sessions: 2, agent_starts: 14, would_refuse: [{ key: "programs", n: 3 }] },
+    ready: false,
+    blockers: ["One session in which the agent itself started."],
+    checked_at: null,
+  };
+
+  /**
+   * A producer that predates the field sends none, and the subject is
+   * exactly what it was: the key is not even there.
+   */
+  it("is absent where the producer sends none", () => {
+    const parsed = parseAgentInventory(inventory());
+    expect("kernel" in parsed.subjects[0]).toBe(false);
+  });
+
+  /** Opaque: parts the kit never heard of are kept as the host sent them. */
+  it("keeps what the host sent, keys it does not know included", () => {
+    const parsed = parseAgentInventory(inventory({ kernel }));
+    expect(parsed.subjects[0].kernel).toEqual(kernel);
+    const { checked_at: _dropped, ...without } = kernel;
+    expect(parseAgentInventory(inventory({ kernel: without })).subjects[0].kernel).toEqual(without);
+  });
+
+  /**
+   * A field that does not hold its shape is dropped whole, never in part,
+   * and never takes the subject or the screen down with it.
+   *
+   * FAILS ON REVERT: parse `kernel` with the throwing parser directly and
+   * the whole inventory is refused; keep it unchecked and these are kept.
+   */
+  it("drops a field that does not hold its shape, and keeps the subject", () => {
+    for (const bad of [
+      null,
+      "on",
+      { ...kernel, mode: "protected" },
+      { ...kernel, strict: "yes" },
+      { ...kernel, parts: [{ key: "Programs", effective: "observe" }] },
+      { ...kernel, parts: [{ key: "programs", effective: "on" }] },
+      { ...kernel, parts: [{ key: "programs", effective: "observe", why: "" }] },
+      { ...kernel, parts: [{ key: "programs", effective: "observe", why: "x".repeat(201) }] },
+      { ...kernel, parts: Array.from({ length: 17 }, () => ({ key: "p", effective: "off" })) },
+      { ...kernel, watch: { ...kernel.watch, sessions: -1 } },
+      { ...kernel, watch: { ...kernel.watch, would_refuse: [{ key: "programs", n: 1.5 }] } },
+      { ...kernel, blockers: [7] },
+      { ...kernel, ready: undefined },
+      { ...kernel, checked_at: 5 },
+    ]) {
+      const parsed = parseAgentInventory(inventory({ kernel: bad }));
+      expect(parsed.subjects[0].kernel, JSON.stringify(bad)).toBeUndefined();
+      expect(parsed.subjects[0].agent_id).toBe("claude-code");
+    }
+  });
+});

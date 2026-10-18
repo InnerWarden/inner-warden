@@ -55,6 +55,29 @@ pub fn state() -> ProfilesState {
     state_from((SYSTEM_PROFILES_PATH, system), (&user_label, user))
 }
 
+/// The files whose profile of `agent` starts its jail only once Active
+/// Defence on this host admitted it, by path: what the launcher names when
+/// such a jail does not start.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn files_that_wait_for_the_host(agent: &str) -> Vec<String> {
+    use innerwarden_agent_guard::profiles::{parse, JailStart};
+    let (system, (user_label, user)) = read_both();
+    [
+        (SYSTEM_PROFILES_PATH.to_string(), system),
+        (user_label, user),
+    ]
+    .into_iter()
+    .filter_map(|(path, read)| match read {
+        FileRead::Bytes(bytes) => parse(&bytes)
+            .ok()?
+            .get(agent)
+            .is_some_and(|profile| profile.jail.start() == JailStart::OnlyWhenAdmitted)
+            .then_some(path),
+        _ => None,
+    })
+    .collect()
+}
+
 /// The two files as found: the system file, and the user's with the path it
 /// is named by.
 fn read_both() -> (FileRead, (String, FileRead)) {

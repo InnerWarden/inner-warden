@@ -8,7 +8,6 @@ import {
   asLifecycle,
   asPlatform,
   asTrustSource,
-  asUsernsOpenCode,
   asVerdict,
   effectiveTrust,
   isDecisionOutcome,
@@ -25,7 +24,6 @@ import {
   type PlatformOs,
   type Trust,
   type TrustSource,
-  type UsernsOpenCode,
   type Verdict,
 } from "./words";
 
@@ -754,8 +752,6 @@ export type LocalInstance = {
     launcherRootOwned?: boolean;
     /** `true` when the jail was started with user namespaces closed; absent is "not said". */
     usernsClosed?: boolean;
-    /** Why this host's bubblewrap cannot close them, for a jail that did not. */
-    usernsOpenReason?: UsernsOpenCode;
   };
 };
 
@@ -837,7 +833,6 @@ function readInstance(value: unknown): LocalInstance | undefined {
       launcherPath: plain(technical?.launcher_path, 300),
       launcherRootOwned: bool(technical?.launcher_root_owned),
       usernsClosed: technical?.userns_closed === true ? true : undefined,
-      usernsOpenReason: asUsernsOpenCode(technical?.userns_open_reason),
     }),
   });
 }

@@ -215,8 +215,12 @@ jobs:
           npm ci
           npm run bundle:check
 
+      # IW_REQUIRE_SECCOMP: the jail tests must run with the sandbox filter
+      # taken, never only the path without it (see ci.yml).
       - name: Test the Community crates
         if: matrix.builder == 'zigbuild'
+        env:
+          IW_REQUIRE_SECCOMP: "1"
         run: cargo test -p innerwarden -p innerwarden-agent-guard -p innerwarden-dashboard-kit -p innerwarden-graph -p innerwarden-notify
 
       - name: Build + stage innerwarden for each target

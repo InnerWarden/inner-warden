@@ -75,7 +75,10 @@ only — no IP, no host data; set `INNERWARDEN_NO_TELEMETRY=1` to disable). A
 - AI Jail: run an agent in a constrained profile so a screened-and-denied action
   is stopped rather than merely flagged. Linux (bubblewrap) and macOS
   (sandbox-exec) only; `contain` exits with an explicit error on Windows rather
-  than pretending to isolate.
+  than pretending to isolate. On Linux, where the host takes it, every jail
+  starts its programs under a seccomp filter that refuses `TIOCSTI` and
+  `TIOCLINUX`, the terminal commands that push input into your terminal, and
+  new btrfs or bcachefs subvolumes and snapshots.
 - Agent identity (off by default, Linux): `innerwarden contain --identity --
   <command>` records the run as an instance, so its hook and the dashboard can
   tell one agent's runs apart. See [Agent identity and trust](#agent-identity-and-trust).
@@ -183,8 +186,62 @@ The hook in a jail never applies a relaxation on its own word. When your
 general rules send a shell command of an identified instance to review, the
 hook asks InnerWarden Active Defence on the same host, if it runs there, and
 the host decides. The hook keeps the stricter of its own decision and the
-host's, so a deny, your suppressions and your own profiles file still win, and
-the trust it records stays its own reading from inside the jail.
+host's, so a deny and your own profiles file still win, and the trust it
+records stays its own reading from inside the jail. A review the hook would
+block on its line is still asked about, because the host may relax it; the
+host lets nothing of it run that the hook does not keep. When the host
+refuses a command on its own (it will not start a program in it), the hook
+says: "Active Defence on this host will not start a program in this command."
+and records the block as the host's.
+
+A profile in the system file (`/etc/innerwarden/agent-profiles.toml`,
+`schema_version = 2`) can ask for more: with `ask_host = "every_command"`
+the hook asks the host about every shell command of that type's identified
+instances, confined or not, that it does not refuse itself, including the
+ones your general rules allow. A command they allow, your suppressions
+included, is made stricter only by a refusal of the host's own: the host's
+reading of your general rules does not override your suppressions. A command
+the hook refuses is never asked about. It costs a request to the host on
+every command, bounded like the others. Only the system file says
+`ask_host`; the user's file never does, and a file of schema 1 that says it
+is refused. Every program that reads the system file must read schema 2
+before you write one: an older `innerwarden` refuses a file of schema 2, and
+so does an older Active Defence on the host, which reads the same file.
+Update both first.
+
+A profile of schema 2, in either file, can also say when its jail starts and
+what of the home it hides, under `[profile.<type>.jail]`:
+
+- `start = "only_when_admitted"`: `contain --identity` starts the agent only
+  once Active Defence on the host has admitted the jail. Otherwise it says
+  "Active Defence on this host did not admit this jail, and its profile
+  starts it only when admitted.", says what to check and which file asks for
+  it, and exits 2 with nothing started. Inside the jail the command starts
+  through `innerwarden contain-gate`, which will not start it without the
+  record of that admission, so a launcher stopped while it waits (a Ctrl-C,
+  killed) starts nothing either. On macOS such a profile never starts.
+- `hide_home = [".cache/git/credential"]`: home paths the jail covers with an
+  empty mount on Linux, or denies on macOS. A link on the way is followed and
+  the place it leads to is hidden. A path that leads outside the home, or
+  that would cover the project, the guard, a read-only path or the agent's
+  own settings, stops the launch; a home folder the jail writes that is
+  itself a link (`~/.cache` on another disk) counts as the home where it
+  leads. On Linux a path that is not there yet, in a folder the jail writes,
+  is made empty (mode 0700) first, so what a program makes there later stays
+  hidden too.
+
+The user's file can only tighten these: the stricter `start` and every hidden
+path of both files hold. When Active Defence sends a note about the jail (for
+example, whether kernel protection is in effect for the session), it prints
+it as `innerwarden contain: <note>`.
+
+Every Linux jail keeps the host's name resolution working: where
+`/etc/resolv.conf` is a link into `/run`, the file it leads to is shown
+read-only in the jail, and nothing else of the host's `/run`. Where that file
+sits in a folder of resolver data alone (resolvconf), the folder is shown, so
+the jail follows the host when the network changes. Elsewhere
+(systemd-resolved, NetworkManager) a jail keeps the resolver file it started
+with until the agent is restarted.
 
 Where a per-agent relaxation applies:
 
@@ -204,9 +261,41 @@ commands only; MCP tools and file edits keep your general rules. A profile
 applies to any program started in a jail under its agent's name: the type is
 the name given at launch.
 
-Limits: this is not yet proven on RHEL 9 or Rocky 9, and where bubblewrap is
-older than 0.8 (or installed setuid) programs in the jail can still create user
-namespaces.
+An identified jail starts its programs under a seccomp filter, in the style of
+Flatpak: no new user namespaces, no joining other namespaces, no new btrfs or
+bcachefs subvolumes or snapshots, and no `TIOCSTI` or `TIOCLINUX`, the
+terminal commands that push input into your terminal. Its
+programs run with no capability, also when `contain` itself runs as root.
+Programs that need their own user namespace (Chromium's sandbox, rootless
+containers, an agent's own bubblewrap sandbox) do not work inside it; turn the
+agent's own sandbox off inside `innerwarden contain`. A 32-bit program (i386
+or x32 on x86_64, arm on aarch64) is ended at its first call in an identified
+jail. A jail started without `--identity` gets only the terminal rule and the
+subvolume rule, and applies them to 32-bit programs too, which run in it as
+before. Every jail refuses new subvolumes and snapshots because a snapshot of
+the project would show the files the jail hides in it (`.env`, `secrets/`,
+each `--deny-read` path).
+
+Where the host cannot start a jail with the filter (a kernel without seccomp
+filters, a binary run under another architecture's emulation, a build for an
+architecture other than x86_64 or aarch64), the jail runs without it and
+`contain` says so when it starts, naming the keystrokes and the snapshots its
+programs can then make. An identified jail whose host takes only the plain
+jail's filter gets that one, and `contain` says user namespaces stay open,
+joining other namespaces too, and that a 32-bit program runs in it; the
+terminal rule and the subvolume rule still hold.
+
+Limits: the filter covers those commands only. It refuses only new
+subvolumes and snapshots: a snapshot made before the jail started, in a folder
+the jail shows, still holds the files the jail hides (`.env`, `secrets/`, each
+`--deny-read` path), and a program in the jail can read them there. Keep such
+snapshots out of the project and out of the folders the jail shows. The jail
+shares the host's network, so a program in it can still reach any abstract unix socket,
+a desktop's X server among them, and through X type into another window. On
+a kernel older than 4.8, a program in the jail that traces another can change
+a call after the filter has seen it: there an identified jail does not close
+user namespaces, and `contain` says the filter is weaker. This is not
+yet proven on RHEL 9 or Rocky 9.
 
 ## Build from source
 

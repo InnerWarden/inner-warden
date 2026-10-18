@@ -35,6 +35,7 @@ export function decidedByLabel(value?: string): string {
     llm: "Your model",
     human: "Human review",
     user: "User decision",
+    host: "Host defence",
     "host-edr": "Host defence",
   };
   if (!value || value === "unknown") return "Source unknown";

@@ -411,6 +411,44 @@ export type AgentSessionRef = {
   evidence: EvidenceRef[];
 };
 
+/** A position of the kernel protection of a type of agent, or of one part of it. */
+export type AgentKernelMode = "off" | "observe" | "enforce";
+
+/** One part of the kernel protection, by a key this kit does not interpret. */
+export type AgentKernelPart = {
+  key: string;
+  /** The mode the part is in, after everything that lowers it. */
+  effective: AgentKernelMode;
+  /** Why it is lower than the type's mode, in the host's words. */
+  why?: string;
+};
+
+/** What watching the type has seen so far. */
+export type AgentKernelWatch = {
+  since: string | null;
+  sessions: number;
+  agent_starts: number;
+  /** What `enforce` would refuse, counted by a part's key. */
+  would_refuse: { key: string; n: number }[];
+};
+
+/**
+ * The kernel protection the host keeps over one type of agent. Produced
+ * only by InnerWarden Active Defence: Community never produces it and never
+ * shows it. Opaque to this kit: the parts are keys it does not know, and it
+ * checks only that the shape holds, dropping the whole field when it does
+ * not (`parseAgentInventory`), never the subject.
+ */
+export type AgentKernel = {
+  mode: AgentKernelMode;
+  strict: boolean;
+  parts: AgentKernelPart[];
+  watch: AgentKernelWatch;
+  ready: boolean;
+  blockers: string[];
+  checked_at?: string | null;
+};
+
 export type AgentSubject = {
   agent_id: string;
   principal: string | null;
@@ -432,6 +470,11 @@ export type AgentSubject = {
   guardrail_configured_at?: string | null;
   guardrail_recorded_activity?: number | null;
   guardrail_last_observed_at?: string | null;
+  /**
+   * The host's kernel protection over this type of agent. Optional and
+   * absent from every producer but Active Defence (see `AgentKernel`).
+   */
+  kernel?: AgentKernel;
 };
 
 export type AgentInventory = {

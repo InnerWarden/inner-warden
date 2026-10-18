@@ -24,8 +24,7 @@ import {
   trustWord,
   TRUSTS,
   UNKNOWN_REASON_WORDS,
-  USERNS_OPEN_CODES,
-  USERNS_OPEN_WORDS,
+  USERNS_CLOSED_WORDS,
   VERDICTS,
   WITHHELD_WORDS,
   withheldWords,
@@ -312,21 +311,21 @@ describe("the CLI's identity fixtures read as written", () => {
 });
 
 describe("user namespaces inside the jail are a fact, not a reason", () => {
-  it("none of their words is a reason code, and every code has its sentence", () => {
-    for (const code of USERNS_OPEN_CODES) {
+  it("its words name the filter and are no reason code", () => {
+    expect(USERNS_CLOSED_WORDS).toBe("User namespaces closed inside the jail (sandbox filter).");
+    for (const code of ["userns_closed", "bwrap_too_old", "bwrap_setuid", "userns_probe_failed"]) {
       expect((REASON_CODES as readonly string[]).includes(code), code).toBe(false);
-      expect(USERNS_OPEN_WORDS[code].length, code).toBeGreaterThan(20);
       expect(effectiveTrust("host_verified", code), code).toBe("declared");
     }
   });
 
-  it("is read only as a closed jail or a known reason, and moves no trust", () => {
+  it("is read only as a closed jail, and moves no trust", () => {
     const read = (technical: Record<string, unknown>) => readAgentIdentity({ instances: [instance({ technical })] });
     const first = (r: ReturnType<typeof read>) => r?.instances[0];
     expect(first(read({ userns_closed: true }))?.technical.usernsClosed).toBe(true);
     expect(first(read({ userns_closed: "true" }))?.technical.usernsClosed).toBeUndefined();
-    expect(first(read({ userns_open_reason: "bwrap_setuid" }))?.technical.usernsOpenReason).toBe("bwrap_setuid");
-    expect(first(read({ userns_open_reason: "confined" }))?.technical.usernsOpenReason).toBeUndefined();
+    // A reason the CLI no longer sends is not read into the view.
+    expect(Object.keys(first(read({ userns_open_reason: "bwrap_setuid" }))?.technical ?? {})).not.toContain("usernsOpenReason");
     expect(first(read({ userns_closed: true }))?.trust).toBe(first(read({}))?.trust);
   });
 });

@@ -129,29 +129,45 @@ fn jail_bwrap() -> Option<std::path::PathBuf> {
         .map(std::path::Path::to_path_buf)
 }
 
-/// What an identified launch on this host does about user namespaces, from
-/// the facts the launcher reads, computed here so each test asserts exactly
-/// one branch.
+/// What a launch on this host does about the jail's seccomp filter, from the
+/// facts the launcher reads, computed here so each test asserts exactly one
+/// branch.
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum UsernsHere {
-    /// No bwrap: a dry run says nothing about them.
+enum FilterHere {
+    /// No bwrap: a dry run says nothing about it.
     NoBwrap,
     /// The kernel restricts unprivileged user namespaces and bwrap has no
     /// profile: the real run stops with the advice, a dry run says it.
     Restricted,
-    /// bwrap 0.8 or later, not setuid, and the throwaway jail with the
-    /// option exits 0: the option is used, the record is schema 2.
-    Closed,
-    /// Any other host: no option, the line that says why, schema 1.
-    Open,
+    /// A throwaway jail under a filter exits 0: every jail gets its filter,
+    /// and an identified one's record is schema 2.
+    Taken,
+    /// Any other host: no filter, the line that says why, schema 1.
+    NotTaken,
+}
+
+/// What a launch on this host does about the filter. With
+/// `IW_REQUIRE_SECCOMP=1` (CI and the release gate set it) anything but
+/// [`FilterHere::Taken`] fails the test: a runner whose bwrap stopped taking
+/// a filter would otherwise prove only the jail without one, and stay green.
+#[cfg(target_os = "linux")]
+fn filter_here() -> FilterHere {
+    let here = filter_here_unchecked();
+    if std::env::var_os("IW_REQUIRE_SECCOMP").is_some_and(|v| v == "1") {
+        assert_eq!(
+            here,
+            FilterHere::Taken,
+            "IW_REQUIRE_SECCOMP=1: this host must start a jail under a seccomp filter"
+        );
+    }
+    here
 }
 
 #[cfg(target_os = "linux")]
-fn userns_here() -> UsernsHere {
-    use std::os::unix::fs::PermissionsExt;
+fn filter_here_unchecked() -> FilterHere {
     let Some(bwrap) = jail_bwrap() else {
-        return UsernsHere::NoBwrap;
+        return FilterHere::NoBwrap;
     };
     let restricted =
         std::fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
@@ -159,54 +175,43 @@ fn userns_here() -> UsernsHere {
     let profile = std::path::Path::new("/etc/apparmor.d/bwrap").exists()
         || std::path::Path::new("/etc/apparmor.d/usr.bin.bwrap").exists();
     if restricted && !profile {
-        return UsernsHere::Restricted;
+        return FilterHere::Restricted;
     }
-    let version = Command::new(&bwrap)
-        .arg("--version")
-        .output()
-        .ok()
-        .and_then(|out| {
-            let text = String::from_utf8_lossy(&out.stdout).into_owned();
-            let number = text.trim().strip_prefix("bubblewrap ")?.to_string();
-            let mut parts = number.split('.').map(|p| {
-                p.chars()
-                    .take_while(char::is_ascii_digit)
-                    .collect::<String>()
-                    .parse::<u32>()
-                    .ok()
-            });
-            Some((
-                parts.next()??,
-                parts.next()??,
-                parts.next().flatten().unwrap_or(0),
-            ))
-        });
-    let setuid = std::fs::metadata(&bwrap)
-        .map(|m| m.permissions().mode() & 0o4000 != 0)
-        .unwrap_or(true);
-    let probe = || {
-        Command::new(&bwrap)
-            .args([
-                "--unshare-user",
-                "--disable-userns",
-                "--unshare-pid",
-                "--unshare-uts",
-                "--unshare-ipc",
-                "--ro-bind",
-                "/",
-                "/",
-                "true",
-            ])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success())
-    };
-    if version.is_some_and(|v| v >= (0, 8, 0)) && !setuid && probe() {
-        UsernsHere::Closed
+    // This test's own probe, independent of the launcher's: a filter that
+    // allows every call of this build's architecture and kills any other
+    // (so a binary under another architecture's emulation is told apart, as
+    // the launcher's filter tells it), on a descriptor, under the namespaces
+    // the jail unshares.
+    let audit_arch: [u8; 4] = if cfg!(target_arch = "x86_64") {
+        0xC000_003Eu32.to_le_bytes()
     } else {
-        UsernsHere::Open
+        0xC000_00B7u32.to_le_bytes()
+    };
+    let mut program = vec![0x20, 0, 0, 0, 4, 0, 0, 0, 0x15, 0, 0, 1];
+    program.extend(audit_arch);
+    program.extend([
+        0x06, 0, 0, 0, 0, 0, 0xff, 0x7f, 0x06, 0, 0, 0, 0, 0, 0, 0x80,
+    ]);
+    let dir = tempfile::TempDir::new().unwrap();
+    let filter = dir.path().join("native.bpf");
+    std::fs::write(&filter, program).unwrap();
+    let taken = Command::new("/bin/sh")
+        .args([
+            "-c",
+            "exec \"$0\" --seccomp 3 --unshare-pid --unshare-uts --unshare-ipc \
+             --ro-bind / / true 3<\"$1\"",
+        ])
+        .arg(&bwrap)
+        .arg(&filter)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    if taken {
+        FilterHere::Taken
+    } else {
+        FilterHere::NotTaken
     }
 }
 
@@ -226,6 +231,13 @@ const READ_THE_RECORD: &str = "readlink /proc/self/ns/pid; \
         then echo RECORD-REPLACED; fi; \
     if [ -e /run/innerwarden/agent-tls.spki ]; then echo KEY-HANDED-IN; fi; \
     if [ -e /run/innerwarden/system-profiles-root ]; then echo PROFILES-MARKED; fi; \
+    grep -E '^Seccomp(_filters)?:' /proc/self/status; \
+    grep -E '^CapEff:' /proc/self/status; \
+    if ! command -v unshare >/dev/null; then echo NO-UNSHARE; \
+    else \
+        if unshare -n true 2>/dev/null; then echo NET-UNSHARED; else echo NET-REFUSED; fi; \
+        if unshare -U true 2>/dev/null; then echo NESTED-USERNS; else echo NESTED-REFUSED; fi; \
+    fi; \
     exit 0";
 
 #[cfg(target_os = "linux")]
@@ -329,24 +341,45 @@ fn identity_flag_mounts_the_record_read_only_inside_and_keeps_a_private_copy() {
     assert!(!stdout.contains("PROFILES-MARKED"), "{stdout}");
 
     let record: serde_json::Value = serde_json::from_slice(&outside).unwrap();
-    // Schema 2 exactly when this host's bwrap takes the option (0.8 or later,
-    // not setuid, the throwaway jail exits 0): then, and only then, the record
-    // says so. Any other host writes the schema 1 it always wrote, without
-    // the field.
-    match userns_here() {
-        UsernsHere::Closed => {
+    // Schema 2 exactly when this host takes the filter (the throwaway jail
+    // under it exits 0): then, and only then, the record says so, the jail's
+    // programs run under it and cannot make a user namespace. Any other host
+    // writes the schema 1 it always wrote, without the field.
+    match filter_here() {
+        FilterHere::Taken => {
             assert_eq!(record["schema"], 2, "{record}");
             assert_eq!(record["jail"]["userns_closed"], true, "{record}");
+            assert!(runs_under_one_more_filter(&stdout, true), "{stdout}");
+            assert!(!stdout.contains("NESTED-USERNS"), "{stdout}");
+            if !stdout.contains("NO-UNSHARE") {
+                assert!(stdout.contains("NESTED-REFUSED"), "{stdout}");
+            }
         }
-        UsernsHere::Open => {
+        FilterHere::NotTaken => {
             assert_eq!(record["schema"], 1, "{record}");
             assert!(record["jail"].get("userns_closed").is_none(), "{record}");
+            // Each thing the jail runs without is said: user namespaces,
+            // and the plain jail's rules (keystrokes, new subvolumes) the
+            // identified filter also carried.
             assert!(
-                stderr.contains("innerwarden contain: user namespaces stay open ("),
+                stderr.contains(
+                    "innerwarden contain: user namespaces stay open (userns_probe_failed)"
+                ),
+                "{stderr}"
+            );
+            assert!(
+                stderr.contains("innerwarden contain: no sandbox filter (filter_probe_failed)"),
                 "{stderr}"
             );
         }
         other => panic!("the jail ran on a host where {other:?}: {record}"),
+    }
+    // No capability inside, filter or not, whoever runs the launcher: as
+    // root bwrap would otherwise keep every one of root's, in the host's user
+    // namespace, and a new network or mount namespace would follow.
+    assert!(stdout.contains("CapEff:\t0000000000000000"), "{stdout}");
+    if !stdout.contains("NO-UNSHARE") {
+        assert!(stdout.contains("NET-REFUSED"), "{stdout}");
     }
     assert_eq!(record["agent_type"], "claude-code");
     assert_eq!(record["mode"], "monitor");
@@ -400,7 +433,10 @@ fn without_the_identity_flag_no_record_is_written_and_nothing_changes() {
             "/bin/sh",
             "-c",
             "readlink /proc/self/ns/pid; \
-             if [ -e /run/innerwarden/system-profiles-root ]; then echo PROFILES-MARKED; fi",
+             if [ -e /run/innerwarden/system-profiles-root ]; then echo PROFILES-MARKED; fi; \
+             grep -E '^Seccomp(_filters)?:' /proc/self/status; \
+             if ! command -v unshare >/dev/null; then echo NO-UNSHARE; \
+             elif unshare -U true 2>/dev/null; then echo NESTED-USERNS; else echo NESTED-REFUSED; fi",
         ])
         .env("HOME", home.path())
         .env_remove("XDG_STATE_HOME")
@@ -423,12 +459,87 @@ fn without_the_identity_flag_no_record_is_written_and_nothing_changes() {
     );
     // The launcher's marker that the way to the system profiles file is
     // root's: only where the host has that file.
+    let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(
-        String::from_utf8_lossy(&output.stdout).contains("PROFILES-MARKED"),
+        stdout.contains("PROFILES-MARKED"),
         std::path::Path::new(SYSTEM_PROFILES).exists(),
-        "{}",
-        String::from_utf8_lossy(&output.stdout)
+        "{stdout}"
     );
+    // The one change without the flag, on purpose: the jail's programs run
+    // under the terminal filter where the host takes it, which refuses the
+    // two terminal commands that push input (by every ABI the kernel runs,
+    // 32-bit ones included) and nothing else a plain jail could do before,
+    // user namespaces included.
+    match filter_here() {
+        FilterHere::Taken => {
+            assert!(runs_under_one_more_filter(&stdout, true), "{stdout}");
+            assert!(!stderr.contains("no sandbox filter"), "{stderr}");
+            if !stdout.contains("NO-UNSHARE") && unshare_works_here() {
+                assert!(stdout.contains("NESTED-USERNS"), "{stdout}");
+            }
+        }
+        FilterHere::NotTaken => {
+            assert!(
+                stderr.contains("innerwarden contain: no sandbox filter (filter_probe_failed)"),
+                "{stderr}"
+            );
+            assert!(runs_under_one_more_filter(&stdout, false), "{stdout}");
+        }
+        other => panic!("the jail ran on a host where {other:?}: {stdout}"),
+    }
+}
+
+/// The `Seccomp_filters:` count of a `/proc/<pid>/status` text.
+#[cfg(target_os = "linux")]
+fn seccomp_filters(status: &str) -> Option<u32> {
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("Seccomp_filters:"))
+        .and_then(|n| n.trim().parse().ok())
+}
+
+/// Whether the jail's programs (their `/proc/self/status` lines in
+/// `inside`) run under exactly one filter more than this test does when
+/// `filtered`, and under the same ones otherwise. The count, not the mode:
+/// a test that already runs under a filter (a container's, an emulator's)
+/// shows mode 2 inside any jail. A kernel too old to count filters (before
+/// 5.9) is judged by the mode alone, and only where the jail has one.
+#[cfg(target_os = "linux")]
+fn runs_under_one_more_filter(inside: &str, filtered: bool) -> bool {
+    let own = std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .as_deref()
+        .and_then(seccomp_filters);
+    match (own, seccomp_filters(inside)) {
+        (Some(own), Some(jail)) => jail == own + u32::from(filtered),
+        _ => !filtered || inside.contains("Seccomp:\t2"),
+    }
+}
+
+/// Whether a jail without any filter can make a user namespace here: the
+/// host's own answer, so the plain jail is held to what it could do before.
+#[cfg(target_os = "linux")]
+fn unshare_works_here() -> bool {
+    let Some(bwrap) = jail_bwrap() else {
+        return false;
+    };
+    Command::new(bwrap)
+        .args([
+            "--unshare-pid",
+            "--unshare-uts",
+            "--unshare-ipc",
+            "--ro-bind",
+            "/",
+            "/",
+            "unshare",
+            "-U",
+            "true",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 /// The host's system profiles file.
@@ -543,18 +654,25 @@ fn dry_run_shows_the_record_and_info_descriptors_only_with_the_identity_flag() {
         .filter(|l| !l.starts_with("#   IW_HOOK_AGENT="))
         .map(|l| format!("{l}\n"))
         .collect();
-    // The ways the dry run speaks of user namespaces: the option in the
-    // argument list, the line that says why it is not there, or, where the
-    // kernel's restriction stops the real run first, its advice. Exactly the
-    // one this host's facts give, and the plain run says none.
-    let option = " --unshare-user --disable-userns";
+    // The ways the dry run speaks of the filter: the filter in the argument
+    // list, the line that says why it is not there, or, where the kernel's
+    // restriction stops the real run first, its advice. Exactly the one this
+    // host's facts give; the plain run shows the same filter (its own, the
+    // terminal one) and never the advice.
+    let option = " --unshare-ipc --seccomp 13 --cap-drop ALL --hostname ai-sandbox ";
+    let plain_option = " --unshare-ipc --seccomp 13 --hostname ai-sandbox ";
     let said = "# innerwarden contain: user namespaces stay open (";
+    let plain_said = "# innerwarden contain: no sandbox filter (filter_probe_failed): ";
     let advice = "# innerwarden contain: this kernel restricts unprivileged user namespaces";
     assert!(
-        !plain.contains("--disable-userns") && !plain.contains(said) && !plain.contains(advice),
+        !plain.contains("--disable-userns")
+            && !identified.contains("--disable-userns")
+            && !identified.contains("--unshare-user")
+            && !plain.contains(said)
+            && !plain.contains(advice),
         "{plain}"
     );
-    let here = userns_here();
+    let here = filter_here();
     assert_eq!(
         (
             identified.contains(option),
@@ -562,37 +680,47 @@ fn dry_run_shows_the_record_and_info_descriptors_only_with_the_identity_flag() {
             identified.contains(advice)
         ),
         match here {
-            UsernsHere::NoBwrap => (false, false, false),
-            UsernsHere::Restricted => (false, false, true),
-            UsernsHere::Closed => (true, false, false),
-            UsernsHere::Open => (false, true, false),
+            FilterHere::NoBwrap => (false, false, false),
+            FilterHere::Restricted => (false, false, true),
+            FilterHere::Taken => (true, false, false),
+            FilterHere::NotTaken => (false, true, false),
         },
         "{here:?}: {identified}"
     );
-    if here == UsernsHere::Closed {
-        assert_eq!(
-            identified.matches("--disable-userns").count(),
-            1,
-            "{identified}"
-        );
-        assert!(
-            identified.contains(&format!(" --unshare-ipc{option} --hostname ai-sandbox ")),
-            "the option follows the namespaces: {identified}"
-        );
-    }
-    if here == UsernsHere::Open {
+    assert_eq!(
+        (plain.contains(plain_option), plain.contains(plain_said)),
+        match here {
+            FilterHere::NoBwrap | FilterHere::Restricted => (false, false),
+            FilterHere::Taken => (true, false),
+            FilterHere::NotTaken => (false, true),
+        },
+        "{here:?}: {plain}"
+    );
+    assert!(identified.matches("--seccomp").count() <= 1, "{identified}");
+    if here == FilterHere::NotTaken {
         assert!(
             identified
                 .lines()
                 .filter(|l| l.starts_with(said))
-                .all(|l| l.contains("(bwrap_too_old)")
-                    || l.contains("(bwrap_setuid)")
-                    || l.contains("(userns_probe_failed)")),
+                .all(|l| l.contains("(userns_probe_failed)")),
+            "{identified}"
+        );
+        // The plain jail's rules went with the identified filter: said too.
+        assert!(
+            identified.lines().any(|l| l.starts_with(plain_said)),
             "{identified}"
         );
     }
+    // Every identified jail drops every capability, filter or not; the plain
+    // one never asks.
+    assert_eq!(
+        identified.matches(" --cap-drop ALL ").count(),
+        1,
+        "{identified}"
+    );
+    assert!(!plain.contains("--cap-drop"), "{plain}");
     // The advice block is the real run's refusal, said as comments.
-    let advice_lines: Vec<&str> = if here == UsernsHere::Restricted {
+    let advice_lines: Vec<&str> = if here == FilterHere::Restricted {
         identified
             .lines()
             .skip_while(|l| !l.starts_with(advice))
@@ -601,11 +729,16 @@ fn dry_run_shows_the_record_and_info_descriptors_only_with_the_identity_flag() {
     } else {
         Vec::new()
     };
+    let plain: String = plain
+        .lines()
+        .filter(|l| !l.starts_with(plain_said))
+        .map(|l| format!("{l}\n"))
+        .collect();
     let without: String = identified
         .replace(" --ro-bind-data 10 /run/innerwarden/instance.json", "")
         .replace(key, "")
-        .replace(option, "")
         .replace(" --info-fd 9", "")
+        .replace(" --cap-drop ALL", "")
         .replace(
             &format!(
                 " --tmpfs {}",
@@ -619,6 +752,7 @@ fn dry_run_shows_the_record_and_info_descriptors_only_with_the_identity_flag() {
         .filter(|l| {
             !l.starts_with("# innerwarden contain: no scope")
                 && !l.starts_with(said)
+                && !l.starts_with(plain_said)
                 && !advice_lines.contains(l)
         })
         .map(|l| format!("{l}\n"))
@@ -722,4 +856,873 @@ fn identity_hides_the_launchers_records_and_names_the_jails_mount_namespace() {
         "{stdout}"
     );
     assert_eq!(lines.next(), Some("seen=0"), "{stdout}");
+}
+
+/// A home whose own profile starts the claude-code jail only once Active
+/// Defence on the host admitted it.
+#[cfg(target_os = "linux")]
+fn home_that_starts_only_once_admitted() -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt;
+    let home = state_home();
+    let dir = home.path().join(".config/innerwarden");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("agent-profiles.toml");
+    std::fs::write(
+        &file,
+        "schema_version = 2\n[profile.claude-code.jail]\nstart = \"only_when_admitted\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    home
+}
+
+/// The processes whose command line names `marker`: a jail left behind.
+#[cfg(target_os = "linux")]
+fn processes_naming(marker: &std::path::Path) -> Vec<String> {
+    let needle = marker.to_string_lossy().into_owned();
+    std::fs::read_dir("/proc")
+        .unwrap()
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().parse::<u32>().is_ok())
+        .filter_map(|entry| std::fs::read(entry.path().join("cmdline")).ok())
+        .map(|bytes| String::from_utf8_lossy(&bytes).replace('\0', " "))
+        .filter(|line| line.contains(&needle))
+        .collect()
+}
+
+/// What the launcher's child wrote on stderr, read to its end on a thread,
+/// so a process that outlived the launcher is waited for, up to a bound.
+#[cfg(target_os = "linux")]
+fn stderr_to_end(child: &mut std::process::Child) -> std::sync::mpsc::Receiver<String> {
+    let mut stderr = child.stderr.take().expect("stderr piped");
+    let (send, receive) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = std::io::Read::read_to_string(&mut stderr, &mut text);
+        let _ = send.send(text);
+    });
+    receive
+}
+
+/// F17-cw: a jail whose profile starts it only once the host admitted it,
+/// on a host with no Active Defence, never runs its command. The launcher
+/// says why and exits 2, its own record of the instance is removed, and no
+/// process of the jail is left. The jail's first process is ended while it
+/// waits for its record, so not even the gate runs.
+///
+/// FAILS ON REVERT: hand the record in whatever the host said (drop the
+/// `starts` check in `launch_identified`) and the command runs; end only
+/// bwrap in `end_jail` (before 11908c7) and the jail's first process reads
+/// the closed pipe and runs the gate, whose refusal is then on stderr.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_jail_the_host_did_not_admit_never_runs_its_command() {
+    require_bwrap();
+    let home = home_that_starts_only_once_admitted();
+    let project = tempfile::TempDir::new().unwrap();
+    let marker = project.path().join("COMMAND-RAN");
+    let script = format!("touch '{}'", marker.display());
+    let mut command = cli();
+    command
+        .args([
+            "contain",
+            "--identity",
+            "--project",
+            project.path().to_str().unwrap(),
+            "--",
+            "/bin/sh",
+            "-c",
+            &script,
+        ])
+        .env("HOME", home.path())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    let mut child = identified_without_a_scope(&mut command)
+        .spawn()
+        .expect("run Linux AI Jail with --identity");
+    let stderr = stderr_to_end(&mut child);
+    let status = child.wait().unwrap();
+    let stderr = stderr
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("every process of the jail ended");
+    assert_eq!(status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains(
+            "innerwarden contain: Active Defence on this host did not admit this jail, and its \
+             profile starts it only when admitted."
+        ),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "innerwarden contain: Check that Active Defence is running (systemctl status \
+             innerwarden-agent), then try again. The jail waits for it because of start = \
+             \"only_when_admitted\" in {}.",
+            home.path()
+                .join(".config/innerwarden/agent-profiles.toml")
+                .display()
+        )),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("holds no record that the host admitted it"),
+        "the jail's first process was ended before it read its record: {stderr}"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert!(!marker.exists(), "the command ran: {stderr}");
+    assert!(
+        processes_naming(&marker).is_empty(),
+        "a process of the jail is left: {:?}",
+        processes_naming(&marker)
+    );
+    let dir = home.path().join(".local/state/innerwarden/instances");
+    let records: Vec<_> = std::fs::read_dir(&dir)
+        .map(|entries| entries.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default();
+    assert!(
+        records.is_empty(),
+        "no record of an instance that never ran: {records:?}"
+    );
+}
+
+/// SEC-4: a launcher that dies while it waits for the host's answer (killed,
+/// a Ctrl-C, the OOM killer) leaves its jail an empty record, and the jail
+/// does not start its command: the gate refuses it.
+///
+/// The host here is a listener that takes the request and never answers;
+/// the launcher is SIGKILLed the moment the request arrives, after bwrap
+/// reported the jail's first process and before the launcher decided.
+///
+/// FAILS ON REVERT: hand the jail its command without the gate (drop
+/// `gate_instance` in `build_linux_jail`, as before this fix) and the
+/// command runs once the launcher is gone.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_launcher_that_dies_before_the_host_answers_starts_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+    require_bwrap();
+    let home = home_that_starts_only_once_admitted();
+    let project = tempfile::TempDir::new().unwrap();
+    let marker = project.path().join("COMMAND-RAN");
+    let script = format!("touch '{}'", marker.display());
+    // Active Defence is "installed" (its ctl is found), and its agent is a
+    // listener that takes the request and answers nothing.
+    let ad = tempfile::TempDir::new().unwrap();
+    let ctl = ad.path().join("innerwarden-ctl");
+    std::fs::write(&ctl, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&ctl, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+
+    let mut command = cli();
+    command
+        .args([
+            "contain",
+            "--identity",
+            "--project",
+            project.path().to_str().unwrap(),
+            "--",
+            "/bin/sh",
+            "-c",
+            &script,
+        ])
+        .env("HOME", home.path())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    let mut child = identified_without_a_scope(&mut command)
+        .env("IW_AD_CLI_DIRS", ad.path())
+        .env("INNERWARDEN_AGENT_URL", &url)
+        .spawn()
+        .expect("run Linux AI Jail with --identity");
+    let stderr = stderr_to_end(&mut child);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let held = loop {
+        match listener.accept() {
+            Ok((stream, _)) => break stream,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if std::time::Instant::now() > deadline || child.try_wait().unwrap().is_some() {
+                    let _ = child.kill();
+                    panic!(
+                        "the launcher never asked the host: {}",
+                        stderr
+                            .recv_timeout(std::time::Duration::from_secs(5))
+                            .unwrap_or_default()
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(e) => panic!("accept: {e}"),
+        }
+    };
+    child.kill().expect("SIGKILL the launcher");
+    child.wait().unwrap();
+    let stderr = stderr
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("every process of the jail ended");
+    drop(held);
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert!(
+        !marker.exists(),
+        "the command ran without an admission: {stderr}"
+    );
+    assert!(
+        stderr.contains("innerwarden contain: this jail holds no record that the host admitted it"),
+        "the gate refused it: {stderr}"
+    );
+    assert!(
+        processes_naming(&marker).is_empty(),
+        "a process of the jail is left: {:?}",
+        processes_naming(&marker)
+    );
+}
+
+/// A home whose own profile hides `paths` in the claude-code jail.
+#[cfg(target_os = "linux")]
+fn home_that_hides(paths: &[&str]) -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt;
+    let home = state_home();
+    let dir = home.path().join(".config/innerwarden");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("agent-profiles.toml");
+    let list = paths
+        .iter()
+        .map(|path| format!("\"{path}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    std::fs::write(
+        &file,
+        format!("schema_version = 2\n[profile.claude-code.jail]\nhide_home = [{list}]\n"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    home
+}
+
+/// brk-1: a hidden home path that is a link (a dotfiles manager's
+/// `~/.config/gh -> ../dotfiles/gh`) does not stop the jail: bwrap is never
+/// asked to mount on a link, and the token stays out of reach. A link to a
+/// folder the jail shows (`~/.config/gh3 -> ~/.local/share/gh3`) is covered
+/// where it leads.
+///
+/// FAILS ON REVERT: mount the path as named (`plan_hidden_home` before this
+/// fix) and bwrap aborts: "Can't mount tmpfs on .../.config/gh".
+#[cfg(target_os = "linux")]
+#[test]
+fn a_hidden_home_path_behind_a_link_hides_what_it_leads_to() {
+    require_bwrap();
+    let home = home_that_hides(&[".config/gh", ".config/gh3"]);
+    let h = home.path();
+    std::fs::create_dir_all(h.join("dotfiles/gh")).unwrap();
+    std::fs::write(h.join("dotfiles/gh/hosts.yml"), "TOKEN-GH").unwrap();
+    std::os::unix::fs::symlink("../dotfiles/gh", h.join(".config/gh")).unwrap();
+    std::fs::create_dir_all(h.join(".local/share/gh3")).unwrap();
+    std::fs::write(h.join(".local/share/gh3/hosts.yml"), "TOKEN-GH3").unwrap();
+    std::os::unix::fs::symlink(h.join(".local/share/gh3"), h.join(".config/gh3")).unwrap();
+    let project = tempfile::TempDir::new().unwrap();
+    let script = format!(
+        "cat '{0}/.config/gh/hosts.yml' '{0}/.config/gh3/hosts.yml' \
+         '{0}/.local/share/gh3/hosts.yml' 2>/dev/null; echo DONE",
+        h.display()
+    );
+    let mut command = cli();
+    command
+        .args([
+            "contain",
+            "--identity",
+            "--project",
+            project.path().to_str().unwrap(),
+            "--",
+            "/bin/sh",
+            "-c",
+            &script,
+        ])
+        .env("HOME", h);
+    let output = identified_without_a_scope(&mut command)
+        .output()
+        .expect("run Linux AI Jail with --identity");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "the jail did not start: {stderr}");
+    assert!(stdout.contains("DONE"), "{stdout} {stderr}");
+    assert!(
+        !stdout.contains("TOKEN"),
+        "a hidden token was read: {stdout}"
+    );
+}
+
+/// F3: a hidden home path that is not there when the jail starts
+/// (`.cache/git/credential` on an account that never used git's credential
+/// cache) is made, empty and 0700, before the jail starts, and covered; what
+/// a host program makes there while the jail runs stays out of it.
+///
+/// FAILS ON REVERT: skip `make_hidden_folder` and the file the host makes
+/// during the run is listed inside the jail.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_hidden_home_path_made_after_the_jail_started_stays_hidden() {
+    use std::os::unix::fs::PermissionsExt;
+    require_bwrap();
+    let home = home_that_hides(&[".cache/git/credential"]);
+    let h = home.path();
+    std::fs::create_dir_all(h.join(".cache")).unwrap();
+    let credential = h.join(".cache/git/credential");
+    assert!(!credential.exists());
+    let project = tempfile::TempDir::new().unwrap();
+    let ready = project.path().join("READY");
+    let script = format!(
+        "touch '{}'; i=0; while [ $i -lt 50 ] && [ ! -e '{}/GO' ]; do sleep 0.1; i=$((i+1)); done; \
+         ls -A '{}'; echo DONE",
+        ready.display(),
+        project.path().display(),
+        credential.display()
+    );
+    let mut command = cli();
+    command
+        .args([
+            "contain",
+            "--identity",
+            "--project",
+            project.path().to_str().unwrap(),
+            "--",
+            "/bin/sh",
+            "-c",
+            &script,
+        ])
+        .env("HOME", h)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let child = identified_without_a_scope(&mut command)
+        .spawn()
+        .expect("run Linux AI Jail with --identity");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !ready.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    // The host's git makes its socket in the folder while the jail runs.
+    std::fs::create_dir_all(&credential).unwrap();
+    std::fs::write(credential.join("socket"), "").unwrap();
+    std::fs::write(project.path().join("GO"), "").unwrap();
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(stdout.contains("DONE"), "{stdout} {stderr}");
+    assert!(
+        !stdout.contains("socket"),
+        "the host's socket is in the jail: {stdout}"
+    );
+    let mode = std::fs::metadata(&credential).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700, "made as git wants it");
+}
+
+/// A person's own home folder that the jail writes is a link to a folder
+/// outside the home (`~/.cache` on another disk): a hidden path below it is
+/// made (empty, 0700) and hidden where the folder leads, as the jail binds
+/// it, and the jail starts. Measured before this: the launch stopped with
+/// "outside the home", having first made the folders through the link.
+///
+/// FAILS ON REVERT: take only the home for the jail's home in
+/// `plan_hidden_home` and the launch stops "outside the home".
+#[cfg(target_os = "linux")]
+#[test]
+fn a_home_folder_linked_outside_the_home_hides_where_it_leads() {
+    use std::os::unix::fs::PermissionsExt;
+    require_bwrap();
+    let home = home_that_hides(&[".cache/git/credential", ".cache/gh"]);
+    let h = home.path();
+    let elsewhere = tempfile::TempDir::new().unwrap();
+    let cache = elsewhere.path().join("cache");
+    std::fs::create_dir_all(cache.join("gh")).unwrap();
+    std::fs::write(cache.join("gh/hosts.yml"), "TOKEN-GH").unwrap();
+    std::os::unix::fs::symlink(&cache, h.join(".cache")).unwrap();
+    let project = tempfile::TempDir::new().unwrap();
+    let script = format!(
+        "cat '{0}/.cache/gh/hosts.yml' 2>/dev/null; ls -A '{0}/.cache/git/credential'; echo DONE",
+        h.display()
+    );
+    let mut command = cli();
+    command
+        .args([
+            "contain",
+            "--identity",
+            "--project",
+            project.path().to_str().unwrap(),
+            "--",
+            "/bin/sh",
+            "-c",
+            &script,
+        ])
+        .env("HOME", h);
+    let output = identified_without_a_scope(&mut command)
+        .output()
+        .expect("run Linux AI Jail with --identity");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "the jail did not start: {stderr}");
+    assert!(stdout.contains("DONE"), "{stdout} {stderr}");
+    assert!(
+        !stdout.contains("TOKEN"),
+        "a hidden token was read: {stdout}"
+    );
+    let made = cache.join("git/credential");
+    let mode = std::fs::metadata(&made).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700, "made where the folder leads, as git wants it");
+    assert!(
+        std::fs::symlink_metadata(h.join(".cache"))
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the person's link is left as it was"
+    );
+}
+
+/// F2: a link planted where a hidden home path will be (the agent can write
+/// `~/.cache`) never moves the mask: one that leads to the project, or
+/// outside the home, stops the launch before anything runs.
+///
+/// FAILS ON REVERT (measured): drop the home check in `plan_hidden_home`
+/// and the launch goes on with the link to `/etc/apt`; drop the check of
+/// what the jail needs in `validate_jail_inputs` and the jail starts with
+/// its project under an empty mount.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_planted_link_never_moves_a_hidden_home_path() {
+    require_bwrap();
+    for target in ["project", "/etc/apt"] {
+        let home = home_that_hides(&[".cache/git/credential"]);
+        let h = home.path();
+        let project = tempfile::TempDir::new_in(h).unwrap();
+        std::fs::write(project.path().join("main.rs"), "fn main() {}").unwrap();
+        std::fs::create_dir_all(h.join(".cache/git")).unwrap();
+        let to = if target == "project" {
+            project.path().to_path_buf()
+        } else {
+            std::path::PathBuf::from(target)
+        };
+        std::os::unix::fs::symlink(&to, h.join(".cache/git/credential")).unwrap();
+        let marker = project.path().join("COMMAND-RAN");
+        let script = format!("touch '{}'", marker.display());
+        let mut command = cli();
+        command
+            .args([
+                "contain",
+                "--identity",
+                "--project",
+                project.path().to_str().unwrap(),
+                "--",
+                "/bin/sh",
+                "-c",
+                &script,
+            ])
+            .env("HOME", h);
+        let output = identified_without_a_scope(&mut command)
+            .output()
+            .expect("run Linux AI Jail with --identity");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{target}: {stderr}");
+        assert!(
+            stderr.contains("holds the project") || stderr.contains("outside the home"),
+            "{target}: {stderr}"
+        );
+        assert!(!marker.exists(), "{target}: the command ran");
+    }
+}
+
+/// What the btrfs side of [`no_jail_on_this_disk_makes_a_subvolume_or_snapshot`]
+/// runs, in a folder (`$1`) that holds a subvolume `src` of this user's,
+/// with the `btrfs` tool at `$2`: the tool's `subvolume create` and
+/// `subvolume snapshot`, then each of the four btrfs commands that make a
+/// subvolume or a snapshot, by its number, from `python3`. One `key=value`
+/// line each: the tool's exit code, or the command's errno (0 when it made
+/// what it names).
+#[cfg(target_os = "linux")]
+const MAKE_BTRFS_SUBVOLUMES: &str = r#"cd "$1" || exit 90
+"$2" subvolume create tool-subvol >/dev/null 2>err; echo "tool_subvolume=$?"; cat err >&2
+"$2" subvolume snapshot src tool-snap >/dev/null 2>err; echo "tool_snapshot=$?"; cat err >&2
+rm -f err
+python3 - <<'PY'
+import fcntl, os, struct
+here = os.open(".", os.O_RDONLY | os.O_DIRECTORY)
+src = os.open("src", os.O_RDONLY | os.O_DIRECTORY)
+def v1(fd, name):
+    return bytearray(struct.pack("=q4088s", fd, name))
+def v2(fd, name):
+    return bytearray(struct.pack("=qQQ32x4040s", fd, 0, 0, name))
+for key, command, arg in (
+    ("snap_create", 0x50009401, v1(src, b"v1-snap")),
+    ("subvol_create", 0x5000940E, v1(0, b"v1-subvol")),
+    ("snap_create_v2", 0x50009417, v2(src, b"v2-snap")),
+    ("subvol_create_v2", 0x50009418, v2(0, b"v2-subvol")),
+):
+    try:
+        fcntl.ioctl(here, command, arg)
+        print(f"{key}=0")
+    except OSError as e:
+        print(f"{key}={e.errno}")
+PY
+"#;
+
+/// The bcachefs side of [`MAKE_BTRFS_SUBVOLUMES`], with the `bcachefs` tool
+/// at `$2`: the tool's `subvolume create` and `subvolume snapshot`, then
+/// each of the two bcachefs commands, as a new subvolume and as a snapshot
+/// of `src`, by its number, from `python3`. `struct bch_ioctl_subvolume`
+/// is `flags`, `dirfd`, `mode`, 6 bytes of padding and the two paths'
+/// addresses; `_v2` adds 16 bytes for an error message, left empty.
+#[cfg(target_os = "linux")]
+const MAKE_BCACHEFS_SUBVOLUMES: &str = r#"cd "$1" || exit 90
+"$2" subvolume create tool-subvol >/dev/null 2>err; echo "tool_subvolume=$?"; cat err >&2
+"$2" subvolume snapshot src tool-snap >/dev/null 2>err; echo "tool_snapshot=$?"; cat err >&2
+rm -f err
+python3 - <<'PY'
+import ctypes, fcntl, os, struct
+here = os.open(".", os.O_RDONLY | os.O_DIRECTORY)
+keep = []
+def at(name):
+    if name is None:
+        return 0
+    buf = ctypes.create_string_buffer(name)
+    keep.append(buf)
+    return ctypes.addressof(buf)
+def v1(flags, dst, src):
+    return bytearray(struct.pack("=IIH6xQQ", flags, here, 0o755, at(dst), at(src)))
+def v2(flags, dst, src):
+    return v1(flags, dst, src) + bytearray(16)
+for key, command, arg in (
+    ("subvolume_create", 0x4020BC10, v1(0, b"v1-subvol", None)),
+    ("snapshot_create", 0x4020BC10, v1(1, b"v1-snap", b"src")),
+    ("subvolume_create_v2", 0x4030BC1D, v2(0, b"v2-subvol", None)),
+    ("snapshot_create_v2", 0x4030BC1D, v2(1, b"v2-snap", b"src")),
+):
+    try:
+        fcntl.ioctl(here, command, arg)
+        print(f"{key}=0")
+    except OSError as e:
+        print(f"{key}={e.errno}")
+PY
+"#;
+
+/// What [`no_jail_on_this_disk_makes_a_subvolume_or_snapshot`] runs in a
+/// project (`$1`) that is a subvolume of this user's holding `.env` and
+/// `secrets/key`, with the tool at `$2`: what each secret holds, a
+/// snapshot of the project into it, and what the copy of each holds.
+#[cfg(target_os = "linux")]
+const SNAPSHOT_THE_PROJECT: &str = r#"cd "$1" || exit 90
+cat .env secrets/key 2>/dev/null | sed 's/^/before: /'
+"$2" subvolume snapshot . snap >/dev/null 2>err; echo "project_snapshot=$?"; cat err >&2
+rm -f err
+cat snap/.env snap/secrets/key 2>/dev/null | sed 's/^/copy: /'
+"#;
+
+/// The `key=value` lines of a run of one of the scripts above.
+#[cfg(target_os = "linux")]
+fn subvolume_answers(stdout: &[u8]) -> std::collections::BTreeMap<String, i32> {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .filter_map(|l| l.split_once('='))
+        .filter_map(|(k, v)| Some((k.to_string(), v.trim().parse().ok()?)))
+        .collect()
+}
+
+/// A disk kind [`no_jail_on_this_disk_makes_a_subvolume_or_snapshot`]
+/// runs on.
+#[cfg(target_os = "linux")]
+struct SubvolumeDisk {
+    /// Its name.
+    kind: &'static str,
+    /// Its magic number, as `stat -f -c %t` gives it (coreutils before 9.5
+    /// has no name for bcachefs's).
+    magic: &'static str,
+    /// The variable that names a folder this user owns on one.
+    var: &'static str,
+    /// The tool that makes subvolumes there.
+    tool: &'static str,
+    /// The script that makes them, by the tool and by number.
+    script: &'static str,
+    /// What the script makes when nothing refuses it, by key.
+    made_by: &'static [(&'static str, &'static str)],
+    /// The keys of commands a kernel of that disk may not have yet: outside
+    /// any jail they answer `ENOTTY` there, and in a jail always `EPERM`.
+    newer: &'static [&'static str],
+}
+
+/// On a real btrfs or bcachefs disk no jail makes a new subvolume or a
+/// snapshot, plain or identified: the tool's `subvolume create` and
+/// `subvolume snapshot` fail with EPERM, and so does each command that makes
+/// one, called by its number. The same user, on the same disk, makes every
+/// one of them outside any jail: so each refusal is the filter's, and each
+/// number is one the kernel's file system takes. And the project, a
+/// subvolume of this user's holding `.env` and `secrets/key`: outside any
+/// jail a snapshot of it shows both, and in each jail both are hidden and
+/// no snapshot shows them.
+///
+/// Needs a folder this user owns on such a disk in the disk's variable,
+/// its tool and `python3`, and a host that starts a jail under the filter.
+/// CI has no such disk, so it runs on a lab host (a loop-mounted disk will
+/// do). Run without any of them, it fails: it never passes having proved
+/// nothing.
+#[cfg(target_os = "linux")]
+fn no_jail_on_this_disk_makes_a_subvolume_or_snapshot(disk: &SubvolumeDisk) {
+    let folder = std::env::var_os(disk.var)
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            panic!(
+                "{}: a folder this user owns on a {} disk",
+                disk.var, disk.kind
+            )
+        });
+    let magic = Command::new("stat")
+        .args(["-f", "-c", "%t"])
+        .arg(&folder)
+        .output()
+        .expect("stat the folder's file system");
+    assert_eq!(
+        String::from_utf8_lossy(&magic.stdout).trim(),
+        disk.magic,
+        "{} is not on a {} disk",
+        disk.var,
+        disk.kind
+    );
+    let tool = ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+        .into_iter()
+        .map(|dir| std::path::Path::new(dir).join(disk.tool))
+        .find(|p| p.is_file())
+        .unwrap_or_else(|| panic!("the {} tool", disk.tool));
+    assert!(
+        Command::new("python3")
+            .arg("--version")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .is_ok_and(|o| o.status.success()),
+        "python3"
+    );
+    require_bwrap();
+    assert_eq!(
+        filter_here(),
+        FilterHere::Taken,
+        "this host must start a jail under the filter"
+    );
+
+    let work = tempfile::TempDir::new_in(&folder).unwrap();
+    // A subvolume of this user's, made outside any jail.
+    let subvolume = |at: &std::path::Path| {
+        let made = Command::new(&tool)
+            .args(["subvolume", "create"])
+            .arg(at)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        assert!(
+            made.status.success(),
+            "this user makes a subvolume outside the jail: {}",
+            String::from_utf8_lossy(&made.stderr)
+        );
+    };
+    let script = |text: &str, at: &std::path::Path| -> Vec<String> {
+        vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            text.into(),
+            "sh".into(),
+            at.to_str().unwrap().into(),
+            tool.to_str().unwrap().into(),
+        ]
+    };
+    let outside = |text: &str, at: &std::path::Path| {
+        let args = script(text, at);
+        let output = Command::new(&args[0])
+            .args(&args[1..])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        (
+            output.stdout.clone(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    };
+    let jailed = |text: &str, at: &std::path::Path, identity: bool| {
+        let home = state_home();
+        let mut command = cli();
+        command.arg("contain");
+        if identity {
+            command.arg("--identity");
+        }
+        command
+            .args(["--project", at.to_str().unwrap(), "--"])
+            .args(script(text, at))
+            .env("HOME", home.path())
+            .stdin(std::process::Stdio::null());
+        let output = identified_without_a_scope(&mut command)
+            .output()
+            .expect("run Linux AI Jail");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        (
+            output.stdout.clone(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    };
+
+    // One folder per place, each with a subvolume `src` to snapshot.
+    let place = |name: &str| {
+        let at = work.path().join(name);
+        std::fs::create_dir(&at).unwrap();
+        subvolume(&at.join("src"));
+        at
+    };
+    let outside_at = place("outside");
+    let (outside_out, outside_err) = outside(disk.script, &outside_at);
+    let outside_answers = subvolume_answers(&outside_out);
+    eprintln!("outside: {outside_answers:?}");
+    for (key, name) in disk.made_by {
+        let answer = outside_answers.get(*key).copied();
+        if disk.newer.contains(key) && answer == Some(libc::ENOTTY) {
+            eprintln!("{key}: this kernel's {} has no such command", disk.kind);
+            continue;
+        }
+        assert_eq!(answer, Some(0), "{key} outside any jail: {outside_err}");
+        assert!(outside_at.join(name).is_dir(), "{name} outside");
+    }
+    for identity in [false, true] {
+        let at = place(if identity { "identified" } else { "plain" });
+        let (out, err) = jailed(disk.script, &at, identity);
+        let answers = subvolume_answers(&out);
+        eprintln!("identity {identity}: {answers:?}");
+        for (key, name) in disk.made_by {
+            assert!(!at.join(name).exists(), "{name} made, identity {identity}");
+            let answer = answers.get(*key).copied();
+            if key.starts_with("tool_") {
+                assert!(
+                    answer.is_some_and(|a| a != 0),
+                    "{key} identity {identity}: {err}"
+                );
+            } else {
+                assert_eq!(
+                    answer,
+                    Some(libc::EPERM),
+                    "{key} identity {identity}: {err}"
+                );
+            }
+        }
+        assert!(
+            err.contains("Operation not permitted"),
+            "the tool says why, identity {identity}: {err}"
+        );
+    }
+
+    // The project is a subvolume holding the secrets the jail hides.
+    let project = |name: &str| {
+        let at = work.path().join(name);
+        subvolume(&at);
+        std::fs::write(at.join(".env"), "SECRET_DOTENV=hunter2\n").unwrap();
+        std::fs::create_dir(at.join("secrets")).unwrap();
+        std::fs::write(at.join("secrets/key"), "SECRET_KEY_FILE\n").unwrap();
+        // On disk before any snapshot: bcachefs in Linux 6.12 can lose a
+        // file written just before one, and then goes read-only.
+        let synced = Command::new("sync")
+            .stdin(std::process::Stdio::null())
+            .status();
+        assert!(synced.is_ok_and(|s| s.success()), "sync");
+        at
+    };
+    let at = project("project-outside");
+    let (out, err) = outside(SNAPSHOT_THE_PROJECT, &at);
+    let text = String::from_utf8_lossy(&out);
+    assert_eq!(
+        subvolume_answers(&out).get("project_snapshot"),
+        Some(&0),
+        "a snapshot of the project outside any jail: {err}"
+    );
+    for line in [
+        "before: SECRET_DOTENV=hunter2",
+        "before: SECRET_KEY_FILE",
+        "copy: SECRET_DOTENV=hunter2",
+        "copy: SECRET_KEY_FILE",
+    ] {
+        assert!(text.contains(line), "outside any jail: {line:?}: {text}");
+    }
+    for identity in [false, true] {
+        let at = project(if identity {
+            "project-identified"
+        } else {
+            "project-plain"
+        });
+        let (out, err) = jailed(SNAPSHOT_THE_PROJECT, &at, identity);
+        let text = String::from_utf8_lossy(&out);
+        let answers = subvolume_answers(&out);
+        assert!(
+            answers.get("project_snapshot").is_some_and(|a| *a != 0),
+            "a snapshot of the project, identity {identity}: {text} {err}"
+        );
+        // Hidden in the jail, and in no copy of the project.
+        assert!(!text.contains("SECRET_"), "identity {identity}: {text}");
+        assert!(!at.join("snap").exists(), "identity {identity}");
+    }
+}
+
+/// [`no_jail_on_this_disk_makes_a_subvolume_or_snapshot`] on btrfs: the
+/// four commands, and the `btrfs` tool's create and snapshot.
+/// `IW_BTRFS_DIR=<folder> cargo test -p innerwarden --test cjc_j007_ai_jail
+/// -- --ignored on_a_btrfs_disk </dev/null`.
+///
+/// FAILS ON REVERT (measured): refuse the btrfs commands in the identified
+/// filter alone, and the plain jail makes each subvolume and snapshot, and
+/// its snapshot of the project shows `.env` and `secrets/key`.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "needs a btrfs folder in IW_BTRFS_DIR, the btrfs tool and python3: a lab host runs it with --ignored"]
+fn on_a_btrfs_disk_no_jail_makes_a_subvolume_or_snapshot() {
+    no_jail_on_this_disk_makes_a_subvolume_or_snapshot(&SubvolumeDisk {
+        kind: "btrfs",
+        magic: "9123683e",
+        var: "IW_BTRFS_DIR",
+        tool: "btrfs",
+        script: MAKE_BTRFS_SUBVOLUMES,
+        made_by: &[
+            ("tool_subvolume", "tool-subvol"),
+            ("tool_snapshot", "tool-snap"),
+            ("snap_create", "v1-snap"),
+            ("subvol_create", "v1-subvol"),
+            ("snap_create_v2", "v2-snap"),
+            ("subvol_create_v2", "v2-subvol"),
+        ],
+        newer: &[],
+    });
+}
+
+/// [`no_jail_on_this_disk_makes_a_subvolume_or_snapshot`] on bcachefs: both
+/// commands, each as a new subvolume and as a snapshot, and the `bcachefs`
+/// tool's create and snapshot. A kernel whose bcachefs has no `_v2`
+/// command answers it `ENOTTY` outside any jail, and the jail still refuses
+/// it. `IW_BCACHEFS_DIR=<folder> cargo test -p innerwarden --test
+/// cjc_j007_ai_jail -- --ignored on_a_bcachefs_disk </dev/null`.
+///
+/// FAILS ON REVERT (measured): drop the bcachefs commands from the filter,
+/// and each jail makes each subvolume and snapshot, and its snapshot of the
+/// project shows `.env` and `secrets/key`.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "needs a bcachefs folder in IW_BCACHEFS_DIR, the bcachefs tool and python3: a lab host runs it with --ignored"]
+fn on_a_bcachefs_disk_no_jail_makes_a_subvolume_or_snapshot() {
+    no_jail_on_this_disk_makes_a_subvolume_or_snapshot(&SubvolumeDisk {
+        kind: "bcachefs",
+        magic: "ca451a4e",
+        var: "IW_BCACHEFS_DIR",
+        tool: "bcachefs",
+        script: MAKE_BCACHEFS_SUBVOLUMES,
+        made_by: &[
+            ("tool_subvolume", "tool-subvol"),
+            ("tool_snapshot", "tool-snap"),
+            ("subvolume_create", "v1-subvol"),
+            ("snapshot_create", "v1-snap"),
+            ("subvolume_create_v2", "v2-subvol"),
+            ("snapshot_create_v2", "v2-snap"),
+        ],
+        newer: &["subvolume_create_v2", "snapshot_create_v2"],
+    });
 }

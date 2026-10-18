@@ -70,55 +70,169 @@ pub fn consult(
 /// past it the hook goes on without an answer, and the thread, still held to
 /// its socket timeouts, ends with the process (the hook runs once per call).
 pub fn ask(url: &str, body: &[u8], timeout: Duration, pin: &[u8; 32]) -> Option<(u16, Vec<u8>)> {
+    post(
+        url,
+        body,
+        timeout,
+        pin,
+        Wanted {
+            status: 200,
+            cap: MAX_INSTANCE_ANSWER_BYTES + 1,
+        },
+    )
+    .ok()
+}
+
+/// Why [`post`] got no answer, said so a person can act on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoAnswer {
+    /// The address is not `https://127.0.0.1:<port><path>`.
+    NotLoopback,
+    /// Nothing listens there: the agent is not running, or restarting.
+    Refused,
+    /// The connection could not be made for another reason.
+    Unreachable,
+    /// A server answered there with a key that is not the host's.
+    WrongKey,
+    /// The connection was made and then failed.
+    Failed,
+    /// No whole answer before the deadline.
+    TimedOut,
+    /// What came back is not an HTTP answer.
+    Broken,
+}
+
+impl std::fmt::Display for NoAnswer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            NoAnswer::NotLoopback => "the agent's address is not this host's loopback",
+            NoAnswer::Refused => {
+                "nothing listens at the agent's address: Active Defence is not running"
+            }
+            NoAnswer::Unreachable => "the agent's address cannot be reached",
+            NoAnswer::WrongKey => "the server at the agent's address does not hold the host's key",
+            NoAnswer::Failed => "the connection to the agent failed",
+            NoAnswer::TimedOut => "the agent did not answer in time",
+            NoAnswer::Broken => "the agent's answer could not be read",
+        })
+    }
+}
+
+/// What a failed socket call says of the exchange: a TLS refusal of the
+/// server's key, a deadline, or another failure.
+fn no_answer(error: &std::io::Error) -> NoAnswer {
+    let tls = error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<rustls::Error>());
+    match (tls, error.kind()) {
+        (Some(rustls::Error::InvalidCertificate(_)), _) => NoAnswer::WrongKey,
+        (_, std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => NoAnswer::TimedOut,
+        _ => NoAnswer::Failed,
+    }
+}
+
+/// The answer the launcher reads of its request for a system scope: the
+/// body of a `202`, up to one byte more than an answer may hold.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn system_scope_wanted() -> Wanted {
+    Wanted {
+        status: innerwarden_agent_guard::identity::SYSTEM_SCOPE_TAKEN,
+        cap: innerwarden_agent_guard::identity::MAX_SYSTEM_SCOPE_ANSWER_BYTES + 1,
+    }
+}
+
+/// Which answer's body a request reads: the one of `status`, up to `cap`
+/// bytes. Any other status is done once its head is read, with no body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Wanted {
+    pub status: u16,
+    pub cap: usize,
+}
+
+/// [`ask`] for any route of the agent: POST `body` as JSON to `url`
+/// (`https://127.0.0.1:<port><path>` only) within `timeout`, believing only
+/// a server whose key hashes to `pin`, and read the body of the answer
+/// `wanted` names. The launcher asks for a system scope with it.
+pub fn post(
+    url: &str,
+    body: &[u8],
+    timeout: Duration,
+    pin: &[u8; 32],
+    wanted: Wanted,
+) -> Result<(u16, Vec<u8>), NoAnswer> {
     let deadline = Instant::now() + timeout;
     let (url, body, pin) = (url.to_string(), body.to_vec(), *pin);
     let (answered, answer) = std::sync::mpsc::sync_channel(1);
     std::thread::Builder::new()
         .name("host-decide".into())
         .spawn(move || {
-            let _ = answered.send(exchange(&url, &body, deadline, &pin));
+            let _ = answered.send(exchange(&url, &body, deadline, &pin, wanted));
         })
-        .ok()?;
+        .map_err(|_| NoAnswer::Failed)?;
     answer
         .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-        .ok()
-        .flatten()
+        .map_err(|_| NoAnswer::TimedOut)?
 }
 
 /// The request itself, each socket call held to what is left before
 /// `deadline`. [`ask`] holds the whole of it to the deadline.
-fn exchange(url: &str, body: &[u8], deadline: Instant, pin: &[u8; 32]) -> Option<(u16, Vec<u8>)> {
+fn exchange(
+    url: &str,
+    body: &[u8],
+    deadline: Instant,
+    pin: &[u8; 32],
+    wanted: Wanted,
+) -> Result<(u16, Vec<u8>), NoAnswer> {
     let remaining = || {
         deadline
             .checked_duration_since(Instant::now())
             .filter(|left| !left.is_zero())
+            .ok_or(NoAnswer::TimedOut)
     };
-    let (addr, path) = loopback_target(url)?;
-    let tcp = TcpStream::connect_timeout(&addr, remaining()?).ok()?;
+    let (addr, path) = loopback_target(url).ok_or(NoAnswer::NotLoopback)?;
+    let tcp = TcpStream::connect_timeout(&addr, remaining()?).map_err(|e| match e.kind() {
+        std::io::ErrorKind::ConnectionRefused => NoAnswer::Refused,
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => NoAnswer::TimedOut,
+        _ => NoAnswer::Unreachable,
+    })?;
     let _ = tcp.set_nodelay(true);
     let connection = rustls::ClientConnection::new(
-        Arc::new(client_config(*pin)?),
+        Arc::new(client_config(*pin).ok_or(NoAnswer::Failed)?),
         ServerName::IpAddress(addr.ip().into()),
     )
-    .ok()?;
+    .map_err(|_| NoAnswer::Failed)?;
     let mut stream = rustls::StreamOwned::new(connection, tcp);
     let head = format!(
         "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
          Accept: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
-    stream.sock.set_write_timeout(Some(remaining()?)).ok()?;
-    stream.sock.set_read_timeout(Some(remaining()?)).ok()?;
-    stream.write_all(head.as_bytes()).ok()?;
-    stream.write_all(body).ok()?;
-    stream.flush().ok()?;
+    let failed = |e: std::io::Error| no_answer(&e);
+    stream
+        .sock
+        .set_write_timeout(Some(remaining()?))
+        .map_err(failed)?;
+    stream
+        .sock
+        .set_read_timeout(Some(remaining()?))
+        .map_err(failed)?;
+    stream.write_all(head.as_bytes()).map_err(failed)?;
+    stream.write_all(body).map_err(failed)?;
+    stream.flush().map_err(failed)?;
     let mut seen = Vec::new();
     let mut chunk = [0u8; 2048];
+    let done = |seen: &[u8]| match parse_response(seen, true, wanted) {
+        Parsed::Done(status, body) => Ok((status, body)),
+        _ => Err(NoAnswer::Broken),
+    };
     loop {
-        if let Parsed::Done(status, body) = parse_response(&seen, false) {
-            return Some((status, body));
+        if let Parsed::Done(status, body) = parse_response(&seen, false, wanted) {
+            return Ok((status, body));
         }
-        stream.sock.set_read_timeout(Some(remaining()?)).ok()?;
+        stream
+            .sock
+            .set_read_timeout(Some(remaining()?))
+            .map_err(failed)?;
         let eof = match stream.read(&mut chunk) {
             Ok(0) => true,
             Ok(n) => {
@@ -127,21 +241,19 @@ fn exchange(url: &str, body: &[u8], deadline: Instant, pin: &[u8; 32]) -> Option
             }
             // A server that closes without saying so still ended its answer.
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => true,
-            Err(_) => return None,
+            Err(e) => return Err(no_answer(&e)),
         };
-        if eof {
-            return match parse_response(&seen, true) {
-                Parsed::Done(status, body) => Some((status, body)),
-                _ => None,
-            };
-        }
-        if seen.len() > MAX_HEAD_BYTES + MAX_INSTANCE_ANSWER_BYTES + 64 {
-            return match parse_response(&seen, true) {
-                Parsed::Done(status, body) => Some((status, body)),
-                _ => None,
-            };
+        if eof || seen.len() > MAX_HEAD_BYTES + wanted.cap + 64 {
+            return done(&seen);
         }
     }
+}
+
+/// Whether [`post`] can reach `url`: `https://127.0.0.1:<port><path>`.
+// Its caller, `contain --identity`, is Linux-only; the test runs everywhere.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn pinnable(url: &str) -> bool {
+    loopback_target(url).is_some()
 }
 
 /// `https://127.0.0.1:<port><path>` and nothing else: the address and the
@@ -171,11 +283,12 @@ enum Parsed {
 }
 
 /// PURE. Read an HTTP/1.1 response from `seen` (`eof`: nothing more will
-/// come). Any status but 200 is done as soon as the head is read, with no
-/// body. A 200's body is read by its `Content-Length`, its chunks, or to the
-/// end, and kept up to one byte more than an answer may hold.
-fn parse_response(seen: &[u8], eof: bool) -> Parsed {
-    let cap = MAX_INSTANCE_ANSWER_BYTES + 1;
+/// come). Any status but the one `wanted` names is done as soon as the head
+/// is read, with no body. That one's body is read by its `Content-Length`,
+/// its chunks, or to the end, and kept up to `wanted.cap` bytes (one more
+/// than an answer may hold, so a longer one is seen to be longer).
+fn parse_response(seen: &[u8], eof: bool, wanted: Wanted) -> Parsed {
+    let cap = wanted.cap;
     let Some(head_end) = find(seen, b"\r\n\r\n") else {
         return if eof || seen.len() > MAX_HEAD_BYTES {
             Parsed::Broken
@@ -201,7 +314,7 @@ fn parse_response(seen: &[u8], eof: bool) -> Parsed {
     let Some(status) = status else {
         return Parsed::Broken;
     };
-    if status != 200 {
+    if status != wanted.status {
         return Parsed::Done(status, Vec::new());
     }
     let mut length: Option<usize> = None;
@@ -223,22 +336,22 @@ fn parse_response(seen: &[u8], eof: bool) -> Parsed {
     let body = &seen[head_end + 4..];
     if chunked {
         return match dechunk(body, cap) {
-            Some((decoded, true)) => Parsed::Done(200, decoded),
+            Some((decoded, true)) => Parsed::Done(status, decoded),
             Some((decoded, false)) if eof || decoded.len() >= cap => {
                 let mut decoded = decoded;
                 decoded.truncate(cap);
-                Parsed::Done(200, decoded)
+                Parsed::Done(status, decoded)
             }
             Some(_) => Parsed::Incomplete,
             None => Parsed::Broken,
         };
     }
-    let wanted = length.map_or(cap, |n| n.min(cap));
-    if body.len() >= wanted {
-        return Parsed::Done(200, body[..wanted].to_vec());
+    let wanted_len = length.map_or(cap, |n| n.min(cap));
+    if body.len() >= wanted_len {
+        return Parsed::Done(status, body[..wanted_len].to_vec());
     }
     if eof {
-        return Parsed::Done(200, body.to_vec());
+        return Parsed::Done(status, body.to_vec());
     }
     Parsed::Incomplete
 }
@@ -432,6 +545,18 @@ mod tests {
 
     const ID: &str = "7f3a9c1e42b84d0e9a6c5f1b2d3e4a59";
 
+    /// What the hook's request reads: a 200's body, to one byte more than an
+    /// answer may hold.
+    const HOOK: Wanted = Wanted {
+        status: 200,
+        cap: MAX_INSTANCE_ANSWER_BYTES + 1,
+    };
+
+    /// [`super::parse_response`] for the hook's request.
+    fn parse_response(seen: &[u8], eof: bool) -> Parsed {
+        super::parse_response(seen, eof, HOOK)
+    }
+
     /// A certificate for 127.0.0.1 and its key, made for the test.
     fn certificate() -> (CertificateDer<'static>, PrivateKeyDer<'static>, [u8; 32]) {
         let made = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
@@ -564,6 +689,51 @@ mod tests {
         );
     }
 
+    /// Under a profile that asks about every command, the request about an
+    /// allow goes whole as version 2, and the host's refusal comes back in an
+    /// answer of the same shape as ever.
+    #[test]
+    fn an_allow_asked_about_goes_as_version_2_and_a_refusal_reads() {
+        let mut refusal = answer_for(ID);
+        refusal["verdict"] = serde_json::json!("deny");
+        refusal["deciding_layer"] = serde_json::json!("general");
+        refusal["profile"] = serde_json::Value::Null;
+        refusal["withheld"] = serde_json::json!("a_word_never_heard");
+        let (url, pin, server) = server(ok_json(&refusal), Duration::ZERO);
+        let request = innerwarden_agent_guard::identity::instance_decide_request_v2(
+            ID,
+            Some("claude-code"),
+            Some("s-1"),
+            "curl https://example.com",
+            &[],
+            false,
+            innerwarden_agent_guard::identity::Verdict::Allow,
+        )
+        .unwrap();
+        let body = serde_json::to_vec(&request).unwrap();
+        let reply = ask(&url, &body, Duration::from_secs(5), &pin);
+        let seen = server.join().unwrap().expect("a request");
+        let sent: serde_json::Value =
+            serde_json::from_slice(&seen[find(&seen, b"\r\n\r\n").unwrap() + 4..]).unwrap();
+        assert_eq!(sent["v"], 2);
+        assert_eq!(sent["hook_verdict"], "allow");
+        assert_eq!(
+            serde_json::from_value::<InstanceDecideRequest>(sent).unwrap(),
+            request
+        );
+        let crate::host_decide::HostReply::Answer(answer) =
+            crate::host_decide::read_reply(reply, Some(ID))
+        else {
+            panic!("the contract's answer");
+        };
+        assert_eq!(answer.v, 1, "the answer keeps its version");
+        assert_eq!(
+            answer.verdict,
+            innerwarden_agent_guard::identity::Verdict::Deny
+        );
+        assert_eq!(answer.withheld.as_deref(), Some("a_word_never_heard"));
+    }
+
     /// A server of the agent's own that holds the right key would still have
     /// to answer for this instance: an allow for another is not taken.
     #[test]
@@ -578,6 +748,124 @@ mod tests {
             crate::host_decide::read_reply(reply, Some(ID)),
             crate::host_decide::HostReply::Invalid
         );
+    }
+
+    /// The launcher's request for a system scope, over the same connection
+    /// held to the host's key: the 202's body is read to its bound and says
+    /// the admission; a server holding another key gets nothing through, so
+    /// nothing is admitted.
+    ///
+    /// FAILS ON REVERT: read the body of a 200 only (the hook's `Wanted`) and
+    /// the admission is never read.
+    #[test]
+    fn the_answer_of_a_scope_request_is_read_from_its_202_over_the_key() {
+        use innerwarden_agent_guard::identity::{
+            system_scope_request, SystemScopeAdmission, MAX_SYSTEM_SCOPE_ANSWER_BYTES,
+            SYSTEM_SCOPE_TAKEN,
+        };
+        let body = br#"{"placed":true,"unit":"u","admitted":true,"note":"Kernel protection is on for this session."}"#;
+        let mut answer = format!(
+            "HTTP/1.1 202 Accepted\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        answer.extend_from_slice(body);
+        let wanted = Wanted {
+            status: SYSTEM_SCOPE_TAKEN,
+            cap: MAX_SYSTEM_SCOPE_ANSWER_BYTES + 1,
+        };
+        // What the launcher asks for is this.
+        assert_eq!(system_scope_wanted(), wanted);
+        let request = serde_json::to_vec(&system_scope_request(ID).unwrap()).unwrap();
+        let (url, pin, taken) = server(answer.clone(), Duration::ZERO);
+        let (status, read) = post(&url, &request, Duration::from_secs(5), &pin, wanted).unwrap();
+        let seen = taken.join().unwrap().expect("a request");
+        let sent: serde_json::Value =
+            serde_json::from_slice(&seen[find(&seen, b"\r\n\r\n").unwrap() + 4..]).unwrap();
+        assert_eq!(
+            sent,
+            serde_json::json!({ "instance": ID }),
+            "the request is unchanged"
+        );
+        assert_eq!(status, 202);
+        let admission = SystemScopeAdmission::read(&read);
+        assert!(admission.admitted);
+        assert_eq!(
+            admission.note.as_deref(),
+            Some("Kernel protection is on for this session.")
+        );
+        // Another key: no request goes through and nothing is read.
+        let (url, _pin, refused) = server(answer, Duration::ZERO);
+        let (_, _, other) = certificate();
+        assert_eq!(
+            post(&url, &request, Duration::from_secs(5), &other, wanted),
+            Err(NoAnswer::WrongKey)
+        );
+        let _ = refused.join();
+        assert!(pinnable("https://127.0.0.1:8787/api/agent/contain-scope"));
+        assert!(!pinnable("https://localhost:8787/api/agent/contain-scope"));
+    }
+
+    /// A request that gets no answer says why, in words a person can act
+    /// on: nothing listening (the agent is down or restarting), a server
+    /// with another key, no answer in time, an answer that is not HTTP, an
+    /// address that is not the loopback. The launcher prints it, and the
+    /// launch admits nothing.
+    ///
+    /// FAILS ON REVERT: map every failure to one kind in `exchange` (the
+    /// one sentence the launcher printed before) and the lines below that
+    /// say otherwise fail.
+    #[test]
+    fn a_request_that_gets_no_answer_says_why() {
+        let wanted = system_scope_wanted();
+        let request = br#"{"instance":"x"}"#;
+        let free = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let (_, _, pin) = certificate();
+        assert_eq!(
+            post(
+                &format!("https://127.0.0.1:{free}/api/agent/contain-scope"),
+                request,
+                Duration::from_secs(5),
+                &pin,
+                wanted
+            ),
+            Err(NoAnswer::Refused)
+        );
+        assert_eq!(
+            post(
+                "https://localhost:8787/x",
+                request,
+                Duration::from_secs(5),
+                &pin,
+                wanted
+            ),
+            Err(NoAnswer::NotLoopback)
+        );
+        let (url, pin, slow) = server(
+            b"HTTP/1.1 202 Accepted\r\n\r\n".to_vec(),
+            Duration::from_secs(1),
+        );
+        assert_eq!(
+            post(&url, request, Duration::from_millis(300), &pin, wanted),
+            Err(NoAnswer::TimedOut)
+        );
+        let _ = slow.join();
+        let (url, pin, broken) = server(b"not http at all".to_vec(), Duration::ZERO);
+        assert_eq!(
+            post(&url, request, Duration::from_secs(5), &pin, wanted),
+            Err(NoAnswer::Broken)
+        );
+        let _ = broken.join();
+        for (why, said) in [
+            (NoAnswer::Refused, "Active Defence is not running"),
+            (NoAnswer::WrongKey, "does not hold the host's key"),
+            (NoAnswer::TimedOut, "did not answer in time"),
+        ] {
+            assert!(why.to_string().contains(said), "{why:?}");
+        }
     }
 
     /// A server whose key is not the published one gets no request through
@@ -890,6 +1178,57 @@ mod tests {
             Parsed::Done(200, body) => assert_eq!(body.len(), MAX_INSTANCE_ANSWER_BYTES + 1),
             other => panic!("{other:?}"),
         }
+    }
+
+    /// Another route reads the body of the status it names, to its own cap,
+    /// and no other: the launcher's request for a system scope reads a
+    /// 202's body, and a 200 there is no answer of that route.
+    #[test]
+    fn another_route_reads_the_body_of_its_own_status_only() {
+        let taken = Wanted {
+            status: 202,
+            cap: 8,
+        };
+        assert_eq!(
+            super::parse_response(
+                b"HTTP/1.1 202 Accepted\r\nContent-Length: 2\r\n\r\n{}",
+                false,
+                taken
+            ),
+            Parsed::Done(202, b"{}".to_vec())
+        );
+        assert_eq!(
+            super::parse_response(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}",
+                false,
+                taken
+            ),
+            Parsed::Done(200, Vec::new())
+        );
+        match super::parse_response(
+            b"HTTP/1.1 202 Accepted\r\nContent-Length: 20\r\n\r\n0123456789abcdefghij",
+            false,
+            taken,
+        ) {
+            Parsed::Done(202, body) => assert_eq!(body, b"01234567"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            super::parse_response(
+                b"HTTP/1.1 202 Accepted\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n\r\n",
+                false,
+                taken
+            ),
+            Parsed::Done(202, b"{}".to_vec())
+        );
+        // The hook's request is what it was: a 202 there has no body.
+        assert_eq!(
+            parse_response(
+                b"HTTP/1.1 202 Accepted\r\nContent-Length: 2\r\n\r\n{}",
+                false
+            ),
+            Parsed::Done(202, Vec::new())
+        );
     }
 
     /// A chunk size near the top of `usize` is not added to: the body is

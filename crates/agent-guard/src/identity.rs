@@ -43,7 +43,9 @@
 //! No reading from inside the jail reaches `confined`, so the hook alone never
 //! applies a relaxation. Where InnerWarden Active Defence runs on the same
 //! host, the hook ASKS it ([`INSTANCE_DECIDE_ROUTE`]) when its general rules
-//! sent a shell command of an instance to review, and the host decides. The
+//! sent a shell command of an instance to review (or about every shell
+//! command it does not refuse itself, where the system profiles file asks for
+//! that: [`crate::profiles::AskHost`]), and the host decides. The
 //! hook takes `confined` as the input of [`decide`] only from an answer that
 //! says so ([`InstanceDecideAnswer::relaxes`]), keeps the stricter of its own
 //! decision and the host's verdict, and never records the answer's word as
@@ -125,6 +127,82 @@ pub const SYSTEM_SCOPE_ROUTE: &str = "/api/agent/contain-scope";
 /// `None` if `instance_id` is not a well-formed id.
 pub fn system_scope_request(instance_id: &str) -> Option<serde_json::Value> {
     is_instance_id(instance_id).then(|| serde_json::json!({ "instance": instance_id }))
+}
+
+/// The status of an answer from [`SYSTEM_SCOPE_ROUTE`] that took the
+/// request. Any other status is no answer: [`SystemScopeAdmission::NONE`].
+pub const SYSTEM_SCOPE_TAKEN: u16 = 202;
+
+/// The most bytes of a [`SYSTEM_SCOPE_TAKEN`] answer's body the launcher
+/// reads. A longer body is read as none.
+pub const MAX_SYSTEM_SCOPE_ANSWER_BYTES: usize = 1024;
+
+/// The most characters of an answer's `note`.
+pub const MAX_SYSTEM_SCOPE_NOTE_CHARS: usize = 200;
+
+/// What a [`SYSTEM_SCOPE_TAKEN`] answer says to the launcher, besides what
+/// else its body holds (the host may say more; the launcher reads these two
+/// keys only):
+///
+/// ```json
+/// {"admitted": true}
+/// {"admitted": false, "note": "<one sentence for the person>"}
+/// ```
+///
+/// * `admitted`: the host admitted the jail, so whatever it keeps over a
+///   jail of the agent's type holds for this one from its start. Only a
+///   JSON `true` is an admission; anything else, or no `admitted` at all
+///   (a host that predates it), is none.
+/// * `note`: a sentence the launcher prints as it came, after
+///   `innerwarden contain: `. 1 to [`MAX_SYSTEM_SCOPE_NOTE_CHARS`] printable
+///   ASCII characters; anything else is dropped and the rest of the answer
+///   still read.
+///
+/// The launcher believes an answer only over a connection held to the key
+/// the host publishes ([`AGENT_TLS_SPKI_PATH`]): with no such connection it
+/// reads no body, and nothing is admitted. Whatever the answer, the system
+/// scope is a fact only once the kernel shows the jail in it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SystemScopeAdmission {
+    pub admitted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+impl SystemScopeAdmission {
+    /// No admission and nothing to say: no answer, or none believed.
+    pub const NONE: SystemScopeAdmission = SystemScopeAdmission {
+        admitted: false,
+        note: None,
+    };
+
+    /// PURE. What the body of a [`SYSTEM_SCOPE_TAKEN`] answer says (see the
+    /// type): nothing from a body longer than
+    /// [`MAX_SYSTEM_SCOPE_ANSWER_BYTES`] or that is not a JSON object.
+    pub fn read(body: &[u8]) -> SystemScopeAdmission {
+        if body.len() > MAX_SYSTEM_SCOPE_ANSWER_BYTES {
+            return SystemScopeAdmission::NONE;
+        }
+        let Ok(serde_json::Value::Object(fields)) = serde_json::from_slice(body) else {
+            return SystemScopeAdmission::NONE;
+        };
+        SystemScopeAdmission {
+            admitted: fields.get("admitted") == Some(&serde_json::Value::Bool(true)),
+            note: fields
+                .get("note")
+                .and_then(serde_json::Value::as_str)
+                .filter(|note| is_system_scope_note(note))
+                .map(str::to_string),
+        }
+    }
+}
+
+/// A note an answer may carry: 1 to [`MAX_SYSTEM_SCOPE_NOTE_CHARS`]
+/// printable ASCII characters, not all of them spaces.
+pub fn is_system_scope_note(note: &str) -> bool {
+    !note.trim().is_empty()
+        && note.len() <= MAX_SYSTEM_SCOPE_NOTE_CHARS
+        && note.bytes().all(|b| (0x20..=0x7e).contains(&b))
 }
 
 /// The local route a launcher calls, best effort, once an identified jail has
@@ -265,7 +343,11 @@ pub fn contained_run_report(run: &ContainedRun<'_>) -> Option<serde_json::Value>
 /// The local route a hook in an identified jail calls, at most once per
 /// screened shell command and within a short bound, to ask the Active
 /// Defence agent on the same host whether a per-agent relaxation applies to
-/// a command its general rules sent to review.
+/// a command its general rules sent to review. Where the system profiles
+/// file asks for it (`ask_host = "every_command"`, see
+/// [`crate::profiles::AskHost`]), the hook also asks about a command its
+/// general rules allow, with a request of
+/// [`INSTANCE_DECIDE_EVERY_COMMAND_VERSION`].
 ///
 /// The request is an [`InstanceDecideRequest`] and it carries the command's
 /// RAW text: the host judges the command again with its own copy of the
@@ -276,8 +358,47 @@ pub fn contained_run_report(run: &ContainedRun<'_>) -> Option<serde_json::Value>
 /// decides as it did before it asked.
 pub const INSTANCE_DECIDE_ROUTE: &str = "/api/agent/instance-decide";
 
-/// The only version of the request and of the answer.
+/// The version of every answer, and of a request about a review under the
+/// default ask ([`crate::profiles::AskHost::Review`]): the request every hook
+/// before schema 2 of the profiles file sent, unchanged.
 pub const INSTANCE_DECIDE_VERSION: u32 = 1;
+
+/// The version of a request a hook sends under a profile that asks the host
+/// about every shell command ([`crate::profiles::AskHost::EveryCommand`]):
+/// the same fields, and `hook_verdict` is `allow` or `review`. The answer
+/// keeps [`INSTANCE_DECIDE_VERSION`] and its shape: what the host decided is
+/// said by its `verdict` and `withheld`.
+///
+/// Three rules hold for an answer to either version:
+///
+/// * the hook's general verdict is the ceiling of what the host lets run
+///   ([`InstanceDecideRequest::host_may_grant`]): the host grants nothing
+///   beyond its answer over a review it did not relax, or relaxed over other
+///   signals than the hook charged, because the hook keeps that review;
+/// * the hook keeps the stricter of its verdict and the host's, except over
+///   a command its general rules allow (by the person's suppression too):
+///   only a refusal of the host's own
+///   ([`InstanceDecideAnswer::refuses_on_its_own`]) makes that one stricter.
+///   The host's own reading of the general rules is not the hook's (it holds
+///   none of the person's suppressions), and the hook's stands. A review the
+///   hook keeps runs on a line that does not block reviews;
+/// * so where a program of the command starts only on such a grant, the host
+///   answers with [`InstanceDecideRequest::grant_or_refuse`]: its own answer
+///   where it may grant, a refusal of its own ([`HOST_NOT_GRANTED`]) in every
+///   other case. Any other answer lets the hook run a command whose program
+///   then does not start, with no reason given.
+pub const INSTANCE_DECIDE_EVERY_COMMAND_VERSION: u32 = 2;
+
+/// The start of every word ([`is_withheld_word`]) the host answers a `deny`
+/// with when the refusal is its own: it will not start a program in the
+/// command, whatever the hook's rules say. See
+/// [`InstanceDecideAnswer::refuses_on_its_own`].
+pub const HOST_REFUSAL_PREFIX: &str = "kernel_";
+
+/// The word of the host's own refusal ([`HOST_REFUSAL_PREFIX`]) that
+/// [`InstanceDecideRequest::grant_or_refuse`] answers with: a program of the
+/// command starts only on a grant, and the host grants none.
+pub const HOST_NOT_GRANTED: &str = "kernel_not_granted";
 
 /// The most signal names one request carries.
 pub const MAX_HOOK_SIGNALS: usize = 64;
@@ -402,10 +523,14 @@ where
 ///  "hook_signals":["bare_ip_fetch"],"tainted":false,
 ///  "hook_verdict":"review","hook_layer":"general"}
 /// ```
+///
+/// Under a profile that asks about every command the same body goes with
+/// `"v":2`, and `hook_verdict` is the general verdict, `allow` or `review`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InstanceDecideRequest {
-    /// [`INSTANCE_DECIDE_VERSION`].
+    /// [`INSTANCE_DECIDE_VERSION`], or [`INSTANCE_DECIDE_EVERY_COMMAND_VERSION`]
+    /// under a profile that asks about every command.
     pub v: u32,
     /// The instance the hook's own record names.
     pub instance_id: String,
@@ -423,7 +548,10 @@ pub struct InstanceDecideRequest {
     pub hook_signals: Vec<String>,
     /// An argument of the command came from an earlier tool result.
     pub tainted: bool,
-    /// Always [`Verdict::Review`]: the hook asks about nothing else.
+    /// The general verdict the hook asks about: always [`Verdict::Review`] in
+    /// a request of [`INSTANCE_DECIDE_VERSION`]; [`Verdict::Allow`] or
+    /// [`Verdict::Review`] in one of [`INSTANCE_DECIDE_EVERY_COMMAND_VERSION`].
+    /// Never [`Verdict::Deny`]: a refusal of the hook's stays the hook's.
     pub hook_verdict: Verdict,
     /// Always [`RuleLayer::General`].
     pub hook_layer: RuleLayer,
@@ -432,7 +560,14 @@ pub struct InstanceDecideRequest {
 impl InstanceDecideRequest {
     /// Whether every field holds what the contract lets it hold.
     pub fn is_valid(&self) -> bool {
-        self.v == INSTANCE_DECIDE_VERSION
+        let asked = match self.v {
+            INSTANCE_DECIDE_VERSION => self.hook_verdict == Verdict::Review,
+            INSTANCE_DECIDE_EVERY_COMMAND_VERSION => {
+                matches!(self.hook_verdict, Verdict::Allow | Verdict::Review)
+            }
+            _ => false,
+        };
+        asked
             && is_instance_id(&self.instance_id)
             && self
                 .claimed_agent_type
@@ -443,8 +578,59 @@ impl InstanceDecideRequest {
             && self.hook_signals.len() <= MAX_HOOK_SIGNALS
             && self.hook_signals.iter().all(|s| is_hook_signal(s))
             && self.hook_signals.windows(2).all(|pair| pair[0] < pair[1])
-            && self.hook_verdict == Verdict::Review
             && self.hook_layer == RuleLayer::General
+    }
+
+    /// PURE. Whether the host may let a program of this command start on
+    /// the strength of `answer`, beyond the answer itself (an allowance it
+    /// holds for the exact command, say). The hook's verdict is the ceiling:
+    /// only an `allow` the hook keeps. That is the host's `allow` over a
+    /// command the hook's general rules allow, or over a review the host
+    /// relaxed itself ([`InstanceDecideAnswer::relaxes`]) over the very
+    /// signals the hook charged (`signals_mismatch` false), and never for a
+    /// command with an argument from a tool result, which the hook does not
+    /// relax.
+    ///
+    /// The hook decides a relaxation again over its own signals, and a
+    /// signal the host did not read keeps the hook's review: an ATR category,
+    /// say, which no profile allows, charged by a hook whose rules differ
+    /// from the host's. An `allow` of the host's over a review it did not
+    /// relax, or relaxed over other signals, grants nothing: the hook keeps
+    /// that review. A line that blocks reviews refuses it, and one that does
+    /// not lets it run, where its program then does not start; so the host
+    /// answers such a command with [`Self::grant_or_refuse`].
+    pub fn host_may_grant(&self, answer: &InstanceDecideAnswer) -> bool {
+        self.is_valid()
+            && !self.tainted
+            && answer.verdict == Verdict::Allow
+            && (self.hook_verdict == Verdict::Allow
+                || (answer.relaxes() && !answer.signals_mismatch))
+    }
+
+    /// PURE. The answer the host sends about this command when a program in
+    /// it starts only on a grant ([`Self::host_may_grant`]): `answer` itself
+    /// where the host may grant it, or where it is already a refusal of the
+    /// host's own ([`InstanceDecideAnswer::refuses_on_its_own`]); in every
+    /// other case a `deny` of the general layer with [`HOST_NOT_GRANTED`],
+    /// whatever `answer` said.
+    ///
+    /// The hook lets a review it keeps run on a line that does not block
+    /// reviews, and lets a command its general rules allow (by the person's
+    /// suppression too) run over any answer but a refusal of the host's own.
+    /// Without a grant, such a command runs and its program does not start,
+    /// with no reason given. A refusal of the host's own stands over both,
+    /// and the hook says why.
+    pub fn grant_or_refuse(&self, answer: InstanceDecideAnswer) -> InstanceDecideAnswer {
+        if self.host_may_grant(&answer) || answer.refuses_on_its_own() {
+            return answer;
+        }
+        InstanceDecideAnswer {
+            verdict: Verdict::Deny,
+            deciding_layer: RuleLayer::General,
+            profile: None,
+            withheld: Some(HOST_NOT_GRANTED.to_string()),
+            ..answer
+        }
     }
 }
 
@@ -464,6 +650,74 @@ pub fn instance_decide_request(
     charged: &[&str],
     tainted: bool,
 ) -> Option<InstanceDecideRequest> {
+    build_instance_decide_request(
+        INSTANCE_DECIDE_VERSION,
+        Verdict::Review,
+        RequestFacts {
+            instance_id,
+            claimed_agent_type,
+            session_id,
+            command,
+            charged,
+            tainted,
+        },
+    )
+}
+
+/// PURE. The request a hook sends under a profile that asks the host about
+/// every shell command ([`INSTANCE_DECIDE_EVERY_COMMAND_VERSION`]), about one
+/// command its general rules gave `hook_verdict`. As
+/// [`instance_decide_request`], and `None` for a [`Verdict::Deny`] too: a
+/// refusal of the hook's is never asked about.
+pub fn instance_decide_request_v2(
+    instance_id: &str,
+    claimed_agent_type: Option<&str>,
+    session_id: Option<&str>,
+    command: &str,
+    charged: &[&str],
+    tainted: bool,
+    hook_verdict: Verdict,
+) -> Option<InstanceDecideRequest> {
+    if hook_verdict == Verdict::Deny {
+        return None;
+    }
+    build_instance_decide_request(
+        INSTANCE_DECIDE_EVERY_COMMAND_VERSION,
+        hook_verdict,
+        RequestFacts {
+            instance_id,
+            claimed_agent_type,
+            session_id,
+            command,
+            charged,
+            tainted,
+        },
+    )
+}
+
+/// What a request says about the command, whatever its version.
+struct RequestFacts<'a> {
+    instance_id: &'a str,
+    claimed_agent_type: Option<&'a str>,
+    session_id: Option<&'a str>,
+    command: &'a str,
+    charged: &'a [&'a str],
+    tainted: bool,
+}
+
+fn build_instance_decide_request(
+    v: u32,
+    hook_verdict: Verdict,
+    facts: RequestFacts<'_>,
+) -> Option<InstanceDecideRequest> {
+    let RequestFacts {
+        instance_id,
+        claimed_agent_type,
+        session_id,
+        command,
+        charged,
+        tainted,
+    } = facts;
     if !is_instance_id(instance_id) || command.is_empty() {
         return None;
     }
@@ -473,7 +727,7 @@ pub fn instance_decide_request(
         .filter(|name| is_hook_signal(name))
         .collect();
     Some(InstanceDecideRequest {
-        v: INSTANCE_DECIDE_VERSION,
+        v,
         instance_id: instance_id.to_string(),
         claimed_agent_type: claimed_agent_type
             .filter(|label| is_agent_label(label))
@@ -488,7 +742,7 @@ pub fn instance_decide_request(
             .map(str::to_string)
             .collect(),
         tainted,
-        hook_verdict: Verdict::Review,
+        hook_verdict,
         hook_layer: RuleLayer::General,
     })
 }
@@ -530,7 +784,9 @@ pub struct InstanceDecideAnswer {
     /// ([`is_withheld_word`]) the hook records without reading it.
     #[serde(deserialize_with = "nullable")]
     pub withheld: Option<String>,
-    /// The host read other signals than the hook sent. Only recorded.
+    /// The host read other signals than the hook sent. The hook only records
+    /// it; [`InstanceDecideRequest::host_may_grant`] grants nothing on a
+    /// relaxation that says it.
     pub signals_mismatch: bool,
     /// The host found the request in conflict with what it holds.
     pub conflict: bool,
@@ -545,6 +801,17 @@ impl InstanceDecideAnswer {
     /// `confined`.
     pub fn relaxes(&self) -> bool {
         self.trust == Trust::Confined && self.withheld.is_none()
+    }
+
+    /// Whether the host refuses the command on its own: a `deny` whose word
+    /// starts with [`HOST_REFUSAL_PREFIX`]. The only answer that makes a
+    /// command the hook's general rules allow stricter.
+    pub fn refuses_on_its_own(&self) -> bool {
+        self.verdict == Verdict::Deny
+            && self
+                .withheld
+                .as_deref()
+                .is_some_and(|word| word.starts_with(HOST_REFUSAL_PREFIX))
     }
 }
 
@@ -2028,6 +2295,122 @@ mod tests {
         );
     }
 
+    /// The launcher takes an admission only from a JSON `true`, within its
+    /// bound; a host that predates the key, or says anything else, admitted
+    /// nothing. What else the body holds is not read.
+    ///
+    /// FAILS ON REVERT: read `admitted` as any truthy value, or without the
+    /// bound, and the lines that say otherwise read as an admission.
+    #[test]
+    fn only_a_json_true_within_the_bound_is_an_admission() {
+        let read = |body: &str| SystemScopeAdmission::read(body.as_bytes());
+        assert_eq!(SYSTEM_SCOPE_TAKEN, 202);
+        assert_eq!(MAX_SYSTEM_SCOPE_ANSWER_BYTES, 1024);
+        assert!(read(r#"{"admitted":true}"#).admitted);
+        assert!(read(r#"{"placed":true,"unit":"u","admitted":true,"more":[1,2]}"#).admitted);
+        for not_admitted in [
+            "",
+            "{}",
+            "null",
+            "[true]",
+            "true",
+            r#"{"placed":true,"unit":"innerwarden-contain-x.scope"}"#,
+            r#"{"admitted":false}"#,
+            r#"{"admitted":"true"}"#,
+            r#"{"admitted":1}"#,
+            r#"{"admitted":null}"#,
+            r#"{"Admitted":true}"#,
+            r#"{"admitted":true"#,
+        ] {
+            assert_eq!(
+                read(not_admitted),
+                SystemScopeAdmission::NONE,
+                "{not_admitted:?}"
+            );
+        }
+        let pad = "x".repeat(MAX_SYSTEM_SCOPE_ANSWER_BYTES);
+        let long = format!(r#"{{"admitted":true,"pad":"{pad}"}}"#);
+        assert_eq!(read(&long), SystemScopeAdmission::NONE);
+        let shell = r#"{"admitted":true,"pad":""}"#.len();
+        let edge = format!(
+            r#"{{"admitted":true,"pad":"{}"}}"#,
+            "x".repeat(MAX_SYSTEM_SCOPE_ANSWER_BYTES - shell)
+        );
+        assert_eq!(edge.len(), MAX_SYSTEM_SCOPE_ANSWER_BYTES);
+        assert!(read(&edge).admitted);
+    }
+
+    /// A note is printed as it came, so only one a terminal shows as text is
+    /// kept: printable ASCII, 1 to 200 characters. A note that is not one is
+    /// dropped and the admission still read.
+    ///
+    /// FAILS ON REVERT: keep any string and the control, escape, bidi and
+    /// overlong notes are printed.
+    #[test]
+    fn a_note_is_kept_only_as_printable_text_within_its_bound() {
+        let note = "Kernel protection for claude-code is not in effect for this session: \
+                    the host could not check it.";
+        let answer = SystemScopeAdmission::read(
+            json!({ "admitted": false, "note": note })
+                .to_string()
+                .as_bytes(),
+        );
+        assert_eq!(
+            answer,
+            SystemScopeAdmission {
+                admitted: false,
+                note: Some(note.to_string())
+            }
+        );
+        assert!(is_system_scope_note(
+            &"a".repeat(MAX_SYSTEM_SCOPE_NOTE_CHARS)
+        ));
+        for bad in [
+            String::new(),
+            "   ".to_string(),
+            "a".repeat(MAX_SYSTEM_SCOPE_NOTE_CHARS + 1),
+            "line\nbreak".to_string(),
+            "tab\there".to_string(),
+            "\u{1b}[2Jcleared".to_string(),
+            "right\u{202e}to left".to_string(),
+            "caf\u{e9}".to_string(),
+        ] {
+            assert!(!is_system_scope_note(&bad), "{bad:?}");
+            let answer = SystemScopeAdmission::read(
+                json!({ "admitted": true, "note": bad })
+                    .to_string()
+                    .as_bytes(),
+            );
+            assert_eq!(
+                answer,
+                SystemScopeAdmission {
+                    admitted: true,
+                    note: None
+                },
+                "{bad:?}"
+            );
+        }
+        let answer = SystemScopeAdmission::read(br#"{"admitted":true,"note":7}"#);
+        assert_eq!(answer.note, None);
+        // What the host writes reads back as it was.
+        let written = SystemScopeAdmission {
+            admitted: false,
+            note: Some(note.to_string()),
+        };
+        assert_eq!(
+            SystemScopeAdmission::read(&serde_json::to_vec(&written).unwrap()),
+            written
+        );
+        assert_eq!(
+            serde_json::to_value(SystemScopeAdmission {
+                admitted: true,
+                note: None
+            })
+            .unwrap(),
+            json!({ "admitted": true })
+        );
+    }
+
     fn ended_run(commands: u32, last_ms: Option<u64>) -> ContainedRun<'static> {
         ContainedRun {
             instance_id: "0123456789abcdef0123456789abcdef",
@@ -2409,8 +2792,10 @@ mod tests {
         missing.as_object_mut().unwrap().remove("session_id");
         assert!(serde_json::from_value::<InstanceDecideRequest>(missing).is_err());
         for (field, value) in [
-            ("v", json!(2)),
+            ("v", json!(0)),
+            ("v", json!(3)),
             ("hook_verdict", json!("allow")),
+            ("hook_verdict", json!("deny")),
             ("hook_layer", json!("agent_type")),
             ("command", json!("")),
             (
@@ -2429,6 +2814,98 @@ mod tests {
                 .is_ok_and(|request| request.is_valid());
             assert!(!accepted, "{wrong}");
         }
+    }
+
+    /// The request of version 1 is byte for byte the one every hook sent
+    /// before version 2 existed.
+    #[test]
+    fn a_request_of_version_1_is_the_bytes_of_before() {
+        let request = instance_decide_request(
+            OWN,
+            Some("claude-code"),
+            Some("s-1"),
+            "curl http://203.0.113.9/x",
+            &["bare_ip_fetch"],
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_string(&request).unwrap(),
+            format!(
+                "{{\"v\":1,\"instance_id\":\"{OWN}\",\"claimed_agent_type\":\"claude-code\",\
+                 \"session_id\":\"s-1\",\"command\":\"curl http://203.0.113.9/x\",\
+                 \"hook_signals\":[\"bare_ip_fetch\"],\"tainted\":false,\
+                 \"hook_verdict\":\"review\",\"hook_layer\":\"general\"}}"
+            )
+        );
+        assert_eq!(INSTANCE_DECIDE_VERSION, 1);
+        assert_eq!(INSTANCE_DECIDE_EVERY_COMMAND_VERSION, 2);
+    }
+
+    /// Under a profile that asks about every command the request is of
+    /// version 2 and says the general verdict, `allow` or `review`; a refusal
+    /// is never sent.
+    #[test]
+    fn a_request_of_version_2_says_allow_or_review() {
+        for (verdict, word) in [(Verdict::Allow, "allow"), (Verdict::Review, "review")] {
+            let request = instance_decide_request_v2(
+                OWN,
+                Some("claude-code"),
+                Some("s-1"),
+                "curl https://example.com",
+                &[],
+                false,
+                verdict,
+            )
+            .unwrap();
+            assert!(request.is_valid(), "{word}");
+            assert_eq!(
+                serde_json::to_value(&request).unwrap(),
+                json!({
+                    "v": 2,
+                    "instance_id": OWN,
+                    "claimed_agent_type": "claude-code",
+                    "session_id": "s-1",
+                    "command": "curl https://example.com",
+                    "hook_signals": [],
+                    "tainted": false,
+                    "hook_verdict": word,
+                    "hook_layer": "general",
+                })
+            );
+            let read: InstanceDecideRequest =
+                serde_json::from_value(serde_json::to_value(&request).unwrap()).unwrap();
+            assert_eq!(read, request);
+        }
+        assert_eq!(
+            instance_decide_request_v2(OWN, None, None, "rm -rf /", &[], false, Verdict::Deny),
+            None
+        );
+        assert_eq!(
+            instance_decide_request_v2("../x", None, None, "ls", &[], false, Verdict::Allow),
+            None
+        );
+    }
+
+    /// FAILS ON REVERT: let `is_valid` take any verdict under version 2 and
+    /// a request about a refusal reads as one the contract allows.
+    #[test]
+    fn a_request_of_version_2_about_a_refusal_is_not_the_contracts() {
+        let good = json!({
+            "v": 2, "instance_id": OWN, "claimed_agent_type": null, "session_id": null,
+            "command": "ls", "hook_signals": [], "tainted": false,
+            "hook_verdict": "allow", "hook_layer": "general",
+        });
+        let read: InstanceDecideRequest = serde_json::from_value(good.clone()).unwrap();
+        assert!(read.is_valid());
+        let mut deny = good.clone();
+        deny["hook_verdict"] = json!("deny");
+        let read: InstanceDecideRequest = serde_json::from_value(deny).unwrap();
+        assert!(!read.is_valid());
+        let mut layer = good;
+        layer["hook_layer"] = json!("agent_type");
+        let read: InstanceDecideRequest = serde_json::from_value(layer).unwrap();
+        assert!(!read.is_valid());
     }
 
     fn answer() -> Value {
@@ -2453,6 +2930,217 @@ mod tests {
         assert_eq!(read.verdict, Verdict::Allow);
         assert_eq!(read.deciding_layer, RuleLayer::AgentType);
         assert_eq!(read.decision_id, DECISION);
+    }
+
+    /// The answer, read, with `verdict`, `trust` and `withheld` as given.
+    fn answer_with(verdict: &str, trust: &str, withheld: Option<&str>) -> InstanceDecideAnswer {
+        let mut value = answer();
+        value["verdict"] = json!(verdict);
+        value["trust"] = json!(trust);
+        value["withheld"] = json!(withheld);
+        if withheld.is_some() {
+            value["deciding_layer"] = json!("general");
+            value["profile"] = Value::Null;
+        }
+        let HostAnswer::Answer(read) = read(&value) else {
+            panic!("the contract's answer: {value}")
+        };
+        read
+    }
+
+    /// Only a `deny` with a word of the host's own refusal is one: another
+    /// word, another verdict or no word is the host's reading of the rules.
+    ///
+    /// FAILS ON REVERT: take any `deny` of the host's as its own refusal (drop
+    /// the prefix check) and its reading of the general rules is one.
+    #[test]
+    fn only_a_deny_with_a_word_of_its_own_is_the_hosts_refusal() {
+        assert_eq!(HOST_REFUSAL_PREFIX, "kernel_");
+        let own = answer_with("deny", "confined", Some("kernel_a_word_never_heard"));
+        assert!(own.refuses_on_its_own());
+        for (verdict, withheld) in [
+            ("deny", Some("not_review")),
+            ("deny", Some("a_kernel_word_never_heard")),
+            ("deny", None),
+            ("review", Some("kernel_a_word_never_heard")),
+            ("allow", Some("kernel_a_word_never_heard")),
+        ] {
+            let other = answer_with(verdict, "confined", withheld);
+            assert!(!other.refuses_on_its_own(), "{verdict} {withheld:?}");
+        }
+    }
+
+    /// The hook's general verdict is the ceiling of what the host lets run:
+    /// its `allow` over an `allow`, or over a review it relaxed itself; never
+    /// over a review it did not relax, which the hook keeps and may block on
+    /// its line, nor for an argument from a tool result.
+    ///
+    /// FAILS ON REVERT: let the host grant on its own `allow` whatever the
+    /// hook's verdict (drop the `hook_verdict` check) and the review the hook
+    /// blocks leaves a grant behind for the exact command.
+    #[test]
+    fn the_hooks_verdict_is_the_ceiling_of_what_the_host_grants() {
+        let request = |verdict: Verdict, tainted: bool| {
+            instance_decide_request_v2(
+                OWN,
+                Some("claude-code"),
+                None,
+                "curl https://x.example/p",
+                &[],
+                tainted,
+                verdict,
+            )
+            .unwrap()
+        };
+        let kept_general = answer_with("allow", "observed", Some("not_review"));
+        let relaxed = answer_with("allow", "confined", None);
+        let refused = answer_with("deny", "confined", Some("kernel_a_word_never_heard"));
+        let held = answer_with("review", "confined", Some("nothing_to_relax"));
+        // The hook's allow, kept by the host: a grant.
+        assert!(request(Verdict::Allow, false).host_may_grant(&kept_general));
+        // The hook's review, which the host did not relax: none.
+        assert!(!request(Verdict::Review, false).host_may_grant(&kept_general));
+        // The hook's review, relaxed by the host: a grant, unless tainted.
+        assert!(request(Verdict::Review, false).host_may_grant(&relaxed));
+        assert!(!request(Verdict::Review, true).host_may_grant(&relaxed));
+        // A request of version 1 is about a review: only a relaxation grants.
+        let v1 = instance_decide_request(OWN, None, None, "curl x", &[], false).unwrap();
+        assert!(v1.host_may_grant(&relaxed));
+        assert!(!v1.host_may_grant(&kept_general));
+        // The host's refusal or review grants nothing, whatever the hook said.
+        for answer in [&refused, &held] {
+            for verdict in [Verdict::Allow, Verdict::Review] {
+                assert!(
+                    !request(verdict, false).host_may_grant(answer),
+                    "{answer:?}"
+                );
+            }
+        }
+        // A request out of the contract grants nothing.
+        let mut odd = request(Verdict::Allow, false);
+        odd.v = 1;
+        assert!(!odd.host_may_grant(&kept_general));
+    }
+
+    /// A relaxation the host decided over other signals than the hook
+    /// charged grants nothing: the hook decides it again over its own, and
+    /// a signal no profile allows (an ATR category the host's rules did not
+    /// charge) keeps its review. Over the hook's allow the host's signals do
+    /// not matter: the hook lets the command run whatever they were.
+    ///
+    /// FAILS ON REVERT: drop the `signals_mismatch` check from
+    /// `host_may_grant` and a review the hook keeps leaves a grant behind
+    /// for the exact command.
+    #[test]
+    fn a_relaxation_over_other_signals_grants_nothing() {
+        let charged = ["atr:a-rule-the-host-lacks", "bare_ip_fetch"];
+        let review = |verdict: Verdict| {
+            instance_decide_request_v2(
+                OWN,
+                Some("claude-code"),
+                None,
+                "curl http://203.0.113.9/x",
+                &charged,
+                false,
+                verdict,
+            )
+            .unwrap()
+        };
+        let mut relaxed_elsewhere = answer_with("allow", "confined", None);
+        relaxed_elsewhere.signals_mismatch = true;
+        assert!(relaxed_elsewhere.relaxes(), "the host says it relaxed");
+        assert!(!review(Verdict::Review).host_may_grant(&relaxed_elsewhere));
+        let v1 = instance_decide_request(OWN, None, None, "curl x", &charged, false).unwrap();
+        assert!(!v1.host_may_grant(&relaxed_elsewhere));
+        // The same relaxation over the signals the hook charged: a grant.
+        let relaxed = answer_with("allow", "confined", None);
+        assert!(review(Verdict::Review).host_may_grant(&relaxed));
+        // Over the hook's own allow: a grant, whatever the host read.
+        let mut kept = answer_with("allow", "observed", Some("not_review"));
+        kept.signals_mismatch = true;
+        assert!(review(Verdict::Allow).host_may_grant(&kept));
+    }
+
+    /// Where a program of the command starts only on a grant, every answer
+    /// without one goes out as a refusal of the host's own, of the general
+    /// layer, that the hook reads as one; an answer with a grant, or one
+    /// that already is a refusal of the host's own, goes as it is.
+    ///
+    /// FAILS ON REVERT: let `grant_or_refuse` send `answer` as it was when
+    /// the host grants nothing, and the hook lets the command run (a review
+    /// it keeps on a line that does not block reviews, a command the
+    /// person's suppression allows) while its program does not start.
+    #[test]
+    fn without_a_grant_the_host_answers_a_refusal_of_its_own() {
+        assert_eq!(HOST_NOT_GRANTED, "kernel_not_granted");
+        assert!(HOST_NOT_GRANTED.starts_with(HOST_REFUSAL_PREFIX));
+        assert!(is_withheld_word(HOST_NOT_GRANTED));
+        let request = |verdict: Verdict, tainted: bool| {
+            instance_decide_request_v2(
+                OWN,
+                Some("claude-code"),
+                None,
+                "curl https://x.example/p",
+                &["bare_ip_fetch"],
+                tainted,
+                verdict,
+            )
+            .unwrap()
+        };
+        let kept_general = answer_with("allow", "observed", Some("not_review"));
+        let relaxed = answer_with("allow", "confined", None);
+        let mut relaxed_elsewhere = relaxed.clone();
+        relaxed_elsewhere.signals_mismatch = true;
+        let held = answer_with("review", "confined", Some("nothing_to_relax"));
+        let read_deny = answer_with("deny", "confined", Some("not_review"));
+        let plain_deny = answer_with("deny", "observed", None);
+        let own = answer_with("deny", "confined", Some("kernel_a_word_never_heard"));
+        // Granted: sent as it is.
+        for (hook, tainted, answer) in [
+            (Verdict::Allow, false, &kept_general),
+            (Verdict::Allow, false, &relaxed),
+            (Verdict::Review, false, &relaxed),
+        ] {
+            let request = request(hook, tainted);
+            assert!(request.host_may_grant(answer));
+            assert_eq!(&request.grant_or_refuse(answer.clone()), answer);
+        }
+        // A refusal of the host's own already: sent as it is.
+        for hook in [Verdict::Allow, Verdict::Review] {
+            assert_eq!(request(hook, false).grant_or_refuse(own.clone()), own);
+        }
+        // Every other answer: the host's own refusal, read as one.
+        let cases = [
+            (Verdict::Review, false, &kept_general),
+            (Verdict::Review, false, &relaxed_elsewhere),
+            (Verdict::Review, true, &relaxed),
+            (Verdict::Allow, true, &kept_general),
+            (Verdict::Allow, false, &held),
+            (Verdict::Review, false, &held),
+            (Verdict::Allow, false, &read_deny),
+            (Verdict::Allow, false, &plain_deny),
+        ];
+        for (hook, tainted, answer) in cases {
+            let request = request(hook, tainted);
+            assert!(!request.host_may_grant(answer), "{hook:?} {answer:?}");
+            let sent = request.grant_or_refuse(answer.clone());
+            assert!(sent.refuses_on_its_own(), "{hook:?} {answer:?}");
+            assert_eq!(sent.verdict, Verdict::Deny);
+            assert_eq!(sent.withheld.as_deref(), Some(HOST_NOT_GRANTED));
+            assert_eq!(sent.deciding_layer, RuleLayer::General);
+            assert_eq!(sent.profile, None);
+            assert!(!sent.relaxes());
+            assert!(!request.host_may_grant(&sent));
+            // The rest of the answer is the host's, unchanged.
+            assert_eq!(sent.decision_id, answer.decision_id);
+            assert_eq!(sent.trust, answer.trust);
+            assert_eq!(sent.signals_mismatch, answer.signals_mismatch);
+            // And it is exactly the contract's answer for the hook.
+            let HostAnswer::Answer(read) = read(&serde_json::to_value(&sent).unwrap()) else {
+                panic!("the contract's answer: {sent:?}")
+            };
+            assert_eq!(read, sent);
+        }
     }
 
     /// FAILS ON REVERT: accept an answer without comparing `instance_id` and

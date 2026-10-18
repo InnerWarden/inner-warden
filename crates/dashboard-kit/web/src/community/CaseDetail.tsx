@@ -11,7 +11,7 @@ import { caseLadder, messageLadder } from "./ladder";
 import { OfferLine } from "./Offer";
 import { caseOffer, messageOffer } from "./offers";
 import { Ago, CARD, Chip, CopyCommand, Eyebrow, HiddenChip, OutcomeDot, tokenWrap } from "./parts";
-import { asVerdict, CHANNEL_WORDS, DECIDER_WORDS, layerLine, OUTCOME_WORDS, reasonWords, shortSession, trustWord, withheldWords, type PlatformOs } from "./words";
+import { asVerdict, CHANNEL_WORDS, DECIDER_WORDS, HOST_REFUSED_WORDS, hostRefused, layerLine, OUTCOME_WORDS, reasonWords, shortSession, trustWord, withheldWords, type PlatformOs } from "./words";
 
 /** A CLI sentence, printed as sent: text as text, a folder as code, a time through the page's clock. */
 export function Segments({ segments }: { segments: readonly Segment[] }) {
@@ -143,11 +143,15 @@ export function CaseDetail({
   const verdict = asVerdict(item.recommendation);
   const identity = item.identity;
   const hostDecided = identity?.trustSource === "host" && identity.hostDecision !== undefined;
+  // A refusal of the host's own is the host's, whatever the general rules said.
+  const refusedByHost = hostRefused(identity?.trustSource, item.decidedBy, verdict);
   const layered = identity?.layer === undefined || verdict === undefined
     ? undefined
-    : layerLine(identity.layer, verdict, identity.trust, item.agent ?? item.agentId ?? "this agent", hostDecided);
+    : refusedByHost
+      ? { text: HOST_REFUSED_WORDS, conflict: false }
+      : layerLine(identity.layer, verdict, identity.trust, item.agent ?? item.agentId ?? "this agent", hostDecided);
   // Why a relaxation did not apply, worded for this page: once, grey, no link.
-  const withheld = identity !== undefined && (identity.relaxationWithheld || identity.hostWithheld !== undefined)
+  const withheld = !refusedByHost && identity !== undefined && (identity.relaxationWithheld || identity.hostWithheld !== undefined)
     ? withheldWords(os, installed, identity.hostWithheld !== undefined)
     : undefined;
   return (

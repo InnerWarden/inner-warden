@@ -233,7 +233,34 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
              command sent to review and the host decides whether a profile rule that\n  \
              relaxes your general rules applies; the stricter verdict wins. Without it\n  \
              the relaxation is recorded and not applied. MCP tools and file edits keep\n  \
-             your general rules.\n\
+             your general rules. A profile of the system file (schema 2) can say\n  \
+             ask_host = \"every_command\": the hook then asks the host about every\n  \
+             shell command it does not refuse itself, one your general rules allow\n  \
+             too, and only a refusal of the host's own makes an allowed command\n  \
+             stricter. A command the hook refuses is never asked about.\n\
+             \n  \
+             A profile of schema 2, in either file, can say when its jail starts and\n  \
+             what of the home it hides. start = \"only_when_admitted\": the agent\n  \
+             starts only once Active Defence on the host admitted the jail; otherwise\n  \
+             contain says what to check and exits 2, having started nothing (a launcher\n  \
+             stopped while it waits starts nothing either). hide_home: home paths the\n  \
+             jail covers with an empty mount, or denies on macOS; a path that leads\n  \
+             outside the home, or over what the jail needs, stops the launch. A note\n  \
+             from the host about the jail is printed as `innerwarden contain: <note>`.\n  \
+             A Linux jail shows the host's resolver file read-only, so names resolve as\n  \
+             on the host.\n\
+             \n  \
+             On Linux, where the host takes it, every jail starts its programs under\n  \
+             a seccomp filter in the style of Flatpak that refuses TIOCSTI and\n  \
+             TIOCLINUX, the terminal commands that push input into your terminal,\n  \
+             and new btrfs or bcachefs subvolumes or snapshots, which would show the\n  \
+             files the jail hides; contain says so when the host does not take it.\n  \
+             A snapshot made before the jail started, in a folder the jail shows,\n  \
+             still holds the files it hides: only new ones are refused.\n  \
+             With --identity it also refuses new user namespaces and joining other\n  \
+             namespaces, ends a 32-bit program, and drops every capability: turn the\n  \
+             agent's own sandbox off inside the jail. The jail shares the host's\n  \
+             network, so an X server's abstract socket stays reachable from it.\n\
              \n  \
              Everything after `--` is the jailed command line, including its own\n  \
              `--help`."
@@ -385,6 +412,125 @@ mod tests {
         }
         // Nothing at all reads from stdin, which is not a help request either.
         assert!(!is_help_request("check", &[]));
+    }
+
+    /// The public words for the jail's seccomp filter say what it covers and
+    /// where it stops, in `contain --help` and in the README alike: the two
+    /// terminal commands by name and the refusal of new btrfs and bcachefs
+    /// subvolumes and snapshots in every jail, only where the host takes
+    /// it, the identified jail's capability drop and its end of 32-bit
+    /// programs, the plain jail's rules on those programs, what a jail that
+    /// falls back says, that a snapshot made before the jail started still
+    /// holds the files it hides, the X server left reachable, and the kernels
+    /// before 4.8.
+    ///
+    /// FAILS ON REVERT: say again that every jail refuses injecting
+    /// keystrokes, or that a plain jail gets only the keystroke rule or only
+    /// the terminal rule, put the subvolume refusal back under `--identity`
+    /// alone, drop the bcachefs words or what a fallback says, or drop the
+    /// limit on snapshots made before the jail started.
+    #[test]
+    fn the_contain_help_and_the_readme_say_what_the_filter_covers() {
+        let flat = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let help = flat(&usage("contain", &[]).expect("contain has usage"));
+        for said in [
+            "where the host takes it",
+            "every jail starts its programs under a seccomp filter in the style of Flatpak that refuses TIOCSTI and TIOCLINUX, the terminal commands that push input into your terminal, and new btrfs or bcachefs subvolumes or snapshots, which would show the files the jail hides;",
+            "contain says so when the host does not take it",
+            "A snapshot made before the jail started, in a folder the jail shows, still holds the files it hides: only new ones are refused.",
+            "ends a 32-bit program, and drops every capability",
+            "With --identity it also refuses new user namespaces and joining other namespaces,",
+            "The jail shares the host's network, so an X server's abstract socket stays reachable",
+        ] {
+            assert!(help.contains(said), "contain --help lacks {said:?}: {help}");
+        }
+        let readme = flat(include_str!("../../../README.md"));
+        for said in [
+            "On Linux, where the host takes it, every jail starts its programs under a seccomp filter that refuses `TIOCSTI` and `TIOCLINUX`, the terminal commands that push input into your terminal, and new btrfs or bcachefs subvolumes and snapshots.",
+            "Its programs run with no capability, also when `contain` itself runs as root.",
+            "in the style of Flatpak: no new user namespaces, no joining other namespaces, no new btrfs or bcachefs subvolumes or snapshots,",
+            "is ended at its first call in an identified jail",
+            "gets only the terminal rule and the subvolume rule, and applies them to 32-bit programs too",
+            "Every jail refuses new subvolumes and snapshots because a snapshot of the project would show the files the jail hides in it",
+            "a build for an architecture other than x86_64 or aarch64",
+            "naming the keystrokes and the snapshots its programs can then make",
+            "`contain` says user namespaces stay open, joining other namespaces too, and that a 32-bit program runs in it; the terminal rule and the subvolume rule still hold.",
+            "Limits: the filter covers those commands only.",
+            "It refuses only new subvolumes and snapshots: a snapshot made before the jail started, in a folder the jail shows, still holds the files the jail hides (`.env`, `secrets/`, each `--deny-read` path), and a program in the jail can read them there.",
+            "a desktop's X server among them",
+            "On a kernel older than 4.8",
+        ] {
+            assert!(readme.contains(said), "README lacks {said:?}");
+        }
+        for text in [&help, &readme] {
+            assert!(!text.contains("refuses injecting keystrokes"));
+            assert!(!text.contains("gets only the keystroke rule"));
+            assert!(!text.contains("gets only the terminal rule,"));
+            assert!(!text.contains("joining other namespaces, and new btrfs"));
+            assert!(!text.contains("covers those terminal commands only"));
+        }
+    }
+
+    /// The contain help and the README say what `ask_host = "every_command"`
+    /// asks, what may make an allowed command stricter, and that the host
+    /// reads the system file too.
+    ///
+    /// FAILS ON REVERT: drop the `ask_host` sentence from the contain help,
+    /// or put back the README's "your suppressions ... still win" and its
+    /// warning about an older `innerwarden` alone.
+    #[test]
+    fn the_contain_help_and_the_readme_say_what_every_command_asks() {
+        let flat = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let help = flat(&usage("contain", &[]).expect("contain has usage"));
+        for said in [
+            "A profile of the system file (schema 2) can say ask_host = \"every_command\"",
+            "asks the host about every shell command it does not refuse itself, one your general rules allow too",
+            "only a refusal of the host's own makes an allowed command stricter",
+            "A command the hook refuses is never asked about.",
+        ] {
+            assert!(help.contains(said), "contain --help lacks {said:?}: {help}");
+        }
+        let readme = flat(include_str!("../../../README.md"));
+        for said in [
+            "A review the hook would block on its line is still asked about, because the host may relax it",
+            "your suppressions included, is made stricter only by a refusal of the host's own",
+            "and so does an older Active Defence on the host, which reads the same file",
+        ] {
+            assert!(readme.contains(said), "README lacks {said:?}");
+        }
+        assert!(!readme.contains("your suppressions and your own profiles file still win"));
+    }
+
+    /// The contain help and the README say what a jail profile of schema 2
+    /// adds: when the jail starts (and the exit 2 with nothing started),
+    /// what of the home it hides, the host's note, and the resolver file
+    /// every Linux jail shows, with its limit.
+    ///
+    /// FAILS ON REVERT: drop any of these from the contain help or the
+    /// README and the line that names it fails.
+    #[test]
+    fn the_contain_help_and_the_readme_say_when_a_jail_starts_and_what_it_hides() {
+        let flat = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let help = flat(&usage("contain", &[]).expect("contain has usage"));
+        for said in [
+            "start = \"only_when_admitted\": the agent starts only once Active Defence on the host admitted the jail",
+            "contain says what to check and exits 2, having started nothing",
+            "hide_home: home paths the jail covers with an empty mount, or denies on macOS",
+            "is printed as `innerwarden contain: <note>`",
+            "A Linux jail shows the host's resolver file read-only",
+        ] {
+            assert!(help.contains(said), "contain --help lacks {said:?}: {help}");
+        }
+        let readme = flat(include_str!("../../../README.md"));
+        for said in [
+            "`start = \"only_when_admitted\"`: `contain --identity` starts the agent only once Active Defence on the host has admitted the jail",
+            "and exits 2 with nothing started",
+            "`hide_home = [\".cache/git/credential\"]`: home paths the jail covers",
+            "it prints it as `innerwarden contain: <note>`",
+            "a jail keeps the resolver file it started with until the agent is restarted",
+        ] {
+            assert!(readme.contains(said), "README lacks {said:?}");
+        }
     }
 
     /// A wrapped child's flags are not ours. `contain -- claude --help` must run
