@@ -15,8 +15,10 @@
 //!
 //! An identified jail (`--identity`) also refuses new user namespaces and
 //! joining other namespaces, so nothing in it can build a namespace of its
-//! own. It ends a call made through any other ABI (another architecture's, or
-//! x32): the numbers it names would not name the same calls there.
+//! own, and the btrfs commands that make a new subvolume or a snapshot of
+//! one, so nothing in it makes a new subvolume or snapshot. It ends a call
+//! made through any other ABI (another architecture's, or x32): the numbers
+//! it names would not name the same calls there.
 //!
 //! PURE, and the one definition of these programs: [`filter`] gives the exact
 //! bytes the launcher hands to bubblewrap, for either architecture, on any
@@ -72,6 +74,56 @@ const TIOCSTI: u32 = 0x5412;
 /// `TIOCLINUX`: the Linux console's subcommands, one of which pastes the
 /// selection into the console's input.
 const TIOCLINUX: u32 = 0x541C;
+
+/// `_IOC_WRITE` (`include/uapi/asm-generic/ioctl.h`, the layout both
+/// architectures use): a command that hands the kernel a struct to read.
+const IOC_WRITE: u32 = 1;
+
+/// `_IOW(ty, nr, size)` (`include/uapi/asm-generic/ioctl.h`): 2 bits of
+/// direction at 30, 14 bits of size at 16, 8 of type at 8, 8 of number at 0.
+/// Added, not OR'd, as the kernel's fields do not overlap: the same bytes,
+/// and a mutation test cannot turn an `+` into an operator that gives them.
+const fn iow(ty: u32, nr: u32, size: u32) -> u32 {
+    (IOC_WRITE << 30) + (size << 16) + (ty << 8) + nr
+}
+
+/// `BTRFS_IOCTL_MAGIC`, the type of every btrfs command
+/// (`include/uapi/linux/btrfs.h`).
+const BTRFS_IOCTL_MAGIC: u32 = 0x94;
+
+/// `sizeof(struct btrfs_ioctl_vol_args)`: `__s64 fd` and `char
+/// name[BTRFS_PATH_NAME_MAX + 1]`, with `BTRFS_PATH_NAME_MAX` 4087. No
+/// padding: 4096 is a multiple of the struct's alignment, 8.
+const BTRFS_VOL_ARGS_SIZE: u32 = 8 + (4087 + 1);
+
+/// `sizeof(struct btrfs_ioctl_vol_args_v2)`: `__s64 fd`, `__u64 transid` and
+/// `__u64 flags`; a union of four `__u64` (`size` and the `qgroup_inherit`
+/// pointer, or `unused[4]`); and a union of `char
+/// name[BTRFS_SUBVOL_NAME_MAX + 1]`, with `BTRFS_SUBVOL_NAME_MAX` 4039, and
+/// two `__u64`. No padding: 4096 is a multiple of 8.
+const BTRFS_VOL_ARGS_V2_SIZE: u32 = 3 * 8 + 4 * 8 + (4039 + 1);
+
+/// The four btrfs commands that make a new subvolume or a snapshot of one,
+/// as `include/uapi/linux/btrfs.h` defines them: `BTRFS_IOC_SNAP_CREATE`
+/// (`_IOW(0x94, 1, struct btrfs_ioctl_vol_args)`), `BTRFS_IOC_SUBVOL_CREATE`
+/// (14, the same struct), `BTRFS_IOC_SNAP_CREATE_V2` (23, `struct
+/// btrfs_ioctl_vol_args_v2`) and `BTRFS_IOC_SUBVOL_CREATE_V2` (24, the same
+/// struct). The same numbers on both architectures; a test holds each to
+/// its value written out, and a real kernel made a subvolume and a snapshot
+/// with each.
+const BTRFS_IOC_SNAP_CREATE: u32 = iow(BTRFS_IOCTL_MAGIC, 1, BTRFS_VOL_ARGS_SIZE);
+const BTRFS_IOC_SUBVOL_CREATE: u32 = iow(BTRFS_IOCTL_MAGIC, 14, BTRFS_VOL_ARGS_SIZE);
+const BTRFS_IOC_SNAP_CREATE_V2: u32 = iow(BTRFS_IOCTL_MAGIC, 23, BTRFS_VOL_ARGS_V2_SIZE);
+const BTRFS_IOC_SUBVOL_CREATE_V2: u32 = iow(BTRFS_IOCTL_MAGIC, 24, BTRFS_VOL_ARGS_V2_SIZE);
+
+/// The commands an identified jail refuses besides the terminal ones, in the
+/// order the program compares them: no new btrfs subvolume or snapshot.
+const BTRFS_NEW_SUBVOLUME: [u32; 4] = [
+    BTRFS_IOC_SNAP_CREATE,
+    BTRFS_IOC_SUBVOL_CREATE,
+    BTRFS_IOC_SNAP_CREATE_V2,
+    BTRFS_IOC_SUBVOL_CREATE_V2,
+];
 
 /// `EPERM`, the same on both architectures.
 const EPERM: u32 = 1;
@@ -201,7 +253,8 @@ pub enum Rules {
     /// kernel runs; every other call allowed.
     Terminal,
     /// An identified jail (`--identity`): the terminal rule, no new user
-    /// namespace, no joining a namespace, and no call through another ABI.
+    /// namespace, no joining a namespace, no new btrfs subvolume or
+    /// snapshot, and no call through another ABI.
     Identified,
 }
 
@@ -247,7 +300,11 @@ fn jeq(k: u32, yes: To, no: To) -> Step {
 /// `ENOSYS`; `setns` `EPERM`; `unshare` and `clone` with `CLONE_NEWUSER` in
 /// the low word of their flags `EPERM`; `ioctl` (on x86_64 also 514, see
 /// [`X32_IOCTL`]) with `TIOCSTI` or `TIOCLINUX` in the low word of its
-/// command `EPERM`; every other call is allowed.
+/// command `EPERM`, and with the identified rules also one of
+/// [`BTRFS_NEW_SUBVOLUME`]; every other call is allowed. The low word, as
+/// the kernel reads it: `ioctl` takes its command as an `unsigned int`, so
+/// the high 32 bits a caller sets never reach the command, and a command
+/// with them set is refused like the same command without them.
 ///
 /// The identified rules KILL a call of another architecture and an x32 one.
 /// The terminal rules keep only the `ioctl` check, and run it on every ABI
@@ -314,11 +371,18 @@ fn steps(arch: Arch, rules: Rules) -> Vec<Step> {
         s.push(Step::Load(OFFSET_NR));
         s.push(jeq(compat_ioctl, To::At(Ioctl), To::At(Allow)));
     }
+    // Each command refused is one compare; a command none of them names
+    // falls through the last to `Allow`, the next instruction.
+    s.push(Step::Mark(Ioctl));
+    s.push(Step::Load(OFFSET_ARG1_LOW));
+    s.push(jeq(TIOCSTI, To::At(Eperm), To::Next));
+    s.push(jeq(TIOCLINUX, To::At(Eperm), To::Next));
+    if identified {
+        for command in BTRFS_NEW_SUBVOLUME {
+            s.push(jeq(command, To::At(Eperm), To::Next));
+        }
+    }
     s.extend([
-        Step::Mark(Ioctl),
-        Step::Load(OFFSET_ARG1_LOW),
-        jeq(TIOCSTI, To::At(Eperm), To::Next),
-        jeq(TIOCLINUX, To::At(Eperm), To::At(Allow)),
         Step::Mark(Allow),
         Step::Ret(SECCOMP_RET_ALLOW),
         Step::Mark(Eperm),
@@ -612,6 +676,82 @@ mod tests {
         }
     }
 
+    /// The btrfs commands that make a new subvolume or a snapshot of one, by
+    /// their values in `include/uapi/linux/btrfs.h`, written out here and
+    /// never taken from the constants the program uses.
+    const BTRFS_COMMANDS: [(&str, u64); 4] = [
+        ("BTRFS_IOC_SNAP_CREATE", 0x5000_9401),
+        ("BTRFS_IOC_SUBVOL_CREATE", 0x5000_940E),
+        ("BTRFS_IOC_SNAP_CREATE_V2", 0x5000_9417),
+        ("BTRFS_IOC_SUBVOL_CREATE_V2", 0x5000_9418),
+    ];
+
+    /// An identified jail makes no new btrfs subvolume and no snapshot: each
+    /// of the four commands that make one answers EPERM, on both
+    /// architectures, by the low word of the command as the terminal ones
+    /// are (the kernel takes the command as a 32-bit `unsigned int`, so a
+    /// caller's high bits never reach it), and on x86_64 also by 514. The
+    /// other btrfs commands (deleting a snapshot, defragmenting) and a
+    /// command with one of the four only in its high word pass. The plain
+    /// jail lets all four through, by every ABI.
+    ///
+    /// FAILS ON REVERT: take the btrfs commands out of the identified filter
+    /// (each passes), compare all 64 bits of the command (the variants with
+    /// high bits pass), or give them to the terminal filter too (the plain
+    /// jail refuses them).
+    #[test]
+    fn an_identified_jail_never_snapshots_a_btrfs_subvolume() {
+        for arch in ARCHES {
+            let n = arch.numbers();
+            let mut ioctls = vec![n.ioctl];
+            if arch == Arch::X86_64 {
+                ioctls.push(X32_IOCTL);
+            }
+            for (name, command) in BTRFS_COMMANDS {
+                for nr in &ioctls {
+                    for (bits, value) in [
+                        ("", command),
+                        (" with bit 32", 0x1_0000_0000 | command),
+                        (" with the high word set", 0xffff_ffff_0000_0000 | command),
+                    ] {
+                        assert_eq!(
+                            identified(arch, *nr, &[3, value]),
+                            Verdict::Errno(EPERM),
+                            "{arch:?} ioctl {nr} {name}{bits}"
+                        );
+                        assert_eq!(
+                            terminal(arch, *nr, &[3, value]),
+                            Verdict::Allow,
+                            "{arch:?} plain jail ioctl {nr} {name}{bits}"
+                        );
+                    }
+                }
+                assert_eq!(
+                    identified(arch, n.ioctl, &[3, command << 32]),
+                    Verdict::Allow,
+                    "{arch:?} {name} only in the high word"
+                );
+                assert_eq!(
+                    run(
+                        &program(arch, Rules::Terminal),
+                        &foreign_call(arch, COMPAT_IOCTL, &[3, command])
+                    ),
+                    Verdict::Allow,
+                    "{arch:?} plain jail 32-bit ioctl {name}"
+                );
+            }
+            // `BTRFS_IOC_SNAP_DESTROY` (15) and `BTRFS_IOC_DEFRAG` (2), both
+            // `_IOW(0x94, nr, struct btrfs_ioctl_vol_args)`: they make nothing.
+            for other in [0x5000_940F, 0x5000_9402] {
+                assert_eq!(
+                    identified(arch, n.ioctl, &[3, other]),
+                    Verdict::Allow,
+                    "{arch:?} {other:#x}"
+                );
+            }
+        }
+    }
+
     /// `clone3` answers `ENOSYS`, never `EPERM`: glibc 2.34 and later falls
     /// back to `clone` only on `ENOSYS`, and every thread (the hook asks the
     /// host on one) and every child it starts goes through it first.
@@ -837,6 +977,11 @@ mod tests {
                 ("setns", n.setns, vec![3, 0]),
                 ("clone3", n.clone3, vec![0, 88]),
                 ("ioctl(TCGETS)", n.ioctl, vec![0, TCGETS]),
+                (
+                    "ioctl(BTRFS_IOC_SNAP_CREATE_V2)",
+                    n.ioctl,
+                    vec![3, 0x5000_9417],
+                ),
             ] {
                 assert_eq!(terminal(arch, nr, &args), Verdict::Allow, "{arch:?} {what}");
             }
@@ -849,8 +994,10 @@ mod tests {
 
     /// The four programs, byte for byte, as [`filter`] gives them: what
     /// bubblewrap reads. Any change to the program shows here first, and the
-    /// tests above say whether it still does what it says. These bytes are
-    /// the same as when the builder lived in the `innerwarden` binary.
+    /// tests above say whether it still does what it says. The terminal
+    /// programs are the same bytes as when the builder lived in the
+    /// `innerwarden` binary; the identified ones have since grown the four
+    /// btrfs compares, one instruction each, after `TIOCLINUX`.
     #[test]
     fn golden_bytes_of_each_filter() {
         let golden = [
@@ -948,6 +1095,32 @@ mod tests {
             (0x0005_0001, 0x0005_0026),
             "SECCOMP_RET_ERRNO | errno"
         );
+        // `include/uapi/linux/btrfs.h`: both structs are 4096 bytes, and
+        // `_IOW(0x94, nr, 4096)` is 0x50009400 + nr on both architectures.
+        assert_eq!(
+            (BTRFS_VOL_ARGS_SIZE, BTRFS_VOL_ARGS_V2_SIZE),
+            (4096, 4096),
+            "sizeof btrfs_ioctl_vol_args and _v2"
+        );
+        assert_eq!(
+            BTRFS_NEW_SUBVOLUME.map(u64::from),
+            BTRFS_COMMANDS.map(|(_, command)| command),
+            "btrfs.h"
+        );
+        assert_eq!(
+            [
+                BTRFS_IOC_SNAP_CREATE,
+                BTRFS_IOC_SUBVOL_CREATE,
+                BTRFS_IOC_SNAP_CREATE_V2,
+                BTRFS_IOC_SUBVOL_CREATE_V2
+            ],
+            [0x5000_9401, 0x5000_940E, 0x5000_9417, 0x5000_9418],
+            "each name its own value"
+        );
+        // The encoding on a command of another family:
+        // `TIOCSPTLCK` is `_IOW('T', 0x31, int)`, 0x40045431, in
+        // `include/uapi/asm-generic/ioctls.h`.
+        assert_eq!(iow(0x54, 0x31, 4), 0x4004_5431, "TIOCSPTLCK");
     }
 
     /// The architecture this build has a filter for is the one it was built
@@ -1036,6 +1209,16 @@ mod tests {
     /// is ([`child_side`]).
     #[cfg(target_os = "linux")]
     const CHILD_VAR: &str = "IW_SECCOMP_FILTER_CHILD";
+
+    /// The answers of a child's btrfs commands ([`child_answers`]).
+    #[cfg(target_os = "linux")]
+    const BTRFS_KEYS: [&str; 5] = [
+        "btrfs_snap_create",
+        "btrfs_subvol_create",
+        "btrfs_snap_create_v2",
+        "btrfs_subvol_create_v2",
+        "btrfs_high",
+    ];
 
     /// The value of [`CHILD_VAR`] for a child under `rules`, or under no
     /// filter (the control).
@@ -1139,6 +1322,30 @@ mod tests {
                 "tiocsti_high={}",
                 answer(libc::syscall(libc::SYS_ioctl, slave, 0x1_0000_5412u64, at))
             ));
+        }
+        // Each btrfs command that makes a subvolume or a snapshot, and one with
+        // high bits set, on no descriptor: the kernel answers a bad
+        // descriptor before it reads the command's struct, so an EPERM is
+        // the filter's, and no disk of any kind is needed.
+        let no_descriptor: libc::c_int = -1;
+        for (key, command) in [
+            ("btrfs_snap_create", 0x5000_9401u64),
+            ("btrfs_subvol_create", 0x5000_940E),
+            ("btrfs_snap_create_v2", 0x5000_9417),
+            ("btrfs_subvol_create_v2", 0x5000_9418),
+            ("btrfs_high", 0xffff_ffff_5000_9418),
+        ] {
+            // SAFETY: `ioctl` on no descriptor, with a null pointer the
+            // kernel never reads (it answers EBADF first).
+            let rc = unsafe {
+                libc::syscall(
+                    libc::SYS_ioctl,
+                    no_descriptor,
+                    command,
+                    std::ptr::null::<u8>(),
+                )
+            };
+            out.push(format!("{key}={}", answer(rc)));
         }
         // SAFETY: each call takes plain integers or a null pointer the kernel
         // rejects. The raw `clone` has no stack of its own, so a child it
@@ -1245,8 +1452,9 @@ mod tests {
     /// `no_new_privs` and the identified filter, a new user namespace (by
     /// `unshare` and by a raw `clone`) and joining one are refused with
     /// EPERM, raw `clone3` answers ENOSYS, threads and child processes still
-    /// start (glibc falls back to `clone`), and TIOCSTI on the child's own
-    /// controlling terminal is refused, high bits or not. The same child
+    /// start (glibc falls back to `clone`), TIOCSTI on the child's own
+    /// controlling terminal is refused, high bits or not, and so is each
+    /// btrfs command that makes a subvolume or a snapshot. The same child
     /// without the filter shows the kernel's own answers, so each refusal
     /// above is the filter's.
     ///
@@ -1258,8 +1466,10 @@ mod tests {
     ///
     /// FAILS ON REVERT: answer `clone3` with EPERM (the thread and the
     /// command fail on glibc 2.34 and later), compare all 64 bits of the
-    /// `ioctl` command (`tiocsti_high` reaches the kernel), drop the `JSET`,
-    /// name the wrong `clone` number (`clone_newuser` is made).
+    /// `ioctl` command (`tiocsti_high` and `btrfs_high` reach the kernel),
+    /// drop the `JSET`, name the wrong `clone` number (`clone_newuser` is
+    /// made), take the btrfs commands out of the identified filter (each
+    /// answers EBADF).
     #[cfg(target_os = "linux")]
     #[test]
     fn a_child_under_the_filter_is_refused_what_it_says() {
@@ -1285,10 +1495,16 @@ mod tests {
         assert_eq!(filtered["command"], 0, "a command starts: {filtered:?}");
         assert_eq!(filtered["tiocsti"], eperm, "{filtered:?}");
         assert_eq!(filtered["tiocsti_high"], eperm, "{filtered:?}");
+        for key in BTRFS_KEYS {
+            assert_eq!(filtered[key], eperm, "{key}: {filtered:?}");
+        }
         // Without the filter the kernel answers otherwise: a bad descriptor,
         // and TIOCSTI taken (or EIO where legacy TIOCSTI is off).
         if the_control_answers_as_the_kernel("the identified child test") {
             assert_eq!(control["setns"], libc::EBADF, "{control:?}");
+            for key in BTRFS_KEYS {
+                assert_eq!(control[key], libc::EBADF, "{key}: {control:?}");
+            }
         }
         for key in ["tiocsti", "tiocsti_high"] {
             assert!(
@@ -1303,8 +1519,9 @@ mod tests {
     /// a real kernel in a child process: TIOCSTI on the child's own
     /// controlling terminal is refused, high bits or not, and nothing the
     /// identified filter adds is: a new user namespace (by `unshare` and by a
-    /// raw `clone`), joining one and raw `clone3` answer exactly what the
-    /// same child answers without a filter, and threads and child processes
+    /// raw `clone`), joining one, raw `clone3` and the btrfs commands that
+    /// make a subvolume or a snapshot answer exactly what the same child
+    /// answers without a filter, and threads and child processes
     /// start. So the kernel loads the terminal program and runs it as the
     /// interpreter does, and a plain jail keeps what it could do before.
     ///
@@ -1315,7 +1532,8 @@ mod tests {
     /// `IW_REQUIRE_SECCOMP=1` the test fails.
     ///
     /// FAILS ON REVERT: give the terminal rules the identified program
-    /// (`setns` and `clone_newuser` are refused by the filter), drop the
+    /// (`setns` and `clone_newuser` are refused by the filter) or the btrfs
+    /// commands (each is refused by the filter), drop the
     /// terminal program's `ioctl` check (`tiocsti` reaches the kernel), or
     /// compare all 64 bits of the command (`tiocsti_high` does).
     #[cfg(target_os = "linux")]
@@ -1330,7 +1548,10 @@ mod tests {
         if the_control_answers_as_the_kernel("the terminal child test") {
             assert_eq!(control["setns"], libc::EBADF, "{control:?}");
         }
-        for key in ["unshare_newuser", "clone_newuser", "setns", "clone3"] {
+        for key in ["unshare_newuser", "clone_newuser", "setns", "clone3"]
+            .into_iter()
+            .chain(BTRFS_KEYS)
+        {
             assert_eq!(
                 terminal[key], control[key],
                 "{key}: the terminal filter answers what the kernel does"
@@ -1349,39 +1570,47 @@ mod tests {
     // Each instruction is `code(2) jt jf k(4)`, little endian, one per line.
     const GOLDEN_X86_64_IDENTIFIED: &str = "
         2000000004000000
-        150000113e0000c0
+        150000153e0000c0
         2000000000000000
-        15000c00ffffffff
-        35000e0000000040
-        15000c00b3010000
-        15000a0034010000
+        15001000ffffffff
+        3500120000000040
+        15001000b3010000
+        15000e0034010000
         1500030010010000
         1500020038000000
         1500030010000000
-        1500020502020000
+        1500020902020000
         2000000010000000
-        4500040300000010
+        4500080700000010
         2000000018000000
-        1500020012540000
-        150001001c540000
+        1500060012540000
+        150005001c540000
+        1500040001940050
+        150003000e940050
+        1500020017940050
+        1500010018940050
         060000000000ff7f
         0600000001000500
         0600000026000500
         0600000000000080";
     const GOLDEN_AARCH64_IDENTIFIED: &str = "
         2000000004000000
-        1500000eb70000c0
+        15000012b70000c0
         2000000000000000
-        15000b00b3010000
-        150009000c010000
+        15000f00b3010000
+        15000d000c010000
         1500020061000000
         15000100dc000000
-        150002051d000000
+        150002091d000000
         2000000010000000
-        4500040300000010
+        4500080700000010
         2000000018000000
-        1500020012540000
-        150001001c540000
+        1500060012540000
+        150005001c540000
+        1500040001940050
+        150003000e940050
+        1500020017940050
+        1500010018940050
         060000000000ff7f
         0600000001000500
         0600000026000500

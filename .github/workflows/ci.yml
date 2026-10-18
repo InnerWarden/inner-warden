@@ -319,7 +319,7 @@ jobs:
         env:
           IW_REQUIRE_SECCOMP: "1"
         run: |
-          bash scripts/cargo-test-at-least.sh 14 -p innerwarden-agent-guard --lib seccomp
+          bash scripts/cargo-test-at-least.sh 15 -p innerwarden-agent-guard --lib seccomp
           bash scripts/cargo-test-at-least.sh 1 -p innerwarden --bin innerwarden the_launcher_hands_bwrap
           cargo test -p innerwarden --test cjc_j007_ai_jail </dev/null
 
