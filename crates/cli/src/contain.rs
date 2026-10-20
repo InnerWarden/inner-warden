@@ -985,6 +985,24 @@ pub fn never_shown_home_paths(home: &Path, macos: bool) -> Vec<PathBuf> {
     names.into_iter().map(|name| home.join(name)).collect()
 }
 
+/// Linux: InnerWarden's own folder kept as a link (a dotfiles manager's
+/// `~/.config/innerwarden`) refuses the launch. The link is an entry in
+/// `~/.config`, which the jail binds read-write, and no mount can pin a
+/// link in place: a program in the jail could replace it with a folder of
+/// its own on the host, whose files the host's guard reads. The remedy is
+/// to make it the folder it leads to.
+pub fn iw_folder_link_refused(named: &Path, leads_to: &Path) -> ContainError {
+    ContainError::Unsupported(format!(
+        "{} is a link (to {}), and on Linux a program in the jail could replace that link \
+         on the host: replace the link with the folder it leads to (remove the link, then \
+         move {} to {}), and start the jail again",
+        printable(named),
+        printable(leads_to),
+        printable(leads_to),
+        printable(named)
+    ))
+}
+
 /// Where the home folder a hidden path is in leads on the host, when the
 /// jail binds that folder read-write ([`writable_home_dirs`]) and shows it
 /// (`shown`, [`shown_host_folders`]): what is below that place is what the
@@ -1072,11 +1090,12 @@ pub struct JailInputs {
     /// the sandbox matches the resolved path.
     pub iw_config_shown: Vec<PathBuf>,
     /// The secret dir as named is itself a link (a dotfiles manager's
-    /// `~/.config/innerwarden`): `iw_config_real` is where it leads, and on
-    /// Linux it is covered only where the jail shows that place
-    /// (`iw_config_shown`, [`plan_linked_places`]), never as named. bwrap
-    /// mounts through a link in the jail's root, where it leads nowhere,
-    /// and such a jail never started.
+    /// `~/.config/innerwarden`): `iw_config_real` is where it leads. On
+    /// Linux such a launch is refused ([`iw_folder_link_refused`]): the link
+    /// is an entry in the `~/.config` the jail binds read-write, which no
+    /// mount can pin, so a program in the jail could replace it on the
+    /// host. On macOS the sandbox denies writing the folder as named, the
+    /// link with it, and denies where it leads.
     pub iw_config_link: bool,
     /// The place that link leads to is left as it is ([`plan_linked_places`]:
     /// onto what the jail needs, round in a loop, or, through a link a
@@ -1285,23 +1304,6 @@ fn protected_host_paths(input: &JailInputs) -> Vec<PathBuf> {
     paths
 }
 
-/// [`protected_host_paths`] as a Linux jail covers them: all of them, but
-/// InnerWarden's folder as named where it is a link, and where it leads
-/// unless the jail shows that place ([`JailInputs::iw_config_link`],
-/// [`JailInputs::iw_config_shown`]). Each is still refused to a writable or
-/// read-only bind.
-fn masked_host_paths(input: &JailInputs) -> Vec<PathBuf> {
-    let mut paths = protected_host_paths(input);
-    if input.iw_config_link {
-        let named = input.iw_config_dir();
-        paths.retain(|path| {
-            input.iw_config_shown.contains(path)
-                || (*path != named && *path != input.iw_config_real)
-        });
-    }
-    paths
-}
-
 /// Validate every host path that will be writable inside the jail. A project may
 /// live below HOME, but it may not be HOME itself, an ancestor of HOME, or overlap
 /// any protected credential/policy directory. Otherwise the late writable bind
@@ -1494,6 +1496,14 @@ pub const CAP_DROP_ALL: [&str; 2] = ["--cap-drop", "ALL"];
 /// entries are never emitted, so they vanish under the HOME tmpfs.
 pub fn build_linux_jail(input: &JailInputs) -> Result<LinuxJailPlan, ContainError> {
     validate_jail_inputs(input)?;
+    // InnerWarden's own folder kept as a link: no mount pins a link, and a
+    // program in the jail could replace it on the host.
+    if input.iw_config_link {
+        return Err(iw_folder_link_refused(
+            &input.iw_config_dir(),
+            &input.iw_config_real,
+        ));
+    }
     let home = input.home.to_string_lossy().to_string();
     let mut a: Vec<String> = Vec::new();
     let mut push = |args: &[&str]| a.extend(args.iter().map(|s| s.to_string()));
@@ -1548,17 +1558,13 @@ pub fn build_linux_jail(input: &JailInputs) -> Result<LinuxJailPlan, ContainErro
     // Shadow the InnerWarden secret dir IMMEDIATELY after the `.config` bind
     // (last-wins). The 0600 llm-key is now absent inside the jail. Shadow BOTH the
     // nominal path and its symlink-resolved real path (a symlinked ~/.config would
-    // otherwise leave the real dir reachable).
-    // Where the dir as named is a link (`iw_config_link`), neither: a mount
-    // on it would go through the link in bwrap's root and abort the jail.
-    // Where it leads is covered at each place the jail shows it, below.
+    // otherwise leave the real dir reachable). The dir as named is never a
+    // link here: such a launch was refused above.
     let iw_cfg = input.iw_config_dir().to_string_lossy().to_string();
     let iw_cfg_real = input.iw_config_real.to_string_lossy().to_string();
-    if !input.iw_config_link {
-        push(&["--tmpfs", &iw_cfg]);
-        if iw_cfg_real != iw_cfg {
-            push(&["--tmpfs", &iw_cfg_real]);
-        }
+    push(&["--tmpfs", &iw_cfg]);
+    if iw_cfg_real != iw_cfg {
+        push(&["--tmpfs", &iw_cfg_real]);
     }
     // And at every other place a home folder the jail binds shows it
     // (`~/.config` a link into a `~/.cache` that leads off the home).
@@ -1658,7 +1664,7 @@ pub fn build_linux_jail(input: &JailInputs) -> Result<LinuxJailPlan, ContainErro
     // so re-apply every protected mask after them. Validation above should make
     // overlap impossible; this final last-wins layer keeps secrets hidden if a
     // future writable bind is added without the corresponding validation.
-    for path in masked_host_paths(input) {
+    for path in protected_host_paths(input) {
         let dest = path.to_string_lossy().to_string();
         push(&["--tmpfs", &dest]);
     }
@@ -2039,10 +2045,33 @@ pub fn build_macos_profile(input: &JailInputs) -> Result<MacosJailPlan, ContainE
     })
 }
 
+/// Where the hook in a jail reads the person's suppressions: nothing. The
+/// person's own file lives in the `~/.config/innerwarden` the jail hides,
+/// and on Linux the jail's own folder there is an empty one it can write: a
+/// `suppress.toml` a program in the jail planted there would lift the hook's
+/// verdicts for the agent. `/dev/null` reads empty, and no program in the
+/// jail can replace it.
+pub const JAIL_SUPPRESS_CONFIG: &str = "/dev/null";
+
+/// What the launcher says of InnerWarden's own folder as the jail starts:
+/// that it is not visible, the API key with it, unless the jail leaves the
+/// place a link leads it to as it is ([`JailInputs::iw_config_left`], said
+/// before).
+pub fn iw_folder_said(input: &JailInputs) -> &'static str {
+    if input.iw_config_left {
+        "  the agent's ~/.config/innerwarden is not visible inside the jail as named; the \
+         place its link leads to is not hidden (said above)."
+    } else {
+        "  the agent's ~/.config/innerwarden (incl. the API key) is not visible inside the jail."
+    }
+}
+
 /// The in-jail environment: redirect the graph to a jail-local writable file and
 /// DISABLE the LLM second-opinion + notify inside the jail (their config lives in
 /// the shadowed `~/.config/innerwarden`, so they must not be reached - blocking
 /// still works from the embedded rules). `IW_GUARD_SESSION` groups the narrative.
+/// The person's suppressions are read from nothing ([`JAIL_SUPPRESS_CONFIG`]):
+/// a `suppress.toml` a program in the jail writes never lifts a verdict.
 ///
 /// With `--identity` the hook is also told the agent the jail was started for
 /// (`IW_HOOK_AGENT`), so a hook wired for another agent, or for none, is not
@@ -2056,6 +2085,10 @@ pub fn compute_jail_env(input: &JailInputs) -> Vec<(String, String)> {
         ("IW_LLM_CONFIG".to_string(), String::new()),
         ("IW_NOTIFY_CONFIG".to_string(), String::new()),
         ("IW_GUARD_SESSION".to_string(), JAIL_SESSION.to_string()),
+        (
+            "IW_SUPPRESS_CONFIG".to_string(),
+            JAIL_SUPPRESS_CONFIG.to_string(),
+        ),
     ];
     if input.args.identity {
         env.push((
@@ -4129,6 +4162,7 @@ mod tests {
         );
         assert_eq!(env["IW_LLM_CONFIG"], "");
         assert_eq!(env["IW_NOTIFY_CONFIG"], "");
+        assert_eq!(env["IW_SUPPRESS_CONFIG"], "/dev/null");
     }
 
     // POSIX-only: these build a jail plan for a hardcoded POSIX project path
@@ -8144,6 +8178,7 @@ mod tests {
                 ("IW_LLM_CONFIG", ""),
                 ("IW_NOTIFY_CONFIG", ""),
                 ("IW_GUARD_SESSION", "contain"),
+                ("IW_SUPPRESS_CONFIG", "/dev/null"),
             ]
             .map(|(k, v)| (k.to_string(), v.to_string()))
         );
@@ -8920,31 +8955,31 @@ mod tests {
         assert_eq!(printable(Path::new("/home/dev/ü é")), "/home/dev/ü é");
     }
 
-    /// InnerWarden's folder that is itself a link (a dotfiles manager's
-    /// `~/.config/innerwarden`): bwrap mounts through a link in its own
-    /// root, where it leads nowhere, and every jail aborted ("Can't mount
-    /// tmpfs on .../.config/innerwarden"). It is covered where the jail
-    /// shows the place it leads to, never as named; a project there is
-    /// still refused, and the refusal names the folder. Where the jail
-    /// leaves that place it is neither covered nor denied there (said by
-    /// the launcher); macOS still denies it as named.
+    /// M30-R1, M30-TL-1: InnerWarden's folder that is itself a link (a
+    /// dotfiles manager's `~/.config/innerwarden`). On Linux the link is an
+    /// entry in the `~/.config` the jail binds read-write, and no mount can
+    /// pin a link: a program in the jail removed it and made a folder of its
+    /// own there, on the host, whose `suppress.toml` the host's hook then
+    /// read. Such a launch is refused, with what to do. On macOS the sandbox
+    /// denies writing the folder as named (the link with it) and denies
+    /// where it leads, read and write; where the jail leaves that place, it
+    /// is not denied there. A project there is refused, naming the folder.
     ///
-    /// FAILS ON REVERT: mount the folder as named in `build_linux_jail` or
-    /// keep it in `masked_host_paths`, and the argv mounts on the link.
+    /// FAILS ON REVERT: drop the `iw_config_link` refusal from
+    /// `build_linux_jail` and the Linux jail is built.
     #[test]
-    fn innerwardens_folder_that_is_a_link_is_covered_where_it_leads_never_as_named() {
+    fn innerwardens_folder_that_is_a_link_is_refused_on_linux_and_denied_where_it_leads_on_macos() {
         let named = "/home/dev/.config/innerwarden";
         let mut input = inputs(&["claude", "--print"]);
         input.iw_config_link = true;
         input.iw_config_real = PathBuf::from("/home/dev/.cache/iw");
-        input.iw_config_shown = vec![PathBuf::from("/home/dev/.cache/iw")];
-        let a = build_linux_jail(&input).unwrap().bwrap_args;
-        assert!(!a.iter().any(|w| w == named), "mounted on the link: {a:?}");
-        let covered = a
-            .windows(2)
-            .filter(|w| w[0] == "--tmpfs" && w[1] == "/home/dev/.cache/iw")
-            .count();
-        assert_eq!(covered, 2, "after the dotdir binds and after the project");
+        assert_eq!(
+            build_linux_jail(&input).unwrap_err().to_string(),
+            "/home/dev/.config/innerwarden is a link (to /home/dev/.cache/iw), and on Linux a \
+             program in the jail could replace that link on the host: replace the link with the \
+             folder it leads to (remove the link, then move /home/dev/.cache/iw to \
+             /home/dev/.config/innerwarden), and start the jail again"
+        );
         let mut project_there = input.clone();
         project_there.args.project = PathBuf::from("/home/dev/.cache/iw/x");
         assert_eq!(
@@ -8957,21 +8992,43 @@ mod tests {
         );
         let profile = build_macos_profile(&input).unwrap().profile;
         for path in [named, "/home/dev/.cache/iw"] {
-            assert!(profile.contains(&format!("(deny file-read* (subpath \"{path}\"))")));
+            for access in ["read", "write"] {
+                let rule = format!("(deny file-{access}* (subpath \"{path}\"))");
+                assert!(profile.contains(&rule), "{rule}");
+            }
         }
-        // Left: no mount at either place, no deny where it leads; a project
-        // there is still refused.
+        // Left: no deny where it leads; a project there is still refused.
         input.iw_config_real = PathBuf::from("/srv/iw");
-        input.iw_config_shown = vec![];
         input.iw_config_left = true;
-        let a = build_linux_jail(&input).unwrap().bwrap_args;
-        assert!(!a.iter().any(|w| w == named || w == "/srv/iw"), "{a:?}");
         let profile = build_macos_profile(&input).unwrap().profile;
         assert!(profile.contains(&format!("(deny file-read* (subpath \"{named}\"))")));
         assert!(!profile.contains("/srv/iw"));
         let mut project_there = input.clone();
         project_there.args.project = PathBuf::from("/srv/iw");
         assert!(validate_jail_inputs(&project_there).is_err());
+        // Without a link the jail is the one it was.
+        assert!(build_linux_jail(&inputs(&["claude", "--print"])).is_ok());
+    }
+
+    /// M30L-DOC-3: the launcher says InnerWarden's folder, the API key with
+    /// it, is not visible in the jail only where that holds; where the jail
+    /// leaves the place the folder's link leads to (said before), it says
+    /// so instead.
+    ///
+    /// FAILS ON REVERT: print the API-key line whatever the jail left and
+    /// the left folder is said to be hidden.
+    #[test]
+    fn the_launcher_says_the_api_key_is_hidden_only_where_it_is() {
+        let mut input = inputs(&["claude"]);
+        assert_eq!(
+            iw_folder_said(&input),
+            "  the agent's ~/.config/innerwarden (incl. the API key) is not visible inside the jail."
+        );
+        input.iw_config_link = true;
+        input.iw_config_left = true;
+        let said = iw_folder_said(&input);
+        assert!(!said.contains("API key"), "{said}");
+        assert!(said.contains("is not hidden (said above)"), "{said}");
     }
 
     /// In every common layout nothing is added: a dotdir that is an

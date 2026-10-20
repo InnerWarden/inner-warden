@@ -374,24 +374,27 @@ fn resolve_inputs(
 
     // Linux: the secret dir at every other place a home folder the jail
     // binds shows it. Empty in every common layout. Where the dir itself
-    // is a link, at every place the jail shows where it leads, unless the
+    // is a link: refused on Linux (a program in the jail could replace
+    // the link on the host), denied where it leads on macOS, unless the
     // jail leaves that place as it is (said).
-    let (iw_config_real, iw_config_shown, iw_config_left, iw_linked) = if iw_config_link {
+    let (iw_config_real, iw_config_shown, iw_config_left) = if iw_config_link {
         let place = hidden_place(&iw_config_named, &facts.writable, true);
         let real = place
             .leads_to
             .clone()
             .unwrap_or_else(|| iw_config_through.clone());
+        if !facts.macos {
+            return Err(crate::contain::iw_folder_link_refused(
+                &iw_config_named,
+                &real,
+            ));
+        }
         let mut linked = crate::contain::plan_linked_places(&[place], &facts, &[], false);
-        // A mount over a file there would abort the jail; only a folder
-        // is InnerWarden's folder.
-        linked.masks.retain(|mask| mask.is_dir);
         // Left as it is: needed, a loop, or onto what the jail runs on
         // through a link a program in the jail can change.
         let iw_left = linked.hidden.is_empty();
-        let views = linked.masks.iter().map(|mask| mask.abs.clone()).collect();
         left.append(&mut linked.left);
-        (real, views, iw_left, linked.missing)
+        (real, Vec::new(), iw_left)
     } else {
         let views = if cfg!(target_os = "linux") {
             crate::contain::other_jail_views(
@@ -402,7 +405,7 @@ fn resolve_inputs(
         } else {
             Vec::new()
         };
-        (iw_config_through, views, false, Vec::new())
+        (iw_config_through, views, false)
     };
 
     // Expand the deny_read globs against the real project + stat each match so the
@@ -442,8 +445,7 @@ fn resolve_inputs(
             linked_masks.push(mask);
         }
     }
-    let mut linked_missing = iw_linked;
-    linked_missing.append(&mut dotdirs_linked.missing);
+    let mut linked_missing = dotdirs_linked.missing;
     linked_missing.append(&mut deny_linked.missing);
     let linked_denies = dotdirs_linked.denies;
     let hidden_targets = dotdirs_linked.hidden;
@@ -2745,9 +2747,7 @@ fn announce(input: &JailInputs) {
             input.args.project.display(),
         );
     }
-    eprintln!(
-        "  the agent's ~/.config/innerwarden (incl. the API key) is not visible inside the jail."
-    );
+    eprintln!("{}", crate::contain::iw_folder_said(input));
 }
 
 /// Map a finished child status to an exit code, mapping a signal death to
