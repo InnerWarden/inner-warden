@@ -34,7 +34,10 @@ follows semantic versioning.
   `innerwarden contain` names it. On Linux, a link inside a hidden dotdir
   that leads to nothing yet, where the jail shows that place, stops it too:
   make what it leads to, or remove the link. Such an identified jail with
-  the records folder behind a link did not start before either.
+  the records folder behind a link did not start before either. So does, on
+  Linux, a profile's `hide_home` path whose way goes through such a link
+  (`~/.cache/git` a link, or a dotfiles manager's `~/.config/gh` link):
+  replace that link with the folder it leads to.
 
 ### Security
 
@@ -108,7 +111,9 @@ follows semantic versioning.
   read its config and ran what it named (`credential_process`, `Match
   exec`, `pinentry-program`), or the launcher kept its records there. No
   mount or deny pins a link, so such a launch is refused (see Upgrade
-  notes).
+  notes). On Linux the same holds for a profile's hidden home path: the
+  host's programs read the jail's folder at that name, and wrote into it
+  what the path was hidden for (a credential cache's socket, a token).
 - **A suppression planted in the jail no longer lifts the hook's verdict.**
   Inside the jail the hook read the person's suppressions from
   `~/.config/innerwarden`, which on Linux is an empty folder of the jail's

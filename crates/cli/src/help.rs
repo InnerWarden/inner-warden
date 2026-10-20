@@ -262,8 +262,9 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
              read-only path), and a --deny-read link never hides what the jail runs\n  \
              on: contain leaves such a place, says so, and the jail still starts. A\n  \
              hidden dotdir, InnerWarden's folder or, with --identity on Linux, the\n  \
-             launcher's records folder, whose way goes through a link in a folder the\n  \
-             jail writes stops the launch (replace that link with what it leads to).\n  \
+             launcher's records folder or a profile's hidden home path, whose way goes\n  \
+             through a link in a folder the jail writes stops the launch (replace that\n  \
+             link with what it leads to).\n  \
              On Linux, InnerWarden's own folder kept as a link stops the launch\n  \
              (replace it with the folder it leads to), and a project, worktree or\n  \
              profile path over where it leads is refused; so is a worktree or profile\n  \
@@ -650,7 +651,7 @@ mod tests {
             "Where a place the jail hides (~/.ssh, ~/.gnupg, ~/.aws or a link inside one, a --deny-read path, InnerWarden's own folder) is a link, the place it leads to is hidden too, wherever the jail shows it (on macOS also outside your home), and the folders above it are pinned, so the agent cannot rename it away.",
             "On macOS the project, ~/.config and each folder the jail may write above a place it hides (a folder between the project and a --deny-read path among them) cannot be renamed, removed or replaced from inside the jail (it still writes in them and sets their mode and times), and contain makes each first where it is missing, and says so.",
             "A link never hides what the jail needs (the guard, the agent's settings, the project, a read-only path), and a --deny-read link never hides what the jail runs on: contain leaves such a place, says so, and the jail still starts.",
-            "A hidden dotdir, InnerWarden's folder or, with --identity on Linux, the launcher's records folder, whose way goes through a link in a folder the jail writes stops the launch (replace that link with what it leads to).",
+            "A hidden dotdir, InnerWarden's folder or, with --identity on Linux, the launcher's records folder or a profile's hidden home path, whose way goes through a link in a folder the jail writes stops the launch (replace that link with what it leads to).",
             "On Linux, InnerWarden's own folder kept as a link stops the launch (replace it with the folder it leads to), and a project, worktree or profile path over where it leads is refused; so is a worktree or profile path over where a hidden dotdir leads.",
         ] {
             assert!(help.contains(said), "contain --help lacks {said:?}: {help}");
@@ -664,13 +665,14 @@ mod tests {
             "A link never moves a mask or a deny onto what the jail needs: the guard, the agent's settings or a file in them, the project, a read-only path, the system's folders.",
             "Nor does a `--deny-read` link in the project, which the agent can change, move one onto what the jail runs on: on Linux a place outside your home, on macOS a place of the system outside the project.",
             "A dotdir that leads into the project is hidden there, and said.",
-            "A link stops the launch only here: a hidden dotdir, a link inside one, InnerWarden's own folder or, in an identified Linux jail, the launcher's records folder, whose way goes through a link in a folder the jail writes (`~/.aws` a link to `~/.cache/aws-link`, itself a link) is refused, since no mount or deny pins a link and a program in the jail could replace it on the host (replace that link with what it leads to); on Linux, InnerWarden's own folder kept as a link is refused for the same reason (replace it with the folder it leads to), and so is a link inside a hidden dotdir that leads to nothing yet where the jail shows that place (make it, or remove the link); and a project, worktree or profile path over the place InnerWarden's folder leads to is refused, as is a worktree or profile path over the place a hidden dotdir leads to.",
+            "A link stops the launch only here: a hidden dotdir, a link inside one, InnerWarden's own folder or, in an identified Linux jail, the launcher's records folder or a profile's hidden home path (above), whose way goes through a link in a folder the jail writes (`~/.aws` a link to `~/.cache/aws-link`, itself a link) is refused, since no mount or deny pins a link and a program in the jail could replace it on the host (replace that link with what it leads to); on Linux, InnerWarden's own folder kept as a link is refused for the same reason (replace it with the folder it leads to), and so is a link inside a hidden dotdir that leads to nothing yet where the jail shows that place (make it, or remove the link); and a project, worktree or profile path over the place InnerWarden's folder leads to is refused, as is a worktree or profile path over the place a hidden dotdir leads to.",
             "Each folder the jail writes between such a path and your home is pinned as below, so no program in the jail renames it away from the path's cover.",
             "On macOS every jail keeps in place the folders above what it hides: the project, `~/.config` (which holds InnerWarden's own folder) and each folder between the project and a `--deny-read` path cannot be renamed, removed or replaced by a link from inside the jail, so nothing it hides is shown at another name.",
             "So is every other folder the jail may write above a place it hides: `~/.cache` or `/tmp` above a project there that holds a `--deny-read` path, or a folder above where a hidden dotdir or a profile's hidden home path leads.",
             "The jail still writes in them, finds them writable and sets their mode and times (`rsync -a` or `cp -a` into the project works); only renaming, removing or replacing the folder itself is refused.",
             "Where such a folder is not there yet (`~/.config` on an account that has none), `innerwarden contain` makes it first, empty and 0700, and says so; a dry run makes nothing and names each folder a real run would make.",
             "A profile's `hide_home` path keeps its own rule, above: one that leads outside the home stops the launch.",
+            "On Linux a path whose way goes through a link in a folder the jail writes (`~/.cache/git` a link, or a dotfiles manager's `~/.config/gh` link) stops the launch: a program in the jail could replace that link with a folder of its own, which your programs would then read and write at that name, so replace the link with the folder it leads to.",
         ] {
             assert!(readme.contains(said), "README lacks {said:?}");
         }
@@ -689,6 +691,8 @@ mod tests {
             "A dotdir, InnerWarden's folder or the launcher's records behind a link the jail can change is refused.",
             "A hidden dotdir behind a link the jail can change stops `innerwarden contain`.",
             "On macOS such a place is denied where it leads, unless it is a place of the system outside the project.",
+            "So does, on Linux, a profile's `hide_home` path whose way goes through such a link (`~/.cache/git` a link, or a dotfiles manager's `~/.config/gh` link): replace that link with the folder it leads to.",
+            "On Linux the same holds for a profile's hidden home path: the host's programs read the jail's folder at that name, and wrote into it what the path was hidden for (a credential cache's socket, a token).",
             "the launcher looks for such links as far as 100000 entries and 32 folders deep, and says where it stops short.",
         ] {
             assert!(changelog.contains(said), "CHANGELOG lacks {said:?}");

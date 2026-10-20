@@ -226,7 +226,12 @@ what of the home it hides, under `[profile.<type>.jail]`:
   that would cover the project, the guard, a read-only path or the agent's
   own settings, stops the launch; a home folder the jail writes that is
   itself a link (`~/.cache` on another disk) counts as the home where it
-  leads. On Linux a path that is not there yet, in a folder the jail writes,
+  leads. On Linux a path whose way goes through a link in a folder the jail
+  writes (`~/.cache/git` a link, or a dotfiles manager's `~/.config/gh`
+  link) stops the launch: a program in the jail could replace that link with
+  a folder of its own, which your programs would then read and write at that
+  name, so replace the link with the folder it leads to. On Linux a path
+  that is not there yet, in a folder the jail writes,
   is made empty (mode 0700) first, so what a program makes there later stays
   hidden too. Each folder the jail writes between such a path and your home
   is pinned as below, so no program in the jail renames it away from the
@@ -285,8 +290,8 @@ left as it is, and `innerwarden contain` says so, with what to do (on Linux
 only where the jail shows that place: elsewhere it is not in the jail at
 all). A dotdir that leads into the project is hidden there, and said. A link
 stops the launch only here: a hidden dotdir, a link inside one, InnerWarden's
-own folder or, in an identified Linux jail, the launcher's records folder,
-whose way goes through a link in a folder the jail writes (`~/.aws` a link to
+own folder or, in an identified Linux jail, the launcher's records folder or
+a profile's hidden home path (above), whose way goes through a link in a folder the jail writes (`~/.aws` a link to
 `~/.cache/aws-link`, itself a link) is refused, since no mount or deny pins a
 link and a program in the jail could replace it on the host (replace that
 link with what it leads to); on Linux, InnerWarden's own folder kept as a

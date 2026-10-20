@@ -312,6 +312,14 @@ pub struct HiddenHomePath {
     /// A link on the way leads to nothing: where a file made through it
     /// would land is not known before it is made.
     pub dangling_link: bool,
+    /// Linux: the first link on the way that sits in a folder the jail
+    /// writes ([`steering_link`]), such as `~/.cache/git` a link to
+    /// `~/.local/git` for `.cache/git/credential`. A mount covers where the
+    /// path leads, never the link, so a program in the jail could replace
+    /// the link with a folder of its own, and the host's programs would
+    /// then read and write that folder at the path's name. Never set on
+    /// macOS, where the sandbox keeps that link in place ([`macos_pins`]).
+    pub steered_by: Option<PathBuf>,
 }
 
 /// What the jail hides of the home ([`plan_hidden_home`]).
@@ -343,7 +351,9 @@ pub struct HiddenPlan {
 /// that leaves it is refused (the agent cannot replace the folder itself,
 /// a mount point in the jail). What a path leads to that the jail needs
 /// (the project, the guard, the agent's own settings) is refused by
-/// [`validate_jail_inputs`].
+/// [`validate_jail_inputs`]. A path whose way goes through a link a program
+/// in the jail can replace (`steered_by`, Linux) is refused too
+/// ([`hidden_home_link_refused`]).
 pub fn plan_hidden_home(
     paths: &[HiddenHomePath],
     home: &Path,
@@ -362,6 +372,9 @@ pub fn plan_hidden_home(
                  remove the link, or name the path it should lead to in hide_home",
                 printable(&path.nominal)
             )));
+        }
+        if let Some(link) = &path.steered_by {
+            return Err(hidden_home_link_refused(&path.nominal, link));
         }
         let leads_to = path.real.as_ref().unwrap_or(&path.resolved);
         let in_its_folder = writable_folder_target(&path.nominal, home, shown)
@@ -817,6 +830,29 @@ pub fn records_link_refused(records: &Path, link: &Path) -> ContainError {
          start the jail again",
         printable(records),
         printable(link),
+        printable(link)
+    ))
+}
+
+/// A profile's hidden home path reached through a link in a folder the
+/// jail writes (`~/.cache/git` a link, for `.cache/git/credential`)
+/// refuses a Linux jail: the jail covers where the path leads, and a mount
+/// pins a folder, never a link, so a program in the jail could replace the
+/// link with a folder of its own. The host's programs would then read what
+/// it put there, and write there what the path was hidden for (a
+/// credential cache's socket, a token), at the path's own name. The only
+/// remedy is the folder itself in place of the link: a link to it would sit
+/// in the same folder the jail writes.
+pub fn hidden_home_link_refused(nominal: &Path, link: &Path) -> ContainError {
+    ContainError::Unsupported(format!(
+        "the hidden home path '{}' goes through {}, a link in a folder a program in the jail \
+         can write: that program could replace the link with a folder of its own, and the \
+         programs on the host would then read and write that folder at '{}'. A link cannot \
+         be held in place the way a folder can, so the jail does not start. Replace {} with \
+         the folder it leads to, and start the jail again",
+        printable(nominal),
+        printable(link),
+        printable(nominal),
         printable(link)
     ))
 }
@@ -1679,9 +1715,26 @@ pub fn linux_pins(input: &JailInputs) -> Vec<(PinRoot, PathBuf)> {
     }
     places.extend(input.hide_paths.iter().map(|hidden| hidden.abs.as_path()));
     places.extend(input.linked_masks.iter().map(|mask| mask.abs.as_path()));
+    // A place is walked by its spelling, so only a plain one: above a
+    // place spelled through `..`, `<home>/.local/state/../..` is the home
+    // itself, and a pin there would bind the host's home over the jail's
+    // own. Every place is plain ([`launch::records_dir`]); this keeps a
+    // later one from undoing the home's cover. Nor is the home, or a folder
+    // above it, ever pinned.
+    let plain = |path: &Path| {
+        path.components().all(|step| {
+            matches!(
+                step,
+                std::path::Component::RootDir | std::path::Component::Normal(_)
+            )
+        })
+    };
     let mut pins: Vec<(PinRoot, PathBuf)> = Vec::new();
-    for place in places {
+    for place in places.into_iter().filter(|place| plain(place)) {
         for folder in place.ancestors().skip(1) {
+            if input.home.starts_with(folder) {
+                break;
+            }
             let Some((shows, bind)) = shown_by(folder) else {
                 break;
             };
@@ -3696,10 +3749,25 @@ pub mod launch {
     /// The directory that holds the launcher's records:
     /// `$XDG_STATE_HOME/innerwarden/instances`, or
     /// `~/.local/state/innerwarden/instances` when the variable is unset, empty
-    /// or not an absolute path (the XDG rule: a relative value is ignored).
+    /// or not a plain absolute path (the XDG rule: a relative value is
+    /// ignored). A value with a `..` in it is ignored too: the jail covers
+    /// and pins the records folder by its spelling, and a folder above it
+    /// spelled through `..` (`~/.local/state/../..`, the home itself) would
+    /// be bound read-write over the jail's empty home. The value is taken
+    /// as its plain steps, so `/var/./state` is `/var/state`.
     pub fn records_dir(xdg_state_home: Option<&str>, home: &Path) -> PathBuf {
-        match xdg_state_home {
-            Some(dir) if Path::new(dir).is_absolute() => Path::new(dir).join(LAUNCHER_RECORD_DIR),
+        use std::path::Component;
+        let plain = |dir: &Path| {
+            dir.is_absolute()
+                && dir
+                    .components()
+                    .all(|step| matches!(step, Component::RootDir | Component::Normal(_)))
+        };
+        match xdg_state_home.map(Path::new) {
+            Some(dir) if plain(dir) => dir
+                .components()
+                .collect::<PathBuf>()
+                .join(LAUNCHER_RECORD_DIR),
             _ => home.join(".local/state").join(LAUNCHER_RECORD_DIR),
         }
     }
@@ -4835,6 +4903,44 @@ mod tests {
         assert_eq!(records_dir(None, home), fallback);
         assert_eq!(records_dir(Some(""), home), fallback);
         assert_eq!(records_dir(Some("relative/state"), home), fallback);
+    }
+
+    /// JP-1 (JAIL-PINS fixes): an `XDG_STATE_HOME` with a `..` in it was
+    /// kept as spelled, so the records folder was
+    /// `~/.local/state/../../.cache/st/innerwarden/instances`. The Linux
+    /// jail pinned each folder above it by that spelling, and
+    /// `~/.local/state/../..`, the home itself, counted as a folder of the
+    /// `~/.local` bind: `--bind <home>/.local/state/../..` bound the host's
+    /// home read-write over the jail's empty home (measured with bwrap 0.9:
+    /// `~/.bashrc` and `~/.netrc` read and written from the jail). Such a
+    /// value is ignored now, as a relative one is, and a plain one is taken
+    /// as its plain steps.
+    ///
+    /// FAILS ON REVERT: keep any absolute value as spelled and the records
+    /// folder holds the `..`.
+    #[test]
+    fn a_state_home_with_a_parent_step_is_ignored() {
+        use launch::records_dir;
+        let home = Path::new("/home/dev");
+        let fallback = PathBuf::from("/home/dev/.local/state/innerwarden/instances");
+        for odd in [
+            "/home/dev/.local/state/../../.cache/st",
+            "/home/dev/.local/state/..",
+            "/..",
+            "/var/state/../../home/dev",
+        ] {
+            assert_eq!(records_dir(Some(odd), home), fallback, "{odd}");
+        }
+        assert_eq!(
+            records_dir(Some("/var/./state/"), home),
+            PathBuf::from("/var/state/innerwarden/instances")
+        );
+        assert_eq!(
+            records_dir(Some("/var/./state/"), home)
+                .to_string_lossy()
+                .as_ref(),
+            "/var/state/innerwarden/instances"
+        );
     }
 
     fn launch_facts<'a>(
@@ -7041,6 +7147,7 @@ mod tests {
             resolved: PathBuf::from(real.unwrap_or(nominal)),
             is_dir,
             dangling_link: false,
+            steered_by: None,
         }
     }
 
@@ -7262,6 +7369,65 @@ mod tests {
         );
     }
 
+    /// JP-2 (JAIL-PINS fixes): on Linux a hidden home path reached through
+    /// a link in a folder the jail writes (`.cache/git/credential`, with
+    /// `~/.cache/git` a link to `~/.local/git`) was covered only where it
+    /// leads, and no mount pins a link: a program in the jail removed the
+    /// link, made `~/.cache/git/credential` a folder of its own, and the
+    /// host read what it put there, and would have written there its
+    /// credential cache's socket (measured with bwrap 0.9). Such a path
+    /// refuses the launch now, with the one remedy that works there; the
+    /// launcher finds the link only on Linux ([`HiddenHomePath::steered_by`]),
+    /// since macOS keeps it in place. Names are printed escaped.
+    ///
+    /// FAILS ON REVERT: drop the `steered_by` check in `plan_hidden_home`
+    /// and the path is planned, masked only where it leads.
+    #[test]
+    fn a_hidden_home_path_behind_a_link_the_jail_can_replace_is_refused() {
+        let input = identified_inputs();
+        let shown = shown_with_linked_config();
+        let mut behind = hidden(
+            "/home/dev/.cache/git/credential",
+            Some("/home/dev/.local/git/credential"),
+            true,
+        );
+        behind.steered_by = Some(PathBuf::from("/home/dev/.cache/git"));
+        let said = plan_hidden_home(&[behind], &input.home, &shown)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            said.starts_with(
+                "the hidden home path '/home/dev/.cache/git/credential' goes through \
+                 /home/dev/.cache/git, a link in a folder a program in the jail can write"
+            ),
+            "{said}"
+        );
+        assert!(said.contains("the jail does not start"), "{said}");
+        assert!(
+            said.ends_with(
+                "Replace /home/dev/.cache/git with the folder it leads to, and start the jail again"
+            ),
+            "{said}"
+        );
+        assert!(!said.contains("straight to its place"), "{said}");
+        let odd =
+            hidden_home_link_refused(Path::new("/home/dev/a\nb"), Path::new("/home/dev/a\nb"))
+                .to_string();
+        assert!(!odd.contains('\n'), "{odd}");
+        // The same path with no such link is planned, as before.
+        let plan = plan_hidden_home(
+            &[hidden(
+                "/home/dev/.cache/git/credential",
+                Some("/home/dev/.local/git/credential"),
+                true,
+            )],
+            &input.home,
+            &shown,
+        )
+        .unwrap();
+        assert!(!plan.masks.is_empty(), "{plan:?}");
+    }
+
     /// A hidden home path that leads outside the home is refused, whatever
     /// the link is: one the agent planted in a folder it can write would
     /// otherwise move the empty mount onto anything the jail shows. What it
@@ -7281,6 +7447,7 @@ mod tests {
                 resolved: PathBuf::from(real),
                 is_dir: true,
                 dangling_link: false,
+                steered_by: None,
             };
             let refused = plan_hidden_home(&[path], &input.home, &shown).unwrap_err();
             assert!(
@@ -9345,6 +9512,70 @@ mod tests {
         }
     }
 
+    /// JP-1 (JAIL-PINS fixes): the pins walk a place by its spelling, so a
+    /// place spelled through `..` (the records folder of an
+    /// `XDG_STATE_HOME=~/.local/state/../../.cache/st`) gave the pin
+    /// `~/.local/state/../..`, which bwrap took for the host's home and
+    /// bound read-write over the jail's empty one. Such a place is never
+    /// walked, and the home, or a folder above it, is never pinned; the
+    /// records folder itself is never spelled so
+    /// ([`a_state_home_with_a_parent_step_is_ignored`]).
+    ///
+    /// FAILS ON REVERT: walk every place as spelled and the home is pinned
+    /// as `/home/dev/.local/state/../..`.
+    #[test]
+    fn a_place_spelled_through_a_parent_step_never_pins_the_home() {
+        let mut input = identified_inputs();
+        input.records_dirs = vec![PathBuf::from(
+            "/home/dev/.local/state/../../.cache/st/innerwarden/instances",
+        )];
+        let plain = |path: &Path| {
+            path.components().all(|step| {
+                matches!(
+                    step,
+                    std::path::Component::RootDir | std::path::Component::Normal(_)
+                )
+            })
+        };
+        let pins = linux_pins(&input);
+        assert!(
+            pins.iter()
+                .all(|(_, folder)| plain(folder) && !input.home.starts_with(folder)),
+            "{pins:?}"
+        );
+        // No bind in the whole jail is spelled through `..` or is the home.
+        let a = build_linux_jail(&input).unwrap().bwrap_args;
+        for bind in a.windows(3).filter(|w| w[0] == "--bind") {
+            let at = Path::new(&bind[1]);
+            assert!(plain(at) && at != input.home, "{bind:?} in {a:?}");
+        }
+        // Not even under a bind that holds the home (a project above it,
+        // which the jail refuses anyway): the walk stops at the home.
+        let mut above = inputs(&["claude", "--print"]);
+        above.args.project = PathBuf::from("/home");
+        above.deny_paths.clear();
+        above.hide_paths = vec![mask("/home/dev/notes/a", true)];
+        let pins = linux_pins(&above);
+        assert!(
+            pins.contains(&(PinRoot::Project, PathBuf::from("/home/dev/notes")))
+                && pins
+                    .iter()
+                    .all(|(_, folder)| !above.home.starts_with(folder)),
+            "{pins:?}"
+        );
+        // A plain place keeps its pins.
+        assert_eq!(
+            linux_pins(&identified_inputs()),
+            [
+                (PinRoot::Home, PathBuf::from("/home/dev/.local/state")),
+                (
+                    PinRoot::Home,
+                    PathBuf::from("/home/dev/.local/state/innerwarden")
+                ),
+            ]
+        );
+    }
+
     /// JAIL-PINS: an identified Linux jail with the launcher's records behind
     /// a link in a folder the jail writes cannot be protected (a mount pins a
     /// folder, never a link), so it is refused, and the words say why and
@@ -9837,6 +10068,7 @@ mod tests {
             resolved: PathBuf::from(real.unwrap_or(planted)),
             is_dir: true,
             dangling_link: dangling,
+            steered_by: None,
         };
         let mut refusals: Vec<String> = [hidden(Some(planted), false), hidden(None, true)]
             .into_iter()

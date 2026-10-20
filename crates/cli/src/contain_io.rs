@@ -456,7 +456,7 @@ fn resolve_inputs(
     let hidden = if args.hide_home.is_empty() {
         crate::contain::HiddenPlan::default()
     } else {
-        let found = hidden_home_facts(&home, &args.hide_home);
+        let found = hidden_home_facts(&home, &args.hide_home, &facts.writable, facts.macos);
         crate::contain::plan_hidden_home(&found, &home, &shown)?
     };
 
@@ -726,15 +726,29 @@ const CLAUDE_FOLDERS_SHARED: &str = "Claude Code's ~/.claude/sessions or ~/.clau
 
 /// Each home path a jail profile hides, as found on the host: where it
 /// leads with every link followed, where a file would be made when nothing
-/// is there, whether it is a folder, and whether a link on the way leads to
-/// nothing. On Linux a path that is not there yet, in a folder of the home
-/// the jail writes, is first made as an empty folder ([`make_hidden_folder`]).
-fn hidden_home_facts(home: &Path, paths: &[PathBuf]) -> Vec<crate::contain::HiddenHomePath> {
+/// is there, whether it is a folder, whether a link on the way leads to
+/// nothing, and (Linux, `macos` false) the first link on the way in a
+/// folder the jail writes (`writable`, [`crate::contain::steering_link`]),
+/// which refuses the launch. On Linux a path that is not there yet, in a
+/// folder of the home the jail writes, is first made as an empty folder
+/// ([`make_hidden_folder`]), unless such a link is on its way.
+fn hidden_home_facts(
+    home: &Path,
+    paths: &[PathBuf],
+    writable: &[PathBuf],
+    macos: bool,
+) -> Vec<crate::contain::HiddenHomePath> {
     paths
         .iter()
         .map(|nominal| {
+            let steered_by = if macos {
+                None
+            } else {
+                let (_, links) = trace_links(nominal);
+                crate::contain::steering_link(&links, None, writable).cloned()
+            };
             #[cfg(target_os = "linux")]
-            if std::fs::symlink_metadata(nominal).is_err() {
+            if steered_by.is_none() && std::fs::symlink_metadata(nominal).is_err() {
                 make_hidden_folder(home, nominal);
             }
             let real = std::fs::canonicalize(nominal).ok();
@@ -750,6 +764,7 @@ fn hidden_home_facts(home: &Path, paths: &[PathBuf]) -> Vec<crate::contain::Hidd
                 resolved,
                 is_dir,
                 dangling_link: link_on_the_way_dangles(home, nominal),
+                steered_by,
             }
         })
         .collect()
