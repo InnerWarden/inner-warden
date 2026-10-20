@@ -11,6 +11,10 @@ follows semantic versioning.
   subvolume or snapshot.** It gets "Operation not permitted". A tool that
   needs one (a container runtime on btrfs, `btrfs subvolume create`) has to
   run outside the jail.
+- **On Linux, InnerWarden's own folder kept as a link stops `innerwarden
+  contain`.** Where `~/.config/innerwarden` is a link (a dotfiles manager's),
+  replace the link with the folder it leads to; `innerwarden contain` says
+  how. Such a jail did not start before either.
 
 ### Security
 
@@ -38,16 +42,50 @@ follows semantic versioning.
   layouts that use symbolic links, a folder the jail hides by default, a
   `--deny-read` path or InnerWarden's own folder could still be read in the
   jail. Each is now hidden where it really is, at every place the jail shows
-  it, in every jail, on Linux and macOS. A link never moves a mask onto what
-  the jail needs or onto a system file: such a place is left as it is, and
-  `innerwarden contain` says so. In every common layout the jail is the one
-  it was.
+  it, in every jail; on macOS it is denied where it leads, also outside your
+  home. A link never moves a mask or a deny onto what the jail needs (the
+  guard, the agent's settings or a file in them, such as the one that
+  carries the hook, the project, a read-only path), and a link that a
+  program in the jail can change (a `--deny-read` link in the project) never
+  moves one onto what the jail runs on: on Linux a place outside your home,
+  on macOS a place of the system. Such a place is left as it is, and
+  `innerwarden contain` says so where the jail shows it. A worktree, or a
+  path of a profile, over the place a hidden dotdir leads to is refused. In
+  every common layout the jail is the one it was.
+- **A suppression planted in the jail no longer lifts the hook's verdict.**
+  Inside the jail the hook read the person's suppressions from
+  `~/.config/innerwarden`, which on Linux is an empty folder of the jail's
+  own that its programs can write: a `suppress.toml` written there let
+  through the command it names. The hook in a jail now reads none
+  (`IW_SUPPRESS_CONFIG=/dev/null`); your own file was never visible there.
+- **On Linux, a jail can no longer replace InnerWarden's own folder kept as
+  a link.** The link sits in the `~/.config` the jail binds read-write, and
+  no mount can pin a link: a program in the jail could put a folder of its
+  own in its place, on the host, whose files the host's guard reads. Such a
+  launch is refused (see Upgrade notes).
+
+### Changed
+
+- **On Linux a `--deny-read` path that a link in the project leads out of
+  your home is not hidden there.** Such a link is the agent's to change, and
+  a mask it steers could land on what the jail runs on (a file in `/etc`, a
+  library the hook loads). Where the jail shows that place, `innerwarden
+  contain` says it is not hidden: keep the secret in your home or your
+  project to have it hidden. A path you name outside the project (absolute,
+  or with `..`) with no such link on the way is hidden where it leads, as
+  before. On macOS such a place is denied where it leads, unless it is a
+  place of the system.
 
 ### Fixed
 
-- **A jail starts where InnerWarden's own folder, or the launcher's records
-  folder, is a link.** On Linux such a jail did not start (bwrap could not
-  mount through the link). Each is now hidden where the link leads.
+- **An identified jail starts where the launcher's records folder is
+  behind a link.** On Linux such a jail did not start (bwrap could not mount
+  through the link). The records are now hidden where the link leads.
+- **The launcher no longer says the API key is hidden where it is not.**
+  Where the place InnerWarden's own folder leads to is left as it is (said
+  before), the launch line said the folder, the API key with it, was not
+  visible in the jail. It now says the place its link leads to is not
+  hidden.
 - **The first jail on an account where Claude Code never ran has the guard's
   hook.** Arming the hook makes `~/.claude`, and the jail was planned before
   that, without it: on Linux the first `innerwarden contain` there showed no

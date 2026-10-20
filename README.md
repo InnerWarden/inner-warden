@@ -247,14 +247,25 @@ Where a place the jail hides is a link, the jail hides the place it leads
 to: `~/.ssh`, `~/.gnupg` or `~/.aws` kept as a link into a folder the jail
 shows (`~/.ssh` a link to `.config/ssh`), a `--deny-read` path of the
 project, or InnerWarden's own folder. Every link on the way is followed. On
-Linux that place is covered wherever a folder the jail shows holds it, and
-one that is not there yet is made first, empty and 0700, so nothing the
-agent writes there reaches it; on macOS it is denied, read and write. For
-these places a link never stops the jail: where it leads outside your home,
-onto what the jail needs (the project, the guard, the agent's settings or a
-read-only path), or round in a loop, the jail leaves that place as it is and
-`innerwarden contain` says so. A profile's `hide_home` path keeps its own
-rule, above: one that leads outside the home stops the launch.
+Linux that place is covered wherever a folder the jail shows holds it; a
+dotdir's place that is not there yet is made first, empty and 0700, so
+nothing the agent writes there reaches it (a `--deny-read` path that is not
+there is not hidden). On macOS it is denied, read and write, also outside
+your home. A link never moves a mask or a deny onto what the jail needs: the
+guard, the agent's settings or a file in them, the project, a read-only path,
+the system's folders. Nor does a link that a program in the jail can change
+(every `--deny-read` link in the project is one) move one onto what the jail
+runs on: on Linux a place outside your home, on macOS a place of the system.
+Each such place is left as it is, and `innerwarden contain` says so, with
+what to do (on Linux only where the jail shows that place: elsewhere it is
+not in the jail at all). A dotdir that leads into the project is hidden
+there, and said. A link stops the launch only here: on Linux, InnerWarden's
+own folder kept as a link is refused (a program in the jail could replace
+the link on the host: replace it with the folder it leads to), and a
+project, worktree or profile path over the place InnerWarden's folder leads
+to is refused, as is a worktree or profile path over the place a hidden
+dotdir leads to. A profile's `hide_home` path keeps its own rule, above: one
+that leads outside the home stops the launch.
 
 An identified Linux jail keeps Claude Code's own state in the `~/.claude` it
 already shares with you. The jail's home is an empty folder of its own, so

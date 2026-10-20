@@ -250,14 +250,19 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
              A Linux jail shows the host's resolver file read-only, so names resolve as\n  \
              on the host. Where a place the jail hides (~/.ssh, ~/.gnupg, ~/.aws, a\n  \
              --deny-read path, InnerWarden's own folder) is a link, the place it leads\n  \
-             to is hidden too, wherever the jail shows it; where it leads outside your\n  \
-             home, or onto what the jail needs, contain leaves it and says so, and the\n  \
-             jail still starts. On Linux, with --identity, Claude Code's settings file is\n  \
-             kept in ~/.claude/.claude.json between launches (your own ~/.claude.json\n  \
-             is not shown), and each jail has an empty ~/.claude/sessions and\n  \
-             ~/.claude/backups of its own, so two jails at once do not write the same\n  \
-             session file. That is for Claude Code's folder at ~/.claude; where a jail\n  \
-             cannot have them of its own, contain says so.\n\
+             to is hidden too, wherever the jail shows it (on macOS also outside your\n  \
+             home). A link never hides what the jail needs (the guard, the agent's\n  \
+             settings, the project, a read-only path), and one a program in the jail\n  \
+             can change never hides what the jail runs on: contain leaves such a place,\n  \
+             says so, and the jail still starts. On Linux, InnerWarden's own folder kept\n  \
+             as a link stops the launch (replace it with the folder it leads to), and a\n  \
+             project, worktree or profile path over where it leads is refused, as one\n  \
+             over where a hidden dotdir leads is. On Linux, with --identity, Claude\n  \
+             Code's settings file is kept in ~/.claude/.claude.json between launches\n  \
+             (your own ~/.claude.json is not shown), and each jail has an empty\n  \
+             ~/.claude/sessions and ~/.claude/backups of its own, so two jails at once\n  \
+             do not write the same session file. That is for Claude Code's folder at\n  \
+             ~/.claude; where a jail cannot have them of its own, contain says so.\n\
              \n  \
              On Linux, where the host takes it, every jail starts its programs under\n  \
              a seccomp filter in the style of Flatpak that refuses TIOCSTI and\n  \
@@ -611,9 +616,13 @@ mod tests {
     /// The contain help, the README and the CHANGELOG say what the jail does
     /// with a place it hides that is a link (M30-CW-link), only what the
     /// launcher makes true: hidden where it leads, wherever the jail shows
-    /// it; left and said where it leads out of the home or onto what the
-    /// jail needs; never a stop for these places, while a `hide_home` path
-    /// keeps its own rule.
+    /// it (on macOS also out of the home); left and said where it leads onto
+    /// what the jail needs, or where a link a program in the jail can change
+    /// leads onto what the jail runs on; a stop only for InnerWarden's own
+    /// folder kept as a link on Linux and for a path over a place it hides
+    /// (M30-R5, M30L-DOC-4); a place not there yet made only for a dotdir
+    /// (M30L-DOC-5); and the CHANGELOG says what changed on Linux for a
+    /// `--deny-read` link out of the home (M30L-DOC-1).
     ///
     /// FAILS ON REVERT: drop the sentence from the help, the README or the
     /// CHANGELOG and the line that names it fails.
@@ -622,25 +631,31 @@ mod tests {
         let flat = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
         let help = flat(&usage("contain", &[]).expect("contain has usage"));
         for said in [
-            "Where a place the jail hides (~/.ssh, ~/.gnupg, ~/.aws, a --deny-read path, InnerWarden's own folder) is a link, the place it leads to is hidden too, wherever the jail shows it;",
-            "where it leads outside your home, or onto what the jail needs, contain leaves it and says so, and the jail still starts.",
+            "Where a place the jail hides (~/.ssh, ~/.gnupg, ~/.aws, a --deny-read path, InnerWarden's own folder) is a link, the place it leads to is hidden too, wherever the jail shows it (on macOS also outside your home).",
+            "A link never hides what the jail needs (the guard, the agent's settings, the project, a read-only path), and one a program in the jail can change never hides what the jail runs on: contain leaves such a place, says so, and the jail still starts.",
+            "On Linux, InnerWarden's own folder kept as a link stops the launch (replace it with the folder it leads to), and a project, worktree or profile path over where it leads is refused, as one over where a hidden dotdir leads is.",
         ] {
             assert!(help.contains(said), "contain --help lacks {said:?}: {help}");
         }
         let readme = flat(include_str!("../../../README.md"));
         for said in [
             "Where a place the jail hides is a link, the jail hides the place it leads to:",
-            "On Linux that place is covered wherever a folder the jail shows holds it, and one that is not there yet is made first, empty and 0700, so nothing the agent writes there reaches it; on macOS it is denied, read and write.",
-            "For these places a link never stops the jail: where it leads outside your home, onto what the jail needs (the project, the guard, the agent's settings or a read-only path), or round in a loop, the jail leaves that place as it is and `innerwarden contain` says so.",
+            "On Linux that place is covered wherever a folder the jail shows holds it; a dotdir's place that is not there yet is made first, empty and 0700, so nothing the agent writes there reaches it (a `--deny-read` path that is not there is not hidden). On macOS it is denied, read and write, also outside your home.",
+            "A link never moves a mask or a deny onto what the jail needs: the guard, the agent's settings or a file in them, the project, a read-only path, the system's folders.",
+            "Nor does a link that a program in the jail can change (every `--deny-read` link in the project is one) move one onto what the jail runs on: on Linux a place outside your home, on macOS a place of the system.",
+            "A dotdir that leads into the project is hidden there, and said.",
+            "A link stops the launch only here: on Linux, InnerWarden's own folder kept as a link is refused (a program in the jail could replace the link on the host: replace it with the folder it leads to), and a project, worktree or profile path over the place InnerWarden's folder leads to is refused, as is a worktree or profile path over the place a hidden dotdir leads to.",
             "A profile's `hide_home` path keeps its own rule, above: one that leads outside the home stops the launch.",
         ] {
             assert!(readme.contains(said), "README lacks {said:?}");
         }
         let changelog = flat(include_str!("../../../CHANGELOG.md"));
         for said in [
-            "Each is now hidden where it really is, at every place the jail shows it, in every jail, on Linux and macOS.",
-            "A link never moves a mask onto what the jail needs or onto a system file: such a place is left as it is, and `innerwarden contain` says so.",
-            "A jail starts where InnerWarden's own folder, or the launcher's records folder, is a link.",
+            "Each is now hidden where it really is, at every place the jail shows it, in every jail; on macOS it is denied where it leads, also outside your home.",
+            "A link never moves a mask or a deny onto what the jail needs (the guard, the agent's settings or a file in them, such as the one that carries the hook, the project, a read-only path), and a link that a program in the jail can change (a `--deny-read` link in the project) never moves one onto what the jail runs on: on Linux a place outside your home, on macOS a place of the system.",
+            "On Linux, InnerWarden's own folder kept as a link stops `innerwarden contain`.",
+            "On Linux a `--deny-read` path that a link in the project leads out of your home is not hidden there.",
+            "A suppression planted in the jail no longer lifts the hook's verdict.",
         ] {
             assert!(changelog.contains(said), "CHANGELOG lacks {said:?}");
         }
