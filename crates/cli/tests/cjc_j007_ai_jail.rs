@@ -102,6 +102,66 @@ fn linux_backend_masks_innerwarden_secrets_and_keeps_project_available() {
     assert!(!String::from_utf8_lossy(&output.stdout).contains("CJC-J007-SECRET"));
 }
 
+/// JP-2 (JAIL-PINS fixes, `--deny-read`): a `--deny-read` link in the
+/// project (`.env` a link to `~/.config/app/secrets.env`) is covered where
+/// it leads, inside the `.config` bind. The folder between that bind and
+/// the cover was never pinned on Linux: a program in the jail renamed
+/// `~/.config/app` (the cover moved with it) and put a file of its own at
+/// the name the host's link reads. It is a mount point now, and the rename
+/// fails; the host's secret stays where it was, unread.
+///
+/// FAILS ON REVERT: drop the `deny_paths` from the places of `linux_pins`
+/// and the folder moves, and the jail's file takes the secret's name.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_deny_read_link_into_a_home_folder_cannot_be_moved_from_its_name() {
+    require_bwrap();
+    let home = tempfile::TempDir::new().unwrap();
+    let h = home.path();
+    std::fs::create_dir_all(h.join(".config/app")).unwrap();
+    std::fs::write(h.join(".config/app/secrets.env"), "KEY=HOST-SECRET").unwrap();
+    let project = tempfile::TempDir::new().unwrap();
+    std::os::unix::fs::symlink(
+        h.join(".config/app/secrets.env"),
+        project.path().join(".env"),
+    )
+    .unwrap();
+    let script = format!(
+        "set -- '{0}'; cat \"$1/.config/app/secrets.env\" 2>/dev/null; \
+         if mv \"$1/.config/app\" \"$1/.config/app-old\" 2>/dev/null; then echo MOVED; \
+         mkdir -p \"$1/.config/app\" && echo KEY=JAIL > \"$1/.config/app/secrets.env\"; fi; \
+         echo DONE",
+        h.display()
+    );
+    let output = cli()
+        .args([
+            "contain",
+            "--project",
+            project.path().to_str().unwrap(),
+            "--",
+            "/bin/sh",
+            "-c",
+            &script,
+        ])
+        .env("HOME", h)
+        .output()
+        .expect("run Linux AI Jail");
+    let out = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{err}");
+    assert!(out.contains("DONE"), "{out} {err}");
+    assert!(!out.contains("HOST-SECRET"), "the secret was read: {out}");
+    assert!(
+        !out.contains("MOVED"),
+        "the folder above the cover moved: {out}"
+    );
+    assert!(!h.join(".config/app-old").exists());
+    assert_eq!(
+        std::fs::read_to_string(h.join(".config/app/secrets.env")).unwrap(),
+        "KEY=HOST-SECRET"
+    );
+}
+
 #[cfg(target_os = "linux")]
 fn require_bwrap() {
     let backend_available = ["/usr/bin/bwrap", "/bin/bwrap", "/usr/local/bin/bwrap"]
@@ -1079,12 +1139,79 @@ fn a_launcher_that_dies_before_the_host_answers_starts_nothing() {
     );
 }
 
+/// JP-1 (JAIL-PINS fixes): an identified jail started with an
+/// `XDG_STATE_HOME` spelled through `..` (`~/.local/state/../../.cache/st`)
+/// pinned the folders above the records folder by that spelling, and
+/// `--bind ~/.local/state/../.. ~/.local/state/../..` bound the host's home
+/// read-write over the jail's empty one: `~/.bashrc`, `~/.netrc` and every
+/// other file of the home were read and written from the jail. Such a value
+/// is ignored now (the records are kept at `~/.local/state`), and no pin is
+/// ever spelled through `..`.
+///
+/// FAILS ON REVERT: keep the value as spelled in `records_dir` and walk
+/// every place as spelled in `linux_pins` (both guards), and the host's
+/// file is read, and one is planted, from the jail.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_state_home_spelled_through_a_parent_step_never_shows_the_home() {
+    require_bwrap();
+    let home = state_home();
+    let h = home.path();
+    std::fs::create_dir_all(h.join(".cache")).unwrap();
+    std::fs::write(h.join("host-only"), "HOST-HOME-FILE").unwrap();
+    let project = tempfile::TempDir::new().unwrap();
+    let script = format!(
+        "cat '{0}/host-only' 2>/dev/null; echo planted > '{0}/planted' 2>/dev/null; echo DONE",
+        h.display()
+    );
+    let mut command = cli();
+    command
+        .args([
+            "contain",
+            "--identity",
+            "--project",
+            project.path().to_str().unwrap(),
+            "--",
+            "/bin/sh",
+            "-c",
+            &script,
+        ])
+        .env("HOME", h);
+    identified_without_a_scope(&mut command)
+        .env("XDG_STATE_HOME", h.join(".local/state/../../.cache/st"));
+    let output = command.output().expect("run Linux AI Jail with --identity");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "the jail did not start: {stderr}");
+    assert!(stdout.contains("DONE"), "{stdout} {stderr}");
+    assert!(
+        !stdout.contains("HOST-HOME-FILE"),
+        "the host's home was shown in the jail: {stdout}"
+    );
+    assert!(
+        !h.join("planted").exists(),
+        "the jail wrote in the host's home"
+    );
+    assert!(
+        h.join(".local/state/innerwarden/instances").is_dir(),
+        "the records are kept where XDG_STATE_HOME is unset: {stderr}"
+    );
+    assert!(!h.join(".cache/st").exists(), "{stderr}");
+}
+
 /// A home whose own profile hides `paths` in the claude-code jail.
 #[cfg(target_os = "linux")]
 fn home_that_hides(paths: &[&str]) -> tempfile::TempDir {
-    use std::os::unix::fs::PermissionsExt;
     let home = state_home();
-    let dir = home.path().join(".config/innerwarden");
+    profile_that_hides(home.path(), paths);
+    home
+}
+
+/// The profile of the home `h` that hides `paths` in the claude-code jail.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn profile_that_hides(h: &std::path::Path, paths: &[&str]) {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = h.join(".config/innerwarden");
     std::fs::create_dir_all(&dir).unwrap();
     let file = dir.join("agent-profiles.toml");
     let list = paths
@@ -1098,32 +1225,183 @@ fn home_that_hides(paths: &[&str]) -> tempfile::TempDir {
     )
     .unwrap();
     std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
-    home
 }
 
-/// brk-1: a hidden home path that is a link (a dotfiles manager's
-/// `~/.config/gh -> ../dotfiles/gh`) does not stop the jail: bwrap is never
-/// asked to mount on a link, and the token stays out of reach. A link to a
-/// folder the jail shows (`~/.config/gh3 -> ~/.local/share/gh3`) is covered
-/// where it leads.
+/// A program in an identified jail of the home `h` (whose profile says what
+/// it hides) runs `script`, with `$1` the home.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn identified_in(
+    h: &std::path::Path,
+    project: &std::path::Path,
+    script: &str,
+) -> std::process::Output {
+    let script = format!("set -- '{}'; {script}", h.display());
+    let mut command = cli();
+    command
+        .args([
+            "contain",
+            "--identity",
+            "--project",
+            project.to_str().unwrap(),
+            "--",
+            "/bin/sh",
+            "-c",
+            &script,
+        ])
+        .env("HOME", h)
+        .env_remove("XDG_STATE_HOME");
+    #[cfg(target_os = "linux")]
+    identified_without_a_scope(&mut command);
+    command.output().expect("run the identified jail")
+}
+
+/// JP-2 completeness (BI NEW-20261018-hidden-path-parent-rename): with
+/// `.cache/git/credential` hidden, a program in the jail renamed
+/// `~/.cache/git` away: the cover moved with it, and the host's git then
+/// made `~/.cache/git/credential` again with nothing over it, and a program
+/// in the jail made it first, a folder of its own. The folder above a
+/// hidden home path that the jail writes is a mount point on Linux and kept
+/// in place on macOS: the rename fails, nothing the jail writes reaches the
+/// host's path, and the jail still writes beside it.
 ///
-/// FAILS ON REVERT: mount the path as named (`plan_hidden_home` before this
-/// fix) and bwrap aborts: "Can't mount tmpfs on .../.config/gh".
+/// FAILS ON REVERT: drop the hidden home paths from the places of
+/// `linux_pins` (Linux) or the `hide_denies` from `macos_pins` (macOS), and
+/// the rename succeeds and the host's `~/.cache/git/credential` is the
+/// jail's.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_folder_above_a_hidden_home_path_cannot_be_renamed() {
+    #[cfg(target_os = "linux")]
+    require_bwrap();
+    let home = tempfile::TempDir::new().unwrap();
+    let h = std::fs::canonicalize(home.path()).unwrap();
+    std::fs::create_dir_all(h.join(".local/state")).unwrap();
+    profile_that_hides(&h, &[".cache/git/credential"]);
+    let credential = h.join(".cache/git/credential");
+    std::fs::create_dir_all(&credential).unwrap();
+    std::fs::write(credential.join("store"), "HOST-SECRET").unwrap();
+    let project = tempfile::TempDir::new().unwrap();
+    let p = std::fs::canonicalize(project.path()).unwrap();
+    let output = identified_in(
+        &h,
+        &p,
+        "mv \"$1/.cache/git\" \"$1/.cache/gitx\" 2>/dev/null; echo \"mv=$?\"; \
+         ( mkdir -p \"$1/.cache/git/credential\" \
+           && echo FORGED > \"$1/.cache/git/credential/store\" ) 2>/dev/null; \
+         echo in > \"$1/.cache/git/beside\" && echo WROTE; echo DONE",
+    );
+    let out = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "the jail did not start: {err}");
+    assert!(out.contains("DONE") && out.contains("WROTE"), "{out} {err}");
+    assert!(
+        out.contains("mv=") && !out.contains("mv=0"),
+        "the folder above the hidden path moved: {out}"
+    );
+    assert!(!h.join(".cache/gitx").exists());
+    assert!(std::fs::symlink_metadata(h.join(".cache/git"))
+        .unwrap()
+        .is_dir());
+    assert_eq!(
+        std::fs::read_to_string(credential.join("store")).unwrap(),
+        "HOST-SECRET"
+    );
+}
+
+/// JP-2 completeness (macOS): the sandbox kept in place the folders above a
+/// hidden home path as named and above where it leads, never a link
+/// further down a chain. With `.cache/git/credential` hidden, `~/.cache/git`
+/// a link to `~/.local/a/git` and `~/.local/a` a link to `~/.local/b`, a
+/// program in the jail removed `~/.local/a`, made
+/// `~/.local/a/git/credential` a folder of its own and put a token there,
+/// and the host read `JAIL-TOKEN` at `~/.cache/git/credential/token`, where
+/// its git keeps its credential cache's socket (measured with
+/// sandbox-exec). Every link on the way is kept in place now: it is not
+/// removed, renamed or replaced, and the host's path still leads to the
+/// person's folder.
+///
+/// FAILS ON REVERT: drop the `hide_links` from `macos_pins` and the link is
+/// removed and the host reads the jail's token.
+#[cfg(target_os = "macos")]
+#[test]
+fn on_macos_a_link_down_the_way_to_a_hidden_home_path_stays_in_place() {
+    let home = tempfile::TempDir::new().unwrap();
+    let h = std::fs::canonicalize(home.path()).unwrap();
+    std::fs::create_dir_all(h.join(".local/state")).unwrap();
+    std::fs::create_dir_all(h.join(".cache")).unwrap();
+    profile_that_hides(&h, &[".cache/git/credential"]);
+    let person = h.join(".local/b/git/credential");
+    std::fs::create_dir_all(&person).unwrap();
+    std::fs::write(person.join("store"), "HOST-SECRET").unwrap();
+    std::os::unix::fs::symlink(h.join(".local/a/git"), h.join(".cache/git")).unwrap();
+    std::os::unix::fs::symlink(h.join(".local/b"), h.join(".local/a")).unwrap();
+    let project = tempfile::TempDir::new().unwrap();
+    let p = std::fs::canonicalize(project.path()).unwrap();
+    let output = identified_in(
+        &h,
+        &p,
+        "rm \"$1/.local/a\" 2>/dev/null; echo \"rm=$?\"; \
+         ( mkdir -p \"$1/.local/a/git/credential\" \
+           && echo JAIL-TOKEN > \"$1/.local/a/git/credential/token\" ) 2>/dev/null; \
+         cat \"$1/.cache/git/credential/store\" 2>/dev/null; \
+         mv \"$1/.local/a\" \"$1/.local/z\" 2>/dev/null; echo \"mv=$?\"; \
+         ln -sfn \"$1/.local/b/git\" \"$1/.local/a\" 2>/dev/null; echo \"ln=$?\"; \
+         echo in > \"$1/.local/b/beside\" && echo WROTE; echo DONE",
+    );
+    let out = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "the jail did not start: {err}");
+    assert!(out.contains("DONE") && out.contains("WROTE"), "{out} {err}");
+    for changed in ["rm=0", "mv=0", "ln=0"] {
+        assert!(!out.contains(changed), "{changed}: the link moved: {out}");
+    }
+    assert!(
+        !out.contains("HOST-SECRET"),
+        "the hidden path was read: {out}"
+    );
+    assert!(std::fs::symlink_metadata(h.join(".local/a"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(
+        std::fs::canonicalize(h.join(".cache/git/credential")).unwrap(),
+        person
+    );
+    assert!(
+        !h.join(".cache/git/credential/token").exists(),
+        "the host reads a token the jail put there"
+    );
+    assert_eq!(
+        std::fs::read_to_string(person.join("store")).unwrap(),
+        "HOST-SECRET"
+    );
+}
+
+/// brk-1: a hidden home path that is a link does not stop the jail when the
+/// jail cannot change that link (a dotfiles manager's `~/gh-dotfiles ->
+/// dotfiles/gh`, in the home, whose entries the jail never writes): bwrap
+/// is never asked to mount on a link, and the token stays out of reach. A
+/// link to a folder the jail shows (`~/gh3 -> ~/.local/share/gh3`) is
+/// covered where it leads. One in a folder the jail writes stops the
+/// launch ([`a_hidden_home_path_behind_a_link_the_jail_can_replace_stops_the_launch`]).
+///
+/// FAILS ON REVERT: cover the path as named (`plan_hidden_home` before this
+/// fix) and the token at `~/.local/share/gh3` is read in the jail.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_hidden_home_path_behind_a_link_hides_what_it_leads_to() {
     require_bwrap();
-    let home = home_that_hides(&[".config/gh", ".config/gh3"]);
+    let home = home_that_hides(&["gh-dotfiles", "gh3"]);
     let h = home.path();
     std::fs::create_dir_all(h.join("dotfiles/gh")).unwrap();
     std::fs::write(h.join("dotfiles/gh/hosts.yml"), "TOKEN-GH").unwrap();
-    std::os::unix::fs::symlink("../dotfiles/gh", h.join(".config/gh")).unwrap();
+    std::os::unix::fs::symlink("dotfiles/gh", h.join("gh-dotfiles")).unwrap();
     std::fs::create_dir_all(h.join(".local/share/gh3")).unwrap();
     std::fs::write(h.join(".local/share/gh3/hosts.yml"), "TOKEN-GH3").unwrap();
-    std::os::unix::fs::symlink(h.join(".local/share/gh3"), h.join(".config/gh3")).unwrap();
+    std::os::unix::fs::symlink(h.join(".local/share/gh3"), h.join("gh3")).unwrap();
     let project = tempfile::TempDir::new().unwrap();
     let script = format!(
-        "cat '{0}/.config/gh/hosts.yml' '{0}/.config/gh3/hosts.yml' \
+        "cat '{0}/gh-dotfiles/hosts.yml' '{0}/gh3/hosts.yml' \
          '{0}/.local/share/gh3/hosts.yml' 2>/dev/null; echo DONE",
         h.display()
     );
@@ -1151,6 +1429,91 @@ fn a_hidden_home_path_behind_a_link_hides_what_it_leads_to() {
         !stdout.contains("TOKEN"),
         "a hidden token was read: {stdout}"
     );
+}
+
+/// JP-2 (JAIL-PINS fixes): a hidden home path whose way goes through a link
+/// in a folder the jail writes (`.cache/git/credential`, `~/.cache/git` a
+/// link to `~/.local/git`, or a dotfiles manager's `~/.config/gh` link) was
+/// covered only where it leads, and no mount pins a link: a program in the
+/// jail removed the link and made the path a folder of its own, which the
+/// host's programs then read, and wrote their credentials into, by name.
+/// Such a launch stops now, says why and names the link, and starts
+/// nothing; the link is left as it was.
+///
+/// FAILS ON REVERT: drop the `steered_by` check in `plan_hidden_home` and
+/// the jail starts, replaces the host's link and plants its own credential.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_hidden_home_path_behind_a_link_the_jail_can_replace_stops_the_launch() {
+    require_bwrap();
+    for (hidden, link, leads_to) in [
+        (".cache/git/credential", ".cache/git", ".local/git"),
+        (".config/gh", ".config/gh", "dotfiles/gh"),
+    ] {
+        let home = home_that_hides(&[hidden]);
+        let h = home.path();
+        std::fs::create_dir_all(h.join(".cache")).unwrap();
+        std::fs::create_dir_all(h.join(leads_to)).unwrap();
+        std::os::unix::fs::symlink(h.join(leads_to), h.join(link)).unwrap();
+        std::fs::create_dir_all(h.join(hidden)).unwrap();
+        std::fs::write(h.join(hidden).join("store"), "HOST-SECRET").unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        let script = format!(
+            "rm -f '{0}/{1}' && mkdir -p '{0}/{2}' && echo FORGED > '{0}/{2}/store'; echo RAN",
+            h.display(),
+            link,
+            hidden
+        );
+        let mut command = cli();
+        command
+            .args([
+                "contain",
+                "--identity",
+                "--project",
+                project.path().to_str().unwrap(),
+                "--",
+                "/bin/sh",
+                "-c",
+                &script,
+            ])
+            .env("HOME", h);
+        let output = identified_without_a_scope(&mut command)
+            .output()
+            .expect("run Linux AI Jail with --identity");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "{hidden}: the jail started: {stdout} {stderr}"
+        );
+        assert!(!stdout.contains("RAN"), "{hidden}: {stdout}");
+        assert!(
+            stderr.contains(&format!(
+                "the hidden home path '{}' goes through {}, a link in a folder a program in the jail can write",
+                h.join(hidden).display(),
+                h.join(link).display()
+            )),
+            "{hidden}: {stderr}"
+        );
+        assert!(
+            stderr.contains(&format!(
+                "Replace {} with the folder it leads to",
+                h.join(link).display()
+            )),
+            "{hidden}: {stderr}"
+        );
+        assert!(
+            std::fs::symlink_metadata(h.join(link))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "{hidden}: the host's link was replaced"
+        );
+        assert_eq!(
+            std::fs::read_to_string(h.join(hidden).join("store")).unwrap(),
+            "HOST-SECRET"
+        );
+    }
 }
 
 /// F3: a hidden home path that is not there when the jail starts
@@ -1280,19 +1643,35 @@ fn a_home_folder_linked_outside_the_home_hides_where_it_leads() {
 }
 
 /// F2: a link planted where a hidden home path will be (the agent can write
-/// `~/.cache`) never moves the mask: one that leads to the project, or
-/// outside the home, stops the launch before anything runs.
+/// `~/.cache`) never moves the mask: it sits in a folder the jail writes,
+/// so it stops the launch before anything runs (JP-2). A link of the
+/// person's own that the jail cannot change (in the home) and that leads to
+/// the project, or outside the home, stops it too.
 ///
 /// FAILS ON REVERT (measured): drop the home check in `plan_hidden_home`
 /// and the launch goes on with the link to `/etc/apt`; drop the check of
 /// what the jail needs in `validate_jail_inputs` and the jail starts with
-/// its project under an empty mount.
+/// its project under an empty mount; drop the `steered_by` check and the
+/// planted link is followed.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_planted_link_never_moves_a_hidden_home_path() {
     require_bwrap();
-    for target in ["project", "/etc/apt"] {
-        let home = home_that_hides(&[".cache/git/credential"]);
+    for (hidden, target, refused) in [
+        (
+            ".cache/git/credential",
+            "project",
+            "a link in a folder a program in the jail can write",
+        ),
+        (
+            ".cache/git/credential",
+            "/etc/apt",
+            "a link in a folder a program in the jail can write",
+        ),
+        ("own-link", "project", "holds the project"),
+        ("own-link", "/etc/apt", "outside the home"),
+    ] {
+        let home = home_that_hides(&[hidden]);
         let h = home.path();
         let project = tempfile::TempDir::new_in(h).unwrap();
         std::fs::write(project.path().join("main.rs"), "fn main() {}").unwrap();
@@ -1302,7 +1681,7 @@ fn a_planted_link_never_moves_a_hidden_home_path() {
         } else {
             std::path::PathBuf::from(target)
         };
-        std::os::unix::fs::symlink(&to, h.join(".cache/git/credential")).unwrap();
+        std::os::unix::fs::symlink(&to, h.join(hidden)).unwrap();
         let marker = project.path().join("COMMAND-RAN");
         let script = format!("touch '{}'", marker.display());
         let mut command = cli();
@@ -1322,12 +1701,9 @@ fn a_planted_link_never_moves_a_hidden_home_path() {
             .output()
             .expect("run Linux AI Jail with --identity");
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert_eq!(output.status.code(), Some(2), "{target}: {stderr}");
-        assert!(
-            stderr.contains("holds the project") || stderr.contains("outside the home"),
-            "{target}: {stderr}"
-        );
-        assert!(!marker.exists(), "{target}: the command ran");
+        assert_eq!(output.status.code(), Some(2), "{hidden} {target}: {stderr}");
+        assert!(stderr.contains(refused), "{hidden} {target}: {stderr}");
+        assert!(!marker.exists(), "{hidden} {target}: the command ran");
     }
 }
 
@@ -1711,6 +2087,85 @@ fn claude_codes_folders_are_the_jails_own_through_a_linked_claude_folder() {
     assert!(!out.contains("HOST-OWN"), "{out}");
     assert!(!real.join("sessions/7.json").exists(), "reached the host");
     assert!(!err.contains("is the host's in this jail"), "{err}");
+}
+
+/// JP-1 (JAIL-PINS fixes, the read-only path): a profile's `extra_ro`
+/// inside the project was written from the jail. On Linux its read-only
+/// bind came before the project's, which covered it (measured with bwrap
+/// 0.9: the host file read `orig,jail`); on macOS nothing denied writing
+/// it. It is read-only on both now, cannot be moved away from its name,
+/// and the project around it is still written.
+///
+/// FAILS ON REVERT: lay every read-only path before the project (Linux) or
+/// drop the read-only denies (macOS), and the host file is written.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_read_only_path_of_a_profile_inside_the_project_is_never_written() {
+    use std::os::unix::fs::PermissionsExt;
+    #[cfg(target_os = "linux")]
+    require_bwrap();
+    let home = tempfile::TempDir::new().unwrap();
+    let h = std::fs::canonicalize(home.path()).unwrap();
+    std::fs::create_dir_all(h.join(".local/state")).unwrap();
+    std::fs::create_dir_all(h.join(".config/innerwarden")).unwrap();
+    let project = tempfile::TempDir::new().unwrap();
+    let p = std::fs::canonicalize(project.path()).unwrap();
+    std::fs::create_dir_all(p.join("vendor")).unwrap();
+    std::fs::write(p.join("vendor/lib.txt"), "orig").unwrap();
+    let file = h.join(".config/innerwarden/agent-profiles.toml");
+    std::fs::write(
+        &file,
+        format!(
+            "schema_version = 2\n[profile.claude-code.jail]\nextra_ro = [\"{}\"]\n",
+            p.join("vendor").display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let script = format!(
+        "set -- '{}'; \
+         if ( echo jail >> \"$1/vendor/lib.txt\" ) 2>/dev/null; then echo WROTE; fi; \
+         if ( echo new > \"$1/vendor/new.txt\" ) 2>/dev/null; then echo MADE; fi; \
+         if mv \"$1/vendor\" \"$1/moved\" 2>/dev/null; then echo MOVED; fi; \
+         echo ok > \"$1/main.txt\" && echo PROJECT-W; echo DONE",
+        p.display()
+    );
+    let mut command = cli();
+    command
+        .args([
+            "contain",
+            "--identity",
+            "--project",
+            p.to_str().unwrap(),
+            "--",
+            "/bin/sh",
+            "-c",
+            &script,
+        ])
+        .env("HOME", &h)
+        .env_remove("XDG_STATE_HOME");
+    #[cfg(target_os = "linux")]
+    identified_without_a_scope(&mut command);
+    let output = command.output().expect("run the identified jail");
+    let out = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "the jail did not start: {err}");
+    assert!(
+        out.contains("DONE") && out.contains("PROJECT-W"),
+        "{out} {err}"
+    );
+    assert!(
+        err.contains("jail settings from the `claude-code` agent profile"),
+        "{err}"
+    );
+    for written in ["WROTE", "MADE", "MOVED"] {
+        assert!(!out.contains(written), "{written}: {out}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(p.join("vendor/lib.txt")).unwrap(),
+        "orig"
+    );
+    assert!(!p.join("vendor/new.txt").exists() && !p.join("moved").exists());
 }
 
 /// M30CW-BRK-1: a profile that shows the person's own `~/.claude.json`
@@ -2698,6 +3153,54 @@ fn a_cover_below_a_folder_the_jail_writes_stays_where_the_hosts_link_leads() {
     }
 }
 
+/// JAIL-PINS: a project two folders inside a home folder the jail binds
+/// (`~/.cache/work/proj`), with `~/.ssh` a link into it. The pins started
+/// at the project's bind, so `~/.cache/work`, between the `~/.cache` bind
+/// and the project's, could be renamed in a plain and an identified jail
+/// (measured): the project's mount and the cover in it moved with it, and
+/// the host's `~/.ssh` led to a folder the jail made. Every folder the jail
+/// writes between the home and the cover is a mount point of its own now:
+/// the rename fails and the host's `~/.ssh` leads to the person's keys.
+///
+/// FAILS ON REVERT: pin only below the nearest bind in `linux_pins` and the
+/// rename succeeds.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_cover_in_a_project_inside_a_home_folder_stays_where_the_hosts_link_leads() {
+    require_bwrap();
+    for identity in [false, true] {
+        let home = tempfile::TempDir::new().unwrap();
+        let h = std::fs::canonicalize(home.path()).unwrap();
+        let between = h.join(".cache/work");
+        let p = between.join("proj");
+        let keys = p.join("keys/ssh");
+        std::fs::create_dir_all(&keys).unwrap();
+        std::fs::write(keys.join("id_test"), "CJC-J007-SSH-KEY").unwrap();
+        std::os::unix::fs::symlink(&keys, h.join(".ssh")).unwrap();
+        let script = format!(
+            "set -- '{}' '{}'; {MOVE_THE_FOLDER_BETWEEN}",
+            between.display(),
+            keys.display()
+        );
+        let output = jail_sh(identity, &h, &p, &script);
+        let out = String::from_utf8_lossy(&output.stdout);
+        let err = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "identity={identity}: {out} {err}");
+        assert!(out.contains("DONE"), "identity={identity}: {out} {err}");
+        assert!(
+            !out.contains("mv=0"),
+            "identity={identity}: the folder between moved: {out}"
+        );
+        assert!(!h.join(".cache/work-old").exists());
+        assert_eq!(std::fs::canonicalize(h.join(".ssh")).unwrap(), keys);
+        assert!(keys.join("id_test").exists());
+        assert!(
+            !keys.join("authorized_keys").exists(),
+            "identity={identity}: a file made in the jail reached the host's ~/.ssh"
+        );
+    }
+}
+
 /// M30C-2, M30C-4: the launcher's records folder is covered at
 /// `~/.local/state/innerwarden/instances`, two folders below the `~/.local`
 /// the jail binds read-write. A program in the identified jail renamed
@@ -2804,6 +3307,318 @@ fn on_macos_a_denied_place_below_a_folder_the_jail_writes_stays_where_the_hosts_
             "in_project={in_project}: a planted file reached the host's ~/.ssh"
         );
     }
+}
+
+/// JAIL-PINS on macOS, in every default profile: the sandbox denies by
+/// path, and let a program in the jail rename a folder it may write above
+/// what it denies. Measured with the 1.6.0 development binary: `mv
+/// ~/.config` then read InnerWarden's model key at the new name, `mv` of
+/// the project its `.env`, `mv` of a folder between the project and a
+/// denied path that secret, and a link of the program's own put at
+/// `~/.config` was where the host's guard read a planted `suppress.toml`.
+/// Each rename fails now, nothing denied is read, the host's `~/.config` is
+/// the person's folder, and the jail still writes in all of them.
+///
+/// FAILS ON REVERT: drop the project, `~/.config` and the denied paths from
+/// `macos_pins` and every rename succeeds, the key and both secrets are
+/// read, and the host's `~/.config` is the planted link.
+#[cfg(target_os = "macos")]
+#[test]
+fn on_macos_no_folder_above_what_the_jail_denies_moves() {
+    let home = tempfile::TempDir::new().unwrap();
+    let h = std::fs::canonicalize(home.path()).unwrap();
+    let project = tempfile::TempDir::new().unwrap();
+    let p = std::fs::canonicalize(project.path()).unwrap();
+    let outside = tempfile::TempDir::new().unwrap();
+    let x = std::fs::canonicalize(outside.path()).unwrap();
+    std::fs::create_dir_all(h.join(".config/innerwarden")).unwrap();
+    std::fs::write(h.join(".config/innerwarden/llm-key"), "CJC-J007-LLM-KEY").unwrap();
+    std::fs::create_dir_all(p.join("sub/dir")).unwrap();
+    std::fs::write(p.join(".env"), "CJC-J007-ENV").unwrap();
+    std::fs::write(p.join("sub/dir/.env"), "CJC-J007-SUB-ENV").unwrap();
+    std::fs::create_dir_all(x.join("evil/innerwarden")).unwrap();
+    std::fs::write(x.join("evil/innerwarden/suppress.toml"), "planted").unwrap();
+    let script = format!(
+        "set -- '{h}' '{p}' '{x}'; \
+         mv \"$1/.config\" \"$3/c\" 2>/dev/null; echo \"config=$?\"; \
+         cat \"$3/c/innerwarden/llm-key\" 2>/dev/null; \
+         mv \"$2\" \"$3/p\" 2>/dev/null; echo \"project=$?\"; \
+         cat \"$3/p/.env\" 2>/dev/null; \
+         mv \"$2/sub\" \"$2/sub2\" 2>/dev/null; echo \"between=$?\"; \
+         cat \"$2/sub2/dir/.env\" 2>/dev/null; \
+         mv \"$1/.config\" \"$1/.config-old\" 2>/dev/null \
+           && ln -s \"$3/evil\" \"$1/.config\" 2>/dev/null; echo \"link=$?\"; \
+         mkdir -p \"$1/.config/app\" && echo in > \"$1/.config/app/x\" && echo WROTE-CONFIG; \
+         echo in > \"$2/new\" && echo in > \"$2/sub/dir/new\" && echo WROTE-PROJECT; \
+         echo DONE",
+        h = h.display(),
+        p = p.display(),
+        x = x.display()
+    );
+    // `sub/dir/.env` is denied by name: the default globs deny only the
+    // project's own `.env`.
+    let output = cli()
+        .args([
+            "contain",
+            "--project",
+            p.to_str().unwrap(),
+            "--deny-read",
+            "sub/dir/.env",
+            "--",
+            "/bin/sh",
+            "-c",
+            &script,
+        ])
+        .env("HOME", &h)
+        .output()
+        .expect("run the macOS jail");
+    let out = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(out.contains("DONE"), "{out} {err}");
+    for moved in ["config=0", "project=0", "between=0", "link=0"] {
+        assert!(!out.contains(moved), "{moved}: {out}");
+    }
+    assert!(!out.contains("CJC-J007"), "a denied secret was read: {out}");
+    assert!(
+        out.contains("WROTE-CONFIG") && out.contains("WROTE-PROJECT"),
+        "{out} {err}"
+    );
+    let config = std::fs::symlink_metadata(h.join(".config")).unwrap();
+    assert!(
+        config.is_dir(),
+        "the host's ~/.config is no folder of its own"
+    );
+    assert!(!h.join(".config-old").exists() && !x.join("c").exists());
+    assert!(!x.join("p").exists() && !p.join("sub2").exists());
+    assert_eq!(
+        std::fs::read_to_string(h.join(".config/innerwarden/llm-key")).unwrap(),
+        "CJC-J007-LLM-KEY"
+    );
+    assert!(!h.join(".config/innerwarden/suppress.toml").exists());
+}
+
+/// JAIL-PINS on macOS: on an account with no `~/.config` the sandbox,
+/// which closes that name, would refuse every program in the jail that
+/// makes it. The launcher makes it before the sandbox starts, an empty
+/// folder of the person's, 0700: the jail writes in it and still cannot
+/// move or replace it. A dry run makes nothing.
+///
+/// FAILS ON REVERT: drop `made_before_the_sandbox` from `run_macos` and
+/// the jail cannot make `~/.config`, nor write anything in it.
+#[cfg(target_os = "macos")]
+#[test]
+fn on_macos_the_launcher_makes_a_missing_config_folder_before_the_sandbox() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = tempfile::TempDir::new().unwrap();
+    let h = std::fs::canonicalize(home.path()).unwrap();
+    let project = tempfile::TempDir::new().unwrap();
+    let p = std::fs::canonicalize(project.path()).unwrap();
+    let dry = cli()
+        .args([
+            "contain",
+            "--dry-run",
+            "--project",
+            p.to_str().unwrap(),
+            "--",
+            "true",
+        ])
+        .env("HOME", &h)
+        .output()
+        .expect("dry run");
+    assert!(
+        dry.status.success(),
+        "{}",
+        String::from_utf8_lossy(&dry.stderr)
+    );
+    let dry_out = String::from_utf8_lossy(&dry.stdout);
+    assert!(
+        dry_out.contains(&format!(
+            "(deny file-write-unlink file-write-create (literal \"{}\"))",
+            h.join(".config").display()
+        )),
+        "the profile closes ~/.config: {dry_out}"
+    );
+    assert!(
+        dry_out.contains(&format!(
+            "# would make {} (empty, 0700) before the sandbox starts",
+            h.join(".config").display()
+        )),
+        "a dry run names the folder a real run makes: {dry_out}"
+    );
+    assert!(!h.join(".config").exists(), "a dry run made ~/.config");
+    let script = "mkdir -p \"$HOME/.config/app\" && echo in > \"$HOME/.config/app/x\" \
+                  && echo WROTE; mv \"$HOME/.config\" \"$HOME/.config-old\" 2>/dev/null; \
+                  echo \"mv=$?\"";
+    let output = cli()
+        .args([
+            "contain",
+            "--project",
+            p.to_str().unwrap(),
+            "--",
+            "/bin/sh",
+            "-c",
+            script,
+        ])
+        .env("HOME", &h)
+        .output()
+        .expect("run the macOS jail");
+    let out = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(out.contains("WROTE"), "{out} {err}");
+    assert!(out.contains("mv=") && !out.contains("mv=0"), "{out}");
+    // F2: the person is told of each folder made in their home.
+    assert!(
+        err.contains(&format!(
+            "innerwarden contain: made {} (empty, 0700)",
+            h.join(".config").display()
+        )),
+        "the folder made is said: {err}"
+    );
+    let config = std::fs::symlink_metadata(h.join(".config")).unwrap();
+    assert!(config.is_dir());
+    assert_eq!(config.permissions().mode() & 0o777, 0o700);
+    assert!(h.join(".config/app/x").exists() && !h.join(".config-old").exists());
+    // Made once: a later run makes nothing, and says nothing of it.
+    let again = cli()
+        .args(["contain", "--project", p.to_str().unwrap(), "--", "true"])
+        .env("HOME", &h)
+        .output()
+        .expect("run the macOS jail again");
+    let again_err = String::from_utf8_lossy(&again.stderr);
+    assert!(!again_err.contains(": made "), "{again_err}");
+}
+
+/// F2 (JAIL-PINS fixes): the launcher makes each folder the sandbox keeps
+/// in place that is not there yet, not only `~/.config`: here the folder
+/// above where `~/.ssh` leads (`~/.cache/keys`, a link to
+/// `~/.cache/keys/ssh` that is not there). Each is said on a real run and
+/// named by a dry run, so no folder appears in the person's home unsaid.
+///
+/// FAILS ON REVERT: drop the line `made_before_the_sandbox` prints and the
+/// folder is made without a word.
+#[cfg(target_os = "macos")]
+#[test]
+fn on_macos_every_folder_the_launcher_makes_is_said() {
+    let home = tempfile::TempDir::new().unwrap();
+    let h = std::fs::canonicalize(home.path()).unwrap();
+    std::fs::create_dir_all(h.join(".config")).unwrap();
+    std::fs::create_dir_all(h.join(".cache")).unwrap();
+    std::os::unix::fs::symlink(h.join(".cache/keys/ssh"), h.join(".ssh")).unwrap();
+    let project = tempfile::TempDir::new().unwrap();
+    let p = std::fs::canonicalize(project.path()).unwrap();
+    let made = h.join(".cache/keys");
+    let dry = cli()
+        .args([
+            "contain",
+            "--dry-run",
+            "--project",
+            p.to_str().unwrap(),
+            "--",
+            "true",
+        ])
+        .env("HOME", &h)
+        .output()
+        .expect("dry run");
+    let dry_out = String::from_utf8_lossy(&dry.stdout);
+    assert!(
+        dry_out.contains(&format!(
+            "# would make {} (empty, 0700) before the sandbox starts",
+            made.display()
+        )),
+        "{dry_out}"
+    );
+    assert!(!made.exists(), "a dry run made {}", made.display());
+    let output = cli()
+        .args(["contain", "--project", p.to_str().unwrap(), "--", "true"])
+        .env("HOME", &h)
+        .output()
+        .expect("run the macOS jail");
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{err}");
+    assert!(made.is_dir(), "{err}");
+    assert!(
+        err.contains(&format!(
+            "innerwarden contain: made {} (empty, 0700)",
+            made.display()
+        )),
+        "the folder made is said: {err}"
+    );
+}
+
+/// F1 (JAIL-PINS fixes): the rule that keeps the project and `~/.config` in
+/// place denied all of writing them as themselves, so inside every macOS
+/// jail both read as not writable (`[ -w . ]` false, `access(W_OK)`
+/// EPERM: `create-next-app` refused "The application path is not
+/// writable"), and `touch`, `cp -a`, `rsync -a` and `tar -x` into the
+/// project failed on its mode and times. The rule now refuses only a
+/// rename, a removal or a replacement: all of those work, and the folders
+/// still cannot move.
+///
+/// FAILS ON REVERT: deny `file-write*` again in `macos_pin_rule` and the
+/// project and `~/.config` read as not writable and `cp -a` fails.
+#[cfg(target_os = "macos")]
+#[test]
+fn on_macos_a_folder_kept_in_place_still_reads_as_writable() {
+    let home = tempfile::TempDir::new().unwrap();
+    let h = std::fs::canonicalize(home.path()).unwrap();
+    std::fs::create_dir_all(h.join(".config")).unwrap();
+    let project = tempfile::TempDir::new().unwrap();
+    let p = std::fs::canonicalize(project.path()).unwrap();
+    let outside = tempfile::TempDir::new().unwrap();
+    let x = std::fs::canonicalize(outside.path()).unwrap();
+    std::fs::create_dir_all(x.join("src/a")).unwrap();
+    std::fs::write(x.join("src/a/f"), "from-src").unwrap();
+    let script = format!(
+        "set -- '{h}' '{p}' '{x}'; \
+         [ -w \"$2\" ] && echo PROJECT-W; \
+         [ -w \"$1/.config\" ] && echo CONFIG-W; \
+         cd \"$2\" && [ -w . ] && echo DOT-W; \
+         touch \"$2\" && echo TOUCH; \
+         chmod 755 \"$2\" && echo CHMOD; \
+         cp -a \"$3/src/.\" \"$2/\" && echo CP-A; \
+         rsync -a \"$3/src/\" \"$2/\" && echo RSYNC; \
+         tar -C \"$3/src\" -cf \"$3/t.tar\" . && tar -C \"$2\" -xf \"$3/t.tar\" && echo TAR; \
+         mv \"$2\" \"$3/moved\" 2>/dev/null; echo \"project=$?\"; \
+         mv \"$1/.config\" \"$1/.config-old\" 2>/dev/null; echo \"config=$?\"; \
+         echo DONE",
+        h = h.display(),
+        p = p.display(),
+        x = x.display()
+    );
+    let output = cli()
+        .args([
+            "contain",
+            "--project",
+            p.to_str().unwrap(),
+            "--",
+            "/bin/sh",
+            "-c",
+            &script,
+        ])
+        .env("HOME", &h)
+        .output()
+        .expect("run the macOS jail");
+    let out = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(out.contains("DONE"), "{out} {err}");
+    for said in [
+        "PROJECT-W",
+        "CONFIG-W",
+        "DOT-W",
+        "TOUCH",
+        "CHMOD",
+        "CP-A",
+        "RSYNC",
+        "TAR",
+    ] {
+        assert!(out.contains(said), "{said} missing: {out} {err}");
+    }
+    assert!(
+        !out.contains("project=0") && !out.contains("config=0"),
+        "a folder kept in place moved: {out}"
+    );
+    assert!(!x.join("moved").exists() && !h.join(".config-old").exists());
+    assert_eq!(std::fs::read_to_string(p.join("a/f")).unwrap(), "from-src");
 }
 
 /// M30-SEC-2: a worktree the project's `.git` names (a file the agent
@@ -3207,10 +4022,20 @@ fn an_identified_jail_where_the_records_folder_is_behind_a_link_is_refused() {
     assert!(!out.contains("DONE"), "{out}");
     assert!(
         err.contains(&format!(
-            "{} goes through {}, a link in a folder a program in the jail can write",
+            "the launcher keeps its records of identified jails in {}, and the way there goes \
+             through {}, a link in a folder a program in the jail can write",
             h.join(".local/state/innerwarden/instances").display(),
             link.display()
         )),
+        "{err}"
+    );
+    // The only remedy that works for the records: never "link it straight
+    // to its place", which would put a link in the same folder.
+    assert!(
+        err.contains(&format!(
+            "Replace {} with the folder it leads to",
+            link.display()
+        )) && !err.contains("straight to its place"),
         "{err}"
     );
     assert!(

@@ -226,9 +226,18 @@ what of the home it hides, under `[profile.<type>.jail]`:
   that would cover the project, the guard, a read-only path or the agent's
   own settings, stops the launch; a home folder the jail writes that is
   itself a link (`~/.cache` on another disk) counts as the home where it
-  leads. On Linux a path that is not there yet, in a folder the jail writes,
+  leads. On Linux a path whose way goes through a link in a folder the jail
+  writes (`~/.cache/git` a link, or a dotfiles manager's `~/.config/gh`
+  link) stops the launch: a program in the jail could replace that link with
+  a folder of its own, which your programs would then read and write at that
+  name, so replace the link with the folder it leads to. On macOS the jail
+  starts, and keeps each such link in place instead, also one further down
+  a chain (`~/.local/a`, where `~/.cache/git` leads to `~/.local/a/git` and
+  `~/.local/a` is a link too): no program in the jail can remove, rename or
+  replace it. On Linux a path
+  that is not there yet, in a folder the jail writes,
   is made empty (mode 0700) first, so what a program makes there later stays
-  hidden too. Each folder between such a path and the folder the jail writes
+  hidden too. Each folder the jail writes between such a path and your home
   is pinned as below, so no program in the jail renames it away from the
   path's cover.
 
@@ -245,14 +254,38 @@ the jail follows the host when the network changes. Elsewhere
 (systemd-resolved, NetworkManager) a jail keeps the resolver file it started
 with until the agent is restarted.
 
+On macOS every jail keeps in place the folders above what it hides: the
+project, `~/.config` (which holds InnerWarden's own folder) and each folder
+between the project and a `--deny-read` path cannot be renamed, removed or
+replaced by a link from inside the jail, so nothing it hides is shown at
+another name. So is every other folder the jail may write above a place it
+hides: `~/.cache` or `/tmp` above a project there that holds a `--deny-read`
+path, or a folder above where a hidden dotdir or a profile's hidden home path
+leads, or above a profile's read-only path. The jail still
+writes in them, finds them writable and sets their mode and times (`rsync -a`
+or `cp -a` into the project works); only renaming, removing or replacing the
+folder itself is refused. Where such a folder is not there yet (`~/.config`
+on an account that has none), `innerwarden contain` makes it first, empty and
+0700, and says so; a dry run makes nothing and names each folder a real run
+would make.
+
+A profile's read-only path (`extra_ro`) is read-only in every jail, wherever
+it is. On macOS the sandbox denies writing it also inside a folder the jail
+may write (the project, `~/.cache`, `~/.local`, `~/.config`, `/tmp`,
+`~/.claude.json`); before, the macOS jail never denied it, so a program in
+the jail wrote it. A tool that has to write at such a path (Claude Code
+updating itself in `~/.local/share/claude/versions`) gets "Operation not
+permitted" there: update it outside the jail, or leave that path out of
+`extra_ro`.
+
 Where a place the jail hides is a link, the jail hides the place it leads
 to: `~/.ssh`, `~/.gnupg` or `~/.aws` kept as a link into a folder the jail
 shows (`~/.ssh` a link to `.config/ssh`), a link inside one of them
 (`~/.ssh/config` a link into `~/.config/dotfiles`, as GNU stow and chezmoi
 make one per file), a `--deny-read` path of the project, or InnerWarden's own
 folder. Every link on the way is followed. On Linux that place is covered
-wherever a folder the jail shows holds it, and each folder between the cover
-and the folder the jail binds is a mount point of its own, so a program in
+wherever a folder the jail shows holds it, and each folder the jail writes
+between the cover and your home is a mount point of its own, so a program in
 the jail can neither read the place nor rename it away from the name your
 link uses; a dotdir's place that is not there yet is made first, empty and
 0700, so nothing the agent writes there reaches it (a `--deny-read` path that
@@ -270,8 +303,8 @@ left as it is, and `innerwarden contain` says so, with what to do (on Linux
 only where the jail shows that place: elsewhere it is not in the jail at
 all). A dotdir that leads into the project is hidden there, and said. A link
 stops the launch only here: a hidden dotdir, a link inside one, InnerWarden's
-own folder or, in an identified Linux jail, the launcher's records folder,
-whose way goes through a link in a folder the jail writes (`~/.aws` a link to
+own folder or, in an identified Linux jail, the launcher's records folder or
+a profile's hidden home path (above), whose way goes through a link in a folder the jail writes (`~/.aws` a link to
 `~/.cache/aws-link`, itself a link) is refused, since no mount or deny pins a
 link and a program in the jail could replace it on the host (replace that
 link with what it leads to); on Linux, InnerWarden's own folder kept as a

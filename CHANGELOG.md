@@ -7,6 +7,44 @@ follows semantic versioning.
 
 ### Upgrade notes: what to do
 
+- **On macOS a program in `innerwarden contain` can no longer rename, remove
+  or replace the project folder itself, `~/.config`, a folder between the
+  project and a `--deny-read` path, or any other folder the jail may write
+  above a place it hides or a profile's read-only path (`~/.cache` or
+  `/tmp` above a project there that holds a `--deny-read` path).**
+  It still writes in them, finds them writable and sets their mode and
+  times; only the folder itself keeps its name. A tool that renames the
+  folder it works in has to run outside the jail. Where such a folder is not
+  there yet (`~/.config` on an account that has none), `innerwarden contain`
+  makes it first (0700) and says so. The same holds for each link on the way
+  to a profile's `hide_home` path that sits in a folder the jail may write
+  (`~/.cache/git` a link): it can no longer be removed, renamed or replaced
+  from inside the jail.
+- **On Linux a program in `innerwarden contain` can no longer rename or
+  remove a folder it writes that sits above a place the jail covers.** Each
+  such folder is now a mount point of its own, and `mv` or `rmdir` on it
+  fails with "Device or resource busy": a folder between the project and a
+  nested `--deny-read` path (`packages` and `packages/app` for `--deny-read
+  packages/app/config/.env`), a folder above a profile's read-only path
+  (`proj/third` above an `extra_ro` of `proj/third/lib`) or above a
+  profile's `hide_home` path (`~/.cache/git` above `.cache/git/credential`),
+  a folder above where a hidden dotdir or a `--deny-read` link leads
+  (`~/.config/keys` above a `~/.ssh` that leads to `~/.config/keys/ssh`),
+  and, with `--identity`, `~/.local/state` and `~/.local/state/innerwarden`.
+  The jail still writes in each of them. A tool that renames such a folder
+  has to run outside the jail. A jail started without `--identity`, with the
+  default `--deny-read` paths, no profile and no linked dotdir, has none of
+  these.
+- **On macOS a profile's read-only path (`extra_ro`) is now read-only
+  wherever it is.** Before, the macOS jail never denied writing it, so one
+  in a folder the jail may write (the project, `~/.cache`, `~/.local`,
+  `~/.config`, `/tmp`, `~/.claude.json`) was written as any other file
+  there. A tool that writes at such a path now gets "Operation not
+  permitted": with `extra_ro = ["~/.local/share/claude/versions"]` Claude
+  Code can no longer update itself in the jail, and with `extra_ro =
+  ["~/.claude.json"]` it can no longer save its settings there. Update the
+  tool outside the jail, or take the path out of `extra_ro` if the jail has
+  to write it.
 - **A program in `innerwarden contain` can no longer make a btrfs or bcachefs
   subvolume or snapshot.** It gets "Operation not permitted". A tool that
   needs one (a container runtime on btrfs, `btrfs subvolume create`) has to
@@ -24,10 +62,26 @@ follows semantic versioning.
   `innerwarden contain` names it. On Linux, a link inside a hidden dotdir
   that leads to nothing yet, where the jail shows that place, stops it too:
   make what it leads to, or remove the link. Such an identified jail with
-  the records folder behind a link did not start before either.
+  the records folder behind a link did not start before either. So does, on
+  Linux, a profile's `hide_home` path whose way goes through such a link
+  (`~/.cache/git` a link, or a dotfiles manager's `~/.config/gh` link):
+  replace that link with the folder it leads to.
 
 ### Security
 
+- **On macOS a jail can no longer move a folder above what it hides.** In
+  1.5.5 and earlier, in every macOS jail, a program in it could rename a
+  folder it may write that holds a place the jail denies, and then read that
+  place under the new name, or put a folder of its own in that folder's
+  place, whose files the host's guard read. Every macOS jail now keeps such
+  folders in place, the project and the folder that holds InnerWarden's own
+  folder among them; the jail still writes in them.
+- **On Linux a hidden place inside a project kept in a folder the jail
+  writes stays where the host reads it.** Where such a place sat in a
+  project kept two or more folders down inside a home folder the jail binds,
+  a folder above the project could be renamed, and the host's link then led
+  to a folder the jail made. Each folder the jail writes between such a
+  place and your home is now a mount point of its own.
 - **No jail makes a new btrfs or bcachefs subvolume or snapshot.** In 1.5.5
   and earlier, on a btrfs or bcachefs disk where the project, or a folder the
   jail shows, is a subvolume, a program in the jail could snapshot it, and
@@ -70,11 +124,12 @@ follows semantic versioning.
   reads it by.** A mount moves with the folder it is in, and Linux renames a folder
   that is not itself a mount point: a program in the jail that renamed the
   folder above a covered place (`~/.config/keys` above `~/.config/keys/ssh`,
-  where `~/.ssh` leads; `~/dotfiles/ssh` above a stowed `~/.ssh`; the
+  where `~/.ssh` leads; `~/dotfiles/ssh` above a stowed `~/.ssh`;
+  `~/.config/app` above where a `--deny-read` link in the project leads; the
   `~/.local/state` above the launcher's records in an identified jail) took
   the cover with it and made a folder of its own at the name the host's
-  link, or the launcher, reads. Each folder between such a place and the
-  folder the jail binds is now a mount point of its own, and the rename
+  link, or the launcher, reads. Each folder the jail writes between such a
+  place and your home is now a mount point of its own, and the rename
   fails. On macOS the sandbox let the jail rename a folder above a denied
   place, the project included: each such folder the jail may write is now
   closed to renaming and removal, and the jail still writes in it.
@@ -85,7 +140,23 @@ follows semantic versioning.
   read its config and ran what it named (`credential_process`, `Match
   exec`, `pinentry-program`), or the launcher kept its records there. No
   mount or deny pins a link, so such a launch is refused (see Upgrade
-  notes).
+  notes). On Linux the same holds for a profile's hidden home path: the
+  host's programs read the jail's folder at that name, and wrote into it
+  what the path was hidden for (a credential cache's socket, a token). On
+  macOS the sandbox keeps each link on the way to a profile's hidden home
+  path in place instead, also one further down a chain (`~/.local/a`, for
+  `~/.cache/git` a link to `~/.local/a/git` and `~/.local/a` a link): before,
+  a program in the jail could remove such a link and make a folder of its
+  own there, and the host's git then kept its credential cache in it.
+- **A profile's read-only path stays read-only.** On Linux the read-only
+  bind of an `extra_ro` path inside the project, or a worktree's folder,
+  came before the bind of that folder, which covered it, and on macOS
+  nothing denied writing any `extra_ro` path, so one in a folder the jail
+  may write (the project, `~/.cache`, `~/.local`, `~/.config`, `/tmp`,
+  `~/.claude.json`) was written: a program in the jail wrote it. Each is
+  read-only on both now (see Upgrade notes), and each folder the jail writes
+  above a read-only path is kept in place, so the path is never moved away
+  from its name.
 - **A suppression planted in the jail no longer lifts the hook's verdict.**
   Inside the jail the hook read the person's suppressions from
   `~/.config/innerwarden`, which on Linux is an empty folder of the jail's

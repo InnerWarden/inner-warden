@@ -456,7 +456,7 @@ fn resolve_inputs(
     let hidden = if args.hide_home.is_empty() {
         crate::contain::HiddenPlan::default()
     } else {
-        let found = hidden_home_facts(&home, &args.hide_home);
+        let found = hidden_home_facts(&home, &args.hide_home, &facts.writable, facts.macos);
         crate::contain::plan_hidden_home(&found, &home, &shown)?
     };
 
@@ -489,7 +489,7 @@ fn resolve_inputs(
         if !facts.macos {
             let (_, links) = trace_links(&nominal);
             if let Some(link) = crate::contain::steering_link(&links, None, &facts.writable) {
-                return Err(crate::contain::steered_link_refused(&nominal, link));
+                return Err(crate::contain::records_link_refused(&nominal, link));
             }
         }
         let real = leads_to(&nominal).unwrap_or_else(|| resolved_through_existing(&nominal));
@@ -563,6 +563,7 @@ fn resolve_inputs(
         seccomp_fd: None,
         hide_paths: hidden.masks,
         hide_denies: hidden.denies,
+        hide_links: hidden.links,
         resolv_conf,
         gate_instance: None,
         claude_state,
@@ -726,15 +727,31 @@ const CLAUDE_FOLDERS_SHARED: &str = "Claude Code's ~/.claude/sessions or ~/.clau
 
 /// Each home path a jail profile hides, as found on the host: where it
 /// leads with every link followed, where a file would be made when nothing
-/// is there, whether it is a folder, and whether a link on the way leads to
-/// nothing. On Linux a path that is not there yet, in a folder of the home
-/// the jail writes, is first made as an empty folder ([`make_hidden_folder`]).
-fn hidden_home_facts(home: &Path, paths: &[PathBuf]) -> Vec<crate::contain::HiddenHomePath> {
+/// is there, whether it is a folder, whether a link on the way leads to
+/// nothing, every link on the way (which the macOS sandbox keeps in place,
+/// [`crate::contain::macos_pins`]), and (Linux, `macos` false) the first
+/// link on the way in a folder the jail writes (`writable`,
+/// [`crate::contain::steering_link`]), which refuses the launch. On Linux a
+/// path that is not there yet, in a folder of the home the jail writes, is
+/// first made as an empty folder ([`make_hidden_folder`]), unless such a
+/// link is on its way.
+fn hidden_home_facts(
+    home: &Path,
+    paths: &[PathBuf],
+    writable: &[PathBuf],
+    macos: bool,
+) -> Vec<crate::contain::HiddenHomePath> {
     paths
         .iter()
         .map(|nominal| {
+            let (_, links) = trace_links(nominal);
+            let steered_by = if macos {
+                None
+            } else {
+                crate::contain::steering_link(&links, None, writable).cloned()
+            };
             #[cfg(target_os = "linux")]
-            if std::fs::symlink_metadata(nominal).is_err() {
+            if steered_by.is_none() && std::fs::symlink_metadata(nominal).is_err() {
                 make_hidden_folder(home, nominal);
             }
             let real = std::fs::canonicalize(nominal).ok();
@@ -750,6 +767,8 @@ fn hidden_home_facts(home: &Path, paths: &[PathBuf]) -> Vec<crate::contain::Hidd
                 resolved,
                 is_dir,
                 dangling_link: link_on_the_way_dangles(home, nominal),
+                steered_by,
+                links,
             }
         })
         .collect()
@@ -1158,7 +1177,7 @@ fn trace_links(path: &Path) -> (Option<PathBuf>, Vec<PathBuf>) {
 /// person's (as `ssh` or `gpg` would make it): from the nearest folder on
 /// the way that is there, never through a link or a file. Whether it is a
 /// folder now.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn make_place(place: &Path) -> bool {
     use std::os::unix::fs::DirBuilderExt;
     let mut missing: Vec<&std::ffi::OsStr> = Vec::new();
@@ -2776,6 +2795,49 @@ fn read_info(reader: &mut std::io::PipeReader) -> InfoRead {
     }
 }
 
+/// Each folder the macOS sandbox keeps in place as itself
+/// ([`crate::contain::macos_pins`]) that is not there yet: `~/.config` on an
+/// account that has none, and any folder above a place the jail hides that
+/// it may write (a folder above where a hidden dotdir leads, or above a
+/// profile's hidden home path). Parents before the folders in them.
+fn macos_pins_missing(input: &JailInputs) -> Vec<PathBuf> {
+    crate::contain::macos_pins(input)
+        .into_iter()
+        .filter(|folder| std::fs::symlink_metadata(folder).is_err())
+        .collect()
+}
+
+/// The real run of a macOS jail, after every check: each folder of
+/// [`macos_pins_missing`] is made, empty and 0700, as a folder of the
+/// person's ([`make_place`]), and said, so no folder appears in the home
+/// without a word. The sandbox refuses to make it, so the jail never has
+/// to, and none of its programs can put a link of its own at that name. One
+/// that cannot be made is said too: no program in the jail can make it
+/// either. A dry run makes nothing and names each.
+#[cfg(target_os = "macos")]
+fn made_before_the_sandbox(input: &JailInputs) {
+    for folder in macos_pins_missing(input) {
+        if std::fs::symlink_metadata(&folder).is_ok() {
+            // Made already, with a folder below it.
+            continue;
+        }
+        if make_place(&folder) {
+            eprintln!(
+                "innerwarden contain: made {} (empty, 0700), a folder the jail writes in but cannot rename or remove",
+                crate::contain::printable(&folder)
+            );
+        } else {
+            eprintln!(
+                "innerwarden contain: {} is not there and could not be made; no program in the jail can make it either",
+                crate::contain::printable(&folder)
+            );
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn made_before_the_sandbox(_input: &JailInputs) {}
+
 fn run_macos(input: &JailInputs) -> ExitCode {
     let plan = match build_macos_profile(input) {
         Ok(p) => p,
@@ -2789,6 +2851,13 @@ fn run_macos(input: &JailInputs) -> ExitCode {
         print_plan_env(&plan.env);
         println!("# --- sandbox profile ---");
         println!("{}", plan.profile);
+        // What a real run would make in the home; a dry run makes nothing.
+        for folder in macos_pins_missing(input) {
+            println!(
+                "# would make {} (empty, 0700) before the sandbox starts",
+                crate::contain::printable(&folder)
+            );
+        }
         println!("# --- argv ---");
         println!(
             "/usr/bin/sandbox-exec -p <profile> -- {}",
@@ -2813,6 +2882,7 @@ fn run_macos(input: &JailInputs) -> ExitCode {
         );
         return ExitCode::from(2);
     }
+    made_before_the_sandbox(input);
     announce(input);
     // argv = [sandbox-exec, -p, <profile>, --, child...]; run argv[1..] under the
     // resolved binary.
@@ -4010,6 +4080,46 @@ mod tests {
         let place = hidden_place(&home.join(".gnupg"), &writable, true);
         assert_eq!(place.leads_to, Some(home.join(".config/ssh-real")));
         assert!(place.there && place.is_dir);
+    }
+
+    /// JP-2 completeness: a hidden home path names every link on its way,
+    /// each where it sits on the host, on both OSes: the macOS sandbox keeps
+    /// each in place ([`crate::contain::macos_pins`]), and Linux refuses the
+    /// first the jail can change. With `~/.cache/git` a link to
+    /// `~/.local/a/git` and `~/.local/a` a link to `~/.local/b`, the second
+    /// link is above neither the path nor where it leads.
+    ///
+    /// FAILS ON REVERT: give `hidden_home_facts` no links and the chain
+    /// names none.
+    #[cfg(unix)]
+    #[test]
+    fn a_hidden_home_path_names_every_link_on_its_way() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(root.path()).unwrap();
+        std::fs::create_dir_all(home.join(".cache")).unwrap();
+        std::fs::create_dir_all(home.join(".local/b/git/credential")).unwrap();
+        symlink(home.join(".local/a/git"), home.join(".cache/git")).unwrap();
+        symlink("b", home.join(".local/a")).unwrap();
+        let nominal = home.join(".cache/git/credential");
+        let writable = [home.join(".cache"), home.join(".local")];
+        for macos in [true, false] {
+            let found = hidden_home_facts(&home, std::slice::from_ref(&nominal), &writable, macos);
+            assert_eq!(
+                found[0].links,
+                [home.join(".cache/git"), home.join(".local/a")]
+            );
+            assert_eq!(found[0].real, Some(home.join(".local/b/git/credential")));
+            assert_eq!(
+                found[0].steered_by,
+                (!macos).then(|| home.join(".cache/git")),
+                "macos={macos}"
+            );
+        }
+        // No link on the way: none.
+        let plain = home.join(".local/b/git/credential");
+        let found = hidden_home_facts(&home, &[plain], &writable, true);
+        assert!(found[0].links.is_empty());
     }
 
     /// M30C-3: the launcher finds every link inside a dotdir the jail
