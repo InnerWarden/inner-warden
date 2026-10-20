@@ -1361,17 +1361,18 @@ fn identified_sh(
 /// writes a new file beside that place (`<target>.tmp.<pid>.<hex>`, made
 /// with `O_EXCL`) and renames it onto the place, and it keeps a copy of the
 /// file in `~/.claude/backups` (`.claude.json.backup.<ms>`, a name that
-/// starts with a dot, so `grep -r`, never a `*` glob, reads it). Exits 71
-/// where `~/.claude.json` is no link, 72 where the write or the rename
-/// fails, 73 where the jail reads the person's own settings file or a copy
-/// of it, 77 where it cannot write its own copy.
+/// starts with a dot, so `grep -r`, never a `*` glob, reads it). It reads the
+/// file first, as Claude Code loads it before it saves. Exits 71 where
+/// `~/.claude.json` is no link, 72 where the write or the rename fails, 73
+/// where the jail reads the person's own settings file (before the save
+/// replaces it) or a copy of it, 77 where it cannot write its own copy.
 #[cfg(target_os = "linux")]
 const SAVE_AS_CLAUDE_CODE_DOES: &str = r#"target=$(readlink "$HOME/.claude.json") || exit 71
+if grep -qs HOST-OWN "$HOME/.claude.json"; then exit 73; fi
+if grep -rqs HOST-OWN "$HOME/.claude/backups"; then exit 73; fi
 tmp="$target.tmp.$$.0a1b2c3d4e5f"
 set -C; printf '{"kept":"JAIL-STATE"}\n' > "$tmp" || exit 72; set +C
 mv "$tmp" "$target" || exit 72
-if grep -qs HOST-OWN "$HOME/.claude.json"; then exit 73; fi
-if grep -rqs HOST-OWN "$HOME/.claude/backups"; then exit 73; fi
 mkdir -p "$HOME/.claude/backups" || exit 77
 printf JAIL-COPY > "$HOME/.claude/backups/.claude.json.backup.1" || exit 77
 echo SAVED
@@ -1912,6 +1913,127 @@ fn claude_codes_folders_are_made_only_by_a_real_identified_launch() {
         let meta = std::fs::symlink_metadata(h.join(".claude").join(name)).unwrap();
         assert!(meta.is_dir(), "{name}");
         assert_eq!(meta.permissions().mode() & 0o777, 0o700, "{name}");
+    }
+}
+
+/// M30CW-C2: on an account where Claude Code never ran there is no
+/// `~/.claude` when the jail is planned, and arming the hook makes it, with
+/// the settings file that carries the hook. The jail is planned again on
+/// what is there then, so it shows that file, plain and identified alike,
+/// and the hook fires inside from the first launch.
+///
+/// FAILS ON REVERT: plan the jail only once, before the hook is armed, and
+/// the jail has no `~/.claude/settings.json`.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_first_launch_on_a_home_with_no_claude_folder_shows_the_hook() {
+    require_bwrap();
+    for identity in [false, true] {
+        let home = state_home();
+        let h = home.path();
+        assert!(!h.join(".claude").exists());
+        let project = tempfile::TempDir::new().unwrap();
+        let script = "cat \"$HOME/.claude/settings.json\" 2>/dev/null || echo NO-SETTINGS";
+        let output = if identity {
+            identified_sh(h, project.path(), script).output()
+        } else {
+            cli()
+                .args([
+                    "contain",
+                    "--project",
+                    project.path().to_str().unwrap(),
+                    "--",
+                    "/bin/sh",
+                    "-c",
+                    script,
+                ])
+                .env("HOME", h)
+                .output()
+        }
+        .expect("run the jail");
+        let out = String::from_utf8_lossy(&output.stdout);
+        let err = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "identity={identity}: {out} {err}");
+        assert!(!out.contains("NO-SETTINGS"), "identity={identity}: {out}");
+        assert!(
+            out.contains("PreToolUse") && out.contains("hook --monitor --agent claude-code"),
+            "identity={identity}: no hook in the jail: {out}"
+        );
+    }
+}
+
+/// M30CW-C3: `~/.cache` leads off the home (`<elsewhere>/cache`), and
+/// `~/.config` and `~/.local` are links into it. The `.cache` bind shows
+/// InnerWarden's folder at `~/.cache/cfg/innerwarden` and the launcher's
+/// records at `~/.cache/local/state/innerwarden/instances`, places that are
+/// neither the folder as named nor as it resolves. Both are covered there
+/// too: the key is read in no jail, and an identified jail neither lists
+/// the launcher's records nor writes there.
+///
+/// FAILS ON REVERT: cover them only as named and as they resolve, and the
+/// jail reads the key through `~/.cache`, lists the record and forges one.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_secret_folder_shown_through_another_linked_home_folder_stays_hidden() {
+    require_bwrap();
+    for identity in [false, true] {
+        let home = tempfile::TempDir::new().unwrap();
+        let h = home.path();
+        let elsewhere = tempfile::TempDir::new().unwrap();
+        let cache = elsewhere.path().join("cache");
+        std::fs::create_dir_all(cache.join("cfg/innerwarden")).unwrap();
+        std::fs::create_dir_all(cache.join("local/state")).unwrap();
+        std::fs::write(cache.join("cfg/innerwarden/llm-key"), "CJC-J007-SECRET").unwrap();
+        std::os::unix::fs::symlink(&cache, h.join(".cache")).unwrap();
+        std::os::unix::fs::symlink(".cache/cfg", h.join(".config")).unwrap();
+        std::os::unix::fs::symlink(".cache/local", h.join(".local")).unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        let script = "cat \"$HOME/.cache/cfg/innerwarden/llm-key\" \
+                      \"$HOME/.config/innerwarden/llm-key\" 2>/dev/null; echo; \
+                      d=\"$HOME/.cache/local/state/innerwarden/instances\"; \
+                      echo \"seen=$(ls -A \"$d\" 2>/dev/null | wc -l | tr -d ' ')\"; \
+                      ( echo forged > \"$d/forged.json\" ) 2>/dev/null; echo DONE";
+        let output = if identity {
+            identified_sh(h, project.path(), script).output()
+        } else {
+            cli()
+                .args([
+                    "contain",
+                    "--project",
+                    project.path().to_str().unwrap(),
+                    "--",
+                    "/bin/sh",
+                    "-c",
+                    script,
+                ])
+                .env("HOME", h)
+                .output()
+        }
+        .expect("run the jail");
+        let out = String::from_utf8_lossy(&output.stdout);
+        let err = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "identity={identity}: {out} {err}");
+        assert!(out.contains("DONE"), "identity={identity}: {out} {err}");
+        assert!(
+            !out.contains("CJC-J007-SECRET"),
+            "identity={identity}: the key was read: {out}"
+        );
+        if identity {
+            assert!(out.contains("seen=0"), "the records were listed: {out}");
+            let records = cache.join("local/state/innerwarden/instances");
+            let names: Vec<_> = std::fs::read_dir(&records)
+                .expect("the launcher's records folder")
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            assert!(
+                !names.iter().any(|name| name == "forged.json"),
+                "a forged record reached the host: {names:?}"
+            );
+            assert!(
+                names.iter().any(|name| name.ends_with(".json")),
+                "the launcher's own record: {names:?}"
+            );
+        }
     }
 }
 

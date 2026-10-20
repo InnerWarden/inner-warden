@@ -26,9 +26,24 @@ follows semantic versioning.
   before the jail started, in a folder the jail shows, still holds those
   files: only new ones are refused, so keep such snapshots out of the
   project.
+- **The jail hides InnerWarden's own folder wherever it shows it.** On Linux,
+  where a home folder the jail binds is a link that leads off the home
+  (`~/.cache` on another disk) and `~/.config` is a link into it, the jail
+  covered `~/.config/innerwarden` as named and as it resolves, but showed it
+  a third time through `~/.cache`, with the model key in it. It is covered
+  there too, and so are the launcher's records in an identified jail (where
+  `~/.local` is such a link). A project at that place is refused, as one at
+  `~/.config/innerwarden` is.
 
 ### Fixed
 
+- **The first jail on an account where Claude Code never ran has the guard's
+  hook.** Arming the hook makes `~/.claude`, and the jail was planned before
+  that, without it: on Linux the first `innerwarden contain` there showed no
+  `~/.claude/settings.json`, so the hook never fired inside, while the
+  launcher said it was armed. The jail is planned again once the hook is
+  armed. A dry run arms nothing, so on such an account it still shows a jail
+  without `~/.claude`.
 - **Claude Code keeps its settings in an identified jail.** In
   `innerwarden contain --identity` on Linux the jail's home is an empty
   folder of its own, so Claude Code's settings file, `~/.claude.json`, was
@@ -39,11 +54,18 @@ follows semantic versioning.
   kept between launches. Your own `~/.claude.json` is not shown in the jail
   and its Claude Code never uses it, and the copies Claude Code keeps of it in
   `~/.claude/backups` are not shown either: each identified jail has an empty
-  `~/.claude/backups` of its own. Not where a hidden home path or a read-only
-  path of the profile covers that place or names `~/.claude.json`, where it
-  is a link of yours or anything other than a file, or where your own
-  `~/.claude.json` is that file or leads into `~/.claude`: Claude Code then
-  keeps its file in the jail's own home, as before.
+  `~/.claude/backups` of its own. Where your own `~/.claude.json` is a link,
+  or a hard link, to a file in `~/.claude`, that file is shared with the jail
+  like the rest of the folder, and where `~/.claude/backups` is a link of
+  yours the jail shows the host's copies (`innerwarden contain` says so). Not
+  where a hidden home path or a read-only path of the profile covers that
+  place or names `~/.claude.json`, where it is a link of yours or anything
+  other than a file, or where your own `~/.claude.json` is that file or leads
+  into `~/.claude` or to nothing: Claude Code then keeps its file in the
+  jail's own home, as before. Every jail shares `~/.claude`, so what a
+  program in any jail writes to `~/.claude/.claude.json` is what the next
+  identified Claude Code loads, as with `~/.claude/settings.json`: an MCP
+  server listed there starts with it.
 - **Two identified jails at once no longer share Claude Code's session
   file.** Claude Code is process 2 in every jail and lists each running
   session as `~/.claude/sessions/<pid>.json`, in the `~/.claude` the jails

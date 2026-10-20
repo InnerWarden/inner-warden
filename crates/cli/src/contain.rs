@@ -411,6 +411,25 @@ fn jail_views(real: &Path, shown: &[(PathBuf, PathBuf)]) -> Vec<PathBuf> {
     views
 }
 
+/// PURE. The places a Linux jail shows the host folder `real` besides those
+/// already covered (`covered`: the folder as named and as it resolves), each
+/// once ([`jail_views`]). `~/.cache` a link to `/data/cache` and `~/.config`
+/// a link to `~/.cache/cfg`: InnerWarden's folder resolves to
+/// `/data/cache/cfg/innerwarden`, which nothing in the jail shows at that
+/// place, while the `.cache` bind shows it at `~/.cache/cfg/innerwarden`.
+/// Empty in every layout where each place is one already covered, so such
+/// a jail is the one it was.
+pub fn other_jail_views(
+    real: &Path,
+    covered: &[PathBuf],
+    shown: &[(PathBuf, PathBuf)],
+) -> Vec<PathBuf> {
+    jail_views(real, shown)
+        .into_iter()
+        .filter(|view| !covered.contains(view))
+        .collect()
+}
+
 /// PURE. Where an identified jail covers Claude Code's folders of its runs
 /// ([`CLAUDE_RUN_FOLDERS`]): `real` holds each such folder of the host's as
 /// its path resolves, and each is covered at every place the jail shows it
@@ -520,6 +539,12 @@ pub struct JailInputs {
     /// the real path, so a symlinked `~/.config` (dotfile managers) would evade a
     /// deny of the nominal path - the resolved path is denied as well.
     pub iw_config_real: PathBuf,
+    /// Linux: every other place the jail shows that secret dir, through a
+    /// home folder it binds that is a link ([`other_jail_views`]), each
+    /// covered like the dir itself. Empty where the dir is shown only as
+    /// named or as it resolves (every common layout), and on macOS, where
+    /// the sandbox matches the resolved path.
+    pub iw_config_shown: Vec<PathBuf>,
     /// The project secrets to mask (glob-expanded + statted by the I/O layer).
     pub deny_paths: Vec<DenyPath>,
     /// The descriptor bwrap writes its start-up facts to (`--info-fd`). `None`
@@ -549,9 +574,11 @@ pub struct JailInputs {
     ///
     /// [`SYSTEM_PROFILES_MARKER_PATH`]: crate::agent_profiles::SYSTEM_PROFILES_MARKER_PATH
     pub profiles_marker_fd: Option<i32>,
-    /// The launcher's own records directory, as named and as resolved, hidden
-    /// inside an identified jail: the agent works in a home that holds it.
-    /// Empty unless the launch asked for an identity record.
+    /// The launcher's own records directory, as named and as resolved, and
+    /// on Linux at every other place the jail shows it
+    /// ([`other_jail_views`]), hidden inside an identified jail: the agent
+    /// works in a home that holds it. Empty unless the launch asked for an
+    /// identity record.
     pub records_dirs: Vec<PathBuf>,
     /// Variables the launcher keeps out of the programs it runs to start the
     /// jail, handed to the jail's command as they were ([`launch_env`]).
@@ -686,6 +713,7 @@ fn paths_overlap(left: &Path, right: &Path) -> bool {
 
 fn protected_host_paths(input: &JailInputs) -> Vec<PathBuf> {
     let mut paths = vec![input.iw_config_dir(), input.iw_config_real.clone()];
+    paths.extend(input.iw_config_shown.iter().cloned());
     paths.extend(DOTDIR_DENY.iter().map(|name| input.home.join(name)));
     paths.extend(MACOS_HOME_DENY.iter().map(|name| input.home.join(name)));
     paths.sort();
@@ -913,6 +941,11 @@ pub fn build_linux_jail(input: &JailInputs) -> Result<LinuxJailPlan, ContainErro
     let iw_cfg_real = input.iw_config_real.to_string_lossy().to_string();
     if iw_cfg_real != iw_cfg {
         push(&["--tmpfs", &iw_cfg_real]);
+    }
+    // And at every other place a home folder the jail binds shows it
+    // (`~/.config` a link into a `~/.cache` that leads off the home).
+    for view in &input.iw_config_shown {
+        push(&["--tmpfs", &view.to_string_lossy()]);
     }
 
     for name in DOTFILE_RO {
@@ -3124,6 +3157,7 @@ mod tests {
                 PathBuf::from("/home/dev/.ssh"),
             ],
             iw_config_real: PathBuf::from("/home/dev/.config/innerwarden"),
+            iw_config_shown: vec![],
             deny_paths: vec![
                 // a resolved project .env FILE (masked with /dev/null, not tmpfs)
                 DenyPath {
@@ -5479,6 +5513,151 @@ mod tests {
         assert!(last_bind < named && last_bind < resolved);
         let record = got.iter().position(|a| a == "--ro-bind-data").unwrap();
         assert!(named < record && resolved < record);
+    }
+
+    /// M30CW-C3: a home folder the jail binds that is a link off the home
+    /// shows InnerWarden's folder, and the launcher's records, at a place
+    /// that is neither the folder as named nor as it resolves. `~/.cache`
+    /// leads to `/data/cache`, `~/.config` to `~/.cache/cfg` and `~/.local`
+    /// to `~/.cache/local`: InnerWarden's folder is
+    /// `/data/cache/cfg/innerwarden`, which nothing in the jail shows at that
+    /// place, and the `.cache` bind shows it at `~/.cache/cfg/innerwarden`
+    /// (the records at `~/.cache/local/state/...`). Each is covered there
+    /// too: the secret folder right after the dotdir binds and again after
+    /// the last writable bind, the records after every writable bind, and a
+    /// project at that place is refused.
+    ///
+    /// FAILS ON REVERT: cover only the folder as named and as it resolves
+    /// (`other_jail_views` left out), and the jail reads the key at
+    /// `~/.cache/cfg/innerwarden` and writes the launcher's records at
+    /// `~/.cache/local/state/innerwarden/instances`.
+    #[test]
+    fn the_secret_folder_and_the_records_are_covered_at_every_place_the_jail_shows_them() {
+        let resolve = |path: &Path| match path.to_str() {
+            Some("/home/dev/.cache") => PathBuf::from("/data/cache"),
+            Some("/home/dev/.config") => PathBuf::from("/data/cache/cfg"),
+            Some("/home/dev/.local") => PathBuf::from("/data/cache/local"),
+            _ => path.to_path_buf(),
+        };
+        let mut input = identified_inputs();
+        let shown = shown_host_folders(
+            &input.args,
+            &input.home,
+            None,
+            &input.existing_paths,
+            resolve,
+        );
+        let real = PathBuf::from("/data/cache/cfg/innerwarden");
+        let views = other_jail_views(
+            &real,
+            &[PathBuf::from("/home/dev/.config/innerwarden"), real.clone()],
+            &shown,
+        );
+        assert_eq!(views, [PathBuf::from("/home/dev/.cache/cfg/innerwarden")]);
+        let records_real = PathBuf::from("/data/cache/local/state/innerwarden/instances");
+        let named = vec![
+            PathBuf::from("/home/dev/.local/state/innerwarden/instances"),
+            records_real.clone(),
+        ];
+        let records_views = other_jail_views(&records_real, &named, &shown);
+        assert_eq!(
+            records_views,
+            [PathBuf::from(
+                "/home/dev/.cache/local/state/innerwarden/instances"
+            )]
+        );
+
+        input.iw_config_real = real;
+        input.iw_config_shown = views;
+        input.records_dirs = named.into_iter().chain(records_views).collect();
+        let got = build_linux_jail(&input).unwrap().bwrap_args;
+        let cache_bind = got
+            .windows(3)
+            .position(|w| w == ["--bind", "/home/dev/.cache", "/home/dev/.cache"])
+            .unwrap();
+        let project = got
+            .windows(3)
+            .position(|w| w == ["--bind", "/home/dev/proj", "/home/dev/proj"])
+            .unwrap();
+        let last_bind = got.iter().rposition(|a| a == "--bind").unwrap();
+        let masks: Vec<usize> = got
+            .windows(2)
+            .enumerate()
+            .filter(|(_, w)| *w == ["--tmpfs", "/home/dev/.cache/cfg/innerwarden"])
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(masks.len(), 2, "{got:?}");
+        assert!(cache_bind < masks[0] && masks[0] < project, "{got:?}");
+        assert!(last_bind < masks[1], "{got:?}");
+        let records = got
+            .windows(2)
+            .position(|w| {
+                w == [
+                    "--tmpfs",
+                    "/home/dev/.cache/local/state/innerwarden/instances",
+                ]
+            })
+            .unwrap_or_else(|| panic!("{got:?}"));
+        assert!(last_bind < records, "{got:?}");
+
+        let mut there = input.clone();
+        there.args.project = PathBuf::from("/home/dev/.cache/cfg");
+        let refused = validate_jail_inputs(&there).unwrap_err().to_string();
+        assert!(refused.contains("unsafe project path"), "{refused}");
+    }
+
+    /// In every common layout InnerWarden's folder and the records are
+    /// shown only as named or as they resolve: `other_jail_views` adds
+    /// nothing, so such a jail is byte for byte the one it was. A home
+    /// whose folders are its own, and one whose `~/.config` and `~/.local`
+    /// lead off the home (a dotfiles manager's), alike.
+    ///
+    /// FAILS ON REVERT: take every view, the named one included, and the
+    /// argv of these jails gains a mask it did not have.
+    #[test]
+    fn no_other_place_is_covered_in_a_common_layout() {
+        let own = |path: &Path| path.to_path_buf();
+        let off_home = |path: &Path| match path.to_str() {
+            Some("/home/dev/.config") => PathBuf::from("/data/cfg"),
+            Some("/home/dev/.local") => PathBuf::from("/data/local"),
+            _ => path.to_path_buf(),
+        };
+        let input = identified_inputs();
+        for (config_real, records_real, resolve) in [
+            (
+                "/home/dev/.config/innerwarden",
+                "/home/dev/.local/state/innerwarden/instances",
+                &own as &dyn Fn(&Path) -> PathBuf,
+            ),
+            (
+                "/data/cfg/innerwarden",
+                "/data/local/state/innerwarden/instances",
+                &off_home,
+            ),
+        ] {
+            let shown = shown_host_folders(
+                &input.args,
+                &input.home,
+                None,
+                &input.existing_paths,
+                resolve,
+            );
+            let real = PathBuf::from(config_real);
+            let named = [PathBuf::from("/home/dev/.config/innerwarden"), real.clone()];
+            assert_eq!(
+                other_jail_views(&real, &named, &shown),
+                Vec::<PathBuf>::new()
+            );
+            let real = PathBuf::from(records_real);
+            let named = [
+                PathBuf::from("/home/dev/.local/state/innerwarden/instances"),
+                real.clone(),
+            ];
+            assert_eq!(
+                other_jail_views(&real, &named, &shown),
+                Vec::<PathBuf>::new()
+            );
+        }
     }
 
     /// Without `--identity` neither the records folder, the command's

@@ -134,7 +134,7 @@ pub fn cmd(rest: &[String]) -> ExitCode {
     }
     args.project = project;
 
-    let input = match resolve_inputs(args, home, iw_binary) {
+    let mut input = match resolve_inputs(args, home, iw_binary) {
         Ok(input) => input,
         Err(error) => {
             eprintln!("innerwarden contain: {error}");
@@ -164,6 +164,27 @@ pub fn cmd(rest: &[String]) -> ExitCode {
             Err(e) => eprintln!(
                 "innerwarden contain: could not arm the in-jail hook: {e} (running with walls only)"
             ),
+        }
+        // On an account where Claude Code never ran, arming the hook made
+        // `~/.claude` after the jail was planned without it: the jail would
+        // show no `~/.claude`, so no settings file and no hook. The jail is
+        // planned again, and checked again, on what is there now.
+        if existing_home_paths(&input.home) != input.existing_paths {
+            input = match resolve_inputs(
+                input.args.clone(),
+                input.home.clone(),
+                input.iw_binary.clone(),
+            ) {
+                Ok(input) => input,
+                Err(error) => {
+                    eprintln!("innerwarden contain: {error}");
+                    return ExitCode::from(2);
+                }
+            };
+            if let Err(error) = validate_jail_inputs(&input) {
+                eprintln!("innerwarden contain: {error}");
+                return ExitCode::from(2);
+            }
         }
     }
 
@@ -268,6 +289,26 @@ fn resolve_project(p: &Path) -> PathBuf {
     std::fs::canonicalize(&base).unwrap_or(base)
 }
 
+/// The home's dotdirs and dotfiles the builders may bind, those that are
+/// there (a link is taken where it leads): bwrap fails on a missing source.
+fn existing_home_paths(home: &Path) -> Vec<PathBuf> {
+    [
+        ".claude",
+        ".config",
+        ".cache",
+        ".cargo",
+        ".rustup",
+        ".npm",
+        ".local",
+        ".gitconfig",
+        ".claude.json",
+    ]
+    .iter()
+    .map(|name| home.join(name))
+    .filter(|path| path.exists())
+    .collect()
+}
+
 fn resolve_inputs(
     args: ContainArgs,
     home: PathBuf,
@@ -281,23 +322,7 @@ fn resolve_inputs(
         .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
         .unwrap_or_else(|| PathBuf::from("/tmp"));
 
-    // Which home-relative paths the builder may bind actually exist.
-    let candidates = [
-        ".claude",
-        ".config",
-        ".cache",
-        ".cargo",
-        ".rustup",
-        ".npm",
-        ".local",
-        ".gitconfig",
-        ".claude.json",
-    ];
-    let existing_paths: Vec<PathBuf> = candidates
-        .iter()
-        .map(|n| home.join(n))
-        .filter(|p| p.exists())
-        .collect();
+    let existing_paths = existing_home_paths(&home);
 
     let usr_merged = std::fs::symlink_metadata("/bin")
         .map(|m| m.file_type().is_symlink())
@@ -315,6 +340,28 @@ fn resolve_inputs(
     // builder knows file-vs-dir (Linux masks a file with /dev/null, a dir with tmpfs).
     let deny_paths = expand_deny_paths(&args.project, &args.deny_read);
 
+    // Each host folder the jail shows, as the jail sees it and as its host
+    // path resolves: what the jail covers is covered at each such place.
+    let shown = crate::contain::shown_host_folders(
+        &args,
+        &home,
+        worktree.as_ref(),
+        &existing_paths,
+        |path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()),
+    );
+
+    // Linux: the secret dir at every other place a home folder the jail
+    // binds shows it. Empty in every common layout.
+    let iw_config_shown = if cfg!(target_os = "linux") {
+        crate::contain::other_jail_views(
+            &iw_config_real,
+            &[home.join(".config/innerwarden"), iw_config_real.clone()],
+            &shown,
+        )
+    } else {
+        Vec::new()
+    };
+
     // The home paths a jail profile hides: where each leads, every link
     // followed, covered where the jail shows it (Linux) and denied as named
     // and as resolved (macOS). Without such a profile nothing is read.
@@ -322,13 +369,6 @@ fn resolve_inputs(
         crate::contain::HiddenPlan::default()
     } else {
         let found = hidden_home_facts(&home, &args.hide_home);
-        let shown = crate::contain::shown_host_folders(
-            &args,
-            &home,
-            worktree.as_ref(),
-            &existing_paths,
-            |path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()),
-        );
         crate::contain::plan_hidden_home(&found, &home, &shown)?
     };
 
@@ -355,7 +395,14 @@ fn resolve_inputs(
         let real = resolved_through_existing(&nominal);
         let mut dirs = vec![nominal];
         if real != dirs[0] {
-            dirs.push(real);
+            dirs.push(real.clone());
+        }
+        // Linux: and at every other place a home folder the jail binds
+        // shows it (`~/.local` a link into a `~/.cache` that leads off the
+        // home).
+        if cfg!(target_os = "linux") {
+            let others = crate::contain::other_jail_views(&real, &dirs, &shown);
+            dirs.extend(others);
         }
         (
             dirs,
@@ -396,6 +443,7 @@ fn resolve_inputs(
         stdin_is_tty: std::io::stdin().is_terminal(),
         existing_paths,
         iw_config_real,
+        iw_config_shown,
         deny_paths,
         info_fd: None,
         record_fd: None,

@@ -278,7 +278,13 @@ own (a link is there, the project is inside it, or it could not be made), the
 jail shows the host's, and `innerwarden contain` says so. Limit: two jails at
 once share the one settings file, and Claude Code's lock on it is each jail's
 own, so a change one jail saves at the same moment as another can be lost (a
-save is never left half written). A jail started without `--identity` is
+save is never left half written). Every jail, with `--identity` or without,
+shares `~/.claude` with you, so what a program in any jail writes to
+`~/.claude/.claude.json` is what the next identified Claude Code loads, as
+with `~/.claude/settings.json`: an MCP server listed there starts with it,
+outside `innerwarden proxy` unless the entry runs through it, and a project
+marked trusted there skips Claude Code's trust question. A jail started
+without `--identity` is
 unchanged: Claude Code's settings file is still gone at every launch there,
 and two such jails at once still share `~/.claude/sessions` and see the
 host's. On macOS the jail lets Claude Code use your own `~/.claude.json`, as
