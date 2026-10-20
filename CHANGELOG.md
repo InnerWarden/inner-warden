@@ -58,6 +58,14 @@ follows semantic versioning.
   own that its programs can write: a `suppress.toml` written there let
   through the command it names. The hook in a jail now reads none
   (`IW_SUPPRESS_CONFIG=/dev/null`); your own file was never visible there.
+- **An LLM or notification config planted in the jail is no longer read.**
+  The jail meant to turn the hook's LLM second opinion and notifications
+  off with `IW_LLM_CONFIG` and `IW_NOTIFY_CONFIG` left empty, but an empty
+  value made the hook read `llm.toml` and `notify.toml` in that same
+  folder: a program in the jail could send each command the hook reviews to
+  an endpoint of its choosing, stall the hook on it, and fire webhooks of
+  its choosing. It could not lift a refusal. Both now read nothing
+  (`/dev/null`).
 - **On Linux, a jail can no longer replace InnerWarden's own folder kept as
   a link.** The link sits in the `~/.config` the jail binds read-write, and
   no mount can pin a link: a program in the jail could put a folder of its

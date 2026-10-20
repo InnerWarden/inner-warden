@@ -2056,6 +2056,17 @@ pub fn build_macos_profile(input: &JailInputs) -> Result<MacosJailPlan, ContainE
 /// jail can replace it.
 pub const JAIL_SUPPRESS_CONFIG: &str = "/dev/null";
 
+/// Where the hook in a jail reads the LLM second opinion's and the
+/// notifications' config: nothing. An empty value is no value to either
+/// reader, which then reads `~/.config/innerwarden/llm.toml` and
+/// `notify.toml` in the jail's home, where on Linux a program in the jail
+/// can write them: an `llm.toml` planted there sent every command the hook
+/// reviews to an endpoint of the agent's choosing, and stalled the hook on
+/// it, and a `notify.toml` fired webhooks of its choosing. `/dev/null`
+/// reads empty, which configures neither, and no program in the jail can
+/// replace it.
+pub const JAIL_NO_CONFIG: &str = "/dev/null";
+
 /// What the launcher says of InnerWarden's own folder as the jail starts:
 /// that it is not visible, the API key with it, unless the jail leaves the
 /// place a link leads it to as it is ([`JailInputs::iw_config_left`], said
@@ -2072,9 +2083,11 @@ pub fn iw_folder_said(input: &JailInputs) -> &'static str {
 /// The in-jail environment: redirect the graph to a jail-local writable file and
 /// DISABLE the LLM second-opinion + notify inside the jail (their config lives in
 /// the shadowed `~/.config/innerwarden`, so they must not be reached - blocking
-/// still works from the embedded rules). `IW_GUARD_SESSION` groups the narrative.
-/// The person's suppressions are read from nothing ([`JAIL_SUPPRESS_CONFIG`]):
-/// a `suppress.toml` a program in the jail writes never lifts a verdict.
+/// still works from the embedded rules): both read their config from nothing
+/// ([`JAIL_NO_CONFIG`]), never from the jail's home. `IW_GUARD_SESSION` groups
+/// the narrative. The person's suppressions are read from nothing
+/// ([`JAIL_SUPPRESS_CONFIG`]): a `suppress.toml` a program in the jail writes
+/// never lifts a verdict.
 ///
 /// With `--identity` the hook is also told the agent the jail was started for
 /// (`IW_HOOK_AGENT`), so a hook wired for another agent, or for none, is not
@@ -2085,8 +2098,8 @@ pub fn compute_jail_env(input: &JailInputs) -> Vec<(String, String)> {
             "IW_GRAPH_FILE".to_string(),
             input.jail_graph_file().to_string_lossy().to_string(),
         ),
-        ("IW_LLM_CONFIG".to_string(), String::new()),
-        ("IW_NOTIFY_CONFIG".to_string(), String::new()),
+        ("IW_LLM_CONFIG".to_string(), JAIL_NO_CONFIG.to_string()),
+        ("IW_NOTIFY_CONFIG".to_string(), JAIL_NO_CONFIG.to_string()),
         ("IW_GUARD_SESSION".to_string(), JAIL_SESSION.to_string()),
         (
             "IW_SUPPRESS_CONFIG".to_string(),
@@ -4163,9 +4176,28 @@ mod tests {
             env["IW_GRAPH_FILE"],
             "/home/dev/proj/.innerwarden/graph.json"
         );
-        assert_eq!(env["IW_LLM_CONFIG"], "");
-        assert_eq!(env["IW_NOTIFY_CONFIG"], "");
+        // M30C-5: never empty. An empty value is no value to the readers,
+        // which then read the config in the jail's home, where a program in
+        // the jail writes it.
+        assert_eq!(env["IW_LLM_CONFIG"], "/dev/null");
+        assert_eq!(env["IW_NOTIFY_CONFIG"], "/dev/null");
         assert_eq!(env["IW_SUPPRESS_CONFIG"], "/dev/null");
+        let read_by_notify = |value: &str| {
+            innerwarden_notify::config_path(|key| match key {
+                "IW_NOTIFY_CONFIG" => Some(value.to_string()),
+                "HOME" => Some("/home/dev".to_string()),
+                _ => None,
+            })
+        };
+        assert_eq!(
+            read_by_notify(&env["IW_NOTIFY_CONFIG"]),
+            Some(PathBuf::from("/dev/null"))
+        );
+        assert_eq!(
+            read_by_notify(""),
+            Some(PathBuf::from("/home/dev/.config/innerwarden/notify.toml")),
+            "why the value is never empty"
+        );
     }
 
     // POSIX-only: these build a jail plan for a hardcoded POSIX project path
@@ -8178,8 +8210,8 @@ mod tests {
             plain,
             [
                 ("IW_GRAPH_FILE", "/home/dev/proj/.innerwarden/graph.json"),
-                ("IW_LLM_CONFIG", ""),
-                ("IW_NOTIFY_CONFIG", ""),
+                ("IW_LLM_CONFIG", "/dev/null"),
+                ("IW_NOTIFY_CONFIG", "/dev/null"),
                 ("IW_GUARD_SESSION", "contain"),
                 ("IW_SUPPRESS_CONFIG", "/dev/null"),
             ]
