@@ -15,6 +15,16 @@ follows semantic versioning.
   contain`.** Where `~/.config/innerwarden` is a link (a dotfiles manager's),
   replace the link with the folder it leads to; `innerwarden contain` says
   how. Such a jail did not start before either.
+- **A hidden dotdir behind a link the jail can change stops `innerwarden
+  contain`.** Where the way to `~/.ssh`, `~/.gnupg` or `~/.aws`, to a link
+  inside one, to InnerWarden's own folder, or (with `--identity` on Linux)
+  to the launcher's records folder goes through a link in a folder the jail
+  writes (`~/.aws` a link to `~/.cache/aws-link`, itself a link;
+  `~/.local/state` a link), replace that link with what it leads to;
+  `innerwarden contain` names it. On Linux, a link inside a hidden dotdir
+  that leads to nothing yet, where the jail shows that place, stops it too:
+  make what it leads to, or remove the link. Such an identified jail with
+  the records folder behind a link did not start before either.
 
 ### Security
 
@@ -51,7 +61,31 @@ follows semantic versioning.
   on macOS a place of the system. Such a place is left as it is, and
   `innerwarden contain` says so where the jail shows it. A worktree, or a
   path of a profile, over the place a hidden dotdir leads to is refused. In
-  every common layout the jail is the one it was.
+  every common layout the jail is the one it was. A link inside one of those
+  dotdirs (`~/.ssh/config` a link into `~/.config/dotfiles`, as GNU stow and
+  chezmoi make one per file where `~/.ssh` is there) is hidden where it
+  leads the same way; the launcher looks for such links as far as 100000
+  entries and 32 folders deep, and says where it stops short.
+- **A jail can no longer move a hidden place away from the name the host
+  reads it by.** A mount moves with the folder it is in, and Linux renames a folder
+  that is not itself a mount point: a program in the jail that renamed the
+  folder above a covered place (`~/.config/keys` above `~/.config/keys/ssh`,
+  where `~/.ssh` leads; `~/dotfiles/ssh` above a stowed `~/.ssh`; the
+  `~/.local/state` above the launcher's records in an identified jail) took
+  the cover with it and made a folder of its own at the name the host's
+  link, or the launcher, reads. Each folder between such a place and the
+  folder the jail binds is now a mount point of its own, and the rename
+  fails. On macOS the sandbox let the jail rename a folder above a denied
+  place, the project included: each such folder the jail may write is now
+  closed to renaming and removal, and the jail still writes in it.
+- **A dotdir, InnerWarden's folder or the launcher's records behind a link
+  the jail can change is refused.** The jail hid where such a way led, but
+  a program in it could replace the link in the folder it writes with a
+  folder of its own, on the host, and the host's `aws`, `ssh` or `gpg` then
+  read its config and ran what it named (`credential_process`, `Match
+  exec`, `pinentry-program`), or the launcher kept its records there. No
+  mount or deny pins a link, so such a launch is refused (see Upgrade
+  notes).
 - **A suppression planted in the jail no longer lifts the hook's verdict.**
   Inside the jail the hook read the person's suppressions from
   `~/.config/innerwarden`, which on Linux is an empty folder of the jail's
@@ -82,13 +116,10 @@ follows semantic versioning.
   project to have it hidden. A path you name outside the project (absolute,
   or with `..`) with no such link on the way is hidden where it leads, as
   before. On macOS such a place is denied where it leads, unless it is a
-  place of the system.
+  place of the system outside the project.
 
 ### Fixed
 
-- **An identified jail starts where the launcher's records folder is
-  behind a link.** On Linux such a jail did not start (bwrap could not mount
-  through the link). The records are now hidden where the link leads.
 - **The launcher no longer says the API key is hidden where it is not.**
   Where the place InnerWarden's own folder leads to is left as it is (said
   before), the launch line said the folder, the API key with it, was not
