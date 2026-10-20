@@ -2806,6 +2806,161 @@ fn on_macos_a_denied_place_below_a_folder_the_jail_writes_stays_where_the_hosts_
     }
 }
 
+/// JAIL-PINS on macOS, in every default profile: the sandbox denies by
+/// path, and let a program in the jail rename a folder it may write above
+/// what it denies. Measured with the 1.6.0 development binary: `mv
+/// ~/.config` then read InnerWarden's model key at the new name, `mv` of
+/// the project its `.env`, `mv` of a folder between the project and a
+/// denied path that secret, and a link of the program's own put at
+/// `~/.config` was where the host's guard read a planted `suppress.toml`.
+/// Each rename fails now, nothing denied is read, the host's `~/.config` is
+/// the person's folder, and the jail still writes in all of them.
+///
+/// FAILS ON REVERT: drop the project, `~/.config` and the denied paths from
+/// `macos_pins` and every rename succeeds, the key and both secrets are
+/// read, and the host's `~/.config` is the planted link.
+#[cfg(target_os = "macos")]
+#[test]
+fn on_macos_no_folder_above_what_the_jail_denies_moves() {
+    let home = tempfile::TempDir::new().unwrap();
+    let h = std::fs::canonicalize(home.path()).unwrap();
+    let project = tempfile::TempDir::new().unwrap();
+    let p = std::fs::canonicalize(project.path()).unwrap();
+    let outside = tempfile::TempDir::new().unwrap();
+    let x = std::fs::canonicalize(outside.path()).unwrap();
+    std::fs::create_dir_all(h.join(".config/innerwarden")).unwrap();
+    std::fs::write(h.join(".config/innerwarden/llm-key"), "CJC-J007-LLM-KEY").unwrap();
+    std::fs::create_dir_all(p.join("sub/dir")).unwrap();
+    std::fs::write(p.join(".env"), "CJC-J007-ENV").unwrap();
+    std::fs::write(p.join("sub/dir/.env"), "CJC-J007-SUB-ENV").unwrap();
+    std::fs::create_dir_all(x.join("evil/innerwarden")).unwrap();
+    std::fs::write(x.join("evil/innerwarden/suppress.toml"), "planted").unwrap();
+    let script = format!(
+        "set -- '{h}' '{p}' '{x}'; \
+         mv \"$1/.config\" \"$3/c\" 2>/dev/null; echo \"config=$?\"; \
+         cat \"$3/c/innerwarden/llm-key\" 2>/dev/null; \
+         mv \"$2\" \"$3/p\" 2>/dev/null; echo \"project=$?\"; \
+         cat \"$3/p/.env\" 2>/dev/null; \
+         mv \"$2/sub\" \"$2/sub2\" 2>/dev/null; echo \"between=$?\"; \
+         cat \"$2/sub2/dir/.env\" 2>/dev/null; \
+         mv \"$1/.config\" \"$1/.config-old\" 2>/dev/null \
+           && ln -s \"$3/evil\" \"$1/.config\" 2>/dev/null; echo \"link=$?\"; \
+         mkdir -p \"$1/.config/app\" && echo in > \"$1/.config/app/x\" && echo WROTE-CONFIG; \
+         echo in > \"$2/new\" && echo in > \"$2/sub/dir/new\" && echo WROTE-PROJECT; \
+         echo DONE",
+        h = h.display(),
+        p = p.display(),
+        x = x.display()
+    );
+    // `sub/dir/.env` is denied by name: the default globs deny only the
+    // project's own `.env`.
+    let output = cli()
+        .args([
+            "contain",
+            "--project",
+            p.to_str().unwrap(),
+            "--deny-read",
+            "sub/dir/.env",
+            "--",
+            "/bin/sh",
+            "-c",
+            &script,
+        ])
+        .env("HOME", &h)
+        .output()
+        .expect("run the macOS jail");
+    let out = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(out.contains("DONE"), "{out} {err}");
+    for moved in ["config=0", "project=0", "between=0", "link=0"] {
+        assert!(!out.contains(moved), "{moved}: {out}");
+    }
+    assert!(!out.contains("CJC-J007"), "a denied secret was read: {out}");
+    assert!(
+        out.contains("WROTE-CONFIG") && out.contains("WROTE-PROJECT"),
+        "{out} {err}"
+    );
+    let config = std::fs::symlink_metadata(h.join(".config")).unwrap();
+    assert!(
+        config.is_dir(),
+        "the host's ~/.config is no folder of its own"
+    );
+    assert!(!h.join(".config-old").exists() && !x.join("c").exists());
+    assert!(!x.join("p").exists() && !p.join("sub2").exists());
+    assert_eq!(
+        std::fs::read_to_string(h.join(".config/innerwarden/llm-key")).unwrap(),
+        "CJC-J007-LLM-KEY"
+    );
+    assert!(!h.join(".config/innerwarden/suppress.toml").exists());
+}
+
+/// JAIL-PINS on macOS: on an account with no `~/.config` the sandbox,
+/// which closes that name, would refuse every program in the jail that
+/// makes it. The launcher makes it before the sandbox starts, an empty
+/// folder of the person's, 0700: the jail writes in it and still cannot
+/// move or replace it. A dry run makes nothing.
+///
+/// FAILS ON REVERT: drop `made_before_the_sandbox` from `run_macos` and
+/// the jail cannot make `~/.config`, nor write anything in it.
+#[cfg(target_os = "macos")]
+#[test]
+fn on_macos_the_launcher_makes_a_missing_config_folder_before_the_sandbox() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = tempfile::TempDir::new().unwrap();
+    let h = std::fs::canonicalize(home.path()).unwrap();
+    let project = tempfile::TempDir::new().unwrap();
+    let p = std::fs::canonicalize(project.path()).unwrap();
+    let dry = cli()
+        .args([
+            "contain",
+            "--dry-run",
+            "--project",
+            p.to_str().unwrap(),
+            "--",
+            "true",
+        ])
+        .env("HOME", &h)
+        .output()
+        .expect("dry run");
+    assert!(
+        dry.status.success(),
+        "{}",
+        String::from_utf8_lossy(&dry.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&dry.stdout).contains(&format!(
+            "(deny file-write* (literal \"{}\"))",
+            h.join(".config").display()
+        )),
+        "the profile closes ~/.config"
+    );
+    assert!(!h.join(".config").exists(), "a dry run made ~/.config");
+    let script = "mkdir -p \"$HOME/.config/app\" && echo in > \"$HOME/.config/app/x\" \
+                  && echo WROTE; mv \"$HOME/.config\" \"$HOME/.config-old\" 2>/dev/null; \
+                  echo \"mv=$?\"";
+    let output = cli()
+        .args([
+            "contain",
+            "--project",
+            p.to_str().unwrap(),
+            "--",
+            "/bin/sh",
+            "-c",
+            script,
+        ])
+        .env("HOME", &h)
+        .output()
+        .expect("run the macOS jail");
+    let out = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(out.contains("WROTE"), "{out} {err}");
+    assert!(out.contains("mv=") && !out.contains("mv=0"), "{out}");
+    let config = std::fs::symlink_metadata(h.join(".config")).unwrap();
+    assert!(config.is_dir());
+    assert_eq!(config.permissions().mode() & 0o777, 0o700);
+    assert!(h.join(".config/app/x").exists() && !h.join(".config-old").exists());
+}
+
 /// M30-SEC-2: a worktree the project's `.git` names (a file the agent
 /// writes) that is the place a hidden dotdir leads to: such a jail would
 /// bind it read-write, and a planner that trusted it as needed left the

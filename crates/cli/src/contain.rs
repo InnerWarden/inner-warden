@@ -1656,16 +1656,24 @@ const MACOS_HOME_WRITABLE: &[&str] = &[
     ".claude", ".cache", ".local", ".cargo", ".npm", ".rustup", ".config",
 ];
 
-/// PURE. macOS: the folders above a place the sandbox denies where a link
-/// leads (a hidden dotdir's, InnerWarden's folder kept as a link, a
-/// profile's hidden home path), that the sandbox lets the jail write, each
-/// to be denied writing as itself. The sandbox denies by path: a program in
-/// the jail that renamed `~/.config/keys` (above `~/.config/keys/ssh`,
-/// where `~/.ssh` leads), or the project above a dotdir that leads into
-/// it, then put a link to a folder of its own at that name, and the host's
-/// link led there, past every deny. Denying the folder itself, never what
-/// is in it, closes that rename and removal; the jail still writes in it.
-/// Only for those places, so in every common layout there is none.
+/// PURE. macOS: the project, and every folder above a place the sandbox
+/// denies that the sandbox lets the jail write, each to be denied writing
+/// as itself. The sandbox denies by path, and lets a program in the jail
+/// rename a folder it may write, and what was denied under it is not
+/// denied at the new name: a program that moved `~/.config` away read
+/// InnerWarden's model key, one that moved the project (or a folder
+/// between the project and a `deny_read` path) read the secret, and one
+/// that put a link of its own at `~/.config` had the host's guard read the
+/// suppressions it planted there. The same for a folder above where a link
+/// leads a hidden dotdir (`~/.config/keys` above `~/.config/keys/ssh`,
+/// where `~/.ssh` leads): the host's link led to a folder of the jail's.
+/// Denying the folder itself, never what is in it, closes that rename and
+/// removal; the jail still writes in it. The places: InnerWarden's folder
+/// as named and where it leads, every `deny_read` path, every hidden home
+/// path as named and as it resolves, and where a link leads a dotdir the
+/// sandbox denies. In every layout that is `~/.config` and the project at
+/// least, and the launcher makes each that is not there yet before the
+/// sandbox starts, so the jail never has to.
 pub fn macos_pins(input: &JailInputs) -> Vec<PathBuf> {
     let mut writable: Vec<PathBuf> = vec![input.args.project.clone()];
     if let Some(worktree) = &input.worktree {
@@ -1676,19 +1684,20 @@ pub fn macos_pins(input: &JailInputs) -> Vec<PathBuf> {
     writable.extend(MACOS_WRITABLE.iter().map(PathBuf::from));
     writable.push(input.tmpdir.clone());
     writable.push(input.home.join("Library/Caches"));
-    let mut places: Vec<PathBuf> = input
-        .linked_denies
-        .iter()
-        .chain(&input.hide_denies)
-        .cloned()
-        .collect();
-    if input.iw_config_link {
-        places.push(input.iw_config_dir());
-        if !input.iw_config_left {
-            places.push(input.iw_config_real.clone());
-        }
+    let iw_named = input.iw_config_dir();
+    let mut places: Vec<PathBuf> = vec![iw_named.clone()];
+    if input.iw_config_real != iw_named && !input.iw_config_left {
+        places.push(input.iw_config_real.clone());
     }
-    let mut pins: Vec<PathBuf> = Vec::new();
+    places.extend(input.deny_paths.iter().map(|denied| denied.abs.clone()));
+    places.extend(
+        input
+            .linked_denies
+            .iter()
+            .chain(&input.hide_denies)
+            .cloned(),
+    );
+    let mut pins: Vec<PathBuf> = vec![input.args.project.clone()];
     for place in &places {
         for folder in place.ancestors().skip(1) {
             if writable.iter().any(|w| folder.starts_with(w)) && !pins.iter().any(|p| p == folder) {
@@ -2201,7 +2210,8 @@ pub fn build_macos_profile(input: &JailInputs) -> Result<MacosJailPlan, ContainE
     }
     // Tool state a real coding agent writes (build caches etc.). `~/.config` is
     // allowed here but `~/.config/innerwarden` is DENIED last (below), so the key
-    // dir stays unreadable/unwritable.
+    // dir stays unreadable/unwritable, and `~/.config` itself is closed to
+    // renaming, removal and replacement ([`macos_pins`]).
     for w in MACOS_HOME_WRITABLE {
         p.push_str(&format!(
             "(allow file-write* (subpath \"{}/{}\"))\n",
@@ -2262,9 +2272,10 @@ pub fn build_macos_profile(input: &JailInputs) -> Result<MacosJailPlan, ContainE
             e(&path.to_string_lossy())
         ));
     }
-    // The folders above such a place that the jail may write, each closed
-    // as itself (never what is in it): never renamed or removed from above
-    // a deny ([`macos_pins`]). None in every common layout.
+    // The project and the folders above a denied place that the jail may
+    // write, `~/.config` among them, each closed as itself (never what is
+    // in it): never renamed or removed from above a deny, nor replaced by
+    // a link ([`macos_pins`]).
     for folder in macos_pins(input) {
         p.push_str(&format!(
             "(deny file-write* (literal \"{}\"))\n",
@@ -9157,11 +9168,17 @@ mod tests {
             let rule = format!("(deny file-write* (literal \"{folder}\"))");
             assert!(profile.contains(&rule), "{rule}");
         }
-        // A common layout: none, on either OS.
+        // A common layout: none on Linux; on macOS the project and
+        // `~/.config` ([`a_macos_jail_never_moves_a_folder_above_what_it_denies`]).
         let plain = inputs(&["claude", "--print"]);
-        assert!(linux_pins(&plain).is_empty() && macos_pins(&plain).is_empty());
-        let profile = build_macos_profile(&plain).unwrap().profile;
-        assert!(!profile.contains("(deny file-write* (literal"), "{profile}");
+        assert!(linux_pins(&plain).is_empty());
+        assert_eq!(
+            macos_pins(&plain),
+            [
+                PathBuf::from("/home/dev/proj"),
+                PathBuf::from("/home/dev/.config")
+            ]
+        );
         assert_eq!(
             linux_pins(&identified_inputs()),
             [
@@ -9171,6 +9188,83 @@ mod tests {
                     PathBuf::from("/home/dev/.local/state/innerwarden")
                 ),
             ]
+        );
+    }
+
+    /// JAIL-PINS (macOS): the sandbox denies by path, and lets a program in
+    /// the jail rename a folder it may write; what was denied under it is
+    /// not denied at the new name. Measured on macOS with every default
+    /// profile: `mv ~/.config` read InnerWarden's model key, `mv` of the
+    /// project read its `.env`, `mv` of a folder between the project and a
+    /// `deny_read` path read that secret, and a link of the jail's own put at
+    /// `~/.config` had the host's guard read the `suppress.toml` planted
+    /// there. Every macOS profile now closes, each as itself, the project,
+    /// `~/.config`, every folder between the project and each denied path,
+    /// and every folder above where InnerWarden's folder leads that the jail
+    /// may write. Never the home, never what is in them.
+    ///
+    /// FAILS ON REVERT: pin only the folders above a linked place (the pins
+    /// of #211) and none of these is closed; drop the project and it moves.
+    #[test]
+    fn a_macos_jail_never_moves_a_folder_above_what_it_denies() {
+        let mut input = inputs(&["claude", "--print"]);
+        input
+            .deny_paths
+            .push(mask("/home/dev/proj/sub/dir/.env", false));
+        input
+            .deny_paths
+            .push(mask("/home/dev/.cache/tool/token", false));
+        assert_eq!(
+            macos_pins(&input),
+            paths(&[
+                "/home/dev/proj",
+                "/home/dev/.config",
+                "/home/dev/.cache",
+                "/home/dev/proj/sub",
+                "/home/dev/.cache/tool",
+                "/home/dev/proj/sub/dir",
+            ])
+        );
+        let profile = build_macos_profile(&input).unwrap().profile;
+        let last_deny = profile
+            .rfind("(deny file-write* (subpath")
+            .expect("the write denies");
+        for folder in macos_pins(&input) {
+            let rule = format!("(deny file-write* (literal \"{}\"))", folder.display());
+            let at = profile.find(&rule).unwrap_or_else(|| panic!("{rule}"));
+            assert!(at > last_deny, "{rule} before a deny it guards");
+        }
+        assert!(!profile.contains("(deny file-write* (literal \"/home/dev\"))"));
+        // A project with nothing denied in it is closed too: the sandbox
+        // must never let it move from under the name the jail works at.
+        let mut bare = inputs(&["claude", "--print"]);
+        bare.deny_paths.clear();
+        assert_eq!(
+            macos_pins(&bare),
+            paths(&["/home/dev/proj", "/home/dev/.config"])
+        );
+        // Where `~/.config` is a link into a folder the jail writes: the
+        // folders above where it leads are closed too.
+        let mut linked = inputs(&["claude", "--print"]);
+        linked.iw_config_real = PathBuf::from("/home/dev/.local/cfg/innerwarden");
+        let pins = macos_pins(&linked);
+        for folder in [
+            "/home/dev/.config",
+            "/home/dev/.local",
+            "/home/dev/.local/cfg",
+        ] {
+            assert!(pins.contains(&PathBuf::from(folder)), "{folder}: {pins:?}");
+        }
+        // Left as it is (onto what the jail needs): not denied, so not
+        // closed either.
+        linked.iw_config_left = true;
+        assert!(!macos_pins(&linked).contains(&PathBuf::from("/home/dev/.local/cfg")));
+        // The whole profile of the common layout, byte for byte.
+        assert_eq!(
+            build_macos_profile(&inputs(&["claude", "--print"]))
+                .unwrap()
+                .profile,
+            GOLDEN_MACOS_PROFILE
         );
     }
 
@@ -9850,6 +9944,70 @@ mod tests {
         );
         assert_eq!(found(&[], None), None);
     }
+
+    /// The whole macOS profile of a jail on a common layout, byte for byte.
+    /// Its last two lines are new, on purpose, in every macOS profile: they
+    /// close the project and `~/.config` to renaming, removal and
+    /// replacement ([`a_macos_jail_never_moves_a_folder_above_what_it_denies`]).
+    const GOLDEN_MACOS_PROFILE: &str = r##"(version 1)
+(deny default)
+
+(allow process-exec)
+(allow process-fork)
+(allow process-info* (target same-sandbox))
+(allow signal (target same-sandbox))
+(allow sysctl-read)
+(allow mach-lookup)
+(allow mach-register)
+(allow mach-host*)
+(allow ipc-posix-shm*)
+(allow ipc-posix-sem)
+(allow pseudo-tty)
+(allow file-ioctl)
+(allow iokit-open)
+(allow file-read* file-write* (literal "/dev/ptmx"))
+(allow file-read* file-write* (regex #"^/dev/ttys[0-9]+"))
+(allow file-read* file-write* (literal "/dev/null"))
+(allow file-read* file-write* (literal "/dev/zero"))
+(allow file-read* (literal "/dev/random"))
+(allow file-read* (literal "/dev/urandom"))
+
+(allow network*)
+(allow system-socket)
+
+(allow file-read*)
+(deny file-read* (subpath "/home/dev/.ssh"))
+(deny file-read* (subpath "/home/dev/.aws"))
+(deny file-read* (subpath "/home/dev/.gnupg"))
+(deny file-read* (subpath "/home/dev/Library/Mail"))
+(deny file-read* (subpath "/home/dev/Library/Messages"))
+(deny file-read* (subpath "/home/dev/Library/Safari"))
+(deny file-read* (subpath "/home/dev/.config/innerwarden"))
+(deny file-read* (subpath "/home/dev/proj/.env"))
+(deny file-read* (subpath "/home/dev/proj/secrets"))
+
+(allow file-write* (subpath "/home/dev/proj"))
+(allow file-write* (subpath "/home/dev/.claude"))
+(allow file-write* (subpath "/home/dev/.cache"))
+(allow file-write* (subpath "/home/dev/.local"))
+(allow file-write* (subpath "/home/dev/.cargo"))
+(allow file-write* (subpath "/home/dev/.npm"))
+(allow file-write* (subpath "/home/dev/.rustup"))
+(allow file-write* (subpath "/home/dev/.config"))
+(allow file-write* (subpath "/tmp"))
+(allow file-write* (subpath "/private/tmp"))
+(allow file-write* (subpath "/private/var/tmp"))
+(allow file-write* (subpath "/private/var/folders"))
+(allow file-write* (subpath "/tmp"))
+(allow file-write* (subpath "/home/dev/Library/Caches"))
+(allow file-write* (literal "/home/dev/.claude.json"))
+(allow file-write* (regex #"^/home/dev/\.claude\.json(\.tmp\.[0-9]+\.[0-9a-f]+|\.lock)$"))
+(deny file-write* (subpath "/home/dev/.config/innerwarden"))
+(deny file-write* (subpath "/home/dev/proj/.env"))
+(deny file-write* (subpath "/home/dev/proj/secrets"))
+(deny file-write* (literal "/home/dev/proj"))
+(deny file-write* (literal "/home/dev/.config"))
+"##;
 
     const GOLDEN_ARGV_IDENTIFIED: &str = "\
         --ro-bind\n\

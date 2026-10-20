@@ -1158,7 +1158,7 @@ fn trace_links(path: &Path) -> (Option<PathBuf>, Vec<PathBuf>) {
 /// person's (as `ssh` or `gpg` would make it): from the nearest folder on
 /// the way that is there, never through a link or a file. Whether it is a
 /// folder now.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn make_place(place: &Path) -> bool {
     use std::os::unix::fs::DirBuilderExt;
     let mut missing: Vec<&std::ffi::OsStr> = Vec::new();
@@ -2776,6 +2776,28 @@ fn read_info(reader: &mut std::io::PipeReader) -> InfoRead {
     }
 }
 
+/// The real run of a macOS jail, after every check: each folder the sandbox
+/// closes as itself ([`crate::contain::macos_pins`]) that is not there yet,
+/// `~/.config` on an account that has none, is made, empty and 0700, as a
+/// folder of the person's ([`make_place`]). The sandbox refuses to make it,
+/// so the jail never has to, and none of its programs can put a link of its
+/// own at that name. One that cannot be made is said: no program in the
+/// jail can make it either. A dry run makes nothing.
+#[cfg(target_os = "macos")]
+fn made_before_the_sandbox(input: &JailInputs) {
+    for folder in crate::contain::macos_pins(input) {
+        if std::fs::symlink_metadata(&folder).is_err() && !make_place(&folder) {
+            eprintln!(
+                "innerwarden contain: {} is not there and could not be made; no program in the jail can make it either",
+                crate::contain::printable(&folder)
+            );
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn made_before_the_sandbox(_input: &JailInputs) {}
+
 fn run_macos(input: &JailInputs) -> ExitCode {
     let plan = match build_macos_profile(input) {
         Ok(p) => p,
@@ -2813,6 +2835,7 @@ fn run_macos(input: &JailInputs) -> ExitCode {
         );
         return ExitCode::from(2);
     }
+    made_before_the_sandbox(input);
     announce(input);
     // argv = [sandbox-exec, -p, <profile>, --, child...]; run argv[1..] under the
     // resolved binary.
