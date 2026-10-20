@@ -243,6 +243,19 @@ the jail follows the host when the network changes. Elsewhere
 (systemd-resolved, NetworkManager) a jail keeps the resolver file it started
 with until the agent is restarted.
 
+Where a place the jail hides is a link, the jail hides the place it leads
+to: `~/.ssh`, `~/.gnupg` or `~/.aws` kept as a link into a folder the jail
+shows (`~/.ssh` a link to `.config/ssh`), a `--deny-read` path of the
+project, or InnerWarden's own folder. Every link on the way is followed. On
+Linux that place is covered wherever a folder the jail shows holds it, and
+one that is not there yet is made first, empty and 0700, so nothing the
+agent writes there reaches it; on macOS it is denied, read and write. For
+these places a link never stops the jail: where it leads outside your home,
+onto what the jail needs (the project, the guard, the agent's settings or a
+read-only path), or round in a loop, the jail leaves that place as it is and
+`innerwarden contain` says so. A profile's `hide_home` path keeps its own
+rule, above: one that leads outside the home stops the launch.
+
 An identified Linux jail keeps Claude Code's own state in the `~/.claude` it
 already shares with you. The jail's home is an empty folder of its own, so
 Claude Code's settings file, `~/.claude.json`, used to be gone at every launch

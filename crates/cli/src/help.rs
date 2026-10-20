@@ -248,7 +248,11 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
              outside the home, or over what the jail needs, stops the launch. A note\n  \
              from the host about the jail is printed as `innerwarden contain: <note>`.\n  \
              A Linux jail shows the host's resolver file read-only, so names resolve as\n  \
-             on the host. On Linux, with --identity, Claude Code's settings file is\n  \
+             on the host. Where a place the jail hides (~/.ssh, ~/.gnupg, ~/.aws, a\n  \
+             --deny-read path, InnerWarden's own folder) is a link, the place it leads\n  \
+             to is hidden too, wherever the jail shows it; where it leads outside your\n  \
+             home, or onto what the jail needs, contain leaves it and says so, and the\n  \
+             jail still starts. On Linux, with --identity, Claude Code's settings file is\n  \
              kept in ~/.claude/.claude.json between launches (your own ~/.claude.json\n  \
              is not shown), and each jail has an empty ~/.claude/sessions and\n  \
              ~/.claude/backups of its own, so two jails at once do not write the same\n  \
@@ -602,6 +606,44 @@ mod tests {
             ),
             "the CHANGELOG leaves out the link to nothing"
         );
+    }
+
+    /// The contain help, the README and the CHANGELOG say what the jail does
+    /// with a place it hides that is a link (M30-CW-link), only what the
+    /// launcher makes true: hidden where it leads, wherever the jail shows
+    /// it; left and said where it leads out of the home or onto what the
+    /// jail needs; never a stop for these places, while a `hide_home` path
+    /// keeps its own rule.
+    ///
+    /// FAILS ON REVERT: drop the sentence from the help, the README or the
+    /// CHANGELOG and the line that names it fails.
+    #[test]
+    fn the_contain_help_and_the_readme_say_what_a_hidden_link_leads_to() {
+        let flat = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let help = flat(&usage("contain", &[]).expect("contain has usage"));
+        for said in [
+            "Where a place the jail hides (~/.ssh, ~/.gnupg, ~/.aws, a --deny-read path, InnerWarden's own folder) is a link, the place it leads to is hidden too, wherever the jail shows it;",
+            "where it leads outside your home, or onto what the jail needs, contain leaves it and says so, and the jail still starts.",
+        ] {
+            assert!(help.contains(said), "contain --help lacks {said:?}: {help}");
+        }
+        let readme = flat(include_str!("../../../README.md"));
+        for said in [
+            "Where a place the jail hides is a link, the jail hides the place it leads to:",
+            "On Linux that place is covered wherever a folder the jail shows holds it, and one that is not there yet is made first, empty and 0700, so nothing the agent writes there reaches it; on macOS it is denied, read and write.",
+            "For these places a link never stops the jail: where it leads outside your home, onto what the jail needs (the project, the guard, the agent's settings or a read-only path), or round in a loop, the jail leaves that place as it is and `innerwarden contain` says so.",
+            "A profile's `hide_home` path keeps its own rule, above: one that leads outside the home stops the launch.",
+        ] {
+            assert!(readme.contains(said), "README lacks {said:?}");
+        }
+        let changelog = flat(include_str!("../../../CHANGELOG.md"));
+        for said in [
+            "Each is now hidden where it really is, at every place the jail shows it, in every jail, on Linux and macOS.",
+            "A link never moves a mask onto what the jail needs or onto a system file: such a place is left as it is, and `innerwarden contain` says so.",
+            "A jail starts where InnerWarden's own folder, or the launcher's records folder, is a link.",
+        ] {
+            assert!(changelog.contains(said), "CHANGELOG lacks {said:?}");
+        }
     }
 
     /// A wrapped child's flags are not ours. `contain -- claude --help` must run

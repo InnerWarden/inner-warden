@@ -458,6 +458,286 @@ pub fn plan_claude_folders(
     (covered, left)
 }
 
+/// A place the jail hides by default (a dotdir it never shows,
+/// InnerWarden's own folder) or by `deny_read` (a path of the project), as
+/// the launcher found it on the host ([`plan_linked_places`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HiddenPlace {
+    /// As the jail names it: `~/.ssh`, `<project>/.env`.
+    pub nominal: PathBuf,
+    /// Where it leads on the host, every link on the way followed and the
+    /// rest as written where nothing is there yet: where a file made
+    /// through it would land. `None` where its links loop.
+    pub leads_to: Option<PathBuf>,
+    /// Something is there.
+    pub there: bool,
+    /// What is there is a folder (a place not there yet is made as one).
+    pub is_dir: bool,
+}
+
+/// What the jail does with the places it hides that a link leads
+/// somewhere else ([`plan_linked_places`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LinkedPlan {
+    /// Linux: each other place the jail shows one of them, as the jail sees
+    /// it, covered like the place as named.
+    pub masks: Vec<DenyPath>,
+    /// macOS: where each such place leads, denied, read and write, like the
+    /// place as named (the sandbox matches the path a link leads to).
+    pub denies: Vec<PathBuf>,
+    /// Linux: each host place not there yet, with the places the jail shows
+    /// it at (in `masks`). The real run makes it first, empty and 0700, as
+    /// a folder of the person's; where it cannot be made, nothing can be
+    /// there, and those masks are dropped, so the jail never fails to start
+    /// over it.
+    pub missing: Vec<(PathBuf, Vec<PathBuf>)>,
+    /// What the launcher says of each place it leaves as it is.
+    pub left: Vec<String>,
+}
+
+/// The places of the person's own: the home, and the host folder behind
+/// each folder the jail shows read-write (a home folder that is a link off
+/// the home, the project, the worktree's folders). The jail hides a place a
+/// link leads to only in them; a link out of them leads to the system (or
+/// to a disk the person keeps elsewhere), where a mask would change what
+/// the jail's programs run on.
+fn own_places<'a>(
+    home: &'a Path,
+    shown: &'a [(PathBuf, PathBuf)],
+    read_only: &'a [PathBuf],
+) -> impl Iterator<Item = &'a Path> + 'a {
+    std::iter::once(home).chain(
+        shown
+            .iter()
+            .filter(|(jail, _)| !read_only.contains(jail))
+            .map(|(_, host)| host.as_path()),
+    )
+}
+
+/// PURE. Whether `place` is in one of the person's own places
+/// ([`own_places`]).
+pub fn in_own_places(
+    place: &Path,
+    home: &Path,
+    shown: &[(PathBuf, PathBuf)],
+    read_only: &[PathBuf],
+) -> bool {
+    own_places(home, shown, read_only).any(|own| place.starts_with(own))
+}
+
+/// PURE. The folders a jail shows read-only, as the jail sees them: the
+/// home's dotfiles ([`DOTFILE_RO`]) and the profile's read-only paths. A
+/// place not there yet is never covered through them (bwrap could not make
+/// the mount point there, and nothing can be made there from the jail).
+pub fn read_only_shown(input: &ContainArgs, home: &Path) -> Vec<PathBuf> {
+    DOTFILE_RO
+        .iter()
+        .map(|name| home.join(name))
+        .chain(input.extra_ro.iter().cloned())
+        .collect()
+}
+
+/// Said of a hidden place that leads outside the person's own places.
+fn left_outside(nominal: &Path, leads_to: &Path) -> String {
+    format!(
+        "{} leads outside your home, to {}: the jail does not hide that place",
+        nominal.display(),
+        leads_to.display()
+    )
+}
+
+/// Said of a hidden place that leads onto what the jail needs.
+fn left_needed(nominal: &Path, leads_to: &Path) -> String {
+    format!(
+        "{} leads to {}, where the jail keeps what it needs (the project, the guard, \
+         the agent's settings or a read-only path): the jail does not hide it there",
+        nominal.display(),
+        leads_to.display()
+    )
+}
+
+/// Said of a hidden place whose links loop.
+fn left_loop(nominal: &Path) -> String {
+    format!(
+        "{} is a link that loops: the jail hides nothing through it",
+        nominal.display()
+    )
+}
+
+/// PURE. The places a jail hides, `places`, at every other place a Linux
+/// jail shows where each really is on the host, and where each leads for
+/// the macOS sandbox.
+///
+/// A place the jail never shows can be a link into a folder it shows
+/// (`~/.ssh` a link to `.config/ssh`, `~/.config` bound): the jail covers
+/// `~/.ssh` as named, and showed the key through `~/.config/ssh`. Each
+/// place is taken where it leads, every link on the way followed (any
+/// number, `leads_to`), and covered at each place a folder the jail shows
+/// holds it (`shown`, [`shown_host_folders`]), at any depth, also where
+/// that folder is itself a link to a folder above the place. Besides the
+/// place as named, and those in `covered`, which are covered already.
+///
+/// Never a refusal: a link a person keeps never stops the jail. A place
+/// that leads outside the person's own places ([`own_places`]) is left as
+/// it is, and so is one that leads onto what the jail needs (`needed`: the
+/// project, the guard, the agent's settings, a read-only path), where a
+/// mask would empty the agent's work or its hook; each is said
+/// (`LinkedPlan::left`). A place not there yet is covered only where the
+/// jail shows it read-write, and made first ([`LinkedPlan::missing`]).
+///
+/// A place with no link on the way and no folder shown above it gives
+/// nothing: in every common layout the jail is the one it was.
+pub fn plan_linked_places(
+    places: &[HiddenPlace],
+    home: &Path,
+    shown: &[(PathBuf, PathBuf)],
+    read_only: &[PathBuf],
+    needed: &[PathBuf],
+    covered: &[PathBuf],
+) -> LinkedPlan {
+    let mut plan = LinkedPlan::default();
+    let holds_needed = |place: &Path| needed.iter().any(|need| need.starts_with(place));
+    for place in places {
+        let Some(leads_to) = &place.leads_to else {
+            plan.left.push(left_loop(&place.nominal));
+            continue;
+        };
+        let linked = *leads_to != place.nominal;
+        if linked && !in_own_places(leads_to, home, shown, read_only) {
+            plan.left.push(left_outside(&place.nominal, leads_to));
+            continue;
+        }
+        let mut needs = linked && holds_needed(leads_to);
+        if linked && !needs && !plan.denies.contains(leads_to) {
+            plan.denies.push(leads_to.clone());
+        }
+        let mut views: Vec<PathBuf> = Vec::new();
+        for (jail, host) in shown {
+            let Ok(rest) = leads_to.strip_prefix(host) else {
+                continue;
+            };
+            let view = jail.join(rest);
+            if view == place.nominal
+                || covered.contains(&view)
+                || views.contains(&view)
+                || plan.masks.iter().any(|mask| mask.abs == view)
+                || (!place.there && read_only.contains(jail))
+            {
+                continue;
+            }
+            if linked && holds_needed(&view) {
+                needs = true;
+                continue;
+            }
+            views.push(view);
+        }
+        if needs {
+            plan.left.push(left_needed(&place.nominal, leads_to));
+        }
+        if !place.there && !views.is_empty() {
+            plan.missing.push((leads_to.clone(), views.clone()));
+        }
+        plan.masks.extend(views.into_iter().map(|abs| DenyPath {
+            abs,
+            is_dir: place.is_dir || !place.there,
+        }));
+    }
+    plan
+}
+
+/// PURE. The project paths `deny_read` names (`found`), as the jail masks
+/// them: each where it leads (`DenyPath::abs`, as before), and at every
+/// other place a Linux jail shows it ([`plan_linked_places`]). One that a
+/// link leads outside the person's own places, or onto what the jail
+/// needs, is left as it is and said: a link in the project (which the
+/// agent writes) must never move the mask onto the system or the agent's
+/// hook. One with no link on the way is masked where it is, as it always
+/// was. A path that is not there is not masked.
+pub fn plan_denied_paths(
+    found: &[HiddenPlace],
+    home: &Path,
+    shown: &[(PathBuf, PathBuf)],
+    read_only: &[PathBuf],
+    needed: &[PathBuf],
+) -> (Vec<DenyPath>, LinkedPlan) {
+    let mut masks: Vec<DenyPath> = Vec::new();
+    let mut kept: Vec<HiddenPlace> = Vec::new();
+    let mut left: Vec<String> = Vec::new();
+    for place in found.iter().filter(|place| place.there) {
+        let Some(leads_to) = &place.leads_to else {
+            continue;
+        };
+        if *leads_to != place.nominal {
+            if !in_own_places(leads_to, home, shown, read_only) {
+                left.push(left_outside(&place.nominal, leads_to));
+                continue;
+            }
+            if needed.iter().any(|need| need.starts_with(leads_to)) {
+                left.push(left_needed(&place.nominal, leads_to));
+                continue;
+            }
+        }
+        if masks.iter().any(|mask| mask.abs == *leads_to) {
+            continue;
+        }
+        masks.push(DenyPath {
+            abs: leads_to.clone(),
+            is_dir: place.is_dir,
+        });
+        kept.push(place.clone());
+    }
+    let covered: Vec<PathBuf> = masks.iter().map(|mask| mask.abs.clone()).collect();
+    let mut linked = plan_linked_places(&kept, home, shown, read_only, needed, &covered);
+    left.append(&mut linked.left);
+    linked.left = left;
+    (masks, linked)
+}
+
+/// PURE. The home paths a jail never shows, each OS's own: on Linux the
+/// dotdirs it never binds ([`DOTDIR_DENY`]); on macOS those its sandbox
+/// denies ([`MACOS_DOTDIR_DENY`], [`MACOS_HOME_DENY`]).
+pub fn never_shown_home_paths(home: &Path, macos: bool) -> Vec<PathBuf> {
+    let names: Vec<&str> = if macos {
+        MACOS_DOTDIR_DENY
+            .iter()
+            .chain(MACOS_HOME_DENY)
+            .copied()
+            .collect()
+    } else {
+        DOTDIR_DENY.to_vec()
+    };
+    names.into_iter().map(|name| home.join(name)).collect()
+}
+
+/// PURE. What the jail needs to see as it is, which no mask laid because
+/// of a link may cover: the project, the worktree's folders, the read-only
+/// paths, the guard, and the agent's settings that carry its hook, each as
+/// named and as it resolves (`resolved`, the launcher's).
+pub fn jail_needs(
+    input: &ContainArgs,
+    home: &Path,
+    worktree: Option<&Worktree>,
+    iw_binary: &Path,
+    resolved: impl Fn(&Path) -> PathBuf,
+) -> Vec<PathBuf> {
+    let mut needed = vec![input.project.clone()];
+    if let Some(worktree) = worktree {
+        needed.push(worktree.git_dir.clone());
+        needed.push(worktree.common_dir.clone());
+    }
+    needed.extend(input.extra_ro.iter().cloned());
+    needed.push(iw_binary.to_path_buf());
+    needed.extend(AGENT_SETTINGS.iter().map(|name| home.join(name)));
+    let named = needed.clone();
+    for path in named {
+        let real = resolved(&path);
+        if !needed.contains(&real) {
+            needed.push(real);
+        }
+    }
+    needed
+}
+
 /// Where the home folder a hidden path is in leads on the host, when the
 /// jail binds that folder read-write ([`writable_home_dirs`]) and shows it
 /// (`shown`, [`shown_host_folders`]): what is below that place is what the
@@ -515,7 +795,6 @@ pub fn shown_host_folders(
 /// The home's folders a jail binds read-write, where a hidden path that is
 /// not there yet is made (empty, 0700) before the jail starts, so what a
 /// host program makes there later is under the mask too.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn writable_home_dirs() -> &'static [&'static str] {
     DOTDIR_RW
 }
@@ -545,6 +824,33 @@ pub struct JailInputs {
     /// named or as it resolves (every common layout), and on macOS, where
     /// the sandbox matches the resolved path.
     pub iw_config_shown: Vec<PathBuf>,
+    /// The secret dir as named is itself a link (a dotfiles manager's
+    /// `~/.config/innerwarden`): `iw_config_real` is where it leads, and on
+    /// Linux it is covered only where the jail shows that place
+    /// (`iw_config_shown`, [`plan_linked_places`]), never as named. bwrap
+    /// mounts through a link in the jail's root, where it leads nowhere,
+    /// and such a jail never started.
+    pub iw_config_link: bool,
+    /// That link leads outside the person's own places ([`in_own_places`]):
+    /// the place is neither covered nor denied there, and the launcher says
+    /// so ([`JailInputs::left`]). A project or path that holds it is still
+    /// refused.
+    pub iw_config_outside: bool,
+    /// Linux: every other place the jail shows a place it hides that a link
+    /// leads somewhere else, a dotdir it never shows or a `deny_read` path
+    /// ([`plan_linked_places`]), each covered like the place itself, after
+    /// every other mask. Empty in every common layout.
+    pub linked_masks: Vec<DenyPath>,
+    /// Linux: each of those places not there yet, with its masks, made by
+    /// the real run before the jail starts ([`LinkedPlan::missing`]).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub linked_missing: Vec<(PathBuf, Vec<PathBuf>)>,
+    /// macOS: where each dotdir the sandbox denies leads, when a link leads
+    /// it somewhere else, denied read and write like the dotdir itself.
+    pub linked_denies: Vec<PathBuf>,
+    /// What the launcher says of each place it hides and leaves as it is
+    /// (a link out of the home, onto what the jail needs, or a loop).
+    pub left: Vec<String>,
     /// The project secrets to mask (glob-expanded + statted by the I/O layer).
     pub deny_paths: Vec<DenyPath>,
     /// The descriptor bwrap writes its start-up facts to (`--info-fd`). `None`
@@ -705,6 +1011,8 @@ pub struct ClaudeState {
 }
 /// Dotdirs that must stay INVISIBLE (never re-bound → absent under the HOME tmpfs).
 const DOTDIR_DENY: &[&str] = &[".ssh", ".gnupg", ".aws", ".mozilla", ".thunderbird"];
+/// The dotdirs the macOS sandbox denies.
+const MACOS_DOTDIR_DENY: &[&str] = &[".ssh", ".aws", ".gnupg"];
 const MACOS_HOME_DENY: &[&str] = &["Library/Mail", "Library/Messages", "Library/Safari"];
 
 fn paths_overlap(left: &Path, right: &Path) -> bool {
@@ -718,6 +1026,22 @@ fn protected_host_paths(input: &JailInputs) -> Vec<PathBuf> {
     paths.extend(MACOS_HOME_DENY.iter().map(|name| input.home.join(name)));
     paths.sort();
     paths.dedup();
+    paths
+}
+
+/// [`protected_host_paths`] as a Linux jail covers them: all of them, but
+/// InnerWarden's folder as named where it is a link, and where it leads
+/// when that is outside the person's own places ([`JailInputs::iw_config_link`]).
+/// Each is still refused to a writable or read-only bind.
+fn masked_host_paths(input: &JailInputs) -> Vec<PathBuf> {
+    let mut paths = protected_host_paths(input);
+    if input.iw_config_link {
+        let named = input.iw_config_dir();
+        paths.retain(|path| {
+            input.iw_config_shown.contains(path)
+                || (*path != named && *path != input.iw_config_real)
+        });
+    }
     paths
 }
 
@@ -875,7 +1199,8 @@ pub const CAP_DROP_ALL: [&str; 2] = ["--cap-drop", "ALL"];
 /// last-wins): system RO → dev/proc/tmpfs → HOME tmpfs → dotdir re-binds → shadow
 /// innerwarden → Claude Code's settings file (`--identity` only) → binary binds →
 /// project (late) → worktree → Claude Code's folders of its runs
-/// (`--identity` only) → nested secret masks →
+/// (`--identity` only) → nested secret masks → every other place the jail
+/// shows a hidden place a link leads somewhere else (`linked_masks`) →
 /// the host's key and the launch record (`--identity` only) → namespaces and the
 /// seccomp filter → child. `DOTDIR_DENY`
 /// entries are never emitted, so they vanish under the HOME tmpfs.
@@ -936,11 +1261,16 @@ pub fn build_linux_jail(input: &JailInputs) -> Result<LinuxJailPlan, ContainErro
     // (last-wins). The 0600 llm-key is now absent inside the jail. Shadow BOTH the
     // nominal path and its symlink-resolved real path (a symlinked ~/.config would
     // otherwise leave the real dir reachable).
+    // Where the dir as named is a link (`iw_config_link`), neither: a mount
+    // on it would go through the link in bwrap's root and abort the jail.
+    // Where it leads is covered at each place the jail shows it, below.
     let iw_cfg = input.iw_config_dir().to_string_lossy().to_string();
-    push(&["--tmpfs", &iw_cfg]);
     let iw_cfg_real = input.iw_config_real.to_string_lossy().to_string();
-    if iw_cfg_real != iw_cfg {
-        push(&["--tmpfs", &iw_cfg_real]);
+    if !input.iw_config_link {
+        push(&["--tmpfs", &iw_cfg]);
+        if iw_cfg_real != iw_cfg {
+            push(&["--tmpfs", &iw_cfg_real]);
+        }
     }
     // And at every other place a home folder the jail binds shows it
     // (`~/.config` a link into a `~/.cache` that leads off the home).
@@ -1040,7 +1370,7 @@ pub fn build_linux_jail(input: &JailInputs) -> Result<LinuxJailPlan, ContainErro
     // so re-apply every protected mask after them. Validation above should make
     // overlap impossible; this final last-wins layer keeps secrets hidden if a
     // future writable bind is added without the corresponding validation.
-    for path in protected_host_paths(input) {
+    for path in masked_host_paths(input) {
         let dest = path.to_string_lossy().to_string();
         push(&["--tmpfs", &dest]);
     }
@@ -1075,6 +1405,20 @@ pub fn build_linux_jail(input: &JailInputs) -> Result<LinuxJailPlan, ContainErro
     // over a file makes bwrap abort with ENOTDIR, which would break every project
     // that has a real `.env`. ---
     for d in &input.deny_paths {
+        let dest = d.abs.to_string_lossy().to_string();
+        if d.is_dir {
+            push(&["--tmpfs", &dest]);
+        } else {
+            push(&["--ro-bind", "/dev/null", &dest]);
+        }
+    }
+
+    // --- every other place the jail shows a place it hides that a link
+    // leads somewhere else: a dotdir it never shows (`~/.ssh` a link to
+    // `.config/ssh`, shown by the `.config` bind) or a `deny_read` path.
+    // Covered like the place itself, after every other mount that can show
+    // it. Empty in every common layout. ---
+    for d in &input.linked_masks {
         let dest = d.abs.to_string_lossy().to_string();
         if d.is_dir {
             push(&["--tmpfs", &dest]);
@@ -1264,7 +1608,7 @@ pub fn build_macos_profile(input: &JailInputs) -> Result<MacosJailPlan, ContainE
 
     // --- file-read: allow all, deny secrets LAST ---
     p.push_str("(allow file-read*)\n");
-    for d in [".ssh", ".aws", ".gnupg"] {
+    for d in MACOS_DOTDIR_DENY {
         p.push_str(&format!(
             "(deny file-read* (subpath \"{}/{}\"))\n",
             e(&home),
@@ -1282,20 +1626,27 @@ pub fn build_macos_profile(input: &JailInputs) -> Result<MacosJailPlan, ContainE
     // nominal and the symlink-RESOLVED real path (sandbox-exec matches the resolved
     // path, so a symlinked ~/.config would otherwise leave the key readable).
     p.push_str(&format!("(deny file-read* (subpath \"{}\"))\n", e(&iw_cfg)));
+    // Where it leads, unless a link leads it outside the person's own
+    // places (`iw_config_outside`, said by the launcher).
     let iw_cfg_real = input.iw_config_real.to_string_lossy().to_string();
-    if iw_cfg_real != iw_cfg {
+    let deny_iw_real = iw_cfg_real != iw_cfg && !input.iw_config_outside;
+    if deny_iw_real {
         p.push_str(&format!(
             "(deny file-read* (subpath \"{}\"))\n",
             e(&iw_cfg_real)
         ));
     }
     // project secrets (glob-expanded + statted by the I/O layer into deny_paths),
-    // and the home paths a jail profile hides, as named and as they resolve:
+    // the home paths a jail profile hides, as named and as they resolve, and
+    // where a link leads a dotdir the sandbox denies (`~/.ssh` a link to
+    // `.config/ssh`: the sandbox matches the place a link leads to, so the
+    // deny of `~/.ssh` alone left `~/.config/ssh` readable and writable):
     for path in input
         .deny_paths
         .iter()
         .map(|d| d.abs.as_path())
         .chain(input.hide_denies.iter().map(PathBuf::as_path))
+        .chain(input.linked_denies.iter().map(PathBuf::as_path))
     {
         p.push_str(&format!(
             "(deny file-read* (subpath \"{}\"))\n",
@@ -1363,7 +1714,7 @@ pub fn build_macos_profile(input: &JailInputs) -> Result<MacosJailPlan, ContainE
         "(deny file-write* (subpath \"{}\"))\n",
         e(&iw_cfg)
     ));
-    if iw_cfg_real != iw_cfg {
+    if deny_iw_real {
         p.push_str(&format!(
             "(deny file-write* (subpath \"{}\"))\n",
             e(&iw_cfg_real)
@@ -1374,6 +1725,7 @@ pub fn build_macos_profile(input: &JailInputs) -> Result<MacosJailPlan, ContainE
         .iter()
         .map(|d| d.abs.as_path())
         .chain(input.hide_denies.iter().map(PathBuf::as_path))
+        .chain(input.linked_denies.iter().map(PathBuf::as_path))
     {
         p.push_str(&format!(
             "(deny file-write* (subpath \"{}\"))\n",
@@ -3158,6 +3510,12 @@ mod tests {
             ],
             iw_config_real: PathBuf::from("/home/dev/.config/innerwarden"),
             iw_config_shown: vec![],
+            iw_config_link: false,
+            iw_config_outside: false,
+            linked_masks: vec![],
+            linked_missing: vec![],
+            linked_denies: vec![],
+            left: vec![],
             deny_paths: vec![
                 // a resolved project .env FILE (masked with /dev/null, not tmpfs)
                 DenyPath {
@@ -7498,6 +7856,540 @@ mod tests {
                 ("IW_GUARD_SESSION", "contain"),
             ]
             .map(|(k, v)| (k.to_string(), v.to_string()))
+        );
+    }
+
+    /// A place the jail hides, as found on the host: `leads_to` where every
+    /// link on the way leads (`None`: they loop).
+    fn place(nominal: &str, leads_to: Option<&str>, there: bool, is_dir: bool) -> HiddenPlace {
+        HiddenPlace {
+            nominal: PathBuf::from(nominal),
+            leads_to: leads_to.map(PathBuf::from),
+            there,
+            is_dir,
+        }
+    }
+
+    fn mask(abs: &str, is_dir: bool) -> DenyPath {
+        DenyPath {
+            abs: PathBuf::from(abs),
+            is_dir,
+        }
+    }
+
+    /// The host folders `input` shows, `real` resolving each, with what the
+    /// planner needs beside them: the folders shown read-only and what the
+    /// jail needs.
+    fn linked_facts(
+        input: &JailInputs,
+        real: impl Fn(&Path) -> PathBuf,
+    ) -> (Vec<(PathBuf, PathBuf)>, Vec<PathBuf>, Vec<PathBuf>) {
+        let shown = shown_host_folders(
+            &input.args,
+            &input.home,
+            input.worktree.as_ref(),
+            &input.existing_paths,
+            real,
+        );
+        let read_only = read_only_shown(&input.args, &input.home);
+        let needed = jail_needs(
+            &input.args,
+            &input.home,
+            input.worktree.as_ref(),
+            &input.iw_binary,
+            Path::to_path_buf,
+        );
+        (shown, read_only, needed)
+    }
+
+    /// M30-CW-link: a dotdir the jail never shows that is a link into a
+    /// folder it shows (`~/.ssh` a link to `.config/ssh`, with `~/.config`
+    /// bound) showed the key through that folder: the jail covered `~/.ssh`
+    /// only as named. Each such place is covered where the jail shows it, a
+    /// folder by an empty tmpfs and a file by /dev/null, after every
+    /// writable bind and every other mask; macOS denies where it leads,
+    /// read and write (the sandbox matches the place a link leads to, and
+    /// `~/.config` is writable there).
+    ///
+    /// FAILS ON REVERT: drop the `linked_masks` loop from
+    /// `build_linux_jail` and `~/.config/ssh` is not covered; drop
+    /// `linked_denies` from the macOS profile and it is not denied.
+    #[test]
+    fn a_dotdir_linked_into_a_folder_the_jail_shows_is_covered_there() {
+        let mut input = inputs(&["claude", "--print"]);
+        let (shown, read_only, needed) = linked_facts(&input, Path::to_path_buf);
+        let plan = plan_linked_places(
+            &[
+                place("/home/dev/.ssh", Some("/home/dev/.config/ssh"), true, true),
+                place(
+                    "/home/dev/.gnupg",
+                    Some("/home/dev/.cache/keys/gnupg"),
+                    true,
+                    true,
+                ),
+                place(
+                    "/home/dev/.aws",
+                    Some("/home/dev/.config/aws-credentials"),
+                    true,
+                    false,
+                ),
+            ],
+            &input.home,
+            &shown,
+            &read_only,
+            &needed,
+            &[],
+        );
+        assert_eq!(
+            plan.masks,
+            [
+                mask("/home/dev/.config/ssh", true),
+                mask("/home/dev/.cache/keys/gnupg", true),
+                mask("/home/dev/.config/aws-credentials", false),
+            ]
+        );
+        assert_eq!(
+            plan.denies,
+            [
+                "/home/dev/.config/ssh",
+                "/home/dev/.cache/keys/gnupg",
+                "/home/dev/.config/aws-credentials",
+            ]
+            .map(PathBuf::from)
+        );
+        assert!(plan.left.is_empty() && plan.missing.is_empty(), "{plan:?}");
+        input.linked_masks = plan.masks;
+        input.linked_denies = plan.denies;
+        let a = build_linux_jail(&input).unwrap().bwrap_args;
+        let ssh = a
+            .windows(2)
+            .position(|w| w[0] == "--tmpfs" && w[1] == "/home/dev/.config/ssh")
+            .expect("~/.config/ssh under an empty tmpfs");
+        let aws = a
+            .windows(3)
+            .position(|w| {
+                w[0] == "--ro-bind"
+                    && w[1] == "/dev/null"
+                    && w[2] == "/home/dev/.config/aws-credentials"
+            })
+            .expect("the credentials file under /dev/null");
+        let last_writable = a.windows(2).rposition(|w| w[0] == "--bind").unwrap();
+        let last_deny = a
+            .windows(2)
+            .rposition(|w| w[1] == "/home/dev/proj/secrets")
+            .unwrap();
+        assert!(ssh > last_writable && ssh > last_deny && aws > last_deny);
+        let profile = build_macos_profile(&input).unwrap().profile;
+        for path in [
+            "/home/dev/.config/ssh",
+            "/home/dev/.cache/keys/gnupg",
+            "/home/dev/.config/aws-credentials",
+        ] {
+            for access in ["read", "write"] {
+                let rule = format!("(deny file-{access}* (subpath \"{path}\"))");
+                assert!(profile.contains(&rule), "{rule}");
+            }
+        }
+    }
+
+    /// A folder the jail shows that is itself a link to a folder above a
+    /// place it hides shows that place below it: `~/.cache` a link to the
+    /// home's `dots` folder, where `~/.ssh` leads, shows the key at
+    /// `~/.cache/ssh`; `~/.cache` a link to the home shows an ordinary
+    /// `~/.ssh` folder at `~/.cache/.ssh`. Each is covered there; the
+    /// ordinary folder needs no deny on macOS beyond the one as named.
+    ///
+    /// FAILS ON REVERT: take only the places a folder shows under its own
+    /// name (skip each shown folder whose host path is not its name) and
+    /// neither is covered.
+    #[test]
+    fn a_shown_folder_that_leads_above_a_hidden_place_shows_it_and_it_is_covered() {
+        let input = inputs(&["claude", "--print"]);
+        for (cache, ssh, view, deny) in [
+            (
+                "/home/dev/dots",
+                Some("/home/dev/dots/ssh"),
+                "/home/dev/.cache/ssh",
+                true,
+            ),
+            ("/home/dev", None, "/home/dev/.cache/.ssh", false),
+        ] {
+            let (shown, read_only, needed) = linked_facts(&input, |path| {
+                if path == Path::new("/home/dev/.cache") {
+                    PathBuf::from(cache)
+                } else {
+                    path.to_path_buf()
+                }
+            });
+            let plan = plan_linked_places(
+                &[place(
+                    "/home/dev/.ssh",
+                    Some(ssh.unwrap_or("/home/dev/.ssh")),
+                    true,
+                    true,
+                )],
+                &input.home,
+                &shown,
+                &read_only,
+                &needed,
+                &[],
+            );
+            assert_eq!(plan.masks, [mask(view, true)], "{cache}");
+            assert_eq!(plan.denies.len(), usize::from(deny), "{cache}");
+            assert!(plan.left.is_empty(), "{cache}");
+        }
+    }
+
+    /// Never a refusal, and never a mask laid by a link onto the system or
+    /// onto what the jail needs: a dotdir that leads outside the person's
+    /// own places (the home, and the folders behind what the jail shows
+    /// read-write) is left as it is, as is one that leads onto the agent's
+    /// settings, the project or the folder that holds the guard, and one
+    /// whose links loop; each is said, and the jail starts. A project
+    /// outside the home is the person's own: a dotdir that leads into it is
+    /// covered there.
+    ///
+    /// FAILS ON REVERT: drop the own-places check from
+    /// `plan_linked_places` and macOS denies `/srv/keys/ssh`, a place
+    /// outside the home, unsaid; drop the needed check and the jail's
+    /// `~/.claude` (its hook) and the project are covered.
+    #[test]
+    fn a_hidden_place_a_link_leads_out_of_the_home_or_onto_what_the_jail_needs_is_left_and_said() {
+        let input = inputs(&["claude", "--print"]);
+        let (shown, read_only, needed) = linked_facts(&input, Path::to_path_buf);
+        let plan = plan_linked_places(
+            &[
+                place("/home/dev/.ssh", Some("/srv/keys/ssh"), true, true),
+                place("/home/dev/.gnupg", Some("/home/dev/.claude"), true, true),
+                place("/home/dev/.aws", Some("/home/dev/proj"), true, true),
+                place("/home/dev/.mozilla", Some("/home/dev/.local"), true, true),
+                place("/home/dev/.thunderbird", None, false, false),
+            ],
+            &input.home,
+            &shown,
+            &read_only,
+            &needed,
+            &[],
+        );
+        assert!(plan.masks.is_empty(), "{:?}", plan.masks);
+        assert!(plan.denies.is_empty(), "{:?}", plan.denies);
+        assert_eq!(
+            plan.left,
+            [
+                "/home/dev/.ssh leads outside your home, to /srv/keys/ssh: the jail does not hide that place".to_string(),
+                left_needed(Path::new("/home/dev/.gnupg"), Path::new("/home/dev/.claude")),
+                left_needed(Path::new("/home/dev/.aws"), Path::new("/home/dev/proj")),
+                left_needed(Path::new("/home/dev/.mozilla"), Path::new("/home/dev/.local")),
+                "/home/dev/.thunderbird is a link that loops: the jail hides nothing through it".to_string(),
+            ]
+        );
+        assert!(plan.left[1].contains("where the jail keeps what it needs"));
+        // A project outside the home is the person's: covered there.
+        let mut elsewhere = input.clone();
+        elsewhere.args.project = PathBuf::from("/srv/work");
+        let (shown, read_only, needed) = linked_facts(&elsewhere, Path::to_path_buf);
+        let plan = plan_linked_places(
+            &[place("/home/dev/.ssh", Some("/srv/work/keys"), true, true)],
+            &elsewhere.home,
+            &shown,
+            &read_only,
+            &needed,
+            &[],
+        );
+        assert_eq!(plan.masks, [mask("/srv/work/keys", true)]);
+        assert!(plan.left.is_empty());
+    }
+
+    /// A link that leads to nothing yet (`~/.ssh` a link to `.config/ssh`,
+    /// not made): what the jail's programs make through the folder it shows
+    /// would land where the host's `~/.ssh` leads (a key the host's `sshd`
+    /// trusts). The place is covered where the jail shows it read-write,
+    /// and the real run makes it first ([`LinkedPlan::missing`]); never
+    /// through a folder it shows read-only, where bwrap could not make the
+    /// mount point and nothing can be made from the jail.
+    ///
+    /// FAILS ON REVERT: skip a place that is not there in
+    /// `plan_linked_places` and nothing covers `~/.config/ssh`; cover it
+    /// through the read-only folder too and the second mask is laid where
+    /// bwrap cannot make it.
+    #[test]
+    fn a_place_a_link_leads_to_that_is_not_there_yet_is_covered_where_the_jail_writes() {
+        let mut input = inputs(&["claude", "--print"]);
+        input.args.extra_ro = vec![PathBuf::from("/data/ro")];
+        let (shown, read_only, needed) = linked_facts(&input, |path| {
+            if path == Path::new("/home/dev/.cache") {
+                PathBuf::from("/data/ro")
+            } else {
+                path.to_path_buf()
+            }
+        });
+        let plan = plan_linked_places(
+            &[
+                place(
+                    "/home/dev/.ssh",
+                    Some("/home/dev/.config/ssh"),
+                    false,
+                    false,
+                ),
+                place("/home/dev/.gnupg", Some("/data/ro/gnupg"), false, false),
+            ],
+            &input.home,
+            &shown,
+            &read_only,
+            &needed,
+            &[],
+        );
+        assert_eq!(
+            plan.masks,
+            [
+                mask("/home/dev/.config/ssh", true),
+                mask("/home/dev/.cache/gnupg", true)
+            ]
+        );
+        assert_eq!(
+            plan.missing,
+            [
+                (
+                    PathBuf::from("/home/dev/.config/ssh"),
+                    vec![PathBuf::from("/home/dev/.config/ssh")]
+                ),
+                (
+                    PathBuf::from("/data/ro/gnupg"),
+                    vec![PathBuf::from("/home/dev/.cache/gnupg")]
+                ),
+            ]
+        );
+    }
+
+    /// A `deny_read` path is masked where it leads, as before, and at every
+    /// other place the jail shows it; one that a link in the project (which
+    /// the agent writes) leads outside the person's own places, onto the
+    /// agent's settings or onto the project itself, is left and said: such
+    /// a link would otherwise empty the jail's `/etc/hostname`, its hook or
+    /// its work at the next launch. One with no link on the way is masked
+    /// where it is, as it always was; one that is not there is not masked.
+    ///
+    /// FAILS ON REVERT: drop the own-places or the needed check from
+    /// `plan_denied_paths` and `/etc/hostname`, `~/.claude` or the project
+    /// is masked.
+    #[test]
+    fn a_deny_read_path_is_masked_where_it_leads_and_never_moved_onto_the_system_or_the_hook() {
+        let input = inputs(&["claude", "--print"]);
+        let (shown, read_only, needed) = linked_facts(&input, |path| {
+            if path == Path::new("/home/dev/.cache") {
+                PathBuf::from("/home/dev")
+            } else {
+                path.to_path_buf()
+            }
+        });
+        let found = [
+            place(
+                "/home/dev/proj/.env",
+                Some("/home/dev/proj/.env"),
+                true,
+                false,
+            ),
+            place(
+                "/home/dev/proj/secrets",
+                Some("/home/dev/.config/app"),
+                true,
+                true,
+            ),
+            place(
+                "/home/dev/proj/.env.local",
+                Some("/etc/hostname"),
+                true,
+                false,
+            ),
+            place(
+                "/home/dev/proj/.env.prod",
+                Some("/home/dev/.claude"),
+                true,
+                true,
+            ),
+            place(
+                "/home/dev/proj/.env.self",
+                Some("/home/dev/proj"),
+                true,
+                true,
+            ),
+            place(
+                "/home/dev/proj/.env.gone",
+                Some("/home/dev/gone"),
+                false,
+                false,
+            ),
+        ];
+        let (masks, linked) = plan_denied_paths(&found, &input.home, &shown, &read_only, &needed);
+        assert_eq!(
+            masks,
+            [
+                mask("/home/dev/proj/.env", false),
+                mask("/home/dev/.config/app", true)
+            ]
+        );
+        // `~/.cache` leads to the home: both are shown there too.
+        assert_eq!(
+            linked.masks,
+            [
+                mask("/home/dev/.cache/proj/.env", false),
+                mask("/home/dev/.cache/.config/app", true)
+            ]
+        );
+        assert_eq!(linked.left.len(), 3, "{:?}", linked.left);
+        assert!(linked.left[0].contains("to /etc/hostname: the jail does not hide that place"));
+        assert!(linked.left[1].contains("leads to /home/dev/.claude, where the jail keeps"));
+        assert!(linked.left[2].contains("leads to /home/dev/proj, where the jail keeps"));
+    }
+
+    /// InnerWarden's folder that is itself a link (a dotfiles manager's
+    /// `~/.config/innerwarden`): bwrap mounts through a link in its own
+    /// root, where it leads nowhere, and every jail aborted ("Can't mount
+    /// tmpfs on .../.config/innerwarden"). It is covered where the jail
+    /// shows the place it leads to, never as named; a project there is
+    /// still refused. Where it leads outside the home it is neither covered
+    /// nor denied there (said by the launcher); macOS still denies it as
+    /// named, which closes the way through the link.
+    ///
+    /// FAILS ON REVERT: mount the folder as named in `build_linux_jail` or
+    /// keep it in `masked_host_paths`, and the argv mounts on the link.
+    #[test]
+    fn innerwardens_folder_that_is_a_link_is_covered_where_it_leads_never_as_named() {
+        let named = "/home/dev/.config/innerwarden";
+        let mut input = inputs(&["claude", "--print"]);
+        input.iw_config_link = true;
+        input.iw_config_real = PathBuf::from("/home/dev/.cache/iw");
+        input.iw_config_shown = vec![PathBuf::from("/home/dev/.cache/iw")];
+        let a = build_linux_jail(&input).unwrap().bwrap_args;
+        assert!(!a.iter().any(|w| w == named), "mounted on the link: {a:?}");
+        let covered = a
+            .windows(2)
+            .filter(|w| w[0] == "--tmpfs" && w[1] == "/home/dev/.cache/iw")
+            .count();
+        assert_eq!(covered, 2, "after the dotdir binds and after the project");
+        let mut project_there = input.clone();
+        project_there.args.project = PathBuf::from("/home/dev/.cache/iw/x");
+        assert!(validate_jail_inputs(&project_there).is_err());
+        let profile = build_macos_profile(&input).unwrap().profile;
+        for path in [named, "/home/dev/.cache/iw"] {
+            assert!(profile.contains(&format!("(deny file-read* (subpath \"{path}\"))")));
+        }
+        // Outside the home: no mount at either place, no deny where it
+        // leads; a project there is still refused.
+        input.iw_config_real = PathBuf::from("/srv/iw");
+        input.iw_config_shown = vec![];
+        input.iw_config_outside = true;
+        let a = build_linux_jail(&input).unwrap().bwrap_args;
+        assert!(!a.iter().any(|w| w == named || w == "/srv/iw"), "{a:?}");
+        let profile = build_macos_profile(&input).unwrap().profile;
+        assert!(profile.contains(&format!("(deny file-read* (subpath \"{named}\"))")));
+        assert!(!profile.contains("/srv/iw"));
+        let mut project_there = input.clone();
+        project_there.args.project = PathBuf::from("/srv/iw");
+        assert!(validate_jail_inputs(&project_there).is_err());
+    }
+
+    /// In every common layout nothing is added: a dotdir that is an
+    /// ordinary folder (or not there), with no folder shown above it, and a
+    /// `deny_read` path with no link on the way, give the masks they always
+    /// gave, and the jail is byte for byte the one it was. The never-shown
+    /// paths are each OS's own list.
+    #[test]
+    fn ordinary_hidden_places_add_nothing_and_the_jail_is_the_one_it_was() {
+        let input = inputs(&["claude", "--print"]);
+        let (shown, read_only, needed) = linked_facts(&input, Path::to_path_buf);
+        let dotdirs: Vec<HiddenPlace> = never_shown_home_paths(&input.home, false)
+            .iter()
+            .map(|path| {
+                let there = path.ends_with(".ssh");
+                place(path.to_str().unwrap(), path.to_str(), there, there)
+            })
+            .collect();
+        let plan = plan_linked_places(&dotdirs, &input.home, &shown, &read_only, &needed, &[]);
+        assert_eq!(plan, LinkedPlan::default());
+        let found = [
+            place(
+                "/home/dev/proj/.env",
+                Some("/home/dev/proj/.env"),
+                true,
+                false,
+            ),
+            place(
+                "/home/dev/proj/secrets",
+                Some("/home/dev/proj/secrets"),
+                true,
+                true,
+            ),
+        ];
+        let (masks, linked) = plan_denied_paths(&found, &input.home, &shown, &read_only, &needed);
+        assert_eq!(masks, input.deny_paths);
+        assert_eq!(linked, LinkedPlan::default());
+        assert_eq!(
+            never_shown_home_paths(Path::new("/h"), false),
+            [".ssh", ".gnupg", ".aws", ".mozilla", ".thunderbird"].map(|n| Path::new("/h").join(n))
+        );
+        assert_eq!(
+            never_shown_home_paths(Path::new("/h"), true),
+            [
+                ".ssh",
+                ".aws",
+                ".gnupg",
+                "Library/Mail",
+                "Library/Messages",
+                "Library/Safari"
+            ]
+            .map(|n| Path::new("/h").join(n))
+        );
+        assert_eq!(
+            build_linux_jail(&input).unwrap().bwrap_args.join("\n"),
+            GOLDEN_ARGV_PLAIN
+        );
+        assert_eq!(
+            build_linux_jail(&identified_inputs())
+                .unwrap()
+                .bwrap_args
+                .join("\n"),
+            GOLDEN_ARGV_IDENTIFIED
+        );
+    }
+
+    /// What the jail needs, as named and as it resolves: the project, the
+    /// worktree's folders, the read-only paths, the guard and the agent's
+    /// settings.
+    #[test]
+    fn what_the_jail_needs_is_named_and_resolved() {
+        let mut input = inputs(&["claude"]);
+        input.args.extra_ro = vec![PathBuf::from("/opt/tool")];
+        let worktree = Worktree {
+            git_dir: PathBuf::from("/home/dev/repo/.git/worktrees/w"),
+            common_dir: PathBuf::from("/home/dev/repo/.git"),
+        };
+        let needed = jail_needs(
+            &input.args,
+            &input.home,
+            Some(&worktree),
+            &input.iw_binary,
+            |path| {
+                if path == Path::new("/home/dev/.claude") {
+                    PathBuf::from("/home/dev/dots/claude")
+                } else {
+                    path.to_path_buf()
+                }
+            },
+        );
+        assert_eq!(
+            needed,
+            [
+                "/home/dev/proj",
+                "/home/dev/repo/.git/worktrees/w",
+                "/home/dev/repo/.git",
+                "/opt/tool",
+                "/home/dev/.local/bin/innerwarden",
+                "/home/dev/.claude",
+                "/home/dev/.claude.json",
+                "/home/dev/dots/claude",
+            ]
+            .map(PathBuf::from)
         );
     }
 

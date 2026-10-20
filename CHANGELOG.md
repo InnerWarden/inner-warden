@@ -34,9 +34,20 @@ follows semantic versioning.
   there too, and so are the launcher's records in an identified jail (where
   `~/.local` is such a link). A project at that place is refused, as one at
   `~/.config/innerwarden` is.
+- **The jail hides what it hides wherever a link leads it.** In some home
+  layouts that use symbolic links, a folder the jail hides by default, a
+  `--deny-read` path or InnerWarden's own folder could still be read in the
+  jail. Each is now hidden where it really is, at every place the jail shows
+  it, in every jail, on Linux and macOS. A link never moves a mask onto what
+  the jail needs or onto a system file: such a place is left as it is, and
+  `innerwarden contain` says so. In every common layout the jail is the one
+  it was.
 
 ### Fixed
 
+- **A jail starts where InnerWarden's own folder, or the launcher's records
+  folder, is a link.** On Linux such a jail did not start (bwrap could not
+  mount through the link). Each is now hidden where the link leads.
 - **The first jail on an account where Claude Code never ran has the guard's
   hook.** Arming the hook makes `~/.claude`, and the jail was planned before
   that, without it: on Linux the first `innerwarden contain` there showed no
