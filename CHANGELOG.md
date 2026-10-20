@@ -96,7 +96,8 @@ follows semantic versioning.
   reads it by.** A mount moves with the folder it is in, and Linux renames a folder
   that is not itself a mount point: a program in the jail that renamed the
   folder above a covered place (`~/.config/keys` above `~/.config/keys/ssh`,
-  where `~/.ssh` leads; `~/dotfiles/ssh` above a stowed `~/.ssh`; the
+  where `~/.ssh` leads; `~/dotfiles/ssh` above a stowed `~/.ssh`;
+  `~/.config/app` above where a `--deny-read` link in the project leads; the
   `~/.local/state` above the launcher's records in an identified jail) took
   the cover with it and made a folder of its own at the name the host's
   link, or the launcher, reads. Each folder the jail writes between such a

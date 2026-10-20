@@ -102,6 +102,66 @@ fn linux_backend_masks_innerwarden_secrets_and_keeps_project_available() {
     assert!(!String::from_utf8_lossy(&output.stdout).contains("CJC-J007-SECRET"));
 }
 
+/// JP-2 (JAIL-PINS fixes, `--deny-read`): a `--deny-read` link in the
+/// project (`.env` a link to `~/.config/app/secrets.env`) is covered where
+/// it leads, inside the `.config` bind. The folder between that bind and
+/// the cover was never pinned on Linux: a program in the jail renamed
+/// `~/.config/app` (the cover moved with it) and put a file of its own at
+/// the name the host's link reads. It is a mount point now, and the rename
+/// fails; the host's secret stays where it was, unread.
+///
+/// FAILS ON REVERT: drop the `deny_paths` from the places of `linux_pins`
+/// and the folder moves, and the jail's file takes the secret's name.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_deny_read_link_into_a_home_folder_cannot_be_moved_from_its_name() {
+    require_bwrap();
+    let home = tempfile::TempDir::new().unwrap();
+    let h = home.path();
+    std::fs::create_dir_all(h.join(".config/app")).unwrap();
+    std::fs::write(h.join(".config/app/secrets.env"), "KEY=HOST-SECRET").unwrap();
+    let project = tempfile::TempDir::new().unwrap();
+    std::os::unix::fs::symlink(
+        h.join(".config/app/secrets.env"),
+        project.path().join(".env"),
+    )
+    .unwrap();
+    let script = format!(
+        "set -- '{0}'; cat \"$1/.config/app/secrets.env\" 2>/dev/null; \
+         if mv \"$1/.config/app\" \"$1/.config/app-old\" 2>/dev/null; then echo MOVED; \
+         mkdir -p \"$1/.config/app\" && echo KEY=JAIL > \"$1/.config/app/secrets.env\"; fi; \
+         echo DONE",
+        h.display()
+    );
+    let output = cli()
+        .args([
+            "contain",
+            "--project",
+            project.path().to_str().unwrap(),
+            "--",
+            "/bin/sh",
+            "-c",
+            &script,
+        ])
+        .env("HOME", h)
+        .output()
+        .expect("run Linux AI Jail");
+    let out = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{err}");
+    assert!(out.contains("DONE"), "{out} {err}");
+    assert!(!out.contains("HOST-SECRET"), "the secret was read: {out}");
+    assert!(
+        !out.contains("MOVED"),
+        "the folder above the cover moved: {out}"
+    );
+    assert!(!h.join(".config/app-old").exists());
+    assert_eq!(
+        std::fs::read_to_string(h.join(".config/app/secrets.env")).unwrap(),
+        "KEY=HOST-SECRET"
+    );
+}
+
 #[cfg(target_os = "linux")]
 fn require_bwrap() {
     let backend_available = ["/usr/bin/bwrap", "/bin/bwrap", "/usr/local/bin/bwrap"]

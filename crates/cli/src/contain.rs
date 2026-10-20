@@ -1697,9 +1697,10 @@ fn read_only_at(input: &JailInputs, root: Option<PinRoot>) -> Vec<PathBuf> {
 /// of the jail's own ends the way. Only the places the host reaches by
 /// name: InnerWarden's folder where it leads and wherever the jail shows
 /// it, the launcher's records (`--identity`), the profile's hidden home
-/// paths, every place a hidden dotdir or a `deny_read` path is covered at
-/// through a link (`linked_masks`), and the profile's read-only paths. In
-/// every common layout there is none but the records' folders.
+/// paths, every `deny_read` cover, every place a hidden dotdir or a
+/// `deny_read` path is covered at through a link (`linked_masks`), and the
+/// profile's read-only paths. In every common layout there is none but the
+/// records' folders.
 pub fn linux_pins(input: &JailInputs) -> Vec<(PinRoot, PathBuf)> {
     // In the order the jail lays them ([`build_linux_jail`]): a later one
     // over a folder is what the jail shows there.
@@ -1762,6 +1763,12 @@ pub fn linux_pins(input: &JailInputs) -> Vec<(PinRoot, PathBuf)> {
     }
     places.extend(input.hide_paths.iter().map(|hidden| hidden.abs.as_path()));
     places.extend(input.linked_masks.iter().map(|mask| mask.abs.as_path()));
+    // Every `deny_read` cover, as macOS takes them: one a link leads to in
+    // a home folder the jail binds (`proj/.env` a link to
+    // `~/.config/app/secrets.env`) is covered there, and a rename of
+    // `~/.config/app` took that cover away and let the jail put a file of
+    // its own at the name the host's link reads.
+    places.extend(input.deny_paths.iter().map(|denied| denied.abs.as_path()));
     // A profile's read-only path: a rename of a folder above it took the
     // read-only bind away with it, and the host's programs then found a
     // folder of the jail's at its name.
@@ -9644,6 +9651,64 @@ mod tests {
                     PathBuf::from("/home/dev/.local/state/innerwarden")
                 ),
             ]
+        );
+    }
+
+    /// JP-2 (JAIL-PINS fixes, `--deny-read`): on Linux the pins never took
+    /// the `deny_read` covers as places, though macOS did. A `--deny-read`
+    /// link (`proj/.env` a link to `~/.config/app/secrets.env`) is covered
+    /// where it leads, in the `.config` bind, and `~/.config/app`, between
+    /// that bind and the cover, could be renamed: the cover moved with it,
+    /// and the jail put a file of its own at the name the host's link
+    /// reads. A cover two folders inside the project had the same gap. Each
+    /// folder the jail writes between the home and every cover is pinned
+    /// now; a common layout still has none.
+    ///
+    /// FAILS ON REVERT: drop the `deny_paths` from the places of
+    /// `linux_pins` and `~/.config/app` is neither pinned nor a mount point.
+    #[test]
+    fn the_folders_above_a_deny_read_cover_are_pinned_on_linux() {
+        let mut input = inputs(&["claude", "--print"]);
+        input.deny_paths = vec![
+            mask("/home/dev/.config/app/secrets.env", false),
+            mask("/home/dev/proj/a/b/.env", false),
+            mask("/home/dev/proj/.env", false),
+        ];
+        assert_eq!(
+            linux_pins(&input),
+            [
+                (PinRoot::Home, PathBuf::from("/home/dev/.config/app")),
+                (PinRoot::Project, PathBuf::from("/home/dev/proj/a")),
+                (PinRoot::Project, PathBuf::from("/home/dev/proj/a/b")),
+            ]
+        );
+        let a = build_linux_jail(&input).unwrap().bwrap_args;
+        let at = |w: &[&str]| {
+            a.windows(w.len())
+                .position(|x| x == w)
+                .unwrap_or_else(|| panic!("{w:?} in {a:?}"))
+        };
+        let config = at(&["--bind", "/home/dev/.config", "/home/dev/.config"]);
+        let app = at(&["--bind", "/home/dev/.config/app", "/home/dev/.config/app"]);
+        let cover = at(&[
+            "--ro-bind",
+            "/dev/null",
+            "/home/dev/.config/app/secrets.env",
+        ]);
+        let project = at(&["--bind", "/home/dev/proj", "/home/dev/proj"]);
+        let inner = at(&["--bind", "/home/dev/proj/a/b", "/home/dev/proj/a/b"]);
+        assert!(
+            config < app && app < project && project < inner && inner < cover,
+            "{a:?}"
+        );
+        // The common layout: covers right in the project, nothing pinned.
+        assert!(linux_pins(&inputs(&["claude", "--print"])).is_empty());
+        assert_eq!(
+            build_linux_jail(&inputs(&["claude", "--print"]))
+                .unwrap()
+                .bwrap_args
+                .join("\n"),
+            GOLDEN_ARGV_PLAIN
         );
     }
 
