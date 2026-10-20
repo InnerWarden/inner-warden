@@ -551,6 +551,10 @@ pub struct JailInputs {
     /// profile that starts the jail once the host admitted it. `None`
     /// otherwise, and the command is the jail's child as it always was.
     pub gate_instance: Option<String>,
+    /// Where an identified jail can keep Claude Code's own state
+    /// ([`ClaudeState`]). Both `false` unless the launch asked for an
+    /// identity record, and then nothing of it reaches the argv.
+    pub claude_state: ClaudeState,
 }
 
 impl JailInputs {
@@ -590,6 +594,33 @@ const DOTDIR_RW: &[&str] = &[
 const DOTFILE_RO: &[&str] = &[".gitconfig"];
 /// The agent's own settings under the home, which carry the guard's hook.
 const AGENT_SETTINGS: &[&str] = &[".claude", ".claude.json"];
+/// Claude Code's own settings file, in the home. A Linux jail's home is an
+/// empty folder of the jail's own, so the file Claude Code keeps there is
+/// gone when the jail ends.
+pub(crate) const CLAUDE_SETTINGS: &str = ".claude.json";
+/// Where an identified jail keeps that file instead: under the same name in
+/// `~/.claude`, the folder the jail already shares with the host (the place
+/// Claude Code itself keeps it when `~/.claude` is named as its
+/// configuration folder).
+pub(crate) const CLAUDE_SETTINGS_KEPT: &str = ".claude/.claude.json";
+/// Claude Code's list of its running sessions, one file per process id.
+pub(crate) const CLAUDE_SESSIONS: &str = ".claude/sessions";
+
+/// What the launcher found on the host of the two places an identified jail
+/// keeps Claude Code's own state in ([`build_linux_jail`]). Read only for an
+/// `--identity` launch on Linux: without the flag nothing is read and both
+/// are `false`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ClaudeState {
+    /// `~/.claude` is a folder, and [`CLAUDE_SETTINGS_KEPT`] in it is a file
+    /// or is not there yet (never a link, a folder or anything else): the
+    /// jail's `~/.claude.json` can lead to it.
+    pub settings_kept: bool,
+    /// `~/.claude` is a folder, and [`CLAUDE_SESSIONS`] in it is a folder of
+    /// its own (no link), made empty (0700) by the launcher where it was not
+    /// there: the jail can cover it with an empty list of its own.
+    pub sessions_own: bool,
+}
 /// Dotdirs that must stay INVISIBLE (never re-bound → absent under the HOME tmpfs).
 const DOTDIR_DENY: &[&str] = &[".ssh", ".gnupg", ".aws", ".mozilla", ".thunderbird"];
 const MACOS_HOME_DENY: &[&str] = &["Library/Mail", "Library/Messages", "Library/Safari"];
@@ -759,7 +790,8 @@ pub const CAP_DROP_ALL: [&str; 2] = ["--cap-drop", "ALL"];
 
 /// Build the ordered bwrap argument vector. Order is load-bearing (bwrap is
 /// last-wins): system RO → dev/proc/tmpfs → HOME tmpfs → dotdir re-binds → shadow
-/// innerwarden → binary binds → project (late) → worktree → nested secret masks →
+/// innerwarden → Claude Code's state (`--identity` only) → binary binds →
+/// project (late) → worktree → nested secret masks →
 /// the host's key and the launch record (`--identity` only) → namespaces and the
 /// seccomp filter → child. `DOTDIR_DENY`
 /// entries are never emitted, so they vanish under the HOME tmpfs.
@@ -836,6 +868,36 @@ pub fn build_linux_jail(input: &JailInputs) -> Result<LinuxJailPlan, ContainErro
     }
     // DOTDIR_DENY entries are intentionally NOT emitted here (asserted by tests),
     // so they stay invisible under the HOME tmpfs.
+
+    // --- Claude Code's own state, where the jail shares `~/.claude` with the
+    // host (`--identity` only). The jail's home is an empty folder of its
+    // own, so the settings file Claude Code keeps in it, `~/.claude.json`,
+    // was gone at every launch: it is a link to the same name in `~/.claude`
+    // instead, and Claude Code writes through it (a temporary file beside
+    // the target, then a rename in that folder; a rename onto a mount would
+    // fail). The person's own `~/.claude.json` stays outside the jail, and
+    // the link is not made where a hidden or denied path covers the file.
+    // Claude Code is process 2 in every jail and names each running session
+    // by its process id, so each jail gets an empty list of sessions of its
+    // own: two jails at once never write the same file, and none reads the
+    // host's. Both before every mask, so a hidden path still covers them. ---
+    if input.args.identity && input.exists(&input.home.join(".claude")) {
+        let kept = input.home.join(CLAUDE_SETTINGS_KEPT);
+        let covered = input
+            .hide_paths
+            .iter()
+            .chain(&input.deny_paths)
+            .any(|hidden| kept.starts_with(&hidden.abs));
+        if input.claude_state.settings_kept && !covered {
+            let target = kept.to_string_lossy().to_string();
+            let link = input.home.join(CLAUDE_SETTINGS);
+            push(&["--symlink", &target, &link.to_string_lossy()]);
+        }
+        if input.claude_state.sessions_own {
+            let sessions = input.home.join(CLAUDE_SESSIONS);
+            push(&["--tmpfs", &sessions.to_string_lossy()]);
+        }
+    }
 
     // --- agent + guard binaries reachable after HOME tmpfs ---
     if let Some(bin) = &input.agent_binary {
@@ -3016,6 +3078,7 @@ mod tests {
             // A host whose `/etc/resolv.conf` is a file of its own.
             resolv_conf: None,
             gate_instance: None,
+            claude_state: ClaudeState::default(),
         }
     }
 
@@ -4375,9 +4438,10 @@ mod tests {
     /// `close_userns` is the record's fact and puts nothing in the argv; the
     /// filter is the descriptor. An identified jail whose host did not take
     /// the filter is the jail the previous build made with its probe
-    /// failing, plus the capability drop and nothing else (the hash is of the
-    /// golden at 4ded5fea), and a plain one without the filter is that
-    /// build's, byte for byte.
+    /// failing, plus the capability drop and Claude Code's own state
+    /// ([`CLAUDE_STATE_LINES`]) and nothing else (the hash is of the golden
+    /// at 4ded5fea), and a plain one without the filter is that build's,
+    /// byte for byte.
     ///
     /// FAILS ON REVERT: emit anything for `close_userns`, or emit the filter
     /// without a descriptor, or move anything else in the identified jail.
@@ -4390,12 +4454,16 @@ mod tests {
             build_linux_jail(&plain).unwrap().bwrap_args.join("\n"),
             GOLDEN_ARGV_PLAIN
         );
-        // Identified, the probe failed: the 4ded5fea golden and the drop.
+        // Identified, the probe failed: the 4ded5fea golden, the drop and
+        // Claude Code's own state.
         let old = identified_inputs();
         let got = build_linux_jail(&old).unwrap().bwrap_args.join("\n");
         assert_eq!(got, GOLDEN_ARGV_IDENTIFIED);
         assert_eq!(got.matches("--cap-drop\nALL\n").count(), 1);
-        let before = got.replacen("--unshare-ipc\n--cap-drop\nALL\n", "--unshare-ipc\n", 1);
+        assert_eq!(got.matches(CLAUDE_STATE_LINES).count(), 1);
+        let before = got
+            .replacen("--unshare-ipc\n--cap-drop\nALL\n", "--unshare-ipc\n", 1)
+            .replacen(CLAUDE_STATE_LINES, "", 1);
         assert_eq!(
             sha256_hex(before.as_bytes()),
             "648f991ed81d228baa0f4c080f5eb53c6fe864d6e4c5be6f3660da6bffbb5044"
@@ -5008,18 +5076,165 @@ mod tests {
         // byte. The filter's own case sets these two.
         input.seccomp_fd = None;
         input.close_userns = false;
+        // A home whose `~/.claude` holds no settings file of the jail's yet
+        // and a sessions folder of its own.
+        input.claude_state = ClaudeState {
+            settings_kept: true,
+            sessions_own: true,
+        };
         input
     }
+
+    /// The lines Claude Code's own state adds to the identified jail of
+    /// [`identified_inputs`], after the dotdir binds and before the guard's
+    /// binary.
+    const CLAUDE_STATE_LINES: &str = "\
+        --symlink\n\
+        /home/dev/.claude/.claude.json\n\
+        /home/dev/.claude.json\n\
+        --tmpfs\n\
+        /home/dev/.claude/sessions\n";
 
     /// The whole argv of an identified jail, one token per line.
     ///
     /// FAILS ON REVERT: drop the records folder `--tmpfs` (the agent can
     /// rewrite the launcher's records through the `.local` bind), or move it
-    /// before the project and dotdir binds, or drop the `--setenv` lines.
+    /// before the project and dotdir binds, or drop the `--setenv` lines, or
+    /// drop the link to the kept settings file or the jail's own sessions
+    /// folder.
     #[test]
     fn golden_argv_of_an_identified_jail() {
         let plan = build_linux_jail(&identified_inputs()).unwrap();
         assert_eq!(plan.bwrap_args.join("\n"), GOLDEN_ARGV_IDENTIFIED);
+    }
+
+    /// Where an identified jail keeps Claude Code's own state: the jail's
+    /// `~/.claude.json` leads to the same name in the shared `~/.claude`,
+    /// and the jail covers `~/.claude/sessions` with an empty list of its
+    /// own. Both after the `.claude` bind they sit in, and before the
+    /// project and every mask, so a hidden or denied path still wins.
+    ///
+    /// FAILS ON REVERT: drop the link (Claude Code's settings file is the
+    /// jail's empty home's again, gone at every launch) or the sessions
+    /// folder (two jails at once write the same `2.json`), or put either
+    /// before the `.claude` bind, where the bind covers it.
+    #[test]
+    fn an_identified_jail_keeps_claude_codes_state_in_the_folder_it_shares() {
+        let mut input = identified_inputs();
+        input.hide_paths = vec![DenyPath {
+            abs: PathBuf::from("/home/dev/.claude/sessions/hidden"),
+            is_dir: true,
+        }];
+        let got = build_linux_jail(&input).unwrap().bwrap_args;
+        let at = |w: &[&str]| {
+            got.windows(w.len())
+                .position(|x| x == w)
+                .unwrap_or_else(|| panic!("{w:?} in {got:?}"))
+        };
+        let claude = at(&["--bind", "/home/dev/.claude", "/home/dev/.claude"]);
+        let link = at(&[
+            "--symlink",
+            "/home/dev/.claude/.claude.json",
+            "/home/dev/.claude.json",
+        ]);
+        let sessions = at(&["--tmpfs", "/home/dev/.claude/sessions"]);
+        let project = at(&["--bind", "/home/dev/proj", "/home/dev/proj"]);
+        let hidden = at(&["--tmpfs", "/home/dev/.claude/sessions/hidden"]);
+        let denied = at(&["--ro-bind", "/dev/null", "/home/dev/proj/.env"]);
+        assert!(claude < link && claude < sessions, "{got:?}");
+        assert!(link < project && sessions < project, "{got:?}");
+        assert!(sessions < hidden && link < denied, "{got:?}");
+        assert_eq!(got.iter().filter(|a| *a == "--symlink").count(), 5);
+        // Nothing of the person's own settings file is bound in.
+        assert!(!got
+            .windows(2)
+            .any(|w| w[0].ends_with("bind") && w[1] == "/home/dev/.claude.json"));
+    }
+
+    /// The link is never made to a kept settings file that a hidden home
+    /// path or a denied path covers: Claude Code then keeps its file in the
+    /// jail's own home, as before, and the mask stays where it was. The
+    /// jail's own sessions folder does not depend on it.
+    ///
+    /// FAILS ON REVERT: make the link whatever covers the file, and the jail's
+    /// `~/.claude.json` leads to the hidden place.
+    #[test]
+    fn the_kept_settings_file_is_never_led_to_where_a_hidden_path_covers_it() {
+        let kept = PathBuf::from("/home/dev/.claude/.claude.json");
+        let mut hidden = identified_inputs();
+        hidden.hide_paths = vec![DenyPath {
+            abs: kept.clone(),
+            is_dir: false,
+        }];
+        let mut denied = identified_inputs();
+        denied.deny_paths.push(DenyPath {
+            abs: kept.clone(),
+            is_dir: false,
+        });
+        for input in [hidden, denied] {
+            let got = build_linux_jail(&input).unwrap().bwrap_args;
+            assert!(
+                !got.windows(2)
+                    .any(|w| w[0] == "--symlink" && w[1] == "/home/dev/.claude/.claude.json"),
+                "{got:?}"
+            );
+            assert!(got
+                .windows(3)
+                .any(|w| w == ["--ro-bind", "/dev/null", "/home/dev/.claude/.claude.json"]));
+            assert!(got
+                .windows(2)
+                .any(|w| w == ["--tmpfs", "/home/dev/.claude/sessions"]));
+        }
+    }
+
+    /// Nothing of Claude Code's state is made where the jail does not share
+    /// `~/.claude` (the home has none), or where the launcher found the
+    /// kept file or the sessions folder to be something else (a link, a
+    /// folder in place of the file): the jail is the identified jail it was.
+    ///
+    /// FAILS ON REVERT: make the link or the sessions folder without the
+    /// `.claude` bind, or whatever the launcher found.
+    #[test]
+    fn nothing_of_claude_codes_state_is_made_where_the_jail_does_not_share_its_folder() {
+        let claude_free = |got: &[String]| {
+            !got.iter()
+                .any(|a| a.starts_with("/home/dev/.claude.json") || a.contains("/sessions"))
+        };
+        let mut no_folder = identified_inputs();
+        no_folder
+            .existing_paths
+            .retain(|p| p != Path::new("/home/dev/.claude"));
+        let got = build_linux_jail(&no_folder).unwrap().bwrap_args;
+        assert!(claude_free(&got), "{got:?}");
+
+        let mut found_other = identified_inputs();
+        found_other.claude_state = ClaudeState::default();
+        let got = build_linux_jail(&found_other)
+            .unwrap()
+            .bwrap_args
+            .join("\n");
+        assert!(claude_free(
+            &got.lines().map(String::from).collect::<Vec<_>>()
+        ));
+        assert_eq!(
+            got,
+            GOLDEN_ARGV_IDENTIFIED.replacen(CLAUDE_STATE_LINES, "", 1)
+        );
+
+        let mut only_sessions = identified_inputs();
+        only_sessions.claude_state.settings_kept = false;
+        let got = build_linux_jail(&only_sessions)
+            .unwrap()
+            .bwrap_args
+            .join("\n");
+        assert_eq!(
+            got,
+            GOLDEN_ARGV_IDENTIFIED.replacen(
+                "--symlink\n/home/dev/.claude/.claude.json\n/home/dev/.claude.json\n",
+                "",
+                1
+            )
+        );
     }
 
     /// The records folder is hidden after the last writable bind that could
@@ -5044,8 +5259,9 @@ mod tests {
         assert!(named < record && resolved < record);
     }
 
-    /// Without `--identity` neither the records folder nor the command's
-    /// variables reach the argv, whatever the inputs carry.
+    /// Without `--identity` neither the records folder, the command's
+    /// variables nor Claude Code's own state reach the argv, whatever the
+    /// inputs carry.
     #[test]
     fn without_identity_the_records_folder_and_variables_change_nothing() {
         let mut off = identified_inputs();
@@ -6890,6 +7106,11 @@ mod tests {
         --ro-bind\n\
         /home/dev/.gitconfig\n\
         /home/dev/.gitconfig\n\
+        --symlink\n\
+        /home/dev/.claude/.claude.json\n\
+        /home/dev/.claude.json\n\
+        --tmpfs\n\
+        /home/dev/.claude/sessions\n\
         --ro-bind\n\
         /home/dev/.local/bin/innerwarden\n\
         /home/dev/.local/bin/innerwarden\n\

@@ -365,6 +365,18 @@ fn resolve_inputs(
         (Vec::new(), Vec::new())
     };
 
+    // Only an identified Linux launch keeps Claude Code's own state in the
+    // folder the jail shares with the host; without the flag none of it is
+    // read.
+    #[cfg(target_os = "linux")]
+    let claude_state = if args.identity {
+        claude_state_here(&home, args.dry_run)
+    } else {
+        crate::contain::ClaudeState::default()
+    };
+    #[cfg(not(target_os = "linux"))]
+    let claude_state = crate::contain::ClaudeState::default();
+
     Ok(JailInputs {
         args,
         home,
@@ -389,7 +401,46 @@ fn resolve_inputs(
         hide_denies: hidden.denies,
         resolv_conf,
         gate_instance: None,
+        claude_state,
     })
+}
+
+/// Where an identified jail can keep Claude Code's own state, as found on
+/// the host ([`crate::contain::ClaudeState`]). Only where `~/.claude` is a
+/// folder (the jail shares it): its settings file there may be a file or not
+/// there yet, never a link or anything else; its sessions folder must be a
+/// folder of its own. A real launch first makes the sessions folder, empty
+/// and 0700 as Claude Code makes it, where it is not there, so the jail has
+/// a place to cover; a dry run makes nothing and shows what the real run
+/// would do.
+#[cfg(target_os = "linux")]
+fn claude_state_here(home: &Path, dry_run: bool) -> crate::contain::ClaudeState {
+    use crate::contain::{ClaudeState, CLAUDE_SESSIONS, CLAUDE_SETTINGS_KEPT};
+    use std::io::ErrorKind;
+    use std::os::unix::fs::DirBuilderExt;
+    if !std::fs::metadata(home.join(".claude")).is_ok_and(|meta| meta.is_dir()) {
+        return ClaudeState::default();
+    }
+    let settings_kept = match std::fs::symlink_metadata(home.join(CLAUDE_SETTINGS_KEPT)) {
+        Ok(meta) => meta.is_file(),
+        Err(error) => error.kind() == ErrorKind::NotFound,
+    };
+    let sessions = home.join(CLAUDE_SESSIONS);
+    let sessions_own = match std::fs::symlink_metadata(&sessions) {
+        Ok(meta) => meta.is_dir(),
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            dry_run
+                || std::fs::DirBuilder::new()
+                    .mode(0o700)
+                    .create(&sessions)
+                    .is_ok()
+        }
+        Err(_) => false,
+    };
+    ClaudeState {
+        settings_kept,
+        sessions_own,
+    }
 }
 
 /// Each home path a jail profile hides, as found on the host: where it
@@ -3066,5 +3117,87 @@ mod tests {
             read_jail_graph(&project, me()),
             JailGraph::Unreadable("graph_dir_is_a_symlink")
         );
+    }
+
+    /// What the launcher takes as places an identified jail can keep Claude
+    /// Code's own state in: the settings file in `~/.claude` only where it
+    /// is a file or not there yet, the sessions folder only where it is a
+    /// folder of its own, which a real launch makes (empty, 0700) and a dry
+    /// run does not. Nothing at all without a `~/.claude` folder.
+    ///
+    /// FAILS ON REVERT: take a link or a folder in place of the settings
+    /// file, or follow a link in place of the sessions folder, or make the
+    /// sessions folder on a dry run.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn claude_state_here_takes_only_a_file_or_nothing_and_a_folder_of_its_own() {
+        use crate::contain::ClaudeState;
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let both = ClaudeState {
+            settings_kept: true,
+            sessions_own: true,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        // No `~/.claude`: nothing, and nothing made.
+        assert_eq!(claude_state_here(&home, false), ClaudeState::default());
+        assert!(!home.join(".claude").exists());
+        // A `~/.claude` file is no folder the jail shares.
+        std::fs::write(home.join(".claude"), "").unwrap();
+        assert_eq!(claude_state_here(&home, false), ClaudeState::default());
+        std::fs::remove_file(home.join(".claude")).unwrap();
+
+        let claude = home.join(".claude");
+        std::fs::create_dir(&claude).unwrap();
+        let sessions = claude.join("sessions");
+        // A dry run shows what a real one would do and makes nothing.
+        assert_eq!(claude_state_here(&home, true), both);
+        assert!(!sessions.exists());
+        // A real launch makes the sessions folder, empty and 0700.
+        assert_eq!(claude_state_here(&home, false), both);
+        let made = std::fs::symlink_metadata(&sessions).unwrap();
+        assert!(made.is_dir());
+        assert_eq!(made.permissions().mode() & 0o777, 0o700);
+        assert_eq!(std::fs::read_dir(&sessions).unwrap().count(), 0);
+        // A settings file there already is kept.
+        let kept = claude.join(".claude.json");
+        std::fs::write(&kept, "{}").unwrap();
+        assert_eq!(claude_state_here(&home, false), both);
+
+        // A link in place of the settings file (a dotfiles manager's), or a
+        // folder, is never taken.
+        std::fs::remove_file(&kept).unwrap();
+        std::fs::write(root.path().join("dotfiles.json"), "{}").unwrap();
+        symlink(root.path().join("dotfiles.json"), &kept).unwrap();
+        assert!(!claude_state_here(&home, false).settings_kept);
+        std::fs::remove_file(&kept).unwrap();
+        std::fs::create_dir(&kept).unwrap();
+        assert!(!claude_state_here(&home, false).settings_kept);
+        std::fs::remove_dir(&kept).unwrap();
+
+        // A link in place of the sessions folder, even to a folder, is never
+        // covered, and the folder it leads to is left as it was.
+        std::fs::remove_dir(&sessions).unwrap();
+        let elsewhere = root.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        symlink(&elsewhere, &sessions).unwrap();
+        let got = claude_state_here(&home, false);
+        assert!(got.settings_kept && !got.sessions_own, "{got:?}");
+        assert!(std::fs::symlink_metadata(&sessions)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
+
+        // A `~/.claude` that is a link to a folder (a dotfiles manager's) is
+        // the folder the jail binds: its places are read where it leads.
+        std::fs::remove_file(&sessions).unwrap();
+        std::fs::remove_dir(&claude).unwrap();
+        let real = root.path().join("real-claude");
+        std::fs::create_dir(&real).unwrap();
+        symlink(&real, &claude).unwrap();
+        assert_eq!(claude_state_here(&home, false), both);
+        assert!(real.join("sessions").is_dir());
     }
 }

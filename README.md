@@ -243,6 +243,27 @@ the jail follows the host when the network changes. Elsewhere
 (systemd-resolved, NetworkManager) a jail keeps the resolver file it started
 with until the agent is restarted.
 
+An identified Linux jail keeps Claude Code's own state in the `~/.claude` it
+already shares with you. The jail's home is an empty folder of its own, so
+Claude Code's settings file, `~/.claude.json`, used to be gone at every launch
+(and Claude Code said, from the second launch on, that it was missing). In the
+jail it now leads to `~/.claude/.claude.json`, so what Claude Code saves there,
+an MCP server you add or its first-run answers, is still there at the next
+launch. Your own `~/.claude.json` stays outside the jail, and the jail never
+changes it; the first identified launch starts Claude Code with a new file of
+the jail's own, so it may ask its first-run questions once. (Where you point
+Claude Code at `~/.claude` with `CLAUDE_CONFIG_DIR`, `~/.claude/.claude.json`
+is already the file it uses, in the jail and out of it.) Claude Code is
+process 2 in every jail and lists each running session by its process id, so
+each identified jail has its own empty `~/.claude/sessions`: two jails at once
+never write the same session file, and none sees the sessions running outside
+it. Where a hidden home path covers `~/.claude/.claude.json`, or that place is
+a link or anything other than a file, Claude Code keeps its file in the jail's
+own home, as before. Limit: two jails at once share the one file, and Claude
+Code's lock on it is each jail's own, so a change one jail saves at the same
+moment as another can be lost (a save is never left half written). A jail
+started without `--identity` keeps Claude Code's state as before.
+
 Where a per-agent relaxation applies:
 
 - Linux;

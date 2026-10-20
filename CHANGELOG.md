@@ -27,6 +27,27 @@ follows semantic versioning.
   files: only new ones are refused, so keep such snapshots out of the
   project.
 
+### Fixed
+
+- **Claude Code keeps its settings in an identified jail.** In
+  `innerwarden contain --identity` on Linux the jail's home is an empty
+  folder of its own, so Claude Code's settings file, `~/.claude.json`, was
+  gone at every launch: from the second launch on Claude Code said twice that
+  the file was missing, and what it saved there (an MCP server you added, its
+  first-run answers) was lost. In the jail that file now leads to
+  `~/.claude/.claude.json`, in the folder the jail already shares, so it is
+  kept between launches. Your own `~/.claude.json` stays outside the jail and
+  is never changed by it. Not where a hidden home path covers that place, or
+  where it is a link of yours or anything other than a file: Claude Code then
+  keeps its file in the jail's own home, as before.
+- **Two identified jails at once no longer share Claude Code's session
+  file.** Claude Code is process 2 in every jail and lists each running
+  session as `~/.claude/sessions/<pid>.json`, in the `~/.claude` the jails
+  share, so two jails at once wrote and read the same `2.json`. Each
+  identified jail now has its own empty `~/.claude/sessions` (the launcher
+  makes the folder, 0700, where it is not there), and none sees the sessions
+  running outside it. A jail started without `--identity` is unchanged.
+
 ## 1.5.5 - 2026-10-11
 
 ### Upgrade notes: what to do

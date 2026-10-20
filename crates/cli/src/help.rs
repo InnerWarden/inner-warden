@@ -248,7 +248,10 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
              outside the home, or over what the jail needs, stops the launch. A note\n  \
              from the host about the jail is printed as `innerwarden contain: <note>`.\n  \
              A Linux jail shows the host's resolver file read-only, so names resolve as\n  \
-             on the host.\n\
+             on the host. With --identity, Claude Code's settings file is kept in\n  \
+             ~/.claude/.claude.json between launches (your own ~/.claude.json stays\n  \
+             outside), and each jail has its own ~/.claude/sessions, so two jails at\n  \
+             once never write the same session file.\n\
              \n  \
              On Linux, where the host takes it, every jail starts its programs under\n  \
              a seccomp filter in the style of Flatpak that refuses TIOCSTI and\n  \
@@ -528,6 +531,36 @@ mod tests {
             "`hide_home = [\".cache/git/credential\"]`: home paths the jail covers",
             "it prints it as `innerwarden contain: <note>`",
             "a jail keeps the resolver file it started with until the agent is restarted",
+        ] {
+            assert!(readme.contains(said), "README lacks {said:?}");
+        }
+    }
+
+    /// The contain help and the README say where an identified jail keeps
+    /// Claude Code's own state, that the person's own settings file stays
+    /// outside, that each jail has its own sessions folder, and the limit of
+    /// two jails sharing the one file.
+    ///
+    /// FAILS ON REVERT: drop the sentence from the contain help, or the
+    /// README's paragraph or its limit.
+    #[test]
+    fn the_contain_help_and_the_readme_say_where_claude_codes_state_is_kept() {
+        let flat = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let help = flat(&usage("contain", &[]).expect("contain has usage"));
+        for said in [
+            "With --identity, Claude Code's settings file is kept in ~/.claude/.claude.json between launches (your own ~/.claude.json stays outside)",
+            "each jail has its own ~/.claude/sessions, so two jails at once never write the same session file",
+        ] {
+            assert!(help.contains(said), "contain --help lacks {said:?}: {help}");
+        }
+        let readme = flat(include_str!("../../../README.md"));
+        for said in [
+            "An identified Linux jail keeps Claude Code's own state in the `~/.claude` it already shares with you.",
+            "In the jail it now leads to `~/.claude/.claude.json`",
+            "Your own `~/.claude.json` stays outside the jail, and the jail never changes it",
+            "each identified jail has its own empty `~/.claude/sessions`: two jails at once never write the same session file",
+            "Where a hidden home path covers `~/.claude/.claude.json`, or that place is a link or anything other than a file, Claude Code keeps its file in the jail's own home, as before.",
+            "Limit: two jails at once share the one file, and Claude Code's lock on it is each jail's own",
         ] {
             assert!(readme.contains(said), "README lacks {said:?}");
         }

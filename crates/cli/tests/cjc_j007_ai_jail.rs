@@ -1331,6 +1331,280 @@ fn a_planted_link_never_moves_a_hidden_home_path() {
     }
 }
 
+/// One identified jail on `home`, working in `project`, running `script`
+/// under `/bin/sh`: its output.
+#[cfg(target_os = "linux")]
+fn identified_sh(
+    home: &std::path::Path,
+    project: &std::path::Path,
+    script: &str,
+) -> std::process::Command {
+    let mut command = cli();
+    command
+        .args([
+            "contain",
+            "--identity",
+            "--project",
+            project.to_str().unwrap(),
+            "--",
+            "/bin/sh",
+            "-c",
+            script,
+        ])
+        .env("HOME", home);
+    identified_without_a_scope(&mut command);
+    command
+}
+
+/// What Claude Code does when it saves its settings file, `~/.claude.json`
+/// (measured with Claude Code 2.1.304): it reads where a link there leads,
+/// writes a new file beside that place (`<target>.tmp.<pid>.<hex>`, made
+/// with `O_EXCL`) and renames it onto the place. Exits 71 where
+/// `~/.claude.json` is no link, 72 where the write or the rename fails.
+#[cfg(target_os = "linux")]
+const SAVE_AS_CLAUDE_CODE_DOES: &str = r#"target=$(readlink "$HOME/.claude.json") || exit 71
+tmp="$target.tmp.$$.0a1b2c3d4e5f"
+set -C; printf '{"kept":"JAIL-STATE"}\n' > "$tmp" || exit 72; set +C
+mv "$tmp" "$target" || exit 72
+if grep -q HOST-OWN "$HOME/.claude.json" "$HOME/.claude/backups"/* 2>/dev/null; then exit 73; fi
+echo SAVED
+"#;
+
+/// M30: Claude Code keeps its settings file in the home, and an identified
+/// jail's home is an empty folder of its own, so the file was gone at every
+/// launch (and Claude Code warned twice, from the second launch on, that it
+/// was missing). It is a link to the same name in the shared `~/.claude`
+/// now: a save as Claude Code makes it lands on the host, the next jail
+/// reads it, and the person's own `~/.claude.json` is never shown in the
+/// jail nor changed. Nothing new is made in the home itself.
+///
+/// FAILS ON REVERT: drop the link, and the save finds no link (71) and the
+/// second jail no file.
+#[cfg(target_os = "linux")]
+#[test]
+fn claude_codes_settings_file_survives_between_identified_jails() {
+    require_bwrap();
+    let home = state_home();
+    let h = home.path();
+    std::fs::create_dir_all(h.join(".claude")).unwrap();
+    std::fs::write(h.join(".claude.json"), "{\"own\":\"HOST-OWN-STATE\"}\n").unwrap();
+    let project = tempfile::TempDir::new().unwrap();
+    let names = |dir: &std::path::Path| {
+        let mut names: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        names.sort();
+        names
+    };
+    let before = names(h);
+
+    let first = identified_sh(h, project.path(), SAVE_AS_CLAUDE_CODE_DOES)
+        .output()
+        .expect("run the first jail");
+    let (out, err) = (
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr),
+    );
+    assert!(first.status.success(), "{:?}: {out} {err}", first.status);
+    assert!(out.contains("SAVED"), "{out} {err}");
+
+    let second = identified_sh(
+        h,
+        project.path(),
+        "cat \"$HOME/.claude.json\"; ls -a \"$HOME/.claude\"",
+    )
+    .output()
+    .expect("run the second jail");
+    let out = String::from_utf8_lossy(&second.stdout);
+    assert!(second.status.success(), "{out}");
+    assert!(out.contains("JAIL-STATE"), "the next jail lost it: {out}");
+    assert!(!out.contains(".tmp."), "a temporary file was left: {out}");
+
+    let kept = std::fs::read_to_string(h.join(".claude/.claude.json")).unwrap();
+    assert!(kept.contains("JAIL-STATE"), "{kept}");
+    let own = std::fs::read_to_string(h.join(".claude.json")).unwrap();
+    assert_eq!(
+        own, "{\"own\":\"HOST-OWN-STATE\"}\n",
+        "the person's own file"
+    );
+    assert_eq!(names(h), before, "nothing new in the home itself");
+    // The sessions folder the jail covers, made by the launcher as Claude
+    // Code makes it, and left empty on the host.
+    use std::os::unix::fs::PermissionsExt;
+    let sessions = std::fs::symlink_metadata(h.join(".claude/sessions")).unwrap();
+    assert!(sessions.is_dir());
+    assert_eq!(sessions.permissions().mode() & 0o777, 0o700);
+    assert_eq!(
+        std::fs::read_dir(h.join(".claude/sessions"))
+            .unwrap()
+            .count(),
+        0
+    );
+}
+
+/// M30: Claude Code is process 2 in every jail and lists each running
+/// session as `~/.claude/sessions/<pid>.json`, in the `~/.claude` the jails
+/// share, so two jails at once wrote the same `2.json` and each read the
+/// other's. Each identified jail has an empty list of its own now: two at
+/// once keep their own `2.json`, neither sees the host's sessions, and
+/// nothing a jail writes there reaches the host.
+///
+/// FAILS ON REVERT: drop the jail's own sessions folder, and the jail that
+/// wrote first reads the other's `2.json`, and the host keeps it.
+#[cfg(target_os = "linux")]
+#[test]
+fn two_identified_jails_at_once_keep_separate_session_files() {
+    require_bwrap();
+    let home = state_home();
+    let h = home.path();
+    std::fs::create_dir_all(h.join(".claude/sessions")).unwrap();
+    std::fs::write(
+        h.join(".claude/sessions/999.json"),
+        "{\"pid\":999,\"sessionId\":\"HOST-OWN-SESSION\"}",
+    )
+    .unwrap();
+    let project = tempfile::TempDir::new().unwrap();
+    let p = project.path();
+    // A writes first, then B, then each reads: both are running when each
+    // writes, and each read comes after both writes.
+    let script = |me: &str, other: &str| {
+        let wait = format!(
+            "i=0; while [ ! -e '{p}/ready-{other}' ] && [ $i -lt 300 ]; do sleep 0.1; i=$((i+1)); done\n\
+             [ -e '{p}/ready-{other}' ] || exit 76\n",
+            p = p.display()
+        );
+        let write = format!(
+            "printf '{{\"pid\":2,\"jail\":\"{me}\"}}' > \"$HOME/.claude/sessions/2.json\" || exit 75\n\
+             touch '{p}/ready-{me}'\n",
+            p = p.display()
+        );
+        let (first, then) = if me == "A" {
+            (write, wait)
+        } else {
+            (wait, write)
+        };
+        format!(
+            "[ \"$$\" = 2 ] || {{ echo \"PID-$$\"; exit 74; }}\n{first}{then}\
+             cat \"$HOME/.claude/sessions/2.json\"; echo; ls \"$HOME/.claude/sessions\""
+        )
+    };
+    let a = identified_sh(h, p, &script("A", "B"))
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("start jail A");
+    let b = identified_sh(h, p, &script("B", "A"))
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("start jail B");
+    for (me, other, child) in [("A", "B", a), ("B", "A", b)] {
+        let output = child.wait_with_output().expect("jail ended");
+        let out = String::from_utf8_lossy(&output.stdout);
+        let err = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "{me}: {:?} {out} {err}",
+            output.status
+        );
+        assert!(
+            out.contains(&format!("\"jail\":\"{me}\"")),
+            "{me} lost its own 2.json: {out}"
+        );
+        assert!(
+            !out.contains(&format!("\"jail\":\"{other}\"")),
+            "{me} read {other}'s: {out}"
+        );
+        assert!(!out.contains("999.json"), "{me} saw the host's: {out}");
+    }
+    let left: Vec<_> = std::fs::read_dir(h.join(".claude/sessions"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(left, ["999.json"], "only the host's own session is there");
+}
+
+/// Where `~/.claude/.claude.json` is a link of the person's (a dotfiles
+/// manager's), or anything but a file, the jail makes no link to it: a save
+/// through two links would replace the person's link with a file. The jail
+/// keeps Claude Code's file in its own home then, as before, and the
+/// person's link is left as it was.
+///
+/// FAILS ON REVERT: let the launcher take a link there as a kept file, and
+/// the save replaces the person's link.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_link_in_place_of_the_kept_settings_file_is_left_alone() {
+    require_bwrap();
+    let home = state_home();
+    let h = home.path();
+    std::fs::create_dir_all(h.join("dotfiles")).unwrap();
+    std::fs::create_dir_all(h.join(".claude")).unwrap();
+    std::fs::write(h.join("dotfiles/claude.json"), "{}").unwrap();
+    std::os::unix::fs::symlink("../dotfiles/claude.json", h.join(".claude/.claude.json")).unwrap();
+    let project = tempfile::TempDir::new().unwrap();
+    let output = identified_sh(
+        h,
+        project.path(),
+        &format!("[ -L \"$HOME/.claude.json\" ] && echo LINKED; {SAVE_AS_CLAUDE_CODE_DOES}"),
+    )
+    .output()
+    .expect("run the jail");
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        output.status.code(),
+        Some(71),
+        "no link to save through: {out}"
+    );
+    assert!(!out.contains("LINKED"), "{out}");
+    let link = std::fs::symlink_metadata(h.join(".claude/.claude.json")).unwrap();
+    assert!(
+        link.file_type().is_symlink(),
+        "the person's link was replaced"
+    );
+    assert_eq!(
+        std::fs::read_to_string(h.join("dotfiles/claude.json")).unwrap(),
+        "{}"
+    );
+}
+
+/// A kept settings file a hidden home path covers stays hidden, and the
+/// jail makes no link to it: Claude Code keeps its file in the jail's own
+/// home then, as before. Where the hidden path is not there yet, the
+/// launcher makes it an empty folder, and no link is made to that either.
+///
+/// FAILS ON REVERT: make the link whatever covers the kept file, and the
+/// jail's `~/.claude.json` leads to the hidden place.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_kept_settings_file_a_profile_hides_stays_hidden() {
+    require_bwrap();
+    for there in [true, false] {
+        let home = home_that_hides(&[".claude/.claude.json"]);
+        let h = home.path();
+        std::fs::create_dir_all(h.join(".claude")).unwrap();
+        if there {
+            std::fs::write(h.join(".claude/.claude.json"), "HIDDEN-KEPT").unwrap();
+        }
+        let project = tempfile::TempDir::new().unwrap();
+        let output = identified_sh(
+            h,
+            project.path(),
+            "[ -L \"$HOME/.claude.json\" ] && echo LINKED; \
+             cat \"$HOME/.claude.json\" \"$HOME/.claude/.claude.json\" 2>/dev/null; echo DONE",
+        )
+        .output()
+        .expect("run the jail");
+        let out = String::from_utf8_lossy(&output.stdout);
+        let err = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{there}: {out} {err}");
+        assert!(out.contains("DONE"), "{there}: {out} {err}");
+        assert!(!out.contains("LINKED"), "{there}: a link to it: {out}");
+        assert!(!out.contains("HIDDEN-KEPT"), "{there}: it was read: {out}");
+    }
+}
+
 /// What the btrfs side of [`no_jail_on_this_disk_makes_a_subvolume_or_snapshot`]
 /// runs, in a folder (`$1`) that holds a subvolume `src` of this user's,
 /// with the `btrfs` tool at `$2`: the tool's `subvolume create` and
