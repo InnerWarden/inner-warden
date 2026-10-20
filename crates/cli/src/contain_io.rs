@@ -1192,7 +1192,11 @@ fn make_place(place: &Path) -> bool {
 /// hides that a link leads somewhere not there yet is made, empty and 0700
 /// ([`make_place`]), so the jail's mount lands on a folder of the person's;
 /// one that cannot be made cannot hold anything either, and its masks are
-/// dropped, so the jail never fails to start over it.
+/// dropped, so the jail never fails to start over it. Then each folder the
+/// jail pins ([`crate::contain::linux_pins`]) that is not there yet is made
+/// the same way, where it leads on the host: bwrap would make it anyway, as
+/// the way to the mount below it, but after the pins, and so unpinned. One
+/// that cannot be made stops bwrap at its pin.
 #[cfg(target_os = "linux")]
 fn with_linked_places_made(input: &JailInputs) -> JailInputs {
     let mut input = input.clone();
@@ -1202,6 +1206,11 @@ fn with_linked_places_made(input: &JailInputs) -> JailInputs {
         }
         input.linked_masks.retain(|mask| !views.contains(&mask.abs));
         input.iw_config_shown.retain(|view| !views.contains(view));
+    }
+    for (_, folder) in crate::contain::linux_pins(&input) {
+        if std::fs::symlink_metadata(&folder).is_err() {
+            make_place(&resolved_through_existing(&folder));
+        }
     }
     input
 }
