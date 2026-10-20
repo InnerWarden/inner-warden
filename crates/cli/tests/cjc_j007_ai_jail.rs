@@ -2386,9 +2386,8 @@ fn a_dotdir_behind_a_chain_of_two_links_stays_hidden() {
 /// A dotdir that a link leads outside the home, where a Linux jail shows
 /// nothing (the jail's root and home are empty folders of its own): the
 /// place is not in the jail, and nothing is said of it, on every launch,
-/// as if it were exposed (M30-R4). The same through a link in `~/.config`,
-/// which a program in the jail can change: never covered out of the
-/// person's own places, and not in the jail either.
+/// as if it were exposed (M30-R4). (Through a link a program in the jail
+/// can change, such a launch is refused: M30C-1.)
 ///
 /// FAILS ON REVERT: say every place a link leads out of the home (the rule
 /// before M30-R4) and a line says the keys are not hidden.
@@ -2401,21 +2400,14 @@ fn a_dotdir_that_leads_where_the_jail_shows_nothing_is_not_in_it_and_nothing_is_
         let h = home.path();
         let elsewhere = tempfile::TempDir::new().unwrap();
         let keys = elsewhere.path().join("ssh");
-        let gpg = elsewhere.path().join("gpg");
-        for dir in [&keys, &gpg] {
-            std::fs::create_dir_all(dir).unwrap();
-            std::fs::write(dir.join("id_test"), "CJC-J007-SSH-KEY").unwrap();
-        }
+        std::fs::create_dir_all(&keys).unwrap();
+        std::fs::write(keys.join("id_test"), "CJC-J007-SSH-KEY").unwrap();
         std::os::unix::fs::symlink(&keys, h.join(".ssh")).unwrap();
         std::fs::create_dir_all(h.join(".config")).unwrap();
-        std::os::unix::fs::symlink(".config/gpg", h.join(".gnupg")).unwrap();
-        std::os::unix::fs::symlink(&gpg, h.join(".config/gpg")).unwrap();
         let project = tempfile::TempDir::new().unwrap();
         let script = format!(
-            "cat '{}/id_test' '{}/id_test' \"$HOME/.ssh/id_test\" \"$HOME/.config/gpg/id_test\" \
-             2>/dev/null; echo DONE",
+            "cat '{}/id_test' \"$HOME/.ssh/id_test\" 2>/dev/null; echo DONE",
             keys.display(),
-            gpg.display()
         );
         let output = jail_sh(identity, h, project.path(), &script);
         let out = String::from_utf8_lossy(&output.stdout);
@@ -2427,6 +2419,98 @@ fn a_dotdir_that_leads_where_the_jail_shows_nothing_is_not_in_it_and_nothing_is_
             "identity={identity}: {out}"
         );
         assert!(!err.contains("leads"), "identity={identity}: {err}");
+    }
+}
+
+/// M30C-1: a dotdir the jail never shows whose way goes through a link in
+/// a folder the jail writes: `~/.aws` a link to `~/.cache/aws-link`, itself
+/// a link to `~/.cache/aws`, and `~/.gnupg` through `~/.config/gpg` to a
+/// folder outside the home. The jail hid where they lead, but a program in
+/// it replaced the middle link with a folder of its own, on the host, and
+/// the host's `aws` (`credential_process`) or `gpg` (`pinentry-program`)
+/// then ran what it put there. The launch is refused, plain, identified
+/// and dry, naming the link; nothing runs, and each host link is as it
+/// was.
+///
+/// FAILS ON REVERT: drop the refusal from `plan_linked_places` and the
+/// jail replaces `~/.cache/aws-link`: the host's `~/.aws` leads to the
+/// agent's folder.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_dotdir_through_a_link_the_jail_can_change_is_refused_and_the_hosts_link_stays() {
+    require_bwrap();
+    for (identity, dry, gpg) in [
+        (false, false, false),
+        (true, false, false),
+        (false, true, false),
+        (false, false, true),
+    ] {
+        let home = tempfile::TempDir::new().unwrap();
+        let h = std::fs::canonicalize(home.path()).unwrap();
+        let elsewhere = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(h.join(".cache/aws")).unwrap();
+        std::fs::create_dir_all(h.join(".config")).unwrap();
+        std::fs::write(h.join(".cache/aws/config"), "[default]\n").unwrap();
+        let (named, middle, target) = if gpg {
+            let target = elsewhere.path().join("gpg");
+            std::fs::create_dir_all(&target).unwrap();
+            (h.join(".gnupg"), h.join(".config/gpg"), target)
+        } else {
+            (
+                h.join(".aws"),
+                h.join(".cache/aws-link"),
+                h.join(".cache/aws"),
+            )
+        };
+        std::os::unix::fs::symlink(&middle, &named).unwrap();
+        std::os::unix::fs::symlink(&target, &middle).unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        let script = format!(
+            "rm '{0}' && mkdir '{0}' && echo 'credential_process = sh -c pwned' > '{0}/config'; \
+             echo DONE",
+            middle.display()
+        );
+        let output = if dry {
+            cli()
+                .args([
+                    "contain",
+                    "--dry-run",
+                    "--project",
+                    project.path().to_str().unwrap(),
+                    "--",
+                    "true",
+                ])
+                .env("HOME", &h)
+                .output()
+                .expect("dry run")
+        } else {
+            jail_sh(identity, &h, project.path(), &script)
+        };
+        let out = String::from_utf8_lossy(&output.stdout);
+        let err = String::from_utf8_lossy(&output.stderr);
+        let case = format!("identity={identity} dry={dry} gpg={gpg}");
+        assert_eq!(output.status.code(), Some(2), "{case}: {out} {err}");
+        assert!(!out.contains("DONE"), "{case}: {out}");
+        assert!(
+            err.contains(&format!(
+                "{} goes through {}, a link in a folder a program in the jail can write",
+                named.display(),
+                middle.display()
+            )),
+            "{case}: {err}"
+        );
+        assert!(
+            std::fs::symlink_metadata(&middle)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "{case}: the host's link was replaced"
+        );
+        assert_eq!(
+            std::fs::canonicalize(&named).unwrap(),
+            std::fs::canonicalize(&target).unwrap(),
+            "{case}: the host's dotdir leads elsewhere"
+        );
     }
 }
 
@@ -2841,51 +2925,56 @@ fn an_llm_or_notify_config_planted_in_the_jail_is_never_read() {
     assert!(!h.join(".config/innerwarden/llm.toml").exists());
 }
 
-/// The launcher's records folder in an identified jail, where
-/// `~/.local/state` is a link (by an absolute path) into `~/.cache`: the
-/// jail covered the folder as named, through that link, and bwrap aborted
-/// every identified launch ("Can't mkdir parents for
-/// .../.local/state/innerwarden/instances"). It starts now; the records are
-/// covered where they are, so the jail neither lists them nor forges one
-/// at either name.
+/// M30C-4: the launcher's records folder in an identified jail, where
+/// `~/.local/state` is a link (by an absolute path) into `~/.cache`. The
+/// link sits in the `~/.local` the jail binds read-write, and no mount pins
+/// a link: a program in the jail could replace it with a folder of its own,
+/// on the host, and the launcher would then keep its records, and read
+/// them, there. Such a launch is refused (it never started before either:
+/// bwrap could not mount through the link), naming the link; nothing runs,
+/// and the host's link is as it was.
 ///
-/// FAILS ON REVERT: keep the folder as named in `records_dirs` (drop the
-/// `goes_through_a_link` check) and the jail does not start.
+/// FAILS ON REVERT: drop the refusal from `resolve_inputs` and the jail
+/// starts and replaces the link: the host's `~/.local/state` is the
+/// agent's folder.
 #[cfg(target_os = "linux")]
 #[test]
-fn an_identified_jail_starts_where_the_records_folder_is_behind_a_link() {
+fn an_identified_jail_where_the_records_folder_is_behind_a_link_is_refused() {
     require_bwrap();
     let home = tempfile::TempDir::new().unwrap();
-    let h = home.path();
+    let h = std::fs::canonicalize(home.path()).unwrap();
     std::fs::create_dir_all(h.join(".local")).unwrap();
     std::fs::create_dir_all(h.join(".cache/state")).unwrap();
-    std::os::unix::fs::symlink(h.join(".cache/state"), h.join(".local/state")).unwrap();
+    let link = h.join(".local/state");
+    std::os::unix::fs::symlink(h.join(".cache/state"), &link).unwrap();
     let project = tempfile::TempDir::new().unwrap();
-    let script = "set -- \"$HOME/.local/state/innerwarden/instances\" \
-                  \"$HOME/.cache/state/innerwarden/instances\"; \
-                  for d in \"$@\"; do echo \"seen=$(ls -A \"$d\" 2>/dev/null | wc -l | tr -d ' ')\"; done; \
-                  for d in \"$@\"; do ( echo forged > \"$d/forged.json\" ) 2>/dev/null; done; echo DONE";
-    let output = identified_sh(h, project.path(), script)
+    let script =
+        "rm \"$HOME/.local/state\" && mkdir -p \"$HOME/.local/state/innerwarden/instances\" \
+                  && echo forged > \"$HOME/.local/state/innerwarden/instances/forged.json\"; \
+                  echo DONE";
+    let output = identified_sh(&h, project.path(), script)
         .output()
         .expect("run the jail");
     let out = String::from_utf8_lossy(&output.stdout);
     let err = String::from_utf8_lossy(&output.stderr);
-    assert!(output.status.success(), "{out} {err}");
-    assert!(out.contains("DONE"), "{out} {err}");
-    assert!(!out.contains("seen=1"), "the records were listed: {out}");
-    let records = h.join(".cache/state/innerwarden/instances");
-    let names: Vec<_> = std::fs::read_dir(&records)
-        .expect("the launcher's records folder")
-        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-        .collect();
+    assert_eq!(output.status.code(), Some(2), "{out} {err}");
+    assert!(!out.contains("DONE"), "{out}");
     assert!(
-        !names.iter().any(|name| name == "forged.json"),
-        "a forged record reached the host: {names:?}"
+        err.contains(&format!(
+            "{} goes through {}, a link in a folder a program in the jail can write",
+            h.join(".local/state/innerwarden/instances").display(),
+            link.display()
+        )),
+        "{err}"
     );
     assert!(
-        names.iter().any(|name| name.ends_with(".json")),
-        "the launcher's own record: {names:?}"
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the host's link was replaced"
     );
+    assert_eq!(std::fs::read_link(&link).unwrap(), h.join(".cache/state"));
 }
 
 /// A `deny_read` path that a link in the project (which the agent writes)

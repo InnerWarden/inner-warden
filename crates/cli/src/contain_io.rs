@@ -389,9 +389,9 @@ fn resolve_inputs(
                 &real,
             ));
         }
-        let mut linked = crate::contain::plan_linked_places(&[place], &facts, &[], false);
-        // Left as it is: needed, a loop, or onto what the jail runs on
-        // through a link a program in the jail can change.
+        // Through a link a program in the jail can change: refused.
+        let mut linked = crate::contain::plan_linked_places(&[place], &facts, &[], false)?;
+        // Left as it is: needed, or a loop.
         let iw_left = linked.hidden.is_empty();
         left.append(&mut linked.left);
         (real, Vec::new(), iw_left)
@@ -423,7 +423,8 @@ fn resolve_inputs(
     // The dotdirs the jail never shows, where a link leads one into a
     // folder it shows (`~/.ssh` a link to `.config/ssh`): covered there too
     // on Linux, denied where it leads on macOS. Empty in every common
-    // layout.
+    // layout. One through a link a program in the jail can change (one in
+    // `~/.config`, the project, `/tmp`) refuses the launch.
     let mut dotdirs_linked = crate::contain::plan_linked_places(
         &crate::contain::never_shown_home_paths(&home, facts.macos)
             .iter()
@@ -436,7 +437,7 @@ fn resolve_inputs(
         ]
         .concat(),
         false,
-    );
+    )?;
     left.append(&mut dotdirs_linked.left);
     // Each plan holds only its own OS's: masks on Linux, denies on macOS.
     let mut linked_masks = dotdirs_linked.masks;
@@ -480,17 +481,21 @@ fn resolve_inputs(
             std::env::var("XDG_STATE_HOME").ok().as_deref(),
             &home,
         );
+        // Linux: never through a link in a folder the jail writes
+        // (`~/.local/state` a link): a program in the jail could replace
+        // that link on the host, and the launcher would keep its records,
+        // and read them, in a folder of the agent's. Refused, as
+        // InnerWarden's own folder kept as a link is. A link the jail
+        // cannot change (`~/.local` itself a link, in the home) is fine.
+        if !facts.macos {
+            let (_, links) = trace_links(&nominal);
+            if let Some(link) = crate::contain::steering_link(&links, None, &facts.writable) {
+                return Err(crate::contain::steered_link_refused(&nominal, link));
+            }
+        }
         let real = leads_to(&nominal).unwrap_or_else(|| resolved_through_existing(&nominal));
-        // Never as named where a link below the home folder it is in leads
-        // it elsewhere (`~/.local/state` a link): bwrap would make the
-        // mount point through the link in its own root, and the jail never
-        // started. Where it leads is hidden, and the launcher makes it there.
         let named = [nominal.clone(), real.clone()];
-        let mut dirs = if goes_through_a_link(&home, &nominal) {
-            vec![real.clone()]
-        } else {
-            vec![nominal]
-        };
+        let mut dirs = vec![nominal];
         if real != dirs[0] {
             dirs.push(real.clone());
         }
@@ -910,17 +915,17 @@ fn deny_read_places(
 /// A place the jail hides, as found on the host: where it leads
 /// ([`leads_to`]), whether something is there and whether it is a folder
 /// (`metadata`, which follows the links, so both describe what is there),
-/// and whether a link on the way sits in a folder the jail writes
-/// (`writable`, [`crate::contain::steerable`]). `hidden_as_named`: the jail
-/// hides the place as named (a dotdir, InnerWarden's folder), so its own
-/// entry is not the jail's to change.
+/// and the first link on the way that sits in a folder the jail writes
+/// (`writable`, [`crate::contain::steering_link`]), also where the links
+/// loop. `hidden_as_named`: the jail hides the place as named (a dotdir,
+/// InnerWarden's folder), so its own entry is not the jail's to change.
 fn hidden_place(
     nominal: &Path,
     writable: &[PathBuf],
     hidden_as_named: bool,
 ) -> crate::contain::HiddenPlace {
     let meta = std::fs::metadata(nominal);
-    let traced = trace(nominal);
+    let (at, links) = trace_links(nominal);
     let own_entry = hidden_as_named
         .then(|| nominal.parent().zip(nominal.file_name()))
         .flatten()
@@ -931,10 +936,8 @@ fn hidden_place(
         });
     crate::contain::HiddenPlace {
         nominal: nominal.to_path_buf(),
-        steerable: traced.as_ref().is_some_and(|(_, links)| {
-            crate::contain::steerable(links, own_entry.as_deref(), writable)
-        }),
-        leads_to: traced.map(|(at, _)| at),
+        steered_by: crate::contain::steering_link(&links, own_entry.as_deref(), writable).cloned(),
+        leads_to: at,
         there: meta.is_ok(),
         is_dir: meta.is_ok_and(|meta| meta.is_dir()),
     }
@@ -1009,9 +1012,19 @@ pub(crate) fn leads_to(path: &Path) -> Option<PathBuf> {
 /// [`leads_to`], with each link followed on the way, as found on the host
 /// (the folder it sits in with every link before it followed).
 pub(crate) fn trace(path: &Path) -> Option<(PathBuf, Vec<PathBuf>)> {
+    match trace_links(path) {
+        (Some(at), links) => Some((at, links)),
+        (None, _) => None,
+    }
+}
+
+/// [`trace`], with the links it followed also where it gives no place
+/// (they loop, or one cannot be read): a link a program in the jail can
+/// change is one on a way that loops too.
+fn trace_links(path: &Path) -> (Option<PathBuf>, Vec<PathBuf>) {
     use std::path::Component;
     if !path.is_absolute() {
-        return None;
+        return (None, Vec::new());
     }
     // The steps still to take, the next one last.
     let mut todo: Vec<std::ffi::OsString> = Vec::new();
@@ -1040,10 +1053,12 @@ pub(crate) fn trace(path: &Path) -> Option<(PathBuf, Vec<PathBuf>)> {
         match std::fs::symlink_metadata(&at) {
             Ok(meta) if meta.file_type().is_symlink() => {
                 if links.len() >= MAX_LINKS {
-                    return None;
+                    return (None, links);
                 }
                 links.push(at.clone());
-                let target = std::fs::read_link(&at).ok()?;
+                let Ok(target) = std::fs::read_link(&at) else {
+                    return (None, links);
+                };
                 at.pop();
                 if target.is_absolute() {
                     at = PathBuf::from("/");
@@ -1054,7 +1069,7 @@ pub(crate) fn trace(path: &Path) -> Option<(PathBuf, Vec<PathBuf>)> {
             Err(_) => gone = true,
         }
     }
-    Some((at, links))
+    (Some(at), links)
 }
 
 /// Make `place`, which is not there, as an empty folder, mode 0700, and
@@ -3854,13 +3869,14 @@ mod tests {
     }
 
     /// Each link followed on the way is found where it sits, and a place
-    /// is steerable only through a link in a folder the jail writes: a
+    /// is steered only through a link in a folder the jail writes: a
     /// `.env` link in the project always; a dotdir only past its own entry
     /// (`~/.ssh` itself sits in the home, which the jail never writes),
     /// through a second link in `~/.config`.
     ///
     /// FAILS ON REVERT: count the dotdir's own entry, or skip the links
-    /// `trace` follows, and `.ssh` and `.env` swap answers.
+    /// `trace` follows, and `.ssh` and `.env` swap answers; drop the links
+    /// of a way that loops and `~/.aws` names none.
     #[cfg(unix)]
     #[test]
     fn a_place_is_steerable_only_through_a_link_the_jail_can_change() {
@@ -3878,10 +3894,29 @@ mod tests {
         assert_eq!(at, home.join(".config/ssh-real"));
         assert_eq!(links, [home.join(".ssh"), home.join(".config/ssh")]);
         let writable = [home.join(".config"), project.clone()];
-        assert!(hidden_place(&home.join(".ssh"), &writable, true).steerable);
-        assert!(!hidden_place(&home.join(".gnupg"), &writable, true).steerable);
-        assert!(hidden_place(&project.join(".env"), &writable, false).steerable);
-        assert!(!hidden_place(&project.join(".env"), &[], false).steerable);
+        assert_eq!(
+            hidden_place(&home.join(".ssh"), &writable, true).steered_by,
+            Some(home.join(".config/ssh"))
+        );
+        assert_eq!(
+            hidden_place(&home.join(".gnupg"), &writable, true).steered_by,
+            None
+        );
+        assert_eq!(
+            hidden_place(&project.join(".env"), &writable, false).steered_by,
+            Some(project.join(".env"))
+        );
+        assert_eq!(
+            hidden_place(&project.join(".env"), &[], false).steered_by,
+            None
+        );
+        // M30C-1: a way that loops still names the link the jail can change.
+        symlink("loop-b", home.join(".config/loop-a")).unwrap();
+        symlink("loop-a", home.join(".config/loop-b")).unwrap();
+        symlink(".config/loop-a", home.join(".aws")).unwrap();
+        let looped = hidden_place(&home.join(".aws"), &writable, true);
+        assert_eq!(looped.leads_to, None);
+        assert_eq!(looped.steered_by, Some(home.join(".config/loop-a")));
         let place = hidden_place(&home.join(".gnupg"), &writable, true);
         assert_eq!(place.leads_to, Some(home.join(".config/ssh-real")));
         assert!(place.there && place.is_dir);

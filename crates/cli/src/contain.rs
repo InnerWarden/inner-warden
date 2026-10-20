@@ -473,11 +473,12 @@ pub struct HiddenPlace {
     pub there: bool,
     /// What is there is a folder (a place not there yet is made as one).
     pub is_dir: bool,
-    /// A link on the way sits in a folder the jail writes
-    /// ([`PlaceFacts::writable`], [`steerable`]): a program in the jail can
-    /// change where the place leads at the next launch. Every `deny_read`
-    /// link in the project is one.
-    pub steerable: bool,
+    /// The first link on the way that sits in a folder the jail writes
+    /// ([`PlaceFacts::writable`], [`steering_link`]): a program in the jail
+    /// can replace it, on the host, and change where the place leads. Every
+    /// `deny_read` link in the project is one. Read also where the links
+    /// loop.
+    pub steered_by: Option<PathBuf>,
 }
 
 /// What the jail does with the places it hides that a link leads
@@ -585,7 +586,7 @@ pub struct PlaceFacts {
     /// dotfiles, a profile's `extra_ro`): own too, for a place that is there.
     pub own_read_only: Vec<PathBuf>,
     /// The host folders the jail writes, as named and as they lead
-    /// ([`HiddenPlace::steerable`]).
+    /// ([`HiddenPlace::steered_by`]).
     pub writable: Vec<PathBuf>,
     /// What the guard needs as it is, as named and as it leads: its binary,
     /// the agent's command, the agent's settings that carry the hook, the
@@ -750,19 +751,45 @@ pub fn place_facts(
     }
 }
 
-/// PURE. Whether a program in the jail can change where a place leads: a
-/// link on the way (`links`, each as found on the host) sits in a folder
-/// the jail writes (`writable`). `own_entry` is the place's own entry where
-/// the jail hides it as named (a dotdir, InnerWarden's folder), which the
-/// jail cannot change; every other link counts.
-pub fn steerable(links: &[PathBuf], own_entry: Option<&Path>, writable: &[PathBuf]) -> bool {
+/// PURE. The link through which a program in the jail can change where a
+/// place leads: the first link on the way (`links`, each as found on the
+/// host) that sits in a folder the jail writes (`writable`). `own_entry`
+/// is the place's own entry where the jail hides it as named (a dotdir,
+/// InnerWarden's folder), which the jail cannot change; every other link
+/// counts.
+pub fn steering_link<'a>(
+    links: &'a [PathBuf],
+    own_entry: Option<&Path>,
+    writable: &[PathBuf],
+) -> Option<&'a PathBuf> {
     links
         .iter()
         .filter(|link| Some(link.as_path()) != own_entry)
-        .any(|link| {
+        .find(|link| {
             link.parent()
                 .is_some_and(|folder| writable.iter().any(|w| folder.starts_with(w)))
         })
+}
+
+/// A place the host reaches by name (a dotdir the jail never shows,
+/// InnerWarden's own folder, the launcher's records) through a link that
+/// sits in a folder the jail writes refuses the launch, as InnerWarden's
+/// folder kept as a link does on Linux ([`iw_folder_link_refused`]): no
+/// mount or deny pins a link, so a program in the jail could replace it on
+/// the host with a folder of its own, and the host's `ssh`, `gpg`, `aws` or
+/// guard would read what it put there (an `ssh` config's `Match exec`, a
+/// `credential_process`). The remedy is to take that link off the way.
+pub fn steered_link_refused(nominal: &Path, link: &Path) -> ContainError {
+    ContainError::Unsupported(format!(
+        "{} goes through {}, a link in a folder a program in the jail can write: that program \
+         could replace the link on the host, and the host would then find its files at {}. \
+         Replace the link with what it leads to, or link {} straight to its place, and start \
+         the jail again",
+        printable(nominal),
+        printable(link),
+        printable(nominal),
+        printable(nominal)
+    ))
 }
 
 /// Said of a hidden place that a link a program in the jail can change
@@ -837,18 +864,20 @@ pub(crate) fn printable(path: &Path) -> String {
 /// those in `covered`, which are covered already. On macOS it is denied
 /// where it leads, also outside the home.
 ///
-/// Never a refusal: a link a person keeps never stops the jail. A place
-/// that leads onto what the jail needs ([`PlaceFacts::needs`]: the guard,
-/// the agent's settings, the folder of the system profiles, in or above
-/// them; the project, a read-only path or the system, above them) is left
-/// as it is, and so is one whose links loop. A place a link that a program
-/// in the jail can change leads to ([`HiddenPlace::steerable`]) is left
-/// where a mask or deny could land on what the jail runs on
-/// ([`PlaceFacts::leaves_steered`]). Each is said (`LinkedPlan::left`), on
-/// Linux only where the jail shows it. A place not there yet is covered
-/// only where the jail shows it read-write, and made first
-/// ([`LinkedPlan::missing`]). A dotdir hidden inside the project
-/// (`from_deny_read` false) is said too.
+/// A refusal only for a place the host reaches by name (`from_deny_read`
+/// false: a dotdir, InnerWarden's folder) through a link a program in the
+/// jail can change ([`HiddenPlace::steered_by`], [`steered_link_refused`]),
+/// wherever that link leads, loops included: no mount or deny pins a link.
+/// Otherwise a link a person keeps never stops the jail. A place that
+/// leads onto what the jail needs ([`PlaceFacts::needs`]: the guard, the
+/// agent's settings, the folder of the system profiles, in or above them;
+/// the project, a read-only path or the system, above them) is left as it
+/// is, and so is one whose links loop. Each is said (`LinkedPlan::left`).
+/// A place not there yet is covered only where the jail shows it
+/// read-write, and made first ([`LinkedPlan::missing`]). A dotdir hidden
+/// inside the project (`from_deny_read` false) is said too. A `deny_read`
+/// place a link the agent can change leads where a mask could land on what
+/// the jail runs on was left before ([`plan_denied_paths`]).
 ///
 /// A place with no link on the way and no folder shown above it gives
 /// nothing: in every common layout the jail is the one it was.
@@ -857,9 +886,12 @@ pub fn plan_linked_places(
     facts: &PlaceFacts,
     covered: &[PathBuf],
     from_deny_read: bool,
-) -> LinkedPlan {
+) -> Result<LinkedPlan, ContainError> {
     let mut plan = LinkedPlan::default();
     for place in places {
+        if let (false, Some(link)) = (from_deny_read, &place.steered_by) {
+            return Err(steered_link_refused(&place.nominal, link));
+        }
         let Some(leads_to) = &place.leads_to else {
             plan.left.push(left_loop(&place.nominal));
             continue;
@@ -867,11 +899,6 @@ pub fn plan_linked_places(
         let linked = *leads_to != place.nominal;
         if linked && facts.needs(leads_to) {
             plan.left.push(left_needed(&place.nominal, leads_to));
-            continue;
-        }
-        if linked && place.steerable && facts.leaves_steered(leads_to, place.there) {
-            plan.left
-                .extend(facts.said_steered(&place.nominal, leads_to));
             continue;
         }
         if linked && !from_deny_read {
@@ -923,7 +950,7 @@ pub fn plan_linked_places(
             is_dir: place.is_dir || !place.there,
         }));
     }
-    plan
+    Ok(plan)
 }
 
 /// PURE. The project paths `deny_read` names (`found`), as the jail hides
@@ -951,7 +978,7 @@ pub fn plan_denied_paths(found: &[HiddenPlace], facts: &PlaceFacts) -> (Vec<Deny
                 left.push(left_needed(&place.nominal, leads_to));
                 continue;
             }
-            if place.steerable && facts.leaves_steered(leads_to, true) {
+            if place.steered_by.is_some() && facts.leaves_steered(leads_to, true) {
                 left.extend(facts.said_steered(&place.nominal, leads_to));
                 continue;
             }
@@ -966,7 +993,8 @@ pub fn plan_denied_paths(found: &[HiddenPlace], facts: &PlaceFacts) -> (Vec<Deny
         kept.push(place.clone());
     }
     let covered: Vec<PathBuf> = masks.iter().map(|mask| mask.abs.clone()).collect();
-    let mut linked = plan_linked_places(&kept, facts, &covered, true);
+    // `deny_read` places never refuse: the project is the agent's to write.
+    let mut linked = plan_linked_places(&kept, facts, &covered, true).unwrap_or_default();
     left.append(&mut linked.left);
     linked.left = left;
     (masks, linked)
@@ -8228,16 +8256,24 @@ mod tests {
             leads_to: leads_to.map(PathBuf::from),
             there,
             is_dir,
-            steerable: false,
+            steered_by: None,
         }
     }
 
-    /// [`place`], through a link a program in the jail can change (every
-    /// `deny_read` link in the project is one).
+    /// [`place`], through a link a program in the jail can change: the
+    /// place's own entry (every `deny_read` link in the project is one).
     fn steered(nominal: &str, leads_to: &str, there: bool, is_dir: bool) -> HiddenPlace {
         HiddenPlace {
-            steerable: true,
+            steered_by: Some(PathBuf::from(nominal)),
             ..place(nominal, Some(leads_to), there, is_dir)
+        }
+    }
+
+    /// [`place`], through `link`, a link a program in the jail can change.
+    fn steered_through(nominal: &str, link: &str, leads_to: Option<&str>) -> HiddenPlace {
+        HiddenPlace {
+            steered_by: Some(PathBuf::from(link)),
+            ..place(nominal, leads_to, true, true)
         }
     }
 
@@ -8272,8 +8308,8 @@ mod tests {
         real: impl Fn(&Path) -> PathBuf + Copy,
     ) -> (LinkedPlan, LinkedPlan) {
         (
-            plan_linked_places(places, &facts_of(input, false, real), &[], false),
-            plan_linked_places(places, &facts_of(input, true, real), &[], false),
+            plan_linked_places(places, &facts_of(input, false, real), &[], false).unwrap(),
+            plan_linked_places(places, &facts_of(input, true, real), &[], false).unwrap(),
         )
     }
 
@@ -8400,23 +8436,18 @@ mod tests {
         }
     }
 
-    /// Never a refusal, and never a mask or deny laid by a link onto what
-    /// the jail needs: a dotdir that leads onto the agent's settings, the
-    /// project or the folder that holds the guard is left as it is, as is
-    /// one whose links loop; each is said, and the jail starts. A person's
-    /// own link out of the home (no link on the way a program in the jail
-    /// can change) is denied there on macOS, where the jail reads
-    /// everywhere else; on Linux that place is not in the jail, and nothing
-    /// is said of it. Through a link a program in the jail can change, a
-    /// place outside the home is left where a mount (Linux) or a deny
-    /// (macOS) could land on what the jail runs on, and said where the jail
-    /// shows it; elsewhere on macOS it is denied. A dotdir that leads into
-    /// the project is hidden there, and said.
+    /// Never a mask or deny laid by a link onto what the jail needs: a
+    /// dotdir that leads onto the agent's settings, the project or the
+    /// folder that holds the guard is left as it is, as is one whose links
+    /// loop; each is said, and the jail starts. A person's own link out of
+    /// the home (no link on the way a program in the jail can change) is
+    /// denied there on macOS, where the jail reads everywhere else; on Linux
+    /// that place is not in the jail, and nothing is said of it. A dotdir
+    /// that leads into the project is hidden there, and said.
     ///
     /// FAILS ON REVERT: drop the needed check from `plan_linked_places` and
     /// the jail's `~/.claude` (its hook) and the project are covered; deny
-    /// no place outside the home on macOS and `/srv/keys/ssh` is readable;
-    /// say every steered place on Linux and one not in the jail is said.
+    /// no place outside the home on macOS and `/srv/keys/ssh` is readable.
     #[test]
     fn a_hidden_place_a_link_leads_out_of_the_home_or_onto_what_the_jail_needs_is_left_and_said() {
         let input = inputs(&["claude", "--print"]);
@@ -8456,20 +8487,6 @@ mod tests {
                 )]
             );
         }
-        // Through a link a program in the jail can change.
-        let places = [
-            steered("/home/dev/.ssh", "/etc/ssh-keys", true, true),
-            steered("/home/dev/.gnupg", "/srv/gpg", true, true),
-            steered("/home/dev/.aws", "/home/dev/.cache/aws", true, true),
-        ];
-        let (linux, macos) = dotdir_plans(&places, &input, Path::to_path_buf);
-        let said = "/home/dev/.ssh leads outside your home, to /etc/ssh-keys, through a link a \
-                    program in the jail can change: the jail does not hide that place; to hide \
-                    it, keep it in your home";
-        assert_eq!(linux.left, [said]);
-        assert_eq!(linux.masks, [mask("/home/dev/.cache/aws", true)]);
-        assert_eq!(macos.left, [said]);
-        assert_eq!(macos.denies, paths(&["/srv/gpg", "/home/dev/.cache/aws"]));
         // A project outside the home is the person's own: a dotdir that
         // leads into it is covered there, and said.
         let mut elsewhere = input.clone();
@@ -8485,6 +8502,54 @@ mod tests {
         assert_eq!(linux.left, [into]);
         assert_eq!(macos.denies, paths(&["/srv/work/keys"]));
         assert_eq!(macos.left, [into]);
+    }
+
+    /// M30C-1: a dotdir the jail never shows whose way goes through a link
+    /// in a folder the jail writes (`~/.aws` a link to `~/.cache/aws-link`,
+    /// itself a link to `~/.cache/aws`). The jail hid `~/.cache/aws`, but a
+    /// program in it could replace `~/.cache/aws-link` with a folder of its
+    /// own, on the host, and the host's `aws` then ran its
+    /// `credential_process`. No mount or deny pins a link, so such a launch
+    /// is refused, on Linux and macOS, wherever the link leads (the person's
+    /// own places, outside the home, onto what the jail needs, round in a
+    /// loop), naming the link. A link the jail cannot change, the dotdir's
+    /// own entry, is no refusal.
+    ///
+    /// FAILS ON REVERT: drop the refusal from `plan_linked_places` and the
+    /// jail covers `~/.cache/aws` and starts.
+    #[test]
+    fn a_dotdir_through_a_link_the_jail_can_change_is_refused() {
+        let input = inputs(&["claude", "--print"]);
+        for macos in [false, true] {
+            let facts = facts_of(&input, macos, Path::to_path_buf);
+            for leads_to in [
+                Some("/home/dev/.cache/aws"),
+                Some("/srv/aws"),
+                Some("/home/dev/.claude"),
+                None,
+            ] {
+                let place =
+                    steered_through("/home/dev/.aws", "/home/dev/.cache/aws-link", leads_to);
+                let refused = plan_linked_places(&[place], &facts, &[], false)
+                    .unwrap_err()
+                    .to_string();
+                assert_eq!(
+                    refused,
+                    "/home/dev/.aws goes through /home/dev/.cache/aws-link, a link in a folder a \
+                     program in the jail can write: that program could replace the link on the \
+                     host, and the host would then find its files at /home/dev/.aws. Replace the \
+                     link with what it leads to, or link /home/dev/.aws straight to its place, \
+                     and start the jail again",
+                    "macos={macos} {leads_to:?}"
+                );
+            }
+            // A `deny_read` place: the project is the agent's to write.
+            let deny = steered("/home/dev/proj/.env", "/home/dev/.cache/env", true, false);
+            assert!(plan_linked_places(&[deny], &facts, &[], true).is_ok());
+            // The dotdir's own link, in the home, is the person's.
+            let own = place("/home/dev/.aws", Some("/home/dev/.cache/aws"), true, true);
+            assert!(plan_linked_places(&[own], &facts, &[], false).is_ok());
+        }
     }
 
     /// M30-SEC-1: the guard's own files are what the jail needs in either
@@ -8648,9 +8713,9 @@ mod tests {
     /// M30-SEC-3: on macOS the jail reads everywhere it is not denied, so a
     /// dotdir (or InnerWarden's own folder) that a person's own link leads
     /// outside the home is denied where it leads, read and write; the deny
-    /// of the name alone closed only the way through the link. Through a
-    /// link a program in the jail can change, a place of the system is left
-    /// (and said), and any other is denied.
+    /// of the name alone closed only the way through the link. (Through a
+    /// link a program in the jail can change, the launch is refused,
+    /// M30C-1.)
     ///
     /// FAILS ON REVERT: leave every place outside the home on macOS and
     /// `/Volumes/keys/ssh` and `/srv/iw` are not denied.
@@ -8660,17 +8725,15 @@ mod tests {
         let macos = plan_linked_places(
             &[
                 place("/home/dev/.ssh", Some("/Volumes/keys/ssh"), true, true),
-                steered("/home/dev/.gnupg", "/usr/local/gpg", true, true),
-                steered("/home/dev/.aws", "/Volumes/aws", true, true),
+                place("/home/dev/.aws", Some("/Volumes/aws"), true, true),
             ],
             &facts_of(&input, true, Path::to_path_buf),
             &[],
             false,
-        );
+        )
+        .unwrap();
         assert_eq!(macos.denies, paths(&["/Volumes/keys/ssh", "/Volumes/aws"]));
-        assert_eq!(macos.left.len(), 1, "{:?}", macos.left);
-        assert!(macos.left[0]
-            .starts_with("/home/dev/.gnupg leads outside your home, to /usr/local/gpg"));
+        assert!(macos.left.is_empty(), "{:?}", macos.left);
         input.linked_denies = macos.denies;
         input.iw_config_link = true;
         input.iw_config_real = PathBuf::from("/srv/iw");
@@ -8978,7 +9041,8 @@ mod tests {
             &facts_of(&input, true, Path::to_path_buf),
             &[],
             false,
-        );
+        )
+        .unwrap();
         assert!(plan.denies.is_empty() && plan.hidden.is_empty(), "{plan:?}");
         assert_eq!(plan.left.len(), 1);
         input.iw_config_link = true;
@@ -9164,7 +9228,7 @@ mod tests {
                     place(path.to_str().unwrap(), path.to_str(), there, there)
                 })
                 .collect();
-            let plan = plan_linked_places(&dotdirs, &facts, &[], false);
+            let plan = plan_linked_places(&dotdirs, &facts, &[], false).unwrap();
             assert_eq!(plan, LinkedPlan::default(), "macos={macos}");
             let found = [
                 place(
@@ -9307,36 +9371,42 @@ mod tests {
             .any(|(jail, _)| jail == Path::new("/etc")));
     }
 
-    /// Whether a program in the jail can change where a place leads: a link
-    /// on the way that sits in a folder the jail writes; never the place's
-    /// own entry where the jail hides it as named, nor a link in a folder
-    /// it does not write.
+    /// The link through which a program in the jail can change where a
+    /// place leads: the first on the way that sits in a folder the jail
+    /// writes; never the place's own entry where the jail hides it as
+    /// named, nor a link in a folder it does not write.
     #[test]
-    fn a_place_is_steerable_through_a_link_in_a_folder_the_jail_writes() {
+    fn a_place_is_steered_by_a_link_in_a_folder_the_jail_writes() {
         let writable = paths(&["/home/dev/.config", "/home/dev/proj"]);
         let links = |list: &[&str]| paths(list);
-        assert!(steerable(&links(&["/home/dev/proj/.env"]), None, &writable));
-        assert!(steerable(
-            &links(&["/home/dev/.ssh", "/home/dev/.config/ssh"]),
-            Some(Path::new("/home/dev/.ssh")),
-            &writable
-        ));
-        assert!(!steerable(
-            &links(&["/home/dev/.ssh"]),
-            Some(Path::new("/home/dev/.ssh")),
-            &writable
-        ));
-        assert!(!steerable(
-            &links(&["/home/dev/.ssh", "/etc"]),
-            None,
-            &writable
-        ));
-        assert!(!steerable(
-            &links(&["/home/dev/.config/innerwarden"]),
-            Some(Path::new("/home/dev/.config/innerwarden")),
-            &writable
-        ));
-        assert!(!steerable(&[], None, &writable));
+        let found = |list: &[&str], own: Option<&str>| {
+            steering_link(&links(list), own.map(Path::new), &writable).cloned()
+        };
+        assert_eq!(
+            found(&["/home/dev/proj/.env"], None),
+            Some(PathBuf::from("/home/dev/proj/.env"))
+        );
+        assert_eq!(
+            found(
+                &[
+                    "/home/dev/.ssh",
+                    "/home/dev/.config/ssh",
+                    "/home/dev/proj/k"
+                ],
+                Some("/home/dev/.ssh")
+            ),
+            Some(PathBuf::from("/home/dev/.config/ssh"))
+        );
+        assert_eq!(found(&["/home/dev/.ssh"], Some("/home/dev/.ssh")), None);
+        assert_eq!(found(&["/home/dev/.ssh", "/etc"], None), None);
+        assert_eq!(
+            found(
+                &["/home/dev/.config/innerwarden"],
+                Some("/home/dev/.config/innerwarden")
+            ),
+            None
+        );
+        assert_eq!(found(&[], None), None);
     }
 
     const GOLDEN_ARGV_IDENTIFIED: &str = "\
