@@ -256,13 +256,14 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
              can change never hides what the jail runs on: contain leaves such a place,\n  \
              says so, and the jail still starts. On Linux, InnerWarden's own folder kept\n  \
              as a link stops the launch (replace it with the folder it leads to), and a\n  \
-             project, worktree or profile path over where it leads is refused, as one\n  \
-             over where a hidden dotdir leads is. On Linux, with --identity, Claude\n  \
-             Code's settings file is kept in ~/.claude/.claude.json between launches\n  \
-             (your own ~/.claude.json is not shown), and each jail has an empty\n  \
-             ~/.claude/sessions and ~/.claude/backups of its own, so two jails at once\n  \
-             do not write the same session file. That is for Claude Code's folder at\n  \
-             ~/.claude; where a jail cannot have them of its own, contain says so.\n\
+             project, worktree or profile path over where it leads is refused; so is a\n  \
+             worktree or profile path over where a hidden dotdir leads. On Linux, with\n  \
+             --identity, Claude Code's settings file is kept in ~/.claude/.claude.json\n  \
+             between launches (your own ~/.claude.json is not shown), and each jail has\n  \
+             an empty ~/.claude/sessions and ~/.claude/backups of its own, so two jails\n  \
+             at once do not write the same session file. That is for Claude Code's\n  \
+             folder at ~/.claude; where a jail cannot have them of its own, contain\n  \
+             says so.\n\
              \n  \
              On Linux, where the host takes it, every jail starts its programs under\n  \
              a seccomp filter in the style of Flatpak that refuses TIOCSTI and\n  \
@@ -633,7 +634,7 @@ mod tests {
         for said in [
             "Where a place the jail hides (~/.ssh, ~/.gnupg, ~/.aws, a --deny-read path, InnerWarden's own folder) is a link, the place it leads to is hidden too, wherever the jail shows it (on macOS also outside your home).",
             "A link never hides what the jail needs (the guard, the agent's settings, the project, a read-only path), and one a program in the jail can change never hides what the jail runs on: contain leaves such a place, says so, and the jail still starts.",
-            "On Linux, InnerWarden's own folder kept as a link stops the launch (replace it with the folder it leads to), and a project, worktree or profile path over where it leads is refused, as one over where a hidden dotdir leads is.",
+            "On Linux, InnerWarden's own folder kept as a link stops the launch (replace it with the folder it leads to), and a project, worktree or profile path over where it leads is refused; so is a worktree or profile path over where a hidden dotdir leads.",
         ] {
             assert!(help.contains(said), "contain --help lacks {said:?}: {help}");
         }
