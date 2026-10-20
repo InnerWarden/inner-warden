@@ -248,10 +248,12 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
              outside the home, or over what the jail needs, stops the launch. A note\n  \
              from the host about the jail is printed as `innerwarden contain: <note>`.\n  \
              A Linux jail shows the host's resolver file read-only, so names resolve as\n  \
-             on the host. With --identity, Claude Code's settings file is kept in\n  \
-             ~/.claude/.claude.json between launches (your own ~/.claude.json stays\n  \
-             outside), and each jail has its own ~/.claude/sessions, so two jails at\n  \
-             once never write the same session file.\n\
+             on the host. On Linux, with --identity, Claude Code's settings file is\n  \
+             kept in ~/.claude/.claude.json between launches (your own ~/.claude.json\n  \
+             is not shown), and each jail has an empty ~/.claude/sessions and\n  \
+             ~/.claude/backups of its own, so two jails at once do not write the same\n  \
+             session file. That is for Claude Code's folder at ~/.claude; where a jail\n  \
+             cannot have them of its own, contain says so.\n\
              \n  \
              On Linux, where the host takes it, every jail starts its programs under\n  \
              a seccomp filter in the style of Flatpak that refuses TIOCSTI and\n  \
@@ -537,32 +539,50 @@ mod tests {
     }
 
     /// The contain help and the README say where an identified jail keeps
-    /// Claude Code's own state, that the person's own settings file stays
-    /// outside, that each jail has its own sessions folder, and the limit of
-    /// two jails sharing the one file.
+    /// Claude Code's own state, and only what the launcher makes true: on
+    /// Linux only, the person's own settings file not shown, nor its copies
+    /// in `~/.claude/backups`, each jail with its own sessions and backups,
+    /// only for Claude Code's folder at `~/.claude`, the cases it shares,
+    /// the limit of two jails sharing the one file, and that a jail without
+    /// `--identity` still loses the file.
     ///
-    /// FAILS ON REVERT: drop the sentence from the contain help, or the
-    /// README's paragraph or its limit.
+    /// FAILS ON REVERT: drop the sentence from the contain help or its
+    /// "On Linux", or a sentence of the README's paragraphs or its limit.
     #[test]
     fn the_contain_help_and_the_readme_say_where_claude_codes_state_is_kept() {
         let flat = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
         let help = flat(&usage("contain", &[]).expect("contain has usage"));
         for said in [
-            "With --identity, Claude Code's settings file is kept in ~/.claude/.claude.json between launches (your own ~/.claude.json stays outside)",
-            "each jail has its own ~/.claude/sessions, so two jails at once never write the same session file",
+            "On Linux, with --identity, Claude Code's settings file is kept in ~/.claude/.claude.json between launches (your own ~/.claude.json is not shown)",
+            "each jail has an empty ~/.claude/sessions and ~/.claude/backups of its own, so two jails at once do not write the same session file.",
+            "That is for Claude Code's folder at ~/.claude; where a jail cannot have them of its own, contain says so.",
         ] {
             assert!(help.contains(said), "contain --help lacks {said:?}: {help}");
         }
+        assert!(!help.contains("stays outside"), "{help}");
         let readme = flat(include_str!("../../../README.md"));
         for said in [
             "An identified Linux jail keeps Claude Code's own state in the `~/.claude` it already shares with you.",
             "In the jail it now leads to `~/.claude/.claude.json`",
-            "Your own `~/.claude.json` stays outside the jail, and the jail never changes it",
-            "each identified jail has its own empty `~/.claude/sessions`: two jails at once never write the same session file",
-            "Where a hidden home path covers `~/.claude/.claude.json`, or that place is a link or anything other than a file, Claude Code keeps its file in the jail's own home, as before.",
-            "Limit: two jails at once share the one file, and Claude Code's lock on it is each jail's own",
+            "Your own `~/.claude.json` is not shown in the jail, and the jail's Claude Code never uses it. Nor are the copies Claude Code keeps of it in `~/.claude/backups`: each identified jail has an empty `~/.claude/backups` of its own",
+            "Where your own `~/.claude.json` is a link, or a hard link, to a file in `~/.claude`, that file is shared with the jail like the rest of the folder, and the jail makes no link to it.",
+            "each identified jail also has an empty `~/.claude/sessions` of its own: two jails at once do not write the same session file",
+            "Both folders are covered at every place the jail shows them",
+            "All of this is for Claude Code's own folder at `~/.claude`, where it is unless `CLAUDE_CONFIG_DIR` names another",
+            "where a read-only path of the profile shows it, `~/.claude` or `~/.claude.json`",
+            "or where your own `~/.claude.json` is that file or leads into `~/.claude` or to nothing.",
+            "Where one of the two folders cannot be the jail's own (a link is there, the project is inside it, or it could not be made), the jail shows the host's, and `innerwarden contain` says so.",
+            "Limit: two jails at once share the one settings file, and Claude Code's lock on it is each jail's own",
+            "A jail started without `--identity` is unchanged: Claude Code's settings file is still gone at every launch there, and two such jails at once still share `~/.claude/sessions` and see the host's.",
+            "On macOS the jail lets Claude Code use your own `~/.claude.json`, as before.",
         ] {
             assert!(readme.contains(said), "README lacks {said:?}");
+        }
+        for unsaid in [
+            "stays outside the jail",
+            "never write the same session file",
+        ] {
+            assert!(!readme.contains(unsaid), "README still says {unsaid:?}");
         }
     }
 

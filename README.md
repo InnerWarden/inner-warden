@@ -249,20 +249,40 @@ Claude Code's settings file, `~/.claude.json`, used to be gone at every launch
 (and Claude Code said, from the second launch on, that it was missing). In the
 jail it now leads to `~/.claude/.claude.json`, so what Claude Code saves there,
 an MCP server you add or its first-run answers, is still there at the next
-launch. Your own `~/.claude.json` stays outside the jail, and the jail never
-changes it; the first identified launch starts Claude Code with a new file of
-the jail's own, so it may ask its first-run questions once. (Where you point
-Claude Code at `~/.claude` with `CLAUDE_CONFIG_DIR`, `~/.claude/.claude.json`
-is already the file it uses, in the jail and out of it.) Claude Code is
-process 2 in every jail and lists each running session by its process id, so
-each identified jail has its own empty `~/.claude/sessions`: two jails at once
-never write the same session file, and none sees the sessions running outside
-it. Where a hidden home path covers `~/.claude/.claude.json`, or that place is
-a link or anything other than a file, Claude Code keeps its file in the jail's
-own home, as before. Limit: two jails at once share the one file, and Claude
-Code's lock on it is each jail's own, so a change one jail saves at the same
-moment as another can be lost (a save is never left half written). A jail
-started without `--identity` keeps Claude Code's state as before.
+launch. Your own `~/.claude.json` is not shown in the jail, and the jail's
+Claude Code never uses it. Nor are the copies Claude Code keeps of it in
+`~/.claude/backups`: each identified jail has an empty `~/.claude/backups` of
+its own, and the copies made there are gone when the jail ends. The first
+identified launch starts Claude Code with a new file of the jail's own, so it
+may ask its first-run questions once. (Where your own `~/.claude.json` is a
+link, or a hard link, to a file in `~/.claude`, that file is shared with the
+jail like the rest of the folder, and the jail makes no link to it. Where you
+point Claude Code at `~/.claude` with `CLAUDE_CONFIG_DIR`,
+`~/.claude/.claude.json` is the file it uses, in the jail and out of it.)
+Claude Code is process 2 in every jail and lists each running session by its
+process id, so each identified jail also has an empty `~/.claude/sessions` of
+its own: two jails at once do not write the same session file, and none sees
+the sessions running outside it. Both folders are covered at every place the
+jail shows them, a `~/.claude` that is a link into `~/.config` and a project
+that is `~/.claude` included. All of this is for Claude Code's own folder at
+`~/.claude`, where it is unless `CLAUDE_CONFIG_DIR` names another: the jail
+leaves another folder as it is, and jails at once share the session list in
+it.
+
+Claude Code keeps its file in the jail's own home, as before, where a hidden
+home path covers `~/.claude/.claude.json`, where a read-only path of the
+profile shows it, `~/.claude` or `~/.claude.json`, where that place is a link
+or anything other than a file, or where your own `~/.claude.json` is that file
+or leads into `~/.claude` or to nothing. Where one of the two folders cannot be the jail's
+own (a link is there, the project is inside it, or it could not be made), the
+jail shows the host's, and `innerwarden contain` says so. Limit: two jails at
+once share the one settings file, and Claude Code's lock on it is each jail's
+own, so a change one jail saves at the same moment as another can be lost (a
+save is never left half written). A jail started without `--identity` is
+unchanged: Claude Code's settings file is still gone at every launch there,
+and two such jails at once still share `~/.claude/sessions` and see the
+host's. On macOS the jail lets Claude Code use your own `~/.claude.json`, as
+before.
 
 Where a per-agent relaxation applies:
 

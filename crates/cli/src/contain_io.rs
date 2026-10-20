@@ -367,10 +367,18 @@ fn resolve_inputs(
 
     // Only an identified Linux launch keeps Claude Code's own state in the
     // folder the jail shares with the host; without the flag none of it is
-    // read.
+    // read. Read only here: the folders the jail covers are made by the
+    // real run alone, after every check ([`with_claude_folders_made`]).
     #[cfg(target_os = "linux")]
     let claude_state = if args.identity {
-        claude_state_here(&home, args.dry_run)
+        claude_state_for(
+            &args,
+            &home,
+            worktree.as_ref(),
+            &existing_paths,
+            &iw_binary,
+            false,
+        )
     } else {
         crate::contain::ClaudeState::default()
     };
@@ -406,42 +414,159 @@ fn resolve_inputs(
 }
 
 /// Where an identified jail can keep Claude Code's own state, as found on
-/// the host ([`crate::contain::ClaudeState`]). Only where `~/.claude` is a
-/// folder (the jail shares it): its settings file there may be a file or not
-/// there yet, never a link or anything else; its sessions folder must be a
-/// folder of its own. A real launch first makes the sessions folder, empty
-/// and 0700 as Claude Code makes it, where it is not there, so the jail has
-/// a place to cover; a dry run makes nothing and shows what the real run
-/// would do.
+/// the host for `args` ([`claude_state_here`]): what the jail shows of the
+/// host ([`crate::contain::shown_host_folders`]) and what it needs under
+/// it (the project, the worktree's folders, the read-only paths, the
+/// guard).
 #[cfg(target_os = "linux")]
-fn claude_state_here(home: &Path, dry_run: bool) -> crate::contain::ClaudeState {
-    use crate::contain::{ClaudeState, CLAUDE_SESSIONS, CLAUDE_SETTINGS_KEPT};
+fn claude_state_for(
+    args: &ContainArgs,
+    home: &Path,
+    worktree: Option<&crate::contain::Worktree>,
+    existing: &[PathBuf],
+    iw_binary: &Path,
+    make: bool,
+) -> crate::contain::ClaudeState {
+    let shown = crate::contain::shown_host_folders(args, home, worktree, existing, |path| {
+        std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    });
+    let mut needed = vec![args.project.clone(), iw_binary.to_path_buf()];
+    if let Some(worktree) = worktree {
+        needed.push(worktree.git_dir.clone());
+        needed.push(worktree.common_dir.clone());
+    }
+    needed.extend(args.extra_ro.iter().cloned());
+    claude_state_here(home, &shown, &needed, make)
+}
+
+/// Where an identified jail can keep Claude Code's own state, as found on
+/// the host ([`crate::contain::ClaudeState`]). Only where `~/.claude` is a
+/// folder (the jail shares it). Its settings file there may be a file or
+/// not there yet, never a link or anything else, and never the person's
+/// own `~/.claude.json` ([`own_settings_in_claude`]). Each folder of
+/// Claude Code's runs there must be a folder of its own; one that is not
+/// there yet counts as made when `make` is false (a dry run, or the plan
+/// before the checks: nothing is made, and the real run does what it
+/// shows), and is made, empty and 0700 as Claude Code makes it, when `make`
+/// is true (the real run, after every check). Each is covered where the
+/// jail shows it ([`crate::contain::plan_claude_folders`]).
+#[cfg(target_os = "linux")]
+fn claude_state_here(
+    home: &Path,
+    shown: &[(PathBuf, PathBuf)],
+    needed: &[PathBuf],
+    make: bool,
+) -> crate::contain::ClaudeState {
+    use crate::contain::{ClaudeState, CLAUDE_RUN_FOLDERS, CLAUDE_SETTINGS_KEPT};
     use std::io::ErrorKind;
-    use std::os::unix::fs::DirBuilderExt;
-    if !std::fs::metadata(home.join(".claude")).is_ok_and(|meta| meta.is_dir()) {
+    let claude = home.join(".claude");
+    if !std::fs::metadata(&claude).is_ok_and(|meta| meta.is_dir()) {
         return ClaudeState::default();
     }
-    let settings_kept = match std::fs::symlink_metadata(home.join(CLAUDE_SETTINGS_KEPT)) {
+    let Ok(claude_real) = std::fs::canonicalize(&claude) else {
+        return ClaudeState::default();
+    };
+    let kept = home.join(CLAUDE_SETTINGS_KEPT);
+    let settings_kept = match std::fs::symlink_metadata(&kept) {
         Ok(meta) => meta.is_file(),
         Err(error) => error.kind() == ErrorKind::NotFound,
-    };
-    let sessions = home.join(CLAUDE_SESSIONS);
-    let sessions_own = match std::fs::symlink_metadata(&sessions) {
-        Ok(meta) => meta.is_dir(),
-        Err(error) if error.kind() == ErrorKind::NotFound => {
-            dry_run
-                || std::fs::DirBuilder::new()
-                    .mode(0o700)
-                    .create(&sessions)
-                    .is_ok()
+    } && !own_settings_in_claude(home, &claude_real, &kept);
+    let mut real = Vec::new();
+    let mut shared = false;
+    for name in CLAUDE_RUN_FOLDERS {
+        let folder = claude.join(name);
+        let own = match std::fs::symlink_metadata(&folder) {
+            Ok(meta) => meta.is_dir(),
+            Err(error) if error.kind() == ErrorKind::NotFound => !make || own_folder(&folder),
+            Err(_) => false,
+        };
+        if own {
+            real.push(claude_real.join(name));
+        } else {
+            shared = true;
         }
-        Err(_) => false,
-    };
+    }
+    let (own_folders, left) = crate::contain::plan_claude_folders(&real, shown, needed);
     ClaudeState {
         settings_kept,
-        sessions_own,
+        own_folders,
+        shared: shared || left,
     }
 }
+
+/// The person's own `~/.claude.json` is the kept file, or leads into
+/// `~/.claude` (a dotfiles manager's link to `.claude/.claude.json`, a hard
+/// link, or a link that leads to nothing yet, where a save would make the
+/// file): a jail's link to the kept file would then hand the jail the
+/// person's own settings file, and its saves would land on it.
+#[cfg(target_os = "linux")]
+fn own_settings_in_claude(home: &Path, claude_real: &Path, kept: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let own = home.join(crate::contain::CLAUDE_SETTINGS);
+    let entry = match std::fs::symlink_metadata(&own) {
+        Ok(entry) => entry,
+        Err(error) => return error.kind() != std::io::ErrorKind::NotFound,
+    };
+    let same_file = std::fs::metadata(&own)
+        .ok()
+        .zip(std::fs::symlink_metadata(kept).ok())
+        .is_some_and(|(own, kept)| own.dev() == kept.dev() && own.ino() == kept.ino());
+    if same_file {
+        return true;
+    }
+    entry.file_type().is_symlink()
+        && std::fs::canonicalize(&own).map_or(true, |real| real.starts_with(claude_real))
+}
+
+/// Make `folder` empty and 0700, as Claude Code makes it, and say whether it
+/// is a folder of its own now. Another launch that made it first (two
+/// identified launches at once, on a home that had none) is no failure: a
+/// folder that is there, and no link, is the same folder.
+#[cfg(target_os = "linux")]
+fn own_folder(folder: &Path) -> bool {
+    use std::os::unix::fs::DirBuilderExt;
+    match std::fs::DirBuilder::new().mode(0o700).create(folder) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            std::fs::symlink_metadata(folder).is_ok_and(|meta| meta.is_dir())
+        }
+        Err(_) => false,
+    }
+}
+
+/// The real run of an identified jail, after every check: Claude Code's
+/// folders of its runs made where they are not there, and what the jail
+/// covers read again ([`claude_state_for`]). A folder that cannot be made
+/// is shared, and that is said once.
+#[cfg(target_os = "linux")]
+fn with_claude_folders_made(input: &JailInputs) -> JailInputs {
+    let mut input = input.clone();
+    input.claude_state = claude_state_for(
+        &input.args,
+        &input.home,
+        input.worktree.as_ref(),
+        &input.existing_paths,
+        &input.iw_binary,
+        true,
+    );
+    say_claude_state(&input.claude_state);
+    input
+}
+
+/// Said once where an identified jail cannot give Claude Code a folder of
+/// its runs of its own.
+#[cfg(target_os = "linux")]
+fn say_claude_state(state: &crate::contain::ClaudeState) {
+    if state.shared {
+        eprintln!("innerwarden contain: {CLAUDE_FOLDERS_SHARED}");
+    }
+}
+
+/// [`say_claude_state`]'s sentence.
+#[cfg(target_os = "linux")]
+const CLAUDE_FOLDERS_SHARED: &str = "Claude Code's ~/.claude/sessions or ~/.claude/backups \
+     is the host's in this jail, not one of its own (a link is there, a path the jail shows \
+     is in it, or it could not be made)";
 
 /// Each home path a jail profile hides, as found on the host: where it
 /// leads with every link followed, where a file would be made when nothing
@@ -867,6 +992,10 @@ fn run_linux(input: &JailInputs, marks: bool) -> ExitCode {
         }
     };
     if input.args.dry_run {
+        #[cfg(target_os = "linux")]
+        if input.args.identity {
+            say_claude_state(&input.claude_state);
+        }
         println!("# innerwarden contain - DRY RUN (Linux / bubblewrap)");
         print_plan_env(&plan.env);
         #[cfg(target_os = "linux")]
@@ -900,7 +1029,7 @@ fn run_linux(input: &JailInputs, marks: bool) -> ExitCode {
     }
     #[cfg(target_os = "linux")]
     if input.args.identity {
-        return run_linux_identified(input, &bwrap, marks);
+        return run_linux_identified(&with_claude_folders_made(input), &bwrap, marks);
     }
     announce(input);
     run_unrecorded(&bwrap, input, marks)
@@ -3120,70 +3249,103 @@ mod tests {
     }
 
     /// What the launcher takes as places an identified jail can keep Claude
+    /// Code's own state in, for a home with nothing else shown.
+    #[cfg(target_os = "linux")]
+    fn claude_state_of(home: &Path, make: bool) -> crate::contain::ClaudeState {
+        let shown: Vec<(PathBuf, PathBuf)> = [".claude", ".config"]
+            .iter()
+            .map(|name| home.join(name))
+            .filter(|path| path.exists())
+            .map(|path| {
+                let real = std::fs::canonicalize(&path).unwrap();
+                (path, real)
+            })
+            .collect();
+        claude_state_here(home, &shown, &[home.join("proj")], make)
+    }
+
+    /// The launcher's view of an identified jail's Claude Code state with
+    /// the kept file there or not and both folders of its own.
+    #[cfg(target_os = "linux")]
+    fn kept_and_own(home: &Path) -> crate::contain::ClaudeState {
+        crate::contain::ClaudeState {
+            settings_kept: true,
+            own_folders: crate::contain::CLAUDE_RUN_FOLDERS
+                .map(|name| home.join(".claude").join(name))
+                .to_vec(),
+            shared: false,
+        }
+    }
+
+    /// What the launcher takes as places an identified jail can keep Claude
     /// Code's own state in: the settings file in `~/.claude` only where it
-    /// is a file or not there yet, the sessions folder only where it is a
-    /// folder of its own, which a real launch makes (empty, 0700) and a dry
-    /// run does not. Nothing at all without a `~/.claude` folder.
+    /// is a file or not there yet, the folders of its runs only where each
+    /// is a folder of its own, which the real run makes (empty, 0700) and a
+    /// plan or a dry run does not. Nothing at all without a `~/.claude`
+    /// folder.
     ///
     /// FAILS ON REVERT: take a link or a folder in place of the settings
-    /// file, or follow a link in place of the sessions folder, or make the
-    /// sessions folder on a dry run.
+    /// file, or follow a link in place of a folder of its runs, or make a
+    /// folder when not asked to.
     #[cfg(target_os = "linux")]
     #[test]
     fn claude_state_here_takes_only_a_file_or_nothing_and_a_folder_of_its_own() {
         use crate::contain::ClaudeState;
         use std::os::unix::fs::{symlink, PermissionsExt};
-        let both = ClaudeState {
-            settings_kept: true,
-            sessions_own: true,
-        };
         let root = tempfile::tempdir().unwrap();
         let home = root.path().join("home");
         std::fs::create_dir(&home).unwrap();
+        let home = std::fs::canonicalize(&home).unwrap();
         // No `~/.claude`: nothing, and nothing made.
-        assert_eq!(claude_state_here(&home, false), ClaudeState::default());
+        assert_eq!(claude_state_of(&home, true), ClaudeState::default());
         assert!(!home.join(".claude").exists());
         // A `~/.claude` file is no folder the jail shares.
         std::fs::write(home.join(".claude"), "").unwrap();
-        assert_eq!(claude_state_here(&home, false), ClaudeState::default());
+        assert_eq!(claude_state_of(&home, true), ClaudeState::default());
         std::fs::remove_file(home.join(".claude")).unwrap();
 
         let claude = home.join(".claude");
         std::fs::create_dir(&claude).unwrap();
         let sessions = claude.join("sessions");
-        // A dry run shows what a real one would do and makes nothing.
-        assert_eq!(claude_state_here(&home, true), both);
-        assert!(!sessions.exists());
-        // A real launch makes the sessions folder, empty and 0700.
-        assert_eq!(claude_state_here(&home, false), both);
-        let made = std::fs::symlink_metadata(&sessions).unwrap();
-        assert!(made.is_dir());
-        assert_eq!(made.permissions().mode() & 0o777, 0o700);
-        assert_eq!(std::fs::read_dir(&sessions).unwrap().count(), 0);
+        let backups = claude.join("backups");
+        // The plan, and a dry run, show what a real run would do and make
+        // nothing.
+        assert_eq!(claude_state_of(&home, false), kept_and_own(&home));
+        assert!(!sessions.exists() && !backups.exists());
+        // The real run makes both folders, empty and 0700.
+        assert_eq!(claude_state_of(&home, true), kept_and_own(&home));
+        for made in [&sessions, &backups] {
+            let meta = std::fs::symlink_metadata(made).unwrap();
+            assert!(meta.is_dir());
+            assert_eq!(meta.permissions().mode() & 0o777, 0o700);
+            assert_eq!(std::fs::read_dir(made).unwrap().count(), 0);
+        }
         // A settings file there already is kept.
         let kept = claude.join(".claude.json");
         std::fs::write(&kept, "{}").unwrap();
-        assert_eq!(claude_state_here(&home, false), both);
+        assert_eq!(claude_state_of(&home, true), kept_and_own(&home));
 
         // A link in place of the settings file (a dotfiles manager's), or a
         // folder, is never taken.
         std::fs::remove_file(&kept).unwrap();
         std::fs::write(root.path().join("dotfiles.json"), "{}").unwrap();
         symlink(root.path().join("dotfiles.json"), &kept).unwrap();
-        assert!(!claude_state_here(&home, false).settings_kept);
+        assert!(!claude_state_of(&home, true).settings_kept);
         std::fs::remove_file(&kept).unwrap();
         std::fs::create_dir(&kept).unwrap();
-        assert!(!claude_state_here(&home, false).settings_kept);
+        assert!(!claude_state_of(&home, true).settings_kept);
         std::fs::remove_dir(&kept).unwrap();
 
         // A link in place of the sessions folder, even to a folder, is never
-        // covered, and the folder it leads to is left as it was.
+        // covered, and the folder it leads to is left as it was: shared,
+        // and said.
         std::fs::remove_dir(&sessions).unwrap();
         let elsewhere = root.path().join("elsewhere");
         std::fs::create_dir(&elsewhere).unwrap();
         symlink(&elsewhere, &sessions).unwrap();
-        let got = claude_state_here(&home, false);
-        assert!(got.settings_kept && !got.sessions_own, "{got:?}");
+        let got = claude_state_of(&home, true);
+        assert!(got.settings_kept && got.shared, "{got:?}");
+        assert_eq!(got.own_folders, std::slice::from_ref(&backups));
         assert!(std::fs::symlink_metadata(&sessions)
             .unwrap()
             .file_type()
@@ -3193,11 +3355,90 @@ mod tests {
         // A `~/.claude` that is a link to a folder (a dotfiles manager's) is
         // the folder the jail binds: its places are read where it leads.
         std::fs::remove_file(&sessions).unwrap();
+        std::fs::remove_dir(&backups).unwrap();
         std::fs::remove_dir(&claude).unwrap();
         let real = root.path().join("real-claude");
         std::fs::create_dir(&real).unwrap();
         symlink(&real, &claude).unwrap();
-        assert_eq!(claude_state_here(&home, false), both);
-        assert!(real.join("sessions").is_dir());
+        assert_eq!(claude_state_of(&home, true), kept_and_own(&home));
+        assert!(real.join("sessions").is_dir() && real.join("backups").is_dir());
+    }
+
+    /// M30CW-SEC-2: the person's own `~/.claude.json` that is the kept file
+    /// (a dotfiles manager's link to `.claude/.claude.json`, or a hard link
+    /// to it), or that leads anywhere into `~/.claude` or to nothing yet,
+    /// is never taken: the jail's link would lead to the person's own
+    /// settings file, and its saves would land on it. A file of its own, or
+    /// a link to a file outside `~/.claude`, keeps the jail's link.
+    ///
+    /// FAILS ON REVERT: drop the check of the person's own file, and the
+    /// first three are taken.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_persons_own_settings_file_is_never_the_kept_one() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(root.path()).unwrap().join("home");
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        let own = home.join(".claude.json");
+        let kept = home.join(".claude/.claude.json");
+        let reset = || {
+            let _ = std::fs::remove_file(&own);
+            let _ = std::fs::remove_file(&kept);
+        };
+        // A link to the kept file, the file there.
+        std::fs::write(&kept, "OWN").unwrap();
+        symlink(".claude/.claude.json", &own).unwrap();
+        assert!(!claude_state_of(&home, false).settings_kept, "link");
+        reset();
+        // A link to the kept file, not there yet: the person's next save
+        // makes it.
+        symlink(".claude/.claude.json", &own).unwrap();
+        assert!(!claude_state_of(&home, false).settings_kept, "dangling");
+        reset();
+        // A hard link.
+        std::fs::write(&kept, "OWN").unwrap();
+        std::fs::hard_link(&kept, &own).unwrap();
+        assert!(!claude_state_of(&home, false).settings_kept, "hard link");
+        reset();
+        // A link elsewhere into `~/.claude`.
+        std::fs::write(home.join(".claude/mine.json"), "OWN").unwrap();
+        symlink(".claude/mine.json", &own).unwrap();
+        assert!(!claude_state_of(&home, false).settings_kept, "into");
+        reset();
+        // A file of its own, a link outside `~/.claude`, or none: kept.
+        std::fs::write(&own, "OWN").unwrap();
+        assert!(claude_state_of(&home, false).settings_kept, "file");
+        reset();
+        std::fs::write(home.join("dotfiles.json"), "OWN").unwrap();
+        symlink("dotfiles.json", &own).unwrap();
+        assert!(claude_state_of(&home, false).settings_kept, "outside");
+        reset();
+        assert!(claude_state_of(&home, false).settings_kept, "none");
+    }
+
+    /// M30CW-3: a folder of Claude Code's runs another launch made first
+    /// (two identified launches at once, on a home that had none) is the
+    /// same folder, not a failure: the second jail covers it too. A link or
+    /// a file there is never taken.
+    ///
+    /// FAILS ON REVERT: take any failure to make it as not its own, and the
+    /// second launch shares the host's sessions.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_folder_another_launch_made_first_is_its_own() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let root = tempfile::tempdir().unwrap();
+        let fresh = root.path().join("fresh");
+        assert!(own_folder(&fresh));
+        let mode = std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+        // The other launch made it between this one's look and its make.
+        assert!(own_folder(&fresh));
+        symlink(&fresh, root.path().join("link")).unwrap();
+        assert!(!own_folder(&root.path().join("link")));
+        std::fs::write(root.path().join("file"), "").unwrap();
+        assert!(!own_folder(&root.path().join("file")));
+        assert!(!own_folder(&root.path().join("no/parent")));
     }
 }

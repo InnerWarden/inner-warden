@@ -36,17 +36,26 @@ follows semantic versioning.
   the file was missing, and what it saved there (an MCP server you added, its
   first-run answers) was lost. In the jail that file now leads to
   `~/.claude/.claude.json`, in the folder the jail already shares, so it is
-  kept between launches. Your own `~/.claude.json` stays outside the jail and
-  is never changed by it. Not where a hidden home path covers that place, or
-  where it is a link of yours or anything other than a file: Claude Code then
+  kept between launches. Your own `~/.claude.json` is not shown in the jail
+  and its Claude Code never uses it, and the copies Claude Code keeps of it in
+  `~/.claude/backups` are not shown either: each identified jail has an empty
+  `~/.claude/backups` of its own. Not where a hidden home path or a read-only
+  path of the profile covers that place or names `~/.claude.json`, where it
+  is a link of yours or anything other than a file, or where your own
+  `~/.claude.json` is that file or leads into `~/.claude`: Claude Code then
   keeps its file in the jail's own home, as before.
 - **Two identified jails at once no longer share Claude Code's session
   file.** Claude Code is process 2 in every jail and lists each running
   session as `~/.claude/sessions/<pid>.json`, in the `~/.claude` the jails
   share, so two jails at once wrote and read the same `2.json`. Each
   identified jail now has its own empty `~/.claude/sessions` (the launcher
-  makes the folder, 0700, where it is not there), and none sees the sessions
-  running outside it. A jail started without `--identity` is unchanged.
+  makes the folder, 0700, where it is not there), at every place the jail
+  shows it, and none sees the sessions running outside it. Only for Claude
+  Code's folder at `~/.claude`, where it is unless `CLAUDE_CONFIG_DIR` names
+  another; where the jail cannot have the folder of its own (a link is there,
+  the project is inside it), `innerwarden contain` says so. A jail started
+  without `--identity` is unchanged: there Claude Code's settings file is
+  still gone at every launch, and its session list is still shared.
 
 ## 1.5.5 - 2026-10-11
 

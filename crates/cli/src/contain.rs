@@ -379,12 +379,7 @@ pub fn plan_hidden_home(
         let Some(real) = &path.real else {
             continue;
         };
-        let jail_view = shown
-            .iter()
-            .filter(|(_, host)| real.starts_with(host))
-            .max_by_key(|(_, host)| host.components().count())
-            .and_then(|(jail, host)| real.strip_prefix(host).ok().map(|rest| jail.join(rest)));
-        if let Some(abs) = jail_view {
+        for abs in jail_views(real, shown) {
             if !plan.masks.iter().any(|seen| seen.abs == abs) {
                 plan.masks.push(DenyPath {
                     abs,
@@ -394,6 +389,54 @@ pub fn plan_hidden_home(
         }
     }
     Ok(plan)
+}
+
+/// PURE. Every place the jail shows the host place `real` (`shown`,
+/// [`shown_host_folders`]), each once, in the order of `shown`. One host
+/// folder can be shown at two places (`~/.claude` a link to
+/// `~/.config/claude`, which the `.config` bind shows too), and a mount laid
+/// at one of them is not seen at the other, so whatever covers `real`
+/// covers each.
+fn jail_views(real: &Path, shown: &[(PathBuf, PathBuf)]) -> Vec<PathBuf> {
+    let mut views: Vec<PathBuf> = Vec::new();
+    for (jail, host) in shown {
+        let Ok(rest) = real.strip_prefix(host) else {
+            continue;
+        };
+        let view = jail.join(rest);
+        if !views.contains(&view) {
+            views.push(view);
+        }
+    }
+    views
+}
+
+/// PURE. Where an identified jail covers Claude Code's folders of its runs
+/// ([`CLAUDE_RUN_FOLDERS`]): `real` holds each such folder of the host's as
+/// its path resolves, and each is covered at every place the jail shows it
+/// ([`jail_views`]), the project or a read-only path of the profile that
+/// shows `~/.claude` too. A place that holds something the jail shows later
+/// (`needed`: the project, the worktree's folders, the read-only paths, the
+/// guard) is not covered, or that would be empty in the jail, and the second
+/// value says one was not.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn plan_claude_folders(
+    real: &[PathBuf],
+    shown: &[(PathBuf, PathBuf)],
+    needed: &[PathBuf],
+) -> (Vec<PathBuf>, bool) {
+    let mut covered: Vec<PathBuf> = Vec::new();
+    let mut left = false;
+    for folder in real {
+        for view in jail_views(folder, shown) {
+            if needed.iter().any(|path| path.starts_with(&view)) {
+                left = true;
+            } else if !covered.contains(&view) {
+                covered.push(view);
+            }
+        }
+    }
+    (covered, left)
 }
 
 /// Where the home folder a hidden path is in leads on the host, when the
@@ -603,23 +646,35 @@ pub(crate) const CLAUDE_SETTINGS: &str = ".claude.json";
 /// Claude Code itself keeps it when `~/.claude` is named as its
 /// configuration folder).
 pub(crate) const CLAUDE_SETTINGS_KEPT: &str = ".claude/.claude.json";
-/// Claude Code's list of its running sessions, one file per process id.
-pub(crate) const CLAUDE_SESSIONS: &str = ".claude/sessions";
+/// Claude Code's folders in `~/.claude` of what each of its runs keeps to
+/// itself: the list of its running sessions, one file per process id (and
+/// Claude Code is process 2 in every jail), and the copies of its settings
+/// file it saves before it changes the file. An identified jail covers each
+/// with an empty folder of its own.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) const CLAUDE_RUN_FOLDERS: [&str; 2] = ["sessions", "backups"];
 
-/// What the launcher found on the host of the two places an identified jail
+/// What the launcher found on the host of the places an identified jail
 /// keeps Claude Code's own state in ([`build_linux_jail`]). Read only for an
-/// `--identity` launch on Linux: without the flag nothing is read and both
-/// are `false`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// `--identity` launch on Linux: without the flag nothing is read, and the
+/// jail is the one it was.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ClaudeState {
-    /// `~/.claude` is a folder, and [`CLAUDE_SETTINGS_KEPT`] in it is a file
-    /// or is not there yet (never a link, a folder or anything else): the
-    /// jail's `~/.claude.json` can lead to it.
+    /// `~/.claude` is a folder, [`CLAUDE_SETTINGS_KEPT`] in it is a file or
+    /// is not there yet (never a link, a folder or anything else), and the
+    /// person's own `~/.claude.json` is not that file nor leads into
+    /// `~/.claude`: the jail's `~/.claude.json` can lead to it.
     pub settings_kept: bool,
-    /// `~/.claude` is a folder, and [`CLAUDE_SESSIONS`] in it is a folder of
-    /// its own (no link), made empty (0700) by the launcher where it was not
-    /// there: the jail can cover it with an empty list of its own.
-    pub sessions_own: bool,
+    /// Each place the jail shows one of [`CLAUDE_RUN_FOLDERS`] (a folder of
+    /// its own in `~/.claude`, no link, made empty and 0700 by the launcher
+    /// where it was not there), as the jail sees it
+    /// ([`plan_claude_folders`]): each is covered by an empty folder of the
+    /// jail's own after every bind that shows it.
+    pub own_folders: Vec<PathBuf>,
+    /// One of [`CLAUDE_RUN_FOLDERS`] cannot be the jail's own (a link is
+    /// there, a path the jail shows is in it, or it could not be made): the
+    /// jail shares it with the host, and the launcher says so.
+    pub shared: bool,
 }
 /// Dotdirs that must stay INVISIBLE (never re-bound → absent under the HOME tmpfs).
 const DOTDIR_DENY: &[&str] = &[".ssh", ".gnupg", ".aws", ".mozilla", ".thunderbird"];
@@ -790,8 +845,9 @@ pub const CAP_DROP_ALL: [&str; 2] = ["--cap-drop", "ALL"];
 
 /// Build the ordered bwrap argument vector. Order is load-bearing (bwrap is
 /// last-wins): system RO → dev/proc/tmpfs → HOME tmpfs → dotdir re-binds → shadow
-/// innerwarden → Claude Code's state (`--identity` only) → binary binds →
-/// project (late) → worktree → nested secret masks →
+/// innerwarden → Claude Code's settings file (`--identity` only) → binary binds →
+/// project (late) → worktree → Claude Code's folders of its runs
+/// (`--identity` only) → nested secret masks →
 /// the host's key and the launch record (`--identity` only) → namespaces and the
 /// seccomp filter → child. `DOTDIR_DENY`
 /// entries are never emitted, so they vanish under the HOME tmpfs.
@@ -869,33 +925,33 @@ pub fn build_linux_jail(input: &JailInputs) -> Result<LinuxJailPlan, ContainErro
     // DOTDIR_DENY entries are intentionally NOT emitted here (asserted by tests),
     // so they stay invisible under the HOME tmpfs.
 
-    // --- Claude Code's own state, where the jail shares `~/.claude` with the
-    // host (`--identity` only). The jail's home is an empty folder of its
-    // own, so the settings file Claude Code keeps in it, `~/.claude.json`,
-    // was gone at every launch: it is a link to the same name in `~/.claude`
-    // instead, and Claude Code writes through it (a temporary file beside
-    // the target, then a rename in that folder; a rename onto a mount would
-    // fail). The person's own `~/.claude.json` stays outside the jail, and
-    // the link is not made where a hidden or denied path covers the file.
-    // Claude Code is process 2 in every jail and names each running session
-    // by its process id, so each jail gets an empty list of sessions of its
-    // own: two jails at once never write the same file, and none reads the
-    // host's. Both before every mask, so a hidden path still covers them. ---
+    // --- Claude Code's settings file, where the jail shares `~/.claude`
+    // with the host (`--identity` only). The jail's home is an empty folder
+    // of its own, so the settings file Claude Code keeps in it,
+    // `~/.claude.json`, was gone at every launch: it is a link to the same
+    // name in `~/.claude` instead, and Claude Code writes through it (a
+    // temporary file beside the target, then a rename in that folder; a
+    // rename onto a mount would fail). The person's own `~/.claude.json` is
+    // not shown, and the launcher takes no kept file that is it or that it
+    // leads to ([`ClaudeState::settings_kept`]). No link where a hidden or
+    // denied path covers the kept file, or where a read-only path of the
+    // profile shows it or `~/.claude.json` (a later mount there would make
+    // bwrap abort, and a read-only file cannot be saved): Claude Code then
+    // keeps its file in the jail's own home, as before. Before every mask,
+    // so a hidden path still covers it. ---
     if input.args.identity && input.exists(&input.home.join(".claude")) {
         let kept = input.home.join(CLAUDE_SETTINGS_KEPT);
+        let link = input.home.join(CLAUDE_SETTINGS);
         let covered = input
             .hide_paths
             .iter()
             .chain(&input.deny_paths)
-            .any(|hidden| kept.starts_with(&hidden.abs));
+            .map(|hidden| hidden.abs.as_path())
+            .chain(input.args.extra_ro.iter().map(PathBuf::as_path))
+            .any(|other| kept.starts_with(other) || paths_overlap(other, &link));
         if input.claude_state.settings_kept && !covered {
             let target = kept.to_string_lossy().to_string();
-            let link = input.home.join(CLAUDE_SETTINGS);
             push(&["--symlink", &target, &link.to_string_lossy()]);
-        }
-        if input.claude_state.sessions_own {
-            let sessions = input.home.join(CLAUDE_SESSIONS);
-            push(&["--tmpfs", &sessions.to_string_lossy()]);
         }
     }
 
@@ -928,6 +984,22 @@ pub fn build_linux_jail(input: &JailInputs) -> Result<LinuxJailPlan, ContainErro
         for p in [&wt.git_dir, &wt.common_dir] {
             let s = p.to_string_lossy().to_string();
             push(&["--bind", &s, &s]);
+        }
+    }
+
+    // --- Claude Code's folders of its runs, where the jail shares
+    // `~/.claude` (`--identity` only). Claude Code is process 2 in every
+    // jail and lists each running session by its process id, and it keeps
+    // copies of its settings file beside them, so each jail covers both
+    // with an empty folder of its own at every place it shows them
+    // ([`ClaudeState::own_folders`]): two jails at once do not write the
+    // same session file, and none sees the host's sessions or the copies of
+    // the person's own settings file. After every bind that can show them (the
+    // dotdirs, the read-only paths, the project, the worktree) and before
+    // every mask, so a hidden path still covers them. ---
+    if input.args.identity && input.exists(&input.home.join(".claude")) {
+        for folder in &input.claude_state.own_folders {
+            push(&["--tmpfs", &folder.to_string_lossy()]);
         }
     }
 
@@ -4439,7 +4511,7 @@ mod tests {
     /// filter is the descriptor. An identified jail whose host did not take
     /// the filter is the jail the previous build made with its probe
     /// failing, plus the capability drop and Claude Code's own state
-    /// ([`CLAUDE_STATE_LINES`]) and nothing else (the hash is of the golden
+    /// ([`CLAUDE_STATE_LINES`], [`CLAUDE_FOLDER_LINES`]) and nothing else (the hash is of the golden
     /// at 4ded5fea), and a plain one without the filter is that build's,
     /// byte for byte.
     ///
@@ -4461,9 +4533,11 @@ mod tests {
         assert_eq!(got, GOLDEN_ARGV_IDENTIFIED);
         assert_eq!(got.matches("--cap-drop\nALL\n").count(), 1);
         assert_eq!(got.matches(CLAUDE_STATE_LINES).count(), 1);
+        assert_eq!(got.matches(CLAUDE_FOLDER_LINES).count(), 1);
         let before = got
             .replacen("--unshare-ipc\n--cap-drop\nALL\n", "--unshare-ipc\n", 1)
-            .replacen(CLAUDE_STATE_LINES, "", 1);
+            .replacen(CLAUDE_STATE_LINES, "", 1)
+            .replacen(CLAUDE_FOLDER_LINES, "", 1);
         assert_eq!(
             sha256_hex(before.as_bytes()),
             "648f991ed81d228baa0f4c080f5eb53c6fe864d6e4c5be6f3660da6bffbb5044"
@@ -5076,24 +5150,34 @@ mod tests {
         // byte. The filter's own case sets these two.
         input.seccomp_fd = None;
         input.close_userns = false;
-        // A home whose `~/.claude` holds no settings file of the jail's yet
-        // and a sessions folder of its own.
+        // A home whose `~/.claude` holds no settings file of the jail's yet,
+        // and a sessions and a backups folder of its own.
         input.claude_state = ClaudeState {
             settings_kept: true,
-            sessions_own: true,
+            own_folders: CLAUDE_RUN_FOLDERS
+                .map(|name| PathBuf::from("/home/dev/.claude").join(name))
+                .to_vec(),
+            shared: false,
         };
         input
     }
 
-    /// The lines Claude Code's own state adds to the identified jail of
+    /// The lines Claude Code's settings file adds to the identified jail of
     /// [`identified_inputs`], after the dotdir binds and before the guard's
     /// binary.
     const CLAUDE_STATE_LINES: &str = "\
         --symlink\n\
         /home/dev/.claude/.claude.json\n\
-        /home/dev/.claude.json\n\
+        /home/dev/.claude.json\n";
+
+    /// The lines Claude Code's folders of its runs add to the identified
+    /// jail of [`identified_inputs`], after the project and before every
+    /// mask.
+    const CLAUDE_FOLDER_LINES: &str = "\
         --tmpfs\n\
-        /home/dev/.claude/sessions\n";
+        /home/dev/.claude/sessions\n\
+        --tmpfs\n\
+        /home/dev/.claude/backups\n";
 
     /// The whole argv of an identified jail, one token per line.
     ///
@@ -5101,7 +5185,7 @@ mod tests {
     /// rewrite the launcher's records through the `.local` bind), or move it
     /// before the project and dotdir binds, or drop the `--setenv` lines, or
     /// drop the link to the kept settings file or the jail's own sessions
-    /// folder.
+    /// or backups folder.
     #[test]
     fn golden_argv_of_an_identified_jail() {
         let plan = build_linux_jail(&identified_inputs()).unwrap();
@@ -5110,14 +5194,16 @@ mod tests {
 
     /// Where an identified jail keeps Claude Code's own state: the jail's
     /// `~/.claude.json` leads to the same name in the shared `~/.claude`,
-    /// and the jail covers `~/.claude/sessions` with an empty list of its
-    /// own. Both after the `.claude` bind they sit in, and before the
-    /// project and every mask, so a hidden or denied path still wins.
+    /// after the `.claude` bind it sits in, and the jail covers
+    /// `~/.claude/sessions` and `~/.claude/backups` with empty folders of
+    /// its own after the project, which can show `~/.claude` too. All before
+    /// every mask, so a hidden or denied path still wins.
     ///
     /// FAILS ON REVERT: drop the link (Claude Code's settings file is the
-    /// jail's empty home's again, gone at every launch) or the sessions
-    /// folder (two jails at once write the same `2.json`), or put either
-    /// before the `.claude` bind, where the bind covers it.
+    /// jail's empty home's again, gone at every launch) or a folder (two
+    /// jails at once write the same `2.json`; the host's copies of the
+    /// person's settings file are in the jail), or put the folders before
+    /// the project, where `--project ~/.claude` brings the host's back.
     #[test]
     fn an_identified_jail_keeps_claude_codes_state_in_the_folder_it_shares() {
         let mut input = identified_inputs();
@@ -5138,11 +5224,14 @@ mod tests {
             "/home/dev/.claude.json",
         ]);
         let sessions = at(&["--tmpfs", "/home/dev/.claude/sessions"]);
+        let backups = at(&["--tmpfs", "/home/dev/.claude/backups"]);
         let project = at(&["--bind", "/home/dev/proj", "/home/dev/proj"]);
         let hidden = at(&["--tmpfs", "/home/dev/.claude/sessions/hidden"]);
         let denied = at(&["--ro-bind", "/dev/null", "/home/dev/proj/.env"]);
-        assert!(claude < link && claude < sessions, "{got:?}");
-        assert!(link < project && sessions < project, "{got:?}");
+        let protected = at(&["--tmpfs", "/home/dev/.aws"]);
+        assert!(claude < link && link < project, "{got:?}");
+        assert!(project < sessions && project < backups, "{got:?}");
+        assert!(sessions < protected && backups < protected, "{got:?}");
         assert!(sessions < hidden && link < denied, "{got:?}");
         assert_eq!(got.iter().filter(|a| *a == "--symlink").count(), 5);
         // Nothing of the person's own settings file is bound in.
@@ -5154,7 +5243,7 @@ mod tests {
     /// The link is never made to a kept settings file that a hidden home
     /// path or a denied path covers: Claude Code then keeps its file in the
     /// jail's own home, as before, and the mask stays where it was. The
-    /// jail's own sessions folder does not depend on it.
+    /// jail's own folders do not depend on it.
     ///
     /// FAILS ON REVERT: make the link whatever covers the file, and the jail's
     /// `~/.claude.json` leads to the hidden place.
@@ -5187,18 +5276,57 @@ mod tests {
         }
     }
 
+    /// No link where a read-only path of the profile shows the person's own
+    /// `~/.claude.json`, the kept file, or the `~/.claude` that holds it.
+    /// Measured with bwrap 0.9.0: a read-only bind of `~/.claude.json` after
+    /// the link aborts the jail ("Can't create file at .../.claude.json"),
+    /// so every identified launch under such a profile died; and a link into
+    /// a read-only folder leads to a file Claude Code cannot save. The
+    /// profile's view wins, as it did before the link. A path beside them
+    /// keeps the link.
+    ///
+    /// FAILS ON REVERT: check only the hidden and denied paths before the
+    /// link, and the read-only `~/.claude.json` comes after a link to it.
+    #[test]
+    fn no_link_where_a_read_only_path_shows_the_settings_file() {
+        for shown in [
+            "/home/dev/.claude.json",
+            "/home/dev/.claude/.claude.json",
+            "/home/dev/.claude",
+        ] {
+            let mut input = identified_inputs();
+            input.args.extra_ro = vec![PathBuf::from(shown)];
+            let got = build_linux_jail(&input).unwrap().bwrap_args;
+            assert!(
+                !(got.join("\n") + "\n").contains(CLAUDE_STATE_LINES),
+                "{shown}: {got:?}"
+            );
+            assert!(
+                got.windows(3).any(|w| w == ["--ro-bind-try", shown, shown]),
+                "{shown}: {got:?}"
+            );
+        }
+        let mut beside = identified_inputs();
+        beside.args.extra_ro = vec![PathBuf::from("/home/dev/.local/share/claude/versions")];
+        let got = build_linux_jail(&beside).unwrap().bwrap_args.join("\n");
+        assert_eq!(got.matches(CLAUDE_STATE_LINES).count(), 1, "{got}");
+    }
+
     /// Nothing of Claude Code's state is made where the jail does not share
     /// `~/.claude` (the home has none), or where the launcher found the
-    /// kept file or the sessions folder to be something else (a link, a
-    /// folder in place of the file): the jail is the identified jail it was.
+    /// kept file or the folders to be something else (a link, a folder in
+    /// place of the file): the jail is the identified jail it was.
     ///
-    /// FAILS ON REVERT: make the link or the sessions folder without the
-    /// `.claude` bind, or whatever the launcher found.
+    /// FAILS ON REVERT: make the link or a folder without the `.claude`
+    /// bind, or whatever the launcher found.
     #[test]
     fn nothing_of_claude_codes_state_is_made_where_the_jail_does_not_share_its_folder() {
         let claude_free = |got: &[String]| {
-            !got.iter()
-                .any(|a| a.starts_with("/home/dev/.claude.json") || a.contains("/sessions"))
+            !got.iter().any(|a| {
+                a.starts_with("/home/dev/.claude.json")
+                    || a.contains("/sessions")
+                    || a.contains("/backups")
+            })
         };
         let mut no_folder = identified_inputs();
         no_folder
@@ -5218,23 +5346,117 @@ mod tests {
         ));
         assert_eq!(
             got,
-            GOLDEN_ARGV_IDENTIFIED.replacen(CLAUDE_STATE_LINES, "", 1)
+            GOLDEN_ARGV_IDENTIFIED
+                .replacen(CLAUDE_STATE_LINES, "", 1)
+                .replacen(CLAUDE_FOLDER_LINES, "", 1)
         );
 
-        let mut only_sessions = identified_inputs();
-        only_sessions.claude_state.settings_kept = false;
-        let got = build_linux_jail(&only_sessions)
+        let mut only_folders = identified_inputs();
+        only_folders.claude_state.settings_kept = false;
+        let got = build_linux_jail(&only_folders)
             .unwrap()
             .bwrap_args
             .join("\n");
         assert_eq!(
             got,
-            GOLDEN_ARGV_IDENTIFIED.replacen(
-                "--symlink\n/home/dev/.claude/.claude.json\n/home/dev/.claude.json\n",
-                "",
-                1
-            )
+            GOLDEN_ARGV_IDENTIFIED.replacen(CLAUDE_STATE_LINES, "", 1)
         );
+    }
+
+    /// Claude Code's folders of its runs are covered at every place the jail
+    /// shows them. `~/.claude` a link to `~/.config/claude` is shown by the
+    /// `.claude` bind and by the `.config` bind, and a mount on one is not
+    /// seen through the other (measured with bwrap 0.9.0: the host's
+    /// sessions were listed, and written, through `~/.config/claude`), so
+    /// both are covered. A project or a read-only path that is `~/.claude`
+    /// shows them once more, at the same place. A place that holds the
+    /// project or a read-only path is never covered (the agent would work in
+    /// an empty folder): it stays shared, and that is said.
+    ///
+    /// FAILS ON REVERT: cover only the place the most specific bind shows
+    /// (`jail_views` taking one), and the host's sessions are listed through
+    /// `~/.config/claude`; or cover a place that holds the project.
+    #[test]
+    fn claude_codes_folders_are_covered_at_every_place_the_jail_shows_them() {
+        let real = CLAUDE_RUN_FOLDERS
+            .map(|name| PathBuf::from("/home/dev/.config/claude").join(name))
+            .to_vec();
+        let mut input = identified_inputs();
+        let linked = shown_host_folders(
+            &input.args,
+            &input.home,
+            None,
+            &input.existing_paths,
+            |path| {
+                if path == Path::new("/home/dev/.claude") {
+                    PathBuf::from("/home/dev/.config/claude")
+                } else {
+                    path.to_path_buf()
+                }
+            },
+        );
+        let needed = [input.args.project.clone(), input.iw_binary.clone()];
+        let (folders, left) = plan_claude_folders(&real, &linked, &needed);
+        assert_eq!(
+            folders,
+            [
+                "/home/dev/.claude/sessions",
+                "/home/dev/.config/claude/sessions",
+                "/home/dev/.claude/backups",
+                "/home/dev/.config/claude/backups",
+            ]
+            .map(PathBuf::from)
+        );
+        assert!(!left);
+        input.claude_state.own_folders = folders;
+        let got = build_linux_jail(&input).unwrap().bwrap_args;
+        let last_bind = got.iter().rposition(|a| a == "--bind").unwrap();
+        for folder in [
+            "/home/dev/.claude/sessions",
+            "/home/dev/.config/claude/sessions",
+        ] {
+            let at = got
+                .windows(2)
+                .position(|w| w == ["--tmpfs", folder])
+                .unwrap_or_else(|| panic!("{folder}: {got:?}"));
+            assert!(at > last_bind, "{folder}: {got:?}");
+        }
+
+        // `--project ~/.claude`: the project shows the same folders at the
+        // same places, covered once, after it.
+        let real = CLAUDE_RUN_FOLDERS
+            .map(|name| PathBuf::from("/home/dev/.claude").join(name))
+            .to_vec();
+        let mut project = identified_inputs();
+        project.args.project = PathBuf::from("/home/dev/.claude");
+        let shown = shown_host_folders(
+            &project.args,
+            &project.home,
+            None,
+            &project.existing_paths,
+            Path::to_path_buf,
+        );
+        let needed = [project.args.project.clone(), project.iw_binary.clone()];
+        let (folders, left) = plan_claude_folders(&real, &shown, &needed);
+        assert_eq!(folders, real);
+        assert!(!left);
+        project.claude_state.own_folders = folders;
+        let got = build_linux_jail(&project).unwrap().bwrap_args;
+        let bind = got
+            .windows(3)
+            .rposition(|w| w == ["--bind", "/home/dev/.claude", "/home/dev/.claude"])
+            .unwrap();
+        let sessions = got
+            .windows(2)
+            .position(|w| w == ["--tmpfs", "/home/dev/.claude/sessions"])
+            .unwrap();
+        assert!(bind < sessions, "{got:?}");
+
+        // A project inside the sessions folder: never under an empty mount.
+        let inside = [PathBuf::from("/home/dev/.claude/sessions/work")];
+        let (folders, left) = plan_claude_folders(&real, &shown, &inside);
+        assert_eq!(folders, [PathBuf::from("/home/dev/.claude/backups")]);
+        assert!(left);
     }
 
     /// The records folder is hidden after the last writable bind that could
@@ -5764,6 +5986,49 @@ mod tests {
                 plan.denies
             );
         }
+    }
+
+    /// A hidden home path is covered at every place the jail shows what it
+    /// leads to: with `~/.claude` a link to `~/.config/claude`, both the
+    /// `.claude` bind and the `.config` bind show it, and a mount on one is
+    /// not seen through the other, so `~/.config/claude/token` is covered
+    /// too.
+    ///
+    /// FAILS ON REVERT: cover only the place the most specific bind shows,
+    /// and the token is read through `~/.config/claude`.
+    #[test]
+    fn a_hidden_home_path_is_covered_at_every_place_the_jail_shows_it() {
+        let input = identified_inputs();
+        let shown = shown_host_folders(
+            &input.args,
+            &input.home,
+            None,
+            &input.existing_paths,
+            |path| {
+                if path == Path::new("/home/dev/.claude") {
+                    PathBuf::from("/home/dev/.config/claude")
+                } else {
+                    path.to_path_buf()
+                }
+            },
+        );
+        let plan = plan_hidden_home(
+            &[hidden(
+                "/home/dev/.claude/token",
+                Some("/home/dev/.config/claude/token"),
+                false,
+            )],
+            &input.home,
+            &shown,
+        )
+        .unwrap();
+        assert_eq!(
+            plan.masks,
+            ["/home/dev/.claude/token", "/home/dev/.config/claude/token"].map(|abs| DenyPath {
+                abs: PathBuf::from(abs),
+                is_dir: false
+            })
+        );
     }
 
     /// A hidden home path that leads outside the home is refused, whatever
@@ -7109,8 +7374,6 @@ mod tests {
         --symlink\n\
         /home/dev/.claude/.claude.json\n\
         /home/dev/.claude.json\n\
-        --tmpfs\n\
-        /home/dev/.claude/sessions\n\
         --ro-bind\n\
         /home/dev/.local/bin/innerwarden\n\
         /home/dev/.local/bin/innerwarden\n\
@@ -7119,6 +7382,10 @@ mod tests {
         /home/dev/proj\n\
         --chdir\n\
         /home/dev/proj\n\
+        --tmpfs\n\
+        /home/dev/.claude/sessions\n\
+        --tmpfs\n\
+        /home/dev/.claude/backups\n\
         --tmpfs\n\
         /home/dev/.aws\n\
         --tmpfs\n\
