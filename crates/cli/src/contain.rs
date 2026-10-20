@@ -1643,6 +1643,43 @@ enum Shows {
     Own,
 }
 
+/// PURE. Where a profile's read-only path lies in the folders the jail
+/// writes as its work: below a worktree's folder (`Some(Worktree)`), else
+/// below the project (`Some(Project)`), never either folder itself. A
+/// read-only bind laid before the bind of that folder is covered by it, and
+/// the jail wrote through it (`extra_ro = ~/code/app/vendor` with the
+/// project `~/code/app`), so the jail lays it right after that folder's
+/// bind and its pins ([`build_linux_jail`]), and macOS denies it after the
+/// write that folder's allow gives ([`build_macos_profile`]). `None` for
+/// any other path, the one that holds the project among them, which is
+/// laid before the project as before, so the project stays writable in it.
+fn read_only_in_the_work(input: &JailInputs, path: &Path) -> Option<PinRoot> {
+    let below = |folder: &Path| path != folder && path.starts_with(folder);
+    if input
+        .worktree
+        .as_ref()
+        .is_some_and(|wt| below(&wt.git_dir) || below(&wt.common_dir))
+    {
+        Some(PinRoot::Worktree)
+    } else if below(&input.args.project) {
+        Some(PinRoot::Project)
+    } else {
+        None
+    }
+}
+
+/// PURE. A profile's read-only paths that [`read_only_in_the_work`] puts
+/// at `root` (`None`: laid before the project).
+fn read_only_at(input: &JailInputs, root: Option<PinRoot>) -> Vec<PathBuf> {
+    input
+        .args
+        .extra_ro
+        .iter()
+        .filter(|path| read_only_in_the_work(input, path) == root)
+        .cloned()
+        .collect()
+}
+
 /// PURE. Linux: every folder between the home (or the top of whatever bind
 /// shows it) and a place the jail covers that the host reaches by name,
 /// that a program in the jail could rename, each bound onto itself so it is
@@ -1660,9 +1697,9 @@ enum Shows {
 /// of the jail's own ends the way. Only the places the host reaches by
 /// name: InnerWarden's folder where it leads and wherever the jail shows
 /// it, the launcher's records (`--identity`), the profile's hidden home
-/// paths, and every place a hidden dotdir or a `deny_read` path is covered
-/// at through a link (`linked_masks`). In every common layout there is
-/// none but the records' folders.
+/// paths, every place a hidden dotdir or a `deny_read` path is covered at
+/// through a link (`linked_masks`), and the profile's read-only paths. In
+/// every common layout there is none but the records' folders.
 pub fn linux_pins(input: &JailInputs) -> Vec<(PinRoot, PathBuf)> {
     // In the order the jail lays them ([`build_linux_jail`]): a later one
     // over a folder is what the jail shows there.
@@ -1691,17 +1728,27 @@ pub fn linux_pins(input: &JailInputs) -> Vec<(PinRoot, PathBuf)> {
                 .flat_map(|bin| [bin.link.clone(), bin.target_dir.clone()]),
         )
         .chain(std::iter::once(input.iw_binary.clone()))
-        .chain(input.args.extra_ro.iter().cloned());
+        .chain(read_only_at(input, None));
     binds.extend(read_only.map(|path| (Shows::ReadOnly, path)));
     binds.push((
         Shows::Writable(PinRoot::Project),
         input.args.project.clone(),
     ));
+    binds.extend(
+        read_only_at(input, Some(PinRoot::Project))
+            .into_iter()
+            .map(|path| (Shows::ReadOnly, path)),
+    );
     if let Some(worktree) = &input.worktree {
         for dir in [&worktree.git_dir, &worktree.common_dir] {
             binds.push((Shows::Writable(PinRoot::Worktree), dir.clone()));
         }
     }
+    binds.extend(
+        read_only_at(input, Some(PinRoot::Worktree))
+            .into_iter()
+            .map(|path| (Shows::ReadOnly, path)),
+    );
     let shown_by = |folder: &Path| {
         binds
             .iter()
@@ -1715,6 +1762,10 @@ pub fn linux_pins(input: &JailInputs) -> Vec<(PinRoot, PathBuf)> {
     }
     places.extend(input.hide_paths.iter().map(|hidden| hidden.abs.as_path()));
     places.extend(input.linked_masks.iter().map(|mask| mask.abs.as_path()));
+    // A profile's read-only path: a rename of a folder above it took the
+    // read-only bind away with it, and the host's programs then found a
+    // folder of the jail's at its name.
+    places.extend(input.args.extra_ro.iter().map(PathBuf::as_path));
     // A place is walked by its spelling, so only a plain one: above a
     // place spelled through `..`, `<home>/.local/state/../..` is the home
     // itself, and a pin there would bind the host's home over the jail's
@@ -1778,7 +1829,8 @@ const MACOS_HOME_WRITABLE: &[&str] = &[
 /// ([`macos_pin_rule`]), closes that rename and removal; the jail still
 /// writes in it. The places: InnerWarden's folder as named and where it
 /// leads, every `deny_read` path, every hidden home path as named and as
-/// it resolves, and where a link leads a dotdir the sandbox denies. In
+/// it resolves, where a link leads a dotdir the sandbox denies, and a
+/// profile's read-only paths. In
 /// every layout that is `~/.config` and the project at least, and the
 /// launcher makes each that is not there yet before the sandbox starts, so
 /// the jail never has to, and says so.
@@ -1803,6 +1855,7 @@ pub fn macos_pins(input: &JailInputs) -> Vec<PathBuf> {
             .linked_denies
             .iter()
             .chain(&input.hide_denies)
+            .chain(&input.args.extra_ro)
             .cloned(),
     );
     let mut pins: Vec<PathBuf> = vec![input.args.project.clone()];
@@ -1835,8 +1888,9 @@ pub fn macos_pin_rule(folder: &Path) -> String {
 /// Build the ordered bwrap argument vector. Order is load-bearing (bwrap is
 /// last-wins): system RO → dev/proc/tmpfs → HOME tmpfs → dotdir re-binds → their
 /// pins ([`linux_pins`]) → shadow innerwarden → Claude Code's settings file
-/// (`--identity` only) → binary binds → project (late) → its pins → worktree →
-/// its pins → Claude Code's folders of its runs
+/// (`--identity` only) → binary binds → the profile's read-only paths →
+/// project (late) → its pins → the read-only paths inside it → worktree →
+/// its pins → the read-only paths inside it → Claude Code's folders of its runs
 /// (`--identity` only) → nested secret masks → every other place the jail
 /// shows a hidden place a link leads somewhere else (`linked_masks`) →
 /// the host's key and the launch record (`--identity` only) → namespaces and the
@@ -1988,11 +2042,25 @@ pub fn build_linux_jail(input: &JailInputs) -> Result<LinuxJailPlan, ContainErro
     // --- extra read-only paths (a jail profile's `extra_ro`), before the
     // project and before the protected masks are re-applied, so neither can
     // be undone by them. `-try`: a path that is gone is skipped. Empty unless
-    // a profile named some, so a jail without one is what it was. ---
-    for p in &input.args.extra_ro {
-        let s = p.to_string_lossy().to_string();
-        push(&["--ro-bind-try", &s, &s]);
-    }
+    // a profile named some, so a jail without one is what it was. One inside
+    // the project or a worktree's folder is laid right after that folder's
+    // bind instead, or the bind would cover it ([`read_only_in_the_work`]). ---
+    let read_only_binds = |root: Option<PinRoot>| -> Vec<String> {
+        read_only_at(input, root)
+            .iter()
+            .flat_map(|p| {
+                let s = p.to_string_lossy().to_string();
+                ["--ro-bind-try".to_string(), s.clone(), s]
+            })
+            .collect()
+    };
+    let outer_read_only = read_only_binds(None);
+    push(
+        &outer_read_only
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+    );
 
     // --- project (rw, same path), LATE so it wins over the HOME tmpfs ---
     let proj = input.args.project.to_string_lossy().to_string();
@@ -2002,6 +2070,13 @@ pub fn build_linux_jail(input: &JailInputs) -> Result<LinuxJailPlan, ContainErro
     // it is covered there, and the folders above that cover are pinned.
     let project_pins = pins_of(PinRoot::Project);
     push(&project_pins.iter().map(String::as_str).collect::<Vec<_>>());
+    let project_read_only = read_only_binds(Some(PinRoot::Project));
+    push(
+        &project_read_only
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+    );
 
     // --- git worktree admin dirs, AFTER the project bind ---
     if let Some(wt) = &input.worktree {
@@ -2012,6 +2087,13 @@ pub fn build_linux_jail(input: &JailInputs) -> Result<LinuxJailPlan, ContainErro
     }
     let worktree_pins = pins_of(PinRoot::Worktree);
     push(&worktree_pins.iter().map(String::as_str).collect::<Vec<_>>());
+    let worktree_read_only = read_only_binds(Some(PinRoot::Worktree));
+    push(
+        &worktree_read_only
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+    );
 
     // --- Claude Code's folders of its runs, where the jail shares
     // `~/.claude` (`--identity` only). Claude Code is process 2 in every
@@ -2372,6 +2454,45 @@ pub fn build_macos_profile(input: &JailInputs) -> Result<MacosJailPlan, ContainE
         "(allow file-write* (regex #\"^{}(\\.tmp\\.[0-9]+\\.[0-9a-f]+|\\.lock)$\"))\n",
         sbpl_regex_escape(&claude_json)
     ));
+    // A profile's read-only paths (`extra_ro`), as the Linux jail lays
+    // them: one outside the work, then the project's write again where
+    // such a path holds it, then one inside the project, then a worktree's
+    // folder's write again where a path holds it, then one inside it
+    // ([`read_only_in_the_work`]). The sandbox lets the jail write whatever
+    // the allows above name, the project among them, so without these a
+    // read-only path in a folder the jail writes was written. Empty
+    // unless a profile named some, so a jail without one is what it was.
+    let deny_writing = |paths: Vec<PathBuf>, p: &mut String| {
+        for path in paths {
+            p.push_str(&format!(
+                "(deny file-write* (subpath \"{}\"))\n",
+                e(&path.to_string_lossy())
+            ));
+        }
+    };
+    let allow_again = |folder: &Path, under: &[PathBuf], p: &mut String| {
+        if under.iter().any(|ro| folder.starts_with(ro)) {
+            p.push_str(&format!(
+                "(allow file-write* (subpath \"{}\"))\n",
+                e(&folder.to_string_lossy())
+            ));
+        }
+    };
+    let outer_read_only = read_only_at(input, None);
+    deny_writing(outer_read_only.clone(), &mut p);
+    allow_again(&input.args.project, &outer_read_only, &mut p);
+    let project_read_only = read_only_at(input, Some(PinRoot::Project));
+    deny_writing(project_read_only.clone(), &mut p);
+    if let Some(wt) = &input.worktree {
+        let before: Vec<PathBuf> = outer_read_only
+            .iter()
+            .chain(&project_read_only)
+            .cloned()
+            .collect();
+        allow_again(&wt.git_dir, &before, &mut p);
+        allow_again(&wt.common_dir, &before, &mut p);
+    }
+    deny_writing(read_only_at(input, Some(PinRoot::Worktree)), &mut p);
     // write-denies LAST (nominal + resolved secret dir; then project secrets):
     p.push_str(&format!(
         "(deny file-write* (subpath \"{}\"))\n",
@@ -7017,6 +7138,107 @@ mod tests {
             .bwrap_args
             .iter()
             .any(|w| w == "--ro-bind-try"));
+    }
+
+    /// JP-1 (JAIL-PINS fixes, the read-only path): a profile's `extra_ro`
+    /// inside the project (`extra_ro = ~/code/app/vendor`, the project
+    /// `~/code/app`) was bound before the project, whose later bind covered
+    /// it: the jail wrote it (measured with bwrap 0.9: the host file read
+    /// `orig,jail`). On macOS nothing denied writing it at all. Such a path
+    /// is laid right after the bind of the folder that holds it, the
+    /// project's or a worktree's, and its pins; one that holds the project
+    /// stays before it, so the project is writable in it. macOS denies
+    /// each after the allow of the folder that holds it, in the same order.
+    /// A folder above such a path that the jail writes is pinned on both,
+    /// or a rename took the read-only bind away from its name.
+    ///
+    /// FAILS ON REVERT: lay every read-only path before the project (or
+    /// drop the macOS denies, or the read-only paths from the pins' places)
+    /// and the path is written through, or the folder above it moves.
+    #[test]
+    fn a_read_only_path_inside_the_project_or_a_worktree_stays_read_only() {
+        let mut input = inputs(&["claude"]);
+        input.worktree = Some(Worktree {
+            git_dir: PathBuf::from("/home/dev/main/.git/worktrees/proj"),
+            common_dir: PathBuf::from("/home/dev/main/.git"),
+        });
+        input.args.extra_ro = vec![
+            PathBuf::from("/opt/sdk"),
+            PathBuf::from("/home/dev/proj/vendor"),
+            PathBuf::from("/home/dev/proj/third/lib"),
+            PathBuf::from("/home/dev/main/.git/hooks"),
+        ];
+        assert!(validate_jail_inputs(&input).is_ok());
+        let a = build_linux_jail(&input).unwrap().bwrap_args;
+        let at = |w: &[&str]| {
+            a.windows(w.len())
+                .position(|x| x == w)
+                .unwrap_or_else(|| panic!("{w:?} in {a:?}"))
+        };
+        let ro = |path: &str| at(&["--ro-bind-try", path, path]);
+        let project = at(&["--bind", "/home/dev/proj", "/home/dev/proj"]);
+        let third = at(&["--bind", "/home/dev/proj/third", "/home/dev/proj/third"]);
+        let common = at(&["--bind", "/home/dev/main/.git", "/home/dev/main/.git"]);
+        assert!(ro("/opt/sdk") < project, "{a:?}");
+        assert!(
+            project < third && third < ro("/home/dev/proj/third/lib"),
+            "{a:?}"
+        );
+        assert!(project < ro("/home/dev/proj/vendor"), "{a:?}");
+        assert!(ro("/home/dev/proj/vendor") < common, "{a:?}");
+        assert!(common < ro("/home/dev/main/.git/hooks"), "{a:?}");
+        // The folder above a read-only path is pinned, never one in it.
+        let mut hidden = input.clone();
+        hidden.hide_paths = vec![mask("/home/dev/proj/vendor/x/y", true)];
+        let pins = linux_pins(&hidden);
+        assert!(
+            pins.contains(&(PinRoot::Project, PathBuf::from("/home/dev/proj/third"))),
+            "{pins:?}"
+        );
+        assert!(
+            !pins
+                .iter()
+                .any(|(_, folder)| folder.starts_with("/home/dev/proj/vendor")),
+            "{pins:?}"
+        );
+        // One that holds the project is laid before it, so the project
+        // stays writable in it.
+        let mut around = inputs(&["claude"]);
+        around.args.project = PathBuf::from("/home/dev/.cache/root/app");
+        around.deny_paths.clear();
+        around.args.extra_ro = vec![PathBuf::from("/home/dev/.cache/root")];
+        let a = build_linux_jail(&around).unwrap().bwrap_args;
+        let ro_at = a
+            .windows(3)
+            .position(|w| w[0] == "--ro-bind-try" && w[1] == "/home/dev/.cache/root")
+            .unwrap();
+        let project_at = a
+            .windows(3)
+            .position(|w| w[0] == "--bind" && w[1] == "/home/dev/.cache/root/app")
+            .unwrap();
+        assert!(ro_at < project_at, "{a:?}");
+        // macOS: each denied after the allow of the folder that holds it.
+        let profile = build_macos_profile(&input).unwrap().profile;
+        let find = |rule: &str| {
+            profile
+                .find(rule)
+                .unwrap_or_else(|| panic!("{rule} in {profile}"))
+        };
+        let deny = |path: &str| find(&format!("(deny file-write* (subpath \"{path}\"))"));
+        let allow = |path: &str| find(&format!("(allow file-write* (subpath \"{path}\"))"));
+        assert!(allow("/home/dev/proj") < deny("/home/dev/proj/vendor"));
+        assert!(allow("/home/dev/main/.git") < deny("/home/dev/main/.git/hooks"));
+        deny("/opt/sdk");
+        deny("/home/dev/proj/third/lib");
+        assert!(macos_pins(&input).contains(&PathBuf::from("/home/dev/proj/third")));
+        let profile = build_macos_profile(&around).unwrap().profile;
+        let denied = profile
+            .find("(deny file-write* (subpath \"/home/dev/.cache/root\"))")
+            .expect("the read-only path is denied");
+        let again = profile
+            .rfind("(allow file-write* (subpath \"/home/dev/.cache/root/app\"))")
+            .expect("the project's write again");
+        assert!(denied < again, "{profile}");
     }
 
     /// A read-only bind shows a reader what is there: the home, an ancestor

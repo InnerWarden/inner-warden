@@ -114,6 +114,13 @@ follows semantic versioning.
   notes). On Linux the same holds for a profile's hidden home path: the
   host's programs read the jail's folder at that name, and wrote into it
   what the path was hidden for (a credential cache's socket, a token).
+- **A profile's read-only path inside the project stays read-only.** On
+  Linux the read-only bind of an `extra_ro` path inside the project, or a
+  worktree's folder, came before the bind of that folder, which covered it,
+  and on macOS nothing denied writing such a path: a program in the jail
+  wrote it. Each is read-only on both now, and each folder the jail writes
+  above a read-only path is kept in place, so the path is never moved away
+  from its name.
 - **A suppression planted in the jail no longer lifts the hook's verdict.**
   Inside the jail the hook read the person's suppressions from
   `~/.config/innerwarden`, which on Linux is an empty folder of the jail's

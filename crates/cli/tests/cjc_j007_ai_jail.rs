@@ -1873,6 +1873,85 @@ fn claude_codes_folders_are_the_jails_own_through_a_linked_claude_folder() {
     assert!(!err.contains("is the host's in this jail"), "{err}");
 }
 
+/// JP-1 (JAIL-PINS fixes, the read-only path): a profile's `extra_ro`
+/// inside the project was written from the jail. On Linux its read-only
+/// bind came before the project's, which covered it (measured with bwrap
+/// 0.9: the host file read `orig,jail`); on macOS nothing denied writing
+/// it. It is read-only on both now, cannot be moved away from its name,
+/// and the project around it is still written.
+///
+/// FAILS ON REVERT: lay every read-only path before the project (Linux) or
+/// drop the read-only denies (macOS), and the host file is written.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_read_only_path_of_a_profile_inside_the_project_is_never_written() {
+    use std::os::unix::fs::PermissionsExt;
+    #[cfg(target_os = "linux")]
+    require_bwrap();
+    let home = tempfile::TempDir::new().unwrap();
+    let h = std::fs::canonicalize(home.path()).unwrap();
+    std::fs::create_dir_all(h.join(".local/state")).unwrap();
+    std::fs::create_dir_all(h.join(".config/innerwarden")).unwrap();
+    let project = tempfile::TempDir::new().unwrap();
+    let p = std::fs::canonicalize(project.path()).unwrap();
+    std::fs::create_dir_all(p.join("vendor")).unwrap();
+    std::fs::write(p.join("vendor/lib.txt"), "orig").unwrap();
+    let file = h.join(".config/innerwarden/agent-profiles.toml");
+    std::fs::write(
+        &file,
+        format!(
+            "schema_version = 2\n[profile.claude-code.jail]\nextra_ro = [\"{}\"]\n",
+            p.join("vendor").display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let script = format!(
+        "set -- '{}'; \
+         if ( echo jail >> \"$1/vendor/lib.txt\" ) 2>/dev/null; then echo WROTE; fi; \
+         if ( echo new > \"$1/vendor/new.txt\" ) 2>/dev/null; then echo MADE; fi; \
+         if mv \"$1/vendor\" \"$1/moved\" 2>/dev/null; then echo MOVED; fi; \
+         echo ok > \"$1/main.txt\" && echo PROJECT-W; echo DONE",
+        p.display()
+    );
+    let mut command = cli();
+    command
+        .args([
+            "contain",
+            "--identity",
+            "--project",
+            p.to_str().unwrap(),
+            "--",
+            "/bin/sh",
+            "-c",
+            &script,
+        ])
+        .env("HOME", &h)
+        .env_remove("XDG_STATE_HOME");
+    #[cfg(target_os = "linux")]
+    identified_without_a_scope(&mut command);
+    let output = command.output().expect("run the identified jail");
+    let out = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "the jail did not start: {err}");
+    assert!(
+        out.contains("DONE") && out.contains("PROJECT-W"),
+        "{out} {err}"
+    );
+    assert!(
+        err.contains("jail settings from the `claude-code` agent profile"),
+        "{err}"
+    );
+    for written in ["WROTE", "MADE", "MOVED"] {
+        assert!(!out.contains(written), "{written}: {out}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(p.join("vendor/lib.txt")).unwrap(),
+        "orig"
+    );
+    assert!(!p.join("vendor/new.txt").exists() && !p.join("moved").exists());
+}
+
 /// M30CW-BRK-1: a profile that shows the person's own `~/.claude.json`
 /// read-only (`extra_ro`, to give the jailed agent the person's MCP
 /// servers) still starts its identified jail, and the jail shows that file
