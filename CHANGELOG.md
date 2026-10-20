@@ -7,6 +7,12 @@ follows semantic versioning.
 
 ### Upgrade notes: what to do
 
+- **On macOS a program in `innerwarden contain` can no longer rename, remove
+  or change the project folder itself, `~/.config`, or a folder between the
+  project and a `--deny-read` path.** It still writes in them; only the
+  folder itself keeps its name, mode and times. A tool that renames the
+  folder it works in has to run outside the jail. Where `~/.config` is not
+  there yet, `innerwarden contain` makes it first (0700).
 - **A program in `innerwarden contain` can no longer make a btrfs or bcachefs
   subvolume or snapshot.** It gets "Operation not permitted". A tool that
   needs one (a container runtime on btrfs, `btrfs subvolume create`) has to
@@ -28,6 +34,19 @@ follows semantic versioning.
 
 ### Security
 
+- **On macOS a jail can no longer move a folder above what it hides.** In
+  1.5.5 and earlier, in every macOS jail, a program in it could rename a
+  folder it may write that holds a place the jail denies, and then read that
+  place under the new name, or put a folder of its own in that folder's
+  place, whose files the host's guard read. Every macOS jail now keeps such
+  folders in place, the project and the folder that holds InnerWarden's own
+  folder among them; the jail still writes in them.
+- **On Linux a hidden place inside a project kept in a folder the jail
+  writes stays where the host reads it.** Where such a place sat in a
+  project kept two or more folders down inside a home folder the jail binds,
+  a folder above the project could be renamed, and the host's link then led
+  to a folder the jail made. Each folder the jail writes between such a
+  place and your home is now a mount point of its own.
 - **No jail makes a new btrfs or bcachefs subvolume or snapshot.** In 1.5.5
   and earlier, on a btrfs or bcachefs disk where the project, or a folder the
   jail shows, is a subvolume, a program in the jail could snapshot it, and
@@ -73,8 +92,8 @@ follows semantic versioning.
   where `~/.ssh` leads; `~/dotfiles/ssh` above a stowed `~/.ssh`; the
   `~/.local/state` above the launcher's records in an identified jail) took
   the cover with it and made a folder of its own at the name the host's
-  link, or the launcher, reads. Each folder between such a place and the
-  folder the jail binds is now a mount point of its own, and the rename
+  link, or the launcher, reads. Each folder the jail writes between such a
+  place and your home is now a mount point of its own, and the rename
   fails. On macOS the sandbox let the jail rename a folder above a denied
   place, the project included: each such folder the jail may write is now
   closed to renaming and removal, and the jail still writes in it.

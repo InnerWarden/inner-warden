@@ -228,7 +228,7 @@ what of the home it hides, under `[profile.<type>.jail]`:
   itself a link (`~/.cache` on another disk) counts as the home where it
   leads. On Linux a path that is not there yet, in a folder the jail writes,
   is made empty (mode 0700) first, so what a program makes there later stays
-  hidden too. Each folder between such a path and the folder the jail writes
+  hidden too. Each folder the jail writes between such a path and your home
   is pinned as below, so no program in the jail renames it away from the
   path's cover.
 
@@ -245,14 +245,23 @@ the jail follows the host when the network changes. Elsewhere
 (systemd-resolved, NetworkManager) a jail keeps the resolver file it started
 with until the agent is restarted.
 
+On macOS every jail keeps in place the folders above what it hides: the
+project, `~/.config` (which holds InnerWarden's own folder) and each folder
+between the project and a `--deny-read` path cannot be renamed, removed or
+replaced by a link from inside the jail, so nothing it hides is shown at
+another name. The jail still writes in them; only the folder itself cannot be
+changed (its mode or times). Where `~/.config` is not there yet,
+`innerwarden contain` makes it first, empty and 0700; a dry run makes
+nothing.
+
 Where a place the jail hides is a link, the jail hides the place it leads
 to: `~/.ssh`, `~/.gnupg` or `~/.aws` kept as a link into a folder the jail
 shows (`~/.ssh` a link to `.config/ssh`), a link inside one of them
 (`~/.ssh/config` a link into `~/.config/dotfiles`, as GNU stow and chezmoi
 make one per file), a `--deny-read` path of the project, or InnerWarden's own
 folder. Every link on the way is followed. On Linux that place is covered
-wherever a folder the jail shows holds it, and each folder between the cover
-and the folder the jail binds is a mount point of its own, so a program in
+wherever a folder the jail shows holds it, and each folder the jail writes
+between the cover and your home is a mount point of its own, so a program in
 the jail can neither read the place nor rename it away from the name your
 link uses; a dotdir's place that is not there yet is made first, empty and
 0700, so nothing the agent writes there reaches it (a `--deny-read` path that
