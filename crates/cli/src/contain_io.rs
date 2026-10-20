@@ -354,39 +354,44 @@ fn resolve_inputs(
         &existing_paths,
         |path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()),
     );
-    // What no mask laid because of a link may cover, and where a place not
-    // there yet is never covered (bwrap cannot make it there).
-    let needed = crate::contain::jail_needs(&args, &home, worktree.as_ref(), &iw_binary, |path| {
-        std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
-    });
-    let read_only = crate::contain::read_only_shown(&args, &home);
+    // What the planner of the places the jail hides knows of this jail:
+    // where it shows each host folder, which ones it writes, what it needs
+    // as it is (the guard, the agent's command and settings, the system
+    // profiles) and what it works in.
+    let agent_command = args.child.first().and_then(|command| command_path(command));
+    let facts = crate::contain::place_facts(
+        &args,
+        &home,
+        worktree.as_ref(),
+        &existing_paths,
+        &iw_binary,
+        agent_command.as_deref(),
+        &tmpdir,
+        cfg!(target_os = "macos"),
+        |path| leads_to(path).unwrap_or_else(|| path.to_path_buf()),
+    );
     let mut left: Vec<String> = Vec::new();
 
     // Linux: the secret dir at every other place a home folder the jail
     // binds shows it. Empty in every common layout. Where the dir itself
-    // is a link, at every place the jail shows where it leads, and never
-    // where it leads outside the person's own places (said).
-    let (iw_config_real, iw_config_shown, iw_config_outside, iw_linked) = if iw_config_link {
-        let place = hidden_place(&iw_config_named);
+    // is a link, at every place the jail shows where it leads, unless the
+    // jail leaves that place as it is (said).
+    let (iw_config_real, iw_config_shown, iw_config_left, iw_linked) = if iw_config_link {
+        let place = hidden_place(&iw_config_named, &facts.writable, true);
         let real = place
             .leads_to
             .clone()
             .unwrap_or_else(|| iw_config_through.clone());
-        let outside = place.leads_to.as_ref().is_some_and(|leads_to| {
-            !crate::contain::in_own_places(leads_to, &home, &shown, &read_only)
-        });
-        let mut linked =
-            crate::contain::plan_linked_places(&[place], &home, &shown, &read_only, &needed, &[]);
+        let mut linked = crate::contain::plan_linked_places(&[place], &facts, &[], false);
         // A mount over a file there would abort the jail; only a folder
         // is InnerWarden's folder.
         linked.masks.retain(|mask| mask.is_dir);
-        let views = if cfg!(target_os = "linux") {
-            linked.masks.iter().map(|mask| mask.abs.clone()).collect()
-        } else {
-            Vec::new()
-        };
+        // Left as it is: needed, a loop, or onto what the jail runs on
+        // through a link a program in the jail can change.
+        let iw_left = linked.hidden.is_empty();
+        let views = linked.masks.iter().map(|mask| mask.abs.clone()).collect();
         left.append(&mut linked.left);
-        (real, views, outside, linked.missing)
+        (real, views, iw_left, linked.missing)
     } else {
         let views = if cfg!(target_os = "linux") {
             crate::contain::other_jail_views(
@@ -402,15 +407,13 @@ fn resolve_inputs(
 
     // Expand the deny_read globs against the real project + stat each match so the
     // builder knows file-vs-dir (Linux masks a file with /dev/null, a dir with tmpfs).
-    // Each is masked where it leads, and at every other place the jail
-    // shows it; one a link leads out of the home or onto what the jail
-    // needs is left as it is (said).
+    // Each is hidden where it leads, and at every other place the jail
+    // shows it; one a link leads onto what the jail needs, or (through a
+    // link a program in the jail can change) onto what the jail runs on,
+    // is left as it is (said).
     let (deny_paths, mut deny_linked) = crate::contain::plan_denied_paths(
-        &deny_read_places(&args.project, &args.deny_read),
-        &home,
-        &shown,
-        &read_only,
-        &needed,
+        &deny_read_places(&args.project, &args.deny_read, &facts.writable),
+        &facts,
     );
     left.append(&mut deny_linked.left);
 
@@ -419,35 +422,31 @@ fn resolve_inputs(
     // on Linux, denied where it leads on macOS. Empty in every common
     // layout.
     let mut dotdirs_linked = crate::contain::plan_linked_places(
-        &crate::contain::never_shown_home_paths(&home, cfg!(target_os = "macos"))
+        &crate::contain::never_shown_home_paths(&home, facts.macos)
             .iter()
-            .map(|path| hidden_place(path))
+            .map(|path| hidden_place(path, &facts.writable, true))
             .collect::<Vec<_>>(),
-        &home,
-        &shown,
-        &read_only,
-        &needed,
+        &facts,
         &[
             vec![iw_config_named.clone(), iw_config_real.clone()],
             iw_config_shown.clone(),
         ]
         .concat(),
+        false,
     );
     left.append(&mut dotdirs_linked.left);
-    let (linked_masks, linked_missing, linked_denies) = if cfg!(target_os = "linux") {
-        let mut masks = dotdirs_linked.masks;
-        for mask in deny_linked.masks {
-            if !masks.iter().any(|seen| seen.abs == mask.abs) {
-                masks.push(mask);
-            }
+    // Each plan holds only its own OS's: masks on Linux, denies on macOS.
+    let mut linked_masks = dotdirs_linked.masks;
+    for mask in deny_linked.masks {
+        if !linked_masks.iter().any(|seen| seen.abs == mask.abs) {
+            linked_masks.push(mask);
         }
-        let mut missing = iw_linked;
-        missing.append(&mut dotdirs_linked.missing);
-        missing.append(&mut deny_linked.missing);
-        (masks, missing, Vec::new())
-    } else {
-        (Vec::new(), Vec::new(), dotdirs_linked.denies)
-    };
+    }
+    let mut linked_missing = iw_linked;
+    linked_missing.append(&mut dotdirs_linked.missing);
+    linked_missing.append(&mut deny_linked.missing);
+    let linked_denies = dotdirs_linked.denies;
+    let hidden_targets = dotdirs_linked.hidden;
 
     // The home paths a jail profile hides: where each leads, every link
     // followed, covered where the jail shows it (Linux) and denied as named
@@ -541,10 +540,11 @@ fn resolve_inputs(
         iw_config_real,
         iw_config_shown,
         iw_config_link,
-        iw_config_outside,
+        iw_config_left,
         linked_masks,
         linked_missing,
         linked_denies,
+        hidden_targets,
         left,
         deny_paths,
         info_fd: None,
@@ -873,12 +873,18 @@ fn resolved_through_existing(path: &Path) -> PathBuf {
 /// covers all descendants); other globs are enumerated with the `glob` crate.
 /// Each is found as [`hidden_place`] finds it: where it leads, every link
 /// followed, so the mask/deny targets the real path
-/// ([`crate::contain::plan_denied_paths`]).
-fn deny_read_places(project: &Path, patterns: &[String]) -> Vec<crate::contain::HiddenPlace> {
+/// ([`crate::contain::plan_denied_paths`]). Every link on the way counts
+/// toward [`crate::contain::HiddenPlace::steerable`]: a link in the project
+/// is the agent's to change.
+fn deny_read_places(
+    project: &Path,
+    patterns: &[String],
+    writable: &[PathBuf],
+) -> Vec<crate::contain::HiddenPlace> {
     let mut out: Vec<crate::contain::HiddenPlace> = Vec::new();
     let mut add = |path: PathBuf| {
         if !out.iter().any(|seen| seen.nominal == path) {
-            out.push(hidden_place(&path));
+            out.push(hidden_place(&path, writable, false));
         }
     };
     for pat in patterns {
@@ -901,15 +907,52 @@ fn deny_read_places(project: &Path, patterns: &[String]) -> Vec<crate::contain::
 
 /// A place the jail hides, as found on the host: where it leads
 /// ([`leads_to`]), whether something is there and whether it is a folder
-/// (`metadata`, which follows the links, so both describe what is there).
-fn hidden_place(nominal: &Path) -> crate::contain::HiddenPlace {
+/// (`metadata`, which follows the links, so both describe what is there),
+/// and whether a link on the way sits in a folder the jail writes
+/// (`writable`, [`crate::contain::steerable`]). `hidden_as_named`: the jail
+/// hides the place as named (a dotdir, InnerWarden's folder), so its own
+/// entry is not the jail's to change.
+fn hidden_place(
+    nominal: &Path,
+    writable: &[PathBuf],
+    hidden_as_named: bool,
+) -> crate::contain::HiddenPlace {
     let meta = std::fs::metadata(nominal);
+    let traced = trace(nominal);
+    let own_entry = hidden_as_named
+        .then(|| nominal.parent().zip(nominal.file_name()))
+        .flatten()
+        .map(|(parent, name)| {
+            leads_to(parent)
+                .unwrap_or_else(|| parent.to_path_buf())
+                .join(name)
+        });
     crate::contain::HiddenPlace {
         nominal: nominal.to_path_buf(),
-        leads_to: leads_to(nominal),
+        steerable: traced.as_ref().is_some_and(|(_, links)| {
+            crate::contain::steerable(links, own_entry.as_deref(), writable)
+        }),
+        leads_to: traced.map(|(at, _)| at),
         there: meta.is_ok(),
         is_dir: meta.is_ok_and(|meta| meta.is_dir()),
     }
+}
+
+/// Where the agent's command is on the host: as given where it names a
+/// path, else the first file of that name in a folder of `PATH`, as the
+/// jail's shell finds it.
+fn command_path(command: &str) -> Option<PathBuf> {
+    if command.contains('/') {
+        let path = Path::new(command);
+        return Some(if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir().ok()?.join(path)
+        });
+    }
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|folder| folder.join(command))
+        .find(|candidate| candidate.is_file())
 }
 
 /// Whether `path`, in a home folder the jail binds ([`crate::contain::writable_home_dirs`]),
@@ -958,6 +1001,12 @@ const MAX_LINKS: usize = 40;
 /// the place a file made through it would land, also where a link leads to
 /// nothing yet. `None` where the links loop, or for a relative path.
 pub(crate) fn leads_to(path: &Path) -> Option<PathBuf> {
+    trace(path).map(|(at, _)| at)
+}
+
+/// [`leads_to`], with each link followed on the way, as found on the host
+/// (the folder it sits in with every link before it followed).
+pub(crate) fn trace(path: &Path) -> Option<(PathBuf, Vec<PathBuf>)> {
     use std::path::Component;
     if !path.is_absolute() {
         return None;
@@ -975,7 +1024,7 @@ pub(crate) fn leads_to(path: &Path) -> Option<PathBuf> {
     };
     push_steps(&mut todo, path);
     let mut at = PathBuf::from("/");
-    let mut links = 0;
+    let mut links: Vec<PathBuf> = Vec::new();
     let mut gone = false;
     while let Some(step) = todo.pop() {
         if step == ".." {
@@ -988,10 +1037,10 @@ pub(crate) fn leads_to(path: &Path) -> Option<PathBuf> {
         }
         match std::fs::symlink_metadata(&at) {
             Ok(meta) if meta.file_type().is_symlink() => {
-                links += 1;
-                if links > MAX_LINKS {
+                if links.len() >= MAX_LINKS {
                     return None;
                 }
+                links.push(at.clone());
                 let target = std::fs::read_link(&at).ok()?;
                 at.pop();
                 if target.is_absolute() {
@@ -1003,7 +1052,7 @@ pub(crate) fn leads_to(path: &Path) -> Option<PathBuf> {
             Err(_) => gone = true,
         }
     }
-    Some(at)
+    Some((at, links))
 }
 
 /// Make `place`, which is not there, as an empty folder, mode 0700, and
@@ -3802,6 +3851,57 @@ mod tests {
             std::fs::canonicalize(home.join(".gnupg")).unwrap()
         );
         assert_eq!(leads_to(Path::new("relative")), None);
+    }
+
+    /// Each link followed on the way is found where it sits, and a place
+    /// is steerable only through a link in a folder the jail writes: a
+    /// `.env` link in the project always; a dotdir only past its own entry
+    /// (`~/.ssh` itself sits in the home, which the jail never writes),
+    /// through a second link in `~/.config`.
+    ///
+    /// FAILS ON REVERT: count the dotdir's own entry, or skip the links
+    /// `trace` follows, and `.ssh` and `.env` swap answers.
+    #[cfg(unix)]
+    #[test]
+    fn a_place_is_steerable_only_through_a_link_the_jail_can_change() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(root.path()).unwrap();
+        let project = home.join("proj");
+        std::fs::create_dir_all(home.join(".config/ssh-real")).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        symlink(".config/ssh", home.join(".ssh")).unwrap();
+        symlink("ssh-real", home.join(".config/ssh")).unwrap();
+        symlink(home.join(".config/ssh-real"), home.join(".gnupg")).unwrap();
+        symlink(home.join(".gnupg"), project.join(".env")).unwrap();
+        let (at, links) = trace(&home.join(".ssh")).unwrap();
+        assert_eq!(at, home.join(".config/ssh-real"));
+        assert_eq!(links, [home.join(".ssh"), home.join(".config/ssh")]);
+        let writable = [home.join(".config"), project.clone()];
+        assert!(hidden_place(&home.join(".ssh"), &writable, true).steerable);
+        assert!(!hidden_place(&home.join(".gnupg"), &writable, true).steerable);
+        assert!(hidden_place(&project.join(".env"), &writable, false).steerable);
+        assert!(!hidden_place(&project.join(".env"), &[], false).steerable);
+        let place = hidden_place(&home.join(".gnupg"), &writable, true);
+        assert_eq!(place.leads_to, Some(home.join(".config/ssh-real")));
+        assert!(place.there && place.is_dir);
+    }
+
+    /// The agent's command is where the jail's shell finds it: a path as
+    /// given, or the first file of that name in a folder of `PATH`.
+    #[cfg(unix)]
+    #[test]
+    fn the_agents_command_is_found_as_the_shell_finds_it() {
+        assert_eq!(
+            command_path("/opt/claude/bin/claude"),
+            Some(PathBuf::from("/opt/claude/bin/claude"))
+        );
+        assert_eq!(
+            command_path("bin/claude"),
+            Some(std::env::current_dir().unwrap().join("bin/claude"))
+        );
+        assert_eq!(command_path("sh").map(|p| p.is_file()), Some(true));
+        assert_eq!(command_path("innerwarden-no-such-command-x9"), None);
     }
 
     /// A path goes through a link below the home folder the jail binds it

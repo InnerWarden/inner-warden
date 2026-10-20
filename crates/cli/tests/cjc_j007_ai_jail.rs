@@ -2160,6 +2160,106 @@ fn on_macos_a_dotdir_linked_into_a_folder_the_jail_writes_stays_hidden() {
     );
 }
 
+/// A folder outside the fake home that is no place of the system: where
+/// the macOS tests keep what a link leads out of the home to (a temporary
+/// folder is under `/private/var`, which a steered link never reaches).
+#[cfg(target_os = "macos")]
+fn outside_the_home() -> tempfile::TempDir {
+    let dir = tempfile::TempDir::new_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    assert!(std::fs::canonicalize(dir.path())
+        .unwrap()
+        .starts_with(std::fs::canonicalize(env!("CARGO_TARGET_TMPDIR")).unwrap()));
+    dir
+}
+
+/// M30-SEC-3: on macOS the jail reads everywhere it is not denied. A
+/// dotdir a person's own link leads outside the home (`~/.ssh` a link to a
+/// key folder on another disk) was denied as named only, so its keys were
+/// readable at the place itself. That place is denied too, read and
+/// write.
+///
+/// FAILS ON REVERT: leave every place outside the home on macOS and the key
+/// is read where it is.
+#[cfg(target_os = "macos")]
+#[test]
+fn on_macos_a_dotdir_a_link_leads_outside_the_home_is_denied_there() {
+    let home = tempfile::TempDir::new().unwrap();
+    let h = std::fs::canonicalize(home.path()).unwrap();
+    let elsewhere = outside_the_home();
+    let keys = std::fs::canonicalize(elsewhere.path()).unwrap().join("ssh");
+    std::fs::create_dir_all(&keys).unwrap();
+    std::fs::write(keys.join("id_test"), "CJC-J007-SSH-KEY").unwrap();
+    std::os::unix::fs::symlink(&keys, h.join(".ssh")).unwrap();
+    let project = tempfile::TempDir::new().unwrap();
+    let script = format!(
+        "cat '{0}/id_test'; echo planted > '{0}/authorized_keys'; echo DONE",
+        keys.display()
+    );
+    let output = cli()
+        .args([
+            "contain",
+            "--project",
+            project.path().to_str().unwrap(),
+            "--",
+            "/bin/sh",
+            "-c",
+            &script,
+        ])
+        .env("HOME", &h)
+        .output()
+        .expect("run the macOS jail");
+    let out = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(out.contains("DONE"), "{out} {err}");
+    assert!(!out.contains("CJC-J007-SSH-KEY"), "the key was read: {out}");
+    assert!(!keys.join("authorized_keys").exists(), "a file was planted");
+    assert!(!err.contains("leads"), "nothing to say: {err}");
+}
+
+/// M30-SEC-5, M30L-DOC-1: on macOS a `deny_read` path of the project that
+/// a link leads out of the home (`.env` a link to a secrets file kept
+/// elsewhere) was denied before links were planned, then left readable.
+/// It is denied where it leads again: a deny in the sandbox closes it to
+/// the jail alone, and that place is no place of the system.
+///
+/// FAILS ON REVERT: leave every steered place out of the home on macOS (the
+/// Linux rule) and the secret is read.
+#[cfg(target_os = "macos")]
+#[test]
+fn on_macos_a_deny_read_link_out_of_the_home_is_denied_where_it_leads() {
+    let home = tempfile::TempDir::new().unwrap();
+    let h = std::fs::canonicalize(home.path()).unwrap();
+    let elsewhere = outside_the_home();
+    let secret = std::fs::canonicalize(elsewhere.path())
+        .unwrap()
+        .join("app.env");
+    std::fs::write(&secret, "CJC-J007-ENV-SECRET").unwrap();
+    let project = tempfile::TempDir::new().unwrap();
+    std::os::unix::fs::symlink(&secret, project.path().join(".env")).unwrap();
+    let script = format!("cat .env '{}'; echo DONE", secret.display());
+    let output = cli()
+        .args([
+            "contain",
+            "--project",
+            project.path().to_str().unwrap(),
+            "--",
+            "/bin/sh",
+            "-c",
+            &script,
+        ])
+        .env("HOME", &h)
+        .output()
+        .expect("run the macOS jail");
+    let out = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(out.contains("DONE"), "{out} {err}");
+    assert!(
+        !out.contains("CJC-J007-ENV-SECRET"),
+        "the secret was read: {out}"
+    );
+    assert!(!err.contains("leads"), "nothing to say: {err}");
+}
+
 /// A folder the jail shows that is itself a link to a folder above a
 /// dotdir: `~/.cache` a link to the home's `dots` folder, where `~/.ssh`
 /// leads, shows the key at `~/.cache/ssh`; `~/.cache` a link to the home
@@ -2235,31 +2335,39 @@ fn a_dotdir_behind_a_chain_of_two_links_stays_hidden() {
     }
 }
 
-/// A dotdir that a link leads outside the home: the jail never follows a
-/// link out of the home to cover a place there (that would be the system,
-/// or a disk the person keeps elsewhere). It starts, leaves that place as
-/// it is, and says so; the place is not in the jail anyway (nothing shows
-/// it).
+/// A dotdir that a link leads outside the home, where a Linux jail shows
+/// nothing (the jail's root and home are empty folders of its own): the
+/// place is not in the jail, and nothing is said of it, on every launch,
+/// as if it were exposed (M30-R4). The same through a link in `~/.config`,
+/// which a program in the jail can change: never covered out of the
+/// person's own places, and not in the jail either.
 ///
-/// FAILS ON REVERT: drop the own-places check from `plan_linked_places`
-/// and nothing is said.
+/// FAILS ON REVERT: say every place a link leads out of the home (the rule
+/// before M30-R4) and a line says the keys are not hidden.
 #[cfg(target_os = "linux")]
 #[test]
-fn a_dotdir_that_leads_outside_the_home_is_left_and_said() {
+fn a_dotdir_that_leads_where_the_jail_shows_nothing_is_not_in_it_and_nothing_is_said() {
     require_bwrap();
     for identity in [false, true] {
         let home = tempfile::TempDir::new().unwrap();
         let h = home.path();
         let elsewhere = tempfile::TempDir::new().unwrap();
         let keys = elsewhere.path().join("ssh");
-        std::fs::create_dir_all(&keys).unwrap();
-        std::fs::write(keys.join("id_test"), "CJC-J007-SSH-KEY").unwrap();
+        let gpg = elsewhere.path().join("gpg");
+        for dir in [&keys, &gpg] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("id_test"), "CJC-J007-SSH-KEY").unwrap();
+        }
         std::os::unix::fs::symlink(&keys, h.join(".ssh")).unwrap();
         std::fs::create_dir_all(h.join(".config")).unwrap();
+        std::os::unix::fs::symlink(".config/gpg", h.join(".gnupg")).unwrap();
+        std::os::unix::fs::symlink(&gpg, h.join(".config/gpg")).unwrap();
         let project = tempfile::TempDir::new().unwrap();
         let script = format!(
-            "cat '{}/id_test' \"$HOME/.ssh/id_test\" 2>/dev/null; echo DONE",
-            keys.display()
+            "cat '{}/id_test' '{}/id_test' \"$HOME/.ssh/id_test\" \"$HOME/.config/gpg/id_test\" \
+             2>/dev/null; echo DONE",
+            keys.display(),
+            gpg.display()
         );
         let output = jail_sh(identity, h, project.path(), &script);
         let out = String::from_utf8_lossy(&output.stdout);
@@ -2270,13 +2378,108 @@ fn a_dotdir_that_leads_outside_the_home_is_left_and_said() {
             !out.contains("CJC-J007-SSH-KEY"),
             "identity={identity}: {out}"
         );
-        let said = format!(
-            "innerwarden contain: {} leads outside your home, to {}: the jail does not hide that place",
-            h.join(".ssh").display(),
-            std::fs::canonicalize(&keys).unwrap().display()
-        );
-        assert!(err.contains(&said), "identity={identity}: {err}");
+        assert!(!err.contains("leads"), "identity={identity}: {err}");
     }
+}
+
+/// A dotdir that a link leads into the project (GNU stow's `~/.ssh` a link
+/// into the dotfiles the agent works on): hidden there, and said, since the
+/// agent finds that folder of its project empty (M30-R3). Nothing the jail
+/// writes there reaches the host.
+///
+/// FAILS ON REVERT: drop the line from `plan_linked_places` and nothing is
+/// said.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_dotdir_that_leads_into_the_project_is_hidden_there_and_said() {
+    require_bwrap();
+    let home = tempfile::TempDir::new().unwrap();
+    let h = home.path();
+    std::fs::create_dir_all(h.join(".config")).unwrap();
+    let project = tempfile::TempDir::new().unwrap();
+    let p = std::fs::canonicalize(project.path()).unwrap();
+    let keys = p.join("ssh/.ssh");
+    std::fs::create_dir_all(&keys).unwrap();
+    std::fs::write(keys.join("id_test"), "CJC-J007-SSH-KEY").unwrap();
+    std::os::unix::fs::symlink(&keys, h.join(".ssh")).unwrap();
+    let output = jail_sh(
+        false,
+        h,
+        &p,
+        &read_and_plant(&[".ssh"]).replace("$HOME/.ssh", "$PWD/ssh/.ssh"),
+    );
+    let out = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{out} {err}");
+    assert!(out.contains("DONE"), "{out} {err}");
+    assert!(!out.contains("CJC-J007-SSH-KEY"), "the key was read: {out}");
+    assert!(
+        !keys.join("authorized_keys").exists(),
+        "a planted file reached the host"
+    );
+    assert!(keys.join("id_test").exists());
+    assert!(
+        err.contains(&format!(
+            "innerwarden contain: {} leads into your project, to {}: the jail hides it there too",
+            h.join(".ssh").display(),
+            keys.display()
+        )),
+        "{err}"
+    );
+}
+
+/// M30-SEC-2: a worktree the project's `.git` names (a file the agent
+/// writes) that is the place a hidden dotdir leads to: such a jail would
+/// bind it read-write, and a planner that trusted it as needed left the
+/// key shown. The launch is refused, and says why.
+///
+/// FAILS ON REVERT: drop the hidden-target check from
+/// `validate_jail_inputs` and the jail starts with the worktree bound.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_worktree_named_onto_where_a_hidden_dotdir_leads_is_refused() {
+    #[cfg(target_os = "linux")]
+    require_bwrap();
+    let home = tempfile::TempDir::new().unwrap();
+    let h = std::fs::canonicalize(home.path()).unwrap();
+    std::fs::create_dir_all(h.join(".config/ssh")).unwrap();
+    std::fs::write(h.join(".config/ssh/id_test"), "CJC-J007-SSH-KEY").unwrap();
+    std::os::unix::fs::symlink(".config/ssh", h.join(".ssh")).unwrap();
+    let project = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        project.path().join(".git"),
+        format!("gitdir: {}\n", h.join(".config/ssh").display()),
+    )
+    .unwrap();
+    let output = cli()
+        .args([
+            "contain",
+            "--project",
+            project.path().to_str().unwrap(),
+            "--",
+            "/bin/sh",
+            "-c",
+            "cat \"$HOME/.config/ssh/id_test\"; echo DONE",
+        ])
+        .env("HOME", &h)
+        .output()
+        .expect("run the jail");
+    let out = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{out} {err}");
+    assert!(
+        !out.contains("CJC-J007-SSH-KEY") && !out.contains("DONE"),
+        "{out}"
+    );
+    assert!(
+        err.contains(&format!(
+            "unsafe worktree git path '{}': it overlaps '{}', where {} leads",
+            h.join(".config/ssh").display(),
+            h.join(".config/ssh").display(),
+            h.join(".ssh").display()
+        )),
+        "{err}"
+    );
 }
 
 /// A person whose dotdirs are ordinary folders: they are hidden as before,
@@ -2489,13 +2692,15 @@ fn an_identified_jail_starts_where_the_records_folder_is_behind_a_link() {
 /// A `deny_read` path that a link in the project (which the agent writes)
 /// leads onto the agent's settings, or onto the system: the jail covered
 /// where it led, so a `.env` link to `~/.claude` emptied the folder that
-/// carries the hook at the next launch, and one to `/etc/passwd` the
-/// jail's own file. Each is left as it is and said; the hook's folder and
+/// carries the hook at the next launch, one to `~/.claude/settings.json`
+/// the file itself (M30-SEC-1), and one to `/etc/passwd` the jail's own
+/// file. Each is left as it is and said; the hook's folder and file and
 /// the system's file are as they are in the jail.
 ///
-/// FAILS ON REVERT: drop the needed or the own-places check from
-/// `plan_denied_paths` and the jail's `~/.claude` is empty, or its
-/// `/etc/passwd` is.
+/// FAILS ON REVERT: drop the needed or the steered check from
+/// `plan_denied_paths`, or check what the jail needs in one direction
+/// only, and the jail's `~/.claude`, its settings file or its
+/// `/etc/passwd` is empty.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_deny_read_link_never_empties_the_hook_or_the_system() {
@@ -2504,11 +2709,13 @@ fn a_deny_read_link_never_empties_the_hook_or_the_system() {
     let h = std::fs::canonicalize(home.path()).unwrap();
     std::fs::create_dir_all(h.join(".claude")).unwrap();
     std::fs::write(h.join(".claude/marker.txt"), "CJC-J007-SETTINGS").unwrap();
+    std::fs::write(h.join(".claude/hook.json"), "CJC-J007-HOOK-FILE").unwrap();
     let project = tempfile::TempDir::new().unwrap();
     let p = project.path();
     std::os::unix::fs::symlink(h.join(".claude"), p.join(".env")).unwrap();
+    std::os::unix::fs::symlink(h.join(".claude/hook.json"), p.join(".env.hook")).unwrap();
     std::os::unix::fs::symlink("/etc/passwd", p.join(".env.local")).unwrap();
-    let script = "cat \"$HOME/.claude/marker.txt\"; echo; \
+    let script = "cat \"$HOME/.claude/marker.txt\"; echo; cat \"$HOME/.claude/hook.json\"; echo; \
                   echo \"name=$(head -c 4 /etc/passwd 2>/dev/null)\"; echo DONE";
     let output = jail_sh(false, &h, p, script);
     let out = String::from_utf8_lossy(&output.stdout);
@@ -2520,6 +2727,18 @@ fn a_deny_read_link_never_empties_the_hook_or_the_system() {
         "the hook's folder was emptied: {out}"
     );
     assert!(
+        out.contains("CJC-J007-HOOK-FILE"),
+        "a file in the hook's folder was emptied: {out}"
+    );
+    assert!(
+        err.contains(&format!(
+            "{} leads to {}, where the jail keeps what it needs",
+            p.join(".env.hook").display(),
+            h.join(".claude/hook.json").display()
+        )),
+        "the link into the hook's folder is said: {err}"
+    );
+    assert!(
         out.contains("name=root"),
         "the jail's /etc/passwd was emptied: {out}"
     );
@@ -2528,7 +2747,10 @@ fn a_deny_read_link_never_empties_the_hook_or_the_system() {
         "the link onto the hook is said: {err}"
     );
     assert!(
-        err.contains("to /etc/passwd: the jail does not hide that place"),
+        err.contains(
+            "to /etc/passwd, through a link a program in the jail can change: the jail does not \
+             hide that place; to hide it, keep it in your home"
+        ),
         "the link onto the system is said: {err}"
     );
 }
