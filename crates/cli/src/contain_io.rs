@@ -563,6 +563,7 @@ fn resolve_inputs(
         seccomp_fd: None,
         hide_paths: hidden.masks,
         hide_denies: hidden.denies,
+        hide_links: hidden.links,
         resolv_conf,
         gate_instance: None,
         claude_state,
@@ -727,11 +728,13 @@ const CLAUDE_FOLDERS_SHARED: &str = "Claude Code's ~/.claude/sessions or ~/.clau
 /// Each home path a jail profile hides, as found on the host: where it
 /// leads with every link followed, where a file would be made when nothing
 /// is there, whether it is a folder, whether a link on the way leads to
-/// nothing, and (Linux, `macos` false) the first link on the way in a
-/// folder the jail writes (`writable`, [`crate::contain::steering_link`]),
-/// which refuses the launch. On Linux a path that is not there yet, in a
-/// folder of the home the jail writes, is first made as an empty folder
-/// ([`make_hidden_folder`]), unless such a link is on its way.
+/// nothing, every link on the way (which the macOS sandbox keeps in place,
+/// [`crate::contain::macos_pins`]), and (Linux, `macos` false) the first
+/// link on the way in a folder the jail writes (`writable`,
+/// [`crate::contain::steering_link`]), which refuses the launch. On Linux a
+/// path that is not there yet, in a folder of the home the jail writes, is
+/// first made as an empty folder ([`make_hidden_folder`]), unless such a
+/// link is on its way.
 fn hidden_home_facts(
     home: &Path,
     paths: &[PathBuf],
@@ -741,10 +744,10 @@ fn hidden_home_facts(
     paths
         .iter()
         .map(|nominal| {
+            let (_, links) = trace_links(nominal);
             let steered_by = if macos {
                 None
             } else {
-                let (_, links) = trace_links(nominal);
                 crate::contain::steering_link(&links, None, writable).cloned()
             };
             #[cfg(target_os = "linux")]
@@ -765,6 +768,7 @@ fn hidden_home_facts(
                 is_dir,
                 dangling_link: link_on_the_way_dangles(home, nominal),
                 steered_by,
+                links,
             }
         })
         .collect()
@@ -4076,6 +4080,46 @@ mod tests {
         let place = hidden_place(&home.join(".gnupg"), &writable, true);
         assert_eq!(place.leads_to, Some(home.join(".config/ssh-real")));
         assert!(place.there && place.is_dir);
+    }
+
+    /// JP-2 completeness: a hidden home path names every link on its way,
+    /// each where it sits on the host, on both OSes: the macOS sandbox keeps
+    /// each in place ([`crate::contain::macos_pins`]), and Linux refuses the
+    /// first the jail can change. With `~/.cache/git` a link to
+    /// `~/.local/a/git` and `~/.local/a` a link to `~/.local/b`, the second
+    /// link is above neither the path nor where it leads.
+    ///
+    /// FAILS ON REVERT: give `hidden_home_facts` no links and the chain
+    /// names none.
+    #[cfg(unix)]
+    #[test]
+    fn a_hidden_home_path_names_every_link_on_its_way() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(root.path()).unwrap();
+        std::fs::create_dir_all(home.join(".cache")).unwrap();
+        std::fs::create_dir_all(home.join(".local/b/git/credential")).unwrap();
+        symlink(home.join(".local/a/git"), home.join(".cache/git")).unwrap();
+        symlink("b", home.join(".local/a")).unwrap();
+        let nominal = home.join(".cache/git/credential");
+        let writable = [home.join(".cache"), home.join(".local")];
+        for macos in [true, false] {
+            let found = hidden_home_facts(&home, std::slice::from_ref(&nominal), &writable, macos);
+            assert_eq!(
+                found[0].links,
+                [home.join(".cache/git"), home.join(".local/a")]
+            );
+            assert_eq!(found[0].real, Some(home.join(".local/b/git/credential")));
+            assert_eq!(
+                found[0].steered_by,
+                (!macos).then(|| home.join(".cache/git")),
+                "macos={macos}"
+            );
+        }
+        // No link on the way: none.
+        let plain = home.join(".local/b/git/credential");
+        let found = hidden_home_facts(&home, &[plain], &writable, true);
+        assert!(found[0].links.is_empty());
     }
 
     /// M30C-3: the launcher finds every link inside a dotdir the jail

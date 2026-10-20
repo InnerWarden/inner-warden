@@ -1202,9 +1202,16 @@ fn a_state_home_spelled_through_a_parent_step_never_shows_the_home() {
 /// A home whose own profile hides `paths` in the claude-code jail.
 #[cfg(target_os = "linux")]
 fn home_that_hides(paths: &[&str]) -> tempfile::TempDir {
-    use std::os::unix::fs::PermissionsExt;
     let home = state_home();
-    let dir = home.path().join(".config/innerwarden");
+    profile_that_hides(home.path(), paths);
+    home
+}
+
+/// The profile of the home `h` that hides `paths` in the claude-code jail.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn profile_that_hides(h: &std::path::Path, paths: &[&str]) {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = h.join(".config/innerwarden");
     std::fs::create_dir_all(&dir).unwrap();
     let file = dir.join("agent-profiles.toml");
     let list = paths
@@ -1218,7 +1225,156 @@ fn home_that_hides(paths: &[&str]) -> tempfile::TempDir {
     )
     .unwrap();
     std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
-    home
+}
+
+/// A program in an identified jail of the home `h` (whose profile says what
+/// it hides) runs `script`, with `$1` the home.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn identified_in(
+    h: &std::path::Path,
+    project: &std::path::Path,
+    script: &str,
+) -> std::process::Output {
+    let script = format!("set -- '{}'; {script}", h.display());
+    let mut command = cli();
+    command
+        .args([
+            "contain",
+            "--identity",
+            "--project",
+            project.to_str().unwrap(),
+            "--",
+            "/bin/sh",
+            "-c",
+            &script,
+        ])
+        .env("HOME", h)
+        .env_remove("XDG_STATE_HOME");
+    #[cfg(target_os = "linux")]
+    identified_without_a_scope(&mut command);
+    command.output().expect("run the identified jail")
+}
+
+/// JP-2 completeness (BI NEW-20261018-hidden-path-parent-rename): with
+/// `.cache/git/credential` hidden, a program in the jail renamed
+/// `~/.cache/git` away: the cover moved with it, and the host's git then
+/// made `~/.cache/git/credential` again with nothing over it, and a program
+/// in the jail made it first, a folder of its own. The folder above a
+/// hidden home path that the jail writes is a mount point on Linux and kept
+/// in place on macOS: the rename fails, nothing the jail writes reaches the
+/// host's path, and the jail still writes beside it.
+///
+/// FAILS ON REVERT: drop the hidden home paths from the places of
+/// `linux_pins` (Linux) or the `hide_denies` from `macos_pins` (macOS), and
+/// the rename succeeds and the host's `~/.cache/git/credential` is the
+/// jail's.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_folder_above_a_hidden_home_path_cannot_be_renamed() {
+    #[cfg(target_os = "linux")]
+    require_bwrap();
+    let home = tempfile::TempDir::new().unwrap();
+    let h = std::fs::canonicalize(home.path()).unwrap();
+    std::fs::create_dir_all(h.join(".local/state")).unwrap();
+    profile_that_hides(&h, &[".cache/git/credential"]);
+    let credential = h.join(".cache/git/credential");
+    std::fs::create_dir_all(&credential).unwrap();
+    std::fs::write(credential.join("store"), "HOST-SECRET").unwrap();
+    let project = tempfile::TempDir::new().unwrap();
+    let p = std::fs::canonicalize(project.path()).unwrap();
+    let output = identified_in(
+        &h,
+        &p,
+        "mv \"$1/.cache/git\" \"$1/.cache/gitx\" 2>/dev/null; echo \"mv=$?\"; \
+         ( mkdir -p \"$1/.cache/git/credential\" \
+           && echo FORGED > \"$1/.cache/git/credential/store\" ) 2>/dev/null; \
+         echo in > \"$1/.cache/git/beside\" && echo WROTE; echo DONE",
+    );
+    let out = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "the jail did not start: {err}");
+    assert!(out.contains("DONE") && out.contains("WROTE"), "{out} {err}");
+    assert!(
+        out.contains("mv=") && !out.contains("mv=0"),
+        "the folder above the hidden path moved: {out}"
+    );
+    assert!(!h.join(".cache/gitx").exists());
+    assert!(std::fs::symlink_metadata(h.join(".cache/git"))
+        .unwrap()
+        .is_dir());
+    assert_eq!(
+        std::fs::read_to_string(credential.join("store")).unwrap(),
+        "HOST-SECRET"
+    );
+}
+
+/// JP-2 completeness (macOS): the sandbox kept in place the folders above a
+/// hidden home path as named and above where it leads, never a link
+/// further down a chain. With `.cache/git/credential` hidden, `~/.cache/git`
+/// a link to `~/.local/a/git` and `~/.local/a` a link to `~/.local/b`, a
+/// program in the jail removed `~/.local/a`, made
+/// `~/.local/a/git/credential` a folder of its own and put a token there,
+/// and the host read `JAIL-TOKEN` at `~/.cache/git/credential/token`, where
+/// its git keeps its credential cache's socket (measured with
+/// sandbox-exec). Every link on the way is kept in place now: it is not
+/// removed, renamed or replaced, and the host's path still leads to the
+/// person's folder.
+///
+/// FAILS ON REVERT: drop the `hide_links` from `macos_pins` and the link is
+/// removed and the host reads the jail's token.
+#[cfg(target_os = "macos")]
+#[test]
+fn on_macos_a_link_down_the_way_to_a_hidden_home_path_stays_in_place() {
+    let home = tempfile::TempDir::new().unwrap();
+    let h = std::fs::canonicalize(home.path()).unwrap();
+    std::fs::create_dir_all(h.join(".local/state")).unwrap();
+    std::fs::create_dir_all(h.join(".cache")).unwrap();
+    profile_that_hides(&h, &[".cache/git/credential"]);
+    let person = h.join(".local/b/git/credential");
+    std::fs::create_dir_all(&person).unwrap();
+    std::fs::write(person.join("store"), "HOST-SECRET").unwrap();
+    std::os::unix::fs::symlink(h.join(".local/a/git"), h.join(".cache/git")).unwrap();
+    std::os::unix::fs::symlink(h.join(".local/b"), h.join(".local/a")).unwrap();
+    let project = tempfile::TempDir::new().unwrap();
+    let p = std::fs::canonicalize(project.path()).unwrap();
+    let output = identified_in(
+        &h,
+        &p,
+        "rm \"$1/.local/a\" 2>/dev/null; echo \"rm=$?\"; \
+         ( mkdir -p \"$1/.local/a/git/credential\" \
+           && echo JAIL-TOKEN > \"$1/.local/a/git/credential/token\" ) 2>/dev/null; \
+         cat \"$1/.cache/git/credential/store\" 2>/dev/null; \
+         mv \"$1/.local/a\" \"$1/.local/z\" 2>/dev/null; echo \"mv=$?\"; \
+         ln -sfn \"$1/.local/b/git\" \"$1/.local/a\" 2>/dev/null; echo \"ln=$?\"; \
+         echo in > \"$1/.local/b/beside\" && echo WROTE; echo DONE",
+    );
+    let out = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "the jail did not start: {err}");
+    assert!(out.contains("DONE") && out.contains("WROTE"), "{out} {err}");
+    for changed in ["rm=0", "mv=0", "ln=0"] {
+        assert!(!out.contains(changed), "{changed}: the link moved: {out}");
+    }
+    assert!(
+        !out.contains("HOST-SECRET"),
+        "the hidden path was read: {out}"
+    );
+    assert!(std::fs::symlink_metadata(h.join(".local/a"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(
+        std::fs::canonicalize(h.join(".cache/git/credential")).unwrap(),
+        person
+    );
+    assert!(
+        !h.join(".cache/git/credential/token").exists(),
+        "the host reads a token the jail put there"
+    );
+    assert_eq!(
+        std::fs::read_to_string(person.join("store")).unwrap(),
+        "HOST-SECRET"
+    );
 }
 
 /// brk-1: a hidden home path that is a link does not stop the jail when the

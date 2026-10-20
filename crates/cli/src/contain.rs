@@ -318,8 +318,17 @@ pub struct HiddenHomePath {
     /// path leads, never the link, so a program in the jail could replace
     /// the link with a folder of its own, and the host's programs would
     /// then read and write that folder at the path's name. Never set on
-    /// macOS, where the sandbox keeps that link in place ([`macos_pins`]).
+    /// macOS, where the sandbox keeps each link on the way in place
+    /// (`links`, [`macos_pins`]).
     pub steered_by: Option<PathBuf>,
+    /// Every link on the way, each as found on the host (the folder it sits
+    /// in with every link before it followed), the order they were followed
+    /// in. The macOS sandbox keeps each that sits in a folder the jail may
+    /// write in place as itself ([`HiddenPlan::links`]): a link further down
+    /// a chain (`~/.local/a`, for `~/.cache/git` a link to `~/.local/a/git`)
+    /// is above neither the path as named nor where it leads, so the pins of
+    /// those never held it.
+    pub links: Vec<PathBuf>,
 }
 
 /// What the jail hides of the home ([`plan_hidden_home`]).
@@ -330,6 +339,10 @@ pub struct HiddenPlan {
     /// macOS: each path the sandbox denies, as named and as it resolves
     /// (the sandbox matches the resolved path).
     pub denies: Vec<PathBuf>,
+    /// macOS: each link on the way to a path ([`HiddenHomePath::links`]),
+    /// each once, which the sandbox keeps in place where the jail may write
+    /// ([`macos_pins`]).
+    pub links: Vec<PathBuf>,
 }
 
 /// PURE. Plan the home paths a jail profile hides.
@@ -341,7 +354,8 @@ pub struct HiddenPlan {
 /// jail sees it and as its host path resolves, and a place none of them
 /// shows is not in the jail at all (the jail's home is empty), so nothing
 /// is laid there. On macOS both the path as named and where it leads are
-/// denied, and a path that is not there yet is denied too.
+/// denied, and a path that is not there yet is denied too, and each link on
+/// the way is kept in place (`links`, [`macos_pins`]).
 ///
 /// A path that leads outside the home is refused: a link the agent planted
 /// in a folder it can write would otherwise move the mask onto anything the
@@ -389,6 +403,11 @@ pub fn plan_hidden_home(
         }
         deny(&path.nominal, &mut plan);
         deny(leads_to, &mut plan);
+        for link in &path.links {
+            if !plan.links.contains(link) {
+                plan.links.push(link.clone());
+            }
+        }
         let Some(real) = &path.real else {
             continue;
         };
@@ -1323,6 +1342,11 @@ pub struct JailInputs {
     /// resolve ([`HiddenPlan::denies`], macOS). Empty without such a
     /// profile.
     pub hide_denies: Vec<PathBuf>,
+    /// Every link on the way to those paths ([`HiddenPlan::links`]): the
+    /// macOS sandbox keeps each that sits in a folder the jail may write in
+    /// place as itself ([`macos_pins`]). Read by macOS only; empty without
+    /// such a profile.
+    pub hide_links: Vec<PathBuf>,
     /// What of the host's resolver `/etc/resolv.conf` leads to where it is a
     /// link into `/run` ([`launch::resolv_conf_target`]): the file, or a
     /// folder of resolver data alone ([`launch::resolv_conf_bind`]), bound
@@ -1841,6 +1865,17 @@ const MACOS_HOME_WRITABLE: &[&str] = &[
 /// every layout that is `~/.config` and the project at least, and the
 /// launcher makes each that is not there yet before the sandbox starts, so
 /// the jail never has to, and says so.
+///
+/// Each link on the way to a hidden home path (`hide_links`) is kept in
+/// place too, as itself, with the folders above it: the host's programs
+/// reach that path by name, through the link, and a link further down a
+/// chain (`~/.local/a`, for `~/.cache/git` a link to `~/.local/a/git` and
+/// `~/.local/a` a link to `~/.local/b`) is above neither the path as named
+/// nor where it leads. A program in the jail removed it, made
+/// `~/.local/a/git/credential` a folder of its own, and the host's git then
+/// kept its credential cache there, at `~/.cache/git/credential` (measured
+/// on macOS). The rule holds a link where it is as it holds a folder: no
+/// removal, no rename away, nothing renamed or linked onto its name.
 pub fn macos_pins(input: &JailInputs) -> Vec<PathBuf> {
     let mut writable: Vec<PathBuf> = vec![input.args.project.clone()];
     if let Some(worktree) = &input.worktree {
@@ -1866,19 +1901,24 @@ pub fn macos_pins(input: &JailInputs) -> Vec<PathBuf> {
             .cloned(),
     );
     let mut pins: Vec<PathBuf> = vec![input.args.project.clone()];
-    for place in &places {
-        for folder in place.ancestors().skip(1) {
-            if writable.iter().any(|w| folder.starts_with(w)) && !pins.iter().any(|p| p == folder) {
-                pins.push(folder.to_path_buf());
-            }
+    let mut keep = |folder: &Path| {
+        if writable.iter().any(|w| folder.starts_with(w)) && !pins.iter().any(|p| p == folder) {
+            pins.push(folder.to_path_buf());
         }
+    };
+    for place in &places {
+        place.ancestors().skip(1).for_each(&mut keep);
+    }
+    // A link itself, and every folder above it.
+    for link in &input.hide_links {
+        link.ancestors().for_each(&mut keep);
     }
     pins.sort_by_key(|folder| folder.components().count());
     pins
 }
 
-/// PURE. The macOS sandbox rule that keeps one folder of [`macos_pins`] in
-/// place: it refuses only removing the folder's own entry (a rename away, a
+/// PURE. The macOS sandbox rule that keeps one folder (or link) of
+/// [`macos_pins`] in place: it refuses only removing the folder's own entry (a rename away, a
 /// removal, a swap) and making an entry at its name (a rename or a link
 /// onto it), measured on macOS. Nothing else of writing: a program in the
 /// jail still writes in the folder, finds it writable (`access(W_OK)`,
@@ -4397,6 +4437,7 @@ mod tests {
             seccomp_fd: Some(launch::DRY_RUN_SECCOMP_FD),
             hide_paths: vec![],
             hide_denies: vec![],
+            hide_links: vec![],
             // A host whose `/etc/resolv.conf` is a file of its own.
             resolv_conf: None,
             gate_instance: None,
@@ -7381,6 +7422,7 @@ mod tests {
             is_dir,
             dangling_link: false,
             steered_by: None,
+            links: Vec::new(),
         }
     }
 
@@ -7661,6 +7703,124 @@ mod tests {
         assert!(!plan.masks.is_empty(), "{plan:?}");
     }
 
+    /// JP-2 completeness (macOS): the sandbox kept in place the folders
+    /// above a hidden home path as named and above where it leads, and no
+    /// link further down a chain. With `.cache/git/credential` hidden,
+    /// `~/.cache/git` a link to `~/.local/a/git` and `~/.local/a` a link to
+    /// `~/.local/b`, a program in the jail removed `~/.local/a`, made
+    /// `~/.local/a/git/credential` a folder of its own, and the host's git
+    /// then kept its credential cache there, at the path's own name
+    /// (measured with sandbox-exec). Every link on the way the jail may
+    /// write is kept in place now, as itself, with the folders above it; a
+    /// link in a folder the jail never writes (a dotfiles manager's link in
+    /// the home) is left as it is, and a jail with no hidden path is byte
+    /// for byte the one it was.
+    ///
+    /// FAILS ON REVERT: drop the `hide_links` from `macos_pins` (or the
+    /// links from `plan_hidden_home`) and `~/.local/a` is not kept in place.
+    #[test]
+    fn on_macos_every_link_on_the_way_to_a_hidden_home_path_is_kept_in_place() {
+        let mut input = inputs(&["claude", "--print"]);
+        let shown = shown_host_folders(
+            &input.args,
+            &input.home,
+            None,
+            &input.existing_paths,
+            Path::to_path_buf,
+        );
+        let chain_links = paths(&["/home/dev/.cache/git", "/home/dev/.local/a"]);
+        let mut chain = hidden(
+            "/home/dev/.cache/git/credential",
+            Some("/home/dev/.local/b/git/credential"),
+            true,
+        );
+        chain.links = chain_links.clone();
+        let mut beside = hidden(
+            "/home/dev/.cache/git/other",
+            Some("/home/dev/.local/b/git/other"),
+            true,
+        );
+        beside.links = chain_links;
+        let mut dotfiles = hidden("/home/dev/gh-dotfiles", Some("/home/dev/dotfiles/gh"), true);
+        dotfiles.links = paths(&["/home/dev/gh-dotfiles"]);
+        let plan = plan_hidden_home(&[chain, beside, dotfiles], &input.home, &shown).unwrap();
+        assert_eq!(
+            plan.links,
+            paths(&[
+                "/home/dev/.cache/git",
+                "/home/dev/.local/a",
+                "/home/dev/gh-dotfiles"
+            ])
+        );
+        input.hide_denies = plan.denies;
+        input.hide_links = plan.links;
+        let pins = macos_pins(&input);
+        for kept in [
+            "/home/dev/.local/a",
+            "/home/dev/.local",
+            "/home/dev/.cache/git",
+        ] {
+            assert!(pins.contains(&PathBuf::from(kept)), "{kept}: {pins:?}");
+        }
+        for never in ["/home/dev/gh-dotfiles", "/home/dev"] {
+            assert!(!pins.contains(&PathBuf::from(never)), "{never}: {pins:?}");
+        }
+        let profile = build_macos_profile(&input).unwrap().profile;
+        assert!(profile.contains(&macos_pin_rule(Path::new("/home/dev/.local/a"))));
+        assert!(!profile.contains(&macos_pin_rule(Path::new("/home/dev/gh-dotfiles"))));
+        assert!(
+            !profile.contains("(deny file-write* (literal"),
+            "a pin denies all of writing: {profile}"
+        );
+        // The gap: without the links, nothing keeps `~/.local/a`.
+        input.hide_links.clear();
+        assert!(!macos_pins(&input).contains(&PathBuf::from("/home/dev/.local/a")));
+        assert_eq!(
+            build_macos_profile(&inputs(&["claude", "--print"]))
+                .unwrap()
+                .profile,
+            GOLDEN_MACOS_PROFILE
+        );
+    }
+
+    /// JP-2 completeness (both OSes): BI NEW-20261018-hidden-path-parent-
+    /// rename. With `.cache/git/credential` hidden, a program in the jail
+    /// renamed `~/.cache/git` away (`mv ~/.cache/git ~/.cache/gitx`): the
+    /// cover moved with it, and the host's git then made
+    /// `~/.cache/git/credential` again with no cover. The folder between a
+    /// home folder the jail writes and a hidden home path is pinned on
+    /// Linux, a mount point of its own laid after that home folder's bind and
+    /// before the cover, and kept in place on macOS.
+    ///
+    /// FAILS ON REVERT: drop the hidden home paths from the places of
+    /// `linux_pins` (or the `hide_denies` from `macos_pins`) and
+    /// `~/.cache/git` is pinned on neither.
+    #[test]
+    fn a_folder_above_a_hidden_home_path_is_pinned_on_both() {
+        let credential = "/home/dev/.cache/git/credential";
+        let mut input = inputs(&["claude", "--print"]);
+        input.hide_paths = vec![mask(credential, true)];
+        assert_eq!(
+            linux_pins(&input),
+            [(PinRoot::Home, PathBuf::from("/home/dev/.cache/git"))]
+        );
+        let a = build_linux_jail(&input).unwrap().bwrap_args;
+        let at = |w: &[&str]| {
+            a.windows(w.len())
+                .position(|x| x == w)
+                .unwrap_or_else(|| panic!("{w:?} in {a:?}"))
+        };
+        let cache = at(&["--bind", "/home/dev/.cache", "/home/dev/.cache"]);
+        let git = at(&["--bind", "/home/dev/.cache/git", "/home/dev/.cache/git"]);
+        let cover = at(&["--tmpfs", credential]);
+        assert!(cache < git && git < cover, "{a:?}");
+        input.hide_denies = vec![PathBuf::from(credential)];
+        assert!(macos_pins(&input).contains(&PathBuf::from("/home/dev/.cache/git")));
+        let profile = build_macos_profile(&input).unwrap().profile;
+        assert!(profile.contains(&macos_pin_rule(Path::new("/home/dev/.cache/git"))));
+        assert!(profile.contains(&macos_pin_rule(Path::new("/home/dev/.cache"))));
+    }
+
     /// A hidden home path that leads outside the home is refused, whatever
     /// the link is: one the agent planted in a folder it can write would
     /// otherwise move the empty mount onto anything the jail shows. What it
@@ -7681,6 +7841,7 @@ mod tests {
                 is_dir: true,
                 dangling_link: false,
                 steered_by: None,
+                links: Vec::new(),
             };
             let refused = plan_hidden_home(&[path], &input.home, &shown).unwrap_err();
             assert!(
@@ -10361,6 +10522,7 @@ mod tests {
             is_dir: true,
             dangling_link: dangling,
             steered_by: None,
+            links: Vec::new(),
         };
         let mut refusals: Vec<String> = [hidden(Some(planted), false), hidden(None, true)]
             .into_iter()
