@@ -1516,10 +1516,150 @@ pub const SECCOMP_OPTION: &str = "--seccomp";
 /// changes nothing there. In every bwrap since 0.2.0.
 pub const CAP_DROP_ALL: [&str; 2] = ["--cap-drop", "ALL"];
 
+/// Which writable bind of a Linux jail holds a pinned folder
+/// ([`linux_pins`]): the pin is laid right after that bind, so every later
+/// bind and mask lands on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinRoot {
+    /// A home folder the jail binds read-write ([`DOTDIR_RW`]).
+    Home,
+    /// The project.
+    Project,
+    /// A worktree's folder.
+    Worktree,
+}
+
+/// PURE. Linux: the folders between a writable bind and a place the jail
+/// covers that the host reaches by name, each bound onto itself so it is a
+/// mount point. A mount moves with the folder it is in: a program in the
+/// jail that renamed a folder above a covered place (`~/.config/keys`
+/// above `~/.config/keys/ssh`, where `~/.ssh` leads; `~/.local/state`
+/// above the launcher's records) took the cover away with it, made a folder
+/// of its own at the old name, and the host's link led there. Linux refuses
+/// to rename or remove a mount point. Only the places the host reaches by
+/// name: InnerWarden's folder where it leads and wherever the jail shows
+/// it, the launcher's records (`--identity`), the profile's hidden home
+/// paths, and every place a hidden dotdir or a `deny_read` path is covered
+/// at through a link (`linked_masks`). A place a read-only bind holds needs
+/// none (nothing there can be renamed), nor one right below its bind (the
+/// cover is the mount point), so in every common layout there is none but
+/// the records' folders.
+pub fn linux_pins(input: &JailInputs) -> Vec<(PinRoot, PathBuf)> {
+    let mut roots: Vec<(Option<PinRoot>, PathBuf)> = DOTDIR_RW
+        .iter()
+        .filter(|name| !DOTDIR_DENY.contains(name))
+        .map(|name| input.home.join(name))
+        .filter(|path| input.exists(path))
+        .map(|path| (Some(PinRoot::Home), path))
+        .collect();
+    roots.push((Some(PinRoot::Project), input.args.project.clone()));
+    if let Some(worktree) = &input.worktree {
+        for dir in [&worktree.git_dir, &worktree.common_dir] {
+            roots.push((Some(PinRoot::Worktree), dir.clone()));
+        }
+    }
+    let read_only = DOTFILE_RO
+        .iter()
+        .map(|name| input.home.join(name))
+        .chain(input.args.extra_ro.iter().cloned())
+        .chain(std::iter::once(input.iw_binary.clone()))
+        .chain(
+            input
+                .agent_binary
+                .iter()
+                .flat_map(|bin| [bin.link.clone(), bin.target_dir.clone()]),
+        )
+        .chain(LINUX_SYSTEM_SHOWN.iter().map(PathBuf::from));
+    roots.extend(read_only.map(|path| (None, path)));
+    let mut places: Vec<&Path> = vec![input.iw_config_real.as_path()];
+    places.extend(input.iw_config_shown.iter().map(PathBuf::as_path));
+    if input.args.identity {
+        places.extend(input.records_dirs.iter().map(PathBuf::as_path));
+    }
+    places.extend(input.hide_paths.iter().map(|hidden| hidden.abs.as_path()));
+    places.extend(input.linked_masks.iter().map(|mask| mask.abs.as_path()));
+    let mut pins: Vec<(PinRoot, PathBuf)> = Vec::new();
+    for place in places {
+        let holder = roots
+            .iter()
+            .filter(|(_, root)| place.starts_with(root) && place != root)
+            .max_by_key(|(_, root)| root.components().count());
+        let Some((Some(kind), root)) = holder else {
+            continue;
+        };
+        let mut between: Vec<PathBuf> = place
+            .ancestors()
+            .skip(1)
+            .take_while(|folder| *folder != root.as_path())
+            .map(Path::to_path_buf)
+            .collect();
+        between.reverse();
+        for folder in between {
+            if !pins.iter().any(|(_, seen)| *seen == folder) {
+                pins.push((*kind, folder));
+            }
+        }
+    }
+    // A folder before the folders in it: a later bind of a folder would
+    // cover the pins below it.
+    pins.sort_by_key(|(_, folder)| folder.components().count());
+    pins
+}
+
+/// The home folders the macOS sandbox lets the jail write.
+const MACOS_HOME_WRITABLE: &[&str] = &[
+    ".claude", ".cache", ".local", ".cargo", ".npm", ".rustup", ".config",
+];
+
+/// PURE. macOS: the folders above a place the sandbox denies where a link
+/// leads (a hidden dotdir's, InnerWarden's folder kept as a link, a
+/// profile's hidden home path), that the sandbox lets the jail write, each
+/// to be denied writing as itself. The sandbox denies by path: a program in
+/// the jail that renamed `~/.config/keys` (above `~/.config/keys/ssh`,
+/// where `~/.ssh` leads), or the project above a dotdir that leads into
+/// it, then put a link to a folder of its own at that name, and the host's
+/// link led there, past every deny. Denying the folder itself, never what
+/// is in it, closes that rename and removal; the jail still writes in it.
+/// Only for those places, so in every common layout there is none.
+pub fn macos_pins(input: &JailInputs) -> Vec<PathBuf> {
+    let mut writable: Vec<PathBuf> = vec![input.args.project.clone()];
+    if let Some(worktree) = &input.worktree {
+        writable.push(worktree.git_dir.clone());
+        writable.push(worktree.common_dir.clone());
+    }
+    writable.extend(MACOS_HOME_WRITABLE.iter().map(|name| input.home.join(name)));
+    writable.extend(MACOS_WRITABLE.iter().map(PathBuf::from));
+    writable.push(input.tmpdir.clone());
+    writable.push(input.home.join("Library/Caches"));
+    let mut places: Vec<PathBuf> = input
+        .linked_denies
+        .iter()
+        .chain(&input.hide_denies)
+        .cloned()
+        .collect();
+    if input.iw_config_link {
+        places.push(input.iw_config_dir());
+        if !input.iw_config_left {
+            places.push(input.iw_config_real.clone());
+        }
+    }
+    let mut pins: Vec<PathBuf> = Vec::new();
+    for place in &places {
+        for folder in place.ancestors().skip(1) {
+            if writable.iter().any(|w| folder.starts_with(w)) && !pins.iter().any(|p| p == folder) {
+                pins.push(folder.to_path_buf());
+            }
+        }
+    }
+    pins.sort_by_key(|folder| folder.components().count());
+    pins
+}
+
 /// Build the ordered bwrap argument vector. Order is load-bearing (bwrap is
-/// last-wins): system RO → dev/proc/tmpfs → HOME tmpfs → dotdir re-binds → shadow
-/// innerwarden → Claude Code's settings file (`--identity` only) → binary binds →
-/// project (late) → worktree → Claude Code's folders of its runs
+/// last-wins): system RO → dev/proc/tmpfs → HOME tmpfs → dotdir re-binds → their
+/// pins ([`linux_pins`]) → shadow innerwarden → Claude Code's settings file
+/// (`--identity` only) → binary binds → project (late) → its pins → worktree →
+/// its pins → Claude Code's folders of its runs
 /// (`--identity` only) → nested secret masks → every other place the jail
 /// shows a hidden place a link leads somewhere else (`linked_masks`) →
 /// the host's key and the launch record (`--identity` only) → namespaces and the
@@ -1527,6 +1667,16 @@ pub const CAP_DROP_ALL: [&str; 2] = ["--cap-drop", "ALL"];
 /// entries are never emitted, so they vanish under the HOME tmpfs.
 pub fn build_linux_jail(input: &JailInputs) -> Result<LinuxJailPlan, ContainError> {
     validate_jail_inputs(input)?;
+    let pins = linux_pins(input);
+    let pins_of = |kind: PinRoot| -> Vec<String> {
+        pins.iter()
+            .filter(|(root, _)| *root == kind)
+            .flat_map(|(_, folder)| {
+                let folder = folder.to_string_lossy().to_string();
+                ["--bind".to_string(), folder.clone(), folder]
+            })
+            .collect()
+    };
     // InnerWarden's own folder kept as a link: no mount pins a link, and a
     // program in the jail could replace it on the host.
     if input.iw_config_link {
@@ -1586,6 +1736,11 @@ pub fn build_linux_jail(input: &JailInputs) -> Result<LinuxJailPlan, ContainErro
             push(&["--bind", &s, &s]);
         }
     }
+    // Each folder in them between a place the host reaches by name and
+    // its bind, a mount point of its own ([`linux_pins`]): never renamed
+    // away from under its cover. Empty in every common layout.
+    let home_pins = pins_of(PinRoot::Home);
+    push(&home_pins.iter().map(String::as_str).collect::<Vec<_>>());
     // Shadow the InnerWarden secret dir IMMEDIATELY after the `.config` bind
     // (last-wins). The 0600 llm-key is now absent inside the jail. Shadow BOTH the
     // nominal path and its symlink-resolved real path (a symlinked ~/.config would
@@ -1666,6 +1821,10 @@ pub fn build_linux_jail(input: &JailInputs) -> Result<LinuxJailPlan, ContainErro
     let proj = input.args.project.to_string_lossy().to_string();
     push(&["--bind", &proj, &proj]);
     push(&["--chdir", &proj]);
+    // The pins in the project ([`linux_pins`]): a dotdir a link leads into
+    // it is covered there, and the folders above that cover are pinned.
+    let project_pins = pins_of(PinRoot::Project);
+    push(&project_pins.iter().map(String::as_str).collect::<Vec<_>>());
 
     // --- git worktree admin dirs, AFTER the project bind ---
     if let Some(wt) = &input.worktree {
@@ -1674,6 +1833,8 @@ pub fn build_linux_jail(input: &JailInputs) -> Result<LinuxJailPlan, ContainErro
             push(&["--bind", &s, &s]);
         }
     }
+    let worktree_pins = pins_of(PinRoot::Worktree);
+    push(&worktree_pins.iter().map(String::as_str).collect::<Vec<_>>());
 
     // --- Claude Code's folders of its runs, where the jail shares
     // `~/.claude` (`--identity` only). Claude Code is process 2 in every
@@ -1996,9 +2157,7 @@ pub fn build_macos_profile(input: &JailInputs) -> Result<MacosJailPlan, ContainE
     // Tool state a real coding agent writes (build caches etc.). `~/.config` is
     // allowed here but `~/.config/innerwarden` is DENIED last (below), so the key
     // dir stays unreadable/unwritable.
-    for w in [
-        ".claude", ".cache", ".local", ".cargo", ".npm", ".rustup", ".config",
-    ] {
+    for w in MACOS_HOME_WRITABLE {
         p.push_str(&format!(
             "(allow file-write* (subpath \"{}/{}\"))\n",
             e(&home),
@@ -2056,6 +2215,15 @@ pub fn build_macos_profile(input: &JailInputs) -> Result<MacosJailPlan, ContainE
         p.push_str(&format!(
             "(deny file-write* (subpath \"{}\"))\n",
             e(&path.to_string_lossy())
+        ));
+    }
+    // The folders above such a place that the jail may write, each closed
+    // as itself (never what is in it): never renamed or removed from above
+    // a deny ([`macos_pins`]). None in every common layout.
+    for folder in macos_pins(input) {
+        p.push_str(&format!(
+            "(deny file-write* (literal \"{}\"))\n",
+            e(&folder.to_string_lossy())
         ));
     }
 
@@ -5289,10 +5457,11 @@ mod tests {
     /// `close_userns` is the record's fact and puts nothing in the argv; the
     /// filter is the descriptor. An identified jail whose host did not take
     /// the filter is the jail the previous build made with its probe
-    /// failing, plus the capability drop and Claude Code's own state
-    /// ([`CLAUDE_STATE_LINES`], [`CLAUDE_FOLDER_LINES`]) and nothing else (the hash is of the golden
-    /// at 4ded5fea), and a plain one without the filter is that build's,
-    /// byte for byte.
+    /// failing, plus the capability drop, Claude Code's own state
+    /// ([`CLAUDE_STATE_LINES`], [`CLAUDE_FOLDER_LINES`]) and the pins of the
+    /// records' folders ([`RECORDS_PIN_LINES`]) and nothing else (the hash
+    /// is of the golden at 4ded5fea), and a plain one without the filter is
+    /// that build's, byte for byte.
     ///
     /// FAILS ON REVERT: emit anything for `close_userns`, or emit the filter
     /// without a descriptor, or move anything else in the identified jail.
@@ -5313,10 +5482,12 @@ mod tests {
         assert_eq!(got.matches("--cap-drop\nALL\n").count(), 1);
         assert_eq!(got.matches(CLAUDE_STATE_LINES).count(), 1);
         assert_eq!(got.matches(CLAUDE_FOLDER_LINES).count(), 1);
+        assert_eq!(got.matches(RECORDS_PIN_LINES).count(), 1);
         let before = got
             .replacen("--unshare-ipc\n--cap-drop\nALL\n", "--unshare-ipc\n", 1)
             .replacen(CLAUDE_STATE_LINES, "", 1)
-            .replacen(CLAUDE_FOLDER_LINES, "", 1);
+            .replacen(CLAUDE_FOLDER_LINES, "", 1)
+            .replacen(RECORDS_PIN_LINES, "", 1);
         assert_eq!(
             sha256_hex(before.as_bytes()),
             "648f991ed81d228baa0f4c080f5eb53c6fe864d6e4c5be6f3660da6bffbb5044"
@@ -5958,13 +6129,26 @@ mod tests {
         --tmpfs\n\
         /home/dev/.claude/backups\n";
 
+    /// The lines the pins of the launcher's records' folders add to the
+    /// identified jail of [`identified_inputs`], right after the dotdir
+    /// binds (M30C-4): `~/.local/state` and `~/.local/state/innerwarden`
+    /// are mount points, so no program in the jail renames them away from
+    /// under the records' cover.
+    const RECORDS_PIN_LINES: &str = "\
+        --bind\n\
+        /home/dev/.local/state\n\
+        /home/dev/.local/state\n\
+        --bind\n\
+        /home/dev/.local/state/innerwarden\n\
+        /home/dev/.local/state/innerwarden\n";
+
     /// The whole argv of an identified jail, one token per line.
     ///
     /// FAILS ON REVERT: drop the records folder `--tmpfs` (the agent can
     /// rewrite the launcher's records through the `.local` bind), or move it
     /// before the project and dotdir binds, or drop the `--setenv` lines, or
     /// drop the link to the kept settings file or the jail's own sessions
-    /// or backups folder.
+    /// or backups folder, or the pins of the records' folders.
     #[test]
     fn golden_argv_of_an_identified_jail() {
         let plan = build_linux_jail(&identified_inputs()).unwrap();
@@ -8824,6 +9008,118 @@ mod tests {
         assert!(linked.left.is_empty(), "{:?}", linked.left);
     }
 
+    /// M30C-2: a mount moves with the folder it is in, and Linux renames
+    /// any folder that is not itself a mount point. A cover two or more
+    /// folders below its bind (GNU stow's `~/.ssh` a link to
+    /// `dotfiles/ssh/.ssh`, the agent at work in `~/dotfiles`; `~/.ssh` a
+    /// link to `~/.config/keys/ssh`) was taken away by renaming the folder
+    /// between, and a folder of the agent's took its name, which the host's
+    /// link leads to. Each folder between is bound onto itself, right after
+    /// the bind that holds it and before every mask; one right below its
+    /// bind needs none, nor one a read-only path holds. macOS denies
+    /// writing each folder above the place, as itself, that the jail may
+    /// write: the project included. In a common layout there is none, and
+    /// the identified jail pins only its records' folders.
+    ///
+    /// FAILS ON REVERT: drop the pins from `build_linux_jail` or the
+    /// literal denies from `build_macos_profile` and the folder between is
+    /// neither a mount point nor closed.
+    #[test]
+    fn the_folders_above_a_cover_the_host_reaches_by_name_are_pinned() {
+        let mut stow = inputs(&["claude", "--print"]);
+        stow.args.project = PathBuf::from("/home/dev/dotfiles");
+        stow.deny_paths.clear();
+        let led = "/home/dev/dotfiles/ssh/.ssh";
+        let (linux, macos) = dotdir_plans(
+            &[place("/home/dev/.ssh", Some(led), true, true)],
+            &stow,
+            Path::to_path_buf,
+        );
+        stow.linked_masks = linux.masks;
+        assert_eq!(
+            linux_pins(&stow),
+            [(PinRoot::Project, PathBuf::from("/home/dev/dotfiles/ssh"))]
+        );
+        let a = build_linux_jail(&stow).unwrap().bwrap_args;
+        let project = a
+            .windows(3)
+            .position(|w| w[0] == "--bind" && w[1] == "/home/dev/dotfiles")
+            .unwrap();
+        let pin = a
+            .windows(3)
+            .position(|w| w[0] == "--bind" && w[1] == "/home/dev/dotfiles/ssh" && w[2] == w[1])
+            .expect("the folder between is a mount point");
+        let cover = a
+            .windows(2)
+            .position(|w| w[0] == "--tmpfs" && w[1] == led)
+            .unwrap();
+        assert!(project < pin && pin < cover, "{a:?}");
+        stow.linked_denies = macos.denies;
+        let profile = build_macos_profile(&stow).unwrap().profile;
+        for folder in ["/home/dev/dotfiles/ssh", "/home/dev/dotfiles"] {
+            let rule = format!("(deny file-write* (literal \"{folder}\"))");
+            assert!(profile.contains(&rule), "{rule}");
+        }
+        assert!(!profile.contains("(deny file-write* (literal \"/home/dev\"))"));
+        // In a home folder the jail binds: pinned right after that bind.
+        let mut keys = inputs(&["claude", "--print"]);
+        keys.args.extra_ro = vec![PathBuf::from("/home/dev/.cache/ro")];
+        let (linux, macos) = dotdir_plans(
+            &[place(
+                "/home/dev/.ssh",
+                Some("/home/dev/.config/keys/ssh"),
+                true,
+                true,
+            )],
+            &keys,
+            Path::to_path_buf,
+        );
+        keys.linked_masks = linux.masks;
+        keys.hide_paths = vec![
+            mask("/home/dev/.cache/ro/x/y", true),
+            mask("/home/dev/.config/app", true),
+        ];
+        assert_eq!(
+            linux_pins(&keys),
+            [(PinRoot::Home, PathBuf::from("/home/dev/.config/keys"))]
+        );
+        let a = build_linux_jail(&keys).unwrap().bwrap_args;
+        let pin = a
+            .windows(3)
+            .position(|w| w[0] == "--bind" && w[1] == "/home/dev/.config/keys")
+            .unwrap();
+        let last_dotdir = a
+            .windows(2)
+            .position(|w| w[0] == "--bind" && w[1] == "/home/dev/.cache")
+            .unwrap();
+        let iw = a
+            .windows(2)
+            .position(|w| w[1] == "/home/dev/.config/innerwarden")
+            .unwrap();
+        assert!(last_dotdir < pin && pin < iw, "{a:?}");
+        keys.linked_denies = macos.denies;
+        let profile = build_macos_profile(&keys).unwrap().profile;
+        for folder in ["/home/dev/.config/keys", "/home/dev/.config"] {
+            let rule = format!("(deny file-write* (literal \"{folder}\"))");
+            assert!(profile.contains(&rule), "{rule}");
+        }
+        // A common layout: none, on either OS.
+        let plain = inputs(&["claude", "--print"]);
+        assert!(linux_pins(&plain).is_empty() && macos_pins(&plain).is_empty());
+        let profile = build_macos_profile(&plain).unwrap().profile;
+        assert!(!profile.contains("(deny file-write* (literal"), "{profile}");
+        assert_eq!(
+            linux_pins(&identified_inputs()),
+            [
+                (PinRoot::Home, PathBuf::from("/home/dev/.local/state")),
+                (
+                    PinRoot::Home,
+                    PathBuf::from("/home/dev/.local/state/innerwarden")
+                ),
+            ]
+        );
+    }
+
     /// M30C-6: on macOS a project kept under a place of the system (a
     /// temporary folder, `/Applications/MAMP/htdocs`) is still the project.
     /// A `deny_read` link to a folder of that same project is denied where
@@ -9453,6 +9749,12 @@ mod tests {
         --bind\n\
         /home/dev/.local\n\
         /home/dev/.local\n\
+        --bind\n\
+        /home/dev/.local/state\n\
+        /home/dev/.local/state\n\
+        --bind\n\
+        /home/dev/.local/state/innerwarden\n\
+        /home/dev/.local/state/innerwarden\n\
         --tmpfs\n\
         /home/dev/.config/innerwarden\n\
         --ro-bind\n\

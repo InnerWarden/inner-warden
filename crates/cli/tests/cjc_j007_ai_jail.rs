@@ -2560,6 +2560,186 @@ fn a_dotdir_that_leads_into_the_project_is_hidden_there_and_said() {
     );
 }
 
+/// What a program in the jail tries on a covered place two folders below
+/// a folder it writes: rename the folder between (`$1`, to `$1-old`), make
+/// a folder of its own at the covered place's name (`$2`) and plant an
+/// `authorized_keys` there, in a plain and an identified jail.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const MOVE_THE_FOLDER_BETWEEN: &str = "mv \"$1\" \"$1-old\" 2>/dev/null; echo \"mv=$?\"; \
+     ( mkdir -p \"$2\" && echo planted > \"$2/authorized_keys\" ) 2>/dev/null; echo DONE";
+
+/// M30C-2: a mount moves with the folder it is in, and Linux renames a
+/// folder that is not itself a mount point. A dotdir covered two folders
+/// below a bind the jail writes (GNU stow's `~/.ssh` a link to
+/// `<project>/ssh/.ssh`; `~/.ssh` a link to `~/.config/keys/ssh`) lost its
+/// cover when a program in the jail renamed the folder between, and the
+/// folder it made at the old name was what the host's `~/.ssh` led to: a
+/// planted `authorized_keys` reached the host. Each folder between is a
+/// mount point of its own now: the rename fails, the host's `~/.ssh` leads
+/// to the person's keys, and nothing planted reaches it.
+///
+/// FAILS ON REVERT: drop the pins from `build_linux_jail` and the rename
+/// succeeds, and the host's `~/.ssh` holds the planted file.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_cover_below_a_folder_the_jail_writes_stays_where_the_hosts_link_leads() {
+    require_bwrap();
+    for (identity, in_project) in [(false, true), (true, true), (false, false), (true, false)] {
+        let home = tempfile::TempDir::new().unwrap();
+        let h = std::fs::canonicalize(home.path()).unwrap();
+        std::fs::create_dir_all(h.join(".config")).unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        let p = std::fs::canonicalize(project.path()).unwrap();
+        let (between, keys) = if in_project {
+            (p.join("ssh"), p.join("ssh/.ssh"))
+        } else {
+            (h.join(".config/keys"), h.join(".config/keys/ssh"))
+        };
+        std::fs::create_dir_all(&keys).unwrap();
+        std::fs::write(keys.join("id_test"), "CJC-J007-SSH-KEY").unwrap();
+        std::os::unix::fs::symlink(&keys, h.join(".ssh")).unwrap();
+        let script = format!(
+            "set -- '{}' '{}'; {MOVE_THE_FOLDER_BETWEEN}",
+            between.display(),
+            keys.display()
+        );
+        let output = jail_sh(identity, &h, &p, &script);
+        let out = String::from_utf8_lossy(&output.stdout);
+        let err = String::from_utf8_lossy(&output.stderr);
+        let case = format!("identity={identity} in_project={in_project}");
+        assert!(output.status.success(), "{case}: {out} {err}");
+        assert!(out.contains("DONE"), "{case}: {out} {err}");
+        assert!(
+            !out.contains("mv=0"),
+            "{case}: the folder between moved: {out}"
+        );
+        assert!(!between
+            .with_file_name(format!(
+                "{}-old",
+                between.file_name().unwrap().to_string_lossy()
+            ))
+            .exists());
+        assert_eq!(
+            std::fs::canonicalize(h.join(".ssh")).unwrap(),
+            keys,
+            "{case}"
+        );
+        assert!(keys.join("id_test").exists(), "{case}");
+        assert!(
+            !keys.join("authorized_keys").exists(),
+            "{case}: a planted file reached the host's ~/.ssh"
+        );
+    }
+}
+
+/// M30C-2, M30C-4: the launcher's records folder is covered at
+/// `~/.local/state/innerwarden/instances`, two folders below the `~/.local`
+/// the jail binds read-write. A program in the identified jail renamed
+/// `~/.local/state` (measured), made the records folder of its own at the
+/// old name and forged a record there, which the host's launcher then
+/// read. `~/.local/state` and `~/.local/state/innerwarden` are mount
+/// points now: the rename fails and no record is forged.
+///
+/// FAILS ON REVERT: drop the pins from `build_linux_jail` and the rename
+/// succeeds, and the forged record is in the host's records folder.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_identified_jail_never_moves_the_records_folder_away() {
+    require_bwrap();
+    let home = state_home();
+    let h = std::fs::canonicalize(home.path()).unwrap();
+    let project = tempfile::TempDir::new().unwrap();
+    let records = h.join(".local/state/innerwarden/instances");
+    let script = format!(
+        "for at in \"$HOME/.local/state\" \"$HOME/.local/state/innerwarden\"; do \
+           mv \"$at\" \"$at-old\" 2>/dev/null; echo \"mv=$?\"; done; \
+         ( mkdir -p '{0}' && echo forged > '{0}/forged.json' ) 2>/dev/null; echo DONE",
+        records.display()
+    );
+    let output = identified_sh(&h, project.path(), &script)
+        .output()
+        .expect("run the jail");
+    let out = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{out} {err}");
+    assert!(out.contains("DONE"), "{out} {err}");
+    assert!(!out.contains("mv=0"), "a records folder moved: {out}");
+    assert!(!h.join(".local/state-old").exists());
+    assert!(!h.join(".local/state/innerwarden-old").exists());
+    let names: Vec<_> = std::fs::read_dir(&records)
+        .expect("the launcher's records folder")
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        !names.iter().any(|name| name == "forged.json"),
+        "a forged record reached the host: {names:?}"
+    );
+    assert!(
+        names.iter().any(|name| name.ends_with(".json")),
+        "the launcher's own record: {names:?}"
+    );
+}
+
+/// M30C-2 on macOS: the sandbox denies by path, and lets the jail rename a
+/// folder above a denied place. A program in the jail renamed
+/// `~/.config/keys` (above `~/.config/keys/ssh`, where `~/.ssh` leads), or
+/// the project above a dotdir that leads into it, then made a folder of
+/// its own at the name, and a planted file reached the host's `~/.ssh`.
+/// Each folder above that the jail may write is denied writing as itself.
+///
+/// FAILS ON REVERT: drop the literal denies from `build_macos_profile` and
+/// the rename succeeds, and the host's `~/.ssh` holds the planted file.
+#[cfg(target_os = "macos")]
+#[test]
+fn on_macos_a_denied_place_below_a_folder_the_jail_writes_stays_where_the_hosts_link_leads() {
+    for in_project in [true, false] {
+        let home = tempfile::TempDir::new().unwrap();
+        let h = std::fs::canonicalize(home.path()).unwrap();
+        std::fs::create_dir_all(h.join(".config")).unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        let p = std::fs::canonicalize(project.path()).unwrap();
+        let (between, keys) = if in_project {
+            (p.clone(), p.join("ssh/.ssh"))
+        } else {
+            (h.join(".config/keys"), h.join(".config/keys/ssh"))
+        };
+        std::fs::create_dir_all(&keys).unwrap();
+        std::fs::write(keys.join("id_test"), "CJC-J007-SSH-KEY").unwrap();
+        std::os::unix::fs::symlink(&keys, h.join(".ssh")).unwrap();
+        let script = format!(
+            "set -- '{}' '{}'; {MOVE_THE_FOLDER_BETWEEN}",
+            between.display(),
+            keys.display()
+        );
+        let output = cli()
+            .args([
+                "contain",
+                "--project",
+                p.to_str().unwrap(),
+                "--",
+                "/bin/sh",
+                "-c",
+                &script,
+            ])
+            .env("HOME", &h)
+            .output()
+            .expect("run the macOS jail");
+        let out = String::from_utf8_lossy(&output.stdout);
+        let err = String::from_utf8_lossy(&output.stderr);
+        assert!(out.contains("DONE"), "in_project={in_project}: {out} {err}");
+        assert!(
+            !out.contains("mv=0"),
+            "in_project={in_project}: the folder above moved: {out}"
+        );
+        assert_eq!(std::fs::canonicalize(h.join(".ssh")).unwrap(), keys);
+        assert!(keys.join("id_test").exists());
+        assert!(
+            !keys.join("authorized_keys").exists(),
+            "in_project={in_project}: a planted file reached the host's ~/.ssh"
+        );
+    }
+}
+
 /// M30-SEC-2: a worktree the project's `.git` names (a file the agent
 /// writes) that is the place a hidden dotdir leads to: such a jail would
 /// bind it read-write, and a planner that trusted it as needed left the
