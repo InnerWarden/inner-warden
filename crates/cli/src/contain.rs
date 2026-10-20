@@ -623,12 +623,15 @@ impl PlaceFacts {
     /// Whether a place that a link a program in the jail can change leads
     /// to is left as it is: on Linux one outside the person's own places,
     /// where a mount would land on what the jail runs on; on macOS one in
-    /// or above a place of the system ([`MACOS_SYSTEM_PLACES`]).
+    /// or above a place of the system ([`MACOS_SYSTEM_PLACES`]), but never
+    /// one in the project, which the jail works in (a project kept under
+    /// `/private/tmp` or `/Applications`).
     fn leaves_steered(&self, place: &Path, there: bool) -> bool {
         if self.macos {
-            MACOS_SYSTEM_PLACES
-                .iter()
-                .any(|system| paths_overlap(Path::new(system), place))
+            !self.in_project(place)
+                && MACOS_SYSTEM_PLACES
+                    .iter()
+                    .any(|system| paths_overlap(Path::new(system), place))
         } else {
             !self.own_place(place, there)
         }
@@ -8724,6 +8727,42 @@ mod tests {
             &facts_of(&input, false, Path::to_path_buf),
         );
         assert!(linked.left.is_empty(), "{:?}", linked.left);
+    }
+
+    /// M30C-6: on macOS a project kept under a place of the system (a
+    /// temporary folder, `/Applications/MAMP/htdocs`) is still the project.
+    /// A `deny_read` link to a folder of that same project is denied where
+    /// it leads, as before links were planned; it was left readable, and
+    /// said to lead outside the home. A link out of the project onto a
+    /// place of the system is still left.
+    ///
+    /// FAILS ON REVERT: drop the project check from `leaves_steered` and
+    /// `config/keys` is left readable.
+    #[test]
+    fn on_macos_a_deny_read_link_inside_a_project_under_a_system_place_is_denied() {
+        for project in ["/private/tmp/app", "/Applications/MAMP/htdocs/app"] {
+            let mut input = inputs(&["claude", "--print"]);
+            input.args.project = PathBuf::from(project);
+            let macos = facts_of(&input, true, Path::to_path_buf);
+            let keys = format!("{project}/config/keys");
+            let (masks, linked) = plan_denied_paths(
+                &[steered(&format!("{project}/secrets"), &keys, true, true)],
+                &macos,
+            );
+            assert_eq!(masks, [mask(&keys, true)], "{project}");
+            assert!(linked.left.is_empty(), "{project}: {:?}", linked.left);
+            let (masks, linked) = plan_denied_paths(
+                &[steered(
+                    &format!("{project}/.env"),
+                    "/private/etc/hosts",
+                    true,
+                    false,
+                )],
+                &macos,
+            );
+            assert!(masks.is_empty(), "{project}: {masks:?}");
+            assert_eq!(linked.left.len(), 1, "{project}: {:?}", linked.left);
+        }
     }
 
     /// A link that leads to nothing yet (`~/.ssh` a link to `.config/ssh`,
