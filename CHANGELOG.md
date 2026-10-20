@@ -10,8 +10,8 @@ follows semantic versioning.
 - **On macOS a program in `innerwarden contain` can no longer rename, remove
   or replace the project folder itself, `~/.config`, a folder between the
   project and a `--deny-read` path, or any other folder the jail may write
-  above a place it hides (`~/.cache` or `/tmp` above a project there that
-  holds a `--deny-read` path).**
+  above a place it hides or a profile's read-only path (`~/.cache` or
+  `/tmp` above a project there that holds a `--deny-read` path).**
   It still writes in them, finds them writable and sets their mode and
   times; only the folder itself keeps its name. A tool that renames the
   folder it works in has to run outside the jail. Where such a folder is not

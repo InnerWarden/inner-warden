@@ -791,9 +791,9 @@ pub fn steering_link<'a>(
         })
 }
 
-/// A place the host reaches by name (a dotdir the jail never shows,
-/// InnerWarden's own folder, the launcher's records) through a link that
-/// sits in a folder the jail writes refuses the launch, as InnerWarden's
+/// A place the host reaches by name (a dotdir the jail never shows, a link
+/// inside one, InnerWarden's own folder on macOS) through a link that sits
+/// in a folder the jail writes refuses the launch, as InnerWarden's
 /// folder kept as a link does on Linux ([`iw_folder_link_refused`]): no
 /// mount or deny pins a link, so a program in the jail could replace it on
 /// the host with a folder of its own, and the host's `ssh`, `gpg`, `aws` or
@@ -1974,9 +1974,12 @@ pub fn build_linux_jail(input: &JailInputs) -> Result<LinuxJailPlan, ContainErro
             push(&["--bind", &s, &s]);
         }
     }
-    // Each folder in them between a place the host reaches by name and
-    // its bind, a mount point of its own ([`linux_pins`]): never renamed
-    // away from under its cover. Empty in every common layout.
+    // Each folder in them that the jail writes between the home and a
+    // place the host reaches by name, a mount point of its own
+    // ([`linux_pins`]): never renamed away from under its cover. That is
+    // also a folder above an inner bind (`~/.cache/work` above a project in
+    // it). None in a common layout of a plain jail; an identified jail pins
+    // its records' folders here.
     let home_pins = pins_of(PinRoot::Home);
     push(&home_pins.iter().map(String::as_str).collect::<Vec<_>>());
     // Shadow the InnerWarden secret dir IMMEDIATELY after the `.config` bind
@@ -2073,8 +2076,9 @@ pub fn build_linux_jail(input: &JailInputs) -> Result<LinuxJailPlan, ContainErro
     let proj = input.args.project.to_string_lossy().to_string();
     push(&["--bind", &proj, &proj]);
     push(&["--chdir", &proj]);
-    // The pins in the project ([`linux_pins`]): a dotdir a link leads into
-    // it is covered there, and the folders above that cover are pinned.
+    // The pins in the project ([`linux_pins`]): the folders above a cover
+    // in it (a dotdir a link leads into it, a `--deny-read` path two
+    // folders down) or above a read-only path in it.
     let project_pins = pins_of(PinRoot::Project);
     push(&project_pins.iter().map(String::as_str).collect::<Vec<_>>());
     let project_read_only = read_only_binds(Some(PinRoot::Project));
@@ -9546,8 +9550,9 @@ mod tests {
     /// the bind that holds it and before every mask; one right below its
     /// bind needs none, nor one a read-only path holds. macOS denies
     /// writing each folder above the place, as itself, that the jail may
-    /// write: the project included. In a common layout there is none, and
-    /// the identified jail pins only its records' folders.
+    /// write: the project included. On Linux a common layout pins none, and
+    /// the identified jail pins only its records' folders; macOS always
+    /// closes the project and `~/.config`.
     ///
     /// FAILS ON REVERT: drop the pins from `build_linux_jail` or the
     /// literal denies from `build_macos_profile` and the folder between is

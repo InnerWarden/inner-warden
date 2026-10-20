@@ -257,7 +257,7 @@ replaced by a link from inside the jail, so nothing it hides is shown at
 another name. So is every other folder the jail may write above a place it
 hides: `~/.cache` or `/tmp` above a project there that holds a `--deny-read`
 path, or a folder above where a hidden dotdir or a profile's hidden home path
-leads. The jail still
+leads, or above a profile's read-only path. The jail still
 writes in them, finds them writable and sets their mode and times (`rsync -a`
 or `cp -a` into the project works); only renaming, removing or replacing the
 folder itself is refused. Where such a folder is not there yet (`~/.config`
