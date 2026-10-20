@@ -489,7 +489,7 @@ fn resolve_inputs(
         if !facts.macos {
             let (_, links) = trace_links(&nominal);
             if let Some(link) = crate::contain::steering_link(&links, None, &facts.writable) {
-                return Err(crate::contain::steered_link_refused(&nominal, link));
+                return Err(crate::contain::records_link_refused(&nominal, link));
             }
         }
         let real = leads_to(&nominal).unwrap_or_else(|| resolved_through_existing(&nominal));

@@ -3410,10 +3410,20 @@ fn an_identified_jail_where_the_records_folder_is_behind_a_link_is_refused() {
     assert!(!out.contains("DONE"), "{out}");
     assert!(
         err.contains(&format!(
-            "{} goes through {}, a link in a folder a program in the jail can write",
+            "the launcher keeps its records of identified jails in {}, and the way there goes \
+             through {}, a link in a folder a program in the jail can write",
             h.join(".local/state/innerwarden/instances").display(),
             link.display()
         )),
+        "{err}"
+    );
+    // The only remedy that works for the records: never "link it straight
+    // to its place", which would put a link in the same folder.
+    assert!(
+        err.contains(&format!(
+            "Replace {} with the folder it leads to",
+            link.display()
+        )) && !err.contains("straight to its place"),
         "{err}"
     );
     assert!(

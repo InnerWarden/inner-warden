@@ -799,6 +799,28 @@ pub fn steered_link_refused(nominal: &Path, link: &Path) -> ContainError {
     ))
 }
 
+/// The launcher's records folder reached through a link in a folder the
+/// jail writes (`~/.local/state` a link) refuses an identified Linux jail:
+/// a program in it could replace that link with a folder of its own, and
+/// the launcher and the dashboard would then read the records it put
+/// there. A mount pins a folder, never a link, so this protection cannot be
+/// built at that place, and the words say so. The only remedy is the
+/// folder itself in place of the link: a link to the records folder would
+/// sit in the same folder the jail writes.
+pub fn records_link_refused(records: &Path, link: &Path) -> ContainError {
+    ContainError::Unsupported(format!(
+        "the launcher keeps its records of identified jails in {}, and the way there goes \
+         through {}, a link in a folder a program in the jail can write: that program could \
+         replace the link with a folder of its own, and the launcher and the dashboard would \
+         then read records it made. A link cannot be held in place the way a folder can, so \
+         the identified jail does not start. Replace {} with the folder it leads to, and \
+         start the jail again",
+        printable(records),
+        printable(link),
+        printable(link)
+    ))
+}
+
 /// Said of a hidden place that a link a program in the jail can change
 /// leads outside the person's own places.
 fn left_steered(nominal: &Path, leads_to: &Path) -> String {
@@ -9308,6 +9330,46 @@ mod tests {
             let rule = format!("(deny file-write* (literal \"{folder}\"))");
             assert!(profile.contains(&rule), "{rule}");
         }
+    }
+
+    /// JAIL-PINS: an identified Linux jail with the launcher's records behind
+    /// a link in a folder the jail writes cannot be protected (a mount pins a
+    /// folder, never a link), so it is refused, and the words say why and
+    /// give the one remedy that works there. The remedy of the other places
+    /// ("link it straight to its place") would put a link to the records in
+    /// that same folder, refused again. Names are printed escaped.
+    ///
+    /// FAILS ON REVERT: refuse with `steered_link_refused` and the remedy
+    /// cannot be followed.
+    #[test]
+    fn the_records_behind_a_link_are_refused_with_the_one_remedy_that_works() {
+        let said = records_link_refused(
+            Path::new("/home/dev/.local/state/innerwarden/instances"),
+            Path::new("/home/dev/.local/state"),
+        )
+        .to_string();
+        assert!(
+            said.starts_with(
+                "the launcher keeps its records of identified jails in \
+                 /home/dev/.local/state/innerwarden/instances, and the way there goes through \
+                 /home/dev/.local/state, a link in a folder a program in the jail can write"
+            ),
+            "{said}"
+        );
+        assert!(
+            said.contains("the identified jail does not start"),
+            "{said}"
+        );
+        assert!(
+            said.ends_with(
+                "Replace /home/dev/.local/state with the folder it leads to, and start the jail again"
+            ),
+            "{said}"
+        );
+        assert!(!said.contains("straight to its place"), "{said}");
+        let odd = records_link_refused(Path::new("/home/dev/a\nb"), Path::new("/home/dev/a\nb"))
+            .to_string();
+        assert!(!odd.contains('\n'), "{odd}");
     }
 
     /// JAIL-PINS (macOS): the sandbox denies by path, and lets a program in
