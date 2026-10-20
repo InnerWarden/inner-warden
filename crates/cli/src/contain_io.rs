@@ -134,7 +134,7 @@ pub fn cmd(rest: &[String]) -> ExitCode {
     }
     args.project = project;
 
-    let input = match resolve_inputs(args, home, iw_binary) {
+    let mut input = match resolve_inputs(args, home, iw_binary) {
         Ok(input) => input,
         Err(error) => {
             eprintln!("innerwarden contain: {error}");
@@ -165,6 +165,33 @@ pub fn cmd(rest: &[String]) -> ExitCode {
                 "innerwarden contain: could not arm the in-jail hook: {e} (running with walls only)"
             ),
         }
+        // On an account where Claude Code never ran, arming the hook made
+        // `~/.claude` after the jail was planned without it: the jail would
+        // show no `~/.claude`, so no settings file and no hook. The jail is
+        // planned again, and checked again, on what is there now.
+        if existing_home_paths(&input.home) != input.existing_paths {
+            input = match resolve_inputs(
+                input.args.clone(),
+                input.home.clone(),
+                input.iw_binary.clone(),
+            ) {
+                Ok(input) => input,
+                Err(error) => {
+                    eprintln!("innerwarden contain: {error}");
+                    return ExitCode::from(2);
+                }
+            };
+            if let Err(error) = validate_jail_inputs(&input) {
+                eprintln!("innerwarden contain: {error}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+
+    // Each place the jail hides that a link leads out of the home, onto
+    // what the jail needs, or round in a loop: left as it is, and said.
+    for line in &input.left {
+        eprintln!("innerwarden contain: {line}");
     }
 
     if cfg!(target_os = "linux") {
@@ -268,6 +295,26 @@ fn resolve_project(p: &Path) -> PathBuf {
     std::fs::canonicalize(&base).unwrap_or(base)
 }
 
+/// The home's dotdirs and dotfiles the builders may bind, those that are
+/// there (a link is taken where it leads): bwrap fails on a missing source.
+fn existing_home_paths(home: &Path) -> Vec<PathBuf> {
+    [
+        ".claude",
+        ".config",
+        ".cache",
+        ".cargo",
+        ".rustup",
+        ".npm",
+        ".local",
+        ".gitconfig",
+        ".claude.json",
+    ]
+    .iter()
+    .map(|name| home.join(name))
+    .filter(|path| path.exists())
+    .collect()
+}
+
 fn resolve_inputs(
     args: ContainArgs,
     home: PathBuf,
@@ -281,23 +328,7 @@ fn resolve_inputs(
         .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
         .unwrap_or_else(|| PathBuf::from("/tmp"));
 
-    // Which home-relative paths the builder may bind actually exist.
-    let candidates = [
-        ".claude",
-        ".config",
-        ".cache",
-        ".cargo",
-        ".rustup",
-        ".npm",
-        ".local",
-        ".gitconfig",
-        ".claude.json",
-    ];
-    let existing_paths: Vec<PathBuf> = candidates
-        .iter()
-        .map(|n| home.join(n))
-        .filter(|p| p.exists())
-        .collect();
+    let existing_paths = existing_home_paths(&home);
 
     let usr_merged = std::fs::symlink_metadata("/bin")
         .map(|m| m.file_type().is_symlink())
@@ -307,13 +338,117 @@ fn resolve_inputs(
 
     // Symlink-resolve the secret dir (dotfile managers symlink ~/.config): resolve
     // the ~/.config parent then append, so it works even before innerwarden/ exists.
-    let iw_config_real = std::fs::canonicalize(home.join(".config"))
+    let iw_config_named = home.join(".config/innerwarden");
+    let iw_config_through = std::fs::canonicalize(home.join(".config"))
         .map(|c| c.join("innerwarden"))
-        .unwrap_or_else(|_| home.join(".config/innerwarden"));
+        .unwrap_or_else(|_| iw_config_named.clone());
+    // The dir itself a link (a dotfiles manager's): taken where it leads.
+    let iw_config_link = goes_through_a_link(&home, &iw_config_named);
+
+    // Each host folder the jail shows, as the jail sees it and as its host
+    // path resolves: what the jail covers is covered at each such place.
+    let shown = crate::contain::shown_host_folders(
+        &args,
+        &home,
+        worktree.as_ref(),
+        &existing_paths,
+        |path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()),
+    );
+    // What the planner of the places the jail hides knows of this jail:
+    // where it shows each host folder, which ones it writes, what it needs
+    // as it is (the guard, the agent's command and settings, the system
+    // profiles) and what it works in.
+    let agent_command = args.child.first().and_then(|command| command_path(command));
+    let facts = crate::contain::place_facts(
+        &args,
+        &home,
+        worktree.as_ref(),
+        &existing_paths,
+        &iw_binary,
+        agent_command.as_deref(),
+        &tmpdir,
+        cfg!(target_os = "macos"),
+        |path| leads_to(path).unwrap_or_else(|| path.to_path_buf()),
+    );
+    let mut left: Vec<String> = Vec::new();
+
+    // Linux: the secret dir at every other place a home folder the jail
+    // binds shows it. Empty in every common layout. Where the dir itself
+    // is a link: refused on Linux (a program in the jail could replace
+    // the link on the host), denied where it leads on macOS, unless the
+    // jail leaves that place as it is (said).
+    let (iw_config_real, iw_config_shown, iw_config_left) = if iw_config_link {
+        let place = hidden_place(&iw_config_named, &facts.writable, true);
+        let real = place
+            .leads_to
+            .clone()
+            .unwrap_or_else(|| iw_config_through.clone());
+        if !facts.macos {
+            return Err(crate::contain::iw_folder_link_refused(
+                &iw_config_named,
+                &real,
+            ));
+        }
+        // Through a link a program in the jail can change: refused.
+        let mut linked = crate::contain::plan_linked_places(&[place], &facts, &[], false)?;
+        // Left as it is: needed, or a loop.
+        let iw_left = linked.hidden.is_empty();
+        left.append(&mut linked.left);
+        (real, Vec::new(), iw_left)
+    } else {
+        let views = if cfg!(target_os = "linux") {
+            crate::contain::other_jail_views(
+                &iw_config_through,
+                &[iw_config_named.clone(), iw_config_through.clone()],
+                &shown,
+            )
+        } else {
+            Vec::new()
+        };
+        (iw_config_through, views, false)
+    };
 
     // Expand the deny_read globs against the real project + stat each match so the
     // builder knows file-vs-dir (Linux masks a file with /dev/null, a dir with tmpfs).
-    let deny_paths = expand_deny_paths(&args.project, &args.deny_read);
+    // Each is hidden where it leads, and at every other place the jail
+    // shows it; one a link leads onto what the jail needs, or (through a
+    // link a program in the jail can change) onto what the jail runs on,
+    // is left as it is (said).
+    let (deny_paths, mut deny_linked) = crate::contain::plan_denied_paths(
+        &deny_read_places(&args.project, &args.deny_read, &facts.writable),
+        &facts,
+    );
+    left.append(&mut deny_linked.left);
+
+    // The dotdirs the jail never shows, where a link leads one into a
+    // folder it shows (`~/.ssh` a link to `.config/ssh`): covered there too
+    // on Linux, denied where it leads on macOS. Empty in every common
+    // layout. One through a link a program in the jail can change (one in
+    // `~/.config`, the project, `/tmp`) refuses the launch. And each link
+    // inside one of them that leads out of it (`~/.ssh/config` a link into
+    // `~/.local/share`), the same way.
+    let mut dotdirs_linked = crate::contain::plan_linked_places(
+        &never_shown_places(&home, &facts, &mut left),
+        &facts,
+        &[
+            vec![iw_config_named.clone(), iw_config_real.clone()],
+            iw_config_shown.clone(),
+        ]
+        .concat(),
+        false,
+    )?;
+    left.append(&mut dotdirs_linked.left);
+    // Each plan holds only its own OS's: masks on Linux, denies on macOS.
+    let mut linked_masks = dotdirs_linked.masks;
+    for mask in deny_linked.masks {
+        if !linked_masks.iter().any(|seen| seen.abs == mask.abs) {
+            linked_masks.push(mask);
+        }
+    }
+    let mut linked_missing = dotdirs_linked.missing;
+    linked_missing.append(&mut deny_linked.missing);
+    let linked_denies = dotdirs_linked.denies;
+    let hidden_targets = dotdirs_linked.hidden;
 
     // The home paths a jail profile hides: where each leads, every link
     // followed, covered where the jail shows it (Linux) and denied as named
@@ -322,13 +457,6 @@ fn resolve_inputs(
         crate::contain::HiddenPlan::default()
     } else {
         let found = hidden_home_facts(&home, &args.hide_home);
-        let shown = crate::contain::shown_host_folders(
-            &args,
-            &home,
-            worktree.as_ref(),
-            &existing_paths,
-            |path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()),
-        );
         crate::contain::plan_hidden_home(&found, &home, &shown)?
     };
 
@@ -352,10 +480,30 @@ fn resolve_inputs(
             std::env::var("XDG_STATE_HOME").ok().as_deref(),
             &home,
         );
-        let real = resolved_through_existing(&nominal);
+        // Linux: never through a link in a folder the jail writes
+        // (`~/.local/state` a link): a program in the jail could replace
+        // that link on the host, and the launcher would keep its records,
+        // and read them, in a folder of the agent's. Refused, as
+        // InnerWarden's own folder kept as a link is. A link the jail
+        // cannot change (`~/.local` itself a link, in the home) is fine.
+        if !facts.macos {
+            let (_, links) = trace_links(&nominal);
+            if let Some(link) = crate::contain::steering_link(&links, None, &facts.writable) {
+                return Err(crate::contain::steered_link_refused(&nominal, link));
+            }
+        }
+        let real = leads_to(&nominal).unwrap_or_else(|| resolved_through_existing(&nominal));
+        let named = [nominal.clone(), real.clone()];
         let mut dirs = vec![nominal];
         if real != dirs[0] {
-            dirs.push(real);
+            dirs.push(real.clone());
+        }
+        // Linux: and at every other place a home folder the jail binds
+        // shows it (`~/.local` a link into a `~/.cache` that leads off the
+        // home).
+        if cfg!(target_os = "linux") {
+            let others = crate::contain::other_jail_views(&real, &named, &shown);
+            dirs.extend(others);
         }
         (
             dirs,
@@ -364,6 +512,26 @@ fn resolve_inputs(
     } else {
         (Vec::new(), Vec::new())
     };
+
+    // Only an identified Linux launch keeps Claude Code's own state in the
+    // folder the jail shares with the host; without the flag none of it is
+    // read. Read only here: the folders the jail covers are made by the
+    // real run alone, after every check ([`with_claude_folders_made`]).
+    #[cfg(target_os = "linux")]
+    let claude_state = if args.identity {
+        claude_state_for(
+            &args,
+            &home,
+            worktree.as_ref(),
+            &existing_paths,
+            &iw_binary,
+            false,
+        )
+    } else {
+        crate::contain::ClaudeState::default()
+    };
+    #[cfg(not(target_os = "linux"))]
+    let claude_state = crate::contain::ClaudeState::default();
 
     Ok(JailInputs {
         args,
@@ -376,6 +544,14 @@ fn resolve_inputs(
         stdin_is_tty: std::io::stdin().is_terminal(),
         existing_paths,
         iw_config_real,
+        iw_config_shown,
+        iw_config_link,
+        iw_config_left,
+        linked_masks,
+        linked_missing,
+        linked_denies,
+        hidden_targets,
+        left,
         deny_paths,
         info_fd: None,
         record_fd: None,
@@ -389,8 +565,164 @@ fn resolve_inputs(
         hide_denies: hidden.denies,
         resolv_conf,
         gate_instance: None,
+        claude_state,
     })
 }
+
+/// Where an identified jail can keep Claude Code's own state, as found on
+/// the host for `args` ([`claude_state_here`]): what the jail shows of the
+/// host ([`crate::contain::shown_host_folders`]) and what it needs under
+/// it (the project, the worktree's folders, the read-only paths, the
+/// guard).
+#[cfg(target_os = "linux")]
+fn claude_state_for(
+    args: &ContainArgs,
+    home: &Path,
+    worktree: Option<&crate::contain::Worktree>,
+    existing: &[PathBuf],
+    iw_binary: &Path,
+    make: bool,
+) -> crate::contain::ClaudeState {
+    let shown = crate::contain::shown_host_folders(args, home, worktree, existing, |path| {
+        std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    });
+    let mut needed = vec![args.project.clone(), iw_binary.to_path_buf()];
+    if let Some(worktree) = worktree {
+        needed.push(worktree.git_dir.clone());
+        needed.push(worktree.common_dir.clone());
+    }
+    needed.extend(args.extra_ro.iter().cloned());
+    claude_state_here(home, &shown, &needed, make)
+}
+
+/// Where an identified jail can keep Claude Code's own state, as found on
+/// the host ([`crate::contain::ClaudeState`]). Only where `~/.claude` is a
+/// folder (the jail shares it). Its settings file there may be a file or
+/// not there yet, never a link or anything else, and never the person's
+/// own `~/.claude.json` ([`own_settings_in_claude`]). Each folder of
+/// Claude Code's runs there must be a folder of its own; one that is not
+/// there yet counts as made when `make` is false (a dry run, or the plan
+/// before the checks: nothing is made, and the real run does what it
+/// shows), and is made, empty and 0700 as Claude Code makes it, when `make`
+/// is true (the real run, after every check). Each is covered where the
+/// jail shows it ([`crate::contain::plan_claude_folders`]).
+#[cfg(target_os = "linux")]
+fn claude_state_here(
+    home: &Path,
+    shown: &[(PathBuf, PathBuf)],
+    needed: &[PathBuf],
+    make: bool,
+) -> crate::contain::ClaudeState {
+    use crate::contain::{ClaudeState, CLAUDE_RUN_FOLDERS, CLAUDE_SETTINGS_KEPT};
+    use std::io::ErrorKind;
+    let claude = home.join(".claude");
+    if !std::fs::metadata(&claude).is_ok_and(|meta| meta.is_dir()) {
+        return ClaudeState::default();
+    }
+    let Ok(claude_real) = std::fs::canonicalize(&claude) else {
+        return ClaudeState::default();
+    };
+    let kept = home.join(CLAUDE_SETTINGS_KEPT);
+    let settings_kept = match std::fs::symlink_metadata(&kept) {
+        Ok(meta) => meta.is_file(),
+        Err(error) => error.kind() == ErrorKind::NotFound,
+    } && !own_settings_in_claude(home, &claude_real, &kept);
+    let mut real = Vec::new();
+    let mut shared = false;
+    for name in CLAUDE_RUN_FOLDERS {
+        let folder = claude.join(name);
+        let own = match std::fs::symlink_metadata(&folder) {
+            Ok(meta) => meta.is_dir(),
+            Err(error) if error.kind() == ErrorKind::NotFound => !make || own_folder(&folder),
+            Err(_) => false,
+        };
+        if own {
+            real.push(claude_real.join(name));
+        } else {
+            shared = true;
+        }
+    }
+    let (own_folders, left) = crate::contain::plan_claude_folders(&real, shown, needed);
+    ClaudeState {
+        settings_kept,
+        own_folders,
+        shared: shared || left,
+    }
+}
+
+/// The person's own `~/.claude.json` is the kept file, or leads into
+/// `~/.claude` (a dotfiles manager's link to `.claude/.claude.json`, a hard
+/// link, or a link that leads to nothing yet, where a save would make the
+/// file): a jail's link to the kept file would then hand the jail the
+/// person's own settings file, and its saves would land on it.
+#[cfg(target_os = "linux")]
+fn own_settings_in_claude(home: &Path, claude_real: &Path, kept: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let own = home.join(crate::contain::CLAUDE_SETTINGS);
+    let entry = match std::fs::symlink_metadata(&own) {
+        Ok(entry) => entry,
+        Err(error) => return error.kind() != std::io::ErrorKind::NotFound,
+    };
+    let same_file = std::fs::metadata(&own)
+        .ok()
+        .zip(std::fs::symlink_metadata(kept).ok())
+        .is_some_and(|(own, kept)| own.dev() == kept.dev() && own.ino() == kept.ino());
+    if same_file {
+        return true;
+    }
+    entry.file_type().is_symlink()
+        && std::fs::canonicalize(&own).map_or(true, |real| real.starts_with(claude_real))
+}
+
+/// Make `folder` empty and 0700, as Claude Code makes it, and say whether it
+/// is a folder of its own now. Another launch that made it first (two
+/// identified launches at once, on a home that had none) is no failure: a
+/// folder that is there, and no link, is the same folder.
+#[cfg(target_os = "linux")]
+fn own_folder(folder: &Path) -> bool {
+    use std::os::unix::fs::DirBuilderExt;
+    match std::fs::DirBuilder::new().mode(0o700).create(folder) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            std::fs::symlink_metadata(folder).is_ok_and(|meta| meta.is_dir())
+        }
+        Err(_) => false,
+    }
+}
+
+/// The real run of an identified jail, after every check: Claude Code's
+/// folders of its runs made where they are not there, and what the jail
+/// covers read again ([`claude_state_for`]). A folder that cannot be made
+/// is shared, and that is said once.
+#[cfg(target_os = "linux")]
+fn with_claude_folders_made(input: &JailInputs) -> JailInputs {
+    let mut input = input.clone();
+    input.claude_state = claude_state_for(
+        &input.args,
+        &input.home,
+        input.worktree.as_ref(),
+        &input.existing_paths,
+        &input.iw_binary,
+        true,
+    );
+    say_claude_state(&input.claude_state);
+    input
+}
+
+/// Said once where an identified jail cannot give Claude Code a folder of
+/// its runs of its own.
+#[cfg(target_os = "linux")]
+fn say_claude_state(state: &crate::contain::ClaudeState) {
+    if state.shared {
+        eprintln!("innerwarden contain: {CLAUDE_FOLDERS_SHARED}");
+    }
+}
+
+/// [`say_claude_state`]'s sentence.
+#[cfg(target_os = "linux")]
+const CLAUDE_FOLDERS_SHARED: &str = "Claude Code's ~/.claude/sessions or ~/.claude/backups \
+     is the host's in this jail, not one of its own (a link is there, a path the jail shows \
+     is in it, or it could not be made)";
 
 /// Each home path a jail profile hides, as found on the host: where it
 /// leads with every link followed, where a file would be made when nothing
@@ -545,22 +877,20 @@ fn resolved_through_existing(path: &Path) -> PathBuf {
 /// Expand each `deny_read` pattern against the REAL project and stat the matches.
 /// Literals are taken as-is; `dir/**` or `dir/*` mask the directory (one entry
 /// covers all descendants); other globs are enumerated with the `glob` crate.
-/// Each result is symlink-resolved so the mask/deny targets the real path.
-fn expand_deny_paths(project: &Path, patterns: &[String]) -> Vec<crate::contain::DenyPath> {
-    use crate::contain::DenyPath;
-    let mut out: Vec<DenyPath> = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    let mut add = |abs: PathBuf| {
-        // metadata() follows symlinks so is_dir reflects the target; canonicalize
-        // gives the real path the sandbox will match on.
-        if let Ok(meta) = std::fs::metadata(&abs) {
-            let real = std::fs::canonicalize(&abs).unwrap_or(abs);
-            if seen.insert(real.clone()) {
-                out.push(DenyPath {
-                    abs: real,
-                    is_dir: meta.is_dir(),
-                });
-            }
+/// Each is found as [`hidden_place`] finds it: where it leads, every link
+/// followed, so the mask/deny targets the real path
+/// ([`crate::contain::plan_denied_paths`]). Every link on the way counts
+/// toward [`crate::contain::HiddenPlace::steerable`]: a link in the project
+/// is the agent's to change.
+fn deny_read_places(
+    project: &Path,
+    patterns: &[String],
+    writable: &[PathBuf],
+) -> Vec<crate::contain::HiddenPlace> {
+    let mut out: Vec<crate::contain::HiddenPlace> = Vec::new();
+    let mut add = |path: PathBuf| {
+        if !out.iter().any(|seen| seen.nominal == path) {
+            out.push(hidden_place(&path, writable, false));
         }
     };
     for pat in patterns {
@@ -579,6 +909,310 @@ fn expand_deny_paths(project: &Path, patterns: &[String]) -> Vec<crate::contain:
         }
     }
     out
+}
+
+/// A place the jail hides, as found on the host: where it leads
+/// ([`leads_to`]), whether something is there and whether it is a folder
+/// (`metadata`, which follows the links, so both describe what is there),
+/// and the first link on the way that sits in a folder the jail writes
+/// (`writable`, [`crate::contain::steering_link`]), also where the links
+/// loop. `hidden_as_named`: the jail hides the place as named (a dotdir,
+/// InnerWarden's folder), so its own entry is not the jail's to change.
+fn hidden_place(
+    nominal: &Path,
+    writable: &[PathBuf],
+    hidden_as_named: bool,
+) -> crate::contain::HiddenPlace {
+    let meta = std::fs::metadata(nominal);
+    let (at, links) = trace_links(nominal);
+    let own_entry = hidden_as_named
+        .then(|| nominal.parent().zip(nominal.file_name()))
+        .flatten()
+        .map(|(parent, name)| {
+            leads_to(parent)
+                .unwrap_or_else(|| parent.to_path_buf())
+                .join(name)
+        });
+    crate::contain::HiddenPlace {
+        nominal: nominal.to_path_buf(),
+        steered_by: crate::contain::steering_link(&links, own_entry.as_deref(), writable).cloned(),
+        leads_to: at,
+        there: meta.is_ok(),
+        is_dir: meta.is_ok_and(|meta| meta.is_dir()),
+        inner: false,
+    }
+}
+
+/// The links inside a dotdir the jail never shows (`dotdir`, as named; its
+/// own link is followed), each by the name the host reaches it by
+/// (`~/.ssh/config`), never through one of them, and whether the walk
+/// stopped short of the end ([`crate::contain::INNER_WALK_ENTRIES`],
+/// [`crate::contain::INNER_WALK_DEPTH`], a folder it cannot read). A
+/// dotdir that is not there holds none.
+fn links_inside(dotdir: &Path) -> (Vec<PathBuf>, bool) {
+    use crate::contain::{INNER_WALK_DEPTH, INNER_WALK_ENTRIES};
+    let mut links = Vec::new();
+    if !std::fs::metadata(dotdir).is_ok_and(|meta| meta.is_dir()) {
+        return (links, false);
+    }
+    let mut seen = 0usize;
+    let mut todo: Vec<(PathBuf, usize)> = vec![(dotdir.to_path_buf(), 0)];
+    while let Some((folder, depth)) = todo.pop() {
+        let Ok(entries) = std::fs::read_dir(&folder) else {
+            return (links, true);
+        };
+        for entry in entries {
+            seen += 1;
+            if seen > INNER_WALK_ENTRIES {
+                return (links, true);
+            }
+            let Ok(entry) = entry else {
+                return (links, true);
+            };
+            let Ok(kind) = entry.file_type() else {
+                return (links, true);
+            };
+            if kind.is_symlink() {
+                links.push(entry.path());
+            } else if kind.is_dir() {
+                if depth + 1 > INNER_WALK_DEPTH {
+                    return (links, true);
+                }
+                todo.push((entry.path(), depth + 1));
+            }
+        }
+    }
+    (links, false)
+}
+
+/// The places the jail hides of each dotdir it never shows
+/// ([`crate::contain::never_shown_home_paths`]): the dotdir, and each link
+/// inside one of the home's own dotdirs ([`links_inside`]) that leads out
+/// of it ([`crate::contain::HiddenPlace::inner`]). What is said of a dotdir
+/// the launcher looked in only so far is added to `left`.
+fn never_shown_places(
+    home: &Path,
+    facts: &crate::contain::PlaceFacts,
+    left: &mut Vec<String>,
+) -> Vec<crate::contain::HiddenPlace> {
+    let never_shown = crate::contain::never_shown_home_paths(home, facts.macos);
+    let mut places: Vec<crate::contain::HiddenPlace> = never_shown
+        .iter()
+        .map(|path| hidden_place(path, &facts.writable, true))
+        .collect();
+    for (dotdir, place) in never_shown.iter().zip(places.clone()) {
+        if dotdir.parent() != Some(home) {
+            continue;
+        }
+        let (links, cut) = links_inside(dotdir);
+        if cut {
+            left.push(crate::contain::left_unwalked(dotdir));
+        }
+        let within = [Some(dotdir.clone()), place.leads_to];
+        for link in links {
+            let mut found = hidden_place(&link, &facts.writable, true);
+            let stays = found
+                .leads_to
+                .as_ref()
+                .is_some_and(|to| within.iter().flatten().any(|folder| to.starts_with(folder)));
+            if !stays {
+                found.inner = true;
+                places.push(found);
+            }
+        }
+    }
+    places
+}
+
+/// Where the agent's command is on the host: as given where it names a
+/// path, else the first file of that name in a folder of `PATH`, as the
+/// jail's shell finds it.
+fn command_path(command: &str) -> Option<PathBuf> {
+    if command.contains('/') {
+        let path = Path::new(command);
+        return Some(if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir().ok()?.join(path)
+        });
+    }
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|folder| folder.join(command))
+        .find(|candidate| candidate.is_file())
+}
+
+/// Whether `path`, in a home folder the jail binds ([`crate::contain::writable_home_dirs`]),
+/// goes through a link below that folder on the host. bwrap binds the
+/// folder where it leads, at its own name, so a link there is fine; one
+/// below it is the host's link in the jail, and a mount through it lands
+/// in bwrap's own root, where it leads nowhere: bwrap aborts ("Can't
+/// mount tmpfs", "Can't mkdir parents"). Such a path is hidden where it
+/// leads, never as named.
+fn goes_through_a_link(home: &Path, path: &Path) -> bool {
+    let Ok(rest) = path.strip_prefix(home) else {
+        return false;
+    };
+    let mut parts = rest.components();
+    let Some(first) = parts.next() else {
+        return false;
+    };
+    let bound = crate::contain::writable_home_dirs()
+        .iter()
+        .any(|dir| first.as_os_str() == *dir);
+    if !bound {
+        return false;
+    }
+    let Ok(mut at) = std::fs::canonicalize(home.join(first)) else {
+        return false;
+    };
+    for part in parts {
+        at.push(part);
+        match std::fs::symlink_metadata(&at) {
+            Ok(meta) if meta.file_type().is_symlink() => return true,
+            Ok(_) => {}
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
+/// The most links followed on the way to one place, as the kernel's own
+/// limit (`ELOOP` past 40).
+const MAX_LINKS: usize = 40;
+
+/// Where the absolute `path` leads on the host: every link on the way
+/// followed, each step read with `symlink_metadata` and `read_link`, and,
+/// from the first step that is not there (or cannot be read), the rest as
+/// written, since nothing below it can be a link (`realpath -m`). That is
+/// the place a file made through it would land, also where a link leads to
+/// nothing yet. `None` where the links loop, or for a relative path.
+pub(crate) fn leads_to(path: &Path) -> Option<PathBuf> {
+    trace(path).map(|(at, _)| at)
+}
+
+/// [`leads_to`], with each link followed on the way, as found on the host
+/// (the folder it sits in with every link before it followed).
+pub(crate) fn trace(path: &Path) -> Option<(PathBuf, Vec<PathBuf>)> {
+    match trace_links(path) {
+        (Some(at), links) => Some((at, links)),
+        (None, _) => None,
+    }
+}
+
+/// [`trace`], with the links it followed also where it gives no place
+/// (they loop, or one cannot be read): a link a program in the jail can
+/// change is one on a way that loops too.
+fn trace_links(path: &Path) -> (Option<PathBuf>, Vec<PathBuf>) {
+    use std::path::Component;
+    if !path.is_absolute() {
+        return (None, Vec::new());
+    }
+    // The steps still to take, the next one last.
+    let mut todo: Vec<std::ffi::OsString> = Vec::new();
+    let push_steps = |todo: &mut Vec<std::ffi::OsString>, of: &Path| {
+        for part in of.components().rev() {
+            match part {
+                Component::Normal(name) => todo.push(name.to_os_string()),
+                Component::ParentDir => todo.push("..".into()),
+                Component::CurDir | Component::RootDir | Component::Prefix(_) => {}
+            }
+        }
+    };
+    push_steps(&mut todo, path);
+    let mut at = PathBuf::from("/");
+    let mut links: Vec<PathBuf> = Vec::new();
+    let mut gone = false;
+    while let Some(step) = todo.pop() {
+        if step == ".." {
+            at.pop();
+            continue;
+        }
+        at.push(&step);
+        if gone {
+            continue;
+        }
+        match std::fs::symlink_metadata(&at) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                if links.len() >= MAX_LINKS {
+                    return (None, links);
+                }
+                links.push(at.clone());
+                let Ok(target) = std::fs::read_link(&at) else {
+                    return (None, links);
+                };
+                at.pop();
+                if target.is_absolute() {
+                    at = PathBuf::from("/");
+                }
+                push_steps(&mut todo, &target);
+            }
+            Ok(_) => {}
+            Err(_) => gone = true,
+        }
+    }
+    (Some(at), links)
+}
+
+/// Make `place`, which is not there, as an empty folder, mode 0700, and
+/// each folder missing on the way to it the same, as a folder of the
+/// person's (as `ssh` or `gpg` would make it): from the nearest folder on
+/// the way that is there, never through a link or a file. Whether it is a
+/// folder now.
+#[cfg(target_os = "linux")]
+fn make_place(place: &Path) -> bool {
+    use std::os::unix::fs::DirBuilderExt;
+    let mut missing: Vec<&std::ffi::OsStr> = Vec::new();
+    let mut at = place;
+    while std::fs::symlink_metadata(at).is_err() {
+        let (Some(name), Some(parent)) = (at.file_name(), at.parent()) else {
+            return false;
+        };
+        missing.push(name);
+        at = parent;
+    }
+    if !std::fs::symlink_metadata(at).is_ok_and(|meta| meta.is_dir()) {
+        return false;
+    }
+    let mut at = at.to_path_buf();
+    for name in missing.into_iter().rev() {
+        at.push(name);
+        match std::fs::DirBuilder::new().mode(0o700).create(&at) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(_) => return false,
+        }
+        if !std::fs::symlink_metadata(&at).is_ok_and(|meta| meta.is_dir()) {
+            return false;
+        }
+    }
+    true
+}
+
+/// The real run of a Linux jail, after every check: each place the jail
+/// hides that a link leads somewhere not there yet is made, empty and 0700
+/// ([`make_place`]), so the jail's mount lands on a folder of the person's;
+/// one that cannot be made cannot hold anything either, and its masks are
+/// dropped, so the jail never fails to start over it. Then each folder the
+/// jail pins ([`crate::contain::linux_pins`]) that is not there yet is made
+/// the same way, where it leads on the host: bwrap would make it anyway, as
+/// the way to the mount below it, but after the pins, and so unpinned. One
+/// that cannot be made stops bwrap at its pin.
+#[cfg(target_os = "linux")]
+fn with_linked_places_made(input: &JailInputs) -> JailInputs {
+    let mut input = input.clone();
+    for (place, views) in std::mem::take(&mut input.linked_missing) {
+        if make_place(&place) {
+            continue;
+        }
+        input.linked_masks.retain(|mask| !views.contains(&mask.abs));
+        input.iw_config_shown.retain(|view| !views.contains(view));
+    }
+    for (_, folder) in crate::contain::linux_pins(&input) {
+        if std::fs::symlink_metadata(&folder).is_err() {
+            make_place(&resolved_through_existing(&folder));
+        }
+    }
+    input
 }
 
 /// A linked git worktree stores its admin data OUTSIDE the project (its `.git` is a
@@ -816,6 +1450,10 @@ fn run_linux(input: &JailInputs, marks: bool) -> ExitCode {
         }
     };
     if input.args.dry_run {
+        #[cfg(target_os = "linux")]
+        if input.args.identity {
+            say_claude_state(&input.claude_state);
+        }
         println!("# innerwarden contain - DRY RUN (Linux / bubblewrap)");
         print_plan_env(&plan.env);
         #[cfg(target_os = "linux")]
@@ -847,9 +1485,15 @@ fn run_linux(input: &JailInputs, marks: bool) -> ExitCode {
         }
         return ExitCode::from(1);
     }
+    // The places a link leads a hidden one to that are not there yet,
+    // made as folders of the person's before the jail mounts on them.
+    #[cfg(target_os = "linux")]
+    let made = with_linked_places_made(input);
+    #[cfg(target_os = "linux")]
+    let input = &made;
     #[cfg(target_os = "linux")]
     if input.args.identity {
-        return run_linux_identified(input, &bwrap, marks);
+        return run_linux_identified(&with_claude_folders_made(input), &bwrap, marks);
     }
     announce(input);
     run_unrecorded(&bwrap, input, marks)
@@ -2208,9 +2852,7 @@ fn announce(input: &JailInputs) {
             input.args.project.display(),
         );
     }
-    eprintln!(
-        "  the agent's ~/.config/innerwarden (incl. the API key) is not visible inside the jail."
-    );
+    eprintln!("{}", crate::contain::iw_folder_said(input));
 }
 
 /// Map a finished child status to an exit code, mapping a signal death to
@@ -3066,5 +3708,458 @@ mod tests {
             read_jail_graph(&project, me()),
             JailGraph::Unreadable("graph_dir_is_a_symlink")
         );
+    }
+
+    /// What the launcher takes as places an identified jail can keep Claude
+    /// Code's own state in, for a home with nothing else shown.
+    #[cfg(target_os = "linux")]
+    fn claude_state_of(home: &Path, make: bool) -> crate::contain::ClaudeState {
+        let shown: Vec<(PathBuf, PathBuf)> = [".claude", ".config"]
+            .iter()
+            .map(|name| home.join(name))
+            .filter(|path| path.exists())
+            .map(|path| {
+                let real = std::fs::canonicalize(&path).unwrap();
+                (path, real)
+            })
+            .collect();
+        claude_state_here(home, &shown, &[home.join("proj")], make)
+    }
+
+    /// The launcher's view of an identified jail's Claude Code state with
+    /// the kept file there or not and both folders of its own.
+    #[cfg(target_os = "linux")]
+    fn kept_and_own(home: &Path) -> crate::contain::ClaudeState {
+        crate::contain::ClaudeState {
+            settings_kept: true,
+            own_folders: crate::contain::CLAUDE_RUN_FOLDERS
+                .map(|name| home.join(".claude").join(name))
+                .to_vec(),
+            shared: false,
+        }
+    }
+
+    /// What the launcher takes as places an identified jail can keep Claude
+    /// Code's own state in: the settings file in `~/.claude` only where it
+    /// is a file or not there yet, the folders of its runs only where each
+    /// is a folder of its own, which the real run makes (empty, 0700) and a
+    /// plan or a dry run does not. Nothing at all without a `~/.claude`
+    /// folder.
+    ///
+    /// FAILS ON REVERT: take a link or a folder in place of the settings
+    /// file, or follow a link in place of a folder of its runs, or make a
+    /// folder when not asked to.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn claude_state_here_takes_only_a_file_or_nothing_and_a_folder_of_its_own() {
+        use crate::contain::ClaudeState;
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let home = std::fs::canonicalize(&home).unwrap();
+        // No `~/.claude`: nothing, and nothing made.
+        assert_eq!(claude_state_of(&home, true), ClaudeState::default());
+        assert!(!home.join(".claude").exists());
+        // A `~/.claude` file is no folder the jail shares.
+        std::fs::write(home.join(".claude"), "").unwrap();
+        assert_eq!(claude_state_of(&home, true), ClaudeState::default());
+        std::fs::remove_file(home.join(".claude")).unwrap();
+
+        let claude = home.join(".claude");
+        std::fs::create_dir(&claude).unwrap();
+        let sessions = claude.join("sessions");
+        let backups = claude.join("backups");
+        // The plan, and a dry run, show what a real run would do and make
+        // nothing.
+        assert_eq!(claude_state_of(&home, false), kept_and_own(&home));
+        assert!(!sessions.exists() && !backups.exists());
+        // The real run makes both folders, empty and 0700.
+        assert_eq!(claude_state_of(&home, true), kept_and_own(&home));
+        for made in [&sessions, &backups] {
+            let meta = std::fs::symlink_metadata(made).unwrap();
+            assert!(meta.is_dir());
+            assert_eq!(meta.permissions().mode() & 0o777, 0o700);
+            assert_eq!(std::fs::read_dir(made).unwrap().count(), 0);
+        }
+        // A settings file there already is kept.
+        let kept = claude.join(".claude.json");
+        std::fs::write(&kept, "{}").unwrap();
+        assert_eq!(claude_state_of(&home, true), kept_and_own(&home));
+
+        // A link in place of the settings file (a dotfiles manager's), or a
+        // folder, is never taken.
+        std::fs::remove_file(&kept).unwrap();
+        std::fs::write(root.path().join("dotfiles.json"), "{}").unwrap();
+        symlink(root.path().join("dotfiles.json"), &kept).unwrap();
+        assert!(!claude_state_of(&home, true).settings_kept);
+        std::fs::remove_file(&kept).unwrap();
+        std::fs::create_dir(&kept).unwrap();
+        assert!(!claude_state_of(&home, true).settings_kept);
+        std::fs::remove_dir(&kept).unwrap();
+
+        // A link in place of the sessions folder, even to a folder, is never
+        // covered, and the folder it leads to is left as it was: shared,
+        // and said.
+        std::fs::remove_dir(&sessions).unwrap();
+        let elsewhere = root.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        symlink(&elsewhere, &sessions).unwrap();
+        let got = claude_state_of(&home, true);
+        assert!(got.settings_kept && got.shared, "{got:?}");
+        assert_eq!(got.own_folders, std::slice::from_ref(&backups));
+        assert!(std::fs::symlink_metadata(&sessions)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
+
+        // A `~/.claude` that is a link to a folder (a dotfiles manager's) is
+        // the folder the jail binds: its places are read where it leads.
+        std::fs::remove_file(&sessions).unwrap();
+        std::fs::remove_dir(&backups).unwrap();
+        std::fs::remove_dir(&claude).unwrap();
+        let real = root.path().join("real-claude");
+        std::fs::create_dir(&real).unwrap();
+        symlink(&real, &claude).unwrap();
+        assert_eq!(claude_state_of(&home, true), kept_and_own(&home));
+        assert!(real.join("sessions").is_dir() && real.join("backups").is_dir());
+    }
+
+    /// M30CW-SEC-2: the person's own `~/.claude.json` that is the kept file
+    /// (a dotfiles manager's link to `.claude/.claude.json`, or a hard link
+    /// to it), or that leads anywhere into `~/.claude` or to nothing yet,
+    /// is never taken: the jail's link would lead to the person's own
+    /// settings file, and its saves would land on it. A file of its own, or
+    /// a link to a file outside `~/.claude`, keeps the jail's link.
+    ///
+    /// FAILS ON REVERT: drop the check of the person's own file, and the
+    /// first three are taken.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_persons_own_settings_file_is_never_the_kept_one() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(root.path()).unwrap().join("home");
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        let own = home.join(".claude.json");
+        let kept = home.join(".claude/.claude.json");
+        let reset = || {
+            let _ = std::fs::remove_file(&own);
+            let _ = std::fs::remove_file(&kept);
+        };
+        // A link to the kept file, the file there.
+        std::fs::write(&kept, "OWN").unwrap();
+        symlink(".claude/.claude.json", &own).unwrap();
+        assert!(!claude_state_of(&home, false).settings_kept, "link");
+        reset();
+        // A link to the kept file, not there yet: the person's next save
+        // makes it.
+        symlink(".claude/.claude.json", &own).unwrap();
+        assert!(!claude_state_of(&home, false).settings_kept, "dangling");
+        reset();
+        // A hard link.
+        std::fs::write(&kept, "OWN").unwrap();
+        std::fs::hard_link(&kept, &own).unwrap();
+        assert!(!claude_state_of(&home, false).settings_kept, "hard link");
+        reset();
+        // A link elsewhere into `~/.claude`.
+        std::fs::write(home.join(".claude/mine.json"), "OWN").unwrap();
+        symlink(".claude/mine.json", &own).unwrap();
+        assert!(!claude_state_of(&home, false).settings_kept, "into");
+        reset();
+        // A file of its own, a link outside `~/.claude`, or none: kept.
+        std::fs::write(&own, "OWN").unwrap();
+        assert!(claude_state_of(&home, false).settings_kept, "file");
+        reset();
+        std::fs::write(home.join("dotfiles.json"), "OWN").unwrap();
+        symlink("dotfiles.json", &own).unwrap();
+        assert!(claude_state_of(&home, false).settings_kept, "outside");
+        reset();
+        assert!(claude_state_of(&home, false).settings_kept, "none");
+    }
+
+    /// M30CW-3: a folder of Claude Code's runs another launch made first
+    /// (two identified launches at once, on a home that had none) is the
+    /// same folder, not a failure: the second jail covers it too. A link or
+    /// a file there is never taken.
+    ///
+    /// FAILS ON REVERT: take any failure to make it as not its own, and the
+    /// second launch shares the host's sessions.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_folder_another_launch_made_first_is_its_own() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let root = tempfile::tempdir().unwrap();
+        let fresh = root.path().join("fresh");
+        assert!(own_folder(&fresh));
+        let mode = std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+        // The other launch made it between this one's look and its make.
+        assert!(own_folder(&fresh));
+        symlink(&fresh, root.path().join("link")).unwrap();
+        assert!(!own_folder(&root.path().join("link")));
+        std::fs::write(root.path().join("file"), "").unwrap();
+        assert!(!own_folder(&root.path().join("file")));
+        assert!(!own_folder(&root.path().join("no/parent")));
+    }
+
+    /// M30-CW-link: where a place the jail hides really is on the host,
+    /// every link on the way followed: a link into another folder, a chain
+    /// of two links (one with `..`), a link to a folder above, a link that
+    /// leads to nothing yet (the rest as written: where `ssh` would make the
+    /// folder through it), and a loop (`None`). Where nothing is a link it
+    /// is the path itself, as `canonicalize` gives it.
+    ///
+    /// FAILS ON REVERT: follow one link only (stop at the second) and the
+    /// chain is taken for a loop, so nothing is covered through it.
+    #[cfg(unix)]
+    #[test]
+    fn a_hidden_place_is_taken_where_every_link_on_the_way_leads() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(root.path()).unwrap();
+        std::fs::create_dir_all(home.join(".config/ssh")).unwrap();
+        std::fs::create_dir_all(home.join("dots/gnupg")).unwrap();
+        std::fs::create_dir_all(home.join(".ordinary")).unwrap();
+        symlink(".config/ssh", home.join(".ssh")).unwrap();
+        // A chain: `.gnupg` to `.mid`, `.mid` to `.config/../dots/gnupg`.
+        symlink(".mid", home.join(".gnupg")).unwrap();
+        symlink(".config/../dots/gnupg", home.join(".mid")).unwrap();
+        // A link to a folder above: `.up/aws` is `<home>/.aws-real`.
+        std::fs::create_dir_all(home.join(".aws-real")).unwrap();
+        symlink(&home, home.join(".up")).unwrap();
+        // Leads to nothing yet, through an absolute link.
+        symlink(home.join(".config/not-yet/keys"), home.join(".dangling")).unwrap();
+        symlink(".loop-b", home.join(".loop-a")).unwrap();
+        symlink(".loop-a", home.join(".loop-b")).unwrap();
+        for (path, leads) in [
+            (".ssh", Some(".config/ssh")),
+            (".ssh/id_test", Some(".config/ssh/id_test")),
+            (".gnupg", Some("dots/gnupg")),
+            (".up/.aws-real", Some(".aws-real")),
+            (".dangling", Some(".config/not-yet/keys")),
+            (".dangling/sub/../file", Some(".config/not-yet/keys/file")),
+            (".ordinary", Some(".ordinary")),
+            (".not-there/x", Some(".not-there/x")),
+            (".loop-a", None),
+            (".loop-a/x", None),
+        ] {
+            assert_eq!(
+                leads_to(&home.join(path)),
+                leads.map(|rest| home.join(rest)),
+                "{path}"
+            );
+        }
+        assert_eq!(
+            leads_to(&home.join(".gnupg")).unwrap(),
+            std::fs::canonicalize(home.join(".gnupg")).unwrap()
+        );
+        assert_eq!(leads_to(Path::new("relative")), None);
+    }
+
+    /// Each link followed on the way is found where it sits, and a place
+    /// is steered only through a link in a folder the jail writes: a
+    /// `.env` link in the project always; a dotdir only past its own entry
+    /// (`~/.ssh` itself sits in the home, which the jail never writes),
+    /// through a second link in `~/.config`.
+    ///
+    /// FAILS ON REVERT: count the dotdir's own entry, or skip the links
+    /// `trace` follows, and `.ssh` and `.env` swap answers; drop the links
+    /// of a way that loops and `~/.aws` names none.
+    #[cfg(unix)]
+    #[test]
+    fn a_place_is_steerable_only_through_a_link_the_jail_can_change() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(root.path()).unwrap();
+        let project = home.join("proj");
+        std::fs::create_dir_all(home.join(".config/ssh-real")).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        symlink(".config/ssh", home.join(".ssh")).unwrap();
+        symlink("ssh-real", home.join(".config/ssh")).unwrap();
+        symlink(home.join(".config/ssh-real"), home.join(".gnupg")).unwrap();
+        symlink(home.join(".gnupg"), project.join(".env")).unwrap();
+        let (at, links) = trace(&home.join(".ssh")).unwrap();
+        assert_eq!(at, home.join(".config/ssh-real"));
+        assert_eq!(links, [home.join(".ssh"), home.join(".config/ssh")]);
+        let writable = [home.join(".config"), project.clone()];
+        assert_eq!(
+            hidden_place(&home.join(".ssh"), &writable, true).steered_by,
+            Some(home.join(".config/ssh"))
+        );
+        assert_eq!(
+            hidden_place(&home.join(".gnupg"), &writable, true).steered_by,
+            None
+        );
+        assert_eq!(
+            hidden_place(&project.join(".env"), &writable, false).steered_by,
+            Some(project.join(".env"))
+        );
+        assert_eq!(
+            hidden_place(&project.join(".env"), &[], false).steered_by,
+            None
+        );
+        // M30C-1: a way that loops still names the link the jail can change.
+        symlink("loop-b", home.join(".config/loop-a")).unwrap();
+        symlink("loop-a", home.join(".config/loop-b")).unwrap();
+        symlink(".config/loop-a", home.join(".aws")).unwrap();
+        let looped = hidden_place(&home.join(".aws"), &writable, true);
+        assert_eq!(looped.leads_to, None);
+        assert_eq!(looped.steered_by, Some(home.join(".config/loop-a")));
+        let place = hidden_place(&home.join(".gnupg"), &writable, true);
+        assert_eq!(place.leads_to, Some(home.join(".config/ssh-real")));
+        assert!(place.there && place.is_dir);
+    }
+
+    /// M30C-3: the launcher finds every link inside a dotdir the jail
+    /// never shows, at any depth, by the name the host reaches it by, and
+    /// never walks through one (a link to a folder is one place, not a
+    /// folder to look in). Each that leads out of the dotdir is a place
+    /// the jail hides ([`crate::contain::HiddenPlace::inner`]), also inside
+    /// a dotdir that is itself a link; one that stays in it (Firefox's
+    /// `lock`, a link to a name in the same folder) is none. A dotdir
+    /// deeper than the walk goes is said.
+    ///
+    /// FAILS ON REVERT: look only at the dotdir's own entry and no link
+    /// inside is found; walk through a link and `keys/inside` is found.
+    #[cfg(unix)]
+    #[test]
+    fn the_links_inside_a_dotdir_the_jail_never_shows_are_found() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(root.path()).unwrap();
+        let dots = home.join(".config/dotfiles");
+        std::fs::create_dir_all(dots.join("keydir")).unwrap();
+        std::fs::write(dots.join("config"), "Host *\n").unwrap();
+        std::fs::write(dots.join("keydir/inside"), "").unwrap();
+        std::fs::create_dir_all(home.join(".ssh/sub")).unwrap();
+        std::fs::create_dir_all(home.join(".ssh/real")).unwrap();
+        symlink(dots.join("config"), home.join(".ssh/config")).unwrap();
+        symlink(dots.join("id"), home.join(".ssh/sub/id")).unwrap();
+        symlink("127.0.0.1:+4242", home.join(".ssh/lock")).unwrap();
+        symlink("real", home.join(".ssh/self")).unwrap();
+        symlink(dots.join("keydir"), home.join(".ssh/keys")).unwrap();
+        std::fs::create_dir_all(home.join("dots/gnupg")).unwrap();
+        symlink("dots/gnupg", home.join(".gnupg")).unwrap();
+        symlink(dots.join("gpg.conf"), home.join("dots/gnupg/gpg.conf")).unwrap();
+        let mut deep = home.join(".aws");
+        for _ in 0..=crate::contain::INNER_WALK_DEPTH {
+            deep.push("d");
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        let (mut links, cut) = links_inside(&home.join(".ssh"));
+        links.sort();
+        assert!(!cut);
+        assert_eq!(
+            links,
+            ["config", "keys", "lock", "self", "sub/id"].map(|name| home.join(".ssh").join(name))
+        );
+        assert_eq!(links_inside(&home.join(".nothing")), (Vec::new(), false));
+        let facts = crate::contain::PlaceFacts {
+            home: home.clone(),
+            writable: vec![home.join(".config")],
+            ..Default::default()
+        };
+        let mut left = Vec::new();
+        let places = never_shown_places(&home, &facts, &mut left);
+        let mut inner: Vec<PathBuf> = places
+            .iter()
+            .filter(|place| place.inner)
+            .map(|place| place.nominal.clone())
+            .collect();
+        inner.sort();
+        assert_eq!(
+            inner,
+            [
+                home.join(".gnupg/gpg.conf"),
+                home.join(".ssh/config"),
+                home.join(".ssh/keys"),
+                home.join(".ssh/sub/id"),
+            ]
+        );
+        let config = places
+            .iter()
+            .find(|place| place.nominal == home.join(".ssh/config"))
+            .unwrap();
+        assert_eq!(config.leads_to, Some(dots.join("config")));
+        assert!(config.there && !config.is_dir && config.steered_by.is_none());
+        assert_eq!(left, [crate::contain::left_unwalked(&home.join(".aws"))]);
+    }
+
+    /// The agent's command is where the jail's shell finds it: a path as
+    /// given, or the first file of that name in a folder of `PATH`.
+    #[cfg(unix)]
+    #[test]
+    fn the_agents_command_is_found_as_the_shell_finds_it() {
+        assert_eq!(
+            command_path("/opt/claude/bin/claude"),
+            Some(PathBuf::from("/opt/claude/bin/claude"))
+        );
+        assert_eq!(
+            command_path("bin/claude"),
+            Some(std::env::current_dir().unwrap().join("bin/claude"))
+        );
+        assert_eq!(command_path("sh").map(|p| p.is_file()), Some(true));
+        assert_eq!(command_path("innerwarden-no-such-command-x9"), None);
+    }
+
+    /// A path goes through a link below the home folder the jail binds it
+    /// in (where a mount through it would abort bwrap) only for a link
+    /// below that folder: the folder itself a link is bound where it leads,
+    /// and a path in a folder the jail does not bind is not in the jail.
+    #[cfg(unix)]
+    #[test]
+    fn a_path_goes_through_a_link_only_below_the_folder_the_jail_binds() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(root.path()).unwrap();
+        std::fs::create_dir_all(home.join("dots/config/iw")).unwrap();
+        std::fs::create_dir_all(home.join(".local")).unwrap();
+        std::fs::create_dir_all(home.join("elsewhere")).unwrap();
+        symlink("dots/config", home.join(".config")).unwrap();
+        symlink(home.join("elsewhere"), home.join(".local/state")).unwrap();
+        symlink("dots", home.join(".unbound")).unwrap();
+        std::fs::create_dir_all(home.join(".cache")).unwrap();
+        for (path, through) in [
+            (".config/iw", false),
+            (".config/innerwarden", false),
+            (".local/state/innerwarden/instances", true),
+            (".local/share", false),
+            (".unbound/config", false),
+            (".cache/x/y", false),
+        ] {
+            assert_eq!(
+                goes_through_a_link(&home, &home.join(path)),
+                through,
+                "{path}"
+            );
+        }
+        symlink("../dots/config/iw", home.join("dots/config/innerwarden")).unwrap();
+        assert!(goes_through_a_link(
+            &home,
+            &home.join(".config/innerwarden")
+        ));
+    }
+
+    /// A place not there yet is made empty and 0700, each folder on the
+    /// way the same, as a folder of the person's; never through a link or a
+    /// file on the way, and one that is there already is no failure.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_place_not_there_yet_is_made_as_a_folder_of_the_persons() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let root = tempfile::tempdir().unwrap();
+        let place = root.path().join("cfg/ssh");
+        assert!(make_place(&place));
+        for made in [root.path().join("cfg"), place.clone()] {
+            let mode = std::fs::metadata(&made).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{}", made.display());
+        }
+        assert!(make_place(&place), "there already");
+        std::fs::write(root.path().join("file"), "").unwrap();
+        assert!(!make_place(&root.path().join("file/below")));
+        symlink(root.path().join("cfg"), root.path().join("link")).unwrap();
+        assert!(!make_place(&root.path().join("link")));
     }
 }

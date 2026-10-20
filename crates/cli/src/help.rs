@@ -248,7 +248,27 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
              outside the home, or over what the jail needs, stops the launch. A note\n  \
              from the host about the jail is printed as `innerwarden contain: <note>`.\n  \
              A Linux jail shows the host's resolver file read-only, so names resolve as\n  \
-             on the host.\n\
+             on the host. Where a place the jail hides (~/.ssh, ~/.gnupg, ~/.aws or a\n  \
+             link inside one, a --deny-read path, InnerWarden's own folder) is a link,\n  \
+             the place it leads to is hidden too, wherever the jail shows it (on macOS\n  \
+             also outside your home), and the folders above it are pinned, so the\n  \
+             agent cannot rename it away. A link never hides what the jail needs (the\n  \
+             guard, the agent's settings, the project, a read-only path), and a\n  \
+             --deny-read link never hides what the jail runs on: contain leaves such a\n  \
+             place, says so, and the jail still starts. A hidden dotdir, InnerWarden's\n  \
+             folder or, with --identity on Linux, the launcher's records folder, whose\n  \
+             way goes through a link in a folder the jail writes stops the launch\n  \
+             (replace that link with what it leads to). On Linux, InnerWarden's own\n  \
+             folder kept as a link stops the launch (replace it with the folder it\n  \
+             leads to), and a project, worktree or profile path over where it leads is\n  \
+             refused; so is a worktree or profile path over where a hidden dotdir\n  \
+             leads. On Linux, with\n  \
+             --identity, Claude Code's settings file is kept in ~/.claude/.claude.json\n  \
+             between launches (your own ~/.claude.json is not shown), and each jail has\n  \
+             an empty ~/.claude/sessions and ~/.claude/backups of its own, so two jails\n  \
+             at once do not write the same session file. That is for Claude Code's\n  \
+             folder at ~/.claude; where a jail cannot have them of its own, contain\n  \
+             says so.\n\
              \n  \
              On Linux, where the host takes it, every jail starts its programs under\n  \
              a seccomp filter in the style of Flatpak that refuses TIOCSTI and\n  \
@@ -531,6 +551,152 @@ mod tests {
         ] {
             assert!(readme.contains(said), "README lacks {said:?}");
         }
+    }
+
+    /// The contain help and the README say where an identified jail keeps
+    /// Claude Code's own state, and only what the launcher makes true: on
+    /// Linux only, the person's own settings file not shown, nor its copies
+    /// in `~/.claude/backups`, each jail with its own sessions and backups,
+    /// only for Claude Code's folder at `~/.claude`, the cases it shares,
+    /// the limit of two jails sharing the one file, that what any jail
+    /// writes to the kept file is what the next identified launch loads,
+    /// and that a jail without `--identity` still loses the file. The
+    /// CHANGELOG says the same cases the README does (M30CW-C6).
+    ///
+    /// FAILS ON REVERT: drop the sentence from the contain help or its
+    /// "On Linux", or a sentence of the README's paragraphs or its limit, or
+    /// put back the CHANGELOG's "not shown" with no case where it is.
+    #[test]
+    fn the_contain_help_and_the_readme_say_where_claude_codes_state_is_kept() {
+        let flat = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let help = flat(&usage("contain", &[]).expect("contain has usage"));
+        for said in [
+            "On Linux, with --identity, Claude Code's settings file is kept in ~/.claude/.claude.json between launches (your own ~/.claude.json is not shown)",
+            "each jail has an empty ~/.claude/sessions and ~/.claude/backups of its own, so two jails at once do not write the same session file.",
+            "That is for Claude Code's folder at ~/.claude; where a jail cannot have them of its own, contain says so.",
+        ] {
+            assert!(help.contains(said), "contain --help lacks {said:?}: {help}");
+        }
+        assert!(!help.contains("stays outside"), "{help}");
+        let readme = flat(include_str!("../../../README.md"));
+        for said in [
+            "An identified Linux jail keeps Claude Code's own state in the `~/.claude` it already shares with you.",
+            "In the jail it now leads to `~/.claude/.claude.json`",
+            "Your own `~/.claude.json` is not shown in the jail, and the jail's Claude Code never uses it. Nor are the copies Claude Code keeps of it in `~/.claude/backups`: each identified jail has an empty `~/.claude/backups` of its own",
+            "Where your own `~/.claude.json` is a link, or a hard link, to a file in `~/.claude`, that file is shared with the jail like the rest of the folder, and the jail makes no link to it.",
+            "each identified jail also has an empty `~/.claude/sessions` of its own: two jails at once do not write the same session file",
+            "Both folders are covered at every place the jail shows them",
+            "All of this is for Claude Code's own folder at `~/.claude`, where it is unless `CLAUDE_CONFIG_DIR` names another",
+            "where a read-only path of the profile shows it, `~/.claude` or `~/.claude.json`",
+            "or where your own `~/.claude.json` is that file or leads into `~/.claude` or to nothing.",
+            "Where one of the two folders cannot be the jail's own (a link is there, the project is inside it, or it could not be made), the jail shows the host's, and `innerwarden contain` says so.",
+            "Limit: two jails at once share the one settings file, and Claude Code's lock on it is each jail's own",
+            "Every jail, with `--identity` or without, shares `~/.claude` with you, so what a program in any jail writes to `~/.claude/.claude.json` is what the next identified Claude Code loads, as with `~/.claude/settings.json`: an MCP server listed there starts with it, outside `innerwarden proxy` unless the entry runs through it",
+            "A jail started without `--identity` is unchanged: Claude Code's settings file is still gone at every launch there, and two such jails at once still share `~/.claude/sessions` and see the host's.",
+            "On macOS the jail lets Claude Code use your own `~/.claude.json`, as before.",
+        ] {
+            assert!(readme.contains(said), "README lacks {said:?}");
+        }
+        for unsaid in [
+            "stays outside the jail",
+            "never write the same session file",
+        ] {
+            assert!(!readme.contains(unsaid), "README still says {unsaid:?}");
+        }
+        let changelog = flat(include_str!("../../../CHANGELOG.md"));
+        for said in [
+            "Where your own `~/.claude.json` is a link, or a hard link, to a file in `~/.claude`, that file is shared with the jail like the rest of the folder, and where `~/.claude/backups` is a link of yours the jail shows the host's copies (`innerwarden contain` says so).",
+            "or where your own `~/.claude.json` is that file or leads into `~/.claude` or to nothing:",
+            "what a program in any jail writes to `~/.claude/.claude.json` is what the next identified Claude Code loads, as with `~/.claude/settings.json`",
+        ] {
+            assert!(changelog.contains(said), "CHANGELOG lacks {said:?}");
+        }
+        assert!(
+            !changelog.contains(
+                "or where your own `~/.claude.json` is that file or leads into `~/.claude`: "
+            ),
+            "the CHANGELOG leaves out the link to nothing"
+        );
+    }
+
+    /// The contain help, the README and the CHANGELOG say what the jail does
+    /// with a place it hides that is a link (M30-CW-link), only what the
+    /// launcher makes true: hidden where it leads, wherever the jail shows
+    /// it (on macOS also out of the home); left and said where it leads onto
+    /// what the jail needs, or where a link a program in the jail can change
+    /// leads onto what the jail runs on; a stop only for InnerWarden's own
+    /// folder kept as a link on Linux and for a path over a place it hides
+    /// (M30-R5, M30L-DOC-4); a place not there yet made only for a dotdir
+    /// (M30L-DOC-5); and the CHANGELOG says what changed on Linux for a
+    /// `--deny-read` link out of the home (M30L-DOC-1). And, since the
+    /// critic's M30C pass: the links inside a hidden dotdir are hidden too
+    /// (M30C-3), the folders above a cover are pinned (M30C-2), a way
+    /// through a link the jail can change stops the launch, the records
+    /// folder's included, which no longer starts (M30C-1, M30C-4), and the
+    /// LLM and notification config are read from nothing (M30C-5).
+    ///
+    /// FAILS ON REVERT: drop the sentence from the help, the README or the
+    /// CHANGELOG and the line that names it fails.
+    #[test]
+    fn the_contain_help_and_the_readme_say_what_a_hidden_link_leads_to() {
+        let flat = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let help = flat(&usage("contain", &[]).expect("contain has usage"));
+        for said in [
+            "Where a place the jail hides (~/.ssh, ~/.gnupg, ~/.aws or a link inside one, a --deny-read path, InnerWarden's own folder) is a link, the place it leads to is hidden too, wherever the jail shows it (on macOS also outside your home), and the folders above it are pinned, so the agent cannot rename it away.",
+            "A link never hides what the jail needs (the guard, the agent's settings, the project, a read-only path), and a --deny-read link never hides what the jail runs on: contain leaves such a place, says so, and the jail still starts.",
+            "A hidden dotdir, InnerWarden's folder or, with --identity on Linux, the launcher's records folder, whose way goes through a link in a folder the jail writes stops the launch (replace that link with what it leads to).",
+            "On Linux, InnerWarden's own folder kept as a link stops the launch (replace it with the folder it leads to), and a project, worktree or profile path over where it leads is refused; so is a worktree or profile path over where a hidden dotdir leads.",
+        ] {
+            assert!(help.contains(said), "contain --help lacks {said:?}: {help}");
+        }
+        let readme = flat(include_str!("../../../README.md"));
+        for said in [
+            "Where a place the jail hides is a link, the jail hides the place it leads to:",
+            "On Linux that place is covered wherever a folder the jail shows holds it, and each folder between the cover and the folder the jail binds is a mount point of its own, so a program in the jail can neither read the place nor rename it away from the name your link uses; a dotdir's place that is not there yet is made first, empty and 0700, so nothing the agent writes there reaches it (a `--deny-read` path that is not there is not hidden). On macOS it is denied, read and write, also outside your home, and each folder above it that the jail may write, the project included, is closed to renaming and removal (the jail still writes in it).",
+            "a link inside one of them (`~/.ssh/config` a link into `~/.config/dotfiles`, as GNU stow and chezmoi make one per file)",
+            "The launcher looks for the links inside those dotdirs as far as 100000 entries and 32 folders deep, and says where it stops short.",
+            "A link never moves a mask or a deny onto what the jail needs: the guard, the agent's settings or a file in them, the project, a read-only path, the system's folders.",
+            "Nor does a `--deny-read` link in the project, which the agent can change, move one onto what the jail runs on: on Linux a place outside your home, on macOS a place of the system outside the project.",
+            "A dotdir that leads into the project is hidden there, and said.",
+            "A link stops the launch only here: a hidden dotdir, a link inside one, InnerWarden's own folder or, in an identified Linux jail, the launcher's records folder, whose way goes through a link in a folder the jail writes (`~/.aws` a link to `~/.cache/aws-link`, itself a link) is refused, since no mount or deny pins a link and a program in the jail could replace it on the host (replace that link with what it leads to); on Linux, InnerWarden's own folder kept as a link is refused for the same reason (replace it with the folder it leads to), and so is a link inside a hidden dotdir that leads to nothing yet where the jail shows that place (make it, or remove the link); and a project, worktree or profile path over the place InnerWarden's folder leads to is refused, as is a worktree or profile path over the place a hidden dotdir leads to.",
+            "Each folder between such a path and the folder the jail writes is pinned as below, so no program in the jail renames it away from the path's cover.",
+            "A profile's `hide_home` path keeps its own rule, above: one that leads outside the home stops the launch.",
+        ] {
+            assert!(readme.contains(said), "README lacks {said:?}");
+        }
+        let changelog = flat(include_str!("../../../CHANGELOG.md"));
+        for said in [
+            "Each is now hidden where it really is, at every place the jail shows it, in every jail; on macOS it is denied where it leads, also outside your home.",
+            "A link never moves a mask or a deny onto what the jail needs (the guard, the agent's settings or a file in them, such as the one that carries the hook, the project, a read-only path), and a link that a program in the jail can change (a `--deny-read` link in the project) never moves one onto what the jail runs on: on Linux a place outside your home, on macOS a place of the system.",
+            "On Linux, InnerWarden's own folder kept as a link stops `innerwarden contain`.",
+            "On Linux a `--deny-read` path that a link in the project leads out of your home is not hidden there.",
+            "A suppression planted in the jail no longer lifts the hook's verdict.",
+            "An LLM or notification config planted in the jail is no longer read.",
+            "A jail can no longer move a hidden place away from the name the host reads it by.",
+            "A dotdir, InnerWarden's folder or the launcher's records behind a link the jail can change is refused.",
+            "A hidden dotdir behind a link the jail can change stops `innerwarden contain`.",
+            "On macOS such a place is denied where it leads, unless it is a place of the system outside the project.",
+            "the launcher looks for such links as far as 100000 entries and 32 folders deep, and says where it stops short.",
+        ] {
+            assert!(changelog.contains(said), "CHANGELOG lacks {said:?}");
+        }
+        // M30C-4: such a jail is refused now, never started.
+        assert!(
+            !changelog.contains(
+                "An identified jail starts where the launcher's records folder is behind a link."
+            ),
+            "the CHANGELOG still says the records-link jail starts"
+        );
+        // M30C-1: through a link the jail can change, a dotdir is refused,
+        // never left and said.
+        assert!(
+            !help.contains("one a program in the jail can change never hides"),
+            "{help}"
+        );
+        assert!(
+            !readme.contains("Nor does a link that a program in the jail can change (every"),
+            "the README still says a dotdir behind such a link is left"
+        );
     }
 
     /// A wrapped child's flags are not ours. `contain -- claude --help` must run

@@ -11,6 +11,20 @@ follows semantic versioning.
   subvolume or snapshot.** It gets "Operation not permitted". A tool that
   needs one (a container runtime on btrfs, `btrfs subvolume create`) has to
   run outside the jail.
+- **On Linux, InnerWarden's own folder kept as a link stops `innerwarden
+  contain`.** Where `~/.config/innerwarden` is a link (a dotfiles manager's),
+  replace the link with the folder it leads to; `innerwarden contain` says
+  how. Such a jail did not start before either.
+- **A hidden dotdir behind a link the jail can change stops `innerwarden
+  contain`.** Where the way to `~/.ssh`, `~/.gnupg` or `~/.aws`, to a link
+  inside one, to InnerWarden's own folder, or (with `--identity` on Linux)
+  to the launcher's records folder goes through a link in a folder the jail
+  writes (`~/.aws` a link to `~/.cache/aws-link`, itself a link;
+  `~/.local/state` a link), replace that link with what it leads to;
+  `innerwarden contain` names it. On Linux, a link inside a hidden dotdir
+  that leads to nothing yet, where the jail shows that place, stops it too:
+  make what it leads to, or remove the link. Such an identified jail with
+  the records folder behind a link did not start before either.
 
 ### Security
 
@@ -26,6 +40,132 @@ follows semantic versioning.
   before the jail started, in a folder the jail shows, still holds those
   files: only new ones are refused, so keep such snapshots out of the
   project.
+- **The jail hides InnerWarden's own folder wherever it shows it.** On Linux,
+  where a home folder the jail binds is a link that leads off the home
+  (`~/.cache` on another disk) and `~/.config` is a link into it, the jail
+  covered `~/.config/innerwarden` as named and as it resolves, but showed it
+  a third time through `~/.cache`, with the model key in it. It is covered
+  there too, and so are the launcher's records in an identified jail (where
+  `~/.local` is such a link). A project at that place is refused, as one at
+  `~/.config/innerwarden` is.
+- **The jail hides what it hides wherever a link leads it.** In some home
+  layouts that use symbolic links, a folder the jail hides by default, a
+  `--deny-read` path or InnerWarden's own folder could still be read in the
+  jail. Each is now hidden where it really is, at every place the jail shows
+  it, in every jail; on macOS it is denied where it leads, also outside your
+  home. A link never moves a mask or a deny onto what the jail needs (the
+  guard, the agent's settings or a file in them, such as the one that
+  carries the hook, the project, a read-only path), and a link that a
+  program in the jail can change (a `--deny-read` link in the project) never
+  moves one onto what the jail runs on: on Linux a place outside your home,
+  on macOS a place of the system. Such a place is left as it is, and
+  `innerwarden contain` says so where the jail shows it. A worktree, or a
+  path of a profile, over the place a hidden dotdir leads to is refused. In
+  every common layout the jail is the one it was. A link inside one of those
+  dotdirs (`~/.ssh/config` a link into `~/.config/dotfiles`, as GNU stow and
+  chezmoi make one per file where `~/.ssh` is there) is hidden where it
+  leads the same way; the launcher looks for such links as far as 100000
+  entries and 32 folders deep, and says where it stops short.
+- **A jail can no longer move a hidden place away from the name the host
+  reads it by.** A mount moves with the folder it is in, and Linux renames a folder
+  that is not itself a mount point: a program in the jail that renamed the
+  folder above a covered place (`~/.config/keys` above `~/.config/keys/ssh`,
+  where `~/.ssh` leads; `~/dotfiles/ssh` above a stowed `~/.ssh`; the
+  `~/.local/state` above the launcher's records in an identified jail) took
+  the cover with it and made a folder of its own at the name the host's
+  link, or the launcher, reads. Each folder between such a place and the
+  folder the jail binds is now a mount point of its own, and the rename
+  fails. On macOS the sandbox let the jail rename a folder above a denied
+  place, the project included: each such folder the jail may write is now
+  closed to renaming and removal, and the jail still writes in it.
+- **A dotdir, InnerWarden's folder or the launcher's records behind a link
+  the jail can change is refused.** The jail hid where such a way led, but
+  a program in it could replace the link in the folder it writes with a
+  folder of its own, on the host, and the host's `aws`, `ssh` or `gpg` then
+  read its config and ran what it named (`credential_process`, `Match
+  exec`, `pinentry-program`), or the launcher kept its records there. No
+  mount or deny pins a link, so such a launch is refused (see Upgrade
+  notes).
+- **A suppression planted in the jail no longer lifts the hook's verdict.**
+  Inside the jail the hook read the person's suppressions from
+  `~/.config/innerwarden`, which on Linux is an empty folder of the jail's
+  own that its programs can write: a `suppress.toml` written there let
+  through the command it names. The hook in a jail now reads none
+  (`IW_SUPPRESS_CONFIG=/dev/null`); your own file was never visible there.
+- **An LLM or notification config planted in the jail is no longer read.**
+  The jail meant to turn the hook's LLM second opinion and notifications
+  off with `IW_LLM_CONFIG` and `IW_NOTIFY_CONFIG` left empty, but an empty
+  value made the hook read `llm.toml` and `notify.toml` in that same
+  folder: a program in the jail could send each command the hook reviews to
+  an endpoint of its choosing, stall the hook on it, and fire webhooks of
+  its choosing. It could not lift a refusal. Both now read nothing
+  (`/dev/null`).
+- **On Linux, a jail can no longer replace InnerWarden's own folder kept as
+  a link.** The link sits in the `~/.config` the jail binds read-write, and
+  no mount can pin a link: a program in the jail could put a folder of its
+  own in its place, on the host, whose files the host's guard reads. Such a
+  launch is refused (see Upgrade notes).
+
+### Changed
+
+- **On Linux a `--deny-read` path that a link in the project leads out of
+  your home is not hidden there.** Such a link is the agent's to change, and
+  a mask it steers could land on what the jail runs on (a file in `/etc`, a
+  library the hook loads). Where the jail shows that place, `innerwarden
+  contain` says it is not hidden: keep the secret in your home or your
+  project to have it hidden. A path you name outside the project (absolute,
+  or with `..`) with no such link on the way is hidden where it leads, as
+  before. On macOS such a place is denied where it leads, unless it is a
+  place of the system outside the project.
+
+### Fixed
+
+- **The launcher no longer says the API key is hidden where it is not.**
+  Where the place InnerWarden's own folder leads to is left as it is (said
+  before), the launch line said the folder, the API key with it, was not
+  visible in the jail. It now says the place its link leads to is not
+  hidden.
+- **The first jail on an account where Claude Code never ran has the guard's
+  hook.** Arming the hook makes `~/.claude`, and the jail was planned before
+  that, without it: on Linux the first `innerwarden contain` there showed no
+  `~/.claude/settings.json`, so the hook never fired inside, while the
+  launcher said it was armed. The jail is planned again once the hook is
+  armed. A dry run arms nothing, so on such an account it still shows a jail
+  without `~/.claude`.
+- **Claude Code keeps its settings in an identified jail.** In
+  `innerwarden contain --identity` on Linux the jail's home is an empty
+  folder of its own, so Claude Code's settings file, `~/.claude.json`, was
+  gone at every launch: from the second launch on Claude Code said twice that
+  the file was missing, and what it saved there (an MCP server you added, its
+  first-run answers) was lost. In the jail that file now leads to
+  `~/.claude/.claude.json`, in the folder the jail already shares, so it is
+  kept between launches. Your own `~/.claude.json` is not shown in the jail
+  and its Claude Code never uses it, and the copies Claude Code keeps of it in
+  `~/.claude/backups` are not shown either: each identified jail has an empty
+  `~/.claude/backups` of its own. Where your own `~/.claude.json` is a link,
+  or a hard link, to a file in `~/.claude`, that file is shared with the jail
+  like the rest of the folder, and where `~/.claude/backups` is a link of
+  yours the jail shows the host's copies (`innerwarden contain` says so). Not
+  where a hidden home path or a read-only path of the profile covers that
+  place or names `~/.claude.json`, where it is a link of yours or anything
+  other than a file, or where your own `~/.claude.json` is that file or leads
+  into `~/.claude` or to nothing: Claude Code then keeps its file in the
+  jail's own home, as before. Every jail shares `~/.claude`, so what a
+  program in any jail writes to `~/.claude/.claude.json` is what the next
+  identified Claude Code loads, as with `~/.claude/settings.json`: an MCP
+  server listed there starts with it.
+- **Two identified jails at once no longer share Claude Code's session
+  file.** Claude Code is process 2 in every jail and lists each running
+  session as `~/.claude/sessions/<pid>.json`, in the `~/.claude` the jails
+  share, so two jails at once wrote and read the same `2.json`. Each
+  identified jail now has its own empty `~/.claude/sessions` (the launcher
+  makes the folder, 0700, where it is not there), at every place the jail
+  shows it, and none sees the sessions running outside it. Only for Claude
+  Code's folder at `~/.claude`, where it is unless `CLAUDE_CONFIG_DIR` names
+  another; where the jail cannot have the folder of its own (a link is there,
+  the project is inside it), `innerwarden contain` says so. A jail started
+  without `--identity` is unchanged: there Claude Code's settings file is
+  still gone at every launch, and its session list is still shared.
 
 ## 1.5.5 - 2026-10-11
 

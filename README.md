@@ -228,7 +228,9 @@ what of the home it hides, under `[profile.<type>.jail]`:
   itself a link (`~/.cache` on another disk) counts as the home where it
   leads. On Linux a path that is not there yet, in a folder the jail writes,
   is made empty (mode 0700) first, so what a program makes there later stays
-  hidden too.
+  hidden too. Each folder between such a path and the folder the jail writes
+  is pinned as below, so no program in the jail renames it away from the
+  path's cover.
 
 The user's file can only tighten these: the stricter `start` and every hidden
 path of both files hold. When Active Defence sends a note about the jail (for
@@ -242,6 +244,91 @@ sits in a folder of resolver data alone (resolvconf), the folder is shown, so
 the jail follows the host when the network changes. Elsewhere
 (systemd-resolved, NetworkManager) a jail keeps the resolver file it started
 with until the agent is restarted.
+
+Where a place the jail hides is a link, the jail hides the place it leads
+to: `~/.ssh`, `~/.gnupg` or `~/.aws` kept as a link into a folder the jail
+shows (`~/.ssh` a link to `.config/ssh`), a link inside one of them
+(`~/.ssh/config` a link into `~/.config/dotfiles`, as GNU stow and chezmoi
+make one per file), a `--deny-read` path of the project, or InnerWarden's own
+folder. Every link on the way is followed. On Linux that place is covered
+wherever a folder the jail shows holds it, and each folder between the cover
+and the folder the jail binds is a mount point of its own, so a program in
+the jail can neither read the place nor rename it away from the name your
+link uses; a dotdir's place that is not there yet is made first, empty and
+0700, so nothing the agent writes there reaches it (a `--deny-read` path that
+is not there is not hidden). On macOS it is denied, read and write, also
+outside your home, and each folder above it that the jail may write, the
+project included, is closed to renaming and removal (the jail still writes in
+it). The launcher looks for the links inside those dotdirs as far as 100000
+entries and 32 folders deep, and says where it stops short. A link never
+moves a mask or a deny onto what the jail needs: the guard, the agent's
+settings or a file in them, the project, a read-only path, the system's
+folders. Nor does a `--deny-read` link in the project, which the agent can
+change, move one onto what the jail runs on: on Linux a place outside your
+home, on macOS a place of the system outside the project. Each such place is
+left as it is, and `innerwarden contain` says so, with what to do (on Linux
+only where the jail shows that place: elsewhere it is not in the jail at
+all). A dotdir that leads into the project is hidden there, and said. A link
+stops the launch only here: a hidden dotdir, a link inside one, InnerWarden's
+own folder or, in an identified Linux jail, the launcher's records folder,
+whose way goes through a link in a folder the jail writes (`~/.aws` a link to
+`~/.cache/aws-link`, itself a link) is refused, since no mount or deny pins a
+link and a program in the jail could replace it on the host (replace that
+link with what it leads to); on Linux, InnerWarden's own folder kept as a
+link is refused for the same reason (replace it with the folder it leads
+to), and so is a link inside a hidden dotdir that leads to nothing yet where
+the jail shows that place (make it, or remove the link); and a project,
+worktree or profile path over the place InnerWarden's folder leads to is
+refused, as is a worktree or profile path over the place a hidden dotdir
+leads to. A profile's `hide_home` path keeps its own rule, above: one that
+leads outside the home stops the launch.
+
+An identified Linux jail keeps Claude Code's own state in the `~/.claude` it
+already shares with you. The jail's home is an empty folder of its own, so
+Claude Code's settings file, `~/.claude.json`, used to be gone at every launch
+(and Claude Code said, from the second launch on, that it was missing). In the
+jail it now leads to `~/.claude/.claude.json`, so what Claude Code saves there,
+an MCP server you add or its first-run answers, is still there at the next
+launch. Your own `~/.claude.json` is not shown in the jail, and the jail's
+Claude Code never uses it. Nor are the copies Claude Code keeps of it in
+`~/.claude/backups`: each identified jail has an empty `~/.claude/backups` of
+its own, and the copies made there are gone when the jail ends. The first
+identified launch starts Claude Code with a new file of the jail's own, so it
+may ask its first-run questions once. (Where your own `~/.claude.json` is a
+link, or a hard link, to a file in `~/.claude`, that file is shared with the
+jail like the rest of the folder, and the jail makes no link to it. Where you
+point Claude Code at `~/.claude` with `CLAUDE_CONFIG_DIR`,
+`~/.claude/.claude.json` is the file it uses, in the jail and out of it.)
+Claude Code is process 2 in every jail and lists each running session by its
+process id, so each identified jail also has an empty `~/.claude/sessions` of
+its own: two jails at once do not write the same session file, and none sees
+the sessions running outside it. Both folders are covered at every place the
+jail shows them, a `~/.claude` that is a link into `~/.config` and a project
+that is `~/.claude` included. All of this is for Claude Code's own folder at
+`~/.claude`, where it is unless `CLAUDE_CONFIG_DIR` names another: the jail
+leaves another folder as it is, and jails at once share the session list in
+it.
+
+Claude Code keeps its file in the jail's own home, as before, where a hidden
+home path covers `~/.claude/.claude.json`, where a read-only path of the
+profile shows it, `~/.claude` or `~/.claude.json`, where that place is a link
+or anything other than a file, or where your own `~/.claude.json` is that file
+or leads into `~/.claude` or to nothing. Where one of the two folders cannot be the jail's
+own (a link is there, the project is inside it, or it could not be made), the
+jail shows the host's, and `innerwarden contain` says so. Limit: two jails at
+once share the one settings file, and Claude Code's lock on it is each jail's
+own, so a change one jail saves at the same moment as another can be lost (a
+save is never left half written). Every jail, with `--identity` or without,
+shares `~/.claude` with you, so what a program in any jail writes to
+`~/.claude/.claude.json` is what the next identified Claude Code loads, as
+with `~/.claude/settings.json`: an MCP server listed there starts with it,
+outside `innerwarden proxy` unless the entry runs through it, and a project
+marked trusted there skips Claude Code's trust question. A jail started
+without `--identity` is
+unchanged: Claude Code's settings file is still gone at every launch there,
+and two such jails at once still share `~/.claude/sessions` and see the
+host's. On macOS the jail lets Claude Code use your own `~/.claude.json`, as
+before.
 
 Where a per-agent relaxation applies:
 
