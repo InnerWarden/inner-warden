@@ -2698,6 +2698,54 @@ fn a_cover_below_a_folder_the_jail_writes_stays_where_the_hosts_link_leads() {
     }
 }
 
+/// JAIL-PINS: a project two folders inside a home folder the jail binds
+/// (`~/.cache/work/proj`), with `~/.ssh` a link into it. The pins started
+/// at the project's bind, so `~/.cache/work`, between the `~/.cache` bind
+/// and the project's, could be renamed in a plain and an identified jail
+/// (measured): the project's mount and the cover in it moved with it, and
+/// the host's `~/.ssh` led to a folder the jail made. Every folder the jail
+/// writes between the home and the cover is a mount point of its own now:
+/// the rename fails and the host's `~/.ssh` leads to the person's keys.
+///
+/// FAILS ON REVERT: pin only below the nearest bind in `linux_pins` and the
+/// rename succeeds.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_cover_in_a_project_inside_a_home_folder_stays_where_the_hosts_link_leads() {
+    require_bwrap();
+    for identity in [false, true] {
+        let home = tempfile::TempDir::new().unwrap();
+        let h = std::fs::canonicalize(home.path()).unwrap();
+        let between = h.join(".cache/work");
+        let p = between.join("proj");
+        let keys = p.join("keys/ssh");
+        std::fs::create_dir_all(&keys).unwrap();
+        std::fs::write(keys.join("id_test"), "CJC-J007-SSH-KEY").unwrap();
+        std::os::unix::fs::symlink(&keys, h.join(".ssh")).unwrap();
+        let script = format!(
+            "set -- '{}' '{}'; {MOVE_THE_FOLDER_BETWEEN}",
+            between.display(),
+            keys.display()
+        );
+        let output = jail_sh(identity, &h, &p, &script);
+        let out = String::from_utf8_lossy(&output.stdout);
+        let err = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "identity={identity}: {out} {err}");
+        assert!(out.contains("DONE"), "identity={identity}: {out} {err}");
+        assert!(
+            !out.contains("mv=0"),
+            "identity={identity}: the folder between moved: {out}"
+        );
+        assert!(!h.join(".cache/work-old").exists());
+        assert_eq!(std::fs::canonicalize(h.join(".ssh")).unwrap(), keys);
+        assert!(keys.join("id_test").exists());
+        assert!(
+            !keys.join("authorized_keys").exists(),
+            "identity={identity}: a file made in the jail reached the host's ~/.ssh"
+        );
+    }
+}
+
 /// M30C-2, M30C-4: the launcher's records folder is covered at
 /// `~/.local/state/innerwarden/instances`, two folders below the `~/.local`
 /// the jail binds read-write. A program in the identified jail renamed

@@ -1574,48 +1574,82 @@ pub enum PinRoot {
     Worktree,
 }
 
-/// PURE. Linux: the folders between a writable bind and a place the jail
-/// covers that the host reaches by name, each bound onto itself so it is a
-/// mount point. A mount moves with the folder it is in: a program in the
+/// What shows a host folder in a Linux jail ([`linux_pins`]): a bind that
+/// lets the jail write there (and which one, so a pin is laid right after
+/// it), a read-only bind, or a folder of the jail's own (the home's, `/tmp`
+/// and `/run`'s empty mounts), where nothing of the host can be renamed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Shows {
+    Writable(PinRoot),
+    ReadOnly,
+    Own,
+}
+
+/// PURE. Linux: every folder between the home (or the top of whatever bind
+/// shows it) and a place the jail covers that the host reaches by name,
+/// that a program in the jail could rename, each bound onto itself so it is
+/// a mount point. A mount moves with the folder it is in: a program in the
 /// jail that renamed a folder above a covered place (`~/.config/keys`
 /// above `~/.config/keys/ssh`, where `~/.ssh` leads; `~/.local/state`
-/// above the launcher's records) took the cover away with it, made a folder
-/// of its own at the old name, and the host's link led there. Linux refuses
-/// to rename or remove a mount point. Only the places the host reaches by
+/// above the launcher's records; `~/.cache/work`, above a project in it
+/// that a link leads into) took the cover away with it, made a folder of
+/// its own at the old name, and the host's link, or the launcher, read
+/// there. Linux refuses to rename or remove a mount point. A folder is
+/// looked at as the jail shows it, by the last bind laid over it: one the
+/// jail writes is pinned, one a read-only bind shows cannot be renamed, a
+/// bind is a mount point already (and the folder above it is still looked
+/// at, since a rename there would take that mount away too), and a folder
+/// of the jail's own ends the way. Only the places the host reaches by
 /// name: InnerWarden's folder where it leads and wherever the jail shows
 /// it, the launcher's records (`--identity`), the profile's hidden home
 /// paths, and every place a hidden dotdir or a `deny_read` path is covered
-/// at through a link (`linked_masks`). A place a read-only bind holds needs
-/// none (nothing there can be renamed), nor one right below its bind (the
-/// cover is the mount point), so in every common layout there is none but
-/// the records' folders.
+/// at through a link (`linked_masks`). In every common layout there is
+/// none but the records' folders.
 pub fn linux_pins(input: &JailInputs) -> Vec<(PinRoot, PathBuf)> {
-    let mut roots: Vec<(Option<PinRoot>, PathBuf)> = DOTDIR_RW
+    // In the order the jail lays them ([`build_linux_jail`]): a later one
+    // over a folder is what the jail shows there.
+    let mut binds: Vec<(Shows, PathBuf)> = LINUX_SYSTEM_SHOWN
         .iter()
-        .filter(|name| !DOTDIR_DENY.contains(name))
-        .map(|name| input.home.join(name))
-        .filter(|path| input.exists(path))
-        .map(|path| (Some(PinRoot::Home), path))
+        .map(|path| (Shows::ReadOnly, PathBuf::from(path)))
         .collect();
-    roots.push((Some(PinRoot::Project), input.args.project.clone()));
-    if let Some(worktree) = &input.worktree {
-        for dir in [&worktree.git_dir, &worktree.common_dir] {
-            roots.push((Some(PinRoot::Worktree), dir.clone()));
-        }
-    }
+    binds.extend(["/tmp", "/run"].map(|path| (Shows::Own, PathBuf::from(path))));
+    binds.push((Shows::Own, input.home.clone()));
+    binds.extend(
+        DOTDIR_RW
+            .iter()
+            .filter(|name| !DOTDIR_DENY.contains(name))
+            .map(|name| input.home.join(name))
+            .filter(|path| input.exists(path))
+            .map(|path| (Shows::Writable(PinRoot::Home), path)),
+    );
     let read_only = DOTFILE_RO
         .iter()
         .map(|name| input.home.join(name))
-        .chain(input.args.extra_ro.iter().cloned())
-        .chain(std::iter::once(input.iw_binary.clone()))
+        .filter(|path| input.exists(path))
         .chain(
             input
                 .agent_binary
                 .iter()
                 .flat_map(|bin| [bin.link.clone(), bin.target_dir.clone()]),
         )
-        .chain(LINUX_SYSTEM_SHOWN.iter().map(PathBuf::from));
-    roots.extend(read_only.map(|path| (None, path)));
+        .chain(std::iter::once(input.iw_binary.clone()))
+        .chain(input.args.extra_ro.iter().cloned());
+    binds.extend(read_only.map(|path| (Shows::ReadOnly, path)));
+    binds.push((
+        Shows::Writable(PinRoot::Project),
+        input.args.project.clone(),
+    ));
+    if let Some(worktree) = &input.worktree {
+        for dir in [&worktree.git_dir, &worktree.common_dir] {
+            binds.push((Shows::Writable(PinRoot::Worktree), dir.clone()));
+        }
+    }
+    let shown_by = |folder: &Path| {
+        binds
+            .iter()
+            .rev()
+            .find(|(_, bind)| folder.starts_with(bind))
+    };
     let mut places: Vec<&Path> = vec![input.iw_config_real.as_path()];
     places.extend(input.iw_config_shown.iter().map(PathBuf::as_path));
     if input.args.identity {
@@ -1625,23 +1659,21 @@ pub fn linux_pins(input: &JailInputs) -> Vec<(PinRoot, PathBuf)> {
     places.extend(input.linked_masks.iter().map(|mask| mask.abs.as_path()));
     let mut pins: Vec<(PinRoot, PathBuf)> = Vec::new();
     for place in places {
-        let holder = roots
-            .iter()
-            .filter(|(_, root)| place.starts_with(root) && place != root)
-            .max_by_key(|(_, root)| root.components().count());
-        let Some((Some(kind), root)) = holder else {
-            continue;
-        };
-        let mut between: Vec<PathBuf> = place
-            .ancestors()
-            .skip(1)
-            .take_while(|folder| *folder != root.as_path())
-            .map(Path::to_path_buf)
-            .collect();
-        between.reverse();
-        for folder in between {
-            if !pins.iter().any(|(_, seen)| *seen == folder) {
-                pins.push((*kind, folder));
+        for folder in place.ancestors().skip(1) {
+            let Some((shows, bind)) = shown_by(folder) else {
+                break;
+            };
+            match shows {
+                Shows::Own => break,
+                // A bind is a mount point of its own; a read-only folder
+                // cannot be renamed. The folders above are still looked at.
+                _ if bind == folder => {}
+                Shows::ReadOnly => {}
+                Shows::Writable(kind) => {
+                    if !pins.iter().any(|(_, seen)| seen == folder) {
+                        pins.push((*kind, folder.to_path_buf()));
+                    }
+                }
             }
         }
     }
@@ -9189,6 +9221,93 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    /// JAIL-PINS: a project two folders inside a home folder the jail binds
+    /// (`~/.cache/work/proj`), and `~/.ssh` a link into it. The pins started
+    /// at the nearest bind, the project's, so `~/.cache/work`, between the
+    /// `~/.cache` bind and the project's, could be renamed (measured in a
+    /// plain and an identified jail): the project's mount and the cover in
+    /// it moved with it, the folder the jail made at the old name was where
+    /// the host's `~/.ssh` led, and a planted `authorized_keys` reached it.
+    /// Every folder the jail writes between the home and the place is pinned
+    /// now, right after the bind that shows it: `~/.cache/work` after the
+    /// home folders and before the project, `keys` after the project. A
+    /// folder a read-only bind shows is never pinned; the folder above that
+    /// bind still is. macOS closes the same folders, and the project.
+    ///
+    /// FAILS ON REVERT: pin only below the nearest bind and `~/.cache/work`
+    /// is neither pinned nor a mount point.
+    #[test]
+    fn every_folder_the_jail_writes_between_the_home_and_a_cover_is_pinned() {
+        let mut nested = inputs(&["claude", "--print"]);
+        nested.args.project = PathBuf::from("/home/dev/.cache/work/proj");
+        nested.deny_paths.clear();
+        let led = "/home/dev/.cache/work/proj/keys/ssh";
+        let (linux, macos) = dotdir_plans(
+            &[place("/home/dev/.ssh", Some(led), true, true)],
+            &nested,
+            Path::to_path_buf,
+        );
+        nested.linked_masks = linux.masks;
+        nested.linked_denies = macos.denies;
+        assert_eq!(
+            linux_pins(&nested),
+            [
+                (PinRoot::Home, PathBuf::from("/home/dev/.cache/work")),
+                (
+                    PinRoot::Project,
+                    PathBuf::from("/home/dev/.cache/work/proj/keys")
+                ),
+            ]
+        );
+        let a = build_linux_jail(&nested).unwrap().bwrap_args;
+        let at = |w: &[&str]| {
+            a.windows(w.len())
+                .position(|x| x == w)
+                .unwrap_or_else(|| panic!("{w:?} in {a:?}"))
+        };
+        let cache = at(&["--bind", "/home/dev/.cache", "/home/dev/.cache"]);
+        let work = at(&["--bind", "/home/dev/.cache/work", "/home/dev/.cache/work"]);
+        let project = at(&[
+            "--bind",
+            "/home/dev/.cache/work/proj",
+            "/home/dev/.cache/work/proj",
+        ]);
+        let keys = at(&[
+            "--bind",
+            "/home/dev/.cache/work/proj/keys",
+            "/home/dev/.cache/work/proj/keys",
+        ]);
+        let cover = at(&["--tmpfs", led]);
+        assert!(
+            cache < work && work < project && project < keys && keys < cover,
+            "{a:?}"
+        );
+        // A read-only bind in between: nothing in it is pinned, and the
+        // folder above it still is.
+        let mut read_only = inputs(&["claude", "--print"]);
+        read_only.args.extra_ro = vec![PathBuf::from("/home/dev/.cache/work/ro")];
+        read_only.hide_paths = vec![mask("/home/dev/.cache/work/ro/x/y", true)];
+        assert_eq!(
+            linux_pins(&read_only),
+            [(PinRoot::Home, PathBuf::from("/home/dev/.cache/work"))]
+        );
+        // A place the jail shows only in its own empty home is nobody's to
+        // rename: nothing.
+        let mut own = inputs(&["claude", "--print"]);
+        own.hide_paths = vec![mask("/home/dev/notes/a/b", true)];
+        assert!(linux_pins(&own).is_empty());
+        let profile = build_macos_profile(&nested).unwrap().profile;
+        for folder in [
+            "/home/dev/.cache",
+            "/home/dev/.cache/work",
+            "/home/dev/.cache/work/proj",
+            "/home/dev/.cache/work/proj/keys",
+        ] {
+            let rule = format!("(deny file-write* (literal \"{folder}\"))");
+            assert!(profile.contains(&rule), "{rule}");
+        }
     }
 
     /// JAIL-PINS (macOS): the sandbox denies by path, and lets a program in
