@@ -2560,6 +2560,72 @@ fn a_dotdir_that_leads_into_the_project_is_hidden_there_and_said() {
     );
 }
 
+/// M30C-3: `~/.ssh` a folder of its own whose key and config are links
+/// into a folder the jail shows (`~/.config/dotfiles/ssh`, as GNU stow and
+/// chezmoi make one per file where `~/.ssh` is there). Only the dotdir's
+/// own entry was traced: the jail read the key there and wrote the config
+/// the host's `ssh` then ran. Each link inside is hidden where it leads now:
+/// nothing is read, and the host's config is as it was.
+///
+/// FAILS ON REVERT: drop the links inside from `never_shown_places` and
+/// the key is read and the config rewritten.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_link_inside_a_dotdir_the_jail_never_shows_is_hidden_where_it_leads() {
+    #[cfg(target_os = "linux")]
+    require_bwrap();
+    for identity in [false, cfg!(target_os = "linux")] {
+        let home = tempfile::TempDir::new().unwrap();
+        let h = std::fs::canonicalize(home.path()).unwrap();
+        let dots = h.join(".config/dotfiles/ssh");
+        std::fs::create_dir_all(&dots).unwrap();
+        std::fs::create_dir_all(h.join(".ssh")).unwrap();
+        std::fs::write(dots.join("id_test"), "CJC-J007-SSH-KEY").unwrap();
+        std::fs::write(dots.join("config"), "Host *\n").unwrap();
+        std::os::unix::fs::symlink(dots.join("id_test"), h.join(".ssh/id_test")).unwrap();
+        std::os::unix::fs::symlink(dots.join("config"), h.join(".ssh/config")).unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        let p = std::fs::canonicalize(project.path()).unwrap();
+        let script = format!(
+            "cat '{0}/id_test' 2>/dev/null; \
+             ( echo 'Match exec \"sh -c pwned\"' > '{0}/config' ) 2>/dev/null; echo DONE",
+            dots.display()
+        );
+        let mut command = cli();
+        command.arg("contain");
+        if identity {
+            command.arg("--identity");
+        }
+        command
+            .args([
+                "--project",
+                p.to_str().unwrap(),
+                "--",
+                "/bin/sh",
+                "-c",
+                &script,
+            ])
+            .env("HOME", &h)
+            .env_remove("XDG_STATE_HOME")
+            .env_remove("XDG_RUNTIME_DIR")
+            .env("IW_AD_CLI_DIRS", "");
+        let output = command.output().expect("run the jail");
+        let out = String::from_utf8_lossy(&output.stdout);
+        let err = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "identity={identity}: {out} {err}");
+        assert!(out.contains("DONE"), "identity={identity}: {out} {err}");
+        assert!(
+            !out.contains("CJC-J007-SSH-KEY"),
+            "identity={identity}: the key was read: {out}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dots.join("config")).unwrap(),
+            "Host *\n",
+            "identity={identity}: the host's ssh config was rewritten"
+        );
+    }
+}
+
 /// What a program in the jail tries on a covered place two folders below
 /// a folder it writes: rename the folder between (`$1`, to `$1-old`), make
 /// a folder of its own at the covered place's name (`$2`) and plant an

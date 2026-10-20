@@ -424,12 +424,11 @@ fn resolve_inputs(
     // folder it shows (`~/.ssh` a link to `.config/ssh`): covered there too
     // on Linux, denied where it leads on macOS. Empty in every common
     // layout. One through a link a program in the jail can change (one in
-    // `~/.config`, the project, `/tmp`) refuses the launch.
+    // `~/.config`, the project, `/tmp`) refuses the launch. And each link
+    // inside one of them that leads out of it (`~/.ssh/config` a link into
+    // `~/.local/share`), the same way.
     let mut dotdirs_linked = crate::contain::plan_linked_places(
-        &crate::contain::never_shown_home_paths(&home, facts.macos)
-            .iter()
-            .map(|path| hidden_place(path, &facts.writable, true))
-            .collect::<Vec<_>>(),
+        &never_shown_places(&home, &facts, &mut left),
         &facts,
         &[
             vec![iw_config_named.clone(), iw_config_real.clone()],
@@ -940,7 +939,89 @@ fn hidden_place(
         leads_to: at,
         there: meta.is_ok(),
         is_dir: meta.is_ok_and(|meta| meta.is_dir()),
+        inner: false,
     }
+}
+
+/// The links inside a dotdir the jail never shows (`dotdir`, as named; its
+/// own link is followed), each by the name the host reaches it by
+/// (`~/.ssh/config`), never through one of them, and whether the walk
+/// stopped short of the end ([`crate::contain::INNER_WALK_ENTRIES`],
+/// [`crate::contain::INNER_WALK_DEPTH`], a folder it cannot read). A
+/// dotdir that is not there holds none.
+fn links_inside(dotdir: &Path) -> (Vec<PathBuf>, bool) {
+    use crate::contain::{INNER_WALK_DEPTH, INNER_WALK_ENTRIES};
+    let mut links = Vec::new();
+    if !std::fs::metadata(dotdir).is_ok_and(|meta| meta.is_dir()) {
+        return (links, false);
+    }
+    let mut seen = 0usize;
+    let mut todo: Vec<(PathBuf, usize)> = vec![(dotdir.to_path_buf(), 0)];
+    while let Some((folder, depth)) = todo.pop() {
+        let Ok(entries) = std::fs::read_dir(&folder) else {
+            return (links, true);
+        };
+        for entry in entries {
+            seen += 1;
+            if seen > INNER_WALK_ENTRIES {
+                return (links, true);
+            }
+            let Ok(entry) = entry else {
+                return (links, true);
+            };
+            let Ok(kind) = entry.file_type() else {
+                return (links, true);
+            };
+            if kind.is_symlink() {
+                links.push(entry.path());
+            } else if kind.is_dir() {
+                if depth + 1 > INNER_WALK_DEPTH {
+                    return (links, true);
+                }
+                todo.push((entry.path(), depth + 1));
+            }
+        }
+    }
+    (links, false)
+}
+
+/// The places the jail hides of each dotdir it never shows
+/// ([`crate::contain::never_shown_home_paths`]): the dotdir, and each link
+/// inside one of the home's own dotdirs ([`links_inside`]) that leads out
+/// of it ([`crate::contain::HiddenPlace::inner`]). What is said of a dotdir
+/// the launcher looked in only so far is added to `left`.
+fn never_shown_places(
+    home: &Path,
+    facts: &crate::contain::PlaceFacts,
+    left: &mut Vec<String>,
+) -> Vec<crate::contain::HiddenPlace> {
+    let never_shown = crate::contain::never_shown_home_paths(home, facts.macos);
+    let mut places: Vec<crate::contain::HiddenPlace> = never_shown
+        .iter()
+        .map(|path| hidden_place(path, &facts.writable, true))
+        .collect();
+    for (dotdir, place) in never_shown.iter().zip(places.clone()) {
+        if dotdir.parent() != Some(home) {
+            continue;
+        }
+        let (links, cut) = links_inside(dotdir);
+        if cut {
+            left.push(crate::contain::left_unwalked(dotdir));
+        }
+        let within = [Some(dotdir.clone()), place.leads_to];
+        for link in links {
+            let mut found = hidden_place(&link, &facts.writable, true);
+            let stays = found
+                .leads_to
+                .as_ref()
+                .is_some_and(|to| within.iter().flatten().any(|folder| to.starts_with(folder)));
+            if !stays {
+                found.inner = true;
+                places.push(found);
+            }
+        }
+    }
+    places
 }
 
 /// Where the agent's command is on the host: as given where it names a
@@ -3920,6 +4001,81 @@ mod tests {
         let place = hidden_place(&home.join(".gnupg"), &writable, true);
         assert_eq!(place.leads_to, Some(home.join(".config/ssh-real")));
         assert!(place.there && place.is_dir);
+    }
+
+    /// M30C-3: the launcher finds every link inside a dotdir the jail
+    /// never shows, at any depth, by the name the host reaches it by, and
+    /// never walks through one (a link to a folder is one place, not a
+    /// folder to look in). Each that leads out of the dotdir is a place
+    /// the jail hides ([`crate::contain::HiddenPlace::inner`]), also inside
+    /// a dotdir that is itself a link; one that stays in it (Firefox's
+    /// `lock`, a link to a name in the same folder) is none. A dotdir
+    /// deeper than the walk goes is said.
+    ///
+    /// FAILS ON REVERT: look only at the dotdir's own entry and no link
+    /// inside is found; walk through a link and `keys/inside` is found.
+    #[cfg(unix)]
+    #[test]
+    fn the_links_inside_a_dotdir_the_jail_never_shows_are_found() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(root.path()).unwrap();
+        let dots = home.join(".config/dotfiles");
+        std::fs::create_dir_all(dots.join("keydir")).unwrap();
+        std::fs::write(dots.join("config"), "Host *\n").unwrap();
+        std::fs::write(dots.join("keydir/inside"), "").unwrap();
+        std::fs::create_dir_all(home.join(".ssh/sub")).unwrap();
+        std::fs::create_dir_all(home.join(".ssh/real")).unwrap();
+        symlink(dots.join("config"), home.join(".ssh/config")).unwrap();
+        symlink(dots.join("id"), home.join(".ssh/sub/id")).unwrap();
+        symlink("127.0.0.1:+4242", home.join(".ssh/lock")).unwrap();
+        symlink("real", home.join(".ssh/self")).unwrap();
+        symlink(dots.join("keydir"), home.join(".ssh/keys")).unwrap();
+        std::fs::create_dir_all(home.join("dots/gnupg")).unwrap();
+        symlink("dots/gnupg", home.join(".gnupg")).unwrap();
+        symlink(dots.join("gpg.conf"), home.join("dots/gnupg/gpg.conf")).unwrap();
+        let mut deep = home.join(".aws");
+        for _ in 0..=crate::contain::INNER_WALK_DEPTH {
+            deep.push("d");
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        let (mut links, cut) = links_inside(&home.join(".ssh"));
+        links.sort();
+        assert!(!cut);
+        assert_eq!(
+            links,
+            ["config", "keys", "lock", "self", "sub/id"].map(|name| home.join(".ssh").join(name))
+        );
+        assert_eq!(links_inside(&home.join(".nothing")), (Vec::new(), false));
+        let facts = crate::contain::PlaceFacts {
+            home: home.clone(),
+            writable: vec![home.join(".config")],
+            ..Default::default()
+        };
+        let mut left = Vec::new();
+        let places = never_shown_places(&home, &facts, &mut left);
+        let mut inner: Vec<PathBuf> = places
+            .iter()
+            .filter(|place| place.inner)
+            .map(|place| place.nominal.clone())
+            .collect();
+        inner.sort();
+        assert_eq!(
+            inner,
+            [
+                home.join(".gnupg/gpg.conf"),
+                home.join(".ssh/config"),
+                home.join(".ssh/keys"),
+                home.join(".ssh/sub/id"),
+            ]
+        );
+        let config = places
+            .iter()
+            .find(|place| place.nominal == home.join(".ssh/config"))
+            .unwrap();
+        assert_eq!(config.leads_to, Some(dots.join("config")));
+        assert!(config.there && !config.is_dir && config.steered_by.is_none());
+        assert_eq!(left, [crate::contain::left_unwalked(&home.join(".aws"))]);
     }
 
     /// The agent's command is where the jail's shell finds it: a path as

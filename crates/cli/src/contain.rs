@@ -479,6 +479,13 @@ pub struct HiddenPlace {
     /// `deny_read` link in the project is one. Read also where the links
     /// loop.
     pub steered_by: Option<PathBuf>,
+    /// A link found inside a dotdir the jail never shows
+    /// ([`never_shown_home_paths`]): `~/.ssh/config` a link into
+    /// `~/.local/share`, as a dotfiles manager makes one per file. Whether
+    /// the place it leads to is a file or a folder is not known before it
+    /// is made, so one that is not there yet is never made: where a Linux
+    /// jail shows it, the launch is refused ([`inner_link_to_nothing_refused`]).
+    pub inner: bool,
 }
 
 /// What the jail does with the places it hides that a link leads
@@ -814,6 +821,41 @@ fn left_needed(nominal: &Path, leads_to: &Path) -> String {
     )
 }
 
+/// Said of a dotdir the jail never shows whose links the launcher looked
+/// for only so far ([`INNER_WALK_ENTRIES`], [`INNER_WALK_DEPTH`]).
+pub fn left_unwalked(dotdir: &Path) -> String {
+    format!(
+        "{} holds more than {INNER_WALK_ENTRIES} entries, folders more than \
+         {INNER_WALK_DEPTH} deep, or a folder the launcher cannot read: the jail looked \
+         for links in it only so far, and one past them that leads where the jail shows \
+         is not hidden there",
+        printable(dotdir)
+    )
+}
+
+/// The most entries the launcher looks at inside one dotdir the jail never
+/// shows, for the links in it.
+pub const INNER_WALK_ENTRIES: usize = 100_000;
+
+/// The deepest folder the launcher looks in inside one such dotdir.
+pub const INNER_WALK_DEPTH: usize = 32;
+
+/// A link inside a dotdir the jail never shows ([`HiddenPlace::inner`])
+/// that leads to nothing yet, where a Linux jail shows that place
+/// read-write: a program in the jail could make it, and the host's `ssh`
+/// or `gpg` would read it through the link. What it should be, a file or a
+/// folder, is the person's to say, so the launch is refused.
+pub fn inner_link_to_nothing_refused(nominal: &Path, leads_to: &Path) -> ContainError {
+    ContainError::Unsupported(format!(
+        "{} is a link to {}, which is not there, in a folder a program in the jail can write: \
+         that program could make it, and the host would read it as {}. Make it (an empty file \
+         or folder), or remove the link, and start the jail again",
+        printable(nominal),
+        printable(leads_to),
+        printable(nominal)
+    ))
+}
+
 /// Said of a hidden place whose links loop.
 fn left_loop(nominal: &Path) -> String {
     format!(
@@ -938,6 +980,9 @@ pub fn plan_linked_places(
         }
         if needs {
             plan.left.push(left_needed(&place.nominal, leads_to));
+        }
+        if place.inner && !place.there && !views.is_empty() {
+            return Err(inner_link_to_nothing_refused(&place.nominal, leads_to));
         }
         if linked && !from_deny_read && views.iter().any(|view| facts.in_project(view)) {
             plan.left.push(said_in_project(&place.nominal, leads_to));
@@ -8441,6 +8486,15 @@ mod tests {
             there,
             is_dir,
             steered_by: None,
+            inner: false,
+        }
+    }
+
+    /// [`place`], a link found inside a dotdir the jail never shows.
+    fn inner(nominal: &str, leads_to: &str, there: bool, is_dir: bool) -> HiddenPlace {
+        HiddenPlace {
+            inner: true,
+            ..place(nominal, Some(leads_to), there, is_dir)
         }
     }
 
@@ -9118,6 +9172,98 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    /// M30C-3: a link inside a dotdir the jail never shows (`~/.ssh` a
+    /// folder of its own, `~/.ssh/config` and `~/.ssh/id_ed25519` links
+    /// into `~/.config/dotfiles/ssh`, as GNU stow and chezmoi make them
+    /// where `~/.ssh` is there) is hidden where it leads, as a dotdir that
+    /// is a link is: on Linux under /dev/null where the jail shows it, on
+    /// macOS denied there, the folders above it pinned. One that leads to
+    /// nothing yet is never made (a file or a folder?): where a Linux jail
+    /// shows that place, the launch is refused; where it does not, or on
+    /// macOS (the deny covers what is not there), it is not.
+    ///
+    /// FAILS ON REVERT: drop the refusal of an inner link to nothing from
+    /// `plan_linked_places` and the jail starts with the place free to make.
+    #[test]
+    fn a_link_inside_a_dotdir_the_jail_never_shows_is_hidden_where_it_leads() {
+        let mut input = inputs(&["claude", "--print"]);
+        let key = "/home/dev/.config/dotfiles/ssh/id_ed25519";
+        let config = "/home/dev/.config/dotfiles/ssh/config";
+        let places = [
+            inner("/home/dev/.ssh/id_ed25519", key, true, false),
+            inner("/home/dev/.ssh/config", config, true, false),
+        ];
+        let (linux, macos) = dotdir_plans(&places, &input, Path::to_path_buf);
+        assert_eq!(linux.masks, [mask(key, false), mask(config, false)]);
+        assert!(
+            linux.missing.is_empty() && linux.left.is_empty(),
+            "{linux:?}"
+        );
+        assert_eq!(macos.denies, paths(&[key, config]));
+        input.linked_masks = linux.masks;
+        input.linked_denies = macos.denies;
+        let a = build_linux_jail(&input).unwrap().bwrap_args;
+        assert!(a
+            .windows(3)
+            .any(|w| w[0] == "--ro-bind" && w[1] == "/dev/null" && w[2] == key));
+        assert_eq!(
+            linux_pins(&input),
+            [
+                (PinRoot::Home, PathBuf::from("/home/dev/.config/dotfiles")),
+                (
+                    PinRoot::Home,
+                    PathBuf::from("/home/dev/.config/dotfiles/ssh")
+                ),
+            ]
+        );
+        let profile = build_macos_profile(&input).unwrap().profile;
+        for rule in [
+            format!("(deny file-read* (subpath \"{key}\"))"),
+            format!("(deny file-write* (subpath \"{config}\"))"),
+            "(deny file-write* (literal \"/home/dev/.config/dotfiles/ssh\"))".to_string(),
+        ] {
+            assert!(profile.contains(&rule), "{rule}");
+        }
+        // Leads to nothing yet, where the Linux jail writes: refused.
+        let nothing = [inner("/home/dev/.ssh/config", config, false, false)];
+        let refused = plan_linked_places(
+            &nothing,
+            &facts_of(&input, false, Path::to_path_buf),
+            &[],
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(
+            refused,
+            "/home/dev/.ssh/config is a link to /home/dev/.config/dotfiles/ssh/config, which is \
+             not there, in a folder a program in the jail can write: that program could make \
+             it, and the host would read it as /home/dev/.ssh/config. Make it (an empty file or \
+             folder), or remove the link, and start the jail again"
+        );
+        let macos = plan_linked_places(
+            &nothing,
+            &facts_of(&input, true, Path::to_path_buf),
+            &[],
+            false,
+        )
+        .unwrap();
+        assert_eq!(macos.denies, paths(&[config]));
+        let elsewhere = [inner(
+            "/home/dev/.ssh/config",
+            "/srv/ssh/config",
+            false,
+            false,
+        )];
+        assert!(plan_linked_places(
+            &elsewhere,
+            &facts_of(&input, false, Path::to_path_buf),
+            &[],
+            false
+        )
+        .is_ok_and(|plan| plan.masks.is_empty()));
     }
 
     /// M30C-6: on macOS a project kept under a place of the system (a
