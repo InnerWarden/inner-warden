@@ -16,7 +16,35 @@ follows semantic versioning.
   times; only the folder itself keeps its name. A tool that renames the
   folder it works in has to run outside the jail. Where such a folder is not
   there yet (`~/.config` on an account that has none), `innerwarden contain`
-  makes it first (0700) and says so.
+  makes it first (0700) and says so. The same holds for each link on the way
+  to a profile's `hide_home` path that sits in a folder the jail may write
+  (`~/.cache/git` a link): it can no longer be removed, renamed or replaced
+  from inside the jail.
+- **On Linux a program in `innerwarden contain` can no longer rename or
+  remove a folder it writes that sits above a place the jail covers.** Each
+  such folder is now a mount point of its own, and `mv` or `rmdir` on it
+  fails with "Device or resource busy": a folder between the project and a
+  nested `--deny-read` path (`packages` and `packages/app` for `--deny-read
+  packages/app/config/.env`), a folder above a profile's read-only path
+  (`proj/third` above an `extra_ro` of `proj/third/lib`) or above a
+  profile's `hide_home` path (`~/.cache/git` above `.cache/git/credential`),
+  a folder above where a hidden dotdir or a `--deny-read` link leads
+  (`~/.config/keys` above a `~/.ssh` that leads to `~/.config/keys/ssh`),
+  and, with `--identity`, `~/.local/state` and `~/.local/state/innerwarden`.
+  The jail still writes in each of them. A tool that renames such a folder
+  has to run outside the jail. A jail started without `--identity`, with the
+  default `--deny-read` paths, no profile and no linked dotdir, has none of
+  these.
+- **On macOS a profile's read-only path (`extra_ro`) is now read-only
+  wherever it is.** Before, the macOS jail never denied writing it, so one
+  in a folder the jail may write (the project, `~/.cache`, `~/.local`,
+  `~/.config`, `/tmp`, `~/.claude.json`) was written as any other file
+  there. A tool that writes at such a path now gets "Operation not
+  permitted": with `extra_ro = ["~/.local/share/claude/versions"]` Claude
+  Code can no longer update itself in the jail, and with `extra_ro =
+  ["~/.claude.json"]` it can no longer save its settings there. Update the
+  tool outside the jail, or take the path out of `extra_ro` if the jail has
+  to write it.
 - **A program in `innerwarden contain` can no longer make a btrfs or bcachefs
   subvolume or snapshot.** It gets "Operation not permitted". A tool that
   needs one (a container runtime on btrfs, `btrfs subvolume create`) has to
@@ -114,12 +142,19 @@ follows semantic versioning.
   mount or deny pins a link, so such a launch is refused (see Upgrade
   notes). On Linux the same holds for a profile's hidden home path: the
   host's programs read the jail's folder at that name, and wrote into it
-  what the path was hidden for (a credential cache's socket, a token).
-- **A profile's read-only path inside the project stays read-only.** On
-  Linux the read-only bind of an `extra_ro` path inside the project, or a
-  worktree's folder, came before the bind of that folder, which covered it,
-  and on macOS nothing denied writing such a path: a program in the jail
-  wrote it. Each is read-only on both now, and each folder the jail writes
+  what the path was hidden for (a credential cache's socket, a token). On
+  macOS the sandbox keeps each link on the way to a profile's hidden home
+  path in place instead, also one further down a chain (`~/.local/a`, for
+  `~/.cache/git` a link to `~/.local/a/git` and `~/.local/a` a link): before,
+  a program in the jail could remove such a link and make a folder of its
+  own there, and the host's git then kept its credential cache in it.
+- **A profile's read-only path stays read-only.** On Linux the read-only
+  bind of an `extra_ro` path inside the project, or a worktree's folder,
+  came before the bind of that folder, which covered it, and on macOS
+  nothing denied writing any `extra_ro` path, so one in a folder the jail
+  may write (the project, `~/.cache`, `~/.local`, `~/.config`, `/tmp`,
+  `~/.claude.json`) was written: a program in the jail wrote it. Each is
+  read-only on both now (see Upgrade notes), and each folder the jail writes
   above a read-only path is kept in place, so the path is never moved away
   from its name.
 - **A suppression planted in the jail no longer lifts the hook's verdict.**

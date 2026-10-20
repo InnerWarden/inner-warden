@@ -673,6 +673,10 @@ mod tests {
             "Where such a folder is not there yet (`~/.config` on an account that has none), `innerwarden contain` makes it first, empty and 0700, and says so; a dry run makes nothing and names each folder a real run would make.",
             "A profile's `hide_home` path keeps its own rule, above: one that leads outside the home stops the launch.",
             "On Linux a path whose way goes through a link in a folder the jail writes (`~/.cache/git` a link, or a dotfiles manager's `~/.config/gh` link) stops the launch: a program in the jail could replace that link with a folder of its own, which your programs would then read and write at that name, so replace the link with the folder it leads to.",
+            // JP-2 completeness: macOS keeps every link on the way in place.
+            "On macOS the jail starts, and keeps each such link in place instead, also one further down a chain (`~/.local/a`, where `~/.cache/git` leads to `~/.local/a/git` and `~/.local/a` is a link too): no program in the jail can remove, rename or replace it.",
+            // A profile's read-only path on macOS, wherever it is.
+            "A profile's read-only path (`extra_ro`) is read-only in every jail, wherever it is. On macOS the sandbox denies writing it also inside a folder the jail may write",
         ] {
             assert!(readme.contains(said), "README lacks {said:?}");
         }
@@ -694,6 +698,12 @@ mod tests {
             "So does, on Linux, a profile's `hide_home` path whose way goes through such a link (`~/.cache/git` a link, or a dotfiles manager's `~/.config/gh` link): replace that link with the folder it leads to.",
             "On Linux the same holds for a profile's hidden home path: the host's programs read the jail's folder at that name, and wrote into it what the path was hidden for (a credential cache's socket, a token).",
             "the launcher looks for such links as far as 100000 entries and 32 folders deep, and says where it stops short.",
+            // The upgrade notes name what no longer moves on Linux, and
+            // what a macOS read-only path now refuses.
+            "On Linux a program in `innerwarden contain` can no longer rename or remove a folder it writes that sits above a place the jail covers.",
+            "fails with \"Device or resource busy\"",
+            "On macOS a profile's read-only path (`extra_ro`) is now read-only wherever it is.",
+            "On macOS the sandbox keeps each link on the way to a profile's hidden home path in place instead, also one further down a chain",
         ] {
             assert!(changelog.contains(said), "CHANGELOG lacks {said:?}");
         }

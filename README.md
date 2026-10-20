@@ -230,7 +230,11 @@ what of the home it hides, under `[profile.<type>.jail]`:
   writes (`~/.cache/git` a link, or a dotfiles manager's `~/.config/gh`
   link) stops the launch: a program in the jail could replace that link with
   a folder of its own, which your programs would then read and write at that
-  name, so replace the link with the folder it leads to. On Linux a path
+  name, so replace the link with the folder it leads to. On macOS the jail
+  starts, and keeps each such link in place instead, also one further down
+  a chain (`~/.local/a`, where `~/.cache/git` leads to `~/.local/a/git` and
+  `~/.local/a` is a link too): no program in the jail can remove, rename or
+  replace it. On Linux a path
   that is not there yet, in a folder the jail writes,
   is made empty (mode 0700) first, so what a program makes there later stays
   hidden too. Each folder the jail writes between such a path and your home
@@ -264,6 +268,15 @@ folder itself is refused. Where such a folder is not there yet (`~/.config`
 on an account that has none), `innerwarden contain` makes it first, empty and
 0700, and says so; a dry run makes nothing and names each folder a real run
 would make.
+
+A profile's read-only path (`extra_ro`) is read-only in every jail, wherever
+it is. On macOS the sandbox denies writing it also inside a folder the jail
+may write (the project, `~/.cache`, `~/.local`, `~/.config`, `/tmp`,
+`~/.claude.json`); before, the macOS jail never denied it, so a program in
+the jail wrote it. A tool that has to write at such a path (Claude Code
+updating itself in `~/.local/share/claude/versions`) gets "Operation not
+permitted" there: update it outside the jail, or leave that path out of
+`extra_ro`.
 
 Where a place the jail hides is a link, the jail hides the place it leads
 to: `~/.ssh`, `~/.gnupg` or `~/.aws` kept as a link into a folder the jail
