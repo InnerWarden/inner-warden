@@ -360,7 +360,7 @@ pub fn plan_hidden_home(
             return Err(ContainError::Unsupported(format!(
                 "the hidden home path '{}' goes through a link that leads to nothing: \
                  remove the link, or name the path it should lead to in hide_home",
-                path.nominal.display()
+                printable(&path.nominal)
             )));
         }
         let leads_to = path.real.as_ref().unwrap_or(&path.resolved);
@@ -370,8 +370,8 @@ pub fn plan_hidden_home(
             return Err(ContainError::Unsupported(format!(
                 "the hidden home path '{}' leads to '{}', outside the home: name a path \
                  inside the home in hide_home, or remove the link",
-                path.nominal.display(),
-                leads_to.display()
+                printable(&path.nominal),
+                printable(leads_to)
             )));
         }
         deny(&path.nominal, &mut plan);
@@ -1410,8 +1410,8 @@ pub fn validate_jail_inputs(input: &JailInputs) -> Result<(), ContainError> {
         if let Some(hidden) = covered {
             return Err(ContainError::Unsupported(format!(
                 "the hidden home path '{}' holds {what} '{}'",
-                hidden.display(),
-                path.display()
+                printable(hidden),
+                printable(&path)
             )));
         }
     }
@@ -1459,7 +1459,7 @@ fn validate_sealed(input: &JailInputs) -> Result<(), ContainError> {
         {
             return Err(ContainError::Unsupported(format!(
                 "unsafe {kind} path '{}' for --identity: it overlaps {sealed}, which the jail keeps closed",
-                path.display()
+                printable(path)
             )));
         }
     }
@@ -8992,6 +8992,51 @@ mod tests {
         }
         assert!(left_loop(Path::new("/a\u{7}b")).starts_with("/a\\u{7}b is a link"));
         assert_eq!(printable(Path::new("/home/dev/ü é")), "/home/dev/ü é");
+        // M30C-7: the refusals print the names they hold the same way. A
+        // `hide_home` path the agent links out of the home (`/srv/w` its
+        // project), one through a link to nothing, one that holds what the
+        // jail needs, and a worktree over a sealed tree.
+        let planted = "/srv/w/\u{1b}[2K\rok";
+        let hidden = |real: Option<&str>, dangling: bool| HiddenHomePath {
+            nominal: PathBuf::from("/home/dev/.cache/x\u{1b}[8m"),
+            real: real.map(PathBuf::from),
+            resolved: PathBuf::from(real.unwrap_or(planted)),
+            is_dir: true,
+            dangling_link: dangling,
+        };
+        let mut refusals: Vec<String> = [hidden(Some(planted), false), hidden(None, true)]
+            .into_iter()
+            .map(|path| {
+                plan_hidden_home(&[path], Path::new("/home/dev"), &[])
+                    .unwrap_err()
+                    .to_string()
+            })
+            .collect();
+        let mut holds = inputs(&["claude", "--print"]);
+        holds.args.project = PathBuf::from("/home/dev/.cache/x\u{1b}[8m/p\u{202e}");
+        holds.hide_denies = vec![PathBuf::from("/home/dev/.cache/x\u{1b}[8m")];
+        refusals.push(validate_jail_inputs(&holds).unwrap_err().to_string());
+        let mut sealed = inputs(&["claude", "--print"]);
+        sealed.args.identity = true;
+        sealed.worktree = Some(Worktree {
+            git_dir: PathBuf::from("/run/\u{1b}[2Kok"),
+            common_dir: PathBuf::from("/run/\u{1b}[2Kok"),
+        });
+        refusals.push(validate_jail_inputs(&sealed).unwrap_err().to_string());
+        for refusal in &refusals {
+            assert!(
+                !refusal.chars().any(|c| c.is_control() || c == '\u{202e}'),
+                "{refusal:?}"
+            );
+            assert!(refusal.contains("\\u{1b}"), "{refusal:?}");
+        }
+        assert!(refusals[0].contains("leads to '/srv/w/\\u{1b}[2K\\u{d}ok'"));
+        assert!(
+            refusals[2].contains("holds the project"),
+            "{:?}",
+            refusals[2]
+        );
+        assert!(refusals[3].contains("for --identity"), "{:?}", refusals[3]);
     }
 
     /// M30-R1, M30-TL-1: InnerWarden's folder that is itself a link (a
