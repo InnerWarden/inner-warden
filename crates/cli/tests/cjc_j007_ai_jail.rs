@@ -2975,12 +2975,20 @@ fn on_macos_the_launcher_makes_a_missing_config_folder_before_the_sandbox() {
         "{}",
         String::from_utf8_lossy(&dry.stderr)
     );
+    let dry_out = String::from_utf8_lossy(&dry.stdout);
     assert!(
-        String::from_utf8_lossy(&dry.stdout).contains(&format!(
-            "(deny file-write* (literal \"{}\"))",
+        dry_out.contains(&format!(
+            "(deny file-write-unlink file-write-create (literal \"{}\"))",
             h.join(".config").display()
         )),
-        "the profile closes ~/.config"
+        "the profile closes ~/.config: {dry_out}"
+    );
+    assert!(
+        dry_out.contains(&format!(
+            "# would make {} (empty, 0700) before the sandbox starts",
+            h.join(".config").display()
+        )),
+        "a dry run names the folder a real run makes: {dry_out}"
     );
     assert!(!h.join(".config").exists(), "a dry run made ~/.config");
     let script = "mkdir -p \"$HOME/.config/app\" && echo in > \"$HOME/.config/app/x\" \
@@ -3003,10 +3011,159 @@ fn on_macos_the_launcher_makes_a_missing_config_folder_before_the_sandbox() {
     let err = String::from_utf8_lossy(&output.stderr);
     assert!(out.contains("WROTE"), "{out} {err}");
     assert!(out.contains("mv=") && !out.contains("mv=0"), "{out}");
+    // F2: the person is told of each folder made in their home.
+    assert!(
+        err.contains(&format!(
+            "innerwarden contain: made {} (empty, 0700)",
+            h.join(".config").display()
+        )),
+        "the folder made is said: {err}"
+    );
     let config = std::fs::symlink_metadata(h.join(".config")).unwrap();
     assert!(config.is_dir());
     assert_eq!(config.permissions().mode() & 0o777, 0o700);
     assert!(h.join(".config/app/x").exists() && !h.join(".config-old").exists());
+    // Made once: a later run makes nothing, and says nothing of it.
+    let again = cli()
+        .args(["contain", "--project", p.to_str().unwrap(), "--", "true"])
+        .env("HOME", &h)
+        .output()
+        .expect("run the macOS jail again");
+    let again_err = String::from_utf8_lossy(&again.stderr);
+    assert!(!again_err.contains(": made "), "{again_err}");
+}
+
+/// F2 (JAIL-PINS fixes): the launcher makes each folder the sandbox keeps
+/// in place that is not there yet, not only `~/.config`: here the folder
+/// above where `~/.ssh` leads (`~/.cache/keys`, a link to
+/// `~/.cache/keys/ssh` that is not there). Each is said on a real run and
+/// named by a dry run, so no folder appears in the person's home unsaid.
+///
+/// FAILS ON REVERT: drop the line `made_before_the_sandbox` prints and the
+/// folder is made without a word.
+#[cfg(target_os = "macos")]
+#[test]
+fn on_macos_every_folder_the_launcher_makes_is_said() {
+    let home = tempfile::TempDir::new().unwrap();
+    let h = std::fs::canonicalize(home.path()).unwrap();
+    std::fs::create_dir_all(h.join(".config")).unwrap();
+    std::fs::create_dir_all(h.join(".cache")).unwrap();
+    std::os::unix::fs::symlink(h.join(".cache/keys/ssh"), h.join(".ssh")).unwrap();
+    let project = tempfile::TempDir::new().unwrap();
+    let p = std::fs::canonicalize(project.path()).unwrap();
+    let made = h.join(".cache/keys");
+    let dry = cli()
+        .args([
+            "contain",
+            "--dry-run",
+            "--project",
+            p.to_str().unwrap(),
+            "--",
+            "true",
+        ])
+        .env("HOME", &h)
+        .output()
+        .expect("dry run");
+    let dry_out = String::from_utf8_lossy(&dry.stdout);
+    assert!(
+        dry_out.contains(&format!(
+            "# would make {} (empty, 0700) before the sandbox starts",
+            made.display()
+        )),
+        "{dry_out}"
+    );
+    assert!(!made.exists(), "a dry run made {}", made.display());
+    let output = cli()
+        .args(["contain", "--project", p.to_str().unwrap(), "--", "true"])
+        .env("HOME", &h)
+        .output()
+        .expect("run the macOS jail");
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{err}");
+    assert!(made.is_dir(), "{err}");
+    assert!(
+        err.contains(&format!(
+            "innerwarden contain: made {} (empty, 0700)",
+            made.display()
+        )),
+        "the folder made is said: {err}"
+    );
+}
+
+/// F1 (JAIL-PINS fixes): the rule that keeps the project and `~/.config` in
+/// place denied all of writing them as themselves, so inside every macOS
+/// jail both read as not writable (`[ -w . ]` false, `access(W_OK)`
+/// EPERM: `create-next-app` refused "The application path is not
+/// writable"), and `touch`, `cp -a`, `rsync -a` and `tar -x` into the
+/// project failed on its mode and times. The rule now refuses only a
+/// rename, a removal or a replacement: all of those work, and the folders
+/// still cannot move.
+///
+/// FAILS ON REVERT: deny `file-write*` again in `macos_pin_rule` and the
+/// project and `~/.config` read as not writable and `cp -a` fails.
+#[cfg(target_os = "macos")]
+#[test]
+fn on_macos_a_folder_kept_in_place_still_reads_as_writable() {
+    let home = tempfile::TempDir::new().unwrap();
+    let h = std::fs::canonicalize(home.path()).unwrap();
+    std::fs::create_dir_all(h.join(".config")).unwrap();
+    let project = tempfile::TempDir::new().unwrap();
+    let p = std::fs::canonicalize(project.path()).unwrap();
+    let outside = tempfile::TempDir::new().unwrap();
+    let x = std::fs::canonicalize(outside.path()).unwrap();
+    std::fs::create_dir_all(x.join("src/a")).unwrap();
+    std::fs::write(x.join("src/a/f"), "from-src").unwrap();
+    let script = format!(
+        "set -- '{h}' '{p}' '{x}'; \
+         [ -w \"$2\" ] && echo PROJECT-W; \
+         [ -w \"$1/.config\" ] && echo CONFIG-W; \
+         cd \"$2\" && [ -w . ] && echo DOT-W; \
+         touch \"$2\" && echo TOUCH; \
+         chmod 755 \"$2\" && echo CHMOD; \
+         cp -a \"$3/src/.\" \"$2/\" && echo CP-A; \
+         rsync -a \"$3/src/\" \"$2/\" && echo RSYNC; \
+         tar -C \"$3/src\" -cf \"$3/t.tar\" . && tar -C \"$2\" -xf \"$3/t.tar\" && echo TAR; \
+         mv \"$2\" \"$3/moved\" 2>/dev/null; echo \"project=$?\"; \
+         mv \"$1/.config\" \"$1/.config-old\" 2>/dev/null; echo \"config=$?\"; \
+         echo DONE",
+        h = h.display(),
+        p = p.display(),
+        x = x.display()
+    );
+    let output = cli()
+        .args([
+            "contain",
+            "--project",
+            p.to_str().unwrap(),
+            "--",
+            "/bin/sh",
+            "-c",
+            &script,
+        ])
+        .env("HOME", &h)
+        .output()
+        .expect("run the macOS jail");
+    let out = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(out.contains("DONE"), "{out} {err}");
+    for said in [
+        "PROJECT-W",
+        "CONFIG-W",
+        "DOT-W",
+        "TOUCH",
+        "CHMOD",
+        "CP-A",
+        "RSYNC",
+        "TAR",
+    ] {
+        assert!(out.contains(said), "{said} missing: {out} {err}");
+    }
+    assert!(
+        !out.contains("project=0") && !out.contains("config=0"),
+        "a folder kept in place moved: {out}"
+    );
+    assert!(!x.join("moved").exists() && !h.join(".config-old").exists());
+    assert_eq!(std::fs::read_to_string(p.join("a/f")).unwrap(), "from-src");
 }
 
 /// M30-SEC-2: a worktree the project's `.git` names (a file the agent

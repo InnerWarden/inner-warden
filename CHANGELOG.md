@@ -8,11 +8,15 @@ follows semantic versioning.
 ### Upgrade notes: what to do
 
 - **On macOS a program in `innerwarden contain` can no longer rename, remove
-  or change the project folder itself, `~/.config`, or a folder between the
-  project and a `--deny-read` path.** It still writes in them; only the
-  folder itself keeps its name, mode and times. A tool that renames the
-  folder it works in has to run outside the jail. Where `~/.config` is not
-  there yet, `innerwarden contain` makes it first (0700).
+  or replace the project folder itself, `~/.config`, a folder between the
+  project and a `--deny-read` path, or any other folder the jail may write
+  above a place it hides (`~/.cache` or `/tmp` above a project there that
+  holds a `--deny-read` path).**
+  It still writes in them, finds them writable and sets their mode and
+  times; only the folder itself keeps its name. A tool that renames the
+  folder it works in has to run outside the jail. Where such a folder is not
+  there yet (`~/.config` on an account that has none), `innerwarden contain`
+  makes it first (0700) and says so.
 - **A program in `innerwarden contain` can no longer make a btrfs or bcachefs
   subvolume or snapshot.** It gets "Operation not permitted". A tool that
   needs one (a container runtime on btrfs, `btrfs subvolume create`) has to

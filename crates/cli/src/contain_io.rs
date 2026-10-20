@@ -2776,17 +2776,38 @@ fn read_info(reader: &mut std::io::PipeReader) -> InfoRead {
     }
 }
 
-/// The real run of a macOS jail, after every check: each folder the sandbox
-/// closes as itself ([`crate::contain::macos_pins`]) that is not there yet,
-/// `~/.config` on an account that has none, is made, empty and 0700, as a
-/// folder of the person's ([`make_place`]). The sandbox refuses to make it,
-/// so the jail never has to, and none of its programs can put a link of its
-/// own at that name. One that cannot be made is said: no program in the
-/// jail can make it either. A dry run makes nothing.
+/// Each folder the macOS sandbox keeps in place as itself
+/// ([`crate::contain::macos_pins`]) that is not there yet: `~/.config` on an
+/// account that has none, and any folder above a place the jail hides that
+/// it may write (a folder above where a hidden dotdir leads, or above a
+/// profile's hidden home path). Parents before the folders in them.
+fn macos_pins_missing(input: &JailInputs) -> Vec<PathBuf> {
+    crate::contain::macos_pins(input)
+        .into_iter()
+        .filter(|folder| std::fs::symlink_metadata(folder).is_err())
+        .collect()
+}
+
+/// The real run of a macOS jail, after every check: each folder of
+/// [`macos_pins_missing`] is made, empty and 0700, as a folder of the
+/// person's ([`make_place`]), and said, so no folder appears in the home
+/// without a word. The sandbox refuses to make it, so the jail never has
+/// to, and none of its programs can put a link of its own at that name. One
+/// that cannot be made is said too: no program in the jail can make it
+/// either. A dry run makes nothing and names each.
 #[cfg(target_os = "macos")]
 fn made_before_the_sandbox(input: &JailInputs) {
-    for folder in crate::contain::macos_pins(input) {
-        if std::fs::symlink_metadata(&folder).is_err() && !make_place(&folder) {
+    for folder in macos_pins_missing(input) {
+        if std::fs::symlink_metadata(&folder).is_ok() {
+            // Made already, with a folder below it.
+            continue;
+        }
+        if make_place(&folder) {
+            eprintln!(
+                "innerwarden contain: made {} (empty, 0700), a folder the jail writes in but cannot rename or remove",
+                crate::contain::printable(&folder)
+            );
+        } else {
             eprintln!(
                 "innerwarden contain: {} is not there and could not be made; no program in the jail can make it either",
                 crate::contain::printable(&folder)
@@ -2811,6 +2832,13 @@ fn run_macos(input: &JailInputs) -> ExitCode {
         print_plan_env(&plan.env);
         println!("# --- sandbox profile ---");
         println!("{}", plan.profile);
+        // What a real run would make in the home; a dry run makes nothing.
+        for folder in macos_pins_missing(input) {
+            println!(
+                "# would make {} (empty, 0700) before the sandbox starts",
+                crate::contain::printable(&folder)
+            );
+        }
         println!("# --- argv ---");
         println!(
             "/usr/bin/sandbox-exec -p <profile> -- {}",

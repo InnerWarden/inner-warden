@@ -249,10 +249,16 @@ On macOS every jail keeps in place the folders above what it hides: the
 project, `~/.config` (which holds InnerWarden's own folder) and each folder
 between the project and a `--deny-read` path cannot be renamed, removed or
 replaced by a link from inside the jail, so nothing it hides is shown at
-another name. The jail still writes in them; only the folder itself cannot be
-changed (its mode or times). Where `~/.config` is not there yet,
-`innerwarden contain` makes it first, empty and 0700; a dry run makes
-nothing.
+another name. So is every other folder the jail may write above a place it
+hides: `~/.cache` or `/tmp` above a project there that holds a `--deny-read`
+path, or a folder above where a hidden dotdir or a profile's hidden home path
+leads. The jail still
+writes in them, finds them writable and sets their mode and times (`rsync -a`
+or `cp -a` into the project works); only renaming, removing or replacing the
+folder itself is refused. Where such a folder is not there yet (`~/.config`
+on an account that has none), `innerwarden contain` makes it first, empty and
+0700, and says so; a dry run makes nothing and names each folder a real run
+would make.
 
 Where a place the jail hides is a link, the jail hides the place it leads
 to: `~/.ssh`, `~/.gnupg` or `~/.aws` kept as a link into a folder the jail
