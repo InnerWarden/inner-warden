@@ -2214,6 +2214,65 @@ pub fn runtime_versions_dir(agent_type: &str) -> Option<&'static str> {
     }
 }
 
+/// The dotdirs under a home that a Linux jail of `innerwarden contain`
+/// never binds, so never shows: they hold keys, cloud credentials and mail.
+/// A macOS jail denies only [`JAIL_HIDDEN_MACOS_DOTDIRS`] of them.
+pub const JAIL_HIDDEN_DOTDIRS: &[&str] = &[".ssh", ".gnupg", ".aws", ".mozilla", ".thunderbird"];
+
+/// The dotdirs under a home that a macOS jail's sandbox denies reading. It
+/// lets the agent read everywhere else, so a macOS jail shows `~/.mozilla`
+/// and `~/.thunderbird` (where Firefox and Thunderbird keep nothing on
+/// macOS: their profiles are in `~/Library`).
+pub const JAIL_HIDDEN_MACOS_DOTDIRS: &[&str] = &[".ssh", ".aws", ".gnupg"];
+
+/// InnerWarden's own folder under a home, which no jail ever shows: it
+/// holds the person's key and settings.
+pub const JAIL_HIDDEN_CONFIG_DIR: &str = ".config/innerwarden";
+
+/// The folders under a macOS home that a macOS jail denies reading: the
+/// person's mail, messages and browser data.
+pub const JAIL_HIDDEN_MACOS_HOME: &[&str] = &["Library/Mail", "Library/Messages", "Library/Safari"];
+
+/// The places under `home` that a jail of `innerwarden contain` hides by
+/// name, on macOS (`macos`) or Linux, each joined to `home`. Linux: each of
+/// [`JAIL_HIDDEN_DOTDIRS`] and [`JAIL_HIDDEN_CONFIG_DIR`] (the jail's home
+/// is an empty folder of its own, so it shows no other folder of the home
+/// unless it binds it, and these it never binds). macOS: each of
+/// [`JAIL_HIDDEN_MACOS_DOTDIRS`], [`JAIL_HIDDEN_CONFIG_DIR`] and
+/// [`JAIL_HIDDEN_MACOS_HOME`]; the sandbox lets the agent read everywhere
+/// else. Where a link there leads is the launcher's to find on the host,
+/// and it hides that place too. Read this list rather than keep a copy of
+/// it: a copy goes stale.
+pub fn jail_hides_on(home: &std::path::Path, macos: bool) -> Vec<std::path::PathBuf> {
+    let (dotdirs, more): (&[&str], &[&str]) = if macos {
+        (JAIL_HIDDEN_MACOS_DOTDIRS, JAIL_HIDDEN_MACOS_HOME)
+    } else {
+        (JAIL_HIDDEN_DOTDIRS, &[])
+    };
+    dotdirs
+        .iter()
+        .chain(std::iter::once(&JAIL_HIDDEN_CONFIG_DIR))
+        .chain(more)
+        .map(|name| home.join(name))
+        .collect()
+}
+
+/// Every place under `home` that [`jail_hides_on`] names on either OS,
+/// each once, joined to `home` as named: [`JAIL_HIDDEN_DOTDIRS`],
+/// [`JAIL_HIDDEN_CONFIG_DIR`] and [`JAIL_HIDDEN_MACOS_HOME`]. These are the
+/// places no project or worktree of a jail may overlap, on any OS (on macOS
+/// that is stricter than what its jail hides: it shows `~/.mozilla` and
+/// `~/.thunderbird`). It is not what a jail of one OS hides: that is
+/// [`jail_hides_on`].
+pub fn jail_never_shows(home: &std::path::Path) -> Vec<std::path::PathBuf> {
+    JAIL_HIDDEN_DOTDIRS
+        .iter()
+        .chain(std::iter::once(&JAIL_HIDDEN_CONFIG_DIR))
+        .chain(JAIL_HIDDEN_MACOS_HOME)
+        .map(|name| home.join(name))
+        .collect()
+}
+
 /// A list of a profile's jail table that [`set_jail_path`] edits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JailList {
@@ -2350,6 +2409,92 @@ mod tests {
 
     fn file(text: &str) -> ProfilesFile {
         toml::from_str(text).expect("parses")
+    }
+
+    /// The places a jail never shows, as another product reads them: each
+    /// dotdir that holds keys or mail, InnerWarden's own folder and the
+    /// macOS mail, messages and browser folders, each under the home given,
+    /// each once.
+    ///
+    /// FAILS ON REVERT: drop a name from one of the three lists and that
+    /// place is missing here.
+    #[test]
+    fn the_places_a_jail_never_shows_are_named_under_the_home() {
+        let home = std::path::Path::new("/home/dev");
+        let places = jail_never_shows(home);
+        let want: Vec<std::path::PathBuf> = [
+            ".ssh",
+            ".gnupg",
+            ".aws",
+            ".mozilla",
+            ".thunderbird",
+            ".config/innerwarden",
+            "Library/Mail",
+            "Library/Messages",
+            "Library/Safari",
+        ]
+        .iter()
+        .map(|name| home.join(name))
+        .collect();
+        assert_eq!(places, want);
+        assert_eq!(
+            home.join(JAIL_HIDDEN_CONFIG_DIR),
+            home.join(".config").join("innerwarden")
+        );
+    }
+
+    /// What a jail of each OS hides by name, as another product reads it: a
+    /// Linux jail never binds any of the dotdirs; a macOS jail's sandbox
+    /// denies `.ssh`, `.aws`, `.gnupg` and the three Library folders, and
+    /// shows `~/.mozilla` and `~/.thunderbird`. Every place either names is
+    /// in the list no project may overlap.
+    ///
+    /// FAILS ON REVERT: name `~/.mozilla` among what a macOS jail hides (the
+    /// one list for both OSes, as before) and the macOS list holds it.
+    #[test]
+    fn what_a_jail_hides_is_named_for_each_os() {
+        let home = std::path::Path::new("/home/dev");
+        let names = |places: Vec<std::path::PathBuf>| -> Vec<String> {
+            places
+                .iter()
+                .map(|place| {
+                    place
+                        .strip_prefix(home)
+                        .unwrap()
+                        .to_string_lossy()
+                        .to_string()
+                })
+                .collect()
+        };
+        assert_eq!(
+            names(jail_hides_on(home, false)),
+            [
+                ".ssh",
+                ".gnupg",
+                ".aws",
+                ".mozilla",
+                ".thunderbird",
+                ".config/innerwarden"
+            ]
+        );
+        assert_eq!(
+            names(jail_hides_on(home, true)),
+            [
+                ".ssh",
+                ".aws",
+                ".gnupg",
+                ".config/innerwarden",
+                "Library/Mail",
+                "Library/Messages",
+                "Library/Safari"
+            ]
+        );
+        let all = jail_never_shows(home);
+        for macos in [false, true] {
+            for place in jail_hides_on(home, macos) {
+                assert!(all.contains(&place), "{place:?}");
+            }
+        }
     }
 
     fn profile(allow: &[&str], deny: &[&str]) -> AgentProfile {

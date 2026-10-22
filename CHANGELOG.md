@@ -7,6 +7,83 @@ follows semantic versioning.
 
 ### Upgrade notes: what to do
 
+- **A profile's read-only path (`extra_ro`) through a link stays read-only
+  where it leads.** `innerwarden contain --identity` follows your own links
+  in such a path (in folders no jail writes: `~/code` or `~/.local` kept on
+  another disk) and lays the path where the jail shows the folder it leads
+  to. A link in a folder a jail writes (`~/.local/share/demo`, which a
+  program in an earlier jail could have made) is followed only to a place
+  the jail shows already, and the start says on one line that the link
+  itself is not held ("... is a link in a folder a program in the jail can
+  write: the jail keeps <where it leads>, where it leads, read-only, but
+  that program could replace the link; ..."): replace the link with the
+  folder it leads to. Such a link to a place the jail shows nothing else of
+  is not followed: the path is left out, said ("... the jail does not
+  follow it, and starts without the extra path; list the real folder
+  instead"). On macOS nothing of this is left out: the path is denied
+  writing as named and where it leads. On Linux, where `bwrap` cannot bind
+  a folder from a descriptor (its `--help` lists no `--ro-bind-fd`: upstream
+  bubblewrap before 0.10.0, or a distribution's package without the security
+  update that added it; the current packages of Debian 12, Ubuntu 22.04 and
+  24.04, and RHEL 9 have it), a read-only path in a folder a jail writes
+  (`<project>/vendor`, `~/.local/share/claude/versions`) is left out and said
+  ("... does not make it read-only; bubblewrap 0.10.0 or later, ... keeps
+  it"): the jail shows it and its programs can write it, where 1.5.5 laid it
+  read-only by name. Update bubblewrap to keep it. A profile with
+  `start = "only_when_admitted"` does not start there: the launch stops,
+  names each such path and says what to do. A read-only path in a place the
+  jail hides (on Linux `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.mozilla`,
+  `~/.thunderbird` and InnerWarden's own
+  folder; on macOS `~/.ssh`, `~/.gnupg`, `~/.aws`, InnerWarden's own folder,
+  `~/Library/Mail`, `~/Library/Messages` and `~/Library/Safari`; or where one
+  of them leads), under a profile's `hide_home` path, your home or a folder
+  above it, or with `--identity` `/run` or `/sys`, used to stop the launch:
+  it is left out now, said on one line, and the jail starts without it. One
+  that holds such a place where the jail shows it already (`~/.config`,
+  which holds InnerWarden's own folder) is laid read-only, and the place
+  stays hidden; on Linux one that holds such a place where the jail shows
+  nothing else of it is left out.
+- **A project whose `.git` file names a folder that does not name the
+  project back is no worktree in `innerwarden contain`.** The jail shows a
+  linked worktree's git folders only where git made them for this project:
+  the worktree's git folder names this project's `.git` file back and sits
+  in the `worktrees` folder of its repository, or (a submodule) its config
+  names this project as its work tree; the repository is a git folder
+  (`HEAD`, `objects`, `refs`); both belong to you; no link is on the way to
+  either; and neither is your home, a folder above it, a place the jail
+  hides, or in a hidden folder of your home that the jail does not show on
+  Linux and lets no program write on macOS (`~/.kube`, `~/.docker`,
+  `~/.password-store`, `~/.dotfiles`). Every folder
+  on the way is there: a path through a folder that is not there and back
+  (`nx/../L`) names none. Any other `.git` file is left alone, the start
+  says why on one line, the jail starts, and git in a Linux jail sees no
+  repository there, while git in a macOS jail cannot commit there (it may
+  still read it). A worktree whose repository you keep in a hidden folder
+  of your home that the jail does not show on Linux and lets no program
+  write on macOS (`~/.dotfiles`; `~/.config`, `~/.local` and the other
+  folders every jail shows writable are fine: the jail shows a repository
+  there through that folder, and binds nothing more for it), or reach
+  through a link, is not shown either: keep the repository elsewhere, or
+  name it by its real path (`git worktree repair`). A worktree whose folder
+  lies over the place InnerWarden's own folder, a hidden dotdir or a link
+  inside one leads to is left out the same way, with one line, and the jail
+  starts. A worktree moved by hand needs `git worktree repair` first. A
+  repository made with `--separate-git-dir` (`git init` or `git clone`, the
+  layout of dotfile managers such as yadm and vcsh) keeps nothing that names
+  the project back, so it is not shown either, where 1.5.5 showed it (one in
+  a folder the jail shows anyway, such as `~/.local/share`, still works):
+  move its git folder into the project in place of the `.git` file, or work
+  in a linked worktree (`git worktree add`).
+- **The command line of a running jail's bubblewrap changed.** An
+  identified jail's (`--identity`) now starts with its seccomp filter
+  (`--seccomp <fd>`), before every other option. Where bwrap binds a place
+  from a descriptor (bubblewrap 0.10.0 or later, or a package with the
+  security update that added it), the real run of any jail binds the
+  folders it pins, a profile's read-only paths and a worktree's git folders
+  with `--bind-fd <fd> <place>` and `--ro-bind-fd <fd> <place>` instead of
+  `--bind` and `--ro-bind-try` by name; a dry run still names each by its
+  host folder. A tool that reads a jail's command line (from `/proc`) has
+  to know those options.
 - **On macOS a program in `innerwarden contain` can no longer rename, remove
   or replace the project folder itself, `~/.config`, a folder between the
   project and a `--deny-read` path, or any other folder the jail may write
@@ -69,6 +146,50 @@ follows semantic versioning.
 
 ### Security
 
+- **A profile's read-only path never shows where a link a jail can change
+  leads.** `innerwarden contain --identity` took each read-only path of a
+  profile (`extra_ro`) where its links led. A program in an earlier jail
+  that replaced that path, or a folder on the way to it, with a link (it
+  can, in `~/.local`) made the next Linux jail show the place the link led
+  to: a folder of your home the jail hides, or the host's `/tmp` and the
+  sockets in it (a terminal multiplexer's, the display's), a way out of the
+  jail. A link in a folder a jail writes is now followed only to a place the
+  jail shows already, and the real Linux run binds each read-only path, and
+  each folder it pins above one, from a descriptor it opens just before
+  bwrap starts, one folder at a time with no link a program in a jail can
+  change followed: a link put there after the launcher looked is never what
+  the jail shows, and a place that changed so stops the launch. Measured
+  before: a link swapped in while the launcher waited on the project's git
+  files showed the host's `/tmp` in the next identified jail, and `tmux`
+  there ran commands outside it. The launcher no longer waits on a file a
+  program in the jail can write: it read the project's `.git` file and the
+  `commondir` it names with a blocking read, so a FIFO there held it for as
+  long as that program liked.
+- **A program in `innerwarden contain` can no longer have the next jail
+  show a folder of your home writable.** The jail binds a linked worktree's
+  git folders read-write, and took them from the project's `.git` file,
+  which the agent writes: `gitdir: ~/.kube` (or `~/.docker`,
+  `~/.password-store`, another repository, `~/bin`, `~/.bashrc`, or on
+  macOS `~/Library/LaunchAgents`) made the next jail in that project, with
+  or without `--identity`, show that place writable: the agent read and
+  changed what is there, and could run code outside the jail the next time
+  you use it. Git's own files there were no proof either: a project in a
+  folder named `worktrees` whose `.git` named the project itself made the
+  folder two above it (`~/code`, with every repository in it) the
+  repository. A git folder is taken now only where it is a git worktree of
+  this project (see Upgrade notes), every path found with every folder on
+  the way there and no link on it, and where bwrap binds a place from a
+  descriptor the real Linux run binds it from one it opens just before
+  bwrap starts, so a folder on the way swapped for a link since the launcher
+  looked stops the launch. An older bwrap binds it by name, as before; a
+  repository in the project or in a folder every jail writes (`~/.config`,
+  `~/.local`) is not bound at all, since the jail shows it there.
+- **A profile's read-only path never keeps a hidden dotdir from being
+  hidden.** A read-only path at or inside the place `~/.ssh`, `~/.gnupg` or
+  `~/.aws` leads to (a link to another disk) made the jail leave that place
+  as it was: a macOS jail read everything in it, and a Linux jail showed the
+  read-only path there. The place is hidden now, and the read-only path in it
+  left out and said.
 - **On macOS a jail can no longer move a folder above what it hides.** In
   1.5.5 and earlier, in every macOS jail, a program in it could rename a
   folder it may write that holds a place the jail denies, and then read that
@@ -109,12 +230,14 @@ follows semantic versioning.
   it, in every jail; on macOS it is denied where it leads, also outside your
   home. A link never moves a mask or a deny onto what the jail needs (the
   guard, the agent's settings or a file in them, such as the one that
-  carries the hook, the project, a read-only path), and a link that a
+  carries the hook, the project, and for a `--deny-read` path a read-only
+  path of the profile; a hidden dotdir is hidden even there), and a link that a
   program in the jail can change (a `--deny-read` link in the project) never
   moves one onto what the jail runs on: on Linux a place outside your home,
   on macOS a place of the system. Such a place is left as it is, and
-  `innerwarden contain` says so where the jail shows it. A worktree, or a
-  path of a profile, over the place a hidden dotdir leads to is refused. In
+  `innerwarden contain` says so where the jail shows it. A worktree over the
+  place a hidden dotdir leads to, and a read-only path of a profile there,
+  are left out of the jail, and said. In
   every common layout the jail is the one it was. A link inside one of those
   dotdirs (`~/.ssh/config` a link into `~/.config/dotfiles`, as GNU stow and
   chezmoi make one per file where `~/.ssh` is there) is hidden where it

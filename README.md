@@ -223,10 +223,12 @@ what of the home it hides, under `[profile.<type>.jail]`:
 - `hide_home = [".cache/git/credential"]`: home paths the jail covers with an
   empty mount on Linux, or denies on macOS. A link on the way is followed and
   the place it leads to is hidden. A path that leads outside the home, or
-  that would cover the project, the guard, a read-only path or the agent's
-  own settings, stops the launch; a home folder the jail writes that is
-  itself a link (`~/.cache` on another disk) counts as the home where it
-  leads. On Linux a path whose way goes through a link in a folder the jail
+  that would cover the project, the guard or the agent's own settings, stops
+  the launch; a profile's read-only path under it is left out (the hidden
+  path wins, so nothing of it is shown or written), said, and the jail
+  starts. A home folder the jail writes that is itself a link (`~/.cache` on
+  another disk) counts as the home where it leads. On Linux a path whose
+  way goes through a link in a folder the jail
   writes (`~/.cache/git` a link, or a dotfiles manager's `~/.config/gh`
   link) stops the launch: a program in the jail could replace that link with
   a folder of its own, which your programs would then read and write at that
@@ -270,13 +272,112 @@ on an account that has none), `innerwarden contain` makes it first, empty and
 would make.
 
 A profile's read-only path (`extra_ro`) is read-only in every jail, wherever
-it is. On macOS the sandbox denies writing it also inside a folder the jail
-may write (the project, `~/.cache`, `~/.local`, `~/.config`, `/tmp`,
-`~/.claude.json`); before, the macOS jail never denied it, so a program in
-the jail wrote it. A tool that has to write at such a path (Claude Code
-updating itself in `~/.local/share/claude/versions`) gets "Operation not
-permitted" there: update it outside the jail, or leave that path out of
-`extra_ro`.
+it is, and wherever a link on its way leads (below). On Linux one inside a
+folder the jail may write (the project, `~/.local`) is kept read-only only
+where bubblewrap binds a folder from a descriptor (below): bubblewrap 0.10.0
+or later, or a package whose security update added `--ro-bind-fd` (the
+current packages of Debian 12, Ubuntu 22.04 and 24.04, and RHEL 9 have it).
+On macOS the sandbox
+denies writing it also inside a folder the jail may write (the project,
+`~/.cache`, `~/.local`, `~/.config`, `/tmp`, `~/.claude.json`); before, the
+macOS jail never denied it, so a program in the jail wrote it. A tool that
+has to write at such a path (Claude Code updating itself in
+`~/.local/share/claude/versions`) gets "Operation not permitted" there:
+update it outside the jail, or leave that path out of `extra_ro`.
+
+Where a profile's read-only path is a link, or goes through one, the jail
+keeps it read-only where it leads, and shows nothing it would not show
+otherwise. On macOS, where the sandbox lets the jail read everywhere, the path
+is denied writing as named and where it leads, and each link on the way that
+sits in a folder the jail may write is kept in place. On Linux the path is
+laid read-only at each place the jail shows the folder it leads to: with
+`~/.local` kept as your link to another disk, at `~/.local/...`, where the
+agent runs it. Your own links, in folders no jail writes (`~/code` a link to
+another disk), are followed as before. A link in a folder a jail writes (a
+program in an earlier jail can make one in `~/.local`) is followed only to a
+place the jail shows already, and the start says on one line that the link
+itself is not held ("... is a link in a folder a program in the jail can
+write: the jail keeps <where it leads>, where it leads, read-only, but that
+program could replace the link; ..."): replace the link with the folder it
+leads to. Such a link to a place the jail shows nothing else of is not
+followed: the path is left out of the jail, and the start says so ("... the
+jail does not follow it, and starts without the extra path; list the real
+folder instead"). Before, the launcher followed every link: a program in an
+earlier jail that replaced the path, or a folder on the way to it, with a link
+made the next Linux jail show where the link led, a folder of your home the
+jail hides or the host's `/tmp` and the sockets in it, and a link into
+`~/.ssh` kept the agent from starting. The real Linux run binds each read-only
+path, and each folder it pins above one, from a descriptor it opens just
+before bwrap starts, one folder at a time with no link a program in a jail can
+change followed: a link put there after the launcher looked is never what
+bwrap binds, and a place that changed so stops the launch, said. A bwrap that
+cannot bind from a descriptor (its `--help` lists no `--ro-bind-fd`: upstream
+before 0.10.0, or a distribution's package without that security update)
+cannot hold in place a path in a folder a jail writes, so such a path is left
+out and said ("... does not make it read-only; bubblewrap 0.10.0 or later,
+... keeps it"): the jail shows it, and its programs can write it, where
+before this release the jail laid it read-only by name. A profile with
+`start = "only_when_admitted"` asked for every defence in effect, so there
+it does not start: the launch stops with a line that names each such path
+and what to do (update bubblewrap, or take the path out of `extra_ro`). A
+read-only path in a place the jail hides is left out, said, and the jail
+starts (on Linux `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.mozilla`,
+`~/.thunderbird` and InnerWarden's own folder; on macOS `~/.ssh`, `~/.gnupg`,
+`~/.aws`, InnerWarden's own folder, `~/Library/Mail`, `~/Library/Messages` and
+`~/Library/Safari`; and where one of them leads), as is one under a profile's
+`hide_home` path, your home or a folder above it, and with `--identity` `/run`
+and `/sys`: before, such a path stopped the launch. One that holds such a
+place where the jail shows it already (`~/.config`, which holds InnerWarden's
+own folder) is laid read-only, and the place stays hidden; on Linux one that
+holds such a place where the jail shows nothing else of it is left out. A
+read-only path never keeps a hidden dotdir from being hidden where a link
+leads it: that place is hidden, and the read-only path in it left out. A path
+that is not there is left out without a word, as before.
+
+A linked git worktree's folders are shown, read-write, only where git made
+them for this project: the worktree's git folder sits in the `worktrees`
+folder of its repository and names the project's `.git` file back, or (a
+submodule) its config names the project as its work tree; the repository is a
+git folder (`HEAD`, `objects`, `refs`); both belong to you; no link is on the
+way to either (git writes these paths with none); and neither is your home, a
+folder above it, a place the jail hides, or in a hidden folder of your home
+that the jail does not show on Linux and lets no program write on macOS
+(`~/.kube`, `~/.docker`, `~/.password-store`, `~/.dotfiles`). Every folder on
+the way is there, as the kernel takes the path: one named through a folder
+that is not there and back (`nx/../L`) is none. A hidden folder of your home
+that every jail shows writable (`~/.config`, `~/.local`, `~/.cache`) is fine:
+a worktree of a repository kept there (an editor's configuration in
+`~/.config/nvim`) works as before. The jail shows such a repository through
+that folder, as it shows one in the project, so it binds nothing more for it
+(unless a profile's read-only path holds it: the worktree's write wins there,
+as before), and says nothing of a `.git` file that names a folder there.
+A program in the jail writes the project, so before, a `.git` file it wrote
+(`gitdir: ~/.kube`, `~/bin`, another repository, on macOS
+`~/Library/LaunchAgents`) had the next jail, with or without `--identity`,
+show that place writable. Such a file is left alone now, the start says why
+on one line, and the jail starts; git in a Linux jail then sees no repository
+there, and git in a macOS jail cannot commit there (it may still read it). A
+worktree whose folder lies over the place InnerWarden's own folder, a hidden
+dotdir or a link inside one leads to is left out the same way, where the
+launch stopped before.
+A worktree moved by hand needs `git worktree repair`. Where bwrap binds a place
+from a descriptor (bubblewrap 0.10.0 or later, or a package with the security
+update that added it), the real Linux run binds a worktree's folders from
+descriptors it opens just before bwrap starts, as it binds a profile's
+read-only paths, so a folder on the way swapped for a link after the launcher
+looked stops the launch. An older bwrap binds them by name, as 1.5.5 did, and
+the start says nothing of it: a program in a jail of a project that holds the
+repository (its main worktree, or a folder above it) could swap a folder on
+the way for a link while this jail starts. A repository made with
+`--separate-git-dir` (`git init` or `git clone`, the layout of dotfile
+managers such as yadm and vcsh) keeps nothing that names the project back,
+so it cannot be told apart from such a file: it is not shown either, where
+before git in the jail worked there (one in a folder the jail shows anyway,
+such as `~/.local/share`, still works). Move its git folder
+into the project in place of the `.git` file, or work in a linked worktree
+(`git worktree add`); the start line says so. The
+launcher reads the project's git files without waiting and only as small
+regular files, so a FIFO put there never holds it.
 
 Where a place the jail hides is a link, the jail hides the place it leads
 to: `~/.ssh`, `~/.gnupg` or `~/.aws` kept as a link into a folder the jail
@@ -295,8 +396,9 @@ project included, is closed to renaming and removal (the jail still writes in
 it). The launcher looks for the links inside those dotdirs as far as 100000
 entries and 32 folders deep, and says where it stops short. A link never
 moves a mask or a deny onto what the jail needs: the guard, the agent's
-settings or a file in them, the project, a read-only path, the system's
-folders. Nor does a `--deny-read` link in the project, which the agent can
+settings or a file in them, the project, the system's folders, and for a
+`--deny-read` path a read-only path of the profile (a hidden dotdir or
+InnerWarden's own folder is hidden where it leads even there). Nor does a `--deny-read` link in the project, which the agent can
 change, move one onto what the jail runs on: on Linux a place outside your
 home, on macOS a place of the system outside the project. Each such place is
 left as it is, and `innerwarden contain` says so, with what to do (on Linux
@@ -310,11 +412,12 @@ link and a program in the jail could replace it on the host (replace that
 link with what it leads to); on Linux, InnerWarden's own folder kept as a
 link is refused for the same reason (replace it with the folder it leads
 to), and so is a link inside a hidden dotdir that leads to nothing yet where
-the jail shows that place (make it, or remove the link); and a project,
-worktree or profile path over the place InnerWarden's folder leads to is
-refused, as is a worktree or profile path over the place a hidden dotdir
-leads to. A profile's `hide_home` path keeps its own rule, above: one that
-leads outside the home stops the launch.
+the jail shows that place (make it, or remove the link); and a project path
+over the place InnerWarden's folder leads to is refused (a worktree's folder
+there, or over the place a hidden dotdir leads to, is left out, above). A
+profile's
+`hide_home` path keeps its own rule, above: one that leads outside the home
+stops the launch.
 
 An identified Linux jail keeps Claude Code's own state in the `~/.claude` it
 already shares with you. The jail's home is an empty folder of its own, so
@@ -416,6 +519,13 @@ a kernel older than 4.8, a program in the jail that traces another can change
 a call after the filter has seen it: there an identified jail does not close
 user namespaces, and `contain` says the filter is weaker. This is not
 yet proven on RHEL 9 or Rocky 9.
+
+A tool that reads the command line of a running jail's bubblewrap (from
+`/proc`) finds an identified jail's filter first: that command line starts
+with `--seccomp <fd>`. Where bwrap binds a place from a descriptor, the real
+run of any jail binds the folders it pins, a profile's read-only paths and a
+worktree's git folders with `--bind-fd` and `--ro-bind-fd` (each followed by
+the descriptor and the place), not `--bind` and `--ro-bind-try`.
 
 ## Build from source
 

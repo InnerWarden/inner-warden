@@ -12,8 +12,8 @@ use std::process::{Command, ExitCode};
 use innerwarden_agent_guard::hook;
 
 use crate::contain::{
-    build_linux_jail, build_macos_profile, parse_contain_args, validate_jail_inputs, ContainArgs,
-    JailInputs, Worktree,
+    build_linux_jail, build_macos_profile, parse_contain_args, validate_jail_inputs_for,
+    ContainArgs, JailInputs, Worktree,
 };
 
 /// `innerwarden contain [--agent claude-code] [--monitor|--enforce|--block-review]
@@ -106,14 +106,6 @@ pub fn cmd(rest: &[String]) -> ExitCode {
                         crate::contain::jail_flags_given(rest),
                         &home,
                     );
-                    // Links resolved, so the check of what may be shown read-only
-                    // is made on the place the bind would really show. A path
-                    // that is not there is dropped (bwrap would skip it).
-                    args.extra_ro = args
-                        .extra_ro
-                        .iter()
-                        .filter_map(|path| std::fs::canonicalize(path).ok())
-                        .collect();
                     eprintln!(
                         "innerwarden contain: jail settings from the `{}` agent profile",
                         args.agent
@@ -122,7 +114,6 @@ pub fn cmd(rest: &[String]) -> ExitCode {
             }
         }
     }
-
     // Resolve the project dir (default cwd), canonicalized so binds are absolute.
     let project = resolve_project(&args.project);
     if !project.is_dir() {
@@ -134,14 +125,29 @@ pub fn cmd(rest: &[String]) -> ExitCode {
     }
     args.project = project;
 
-    let mut input = match resolve_inputs(args, home, iw_binary) {
+    // Each extra path found where it leads, with every link on its way
+    // ([`crate::contain::screen_extra_paths`]): a read-only path is laid
+    // where the jail shows the place it leads to, a link a program in a jail
+    // can change is never followed to a place the jail shows nothing else
+    // of, and each path left out is said. Empty lists (every jail without a
+    // profile that names some) read nothing.
+    let mut extra_said = screen_extra(&mut args, &home, &iw_binary);
+    // A profile that starts the jail only once the host admitted it asked
+    // for every defence in effect: a read-only path of it this bubblewrap
+    // cannot keep read-only stops the launch, in a dry run too.
+    if let Some(refused) = crate::contain::unheld_refused(args.start, &args.extra_ro_unheld) {
+        eprintln!("innerwarden contain: {refused}");
+        return ExitCode::from(2);
+    }
+
+    let mut input = match resolve_screened(args, home, iw_binary, &mut extra_said) {
         Ok(input) => input,
         Err(error) => {
             eprintln!("innerwarden contain: {error}");
             return ExitCode::from(2);
         }
     };
-    if let Err(error) = validate_jail_inputs(&input) {
+    if let Err(error) = validate_jail_inputs_for(&input, cfg!(target_os = "macos")) {
         eprintln!("innerwarden contain: {error}");
         return ExitCode::from(2);
     }
@@ -170,10 +176,11 @@ pub fn cmd(rest: &[String]) -> ExitCode {
         // show no `~/.claude`, so no settings file and no hook. The jail is
         // planned again, and checked again, on what is there now.
         if existing_home_paths(&input.home) != input.existing_paths {
-            input = match resolve_inputs(
+            input = match resolve_screened(
                 input.args.clone(),
                 input.home.clone(),
                 input.iw_binary.clone(),
+                &mut extra_said,
             ) {
                 Ok(input) => input,
                 Err(error) => {
@@ -181,16 +188,17 @@ pub fn cmd(rest: &[String]) -> ExitCode {
                     return ExitCode::from(2);
                 }
             };
-            if let Err(error) = validate_jail_inputs(&input) {
+            if let Err(error) = validate_jail_inputs_for(&input, cfg!(target_os = "macos")) {
                 eprintln!("innerwarden contain: {error}");
                 return ExitCode::from(2);
             }
         }
     }
 
-    // Each place the jail hides that a link leads out of the home, onto
-    // what the jail needs, or round in a loop: left as it is, and said.
-    for line in &input.left {
+    // Each extra path the jail leaves out, and why. Each place the jail
+    // hides that a link leads out of the home, onto what the jail needs, or
+    // round in a loop: left as it is, and said.
+    for line in extra_said.iter().chain(&input.left) {
         eprintln!("innerwarden contain: {line}");
     }
 
@@ -315,18 +323,40 @@ fn existing_home_paths(home: &Path) -> Vec<PathBuf> {
     .collect()
 }
 
+/// What the jail is, from what is on the host now: the worktree the
+/// project's `.git` file names ([`detect_worktree`]), then the jail planned
+/// with it. A worktree the plan finds the jail shows writable anyway, or
+/// over a place it hides, is taken out, and the jail planned again without
+/// it ([`crate::contain::worktree_planned`]): no worktree, one line at
+/// most, and the jail starts.
 fn resolve_inputs(
     args: ContainArgs,
     home: PathBuf,
     iw_binary: PathBuf,
 ) -> Result<JailInputs, crate::contain::ContainError> {
+    use crate::contain::WorktreePlanned;
+    let found = detect_worktree(&args.project, &home);
+    let input = resolve_planned(args.clone(), home.clone(), iw_binary.clone(), found)?;
+    let said = match crate::contain::worktree_planned(&input) {
+        WorktreePlanned::Kept => return Ok(input),
+        WorktreePlanned::ShownAnyway => None,
+        WorktreePlanned::Left(why) => input.worktree.as_ref().map(|worktree| {
+            crate::contain::worktree_left_out(&args.project.join(".git"), &worktree.git_dir, &why)
+        }),
+    };
+    resolve_planned(args, home, iw_binary, (None, said))
+}
+
+/// [`resolve_inputs`], with the worktree (and the line said of it) given.
+fn resolve_planned(
+    args: ContainArgs,
+    home: PathBuf,
+    iw_binary: PathBuf,
+    found: (Option<Worktree>, Option<String>),
+) -> Result<JailInputs, crate::contain::ContainError> {
     // Canonicalize TMPDIR too (macOS $TMPDIR is under the /var symlink) so the
     // writable-set rule matches the resolved path.
-    let tmpdir = std::env::var_os("TMPDIR")
-        .map(PathBuf::from)
-        .filter(|p| !p.as_os_str().is_empty())
-        .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    let tmpdir = launcher_tmpdir();
 
     let existing_paths = existing_home_paths(&home);
 
@@ -334,7 +364,7 @@ fn resolve_inputs(
         .map(|m| m.file_type().is_symlink())
         .unwrap_or(false);
 
-    let worktree = detect_worktree(&args.project);
+    let (worktree, worktree_said) = found;
 
     // Symlink-resolve the secret dir (dotfile managers symlink ~/.config): resolve
     // the ~/.config parent then append, so it works even before innerwarden/ exists.
@@ -370,7 +400,11 @@ fn resolve_inputs(
         cfg!(target_os = "macos"),
         |path| leads_to(path).unwrap_or_else(|| path.to_path_buf()),
     );
-    let mut left: Vec<String> = Vec::new();
+    let mut left: Vec<String> = worktree_said.into_iter().collect();
+    // The places the jail never shows are planned with hiding first: a
+    // read-only path of the profile never keeps one from being hidden where
+    // a link leads it ([`crate::contain::PlaceFacts::hiding_first`]).
+    let hiding = facts.hiding_first();
 
     // Linux: the secret dir at every other place a home folder the jail
     // binds shows it. Empty in every common layout. Where the dir itself
@@ -390,7 +424,7 @@ fn resolve_inputs(
             ));
         }
         // Through a link a program in the jail can change: refused.
-        let mut linked = crate::contain::plan_linked_places(&[place], &facts, &[], false)?;
+        let mut linked = crate::contain::plan_linked_places(&[place], &hiding, &[], false)?;
         // Left as it is: needed, or a loop.
         let iw_left = linked.hidden.is_empty();
         left.append(&mut linked.left);
@@ -429,7 +463,7 @@ fn resolve_inputs(
     // `~/.local/share`), the same way.
     let mut dotdirs_linked = crate::contain::plan_linked_places(
         &never_shown_places(&home, &facts, &mut left),
-        &facts,
+        &hiding,
         &[
             vec![iw_config_named.clone(), iw_config_real.clone()],
             iw_config_shown.clone(),
@@ -567,7 +601,325 @@ fn resolve_inputs(
         resolv_conf,
         gate_instance: None,
         claude_state,
+        jail_writes: facts.writable.clone(),
+        bind_fds: Vec::new(),
     })
+}
+
+/// [`resolve_inputs`], with each extra path of the jail that would show
+/// what it must not left out first ([`crate::contain::extra_paths_left_out`]:
+/// one over the home, in a place the jail hides, under a profile's hidden
+/// home path, or with `--identity` over `/run` or `/sys`; on Linux, one
+/// that holds a place the jail hides where the jail shows nothing else of
+/// it), and the line that says so added to `said` once. The jail is
+/// planned again without it, so nothing of it is left in the plan, and it
+/// still starts: one wrong extra path never keeps the agent from starting.
+/// Each round takes one path or more out, so it ends.
+fn resolve_screened(
+    args: ContainArgs,
+    home: PathBuf,
+    iw_binary: PathBuf,
+    said: &mut Vec<String>,
+) -> Result<JailInputs, crate::contain::ContainError> {
+    let mut args = args;
+    loop {
+        let input = resolve_inputs(args.clone(), home.clone(), iw_binary.clone())?;
+        let left = crate::contain::extra_paths_left_out(&input, cfg!(target_os = "macos"));
+        if left.is_empty() {
+            return Ok(input);
+        }
+        for (_, line) in &left {
+            if !said.contains(line) {
+                said.push(line.clone());
+            }
+        }
+        crate::contain::leave_out_extra_paths(&mut args, &left);
+    }
+}
+
+/// The trusted places of the bwrap a Linux jail runs with.
+const BWRAP_PATHS: &[&str] = &["/usr/bin/bwrap", "/bin/bwrap", "/usr/local/bin/bwrap"];
+
+/// The launcher's temporary folder, `TMPDIR` symlink-resolved (macOS's is
+/// under the `/var` link) so the writable-set rule matches the resolved
+/// path, else `/tmp`.
+fn launcher_tmpdir() -> PathBuf {
+    std::env::var_os("TMPDIR")
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+}
+
+/// Each extra path of `args` laid where the jail lays it, and the lines
+/// that say what is left out ([`crate::contain::screen_extra_paths`]), from
+/// what is on the host now: where each path leads and through which links
+/// ([`extra_found`]), what the jail shows and writes (the project, the
+/// worktree, the home's folders it binds), and whether bwrap binds a place
+/// from a descriptor ([`bwrap_binds_fds`]). A jail without such a path
+/// reads nothing.
+fn screen_extra(args: &mut ContainArgs, home: &Path, iw_binary: &Path) -> Vec<String> {
+    if args.extra_ro.is_empty() && args.extra_rw.is_empty() {
+        return Vec::new();
+    }
+    let macos = cfg!(target_os = "macos");
+    let existing = existing_home_paths(home);
+    let (worktree, _) = detect_worktree(&args.project, home);
+    let mut bare = args.clone();
+    bare.extra_ro.clear();
+    bare.extra_ro_sources.clear();
+    let facts = crate::contain::place_facts(
+        &bare,
+        home,
+        worktree.as_ref(),
+        &existing,
+        iw_binary,
+        None,
+        &launcher_tmpdir(),
+        macos,
+        |path| leads_to(path).unwrap_or_else(|| path.to_path_buf()),
+    );
+    let jail = crate::contain::ExtraJail {
+        shown: &facts.shown,
+        writable: &facts.writable,
+        macos,
+        binds_fds: bwrap_binds_fds(),
+    };
+    crate::contain::screen_extra_paths(args, extra_found, jail)
+}
+
+/// What is at an extra path of the jail on the host: where it leads with
+/// every link on the way followed, and each link followed ([`trace_links`],
+/// one `lstat` and `readlink` per step). On macOS the place it leads to is
+/// taken as the disk spells its names (`~/Code` named `~/code` on a disk
+/// that tells no case apart), as the sandbox matches it.
+fn extra_found(path: &Path) -> crate::contain::ExtraFound {
+    use crate::contain::ExtraFound;
+    if !crate::contain::plain_absolute(path) {
+        return ExtraFound::NotPlain;
+    }
+    let (at, links) = trace_links(path);
+    let Some(at) = at else {
+        return ExtraFound::Loop;
+    };
+    if std::fs::symlink_metadata(&at).is_err() {
+        return ExtraFound::Missing;
+    }
+    #[cfg(target_os = "macos")]
+    let at = std::fs::canonicalize(&at).unwrap_or(at);
+    ExtraFound::Found {
+        leads_to: at,
+        links,
+    }
+}
+
+/// Whether the bwrap this launcher would use binds a place from a
+/// descriptor (`--ro-bind-fd`, `--bind-fd`), as its own `--help` says;
+/// asked once. A host with no bwrap the launcher trusts answers yes: its
+/// real run stops anyway ("bwrap not found"), and its dry run shows the
+/// plan such a bwrap would run. Not Linux: no.
+fn bwrap_binds_fds() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        static TAKES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *TAKES.get_or_init(|| match resolve_backend(BWRAP_PATHS) {
+            None => true,
+            Some(bwrap) => Command::new(&bwrap)
+                .arg("--help")
+                .stdin(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .output()
+                .is_ok_and(|out| crate::contain::help_binds_fds(&out.stdout)),
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+/// Linux: open `path` to bind from the descriptor, one step at a time from
+/// the root, each step opened with no link followed (`O_PATH`,
+/// `O_NOFOLLOW`), so what is opened is what each step held when it was
+/// opened, whatever is renamed or linked there after. A link is followed
+/// only where it sits in a folder no program in a jail can write
+/// (`writes`): the person's own (`~/.local` a link to another disk), and a
+/// home folder the jail binds (`dotdirs`, as named), which the jail's own
+/// bind of that folder follows by name too. Any other link in such a folder
+/// refuses, as does a step that is not there: a program in a jail could
+/// have put a link there since the launcher looked. Returns the descriptor,
+/// the place it opened (every link it followed resolved) and whether that
+/// is a folder.
+#[cfg(target_os = "linux")]
+fn open_held(
+    path: &Path,
+    writes: &[PathBuf],
+    dotdirs: &[PathBuf],
+) -> Result<(std::os::fd::OwnedFd, PathBuf, bool), String> {
+    use std::ffi::{CString, OsStr, OsString};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Component;
+    let open = |dir: libc::c_int, name: &OsStr| -> Result<OwnedFd, String> {
+        let c = CString::new(name.as_bytes()).map_err(|_| "a name with a NUL".to_string())?;
+        // SAFETY: a NUL-ended name alive for the call, on a descriptor this
+        // function holds (or the current folder's, for an absolute name).
+        let fd = unsafe {
+            libc::openat(
+                dir,
+                c.as_ptr(),
+                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        // SAFETY: the descriptor was opened by this call, and is owned once.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    };
+    let mode = |fd: &OwnedFd| -> Result<libc::mode_t, String> {
+        // SAFETY: an all-zero `stat` is a valid value to be written over.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: fstat on a descriptor this function holds, into `st`.
+        if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        Ok(st.st_mode & libc::S_IFMT)
+    };
+    if !path.is_absolute() {
+        return Err("not an absolute path".to_string());
+    }
+    let push_steps = |todo: &mut Vec<OsString>, of: &Path| {
+        for part in of.components().rev() {
+            match part {
+                Component::Normal(name) => todo.push(name.to_os_string()),
+                Component::ParentDir => todo.push("..".into()),
+                Component::CurDir | Component::RootDir | Component::Prefix(_) => {}
+            }
+        }
+    };
+    let root = || open(libc::AT_FDCWD, OsStr::new("/"));
+    let mut todo: Vec<OsString> = Vec::new();
+    push_steps(&mut todo, path);
+    let mut at = PathBuf::from("/");
+    let mut fd = root()?;
+    let mut links = 0usize;
+    while let Some(step) = todo.pop() {
+        if step == ".." {
+            at.pop();
+            fd = open(fd.as_raw_fd(), OsStr::new(".."))?;
+            continue;
+        }
+        let next = open(fd.as_raw_fd(), &step)
+            .map_err(|why| format!("{}: {why}", crate::contain::printable(&at.join(&step))))?;
+        if mode(&next)? != libc::S_IFLNK {
+            at.push(&step);
+            fd = next;
+            continue;
+        }
+        let link = at.join(&step);
+        if writes.iter().any(|folder| at.starts_with(folder)) && !dotdirs.contains(&link) {
+            return Err(format!(
+                "{} is a link in a folder a program in the jail can write",
+                crate::contain::printable(&link)
+            ));
+        }
+        links += 1;
+        if links > MAX_LINKS {
+            return Err("its links loop".to_string());
+        }
+        let mut target = vec![0u8; libc::PATH_MAX as usize];
+        // SAFETY: readlinkat on the link's own descriptor (an `O_PATH` one
+        // of a link, read with an empty name), into a buffer of the length
+        // given.
+        let read = unsafe {
+            libc::readlinkat(
+                next.as_raw_fd(),
+                c"".as_ptr(),
+                target.as_mut_ptr().cast(),
+                target.len(),
+            )
+        };
+        let Ok(read) = usize::try_from(read) else {
+            return Err(std::io::Error::last_os_error().to_string());
+        };
+        target.truncate(read);
+        let target = PathBuf::from(OsStr::from_bytes(&target));
+        if target.is_absolute() {
+            at = PathBuf::from("/");
+            fd = root()?;
+        }
+        push_steps(&mut todo, &target);
+    }
+    let folder = mode(&fd)? == libc::S_IFDIR;
+    Ok((fd, at, folder))
+}
+
+/// Linux, the real run: [`JailInputs::bind_fds`] filled where bwrap binds a
+/// place from a descriptor ([`bwrap_binds_fds`]): each place of
+/// [`crate::contain::places_bound_from_descriptors`] opened now, after
+/// every check ([`open_held`]), its descriptor handed to bwrap, which binds
+/// what it holds and closes it before the jail's command runs. The
+/// descriptors are returned, to be kept open until bwrap has started. Where
+/// bwrap binds none, the input as it is. A place that cannot be opened so
+/// stops the launch: a link a program in a jail put on its way since the
+/// launcher looked, a pinned folder or a worktree's folder that is no
+/// folder now, a worktree's folder or a read-only path that leads elsewhere
+/// now.
+#[cfg(target_os = "linux")]
+fn with_held_binds(input: &JailInputs) -> Result<(JailInputs, Vec<std::os::fd::OwnedFd>), String> {
+    hold_binds(input, bwrap_binds_fds())
+}
+
+/// [`with_held_binds`], `takes_fds` saying whether bwrap binds a place
+/// from a descriptor.
+#[cfg(target_os = "linux")]
+fn hold_binds(
+    input: &JailInputs,
+    takes_fds: bool,
+) -> Result<(JailInputs, Vec<std::os::fd::OwnedFd>), String> {
+    use std::os::fd::AsRawFd;
+    let mut out = input.clone();
+    let mut held = Vec::new();
+    if !takes_fds {
+        return Ok((out, held));
+    }
+    let dotdirs: Vec<PathBuf> = crate::contain::writable_home_dirs()
+        .iter()
+        .map(|name| input.home.join(name))
+        .collect();
+    // A worktree's folders are folders where they were found: exact, and
+    // folders still.
+    let worktree_dirs: Vec<&PathBuf> = input
+        .worktree
+        .iter()
+        .flat_map(|worktree| [&worktree.git_dir, &worktree.common_dir])
+        .collect();
+    for (at, host, exact) in crate::contain::places_bound_from_descriptors(input) {
+        let (fd, opened, folder) = open_held(&host, &input.jail_writes, &dotdirs)
+            .map_err(|why| crate::contain::held_place_changed(&at, &why))?;
+        if exact && opened != host {
+            return Err(crate::contain::held_place_changed(
+                &at,
+                &format!("it leads to {} now", crate::contain::printable(&opened)),
+            ));
+        }
+        if (!exact || worktree_dirs.contains(&&at)) && !folder {
+            return Err(crate::contain::held_place_changed(
+                &at,
+                "it is no folder now",
+            ));
+        }
+        if !hand_to_child(&fd) {
+            return Err(crate::contain::held_place_changed(
+                &at,
+                "its descriptor cannot be handed to bwrap",
+            ));
+        }
+        out.bind_fds.push((at, fd.as_raw_fd()));
+        held.push(fd);
+    }
+    Ok((out, held))
 }
 
 /// Where an identified jail can keep Claude Code's own state, as found on
@@ -1101,10 +1453,12 @@ const MAX_LINKS: usize = 40;
 
 /// Where the absolute `path` leads on the host: every link on the way
 /// followed, each step read with `symlink_metadata` and `read_link`, and,
-/// from the first step that is not there (or cannot be read), the rest as
-/// written, since nothing below it can be a link (`realpath -m`). That is
-/// the place a file made through it would land, also where a link leads to
-/// nothing yet. `None` where the links loop, or for a relative path.
+/// below a step that is not there (or cannot be read), the rest as
+/// written, since nothing below it can be a link (`realpath -m`); a `..`
+/// that takes the way back above such a step is taken, and each step after
+/// it is read again. That is the place a file made through it would land,
+/// also where a link leads to nothing yet. `None` where the links loop, or
+/// for a relative path.
 pub(crate) fn leads_to(path: &Path) -> Option<PathBuf> {
     trace(path).map(|(at, _)| at)
 }
@@ -1122,9 +1476,37 @@ pub(crate) fn trace(path: &Path) -> Option<(PathBuf, Vec<PathBuf>)> {
 /// (they loop, or one cannot be read): a link a program in the jail can
 /// change is one on a way that loops too.
 fn trace_links(path: &Path) -> (Option<PathBuf>, Vec<PathBuf>) {
+    let walked = walk(path);
+    (walked.at, walked.links)
+}
+
+/// What [`walk`] found on the way to a place.
+struct Walked {
+    /// Where the way leads ([`leads_to`]), `None` where its links loop or
+    /// one cannot be read, or for a relative path.
+    at: Option<PathBuf>,
+    /// Each link followed on the way, where it sits.
+    links: Vec<PathBuf>,
+    /// The first step on the way that was not there (or could not be
+    /// read), as found. The kernel stops there, also where a later `..`
+    /// would take the way back to folders that are there.
+    missing: Option<PathBuf>,
+}
+
+/// The walk of [`trace_links`]: one `lstat` per step, every step, a link
+/// followed with `read_link`. Each step after one that is not there is
+/// read too: below that step none is there, and a `..` that takes the way
+/// back above it reaches folders that are, where a link is a link again
+/// (`<project>/gone/../L` goes through the link `L`).
+fn walk(path: &Path) -> Walked {
     use std::path::Component;
+    let mut walked = Walked {
+        at: None,
+        links: Vec::new(),
+        missing: None,
+    };
     if !path.is_absolute() {
-        return (None, Vec::new());
+        return walked;
     }
     // The steps still to take, the next one last.
     let mut todo: Vec<std::ffi::OsString> = Vec::new();
@@ -1139,25 +1521,20 @@ fn trace_links(path: &Path) -> (Option<PathBuf>, Vec<PathBuf>) {
     };
     push_steps(&mut todo, path);
     let mut at = PathBuf::from("/");
-    let mut links: Vec<PathBuf> = Vec::new();
-    let mut gone = false;
     while let Some(step) = todo.pop() {
         if step == ".." {
             at.pop();
             continue;
         }
         at.push(&step);
-        if gone {
-            continue;
-        }
         match std::fs::symlink_metadata(&at) {
             Ok(meta) if meta.file_type().is_symlink() => {
-                if links.len() >= MAX_LINKS {
-                    return (None, links);
+                if walked.links.len() >= MAX_LINKS {
+                    return walked;
                 }
-                links.push(at.clone());
+                walked.links.push(at.clone());
                 let Ok(target) = std::fs::read_link(&at) else {
-                    return (None, links);
+                    return walked;
                 };
                 at.pop();
                 if target.is_absolute() {
@@ -1166,10 +1543,15 @@ fn trace_links(path: &Path) -> (Option<PathBuf>, Vec<PathBuf>) {
                 push_steps(&mut todo, &target);
             }
             Ok(_) => {}
-            Err(_) => gone = true,
+            Err(_) => {
+                if walked.missing.is_none() {
+                    walked.missing = Some(at.clone());
+                }
+            }
         }
     }
-    (Some(at), links)
+    walked.at = Some(at);
+    walked
 }
 
 /// Make `place`, which is not there, as an empty folder, mode 0700, and
@@ -1234,23 +1616,252 @@ fn with_linked_places_made(input: &JailInputs) -> JailInputs {
     input
 }
 
+/// The most bytes read of a git file the jail's programs can write (a
+/// `.git` file, `commondir`, `gitdir`): each holds one path.
+const GIT_FILE_MAX: u64 = 4096;
+
+/// The most bytes read of a git folder's `config`.
+const GIT_CONFIG_MAX: u64 = 64 * 1024;
+
+/// The text of the small file at `path`, read as the launcher reads any
+/// file a program in the jail can write: opened with no link followed and
+/// without waiting (`O_NOFOLLOW | O_NONBLOCK`, so a FIFO put there never
+/// holds the launcher), only a regular file, at most `max` bytes. `None`
+/// for anything else.
+fn read_small_file(path: &Path, max: u64) -> Option<String> {
+    use std::io::Read;
+    let file = innerwarden_safe_io::open_no_follow(path).ok()?;
+    let meta = file.metadata().ok()?;
+    if !innerwarden_safe_io::is_regular_file(&meta) || meta.len() > max {
+        return None;
+    }
+    let mut text = String::new();
+    file.take(max).read_to_string(&mut text).ok()?;
+    Some(text)
+}
+
+/// The first line of a git file that names a path, `prefix` taken off
+/// (`gitdir:` in a `.git` file), trimmed.
+fn git_file_path(text: &str, prefix: &str) -> Option<PathBuf> {
+    let line = text.lines().next()?;
+    let named = line.strip_prefix(prefix)?.trim();
+    (!named.is_empty()).then(|| PathBuf::from(named))
+}
+
+/// Where `path` (absolute) is, found with the walk the launcher takes for a
+/// profile's extra paths ([`walk`]: one `lstat` per step), taken only where
+/// no step on the way is a link and every step is there: git writes the
+/// paths of its own folders as they really are, and a link on the way is
+/// one a program in a jail may have put there. A `..` step is taken where
+/// it stands, which, with no link before it and every step before it
+/// there, is where the kernel takes it; after a step that is not there the
+/// kernel takes none (`<project>/gone/../L` is no place to git, whatever
+/// `L` is), so neither does the launcher.
+fn place_without_links(path: &Path) -> Result<PathBuf, crate::contain::WorktreeLeft> {
+    use crate::contain::WorktreeLeft;
+    let Walked { at, links, missing } = walk(path);
+    if let Some(link) = links.first() {
+        return Err(WorktreeLeft::Link(link.clone()));
+    }
+    if let Some(missing) = missing {
+        return Err(WorktreeLeft::NotThere(missing));
+    }
+    // macOS: as the disk spells its names (`~/Code` named `~/code` on a
+    // disk that tells no case apart), as the sandbox matches it and as the
+    // project is found; with no link on the way nothing else changes.
+    #[cfg(target_os = "macos")]
+    let at = at.map(|at| std::fs::canonicalize(&at).unwrap_or(at));
+    match at {
+        Some(at) if std::fs::symlink_metadata(&at).is_ok() => Ok(at),
+        Some(at) => Err(WorktreeLeft::NotThere(at)),
+        None => Err(WorktreeLeft::NotThere(path.to_path_buf())),
+    }
+}
+
+/// [`place_without_links`], and a folder there.
+fn folder_without_links(path: &Path) -> Result<PathBuf, crate::contain::WorktreeLeft> {
+    let at = place_without_links(path)?;
+    if std::fs::symlink_metadata(&at).is_ok_and(|meta| meta.is_dir()) {
+        Ok(at)
+    } else {
+        Err(crate::contain::WorktreeLeft::NoFolder(at))
+    }
+}
+
+/// Whether `dir` is a git folder, as git itself tells one: a `HEAD` file,
+/// and an `objects` and a `refs` folder, none of them a link.
+fn is_git_dir(dir: &Path) -> bool {
+    let meta = |name: &str| std::fs::symlink_metadata(dir.join(name));
+    meta("HEAD").is_ok_and(|m| m.is_file())
+        && meta("objects").is_ok_and(|m| m.is_dir())
+        && meta("refs").is_ok_and(|m| m.is_dir())
+}
+
+/// Whether the folder `dir` (no link followed) belongs to the account `uid`.
+#[cfg(unix)]
+fn owned_by(dir: &Path, uid: u32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(dir).is_ok_and(|meta| meta.uid() == uid)
+}
+
+#[cfg(not(unix))]
+fn owned_by(_dir: &Path, _uid: u32) -> bool {
+    false
+}
+
+/// The account this launcher runs as.
+fn own_uid() -> u32 {
+    #[cfg(unix)]
+    {
+        // SAFETY: geteuid takes no arguments and cannot fail.
+        unsafe { libc::geteuid() }
+    }
+    #[cfg(not(unix))]
+    {
+        u32::MAX
+    }
+}
+
+/// Whether the git `config` of `git_dir` names `project` as its work tree
+/// (`core.worktree`, relative to `git_dir`), as a submodule's own git
+/// folder does, with no link on the way to it.
+fn config_names_work_tree(git_dir: &Path, project: &Path) -> bool {
+    let Some(text) = read_small_file(&git_dir.join("config"), GIT_CONFIG_MAX) else {
+        return false;
+    };
+    let mut in_core = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_core = line.trim_start_matches('[').trim_end_matches(']').trim() == "core";
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if in_core && key.trim().eq_ignore_ascii_case("worktree") {
+            let named = value.trim().trim_matches('"');
+            return folder_without_links(&git_dir.join(named)).is_ok_and(|tree| tree == project);
+        }
+    }
+    false
+}
+
 /// A linked git worktree stores its admin data OUTSIDE the project (its `.git` is a
 /// FILE `gitdir: <path>`). Expose those dirs so `git` keeps working inside the jail.
-fn detect_worktree(project: &Path) -> Option<Worktree> {
+///
+/// The jail binds both read-write, and a program in the jail writes the
+/// project, so it could name any folder there (`gitdir: ~/.kube`,
+/// `gitdir: ~/Library/LaunchAgents`, another repository) and have the next
+/// jail in the project bind it read-write. So the folders are shown only
+/// where they ARE a git worktree of this project ([`detect_worktree_as`]).
+/// Anything else: no worktree, and the line that says so; the jail starts.
+fn detect_worktree(project: &Path, home: &Path) -> (Option<Worktree>, Option<String>) {
+    detect_worktree_as(project, home, own_uid())
+}
+
+/// [`detect_worktree`], for the account `uid`. A worktree's folders are
+/// taken only as git lays them out: the git folder is
+/// `<repository>/worktrees/<name>` of the repository its `commondir` names,
+/// and its `gitdir` file names exactly this project's `.git` file back; or,
+/// a submodule's, the git folder's `config` names exactly this project as
+/// its work tree. Every path is found with no link on the way
+/// ([`place_without_links`]), the repository is a git folder
+/// ([`is_git_dir`]), both folders belong to `uid`, and neither is a place
+/// no jail shows read-write ([`crate::contain::worktree_place_left`]: the
+/// home, a folder above it, a place a jail hides, a hidden folder of the
+/// home). Each file is read as one a program in the jail can write
+/// ([`read_small_file`]: no link, no FIFO, a few bytes), and a relative
+/// path in it is taken as git takes it (a `.git` file's from the project,
+/// the others' from the git folder). A git folder that is no worktree but
+/// that every jail shows writable anyway (in the project, or in a home
+/// folder such as `~/.local`, [`crate::contain::worktree_shown_anyway`]) is
+/// not said: the jail binds nothing for it either way, and git in the jail
+/// sees what the jail shows there (a repository made with
+/// `--separate-git-dir` into `~/.local/share` works).
+fn detect_worktree_as(project: &Path, home: &Path, uid: u32) -> (Option<Worktree>, Option<String>) {
     let dotgit = project.join(".git");
-    let meta = std::fs::symlink_metadata(&dotgit).ok()?;
-    if !meta.is_file() {
-        return None; // a normal repo: .git is a dir, already inside the project bind
+    if !std::fs::symlink_metadata(&dotgit).is_ok_and(|meta| meta.is_file()) {
+        return (None, None); // a normal repo: .git is a dir, already inside the project bind
     }
-    let content = std::fs::read_to_string(&dotgit).ok()?;
-    let rel = content.strip_prefix("gitdir:")?.trim();
-    let git_dir = std::fs::canonicalize(rel).ok()?;
-    // commondir points at the main repo's .git (relative to git_dir).
-    let common_dir = std::fs::read_to_string(git_dir.join("commondir"))
-        .ok()
-        .and_then(|c| std::fs::canonicalize(git_dir.join(c.trim())).ok())
-        .unwrap_or_else(|| git_dir.clone());
-    Some(Worktree {
+    let Some(named) =
+        read_small_file(&dotgit, GIT_FILE_MAX).and_then(|text| git_file_path(&text, "gitdir:"))
+    else {
+        return (None, None);
+    };
+    let mut homes = vec![home.to_path_buf()];
+    if let Ok(real) = std::fs::canonicalize(home) {
+        if real != home {
+            homes.push(real);
+        }
+    }
+    let said = |why| {
+        (
+            None,
+            Some(crate::contain::worktree_left_out(&dotgit, &named, &why)),
+        )
+    };
+    let git_dir = match folder_without_links(&project.join(&named)) {
+        Ok(git_dir) => git_dir,
+        Err(why) => return said(why),
+    };
+    match worktree_of(project, &dotgit, git_dir.clone(), &homes, uid) {
+        Ok(worktree) => (Some(worktree), None),
+        Err(_) if crate::contain::worktree_shown_anyway(home, project, &git_dir) => (None, None),
+        Err(why) => said(why),
+    }
+}
+
+/// The worktree whose git folder is `git_dir` (where the `.git` file
+/// `dotgit` leads, with no link on the way), or why it is none
+/// ([`detect_worktree_as`]).
+fn worktree_of(
+    project: &Path,
+    dotgit: &Path,
+    git_dir: PathBuf,
+    homes: &[PathBuf],
+    uid: u32,
+) -> Result<Worktree, crate::contain::WorktreeLeft> {
+    use crate::contain::WorktreeLeft;
+    let read_path = |name: &str| {
+        read_small_file(&git_dir.join(name), GIT_FILE_MAX).and_then(|text| git_file_path(&text, ""))
+    };
+    let common_dir = match read_path("commondir") {
+        // A submodule's own git folder: no `commondir`, its work tree named
+        // in its config.
+        None => {
+            if !config_names_work_tree(&git_dir, project) {
+                return Err(WorktreeLeft::NoBackLink);
+            }
+            git_dir.clone()
+        }
+        // A linked worktree: git's own link back to this `.git` file, and
+        // the git folder in the repository's `worktrees`.
+        Some(common) => {
+            let back = read_path("gitdir").ok_or(WorktreeLeft::NoBackLink)?;
+            let back = place_without_links(&git_dir.join(back))?;
+            if back != dotgit {
+                return Err(WorktreeLeft::OtherProject(back));
+            }
+            let common_dir = folder_without_links(&git_dir.join(common))?;
+            if git_dir.parent() != Some(common_dir.join("worktrees").as_path()) {
+                return Err(WorktreeLeft::NotInWorktrees(common_dir));
+            }
+            common_dir
+        }
+    };
+    if !is_git_dir(&common_dir) {
+        return Err(WorktreeLeft::NotGitDir(common_dir));
+    }
+    for folder in [&git_dir, &common_dir] {
+        if !owned_by(folder, uid) {
+            return Err(WorktreeLeft::NotYours(folder.clone()));
+        }
+        if crate::contain::worktree_place_left(homes, folder) {
+            return Err(WorktreeLeft::Place(folder.clone()));
+        }
+    }
+    Ok(Worktree {
         git_dir,
         common_dir,
     })
@@ -1261,7 +1872,7 @@ fn detect_worktree(project: &Path) -> Option<Worktree> {
 /// the dashboard never says "Ready" for a jail that would refuse to start.
 pub(crate) fn jail_backend() -> Option<&'static str> {
     if cfg!(target_os = "linux") {
-        resolve_backend(&["/usr/bin/bwrap", "/bin/bwrap", "/usr/local/bin/bwrap"]).map(|_| "bwrap")
+        resolve_backend(BWRAP_PATHS).map(|_| "bwrap")
     } else if cfg!(target_os = "macos") {
         resolve_backend(&["/usr/bin/sandbox-exec"]).map(|_| "sandbox-exec")
     } else {
@@ -1276,7 +1887,7 @@ pub(crate) fn jail_backend() -> Option<&'static str> {
 /// a bwrap with no profile that grants it one).
 pub(crate) fn jail_start_here() -> Option<Result<(), Vec<String>>> {
     if cfg!(target_os = "linux") {
-        let bwrap = resolve_backend(&["/usr/bin/bwrap", "/bin/bwrap", "/usr/local/bin/bwrap"])?;
+        let bwrap = resolve_backend(BWRAP_PATHS)?;
         Some(restriction_advice(&bwrap).map_or(Ok(()), Err))
     } else {
         jail_backend().map(|_| Ok(()))
@@ -1426,7 +2037,7 @@ fn run_linux(input: &JailInputs, marks: bool) -> ExitCode {
     let dry_bwrap = input
         .args
         .dry_run
-        .then(|| resolve_backend(&["/usr/bin/bwrap", "/bin/bwrap", "/usr/local/bin/bwrap"]))
+        .then(|| resolve_backend(BWRAP_PATHS))
         .flatten();
     let dry_filter = dry_bwrap.as_ref().map(|bwrap| {
         dry_run_filter(restriction_advice(bwrap), || {
@@ -1485,12 +2096,16 @@ fn run_linux(input: &JailInputs, marks: bool) -> ExitCode {
         {
             println!("{line}");
         }
+        // The real run binds these from descriptors it opens just before
+        // bwrap starts; the dry run names each by its host folder.
+        if bwrap_binds_fds() && !crate::contain::places_bound_from_descriptors(planned).is_empty() {
+            println!("# {}", crate::contain::FROM_DESCRIPTORS_SAID);
+        }
         println!("bwrap \\");
         println!("  {}", plan.bwrap_args.join(" "));
         return ExitCode::SUCCESS;
     }
-    let Some(bwrap) = resolve_backend(&["/usr/bin/bwrap", "/bin/bwrap", "/usr/local/bin/bwrap"])
-    else {
+    let Some(bwrap) = resolve_backend(BWRAP_PATHS) else {
         eprintln!(
             "innerwarden contain: bubblewrap (bwrap) not found. Install it:\n  Debian/Ubuntu: apt install bubblewrap\n  Fedora: dnf install bubblewrap\n  Arch: pacman -S bubblewrap"
         );
@@ -1537,6 +2152,18 @@ fn run_unrecorded(bwrap: &Path, input: &JailInputs, marks: bool) -> ExitCode {
     };
     #[cfg(not(target_os = "linux"))]
     let _ = marks;
+    // Each pin and read-only path from a descriptor opened now, after every
+    // check ([`with_held_binds`]); kept open until bwrap has run.
+    #[cfg(target_os = "linux")]
+    let (held_input, held) = match with_held_binds(input) {
+        Ok(held) => held,
+        Err(why) => {
+            eprintln!("innerwarden contain: {why}");
+            return ExitCode::from(2);
+        }
+    };
+    #[cfg(target_os = "linux")]
+    let input = &held_input;
     let code = match build_linux_jail(input) {
         Ok(plan) => run_plain(bwrap, &plan),
         Err(e) => {
@@ -1546,7 +2173,7 @@ fn run_unrecorded(bwrap: &Path, input: &JailInputs, marks: bool) -> ExitCode {
     };
     // Ours close only once bwrap has read them.
     #[cfg(target_os = "linux")]
-    drop((marker, filter));
+    drop((marker, filter, held));
     code
 }
 
@@ -1945,6 +2572,15 @@ fn launch_identified(
     // the launcher writes only after the admission: a launcher that dies
     // before the host answered leaves the jail an empty record.
     identified.gate_instance = crate::contain::launch::gate_for(input.args.start, instance_id);
+    // Each pin and read-only path from a descriptor opened now, after every
+    // check ([`with_held_binds`]); bwrap holds its own copies once started.
+    let (identified, held) = match with_held_binds(&identified) {
+        Ok(held) => held,
+        Err(why) => {
+            eprintln!("innerwarden contain: {why}");
+            return Attempt::Done(ExitCode::from(2));
+        }
+    };
     let plan = match build_linux_jail(&identified) {
         Ok(p) => p,
         Err(e) => {
@@ -1964,6 +2600,7 @@ fn launch_identified(
     drop(record_reader);
     drop(key_reader);
     drop(filter_reader);
+    drop(held);
     let mut child = match spawned {
         Ok(c) => c,
         Err(e) if matches!(scope, ScopePlan::User { .. }) => return Attempt::NeverStarted(Err(e)),
@@ -3974,6 +4611,41 @@ mod tests {
         assert!(!own_folder(&root.path().join("no/parent")));
     }
 
+    /// CWWT-SEC-1: a `..` after a step that is not there takes the way back
+    /// to folders that are there, and a link there is a link. The walk read
+    /// no step after the first that was not there, so `proj/gone/../L/x`
+    /// led to `proj/L/x` as written, the link `L` (to a hidden folder of
+    /// the home) never seen nor followed, and a worktree named so was bound
+    /// by that spelling while bwrap followed the link. Every step is read
+    /// now: the way leads where `L` leads, `L` is a link on it, and the
+    /// first step that is not there is found.
+    ///
+    /// FAILS ON REVERT: stop reading steps after the first that is not
+    /// there (as before) and the way leads to `proj/L/x`, with no link.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_after_a_step_that_is_not_there_and_a_dotdot_is_still_followed() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let r = std::fs::canonicalize(root.path()).unwrap();
+        std::fs::create_dir_all(r.join("home/.kube/x")).unwrap();
+        std::fs::create_dir_all(r.join("proj")).unwrap();
+        symlink(r.join("home/.kube"), r.join("proj/L")).unwrap();
+        let (at, links) = trace(&r.join("proj/gone/../L/x")).unwrap();
+        assert_eq!(at, r.join("home/.kube/x"));
+        assert_eq!(links, [r.join("proj/L")]);
+        assert_eq!(
+            walk(&r.join("proj/gone/../L/x")).missing,
+            Some(r.join("proj/gone"))
+        );
+        // Below a step that is not there nothing is a link: as written.
+        assert_eq!(
+            trace(&r.join("proj/gone/L/x")),
+            Some((r.join("proj/gone/L/x"), Vec::new()))
+        );
+        assert_eq!(walk(&r.join("proj/L/x")).missing, None);
+    }
+
     /// M30-CW-link: where a place the jail hides really is on the host,
     /// every link on the way followed: a link into another folder, a chain
     /// of two links (one with `..`), a link to a folder above, a link that
@@ -4271,5 +4943,1332 @@ mod tests {
         assert!(!make_place(&root.path().join("file/below")));
         symlink(root.path().join("cfg"), root.path().join("link")).unwrap();
         assert!(!make_place(&root.path().join("link")));
+    }
+
+    /// CWNF (CW-extra-nofollow review), on this host's own disk: an extra
+    /// path is found where it leads, each link on the way kept with the
+    /// folder it sits in, so the planner can tell a link a program in a jail
+    /// could change from the person's own. A link at the path, one on the
+    /// way and one of the person's are each listed; a real folder has none;
+    /// a path not there, or one a link leads to nothing through, is missing;
+    /// links that loop are said; a path with `..` is not plain. On macOS a
+    /// path spelled in another case than the disk's is found as the disk
+    /// spells it.
+    ///
+    /// FAILS ON REVERT: find each path with `std::fs::canonicalize` alone
+    /// (no links kept) and the planted link at `.local/share/demo` is found
+    /// with none, so nothing tells it from the person's own.
+    #[cfg(unix)]
+    #[test]
+    fn an_extra_path_is_found_where_it_leads_with_each_link_on_the_way() {
+        use crate::contain::ExtraFound;
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let r = std::fs::canonicalize(root.path()).unwrap();
+        let home = r.join("home");
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        std::fs::create_dir_all(home.join("sdk/lib")).unwrap();
+        std::fs::create_dir_all(home.join(".local/share")).unwrap();
+        std::fs::create_dir_all(home.join("private/ro")).unwrap();
+        symlink(home.join(".ssh"), home.join(".local/share/demo")).unwrap();
+        symlink("private", home.join("shared")).unwrap();
+        symlink(home.join("nowhere"), home.join("dangling")).unwrap();
+        symlink("loop", home.join("loop")).unwrap();
+        let found = |to: &str, links: &[&str]| ExtraFound::Found {
+            leads_to: home.join(to),
+            links: links.iter().map(|link| home.join(link)).collect(),
+        };
+        let cases = [
+            (".local/share/demo", found(".ssh", &[".local/share/demo"])),
+            (".local/share/demo/id", ExtraFound::Missing),
+            ("shared/ro", found("private/ro", &["shared"])),
+            ("sdk/lib", found("sdk/lib", &[])),
+            ("dangling", ExtraFound::Missing),
+            ("gone", ExtraFound::Missing),
+            ("loop", ExtraFound::Loop),
+        ];
+        for (path, want) in &cases {
+            let path = home.join(path);
+            assert_eq!(&extra_found(&path), want, "{}", path.display());
+        }
+        assert_eq!(extra_found(&home.join("sdk/../.ssh")), ExtraFound::NotPlain);
+        #[cfg(target_os = "macos")]
+        if home.join("SDK").exists() {
+            assert_eq!(extra_found(&home.join("SDK/Lib")), found("sdk/lib", &[]));
+        }
+    }
+
+    /// CWNF-1, on this host's own disk (Linux): a place the jail binds from
+    /// a descriptor is opened one step at a time with no link followed, so
+    /// the launcher holds what each step held when it looked. A link in a
+    /// folder a program in a jail can write refuses (one could have put it
+    /// there after the launcher planned the jail: measured, a link swapped
+    /// in while the launcher waited on the project's `commondir` showed the
+    /// host's `/tmp`, sockets and all, in the next identified jail). The
+    /// person's own link, in a folder no jail writes, is followed. A step
+    /// not there refuses. The descriptor names the folder it opened.
+    ///
+    /// FAILS ON REVERT: follow every link (the `writes` check dropped) and
+    /// the link planted in `.local` opens the folder it leads to.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_place_to_bind_is_opened_with_no_link_a_jail_can_change_followed() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let r = std::fs::canonicalize(root.path()).unwrap();
+        let home = r.join("home");
+        std::fs::create_dir_all(home.join(".local/share/tool")).unwrap();
+        std::fs::create_dir_all(home.join("private/ro")).unwrap();
+        std::fs::write(home.join("private/ro/notes"), "PRIVATE").unwrap();
+        symlink(home.join("private"), home.join(".local/share/demo")).unwrap();
+        symlink("private", home.join("shared")).unwrap();
+        let writes = vec![home.join(".local")];
+        let (fd, at, folder) = open_held(&home.join(".local/share/tool"), &writes, &[]).unwrap();
+        assert_eq!(at, home.join(".local/share/tool"));
+        assert!(folder);
+        let shown = std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd())).unwrap();
+        assert_eq!(shown, home.join(".local/share/tool"));
+        let refused = open_held(&home.join(".local/share/demo/ro"), &writes, &[]).unwrap_err();
+        assert!(
+            refused.contains("is a link in a folder a program in the jail can write"),
+            "{refused}"
+        );
+        let (_, at, _) = open_held(&home.join("shared/ro"), &writes, &[]).unwrap();
+        assert_eq!(at, home.join("private/ro"));
+        let (_, at, folder) = open_held(&home.join("private/ro/notes"), &writes, &[]).unwrap();
+        assert!(at.ends_with("private/ro/notes") && !folder);
+        assert!(open_held(&home.join("gone/x"), &writes, &[]).is_err());
+        assert!(open_held(Path::new("relative"), &writes, &[]).is_err());
+        // A home folder the jail binds, kept as a link, where the home is a
+        // folder a jail writes (another home folder a link to the home
+        // itself): the jail's own bind of it follows it by name, and so
+        // does this; any other link there is refused.
+        let wide = vec![home.clone()];
+        std::fs::create_dir_all(home.join("disk/cache/x")).unwrap();
+        symlink("disk/cache", home.join(".cache")).unwrap();
+        assert!(open_held(&home.join(".cache/x"), &wide, &[]).is_err());
+        let (_, at, _) = open_held(&home.join(".cache/x"), &wide, &[home.join(".cache")]).unwrap();
+        assert_eq!(at, home.join("disk/cache/x"));
+        assert!(open_held(&home.join("shared/ro"), &wide, &[home.join(".cache")]).is_err());
+    }
+
+    /// CWNF-1 (Linux): the real run opens each pin and each read-only path
+    /// of the jail just before bwrap starts, after every check, and hands
+    /// bwrap those descriptors: the read-only path and the folder pinned
+    /// above it are bound from them. Where a program in an earlier jail
+    /// swapped the read-only path for a link since the launcher planned the
+    /// jail (the race the review measured), the launch stops and says so;
+    /// nothing is bound by name. Where bwrap binds no descriptor nothing is
+    /// opened.
+    ///
+    /// FAILS ON REVERT: open nothing (`hold_binds` returning the input as it
+    /// is) and the swapped path is bound by name, so the jail shows where
+    /// the link leads.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_read_only_path_swapped_for_a_link_after_the_plan_stops_the_launch() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let r = std::fs::canonicalize(root.path()).unwrap();
+        let home = r.join("home");
+        let versions = home.join(".local/share/claude/versions");
+        std::fs::create_dir_all(&versions).unwrap();
+        std::fs::create_dir_all(home.join("private")).unwrap();
+        let project = r.join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let rest: Vec<String> = ["--project", project.to_str().unwrap(), "--", "true"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut args = parse_contain_args(&rest).unwrap();
+        args.extra_ro = vec![versions.clone()];
+        let said = screen_extra(&mut args, &home, Path::new("/usr/bin/true"));
+        // The plan keeps it where this host's bwrap binds a descriptor, and
+        // says it leaves it out where it binds none.
+        if bwrap_binds_fds() {
+            assert!(said.is_empty(), "{said:?}");
+            assert_eq!(args.extra_ro, std::slice::from_ref(&versions));
+        } else {
+            assert_eq!(said, [crate::contain::extra_not_held(&versions)]);
+            args.extra_ro = vec![versions.clone()];
+        }
+        let input = resolve_inputs(args, home.clone(), PathBuf::from("/usr/bin/true")).unwrap();
+        let (held_input, held) = hold_binds(&input, true).unwrap();
+        let places = crate::contain::places_bound_from_descriptors(&input);
+        assert_eq!(held.len(), places.len());
+        assert!(
+            held_input.bind_fds.iter().any(|(at, _)| *at == versions),
+            "{:?}",
+            held_input.bind_fds
+        );
+        assert!(
+            held_input
+                .bind_fds
+                .iter()
+                .any(|(at, _)| *at == home.join(".local/share/claude")),
+            "{:?}",
+            held_input.bind_fds
+        );
+        // The command line binds the held folder from its descriptor only
+        // where this host's bwrap can (a CI runner's 0.9.0 cannot).
+        if bwrap_binds_fds() {
+            let a = build_linux_jail(&held_input).unwrap().bwrap_args;
+            assert!(
+                a.windows(3)
+                    .any(|x| x[0] == "--ro-bind-fd" && x[2] == versions.to_str().unwrap()),
+                "{a:?}"
+            );
+            // Never also by name (the host's resolver file may be, a
+            // systemd-resolved runner binds its stub with -try).
+            assert!(
+                !a.windows(3)
+                    .any(|x| x[0] == "--ro-bind-try" && x[2] == versions.to_str().unwrap()),
+                "{a:?}"
+            );
+        }
+        drop(held);
+        // An earlier jail swaps the planned folder for a link meanwhile.
+        std::fs::rename(&versions, home.join(".local/share/claude/versions.old")).unwrap();
+        symlink(home.join("private"), &versions).unwrap();
+        let refused = hold_binds(&input, true).unwrap_err();
+        assert!(
+            refused.starts_with(&format!(
+                "{} changed since the launcher looked at it",
+                versions.display()
+            )),
+            "{refused}"
+        );
+        // A bwrap that binds no descriptor: nothing opened.
+        let (same, none) = hold_binds(&input, false).unwrap();
+        assert!(none.is_empty() && same.bind_fds.is_empty());
+    }
+
+    /// CWNF-1 (tests lens), on this host's own disk: `~/.aws` a link to a
+    /// folder outside the home, and a profile's read-only path in that
+    /// folder. The planner left that folder as it was (the read-only path
+    /// counted as what the jail needs), so the jail hid nothing there,
+    /// while the read-only path was kept: the unit test that said otherwise
+    /// set the hidden target by hand. Planned for real now: the folder is
+    /// hidden where `~/.aws` leads (denied on macOS), and the read-only path
+    /// is left out and said.
+    ///
+    /// FAILS ON REVERT: plan the dotdirs with `facts` instead of
+    /// `facts.hiding_first()` and the read-only path is kept, the folder
+    /// not hidden.
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_path_where_a_hidden_dotdir_leads_is_left_out_and_the_place_hidden() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let r = std::fs::canonicalize(root.path()).unwrap();
+        let home = r.join("home");
+        let aws = r.join("data/aws");
+        std::fs::create_dir_all(aws.join("creds")).unwrap();
+        std::fs::write(aws.join("credentials"), "AWS-SECRET").unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        symlink(&aws, home.join(".aws")).unwrap();
+        let project = r.join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let rest: Vec<String> = ["--project", project.to_str().unwrap(), "--", "true"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut args = parse_contain_args(&rest).unwrap();
+        args.extra_ro = vec![aws.join("creds")];
+        let mut said = screen_extra(&mut args, &home, Path::new("/usr/bin/true"));
+        let input = resolve_screened(
+            args,
+            home.clone(),
+            PathBuf::from("/usr/bin/true"),
+            &mut said,
+        )
+        .unwrap();
+        assert!(input.args.extra_ro.is_empty(), "{:?}", input.args.extra_ro);
+        assert_eq!(input.hidden_targets, [(home.join(".aws"), aws.clone())]);
+        assert!(
+            said.iter().any(|line| line.contains(&format!(
+                "where {} leads, which the jail hides; the jail starts without it",
+                home.join(".aws").display()
+            ))),
+            "{said:?}"
+        );
+        #[cfg(target_os = "macos")]
+        assert!(
+            input.linked_denies.contains(&aws),
+            "{:?}",
+            input.linked_denies
+        );
+        assert!(validate_jail_inputs_for(&input, cfg!(target_os = "macos")).is_ok());
+    }
+
+    /// A git folder at `dir` as git makes one: a `HEAD` file, and an
+    /// `objects` and a `refs` folder.
+    #[cfg(unix)]
+    fn git_dir_by_hand(dir: &Path) {
+        for sub in ["objects", "refs/heads"] {
+            std::fs::create_dir_all(dir.join(sub)).unwrap();
+        }
+        std::fs::write(dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    }
+
+    /// A worktree laid out by hand as `git worktree add` lays it: the
+    /// repository `main`, a git folder, its worktree's git folder
+    /// `main/.git/worktrees/w` with `gitdir` naming `w/.git` back and
+    /// `commondir` naming the repository's `.git`, and `w/.git` naming that
+    /// git folder. `relative`: each named as git 2.48 does with
+    /// `worktree.useRelativePaths`.
+    #[cfg(unix)]
+    fn worktree_by_hand(root: &Path, relative: bool) -> (PathBuf, PathBuf, PathBuf) {
+        let common = root.join("main/.git");
+        git_dir_by_hand(&common);
+        let git_dir = common.join("worktrees/w");
+        let tree = root.join("w");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        std::fs::create_dir_all(&tree).unwrap();
+        if relative {
+            std::fs::write(tree.join(".git"), "gitdir: ../main/.git/worktrees/w\n").unwrap();
+            std::fs::write(git_dir.join("gitdir"), "../../../../w/.git\n").unwrap();
+        } else {
+            std::fs::write(
+                tree.join(".git"),
+                format!("gitdir: {}\n", git_dir.display()),
+            )
+            .unwrap();
+            std::fs::write(
+                git_dir.join("gitdir"),
+                format!("{}\n", tree.join(".git").display()),
+            )
+            .unwrap();
+        }
+        std::fs::write(git_dir.join("commondir"), "../..\n").unwrap();
+        (tree, git_dir, common)
+    }
+
+    /// What [`detect_worktree`] says of the project `tree` whose `.git`
+    /// file names `named`, left out for `why`.
+    #[cfg(unix)]
+    fn left_out(
+        tree: &Path,
+        named: &Path,
+        why: crate::contain::WorktreeLeft,
+    ) -> (Option<Worktree>, Option<String>) {
+        (
+            None,
+            Some(crate::contain::worktree_left_out(
+                &tree.join(".git"),
+                named,
+                &why,
+            )),
+        )
+    }
+
+    /// Run git with no config of the person's, in `dir`; whether it ran.
+    #[cfg(unix)]
+    fn git_in(dir: &Path, home: &Path, args: &[&str]) -> bool {
+        Command::new("git")
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "init.defaultBranch=main",
+            ])
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", home)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .is_ok_and(|out| out.status.success())
+    }
+
+    /// NEW-WORKTREE (found fixing CWNF-1): a jail binds a linked worktree's
+    /// git folders read-write, and took them from the project's `.git`
+    /// file, which every program in the jail can write: `gitdir: ~/.bashrc`
+    /// (or `~/bin`, `~/Library/LaunchAgents`) had the next jail in the
+    /// project bind that place read-write. A git folder is taken now only
+    /// where git took it: a worktree's, whose `gitdir` names this `.git`
+    /// back, in the repository's `worktrees`, absolute or relative, laid out
+    /// by hand and by `git worktree add` itself where this host has git; or
+    /// a submodule's, whose config names this project as its work tree. Any
+    /// other is no worktree, and the line says why.
+    ///
+    /// FAILS ON REVERT: take the folder the `.git` file names as it is (as
+    /// before) and `~/.bashrc` and `~/bin` are worktree folders.
+    #[cfg(unix)]
+    #[test]
+    fn a_worktree_is_taken_only_where_git_names_the_project_back() {
+        use crate::contain::WorktreeLeft;
+        let root = tempfile::tempdir().unwrap();
+        let r = std::fs::canonicalize(root.path()).unwrap();
+        let home = r.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        for relative in [false, true] {
+            let at = r.join(if relative { "rel" } else { "abs" });
+            let (tree, git_dir, common) = worktree_by_hand(&at, relative);
+            assert_eq!(
+                detect_worktree(&tree, &home),
+                (
+                    Some(Worktree {
+                        git_dir: git_dir.clone(),
+                        common_dir: common.clone(),
+                    }),
+                    None
+                ),
+                "relative {relative}"
+            );
+        }
+        // Made by `git worktree add` itself, where this host has git, with
+        // absolute and with relative paths.
+        let made = r.join("made");
+        std::fs::create_dir_all(&made).unwrap();
+        if git_in(&made, &r, &["init", "-q", "main"])
+            && git_in(
+                &made.join("main"),
+                &r,
+                &["commit", "-q", "--allow-empty", "-m", "x"],
+            )
+        {
+            for (name, relative) in [("w", false), ("w2", true)] {
+                let mut args = vec!["worktree", "add", "-q"];
+                if relative {
+                    args = vec![
+                        "-c",
+                        "worktree.useRelativePaths=true",
+                        "worktree",
+                        "add",
+                        "-q",
+                    ];
+                }
+                let tree = format!("../{name}");
+                args.push(&tree);
+                assert!(
+                    git_in(&made.join("main"), &r, &args),
+                    "git worktree add {name}"
+                );
+                assert_eq!(
+                    detect_worktree(&made.join(name), &home),
+                    (
+                        Some(Worktree {
+                            git_dir: made.join("main/.git/worktrees").join(name),
+                            common_dir: made.join("main/.git"),
+                        }),
+                        None
+                    ),
+                    "{name}"
+                );
+            }
+        }
+        // A submodule: its git folder in the superproject's `.git/modules`.
+        let modules = r.join("super/.git/modules/sub");
+        git_dir_by_hand(&modules);
+        std::fs::create_dir_all(r.join("super/sub")).unwrap();
+        std::fs::write(
+            modules.join("config"),
+            "[core]\n\tbare = false\n\tworktree = ../../../sub\n",
+        )
+        .unwrap();
+        std::fs::write(r.join("super/sub/.git"), "gitdir: ../.git/modules/sub\n").unwrap();
+        assert_eq!(
+            detect_worktree(&r.join("super/sub"), &home),
+            (
+                Some(Worktree {
+                    git_dir: modules.clone(),
+                    common_dir: modules.clone(),
+                }),
+                None
+            )
+        );
+        // Forged by a program in the jail: none is a worktree.
+        std::fs::create_dir_all(home.join("bin")).unwrap();
+        std::fs::write(home.join(".bashrc"), "# rc\n").unwrap();
+        let proj = r.join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        // A git folder that names this `.git` back, outside `worktrees` of
+        // the repository its `commondir` names, in a folder no jail shows
+        // (`~/w`) and in one every jail shows writable (`~/.local/w`).
+        for at in ["w", ".local/w"] {
+            let x = home.join(at).join("worktrees/x");
+            std::fs::create_dir_all(&x).unwrap();
+            std::fs::write(
+                x.join("gitdir"),
+                format!("{}\n", proj.join(".git").display()),
+            )
+            .unwrap();
+            std::fs::write(
+                x.join("commondir"),
+                format!("{}\n", home.join("bin").display()),
+            )
+            .unwrap();
+        }
+        for (named, why) in [
+            (
+                home.join(".bashrc"),
+                WorktreeLeft::NoFolder(home.join(".bashrc")),
+            ),
+            (home.join("bin"), WorktreeLeft::NoBackLink),
+            (
+                home.join("w/worktrees/x"),
+                WorktreeLeft::NotInWorktrees(home.join("bin")),
+            ),
+            (r.join("gone"), WorktreeLeft::NotThere(r.join("gone"))),
+        ] {
+            std::fs::write(proj.join(".git"), format!("gitdir: {}\n", named.display())).unwrap();
+            assert_eq!(
+                detect_worktree(&proj, &home),
+                left_out(&proj, &named, why),
+                "{}",
+                named.display()
+            );
+        }
+        // The same in a folder every jail shows writable anyway: nothing is
+        // bound and nothing said (the jail shows `~/.local` as it is).
+        std::fs::write(
+            proj.join(".git"),
+            format!("gitdir: {}\n", home.join(".local/w/worktrees/x").display()),
+        )
+        .unwrap();
+        assert_eq!(detect_worktree(&proj, &home), (None, None));
+        // A plain repository (`.git` a folder) and no repository: nothing.
+        std::fs::remove_file(proj.join(".git")).unwrap();
+        assert_eq!(detect_worktree(&proj, &home), (None, None));
+        std::fs::create_dir_all(proj.join(".git")).unwrap();
+        assert_eq!(detect_worktree(&proj, &home), (None, None));
+    }
+
+    /// CW-worktree-gitdir: the project's `.git` file is the agent's to
+    /// write, and the jail binds the folders it names read-write, a plain
+    /// jail too. Each of these is no git worktree of this project, and none
+    /// is shown:
+    ///
+    /// - an arbitrary folder of the home (`~/kube-test`, `~/.kube`, with a
+    ///   `config` that is no git config);
+    /// - a folder with a fake `worktrees/<name>` and no link back;
+    /// - a git folder whose link back names another project;
+    /// - a project in a folder named `worktrees` whose `.git` names the
+    ///   project itself, with a link back and a `commondir` of `../..`:
+    ///   the repository it names is the folder two up (`~/code`, every
+    ///   repository of the person's), which is no git folder (taken before;
+    ///   the git folder it names is the project, which the jail shows
+    ///   anyway, so nothing is said of it, CWWT-C2; the same layout named
+    ///   from another project is said);
+    /// - a worktree's layout in a hidden folder of the home (`~/.kube`), in
+    ///   a place the jail hides (`~/Library/Mail`), or with the home itself
+    ///   as its repository (taken before, or refused only by the late check
+    ///   that stopped the launch);
+    /// - a real worktree of another account's.
+    ///
+    /// Each says why on one line, and git in the jail then sees no
+    /// repository.
+    ///
+    /// FAILS ON REVERT: drop the git folder check (`is_git_dir`) and
+    /// `~/code` is the repository; drop the place check
+    /// (`worktree_place_left`) and the `~/.kube`, `~/Library/Mail` and home
+    /// layouts are; drop the owner check and another account's is.
+    #[cfg(unix)]
+    #[test]
+    fn a_git_file_never_shows_a_folder_that_is_no_worktree_of_this_project() {
+        use crate::contain::WorktreeLeft;
+        let root = tempfile::tempdir().unwrap();
+        let r = std::fs::canonicalize(root.path()).unwrap();
+        let h = r.join("home");
+        let proj = h.join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let other = h.join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join(".git"), "gitdir: elsewhere\n").unwrap();
+        let name_back = |git_dir: &Path, to: &Path| {
+            std::fs::create_dir_all(git_dir).unwrap();
+            std::fs::write(git_dir.join("gitdir"), format!("{}\n", to.display())).unwrap();
+            std::fs::write(git_dir.join("commondir"), "../..\n").unwrap();
+        };
+        // An arbitrary folder of the home, and a hidden one, each with a
+        // config that is no git config.
+        for folder in ["kube-test", ".kube"] {
+            std::fs::create_dir_all(h.join(folder)).unwrap();
+            std::fs::write(
+                h.join(folder).join("config"),
+                "apiVersion: v1\nkind: Config\n",
+            )
+            .unwrap();
+        }
+        // A fake `worktrees/<name>` with no link back.
+        git_dir_by_hand(&h.join("fake"));
+        std::fs::create_dir_all(h.join("fake/worktrees/x")).unwrap();
+        std::fs::write(h.join("fake/worktrees/x/commondir"), "../..\n").unwrap();
+        // A git folder that names another project back.
+        git_dir_by_hand(&h.join("repo"));
+        name_back(&h.join("repo/worktrees/x"), &other.join(".git"));
+        // A worktree's layout in a hidden folder of the home, in a place
+        // the jail hides, and with the home as its repository.
+        for repo in [h.join(".kube/repo"), h.join("Library/Mail/repo"), h.clone()] {
+            git_dir_by_hand(&repo);
+            name_back(&repo.join("worktrees/x"), &proj.join(".git"));
+        }
+        let cases = [
+            (h.join("kube-test"), WorktreeLeft::NoBackLink),
+            (h.join(".kube"), WorktreeLeft::NoBackLink),
+            (h.join("fake/worktrees/x"), WorktreeLeft::NoBackLink),
+            (
+                h.join("repo/worktrees/x"),
+                WorktreeLeft::OtherProject(other.join(".git")),
+            ),
+            (
+                h.join(".kube/repo/worktrees/x"),
+                WorktreeLeft::Place(h.join(".kube/repo/worktrees/x")),
+            ),
+            (
+                h.join("Library/Mail/repo/worktrees/x"),
+                WorktreeLeft::Place(h.join("Library/Mail/repo/worktrees/x")),
+            ),
+            (h.join("worktrees/x"), WorktreeLeft::Place(h.clone())),
+        ];
+        for (named, why) in cases {
+            std::fs::write(proj.join(".git"), format!("gitdir: {}\n", named.display())).unwrap();
+            assert_eq!(
+                detect_worktree(&proj, &h),
+                left_out(&proj, &named, why),
+                "{}",
+                named.display()
+            );
+        }
+        // A project in a folder named `worktrees` that names itself: the
+        // repository would be `~/code`, which is no git folder. The git
+        // folder it names is the project, which the jail shows anyway:
+        // nothing more is bound, and nothing said. The same layout named
+        // from another project is said.
+        let code = h.join("code");
+        let p = code.join("worktrees/p");
+        name_back(&p, &p.join(".git"));
+        std::fs::create_dir_all(code.join("another-repo")).unwrap();
+        std::fs::write(p.join(".git"), "gitdir: .\n").unwrap();
+        assert_eq!(detect_worktree(&p, &h), (None, None));
+        let p3 = h.join("p3");
+        std::fs::create_dir_all(&p3).unwrap();
+        name_back(&code.join("worktrees/q"), &p3.join(".git"));
+        std::fs::write(
+            p3.join(".git"),
+            format!("gitdir: {}\n", code.join("worktrees/q").display()),
+        )
+        .unwrap();
+        assert_eq!(
+            detect_worktree(&p3, &h),
+            left_out(
+                &p3,
+                &code.join("worktrees/q"),
+                WorktreeLeft::NotGitDir(code.clone())
+            )
+        );
+        // A real worktree, of another account's.
+        let (tree, git_dir, common) = worktree_by_hand(&h.join("mine"), false);
+        let uid = own_uid();
+        assert_eq!(
+            detect_worktree_as(&tree, &h, uid.wrapping_add(1)),
+            left_out(&tree, &git_dir, WorktreeLeft::NotYours(git_dir.clone()))
+        );
+        assert_eq!(
+            detect_worktree_as(&tree, &h, uid),
+            (
+                Some(Worktree {
+                    git_dir,
+                    common_dir: common
+                }),
+                None
+            )
+        );
+    }
+
+    /// CW-worktree-gitdir: git writes every path of a worktree's folders as
+    /// it really is, with no link on the way (measured with git 2.52, also
+    /// through a link to the repository), and a link on the way is one a
+    /// program in a jail may have put there (in the project, or in a
+    /// repository it writes). So a worktree whose `.git` names its git
+    /// folder through a link, whose git folder is a link, whose `commondir`
+    /// or link back goes through one, is no worktree, and the line names the
+    /// link. So is each named through a folder that is not there and a `..`
+    /// back to that link (`nx/../L`, CWWT-SEC-1: the walk saw no step after
+    /// `nx`, and on Linux the worktree was bound by that spelling, the link
+    /// in it; a submodule's work tree has its own test), and a project that
+    /// is its own repository with a link `L` to the folder above it (the
+    /// layout a
+    /// program in a jail can leave, measured to make a read-only path of
+    /// the project writable). A way through a folder that is not there is no
+    /// place to git, whatever comes after it. The same layout with no link
+    /// is one.
+    ///
+    /// FAILS ON REVERT: find each path with `std::fs::canonicalize` (as
+    /// before) and each is a worktree; stop reading steps after one that is
+    /// not there and each `nx/../L` is one.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_on_the_way_to_a_worktree_is_no_worktree() {
+        use crate::contain::WorktreeLeft;
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let r = std::fs::canonicalize(root.path()).unwrap();
+        let home = r.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let (tree, git_dir, common) = worktree_by_hand(&r, false);
+        let dotgit = tree.join(".git");
+        let real_dotgit = std::fs::read_to_string(&dotgit).unwrap();
+        // The git folder named through a link in the project.
+        symlink(&common, tree.join("L")).unwrap();
+        let through = tree.join("L/worktrees/w");
+        std::fs::write(&dotgit, format!("gitdir: {}\n", through.display())).unwrap();
+        assert_eq!(
+            detect_worktree(&tree, &home),
+            left_out(&tree, &through, WorktreeLeft::Link(tree.join("L")))
+        );
+        // The same through a folder that is not there and back.
+        let gone_through = Path::new("nx/../L/worktrees/w");
+        std::fs::write(&dotgit, format!("gitdir: {}\n", gone_through.display())).unwrap();
+        assert_eq!(
+            detect_worktree(&tree, &home),
+            left_out(&tree, gone_through, WorktreeLeft::Link(tree.join("L")))
+        );
+        // A folder that is not there on the way, and no link at all: the
+        // kernel stops at `nx`, and so does git.
+        let gone_only = tree.join("nx/../../main/.git/worktrees/w");
+        std::fs::write(&dotgit, format!("gitdir: {}\n", gone_only.display())).unwrap();
+        assert_eq!(
+            detect_worktree(&tree, &home),
+            left_out(&tree, &gone_only, WorktreeLeft::NotThere(tree.join("nx")))
+        );
+        // The git folder itself a link.
+        symlink(&git_dir, common.join("worktrees/v")).unwrap();
+        let linked = common.join("worktrees/v");
+        std::fs::write(&dotgit, format!("gitdir: {}\n", linked.display())).unwrap();
+        assert_eq!(
+            detect_worktree(&tree, &home),
+            left_out(&tree, &linked, WorktreeLeft::Link(linked.clone()))
+        );
+        // `commondir` through a link.
+        std::fs::write(&dotgit, &real_dotgit).unwrap();
+        symlink(r.join("main"), r.join("alias")).unwrap();
+        std::fs::write(
+            git_dir.join("commondir"),
+            format!("{}\n", r.join("alias/.git").display()),
+        )
+        .unwrap();
+        assert_eq!(
+            detect_worktree(&tree, &home),
+            left_out(&tree, &git_dir, WorktreeLeft::Link(r.join("alias")))
+        );
+        std::fs::write(
+            git_dir.join("commondir"),
+            format!("{}\n", r.join("nx/../alias/.git").display()),
+        )
+        .unwrap();
+        assert_eq!(
+            detect_worktree(&tree, &home),
+            left_out(&tree, &git_dir, WorktreeLeft::Link(r.join("alias")))
+        );
+        // The link back through a link.
+        std::fs::write(git_dir.join("commondir"), "../..\n").unwrap();
+        symlink(&tree, r.join("walias")).unwrap();
+        for back in ["walias/.git", "nx/../walias/.git"] {
+            std::fs::write(
+                git_dir.join("gitdir"),
+                format!("{}\n", r.join(back).display()),
+            )
+            .unwrap();
+            assert_eq!(
+                detect_worktree(&tree, &home),
+                left_out(&tree, &git_dir, WorktreeLeft::Link(r.join("walias"))),
+                "{back}"
+            );
+        }
+        // With no link on the way: a worktree.
+        std::fs::write(git_dir.join("gitdir"), format!("{}\n", dotgit.display())).unwrap();
+        assert_eq!(
+            detect_worktree(&tree, &home),
+            (
+                Some(Worktree {
+                    git_dir,
+                    common_dir: common
+                }),
+                None
+            )
+        );
+        // A project that is its own repository, its `worktrees/x` naming it
+        // back, with `L` a link to the folder above it: its `.git` and the
+        // `commondir` name the project through `nx/../L/app`.
+        let app = r.join("code/app");
+        git_dir_by_hand(&app);
+        let x = app.join("worktrees/x");
+        std::fs::create_dir_all(&x).unwrap();
+        std::fs::write(
+            x.join("gitdir"),
+            format!("{}\n", app.join(".git").display()),
+        )
+        .unwrap();
+        std::fs::write(
+            x.join("commondir"),
+            format!("{}\n", app.join("nx/../L/app").display()),
+        )
+        .unwrap();
+        symlink("..", app.join("L")).unwrap();
+        let forged = Path::new("nx/../L/app/worktrees/x");
+        std::fs::write(app.join(".git"), format!("gitdir: {}\n", forged.display())).unwrap();
+        assert_eq!(
+            detect_worktree(&app, &home),
+            left_out(&app, forged, WorktreeLeft::Link(app.join("L")))
+        );
+    }
+
+    /// CWWT-SEC-1, C4: a submodule's git folder names its work tree in its
+    /// config (`core.worktree`), which a program in the jail can write too.
+    /// Named through a folder that is not there and a link back to the
+    /// folder above (`../../../nx/../SL/sub`, `SL` a link to `.`), or
+    /// through a folder that is not there alone (`../../../nx/../sub`), it
+    /// names no work tree: the kernel stops at `nx`, and so does git. Its
+    /// own test, so that each assert here is reached with the fix reverted.
+    ///
+    /// FAILS ON REVERT (Linux and macOS): stop reading steps after one that
+    /// is not there and take a way through one (as before): the walk takes
+    /// `nx/../SL/sub` with no link and `nx/../sub` as a place, and
+    /// `nx/../sub` names the project as its work tree. (On Linux the
+    /// spelling through `SL` was no worktree before either: the walk gave
+    /// `super/SL/sub`, which is not the project's spelling.)
+    #[cfg(unix)]
+    #[test]
+    fn a_submodule_whose_work_tree_is_named_through_a_missing_folder_is_no_worktree() {
+        use crate::contain::WorktreeLeft;
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let r = std::fs::canonicalize(root.path()).unwrap();
+        let home = r.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        // A submodule whose config names its work tree through a folder
+        // that is not there and a link back to it: no work tree named.
+        let modules = r.join("super/.git/modules/sub");
+        git_dir_by_hand(&modules);
+        std::fs::create_dir_all(r.join("super/sub")).unwrap();
+        symlink(".", r.join("super/SL")).unwrap();
+        std::fs::write(r.join("super/sub/.git"), "gitdir: ../.git/modules/sub\n").unwrap();
+        let named = Path::new("../.git/modules/sub");
+        // What the walk finds for each spelling, apart: on Linux the
+        // spelling through `SL` was no worktree before either (`super/SL/
+        // sub` is not the project's spelling), so the walk itself is what
+        // these hold: through the link, and through `nx` alone.
+        assert_eq!(
+            folder_without_links(&modules.join("../../../nx/../SL/sub")),
+            Err(WorktreeLeft::Link(r.join("super/SL")))
+        );
+        assert_eq!(
+            folder_without_links(&modules.join("../../../nx/../sub")),
+            Err(WorktreeLeft::NotThere(r.join("super/nx")))
+        );
+        for tree_named in [
+            "../../../sub",
+            "../../../nx/../SL/sub",
+            "../../../nx/../sub",
+        ] {
+            std::fs::write(
+                modules.join("config"),
+                format!("[core]\n\tbare = false\n\tworktree = {tree_named}\n"),
+            )
+            .unwrap();
+            let found = detect_worktree(&r.join("super/sub"), &home);
+            if tree_named == "../../../sub" {
+                assert!(found.0.is_some(), "{found:?}");
+            } else {
+                assert_eq!(
+                    found,
+                    left_out(&r.join("super/sub"), named, WorktreeLeft::NoBackLink),
+                    "{tree_named}"
+                );
+            }
+        }
+    }
+
+    /// CW-worktree-gitdir (macOS): on a disk that tells no case apart, a
+    /// worktree's `.git` and its link back may spell a folder in another
+    /// case than the disk does (`~/Code` for `~/code`), as git keeps what
+    /// it was given. That is no link: the worktree is found, spelled as the
+    /// disk spells it, as the project is and as the sandbox matches it. A
+    /// disk that tells case apart has no such folder, and the test says so.
+    ///
+    /// FAILS ON REVERT: keep each place as the files spell it and the link
+    /// back names another project.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn on_macos_a_worktree_spelled_in_another_case_is_found_as_the_disk_spells_it() {
+        let root = tempfile::tempdir().unwrap();
+        let r = std::fs::canonicalize(root.path()).unwrap();
+        let (tree, git_dir, common) = worktree_by_hand(&r, false);
+        if std::fs::symlink_metadata(r.join("MAIN")).is_err() {
+            eprintln!("this disk tells case apart: nothing to find");
+            return;
+        }
+        std::fs::write(
+            tree.join(".git"),
+            format!("gitdir: {}\n", r.join("MAIN/.git/worktrees/w").display()),
+        )
+        .unwrap();
+        std::fs::write(
+            git_dir.join("gitdir"),
+            format!("{}\n", r.join("W/.git").display()),
+        )
+        .unwrap();
+        assert_eq!(
+            detect_worktree(&tree, Path::new("/nonexistent-home")),
+            (
+                Some(Worktree {
+                    git_dir,
+                    common_dir: common
+                }),
+                None
+            )
+        );
+    }
+
+    /// CW-worktree-gitdir (Linux): the real run binds a worktree's git
+    /// folder and its repository from descriptors it opens just before
+    /// bwrap starts ([`hold_binds`]), as it binds a profile's read-only
+    /// paths. A program in a jail of the repository's own project writes
+    /// that repository, and swapped its `.git` for a link to a folder of
+    /// the home after the launcher found the worktree: the launch stops and
+    /// says so; nothing of the worktree is bound by name. That folder of the
+    /// home holds a `worktrees/w` folder, so the walk opens it to the end
+    /// and the launch stops because the git folder leads there now (not on
+    /// a step that is not there). And a git folder swapped for a regular
+    /// file opens with no link on the way, at its own place, and stops the
+    /// launch because it is no folder now (CWWT-T2).
+    ///
+    /// FAILS ON REVERT: leave the worktree's folders out of
+    /// `places_bound_from_descriptors` and the swapped folder is bound by
+    /// name, read-write, where the link leads; drop the check that a place
+    /// opened is where it was found and the link is held; drop the check
+    /// that a worktree's folder is a folder still and bwrap is handed the
+    /// file.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_worktree_folder_swapped_for_a_link_after_the_plan_stops_the_launch() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let r = std::fs::canonicalize(root.path()).unwrap();
+        let home = r.join("home");
+        std::fs::create_dir_all(home.join(".kube/worktrees/w")).unwrap();
+        let (tree, git_dir, common) = worktree_by_hand(&r, false);
+        let rest: Vec<String> = ["--project", tree.to_str().unwrap(), "--", "true"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let args = parse_contain_args(&rest).unwrap();
+        let input = resolve_inputs(args, home.clone(), PathBuf::from("/usr/bin/true")).unwrap();
+        assert_eq!(
+            input.worktree,
+            Some(Worktree {
+                git_dir: git_dir.clone(),
+                common_dir: common.clone(),
+            })
+        );
+        let (held_input, held) = hold_binds(&input, true).unwrap();
+        let a = build_linux_jail(&held_input).unwrap().bwrap_args;
+        for dir in [&git_dir, &common] {
+            assert!(
+                a.windows(3)
+                    .any(|x| x[0] == "--bind-fd" && x[2] == dir.to_str().unwrap()),
+                "{a:?}"
+            );
+            assert!(
+                !a.windows(3)
+                    .any(|x| x[0] == "--bind" && x[2] == dir.to_str().unwrap()),
+                "{a:?}"
+            );
+        }
+        drop(held);
+        // A jail of `main` swaps its `.git` for a link to `~/.kube`.
+        std::fs::rename(&common, r.join("main/.git.old")).unwrap();
+        symlink(home.join(".kube"), &common).unwrap();
+        assert_eq!(
+            hold_binds(&input, true).unwrap_err(),
+            crate::contain::held_place_changed(
+                &git_dir,
+                &format!(
+                    "it leads to {} now",
+                    home.join(".kube/worktrees/w").display()
+                )
+            )
+        );
+        // Put back, then the git folder swapped for a regular file.
+        std::fs::remove_file(&common).unwrap();
+        std::fs::rename(r.join("main/.git.old"), &common).unwrap();
+        assert!(hold_binds(&input, true).is_ok());
+        std::fs::rename(&git_dir, common.join("worktrees/w.old")).unwrap();
+        std::fs::write(&git_dir, "not a folder\n").unwrap();
+        assert_eq!(
+            hold_binds(&input, true).unwrap_err(),
+            crate::contain::held_place_changed(&git_dir, "it is no folder now")
+        );
+        // A bwrap that binds no descriptor: nothing opened.
+        let (same, none) = hold_binds(&input, false).unwrap();
+        assert!(none.is_empty() && same.bind_fds.is_empty());
+    }
+
+    /// CWWT-SEC-1, live (Linux, the host's own bwrap): a program in a jail
+    /// of the project `app` lays it out as its own repository (`HEAD`,
+    /// `objects`, `refs`, `worktrees/x` naming its `.git` back), puts `L`, a
+    /// link to the folder above it, there, and has its `.git` and
+    /// `commondir` name the project through `nx/../L/app` (`nx` is not
+    /// there). The profile shows `app/vendor` read-only. The worktree was
+    /// taken by that spelling, `app/L/app`: the read-only bind of `vendor`
+    /// came before the worktree's bind, which bwrap took through `L` onto
+    /// the project, and the jail wrote `vendor` (measured with bwrap 0.9.0
+    /// on Ubuntu 24.04); where bwrap binds from descriptors the link stopped
+    /// every launch. Now no worktree is found, the one line says why, and in
+    /// the plan bwrap runs by name (a bwrap that binds no descriptor) and,
+    /// where this bwrap binds them, in the one it runs from descriptors, the
+    /// jail starts and `vendor` stays as it was. A host whose bwrap cannot
+    /// start a jail fails the test (CWWT-C5): it would prove nothing.
+    ///
+    /// FAILS ON REVERT: stop reading steps after one that is not there and
+    /// take a way through one (as before): the line is not said. (The
+    /// worktree it then finds, spelled through `L`, lies in the project by
+    /// that spelling, so since CWWT-C2 it is not bound either; before that
+    /// the by-name jail wrote `vendor`, and the descriptor plan stopped the
+    /// launch.)
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_worktree_forged_through_a_missing_folder_never_makes_a_read_only_path_writable() {
+        use crate::contain::WorktreeLeft;
+        use std::os::unix::fs::symlink;
+        let bwrap = resolve_backend(BWRAP_PATHS)
+            .expect("this test runs the host's bubblewrap: install bwrap instead of skipping it");
+        let root = tempfile::tempdir().unwrap();
+        let r = std::fs::canonicalize(root.path()).unwrap();
+        let home = r.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let app = r.join("code/app");
+        git_dir_by_hand(&app);
+        let x = app.join("worktrees/x");
+        std::fs::create_dir_all(&x).unwrap();
+        std::fs::write(
+            x.join("gitdir"),
+            format!("{}\n", app.join(".git").display()),
+        )
+        .unwrap();
+        std::fs::write(
+            x.join("commondir"),
+            format!("{}\n", app.join("nx/../L/app").display()),
+        )
+        .unwrap();
+        symlink("..", app.join("L")).unwrap();
+        let forged = Path::new("nx/../L/app/worktrees/x");
+        std::fs::write(app.join(".git"), format!("gitdir: {}\n", forged.display())).unwrap();
+        let vendor = app.join("vendor");
+        std::fs::create_dir_all(&vendor).unwrap();
+        std::fs::write(vendor.join("f"), "orig").unwrap();
+        let script = format!(
+            "echo AGENT > '{}' 2>/dev/null; echo STARTED",
+            vendor.join("f").display()
+        );
+        let rest: Vec<String> = [
+            "--project",
+            app.to_str().unwrap(),
+            "--",
+            "/bin/sh",
+            "-c",
+            &script,
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let mut args = parse_contain_args(&rest).unwrap();
+        args.extra_ro = vec![vendor.clone()];
+        let input = resolve_inputs(args, home.clone(), PathBuf::from("/usr/bin/true")).unwrap();
+        assert_eq!(input.worktree, None);
+        assert!(
+            input.left.contains(&crate::contain::worktree_left_out(
+                &app.join(".git"),
+                forged,
+                &WorktreeLeft::Link(app.join("L"))
+            )),
+            "{:?}",
+            input.left
+        );
+        let input = with_linked_places_made(&input);
+        // CWWT-C5: a host whose bwrap cannot start a jail proves nothing
+        // here, so it fails rather than pass with nothing run.
+        if let Some(lines) = restriction_advice(&bwrap) {
+            panic!(
+                "this test runs a jail with the host's bubblewrap, which cannot start one here \
+                 (lift the restriction, as CI does, instead of skipping it): {lines:?}"
+            );
+        }
+        let by_descriptor = bwrap_binds_fds();
+        for takes_fds in [false, true] {
+            if takes_fds && !by_descriptor {
+                eprintln!("this bwrap binds no descriptor: the by-name plan only");
+                continue;
+            }
+            let (held_input, held) = hold_binds(&input, takes_fds)
+                .unwrap_or_else(|why| panic!("fds {takes_fds}: the launch stopped: {why}"));
+            let plan = build_linux_jail(&held_input).unwrap();
+            assert!(
+                !plan.bwrap_args.iter().any(|arg| arg.contains("/L/")),
+                "{:?}",
+                plan.bwrap_args
+            );
+            let out = Command::new(&bwrap)
+                .args(&plan.bwrap_args)
+                .envs(plan.env.iter().cloned())
+                .stdin(std::process::Stdio::null())
+                .output()
+                .unwrap();
+            drop(held);
+            let said = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success() && said.contains("STARTED"),
+                "fds {takes_fds}: {said} {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(
+                std::fs::read_to_string(vendor.join("f")).unwrap(),
+                "orig",
+                "fds {takes_fds}"
+            );
+        }
+    }
+
+    /// CWWT-C3: a link inside a hidden dotdir leads into a folder every jail
+    /// writes (`~/.ssh/config` a link to `~/.local/share/dots/ssh_config`),
+    /// and a program in a jail lays a repository out around it there (it
+    /// writes `~/.local`), with `worktrees/x` naming the project back and the
+    /// project's `.git` naming that. The next launch refused to start
+    /// ("unsafe worktree common path ... which the jail hides"), where any
+    /// other `.git` file that is no worktree to show is one line and a jail
+    /// that starts. The jail shows `~/.local` anyway, so the worktree is not
+    /// bound and nothing is said; the same in `~/dots`, which no jail shows,
+    /// is left out with one line. Either way the jail starts, and the place
+    /// the link leads to stays hidden.
+    ///
+    /// FAILS ON REVERT: keep the worktree the plan finds over a hidden place
+    /// (as before) and the launch is refused.
+    #[cfg(unix)]
+    #[test]
+    fn a_worktree_over_where_a_link_in_a_hidden_dotdir_leads_never_stops_the_launch() {
+        use crate::contain::WorktreeLeft;
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let r = std::fs::canonicalize(root.path()).unwrap();
+        let home = r.join("home");
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        let proj = r.join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let macos = cfg!(target_os = "macos");
+        for (repo, said) in [
+            (home.join(".local/share/dots"), false),
+            (home.join("dots"), true),
+        ] {
+            git_dir_by_hand(&repo);
+            std::fs::write(repo.join("ssh_config"), "Host *\n").unwrap();
+            let x = repo.join("worktrees/x");
+            std::fs::create_dir_all(&x).unwrap();
+            std::fs::write(
+                x.join("gitdir"),
+                format!("{}\n", proj.join(".git").display()),
+            )
+            .unwrap();
+            std::fs::write(x.join("commondir"), "../..\n").unwrap();
+            let _ = std::fs::remove_file(home.join(".ssh/config"));
+            symlink(repo.join("ssh_config"), home.join(".ssh/config")).unwrap();
+            std::fs::write(proj.join(".git"), format!("gitdir: {}\n", x.display())).unwrap();
+            assert_eq!(
+                detect_worktree(&proj, &home).0,
+                Some(Worktree {
+                    git_dir: x.clone(),
+                    common_dir: repo.clone(),
+                }),
+                "{}",
+                repo.display()
+            );
+            let rest: Vec<String> = ["--project", proj.to_str().unwrap(), "--", "true"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            let args = parse_contain_args(&rest).unwrap();
+            let input = resolve_inputs(args, home.clone(), PathBuf::from("/usr/bin/true")).unwrap();
+            assert_eq!(input.worktree, None, "{}", repo.display());
+            let line = crate::contain::worktree_left_out(
+                &proj.join(".git"),
+                &x,
+                &WorktreeLeft::Hidden {
+                    folder: repo.clone(),
+                    place: repo.join("ssh_config"),
+                    through: Some(home.join(".ssh/config")),
+                },
+            );
+            assert_eq!(input.left.contains(&line), said, "{:?}", input.left);
+            assert!(
+                !input.left.iter().any(|l| l.contains("as its git folder")) || said,
+                "{:?}",
+                input.left
+            );
+            validate_jail_inputs_for(&input, macos)
+                .unwrap_or_else(|why| panic!("{}: the launch stopped: {why}", repo.display()));
+        }
+    }
+
+    /// CWWT-BRK-1, C2: a worktree of a repository in a home folder every
+    /// jail shows writable (`~/.config/nvim`) is a worktree, and the jail
+    /// shows it there anyway: once planned it is not bound, and nothing is
+    /// said. Where a profile's read-only path holds the repository, the
+    /// worktree is bound as any other, so git in the jail still writes it
+    /// (the worktree's write wins there, as it does in every other place).
+    ///
+    /// FAILS ON REVERT: take every folder of the home whose name starts with
+    /// a dot as one no jail shows (before BRK-1) and the read-only path wins
+    /// over the worktree; bind a worktree the jail shows anyway (before C2)
+    /// and the plan keeps it.
+    #[cfg(unix)]
+    #[test]
+    fn a_worktree_in_a_folder_every_jail_writes_is_shown_by_that_folder() {
+        let root = tempfile::tempdir().unwrap();
+        let r = std::fs::canonicalize(root.path()).unwrap();
+        let home = r.join("home");
+        let repo = home.join(".config/nvim");
+        git_dir_by_hand(&repo.join(".git"));
+        let git_dir = repo.join(".git/worktrees/w");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        let tree = home.join("code/w");
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(
+            git_dir.join("gitdir"),
+            format!("{}\n", tree.join(".git").display()),
+        )
+        .unwrap();
+        std::fs::write(git_dir.join("commondir"), "../..\n").unwrap();
+        std::fs::write(
+            tree.join(".git"),
+            format!("gitdir: {}\n", git_dir.display()),
+        )
+        .unwrap();
+        let worktree = Worktree {
+            git_dir: git_dir.clone(),
+            common_dir: repo.join(".git"),
+        };
+        assert_eq!(
+            detect_worktree(&tree, &home),
+            (Some(worktree.clone()), None)
+        );
+        let rest: Vec<String> = ["--project", tree.to_str().unwrap(), "--", "true"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let args = parse_contain_args(&rest).unwrap();
+        let input =
+            resolve_inputs(args.clone(), home.clone(), PathBuf::from("/usr/bin/true")).unwrap();
+        assert_eq!(input.worktree, None);
+        assert!(input.left.is_empty(), "{:?}", input.left);
+        let mut read_only = args;
+        read_only.extra_ro = vec![repo.clone()];
+        let input = resolve_inputs(read_only, home, PathBuf::from("/usr/bin/true")).unwrap();
+        assert_eq!(input.worktree, Some(worktree));
+    }
+
+    /// CRIT-3: a repository made with `--separate-git-dir` (`git init` or
+    /// `git clone`, as dotfile managers lay theirs out): its `.git` file
+    /// names a git folder that keeps no `commondir`, no `gitdir` back and no
+    /// `core.worktree` (git 2.52 writes only `repositoryformatversion`,
+    /// `filemode`, `bare` and `logallrefupdates`), the same as a folder a
+    /// program in a jail named. It is not shown (the jail before this phase
+    /// bound it read-write), and the line says what to do: move the git
+    /// folder into the project, or work in a linked worktree. Laid out by
+    /// hand as git lays it, and by git itself where this host has git.
+    ///
+    /// FAILS ON REVERT: take a git folder with no `commondir` as the
+    /// project's own (as before), or drop the remedy from the line.
+    #[cfg(unix)]
+    #[test]
+    fn a_separate_git_dir_is_not_shown_and_the_line_says_what_to_do() {
+        let root = tempfile::tempdir().unwrap();
+        let r = std::fs::canonicalize(root.path()).unwrap();
+        let effect = if cfg!(target_os = "macos") {
+            "the jail does not let a program in it write there (git in the jail cannot commit \
+             here)"
+        } else {
+            "the jail does not show it (git in the jail sees no repository here)"
+        };
+        let said = |dotgit: &Path, named: &Path| {
+            format!(
+                "{} names {} as its git folder, and that folder does not name this project \
+                 back: {effect}. For a repository made with --separate-git-dir, move its git \
+                 folder into the project in place of the .git file, or work in a worktree made \
+                 with git worktree add",
+                dotgit.display(),
+                named.display()
+            )
+        };
+        let store = r.join("store.git");
+        let proj = r.join("proj");
+        git_dir_by_hand(&store);
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(
+            store.join("config"),
+            "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = false\n\
+             \tlogallrefupdates = true\n",
+        )
+        .unwrap();
+        std::fs::write(proj.join(".git"), format!("gitdir: {}\n", store.display())).unwrap();
+        assert_eq!(
+            detect_worktree(&proj, &r),
+            (None, Some(said(&proj.join(".git"), &store)))
+        );
+        // Made by git itself, where this host has it.
+        let made = r.join("made");
+        let made_store = r.join("made-store.git");
+        let git = Command::new("git")
+            .args(["init", "-q", "--separate-git-dir"])
+            .arg(&made_store)
+            .arg(&made)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", &r)
+            .stdin(std::process::Stdio::null())
+            .output();
+        if git.is_ok_and(|out| out.status.success()) {
+            assert_eq!(
+                detect_worktree(&made, &r),
+                (None, Some(said(&made.join(".git"), &made_store)))
+            );
+        }
+    }
+
+    /// CWNF-1: the launcher read the project's `.git` file and the
+    /// `commondir` it names with a blocking read, and a program in the jail
+    /// writes both: a FIFO there held the launcher for as long as that
+    /// program liked, after it had looked at the profile's read-only paths
+    /// and before bwrap bound them (measured: one stall was enough to swap
+    /// a checked folder for a link). Each such file is read without
+    /// waiting, a regular file only, a few bytes at most: a FIFO is no
+    /// worktree, at once.
+    ///
+    /// FAILS ON REVERT: read `commondir` with `std::fs::read_to_string` (as
+    /// before) and the launcher waits on the FIFO until the test gives up.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_in_the_projects_git_files_never_holds_the_launcher() {
+        let root = tempfile::tempdir().unwrap();
+        let r = std::fs::canonicalize(root.path()).unwrap();
+        let (tree, git_dir, _) = worktree_by_hand(&r, false);
+        std::fs::remove_file(git_dir.join("commondir")).unwrap();
+        let fifo = std::ffi::CString::new(git_dir.join("commondir").to_str().unwrap()).unwrap();
+        // SAFETY: a NUL-ended path alive for the call.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let (done, waited) = std::sync::mpsc::channel();
+        let looked = tree.clone();
+        std::thread::spawn(move || {
+            let _ = done.send(detect_worktree(&looked, Path::new("/nonexistent-home")));
+        });
+        let found = waited
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the launcher waited on a FIFO in the project's git files");
+        assert_eq!(found.0, None);
+        // A huge `.git` file is not read whole either.
+        std::fs::write(tree.join(".git"), "x".repeat(1 << 20)).unwrap();
+        assert_eq!(detect_worktree(&tree, &r), (None, None));
     }
 }
