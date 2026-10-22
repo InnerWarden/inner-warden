@@ -5119,7 +5119,13 @@ mod tests {
                     .any(|x| x[0] == "--ro-bind-fd" && x[2] == versions.to_str().unwrap()),
                 "{a:?}"
             );
-            assert!(!a.iter().any(|arg| arg == "--ro-bind-try"), "{a:?}");
+            // Never also by name (the host's resolver file may be, a
+            // systemd-resolved runner binds its stub with -try).
+            assert!(
+                !a.windows(3)
+                    .any(|x| x[0] == "--ro-bind-try" && x[2] == versions.to_str().unwrap()),
+                "{a:?}"
+            );
         }
         drop(held);
         // An earlier jail swaps the planned folder for a link meanwhile.
