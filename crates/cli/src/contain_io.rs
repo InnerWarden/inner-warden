@@ -5110,13 +5110,17 @@ mod tests {
             "{:?}",
             held_input.bind_fds
         );
-        let a = build_linux_jail(&held_input).unwrap().bwrap_args;
-        assert!(
-            a.windows(3)
-                .any(|x| x[0] == "--ro-bind-fd" && x[2] == versions.to_str().unwrap()),
-            "{a:?}"
-        );
-        assert!(!a.iter().any(|arg| arg == "--ro-bind-try"), "{a:?}");
+        // The command line binds the held folder from its descriptor only
+        // where this host's bwrap can (a CI runner's 0.9.0 cannot).
+        if bwrap_binds_fds() {
+            let a = build_linux_jail(&held_input).unwrap().bwrap_args;
+            assert!(
+                a.windows(3)
+                    .any(|x| x[0] == "--ro-bind-fd" && x[2] == versions.to_str().unwrap()),
+                "{a:?}"
+            );
+            assert!(!a.iter().any(|arg| arg == "--ro-bind-try"), "{a:?}");
+        }
         drop(held);
         // An earlier jail swaps the planned folder for a link meanwhile.
         std::fs::rename(&versions, home.join(".local/share/claude/versions.old")).unwrap();
