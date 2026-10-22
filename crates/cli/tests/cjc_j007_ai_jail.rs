@@ -718,8 +718,21 @@ fn dry_run_shows_the_record_and_info_descriptors_only_with_the_identity_flag() {
     // list, the line that says why it is not there, or, where the kernel's
     // restriction stops the real run first, its advice. Exactly the one this
     // host's facts give; the plain run shows the same filter (its own, the
-    // terminal one) and never the advice.
-    let option = " --unshare-ipc --seccomp 13 --cap-drop ALL --hostname ai-sandbox ";
+    // terminal one) and never the advice. The identified jail lays its
+    // filter first of all (a reader of its command line that knows only an
+    // older bubblewrap's options finds it before a descriptor bind), the plain one
+    // after the namespaces; the rest is compared with the filter put where
+    // the plain one has it.
+    let first = "\n  --seccomp 13 --ro-bind /usr /usr ";
+    let after = " --unshare-ipc --cap-drop ALL --hostname ai-sandbox ";
+    let filter_first = identified.contains(first) && identified.contains(after);
+    let identified = if identified.contains(first) {
+        identified
+            .replacen("\n  --seccomp 13 ", "\n  ", 1)
+            .replacen(" --unshare-ipc ", " --unshare-ipc --seccomp 13 ", 1)
+    } else {
+        identified
+    };
     let plain_option = " --unshare-ipc --seccomp 13 --hostname ai-sandbox ";
     let said = "# innerwarden contain: user namespaces stay open (";
     let plain_said = "# innerwarden contain: no sandbox filter (filter_probe_failed): ";
@@ -735,7 +748,7 @@ fn dry_run_shows_the_record_and_info_descriptors_only_with_the_identity_flag() {
     let here = filter_here();
     assert_eq!(
         (
-            identified.contains(option),
+            filter_first,
             identified.contains(said),
             identified.contains(advice)
         ),
@@ -2094,34 +2107,27 @@ fn claude_codes_folders_are_the_jails_own_through_a_linked_claude_folder() {
 /// bind came before the project's, which covered it (measured with bwrap
 /// 0.9: the host file read `orig,jail`); on macOS nothing denied writing
 /// it. It is read-only on both now, cannot be moved away from its name,
-/// and the project around it is still written.
+/// and the project around it is still written. On Linux that needs a bwrap
+/// that binds a folder from a descriptor: with one that binds none, the
+/// path (in the project, which a jail writes) is left out and said, and
+/// the jail still starts ([`a_strict_profile_never_starts_where_bwrap_cannot_keep_its_read_only_path`]).
 ///
 /// FAILS ON REVERT: lay every read-only path before the project (Linux) or
 /// drop the read-only denies (macOS), and the host file is written.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn a_read_only_path_of_a_profile_inside_the_project_is_never_written() {
-    use std::os::unix::fs::PermissionsExt;
     #[cfg(target_os = "linux")]
     require_bwrap();
     let home = tempfile::TempDir::new().unwrap();
     let h = std::fs::canonicalize(home.path()).unwrap();
     std::fs::create_dir_all(h.join(".local/state")).unwrap();
-    std::fs::create_dir_all(h.join(".config/innerwarden")).unwrap();
     let project = tempfile::TempDir::new().unwrap();
     let p = std::fs::canonicalize(project.path()).unwrap();
     std::fs::create_dir_all(p.join("vendor")).unwrap();
     std::fs::write(p.join("vendor/lib.txt"), "orig").unwrap();
-    let file = h.join(".config/innerwarden/agent-profiles.toml");
-    std::fs::write(
-        &file,
-        format!(
-            "schema_version = 2\n[profile.claude-code.jail]\nextra_ro = [\"{}\"]\n",
-            p.join("vendor").display()
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let vendor = p.join("vendor");
+    profile_that_shows(&h, &[vendor.to_str().unwrap()]);
     let script = format!(
         "set -- '{}'; \
          if ( echo jail >> \"$1/vendor/lib.txt\" ) 2>/dev/null; then echo WROTE; fi; \
@@ -2158,6 +2164,12 @@ fn a_read_only_path_of_a_profile_inside_the_project_is_never_written() {
         err.contains("jail settings from the `claude-code` agent profile"),
         "{err}"
     );
+    #[cfg(target_os = "linux")]
+    if !bwrap_binds_fds() {
+        // A bwrap that binds no folder from a descriptor: left out, said.
+        assert!(err.contains(&not_held(&vendor)), "{err}");
+        return;
+    }
     for written in ["WROTE", "MADE", "MOVED"] {
         assert!(!out.contains(written), "{written}: {out}");
     }
@@ -2166,6 +2178,1246 @@ fn a_read_only_path_of_a_profile_inside_the_project_is_never_written() {
         "orig"
     );
     assert!(!p.join("vendor/new.txt").exists() && !p.join("moved").exists());
+}
+
+/// CRIT-1 (spec 104 seam), live: a reader of the command line of the jail's
+/// own bwrap that knows only the options of an older bubblewrap, read
+/// option by option, ends the read at an option it does not know with no
+/// filter found. The real run binds the records' folders it pins from
+/// descriptors wherever bwrap takes them (`--bind-fd`, which such a reader
+/// does not know), and laid the filter after them: such a reader took every
+/// identified jail there for one without a filter. The bwrap of a running
+/// identified jail, as `/proc` shows it, now hands the filter as its first
+/// option, before any descriptor bind.
+///
+/// FAILS ON REVERT: lay the identified jail's filter after the namespaces
+/// again, and the first `--bind-fd` comes before it.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_running_identified_jail_hands_its_filter_before_any_descriptor_bind() {
+    require_bwrap();
+    let home = state_home();
+    let project = tempfile::TempDir::new().unwrap();
+    let p = std::fs::canonicalize(project.path()).unwrap();
+    let go = p.join("GO");
+    let script = format!(
+        "i=0; while [ ! -e '{}' ] && [ $i -lt 300 ]; do sleep 0.1; i=$((i+1)); done",
+        go.display()
+    );
+    let mut command = cli();
+    command
+        .args([
+            "contain",
+            "--identity",
+            "--project",
+            p.to_str().unwrap(),
+            "--",
+            "/bin/sh",
+            "-c",
+            &script,
+        ])
+        .env("HOME", home.path())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    let mut child = identified_without_a_scope(&mut command)
+        .spawn()
+        .expect("run Linux AI Jail with --identity");
+    let stderr = stderr_to_end(&mut child);
+    // The jail's bwrap: its command line names the project's `GO`.
+    let mut words: Vec<String> = Vec::new();
+    for _ in 0..200 {
+        words = std::fs::read_dir("/proc")
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().parse::<u32>().is_ok())
+            .filter_map(|entry| std::fs::read(entry.path().join("cmdline")).ok())
+            .map(|bytes| {
+                bytes
+                    .split(|b| *b == 0)
+                    .filter(|w| !w.is_empty())
+                    .map(|w| String::from_utf8_lossy(w).into_owned())
+                    .collect::<Vec<_>>()
+            })
+            .find(|argv| {
+                argv.first().is_some_and(|a| a.ends_with("/bwrap"))
+                    && argv.iter().any(|a| a.contains(go.to_str().unwrap()))
+            })
+            .unwrap_or_default();
+        if !words.is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    std::fs::write(&go, "").unwrap();
+    let status = child.wait().unwrap();
+    let err = stderr
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("the jail ended");
+    assert!(status.success(), "{err}");
+    assert!(!words.is_empty(), "no running bwrap of the jail: {err}");
+    let first_fd_bind = words
+        .iter()
+        .position(|w| w == "--bind-fd" || w == "--ro-bind-fd");
+    assert_eq!(
+        first_fd_bind.is_some(),
+        bwrap_binds_fds(),
+        "the records' folders are pinned from descriptors where bwrap binds them: {words:?}"
+    );
+    if filter_here() == FilterHere::Taken {
+        assert_eq!(words[1], "--seccomp", "{words:?}");
+        assert!(
+            !words[2].is_empty() && words[2].bytes().all(|b| b.is_ascii_digit()),
+            "{words:?}"
+        );
+        assert_eq!(words.iter().filter(|w| *w == "--seccomp").count(), 1);
+    }
+}
+
+/// What bubblewrap keeps a read-only path in a folder a jail writes, in the
+/// launcher's lines.
+#[cfg(target_os = "linux")]
+const NEWER_BWRAP: &str = "bubblewrap 0.10.0 or later, or a bubblewrap whose security update \
+     added --ro-bind-fd (the current packages of Debian 12, Ubuntu 22.04 and 24.04, and RHEL 9 \
+     have it)";
+
+/// The line the launcher says for a read-only path in a folder a jail
+/// writes, left out because the bwrap in use binds no folder from a
+/// descriptor.
+#[cfg(target_os = "linux")]
+fn not_held(path: &std::path::Path) -> String {
+    format!(
+        "{} is in a folder a program in the jail can write, or goes through a link there, and \
+         this bubblewrap binds no folder from a descriptor (--ro-bind-fd), so it cannot hold \
+         the path in place: the jail starts without it and does not make it read-only; \
+         {NEWER_BWRAP} keeps it",
+        path.display()
+    )
+}
+
+/// CRIT-2: where bwrap binds no folder from a descriptor (upstream before
+/// 0.10.0, a distribution's bubblewrap without its security update), a
+/// read-only path of the profile in a folder a jail writes is left out: the
+/// jail shows it and its programs write it. A profile that starts the jail
+/// only once the host admitted it asked for every defence in effect: such a
+/// jail never starts there, in a dry run or a real run, and the launcher
+/// says why and what to do; the jail's command never runs. Where bwrap
+/// binds from descriptors the dry run lays the path read-only from its
+/// descriptor, and the real run waits for the host's admission as before
+/// (none here: it does not start either, for that reason).
+///
+/// FAILS ON REVERT: refuse nothing under `only_when_admitted`, and on a
+/// bwrap that binds no descriptor the dry run plans a jail with the path
+/// left writable, and the real run asks the host to admit that jail.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_strict_profile_never_starts_where_bwrap_cannot_keep_its_read_only_path() {
+    use std::os::unix::fs::PermissionsExt;
+    require_bwrap();
+    let (_home, h) = extra_home();
+    let project = tempfile::TempDir::new().unwrap();
+    let p = std::fs::canonicalize(project.path()).unwrap();
+    let vendor = p.join("vendor");
+    std::fs::create_dir_all(&vendor).unwrap();
+    std::fs::write(vendor.join("lib.txt"), "orig").unwrap();
+    let file = h.join(".config/innerwarden/agent-profiles.toml");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(
+        &file,
+        format!(
+            "schema_version = 2\n[profile.claude-code.jail]\nstart = \"only_when_admitted\"\n\
+             extra_ro = [\"{}\"]\n",
+            vendor.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let refused = format!(
+        "innerwarden contain: this bubblewrap binds no folder from a descriptor (--ro-bind-fd), \
+         so the jail cannot keep the profile's read-only path {} read-only (in a folder a \
+         program in the jail can write, or through a link there), and the profile starts the \
+         jail only when admitted (start = \"only_when_admitted\"): the jail does not start. \
+         Install {NEWER_BWRAP}, or take it out of extra_ro",
+        vendor.display()
+    );
+    let held = bwrap_binds_fds();
+    // What the command prints when it runs; a dry run shows the script, so
+    // the words are joined only by running it.
+    let script = format!(
+        "echo jail >> '{}/lib.txt' 2>/dev/null; printf 'COMMAND-%s\\n' RAN",
+        vendor.display()
+    );
+    for dry in [true, false] {
+        let mut command = cli();
+        command.arg("contain").arg("--identity");
+        if dry {
+            command.arg("--dry-run");
+        }
+        command
+            .args([
+                "--project",
+                p.to_str().unwrap(),
+                "--",
+                "/bin/sh",
+                "-c",
+                &script,
+            ])
+            .env("HOME", &h)
+            .env_remove("XDG_STATE_HOME");
+        identified_without_a_scope(&mut command);
+        let output = command.output().expect("run the identified jail");
+        let out = String::from_utf8_lossy(&output.stdout);
+        let err = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !out.contains("COMMAND-RAN"),
+            "dry={dry}: the command ran: {out} {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(vendor.join("lib.txt")).unwrap(),
+            "orig",
+            "dry={dry}"
+        );
+        if held {
+            assert!(!err.contains(&refused), "dry={dry}: {err}");
+            if dry {
+                assert!(output.status.success(), "{out} {err}");
+                assert!(
+                    out.contains(&format!(" --ro-bind-try {0} {0} ", vendor.display())),
+                    "the dry run names it by its host folder: {out}"
+                );
+            } else {
+                // No host to admit the jail here: refused for that.
+                assert_eq!(output.status.code(), Some(2), "{out} {err}");
+            }
+        } else {
+            assert_eq!(output.status.code(), Some(2), "dry={dry}: {out} {err}");
+            assert!(err.lines().any(|line| line == refused), "dry={dry}: {err}");
+            assert!(!out.contains("bwrap"), "dry={dry}: no plan: {out}");
+        }
+    }
+}
+
+/// The profile of the home `h` that shows `paths` read-only in the
+/// claude-code jail (`extra_ro`).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn profile_that_shows(h: &std::path::Path, paths: &[&str]) {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = h.join(".config/innerwarden");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("agent-profiles.toml");
+    let list = paths
+        .iter()
+        .map(|path| format!("\"{path}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    std::fs::write(
+        &file,
+        format!("schema_version = 2\n[profile.claude-code.jail]\nextra_ro = [{list}]\n"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+/// The line the launcher says for a read-only path left out because
+/// `link`, a link a program in a jail can change, leads where the jail
+/// shows nothing else.
+#[cfg(target_os = "linux")]
+fn link_left(link: &std::path::Path) -> String {
+    format!(
+        "{} is a link in a folder a program in the jail can write, and the jail shows nothing \
+         else of where it leads: the jail does not follow it, and starts without the extra \
+         path; list the real folder instead",
+        link.display()
+    )
+}
+
+/// A home for a jail of a profile's read-only paths, its launcher's records
+/// folder there.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn extra_home() -> (tempfile::TempDir, std::path::PathBuf) {
+    let home = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir_all(home.path().join(".local/state")).unwrap();
+    let h = std::fs::canonicalize(home.path()).unwrap();
+    (home, h)
+}
+
+/// Whether this host's bwrap binds a place from a descriptor, as its own
+/// help says.
+#[cfg(target_os = "linux")]
+fn bwrap_binds_fds() -> bool {
+    jail_bwrap()
+        .and_then(|bwrap| Command::new(bwrap).arg("--help").output().ok())
+        .is_some_and(|out| {
+            let help = String::from_utf8_lossy(&out.stdout);
+            help.contains("--ro-bind-fd") && help.contains("--bind-fd")
+        })
+}
+
+/// CW-extra-nofollow: a profile's read-only path that a program in an
+/// earlier jail replaced with a link (`~/.local/share/demo`, a link to
+/// `~/private`, a folder the jail's empty home hides) made the next jail
+/// show where the link leads: the launcher took each read-only path where
+/// its links led. A link in a folder a jail writes is never followed to a
+/// place the jail shows nothing else of: the path is left out, said on one
+/// line, the jail starts, and a real folder of the same profile is still
+/// shown read-only.
+///
+/// FAILS ON REVERT: take each read-only path where its links lead
+/// (`std::fs::canonicalize`, as before this phase) and the jail reads
+/// `HOST-PRIVATE`.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_link_planted_at_a_read_only_path_never_shows_where_it_leads() {
+    use std::os::unix::fs::symlink;
+    require_bwrap();
+    let (_home, h) = extra_home();
+    std::fs::create_dir_all(h.join(".local/share")).unwrap();
+    std::fs::create_dir_all(h.join("private")).unwrap();
+    std::fs::write(h.join("private/notes"), "HOST-PRIVATE").unwrap();
+    std::fs::create_dir_all(h.join("real/ro")).unwrap();
+    std::fs::write(h.join("real/ro/file"), "REAL-OK").unwrap();
+    symlink(h.join("private"), h.join(".local/share/demo")).unwrap();
+    profile_that_shows(&h, &["~/.local/share/demo", "~/real/ro"]);
+    let project = tempfile::TempDir::new().unwrap();
+    let output = identified_in(
+        &h,
+        project.path(),
+        "cat \"$1/.local/share/demo/notes\" \"$1/private/notes\" 2>/dev/null; \
+         cat \"$1/real/ro/file\"; echo; \
+         if ( echo x >> \"$1/real/ro/file\" ) 2>/dev/null; then echo WROTE; fi; echo DONE",
+    );
+    let out = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "the jail did not start: {err}");
+    assert!(
+        out.contains("DONE") && out.contains("REAL-OK"),
+        "{out} {err}"
+    );
+    assert!(
+        !out.contains("HOST-PRIVATE"),
+        "the link was followed: {out}"
+    );
+    assert!(!out.contains("WROTE"), "{out}");
+    assert!(
+        err.contains(&link_left(&h.join(".local/share/demo"))),
+        "{err}"
+    );
+    assert_eq!(
+        err.matches("is a link in a folder a program in the jail can write")
+            .count(),
+        1,
+        "{err}"
+    );
+}
+
+/// CW-extra-nofollow: a link planted at a profile's read-only path that
+/// leads into a folder the jail never shows (`~/.ssh`) refused the launch
+/// with exit 2 (the launcher followed it and found the hidden folder): an
+/// account could keep the agent from starting. It is left out now, said,
+/// the jail starts, and the key is nowhere in it.
+///
+/// FAILS ON REVERT: take each read-only path where its links lead and the
+/// launch is refused ("unsafe extra read-only path").
+#[cfg(target_os = "linux")]
+#[test]
+fn a_link_into_a_hidden_folder_is_left_out_and_the_jail_still_starts() {
+    use std::os::unix::fs::symlink;
+    require_bwrap();
+    let (_home, h) = extra_home();
+    std::fs::create_dir_all(h.join(".local/share")).unwrap();
+    std::fs::create_dir_all(h.join(".ssh")).unwrap();
+    std::fs::write(h.join(".ssh/id_test"), "HOST-KEY").unwrap();
+    symlink(h.join(".ssh"), h.join(".local/share/keys")).unwrap();
+    profile_that_shows(&h, &["~/.local/share/keys"]);
+    let project = tempfile::TempDir::new().unwrap();
+    let output = identified_in(
+        &h,
+        project.path(),
+        "cat \"$1/.local/share/keys/id_test\" \"$1/.ssh/id_test\" 2>/dev/null; \
+         ls -A \"$1/.ssh\" 2>/dev/null; echo DONE",
+    );
+    let out = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "the jail did not start: {err}");
+    assert!(out.contains("DONE"), "{out} {err}");
+    assert!(
+        !out.contains("HOST-KEY") && !out.contains("id_test"),
+        "{out}"
+    );
+    assert!(
+        err.contains(&link_left(&h.join(".local/share/keys"))),
+        "{err}"
+    );
+    assert!(!err.contains("unsafe extra read-only path"), "{err}");
+}
+
+/// CWNF-BRK-1: the person's own link on the way to a profile's read-only
+/// path (`~/shared` a link to `~/private`, in the home, where no jail
+/// writes) is followed, as before this phase dropped the path: no jail
+/// could have put it there. The jail shows where it leads, read-only, and
+/// says nothing of it. On macOS the sandbox shows everything, and denies
+/// writing there.
+///
+/// FAILS ON REVERT: leave out every path a link is on (this phase) and the
+/// jail neither shows it on Linux nor keeps it read-only on macOS.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn the_persons_own_link_on_the_way_to_a_read_only_path_is_followed() {
+    use std::os::unix::fs::symlink;
+    #[cfg(target_os = "linux")]
+    require_bwrap();
+    let (_home, h) = extra_home();
+    std::fs::create_dir_all(h.join("private/ro")).unwrap();
+    std::fs::write(h.join("private/ro/notes"), "HOST-PRIVATE").unwrap();
+    symlink("private", h.join("shared")).unwrap();
+    profile_that_shows(&h, &["~/shared/ro"]);
+    let project = tempfile::TempDir::new().unwrap();
+    let output = identified_in(
+        &h,
+        project.path(),
+        "cat \"$1/private/ro/notes\"; echo; \
+         if ( echo x >> \"$1/private/ro/notes\" ) 2>/dev/null; then echo WROTE; fi; echo DONE",
+    );
+    let out = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "the jail did not start: {err}");
+    assert!(
+        out.contains("HOST-PRIVATE") && out.contains("DONE"),
+        "{out} {err}"
+    );
+    assert!(!out.contains("WROTE"), "{out}");
+    assert!(!err.contains("is a link"), "{err}");
+    assert_eq!(
+        std::fs::read_to_string(h.join("private/ro/notes")).unwrap(),
+        "HOST-PRIVATE"
+    );
+}
+
+/// CWNF-2: a profile's read-only path that is a link in a folder every
+/// jail writes (`~/.local/share/claude/versions` a link to
+/// `versions-real` beside it, the runtime the host runs later) was left
+/// out by this phase, and the agent rewrote the runtime (measured on Linux
+/// and macOS: the host file read `TAMPERED`). The jail keeps where it leads
+/// read-only now; on Linux it says the link itself cannot be held, on
+/// macOS the sandbox keeps the link in place too. On Linux the real run
+/// binds it from a descriptor, and its dry run says so; with a bwrap that
+/// binds none it is left out and said instead.
+///
+/// FAILS ON REVERT: leave out every path a link is on (this phase) and
+/// the jail writes the runtime.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_read_only_path_that_is_a_link_stays_read_only_where_it_leads() {
+    use std::os::unix::fs::symlink;
+    #[cfg(target_os = "linux")]
+    require_bwrap();
+    let (_home, h) = extra_home();
+    let real = h.join(".local/share/claude/versions-real");
+    std::fs::create_dir_all(&real).unwrap();
+    std::fs::write(real.join("2.1.0"), "ORIGINAL").unwrap();
+    symlink("versions-real", h.join(".local/share/claude/versions")).unwrap();
+    profile_that_shows(&h, &["~/.local/share/claude/versions"]);
+    let project = tempfile::TempDir::new().unwrap();
+    let output = identified_in(
+        &h,
+        project.path(),
+        "if ( echo TAMPERED > \"$1/.local/share/claude/versions/2.1.0\" ) 2>/dev/null; \
+         then echo WROTE-RUNTIME; fi; \
+         if ( echo TAMPERED > \"$1/.local/share/claude/versions-real/2.1.0\" ) 2>/dev/null; \
+         then echo WROTE-REAL; fi; echo DONE",
+    );
+    let out = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "the jail did not start: {err}");
+    assert!(out.contains("DONE"), "{out} {err}");
+    #[cfg(target_os = "linux")]
+    let held = bwrap_binds_fds();
+    #[cfg(target_os = "macos")]
+    let held = true;
+    if held {
+        assert!(
+            !out.contains("WROTE-RUNTIME") && !out.contains("WROTE-REAL"),
+            "the runtime was written: {out}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(real.join("2.1.0")).unwrap(),
+            "ORIGINAL"
+        );
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let versions = h.join(".local/share/claude/versions");
+        let said = if held {
+            format!(
+                "{} is a link in a folder a program in the jail can write: the jail keeps {}, \
+                 where it leads, read-only",
+                versions.display(),
+                real.display()
+            )
+        } else {
+            format!(
+                "{} is in a folder a program in the jail can write, or goes through a link there",
+                versions.display()
+            )
+        };
+        assert!(err.contains(&said), "{err}");
+        // The dry run says the real run binds it from a descriptor.
+        let dry = cli()
+            .args([
+                "contain",
+                "--identity",
+                "--dry-run",
+                "--project",
+                project.path().to_str().unwrap(),
+                "--",
+                "true",
+            ])
+            .env("HOME", &h)
+            .env_remove("XDG_STATE_HOME")
+            .output()
+            .unwrap();
+        let dry_out = String::from_utf8_lossy(&dry.stdout);
+        assert_eq!(
+            dry_out.contains("# the real run binds each folder pinned in place"),
+            held,
+            "{dry_out}"
+        );
+    }
+    #[cfg(target_os = "macos")]
+    assert!(!err.contains("is a link"), "{err}");
+}
+
+/// CWNF-2 on macOS: a profile's read-only path over `~/.config` (which
+/// holds InnerWarden's own folder) stopped the launch before this phase,
+/// and this phase started the jail without it: the agent wrote the host's
+/// `~/.config/git/config` (a `core.hooksPath`, code that runs the next
+/// time the person runs git). A deny shows nothing, so the jail denies
+/// writing it now, and starts.
+///
+/// FAILS ON REVERT: leave out a read-only path that holds a place the jail
+/// hides (this phase) and the git config is written.
+#[cfg(target_os = "macos")]
+#[test]
+fn on_macos_a_read_only_config_folder_is_never_written() {
+    let (_home, h) = extra_home();
+    std::fs::create_dir_all(h.join(".config/git")).unwrap();
+    std::fs::write(h.join(".config/git/config"), "[user]\n").unwrap();
+    profile_that_shows(&h, &["~/.config"]);
+    let project = tempfile::TempDir::new().unwrap();
+    let output = identified_in(
+        &h,
+        project.path(),
+        "if ( printf '[core]\\n\\thooksPath = /tmp/evil\\n' >> \"$1/.config/git/config\" ) \
+         2>/dev/null; then echo WROTE-GIT-CONFIG; fi; echo DONE",
+    );
+    let out = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "the jail did not start: {err}");
+    assert!(out.contains("DONE"), "{out} {err}");
+    assert!(!out.contains("WROTE-GIT-CONFIG"), "{out}");
+    assert_eq!(
+        std::fs::read_to_string(h.join(".config/git/config")).unwrap(),
+        "[user]\n"
+    );
+    assert!(!err.contains("starts without it"), "{err}");
+}
+
+/// CWNF-BRK-3: `~/.local` kept as the person's link to another disk. This
+/// phase dropped the runtime's versions under it and told the person to
+/// list the real folder, whose bind sat beside the `~/.local` the agent
+/// runs through, which stayed writable. The jail lays the path read-only
+/// where it shows it now, at `~/.local/share/claude/versions`, from the
+/// folder it leads to, and says nothing.
+///
+/// FAILS ON REVERT: lay a read-only path where it leads only (no view of
+/// the jail's) and the agent writes the runtime through `~/.local`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_read_only_path_under_a_home_folder_kept_as_a_link_is_read_only_where_the_agent_runs_it() {
+    use std::os::unix::fs::symlink;
+    #[cfg(target_os = "linux")]
+    require_bwrap();
+    let (_home, h) = extra_home();
+    let disk = h.join("disk/.local");
+    std::fs::create_dir_all(disk.join("share/claude/versions")).unwrap();
+    std::fs::write(disk.join("share/claude/versions/2.1.0"), "ORIGINAL").unwrap();
+    std::fs::create_dir_all(disk.join("state")).unwrap();
+    std::fs::remove_dir_all(h.join(".local")).unwrap();
+    symlink(&disk, h.join(".local")).unwrap();
+    profile_that_shows(&h, &["~/.local/share/claude/versions"]);
+    let project = tempfile::TempDir::new().unwrap();
+    let output = identified_in(
+        &h,
+        project.path(),
+        "if ( echo TAMPERED > \"$1/.local/share/claude/versions/2.1.0\" ) 2>/dev/null; \
+         then echo WROTE-RUNTIME; fi; \
+         if ( echo x > \"$1/.local/share/claude/versions/new\" ) 2>/dev/null; \
+         then echo MADE; fi; echo DONE",
+    );
+    let out = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "the jail did not start: {err}");
+    assert!(out.contains("DONE"), "{out} {err}");
+    #[cfg(target_os = "linux")]
+    let held = bwrap_binds_fds();
+    #[cfg(target_os = "macos")]
+    let held = true;
+    if held {
+        assert!(
+            !out.contains("WROTE-RUNTIME") && !out.contains("MADE"),
+            "{out}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(disk.join("share/claude/versions/2.1.0")).unwrap(),
+            "ORIGINAL"
+        );
+        assert!(!err.contains("is a link"), "{err}");
+    }
+}
+
+/// CWNF-BRK-1: the project reached through the person's own link (`~/code`
+/// a link to `disk/code`, the project `~/code/app` taken where it leads)
+/// and a profile's read-only path in it (`~/code/app/vendor`). This phase
+/// dropped the path, and the project's write let the agent write it. It is
+/// laid read-only in the project now, after the project's bind (macOS:
+/// denied after the project's write).
+///
+/// FAILS ON REVERT: leave out every path a link is on (this phase) and the
+/// agent writes `vendor`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_read_only_path_in_a_project_reached_through_a_link_is_never_written() {
+    use std::os::unix::fs::symlink;
+    #[cfg(target_os = "linux")]
+    require_bwrap();
+    let (_home, h) = extra_home();
+    let app = h.join("disk/code/app");
+    std::fs::create_dir_all(app.join("vendor")).unwrap();
+    std::fs::write(app.join("vendor/lib.txt"), "ORIGINAL").unwrap();
+    symlink("disk/code", h.join("code")).unwrap();
+    profile_that_shows(&h, &["~/code/app/vendor"]);
+    let script = format!(
+        "if ( echo TAMPERED > '{0}/vendor/lib.txt' ) 2>/dev/null; then echo WROTE-VENDOR; fi; \
+         if ( echo x > '{0}/new.txt' ) 2>/dev/null; then echo PROJECT-WRITABLE; fi; \
+         echo DONE",
+        app.display()
+    );
+    let output = identified_in(&h, &h.join("code/app"), &script);
+    let out = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "the jail did not start: {err}");
+    assert!(
+        out.contains("DONE") && out.contains("PROJECT-WRITABLE"),
+        "{out} {err}"
+    );
+    #[cfg(target_os = "linux")]
+    let held = bwrap_binds_fds();
+    #[cfg(target_os = "macos")]
+    let held = true;
+    if held {
+        assert!(!out.contains("WROTE-VENDOR"), "{out}");
+        assert_eq!(
+            std::fs::read_to_string(app.join("vendor/lib.txt")).unwrap(),
+            "ORIGINAL"
+        );
+    }
+}
+
+/// CWNF-1 (tests lens): `~/.aws` a link to a folder outside the home, and a
+/// profile's read-only path in that folder (`creds`). The planner left the
+/// folder as it was (the read-only path counted as what the jail needs),
+/// and kept the path: on macOS the jail read the credentials beside it
+/// (measured), on Linux it showed the `creds` folder. Hiding comes first
+/// now: the folder is hidden where `~/.aws` leads, and the path is left out
+/// and said.
+///
+/// FAILS ON REVERT: plan the dotdirs with the read-only paths in what the
+/// jail needs and the jail reads `AWS-SECRET`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_read_only_path_where_a_hidden_dotdir_leads_never_shows_the_secret() {
+    use std::os::unix::fs::symlink;
+    #[cfg(target_os = "linux")]
+    require_bwrap();
+    let (_home, h) = extra_home();
+    let data = tempfile::TempDir::new().unwrap();
+    let aws = std::fs::canonicalize(data.path()).unwrap().join("aws");
+    std::fs::create_dir_all(aws.join("creds")).unwrap();
+    std::fs::write(aws.join("credentials"), "AWS-SECRET").unwrap();
+    std::fs::write(aws.join("creds/key"), "AWS-KEY").unwrap();
+    symlink(&aws, h.join(".aws")).unwrap();
+    profile_that_shows(&h, &[aws.join("creds").to_str().unwrap()]);
+    let project = tempfile::TempDir::new().unwrap();
+    let script = format!(
+        "cat '{}' '{}' 2>/dev/null; echo DONE",
+        aws.join("credentials").display(),
+        aws.join("creds/key").display()
+    );
+    let output = identified_in(&h, project.path(), &script);
+    let out = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "the jail did not start: {err}");
+    assert!(out.contains("DONE"), "{out} {err}");
+    assert!(
+        !out.contains("AWS-SECRET") && !out.contains("AWS-KEY"),
+        "the secret was read: {out}"
+    );
+    assert!(
+        err.contains(&format!(
+            "where {} leads, which the jail hides; the jail starts without it",
+            h.join(".aws").display()
+        )),
+        "{err}"
+    );
+}
+
+/// NEW-WORKTREE (found fixing CWNF-1): a program in a jail writes the
+/// project's `.git`, and the next jail in the project bound the folder it
+/// named read-write as a worktree's (`gitdir: ~/victim`): any folder of the
+/// home outside the few it hides, `~/bin` or `~/Library/LaunchAgents`
+/// among them. A folder that does not name the project back is no
+/// worktree now: nothing of it is shown writable, and the start says so.
+///
+/// FAILS ON REVERT: take the folder the `.git` file names as it is and the
+/// jail writes `~/victim/planted`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_git_file_that_names_a_folder_of_the_home_never_shows_it_writable() {
+    #[cfg(target_os = "linux")]
+    require_bwrap();
+    // A home outside the temporary folders a macOS jail may write anyway.
+    let home = tempfile::TempDir::new_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let h = std::fs::canonicalize(home.path()).unwrap();
+    std::fs::create_dir_all(h.join(".local/state")).unwrap();
+    std::fs::create_dir_all(h.join("victim")).unwrap();
+    std::fs::write(h.join("victim/note"), "VICTIM").unwrap();
+    let project = tempfile::TempDir::new().unwrap();
+    let p = std::fs::canonicalize(project.path()).unwrap();
+    std::fs::write(
+        p.join(".git"),
+        format!("gitdir: {}\n", h.join("victim").display()),
+    )
+    .unwrap();
+    let script = format!(
+        "if ( echo x > '{}' ) 2>/dev/null; then echo PLANTED; fi; echo DONE",
+        h.join("victim/planted").display()
+    );
+    let mut command = cli();
+    command
+        .args([
+            "contain",
+            "--project",
+            p.to_str().unwrap(),
+            "--",
+            "/bin/sh",
+            "-c",
+            &script,
+        ])
+        .env("HOME", &h);
+    #[cfg(target_os = "linux")]
+    identified_without_a_scope(&mut command);
+    let output = command.output().unwrap();
+    let out = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "the jail did not start: {err}");
+    assert!(out.contains("DONE"), "{out} {err}");
+    assert!(!out.contains("PLANTED"), "{out}");
+    assert!(!h.join("victim/planted").exists());
+    assert!(
+        err.contains("as its git folder, and that folder does not name this project back"),
+        "{err}"
+    );
+}
+
+/// Run a plain `innerwarden contain` of the project `p` with the home `h`,
+/// the shell `script` its command: (exit code, stdout, stderr).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn plain_jail(
+    h: &std::path::Path,
+    p: &std::path::Path,
+    dry_run: bool,
+    script: &str,
+) -> (Option<i32>, String, String) {
+    let mut command = cli();
+    command.args(["contain", "--project", p.to_str().unwrap()]);
+    if dry_run {
+        command.arg("--dry-run");
+    }
+    command
+        .args(["--", "/bin/sh", "-c", script])
+        .env("HOME", h)
+        .env_remove("XDG_STATE_HOME")
+        .env_remove("XDG_CONFIG_HOME");
+    #[cfg(target_os = "linux")]
+    identified_without_a_scope(&mut command);
+    let output = command.output().expect("run the jail");
+    (
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+/// What the start line says a worktree's git folder left out means for git
+/// in a jail of this OS: a Linux jail shows nothing of it, and the macOS
+/// sandbox lets git read it but write nothing there.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn worktree_left_effect() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "the jail does not let a program in it write there (git in the jail cannot commit here)"
+    } else {
+        "the jail does not show it (git in the jail sees no repository here)"
+    }
+}
+
+/// A git folder at `dir` as git makes one: `HEAD`, `objects`, `refs`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn git_dir_by_hand(dir: &std::path::Path) {
+    for sub in ["objects", "refs/heads"] {
+        std::fs::create_dir_all(dir.join(sub)).unwrap();
+    }
+    std::fs::write(dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+}
+
+/// CW-worktree-gitdir: the project's `.git` file is the agent's to write,
+/// and the folders it names were bound read-write into the next jail, a
+/// plain jail too, wherever git's own files there agreed. Two layouts a
+/// program in a jail can leave, each forged here as it would be:
+///
+/// - the project sits in a folder named `worktrees` (`~/code/worktrees/p`)
+///   and its `.git` names the project itself (`gitdir: .`), with a link
+///   back to its own `.git` and a `commondir` of `../..`: the repository it
+///   names is `~/code`, every repository of the person's, which is no git
+///   folder;
+/// - a worktree's layout in a hidden folder of the home (`~/.kube/repo`, a
+///   git folder, its `worktrees/x` naming the project back).
+///
+/// Neither is shown: the jail cannot write `~/code/another-repo` or
+/// `~/.kube/repo`, the start says why on one line, and the jail starts. On macOS
+/// the sandbox profile (a dry run prints it) allows writing neither. The
+/// project that names itself names a folder the jail shows anyway (the
+/// project), so nothing is said of it (CWWT-C2); the same layout named from
+/// another project (`~/p3`) is.
+///
+/// FAILS ON REVERT: take the repository a `commondir` names without the git
+/// folder check, or a place in a hidden folder of the home, and the jail
+/// writes `~/code/another-repo/planted` and `~/.kube/repo/planted`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_forged_worktree_never_shows_a_folder_of_the_home_writable() {
+    #[cfg(target_os = "linux")]
+    require_bwrap();
+    let home = tempfile::TempDir::new_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let h = std::fs::canonicalize(home.path()).unwrap();
+    std::fs::create_dir_all(h.join(".local/state")).unwrap();
+    // The project in a folder named `worktrees`, naming itself.
+    let code = h.join("code");
+    std::fs::create_dir_all(code.join("another-repo")).unwrap();
+    let p = code.join("worktrees/p");
+    std::fs::create_dir_all(&p).unwrap();
+    std::fs::write(p.join("gitdir"), format!("{}\n", p.join(".git").display())).unwrap();
+    std::fs::write(p.join("commondir"), "../..\n").unwrap();
+    std::fs::write(p.join(".git"), "gitdir: .\n").unwrap();
+    // A second project whose `.git` names a worktree's layout in `~/.kube`.
+    let kube = h.join(".kube");
+    git_dir_by_hand(&kube.join("repo"));
+    let x = kube.join("repo/worktrees/x");
+    std::fs::create_dir_all(&x).unwrap();
+    std::fs::write(x.join("commondir"), "../..\n").unwrap();
+    let p2 = h.join("p2");
+    std::fs::create_dir_all(&p2).unwrap();
+    std::fs::write(x.join("gitdir"), format!("{}\n", p2.join(".git").display())).unwrap();
+    std::fs::write(p2.join(".git"), format!("gitdir: {}\n", x.display())).unwrap();
+    // A third project whose `.git` names a folder in `worktrees` that names
+    // it back, with a `commondir` of `../..`: `~/code` again.
+    let q = code.join("worktrees/q");
+    std::fs::create_dir_all(&q).unwrap();
+    let p3 = h.join("p3");
+    std::fs::create_dir_all(&p3).unwrap();
+    std::fs::write(q.join("gitdir"), format!("{}\n", p3.join(".git").display())).unwrap();
+    std::fs::write(q.join("commondir"), "../..\n").unwrap();
+    std::fs::write(p3.join(".git"), format!("gitdir: {}\n", q.display())).unwrap();
+    // CWWT-C1: the macOS sandbox lets a program read `~/.kube`, so the line
+    // there says the jail lets no program write it.
+    let hidden_folder = if cfg!(target_os = "macos") {
+        "no program in the jail may write"
+    } else {
+        "the jail does not show"
+    };
+    for (project, target, said) in [
+        // The git folder `p` names is `p` itself, which the jail shows
+        // anyway: nothing more is shown, and nothing said.
+        (&p, code.join("another-repo/planted"), None),
+        (
+            &p3,
+            code.join("another-repo/planted"),
+            Some(format!(
+                "{} names {} as its git folder, and {} is no git repository (it has no HEAD, \
+                 objects or refs): {}",
+                p3.join(".git").display(),
+                q.display(),
+                code.display(),
+                worktree_left_effect()
+            )),
+        ),
+        (
+            &p2,
+            kube.join("repo/planted"),
+            Some(format!(
+                "{} names {} as its git folder, and {} is your home, a folder above it, a place \
+                 the jail hides or in a hidden folder of your home {hidden_folder}: {}",
+                p2.join(".git").display(),
+                x.display(),
+                x.display(),
+                worktree_left_effect()
+            )),
+        ),
+    ] {
+        let script = format!(
+            "if ( echo x > '{}' ) 2>/dev/null; then echo PLANTED; fi; echo DONE",
+            target.display()
+        );
+        let (code_out, out, err) = plain_jail(&h, project, false, &script);
+        assert_eq!(code_out, Some(0), "the jail did not start: {out} {err}");
+        assert!(out.contains("DONE"), "{out} {err}");
+        assert!(!out.contains("PLANTED"), "{out}");
+        assert!(!target.exists(), "{}", target.display());
+        match &said {
+            Some(said) => assert!(err.contains(said), "{said}\n{err}"),
+            None => assert!(!err.contains("as its git folder"), "{err}"),
+        }
+        // macOS: the sandbox profile allows writing none of those folders.
+        #[cfg(target_os = "macos")]
+        {
+            let (_, profile, _) = plain_jail(&h, project, true, "true");
+            for never in [&code, &kube.join("repo"), &x] {
+                assert!(
+                    !profile.contains(&format!(
+                        "(allow file-write* (subpath \"{}\"))",
+                        never.display()
+                    )),
+                    "{profile}"
+                );
+            }
+        }
+    }
+}
+
+/// CW-worktree-gitdir: a worktree `git worktree add` made keeps working in
+/// the jail: git there finds its repository and commits (it writes the
+/// repository's objects and refs), and the start says nothing about it. A
+/// dry run binds the worktree's git folder and its repository read-write
+/// (Linux), or allows writing both (macOS profile). Skipped where this host
+/// has no git.
+///
+/// FAILS ON REVERT: refuse every worktree (the new checks too strict) and
+/// git in the jail sees no repository.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_real_worktree_still_works_in_the_jail() {
+    #[cfg(target_os = "linux")]
+    require_bwrap();
+    let home = tempfile::TempDir::new_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let h = std::fs::canonicalize(home.path()).unwrap();
+    std::fs::create_dir_all(h.join(".local/state")).unwrap();
+    let git = |dir: &std::path::Path, args: &[&str]| {
+        Command::new("git")
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "init.defaultBranch=main",
+            ])
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", &h)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .is_ok_and(|out| out.status.success())
+    };
+    let code = h.join("code");
+    std::fs::create_dir_all(&code).unwrap();
+    if !git(&code, &["init", "-q", "main"]) {
+        eprintln!("no git on this host: skipped");
+        return;
+    }
+    let main = code.join("main");
+    assert!(git(
+        &main,
+        &["commit", "-q", "--allow-empty", "-m", "first"]
+    ));
+    assert!(git(&main, &["worktree", "add", "-q", "../w"]));
+    let w = code.join("w");
+    let common = main.join(".git");
+    let git_dir = common.join("worktrees/w");
+    let script = format!(
+        "cd '{}' && git -c user.name=t -c user.email=t@t commit -q --allow-empty -m in-jail \
+         && git rev-parse --git-common-dir && echo DONE",
+        w.display()
+    );
+    let (code_out, out, err) = plain_jail(&h, &w, false, &script);
+    assert_eq!(code_out, Some(0), "{out} {err}");
+    assert!(out.contains("DONE"), "git in the jail failed: {out} {err}");
+    assert!(out.contains(common.to_str().unwrap()), "{out}");
+    assert!(!err.contains("as its git folder"), "{err}");
+    let log = Command::new("git")
+        .args(["log", "--format=%s", "-1"])
+        .current_dir(&w)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&log.stdout).trim(), "in-jail");
+    let (_, plan, _) = plain_jail(&h, &w, true, "true");
+    for dir in [&git_dir, &common] {
+        #[cfg(target_os = "linux")]
+        assert!(
+            plan.contains(&format!("--bind {} {}", dir.display(), dir.display())),
+            "{plan}"
+        );
+        #[cfg(target_os = "macos")]
+        assert!(
+            plan.contains(&format!(
+                "(allow file-write* (subpath \"{}\"))",
+                dir.display()
+            )),
+            "{plan}"
+        );
+    }
+}
+
+/// CWWT-BRK-1: a worktree of a repository kept in a home folder every jail
+/// shows writable (an editor's configuration in `~/.config/nvim`, as
+/// home-manager and chezmoi keep theirs under `~/.config` and `~/.local`)
+/// was refused as one in a hidden folder of the home, with a start line
+/// that said git in the jail saw no repository, while git there committed
+/// through the jail's own `~/.config`. It is a worktree: git in the jail
+/// commits, and the start says nothing about it. The jail shows `~/.config`
+/// writable anyway, so it binds nothing more for the worktree (CWWT-C2).
+/// Skipped where this host has no git.
+///
+/// FAILS ON REVERT: say of every folder of the home whose name starts with
+/// a dot that it is left out (as before) and the start says so; bind a
+/// worktree the jail shows anyway (as before) and the plan names its git
+/// folder.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_worktree_of_a_repository_in_a_folder_every_jail_writes_still_works() {
+    #[cfg(target_os = "linux")]
+    require_bwrap();
+    let home = tempfile::TempDir::new_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let h = std::fs::canonicalize(home.path()).unwrap();
+    std::fs::create_dir_all(h.join(".local/state")).unwrap();
+    std::fs::create_dir_all(h.join(".config")).unwrap();
+    std::fs::create_dir_all(h.join("code")).unwrap();
+    let git = |dir: &std::path::Path, args: &[&str]| {
+        Command::new("git")
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "init.defaultBranch=main",
+            ])
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", &h)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .is_ok_and(|out| out.status.success())
+    };
+    if !git(&h.join(".config"), &["init", "-q", "nvim"]) {
+        eprintln!("no git on this host: skipped");
+        return;
+    }
+    let repo = h.join(".config/nvim");
+    assert!(git(
+        &repo,
+        &["commit", "-q", "--allow-empty", "-m", "first"]
+    ));
+    let wt = h.join("code/nvim-wt");
+    assert!(git(&repo, &["worktree", "add", "-q", wt.to_str().unwrap()]));
+    let script = format!(
+        "cd '{}' && git -c user.name=t -c user.email=t@t commit -q --allow-empty -m in-jail \
+         && echo DONE",
+        wt.display()
+    );
+    let (code_out, out, err) = plain_jail(&h, &wt, false, &script);
+    assert_eq!(code_out, Some(0), "{out} {err}");
+    assert!(out.contains("DONE"), "git in the jail failed: {out} {err}");
+    assert!(!err.contains("as its git folder"), "{err}");
+    let log = Command::new("git")
+        .args(["log", "--format=%s", "-1"])
+        .current_dir(&wt)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&log.stdout).trim(), "in-jail");
+    // CWWT-C2: the jail shows `~/.config` writable anyway, so nothing more
+    // is bound for the worktree (a bwrap that binds no descriptor bound its
+    // folders by name, after the launcher looked, in a folder every jail
+    // writes), and the macOS profile allows nothing more.
+    let (_, plan, _) = plain_jail(&h, &wt, true, "true");
+    let git_folder = repo.join(".git").to_string_lossy().into_owned();
+    assert!(
+        plan.contains(&*h.join(".config").to_string_lossy()),
+        "{plan}"
+    );
+    assert!(!plan.contains(&git_folder), "{git_folder}: {plan}");
+}
+
+/// CWWT-SEC-1, live: a program in a jail of the project lays it out as its
+/// own repository (`HEAD`, `objects`, `refs`, `worktrees/x` naming its
+/// `.git` back), puts `L`, a link to the folder above it, there, and has
+/// its `.git` and `commondir` name the project through `nx/../L/<project>`
+/// (`nx` is not there). The profile shows the project's `vendor`
+/// read-only. The launcher's walk read no step after `nx`, so it took that
+/// spelling as a worktree with no link on the way: on Linux the worktree's
+/// bind of `<project>/L/<project>` went through `L` onto the project and
+/// covered the read-only bind of `vendor` (measured: the jail wrote it,
+/// with a bwrap that binds no descriptor), and with a bwrap that binds them
+/// every launch stopped on the link; on macOS the link rule did not hold.
+/// No worktree is found now, the start says why on one line, the jail
+/// starts, and `vendor` stays as it was. A bwrap that binds no descriptor
+/// leaves `vendor` out of this jail anyway (in a folder the jail writes),
+/// and says so.
+///
+/// FAILS ON REVERT: stop reading steps after one that is not there, and
+/// take a way through one (as before): on Linux, with a bwrap that binds
+/// descriptors, the launch stops; on macOS the line is not said.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_worktree_forged_through_a_missing_folder_never_makes_a_read_only_path_writable() {
+    #[cfg(target_os = "linux")]
+    require_bwrap();
+    let (_home, h) = extra_home();
+    let project = tempfile::TempDir::new().unwrap();
+    let p = std::fs::canonicalize(project.path()).unwrap();
+    let name = p.file_name().unwrap().to_str().unwrap().to_string();
+    git_dir_by_hand(&p);
+    let x = p.join("worktrees/x");
+    std::fs::create_dir_all(&x).unwrap();
+    std::fs::write(x.join("gitdir"), format!("{}\n", p.join(".git").display())).unwrap();
+    std::fs::write(
+        x.join("commondir"),
+        format!("{}\n", p.join("nx/../L").join(&name).display()),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink("..", p.join("L")).unwrap();
+    let forged = format!("nx/../L/{name}/worktrees/x");
+    std::fs::write(p.join(".git"), format!("gitdir: {forged}\n")).unwrap();
+    let vendor = p.join("vendor");
+    std::fs::create_dir_all(&vendor).unwrap();
+    std::fs::write(vendor.join("lib.txt"), "orig").unwrap();
+    profile_that_shows(&h, &[vendor.to_str().unwrap()]);
+    let script = format!(
+        "if ( echo jail >> '{}' ) 2>/dev/null; then echo WROTE; fi; echo DONE",
+        vendor.join("lib.txt").display()
+    );
+    let mut command = cli();
+    command
+        .args([
+            "contain",
+            "--identity",
+            "--project",
+            p.to_str().unwrap(),
+            "--",
+            "/bin/sh",
+            "-c",
+            &script,
+        ])
+        .env("HOME", &h)
+        .env_remove("XDG_STATE_HOME");
+    #[cfg(target_os = "linux")]
+    identified_without_a_scope(&mut command);
+    let output = command.output().expect("run the identified jail");
+    let out = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "the jail did not start: {err}");
+    assert!(out.contains("DONE"), "{out} {err}");
+    let said = format!(
+        "{} names {forged} as its git folder, and the way to it goes through the link {} (git \
+         writes these paths with no link on the way): {}",
+        p.join(".git").display(),
+        p.join("L").display(),
+        worktree_left_effect()
+    );
+    assert!(err.contains(&said), "{said}\n{err}");
+    #[cfg(target_os = "linux")]
+    if !bwrap_binds_fds() {
+        assert!(err.contains(&not_held(&vendor)), "{err}");
+        return;
+    }
+    assert!(!out.contains("WROTE"), "{out}");
+    assert_eq!(
+        std::fs::read_to_string(vendor.join("lib.txt")).unwrap(),
+        "orig"
+    );
+}
+
+/// CWNF-2 on macOS: the sandbox profile is written after the launcher found
+/// where each read-only path leads: one that is a link (to `~/private`) is
+/// denied writing as named and where it leads, never left out, and a real
+/// folder of the same profile is denied too. The real run starts.
+///
+/// FAILS ON REVERT: leave out every path a link is on (this phase) and the
+/// profile denies writing neither `~/private` nor the link.
+#[cfg(target_os = "macos")]
+#[test]
+fn on_macos_a_link_at_a_read_only_path_is_denied_as_named_and_where_it_leads() {
+    use std::os::unix::fs::symlink;
+    let (_home, h) = extra_home();
+    std::fs::create_dir_all(h.join(".local/share")).unwrap();
+    std::fs::create_dir_all(h.join("private")).unwrap();
+    std::fs::create_dir_all(h.join("real/ro")).unwrap();
+    symlink(h.join("private"), h.join(".local/share/demo")).unwrap();
+    profile_that_shows(&h, &["~/.local/share/demo", "~/real/ro"]);
+    let project = tempfile::TempDir::new().unwrap();
+    let p = std::fs::canonicalize(project.path()).unwrap();
+    let output = cli()
+        .args([
+            "contain",
+            "--identity",
+            "--dry-run",
+            "--project",
+            p.to_str().unwrap(),
+            "--",
+            "/bin/sh",
+            "-c",
+            "true",
+        ])
+        .env("HOME", &h)
+        .env_remove("XDG_STATE_HOME")
+        .output()
+        .expect("run the dry run");
+    let out = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{err}");
+    for denied in [
+        h.join("real/ro"),
+        h.join("private"),
+        h.join(".local/share/demo"),
+    ] {
+        let rule = format!("(deny file-write* (subpath \"{}\"))", denied.display());
+        assert!(out.contains(&rule), "{rule}: {out}");
+    }
+    let kept = format!(
+        "(deny file-write-unlink file-write-create (literal \"{}\"))",
+        h.join(".local/share/demo").display()
+    );
+    assert!(out.contains(&kept), "{kept}: {out}");
+    assert!(!err.contains("is a link"), "{err}");
+    let ran = identified_in(&h, &p, "echo DONE");
+    let ran_out = String::from_utf8_lossy(&ran.stdout);
+    assert!(
+        ran.status.success() && ran_out.contains("DONE"),
+        "{ran_out} {}",
+        String::from_utf8_lossy(&ran.stderr)
+    );
 }
 
 /// M30CW-BRK-1: a profile that shows the person's own `~/.claude.json`
@@ -3621,58 +4873,88 @@ fn on_macos_a_folder_kept_in_place_still_reads_as_writable() {
     assert_eq!(std::fs::read_to_string(p.join("a/f")).unwrap(), "from-src");
 }
 
-/// M30-SEC-2: a worktree the project's `.git` names (a file the agent
-/// writes) that is the place a hidden dotdir leads to: such a jail would
-/// bind it read-write, and a planner that trusted it as needed left the
-/// key shown. The launch is refused, and says why.
+/// M30-SEC-2: a worktree the project's `.git` names that is the place a
+/// hidden dotdir leads to: such a jail would bind it read-write, and a
+/// planner that trusted it as needed left the key shown. Since NEW-WORKTREE
+/// a `.git` file the agent wrote is no worktree at all unless git made it
+/// (the git folder names the project back, and its repository is a git
+/// folder), so the layout here is a real worktree's, with `~/.ssh` a link
+/// to its git folder; the same `.git` file naming that folder with no link
+/// back starts the jail without it, and shows no key either. The launch was
+/// refused; since CWWT-C3 the worktree is left out instead, the start says
+/// why on one line, and the jail starts and shows no key, as for every other
+/// folder a `.git` file names that is no worktree to show (a program in a
+/// jail could otherwise stop every later launch of the project).
 ///
-/// FAILS ON REVERT: drop the hidden-target check from
-/// `validate_jail_inputs` and the jail starts with the worktree bound.
+/// FAILS ON REVERT: keep a worktree over a hidden place (as before) and the
+/// launch stops; drop the hidden-target check from `validate_jail_inputs`
+/// and the plan too, and the jail shows the key.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
-fn a_worktree_named_onto_where_a_hidden_dotdir_leads_is_refused() {
+fn a_worktree_named_onto_where_a_hidden_dotdir_leads_is_left_out() {
     #[cfg(target_os = "linux")]
     require_bwrap();
     let home = tempfile::TempDir::new().unwrap();
     let h = std::fs::canonicalize(home.path()).unwrap();
-    std::fs::create_dir_all(h.join(".config/ssh")).unwrap();
-    std::fs::write(h.join(".config/ssh/id_test"), "CJC-J007-SSH-KEY").unwrap();
-    std::os::unix::fs::symlink(".config/ssh", h.join(".ssh")).unwrap();
+    let git_dir = h.join("repo/.git/worktrees/w");
+    git_dir_by_hand(&h.join("repo/.git"));
+    std::fs::create_dir_all(&git_dir).unwrap();
+    std::fs::write(git_dir.join("id_test"), "CJC-J007-SSH-KEY").unwrap();
+    std::fs::write(git_dir.join("commondir"), "../..\n").unwrap();
+    std::os::unix::fs::symlink("repo/.git/worktrees/w", h.join(".ssh")).unwrap();
     let project = tempfile::TempDir::new().unwrap();
-    std::fs::write(
-        project.path().join(".git"),
-        format!("gitdir: {}\n", h.join(".config/ssh").display()),
-    )
-    .unwrap();
-    let output = cli()
-        .args([
-            "contain",
-            "--project",
-            project.path().to_str().unwrap(),
-            "--",
-            "/bin/sh",
-            "-c",
-            "cat \"$HOME/.config/ssh/id_test\"; echo DONE",
-        ])
-        .env("HOME", &h)
-        .output()
-        .expect("run the jail");
+    let p = std::fs::canonicalize(project.path()).unwrap();
+    std::fs::write(p.join(".git"), format!("gitdir: {}\n", git_dir.display())).unwrap();
+    let run = |p: &std::path::Path| {
+        let script = format!("cat '{}'; echo DONE", git_dir.join("id_test").display());
+        cli()
+            .args([
+                "contain",
+                "--project",
+                p.to_str().unwrap(),
+                "--",
+                "/bin/sh",
+                "-c",
+                &script,
+            ])
+            .env("HOME", &h)
+            .output()
+            .expect("run the jail")
+    };
+    // No link back: no worktree, said, and the key is not shown.
+    let output = run(&p);
     let out = String::from_utf8_lossy(&output.stdout);
     let err = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(output.status.code(), Some(2), "{out} {err}");
+    assert!(output.status.success(), "{out} {err}");
+    assert!(!out.contains("CJC-J007-SSH-KEY"), "{out}");
+    assert!(err.contains("does not name this project back"), "{err}");
+    // The git folder names the project back: a worktree git made, over
+    // where `~/.ssh` leads. Left out, said, and the jail starts.
+    std::fs::write(
+        git_dir.join("gitdir"),
+        format!("{}\n", p.join(".git").display()),
+    )
+    .unwrap();
+    let output = run(&p);
+    let out = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{out} {err}");
     assert!(
-        !out.contains("CJC-J007-SSH-KEY") && !out.contains("DONE"),
+        !out.contains("CJC-J007-SSH-KEY") && out.contains("DONE"),
         "{out}"
     );
-    assert!(
-        err.contains(&format!(
-            "unsafe worktree git path '{}': it overlaps '{}', where {} leads",
-            h.join(".config/ssh").display(),
-            h.join(".config/ssh").display(),
-            h.join(".ssh").display()
-        )),
-        "{err}"
+    let said = format!(
+        "{} names {} as its git folder, and {} overlaps {}, where {} leads, which the jail \
+         hides: {}",
+        p.join(".git").display(),
+        git_dir.display(),
+        git_dir.display(),
+        git_dir.display(),
+        h.join(".ssh").display(),
+        worktree_left_effect()
     );
+    assert!(err.contains(&said), "{said}\n{err}");
+    assert!(!err.contains("unsafe worktree"), "{err}");
 }
 
 /// A person whose dotdirs are ordinary folders: they are hidden as before,
