@@ -3,7 +3,7 @@
 All notable changes to InnerWarden are documented here. This project
 follows semantic versioning.
 
-## Unreleased
+## 1.6.0 - 2026-10-22
 
 ### Upgrade notes: what to do
 
