@@ -75,7 +75,7 @@ test.describe("CJC-090-J004 local decision overview", () => {
     await page.goto("/");
     const band = page.locator("[data-verdict-row]");
     await expect(band).toHaveAttribute("data-verdict-row", "6");
-    await expect(band).toContainText("Connected, but nothing screened yet");
+    await expect(band).toContainText("Connected, but nothing screened since the settings changed");
     await expect(page.locator("#needs-a-look")).toContainText("Nothing recorded yet.");
     await expect(page.getByRole("heading", { name: "Getting started" })).toHaveCount(0);
   });

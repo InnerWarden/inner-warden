@@ -1,5 +1,16 @@
 import { describe, expect, it } from "vitest";
-import { decidedWords, decisionLadder, messageLadder, MONITOR_NOT_REFUSED, NOT_CHECKED_AFTERWARDS, REVIEW_NOT_REFUSED } from "./ladder";
+import {
+  decidedWords,
+  decisionLadder,
+  messageLadder,
+  MONITOR_NOT_REFUSED,
+  NOT_CHECKED_AFTERWARDS,
+  NOT_RECORDED_LABEL,
+  NOT_REFUSED_LABEL,
+  NOTHING_TO_REFUSE_LABEL,
+  REFUSED_LABEL,
+  REVIEW_NOT_REFUSED,
+} from "./ladder";
 import { DECISION_OUTCOMES, MESSAGE_OUTCOMES, type DecisionOutcomeKey } from "./words";
 
 function marks(outcomeKey: DecisionOutcomeKey, mode = "monitor", recommendation = "deny") {
@@ -14,6 +25,7 @@ describe("a decision's three steps", () => {
   it("is Seen, Decided, Refused, in that order, and nothing after", () => {
     const steps = decisionLadder({ outcomeKey: "refused_before_run", mode: "enforce", recommendation: "deny", decidedBy: "rules" });
     expect(steps.map((step) => step.label)).toEqual(["Seen", "Decided", "Refused"]);
+    expect(steps.map((step) => step.key)).toEqual(["seen", "decided", "refused"]);
     expect(NOT_CHECKED_AFTERWARDS).toBe("Not checked afterwards: Community does not look at what a command did after it ran.");
   });
 
@@ -27,12 +39,39 @@ describe("a decision's three steps", () => {
   });
 
   it("says why a step was not done, in the words a screen reader reads", () => {
-    expect(refused("refused_before_run", "enforce").words).toBe("Refused before it ran");
+    expect(refused("refused_before_run", "enforce").words).toBe("Before it ran");
     expect(refused("would_have_refused", "monitor").words).toBe(MONITOR_NOT_REFUSED);
     expect(refused("flagged_ran", "monitor").words).toBe(MONITOR_NOT_REFUSED);
     expect(refused("flagged_ran", "enforce").words).toBe(REVIEW_NOT_REFUSED);
-    expect(REVIEW_NOT_REFUSED).toBe("Not refused: a review is recorded and, by default, still runs");
+    expect(REVIEW_NOT_REFUSED).toBe("A review is recorded and, by default, still runs");
     expect(refused("unplaced", "unknown").words).toBe("Not recorded whether it was refused");
+  });
+
+  /**
+   * The bold label alone must read true: a monitor deny that ran is never
+   * labelled "Refused", whatever its mark. FAILS ON REVERT to a fixed
+   * "Refused" label.
+   */
+  it("labels the third step with what happened, never Refused for a decision that was not", () => {
+    expect(refused("refused_before_run", "enforce").label).toBe(REFUSED_LABEL);
+    expect(refused("would_have_refused", "monitor").label).toBe(NOT_REFUSED_LABEL);
+    expect(refused("flagged_ran", "monitor").label).toBe(NOT_REFUSED_LABEL);
+    expect(refused("flagged_ran", "enforce").label).toBe(NOT_REFUSED_LABEL);
+    expect(refused("unsafe_may_have_run", "enforce").label).toBe(NOT_REFUSED_LABEL);
+    expect(refused("allowed", "enforce").label).toBe(NOTHING_TO_REFUSE_LABEL);
+    expect(refused("checked_only", "check").label).toBe(NOTHING_TO_REFUSE_LABEL);
+    expect(refused("unplaced", "unknown").label).toBe(NOT_RECORDED_LABEL);
+    for (const outcomeKey of DECISION_OUTCOMES) {
+      for (const mode of ["monitor", "enforce", "check", "unknown"]) {
+        const step = decisionLadder({ outcomeKey, mode, recommendation: "deny", decidedBy: "rules" })[2];
+        expect(step.label === REFUSED_LABEL, `${outcomeKey} ${mode}`).toBe(step.mark === "done");
+        expect(step.words.startsWith("Not refused:"), `${outcomeKey} ${mode}`).toBe(false);
+      }
+    }
+    for (const outcomeKey of MESSAGE_OUTCOMES) {
+      const step = messageLadder(outcomeKey)[2];
+      expect(step.label === REFUSED_LABEL, outcomeKey).toBe(outcomeKey === "stopped_by_innerwarden");
+    }
   });
 
   it("says the verdict and who decided, and never prints a token it has no words for", () => {
@@ -68,7 +107,8 @@ describe("a decision's three steps", () => {
   it("never refuses a message: observe records and does not block", () => {
     const steps = messageLadder("declined_by_agent");
     expect(steps.map((step) => step.mark)).toEqual(["done", "done", "not_applicable"]);
-    expect(steps[2].words).toBe("Not refused: observe records and does not block");
+    expect(steps[2].label).toBe(NOT_REFUSED_LABEL);
+    expect(steps[2].words).toBe("Observe records and does not block");
     expect(messageLadder("not_seen")[1].mark).toBe("unknown");
   });
 

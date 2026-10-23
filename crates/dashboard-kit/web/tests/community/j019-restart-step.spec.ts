@@ -125,4 +125,27 @@ test("every config-changing step on a decision says how to restart its agent, an
   await expect(detail.locator("[data-command]").filter({ hasText: "innerwarden enforce" })).toBeVisible();
   await expectEveryStepRestarts(page, 1);
   await expectNoRestartClaim(page);
+  // `innerwarden enforce` switches every connected agent: each one's how and
+  // why, not only the agent this decision is about. FAILS ON REVERT to one note.
+  const step = detail.locator("[data-step]").filter({ has: page.locator("[data-command]", { hasText: /^innerwarden enforce$/ }) });
+  const connected = (fixture("agents.json") as { agents: { display_name: string; guardrail: { mode: string } }[] }).agents
+    .filter((agent) => ["monitor", "enforce", "partial", "mixed"].includes(agent.guardrail.mode))
+    .map((agent) => agent.display_name);
+  expect(connected.length).toBeGreaterThan(1);
+  await expect(step.locator("[data-restart]")).toHaveCount(connected.length);
+  for (const name of connected) await expect(step.locator(`[data-restart="${name}"]`)).toContainText(WHY);
+});
+
+/** A band or a prompt with no command before the restart says "now", never "after this step". */
+test("a restart with no step before it says now", async ({ page, baseURL }) => {
+  await useScenario(page, baseURL, "never-screened");
+  await page.goto("/");
+  const band = page.locator('[data-verdict-row="6"]');
+  await expect(band.locator("[data-command]")).toHaveCount(0);
+  const notes = band.locator("[data-restart]");
+  expect(await notes.count()).toBeGreaterThan(0);
+  for (const note of await notes.all()) {
+    await expect(note).toHaveText(/^If .+ is running, restart it now\. /);
+    await expect(note).not.toContainText("after this step");
+  }
 });

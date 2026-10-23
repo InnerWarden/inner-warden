@@ -51,11 +51,14 @@ function BarTable({ bars, first, caption }: { bars: readonly Bar[]; first: strin
 const WIDTH = 280;
 const HEIGHT = 120;
 
-/** The stacked bars, scaled to the largest; a partial bar is faded (a day) or outlined (a week). */
+/**
+ * The stacked bars, scaled to the largest; a partial bar (today, or the week
+ * under way) is drawn at half strength and its words say "so far". Never
+ * dashed: a dashed line on these pages means a value that was not read.
+ */
 function StackedBars({
   bars,
   name,
-  partialStyle,
   start,
   end,
   first,
@@ -63,7 +66,6 @@ function StackedBars({
 }: {
   bars: readonly Bar[];
   name: string;
-  partialStyle: "faded" | "outlined";
   /** The words under the first bar and under the last. */
   start: string;
   end: string;
@@ -86,7 +88,7 @@ function StackedBars({
             const x = index * slot + (slot - width) / 2;
             const blocked = scale(bar.blocked);
             const would = scale(bar.wouldBlock);
-            const faded = bar.partial && partialStyle === "faded";
+            const faded = bar.partial;
             return (
               <g key={bar.key} data-bar={bar.key} data-partial={bar.partial ? "" : undefined} opacity={faded ? 0.5 : 1}>
                 <rect x={x} y={HEIGHT - 1} width={width} height={1} style={{ fill: "var(--iw-line-strong)" }} />
@@ -99,18 +101,6 @@ function StackedBars({
                     height={would}
                     style={{ fill: `url(#${HATCH_PATTERN.deny}) var(--iw-deny)`, stroke: "var(--iw-deny)" }}
                     strokeWidth={0.75}
-                    vectorEffect="non-scaling-stroke"
-                  />
-                ) : null}
-                {bar.partial && partialStyle === "outlined" ? (
-                  <rect
-                    x={x - 1}
-                    y={0.5}
-                    width={width + 2}
-                    height={HEIGHT - 1}
-                    fill="none"
-                    style={{ stroke: "var(--iw-line-strong)" }}
-                    strokeDasharray="3 2"
                     vectorEffect="non-scaling-stroke"
                   />
                 ) : null}
@@ -165,7 +155,6 @@ export function DayBars({ days }: { days: readonly RefusalDay[] }) {
     <StackedBars
       bars={bars}
       name={name}
-      partialStyle="faded"
       first="Day (UTC)"
       caption={name}
       start={days.length === 0 ? "" : `From ${dayLabel(days[0].date)}`}
@@ -174,7 +163,7 @@ export function DayBars({ days }: { days: readonly RefusalDay[] }) {
   );
 }
 
-/** Weeks of the guard's log; the week still under way is outlined and says so, never dropped. */
+/** Weeks of the guard's log; the week still under way is drawn at half strength and says so, never dropped. */
 export function WeekBars({ weeks }: { weeks: readonly RefusalWeek[] }) {
   const bars: Bar[] = weeks.map((week) => ({
     key: week.start,
@@ -190,7 +179,6 @@ export function WeekBars({ weeks }: { weeks: readonly RefusalWeek[] }) {
     <StackedBars
       bars={bars}
       name={name}
-      partialStyle="outlined"
       first="Week (UTC)"
       caption={name}
       start={weeks.length === 0 ? "" : `From ${dayLabel(weeks[0].start)}`}
@@ -209,6 +197,18 @@ export function share(value: bigint, whole: bigint): number {
 }
 
 const TOKEN_SHADES = ["var(--iw-ink)", "var(--iw-ink-2)", "var(--iw-ink-3)", "var(--iw-allow)"];
+/** The cache reads' own track. */
+const CACHE_SHADE = "var(--iw-line-strong)";
+
+/** A key square in a shade, beside its words: the shades alone are never the signal. */
+function ShadeKey({ shade, label }: { shade: string; label: string }) {
+  return (
+    <span className="inline-flex items-center gap-1.5">
+      <span aria-hidden="true" className="h-2.5 w-2.5 shrink-0 rounded-[2px]" style={{ background: shade }} />
+      {label}
+    </span>
+  );
+}
 
 /**
  * One agent's tokens: the parts that are not cache reads stacked in ink
@@ -250,10 +250,14 @@ export function TokenBars({
         {cacheReads === undefined ? null : (
           <>
             <rect x={0} y={10} width={100} height={4} style={{ fill: "var(--iw-surface-2)" }} />
-            <rect data-part="cache_reads" x={0} y={10} width={share(cacheReads, cacheWhole) * 100} height={4} style={{ fill: "var(--iw-line-strong)" }} />
+            <rect data-part="cache_reads" x={0} y={10} width={share(cacheReads, cacheWhole) * 100} height={4} style={{ fill: CACHE_SHADE }} />
           </>
         )}
       </svg>
+      <figcaption data-token-key className={`flex flex-wrap gap-x-3 gap-y-1 ${META_TEXT}`}>
+        {parts.map((part, index) => <ShadeKey key={part.key} shade={TOKEN_SHADES[index % TOKEN_SHADES.length]} label={part.label} />)}
+        {cacheReads === undefined ? null : <ShadeKey shade={CACHE_SHADE} label="Re-read from cache" />}
+      </figcaption>
       {/* A table sizes to its content whatever its width says: the wrapper is what hides it. */}
       <div className="sr-only">
         <table>

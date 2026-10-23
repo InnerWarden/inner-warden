@@ -2,7 +2,10 @@ import { DECIDER_WORDS, type DecisionOutcomeKey, type MessageOutcomeKey } from "
 
 /**
  * What InnerWarden did with one decision, in three steps: Seen, Decided,
- * Refused. Then, said once under them, that nothing was checked afterwards
+ * and whether it was refused. The third step's label is what happened
+ * ("Refused", "Not refused", "Nothing to refuse", "Not recorded"), never
+ * "Refused" for a decision that was not: the bold labels alone read true.
+ * Then, said once under them, that nothing was checked afterwards
  * (`NOT_CHECKED_AFTERWARDS`): Community records the guard's own answer and
  * never looks at what a command did after it ran.
  *
@@ -31,29 +34,35 @@ export type LadderInput = {
 
 export const NOT_CHECKED_AFTERWARDS = "Not checked afterwards: Community does not look at what a command did after it ran.";
 
-export const MONITOR_NOT_REFUSED = "Not refused: monitor records and does not refuse";
-export const REVIEW_NOT_REFUSED = "Not refused: a review is recorded and, by default, still runs";
+export const MONITOR_NOT_REFUSED = "Monitor records and does not refuse";
+export const REVIEW_NOT_REFUSED = "A review is recorded and, by default, still runs";
 
 const VERDICT_WORDS: Record<string, string> = { deny: "Deny", review: "Review", allow: "Allow" };
 
-function refused(input: LadderInput): Pick<LadderStep, "mark" | "words"> {
+/** The third step's labels: what happened, in the label itself. */
+export const REFUSED_LABEL = "Refused";
+export const NOT_REFUSED_LABEL = "Not refused";
+export const NOTHING_TO_REFUSE_LABEL = "Nothing to refuse";
+export const NOT_RECORDED_LABEL = "Not recorded";
+
+function refused(input: LadderInput): Pick<LadderStep, "label" | "mark" | "words"> {
   switch (input.outcomeKey) {
     case "refused_before_run":
-      return { mark: "done", words: "Refused before it ran" };
+      return { label: REFUSED_LABEL, mark: "done", words: "Before it ran" };
     case "unsafe_may_have_run":
-      return { mark: "no", words: "Not refused: judged unsafe, and it ran" };
+      return { label: NOT_REFUSED_LABEL, mark: "no", words: "Judged unsafe, and it ran" };
     case "would_have_refused":
-      return { mark: "not_applicable", words: MONITOR_NOT_REFUSED };
+      return { label: NOT_REFUSED_LABEL, mark: "not_applicable", words: MONITOR_NOT_REFUSED };
     case "flagged_ran":
       return input.mode === "monitor"
-        ? { mark: "not_applicable", words: MONITOR_NOT_REFUSED }
-        : { mark: "not_applicable", words: REVIEW_NOT_REFUSED };
+        ? { label: NOT_REFUSED_LABEL, mark: "not_applicable", words: MONITOR_NOT_REFUSED }
+        : { label: NOT_REFUSED_LABEL, mark: "not_applicable", words: REVIEW_NOT_REFUSED };
     case "checked_only":
-      return { mark: "not_applicable", words: "Nothing to refuse: a check by hand runs nothing" };
+      return { label: NOTHING_TO_REFUSE_LABEL, mark: "not_applicable", words: "A check by hand runs nothing" };
     case "allowed":
-      return { mark: "not_applicable", words: "Nothing to refuse: it was allowed" };
+      return { label: NOTHING_TO_REFUSE_LABEL, mark: "not_applicable", words: "It was allowed" };
     case "unplaced":
-      return { mark: "unknown", words: "Not recorded whether it was refused" };
+      return { label: NOT_RECORDED_LABEL, mark: "unknown", words: "Not recorded whether it was refused" };
   }
 }
 
@@ -72,7 +81,7 @@ export function decisionLadder(input: LadderInput): LadderStep[] {
     // No time on Decided: the record keeps one time per decision, so a "+0 s"
     // here would be a constant dressed as a measurement.
     { key: "decided", label: "Decided", mark: "done", words: decidedWords(input.recommendation, input.decidedBy) },
-    { key: "refused", label: "Refused", ...refused(input) },
+    { key: "refused", ...refused(input) },
   ];
 }
 
@@ -106,10 +115,9 @@ export function messageLadder(outcomeKey: MessageOutcomeKey): LadderStep[] {
     { key: "decided", label: "Decided", ...messageDecided(outcomeKey) },
     {
       key: "refused",
-      label: "Refused",
       ...(outcomeKey === "stopped_by_innerwarden"
-        ? { mark: "done" as const, words: "The guard refused it" }
-        : { mark: "not_applicable" as const, words: "Not refused: observe records and does not block" }),
+        ? { label: REFUSED_LABEL, mark: "done" as const, words: "The guard refused it" }
+        : { label: NOT_REFUSED_LABEL, mark: "not_applicable" as const, words: "Observe records and does not block" }),
     },
   ];
 }

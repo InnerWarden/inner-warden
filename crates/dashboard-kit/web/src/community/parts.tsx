@@ -172,6 +172,9 @@ export function CopyCommand({
           {copied ? "Copied" : "Copy"}
         </button>
       ) : null}
+      {/* The button's name stays "Copy command": a screen reader hears that it
+          worked here, once, politely. */}
+      {canCopy ? <span data-copied-status className="sr-only" aria-live="polite">{copied ? `Copied: ${command}` : ""}</span> : null}
     </div>
   );
 }

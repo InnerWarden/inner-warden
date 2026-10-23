@@ -16,7 +16,8 @@ import { ENFORCE_MEANS, MONITOR_MEANS, type DecisionOutcomeKey } from "./words";
  *    or mixed, and seen only when a screening came through after its
  *    settings last changed.
  *  - What could not be read is said as such (rows 0 and 3), never as off and
- *    never as zero.
+ *    never as zero. An agent whose mode could not be read is never "not
+ *    connected": it is said by name, as not read.
  *  - Monitor is a fine place to stay: row 8 never says "you should".
  *  - Row 9 says "set to refuse" (the config) beside a counted number, and
  *    never that anything is protected.
@@ -51,6 +52,11 @@ export type VerdictAction = {
 export type Verdict = {
   row: VerdictRow;
   tone: VerdictTone;
+  /**
+   * Some agents refuse a deny and others do not (row 7): drawn with the
+   * half shield the header uses for the same state, never the monitor eye.
+   */
+  mixed?: boolean;
   /** Absent only for row 0, which draws a fixed-height skeleton. */
   headline?: string;
   lines: string[];
@@ -146,6 +152,37 @@ function plural(n: number, one: string, many: string): string {
   return n === 1 ? one : many;
 }
 
+/** Agents set up to reach the guard whose hook or MCP config could not be read: their mode is not known. */
+function modeUnread(agents: readonly AgentFacts[]): AgentFacts[] {
+  return agents.filter((agent) => agent.mode === "unknown");
+}
+
+/** "Codex's" or "Codex's and Cursor's": whose mode could not be read. */
+function possessive(agents: readonly AgentFacts[]): string {
+  return nameList(agents.map((agent) => `${agent.name}'s`));
+}
+
+/** Said beside any other answer when one agent's mode could not be read: it is never counted as on or off. */
+function unreadLine(unread: readonly AgentFacts[]): string {
+  return `Could not read ${possessive(unread)} ${plural(unread.length, "mode", "modes")}: ${plural(unread.length, "it is", "they are")} counted as neither connected nor off. innerwarden status says why.`;
+}
+
+/** No agent connected, and at least one whose mode could not be read: said by name, as not read. */
+function unreadVerdict(unread: readonly AgentFacts[]): Verdict {
+  return {
+    row: 3,
+    tone: "unknown",
+    headline: `Could not read ${possessive(unread)} ${plural(unread.length, "mode", "modes")}`,
+    lines: [`${plural(unread.length, "Its", "Their")} hook or MCP config could not be read, so this page says neither connected nor off.`],
+    action: { ...emptyAction(), steps: [{ step: STATUS_STEP, restarts: [] }] },
+  };
+}
+
+/** Add the unread line to an answer about the other agents. */
+function withUnread(verdict: Verdict, unread: readonly AgentFacts[]): Verdict {
+  return unread.length === 0 ? verdict : { ...verdict, lines: [...verdict.lines, unreadLine(unread)] };
+}
+
 export function overviewVerdict(input: VerdictInput): Verdict {
   const clock = input.clock ?? clockTime;
 
@@ -207,7 +244,22 @@ export function overviewVerdict(input: VerdictInput): Verdict {
 
   const agents = input.agents ?? [];
   const connected = agents.filter(isConnected);
+  const unread = modeUnread(agents);
 
+  // 3 again: no agent connected, and one whose mode could not be read. It
+  // may well be connected: it is never said as "not connected".
+  if (connected.length === 0 && unread.length > 0) return unreadVerdict(unread);
+
+  return withUnread(connectedVerdict(input, agents, connected, clock), unread);
+}
+
+/** Rows 4 to 9: what the agents that were read are set to, and what was seen. */
+function connectedVerdict(
+  input: VerdictInput,
+  agents: readonly AgentFacts[],
+  connected: readonly AgentFacts[],
+  clock: (ms: number) => string,
+): Verdict {
   // 4: no agent connected.
   if (connected.length === 0) {
     const found = agents.filter((agent) => agent.mode === "not_configured" && agent.supported && agent.present);
@@ -249,10 +301,13 @@ export function overviewVerdict(input: VerdictInput): Verdict {
   // 6: connected, and nothing seen since the settings changed.
   const considered = connected.filter((agent) => agentSeen(agent, input.unnamed) !== "nothing_to_screen");
   if (considered.length > 0 && considered.every((agent) => agentSeen(agent, input.unnamed) === "not_seen")) {
+    // "Yet" only when nothing was ever screened: an agent whose settings
+    // changed may well have been screened before the change.
+    const changed = considered.some((agent) => agent.configChangedAt !== undefined);
     return {
       row: 6,
       tone: "unknown",
-      headline: "Connected, but nothing screened yet",
+      headline: changed ? "Connected, but nothing screened since the settings changed" : "Connected, but nothing screened yet",
       lines: considered.map((agent) =>
         agent.configChangedAt === undefined
           ? `Nothing has come through the guard from ${agent.name} yet.`
@@ -296,6 +351,7 @@ export function overviewVerdict(input: VerdictInput): Verdict {
     return {
       row: 7,
       tone: "watch",
+      mixed: true,
       headline: parts.join(" "),
       lines: [MONITOR_MEANS],
       action: perAgent
@@ -391,6 +447,12 @@ export function modeBox(input: ModeBoxInput): Verdict {
     };
   }
   const connected = input.agents.filter(isConnected);
+  const unread = modeUnread(input.agents);
+  if (connected.length === 0 && unread.length > 0) return unreadVerdict(unread);
+  return withUnread(connectedModeBox(connected), unread);
+}
+
+function connectedModeBox(connected: readonly AgentFacts[]): Verdict {
   if (connected.length === 0) {
     return {
       row: 4,
@@ -458,6 +520,7 @@ export function modeBox(input: ModeBoxInput): Verdict {
   return {
     row: 7,
     tone: "watch",
+    mixed: true,
     headline: `Mixed: ${parts.join(", ")}.`,
     lines: partialLines,
     // A switch for one agent restarts that agent; the way back for every

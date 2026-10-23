@@ -100,13 +100,25 @@ describe("tokens", () => {
     expect(tokenWords(claude.cacheReads!)).toBe("1.3 billion");
   });
 
-  /** FAILS ON REVERT: stack Codex's parts and its cached input is counted twice. */
-  it("never stacks or subtracts counters that overlap: the total as sent, the overlaps in words", () => {
+  /**
+   * FAILS ON REVERT: stack Codex's parts and its cached input is counted
+   * twice. Its cached input is inside its input, so the headline leaves it
+   * out, on the same basis as Claude Code's ("not counting cache reads"),
+   * and says it apart: never 25 times another agent's for the cache alone.
+   */
+  it("never stacks counters that overlap, and puts the headline on one basis: cache reads said apart", () => {
     const codex = tokenViews(tokens)[1];
+    const input = BigInt(tokens.agents[1].input_tokens!);
+    const output = BigInt(tokens.agents[1].output_tokens!);
+    const cached = BigInt(tokens.agents[1].cached_input_tokens!);
     expect(codex.disjoint).toBe(false);
     expect(codex.parts).toEqual([]);
-    expect(codex.headline?.value).toBe(1_004_385_989n);
+    expect(codex.headline).toEqual({ value: input - cached + output, words: "tokens, not counting cache reads" });
+    expect(codex.cacheReads).toBe(cached);
     expect(codex.lines).toEqual(["1.0 billion input, of which 959 million cached", "2.9 million output, of which 844,960 reasoning"]);
+    // Without a cached count there is nothing to leave out: the total as sent.
+    const plain = tokenView({ ...tokens.agents[1], cached_input_tokens: null } as never);
+    expect(plain.headline).toEqual({ value: 1_004_385_989n, words: "tokens in all" });
   });
 
   it("says a source that does not exist, never a zero", () => {
@@ -138,7 +150,7 @@ describe("tokens", () => {
 
   it("keeps counts past what a number holds exact, and draws every agent on one scale", () => {
     const huge = "90071992547409930";
-    const view = tokenView({ ...tokens.agents[1], total_tokens: huge, input_tokens: huge, output_tokens: "0", parts_disjoint: false } as never);
+    const view = tokenView({ ...tokens.agents[1], total_tokens: huge, input_tokens: huge, output_tokens: "0", cached_input_tokens: null, parts_disjoint: false } as never);
     expect(view.headline?.value).toBe(90071992547409930n);
     expect(tokenScales(tokenViews(tokens))).toEqual({ fresh: 40_921_626n, cache: 1_271_432_724n });
     expect(share(1n, 4n)).toBeCloseTo(0.25);

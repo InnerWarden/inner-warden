@@ -271,6 +271,46 @@ describe("the fields and routes v2 reads (A1 to E2): present, absent, malformed"
     expect(unmarked.allow[0].remove).toBeUndefined();
   });
 
+  /** A log that could not be read sends a null count: it stays absent, never a zero ("no change"). FAILS ON REVERT of `?? 0`. */
+  it("E1: a change count the log could not give is absent, never zero", () => {
+    const list = readSuppressList({ ...suppress, changes: { count: null, since: null, last_at: null } });
+    expect(list.changes.count).toBeUndefined();
+    expect("count" in list.changes).toBe(false);
+    expect(readSuppressList({ ...suppress, changes: { count: 0 } }).changes.count).toBe(0);
+  });
+
+  /**
+   * A mute the CLI serves at up to 400 characters is read whole, and a row
+   * that cannot be read is counted, never dropped silently. FAILS ON REVERT
+   * of the 64 character bound: the category vanishes and the page says
+   * "Nothing muted.".
+   */
+  it("E1: reads a long mute whole, and counts a row it cannot read", () => {
+    const long = `c${"x".repeat(99)}`;
+    const list = readSuppressList({ ...suppress, mute_categories: [{ id: long }, { id: 7 }], mute_rules: [{ id: "R-1" }, {}] });
+    expect(list.muteCategories.map((entry) => entry.id)).toEqual([long]);
+    expect(list.muteRules.map((entry) => entry.id)).toEqual(["R-1"]);
+    expect(list.unshown).toBe(2);
+    expect(readSuppressList(suppress).unshown).toBe(0);
+  });
+
+  /** A pattern too long to serve whole is marked shortened: no remove step, whatever was sent beside it. */
+  it("E1: a shortened pattern is marked and has no remove step", () => {
+    const cut = `${"a".repeat(399)}…`;
+    const list = readSuppressList({ ...suppress, allow: [{ pattern: cut, redacted: false, hidden_characters: false, warning: null, shortened: true, remove: { label: "a", command: "b", line: "c" } }] });
+    expect(list.allow[0]).toMatchObject({ pattern: cut, shortened: true });
+    expect(list.allow[0].remove).toBeUndefined();
+    expect(readSuppressList(suppress).allow.every((entry) => !entry.shortened)).toBe(true);
+  });
+
+  /** A line of jail advice the CLI serves (up to 400 characters) is never dropped. FAILS ON REVERT of the 300 bound. */
+  it("D1: keeps a 350 character line of jail advice", () => {
+    const line = `bwrap cannot create a user namespace here. ${"w".repeat(307)}`;
+    expect(line.length).toBe(350);
+    const jail = readProtection({ ...protection, jail: { ...protection.jail, checks_pass: false, advice: [line] } }).jail;
+    expect(jail.advice).toEqual([line]);
+  });
+
   it("E1: withheld lists are empty and say why, and the counts stay", () => {
     const list = readSuppressList(suppressExposed);
     expect(list.withheld).toBe(true);

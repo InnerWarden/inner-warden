@@ -36,7 +36,7 @@ export const PROTECTION_LEAD =
 export const EXCEPTION_RULES = [
   "An allow pattern lets through only the commands it matches, and the record says you allowed it.",
   "A mute clears a flag only when every rule behind it is muted and no other danger signal remains.",
-  "These change only from a terminal you type in. An agent that runs them is refused.",
+  "Adding to these lists needs a terminal: the CLI refuses an allow or mute that runs with no terminal, as an agent's shell does. Removing one does not.",
 ] as const;
 
 const STATUS_STEP = { label: "To see why:", command: "innerwarden status", line: "Says why, and what to do." };
@@ -227,7 +227,7 @@ export function recordSpanLine(record: RecordSpan, now: number): string {
 
 /**
  * The decision record: whether it is recording, what it holds, and the
- * guard's log by week, the week under way outlined and said as so far.
+ * guard's log by week, the week under way at half strength and said as so far.
  */
 function RecordSection({
   health,
@@ -419,15 +419,22 @@ function FromTerminal() {
 }
 
 function AllowRow({ entry }: { entry: AllowEntry }) {
+  const kind = entry.redacted ? "redacted" : entry.hiddenCharacters ? "hidden" : entry.shortened ? "shortened" : "plain";
   return (
-    <li data-allow={entry.redacted ? "redacted" : entry.hiddenCharacters ? "hidden" : "plain"} className="space-y-2 py-3 first:pt-0 last:pb-0">
+    <li data-allow={kind} className="space-y-2 py-3 first:pt-0 last:pb-0">
       <div className="flex flex-wrap items-center gap-2">
         <code className="min-w-0 break-all font-mono text-[12.5px] leading-[18px] text-(--iw-ink)">{entry.pattern}</code>
         {entry.unanchored ? <span data-unanchored><StatusPill state="needs" words="Matches more than one command" /></span> : null}
         {entry.hiddenCharacters ? <HiddenChip compact /> : null}
+        {entry.shortened ? (
+          <span data-shortened className="inline-flex w-fit shrink-0 items-center rounded-md border border-(--iw-line-strong) bg-(--iw-surface) px-1.5 py-0.5 text-[11px] font-semibold leading-4 text-(--iw-ink-2)">
+            Shortened here
+          </span>
+        ) : null}
       </div>
       {entry.redacted ? <p className={`${SMALL_TEXT} text-(--iw-ink-2)`}>Contains a secret, hidden here.</p> : null}
-      {entry.redacted || entry.hiddenCharacters ? (
+      {entry.shortened ? <p className={`${SMALL_TEXT} text-(--iw-ink-2)`}>Too long to show whole: this is its first part.</p> : null}
+      {entry.redacted || entry.hiddenCharacters || entry.shortened ? (
         <FromTerminal />
       ) : entry.remove === undefined ? null : (
         <RemoveStep step={entry.remove} />
@@ -456,11 +463,19 @@ function MoreLine({ n, step }: { n: number; step?: { label: string; command: str
   );
 }
 
+/** How often the lists changed, from the guard's log; a log that could not be read is said, never "no change". */
+export function changesWords(changes: SuppressList["changes"], now: number): string | undefined {
+  const n = changes.count;
+  if (n === undefined) return undefined;
+  if (n === 0) return "No change to these lists in the guard's log.";
+  return `${formatCount(n)} ${n === 1 ? "change" : "changes"}${changes.since === undefined ? "" : ` since ${shortDay(changes.since)}`}${changes.lastAt === undefined ? "" : `, the last ${atWords(Date.parse(changes.lastAt), now)}`}.`;
+}
+
+/** Said when the guard's log could not be read: the changes are not counted, and that is not "no change". */
+export const CHANGES_NOT_READ = "Not read: the guard's log could not be read, so changes are not counted.";
+
 function ExceptionLists({ list, now }: { list: SuppressList; now: number }) {
-  const changes = list.changes;
-  const changesLine = changes.count === 0
-    ? "No change to these lists in the guard's log."
-    : `${formatCount(changes.count)} ${changes.count === 1 ? "change" : "changes"}${changes.since === undefined ? "" : ` since ${shortDay(changes.since)}`}${changes.lastAt === undefined ? "" : `, the last ${atWords(Date.parse(changes.lastAt), now)}`}.`;
+  const changesLine = changesWords(list.changes, now);
   return (
     <div className="space-y-5">
       <p data-exception-counts className={BODY_TEXT}>{countsLine(list.counts)}</p>
@@ -524,9 +539,19 @@ function ExceptionLists({ list, now }: { list: SuppressList; now: number }) {
             )}
             <MoreLine n={list.more.muteRules + list.more.muteCategories} step={list.listSteps.mute} />
           </div>
+          {list.unshown === 0 ? null : (
+            <p data-exception-unshown className={BODY_TEXT}>
+              {formatCount(list.unshown)} {list.unshown === 1 ? "entry" : "entries"} could not be shown here. <Code>innerwarden allow --list</Code> and{" "}
+              <Code>innerwarden mute --list</Code> show every one.
+            </p>
+          )}
         </>
       )}
-      <p data-exception-changes className={BODY_TEXT}>{changesLine}</p>
+      {changesLine === undefined ? (
+        <div data-exception-changes="not_read"><NotRead>{CHANGES_NOT_READ}</NotRead></div>
+      ) : (
+        <p data-exception-changes className={BODY_TEXT}>{changesLine}</p>
+      )}
     </div>
   );
 }

@@ -1,13 +1,13 @@
-import { useMemo, type MouseEvent, type ReactNode } from "react";
+import { useMemo, useState, type MouseEvent, type ReactNode } from "react";
 import { TechnicalOnly } from "../../components/TechnicalDetail";
 import { formatCount } from "../../presentation";
-import { OUTCOME_STYLE, type OutcomeKey } from "../outcomeStyle";
+import type { OutcomeKey } from "../outcomeStyle";
 import { CopyCommand } from "../parts";
-import { restartNote, type RestartWords } from "../restart";
+import { restartNote, type RestartWhen, type RestartWords } from "../restart";
 import { clockTime, type BandStep, type Restart, type Verdict, type VerdictAction, type VerdictTone } from "../verdict";
 import { isTemplate, OUTCOME_WORDS } from "../words";
 import { Icon, type IconName } from "./Icon";
-import { Mark, MarkSwatch, OutcomeMark } from "./marks";
+import { MarkSwatch, OutcomeMark } from "./marks";
 
 /**
  * The blocks a Community page is built from (spec 9.2, 9.3): one panel per
@@ -120,30 +120,41 @@ export function Disclosure({ summary, children, open = false }: { summary: React
   );
 }
 
-/** The outcome marks a list uses, each with its words. */
-export function Legend({ outcomes, className = "" }: { outcomes: readonly OutcomeKey[]; className?: string }) {
-  return (
-    <ul data-legend className={`flex flex-wrap gap-x-4 gap-y-1 ${META_TEXT} ${className}`}>
-      {outcomes.map((outcome) => (
-        <li key={outcome} className="flex items-center gap-1.5">
-          <Mark {...OUTCOME_STYLE[outcome]} />
-          <span>{OUTCOME_WORDS[outcome]}</span>
-        </li>
-      ))}
-    </ul>
-  );
-}
-
 /**
  * The person's restart, after a step that changes an agent's config: how, and
  * why. Never that it restarted: only the person can do that.
  */
-export function RestartNote({ agent, words }: { agent: string; words: RestartWords }) {
+export function RestartNote({ agent, words, when = "after_step" }: { agent: string; words: RestartWords; when?: RestartWhen }) {
   return (
-    <p data-restart={agent} className={`flex items-start gap-2 ${SMALL_TEXT} text-(--iw-ink-2)`}>
+    <p data-restart={agent} data-restart-when={when} className={`flex items-start gap-2 ${SMALL_TEXT} text-(--iw-ink-2)`}>
       <span className="mt-0.5 text-(--iw-ink-3)"><Icon name="terminal" /></span>
-      <span className="min-w-0">{restartNote(agent, words)}</span>
+      <span className="min-w-0">{restartNote(agent, words, when)}</span>
     </p>
+  );
+}
+
+/** "Claude Code, Codex and Cursor". */
+function names(list: readonly string[]): string {
+  return list.length < 2 ? (list[0] ?? "") : `${list.slice(0, -1).join(", ")} and ${list[list.length - 1]}`;
+}
+
+/**
+ * Several agents to restart after one step: open at a desk, where there is
+ * room for every note; folded on a phone under one line that names them
+ * all, so the band's step and the two counts stay on the first screen. Each
+ * agent's how and why is the same note either way, one press away.
+ */
+function RestartGroup({ restarts }: { restarts: readonly Restart[] }) {
+  const [open] = useState(() => typeof window !== "undefined" && window.matchMedia?.("(min-width: 1024px)").matches === true);
+  return (
+    <details data-restart-group open={open} className="min-w-0">
+      <summary className={`min-h-9 cursor-pointer py-1 ${SMALL_TEXT} font-medium text-(--iw-ink-2) pointer-coarse:min-h-11`}>
+        Then restart each one that is running: {names(restarts.map((restart) => restart.agent))}
+      </summary>
+      <div className="mt-1 space-y-2">
+        {restarts.map((restart) => <RestartNote key={restart.agent} agent={restart.agent} words={restart.words} />)}
+      </div>
+    </details>
   );
 }
 
@@ -158,7 +169,11 @@ export function StepBlock({ step, restarts = [] }: { step: BandStep; restarts?: 
       <p className="text-sm leading-[21px] font-medium text-(--iw-ink)">{step.label}</p>
       {step.command === undefined ? null : <CopyCommand command={step.command} template={isTemplate(step.command)} />}
       {step.line === undefined ? null : <p className={META_TEXT}>{step.line}</p>}
-      {restarts.map((restart) => <RestartNote key={restart.agent} agent={restart.agent} words={restart.words} />)}
+      {restarts.length > 1 ? (
+        <RestartGroup restarts={restarts} />
+      ) : (
+        restarts.map((restart) => <RestartNote key={restart.agent} agent={restart.agent} words={restart.words} />)
+      )}
     </div>
   );
 }
@@ -222,7 +237,8 @@ function ActionBlock({ action, said = [], onOpenAgents }: { action: VerdictActio
       ))}
       {action.restarts.length === 0 ? null : (
         <div className="space-y-2 rounded-lg bg-(--iw-surface-2) p-3">
-          {action.restarts.map((restart) => <RestartNote key={restart.agent} agent={restart.agent} words={restart.words} />)}
+          {/* No command comes first here: the restart is the step, now. */}
+          {action.restarts.map((restart) => <RestartNote key={restart.agent} agent={restart.agent} words={restart.words} when="now" />)}
           {action.after === undefined ? null : <p className={`${SMALL_TEXT} text-(--iw-ink-2)`}>{action.after}</p>}
         </div>
       )}
@@ -288,7 +304,7 @@ export function VerdictBand({
       <div className={compact ? "space-y-4" : "space-y-4 lg:grid lg:grid-cols-12 lg:gap-6 lg:space-y-0"}>
         <div className={`min-w-0 space-y-2 ${compact ? "" : "lg:col-span-7"}`}>
           <Heading id={`${id}-title`} tabIndex={page === undefined ? undefined : -1} className="flex items-start gap-2 text-xl leading-7 font-semibold text-(--iw-ink)">
-            <span className={`mt-1.5 ${TONE_ICON_COLOUR[verdict.tone]}`}><Icon name={TONE_ICON[verdict.tone]} /></span>
+            <span className={`mt-1.5 ${TONE_ICON_COLOUR[verdict.tone]}`}><Icon name={verdict.mixed === true ? "half-shield" : TONE_ICON[verdict.tone]} /></span>
             <span className="min-w-0">
               {page === undefined ? null : <span className="sr-only">{page}: </span>}
               {verdict.headline}

@@ -17,6 +17,7 @@ import {
   SCREENING_WORDS,
   screeningRows,
   screeningState,
+  screeningSummary,
   secondOpinionControl,
 } from "./controls";
 import { modeBox } from "./verdict";
@@ -74,6 +75,31 @@ describe("the mode box (spec 6.2, section 1)", () => {
 });
 
 describe("the screening rows", () => {
+  /**
+   * An agent whose mode could not be read has a row, in the unknown state,
+   * and the summary says its mode was not read: never "no agent is connected
+   * yet". FAILS ON REVERT of `isListedForScreening` to `isConnected`.
+   */
+  it("lists an agent whose mode could not be read, as unknown, and the summary says so", () => {
+    const codex = facts.agents.find((agent) => agent.id === "codex")!;
+    const rows = screeningRows([{ ...codex, mode: "unknown" }], facts.unnamed);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].state).toBe("unknown");
+    expect(screeningSummary(rows)).toBe("Screening: 1 agent with a mode that could not be read.");
+    expect(screeningSummary(rows)).not.toContain("no agent is connected");
+  });
+
+  /** A mixed agent refuses a deny for some calls: never "in monitor" in the summary. FAILS ON REVERT of the mixed state. */
+  it("counts a seen mixed agent apart, never as in monitor", () => {
+    const cursor = facts.agents.find((agent) => agent.id === "cursor")!;
+    const mixed = { ...cursor, mode: "mixed" as const };
+    expect(screeningState(mixed, {})).toBe("mixed");
+    expect(SCREENING_PILL.mixed).toBe("mixed");
+    const summary = screeningSummary(screeningRows([mixed], {}));
+    expect(summary).toBe("Screening: 1 agent refusing a deny for some calls only.");
+    expect(summary).not.toContain("monitor");
+  });
+
   it("offers each agent its own switch only where the CLI sends one, with its restart words", () => {
     const rows = screeningRows(facts.agents, facts.unnamed);
     const without = screeningRows(facts.agents.map((agent) => ({ ...agent, modeSteps: undefined })), facts.unnamed);

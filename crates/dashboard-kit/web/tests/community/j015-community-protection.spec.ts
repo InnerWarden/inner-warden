@@ -85,7 +85,9 @@ test("never says nothing refuses beside agents that refuse", async ({ page }) =>
   // Refusing a deny is said only for an agent seen working since its settings changed.
   await expect(page.locator('li[data-screening="cursor"]')).toHaveAttribute("data-control-state", "refusing");
   await expect(page.locator('li[data-screening="gemini"]')).toHaveAttribute("data-control-state", "unknown");
-  await expect(page.locator('li[data-screening="gemini"]')).toContainText("Nothing screened yet");
+  // Screened before its settings changed and not since: never drawn as "Screened".
+  await expect(page.locator('li[data-screening="gemini"]')).toContainText("Nothing since its settings changed on 27 Sept at 14:05");
+  await expect(page.locator('li[data-screening="gemini"] [data-seen="screened"]')).toHaveCount(0);
 });
 
 test("what Community did comes before the controls, and draws only whole weeks", async ({ page }) => {
@@ -96,8 +98,11 @@ test("what Community did comes before the controls, and draws only whole weeks",
   const recordTop = await record.evaluate((element) => element.getBoundingClientRect().top);
   const optionalTop = await optional.evaluate((element) => element.getBoundingClientRect().top);
   expect(recordTop).toBeLessThan(optionalTop);
-  // v2 draws the week under way too, outlined and said as so far: never dropped, never a fall.
+  // v2 draws the week under way too, at half strength and said as so far:
+  // never dropped, never a fall, and never dashed (dashed means not read).
   await expect(record.getByText("This week so far", { exact: true })).toBeVisible();
+  await expect(record.locator("[data-partial]")).toHaveAttribute("opacity", "0.5");
+  await expect(record.locator("svg [stroke-dasharray]")).toHaveCount(0);
 });
 
 test("an unreadable protection answer is said, and the controls from other sources stay", async ({ page }) => {

@@ -15,17 +15,18 @@ import {
   type Reason,
   type RecordSpan,
 } from "./api";
+import { factsOf } from "./agentsView";
 import { DecisionDetail, DecisionGuide, MessageDetail, wideLayout } from "./DecisionDetail";
-import { dominantOutcome } from "./outcomeStyle";
 import { StaleLine } from "./parts";
 import { usePolled, type Polled } from "./poll";
 import { rowRuns, runHolds, type Run } from "./rows";
 import { useSource } from "./store";
-import { BODY_TEXT, Disclosure, Legend, LINK_TEXT, META_TEXT, NotRead, onPlainClick, PANEL, ReadAt, SMALL_TEXT, SourceLine } from "./ui/blocks";
+import { BODY_TEXT, Disclosure, LINK_TEXT, META_TEXT, NotRead, onPlainClick, PANEL, ReadAt, SMALL_TEXT, SourceLine } from "./ui/blocks";
 import { Icon } from "./ui/Icon";
 import { OutcomeMark } from "./ui/marks";
-import { DecisionRow, MessageRow, SessionRow } from "./ui/rows";
-import { spanWords } from "./verdict";
+import { DecisionRow, MessageRow, ReasonOutcomes, SessionRow, worstOutcome } from "./ui/rows";
+import { restartFor, type AgentRestart } from "./restart";
+import { isConnected, spanWords } from "./verdict";
 import { asPlatform, DECISION_OUTCOMES, OUTCOME_WORDS, shortSession, type DecisionOutcomeKey } from "./words";
 
 export const DECISIONS_POLL_MS = 10_000;
@@ -225,8 +226,21 @@ function recallList(): { id: string; y: number } | undefined {
 }
 
 /**
+ * Every connected agent's restart, from the shared agents source: a step
+ * that switches every connected agent is followed by each one's words.
+ * `undefined` while the agents were not read.
+ */
+function useConnectedRestarts(): AgentRestart[] | undefined {
+  const agents = useSource("agents");
+  const facts = factsOf(agents.data).facts;
+  return facts?.agents.filter(isConnected).map((agent) => ({ agent: agent.name, words: restartFor(agent.id, agent.name, agent.restart) }));
+}
+
+/**
  * The list and the open decision: side by side at `lg`, the detail sticky;
- * below it the list alone, or the decision alone with a way back.
+ * below it the list alone, or the decision alone with a way back. With no
+ * decision open at a desk the list takes the width and the guide is a short
+ * aside, so a command shows as much of itself as it can.
  */
 function Layout({
   header,
@@ -260,20 +274,34 @@ function Layout({
       document.querySelector<HTMLElement>(`[data-row-id="${CSS.escape(back.id)}"]`)?.focus({ preventScroll: true });
     }
   }, [open]);
-  const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
-    if (event.key === "Escape" && open !== undefined && !wideLayout()) {
+  // On a phone an open decision takes the page, and Escape goes back to the
+  // list from anywhere on it: a decision opened from a link has not moved
+  // focus into the detail (no focus move on a first load), and Escape still
+  // works. Never while typing in a field.
+  const back = useRef(onBack);
+  back.current = onBack;
+  useEffect(() => {
+    if (open === undefined) return;
+    const onKey = (event: globalThis.KeyboardEvent) => {
+      if (event.key !== "Escape" || event.defaultPrevented || wideLayout()) return;
+      const target = event.target as HTMLElement | null;
+      if (target?.closest("input, textarea, select, [contenteditable='true'], [role='dialog']")) return;
       event.preventDefault();
-      onBack();
-    }
-  };
+      back.current();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open]);
+  const listSpan = open === undefined ? "lg:col-span-8" : "lg:col-span-5";
+  const detailSpan = open === undefined ? "lg:col-span-4 lg:col-start-9" : "lg:col-span-7 lg:col-start-6";
   return (
     <div className="grid min-w-0 items-start gap-6 lg:grid-cols-12">
-      <div className="min-w-0 lg:col-span-5 lg:row-start-1">{header}</div>
-      <div id="decisions-panel" className={`min-w-0 space-y-4 lg:col-span-5 lg:row-start-2 ${open === undefined ? "" : "hidden lg:block"}`}>{list}</div>
+      <div className={`min-w-0 ${listSpan} lg:row-start-1`}>{header}</div>
+      <div id="decisions-panel" className={`min-w-0 space-y-4 ${listSpan} lg:row-start-2 ${open === undefined ? "" : "hidden lg:block"}`}>{list}</div>
       <div
         ref={detailColumn}
-        onKeyDown={onKeyDown}
-        className={`min-w-0 scroll-mt-4 lg:sticky lg:top-4 lg:col-span-7 lg:col-start-6 lg:row-span-2 lg:row-start-1 lg:max-h-[calc(100vh-2rem)] lg:overflow-y-auto ${open === undefined ? "hidden lg:block" : ""}`}
+        data-detail-column={open === undefined ? "guide" : "open"}
+        className={`min-w-0 scroll-mt-4 lg:sticky lg:top-4 ${detailSpan} lg:row-span-2 lg:row-start-1 lg:max-h-[calc(100vh-2rem)] lg:overflow-y-auto ${open === undefined ? "hidden lg:block" : ""}`}
       >
         {open === undefined ? null : (
           <button type="button" onClick={onBack} className={`mb-3 inline-flex min-h-11 items-center gap-1 text-sm lg:hidden ${LINK_TEXT}`}>
@@ -324,7 +352,16 @@ function ActionsLane({
   const sessionsServed = probe.data?.supported !== false;
   const lens: Lens = state.lens === "session" && !sessionsServed ? "newest" : state.lens;
   const shown: readonly Lens[] = sessionsServed ? LENSES : LENSES.filter((candidate) => candidate !== "session");
-  const { open, back } = useBack(state, go);
+  const { open: openRow, back } = useBack(state, go);
+  const restarts = useConnectedRestarts();
+  // Whether the next decision drawn takes focus: only one the person opened
+  // (a click, Enter, Newer, Older), never one the arrow keys moved to, so
+  // the arrows keep working on the list, and never a first load.
+  const focusDetail = useRef(false);
+  const open = (id: string) => {
+    focusDetail.current = true;
+    openRow(id);
+  };
   const detail = usePolled(() => (state.open === undefined ? Promise.resolve(undefined) : fetchDecision(state.open)), 0, state.open ?? "");
   const query = state.query;
   // The newest list is read only while it is the lens on screen: the other
@@ -344,8 +381,13 @@ function ActionsLane({
   const move = (delta: number) => {
     const next = items[at === -1 ? 0 : at + delta];
     if (next === undefined) return;
+    focusDetail.current = false;
     go({ ...state, open: next.id });
     requestAnimationFrame(() => document.querySelector<HTMLElement>(`[data-row-id="${CSS.escape(next.id)}"]`)?.focus());
+  };
+  const openHere = (id: string) => {
+    focusDetail.current = true;
+    go({ ...state, open: id });
   };
 
   const list = (
@@ -382,11 +424,13 @@ function ActionsLane({
           session={found.session}
           os={os}
           installed={installed}
-          onNewer={at > 0 ? () => go({ ...state, open: items[at - 1].id }) : undefined}
-          onOlder={at >= 0 && at < items.length - 1 ? () => go({ ...state, open: items[at + 1].id }) : undefined}
-          onOpen={(id) => go({ ...state, open: id })}
+          onNewer={at > 0 ? () => openHere(items[at - 1].id) : undefined}
+          onOlder={at >= 0 && at < items.length - 1 ? () => openHere(items[at + 1].id) : undefined}
+          onOpen={openHere}
           onSession={(session) => go({ lane: "agent_actions", lens: "newest", open: found.item.id, query: { session } })}
           onHideReason={(reason) => hideReason(reason)}
+          restarts={restarts}
+          focusTitle={focusDetail.current}
         />
       );
     } else if (detail.error !== undefined) {
@@ -449,8 +493,10 @@ function LensTabs({ lens, shown, onChange }: { lens: Lens; shown: readonly Lens[
 
 /** Each outcome as a filter: its mark, its words and how many in the list. Pressed shows only it. */
 function OutcomeBar({ page, outcome, onOutcome }: { page: DecisionsPage; outcome?: string; onOutcome: (outcome: string | undefined) => void }) {
+  // Each filter is the key to the marks too: its mark and its words, so no
+  // separate legend repeats them.
   return (
-    <div role="group" aria-label="Show one outcome only" data-outcome-bar className="grid grid-cols-2 gap-1.5">
+    <div role="group" aria-label="Show one outcome only" data-outcome-bar data-tour="legend" className="grid grid-cols-2 gap-1.5">
       {OUTCOME_FILTERS.map((key) => {
         const pressed = outcome === key;
         return (
@@ -569,7 +615,6 @@ function NewestList({
           <button type="button" onClick={() => onHide(undefined)} className={`min-h-9 pointer-coarse:min-h-11 ${LINK_TEXT}`}>Show them again</button>
         </p>
       )}
-      <div data-tour="legend"><Legend outcomes={OUTCOME_FILTERS} /></div>
       <div className={`flex flex-wrap items-center justify-between gap-2 ${META_TEXT}`}>
         <span data-count-line>{casePageCountLabel(data.items.length, { rows_in_window: data.total })}</span>
         {filtered ? <button type="button" onClick={clear} className={`min-h-9 pointer-coarse:min-h-11 ${LINK_TEXT}`}>Clear filters</button> : null}
@@ -615,7 +660,7 @@ function RunRows({ run, open, onOpen, onMove }: { run: Run<Decision>; open?: str
       {row(run.first)}
       {run.folded.length === 0 ? null : (
         <>
-          <li data-run-fold className={`flex items-center gap-3 border-l-2 border-dashed border-(--iw-line-strong) py-1.5 pr-3 pl-6 ${SMALL_TEXT} text-(--iw-ink-2)`}>
+          <li data-run-fold className={`flex items-center gap-3 border-l-2 border-(--iw-line) py-1.5 pr-3 pl-6 ${SMALL_TEXT} text-(--iw-ink-2)`}>
             <span className="min-w-0 flex-1">{formatCount(run.folded.length)} more in a row, flagged for the same reason</span>
             <button
               type="button"
@@ -716,7 +761,7 @@ function ReasonGroup({
   onAll: () => void;
 }) {
   const [expanded, setExpanded] = useState(false);
-  const dominant = reason.byOutcome === undefined ? undefined : dominantOutcome(reason.byOutcome);
+  const worst = worstOutcome(reason.byOutcome);
   const panel = `reason-${reason.key.replace(/[^a-zA-Z0-9_-]/g, "-")}`;
   return (
     <li data-reason-group={reason.key} className={`py-1 ${hidden ? "opacity-70" : ""}`}>
@@ -728,14 +773,14 @@ function ReasonGroup({
           onClick={() => setExpanded((value) => !value)}
           className="flex min-h-9 min-w-0 flex-1 items-start gap-2 rounded-lg px-2 py-1.5 text-left hover:bg-(--iw-surface-2) pointer-coarse:min-h-11"
         >
-          {dominant === undefined ? <span className="h-2.5 w-2.5 shrink-0" /> : <OutcomeMark outcome={dominant} className="mt-1.5" />}
+          {worst === undefined ? <span className="h-2.5 w-2.5 shrink-0" /> : <OutcomeMark outcome={worst} className="mt-1.5" />}
           <span className="min-w-0 flex-1">
             <span className="block text-sm leading-[21px] font-medium text-(--iw-ink)">{reason.short}</span>
             {reason.detail === undefined ? null : <span className={`block break-all font-mono ${META_TEXT}`}>{reason.detail}</span>}
           </span>
           <span className="shrink-0 text-right">
             <span className="block text-sm font-semibold tabular-nums text-(--iw-ink)">{formatCount(reason.count)}</span>
-            {dominant === undefined ? null : <span className={`block ${META_TEXT}`}>{OUTCOME_WORDS[dominant]}</span>}
+            <ReasonOutcomes byOutcome={reason.byOutcome} />
           </span>
         </button>
         <button
@@ -818,12 +863,22 @@ function SessionsList({ state, go }: { state: DecisionsParams; go: Go }) {
 function MessagesLane({ header, state, go, hostMode, since }: { header: ReactNode; state: DecisionsParams; go: Go; hostMode: string; since?: string }) {
   const cursor = state.query.cursor;
   const page = usePolled(() => fetchAttempts(cursor), cursor === undefined ? MESSAGES_POLL_MS : 0, cursor ?? "");
-  const { open, back } = useBack(state, go);
+  const { open: openRow, back } = useBack(state, go);
+  const restarts = useConnectedRestarts();
+  // As on the decisions: only an open the person made moves focus.
+  const focusDetail = useRef(false);
+  const open = (id: string) => {
+    focusDetail.current = true;
+    openRow(id);
+  };
   const items = page.data?.items ?? [];
   const at = state.open === undefined ? -1 : items.findIndex((item) => item.id === state.open);
   const move = (delta: number) => {
     const next = items[at === -1 ? 0 : at + delta];
-    if (next !== undefined) go({ ...state, open: next.id });
+    if (next === undefined) return;
+    focusDetail.current = false;
+    go({ ...state, open: next.id });
+    requestAnimationFrame(() => document.querySelector<HTMLElement>(`[data-row-id="${CSS.escape(next.id)}"]`)?.focus());
   };
   const sinceDay = since === undefined ? undefined : new Intl.DateTimeFormat("en-GB", { day: "numeric", month: "short", year: "numeric", timeZone: "UTC" }).format(Date.parse(since));
   const list = (
@@ -876,6 +931,6 @@ function MessagesLane({ header, state, go, hostMode, since }: { header: ReactNod
       ? page.data === undefined
         ? <Pending className="h-96" />
         : <NotRead>This message is not on this page of the list. Use Newest to go back to the start.</NotRead>
-      : <MessageDetail item={found} hostMode={hostMode} />;
+      : <MessageDetail item={found} hostMode={hostMode} restarts={restarts} focusTitle={focusDetail.current} />;
   return <Layout header={header} list={list} detail={pane} open={state.open} onBack={back} />;
 }

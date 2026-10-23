@@ -46,9 +46,16 @@ const SCENARIOS: [string | undefined, Expected][] = [
     pill: { state: "needs", words: /Needs you/ },
     step: { command: "innerwarden agents connect cursor --monitor" },
   }],
+  // The default state: every connected agent in monitor, seen working.
+  ["monitor", {
+    row: 8,
+    headline: "Your 3 AI agents are connected. Monitor: nothing is refused.",
+    pill: { state: "monitor", words: /Monitor/ },
+    step: { command: "innerwarden enforce" },
+  }],
   ["never-screened", {
     row: 6,
-    headline: "Connected, but nothing screened yet",
+    headline: "Connected, but nothing screened since the settings changed",
     pill: { state: "monitor", words: /Monitor/ },
     step: { restart: "Claude Code" },
   }],
@@ -112,6 +119,11 @@ for (const viewport of VIEWPORTS) {
       await expect(pill).toHaveAttribute("data-pill", expected.pill.state);
       await expect(pill).toHaveText(expected.pill.words);
       await aboveTheFold(pill, viewport.height);
+
+      // The two numbers are part of the five-second answer too (spec 6.1).
+      if ((await page.locator("#refused [data-count]").count()) > 0) {
+        await aboveTheFold(page.locator("#refused [data-count]").nth(1), viewport.height);
+      }
 
       if ("command" in expected.step) {
         // ONE step: the first command in the band is the one named, and it is on the first screen.

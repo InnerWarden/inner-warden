@@ -18,6 +18,7 @@ import {
   type RecordSpan,
   type RefusalDay,
 } from "./api";
+import { isListedForScreening } from "./controls";
 import { StaleLine } from "./parts";
 import { shortDay } from "./words";
 import { usePolled, type Polled } from "./poll";
@@ -42,7 +43,8 @@ import {
 import { DayBars } from "./ui/charts";
 import { Icon } from "./ui/Icon";
 import { AgentStrip, DecisionRow, ReasonRow } from "./ui/rows";
-import { isConnected, lastDays, overviewVerdict, recordCounts, spanWords, type BandStep, type Restart } from "./verdict";
+import { isConnected, lastDays, overviewVerdict, recordCounts, spanWords, type BandStep, type Restart, type Verdict } from "./verdict";
+import { ENFORCE_MEANS, MONITOR_MEANS } from "./words";
 
 /** The newest denies and the reasons are read on their own, every 30 s. */
 export const DECISIONS_POLL_MS = 30_000;
@@ -139,7 +141,9 @@ export function CommunityOverview({ context }: { context: CommunityScreenContext
   });
   const openDecisions = (params?: Record<string, string>) => context.navigate("activity", params);
   const openAgents = () => context.navigate("agents");
-  const connected = facts?.agents.some(isConnected) === true;
+  // An agent whose mode could not be read may be connected: Getting started
+  // never tells the person to connect it.
+  const connected = facts?.agents.some(isListedForScreening) === true;
 
   return (
     <div data-overview className="min-w-0 space-y-8">
@@ -147,8 +151,12 @@ export function CommunityOverview({ context }: { context: CommunityScreenContext
         <VerdictBand verdict={verdict} page="Overview" tour="overview-verdict" onOpenAgents={openAgents} />
         <ReadAt data={agents.data} path="/api/guard/agents" />
       </div>
+      {/* The DOM order is the order at a desk (Agents, Refused, Needs a look),
+          so reading and Tab follow what is drawn there. On a phone the two
+          numbers come first (spec 6.1), by CSS order only. */}
       <div className="grid min-w-0 grid-cols-1 gap-8 lg:grid-cols-12 lg:gap-6">
-        <Refused history={history} flagged={flagged} now={now} className="lg:col-span-5 lg:col-start-8 lg:row-start-1" />
+        <AgentsStrip agents={agents} facts={facts} unreadable={read.unreadable} verdict={verdict} onOpenAgents={openAgents} className="order-3 lg:order-none lg:col-span-7 lg:col-start-1 lg:row-start-1" />
+        <Refused history={history} flagged={flagged} now={now} className="order-1 lg:order-none lg:col-span-5 lg:col-start-8 lg:row-start-1" />
         <NeedsALook
           denies={denies}
           flagged={flagged}
@@ -159,9 +167,8 @@ export function CommunityOverview({ context }: { context: CommunityScreenContext
           onOpen={(id) => openDecisions({ decision: id })}
           onReason={(reason) => openDecisions({ reason })}
           onAll={() => openDecisions()}
-          className="lg:col-span-12 lg:row-start-2"
+          className="order-2 lg:order-none lg:col-span-12 lg:row-start-2"
         />
-        <AgentsStrip agents={agents} facts={facts} unreadable={read.unreadable} onOpenAgents={openAgents} className="lg:col-span-7 lg:col-start-1 lg:row-start-1" />
       </div>
       <FooterLine
         health={health}
@@ -175,22 +182,39 @@ export function CommunityOverview({ context }: { context: CommunityScreenContext
   );
 }
 
+/**
+ * What the modes the strip shows mean, said once on the page (T4): monitor
+ * whenever a connected agent is drawn with a mode, enforce when one is in
+ * enforce or mixed, each only when the band does not already say it.
+ */
+export function modeMeanings(agents: readonly AgentFacts[], said: readonly string[]): string[] {
+  const shown = agents.filter(isConnected);
+  const lines: string[] = [];
+  if (shown.length > 0 && !said.includes(MONITOR_MEANS)) lines.push(MONITOR_MEANS);
+  if (shown.some((agent) => agent.mode === "enforce" || agent.mode === "mixed") && !said.includes(ENFORCE_MEANS)) lines.push(ENFORCE_MEANS);
+  return lines;
+}
+
 function AgentsStrip({
   agents,
   facts,
   unreadable,
+  verdict,
   onOpenAgents,
   className,
 }: {
   agents: Polled<unknown>;
   facts?: AgentsFacts;
   unreadable: boolean;
+  verdict: Verdict;
   onOpenAgents: () => void;
   className: string;
 }) {
+  // The connected agents the strip draws a mode pill for: it lists them first.
+  const meanings = facts === undefined ? [] : modeMeanings(facts.agents.filter(isConnected).slice(0, STRIP_MAX), verdict.lines);
   let body: ReactNode;
   if (facts !== undefined) {
-    const listed = facts.agents.filter((agent) => isConnected(agent) || (agent.supported && agent.present));
+    const listed = facts.agents.filter((agent) => isListedForScreening(agent) || (agent.supported && agent.present));
     const unsupported = facts.agents.filter((agent) => !agent.supported);
     body = listed.length > 0 ? (
       <AgentStrip agents={facts.agents} unnamed={facts.unnamed} max={STRIP_MAX} onOpenAgents={onOpenAgents} />
@@ -216,6 +240,11 @@ function AgentsStrip({
     <Section id="overview-agents" title="Agents" className={`${PANEL} ${className}`}>
       {agents.stale ? <StaleLine onRetry={agents.refresh} /> : null}
       {body}
+      {meanings.length === 0 ? null : (
+        <div data-mode-means className="space-y-1">
+          {meanings.map((line) => <p key={line} className={META_TEXT}>{line}</p>)}
+        </div>
+      )}
       {waiting.length === 0 ? null : (
         <p data-agents-waiting className={`flex flex-wrap items-center gap-x-2 gap-y-1 ${SMALL_TEXT} text-(--iw-ink-2)`}>
           <span className="text-(--iw-review)"><Icon name="triangle" className="h-3.5 w-3.5" /></span>
@@ -257,10 +286,12 @@ function Refused({
     const since = data.since === undefined ? undefined : shortDay(data.since);
     body = (
       <>
+        <p data-span="counts" className={META_TEXT}>Last 7 days</p>
         <div className="grid grid-cols-2 gap-4">
           <CountStat value={sums.blocked} label="Refused before they ran" tone="stopped" fill="solid" />
           <CountStat value={sums.wouldBlock} label="Would have been refused" tone="deny" fill="hatched" />
         </div>
+        <p data-span="chart" className={META_TEXT}>Last 14 days</p>
         <DayBars days={data.refusals.days} />
         {sums.today === undefined ? null : (
           <p data-today className={`${SMALL_TEXT} text-(--iw-ink-2)`}>
@@ -331,7 +362,7 @@ function GettingStarted({ facts }: { facts?: AgentsFacts }) {
           <StepNumber n={2} />
           <div className="min-w-0 flex-1 space-y-2 rounded-lg bg-(--iw-surface-2) p-3">
             <p className="text-sm leading-[21px] font-medium text-(--iw-ink)">Restart it:</p>
-            <RestartNote agent={restart.agent} words={restart.words} />
+            <RestartNote agent={restart.agent} words={restart.words} when="now" />
           </div>
         </li>
         <li className="flex gap-3">
@@ -537,10 +568,11 @@ export function footerItems(
     });
     items.push({ key: "second-opinion", words: protection.secondOpinion.configured ? "Second opinion: on." : "Second opinion: off.", section: "second-opinion" });
   }
-  const messages = history?.messages.recorded ?? 0;
-  if (protection?.observe.available === true || messages > 0) {
+  // A count from a log that could not be read is not a count: never "0 recorded".
+  const messages = history === undefined || !history.readable ? undefined : history.messages.recorded;
+  if (protection?.observe.available === true || (messages ?? 0) > 0) {
     items.push(
-      history === undefined
+      messages === undefined
         ? { key: "messages", words: "Messages: not read.", route: "activity", params: { lane: "agent_messages" } }
         : { key: "messages", words: `Messages: ${formatCount(messages)} recorded.`, route: "activity", params: { lane: "agent_messages" } },
     );
@@ -586,7 +618,7 @@ function FooterLine({
           };
           return (
             <li key={item.key} data-footer-item={item.key}>
-              <a href={href} onClick={onPlainClick(open)} className="inline-flex min-h-9 items-center underline-offset-2 hover:text-(--iw-accent) hover:underline pointer-coarse:min-h-11">
+              <a href={href} onClick={onPlainClick(open)} className="inline-flex min-h-9 items-center text-(--iw-accent) underline decoration-(--iw-line-strong) underline-offset-2 hover:decoration-(--iw-accent) pointer-coarse:min-h-11">
                 {item.words}
               </a>
             </li>

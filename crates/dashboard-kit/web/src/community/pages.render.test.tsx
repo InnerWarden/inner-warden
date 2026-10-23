@@ -17,6 +17,7 @@ import tokensFixture from "../../tests/fixtures/community/token-intelligence.jso
 import sessionsFixture from "../../tests/fixtures/community/sessions.json";
 import suppressFixture from "../../tests/fixtures/community/suppress.json";
 import { readAttemptsPage, readDecisionDetail, readDecisionsPage, readHistory, readProtection, readRecordHealth, readSessionsPage, readSuppressList } from "./api";
+import { ENFORCE_MEANS, MONITOR_MEANS } from "./words";
 
 /**
  * The Community pages, RENDERED from the CLI's fixtures, with each polled
@@ -54,7 +55,8 @@ vi.mock("./store", () => ({
   useSource: (key: string) => answered(key),
 }));
 
-const { CommunityOverview } = await import("./Overview");
+const { CommunityOverview, footerItems, modeMeanings } = await import("./Overview");
+const { messageStep } = await import("./DecisionDetail");
 const { CommunityDecisions, decisionsParams, emptyListWords, filterCode, toParams } = await import("./Decisions");
 const { CommunityProtection } = await import("./Protection");
 const { CommunityAgents } = await import("./Agents");
@@ -458,7 +460,9 @@ describe("the first run", () => {
     expect(links(html)).toEqual([]);
     expect(html).not.toContain("data-offer");
     expect(commandBoxes(steps).map((box) => box.text)).toEqual(["innerwarden agents connect claude-code --monitor"]);
-    expect(textOf(steps)).toContain("If Claude Code is running, restart it after this step.");
+    // Step 2 is the restart itself: "now", never "after this step".
+    expect(textOf(steps)).toContain("If Claude Code is running, restart it now.");
+    expect(textOf(steps)).not.toContain("after this step");
     expect(textOf(steps)).toContain("Ask it to run any command. The decision shows here within seconds.");
     // The page they are reading is not a step.
     expect(commandBoxes(html).some((box) => box.text === "innerwarden dashboard")).toBe(false);
@@ -489,7 +493,10 @@ describe("Decisions", () => {
     expect(html).toMatch(/<h1 id="decisions-title"[^>]*>Decisions<\/h1>/);
     expect(text).toContain("Every command or tool call the guard flagged, from the decision record.");
     expect(text).toContain("Newest 96 decisions, about 4 days.");
-    const bar = textOf(html.slice(html.indexOf("data-outcome-bar"), html.indexOf("data-tour=\"legend\"")));
+    const bar = textOf(html.slice(html.indexOf("data-outcome-bar"), html.indexOf("data-count-line")));
+    // The outcome bar is the key to the marks: no second legend repeats it.
+    expect(html).not.toContain("data-legend");
+    expect(html).toMatch(/data-outcome-bar="true" data-tour="legend"/);
     expect(bar).toContain("Refused before it ran3");
     expect(bar).toContain("Would have been refused6");
     expect(bar).toContain("Judged unsafe, and it ran1");
@@ -574,7 +581,8 @@ describe("Decisions", () => {
       ["refused", "not_applicable"],
     ]);
     const text = textOf(html);
-    expect(text).toContain("Not refused: monitor records and does not refuse");
+    expect(text).toContain("Not refused");
+    expect(text).toContain("Monitor records and does not refuse");
     expect(text).toContain("Deny, by InnerWarden's rules");
     expect(text).toContain("Not checked afterwards: Community does not look at what a command did after it ran.");
     expect(text).toContain("Decided in monitor");
@@ -789,7 +797,14 @@ describe("a message someone sent the agent", () => {
     const text = textOf(html);
     expect(text).toContain("If your agent had obeyed, the guard would have screened what it ran.");
     expect(commandBoxes(html).map((box) => box.text)).toContain("innerwarden enforce");
-    expect(text).toContain("If your agent is running, restart it after this step.");
+    // `innerwarden enforce` switches every connected agent: each one's restart, in its own words.
+    for (const line of [
+      "If Claude Code is running, restart it after this step. In Claude Code, type /exit, then run claude.",
+      "If Codex is running, restart it after this step. Quit Codex and start it again.",
+      "If Cursor is running, restart it after this step.",
+      "If Gemini CLI is running, restart it after this step.",
+    ]) expect(text).toContain(line);
+    expect(text).not.toContain("If your agent is running");
     expect(html).not.toContain("data-offer");
     expect(links(html)).toEqual([]);
     expect(html).toContain("Contains hidden characters");
@@ -864,7 +879,10 @@ describe("Protection, Agents and Tokens", () => {
     expect(text).toContain("2 of 3 local servers wrapped.");
     expect(text).toContain("1 remote server is not screened (Community wraps local servers only).");
     expect(text).toContain("Calls to its MCP servers. Its built-in tools are not screened by this edition.");
-    expect(text).toContain("Nothing screened yet");
+    // Gemini was screened before its settings changed and not since: never "Screened".
+    const gemini = screening.slice(screening.indexOf('data-screening="gemini"'));
+    expect(textOf(gemini)).toContain("Nothing since its settings changed on 27 Sept at 14:05");
+    expect(gemini).not.toContain('data-seen="screened"');
     expect(text).not.toContain("Checked after");
     // Codex sends no judges line: not drawn in the plain view, "Not read" in the technical one.
     const codex = textOf(screening.slice(screening.indexOf('data-screening="codex"'), screening.indexOf('data-screening="cursor"')));
@@ -911,7 +929,8 @@ describe("Protection, Agents and Tokens", () => {
     expect(text).toContain("Contains a secret, hidden here.");
     expect(text).toContain("Ignored: matches every command.");
     expect(text).toContain("ATR-2026-030: cross-agent attack detection");
-    expect(text).toContain("These change only from a terminal you type in. An agent that runs them is refused.");
+    expect(text).toContain("Adding to these lists needs a terminal: the CLI refuses an allow or mute that runs with no terminal, as an agent's shell does. Removing one does not.");
+    expect(text).not.toContain("An agent that runs them is refused");
     expect(commandBoxes(exceptions).map((box) => box.text)).not.toContain("innerwarden allow --remove 'deploy-cli --token=[REDACTED]'");
     answers.set("suppress", { supported: false });
     const older = textOf(protectionHtml().slice(protectionHtml().indexOf('id="exceptions"')));
@@ -975,3 +994,151 @@ describe("Protection, Agents and Tokens", () => {
     expect(textOf(render(<CommunityTokens />))).toContain("Per-day totals are not recorded.");
   });
 });
+
+describe("review fixes, as a reader sees them", () => {
+  const protectionHtml = () => render(<CommunityProtection context={context()} />);
+
+  /** The band carries one fact: open to the network wins, so not recording is still said above it. */
+  it("still says not recording on the Overview when the dashboard is also exposed", () => {
+    const both = { meta: { ...META, exposed: true }, health: { recording: false, lostActions: 2 } };
+    const overview = render(<Notices {...both} inBand />);
+    expect(overview).toContain('data-notice="recording"');
+    expect(overview).not.toContain("data-exposed");
+    const onlyOutage = render(<Notices meta={META} health={{ recording: false }} inBand />);
+    expect(onlyOutage).toBe("");
+    const elsewhere = render(<Notices {...both} />);
+    expect(elsewhere).toContain("data-exposed");
+    expect(elsewhere).toContain('data-notice="recording"');
+  });
+
+  /** One fix on every page: the band's step, the same flag, and the way to the Overview. */
+  it("gives the exposed banner the band's own step and a way to the Overview", () => {
+    const text = textOf(render(<Notices meta={{ ...META, exposed: true }} />));
+    expect(text).toContain("Stop the dashboard and start it again with innerwarden dashboard: without --expose it answers on this machine only.");
+    expect(text).toContain("Open the Overview");
+    expect(text).not.toContain("--bind");
+  });
+
+  /** T4: a screen that shows a mode says what monitor means, once, whatever row the band is on. */
+  it("says what monitor means exactly once on every Overview that draws a mode pill", () => {
+    const monitorAll = {
+      ...agentsFixture,
+      agents: agentsFixture.agents.map((agent) => ({ ...agent, guardrail: { ...agent.guardrail, mode: agent.guardrail.mode === "not_configured" ? "not_configured" : "monitor" } })),
+    };
+    for (const agents of [agentsFixture, monitorAll]) {
+      answers.set("agents", agents);
+      const text = textOf(overviewHtml());
+      expect(text.split(MONITOR_MEANS).length - 1, JSON.stringify(agents.agents.map((agent) => agent.guardrail.mode))).toBe(1);
+    }
+    // The default fixture draws Enforce pills too, and the band does not say enforce.
+    answers.set("agents", agentsFixture);
+    expect(textOf(overviewHtml()).split(ENFORCE_MEANS).length - 1).toBe(1);
+    expect(modeMeanings([], [])).toEqual([]);
+  });
+
+  /** Desk order is DOM order: Agents, then Refused, then Needs a look; the phone reorders by CSS only. */
+  it("puts the Agents strip first in the DOM, as it is drawn at a desk", () => {
+    const html = overviewHtml();
+    const agents = html.indexOf('id="overview-agents"');
+    const refused = html.indexOf('id="refused"');
+    const needs = html.indexOf('id="needs-a-look"');
+    expect(agents).toBeLessThan(refused);
+    expect(refused).toBeLessThan(needs);
+    expect(html).toMatch(/id="overview-agents"[^>]*class="[^"]*order-3 lg:order-none/);
+    expect(html).toMatch(/id="refused"[^>]*class="[^"]*order-1 lg:order-none/);
+  });
+
+  /** T6: the two numbers say their span where they are read, and the chart says its own. */
+  it("names the span of the two numbers and of the chart where they are read", () => {
+    const refused = html(overviewHtml(), 'id="refused"', 'id="needs-a-look"');
+    expect(textOf(refused)).toMatch(/Refused, or would have beenLast 7 days0Refused before they ran17Would have been refusedLast 14 days/);
+  });
+
+  it("says Messages: not read when the guard's log could not be read, never 0 recorded", () => {
+    answers.set("history", { ...readHistory(historyFixture), readable: false });
+    const footer = textOf(overviewHtml().slice(overviewHtml().indexOf("data-overview-footer")));
+    expect(footer).toContain("Messages: not read.");
+    expect(footer).not.toContain("Messages: 0 recorded.");
+    expect(footerItems({ recording: true }, readProtection(protectionFixture), { ...readHistory(historyFixture), readable: false }).find((item) => item.key === "messages")?.words).toBe("Messages: not read.");
+  });
+
+  /** WCAG 1.4.1: a link is told apart by more than its place. */
+  it("draws the footer's items as links: accent and underlined", () => {
+    const footer = overviewHtml().slice(overviewHtml().indexOf("data-overview-footer"));
+    for (const match of footer.matchAll(/<a href="[^"]*"[^>]*class="([^"]*)"/g)) {
+      expect(match[1]).toContain("text-(--iw-accent)");
+      expect(match[1]).toMatch(/(^| )underline( |$)/);
+    }
+  });
+
+  /** A log that could not be read is not "no change". FAILS ON REVERT of the not-read line. */
+  it("says the list changes were not counted when the guard's log could not be read", () => {
+    answers.set("suppress", { supported: true, value: readSuppressList({ ...suppressFixture, changes: { count: null, since: null, last_at: null } }) });
+    const exceptions = textOf(protectionHtml().slice(protectionHtml().indexOf('id="exceptions"')));
+    expect(exceptions).toContain("Not read: the guard's log could not be read, so changes are not counted.");
+    expect(exceptions).not.toContain("No change to these lists");
+  });
+
+  /** T7: a pattern cut short is said as such, with the terminal step to remove it. FAILS ON REVERT of the shortened chip. */
+  it("marks a shortened allow pattern and names the terminal step to remove it", () => {
+    const cut = `${"a".repeat(399)}…`;
+    answers.set("suppress", {
+      supported: true,
+      value: readSuppressList({ ...suppressFixture, allow: [{ pattern: cut, redacted: false, hidden_characters: false, warning: null, shortened: true }] }),
+    });
+    const html = protectionHtml();
+    const row = html.slice(html.indexOf('data-allow="shortened"'), html.indexOf("</li>", html.indexOf('data-allow="shortened"')));
+    expect(row).toContain("data-shortened");
+    expect(textOf(row)).toContain("Shortened here");
+    expect(textOf(row)).toContain("Remove it from a terminal: innerwarden allow --list shows it.");
+    expect(row).not.toContain("data-remove");
+  });
+
+  it("counts the list entries it could not show, never drops them silently", () => {
+    answers.set("suppress", { supported: true, value: readSuppressList({ ...suppressFixture, mute_categories: [{ id: 7 }] }) });
+    expect(textOf(protectionHtml())).toContain("1 entry could not be shown here.");
+  });
+
+  /** T5: `innerwarden enforce` switches every connected agent, so every one of them is restarted after it. */
+  it("follows a decision's switch for every agent with every connected agent's restart", () => {
+    const text = textOf(decisionHtml(CASE_WOULD_REFUSE));
+    const next = text.slice(text.indexOf("What you can do"));
+    for (const name of ["Claude Code", "Codex", "Cursor", "Gemini CLI"]) expect(next).toContain(`If ${name} is running, restart it after this step.`);
+    expect(next).not.toContain("If your agent is running");
+  });
+
+  /** CJC-090 must not claim every action is intercepted: the step follows the mode that was read. */
+  it("words a message's step by the mode read, and claims nothing when the mode is unknown", () => {
+    expect(messageStep("answered", "enforce").text).toBe("Nothing to do here: a deny from your connected agents is refused before it runs.");
+    expect(messageStep("declined_by_agent", "enforce").text).toContain("a deny from your connected agents is refused before it runs");
+    expect(messageStep("answered", "not_configured")).toEqual({
+      text: "No agent is connected to the guard, so nothing your agent runs is screened. To connect every agent found here, in monitor:",
+      command: "innerwarden agents connect --all --monitor",
+    });
+    expect(messageStep("answered", "unknown")).toEqual({ text: "The mode could not be read, so this page claims none. To see it:", command: "innerwarden status" });
+    for (const mode of ["enforce", "not_configured", "unknown", "monitor", "mixed", "partial"]) {
+      expect(messageStep("answered", mode).text, mode).not.toMatch(/screens whatever|every action/);
+    }
+    const first = attemptsFixture.items[0];
+    for (const [mode, words] of [
+      ["enforce", "a deny from your connected agents is refused before it runs"],
+      ["not_configured", "No agent is connected to the guard"],
+      ["unknown", "The mode could not be read, so this page claims none."],
+    ] as const) {
+      const html = render(<CommunityDecisions context={context(`?view=activity&lane=agent_messages&decision=${first.id}`, { ...META, guardrail: { mode, guarded_agents: 0 } })} />);
+      expect(textOf(html), mode).toContain(words);
+    }
+  });
+
+  /** The ladder's bold label reads true on its own. */
+  it("labels a monitor deny's third step Not refused, never Refused", () => {
+    const html = decisionHtml(CASE_WOULD_REFUSE);
+    const stage = html.slice(html.indexOf('data-stage="refused"'), html.indexOf("</li>", html.indexOf('data-stage="refused"')));
+    expect(textOf(stage)).toContain("Not refused");
+    expect(stage).not.toMatch(/<\/span>Refused<span/);
+  });
+});
+
+function html(page: string, from: string, to: string): string {
+  return page.slice(page.indexOf(from), page.indexOf(to));
+}

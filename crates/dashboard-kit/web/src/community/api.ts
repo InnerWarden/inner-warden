@@ -686,6 +686,9 @@ export type Protection = {
   flagged?: FlaggedConcerns;
 };
 
+/** The longest line of jail advice the CLI serves. */
+export const JAIL_ADVICE_MAX = 400;
+
 export function readProtection(value: unknown): Protection {
   const body = record(value);
   const recordFacts = record(body?.record);
@@ -706,9 +709,11 @@ export function readProtection(value: unknown): Protection {
       available: jailAvailable,
       backend: plain(jail?.backend, 32),
       checksPass: bool(jail?.checks_pass),
+      // The same bound the CLI cuts a line of advice to (400 characters), so
+      // no line it serves is dropped here.
       advice: Array.isArray(jail?.advice)
         ? jail.advice.slice(0, 6).flatMap((line) => {
-            const read = plain(line, 300);
+            const read = plain(line, JAIL_ADVICE_MAX);
             return read === undefined ? [] : [read];
           })
         : [],
@@ -1331,7 +1336,12 @@ export type AllowEntry = {
   /** It held a secret, which the CLI replaced before serving it. */
   redacted: boolean;
   hiddenCharacters: boolean;
-  /** Never present for a redacted pattern or one with hidden characters: the step would not remove it. */
+  /**
+   * Too long to serve whole: `pattern` is its first part. The text shown is
+   * not the pattern in force, so it has no remove step here.
+   */
+  shortened: boolean;
+  /** Never present for a redacted, shortened or hidden-character pattern: the step would not remove it. */
   remove?: AgentNextStep;
 };
 
@@ -1346,13 +1356,25 @@ export type SuppressList = {
   muteCategories: { id: string; remove?: AgentNextStep }[];
   /** How many more each list holds than it shows. */
   more: SuppressCounts;
-  /** How many times the lists changed, counted from the guard's log: never a pattern from it. */
-  changes: { count: number; since?: string; lastAt?: string };
+  /** Entries the CLI served that this page could not read: counted, never dropped silently. */
+  unshown: number;
+  /**
+   * How many times the lists changed, counted from the guard's log: never a
+   * pattern from it. `count` is absent when the log could not be read, which
+   * is said as not read, never as no change.
+   */
+  changes: { count?: number; since?: string; lastAt?: string };
   listSteps: { allow?: AgentNextStep; mute?: AgentNextStep };
 };
 
 /** Most entries one list carries, as the route bounds it. */
 export const MAX_SUPPRESS_ENTRIES = 200;
+/**
+ * The bound an entry of these lists is read with. The CLI serves at most 400
+ * characters of one (a longer one is cut and marked), which is at most 800
+ * UTF-16 units here.
+ */
+export const SUPPRESS_ENTRY_MAX = 1_024;
 
 export function readSuppressList(value: unknown): SuppressList {
   const body = record(value);
@@ -1362,36 +1384,46 @@ export function readSuppressList(value: unknown): SuppressList {
   const list = (entries: unknown) => (withheld || !Array.isArray(entries) ? [] : entries.slice(0, MAX_SUPPRESS_ENTRIES));
   const changes = record(body.changes);
   const steps = record(body.list_steps);
+  let unshown = 0;
+  const skip = (): [] => {
+    unshown += 1;
+    return [];
+  };
   return {
     withheld,
     counts: readSuppress(counts),
     allow: list(body.allow).flatMap((entry): AllowEntry[] => {
       const item = record(entry);
-      const pattern = evidence(item?.pattern, 1_024);
-      if (item === undefined || pattern === undefined) return [];
+      const pattern = evidence(item?.pattern, SUPPRESS_ENTRY_MAX);
+      if (item === undefined || pattern === undefined) return skip();
       const redacted = item.redacted === true;
       const hiddenCharacters = pattern.hidden || item.hidden_characters === true;
-      const remove = redacted || hiddenCharacters ? undefined : readAgentNextStep(item.remove);
-      return [defined({ pattern: pattern.text, unanchored: item.warning === "unanchored", redacted, hiddenCharacters, remove })];
+      const shortened = item.shortened === true;
+      const remove = redacted || hiddenCharacters || shortened ? undefined : readAgentNextStep(item.remove);
+      return [defined({ pattern: pattern.text, unanchored: item.warning === "unanchored", redacted, hiddenCharacters, shortened, remove })];
     }),
     dropped: list(body.dropped).flatMap((entry) => {
-      const pattern = evidence(record(entry)?.pattern, 1_024);
-      return pattern === undefined ? [] : [pattern.text];
+      const pattern = evidence(record(entry)?.pattern, SUPPRESS_ENTRY_MAX);
+      return pattern === undefined ? skip() : [pattern.text];
     }),
+    // A mute is read with the bound the CLI serves it at (it may be any
+    // length, and the file can be edited by hand), as evidence: a hidden
+    // character is shown written out, never a reason to drop the row.
     muteRules: list(body.mute_rules).flatMap((entry) => {
       const item = record(entry);
-      const id = plain(item?.id, 64);
-      return item === undefined || id === undefined
-        ? []
+      const id = evidence(item?.id, SUPPRESS_ENTRY_MAX)?.text.trim();
+      return item === undefined || id === undefined || id === ""
+        ? skip()
         : [defined({ id, title: plain(item.title, 120), remove: readAgentNextStep(item.remove) })];
     }),
     muteCategories: list(body.mute_categories).flatMap((entry) => {
       const item = record(entry);
-      const id = plain(item?.id, 64);
-      return item === undefined || id === undefined ? [] : [defined({ id, remove: readAgentNextStep(item.remove) })];
+      const id = evidence(item?.id, SUPPRESS_ENTRY_MAX)?.text.trim();
+      return item === undefined || id === undefined || id === "" ? skip() : [defined({ id, remove: readAgentNextStep(item.remove) })];
     }),
     more: readSuppress(body.more),
-    changes: defined({ count: count(changes?.count) ?? 0, since: time(changes?.since), lastAt: time(changes?.last_at) }),
+    unshown,
+    changes: defined({ count: count(changes?.count), since: time(changes?.since), lastAt: time(changes?.last_at) }),
     listSteps: defined({ allow: readAgentNextStep(steps?.allow), mute: readAgentNextStep(steps?.mute) }),
   };
 }

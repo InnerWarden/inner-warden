@@ -84,17 +84,40 @@ test("the five tabs wrap inside the screen, and the header stays under a third o
   await expect(page.getByRole("button", { name: "Open the product tour" })).toBeVisible();
 });
 
-/** FAILS ON REVERT: at 390 the tabs wrapped, "Tokens" alone on a second row. */
-for (const width of [320, 390]) {
-  test(`the five tabs share one row at ${width} px`, async ({ page }) => {
+/**
+ * Below 400 px five tabs in one row clip "Protection" and "Decisions" under
+ * their neighbours (54 px for a 71 px word at 320): two rows of three
+ * columns, every word whole, never "Tokens" alone on a row of its own.
+ * FAILS ON REVERT of the Community nav rule: the labels overflow.
+ */
+for (const width of [320, 360, 390]) {
+  test(`every tab's word fits, in at most two even rows, at ${width} px`, async ({ page }) => {
     await page.setViewportSize({ width, height: 800 });
     await page.goto("/");
     const tabs = page.getByRole("navigation", { name: "Dashboard views" }).getByRole("button");
     await expect(tabs).toHaveCount(COMMUNITY_TABS.length);
-    const tops = await tabs.evaluateAll((buttons) => buttons.map((button) => Math.round(button.getBoundingClientRect().top)));
-    expect(new Set(tops).size).toBe(1);
+    const boxes = await tabs.evaluateAll((buttons) =>
+      buttons.map((button) => ({
+        top: Math.round(button.getBoundingClientRect().top),
+        overflow: button.scrollWidth - button.clientWidth,
+        right: button.getBoundingClientRect().right,
+      })),
+    );
+    for (const box of boxes) expect(box.overflow).toBeLessThanOrEqual(0);
+    const rows = [...new Set(boxes.map((box) => box.top))];
+    expect(rows.length).toBeLessThanOrEqual(2);
+    expect(boxes.filter((box) => box.top === rows[0])).toHaveLength(3);
+    for (const box of boxes) expect(box.right).toBeLessThanOrEqual(width);
   });
 }
+
+test("the five tabs share one row from 640 px", async ({ page }) => {
+  await page.setViewportSize({ width: 640, height: 800 });
+  await page.goto("/");
+  const tabs = page.getByRole("navigation", { name: "Dashboard views" }).getByRole("button");
+  const tops = await tabs.evaluateAll((buttons) => buttons.map((button) => Math.round(button.getBoundingClientRect().top)));
+  expect(new Set(tops).size).toBe(1);
+});
 
 /**
  * A case's neighbours say their outcome in words for a screen reader at

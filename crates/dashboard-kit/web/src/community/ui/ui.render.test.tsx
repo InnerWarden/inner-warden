@@ -12,7 +12,8 @@ import { MONITOR_MEANS } from "../words";
 import { NotRead, StepBlock, VerdictBand, CountStat } from "./blocks";
 import { DayBars, share, TokenBars, WeekBars } from "./charts";
 import { HatchDefs, ModePill, OutcomeMark, StatusPill } from "./marks";
-import { AgentStrip, DecisionRow, ReasonRow, SeenCell, SessionRow } from "./rows";
+import { AgentRow, AgentStrip, DecisionRow, ReasonRow, SeenCell, SessionRow } from "./rows";
+import { CopyCommand } from "../parts";
 
 const NOW = Date.parse("2026-09-29T14:05:00Z");
 let restoreZone: () => void;
@@ -54,6 +55,32 @@ describe("the verdict band", () => {
     expect(html).toContain('aria-label="Copy command: innerwarden dry-run"');
   });
 
+  /** Restarts with no command before them are the step itself: "now". FAILS ON REVERT of `when="now"` in the band. */
+  it("asks for a restart now where the band has no command, never after a step that is not there", () => {
+    const changed = facts.agents
+      .filter((agent) => agent.id === "claude-code")
+      .map((agent) => ({ ...agent, lastObservedAt: "2026-09-27T13:00:00Z", configChangedAt: "2026-09-27T14:05:00Z" }));
+    const verdict = overviewVerdict({ metaStatus: "ready", meta: {}, health: { recording: true }, agents: changed, agentsFailed: false, unnamed: {}, now: NOW });
+    expect(verdict.row).toBe(6);
+    const html = render(<VerdictBand verdict={verdict} />);
+    expect(html).toContain("If Claude Code is running, restart it now.");
+    expect(html).not.toContain("after this step");
+    expect(html).not.toContain("data-command");
+  });
+
+  /** Some agents refuse a deny and others do not: the half shield, as in the header, never the monitor eye. */
+  it("draws the mixed band with the half shield", () => {
+    const enforce = facts.agents.filter((agent) => agent.id === "cursor");
+    const monitor = facts.agents.filter((agent) => agent.id === "claude-code");
+    const verdict = overviewVerdict({ metaStatus: "ready", meta: {}, health: { recording: true }, agents: [...monitor, ...enforce], agentsFailed: false, unnamed: {}, now: NOW });
+    expect(verdict.row).toBe(7);
+    const html = render(<VerdictBand verdict={verdict} />);
+    expect(html).toContain('data-icon="half-shield"');
+    expect(html).not.toContain('data-icon="eye"');
+    const monitorOnly = overviewVerdict({ metaStatus: "ready", meta: {}, health: { recording: true }, agents: monitor, agentsFailed: false, unnamed: {}, now: NOW });
+    expect(render(<VerdictBand verdict={monitorOnly} />)).toContain('data-icon="eye"');
+  });
+
   it("shows a template step to fill in, never to copy", () => {
     const html = render(<StepBlock step={{ label: "To start one:", command: "innerwarden contain -- <command>", line: "Runs it in the jail." }} />);
     expect(html).toContain("data-template");
@@ -92,10 +119,12 @@ describe("the charts", () => {
     expect(html.match(/data-bar=/g)).toHaveLength(2);
   });
 
-  it("outlines the week still under way and says so", () => {
+  /** Dashed means not read on these pages: the week under way is known, so it is drawn at half strength, never dashed. */
+  it("draws the week still under way at half strength, says so, and never dashes it", () => {
     const html = render(<WeekBars weeks={history.refusals.weeks} />);
     expect(html).toContain("This week so far");
-    expect(html).toContain('stroke-dasharray="3 2"');
+    expect(html).toMatch(/data-partial="" opacity="0.5"/);
+    expect(html).not.toContain("stroke-dasharray");
   });
 
   it("draws tokens from BigInts, cache reads on their own track", () => {
@@ -111,6 +140,10 @@ describe("the charts", () => {
     );
     expect(html).toContain('aria-label="Claude Code: 68,600,000 input, 353,850 output; 70,400,000,000 re-read from cache"');
     expect(html).toContain('data-part="cache_reads"');
+    // A key on screen says what each shade is: the shades are never the only signal.
+    const key = html.slice(html.indexOf("data-token-key"), html.indexOf("</figcaption>"));
+    expect(key.replace(/<[^>]+>/g, "|")).toMatch(/\|Input\|.*\|Output\|.*\|Re-read from cache\|/);
+    expect(key.match(/aria-hidden="true"/g)).toHaveLength(3);
     expect(share(1n, 3n)).toBeCloseTo(0.3333, 3);
     expect(share(5n, 0n)).toBe(0);
   });
@@ -144,15 +177,32 @@ describe("the rows", () => {
     expect(html).toContain(`href="?view=activity&amp;decision=${encodeURIComponent(item.id).replace(/&/g, "&amp;")}"`);
     expect(html).toContain('title="cd /Users/me/my-app &amp;&amp; rm -rf node_modules/.cache"');
     expect(html).toContain('<span data-muted="true" class="text-(--iw-ink-3)">cd /Users/me/my-app &amp;&amp; </span>');
-    expect(html).toContain("line-clamp-2");
+    expect(html).toContain("line-clamp-2 lg:line-clamp-3");
     expect(html).toContain('in <span class="font-mono">my-app</span>');
   });
 
-  it("draw a reason with the outcome most of its decisions reached", () => {
+  it("draw a reason with the outcome its decisions reached", () => {
     const reason = page.reasons.find((entry) => entry.key === "rule:download_and_execute")!;
     const html = render(<ReasonRow reason={reason} href="?view=activity&amp;reason=x" />);
     expect(html).toContain("Would have been refused");
     expect(html).toContain(reason.short);
+  });
+
+  /**
+   * 500 would have been refused and 3 refused before they ran: the row says
+   * both, each with its count, and its mark is the more severe one. FAILS ON
+   * REVERT to the dominant outcome alone ("503, Would have been refused").
+   */
+  it("draw every outcome a reason reached, the most severe never hidden behind the most frequent", () => {
+    const reason = { key: "rule:x", words: "x", short: "Downloads and runs a script", count: 503, byOutcome: { would_have_refused: 500, refused_before_run: 3 } };
+    const html = render(<ReasonRow reason={reason} href="?view=activity&amp;reason=x" />);
+    const outcomes = [...html.matchAll(/data-reason-outcome="([a-z_]+)"/g)].map((match) => match[1]);
+    expect(outcomes).toEqual(["refused_before_run", "would_have_refused"]);
+    const text = html.replace(/<[^>]+>/g, "");
+    expect(text).toContain("3Refused before it ran");
+    expect(text).toContain("500Would have been refused");
+    // The row's own mark is the most severe outcome's.
+    expect(html.indexOf('data-mark-tone="stopped"')).toBeLessThan(html.indexOf("Downloads and runs a script"));
   });
 
   it("draw a session with its span in the reader's clock and its outcomes", () => {
@@ -173,9 +223,57 @@ describe("the rows", () => {
 
   it("say whether an agent was seen working, dashed when it was not or cannot be told", () => {
     const gemini = facts.agents.find((agent) => agent.id === "gemini")!;
-    expect(render(<SeenCell agent={gemini} unnamed={{}} />)).toContain("Nothing screened yet");
+    expect(render(<SeenCell agent={gemini} unnamed={{}} now={NOW} />)).toContain("Nothing since its settings changed on 27 Sept at 14:05");
+    expect(render(<SeenCell agent={{ ...gemini, configChangedAt: undefined }} unnamed={{}} />)).toContain("Nothing screened yet");
     expect(render(<SeenCell agent={gemini} unnamed={{ mcp: "2026-09-29T14:00:00Z" }} />)).toContain("Not reported");
-    expect(render(<SeenCell agent={{ ...gemini, mcp: { stdio: 0, wrapped: 0, remote: 1 } }} unnamed={{}} />)).toContain("No MCP server to screen");
     expect(render(<SeenCell agent={facts.agents.find((agent) => agent.id === "cursor")!} unnamed={{}} />)).toContain("Screened");
+  });
+
+  /**
+   * A screening older than the settings change is not the guard seen
+   * working: the band and the summary count it as not seen, and so does the
+   * cell. FAILS ON REVERT of the `seen` branch ("Screened 2 minutes ago").
+   */
+  it("never draw a screening from before the settings changed as Screened", () => {
+    const gemini = facts.agents.find((agent) => agent.id === "gemini")!;
+    const before = { ...gemini, lastObservedAt: "2026-09-27T13:00:00Z", configChangedAt: "2026-09-27T14:05:00Z" };
+    const html = render(<SeenCell agent={before} unnamed={{}} now={NOW} />);
+    expect(html).toContain('data-seen="not_seen"');
+    expect(html).not.toContain('data-seen="screened"');
+    expect(html).toContain("Nothing since its settings changed on 27 Sept at 14:05");
+    expect(html).toContain('title="Last screened');
+    const after = render(<SeenCell agent={{ ...before, lastObservedAt: "2026-09-27T15:00:00Z" }} unnamed={{}} now={NOW} />);
+    expect(after).toContain('data-seen="screened"');
+  });
+
+  /** A proxy with no local server and a remote one: the remote one is said as not screened. */
+  it("say a remote server is not screened where there is no local one to screen", () => {
+    const gemini = facts.agents.find((agent) => agent.id === "gemini")!;
+    expect(render(<SeenCell agent={{ ...gemini, mcp: { stdio: 0, wrapped: 0, remote: 1 } }} unnamed={{}} />)).toContain(
+      "No local MCP server to screen. 1 remote not screened.",
+    );
+    const none = render(<SeenCell agent={{ ...gemini, mcp: { stdio: 0, wrapped: 0, remote: 0 } }} unnamed={{}} />);
+    expect(none).toContain("No MCP server to screen");
+    expect(none).not.toContain("remote");
+  });
+
+  /** A mode that could not be read is the Unknown pill, never "Not connected". */
+  it("draw an agent whose mode could not be read as unknown, never as not connected", () => {
+    const codex = facts.agents.find((agent) => agent.id === "codex")!;
+    const html = render(<AgentRow agent={{ ...codex, mode: "unknown" }} unnamed={{}} />);
+    expect(html).toContain('data-pill="unknown"');
+    expect(html).toContain("Its mode could not be read.");
+    expect(html).not.toContain("Not connected");
+    const strip = render(<AgentStrip agents={[{ ...codex, mode: "unknown", present: false }]} unnamed={{}} />);
+    expect(strip).toContain('data-agent-row="codex"');
+    expect(strip).not.toContain("Not connected");
+  });
+
+  /** "Copied" is said to a screen reader in a polite live region; the button's name stays the command. */
+  it("give Copy a polite live region, empty until a copy worked", () => {
+    const html = render(<CopyCommand command="innerwarden enforce" />);
+    expect(html).toContain('data-copied-status="true" class="sr-only" aria-live="polite"></span>');
+    expect(html).toContain('aria-label="Copy command: innerwarden enforce"');
+    expect(render(<CopyCommand command="innerwarden contain -- &lt;command&gt;" template />)).not.toContain("aria-live");
   });
 });

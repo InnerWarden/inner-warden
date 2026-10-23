@@ -28,7 +28,9 @@ test.describe("CJC-090-J002 deterministic action screening", () => {
     await expect(card.locator('[data-pill="monitor"]')).toHaveText("Decided in monitor");
     await expect(card).not.toContainText("Refused before it ran");
     await expect(stage(page, "refused")).toHaveAttribute("data-mark", "not_applicable");
-    await expect(stage(page, "refused")).toContainText("Not refused: monitor records and does not refuse");
+    // The bold label says what happened: never "Refused" for a decision that ran.
+    await expect(stage(page, "refused").locator("p").first()).toHaveText(/^Not refused/);
+    await expect(stage(page, "refused")).toContainText("Monitor records and does not refuse");
     // Community reads nothing back, so nothing is ever marked verified.
     await expect(page.locator('section[data-decision] [data-mark="verified"]')).toHaveCount(0);
     await expect(card.locator("[data-not-checked-afterwards]")).toHaveText("Not checked afterwards: Community does not look at what a command did after it ran.");
@@ -47,7 +49,8 @@ test.describe("CJC-090-J002 deterministic action screening", () => {
     const card = page.locator(`section[data-decision="${CASE.refused}"]`);
     await expect(card.locator('[data-pill="enforce"]')).toHaveText("Decided in enforce");
     await expect(stage(page, "refused")).toHaveAttribute("data-mark", "done");
-    await expect(stage(page, "refused")).toContainText("Refused before it ran");
+    await expect(stage(page, "refused").locator("p").first()).toHaveText(/^Refused/);
+    await expect(stage(page, "refused")).toContainText("Before it ran");
     // There is no fourth step: what is not checked is said once, in words, never as a mark.
     await expect(stage(page, "verified")).toHaveCount(0);
     await expect(card.locator("[data-not-checked-afterwards]")).toContainText("Not checked afterwards");

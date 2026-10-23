@@ -48,12 +48,14 @@ export function agentSeen(agent: SeenFacts, unnamed: { hook?: string; mcp?: stri
   return "not_reported";
 }
 
-/** The six states one agent's screening can be in. */
-export const SCREENING_STATES = ["refusing", "monitor", "needs_you", "unknown", "off", "not_available"] as const;
+/** The seven states one agent's screening can be in. */
+export const SCREENING_STATES = ["refusing", "mixed", "monitor", "needs_you", "unknown", "off", "not_available"] as const;
 export type ScreeningState = (typeof SCREENING_STATES)[number];
 
 /**
  * - `refusing`: Enforce, and seen working since its settings changed.
+ * - `mixed`: its own hooks or servers differ, and seen working since: it
+ *   refuses a deny for some calls only, so it is neither refusing nor monitor.
  * - `monitor`: Monitor, and seen working since. Monitor never refuses.
  * - `needs_you`: partly connected, or a proxy with a local server not wrapped.
  * - `unknown`: connected but not seen since its settings changed, or a row
@@ -68,13 +70,15 @@ export function screeningState(agent: AgentFacts | undefined, unnamed: { hook?: 
   if (agent.mode === "unknown") return "unknown";
   if (agent.mode === "partial" || (agent.mcp !== undefined && agent.mcp.wrapped < agent.mcp.stdio)) return "needs_you";
   if (agentSeen(agent, unnamed) !== "seen") return "unknown";
-  // A mixed agent refuses some calls and not others: it is not counted as refusing.
-  return agent.mode === "enforce" ? "refusing" : "monitor";
+  // A mixed agent refuses some calls and not others: it is counted as
+  // neither refusing nor monitor.
+  return agent.mode === "enforce" ? "refusing" : agent.mode === "mixed" ? "mixed" : "monitor";
 }
 
 /** The pill each state is drawn with. */
-export const SCREENING_PILL: Record<ScreeningState, "enforce" | "monitor" | "needs" | "unknown" | "off" | "not_available"> = {
+export const SCREENING_PILL: Record<ScreeningState, "enforce" | "mixed" | "monitor" | "needs" | "unknown" | "off" | "not_available"> = {
   refusing: "enforce",
+  mixed: "mixed",
   monitor: "monitor",
   needs_you: "needs",
   unknown: "unknown",
@@ -85,6 +89,7 @@ export const SCREENING_PILL: Record<ScreeningState, "enforce" | "monitor" | "nee
 /** The words on that pill. */
 export const SCREENING_WORDS: Record<ScreeningState, string> = {
   refusing: "Refusing a deny",
+  mixed: "Refusing for some calls",
   monitor: "Monitor",
   needs_you: "Needs you",
   unknown: "Unknown",
@@ -125,9 +130,19 @@ function rowStep(agent: AgentFacts, state: ScreeningState): AgentNextStep | unde
   return undefined;
 }
 
-/** One row per connected or partly connected agent, in the order the CLI sent them. */
+/**
+ * Whether an agent has a row under Screening: connected or partly connected,
+ * or set up with a mode that could not be read (its hook or MCP config could
+ * not be read). An unread mode is said as such, never dropped as "not
+ * connected".
+ */
+export function isListedForScreening(agent: Pick<AgentFacts, "mode">): boolean {
+  return isConnected(agent) || agent.mode === "unknown";
+}
+
+/** One row per connected, partly connected or unread agent, in the order the CLI sent them. */
 export function screeningRows(agents: readonly AgentFacts[], unnamed: { hook?: string; mcp?: string } | undefined): ScreeningRow[] {
-  return agents.filter(isConnected).map((agent) => {
+  return agents.filter(isListedForScreening).map((agent) => {
     const state = screeningState(agent, unnamed);
     const step = rowStep(agent, state);
     return {
@@ -162,12 +177,21 @@ export function mcpLines(mcp: McpCounts | undefined): string[] {
   return lines;
 }
 
-const SUMMARY_PARTS: { state: ScreeningState; words: (n: number) => string }[] = [
-  { state: "refusing", words: () => "refusing a deny" },
-  { state: "monitor", words: () => "in monitor" },
-  { state: "needs_you", words: (n) => plural(n, "needs you", "need you") },
-  { state: "unknown", words: () => "not yet seen working" },
+/** How the summary counts a row: its state, or an agent whose mode could not be read. */
+type SummaryKey = ScreeningState | "mode_unread";
+
+const SUMMARY_PARTS: { key: SummaryKey; words: (n: number) => string }[] = [
+  { key: "refusing", words: () => "refusing a deny" },
+  { key: "mixed", words: () => "refusing a deny for some calls only" },
+  { key: "monitor", words: () => "in monitor" },
+  { key: "needs_you", words: (n) => plural(n, "needs you", "need you") },
+  { key: "unknown", words: () => "not yet seen working" },
+  { key: "mode_unread", words: () => "with a mode that could not be read" },
 ];
+
+function summaryKey(row: ScreeningRow): SummaryKey {
+  return row.agent.mode === "unknown" ? "mode_unread" : row.state;
+}
 
 /**
  * The screening half of Protection's summary sentence, counted by state:
@@ -178,8 +202,8 @@ export function screeningSummary(rows: readonly ScreeningRow[] | undefined): str
   if (rows === undefined) return "Screening: not read.";
   if (rows.length === 0) return "Screening: no agent is connected yet.";
   const parts: string[] = [];
-  for (const { state, words } of SUMMARY_PARTS) {
-    const n = rows.filter((row) => row.state === state).length;
+  for (const { key, words } of SUMMARY_PARTS) {
+    const n = rows.filter((row) => summaryKey(row) === key).length;
     if (n === 0) continue;
     parts.push(parts.length === 0 ? `${formatCount(n)} ${plural(n, "agent", "agents")} ${words(n)}` : `${formatCount(n)} ${words(n)}`);
   }

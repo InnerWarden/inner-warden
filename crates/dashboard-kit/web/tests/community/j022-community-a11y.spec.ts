@@ -171,6 +171,39 @@ test("moving between pages puts focus on the new page's h1, and a first load doe
   await expect(page.locator("main h1")).toBeFocused();
 });
 
+/**
+ * WCAG 1.3.2 and 2.4.3 at a desk: the Overview's sections are read in the
+ * order they are drawn, left to right and top to bottom. FAILS ON REVERT of
+ * the DOM order: Refused and Needs a look came before Agents, drawn first.
+ */
+test("the Overview's sections are in the DOM in the order they are drawn at a desk", async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await open(page, "/", PAGE_READY.Overview);
+  await expect(page.locator("#needs-a-look")).toBeVisible();
+  const headings = await page.locator("main h2:not(.sr-only)").evaluateAll((elements) =>
+    elements
+      .filter((element) => element.getBoundingClientRect().height > 0)
+      .map((element) => ({ text: element.textContent ?? "", top: Math.round(element.getBoundingClientRect().top), left: Math.round(element.getBoundingClientRect().left) })),
+  );
+  const drawn = headings.slice().sort((a, b) => (Math.abs(a.top - b.top) < 8 ? a.left - b.left : a.top - b.top));
+  expect(headings.map((heading) => heading.text)).toEqual(drawn.map((heading) => heading.text));
+  expect(headings.map((heading) => heading.text).slice(0, 3)).toEqual(["Agents", "Refused, or would have been", "Needs a look"]);
+});
+
+/** "Copied" is said to a screen reader, politely, while the button's name stays the command. */
+test("a copy is announced in a polite live region", async ({ page, context }) => {
+  await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+  await open(page, "/", PAGE_READY.Overview);
+  const box = page.locator("[data-verdict-action] [data-step]").first();
+  const button = box.getByRole("button", { name: /^Copy command: / });
+  const command = ((await button.getAttribute("aria-label")) ?? "").replace("Copy command: ", "");
+  const status = box.locator("[data-copied-status]");
+  await expect(status).toHaveAttribute("aria-live", "polite");
+  await expect(status).toHaveText("");
+  await button.click();
+  await expect(status).toHaveText(`Copied: ${command}`);
+});
+
 test("every chart has a table twin a screen reader reads and a sighted reader can open", async ({ page }) => {
   let charts = 0;
   for (const [label, path] of [["Overview", "/"], ["Protection", "/?view=posture"], ["Tokens", "/?view=tokens"]] as const) {

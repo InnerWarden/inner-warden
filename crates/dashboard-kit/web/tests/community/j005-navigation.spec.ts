@@ -75,7 +75,8 @@ test.describe("CJC-090-J005 activity filters, pagination, and drilldown", () => 
     await page.goto(`/?view=activity&decision=${encodeURIComponent(CASE.refused)}`);
     const card = page.locator(`section[data-decision="${CASE.refused}"]`);
     await expect(card).toBeVisible();
-    await expect(card.getByRole("heading", { level: 2 })).toBeFocused();
+    // A first load moves no focus (spec 5.4): the page reads from its top.
+    await expect(card.getByRole("heading", { level: 2 })).not.toBeFocused();
     await page.reload();
     await expect(card).toBeVisible();
   });

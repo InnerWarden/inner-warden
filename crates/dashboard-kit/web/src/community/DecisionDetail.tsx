@@ -6,7 +6,7 @@ import type { Attempt, Brief, Decision, NextStep, Segment, SessionFacts } from "
 import { asiLabel } from "./asi";
 import { decisionLadder, messageLadder, NOT_CHECKED_AFTERWARDS, type LadderMark, type LadderStep } from "./ladder";
 import { Ago, CopyCommand, HiddenChip, tokenWrap } from "./parts";
-import { changesAgentConfig, restartFor } from "./restart";
+import { changesAgentConfig, restartFor, restartsAfter, type AgentRestart } from "./restart";
 import { BODY_TEXT, H2, LINK_TEXT, META_TEXT, OutcomeWords, PANEL, RestartNote, SMALL_TEXT } from "./ui/blocks";
 import { Icon } from "./ui/Icon";
 import { ModePill, OutcomeMark } from "./ui/marks";
@@ -102,15 +102,18 @@ function Part({ id, title, children }: { id: string; title: string; children: Re
 function NextSteps({
   steps,
   item,
+  restarts,
   onHideReason,
 }: {
   steps: readonly NextStep[];
   item: Decision;
+  /** Every connected agent's restart, for a switch that changes them all. */
+  restarts?: readonly AgentRestart[];
   onHideReason?: (key: string) => void;
 }) {
   if (steps.length === 0) return <p className={BODY_TEXT}>Nothing to do.</p>;
   const agent = item.agent ?? "your agent";
-  const restart = restartFor(item.agentId ?? "", agent, undefined);
+  const own: AgentRestart = { agent, words: restartFor(item.agentId ?? "", agent, undefined) };
   return (
     <div className="space-y-3">
       {steps.map((step) => (
@@ -118,7 +121,7 @@ function NextSteps({
           <p className="text-sm leading-[21px] font-medium text-(--iw-ink)">{step.label}</p>
           {step.command === undefined ? null : <CopyCommand command={step.command} template={step.template === true} />}
           <p className={META_TEXT}>{step.line}</p>
-          {changesAgentConfig(step.command) ? <RestartNote agent={agent} words={restart} /> : null}
+          {restartsAfter(step.command, own, restarts).map((restart) => <RestartNote key={restart.agent} agent={restart.agent} words={restart.words} />)}
           {step.viewAction === "hide_reason" && onHideReason !== undefined && item.reason.key !== "none" ? (
             <button
               type="button"
@@ -171,6 +174,8 @@ export function DecisionDetail({
   onOpen,
   onSession,
   onHideReason,
+  restarts,
+  focusTitle = true,
 }: {
   item: Decision;
   before: readonly Brief[];
@@ -184,10 +189,19 @@ export function DecisionDetail({
   onSession: (label: string) => void;
   /** Hide this decision's reason from the list: a view only (`hide=` in the address). */
   onHideReason?: (key: string) => void;
+  /** Every connected agent's restart, for a step that switches them all. */
+  restarts?: readonly AgentRestart[];
+  /**
+   * Move focus to the title when this decision is drawn: only when the
+   * person opened it (a click, Enter, Newer or Older), never when arrow keys
+   * on the list moved it or on a first load from an address.
+   */
+  focusTitle?: boolean;
 }) {
   const title = useRef<HTMLHeadingElement>(null);
   useEffect(() => {
-    title.current?.focus({ preventScroll: true });
+    if (focusTitle) title.current?.focus({ preventScroll: true });
+    // Only a new decision moves focus, never a re-render of the same one.
   }, [item.id]);
   const steps = decisionLadder({ outcomeKey: item.outcomeKey, mode: item.mode, recommendation: item.recommendation, decidedBy: item.decidedBy });
   const notWhole = notWholeWords(item);
@@ -242,7 +256,7 @@ export function DecisionDetail({
           )}
         </Part>
         <Part id="next" title="What you can do">
-          <NextSteps steps={item.next} item={item} onHideReason={onHideReason} />
+          <NextSteps steps={item.next} item={item} restarts={restarts} onHideReason={onHideReason} />
         </Part>
       </section>
       <AroundIt item={item} before={before} after={after} session={session} onOpen={onOpen} onSession={onSession} />
@@ -434,15 +448,39 @@ export function messageStep(outcomeKey: Attempt["outcomeKey"], hostMode: string)
       command: "innerwarden enforce",
     };
   }
-  if (outcomeKey === "declined_by_agent") return { text: "Nothing to do: your agent declined, and the guard screens what it runs." };
-  return { text: "Nothing to do here: the guard screens whatever your agent runs." };
+  if (hostMode === "enforce") {
+    // A hook judges shell commands and a proxy MCP calls: what is screened is
+    // a deny refused, never "whatever your agent runs".
+    return outcomeKey === "declined_by_agent"
+      ? { text: "Nothing to do: your agent declined, and a deny from your connected agents is refused before it runs." }
+      : { text: "Nothing to do here: a deny from your connected agents is refused before it runs." };
+  }
+  if (hostMode === "not_configured") {
+    return {
+      text: "No agent is connected to the guard, so nothing your agent runs is screened. To connect every agent found here, in monitor:",
+      command: "innerwarden agents connect --all --monitor",
+    };
+  }
+  return { text: "The mode could not be read, so this page claims none. To see it:", command: "innerwarden status" };
 }
 
 /** A message someone sent the agent, in the same parts as a decision. */
-export function MessageDetail({ item, hostMode = "unknown" }: { item: Attempt; hostMode?: string }) {
+export function MessageDetail({
+  item,
+  hostMode = "unknown",
+  restarts,
+  focusTitle = true,
+}: {
+  item: Attempt;
+  hostMode?: string;
+  /** Every connected agent's restart, for a step that switches them all. */
+  restarts?: readonly AgentRestart[];
+  /** As on a decision: only an open the person made moves focus. */
+  focusTitle?: boolean;
+}) {
   const title = useRef<HTMLHeadingElement>(null);
   useEffect(() => {
-    title.current?.focus({ preventScroll: true });
+    if (focusTitle) title.current?.focus({ preventScroll: true });
   }, [item.id]);
   const declined = item.outcomeKey === "declined_by_agent";
   const step = messageStep(item.outcomeKey, hostMode);
@@ -481,7 +519,9 @@ export function MessageDetail({ item, hostMode = "unknown" }: { item: Attempt; h
           <div data-step className="min-w-0 space-y-2 rounded-lg bg-(--iw-surface-2) p-3">
             <p className="text-sm leading-[21px] text-(--iw-ink)">{step.text}</p>
             {step.command === undefined ? null : <CopyCommand command={step.command} />}
-            {changesAgentConfig(step.command) ? <RestartNote agent="your agent" words={restartFor("", "your agent", undefined)} /> : null}
+            {restartsAfter(step.command, { agent: "your agent", words: restartFor("", "your agent", undefined) }, restarts).map((restart) => (
+              <RestartNote key={restart.agent} agent={restart.agent} words={restart.words} />
+            ))}
           </div>
         </Part>
         <TechnicalOnly>

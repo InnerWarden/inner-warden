@@ -206,7 +206,7 @@ function AgentCard({
         {prompt === undefined ? null : (
           <div data-restart-prompt className="space-y-2 rounded-lg bg-(--iw-surface-2) p-3">
             <p className="text-sm leading-[21px] font-medium text-(--iw-ink)">{prompt}</p>
-            <RestartNote agent={restart.agent} words={restart.words} />
+            <RestartNote agent={restart.agent} words={restart.words} when="now" />
           </div>
         )}
         {step !== undefined ? (

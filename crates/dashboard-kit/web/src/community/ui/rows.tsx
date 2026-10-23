@@ -3,11 +3,11 @@ import { TechnicalOnly } from "../../components/TechnicalDetail";
 import { formatAbsolute, formatCount } from "../../presentation";
 import type { AgentFacts, Attempt, Decision, Reason, SessionSummary } from "../api";
 import { commandSegments } from "../commandDisplay";
-import { agentSeen } from "../controls";
-import { dominantOutcome, SEVERITY_ORDER, type OutcomeKey } from "../outcomeStyle";
+import { agentSeen, isListedForScreening } from "../controls";
+import { outcomesBySeverity, SEVERITY_ORDER, type OutcomeKey } from "../outcomeStyle";
 import { Ago, HiddenChip } from "../parts";
 import { clockTime, isConnected } from "../verdict";
-import { MODE_WORDS, OUTCOME_WORDS, WHO_WORDS } from "../words";
+import { atWords, MODE_WORDS, OUTCOME_WORDS, WHO_WORDS } from "../words";
 import { LINK_TEXT, META_TEXT, onPlainClick, SMALL_TEXT } from "./blocks";
 import { Icon } from "./Icon";
 import { OutcomeMark, StatusPill, type PillState } from "./marks";
@@ -27,7 +27,7 @@ const ROW_LINK = "block min-h-9 rounded-lg px-3 py-2 hover:bg-(--iw-surface-2) p
  */
 export function CommandText({ command, className = "" }: { command: string; className?: string }) {
   return (
-    <code title={command} data-command-text className={`line-clamp-2 min-w-0 break-all font-mono text-[12.5px] leading-[18px] text-(--iw-ink) ${className}`}>
+    <code title={command} data-command-text className={`line-clamp-2 lg:line-clamp-3 min-w-0 break-all font-mono text-[12.5px] leading-[18px] text-(--iw-ink) ${className}`}>
       {commandSegments(command).map((segment, index) =>
         segment.muted ? (
           <span key={index} data-muted className="text-(--iw-ink-3)">{segment.text}</span>
@@ -148,21 +148,49 @@ export function MessageRow({
   );
 }
 
-/** One reason commands were flagged: the outcome most of them reached, the words, how many. */
+/**
+ * What a reason's decisions came to, every outcome it has, the most severe
+ * first: one outcome is said in words; several each with its mark and count,
+ * so a refusal or an unsafe command that ran is never hidden behind the
+ * outcome most of them reached.
+ */
+export function ReasonOutcomes({ byOutcome }: { byOutcome?: Reason["byOutcome"] }) {
+  const outcomes = byOutcome === undefined ? [] : outcomesBySeverity(byOutcome);
+  if (outcomes.length === 0) return null;
+  if (outcomes.length === 1) return <span data-reason-outcome={outcomes[0]} className={`block ${META_TEXT}`}>{OUTCOME_WORDS[outcomes[0]]}</span>;
+  return (
+    <span className={`block space-y-0.5 ${META_TEXT}`}>
+      {outcomes.map((key) => (
+        <span key={key} data-reason-outcome={key} className="flex items-center justify-end gap-1.5">
+          <OutcomeMark outcome={key} />
+          <span className="tabular-nums">{formatCount(byOutcome?.[key as keyof NonNullable<Reason["byOutcome"]>] ?? 0)}</span>
+          <span>{OUTCOME_WORDS[key]}</span>
+        </span>
+      ))}
+    </span>
+  );
+}
+
+/** The most severe outcome a reason's decisions reached, for the mark at the start of its row. */
+export function worstOutcome(byOutcome: Reason["byOutcome"]): OutcomeKey | undefined {
+  return byOutcome === undefined ? undefined : outcomesBySeverity(byOutcome)[0];
+}
+
+/** One reason commands were flagged: the most severe outcome's mark, the words, how many, and what they came to. */
 export function ReasonRow({ reason, href, onOpen }: { reason: Reason; href: string; onOpen?: () => void }) {
-  const dominant = reason.byOutcome === undefined ? undefined : dominantOutcome(reason.byOutcome);
+  const worst = worstOutcome(reason.byOutcome);
   return (
     <li data-reason-row={reason.key}>
       <a href={href} onClick={onPlainClick(onOpen)} className={ROW_LINK}>
         <span className="flex min-w-0 items-start gap-2">
-          {dominant === undefined ? <span className="h-2.5 w-2.5 shrink-0" /> : <OutcomeMark outcome={dominant} className="mt-1.5" />}
+          {worst === undefined ? <span className="h-2.5 w-2.5 shrink-0" /> : <OutcomeMark outcome={worst} className="mt-1.5" />}
           <span className="min-w-0 flex-1">
             <span className="block text-sm leading-[21px] font-medium text-(--iw-ink)">{reason.short}</span>
             {reason.detail === undefined ? null : <span className={`block break-all font-mono ${META_TEXT}`}>{reason.detail}</span>}
           </span>
           <span className="shrink-0 text-right">
             <span className="block text-sm font-semibold tabular-nums text-(--iw-ink)">{formatCount(reason.count)}</span>
-            {dominant === undefined ? null : <span className={`block ${META_TEXT}`}>{OUTCOME_WORDS[dominant]}</span>}
+            <ReasonOutcomes byOutcome={reason.byOutcome} />
           </span>
         </span>
       </a>
@@ -240,29 +268,41 @@ export const JUDGES_SHORT: Record<NonNullable<AgentFacts["judges"]>, string> = {
   mcp_server_calls: "Calls to its MCP servers",
 };
 
+/** "No local MCP server to screen." and, where some are remote, that those are not screened. */
+export function nothingToScreenWords(remote: number | undefined): string {
+  return remote === undefined || remote === 0
+    ? "No MCP server to screen"
+    : `No local MCP server to screen. ${formatCount(remote)} remote not screened.`;
+}
+
 /**
- * Whether the guard was seen working for an agent, in one line: when it last
- * screened something, or dashed when nothing was seen or it cannot be told.
+ * Whether the guard was seen working for an agent, in one line, from the
+ * same reading the band and the summary use (`agentSeen`): when it last
+ * screened something since its settings changed, or dashed when nothing came
+ * through since, nothing was ever seen, or it cannot be told. A screening
+ * older than the change is never drawn as working: it is in the title only.
  */
 export function SeenCell({
   agent,
   unnamed,
   screened = "Screened",
+  now = Date.now(),
 }: {
   agent: AgentFacts;
   unnamed: { hook?: string; mcp?: string } | undefined;
   /** The words before the time: "Screened" in a short row, "Last screened" on an agent's own card. */
   screened?: string;
+  now?: number;
 }) {
   const seen = agentSeen(agent, unnamed);
   if (seen === "nothing_to_screen") {
     return (
       <span data-seen="nothing_to_screen" className={`inline-flex items-center gap-1.5 ${META_TEXT}`}>
-        <span className="text-(--iw-ink-3)"><Icon name="hollow-circle" className="h-3 w-3" /></span>No MCP server to screen
+        <span className="text-(--iw-ink-3)"><Icon name="hollow-circle" className="h-3 w-3" /></span>{nothingToScreenWords(agent.mcp?.remote)}
       </span>
     );
   }
-  if (agent.lastObservedAt !== undefined) {
+  if (seen === "seen" && agent.lastObservedAt !== undefined) {
     return (
       <span data-seen="screened" className={`inline-flex items-center gap-1.5 ${SMALL_TEXT} text-(--iw-ink-2)`}>
         <span className="h-2 w-2 shrink-0 rounded-full bg-(--iw-ink-3)" aria-hidden="true" />
@@ -270,10 +310,21 @@ export function SeenCell({
       </span>
     );
   }
+  const changed = agent.configChangedAt === undefined ? undefined : Date.parse(agent.configChangedAt);
+  const words = seen === "not_reported"
+    ? "Not reported"
+    : changed !== undefined && Number.isFinite(changed)
+      ? `Nothing since its settings changed ${atWords(changed, now)}`
+      : "Nothing screened yet";
+  const last = agent.lastObservedAt === undefined ? undefined : formatAbsolute(agent.lastObservedAt);
   return (
-    <span data-seen={seen} className={`inline-flex items-center gap-1.5 ${SMALL_TEXT} text-(--iw-ink-2)`}>
+    <span
+      data-seen={seen}
+      title={last === undefined ? undefined : `Last screened ${last}, before its settings changed.`}
+      className={`inline-flex items-center gap-1.5 ${SMALL_TEXT} text-(--iw-ink-2)`}
+    >
       <span className="h-2 w-2 shrink-0 rounded-full border border-dashed border-(--iw-unknown)" aria-hidden="true" />
-      {seen === "not_reported" ? "Not reported" : "Nothing screened yet"}
+      {words}
     </span>
   );
 }
@@ -289,13 +340,19 @@ export function AgentRow({
   onOpenAgents?: () => void;
 }) {
   const connected = isConnected(agent);
+  const unread = agent.mode === "unknown";
   return (
     <li data-agent-row={agent.id} className="min-w-0 space-y-1 py-2">
       <p className="flex flex-wrap items-center gap-x-2 gap-y-1">
         <span className="text-sm leading-[21px] font-semibold text-(--iw-ink)">{agent.name}</span>
-        {connected ? <AgentModePill agent={agent} /> : null}
+        {connected || unread ? <AgentModePill agent={agent} /> : null}
       </p>
-      {connected ? (
+      {unread ? (
+        // Its hook or MCP config could not be read: never "Not connected".
+        <p data-mode-unread className={`${SMALL_TEXT} text-(--iw-ink-2)`}>
+          Its mode could not be read. <code className="font-mono text-[12.5px]">innerwarden status</code> says why.
+        </p>
+      ) : connected ? (
         <>
           <p className={`${SMALL_TEXT} text-(--iw-ink-2)`}>
             {agent.mechanism === undefined ? null : MECHANISM_WORDS[agent.mechanism]}
@@ -333,8 +390,10 @@ export function AgentStrip({
   max?: number;
   onOpenAgents?: () => void;
 }) {
-  const connected = agents.filter(isConnected);
-  const found = agents.filter((agent) => !isConnected(agent) && agent.supported && agent.present);
+  // Connected first, then those whose mode could not be read (never listed
+  // as not connected), then those found here and not connected.
+  const connected = agents.filter(isListedForScreening);
+  const found = agents.filter((agent) => !isListedForScreening(agent) && agent.supported && agent.present);
   const listed = [...connected, ...found];
   const shown = listed.slice(0, max);
   const more = listed.length - shown.length;

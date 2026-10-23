@@ -28,9 +28,16 @@ export function restartFor(agentId: string, displayName: string, served: Restart
   return served ?? restartWords(agentId, displayName);
 }
 
+/**
+ * When the restart comes: `after_step` under a step that changes the agent's
+ * config, `now` where the change already happened and there is no step to
+ * take first (a prompt to restart, or a band with no command).
+ */
+export type RestartWhen = "after_step" | "now";
+
 /** The whole note, as one sentence run: "If Codex is running, restart it after this step. Quit Codex ..." */
-export function restartNote(displayName: string, words: RestartWords): string {
-  return `If ${displayName} is running, restart it after this step. ${words.how} ${words.why}`;
+export function restartNote(displayName: string, words: RestartWords, when: RestartWhen = "after_step"): string {
+  return `If ${displayName} is running, restart it ${when === "now" ? "now" : "after this step"}. ${words.how} ${words.why}`;
 }
 
 /**
@@ -43,6 +50,30 @@ export const CONFIG_CHANGING = ["innerwarden enforce", "innerwarden dry-run", "i
 
 export function changesAgentConfig(command: string | undefined): boolean {
   return command !== undefined && CONFIG_CHANGING.some((prefix) => command === prefix || command.startsWith(`${prefix} `));
+}
+
+/** The switches that change every connected agent's config at once, not one agent's. */
+const EVERY_AGENT = ["innerwarden enforce", "innerwarden dry-run", "innerwarden install", "innerwarden agents connect --all"] as const;
+
+/**
+ * Whether a step changes every connected agent's config: then every one of
+ * them is restarted after it, each with its own words, not only the agent
+ * the page is about. `innerwarden agents connect <id>` changes one.
+ */
+export function changesEveryAgent(command: string | undefined): boolean {
+  return command !== undefined && EVERY_AGENT.some((prefix) => command === prefix || command.startsWith(`${prefix} `));
+}
+
+/** An agent to restart, with the words for it. */
+export type AgentRestart = { agent: string; words: RestartWords };
+
+/**
+ * Who restarts after a step: every agent in `every` for a switch that
+ * changes them all (when they were read), otherwise the one agent named.
+ */
+export function restartsAfter(command: string | undefined, one: AgentRestart, every: readonly AgentRestart[] | undefined): AgentRestart[] {
+  if (!changesAgentConfig(command)) return [];
+  return changesEveryAgent(command) && every !== undefined && every.length > 0 ? [...every] : [one];
 }
 
 /**

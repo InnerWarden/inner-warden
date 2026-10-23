@@ -20,7 +20,7 @@ async function useScenario(page: Page, baseURL: string | undefined, scenario: st
 const RULES = [
   "An allow pattern lets through only the commands it matches, and the record says you allowed it.",
   "A mute clears a flag only when every rule behind it is muted and no other danger signal remains.",
-  "These change only from a terminal you type in. An agent that runs them is refused.",
+  "Adding to these lists needs a terminal: the CLI refuses an allow or mute that runs with no terminal, as an agent's shell does. Removing one does not.",
 ];
 
 test("lists the exceptions as the CLI serves them, with the rules said once", async ({ page }) => {
@@ -38,6 +38,39 @@ test("lists the exceptions as the CLI serves them, with the rules said once", as
   for (const line of RULES) await expect(section.getByText(line, { exact: true })).toHaveCount(1);
   // The rule about terminals is said once on the page.
   expect((await page.locator("main").innerText()).split(RULES[2]).length - 1).toBe(1);
+});
+
+/**
+ * The guard's log could not be read: the list changes are not counted, and
+ * that is said as not read, never "No change to these lists". FAILS ON
+ * REVERT of the not-read line.
+ */
+test("says the list changes were not counted when the guard's log could not be read", async ({ page, baseURL }) => {
+  await useScenario(page, baseURL, "log-unreadable");
+  await page.goto("/?view=posture");
+  const section = page.locator("#exceptions");
+  await expect(section.locator('[data-exception-changes="not_read"]')).toHaveText(
+    "Not read: the guard's log could not be read, so changes are not counted.",
+  );
+  await expect(section).not.toContainText("No change to these lists");
+  await expect(section.locator("[data-allow-list] > li")).toHaveCount(5);
+});
+
+/** A pattern too long to serve whole is marked, with the terminal step to remove it, and nothing to copy. */
+test("marks a shortened pattern and names the terminal step to remove it", async ({ page }) => {
+  const cut = `${"sh /opt/build/".repeat(30).slice(0, 399)}\u2026`;
+  await page.route("**/api/guard/suppress", async (route) => {
+    const response = await route.fetch();
+    const body = await response.json();
+    body.allow = [{ pattern: cut, redacted: false, hidden_characters: false, warning: null, shortened: true }];
+    await route.fulfill({ response, json: body });
+  });
+  await page.goto("/?view=posture");
+  const row = page.locator('#exceptions [data-allow="shortened"]');
+  await expect(row.locator("[data-shortened]")).toHaveText("Shortened here");
+  await expect(row).toContainText("Remove it from a terminal: innerwarden allow --list shows it.");
+  await expect(row.locator("[data-command]")).toHaveCount(0);
+  await expect(row.getByRole("button", { name: /Copy/ })).toHaveCount(0);
 });
 
 test("marks a pattern that matches more than one command, and only that one", async ({ page }) => {

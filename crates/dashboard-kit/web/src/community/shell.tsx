@@ -71,7 +71,7 @@ function Page({ context, route, children }: { context: CommunityScreenContext; r
   return (
     <div ref={root} data-community-page={route} className="min-w-0 space-y-6">
       <HatchDefs />
-      <PageNotices meta={context.meta} route={route} />
+      <PageNotices meta={context.meta} route={route} onOverview={() => context.navigate("overview")} />
       {children}
       {context.meta?.exposed === false ? (
         <TechnicalOnly>

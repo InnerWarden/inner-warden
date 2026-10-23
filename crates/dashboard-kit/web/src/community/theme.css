@@ -67,3 +67,17 @@
 @media (pointer: coarse) {
   [role="tab"][data-lane] { min-height: 44px; }
 }
+
+/*
+ * The shared header's fitted nav puts every tab in one row of equal columns.
+ * Below 400 px five Community tabs do not fit in one row: "Protection" and
+ * "Decisions" spill under their neighbours. Two rows of three columns instead,
+ * here rather than in the shared file, so a bundle that composes the kit pays
+ * nothing for it.
+ */
+@media (max-width: 400px) {
+  nav[aria-label="Dashboard views"] {
+    grid-auto-flow: row;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}

@@ -133,10 +133,17 @@ export function tokenView(agent: TokenAgent & { parts_disjoint?: unknown }): Tok
     };
   }
 
-  // Counters that overlap: nothing stacked, nothing subtracted.
+  // Counters that overlap: nothing stacked.
   const lines: string[] = [];
   if (input !== null) lines.push(cached === null ? `${tokenWords(input)} input` : `${tokenWords(input)} input, of which ${tokenWords(cached)} cached`);
   if (output !== null) lines.push(reasoning === null ? `${tokenWords(output)} output` : `${tokenWords(output)} output, of which ${tokenWords(reasoning)} reasoning`);
+  // Cached input is reported as part of input (its counter says so), so the
+  // headline can leave it out and be on the same basis as an agent whose
+  // parts are apart: "not counting cache reads", the cached part said under
+  // it. Two headlines side by side then compare like with like.
+  if (input !== null && output !== null && cached !== null && cached <= input) {
+    return { ...view, headline: { value: input - cached + output, words: "tokens, not counting cache reads" }, cacheReads: cached, lines };
+  }
   return { ...view, headline: { value: total, words: cached === null ? "tokens in all" : "tokens in all, cached input included" }, lines };
 }
 

@@ -68,6 +68,11 @@ export const SEVERITY_ORDER: readonly OutcomeKey[] = [
   "unplaced",
 ];
 
+/** Every outcome with a count above zero, the most severe first. */
+export function outcomesBySeverity(counts: Partial<Record<OutcomeKey, number>>): OutcomeKey[] {
+  return SEVERITY_ORDER.filter((key) => (counts[key] ?? 0) > 0);
+}
+
 export function dominantOutcome(counts: Partial<Record<OutcomeKey, number>>): OutcomeKey | undefined {
   let best: OutcomeKey | undefined;
   let bestCount = 0;

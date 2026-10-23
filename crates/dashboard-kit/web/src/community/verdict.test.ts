@@ -9,7 +9,7 @@ import agentsNeverScreened from "../../tests/fixtures/community/scenarios/never-
 import agentsOlder from "../../tests/fixtures/community/scenarios/older-cli/agents.json";
 import page1 from "../../tests/fixtures/community/decisions-page-1.json";
 import { readAgentsFacts, readDecisionsPage, readHistory, type AgentFacts } from "./api";
-import { lastDays, overviewVerdict, recordCounts, spanWords, type Verdict, type VerdictInput } from "./verdict";
+import { lastDays, modeBox, overviewVerdict, recordCounts, spanWords, type Verdict, type VerdictInput } from "./verdict";
 import { ENFORCE_MEANS, MONITOR_MEANS } from "./words";
 
 const NOW = Date.parse("2026-09-29T14:05:00Z");
@@ -132,7 +132,8 @@ describe("the verdict band, row by row (spec 6.1)", () => {
     const verdict = overviewVerdict(input({ agents: readAgentsFacts(agentsNeverScreened).agents }));
     expect(verdict.row).toBe(6);
     expect(verdict.tone).toBe("unknown");
-    expect(verdict.headline).toBe("Connected, but nothing screened yet");
+    // Both were screened before their settings changed: not "yet".
+    expect(verdict.headline).toBe("Connected, but nothing screened since the settings changed");
     expect(verdict.lines).toEqual([
       "Nothing has come through the guard since Claude Code's settings changed at 14:04.",
       "Nothing has come through the guard since Codex's settings changed at 13:35.",
@@ -142,6 +143,7 @@ describe("the verdict band, row by row (spec 6.1)", () => {
     expect(verdict.action?.after).toBe("Then ask it to run any command. It shows here within seconds.");
     const never = overviewVerdict(input({ agents: [agent({ id: "claude-code", name: "Claude Code", mode: "enforce" })] }));
     expect(never.row).toBe(6);
+    expect(never.headline).toBe("Connected, but nothing screened yet");
     expect(never.lines).toEqual(["Nothing has come through the guard from Claude Code yet."]);
   });
 
@@ -168,6 +170,55 @@ describe("the verdict band, row by row (spec 6.1)", () => {
     expect(verdict.action?.steps).toHaveLength(1);
     expect(verdict.action?.steps[0].step.command).toBe("innerwarden enforce");
     expect(verdict.action?.steps[0].restarts.map((restart) => restart.agent)).toEqual(["Claude Code", "Cursor"]);
+  });
+
+  /**
+   * One monitor agent has its own switch and one does not: the per-agent
+   * steps cannot cover both, so the band falls back to the shared switch,
+   * with every connected agent's restart. FAILS ON REVERT of `every` to `some`.
+   */
+  it("7 falls back to the shared step when any recording agent has no switch of its own", () => {
+    const enforcing = agent({ id: "cursor", name: "Cursor", mode: "enforce", mechanism: "mcp", lastObservedAt: "2026-09-29T12:05:00Z" });
+    const withSwitch = { ...CLAUDE_SEEN, modeSteps: { enforce: { label: "To refuse a deny for this agent only:", command: "innerwarden agents connect claude-code", line: "Switches this agent to Enforce." } } };
+    const verdict = overviewVerdict(input({ agents: [enforcing, withSwitch, CODEX_SEEN] }));
+    expect(verdict.row).toBe(7);
+    expect(verdict.mixed).toBe(true);
+    expect(verdict.action?.steps.map(({ step }) => step.command)).toEqual(["innerwarden enforce"]);
+    expect(verdict.action?.steps[0].restarts.map((restart) => restart.agent)).toEqual(["Cursor", "Claude Code", "Codex"]);
+    const box = modeBox({ agents: [enforcing, withSwitch, CODEX_SEEN], failed: false, now: NOW, clock: UTC });
+    expect(box.row).toBe(7);
+    expect(box.mixed).toBe(true);
+    expect(box.action?.steps.map(({ step }) => step.command)).toEqual(["innerwarden enforce"]);
+    expect(box.action?.steps[0].restarts.map((restart) => restart.agent)).toEqual(["Cursor", "Claude Code", "Codex"]);
+    expect(box.action?.back?.command).toBe("innerwarden dry-run");
+  });
+
+  /**
+   * An agent whose hook or MCP config could not be read is set up to reach
+   * the guard: it is said by name as not read, never "No AI agent is
+   * connected yet" or "No supported agent was found". FAILS ON REVERT of the
+   * unread case (row 4).
+   */
+  it("3: an agent whose mode could not be read is said as not read, never as not connected", () => {
+    const unread = agent({ id: "codex", name: "Codex", mode: "unknown", mechanism: "mcp" });
+    const verdict = overviewVerdict(input({ agents: [unread] }));
+    expect(verdict.row).toBe(3);
+    expect(verdict.tone).toBe("unknown");
+    expect(verdict.headline).toBe("Could not read Codex's mode");
+    expect(verdict.action?.steps[0].step.command).toBe("innerwarden status");
+    expect(words(verdict)).not.toMatch(/No AI agent is connected|No supported agent was found|not connected/);
+    const box = modeBox({ agents: [unread], failed: false, now: NOW, clock: UTC });
+    expect(box.row).toBe(3);
+    expect(box.headline).toBe("Could not read Codex's mode");
+    expect(words(box)).not.toMatch(/No AI agent is connected/);
+    // Beside a connected agent, the band answers for that one and names the unread one.
+    const both = overviewVerdict(input({ agents: [CLAUDE_SEEN, unread] }));
+    expect(both.row).toBe(8);
+    expect(both.headline).toBe("Your AI agent is connected. Monitor: nothing is refused.");
+    expect(both.lines).toContain("Could not read Codex's mode: it is counted as neither connected nor off. innerwarden status says why.");
+    expect(modeBox({ agents: [CLAUDE_SEEN, unread], failed: false, now: NOW, clock: UTC }).lines).toContain(
+      "Could not read Codex's mode: it is counted as neither connected nor off. innerwarden status says why.",
+    );
   });
 
   it("7: an agent whose own wiring differs is never counted as refusing or as only recording", () => {

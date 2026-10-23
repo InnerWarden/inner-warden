@@ -69,6 +69,48 @@ test.describe("at a desk", () => {
     await expect(page).not.toHaveURL(/session=/);
   });
 
+  /**
+   * The arrow keys browse the list: each press opens the next decision and
+   * focus stays on the rows. FAILS ON REVERT: the detail took focus on every
+   * open and the arrows stopped after one or two presses.
+   */
+  test("three ArrowDown presses open three successive decisions, and focus stays on the rows", async ({ page }) => {
+    await page.goto("/?view=activity");
+    const rows = page.locator("[data-decision-row] a");
+    await expect(rows.first()).toBeVisible();
+    await rows.first().focus();
+    const opened: string[] = [];
+    for (let press = 0; press < 3; press += 1) {
+      await page.keyboard.press("ArrowDown");
+      await expect.poll(() => new URL(page.url()).searchParams.get("decision")).not.toBe(opened.at(-1) ?? null);
+      const id = new URL(page.url()).searchParams.get("decision")!;
+      opened.push(id);
+      await expect(page.locator(`section[data-decision="${id}"]`)).toBeVisible();
+      await expect.poll(() => page.evaluate(() => document.activeElement?.getAttribute("data-row-id"))).toBe(id);
+    }
+    expect(new Set(opened).size).toBe(3);
+    expect(await page.evaluate(() => document.activeElement?.id)).not.toBe("decision-title");
+  });
+
+  /** With no decision open the list takes the width at a desk, and a command shows three lines of itself. */
+  test("with nothing open, the list takes the width and the guide is a short aside", async ({ page }) => {
+    await page.goto("/?view=activity");
+    const panel = page.locator("#decisions-panel");
+    await expect(panel.locator("[data-decision-row]").first()).toBeVisible();
+    const width = (await panel.boundingBox())!.width;
+    expect(width).toBeGreaterThan(700);
+    await expect(page.locator('[data-detail-column="guide"]')).toBeVisible();
+    await expect(page.locator("[data-legend]")).toHaveCount(0);
+    await expect(page.locator('[data-outcome-bar][data-tour="legend"]')).toHaveCount(1);
+    const clamp = await panel.locator("[data-command-text]").first().evaluate((code) => getComputedStyle(code).webkitLineClamp);
+    expect(clamp).toBe("3");
+    // A decision opened: the list goes back to its column beside it.
+    await panel.locator("[data-decision-row] a").first().click();
+    await expect(page.locator('[data-detail-column="open"]')).toBeVisible();
+    expect((await panel.boundingBox())!.width).toBeLessThan(width);
+    await expect(page.locator("#decision-title")).toBeFocused();
+  });
+
   test("the list flows with the page, and the open decision stays in view beside it", async ({ page }) => {
     await page.goto(`/?view=activity&decision=${encodeURIComponent(CASE.wouldRefuse)}`);
     const detail = page.locator(`section[data-decision="${CASE.wouldRefuse}"]`);
@@ -131,7 +173,9 @@ test.describe("on a phone", () => {
   test("Escape closes the decision, and a link that opened it directly goes back to the list", async ({ page }) => {
     await page.goto(`/?view=activity&decision=${encodeURIComponent(CASE.refused)}`);
     const detail = page.locator(`section[data-decision="${CASE.refused}"]`);
-    await expect(detail.getByRole("heading", { level: 2 })).toBeFocused();
+    // Opened from a link: no focus move on a first load, and Escape still goes back.
+    await expect(detail.getByRole("heading", { level: 2 })).toBeVisible();
+    await expect(detail.getByRole("heading", { level: 2 })).not.toBeFocused();
     await page.keyboard.press("Escape");
     await expect(page).toHaveURL(/\?view=activity$/);
     await expect(page.locator("[data-decision-row]").first()).toBeVisible();
