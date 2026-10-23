@@ -3742,17 +3742,48 @@ where
 /// 1, the image ships no profile for bwrap, and the profile below makes
 /// `innerwarden contain` run.
 ///
+/// Ubuntu 26.04 ships its own profile for bwrap ([`DISTRO_BWRAP_PROFILE`],
+/// loaded as `bwrap`, granting it a user namespace): a plain `bwrap
+/// --unshare-user` ran there, yet the check looked only for a profile file
+/// of ours, refused, and printed a second profile named `bwrap` that replaced
+/// the distribution's once loaded (live gate of 0.17.0, C4). So a run asks
+/// bwrap itself ([`UsernsGrant::probed`]): whatever profile grants the user
+/// namespace, it got one, and nothing is said. Only a dry run, which runs
+/// nothing, goes by the files on disk, the distribution's included. Where
+/// bwrap is refused and the distribution's profile is on disk for this
+/// bwrap, the advice is to load that one, never a second profile over it.
+///
 /// Pure: the sysctl's text (or `None` where the file does not exist, every
-/// non-Ubuntu kernel), whether a bwrap profile is present on disk, and the
-/// bwrap path to name in the profile. `Some(lines)` means refuse and print.
+/// non-Ubuntu kernel), what is known of the grant, and the bwrap path to name
+/// in the profile. `Some(lines)` means refuse and print.
 pub fn userns_restriction_advice(
     sysctl: Option<&str>,
-    profile_on_disk: bool,
+    grant: UsernsGrant,
     bwrap: &Path,
 ) -> Option<Vec<String>> {
     let restricted = sysctl.map(|v| v.trim() == "1").unwrap_or(false);
-    if !restricted || profile_on_disk {
+    let granted = match grant.probed {
+        Some(got_one) => got_one,
+        None => grant.own_profile || grant.distro_profile,
+    };
+    if !restricted || granted {
         return None;
+    }
+    if grant.distro_profile && bwrap == Path::new(DISTRO_BWRAP_PATH) {
+        return Some(vec![
+            "innerwarden contain: this kernel restricts unprivileged user namespaces".into(),
+            "  (kernel.apparmor_restrict_unprivileged_userns = 1, the Ubuntu 24.04 default), and"
+                .into(),
+            format!(
+                "  {} was not granted one, so the jail cannot be built.",
+                bwrap.display()
+            ),
+            "".into(),
+            "  This distribution's own profile for bwrap grants it one once it is loaded:".into(),
+            format!("    sudo apparmor_parser -r {DISTRO_BWRAP_PROFILE}"),
+            "".into(),
+            RESTRICTION_ADVICE_END.into(),
+        ]);
     }
     let bwrap = bwrap.display();
     Some(vec![
@@ -3781,6 +3812,27 @@ pub fn userns_restriction_advice(
 /// The last line of [`userns_restriction_advice`]: what `contain` says to
 /// do once the profile is in place.
 pub const RESTRICTION_ADVICE_END: &str = "  Then run this command again. Nothing was run.";
+
+/// Ubuntu's own AppArmor profile for bwrap (24.04 and later), which grants
+/// `/usr/bin/bwrap` a user namespace once loaded.
+pub const DISTRO_BWRAP_PROFILE: &str = "/etc/apparmor.d/bwrap-userns-restrict";
+
+/// The bwrap [`DISTRO_BWRAP_PROFILE`] attaches to.
+pub const DISTRO_BWRAP_PATH: &str = "/usr/bin/bwrap";
+
+/// What the launcher knows of whether `bwrap` gets a user namespace on a
+/// kernel that restricts them ([`userns_restriction_advice`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UsernsGrant {
+    /// `bwrap` run once with a user namespace: it got one (`Some(true)`) or
+    /// was refused (`Some(false)`). `None`: not run (a dry run runs nothing),
+    /// or it could not be run or did not end.
+    pub probed: Option<bool>,
+    /// A profile of ours on disk (`/etc/apparmor.d/bwrap` or `usr.bin.bwrap`).
+    pub own_profile: bool,
+    /// This distribution's own profile on disk ([`DISTRO_BWRAP_PROFILE`]).
+    pub distro_profile: bool,
+}
 
 /// The pure half of `contain --identity`: read what bwrap reported, read what
 /// the host says about the jail process, and put the facts into a
@@ -5857,7 +5909,8 @@ mod tests {
         use std::path::Path;
         let bwrap = Path::new("/usr/bin/bwrap");
         // The measured stock Ubuntu 24.04 host: restricted, no profile.
-        let lines = userns_restriction_advice(Some("1\n"), false, bwrap).expect("advice");
+        let none = UsernsGrant::default();
+        let lines = userns_restriction_advice(Some("1\n"), none, bwrap).expect("advice");
         let text = lines.join("\n");
         assert!(
             text.contains("apparmor_restrict_unprivileged_userns"),
@@ -5874,16 +5927,78 @@ mod tests {
         );
         assert!(text.contains("Nothing was run"), "{text}");
         // With the profile on disk the jail builds: say nothing.
-        assert!(userns_restriction_advice(Some("1"), true, bwrap).is_none());
+        let own = UsernsGrant {
+            own_profile: true,
+            ..none
+        };
+        assert!(userns_restriction_advice(Some("1"), own, bwrap).is_none());
         // Sysctl off, or absent (every non-Ubuntu kernel): say nothing.
-        assert!(userns_restriction_advice(Some("0"), false, bwrap).is_none());
-        assert!(userns_restriction_advice(None, false, bwrap).is_none());
+        assert!(userns_restriction_advice(Some("0"), none, bwrap).is_none());
+        assert!(userns_restriction_advice(None, none, bwrap).is_none());
         // The profile names the resolved binary, not a guess.
         let other =
-            userns_restriction_advice(Some("1"), false, Path::new("/usr/local/bin/bwrap")).unwrap();
+            userns_restriction_advice(Some("1"), none, Path::new("/usr/local/bin/bwrap")).unwrap();
         assert!(other
             .join("\n")
             .contains("profile bwrap /usr/local/bin/bwrap"));
+    }
+
+    /// Ubuntu 26.04 (live gate of 0.17.0, C4): its own profile for bwrap is
+    /// loaded and grants a user namespace, and `contain` refused anyway and
+    /// printed a second profile named `bwrap` that replaced it. What bwrap
+    /// got when run decides, whatever the files: granted is nothing said,
+    /// refused is advice even with our profile on disk. A dry run goes by the
+    /// files, the distribution's included. Refused with the distribution's
+    /// profile on disk for this bwrap, the advice loads that one and never
+    /// writes another. FAILS ON REVERT of the probe (the 26.04 host refused)
+    /// or of the distribution's profile in the advice.
+    #[test]
+    fn what_bwrap_got_decides_and_the_distributions_profile_is_never_shadowed() {
+        use std::path::Path;
+        let bwrap = Path::new("/usr/bin/bwrap");
+        let distro = UsernsGrant {
+            distro_profile: true,
+            ..UsernsGrant::default()
+        };
+        // 26.04: the distribution's profile loaded, bwrap got one.
+        let ran = UsernsGrant {
+            probed: Some(true),
+            ..distro
+        };
+        assert!(userns_restriction_advice(Some("1"), ran, bwrap).is_none());
+        // A dry run, nothing run: the distribution's profile on disk counts.
+        assert!(userns_restriction_advice(Some("1"), distro, bwrap).is_none());
+        // Refused with the distribution's profile on disk: load that one.
+        let refused = UsernsGrant {
+            probed: Some(false),
+            ..distro
+        };
+        let text = userns_restriction_advice(Some("1"), refused, bwrap)
+            .expect("advice")
+            .join("\n");
+        assert!(
+            text.contains("sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict"),
+            "{text}"
+        );
+        assert!(!text.contains("profile bwrap"), "no second profile: {text}");
+        assert!(!text.contains("tee /etc/apparmor.d/bwrap"), "{text}");
+        // Refused with our own profile on disk (not loaded): said.
+        let own_refused = UsernsGrant {
+            probed: Some(false),
+            own_profile: true,
+            ..UsernsGrant::default()
+        };
+        assert!(userns_restriction_advice(Some("1"), own_refused, bwrap).is_some());
+        // The distribution's profile attaches to /usr/bin/bwrap only: another
+        // bwrap gets ours.
+        let elsewhere =
+            userns_restriction_advice(Some("1"), refused, Path::new("/usr/local/bin/bwrap"))
+                .expect("advice")
+                .join("\n");
+        assert!(
+            elsewhere.contains("profile bwrap /usr/local/bin/bwrap"),
+            "{elsewhere}"
+        );
     }
 
     // ---- `--identity`: argv, flag parse, the pure record parts ----
@@ -6762,7 +6877,11 @@ mod tests {
     fn a_dry_run_says_the_restriction_and_never_probes_where_it_applies() {
         use innerwarden_agent_guard::seccomp::Rules::{Identified, Terminal};
         use launch::{dry_run_filter, DryRunFilter};
-        let advice = userns_restriction_advice(Some("1\n"), false, Path::new("/usr/bin/bwrap"));
+        let advice = userns_restriction_advice(
+            Some("1\n"),
+            UsernsGrant::default(),
+            Path::new("/usr/bin/bwrap"),
+        );
         let said = dry_run_filter(advice.clone(), || {
             panic!("the probe is not started where the advice applies")
         });
