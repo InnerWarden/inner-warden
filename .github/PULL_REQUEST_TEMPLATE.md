@@ -8,7 +8,7 @@
 
 ## Checklist
 
-- [ ] `cargo fmt --all --check`, `cargo clippy --workspace -- -D warnings` and `cargo test --workspace` pass
+- [ ] `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test --workspace` pass
 - [ ] Tests in the same change as the code they cover
 - [ ] Every commit is signed off (`git commit -s`, see CONTRIBUTING.md)
 - [ ] No check is loosened to make a test pass (a rule, an allowlist, a deny)

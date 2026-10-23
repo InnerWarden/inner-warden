@@ -89,7 +89,7 @@ cargo install --git https://github.com/InnerWarden/inner-warden innerwarden
 
 No account. The guard itself sends nothing off the machine. The `curl | sh`
 installer sends one anonymous, opt-out install ping (version + OS + CPU arch
-only — no IP, no host data; set `INNERWARDEN_NO_TELEMETRY=1` to disable). A
+only: no IP, no host data; set `INNERWARDEN_NO_TELEMETRY=1` to disable). A
 `cargo install` or from-source build sends nothing at all.
 
 ## What it does
@@ -156,9 +156,11 @@ Whatever agent you run, there is a mechanism and a command for it:
 - **Anything with no cooperative surface** - run it isolated:
   `innerwarden contain -- <command>`.
 
-`innerwarden install` with no argument detects what is on the machine and prints
-the mechanism for each. Any agent with a pre-execution wrapper can also gate on
-the exit code directly: `innerwarden` exits non-zero on a deny.
+`innerwarden install` with no argument detects what is on the machine: it
+installs the hook for an agent that takes one (Claude Code), and otherwise
+prints the mechanism for each agent it found. Any agent with a pre-execution
+wrapper can also gate on the exit code directly: `innerwarden` exits non-zero
+on a deny.
 
 ## Agent identity and trust
 
@@ -186,7 +188,8 @@ tightens applies at every level. `innerwarden contain --identity -- <command>`
 
 ## Build from source
 
-Requires a stable Rust toolchain.
+Requires Rust; on the first build `rustup` installs the toolchain this repo
+pins (`rust-toolchain.toml`).
 
 ```sh
 cargo build --release

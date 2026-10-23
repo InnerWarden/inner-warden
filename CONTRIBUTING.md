@@ -26,14 +26,14 @@ you work, name it: `cargo test -p innerwarden-agent-guard` for the engine,
 
 ## Build and test
 
-InnerWarden is a Rust workspace. A stable Rust toolchain is all you
-need.
+InnerWarden is a Rust workspace. Rust is all you need: `rustup` installs
+the toolchain the repo pins (`rust-toolchain.toml`) on the first build.
 
 ```sh
 cargo build --release          # build the workspace
 cargo test --workspace         # run all tests
 cargo fmt --all --check        # confirm formatting
-cargo clippy --workspace -- -D warnings   # lint, warnings are errors
+cargo clippy --workspace --all-targets -- -D warnings   # lint, warnings are errors, as CI runs it
 ```
 
 Run all four locally and confirm they pass before you open a pull request.
