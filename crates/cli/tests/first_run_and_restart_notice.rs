@@ -181,7 +181,10 @@ fn a_mode_switch_says_how_to_restart_each_connected_agent() {
 #[test]
 fn install_says_how_to_restart_claude_code() {
     let home = tempfile::TempDir::new().unwrap();
+    // A configured Claude Code (an empty ~/.claude is no sign of it), so the
+    // run does not depend on a `claude` on this machine's PATH.
     std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+    std::fs::write(home.path().join(".claude/settings.json"), "{}\n").unwrap();
     let out = run(home.path(), &["install"]);
     assert!(
         out.contains("InnerWarden guard hook installed for claude-code"),
