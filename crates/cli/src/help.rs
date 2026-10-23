@@ -498,7 +498,15 @@ mod tests {
         ] {
             assert!(help.contains(said), "contain --help lacks {said:?}: {help}");
         }
-        let readme = flat(include_str!("../../../README.md"));
+        // The README and the two pages its detail moved to: the user docs.
+        let readme = flat(
+            &[
+                include_str!("../../../README.md"),
+                include_str!("../../../docs/features.md"),
+                include_str!("../../../docs/agent-identity.md"),
+            ]
+            .join("\n"),
+        );
         for said in [
             "On Linux, where the host takes it, every jail starts its programs under a seccomp filter that refuses `TIOCSTI` and `TIOCLINUX`, the terminal commands that push input into your terminal, and new btrfs or bcachefs subvolumes and snapshots.",
             "Its programs run with no capability, also when `contain` itself runs as root.",
@@ -544,7 +552,15 @@ mod tests {
         ] {
             assert!(help.contains(said), "contain --help lacks {said:?}: {help}");
         }
-        let readme = flat(include_str!("../../../README.md"));
+        // The README and the two pages its detail moved to: the user docs.
+        let readme = flat(
+            &[
+                include_str!("../../../README.md"),
+                include_str!("../../../docs/features.md"),
+                include_str!("../../../docs/agent-identity.md"),
+            ]
+            .join("\n"),
+        );
         for said in [
             "A review the hook would block on its line is still asked about, because the host may relax it",
             "your suppressions included, is made stricter only by a refusal of the host's own",
@@ -575,7 +591,15 @@ mod tests {
         ] {
             assert!(help.contains(said), "contain --help lacks {said:?}: {help}");
         }
-        let readme = flat(include_str!("../../../README.md"));
+        // The README and the two pages its detail moved to: the user docs.
+        let readme = flat(
+            &[
+                include_str!("../../../README.md"),
+                include_str!("../../../docs/features.md"),
+                include_str!("../../../docs/agent-identity.md"),
+            ]
+            .join("\n"),
+        );
         for said in [
             "`start = \"only_when_admitted\"`: `contain --identity` starts the agent only once Active Defence on the host has admitted the jail",
             "and exits 2 with nothing started",
@@ -612,7 +636,15 @@ mod tests {
             assert!(help.contains(said), "contain --help lacks {said:?}: {help}");
         }
         assert!(!help.contains("stays outside"), "{help}");
-        let readme = flat(include_str!("../../../README.md"));
+        // The README and the two pages its detail moved to: the user docs.
+        let readme = flat(
+            &[
+                include_str!("../../../README.md"),
+                include_str!("../../../docs/features.md"),
+                include_str!("../../../docs/agent-identity.md"),
+            ]
+            .join("\n"),
+        );
         for said in [
             "An identified Linux jail keeps Claude Code's own state in the `~/.claude` it already shares with you.",
             "In the jail it now leads to `~/.claude/.claude.json`",
@@ -701,7 +733,15 @@ mod tests {
         ] {
             assert!(help.contains(said), "contain --help lacks {said:?}: {help}");
         }
-        let readme = flat(include_str!("../../../README.md"));
+        // The README and the two pages its detail moved to: the user docs.
+        let readme = flat(
+            &[
+                include_str!("../../../README.md"),
+                include_str!("../../../docs/features.md"),
+                include_str!("../../../docs/agent-identity.md"),
+            ]
+            .join("\n"),
+        );
         for said in [
             "Where a place the jail hides is a link, the jail hides the place it leads to:",
             "On Linux that place is covered wherever a folder the jail shows holds it, and each folder the jail writes between the cover and your home is a mount point of its own, so a program in the jail can neither read the place nor rename it away from the name your link uses; a dotdir's place that is not there yet is made first, empty and 0700, so nothing the agent writes there reaches it (a `--deny-read` path that is not there is not hidden). On macOS it is denied, read and write, also outside your home, and each folder above it that the jail may write, the project included, is closed to renaming and removal (the jail still writes in it).",

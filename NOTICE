@@ -14,13 +14,13 @@ Rules project:
 
     https://github.com/Agent-Threat-Rule/agent-threat-rules
     Copyright (c) 2026 ATR Contributors
-    MIT License (see LICENSE-MIT)
+    MIT License (see LICENSES/ATR-MIT.txt)
 
 They were taken from that project's tree at commit efad113 (2026-03-26,
 "v0.4.0 — 71 rules"), and some have since been modified here. Each rule file
 carries its original `author:` line.
 
-LICENSE-MIT in this repository carries the MIT copyright and permission notice
+LICENSES/ATR-MIT.txt (LICENSE-MIT until 1.6.2) carries the MIT copyright and permission notice
 for that material. It applies to the rule files under `rules/atr/`. Everything
 else in this repository, including the engine that loads them, is Apache-2.0
 under LICENSE.
