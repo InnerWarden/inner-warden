@@ -58,3 +58,12 @@
 [data-pill="exposed"] { color: var(--iw-deny-ink); background: var(--iw-deny-bg); border-color: #fecdd3; }
 [data-pill="off"], [data-pill="not_available"] { color: var(--iw-ink-3); background: var(--iw-surface); border-color: var(--iw-line); }
 [data-pill="unknown"] { color: var(--iw-ink-2); background: var(--iw-surface); border: 1px dashed var(--iw-line-strong); }
+
+/*
+ * The shared lane tabs on Decisions are 44 px tall under a coarse pointer on
+ * a Community page. Here rather than in the shared file, so a bundle that
+ * composes the kit pays nothing for it.
+ */
+@media (pointer: coarse) {
+  [role="tab"][data-lane] { min-height: 44px; }
+}

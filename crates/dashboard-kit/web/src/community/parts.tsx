@@ -167,7 +167,7 @@ export function CopyCommand({
           type="button"
           onClick={onCopy}
           aria-label={`Copy command: ${command}`}
-          className="shrink-0 rounded-md border border-slate-300 bg-white px-2 py-1 text-xs font-semibold text-slate-700 hover:bg-slate-100"
+          className="shrink-0 rounded-md border border-slate-300 bg-white px-2 py-1 text-xs font-semibold text-slate-700 hover:bg-slate-100 pointer-coarse:min-h-11 pointer-coarse:px-3"
         >
           {copied ? "Copied" : "Copy"}
         </button>

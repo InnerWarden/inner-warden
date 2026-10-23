@@ -333,7 +333,7 @@ function AroundIt({
           return (
             <li key={row.id}>
               {row.id !== item.id && row.flagged ? (
-                <button type="button" onClick={() => onOpen(row.id)} className="block w-full min-w-0 text-left hover:bg-(--iw-surface-2)">{body}</button>
+                <button type="button" onClick={() => onOpen(row.id)} className="block w-full min-w-0 text-left hover:bg-(--iw-surface-2) pointer-coarse:min-h-11">{body}</button>
               ) : (
                 body
               )}
@@ -377,7 +377,7 @@ function CopyValue({ value, what }: { value: string; what: string }) {
     }
   };
   return (
-    <button type="button" onClick={copy} aria-label={`Copy ${what}: ${value}`} className={`ml-2 text-xs ${LINK_TEXT}`}>
+    <button type="button" onClick={copy} aria-label={`Copy ${what}: ${value}`} className={`ml-2 text-xs pointer-coarse:min-h-11 ${LINK_TEXT}`}>
       <span aria-live="polite">{copied ? "Copied" : "Copy"}</span>
     </button>
   );

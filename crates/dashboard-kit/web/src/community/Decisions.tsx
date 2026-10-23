@@ -477,7 +477,7 @@ function Chip({ label, onRemove, what }: { label: ReactNode; onRemove: () => voi
   return (
     <span data-filter-chip={what} className={`inline-flex max-w-full items-center gap-1 rounded-full border border-(--iw-line-strong) bg-(--iw-surface) py-0.5 pr-1 pl-2.5 ${SMALL_TEXT} text-(--iw-ink-2)`}>
       <span className="min-w-0 truncate">{label}</span>
-      <button type="button" onClick={onRemove} aria-label={`Remove the ${what} filter`} className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-(--iw-ink-3) hover:bg-(--iw-surface-2) hover:text-(--iw-ink)">
+      <button type="button" onClick={onRemove} aria-label={`Remove the ${what} filter`} className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-(--iw-ink-3) hover:bg-(--iw-surface-2) hover:text-(--iw-ink) pointer-coarse:h-11 pointer-coarse:w-11">
         <span aria-hidden="true">×</span>
       </button>
     </span>
@@ -543,7 +543,7 @@ function NewestList({
     ) : (
       <NotRead alert>
         That filter is not valid here ({code}).{" "}
-        <button type="button" onClick={() => onQuery({})} className={LINK_TEXT}>Clear filters</button>
+        <button type="button" onClick={() => onQuery({})} className={`min-h-9 pointer-coarse:min-h-11 ${LINK_TEXT}`}>Clear filters</button>
       </NotRead>
     );
   }
@@ -566,7 +566,7 @@ function NewestList({
         <p className={META_TEXT}>
           <span data-hidden-summary className="font-medium text-(--iw-ink-2)">{formatCount(data.total)} flagged without {hidden}.</span>{" "}
           Hidden from this list only; the guard still flags them.{" "}
-          <button type="button" onClick={() => onHide(undefined)} className={LINK_TEXT}>Show them again</button>
+          <button type="button" onClick={() => onHide(undefined)} className={`min-h-9 pointer-coarse:min-h-11 ${LINK_TEXT}`}>Show them again</button>
         </p>
       )}
       <div data-tour="legend"><Legend outcomes={OUTCOME_FILTERS} /></div>
@@ -579,7 +579,7 @@ function NewestList({
         {data.items.length === 0 ? (
           <div className={`space-y-1 p-2 ${BODY_TEXT}`}>
             <p data-empty-list>{emptyListWords(data, filtered || query.reasonNot !== undefined)}</p>
-            {filtered && data.total === 0 ? <button type="button" onClick={clear} className={LINK_TEXT}>Clear filters</button> : null}
+            {filtered && data.total === 0 ? <button type="button" onClick={clear} className={`min-h-9 pointer-coarse:min-h-11 ${LINK_TEXT}`}>Clear filters</button> : null}
             {!filtered && data.record.decisions === 0 ? <a href="?view=agents" className={LINK_TEXT}>See Agents</a> : null}
           </div>
         ) : (
