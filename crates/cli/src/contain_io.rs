@@ -1884,13 +1884,74 @@ pub(crate) fn jail_backend() -> Option<&'static str> {
 /// before it builds one: `None` without a backend it trusts (as
 /// [`jail_backend`]); otherwise `Ok`, or the lines `contain` says and stops
 /// on (on Linux, a kernel that restricts unprivileged user namespaces and
-/// a bwrap with no profile that grants it one).
+/// a bwrap with no profile that grants it one). On macOS, finding
+/// `sandbox-exec` is not a check: it starts one sandboxed `true`
+/// ([`sandbox_exec_starts`]), so "ready" is said only for a sandbox that
+/// started here (one already inside a sandbox cannot start another).
 pub(crate) fn jail_start_here() -> Option<Result<(), Vec<String>>> {
     if cfg!(target_os = "linux") {
         let bwrap = resolve_backend(BWRAP_PATHS)?;
         Some(restriction_advice(&bwrap, true).map_or(Ok(()), Err))
+    } else if cfg!(target_os = "macos") {
+        let sandbox = resolve_backend(&["/usr/bin/sandbox-exec"])?;
+        Some(sandbox_start_answer(sandbox_exec_starts(&sandbox)))
     } else {
         jail_backend().map(|_| Ok(()))
+    }
+}
+
+/// The profile of the test start: it allows everything, so what it measures
+/// is that `sandbox-exec` can put a process in a sandbox here at all.
+const SANDBOX_TEST_PROFILE: &str = "(version 1)(allow default)";
+
+/// Run `/usr/bin/true` under `sandbox-exec` once: `Some((exited 0, the
+/// first line it said on stderr))`, or `None` when it could not be started
+/// or did not end within 5 s (killed).
+fn sandbox_exec_starts(sandbox: &Path) -> Option<(bool, String)> {
+    let mut child = Command::new(sandbox)
+        .args(["-p", SANDBOX_TEST_PROFILE, "/usr/bin/true"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut said = String::new();
+                if let Some(mut stderr) = child.stderr.take() {
+                    let _ = std::io::Read::read_to_string(&mut stderr, &mut said);
+                }
+                let first = said.lines().next().unwrap_or("").trim().to_string();
+                return Some((status.success(), first));
+            }
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
+/// What the test start of `sandbox-exec` says: ready only when it ran and
+/// exited 0; otherwise the line a person reads, with what it said. Pure.
+fn sandbox_start_answer(outcome: Option<(bool, String)>) -> Result<(), Vec<String>> {
+    match outcome {
+        Some((true, _)) => Ok(()),
+        Some((false, said)) if !said.is_empty() => Err(vec![format!(
+            "sandbox-exec could not start a sandboxed process here: {said}"
+        )]),
+        Some((false, _)) => Err(vec![
+            "sandbox-exec could not start a sandboxed process here.".to_string(),
+        ]),
+        None => Err(vec![
+            "sandbox-exec did not start a sandboxed process within 5 seconds here.".to_string(),
+        ]),
     }
 }
 
@@ -3644,6 +3705,43 @@ fn print_plan_env(env: &[(String, String)]) {
 
 #[cfg(test)]
 mod tests {
+    /// Finding `sandbox-exec` is not a check: ready only when a sandboxed
+    /// `true` ran and exited 0; a failed or hung start says so, with what
+    /// `sandbox-exec` said. FAILS ON REVERT to the lookup alone (every macOS
+    /// read "Ready" with no start made).
+    #[test]
+    fn a_macos_jail_is_ready_only_when_a_sandbox_started() {
+        assert_eq!(sandbox_start_answer(Some((true, String::new()))), Ok(()));
+        assert_eq!(
+            sandbox_start_answer(Some((false, "sandbox-exec: sandbox_apply: Operation not permitted".into()))),
+            Err(vec!["sandbox-exec could not start a sandboxed process here: sandbox-exec: sandbox_apply: Operation not permitted".to_string()])
+        );
+        assert_eq!(
+            sandbox_start_answer(Some((false, String::new()))),
+            Err(vec![
+                "sandbox-exec could not start a sandboxed process here.".to_string()
+            ])
+        );
+        assert_eq!(
+            sandbox_start_answer(None),
+            Err(vec![
+                "sandbox-exec did not start a sandboxed process within 5 seconds here.".to_string()
+            ])
+        );
+    }
+
+    /// On a Mac the check starts a real sandbox, and its answer is a check
+    /// that ran: never the bare lookup's `Ok` for a start that failed.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_macos_jail_check_starts_a_sandbox() {
+        let Some(sandbox) = resolve_backend(&["/usr/bin/sandbox-exec"]) else {
+            return;
+        };
+        let outcome = sandbox_exec_starts(&sandbox).expect("sandbox-exec answers within 5 s");
+        assert_eq!(jail_start_here(), Some(sandbox_start_answer(Some(outcome))));
+    }
+
     use super::*;
 
     /// Set in a child these tests start: what it answers.

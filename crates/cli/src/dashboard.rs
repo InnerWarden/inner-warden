@@ -1480,25 +1480,21 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
                     second_opinion_provider: crate::second_opinion_io::provider(),
                     suppress: crate::suppress_io::current(),
                     flagged,
-                    jail_check: read_jail_check(jail_check.as_ref()),
+                    // Filled from the worker's result by `protection_body`.
+                    jail_check: None,
                 };
-                request.respond(json_response(
-                    crate::dashboard_community::protection_json(&facts).to_string(),
-                ))
+                request.respond(json_response(protection_body(facts, jail_check.as_ref())))
             }
             "/api/guard/suppress" => {
                 let log = community.log();
                 let (config, dropped) = crate::suppress_io::current_with_ignored();
-                let facts = crate::dashboard_community::SuppressFacts {
-                    now_ms: now_ms(),
+                request.respond(json_response(suppress_body(
                     exposed,
-                    config: &config,
-                    dropped: &dropped,
-                    log: &log,
-                };
-                request.respond(json_response(
-                    crate::dashboard_community::suppress_json(&facts).to_string(),
-                ))
+                    &config,
+                    &dropped,
+                    &log,
+                    now_ms(),
+                )))
             }
             "/api/guard/sessions" => {
                 request.respond(sessions_response(|| community.graph(), &query, now_ms()))
@@ -1783,6 +1779,38 @@ fn sessions_limit(query: &str) -> Result<usize, &'static str> {
     }
 }
 
+/// `GET /api/guard/protection`, as a body: the host's facts with the jail
+/// check the background worker last made, read here, so the route cannot
+/// answer "not checked here yet" for a check that ran. Pure but for the read
+/// of `jail`.
+fn protection_body(
+    mut facts: crate::dashboard_community::ProtectionFacts,
+    jail: Option<&SharedJailCheck>,
+) -> String {
+    facts.jail_check = read_jail_check(jail);
+    crate::dashboard_community::protection_json(&facts).to_string()
+}
+
+/// `GET /api/guard/suppress`, as a body. `exposed` is whether this dashboard
+/// answers on the network: then every list is withheld and only the counts
+/// are served. Pure.
+fn suppress_body(
+    exposed: bool,
+    config: &crate::suppress::SuppressConfig,
+    dropped: &[String],
+    log: &crate::dashboard_community::EventLog,
+    now_ms: u64,
+) -> String {
+    crate::dashboard_community::suppress_json(&crate::dashboard_community::SuppressFacts {
+        now_ms,
+        exposed,
+        config,
+        dropped,
+        log,
+    })
+    .to_string()
+}
+
 /// `GET /api/guard/sessions`, as a status and a body. Pure.
 fn sessions_body(graph: &innerwarden_graph::Graph, query: &str, now_ms: u64) -> (u16, String) {
     match sessions_limit(query) {
@@ -2034,6 +2062,85 @@ mod fixtures;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The suppress route's body, as the route builds it: open to the network,
+    /// every list is withheld and only the counts are served. FAILS ON REVERT
+    /// of `exposed` in the body (the patterns reach the network).
+    #[test]
+    fn suppress_route_body_withholds_every_list_when_exposed() {
+        let config = crate::suppress::SuppressConfig {
+            allow: vec!["npm run * --silent".into()],
+            mute_rules: vec!["ATR-2026-030".into()],
+            mute_categories: vec!["data-poisoning".into()],
+        };
+        let dropped = vec!["*".to_string()];
+        let log = crate::dashboard_community::parse_event_log("");
+        let exposed: serde_json::Value =
+            serde_json::from_str(&suppress_body(true, &config, &dropped, &log, 1)).unwrap();
+        assert_eq!(exposed["withheld"], "exposed");
+        for list in ["allow", "dropped", "mute_rules", "mute_categories"] {
+            assert_eq!(exposed[list], serde_json::json!([]), "{list}");
+        }
+        assert_eq!(exposed["counts"]["allow"], 1);
+        let text = exposed.to_string();
+        assert!(
+            !text.contains("npm run") && !text.contains("ATR-2026-030"),
+            "{text}"
+        );
+        let local: serde_json::Value =
+            serde_json::from_str(&suppress_body(false, &config, &dropped, &log, 1)).unwrap();
+        assert_eq!(local["withheld"], serde_json::Value::Null);
+        assert_eq!(local["allow"].as_array().unwrap().len(), 1);
+    }
+
+    fn host_facts() -> crate::dashboard_community::ProtectionFacts {
+        crate::dashboard_community::ProtectionFacts {
+            now_ms: 1_790_000_000_000,
+            os: "linux",
+            recording: true,
+            outage_since_unix: None,
+            lost_actions: None,
+            jail_backend: Some("bwrap"),
+            observe_installed: false,
+            openclaw_present: false,
+            alert_channels: 0,
+            second_opinion_provider: None,
+            suppress: crate::suppress::SuppressConfig::default(),
+            flagged: None,
+            jail_check: None,
+        }
+    }
+
+    /// The protection route's body reads the jail check the worker made:
+    /// "not checked here yet" only until it answers. FAILS ON REVERT of the
+    /// read (AI Jail read "Not checked here yet" forever).
+    #[test]
+    fn protection_route_body_reads_the_workers_jail_check() {
+        let shared = jail_check_initial();
+        let before: serde_json::Value =
+            serde_json::from_str(&protection_body(host_facts(), Some(&shared))).unwrap();
+        assert_eq!(before["jail"]["checks_pass"], serde_json::Value::Null);
+        *shared.write().unwrap() = Some(crate::dashboard_community::jail_check(
+            Some(Ok(())),
+            1_790_000_000_000,
+        ));
+        let after: serde_json::Value =
+            serde_json::from_str(&protection_body(host_facts(), Some(&shared))).unwrap();
+        assert_eq!(after["jail"]["checks_pass"], true);
+        let failed =
+            crate::dashboard_community::jail_check(Some(Err(vec!["a check stopped it".into()])), 1);
+        *shared.write().unwrap() = Some(failed);
+        let stopped: serde_json::Value =
+            serde_json::from_str(&protection_body(host_facts(), Some(&shared))).unwrap();
+        assert_eq!(stopped["jail"]["checks_pass"], false);
+        assert_eq!(
+            stopped["jail"]["advice"],
+            serde_json::json!(["a check stopped it"])
+        );
+        let none: serde_json::Value =
+            serde_json::from_str(&protection_body(host_facts(), None)).unwrap();
+        assert_eq!(none["jail"]["checks_pass"], serde_json::Value::Null);
+    }
 
     fn args(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()

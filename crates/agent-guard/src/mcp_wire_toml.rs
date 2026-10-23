@@ -242,8 +242,9 @@ fn for_each_server(doc: &mut DocumentMut, mut f: impl FnMut(&mut Table) -> bool)
 }
 
 /// The TOML twin of [`crate::mcp_wire::server_counts`]: the servers under
-/// `[mcp_servers]`, counted by how the proxy can reach them. A server with no
-/// local command that names a `url` is remote. Pure.
+/// `[mcp_servers]`, counted by how the proxy can reach them. Every server
+/// with no local command is remote, whatever names its address: the proxy
+/// never sees its calls. Pure.
 pub fn server_counts_toml(doc: &DocumentMut) -> crate::mcp_wire::ServerCounts {
     let (stdio, wrapped) = counts(doc);
     let remote = doc
@@ -253,12 +254,7 @@ pub fn server_counts_toml(doc: &DocumentMut) -> crate::mcp_wire::ServerCounts {
             servers
                 .iter()
                 .filter_map(|(_name, item)| item.as_table())
-                .filter(|t| {
-                    !is_stdio_server(t)
-                        && t.get("url")
-                            .and_then(Item::as_str)
-                            .is_some_and(|url| !url.trim().is_empty())
-                })
+                .filter(|t| !is_stdio_server(t))
                 .count()
         })
         .unwrap_or(0);
@@ -468,17 +464,21 @@ args = ["repl.js"]
 
 [mcp_servers.docs]
 url = "https://example.com/mcp"
+
+[mcp_servers.streamed]
+httpUrl = "https://example.com/stream"
 "#;
         let json_cfg = serde_json::json!({"mcpServers": {
             "icm": {"command": "npx", "args": ["-y", "some-server"]},
             "node_repl": {"command": "node", "args": ["repl.js"]},
-            "docs": {"url": "https://example.com/mcp"}
+            "docs": {"url": "https://example.com/mcp"},
+            "streamed": {"httpUrl": "https://example.com/stream"}
         }});
         let mut doc: DocumentMut = toml_text.parse().expect("toml");
         let expected = crate::mcp_wire::ServerCounts {
             stdio: 2,
             wrapped: 0,
-            remote: 1,
+            remote: 2,
         };
         assert_eq!(server_counts_toml(&doc), expected);
         assert_eq!(crate::mcp_wire::server_counts(&json_cfg), expected);

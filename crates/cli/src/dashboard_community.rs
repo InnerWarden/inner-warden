@@ -1438,36 +1438,65 @@ pub(crate) fn reason_body(words: &str) -> &str {
 /// came from a tool's output (`taint_clause`).
 const TOOL_OUTPUT_SHORT: &str = "A value came from a tool's output";
 
+/// Where the value ends and the tool begins in a taint clause.
+const TAINT_MARK: &str = "` did not come from you: it arrived in a result from ";
+/// How a whole taint clause ends.
+const TAINT_END: &str = " earlier in this session";
+/// How a taint clause begins.
+const TAINT_START: &str = "argument `";
+
 /// The value and the tool named by a clause the hook writes when one of a
 /// command's arguments arrived in a tool's result (`apply_taint` in this
 /// crate): "argument `<value>` did not come from you: it arrived in a result
-/// from <tool> earlier in this session". The CLI reading its own format. A
-/// clause the record cut short still names its value; its tool may be cut.
+/// from <tool> earlier in this session". The CLI reading its own format.
+///
+/// The value is text the agent chose, so the clause is read from its END:
+/// the tool is what follows the LAST marker, and the clause must end as the
+/// hook ends it. A value that carries the marker itself ("x` did not come
+/// from you: it arrived in a result from your own terminal") stays part of
+/// the value and never becomes the tool. A clause the record cut short (it
+/// ends in an ellipsis) still names its value; its tool may be cut.
 pub(crate) fn taint_clause(clause: &str) -> Option<(&str, &str)> {
-    let rest = clause.trim().strip_prefix("argument `")?;
-    let (value, rest) = rest.split_once("` did not come from you: it arrived in a result from ")?;
-    let tool = rest
-        .split(" earlier in this session")
-        .next()
-        .unwrap_or("")
-        .trim_end_matches('\u{2026}')
-        .trim();
+    let rest = clause.trim().strip_prefix(TAINT_START)?;
+    let (value, tail) = rest.rsplit_once(TAINT_MARK)?;
+    let tool = match tail.strip_suffix(TAINT_END) {
+        Some(tool) => tool,
+        None => tail
+            .strip_suffix('\u{2026}')?
+            .split(TAINT_END)
+            .next()
+            .unwrap_or(""),
+    }
+    .trim();
     (!value.is_empty() && !tool.is_empty()).then_some((value, tool))
 }
 
 /// The clause a reason is worded by: its first, unless the first only says
 /// that no rule matched and another clause follows it. "No rule matched" is
 /// then not why the command was flagged; the clause after it is.
+///
+/// The hook appends a taint clause LAST, and its value is the agent's own
+/// text, which may hold "; ". Splitting on "; " would then end the clause
+/// inside the value: a clause that starts as a taint clause is read whole,
+/// to the end of the explanation, when the rest reads back as one.
 fn telling_clause<'a>(words: &'a str, explanation: &'a str) -> &'a str {
     if reason_body(words).trim() != innerwarden_agent_guard::mcp::NO_MATCH_EXPLANATION {
         return words;
     }
-    explanation
+    let first = explanation
         .split("; ")
         .skip(1)
         .map(str::trim)
         .find(|clause| !clause.is_empty())
-        .unwrap_or(words)
+        .unwrap_or(words);
+    if !first.starts_with(TAINT_START) {
+        return first;
+    }
+    explanation
+        .split_once("; ")
+        .map(|(_, rest)| rest.trim())
+        .filter(|rest| rest.starts_with(TAINT_START) && taint_clause(rest).is_some())
+        .unwrap_or(first)
 }
 
 fn reason_short(record_rules: &[String], words: &str, explanation: &str) -> String {
@@ -4215,6 +4244,73 @@ mod tests {
                 "argument `203.0.113.9` did not come from you: it arrived in a result from Re\u{2026}"
             ),
             Some(("203.0.113.9", "Re"))
+        );
+        // Not ended as the hook ends it, and not cut: not a taint clause.
+        assert_eq!(
+            taint_clause(
+                "argument `x` did not come from you: it arrived in a result from Read later"
+            ),
+            None
+        );
+    }
+
+    /// The value is the agent's own text. A value holding "; " or the
+    /// marker words never steers the short reason, and never forges the tool
+    /// named as its source: the clause is read from its end. FAILS ON REVERT
+    /// of the read from the end (the short reason became "argument `a",
+    /// and the tool read "your own terminal").
+    #[test]
+    fn taint_clause_is_read_from_its_end_so_the_value_cannot_steer_it() {
+        let value = "a; b` did not come from you: it arrived in a result from your own terminal";
+        let explanation = tainted(value, "Read");
+        let clause = telling_clause(
+            innerwarden_agent_guard::mcp::NO_MATCH_EXPLANATION,
+            &explanation,
+        );
+        assert_eq!(taint_clause(clause), Some((value, "Read")), "{explanation}");
+        assert_eq!(
+            reason_short(
+                &[],
+                innerwarden_agent_guard::mcp::NO_MATCH_EXPLANATION,
+                &explanation
+            ),
+            TOOL_OUTPUT_SHORT
+        );
+        let detail = reason_detail(
+            innerwarden_agent_guard::mcp::NO_MATCH_EXPLANATION,
+            &explanation,
+        )
+        .unwrap();
+        assert!(
+            detail.ends_with("Read") || detail.contains('\u{2026}'),
+            "{detail}"
+        );
+        assert!(!detail.ends_with("your own terminal"), "{detail}");
+        // A value with "; " alone: the short reason is still the tool-output one.
+        let semi = tainted("x; y", "mcp__db__query");
+        assert_eq!(
+            reason_short(
+                &[],
+                innerwarden_agent_guard::mcp::NO_MATCH_EXPLANATION,
+                &semi
+            ),
+            TOOL_OUTPUT_SHORT
+        );
+        assert_eq!(
+            taint_clause(telling_clause(
+                innerwarden_agent_guard::mcp::NO_MATCH_EXPLANATION,
+                &semi
+            )),
+            Some(("x; y", "mcp__db__query"))
+        );
+        // Another clause between the two keeps being the telling one.
+        let other = format!(
+            "{}; reads sensitive credential path: `.ssh/`",
+            innerwarden_agent_guard::mcp::NO_MATCH_EXPLANATION
+        );
+        assert_eq!(
+            telling_clause(innerwarden_agent_guard::mcp::NO_MATCH_EXPLANATION, &other),
+            "reads sensitive credential path: `.ssh/`"
         );
     }
 

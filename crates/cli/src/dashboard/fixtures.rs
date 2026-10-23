@@ -965,6 +965,31 @@ pub(super) fn scenarios() -> Vec<(&'static str, Vec<(&'static str, Value)>)> {
                 "not_configured",
             ))),
         ),
+        // Every connected agent in monitor and seen working: the default
+        // state, verdict row 8, with three agents' restart words in the band.
+        (
+            "monitor",
+            differ(scene_files(&scene(
+                vec![
+                    agent("claude-code", "monitor", Hook, Some(3 * HOUR), None),
+                    agent(
+                        "codex",
+                        "monitor",
+                        McpToml,
+                        Some(DAY),
+                        Some(counts(3, 3, 1)),
+                    ),
+                    agent(
+                        "cursor",
+                        "monitor",
+                        McpJson,
+                        Some(2 * DAY),
+                        Some(counts(2, 2, 0)),
+                    ),
+                ],
+                "monitor",
+            ))),
+        ),
         (
             "never-screened",
             differ(scene_files(&scene(
