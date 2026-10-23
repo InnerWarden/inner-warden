@@ -375,6 +375,13 @@ jobs:
       - name: Committed bundle must match its sources
         run: npm run bundle:check
 
+      # A composing build leaves the Community pages out of its stylesheet and
+      # has little CSS room: a utility a shared file starts to use is paid for
+      # there. This fails when the stylesheet the shared files produce changes
+      # from the committed baseline.
+      - name: Shared stylesheet must not grow
+        run: npm run css:shared
+
       - name: Bundle must not be built out of its own output
         run: npm run bundle:reproducible
 
