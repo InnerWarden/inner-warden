@@ -125,8 +125,16 @@ test.describe("CJC-090-J003 reviewed and unreviewed integration sessions", () =>
 
   test("the Overview's Agents tile counts what the rows count and names who needs you", async ({ page }) => {
     await page.goto("/");
-    const tile = page.locator("#on-machine-title").locator("..");
-    await expect(tile).toContainText("1 of 2");
-    await expect(tile.locator("[data-needs-you]")).toHaveText(/1 partly connected: Partial MCP wrapper/);
+    // The band names who needs you, with the CLI's own step for it.
+    const band = page.locator("[data-verdict-row]");
+    await expect(band).toHaveAttribute("data-verdict-row", "5");
+    await expect(band.getByRole("heading", { level: 1 })).toHaveText(/Partial MCP wrapper is only partly connected/);
+    await expect(band.locator("[data-command]")).toHaveText("innerwarden agents connect partial-wrapper");
+    // The strip lists the two the rows list as connected, and not the leftover configuration.
+    const strip = page.locator("#overview-agents");
+    await expect(strip.locator("[data-agent-row]")).toHaveCount(2);
+    await expect(strip.locator('[data-agent-row="partial-wrapper"] [data-pill="needs"]')).toHaveText(/Partly connected/);
+    await expect(strip.locator('[data-agent-row="claude-code"] [data-pill="enforce"]')).toHaveText(/Enforce/);
+    await expect(strip).not.toContainText("OpenClaw");
   });
 });

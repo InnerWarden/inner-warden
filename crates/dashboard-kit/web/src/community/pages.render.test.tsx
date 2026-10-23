@@ -58,6 +58,9 @@ const { Notices } = await import("./Notices");
 const { HeaderStatus } = await import("./HeaderStatus");
 const { COMMUNITY_SHELL } = await import("./shell");
 
+/** The fixture's denies, newest first: what `verdict=deny` answers. */
+const DENIES = page1.items.filter((item) => item.recommendation === "deny");
+
 const META: DashboardMeta = { version: "1.5.0", exposed: false, edition: "community", guardrail: { mode: "partial", guarded_agents: 3 } };
 
 function context(search = "", meta: DashboardMeta = META, os = "macos"): CommunityScreenContext {
@@ -76,6 +79,8 @@ function seed() {
   answers.set("overview", overviewFixture);
   answers.set("overview-record", overviewFixture);
   answers.set("recent-flagged", readDecisionsPage({ ...page1, items: page1.items.slice(0, 15) }));
+  answers.set("overview-denies", readDecisionsPage({ ...page1, items: DENIES.slice(0, 3), total: DENIES.length }));
+  answers.set("overview-flagged", readDecisionsPage({ ...page1, items: page1.items.slice(0, 1) }));
   answers.set("decisions", readDecisionsPage(page1));
   answers.set("flagged-count", readDecisionsPage(page1));
   answers.set("agents", agentsFixture);
@@ -215,7 +220,6 @@ describe("the colour jobs, on every Community page", () => {
   it("sees the technical view's spec sheets, and they are neutral", () => {
     setTechnicalDetail(true);
     for (const [html, panel] of [
-      [render(<CommunityOverview context={context()} />), "Agents on this machine"],
       [render(<CommunityAgents />), "Agents on this machine"],
       [render(<CommunityTokens />), "Tokens observed"],
     ] as const) {
@@ -274,125 +278,127 @@ describe("the header", () => {
   });
 });
 
+const overviewHtml = (search = "", meta: DashboardMeta = META) => render(<CommunityOverview context={context(search, meta)} />);
+
 describe("the Overview", () => {
-  it("leads with what the agent did, then messages, then what Community does not watch", () => {
-    const html = render(<CommunityOverview context={context()} />);
-    const order = ["agent_actions", "agent_messages", "server_attacks"].map((lane) => html.indexOf(`data-lane="${lane}"`));
-    expect(order).toEqual([...order].sort((a, b) => a - b));
-    expect(html).toContain("From this machine&#x27;s own records.");
-    expect(html).toContain("See the flagged commands");
+
+  /** FAILS ON REVERT: the band, the two numbers and the step are the page's first three things. */
+  it("answers the three questions first: the band and its one step, then the two numbers", () => {
+    const html = overviewHtml();
+    const band = html.indexOf("data-verdict-row");
+    const step = html.indexOf("data-step");
+    const refused = html.indexOf('data-tour="overview-lanes"');
+    const needs = html.indexOf('id="needs-a-look"');
+    expect(band).toBeGreaterThan(-1);
+    expect([band, step, refused, needs]).toEqual([band, step, refused, needs].slice().sort((a, b) => a - b));
+    // The band is the page's heading, named for the page.
+    expect(html).toMatch(/<h1[^>]*><span[^>]*>.*?<\/span><span class="min-w-0"><span class="sr-only">Overview: <\/span>Codex is only partly connected<\/span><\/h1>/);
+    expect(html.match(/<h1/g)).toHaveLength(1);
+    // Its one step is the CLI's, with the restart it needs.
+    expect(commandBoxes(html.slice(band, refused)).map((box) => box.text)).toEqual(["innerwarden agents connect codex --monitor"]);
+    expect(textOf(html)).toContain("If Codex is running, restart it after this step. Quit Codex and start it again.");
+    expect(html).toContain('data-tour="overview-verdict"');
   });
 
-  it("names the attacks card for this machine, and says Community does not watch it", () => {
-    const mac = render(<CommunityOverview context={context()} />);
-    const server = mac.slice(mac.indexOf('data-lane="server_attacks"'));
-    expect(server).toContain("Attacks on this machine");
-    expect(server).toContain("Active Defence watches this on Linux servers.");
-    // Said once: the CLI's sentence says Community does not watch it, and the
-    // line under the heading does not say it again.
-    expect(textOf(server).match(/does not watch/g)).toHaveLength(1);
-    expect(server).not.toContain("honeypot");
-    const linux = render(<CommunityOverview context={context("", META, "linux")} />);
-    expect(linux.slice(linux.indexOf('data-lane="server_attacks"'))).toContain("Attacks on this server");
+  it("counts the last 7 days from the guard's log, and says today so far and where the count comes from", () => {
+    const html = overviewHtml();
+    const text = textOf(html);
+    // 17 would have been refused in the last 7 UTC days; none refused.
+    expect(text).toContain("0Refused before they ran");
+    expect(text).toContain("17Would have been refused");
+    expect(text).toContain("Today so far: 0 refused, 2 would have.");
+    expect(text).toContain("From the guard's log, last 7 days (UTC). It keeps refusals since 30 Jul.");
+    expect(html).toContain('aria-label="Last 14 days: 3 refused, 30 would have been refused"');
   });
 
-  it("makes one offer, led by this machine's own count, and links out once", () => {
-    const html = render(<CommunityOverview context={context()} />);
-    expect(links(html)).toEqual(["https://innerwarden.com/pricing"]);
-    const server = textOf(html.slice(html.indexOf('data-lane="server_attacks"')));
-    // flagged_ran 20 + unsafe_may_have_run 1, from the agent card's own split.
-    expect(server).toContain("21 flagged commands ran here since 25 Sept 2026: Community relies on your agent asking first.");
-    expect(server).toContain("On a Linux server, Active Defence adds the kernel Execution Gate");
-    expect(server).not.toMatch(/would have (stopped|refused|blocked)/);
+  it("counts from the decision record, said as such, when the log sends no days", () => {
+    const history = readHistory(historyFixture);
+    answers.set("history", { ...history, refusals: { ...history.refusals, days: undefined } });
+    const html = overviewHtml();
+    const refused = textOf(html.slice(html.indexOf('id="refused"'), html.indexOf('id="needs-a-look"')));
+    expect(refused).toContain("3Refused before they ran");
+    expect(refused).toContain("6Would have been refused");
+    expect(refused).toContain("From the decision record: newest 96 decisions, about 4 days.");
+    expect(html.slice(html.indexOf('id="refused"'), html.indexOf('id="needs-a-look"'))).not.toContain("data-chart");
   });
 
-  it("prints each part of a split in the same words the Cases page does", () => {
-    const overview = textOf(render(<CommunityOverview context={context()} />));
-    const cases = textOf(render(<CommunityCases context={context("?view=activity")} />));
-    for (const words of ["Refused before it ran", "Would have been refused", "Flagged, and it ran", "Judged unsafe, and it ran"]) {
-      expect(overview, words).toContain(words);
-      expect(cases, words).toContain(words);
-    }
-    expect(overview).not.toContain("would have been refused (monitor mode)");
+  it("draws no count from a log it could not read", () => {
+    answers.set("history", { ...readHistory(historyFixture), readable: false });
+    const html = overviewHtml();
+    const refused = html.slice(html.indexOf('id="refused"'), html.indexOf('id="needs-a-look"'));
+    expect(textOf(refused)).toContain("Not read: the guard's log could not be read.");
+    expect(refused).not.toContain("data-count");
+    expect(refused).not.toContain("data-chart");
   });
 
-  it("brings the guard's long log onto the page people open first", () => {
-    const html = render(<CommunityOverview context={context()} />);
-    expect(textOf(html)).toContain("123 refused before they ran since 30 Jul 2026, from the guard's log.");
-    expect(links(html).length).toBe(1);
+  it("lists at most three denies and four reasons, with no Hide, and the way to all of them", () => {
+    const html = overviewHtml();
+    expect(html.match(/data-decision-row=/g)).toHaveLength(3);
+    expect(html.match(/data-reason-row=/g)).toHaveLength(4);
+    for (const deny of DENIES.slice(0, 3)) expect(html).toContain(`href="?view=activity&amp;decision=${encodeURIComponent(deny.id)}"`);
+    expect(html).toContain(`href="?view=activity&amp;reason=${encodeURIComponent("rule:tmp_execution")}"`);
+    expect(textOf(html)).toContain("See all 30 flagged in Cases");
+    expect(textOf(html)).not.toMatch(/\bHide\b/);
+    expect(textOf(html)).toContain("From the decision record: newest 96 decisions, about 4 days.");
+    // A row never shows a session id.
+    expect(textOf(html)).not.toMatch(/[0-9a-f]{8}-demo-4000/);
   });
 
-  it("gives a watching agent the CLI's own command that refuses what would have been refused", () => {
-    const text = textOf(render(<CommunityOverview context={context()} />));
-    expect(text).toContain("6 commands would have been refused since 25 Sept 2026. innerwarden enforce refuses them.");
-  });
-
-  it("counts the record, and says a check by hand is one of them", () => {
-    const text = textOf(render(<CommunityOverview context={context()} />));
-    expect(text).toContain("96 decisions since 25 Sept 2026");
-    expect(text).toContain("1 of them a check by hand.");
-    expect(text).toContain("Recording.");
-    expect(text).not.toContain("Recording every decision");
+  it("says when the record is full and drops its oldest", () => {
+    const page = readDecisionsPage(page1);
+    answers.set("overview-flagged", { ...page, record: { ...page.record, capped: true } });
+    expect(textOf(overviewHtml())).toContain("Older ones are dropped as new ones arrive.");
+    answers.set("overview-flagged", page);
+    expect(textOf(overviewHtml())).not.toContain("Older ones are dropped");
   });
 
   it("says a failed source in its own place and still draws the others", () => {
     failing.add("agents");
-    failing.add("overview");
-    const html = render(<CommunityOverview context={context()} />);
-    expect(html).toContain("Agents did not answer");
-    expect(html).toContain("The decision record could not be read");
-    expect(html).toContain("Could not be read.");
-    expect(html).toContain("tokens");
+    failing.add("overview-flagged");
+    const html = overviewHtml();
+    expect(textOf(html)).toContain("Could not read whether your agents are connected");
+    expect(textOf(html)).toContain("Nothing on this page is counted as zero.");
+    expect(textOf(html)).toContain("Not read: the dashboard did not answer for the agents.");
+    expect(html).toMatch(/role="alert"[^>]*>[\s\S]*The decision record could not be read/);
+    // The guard's log answered, so its numbers are still drawn.
+    expect(textOf(html)).toContain("17Would have been refused");
     expect(html).not.toContain("The local dashboard is unavailable");
-    expect(html).not.toContain("Recording.");
-  });
-
-  it("lists the five newest flagged situations, a run of one reason folded, never a session id", () => {
-    const html = render(<CommunityOverview context={context()} />);
-    expect(html.match(/data-case-row=/g)?.length).toBe(5);
-    // The agent's scratch script and the six build-cache scripts in a row are
-    // ONE situation, not seven rows.
-    expect(html).toContain("6 more in a row, flagged for the same reason");
-    expect(html).toContain("bash /tmp/agent-scratch/0e6f3c1a-5b2d-4c7e-9a10-2f3b4c5d6e7f/check.sh");
-    expect(html).not.toContain("bash /tmp/build-cache/step-1.sh");
-    expect(textOf(html)).not.toMatch(/[0-9a-f]{8}-demo-4000/);
-  });
-
-  /** One reason can be three quarters of a real record: the list must still show the rest. */
-  it("folds a reason that is more than half of everything flagged into one line, and can show it", () => {
-    const page = readDecisionsPage(page1);
-    const top = page.reasons[0];
-    answers.set("recent-flagged", { ...page, flaggedTotal: 20, reasons: [{ ...top, count: 15 }, ...page.reasons.slice(1)] });
-    answers.set("recent-without", { ...page, items: page.items.filter((item) => item.reason.key !== top.key) });
-    const html = render(<CommunityOverview context={context()} />);
-    expect(textOf(html)).toContain("15 from the world-writable folder rule, hidden here.");
-    expect(html).not.toContain("/tmp/build-cache/run.sh");
-    expect(html.match(/data-case-row=/g)?.length).toBe(5);
+    expect(textOf(html)).not.toContain("Nothing flagged");
   });
 
   it("never says nothing was flagged when rows could not be drawn", () => {
-    answers.set("recent-flagged", { ...readDecisionsPage(page1), items: [] });
-    const html = render(<CommunityOverview context={context()} />);
+    answers.set("overview-flagged", { ...readDecisionsPage(page1), reasons: [] });
+    const html = overviewHtml();
     expect(html).not.toContain("Nothing flagged");
     expect(textOf(html)).toContain("30 flagged could not be shown.");
   });
 
-  it("claims installation, never protection, where Active Defence is installed", () => {
-    const html = render(<CommunityOverview context={context("", { ...META, active_defence_installed: true })} />);
-    expect(html).toContain('data-ad-state="installed"');
-    expect(links(html)).toEqual([]);
-    for (const word of [" armed", "enforcing", "protected"]) expect(html.toLowerCase()).not.toContain(word);
+  it("says nothing was flagged only from the record's own count", () => {
+    const page = readDecisionsPage(page1);
+    answers.set("overview-flagged", { ...page, items: [], flaggedTotal: 0, total: 0, reasons: [] });
+    expect(textOf(overviewHtml())).toMatch(/Nothing flagged in the record \(25 Sept, \d\d:34 to now\)\./);
   });
-});
 
-describe("an out-of-date message hook", () => {
-  /**
-   * The hook an earlier version wrote keeps running after an upgrade. The
-   * CLI names it on the Messages card with the command that fixes it, and
-   * the card shows it while it still shows its count. FAILS ON REVERT: render
-   * a step on a no_source card only, and the step is gone.
-   */
-  it("shows the CLI's step on a Messages card that records", () => {
+  it("makes no Active Defence offer and links out nowhere, installed or not", () => {
+    for (const meta of [META, { ...META, active_defence_installed: true }]) {
+      const html = overviewHtml("", meta);
+      expect(links(html)).toEqual([]);
+      expect(html).not.toContain("data-ad-state");
+      expect(textOf(html)).not.toContain("Active Defence");
+    }
+  });
+
+  it("says each control in the footer from what was read, and links each to where it is set", () => {
+    const html = overviewHtml();
+    const footer = textOf(html.slice(html.indexOf("data-overview-footer")));
+    expect(footer).toContain("Record: recording.");
+    expect(footer).toContain("Messages: 4 recorded.");
+    expect(html).toContain('href="?view=posture#record"');
+    expect(html).toContain('href="?view=activity&amp;lane=agent_messages"');
+    expect(html).toContain('href="?view=tokens"');
+  });
+
+  it("keeps the CLI's step for an out-of-date message hook while messages are recorded", () => {
     const lanes = overviewFixture.lanes;
     answers.set("overview", {
       ...overviewFixture,
@@ -404,51 +410,65 @@ describe("an out-of-date message hook", () => {
         },
       },
     });
-    const html = render(<CommunityOverview context={context()} />);
-    const card = html.slice(html.indexOf('data-lane="agent_messages"'), html.indexOf('data-lane="server_attacks"'));
-    expect(card).toContain("data-lane-step");
-    expect(commandBoxes(card).map((box) => box.text)).toContain("innerwarden observe install");
-    expect(textOf(card)).toContain("older than this version");
-    // Without the step the card shows none.
+    const html = overviewHtml();
+    const step = html.slice(html.indexOf("data-lane-step"));
+    expect(commandBoxes(step).map((box) => box.text)).toContain("innerwarden observe install");
+    expect(textOf(step)).toContain("older than this version");
     answers.set("overview", overviewFixture);
-    const plain = render(<CommunityOverview context={context()} />);
-    expect(plain).not.toContain("innerwarden observe install");
+    expect(overviewHtml()).not.toContain("innerwarden observe install");
+  });
+
+  it("reads no token history, and draws no lane card, ring or tile", () => {
+    const html = overviewHtml();
+    expect(html).not.toContain("data-lane=");
+    expect(html).not.toContain("on-machine-title");
+    expect(html).not.toContain("Agents on this machine");
+    expect(textOf(html)).not.toMatch(/\btokens\b/);
   });
 });
 
 describe("the first run", () => {
-  const ZERO = {
-    ...overviewFixture,
-    lanes: {
-      agent_actions: { lane: "agent_actions", availability: "no_source", sentence: "No agent is connected to the guard yet.", next_step: { command: "innerwarden agents connect --all --monitor", line: "Connects every agent it finds." } },
-      agent_messages: { lane: "agent_messages", availability: "no_source", sentence: "Recording what people ask your agent needs OpenClaw, a chat gateway for agents. None is set up on this machine." },
-      server_attacks: { lane: "server_attacks", availability: "no_source", sentence: "Community watches what your AI agents try to run. It does not watch this machine itself." },
-    },
-    record: { decisions: 0, flagged: 0, checked: 0 },
+  const EMPTY = { ...readDecisionsPage(page1), items: [], total: 0, flaggedTotal: 0, byOutcome: {}, reasons: [], reasonsDistinct: 0, record: { decisions: 0, flagged: 0, checked: 0 } };
+  const NOT_CONNECTED = {
+    ...agentsFixture,
+    agents: agentsFixture.agents.map((agent) => ({
+      ...agent,
+      guardrail: { ...agent.guardrail, mode: "not_configured" },
+      next_step: { label: "To put the guard in front of it:", command: `innerwarden agents connect ${agent.id} --monitor`, line: "It starts in monitor mode." },
+    })),
   };
 
-  it("shows its first steps before any card, with no offer and no link out", () => {
-    answers.set("overview", ZERO);
-    const html = render(<CommunityOverview context={context()} />);
-    expect(html.indexOf("data-get-started")).toBeGreaterThan(0);
-    expect(html.indexOf("data-get-started")).toBeLessThan(html.indexOf("data-lane="));
+  it("shows its first steps in place of Needs a look, with no offer and no link out", () => {
+    answers.set("overview-flagged", EMPTY);
+    answers.set("agents", NOT_CONNECTED);
+    const html = overviewHtml();
+    const steps = html.slice(html.indexOf("data-get-started"));
+    expect(html.indexOf("data-get-started")).toBeGreaterThan(html.indexOf("data-verdict-row"));
+    expect(html).not.toContain("Needs a look");
     expect(links(html)).toEqual([]);
     expect(html).not.toContain("data-offer");
-    // The connect command is said once, in the steps, not again in the card.
-    expect(commandBoxes(html).filter((box) => box.text === "innerwarden agents connect --all --monitor").length).toBe(1);
-    expect(html).toContain("Start with the steps above.");
+    expect(commandBoxes(steps).map((box) => box.text)).toEqual(["innerwarden agents connect claude-code --monitor"]);
+    expect(textOf(steps)).toContain("If Claude Code is running, restart it after this step.");
+    expect(textOf(steps)).toContain("Ask it to run any command. The decision shows here within seconds.");
     // The page they are reading is not a step.
     expect(commandBoxes(html).some((box) => box.text === "innerwarden dashboard")).toBe(false);
-    // No observe install where there is no OpenClaw.
-    expect(html).not.toContain("innerwarden observe install");
+    // It never says nothing was flagged as if something had been checked.
+    expect(textOf(html)).not.toContain("Nothing flagged");
   });
 
   it("asks for an agent before offering to connect one, when none is here", () => {
-    answers.set("overview", ZERO);
+    answers.set("overview-flagged", EMPTY);
     answers.set("agents", { ...agentsFixture, agents: [] });
-    const html = render(<CommunityOverview context={context()} />);
+    const html = overviewHtml();
     expect(textOf(html)).toContain("Install a supported agent (Claude Code, Codex, Cursor, Gemini CLI), then connect it");
     expect(commandBoxes(html).some((box) => box.text.includes("agents connect"))).toBe(false);
+  });
+
+  it("is not onboarding again once an agent is connected", () => {
+    answers.set("overview-flagged", EMPTY);
+    const html = overviewHtml();
+    expect(html).not.toContain("data-get-started");
+    expect(textOf(html)).toContain("Nothing recorded yet. Ask your agent to run any command.");
   });
 });
 

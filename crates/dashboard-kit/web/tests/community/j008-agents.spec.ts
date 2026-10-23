@@ -121,9 +121,13 @@ test.describe("CJC-090-J008 conservative general agent discovery", () => {
 
   test("the Overview counts neither a leftover nor an agent the guard cannot wire as one to connect", async ({ page }) => {
     await page.goto("/");
-    const strip = page.locator('section[aria-labelledby="on-machine-title"]');
+    const strip = page.locator("#overview-agents");
     await expect(strip).toContainText("Unknown MCP client and Hermes cannot be connected yet.");
-    await expect(strip).not.toContainText("Every agent found is connected");
-    await expect(strip.locator("[data-needs-you]")).toHaveCount(0);
+    await expect(strip.locator("[data-agent-row]")).toHaveCount(0);
+    await expect(strip.locator("[data-pill]")).toHaveCount(0);
+    // Nothing found here can be connected, so the band offers no connect.
+    const band = page.locator("[data-verdict-row]");
+    await expect(band).toContainText("No supported agent was found on this machine.");
+    await expect(band.locator("[data-command]")).toHaveCount(0);
   });
 });

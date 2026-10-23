@@ -459,6 +459,8 @@ export function readDecisionDetail(value: unknown): DecisionDetail {
 }
 
 export type DecisionsQuery = {
+  /** What the rules said (`deny`, `review`, `allow`): the Overview's newest denies. */
+  verdict?: "deny" | "review" | "allow";
   outcome?: string;
   reason?: string;
   /** A reason the reader hid from the list: a view only, the guard keeps flagging it. */
@@ -472,7 +474,7 @@ export type DecisionsQuery = {
 export function decisionsPath(query: DecisionsQuery): string {
   const params = new URLSearchParams();
   params.set("flagged", "1");
-  for (const name of ["outcome", "reason", "session", "q", "cursor"] as const) {
+  for (const name of ["verdict", "outcome", "reason", "session", "q", "cursor"] as const) {
     const value = query[name];
     if (value !== undefined && value.length > 0) params.set(name, value);
   }

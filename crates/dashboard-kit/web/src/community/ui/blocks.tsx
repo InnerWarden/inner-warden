@@ -67,9 +67,20 @@ export function SourceLine({ children }: { children: ReactNode }) {
  * never "off". `children` is the sentence; `at` the last try; `onRetry` asks
  * again (a GET, nothing more).
  */
-export function NotRead({ children, at, onRetry }: { children: ReactNode; at?: number; onRetry?: () => void }) {
+export function NotRead({
+  children,
+  at,
+  onRetry,
+  alert = false,
+}: {
+  children: ReactNode;
+  at?: number;
+  onRetry?: () => void;
+  /** Said at once to a screen reader: a source the page is built on could not be read. */
+  alert?: boolean;
+}) {
   return (
-    <div data-not-read className={`rounded-lg border border-dashed border-(--iw-line-strong) bg-(--iw-surface) px-4 py-3 ${BODY_TEXT}`}>
+    <div data-not-read role={alert ? "alert" : undefined} className={`rounded-lg border border-dashed border-(--iw-line-strong) bg-(--iw-surface) px-4 py-3 ${BODY_TEXT}`}>
       <p className="flex items-start gap-2">
         <span className="mt-0.5 text-(--iw-unknown)"><Icon name="dashed-circle" /></span>
         <span className="min-w-0">
@@ -185,10 +196,17 @@ const TONE_ICON_COLOUR: Record<VerdictTone, string> = {
   unknown: "text-(--iw-unknown)",
 };
 
-function ActionBlock({ action, onOpenAgents }: { action: VerdictAction; onOpenAgents?: () => void }) {
+function ActionBlock({ action, said = [], onOpenAgents }: { action: VerdictAction; said?: readonly string[]; onOpenAgents?: () => void }) {
   return (
     <div data-verdict-action className="min-w-0 space-y-3">
-      {action.steps.map(({ step, restarts }) => <StepBlock key={`${step.label}${step.command ?? ""}`} step={step} restarts={restarts} />)}
+      {action.steps.map(({ step, restarts }) => (
+        <StepBlock
+          key={`${step.label}${step.command ?? ""}`}
+          // A line the band already says beside the step (row 5) is not said twice.
+          step={step.line !== undefined && said.includes(step.line) ? { ...step, line: undefined } : step}
+          restarts={restarts}
+        />
+      ))}
       {action.restarts.length === 0 ? null : (
         <div className="space-y-2 rounded-lg bg-(--iw-surface-2) p-3">
           {action.restarts.map((restart) => <RestartNote key={restart.agent} agent={restart.agent} words={restart.words} />)}
@@ -225,6 +243,7 @@ export function VerdictBand({
   onOpenAgents,
   tour,
   extra,
+  page,
 }: {
   verdict: Verdict;
   compact?: boolean;
@@ -233,6 +252,12 @@ export function VerdictBand({
   tour?: string;
   /** More under the lines, in the band's own words (the Protection page's two definitions). */
   extra?: ReactNode;
+  /**
+   * The band is the page's own heading (the Overview): its headline is the
+   * page's h1, named "<page>: <headline>" for a screen reader, and takes
+   * focus when someone moves to the page.
+   */
+  page?: string;
 }) {
   const frame = `${PANEL} border-l-4 border-l-(--iw-band) ${compact ? "" : "min-h-[188px] lg:min-h-[148px]"}`;
   if (verdict.row === 0 || verdict.headline === undefined) {
@@ -244,14 +269,18 @@ export function VerdictBand({
     );
   }
   const action = verdict.action;
+  const Heading = page === undefined ? "h2" : "h1";
   return (
     <section id={id} data-tone={verdict.tone} data-verdict-row={verdict.row} aria-labelledby={`${id}-title`} data-tour={tour} className={frame}>
       <div className={compact ? "space-y-4" : "space-y-4 lg:grid lg:grid-cols-12 lg:gap-6 lg:space-y-0"}>
         <div className={`min-w-0 space-y-2 ${compact ? "" : "lg:col-span-7"}`}>
-          <h2 id={`${id}-title`} className="flex items-start gap-2 text-xl leading-7 font-semibold text-(--iw-ink)">
+          <Heading id={`${id}-title`} tabIndex={page === undefined ? undefined : -1} className="flex items-start gap-2 text-xl leading-7 font-semibold text-(--iw-ink)">
             <span className={`mt-1.5 ${TONE_ICON_COLOUR[verdict.tone]}`}><Icon name={TONE_ICON[verdict.tone]} /></span>
-            <span className="min-w-0">{verdict.headline}</span>
-          </h2>
+            <span className="min-w-0">
+              {page === undefined ? null : <span className="sr-only">{page}: </span>}
+              {verdict.headline}
+            </span>
+          </Heading>
           {verdict.lines.map((line, index) => (
             <p key={index} className={BODY_TEXT}>{line}</p>
           ))}
@@ -259,7 +288,7 @@ export function VerdictBand({
         </div>
         {action === undefined ? null : (
           <div className={`min-w-0 ${compact ? "" : "lg:col-span-5"}`}>
-            <ActionBlock action={action} onOpenAgents={onOpenAgents} />
+            <ActionBlock action={action} said={verdict.lines} onOpenAgents={onOpenAgents} />
           </div>
         )}
       </div>

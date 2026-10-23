@@ -1,593 +1,635 @@
-import { Fragment, useState, type ReactNode } from "react";
+import { useMemo, type ReactNode } from "react";
 import type { CommunityScreenContext } from "../App";
-import { fetchAgents, fetchOverview, fetchTokenIntelligence, type Overview as OverviewPayload } from "../api";
-import { LaneCards } from "../components/LaneCards";
-import { MachineIntelligence } from "../components/MachineIntelligence";
+import type { AgentsResponse, Overview as OverviewPayload } from "../api";
 import { TechnicalOnly, useTechnicalDetail } from "../components/TechnicalDetail";
-import { When } from "../components/When";
-import { Ring, type Part } from "../components/viz";
-import { overviewLaneCards, type LaneCard } from "../lanes";
-import { compactCount, formatCount, formatDay, humanizeToken, normaliseMode } from "../presentation";
-import { agentRows, agentsSummary, awaitingApproval, modeLine, modeWord, nameList, trustCounts, type AgentRow } from "./agentsView";
-import { fetchDecisions, fetchHistory, fetchRecordHealth, readLaneNextStep, readOverviewRecord, type Decision, type DecisionsPage, type History, type Reason, type RecordSpan } from "./api";
-import { CaseRow } from "./CaseRow";
-import { OfferBox } from "./Offer";
-import { serverOffer, type RanHere } from "./offers";
-import { CARD, CopyCommand, Go, Skeleton, StaleLine, Unreadable } from "./parts";
-import { usePolled } from "./poll";
-import { rowRuns, type Run } from "./rows";
-import { tokenRows, tokenTotal } from "./tokensView";
-import { agentTrustSentence, asPlatform, MODE_WORDS, OUTCOME_WORDS, PLATFORM_WORDS, type PlatformOs } from "./words";
+import { formatAbsolute, formatCount, humanizeToken } from "../presentation";
+import { agentRows, awaitingApproval, nameList } from "./agentsView";
+import {
+  fetchDecisions,
+  readAgentsFacts,
+  readLaneNextStep,
+  readOverviewRecord,
+  type AgentFacts,
+  type AgentsFacts,
+  type DecisionsPage,
+  type History,
+  type Protection,
+  type RecordHealth,
+  type RecordSpan,
+  type RefusalDay,
+} from "./api";
+import { StaleLine } from "./parts";
+import { usePolled, type Polled } from "./poll";
+import { restartFor, restartWords } from "./restart";
+import { useSource } from "./store";
+import {
+  BODY_TEXT,
+  CountStat,
+  LINK_TEXT,
+  META_TEXT,
+  NotRead,
+  onPlainClick,
+  PANEL,
+  RestartNote,
+  Section,
+  SMALL_TEXT,
+  SourceLine,
+  StepBlock,
+  VerdictBand,
+} from "./ui/blocks";
+import { DayBars } from "./ui/charts";
+import { Icon } from "./ui/Icon";
+import { AgentStrip, DecisionRow, ReasonRow } from "./ui/rows";
+import { isConnected, lastDays, overviewVerdict, recordCounts, spanWords, type BandStep, type Restart } from "./verdict";
 
-export const OVERVIEW_POLL_MS = 10_000;
-export const AGENTS_POLL_MS = 30_000;
-export const TOKENS_POLL_MS = 300_000;
-export const HISTORY_POLL_MS = 60_000;
-/** Recently flagged shows this many situations, runs of one reason folded into one. */
-export const RECENT_SHOWN = 5;
-/**
- * Read enough to fill five situations when the newest are one long run (an
- * agent looping on one script), and ask less often than the cards: this list
- * is the newest flagged, not a live feed.
- */
-const RECENT_READ = 30;
-const RECENT_POLL_MS = 30_000;
+/** The newest denies and the reasons are read on their own, every 30 s. */
+export const DECISIONS_POLL_MS = 30_000;
+/** At most this many denies, and this many reasons, under Needs a look. */
+export const DENIES_SHOWN = 3;
+export const REASONS_SHOWN = 4;
+/** At most this many agents in the strip; the rest are on the Agents page. */
+export const STRIP_MAX = 4;
 
-/** Community's order: what the agent did leads, the card with the offer is last. */
-const LANE_ORDER = ["agent_actions", "agent_messages", "server_attacks"] as const;
+/** The first step when no agent can be named: connect every agent found, in monitor. */
+export const CONNECT_ALL = "innerwarden agents connect --all --monitor";
 
-export function orderedCards(cards: readonly LaneCard[]): LaneCard[] {
-  return [...cards].sort((a, b) => LANE_ORDER.indexOf(a.lane) - LANE_ORDER.indexOf(b.lane));
+const SHORT_DAY = new Intl.DateTimeFormat("en-GB", { day: "numeric", month: "short", timeZone: "UTC" });
+
+/** "30 Jul", for the day the guard's log starts (a UTC date). */
+export function shortDay(iso: string): string | undefined {
+  const ms = Date.parse(iso);
+  return Number.isFinite(ms) ? SHORT_DAY.format(ms) : undefined;
 }
 
+const SECONDS = new Intl.DateTimeFormat("en-GB", { hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23" });
+
 /**
- * The cards with each part of a split in the words the Cases page prints the
- * same outcome in (`OUTCOME_WORDS`): one count, one name, on every page. A
- * key the table does not know keeps the CLI's own words.
+ * What the decision record holds, as the line every count from it carries
+ * (T6): "From the decision record: newest 96 decisions, about 4 days." The
+ * span runs from the oldest decision kept to the newest.
  */
-export function communityCards(cards: readonly LaneCard[]): LaneCard[] {
-  return cards.map((card) =>
-    card.state !== "available" || card.breakdown === undefined
-      ? card
-      : {
-          ...card,
-          breakdown: card.breakdown.map((part) =>
-            Object.prototype.hasOwnProperty.call(OUTCOME_WORDS, part.key)
-              ? { ...part, label: OUTCOME_WORDS[part.key as keyof typeof OUTCOME_WORDS] }
-              : part,
-          ),
-        },
+export function recordSourceLine(record: RecordSpan, now: number): string {
+  const decisions = `newest ${formatCount(record.decisions)} ${record.decisions === 1 ? "decision" : "decisions"}`;
+  const span = record.oldestAt === undefined
+    ? ""
+    : `, ${spanWords(Date.parse(record.oldestAt), record.newestAt === undefined ? now : Date.parse(record.newestAt))}`;
+  return `From the decision record: ${decisions}${span}.`;
+}
+
+/** The exact span behind `recordSourceLine`, for its title. */
+function recordSpanTitle(record: RecordSpan): string | undefined {
+  if (record.oldestAt === undefined) return undefined;
+  const from = formatAbsolute(record.oldestAt);
+  const to = record.newestAt === undefined ? "now" : formatAbsolute(record.newestAt);
+  return from === undefined || to === undefined ? undefined : `${from} to ${to}`;
+}
+
+/** The guard's log by day, summed over the last week, and today so far. */
+export function refusalSums(days: readonly RefusalDay[]): { blocked: number; wouldBlock: number; today?: RefusalDay } {
+  const week = lastDays(days, 7);
+  const last = days.at(-1);
+  return { ...week, ...(last?.partial === true ? { today: last } : {}) };
+}
+
+/** The agents' answer, read; `undefined` while none came, and an answer that cannot be read counts as failed. */
+function readFacts(data: unknown): { facts?: AgentsFacts; unreadable: boolean } {
+  if (data === undefined) return { unreadable: false };
+  try {
+    return { facts: readAgentsFacts(data), unreadable: false };
+  } catch {
+    return { unreadable: true };
+  }
+}
+
+/** When a source's answer came in, for the technical view: kept until a new answer arrives. */
+function useReadAt(data: unknown): number | undefined {
+  return useMemo(() => (data === undefined ? undefined : Date.now()), [data]);
+}
+
+function ReadAt({ data, path }: { data: unknown; path: string }) {
+  const at = useReadAt(data);
+  if (at === undefined) return null;
+  return (
+    <TechnicalOnly>
+      <p data-read-at={path} className={META_TEXT}>Read at {SECONDS.format(at)} from {path}.</p>
+    </TechnicalOnly>
   );
 }
 
-/** A part of a card's split, by key, or 0. */
-function partCount(card: LaneCard | undefined, key: string): number {
-  if (card === undefined || card.state !== "available") return 0;
-  return card.breakdown?.find((part) => part.key === key)?.count ?? 0;
-}
-
-/** The span a card counted, in the words a sentence ends with. */
-function spanWords(card: LaneCard | undefined): string {
-  if (card === undefined || card.state !== "available" || card.since === undefined) return "in the last 7 days";
-  return `since ${formatDay(card.since)}`;
+/** A fixed-height block while the first answer is on its way: never a zero, never an empty list. */
+function Pending({ className = "h-24" }: { className?: string }) {
+  return <div aria-hidden="true" className={`animate-pulse rounded-lg bg-(--iw-surface-2) ${className}`} />;
 }
 
 /**
- * The flagged commands that ran here in a way Community's own refusing mode
- * does not stop (the rules asked for a review, or a deny went through an MCP
- * connection that only warns): the reader's own number the offer leads with.
- */
-export function ranHere(card: LaneCard | undefined): RanHere {
-  return { count: partCount(card, "flagged_ran") + partCount(card, "unsafe_may_have_run"), span: spanWords(card) };
-}
-
-/**
- * The reason that is more than half of everything flagged, when one is: an
- * agent's own scratch scripts can be three quarters of a real record, and a
- * list of the newest would then show nothing else.
- */
-export function dominantReason(page: DecisionsPage | undefined): Reason | undefined {
-  const top = page?.reasons[0];
-  if (page === undefined || top === undefined || page.flaggedTotal === 0) return undefined;
-  return top.count * 2 > page.flaggedTotal ? top : undefined;
-}
-
-/**
- * The guard's long log in one slate line: what Community refused for this
- * reader since the log began. The proof it is worth keeping, on the page
- * people open first; Protection has it week by week.
- */
-export function valueProofLine(history: History | undefined): string | undefined {
-  if (history === undefined || !history.readable) return undefined;
-  const since = history.since === undefined ? "" : ` since ${formatDay(history.since)}`;
-  if (history.refusals.blocked > 0) return `${formatCount(history.refusals.blocked)} refused before they ran${since}, from the guard's log.`;
-  if (history.refusals.wouldBlock > 0) return `${formatCount(history.refusals.wouldBlock)} would have been refused${since}, from the guard's log.`;
-  return undefined;
-}
-
-/**
- * Community's Overview: what the agents did, what people asked them, and
- * what Community does not watch, then what is on this machine, then the
- * newest flagged commands. Every figure is the CLI's, from this machine's
- * own records; a source that could not be read says so in its own place and
- * the rest of the page still renders. A machine with nothing connected yet
- * gets its first steps FIRST, under the heading, before any card.
+ * Community's Overview (spec 6.1). Without scrolling, at a desk or on a
+ * phone, it answers three questions: are my agents connected and in which
+ * mode (the band and the header), what was refused or would have been (two
+ * numbers and fourteen days), and what is the one next step (the band's
+ * command, what it does, and the restart it needs).
+ *
+ * It reads seven sources: five shared ones (the record's health, the agents,
+ * the guard's log, the controls and the overview) and two of its own (the
+ * three newest denies, and the reasons). What could not be read is said in
+ * its own place and never as a zero; the rest of the page still renders.
  */
 export function CommunityOverview({ context }: { context: CommunityScreenContext }) {
-  const overview = usePolled(fetchOverview, OVERVIEW_POLL_MS, "overview");
-  const recent = usePolled(() => fetchDecisions({ limit: RECENT_READ }), RECENT_POLL_MS, "recent-flagged");
-  const agents = usePolled(fetchAgents, AGENTS_POLL_MS, "agents");
-  const tokens = usePolled(fetchTokenIntelligence, TOKENS_POLL_MS, "tokens");
-  const health = usePolled(fetchRecordHealth, AGENTS_POLL_MS, "record-health");
-  const history = usePolled(fetchHistory, HISTORY_POLL_MS, "history");
-  const [showDominant, setShowDominant] = useState(false);
-  const dominant = dominantReason(recent.data);
-  const hiding = dominant !== undefined && !showDominant;
-  const withoutDominant = usePolled(
-    () => (dominant === undefined ? Promise.resolve(undefined) : fetchDecisions({ limit: RECENT_READ, reasonNot: dominant.key })),
-    hiding ? RECENT_POLL_MS : 0,
-    hiding ? `recent-without:${dominant.key}` : "recent-without:",
-  );
-  const os = asPlatform(context.bootstrap?.platform.os);
-  const installed = context.meta?.active_defence_installed === true;
-  const openCases = (params?: Record<string, string>) => context.navigate("activity", params);
-  const data = overview.data;
-  const parsed = data === undefined ? undefined : overviewLaneCards(data.lanes);
-  const cards = parsed === undefined ? undefined : communityCards(parsed);
-  const agentCard = cards?.find((card) => card.lane === "agent_actions");
-  const record = readOverviewRecord((data as (OverviewPayload & { record?: unknown }) | undefined)?.record);
-  const rows = agentRows(agents.data);
-  const nothingYet = agentCard?.state === "no_source";
-  const shown = hiding ? withoutDominant.data : recent.data;
-  const shownFailed = hiding ? withoutDominant.data === undefined && withoutDominant.error !== undefined : false;
+  const health = useSource("record-health");
+  const agents = useSource("agents");
+  const history = useSource("history");
+  const protection = useSource("protection");
+  const overview = useSource("overview");
+  const denies = usePolled(() => fetchDecisions({ verdict: "deny", limit: DENIES_SHOWN }), DECISIONS_POLL_MS, "overview-denies");
+  const flagged = usePolled(() => fetchDecisions({ limit: 1 }), DECISIONS_POLL_MS, "overview-flagged");
+  const read = useMemo(() => readFacts(agents.data), [agents.data]);
+  const facts = read.facts;
+  const now = Date.now();
+  const page = flagged.data;
+  const verdict = overviewVerdict({
+    metaStatus: context.metaStatus,
+    meta: context.meta,
+    health: health.data,
+    agents: facts?.agents,
+    agentsFailed: facts === undefined && (read.unreadable || agents.error !== undefined),
+    unnamed: facts?.unnamed,
+    days: history.data?.refusals.days,
+    logReadable: history.data?.readable,
+    record: recordCounts(page?.record, page?.byOutcome, now),
+    alertChannels: protection.data?.alerts.channels,
+    now,
+  });
+  const openDecisions = (params?: Record<string, string>) => context.navigate("activity", params);
+  const openAgents = () => context.navigate("agents");
+  const connected = facts?.agents.some(isConnected) === true;
 
   return (
-    <div className="min-w-0 space-y-8">
-      {overview.stale ? <StaleLine onRetry={overview.refresh} /> : null}
-      {data === undefined ? (
-        overview.error === undefined ? (
-          <Skeleton className="h-80" />
-        ) : (
-          <section aria-labelledby="lanes-title" className="space-y-3">
-            <h1 id="lanes-title" tabIndex={-1} className="text-2xl font-semibold tracking-tight text-slate-950 sm:text-3xl">What is happening here</h1>
-            <Unreadable
-              title="The decision record could not be read"
-              body={<><code className="font-mono">innerwarden status</code> says why. Agents and tokens below still come from their own sources.</>}
-              onRetry={overview.refresh}
-            />
-          </section>
-        )
-      ) : cards === undefined ? (
-        <Unreadable title="This InnerWarden sends no summary this page can read" body="Update InnerWarden, or run innerwarden status." />
-      ) : (
-        <LaneCards
-          cards={orderedCards(cards)}
-          edition="community"
-          intro="From this machine's own records."
-          beforeCards={nothingYet ? <GetStarted rows={rows} agentsLoaded={agents.data !== undefined} connect={readLaneNextStep(data.lanes, "agent_actions")?.command} /> : undefined}
-          onOpenLane={(lane) => openCases(lane === "agent_messages" ? { lane } : {})}
-          onOpenCase={(caseId, lane) => openCases(lane === "agent_messages" ? { lane, decision: caseId } : { decision: caseId })}
-          linkLabel={(lane) => (lane === "agent_actions" ? "See the flagged commands" : lane === "agent_messages" ? "See the messages" : undefined)}
-          title={(lane) => (lane === "server_attacks" && os !== "linux" ? "Attacks on this machine" : undefined)}
-          // The CLI's own sentence under it already says Community does not
-          // watch this machine; the line under the heading says who does,
-          // never the paid card's "the honeypot, and what the kernel caught".
-          blurb={(lane) =>
-            lane !== "server_attacks"
-              ? undefined
-              : os === "linux"
-                ? "Active Defence watches this."
-                : "Active Defence watches this on Linux servers."
-          }
-          footer={(card) =>
-            laneFooter(card, {
-              overview: data,
-              os,
-              installed,
-              nothingYet,
-              record,
-              history: history.data,
-              ran: ranHere(agentCard),
-              onProtection: () => context.navigate("posture"),
-            })
-          }
-          align={cards.some((card) => card.lane !== "server_attacks" && card.state === "no_source") ? "start" : undefined}
+    <div data-overview className="min-w-0 space-y-8">
+      <div>
+        <VerdictBand verdict={verdict} page="Overview" tour="overview-verdict" onOpenAgents={openAgents} />
+        <ReadAt data={agents.data} path="/api/guard/agents" />
+      </div>
+      <div className="grid min-w-0 grid-cols-1 gap-8 lg:grid-cols-12 lg:gap-6">
+        <Refused history={history} flagged={flagged} now={now} className="lg:col-span-5 lg:col-start-8 lg:row-start-1" />
+        <NeedsALook
+          denies={denies}
+          flagged={flagged}
+          facts={facts}
+          connected={connected}
+          agentsPending={facts === undefined && !read.unreadable && agents.error === undefined}
+          now={now}
+          onOpen={(id) => openDecisions({ decision: id })}
+          onReason={(reason) => openDecisions({ reason })}
+          onAll={() => openDecisions()}
+          className="lg:col-span-12 lg:row-start-2"
         />
-      )}
-
-      <OnThisMachine
-        context={context}
-        agentsLoaded={agents.data !== undefined}
-        agentsFailed={agents.data === undefined && agents.error !== undefined}
-        rows={rows}
-        record={record}
-        recordFailed={data === undefined && overview.error !== undefined}
-        recording={health.data?.recording}
-        outageSince={health.data?.sinceUnix}
-        wouldHaveRefused={partCount(agentCard, "would_have_refused")}
-        wouldSpan={spanWords(agentCard)}
-        tokens={tokens.data === undefined ? undefined : tokenTotal(tokenRows(tokens.data))}
-        tokensFailed={tokens.data === undefined && tokens.error !== undefined}
-        tokensRead={tokens.data !== undefined && tokens.data.availability !== "loading"}
+        <AgentsStrip agents={agents} facts={facts} unreadable={read.unreadable} onOpenAgents={openAgents} className="lg:col-span-7 lg:col-start-1 lg:row-start-1" />
+      </div>
+      <FooterLine
+        health={health}
+        protection={protection}
+        history={history}
+        navigate={context.navigate}
       />
-
-      {nothingYet ? null : (
-        <RecentFlagged
-          loading={(recent.data === undefined && recent.error === undefined) || (shown === undefined && !shownFailed && recent.error === undefined)}
-          failed={(recent.data === undefined && recent.error !== undefined) || shownFailed}
-          runs={rowRuns(shown?.items ?? []).slice(0, RECENT_SHOWN)}
-          total={recent.data?.flaggedTotal}
-          sinceWords={record?.oldestAt === undefined ? undefined : formatDay(record.oldestAt)}
-          screened={record?.decisions}
-          dominant={dominant}
-          hidingDominant={hiding}
-          onToggleDominant={() => setShowDominant((value) => !value)}
-          onOpen={(id) => openCases({ decision: id })}
-          onAll={() => openCases()}
-          onReason={(reason) => openCases({ reason })}
-        />
-      )}
-
-      {data === undefined ? null : <OverviewRecords overview={data} />}
+      <MessagesStep overview={overview.data} />
+      {overview.data === undefined ? null : <OverviewRecords overview={overview.data} />}
     </div>
   );
 }
 
-type FooterFacts = {
-  overview: OverviewPayload;
-  os: PlatformOs;
-  installed: boolean;
-  nothingYet: boolean;
-  record?: RecordSpan;
-  history?: History;
-  ran: RanHere;
-  onProtection: () => void;
-};
-
-function laneFooter(card: LaneCard, facts: FooterFacts): ReactNode {
-  if (card.lane === "server_attacks") {
-    // No offer on a machine with nothing recorded yet: a new reader's first
-    // need is their own first step, and an offer never comes before the
-    // page's first real figure.
-    if (facts.record === undefined || facts.record.decisions === 0) return undefined;
-    return <OfferBox offer={serverOffer(facts.os, facts.ran)} installed={facts.installed} />;
-  }
-  if (card.lane === "agent_actions" && card.state === "available") {
-    const proof = valueProofLine(facts.history);
-    if (proof === undefined) return undefined;
-    return (
-      <p data-value-proof className="text-xs leading-5 text-slate-600">
-        {proof}{" "}
-        <button type="button" onClick={facts.onProtection} className="font-semibold text-cyan-700 hover:text-cyan-900">
-          Protection <span aria-hidden="true">→</span>
-        </button>
+function AgentsStrip({
+  agents,
+  facts,
+  unreadable,
+  onOpenAgents,
+  className,
+}: {
+  agents: Polled<unknown>;
+  facts?: AgentsFacts;
+  unreadable: boolean;
+  onOpenAgents: () => void;
+  className: string;
+}) {
+  let body: ReactNode;
+  if (facts !== undefined) {
+    const listed = facts.agents.filter((agent) => isConnected(agent) || (agent.supported && agent.present));
+    const unsupported = facts.agents.filter((agent) => !agent.supported);
+    body = listed.length > 0 ? (
+      <AgentStrip agents={facts.agents} unnamed={facts.unnamed} max={STRIP_MAX} onOpenAgents={onOpenAgents} />
+    ) : (
+      <p className={BODY_TEXT}>
+        {unsupported.length > 0
+          ? `${nameList(unsupported.map((agent) => agent.name))} cannot be connected yet.`
+          : "No supported agent was found on this machine."}
       </p>
     );
+  } else if (unreadable || agents.error !== undefined) {
+    body = (
+      <NotRead onRetry={agents.refresh}>
+        {unreadable ? "Not read: the agents' answer could not be read." : "Not read: the dashboard did not answer for the agents."}
+      </NotRead>
+    );
+  } else {
+    body = <Pending className="h-40" />;
   }
-  // A Messages card that records can still need a step: a message hook an
-  // earlier version wrote, which the CLI names with the command that fixes it.
-  if (card.lane === "agent_messages" && card.state === "available") {
-    return laneStep(readLaneNextStep(facts.overview.lanes, card.lane));
-  }
-  if (card.state !== "no_source") return undefined;
-  // The first run's steps sit above the cards; the card does not repeat them.
-  if (card.lane === "agent_actions" && facts.nothingYet) {
-    return <p className="text-sm leading-6 text-slate-600">Start with the steps above.</p>;
-  }
-  return laneStep(readLaneNextStep(facts.overview.lanes, card.lane));
-}
-
-function laneStep(step: { command: string; line: string } | undefined): ReactNode {
-  if (step === undefined) return undefined;
+  // A new agent the person has not approved yet is theirs to decide, on Agents.
+  const waiting = facts === undefined ? [] : awaitingApproval(agentRows(agents.data as AgentsResponse));
   return (
-    <div data-lane-step>
-      <CopyCommand command={step.command} />
-      <p className="mt-1.5 text-xs leading-5 text-slate-600">{step.line}</p>
-    </div>
+    <Section id="overview-agents" title="Agents" className={`${PANEL} ${className}`}>
+      {agents.stale ? <StaleLine onRetry={agents.refresh} /> : null}
+      {body}
+      {waiting.length === 0 ? null : (
+        <p data-agents-waiting className={`flex flex-wrap items-center gap-x-2 gap-y-1 ${SMALL_TEXT} text-(--iw-ink-2)`}>
+          <span className="text-(--iw-review)"><Icon name="triangle" className="h-3.5 w-3.5" /></span>
+          <span>{formatCount(waiting.length)} new {waiting.length === 1 ? "agent waits" : "agents wait"} for your approval.</span>
+          <a href="?view=agents" onClick={onPlainClick(onOpenAgents)} className={`inline-flex min-h-9 items-center pointer-coarse:min-h-11 ${LINK_TEXT}`}>See Agents</a>
+        </p>
+      )}
+    </Section>
   );
 }
 
-function Tile({ label, children, link }: { label: string; children: ReactNode; link?: ReactNode }) {
-  return (
-    <div className="flex min-w-0 flex-col rounded-2xl border border-slate-200 bg-white p-3 shadow-sm sm:p-4">
-      <p className="text-xs font-semibold uppercase tracking-[0.14em] text-slate-500">{label}</p>
-      <div className="mt-2 min-w-0">{children}</div>
-      {link === undefined ? null : <div className="mt-auto pt-3">{link}</div>}
-    </div>
-  );
-}
-
-/** The four tiles: two across on a phone, four across on a desk. */
-export const TILES = "mt-3 grid grid-cols-2 gap-3 sm:gap-4 lg:grid-cols-4";
-
-function OnThisMachine({
-  context,
-  agentsLoaded,
-  agentsFailed,
-  rows,
-  record,
-  recordFailed,
-  recording,
-  outageSince,
-  wouldHaveRefused,
-  wouldSpan,
-  tokens,
-  tokensFailed,
-  tokensRead,
+/**
+ * Refused, or would have been: two numbers for the last 7 days and the
+ * fourteen days behind them, from the guard's log. An older CLI sends no
+ * days: the two numbers then come from the decision record, said as such,
+ * with no bars. A log that could not be read draws no number at all.
+ */
+function Refused({
+  history,
+  flagged,
+  now,
+  className,
 }: {
-  context: CommunityScreenContext;
-  agentsLoaded: boolean;
-  agentsFailed: boolean;
-  rows: AgentRow[];
-  record?: RecordSpan;
-  recordFailed: boolean;
-  recording?: boolean;
-  outageSince?: number;
-  /** Commands the agent card counts as "would have been refused" (monitor mode). */
-  wouldHaveRefused: number;
-  wouldSpan: string;
-  tokens?: { total: bigint; agents: number; sample: boolean };
-  tokensFailed: boolean;
-  /** The history was read and holds no counters: said, never left "reading". */
-  tokensRead: boolean;
+  history: Polled<History>;
+  flagged: Polled<DecisionsPage>;
+  now: number;
+  className: string;
 }) {
-  const summary = agentsSummary(rows);
-  const trust = trustCounts(rows, Date.now());
-  const waiting = awaitingApproval(rows);
-  const connected = summary.refusing + summary.watching;
-  const ringParts: Part[] = [
-    { key: "refusing", value: summary.refusing, tone: "accent", label: `Refusing: ${summary.refusing}` },
-    { key: "watching", value: summary.watching, tone: "watch", label: `Watching only: ${summary.watching}` },
-    { key: "needs", value: summary.needsYou.length, tone: "attention", label: `Need you: ${summary.needsYou.length}` },
-    { key: "other", value: summary.unconfirmed.length, tone: "off", label: `Status not confirmed: ${summary.unconfirmed.length}` },
-  ];
-  const mode = normaliseMode(context.meta);
-  const line = modeLine(rows);
-  // The CLI's own step for an agent that only watches (`innerwarden enforce`),
-  // printed as sent: the kit never builds it.
-  const enforceStep = rows.find((row) => row.state === "watching" && row.next !== undefined)?.next;
-  const watching = rows.some((row) => row.state === "watching");
-  return (
-    <section aria-labelledby="on-machine-title">
-      <h2 id="on-machine-title" className="text-xs font-semibold uppercase tracking-[0.14em] text-cyan-700">On this machine</h2>
-      <div className={TILES}>
-        <Tile label="Agents" link={<Go onClick={() => context.navigate("agents")}>Agents</Go>}>
-          {agentsFailed ? (
-            <p className="text-sm text-slate-600">Agents did not answer.</p>
-          ) : !agentsLoaded ? (
-            <p className="text-sm text-slate-500">Looking for agents</p>
-          ) : summary.total === 0 ? (
-            <p className="text-sm leading-6 text-slate-600">
-              {rows.some((row) => row.state === "unsupported")
-                ? `${nameList(rows.filter((row) => row.state === "unsupported").map((row) => row.name))} cannot be connected yet.`
-                : "No AI agent found on this machine."}
-            </p>
-          ) : (
-            <div className="flex flex-col items-start gap-2 sm:flex-row sm:items-center sm:gap-3">
-              <Ring parts={ringParts} size={44} stroke={6} label={`${connected} of ${summary.total} agents connected`} />
-              <div className="min-w-0">
-                <p className="flex flex-wrap items-baseline gap-x-1.5">
-                  <span className="text-xl font-semibold text-slate-950 sm:text-2xl">{connected} of {summary.total}</span>{" "}
-                  <span className="text-sm text-slate-600">connected</span>
-                </p>
-                {summary.needsYou.length > 0 ? (
-                  <p data-needs-you="" className="mt-0.5 text-xs font-semibold leading-5 text-amber-900">
-                    <span aria-hidden="true">! </span>
-                    {summary.needsYou.length} {summary.needsYou.every((row) => row.state === "partial") ? "partly connected" : "not connected"}: {nameList(summary.needsYou.map((row) => row.name))}
-                  </p>
-                ) : summary.unconfirmed.length > 0 ? (
-                  <p className="mt-0.5 text-xs leading-5 text-slate-600">
-                    {nameList(summary.unconfirmed.map((row) => row.name))}: status not confirmed.
-                  </p>
-                ) : (
-                  <p className="mt-0.5 text-xs leading-5 text-slate-600">Every agent found is connected.</p>
-                )}
-                {trust === undefined ? null : (
-                  <p data-agent-trust className="mt-1 text-xs leading-5 text-slate-600">
-                    {agentTrustSentence(trust, PLATFORM_WORDS[asPlatform(context.bootstrap?.platform.os)])}
-                  </p>
-                )}
-                {waiting.length === 0 ? null : (
-                  <p data-needs-you="" data-agents-waiting className="mt-1 text-xs font-semibold leading-5 text-amber-900">
-                    <span aria-hidden="true">! </span>
-                    {waiting.length} new {waiting.length === 1 ? "agent waits" : "agents wait"} for your approval.
-                  </p>
-                )}
-              </div>
-            </div>
-          )}
-        </Tile>
-        <Tile label="Mode" link={<Go onClick={() => context.navigate("posture")}>Protection</Go>}>
-          <p className="text-xl font-semibold text-slate-950 sm:text-2xl">{modeWord(rows) ?? MODE_WORDS[mode]}</p>
-          {line === undefined ? null : <p className="mt-1 text-xs leading-5 text-slate-600">{line}</p>}
-          {watching && wouldHaveRefused > 0 ? (
-            <p data-mode-step className="mt-1 text-xs leading-5 text-slate-700">
-              {formatCount(wouldHaveRefused)} {wouldHaveRefused === 1 ? "command" : "commands"} would have been refused {wouldSpan}.
-              {enforceStep === undefined ? null : (
-                <> <code className="font-mono text-slate-900">{enforceStep.command}</code> refuses them.</>
-              )}
-            </p>
-          ) : null}
-        </Tile>
-        <Tile label="Decision record" link={<Go onClick={() => context.navigate("activity")}>Cases</Go>}>
-          {record === undefined ? (
-            <p className="text-sm text-slate-600">{recordFailed ? "Could not be read." : "Reading the record"}</p>
-          ) : (
-            <>
-              <p className="flex flex-wrap items-baseline gap-x-1.5">
-                <span className="text-xl font-semibold text-slate-950 sm:text-2xl">{formatCount(record.decisions)}</span>{" "}
-                <span className="text-sm text-slate-600">
-                  {record.decisions === 1 ? "decision" : "decisions"}
-                  {record.oldestAt === undefined ? "" : ` since ${formatDay(record.oldestAt)}`}
-                </span>
-              </p>
-              {record.checked > 0 ? (
-                <p data-record-checked className="mt-0.5 text-xs leading-5 text-slate-600">
-                  {formatCount(record.checked)} of them {record.checked === 1 ? "a check" : "checks"} by hand.
-                </p>
-              ) : null}
-            </>
-          )}
-          {recording === false ? (
-            <p data-needs-you="" className="mt-1 text-xs font-semibold leading-5 text-amber-900">
-              <span aria-hidden="true">! </span>Not recording{outageSince === undefined ? "" : " since "}
-              {outageSince === undefined ? null : <When at={outageSince * 1_000} />}
-            </p>
-          ) : recording === true && record !== undefined ? (
-            <p className="mt-1 text-xs leading-5 text-slate-600">Recording.</p>
-          ) : null}
-        </Tile>
-        <Tile label="Tokens" link={<Go onClick={() => context.navigate("tokens")}>Tokens</Go>}>
-          {tokens === undefined ? (
-            <p className="text-sm leading-6 text-slate-600">
-              {tokensFailed ? "Token history did not answer." : tokensRead ? "No agent here keeps a token history this can read." : "Reading local history"}
-            </p>
-          ) : (
-            <>
-              <p className="flex flex-wrap items-baseline gap-x-1.5">
-                <span className="text-xl font-semibold text-slate-950 sm:text-2xl">{compactCount(tokens.total)}</span>{" "}
-                <span className="text-sm text-slate-600">tokens</span>
-              </p>
-              <p className="mt-1 text-xs leading-5 text-slate-600">
-                {tokens.agents === 1 ? "From 1 agent's own history" : `From ${tokens.agents} agents' own history`}
-                {tokens.sample ? " (a sample, not the total)" : ""}
-              </p>
-            </>
-          )}
-        </Tile>
-      </div>
-    </section>
-  );
-}
-
-function RecentFlagged({
-  loading,
-  failed,
-  runs,
-  total,
-  sinceWords,
-  screened,
-  dominant,
-  hidingDominant,
-  onToggleDominant,
-  onOpen,
-  onAll,
-  onReason,
-}: {
-  loading: boolean;
-  failed: boolean;
-  /** The newest flagged situations: a run of one reason in one session is one. */
-  runs: Run<Decision>[];
-  /** Every flagged decision in the record: what "nothing flagged" is decided by, never the rows drawn. */
-  total?: number;
-  sinceWords?: string;
-  screened?: number;
-  /** A reason that is more than half of everything flagged, when one is. */
-  dominant?: Reason;
-  hidingDominant: boolean;
-  onToggleDominant: () => void;
-  onOpen: (id: string) => void;
-  onAll: () => void;
-  onReason: (reason: string) => void;
-}) {
-  return (
-    <section aria-labelledby="recent-flagged-title">
-      <div className="flex flex-wrap items-end justify-between gap-x-4 gap-y-1">
-        <h2 id="recent-flagged-title" className="text-lg font-semibold text-slate-950">Recently flagged</h2>
-        {total !== undefined && total > 0 ? <Go onClick={onAll}>See all {formatCount(total)} in Cases</Go> : null}
-      </div>
-      <div className="mt-3">
-        {loading ? (
-          <Skeleton className="h-40" />
-        ) : failed ? (
-          <Unreadable title="The flagged commands could not be read" />
-        ) : total === 0 ? (
-          <p className="rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-600">
-            {screened === undefined || screened === 0
-              ? "Nothing flagged yet."
-              : `Nothing flagged${sinceWords === undefined ? "" : ` since ${sinceWords}`}. Every command was screened and allowed.`}
+  const data = history.data;
+  let body: ReactNode;
+  if (data === undefined) {
+    body = history.error === undefined
+      ? <Pending className="h-48" />
+      : <NotRead at={now} onRetry={history.refresh}>Not read: the dashboard did not answer for the guard's log.</NotRead>;
+  } else if (!data.readable) {
+    body = <NotRead>Not read: the guard's log could not be read.</NotRead>;
+  } else if (data.refusals.days !== undefined) {
+    const sums = refusalSums(data.refusals.days);
+    const since = data.since === undefined ? undefined : shortDay(data.since);
+    body = (
+      <>
+        <div className="grid grid-cols-2 gap-4">
+          <CountStat value={sums.blocked} label="Refused before they ran" tone="stopped" fill="solid" />
+          <CountStat value={sums.wouldBlock} label="Would have been refused" tone="deny" fill="hatched" />
+        </div>
+        <DayBars days={data.refusals.days} />
+        {sums.today === undefined ? null : (
+          <p data-today className={`${SMALL_TEXT} text-(--iw-ink-2)`}>
+            Today so far: {formatCount(sums.today.blocked)} refused, {formatCount(sums.today.wouldBlock)} would have.
           </p>
-        ) : (
-          <ul className="divide-y divide-slate-100 overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
-            {dominant === undefined ? null : (
-              <li data-dominant-reason={dominant.key} className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 bg-slate-50 px-4 py-2 text-xs text-slate-600">
-                <span>
-                  {hidingDominant
-                    ? `${formatCount(dominant.count)} from the ${dominant.short} rule, hidden here.`
-                    : `Showing the ${formatCount(dominant.count)} from the ${dominant.short} rule.`}
-                </span>
-                <button type="button" onClick={onToggleDominant} aria-pressed={!hidingDominant} className="font-semibold text-cyan-700 hover:text-cyan-900">
-                  {hidingDominant ? "Show" : "Hide"}
-                </button>
-              </li>
-            )}
-            {runs.length === 0 ? (
-              <li className="px-4 py-3 text-sm text-slate-600">
-                {hidingDominant ? "Nothing else was flagged." : `${formatCount(total ?? 0)} flagged could not be shown.`}
-              </li>
-            ) : null}
-            {runs.map((run) => (
-              <Fragment key={run.first.id}>
-                <CaseRow item={run.first} open={false} onOpen={onOpen} />
-                {run.folded.length === 0 ? null : (
-                  <li className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 border-l-2 border-dashed border-slate-300 bg-slate-50 py-2 pl-8 pr-4 text-xs text-slate-600">
-                    <span>{formatCount(run.folded.length)} more in a row, flagged for the same reason</span>
-                    <button type="button" onClick={() => onReason(run.first.reason.key)} className="font-semibold text-cyan-700 hover:text-cyan-900">
-                      See them <span aria-hidden="true">→</span>
-                    </button>
-                  </li>
-                )}
-              </Fragment>
-            ))}
-          </ul>
         )}
+        <SourceLine>
+          From the guard's log, last 7 days (UTC).{since === undefined ? "" : ` It keeps refusals since ${since}.`}
+        </SourceLine>
+      </>
+    );
+  } else {
+    const page = flagged.data;
+    body = page === undefined ? (
+      flagged.error === undefined ? <Pending className="h-24" /> : <NotRead onRetry={flagged.refresh}>Not read: the decision record could not be read.</NotRead>
+    ) : (
+      <>
+        <div className="grid grid-cols-2 gap-4">
+          <CountStat value={page.byOutcome.refused_before_run ?? 0} label="Refused before they ran" tone="stopped" fill="solid" />
+          <CountStat value={page.byOutcome.would_have_refused ?? 0} label="Would have been refused" tone="deny" fill="hatched" />
+        </div>
+        <SourceLine>
+          {page.record.decisions === 0
+            ? "From the decision record: nothing recorded yet."
+            : <span title={recordSpanTitle(page.record)}>{recordSourceLine(page.record, now)}</span>}
+        </SourceLine>
+      </>
+    );
+  }
+  return (
+    <Section id="refused" title="Refused, or would have been" tour="overview-lanes" className={`${PANEL} ${className}`}>
+      {history.stale ? <StaleLine onRetry={history.refresh} /> : null}
+      {body}
+      <ReadAt data={data} path="/api/guard/history" />
+    </Section>
+  );
+}
+
+/** The agent Getting started names: the first one found here and not connected, with a step the CLI sent. */
+function firstFound(facts: AgentsFacts | undefined): AgentFacts | undefined {
+  return facts?.agents.find((agent) => !isConnected(agent) && agent.supported && agent.present && agent.nextStep !== undefined);
+}
+
+/**
+ * The first run, in place of Needs a look: three steps, each a thing to do
+ * on THIS machine. With no supported agent here, the first step asks for
+ * one: connecting would connect nothing.
+ */
+function GettingStarted({ facts }: { facts?: AgentsFacts }) {
+  const agent = firstFound(facts);
+  const none = facts !== undefined && !facts.agents.some((candidate) => candidate.supported && candidate.present);
+  const connect: BandStep = none
+    ? { label: "Install a supported agent (Claude Code, Codex, Cursor, Gemini CLI), then connect it." }
+    : agent?.nextStep !== undefined
+      ? { label: "Connect your agent:", command: agent.nextStep.command, line: agent.nextStep.line }
+      : { label: "Connect your agent:", command: CONNECT_ALL, line: "Connects every agent it finds, in monitor: it records and refuses nothing." };
+  const restart: Restart = agent === undefined
+    ? { agent: "your agent", words: restartWords("", "your agent") }
+    : { agent: agent.name, words: restartFor(agent.id, agent.name, agent.restart) };
+  return (
+    <Section id="getting-started" title="Getting started" className={PANEL}>
+      <ol data-get-started className="space-y-3">
+        <li className="flex gap-3">
+          <StepNumber n={1} />
+          <div className="min-w-0 flex-1"><StepBlock step={connect} /></div>
+        </li>
+        <li className="flex gap-3">
+          <StepNumber n={2} />
+          <div className="min-w-0 flex-1 space-y-2 rounded-lg bg-(--iw-surface-2) p-3">
+            <p className="text-sm leading-[21px] font-medium text-(--iw-ink)">Restart it:</p>
+            <RestartNote agent={restart.agent} words={restart.words} />
+          </div>
+        </li>
+        <li className="flex gap-3">
+          <StepNumber n={3} />
+          <p className={`min-w-0 flex-1 pt-0.5 ${BODY_TEXT}`}>Ask it to run any command. The decision shows here within seconds.</p>
+        </li>
+      </ol>
+    </Section>
+  );
+}
+
+function StepNumber({ n }: { n: number }) {
+  return (
+    <span aria-hidden="true" className="mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-full border border-(--iw-line-strong) text-xs font-semibold tabular-nums text-(--iw-ink-2)">
+      {n}
+    </span>
+  );
+}
+
+/**
+ * Needs a look: the three newest denies and why commands were flagged, from
+ * the decision record, said with the span it covers. No Hide here: hiding a
+ * reason is a view of the Cases list, done there.
+ */
+function NeedsALook({
+  denies,
+  flagged,
+  facts,
+  connected,
+  agentsPending,
+  now,
+  onOpen,
+  onReason,
+  onAll,
+  className,
+}: {
+  denies: Polled<DecisionsPage>;
+  flagged: Polled<DecisionsPage>;
+  facts?: AgentsFacts;
+  connected: boolean;
+  /** The agents have not answered yet, and have not failed. */
+  agentsPending: boolean;
+  now: number;
+  onOpen: (id: string) => void;
+  onReason: (reason: string) => void;
+  onAll: () => void;
+  className: string;
+}) {
+  const page = flagged.data;
+  if (page === undefined) {
+    return (
+      <Section id="needs-a-look" title="Needs a look" className={`${PANEL} ${className}`}>
+        {flagged.error === undefined ? (
+          <Pending className="h-48" />
+        ) : (
+          <NotRead alert at={now} onRetry={flagged.refresh}>
+            The decision record could not be read. <code className="font-mono">innerwarden status</code> says why.
+          </NotRead>
+        )}
+      </Section>
+    );
+  }
+  const record = page.record;
+  // A first run: nothing recorded, and no agent connected to record anything.
+  // Until the agents answer, it is not yet known which of the two it is.
+  if (record.decisions === 0 && facts === undefined && agentsPending) {
+    return (
+      <Section id="needs-a-look" title="Needs a look" className={`${PANEL} ${className}`}>
+        <Pending className="h-32" />
+      </Section>
+    );
+  }
+  if (record.decisions === 0 && !connected) {
+    return <div className={className}><GettingStarted facts={facts} /></div>;
+  }
+  const source = record.decisions === 0 ? null : (
+    <SourceLine>
+      <span title={recordSpanTitle(record)}>{recordSourceLine(record, now)}</span>
+      {record.capped === true ? " Older ones are dropped as new ones arrive." : null}
+    </SourceLine>
+  );
+  let body: ReactNode;
+  if (record.decisions === 0) {
+    body = <p className={BODY_TEXT}>Nothing recorded yet. Ask your agent to run any command. The decision shows here within seconds.</p>;
+  } else if (page.flaggedTotal === 0) {
+    const from = record.oldestAt === undefined ? undefined : shortStamp(record.oldestAt);
+    body = <p className={BODY_TEXT}>Nothing flagged in the record{from === undefined ? "" : ` (${from} to now)`}.</p>;
+  } else {
+    const reasons = page.reasons.slice(0, REASONS_SHOWN);
+    body = (
+      <div className="space-y-6">
+        <div className="space-y-2">
+          <h3 className="text-sm leading-[21px] font-semibold text-(--iw-ink)">Newest denies</h3>
+          {denies.stale ? <StaleLine onRetry={denies.refresh} /> : null}
+          {denies.data === undefined ? (
+            denies.error === undefined ? <Pending className="h-28" /> : <NotRead onRetry={denies.refresh}>Not read: the dashboard did not answer for the newest denies.</NotRead>
+          ) : denies.data.items.length === 0 ? (
+            <p className={BODY_TEXT}>
+              {denies.data.total > 0 ? `${formatCount(denies.data.total)} denied could not be shown.` : "No command was denied in the record."}
+            </p>
+          ) : (
+            <ul className="-mx-3 divide-y divide-(--iw-line)">
+              {denies.data.items.slice(0, DENIES_SHOWN).map((decision) => (
+                <DecisionRow
+                  key={decision.id}
+                  decision={decision}
+                  href={`?view=activity&decision=${encodeURIComponent(decision.id)}`}
+                  onOpen={() => onOpen(decision.id)}
+                />
+              ))}
+            </ul>
+          )}
+        </div>
+        <div className="space-y-2">
+          <h3 className="text-sm leading-[21px] font-semibold text-(--iw-ink)">Why commands were flagged</h3>
+          {reasons.length === 0 ? (
+            <p className={BODY_TEXT}>{formatCount(page.flaggedTotal)} flagged could not be shown.</p>
+          ) : (
+            <ul className="-mx-3 divide-y divide-(--iw-line)">
+              {reasons.map((reason) => (
+                <ReasonRow
+                  key={reason.key}
+                  reason={reason}
+                  href={`?view=activity&reason=${encodeURIComponent(reason.key)}`}
+                  onOpen={() => onReason(reason.key)}
+                />
+              ))}
+            </ul>
+          )}
+        </div>
+        <a
+          href="?view=activity"
+          data-see-all
+          onClick={onPlainClick(onAll)}
+          className={`inline-flex min-h-9 items-center gap-1 text-sm pointer-coarse:min-h-11 ${LINK_TEXT}`}
+        >
+          See all {formatCount(page.flaggedTotal)} flagged in Cases <Icon name="arrow-right" className="h-3.5 w-3.5" />
+        </a>
       </div>
+    );
+  }
+  return (
+    <Section id="needs-a-look" title="Needs a look" className={`${PANEL} ${className}`}>
+      {flagged.stale ? <StaleLine onRetry={flagged.refresh} /> : null}
+      {source}
+      {body}
+      <ReadAt data={page} path="/api/guard/decisions" />
+    </Section>
+  );
+}
+
+const STAMP = new Intl.DateTimeFormat("en-GB", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
+
+/** "25 Sept, 17:34", in the reader's own clock. */
+function shortStamp(iso: string): string | undefined {
+  const ms = Date.parse(iso);
+  return Number.isFinite(ms) ? STAMP.format(ms) : undefined;
+}
+
+type FooterItem = { key: string; words: string; section?: string; route?: "posture" | "activity" | "tokens"; params?: Record<string, string> };
+
+/** The footer's words for each control, from what was read; never a guess for what was not. */
+export function footerItems(
+  health: RecordHealth | undefined,
+  protection: Protection | undefined,
+  history: History | undefined,
+): FooterItem[] {
+  const items: FooterItem[] = [];
+  items.push({
+    key: "record",
+    words: health === undefined ? "Record: not read." : health.recording ? "Record: recording." : "Record: not recording.",
+    section: "record",
+  });
+  if (protection === undefined) {
+    items.push({ key: "alerts", words: "Alerts: not read.", section: "alerts" });
+    items.push({ key: "jail", words: "AI Jail: not read.", section: "jail" });
+    items.push({ key: "second-opinion", words: "Second opinion: not read.", section: "second-opinion" });
+  } else {
+    const channels = protection.alerts.channels;
+    items.push({
+      key: "alerts",
+      words: channels === 0 ? "Alerts: off." : `Alerts: ${formatCount(channels)} ${channels === 1 ? "channel" : "channels"}.`,
+      section: "alerts",
+    });
+    const jail = protection.jail;
+    items.push({
+      key: "jail",
+      words: !jail.available
+        ? "AI Jail: not available."
+        : jail.checksPass === true
+          ? "AI Jail: ready."
+          : jail.checksPass === false
+            ? "AI Jail: needs you."
+            : "AI Jail: not checked here yet.",
+      section: "jail",
+    });
+    items.push({ key: "second-opinion", words: protection.secondOpinion.configured ? "Second opinion: on." : "Second opinion: off.", section: "second-opinion" });
+  }
+  const messages = history?.messages.recorded ?? 0;
+  if (protection?.observe.available === true || messages > 0) {
+    items.push(
+      history === undefined
+        ? { key: "messages", words: "Messages: not read.", route: "activity", params: { lane: "agent_messages" } }
+        : { key: "messages", words: `Messages: ${formatCount(messages)} recorded.`, route: "activity", params: { lane: "agent_messages" } },
+    );
+  }
+  items.push({ key: "tokens", words: "Tokens", route: "tokens" });
+  return items;
+}
+
+/** Scroll to a section of the page just opened, once it is drawn; a page that never draws it is left as it is. */
+function scrollWhenDrawn(id: string, tries = 20) {
+  const element = document.getElementById(id);
+  if (element !== null) {
+    element.scrollIntoView({ block: "start" });
+    return;
+  }
+  if (tries > 0) setTimeout(() => scrollWhenDrawn(id, tries - 1), 100);
+}
+
+/** One line: the rest of what is on this machine, each item a link to where it is set. */
+function FooterLine({
+  health,
+  protection,
+  history,
+  navigate,
+}: {
+  health: Polled<RecordHealth>;
+  protection: Polled<Protection>;
+  history: Polled<History>;
+  navigate: CommunityScreenContext["navigate"];
+}) {
+  const items = footerItems(health.data, protection.data, history.data);
+  return (
+    <section aria-labelledby="overview-footer-title" data-overview-footer className="rounded-[10px] bg-(--iw-surface-2) px-4 py-3">
+      <h2 id="overview-footer-title" className="sr-only">The rest of this machine</h2>
+      <ul className={`flex flex-wrap gap-x-4 gap-y-1 ${SMALL_TEXT} text-(--iw-ink-2)`}>
+        {items.map((item) => {
+          const route = item.route ?? "posture";
+          const query = new URLSearchParams({ view: route, ...(item.params ?? {}) }).toString();
+          const href = `?${query}${item.section === undefined ? "" : `#${item.section}`}`;
+          const open = () => {
+            navigate(route, item.params);
+            if (item.section !== undefined) setTimeout(() => scrollWhenDrawn(item.section!), 0);
+          };
+          return (
+            <li key={item.key} data-footer-item={item.key}>
+              <a href={href} onClick={onPlainClick(open)} className="inline-flex min-h-9 items-center underline-offset-2 hover:text-(--iw-accent) hover:underline pointer-coarse:min-h-11">
+                {item.words}
+              </a>
+            </li>
+          );
+        })}
+      </ul>
+      <ReadAt data={protection.data} path="/api/guard/protection" />
     </section>
   );
 }
 
 /**
- * A first run's steps, where a new reader sees them first: under the page's
- * heading, before any card. Only commands that do something on THIS machine
- * are offered: connecting when an agent is here, installing one when none is.
- * The page they are reading is not a step.
+ * A message hook an earlier version wrote keeps running after an upgrade.
+ * The CLI names it, with the command that fixes it, beside the messages it
+ * still records; the step is printed as sent. Nothing when it sends none.
  */
-function GetStarted({ rows, agentsLoaded, connect }: { rows: readonly AgentRow[]; agentsLoaded: boolean; connect?: string }) {
-  const found = rows.filter((row) => row.state !== "unsupported");
-  const steps: { title: string; command?: string; line: string }[] = [
-    agentsLoaded && found.length === 0
-      ? {
-          title: "Install a supported agent (Claude Code, Codex, Cursor, Gemini CLI), then connect it",
-          line: "Once one is installed, this step shows the command that connects it.",
-        }
-      : {
-          title: "Connect your agents in monitor mode",
-          command: connect ?? "innerwarden agents connect --all --monitor",
-          line: "Every command they try is recorded and nothing is refused.",
-        },
-    { title: "Use your agent as usual", line: "Flagged commands appear under Cases, one case each." },
-    { title: "Refuse a deny when you are ready", command: "innerwarden enforce", line: "A deny is then refused before it runs." },
-  ];
+function MessagesStep({ overview }: { overview?: OverviewPayload }) {
+  const lanes = (overview as (OverviewPayload & { lanes?: unknown }) | undefined)?.lanes;
+  const lane = (lanes as Record<string, { availability?: unknown }> | undefined)?.agent_messages;
+  const step = lane?.availability === "available" ? readLaneNextStep(lanes, "agent_messages") : undefined;
+  if (step === undefined) return null;
   return (
-    <section aria-labelledby="get-started-title" data-get-started="" className={CARD}>
-      <h2 id="get-started-title" className="text-lg font-semibold text-slate-950">Getting started</h2>
-      <ol className="mt-3 space-y-4">
-        {steps.map((step, index) => (
-          <li key={step.title} className="flex gap-3">
-            <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-slate-900 text-[11px] font-semibold text-white">{index + 1}</span>
-            <div className="min-w-0 flex-1">
-              <p className="text-sm font-semibold text-slate-900">{step.title}</p>
-              {step.command === undefined ? null : <CopyCommand command={step.command} className="mt-1.5 max-w-xl" />}
-              <p className="mt-1 text-xs leading-5 text-slate-600">{step.line}</p>
-            </div>
-          </li>
-        ))}
-      </ol>
-    </section>
+    <div data-lane-step className="max-w-xl">
+      <StepBlock step={{ label: "Messages to your agent:", command: step.command, line: step.line }} />
+    </div>
   );
 }
 
-/** The numbers behind the cards, for whoever asks: technical view only. */
+/** The numbers behind the page, for whoever asks: technical view only. */
 function OverviewRecords({ overview }: { overview: OverviewPayload }) {
   const [technical] = useTechnicalDetail();
   if (!technical) return null;
@@ -609,52 +651,45 @@ function OverviewRecords({ overview }: { overview: OverviewPayload }) {
     ["ran", Math.max(0, overview.commands - refused - would - checked - unknown)],
     ["outcome not recorded", unknown],
   ];
+  const list = (rows: [string, number][]) => (
+    <dl className={`space-y-1 ${SMALL_TEXT}`}>
+      {rows.map(([name, value]) => (
+        <div key={name} className="flex justify-between gap-3">
+          <dt className="text-(--iw-ink-3)">{name}</dt>
+          <dd className="font-semibold tabular-nums text-(--iw-ink)">{formatCount(value)}</dd>
+        </div>
+      ))}
+    </dl>
+  );
   return (
-    <TechnicalOnly>
-      <section aria-labelledby="overview-records-title" className="space-y-6 border-t border-slate-200 pt-6">
-        <div>
-          <p className="text-xs font-semibold uppercase tracking-[0.14em] text-cyan-700">Technical detail</p>
-          <h2 id="overview-records-title" className="mt-1 text-lg font-semibold text-slate-950">The records behind these cards</h2>
+    <Section id="overview-records" title="The records behind these numbers" className="border-t border-(--iw-line) pt-6">
+      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+        <div className={PANEL}><p className="mb-2 text-xs font-medium text-(--iw-ink-3)">By verdict</p>{list(verdicts)}</div>
+        <div className={PANEL}><p className="mb-2 text-xs font-medium text-(--iw-ink-3)">By outcome</p>{list(outcomes)}</div>
+        <div className={PANEL}>
+          <p className="mb-2 text-xs font-medium text-(--iw-ink-3)">The record</p>
+          <dl className={`space-y-1 ${SMALL_TEXT} text-(--iw-ink-2)`}>
+            <div><dt className="inline text-(--iw-ink-3)">Decisions kept: </dt><dd className="inline tabular-nums">{formatCount(record?.decisions ?? overview.commands)}</dd></div>
+            {record?.oldestAt === undefined ? null : <div><dt className="inline text-(--iw-ink-3)">Oldest: </dt><dd className="inline">{formatAbsolute(record.oldestAt)}</dd></div>}
+            {record?.newestAt === undefined ? null : <div><dt className="inline text-(--iw-ink-3)">Newest: </dt><dd className="inline">{formatAbsolute(record.newestAt)}</dd></div>}
+            {record?.capped === undefined ? null : <div><dt className="inline text-(--iw-ink-3)">Full: </dt><dd className="inline">{record.capped ? "yes, the oldest are dropped as new ones arrive" : "no"}</dd></div>}
+          </dl>
         </div>
-        <div className="grid gap-3 sm:grid-cols-2 sm:gap-4 lg:grid-cols-3">
-          <Tile label="By verdict">
-            <dl className="space-y-1 text-sm">
-              {verdicts.map(([name, count]) => (
-                <div key={name} className="flex justify-between gap-3"><dt className="text-slate-600">{name}</dt><dd className="font-semibold tabular-nums text-slate-950">{formatCount(count)}</dd></div>
-              ))}
-            </dl>
-          </Tile>
-          <Tile label="By outcome">
-            <dl className="space-y-1 text-sm">
-              {outcomes.map(([name, count]) => (
-                <div key={name} className="flex justify-between gap-3"><dt className="text-slate-600">{name}</dt><dd className="font-semibold tabular-nums text-slate-950">{formatCount(count)}</dd></div>
-              ))}
-            </dl>
-          </Tile>
-          <Tile label="The record">
-            <dl className="space-y-1 text-sm text-slate-700">
-              <div><dt className="inline text-slate-500">Decisions kept: </dt><dd className="inline tabular-nums">{formatCount(record?.decisions ?? overview.commands)}</dd></div>
-              {record?.oldestAt === undefined ? null : <div><dt className="inline text-slate-500">Oldest: </dt><dd className="inline"><When at={record.oldestAt} /></dd></div>}
-              {record?.newestAt === undefined ? null : <div><dt className="inline text-slate-500">Newest: </dt><dd className="inline"><When at={record.newestAt} /></dd></div>}
-            </dl>
-            <p className="mt-2 text-xs leading-5 text-slate-500">InnerWarden keeps the newest decisions; older ones are dropped.</p>
-          </Tile>
+      </div>
+      {overview.top_categories.length === 0 ? null : (
+        <div className={PANEL}>
+          <p className="text-sm font-semibold text-(--iw-ink)">Rule categories matched</p>
+          <p className={`mt-1 ${META_TEXT}`}>These count categories matched, not decisions: one decision can match several.</p>
+          <ul className="mt-2 flex flex-wrap gap-2 text-xs">
+            {overview.top_categories.slice(0, 8).map((category) => (
+              <li key={category.name} className="rounded-full border border-(--iw-line) bg-(--iw-surface-2) px-2.5 py-0.5 text-(--iw-ink-2)">
+                {humanizeToken(category.name)} <span className="font-semibold tabular-nums">{formatCount(category.count)}</span>
+              </li>
+            ))}
+          </ul>
         </div>
-        {overview.top_categories.length === 0 ? null : (
-          <div className={CARD}>
-            <p className="text-sm font-semibold text-slate-900">Rule categories matched</p>
-            <p className="mt-1 text-xs leading-5 text-slate-500">These count categories matched, not decisions: one decision can match several.</p>
-            <ul className="mt-2 flex flex-wrap gap-2 text-xs">
-              {overview.top_categories.slice(0, 8).map((category) => (
-                <li key={category.name} className="rounded-full border border-slate-200 bg-slate-50 px-2.5 py-0.5 text-slate-700">
-                  {humanizeToken(category.name)} <span className="font-semibold tabular-nums">{formatCount(category.count)}</span>
-                </li>
-              ))}
-            </ul>
-          </div>
-        )}
-        <MachineIntelligence edition="community" showAgents showTokens tones="neutral" />
-      </section>
-    </TechnicalOnly>
+      )}
+      <ReadAt data={overview} path="/api/guard/overview" />
+    </Section>
   );
 }

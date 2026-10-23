@@ -198,7 +198,7 @@ export const COMMUNITY_TABS = [
 
 /** What each page draws once it has an answer, to wait on before measuring. */
 export const PAGE_READY: Record<(typeof COMMUNITY_TABS)[number][0], string> = {
-  Overview: "#on-machine-title",
+  Overview: "#verdict-title",
   Protection: "#protection-title",
   Cases: "#cases-title",
   Agents: "#agents-title",

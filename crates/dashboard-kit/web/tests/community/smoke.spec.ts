@@ -11,7 +11,7 @@ test("Community works with every Enterprise producer absent", async ({ page }) =
   await page.goto("/");
 
   await expect(page.getByText("Community", { exact: true })).toBeVisible();
-  await expect(page.getByRole("heading", { name: "What is happening here" })).toBeVisible();
+  await expect(page.getByRole("heading", { level: 1, name: /^Overview: / })).toBeVisible();
   await expect(page.getByRole("navigation", { name: "Dashboard views" }).getByRole("button")).toHaveText(COMMUNITY_TABS.map(([label]) => label));
   await expect(page.getByText("InnerWarden Enterprise", { exact: true })).toHaveCount(0);
   expect(postureRequests).toEqual([]);

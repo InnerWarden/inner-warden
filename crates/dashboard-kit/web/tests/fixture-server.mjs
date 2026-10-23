@@ -188,7 +188,15 @@ const server = createServer(async (request, response) => {
       if (path === "/api/guard/decisions") {
         const file = address.searchParams.has("cursor") ? "decisions-page-2.json" : "decisions-page-1.json";
         const page = JSON.parse(String(await fixtureFile(scenario, file)));
-        // A smaller page (the Overview's five) is the first rows of the same
+        // `verdict` (the Overview's newest denies) keeps the rows whose rules
+        // said that verdict, as the CLI filters them, and counts what matched.
+        const verdict = address.searchParams.get("verdict");
+        if (verdict !== null) {
+          page.items = page.items.filter((item) => item.recommendation === verdict);
+          page.total = page.items.length;
+          delete page.next_cursor;
+        }
+        // A smaller page (the Overview's three) is the first rows of the same
         // page, with the cursor the server would send after them.
         const limit = Number.parseInt(address.searchParams.get("limit") ?? "", 10);
         if (Number.isInteger(limit) && limit > 0 && limit < page.items.length) page.items = page.items.slice(0, limit);

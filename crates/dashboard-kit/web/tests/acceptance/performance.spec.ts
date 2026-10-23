@@ -134,7 +134,7 @@ test.describe("CJC-090 / spec 090 T155 — dashboard performance acceptance", ()
     await page.goto("/", { waitUntil: "commit" });
     // The Community shell's first meaningful, claim-honest content — not a spinner.
     await expect(page.getByText("Community", { exact: true })).toBeVisible();
-    await expect(page.getByRole("heading", { name: "What is happening here" })).toBeVisible();
+    await expect(page.getByRole("heading", { level: 1, name: /^Overview: / })).toBeVisible();
     const elapsed = Date.now() - started;
     expect(
       elapsed,

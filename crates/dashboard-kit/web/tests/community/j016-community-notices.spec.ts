@@ -13,8 +13,17 @@ for (const [label, path] of COMMUNITY_TABS) {
     await page.route(guardRoute("meta"), (route) => fulfillJson(route, { ...META, exposed: true }));
     await page.goto(path);
     await expect(page.locator(PAGE_READY[label])).toBeVisible();
-    const notice = page.locator("main [data-exposed][role=alert]");
-    await expect(notice).toContainText("This dashboard is open to the network with no sign-in.");
+    if (path === "/") {
+      // The Overview's band says it, with the step that closes it: not a second banner.
+      const band = page.locator('[data-verdict-row="1"]');
+      await expect(band).toHaveAttribute("data-tone", "exposed");
+      await expect(band).toContainText("This dashboard is open to the network");
+      await expect(band).toContainText("Anyone who can reach this machine can read your agents' commands here.");
+      await expect(page.locator("main [data-exposed]")).toHaveCount(0);
+    } else {
+      const notice = page.locator("main [data-exposed][role=alert]");
+      await expect(notice).toContainText("This dashboard is open to the network with no sign-in.");
+    }
     await expect(page.locator('header [data-pill="exposed"]')).toHaveText(/Open to network/);
     await expectHonestUpsell(page);
   });
@@ -28,6 +37,17 @@ for (const [label, path] of COMMUNITY_TABS) {
     }));
     await page.goto(path);
     await expect(page.locator(PAGE_READY[label])).toBeVisible();
+    if (path === "/") {
+      // The Overview's band says it, with what was lost and the step that says why.
+      const band = page.locator('[data-verdict-row="2"]');
+      await expect(band).toHaveAttribute("data-tone", "needs");
+      await expect(band).toContainText("Decisions are not being recorded");
+      await expect(band).toContainText("37 actions were not recorded.");
+      await expect(band).toContainText("the decision store could not be written");
+      await expect(band.locator("[data-command]")).toHaveText("innerwarden status");
+      await expect(page.locator('main [data-notice="recording"]')).toHaveCount(0);
+      return;
+    }
     const notice = page.locator('main [data-notice="recording"]');
     await expect(notice).toHaveAttribute("data-needs-you", "");
     await expect(notice).toContainText("InnerWarden is not recording decisions since");

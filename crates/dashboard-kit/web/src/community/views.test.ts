@@ -5,6 +5,10 @@ import tokensFixture from "../../tests/fixtures/community/token-intelligence.jso
 import { agentRows, agentsSummary, agentState, modeLine, modeWord, nameList } from "./agentsView";
 import { communityControls, controlCounts, controlRing } from "./controls";
 import { share, tokenRow, tokenRows, tokenTotal } from "./tokensView";
+import historyFixture from "../../tests/fixtures/community/history.json";
+import protectionFixture from "../../tests/fixtures/community/protection.json";
+import { readHistory, readProtection, type Protection } from "./api";
+import { footerItems, recordSourceLine, refusalSums, shortDay } from "./Overview";
 
 const agents = agentsFixture as unknown as AgentsResponse;
 const tokens = tokensFixture as unknown as TokenIntelligenceResponse;
@@ -130,5 +134,64 @@ describe("what Community covers", () => {
     for (const control of communityControls({ agents: rows, now })) {
       for (const step of control.ladder ?? []) expect(step.mark).not.toBe("verified");
     }
+  });
+});
+
+describe("the Overview's counts and lines", () => {
+  const history = readHistory(historyFixture);
+  const protection = readProtection(protectionFixture);
+
+  it("sums the last 7 UTC days of the guard's log, and keeps today apart as so far", () => {
+    const sums = refusalSums(history.refusals.days ?? []);
+    expect([sums.blocked, sums.wouldBlock]).toEqual([0, 17]);
+    expect(sums.today).toMatchObject({ date: "2026-09-29", blocked: 0, wouldBlock: 2, partial: true });
+    // A last day that is whole is not "today so far".
+    expect(refusalSums([{ date: "2026-09-28", blocked: 1, wouldBlock: 0, partial: false }]).today).toBeUndefined();
+    // No day is no count, never a made-up one.
+    expect(refusalSums([])).toEqual({ blocked: 0, wouldBlock: 0 });
+  });
+
+  it("says the record's source and span in one line, and the day the log starts in short words", () => {
+    const now = Date.parse("2026-09-29T14:05:00Z");
+    expect(recordSourceLine({ decisions: 96, flagged: 30, checked: 1, oldestAt: "2026-09-25T17:34:00Z", newestAt: "2026-09-29T14:03:00Z" }, now))
+      .toBe("From the decision record: newest 96 decisions, about 4 days.");
+    expect(recordSourceLine({ decisions: 1, flagged: 0, checked: 0, oldestAt: "2026-09-29T13:47:00Z" }, now))
+      .toBe("From the decision record: newest 1 decision, about 18 minutes.");
+    expect(recordSourceLine({ decisions: 5, flagged: 0, checked: 0 }, now)).toBe("From the decision record: newest 5 decisions.");
+    expect(shortDay("2026-07-30T00:00:00Z")).toBe("30 Jul");
+    expect(shortDay("not a time")).toBeUndefined();
+  });
+
+  it("says each control in the footer from what was read, and never guesses what was not", () => {
+    const words = (items: ReturnType<typeof footerItems>) => items.map((item) => item.words);
+    expect(words(footerItems(undefined, undefined, undefined))).toEqual([
+      "Record: not read.",
+      "Alerts: not read.",
+      "AI Jail: not read.",
+      "Second opinion: not read.",
+      "Tokens",
+    ]);
+    const jail = (checksPass: boolean | undefined, available = true): Protection => ({
+      ...protection,
+      jail: { ...protection.jail, available, ...(checksPass === undefined ? { checksPass: undefined } : { checksPass }) },
+    });
+    const jailWords = (value: Protection) => footerItems({ recording: true }, value, history).find((item) => item.key === "jail")?.words;
+    expect(jailWords(jail(true))).toBe("AI Jail: ready.");
+    expect(jailWords(jail(false))).toBe("AI Jail: needs you.");
+    // Ready only when the checks passed: not checked is never ready.
+    expect(jailWords(jail(undefined))).toBe("AI Jail: not checked here yet.");
+    expect(jailWords(jail(true, false))).toBe("AI Jail: not available.");
+    const alerts = (channels: number) => footerItems(undefined, { ...protection, alerts: { channels } }, history).find((item) => item.key === "alerts")?.words;
+    expect([alerts(0), alerts(1), alerts(3)]).toEqual(["Alerts: off.", "Alerts: 1 channel.", "Alerts: 3 channels."]);
+    expect(footerItems({ recording: false }, protection, history)[0].words).toBe("Record: not recording.");
+  });
+
+  it("lists messages only where they can be or were recorded", () => {
+    const keys = (value: Protection, recorded: number) =>
+      footerItems(undefined, value, { ...history, messages: { ...history.messages, recorded } }).map((item) => item.key);
+    const off = { ...protection, observe: { installed: false, available: false } };
+    expect(keys(off, 0)).not.toContain("messages");
+    expect(keys(off, 2)).toContain("messages");
+    expect(keys({ ...protection, observe: { installed: false, available: true } }, 0)).toContain("messages");
   });
 });

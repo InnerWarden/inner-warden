@@ -29,7 +29,7 @@ export const COMMUNITY_SHELL_TOUR_STEPS: readonly TourStep[] = [
     title: "Three questions",
     body: "What your AI agent did, what people asked it, and what Community does not watch. Each card opens what is behind it.",
     route: "overview",
-    selectors: ['[data-tour="overview-lanes"]', 'section[aria-labelledby="lanes-title"]'],
+    selectors: ['[data-tour="overview-verdict"]', '[data-tour="overview-lanes"]'],
   },
   {
     key: ACTIVITY_TOUR_STEP_KEY,

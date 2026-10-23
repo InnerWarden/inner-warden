@@ -53,7 +53,7 @@ function contrast(foreground: [number, number, number], background: [number, num
 
 test("primary navigation is keyboard-completable and exposes a visible focus indicator", async ({ page }) => {
   await page.goto(communityUrl);
-  await expect(page.getByRole("heading", { name: "What is happening here" })).toBeVisible();
+  await expect(page.getByRole("heading", { level: 1, name: /^Overview: / })).toBeVisible();
 
   const skipLink = page.getByRole("link", { name: "Skip to content" });
   await page.keyboard.press("Tab");
@@ -81,7 +81,7 @@ test("primary navigation is keyboard-completable and exposes a visible focus ind
   await expectVisibleFocus(overview);
   await page.keyboard.press("Enter");
   await expect(page).not.toHaveURL(/view=/);
-  await expect(page.getByRole("heading", { name: "What is happening here" })).toBeVisible();
+  await expect(page.getByRole("heading", { level: 1, name: /^Overview: / })).toBeVisible();
 });
 
 test("opening a Community case from the keyboard puts focus on its title", async ({ page }) => {

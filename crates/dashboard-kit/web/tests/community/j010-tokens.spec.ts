@@ -69,8 +69,16 @@ test.describe("CJC-090-J010 provenance-aware token intelligence", () => {
     await page.goto("/?view=tokens");
     await expect(page.getByText("No agent on this machine keeps a token history this can read.")).toBeVisible();
     await expect(page.getByText("0 tokens")).toHaveCount(0);
+    // The Overview does not read token history at all: it links to Tokens.
+    const asked: string[] = [];
+    page.on("request", (request) => {
+      if (request.url().includes("/api/guard/token-intelligence")) asked.push(request.url());
+    });
     await page.goto("/");
-    await expect(page.locator('section[aria-labelledby="on-machine-title"]')).toContainText("No agent here keeps a token history this can read.");
+    await expect(page.locator("#verdict-title")).toBeVisible();
+    await expect(page.locator('[data-footer-item="tokens"]')).toHaveText("Tokens");
+    await expect(page.getByText("0 tokens")).toHaveCount(0);
+    expect(asked).toEqual([]);
   });
 
   test("an unreadable answer is unreadable, not no usage", async ({ page }) => {

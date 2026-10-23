@@ -11,9 +11,22 @@ import { useSource } from "./store";
  * is true right now), decisions are not being recorded (amber: a person has
  * to fix it), a newer InnerWarden is installed (slate: nothing is wrong).
  */
-export function Notices({ meta, health }: { meta?: DashboardMeta; health?: RecordHealth }) {
-  const exposed = meta?.exposed === true;
-  const outage = health !== undefined && !health.recording;
+export function Notices({
+  meta,
+  health,
+  inBand = false,
+}: {
+  meta?: DashboardMeta;
+  health?: RecordHealth;
+  /**
+   * The page's verdict band already says the dashboard is open to the
+   * network, or that decisions are not recorded (the Overview, rows 1 and 2):
+   * those two are not said twice. The update line still is.
+   */
+  inBand?: boolean;
+}) {
+  const exposed = !inBand && meta?.exposed === true;
+  const outage = !inBand && health !== undefined && !health.recording;
   const update = meta?.update_pending === true && typeof meta.update_note === "string" && meta.update_note.trim().length > 0;
   if (!exposed && !outage && !update) return null;
   return (
@@ -60,8 +73,11 @@ export function Notices({ meta, health }: { meta?: DashboardMeta; health?: Recor
   );
 }
 
+/** The pages whose verdict band carries the exposed and not-recording facts. */
+export const BAND_ROUTES: readonly string[] = ["overview"];
+
 /** The notices, with the record's health read from the source the header shares. */
-export function PageNotices({ meta }: { meta?: DashboardMeta }) {
+export function PageNotices({ meta, route }: { meta?: DashboardMeta; route?: string }) {
   const health = useSource("record-health");
-  return <Notices meta={meta} health={health.data} />;
+  return <Notices meta={meta} health={health.data} inBand={route !== undefined && BAND_ROUTES.includes(route)} />;
 }

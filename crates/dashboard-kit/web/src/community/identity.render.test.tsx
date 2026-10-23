@@ -21,14 +21,21 @@ import { readDecisionDetail, readDecisionsPage, readHistory, readRecordHealth } 
  */
 const answers = new Map<string, unknown>();
 
+function answered(lookup: string) {
+  const data = answers.get(lookup);
+  return data === undefined
+    ? { loading: true, stale: false, refresh: () => undefined }
+    : { data, loading: false, stale: false, refresh: () => undefined };
+}
+
 vi.mock("./poll", () => ({
-  usePolled: (_load: unknown, _delay: number, key = "") => {
-    const lookup = key.startsWith("{") ? "decisions" : key.startsWith("recent-without:") ? "recent-without" : key;
-    const data = answers.get(lookup);
-    return data === undefined
-      ? { loading: true, stale: false, refresh: () => undefined }
-      : { data, loading: false, stale: false, refresh: () => undefined };
-  },
+  usePolled: (_load: unknown, _delay: number, key = "") =>
+    answered(key.startsWith("{") ? "decisions" : key.startsWith("recent-without:") ? "recent-without" : key),
+}));
+
+// The shared sources answer from the same table, by their key.
+vi.mock("./store", () => ({
+  useSource: (key: string) => answered(key),
 }));
 
 const { CommunityOverview } = await import("./Overview");
@@ -321,18 +328,16 @@ describe("user namespaces inside the jail, in the technical view", () => {
 });
 
 describe("the Overview with identity data", () => {
-  it("says how far the agents are backed in one sentence, and counts the ones waiting", () => {
+  it("counts the agents waiting for approval, and leaves how far each is backed to the Agents page", () => {
     const agents = withIdentity();
     seed(agents);
     const html = render(<CommunityOverview context={context()} />, agents);
     const text = textOf(html);
-    // The CLI's payload claims host_verified for one instance; a reading from
-    // inside the jail is shown at observed, so nothing here runs confined.
-    expect(text).toContain("3 agents on this Mac. 2 run in a jail nothing outside it has confirmed; 1 runs as you, and only its own word says what it is.");
-    expect(text).not.toContain("runs confined");
     expect(text).toContain("1 new agent waits for your approval.");
-    const waiting = html.slice(html.indexOf("data-agents-waiting") - 80);
-    expect(waiting.slice(0, 200)).toContain("data-needs-you");
+    expect(html).toContain("data-agents-waiting");
+    // How far each agent's word is backed is said per agent on Agents, never summed up here.
+    expect(text).not.toContain("runs confined");
+    expect(html).not.toContain("data-agent-trust");
   });
 
   it("adds nothing when the CLI sends no instance", () => {

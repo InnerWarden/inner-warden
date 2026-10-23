@@ -40,7 +40,8 @@ test.describe("CJC-090-J001 Community shell and posture", () => {
     await expect(page.getByRole("heading", { name: "Cases", exact: true, level: 1 })).toBeVisible();
     await expect(page).toHaveURL(/\?view=activity$/);
     await page.getByRole("button", { name: "Go to overview" }).click();
-    await expect(page.getByRole("heading", { name: "What is happening here" })).toBeVisible();
+    // The Overview's heading is its verdict, named for the page.
+    await expect(page.getByRole("heading", { level: 1, name: /^Overview: / })).toBeVisible();
     expect(new URL(page.url()).search).toBe("");
     expect(documentRequests).toBe(1);
   });
@@ -67,7 +68,7 @@ test.describe("CJC-090-J001 Community shell and posture", () => {
     await expect(status).toHaveText(/Unknown/);
     await expect(status).not.toHaveText(/Enforce/);
     // The page itself stays: a failed refresh withdraws a claim, not the screen.
-    await expect(page.getByRole("heading", { name: "What is happening here" })).toBeVisible();
+    await expect(page.getByRole("heading", { level: 1, name: /^Overview: / })).toBeVisible();
 
     await page.clock.runFor(5_000);
     await expect(status).toHaveAttribute("data-meta-status", "ready");
