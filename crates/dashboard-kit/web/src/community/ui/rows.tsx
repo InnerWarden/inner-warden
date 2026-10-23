@@ -244,7 +244,16 @@ export const JUDGES_SHORT: Record<NonNullable<AgentFacts["judges"]>, string> = {
  * Whether the guard was seen working for an agent, in one line: when it last
  * screened something, or dashed when nothing was seen or it cannot be told.
  */
-export function SeenCell({ agent, unnamed }: { agent: AgentFacts; unnamed: { hook?: string; mcp?: string } | undefined }) {
+export function SeenCell({
+  agent,
+  unnamed,
+  screened = "Screened",
+}: {
+  agent: AgentFacts;
+  unnamed: { hook?: string; mcp?: string } | undefined;
+  /** The words before the time: "Screened" in a short row, "Last screened" on an agent's own card. */
+  screened?: string;
+}) {
   const seen = agentSeen(agent, unnamed);
   if (seen === "nothing_to_screen") {
     return (
@@ -257,7 +266,7 @@ export function SeenCell({ agent, unnamed }: { agent: AgentFacts; unnamed: { hoo
     return (
       <span data-seen="screened" className={`inline-flex items-center gap-1.5 ${SMALL_TEXT} text-(--iw-ink-2)`}>
         <span className="h-2 w-2 shrink-0 rounded-full bg-(--iw-ink-3)" aria-hidden="true" />
-        Screened <Ago at={agent.lastObservedAt} />
+        {screened} <Ago at={agent.lastObservedAt} />
       </span>
     );
   }

@@ -2,12 +2,13 @@ import { describe, expect, it } from "vitest";
 import type { AgentsResponse, TokenIntelligenceResponse } from "../api";
 import agentsFixture from "../../tests/fixtures/community/agents.json";
 import tokensFixture from "../../tests/fixtures/community/token-intelligence.json";
-import { agentRows, agentsSummary, agentState, modeLine, modeWord, nameList } from "./agentsView";
-import { communityControls, controlCounts, controlRing } from "./controls";
-import { share, tokenRow, tokenRows, tokenTotal } from "./tokensView";
+import { agentGroups, agentRows, agentState, autoSetupLine, factsOf, nameList, programWords, restartPrompt, runningWords } from "./agentsView";
+import { mcpLines, screeningRows, screeningSummary } from "./controls";
+import { noCountWords, qualityWords, tokenScales, tokenView, tokenViews, tokenWords } from "./tokensView";
+import { share } from "./ui/charts";
 import historyFixture from "../../tests/fixtures/community/history.json";
 import protectionFixture from "../../tests/fixtures/community/protection.json";
-import { readHistory, readProtection, type Protection } from "./api";
+import { readAgentsFacts, readHistory, readProtection, type Protection } from "./api";
 import { footerItems, recordSourceLine, refusalSums, shortDay } from "./Overview";
 
 const agents = agentsFixture as unknown as AgentsResponse;
@@ -37,103 +38,143 @@ describe("agents as rows", () => {
     const [row] = agentRows({ ...agents, agents: [leftover] });
     expect(row.state).toBe("not_connected");
     expect(row.needsYou).toBe(false);
-    // Nor into one more agent to connect: "0 of 1 connected" beside
-    // "Every agent found is connected" was the page contradicting itself.
-    expect(agentsSummary([row]).total).toBe(0);
-  });
-
-  it("names an agent whose status is not confirmed rather than calling every agent connected", () => {
-    const unseen = { ...agents.agents[2], guardrail: { ...agents.agents[2].guardrail, mode: "configured_not_observed" } };
-    const summary = agentsSummary(agentRows({ ...agents, agents: [agents.agents[3], unseen] }));
-    expect([summary.total, summary.refusing, summary.unconfirmed.map((row) => row.name)]).toEqual([2, 1, ["Cursor"]]);
-  });
-
-  it("counts and words the machine's agents", () => {
-    const rows = agentRows(agents);
-    const summary = agentsSummary(rows);
-    expect([summary.total, summary.refusing, summary.watching, summary.needsYou.length]).toEqual([4, 2, 1, 1]);
-    expect(modeWord(rows)).toBe("Mixed modes");
-    expect(modeLine(rows)).toBe("Claude Code watches only; Cursor and Gemini CLI refuse.");
     expect(nameList(["A", "B", "C"])).toBe("A, B and C");
   });
 });
 
-describe("tokens as bars", () => {
-  it("stacks only disjoint counters, and the parts add up to the total", () => {
-    const [claude, codex, cursor] = tokenRows(tokens);
-    expect(claude.parts.map((part) => part.key)).toEqual(["cache_read", "cache_write", "output", "input"]);
-    expect(claude.parts.reduce((sum, part) => sum + part.value, 0n)).toBe(claude.total);
-    // Codex's cached input is INSIDE its input: never a segment of its own.
-    expect(codex.parts.map((part) => part.key)).toEqual(["input", "output"]);
-    expect(codex.lines.find((line) => line.key === "cached")?.within).toBe("inside input");
-    expect(cursor.available).toBe(false);
+describe("the Agents page", () => {
+  const facts = readAgentsFacts(agentsFixture);
+  const now = Date.parse("2026-09-29T14:05:00Z");
+  const byId = Object.fromEntries(facts.agents.map((agent) => [agent.id, agent]));
+
+  it("puts each agent in one group: connected, found here, or only the jail's walls", () => {
+    const base = agents.agents[0];
+    const found = { ...base, id: "found", display_name: "Found", guardrail: { ...base.guardrail, mode: "not_configured", mechanism: null } };
+    const jailOnly = { ...found, id: "jail-only", display_name: "Jail only", guardrail: { ...found.guardrail, setup_support: "unsupported" } };
+    const groups = agentGroups(readAgentsFacts({ ...agents, agents: [...agents.agents, found, jailOnly] }).agents);
+    expect(groups.connected.map((agent) => agent.id)).toEqual(["claude-code", "codex", "cursor", "gemini"]);
+    expect(groups.found.map((agent) => agent.id)).toEqual(["found"]);
+    expect(groups.jailOnly.map((agent) => agent.id)).toEqual(["jail-only"]);
+  });
+
+  it("says automatic setup as the CLI read it, and nothing when it did not say", () => {
+    expect(autoSetupLine(facts.autoConnect)).toBe("Automatic setup is on: a new agent joins in monitor, checked every 60 s.");
+    expect(autoSetupLine({ enabled: false })).toBe("Automatic setup is off.");
+    expect(autoSetupLine(undefined)).toBeUndefined();
+  });
+
+  /** FAILS ON REVERT: without the seen rule, a prompt said nothing came through for an agent that was screened. */
+  it("asks for a restart only where the settings changed and nothing came through since", () => {
+    expect(restartPrompt(byId["claude-code"], facts.unnamed, now)).toBeUndefined();
+    expect(restartPrompt(byId.gemini, facts.unnamed, now)).toMatch(/^Its settings changed on 27 Sept at \d\d:\d\d and nothing has come through since\.$/);
+    // A screening that names nobody could be this agent's: no prompt.
+    expect(restartPrompt(byId.gemini, { mcp: "2026-09-29T13:00:00Z" }, now)).toBeUndefined();
+    // Not connected, or no change time: no prompt.
+    expect(restartPrompt({ ...byId.gemini, mode: "not_configured" }, facts.unnamed, now)).toBeUndefined();
+    expect(restartPrompt({ ...byId.gemini, configChangedAt: undefined }, facts.unnamed, now)).toBeUndefined();
+  });
+
+  it("says a running state it did not read as not read, never as not running", () => {
+    expect(runningWords(null, "macos")).toBe("Running: not read on macOS");
+    expect(runningWords(null, "other")).toBe("Running: not read on this platform");
+    expect(runningWords(false, "linux")).toBe("Running: no");
+    expect(programWords({ installed: false, detectedBy: ["configuration_file"] })).toBe("Program on PATH: not found (its configuration file was found)");
+    expect(programWords({ installed: true, detectedBy: [] })).toBe("Program on PATH: found");
+  });
+
+  it("reads an answer still loading as pending, and one it cannot read as failed, never as no agent", () => {
+    expect(factsOf(undefined)).toEqual({ unreadable: false, loading: false });
+    expect(factsOf({ availability: "loading", agents: [] }).loading).toBe(true);
+    expect(factsOf({ nonsense: true }).unreadable).toBe(true);
+    expect(factsOf(agentsFixture).facts?.agents).toHaveLength(4);
+  });
+});
+
+describe("tokens", () => {
+  it("leaves cache reads out of the headline where the counters are disjoint, and says them apart", () => {
+    const [claude] = tokenViews(tokens);
+    // 6,312 input + 2,606,929 output + 38,308,385 written to cache.
+    expect(claude.headline).toEqual({ value: 40_921_626n, words: "tokens, not counting cache reads" });
+    expect(claude.cacheReads).toBe(1_271_432_724n);
+    expect(claude.parts.map((part) => part.key)).toEqual(["input", "output", "cache_write"]);
+    expect(tokenWords(claude.cacheReads!)).toBe("1.3 billion");
+  });
+
+  /** FAILS ON REVERT: stack Codex's parts and its cached input is counted twice. */
+  it("never stacks or subtracts counters that overlap: the total as sent, the overlaps in words", () => {
+    const codex = tokenViews(tokens)[1];
+    expect(codex.disjoint).toBe(false);
+    expect(codex.parts).toEqual([]);
+    expect(codex.headline?.value).toBe(1_004_385_989n);
+    expect(codex.lines).toEqual(["1.0 billion input, of which 959 million cached", "2.9 million output, of which 844,960 reasoning"]);
+  });
+
+  it("says a source that does not exist, never a zero", () => {
+    const cursor = tokenViews(tokens)[2];
+    expect(cursor.status).toBe("no_source");
+    expect(cursor.headline).toBeUndefined();
+    expect(noCountWords(cursor)).toBe("No local source for Cursor's tokens.");
+    expect(cursor.provenance.words).toBe("No local source");
+    expect(qualityWords("sample")).toBe("A sample");
+    expect(qualityWords("partial")).toBe("Partial");
   });
 
   it("never draws a counter the provider did not report as zero", () => {
-    const row = tokenRow({ ...tokens.agents[0], input_tokens: null, parts_disjoint: true } as never);
-    expect(row.lines.find((line) => line.key === "input")?.value).toBeNull();
-    expect(row.parts).toEqual([]);
+    const view = tokenView({ ...tokens.agents[0], cache_creation_input_tokens: null, parts_disjoint: true } as never);
+    expect(view.parts.map((part) => part.key)).toEqual(["input", "output"]);
+    expect(view.counters.find((counter) => counter.key === "cache_write")?.value).toBeNull();
+    // Input not reported: no headline is made up from the rest.
+    const noInput = tokenView({ ...tokens.agents[0], input_tokens: null, parts_disjoint: true } as never);
+    expect(noInput.headline?.words).toBe("tokens in all");
   });
 
-  it("marks a capped scan as a sample, and only that", () => {
-    const covered = { complete: true, files_read: 9, files_found: 9 };
-    expect(tokenRow({ ...tokens.agents[0], coverage: covered }).sample).toBeUndefined();
-    expect(tokenRow({ ...tokens.agents[0] }).sample).toBeUndefined();
-    const cut = tokenRow({ ...tokens.agents[0], coverage: { complete: false, files_read: 4, files_found: 9 } });
-    expect(cut.sample).toBe("A sample, not the total: the newest 4 of 9 history files.");
-    const uncounted = tokenRow({ ...tokens.agents[0], coverage: { complete: false, files_read: 9, files_found: 9 } });
-    expect(uncounted.sample).toContain("could not be counted");
-    expect(tokenTotal([cut, tokenRow(tokens.agents[1])])?.sample).toBe(true);
-    expect(tokenTotal([tokenRow(tokens.agents[1])])?.sample).toBe(false);
+  it("says the files read, and a capped scan as the newest history only", () => {
+    expect(tokenView({ ...tokens.agents[0], coverage: { complete: true, files_read: 4641, files_found: 4641 } }).coverage).toBe("Read 4,641 of 4,641 files.");
+    expect(tokenView({ ...tokens.agents[0], coverage: { complete: false, files_read: 40, files_found: 1879 } }).coverage).toBe(
+      "Read 40 of 1,879 files: the newest history only.",
+    );
+    expect(tokenView({ ...tokens.agents[0] }).coverage).toBeUndefined();
   });
 
-  it("keeps counts past what a number holds exact", () => {
+  it("keeps counts past what a number holds exact, and draws every agent on one scale", () => {
     const huge = "90071992547409930";
-    const row = tokenRow({ ...tokens.agents[1], total_tokens: huge, input_tokens: huge, output_tokens: "0", parts_disjoint: false } as never);
-    expect(row.total).toBe(90071992547409930n);
-    expect(tokenTotal([row])?.total).toBe(90071992547409930n);
+    const view = tokenView({ ...tokens.agents[1], total_tokens: huge, input_tokens: huge, output_tokens: "0", parts_disjoint: false } as never);
+    expect(view.headline?.value).toBe(90071992547409930n);
+    expect(tokenScales(tokenViews(tokens))).toEqual({ fresh: 40_921_626n, cache: 1_271_432_724n });
     expect(share(1n, 4n)).toBeCloseTo(0.25);
     expect(share(1n, 0n)).toBe(0);
   });
 });
 
-describe("what Community covers", () => {
-  it("counts its controls into the ring, and the ring parts say their counts", () => {
-    const controls = communityControls({ agents: agentRows(agents), now: Date.parse("2026-09-29T14:05:00Z") });
-    const counts = controlCounts(controls);
-    expect(counts.needs).toBe(1);
-    const ring = controlRing(counts);
-    expect(ring.map((part) => part.key)).toEqual(["refusing", "on", "needs", "off"]);
-    expect(ring.find((part) => part.key === "needs")?.tone).toBe("attention");
+describe("Protection's screening rows", () => {
+  const facts = readAgentsFacts(agentsFixture);
+
+  it("lists each connected agent with its state, its own switch, or the step that finishes connecting it", () => {
+    const rows = screeningRows(facts.agents, facts.unnamed);
+    expect(rows.map((row) => [row.agent.id, row.state, row.step?.command])).toEqual([
+      ["claude-code", "monitor", "innerwarden agents connect claude-code"],
+      ["codex", "needs_you", "innerwarden agents connect codex --monitor"],
+      ["cursor", "refusing", "innerwarden agents connect cursor --monitor"],
+      ["gemini", "unknown", "innerwarden agents connect gemini --monitor"],
+    ]);
+    expect(rows[0].restart.how).toBe("In Claude Code, type /exit, then run claude.");
   });
 
-  it("says who is not behind the guard and who is, and never names one agent as both", () => {
-    const controls = communityControls({ agents: agentRows(agents), now: Date.parse("2026-09-29T14:05:00Z") });
-    const tools = controls.find((control) => control.key === "tool_call_screening");
-    expect(tools?.line).toBe("Cursor and Gemini CLI refuse a deny. Codex is not fully behind the guard.");
+  it("counts the rows by state in one sentence, and says what was not read", () => {
+    expect(screeningSummary(screeningRows(facts.agents, facts.unnamed))).toBe(
+      "Screening: 1 agent refusing a deny, 1 in monitor, 1 needs you, 1 not yet seen working.",
+    );
+    expect(screeningSummary([])).toBe("Screening: no agent is connected yet.");
+    expect(screeningSummary(undefined)).toBe("Screening: not read.");
   });
 
-  it("counts an agent with no connection at all as needing you, and a leftover configuration not at all", () => {
-    const base = agents.agents[0];
-    const unwired = { ...base, id: "unwired", display_name: "Unwired", installed: true, guardrail: { ...base.guardrail, mode: "not_configured", mechanism: null } };
-    const leftover = { ...unwired, id: "leftover", display_name: "Leftover", installed: false, detected_by: ["configuration_file"] };
-    const controls = communityControls({ agents: agentRows({ ...agents, agents: [unwired, leftover] }), now: Date.parse("2026-09-29T14:05:00Z") });
-    const hook = controls.find((control) => control.key === "command_screening");
-    expect(hook?.state).toBe("needs");
-    expect(hook?.line).toBe("Unwired is not fully behind the guard.");
-    expect(controls.find((control) => control.key === "tool_call_screening")?.state).toBe("none");
-  });
-
-  it("marks Seen working only from a decision in the last day, never assumed", () => {
-    const now = Date.parse("2026-09-29T14:05:00Z");
-    const rows = agentRows(agents);
-    const [hook] = communityControls({ agents: rows, now });
-    expect(hook.ladder?.find((step) => step.key === "seen")?.mark).toBe("done");
-    const [later] = communityControls({ agents: rows, now: now + 3 * 86_400_000 });
-    expect(later.ladder?.find((step) => step.key === "seen")?.mark).toBe("unknown");
-    for (const control of communityControls({ agents: rows, now })) {
-      for (const step of control.ladder ?? []) expect(step.mark).not.toBe("verified");
-    }
+  it("says how a proxy's servers are wrapped, and that remote ones are not screened", () => {
+    expect(mcpLines({ stdio: 3, wrapped: 2, remote: 1 })).toEqual([
+      "2 of 3 local servers wrapped.",
+      "1 remote server is not screened (Community wraps local servers only).",
+    ]);
+    expect(mcpLines({ stdio: 0, wrapped: 0, remote: 0 })).toEqual(["No local MCP server to wrap."]);
+    expect(mcpLines(undefined)).toEqual([]);
   });
 });
 
@@ -181,8 +222,10 @@ describe("the Overview's counts and lines", () => {
     // Ready only when the checks passed: not checked is never ready.
     expect(jailWords(jail(undefined))).toBe("AI Jail: not checked here yet.");
     expect(jailWords(jail(true, false))).toBe("AI Jail: not available.");
-    const alerts = (channels: number) => footerItems(undefined, { ...protection, alerts: { channels } }, history).find((item) => item.key === "alerts")?.words;
+    const alerts = (channels: number | undefined) => footerItems(undefined, { ...protection, alerts: channels === undefined ? {} : { channels } }, history).find((item) => item.key === "alerts")?.words;
     expect([alerts(0), alerts(1), alerts(3)]).toEqual(["Alerts: off.", "Alerts: 1 channel.", "Alerts: 3 channels."]);
+    // A CLI that did not say how many: not read, never off.
+    expect(alerts(undefined)).toBe("Alerts: not read.");
     expect(footerItems({ recording: false }, protection, history)[0].words).toBe("Record: not recording.");
   });
 

@@ -19,8 +19,9 @@ import {
   type RefusalDay,
 } from "./api";
 import { StaleLine } from "./parts";
+import { shortDay } from "./words";
 import { usePolled, type Polled } from "./poll";
-import { restartFor, restartWords } from "./restart";
+import { gatewayRestart, restartFor, restartWords } from "./restart";
 import { useSource } from "./store";
 import {
   BODY_TEXT,
@@ -54,13 +55,7 @@ export const STRIP_MAX = 4;
 /** The first step when no agent can be named: connect every agent found, in monitor. */
 export const CONNECT_ALL = "innerwarden agents connect --all --monitor";
 
-const SHORT_DAY = new Intl.DateTimeFormat("en-GB", { day: "numeric", month: "short", timeZone: "UTC" });
-
-/** "30 Jul", for the day the guard's log starts (a UTC date). */
-export function shortDay(iso: string): string | undefined {
-  const ms = Date.parse(iso);
-  return Number.isFinite(ms) ? SHORT_DAY.format(ms) : undefined;
-}
+export { shortDay };
 
 /**
  * What the decision record holds, as the line every count from it carries
@@ -521,7 +516,11 @@ export function footerItems(
     const channels = protection.alerts.channels;
     items.push({
       key: "alerts",
-      words: channels === 0 ? "Alerts: off." : `Alerts: ${formatCount(channels)} ${channels === 1 ? "channel" : "channels"}.`,
+      words: channels === undefined
+        ? "Alerts: not read."
+        : channels === 0
+          ? "Alerts: off."
+          : `Alerts: ${formatCount(channels)} ${channels === 1 ? "channel" : "channels"}.`,
       section: "alerts",
     });
     const jail = protection.jail;
@@ -611,7 +610,10 @@ function MessagesStep({ overview }: { overview?: OverviewPayload }) {
   if (step === undefined) return null;
   return (
     <div data-lane-step className="max-w-xl">
-      <StepBlock step={{ label: "Messages to your agent:", command: step.command, line: step.line }} />
+      <StepBlock
+        step={{ label: "Messages to your agent:", command: step.command, line: step.line }}
+        restarts={step.command.startsWith("innerwarden observe install") ? [gatewayRestart()] : []}
+      />
     </div>
   );
 }

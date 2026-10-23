@@ -15,7 +15,8 @@ import protectionFixture from "../../tests/fixtures/community/protection.json";
 import agentsFixture from "../../tests/fixtures/community/agents.json";
 import tokensFixture from "../../tests/fixtures/community/token-intelligence.json";
 import sessionsFixture from "../../tests/fixtures/community/sessions.json";
-import { readAttemptsPage, readDecisionDetail, readDecisionsPage, readHistory, readProtection, readRecordHealth, readSessionsPage } from "./api";
+import suppressFixture from "../../tests/fixtures/community/suppress.json";
+import { readAttemptsPage, readDecisionDetail, readDecisionsPage, readHistory, readProtection, readRecordHealth, readSessionsPage, readSuppressList } from "./api";
 
 /**
  * The Community pages, RENDERED from the CLI's fixtures, with each polled
@@ -224,20 +225,18 @@ describe("the colour jobs, on every Community page", () => {
   }
 
   /**
-   * FAILS ON REVERT: before `tones="neutral"` the technical view's agent and
-   * token spec sheets drew emerald "Available" and amber "Partial" badges,
-   * and this test could not see them: the panels rendered their loading state.
+   * The technical views of Agents and Tokens are Community's own evidence
+   * lists now, drawn in the same tokens: no badge colour of their own.
    */
-  it("sees the technical view's spec sheets, and they are neutral", () => {
+  it("sees the technical view's evidence, and it is neutral", () => {
     setTechnicalDetail(true);
-    for (const [html, panel] of [
-      [render(<CommunityAgents />), "Agents on this machine"],
-      [render(<CommunityTokens />), "Tokens observed"],
+    for (const [html, marker] of [
+      [render(<CommunityAgents />), "data-agent-evidence"],
+      [render(<CommunityTokens />), "data-token-technical"],
     ] as const) {
-      // The seeded panels are drawn, not their loading state.
-      expect(html).toContain(panel);
+      expect(html).toContain(marker);
       expectColourJobs(html);
-      expect(html).not.toContain("Runtime not confirmed");
+      expect(html).not.toMatch(/emerald-|amber-|rose-/);
     }
   });
 
@@ -815,72 +814,153 @@ describe("a message someone sent the agent", () => {
 });
 
 describe("Protection, Agents and Tokens", () => {
-  it("lists what Community covers, what it did, and what it does not cover, with one link out", () => {
-    const html = render(<CommunityProtection context={context()} />);
-    expect(html).toContain("What Community covers on this Mac");
-    expect(html).toContain("What Community did for you");
-    expect(html).toContain("Not in Community");
-    expect(html).toContain("Execution Gate");
+  const protectionHtml = (search = "", meta: DashboardMeta = META) => render(<CommunityProtection context={context(search, meta)} />);
+
+  it("says the platform, the lead and one summary sentence, with no ring and no paid rows", () => {
+    const html = protectionHtml();
+    const text = textOf(html);
+    expect(text).toContain("Protection on this Mac");
+    expect(text).toContain("Community checks what your AI agents ask to run.");
+    expect(text).toContain(
+      "Screening: 1 agent refusing a deny, 1 in monitor, 1 needs you, 1 not yet seen working. Optional: AI Jail ready, alerts off, second opinion off, messages recording.",
+    );
+    // No ring: the only image on the page is the weekly chart.
+    expect(html).not.toMatch(/Community controls on|of \d+ on/);
+    expect(html.match(/role="img"/g)?.length).toBe(1);
+    expect(html).not.toContain("Not in Community");
+    expect(html).not.toContain("data-paid");
+    expect(html).not.toContain("Execution Gate");
+    expect(html).not.toContain("Checked after");
     expect(links(html)).toEqual(["https://innerwarden.com/docs/editions-and-guarantees"]);
     expect(html).toContain('data-tour="upgrade"');
+    answers.set("protection", readProtection({ ...protectionFixture, platform: { os: "linux" } }));
+    expect(protectionHtml()).toContain("Protection on this Linux machine");
+    // Neither the controls nor the bootstrap read: no platform is guessed.
+    failing.add("protection");
+    expect(render(<CommunityProtection context={{ ...context(), bootstrap: undefined }} />)).toContain("Protection on this machine");
   });
 
-  it("proves its value before the controls: what it did sits under the ring", () => {
-    const html = render(<CommunityProtection context={context()} />);
-    expect(html.indexOf('id="did-title"')).toBeLessThan(html.indexOf('data-control="command_screening"'));
-    expect(html.indexOf('id="coverage-title"')).toBeLessThan(html.indexOf('id="did-title"'));
+  it("draws the mode box with both definitions, the switch, every agent's restart and the way back", () => {
+    const html = protectionHtml();
+    const box = html.slice(html.indexOf('id="mode"'), html.indexOf('id="screening"'));
+    expect(box).toContain('data-tour="community-protection"');
+    const text = textOf(box);
+    expect(text).toContain("Mixed: Cursor and Gemini CLI are set to refuse a deny, Claude Code is in monitor.");
+    expect(text).toContain("Monitor is a dry run: every command is checked and recorded, and none is stopped.");
+    expect(text).toContain("Enforce: a deny is refused before it runs. A review is recorded and, by default, still runs.");
+    expect(text.match(/Monitor is a dry run/g)?.length).toBe(1);
+    expect(commandBoxes(box).map((b) => b.text)).toEqual(["innerwarden agents connect claude-code", "innerwarden dry-run"]);
+    expect(text).toContain("If Claude Code is running, restart it after this step. In Claude Code, type /exit, then run claude.");
+    expect(text).toContain("If Codex is running, restart it after this step. Quit Codex and start it again.");
   });
 
-  it("never says 0 Refusing beside agents that refuse", () => {
-    const html = render(<CommunityProtection context={context()} />);
-    const text = textOf(html);
-    expect(text).toContain("Some refuse");
-    expect(text).not.toMatch(/0\s*Refusing/);
-    const tools = textOf(html.slice(html.indexOf('data-control="tool_call_screening"'), html.indexOf('data-control="decision_record"')));
-    expect(tools).toContain("Cursor and Gemini CLI refuse a deny. Codex is not fully behind the guard.");
-    expect(tools).not.toContain("nothing is refused");
+  it("lists one screening row per connected agent: how, what it judges, mode and seen kept apart, and its step", () => {
+    const html = protectionHtml();
+    const screening = html.slice(html.indexOf('id="screening"'), html.indexOf('id="record"'));
+    expect(screening.match(/data-screening=/g)?.length).toBe(4);
+    expect(screening).toContain('data-screening="gemini" data-control-state="unknown"');
+    const text = textOf(screening);
+    expect(text).toContain("2 of 3 local servers wrapped.");
+    expect(text).toContain("1 remote server is not screened (Community wraps local servers only).");
+    expect(text).toContain("Calls to its MCP servers. Its built-in tools are not screened by this edition.");
+    expect(text).toContain("Nothing screened yet");
+    expect(text).not.toContain("Checked after");
+    // Codex sends no judges line: not drawn in the plain view, "Not read" in the technical one.
+    const codex = textOf(screening.slice(screening.indexOf('data-screening="codex"'), screening.indexOf('data-screening="cursor"')));
+    expect(codex).not.toContain("Judges before it runs");
+    setTechnicalDetail(true);
+    const technical = protectionHtml();
+    const codexTech = textOf(technical.slice(technical.indexOf('data-screening="codex"'), technical.indexOf('data-screening="cursor"')));
+    expect(codexTech).toContain("Judges before it runsNot read");
   });
 
-  it("ties each paid row with a fact here to this machine's own count", () => {
-    const html = render(<CommunityProtection context={context()} />);
-    const facts = textOf(html.slice(html.indexOf('id="not-in-community-title"')));
-    expect(facts).toContain("21 flagged commands ran on this machine since 25 Sept 2026.");
-    expect(facts).toContain("4 cases here reached for a credential file since 25 Sept 2026.");
-    expect(facts).toContain("2 flagged commands here fetched from the internet by name since 25 Sept 2026.");
+  it("says the record, its span and the guard's log by week, the week under way outlined, not dropped", () => {
+    const html = protectionHtml();
+    const record = textOf(html.slice(html.indexOf('id="record"'), html.indexOf('id="optional"')));
+    expect(record).toMatch(/Recording\. The newest 96 decisions, from 25 Sept, \d\d:\d\d to now \(about \d+ \w+\)\./);
+    expect(record).toContain("The guard's log keeps refusals and list changes since 30 Jul (10 weeks).");
+    expect(record).toContain("this week so far");
+    answers.set("history", readHistory({ ...historyFixture, readable: false }));
+    expect(textOf(protectionHtml())).toContain("Not read: the guard's log could not be read.");
   });
 
-  it("draws refusals per FULL week, leaving out the week still under way", async () => {
-    const { fullWeeks } = await import("./Protection");
-    const history = readHistory(historyFixture);
-    expect(history.refusals.weeks.at(-1)?.partial).toBe(true);
-    expect(fullWeeks(history).every((week) => !week.partial)).toBe(true);
-    expect(fullWeeks(history).length).toBe(history.refusals.weeks.length - 1);
-    expect(render(<CommunityProtection context={context()} />)).toContain("per full week");
+  it("says each optional defence in words, a count for alerts, and a template the reader fills in", () => {
+    const html = protectionHtml();
+    const optional = html.slice(html.indexOf('id="optional"'), html.indexOf('id="exceptions"'));
+    for (const id of ["jail", "alerts", "second-opinion", "messages"]) expect(optional).toContain(`id="${id}"`);
+    const text = textOf(optional);
+    expect(text).toContain("Ready: the checks a jail needs pass on this machine (sandbox-exec).");
+    expect(text).toContain("Off: no alert channel is set up.");
+    expect(text).toContain("Recording: 4 messages since 30 Jul.");
+    const boxes = commandBoxes(optional);
+    expect(boxes.find((box) => box.text === "innerwarden contain -- <command>")).toMatchObject({ template: true, copy: false });
+    expect(boxes.find((box) => box.text === "innerwarden notify")?.copy).toBe(true);
+    // An absent check reads not checked here yet, never ready.
+    answers.set("protection", readProtection({ ...protectionFixture, jail: { available: true, backend: "sandbox-exec" } }));
+    expect(textOf(protectionHtml())).toContain("Not checked here yet (sandbox-exec found).");
   });
 
-  it("gives each agent its state and the CLI's command, with no link out", () => {
+  it("lists the exceptions when the CLI serves them, and the counts when it does not", () => {
+    answers.set("suppress", { supported: true, value: readSuppressList(suppressFixture) });
+    const html = protectionHtml();
+    const exceptions = html.slice(html.indexOf('id="exceptions"'));
+    const text = textOf(exceptions);
+    expect(text).toContain("5 allow patterns, 1 muted rule, 1 muted category.");
+    expect(text).toContain("Matches more than one command");
+    expect(text).toContain("Contains a secret, hidden here.");
+    expect(text).toContain("Ignored: matches every command.");
+    expect(text).toContain("ATR-2026-030: cross-agent attack detection");
+    expect(text).toContain("These change only from a terminal you type in. An agent that runs them is refused.");
+    expect(commandBoxes(exceptions).map((box) => box.text)).not.toContain("innerwarden allow --remove 'deploy-cli --token=[REDACTED]'");
+    answers.set("suppress", { supported: false });
+    const older = textOf(protectionHtml().slice(protectionHtml().indexOf('id="exceptions"')));
+    expect(older).toContain("5 allow patterns, 1 muted rule, 1 muted category.");
+    expect(older).toContain("This InnerWarden lists only the counts.");
+  });
+
+  it("gives each agent its card: judges, servers, seen, its own switch with the restart, and no link out", () => {
     const html = render(<CommunityAgents />);
-    expect(html).toContain("Partly connected");
+    const text = textOf(html);
+    expect(text).toContain("Automatic setup is on: a new agent joins in monitor, checked every 60 s.");
+    expect(text.match(/Monitor is a dry run/g)?.length).toBe(1);
+    expect(html).toContain('id="agent-claude-code"');
+    expect(text).toContain("Judges before it runs: Shell commands, and file changes");
+    expect(text).toContain("2 of 3 local servers wrapped.");
+    expect(text).toContain("Last screened");
     expect(commandBoxes(html).map((box) => box.text)).toContain("innerwarden agents connect codex --monitor");
-    expect(html).toContain("Last screened a command");
-    expect(html).toContain("Last screened a tool call");
-    expect(html).toContain("No tool call screened yet.");
+    expect(commandBoxes(html).map((box) => box.text)).toContain("innerwarden agents connect claude-code");
+    expect(text).toMatch(/Its settings changed on 27 Sept at \d\d:\d\d and nothing has come through since\./);
+    expect(text).toContain("If Gemini CLI is running, restart it after this step. Quit Gemini CLI and start it again.");
     expect(links(html)).toEqual([]);
+    expect(html).not.toContain("data-offer");
   });
 
-  it("draws token use once per agent, with the provenance said once, and no link out", () => {
+  it("says running as not read on macOS in the technical view, never not running", () => {
+    answers.set("protection", readProtection(protectionFixture));
+    setTechnicalDetail(true);
+    const text = textOf(render(<CommunityAgents />));
+    expect(text).toContain("Running: not read on macOS");
+    expect(text).not.toMatch(/Running: no\b/);
+    expect(text).not.toMatch(/not running/i);
+    expect(text).toContain("Program on PATH: found");
+  });
+
+  it("leads tokens with what is not a cache read, never stacks overlapping counters, and links nowhere", () => {
     const html = render(<CommunityTokens />);
+    const text = textOf(html);
     expect(html.match(/prompts and responses never reach this dashboard/g)?.length).toBe(1);
-    expect(html).toContain("1,271,432,724");
-    expect(html).toContain("1.3 billion");
-    expect(html).toContain("1.0 billion");
-    expect(html).toContain("Keeps no token history InnerWarden can read.");
+    expect(text).toContain("41 milliontokens, not counting cache reads");
+    expect(text).toContain("plus 1.3 billion re-read from cache");
+    expect(text).toContain("1.0 billion input, of which 959 million cached");
+    expect(text).toContain("No local source for Cursor's tokens.");
+    expect(text).not.toMatch(/Cursor[^.]*\b0 tokens/);
+    const codex = html.slice(html.indexOf('data-token-agent="codex"'), html.indexOf('data-token-agent="cursor"'));
+    expect(codex).not.toContain("data-part=");
     expect(links(html)).toEqual([]);
-    // A fully covered history is not called a sample.
     expect(html).not.toContain("A sample, not the total");
   });
 
-  it("says plainly that a capped scan is a sample of the newest history, never the total", () => {
+  it("says plainly that a capped scan read only the newest history", () => {
     const sampled = {
       ...tokensFixture,
       agents: tokensFixture.agents.map((agent) =>
@@ -888,8 +968,9 @@ describe("Protection, Agents and Tokens", () => {
       ),
     };
     answers.set("tokens", sampled);
-    const html = render(<CommunityTokens />);
-    expect(html).toContain("A sample, not the total: the newest 40 of 1879 history files.");
-    expect(html.match(/A sample, not the total/g)?.length).toBe(1);
+    const text = textOf(render(<CommunityTokens />));
+    expect(text).toContain("Read 40 of 1,879 files: the newest history only.");
+    setTechnicalDetail(true);
+    expect(textOf(render(<CommunityTokens />))).toContain("Per-day totals are not recorded.");
   });
 });

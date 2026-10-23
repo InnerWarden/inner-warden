@@ -53,7 +53,7 @@
 [data-tone="unknown"] { --iw-band: var(--iw-unknown); }
 
 [data-pill="enforce"] { color: var(--iw-stopped-ink); background: var(--iw-stopped-bg); border-color: #99f6e4; }
-[data-pill="monitor"], [data-pill="mixed"] { color: var(--iw-ink-2); background: var(--iw-surface-2); border-color: var(--iw-line); }
+[data-pill="monitor"], [data-pill="mixed"], [data-pill="on"] { color: var(--iw-ink-2); background: var(--iw-surface-2); border-color: var(--iw-line); }
 [data-pill="needs"]   { color: var(--iw-needs-ink); background: var(--iw-needs-bg); border-color: var(--iw-needs-line); }
 [data-pill="exposed"] { color: var(--iw-deny-ink); background: var(--iw-deny-bg); border-color: #fecdd3; }
 [data-pill="off"], [data-pill="not_available"] { color: var(--iw-ink-3); background: var(--iw-surface); border-color: var(--iw-line); }

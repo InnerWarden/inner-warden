@@ -1,52 +1,87 @@
 import type { TokenAgent, TokenIntelligenceResponse } from "../api";
-import type { Tone } from "../components/viz";
+import { compactCount, formatCount, humanizeToken } from "../presentation";
+import type { TokenPart } from "./ui/charts";
 
 /**
- * One agent's token history as a bar and a legend.
+ * One agent's token history, as the Tokens page says it (spec 6.5).
  *
  * The counters arrive as decimal strings because a total can pass what a
- * JavaScript number holds exactly; the legend prints them exact (BigInt),
- * and only the bar widths are scaled as numbers. A counter the provider does
- * not report is "not reported", never a zero segment.
+ * JavaScript number holds exactly; every sum here is a BigInt. A counter the
+ * provider does not report is left out, never a zero.
  *
- * Parts are STACKED only where they do not overlap. Claude Code reports
- * input, cache writes and cache reads apart; Codex reports cached input
- * inside input and reasoning inside output, so its bar is input and output,
- * and the two subsets are legend lines. The CLI says which (`parts_disjoint`).
+ * The headline leaves cache reads out: a prompt read back from the cache on
+ * every turn would otherwise dwarf what the agent actually sent and got back.
+ * Where the CLI says the counters are disjoint (`parts_disjoint`: Claude Code
+ * reports input, output, cache writes and cache reads apart), the headline is
+ * input + output + cache writes (+ reasoning when reported), and the cache
+ * reads are a line of their own. Where they overlap (Codex counts cached
+ * input inside input and reasoning inside output), nothing is stacked or
+ * subtracted: the total is said as sent, and the overlaps in words.
  */
-export type TokenPart = { key: string; label: string; value: bigint; tone: Tone };
-export type TokenLine = { key: string; label: string; value: bigint | null; within?: string };
+export type TokenStatus = "counted" | "no_source" | "no_history" | "not_read" | "reading";
 
-export type TokenRow = {
+export type TokenView = {
   id: string;
   name: string;
-  available: boolean;
-  total: bigint | null;
+  status: TokenStatus;
+  disjoint: boolean;
+  /** The headline count and what it counts; absent where nothing was counted. */
+  headline?: { value: bigint; words: string };
+  /** Cache reads, apart from the headline (disjoint counters only). */
+  cacheReads?: bigint;
+  /** Stacked in the bar: disjoint counters only, each one the provider reported. */
+  parts: TokenPart[];
+  /** The overlaps in words, for counters that are not disjoint. */
+  lines: string[];
+  provenance: { quality: string; words: string; note: string };
+  /** "Read 4,641 of 4,641 files." or, for a capped scan, that only the newest history was read. */
+  coverage?: string;
   sessions: number | null;
   lastUsedAt?: number;
-  /** Set when the figures are a sample of the newest history, not the total. */
-  sample?: string;
-  /** Stacked in the bar; they add up to `total` or the bar is not drawn. */
-  parts: TokenPart[];
-  /** Everything the provider reported, in the legend, exact. */
-  lines: TokenLine[];
+  /** Every counter exactly as sent, for the technical view and the table. */
+  counters: { key: string; label: string; value: string | null }[];
+  availability: string;
+  source: string;
 };
 
-/** What to say when a cap cut the scan; `undefined` when the history is covered. */
-function sampleNote(coverage: TokenAgent["coverage"]): string | undefined {
-  if (coverage === undefined || coverage.complete) return undefined;
-  return coverage.files_read < coverage.files_found
-    ? `A sample, not the total: the newest ${coverage.files_read} of ${coverage.files_found} history files.`
-    : "A sample, not the total: part of this history could not be counted.";
+/** The provenance chip's words, by the CLI's `quality`; an unknown one is said in its own words. */
+export const QUALITY_WORDS: Record<string, string> = {
+  sample: "A sample",
+  partial: "Partial",
+  unsupported: "No local source",
+  no_data: "No history yet",
+  error: "Not read",
+  loading: "Reading",
+};
+
+export function qualityWords(quality: string): string {
+  return QUALITY_WORDS[quality] ?? humanizeToken(quality);
 }
 
 function big(value: string | null): bigint | null {
   return value === null || !/^(0|[1-9]\d*)$/.test(value) ? null : BigInt(value);
 }
 
-const TONES: Tone[] = ["fact", "watch", "other", "watchLight"];
+/** A count in words: exact below a million ("353,850"), then "68.6 million". */
+export function tokenWords(value: bigint): string {
+  return value < 1_000_000n ? formatCount(value) : compactCount(value);
+}
 
-export function tokenRow(agent: TokenAgent & { parts_disjoint?: unknown }): TokenRow {
+function coverageLine(coverage: TokenAgent["coverage"]): string | undefined {
+  if (coverage === undefined) return undefined;
+  const read = `Read ${formatCount(coverage.files_read)} of ${formatCount(coverage.files_found)} ${coverage.files_found === 1 ? "file" : "files"}`;
+  return coverage.complete ? `${read}.` : `${read}: the newest history only.`;
+}
+
+function statusOf(agent: TokenAgent, total: bigint | null): TokenStatus {
+  if (agent.availability === "unsupported" || agent.provenance.quality === "unsupported") return "no_source";
+  if (agent.availability === "loading") return "reading";
+  if (agent.availability === "no_data") return "no_history";
+  if (agent.availability === "available" && total !== null) return "counted";
+  return "not_read";
+}
+
+export function tokenView(agent: TokenAgent & { parts_disjoint?: unknown }): TokenView {
   const total = big(agent.total_tokens);
   const input = big(agent.input_tokens);
   const output = big(agent.output_tokens);
@@ -55,57 +90,82 @@ export function tokenRow(agent: TokenAgent & { parts_disjoint?: unknown }): Toke
   const cached = big(agent.cached_input_tokens);
   const reasoning = big(agent.reasoning_output_tokens);
   const disjoint = agent.parts_disjoint === true;
-  const lines: TokenLine[] = [];
-  let parts: TokenPart[] = [];
-  if (disjoint) {
-    const candidates: [string, string, bigint | null][] = [
-      ["cache_read", "read from cache", cacheRead],
-      ["cache_write", "written to cache", cacheWrite],
-      ["output", "output", output],
-      ["input", "input", input],
-    ];
-    for (const [key, label, value] of candidates) lines.push({ key, label, value });
-    parts = candidates.flatMap(([key, label, value], index) => (value === null || value === 0n ? [] : [{ key, label, value, tone: TONES[index] }]));
-  } else {
-    lines.push({ key: "input", label: "input", value: input });
-    if (cached !== null) lines.push({ key: "cached", label: "cached input", value: cached, within: "inside input" });
-    lines.push({ key: "output", label: "output", value: output });
-    if (reasoning !== null) lines.push({ key: "reasoning", label: "reasoning", value: reasoning, within: "inside output" });
-    parts = ([["input", "input", input], ["output", "output", output]] as [string, string, bigint | null][])
-      .flatMap(([key, label, value], index) => (value === null || value === 0n ? [] : [{ key, label, value, tone: TONES[index] }]));
-  }
-  const sum = parts.reduce((acc, part) => acc + part.value, 0n);
-  if (total === null || sum !== total) parts = [];
-  return {
+  const status = statusOf(agent, total);
+  const counters = [
+    { key: "total", label: "Total", value: agent.total_tokens },
+    { key: "input", label: "Input", value: agent.input_tokens },
+    { key: "output", label: "Output", value: agent.output_tokens },
+    { key: "cache_write", label: "Written to cache", value: agent.cache_creation_input_tokens },
+    { key: "cache_read", label: "Read from cache", value: agent.cache_read_input_tokens },
+    { key: "cached", label: "Cached input (inside input)", value: agent.cached_input_tokens },
+    { key: "reasoning", label: "Reasoning (inside output)", value: agent.reasoning_output_tokens },
+  ];
+  const view: TokenView = {
     id: agent.agent_id,
     name: agent.display_name,
-    available: agent.availability === "available" && total !== null,
-    total,
+    status,
+    disjoint,
+    parts: [],
+    lines: [],
+    provenance: { quality: agent.provenance.quality, words: qualityWords(agent.provenance.quality), note: agent.provenance.note },
+    ...(coverageLine(agent.coverage) === undefined ? {} : { coverage: coverageLine(agent.coverage) }),
     sessions: agent.sessions,
     ...(agent.last_observed_at_ms === null ? {} : { lastUsedAt: agent.last_observed_at_ms }),
-    ...(sampleNote(agent.coverage) === undefined ? {} : { sample: sampleNote(agent.coverage) }),
-    parts,
-    lines: lines.filter((line) => line.value !== null || line.key === "cache_write" || line.key === "input" || line.key === "output"),
+    counters,
+    availability: agent.availability,
+    source: agent.provenance.source,
   };
+  if (status !== "counted" || total === null) return view;
+
+  if (disjoint && input !== null && output !== null) {
+    const parts: TokenPart[] = [
+      { key: "input", label: "Input", value: input },
+      { key: "output", label: "Output", value: output },
+      ...(cacheWrite === null ? [] : [{ key: "cache_write", label: "Written to cache", value: cacheWrite }]),
+      ...(reasoning === null ? [] : [{ key: "reasoning", label: "Reasoning", value: reasoning }]),
+    ];
+    const fresh = parts.reduce((sum, part) => sum + part.value, 0n);
+    return {
+      ...view,
+      headline: { value: fresh, words: "tokens, not counting cache reads" },
+      ...(cacheRead === null ? {} : { cacheReads: cacheRead }),
+      parts: parts.filter((part) => part.value > 0n),
+    };
+  }
+
+  // Counters that overlap: nothing stacked, nothing subtracted.
+  const lines: string[] = [];
+  if (input !== null) lines.push(cached === null ? `${tokenWords(input)} input` : `${tokenWords(input)} input, of which ${tokenWords(cached)} cached`);
+  if (output !== null) lines.push(reasoning === null ? `${tokenWords(output)} output` : `${tokenWords(output)} output, of which ${tokenWords(reasoning)} reasoning`);
+  return { ...view, headline: { value: total, words: cached === null ? "tokens in all" : "tokens in all, cached input included" }, lines };
 }
 
-export function tokenRows(report: TokenIntelligenceResponse | undefined): TokenRow[] {
-  return report === undefined ? [] : report.agents.map((agent) => tokenRow(agent));
+export function tokenViews(report: TokenIntelligenceResponse | undefined): TokenView[] {
+  return report === undefined ? [] : report.agents.map((agent) => tokenView(agent));
 }
 
-/** Every available agent's total, exact, and how many agents it covers. */
-export function tokenTotal(rows: readonly TokenRow[]): { total: bigint; agents: number; sample: boolean } | undefined {
-  const counted = rows.filter((row) => row.total !== null && row.available);
-  if (counted.length === 0) return undefined;
-  return {
-    total: counted.reduce((sum, row) => sum + (row.total ?? 0n), 0n),
-    agents: counted.length,
-    sample: counted.some((row) => row.sample !== undefined),
-  };
+/** The largest headline and the largest cache reads, so every agent is drawn on one scale. */
+export function tokenScales(views: readonly TokenView[]): { fresh: bigint; cache: bigint } {
+  let fresh = 0n;
+  let cache = 0n;
+  for (const view of views) {
+    if (!view.disjoint || view.headline === undefined) continue;
+    if (view.headline.value > fresh) fresh = view.headline.value;
+    if ((view.cacheReads ?? 0n) > cache) cache = view.cacheReads ?? 0n;
+  }
+  return { fresh, cache };
 }
 
-/** A bigint scaled to a share of `whole` for a bar width; exact enough for pixels. */
-export function share(value: bigint, whole: bigint): number {
-  if (whole <= 0n) return 0;
-  return Number((value * 1_000_000n) / whole) / 1_000_000;
+/** What to say for an agent nothing was counted for: never a zero. */
+export function noCountWords(view: TokenView): string {
+  switch (view.status) {
+    case "no_source":
+      return `No local source for ${view.name}'s tokens.`;
+    case "no_history":
+      return `No token history from ${view.name} on this machine yet.`;
+    case "reading":
+      return `Still reading ${view.name}'s history.`;
+    default:
+      return `Not read: ${view.name}'s history could not be counted.`;
+  }
 }

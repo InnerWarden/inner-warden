@@ -1,6 +1,6 @@
 import { formatCount } from "../presentation";
 import type { AgentFacts, AgentNextStep, RecordSpan, RefusalDay } from "./api";
-import { agentSeen } from "./controls";
+import { agentSeen, isConnected } from "./controls";
 import { nameList } from "./agentsView";
 import { restartFor, type RestartWords } from "./restart";
 import { ENFORCE_MEANS, MONITOR_MEANS, type DecisionOutcomeKey } from "./words";
@@ -123,10 +123,7 @@ export function lastDays(days: readonly RefusalDay[], n = 7): { blocked: number;
   );
 }
 
-/** Connected: wired to the guard, whatever was seen. */
-export function isConnected(agent: AgentFacts): boolean {
-  return agent.mode === "monitor" || agent.mode === "enforce" || agent.mode === "partial" || agent.mode === "mixed";
-}
+export { isConnected };
 
 /** The shared switch's line, as the CLI words it, for a CLI that sends no step with it. */
 export const SHARED_ENFORCE_LINE = "Switches every connected agent from Monitor to Enforce: a deny is refused before it runs.";
@@ -355,5 +352,124 @@ export function overviewVerdict(input: VerdictInput): Verdict {
           }],
         }
       : { ...emptyAction(), nothing: "Nothing to do." },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Protection's mode box (spec 6.2, section 1): the same band, compact, about
+// the mode alone. Both definitions are always beside it (the page draws them).
+// ---------------------------------------------------------------------------
+
+/** The way back from Enforce, in the CLI's own terms, for a CLI that sends no step for it. */
+export const SHARED_DRY_RUN_LINE = "Switches every connected agent from Enforce to Monitor: every command is checked and recorded, and none is stopped.";
+
+export type ModeBoxInput = {
+  /** `guard/agents`: `undefined` until read. */
+  agents?: readonly AgentFacts[];
+  /** The agents could not be read and nothing was ever read. */
+  failed: boolean;
+  now: number;
+  clock?: (ms: number) => string;
+};
+
+/**
+ * The mode the connected agents are set to, and the one switch: Monitor for
+ * all, Enforce for all, or mixed, each with every connected agent's restart
+ * words and the way back. A partly connected agent is named; its step is its
+ * own row's. What could not be read is said, never counted as monitor.
+ */
+export function modeBox(input: ModeBoxInput): Verdict {
+  const clock = input.clock ?? clockTime;
+  if (input.agents === undefined && !input.failed) return { row: 0, tone: "unknown", lines: [] };
+  if (input.agents === undefined) {
+    return {
+      row: 3,
+      tone: "unknown",
+      headline: "The mode could not be read",
+      lines: [`The dashboard did not answer at ${clock(input.now)}. No agent is counted as in monitor or enforce.`],
+      action: { ...emptyAction(), steps: [{ step: STATUS_STEP, restarts: [] }] },
+    };
+  }
+  const connected = input.agents.filter(isConnected);
+  if (connected.length === 0) {
+    return {
+      row: 4,
+      tone: "needs",
+      headline: "No AI agent is connected yet",
+      lines: ["Connect one on Agents. It joins in monitor."],
+      action: { ...emptyAction(), link: "agents" },
+    };
+  }
+  const enforce = connected.filter((agent) => agent.mode === "enforce");
+  const monitor = connected.filter((agent) => agent.mode === "monitor");
+  const mixed = connected.filter((agent) => agent.mode === "mixed");
+  const partial = connected.filter((agent) => agent.mode === "partial");
+  const restarts = connected.map(restartOf);
+  const partialLines = partial.map((agent) => `${agent.name} is only partly connected. Its step is under Screening.`);
+  const sharedServed = connected.find((agent) => agent.nextStep?.command === "innerwarden enforce")?.nextStep;
+  const toEnforce: BandStep = { label: "When you want a deny refused:", command: "innerwarden enforce", line: sharedServed?.line ?? SHARED_ENFORCE_LINE };
+  const toMonitor: BandStep = { label: "To go back to monitor:", command: "innerwarden dry-run", line: SHARED_DRY_RUN_LINE };
+  const forAll = (set: readonly AgentFacts[], word: string) =>
+    partial.length === 0 && set.length > 1
+      ? `${word} for all ${formatCount(set.length)} agents.`
+      : `${word} for ${nameList(set.map((agent) => agent.name))}.`;
+
+  if (enforce.length + monitor.length + mixed.length === 0) {
+    // Only partly connected agents: the mode is not theirs to say yet.
+    return {
+      row: 5,
+      tone: "needs",
+      headline: partial.length === 1 ? `${partial[0].name} is only partly connected` : `${nameList(partial.map((agent) => agent.name))} are only partly connected`,
+      lines: ["Its step is under Screening. Once connected, it runs in the mode it was connected in."],
+    };
+  }
+  if (enforce.length === 0 && mixed.length === 0) {
+    return {
+      row: 8,
+      tone: "watch",
+      headline: forAll(monitor, "Monitor"),
+      lines: partialLines,
+      action: {
+        ...emptyAction(),
+        steps: [{ step: toEnforce, restarts }],
+        back: { label: "Back to monitor any time:", command: "innerwarden dry-run" },
+      },
+    };
+  }
+  if (monitor.length === 0 && mixed.length === 0) {
+    return {
+      row: 9,
+      tone: "stopped",
+      headline: forAll(enforce, "Enforce"),
+      lines: partialLines,
+      action: {
+        ...emptyAction(),
+        steps: [{ step: toMonitor, restarts }],
+        back: { label: "Back to enforce any time:", command: "innerwarden enforce" },
+      },
+    };
+  }
+  const parts: string[] = [];
+  if (enforce.length > 0) parts.push(`${nameList(enforce.map((agent) => agent.name))} ${plural(enforce.length, "is", "are")} set to refuse a deny`);
+  if (monitor.length > 0) parts.push(`${nameList(monitor.map((agent) => agent.name))} ${plural(monitor.length, "is", "are")} in monitor`);
+  if (mixed.length > 0) parts.push(`${nameList(mixed.map((agent) => agent.name))} ${plural(mixed.length, "refuses", "refuse")} a deny for some calls only`);
+  const recording = [...monitor, ...mixed];
+  const perAgent = recording.every((agent) => agent.modeSteps?.enforce !== undefined);
+  return {
+    row: 7,
+    tone: "watch",
+    headline: `Mixed: ${parts.join(", ")}.`,
+    lines: partialLines,
+    // A switch for one agent restarts that agent; the way back for every
+    // agent restarts them all, so it is a step with its own restart words.
+    action: perAgent
+      ? {
+          ...emptyAction(),
+          steps: [
+            ...recording.map((agent) => ({ step: bandStep(agent.modeSteps!.enforce!), restarts: [restartOf(agent)] })),
+            { step: { ...toMonitor, label: "Back to monitor for every agent:" }, restarts },
+          ],
+        }
+      : { ...emptyAction(), steps: [{ step: toEnforce, restarts }], back: { label: "Back to monitor for every agent:", command: "innerwarden dry-run" } },
   };
 }

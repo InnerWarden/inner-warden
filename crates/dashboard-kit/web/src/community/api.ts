@@ -679,7 +679,8 @@ export type Protection = {
   jail: { available: boolean; backend?: string; checksPass?: boolean; advice: string[]; checkedAt?: string };
   /** `available`: an OpenClaw config is here, so `observe install` can work. */
   observe: { installed: boolean; available: boolean };
-  alerts: { channels: number };
+  /** `channels`: how many are set up; absent when the CLI did not say, which is "not read", never zero. */
+  alerts: { channels?: number };
   secondOpinion: { configured: boolean; provider?: string };
   suppress: SuppressCounts;
   flagged?: FlaggedConcerns;
@@ -715,7 +716,7 @@ export function readProtection(value: unknown): Protection {
     }),
     // An older CLI sends no `available`: then only an installed hook says yes.
     observe: { installed, available: bool(record(body.observe)?.available) ?? installed },
-    alerts: { channels: count(record(body.alerts)?.channels) ?? 0 },
+    alerts: defined({ channels: count(record(body.alerts)?.channels) }),
     secondOpinion: defined({ configured: bool(second?.configured) ?? false, provider: plain(second?.provider, 32) }),
     suppress: readSuppress(body.suppress),
     flagged: ran === undefined || credentialRead === undefined || domainFetch === undefined
@@ -1137,6 +1138,11 @@ export type AgentFacts = {
   modeSteps?: ModeSteps;
   mcp?: McpCounts;
   nextStep?: AgentNextStep;
+  /** The technical view's evidence, as sent: how the agent was found, and the raw ids. */
+  detectedBy?: string[];
+  setupSupport?: string;
+  mechanismId?: string;
+  modeId?: string;
 };
 
 function agentMode(guardrail: Json | undefined): AgentMode {
@@ -1199,6 +1205,10 @@ export function readAgentFacts(value: unknown): AgentFacts | undefined {
     modeSteps: readModeSteps(item.mode_steps),
     mcp: mechanism === "mcp" ? readMcp(item.mcp) : undefined,
     nextStep: readAgentNextStep(item.next_step),
+    detectedBy: strings(item.detected_by, 64),
+    setupSupport: plain(guardrail?.setup_support, 32),
+    mechanismId: plain(guardrail?.mechanism, 32),
+    modeId: plain(guardrail?.mode, 32),
   });
 }
 
@@ -1209,6 +1219,8 @@ export type AgentsFacts = {
   /** The newest decision each channel screened that names no agent; `undefined` when the CLI did not say. */
   unnamed?: { hook?: string; mcp?: string };
   autoConnect?: { enabled: boolean; mode?: string; everySeconds?: number };
+  /** Discovery stopped at its local safety limit: an agent may be missing from the list. */
+  discoveryLimited: boolean;
 };
 
 /** The whole `guard/agents` answer, or an error: a list that could not be read is never "no agent". */
@@ -1227,6 +1239,7 @@ export function readAgentsFacts(value: AgentsResponse | unknown): AgentsFacts {
     autoConnect: enabled === undefined
       ? undefined
       : defined({ enabled, mode: plain(auto?.mode, 32), everySeconds: count(auto?.refresh_interval_secs) }),
+    discoveryLimited: body.discovery_limited === true,
   });
 }
 

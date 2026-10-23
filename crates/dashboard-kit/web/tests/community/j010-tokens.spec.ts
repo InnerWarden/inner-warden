@@ -36,14 +36,21 @@ test.describe("CJC-090-J010 provenance-aware token intelligence", () => {
     await page.goto("/?view=tokens");
     const claude = page.locator('li[data-token-agent="claude"]');
     await expect(claude).toContainText("Claude Code");
-    await expect(claude).toContainText("1.3 billion");
-    await expect(claude.locator("[data-segment]")).toHaveCount(4);
-    // Codex's cached input is inside its input: never a bar segment of its own.
+    // The headline leaves cache reads out; they are said apart.
+    await expect(claude.locator("[data-token-headline]")).toContainText("41 million");
+    await expect(claude.locator("[data-token-headline]")).toContainText("tokens, not counting cache reads");
+    await expect(claude.locator("[data-token-cache]")).toHaveText("plus 1.3 billion re-read from cache");
+    await expect(claude.locator("[data-part]")).toHaveCount(4);
+    // Codex's cached input is inside its input: never a bar segment of its own,
+    // and nothing is stacked at all.
     const codex = page.locator('li[data-token-agent="codex"]');
-    await expect(codex.locator("[data-segment]")).toHaveCount(2);
-    await expect(codex).toContainText("inside input");
-    await expect(page.locator('li[data-token-agent="cursor"]')).toContainText("Keeps no token history InnerWarden can read.");
-    await expect(page.locator('li[data-token-agent="cursor"]')).not.toContainText("0 tokens");
+    await expect(codex.locator("[data-part]")).toHaveCount(0);
+    await expect(codex.locator("[data-token-lines]")).toContainText("of which 959 million cached");
+    await expect(codex.locator("[data-token-lines]")).toContainText("of which 844,960 reasoning");
+    const cursor = page.locator('li[data-token-agent="cursor"]');
+    await expect(cursor).toContainText("No local source for Cursor's tokens.");
+    await expect(cursor).not.toContainText("0 tokens");
+    await expect(cursor.locator("[data-provenance]")).toHaveText("No local source");
     await expect(page.getByText("prompts and responses never reach this dashboard", { exact: false })).toBeVisible();
   });
 
@@ -51,17 +58,21 @@ test.describe("CJC-090-J010 provenance-aware token intelligence", () => {
     await page.route(guardRoute("token-intelligence"), (route) => fulfillJson(route, HUGE));
     await page.goto("/?view=tokens");
     const row = page.locator('li[data-token-agent="codex"]');
+    // The exact counts are one press away, every digit kept.
+    await row.getByText("Show the exact counts").click();
     await expect(row).toContainText("123,456,789,012,345,678,901,234,567,000");
     await expect(row).toContainText("890");
     await expect(row).not.toContainText("e+");
 
     await page.getByRole("checkbox", { name: "Show technical detail" }).check();
-    const card = page.locator('section[aria-labelledby="token-intelligence-title"] li').filter({ has: page.getByRole("heading", { name: "Codex", exact: true }) });
+    const card = row.locator("[data-token-technical]");
     await expect(card).toContainText("123,456,789,012,345,678,901,234,567,890");
-    await expect(card).toContainText("Unavailable");
-    await expect(card).toContainText("Retained local history; not billing data.");
-    await expect(card).toContainText("Partial");
-    await expect(card).not.toContainText("billing total");
+    await expect(card).toContainText("not reported");
+    await expect(row).toContainText("Retained local history; not billing data.");
+    await expect(row.locator("[data-provenance]")).toHaveText("Partial");
+    await expect(card).toContainText("Quality: partial");
+    await expect(row).not.toContainText("billing total");
+    await expect(page.getByText("Per-day totals are not recorded.")).toBeVisible();
   });
 
   test("no history at all is said, never drawn as zero", async ({ page }) => {
@@ -84,11 +95,12 @@ test.describe("CJC-090-J010 provenance-aware token intelligence", () => {
   test("an unreadable answer is unreadable, not no usage", async ({ page }) => {
     await page.route(guardRoute("token-intelligence"), (route) => fulfillJson(route, { error: "token_source_failed" }, 503));
     await page.goto("/?view=tokens");
-    await expect(page.getByRole("alert")).toContainText("Token history did not answer");
+    await expect(page.getByRole("alert")).toContainText("Token history did not answer. Nothing here is counted as zero.");
     await expect(page.getByText("No agent on this machine keeps a token history")).toHaveCount(0);
     await page.getByRole("checkbox", { name: "Show technical detail" }).check();
-    await expect(page.getByRole("heading", { name: "Token intelligence is unavailable" })).toBeVisible();
-    await expect(page.getByText("No usage value is being inferred from the missing response.")).toBeVisible();
+    // Nothing was read, so the technical view claims no read either.
+    await expect(page.locator('[data-read-at="/api/guard/token-intelligence"]')).toHaveCount(0);
+    await expect(page.locator("li[data-token-agent]")).toHaveCount(0);
   });
 
   test("an unsupported provider stays explicit and entirely nullable", async ({ page }) => {
@@ -115,14 +127,14 @@ test.describe("CJC-090-J010 provenance-aware token intelligence", () => {
     }));
     await page.goto("/?view=tokens");
     const row = page.locator('li[data-token-agent="cursor"]');
-    await expect(row).toContainText("Keeps no token history InnerWarden can read.");
-    await expect(row).not.toContainText("tokens");
+    await expect(row).toContainText("No local source for Cursor's tokens.");
+    await expect(row).not.toContainText(/\d+ tokens/);
+    await expect(row).toContainText("No reviewed local token source is available.");
 
     await page.getByRole("checkbox", { name: "Show technical detail" }).check();
-    const card = page.locator('section[aria-labelledby="token-intelligence-title"] li').filter({ has: page.getByRole("heading", { name: "Cursor", exact: true }) });
-    await expect(card).toContainText("Unsupported");
-    await expect(card).toContainText("Token usage is unavailable for this agent");
-    await expect(card).toContainText("No reviewed local token source is available.");
-    await expect(card).not.toContainText("Tokens observed");
+    const card = row.locator("[data-token-technical]");
+    await expect(card).toContainText("Availability: unsupported");
+    await expect(card).toContainText("Quality: unsupported");
+    await expect(card).not.toContainText(/\b0\b/);
   });
 });

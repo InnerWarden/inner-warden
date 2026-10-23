@@ -20,6 +20,18 @@ export const META_TEXT = `${SMALL_TEXT} text-(--iw-ink-3)`;
 export const BODY_TEXT = "text-sm leading-[21px] text-(--iw-ink-2)";
 export const H2 = "text-[15px] leading-[22px] font-semibold text-(--iw-ink)";
 export const LINK_TEXT = "font-semibold text-(--iw-accent) underline-offset-2 hover:underline";
+export const H3 = "text-sm leading-[21px] font-semibold text-(--iw-ink)";
+export const PAGE_TITLE = "text-2xl leading-[30px] font-semibold tracking-tight text-(--iw-ink)";
+
+/** A fixed-height block while the first answer is on its way: never a zero, never an empty list. */
+export function Pending({ label, className = "h-24" }: { label: string; className?: string }) {
+  return <div aria-busy="true" aria-label={label} className={`animate-pulse rounded-lg bg-(--iw-surface-2) ${className}`} />;
+}
+
+/** A command or a pattern inside a sentence, in the command face. */
+export function Code({ children }: { children: ReactNode }) {
+  return <code className="font-mono text-[12.5px]">{children}</code>;
+}
 
 /** A plain left click on a link is handled in the page; any other click is the browser's. */
 export function onPlainClick(open: (() => void) | undefined) {

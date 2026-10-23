@@ -134,6 +134,7 @@ export const FIXED_COMMANDS = [
   "innerwarden dashboard",
   "innerwarden observe install",
   "innerwarden agents connect --all --monitor",
+  "innerwarden agents auto-connect --monitor",
   "innerwarden allow --list",
   "innerwarden mute --list",
   "innerwarden contain -- <command>",
@@ -150,7 +151,7 @@ export type PlatformOs = "macos" | "linux" | "windows" | "other";
 
 export const PLATFORM_WORDS: Record<PlatformOs, string> = {
   macos: "this Mac",
-  linux: "this machine",
+  linux: "this Linux machine",
   windows: "this PC",
   other: "this machine",
 };
@@ -482,4 +483,26 @@ export function layerLine(
   }
   const text = layerWords(layer, verdict, agent);
   return text === undefined ? undefined : { text, conflict: false };
+}
+
+const SHORT_DAY = new Intl.DateTimeFormat("en-GB", { day: "numeric", month: "short", timeZone: "UTC" });
+
+/** "30 Jul", for the day the guard's log starts (a UTC date). */
+export function shortDay(iso: string): string | undefined {
+  const ms = Date.parse(iso);
+  return Number.isFinite(ms) ? SHORT_DAY.format(ms) : undefined;
+}
+
+/** "25 Sept, 17:34", in the reader's own clock; built per call, so it follows the zone the page runs in. */
+export function dayAndTime(ms: number): string {
+  return new Intl.DateTimeFormat("en-GB", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).format(ms);
+}
+
+/** When something happened, for a sentence: "at 14:02" today, "on 28 Sept at 14:05" before. In the reader's own clock. */
+export function atWords(ms: number, now: number): string {
+  const day = (at: number) => new Intl.DateTimeFormat("en-GB", { year: "numeric", month: "2-digit", day: "2-digit" }).format(at);
+  const clock = new Intl.DateTimeFormat("en-GB", { hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).format(ms);
+  if (day(ms) === day(now)) return `at ${clock}`;
+  const date = new Intl.DateTimeFormat("en-GB", { day: "numeric", month: "short" }).format(ms);
+  return `on ${date} at ${clock}`;
 }

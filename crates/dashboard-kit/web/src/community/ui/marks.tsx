@@ -84,8 +84,12 @@ export function HatchDefs() {
   );
 }
 
-/** Every state a pill can show. `checking` is drawn as unknown and says so. */
-export const PILL_STATES = ["enforce", "monitor", "mixed", "needs", "off", "not_available", "unknown", "exposed", "checking"] as const;
+/**
+ * Every state a pill can show. `checking` is drawn as unknown and says so.
+ * `on` is an optional defence that is on or ready: neutral, like monitor, and
+ * never green, because Community reads nothing back after a command ran.
+ */
+export const PILL_STATES = ["enforce", "monitor", "mixed", "needs", "on", "off", "not_available", "unknown", "exposed", "checking"] as const;
 export type PillState = (typeof PILL_STATES)[number];
 
 const PILL_ICON: Record<PillState, IconName> = {
@@ -93,6 +97,7 @@ const PILL_ICON: Record<PillState, IconName> = {
   monitor: "eye",
   mixed: "half-shield",
   needs: "triangle",
+  on: "circle",
   off: "hollow-circle",
   not_available: "slashed-circle",
   unknown: "dashed-circle",
@@ -132,7 +137,7 @@ export function StatusPill({
   return (
     <span data-pill={state === "checking" ? "unknown" : state} data-state={state} title={title} className={`${PILL_BASE} ${className}`}>
       <span className="inline-flex" style={colour === undefined ? undefined : { color: colour }}>
-        <Icon name={PILL_ICON[state]} className="h-3.5 w-3.5" />
+        <Icon name={PILL_ICON[state]} className={`h-3.5 w-3.5 ${state === "on" ? "fill-current" : ""}`} />
       </span>
       {label === undefined ? (
         <span className="whitespace-nowrap">{words}</span>

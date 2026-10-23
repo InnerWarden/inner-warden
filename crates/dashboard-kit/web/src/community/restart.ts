@@ -32,3 +32,25 @@ export function restartFor(agentId: string, displayName: string, served: Restart
 export function restartNote(displayName: string, words: RestartWords): string {
   return `If ${displayName} is running, restart it after this step. ${words.how} ${words.why}`;
 }
+
+/**
+ * The commands that change an agent's hook or MCP config: the person restarts
+ * the agent afterwards, because an agent reads that config only when it
+ * starts. Every step whose command starts with one of these carries the
+ * agent's restart words.
+ */
+export const CONFIG_CHANGING = ["innerwarden enforce", "innerwarden dry-run", "innerwarden install", "innerwarden agents connect"] as const;
+
+export function changesAgentConfig(command: string | undefined): boolean {
+  return command !== undefined && CONFIG_CHANGING.some((prefix) => command === prefix || command.startsWith(`${prefix} `));
+}
+
+/**
+ * `observe install` writes a hook into the OpenClaw gateway, which loads its
+ * hooks only when it starts; nothing here restarts it. Its restart, in the
+ * same words as any other.
+ */
+export const GATEWAY_NAME = "the OpenClaw gateway";
+export function gatewayRestart(): { agent: string; words: RestartWords } {
+  return { agent: GATEWAY_NAME, words: restartWords("openclaw", GATEWAY_NAME) };
+}

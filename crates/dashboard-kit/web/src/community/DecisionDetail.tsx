@@ -6,7 +6,7 @@ import type { Attempt, Brief, Decision, NextStep, Segment, SessionFacts } from "
 import { asiLabel } from "./asi";
 import { decisionLadder, messageLadder, NOT_CHECKED_AFTERWARDS, type LadderMark, type LadderStep } from "./ladder";
 import { Ago, CopyCommand, HiddenChip, tokenWrap } from "./parts";
-import { restartFor } from "./restart";
+import { changesAgentConfig, restartFor } from "./restart";
 import { BODY_TEXT, H2, LINK_TEXT, META_TEXT, OutcomeWords, PANEL, RestartNote, SMALL_TEXT } from "./ui/blocks";
 import { Icon } from "./ui/Icon";
 import { ModePill, OutcomeMark } from "./ui/marks";
@@ -48,15 +48,7 @@ export function notWholeWords(item: Pick<Decision, "commandWhole" | "hiddenChara
   return "Shortened when it was recorded, so there is nothing whole to copy.";
 }
 
-/**
- * A step that changes an agent's hook or MCP config: the person restarts the
- * agent afterwards, because an agent reads that config only when it starts.
- */
-const CONFIG_CHANGING = ["innerwarden enforce", "innerwarden dry-run", "innerwarden install", "innerwarden agents connect"];
-
-export function changesAgentConfig(command: string | undefined): boolean {
-  return command !== undefined && CONFIG_CHANGING.some((prefix) => command === prefix || command.startsWith(`${prefix} `));
-}
+export { changesAgentConfig };
 
 /** Whether the page is as wide as the two-column layout (lg). */
 export function wideLayout(): boolean {

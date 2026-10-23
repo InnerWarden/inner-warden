@@ -229,16 +229,14 @@ test.describe("CJC-090 / spec 090 T155 — dashboard performance acceptance", ()
     await expect(row).toContainText(EXACT);
     await expect(row).not.toContainText(LOSSY);
 
-    // The technical card keeps the exact string and the provenance words.
+    // The technical view keeps the exact string, and the row the provenance words.
     await page.getByRole("checkbox", { name: "Show technical detail" }).check();
-    const card = page
-      .locator('section[aria-labelledby="token-intelligence-title"] li')
-      .filter({ has: page.getByRole("heading", { name: "Codex", exact: true }) });
+    const card = row.locator("[data-token-technical]");
     await expect(card).toContainText(EXACT);
     // Community claim language + no float corruption.
     await expect(card).not.toContainText(LOSSY);
-    await expect(card).toContainText("Retained local history; not billing data.");
-    await expect(card).not.toContainText("billing total");
+    await expect(row).toContainText("Retained local history; not billing data.");
+    await expect(row).not.toContainText("billing total");
   });
 
   test("Community Cases asks for one bounded page, and the page stays small", async ({ page }) => {

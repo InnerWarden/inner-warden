@@ -214,7 +214,9 @@ describe("the Agents page with identity data", () => {
     expect(text).toContain("dev in payments-api");
     expect(text).toContain("Refuses");
     expect(text).toContain("The launcher is installed in your home folder, so any program you run could replace it: install it system-wide.");
-    expect(text).toContain("a1b2c3d4 (open case)");
+    expect(text).toContain("a1b2c3d4 (open decision)");
+    // The session opens its decision as a real link, so a middle click works.
+    expect(row).toContain('href="?view=activity&amp;decision=cmd%3Aabc%3A0"');
     expect(text).toContain("Start it in a jail");
     expect(text).toContain("innerwarden contain --identity -- claude");
     expect(text).toContain("innerwarden agents approve claude-code");
@@ -226,16 +228,20 @@ describe("the Agents page with identity data", () => {
     expect(codex).toContain("No instance started in a jail yet.");
   });
 
-  it("makes one Active Defence line when a contained agent is shown, and the installed line on a host that has it", () => {
+  /**
+   * Agents makes no Active Defence offer of its own (spec 6.4): the one
+   * generic line is on Protection, so the page links nowhere outside.
+   */
+  it("makes no Active Defence line, contained agent or not, and on a host that has it", () => {
     seed(withIdentity());
     const html = render(<CommunityAgents context={context()} />, withIdentity());
-    expect(html.match(/data-offer=/g)?.length).toBe(1);
-    expect(html).toContain('data-offer="agent_kernel"');
-    expect(textOf(html)).toContain("Contained agents are checked by the kernel with Active Defence.");
-    expect([...html.matchAll(/href="(https:\/\/innerwarden\.com[^"]*)"/g)].map((m) => m[1])).toEqual(["https://innerwarden.com/pricing"]);
+    expect(html).not.toContain("data-offer");
+    expect(html).not.toContain("data-ad-state");
+    expect(textOf(html)).not.toContain("Active Defence");
+    expect([...html.matchAll(/href="(https:\/\/innerwarden\.com[^"]*)"/g)]).toEqual([]);
     const installed = render(<CommunityAgents context={context({ ...META, active_defence_installed: true })} />, withIdentity());
     expect(installed).not.toContain("data-offer");
-    expect(installed).toContain('data-ad-state="installed"');
+    expect(installed).not.toContain("data-ad-state");
   });
 
   it("makes no offer when no instance is shown", () => {
@@ -248,6 +254,9 @@ describe("the Agents page with identity data", () => {
   it("lists what people decided, newest as the CLI sent it, refusals included", () => {
     seed(withIdentity());
     answers.set("history", readHistory({ ...historyFixture, agent_decisions: DECISION_LINES }));
+    // What people decided is evidence: the technical view's (spec 6.4).
+    expect(textOf(render(<CommunityAgents context={context()} />, withIdentity()))).not.toContain("dev approved Codex");
+    setTechnicalDetail(true);
     const text = textOf(render(<CommunityAgents context={context()} />, withIdentity()));
     expect(text).toContain("dev approved Codex, owner maria, profile Engineering.");
     expect(text).toContain("dev changed the Codex profile from General rules to Engineering. Applies to 1 confined instance.");

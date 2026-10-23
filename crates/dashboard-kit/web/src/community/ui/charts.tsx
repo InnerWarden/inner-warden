@@ -254,23 +254,26 @@ export function TokenBars({
           </>
         )}
       </svg>
-      <table className="sr-only">
-        <caption>{name}</caption>
-        <tbody>
-          {parts.map((part) => (
-            <tr key={part.key}>
-              <th scope="row">{part.label}</th>
-              <td>{formatCount(part.value)}</td>
-            </tr>
-          ))}
-          {cacheReads === undefined ? null : (
-            <tr>
-              <th scope="row">Re-read from cache</th>
-              <td>{formatCount(cacheReads)}</td>
-            </tr>
-          )}
-        </tbody>
-      </table>
+      {/* A table sizes to its content whatever its width says: the wrapper is what hides it. */}
+      <div className="sr-only">
+        <table>
+          <caption>{name}</caption>
+          <tbody>
+            {parts.map((part) => (
+              <tr key={part.key}>
+                <th scope="row">{part.label}</th>
+                <td>{formatCount(part.value)}</td>
+              </tr>
+            ))}
+            {cacheReads === undefined ? null : (
+              <tr>
+                <th scope="row">Re-read from cache</th>
+                <td>{formatCount(cacheReads)}</td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
       <Disclosure summary="Show as a table">
         <table className={`w-full text-left ${SMALL_TEXT} text-(--iw-ink-2)`}>
           <tbody>

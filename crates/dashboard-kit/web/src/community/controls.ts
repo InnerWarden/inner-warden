@@ -1,6 +1,7 @@
-import type { Part, Step } from "../components/viz";
-import type { AgentFacts, Protection, RecordHealth, RecordSpan } from "./api";
-import { nameList, type AgentRow } from "./agentsView";
+import { formatCount } from "../presentation";
+import type { AgentFacts, AgentNextStep, History, McpCounts, Protection } from "./api";
+import { gatewayRestart, restartFor, type RestartWords } from "./restart";
+import { shortDay } from "./words";
 
 // ---------------------------------------------------------------------------
 // One agent's screening, in six states (spec 6.2). "Connected" is the config;
@@ -20,6 +21,14 @@ import { nameList, type AgentRow } from "./agentsView";
 export type Seen = "seen" | "not_seen" | "not_reported" | "nothing_to_screen";
 
 type SeenFacts = Pick<AgentFacts, "mechanism" | "lastObservedAt" | "configChangedAt" | "mcp">;
+
+/**
+ * Connected: wired to the guard (the config), whatever was seen. Monitor,
+ * enforce, partly connected, or mixed (its own hooks or servers differ).
+ */
+export function isConnected(agent: Pick<AgentFacts, "mode">): boolean {
+  return agent.mode === "monitor" || agent.mode === "enforce" || agent.mode === "partial" || agent.mode === "mixed";
+}
 
 function later(a: string, b: string): boolean {
   return Date.parse(a) > Date.parse(b);
@@ -89,156 +98,123 @@ export function countsAsRefusing(state: ScreeningState): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// The control list the Protection page draws today.
+// The Protection page's screening rows (spec 6.2, section 2).
 // ---------------------------------------------------------------------------
 
-/**
- * What Community covers on this machine, control by control, and the ring
- * that counts them.
- *
- * Four states, each with one colour job: refusing (the accent: InnerWarden
- * acts), on (slate: working as set up, watching, recording), needs you
- * (amber: a person has to do something) and off (the faint track: off by
- * choice is not a problem, and the ring says "off", never "missing").
- *
- * A screening control is ONE row over several agents, so its state is one
- * word while its agents can differ: Tool-call screening is "needs you"
- * because Codex is partly connected, while Cursor and Gemini CLI refuse. The
- * control carries the agents that refuse (`refusingAgents`), so neither its
- * line, nor its ladder, nor the ring's legend can say nothing refuses while
- * something does.
- */
-export type ControlState = "refusing" | "on" | "needs" | "off";
-
-export type Control = {
-  key: string;
-  glyph?: "prompt" | "plug" | "file" | "cage" | "chat" | "bell" | "person";
-  name: string;
-  /** Words on the chip. */
-  status: string;
-  state: ControlState | "none";
-  /** One plain line on what it does here. */
-  line: string;
-  /**
-   * A command the CLI or the product documents, and what it is for. A
-   * `template` holds a `<placeholder>` to fill in: shown, never copied.
-   */
-  command?: { label: string; command: string; template?: boolean };
-  /** The four-step ladder, for the two screening controls. */
-  ladder?: Step[];
-  /** The agents this control refuses a deny for, whatever its one state says. */
-  refusingAgents?: string[];
+/** One connected agent as Protection lists it: its state, what was seen, and the one step for it. */
+export type ScreeningRow = {
+  agent: AgentFacts;
+  state: ScreeningState;
+  seen: Seen;
+  /** A step for this agent only, or the step that finishes connecting it. */
+  step?: AgentNextStep;
+  /** The agent's restart words: every row step changes this agent's config, so they follow it. */
+  restart: RestartWords;
 };
 
-const SEEN_WITHIN_MS = 24 * 3_600_000;
+/**
+ * The step a row offers: a switch for this agent only when the CLI sends one
+ * (it does so only where the switch is proven), the step that finishes
+ * connecting a partly connected agent, or none. Never a guess.
+ */
+function rowStep(agent: AgentFacts, state: ScreeningState): AgentNextStep | undefined {
+  if (agent.mode === "enforce") return agent.modeSteps?.monitor;
+  if (agent.mode === "monitor") return agent.modeSteps?.enforce;
+  if (agent.mode === "mixed") return agent.modeSteps?.enforce ?? agent.modeSteps?.monitor;
+  if (agent.mode === "partial" || state === "needs_you") return agent.nextStep;
+  return undefined;
+}
 
-function recent(at: string | undefined, now: number): boolean {
-  return at !== undefined && Number.isFinite(Date.parse(at)) && now - Date.parse(at) <= SEEN_WITHIN_MS;
+/** One row per connected or partly connected agent, in the order the CLI sent them. */
+export function screeningRows(agents: readonly AgentFacts[], unnamed: { hook?: string; mcp?: string } | undefined): ScreeningRow[] {
+  return agents.filter(isConnected).map((agent) => {
+    const state = screeningState(agent, unnamed);
+    const step = rowStep(agent, state);
+    return {
+      agent,
+      state,
+      seen: agentSeen(agent, unnamed),
+      ...(step === undefined ? {} : { step }),
+      restart: restartFor(agent.id, agent.name, agent.restart),
+    };
+  });
+}
+
+function plural(n: number, one: string, many: string): string {
+  return n === 1 ? one : many;
 }
 
 /**
- * The four steps of one screening control, per agent where they differ.
- *
- * "Seen working" reads the decision record, not only the agents that name
- * themselves in it: a hook written before hooks named their agent still
- * screens, and the channel's newest decision (`channelSeenAt`) says so.
+ * How a proxy agent's MCP servers are wrapped, in lines: "2 of 3 local servers
+ * wrapped." and, where some are remote, that Community does not screen those.
  */
-function screeningLadder(rows: readonly AgentRow[], channelSeenAt: string | undefined, now: number): Step[] {
-  const connected = rows.some((row) => row.state === "refusing" || row.state === "watching" || row.state === "partial");
-  const refusing = rows.filter((row) => row.state === "refusing");
-  const others = rows.filter((row) => row.state !== "refusing");
-  const seen = recent(channelSeenAt, now) || rows.some((row) => recent(row.lastScreenedAt, now));
-  const everSeen = channelSeenAt !== undefined || rows.some((row) => row.lastScreenedAt !== undefined);
-  const refusingWords = refusing.length === 0
-    ? "watching only: nothing is refused"
-    : others.length === 0
-      ? "a deny is refused before it runs"
-      : `${nameList(refusing.map((row) => row.name))} ${refusing.length === 1 ? "refuses" : "refuse"} a deny; ${nameList(others.map((row) => row.name))} ${others.length === 1 ? "does" : "do"} not`;
-  return [
-    { key: "connected", label: "Connected", mark: connected ? "done" : "not_applicable", words: connected ? "the guard is wired in" : "no agent is connected" },
-    {
-      key: "seen",
-      label: "Seen working",
-      mark: seen ? "done" : "unknown",
-      words: seen ? "screened in the last 24 hours" : everSeen ? "nothing screened in the last 24 hours" : "nothing screened yet",
-    },
-    { key: "refusing", label: "Refusing", mark: refusing.length > 0 ? "done" : "not_applicable", words: refusingWords },
-    { key: "checked", label: "Checked after", mark: "unknown", words: "not checked by a second part of InnerWarden" },
-  ];
+export function mcpLines(mcp: McpCounts | undefined): string[] {
+  if (mcp === undefined) return [];
+  const lines: string[] = [];
+  lines.push(
+    mcp.stdio === 0
+      ? "No local MCP server to wrap."
+      : `${formatCount(mcp.wrapped)} of ${formatCount(mcp.stdio)} local ${plural(mcp.stdio, "server", "servers")} wrapped.`,
+  );
+  if (mcp.remote > 0) {
+    lines.push(`${formatCount(mcp.remote)} remote ${plural(mcp.remote, "server is", "servers are")} not screened (Community wraps local servers only).`);
+  }
+  return lines;
 }
 
-function screening(
-  key: string,
-  glyph: "prompt" | "plug",
-  name: string,
-  through: string,
-  rows: readonly AgentRow[],
-  channelSeenAt: string | undefined,
-  now: number,
-): Control {
-  // What the rows count as agents here: not one the guard cannot wire, and
-  // not a configuration left behind by an agent that is not on this machine.
-  const present = rows.filter((row) => row.state !== "unsupported" && !(row.state === "not_connected" && !row.needsYou));
-  if (present.length === 0) {
-    return { key, glyph, name, status: "No agent found", state: "none", line: `No agent on this machine is screened ${through}.` };
+const SUMMARY_PARTS: { state: ScreeningState; words: (n: number) => string }[] = [
+  { state: "refusing", words: () => "refusing a deny" },
+  { state: "monitor", words: () => "in monitor" },
+  { state: "needs_you", words: (n) => plural(n, "needs you", "need you") },
+  { state: "unknown", words: () => "not yet seen working" },
+];
+
+/**
+ * The screening half of Protection's summary sentence, counted by state:
+ * "Screening: 1 agent refusing a deny, 1 in monitor, 1 not yet seen working."
+ * `undefined` rows: the agents were not read, which is said, never a zero.
+ */
+export function screeningSummary(rows: readonly ScreeningRow[] | undefined): string {
+  if (rows === undefined) return "Screening: not read.";
+  if (rows.length === 0) return "Screening: no agent is connected yet.";
+  const parts: string[] = [];
+  for (const { state, words } of SUMMARY_PARTS) {
+    const n = rows.filter((row) => row.state === state).length;
+    if (n === 0) continue;
+    parts.push(parts.length === 0 ? `${formatCount(n)} ${plural(n, "agent", "agents")} ${words(n)}` : `${formatCount(n)} ${words(n)}`);
   }
-  const needs = present.filter((row) => row.needsYou);
-  const refusing = present.filter((row) => row.state === "refusing");
-  const watching = present.filter((row) => row.state === "watching");
-  const names = nameList(present.map((row) => row.name));
-  const firstNext = [...needs, ...watching, ...present].find((row) => row.next !== undefined)?.next;
-  const command = firstNext === undefined ? undefined : { label: firstNext.label, command: firstNext.command };
-  const ladder = screeningLadder(present, channelSeenAt, now);
-  const refusingAgents = refusing.map((row) => row.name);
-  const refuses = (list: readonly AgentRow[]) => `${nameList(list.map((row) => row.name))} ${list.length === 1 ? "refuses" : "refuse"} a deny.`;
-  if (needs.length > 0) {
-    const who = nameList(needs.map((row) => row.name));
-    const notBehind = `${who} ${needs.length === 1 ? "is" : "are"} not fully behind the guard.`;
-    const rest = present.filter((row) => !row.needsYou && row.state !== "refusing");
-    const restWords = rest.length === 0 ? "" : ` ${nameList(rest.map((row) => row.name))} ${rest.length === 1 ? "watches" : "watch"} only.`;
-    return {
-      key, glyph, name,
-      status: needs.every((row) => row.state === "partial") ? "Partly connected" : "Not connected",
-      state: "needs",
-      line: `${refusing.length === 0 ? "" : `${refuses(refusing)} `}${notBehind}${restWords}`,
-      ...(command === undefined ? {} : { command }),
-      ladder,
-      refusingAgents,
-    };
-  }
-  if (refusing.length === present.length) {
-    return { key, glyph, name, status: "Refusing", state: "refusing", line: `${names}, ${through}. A deny is refused before it runs.`, ladder, refusingAgents };
-  }
-  if (watching.length === present.length) {
-    return {
-      key, glyph, name, status: "Watching only", state: "on",
-      line: `${names}, ${through}. Every command is recorded; none is refused.`,
-      ...(command === undefined ? {} : { command }),
-      ladder,
-      refusingAgents,
-    };
-  }
-  const rest = present.filter((row) => row.state !== "refusing");
-  return {
-    key, glyph, name, status: "Some refuse", state: "on",
-    line: `${refuses(refusing)} ${nameList(rest.map((row) => row.name))} ${rest.length === 1 ? "watches" : "watch"} only.`,
-    ...(command === undefined ? {} : { command }),
-    ladder,
-    refusingAgents,
-  };
+  return `Screening: ${parts.join(", ")}.`;
 }
 
-export type ControlsInput = {
-  agents: readonly AgentRow[];
-  protection?: Protection;
-  health?: RecordHealth;
-  record?: RecordSpan;
-  sinceWords?: string;
-  /** `undefined` when the event log was not read: then no count is said. */
-  messagesRecorded?: number;
-  /** The newest decision each channel screened, named or not (`screened_by_channel`). */
-  channelSeen?: { hook?: string; mcp?: string };
-  now: number;
+// ---------------------------------------------------------------------------
+// The optional defences (spec 6.2, section 4). Each is off until the person
+// turns it on, and each says its one step. What could not be read is "Not
+// read", never off.
+// ---------------------------------------------------------------------------
+
+export type OptionalKey = "jail" | "alerts" | "second-opinion" | "messages";
+/** The pill an optional defence is drawn with: off is neutral, never a warning. */
+export type OptionalPill = "on" | "needs" | "unknown" | "off" | "not_available";
+
+export type OptionalStep = { label: string; command: string; line?: string };
+
+export type OptionalControl = {
+  key: OptionalKey;
+  name: string;
+  pill: OptionalPill;
+  /** The words on the pill. */
+  words: string;
+  /** What it does here now, in one sentence. */
+  line: string;
+  /** More lines from the CLI, as sent (the jail's advice). */
+  more: string[];
+  /** How the summary sentence names it. */
+  summary: string;
+  step?: OptionalStep;
+  /** Whoever must be restarted after the step, with the words for it. */
+  restarts: { agent: string; words: RestartWords }[];
+  /** A tip below the step (the alias that starts Claude Code in the jail). */
+  tip?: string;
 };
 
 /**
@@ -249,139 +225,138 @@ export type ControlsInput = {
 export const JAIL_ALIAS_WORDS =
   "To start Claude Code in it every time, add alias claude='innerwarden contain --identity -- claude' to your shell.";
 
-export function communityControls(input: ControlsInput): Control[] {
-  const { agents, protection, health, now } = input;
-  // An agent found here with no connection at all has no mechanism to sort it
-  // by. It is not behind the guard, and that is said once, under Command
-  // screening, rather than left out of both.
-  const unwired = (row: AgentRow) => row.mechanism === undefined && row.needsYou;
-  const controls: Control[] = [
-    screening("command_screening", "prompt", "Command screening", "through its shell hook", agents.filter((row) => row.mechanism === "hook" || unwired(row)), input.channelSeen?.hook, now),
-    screening("tool_call_screening", "plug", "Tool-call screening", "through the MCP proxy", agents.filter((row) => row.mechanism === "mcp"), input.channelSeen?.mcp, now),
-  ];
-  const recording = health?.recording ?? protection?.record.recording;
-  controls.push({
-    key: "decision_record",
-    glyph: "file",
-    name: "Decision record",
-    status: recording === false ? "Not recording" : recording === true ? "Recording" : "Not read",
-    state: recording === false ? "needs" : recording === true ? "on" : "none",
-    line: recording === false
-      ? "Decisions are not being written down. innerwarden status says why."
-      : input.record === undefined
-        ? "Every decision the guard makes is written to a local record."
-        : `${input.record.decisions.toLocaleString("en-GB")} decisions${input.sinceWords === undefined ? "" : ` since ${input.sinceWords}`}. It keeps the newest and drops the oldest.`,
-  });
-  if (protection !== undefined) {
-    const claudeHere = agents.some((row) => row.id === "claude-code");
-    controls.push({
-      key: "ai_jail",
-      glyph: "cage",
-      name: "AI Jail",
-      status: protection.jail.available ? "Ready" : "Not available here",
-      state: protection.jail.available ? "on" : "off",
-      line: protection.jail.available
-        ? "Runs an agent in a jail when you ask for one, with the guard inside it for Claude Code; other agents get the walls." +
-          (claudeHere ? ` ${JAIL_ALIAS_WORDS}` : "")
-        : "This machine has no sandbox the jail trusts.",
-      ...(protection.jail.available
-        ? { command: { label: "To start one, with your agent's own command in place of <command>:", command: "innerwarden contain -- <command>", template: true } }
-        : {}),
-    });
-    controls.push(messagesControl(protection, input.messagesRecorded));
-    controls.push({
-      key: "alerts",
-      glyph: "bell",
-      name: "Alerts",
-      status: protection.alerts.channels > 0 ? `On, ${protection.alerts.channels} ${protection.alerts.channels === 1 ? "channel" : "channels"}` : "Off",
-      state: protection.alerts.channels > 0 ? "on" : "off",
-      line: protection.alerts.channels > 0
-        ? "A deny is sent where you asked: Telegram, Slack, Discord or a webhook."
-        : "Sends a deny to Telegram, Slack, Discord or a webhook.",
-      ...(protection.alerts.channels > 0 ? {} : { command: { label: "To turn them on:", command: "innerwarden notify" } }),
-    });
-    controls.push({
-      key: "second_opinion",
-      glyph: "person",
-      name: "Second opinion",
-      status: protection.secondOpinion.configured ? "On" : "Off",
-      state: protection.secondOpinion.configured ? "on" : "off",
-      line: protection.secondOpinion.configured
-        ? "Your own model is asked about commands the rules cannot settle."
-        : "Asks your own model about commands the rules cannot settle.",
-      ...(protection.secondOpinion.configured
-        ? {}
-        : { command: { label: "To set it up, with your model's address and name:", command: "innerwarden llm set --url <URL> --model <MODEL>", template: true } }),
-    });
-    const suppress = protection.suppress;
-    const mutes = suppress.muteRules + suppress.muteCategories;
-    controls.push({
-      key: "allow_list",
-      name: "Allow and mute list",
-      status: `${suppress.allow} ${suppress.allow === 1 ? "pattern" : "patterns"}, ${mutes} ${mutes === 1 ? "rule" : "rules"}`,
-      state: "none",
-      line: suppress.allow + mutes === 0 ? "Nothing is let through by hand." : "Commands they cover are not flagged.",
-    });
-  }
-  return controls;
+/** The jail's template step: drawn to fill in, never copied as it is. */
+export const JAIL_STEP: OptionalStep = {
+  label: "To start an agent in the jail:",
+  command: "innerwarden contain -- <command>",
+  line: "Put your agent's own command in place of <command>. The guard runs inside the jail for Claude Code; other agents get the jail's walls.",
+};
+
+function notRead(key: OptionalKey, name: string, summary: string): OptionalControl {
+  return { key, name, pill: "unknown", words: "Not read", line: "Not read: the dashboard did not answer for it.", more: [], summary: `${summary} not read`, restarts: [] };
 }
 
 /**
- * Messages to the agent. Recording them goes through an OpenClaw chat
- * gateway: where there is none, `observe install` changes nothing and exits
- * 1, so it is not offered, and the control is not counted as "off" in a ring
- * that could never turn it on.
+ * The AI Jail. "Ready" only when the CLI ran the checks a jail needs and they
+ * passed (`checks_pass === true`); not checked yet, or a CLI that does not
+ * say, reads "Not checked here yet", never ready and never off.
  */
-function messagesControl(protection: Protection, recorded: number | undefined): Control {
-  const base = { key: "messages", glyph: "chat" as const, name: "Messages to your agent" };
-  if (protection.observe.installed) {
+export function jailControl(jail: Protection["jail"] | undefined, claudeHere: boolean): OptionalControl {
+  const name = "AI Jail";
+  if (jail === undefined) return notRead("jail", name, "AI Jail");
+  const base = { key: "jail" as const, name, more: [] as string[], restarts: [] };
+  if (!jail.available) {
+    return { ...base, pill: "not_available", words: "Not available", line: "Not available on this system.", summary: "AI Jail not available" };
+  }
+  const backend = jail.backend === undefined ? "" : ` (${jail.backend})`;
+  const offered = { step: JAIL_STEP, ...(claudeHere ? { tip: JAIL_ALIAS_WORDS } : {}) };
+  if (jail.checksPass === true) {
+    return { ...base, ...offered, pill: "on", words: "Ready", line: `Ready: the checks a jail needs pass on this machine${backend}.`, summary: "AI Jail ready" };
+  }
+  if (jail.checksPass === false) {
     return {
       ...base,
-      status: "Recording",
-      state: "on",
-      line: `${recorded === undefined ? "" : `${recorded.toLocaleString("en-GB")} recorded. `}Records the risky ones; it does not block them.`,
+      ...offered,
+      pill: "needs",
+      words: "Needs you",
+      line: "Needs you: a jail does not start here yet.",
+      more: jail.advice,
+      summary: "AI Jail needs you",
     };
   }
-  if (!protection.observe.available) {
+  const found = jail.backend === undefined ? "" : ` (${jail.backend} found)`;
+  return { ...base, ...offered, pill: "unknown", words: "Not checked here yet", line: `Not checked here yet${found}.`, summary: "AI Jail not checked here yet" };
+}
+
+/** Alerts, by how many channels are set up. Never a channel's name or address (CJC-090-J012). */
+export function alertsControl(alerts: Protection["alerts"] | undefined): OptionalControl {
+  const name = "Alerts";
+  const channels = alerts?.channels;
+  if (channels === undefined) return notRead("alerts", name, "alerts");
+  const base = { key: "alerts" as const, name, more: [] as string[], restarts: [] };
+  if (channels === 0) {
     return {
       ...base,
-      status: "Needs OpenClaw",
-      state: "none",
-      line: "Records the risky messages people send your agent through OpenClaw, a chat gateway. None is set up here.",
+      pill: "off",
+      words: "Off",
+      line: "Off: no alert channel is set up.",
+      summary: "alerts off",
+      step: { label: "To turn them on:", command: "innerwarden notify", line: "Sets up a chat or webhook alert for a deny." },
+    };
+  }
+  const set = `${formatCount(channels)} ${plural(channels, "channel", "channels")}`;
+  return { ...base, pill: "on", words: "On", line: `On: ${set} set up. A deny is sent; reviews only if you set that up.`, summary: `alerts on (${set})` };
+}
+
+/** A second opinion from the person's own model. */
+export function secondOpinionControl(second: Protection["secondOpinion"] | undefined): OptionalControl {
+  const name = "Second opinion";
+  if (second === undefined) return notRead("second-opinion", name, "second opinion");
+  const base = { key: "second-opinion" as const, name, more: [] as string[], restarts: [] };
+  if (second.configured) {
+    const provider = second.provider === undefined ? "" : ` (${second.provider})`;
+    return {
+      ...base,
+      pill: "on",
+      words: "On",
+      line: `On${provider}: your own model is asked about commands the rules cannot settle.`,
+      summary: "second opinion on",
     };
   }
   return {
     ...base,
-    status: "Off",
-    state: "off",
-    line: "Records the risky messages people send your agent through OpenClaw. It does not block them.",
-    command: { label: "To turn it on:", command: "innerwarden observe install" },
+    pill: "off",
+    words: "Off",
+    line: "Off.",
+    summary: "second opinion off",
+    step: {
+      label: "To set it up, with your model's address and name:",
+      command: "innerwarden llm set --url <URL> --model <MODEL>",
+      line: "Asks your own model about commands the rules cannot settle.",
+    },
   };
 }
 
-export type ControlCounts = Record<ControlState, number>;
-
-export function controlCounts(controls: readonly Control[]): ControlCounts {
-  const counts: ControlCounts = { refusing: 0, on: 0, needs: 0, off: 0 };
-  for (const control of controls) if (control.state !== "none") counts[control.state] += 1;
-  return counts;
+/**
+ * Messages people send the agent. Recording them goes through an OpenClaw
+ * chat gateway: where there is none, `observe install` changes nothing, so it
+ * is not offered. A count is said only when the guard's log was read.
+ */
+export function messagesControl(protection: Protection | undefined, history: History | undefined): OptionalControl {
+  const name = "Messages to your agent";
+  if (protection === undefined) return notRead("messages", name, "messages");
+  const base = { key: "messages" as const, name, more: [] as string[], restarts: [] as OptionalControl["restarts"] };
+  if (protection.observe.installed) {
+    const since = history?.since === undefined ? undefined : shortDay(history.since);
+    const recorded = history === undefined || !history.readable
+      ? "Recording."
+      : `Recording: ${formatCount(history.messages.recorded)} ${plural(history.messages.recorded, "message", "messages")}${since === undefined ? "" : ` since ${since}`}.`;
+    return { ...base, pill: "on", words: "Recording", line: recorded, summary: "messages recording" };
+  }
+  if (!protection.observe.available) {
+    return { ...base, pill: "not_available", words: "Not available", line: "Not available here: needs OpenClaw.", summary: "messages not available" };
+  }
+  return {
+    ...base,
+    pill: "off",
+    words: "Off",
+    line: "Off.",
+    summary: "messages off",
+    step: {
+      label: "To turn it on:",
+      command: "innerwarden observe install",
+      line: "Records the risky messages people send your agent through OpenClaw. It does not block them.",
+    },
+    restarts: [gatewayRestart()],
+  };
 }
 
 /**
- * Whether some agent refuses a deny under a control whose one state is not
- * "refusing": the ring's legend then says "Some refuse" rather than
- * "0 Refusing" beside agents that refuse.
+ * The optional half of the summary sentence: "Optional: AI Jail not checked
+ * here yet, alerts off, second opinion on." Messages are named only where
+ * they can be recorded.
  */
-export function someRefuse(controls: readonly Control[]): boolean {
-  return controls.some((control) => control.state !== "refusing" && (control.refusingAgents?.length ?? 0) > 0);
-}
-
-/** The ring's parts, in reading order, each with its count in its label. */
-export function controlRing(counts: ControlCounts): Part[] {
-  return [
-    { key: "refusing", value: counts.refusing, tone: "accent", label: `Refusing: ${counts.refusing}` },
-    { key: "on", value: counts.on, tone: "watch", label: `On: ${counts.on}` },
-    { key: "needs", value: counts.needs, tone: "attention", label: `Needs you: ${counts.needs}` },
-    { key: "off", value: counts.off, tone: "off", label: `Off: ${counts.off}` },
-  ];
+export function optionalSummary(controls: readonly OptionalControl[]): string {
+  const named = controls.filter((control) => control.key !== "messages" || control.pill !== "not_available");
+  return `Optional: ${named.map((control) => control.summary).join(", ")}.`;
 }
