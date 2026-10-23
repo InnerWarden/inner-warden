@@ -2,11 +2,8 @@ import type { DashboardMeta } from "../api";
 import { TechnicalOnly } from "../components/TechnicalDetail";
 import { When } from "../components/When";
 import { formatCount } from "../presentation";
-import { fetchRecordHealth, type RecordHealth } from "./api";
-import { usePolled } from "./poll";
-
-/** How often every page re-asks whether decisions are being recorded. */
-export const RECORD_HEALTH_POLL_MS = 30_000;
+import type { RecordHealth } from "./api";
+import { useSource } from "./store";
 
 /**
  * The notices at the top of every Community page, in both views, in order of
@@ -63,8 +60,8 @@ export function Notices({ meta, health }: { meta?: DashboardMeta; health?: Recor
   );
 }
 
-/** The notices, with the record's health polled for them. */
+/** The notices, with the record's health read from the source the header shares. */
 export function PageNotices({ meta }: { meta?: DashboardMeta }) {
-  const health = usePolled(fetchRecordHealth, RECORD_HEALTH_POLL_MS, "record-health");
+  const health = useSource("record-health");
   return <Notices meta={meta} health={health.data} />;
 }

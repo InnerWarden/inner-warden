@@ -145,11 +145,11 @@ test("a command with hidden characters is listed with a chip, shown written out,
   await expect(page.locator(`[data-case-row="${CASE.hidden}"] [data-hidden-characters]`)).toBeVisible();
   await expect(card.locator("[data-command]").first()).toContainText("\\u{202E}");
   await expect(card).toContainText("Shown with its hidden characters written out, so there is nothing whole to copy.");
-  await expect(card.getByRole("button", { name: /^Copy the command printf/ })).toHaveCount(0);
+  await expect(card.getByRole("button", { name: /^Copy command: printf/ })).toHaveCount(0);
   // Its step is a template: the placeholder is drawn apart, and nothing is copied.
   const template = card.locator("[data-command][data-template]");
   await expect(template.locator("var[data-placeholder]")).toHaveText("<pattern>");
-  await expect(card.getByRole("button", { name: /Copy the command innerwarden allow/ })).toHaveCount(0);
+  await expect(card.getByRole("button", { name: /Copy command: innerwarden allow/ })).toHaveCount(0);
 });
 
 /** The outcome words are a row's main signal: never cut, in either view. */
@@ -179,8 +179,8 @@ test("Copy copies the exact command the CLI sent", async ({ page, context }) => 
   await context.grantPermissions(["clipboard-read", "clipboard-write"]);
   const card = await openCase(page, CASE.flaggedRan);
   const allow = "innerwarden allow 'bash /tmp/build-cache/run.sh --clean'";
-  await card.getByRole("button", { name: `Copy the command ${allow}` }).click();
-  await expect(card.getByRole("button", { name: `Copy the command ${allow}` })).toHaveText("Copied");
+  await card.getByRole("button", { name: `Copy command: ${allow}` }).click();
+  await expect(card.getByRole("button", { name: `Copy command: ${allow}` })).toHaveText("Copied");
   expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(allow);
 });
 

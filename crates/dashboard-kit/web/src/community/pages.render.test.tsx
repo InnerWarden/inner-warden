@@ -31,15 +31,22 @@ function lookupOf(key: string): string {
   return key;
 }
 
+function answered(key: string) {
+  const lookup = lookupOf(key);
+  if (failing.has(lookup)) return { error: new Error("unreadable"), loading: false, stale: false, refresh: () => undefined };
+  const data = answers.get(lookup);
+  return data === undefined
+    ? { loading: true, stale: false, refresh: () => undefined }
+    : { data, loading: false, stale: false, refresh: () => undefined };
+}
+
 vi.mock("./poll", () => ({
-  usePolled: (_load: unknown, _delay: number, key = "") => {
-    const lookup = lookupOf(key);
-    if (failing.has(lookup)) return { error: new Error("unreadable"), loading: false, stale: false, refresh: () => undefined };
-    const data = answers.get(lookup);
-    return data === undefined
-      ? { loading: true, stale: false, refresh: () => undefined }
-      : { data, loading: false, stale: false, refresh: () => undefined };
-  },
+  usePolled: (_load: unknown, _delay: number, key = "") => answered(key),
+}));
+
+// The shared sources answer from the same table, by their key.
+vi.mock("./store", () => ({
+  useSource: (key: string) => answered(key),
 }));
 
 const { CommunityOverview } = await import("./Overview");
@@ -125,7 +132,7 @@ function textOf(html: string): string {
 /** Every command box's text, as a reader sees it (its words are spans). */
 function commandBoxes(html: string): { text: string; copy: boolean; template: boolean }[] {
   const boxes: { text: string; copy: boolean; template: boolean }[] = [];
-  for (const match of html.matchAll(/<code data-command="[^"]*"( data-template="[^"]*")?[^>]*>([\s\S]*?)<\/code>(\s*<button[^>]*aria-label="Copy the command)?/g)) {
+  for (const match of html.matchAll(/<code data-command="[^"]*"( data-template="[^"]*")?[^>]*>([\s\S]*?)<\/code>(\s*<button[^>]*aria-label="Copy command: )?/g)) {
     boxes.push({ text: textOf(match[2]), template: match[1] !== undefined, copy: match[3] !== undefined });
   }
   return boxes;
@@ -238,15 +245,16 @@ describe("the colour jobs, on every Community page", () => {
 });
 
 describe("the header", () => {
-  const chips = (html: string) => html.match(/data-chip=/g)?.length ?? 0;
+  const chips = (html: string) => html.match(/data-pill=/g)?.length ?? 0;
 
   it("carries ONE chip, the most severe thing that is true, in both views", () => {
     const plain = render(<HeaderStatus meta={META} metaStatus="ready" />);
-    expect(plain).toContain("Partly connected");
+    expect(plain).toContain("Needs you");
+    expect(plain).toContain('aria-live="polite"');
     expect(plain).not.toMatch(/class="[^"]*\bhidden\b/);
     const exposed = render(<HeaderStatus meta={{ ...META, exposed: true }} metaStatus="ready" />);
-    expect(exposed).toContain("Open to the network");
-    expect(exposed).not.toContain("Partly connected");
+    expect(exposed).toContain("Open to network");
+    expect(exposed).not.toContain("Needs you");
     expectColourJobs(exposed);
     answers.set("record-health", readRecordHealth({ recording: false }));
     const outage = render(<HeaderStatus meta={META} metaStatus="ready" />);

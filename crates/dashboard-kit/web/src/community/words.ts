@@ -100,15 +100,51 @@ export const STATE_WORDS: Record<AgentState, string> = {
   unknown: "Status unknown",
 };
 
-/** The host-wide mode in the header (`guard/meta`). */
+/**
+ * What monitor means, said once on every screen that shows a mode. Monitor is
+ * the default and a fine place to stay; the words never ask anyone to leave it.
+ */
+export const MONITOR_MEANS = "Monitor is a dry run: every command is checked and recorded, and none is stopped.";
+
+/** What enforce means. "Set to refuse" is the config; a refusal is only what was counted. */
+export const ENFORCE_MEANS = "Enforce: a deny is refused before it runs. A review is recorded and, by default, still runs.";
+
+/** One vocabulary for the mode, everywhere: Monitor and Enforce (`guard/meta`, an agent's row). */
 export const MODE_WORDS: Record<"enforce" | "monitor" | "mixed" | "partial" | "not_configured" | "unknown", string> = {
-  enforce: "Refusing",
-  monitor: "Watching only",
-  mixed: "Mixed modes",
+  enforce: "Enforce",
+  monitor: "Monitor",
+  mixed: "Mixed",
   partial: "Partly connected",
   not_configured: "Not connected",
-  unknown: "Status unknown",
+  unknown: "Unknown",
 };
+
+/**
+ * Every product command the pages print that carries no per-agent argument.
+ * A per-agent command comes only from the CLI. A Rust test reads this list
+ * (`dashboard_fixed_commands_are_real_cli_verbs`) and holds each verb and
+ * flag to one the CLI answers, so keep one quoted command per line. The last
+ * two are templates: a `<placeholder>` is shown to fill in, never copied.
+ */
+export const FIXED_COMMANDS = [
+  "innerwarden status",
+  "innerwarden enforce",
+  "innerwarden dry-run",
+  "innerwarden notify",
+  "innerwarden dashboard",
+  "innerwarden observe install",
+  "innerwarden agents connect --all --monitor",
+  "innerwarden allow --list",
+  "innerwarden mute --list",
+  "innerwarden contain -- <command>",
+  "innerwarden llm set --url <URL> --model <MODEL>",
+] as const;
+export type FixedCommand = (typeof FIXED_COMMANDS)[number];
+
+/** Whether a fixed command is a template: it holds a `<placeholder>`. */
+export function isTemplate(command: string): boolean {
+  return /<[^<>]+>/.test(command);
+}
 
 export type PlatformOs = "macos" | "linux" | "windows" | "other";
 

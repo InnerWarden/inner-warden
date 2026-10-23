@@ -1,6 +1,96 @@
 import type { Part, Step } from "../components/viz";
-import type { Protection, RecordHealth, RecordSpan } from "./api";
+import type { AgentFacts, Protection, RecordHealth, RecordSpan } from "./api";
 import { nameList, type AgentRow } from "./agentsView";
+
+// ---------------------------------------------------------------------------
+// One agent's screening, in six states (spec 6.2). "Connected" is the config;
+// "screened" is what was seen; the two are never merged, so nothing here
+// says an agent refuses anything until a screening came through the guard
+// after its settings last changed.
+// ---------------------------------------------------------------------------
+
+/**
+ * Whether the guard has seen an agent working since its settings changed.
+ *
+ * `not_reported`: no screening names it, and one on its channel names nobody
+ * (or the CLI did not say), so it could be this agent's: nothing is said
+ * either way. `nothing_to_screen`: a proxy with no local MCP server, which is
+ * a fact about the agent, not a fault.
+ */
+export type Seen = "seen" | "not_seen" | "not_reported" | "nothing_to_screen";
+
+type SeenFacts = Pick<AgentFacts, "mechanism" | "lastObservedAt" | "configChangedAt" | "mcp">;
+
+function later(a: string, b: string): boolean {
+  return Date.parse(a) > Date.parse(b);
+}
+
+export function agentSeen(agent: SeenFacts, unnamed: { hook?: string; mcp?: string } | undefined): Seen {
+  if (agent.mechanism === "mcp" && agent.mcp?.stdio === 0) return "nothing_to_screen";
+  if (agent.lastObservedAt !== undefined) {
+    return agent.configChangedAt === undefined || later(agent.lastObservedAt, agent.configChangedAt) ? "seen" : "not_seen";
+  }
+  if (agent.mechanism === undefined || unnamed === undefined) return "not_reported";
+  const unnamedAt = unnamed[agent.mechanism];
+  if (unnamedAt === undefined) return "not_seen";
+  // A decision that names nobody, made before the settings changed, cannot
+  // show the new settings working.
+  if (agent.configChangedAt !== undefined && !later(unnamedAt, agent.configChangedAt)) return "not_seen";
+  return "not_reported";
+}
+
+/** The six states one agent's screening can be in. */
+export const SCREENING_STATES = ["refusing", "monitor", "needs_you", "unknown", "off", "not_available"] as const;
+export type ScreeningState = (typeof SCREENING_STATES)[number];
+
+/**
+ * - `refusing`: Enforce, and seen working since its settings changed.
+ * - `monitor`: Monitor, and seen working since. Monitor never refuses.
+ * - `needs_you`: partly connected, or a proxy with a local server not wrapped.
+ * - `unknown`: connected but not seen since its settings changed, or a row
+ *   that could not be read. Never-screened is unknown, never "on".
+ * - `off`: not connected. Neutral: off by choice is not a problem.
+ * - `not_available`: the guard cannot wire this agent.
+ */
+export function screeningState(agent: AgentFacts | undefined, unnamed: { hook?: string; mcp?: string } | undefined): ScreeningState {
+  if (agent === undefined) return "unknown";
+  if (!agent.supported) return "not_available";
+  if (agent.mode === "not_configured") return "off";
+  if (agent.mode === "unknown") return "unknown";
+  if (agent.mode === "partial" || (agent.mcp !== undefined && agent.mcp.wrapped < agent.mcp.stdio)) return "needs_you";
+  if (agentSeen(agent, unnamed) !== "seen") return "unknown";
+  // A mixed agent refuses some calls and not others: it is not counted as refusing.
+  return agent.mode === "enforce" ? "refusing" : "monitor";
+}
+
+/** The pill each state is drawn with. */
+export const SCREENING_PILL: Record<ScreeningState, "enforce" | "monitor" | "needs" | "unknown" | "off" | "not_available"> = {
+  refusing: "enforce",
+  monitor: "monitor",
+  needs_you: "needs",
+  unknown: "unknown",
+  off: "off",
+  not_available: "not_available",
+};
+
+/** The words on that pill. */
+export const SCREENING_WORDS: Record<ScreeningState, string> = {
+  refusing: "Refusing a deny",
+  monitor: "Monitor",
+  needs_you: "Needs you",
+  unknown: "Unknown",
+  off: "Not connected",
+  not_available: "Not available",
+};
+
+/** Whether a state counts as refusing a deny: only `refusing`, never monitor. */
+export function countsAsRefusing(state: ScreeningState): boolean {
+  return state === "refusing";
+}
+
+// ---------------------------------------------------------------------------
+// The control list the Protection page draws today.
+// ---------------------------------------------------------------------------
 
 /**
  * What Community covers on this machine, control by control, and the ring

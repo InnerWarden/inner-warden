@@ -1,5 +1,6 @@
 import { createServer } from "node:http";
 import { readFile, stat } from "node:fs/promises";
+import { existsSync, statSync } from "node:fs";
 import { dirname, extname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -32,6 +33,7 @@ const apiFiles = fixture === "community"
     ["/api/guard/token-intelligence", "token-intelligence.json"],
     ["/api/guard/protection", "protection.json"],
     ["/api/guard/record-health", "record-health.json"],
+    ["/api/guard/suppress", "suppress.json"],
   ])
   : new Map([
     ["/api/dashboard/v1/bootstrap", "bootstrap.json"],
@@ -47,6 +49,67 @@ const apiFiles = fixture === "community"
     ["/api/guard/agents", "agents.json"],
     ["/api/guard/token-intelligence", "token-intelligence.json"],
   ]);
+
+// Scenarios: the same screens in the states a reader meets. A request that
+// carries the cookie `iw-fixture=<scenario>` is answered from
+// `fixtures/community/scenarios/<scenario>/` first and the plain files
+// second; a scenario lists the routes its server does not serve in
+// `404.json` and those it cannot answer in `503.json`. The CLI's fixture
+// writer renders every scenario file it has a builder for
+// (`community_fixtures_match_what_the_cli_serves`); the files below are
+// written by hand because their route has no pure builder, each with why.
+const HAND_WRITTEN = [
+  ["enforce/meta.json", "the host mode comes from guard/meta, which has no pure builder: every agent here is in enforce"],
+  ["mixed/meta.json", "the host mode comes from guard/meta: one agent in monitor, one in enforce"],
+  ["no-agents/meta.json", "the host mode comes from guard/meta: no agent is connected"],
+  ["never-screened/meta.json", "the host mode comes from guard/meta: both agents in monitor"],
+  ["unknown/meta.json", "the host mode comes from guard/meta: it is unknown while the agents cannot be read"],
+  ["exposed/meta.json", "whether the dashboard is open to the network comes from guard/meta"],
+  ["ad-installed/meta.json", "whether Active Defence is installed comes from guard/meta"],
+  ["not-recording/record-health.json", "guard/record-health reads a live outage file, which has no pure builder"],
+];
+
+const scenarioRoot = join(fixtureRoot, "scenarios");
+if (fixture === "community") {
+  for (const [file] of HAND_WRITTEN) {
+    if (!existsSync(join(scenarioRoot, file))) throw new Error(`hand-written scenario file is missing: ${file}`);
+  }
+}
+
+/** The scenario a request asked for by cookie, or `undefined` for the plain files. */
+function scenarioOf(request) {
+  for (const part of (request.headers.cookie ?? "").split(";")) {
+    const [name, value] = part.trim().split("=");
+    if (name !== "iw-fixture" || value === undefined || value === "identity") continue;
+    if (!/^[a-z][a-z-]{0,39}$/.test(value)) return undefined;
+    try {
+      return statSync(join(scenarioRoot, value)).isDirectory() ? value : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+  return undefined;
+}
+
+/** A fixture file: the scenario's own when it has one, else the plain one. */
+async function fixtureFile(scenario, name) {
+  if (scenario !== undefined) {
+    const own = join(scenarioRoot, scenario, name);
+    if (existsSync(own)) return regularFile(own);
+  }
+  return regularFile(join(fixtureRoot, name));
+}
+
+/** The routes a scenario lists in `404.json` or `503.json`. */
+async function routeList(scenario, name) {
+  if (scenario === undefined) return [];
+  try {
+    const list = JSON.parse(await readFile(join(scenarioRoot, scenario, name), "utf8"));
+    return Array.isArray(list) ? list : [];
+  } catch {
+    return [];
+  }
+}
 
 const mime = new Map([
   [".css", "text/css; charset=utf-8"],
@@ -92,6 +155,15 @@ const server = createServer(async (request, response) => {
     // fixture writer rendered (`community_fixtures_match_what_the_cli_serves`).
     if (fixture === "community") {
       const json = "application/json; charset=utf-8";
+      const scenario = scenarioOf(request);
+      if ((await routeList(scenario, "404.json")).includes(path)) {
+        write(response, 404, json, JSON.stringify({ error: "not found" }));
+        return;
+      }
+      if ((await routeList(scenario, "503.json")).includes(path)) {
+        write(response, 503, json, JSON.stringify({ error: "unavailable" }));
+        return;
+      }
       // The identity screens: a journey that sets the cookie
       // `iw-fixture=identity` is served what the CLI answers with a profiles
       // file and a launcher's records (the `*-identity` files); every other
@@ -115,7 +187,7 @@ const server = createServer(async (request, response) => {
       }
       if (path === "/api/guard/decisions") {
         const file = address.searchParams.has("cursor") ? "decisions-page-2.json" : "decisions-page-1.json";
-        const page = JSON.parse(await readFile(join(fixtureRoot, file), "utf8"));
+        const page = JSON.parse(String(await fixtureFile(scenario, file)));
         // A smaller page (the Overview's five) is the first rows of the same
         // page, with the cursor the server would send after them.
         const limit = Number.parseInt(address.searchParams.get("limit") ?? "", 10);
@@ -124,7 +196,7 @@ const server = createServer(async (request, response) => {
         return;
       }
       if (path === "/api/guard/decision") {
-        const all = JSON.parse(await readFile(join(fixtureRoot, "decisions-by-id.json"), "utf8"));
+        const all = JSON.parse(String(await fixtureFile(scenario, "decisions-by-id.json")));
         const found = all[address.searchParams.get("id") ?? ""];
         if (found === undefined) write(response, 404, json, JSON.stringify({ error: "decision_not_in_record" }));
         else write(response, 200, json, JSON.stringify(found));
@@ -132,13 +204,31 @@ const server = createServer(async (request, response) => {
       }
       if (path === "/api/guard/history") {
         const file = address.searchParams.get("kind") === "attempt" ? "history-attempts.json" : "history.json";
-        write(response, 200, json, await regularFile(join(fixtureRoot, file)));
+        write(response, 200, json, await fixtureFile(scenario, file));
+        return;
+      }
+      // Bounded as the CLI bounds it: 1 to 50, default 20, otherwise a 400 with its code.
+      if (path === "/api/guard/sessions") {
+        const raw = address.searchParams.get("limit");
+        const limit = raw === null ? 20 : /^\d+$/.test(raw) ? Number.parseInt(raw, 10) : Number.NaN;
+        if (!Number.isInteger(limit) || limit < 1 || limit > 50) {
+          write(response, 400, json, JSON.stringify({ error: "limit_invalid" }));
+          return;
+        }
+        const page = JSON.parse(String(await fixtureFile(scenario, "sessions.json")));
+        page.items = page.items.slice(0, limit);
+        write(response, 200, json, JSON.stringify(page));
+        return;
+      }
+      const name = apiFiles.get(path);
+      if (name) {
+        write(response, 200, json, await fixtureFile(scenario, name));
         return;
       }
     }
-    const fixtureFile = apiFiles.get(path);
-    if (fixtureFile) {
-      write(response, 200, "application/json; charset=utf-8", await regularFile(join(fixtureRoot, fixtureFile)));
+    const fixtureName = apiFiles.get(path);
+    if (fixtureName) {
+      write(response, 200, "application/json; charset=utf-8", await regularFile(join(fixtureRoot, fixtureName)));
       return;
     }
     if (path.startsWith("/api/")) {

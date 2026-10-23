@@ -15,7 +15,7 @@ for (const [label, path] of COMMUNITY_TABS) {
     await expect(page.locator(PAGE_READY[label])).toBeVisible();
     const notice = page.locator("main [data-exposed][role=alert]");
     await expect(notice).toContainText("This dashboard is open to the network with no sign-in.");
-    await expect(page.locator("header [data-exposed]")).toHaveText(/Open to the network/);
+    await expect(page.locator('header [data-pill="exposed"]')).toHaveText(/Open to network/);
     await expectHonestUpsell(page);
   });
 

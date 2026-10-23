@@ -28,7 +28,7 @@ test.describe("CJC-090-J001 Community shell and posture", () => {
     await expect(status).toHaveText(/Checking/);
     releaseMeta();
     await expect(status).toHaveAttribute("data-meta-status", "ready");
-    await expect(status).toHaveText(/Watching only/);
+    await expect(status).toHaveText(/Monitor/);
 
     const nav = page.getByRole("navigation", { name: "Dashboard views" });
     await expect(nav.getByRole("button")).toHaveText(COMMUNITY_TABS.map(([label]) => label));
@@ -60,18 +60,18 @@ test.describe("CJC-090-J001 Community shell and posture", () => {
     await page.goto("/");
     const status = page.locator("header [data-meta-status]");
     await expect(status).toHaveAttribute("data-meta-status", "ready");
-    await expect(status).toHaveText(/Refusing/);
+    await expect(status).toHaveText(/Enforce/);
 
     await page.clock.runFor(5_000);
     await expect(status).toHaveAttribute("data-meta-status", "error");
-    await expect(status).toHaveText(/Status unknown/);
-    await expect(status).not.toHaveText(/Refusing/);
+    await expect(status).toHaveText(/Unknown/);
+    await expect(status).not.toHaveText(/Enforce/);
     // The page itself stays: a failed refresh withdraws a claim, not the screen.
     await expect(page.getByRole("heading", { name: "What is happening here" })).toBeVisible();
 
     await page.clock.runFor(5_000);
     await expect(status).toHaveAttribute("data-meta-status", "ready");
-    await expect(status).toHaveText(/Refusing/);
+    await expect(status).toHaveText(/Enforce/);
   });
 
   test("never calls the dashboard local when the host did not say where it listens", async ({ page }) => {
@@ -83,7 +83,7 @@ test.describe("CJC-090-J001 Community shell and posture", () => {
     await page.goto("/");
     const status = page.locator("header [data-meta-status]");
     await expect(status).toHaveAttribute("data-meta-status", "ready");
-    await expect(status).toHaveText(/Status unknown/);
+    await expect(status).toHaveText(/Unknown/);
     await page.getByRole("checkbox", { name: "Show technical detail" }).check();
     await expect(status).not.toHaveText(/Local only/);
     await expect(status).not.toHaveText(/Open to the network/);
@@ -97,7 +97,7 @@ test.describe("CJC-090-J001 Community shell and posture", () => {
     await expect(page.locator("[data-local-only]")).toHaveCount(0);
     await page.getByRole("checkbox", { name: "Show technical detail" }).check();
     await expect(status).not.toHaveText(/Local only/);
-    await expect(status.locator("[data-chip]")).toHaveCount(1);
+    await expect(status.locator("[data-pill]")).toHaveCount(1);
     await expect(page.locator("[data-local-only]")).toHaveText(/Local only/);
   });
 

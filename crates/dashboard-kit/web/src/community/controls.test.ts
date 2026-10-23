@@ -4,8 +4,19 @@ import type { AgentsResponse } from "../api";
 import agentsFixture from "../../tests/fixtures/community/agents.json";
 import protectionFixture from "../../tests/fixtures/community/protection.json";
 import { agentRows } from "./agentsView";
-import { readProtection } from "./api";
-import { JAIL_ALIAS_WORDS, communityControls, controlCounts, someRefuse } from "./controls";
+import { readAgentsFacts, readProtection, type AgentFacts } from "./api";
+import {
+  agentSeen,
+  communityControls,
+  controlCounts,
+  countsAsRefusing,
+  JAIL_ALIAS_WORDS,
+  SCREENING_PILL,
+  SCREENING_STATES,
+  SCREENING_WORDS,
+  screeningState,
+  someRefuse,
+} from "./controls";
 import { legendWords } from "./Protection";
 
 const NOW = Date.parse("2026-09-29T14:05:00Z");
@@ -112,5 +123,74 @@ describe("the other controls", () => {
     expect(unread.line).not.toMatch(/\d/);
     const read = communityControls({ agents: [], protection: installed, messagesRecorded: 4, now: NOW }).find((control) => control.key === "messages")!;
     expect(read.line).toContain("4 recorded");
+  });
+});
+
+describe("one agent's screening, in six states (spec 6.2)", () => {
+  const base: AgentFacts = {
+    id: "claude-code",
+    name: "Claude Code",
+    mode: "enforce",
+    mechanism: "hook",
+    supported: true,
+    present: true,
+    installed: true,
+    running: null,
+    configChangedAt: "2026-09-29T11:05:00Z",
+    lastObservedAt: "2026-09-29T14:03:00Z",
+  };
+  const facts = readAgentsFacts(agentsFixture);
+  const byId = Object.fromEntries(facts.agents.map((agent) => [agent.id, agent]));
+
+  it("refuses a deny only in enforce and seen working since its settings changed", () => {
+    expect(screeningState(base, {})).toBe("refusing");
+    expect(screeningState(byId.cursor, facts.unnamed)).toBe("refusing");
+  });
+
+  /** FAILS ON REVERT: without the seen rule, a connected agent nothing came through read as refusing. */
+  it("calls a connected agent nothing came through unknown, never refusing and never on", () => {
+    const never = { ...base, lastObservedAt: undefined };
+    expect(screeningState(never, {})).toBe("unknown");
+    expect(screeningState(byId.gemini, facts.unnamed)).toBe("unknown");
+    // Seen, but before its settings changed: not seen since.
+    expect(screeningState({ ...base, lastObservedAt: "2026-09-29T11:00:00Z" }, {})).toBe("unknown");
+    // A screening on its channel that names nobody could be its own: still not counted.
+    expect(screeningState(never, { hook: "2026-09-29T14:00:00Z" })).toBe("unknown");
+    expect(agentSeen(never, { hook: "2026-09-29T14:00:00Z" })).toBe("not_reported");
+    expect(agentSeen(never, { hook: "2026-09-29T10:00:00Z" })).toBe("not_seen");
+    expect(agentSeen(never, undefined)).toBe("not_reported");
+  });
+
+  it("never counts monitor as refusing", () => {
+    const monitor = { ...base, mode: "monitor" as const };
+    expect(screeningState(monitor, {})).toBe("monitor");
+    expect(countsAsRefusing(screeningState(monitor, {}))).toBe(false);
+    expect(countsAsRefusing(screeningState({ ...base, mode: "mixed" }, {}))).toBe(false);
+    expect(screeningState(byId["claude-code"], facts.unnamed)).toBe("monitor");
+  });
+
+  it("needs a person for a partial connection or a local server left unwrapped", () => {
+    expect(screeningState(byId.codex, facts.unnamed)).toBe("needs_you");
+    expect(screeningState({ ...base, mechanism: "mcp", mcp: { stdio: 3, wrapped: 2, remote: 0 } }, {})).toBe("needs_you");
+  });
+
+  it("draws off as neutral, unsupported as not available, and an unreadable row as unknown", () => {
+    expect(screeningState({ ...base, mode: "not_configured" }, {})).toBe("off");
+    expect(SCREENING_PILL.off).toBe("off");
+    expect(screeningState({ ...base, mode: "not_configured", supported: false }, {})).toBe("not_available");
+    expect(screeningState({ ...base, mode: "unknown" }, {})).toBe("unknown");
+    expect(screeningState(undefined, {})).toBe("unknown");
+    expect(SCREENING_PILL.unknown).toBe("unknown");
+  });
+
+  it("says a proxy with no local MCP server has nothing to screen, a fact and not a fault", () => {
+    expect(agentSeen({ ...base, mechanism: "mcp", mcp: { stdio: 0, wrapped: 0, remote: 2 } }, {})).toBe("nothing_to_screen");
+  });
+
+  it("has words and a pill for every state", () => {
+    for (const state of SCREENING_STATES) {
+      expect(SCREENING_WORDS[state]).toBeTruthy();
+      expect(SCREENING_PILL[state]).toBeTruthy();
+    }
   });
 });

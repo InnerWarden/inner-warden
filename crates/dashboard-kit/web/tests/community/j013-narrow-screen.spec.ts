@@ -72,7 +72,7 @@ test("the five tabs wrap inside the screen, and the header stays under a third o
   expect(height).toBeLessThan(640 / 3);
 
   // The mode is said in words at this width too, not a bare mark.
-  await expect(page.locator("header [data-meta-status]")).toHaveText(/Partly connected/);
+  await expect(page.locator("header [data-meta-status]")).toHaveText(/Needs you/);
 
   const toggle = page.getByRole("checkbox", { name: "Show technical detail" });
   await expect(toggle).toBeHidden();
@@ -185,9 +185,9 @@ test.describe("the header at a desk", () => {
         await page.goto("/");
         await expect(page.locator("header [data-meta-status]")).toHaveAttribute("data-meta-status", "ready");
         if (technical) await page.getByRole("checkbox", { name: "Show technical detail" }).check();
-        await expect(page.locator("header [data-chip]")).toHaveCount(1);
+        await expect(page.locator("header [data-pill]")).toHaveCount(1);
         const nav = await page.getByRole("navigation", { name: "Dashboard views" }).boundingBox();
-        const chip = await page.locator("header [data-chip]").boundingBox();
+        const chip = await page.locator("header [data-pill]").boundingBox();
         expect(Math.abs((chip!.y + chip!.height / 2) - (nav!.y + nav!.height / 2))).toBeLessThan(12);
       });
     }

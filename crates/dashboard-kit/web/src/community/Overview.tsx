@@ -149,7 +149,7 @@ export function CommunityOverview({ context }: { context: CommunityScreenContext
           <Skeleton className="h-80" />
         ) : (
           <section aria-labelledby="lanes-title" className="space-y-3">
-            <h1 id="lanes-title" className="text-2xl font-semibold tracking-tight text-slate-950 sm:text-3xl">What is happening here</h1>
+            <h1 id="lanes-title" tabIndex={-1} className="text-2xl font-semibold tracking-tight text-slate-950 sm:text-3xl">What is happening here</h1>
             <Unreadable
               title="The decision record could not be read"
               body={<><code className="font-mono">innerwarden status</code> says why. Agents and tokens below still come from their own sources.</>}

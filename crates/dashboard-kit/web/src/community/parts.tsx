@@ -48,7 +48,7 @@ export function PageHeader({
     <div className="flex flex-wrap items-end justify-between gap-x-4 gap-y-3" data-tour={tour}>
       <div className="min-w-0">
         <p className={EYEBROW}>{eyebrow}</p>
-        <h1 id={titleId} className="mt-1 text-2xl font-semibold tracking-tight text-slate-950">{title}</h1>
+        <h1 id={titleId} tabIndex={-1} className="mt-1 text-2xl font-semibold tracking-tight text-slate-950">{title}</h1>
         {description === undefined ? null : <p className="mt-1 max-w-3xl text-sm leading-6 text-slate-600">{description}</p>}
       </div>
       {aside === undefined ? null : <div className="flex flex-wrap items-center gap-2">{aside}</div>}
@@ -204,7 +204,7 @@ export function CopyCommand({
         <button
           type="button"
           onClick={onCopy}
-          aria-label={`Copy the command ${command}`}
+          aria-label={`Copy command: ${command}`}
           className="shrink-0 rounded-md border border-slate-300 bg-white px-2 py-1 text-xs font-semibold text-slate-700 hover:bg-slate-100"
         >
           {copied ? "Copied" : "Copy"}
