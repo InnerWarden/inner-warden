@@ -829,7 +829,8 @@ describe("Protection, Agents and Tokens", () => {
     expect(html.match(/role="img"/g)?.length).toBe(1);
     expect(html).not.toContain("Not in Community");
     expect(html).not.toContain("data-paid");
-    expect(html).not.toContain("Execution Gate");
+    // The paid edition: the one generic line at the foot, nothing else (copy.test.ts holds the words).
+    expect(html.match(/data-ad-state=/g)?.length).toBe(1);
     expect(html).not.toContain("Checked after");
     expect(links(html)).toEqual(["https://innerwarden.com/docs/editions-and-guarantees"]);
     expect(html).toContain('data-tour="upgrade"');

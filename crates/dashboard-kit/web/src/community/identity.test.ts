@@ -4,8 +4,6 @@ import agentsFixture from "../../tests/fixtures/community/agents.json";
 import { agentGroups, agentRows, awaitingApproval, decisionSentence, factsOf, trustCounts } from "./agentsView";
 import { readAgentIdentity, readDecisionIdentity, readHistory, MAX_INSTANCES } from "./api";
 import historyFixture from "../../tests/fixtures/community/history.json";
-import { agentsOffer, PRICING_URL } from "./offers";
-import { OFFER_KEYS } from "./dismiss";
 import {
   agentTrustSentence,
   effectiveTrust,
@@ -249,15 +247,6 @@ describe("the Changes list", () => {
 
   it("leaves the history as it was when the log holds none", () => {
     expect("agentDecisions" in readHistory(historyFixture)).toBe(false);
-  });
-});
-
-describe("the one Active Defence line", () => {
-  it("has its own remembered slot, links to pricing once, and says nothing of this machine", () => {
-    const offer = agentsOffer();
-    expect(offer).toMatchObject({ slot: "agents", key: "agent_kernel", href: PRICING_URL, body: "Contained agents are checked by the kernel with Active Defence." });
-    expect(OFFER_KEYS.agents).toBe("iw-community-offer-v1:agents");
-    expect(new Set(Object.values(OFFER_KEYS)).size).toBe(Object.keys(OFFER_KEYS).length);
   });
 });
 

@@ -1,6 +1,6 @@
 import { expect } from "@playwright/test";
 import { test } from "./clock";
-import { expectHonestUpsell, FIXTURE_NOW_MS, fulfillJson, guardRoute, META } from "./support";
+import { EDITION_LINES, expectHonestUpsell, FIXTURE_NOW_MS, fulfillJson, guardRoute, META } from "./support";
 
 /**
  * Where Community says what Active Defence adds: the Protection page, which
@@ -25,6 +25,8 @@ test.describe("CJC-J006 the Active Defence card reads the host", () => {
     await expect(page.locator('a[href^="https://innerwarden.com"]')).toHaveCount(0);
     // It says where the answer it cannot give actually lives.
     await expect(installed.locator("[data-command]")).toHaveText("innerwarden get status");
+    await expect(installed).toContainText(EDITION_LINES.installed);
+    await expectHonestUpsell(page);
   });
 
   test("still offers it on a host that does not, once, in the card Community does not cover", async ({ page }) => {
@@ -39,9 +41,13 @@ test.describe("CJC-J006 the Active Defence card reads the host", () => {
     await page.goto("/?view=posture");
     const offer = page.locator('[data-tour="upgrade"] [data-ad-state="offer"]');
     await expect(offer).toBeVisible();
-    // It says where Active Defence runs, and never that it would have stopped anything here.
-    await expect(offer).toContainText("Linux servers");
+    // The one generic line, never that it would have stopped anything here:
+    // one link to the editions page, with no query string, and Not now.
+    await expect(offer.locator("p").first()).toHaveText(EDITION_LINES.generic);
     await expect(offer).not.toContainText("would have");
+    const link = offer.getByRole("link", { name: /Compare the editions/ });
+    await expect(link).toHaveAttribute("href", "https://innerwarden.com/docs/editions-and-guarantees");
+    await expect(offer.getByRole("button", { name: "Not now: hide this offer" })).toBeVisible();
     await expect(page.locator('[data-ad-state="offer"]')).toHaveCount(1);
     await expectHonestUpsell(page);
   });

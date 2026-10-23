@@ -1,6 +1,6 @@
 import { expect, type Page } from "@playwright/test";
 import { test } from "./clock";
-import { CASE, expectHonestUpsell, FIXTURE_NOW_MS, fulfillJson, guardRoute, META } from "./support";
+import { CASE, EDITION_LINES, expectHonestUpsell, FIXTURE_NOW_MS, fulfillJson, guardRoute, META } from "./support";
 
 /**
  * Community's Decisions at a desk, 1440 x 900: the list and the open decision
@@ -98,6 +98,8 @@ test("a case carries at most one offer, under it; Not now hides it and it stays 
   const card = await openCase(page, CASE.wouldRefuse);
   await expect(card.locator("[data-step]").first()).toBeVisible();
   await expect(page.locator("[data-ad-state]")).toHaveCount(0);
+  // Not even the generic line: that is Protection's.
+  await expect(page.locator("main")).not.toContainText("Active Defence adds");
   await expect(page.locator('a[href^="https://innerwarden.com"]')).toHaveCount(0);
   await expectHonestUpsell(page);
   await page.reload();
@@ -109,6 +111,8 @@ test("a refused case and a check by hand carry no offer", async ({ page }) => {
   for (const id of [CASE.refused, CASE.checked]) {
     await openCase(page, id);
     await expect(page.locator('[data-ad-state="offer"]')).toHaveCount(0);
+    await expect(page.locator('a[href^="https://innerwarden.com"]')).toHaveCount(0);
+    await expectHonestUpsell(page);
   }
 });
 
@@ -119,6 +123,7 @@ test("a host with Active Defence installed gets the installed line, never an off
   await expect(page.locator("[data-ad-state]")).toHaveCount(0);
   await page.goto("/?view=posture");
   await expect(page.locator('[data-ad-state="installed"]')).toBeVisible();
+  await expect(page.locator('[data-ad-state="installed"]')).toContainText(EDITION_LINES.installed);
   await expect(page.locator('[data-ad-state="offer"]')).toHaveCount(0);
 });
 

@@ -176,8 +176,31 @@ export async function pageWidth(page: Page) {
  * link to innerwarden.com, and nothing drawn blurred (no locked screen, no
  * teaser behind frosted glass).
  */
+/**
+ * The only words a Community page may name the paid edition in (spec 10.6):
+ * the generic line, the installed line, the Linux relaxation sentence, and
+ * the attribution words that say which layer decided a command. An
+ * allow-list of what may be said, never a list of names.
+ */
+export const EDITION_LINES = {
+  generic: "Active Defence adds host-level protection for Linux servers.",
+  installed: "Active Defence is installed on this host.",
+  relaxation: "Per-agent relaxations apply on Linux with Active Defence, for an agent started with innerwarden contain --identity.",
+} as const;
+const ATTRIBUTION = /Active Defence on (?:this|its|the) host/g;
+
+/** Everything the page says about the paid edition is one of `EDITION_LINES`, or an attribution. */
+export async function expectOnlyEditionLines(page: Page) {
+  let rest = await page.locator("body").innerText();
+  for (const line of Object.values(EDITION_LINES)) rest = rest.split(line).join("");
+  expect(rest.replace(ATTRIBUTION, ""), "the page names the paid edition outside the permitted lines").not.toContain("Active Defence");
+}
+
 export async function expectHonestUpsell(page: Page) {
-  expect(await page.locator('a[href^="https://innerwarden.com"]').count()).toBeLessThanOrEqual(1);
+  const links = await page.locator('a[href^="https://innerwarden.com"]').evaluateAll((anchors) => anchors.map((anchor) => anchor.getAttribute("href") ?? ""));
+  expect(links.length).toBeLessThanOrEqual(1);
+  for (const href of links) expect(href, "a link out carries no query string").not.toMatch(/[?#]/);
+  await expectOnlyEditionLines(page);
   const blurred = await page.evaluate(() =>
     Array.from(document.querySelectorAll("*")).filter((element) => {
       const style = getComputedStyle(element);

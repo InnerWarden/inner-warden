@@ -46,6 +46,7 @@ for (const [label, path, titled] of COMMUNITY_TABS) {
       await expect(band).toContainText("the decision store could not be written");
       await expect(band.locator("[data-command]")).toHaveText("innerwarden status");
       await expect(page.locator('main [data-notice="recording"]')).toHaveCount(0);
+      await expectHonestUpsell(page);
       return;
     }
     const notice = page.locator('main [data-notice="recording"]');
@@ -55,6 +56,8 @@ for (const [label, path, titled] of COMMUNITY_TABS) {
     await expect(notice).not.toContainText("the decision store could not be written");
     await page.getByRole("checkbox", { name: "Show technical detail" }).check();
     await expect(notice).toContainText("the decision store could not be written");
+    // The technical view says more evidence, never another word about the paid edition.
+    await expectHonestUpsell(page);
   });
 }
 
@@ -72,4 +75,5 @@ test("with nothing to say, there are no notices", async ({ page }) => {
   await page.goto("/");
   await expect(page.locator(PAGE_READY.Overview)).toBeVisible();
   await expect(page.locator("main [data-exposed], main [data-notice]")).toHaveCount(0);
+  await expectHonestUpsell(page);
 });

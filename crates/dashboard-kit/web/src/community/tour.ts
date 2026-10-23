@@ -6,6 +6,7 @@ import {
   TOUR_WELCOME_STEP_KEY,
   type TourStep,
 } from "../components/ProductTour";
+import { TOUR_UPGRADE_LINE } from "./offers";
 
 /**
  * The Community shell's tour: the shared opening and closing steps, and one
@@ -26,8 +27,8 @@ export const COMMUNITY_SHELL_TOUR_STEPS: readonly TourStep[] = [
   shared("nav"),
   {
     key: "community-lanes",
-    title: "Three questions",
-    body: "What your AI agent did, what people asked it, and what Community does not watch. Each card opens what is behind it.",
+    title: "Your agents at a glance",
+    body: "Whether your AI agents are connected and in which mode, what was refused or would have been, and the one next step.",
     route: "overview",
     selectors: ['[data-tour="overview-verdict"]', '[data-tour="overview-lanes"]'],
   },
@@ -47,15 +48,15 @@ export const COMMUNITY_SHELL_TOUR_STEPS: readonly TourStep[] = [
   },
   {
     key: COMMUNITY_UPGRADE_STEP_KEY,
-    title: "Going further: Active Defence",
-    body: "Community screens what your agents try to run. Active Defence is the paid edition for Linux servers: it adds the kernel Execution Gate, Secret Read Guard, DNS Guard, the host sensor and automatic response. The Protection page lists them.",
+    title: "Going further",
+    body: TOUR_UPGRADE_LINE,
     route: "posture",
     selectors: ['[data-tour="upgrade"]'],
   },
   shared(TOUR_FINISH_STEP_KEY),
 ];
 
-/** The steps for a machine, with the pitch dropped where Active Defence is installed. */
+/** The steps for a machine, with the upgrade step dropped where the paid edition is installed. */
 export function communityShellTourSteps(activeDefenceInstalled: boolean): readonly TourStep[] {
   if (!activeDefenceInstalled) return COMMUNITY_SHELL_TOUR_STEPS;
   return COMMUNITY_SHELL_TOUR_STEPS.filter((step) => step.key !== COMMUNITY_UPGRADE_STEP_KEY);

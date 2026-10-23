@@ -17,8 +17,7 @@ import {
   type OptionalControl,
   type ScreeningRow,
 } from "./controls";
-import { OfferBox } from "./Offer";
-import { protectionOffer } from "./offers";
+import { FooterOffer } from "./Offer";
 import { CopyCommand, HiddenChip, StaleLine } from "./parts";
 import type { Polled } from "./poll";
 import { useSource } from "./store";
@@ -121,9 +120,7 @@ export function CommunityProtection({ context }: { context: CommunityScreenConte
 
       <Exceptions protection={protection.data} history={history.data} now={now} />
 
-      <div data-tour="upgrade" className="min-w-0">
-        <OfferBox offer={protectionOffer()} installed={installed} />
-      </div>
+      <FooterOffer installed={installed} />
     </div>
   );
 }

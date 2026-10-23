@@ -386,7 +386,7 @@ export const LAYER_WORDS: Record<LayerKey, string> = {
 
 /**
  * Why a relaxation was not applied, chosen when the page renders (never when
- * the hook ran): by where the page runs and whether Active Defence is
+ * the hook ran): by where the page runs and whether the paid edition is
  * installed there.
  */
 export const WITHHELD_WORDS = {
