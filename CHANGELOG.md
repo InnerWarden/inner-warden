@@ -3,6 +3,16 @@
 All notable changes to InnerWarden are documented here. This project
 follows semantic versioning.
 
+## 1.6.2 - 2026-10-23
+
+### Fixed
+
+- **The user namespace check of 1.6.1 runs bubblewrap like every other
+  program `contain` starts**: with root's two folders as `PATH` and no
+  dynamic loader variable (`helper_env`), instead of a cleared environment.
+  Nothing a person sees changes; Active Defence reads the launcher's
+  contract by that shape before it pins a free CLI release.
+
 ## 1.6.1 - 2026-10-23
 
 ### Fixed
