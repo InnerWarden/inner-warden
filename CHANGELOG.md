@@ -3,6 +3,32 @@
 All notable changes to InnerWarden are documented here. This project
 follows semantic versioning.
 
+## 1.6.3 - 2026-10-23
+
+### Fixed
+
+- **Every cloud's metadata service is an internal target.** Besides EC2,
+  Azure and GCP (`169.254.169.254`, `metadata.google.internal`) and Alibaba,
+  the guard now reads the ECS task credentials endpoint (`169.254.170.2`,
+  `$AWS_CONTAINER_CREDENTIALS_RELATIVE_URI`), EKS Pod Identity
+  (`169.254.170.23`) and EC2's IPv6 endpoints (`fd00:ec2::254`,
+  `fd00:ec2::23`), with the address ended by a quote, a bracket or a
+  variable too. Their credential reads are refused.
+- **Removing the account's keys is destructive**, as removing the home is:
+  `rm` of `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.kube`, `~/.azure`,
+  `~/.config/gcloud`, `~/.aws/credentials`, `~/.kube/config` or a private
+  key `~/.ssh/id_*` is refused. `rm ~/.ssh/known_hosts`, a `.pub` and a
+  cache under a store stay cleanups.
+- **`innerwarden graph --clear` is the person's**, as `allow` and `mute`
+  are: refused with no terminal (an operator's `--operator` outside an
+  agent's shell clears it), and the hook refuses an agent that runs it.
+- **`check`'s human summary writes out what would repaint or hide the
+  command** (control characters other than a new line or a tab, bidi
+  overrides, characters that draw nothing) as `\u{..}`. `--json` is
+  unchanged.
+- **Chat alerts ping nobody and link nowhere**: Discord parses no mention in
+  them, and Slack's `&`, `<` and `>` are escaped.
+
 ## 1.6.2 - 2026-10-23
 
 ### Fixed

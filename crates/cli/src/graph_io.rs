@@ -1301,6 +1301,20 @@ pub fn current_outage() -> Option<crate::record_health::Outage> {
 
 pub fn cmd(rest: &[String]) -> std::process::ExitCode {
     if rest.iter().any(|a| a == "--clear") {
+        // Clearing erases the record of what AI agents did, so it is the
+        // person's, as allowing and muting are (`suppress_io::may_widen`): a
+        // terminal, or an operator's script that says so outside an agent's
+        // shell. An agent wiping its own trail ran `graph --clear` at risk 0
+        // while `rm` of the same file was refused.
+        let (_, operator) = crate::suppress_io::split_operator_flag(rest);
+        if !crate::suppress_io::may_widen(operator) {
+            eprintln!(
+                "innerwarden graph --clear: refused, no terminal. Clearing erases the record of \
+                 what AI agents did, so it is done by a person at their own terminal. Nothing \
+                 was changed."
+            );
+            return std::process::ExitCode::from(1);
+        }
         if let Some(p) = graph_path() {
             let _ = std::fs::remove_file(&p);
             println!("innerwarden graph - cleared {}", p.display());
