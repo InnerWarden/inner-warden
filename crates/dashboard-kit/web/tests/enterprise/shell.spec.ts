@@ -143,12 +143,12 @@ async function installEnterpriseState(page: Page, state: "healthy" | "partial" |
 test("Community keeps its current white shell and logo returns to home", async ({ page }) => {
   await page.goto("http://127.0.0.1:4173/");
   await expect(page.getByText("Community", { exact: true })).toBeVisible();
-  await expect(page.getByRole("heading", { name: "What is happening here" })).toBeVisible();
+  await expect(page.getByRole("heading", { level: 1, name: /^Overview: / })).toBeVisible();
 
-  await page.getByRole("navigation", { name: "Dashboard views" }).getByRole("button", { name: "Cases", exact: true }).click();
-  await expect(page.getByRole("heading", { name: "Cases", exact: true, level: 1 })).toBeVisible();
+  await page.getByRole("navigation", { name: "Dashboard views" }).getByRole("button", { name: "Decisions", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Decisions", exact: true, level: 1 })).toBeVisible();
   await page.getByRole("button", { name: "Go to overview" }).click();
-  await expect(page.getByRole("heading", { name: "What is happening here" })).toBeVisible();
+  await expect(page.getByRole("heading", { level: 1, name: /^Overview: / })).toBeVisible();
 });
 
 test("healthy Enterprise mounts capability-derived Posture without Community upsell content", async ({ page }) => {

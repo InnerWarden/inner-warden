@@ -391,13 +391,15 @@ jobs:
       # as "executable evidence" that the journey passes, so an entirely broken
       # journey satisfied the contract as long as the file parsed as a test.
       #
-      # Only the Community specs run. The enterprise ones belong to the paid
-      # bundle and are not built here.
+      # The Community specs run, and the one enterprise spec that tests the
+      # kit's own shell wiring (the licence notice) against the kit's bundle.
+      # The other enterprise specs belong to the paid bundle and are not
+      # built here.
       - name: Install Playwright browsers
         run: npx playwright install --with-deps chromium
 
       - name: Browser journeys
-        run: npx playwright test tests/community
+        run: npx playwright test tests/community tests/enterprise/plan-notice.spec.ts
 
   # Audit SUP-02 / CI-07: the repo had no supply-chain gate. This is it. It runs
   # on every push, so an advisory or an incompatible licence fails a PR instead

@@ -834,8 +834,8 @@ components:
       additionalProperties: false
       required: [state, line]
       properties:
-        state: { type: string, enum: [active, ending_soon, free_mode, unknown] }
-        line: { type: string, minLength: 1, maxLength: 400 }
+        state: { type: string, enum: [active, ending_soon, partly_covered, free_mode, unknown] }
+        line: { type: string, minLength: 1, maxLength: 1000 }
         step: { type: string, minLength: 1, maxLength: 200 }
         since: { type: string, format: date-time }
         until: { type: string, format: date-time }

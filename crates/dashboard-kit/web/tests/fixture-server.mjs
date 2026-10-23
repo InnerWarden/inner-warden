@@ -63,6 +63,7 @@ const HAND_WRITTEN = [
   ["mixed/meta.json", "the host mode comes from guard/meta: one agent in monitor, one in enforce"],
   ["no-agents/meta.json", "the host mode comes from guard/meta: no agent is connected"],
   ["never-screened/meta.json", "the host mode comes from guard/meta: both agents in monitor"],
+  ["monitor/meta.json", "the host mode comes from guard/meta: all three agents in monitor"],
   ["unknown/meta.json", "the host mode comes from guard/meta: it is unknown while the agents cannot be read"],
   ["exposed/meta.json", "whether the dashboard is open to the network comes from guard/meta"],
   ["ad-installed/meta.json", "whether Active Defence is installed comes from guard/meta"],
@@ -120,6 +121,7 @@ const PLAN_BOOTSTRAPS = new Map([
   ["free-mode", ["bootstrap-plan-free-mode.json"]],
   ["ending-soon", ["bootstrap-plan-ending-soon.json"]],
   ["renewed", ["bootstrap-plan-renewed-1.json", "bootstrap-plan-renewed-2.json"]],
+  ["not-read", ["bootstrap-plan-not-read.json"]],
 ]);
 const planReads = new Map();
 

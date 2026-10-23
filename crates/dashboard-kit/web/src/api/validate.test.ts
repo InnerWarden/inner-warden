@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { parseAgentInventory, parseDashboardBootstrap, parseDashboardPosture, planNoticeOf } from "./validate";
+import { PLAN_LINE_MAX } from "./v1";
 
 function bootstrapWithSourceKind(kind: unknown): unknown {
   const stage = { state: "unknown", evidence: [], reason_code: "not_observed" };
@@ -564,23 +565,40 @@ describe("the plan notice is read leniently and never costs the bootstrap", () =
     expect("plan_notice" in parseDashboardBootstrap(bootstrapWithSourceKind("runtime_probe"))).toBe(false);
   });
 
-  it("keeps the bootstrap and drops the notice when the notice is not readable", () => {
+  it("keeps the bootstrap and drops the notice when it has neither a known state nor a line", () => {
     for (const bad of [
-      null, "free_mode", 7, [], {}, { state: "free_mode" }, { state: "free_mode", line: "" },
-      { state: "free_mode", line: "   " }, { state: "free_mode", line: "x".repeat(401) },
-      { state: "free_mode", line: "two\nlines" }, { state: "free_mode", line: "bidi \u202e trick" },
-      { state: "free_mode", line: 12 },
+      null, "free_mode", 7, [], {}, { line: "" }, { state: "renewed" }, { state: "FREE_MODE", line: "two\nlines" },
+      { state: 3, line: 12 },
     ]) {
       const parsed = parseDashboardBootstrap(withPlan(bad));
       expect(parsed.edition).toBe("community");
-      expect("plan_notice" in parsed).toBe(false);
+      expect("plan_notice" in parsed, JSON.stringify(bad)).toBe(false);
     }
   });
 
-  it("reads a line of 400 characters, and a step of 200", () => {
-    const notice = planNoticeOf({ state: "active", line: "x".repeat(400), step: "s".repeat(200) });
-    expect(notice?.line.length).toBe(400);
+  /**
+   * A known state is never lost because of its words: free mode with a line
+   * that is too long, empty, multi-line or carries a bidi override keeps its
+   * state and drops only the line. FAILS ON REVERT of the line-first read.
+   */
+  it("keeps a known state when its line is not usable, and drops the line alone", () => {
+    for (const line of [undefined, "", "   ", "x".repeat(PLAN_LINE_MAX + 1), "two\nlines", "bidi \u202e trick", 12]) {
+      const parsed = parseDashboardBootstrap(withPlan({ state: "free_mode", line, since: "2026-07-30T09:00:00Z" }));
+      expect(parsed.plan_notice, JSON.stringify(line)).toEqual({ state: "free_mode", since: "2026-07-30T09:00:00Z" });
+    }
+  });
+
+  it("reads a free mode sentence of 558 characters whole, and a line of 1,000", () => {
+    const sentence = `The licence ended, so the host runs its paid functions in free mode. ${"w".repeat(489)}`;
+    expect(sentence.length).toBe(558);
+    expect(planNoticeOf({ state: "free_mode", line: sentence })).toEqual({ state: "free_mode", line: sentence });
+    const notice = planNoticeOf({ state: "active", line: "x".repeat(PLAN_LINE_MAX), step: "s".repeat(200) });
+    expect(notice?.line?.length).toBe(1_000);
     expect(notice?.step?.length).toBe(200);
+  });
+
+  it("reads a valid licence that does not cover every paid function as its own state", () => {
+    expect(planNoticeOf({ state: "partly_covered", line: "Sent." })).toEqual({ state: "partly_covered", line: "Sent." });
   });
 
   it("reads a state it does not know as unknown, never as active", () => {

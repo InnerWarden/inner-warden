@@ -31,7 +31,8 @@ describe("PlanNotice", () => {
   it("draws free mode with the host's line and step, a copy button, and no Hide", () => {
     const html = render({ kind: "free_mode", notice: free }, () => undefined);
     expect(html).toContain('data-plan-state="free_mode"');
-    expect(html).toContain('role="status"');
+    // The live region is the shell's wrapper, there before any notice.
+    expect(html).not.toContain('role="status"');
     expect(html).toContain('aria-labelledby="plan-notice-title"');
     expect(html).toContain("Free mode since 30 Jul 2026");
     expect(html).toContain("The host sentence, as sent.");
@@ -64,9 +65,33 @@ describe("PlanNotice", () => {
     expect(html).not.toMatch(/back on|restored|protected|re-?enabled/i);
   });
 
-  it("says no plan words for absent, active or unknown, and only after a move to active says it is valid again", () => {
+  it("says a licence state that was not read in the slate box, with the host's line and Hide, and never free mode", () => {
+    const html = render({ kind: "unknown", notice: { state: "unknown", line: "The host could not read it." } }, () => undefined);
+    expect(html).toContain('data-plan-state="unknown"');
+    expect(html).toContain("Licence state not read");
+    expect(html).toContain("The host could not read it.");
+    expect(html).toContain("border-slate-200");
+    expect(html).toContain("Hide");
+    expect(html).not.toMatch(/free mode/i);
+  });
+
+  it("draws a partial grant in the amber box with the host's line and step", () => {
+    const html = render({ kind: "partly_covered", notice: { state: "partly_covered", line: "Sent.", step: "fixture-licence renew" } }, () => undefined);
+    expect(html).toContain("Some paid functions are off");
+    expect(html).toContain("Sent.");
+    expect(html).toContain("Next step:");
+    expect(html).toContain("border-amber-200");
+  });
+
+  it("draws the kit's own title when the host's line was not usable", () => {
+    const html = render({ kind: "free_mode", notice: { state: "free_mode" } });
+    expect(html).toContain(">Free mode<");
+    expect(html).not.toContain("undefined");
+  });
+
+  it("says no plan words for absent or active, and only after a move to active says it is valid again", () => {
     const t = READ_AT;
-    for (const state of [undefined, "active", "unknown"] as const) {
+    for (const state of [undefined, "active"] as const) {
       const { view } = planStep("enterprise", state === undefined ? undefined : { state, line: "Sent." }, {}, t);
       expect(render(view)).not.toMatch(PLAN_WORDS);
     }
@@ -84,10 +109,30 @@ describe("PlanNotice", () => {
     for (const view of [
       { kind: "free_mode", notice: free },
       { kind: "ending_soon", notice: soon },
+      { kind: "unknown", notice: { state: "unknown", line: "Sent." } },
+      { kind: "partly_covered", notice: { state: "partly_covered", line: "Sent." } },
       { kind: "renewed", readAt: READ_AT },
     ] as PlanView[]) {
       expect(render(view, () => undefined)).not.toMatch(DASHES);
     }
+  });
+});
+
+describe("PlanNotice west of UTC", () => {
+  let restore: () => void = () => undefined;
+  beforeAll(() => {
+    restore = pinZone("America/Los_Angeles");
+  });
+  afterAll(() => restore());
+
+  /**
+   * The host's sentence names the UTC day; the title names the same day for
+   * a reader west of UTC, where local midnight is the day before. FAILS ON
+   * REVERT to the reader's own zone ("5 Nov 2026").
+   */
+  it("names the UTC day the host's sentence names", () => {
+    expect(render({ kind: "ending_soon", notice: soon })).toContain("The licence ends on 6 Nov 2026");
+    expect(render({ kind: "free_mode", notice: { state: "free_mode", line: "Sent.", since: "2026-07-30T00:00:00Z" } })).toContain("Free mode since 30 Jul 2026");
   });
 });
 

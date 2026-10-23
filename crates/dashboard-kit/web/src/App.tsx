@@ -23,7 +23,7 @@ import { Posture } from "./screens/Posture";
 import { TokenIntelligence } from "./screens/TokenIntelligence";
 import { EMPTY_BODY } from "./components/classes";
 import { PlanNotice } from "./components/PlanNotice";
-import { bootstrapRefreshMs, editionLabelFor, hidePlan, planStep, type PlanStep } from "./plan";
+import { bootstrapRefreshMs, editionLabelFor, hidePlan, planStep, RENEWED_SHOW_MS, type PlanStep } from "./plan";
 
 /**
  * The routes this repository builds. A contributed screen widens the type but
@@ -714,6 +714,18 @@ export function App({
     setPlan((last) => planStep(edition, bootstrap?.plan_notice, last.memory, now));
   }, [bootstrap, edition]);
 
+  // The renewal's confirmation ends when its time is up, not at the next
+  // read, which may come minutes later: the same reading is stepped again
+  // at that moment.
+  const renewedAt = plan.view.kind === "renewed" ? plan.view.readAt : undefined;
+  useEffect(() => {
+    if (renewedAt === undefined) return;
+    const timer = setTimeout(() => {
+      setPlan((last) => planStep(edition, bootstrap?.plan_notice, last.memory, Date.now()));
+    }, Math.max(0, renewedAt + RENEWED_SHOW_MS - Date.now()));
+    return () => clearTimeout(timer);
+  }, [renewedAt, bootstrap, edition]);
+
   const navigate = (next: ShellRoute, params?: Readonly<Record<string, string>>) => {
     const url = new URL(window.location.href);
     if (next === "overview") url.searchParams.delete("view");
@@ -777,9 +789,13 @@ export function App({
       />
 
       <main id="main-content" className="mx-auto max-w-6xl px-4 py-6 sm:px-6 sm:py-8 lg:px-8">
-        {edition === "enterprise" && plan.view.kind !== "none" && (
-          // Hidden in memory only: a reload shows the notice again.
-          <div data-shell-notice className="pb-5"><PlanNotice view={plan.view} onHide={() => setPlan(hidePlan)} /></div>
+        {edition === "enterprise" && (
+          // A polite live region that is there before any notice, so a move
+          // to free mode is announced once. Hidden in memory only: a reload
+          // shows the notice again.
+          <div data-shell-notice role="status" aria-live="polite" className={plan.view.kind === "none" ? undefined : "pb-5"}>
+            <PlanNotice view={plan.view} onHide={() => setPlan(hidePlan)} />
+          </div>
         )}
         {edition === "enterprise" && bootstrap && enterpriseAuthorized ? (
           <EnterpriseRoute

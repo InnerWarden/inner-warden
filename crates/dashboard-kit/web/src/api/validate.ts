@@ -21,6 +21,8 @@ import {
   type MeasuredValue,
   type Metric,
   type PlanNotice,
+  PLAN_LINE_MAX,
+  PLAN_STEP_MAX,
   type ProtectionLayer,
   type ScopeRef,
   type SourceRef,
@@ -341,16 +343,21 @@ function planTime(value: unknown): string | undefined {
 
 /**
  * `plan_notice`, read leniently like `dashboard_access`: it never refuses the
- * bootstrap. No object, or no line to print, is read as not sent. A state
- * this bundle does not know is `unknown`, which draws nothing and is never
- * read as `active`. A step or time that is not well formed is dropped alone.
+ * bootstrap. A known state is kept whatever its line: a line that is not
+ * usable is dropped alone, so free mode is never lost because of its words.
+ * A state this bundle does not know is `unknown` when there is a line to
+ * print, and is never read as `active`; no object, or neither a known state
+ * nor a line, is read as not sent. A step or time that is not well formed is
+ * dropped alone.
  */
 export function planNoticeOf(value: unknown): PlanNotice | undefined {
   const item = (typeof value === "object" && value !== null ? value : {}) as Record<string, unknown>;
-  const line = planLine(item.line, 400);
-  if (line === undefined) return undefined;
-  const notice: PlanNotice = { state: PLAN_STATES.find((candidate) => candidate === item.state) ?? "unknown", line };
-  const step = planLine(item.step, 200);
+  const line = planLine(item.line, PLAN_LINE_MAX);
+  const state = PLAN_STATES.find((candidate) => candidate === item.state) ?? (line === undefined ? undefined : "unknown");
+  if (state === undefined) return undefined;
+  const notice: PlanNotice = { state };
+  if (line !== undefined) notice.line = line;
+  const step = planLine(item.step, PLAN_STEP_MAX);
   const since = planTime(item.since);
   const until = planTime(item.until);
   if (step !== undefined) notice.step = step;
