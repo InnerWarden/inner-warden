@@ -299,7 +299,7 @@ fn main() -> std::process::ExitCode {
             code
         }
         Some("install") => cmd_install(&args[1..]),
-        Some("status") => status_io_cmd(),
+        Some("status") => status_cmd(&args[1..]),
         Some("agents") => agents_io::cmd(&args[1..]),
         Some("contain") => contain_io::cmd(&args[1..]),
         // Run by `contain` inside a jail that starts only once admitted.
@@ -1982,16 +1982,52 @@ fn can_unlink(exe: &std::path::Path) -> bool {
 /// loopback so an AI agent's MCP wrapper / hook can POST to it. Mirrors the
 /// agent's `POST /api/agent/check-command` shape (body `{"command":"..."}`),
 /// minus TLS (loopback only) so the binary pulls no crypto and stays Windows-clean.
-fn cmd_serve(rest: &[String]) -> std::process::ExitCode {
-    let mut bind = SERVE_BIND.to_string();
+/// `serve` takes only `--bind <addr>`; anything else is refused by name, and
+/// `--bind` needs its value (issue #223). Repeating `--bind` keeps the last.
+fn parse_serve_flags(rest: &[String]) -> Result<Option<String>, String> {
+    let mut bind: Option<String> = None;
     let mut it = rest.iter();
     while let Some(a) = it.next() {
-        if a.as_str() == "--bind" {
-            if let Some(v) = it.next() {
-                bind = v.clone();
-            }
+        match a.as_str() {
+            "--bind" => match it.next() {
+                Some(v) => bind = Some(v.clone()),
+                None => {
+                    return Err(
+                        "--bind needs an address, for example --bind 127.0.0.1:8788".into()
+                    )
+                }
+            },
+            other => return Err(format!("unknown flag `{other}` for `serve`")),
         }
     }
+    Ok(bind)
+}
+
+/// `status` takes no arguments; anything here is refused by name (#223).
+fn parse_status_flags(rest: &[String]) -> Result<(), String> {
+    match rest.first() {
+        Some(flag) => Err(format!("unknown flag `{flag}` for `status`; it takes no arguments")),
+        None => Ok(()),
+    }
+}
+
+fn status_cmd(rest: &[String]) -> std::process::ExitCode {
+    if let Err(msg) = parse_status_flags(rest) {
+        eprintln!("innerwarden status: {msg}");
+        return std::process::ExitCode::from(2);
+    }
+    status_io_cmd()
+}
+
+fn cmd_serve(rest: &[String]) -> std::process::ExitCode {
+    let bind = match parse_serve_flags(rest) {
+        Ok(Some(b)) => b,
+        Ok(None) => SERVE_BIND.to_string(),
+        Err(msg) => {
+            eprintln!("innerwarden serve: {msg}");
+            return std::process::ExitCode::from(2);
+        }
+    };
 
     // Shell surface only: an engine that holds just the rules a command can
     // match, on a process that runs per tool call. See
@@ -3127,5 +3163,43 @@ mod install_target_tests {
             };
             assert!(stderr.contains(said), "{mode}: {stderr}");
         }
+    }
+}
+
+#[cfg(test)]
+mod flag_parse_tests {
+    use super::*;
+
+    #[test]
+    fn serve_parses_bind_and_keeps_the_last_one() {
+        let none: Vec<String> = vec![];
+        assert_eq!(parse_serve_flags(&none).unwrap(), None);
+        let bind = |v: &str| vec!["--bind".to_string(), v.to_string()];
+        assert_eq!(parse_serve_flags(&bind("127.0.0.1:9")).unwrap(), Some("127.0.0.1:9".into()));
+        let two = vec!["--bind".to_string(), "a:1".to_string(), "--bind".to_string(), "b:2".to_string()];
+        assert_eq!(parse_serve_flags(&two).unwrap(), Some("b:2".into()));
+    }
+
+    #[test]
+    fn serve_refuses_an_unknown_flag_by_name() {
+        let bogus = vec!["--bnd".to_string(), "127.0.0.1:1".to_string()];
+        let err = parse_serve_flags(&bogus).unwrap_err();
+        assert!(err.contains("`--bnd`"), "{err}");
+    }
+
+    #[test]
+    fn serve_refuses_bind_without_a_value_with_an_example() {
+        let missing = vec!["--bind".to_string()];
+        let err = parse_serve_flags(&missing).unwrap_err();
+        assert!(err.contains("needs an address") && err.contains("127.0.0.1:8788"), "{err}");
+    }
+
+    #[test]
+    fn status_takes_no_arguments() {
+        let none: Vec<String> = vec![];
+        assert!(parse_status_flags(&none).is_ok());
+        let bogus = vec!["--bogus".to_string()];
+        let err = parse_status_flags(&bogus).unwrap_err();
+        assert!(err.contains("`--bogus`"), "{err}");
     }
 }
