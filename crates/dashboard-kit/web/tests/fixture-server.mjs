@@ -111,6 +111,33 @@ async function routeList(scenario, name) {
   }
 }
 
+// The paid shell's plan notice: a request that carries the cookie
+// `iw-plan=<plan>` is answered a bootstrap with that `plan_notice`.
+// `renewed` (or `renewed-run<id>`, so two runs never share a count) is a
+// sequence: the first bootstrap read under that cookie is in free mode and
+// every later one is active, the move the notice confirms as a renewal.
+const PLAN_BOOTSTRAPS = new Map([
+  ["free-mode", ["bootstrap-plan-free-mode.json"]],
+  ["ending-soon", ["bootstrap-plan-ending-soon.json"]],
+  ["renewed", ["bootstrap-plan-renewed-1.json", "bootstrap-plan-renewed-2.json"]],
+]);
+const planReads = new Map();
+
+/** The bootstrap file a plan cookie asks for, or `undefined` for the plain one. */
+function planBootstrap(request) {
+  for (const part of (request.headers.cookie ?? "").split(";")) {
+    const [name, value] = part.trim().split("=");
+    if (name !== "iw-plan" || value === undefined || !/^[a-z][a-z-]{0,39}(?:-[a-z0-9]{1,16})?$/.test(value)) continue;
+    const plan = [...PLAN_BOOTSTRAPS.keys()].find((key) => value === key || value.startsWith(`${key}-run`));
+    if (plan === undefined) return undefined;
+    const files = PLAN_BOOTSTRAPS.get(plan);
+    const read = planReads.get(value) ?? 0;
+    planReads.set(value, read + 1);
+    return files[Math.min(read, files.length - 1)];
+  }
+  return undefined;
+}
+
 const mime = new Map([
   [".css", "text/css; charset=utf-8"],
   [".html", "text/html; charset=utf-8"],
@@ -231,6 +258,13 @@ const server = createServer(async (request, response) => {
       const name = apiFiles.get(path);
       if (name) {
         write(response, 200, json, await fixtureFile(scenario, name));
+        return;
+      }
+    }
+    if (fixture === "enterprise" && path === "/api/dashboard/v1/bootstrap") {
+      const plan = planBootstrap(request);
+      if (plan !== undefined) {
+        write(response, 200, "application/json; charset=utf-8", await regularFile(join(fixtureRoot, plan)));
         return;
       }
     }

@@ -42,8 +42,9 @@ export function friendlyId(value: string): { label: string; short: string | null
 /** A standalone "copy full id" affordance. Kept separate from the label so a
  * caller can render the label inside a semantic element (e.g. an <h3> heading)
  * whose accessible name stays the id itself, not "id Copy full id: id", while
- * still offering copy-to-clipboard next to it. */
-export function CopyIdButton({ value, className = "" }: { value: string; className?: string }) {
+ * still offering copy-to-clipboard next to it. `label` names what is copied
+ * in the button's accessible name ("full id" unless said). */
+export function CopyIdButton({ value, className = "", label = "full id" }: { value: string; className?: string; label?: string }) {
   const [copied, setCopied] = useState(false);
   const copy = () => {
     navigator.clipboard
@@ -59,7 +60,7 @@ export function CopyIdButton({ value, className = "" }: { value: string; classNa
       type="button"
       onClick={copy}
       className={`shrink-0 rounded p-0.5 text-slate-400 transition-colors hover:bg-slate-100 hover:text-slate-700 focus:outline-none focus:ring-2 focus:ring-cyan-500 ${className}`}
-      aria-label={copied ? "Copied full id" : `Copy full id: ${value}`}
+      aria-label={copied ? `Copied ${label}` : `Copy ${label}: ${value}`}
     >
       {copied ? <CheckIcon /> : <CopyIcon />}
     </button>

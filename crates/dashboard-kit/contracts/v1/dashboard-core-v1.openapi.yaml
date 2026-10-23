@@ -826,6 +826,19 @@ components:
         capabilities: { type: array, items: { $ref: '#/components/schemas/CapabilityStatus' } }
         highest_priority_gap: { oneOf: [{ $ref: '#/components/schemas/CoverageGap' }, { type: 'null' }] }
         privacy: { $ref: '#/components/schemas/PrivacyBoundary' }
+        dashboard_access: { type: string, enum: [read_only, confirmed_changes] }
+        audit_trail_view: { type: string, pattern: '^[a-z][a-z0-9_-]{0,63}$' }
+        plan_notice: { $ref: '#/components/schemas/PlanNotice' }
+    PlanNotice:
+      type: object
+      additionalProperties: false
+      required: [state, line]
+      properties:
+        state: { type: string, enum: [active, ending_soon, free_mode, unknown] }
+        line: { type: string, minLength: 1, maxLength: 400 }
+        step: { type: string, minLength: 1, maxLength: 200 }
+        since: { type: string, format: date-time }
+        until: { type: string, format: date-time }
     CoverageGap:
       type: object
       additionalProperties: false

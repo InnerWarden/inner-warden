@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseAgentInventory, parseDashboardBootstrap, parseDashboardPosture } from "./validate";
+import { parseAgentInventory, parseDashboardBootstrap, parseDashboardPosture, planNoticeOf } from "./validate";
 
 function bootstrapWithSourceKind(kind: unknown): unknown {
   const stage = { state: "unknown", evidence: [], reason_code: "not_observed" };
@@ -543,5 +543,59 @@ describe("the host's kernel protection on an agent subject", () => {
       expect(parsed.subjects[0].kernel, JSON.stringify(bad)).toBeUndefined();
       expect(parsed.subjects[0].agent_id).toBe("claude-code");
     }
+  });
+});
+
+describe("the plan notice is read leniently and never costs the bootstrap", () => {
+  const withPlan = (plan_notice: unknown) => ({ ...(bootstrapWithSourceKind("runtime_probe") as object), plan_notice });
+
+  it("keeps a well formed notice, trimmed", () => {
+    const parsed = parseDashboardBootstrap(withPlan({
+      state: "free_mode", line: "  The host sentence.  ", step: "fixture-licence renew",
+      since: "2026-07-30T09:00:00Z", until: "2026-11-06T00:00:00+01:00",
+    }));
+    expect(parsed.plan_notice).toEqual({
+      state: "free_mode", line: "The host sentence.", step: "fixture-licence renew",
+      since: "2026-07-30T09:00:00Z", until: "2026-11-06T00:00:00+01:00",
+    });
+  });
+
+  it("grows no plan_notice key when none was sent", () => {
+    expect("plan_notice" in parseDashboardBootstrap(bootstrapWithSourceKind("runtime_probe"))).toBe(false);
+  });
+
+  it("keeps the bootstrap and drops the notice when the notice is not readable", () => {
+    for (const bad of [
+      null, "free_mode", 7, [], {}, { state: "free_mode" }, { state: "free_mode", line: "" },
+      { state: "free_mode", line: "   " }, { state: "free_mode", line: "x".repeat(401) },
+      { state: "free_mode", line: "two\nlines" }, { state: "free_mode", line: "bidi \u202e trick" },
+      { state: "free_mode", line: 12 },
+    ]) {
+      const parsed = parseDashboardBootstrap(withPlan(bad));
+      expect(parsed.edition).toBe("community");
+      expect("plan_notice" in parsed).toBe(false);
+    }
+  });
+
+  it("reads a line of 400 characters, and a step of 200", () => {
+    const notice = planNoticeOf({ state: "active", line: "x".repeat(400), step: "s".repeat(200) });
+    expect(notice?.line.length).toBe(400);
+    expect(notice?.step?.length).toBe(200);
+  });
+
+  it("reads a state it does not know as unknown, never as active", () => {
+    expect(planNoticeOf({ state: "renewed", line: "Sent." })?.state).toBe("unknown");
+    expect(planNoticeOf({ line: "Sent." })?.state).toBe("unknown");
+    expect(planNoticeOf({ state: "ACTIVE", line: "Sent." })?.state).toBe("unknown");
+  });
+
+  it("drops a bad step or time alone and keeps the rest", () => {
+    expect(planNoticeOf({
+      state: "ending_soon", line: "Sent.", step: "x".repeat(201), since: "yesterday", until: "2026-13-40T99:00:00Z",
+    })).toEqual({ state: "ending_soon", line: "Sent." });
+    expect(planNoticeOf({ state: "ending_soon", line: "Sent.", step: "a\nb", until: "2026-11-06T00:00:00Z" }))
+      .toEqual({ state: "ending_soon", line: "Sent.", until: "2026-11-06T00:00:00Z" });
+    expect(planNoticeOf({ state: "ending_soon", line: "Sent.", step: "", since: 1_700_000_000 }))
+      .toEqual({ state: "ending_soon", line: "Sent." });
   });
 });

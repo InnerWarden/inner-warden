@@ -191,9 +191,28 @@ export type DashboardBootstrap = {
    * claim reads as it did.
    */
   audit_trail_view?: string;
+  /**
+   * What the host says about its licence, when it has one: the shell draws a
+   * notice from it above the screen (`plan.ts`, `components/PlanNotice.tsx`).
+   *
+   * Optional and read leniently (`planNoticeOf`): a malformed notice is read
+   * as not sent and never costs the reader the bootstrap. Absent, `active`
+   * and `unknown` draw nothing about the plan; absent or `unknown` is never
+   * read as `active`. Community never sends it, and a Community shell ignores
+   * one if it is sent.
+   */
+  plan_notice?: PlanNotice;
 };
 export const DASHBOARD_ACCESS = ["read_only", "confirmed_changes"] as const;
 export type DashboardAccess = (typeof DASHBOARD_ACCESS)[number];
+export const PLAN_STATES = ["active", "ending_soon", "free_mode", "unknown"] as const;
+export type PlanState = (typeof PLAN_STATES)[number];
+/**
+ * The host's licence word. `line` is the host's own sentence, printed as
+ * sent; `step` is one command that changes it; `since` is when the current
+ * state began and `until` when the licence ends (RFC 3339).
+ */
+export type PlanNotice = { state: PlanState; line: string; step?: string; since?: string; until?: string };
 export type EgressPath = {
   id: string;
   destination_class: "none" | "local_process" | "customer_managed" | "vendor_managed" | "third_party" | "unknown";

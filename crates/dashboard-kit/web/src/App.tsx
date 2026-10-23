@@ -22,6 +22,8 @@ import { Agents } from "./screens/Agents";
 import { Posture } from "./screens/Posture";
 import { TokenIntelligence } from "./screens/TokenIntelligence";
 import { EMPTY_BODY } from "./components/classes";
+import { PlanNotice } from "./components/PlanNotice";
+import { bootstrapRefreshMs, editionLabelFor, hidePlan, planStep, type PlanStep } from "./plan";
 
 /**
  * The routes this repository builds. A contributed screen widens the type but
@@ -482,6 +484,11 @@ export function App({
   const [agentsResource, setAgentsResource] = useState<DashboardResource<AgentInventory>>({ state: "idle" });
   const [tokensResource, setTokensResource] = useState<DashboardResource<TokenIntelligenceContract>>({ state: "idle" });
   const [consumerEvaluatedAt, setConsumerEvaluatedAt] = useState(() => new Date().toISOString());
+  // The licence notice (`plan.ts`) and what it remembers across reads.
+  const [plan, setPlan] = useState<PlanStep>({ view: { kind: "none" }, memory: {} });
+  // How often the bootstrap is read again. A host that never sends a plan
+  // keeps `POSTURE_REFRESH_MS`, the cadence the bootstrap always had.
+  const bootstrapEveryMs = bootstrapRefreshMs(plan.memory, Date.now(), POSTURE_REFRESH_MS);
 
   const bootstrap = resourceData(bootstrapResource);
   const enterpriseConfirmed = bootstrap?.edition === "enterprise";
@@ -543,13 +550,18 @@ export function App({
     };
     void load();
     postureRefreshRef.current.bootstrap = load;
-    const timer = setInterval(() => void load(), POSTURE_REFRESH_MS);
     return () => {
       active = false;
       controller?.abort("dashboard-unmount");
-      clearInterval(timer);
     };
   }, []);
+
+  // The bootstrap re-read, on its own timer so the plan can shorten it while
+  // the licence needs watching (`bootstrapRefreshMs`) without a second read.
+  useEffect(() => {
+    const timer = setInterval(() => void postureRefreshRef.current.bootstrap?.(), bootstrapEveryMs);
+    return () => clearInterval(timer);
+  }, [bootstrapEveryMs]);
 
   useEffect(() => {
     if (!enterpriseAuthorized || enterpriseCapabilities.length === 0) {
@@ -652,7 +664,10 @@ export function App({
     meta?.edition,
     metaStatus,
   );
-  const editionLabel = edition === "enterprise" ? "Enterprise" : edition === "community" ? "Community" : "Dashboard";
+  const editionLabel = editionLabelFor(
+    edition === "enterprise" ? "Enterprise" : edition === "community" ? "Community" : "Dashboard",
+    plan.view,
+  );
   const version = bootstrap?.product_version ?? (edition === "community" ? meta?.version : undefined);
   const community = edition === "community" ? communityScreens : undefined;
   const navigation = deriveShellNavigation(bootstrap, edition, contributed, community?.screens);
@@ -691,6 +706,13 @@ export function App({
   useEffect(() => {
     document.title = `InnerWarden ${editionLabel}: Agent Security`;
   }, [editionLabel]);
+
+  // Fed the last bootstrap read well: a failed read keeps the retained one,
+  // so it never changes what the notice says (`planStep`).
+  useEffect(() => {
+    const now = Date.now();
+    setPlan((last) => planStep(edition, bootstrap?.plan_notice, last.memory, now));
+  }, [bootstrap, edition]);
 
   const navigate = (next: ShellRoute, params?: Readonly<Record<string, string>>) => {
     const url = new URL(window.location.href);
@@ -755,6 +777,10 @@ export function App({
       />
 
       <main id="main-content" className="mx-auto max-w-6xl px-4 py-6 sm:px-6 sm:py-8 lg:px-8">
+        {edition === "enterprise" && plan.view.kind !== "none" && (
+          // Hidden in memory only: a reload shows the notice again.
+          <div data-shell-notice className="pb-5"><PlanNotice view={plan.view} onHide={() => setPlan(hidePlan)} /></div>
+        )}
         {edition === "enterprise" && bootstrap && enterpriseAuthorized ? (
           <EnterpriseRoute
             route={route}
