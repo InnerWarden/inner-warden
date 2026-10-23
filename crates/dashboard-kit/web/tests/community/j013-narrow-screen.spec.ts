@@ -41,9 +41,9 @@ function messageId(opening: string): string {
 const MESSAGE = messageId("Ignore your rules");
 
 const PAGES: [string, string, string][] = [
-  ...COMMUNITY_TABS.map(([label, path]) => [label, path, PAGE_READY[label]] as [string, string, string]),
-  ["A case", `/?view=activity&decision=${encodeURIComponent(CASE.domainFetch)}`, `section[data-case="${CASE.domainFetch}"]`],
-  ["A message", `/?view=activity&lane=agent_messages&decision=${MESSAGE}`, `section[data-case="${MESSAGE}"]`],
+  ...COMMUNITY_TABS.map(([label, path, titled]) => [titled, path, PAGE_READY[label]] as [string, string, string]),
+  ["A case", `/?view=activity&decision=${encodeURIComponent(CASE.domainFetch)}`, `section[data-decision="${CASE.domainFetch}"]`],
+  ["A message", `/?view=activity&lane=agent_messages&decision=${MESSAGE}`, `section[data-decision="${MESSAGE}"]`],
 ];
 
 for (const [name, path, drawn] of PAGES) {
@@ -145,7 +145,7 @@ test("the menu closes on Escape, on a press outside it, and on going to another 
   await expect(menu).toHaveAttribute("aria-expanded", "true");
   await toggle.click();
 
-  await page.getByRole("navigation", { name: "Dashboard views" }).getByRole("button", { name: "Cases" }).click();
+  await page.getByRole("navigation", { name: "Dashboard views" }).getByRole("button", { name: "Decisions" }).click();
   await expect(menu).toHaveAttribute("aria-expanded", "false");
   await expect(toggle).toBeHidden();
 });

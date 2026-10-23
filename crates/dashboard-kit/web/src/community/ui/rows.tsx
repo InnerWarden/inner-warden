@@ -1,5 +1,7 @@
-import { formatCount } from "../../presentation";
-import type { AgentFacts, Decision, Reason, SessionSummary } from "../api";
+import type { KeyboardEvent } from "react";
+import { TechnicalOnly } from "../../components/TechnicalDetail";
+import { formatAbsolute, formatCount } from "../../presentation";
+import type { AgentFacts, Attempt, Decision, Reason, SessionSummary } from "../api";
 import { commandSegments } from "../commandDisplay";
 import { agentSeen } from "../controls";
 import { dominantOutcome, SEVERITY_ORDER, type OutcomeKey } from "../outcomeStyle";
@@ -37,18 +39,51 @@ export function CommandText({ command, className = "" }: { command: string; clas
   );
 }
 
+/**
+ * Arrow keys move the open row from a focused row, inside the list only:
+ * never a global key, so typing in a search box moves nothing.
+ */
+export function rowKeys(event: KeyboardEvent<HTMLElement>, move: (delta: number) => void) {
+  if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+  event.preventDefault();
+  move(event.key === "ArrowDown" ? 1 : -1);
+}
+
+/** The bar a row that is open carries on its left edge, beside its tint. */
+const CURRENT_ROW = "bg-(--iw-surface-2) shadow-[inset_3px_0_0_var(--iw-accent)]";
+
 /** One flagged decision: what ran, what happened, who asked and where. */
-export function DecisionRow({ decision, href, onOpen, current = false }: { decision: Decision; href: string; onOpen?: () => void; current?: boolean }) {
+export function DecisionRow({
+  decision,
+  href,
+  onOpen,
+  current = false,
+  onMove,
+}: {
+  decision: Decision;
+  href: string;
+  onOpen?: () => void;
+  current?: boolean;
+  /** Arrow keys on the focused row open the next or the previous one. */
+  onMove?: (delta: number) => void;
+}) {
   return (
     <li data-decision-row={decision.id}>
-      <a href={href} onClick={onPlainClick(onOpen)} aria-current={current ? "true" : undefined} className={`${ROW_LINK} ${current ? "bg-(--iw-surface-2)" : ""}`}>
+      <a
+        href={href}
+        data-row-id={decision.id}
+        onClick={onPlainClick(onOpen)}
+        onKeyDown={onMove === undefined ? undefined : (event) => rowKeys(event, onMove)}
+        aria-current={current ? "true" : undefined}
+        className={`${ROW_LINK} ${current ? CURRENT_ROW : ""}`}
+      >
         <span className="flex min-w-0 items-start gap-2">
           <OutcomeMark outcome={decision.outcomeKey} className="mt-1" />
           <CommandText command={decision.command} className="flex-1" />
           {decision.recordedAt === undefined ? null : <Ago at={decision.recordedAt} className={`shrink-0 whitespace-nowrap ${META_TEXT}`} />}
         </span>
         <span className={`mt-1 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 pl-[18px] ${SMALL_TEXT} text-(--iw-ink-2)`}>
-          <span className="font-medium">{OUTCOME_WORDS[decision.outcomeKey]}</span>
+          <span data-outcome-words={decision.outcomeKey} className="whitespace-nowrap font-medium">{OUTCOME_WORDS[decision.outcomeKey]}</span>
           <span>{decision.agent ?? WHO_WORDS[decision.channel]}</span>
           {decision.project === undefined ? null : (
             <span data-folder className="rounded border border-(--iw-line) px-1">
@@ -58,6 +93,56 @@ export function DecisionRow({ decision, href, onOpen, current = false }: { decis
           <span className="min-w-0 text-(--iw-ink-3)">{decision.reason.short}</span>
           {decision.hiddenCharacters ? <HiddenChip compact /> : null}
         </span>
+        <TechnicalOnly>
+          <span className={`mt-1 flex min-w-0 flex-wrap gap-x-2 pl-[18px] font-mono text-[11px] text-(--iw-ink-3)`}>
+            {decision.recordedAt === undefined ? null : <span className="tabular-nums">{formatAbsolute(decision.recordedAt, "UTC")}</span>}
+            <span className="break-all">{decision.id}</span>
+            <span>{decision.recommendation}</span>
+            <span>{decision.mode}</span>
+          </span>
+        </TechnicalOnly>
+      </a>
+    </li>
+  );
+}
+
+/** One message someone sent the agent, in the same row grammar: what was said, what came of it, where. */
+export function MessageRow({
+  message,
+  href,
+  onOpen,
+  current = false,
+  onMove,
+}: {
+  message: Attempt;
+  href: string;
+  onOpen?: () => void;
+  current?: boolean;
+  onMove?: (delta: number) => void;
+}) {
+  return (
+    <li data-message-row={message.id}>
+      <a
+        href={href}
+        data-row-id={message.id}
+        onClick={onPlainClick(onOpen)}
+        onKeyDown={onMove === undefined ? undefined : (event) => rowKeys(event, onMove)}
+        aria-current={current ? "true" : undefined}
+        className={`${ROW_LINK} ${current ? CURRENT_ROW : ""}`}
+      >
+        <span className="flex min-w-0 items-start gap-2">
+          <OutcomeMark outcome={message.outcomeKey} className="mt-1" />
+          <span title={message.detail} className="line-clamp-2 min-w-0 flex-1 break-words text-sm leading-5 text-(--iw-ink) [overflow-wrap:anywhere]">{message.detail}</span>
+          <Ago at={message.at} className={`shrink-0 whitespace-nowrap ${META_TEXT}`} />
+        </span>
+        <span className={`mt-1 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 pl-[18px] ${SMALL_TEXT} text-(--iw-ink-2)`}>
+          <span data-outcome-words={message.outcomeKey} className="whitespace-nowrap font-medium">{OUTCOME_WORDS[message.outcomeKey]}</span>
+          <span>Someone on {message.channelWords}</span>
+          {message.hiddenCharacters ? <HiddenChip compact /> : null}
+        </span>
+        <TechnicalOnly>
+          <span className="mt-1 block pl-[18px] font-mono text-[11px] tabular-nums text-(--iw-ink-3)">{formatAbsolute(message.at, "UTC")}</span>
+        </TechnicalOnly>
       </a>
     </li>
   );
@@ -85,11 +170,28 @@ export function ReasonRow({ reason, href, onOpen }: { reason: Reason; href: stri
   );
 }
 
+
+/**
+ * When a session ran, in the reader's clock: "16:12" to "17:14" within one
+ * day, and with the day on each end when it ran across days, so a span of
+ * four days never reads as one afternoon.
+ */
+export function sessionSpan(firstAt: string | undefined, lastAt: string | undefined): [string, string] | undefined {
+  if (firstAt === undefined || lastAt === undefined) return undefined;
+  const first = Date.parse(firstAt);
+  const last = Date.parse(lastAt);
+  // Built per call, like `clockTime`, so they follow the zone the page runs in.
+  const day = new Intl.DateTimeFormat("en-GB", { day: "numeric", month: "short" });
+  if (day.format(first) === day.format(last)) return [clockTime(first), clockTime(last)];
+  const stamp = new Intl.DateTimeFormat("en-GB", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
+  return [stamp.format(first), stamp.format(last)];
+}
+
 /** One session with decisions still in the record. */
 export function SessionRow({ session, href, onOpen }: { session: SessionSummary; href: string; onOpen?: () => void }) {
   const outcomes = SEVERITY_ORDER.filter((key): key is OutcomeKey => (session.byOutcome[key as keyof typeof session.byOutcome] ?? 0) > 0);
-  const from = session.firstAt === undefined ? undefined : clockTime(Date.parse(session.firstAt));
-  const to = session.lastAt === undefined ? undefined : clockTime(Date.parse(session.lastAt));
+  const span = sessionSpan(session.firstAt, session.lastAt);
+  const [from, to] = span === undefined ? [undefined, undefined] : span;
   return (
     <li data-session-row={session.id}>
       <a href={href} onClick={onPlainClick(onOpen)} className={ROW_LINK}>

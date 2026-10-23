@@ -249,7 +249,7 @@ test.describe("CJC-090 / spec 090 T155 — dashboard performance acceptance", ()
       pages.push({ limit: Number(url.searchParams.get("limit")), bytes: (await response.body()).byteLength });
     });
     await page.goto("/?view=activity");
-    await expect(page.locator("[data-case-row]").first()).toBeVisible();
+    await expect(page.locator("[data-decision-row]").first()).toBeVisible();
     await expect.poll(() => pages.length).toBeGreaterThan(0);
     for (const { limit, bytes } of pages) {
       expect(limit, `a Cases page asked for ${limit} decisions; the cap is ${MAX_CASES_PER_PAGE}`).toBeGreaterThan(0);

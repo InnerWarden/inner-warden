@@ -2,7 +2,7 @@ import { useEffect, useRef, type ReactNode } from "react";
 import { PROTECTION_LABEL, type CommunityScreenContext, type CommunityShell } from "../App";
 import { TechnicalOnly } from "../components/TechnicalDetail";
 import { CommunityAgents } from "./Agents";
-import { CommunityCases } from "./Cases";
+import { CommunityDecisions } from "./Decisions";
 import { HeaderStatus } from "./HeaderStatus";
 import { PageNotices } from "./Notices";
 import { CommunityOverview } from "./Overview";
@@ -108,7 +108,7 @@ export const COMMUNITY_SHELL: CommunityShell = {
   screens: [
     { route: "overview", label: "Overview", render: (context) => <Page context={context} route="overview"><CommunityOverview context={context} /></Page> },
     { route: "posture", label: PROTECTION_LABEL, render: (context) => <Page context={context} route="posture"><CommunityProtection context={context} /></Page> },
-    { route: "activity", label: "Cases", render: (context) => <Page context={context} route="activity"><CommunityCases context={context} /></Page> },
+    { route: "activity", label: "Decisions", render: (context) => <Page context={context} route="activity"><CommunityDecisions context={context} /></Page> },
     { route: "agents", label: "Agents", render: (context) => <Page context={context} route="agents"><CommunityAgents context={context} /></Page> },
     { route: "tokens", label: "Tokens", render: (context) => <Page context={context} route="tokens"><CommunityTokens /></Page> },
   ],

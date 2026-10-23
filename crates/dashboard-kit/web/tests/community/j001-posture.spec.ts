@@ -4,7 +4,7 @@ import { COMMUNITY_TABS, FIXTURE_NOW_MS, fulfillJson, guardRoute, META } from ".
 
 /**
  * CJC-090-J001. The Community shell: five tabs (the `activity` route is the
- * one labelled Cases), the mode the guard runs in as ONE chip in words, and
+ * one labelled Decisions), the mode the guard runs in as ONE chip in words, and
  * nothing that calls the dashboard local or safe unless the host said so.
  */
 test.describe("CJC-090-J001 Community shell and posture", () => {
@@ -36,8 +36,8 @@ test.describe("CJC-090-J001 Community shell and posture", () => {
     await expect(page.getByText("Local · read-only API", { exact: true })).toHaveCount(0);
     await expect(page.getByText("Local only", { exact: true })).toHaveCount(0);
 
-    await nav.getByRole("button", { name: "Cases", exact: true }).click();
-    await expect(page.getByRole("heading", { name: "Cases", exact: true, level: 1 })).toBeVisible();
+    await nav.getByRole("button", { name: "Decisions", exact: true }).click();
+    await expect(page.getByRole("heading", { name: "Decisions", exact: true, level: 1 })).toBeVisible();
     await expect(page).toHaveURL(/\?view=activity$/);
     await page.getByRole("button", { name: "Go to overview" }).click();
     // The Overview's heading is its verdict, named for the page.

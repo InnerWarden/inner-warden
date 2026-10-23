@@ -139,11 +139,12 @@ test.describe("CJC-090-J004 local decision overview", () => {
     const linkCount = Number((await link.textContent())?.match(/See all ([\d,]+)/)?.[1].replace(/,/g, ""));
     expect(linkCount).toBeGreaterThan(0);
     await link.click();
-    const summary = page.locator("#flagged-summary-title").locator("..");
-    await expect(summary).toContainText(`${linkCount.toLocaleString("en-GB")} flagged`);
-    await expect(summary).not.toContainText("Checked by hand");
-    // The list's own split by outcome adds up to the same N.
-    const parts = await summary.locator("[data-part]").evaluateAll((items) =>
+    await expect(page.getByRole("heading", { name: "Decisions", level: 1 })).toBeVisible();
+    await expect(page.getByRole("tab", { name: /What your AI agent did/ })).toContainText(linkCount.toLocaleString("en-GB"));
+    // The list's own split by outcome adds up to the same N, and a check by hand is not in it.
+    const bar = page.locator("[data-outcome-bar]");
+    await expect(bar).not.toContainText("Checked by hand");
+    const parts = await bar.locator("[data-outcome-filter]").evaluateAll((items) =>
       items.map((item) => Number(item.querySelector("span.font-semibold")?.textContent?.replace(/,/g, "") ?? "0")));
     expect(parts.reduce((sum, part) => sum + part, 0)).toBe(linkCount);
   });

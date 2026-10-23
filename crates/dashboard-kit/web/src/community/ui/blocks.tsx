@@ -1,4 +1,5 @@
-import type { MouseEvent, ReactNode } from "react";
+import { useMemo, type MouseEvent, type ReactNode } from "react";
+import { TechnicalOnly } from "../../components/TechnicalDetail";
 import { formatCount } from "../../presentation";
 import { OUTCOME_STYLE, type OutcomeKey } from "../outcomeStyle";
 import { CopyCommand } from "../parts";
@@ -303,5 +304,21 @@ export function OutcomeWords({ outcome, className = "" }: { outcome: OutcomeKey;
       <OutcomeMark outcome={outcome} />
       {OUTCOME_WORDS[outcome]}
     </span>
+  );
+}
+
+const SECONDS = new Intl.DateTimeFormat("en-GB", { hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23" });
+
+/**
+ * The technical view's line under a section: when its answer came in, and
+ * from which route. Kept until a new answer arrives; nothing before the first.
+ */
+export function ReadAt({ data, path }: { data: unknown; path: string }) {
+  const at = useMemo(() => (data === undefined ? undefined : Date.now()), [data]);
+  if (at === undefined) return null;
+  return (
+    <TechnicalOnly>
+      <p data-read-at={path} className={META_TEXT}>Read at {SECONDS.format(at)} from {path}.</p>
+    </TechnicalOnly>
   );
 }

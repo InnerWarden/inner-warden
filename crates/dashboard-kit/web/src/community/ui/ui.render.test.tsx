@@ -158,8 +158,11 @@ describe("the rows", () => {
   it("draw a session with its span in the reader's clock and its outcomes", () => {
     const sessions = readSessionsPage(sessionsFixture);
     const html = render(<SessionRow session={sessions.items[0]} href="?view=activity&amp;session=x" />);
-    expect(html).toContain("22:26 to 14:03");
+    // It ran across four days: each end says its day.
+    expect(html).toContain("25 Sept, 22:26 to 29 Sept, 14:03");
     expect(html).toContain("67 decisions, 16 flagged");
+    const sameDay = { ...sessions.items[0], firstAt: "2026-09-29T16:12:00Z", lastAt: "2026-09-29T17:14:00Z" };
+    expect(render(<SessionRow session={sameDay} href="?view=activity&amp;session=x" />)).toContain("16:12 to 17:14");
   });
 
   it("list connected agents first, then those found here, then how many more", () => {

@@ -1,7 +1,7 @@
 import { useMemo, type ReactNode } from "react";
 import type { CommunityScreenContext } from "../App";
 import type { AgentsResponse, Overview as OverviewPayload } from "../api";
-import { TechnicalOnly, useTechnicalDetail } from "../components/TechnicalDetail";
+import { useTechnicalDetail } from "../components/TechnicalDetail";
 import { formatAbsolute, formatCount, humanizeToken } from "../presentation";
 import { agentRows, awaitingApproval, nameList } from "./agentsView";
 import {
@@ -30,6 +30,7 @@ import {
   NotRead,
   onPlainClick,
   PANEL,
+  ReadAt,
   RestartNote,
   Section,
   SMALL_TEXT,
@@ -60,8 +61,6 @@ export function shortDay(iso: string): string | undefined {
   const ms = Date.parse(iso);
   return Number.isFinite(ms) ? SHORT_DAY.format(ms) : undefined;
 }
-
-const SECONDS = new Intl.DateTimeFormat("en-GB", { hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23" });
 
 /**
  * What the decision record holds, as the line every count from it carries
@@ -99,21 +98,6 @@ function readFacts(data: unknown): { facts?: AgentsFacts; unreadable: boolean } 
   } catch {
     return { unreadable: true };
   }
-}
-
-/** When a source's answer came in, for the technical view: kept until a new answer arrives. */
-function useReadAt(data: unknown): number | undefined {
-  return useMemo(() => (data === undefined ? undefined : Date.now()), [data]);
-}
-
-function ReadAt({ data, path }: { data: unknown; path: string }) {
-  const at = useReadAt(data);
-  if (at === undefined) return null;
-  return (
-    <TechnicalOnly>
-      <p data-read-at={path} className={META_TEXT}>Read at {SECONDS.format(at)} from {path}.</p>
-    </TechnicalOnly>
-  );
 }
 
 /** A fixed-height block while the first answer is on its way: never a zero, never an empty list. */
@@ -375,7 +359,7 @@ function StepNumber({ n }: { n: number }) {
 /**
  * Needs a look: the three newest denies and why commands were flagged, from
  * the decision record, said with the span it covers. No Hide here: hiding a
- * reason is a view of the Cases list, done there.
+ * reason is a view of the Decisions list, done there.
  */
 function NeedsALook({
   denies,
@@ -489,7 +473,7 @@ function NeedsALook({
           onClick={onPlainClick(onAll)}
           className={`inline-flex min-h-9 items-center gap-1 text-sm pointer-coarse:min-h-11 ${LINK_TEXT}`}
         >
-          See all {formatCount(page.flaggedTotal)} flagged in Cases <Icon name="arrow-right" className="h-3.5 w-3.5" />
+          See all {formatCount(page.flaggedTotal)} flagged in Decisions <Icon name="arrow-right" className="h-3.5 w-3.5" />
         </a>
       </div>
     );
@@ -504,12 +488,15 @@ function NeedsALook({
   );
 }
 
-const STAMP = new Intl.DateTimeFormat("en-GB", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
+/** "25 Sept, 17:34" in the reader's own clock, built per call so it follows the zone the page runs in. */
+function stamp(ms: number): string {
+  return new Intl.DateTimeFormat("en-GB", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).format(ms);
+}
 
 /** "25 Sept, 17:34", in the reader's own clock. */
 function shortStamp(iso: string): string | undefined {
   const ms = Date.parse(iso);
-  return Number.isFinite(ms) ? STAMP.format(ms) : undefined;
+  return Number.isFinite(ms) ? stamp(ms) : undefined;
 }
 
 type FooterItem = { key: string; words: string; section?: string; route?: "posture" | "activity" | "tokens"; params?: Record<string, string> };

@@ -6,7 +6,7 @@ import { fulfillJson, guardRoute } from "./support";
  * CJC-090-J011. A corrupt local graph is an error in its own place, never an
  * empty record: the API answers 503, the Overview says the record could not
  * be read where its decisions go and still draws what other sources
- * answered, and Cases says the same instead of "nothing flagged".
+ * answered, and Decisions says the same instead of "nothing flagged".
  */
 test.describe("CJC-090-J011 corrupt local graph behavior", () => {
   test("returns an explicit corrupt-source HTTP error instead of a fabricated empty graph", async ({ page }) => {
@@ -32,12 +32,12 @@ test.describe("CJC-090-J011 corrupt local graph behavior", () => {
     await expect(page.locator("#verdict-title")).toBeVisible();
     await expect(page.locator("#overview-agents")).toContainText("Claude Code");
 
-    await page.getByRole("navigation", { name: "Dashboard views" }).getByRole("button", { name: "Cases", exact: true }).click();
+    await page.getByRole("navigation", { name: "Dashboard views" }).getByRole("button", { name: "Decisions", exact: true }).click();
     const alert = page.getByRole("alert").filter({ hasText: "The decision record could not be read" });
     await expect(alert).toBeVisible();
     await expect(alert.getByRole("button", { name: "Try again" })).toBeVisible();
     await expect(page.getByText("Nothing recorded yet.", { exact: false })).toHaveCount(0);
     await expect(page.getByText(/Nothing flagged/)).toHaveCount(0);
-    await expect(page.locator("[data-case-row]")).toHaveCount(0);
+    await expect(page.locator("[data-decision-row]")).toHaveCount(0);
   });
 });

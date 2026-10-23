@@ -40,7 +40,7 @@ vi.mock("./store", () => ({
 
 const { CommunityOverview } = await import("./Overview");
 const { CommunityAgents } = await import("./Agents");
-const { CaseDetail } = await import("./CaseDetail");
+const { DecisionDetail } = await import("./DecisionDetail");
 
 const META: DashboardMeta = { version: "1.5.0", exposed: false, edition: "community", guardrail: { mode: "partial", guarded_agents: 3 } };
 
@@ -194,7 +194,7 @@ describe("with no identity data the screens are what they were", () => {
   it("a case with no identity has no identity block and no layer line", () => {
     const [id] = Object.keys(byId);
     const detail = readDecisionDetail((byId as Record<string, unknown>)[id]);
-    const html = render(<CaseDetail item={detail.item} before={[]} after={[]} os="macos" installed={false} onOpen={() => undefined} onSession={() => undefined} />);
+    const html = render(<DecisionDetail item={detail.item} before={[]} after={[]} os="macos" installed={false} onOpen={() => undefined} onSession={() => undefined} />);
     expect(html).not.toContain("data-case-identity");
     expect(html).not.toContain("data-decided-by-layer");
   });
@@ -355,7 +355,7 @@ describe("a case with identity", () => {
   }
   const html = (identity: Record<string, unknown>, recommendation: string, os: "macos" | "linux" = "macos", installed = false, more: Record<string, unknown> = {}) => {
     const detail = detailWith(identity, recommendation, more);
-    return render(<CaseDetail item={detail.item} before={[]} after={[]} os={os} installed={installed} onOpen={() => undefined} onSession={() => undefined} />);
+    return render(<DecisionDetail item={detail.item} before={[]} after={[]} os={os} installed={installed} onOpen={() => undefined} onSession={() => undefined} />);
   };
 
   // FAILS ON REVERT: word the "Decided by" line from the recorded layer
@@ -376,7 +376,7 @@ describe("a case with identity", () => {
     const out = html(refused, "deny", "linux", true, { decided_by: "host" });
     const text = textOf(out);
     expect(text).toContain("Refused by Active Defence on this host.");
-    expect(text).toContain("decided by Active Defence on this host");
+    expect(text).toContain("Deny, by Active Defence on this host");
     expect(text).not.toContain("Refused by your general rules.");
     expect(text).not.toContain("kept your general rules");
     expect(text).not.toContain("kernel_a_word_never_heard");

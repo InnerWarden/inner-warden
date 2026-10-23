@@ -18,7 +18,7 @@ export const FIXTURE_NOW_MS = Date.UTC(2026, 8, 29, 14, 5, 0);
 export const S_APP = "4b1d9c2e-demo-4000-8000-000000000001";
 export const S_INFRA = "7e0a55f1-demo-4000-8000-000000000002";
 
-/** Fixture cases, by what happened to them. */
+/** Fixture decisions, by what happened to them. */
 export const CASE = {
   /** `cat ~/.ssh/config` in monitor mode: a deny, recorded, and it ran. */
   wouldRefuse: `cmd:${S_APP}:66`,
@@ -187,20 +187,25 @@ export async function expectHonestUpsell(page: Page) {
   expect(blurred).toBe(0);
 }
 
-/** The five Community tabs, in the nav's order, with the route each opens. */
+/**
+ * The five Community tabs, in the nav's order: the label the nav shows, the
+ * route each opens, and the name a generated test title uses. That name is
+ * kept as it was before the activity tab was renamed Decisions, because a
+ * composing bundle matches these tests by their exact titles.
+ */
 export const COMMUNITY_TABS = [
-  ["Overview", "/"],
-  ["Protection", "/?view=posture"],
-  ["Cases", "/?view=activity"],
-  ["Agents", "/?view=agents"],
-  ["Tokens", "/?view=tokens"],
+  ["Overview", "/", "Overview"],
+  ["Protection", "/?view=posture", "Protection"],
+  ["Decisions", "/?view=activity", "Cases"],
+  ["Agents", "/?view=agents", "Agents"],
+  ["Tokens", "/?view=tokens", "Tokens"],
 ] as const;
 
 /** What each page draws once it has an answer, to wait on before measuring. */
 export const PAGE_READY: Record<(typeof COMMUNITY_TABS)[number][0], string> = {
   Overview: "#verdict-title",
   Protection: "#protection-title",
-  Cases: "#cases-title",
+  Decisions: "#decisions-title",
   Agents: "#agents-title",
   Tokens: "#tokens-title",
 };

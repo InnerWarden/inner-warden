@@ -244,7 +244,7 @@ function routeFromLocation(extraScreens: readonly ScreenModule[]): ShellRoute {
 const SCREEN_PARAMS = [
   "q", "outcome", "severity", "status", "mode", "authority", "capability", "scope_kind",
   "scope", "window", "cursor", "case", "decision", "session", "verdict", "action", "lane",
-  "reason", "hide",
+  "reason", "hide", "lens",
 ] as const;
 
 const ACTIVITY_PARAM_LIMIT = 256;

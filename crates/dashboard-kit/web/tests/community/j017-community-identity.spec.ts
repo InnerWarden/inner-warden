@@ -97,7 +97,7 @@ test("an instance's session opens its case, which says which layer decided and w
   await page.goto("/?view=agents");
   const observed = row(page, "claude-code").locator(`[data-instance="${OBSERVED}"]`);
   await observed.getByRole("button", { name: "9d2f41b8 (open case)" }).click();
-  const card = page.locator('section[data-case="cmd:contain:2"]');
+  const card = page.locator('section[data-decision="cmd:contain:2"]');
   await expect(card).toBeVisible();
   const identity = card.locator("[data-case-identity]");
   await expect(identity).toContainText("instance 9d2f41b8");

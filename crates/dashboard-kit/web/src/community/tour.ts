@@ -33,8 +33,8 @@ export const COMMUNITY_SHELL_TOUR_STEPS: readonly TourStep[] = [
   },
   {
     key: ACTIVITY_TOUR_STEP_KEY,
-    title: "Cases",
-    body: "Every command the guard flagged, one case each, with what you can do about it.",
+    title: "Decisions",
+    body: "Every command or tool call the guard flagged, with what you can do about it.",
     route: "activity",
     selectors: ['[data-tour="activity"]'],
   },

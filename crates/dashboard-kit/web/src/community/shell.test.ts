@@ -13,7 +13,7 @@ describe("the Community shell", () => {
     expect(nav.map((item) => `${item.route}:${item.label}`)).toEqual([
       "overview:Overview",
       "posture:Protection",
-      "activity:Cases",
+      "activity:Decisions",
       "agents:Agents",
       "tokens:Tokens",
     ]);

@@ -3,35 +3,38 @@ import { test } from "./clock";
 import { CASE, fixture, fulfillJson, guardRoute, S_APP } from "./support";
 
 /**
- * CJC-090-J002. A case keeps three facts apart: what the rules said (the
+ * CJC-090-J002. A decision keeps three facts apart: what the rules said (the
  * verdict), what finally happened (the outcome), and how far InnerWarden got
- * (Seen, Decided, Enforced, Verified). None is derived from another, and a
- * record that did not keep the outcome says so rather than "Allowed".
+ * (Seen, Decided, Refused, and nothing checked afterwards). None is derived
+ * from another, and a record that did not keep the outcome says so rather
+ * than "Allowed".
  */
 
 function stage(page: Page, key: string) {
-  return page.locator(`section[data-case] li[data-stage="${key}"]`);
+  return page.locator(`section[data-decision] li[data-stage="${key}"]`);
 }
 
 async function openCase(page: Page, id: string) {
   await page.goto(`/?view=activity&decision=${encodeURIComponent(id)}`);
-  await expect(page.locator(`section[data-case="${id}"]`)).toBeVisible();
+  await expect(page.locator(`section[data-decision="${id}"]`)).toBeVisible();
 }
 
 test.describe("CJC-090-J002 deterministic action screening", () => {
   test("a deny in monitor mode: would have been refused, not refused, and Enforced says why", async ({ page }) => {
     await openCase(page, CASE.wouldRefuse);
-    const card = page.locator(`section[data-case="${CASE.wouldRefuse}"]`);
-    await expect(card.getByRole("heading", { level: 2 })).toHaveText("Claude Code ran a command the guard flagged");
-    await expect(card).toContainText("The rules said deny. Monitor mode records and does not refuse, so it ran.");
-    await expect(card).not.toContainText("refused before it ran");
-    await expect(stage(page, "enforced")).toHaveAttribute("data-mark", "not_applicable");
-    await expect(stage(page, "enforced")).toContainText("monitor");
+    const card = page.locator(`section[data-decision="${CASE.wouldRefuse}"]`);
+    // The heading is what the guard did, in the CLI's words; the mode it decided in is beside it.
+    await expect(card.getByRole("heading", { level: 2 })).toHaveText("The rules said deny. Monitor mode records and does not refuse, so it ran.");
+    await expect(card.locator('[data-pill="monitor"]')).toHaveText("Decided in monitor");
+    await expect(card).not.toContainText("Refused before it ran");
+    await expect(stage(page, "refused")).toHaveAttribute("data-mark", "not_applicable");
+    await expect(stage(page, "refused")).toContainText("Not refused: monitor records and does not refuse");
     // Community reads nothing back, so nothing is ever marked verified.
-    await expect(page.locator('section[data-case] [data-mark="verified"]')).toHaveCount(0);
+    await expect(page.locator('section[data-decision] [data-mark="verified"]')).toHaveCount(0);
+    await expect(card.locator("[data-not-checked-afterwards]")).toHaveText("Not checked afterwards: Community does not look at what a command did after it ran.");
 
     // The row in the list says the same outcome, in the same words.
-    const row = page.locator(`[data-case-row="${CASE.wouldRefuse}"]`);
+    const row = page.locator(`[data-decision-row="${CASE.wouldRefuse}"]`);
     await expect(row.locator("[data-outcome-words]")).toHaveText("Would have been refused");
 
     // Verdict, mode and outcome, each as recorded, side by side for whoever asks.
@@ -41,18 +44,19 @@ test.describe("CJC-090-J002 deterministic action screening", () => {
 
   test("a deny in enforce mode: refused before it ran, Enforced done, Verified not checked", async ({ page }) => {
     await openCase(page, CASE.refused);
-    const card = page.locator(`section[data-case="${CASE.refused}"]`);
-    await expect(card.getByRole("heading", { level: 2 })).toHaveText("Claude Code tried a command the guard refused");
-    await expect(stage(page, "enforced")).toHaveAttribute("data-mark", "done");
-    await expect(stage(page, "enforced")).toContainText("refused");
-    await expect(stage(page, "verified")).toHaveAttribute("data-mark", "unknown");
-    await expect(stage(page, "verified")).toContainText("not checked");
+    const card = page.locator(`section[data-decision="${CASE.refused}"]`);
+    await expect(card.locator('[data-pill="enforce"]')).toHaveText("Decided in enforce");
+    await expect(stage(page, "refused")).toHaveAttribute("data-mark", "done");
+    await expect(stage(page, "refused")).toContainText("Refused before it ran");
+    // There is no fourth step: what is not checked is said once, in words, never as a mark.
+    await expect(stage(page, "verified")).toHaveCount(0);
+    await expect(card.locator("[data-not-checked-afterwards]")).toContainText("Not checked afterwards");
   });
 
   test("an unsafe call that went through is drawn as a No, never as refused", async ({ page }) => {
     await openCase(page, CASE.unsafeRan);
-    await expect(stage(page, "enforced")).toHaveAttribute("data-mark", "no");
-    await expect(page.locator(`[data-case-row="${CASE.unsafeRan}"] [data-outcome-words]`)).toHaveText("Judged unsafe, and it ran");
+    await expect(stage(page, "refused")).toHaveAttribute("data-mark", "no");
+    await expect(page.locator(`[data-decision-row="${CASE.unsafeRan}"] [data-outcome-words]`)).toHaveText("Judged unsafe, and it ran");
   });
 
   test("a record that kept no outcome says so, and never becomes Allowed", async ({ page }) => {
@@ -81,11 +85,11 @@ test.describe("CJC-090-J002 deterministic action screening", () => {
     await page.route(guardRoute("decision"), (route) => fulfillJson(route, { ...base, item: legacy, around: { before: [], after: [] } }));
 
     await openCase(page, id);
-    const row = page.locator(`[data-case-row="${id}"]`);
+    const row = page.locator(`[data-decision-row="${id}"]`);
     await expect(row.locator("[data-outcome-words]")).toHaveText("Outcome not recorded");
     await expect(row).not.toContainText("Allowed");
-    await expect(stage(page, "enforced")).toHaveAttribute("data-mark", "unknown");
-    await expect(stage(page, "enforced")).toContainText("not recorded");
-    await expect(page.locator(`section[data-case="${id}"]`)).not.toContainText("Allowed");
+    await expect(stage(page, "refused")).toHaveAttribute("data-mark", "unknown");
+    await expect(stage(page, "refused")).toContainText("Not recorded whether it was refused");
+    await expect(page.locator(`section[data-decision="${id}"]`)).not.toContainText("Allowed");
   });
 });
