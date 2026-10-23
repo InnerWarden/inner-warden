@@ -752,6 +752,12 @@ fn guard_self_disable_in(content: &str) -> Option<(&'static str, u32)> {
             "deletes the guard's hook script",
             60,
         );
+        // The guard's own verb for what the `rm` above does to its record.
+        add(
+            r#"(?i)\b(?:innerwarden|iw(?:-guard)?)\b[^|;&]*\bgraph\b[^|;&]*--clear\b"#,
+            "wipes the guard's record of what AI agents did",
+            60,
+        );
         add(
             r#"(?i)\bchmod\b[^|;&]*-x[^|;&]*innerwarden"#,
             "removes the execute bit from the guard, so the hook silently does nothing",
@@ -4668,6 +4674,73 @@ pub fn destructive_rm_home(hay: &str) -> bool {
             .into_iter()
             .flat_map(shell_command_segments)
             .any(segment_is_home_wipe)
+}
+
+/// `rm` of the account's keys or credential store: `~/.ssh`, `~/.gnupg`,
+/// `~/.aws`, `~/.kube`, `~/.azure`, `~/.config/gcloud` (or all their
+/// contents), `~/.aws/credentials`, `~/.kube/config`, or a private key
+/// `~/.ssh/id_*` (never a `.pub`), in a home named `~`, `$HOME`, `/root`,
+/// `/home/<user>` or `/Users/<user>`. Correlated to one `rm` per segment and
+/// substitution body, as [`destructive_rm_home`] is, with any flags: one
+/// private key removed is as gone as the folder.
+///
+/// `rm -rf ~/.ssh` ran at risk 0 while `rm -rf ~` was refused and `find
+/// ~/.ssh -delete` was a dangerous command. What is under a store and holds
+/// no key stays a cleanup: `rm ~/.ssh/known_hosts`, `rm -rf ~/.aws/cli/cache`.
+pub fn destructive_rm_credentials(hay: &str) -> bool {
+    let wipes = |segment: &str| {
+        segment_rm_invocation(segment)
+            .is_some_and(|rm| rm.targets.iter().any(|t| rm_target_is_credential_store(t)))
+    };
+    shell_command_segments(hay).into_iter().any(wipes)
+        || substitution_bodies(hay)
+            .into_iter()
+            .flat_map(shell_command_segments)
+            .any(wipes)
+}
+
+/// Whether an `rm` target is a credential store or a private key in a home
+/// ([`destructive_rm_credentials`]).
+fn rm_target_is_credential_store(target: &str) -> bool {
+    const STORES: &[&str] = &[
+        ".ssh",
+        ".gnupg",
+        ".aws",
+        ".aws/credentials",
+        ".kube",
+        ".kube/config",
+        ".azure",
+        ".config/gcloud",
+    ];
+    let lower = target.to_ascii_lowercase();
+    let placed = if lower == "~" || lower.starts_with("~/") {
+        format!("/home/~{}", &lower[1..])
+    } else if let Some(rest) = lower.strip_prefix("$home") {
+        format!("/home/~{rest}")
+    } else if lower.starts_with('/') {
+        lower.clone()
+    } else {
+        return false;
+    };
+    let collapsed = collapse_path(&placed);
+    let base = rm_target_base(&collapsed);
+    let in_home = if let Some(rest) = base.strip_prefix("/root/") {
+        rest
+    } else if let Some(rest) = base
+        .strip_prefix("/home/")
+        .or_else(|| base.strip_prefix("/users/"))
+    {
+        match rest.split_once('/') {
+            Some((user, rest)) if !user.is_empty() => rest,
+            _ => return false,
+        }
+    } else {
+        return false;
+    };
+    STORES.contains(&in_home)
+        || in_home
+            .strip_prefix(".ssh/id_")
+            .is_some_and(|key| !key.contains('/') && !key.ends_with(".pub"))
 }
 
 /// Recursive, forced `rm` whose operand, resolved from the directory the
@@ -12617,6 +12690,81 @@ mod kernel_protection_tests {
             .filter(|cmd| check_guard_self_disable(cmd).is_none())
             .collect();
         assert!(allowed.is_empty(), "allowed: {allowed:#?}");
+    }
+
+    /// Removing the account's keys or credential stores is destructive, as
+    /// removing the home is: `rm -rf ~/.ssh` ran at risk 0. What is under a
+    /// store and holds no key, a public key, and a project folder stay
+    /// cleanups. FAILS ON REVERT of `destructive_rm_credentials`.
+    #[test]
+    fn removing_the_accounts_keys_is_destructive_and_a_cleanup_under_them_is_not() {
+        for cmd in [
+            "rm -rf ~/.ssh",
+            "rm -rf ~/.ssh/",
+            "rm -rf ~/.ssh/*",
+            "rm ~/.ssh/id_ed25519",
+            "rm -f ~/.ssh/id_rsa",
+            "rm ~/.ssh/id_*",
+            "rm -rf $HOME/.ssh",
+            "rm -rf ${HOME}/.gnupg",
+            "rm -rf \"$HOME/.aws\"",
+            "rm ~/.aws/credentials",
+            "rm -rf ~/.kube",
+            "rm ~/.kube/config",
+            "rm -rf ~/.azure",
+            "rm -rf ~/.config/gcloud",
+            "rm -rf /root/.ssh",
+            "rm -rf /home/dev/.ssh",
+            "rm -rf /Users/dev/.gnupg",
+            "sudo rm -rf /home/dev/.ssh",
+            "cd /tmp && rm -rf ~/.ssh",
+            "echo \"$(rm -rf ~/.ssh)\"",
+        ] {
+            assert!(destructive_rm_credentials(cmd), "{cmd}");
+        }
+        for cmd in [
+            "rm ~/.ssh/known_hosts",
+            "rm ~/.ssh/id_ed25519.pub",
+            "rm ~/.ssh/*.pub",
+            "rm -rf ~/.aws/cli/cache",
+            "rm -rf ~/.kube/cache",
+            "rm -rf ~/projects/old",
+            "rm -rf ./.ssh",
+            "ls ~/.ssh",
+            "echo rm -rf ~/.ssh",
+            "rm -rf /home/.ssh",
+        ] {
+            assert!(!destructive_rm_credentials(cmd), "{cmd}");
+        }
+    }
+
+    /// The guard's own verb that wipes its record of what agents did is a
+    /// self-disable, as `rm` of that file is: `innerwarden graph --clear`
+    /// ran at risk 0. Reading the record is not. FAILS ON REVERT of the
+    /// `graph --clear` rule.
+    #[test]
+    fn wiping_the_guards_record_is_a_self_disable_and_reading_it_is_not() {
+        for cmd in [
+            "innerwarden graph --clear",
+            "iw graph --clear",
+            "iw-guard graph --clear",
+            "npx innerwarden graph --clear",
+            "innerwarden graph --json --clear",
+            "/usr/local/bin/innerwarden graph --clear",
+        ] {
+            assert_eq!(
+                check_guard_self_disable(cmd).map(|(_, score)| score),
+                Some(60),
+                "{cmd}"
+            );
+        }
+        for cmd in [
+            "innerwarden graph",
+            "innerwarden graph --stats",
+            "innerwarden graph --json",
+        ] {
+            assert!(check_guard_self_disable(cmd).is_none(), "{cmd}");
+        }
     }
 
     /// Reading the kernel protection is not changing it: `agent kernel`

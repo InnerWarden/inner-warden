@@ -323,3 +323,46 @@ fn the_advice_after_a_block_is_for_the_person_and_not_runnable() {
     assert!(!said.contains("innerwarden allow '"), "{said}");
     assert!(!said.contains("innerwarden allow \""), "{said}");
 }
+
+/// FAILS ON REVERT (no terminal check on `graph --clear`): clearing the
+/// record of what AI agents did is the person's, as allowing and muting are.
+/// With no terminal it is refused and the record stays; an operator's flag
+/// outside an agent's shell clears it; the same flag inside one does not; and
+/// the hook refuses an agent that runs it.
+#[test]
+fn clearing_the_record_without_a_terminal_is_refused_and_the_record_stays() {
+    let home = Home::new();
+    let graph = home.path().join("graph.json");
+    std::fs::write(&graph, "{}").expect("a record");
+    let out = home.run(&["graph", "--clear"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("refused, no terminal"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(graph.exists(), "the record must stay");
+
+    for marker in AGENT_SHELL_MARKERS {
+        let out = home
+            .command()
+            .args(["graph", "--clear", "--operator"])
+            .env(marker, "1")
+            .output()
+            .expect("run innerwarden");
+        assert_eq!(out.status.code(), Some(1), "{marker}: {}", stderr(&out));
+        assert!(graph.exists(), "{marker}: the record must stay");
+    }
+
+    let out = home.run(&["graph", "--clear", "--operator"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(!graph.exists(), "the operator's flag clears it");
+
+    let out = home.hook("innerwarden graph --clear");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "the hook refuses it: {}",
+        stderr(&out)
+    );
+}

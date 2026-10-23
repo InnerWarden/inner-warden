@@ -53,7 +53,7 @@ const MAX_B64_DECODED: usize = 8192;
 /// Invisible / format characters used to smuggle or split keywords: zero-width,
 /// joiners, BOM, bidi controls, variation selectors, and the Unicode Tags block
 /// (U+E0000-E007F, ASCII smuggling).
-fn is_invisible(c: char) -> bool {
+pub(crate) fn is_invisible(c: char) -> bool {
     matches!(
         c as u32,
         0x00AD                 // soft hyphen

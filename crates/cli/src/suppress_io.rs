@@ -168,7 +168,7 @@ pub(crate) fn in_agent_shell() -> bool {
 /// see the call (a renamed copy of the binary, a script the agent wrote). A
 /// same-user agent can still allocate a terminal or unset its markers, so
 /// this raises the cost, it does not close the route.
-fn may_widen(operator_flag: bool) -> bool {
+pub(crate) fn may_widen(operator_flag: bool) -> bool {
     std::io::IsTerminal::is_terminal(&std::io::stdin()) || (operator_flag && !in_agent_shell())
 }
 
@@ -184,7 +184,7 @@ fn refuse_without_terminal(verb: &str) -> std::process::ExitCode {
 }
 
 /// The arguments with the operator flag taken out, and whether it was there.
-fn split_operator_flag(rest: &[String]) -> (Vec<String>, bool) {
+pub(crate) fn split_operator_flag(rest: &[String]) -> (Vec<String>, bool) {
     let operator = rest.iter().any(|a| a == GUARD_OPERATOR_FLAG);
     let args = rest
         .iter()

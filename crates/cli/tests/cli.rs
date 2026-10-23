@@ -1157,13 +1157,23 @@ fn graph_records_checks_and_narrates() {
         "narrative counts the deny verdict: {narrative}"
     );
 
-    // `graph --clear` resets it.
+    // `graph --clear` resets it, as the person's: here an operator's script
+    // (no terminal, `--operator`, outside an AI agent's shell).
     let out = cli()
-        .args(["graph", "--clear"])
+        .args(["graph", "--clear", "--operator"])
         .env("IW_GRAPH_FILE", gp)
+        .env_remove("CLAUDECODE")
+        .env_remove("CLAUDE_CODE_ENTRYPOINT")
+        .env_remove("CODEX_SANDBOX")
+        .env_remove("CODEX_SANDBOX_NETWORK_DISABLED")
+        .env_remove("GEMINI_CLI")
         .output()
         .expect("run graph clear");
-    assert!(out.status.success());
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert!(!graph.exists(), "clear removed the file");
 }
 

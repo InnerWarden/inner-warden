@@ -1593,6 +1593,18 @@ fn analyze_command_at(
                 detail: "recursive removal of a home directory".into(),
             });
             score += 50;
+        } else if crate::threats::destructive_rm_credentials(&lower) || {
+            let normalized = threats::normalize_command(&lower);
+            normalized != lower && crate::threats::destructive_rm_credentials(&normalized)
+        } {
+            // The keys and credential stores of the account: gone, they lock
+            // the person out of every host and service they reach.
+            signals.push(AnalysisSignal {
+                signal: "destructive_command".into(),
+                score: 50,
+                detail: "removal of the account's keys or credential store".into(),
+            });
+            score += 50;
         } else if context.is_some_and(|place| {
             crate::threats::destructive_rm_in_place(scan_cmd, &place.cwd, place.home.as_deref())
         }) {
@@ -1955,7 +1967,11 @@ fn check_shell_internal_target(command: &str) -> Option<String> {
     static INTERNAL_HOST: OnceLock<regex::Regex> = OnceLock::new();
     let metadata = METADATA.get_or_init(|| {
         regex::Regex::new(
-            r"(?i)(?:https?://)?(?:169\.254\.169\.254|100\.100\.100\.200)(?::\d+)?(?:/|\s|$)|metadata\.google\.internal(?:/|\s|$)",
+            // EC2/Azure/GCP, Alibaba, the ECS task credentials endpoint, EKS
+            // Pod Identity and EC2's IPv6 endpoints; the address ends where a
+            // path, a space, a quote, a bracket or a `$VARIABLE` starts
+            // (`http://169.254.170.2$AWS_CONTAINER_CREDENTIALS_RELATIVE_URI`).
+            r#"(?i)(?:https?://)?(?:\[?fd00:ec2::(?:254|23)\]?|169\.254\.169\.254|169\.254\.170\.23?|100\.100\.100\.200)(?::\d+)?(?:/|\s|$|\$|['"\]])|metadata\.google\.internal(?:/|\s|$)"#,
         )
         .expect("static shell metadata regex")
     });
@@ -1987,6 +2003,70 @@ fn check_shell_internal_target(command: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every cloud's metadata service a shell can reach is an internal
+    /// target: EC2, Azure and GCP (169.254.169.254, metadata.google.internal),
+    /// Alibaba (100.100.100.200), the ECS task credentials endpoint
+    /// (169.254.170.2, named by `$AWS_CONTAINER_CREDENTIALS_RELATIVE_URI`),
+    /// EKS Pod Identity (169.254.170.23) and EC2's IPv6 endpoints
+    /// (fd00:ec2::254, fd00:ec2::23), bare, quoted or followed by a variable.
+    /// A neighbouring address is not one. FAILS ON REVERT of the ECS, EKS or
+    /// IPv6 addresses, or of a quote or a `$` ending the address.
+    #[test]
+    fn every_clouds_metadata_service_is_an_internal_target() {
+        for command in [
+            "curl http://169.254.169.254/latest/meta-data/",
+            "curl \"http://169.254.169.254/latest/meta-data/\"",
+            "curl -s http://100.100.100.200/latest/meta-data/",
+            "curl -H 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/",
+            "wget -qO- http://169.254.170.2$AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+            "curl http://169.254.170.2/v2/credentials/1234",
+            "curl 169.254.170.23/v1/credentials",
+            "curl http://[fd00:ec2::254]/latest/meta-data/",
+            "curl -g 'http://[fd00:ec2::23]/v1/credentials'",
+        ] {
+            assert!(
+                check_shell_internal_target(command).is_some(),
+                "not an internal target: {command}"
+            );
+            let verdict = analyze_command(command, None);
+            assert_ne!(verdict.recommendation, "allow", "{command}: {verdict:?}");
+        }
+        // The credential reads among them are refused, as EC2's always was.
+        for command in [
+            "curl http://169.254.169.254/latest/meta-data/iam/security-credentials/role",
+            "curl http://[fd00:ec2::254]/latest/meta-data/iam/security-credentials/role",
+            "wget -qO- http://169.254.170.2$AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+            "curl http://169.254.170.2/v2/credentials/1234",
+            "curl http://169.254.170.23/v1/credentials",
+        ] {
+            let verdict = analyze_command(command, None);
+            assert_eq!(verdict.recommendation, "deny", "{command}: {verdict:?}");
+        }
+        for command in [
+            "ping -c1 169.254.170.21",
+            "curl http://169.254.170.200/x",
+            "echo fd00:ec2::2540",
+        ] {
+            assert!(
+                check_shell_internal_target(command).is_none(),
+                "an internal target: {command}"
+            );
+        }
+    }
+
+    /// The account's keys removed are a deny, as the home removed is.
+    #[test]
+    fn removing_the_accounts_keys_is_refused() {
+        for command in ["rm -rf ~/.ssh", "rm ~/.ssh/id_ed25519", "rm -rf $HOME/.aws"] {
+            let verdict = analyze_command(command, None);
+            assert_eq!(verdict.recommendation, "deny", "{command}: {verdict:?}");
+        }
+        for command in ["rm ~/.ssh/known_hosts", "rm -rf ~/.aws/cli/cache"] {
+            let verdict = analyze_command(command, None);
+            assert_eq!(verdict.recommendation, "allow", "{command}: {verdict:?}");
+        }
+    }
 
     /// The profile vocabulary is the set of names the checks in this file
     /// raise, read from the source itself, so a new check cannot be added
