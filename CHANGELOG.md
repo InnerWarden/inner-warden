@@ -3,6 +3,24 @@
 All notable changes to InnerWarden are documented here. This project
 follows semantic versioning.
 
+## 1.6.1 - 2026-10-23
+
+### Fixed
+
+- **`innerwarden contain` on Ubuntu 26.04 (and any kernel that restricts
+  unprivileged user namespaces) asks bubblewrap itself.** Under
+  `kernel.apparmor_restrict_unprivileged_userns = 1` it looked only for a
+  profile file of its own and refused where the distribution's profile
+  (`/etc/apparmor.d/bwrap-userns-restrict`, Ubuntu 26.04) already grants
+  bwrap a user namespace, and the profile it printed replaced the
+  distribution's once loaded. A run now starts bwrap once with a user
+  namespace (`bwrap --unshare-user --ro-bind / / true`, 5 seconds at most):
+  granted, nothing is said, whatever profile granted it; refused, the advice
+  is said. Refused with the distribution's profile on disk, the advice loads
+  that one (`sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict`)
+  and never writes another. A dry run, which runs nothing, goes by the files
+  on disk, the distribution's included.
+
 ## 1.6.0 - 2026-10-22
 
 ### Upgrade notes: what to do

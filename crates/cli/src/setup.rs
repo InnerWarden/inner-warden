@@ -226,7 +226,7 @@ mod tests {
         );
         let advice = crate::contain::userns_restriction_advice(
             Some("1\n"),
-            false,
+            crate::contain::UsernsGrant::default(),
             std::path::Path::new("/usr/bin/bwrap"),
         )
         .expect("a restricted host");

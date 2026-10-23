@@ -1888,7 +1888,7 @@ pub(crate) fn jail_backend() -> Option<&'static str> {
 pub(crate) fn jail_start_here() -> Option<Result<(), Vec<String>>> {
     if cfg!(target_os = "linux") {
         let bwrap = resolve_backend(BWRAP_PATHS)?;
-        Some(restriction_advice(&bwrap).map_or(Ok(()), Err))
+        Some(restriction_advice(&bwrap, true).map_or(Ok(()), Err))
     } else {
         jail_backend().map(|_| Ok(()))
     }
@@ -2040,7 +2040,7 @@ fn run_linux(input: &JailInputs, marks: bool) -> ExitCode {
         .then(|| resolve_backend(BWRAP_PATHS))
         .flatten();
     let dry_filter = dry_bwrap.as_ref().map(|bwrap| {
-        dry_run_filter(restriction_advice(bwrap), || {
+        dry_run_filter(restriction_advice(bwrap, false), || {
             filter_plan_here(bwrap, input.args.identity)
         })
     });
@@ -2113,7 +2113,7 @@ fn run_linux(input: &JailInputs, marks: bool) -> ExitCode {
     };
     // Say why the jail cannot be built BEFORE bwrap dies with an error that
     // names neither the cause nor the fix.
-    if let Some(lines) = restriction_advice(&bwrap) {
+    if let Some(lines) = restriction_advice(&bwrap, true) {
         for line in lines {
             eprintln!("{line}");
         }
@@ -2235,15 +2235,54 @@ fn filter_pipe(rules: innerwarden_agent_guard::seccomp::Rules) -> Option<std::io
 }
 
 /// What to say, and stop on, when this kernel restricts unprivileged user
-/// namespaces and `bwrap` has no AppArmor profile that grants it one. The
-/// sysctl file exists only on kernels that carry the restriction; the profile
-/// check is on disk because the loaded-profiles list is root-only.
-fn restriction_advice(bwrap: &Path) -> Option<Vec<String>> {
+/// namespaces and `bwrap` is not granted one. The sysctl file exists only on
+/// kernels that carry the restriction. Where it applies, a run (`probe`)
+/// asks bwrap itself ([`bwrap_gets_a_userns`]): the loaded-profiles list is
+/// root-only, and a profile file on disk says nothing of what is loaded (the
+/// distribution's own, Ubuntu 26.04, is loaded and named otherwise). A dry
+/// run, which runs nothing, goes by the files on disk.
+fn restriction_advice(bwrap: &Path, probe: bool) -> Option<Vec<String>> {
     let sysctl =
         std::fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns").ok();
-    let profile_on_disk = Path::new("/etc/apparmor.d/bwrap").exists()
-        || Path::new("/etc/apparmor.d/usr.bin.bwrap").exists();
-    crate::contain::userns_restriction_advice(sysctl.as_deref(), profile_on_disk, bwrap)
+    let restricted = sysctl.as_deref().is_some_and(|v| v.trim() == "1");
+    let grant = crate::contain::UsernsGrant {
+        probed: (probe && restricted)
+            .then(|| bwrap_gets_a_userns(bwrap))
+            .flatten(),
+        own_profile: Path::new("/etc/apparmor.d/bwrap").exists()
+            || Path::new("/etc/apparmor.d/usr.bin.bwrap").exists(),
+        distro_profile: Path::new(crate::contain::DISTRO_BWRAP_PROFILE).exists(),
+    };
+    crate::contain::userns_restriction_advice(sysctl.as_deref(), grant, bwrap)
+}
+
+/// Whether `bwrap` gets a user namespace here: run once with one, the root
+/// bound read-only, running `true`. `None` when it could not be started or
+/// did not end within 5 s (killed): not known, and the files on disk decide.
+fn bwrap_gets_a_userns(bwrap: &Path) -> Option<bool> {
+    let mut child = Command::new(bwrap)
+        .args(["--unshare-user", "--ro-bind", "/", "/", "true"])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status.success()),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
 }
 
 /// The key of Active Defence on this host, read from its file with the
@@ -5993,7 +6032,7 @@ mod tests {
         let input = with_linked_places_made(&input);
         // CWWT-C5: a host whose bwrap cannot start a jail proves nothing
         // here, so it fails rather than pass with nothing run.
-        if let Some(lines) = restriction_advice(&bwrap) {
+        if let Some(lines) = restriction_advice(&bwrap, true) {
             panic!(
                 "this test runs a jail with the host's bubblewrap, which cannot start one here \
                  (lift the restriction, as CI does, instead of skipping it): {lines:?}"
