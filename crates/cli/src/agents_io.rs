@@ -94,13 +94,67 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
     // restart after deliberately unwiring. Same wording as `dry-run`/`enforce`
     // so the product says one thing.
     if outcome.configured > 0 {
-        println!("{}", crate::RESTART_GUARDED_AGENTS);
+        let target = command_target(rest);
+        let connected: Vec<String> = agents_ops::rows(&home)
+            .into_iter()
+            .filter(|agent| {
+                agent.guardable()
+                    && agent.guarded
+                    && target.is_none_or(|name| agent.name.eq_ignore_ascii_case(name))
+            })
+            .map(|agent| agent.name)
+            .collect();
+        for line in restart_footer(&connected) {
+            println!("{line}");
+        }
     }
     if failed {
         std::process::ExitCode::from(1)
     } else {
         std::process::ExitCode::SUCCESS
     }
+}
+
+/// How to restart one agent so it reads its changed hook or MCP config, and
+/// why that is needed. The person restarts it: nothing here says it was.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct RestartWords {
+    pub how: String,
+    pub why: &'static str,
+}
+
+/// Why a running agent needs a restart after its config changed.
+pub(crate) const RESTART_WHY: &str = "An agent reads its hook or MCP config only when it starts.";
+
+/// The restart words for one agent: Claude Code and Codex by their own
+/// steps, any other agent by the generic one, named by `display_name`.
+pub(crate) fn restart_words(agent_id: &str, display_name: &str) -> RestartWords {
+    let how = match agent_id {
+        "claude-code" | "claude" => "In Claude Code, type /exit, then run claude.".to_string(),
+        "codex" => "Quit Codex and start it again.".to_string(),
+        _ => format!("Quit {display_name} and start it again."),
+    };
+    RestartWords {
+        how,
+        why: RESTART_WHY,
+    }
+}
+
+/// What a command that changed agents' configs prints at its end: the
+/// shared restart line, byte for byte as it always was, then one line per
+/// agent saying how to restart that one. Each agent once, in the order given.
+pub(crate) fn restart_footer(agent_ids: &[String]) -> Vec<String> {
+    let mut lines = vec![crate::RESTART_GUARDED_AGENTS.to_string()];
+    let mut seen: Vec<&str> = Vec::new();
+    for id in agent_ids {
+        if seen.contains(&id.as_str()) {
+            continue;
+        }
+        seen.push(id);
+        let name = crate::dashboard_community::agent_name(id);
+        lines.push(format!("  {name}: {}", restart_words(id, &name).how));
+    }
+    lines
 }
 
 fn is_known_agent_name(name: &str) -> bool {
@@ -285,6 +339,80 @@ fn print_auto_connect_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Claude Code and Codex get their own steps; any other agent the
+    /// generic one under its own name. Every one says why.
+    #[test]
+    fn restart_words_cover_claude_code_codex_and_a_generic_agent() {
+        assert_eq!(
+            restart_words("claude-code", "Claude Code"),
+            RestartWords {
+                how: "In Claude Code, type /exit, then run claude.".into(),
+                why: "An agent reads its hook or MCP config only when it starts.",
+            }
+        );
+        assert_eq!(
+            restart_words("codex", "Codex").how,
+            "Quit Codex and start it again."
+        );
+        assert_eq!(
+            restart_words("gemini", "Gemini CLI").how,
+            "Quit Gemini CLI and start it again."
+        );
+        assert_eq!(restart_words("gemini", "Gemini CLI").why, RESTART_WHY);
+    }
+
+    /// The person restarts the agent; no word says it happened, or that a
+    /// change was taken up.
+    #[test]
+    fn restart_words_never_say_restarted_or_reloaded() {
+        for (id, name) in [
+            ("claude-code", "Claude Code"),
+            ("codex", "Codex"),
+            ("cursor", "Cursor"),
+            ("openclaw", "OpenClaw"),
+            ("some-agent", "Some Agent"),
+        ] {
+            let words = restart_words(id, name);
+            let text = format!("{} {}", words.how, words.why).to_lowercase();
+            for banned in [
+                "restarted",
+                "reloaded",
+                "picked up",
+                "now protected",
+                "protected",
+            ] {
+                assert!(!text.contains(banned), "{id}: {text}");
+            }
+            assert!(!text.contains('\u{2014}') && !text.contains('\u{2013}'));
+        }
+    }
+
+    /// After a mode switch or a connect: the shared restart line exactly as
+    /// it always was, then one line per agent whose config changed, each
+    /// once. FAILS ON REVERT of the per-agent lines: only the shared line is
+    /// printed.
+    #[test]
+    fn mode_switch_prints_each_connected_agents_restart_words() {
+        let lines = restart_footer(&[
+            "claude-code".to_string(),
+            "codex".to_string(),
+            "claude-code".to_string(),
+            "cursor".to_string(),
+        ]);
+        assert_eq!(
+            lines,
+            vec![
+                "  Restart guarded agents so they reload their hook or MCP configuration."
+                    .to_string(),
+                "  Claude Code: In Claude Code, type /exit, then run claude.".to_string(),
+                "  Codex: Quit Codex and start it again.".to_string(),
+                "  Cursor: Quit Cursor and start it again.".to_string(),
+            ]
+        );
+        assert_eq!(lines[0], crate::RESTART_GUARDED_AGENTS);
+        assert_eq!(restart_footer(&[]), vec![crate::RESTART_GUARDED_AGENTS]);
+    }
 
     #[test]
     fn disconnect_excludes_connect_includes_and_disconnect_all_disables() {

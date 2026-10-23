@@ -397,21 +397,128 @@ fn suppress() -> crate::suppress::SuppressConfig {
     }
 }
 
-fn agents() -> Value {
-    let agent =
-        |id: &str, mode: &str, mechanism: &'static str, next: Option<AgentNextStep>| AgentView {
-            id: id.into(),
-            display_name: display_agent_name(id),
+/// How a fixture agent reaches the guard: its shell hook, or the MCP proxy
+/// over a JSON or a TOML config.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Wiring {
+    Hook,
+    McpJson,
+    McpToml,
+}
+
+/// One agent row of a fixture, before the real builders turn it into what
+/// the CLI serves.
+#[derive(Clone)]
+pub(super) struct FixtureAgent {
+    pub id: &'static str,
+    pub mode: &'static str,
+    pub wiring: Wiring,
+    /// How long before `NOW` its config last changed, for a connected agent.
+    pub changed_ago: Option<u64>,
+    pub mcp: Option<innerwarden_agent_guard::mcp_wire::ServerCounts>,
+}
+
+fn counts(
+    stdio: usize,
+    wrapped: usize,
+    remote: usize,
+) -> innerwarden_agent_guard::mcp_wire::ServerCounts {
+    innerwarden_agent_guard::mcp_wire::ServerCounts {
+        stdio,
+        wrapped,
+        remote,
+    }
+}
+
+/// The agents of the plain fixture: Claude Code in monitor, Codex partly
+/// connected, Cursor and Gemini CLI set to refuse a deny.
+pub(super) fn base_agents() -> Vec<FixtureAgent> {
+    vec![
+        FixtureAgent {
+            id: "claude-code",
+            mode: "monitor",
+            wiring: Wiring::Hook,
+            changed_ago: Some(3 * HOUR),
+            mcp: None,
+        },
+        FixtureAgent {
+            id: "codex",
+            mode: "partial",
+            wiring: Wiring::McpToml,
+            changed_ago: Some(DAY),
+            mcp: Some(counts(3, 2, 1)),
+        },
+        FixtureAgent {
+            id: "cursor",
+            mode: "enforce",
+            wiring: Wiring::McpJson,
+            changed_ago: Some(2 * DAY),
+            mcp: Some(counts(2, 2, 0)),
+        },
+        FixtureAgent {
+            id: "gemini",
+            mode: "enforce",
+            wiring: Wiring::McpJson,
+            changed_ago: Some(2 * DAY),
+            mcp: Some(counts(1, 1, 0)),
+        },
+    ]
+}
+
+/// The agents payload the CLI would serve for `rows` on a host whose mode
+/// is `host_mode`, every field from the builder the live route uses.
+pub(super) fn agents_payload(rows: &[FixtureAgent], host_mode: &str) -> Value {
+    let agent = |row: &FixtureAgent| {
+        let status = innerwarden_agent_guard::agents::AgentStatus {
+            name: row.id.into(),
+            pids: Vec::new(),
+            installed: true,
+            evidence: Vec::new(),
+            hookable: row.wiring == Wiring::Hook,
+            mcp_json: (row.wiring == Wiring::McpJson).then(|| format!(".{}/mcp.json", row.id)),
+            mcp_toml: (row.wiring == Wiring::McpToml).then(|| format!(".{}/config.toml", row.id)),
+            guarded: matches!(row.mode, "monitor" | "enforce" | "mixed"),
+            mode: None,
+        };
+        let connected = row.mode != "not_configured";
+        let classes = if row.wiring == Wiring::Hook {
+            crate::status::ToolClasses::Hook {
+                agent: row.id.into(),
+                file_tools: true,
+                next: String::new(),
+            }
+        } else {
+            crate::status::ToolClasses::Proxy {
+                agent: row.id.into(),
+            }
+        };
+        let judges = matches!(row.mode, "monitor" | "enforce" | "mixed")
+            .then(|| crate::status::judges(&classes));
+        let display_name = display_agent_name(row.id);
+        AgentView {
+            id: row.id.into(),
+            restart: Some(crate::agents_io::restart_words(row.id, &display_name)),
+            display_name,
             installed: true,
             running: None,
             detected_by: vec!["executable_on_path", "configuration_file"],
             guardrail: AgentGuardrailView {
-                mode: mode.into(),
-                mechanism: Some(mechanism),
+                mode: row.mode.into(),
+                mechanism: agent_mechanism(&status),
                 setup_support: "automatic",
+                config_changed_at: row
+                    .changed_ago
+                    .filter(|_| connected)
+                    .map(|ago| community::rfc3339(NOW - ago)),
             },
             auto_connect_eligible: Some(false),
-            next_step: next,
+            next_step: agent_next_step(
+                row.id,
+                row.mode,
+                "automatic",
+                host_mode,
+                row.mode == "partial",
+            ),
             identity_step: None,
             lifecycle: None,
             profile: None,
@@ -424,7 +531,12 @@ fn agents() -> Value {
             confine_step: None,
             instances: None,
             more_instances: None,
-        };
+            judges: judges.as_ref().map(|(key, _)| *key),
+            judges_line: judges.map(|(_, line)| line),
+            mode_steps: agent_mode_steps(&status, row.mode, "automatic"),
+            mcp: row.mcp,
+        }
+    };
     let payload = AgentsPayload {
         schema_version: AGENTS_SCHEMA_VERSION,
         generated_at_ms: NOW,
@@ -437,25 +549,14 @@ fn agents() -> Value {
             refresh_interval_secs: crate::agent_policy::RECONCILE_INTERVAL_SECS,
             watcher: crate::agent_policy::DashboardReconcilerStatus::unavailable(),
         },
-        agents: vec![
-            agent(
-                "claude-code",
-                "monitor",
-                "pretooluse_hook",
-                agent_next_step("claude-code", "monitor", "automatic", "partial", false),
-            ),
-            agent(
-                "codex",
-                "partial",
-                "mcp_proxy",
-                agent_next_step("codex", "partial", "automatic", "partial", true),
-            ),
-            agent("cursor", "enforce", "mcp_proxy", None),
-            agent("gemini", "enforce", "mcp_proxy", None),
-        ],
+        agents: rows.iter().map(agent).collect(),
         profiles_file: None,
     };
     serde_json::to_value(payload).expect("agents fixture")
+}
+
+fn agents() -> Value {
+    agents_payload(&base_agents(), "partial")
 }
 
 fn tokens() -> Value {
@@ -891,6 +992,7 @@ fn identity_fixtures() -> Vec<(&'static str, Value)> {
                     "mcp_proxy"
                 }),
                 setup_support: "automatic",
+                config_changed_at: None,
             },
             auto_connect_eligible: Some(false),
             next_step: None,
@@ -906,6 +1008,11 @@ fn identity_fixtures() -> Vec<(&'static str, Value)> {
             confine_step: None,
             instances: None,
             more_instances: None,
+            judges: None,
+            judges_line: None,
+            restart: None,
+            mode_steps: None,
+            mcp: None,
         })
         .collect();
     for row in &mut rows {

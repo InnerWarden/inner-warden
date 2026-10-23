@@ -156,6 +156,35 @@ struct AgentView {
     instances: Option<Vec<crate::dashboard_identity::LocalInstanceView>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     more_instances: Option<usize>,
+    /// What its wiring judges before a call runs (`shell_and_privileged_files`,
+    /// `shell_only` or `mcp_server_calls`) and the sentence `status` prints
+    /// for it. Only for an agent connected in one mode; absent when its
+    /// settings cannot be read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    judges: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    judges_line: Option<String>,
+    /// How to restart this agent after a step that changes its config, and
+    /// why. The person restarts it; the page never says it was.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    restart: Option<crate::agents_io::RestartWords>,
+    /// The steps that switch THIS agent's mode alone, served only for a
+    /// mechanism whose switch a test reads back through `agent_mode`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mode_steps: Option<AgentModeSteps>,
+    /// Its MCP servers by how the proxy reaches them, for an agent screened
+    /// through the proxy whose config could be read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mcp: Option<innerwarden_agent_guard::mcp_wire::ServerCounts>,
+}
+
+/// The steps that switch one agent's mode and leave the others as they are.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct AgentModeSteps {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enforce: Option<AgentNextStep>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    monitor: Option<AgentNextStep>,
 }
 
 /// The step that names an agent whose hook does not, from the hook's own
@@ -280,7 +309,135 @@ fn agent_next_step(
         "monitor" | "mixed" => Some(AgentNextStep {
             label: "To refuse a deny as well:",
             command: "innerwarden enforce".into(),
-            line: "Switches every connected agent from watching to refusing a deny.",
+            line: "Switches every connected agent from Monitor to Enforce: a deny is refused before it runs.",
+        }),
+        _ => None,
+    }
+}
+
+/// The config a connected agent's mode is read from, the file `agent_mode`
+/// reads: the hook's settings, or the MCP config the proxy wraps.
+fn agent_config_rel(agent: &innerwarden_agent_guard::agents::AgentStatus) -> Option<&str> {
+    if agent.hookable {
+        return Some(".claude/settings.json");
+    }
+    agent.mcp_json.as_deref().or(agent.mcp_toml.as_deref())
+}
+
+/// When the config `agent_mode` reads last changed, under the same rule:
+/// no link anywhere on the path, the file itself included. `None` when it
+/// cannot be read that way.
+fn agent_config_changed_ms(
+    home: &std::path::Path,
+    agent: &innerwarden_agent_guard::agents::AgentStatus,
+) -> Option<u64> {
+    let path = home.join(agent_config_rel(agent)?);
+    // The read is the check: it refuses a link in any component and opens
+    // the file without following one.
+    innerwarden_agent_guard::file_update::read_config_no_symlinks(home, &path)
+        .ok()
+        .flatten()?;
+    let metadata = std::fs::symlink_metadata(&path).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    let modified = metadata.modified().ok()?;
+    let ms = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis();
+    u64::try_from(ms).ok()
+}
+
+/// What a connected agent's wiring judges, from the same read `status`
+/// makes. Only for an agent connected in one mode: a partly connected one
+/// leaves some servers unscreened, and its row says so instead.
+fn agent_judges(
+    home: &std::path::Path,
+    agent: &innerwarden_agent_guard::agents::AgentStatus,
+    mode: &str,
+) -> Option<(&'static str, String)> {
+    if !matches!(mode, "monitor" | "enforce" | "mixed") {
+        return None;
+    }
+    crate::status::tool_classes_for(home, [agent])
+        .first()
+        .map(crate::status::judges)
+}
+
+/// The MCP servers of an agent screened through the proxy, from the same
+/// config `agent_mode` reads, read without following a link. `None` for a
+/// hook agent or a config that cannot be read.
+fn agent_server_counts(
+    home: &std::path::Path,
+    agent: &innerwarden_agent_guard::agents::AgentStatus,
+) -> Option<innerwarden_agent_guard::mcp_wire::ServerCounts> {
+    if agent.hookable {
+        return None;
+    }
+    let read = |rel: &str| {
+        innerwarden_agent_guard::file_update::read_config_no_symlinks(home, &home.join(rel))
+            .ok()
+            .flatten()
+    };
+    if let Some(rel) = &agent.mcp_json {
+        return read(rel)
+            .and_then(|body| serde_json::from_slice::<serde_json::Value>(&body).ok())
+            .map(|config| innerwarden_agent_guard::mcp_wire::server_counts(&config));
+    }
+    if let Some(rel) = &agent.mcp_toml {
+        return read(rel)
+            .and_then(|body| std::str::from_utf8(&body).ok()?.parse().ok())
+            .map(|config| innerwarden_agent_guard::mcp_wire_toml::server_counts_toml(&config));
+    }
+    None
+}
+
+/// The steps that switch one agent between Monitor and Enforce, built from
+/// the name `agents connect` accepts: it rewires that agent alone, in the
+/// mode asked for. Offered for an agent connected in one mode or in both;
+/// a partly connected one is finished first (`agent_next_step`).
+///
+/// Served only for the mechanisms `per_agent_switch_reads_back_through_agent_mode`
+/// proves: the shell hook, and the MCP proxy over a JSON or a TOML config.
+/// Any other agent gets none, and the page offers the switch for every
+/// agent at once.
+fn agent_mode_steps(
+    agent: &innerwarden_agent_guard::agents::AgentStatus,
+    mode: &str,
+    setup_support: &str,
+) -> Option<AgentModeSteps> {
+    let proven = agent.hookable || agent.mcp_json.is_some() || agent.mcp_toml.is_some();
+    if !proven || setup_support == "unsupported" {
+        return None;
+    }
+    let name = &agent.name;
+    let enforce = || {
+        AgentNextStep {
+        label: "To refuse a deny for this agent only:",
+        command: format!("innerwarden agents connect {name}"),
+        line: "Switches this agent to Enforce: a deny is refused before it runs. Your other agents keep their mode.",
+    }
+    };
+    let monitor = || {
+        AgentNextStep {
+        label: "To put this agent back in monitor:",
+        command: format!("innerwarden agents connect {name} --monitor"),
+        line: "Switches this agent to Monitor: every command is checked and recorded, and none is stopped. Your other agents keep their mode.",
+    }
+    };
+    match mode {
+        "monitor" => Some(AgentModeSteps {
+            enforce: Some(enforce()),
+            monitor: None,
+        }),
+        "enforce" => Some(AgentModeSteps {
+            enforce: None,
+            monitor: Some(monitor()),
+        }),
+        "mixed" => Some(AgentModeSteps {
+            enforce: Some(enforce()),
+            monitor: Some(monitor()),
         }),
         _ => None,
     }
@@ -322,6 +479,11 @@ struct AgentGuardrailView {
     mode: String,
     mechanism: Option<&'static str>,
     setup_support: &'static str,
+    /// When the config its mode is read from last changed (RFC 3339), for a
+    /// connected agent. Absent when that file cannot be read without
+    /// following a link.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    config_changed_at: Option<String>,
 }
 
 #[derive(Clone)]
@@ -433,9 +595,18 @@ fn agents_json_with_status(
                 &host_mode,
                 mode == "partial" && agent_wired_monitor(home, agent),
             );
+            let judges = agent_judges(home, agent, &mode);
+            let config_changed_at = if effectively_guarded {
+                agent_config_changed_ms(home, agent).map(crate::dashboard_community::rfc3339)
+            } else {
+                None
+            };
+            let display_name = display_agent_name(&agent.name);
+            let restart = (setup_support != "unsupported")
+                .then(|| crate::agents_io::restart_words(&agent.name, &display_name));
             let mut view = AgentView {
                 id: agent.name.clone(),
-                display_name: display_agent_name(&agent.name),
+                display_name,
                 installed: agent.installed,
                 running: if cfg!(target_os = "linux") {
                     Some(!agent.pids.is_empty())
@@ -443,11 +614,17 @@ fn agents_json_with_status(
                     None
                 },
                 detected_by,
+                mode_steps: agent_mode_steps(agent, &mode, setup_support),
+                mcp: agent_server_counts(home, agent),
                 guardrail: AgentGuardrailView {
                     mode,
                     mechanism: agent_mechanism(agent),
                     setup_support,
+                    config_changed_at,
                 },
+                judges: judges.as_ref().map(|(key, _)| *key),
+                judges_line: judges.map(|(_, line)| line),
+                restart,
                 auto_connect_eligible: policy_available
                     .then(|| crate::agent_policy::is_auto_connect_candidate(home, agent, &policy)),
                 next_step,
@@ -1934,9 +2111,372 @@ mod tests {
         let watching =
             agent_next_step("claude-code", "monitor", "automatic", "monitor", false).unwrap();
         assert_eq!(watching.command, "innerwarden enforce");
+        assert_eq!(
+            watching.line,
+            "Switches every connected agent from Monitor to Enforce: a deny is refused before it runs."
+        );
         assert!(agent_next_step("cursor", "enforce", "automatic", "enforce", false).is_none());
         assert!(agent_next_step("x", "not_configured", "unsupported", "monitor", false).is_none());
         assert!(agent_next_step("x", "unknown", "automatic", "monitor", false).is_none());
+    }
+
+    /// A home with an executable stand-in for the CLI, the path the wrappers
+    /// and the hook run: a wrapper whose program is gone is not guarded.
+    fn home_with_cli() -> (tempfile::TempDir, String) {
+        let home = tempfile::TempDir::new().unwrap();
+        if !cfg!(unix) {
+            return (home, "/abs/innerwarden".into());
+        }
+        let path = home.path().join("abs/innerwarden");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let bin = path.display().to_string();
+        (home, bin)
+    }
+
+    fn write_in(home: &std::path::Path, rel: &str, body: &str) {
+        let path = home.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+
+    fn row_of(payload: &serde_json::Value, id: &str) -> serde_json::Value {
+        payload["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|agent| agent["id"] == id)
+            .unwrap_or_else(|| panic!("{id} row: {payload}"))
+            .clone()
+    }
+
+    fn payload_for(home: &std::path::Path, bin: &str) -> serde_json::Value {
+        let rows = innerwarden_agent_guard::agents_ops::rows(home);
+        serde_json::from_str(&agents_json_with_status(
+            home, &rows, false, None, bin, None,
+        ))
+        .unwrap()
+    }
+
+    fn connect(home: &std::path::Path, bin: &str, args: &[&str]) {
+        let args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+        let outcome =
+            innerwarden_agent_guard::agents_ops::run_with_guard_bin_outcome(home, &args, bin);
+        assert!(
+            !outcome.lines.iter().any(|line| line.contains("failed:")),
+            "{:?}",
+            outcome.lines
+        );
+    }
+
+    /// The row says what `status` says the agent's wiring judges, in its
+    /// words: the hook with its file tools, and the proxy.
+    #[test]
+    fn agents_row_judges_matches_status_tool_classes() {
+        let (home, bin) = home_with_cli();
+        write_in(home.path(), ".claude/settings.json", "{}");
+        write_in(
+            home.path(),
+            ".cursor/mcp.json",
+            r#"{"mcpServers":{"fs":{"command":"npx"}}}"#,
+        );
+        connect(home.path(), &bin, &["connect", "--all", "--monitor"]);
+        let payload = payload_for(home.path(), &bin);
+        let rows = innerwarden_agent_guard::agents_ops::rows(home.path());
+        for id in ["claude-code", "cursor"] {
+            let row = row_of(&payload, id);
+            assert_eq!(row["guardrail"]["mode"], "monitor", "{row}");
+            let status_row = rows.iter().find(|r| r.name == id).unwrap();
+            let classes = crate::status::tool_classes_for(home.path(), [status_row]);
+            let (key, line) = crate::status::judges(&classes[0]);
+            assert_eq!(row["judges"], key, "{row}");
+            assert_eq!(row["judges_line"], line.as_str(), "{row}");
+            let printed = match crate::status::tool_classes_finding(&classes[0]) {
+                crate::status::Finding::Working(text) => text,
+                other => panic!("{other:?}"),
+            };
+            assert!(
+                printed
+                    .to_lowercase()
+                    .ends_with(&row["judges_line"].as_str().unwrap().to_lowercase()),
+                "{printed}"
+            );
+        }
+        assert_eq!(
+            row_of(&payload, "claude-code")["judges"],
+            "shell_and_privileged_files"
+        );
+        assert_eq!(row_of(&payload, "cursor")["judges"], "mcp_server_calls");
+    }
+
+    /// Settings that cannot be parsed say nothing about what is judged:
+    /// the field is absent, never a guess.
+    #[test]
+    fn agents_row_judges_is_absent_when_settings_are_unreadable() {
+        let (home, _) = home_with_cli();
+        write_in(home.path(), ".claude/settings.json", "not json");
+        let agent = innerwarden_agent_guard::agents::AgentStatus {
+            name: "claude-code".into(),
+            pids: Vec::new(),
+            installed: true,
+            evidence: Vec::new(),
+            hookable: true,
+            mcp_json: None,
+            mcp_toml: None,
+            guarded: true,
+            mode: None,
+        };
+        for mode in ["monitor", "enforce", "mixed"] {
+            assert_eq!(agent_judges(home.path(), &agent, mode), None, "{mode}");
+        }
+        std::fs::write(home.path().join(".claude/settings.json"), "{}").unwrap();
+        assert!(agent_judges(home.path(), &agent, "monitor").is_some());
+        assert_eq!(agent_judges(home.path(), &agent, "partial"), None);
+        assert_eq!(agent_judges(home.path(), &agent, "not_configured"), None);
+    }
+
+    /// `config_changed_at` is the time the file `agent_mode` reads was last
+    /// written: the hook's settings for Claude Code, the MCP config for a
+    /// proxy agent.
+    #[test]
+    fn config_changed_at_is_the_mtime_of_the_file_agent_mode_read() {
+        let (home, bin) = home_with_cli();
+        write_in(home.path(), ".claude/settings.json", "{}");
+        write_in(
+            home.path(),
+            ".codex/config.toml",
+            "[mcp_servers.icm]\ncommand = \"icm\"\n",
+        );
+        connect(home.path(), &bin, &["connect", "--all", "--monitor"]);
+        let set = |rel: &str, secs: u64| {
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(home.path().join(rel))
+                .unwrap();
+            file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+                .unwrap();
+        };
+        set(".claude/settings.json", 1_790_680_000);
+        set(".codex/config.toml", 1_790_600_000);
+        let payload = payload_for(home.path(), &bin);
+        assert_eq!(
+            row_of(&payload, "claude-code")["guardrail"]["config_changed_at"],
+            crate::dashboard_community::rfc3339(1_790_680_000_000)
+        );
+        assert_eq!(
+            row_of(&payload, "codex")["guardrail"]["config_changed_at"],
+            crate::dashboard_community::rfc3339(1_790_600_000_000)
+        );
+    }
+
+    /// A config reached through a link is not read for its time: the same
+    /// rule `agent_mode` keeps.
+    #[cfg(unix)]
+    #[test]
+    fn config_changed_at_is_absent_for_a_symlinked_config() {
+        let (home, _) = home_with_cli();
+        write_in(home.path(), "dotfiles/mcp.json", r#"{"mcpServers":{}}"#);
+        std::fs::create_dir_all(home.path().join(".cursor")).unwrap();
+        std::os::unix::fs::symlink(
+            home.path().join("dotfiles/mcp.json"),
+            home.path().join(".cursor/mcp.json"),
+        )
+        .unwrap();
+        let agent = innerwarden_agent_guard::agents::AgentStatus {
+            name: "cursor".into(),
+            pids: Vec::new(),
+            installed: true,
+            evidence: Vec::new(),
+            hookable: false,
+            mcp_json: Some(".cursor/mcp.json".into()),
+            mcp_toml: None,
+            guarded: true,
+            mode: None,
+        };
+        assert_eq!(agent_config_changed_ms(home.path(), &agent), None);
+        // A link in a folder on the way is refused the same way.
+        write_in(home.path(), "real-claude/settings.json", "{}");
+        std::os::unix::fs::symlink(home.path().join("real-claude"), home.path().join(".claude"))
+            .unwrap();
+        let hook = innerwarden_agent_guard::agents::AgentStatus {
+            name: "claude-code".into(),
+            hookable: true,
+            mcp_json: None,
+            ..agent.clone()
+        };
+        assert_eq!(agent_config_changed_ms(home.path(), &hook), None);
+        // And a plain file is read.
+        std::fs::remove_file(home.path().join(".cursor/mcp.json")).unwrap();
+        write_in(home.path(), ".cursor/mcp.json", r#"{"mcpServers":{}}"#);
+        assert!(agent_config_changed_ms(home.path(), &agent).is_some());
+    }
+
+    /// For one mechanism: switch one agent to Enforce and back with the
+    /// commands `mode_steps` serves, read the mode back through
+    /// `agent_mode`, and check the other agent kept its own.
+    fn switch_reads_back(rel: &str, body: &str, id: &str) {
+        let (home, bin) = home_with_cli();
+        write_in(home.path(), rel, body);
+        // A second agent, in monitor, that must keep its mode.
+        let (other_rel, other_id) = if id == "cursor" {
+            (".gemini/settings.json", "gemini")
+        } else {
+            (".cursor/mcp.json", "cursor")
+        };
+        write_in(
+            home.path(),
+            other_rel,
+            r#"{"mcpServers":{"other":{"command":"node","args":["s.js"]}}}"#,
+        );
+        connect(home.path(), &bin, &["connect", "--all", "--monitor"]);
+        let mode_of = |id: &str| {
+            let rows = innerwarden_agent_guard::agents_ops::rows(home.path());
+            let row = rows.iter().find(|r| r.name == id).unwrap();
+            agent_mode(home.path(), row)
+        };
+        assert_eq!(mode_of(id), "monitor");
+        assert_eq!(mode_of(other_id), "monitor");
+
+        let payload = payload_for(home.path(), &bin);
+        let steps = &row_of(&payload, id)["mode_steps"];
+        let enforce = steps["enforce"]["command"].as_str().expect("enforce step");
+        assert!(steps.get("monitor").is_none(), "{steps}");
+        let args: Vec<&str> = enforce
+            .strip_prefix("innerwarden agents ")
+            .unwrap()
+            .split(' ')
+            .collect();
+        connect(home.path(), &bin, &args);
+        assert_eq!(mode_of(id), "enforce", "{enforce}");
+        assert_eq!(
+            mode_of(other_id),
+            "monitor",
+            "the other agent kept its mode"
+        );
+
+        let payload = payload_for(home.path(), &bin);
+        let steps = &row_of(&payload, id)["mode_steps"];
+        let monitor = steps["monitor"]["command"].as_str().expect("monitor step");
+        assert!(steps.get("enforce").is_none(), "{steps}");
+        let args: Vec<&str> = monitor
+            .strip_prefix("innerwarden agents ")
+            .unwrap()
+            .split(' ')
+            .collect();
+        connect(home.path(), &bin, &args);
+        assert_eq!(mode_of(id), "monitor", "{monitor}");
+        assert_eq!(mode_of(other_id), "monitor");
+    }
+
+    /// FAILS ON REVERT of the per-agent switch: a step that does not reach
+    /// the agent's own wiring leaves it in monitor.
+    #[test]
+    fn per_agent_switch_reads_back_through_agent_mode_hook() {
+        switch_reads_back(".claude/settings.json", "{}", "claude-code");
+    }
+
+    #[test]
+    fn per_agent_switch_reads_back_through_agent_mode_mcp_json() {
+        switch_reads_back(
+            ".cursor/mcp.json",
+            r#"{"mcpServers":{"fs":{"command":"npx","args":["-y","server"]}}}"#,
+            "cursor",
+        );
+    }
+
+    #[test]
+    fn per_agent_switch_reads_back_through_agent_mode_mcp_toml() {
+        switch_reads_back(
+            ".codex/config.toml",
+            "[mcp_servers.icm]\ncommand = \"icm\"\n",
+            "codex",
+        );
+    }
+
+    /// An agent with no wiring this file reads its mode from gets no step
+    /// of its own, and neither does one in a state the switch does not
+    /// apply to.
+    #[test]
+    fn mode_steps_are_absent_for_an_unproven_mechanism() {
+        let agent = innerwarden_agent_guard::agents::AgentStatus {
+            name: "goose".into(),
+            pids: Vec::new(),
+            installed: true,
+            evidence: Vec::new(),
+            hookable: false,
+            mcp_json: None,
+            mcp_toml: None,
+            guarded: true,
+            mode: None,
+        };
+        for mode in ["monitor", "enforce", "mixed"] {
+            assert_eq!(agent_mode_steps(&agent, mode, "manual"), None, "{mode}");
+        }
+        let cursor = innerwarden_agent_guard::agents::AgentStatus {
+            name: "cursor".into(),
+            mcp_json: Some(".cursor/mcp.json".into()),
+            ..agent.clone()
+        };
+        assert!(agent_mode_steps(&cursor, "monitor", "automatic").is_some());
+        for mode in ["partial", "not_configured", "unknown"] {
+            assert_eq!(agent_mode_steps(&cursor, mode, "automatic"), None, "{mode}");
+        }
+        assert_eq!(agent_mode_steps(&cursor, "monitor", "unsupported"), None);
+        let mixed = agent_mode_steps(&cursor, "mixed", "automatic").unwrap();
+        assert!(mixed.enforce.is_some() && mixed.monitor.is_some());
+    }
+
+    /// The server counts belong to an agent screened through the proxy: a
+    /// hook agent has none.
+    #[test]
+    fn agents_row_mcp_is_absent_for_a_hook_agent() {
+        let (home, bin) = home_with_cli();
+        write_in(home.path(), ".claude/settings.json", "{}");
+        write_in(
+            home.path(),
+            ".cursor/mcp.json",
+            r#"{"mcpServers":{"fs":{"command":"npx"},"git":{"command":"uvx"},"docs":{"url":"https://example.com/mcp"}}}"#,
+        );
+        connect(home.path(), &bin, &["connect", "cursor", "--monitor"]);
+        let payload = payload_for(home.path(), &bin);
+        assert!(
+            row_of(&payload, "claude-code").get("mcp").is_none(),
+            "{payload}"
+        );
+        assert_eq!(
+            row_of(&payload, "cursor")["mcp"],
+            serde_json::json!({"stdio": 2, "wrapped": 2, "remote": 1})
+        );
+    }
+
+    /// Every row that can be connected carries its restart words; the
+    /// restart words are the agent's own.
+    #[test]
+    fn agents_rows_carry_their_restart_words() {
+        let (home, bin) = home_with_cli();
+        write_in(home.path(), ".claude/settings.json", "{}");
+        write_in(
+            home.path(),
+            ".codex/config.toml",
+            "[mcp_servers.icm]\ncommand = \"icm\"\n",
+        );
+        let payload = payload_for(home.path(), &bin);
+        assert_eq!(
+            row_of(&payload, "claude-code")["restart"],
+            serde_json::json!({
+                "how": "In Claude Code, type /exit, then run claude.",
+                "why": "An agent reads its hook or MCP config only when it starts.",
+            })
+        );
+        assert_eq!(
+            row_of(&payload, "codex")["restart"]["how"],
+            "Quit Codex and start it again."
+        );
     }
 
     #[test]
@@ -2133,6 +2673,14 @@ mod tests {
             "auto_connect_eligible",
             "next_step",
             "identity_step",
+            // What the wiring judges, how to restart, the per-agent switch and
+            // the MCP server counts: read from the agent's own config, with or
+            // without the identity features.
+            "judges",
+            "judges_line",
+            "restart",
+            "mode_steps",
+            "mcp",
         ];
         let off: serde_json::Value =
             serde_json::from_str(&agents_json(home.path(), &rows)).unwrap();
@@ -2219,6 +2767,7 @@ mod tests {
                 mode: "monitor".into(),
                 mechanism: Some("pretooluse_hook"),
                 setup_support: "automatic",
+                config_changed_at: None,
             },
             auto_connect_eligible: Some(true),
             next_step: None,
@@ -2234,6 +2783,11 @@ mod tests {
             confine_step: None,
             instances: None,
             more_instances: None,
+            judges: None,
+            judges_line: None,
+            restart: None,
+            mode_steps: None,
+            mcp: None,
         })
         .unwrap();
         assert_eq!(

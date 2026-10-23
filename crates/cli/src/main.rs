@@ -153,24 +153,7 @@ fn status_io_cmd() -> std::process::ExitCode {
     let tool_classes: Vec<status::ToolClasses> = home
         .as_deref()
         .map(|home| {
-            rows.iter()
-                .filter(|r| wired_agents.contains(&r.name))
-                .filter_map(|r| {
-                    if !r.hookable {
-                        return Some(status::ToolClasses::Proxy {
-                            agent: r.name.clone(),
-                        });
-                    }
-                    let settings = std::fs::read(home.join(".claude/settings.json"))
-                        .ok()
-                        .and_then(|body| serde_json::from_slice::<serde_json::Value>(&body).ok())?;
-                    Some(status::ToolClasses::Hook {
-                        agent: r.name.clone(),
-                        file_tools: hook::iwguard_judges_file_tools(&settings),
-                        next: innerwarden_agent_guard::agents_ops::hook_repair_command(home, r),
-                    })
-                })
-                .collect()
+            status::tool_classes_for(home, rows.iter().filter(|r| wired_agents.contains(&r.name)))
         })
         .unwrap_or_default();
 
@@ -1276,6 +1259,7 @@ fn cmd_mode(rest: &[String], monitor: bool) -> std::process::ExitCode {
         let mut flipped = 0usize;
         let mut attempted = 0usize;
         let mut failed = 0usize;
+        let mut configured: Vec<String> = Vec::new();
         for agent in &agents {
             if !innerwarden_agent_guard::agents_ops::status_has_guard_wiring(&home, agent) {
                 continue;
@@ -1286,15 +1270,16 @@ fn cmd_mode(rest: &[String], monitor: bool) -> std::process::ExitCode {
             );
             if result.configured() {
                 flipped += 1;
+                configured.push(agent.name.clone());
             }
             if result.effect == innerwarden_agent_guard::agents_ops::ConnectEffect::Failed {
                 failed += 1;
             }
             println!("{}", result.line);
         }
-        Ok((attempted, failed, flipped))
+        Ok((attempted, failed, flipped, configured))
     });
-    let (attempted, failed, flipped) = match mode_result {
+    let (attempted, failed, flipped, configured) = match mode_result {
         Ok(counts) => counts,
         Err(error) => {
             eprintln!(
@@ -1328,7 +1313,9 @@ fn cmd_mode(rest: &[String], monitor: bool) -> std::process::ExitCode {
         );
         println!("  Back to observe-only:  innerwarden dry-run");
     }
-    println!("{RESTART_GUARDED_AGENTS}");
+    for line in agents_io::restart_footer(&configured) {
+        println!("{line}");
+    }
     std::process::ExitCode::SUCCESS
 }
 
@@ -1497,6 +1484,8 @@ fn cmd_install(rest: &[String]) -> std::process::ExitCode {
                 } else {
                     println!("before it runs; a dangerous one is blocked. Restart Claude Code to load it.");
                 }
+                let name = dashboard_community::agent_name(&agent);
+                println!("  {name}: {}", agents_io::restart_words(&agent, &name).how);
             } else {
                 println!(
                     "Note: Claude Code was not detected here (no `claude` on PATH, no ~/.claude)."
