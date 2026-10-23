@@ -457,6 +457,44 @@ fn for_each_server(root: &mut Value, mut f: impl FnMut(&mut Value) -> bool) -> u
     n
 }
 
+/// How many MCP servers a configuration names, by how the proxy can reach
+/// them: `stdio` servers run a local command and can be wrapped, `wrapped`
+/// of those already run through the proxy, and `remote` servers name a `url`
+/// and have no local command to wrap, so the proxy never sees their calls.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct ServerCounts {
+    pub stdio: usize,
+    pub wrapped: usize,
+    pub remote: usize,
+}
+
+/// A server with no local command that names a `url`: a remote server.
+fn is_remote_server(server: &Value) -> bool {
+    !is_stdio_server(server)
+        && server
+            .get("url")
+            .and_then(Value::as_str)
+            .is_some_and(|url| !url.trim().is_empty())
+}
+
+/// The servers of a configuration, counted across every table this module
+/// wires, the same tables and the same tests [`wrap`] uses, so the counts
+/// say what a wrap would and did reach. Pure.
+pub fn server_counts(root: &Value) -> ServerCounts {
+    let (stdio, wrapped) = counts(root);
+    let remote = SERVER_TABLE_PATHS
+        .iter()
+        .filter_map(|path| table_at(root, path))
+        .flat_map(|map| map.values())
+        .filter(|server| is_remote_server(server))
+        .count();
+    ServerCounts {
+        stdio,
+        wrapped,
+        remote,
+    }
+}
+
 /// Count (stdio servers, of those already wrapped) across both schema keys.
 fn counts(root: &Value) -> (usize, usize) {
     let mut stdio = 0;
@@ -684,6 +722,44 @@ mod tests {
                 "remote": { "url": "https://example.com/sse" }
             }
         })
+    }
+
+    /// A remote server is counted apart and never as a local one, before
+    /// and after a wrap, in every table the module wires. FAILS ON REVERT of
+    /// the `url` test: the remote server is not counted at all.
+    #[test]
+    fn server_counts_counts_remote_servers_apart() {
+        assert_eq!(
+            server_counts(&cfg()),
+            ServerCounts {
+                stdio: 2,
+                wrapped: 0,
+                remote: 1
+            }
+        );
+        let (wrapped, _) = wrap(cfg(), "/abs/innerwarden", true, "cursor");
+        assert_eq!(
+            server_counts(&wrapped),
+            ServerCounts {
+                stdio: 2,
+                wrapped: 2,
+                remote: 1
+            }
+        );
+        let nested = json!({
+            "mcp": {"servers": {"a": {"url": "https://x/mcp"}, "b": {"command": "node"}}},
+            "servers": {"c": {"url": " "}, "d": {"command": "", "url": "https://y"}}
+        });
+        assert_eq!(
+            server_counts(&nested),
+            ServerCounts {
+                stdio: 1,
+                wrapped: 0,
+                remote: 2
+            },
+            "an empty url is not a server; an empty command with a url is remote"
+        );
+        assert_eq!(server_counts(&json!({})), ServerCounts::default());
     }
 
     #[test]
