@@ -198,7 +198,8 @@ describe("the rows", () => {
     const html = render(<ReasonRow reason={reason} href="?view=activity&amp;reason=x" />);
     const outcomes = [...html.matchAll(/data-reason-outcome="([a-z_]+)"/g)].map((match) => match[1]);
     expect(outcomes).toEqual(["refused_before_run", "would_have_refused"]);
-    const text = html.replace(/<[^>]+>/g, "");
+    // The text a reader sees, tags dropped (a test's read, not a sanitizer).
+    const text = html.split(/<[^>]*>/).join("");
     expect(text).toContain("3Refused before it ran");
     expect(text).toContain("500Would have been refused");
     // The row's own mark is the most severe outcome's.
