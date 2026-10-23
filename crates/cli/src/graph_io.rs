@@ -1299,14 +1299,43 @@ pub fn current_outage() -> Option<crate::record_health::Outage> {
     crate::record_health::current()
 }
 
+/// Flags `graph` knows; anything else is refused by name (#223). The
+/// operator flag is peeled off before this runs, as `allow` and `mute` do.
+#[derive(Default, PartialEq, Debug)]
+struct GraphFlags {
+    clear: bool,
+    json: bool,
+    stats: bool,
+}
+
+fn parse_graph_flags(rest: &[String]) -> Result<GraphFlags, String> {
+    let mut flags = GraphFlags::default();
+    for a in rest {
+        match a.as_str() {
+            "--clear" => flags.clear = true,
+            "--json" => flags.json = true,
+            "--stats" => flags.stats = true,
+            other => return Err(format!("unknown flag `{other}` for `graph`")),
+        }
+    }
+    Ok(flags)
+}
+
 pub fn cmd(rest: &[String]) -> std::process::ExitCode {
-    if rest.iter().any(|a| a == "--clear") {
+    let (rest, operator) = crate::suppress_io::split_operator_flag(rest);
+    let flags = match parse_graph_flags(&rest) {
+        Ok(flags) => flags,
+        Err(msg) => {
+            eprintln!("innerwarden graph: {msg}");
+            return std::process::ExitCode::from(2);
+        }
+    };
+    if flags.clear {
         // Clearing erases the record of what AI agents did, so it is the
         // person's, as allowing and muting are (`suppress_io::may_widen`): a
         // terminal, or an operator's script that says so outside an agent's
         // shell. An agent wiping its own trail ran `graph --clear` at risk 0
         // while `rm` of the same file was refused.
-        let (_, operator) = crate::suppress_io::split_operator_flag(rest);
         if !crate::suppress_io::may_widen(operator) {
             eprintln!(
                 "innerwarden graph --clear: refused, no terminal. Clearing erases the record of \
@@ -1327,9 +1356,9 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
         eprintln!("innerwarden: {}", outage.summary());
     }
     let g = load_graph();
-    if rest.iter().any(|a| a == "--json") {
+    if flags.json {
         println!("{}", g.to_json());
-    } else if rest.iter().any(|a| a == "--stats") {
+    } else if flags.stats {
         let s = g.stats();
         println!(
             "innerwarden graph - {} session(s), {} command(s), {} deny verdict(s), {} review verdict(s), {} actually blocked, {} would block",
@@ -3177,5 +3206,33 @@ mod tests {
             })
             .expect("preserved corrupt sibling");
         assert_eq!(std::fs::read(preserved).unwrap(), corrupt);
+    }
+}
+
+#[cfg(test)]
+mod flag_parse_tests {
+    use super::*;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn graph_accepts_its_three_flags() {
+        assert_eq!(parse_graph_flags(&args(&[])).unwrap(), GraphFlags::default());
+        assert_eq!(
+            parse_graph_flags(&args(&["--clear"])).unwrap(),
+            GraphFlags { clear: true, ..Default::default() }
+        );
+        assert_eq!(
+            parse_graph_flags(&args(&["--json", "--stats"])).unwrap(),
+            GraphFlags { json: true, stats: true, ..Default::default() }
+        );
+    }
+
+    #[test]
+    fn graph_refuses_an_unknown_flag_by_name() {
+        let err = parse_graph_flags(&args(&["--bogus"])).unwrap_err();
+        assert!(err.contains("`--bogus`"), "{err}");
     }
 }
