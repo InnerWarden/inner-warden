@@ -11,7 +11,7 @@ use tracing::warn;
 
 /// Derived from https://github.com/Agent-Threat-Rule/agent-threat-rules,
 /// Copyright (c) 2026 ATR Contributors, MIT licensed. See `NOTICE` and
-/// `LICENSE-MIT` at the repository root; the MIT notice has to travel with
+/// `LICENSES/ATR-MIT.txt` (`LICENSE-MIT` at the root until 1.6.2); the MIT notice has to travel with
 /// these files and this is the copy that travels with the embedded corpus.
 ///
 /// The vendored ATR (Agent Threat Rules) corpus, embedded into the binary at

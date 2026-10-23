@@ -1,0 +1,46 @@
+name: Wrong verdict
+description: The guard allows a command it should catch, or flags one it should not.
+labels: ["detection"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        A clear command and the verdict you expected is the most useful report there is. If the command is a working exploit or a bypass of the guard, send it to security@innerwarden.com instead.
+  - type: textarea
+    id: command
+    attributes:
+      label: The command or tool call
+      description: Exactly as the agent would run it.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: verdict
+    attributes:
+      label: What the guard said
+      description: The output of `innerwarden check --json "<command>"`.
+      render: json
+    validations:
+      required: true
+  - type: dropdown
+    id: expected
+    attributes:
+      label: The verdict you expected
+      options:
+        - deny
+        - review
+        - allow
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why
+      description: What the command does, and why that verdict fits.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The output of `innerwarden --version`.
