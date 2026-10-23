@@ -17,6 +17,8 @@ use serde::Serialize;
 pub(crate) const DEFAULT_BIND: &str = "127.0.0.1:8788";
 const AGENT_REFRESH_SECS: u64 = 30;
 const TOKEN_REFRESH_SECS: u64 = 300;
+/// How often the background worker runs the checks a jail needs again.
+const JAIL_CHECK_SECS: u64 = 600;
 
 /// Map a request URL to the embedded asset path: `/` (and any unknown route) →
 /// `index.html` (single-page app), otherwise the leading slash is stripped. Pure.
@@ -792,6 +794,48 @@ fn spawn_agent_refresher(
     Ok(shared)
 }
 
+type SharedJailCheck =
+    std::sync::Arc<std::sync::RwLock<Option<crate::dashboard_community::JailCheck>>>;
+
+/// The jail check before the worker's first answer: none, which the page
+/// reads as "not checked here yet".
+fn jail_check_initial() -> SharedJailCheck {
+    std::sync::Arc::new(std::sync::RwLock::new(None))
+}
+
+/// Run the checks `contain` makes before it builds a jail on a worker of
+/// its own: once at start, then every [`JAIL_CHECK_SECS`]. On Linux a check
+/// can run a helper for a few seconds, so it never runs on a request.
+fn spawn_jail_checker() -> Result<SharedJailCheck, String> {
+    let shared = jail_check_initial();
+    let writer = std::sync::Arc::clone(&shared);
+    std::thread::Builder::new()
+        .name("iw-jail-check".into())
+        .spawn(move || loop {
+            let check = crate::dashboard_community::jail_check(
+                crate::contain_io::jail_start_here(),
+                now_ms(),
+            );
+            match writer.write() {
+                Ok(mut state) => *state = Some(check),
+                Err(poisoned) => *poisoned.into_inner() = Some(check),
+            }
+            std::thread::sleep(std::time::Duration::from_secs(JAIL_CHECK_SECS));
+        })
+        .map_err(|error| format!("starting the jail check: {error}"))?;
+    Ok(shared)
+}
+
+fn read_jail_check(
+    shared: Option<&SharedJailCheck>,
+) -> Option<crate::dashboard_community::JailCheck> {
+    let shared = shared?;
+    match shared.read() {
+        Ok(state) => state.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
+}
+
 fn read_agent_snapshot(shared: &SharedAgentSnapshot) -> AgentSnapshot {
     match shared.read() {
         Ok(snapshot) => snapshot.clone(),
@@ -1269,6 +1313,13 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
                 }
             },
         );
+    let jail_check = match spawn_jail_checker() {
+        Ok(shared) => Some(shared),
+        Err(error) => {
+            eprintln!("innerwarden dashboard: {error}");
+            None
+        }
+    };
     let url = format!("http://{bind}");
     eprintln!("innerwarden dashboard: serving on {url}  (read-only API; Ctrl-C to stop)");
     // The graph and the event log, parsed once per version of each file. The
@@ -1429,10 +1480,28 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
                     second_opinion_provider: crate::second_opinion_io::provider(),
                     suppress: crate::suppress_io::current(),
                     flagged,
+                    jail_check: read_jail_check(jail_check.as_ref()),
                 };
                 request.respond(json_response(
                     crate::dashboard_community::protection_json(&facts).to_string(),
                 ))
+            }
+            "/api/guard/suppress" => {
+                let log = community.log();
+                let (config, dropped) = crate::suppress_io::current_with_ignored();
+                let facts = crate::dashboard_community::SuppressFacts {
+                    now_ms: now_ms(),
+                    exposed,
+                    config: &config,
+                    dropped: &dropped,
+                    log: &log,
+                };
+                request.respond(json_response(
+                    crate::dashboard_community::suppress_json(&facts).to_string(),
+                ))
+            }
+            "/api/guard/sessions" => {
+                request.respond(sessions_response(|| community.graph(), &query, now_ms()))
             }
             // Deprecated: no page of the bundled dashboard calls this since
             // Community's Cases lists `guard/decisions`. Served for one release
@@ -1692,6 +1761,64 @@ fn decisions_body(
             )
         }
         Err(code) => (400, serde_json::json!({ "error": code }).to_string()),
+    }
+}
+
+/// The most sessions one answer lists, and how many when the request does
+/// not say.
+const MAX_SESSIONS_PAGE: usize = 50;
+const DEFAULT_SESSIONS_PAGE: usize = 20;
+
+/// The `limit` of a sessions request: 1 to 50, 20 when absent. Anything else
+/// is refused with a code, never clamped: a clamp would answer a question
+/// the reader did not ask.
+fn sessions_limit(query: &str) -> Result<usize, &'static str> {
+    match query_param(query, "limit") {
+        None => Ok(DEFAULT_SESSIONS_PAGE),
+        Some(limit) => limit
+            .parse::<usize>()
+            .ok()
+            .filter(|limit| (1..=MAX_SESSIONS_PAGE).contains(limit))
+            .ok_or("limit_invalid"),
+    }
+}
+
+/// `GET /api/guard/sessions`, as a status and a body. Pure.
+fn sessions_body(graph: &innerwarden_graph::Graph, query: &str, now_ms: u64) -> (u16, String) {
+    match sessions_limit(query) {
+        Ok(limit) => (
+            200,
+            crate::dashboard_community::sessions_json(
+                &graph.recent_sessions(limit),
+                &graph.record_span(),
+                now_ms,
+            )
+            .to_string(),
+        ),
+        Err(code) => (400, serde_json::json!({ "error": code }).to_string()),
+    }
+}
+
+/// The sessions route's answer: a bad `limit` is a 400 before the record is
+/// read, and a record that cannot be read is the 503 every record route
+/// answers.
+fn sessions_response(
+    graph: impl FnOnce() -> Result<std::sync::Arc<innerwarden_graph::Graph>, graph_io::GraphLoadError>,
+    query: &str,
+    now_ms: u64,
+) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
+    if let Err(code) = sessions_limit(query) {
+        return json_error_response(400, code);
+    }
+    match graph() {
+        Ok(graph) => {
+            let (status, body) = sessions_body(&graph, query, now_ms);
+            json_response(body).with_status_code(status)
+        }
+        Err(error) => {
+            log_graph_unreadable(&error);
+            graph_unreadable_response()
+        }
     }
 }
 
@@ -1990,6 +2117,8 @@ mod tests {
             "/api/guard/decision",
             "/api/guard/history",
             "/api/guard/protection",
+            "/api/guard/suppress",
+            "/api/guard/sessions",
         ] {
             assert!(api_method_is_allowed(path, &tiny_http::Method::Get));
             for method in [
@@ -2028,6 +2157,56 @@ mod tests {
             );
         }
         graph
+    }
+
+    /// A `limit` outside 1 to 50, or not a number, is a 400 with a code;
+    /// none is the default 20.
+    #[test]
+    fn sessions_route_rejects_a_bad_limit_with_a_code() {
+        let graph = decisions_fixture();
+        for query in ["limit=0", "limit=51", "limit=x", "limit=-1", "limit=2.5"] {
+            let (status, body) = sessions_body(&graph, query, 0);
+            assert_eq!(status, 400, "{query}");
+            assert_eq!(body, r#"{"error":"limit_invalid"}"#, "{query}");
+        }
+        for (query, status) in [("", 200), ("limit=1", 200), ("limit=50", 200)] {
+            assert_eq!(sessions_body(&graph, query, 0).0, status, "{query}");
+        }
+        let (_, body) = sessions_body(&graph, "", 0);
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(body["items"].as_array().unwrap().len() <= DEFAULT_SESSIONS_PAGE);
+        assert_eq!(body["schema_version"], 1);
+        // The 400 comes before the record is read.
+        let response = sessions_response(
+            || panic!("the record is not read for a bad limit"),
+            "limit=0",
+            0,
+        );
+        assert_eq!(response.status_code().0, 400);
+    }
+
+    /// A record that cannot be read is the same 503 every record route
+    /// answers, never an empty list.
+    #[test]
+    fn sessions_route_answers_503_on_an_unreadable_record() {
+        let response = sessions_response(|| Err(graph_io::GraphLoadError::Unreadable), "", 0);
+        assert_eq!(response.status_code().0, 503);
+        let response = sessions_response(
+            || Ok(std::sync::Arc::new(decisions_fixture())),
+            "limit=20",
+            0,
+        );
+        assert_eq!(response.status_code().0, 200);
+    }
+
+    /// The jail check starts with no answer: the page says "not checked here
+    /// yet" until the worker's first result. FAILS ON REVERT of the `None`
+    /// initial state.
+    #[test]
+    fn the_jail_check_has_no_answer_before_the_worker_runs() {
+        let shared = jail_check_initial();
+        assert_eq!(read_jail_check(Some(&shared)), None);
+        assert_eq!(read_jail_check(None), None);
     }
 
     #[test]

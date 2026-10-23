@@ -10,13 +10,15 @@
 //! happened and never a command built from parts.
 //!
 //! What this module must never send (and its tests pin): a suppression
-//! pattern, a key, a full path for a project, a raw MCP argument beyond the
-//! redacted summary the record already holds, or anything from another
-//! product's files.
+//! pattern from the event log, a key, a full path for a project, a raw MCP
+//! argument beyond the redacted summary the record already holds, or
+//! anything from another product's files. The current allow and mute list is
+//! served by one route only (`suppress_json`), each pattern redacted, and
+//! withheld whole when the dashboard is open to the network.
 
 use innerwarden_graph::{
     DecisionBrief, DecisionCursor, DecisionDetail, DecisionRecord, DecisionsPage, RecordSpan,
-    SessionFacts, Tally, TALLY_KEYS,
+    SessionFacts, SessionSummary, Tally, TALLY_KEYS,
 };
 use serde_json::{json, Map, Value};
 
@@ -29,6 +31,9 @@ const DAY_MS: u64 = 86_400_000;
 pub(crate) const LANE_WINDOW_MS: u64 = 7 * DAY_MS;
 /// The event log's refusals, week by week, at most this many weeks back.
 const MAX_WEEKS: u64 = 26;
+/// The event log's refusals, day by day (UTC), this many days back, today
+/// included.
+const DAYS_SHOWN: u64 = 14;
 /// A message's text is cut to this many characters before it is served.
 const MESSAGE_DETAIL_MAX: usize = 240;
 /// A lane card's newest item names at most this much of its command.
@@ -227,6 +232,9 @@ pub(crate) fn record_json(span: &RecordSpan) -> Value {
     object.insert("checked".into(), json!(span.checked));
     opt(&mut object, "oldest_at", span.oldest_at_ms.map(rfc3339));
     opt(&mut object, "newest_at", span.newest_at_ms.map(rfc3339));
+    // The record holds as many decisions as it keeps: the oldest are dropped
+    // as new ones arrive, so every count above is of the newest part.
+    object.insert("capped".into(), json!(span.capped));
     Value::Object(object)
 }
 
@@ -269,6 +277,9 @@ pub(crate) struct EventLog {
     /// Newest first.
     pub attempts: Vec<Attempt>,
     pub suppression_changes: usize,
+    /// Seconds since the epoch of the newest change to the allow and mute
+    /// list. The change is counted; what it changed is never kept.
+    pub suppression_last_ts: Option<u64>,
     /// What people decided about agents (`guard.agent_decision`), as served,
     /// newest first. Empty on every log written without the verbs.
     pub agent_decisions: Vec<Value>,
@@ -334,7 +345,11 @@ pub(crate) fn parse_event_log(text: &str) -> EventLog {
                 Some("would_block") => log.would_block.push(ts),
                 _ => {}
             },
-            Some("guard.suppression_changed") => log.suppression_changes += 1,
+            Some("guard.suppression_changed") => {
+                log.suppression_changes += 1;
+                log.suppression_last_ts =
+                    Some(log.suppression_last_ts.map_or(ts, |last| last.max(ts)));
+            }
             Some("guard.agent_decision") => {
                 if let Some(line) = agent_decision_line(&record, ts) {
                     decisions.push((ts, line));
@@ -568,6 +583,34 @@ pub(crate) fn history_json(log: &EventLog, now_ms: u64) -> Value {
             monday += 7;
         }
     }
+    // The same refusals, day by day over the last two weeks (UTC), oldest
+    // first, today partial. Only from a log that was read: a log that could
+    // not be read has no days, never fourteen zeros.
+    let days: Option<Vec<Value>> = log.readable.then(|| {
+        let today = now_ms / DAY_MS;
+        (0..DAYS_SHOWN)
+            .rev()
+            .filter_map(|back| today.checked_sub(back))
+            .map(|day| {
+                let start_ms = day * DAY_MS;
+                let end_ms = start_ms + DAY_MS;
+                let within = |ts: &u64| {
+                    let ms = ts.saturating_mul(1_000);
+                    ms >= start_ms && ms < end_ms
+                };
+                let (year, month, date) = civil_from_days(day as i64);
+                let mut entry = json!({
+                    "date": format!("{year:04}-{month:02}-{date:02}"),
+                    "blocked": log.blocked.iter().filter(|ts| within(ts)).count(),
+                    "would_block": log.would_block.iter().filter(|ts| within(ts)).count(),
+                });
+                if day == today {
+                    entry["partial"] = json!(true);
+                }
+                entry
+            })
+            .collect()
+    });
     let window_start = now_ms.saturating_sub(LANE_WINDOW_MS) / 1_000;
     let mut messages = Map::new();
     messages.insert("recorded".into(), json!(log.attempts.len()));
@@ -595,14 +638,15 @@ pub(crate) fn history_json(log: &EventLog, now_ms: u64) -> Value {
         log.earliest_ts.map(|ts| rfc3339(ts * 1_000)),
     );
     object.insert("unparsable_lines".into(), json!(log.unparsable_lines));
-    object.insert(
-        "refusals".into(),
-        json!({
-            "blocked": log.blocked.len(),
-            "would_block": log.would_block.len(),
-            "weeks": weeks,
-        }),
-    );
+    let mut refusals = json!({
+        "blocked": log.blocked.len(),
+        "would_block": log.would_block.len(),
+        "weeks": weeks,
+    });
+    if let Some(days) = days {
+        refusals["days"] = json!(days);
+    }
+    object.insert("refusals".into(), refusals);
     object.insert("messages".into(), Value::Object(messages));
     object.insert("suppression_changes".into(), json!(log.suppression_changes));
     // Only where the log holds one: a history without them is what it was.
@@ -1390,7 +1434,47 @@ pub(crate) fn reason_body(words: &str) -> &str {
     rest
 }
 
-fn reason_short(record_rules: &[String], words: &str) -> String {
+/// The short words for a reason whose telling clause is an argument that
+/// came from a tool's output (`taint_clause`).
+const TOOL_OUTPUT_SHORT: &str = "A value came from a tool's output";
+
+/// The value and the tool named by a clause the hook writes when one of a
+/// command's arguments arrived in a tool's result (`apply_taint` in this
+/// crate): "argument `<value>` did not come from you: it arrived in a result
+/// from <tool> earlier in this session". The CLI reading its own format. A
+/// clause the record cut short still names its value; its tool may be cut.
+pub(crate) fn taint_clause(clause: &str) -> Option<(&str, &str)> {
+    let rest = clause.trim().strip_prefix("argument `")?;
+    let (value, rest) = rest.split_once("` did not come from you: it arrived in a result from ")?;
+    let tool = rest
+        .split(" earlier in this session")
+        .next()
+        .unwrap_or("")
+        .trim_end_matches('\u{2026}')
+        .trim();
+    (!value.is_empty() && !tool.is_empty()).then_some((value, tool))
+}
+
+/// The clause a reason is worded by: its first, unless the first only says
+/// that no rule matched and another clause follows it. "No rule matched" is
+/// then not why the command was flagged; the clause after it is.
+fn telling_clause<'a>(words: &'a str, explanation: &'a str) -> &'a str {
+    if reason_body(words).trim() != innerwarden_agent_guard::mcp::NO_MATCH_EXPLANATION {
+        return words;
+    }
+    explanation
+        .split("; ")
+        .skip(1)
+        .map(str::trim)
+        .find(|clause| !clause.is_empty())
+        .unwrap_or(words)
+}
+
+fn reason_short(record_rules: &[String], words: &str, explanation: &str) -> String {
+    let words = telling_clause(words, explanation);
+    if taint_clause(words).is_some() {
+        return TOOL_OUTPUT_SHORT.to_string();
+    }
     let rule = primary_rule(record_rules, words);
     rule.and_then(concern::short_words)
         .map(str::to_string)
@@ -1401,7 +1485,14 @@ fn reason_short(record_rules: &[String], words: &str) -> String {
 /// The detail after a reason's colon ("reads sensitive credential path:
 /// `.ssh/`" gives `.ssh/`), cut short, for telling two reasons with the same
 /// few words apart on a touch screen, where a hover title cannot be reached.
-fn reason_detail(words: &str) -> Option<String> {
+fn reason_detail(words: &str, explanation: &str) -> Option<String> {
+    let words = telling_clause(words, explanation);
+    if let Some((value, tool)) = taint_clause(words) {
+        return Some(concern::cut_words(
+            &revealed(&format!("{value} from {tool}")),
+            24,
+        ));
+    }
     let (_, detail) = reason_body(words).split_once(": ")?;
     let detail = detail.replace('`', "");
     let detail = detail.trim();
@@ -1461,7 +1552,7 @@ pub(crate) fn decision_view(record: &DecisionRecord, suppress: &SuppressConfig) 
         json!({
             "key": record.reason_key,
             "words": revealed(&record.reason_words),
-            "short": reason_short(&record.rules, &record.reason_words),
+            "short": reason_short(&record.rules, &record.reason_words, &record.explanation),
         }),
     );
     object.insert("reasons_more".into(), json!(record.reasons_more));
@@ -1567,7 +1658,7 @@ pub(crate) fn decisions_json(
     let mut shorts: Vec<String> = page
         .reasons
         .iter()
-        .map(|reason| reason_short(&reason.rules, &reason.words))
+        .map(|reason| reason_short(&reason.rules, &reason.words, &reason.explanation))
         .collect();
     // Records older than rule ids are grouped by their whole wording, so two
     // groups can share a short label ("credential path" for `.ssh/` and for
@@ -1578,7 +1669,7 @@ pub(crate) fn decisions_json(
         .collect();
     for (index, reason) in page.reasons.iter().enumerate() {
         if duplicated[index] {
-            if let Some(detail) = reason_detail(&reason.words) {
+            if let Some(detail) = reason_detail(&reason.words, &reason.explanation) {
                 shorts[index] = format!("{}: {detail}", shorts[index]);
             }
         }
@@ -1592,7 +1683,13 @@ pub(crate) fn decisions_json(
             object.insert("key".into(), json!(reason.key));
             object.insert("words".into(), json!(revealed(&reason.words)));
             object.insert("short".into(), json!(short));
+            opt(
+                &mut object,
+                "detail",
+                reason_detail(&reason.words, &reason.explanation),
+            );
             object.insert("count".into(), json!(reason.count));
+            object.insert("by_outcome".into(), json!(reason.by_outcome));
             if let [only] = reason.rules.as_slice() {
                 if concern::is_mutable_rule(only) {
                     object.insert("mute".into(), json!(format!("innerwarden mute {only}")));
@@ -1740,6 +1837,48 @@ pub(crate) struct ProtectionFacts {
     pub suppress: SuppressConfig,
     /// `None` when the decision record could not be read: no row says a count.
     pub flagged: Option<FlaggedConcerns>,
+    /// Whether a jail starts here, from the checks `contain` runs, made on the
+    /// dashboard's background worker. `None` until its first result.
+    pub jail_check: Option<JailCheck>,
+}
+
+/// The most lines of advice the jail check serves.
+pub(crate) const MAX_JAIL_ADVICE: usize = 6;
+/// The longest line of advice the jail check serves.
+const JAIL_ADVICE_MAX: usize = 400;
+
+/// What the checks `contain` runs before it builds a jail said, and when.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct JailCheck {
+    pub passes: bool,
+    /// The lines `contain` prints when a check stops it, at most
+    /// [`MAX_JAIL_ADVICE`]. Empty when the checks pass.
+    pub advice: Vec<String>,
+    pub checked_at_ms: u64,
+}
+
+/// A jail check from `contain_io::jail_start_here`'s answer: no backend it
+/// trusts is a check that does not pass (and says nothing more), the lines
+/// it stops on are the advice, as the CLI words them.
+pub(crate) fn jail_check(result: Option<Result<(), Vec<String>>>, now_ms: u64) -> JailCheck {
+    let (passes, advice) = match result {
+        Some(Ok(())) => (true, Vec::new()),
+        Some(Err(lines)) => (
+            false,
+            lines
+                .iter()
+                .map(|line| one_line(&revealed(line), JAIL_ADVICE_MAX))
+                .filter(|line| !line.is_empty())
+                .take(MAX_JAIL_ADVICE)
+                .collect(),
+        ),
+        None => (false, Vec::new()),
+    };
+    JailCheck {
+        passes,
+        advice,
+        checked_at_ms: now_ms,
+    }
 }
 
 /// `GET /api/guard/protection`.
@@ -1762,6 +1901,27 @@ pub(crate) fn protection_json(facts: &ProtectionFacts) -> Value {
     let mut jail = Map::new();
     jail.insert("available".into(), json!(facts.jail_backend.is_some()));
     opt(&mut jail, "backend", facts.jail_backend);
+    // `null` until the background check has an answer: "not checked here
+    // yet" is never "ready", and never "does not start".
+    jail.insert(
+        "checks_pass".into(),
+        json!(facts.jail_check.as_ref().map(|check| check.passes)),
+    );
+    jail.insert(
+        "advice".into(),
+        json!(facts
+            .jail_check
+            .as_ref()
+            .map(|check| check.advice.clone())
+            .unwrap_or_default()),
+    );
+    jail.insert(
+        "checked_at".into(),
+        json!(facts
+            .jail_check
+            .as_ref()
+            .map(|check| rfc3339(check.checked_at_ms))),
+    );
     let mut second = Map::new();
     second.insert(
         "configured".into(),
@@ -1795,6 +1955,265 @@ pub(crate) fn protection_json(facts: &ProtectionFacts) -> Value {
         body["flagged"] = Value::Object(counts);
     }
     body
+}
+
+// ---------------------------------------------------------------------------
+// Exceptions: the allow and mute list
+// ---------------------------------------------------------------------------
+
+/// The most entries each exceptions list serves; the rest are counted.
+pub(crate) const MAX_SUPPRESS_ENTRIES: usize = 200;
+/// The bytes the exceptions lists may take together. An entry past this is
+/// counted in `more`, never cut, so the whole answer stays small however
+/// long the patterns are.
+const SUPPRESS_LIST_BUDGET: usize = 34_000;
+/// The longest pattern served whole. A longer one is served cut, marked
+/// `shortened`, and offers no remove step (the cut text matches nothing).
+const SUPPRESS_PATTERN_MAX: usize = 400;
+
+/// What the exceptions route reads: the list as it is applied, the allow
+/// patterns the file holds that are ignored, the event log for the count of
+/// changes, and whether the dashboard is open to the network.
+pub(crate) struct SuppressFacts<'a> {
+    pub now_ms: u64,
+    pub exposed: bool,
+    pub config: &'a SuppressConfig,
+    /// Allow patterns in the file that match every command, so the guard
+    /// ignores them.
+    pub dropped: &'a [String],
+    pub log: &'a EventLog,
+}
+
+/// A list entry's text, as it may be shown: secrets redacted first, then
+/// every hidden character written out, then cut when very long. Returns the
+/// text, and whether it was redacted, had a hidden character, or was cut.
+fn shown_pattern(raw: &str) -> (String, bool, bool, bool) {
+    let redaction = innerwarden_agent_guard::redact::redact_secrets(raw);
+    let (text, hidden) = reveal_hidden(&redaction.text);
+    if text.chars().count() <= SUPPRESS_PATTERN_MAX {
+        return (text, redaction.count > 0, hidden, false);
+    }
+    let head: String = text.chars().take(SUPPRESS_PATTERN_MAX - 1).collect();
+    (format!("{head}\u{2026}"), redaction.count > 0, hidden, true)
+}
+
+/// A rule id or a category as a shell word: bare when it is one already,
+/// quoted otherwise.
+fn shell_word(text: &str) -> String {
+    if !text.is_empty()
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':'))
+    {
+        text.to_string()
+    } else {
+        shell_quote(text)
+    }
+}
+
+/// Fill one list from `entries` while it is under [`MAX_SUPPRESS_ENTRIES`]
+/// and the shared byte budget lasts. Returns how many were left out.
+fn fill_list(
+    entries: impl Iterator<Item = Value>,
+    total: usize,
+    used: &mut usize,
+) -> (Vec<Value>, usize) {
+    let mut list = Vec::new();
+    for entry in entries {
+        if list.len() >= MAX_SUPPRESS_ENTRIES {
+            break;
+        }
+        let size = entry.to_string().len() + 1;
+        if *used + size > SUPPRESS_LIST_BUDGET {
+            break;
+        }
+        *used += size;
+        list.push(entry);
+    }
+    let left = total - list.len();
+    (list, left)
+}
+
+/// `GET /api/guard/suppress`: the allow and mute list, so a person can see
+/// what is let through and how to take it back.
+///
+/// Every pattern passes `redact_secrets`, then `reveal_hidden`. A pattern
+/// that was redacted, has a hidden character or was cut has no remove step:
+/// the text shown is not the text in the file, so a step built from it would
+/// remove nothing. With the dashboard open to the network every list is
+/// withheld and only the counts are served. Changes are counted from the
+/// event log; no pattern is ever read from it.
+pub(crate) fn suppress_json(facts: &SuppressFacts<'_>) -> Value {
+    let config = facts.config;
+    let withheld = facts.exposed;
+    let mut used = 0usize;
+    let allow_entries = config.allow.iter().map(|raw| {
+        let (pattern, redacted, hidden, cut) = shown_pattern(raw);
+        let mut entry = Map::new();
+        entry.insert("pattern".into(), json!(pattern));
+        entry.insert(
+            "warning".into(),
+            json!(crate::suppress::is_unanchored_pattern(raw).then_some("unanchored")),
+        );
+        entry.insert("redacted".into(), json!(redacted));
+        entry.insert("hidden_characters".into(), json!(hidden));
+        if cut {
+            entry.insert("shortened".into(), json!(true));
+        }
+        if !redacted && !hidden && !cut && !raw.contains('\n') {
+            entry.insert(
+                "remove".into(),
+                step(
+                    "To remove it:",
+                    Some(format!("innerwarden allow --remove {}", shell_quote(raw))),
+                    "Commands it matches are judged by the rules again.",
+                ),
+            );
+        }
+        Value::Object(entry)
+    });
+    let dropped_entries = facts
+        .dropped
+        .iter()
+        .map(|raw| json!({ "pattern": shown_pattern(raw).0, "why": "universal" }));
+    let mute_entry = |raw: &String, kind: &str| {
+        let (id, redacted, hidden, cut) = shown_pattern(raw);
+        let mut entry = Map::new();
+        entry.insert("id".into(), json!(id));
+        if kind == "rule" {
+            entry.insert("title".into(), json!(concern::atr_short_words(raw)));
+        }
+        if !redacted && !hidden && !cut && !raw.contains('\n') {
+            entry.insert(
+                "remove".into(),
+                step(
+                    "To remove it:",
+                    Some(format!("innerwarden mute --remove {}", shell_word(raw))),
+                    if kind == "rule" {
+                        "The rule counts against a command again."
+                    } else {
+                        "The category counts against a command again."
+                    },
+                ),
+            );
+        }
+        Value::Object(entry)
+    };
+    let (allow, allow_more, dropped, rules, rules_more, categories, categories_more) = if withheld {
+        (
+            Vec::new(),
+            config.allow.len(),
+            Vec::new(),
+            Vec::new(),
+            config.mute_rules.len(),
+            Vec::new(),
+            config.mute_categories.len(),
+        )
+    } else {
+        let (allow, allow_more) = fill_list(allow_entries, config.allow.len(), &mut used);
+        let (dropped, _) = fill_list(dropped_entries, facts.dropped.len(), &mut used);
+        let (rules, rules_more) = fill_list(
+            config.mute_rules.iter().map(|raw| mute_entry(raw, "rule")),
+            config.mute_rules.len(),
+            &mut used,
+        );
+        let (categories, categories_more) = fill_list(
+            config
+                .mute_categories
+                .iter()
+                .map(|raw| mute_entry(raw, "category")),
+            config.mute_categories.len(),
+            &mut used,
+        );
+        (
+            allow,
+            allow_more,
+            dropped,
+            rules,
+            rules_more,
+            categories,
+            categories_more,
+        )
+    };
+    let log = facts.log;
+    json!({
+        "schema_version": SCHEMA_VERSION,
+        "generated_at_ms": facts.now_ms,
+        "withheld": withheld.then_some("exposed"),
+        "counts": suppress_counts_json(config),
+        "allow": allow,
+        "dropped": dropped,
+        "mute_rules": rules,
+        "mute_categories": categories,
+        "more": {
+            "allow": allow_more,
+            "mute_rules": rules_more,
+            "mute_categories": categories_more,
+        },
+        "changes": {
+            "count": log.readable.then_some(log.suppression_changes),
+            "since": log.earliest_ts.filter(|_| log.readable).map(|ts| rfc3339(ts * 1_000)),
+            "last_at": log
+                .suppression_last_ts
+                .filter(|_| log.readable)
+                .map(|ts| rfc3339(ts * 1_000)),
+        },
+        "list_steps": {
+            "allow": step(
+                "To see every allow pattern:",
+                Some("innerwarden allow --list".into()),
+                "Prints the whole list in your terminal.",
+            ),
+            "mute": step(
+                "To see every muted rule and category:",
+                Some("innerwarden mute --list".into()),
+                "Prints the whole list in your terminal.",
+            ),
+        },
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Sessions
+// ---------------------------------------------------------------------------
+
+/// The longest folder name a session row serves.
+const SESSION_PROJECT_MAX: usize = 80;
+
+/// `GET /api/guard/sessions`: the sessions with decisions in the record,
+/// newest first, each counted the way a page filtered to it counts it.
+pub(crate) fn sessions_json(
+    sessions: &[SessionSummary],
+    record: &RecordSpan,
+    now_ms: u64,
+) -> Value {
+    let items: Vec<Value> = sessions
+        .iter()
+        .map(|session| {
+            let facts = &session.facts;
+            json!({
+                "id": session.id,
+                "agent": facts.agent.as_deref().map(agent_name),
+                "agent_id": facts.agent,
+                "channel": facts.channel,
+                "project": facts
+                    .project
+                    .as_deref()
+                    .map(|project| one_line(&revealed(project), SESSION_PROJECT_MAX)),
+                "first_at": facts.first_at_ms.map(rfc3339),
+                "last_at": facts.last_at_ms.map(rfc3339),
+                "decisions": facts.decisions,
+                "flagged": facts.flagged,
+                "by_outcome": session.by_outcome,
+            })
+        })
+        .collect();
+    json!({
+        "schema_version": SCHEMA_VERSION,
+        "generated_at_ms": now_ms,
+        "record": record_json(record),
+        "items": items,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2858,13 +3277,15 @@ mod tests {
         assert_eq!(
             reason_short(
                 &[],
-                "[ATR-2026-099] HIGH: Agent attempting to invoke a tool"
+                "[ATR-2026-099] HIGH: Agent attempting to invoke a tool",
+                ""
             ),
             "Agent attempting to invoke a tool"
         );
         let atr = reason_short(
             &["ATR-2026-099".to_string()],
             "[ATR-2026-099] high-risk tool called without a confirmation step",
+            "",
         );
         assert!(!atr.contains("[ATR"), "{atr}");
         assert!(atr.starts_with("high-risk tool"), "{atr}");
@@ -2922,6 +3343,7 @@ mod tests {
                 mute_categories: vec![],
             },
             flagged: None,
+            jail_check: None,
         };
         let body = protection_json(&facts);
         let text = body.to_string();
@@ -2933,7 +3355,13 @@ mod tests {
         );
         assert_eq!(
             body["jail"],
-            json!({"available": true, "backend": "sandbox-exec"})
+            json!({
+                "available": true,
+                "backend": "sandbox-exec",
+                "checks_pass": null,
+                "advice": [],
+                "checked_at": null,
+            })
         );
         assert!(body["record"].get("since").is_none());
         // Messages cannot be recorded here: no OpenClaw config.
@@ -3004,6 +3432,7 @@ mod tests {
             second_opinion_provider: None,
             suppress: SuppressConfig::default(),
             flagged: Some(counts),
+            jail_check: None,
         };
         let body = protection_json(&facts);
         assert_eq!(body["flagged"]["ran"], 2);
@@ -3581,5 +4010,541 @@ mod tests {
         assert_eq!(out["agents"][1]["parts_disjoint"], false);
         assert_eq!(out["agents"][2]["parts_disjoint"], false);
         assert_eq!(token_intelligence_with_parts("not json"), "not json");
+    }
+
+    // -----------------------------------------------------------------------
+    // Dashboard v2: history days, record cap, reason words, jail checks,
+    // exceptions and sessions
+    // -----------------------------------------------------------------------
+
+    /// A log with one refusal a day over three weeks before `NOW`, and a
+    /// would-be refusal every third day.
+    fn daily_log_text() -> String {
+        let now_s = NOW / 1_000;
+        (0..21u64)
+            .flat_map(|back| {
+                let ts = now_s - back * 86_400;
+                let mut lines = vec![
+                    json!({"kind": "guard.blocked", "ts": ts, "outcome": "blocked"}).to_string(),
+                ];
+                if back % 3 == 0 {
+                    lines.push(
+                        json!({"kind": "guard.blocked", "ts": ts - 60, "outcome": "would_block"})
+                            .to_string(),
+                    );
+                }
+                lines
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Fourteen UTC days, oldest first, ending today, which says it is not
+    /// over. FAILS ON REVERT of the order: the newest would come first.
+    #[test]
+    fn history_days_cover_fourteen_utc_days_oldest_first() {
+        let history = history_json(&parse_event_log(&daily_log_text()), NOW);
+        let days = history["refusals"]["days"].as_array().expect("days");
+        assert_eq!(days.len(), 14);
+        assert_eq!(days[0]["date"], "2026-09-08");
+        assert_eq!(days[13]["date"], "2026-09-21");
+        assert_eq!(days[13]["partial"], true);
+        assert!(days[..13].iter().all(|day| day.get("partial").is_none()));
+        for pair in days.windows(2) {
+            assert!(pair[0]["date"].as_str() < pair[1]["date"].as_str());
+        }
+        assert!(days.iter().all(|day| day["blocked"] == 1));
+        // An empty log that was read is fourteen real zeros.
+        let empty = history_json(&parse_event_log(""), NOW);
+        let days = empty["refusals"]["days"].as_array().expect("days");
+        assert_eq!(days.len(), 14);
+        assert!(days
+            .iter()
+            .all(|day| day["blocked"] == 0 && day["would_block"] == 0));
+    }
+
+    /// The date `days` after `date`, both `YYYY-MM-DD`.
+    fn add_days(date: &str, days: i64) -> String {
+        let parts: Vec<i64> = date.split('-').map(|p| p.parse().unwrap()).collect();
+        let (y, m, d) = (parts[0], parts[1], parts[2]);
+        // Days from civil, the inverse of `civil_from_days`.
+        let y = if m <= 2 { y - 1 } else { y };
+        let era = if y >= 0 { y } else { y - 399 } / 400;
+        let yoe = y - era * 400;
+        let mp = (m + 9) % 12;
+        let doy = (153 * mp + 2) / 5 + d - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        let n = era * 146_097 + doe - 719_468 + days;
+        let (year, month, day) = civil_from_days(n);
+        format!("{year:04}-{month:02}-{day:02}")
+    }
+
+    /// Over every week the fourteen days hold whole, the days add up to the
+    /// week, and over the whole span to the refusals the log holds there.
+    #[test]
+    fn history_days_sum_to_the_weeks_over_the_same_span() {
+        let log = parse_event_log(&daily_log_text());
+        let history = history_json(&log, NOW);
+        let days = history["refusals"]["days"].as_array().unwrap();
+        let weeks = history["refusals"]["weeks"].as_array().unwrap();
+        let first = days[0]["date"].as_str().unwrap().to_string();
+        let last = days[13]["date"].as_str().unwrap().to_string();
+        let mut whole = 0;
+        for week in weeks {
+            let start = week["start"].as_str().unwrap();
+            if start < first.as_str() || add_days(start, 6) > last {
+                continue;
+            }
+            whole += 1;
+            let end = add_days(start, 7);
+            let in_week: Vec<&Value> = days
+                .iter()
+                .filter(|day| {
+                    let date = day["date"].as_str().unwrap();
+                    date >= start && date < end.as_str()
+                })
+                .collect();
+            assert_eq!(in_week.len(), 7, "{start}");
+            for key in ["blocked", "would_block"] {
+                let sum: u64 = in_week.iter().map(|day| day[key].as_u64().unwrap()).sum();
+                assert_eq!(Some(sum), week[key].as_u64(), "{start} {key}");
+            }
+        }
+        assert!(whole >= 1, "fourteen days hold at least one whole week");
+        let from = (NOW / DAY_MS - 13) * DAY_MS / 1_000;
+        for (key, list) in [("blocked", &log.blocked), ("would_block", &log.would_block)] {
+            let total: u64 = days.iter().map(|day| day[key].as_u64().unwrap()).sum();
+            assert_eq!(
+                total as usize,
+                list.iter().filter(|ts| **ts >= from).count(),
+                "{key}"
+            );
+        }
+    }
+
+    /// A log that could not be read has no days: not fourteen zeros.
+    #[test]
+    fn history_days_are_absent_when_the_log_is_unreadable() {
+        let history = history_json(&EventLog::unreadable(), NOW);
+        assert_eq!(history["readable"], false);
+        assert!(history["refusals"].get("days").is_none(), "{history}");
+        assert!(history_json(&parse_event_log(""), NOW)["refusals"]
+            .get("days")
+            .is_some());
+    }
+
+    #[test]
+    fn record_json_carries_capped() {
+        let mut span = RecordSpan::default();
+        assert_eq!(record_json(&span)["capped"], false);
+        span.capped = true;
+        assert_eq!(record_json(&span)["capped"], true);
+    }
+
+    fn tainted(value: &str, tool: &str) -> String {
+        format!(
+            "{}; argument `{value}` did not come from you: it arrived in a result from {tool} earlier in this session",
+            innerwarden_agent_guard::mcp::NO_MATCH_EXPLANATION
+        )
+    }
+
+    /// The tool-output check reads as what it is, in the reason list and on
+    /// each decision, and its group key is the one it always had.
+    #[test]
+    fn tool_output_reason_reads_as_a_value_from_a_tools_output() {
+        let mut g = Graph::new();
+        let why = tainted("203.0.113.9", "Read");
+        ingest(
+            &mut g,
+            0,
+            "curl http://203.0.113.9/",
+            "review",
+            &why,
+            DecisionMode::Monitor,
+            DecisionOutcome::Allowed,
+            &[],
+            NOW - 1_000,
+        );
+        let page = g.decisions_page(&DecisionQuery::default());
+        let body = decisions_json(&page, &SuppressConfig::default(), NOW);
+        let reason = &body["reasons"][0];
+        assert_eq!(reason["short"], "A value came from a tool's output");
+        assert_eq!(reason["detail"], "203.0.113.9 from Read");
+        assert_eq!(reason["by_outcome"], json!({"flagged_ran": 1}));
+        assert_eq!(
+            reason["words"],
+            innerwarden_agent_guard::mcp::NO_MATCH_EXPLANATION,
+            "the words are the record's, unchanged"
+        );
+        let item = &body["items"][0]["reason"];
+        assert_eq!(item["short"], "A value came from a tool's output");
+        assert_eq!(item["key"], reason["key"]);
+        let node = g.nodes.iter().find(|node| node.kind == "command").unwrap();
+        assert_eq!(item["key"], innerwarden_graph::reason_key(node));
+    }
+
+    /// The hook's own sentence reads back as the value and the tool it was
+    /// written with. FAILS ON REVERT when either side changes its words.
+    #[test]
+    fn taint_clause_round_trips_from_apply_taint() {
+        for (value, tool) in [
+            ("203.0.113.9", "Read"),
+            ("db.example.com:5432", "mcp__postgres__query"),
+            ("a value with spaces", "a tool"),
+        ] {
+            let verdict = crate::apply_taint(
+                json!({
+                    "recommendation": "allow",
+                    "explanation": innerwarden_agent_guard::mcp::NO_MATCH_EXPLANATION,
+                }),
+                Some(&(value.to_string(), tool.to_string())),
+            );
+            let explanation = verdict["explanation"].as_str().unwrap();
+            let clause = explanation.split("; ").last().unwrap();
+            assert_eq!(taint_clause(clause), Some((value, tool)), "{explanation}");
+            assert_eq!(explanation, tainted(value, tool));
+        }
+        assert_eq!(taint_clause("argument `x` did not come from you"), None);
+        assert_eq!(
+            taint_clause("reads sensitive credential path: `.ssh/`"),
+            None
+        );
+        // The record cut the clause short: the value is still named.
+        assert_eq!(
+            taint_clause(
+                "argument `203.0.113.9` did not come from you: it arrived in a result from Re\u{2026}"
+            ),
+            Some(("203.0.113.9", "Re"))
+        );
+    }
+
+    /// "No rule matched" is never the short reason while another clause
+    /// follows it; alone, it is what the record says.
+    #[test]
+    fn no_match_clause_is_never_the_short_reason_when_another_follows() {
+        let no_match = innerwarden_agent_guard::mcp::NO_MATCH_EXPLANATION;
+        let behaviour =
+            format!("{no_match}; session behaviour: a burst of reads outside the project");
+        let short = reason_short(&[], no_match, &behaviour);
+        assert!(!short.contains("no rule matched"), "{short}");
+        assert!(short.starts_with("session behaviour"), "{short}");
+        let short = reason_short(&[], no_match, &tainted("x", "Bash"));
+        assert_eq!(short, "A value came from a tool's output");
+        // Alone, the clause is kept as the record wrote it.
+        let alone = reason_short(&[], no_match, no_match);
+        assert!(alone.starts_with("no rule matched"), "{alone}");
+        // Another first clause is never replaced.
+        let other = reason_short(
+            &[],
+            "reads sensitive credential path: `.ssh/`",
+            "reads sensitive credential path: `.ssh/`; dangerous command: cat",
+        );
+        assert!(!other.contains("dangerous"), "{other}");
+    }
+
+    fn protection_facts(jail_check: Option<JailCheck>) -> ProtectionFacts {
+        ProtectionFacts {
+            now_ms: NOW,
+            os: "linux",
+            recording: true,
+            outage_since_unix: None,
+            lost_actions: None,
+            jail_backend: Some("bwrap"),
+            observe_installed: false,
+            openclaw_present: false,
+            alert_channels: 2,
+            second_opinion_provider: None,
+            suppress: SuppressConfig::default(),
+            flagged: None,
+            jail_check,
+        }
+    }
+
+    /// Before the background check answers, the jail is not checked: never
+    /// ready, never failing. FAILS ON REVERT of the `null` initial state.
+    #[test]
+    fn protection_jail_checks_pass_is_null_until_checked() {
+        let body = protection_json(&protection_facts(None));
+        assert_eq!(body["jail"]["checks_pass"], Value::Null);
+        assert_eq!(body["jail"]["checked_at"], Value::Null);
+        assert_eq!(body["jail"]["advice"], json!([]));
+        assert_eq!(body["jail"]["available"], true);
+        let checked = protection_json(&protection_facts(Some(jail_check(
+            Some(Ok(())),
+            NOW - 60_000,
+        ))));
+        assert_eq!(checked["jail"]["checks_pass"], true);
+        assert_eq!(checked["jail"]["checked_at"], rfc3339(NOW - 60_000));
+        let none = jail_check(None, NOW);
+        assert!(!none.passes && none.advice.is_empty());
+    }
+
+    /// The advice is the CLI's own lines, at most six, each one line.
+    #[test]
+    fn protection_jail_advice_is_the_cli_words_and_bounded() {
+        let lines: Vec<String> = (0..9)
+            .map(|n| format!("  step {n}: run the command\n  that fixes it"))
+            .collect();
+        let check = jail_check(Some(Err(lines)), NOW);
+        assert!(!check.passes);
+        assert_eq!(check.advice.len(), MAX_JAIL_ADVICE);
+        assert_eq!(check.advice[0], "step 0: run the command that fixes it");
+        let long = jail_check(Some(Err(vec!["x".repeat(2_000)])), NOW);
+        assert!(long.advice[0].chars().count() <= 400);
+        let body = protection_json(&protection_facts(Some(check)));
+        assert_eq!(body["jail"]["checks_pass"], false);
+        assert_eq!(body["jail"]["advice"].as_array().unwrap().len(), 6);
+    }
+
+    /// Alerts are a count: no channel name, address or kind (CJC-090-J012).
+    #[test]
+    fn protection_json_serves_no_channel_name() {
+        let body = protection_json(&protection_facts(None));
+        assert_eq!(body["alerts"], json!({"channels": 2}));
+        let text = body.to_string().to_lowercase();
+        for name in ["telegram", "slack", "webhook", "discord", "http"] {
+            assert!(!text.contains(name), "{name} in {text}");
+        }
+    }
+
+    fn suppress_config() -> SuppressConfig {
+        SuppressConfig {
+            allow: vec![
+                "npm run * --silent".into(),
+                "* | bash".into(),
+                "deploy --token=correct-horse-battery-staple".into(),
+                "git status\u{200B}".into(),
+                "echo it's fine".into(),
+            ],
+            mute_rules: vec!["ATR-2026-030".into()],
+            mute_categories: vec!["data-poisoning".into()],
+        }
+    }
+
+    fn suppress_body(config: &SuppressConfig, exposed: bool, log: &EventLog) -> Value {
+        suppress_json(&SuppressFacts {
+            now_ms: NOW,
+            exposed,
+            config,
+            dropped: &["*".to_string()],
+            log,
+        })
+    }
+
+    fn allow_entry<'a>(body: &'a Value, starts: &str) -> &'a Value {
+        body["allow"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["pattern"].as_str().unwrap().starts_with(starts))
+            .unwrap_or_else(|| panic!("{starts} in {body}"))
+    }
+
+    /// A secret in a pattern is never served. FAILS ON REVERT of
+    /// `redact_secrets` in `suppress_json`.
+    #[test]
+    fn suppress_json_redacts_a_secret_in_a_pattern() {
+        let body = suppress_body(&suppress_config(), false, &parse_event_log(""));
+        assert!(!body.to_string().contains("correct-horse-battery-staple"));
+        let entry = allow_entry(&body, "deploy --token=");
+        assert_eq!(entry["redacted"], true);
+        assert!(entry["pattern"]
+            .as_str()
+            .unwrap()
+            .contains(REDACTION_MARKER));
+    }
+
+    /// Open to the network, the lists are withheld and the counts stay.
+    /// FAILS ON REVERT of the exposed check.
+    #[test]
+    fn suppress_json_withholds_lists_when_exposed() {
+        let config = suppress_config();
+        let body = suppress_body(&config, true, &parse_event_log(""));
+        assert_eq!(body["withheld"], "exposed");
+        for list in ["allow", "dropped", "mute_rules", "mute_categories"] {
+            assert_eq!(body[list], json!([]), "{list}");
+        }
+        assert_eq!(
+            body["counts"],
+            json!({"allow": 5, "mute_rules": 1, "mute_categories": 1})
+        );
+        let text = body.to_string();
+        assert!(!text.contains("npm run"), "{text}");
+        assert!(!text.contains("ATR-2026-030"), "{text}");
+        let local = suppress_body(&config, false, &parse_event_log(""));
+        assert_eq!(local["withheld"], Value::Null);
+        assert_eq!(local["allow"].as_array().unwrap().len(), 5);
+    }
+
+    /// A pattern with no literal start carries its warning, and one the guard
+    /// ignores is listed apart with why.
+    #[test]
+    fn suppress_json_marks_unanchored_and_dropped_patterns() {
+        let body = suppress_body(&suppress_config(), false, &parse_event_log(""));
+        assert_eq!(allow_entry(&body, "* | bash")["warning"], "unanchored");
+        assert_eq!(allow_entry(&body, "npm run")["warning"], Value::Null);
+        assert_eq!(
+            body["dropped"],
+            json!([{"pattern": "*", "why": "universal"}])
+        );
+        assert_eq!(body["mute_rules"][0]["id"], "ATR-2026-030");
+        assert_eq!(
+            body["mute_rules"][0]["remove"]["command"],
+            "innerwarden mute --remove ATR-2026-030"
+        );
+        assert_eq!(
+            body["mute_categories"][0]["remove"]["command"],
+            "innerwarden mute --remove data-poisoning"
+        );
+        assert_eq!(
+            body["list_steps"]["allow"]["command"],
+            "innerwarden allow --list"
+        );
+        assert_eq!(
+            body["list_steps"]["mute"]["command"],
+            "innerwarden mute --list"
+        );
+    }
+
+    /// The remove step is the exact pattern, quoted for a shell, and only for
+    /// a pattern shown as it is in the file.
+    #[test]
+    fn suppress_json_offers_no_remove_step_for_a_redacted_or_hidden_pattern() {
+        let body = suppress_body(&suppress_config(), false, &parse_event_log(""));
+        assert!(allow_entry(&body, "deploy --token=")
+            .get("remove")
+            .is_none());
+        let hidden = allow_entry(&body, "git status");
+        assert_eq!(hidden["hidden_characters"], true);
+        assert_eq!(hidden["pattern"], "git status\\u{200B}");
+        assert!(hidden.get("remove").is_none());
+        assert_eq!(
+            allow_entry(&body, "npm run")["remove"]["command"],
+            "innerwarden allow --remove 'npm run * --silent'"
+        );
+        assert_eq!(
+            allow_entry(&body, "echo")["remove"]["command"],
+            "innerwarden allow --remove 'echo it'\\''s fine'"
+        );
+        let long = SuppressConfig {
+            allow: vec![format!("make {}", "x".repeat(600))],
+            ..SuppressConfig::default()
+        };
+        let body = suppress_body(&long, false, &parse_event_log(""));
+        let entry = &body["allow"][0];
+        assert_eq!(entry["shortened"], true);
+        assert!(entry.get("remove").is_none());
+    }
+
+    /// At most 200 entries a list, the rest counted, and the whole answer
+    /// under 40,000 bytes with every list full of long entries.
+    #[test]
+    fn suppress_json_bounds_each_list() {
+        let many = |prefix: &str, n: usize, len: usize| -> Vec<String> {
+            (0..n)
+                .map(|i| format!("{prefix}{i} {}", "y".repeat(len)))
+                .collect()
+        };
+        let small = SuppressConfig {
+            allow: many("tool", 300, 4),
+            ..SuppressConfig::default()
+        };
+        let body = suppress_body(&small, false, &parse_event_log(""));
+        let shown = body["allow"].as_array().unwrap().len();
+        assert!(shown <= MAX_SUPPRESS_ENTRIES);
+        assert_eq!(
+            shown + body["more"]["allow"].as_u64().unwrap() as usize,
+            300
+        );
+        assert!(
+            body.to_string().len() < 40_000,
+            "{}",
+            body.to_string().len()
+        );
+        let full = SuppressConfig {
+            allow: many("cmd", 400, 380),
+            mute_rules: many("ATR-2026-", 400, 20),
+            mute_categories: many("category-", 400, 20),
+        };
+        let body = suppress_body(&full, false, &parse_event_log(""));
+        assert!(
+            body.to_string().len() < 40_000,
+            "{}",
+            body.to_string().len()
+        );
+        for list in ["allow", "mute_rules", "mute_categories"] {
+            let shown = body[list].as_array().unwrap().len();
+            assert!(shown <= MAX_SUPPRESS_ENTRIES, "{list}");
+            assert_eq!(
+                shown + body["more"][list].as_u64().unwrap() as usize,
+                400,
+                "{list}"
+            );
+        }
+        assert_eq!(body["counts"]["allow"], 400);
+    }
+
+    /// The log's changes are counted; what they changed is never read from
+    /// it. A log that could not be read counts nothing, never zero.
+    #[test]
+    fn suppress_json_never_serves_a_pattern_from_the_event_log() {
+        let log = parse_event_log(&log_text());
+        let body = suppress_body(&suppress_config(), false, &log);
+        assert!(!body.to_string().contains("secret-token-PATTERN"));
+        assert_eq!(body["changes"]["count"], 1);
+        assert_eq!(body["changes"]["last_at"], rfc3339(1_789_900_100_000));
+        assert_eq!(body["changes"]["since"], rfc3339(1_789_000_000_000));
+        let unread = suppress_body(&suppress_config(), false, &EventLog::unreadable());
+        assert_eq!(
+            unread["changes"],
+            json!({"count": null, "since": null, "last_at": null})
+        );
+    }
+
+    /// Twenty sessions with every outcome, ids of the hook's own shape and
+    /// long folder names, answer in under 12,000 bytes.
+    #[test]
+    fn a_page_of_twenty_sessions_stays_small() {
+        let mut g = Graph::new();
+        let outcomes = [
+            ("deny", DecisionMode::Enforce, DecisionOutcome::Blocked),
+            ("deny", DecisionMode::Monitor, DecisionOutcome::WouldBlock),
+            ("deny", DecisionMode::Monitor, DecisionOutcome::Allowed),
+            ("review", DecisionMode::Monitor, DecisionOutcome::Allowed),
+            ("allow", DecisionMode::Monitor, DecisionOutcome::Allowed),
+            ("deny", DecisionMode::Check, DecisionOutcome::Screened),
+        ];
+        for session in 0..25u64 {
+            let id = format!("{session:08x}-demo-4000-8000-000000000000");
+            for (seq, (recommendation, mode, outcome)) in outcomes.iter().enumerate() {
+                g.ingest_verdict_with_origin(
+                    &id,
+                    seq,
+                    "ls",
+                    &json!({"recommendation": recommendation, "explanation": "x"}),
+                    DecisionContext {
+                        mode: *mode,
+                        outcome: *outcome,
+                        recorded_at_ms: Some(NOW - session * 60_000 - seq as u64),
+                    },
+                    &DecisionOrigin {
+                        channel: Some(DecisionChannel::Hook),
+                        agent: Some("claude-code".into()),
+                        project: Some("p".repeat(120)),
+                        ..DecisionOrigin::default()
+                    },
+                );
+            }
+        }
+        let body = sessions_json(&g.recent_sessions(20), &g.record_span(), NOW).to_string();
+        assert!(body.len() < 12_000, "{}", body.len());
+        let value: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["items"].as_array().unwrap().len(), 20);
+        assert_eq!(value["items"][0]["agent"], "Claude Code");
+        assert_eq!(value["items"][0]["agent_id"], "claude-code");
+        assert_eq!(value["items"][0]["by_outcome"]["refused_before_run"], 1);
+        assert_eq!(value["items"][0]["decisions"], 6);
+        assert_eq!(value["items"][0]["flagged"], 4);
+        assert_eq!(value["record"]["capped"], false);
     }
 }
