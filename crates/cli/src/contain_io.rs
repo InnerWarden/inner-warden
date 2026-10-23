@@ -2259,16 +2259,20 @@ fn restriction_advice(bwrap: &Path, probe: bool) -> Option<Vec<String>> {
 /// Whether `bwrap` gets a user namespace here: run once with one, the root
 /// bound read-only, running `true`. `None` when it could not be started or
 /// did not end within 5 s (killed): not known, and the files on disk decide.
+///
+/// Like every program the launcher starts, under [`helper_env`]: root's two
+/// folders as `PATH` and no dynamic loader variable (Active Defence reads the
+/// launcher's contract by that shape; 1.6.1 cleared the environment instead).
+#[cfg(target_os = "linux")]
 fn bwrap_gets_a_userns(bwrap: &Path) -> Option<bool> {
-    let mut child = Command::new(bwrap)
+    let mut command = Command::new(bwrap);
+    helper_env(&mut command);
+    command
         .args(["--unshare-user", "--ro-bind", "/", "/", "true"])
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .ok()?;
+        .stderr(std::process::Stdio::null());
+    let mut child = command.spawn().ok()?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         match child.try_wait() {
@@ -2283,6 +2287,12 @@ fn bwrap_gets_a_userns(bwrap: &Path) -> Option<bool> {
             }
         }
     }
+}
+
+/// No user namespace restriction to ask about where there is no bwrap jail.
+#[cfg(not(target_os = "linux"))]
+fn bwrap_gets_a_userns(_bwrap: &Path) -> Option<bool> {
+    None
 }
 
 /// The key of Active Defence on this host, read from its file with the
