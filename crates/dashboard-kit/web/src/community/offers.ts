@@ -6,9 +6,12 @@ import type { OfferSlot } from "./dismiss";
  * Two places and three sentences: the foot of Protection (`GENERIC_LINE`,
  * or `INSTALLED_LINE` where the paid edition is installed) and one tour step
  * (`TOUR_UPGRADE_LINE`, dropped where it is installed). Nothing on a
- * decision, an agent or the Overview. One link, with no query string, and
- * nothing is sent anywhere. The words are generic on purpose: this page is
- * public, and it says what the edition is for, never how it works.
+ * decision or the Overview. One link, with no query string, and nothing is
+ * sent anywhere. The words are generic on purpose: this page is public, and
+ * it says what the edition is for, never how it works. The one exception is
+ * OpenClaw's card (`ownTools.tsx`, the `agents` slot): the CLI's one line
+ * about the paid edition, served only on a measured fact of this machine's
+ * record, at most once a week, and hidden by its own "Not now".
  *
  * `copy.test.ts` holds every line of this folder that names the paid
  * edition to these sentences and to the attribution words that say which

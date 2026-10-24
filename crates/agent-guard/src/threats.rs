@@ -610,6 +610,7 @@ fn dangerous_command_regexes() -> &'static [(regex::Regex, &'static str, bool)] 
 pub fn check_guard_self_disable(content: &str) -> Option<(&'static str, u32)> {
     const NEEDLES: &[&str] = &[
         "innerwarden",
+        "openclaw",
         "settings.json",
         ".claude.json",
         "mcp.json",
@@ -732,7 +733,7 @@ fn guard_self_disable_in(content: &str) -> Option<(&'static str, u32)> {
         // Round two of the same evaluation found these, all of which reach the
         // configuration the guard is carried by without naming a guard verb.
         add(
-            r#"(?i)\bsed\b[^|;&]*-i[^|;&]*(?:settings(?:\.local)?\.json|\.claude\.json|mcp\.json)"#,
+            r#"(?i)\bsed\b[^|;&]*-i[^|;&]*(?:settings(?:\.local)?\.json|\.claude\.json|mcp\.json|openclaw\.json)"#,
             "edits an agent's configuration in place to remove the guard",
             60,
         );
@@ -753,6 +754,35 @@ fn guard_self_disable_in(content: &str) -> Option<(&'static str, u32)> {
         add(
             r#"(?i)\brm\b[^|;&]*(?:hooks?/[^\s]*innerwarden|innerwarden[^\s]*\.(?:sh|json))"#,
             "deletes the guard's hook script",
+            60,
+        );
+        // OpenClaw loads the guard that screens its own tools, and the hook
+        // that records its chats, from its home folder: removing, moving or
+        // emptying them, or the folders that hold them, takes the guard off.
+        add(
+            r#"(?i)(?:\brm\b|\bmv\b|\bunlink\b|\btruncate\b|\bchmod\b|\bshred\b)[^|;&]*(?:(?:extensions|hooks)/[^\s/'"]*innerwarden|\.openclaw[^/\s'"]*/(?:extensions|hooks)(?:/?(?:[\s'"]|$)))"#,
+            "removes or moves aside the plugin or hook that carries the guard in OpenClaw",
+            60,
+        );
+        // OpenClaw's own commands that turn a plugin or hook off, or rewrite
+        // the plugin and MCP wiring the guard is carried by. Reading
+        // (`openclaw plugins list`, `inspect`, `config get`) is not here.
+        add(
+            r#"(?i)\bopenclaw\b[^|;&]*\b(?:plugins?|hooks?)\b[^|;&]*\b(?:disable|uninstall|remove|rm|delete|off)\b[^|;&]*innerwarden"#,
+            "turns off the OpenClaw plugin or hook that carries the guard",
+            60,
+        );
+        add(
+            r#"(?i)\bopenclaw\b[^|;&]*\bconfig\b[^|;&]*\b(?:set|unset|delete|rm|patch|edit|apply)\b[^|;&]*(?:plugins|innerwarden|mcp|hooks)"#,
+            "rewrites the OpenClaw plugin or MCP wiring that carries the guard",
+            60,
+        );
+        // A plugin runs inside the gateway and is asked about every tool call
+        // after the guard: one an agent adds can change the call the guard
+        // screened, or wave it through. Adding one is the person's.
+        add(
+            r#"(?i)\bopenclaw\b[^|;&]*\bplugins?\b[^|;&]*\b(?:install|enable|link|update)\b"#,
+            "adds or enables an OpenClaw plugin, which runs inside the gateway and is asked about every call the guard screens",
             60,
         );
         // The guard's own verb for what the `rm` above does to its record.
@@ -2064,6 +2094,18 @@ fn words_run_guard_loosening_verb_fed(words: &[String], depth: u8, mut fed: bool
             let arguments = &words[index + 1..];
             return guard_verb_loosens(arguments) || (fed && guard_verb_is_fed(arguments));
         }
+        // Active Defence's ctl takes the guard off an agent with verbs of its
+        // own (`agent disconnect`, `agent install-hook --remove|--monitor`,
+        // `uninstall`): read through the same parse.
+        if base == "innerwarden-ctl" {
+            let arguments = &words[index + 1..];
+            let verb = arguments
+                .iter()
+                .find(|word| *word != "--")
+                .map(|word| word.to_ascii_lowercase());
+            return matches!(verb.as_deref(), Some("agent" | "uninstall"))
+                && guard_verb_loosens(arguments);
+        }
         if base == "find" {
             // `find ... -exec innerwarden allow {} \;`: the command after
             // `-exec` runs once per file found, with the file as an argument.
@@ -2537,6 +2579,20 @@ fn guard_verb_loosens(arguments: &[String]) -> bool {
         // record only, as `agents connect --monitor` does (review of 1.6.6,
         // H1). Installing in enforce, or asking for help, lowers nothing.
         "install" => !asks_for_help && rest.contains(&"--monitor"),
+        // `innerwarden-ctl agent disconnect` and `agent install-hook
+        // --remove` take the guard off an agent, and `install-hook
+        // --monitor` rewires it to record only (`innerwarden agent ...`
+        // reaches the same ctl). Installing, scanning and help lower
+        // nothing.
+        "agent" => {
+            !asks_for_help
+                && rest.first().is_some_and(|first| {
+                    let sub = first.to_ascii_lowercase();
+                    sub == "disconnect"
+                        || (sub == "install-hook"
+                            && (rest.contains(&"--remove") || rest.contains(&"--monitor")))
+                })
+        }
         // `innerwarden uninstall [<agent>]` takes the hook off (all of it, or
         // one agent's): read through the same parse as every other verb, so
         // `iw uninstall`, quotes and spacing are the same command (live gate
@@ -7975,9 +8031,16 @@ const PRIVILEGED_WRITE_TARGETS: &[PrivilegedGroup] = &[
             Place::Components("openclaw.json"),
             // The OpenClaw message hook and reply plugin `innerwarden observe
             // install` lays down (`HOOK_NAME` and `PLUGIN_ID` in the CLI's
-            // observe_io.rs), in any OpenClaw profile.
+            // observe_io.rs), and the guard plugin `agents connect openclaw`
+            // lays down (`openclaw_guard::PLUGIN_ID`), in any OpenClaw
+            // profile. And every plugin and hook OpenClaw loads from its home
+            // folder: a plugin there runs inside the gateway and can rewrite
+            // or wave through the calls the guard screens.
             Place::Components("hooks/innerwarden-attempts"),
             Place::Components("extensions/innerwarden-replies"),
+            Place::Components("extensions/innerwarden-guard"),
+            Place::Components(".openclaw/extensions"),
+            Place::Components(".openclaw/hooks"),
             // The Community configuration, its allow rules and its record.
             Place::Components(".config/innerwarden"),
             // INNERWARDEN_SELF_PATHS, but for the binary, which is a program.
@@ -13215,6 +13278,64 @@ mod brq_evaluation_tests {
         }
     }
 
+    /// OpenClaw's guard plugin is the person's to take off, and so is the
+    /// guard Active Defence's ctl wires: from inside OpenClaw (whose own
+    /// exec the plugin screens) an agent removing the plugin, turning it off
+    /// with OpenClaw's own commands, or running the ctl's disconnect and
+    /// `install-hook --remove|--monitor` is refused. Reading them is not.
+    ///
+    /// FAILS ON REVERT: drop the OpenClaw rules or the ctl arm and these are
+    /// `None` again (the ctl forms were let through until this change).
+    #[test]
+    fn an_agent_cannot_take_off_the_openclaw_guard_or_the_ctl_guard() {
+        for cmd in [
+            "rm -rf ~/.openclaw/extensions/innerwarden-guard",
+            "rm -rf /home/lab/.openclaw/extensions/innerwarden-guard/",
+            "mv ~/.openclaw/extensions/innerwarden-guard /tmp/x",
+            "rm -rf ~/.openclaw/extensions",
+            "rm -rf ~/.openclaw/hooks/innerwarden-attempts",
+            "rm -rf ~/.openclaw-work/extensions/",
+            "openclaw plugins disable innerwarden-guard",
+            "openclaw plugins uninstall innerwarden-guard --force",
+            "openclaw hooks disable innerwarden-attempts",
+            "openclaw config set plugins.entries.innerwarden-guard.config.mode monitor",
+            "openclaw config set plugins.enabled false",
+            "openclaw config unset mcp.servers.innerwarden",
+            "openclaw plugins install ./rewriter",
+            "openclaw plugins enable some-plugin",
+            "sed -i 's/enforce/monitor/' ~/.openclaw/openclaw.json",
+            "innerwarden-ctl agent disconnect openclaw-1",
+            "sudo innerwarden-ctl agent install-hook --remove",
+            "/usr/local/bin/innerwarden-ctl agent install-hook --agent claude-code --monitor",
+            "innerwarden agent install-hook --remove",
+            "innerwarden-ctl uninstall",
+        ] {
+            assert!(
+                check_guard_self_disable(cmd).is_some(),
+                "an agent must not take off the guard screening it: {cmd}"
+            );
+        }
+        for cmd in [
+            "openclaw plugins list",
+            "openclaw plugins inspect innerwarden-guard",
+            "openclaw config get plugins.entries.innerwarden-guard",
+            "ls ~/.openclaw/extensions",
+            "cat ~/.openclaw/extensions/innerwarden-guard/index.js",
+            "openclaw status",
+            "innerwarden-ctl agent install-hook --agent claude-code",
+            "innerwarden-ctl agent scan",
+            "innerwarden-ctl agent install-hook --help",
+            "innerwarden-ctl uninstall --dry-run",
+            "innerwarden-ctl get status",
+        ] {
+            assert!(
+                check_guard_self_disable(cmd).is_none(),
+                "{cmd} lowers nothing: {:?}",
+                check_guard_self_disable(cmd)
+            );
+        }
+    }
+
     /// Review of 1.6.6: H1, `install <agent> --monitor` rewires the hook to
     /// record only, as `agents connect --monitor` does; H2, a help flag or a
     /// `--dry-run` of the AGENT's command (after `--`, or after the first bare
@@ -14446,6 +14567,10 @@ mod privileged_write_target_tests {
             "/home/dev/.openclaw-work/openclaw.json",
             "/home/dev/.openclaw/hooks/innerwarden-attempts/handler.js",
             "~/.openclaw/extensions/innerwarden-replies/index.js",
+            "~/.openclaw/extensions/innerwarden-guard/index.js",
+            "/home/dev/.openclaw-work/extensions/innerwarden-guard/bin.json",
+            "/home/dev/.openclaw/extensions/another-plugin/index.js",
+            "/home/dev/.openclaw/hooks/another-hook/handler.js",
             "~/.config/innerwarden/agents.toml",
             "/home/dev/.config/innerwarden/guard-events.jsonl",
             "~/.CONFIG/InnerWarden/allow.toml",

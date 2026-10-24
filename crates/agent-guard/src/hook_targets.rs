@@ -89,31 +89,32 @@ pub static TARGETS: &[HookTarget] = &[
     HookTarget {
         id: "openclaw",
         display: "OpenClaw",
-        // Established against the shipped build, not assumed: OpenClaw's own
-        // hook events are command/session/agent/gateway/message, none of which
-        // sees a proposed shell command, and its PreToolUse path is a relay of
-        // whatever harness it drives. So a hook is not the mechanism for it.
+        // Established against the shipped build (OpenClaw 2026.9.7), not
+        // assumed. Its internal hook events (command/session/agent/gateway/
+        // message) never see a proposed shell command, and they cannot refuse
+        // anything. Its typed plugin hook `before_tool_call` does both: it is
+        // asked before each of OpenClaw's own tools runs (`exec`, `process`,
+        // `write`, `edit`, `apply_patch`, among others) and may refuse the
+        // call or ask the person. `agents connect openclaw` installs the
+        // `innerwarden-guard` plugin on it (monitor unless the person turns
+        // enforce on) next to the MCP proxy, which still carries its MCP
+        // servers (under a NESTED `mcp.servers`, which `mcp_wire` learned to
+        // locate on 2026-08-05; a config that is not strict JSON is refused by
+        // the reader rather than rewritten, so a genuinely JSON5 file is left
+        // untouched).
         //
-        // That statement is about ENFORCEMENT and stays true. The message
-        // family is an OBSERVATION surface and a different thing: verified
-        // against openclaw 2026.7.1-2, `message:received` carries the inbound
-        // user text and `message:sent` carries the outbound reply, so an attack
-        // prompt the model refuses can be recorded even though no command ever
-        // existed to screen. (Not on the Control UI chat: in 2026.9.7 its reply
-        // streams over the gateway connection and fires no `message:sent`. The
-        // plugin `observe install` adds reads the turn's end through the typed
-        // `agent_end` hook instead, and without it `innerwarden observe settle`
-        // records those asks as not visible.) `innerwarden observe install` wires that, and the
-        // record it writes says the model decided, never the product. It cannot
-        // block: strings pushed to `event.messages` are ignored for every
-        // `message:*` event.
-        //
-        // Its MCP servers live under a NESTED `mcp.servers`, which `mcp_wire`
-        // learned to locate on 2026-08-05. A config that is not strict JSON is
-        // refused by the reader rather than rewritten, so a genuinely JSON5 file
-        // is left untouched.
+        // The message family is an OBSERVATION surface and a different thing:
+        // `message:received` carries the inbound user text and `message:sent`
+        // the outbound reply, so an attack prompt the model refuses is
+        // recorded even though no command ever existed to screen. (Not on the
+        // Control UI chat: in 2026.9.7 its reply streams over the gateway
+        // connection and fires no `message:sent`. The plugin `observe install`
+        // adds reads the turn's end through the typed `agent_end` hook
+        // instead, and without it `innerwarden observe settle` records those
+        // asks as not visible.) `innerwarden observe install` wires that, and
+        // the record it writes says who decided, never more than was seen.
         mechanism: Mechanism::McpProxy {
-            why: "no tool gate of its own; it relays whichever harness it drives",
+            why: "its own tools are screened by the plugin `agents connect` installs, and its MCP servers through the proxy",
             connect: "openclaw",
         },
         markers: &[".openclaw", ".config/openclaw"],
@@ -224,7 +225,7 @@ pub fn guidance(target: &HookTarget) -> String {
         // `innerwarden proxy` by hand would send them the long way round a thing
         // the product already does for them.
         Mechanism::McpProxy { why, connect } => format!(
-            "{}: {why}. Guard it through its MCP config:  innerwarden agents connect {connect}",
+            "{}: {why}. Guard it with:  innerwarden agents connect {connect}",
             target.display
         ),
         Mechanism::NotYetWirable { why } => format!(

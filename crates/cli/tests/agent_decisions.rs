@@ -22,6 +22,7 @@ const AGENT_MARKERS: &[&str] = &[
     "CODEX_SANDBOX",
     "CODEX_SANDBOX_NETWORK_DISABLED",
     "GEMINI_CLI",
+    "OPENCLAW_SHELL",
 ];
 
 struct Host {

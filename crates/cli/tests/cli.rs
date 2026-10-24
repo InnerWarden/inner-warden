@@ -46,6 +46,7 @@ fn cli() -> Command {
         "CODEX_SANDBOX",
         "CODEX_SANDBOX_NETWORK_DISABLED",
         "GEMINI_CLI",
+        "OPENCLAW_SHELL",
     ] {
         command.env_remove(marker);
     }
@@ -1179,6 +1180,7 @@ fn graph_records_checks_and_narrates() {
         .env_remove("CODEX_SANDBOX")
         .env_remove("CODEX_SANDBOX_NETWORK_DISABLED")
         .env_remove("GEMINI_CLI")
+        .env_remove("OPENCLAW_SHELL")
         .output()
         .expect("run graph clear");
     assert!(

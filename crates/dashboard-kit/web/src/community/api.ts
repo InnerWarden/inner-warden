@@ -1143,12 +1143,41 @@ export type AgentFacts = {
   modeSteps?: ModeSteps;
   mcp?: McpCounts;
   nextStep?: AgentNextStep;
+  /** OpenClaw only: its own tools, the guard plugin that screens them, what Pro says about this host and the suggestion. */
+  ownTools?: OwnTools;
   /** The technical view's evidence, as sent: how the agent was found, and the raw ids. */
   detectedBy?: string[];
   setupSupport?: string;
   mechanismId?: string;
   modeId?: string;
 };
+
+/**
+ * OpenClaw's own tools (`exec`, `process`, `write`, `edit`, `apply_patch`),
+ * as the CLI serves them on its card: screened by the guard plugin or not,
+ * in which mode, the paid edition's line where it is installed, and the one
+ * suggestion line, only on a measured fact.
+ */
+export type OwnTools = {
+  screened: boolean;
+  mode?: "monitor" | "enforce";
+  turnedOff: boolean;
+  proLine?: string;
+  suggestion?: string;
+};
+
+export function readOwnTools(value: unknown): OwnTools | undefined {
+  const item = record(value);
+  if (item === undefined || typeof item.screened !== "boolean") return undefined;
+  const mode: OwnTools["mode"] = item.mode === "monitor" ? "monitor" : item.mode === "enforce" ? "enforce" : undefined;
+  return defined({
+    screened: item.screened,
+    mode,
+    turnedOff: item.turned_off === true,
+    proLine: plain(item.pro_line, 300),
+    suggestion: plain(item.suggestion, 300),
+  });
+}
 
 function agentMode(guardrail: Json | undefined): AgentMode {
   const raw = guardrail?.mode;
@@ -1210,6 +1239,7 @@ export function readAgentFacts(value: unknown): AgentFacts | undefined {
     modeSteps: readModeSteps(item.mode_steps),
     mcp: mechanism === "mcp" ? readMcp(item.mcp) : undefined,
     nextStep: readAgentNextStep(item.next_step),
+    ownTools: id === "openclaw" ? readOwnTools(item.own_tools) : undefined,
     detectedBy: strings(item.detected_by, 64),
     setupSupport: plain(guardrail?.setup_support, 32),
     mechanismId: plain(guardrail?.mechanism, 32),

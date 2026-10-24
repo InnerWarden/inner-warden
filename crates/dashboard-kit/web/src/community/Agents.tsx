@@ -19,6 +19,7 @@ import {
 import { readProfilesFile, type AgentFacts, type AgentNextStep, type LocalInstance } from "./api";
 import { JAIL_STEP, mcpLines, screeningState } from "./controls";
 import { CONNECT_ALL } from "./Overview";
+import { OwnToolsBlock } from "./ownTools";
 import { StaleLine } from "./parts";
 import { restartFor } from "./restart";
 import { useSource } from "./store";
@@ -202,6 +203,7 @@ function AgentCard({
         {mcpLines(agent.mcp).map((line) => (
           <p key={line} data-mcp className={`${SMALL_TEXT} text-(--iw-ink-2)`}>{line}</p>
         ))}
+        {agent.ownTools === undefined ? null : <OwnToolsBlock tools={agent.ownTools} />}
         <p><SeenCell agent={agent} unnamed={unnamed} screened="Last screened" /></p>
         {prompt === undefined ? null : (
           <div data-restart-prompt className="space-y-2 rounded-lg bg-(--iw-surface-2) p-3">
