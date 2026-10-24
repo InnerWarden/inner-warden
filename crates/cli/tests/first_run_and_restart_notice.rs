@@ -31,6 +31,17 @@ fn cli(home: &Path) -> Command {
         .env("HOME", home)
         .env("USERPROFILE", home)
         .env("IW_GRAPH_FILE", home.join(".config/innerwarden/graph.json"));
+    // The person's shell, even when the suite runs under an AI agent's: the
+    // wiring that lowers a guard is refused inside one.
+    for marker in [
+        "CLAUDECODE",
+        "CLAUDE_CODE_ENTRYPOINT",
+        "CODEX_SANDBOX",
+        "CODEX_SANDBOX_NETWORK_DISABLED",
+        "GEMINI_CLI",
+    ] {
+        command.env_remove(marker);
+    }
     command
 }
 

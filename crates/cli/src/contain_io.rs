@@ -27,6 +27,17 @@ pub fn cmd(rest: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // A jail rewires the agent's hook: it is the person's to start, never a
+    // command an AI agent's shell runs (live gate of Active Defence 0.17.4,
+    // G1). Its own `--dry-run` changes nothing and stays open.
+    if !args.dry_run && crate::suppress_io::in_agent_shell() {
+        eprintln!(
+            "innerwarden contain: refused inside an AI agent's shell. A jail rewires the \
+             agent's hook, so it is started by the person, from their own terminal. Nothing \
+             was changed."
+        );
+        return ExitCode::from(1);
+    }
 
     let home = match std::env::var_os("HOME").map(PathBuf::from) {
         Some(h) if !h.as_os_str().is_empty() => h,
@@ -51,6 +62,30 @@ pub fn cmd(rest: &[String]) -> ExitCode {
     // --setup intentionally only arms the hook and therefore needs no project.
     // Every normal run validates all future writable binds BEFORE this host
     // mutation; an unsafe project must fail closed without changing settings.
+    // A mode asked for on the command line is set; with none, the hook keeps
+    // the mode it already has (live gate of Active Defence 0.17.4, G2: a plain
+    // `contain` rewired an enforcing hook to monitor, unsaid, a failed start
+    // included). Only a first wiring takes the default.
+    let mode_given = rest
+        .iter()
+        .take_while(|a| *a != "--")
+        .any(|a| matches!(a.as_str(), "--monitor" | "--enforce" | "--block-review"));
+    let mut args = args;
+    if !mode_given {
+        if let Some((block_review, monitor)) =
+            std::fs::read_to_string(home.join(".claude/settings.json"))
+                .ok()
+                .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+                .as_ref()
+                .and_then(hook::kept_hook_flags)
+        {
+            args.mode = match (block_review, monitor) {
+                (true, _) => crate::contain::Mode::BlockReview,
+                (false, true) => crate::contain::Mode::Monitor,
+                (false, false) => crate::contain::Mode::Enforce,
+            };
+        }
+    }
     let (block_review, monitor) = args.mode.hook_flags();
     if args.setup_only {
         match hook::install_hook(&home, &args.agent, None, &iw_binary, block_review, monitor) {
@@ -90,7 +125,6 @@ pub fn cmd(rest: &[String]) -> ExitCode {
     // An identified launch takes its jail settings from the agent type's
     // profile, where a profiles file exists; a flag given here still wins.
     // Without `--identity` no profile is read and the jail is what it was.
-    let mut args = args;
     if args.identity {
         match crate::agent_profiles_io::load() {
             crate::agent_profiles::ProfilesState::Off => {}
@@ -166,7 +200,17 @@ pub fn cmd(rest: &[String]) -> ExitCode {
             block_review,
             monitor,
         ) {
-            Ok(_) => {}
+            // Said every time, so a change of mode is never silent.
+            Ok(_) => eprintln!(
+                "innerwarden contain: the guard hook for {} is in {}{}.",
+                input.args.agent,
+                match input.args.mode {
+                    crate::contain::Mode::Monitor => "monitor (records, never blocks)",
+                    crate::contain::Mode::Enforce => "enforce (blocks dangerous commands)",
+                    crate::contain::Mode::BlockReview => "enforce with review",
+                },
+                if mode_given { "" } else { ", as it was" }
+            ),
             Err(e) => eprintln!(
                 "innerwarden contain: could not arm the in-jail hook: {e} (running with walls only)"
             ),

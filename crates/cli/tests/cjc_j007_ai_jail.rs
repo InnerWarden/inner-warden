@@ -27,6 +27,17 @@ fn scratch_graph() -> &'static std::path::Path {
 fn cli() -> Command {
     let mut command = Command::new(bin());
     command.env("IW_GRAPH_FILE", scratch_graph());
+    // The person's shell, even when the suite runs under an AI agent's: a
+    // jail is refused inside one (`an_agent_cannot_lower_its_own_guard.rs`).
+    for marker in [
+        "CLAUDECODE",
+        "CLAUDE_CODE_ENTRYPOINT",
+        "CODEX_SANDBOX",
+        "CODEX_SANDBOX_NETWORK_DISABLED",
+        "GEMINI_CLI",
+    ] {
+        command.env_remove(marker);
+    }
     command
 }
 

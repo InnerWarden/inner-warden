@@ -3,6 +3,26 @@
 All notable changes to InnerWarden are documented here. This project
 follows semantic versioning.
 
+## 1.6.6 - 2026-10-24
+
+### Security
+
+- **An agent can no longer lower the guard that screens it.** Under an
+  enforcing hook, `innerwarden agents connect <agent> --monitor`,
+  `innerwarden agents disconnect` and `innerwarden contain` (which rewrites
+  the agent's hook) were let through, while `dry-run` and `monitor` were
+  refused. The hook now refuses all of them as the person's, and the CLI
+  refuses them inside an AI agent's shell, where the hook cannot see the call
+  (a script the agent wrote). A read, a connect that keeps enforcing, help and
+  `contain --dry-run` stay open.
+
+### Fixed
+
+- **`innerwarden contain` keeps the hook's mode.** With no mode asked, it set
+  an enforcing hook to monitor, unsaid, also when the jail then failed to
+  start. It now keeps the mode the hook already has (a first wiring takes
+  monitor), and says the mode on every run.
+
 ## 1.6.5 - 2026-10-24
 
 1.6.4 was tagged and not published: its new jail check on macOS started
