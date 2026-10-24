@@ -158,7 +158,7 @@ test("healthy Enterprise mounts capability-derived Posture without Community ups
   await expect(page.getByText("Enterprise", { exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "Protection" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Runtime assurance foundation" })).toBeVisible();
-  await expect(page.getByText("Explore Active Defence", { exact: false })).toHaveCount(0);
+  await expect(page.getByText("Explore InnerWarden Pro", { exact: false })).toHaveCount(0);
 
   await page.getByRole("button", { name: "Protection" }).click();
   await expect(page.getByRole("heading", { name: "Agent-boundary controls" })).toBeVisible();

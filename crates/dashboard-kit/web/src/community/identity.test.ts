@@ -66,10 +66,10 @@ describe("trust never rises above its reason", () => {
     const row = readAgentIdentity({ id: "x", instances: [instance({ trust_source: "host", trust_reason: "host_decided" })] });
     expect(row?.instances[0]).toMatchObject({ trust: "observed", trustReason: "host_decided", trustSource: "host" });
     expect(REASON_TRUST.host_decided).toBe("observed");
-    expect(reasonWords("host_decided")).toBe("Active Defence on this host decided its rules.");
+    expect(reasonWords("host_decided")).toBe("InnerWarden Pro on this host decided its rules.");
     expect(trustWord("observed", "host")).toEqual({
       label: "Observed",
-      tooltip: "Read from inside the jail; Active Defence on this host decided its rules.",
+      tooltip: "Read from inside the jail; InnerWarden Pro on this host decided its rules.",
       tone: "watch",
     });
     // A pair with no words of its own reads as the jail's.
@@ -188,26 +188,26 @@ describe("the layer that decided", () => {
 
   it("words a profile's allowance the host decided neutrally, as what was recorded", () => {
     expect(layerLine("agent_type", "allow", "observed", "Claude Code", true)).toEqual({
-      text: "Allowed by the Claude Code profile, decided by Active Defence on this host.",
+      text: "Allowed by the Claude Code profile, decided by InnerWarden Pro on this host.",
       conflict: false,
     });
     expect(layerLine("instance", "allow", "observed", "Claude Code", true)?.text).toBe(
-      "Allowed by an exception for this instance, decided by Active Defence on this host.",
+      "Allowed by an exception for this instance, decided by InnerWarden Pro on this host.",
     );
     expect(layerLine("agent_type", "deny", "observed", "Claude Code", true)?.text).toBe("Refused by the Claude Code profile.");
   });
 
   it("chooses why a relaxation did not apply when the page renders", () => {
     expect(withheldWords("linux", false, false)).toBe(
-      "Per-agent relaxations apply on Linux with Active Defence, for an agent started with innerwarden contain --identity.",
+      "Per-agent relaxations apply on Linux with InnerWarden Pro, for an agent started with innerwarden contain --identity.",
     );
-    expect(withheldWords("linux", true, false)).toBe("Active Defence on this host did not decide this command, so your general rules decided.");
+    expect(withheldWords("linux", true, false)).toBe("InnerWarden Pro on this host did not decide this command, so your general rules decided.");
     expect(withheldWords("macos", false, false)).toBe(
       "Per-agent relaxations do not apply on macOS: a jail there has no boundary a witness outside it can check.",
     );
     expect(withheldWords("macos", true, false)).toBe(WITHHELD_WORDS.macos);
     for (const os of ["linux", "macos", "windows", "other"] as const) {
-      expect(withheldWords(os, true, true)).toBe("Active Defence on this host kept your general rules for this command.");
+      expect(withheldWords(os, true, true)).toBe("InnerWarden Pro on this host kept your general rules for this command.");
     }
     expect(withheldWords("windows", false, false)).toBe(WITHHELD_WORDS.linux);
   });

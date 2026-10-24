@@ -60,7 +60,7 @@ describe("the tour's upgrade step", () => {
   it("says the tour line, and points at the Protection footer", () => {
     const step = COMMUNITY_SHELL_TOUR_STEPS.find((candidate) => candidate.key === COMMUNITY_UPGRADE_STEP_KEY);
     expect(step?.body).toBe(TOUR_UPGRADE_LINE);
-    expect(step?.title).not.toContain("Active Defence");
+    expect(step?.title).not.toContain("InnerWarden Pro");
     expect(step?.route).toBe("posture");
     expect(step?.selectors).toEqual(['[data-tour="upgrade"]']);
   });

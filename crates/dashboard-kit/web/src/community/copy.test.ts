@@ -101,19 +101,19 @@ describe("(a) the words a Community screen never uses", () => {
 
 /** The only sentences that may name the paid edition, and the attribution words. */
 const PERMITTED = [GENERIC_LINE, TOUR_UPGRADE_LINE, INSTALLED_LINE.lead, WITHHELD_WORDS.linux];
-const ATTRIBUTION = /Active Defence on (?:this|its|the) host/g;
+const ATTRIBUTION = /InnerWarden Pro on (?:this|its|the) host/g;
 
 describe("(b) the paid edition is named only in the permitted sentences", () => {
   it("holds every line of every Community source, comments included", () => {
     let named = 0;
     for (const file of shipped) {
       file.text.split("\n").forEach((line, index) => {
-        if (!line.includes("Active Defence")) return;
+        if (!line.includes("InnerWarden Pro")) return;
         named += 1;
         let rest = line;
         for (const sentence of PERMITTED) rest = rest.split(sentence).join("");
         rest = rest.replace(ATTRIBUTION, "");
-        expect(rest, `${file.path}:${index + 1} names the paid edition outside the permitted sentences`).not.toContain("Active Defence");
+        expect(rest, `${file.path}:${index + 1} names the paid edition outside the permitted sentences`).not.toContain("InnerWarden Pro");
       });
     }
     // Anti-vacuous: the offer and the attribution words are still here.
@@ -121,11 +121,21 @@ describe("(b) the paid edition is named only in the permitted sentences", () => 
   });
 
   it("says the three offer sentences exactly, each about what the edition is for", () => {
-    expect(GENERIC_LINE).toBe("Active Defence adds host-level protection for Linux servers.");
+    expect(GENERIC_LINE).toBe("InnerWarden Pro adds host-level protection for Linux servers.");
     expect(TOUR_UPGRADE_LINE).toBe(
-      "Community screens what your AI agents try to run. Active Defence, the paid edition, adds host-level protection for Linux servers.",
+      "Community screens what your AI agents try to run. InnerWarden Pro, the paid edition, adds host-level protection for Linux servers.",
     );
-    expect(INSTALLED_LINE.lead).toBe("Active Defence is installed on this host.");
+    expect(INSTALLED_LINE.lead).toBe("InnerWarden Pro is installed on this host.");
+  });
+
+  it("never calls the paid edition by its repository name", () => {
+    // Customers buy InnerWarden Pro; "Active Defence" names only the
+    // repository and its release line (operator, 2026-10-24).
+    for (const file of shipped) {
+      withoutComments(file.text).split("\n").forEach((line, index) => {
+        expect(line, `${file.path}:${index + 1}`).not.toMatch(/Active Defen[cs]e/i);
+      });
+    }
   });
 });
 

@@ -1016,7 +1016,7 @@ function DashboardContractState({ resource }: { resource: DashboardResource<Dash
         {loading
           ? "Asking the local process which edition is running before showing anything."
           : auth
-            ? "Sign in through Active Defence on this host. Nothing is shown until that succeeds."
+            ? "Sign in through InnerWarden Pro on this host. Nothing is shown until that succeeds."
             : "The local process did not answer, or answered with something this dashboard cannot read. Check that InnerWarden is running, then reload. Nothing about your protection is assumed in the meantime."}
       </p>
     </section>

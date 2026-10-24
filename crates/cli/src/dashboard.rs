@@ -3251,7 +3251,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             v["active_defence_installed"], true,
-            "a host running Active Defence has to be able to say so"
+            "a host running InnerWarden Pro has to be able to say so"
         );
     }
 

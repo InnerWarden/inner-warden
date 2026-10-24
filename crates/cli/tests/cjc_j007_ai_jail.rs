@@ -468,7 +468,7 @@ fn identity_flag_mounts_the_record_read_only_inside_and_keeps_a_private_copy() {
     assert!(stderr.contains("identity is at most observed"), "{stderr}");
     assert!(
         !stderr.contains("system scope"),
-        "no Active Defence, no request: {stderr}"
+        "no InnerWarden Pro, no request: {stderr}"
     );
     // The namespace the launcher recorded is the one the jailed process saw.
     let inside: u64 = ns_line
@@ -1033,14 +1033,14 @@ fn a_jail_the_host_did_not_admit_never_runs_its_command() {
     assert_eq!(status.code(), Some(2), "{stderr}");
     assert!(
         stderr.contains(
-            "innerwarden contain: Active Defence on this host did not admit this jail, and its \
+            "innerwarden contain: InnerWarden Pro on this host did not admit this jail, and its \
              profile starts it only when admitted."
         ),
         "{stderr}"
     );
     assert!(
         stderr.contains(&format!(
-            "innerwarden contain: Check that Active Defence is running (systemctl status \
+            "innerwarden contain: Check that InnerWarden Pro is running (systemctl status \
              innerwarden-agent), then try again. The jail waits for it because of start = \
              \"only_when_admitted\" in {}.",
             home.path()

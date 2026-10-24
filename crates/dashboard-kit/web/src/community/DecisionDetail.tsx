@@ -293,7 +293,7 @@ function DecisionIdentity({ item }: { item: Decision }) {
         <p className="font-mono text-[11px] text-(--iw-ink-3) [overflow-wrap:anywhere]">
           {identity.instanceId === undefined ? "No instance on record" : `Instance ${identity.instanceId}`}. Trust read by: the hook inside the jail ({identity.trustReason === "" ? "no reason recorded" : identity.trustReason}).
           {identity.layer === undefined ? "" : ` Deciding layer: ${identity.layer}${identity.profile === undefined ? "" : `, profile ${identity.profile}`}.`}
-          {identity.trustSource === "host" ? ` Rules decided by: Active Defence on this host${identity.hostDecision === undefined ? "" : ` (decision ${identity.hostDecision})`}.` : ""}
+          {identity.trustSource === "host" ? ` Rules decided by: InnerWarden Pro on this host${identity.hostDecision === undefined ? "" : ` (decision ${identity.hostDecision})`}.` : ""}
         </p>
       </TechnicalOnly>
     </div>

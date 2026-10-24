@@ -112,7 +112,7 @@ test("an instance's session opens its case, which says which layer decided and w
   const withheld = card.locator("[data-relaxation-withheld]");
   await expect(withheld).toHaveCount(1);
   await expect(withheld).toHaveText(
-    "Per-agent relaxations apply on Linux with Active Defence, for an agent started with innerwarden contain --identity.",
+    "Per-agent relaxations apply on Linux with InnerWarden Pro, for an agent started with innerwarden contain --identity.",
   );
   await noProtectedWords(page);
 });

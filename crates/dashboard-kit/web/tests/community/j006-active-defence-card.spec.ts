@@ -15,7 +15,7 @@ import { EDITION_LINES, expectHonestUpsell, FIXTURE_NOW_MS, fulfillJson, guardRo
  * protected", on a host that was.
  */
 
-test.describe("CJC-J006 the Active Defence card reads the host", () => {
+test.describe("CJC-J006 the InnerWarden Pro card reads the host", () => {
   test("stops offering the product on a host that already runs it", async ({ page }) => {
     await page.route(guardRoute("meta"), (route) => fulfillJson(route, { ...META, active_defence_installed: true }));
     await page.goto("/?view=posture");

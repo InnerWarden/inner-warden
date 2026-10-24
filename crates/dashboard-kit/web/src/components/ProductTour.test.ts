@@ -103,14 +103,14 @@ describe("the upgrade step is an honest offer", () => {
   // rather than restating the offer here. One pitch, one voice, one place to
   // change it: a second copy in tour prose would drift from the card.
   it("exists, and sits just before the closing step", () => {
-    expect(upgradeStep, "the Community tour must offer Active Defence").toBeDefined();
+    expect(upgradeStep, "the Community tour must offer InnerWarden Pro").toBeDefined();
     const index = COMMUNITY_TOUR_STEPS.findIndex((step) => step.key === COMMUNITY_UPGRADE_STEP_KEY);
     expect(index).toBe(COMMUNITY_TOUR_STEPS.length - 2);
   });
 
   it("names the product and what it adds", () => {
     const text = `${upgradeStep?.title ?? ""} ${upgradeStep?.body ?? ""}`;
-    expect(text).toContain("Active Defence");
+    expect(text).toContain("InnerWarden Pro");
     for (const claim of ["host protection", "response", "kernel enforcement"]) {
       expect(text, `the offer should name ${claim}`).toContain(claim);
     }
@@ -125,8 +125,8 @@ describe("the upgrade step is an honest offer", () => {
 
   it("is phrased as an addition, never as something already installed", () => {
     const body = upgradeStep?.body ?? "";
-    expect(body).toContain("Active Defence is the paid tier that adds");
-    for (const wrong of ["you have", "your Active Defence", "already protecting", "is enforcing on this host"]) {
+    expect(body).toContain("InnerWarden Pro is the paid tier that adds");
+    for (const wrong of ["you have", "your InnerWarden Pro", "already protecting", "is enforcing on this host"]) {
       expect(body.toLowerCase(), `the offer must not claim ${wrong}`).not.toContain(wrong.toLowerCase());
     }
   });
@@ -137,7 +137,7 @@ describe("no Community step claims a paid feature is already running", () => {
   // capability named anywhere else would read as "you have this", which is the
   // one thing an upsell in a free product must never do.
   const paidOnlyTerms = [
-    "Active Defence",
+    "InnerWarden Pro",
     "execution gate",
     "DNS guard",
     "host EDR",
@@ -221,7 +221,7 @@ describe("the open-once gate", () => {
  * do it on its own: `findTarget` returning null leaves the step rendered, just
  * unanchored, so the pitch still gets read out to somebody who already owns it.
  */
-describe("the tour on a host that already runs Active Defence", () => {
+describe("the tour on a host that already runs InnerWarden Pro", () => {
   it("drops the acquisition step", () => {
     const keys = communityTourSteps(true).map((step) => step.key);
     expect(keys).not.toContain(COMMUNITY_UPGRADE_STEP_KEY);

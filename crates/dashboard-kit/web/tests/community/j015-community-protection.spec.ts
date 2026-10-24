@@ -61,12 +61,12 @@ test("Not in Community names the paid features, says nothing of how one works, a
   await expect(page.locator('a[href^="https://innerwarden.com"]')).toHaveCount(0);
 });
 
-test("where Active Defence is installed, the section says so and links nowhere", async ({ page }) => {
+test("where InnerWarden Pro is installed, the section says so and links nowhere", async ({ page }) => {
   await page.route(guardRoute("meta"), (route) => fulfillJson(route, { ...META, active_defence_installed: true }));
   await page.goto("/?view=posture");
   const installed = page.locator('[data-tour="upgrade"] [data-ad-state="installed"]');
   await expect(installed).toBeVisible();
-  await expect(installed).toContainText("Active Defence is installed on this host.");
+  await expect(installed).toContainText("InnerWarden Pro is installed on this host.");
   await expect(page.locator('a[href^="https://innerwarden.com"]')).toHaveCount(0);
   await expect(page.locator("li[data-paid]")).toHaveCount(0);
 });

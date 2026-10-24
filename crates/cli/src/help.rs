@@ -229,7 +229,7 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
              With --identity the hook inside the jail tells this instance apart from\n  \
              the agent's other runs. Read from inside the jail, the instance is at most\n  \
              `observed`: confined needs a witness outside the jail. On Linux, where\n  \
-             Active Defence runs on the same host, the hook asks it about a shell\n  \
+             InnerWarden Pro runs on the same host, the hook asks it about a shell\n  \
              command sent to review and the host decides whether a profile rule that\n  \
              relaxes your general rules applies; the stricter verdict wins. Without it\n  \
              the relaxation is recorded and not applied. MCP tools and file edits keep\n  \
@@ -241,7 +241,7 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
              \n  \
              A profile of schema 2, in either file, can say when its jail starts and\n  \
              what of the home it hides. start = \"only_when_admitted\": the agent\n  \
-             starts only once Active Defence on the host admitted the jail; otherwise\n  \
+             starts only once InnerWarden Pro on the host admitted the jail; otherwise\n  \
              contain says what to check and exits 2, having started nothing (a launcher\n  \
              stopped while it waits starts nothing either). hide_home: home paths the\n  \
              jail covers with an empty mount, or denies on macOS; a path that leads\n  \
@@ -398,8 +398,8 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
         ),
         "host" => format!(
             "{p} host <command> [args...]\n  \
-             Run a command in the Active Defence host layer, even when this binary has\n  \
-             a verb by the same name. Without Active Defence installed it says so\n  \
+             Run a command in the InnerWarden Pro host layer, even when this binary has\n  \
+             a verb by the same name. Without InnerWarden Pro installed it says so\n  \
              rather than guessing."
         ),
         _ => return None,
@@ -564,7 +564,7 @@ mod tests {
         for said in [
             "A review the hook would block on its line is still asked about, because the host may relax it",
             "your suppressions included, is made stricter only by a refusal of the host's own",
-            "and so does an older Active Defence on the host, which reads the same file",
+            "and so does an older InnerWarden Pro on the host, which reads the same file",
         ] {
             assert!(readme.contains(said), "README lacks {said:?}");
         }
@@ -583,7 +583,7 @@ mod tests {
         let flat = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
         let help = flat(&usage("contain", &[]).expect("contain has usage"));
         for said in [
-            "start = \"only_when_admitted\": the agent starts only once Active Defence on the host admitted the jail",
+            "start = \"only_when_admitted\": the agent starts only once InnerWarden Pro on the host admitted the jail",
             "contain says what to check and exits 2, having started nothing",
             "hide_home: home paths the jail covers with an empty mount, or denies on macOS",
             "is printed as `innerwarden contain: <note>`",
@@ -601,7 +601,7 @@ mod tests {
             .join("\n"),
         );
         for said in [
-            "`start = \"only_when_admitted\"`: `contain --identity` starts the agent only once Active Defence on the host has admitted the jail",
+            "`start = \"only_when_admitted\"`: `contain --identity` starts the agent only once InnerWarden Pro on the host has admitted the jail",
             "and exits 2 with nothing started",
             "`hide_home = [\".cache/git/credential\"]`: home paths the jail covers",
             "it prints it as `innerwarden contain: <note>`",

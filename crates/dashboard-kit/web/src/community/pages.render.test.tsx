@@ -391,12 +391,12 @@ describe("the Overview", () => {
     expect(textOf(overviewHtml())).toMatch(/Nothing flagged in the record \(25 Sept, \d\d:34 to now\)\./);
   });
 
-  it("makes no Active Defence offer and links out nowhere, installed or not", () => {
+  it("makes no InnerWarden Pro offer and links out nowhere, installed or not", () => {
     for (const meta of [META, { ...META, active_defence_installed: true }]) {
       const html = overviewHtml("", meta);
       expect(links(html)).toEqual([]);
       expect(html).not.toContain("data-ad-state");
-      expect(textOf(html)).not.toContain("Active Defence");
+      expect(textOf(html)).not.toContain("InnerWarden Pro");
     }
   });
 

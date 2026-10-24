@@ -183,17 +183,17 @@ export async function pageWidth(page: Page) {
  * allow-list of what may be said, never a list of names.
  */
 export const EDITION_LINES = {
-  generic: "Active Defence adds host-level protection for Linux servers.",
-  installed: "Active Defence is installed on this host.",
-  relaxation: "Per-agent relaxations apply on Linux with Active Defence, for an agent started with innerwarden contain --identity.",
+  generic: "InnerWarden Pro adds host-level protection for Linux servers.",
+  installed: "InnerWarden Pro is installed on this host.",
+  relaxation: "Per-agent relaxations apply on Linux with InnerWarden Pro, for an agent started with innerwarden contain --identity.",
 } as const;
-const ATTRIBUTION = /Active Defence on (?:this|its|the) host/g;
+const ATTRIBUTION = /InnerWarden Pro on (?:this|its|the) host/g;
 
 /** Everything the page says about the paid edition is one of `EDITION_LINES`, or an attribution. */
 export async function expectOnlyEditionLines(page: Page) {
   let rest = await page.locator("body").innerText();
   for (const line of Object.values(EDITION_LINES)) rest = rest.split(line).join("");
-  expect(rest.replace(ATTRIBUTION, ""), "the page names the paid edition outside the permitted lines").not.toContain("Active Defence");
+  expect(rest.replace(ATTRIBUTION, ""), "the page names the paid edition outside the permitted lines").not.toContain("InnerWarden Pro");
 }
 
 export async function expectHonestUpsell(page: Page) {

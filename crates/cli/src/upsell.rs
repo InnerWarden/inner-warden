@@ -36,13 +36,13 @@ pub fn is_host_command(cmd: &str) -> bool {
 /// Defence. `prog` is the invoked name, `command` the host verb attempted. Pure.
 pub fn default_message(prog: &str, command: &str) -> String {
     format!(
-        "\n  🛡  `{prog} {command}` is part of InnerWarden Active Defence - the licensed host layer:\n\
+        "\n  🛡  `{prog} {command}` is part of InnerWarden Pro - the licensed host layer:\n\
         \x20     host telemetry + response · incident triage · on Linux: kernel eBPF + execution gate.\n\
         \n\
         \x20 Not active on this machine - you're running {community}, which keeps\n\
-        \x20 screening your agent's commands. Active Defence adds host EDR + response; on Linux, kernel enforcement.\n\
+        \x20 screening your agent's commands. Pro adds that host layer; kernel enforcement is Linux only.\n\
         \n\
-        \x20 → Get Active Defence:  https://innerwarden.com/defend\n",
+        \x20 → Get InnerWarden Pro:  https://innerwarden.com/pricing\n",
         community = crate::COMMUNITY_NAME,
     )
 }
@@ -97,9 +97,16 @@ mod tests {
     fn default_message_pitches_active_defence_with_a_cta() {
         let m = default_message("innerwarden", "get");
         assert!(m.contains("innerwarden get"));
-        assert!(m.contains("Active Defence"));
+        assert!(m.contains("InnerWarden Pro"));
+        assert!(
+            !m.contains("Active Defen"),
+            "the repository name is not what is sold"
+        );
         assert!(m.contains(crate::COMMUNITY_NAME));
-        assert!(m.contains("innerwarden.com/defend"), "has a call to action");
+        assert!(
+            m.contains("innerwarden.com/pricing"),
+            "has a call to action"
+        );
     }
 
     #[test]
@@ -117,6 +124,6 @@ mod tests {
         assert_eq!(m, "trial offer");
         // blank override falls through to default
         let m = message("iw", "get", |_| Some("   ".into()), || None);
-        assert!(m.contains("Active Defence"));
+        assert!(m.contains("InnerWarden Pro"));
     }
 }
