@@ -674,9 +674,10 @@ const GUARD_DISARMED: &str = "disarms the guard, or asks it to authorise itself"
 /// What [`check_guard_self_disable`] says of the guard's own loosening
 /// verbs ([`runs_guard_loosening_verb`]).
 const GUARD_LOOSENING_VERB: &str =
-    "runs the guard's own allow, mute or monitor command, or one of its agent \
-     decisions (approve, profile, allow, revoke), which only the person supervising \
-     the agent may run, from their own terminal";
+    "runs the guard's own allow, mute or monitor command, one of its agent \
+     decisions (approve, profile, allow, revoke), disconnects an agent or connects it \
+     in monitor, or starts a jail, which only the person supervising the agent may \
+     run, from their own terminal";
 
 /// [`check_guard_self_disable`] on one spelling of the command.
 fn guard_self_disable_in(content: &str) -> Option<(&'static str, u32)> {
@@ -2278,7 +2279,9 @@ fn text_runs_guard_verb(text: &str, only: &[&str]) -> bool {
 /// The verbs that switch the guard to recording only (`dry-run`, `monitor`)
 /// or silence its rules (`mute`). `dry-run` has no terminal check of its own,
 /// so the guard's reading of the agent's command is the only thing in its way.
-const MODE_VERBS: &[&str] = &["mute", "dry-run", "monitor"];
+/// `agents` and `contain` are read here too, for their forms that take the
+/// hook off or rewire it ([`guard_verb_loosens`]).
+const MODE_VERBS: &[&str] = &["mute", "dry-run", "monitor", "agents", "contain"];
 
 /// Whether `innerwarden mute|dry-run|monitor`, with arguments that widen what
 /// is let through, appears in the command anywhere but in a simple command
@@ -2445,8 +2448,22 @@ fn guard_verb_loosens(arguments: &[String]) -> bool {
         "agents" => {
             !asks_for_help
                 && rest.first().is_some_and(|first| {
-                    AGENT_DECISION_VERBS.contains(&first.to_ascii_lowercase().as_str())
+                    let sub = first.to_ascii_lowercase();
+                    AGENT_DECISION_VERBS.contains(&sub.as_str())
+                        // Taking the hook off an agent, or rewiring it to
+                        // record only, lowers the guard that screens it
+                        // (live gate of Active Defence 0.17.4, G1).
+                        || sub == "disconnect"
+                        || (sub == "connect" && rest.contains(&"--monitor"))
                 })
+        }
+        // `innerwarden contain` rewires the agent's hook (`--setup` too): a
+        // jail is the person's to start. Asking for help, or for the argv it
+        // would run (its own `--dry-run`, before the agent's command), changes
+        // nothing.
+        "contain" => {
+            let own: Vec<&str> = rest.iter().copied().take_while(|a| *a != "--").collect();
+            !asks_for_help && !own.contains(&"--dry-run")
         }
         _ => false,
     }
@@ -13041,6 +13058,52 @@ mod brq_evaluation_tests {
         }
     }
 
+    /// Live gate of Active Defence 0.17.4, G1: under an enforce hook, an
+    /// agent could lower or take off its own guard with `agents connect
+    /// --monitor`, `agents disconnect` or `contain` (which rewrites the hook),
+    /// while `dry-run` and `monitor` were refused. Each is the person's; a
+    /// read, a connect that keeps enforcing, help, and `contain`'s own
+    /// `--dry-run` are not.
+    ///
+    /// FAILS ON REVERT: drop the `disconnect`, `connect --monitor` or
+    /// `contain` arm and its forms are `None` again.
+    #[test]
+    fn an_agent_cannot_lower_its_own_guard_by_wiring_or_a_jail() {
+        for cmd in [
+            "innerwarden agents connect claude-code --monitor",
+            "innerwarden agents connect --all --monitor",
+            "innerwarden agents disconnect --all",
+            "innerwarden agents disconnect claude-code",
+            "innerwarden contain -- true",
+            "innerwarden contain --identity --agent claude-code -- true",
+            "innerwarden contain --setup",
+            "npx innerwarden agents disconnect --all",
+            "env -u CLAUDECODE innerwarden contain -- claude",
+            "flock /tmp/x innerwarden agents disconnect --all",
+        ] {
+            assert!(
+                check_guard_self_disable(cmd).is_some(),
+                "an agent must not lower the guard screening it: {cmd}"
+            );
+        }
+        for cmd in [
+            "innerwarden agents list",
+            "innerwarden agents connect claude-code",
+            "innerwarden agents --help",
+            "innerwarden agents disconnect --help",
+            "innerwarden contain --help",
+            "innerwarden contain --dry-run -- claude",
+            "echo innerwarden agents disconnect --all",
+            "grep 'innerwarden contain' README.md",
+        ] {
+            assert!(
+                check_guard_self_disable(cmd).is_none(),
+                "{cmd} lowers nothing: {:?}",
+                check_guard_self_disable(cmd)
+            );
+        }
+    }
+
     /// Any force-allow or mute an agent runs is a bypass it grants itself, a
     /// narrow one included: `innerwarden allow 'rm -rf /'` lifts exactly the
     /// block it was just given. Only the person at their own terminal decides
@@ -14287,7 +14350,9 @@ mod privileged_write_target_tests {
         for cmd in [
             "innerwarden agents",
             "innerwarden agents list",
-            "innerwarden agents connect claude-code --monitor",
+            // A connect that keeps enforcing; `--monitor` lowers the guard
+            // and is refused (an_agent_cannot_lower_its_own_guard_by_wiring_or_a_jail).
+            "innerwarden agents connect claude-code",
             "innerwarden agents approve --help",
             "grep 'innerwarden agents approve' docs/README.md",
         ] {

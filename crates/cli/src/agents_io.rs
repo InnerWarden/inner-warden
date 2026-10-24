@@ -6,6 +6,16 @@ use innerwarden_agent_guard::{agents_ops, hook};
 use crate::agent_policy::{self, DesiredMode};
 
 /// `innerwarden agents [connect|disconnect [--all|<name>]]` - discover + connect.
+/// PURE. Whether `innerwarden agents <rest>` lowers a guard: a disconnect, or
+/// a connect in monitor.
+pub(crate) fn lowers_a_guard(rest: &[String]) -> bool {
+    match rest.first().map(String::as_str) {
+        Some("disconnect") => true,
+        Some("connect") => rest.iter().any(|a| a == "--monitor"),
+        _ => false,
+    }
+}
+
 pub fn cmd(rest: &[String]) -> std::process::ExitCode {
     // The person's decisions about an agent (approve, profile, allow,
     // revoke): verbs of their own, never part of discovery or wiring.
@@ -32,6 +42,18 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
         return cmd_auto_connect(&home, &rest[1..]);
     }
 
+    // Taking the hook off an agent, or rewiring it to record only, lowers the
+    // guard that screens it: the person's, never a command an AI agent's
+    // shell runs (live gate of Active Defence 0.17.4, G1). The guard refuses
+    // the agent running it; this holds where the guard cannot see the call.
+    if lowers_a_guard(rest) && crate::suppress_io::in_agent_shell() {
+        eprintln!(
+            "innerwarden agents: refused inside an AI agent's shell. Disconnecting an agent, \
+             or connecting it in monitor, lowers the guard that screens it, so it is done \
+             by the person, from their own terminal. Nothing was changed."
+        );
+        return std::process::ExitCode::from(1);
+    }
     let mutating = matches!(
         rest.first().map(String::as_str),
         Some("connect" | "disconnect")
