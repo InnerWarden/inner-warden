@@ -159,13 +159,16 @@ pub fn consider_reporting(command: &str, verdict: &Value) -> Option<Value> {
 
 /// Environment variables an AI coding agent sets in the shell it runs
 /// commands in. Any of them set (non-empty) means the caller is, or was
-/// started by, such an agent.
-const AGENT_SHELL_MARKERS: &[&str] = &[
+/// started by, such an agent. OpenClaw sets `OPENCLAW_SHELL=exec` in every
+/// command its `exec` tool runs, a PTY and a sandbox included (OpenClaw
+/// 2026.9.7, `docs/tools/exec.md`).
+pub(crate) const AGENT_SHELL_MARKERS: &[&str] = &[
     "CLAUDECODE",
     "CLAUDE_CODE_ENTRYPOINT",
     "CODEX_SANDBOX",
     "CODEX_SANDBOX_NETWORK_DISABLED",
     "GEMINI_CLI",
+    "OPENCLAW_SHELL",
 ];
 
 /// Whether this process runs in an AI agent's shell, by its markers.

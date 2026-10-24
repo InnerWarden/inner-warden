@@ -2,10 +2,13 @@
  * InnerWarden conversation-attempt observer for OpenClaw.
  *
  * OpenClaw's internal hook events are command / session / agent / gateway /
- * message. None of them sees a proposed shell command, which is why the guard
- * enforces through MCP. The message family is a different thing: it sees the
- * inbound user text (`message:received`) and the outbound assistant reply
- * (`message:sent`), which is exactly what a refused attack attempt looks like.
+ * message. None of them sees a proposed shell command: the guard screens
+ * OpenClaw's own tools through the typed `before_tool_call` plugin hook (the
+ * `innerwarden-guard` plugin `agents connect openclaw` installs) and its MCP
+ * servers through the proxy. The message family is a different thing: it
+ * sees the inbound user text (`message:received`) and the outbound assistant
+ * reply (`message:sent`), which is exactly what a refused attack attempt
+ * looks like.
  *
  * Except on the Control UI chat. A `webchat` turn fires `message:received`, but
  * its reply is streamed back over the gateway connection and never fires

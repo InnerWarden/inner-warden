@@ -14,12 +14,13 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_innerwarden")
 }
 
-const AGENT_SHELL_MARKERS: [&str; 5] = [
+const AGENT_SHELL_MARKERS: [&str; 6] = [
     "CLAUDECODE",
     "CLAUDE_CODE_ENTRYPOINT",
     "CODEX_SANDBOX",
     "CODEX_SANDBOX_NETWORK_DISABLED",
     "GEMINI_CLI",
+    "OPENCLAW_SHELL",
 ];
 
 /// A home whose Claude Code runs an enforcing hook.

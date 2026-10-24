@@ -78,12 +78,20 @@ const HOOK_FILES: [ShippedFile; 2] = [
     ShippedFile {
         name: "handler.js",
         body: HOOK_HANDLER,
-        earlier: &["d58c13d9d2f481f773d81c484474468e9233369efd4d49539cad7166ca6673d9"],
+        earlier: &[
+            "d58c13d9d2f481f773d81c484474468e9233369efd4d49539cad7166ca6673d9",
+            // Community 1.5.2 through 1.6.9.
+            "a1954a47b1dbf17124a9262606f170d0869db55803d2312f9571bb6d0d6b2b1b",
+        ],
     },
     ShippedFile {
         name: "HOOK.md",
         body: HOOK_DOC,
-        earlier: &["6e99a2648f690360b5c4bcebcb577b61445e0859f7e883003b76d772d45610dc"],
+        earlier: &[
+            "6e99a2648f690360b5c4bcebcb577b61445e0859f7e883003b76d772d45610dc",
+            // Community 1.5.2 through 1.6.9.
+            "c3dbfe77aa256befd7937fd4fd56c3a682b328780cb510e707aee160fe16d6ab",
+        ],
     },
 ];
 
@@ -289,13 +297,37 @@ fn record(dir: &Path, leaving: Vec<Leaving>, at: u64) {
     for leaving in leaving {
         let window = if needs_block_correlation(leaving.departure) {
             let (from, until) = correlation_window(&leaving, at);
-            guard_window(&tail, &leaving.ask.agent, &leaving.ask.session, from, until)
+            let mut window =
+                guard_window(&tail, &leaving.ask.agent, &leaving.ask.session, from, until);
+            window.kernel_refused_this_session =
+                kernel_confirmed(&tail, &leaving.ask.agent, &leaving.ask.session, from, until);
+            window
         } else {
             GuardWindow::default()
         };
         let attempt = outcome(leaving, window, at);
         crate::graph_io::append_guard_event_at(dir, &attempt_line(&attempt));
     }
+}
+
+/// Whether a refusal of the kernel the guard plugin attributed to this chat
+/// in the window is one InnerWarden Pro's own record holds: Pro is asked
+/// now, on this host's loopback, for the refusals its Execution Gate made in
+/// enforce in this agent's scope. A claim in the sink alone (a file the
+/// agent's account can append to) never makes `kernel_denied`.
+fn kernel_confirmed(tail: &str, agent: &str, session: &str, from: u64, until: u64) -> bool {
+    let claims = crate::observe::kernel_claims(tail, agent, session, from, until);
+    if claims.is_empty() || !crate::upsell_io::active_defence_installed() {
+        return false;
+    }
+    let Some(refusals) = crate::openclaw_guard_io::pro_refusals(from.saturating_sub(5)) else {
+        return false;
+    };
+    claims.iter().any(|claim| {
+        refusals
+            .iter()
+            .any(|refusal| refusal.ts == claim.refused_at)
+    })
 }
 
 /// The tail of the guard event sink, for the block correlation.
@@ -568,7 +600,7 @@ fn home(rest: &[String]) -> Result<PathBuf, String> {
     }
 }
 
-fn openclaw_config(home: &Path) -> PathBuf {
+pub(crate) fn openclaw_config(home: &Path) -> PathBuf {
     home.join(".openclaw/openclaw.json")
 }
 
@@ -585,7 +617,11 @@ fn plugin_dir(home: &Path) -> PathBuf {
 /// Write `files` and the pinned binary path into `directory`, creating it.
 /// The explicit install writes the way it always has: what the operator asked
 /// for, over whatever is there.
-fn write_files(directory: &Path, files: &[ShippedFile], bin_json: &str) -> Result<(), String> {
+pub(crate) fn write_files(
+    directory: &Path,
+    files: &[ShippedFile],
+    bin_json: &str,
+) -> Result<(), String> {
     std::fs::create_dir_all(directory)
         .map_err(|error| format!("creating {}: {error}", directory.display()))?;
     let bodies = files
@@ -794,7 +830,10 @@ fn pending_notice(path: &Path, read_error: Option<&str>) -> Option<String> {
 /// name, and never blocking on something that is not a plain file. The
 /// directory sits where the agent's own account can write, and the dashboard
 /// reads it on every page.
-fn read_installed(directory: &Path, files: &[ShippedFile]) -> Vec<Result<Option<Vec<u8>>, String>> {
+pub(crate) fn read_installed(
+    directory: &Path,
+    files: &[ShippedFile],
+) -> Vec<Result<Option<Vec<u8>>, String>> {
     files
         .iter()
         .map(|file| {
@@ -809,7 +848,7 @@ fn read_installed(directory: &Path, files: &[ShippedFile]) -> Vec<Result<Option<
 /// Judge what `observe install` left in `directory` against what this version
 /// ships. A file that is there and cannot be read as a plain file is not one
 /// InnerWarden can vouch for, and is judged as changed.
-fn judge(directory: &Path, files: &[ShippedFile]) -> InstalledFiles {
+pub(crate) fn judge(directory: &Path, files: &[ShippedFile]) -> InstalledFiles {
     let read = read_installed(directory, files);
     if matches!(read.first(), Some(Ok(None)) | None) {
         return InstalledFiles::NotInstalled;
@@ -941,7 +980,7 @@ fn observation_lines(observation: &Observation, prog: &str) -> Vec<String> {
 
 /// What `observe refresh` did with one set of files.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Refreshed {
+pub(crate) enum Refreshed {
     NotInstalled,
     Current,
     Updated,
@@ -960,7 +999,7 @@ enum Refreshed {
 /// a link planted between the read and the write must not turn this into a
 /// root write somewhere else. A file somebody changed is left alone, and so is
 /// the rest of its set.
-fn refresh_files(home: &Path, directory: &Path, files: &[ShippedFile]) -> Refreshed {
+pub(crate) fn refresh_files(home: &Path, directory: &Path, files: &[ShippedFile]) -> Refreshed {
     let read = read_installed(directory, files);
     if matches!(read.first(), Some(Ok(None)) | None) {
         return Refreshed::NotInstalled;
@@ -1034,6 +1073,24 @@ fn refresh_lines(hook: &Refreshed, plugin: &Refreshed, prog: &str) -> Vec<String
     lines
 }
 
+/// What `observe refresh` prints about the guard plugin. PURE.
+fn guard_refresh_lines(guard: &Refreshed, prog: &str) -> Vec<String> {
+    let what = "The plugin that screens OpenClaw's own tools";
+    match guard {
+        Refreshed::Updated => vec![format!(
+            "Updated {what} to this version's. Restart the OpenClaw gateway to load it."
+        )],
+        Refreshed::Changed(file) => vec![format!(
+            "{what} was left as it is: {file} matches no version InnerWarden shipped.\n\
+             To replace it with this version's:  {prog} agents connect openclaw"
+        )],
+        Refreshed::Failed(error) => vec![format!(
+            "{what} could not be updated ({error}).\nTo update it:  {prog} agents connect openclaw"
+        )],
+        Refreshed::NotInstalled | Refreshed::Current => Vec::new(),
+    }
+}
+
 /// `innerwarden observe refresh` - bring the files `observe install` wrote up
 /// to this version's, where they are exactly what an earlier release wrote.
 ///
@@ -1056,7 +1113,15 @@ fn cmd_refresh(rest: &[String]) -> std::process::ExitCode {
     for line in refresh_lines(&hook, &plugin, &crate::prog()) {
         println!("{line}");
     }
-    if matches!(hook, Refreshed::Failed(_)) || matches!(plugin, Refreshed::Failed(_)) {
+    // The plugin that screens OpenClaw's own tools, laid by `agents connect`.
+    let guard = crate::openclaw_guard_io::refresh(&home);
+    for line in guard_refresh_lines(&guard, &crate::prog()) {
+        println!("{line}");
+    }
+    if [&hook, &plugin, &guard]
+        .iter()
+        .any(|refreshed| matches!(refreshed, Refreshed::Failed(_)))
+    {
         return std::process::ExitCode::from(1);
     }
     std::process::ExitCode::SUCCESS
@@ -1400,11 +1465,11 @@ mod tests {
         let pinned: [(&str, &str); 5] = [
             (
                 "handler.js",
-                "a1954a47b1dbf17124a9262606f170d0869db55803d2312f9571bb6d0d6b2b1b",
+                "2b0cfadd0163db8d2dce1ff0faed201808e2e2df2cd2533ece11c8311d3796b5",
             ),
             (
                 "HOOK.md",
-                "c3dbfe77aa256befd7937fd4fd56c3a682b328780cb510e707aee160fe16d6ab",
+                "c7902069fb350efa9326510d9caffbe7dd296b20f8523ab796435bbcd6cfd455",
             ),
             (
                 "index.js",

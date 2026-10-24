@@ -1,0 +1,10 @@
+{
+  "name": "innerwarden-guard",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Screens OpenClaw's own exec, process, write, edit and apply_patch calls with InnerWarden before they run.",
+  "type": "module",
+  "openclaw": {
+    "extensions": ["./index.js"]
+  }
+}

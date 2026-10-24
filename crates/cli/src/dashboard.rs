@@ -1586,11 +1586,12 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
                             )
                         })
                         .unwrap_or_default();
-                    request.respond(json_response(
-                        crate::dashboard_community::agents_with_last_screened(
-                            &body, &seen, &channels, &unnamed,
-                        ),
-                    ))
+                    let body = crate::dashboard_community::agents_with_last_screened(
+                        &body, &seen, &channels, &unnamed,
+                    );
+                    request.respond(json_response(crate::openclaw_guard_io::with_own_tools(
+                        body,
+                    )))
                 }
                 None => request.respond(json_error_response(503, "user home is unavailable")),
             },

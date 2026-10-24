@@ -121,6 +121,7 @@ fn run_uninstall(exe: &Path, home: &Path, extra: &[&str]) -> Output {
         "CODEX_SANDBOX",
         "CODEX_SANDBOX_NETWORK_DISABLED",
         "GEMINI_CLI",
+        "OPENCLAW_SHELL",
     ] {
         cmd.env_remove(marker);
     }
