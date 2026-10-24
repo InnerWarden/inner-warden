@@ -1506,11 +1506,12 @@ fn the_fixture_attempts_carry_what_the_producer_writes() {
     }
     let mut written = BTreeSet::new();
     for departure in departures {
-        for bits in 0..8u8 {
+        for bits in 0..16u8 {
             let window = GuardWindow {
                 flagged_ran: bits & 1 != 0,
                 refused_this_session: bits & 2 != 0,
                 refused_unattributed: bits & 4 != 0,
+                kernel_refused_this_session: bits & 8 != 0,
             };
             let leaving = Leaving {
                 ask: ask.clone(),

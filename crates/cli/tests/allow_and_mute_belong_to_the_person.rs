@@ -16,12 +16,13 @@ fn bin() -> &'static str {
 }
 
 /// What an AI coding agent sets in the shell it runs commands in.
-const AGENT_SHELL_MARKERS: [&str; 5] = [
+const AGENT_SHELL_MARKERS: [&str; 6] = [
     "CLAUDECODE",
     "CLAUDE_CODE_ENTRYPOINT",
     "CODEX_SANDBOX",
     "CODEX_SANDBOX_NETWORK_DISABLED",
     "GEMINI_CLI",
+    "OPENCLAW_SHELL",
 ];
 
 struct Home {

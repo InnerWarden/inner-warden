@@ -384,6 +384,7 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
              --clear   delete the local record"
         ),
         "observe" => crate::observe_io::help_text(),
+        "openclaw" => crate::openclaw_guard_io::help_text(),
         "llm" => format!(
             "{p} llm [status]\n\
              {p} llm set --url <chat-completions-URL> --model <name> [--provider azure]\n\
@@ -1103,6 +1104,7 @@ mod tests {
         "mute",
         "notify",
         "observe",
+        "openclaw",
         "graph",
         "llm",
         "host",

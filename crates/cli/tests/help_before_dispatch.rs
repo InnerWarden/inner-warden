@@ -97,6 +97,7 @@ const VERBS: &[&str] = &[
     "mute",
     "notify",
     "observe",
+    "openclaw",
     "graph",
     "llm",
     "host",

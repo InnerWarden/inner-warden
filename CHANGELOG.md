@@ -3,6 +3,57 @@
 All notable changes to InnerWarden are documented here. This project
 follows semantic versioning.
 
+## Unreleased
+
+### Added
+
+- **OpenClaw's own tools are screened before they run.** Until now only the
+  MCP servers `agents connect openclaw` wraps went through the guard:
+  OpenClaw's own `exec`, `process`, `write`, `edit` and `apply_patch` never
+  reached it. `innerwarden agents connect openclaw` now also installs the
+  `innerwarden-guard` plugin on OpenClaw's `before_tool_call` hook (OpenClaw
+  2026.9.7), which asks `innerwarden openclaw screen` about each call: the
+  screening the Claude Code hook uses (the general rules, your allow and mute
+  rules, the per-agent profiles, the privileged-file rule for what a file tool
+  writes) and, where InnerWarden Pro is installed, Pro's `check-command` too.
+  Monitor (the default) records only. After `innerwarden enforce` a deny is
+  refused, and the model is told only "Refused by InnerWarden."; a review asks
+  you to allow it once or deny it, and nobody answering in time is a refusal.
+  The record credits each refusal to the chat it belonged to (the session
+  key). The plugin answers first and last among OpenClaw's plugins, so the
+  call that runs is the copy that was screened, not a rewrite another plugin
+  made in between.
+- On a host with InnerWarden Pro, the approval card, `innerwarden agents list`
+  and the dashboard's OpenClaw card say what Pro holds there (the Execution
+  Gate for this agent, the DNS Guard, the licence), as Pro reads it. A
+  conversation attempt is recorded as `kernel_denied` only where Pro's
+  Execution Gate, in enforce for that agent, refused a program during a call
+  of that chat, as Pro recorded it.
+- A one line suggestion about InnerWarden Pro, to the owner only (the Control
+  UI approval card, `agents list`, the dashboard), on a measured fact: a
+  program this agent tried to run was refused or held for review, or monitor
+  let through a call enforce would have stopped. At most once a week unasked,
+  never in a reply to a chat, never on macOS or Windows; on a host with Pro
+  it names the next step for the gate instead.
+
+### Security
+
+- An agent can no longer take off the OpenClaw guard: a file tool may not
+  write into `~/.openclaw/extensions` or `~/.openclaw/hooks`, and the hook
+  refuses removing them, `openclaw plugins disable|uninstall` of InnerWarden's
+  plugin or hook, adding or enabling an OpenClaw plugin, `openclaw config set`
+  of the plugin or MCP wiring, and `sed -i` on `openclaw.json`.
+- Active Defence's own guard-lowering verbs are refused like the free CLI's:
+  `innerwarden-ctl agent disconnect`, `agent install-hook --remove` and
+  `--monitor`, and `innerwarden-ctl uninstall`.
+- OpenClaw's exec shell is recognised as an AI agent's shell
+  (`OPENCLAW_SHELL`), so `agents disconnect`, `connect --monitor`, `install
+  --monitor`, `contain`, `dry-run`, `monitor` and `uninstall` refuse there as
+  they do in Claude Code's, Codex's and Gemini CLI's.
+- Stated limit: a plugin that freezes a rewrite of its own under an approval
+  of its own, before the guard answers, decides what runs; the guard records
+  that the call ran other than as screened, after it ran.
+
 ## 1.6.10 - 2026-10-24
 
 ### Security

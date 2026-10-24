@@ -92,7 +92,11 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
     let outcome = if mutating {
         match agent_policy::with_lock(&home, || {
             prepare_policy_for_agent_command(&home, rest)?;
-            Ok(agents_ops::run_outcome(&home, rest))
+            let mut outcome = agents_ops::run_outcome(&home, rest);
+            // OpenClaw's own tools never reach the MCP proxy: the plugin
+            // that screens them goes in (and out) next to it.
+            outcome.lines.extend(openclaw_guard_lines(&home, rest));
+            Ok(outcome)
         }) {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -106,6 +110,14 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
     let failed = outcome.lines.iter().any(|line| line.contains("failed:"));
     for line in &outcome.lines {
         println!("{line}");
+    }
+    if matches!(rest.first().map(String::as_str), None | Some("list"))
+        && crate::observe_io::openclaw_config(&home).is_file()
+    {
+        println!();
+        for line in crate::openclaw_guard_io::status_lines(&home) {
+            println!("{line}");
+        }
     }
     // An agent reads its hook / MCP configuration at STARTUP. Without this the
     // command printed "connected" and the user went back to a session that was
@@ -212,6 +224,45 @@ pub(crate) fn help_text() -> String {
 
 fn print_agents_help() {
     println!("{}", help_text());
+}
+
+/// PURE. Whether an `agents connect` or `disconnect` reaches OpenClaw: it
+/// names it, or names no agent (every agent detected).
+pub(crate) fn names_openclaw(rest: &[String]) -> bool {
+    command_target(rest).is_none_or(|name| name.eq_ignore_ascii_case("openclaw"))
+}
+
+/// The guard plugin, installed by a connect that reaches a detected OpenClaw
+/// (in monitor unless the entry holds a mode, and in monitor with
+/// `--monitor`), taken out by a disconnect that reaches it.
+fn openclaw_guard_lines(home: &std::path::Path, rest: &[String]) -> Vec<String> {
+    use crate::openclaw_guard::Mode;
+    use crate::openclaw_guard_io as guard;
+    if !names_openclaw(rest) {
+        return Vec::new();
+    }
+    match rest.first().map(String::as_str) {
+        Some("connect") => {
+            let detected = agents_ops::rows(home)
+                .iter()
+                .any(|agent| agent.guardable() && agent.name.eq_ignore_ascii_case("openclaw"));
+            if !detected {
+                return Vec::new();
+            }
+            let mut installed = guard::install(home, &agents_ops::guard_bin());
+            if rest.iter().any(|a| a == "--monitor") {
+                if let guard::Installed::Enabled { mode, .. } = &mut installed {
+                    match guard::set_mode(home, Mode::Monitor) {
+                        Ok(_) => *mode = Mode::Monitor,
+                        Err(error) => installed = guard::Installed::Failed(error),
+                    }
+                }
+            }
+            guard::install_lines(&installed, home)
+        }
+        Some("disconnect") => guard::uninstall(home),
+        _ => Vec::new(),
+    }
 }
 
 fn command_target(rest: &[String]) -> Option<&str> {
@@ -477,5 +528,25 @@ mod tests {
         assert!(is_known_agent_name("claude-code"));
         assert!(!is_known_agent_name("cursor-mcp"));
         assert!(!is_known_agent_name("c"));
+    }
+}
+
+#[cfg(test)]
+mod openclaw_guard_tests {
+    use super::names_openclaw;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// A connect or disconnect that names OpenClaw, or names no agent,
+    /// reaches the guard plugin; one naming another agent does not.
+    #[test]
+    fn the_guard_follows_a_connect_that_reaches_openclaw() {
+        assert!(names_openclaw(&args(&["connect", "openclaw"])));
+        assert!(names_openclaw(&args(&["connect", "OpenClaw", "--monitor"])));
+        assert!(names_openclaw(&args(&["connect", "--all"])));
+        assert!(names_openclaw(&args(&["disconnect"])));
+        assert!(!names_openclaw(&args(&["connect", "claude-code"])));
     }
 }

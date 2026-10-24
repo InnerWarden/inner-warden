@@ -39,6 +39,7 @@ fn cli(home: &Path) -> Command {
         "CODEX_SANDBOX",
         "CODEX_SANDBOX_NETWORK_DISABLED",
         "GEMINI_CLI",
+        "OPENCLAW_SHELL",
     ] {
         command.env_remove(marker);
     }

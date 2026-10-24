@@ -2074,8 +2074,8 @@ mod tests {
             "must name the automatic mechanism that covers it: {err}"
         );
         assert!(
-            err.contains("relays"),
-            "and must explain why a hook is not the mechanism: {err}"
+            err.contains("plugin") && err.contains("its own tools"),
+            "and must say what screens its own tools: {err}"
         );
     }
 
