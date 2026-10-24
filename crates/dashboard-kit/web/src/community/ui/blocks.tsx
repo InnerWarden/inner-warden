@@ -244,10 +244,18 @@ function ActionBlock({ action, said = [], onOpenAgents }: { action: VerdictActio
       )}
       {action.restarts.length === 0 && action.after !== undefined ? <p className={BODY_TEXT}>{action.after}</p> : null}
       {action.back === undefined ? null : (
-        <div className="space-y-1.5">
-          <p className={META_TEXT}>{action.back.label}</p>
-          {action.back.command === undefined ? null : <CopyCommand command={action.back.command} />}
-        </div>
+        <>
+          {/* On a phone the way back folds under one line, so the band's step
+              and the two numbers stay on the first screen (j018). */}
+          <details data-back className="sm:hidden">
+            <summary className={`${META_TEXT} cursor-pointer`}>{action.back.label.replace(/:$/, "")}</summary>
+            {action.back.command === undefined ? null : <div className="mt-1.5"><CopyCommand command={action.back.command} /></div>}
+          </details>
+          <div data-back className="hidden space-y-1.5 sm:block">
+            <p className={META_TEXT}>{action.back.label}</p>
+            {action.back.command === undefined ? null : <CopyCommand command={action.back.command} />}
+          </div>
+        </>
       )}
       {action.nothing === undefined ? null : <p className="text-sm leading-[21px] font-medium text-(--iw-ink)">{action.nothing}</p>}
       {action.link === "agents" ? (
