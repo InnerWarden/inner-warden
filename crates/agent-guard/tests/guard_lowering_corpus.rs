@@ -34,23 +34,65 @@ struct Verb {
 
 const VERBS: &[Verb] = &[
     // Free CLI: record-only modes and rule widening.
-    Verb { tail: "dry-run", ctl: false },
-    Verb { tail: "monitor", ctl: false },
-    Verb { tail: "mute reverse_shell", ctl: false },
-    Verb { tail: "allow 'rm -rf *'", ctl: false },
+    Verb {
+        tail: "dry-run",
+        ctl: false,
+    },
+    Verb {
+        tail: "monitor",
+        ctl: false,
+    },
+    Verb {
+        tail: "mute reverse_shell",
+        ctl: false,
+    },
+    Verb {
+        tail: "allow 'rm -rf *'",
+        ctl: false,
+    },
     // Free CLI: taking the hook off an agent, or rewiring it to record only.
-    Verb { tail: "agents disconnect claude-code", ctl: false },
-    Verb { tail: "agents connect claude-code --monitor", ctl: false },
-    Verb { tail: "install claude-code --monitor", ctl: false },
-    Verb { tail: "contain", ctl: false },
-    Verb { tail: "uninstall", ctl: false },
-    Verb { tail: "uninstall claude-code", ctl: false },
+    Verb {
+        tail: "agents disconnect claude-code",
+        ctl: false,
+    },
+    Verb {
+        tail: "agents connect claude-code --monitor",
+        ctl: false,
+    },
+    Verb {
+        tail: "install claude-code --monitor",
+        ctl: false,
+    },
+    Verb {
+        tail: "contain",
+        ctl: false,
+    },
+    Verb {
+        tail: "uninstall",
+        ctl: false,
+    },
+    Verb {
+        tail: "uninstall claude-code",
+        ctl: false,
+    },
     // Active Defence's ctl: the same lowering through Pro's verbs
     // (live gate v0.17.8, F1).
-    Verb { tail: "agent disconnect claude-code", ctl: true },
-    Verb { tail: "agent install-hook --remove", ctl: true },
-    Verb { tail: "agent install-hook --monitor", ctl: true },
-    Verb { tail: "uninstall", ctl: true },
+    Verb {
+        tail: "agent disconnect claude-code",
+        ctl: true,
+    },
+    Verb {
+        tail: "agent install-hook --remove",
+        ctl: true,
+    },
+    Verb {
+        tail: "agent install-hook --monitor",
+        ctl: true,
+    },
+    Verb {
+        tail: "uninstall",
+        ctl: true,
+    },
 ];
 
 /// The names the guard's program runs as. `ctl_name` is true for the Active
@@ -62,10 +104,22 @@ struct Name {
 }
 
 const NAMES: &[Name] = &[
-    Name { program: "innerwarden", ctl_name: false },
-    Name { program: "iw", ctl_name: false },
-    Name { program: "iw-guard", ctl_name: false },
-    Name { program: "innerwarden-ctl", ctl_name: true },
+    Name {
+        program: "innerwarden",
+        ctl_name: false,
+    },
+    Name {
+        program: "iw",
+        ctl_name: false,
+    },
+    Name {
+        program: "iw-guard",
+        ctl_name: false,
+    },
+    Name {
+        program: "innerwarden-ctl",
+        ctl_name: true,
+    },
 ];
 
 /// A wrapper in front of the command. `{C}` is replaced by `<program> <tail>`
@@ -81,22 +135,66 @@ struct Wrapper {
 }
 
 const WRAPPERS: &[Wrapper] = &[
-    Wrapper { label: "direct", template: "{C}", string: false },
-    Wrapper { label: "sh -c", template: "sh -c '{C}'", string: true },
-    Wrapper { label: "bash -c", template: "bash -c '{C}'", string: true },
-    Wrapper { label: "env -S", template: "env -S '{C}'", string: true },
-    Wrapper { label: "flock -c", template: "flock -x /tmp/x -c '{C}'", string: true },
-    Wrapper { label: "busybox sh -c", template: "busybox sh -c '{C}'", string: true },
-    Wrapper { label: "flock wrap", template: "flock /tmp/x {C}", string: false },
-    Wrapper { label: "taskset", template: "taskset -c 0 {C}", string: false },
+    Wrapper {
+        label: "direct",
+        template: "{C}",
+        string: false,
+    },
+    Wrapper {
+        label: "sh -c",
+        template: "sh -c '{C}'",
+        string: true,
+    },
+    Wrapper {
+        label: "bash -c",
+        template: "bash -c '{C}'",
+        string: true,
+    },
+    Wrapper {
+        label: "env -S",
+        template: "env -S '{C}'",
+        string: true,
+    },
+    Wrapper {
+        label: "flock -c",
+        template: "flock -x /tmp/x -c '{C}'",
+        string: true,
+    },
+    Wrapper {
+        label: "busybox sh -c",
+        template: "busybox sh -c '{C}'",
+        string: true,
+    },
+    Wrapper {
+        label: "flock wrap",
+        template: "flock /tmp/x {C}",
+        string: false,
+    },
+    Wrapper {
+        label: "taskset",
+        template: "taskset -c 0 {C}",
+        string: false,
+    },
     Wrapper {
         label: "systemd-run",
         template: "systemd-run --user --wait -q {C}",
         string: false,
     },
-    Wrapper { label: "unshare", template: "unshare -U {C}", string: false },
-    Wrapper { label: "watch", template: "watch -n 1 {C}", string: false },
-    Wrapper { label: "nice", template: "nice {C}", string: false },
+    Wrapper {
+        label: "unshare",
+        template: "unshare -U {C}",
+        string: false,
+    },
+    Wrapper {
+        label: "watch",
+        template: "watch -n 1 {C}",
+        string: false,
+    },
+    Wrapper {
+        label: "nice",
+        template: "nice {C}",
+        string: false,
+    },
     Wrapper {
         label: "env -u markers",
         template: "env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT {C}",
@@ -130,13 +228,19 @@ fn deny_cases() -> Vec<(String, String)> {
     // The spellings earlier gates found by hand: a name built from quoted
     // pieces, and a name held in a variable set on the line.
     cases.push(("'i'w dry-run".into(), "quote-split|iw|dry-run".into()));
-    cases.push(("\"i\"w uninstall claude-code".into(), "quote-split|iw|uninstall".into()));
+    cases.push((
+        "\"i\"w uninstall claude-code".into(),
+        "quote-split|iw|uninstall".into(),
+    ));
     cases.push(("I=iw; $I dry-run".into(), "variable|iw|dry-run".into()));
     cases.push((
         "export I=iw && ${I} uninstall claude-code".into(),
         "variable|iw|uninstall".into(),
     ));
-    cases.push(("G=iw-guard; V=dry-run; $G $V".into(), "variable|iw-guard|dry-run".into()));
+    cases.push((
+        "G=iw-guard; V=dry-run; $G $V".into(),
+        "variable|iw-guard|dry-run".into(),
+    ));
     cases.push((
         "C=innerwarden-ctl; $C agent install-hook --monitor".into(),
         "variable|innerwarden-ctl|install-hook".into(),
@@ -149,12 +253,24 @@ fn deny_cases() -> Vec<(String, String)> {
 fn allow_cases() -> Vec<(String, String)> {
     vec![
         ("innerwarden --version".into(), "read|version".into()),
-        ("innerwarden-ctl agent kernel status".into(), "read|kernel-status".into()),
+        (
+            "innerwarden-ctl agent kernel status".into(),
+            "read|kernel-status".into(),
+        ),
         ("innerwarden mute --list".into(), "read|mute-list".into()),
         ("innerwarden allow --list".into(), "read|allow-list".into()),
-        ("innerwarden uninstall --help".into(), "read|uninstall-help".into()),
-        ("iw uninstall --dry-run".into(), "read|uninstall-dry-run".into()),
-        ("innerwarden-ctl agent install-hook --help".into(), "read|ctl-help".into()),
+        (
+            "innerwarden uninstall --help".into(),
+            "read|uninstall-help".into(),
+        ),
+        (
+            "iw uninstall --dry-run".into(),
+            "read|uninstall-dry-run".into(),
+        ),
+        (
+            "innerwarden-ctl agent install-hook --help".into(),
+            "read|ctl-help".into(),
+        ),
         ("iw dev wlan0 scan".into(), "control|unrelated-verb".into()),
         ("grep 'iw dry-run' docs/".into(), "control|grep".into()),
         ("echo 'iw dry-run'".into(), "control|echo".into()),
