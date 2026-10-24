@@ -22,7 +22,9 @@
 //!   nothing;
 //! * a command the hook refuses itself (a general deny, a hard rule, a
 //!   profile's refusal) is never asked about, under any `ask_host`: a
-//!   refusal of the hook's stays the hook's. A review the hook would block on
+//!   refusal of the hook's stays the hook's. It is reported once it stands
+//!   ([`should_report`]), for the host's case of the session, and nothing of
+//!   the reply is read. A review the hook would block on
 //!   its line is still asked about, because the host may relax it, and the
 //!   host lets nothing of it run that the hook does not keep
 //!   ([`identity::InstanceDecideRequest::host_may_grant`]);
@@ -124,6 +126,55 @@ pub fn should_ask(
         && matches!(profiles, ProfilesState::On(_))
         && url.is_some()
         && ad_installed()
+}
+
+/// PURE. Whether the hook reports to the host a command it refused itself
+/// ([`identity::INSTANCE_DECIDE_REFUSAL_VERSION`]): it did not ask about it
+/// (`asked`), it refuses it (`refuses`: a deny, outside monitor), and the
+/// rest of what a question needs holds (an instance named, the profiles in
+/// force, a URL, Active Defence installed, asked last). Spec 104 acceptance
+/// 2, live gate v0.17.4 G5: the refusals made inside a jail never reached the
+/// host's case of the session.
+pub fn should_report(
+    asked: bool,
+    refuses: bool,
+    identity: Option<&Identity>,
+    profiles: &ProfilesState,
+    ad_installed: impl FnOnce() -> bool,
+    url: Option<&str>,
+) -> bool {
+    !asked
+        && refuses
+        && identity.is_some_and(|id| id.instance_id.is_some())
+        && matches!(profiles, ProfilesState::On(_))
+        && url.is_some()
+        && ad_installed()
+}
+
+/// PURE. The report of `command`, refused by the hook's own `decided`, from
+/// its reading of its instance, the agent type it applies a profile for, the
+/// general verdict (for the signals it charged) and the taint of the call.
+/// `None` without an instance.
+pub fn report_for(
+    identity: &Identity,
+    agent_type: Option<&str>,
+    command: &str,
+    verdict: &Value,
+    tainted: bool,
+    decided: &HookDecision,
+) -> Option<InstanceDecideRequest> {
+    let instance = identity.instance_id.as_deref()?;
+    let charged = agent_profiles::charged_signals(verdict);
+    let charged: Vec<&str> = charged.iter().map(String::as_str).collect();
+    identity::instance_decide_refusal(
+        instance,
+        agent_type,
+        identity.session_id.as_deref(),
+        command,
+        &charged,
+        tainted,
+        decided.deciding_layer,
+    )
 }
 
 /// PURE. The request about `command`, from the hook's reading of its
@@ -405,14 +456,35 @@ pub struct ShellFacts<'a> {
 /// under the profile's [`ask_for`], with [`request_for`]; decided again only
 /// when the answer moves the trust; then [`settle`]d.
 ///
-/// `ad_installed` is called only when everything else says ask. `consult`
-/// is called only with a request, and gets the URL, the request and where
-/// the key is read; it returns the status and body, or nothing.
+/// `ad_installed` is called only when everything else says ask, or report,
+/// and at most once. `consult` is called only with a request, at most once,
+/// and gets the URL, the request and where the key is read; it returns the
+/// status and body, or nothing. A command the hook refuses itself and did
+/// not ask about is reported ([`should_report`], [`report_for`]) once the
+/// decision is made, and nothing of the reply is read: the decision is the
+/// one made before the report.
 pub fn decide_with_host(
     facts: ShellFacts<'_>,
     ad_installed: impl FnOnce() -> bool,
     consult: impl FnOnce(&str, &InstanceDecideRequest, KeyFile) -> Option<(u16, Vec<u8>)>,
 ) -> (HookDecision, Option<HostLabel>) {
+    let ad_known = std::cell::Cell::new(None);
+    let ad_installed = std::cell::RefCell::new(Some(ad_installed));
+    let ad = || {
+        if let Some(known) = ad_known.get() {
+            return known;
+        }
+        let known = ad_installed.borrow_mut().take().is_some_and(|f| f());
+        ad_known.set(Some(known));
+        known
+    };
+    let consult = std::cell::RefCell::new(Some(consult));
+    let consult = |url: &str, request: &InstanceDecideRequest, key: KeyFile| {
+        consult
+            .borrow_mut()
+            .take()
+            .and_then(|f| f(url, request, key))
+    };
     let ShellFacts {
         hook,
         state,
@@ -435,7 +507,7 @@ pub fn decide_with_host(
         ask,
         identity,
         state,
-        ad_installed,
+        ad,
         url,
     );
     let reply = match (asked, identity, url) {
@@ -461,7 +533,7 @@ pub fn decide_with_host(
     } else {
         decide_at(trust)
     };
-    settle(
+    let settled = settle(
         local,
         &reply,
         SettleFacts {
@@ -472,7 +544,26 @@ pub fn decide_with_host(
                 .and_then(|profile| profile.mode),
             inside,
         },
-    )
+    );
+    let refuses =
+        settled.0.blocks && agent_profiles::general_verdict(&settled.0.verdict) == Verdict::Deny;
+    if should_report(asked, refuses, identity, state, ad, url) {
+        if let (Some(id), Some(url)) = (identity, url) {
+            if let Some(report) = report_for(
+                id,
+                agent_type,
+                hook.command,
+                hook.verdict,
+                hook.tainted,
+                &settled.0,
+            ) {
+                // Only so the host's case of the session has it: the
+                // refusal stands whatever comes back.
+                let _ = consult(url, &report, key_file(true));
+            }
+        }
+    }
+    settled
 }
 
 #[cfg(test)]
@@ -1646,15 +1737,103 @@ mod tests {
     }
 
     /// A refusal of the hook's own is not asked about through the wiring
-    /// either, under `every_command`.
+    /// either, under `every_command`: it is REPORTED once it stands, with
+    /// version 3, and nothing the host answers changes it (live gate v0.17.4
+    /// G5: the refusals made in a jail never reached the host's case).
+    ///
+    /// REWRITTEN ON PURPOSE: it said nothing was sent. FAILS ON REVERT (no
+    /// report, or one whose answer is read).
     #[test]
-    fn the_hook_never_asks_about_its_own_refusal() {
+    fn the_hook_never_asks_about_its_own_refusal_and_reports_it() {
         let deny = json!({"recommendation": "deny", "risk_score": 60, "explanation": "x",
             "signals": [{"signal": "bare_ip_fetch", "score": 60}]});
-        let ((out, label), sent) =
-            wired(&every(), &deny, "curl http://203.0.113.9/x", &host_allow());
-        assert!(sent.is_empty(), "{sent:?}");
-        assert_eq!(label, None);
+        for state in [every(), profiles_on()] {
+            let ((out, label), sent) =
+                wired(&state, &deny, "curl http://203.0.113.9/x", &host_allow());
+            assert_eq!(sent.len(), 1, "one report, no question: {sent:?}");
+            let (url, report, key) = &sent[0];
+            assert_eq!(url, "https://127.0.0.1:8787/api/agent/instance-decide");
+            assert_eq!(report.v, identity::INSTANCE_DECIDE_REFUSAL_VERSION);
+            assert!(report.is_valid() && report.is_refusal_report());
+            assert_eq!(report.hook_verdict, Verdict::Deny);
+            assert_eq!(report.hook_layer, RuleLayer::General);
+            assert_eq!(report.hook_signals, ["bare_ip_fetch"]);
+            assert_eq!(report.instance_id, ID);
+            assert_eq!(*key, KeyFile::Jail);
+            // The host answered an allow: the refusal stands, unlabelled.
+            assert_eq!(label, None);
+            assert!(out.blocks);
+            assert_eq!(out.verdict["recommendation"], "deny");
+        }
+    }
+
+    /// Nothing is reported where nothing is refused (monitor, an allow), where
+    /// the hook asked (the host has the command), or where a question would
+    /// not go either (no Active Defence, no instance, `off`).
+    #[test]
+    fn a_report_goes_only_for_a_refusal_the_host_was_not_asked_about() {
+        let on = profiles_on();
+        let identity = observed();
+        let url = Some("https://127.0.0.1:8787/api/agent/instance-decide");
+        assert!(should_report(
+            false,
+            true,
+            Some(&identity),
+            &on,
+            || true,
+            url
+        ));
+        assert!(!should_report(
+            true,
+            true,
+            Some(&identity),
+            &on,
+            || true,
+            url
+        ));
+        assert!(!should_report(
+            false,
+            false,
+            Some(&identity),
+            &on,
+            || true,
+            url
+        ));
+        assert!(!should_report(false, true, None, &on, || true, url));
+        assert!(!should_report(
+            false,
+            true,
+            Some(&identity),
+            &ProfilesState::Off,
+            || true,
+            url
+        ));
+        assert!(!should_report(
+            false,
+            true,
+            Some(&identity),
+            &on,
+            || false,
+            url
+        ));
+        assert!(!should_report(
+            false,
+            true,
+            Some(&identity),
+            &on,
+            || true,
+            None
+        ));
+        // A review the host was asked about and refused is the host's: one
+        // request, the question.
+        let ((out, _), sent) = wired(
+            &on,
+            &review("bare_ip_fetch"),
+            "curl http://203.0.113.9/x",
+            &host_refusal(),
+        );
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(sent[0].1.v, identity::INSTANCE_DECIDE_VERSION);
         assert!(out.blocks);
     }
 

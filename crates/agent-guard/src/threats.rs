@@ -4747,9 +4747,11 @@ fn rm_target_is_credential_store(target: &str) -> bool {
         .strip_prefix("/home/")
         .or_else(|| base.strip_prefix("/users/"))
     {
+        // `collapse_path` drops empty segments, so the user is never empty
+        // (nightly mutant 2026-10-24: a guard on it could never be false).
         match rest.split_once('/') {
-            Some((user, rest)) if !user.is_empty() => rest,
-            _ => return false,
+            Some((_user, rest)) => rest,
+            None => return false,
         }
     } else {
         return false;
