@@ -51,7 +51,15 @@ ones your general rules allow. A command they allow, your suppressions
 included, is made stricter only by a refusal of the host's own: the host's
 reading of your general rules does not override your suppressions. A command
 the hook refuses is never asked about. It costs a request to the host on
-every command, bounded like the others. Only the system file says
+every command, bounded like the others.
+
+A command the hook refuses itself, where it would ask the host about a
+review (an identified instance, the profiles in force, Active Defence on the
+host), is reported to the host once the refusal stands, so the host's case
+of that session lists it with the commands it was asked about. The report
+is the hook's refusal, sent after it decided: nothing the host answers
+changes it, and an Active Defence that does not know the report refuses it,
+with nothing else changing. Monitor refuses nothing, so it reports nothing. Only the system file says
 `ask_host`; the user's file never does, and a file of schema 1 that says it
 is refused. Every program that reads the system file must read schema 2
 before you write one: an older `innerwarden` refuses a file of schema 2, and

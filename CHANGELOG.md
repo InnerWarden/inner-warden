@@ -3,6 +3,25 @@
 All notable changes to InnerWarden are documented here. This project
 follows semantic versioning.
 
+## 1.6.7 - 2026-10-24
+
+### Added
+
+- **A refusal made in a jail reaches the host's case.** Inside a jail started
+  with `contain --identity`, where Active Defence runs on the host, the hook
+  now reports each shell command it refuses itself (a deny of the general
+  rules, a hard rule, a profile's refusal) to the host once the refusal
+  stands, so the host's case of that session lists it beside the commands it
+  was asked about. The refusal is the hook's, and nothing the host answers
+  changes it. An older Active Defence refuses the report, and nothing else
+  changes.
+
+### Fixed
+
+- Tests for three gaps the nightly mutation sweep found (the account's keys
+  removed behind a rewrite, the remote MCP server count of a Codex file, and a
+  guard that could never be false in the credential-store check).
+
 ## 1.6.6 - 2026-10-24
 
 ### Security
