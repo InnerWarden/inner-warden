@@ -680,6 +680,10 @@ pub struct RecordSpan {
     pub checked: usize,
     pub oldest_at_ms: Option<u64>,
     pub newest_at_ms: Option<u64>,
+    /// The record holds as many nodes as it keeps ([`Graph::MAX_NODES`]), so
+    /// the oldest are dropped as new ones arrive: the span is the newest part
+    /// of what was screened, not all of it.
+    pub capped: bool,
 }
 
 /// One reason, counted per DECISION: a decision counts once, under its
@@ -691,6 +695,27 @@ pub struct ReasonCount {
     /// The rule ids of the newest decision under this key.
     pub rules: Vec<String>,
     pub count: usize,
+    /// The decisions under this key by outcome key, non-zero keys only. Adds
+    /// up to `count`.
+    pub by_outcome: BTreeMap<&'static str, usize>,
+    /// The newest decision's whole explanation, as stored, at most
+    /// [`MAX_REASON_EXPLANATION_CHARS`] characters: `words` is only its first
+    /// clause, and a reader may need a later one to say what it was.
+    pub explanation: String,
+}
+
+/// The most characters of an explanation a reason carries. The record keeps
+/// no more than this per decision.
+pub const MAX_REASON_EXPLANATION_CHARS: usize = 300;
+
+/// One session that has decisions in the record: what [`SessionFacts`] says
+/// about it, and its decisions by outcome key (non-zero keys only).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SessionSummary {
+    /// The session, as a decision's `session` names it.
+    pub id: String,
+    pub facts: SessionFacts,
+    pub by_outcome: BTreeMap<&'static str, usize>,
 }
 
 /// What a page asks for. Every filter narrows; none widens.
@@ -1125,7 +1150,47 @@ impl Graph {
                 span.newest_at_ms = Some(span.newest_at_ms.map_or(ms, |newest| newest.max(ms)));
             }
         }
+        // Every node counts toward the cap, not only commands: `prune` drops
+        // the oldest of all of them once the store holds this many.
+        span.capped = self.nodes.len() >= Graph::MAX_NODES;
         span
+    }
+
+    /// The sessions with decisions in the record, newest last decision first
+    /// (a session with no recorded time last), at most `limit` of them.
+    ///
+    /// Built from the decisions themselves, the same derivation as the
+    /// `sessions` of a page, so a session anchor that outlived its commands is
+    /// never listed, and neither is `session:host`, the container of host
+    /// observations that holds no agent session.
+    pub fn recent_sessions(&self, limit: usize) -> Vec<SessionSummary> {
+        let rows = self.command_rows();
+        let mut by_outcome: HashMap<&str, BTreeMap<&'static str, usize>> = HashMap::new();
+        for row in &rows {
+            *by_outcome
+                .entry(row.session)
+                .or_default()
+                .entry(row.outcome)
+                .or_insert(0) += 1;
+        }
+        let mut sessions: Vec<SessionSummary> = self
+            .session_facts(&rows)
+            .into_iter()
+            .filter(|(id, _)| !id.is_empty() && id != "host")
+            .map(|(id, facts)| SessionSummary {
+                by_outcome: by_outcome.remove(id.as_str()).unwrap_or_default(),
+                id,
+                facts,
+            })
+            .collect();
+        sessions.sort_by(|a, b| {
+            b.facts
+                .last_at_ms
+                .cmp(&a.facts.last_at_ms)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        sessions.truncate(limit);
+        sessions
     }
 
     /// The agent's commands recorded at or after `from_ms`, split by outcome.
@@ -1214,6 +1279,7 @@ impl Graph {
 
         let mut by_outcome: BTreeMap<&'static str, usize> = BTreeMap::new();
         let mut reasons: HashMap<&str, (usize, &OrderKey, &Node)> = HashMap::new();
+        let mut reason_outcomes: HashMap<&str, BTreeMap<&'static str, usize>> = HashMap::new();
         let mut matching: Vec<&Row<'_>> = Vec::new();
         let mut flagged_total = 0usize;
         for row in &rows {
@@ -1235,6 +1301,11 @@ impl Graph {
                     entry.1 = &row.key;
                     entry.2 = row.node;
                 }
+                *reason_outcomes
+                    .entry(row.reason.as_str())
+                    .or_default()
+                    .entry(row.outcome)
+                    .or_insert(0) += 1;
             }
             if outcome_ok(row) && reason_ok(row) {
                 matching.push(row);
@@ -1270,6 +1341,11 @@ impl Graph {
                 words: reason_words(node),
                 rules: rules_of(node),
                 count,
+                by_outcome: reason_outcomes.remove(key).unwrap_or_default(),
+                explanation: explanation_of(node)
+                    .chars()
+                    .take(MAX_REASON_EXPLANATION_CHARS)
+                    .collect(),
             })
             .collect();
         reason_list.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.key.cmp(&b.key)));
@@ -2220,6 +2296,266 @@ mod tests {
         assert_eq!(span.oldest_at_ms, Some(1_000));
         assert_eq!(span.newest_at_ms, Some(7_000));
         assert_eq!(Graph::new().record_span(), RecordSpan::default());
+    }
+
+    fn plain_node(at: usize) -> Node {
+        Node {
+            id: format!("n{at:06}"),
+            kind: "category".into(),
+            label: String::new(),
+            attrs: BTreeMap::new(),
+        }
+    }
+
+    /// `capped` says the record holds as many nodes as it keeps, and only
+    /// then. FAILS ON REVERT: with the line gone the full record reads as
+    /// one that still keeps everything.
+    #[test]
+    fn record_span_capped_is_true_only_at_max_nodes() {
+        assert!(!record().record_span().capped);
+        let mut g = record();
+        let room = Graph::MAX_NODES - g.nodes.len();
+        g.nodes.extend((0..room - 1).map(plain_node));
+        assert_eq!(g.nodes.len(), Graph::MAX_NODES - 1);
+        assert!(!g.record_span().capped, "one short of the cap");
+        g.nodes.push(plain_node(room));
+        let span = g.record_span();
+        assert!(span.capped, "at the cap the oldest are being dropped");
+        assert_eq!(span.decisions, 7, "the cap changes no count");
+    }
+
+    /// Each reason's outcomes add up to its count, name only outcomes that
+    /// happened, and follow the outcome filter like the count does.
+    #[test]
+    fn reasons_by_outcome_add_up_to_the_reason_count() {
+        let page = record().decisions_page(&DecisionQuery::default());
+        assert!(!page.reasons.is_empty());
+        for reason in &page.reasons {
+            assert_eq!(
+                reason.by_outcome.values().sum::<usize>(),
+                reason.count,
+                "{}",
+                reason.key
+            );
+            assert!(reason.by_outcome.values().all(|count| *count > 0));
+        }
+        let tmp = page
+            .reasons
+            .iter()
+            .find(|reason| reason.key == "rule:tmp_execution")
+            .expect("the world-writable reason");
+        assert_eq!(tmp.by_outcome, BTreeMap::from([("flagged_ran", 2usize)]));
+        let filtered = record().decisions_page(&DecisionQuery {
+            outcome: Some("refused_before_run".into()),
+            ..DecisionQuery::default()
+        });
+        assert_eq!(filtered.reasons.len(), 1);
+        assert_eq!(
+            filtered.reasons[0].by_outcome,
+            BTreeMap::from([("refused_before_run", 1usize)])
+        );
+    }
+
+    /// A reason carries the whole explanation of its NEWEST decision, never
+    /// more than the record keeps.
+    #[test]
+    fn reasons_explanation_is_the_newest_decisions() {
+        let mut g = record();
+        g.ingest_verdict_with_origin(
+            "s2",
+            0,
+            "bash /tmp/third.sh",
+            &verdict(
+                "review",
+                "references world-writable directory: /tmp/third; dangerous command: bash",
+            ),
+            context(DecisionMode::Monitor, DecisionOutcome::Allowed, 50_000),
+            &origin(&["tmp_execution"]),
+        );
+        let long = format!(
+            "references world-writable directory: /tmp/{}",
+            "x".repeat(400)
+        );
+        g.ingest_verdict_with_origin(
+            "s2",
+            1,
+            "bash /tmp/long.sh",
+            &verdict("review", &long),
+            context(DecisionMode::Monitor, DecisionOutcome::Allowed, 40_000),
+            &origin(&["tmp_execution"]),
+        );
+        let page = g.decisions_page(&DecisionQuery::default());
+        let tmp = page
+            .reasons
+            .iter()
+            .find(|reason| reason.key == "rule:tmp_execution")
+            .expect("the world-writable reason");
+        assert_eq!(tmp.count, 4);
+        assert_eq!(
+            tmp.explanation,
+            "references world-writable directory: /tmp/third; dangerous command: bash"
+        );
+        assert_eq!(tmp.words, "references world-writable directory: /tmp/third");
+        let mut only_long = record();
+        only_long.ingest_verdict_with_origin(
+            "s2",
+            1,
+            "bash /tmp/long.sh",
+            &verdict("review", &long),
+            context(DecisionMode::Monitor, DecisionOutcome::Allowed, 40_000),
+            &origin(&["tmp_execution"]),
+        );
+        let page = only_long.decisions_page(&DecisionQuery::default());
+        let tmp = page
+            .reasons
+            .iter()
+            .find(|reason| reason.key == "rule:tmp_execution")
+            .expect("the world-writable reason");
+        assert!(tmp.explanation.chars().count() <= MAX_REASON_EXPLANATION_CHARS);
+        assert!(tmp
+            .explanation
+            .starts_with("references world-writable directory: /tmp/xxx"));
+    }
+
+    /// The grouping key of a fixed node is pinned: a saved `reason=` link
+    /// keeps opening the same group after this change.
+    #[test]
+    fn reason_keys_are_unchanged_by_v2() {
+        let mut g = record();
+        g.ingest_verdict_with_origin(
+            "s3",
+            0,
+            "curl http://203.0.113.9/",
+            &verdict(
+                "review",
+                "no rule matched (absence of a match is not a safety judgement); \
+                 argument `203.0.113.9` did not come from you: it arrived in a result \
+                 from Read earlier in this session",
+            ),
+            context(DecisionMode::Monitor, DecisionOutcome::Allowed, 60_000),
+            &origin(&[]),
+        );
+        let page = g.decisions_page(&DecisionQuery {
+            limit: 50,
+            ..DecisionQuery::default()
+        });
+        let key_of = |command: &str| {
+            page.items
+                .iter()
+                .find(|item| item.command == command)
+                .map(|item| item.reason_key.clone())
+                .expect(command)
+        };
+        assert_eq!(key_of("bash /tmp/run.sh"), "rule:tmp_execution");
+        assert_eq!(key_of("rm -rf /"), "rule:destructive_command");
+        assert_eq!(
+            key_of("MCP · fs · {\"path\":\"/etc/passwd\"}"),
+            "text:653fec6848b9e3b9"
+        );
+        assert_eq!(key_of("curl http://203.0.113.9/"), "text:2c1ddeb4188a2616");
+        let keys: Vec<&str> = page.reasons.iter().map(|r| r.key.as_str()).collect();
+        assert!(keys.contains(&"text:2c1ddeb4188a2616"));
+        assert!(keys.contains(&"rule:sensitive_credential_read"));
+    }
+
+    /// Every session the list knows, counted the way a page filtered to it
+    /// counts it.
+    #[test]
+    fn recent_sessions_counts_match_decisions_page() {
+        let g = record();
+        let sessions = g.recent_sessions(50);
+        assert_eq!(sessions.len(), 2);
+        for summary in &sessions {
+            let all = g.decisions_page(&DecisionQuery {
+                flagged_only: false,
+                session: Some(summary.id.clone()),
+                ..DecisionQuery::default()
+            });
+            assert_eq!(all.total, summary.facts.decisions, "{}", summary.id);
+            assert_eq!(all.by_outcome, summary.by_outcome, "{}", summary.id);
+            assert_eq!(
+                all.sessions.get(&summary.id),
+                Some(&summary.facts),
+                "{}",
+                summary.id
+            );
+            let flagged = g.decisions_page(&DecisionQuery {
+                session: Some(format!("session:{}", summary.id)),
+                ..DecisionQuery::default()
+            });
+            assert_eq!(flagged.total, summary.facts.flagged, "{}", summary.id);
+        }
+        let s1 = sessions.iter().find(|s| s.id == "s1").expect("s1");
+        assert_eq!(s1.facts.decisions, 6);
+        assert_eq!(s1.facts.flagged, 4, "a check by hand is not flagged");
+        assert_eq!(s1.facts.agent.as_deref(), Some("claude-code"));
+        assert_eq!(s1.facts.project.as_deref(), Some("my-app"));
+        assert_eq!(s1.by_outcome.get("checked_only"), Some(&1));
+    }
+
+    /// An anchor whose commands were pruned, and `session:host`, are not
+    /// sessions anybody worked in.
+    #[test]
+    fn recent_sessions_leave_out_anchors_and_the_host_session() {
+        let mut g = record();
+        for id in ["session:host", "session:s7"] {
+            g.upsert_node(Node {
+                id: id.into(),
+                kind: "session".into(),
+                label: id.trim_start_matches("session:").into(),
+                attrs: BTreeMap::new(),
+            });
+        }
+        g.ingest_verdict_with_context(
+            "host",
+            0,
+            "observed on the host",
+            &verdict("allow", ""),
+            context(DecisionMode::Monitor, DecisionOutcome::Allowed, 90_000),
+        );
+        let ids: Vec<String> = g.recent_sessions(50).into_iter().map(|s| s.id).collect();
+        assert_eq!(ids, vec!["mcp:innerwarden".to_string(), "s1".to_string()]);
+    }
+
+    /// Newest last decision first, a session with no recorded time last,
+    /// and never more than asked for.
+    #[test]
+    fn recent_sessions_are_newest_first_and_bounded() {
+        let mut g = record();
+        g.ingest_verdict_with_context(
+            "old",
+            0,
+            "ls",
+            &verdict("allow", ""),
+            context(DecisionMode::Monitor, DecisionOutcome::Allowed, 500),
+        );
+        g.ingest_verdict_with_context(
+            "newest",
+            0,
+            "ls",
+            &verdict("allow", ""),
+            context(DecisionMode::Monitor, DecisionOutcome::Allowed, 80_000),
+        );
+        g.ingest_verdict_with_context(
+            "untimed",
+            0,
+            "ls",
+            &verdict("allow", ""),
+            DecisionContext {
+                mode: DecisionMode::Monitor,
+                outcome: DecisionOutcome::Allowed,
+                recorded_at_ms: None,
+            },
+        );
+        let ids: Vec<String> = g.recent_sessions(50).into_iter().map(|s| s.id).collect();
+        assert_eq!(
+            ids,
+            ["newest", "mcp:innerwarden", "s1", "old", "untimed"].map(String::from)
+        );
+        let two: Vec<String> = g.recent_sessions(2).into_iter().map(|s| s.id).collect();
+        assert_eq!(two, ["newest", "mcp:innerwarden"].map(String::from));
+        assert!(g.recent_sessions(0).is_empty());
+        assert!(Graph::new().recent_sessions(20).is_empty());
     }
 
     #[test]

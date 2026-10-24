@@ -95,6 +95,32 @@ pub enum ToolClasses {
 /// The agent's own file tools, as `status` names them.
 pub const FILE_TOOL_NAMES: &str = "Write, Edit, MultiEdit, NotebookEdit";
 
+/// What a hook that also runs for the agent's file tools judges, in the
+/// words `status` prints after "judged before they run: ".
+fn hook_with_file_tools_words() -> String {
+    format!(
+        "shell commands, and file changes ({FILE_TOOL_NAMES}) to privileged files such \
+         as its settings, the guard's configuration and your shell startup files. Its \
+         other tools are recorded after they run."
+    )
+}
+
+/// What a hook wired before the file tools were judged leaves unjudged, in
+/// the words `status` prints after the agent's name.
+fn hook_shell_only_words() -> String {
+    format!(
+        "only shell commands are judged. Its own file tools ({FILE_TOOL_NAMES}) can \
+         change its settings, the guard's configuration or your shell startup files \
+         unchecked: its hook was wired before they were judged, or records them \
+         without refusing while its shell hook refuses."
+    )
+}
+
+/// What the MCP proxy judges, in the words `status` prints after "judged
+/// before they run: ".
+const PROXY_WORDS: &str =
+    "calls to its MCP servers. Its built-in tools are not screened by this edition.";
+
 /// PURE: the line `status` prints for what one agent's wiring judges.
 pub fn tool_classes_finding(classes: &ToolClasses) -> Finding {
     match classes {
@@ -103,30 +129,76 @@ pub fn tool_classes_finding(classes: &ToolClasses) -> Finding {
             file_tools: true,
             ..
         } => Finding::Working(format!(
-            "{agent}: judged before they run: shell commands, and file changes \
-             ({FILE_TOOL_NAMES}) to privileged files such as its settings, the guard's \
-             configuration and your shell startup files. Its other tools are recorded \
-             after they run."
+            "{agent}: judged before they run: {}",
+            hook_with_file_tools_words()
         )),
         ToolClasses::Hook {
             agent,
             file_tools: false,
             next,
         } => Finding::NotWorking {
-            what: format!(
-                "{agent}: only shell commands are judged. Its own file tools \
-                 ({FILE_TOOL_NAMES}) can change its settings, the guard's configuration \
-                 or your shell startup files unchecked: its hook was wired before they \
-                 were judged, or records them without refusing while its shell hook \
-                 refuses."
-            ),
+            what: format!("{agent}: {}", hook_shell_only_words()),
             next: next.clone(),
         },
-        ToolClasses::Proxy { agent } => Finding::Working(format!(
-            "{agent}: judged before they run: calls to its MCP servers. Its built-in \
-             tools are not screened by this edition."
-        )),
+        ToolClasses::Proxy { agent } => {
+            Finding::Working(format!("{agent}: judged before they run: {PROXY_WORDS}"))
+        }
     }
+}
+
+/// PURE: what one agent's wiring judges, as a key and as the sentence
+/// `status` prints for it without the agent's name, so the dashboard and
+/// `status` say one thing. The keys: `shell_and_privileged_files`,
+/// `shell_only` and `mcp_server_calls`.
+pub fn judges(classes: &ToolClasses) -> (&'static str, String) {
+    let sentence = |words: &str| {
+        let mut chars = words.chars();
+        chars
+            .next()
+            .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
+            .unwrap_or_default()
+    };
+    match classes {
+        ToolClasses::Hook {
+            file_tools: true, ..
+        } => (
+            "shell_and_privileged_files",
+            sentence(&hook_with_file_tools_words()),
+        ),
+        ToolClasses::Hook {
+            file_tools: false, ..
+        } => ("shell_only", sentence(&hook_shell_only_words())),
+        ToolClasses::Proxy { .. } => ("mcp_server_calls", sentence(PROXY_WORDS)),
+    }
+}
+
+/// What each of `rows` judges before a call runs: a hook agent's settings
+/// say whether its hook covers the agent's own file tools, which wiring
+/// written by an earlier version does not; an MCP agent is judged through
+/// the proxy. A hook agent whose settings cannot be read or parsed is left
+/// out: what it judges is not known. The caller passes the rows it counts
+/// as wired.
+pub fn tool_classes_for<'a>(
+    home: &std::path::Path,
+    rows: impl IntoIterator<Item = &'a innerwarden_agent_guard::agents::AgentStatus>,
+) -> Vec<ToolClasses> {
+    rows.into_iter()
+        .filter_map(|r| {
+            if !r.hookable {
+                return Some(ToolClasses::Proxy {
+                    agent: r.name.clone(),
+                });
+            }
+            let settings = std::fs::read(home.join(".claude/settings.json"))
+                .ok()
+                .and_then(|body| serde_json::from_slice::<serde_json::Value>(&body).ok())?;
+            Some(ToolClasses::Hook {
+                agent: r.name.clone(),
+                file_tools: innerwarden_agent_guard::hook::iwguard_judges_file_tools(&settings),
+                next: innerwarden_agent_guard::agents_ops::hook_repair_command(home, r),
+            })
+        })
+        .collect()
 }
 
 /// PURE: a duration a person reads at a glance, in its largest whole unit.
@@ -614,6 +686,150 @@ mod tests {
                 if what.contains("only shell commands are judged")
                     && next == "innerwarden install claude-code --monitor"
         )));
+    }
+
+    /// The three sentences `status` prints for what an agent's wiring judges,
+    /// pinned byte for byte: moving them into shared pieces changed no
+    /// output.
+    #[test]
+    fn status_tool_classes_sentences_are_byte_identical() {
+        let hook = |file_tools| ToolClasses::Hook {
+            agent: "claude-code".into(),
+            file_tools,
+            next: "innerwarden install claude-code".into(),
+        };
+        assert_eq!(
+            tool_classes_finding(&hook(true)),
+            Finding::Working(
+                "claude-code: judged before they run: shell commands, and file changes \
+                 (Write, Edit, MultiEdit, NotebookEdit) to privileged files such as its \
+                 settings, the guard's configuration and your shell startup files. Its \
+                 other tools are recorded after they run."
+                    .into()
+            )
+        );
+        assert_eq!(
+            tool_classes_finding(&hook(false)),
+            Finding::NotWorking {
+                what: "claude-code: only shell commands are judged. Its own file tools \
+                       (Write, Edit, MultiEdit, NotebookEdit) can change its settings, the \
+                       guard's configuration or your shell startup files unchecked: its hook \
+                       was wired before they were judged, or records them without refusing \
+                       while its shell hook refuses."
+                    .into(),
+                next: "innerwarden install claude-code".into(),
+            }
+        );
+        assert_eq!(
+            tool_classes_finding(&ToolClasses::Proxy {
+                agent: "codex".into()
+            }),
+            Finding::Working(
+                "codex: judged before they run: calls to its MCP servers. Its built-in \
+                 tools are not screened by this edition."
+                    .into()
+            )
+        );
+    }
+
+    /// `tool_classes_for` answers what the block `main` used to run inline
+    /// answered, row for row, on a home with a hook agent and an MCP agent,
+    /// and leaves a hook agent out when its settings cannot be parsed.
+    #[test]
+    fn status_tool_classes_for_matches_the_old_inline_read() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+        std::fs::create_dir_all(home.path().join(".cursor")).unwrap();
+        std::fs::write(
+            home.path().join(".cursor/mcp.json"),
+            r#"{"mcpServers":{"fs":{"command":"npx"}}}"#,
+        )
+        .unwrap();
+        let old_inline = |home: &std::path::Path,
+                          rows: &[innerwarden_agent_guard::agents::AgentStatus]|
+         -> Vec<ToolClasses> {
+            rows.iter()
+                .filter_map(|r| {
+                    if !r.hookable {
+                        return Some(ToolClasses::Proxy {
+                            agent: r.name.clone(),
+                        });
+                    }
+                    let settings = std::fs::read(home.join(".claude/settings.json"))
+                        .ok()
+                        .and_then(|body| serde_json::from_slice::<serde_json::Value>(&body).ok())?;
+                    Some(ToolClasses::Hook {
+                        agent: r.name.clone(),
+                        file_tools: innerwarden_agent_guard::hook::iwguard_judges_file_tools(
+                            &settings,
+                        ),
+                        next: innerwarden_agent_guard::agents_ops::hook_repair_command(home, r),
+                    })
+                })
+                .collect()
+        };
+        for settings in [
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"\"/abs/innerwarden\" hook --monitor"}]}]}}"#,
+            r#"{}"#,
+            "not json",
+        ] {
+            std::fs::write(home.path().join(".claude/settings.json"), settings).unwrap();
+            let rows = innerwarden_agent_guard::agents_ops::rows(home.path());
+            assert!(rows.iter().any(|r| r.hookable), "a hook agent row");
+            assert!(rows.iter().any(|r| !r.hookable), "an MCP agent row");
+            let classes = tool_classes_for(home.path(), &rows);
+            assert_eq!(classes, old_inline(home.path(), &rows), "{settings}");
+            assert_eq!(
+                classes
+                    .iter()
+                    .any(|c| matches!(c, ToolClasses::Hook { .. })),
+                settings != "not json",
+                "{settings}"
+            );
+        }
+    }
+
+    /// The dashboard's words for what an agent judges are the words `status`
+    /// prints for it, without the agent's name.
+    #[test]
+    fn judges_words_are_the_status_words() {
+        for (classes, key) in [
+            (
+                ToolClasses::Hook {
+                    agent: "claude-code".into(),
+                    file_tools: true,
+                    next: String::new(),
+                },
+                "shell_and_privileged_files",
+            ),
+            (
+                ToolClasses::Hook {
+                    agent: "claude-code".into(),
+                    file_tools: false,
+                    next: String::new(),
+                },
+                "shell_only",
+            ),
+            (
+                ToolClasses::Proxy {
+                    agent: "codex".into(),
+                },
+                "mcp_server_calls",
+            ),
+        ] {
+            let (found, line) = judges(&classes);
+            assert_eq!(found, key);
+            let printed = match tool_classes_finding(&classes) {
+                Finding::Working(text) => text,
+                Finding::NotWorking { what, .. } => what,
+                other => panic!("{other:?}"),
+            };
+            assert!(
+                printed.to_lowercase().ends_with(&line.to_lowercase()),
+                "{printed} / {line}"
+            );
+            assert!(line.starts_with(char::is_uppercase), "{line}");
+        }
     }
 
     /// The short-circuit must not swallow a real problem: once anything IS

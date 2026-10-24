@@ -1,0 +1,83 @@
+/* Community's visual tokens.
+ *
+ * Plain custom properties, read by utilities with the shorthand
+ * `bg-(--iw-surface)`, and the tone and pill rules keyed on data attributes,
+ * so a component picks a tone by saying which one it is, never by composing a
+ * class string. No @theme and no @apply: nothing here reaches the shared
+ * stylesheet.
+ *
+ * Imported only by `shell.tsx`, which only the Community entry point mounts,
+ * so a bundle that overlays its own entry point never loads it.
+ *
+ * Contrast, WCAG formula: every text token is at least 4.5:1 on white and on
+ * --iw-surface-2; every mark and border that carries meaning at least 3:1.
+ * There is no green token: Community reads nothing back after a command ran,
+ * so nothing here may look like a confirmation. */
+
+:root {
+  --iw-bg: #f8fafc;
+  --iw-surface: #ffffff;
+  --iw-surface-2: #f1f5f9;
+  /* Decorative 1 px borders only, never meaning. */
+  --iw-line: #e2e8f0;
+  /* Borders that carry meaning: a dashed unknown, an input. */
+  --iw-line-strong: #7c8796;
+  --iw-ink: #0f172a;
+  --iw-ink-2: #334155;
+  --iw-ink-3: #5f6b78;
+  --iw-accent: #0f6f7a;
+  /* Refused before it ran; the Enforce icon. */
+  --iw-stopped: #0f766e;
+  --iw-stopped-ink: #115e59;
+  --iw-stopped-bg: #f0fdfa;
+  /* A deny: it would have been refused, or it ran. */
+  --iw-deny: #be123c;
+  --iw-deny-ink: #9f1239;
+  --iw-deny-bg: #fff1f2;
+  /* A review, and the needs-you icon. */
+  --iw-review: #b45309;
+  --iw-needs-ink: #92400e;
+  --iw-needs-bg: #fffbeb;
+  /* Decorative. */
+  --iw-needs-line: #f2c46b;
+  --iw-allow: #64748b;
+  /* Dashed marks and dashed borders only, never text. */
+  --iw-unknown: #7c8796;
+  --iw-band: var(--iw-ink-3);
+}
+
+[data-tone="watch"]   { --iw-band: var(--iw-ink-3); }
+[data-tone="stopped"] { --iw-band: var(--iw-stopped); }
+[data-tone="needs"]   { --iw-band: var(--iw-review); }
+[data-tone="exposed"] { --iw-band: var(--iw-deny); }
+[data-tone="unknown"] { --iw-band: var(--iw-unknown); }
+
+[data-pill="enforce"] { color: var(--iw-stopped-ink); background: var(--iw-stopped-bg); border-color: #99f6e4; }
+[data-pill="monitor"], [data-pill="mixed"], [data-pill="on"] { color: var(--iw-ink-2); background: var(--iw-surface-2); border-color: var(--iw-line); }
+[data-pill="needs"]   { color: var(--iw-needs-ink); background: var(--iw-needs-bg); border-color: var(--iw-needs-line); }
+[data-pill="exposed"] { color: var(--iw-deny-ink); background: var(--iw-deny-bg); border-color: #fecdd3; }
+[data-pill="off"], [data-pill="not_available"] { color: var(--iw-ink-3); background: var(--iw-surface); border-color: var(--iw-line); }
+[data-pill="unknown"] { color: var(--iw-ink-2); background: var(--iw-surface); border: 1px dashed var(--iw-line-strong); }
+
+/*
+ * The shared lane tabs on Decisions are 44 px tall under a coarse pointer on
+ * a Community page. Here rather than in the shared file, so a bundle that
+ * composes the kit pays nothing for it.
+ */
+@media (pointer: coarse) {
+  [role="tab"][data-lane] { min-height: 44px; }
+}
+
+/*
+ * The shared header's fitted nav puts every tab in one row of equal columns.
+ * Below 400 px five Community tabs do not fit in one row: "Protection" and
+ * "Decisions" spill under their neighbours. Two rows of three columns instead,
+ * here rather than in the shared file, so a bundle that composes the kit pays
+ * nothing for it.
+ */
+@media (max-width: 400px) {
+  nav[aria-label="Dashboard views"] {
+    grid-auto-flow: row;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}

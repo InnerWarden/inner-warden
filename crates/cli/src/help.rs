@@ -1018,6 +1018,67 @@ mod tests {
         }
     }
 
+    /// The commands the dashboard prints with no per-agent argument
+    /// (`FIXED_COMMANDS` in the Community pages' `words.ts`), read out of the
+    /// list one quoted command per line.
+    fn dashboard_fixed_commands() -> Vec<String> {
+        let words = include_str!("../../dashboard-kit/web/src/community/words.ts");
+        let start = words
+            .find("export const FIXED_COMMANDS = [")
+            .expect("words.ts names FIXED_COMMANDS");
+        let body = &words[start..];
+        let end = body.find("] as const;").expect("FIXED_COMMANDS ends");
+        body[..end]
+            .lines()
+            .skip(1)
+            .filter_map(|line| {
+                let line = line.trim().trim_end_matches(',');
+                line.strip_prefix('"')
+                    .and_then(|rest| rest.strip_suffix('"'))
+                    .map(str::to_string)
+            })
+            .collect()
+    }
+
+    /// Every fixed command a dashboard page tells a person to type is one this
+    /// binary answers: its verb is dispatched natively, and every subcommand
+    /// and flag it carries is in that verb's own usage. A `<placeholder>` and
+    /// the `--` before a wrapped command are the person's to fill in.
+    ///
+    /// FAILS ON REVERT: a misspelt verb or flag in `words.ts`
+    /// (`innerwarden enforce --all`, `innerwarden agent connect`) has no usage
+    /// that holds it.
+    #[test]
+    fn dashboard_fixed_commands_are_real_cli_verbs() {
+        let commands = dashboard_fixed_commands();
+        assert!(
+            commands.len() >= 10,
+            "the list was read, not skipped: {commands:?}"
+        );
+        for command in &commands {
+            let mut words = command.split_whitespace();
+            assert_eq!(words.next(), Some("innerwarden"), "{command}");
+            let verb = words.next().unwrap_or_else(|| panic!("{command}: no verb"));
+            assert!(
+                NATIVE_VERBS.contains(&verb),
+                "{command}: `{verb}` is not a verb this binary dispatches"
+            );
+            let rest: Vec<String> = words.clone().map(str::to_string).collect();
+            let text = usage(verb, &rest)
+                .unwrap_or_else(|| panic!("{command}: `{verb}` has no usage of its own"));
+            for word in words {
+                if word == "--" || (word.starts_with('<') && word.ends_with('>')) {
+                    continue;
+                }
+                assert!(
+                    text.split(|c: char| c.is_whitespace() || "[]|".contains(c))
+                        .any(|token| token == word),
+                    "{command}: `{word}` is not in the usage of `{verb}`:\n{text}"
+                );
+            }
+        }
+    }
+
     /// Every verb `main` dispatches natively. Kept beside the usage table so the
     /// synopsis rule above is checked against all of them.
     const NATIVE_VERBS: &[&str] = &[

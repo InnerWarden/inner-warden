@@ -1,6 +1,7 @@
 import {
   DASHBOARD_ACCESS,
   DASHBOARD_SCHEMA_VERSION,
+  PLAN_STATES,
   type AgentCapabilityState,
   type AgentInventory,
   type AgentKernel,
@@ -19,6 +20,9 @@ import {
   type LocalModelReport,
   type MeasuredValue,
   type Metric,
+  type PlanNotice,
+  PLAN_LINE_MAX,
+  PLAN_STEP_MAX,
   type ProtectionLayer,
   type ScopeRef,
   type SourceRef,
@@ -320,6 +324,48 @@ export function auditTrailViewOf(value: unknown): string | undefined {
   return typeof value === "string" && /^[a-z][a-z0-9_-]{0,63}$/.test(value) ? value : undefined;
 }
 
+/**
+ * One line of the host's words: trimmed, 1 to `maximum` characters, and no
+ * line break, control or format character (the bidi overrides among them,
+ * as `hasControlCharacters` refuses them).
+ */
+function planLine(value: unknown, maximum: number): string | undefined {
+  const line = typeof value === "string" ? value.trim() : "";
+  return line !== "" && line.length <= maximum && !/[\p{Cc}\p{Cf}\u2028\u2029]/u.test(line) ? line : undefined;
+}
+
+/** An RFC 3339 date-time, or `undefined`. */
+function planTime(value: unknown): string | undefined {
+  return typeof value === "string" && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?(Z|[+-]\d\d:\d\d)$/.test(value) && !isNaN(Date.parse(value))
+    ? value
+    : undefined;
+}
+
+/**
+ * `plan_notice`, read leniently like `dashboard_access`: it never refuses the
+ * bootstrap. A known state is kept whatever its line: a line that is not
+ * usable is dropped alone, so free mode is never lost because of its words.
+ * A state this bundle does not know is `unknown` when there is a line to
+ * print, and is never read as `active`; no object, or neither a known state
+ * nor a line, is read as not sent. A step or time that is not well formed is
+ * dropped alone.
+ */
+export function planNoticeOf(value: unknown): PlanNotice | undefined {
+  const item = (typeof value === "object" && value !== null ? value : {}) as Record<string, unknown>;
+  const line = planLine(item.line, PLAN_LINE_MAX);
+  const state = PLAN_STATES.find((candidate) => candidate === item.state) ?? (line === undefined ? undefined : "unknown");
+  if (state === undefined) return undefined;
+  const notice: PlanNotice = { state };
+  if (line !== undefined) notice.line = line;
+  const step = planLine(item.step, PLAN_STEP_MAX);
+  const since = planTime(item.since);
+  const until = planTime(item.until);
+  if (step !== undefined) notice.step = step;
+  if (since !== undefined) notice.since = since;
+  if (until !== undefined) notice.until = until;
+  return notice;
+}
+
 export function parseDashboardBootstrap(value: unknown): DashboardBootstrap {
   const item = record(value, "bootstrap");
   if (item.schema_version !== DASHBOARD_SCHEMA_VERSION) throw new Error("bootstrap.schema_version: unsupported contract version");
@@ -328,11 +374,13 @@ export function parseDashboardBootstrap(value: unknown): DashboardBootstrap {
   const privacy = record(item.privacy, "bootstrap.privacy");
   const access = dashboardAccessOf(item.dashboard_access);
   const auditTrail = auditTrailViewOf(item.audit_trail_view);
+  const plan = planNoticeOf(item.plan_notice);
   return {
     // Only when sent and known: an older server's bootstrap has no such key,
     // and the parsed value must not grow one either.
     ...(access === undefined ? {} : { dashboard_access: access }),
     ...(auditTrail === undefined ? {} : { audit_trail_view: auditTrail }),
+    ...(plan === undefined ? {} : { plan_notice: plan }),
     schema_version: DASHBOARD_SCHEMA_VERSION, generated_at: text(item.generated_at, "bootstrap.generated_at"),
     edition: oneOf(item.edition, ["community", "enterprise"] as const, "bootstrap.edition"), product_version: text(item.product_version, "bootstrap.product_version"),
     community_contract: versionRef(item.community_contract, "bootstrap.community_contract"),

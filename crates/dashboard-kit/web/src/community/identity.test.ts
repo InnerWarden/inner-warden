@@ -1,11 +1,9 @@
 import { describe, expect, it } from "vitest";
 import type { AgentsResponse } from "../api";
 import agentsFixture from "../../tests/fixtures/community/agents.json";
-import { agentRows, awaitingApproval, decisionSentence, trustCounts } from "./agentsView";
+import { agentGroups, agentRows, awaitingApproval, decisionSentence, factsOf, trustCounts } from "./agentsView";
 import { readAgentIdentity, readDecisionIdentity, readHistory, MAX_INSTANCES } from "./api";
 import historyFixture from "../../tests/fixtures/community/history.json";
-import { agentsOffer, PRICING_URL } from "./offers";
-import { OFFER_KEYS } from "./dismiss";
 import {
   agentTrustSentence,
   effectiveTrust,
@@ -252,15 +250,6 @@ describe("the Changes list", () => {
   });
 });
 
-describe("the one Active Defence line", () => {
-  it("has its own remembered slot, links to pricing once, and says nothing of this machine", () => {
-    const offer = agentsOffer();
-    expect(offer).toMatchObject({ slot: "agents", key: "agent_kernel", href: PRICING_URL, body: "Contained agents are checked by the kernel with Active Defence." });
-    expect(OFFER_KEYS.agents).toBe("iw-community-offer-v1:agents");
-    expect(new Set(Object.values(OFFER_KEYS)).size).toBe(Object.keys(OFFER_KEYS).length);
-  });
-});
-
 describe("the CLI's identity fixtures read as written", () => {
   it("reads every row and instance the CLI serves, and every hook reason has words", async () => {
     const identityAgents = (await import("../../tests/fixtures/community/agents-identity.json")).default as unknown as AgentsResponse;
@@ -327,5 +316,22 @@ describe("user namespaces inside the jail are a fact, not a reason", () => {
     // A reason the CLI no longer sends is not read into the view.
     expect(Object.keys(first(read({ userns_open_reason: "bwrap_setuid" }))?.technical ?? {})).not.toContain("usernsOpenReason");
     expect(first(read({ userns_closed: true }))?.trust).toBe(first(read({}))?.trust);
+  });
+});
+
+describe("the Agents page draws identity beside each agent, never instead of it", () => {
+  it("keeps every identity row in a group of the page, with its identity joined by id", async () => {
+    const identityAgents = (await import("../../tests/fixtures/community/agents-identity.json")).default as unknown as AgentsResponse;
+    const facts = factsOf(identityAgents).facts;
+    expect(facts).toBeDefined();
+    const groups = agentGroups(facts!.agents);
+    const grouped = [...groups.connected, ...groups.found, ...groups.jailOnly].map((agent) => agent.id);
+    // Every agent the CLI sent is in exactly one group.
+    expect(grouped.slice().sort()).toEqual(facts!.agents.map((agent) => agent.id).sort());
+    expect(new Set(grouped).size).toBe(grouped.length);
+    // The identity of each is read from the same answer, by the same id.
+    const rows = new Map(agentRows(identityAgents).map((row) => [row.id, row]));
+    for (const id of grouped) expect(rows.has(id), id).toBe(true);
+    expect(rows.get("claude-code")?.who?.trust).toBe("observed");
   });
 });

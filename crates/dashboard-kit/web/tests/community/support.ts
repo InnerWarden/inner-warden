@@ -18,7 +18,7 @@ export const FIXTURE_NOW_MS = Date.UTC(2026, 8, 29, 14, 5, 0);
 export const S_APP = "4b1d9c2e-demo-4000-8000-000000000001";
 export const S_INFRA = "7e0a55f1-demo-4000-8000-000000000002";
 
-/** Fixture cases, by what happened to them. */
+/** Fixture decisions, by what happened to them. */
 export const CASE = {
   /** `cat ~/.ssh/config` in monitor mode: a deny, recorded, and it ran. */
   wouldRefuse: `cmd:${S_APP}:66`,
@@ -176,8 +176,31 @@ export async function pageWidth(page: Page) {
  * link to innerwarden.com, and nothing drawn blurred (no locked screen, no
  * teaser behind frosted glass).
  */
+/**
+ * The only words a Community page may name the paid edition in (spec 10.6):
+ * the generic line, the installed line, the Linux relaxation sentence, and
+ * the attribution words that say which layer decided a command. An
+ * allow-list of what may be said, never a list of names.
+ */
+export const EDITION_LINES = {
+  generic: "Active Defence adds host-level protection for Linux servers.",
+  installed: "Active Defence is installed on this host.",
+  relaxation: "Per-agent relaxations apply on Linux with Active Defence, for an agent started with innerwarden contain --identity.",
+} as const;
+const ATTRIBUTION = /Active Defence on (?:this|its|the) host/g;
+
+/** Everything the page says about the paid edition is one of `EDITION_LINES`, or an attribution. */
+export async function expectOnlyEditionLines(page: Page) {
+  let rest = await page.locator("body").innerText();
+  for (const line of Object.values(EDITION_LINES)) rest = rest.split(line).join("");
+  expect(rest.replace(ATTRIBUTION, ""), "the page names the paid edition outside the permitted lines").not.toContain("Active Defence");
+}
+
 export async function expectHonestUpsell(page: Page) {
-  expect(await page.locator('a[href^="https://innerwarden.com"]').count()).toBeLessThanOrEqual(1);
+  const links = await page.locator('a[href^="https://innerwarden.com"]').evaluateAll((anchors) => anchors.map((anchor) => anchor.getAttribute("href") ?? ""));
+  expect(links.length).toBeLessThanOrEqual(1);
+  for (const href of links) expect(href, "a link out carries no query string").not.toMatch(/[?#]/);
+  await expectOnlyEditionLines(page);
   const blurred = await page.evaluate(() =>
     Array.from(document.querySelectorAll("*")).filter((element) => {
       const style = getComputedStyle(element);
@@ -187,20 +210,25 @@ export async function expectHonestUpsell(page: Page) {
   expect(blurred).toBe(0);
 }
 
-/** The five Community tabs, in the nav's order, with the route each opens. */
+/**
+ * The five Community tabs, in the nav's order: the label the nav shows, the
+ * route each opens, and the name a generated test title uses. That name is
+ * kept as it was before the activity tab was renamed Decisions, because a
+ * composing bundle matches these tests by their exact titles.
+ */
 export const COMMUNITY_TABS = [
-  ["Overview", "/"],
-  ["Protection", "/?view=posture"],
-  ["Cases", "/?view=activity"],
-  ["Agents", "/?view=agents"],
-  ["Tokens", "/?view=tokens"],
+  ["Overview", "/", "Overview"],
+  ["Protection", "/?view=posture", "Protection"],
+  ["Decisions", "/?view=activity", "Cases"],
+  ["Agents", "/?view=agents", "Agents"],
+  ["Tokens", "/?view=tokens", "Tokens"],
 ] as const;
 
 /** What each page draws once it has an answer, to wait on before measuring. */
 export const PAGE_READY: Record<(typeof COMMUNITY_TABS)[number][0], string> = {
-  Overview: "#on-machine-title",
+  Overview: "#verdict-title",
   Protection: "#protection-title",
-  Cases: "#cases-title",
+  Decisions: "#decisions-title",
   Agents: "#agents-title",
   Tokens: "#tokens-title",
 };

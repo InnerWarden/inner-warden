@@ -1003,6 +1003,12 @@ pub fn recommendation_for_score(score: u32) -> &'static str {
     }
 }
 
+/// The explanation a command gets when no rule matched it. Readers that word
+/// a decision for a person compare against this text, so it is one constant:
+/// a reworded copy elsewhere would stop matching without a test noticing.
+pub const NO_MATCH_EXPLANATION: &str =
+    "no rule matched (absence of a match is not a safety judgement)";
+
 /// Analyze a command for dangerous patterns. Unifies all threat detection
 /// (builtin patterns + ATR rules) into a single scored result.
 pub fn analyze_command(command: &str, rule_engine: Option<&RuleEngine>) -> CommandAnalysis {
@@ -1889,7 +1895,7 @@ fn analyze_command_at(
     // node's 300-character budget restating one observation three ways, pushing the
     // reasons that did carry the verdict past the truncation.
     let explanation = if signals.is_empty() {
-        "no rule matched (absence of a match is not a safety judgement)".to_string()
+        NO_MATCH_EXPLANATION.to_string()
     } else {
         let charged: Vec<&str> = signals
             .iter()
@@ -2003,6 +2009,28 @@ fn check_shell_internal_target(command: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The constant is the exact text the guard has always written, and the
+    /// text a command no rule matches still gets. FAILS ON REVERT of either
+    /// a reworded constant or a literal put back in `analyze_command_at`.
+    #[test]
+    fn no_match_explanation_is_byte_identical() {
+        assert_eq!(
+            NO_MATCH_EXPLANATION,
+            "no rule matched (absence of a match is not a safety judgement)"
+        );
+        let analysis = analyze_command("ls", None);
+        assert_eq!(analysis.explanation, NO_MATCH_EXPLANATION);
+        let source = include_str!("mcp.rs");
+        let production = &source[..source.find("#[cfg(test)]").expect("a test module")];
+        assert_eq!(
+            production
+                .matches("\"no rule matched (absence of a match is not a safety judgement)\"")
+                .count(),
+            1,
+            "the text is written once, in the constant"
+        );
+    }
 
     /// Every cloud's metadata service a shell can reach is an internal
     /// target: EC2, Azure and GCP (169.254.169.254, metadata.google.internal),

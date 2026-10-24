@@ -149,6 +149,51 @@ fn connecting_an_agent_says_it_must_be_restarted() {
         "the hook is read at agent STARTUP; without this line the user returns \
          to an unscreened session believing it is screened, got:\n{out}"
     );
+    // How to restart THIS agent, not only that agents must be restarted.
+    // FAILS ON REVERT of the call site to the shared line alone.
+    assert!(
+        out.contains("  New Agent: Quit New Agent and start it again."),
+        "each connected agent's own restart words, got:\n{out}"
+    );
+}
+
+/// A mode switch changes every connected agent's config: each one is named
+/// with how to restart it. FAILS ON REVERT of either call site to the shared
+/// line alone (`enforce` and `dry-run` share one; `connect` has its own).
+#[test]
+fn a_mode_switch_says_how_to_restart_each_connected_agent() {
+    let home = tempfile::TempDir::new().unwrap();
+    a_guardable_agent(home.path());
+    let connected = run(home.path(), &["agents", "connect", "--all", "--monitor"]);
+    assert!(connected.contains("new-agent"), "{connected}");
+    for verb in ["enforce", "dry-run"] {
+        let out = run(home.path(), &[verb]);
+        assert!(out.contains("Restart guarded agents"), "{verb}: {out}");
+        assert!(
+            out.contains("  New Agent: Quit New Agent and start it again."),
+            "{verb} must say how to restart each agent it switched, got:\n{out}"
+        );
+    }
+}
+
+/// `install` wires Claude Code's hook: it says how to restart Claude Code,
+/// in the same words as every other step.
+#[test]
+fn install_says_how_to_restart_claude_code() {
+    let home = tempfile::TempDir::new().unwrap();
+    // A configured Claude Code (an empty ~/.claude is no sign of it), so the
+    // run does not depend on a `claude` on this machine's PATH.
+    std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+    std::fs::write(home.path().join(".claude/settings.json"), "{}\n").unwrap();
+    let out = run(home.path(), &["install"]);
+    assert!(
+        out.contains("InnerWarden guard hook installed for claude-code"),
+        "{out}"
+    );
+    assert!(
+        out.contains("  Claude Code: In Claude Code, type /exit, then run claude."),
+        "install must say how to restart the agent whose hook it wrote, got:\n{out}"
+    );
 }
 
 /// Telling someone to restart after they deliberately unwired is noise, and a

@@ -1,185 +1,341 @@
+import { useMemo, type ReactNode } from "react";
 import type { CommunityScreenContext } from "../App";
-import { fetchAgents, type AgentsResponse } from "../api";
-import { MachineIntelligence } from "../components/MachineIntelligence";
+import type { AgentsResponse } from "../api";
 import { TechnicalOnly } from "../components/TechnicalDetail";
 import { When } from "../components/When";
-import { agentRows, decisionSentence, type AgentRow } from "./agentsView";
-import { fetchHistory, readProfilesFile, readUnnamedByChannel, type AgentNextStep, type LocalInstance } from "./api";
-import { OfferLine } from "./Offer";
-import { agentsOffer } from "./offers";
-import { CARD, Chip, CopyCommand, PageHeader, Skeleton, StaleLine, Unreadable, type ChipTone } from "./parts";
-import { usePolled } from "./poll";
-import { LAUNCH_MODE_WORDS, LIFECYCLE_WORDS, reasonWords, STATE_WORDS, trustWord, USERNS_CLOSED_WORDS, type AgentState, type Trust, type TrustSource } from "./words";
-
-export const AGENTS_PAGE_POLL_MS = 30_000;
-
-const STATE_TONE: Record<AgentState, ChipTone> = {
-  refusing: "accent",
-  watching: "watch",
-  partial: "needs",
-  not_connected: "needs",
-  unsupported: "off",
-  unknown: "watch",
-};
-
-const MECHANISM_WORDS = { hook: "Shell hook", mcp: "MCP proxy" } as const;
-
-/** What automatic setup is doing, in one line, from the policy the CLI read. */
-export function autoConnectLine(response: AgentsResponse | undefined): { text: string; command?: string } | undefined {
-  const auto = response?.auto_connect;
-  if (auto === undefined || auto.status === "unavailable" || auto.enabled === null) return undefined;
-  if (auto.enabled) {
-    return { text: "Automatic setup is on: while this dashboard runs, it connects new agents in monitor mode, checking every minute." };
-  }
-  return { text: "Automatic setup is off. This turns it on, in monitor mode:", command: "innerwarden agents auto-connect --monitor" };
-}
-
-function rowLine(row: AgentRow): string | undefined {
-  if (row.state === "unsupported") return "This agent has no hook or MCP configuration the guard can use yet.";
-  if (row.state === "not_connected" && !row.needsYou) return "Found a configuration for it; the agent itself was not found on this machine.";
-  return undefined;
-}
-
-const CONNECTED: readonly AgentRow["state"][] = ["refusing", "watching", "partial"];
+import { formatAbsolute } from "../presentation";
+import {
+  agentGroups,
+  agentRows,
+  AUTO_SETUP_STEP,
+  autoSetupLine,
+  decisionSentence,
+  factsOf,
+  programWords,
+  restartPrompt,
+  runningWords,
+  type AgentRow,
+} from "./agentsView";
+import { readProfilesFile, type AgentFacts, type AgentNextStep, type LocalInstance } from "./api";
+import { JAIL_STEP, mcpLines, screeningState } from "./controls";
+import { CONNECT_ALL } from "./Overview";
+import { StaleLine } from "./parts";
+import { restartFor } from "./restart";
+import { useSource } from "./store";
+import { BODY_TEXT, H2, H3, LINK_TEXT, META_TEXT, NotRead, onPlainClick, PAGE_TITLE, PANEL, Pending, ReadAt, RestartNote, SMALL_TEXT, StepBlock } from "./ui/blocks";
+import { Icon } from "./ui/Icon";
+import { StatusPill } from "./ui/marks";
+import { AgentModePill, MECHANISM_WORDS, SeenCell } from "./ui/rows";
+import type { Restart } from "./verdict";
+import {
+  asPlatform,
+  LAUNCH_MODE_WORDS,
+  LIFECYCLE_WORDS,
+  MONITOR_MEANS,
+  reasonWords,
+  trustWord,
+  USERNS_CLOSED_WORDS,
+  type PlatformOs,
+  type Trust,
+  type TrustSource,
+} from "./words";
 
 /**
- * When the guard last screened something for this agent, by what it screens
- * (a shell hook screens commands, the MCP proxy tool calls), or that nothing
- * has been screened yet. Said only from facts: "nothing yet" only where the
- * channel holds no decision that names nobody (`unnamed`), since such a
- * decision could be this agent's; otherwise no line.
- */
-export function screenedLine(row: AgentRow, unnamed: { hook?: string; mcp?: string } | undefined): { at?: string; words: string } | undefined {
-  if (!CONNECTED.includes(row.state) || row.mechanism === undefined) return undefined;
-  const thing = row.mechanism === "mcp" ? "tool call" : "command";
-  if (row.lastScreenedAt !== undefined) return { at: row.lastScreenedAt, words: `Last screened a ${thing}` };
-  if (unnamed !== undefined && unnamed[row.mechanism] === undefined) return { words: `No ${thing} screened yet.` };
-  return undefined;
-}
-
-/**
- * Community's Agents: one row per AI agent on this machine, whether the guard
- * is in front of it, and the one command (the CLI's, printed as sent) that
- * changes that. The spec sheet of each agent is the technical view's.
+ * Community's Agents (spec 6.4): the AI agents on this machine and how each
+ * one reaches the guard. Connected (the config) and screened (what was seen)
+ * stay apart on every card; a change the person makes is followed by how to
+ * restart that agent and why, because only they can; the technical view adds
+ * evidence and never a different claim.
  */
 export function CommunityAgents({ context }: { context?: CommunityScreenContext } = {}) {
-  const agents = usePolled(fetchAgents, AGENTS_PAGE_POLL_MS, "agents");
-  const rows = agentRows(agents.data);
-  const auto = autoConnectLine(agents.data);
-  const unnamed = readUnnamedByChannel(agents.data);
+  const agents = useSource("agents");
+  const protection = useSource("protection");
+  const read = useMemo(() => factsOf(agents.data), [agents.data]);
+  const facts = read.facts;
+  const rows = useMemo(() => new Map(agentRows(facts === undefined ? undefined : (agents.data as AgentsResponse)).map((row) => [row.id, row])), [agents.data, facts]);
   const profilesFile = readProfilesFile(agents.data);
-  return (
-    <div className="min-w-0 space-y-5" data-tour="agents">
-      <PageHeader
-        eyebrow="Agents"
-        title="Agents"
-        titleId="agents-title"
-        description="AI agents on this machine, and whether the guard is in front of each one."
-      />
-      {auto === undefined ? null : (
-        <div className="text-sm leading-6 text-slate-600">
-          <p>{auto.text}</p>
-          {auto.command === undefined ? null : <CopyCommand command={auto.command} className="mt-1 max-w-xl" />}
-        </div>
-      )}
-      {agents.stale ? <StaleLine onRetry={agents.refresh} /> : null}
-      {profilesFile === undefined ? null : (
-        <div data-profiles-invalid className={CARD}>
-          <Chip tone="needs" label="Invalid profiles file" />
-          <p className="mt-2 text-sm leading-6 text-slate-700">{profilesFile.sentence}</p>
-        </div>
-      )}
-      {agents.data === undefined ? (
-        agents.error === undefined ? <Skeleton className="h-48" /> : <Unreadable title="Agents did not answer" onRetry={agents.refresh} />
-      ) : agents.data.availability === "loading" ? (
-        <Skeleton className="h-48" />
-      ) : rows.length === 0 ? (
-        <div className={CARD}>
-          <p className="text-sm font-semibold text-slate-900">No AI agent found on this machine</p>
-          <p className="mt-1 text-sm leading-6 text-slate-600">When one is installed, this finds it and connects it:</p>
-          <CopyCommand command="innerwarden agents connect --all --monitor" className="mt-2 max-w-xl" />
-        </div>
-      ) : (
-        <section aria-labelledby="agents-list-title" className={CARD}>
-          <h2 id="agents-list-title" className="sr-only">Agents on this machine</h2>
-          <ul className="divide-y divide-slate-100">
-            {rows.map((row) => (
-              <li key={row.id} data-agent={row.id} data-agent-state={row.state} className="flex flex-col gap-2 py-4 first:pt-0 last:pb-0 sm:flex-row sm:gap-6">
-                <div className="min-w-0 sm:w-56 sm:shrink-0">
-                  <p className="text-sm font-semibold text-slate-950">{row.name}</p>
-                  <p className="text-xs text-slate-500">{row.mechanism === undefined ? "No connection it can use" : MECHANISM_WORDS[row.mechanism]}</p>
-                </div>
-                <div className="min-w-0 flex-1">
-                  <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
-                    <Chip tone={row.state === "not_connected" && !row.needsYou ? "off" : STATE_TONE[row.state]} label={STATE_WORDS[row.state]} />
-                    {row.who?.trust === undefined ? null : <TrustChip trust={row.who.trust} />}
-                    {row.who?.lifecycle === undefined || LIFECYCLE_WORDS[row.who.lifecycle] === undefined ? null : (
-                      <span data-lifecycle={row.who.lifecycle}>
-                        <Chip tone={row.who.lifecycle === "discovered" ? "needs" : "off"} label={LIFECYCLE_WORDS[row.who.lifecycle] ?? ""} />
-                      </span>
-                    )}
-                    {(() => {
-                      const screened = screenedLine(row, unnamed);
-                      if (screened === undefined) return null;
-                      return (
-                        <span data-screened className="text-xs text-slate-600">
-                          {screened.words}
-                          {screened.at === undefined ? null : <> <When at={screened.at} relative /></>}
-                        </span>
-                      );
-                    })()}
-                    {row.running === true ? <span className="text-xs text-slate-600">Running now</span> : null}
-                  </div>
-                  {rowLine(row) === undefined ? null : <p className="mt-1 text-sm leading-6 text-slate-600">{rowLine(row)}</p>}
-                  {[row.next, row.identity].map((step) =>
-                    step === undefined ? null : (
-                      <div key={step.command} className="mt-2 max-w-xl">
-                        <p className="text-xs font-semibold text-slate-700">{step.label}</p>
-                        <CopyCommand command={step.command} className="mt-1" />
-                        <p className="mt-1 text-xs leading-5 text-slate-600">{step.line}</p>
-                      </div>
-                    ),
-                  )}
-                  {row.who === undefined ? null : <WhoBlock row={row} context={context} />}
-                </div>
-              </li>
+  const os = asPlatform(protection.data?.os ?? context?.bootstrap?.platform.os);
+  const now = Date.now();
+  const openProtectionMode = () => {
+    context?.navigate("posture");
+    setTimeout(() => document.getElementById("mode")?.scrollIntoView({ block: "start" }), 0);
+  };
+  const openDecision = (id: string) => context?.navigate("activity", { decision: id });
+  const auto = autoSetupLine(facts?.autoConnect);
+  const groups = facts === undefined ? undefined : agentGroups(facts.agents);
+  const anyConnected = (groups?.connected.length ?? 0) > 0;
+
+  let body: ReactNode;
+  if (facts === undefined) {
+    body = read.unreadable || agents.error !== undefined ? (
+      <NotRead alert onRetry={agents.refresh}>
+        {read.unreadable ? "Not read: the agents' answer could not be read." : "Not read: the dashboard did not answer for the agents."} Nothing here is counted as not connected.
+      </NotRead>
+    ) : (
+      <Pending label="Reading the agents on this machine" className="h-48" />
+    );
+  } else if (facts.agents.length === 0) {
+    body = (
+      <section aria-labelledby="agents-none-title" className={`${PANEL} space-y-3`}>
+        <h2 id="agents-none-title" className={H2}>No AI agent found on this machine</h2>
+        <StepBlock
+          step={{ label: "When one is installed, this finds it and connects it:", command: CONNECT_ALL, line: "Connects every agent it finds, in monitor: it records and refuses nothing." }}
+          restarts={[{ agent: "your agent", words: restartFor("", "your agent", undefined) }]}
+        />
+      </section>
+    );
+  } else {
+    body = (
+      <>
+        {groups!.connected.length === 0 ? null : (
+          <ul data-agents-connected className="min-w-0 space-y-6">
+            {groups!.connected.map((agent) => (
+              <AgentCard
+                key={agent.id}
+                agent={agent}
+                row={rows.get(agent.id)}
+                unnamed={facts.unnamed}
+                os={os}
+                now={now}
+                onProtectionMode={openProtectionMode}
+                onDecision={openDecision}
+              />
             ))}
           </ul>
-          {rows.some((row) => row.running === null) ? (
-            <TechnicalOnly>
-              <p className="mt-3 text-xs text-slate-500">Whether an agent is running is not checked on this platform.</p>
-            </TechnicalOnly>
-          ) : null}
-        </section>
+        )}
+        {groups!.found.length === 0 ? null : <FoundHere agents={groups!.found} rows={rows} os={os} />}
+        {groups!.jailOnly.length === 0 ? null : <JailOnly agents={groups!.jailOnly} rows={rows} os={os} jailAvailable={protection.data?.jail.available} />}
+      </>
+    );
+  }
+
+  return (
+    <div data-agents className="min-w-0 space-y-8" data-tour="agents">
+      <div className="space-y-2">
+        <h1 id="agents-title" tabIndex={-1} className={PAGE_TITLE}>Agents</h1>
+        <p className={BODY_TEXT}>The AI agents on this machine and how each one reaches the guard.</p>
+        {auto === undefined ? null : <p data-auto-setup className={BODY_TEXT}>{auto}</p>}
+        {facts?.autoConnect?.enabled === false ? (
+          <div className="max-w-xl">
+            <StepBlock step={AUTO_SETUP_STEP} />
+            <p className={`mt-2 ${META_TEXT}`}>An agent it connects reads the change when it next starts.</p>
+          </div>
+        ) : null}
+        {anyConnected ? <p data-monitor-means className={META_TEXT}>{MONITOR_MEANS}</p> : null}
+      </div>
+      {agents.stale ? <StaleLine onRetry={agents.refresh} /> : null}
+      {profilesFile === undefined ? null : (
+        <div data-profiles-invalid className={`${PANEL} space-y-2`}>
+          <StatusPill state="needs" words="Invalid profiles file" />
+          <p className={BODY_TEXT}>{profilesFile.sentence}</p>
+        </div>
       )}
-      {rows.some((row) => (row.who?.instances.length ?? 0) > 0) ? (
-        <OfferLine offer={agentsOffer()} installed={context?.meta?.active_defence_installed === true} />
-      ) : null}
-      {rows.some((row) => row.who !== undefined) ? <AgentChanges names={new Map(rows.map((row) => [row.id, row.name]))} /> : null}
+      {body}
       <TechnicalOnly>
-        <MachineIntelligence edition="community" showAgents showTokens={false} tones="neutral" />
+        <div data-agents-technical className="space-y-4">
+          {facts?.discoveryLimited === true ? (
+            <p className={META_TEXT}>Discovery stopped at its local safety limit: an agent may be missing from this list.</p>
+          ) : null}
+          {rows.size === 0 ? null : <AgentChanges names={new Map([...rows.values()].map((row) => [row.id, row.name]))} />}
+        </div>
       </TechnicalOnly>
+      <ReadAt data={agents.data} path="/api/guard/agents" />
     </div>
   );
 }
 
-/** The trust chip: the words and the tooltip are the closed table's, the tone the page's grey. */
-function TrustChip({ trust, source }: { trust: Trust; source?: TrustSource }) {
+function restartOf(agent: AgentFacts): Restart {
+  return { agent: agent.name, words: restartFor(agent.id, agent.name, agent.restart) };
+}
+
+/** The one step that changes this agent: its own switch when the CLI sends one, or the step that finishes connecting it. */
+function changeStep(agent: AgentFacts): AgentNextStep | undefined {
+  if (agent.mode === "partial") return agent.nextStep;
+  if (agent.mode === "enforce") return agent.modeSteps?.monitor;
+  if (agent.mode === "monitor") return agent.modeSteps?.enforce;
+  if (agent.mode === "mixed") return agent.modeSteps?.enforce ?? agent.modeSteps?.monitor;
+  return undefined;
+}
+
+function AgentCard({
+  agent,
+  row,
+  unnamed,
+  os,
+  now,
+  onProtectionMode,
+  onDecision,
+}: {
+  agent: AgentFacts;
+  row?: AgentRow;
+  unnamed: { hook?: string; mcp?: string } | undefined;
+  os: PlatformOs;
+  now: number;
+  onProtectionMode: () => void;
+  onDecision: (id: string) => void;
+}) {
+  const state = screeningState(agent, unnamed);
+  const prompt = restartPrompt(agent, unnamed, now);
+  const step = changeStep(agent);
+  const restart = restartOf(agent);
+  const titleId = `agent-${agent.id}-title`;
+  return (
+    <li data-agent={agent.id} data-agent-state={row?.state ?? "unknown"} data-control-state={state}>
+      <article id={`agent-${agent.id}`} aria-labelledby={titleId} className={`${PANEL} space-y-3`}>
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+          <h2 id={titleId} className={H2}>{agent.name}</h2>
+          {agent.mechanism === undefined ? null : <span className={META_TEXT}>{MECHANISM_WORDS[agent.mechanism]}</span>}
+          <AgentModePill agent={agent} />
+          {row?.who?.trust === undefined ? null : <TrustTag trust={row.who.trust} />}
+          {row?.who?.lifecycle === undefined || LIFECYCLE_WORDS[row.who.lifecycle] === undefined ? null : (
+            <span data-lifecycle={row.who.lifecycle}>
+              <StatusPill state={row.who.lifecycle === "discovered" ? "needs" : "off"} words={LIFECYCLE_WORDS[row.who.lifecycle] ?? ""} />
+            </span>
+          )}
+        </div>
+        {agent.judgesLine === undefined ? null : (
+          <p data-judges className={BODY_TEXT}>
+            <span className="font-medium text-(--iw-ink)">Judges before it runs: </span>
+            {agent.judgesLine}
+          </p>
+        )}
+        {mcpLines(agent.mcp).map((line) => (
+          <p key={line} data-mcp className={`${SMALL_TEXT} text-(--iw-ink-2)`}>{line}</p>
+        ))}
+        <p><SeenCell agent={agent} unnamed={unnamed} screened="Last screened" /></p>
+        {prompt === undefined ? null : (
+          <div data-restart-prompt className="space-y-2 rounded-lg bg-(--iw-surface-2) p-3">
+            <p className="text-sm leading-[21px] font-medium text-(--iw-ink)">{prompt}</p>
+            <RestartNote agent={restart.agent} words={restart.words} when="now" />
+          </div>
+        )}
+        {step !== undefined ? (
+          <div data-agent-change className="max-w-xl space-y-2">
+            {agent.mode === "partial" ? null : <p className={META_TEXT}>Change this agent only:</p>}
+            <StepBlock step={step} restarts={[restart]} />
+          </div>
+        ) : agent.mode === "monitor" || agent.mode === "enforce" || agent.mode === "mixed" ? (
+          <a href="?view=posture#mode" data-agent-change onClick={onPlainClick(onProtectionMode)} className={`inline-flex min-h-9 items-center gap-1 text-sm pointer-coarse:min-h-11 ${LINK_TEXT}`}>
+            Switch every connected agent at once on Protection. <Icon name="arrow-right" className="h-3.5 w-3.5" />
+          </a>
+        ) : null}
+        {row?.identity === undefined ? null : (
+          <div className="max-w-xl">
+            <StepBlock step={row.identity} restarts={[restart]} />
+          </div>
+        )}
+        {row?.who === undefined ? null : <WhoBlock row={row} onDecision={onDecision} />}
+        <TechnicalOnly>
+          <AgentTechnical agent={agent} os={os} connected />
+        </TechnicalOnly>
+      </article>
+    </li>
+  );
+}
+
+/** Agents found here and not connected: each with the CLI's step to connect it and the restart it needs. */
+function FoundHere({ agents, rows, os }: { agents: readonly AgentFacts[]; rows: ReadonlyMap<string, AgentRow>; os: PlatformOs }) {
+  return (
+    <section id="agents-found" aria-labelledby="agents-found-title" className={`${PANEL} space-y-3`}>
+      <h2 id="agents-found-title" className={H2}>Found here, not connected</h2>
+      <ul className="divide-y divide-(--iw-line)">
+        {agents.map((agent) => (
+          <li key={agent.id} data-agent={agent.id} data-agent-state={rows.get(agent.id)?.state ?? "not_connected"} className="space-y-2 py-3 first:pt-0 last:pb-0">
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+              <h3 className={H3}>{agent.name}</h3>
+              <StatusPill state="off" words="Not connected" />
+            </div>
+            {agent.present ? null : <p className={BODY_TEXT}>Found a configuration for it; the agent itself was not found on this machine.</p>}
+            {agent.nextStep === undefined ? null : (
+              <div className="max-w-xl">
+                <StepBlock step={agent.nextStep} restarts={[restartOf(agent)]} />
+              </div>
+            )}
+            <TechnicalOnly>
+              <AgentTechnical agent={agent} os={os} />
+            </TechnicalOnly>
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+
+/**
+ * Agents the guard cannot connect to: no hook or MCP configuration it can
+ * use. The jail's walls are on offer (a template, never copied as it is);
+ * the guard runs inside the jail for Claude Code only.
+ */
+function JailOnly({
+  agents,
+  rows,
+  os,
+  jailAvailable,
+}: {
+  agents: readonly AgentFacts[];
+  rows: ReadonlyMap<string, AgentRow>;
+  os: PlatformOs;
+  jailAvailable: boolean | undefined;
+}) {
+  return (
+    <section id="agents-jail-only" aria-labelledby="agents-jail-only-title" className={`${PANEL} space-y-3`}>
+      <h2 id="agents-jail-only-title" className={H2}>Can only run inside AI Jail</h2>
+      <ul className="divide-y divide-(--iw-line)">
+        {agents.map((agent) => (
+          <li key={agent.id} data-agent={agent.id} data-agent-state={rows.get(agent.id)?.state ?? "unsupported"} className="space-y-2 py-3 first:pt-0 last:pb-0">
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+              <h3 className={H3}>{agent.name}</h3>
+              <StatusPill state="not_available" words="Cannot be connected yet" />
+            </div>
+            <p className={BODY_TEXT}>It has no hook or MCP configuration the guard can use yet.</p>
+            {jailAvailable === false ? (
+              <p className={BODY_TEXT}>AI Jail is not available on this system either.</p>
+            ) : (
+              <div className="max-w-xl">
+                <StepBlock step={JAIL_STEP} />
+              </div>
+            )}
+            <TechnicalOnly>
+              <AgentTechnical agent={agent} os={os} />
+            </TechnicalOnly>
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+
+/** The evidence behind one agent, as sent: more evidence than the plain view, never a different claim. */
+function AgentTechnical({ agent, os, connected = false }: { agent: AgentFacts; os: PlatformOs; connected?: boolean }) {
+  const lines = [
+    programWords(agent),
+    runningWords(agent.running, os),
+    `Connection: ${agent.mechanismId ?? "none"}`,
+    `Mode as sent: ${agent.modeId ?? "not sent"}`,
+    `Setup: ${agent.setupSupport ?? "not sent"}`,
+    `Found by: ${(agent.detectedBy ?? []).join(", ") || "not sent"}`,
+  ];
+  if (connected && agent.judgesLine === undefined) lines.push("Judges before it runs: Not read");
+  if (agent.configChangedAt !== undefined) lines.push(`Settings changed: ${formatAbsolute(agent.configChangedAt) ?? agent.configChangedAt}`);
+  if (agent.lastObservedAt !== undefined) lines.push(`Last screened: ${formatAbsolute(agent.lastObservedAt) ?? agent.lastObservedAt}`);
+  return (
+    <ul data-agent-evidence className={`space-y-0.5 border-t border-(--iw-line) pt-2 font-mono text-[12px] leading-[18px] text-(--iw-ink-3) [overflow-wrap:anywhere]`}>
+      {lines.map((line) => <li key={line}>{line}</li>)}
+    </ul>
+  );
+}
+
+/** How far an agent's own word is backed, in the closed table's words: neutral, never green. */
+function TrustTag({ trust, source }: { trust: Trust; source?: TrustSource }) {
   const word = trustWord(trust, source);
   return (
-    <span data-trust={trust} title={word.tooltip}>
-      <Chip tone={word.tone} label={word.label} />
+    <span
+      data-trust={trust}
+      title={word.tooltip}
+      className="inline-flex items-center rounded-full border border-(--iw-line) bg-(--iw-surface-2) px-2 py-0.5 text-xs font-semibold text-(--iw-ink-2)"
+    >
+      {word.label}
     </span>
-  );
-}
-
-function StepBlock({ step }: { step: AgentNextStep }) {
-  return (
-    <div className="mt-2 max-w-xl">
-      <p className="text-xs font-semibold text-slate-700">{step.label}</p>
-      <CopyCommand command={step.command} className="mt-1" />
-      <p className="mt-1 text-xs leading-5 text-slate-600">{step.line}</p>
-    </div>
   );
 }
 
@@ -188,48 +344,56 @@ function StepBlock({ step }: { step: AgentNextStep }) {
  * or is not confined and how to start it in a jail, what was decided about it,
  * and its instances. Every part is drawn only from a field that was sent.
  */
-function WhoBlock({ row, context }: { row: AgentRow; context?: CommunityScreenContext }) {
+function WhoBlock({ row, onDecision }: { row: AgentRow; onDecision: (id: string) => void }) {
   const who = row.who;
   if (who === undefined) return null;
   const approvedBy = who.lifecycle === "approved" && who.lifecycleBy !== undefined;
+  const facts: ReactNode[] = [];
+  if (who.profile !== undefined) facts.push(<span key="profile" data-profile>Profile: {who.profile.label}</span>);
+  if (who.owner !== undefined) facts.push(<span key="owner" data-owner>Owner: {who.owner}</span>);
+  if (approvedBy) {
+    facts.push(
+      <span key="approved" data-approved>
+        Approved by {who.lifecycleBy}
+        {who.lifecycleAt === undefined ? null : <>, <When at={who.lifecycleAt} relative /></>}
+      </span>,
+    );
+  }
   return (
-    <div data-agent-identity className="mt-2 space-y-2">
-      {who.profile === undefined && who.owner === undefined && !approvedBy ? null : (
-        <p className="text-xs leading-5 text-slate-600">
-          {who.profile === undefined ? null : <span data-profile>Profile: {who.profile.label}</span>}
-          {who.owner === undefined ? null : <span data-owner>{who.profile === undefined ? "" : " · "}Owner: {who.owner}</span>}
-          {approvedBy ? (
-            <span data-approved>
-              {who.profile === undefined && who.owner === undefined ? "" : " · "}Approved by {who.lifecycleBy}
-              {who.lifecycleAt === undefined ? null : <>, <When at={who.lifecycleAt} relative /></>}
-            </span>
-          ) : null}
-        </p>
+    <div data-agent-identity className="space-y-2">
+      {facts.length === 0 ? null : (
+        <p className={`flex flex-wrap gap-x-3 gap-y-1 ${SMALL_TEXT} text-(--iw-ink-2)`}>{facts}</p>
       )}
       {who.trust !== undefined && who.trust !== "host_verified" ? (
-        <p data-trust-reason className="text-xs leading-5 text-slate-600">{reasonWords(who.trustReason)}</p>
+        <p data-trust-reason className={`${SMALL_TEXT} text-(--iw-ink-2)`}>{reasonWords(who.trustReason)}</p>
       ) : null}
-      {who.confine === undefined ? null : <div data-confine-step><StepBlock step={who.confine} /></div>}
+      {who.confine === undefined ? null : (
+        <div data-confine-step className="max-w-xl">
+          <StepBlock step={who.confine} />
+        </div>
+      )}
       {who.decisionSteps.map((step) => (
-        <StepBlock key={`${step.label}${step.command}`} step={step} />
+        <div key={`${step.label}${step.command}`} className="max-w-xl">
+          <StepBlock step={step} />
+        </div>
       ))}
       {who.instances.length > 0 ? (
-        <ul data-instances className="divide-y divide-slate-100 rounded-lg border border-slate-100">
+        <ul data-instances className="divide-y divide-(--iw-line) rounded-lg border border-(--iw-line)">
           {who.instances.map((instance) => (
-            <InstanceRow key={instance.instanceId} instance={instance} profileLabel={who.profile?.label} context={context} />
+            <InstanceRow key={instance.instanceId} instance={instance} profileLabel={who.profile?.label} onDecision={onDecision} />
           ))}
         </ul>
       ) : who.trust !== undefined ? (
-        <p data-no-instance className="text-xs leading-5 text-slate-500">No instance started in a jail yet.</p>
+        <p data-no-instance className={META_TEXT}>No instance started in a jail yet.</p>
       ) : null}
       {who.moreInstances > 0 ? (
-        <p className="text-xs text-slate-500">{who.moreInstances} more {who.moreInstances === 1 ? "instance" : "instances"} not listed.</p>
+        <p className={META_TEXT}>{who.moreInstances} more {who.moreInstances === 1 ? "instance" : "instances"} not listed.</p>
       ) : null}
     </div>
   );
 }
 
-function InstanceRow({ instance, profileLabel, context }: { instance: LocalInstance; profileLabel?: string; context?: CommunityScreenContext }) {
+function InstanceRow({ instance, profileLabel, onDecision }: { instance: LocalInstance; profileLabel?: string; onDecision: (id: string) => void }) {
   const place = [
     instance.user === undefined ? undefined : instance.project === undefined ? instance.user : `${instance.user} in ${instance.project}`,
     instance.user === undefined ? instance.project : undefined,
@@ -237,38 +401,36 @@ function InstanceRow({ instance, profileLabel, context }: { instance: LocalInsta
   const when = instance.live === false ? "Ended" : "Last active";
   const at = instance.lastActivityAt ?? (instance.live === false ? undefined : instance.startedAt);
   return (
-    <li data-instance={instance.instanceId} data-instance-trust={instance.trust} data-live={instance.live === undefined ? undefined : String(instance.live)} className="px-3 py-2">
-      <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-slate-600">
-        <TrustChip trust={instance.trust} source={instance.trustSource} />
+    <li data-instance={instance.instanceId} data-instance-trust={instance.trust} data-live={instance.live === undefined ? undefined : String(instance.live)} className="space-y-1 px-3 py-2">
+      <div className={`flex flex-wrap items-center gap-x-2 gap-y-1 ${SMALL_TEXT} text-(--iw-ink-2)`}>
+        <TrustTag trust={instance.trust} source={instance.trustSource} />
         {place === undefined ? null : <span>{place}</span>}
-        {instance.mode === undefined ? null : <span>· {LAUNCH_MODE_WORDS[instance.mode]}</span>}
-        {profileLabel === undefined ? null : <span>· {profileLabel}</span>}
-        {at === undefined ? null : <span>· {when} <When at={at} relative /></span>}
+        {instance.mode === undefined ? null : <span>{LAUNCH_MODE_WORDS[instance.mode]}</span>}
+        {profileLabel === undefined ? null : <span>{profileLabel}</span>}
+        {at === undefined ? null : <span>{when} <When at={at} relative /></span>}
       </div>
-      {instance.trust === "host_verified" ? null : (
-        <p className="mt-1 text-xs leading-5 text-slate-600">{reasonWords(instance.trustReason)}</p>
-      )}
+      {instance.trust === "host_verified" ? null : <p className={`${SMALL_TEXT} text-(--iw-ink-2)`}>{reasonWords(instance.trustReason)}</p>}
       {instance.sessions.length === 0 ? null : (
-        <p className="mt-1 flex flex-wrap items-center gap-x-2 text-xs text-slate-600">
+        <p className={`flex flex-wrap items-center gap-x-2 ${SMALL_TEXT} text-(--iw-ink-2)`}>
           <span>Sessions:</span>
           {instance.sessions.map((session) =>
-            session.caseId !== undefined && context !== undefined ? (
-              <button
+            session.caseId !== undefined ? (
+              <a
                 key={session.session}
-                type="button"
-                onClick={() => context.navigate("activity", { decision: session.caseId ?? "" })}
-                className="font-semibold text-cyan-700 hover:text-cyan-900"
+                href={`?view=activity&decision=${encodeURIComponent(session.caseId)}`}
+                onClick={onPlainClick(() => onDecision(session.caseId ?? ""))}
+                className={`inline-flex min-h-9 items-center pointer-coarse:min-h-11 ${LINK_TEXT}`}
               >
-                {session.session} (open case)
-              </button>
+                {session.session} (open decision)
+              </a>
             ) : (
-              <span key={session.session}>{session.session}{session.caseId === undefined ? "" : " (open case)"}</span>
+              <span key={session.session}>{session.session}</span>
             ),
           )}
         </p>
       )}
       <TechnicalOnly>
-        <dl className="mt-1 space-y-0.5 text-[11px] leading-4 text-slate-500 [overflow-wrap:anywhere]">
+        <dl className="mt-1 space-y-0.5 text-[11px] leading-4 text-(--iw-ink-3) [overflow-wrap:anywhere]">
           <div>Instance {instance.instanceId}</div>
           {instance.technical.jailPid === undefined ? null : (
             <div>Jail pid {instance.technical.jailPid}{instance.technical.jailStartTicks === undefined ? "" : `, started at tick ${instance.technical.jailStartTicks}`}</div>
@@ -289,24 +451,22 @@ function InstanceRow({ instance, profileLabel, context }: { instance: LocalInsta
   );
 }
 
-/** What people decided about agents, most recent first (P6). Read only when the page has identity fields. */
+/** What people decided about agents, most recent first; read only in the technical view, and only when the log holds any. */
 function AgentChanges({ names }: { names: ReadonlyMap<string, string> }) {
-  const history = usePolled(fetchHistory, AGENTS_PAGE_POLL_MS, "history");
+  const history = useSource("history");
   const lines = history.data?.agentDecisions;
   if (lines === undefined || lines.length === 0) return null;
   return (
-    <section aria-labelledby="agent-changes-title" data-agent-changes className={CARD}>
-      <h2 id="agent-changes-title" className="text-xs font-semibold uppercase tracking-[0.14em] text-cyan-700">Changes</h2>
-      <ul className="mt-2 divide-y divide-slate-100">
+    <section aria-labelledby="agent-changes-title" data-agent-changes className={`${PANEL} space-y-2`}>
+      <h2 id="agent-changes-title" className={H2}>Changes</h2>
+      <ul className="divide-y divide-(--iw-line)">
         {lines.map((line) => (
-          <li key={`${line.at}${line.action}${line.agent}${line.instanceId ?? ""}`} className="py-1.5 text-sm leading-6 text-slate-700">
+          <li key={`${line.at}${line.action}${line.agent}${line.instanceId ?? ""}`} className={`py-1.5 ${BODY_TEXT}`}>
             {decisionSentence(line, names.get(line.agent) ?? line.agent)}{" "}
-            <span className="text-xs text-slate-500"><When at={line.at} relative /></span>
-            <TechnicalOnly>
-              <span className="block font-mono text-[11px] text-slate-500 [overflow-wrap:anywhere]">
-                {line.action} {line.agent}{line.instanceId === undefined ? "" : ` ${line.instanceId}`}: {line.result}
-              </span>
-            </TechnicalOnly>
+            <span className={META_TEXT}><When at={line.at} relative /></span>
+            <span className="block font-mono text-[11px] text-(--iw-ink-3) [overflow-wrap:anywhere]">
+              {line.action} {line.agent}{line.instanceId === undefined ? "" : ` ${line.instanceId}`}: {line.result}
+            </span>
           </li>
         ))}
       </ul>

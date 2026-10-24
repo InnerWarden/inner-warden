@@ -36,8 +36,6 @@ that any protection journey passed.
 | `CJC-090-v1.yaml` | Exact normalized Community baseline; expectations and open evidence gaps, never journey results. |
 | `CJC-090-compatibility.md` | Auditable identity migration and the non-retroactive J006/FR-049 resolution. |
 | `C1-contract-compatibility.md` | Fail-closed migration map from the pre-contract dashboard prototype to strict C0 vocabulary. |
-| `assurance-matrix-v1.schema.json` | Public schema for private immutable Assurance Matrix instances. |
-| `privileged-actions-v1.schema.json` | Public default-deny schema for private immutable PAAM instances and bound previews. |
 | `enterprise-proof-report-v1.schema.json` | Proof shape whose generation/export remains gated. |
 
 Feature-local `.specify` copies are planning inputs only and cannot authorize a

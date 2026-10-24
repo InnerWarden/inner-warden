@@ -241,6 +241,30 @@ fn for_each_server(doc: &mut DocumentMut, mut f: impl FnMut(&mut Table) -> bool)
     n
 }
 
+/// The TOML twin of [`crate::mcp_wire::server_counts`]: the servers under
+/// `[mcp_servers]`, counted by how the proxy can reach them. Every server
+/// with no local command is remote, whatever names its address: the proxy
+/// never sees its calls. Pure.
+pub fn server_counts_toml(doc: &DocumentMut) -> crate::mcp_wire::ServerCounts {
+    let (stdio, wrapped) = counts(doc);
+    let remote = doc
+        .get("mcp_servers")
+        .and_then(Item::as_table)
+        .map(|servers| {
+            servers
+                .iter()
+                .filter_map(|(_name, item)| item.as_table())
+                .filter(|t| !is_stdio_server(t))
+                .count()
+        })
+        .unwrap_or(0);
+    crate::mcp_wire::ServerCounts {
+        stdio,
+        wrapped,
+        remote,
+    }
+}
+
 fn counts(doc: &DocumentMut) -> (usize, usize) {
     let mut stdio = 0;
     let mut wrapped = 0;
@@ -423,6 +447,55 @@ pub fn is_automatic_wrap_safe_toml(doc: &DocumentMut) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The same servers, written as Codex's TOML and as a JSON client's
+    /// `mcpServers`, count the same before and after a wrap. FAILS ON REVERT
+    /// of the remote count in either reader.
+    #[test]
+    fn server_counts_toml_agrees_with_json() {
+        let toml_text = r#"
+[mcp_servers.icm]
+command = "npx"
+args = ["-y", "some-server"]
+
+[mcp_servers.node_repl]
+command = "node"
+args = ["repl.js"]
+
+[mcp_servers.docs]
+url = "https://example.com/mcp"
+
+[mcp_servers.streamed]
+httpUrl = "https://example.com/stream"
+"#;
+        let json_cfg = serde_json::json!({"mcpServers": {
+            "icm": {"command": "npx", "args": ["-y", "some-server"]},
+            "node_repl": {"command": "node", "args": ["repl.js"]},
+            "docs": {"url": "https://example.com/mcp"},
+            "streamed": {"httpUrl": "https://example.com/stream"}
+        }});
+        let mut doc: DocumentMut = toml_text.parse().expect("toml");
+        let expected = crate::mcp_wire::ServerCounts {
+            stdio: 2,
+            wrapped: 0,
+            remote: 2,
+        };
+        assert_eq!(server_counts_toml(&doc), expected);
+        assert_eq!(crate::mcp_wire::server_counts(&json_cfg), expected);
+        wrap_toml(&mut doc, "/abs/innerwarden", true, "codex");
+        let (wrapped_json, _) = crate::mcp_wire::wrap(json_cfg, "/abs/innerwarden", true, "codex");
+        let after = crate::mcp_wire::ServerCounts {
+            wrapped: 2,
+            ..expected
+        };
+        assert_eq!(server_counts_toml(&doc), after);
+        assert_eq!(crate::mcp_wire::server_counts(&wrapped_json), after);
+        let empty: DocumentMut = "model = \"x\"\n".parse().expect("toml");
+        assert_eq!(
+            server_counts_toml(&empty),
+            crate::mcp_wire::ServerCounts::default()
+        );
+    }
 
     fn doc() -> DocumentMut {
         r#"

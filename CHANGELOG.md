@@ -3,6 +3,28 @@
 All notable changes to InnerWarden are documented here. This project
 follows semantic versioning.
 
+## 1.6.4 - 2026-10-24
+
+### Added
+
+- **The dashboard shows what the free product does.** Overview, Decisions,
+  Protection, Agents and Tokens were rebuilt on one foundation: each agent
+  with its mode, what it screens and how to restart it (Claude Code: `/exit`,
+  then `claude`; Codex: quit and start again), the decision history by day
+  with the reason in words, recent sessions, the allow and mute lists with
+  their remove step, the jail check, and how many MCP servers each agent has
+  (local and remote). A value that could not be read is said as not read,
+  never as off or zero, and monitor is said plainly.
+- **One plan notice for an Active Defence host**: its licence ending soon,
+  partly covered, lapsed to free mode, or not read, with the one step that
+  fixes it. A Community install draws none.
+- `install`, `agents connect`, `enforce` and `dry-run` say how to restart each
+  agent they changed.
+
+### Changed
+
+- tokio 1.53.3 (RUSTSEC-2026-0386).
+
 ## 1.6.3 - 2026-10-23
 
 ### Fixed

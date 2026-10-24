@@ -366,16 +366,19 @@ pub(super) fn event_log_text() -> String {
         let attempt = observe::outcome(leaving, observe::GuardWindow::default(), ts);
         lines.push(observe::attempt_line(&attempt));
     }
-    for (ts, action) in [
-        (1_786_000_000u64, "allow_added"),
-        (1_787_000_000, "mute_added"),
-        (1_789_000_000, "allow_added"),
+    // What changed is written in the log, and never served from it: these
+    // patterns are not in the list today, so a fixture that carries one
+    // read it from the log.
+    for (ts, action, pattern) in [
+        (1_786_000_000u64, "allow_added", LOG_ONLY_PATTERNS[0]),
+        (1_787_000_000, "mute_added", LOG_ONLY_PATTERNS[1]),
+        (1_789_000_000, "allow_removed", LOG_ONLY_PATTERNS[2]),
     ] {
         lines.push(json!({
             "kind": "guard.suppression_changed",
             "ts": ts,
             "action": action,
-            "pattern": "npm run * --silent",
+            "pattern": pattern,
             "allow_count": 2,
             "mute_rule_count": 1,
             "mute_category_count": 0,
@@ -389,29 +392,157 @@ pub(super) fn event_log_text() -> String {
         .join("\n")
 }
 
+/// Patterns the event log names that the list does not hold.
+const LOG_ONLY_PATTERNS: [&str; 3] = [
+    "rsync -a ./site/ deploy@example.com:/srv/www/*",
+    "ATR-2026-076",
+    "docker compose down --volumes *",
+];
+
+/// The allow and mute list: two patterns that name their command, one with
+/// no literal start, one holding a secret, one with a hidden character, a
+/// muted rule and a muted category.
 fn suppress() -> crate::suppress::SuppressConfig {
     crate::suppress::SuppressConfig {
-        allow: vec!["npm run * --silent".into(), "make release".into()],
+        allow: vec![
+            "npm run * --silent".into(),
+            "make release".into(),
+            "* --dry-run".into(),
+            "deploy-cli --token=correct-horse-battery-staple".into(),
+            "git status\u{200B}".into(),
+        ],
         mute_rules: vec!["ATR-2026-030".into()],
-        mute_categories: vec![],
+        mute_categories: vec!["data-poisoning".into()],
     }
 }
 
-fn agents() -> Value {
-    let agent =
-        |id: &str, mode: &str, mechanism: &'static str, next: Option<AgentNextStep>| AgentView {
-            id: id.into(),
-            display_name: display_agent_name(id),
+/// The allow patterns the file holds that the guard ignores.
+fn ignored_patterns() -> Vec<String> {
+    vec!["*".into()]
+}
+
+/// How a fixture agent reaches the guard: its shell hook, or the MCP proxy
+/// over a JSON or a TOML config.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Wiring {
+    Hook,
+    McpJson,
+    McpToml,
+}
+
+/// One agent row of a fixture, before the real builders turn it into what
+/// the CLI serves.
+#[derive(Clone)]
+pub(super) struct FixtureAgent {
+    pub id: &'static str,
+    pub mode: &'static str,
+    pub wiring: Wiring,
+    /// How long before `NOW` its config last changed, for a connected agent.
+    pub changed_ago: Option<u64>,
+    pub mcp: Option<innerwarden_agent_guard::mcp_wire::ServerCounts>,
+}
+
+fn counts(
+    stdio: usize,
+    wrapped: usize,
+    remote: usize,
+) -> innerwarden_agent_guard::mcp_wire::ServerCounts {
+    innerwarden_agent_guard::mcp_wire::ServerCounts {
+        stdio,
+        wrapped,
+        remote,
+    }
+}
+
+/// The agents of the plain fixture: Claude Code in monitor, Codex partly
+/// connected, Cursor and Gemini CLI set to refuse a deny.
+pub(super) fn base_agents() -> Vec<FixtureAgent> {
+    vec![
+        FixtureAgent {
+            id: "claude-code",
+            mode: "monitor",
+            wiring: Wiring::Hook,
+            changed_ago: Some(3 * HOUR),
+            mcp: None,
+        },
+        FixtureAgent {
+            id: "codex",
+            mode: "partial",
+            wiring: Wiring::McpToml,
+            changed_ago: Some(DAY),
+            mcp: Some(counts(3, 2, 1)),
+        },
+        FixtureAgent {
+            id: "cursor",
+            mode: "enforce",
+            wiring: Wiring::McpJson,
+            changed_ago: Some(2 * DAY),
+            mcp: Some(counts(2, 2, 0)),
+        },
+        FixtureAgent {
+            id: "gemini",
+            mode: "enforce",
+            wiring: Wiring::McpJson,
+            changed_ago: Some(2 * DAY),
+            mcp: Some(counts(1, 1, 0)),
+        },
+    ]
+}
+
+/// The agents payload the CLI would serve for `rows` on a host whose mode
+/// is `host_mode`, every field from the builder the live route uses.
+pub(super) fn agents_payload(rows: &[FixtureAgent], host_mode: &str) -> Value {
+    let agent = |row: &FixtureAgent| {
+        let status = innerwarden_agent_guard::agents::AgentStatus {
+            name: row.id.into(),
+            pids: Vec::new(),
+            installed: true,
+            evidence: Vec::new(),
+            hookable: row.wiring == Wiring::Hook,
+            mcp_json: (row.wiring == Wiring::McpJson).then(|| format!(".{}/mcp.json", row.id)),
+            mcp_toml: (row.wiring == Wiring::McpToml).then(|| format!(".{}/config.toml", row.id)),
+            guarded: matches!(row.mode, "monitor" | "enforce" | "mixed"),
+            mode: None,
+        };
+        let connected = row.mode != "not_configured";
+        let classes = if row.wiring == Wiring::Hook {
+            crate::status::ToolClasses::Hook {
+                agent: row.id.into(),
+                file_tools: true,
+                next: String::new(),
+            }
+        } else {
+            crate::status::ToolClasses::Proxy {
+                agent: row.id.into(),
+            }
+        };
+        let judges = matches!(row.mode, "monitor" | "enforce" | "mixed")
+            .then(|| crate::status::judges(&classes));
+        let display_name = display_agent_name(row.id);
+        AgentView {
+            id: row.id.into(),
+            restart: Some(crate::agents_io::restart_words(row.id, &display_name)),
+            display_name,
             installed: true,
             running: None,
             detected_by: vec!["executable_on_path", "configuration_file"],
             guardrail: AgentGuardrailView {
-                mode: mode.into(),
-                mechanism: Some(mechanism),
+                mode: row.mode.into(),
+                mechanism: agent_mechanism(&status),
                 setup_support: "automatic",
+                config_changed_at: row
+                    .changed_ago
+                    .filter(|_| connected)
+                    .map(|ago| community::rfc3339(NOW - ago)),
             },
             auto_connect_eligible: Some(false),
-            next_step: next,
+            next_step: agent_next_step(
+                row.id,
+                row.mode,
+                "automatic",
+                host_mode,
+                row.mode == "partial",
+            ),
             identity_step: None,
             lifecycle: None,
             profile: None,
@@ -424,7 +555,12 @@ fn agents() -> Value {
             confine_step: None,
             instances: None,
             more_instances: None,
-        };
+            judges: judges.as_ref().map(|(key, _)| *key),
+            judges_line: judges.map(|(_, line)| line),
+            mode_steps: agent_mode_steps(&status, row.mode, "automatic"),
+            mcp: row.mcp,
+        }
+    };
     let payload = AgentsPayload {
         schema_version: AGENTS_SCHEMA_VERSION,
         generated_at_ms: NOW,
@@ -437,22 +573,7 @@ fn agents() -> Value {
             refresh_interval_secs: crate::agent_policy::RECONCILE_INTERVAL_SECS,
             watcher: crate::agent_policy::DashboardReconcilerStatus::unavailable(),
         },
-        agents: vec![
-            agent(
-                "claude-code",
-                "monitor",
-                "pretooluse_hook",
-                agent_next_step("claude-code", "monitor", "automatic", "partial", false),
-            ),
-            agent(
-                "codex",
-                "partial",
-                "mcp_proxy",
-                agent_next_step("codex", "partial", "automatic", "partial", true),
-            ),
-            agent("cursor", "enforce", "mcp_proxy", None),
-            agent("gemini", "enforce", "mcp_proxy", None),
-        ],
+        agents: rows.iter().map(agent).collect(),
         profiles_file: None,
     };
     serde_json::to_value(payload).expect("agents fixture")
@@ -514,10 +635,33 @@ fn tokens() -> Value {
         .expect("token fixture json")
 }
 
-/// Every Community fixture, by file name, as the CLI would serve it at `NOW`.
-pub(super) fn fixtures() -> Vec<(&'static str, Value)> {
-    let graph = record();
-    let log = community::parse_event_log(&event_log_text());
+/// One state of the machine the fixtures are rendered for: the record, the
+/// event log, the agents, and the few facts the routes read beside them.
+struct Scene {
+    graph: Graph,
+    log: community::EventLog,
+    agents: Vec<FixtureAgent>,
+    host_mode: &'static str,
+    recording: bool,
+    exposed: bool,
+}
+
+fn base_scene() -> Scene {
+    Scene {
+        graph: record(),
+        log: community::parse_event_log(&event_log_text()),
+        agents: base_agents(),
+        host_mode: "partial",
+        recording: true,
+        exposed: false,
+    }
+}
+
+/// Every route a scene answers, by fixture file name, from the builders the
+/// live routes use.
+fn scene_files(scene: &Scene) -> Vec<(&'static str, Value)> {
+    let graph = &scene.graph;
+    let log = &scene.log;
     let suppress = suppress();
     let tally = graph.agent_actions_tally(NOW - community::LANE_WINDOW_MS);
     let span = graph.record_span();
@@ -525,7 +669,7 @@ pub(super) fn fixtures() -> Vec<(&'static str, Value)> {
         now_ms: NOW,
         tally: &tally,
         record: &span,
-        guard_mode: "partial",
+        guard_mode: scene.host_mode,
         observe_installed: true,
         observation: crate::observe_io::Observation {
             hook: crate::observe::InstalledFiles::Current,
@@ -533,7 +677,7 @@ pub(super) fn fixtures() -> Vec<(&'static str, Value)> {
             plugin_blocker: None,
         },
         openclaw_present: true,
-        log: &log,
+        log,
     };
     let overview = community::overview_json(
         serde_json::to_value(graph.overview(20)).expect("overview"),
@@ -576,9 +720,9 @@ pub(super) fn fixtures() -> Vec<(&'static str, Value)> {
     let protection = community::protection_json(&community::ProtectionFacts {
         now_ms: NOW,
         os: "macos",
-        recording: true,
-        outage_since_unix: None,
-        lost_actions: None,
+        recording: scene.recording,
+        outage_since_unix: (!scene.recording).then_some((NOW - 25 * MINUTE) / 1_000),
+        lost_actions: (!scene.recording).then_some(14),
         jail_backend: Some("sandbox-exec"),
         observe_installed: true,
         openclaw_present: true,
@@ -589,7 +733,18 @@ pub(super) fn fixtures() -> Vec<(&'static str, Value)> {
             &graph.flagged_summaries(),
             span.oldest_at_ms,
         )),
+        jail_check: Some(community::jail_check(Some(Ok(())), NOW - 4 * MINUTE)),
     });
+    let ignored = ignored_patterns();
+    let suppress_body = |exposed: bool| {
+        community::suppress_json(&community::SuppressFacts {
+            now_ms: NOW,
+            exposed,
+            config: &suppress,
+            dropped: &ignored,
+            log,
+        })
+    };
     vec![
         ("overview.json", overview),
         (
@@ -601,17 +756,16 @@ pub(super) fn fixtures() -> Vec<(&'static str, Value)> {
             community::decisions_json(&second, &suppress, NOW),
         ),
         ("decisions-by-id.json", Value::Object(by_id)),
-        ("history.json", community::history_json(&log, NOW)),
+        ("history.json", community::history_json(log, NOW)),
         (
             "history-attempts.json",
-            community::attempts_json(&log, None, 25).expect("first page"),
+            community::attempts_json(log, None, 25).expect("first page"),
         ),
         ("protection.json", protection),
-        ("record-health.json", json!({ "recording": true })),
         (
             "agents.json",
             serde_json::from_str(&community::agents_with_last_screened(
-                &agents().to_string(),
+                &agents_payload(&scene.agents, scene.host_mode).to_string(),
                 &graph.agents_last_seen(),
                 &graph.channels_last_seen(),
                 &graph.unnamed_channels_last_seen(),
@@ -619,10 +773,291 @@ pub(super) fn fixtures() -> Vec<(&'static str, Value)> {
             .expect("agents fixture"),
         ),
         ("token-intelligence.json", tokens()),
+        ("suppress.json", suppress_body(scene.exposed)),
+        (
+            "sessions.json",
+            community::sessions_json(&graph.recent_sessions(20), &span, NOW),
+        ),
     ]
-    .into_iter()
-    .chain(identity_fixtures())
-    .collect()
+}
+
+/// Every Community fixture, by file name, as the CLI would serve it at `NOW`.
+pub(super) fn fixtures() -> Vec<(&'static str, Value)> {
+    let base = base_scene();
+    let mut files = scene_files(&base);
+    files.insert(7, ("record-health.json", json!({ "recording": true })));
+    files.push((
+        "suppress-exposed.json",
+        scene_files(&Scene {
+            exposed: true,
+            ..base_scene()
+        })
+        .into_iter()
+        .find(|(name, _)| *name == "suppress.json")
+        .map(|(_, value)| value)
+        .expect("suppress"),
+    ));
+    files.into_iter().chain(identity_fixtures()).collect()
+}
+
+// ---------------------------------------------------------------------------
+// Scenarios: the same screens in the states a reader meets. Each holds only
+// the files that differ from the plain fixture; a route with no builder here
+// (meta, record-health) is written by hand beside them. A scenario declares
+// the routes its server does not serve in `404.json`, and the routes it
+// cannot answer in `503.json`, as route paths.
+// ---------------------------------------------------------------------------
+
+fn agent(
+    id: &'static str,
+    mode: &'static str,
+    wiring: Wiring,
+    changed_ago: Option<u64>,
+    mcp: Option<innerwarden_agent_guard::mcp_wire::ServerCounts>,
+) -> FixtureAgent {
+    FixtureAgent {
+        id,
+        mode,
+        wiring,
+        changed_ago,
+        mcp,
+    }
+}
+
+/// The plain event log with every refusal made in enforce.
+fn enforce_log_text() -> String {
+    event_log_text()
+        .replace("\"outcome\":\"would_block\"", "\"outcome\":\"blocked\"")
+        .replace("\"mode\":\"monitor\"", "\"mode\":\"enforce\"")
+}
+
+/// The fields a CLI older than these routes did not serve, removed from a
+/// plain fixture: what the page reads when a field is absent.
+fn without_new_fields(name: &str, mut value: Value) -> Value {
+    fn drop_keys(value: &mut Value, keys: &[&str]) {
+        if let Some(object) = value.as_object_mut() {
+            for key in keys {
+                object.remove(*key);
+            }
+        }
+    }
+    match name {
+        "agents.json" => {
+            for agent in value["agents"].as_array_mut().into_iter().flatten() {
+                drop_keys(
+                    agent,
+                    &["judges", "judges_line", "restart", "mode_steps", "mcp"],
+                );
+                drop_keys(&mut agent["guardrail"], &["config_changed_at"]);
+            }
+        }
+        "history.json" => drop_keys(&mut value["refusals"], &["days"]),
+        "decisions-page-1.json" | "decisions-page-2.json" => {
+            drop_keys(&mut value["record"], &["capped"]);
+            for reason in value["reasons"].as_array_mut().into_iter().flatten() {
+                drop_keys(reason, &["by_outcome", "detail"]);
+            }
+        }
+        "overview.json" => drop_keys(&mut value["record"], &["capped"]),
+        "protection.json" => {
+            drop_keys(&mut value["jail"], &["checks_pass", "advice", "checked_at"])
+        }
+        _ => {}
+    }
+    value
+}
+
+/// Each scenario, by name, with the files it holds: those that differ from
+/// the plain fixture, and its route lists.
+pub(super) fn scenarios() -> Vec<(&'static str, Vec<(&'static str, Value)>)> {
+    use Wiring::{Hook, McpJson, McpToml};
+    let base: std::collections::BTreeMap<&str, Value> =
+        scene_files(&base_scene()).into_iter().collect();
+    let differ = |files: Vec<(&'static str, Value)>| -> Vec<(&'static str, Value)> {
+        files
+            .into_iter()
+            .filter(|(name, value)| base.get(name) != Some(value))
+            .collect()
+    };
+    let scene = |agents: Vec<FixtureAgent>, host_mode: &'static str| Scene {
+        agents,
+        host_mode,
+        ..base_scene()
+    };
+    let mut list = vec![
+        (
+            "enforce",
+            differ(scene_files(&Scene {
+                log: community::parse_event_log(&enforce_log_text()),
+                ..scene(
+                    vec![
+                        agent("claude-code", "enforce", Hook, Some(3 * HOUR), None),
+                        agent(
+                            "codex",
+                            "enforce",
+                            McpToml,
+                            Some(DAY),
+                            Some(counts(3, 3, 1)),
+                        ),
+                        agent(
+                            "cursor",
+                            "enforce",
+                            McpJson,
+                            Some(2 * DAY),
+                            Some(counts(2, 2, 0)),
+                        ),
+                    ],
+                    "enforce",
+                )
+            })),
+        ),
+        (
+            "mixed",
+            differ(scene_files(&scene(
+                vec![
+                    agent("claude-code", "monitor", Hook, Some(3 * HOUR), None),
+                    agent(
+                        "cursor",
+                        "enforce",
+                        McpJson,
+                        Some(2 * DAY),
+                        Some(counts(2, 2, 0)),
+                    ),
+                ],
+                "mixed",
+            ))),
+        ),
+        (
+            "partial",
+            differ(scene_files(&scene(
+                vec![
+                    agent("claude-code", "monitor", Hook, Some(3 * HOUR), None),
+                    agent(
+                        "codex",
+                        "partial",
+                        McpToml,
+                        Some(DAY),
+                        Some(counts(3, 2, 1)),
+                    ),
+                ],
+                "partial",
+            ))),
+        ),
+        (
+            "no-agents",
+            differ(scene_files(&scene(
+                vec![
+                    agent(
+                        "cursor",
+                        "not_configured",
+                        McpJson,
+                        None,
+                        Some(counts(2, 0, 0)),
+                    ),
+                    agent(
+                        "gemini",
+                        "not_configured",
+                        McpJson,
+                        None,
+                        Some(counts(1, 0, 0)),
+                    ),
+                ],
+                "not_configured",
+            ))),
+        ),
+        // Every connected agent in monitor and seen working: the default
+        // state, verdict row 8, with three agents' restart words in the band.
+        (
+            "monitor",
+            differ(scene_files(&scene(
+                vec![
+                    agent("claude-code", "monitor", Hook, Some(3 * HOUR), None),
+                    agent(
+                        "codex",
+                        "monitor",
+                        McpToml,
+                        Some(DAY),
+                        Some(counts(3, 3, 1)),
+                    ),
+                    agent(
+                        "cursor",
+                        "monitor",
+                        McpJson,
+                        Some(2 * DAY),
+                        Some(counts(2, 2, 0)),
+                    ),
+                ],
+                "monitor",
+            ))),
+        ),
+        (
+            "never-screened",
+            differ(scene_files(&scene(
+                vec![
+                    agent("claude-code", "monitor", Hook, Some(MINUTE), None),
+                    agent(
+                        "codex",
+                        "monitor",
+                        McpToml,
+                        Some(30 * MINUTE),
+                        Some(counts(2, 2, 0)),
+                    ),
+                ],
+                "monitor",
+            ))),
+        ),
+        ("unknown", Vec::new()),
+        (
+            "not-recording",
+            differ(scene_files(&Scene {
+                recording: false,
+                ..base_scene()
+            })),
+        ),
+        (
+            "exposed",
+            differ(scene_files(&Scene {
+                exposed: true,
+                ..base_scene()
+            })),
+        ),
+        (
+            "empty-record",
+            differ(scene_files(&Scene {
+                graph: Graph::new(),
+                ..base_scene()
+            })),
+        ),
+        (
+            "log-unreadable",
+            differ(scene_files(&Scene {
+                log: community::EventLog::unreadable(),
+                ..base_scene()
+            })),
+        ),
+        (
+            "older-cli",
+            differ(
+                scene_files(&base_scene())
+                    .into_iter()
+                    .filter(|(name, _)| !matches!(*name, "suppress.json" | "sessions.json"))
+                    .map(|(name, value)| (name, without_new_fields(name, value)))
+                    .collect(),
+            ),
+        ),
+        ("ad-installed", Vec::new()),
+    ];
+    for (name, files) in &mut list {
+        match *name {
+            "unknown" => files.push(("503.json", json!(["/api/guard/agents"]))),
+            "older-cli" => files.push((
+                "404.json",
+                json!(["/api/guard/suppress", "/api/guard/sessions"]),
+            )),
+            _ => {}
+        }
+    }
+    list
 }
 
 // ---------------------------------------------------------------------------
@@ -891,6 +1326,7 @@ fn identity_fixtures() -> Vec<(&'static str, Value)> {
                     "mcp_proxy"
                 }),
                 setup_support: "automatic",
+                config_changed_at: None,
             },
             auto_connect_eligible: Some(false),
             next_step: None,
@@ -906,6 +1342,11 @@ fn identity_fixtures() -> Vec<(&'static str, Value)> {
             confine_step: None,
             instances: None,
             more_instances: None,
+            judges: None,
+            judges_line: None,
+            restart: None,
+            mode_steps: None,
+            mcp: None,
         })
         .collect();
     for row in &mut rows {
@@ -982,9 +1423,21 @@ fn community_fixtures_match_what_the_cli_serves() {
     let dir = fixture_dir();
     let write = std::env::var("IW_WRITE_FIXTURES").as_deref() == Ok("1");
     let mut stale = Vec::new();
-    for (name, value) in fixtures() {
-        let path = dir.join(name);
+    let scenario_files = scenarios().into_iter().flat_map(|(scenario, files)| {
+        files
+            .into_iter()
+            .map(move |(name, value)| (format!("scenarios/{scenario}/{name}"), value))
+    });
+    let all = fixtures()
+        .into_iter()
+        .map(|(name, value)| (name.to_string(), value))
+        .chain(scenario_files);
+    for (name, value) in all {
+        let path = dir.join(&name);
         if write {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("fixture folder");
+            }
             let body = serde_json::to_string_pretty(&value).expect("fixture json") + "\n";
             std::fs::write(&path, body).expect("write fixture");
             continue;
@@ -1125,8 +1578,24 @@ fn the_synthetic_record_holds_every_outcome_and_no_real_data() {
     for forbidden in ["/Users/", "192.168.", "10.0.", "innerwarden-active-defence"] {
         assert!(!text.contains(forbidden), "fixture carries `{forbidden}`");
     }
-    // The suppression pattern never leaves the CLI, even in fixtures.
-    assert!(!text.contains("npm run * --silent"));
+    // A pattern the event log names never leaves the CLI, even in fixtures,
+    // and the current list leaves it only through the exceptions route.
+    let scenario_text = scenarios()
+        .iter()
+        .flat_map(|(_, files)| files.iter().map(|(_, value)| value.to_string()))
+        .collect::<String>();
+    for pattern in LOG_ONLY_PATTERNS {
+        assert!(!text.contains(pattern), "{pattern}");
+        assert!(!scenario_text.contains(pattern), "{pattern}");
+    }
+    for (name, value) in fixtures() {
+        if !name.starts_with("suppress") {
+            assert!(
+                !value.to_string().contains("npm run * --silent"),
+                "{name} serves an allow pattern"
+            );
+        }
+    }
     // Every hidden character is served written out, never as it is.
     for (name, value) in fixtures() {
         assert!(

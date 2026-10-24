@@ -100,21 +100,58 @@ export const STATE_WORDS: Record<AgentState, string> = {
   unknown: "Status unknown",
 };
 
-/** The host-wide mode in the header (`guard/meta`). */
+/**
+ * What monitor means, said once on every screen that shows a mode. Monitor is
+ * the default and a fine place to stay; the words never ask anyone to leave it.
+ */
+export const MONITOR_MEANS = "Monitor is a dry run: every command is checked and recorded, and none is stopped.";
+
+/** What enforce means. "Set to refuse" is the config; a refusal is only what was counted. */
+export const ENFORCE_MEANS = "Enforce: a deny is refused before it runs. A review is recorded and, by default, still runs.";
+
+/** One vocabulary for the mode, everywhere: Monitor and Enforce (`guard/meta`, an agent's row). */
 export const MODE_WORDS: Record<"enforce" | "monitor" | "mixed" | "partial" | "not_configured" | "unknown", string> = {
-  enforce: "Refusing",
-  monitor: "Watching only",
-  mixed: "Mixed modes",
+  enforce: "Enforce",
+  monitor: "Monitor",
+  mixed: "Mixed",
   partial: "Partly connected",
   not_configured: "Not connected",
-  unknown: "Status unknown",
+  unknown: "Unknown",
 };
+
+/**
+ * Every product command the pages print that carries no per-agent argument.
+ * A per-agent command comes only from the CLI. A Rust test reads this list
+ * (`dashboard_fixed_commands_are_real_cli_verbs`) and holds each verb and
+ * flag to one the CLI answers, so keep one quoted command per line. The last
+ * two are templates: a `<placeholder>` is shown to fill in, never copied.
+ */
+export const FIXED_COMMANDS = [
+  "innerwarden status",
+  "innerwarden enforce",
+  "innerwarden dry-run",
+  "innerwarden notify",
+  "innerwarden dashboard",
+  "innerwarden observe install",
+  "innerwarden agents connect --all --monitor",
+  "innerwarden agents auto-connect --monitor",
+  "innerwarden allow --list",
+  "innerwarden mute --list",
+  "innerwarden contain -- <command>",
+  "innerwarden llm set --url <URL> --model <MODEL>",
+] as const;
+export type FixedCommand = (typeof FIXED_COMMANDS)[number];
+
+/** Whether a fixed command is a template: it holds a `<placeholder>`. */
+export function isTemplate(command: string): boolean {
+  return /<[^<>]+>/.test(command);
+}
 
 export type PlatformOs = "macos" | "linux" | "windows" | "other";
 
 export const PLATFORM_WORDS: Record<PlatformOs, string> = {
   macos: "this Mac",
-  linux: "this machine",
+  linux: "this Linux machine",
   windows: "this PC",
   other: "this machine",
 };
@@ -349,7 +386,7 @@ export const LAYER_WORDS: Record<LayerKey, string> = {
 
 /**
  * Why a relaxation was not applied, chosen when the page renders (never when
- * the hook ran): by where the page runs and whether Active Defence is
+ * the hook ran): by where the page runs and whether the paid edition is
  * installed there.
  */
 export const WITHHELD_WORDS = {
@@ -446,4 +483,26 @@ export function layerLine(
   }
   const text = layerWords(layer, verdict, agent);
   return text === undefined ? undefined : { text, conflict: false };
+}
+
+const SHORT_DAY = new Intl.DateTimeFormat("en-GB", { day: "numeric", month: "short", timeZone: "UTC" });
+
+/** "30 Jul", for the day the guard's log starts (a UTC date). */
+export function shortDay(iso: string): string | undefined {
+  const ms = Date.parse(iso);
+  return Number.isFinite(ms) ? SHORT_DAY.format(ms) : undefined;
+}
+
+/** "25 Sept, 17:34", in the reader's own clock; built per call, so it follows the zone the page runs in. */
+export function dayAndTime(ms: number): string {
+  return new Intl.DateTimeFormat("en-GB", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).format(ms);
+}
+
+/** When something happened, for a sentence: "at 14:02" today, "on 28 Sept at 14:05" before. In the reader's own clock. */
+export function atWords(ms: number, now: number): string {
+  const day = (at: number) => new Intl.DateTimeFormat("en-GB", { year: "numeric", month: "2-digit", day: "2-digit" }).format(at);
+  const clock = new Intl.DateTimeFormat("en-GB", { hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).format(ms);
+  if (day(ms) === day(now)) return `at ${clock}`;
+  const date = new Intl.DateTimeFormat("en-GB", { day: "numeric", month: "short" }).format(ms);
+  return `on ${date} at ${clock}`;
 }

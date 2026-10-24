@@ -191,9 +191,39 @@ export type DashboardBootstrap = {
    * claim reads as it did.
    */
   audit_trail_view?: string;
+  /**
+   * What the host says about its licence, when it has one: the shell draws a
+   * notice from it above the screen (`plan.ts`, `components/PlanNotice.tsx`).
+   *
+   * Optional and read leniently (`planNoticeOf`): a notice with no state the
+   * reader can use is read as not sent and never costs the reader the
+   * bootstrap; a known state is kept even when its line is not usable.
+   * Absent and `active` draw nothing about the plan; `unknown` says the
+   * licence state was not read, and is never read as `active`. Community
+   * never sends it, and a Community shell ignores one if it is sent.
+   */
+  plan_notice?: PlanNotice;
 };
 export const DASHBOARD_ACCESS = ["read_only", "confirmed_changes"] as const;
 export type DashboardAccess = (typeof DASHBOARD_ACCESS)[number];
+/**
+ * `free_mode`: the licence is not in effect, and the host runs every paid
+ * function in free mode. `partly_covered`: the licence is valid and does not
+ * cover some paid functions, which are off. `unknown`: the host could not
+ * read its licence state.
+ */
+export const PLAN_STATES = ["active", "ending_soon", "partly_covered", "free_mode", "unknown"] as const;
+export type PlanState = (typeof PLAN_STATES)[number];
+/** The longest host sentence the notice prints, and the longest step. */
+export const PLAN_LINE_MAX = 1_000;
+export const PLAN_STEP_MAX = 200;
+/**
+ * The host's licence word. `line` is the host's own sentence, printed as
+ * sent (absent here when it was not usable: the state is kept); `step` is
+ * one command that changes it; `since` is when the current state began and
+ * `until` when the licence ends (RFC 3339).
+ */
+export type PlanNotice = { state: PlanState; line?: string; step?: string; since?: string; until?: string };
 export type EgressPath = {
   id: string;
   destination_class: "none" | "local_process" | "customer_managed" | "vendor_managed" | "third_party" | "unknown";

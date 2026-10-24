@@ -1,12 +1,13 @@
 import { expect, type Page } from "@playwright/test";
 import { test } from "./clock";
-import { CASE, expectHonestUpsell, FIXTURE_NOW_MS, fulfillJson, guardRoute, META } from "./support";
+import { CASE, EDITION_LINES, expectHonestUpsell, FIXTURE_NOW_MS, fulfillJson, guardRoute, META } from "./support";
 
 /**
- * Community's Cases at a desk, 1440 x 900: the list and the open case side by
- * side, the three answers of a case (what happened, what InnerWarden did,
- * what you can do) on the first screen, runs of the same reason folded,
- * Newer and Older, the one offer a case can carry, and commands copied whole.
+ * Community's Decisions at a desk, 1440 x 900: the list and the open decision
+ * side by side, the three answers of a decision (what happened, what
+ * InnerWarden did, what you can do) on the first screen, runs of the same
+ * reason folded, Newer and Older, no offer on a decision, and commands copied
+ * whole.
  */
 
 test.use({ viewport: { width: 1440, height: 900 } });
@@ -20,19 +21,19 @@ test.beforeEach(async ({ page }) => {
 
 async function openCase(page: Page, id: string) {
   await page.goto(`/?view=activity&decision=${encodeURIComponent(id)}`);
-  const card = page.locator(`section[data-case="${id}"]`);
+  const card = page.locator(`section[data-decision="${id}"]`);
   await expect(card).toBeVisible();
   return card;
 }
 
 test("the list and the open case sit side by side", async ({ page }) => {
   await openCase(page, CASE.wouldRefuse);
-  const list = await page.locator(`[data-case-row="${CASE.wouldRefuse}"]`).boundingBox();
-  const detail = await page.locator(`section[data-case="${CASE.wouldRefuse}"]`).boundingBox();
+  const list = await page.locator(`[data-decision-row="${CASE.wouldRefuse}"]`).boundingBox();
+  const detail = await page.locator(`section[data-decision="${CASE.wouldRefuse}"]`).boundingBox();
   expect(list).not.toBeNull();
   expect(detail).not.toBeNull();
   expect(list!.x + list!.width).toBeLessThanOrEqual(detail!.x);
-  await expect(page.locator(`[data-case-row="${CASE.wouldRefuse}"] button`)).toHaveAttribute("aria-current", "true");
+  await expect(page.locator(`[data-decision-row="${CASE.wouldRefuse}"] a`)).toHaveAttribute("aria-current", "true");
   await expectHonestUpsell(page);
 });
 
@@ -46,8 +47,9 @@ for (const [name, id] of [
 ] as const) {
   test(`what you can do is on the first screen for ${name} case`, async ({ page }) => {
     const card = await openCase(page, id);
-    const answer = card.locator("dl > div").filter({ has: page.locator("dt", { hasText: "What you can do" }) }).locator("dd");
+    const answer = card.locator('[data-part="next"]');
     await expect(answer).toBeVisible();
+    await expect(answer.locator("h3")).toHaveText("What you can do");
     // Its first line sits on the first screen with room below it for the
     // command. Measured against the screen, not a pixel row: the same page
     // lays out about 60 px taller with Linux fonts than with macOS ones.
@@ -69,60 +71,59 @@ test("a run of the same reason folds into one line, and opens", async ({ page })
 
 test("Newer and Older move through the list, and keep it in the address", async ({ page }) => {
   await openCase(page, CASE.scratch);
-  const card = page.locator("section[data-case]");
+  const card = page.locator("section[data-decision]");
   await card.getByRole("button", { name: "Newer", exact: true }).click();
-  await expect(page.locator(`section[data-case="${CASE.wouldRefuse}"]`)).toBeVisible();
+  await expect(page.locator(`section[data-decision="${CASE.wouldRefuse}"]`)).toBeVisible();
   await expect(page).toHaveURL(new RegExp(`decision=${encodeURIComponent(CASE.wouldRefuse)}`));
   await expect(card.getByRole("button", { name: "Newer", exact: true })).toBeDisabled();
   await card.getByRole("button", { name: "Older", exact: true }).click();
-  await expect(page.locator(`section[data-case="${CASE.scratch}"]`)).toBeVisible();
+  await expect(page.locator(`section[data-decision="${CASE.scratch}"]`)).toBeVisible();
 });
 
 test("the arrow keys move the open case from a focused row, and nowhere else", async ({ page }) => {
   await openCase(page, CASE.wouldRefuse);
-  await page.locator(`[data-case-row="${CASE.wouldRefuse}"] button`).focus();
+  await page.locator(`[data-decision-row="${CASE.wouldRefuse}"] a`).focus();
   await page.keyboard.press("ArrowDown");
-  await expect(page.locator(`section[data-case="${CASE.scratch}"]`)).toBeVisible();
+  await expect(page.locator(`section[data-decision="${CASE.scratch}"]`)).toBeVisible();
   await page.getByRole("searchbox", { name: "Search flagged commands" }).focus();
   await page.keyboard.press("ArrowDown");
-  await expect(page.locator(`section[data-case="${CASE.scratch}"]`)).toBeVisible();
+  await expect(page.locator(`section[data-decision="${CASE.scratch}"]`)).toBeVisible();
 });
 
 /**
- * The offer is ONE line under the case, never a box inside it: the reader's
- * own step stays the heaviest thing on the card.
+ * A decision carries no offer: the reader's own step is the heaviest thing on
+ * it, and what Active Defence adds is said once, on Protection.
  */
 test("a case carries at most one offer, under it; Not now hides it and it stays hidden after a reload", async ({ page }) => {
   const card = await openCase(page, CASE.wouldRefuse);
-  await expect(card.locator('[data-ad-state="offer"]')).toHaveCount(0);
-  const offer = page.locator('[data-ad-state="offer"]');
-  await expect(offer).toHaveCount(1);
-  await expect(offer).toHaveAttribute("data-offer", "credential_read");
-  await expect(offer).toContainText("Secret Read Guard");
-  const cardBox = await card.boundingBox();
-  const offerBox = await offer.boundingBox();
-  expect(offerBox!.y).toBeGreaterThanOrEqual(cardBox!.y + cardBox!.height);
-  // A text link, lighter than the reader's own Copy button.
-  expect(await offer.locator("a").evaluate((link) => getComputedStyle(link).borderTopWidth)).toBe("0px");
+  await expect(card.locator("[data-step]").first()).toBeVisible();
+  await expect(page.locator("[data-ad-state]")).toHaveCount(0);
+  // Not even the generic line: that is Protection's.
+  await expect(page.locator("main")).not.toContainText("Active Defence adds");
+  await expect(page.locator('a[href^="https://innerwarden.com"]')).toHaveCount(0);
   await expectHonestUpsell(page);
-  await offer.getByRole("button", { name: /Not now/ }).click();
-  await expect(page.locator('[data-ad-state="offer"]')).toHaveCount(0);
   await page.reload();
-  await expect(page.locator(`section[data-case="${CASE.wouldRefuse}"]`)).toBeVisible();
-  await expect(page.locator('[data-ad-state="offer"]')).toHaveCount(0);
+  await expect(page.locator(`section[data-decision="${CASE.wouldRefuse}"]`)).toBeVisible();
+  await expect(page.locator("[data-ad-state]")).toHaveCount(0);
 });
 
 test("a refused case and a check by hand carry no offer", async ({ page }) => {
   for (const id of [CASE.refused, CASE.checked]) {
     await openCase(page, id);
     await expect(page.locator('[data-ad-state="offer"]')).toHaveCount(0);
+    await expect(page.locator('a[href^="https://innerwarden.com"]')).toHaveCount(0);
+    await expectHonestUpsell(page);
   }
 });
 
 test("a host with Active Defence installed gets the installed line, never an offer", async ({ page }) => {
   await page.route(guardRoute("meta"), (route) => fulfillJson(route, { ...META, active_defence_installed: true }));
   await openCase(page, CASE.wouldRefuse);
+  // Nothing on a decision: the installed line is Protection's.
+  await expect(page.locator("[data-ad-state]")).toHaveCount(0);
+  await page.goto("/?view=posture");
   await expect(page.locator('[data-ad-state="installed"]')).toBeVisible();
+  await expect(page.locator('[data-ad-state="installed"]')).toContainText(EDITION_LINES.installed);
   await expect(page.locator('[data-ad-state="offer"]')).toHaveCount(0);
 });
 
@@ -134,7 +135,7 @@ test("the agent's own scratch scripts are hidden from the list in one press, and
   await expect(page).toHaveURL(/hide=rule%3Atmp_execution/);
   const summary = page.locator("[data-hidden-summary]");
   await expect(summary).toHaveText(/flagged without world-writable folder/);
-  await expect(page.locator(`[data-case-row="${CASE.flaggedRan}"]`)).toHaveCount(0);
+  await expect(page.locator(`[data-decision-row="${CASE.flaggedRan}"]`)).toHaveCount(0);
   await page.getByRole("button", { name: "Show them again" }).click();
   await expect(page).not.toHaveURL(/hide=/);
   await expect(page.locator("[data-hidden-summary]")).toHaveCount(0);
@@ -142,14 +143,14 @@ test("the agent's own scratch scripts are hidden from the list in one press, and
 
 test("a command with hidden characters is listed with a chip, shown written out, and never copied", async ({ page }) => {
   const card = await openCase(page, CASE.hidden);
-  await expect(page.locator(`[data-case-row="${CASE.hidden}"] [data-hidden-characters]`)).toBeVisible();
+  await expect(page.locator(`[data-decision-row="${CASE.hidden}"] [data-hidden-characters]`)).toBeVisible();
   await expect(card.locator("[data-command]").first()).toContainText("\\u{202E}");
   await expect(card).toContainText("Shown with its hidden characters written out, so there is nothing whole to copy.");
-  await expect(card.getByRole("button", { name: /^Copy the command printf/ })).toHaveCount(0);
+  await expect(card.getByRole("button", { name: /^Copy command: printf/ })).toHaveCount(0);
   // Its step is a template: the placeholder is drawn apart, and nothing is copied.
   const template = card.locator("[data-command][data-template]");
   await expect(template.locator("var[data-placeholder]")).toHaveText("<pattern>");
-  await expect(card.getByRole("button", { name: /Copy the command innerwarden allow/ })).toHaveCount(0);
+  await expect(card.getByRole("button", { name: /Copy command: innerwarden allow/ })).toHaveCount(0);
 });
 
 /** The outcome words are a row's main signal: never cut, in either view. */
@@ -157,17 +158,17 @@ test("a row's outcome words are never cut, and its command gets two lines", asyn
   for (const technical of [false, true]) {
     await page.goto("/?view=activity");
     if (technical) await page.getByRole("checkbox", { name: "Show technical detail" }).check();
-    const words = page.locator("[data-case-row] [data-outcome-words] > span:last-child");
+    const words = page.locator("[data-decision-row] [data-outcome-words]");
     await expect(words.first()).toBeVisible();
     const cut = await words.evaluateAll((spans) => spans.filter((span) => span.scrollWidth > span.clientWidth + 1).length);
     expect(cut, technical ? "technical view" : "plain view").toBe(0);
     // A relative time in both views; the exact UTC time is the technical line's.
-    await expect(page.locator("[data-case-row] time").first()).toHaveText(/ago|yesterday|\d{1,2} \w+/);
+    await expect(page.locator("[data-decision-row] time").first()).toHaveText(/ago|yesterday|\d{1,2} \w+/);
     if (!technical) {
       // Two lines of command when it needs them, and the row stays under
       // 100 px. A row that also carries the hidden-characters chip may take
       // one line more: it is the row that most needs reading.
-      const heights = await page.locator("[data-case-row] > button").evaluateAll((rows) =>
+      const heights = await page.locator("[data-decision-row] > a").evaluateAll((rows) =>
         rows.filter((row) => row.querySelector("[data-hidden-characters]") === null).map((row) => row.getBoundingClientRect().height));
       expect(heights.length).toBeGreaterThan(5);
       expect(Math.max(...heights)).toBeLessThanOrEqual(100);
@@ -179,8 +180,8 @@ test("Copy copies the exact command the CLI sent", async ({ page, context }) => 
   await context.grantPermissions(["clipboard-read", "clipboard-write"]);
   const card = await openCase(page, CASE.flaggedRan);
   const allow = "innerwarden allow 'bash /tmp/build-cache/run.sh --clean'";
-  await card.getByRole("button", { name: `Copy the command ${allow}` }).click();
-  await expect(card.getByRole("button", { name: `Copy the command ${allow}` })).toHaveText("Copied");
+  await card.getByRole("button", { name: `Copy command: ${allow}` }).click();
+  await expect(card.getByRole("button", { name: `Copy command: ${allow}` })).toHaveText("Copied");
   expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(allow);
 });
 

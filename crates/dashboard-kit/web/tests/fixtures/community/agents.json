@@ -8,6 +8,7 @@
       ],
       "display_name": "Claude Code",
       "guardrail": {
+        "config_changed_at": "2026-09-29T11:05:00Z",
         "last_observed_at": "2026-09-29T14:03:00Z",
         "mechanism": "pretooluse_hook",
         "mode": "monitor",
@@ -15,10 +16,23 @@
       },
       "id": "claude-code",
       "installed": true,
+      "judges": "shell_and_privileged_files",
+      "judges_line": "Shell commands, and file changes (Write, Edit, MultiEdit, NotebookEdit) to privileged files such as its settings, the guard's configuration and your shell startup files. Its other tools are recorded after they run.",
+      "mode_steps": {
+        "enforce": {
+          "command": "innerwarden agents connect claude-code",
+          "label": "To refuse a deny for this agent only:",
+          "line": "Switches this agent to Enforce: a deny is refused before it runs. Your other agents keep their mode."
+        }
+      },
       "next_step": {
         "command": "innerwarden enforce",
         "label": "To refuse a deny as well:",
-        "line": "Switches every connected agent from watching to refusing a deny."
+        "line": "Switches every connected agent from Monitor to Enforce: a deny is refused before it runs."
+      },
+      "restart": {
+        "how": "In Claude Code, type /exit, then run claude.",
+        "why": "An agent reads its hook or MCP config only when it starts."
       },
       "running": null
     },
@@ -30,16 +44,26 @@
       ],
       "display_name": "Codex",
       "guardrail": {
+        "config_changed_at": "2026-09-28T14:05:00Z",
         "mechanism": "mcp_proxy",
         "mode": "partial",
         "setup_support": "automatic"
       },
       "id": "codex",
       "installed": true,
+      "mcp": {
+        "remote": 1,
+        "stdio": 3,
+        "wrapped": 2
+      },
       "next_step": {
         "command": "innerwarden agents connect codex --monitor",
         "label": "To finish connecting it:",
         "line": "Wires the MCP servers that are still open, in the mode the others run in."
+      },
+      "restart": {
+        "how": "Quit Codex and start it again.",
+        "why": "An agent reads its hook or MCP config only when it starts."
       },
       "running": null
     },
@@ -51,6 +75,7 @@
       ],
       "display_name": "Cursor",
       "guardrail": {
+        "config_changed_at": "2026-09-27T14:05:00Z",
         "last_observed_at": "2026-09-29T12:05:00Z",
         "mechanism": "mcp_proxy",
         "mode": "enforce",
@@ -58,6 +83,24 @@
       },
       "id": "cursor",
       "installed": true,
+      "judges": "mcp_server_calls",
+      "judges_line": "Calls to its MCP servers. Its built-in tools are not screened by this edition.",
+      "mcp": {
+        "remote": 0,
+        "stdio": 2,
+        "wrapped": 2
+      },
+      "mode_steps": {
+        "monitor": {
+          "command": "innerwarden agents connect cursor --monitor",
+          "label": "To put this agent back in monitor:",
+          "line": "Switches this agent to Monitor: every command is checked and recorded, and none is stopped. Your other agents keep their mode."
+        }
+      },
+      "restart": {
+        "how": "Quit Cursor and start it again.",
+        "why": "An agent reads its hook or MCP config only when it starts."
+      },
       "running": null
     },
     {
@@ -68,12 +111,31 @@
       ],
       "display_name": "Gemini CLI",
       "guardrail": {
+        "config_changed_at": "2026-09-27T14:05:00Z",
         "mechanism": "mcp_proxy",
         "mode": "enforce",
         "setup_support": "automatic"
       },
       "id": "gemini",
       "installed": true,
+      "judges": "mcp_server_calls",
+      "judges_line": "Calls to its MCP servers. Its built-in tools are not screened by this edition.",
+      "mcp": {
+        "remote": 0,
+        "stdio": 1,
+        "wrapped": 1
+      },
+      "mode_steps": {
+        "monitor": {
+          "command": "innerwarden agents connect gemini --monitor",
+          "label": "To put this agent back in monitor:",
+          "line": "Switches this agent to Monitor: every command is checked and recorded, and none is stopped. Your other agents keep their mode."
+        }
+      },
+      "restart": {
+        "how": "Quit Gemini CLI and start it again.",
+        "why": "An agent reads its hook or MCP config only when it starts."
+      },
       "running": null
     }
   ],
