@@ -675,9 +675,9 @@ const GUARD_DISARMED: &str = "disarms the guard, or asks it to authorise itself"
 /// verbs ([`runs_guard_loosening_verb`]).
 const GUARD_LOOSENING_VERB: &str =
     "runs the guard's own allow, mute or monitor command, one of its agent \
-     decisions (approve, profile, allow, revoke), disconnects an agent or connects it \
-     in monitor, or starts a jail, which only the person supervising the agent may \
-     run, from their own terminal";
+     decisions (approve, profile, allow, revoke), disconnects an agent or connects or \
+     installs it in monitor, or starts a jail, which only the person supervising the \
+     agent may run, from their own terminal";
 
 /// [`check_guard_self_disable`] on one spelling of the command.
 fn guard_self_disable_in(content: &str) -> Option<(&'static str, u32)> {
@@ -2279,9 +2279,9 @@ fn text_runs_guard_verb(text: &str, only: &[&str]) -> bool {
 /// The verbs that switch the guard to recording only (`dry-run`, `monitor`)
 /// or silence its rules (`mute`). `dry-run` has no terminal check of its own,
 /// so the guard's reading of the agent's command is the only thing in its way.
-/// `agents` and `contain` are read here too, for their forms that take the
-/// hook off or rewire it ([`guard_verb_loosens`]).
-const MODE_VERBS: &[&str] = &["mute", "dry-run", "monitor", "agents", "contain"];
+/// `agents`, `contain` and `install` are read here too, for their forms that
+/// take the hook off or rewire it ([`guard_verb_loosens`]).
+const MODE_VERBS: &[&str] = &["mute", "dry-run", "monitor", "agents", "contain", "install"];
 
 /// Whether `innerwarden mute|dry-run|monitor`, with arguments that widen what
 /// is let through, appears in the command anywhere but in a simple command
@@ -2459,14 +2459,45 @@ fn guard_verb_loosens(arguments: &[String]) -> bool {
         }
         // `innerwarden contain` rewires the agent's hook (`--setup` too): a
         // jail is the person's to start. Asking for help, or for the argv it
-        // would run (its own `--dry-run`, before the agent's command), changes
-        // nothing.
+        // would run (its own `--dry-run`), changes nothing; both are read
+        // among its OWN arguments only, as the CLI reads them
+        // ([`contain_own_args`]): a `-h` or `--dry-run` of the agent's
+        // command is the agent's (review of 1.6.6, H2: `contain --setup
+        // --monitor -- -h` and `contain --monitor true --dry-run` rewired the
+        // hook while the guard read them as help or a dry run).
         "contain" => {
-            let own: Vec<&str> = rest.iter().copied().take_while(|a| *a != "--").collect();
-            !asks_for_help && !own.contains(&"--dry-run")
+            let own = contain_own_args(&rest);
+            !own.iter().any(|a| matches!(*a, "--help" | "-h")) && !own.contains(&"--dry-run")
         }
+        // `innerwarden install <agent> --monitor` rewires the agent's hook to
+        // record only, as `agents connect --monitor` does (review of 1.6.6,
+        // H1). Installing in enforce, or asking for help, lowers nothing.
+        "install" => !asks_for_help && rest.contains(&"--monitor"),
         _ => false,
     }
+}
+
+/// The flags of `innerwarden contain` that take the next argument as their
+/// value (`contain::parse_contain_args`).
+const CONTAIN_VALUE_FLAGS: &[&str] = &["--agent", "--project", "--deny-read"];
+
+/// PURE. The arguments of `innerwarden contain` that are its own, as the CLI
+/// reads them (`parse_contain_args`, `help::own_args`): up to `--` or the
+/// first bare word, which starts the agent's command, a value flag taking its
+/// value with it.
+fn contain_own_args<'a>(rest: &[&'a str]) -> Vec<&'a str> {
+    let mut own = Vec::new();
+    let mut words = rest.iter();
+    while let Some(word) = words.next() {
+        if *word == "--" || !word.starts_with('-') {
+            break;
+        }
+        own.push(*word);
+        if CONTAIN_VALUE_FLAGS.contains(word) {
+            words.next();
+        }
+    }
+    own
 }
 
 /// The `innerwarden agents` verbs that decide about an agent.
@@ -13097,6 +13128,47 @@ mod brq_evaluation_tests {
             "innerwarden contain --dry-run -- claude",
             "echo innerwarden agents disconnect --all",
             "grep 'innerwarden contain' README.md",
+        ] {
+            assert!(
+                check_guard_self_disable(cmd).is_none(),
+                "{cmd} lowers nothing: {:?}",
+                check_guard_self_disable(cmd)
+            );
+        }
+    }
+
+    /// Review of 1.6.6: H1, `install <agent> --monitor` rewires the hook to
+    /// record only, as `agents connect --monitor` does; H2, a help flag or a
+    /// `--dry-run` of the AGENT's command (after `--`, or after the first bare
+    /// word, which starts it) is not `contain`'s own, as the CLI reads them.
+    ///
+    /// FAILS ON REVERT: drop the `install` arm, or read help and `--dry-run`
+    /// across every argument, and these are `None` again.
+    #[test]
+    fn install_in_monitor_and_a_jail_behind_the_agents_own_help_are_the_persons() {
+        for cmd in [
+            "innerwarden install claude-code --monitor",
+            "innerwarden install --monitor",
+            "iw-guard install claude-code --settings /tmp/s.json --monitor",
+            "innerwarden contain --setup --monitor -- -h",
+            "innerwarden contain --monitor -- claude --help",
+            "innerwarden contain --monitor true --dry-run",
+            "innerwarden contain claude --dry-run",
+            "env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT innerwarden contain --setup --monitor -- -h",
+        ] {
+            assert!(
+                check_guard_self_disable(cmd).is_some(),
+                "an agent must not lower the guard screening it: {cmd}"
+            );
+        }
+        for cmd in [
+            "innerwarden install claude-code",
+            "innerwarden install --help",
+            "innerwarden install claude-code --block-review",
+            "innerwarden contain --help",
+            "innerwarden contain --agent claude-code --help",
+            "innerwarden contain --project /tmp/p --dry-run -- claude",
+            "innerwarden contain --dry-run claude",
         ] {
             assert!(
                 check_guard_self_disable(cmd).is_none(),

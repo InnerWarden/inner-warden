@@ -3,6 +3,25 @@
 All notable changes to InnerWarden are documented here. This project
 follows semantic versioning.
 
+## 1.6.8 - 2026-10-24
+
+### Security
+
+- **Two more ways an agent could lower its own guard are closed.** Under an
+  enforcing hook, `innerwarden install <agent> --monitor` rewired the hook to
+  record only, as `agents connect --monitor` did before 1.6.6, and was let
+  through. And the hook read a help flag or a `--dry-run` anywhere in a
+  `contain` line, including in the agent's own command after `--` (`contain
+  --setup --monitor -- -h`) or after the first word (`contain --monitor true
+  --dry-run`), so it let through a `contain` that then rewired the hook. The
+  hook now refuses `install --monitor` as the person's, the CLI refuses it
+  inside an AI agent's shell, and `contain`'s help and dry run are read among
+  its own arguments only, as the CLI reads them.
+- Stated limit, unchanged: the CLI's own refusal reads the agent's shell
+  markers, which a script the agent writes can unset, and the hook knows the
+  CLI by its names (`innerwarden`, `iw`, `iw-guard`), so a renamed copy run
+  from a script is not seen. The hook refuses every spelling it can read.
+
 ## 1.6.7 - 2026-10-24
 
 ### Added
