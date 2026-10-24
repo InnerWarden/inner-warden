@@ -1908,13 +1908,17 @@ const SANDBOX_TEST_PROFILE: &str = "(version 1)(allow default)";
 /// first line it said on stderr))`, or `None` when it could not be started
 /// or did not end within 5 s (killed).
 fn sandbox_exec_starts(sandbox: &Path) -> Option<(bool, String)> {
-    let mut child = Command::new(sandbox)
+    let mut command = Command::new(sandbox);
+    command
         .args(["-p", SANDBOX_TEST_PROFILE, "/usr/bin/true"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .ok()?;
+        .stderr(std::process::Stdio::piped());
+    // As every program a launch starts: root's two folders as PATH and no
+    // loader variable, so the account's environment cannot pick what
+    // answers "a sandbox started".
+    helper_env(&mut command);
+    let mut child = command.spawn().ok()?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         match child.try_wait() {
@@ -3279,7 +3283,7 @@ fn await_system_scope<T>(
 /// The environment of a program the launcher runs to start an identified
 /// jail: [`crate::contain::HELPER_PATH`] and no dynamic loader variable. The
 /// jail's command gets its own back through bwrap ([`JailInputs::child_env`]).
-#[cfg(target_os = "linux")]
+/// On every platform: the jail check on macOS starts `sandbox-exec` under it.
 fn helper_env(command: &mut Command) {
     for name in crate::contain::launch_env(std::env::vars_os()).helper_remove {
         command.env_remove(name);
@@ -3705,6 +3709,41 @@ fn print_plan_env(env: &[(String, String)]) {
 
 #[cfg(test)]
 mod tests {
+    /// Every program this file starts outside the launch paths runs under
+    /// `helper_env` (root's two folders as PATH, no loader variable): Active
+    /// Defence reads the same rule off the shipped source before it pins a
+    /// release (1.6.4's jail check started `sandbox-exec` with the account's
+    /// environment and was held back). The launch paths themselves start the
+    /// person's own agent. FAILS ON REVERT of `helper_env` in any helper.
+    #[test]
+    fn every_helper_this_file_starts_runs_under_helper_env() {
+        const LAUNCH_PATHS: &[&str] = &["run_in_place", "run_plain", "run_macos"];
+        // Asks the bubblewrap it resolved from absolute paths for its own
+        // `--help` and nothing else (Active Defence reads it as allowed as it
+        // is, and refuses any argument or environment added to it).
+        const HELP_PROBE: &str = "bwrap_binds_fds";
+        let text = include_str!("contain_io.rs");
+        let shipped = &text[..text.find("#[cfg(test)]\nmod tests {").unwrap_or(text.len())];
+        let mut checked = 0;
+        for chunk in shipped.split("\nfn ").skip(1) {
+            let name = chunk.split(['(', '<']).next().unwrap_or("");
+            let body = &chunk[..chunk.find("\n}\n").unwrap_or(chunk.len())];
+            if !body.contains("Command::new(") || LAUNCH_PATHS.contains(&name) || name == HELP_PROBE
+            {
+                continue;
+            }
+            checked += 1;
+            assert!(
+                body.contains("helper_env(&mut "),
+                "{name} starts a program without helper_env"
+            );
+        }
+        assert!(
+            checked >= 3,
+            "only {checked} helpers read: the scan stopped matching"
+        );
+    }
+
     /// Finding `sandbox-exec` is not a check: ready only when a sandboxed
     /// `true` ran and exited 0; a failed or hung start says so, with what
     /// `sandbox-exec` said. FAILS ON REVERT to the lookup alone (every macOS
