@@ -3,6 +3,29 @@
 All notable changes to InnerWarden are documented here. This project
 follows semantic versioning.
 
+## 1.6.10 - 2026-10-24
+
+### Security
+
+- **A wrapper in front of the CLI no longer hides it from the guard.** A
+  program the guard did not unwrap (`flock`, `taskset`, `systemd-run --user`,
+  `prlimit`, `unshare`, `cpulimit`, `watch`) in front of `iw` let `uninstall`,
+  `dry-run` or `agents disconnect` through the enforcing hook, and
+  `systemd-run --user` or `env -u` then ran it without the agent's shell
+  markers, so the CLI did not refuse it either. Behind any program the guard
+  does not know, the CLI named with a verb that lowers the guard is now read
+  as run (a program that only reads or prints text keeps it as text).
+
+### Fixed
+
+- The hook no longer refuses `innerwarden uninstall --dry-run`, `--help` and
+  `-h`, which remove nothing, and reads them as `uninstall`'s own only before
+  `--`.
+- Stated limit, widened: a Bash command that only writes a guard verb into a
+  file (`echo ... > x.sh`, `printf`, a heredoc) is not screened as running it,
+  like a Write or Edit tool call; the CLI refuses the verb when the agent's
+  shell runs the file with its markers.
+
 ## 1.6.9 - 2026-10-24
 
 ### Security
