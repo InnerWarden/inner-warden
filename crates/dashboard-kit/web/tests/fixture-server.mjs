@@ -66,7 +66,7 @@ const HAND_WRITTEN = [
   ["monitor/meta.json", "the host mode comes from guard/meta: all three agents in monitor"],
   ["unknown/meta.json", "the host mode comes from guard/meta: it is unknown while the agents cannot be read"],
   ["exposed/meta.json", "whether the dashboard is open to the network comes from guard/meta"],
-  ["ad-installed/meta.json", "whether Active Defence is installed comes from guard/meta"],
+  ["ad-installed/meta.json", "whether InnerWarden Pro is installed comes from guard/meta"],
   ["not-recording/record-health.json", "guard/record-health reads a live outage file, which has no pure builder"],
 ];
 

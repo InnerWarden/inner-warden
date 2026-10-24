@@ -19,11 +19,11 @@ export const PRICING_URL = "https://innerwarden.com/pricing";
 export const EDITIONS_URL = "https://innerwarden.com/docs/editions-and-guarantees";
 
 /** The one offer, at the foot of Protection. */
-export const GENERIC_LINE = "Active Defence adds host-level protection for Linux servers.";
+export const GENERIC_LINE = "InnerWarden Pro adds host-level protection for Linux servers.";
 
 /** The tour's last step before it ends. */
 export const TOUR_UPGRADE_LINE =
-  "Community screens what your AI agents try to run. Active Defence, the paid edition, adds host-level protection for Linux servers.";
+  "Community screens what your AI agents try to run. InnerWarden Pro, the paid edition, adds host-level protection for Linux servers.";
 
 export type Offer = {
   slot: OfferSlot;
@@ -51,7 +51,7 @@ export function protectionOffer(): Offer {
  * and cannot read the host stack, so it claims nothing about what runs there.
  */
 export const INSTALLED_LINE = {
-  lead: "Active Defence is installed on this host.",
+  lead: "InnerWarden Pro is installed on this host.",
   body: "This dashboard runs without privileges and cannot read it, so it does not say what is running there. Ask the host:",
   command: "innerwarden get status",
 } as const;

@@ -99,7 +99,7 @@ test("a case carries at most one offer, under it; Not now hides it and it stays 
   await expect(card.locator("[data-step]").first()).toBeVisible();
   await expect(page.locator("[data-ad-state]")).toHaveCount(0);
   // Not even the generic line: that is Protection's.
-  await expect(page.locator("main")).not.toContainText("Active Defence adds");
+  await expect(page.locator("main")).not.toContainText("InnerWarden Pro adds");
   await expect(page.locator('a[href^="https://innerwarden.com"]')).toHaveCount(0);
   await expectHonestUpsell(page);
   await page.reload();
@@ -116,7 +116,7 @@ test("a refused case and a check by hand carry no offer", async ({ page }) => {
   }
 });
 
-test("a host with Active Defence installed gets the installed line, never an offer", async ({ page }) => {
+test("a host with InnerWarden Pro installed gets the installed line, never an offer", async ({ page }) => {
   await page.route(guardRoute("meta"), (route) => fulfillJson(route, { ...META, active_defence_installed: true }));
   await openCase(page, CASE.wouldRefuse);
   // Nothing on a decision: the installed line is Protection's.

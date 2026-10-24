@@ -2414,7 +2414,7 @@ fn host_key() -> Option<[u8; 32]> {
     if key.is_none() && std::fs::symlink_metadata(path).is_ok() {
         eprintln!(
             "innerwarden contain: {} is not a key this launcher believes (it must be root's, in \
-             folders only root can write), so the jail's hook will not ask Active Defence",
+             folders only root can write), so the jail's hook will not ask InnerWarden Pro",
             path.display()
         );
     }

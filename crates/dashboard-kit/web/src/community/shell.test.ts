@@ -41,7 +41,7 @@ describe("the Community tour", () => {
     }
   });
 
-  it("drops the pitch where Active Defence is installed", () => {
+  it("drops the pitch where InnerWarden Pro is installed", () => {
     expect(communityShellTourSteps(false).some((step) => step.key === COMMUNITY_UPGRADE_STEP_KEY)).toBe(true);
     expect(communityShellTourSteps(true).some((step) => step.key === COMMUNITY_UPGRADE_STEP_KEY)).toBe(false);
   });

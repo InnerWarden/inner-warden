@@ -1221,7 +1221,7 @@ fn hook_block_remedy(verdict: &serde_json::Value) -> &'static str {
 
 /// The remedy after a refusal of Active Defence's own on the host.
 const HOST_BLOCK_REMEDY: &str =
-    "  For the person supervising this agent: Active Defence on this host refused \
+    "  For the person supervising this agent: InnerWarden Pro on this host refused \
      this command on its own, and `innerwarden allow` does not lift that; its settings \
      on this host decide. An agent cannot authorise it and should ask you instead of \
      retrying.";
@@ -2291,7 +2291,7 @@ fn help_text() -> String {
          AI-agent guardrail (cross-platform: Linux, macOS, Windows)\n\
          \n\
          Screen an AI agent's shell command for danger before it runs.\n\
-         InnerWarden Active Defence adds host telemetry and response; on Linux it\n\
+         InnerWarden Pro adds host telemetry and response; on Linux it\n\
          also adds eBPF and the kernel Execution Gate under the SAME `{p}` command.\n\
          What you learn here carries over 1:1.\n\
          \n\
@@ -2309,7 +2309,7 @@ fn help_text() -> String {
            \x20                                wire a PreToolUse hook into Claude Code (--monitor = records, never blocks)\n  \
            {p} uninstall claude-code     remove that hook (leaves other settings untouched)\n  \
            {p} upgrade                   update to the latest signed release (verifies before replacing)\n  \
-         {p} host <command>            run a command in the Active Defence host layer\n  \
+         {p} host <command>            run a command in the InnerWarden Pro host layer\n  \
            {p} uninstall                 remove InnerWarden entirely: hook, config, binary and its iw shortcuts\n  \
            {p} agents [connect [--monitor]|disconnect [--all|<name>]]\n  \
            \x20                                find AI agents on this machine + connect the guard\n  \
@@ -2333,10 +2333,10 @@ fn help_text() -> String {
            \x20                                (setup wizard collects the key for you; set-key adds it later)\n  \
            {p} --version\n\
          \n\
-         Active Defence (licensed host layer - Linux eBPF, exec-gate, incident triage):\n  \
+         InnerWarden Pro (licensed host layer - Linux eBPF, exec-gate, incident triage):\n  \
            {p} get | action | trust | stream | rule | system | exec-gate | scan | harden\n  \
-           \x20                                run these once Active Defence is installed;\n  \
-           \x20                                without it they explain how to get it. → innerwarden.com/defend\n\
+           \x20                                run these once InnerWarden Pro is installed;\n  \
+           \x20                                without it they explain how to get it. → innerwarden.com/pricing\n\
          \n\
          `check` prints a human summary on a terminal, JSON when piped (or with --json),\n\
          and exits 1 on `deny`, so a PreToolUse hook can gate:\n  \
@@ -2430,7 +2430,7 @@ mod tests {
         let said = super::hook_block_remedy(&host);
         assert!(!said.contains("innerwarden allow --help"), "{said}");
         assert!(
-            said.contains("Active Defence on this host refused this command on its own"),
+            said.contains("InnerWarden Pro on this host refused this command on its own"),
             "{said}"
         );
         for other in [
@@ -2524,6 +2524,22 @@ mod tests {
             "claude-code".into(),
             "--purge".into()
         ]));
+    }
+
+    /// Customers buy InnerWarden Community, InnerWarden Pro and Enterprise.
+    /// "Active Defence" names only the paid repository and its release line
+    /// (operator, 2026-10-24), so `--help` names the paid tier as it is sold
+    /// and points at the page that sells it, not at the free install page.
+    ///
+    /// FAILS ON REVERT: put "Active Defence" back in `help_text()`, or the
+    /// `/defend` link, and this fails.
+    #[test]
+    fn help_names_the_paid_tier_as_it_is_sold() {
+        let help = help_text();
+        assert!(help.contains("InnerWarden Pro"), "{help}");
+        assert!(!help.contains("Active Defen"), "{help}");
+        assert!(help.contains("innerwarden.com/pricing"), "{help}");
+        assert!(!help.contains("innerwarden.com/defend"), "{help}");
     }
 
     #[test]

@@ -232,12 +232,12 @@ describe("the Agents page with identity data", () => {
    * Agents makes no Active Defence offer of its own (spec 6.4): the one
    * generic line is on Protection, so the page links nowhere outside.
    */
-  it("makes no Active Defence line, contained agent or not, and on a host that has it", () => {
+  it("makes no InnerWarden Pro line, contained agent or not, and on a host that has it", () => {
     seed(withIdentity());
     const html = render(<CommunityAgents context={context()} />, withIdentity());
     expect(html).not.toContain("data-offer");
     expect(html).not.toContain("data-ad-state");
-    expect(textOf(html)).not.toContain("Active Defence");
+    expect(textOf(html)).not.toContain("InnerWarden Pro");
     expect([...html.matchAll(/href="(https:\/\/innerwarden\.com[^"]*)"/g)]).toEqual([]);
     const installed = render(<CommunityAgents context={context({ ...META, active_defence_installed: true })} />, withIdentity());
     expect(installed).not.toContain("data-offer");
@@ -384,8 +384,8 @@ describe("a case with identity", () => {
     };
     const out = html(refused, "deny", "linux", true, { decided_by: "host" });
     const text = textOf(out);
-    expect(text).toContain("Refused by Active Defence on this host.");
-    expect(text).toContain("Deny, by Active Defence on this host");
+    expect(text).toContain("Refused by InnerWarden Pro on this host.");
+    expect(text).toContain("Deny, by InnerWarden Pro on this host");
     expect(text).not.toContain("Refused by your general rules.");
     expect(text).not.toContain("kept your general rules");
     expect(text).not.toContain("kernel_a_word_never_heard");
@@ -393,7 +393,7 @@ describe("a case with identity", () => {
     // The same record decided by the general rules keeps their words.
     const rules = textOf(html(refused, "deny", "linux", true, { decided_by: "rules" }));
     expect(rules).toContain("Refused by your general rules.");
-    expect(rules).not.toContain("Refused by Active Defence on this host.");
+    expect(rules).not.toContain("Refused by InnerWarden Pro on this host.");
   });
 
   it("names the instance and session, the trust and why, and the layer that decided", () => {
@@ -410,19 +410,19 @@ describe("a case with identity", () => {
   it("says why a relaxation did not apply in the words of the page it is on", () => {
     const withheld = { instance_id: ID_A, trust: "observed", trust_reason: "confined_by_namespace", deciding_layer: "general", profile: "claude-code", relaxation_withheld: true };
     expect(textOf(html(withheld, "review", "linux", false))).toContain(
-      "Per-agent relaxations apply on Linux with Active Defence, for an agent started with innerwarden contain --identity.",
+      "Per-agent relaxations apply on Linux with InnerWarden Pro, for an agent started with innerwarden contain --identity.",
     );
-    expect(textOf(html(withheld, "review", "linux", true))).toContain("Active Defence on this host did not decide this command, so your general rules decided.");
+    expect(textOf(html(withheld, "review", "linux", true))).toContain("InnerWarden Pro on this host did not decide this command, so your general rules decided.");
     const kept = { ...withheld, trust_source: "host", host_decision: "0f1e2d3c4b5a69788796a5b4c3d2e1f0", host_withheld: "a_word_never_heard" };
     const text = textOf(html(kept, "review", "linux", true));
-    expect(text).toContain("Active Defence on this host kept your general rules for this command.");
+    expect(text).toContain("InnerWarden Pro on this host kept your general rules for this command.");
     expect(text).not.toContain("a_word_never_heard");
     // The technical view names who read the trust and who decided the rules,
     // and still never the host's word: the one sentence is all it says.
     setTechnicalDetail(true);
     const technical = textOf(html(kept, "review", "linux", true));
     expect(technical).toContain("Trust read by: the hook inside the jail (confined_by_namespace).");
-    expect(technical).toContain("Rules decided by: Active Defence on this host (decision 0f1e2d3c4b5a69788796a5b4c3d2e1f0).");
+    expect(technical).toContain("Rules decided by: InnerWarden Pro on this host (decision 0f1e2d3c4b5a69788796a5b4c3d2e1f0).");
     expect(technical).not.toContain("Trust decided by");
     expect(technical).not.toContain("a_word_never_heard");
     expect(technical).not.toContain("Host word");
@@ -444,11 +444,11 @@ describe("a case with identity", () => {
     };
     const out = html(decided, "allow", "linux", true);
     const text = textOf(out);
-    expect(text).toContain("decided by Active Defence on this host.");
+    expect(text).toContain("decided by InnerWarden Pro on this host.");
     expect(out).not.toContain("data-identity-conflict");
     expect(text).toContain("Observed");
     expect(text).not.toContain("Confined");
-    expect(out).toContain('title="Read from inside the jail; Active Defence on this host decided its rules."');
+    expect(out).toContain('title="Read from inside the jail; InnerWarden Pro on this host decided its rules."');
     // A host label without the host's decision is not taken as one.
     const bare = { ...decided, host_decision: undefined };
     expect(html(bare, "allow", "linux", true)).toContain("data-identity-conflict");

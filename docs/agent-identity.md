@@ -20,7 +20,7 @@ Trust has three levels, and in Community the highest one is never reached:
   dashboard says why.
 - `host_verified` (shown as confined): the instance runs in a boundary it
   cannot leave, confirmed by a witness outside the agent. Community has no such
-  witness; it exists only where InnerWarden Active Defence is installed on the
+  witness; it exists only where InnerWarden Pro is installed on the
   same host and confirms the instance from outside the jail. The Community
   dashboard never shows an instance as confined, whatever a label in a graph
   or a record says.
@@ -33,14 +33,14 @@ allowed it. A rule that TIGHTENS (refuses more) applies at every trust level.
 
 The hook in a jail never applies a relaxation on its own word. When your
 general rules send a shell command of an identified instance to review, the
-hook asks InnerWarden Active Defence on the same host, if it runs there, and
+hook asks InnerWarden Pro on the same host, if it runs there, and
 the host decides. The hook keeps the stricter of its own decision and the
 host's, so a deny and your own profiles file still win, and the trust it
 records stays its own reading from inside the jail. A review the hook would
 block on its line is still asked about, because the host may relax it; the
 host lets nothing of it run that the hook does not keep. When the host
 refuses a command on its own (it will not start a program in it), the hook
-says: "Active Defence on this host will not start a program in this command."
+says: "InnerWarden Pro on this host will not start a program in this command."
 and records the block as the host's.
 
 A profile in the system file (`/etc/innerwarden/agent-profiles.toml`,
@@ -54,24 +54,24 @@ the hook refuses is never asked about. It costs a request to the host on
 every command, bounded like the others.
 
 A command the hook refuses itself, where it would ask the host about a
-review (an identified instance, the profiles in force, Active Defence on the
+review (an identified instance, the profiles in force, InnerWarden Pro on the
 host), is reported to the host once the refusal stands, so the host's case
 of that session lists it with the commands it was asked about. The report
 is the hook's refusal, sent after it decided: nothing the host answers
-changes it, and an Active Defence that does not know the report refuses it,
+changes it, and a version of InnerWarden Pro that does not know the report refuses it,
 with nothing else changing. Monitor refuses nothing, so it reports nothing. Only the system file says
 `ask_host`; the user's file never does, and a file of schema 1 that says it
 is refused. Every program that reads the system file must read schema 2
 before you write one: an older `innerwarden` refuses a file of schema 2, and
-so does an older Active Defence on the host, which reads the same file.
+so does an older InnerWarden Pro on the host, which reads the same file.
 Update both first.
 
 A profile of schema 2, in either file, can also say when its jail starts and
 what of the home it hides, under `[profile.<type>.jail]`:
 
 - `start = "only_when_admitted"`: `contain --identity` starts the agent only
-  once Active Defence on the host has admitted the jail. Otherwise it says
-  "Active Defence on this host did not admit this jail, and its profile
+  once InnerWarden Pro on the host has admitted the jail. Otherwise it says
+  "InnerWarden Pro on this host did not admit this jail, and its profile
   starts it only when admitted.", says what to check and which file asks for
   it, and exits 2 with nothing started. Inside the jail the command starts
   through `innerwarden contain-gate`, which will not start it without the
@@ -101,7 +101,7 @@ what of the home it hides, under `[profile.<type>.jail]`:
   path's cover.
 
 The user's file can only tighten these: the stricter `start` and every hidden
-path of both files hold. When Active Defence sends a note about the jail (for
+path of both files hold. When InnerWarden Pro sends a note about the jail (for
 example, whether kernel protection is in effect for the session), it prints
 it as `innerwarden contain: <note>`.
 
@@ -329,9 +329,9 @@ Where a per-agent relaxation applies:
 - the `innerwarden` that starts the jail is installed system-wide and owned by
   root (for example `/usr/local/bin/innerwarden`), not in your home folder;
 - the agent was started with `innerwarden contain --identity`;
-- InnerWarden Active Defence runs on the same host with agent identity turned
+- InnerWarden Pro runs on the same host with agent identity turned
   on and an active licence, and it placed the jail in a scope of its own;
-- Active Defence can tell which jail the asking process belongs to;
+- InnerWarden Pro can tell which jail the asking process belongs to;
 - shell commands your general rules sent to review (never MCP tools or file
   edits);
 - the `innerwarden` inside the jail is a version that asks the host.

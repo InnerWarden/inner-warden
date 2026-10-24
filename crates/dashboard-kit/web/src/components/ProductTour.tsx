@@ -293,8 +293,8 @@ export const COMMUNITY_TOUR_STEPS: readonly TourStep[] = [
     // rather than restating the offer in tour copy. The product then makes its
     // pitch once, in one voice, and a change to the card cannot leave a second
     // stale version of it behind in here.
-    title: "Going further: Active Defence",
-    body: "Community screens what your agents try to run. Active Defence is the paid tier that adds host protection: its own telemetry, incident triage, evidence-backed response and, on supported Linux hosts, kernel enforcement. This card links to the details.",
+    title: "Going further: InnerWarden Pro",
+    body: "Community screens what your agents try to run. InnerWarden Pro is the paid tier that adds host protection: its own telemetry, incident triage, evidence-backed response and, on supported Linux hosts, kernel enforcement. This card links to the details.",
     route: "overview",
     selectors: ['[data-tour="upgrade"]', 'aside[aria-labelledby="active-defence-title"]'],
   },

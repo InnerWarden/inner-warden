@@ -107,7 +107,7 @@ impl std::fmt::Display for NoAnswer {
         f.write_str(match self {
             NoAnswer::NotLoopback => "the agent's address is not this host's loopback",
             NoAnswer::Refused => {
-                "nothing listens at the agent's address: Active Defence is not running"
+                "nothing listens at the agent's address: InnerWarden Pro is not running"
             }
             NoAnswer::Unreachable => "the agent's address cannot be reached",
             NoAnswer::WrongKey => "the server at the agent's address does not hold the host's key",
@@ -860,7 +860,7 @@ mod tests {
         );
         let _ = broken.join();
         for (why, said) in [
-            (NoAnswer::Refused, "Active Defence is not running"),
+            (NoAnswer::Refused, "InnerWarden Pro is not running"),
             (NoAnswer::WrongKey, "does not hold the host's key"),
             (NoAnswer::TimedOut, "did not answer in time"),
         ] {

@@ -61,7 +61,7 @@ export const DECIDER_WORDS: Record<string, string> = {
   warden: "the local model",
   llm: "your model's second opinion",
   user: "you",
-  host: "Active Defence on this host",
+  host: "InnerWarden Pro on this host",
 };
 
 export const CHANNELS = ["hook", "mcp", "check", "unknown"] as const;
@@ -212,7 +212,7 @@ export const TRUST_WORDS: Record<TrustWordKey, TrustWord> = {
   },
   "observed:host": {
     label: "Observed",
-    tooltip: "Read from inside the jail; Active Defence on this host decided its rules.",
+    tooltip: "Read from inside the jail; InnerWarden Pro on this host decided its rules.",
     tone: "watch",
   },
   "declared:jail": { label: "Declared only", tooltip: "Only its own word says what it is.", tone: "watch" },
@@ -300,7 +300,7 @@ export const REASON_WORDS: Record<ReasonCode, string> = {
   mount_namespace_mismatch: "It sees a filesystem its launcher did not build, so its jail record proves nothing.",
   agent_mismatch: "Its jail record names another kind of agent than its hook serves.",
   agent_not_named: "Neither its hook nor its launcher named the agent, so its jail record proves nothing about it.",
-  host_decided: "Active Defence on this host decided its rules.",
+  host_decided: "InnerWarden Pro on this host decided its rules.",
 };
 
 export const UNKNOWN_REASON_WORDS = "Why it is unverified was not recorded.";
@@ -390,20 +390,20 @@ export const LAYER_WORDS: Record<LayerKey, string> = {
  * installed there.
  */
 export const WITHHELD_WORDS = {
-  linux: "Per-agent relaxations apply on Linux with Active Defence, for an agent started with innerwarden contain --identity.",
-  linuxWithActiveDefence: "Active Defence on this host did not decide this command, so your general rules decided.",
+  linux: "Per-agent relaxations apply on Linux with InnerWarden Pro, for an agent started with innerwarden contain --identity.",
+  linuxWithActiveDefence: "InnerWarden Pro on this host did not decide this command, so your general rules decided.",
   macos: "Per-agent relaxations do not apply on macOS: a jail there has no boundary a witness outside it can check.",
 } as const;
 
 /** Any word the host recorded for not relaxing, whatever it is: one sentence. */
-export const HOST_WITHHELD_WORDS = "Active Defence on this host kept your general rules for this command.";
+export const HOST_WITHHELD_WORDS = "InnerWarden Pro on this host kept your general rules for this command.";
 
 /**
  * A refusal of the host's own that stood: the hook recorded the host's answer
  * and that the host decided the refusal (`decided_by: host`). Never worded as
  * one of the general rules, which may have allowed the command.
  */
-export const HOST_REFUSED_WORDS = "Refused by Active Defence on this host.";
+export const HOST_REFUSED_WORDS = "Refused by InnerWarden Pro on this host.";
 
 export function hostRefused(trustSource: TrustSource | undefined, decidedBy: string, verdict: Verdict | undefined): boolean {
   return trustSource === "host" && decidedBy === "host" && verdict === "deny";
@@ -422,8 +422,8 @@ export function layerWords(layer: Layer, verdict: Verdict, agent: string): strin
 
 /** An allowance a per-agent layer gave where Active Defence on the host decided the rules. */
 export const HOST_LAYER_WORDS: Record<"agent_type" | "instance", string> = {
-  agent_type: "Allowed by the {agent} profile, decided by Active Defence on this host.",
-  instance: "Allowed by an exception for this instance, decided by Active Defence on this host.",
+  agent_type: "Allowed by the {agent} profile, decided by InnerWarden Pro on this host.",
+  instance: "Allowed by an exception for this instance, decided by InnerWarden Pro on this host.",
 };
 
 /** One line in the Changes list (P6), by what was done. */

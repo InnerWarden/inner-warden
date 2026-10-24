@@ -289,7 +289,7 @@ fn relaxed(verdict: Verdict, layer: RuleLayer) -> bool {
 /// the host says beyond it is its word in `withheld`, recorded and never
 /// shown, so the sentence is the same for every refusal of the host's own.
 pub const HOST_DENY_SENTENCE: &str =
-    "Active Defence on this host will not start a program in this command.";
+    "InnerWarden Pro on this host will not start a program in this command.";
 
 /// Who decided (`decided_by`) where a refusal of the host's own stands: the
 /// host, never the general rules nor the person's suppression the verdict
@@ -1486,7 +1486,7 @@ mod tests {
         }
         assert_eq!(
             HOST_DENY_SENTENCE,
-            "Active Defence on this host will not start a program in this command."
+            "InnerWarden Pro on this host will not start a program in this command."
         );
         assert_eq!(HOST_DECIDED_BY, "host");
     }
