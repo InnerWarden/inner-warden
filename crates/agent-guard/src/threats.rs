@@ -2170,13 +2170,7 @@ fn words_run_guard_loosening_verb_fed(words: &[String], depth: u8, mut fed: bool
         // own (`agent disconnect`, `agent install-hook --remove|--monitor`,
         // `uninstall`): read through the same parse.
         if base == "innerwarden-ctl" {
-            let arguments = &words[index + 1..];
-            let verb = arguments
-                .iter()
-                .find(|word| *word != "--")
-                .map(|word| word.to_ascii_lowercase());
-            return matches!(verb.as_deref(), Some("agent" | "uninstall"))
-                && guard_verb_loosens(arguments);
+            return ctl_verb_loosens(&words[index + 1..]);
         }
         if base == "find" {
             // `find ... -exec innerwarden allow {} \;`: the command after
@@ -2277,14 +2271,34 @@ fn uninstall_only_asks(lower: &str) -> bool {
 }
 
 /// Whether `words` hold the guard's CLI (any of its names, by any path)
-/// followed by arguments that loosen the guard ([`guard_verb_loosens`]).
+/// followed by arguments that loosen the guard ([`guard_verb_loosens`]), or
+/// Active Defence's `innerwarden-ctl` followed by a verb of its own that
+/// lowers the guard ([`ctl_verb_loosens`]; live gate 0.17.8, F1: a wrapper
+/// `guard_cli_named_later_loosens` reads past, like `taskset` or `flock`, in
+/// front of `innerwarden-ctl agent install-hook --monitor`).
 fn guard_cli_named_later_loosens(words: &[String]) -> bool {
     words.iter().enumerate().any(|(index, word)| {
         let lower = word.to_ascii_lowercase();
         let base = token_basename(lower.trim_matches('`'));
         let base = base.strip_suffix(".exe").unwrap_or(base);
-        is_guard_cli_name(base) && guard_verb_loosens(&words[index + 1..])
+        if is_guard_cli_name(base) {
+            return guard_verb_loosens(&words[index + 1..]);
+        }
+        base == "innerwarden-ctl" && ctl_verb_loosens(&words[index + 1..])
     })
+}
+
+/// Whether the arguments after Active Defence's `innerwarden-ctl` name one of
+/// its own guard-lowering verbs (`agent disconnect`, `agent install-hook
+/// --remove|--monitor`, `uninstall`), read through [`guard_verb_loosens`]. The
+/// free CLI (and its `iw`/`iw-guard` aliases) forwards an unknown verb to the
+/// ctl, so [`is_guard_cli_name`] with [`guard_verb_loosens`] covers those.
+fn ctl_verb_loosens(arguments: &[String]) -> bool {
+    let verb = arguments
+        .iter()
+        .find(|word| *word != "--")
+        .map(|word| word.to_ascii_lowercase());
+    matches!(verb.as_deref(), Some("agent" | "uninstall")) && guard_verb_loosens(arguments)
 }
 
 /// The command string a shell (`-c`), `script` (`-c`, `--command`) or `su`
@@ -2388,12 +2402,15 @@ fn code_text_runs_guard_verb(text: &str) -> bool {
 }
 
 /// [`code_text_runs_guard_verb`] for the verbs in `only` (every verb when it
-/// is empty), under any of the CLI's names: `innerwarden`, and the
-/// installer's `iw-guard` and `iw` (live gate of Active Defence 0.17.7, L1:
-/// `env -S 'iw dry-run'`, `flock -c 'iw dry-run'` and `busybox sh -c 'iw
-/// dry-run'` hid the alias inside a command string only this backstop reads).
+/// is empty), under any of the CLI's names: `innerwarden`, Active Defence's
+/// `innerwarden-ctl`, and the installer's `iw-guard` and `iw` (live gate of
+/// Active Defence 0.17.7, L1: `env -S 'iw dry-run'`, `flock -c 'iw dry-run'`
+/// and `busybox sh -c 'iw dry-run'` hid the alias inside a command string only
+/// this backstop reads; live gate 0.17.8, F1: the same forms carried the ctl's
+/// own guard-lowering verbs, which the name `innerwarden-ctl` and the verb
+/// `agent` were missing from this search).
 fn text_runs_guard_verb(text: &str, only: &[&str]) -> bool {
-    ["innerwarden", "iw-guard", "iw"]
+    ["innerwarden-ctl", "innerwarden", "iw-guard", "iw"]
         .iter()
         .any(|name| text_runs_guard_verb_named(text, only, name))
 }
@@ -2453,7 +2470,9 @@ fn text_runs_guard_verb_named(text: &str, only: &[&str], name: &str) -> bool {
 /// or silence its rules (`mute`). `dry-run` has no terminal check of its own,
 /// so the guard's reading of the agent's command is the only thing in its way.
 /// `agents`, `contain`, `install` and `uninstall` are read here too, for
-/// their forms that take the hook off or rewire it ([`guard_verb_loosens`]).
+/// their forms that take the hook off or rewire it ([`guard_verb_loosens`]),
+/// and `agent` for Active Defence's `innerwarden-ctl` verbs (`agent
+/// disconnect`, `agent install-hook --remove|--monitor`; live gate 0.17.8, F1).
 /// The text of a file the agent WRITES is not read here (a Write or Edit
 /// carries no command): a script it writes and runs is held by the CLI,
 /// which refuses these verbs inside an AI agent's shell, the script's too.
@@ -2462,6 +2481,7 @@ const MODE_VERBS: &[&str] = &[
     "dry-run",
     "monitor",
     "agents",
+    "agent",
     "contain",
     "install",
     "uninstall",
