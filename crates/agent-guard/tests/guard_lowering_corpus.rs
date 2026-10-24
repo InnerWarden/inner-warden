@@ -245,6 +245,54 @@ fn deny_cases() -> Vec<(String, String)> {
         "C=innerwarden-ctl; $C agent install-hook --monitor".into(),
         "variable|innerwarden-ctl|install-hook".into(),
     ));
+
+    // Live gate v0.17.8 (Community gate, F0): three more shapes of the ctl
+    // verbs. A valid global option spliced between the program and its
+    // subcommand, or between `agent` and its subcommand; command substitution;
+    // and a quote-split of the full `innerwarden` name.
+    let ctl_tails = [
+        "agent disconnect claude-code",
+        "agent install-hook --remove",
+        "agent install-hook --monitor",
+        "uninstall",
+    ];
+    // Global options ctl accepts before a subcommand: value-taking (space and
+    // `=` forms) and a bare flag.
+    for tail in ctl_tails {
+        for (opt, label) in [
+            ("--data-dir /var/lib/innerwarden ", "opt-space"),
+            ("--agent-config=/etc/innerwarden/agent.toml ", "opt-eq"),
+            ("--url=https://127.0.0.1:8787 ", "opt-url-eq"),
+        ] {
+            cases.push((
+                format!("innerwarden-ctl {opt}{tail}"),
+                format!("global-option|{label}|{tail}"),
+            ));
+        }
+        // The option between `agent` and its subcommand (not for bare
+        // `uninstall`, which has no second word to splice before).
+        if let Some(rest) = tail.strip_prefix("agent ") {
+            cases.push((
+                format!("innerwarden-ctl agent --data-dir /var/lib/innerwarden {rest}"),
+                format!("global-option|after-agent|{tail}"),
+            ));
+        }
+        // Command substitution carrying the whole invocation.
+        cases.push((
+            format!("echo $(innerwarden-ctl {tail})"),
+            format!("cmd-subst|echo|{tail}"),
+        ));
+    }
+    // A quote-split of the full `innerwarden` name, carrying a ctl verb the free
+    // CLI forwards to the ctl.
+    cases.push((
+        "'inner'warden agent install-hook --remove".into(),
+        "quote-split|innerwarden|install-hook".into(),
+    ));
+    cases.push((
+        "innerwarden-'ctl' agent disconnect claude-code".into(),
+        "quote-split|innerwarden-ctl|disconnect".into(),
+    ));
     cases
 }
 

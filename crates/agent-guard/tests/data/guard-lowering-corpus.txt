@@ -590,6 +590,27 @@ DENY	I=iw; $I dry-run
 DENY	export I=iw && ${I} uninstall claude-code
 DENY	G=iw-guard; V=dry-run; $G $V
 DENY	C=innerwarden-ctl; $C agent install-hook --monitor
+DENY	innerwarden-ctl --data-dir /var/lib/innerwarden agent disconnect claude-code
+DENY	innerwarden-ctl --agent-config=/etc/innerwarden/agent.toml agent disconnect claude-code
+DENY	innerwarden-ctl --url=https://127.0.0.1:8787 agent disconnect claude-code
+DENY	innerwarden-ctl agent --data-dir /var/lib/innerwarden disconnect claude-code
+DENY	echo $(innerwarden-ctl agent disconnect claude-code)
+DENY	innerwarden-ctl --data-dir /var/lib/innerwarden agent install-hook --remove
+DENY	innerwarden-ctl --agent-config=/etc/innerwarden/agent.toml agent install-hook --remove
+DENY	innerwarden-ctl --url=https://127.0.0.1:8787 agent install-hook --remove
+DENY	innerwarden-ctl agent --data-dir /var/lib/innerwarden install-hook --remove
+DENY	echo $(innerwarden-ctl agent install-hook --remove)
+DENY	innerwarden-ctl --data-dir /var/lib/innerwarden agent install-hook --monitor
+DENY	innerwarden-ctl --agent-config=/etc/innerwarden/agent.toml agent install-hook --monitor
+DENY	innerwarden-ctl --url=https://127.0.0.1:8787 agent install-hook --monitor
+DENY	innerwarden-ctl agent --data-dir /var/lib/innerwarden install-hook --monitor
+DENY	echo $(innerwarden-ctl agent install-hook --monitor)
+DENY	innerwarden-ctl --data-dir /var/lib/innerwarden uninstall
+DENY	innerwarden-ctl --agent-config=/etc/innerwarden/agent.toml uninstall
+DENY	innerwarden-ctl --url=https://127.0.0.1:8787 uninstall
+DENY	echo $(innerwarden-ctl uninstall)
+DENY	'inner'warden agent install-hook --remove
+DENY	innerwarden-'ctl' agent disconnect claude-code
 ALLOW	innerwarden --version
 ALLOW	innerwarden-ctl agent kernel status
 ALLOW	innerwarden mute --list

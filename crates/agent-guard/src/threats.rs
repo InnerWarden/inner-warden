@@ -620,7 +620,13 @@ pub fn check_guard_self_disable(content: &str) -> Option<(&'static str, u32)> {
         .chars()
         .filter(|c| !matches!(c, '\'' | '"' | '\\'))
         .collect();
-    if unquoted != content && !names_guard_alias(content) && names_guard_alias(&unquoted) {
+    // A name split by quotes reads as the name once the quotes are dropped:
+    // the `iw` alias (`'i'w`), and the full name too (`'inner'warden agent
+    // install-hook --remove`; live gate v0.17.8, F0). Only act on the unquoted
+    // reading when it reveals a guard name the quoted form hid.
+    let reveals_guard =
+        |text: &str| text.to_ascii_lowercase().contains("innerwarden") || names_guard_alias(text);
+    if unquoted != content && !reveals_guard(content) && reveals_guard(&unquoted) {
         if let Some(hit) = guard_self_disable_in(&unquoted) {
             return Some(hit);
         }
@@ -2294,11 +2300,69 @@ fn guard_cli_named_later_loosens(words: &[String]) -> bool {
 /// free CLI (and its `iw`/`iw-guard` aliases) forwards an unknown verb to the
 /// ctl, so [`is_guard_cli_name`] with [`guard_verb_loosens`] covers those.
 fn ctl_verb_loosens(arguments: &[String]) -> bool {
-    let verb = arguments
-        .iter()
-        .find(|word| *word != "--")
-        .map(|word| word.to_ascii_lowercase());
+    let arguments = skip_leading_options(arguments);
+    let verb = arguments.first().map(|word| word.to_ascii_lowercase());
     matches!(verb.as_deref(), Some("agent" | "uninstall")) && guard_verb_loosens(arguments)
+}
+
+/// Active Defence's ctl, and its `agent` subcommand, take global options before
+/// the verb that follows (`innerwarden-ctl --data-dir X agent disconnect`,
+/// `innerwarden-ctl agent --data-dir X disconnect`; live gate v0.17.8, F0). The
+/// options that take a value consume the next word too. `skip_leading_options`
+/// drops those leading options so the verb is read where it actually is; it
+/// stops at the first word that is not an option (the verb or subcommand), so a
+/// `--monitor` or `--remove` that belongs to the subcommand is never skipped.
+const GLOBAL_VALUE_OPTIONS: &[&str] = &[
+    "--data-dir",
+    "--agent-config",
+    "--sensor-config",
+    "--config",
+    "--url",
+];
+
+/// The first non-option word in `args`, with the value of a value-taking option
+/// skipped too. The `&str` twin of [`skip_leading_options`], for the subcommand
+/// after `agent`/`agents` (`agent --data-dir X disconnect`; live gate F0).
+fn first_positional<'a>(args: &[&'a str]) -> Option<&'a str> {
+    let mut index = 0;
+    while let Some(&word) = args.get(index) {
+        if word == "--" || (word.starts_with("--") && word.contains('=')) {
+            index += 1;
+        } else if word.starts_with('-') {
+            index += 1;
+            if GLOBAL_VALUE_OPTIONS.contains(&word)
+                && args.get(index).is_some_and(|value| !value.starts_with('-'))
+            {
+                index += 1;
+            }
+        } else {
+            return Some(word);
+        }
+    }
+    None
+}
+
+/// The arguments with any leading options (and the value of a value-taking one)
+/// dropped. See [`GLOBAL_VALUE_OPTIONS`].
+fn skip_leading_options(mut arguments: &[String]) -> &[String] {
+    while let Some(word) = arguments.first() {
+        if word == "--" || (word.starts_with("--") && word.contains('=')) {
+            arguments = &arguments[1..];
+        } else if word.starts_with('-') {
+            let takes_value = GLOBAL_VALUE_OPTIONS.contains(&word.as_str());
+            arguments = &arguments[1..];
+            if takes_value
+                && arguments
+                    .first()
+                    .is_some_and(|value| !value.starts_with('-'))
+            {
+                arguments = &arguments[1..];
+            }
+        } else {
+            break;
+        }
+    }
+    arguments
 }
 
 /// The command string a shell (`-c`), `script` (`-c`, `--command`) or `su`
@@ -2625,11 +2689,10 @@ fn guard_verb_is_fed(arguments: &[String]) -> bool {
 
 /// The arguments after `innerwarden`: whether they widen what is let through.
 fn guard_verb_loosens(arguments: &[String]) -> bool {
-    // `npm exec innerwarden -- allow x`: the `--` belongs to the launcher.
-    let arguments = match arguments.first() {
-        Some(first) if first == "--" => &arguments[1..],
-        _ => arguments,
-    };
+    // `npm exec innerwarden -- allow x`: the `--` belongs to the launcher. A
+    // global option spliced before the verb (`innerwarden-ctl --data-dir X
+    // agent disconnect`; live gate v0.17.8, F0) is stepped past the same way.
+    let arguments = skip_leading_options(arguments);
     let Some(verb) = arguments.first() else {
         return false;
     };
@@ -2654,7 +2717,7 @@ fn guard_verb_loosens(arguments: &[String]) -> bool {
         // agents, connecting them and asking for help are not decisions.
         "agents" => {
             !asks_for_help
-                && rest.first().is_some_and(|first| {
+                && first_positional(&rest).is_some_and(|first| {
                     let sub = first.to_ascii_lowercase();
                     AGENT_DECISION_VERBS.contains(&sub.as_str())
                         // Taking the hook off an agent, or rewiring it to
@@ -2687,7 +2750,7 @@ fn guard_verb_loosens(arguments: &[String]) -> bool {
         // nothing.
         "agent" => {
             !asks_for_help
-                && rest.first().is_some_and(|first| {
+                && first_positional(&rest).is_some_and(|first| {
                     let sub = first.to_ascii_lowercase();
                     sub == "disconnect"
                         || (sub == "install-hook"
