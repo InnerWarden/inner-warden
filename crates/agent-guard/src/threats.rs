@@ -608,6 +608,78 @@ fn dangerous_command_regexes() -> &'static [(regex::Regex, &'static str, bool)] 
 ///
 /// Returns `(what, score)`.
 pub fn check_guard_self_disable(content: &str) -> Option<(&'static str, u32)> {
+    // As the shell reads it: a variable set earlier on the line stands for
+    // its value (`I=iw; $I dry-run`), and a name built from quoted pieces is
+    // the name (`'i'w dry-run`) (live gate of Active Defence 0.17.7, L1).
+    if let Some(expanded) = with_assignments_expanded(content) {
+        if let Some(hit) = check_guard_self_disable(&expanded) {
+            return Some(hit);
+        }
+    }
+    let unquoted: String = content
+        .chars()
+        .filter(|c| !matches!(c, '\'' | '"' | '\\'))
+        .collect();
+    if unquoted != content && !names_guard_alias(content) && names_guard_alias(&unquoted) {
+        if let Some(hit) = guard_self_disable_in(&unquoted) {
+            return Some(hit);
+        }
+    }
+    check_guard_self_disable_read(content)
+}
+
+/// PURE. `content` with every `$NAME` / `${NAME}` of a variable set on the
+/// same line (`NAME=value`, `export NAME=value`) replaced by its value, or
+/// `None` when nothing was replaced.
+fn with_assignments_expanded(content: &str) -> Option<String> {
+    if !content.contains('$') || !content.contains('=') {
+        return None;
+    }
+    static ASSIGN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let assign = ASSIGN.get_or_init(|| {
+        regex::Regex::new(
+            r#"(?:^|[\s;&|(])(?:(?:export|local|readonly|declare)\s+)?([A-Za-z_][A-Za-z0-9_]*)=(?:'([^']*)'|"([^"$`]*)"|([^\s;&|()'"$`]*))"#,
+        )
+        .expect("a valid pattern")
+    });
+    let mut out = content.to_string();
+    let mut changed = false;
+    for capture in assign.captures_iter(content) {
+        let name = &capture[1];
+        let value = capture
+            .get(2)
+            .or_else(|| capture.get(3))
+            .or_else(|| capture.get(4))
+            .map_or("", |m| m.as_str());
+        for reference in [format!("${{{name}}}"), format!("${name}")] {
+            let mut next = String::with_capacity(out.len());
+            let mut rest = out.as_str();
+            while let Some(at) = rest.find(&reference) {
+                let after = &rest[at + reference.len()..];
+                // `$IW` is not `$I`: the name ends where the shell ends it.
+                let ends = reference.ends_with('}')
+                    || !after
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+                next.push_str(&rest[..at]);
+                if ends {
+                    next.push_str(value);
+                    changed = true;
+                } else {
+                    next.push_str(&reference);
+                }
+                rest = after;
+            }
+            next.push_str(rest);
+            out = next;
+        }
+    }
+    changed.then_some(out)
+}
+
+/// [`check_guard_self_disable`] on the command as written.
+fn check_guard_self_disable_read(content: &str) -> Option<(&'static str, u32)> {
     const NEEDLES: &[&str] = &[
         "innerwarden",
         "openclaw",
@@ -2316,15 +2388,24 @@ fn code_text_runs_guard_verb(text: &str) -> bool {
 }
 
 /// [`code_text_runs_guard_verb`] for the verbs in `only` (every verb when it
-/// is empty).
+/// is empty), under any of the CLI's names: `innerwarden`, and the
+/// installer's `iw-guard` and `iw` (live gate of Active Defence 0.17.7, L1:
+/// `env -S 'iw dry-run'`, `flock -c 'iw dry-run'` and `busybox sh -c 'iw
+/// dry-run'` hid the alias inside a command string only this backstop reads).
 fn text_runs_guard_verb(text: &str, only: &[&str]) -> bool {
-    const NAME: &str = "innerwarden";
+    ["innerwarden", "iw-guard", "iw"]
+        .iter()
+        .any(|name| text_runs_guard_verb_named(text, only, name))
+}
+
+/// [`text_runs_guard_verb`] for one of the CLI's names.
+fn text_runs_guard_verb_named(text: &str, only: &[&str], name: &str) -> bool {
     // Same byte offsets as `text`, which is what the slices below rely on.
     let lower = text.to_ascii_lowercase();
     let mut from = 0usize;
-    while let Some(found) = lower[from..].find(NAME) {
+    while let Some(found) = lower[from..].find(name) {
         let start = from + found;
-        let after = start + NAME.len();
+        let after = start + name.len();
         from = after;
         // `$'x:\n\tinnerwarden ...'`: an escaped tab or newline before the
         // name is a separator once the shell decodes it.
@@ -13469,6 +13550,54 @@ mod brq_evaluation_tests {
                 check_security_tamper(cmd).is_none(),
                 "{cmd} is not tampering: {:?}",
                 check_security_tamper(cmd)
+            );
+        }
+    }
+
+    /// Live gate of Active Defence 0.17.7, L1: the `iw` alias passed both
+    /// hooks inside a command string (`env -S`, `flock -c`, `busybox sh -c`),
+    /// built from quoted pieces (`'i'w`), and behind a variable set on the
+    /// same line (`I=iw; $I`); `innerwarden` in the same forms was refused.
+    /// The CLI's names are one name to the guard, read as the shell reads
+    /// them.
+    ///
+    /// FAILS ON REVERT: the text backstop knows only `innerwarden`, or the
+    /// line is not read with its quotes and assignments, and these are `None`.
+    #[test]
+    fn the_clis_alias_is_its_name_in_a_command_string_a_quote_or_a_variable() {
+        for cmd in [
+            "env -S 'iw dry-run'",
+            "busybox sh -c 'iw dry-run'",
+            "'i'w dry-run",
+            "\"i\"w uninstall claude-code",
+            "i\\w dry-run",
+            "flock -x /tmp/x -c 'iw dry-run'",
+            "flock -x /tmp/x -c 'env -u CLAUDECODE iw uninstall claude-code'",
+            "I=iw; $I dry-run",
+            "export I=iw && ${I} uninstall claude-code",
+            "G=iw-guard; V=dry-run; $G $V",
+            "env -S 'iw-guard monitor'",
+        ] {
+            assert!(
+                check_guard_self_disable(cmd).is_some(),
+                "an agent must not lower the guard screening it: {cmd}"
+            );
+        }
+        for cmd in [
+            "iw dev wlan0 scan",
+            "iw list",
+            "I=iw; echo $I dry-run",
+            "IW=1; echo $IW",
+            "echo 'iw dry-run'",
+            "grep -rn 'iw uninstall' docs/",
+            "env -S 'ls -la'",
+            "flock -x /tmp/x -c 'cargo build'",
+            "review='done'; echo $review",
+        ] {
+            assert!(
+                check_guard_self_disable(cmd).is_none(),
+                "{cmd} lowers nothing: {:?}",
+                check_guard_self_disable(cmd)
             );
         }
     }

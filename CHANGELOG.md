@@ -3,7 +3,7 @@
 All notable changes to InnerWarden are documented here. This project
 follows semantic versioning.
 
-## Unreleased
+## 1.6.11 - 2026-10-24
 
 ### Added
 
@@ -38,6 +38,13 @@ follows semantic versioning.
 
 ### Security
 
+- **The CLI's short names are its name to the guard everywhere.** The hook
+  refused `innerwarden dry-run` in a command string, built from quoted pieces
+  or behind a variable, but not the same with the installer's `iw` or
+  `iw-guard`: `env -S 'iw dry-run'`, `flock -c 'iw dry-run'`, `busybox sh -c
+  'iw dry-run'`, `'i'w dry-run` and `I=iw; $I dry-run` passed. The guard now
+  reads every name of the CLI in command strings, with the line's quotes and
+  the variables it sets resolved as the shell resolves them.
 - An agent can no longer take off the OpenClaw guard: a file tool may not
   write into `~/.openclaw/extensions` or `~/.openclaw/hooks`, and the hook
   refuses removing them, `openclaw plugins disable|uninstall` of InnerWarden's
