@@ -1425,6 +1425,18 @@ fn cmd_install(rest: &[String]) -> std::process::ExitCode {
             return std::process::ExitCode::from(2);
         }
     };
+    // Installing the hook in monitor rewires it to record only, as `agents
+    // connect --monitor` does: the person's, never a command an AI agent's
+    // shell runs (review of 1.6.6, H1). The guard refuses the agent running
+    // it; this holds where the guard cannot see the call.
+    if monitor && suppress_io::in_agent_shell() {
+        eprintln!(
+            "innerwarden install: refused inside an AI agent's shell. Installing the hook in \
+             monitor lowers the guard that screens the agent, so it is done by the person, \
+             from their own terminal. Nothing was changed."
+        );
+        return std::process::ExitCode::from(1);
+    }
 
     let home = match hook::home_dir() {
         Ok(h) => h,
