@@ -2096,6 +2096,26 @@ mod tests {
         }
     }
 
+    /// The same removal behind a rewrite the shell undoes is the same
+    /// finding, said as the keys removed (not only as code the shell builds).
+    ///
+    /// FAILS ON REVERT (nightly mutant 2026-10-24, `!=` to `==` in the
+    /// normalized arm): the keys' detail is never raised for a rewrite.
+    #[test]
+    fn removing_the_accounts_keys_behind_a_rewrite_is_the_same_finding() {
+        for command in ["${x:-rm} -rf ~/.ssh", "r''m ~/.ssh/id_ed25519"] {
+            let verdict = analyze_command(command, None);
+            assert_eq!(verdict.recommendation, "deny", "{command}: {verdict:?}");
+            assert!(
+                verdict
+                    .signals
+                    .iter()
+                    .any(|s| s.detail == "removal of the account's keys or credential store"),
+                "{command}: {verdict:?}"
+            );
+        }
+    }
+
     /// The profile vocabulary is the set of names the checks in this file
     /// raise, read from the source itself, so a new check cannot be added
     /// without a profile being able to name it, and a removed one cannot stay

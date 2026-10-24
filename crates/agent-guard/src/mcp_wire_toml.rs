@@ -462,6 +462,10 @@ args = ["-y", "some-server"]
 command = "node"
 args = ["repl.js"]
 
+[mcp_servers.py]
+command = "uvx"
+args = ["a-server"]
+
 [mcp_servers.docs]
 url = "https://example.com/mcp"
 
@@ -471,12 +475,16 @@ httpUrl = "https://example.com/stream"
         let json_cfg = serde_json::json!({"mcpServers": {
             "icm": {"command": "npx", "args": ["-y", "some-server"]},
             "node_repl": {"command": "node", "args": ["repl.js"]},
+            "py": {"command": "uvx", "args": ["a-server"]},
             "docs": {"url": "https://example.com/mcp"},
             "streamed": {"httpUrl": "https://example.com/stream"}
         }});
         let mut doc: DocumentMut = toml_text.parse().expect("toml");
+        // Three local and two remote: a count that took one for the other
+        // reads 3 where 2 is (nightly mutant 2026-10-24: with two of each, a
+        // reader that counted the local servers as remote read the same).
         let expected = crate::mcp_wire::ServerCounts {
-            stdio: 2,
+            stdio: 3,
             wrapped: 0,
             remote: 2,
         };
@@ -485,7 +493,7 @@ httpUrl = "https://example.com/stream"
         wrap_toml(&mut doc, "/abs/innerwarden", true, "codex");
         let (wrapped_json, _) = crate::mcp_wire::wrap(json_cfg, "/abs/innerwarden", true, "codex");
         let after = crate::mcp_wire::ServerCounts {
-            wrapped: 2,
+            wrapped: 3,
             ..expected
         };
         assert_eq!(server_counts_toml(&doc), after);
