@@ -516,7 +516,9 @@ pub const SECURITY_TAMPER_INDICATORS: &[&str] = &[
     "pkill innerwarden",
     "pkill -f innerwarden",
     "killall innerwarden",
-    // InnerWarden CLI self-disable / removal.
+    // InnerWarden CLI self-disable / removal. Its own `--dry-run` and help
+    // remove nothing ([`uninstall_only_asks`]; live gate of Active Defence
+    // 0.17.6, K2).
     "innerwarden uninstall",
     "innerwarden disable",
     // Host security monitors (universal defense-evasion).
@@ -2102,7 +2104,11 @@ fn words_run_guard_loosening_verb_fed(words: &[String], depth: u8, mut fed: bool
         // interpreter, a remote or container exec): the verb inside the text
         // it is given is run by it, whatever the quoting.
         if is_code_runner(base) {
-            return code_text_runs_guard_verb(&words[index + 1..].join(" "));
+            // The text it is handed, and the guard's CLI by any of its names
+            // as a word of it (`watch -n 1 iw-guard uninstall`, `ssh host iw
+            // dry-run`; live gate of Active Defence 0.17.6, K1).
+            return code_text_runs_guard_verb(&words[index + 1..].join(" "))
+                || guard_cli_named_later_loosens(&words[index + 1..]);
         }
         let skippable = after_option
             || dollar
@@ -2115,12 +2121,56 @@ fn words_run_guard_loosening_verb_fed(words: &[String], depth: u8, mut fed: bool
                 .parse::<f64>()
                 .is_ok();
         if !skippable {
-            return false;
+            // A program this parse does not unwrap (`flock /tmp/x`,
+            // `taskset -c 0`, `systemd-run --user -q`, `prlimit`, `unshare
+            // -U`, `cpulimit`, `watch`, any other): the guard's CLI named
+            // after it with a verb that loosens is read as run, whatever the
+            // program in front (live gate of Active Defence 0.17.6, K1: a
+            // wrapper not on a list took the hook off). A program that only
+            // reads or prints text holds the name as text.
+            return !words_only_read(&words[index..])
+                && guard_cli_named_later_loosens(&words[index + 1..]);
         }
         after_option = word.starts_with('-') && !word.contains('=') && !after_option;
         in_substitution = dollar;
     }
     false
+}
+
+/// PURE. Whether every `innerwarden uninstall` in `lower` only asks: its own
+/// arguments (up to `--` or the end of the simple command) hold `--dry-run`,
+/// `--help` or `-h` (live gate of Active Defence 0.17.6, K2: the literal
+/// refused the dry run the CHANGELOG says stays open). Any other occurrence
+/// removes, and keeps the tamper verdict.
+fn uninstall_only_asks(lower: &str) -> bool {
+    let mut seen = false;
+    for (at, _) in lower.match_indices("innerwarden uninstall") {
+        seen = true;
+        let tail = &lower[at + "innerwarden uninstall".len()..];
+        let end = tail.find([';', '|', '&', '\n', ')']).unwrap_or(tail.len());
+        let own: Vec<&str> = tail[..end]
+            .split_whitespace()
+            .take_while(|word| *word != "--")
+            .collect();
+        if !own
+            .iter()
+            .any(|word| matches!(*word, "--dry-run" | "--help" | "-h"))
+        {
+            return false;
+        }
+    }
+    seen
+}
+
+/// Whether `words` hold the guard's CLI (any of its names, by any path)
+/// followed by arguments that loosen the guard ([`guard_verb_loosens`]).
+fn guard_cli_named_later_loosens(words: &[String]) -> bool {
+    words.iter().enumerate().any(|(index, word)| {
+        let lower = word.to_ascii_lowercase();
+        let base = token_basename(lower.trim_matches('`'));
+        let base = base.strip_suffix(".exe").unwrap_or(base);
+        is_guard_cli_name(base) && guard_verb_loosens(&words[index + 1..])
+    })
 }
 
 /// The command string a shell (`-c`), `script` (`-c`, `--command`) or `su`
@@ -2492,7 +2542,12 @@ fn guard_verb_loosens(arguments: &[String]) -> bool {
         // `iw uninstall`, quotes and spacing are the same command (live gate
         // of Active Defence 0.17.5, J1: only the literal text was refused).
         // Its own `--dry-run` and help change nothing.
-        "uninstall" => !asks_for_help && !rest.contains(&"--dry-run"),
+        "uninstall" => {
+            // Its own arguments end at `--` (live gate of Active Defence
+            // 0.17.6, K4: a `--dry-run` or `-h` after it was read as its own).
+            let own: Vec<&str> = rest.iter().copied().take_while(|a| *a != "--").collect();
+            !own.iter().any(|a| matches!(*a, "--help" | "-h")) && !own.contains(&"--dry-run")
+        }
         _ => false,
     }
 }
@@ -6744,6 +6799,7 @@ pub fn check_security_tamper(content: &str) -> Option<(&'static str, u32)> {
     if let Some(i) = SECURITY_TAMPER_INDICATORS
         .iter()
         .find(|i| lower.contains(*i))
+        .filter(|i| !(**i == "innerwarden uninstall" && uninstall_only_asks(&lower)))
     {
         return Some((*i, 60));
     }
@@ -10886,6 +10942,8 @@ mod tests {
             "systemctl stop innerwarden",
             "pkill -f innerwarden",
             "innerwarden uninstall",
+            "innerwarden uninstall claude-code -- --dry-run",
+            "innerwarden uninstall --dry-run; innerwarden uninstall",
         ] {
             assert!(
                 check_security_tamper(evil).is_some(),
@@ -13235,6 +13293,61 @@ mod brq_evaluation_tests {
                 check_guard_self_disable(cmd).is_none(),
                 "{cmd} lowers nothing: {:?}",
                 check_guard_self_disable(cmd)
+            );
+        }
+    }
+
+    /// Live gate of Active Defence 0.17.6, K1: a program the parse did not
+    /// unwrap in front of `iw` (flock, taskset, systemd-run --user, prlimit,
+    /// unshare, cpulimit, watch) let the verb through, and the agent took its
+    /// hook off in one command. Behind any unknown program the guard's CLI
+    /// with a verb that loosens is run; a reader holds it as text. K2: its
+    /// own `--dry-run` and help stay open. K4: they are its own only before
+    /// `--`.
+    ///
+    /// FAILS ON REVERT: an unknown program in front returns "nothing run",
+    /// and every wrapper form is `None` again.
+    #[test]
+    fn a_wrapper_in_front_of_the_guards_cli_hides_nothing() {
+        for cmd in [
+            "systemd-run --user --wait -q iw uninstall claude-code",
+            "flock /tmp/x env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT iw uninstall claude-code",
+            "flock /tmp/x iw dry-run",
+            "taskset -c 0 iw uninstall claude-code",
+            "systemd-run --user --wait -q iw dry-run",
+            "prlimit --nofile=64 iw agents disconnect --all",
+            "unshare -U iw uninstall claude-code",
+            "cpulimit -l 50 iw monitor",
+            "watch -n 1 /usr/local/bin/iw-guard uninstall",
+            "some-new-wrapper --opt v iw install claude-code --monitor",
+            "iw uninstall claude-code -- --dry-run",
+            "iw uninstall -- -h",
+        ] {
+            assert!(
+                check_guard_self_disable(cmd).is_some(),
+                "an agent must not take off the guard screening it: {cmd}"
+            );
+        }
+        for cmd in [
+            "innerwarden uninstall --dry-run",
+            "innerwarden uninstall --help",
+            "innerwarden uninstall -h",
+            "innerwarden uninstall claude-code --dry-run",
+            "flock /tmp/x iw uninstall --dry-run",
+            "taskset -c 0 iw agents list",
+            "grep -rn iw uninstall docs/",
+            "echo iw dry-run",
+            "flock /tmp/x cargo build",
+        ] {
+            assert!(
+                check_guard_self_disable(cmd).is_none(),
+                "{cmd} lowers nothing: {:?}",
+                check_guard_self_disable(cmd)
+            );
+            assert!(
+                check_security_tamper(cmd).is_none(),
+                "{cmd} is not tampering: {:?}",
+                check_security_tamper(cmd)
             );
         }
     }
