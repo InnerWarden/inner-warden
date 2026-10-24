@@ -74,6 +74,13 @@ fn inside_an_agents_shell_wiring_that_lowers_the_guard_is_refused() {
             &["contain", "--setup"],
             // Review of 1.6.6, H1.
             &["install", "claude-code", "--monitor"],
+            // Live gate of Active Defence 0.17.5, J1 and J2: the hook off,
+            // or monitor, from a script the agent wrote as much as typed.
+            &["uninstall", "claude-code"],
+            &["uninstall"],
+            &["uninstall", "--purge"],
+            &["dry-run"],
+            &["monitor"],
         ] {
             let home = enforced_home();
             let settings = home.path().join(".claude/settings.json");
@@ -108,6 +115,8 @@ fn what_lowers_nothing_and_the_person_are_not_refused() {
         &["agents", "connect", "claude-code"][..],
         &["contain", "--dry-run", "--", "true"],
         &["install", "claude-code"],
+        &["uninstall", "--dry-run"],
+        &["enforce"],
     ] {
         let home = enforced_home();
         let out = run(home.path(), args, Some("CLAUDECODE"));

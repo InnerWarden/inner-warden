@@ -676,8 +676,8 @@ const GUARD_DISARMED: &str = "disarms the guard, or asks it to authorise itself"
 const GUARD_LOOSENING_VERB: &str =
     "runs the guard's own allow, mute or monitor command, one of its agent \
      decisions (approve, profile, allow, revoke), disconnects an agent or connects or \
-     installs it in monitor, or starts a jail, which only the person supervising the \
-     agent may run, from their own terminal";
+     installs it in monitor, uninstalls it, or starts a jail, which only the person \
+     supervising the agent may run, from their own terminal";
 
 /// [`check_guard_self_disable`] on one spelling of the command.
 fn guard_self_disable_in(content: &str) -> Option<(&'static str, u32)> {
@@ -2279,9 +2279,20 @@ fn text_runs_guard_verb(text: &str, only: &[&str]) -> bool {
 /// The verbs that switch the guard to recording only (`dry-run`, `monitor`)
 /// or silence its rules (`mute`). `dry-run` has no terminal check of its own,
 /// so the guard's reading of the agent's command is the only thing in its way.
-/// `agents`, `contain` and `install` are read here too, for their forms that
-/// take the hook off or rewire it ([`guard_verb_loosens`]).
-const MODE_VERBS: &[&str] = &["mute", "dry-run", "monitor", "agents", "contain", "install"];
+/// `agents`, `contain`, `install` and `uninstall` are read here too, for
+/// their forms that take the hook off or rewire it ([`guard_verb_loosens`]).
+/// The text of a file the agent WRITES is not read here (a Write or Edit
+/// carries no command): a script it writes and runs is held by the CLI,
+/// which refuses these verbs inside an AI agent's shell, the script's too.
+const MODE_VERBS: &[&str] = &[
+    "mute",
+    "dry-run",
+    "monitor",
+    "agents",
+    "contain",
+    "install",
+    "uninstall",
+];
 
 /// Whether `innerwarden mute|dry-run|monitor`, with arguments that widen what
 /// is let through, appears in the command anywhere but in a simple command
@@ -2290,8 +2301,11 @@ const MODE_VERBS: &[&str] = &["mute", "dry-run", "monitor", "agents", "contain",
 /// This is the backstop behind [`runs_guard_loosening_verb`], which finds the
 /// verb only where it knows the program that runs it. A launcher it does not
 /// know (`flock`, `strace`, `systemd-run`, `socat EXEC:`, a `git` alias, an
-/// editor's `!`, a file written and then run) still carries the verb in the
-/// text. So the text decides, and only a search, a commit message or an
+/// editor's `!`, a file written and then run IN THE SAME COMMAND, `echo ...
+/// > x.sh && sh x.sh`) still carries the verb in the text. A file written by
+/// a Write or Edit tool call is not a command and is not read here (the CLI
+/// refuses these verbs in an AI agent's shell, a script's too). So the text
+/// decides, and only a search, a commit message or an
 /// `echo` that goes nowhere is let through. Reading the lists and asking for
 /// help (`mute --list`, `--help`) are not a widening, wherever they appear.
 fn mode_verb_text_outside_a_reader(content: &str) -> bool {
@@ -2473,6 +2487,12 @@ fn guard_verb_loosens(arguments: &[String]) -> bool {
         // record only, as `agents connect --monitor` does (review of 1.6.6,
         // H1). Installing in enforce, or asking for help, lowers nothing.
         "install" => !asks_for_help && rest.contains(&"--monitor"),
+        // `innerwarden uninstall [<agent>]` takes the hook off (all of it, or
+        // one agent's): read through the same parse as every other verb, so
+        // `iw uninstall`, quotes and spacing are the same command (live gate
+        // of Active Defence 0.17.5, J1: only the literal text was refused).
+        // Its own `--dry-run` and help change nothing.
+        "uninstall" => !asks_for_help && !rest.contains(&"--dry-run"),
         _ => false,
     }
 }
@@ -13169,6 +13189,47 @@ mod brq_evaluation_tests {
             "innerwarden contain --agent claude-code --help",
             "innerwarden contain --project /tmp/p --dry-run -- claude",
             "innerwarden contain --dry-run claude",
+        ] {
+            assert!(
+                check_guard_self_disable(cmd).is_none(),
+                "{cmd} lowers nothing: {:?}",
+                check_guard_self_disable(cmd)
+            );
+        }
+    }
+
+    /// Live gate of Active Defence 0.17.5, J1 and J2: only the literal text
+    /// `innerwarden uninstall` was refused, so `iw uninstall`, quotes and
+    /// spacing took the hook off; and a script a command writes and runs
+    /// carries the verb behind an escaped newline. Every spelling the shell
+    /// runs is the same command; its own `--dry-run` and help lower nothing.
+    ///
+    /// FAILS ON REVERT: drop the `uninstall` arm and the parsed spellings are
+    /// `None` again.
+    #[test]
+    fn uninstalling_the_guard_is_the_persons_whatever_its_spelling() {
+        for cmd in [
+            "innerwarden uninstall claude-code",
+            "iw uninstall claude-code",
+            "innerwarden  uninstall claude-code",
+            "innerwarden 'uninstall' claude-code",
+            "innerwarden \"uninstall\" claude-code",
+            "\"innerwarden\" uninstall claude-code",
+            "innerwarden uninstall",
+            "innerwarden uninstall --purge",
+            "iw-guard uninstall claude-code",
+            "printf '#!/bin/sh\\ninnerwarden dry-run\\n' > tidy.sh && sh tidy.sh",
+            "printf '#!/bin/sh\\ninnerwarden dry-run\\n' > tidy.sh",
+        ] {
+            assert!(
+                check_guard_self_disable(cmd).is_some(),
+                "an agent must not take off the guard screening it: {cmd}"
+            );
+        }
+        for cmd in [
+            "innerwarden uninstall --dry-run",
+            "innerwarden uninstall --help",
+            "grep 'innerwarden uninstall' README.md",
         ] {
             assert!(
                 check_guard_self_disable(cmd).is_none(),
