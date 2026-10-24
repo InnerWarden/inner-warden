@@ -166,6 +166,17 @@ jobs:
           IW_REQUIRE_SECCOMP: "1"
         run: cargo test --workspace
 
+      # The guard-lowering corpus, driven through the REAL hook binary, not only
+      # through analyze_command as the unit test does. Every release from Active
+      # Defence 0.17.4 to 0.17.8 was cut by a spelling of this class found by
+      # hand on a VM; this runs the same corpus Active Defence's host gate runs,
+      # against the freshly built hook, on every push.
+      - name: Guard-lowering corpus through the hook
+        if: runner.os == 'Linux'
+        run: |
+          cargo build --bin innerwarden
+          bash scripts/check-guard-lowering.sh target/debug/innerwarden
+
       # Windows used to run fmt + clippy only, on the reasoning that the platform
       # is experimental and its file-write integration has rough edges (audit
       # TEST-06). But the project SIGNS AND PUBLISHES Windows binaries, so
