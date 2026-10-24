@@ -468,8 +468,8 @@ jobs:
             can be reproduced and a bad cut can be rolled back to it.
 
             ```sh
-            IW_GUARD_TAG=guard-v${{ steps.version.outputs.guard_version }} \
-              curl -fsSL https://innerwarden.com/free | sh
+            curl -fsSL https://innerwarden.com/free \
+              | IW_GUARD_TAG=guard-v${{ steps.version.outputs.guard_version }} sh
             ```
 
             Same signed bytes as the rolling release for this version: every
@@ -499,7 +499,8 @@ jobs:
 
             Every binary ships SHA-256 and Ed25519 sidecars; the installer verifies
             both. Rolling release: always the freshest Linux/macOS/Windows
-            (x86_64 + aarch64) binary. Pin a cut with IW_GUARD_TAG=guard-vX.Y.Z.
+            (x86_64 + aarch64) binary. Pin a cut by setting the variable on the
+            sh side: curl -fsSL https://innerwarden.com/free | IW_GUARD_TAG=guard-vX.Y.Z sh
           prerelease: false
           make_latest: false
           files: dist/*
