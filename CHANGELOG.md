@@ -3,7 +3,13 @@
 All notable changes to InnerWarden are documented here. This project
 follows semantic versioning.
 
-## 1.6.4 - 2026-10-24
+## 1.6.5 - 2026-10-24
+
+1.6.4 was tagged and not published: its new jail check on macOS started
+`sandbox-exec` with the account's environment. 1.6.5 is 1.6.4 with that check
+under the launcher's own environment (root's two folders as `PATH`, no loader
+variable), as every program a launch starts.
+
 
 ### Added
 
