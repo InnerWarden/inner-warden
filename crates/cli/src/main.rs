@@ -1239,6 +1239,17 @@ fn cmd_mode(rest: &[String], monitor: bool) -> std::process::ExitCode {
         );
         return std::process::ExitCode::from(2);
     }
+    // Monitor (dry-run) lowers the guard that screens the agent: the
+    // person's, never a command an AI agent's shell runs, a script it wrote
+    // included (live gate of Active Defence 0.17.5, J2). Enforce raises it.
+    if monitor && suppress_io::in_agent_shell() {
+        eprintln!(
+            "innerwarden dry-run: refused inside an AI agent's shell. Monitor lowers the guard \
+             that screens the agent, so it is set by the person, from their own terminal. \
+             Nothing was changed."
+        );
+        return std::process::ExitCode::from(1);
+    }
     let home = match hook::home_dir() {
         Ok(h) => h,
         Err(e) => {
@@ -1522,6 +1533,18 @@ fn cmd_install(rest: &[String]) -> std::process::ExitCode {
 /// installed (removes 0). Does not delete the binary: it names the full
 /// `uninstall`, which decides whether the binary is this install's to delete.
 fn cmd_uninstall(rest: &[String]) -> std::process::ExitCode {
+    // Taking InnerWarden off, all of it or one agent's hook, takes off the
+    // guard that screens the agent: the person's, never a command an AI
+    // agent's shell runs, a script it wrote included (live gate of Active
+    // Defence 0.17.5, J1 and J2). A dry run changes nothing.
+    if !rest.iter().any(|a| a == "--dry-run") && suppress_io::in_agent_shell() {
+        eprintln!(
+            "innerwarden uninstall: refused inside an AI agent's shell. Uninstalling takes off \
+             the guard that screens the agent, so it is done by the person, from their own \
+             terminal. Nothing was changed."
+        );
+        return std::process::ExitCode::from(1);
+    }
     // Bare `uninstall` (or with --all / --purge) removes InnerWarden entirely:
     // the agent hook, the config directory, the binary and its shortcuts. `uninstall
     // claude-code` (a named agent) removes only that agent's hook.

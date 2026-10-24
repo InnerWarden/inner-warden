@@ -3,6 +3,23 @@
 All notable changes to InnerWarden are documented here. This project
 follows semantic versioning.
 
+## 1.6.9 - 2026-10-24
+
+### Security
+
+- **An agent can no longer take its guard off with `uninstall`, or lower it
+  from a script.** Under an enforcing hook, the hook refused only the literal
+  text `innerwarden uninstall`: `iw uninstall claude-code`, a quoted verb or
+  two spaces took the hook off. And `innerwarden dry-run`, `monitor` and
+  `uninstall` had no refusal of their own in the CLI, so a script the agent
+  wrote and ran lowered or removed the hook. The hook now reads `uninstall`
+  as the person's whatever its spelling (its own `--dry-run` and help stay
+  open), and the CLI refuses `uninstall`, `dry-run` and `monitor` inside an AI
+  agent's shell, a script it runs included.
+- Stated limit: the CLI's refusal reads the agent's shell markers, which a
+  script can unset, and the content of a file the agent writes with a Write
+  or Edit tool call is not screened for these verbs.
+
 ## 1.6.8 - 2026-10-24
 
 ### Security
