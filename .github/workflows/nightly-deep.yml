@@ -132,7 +132,7 @@ jobs:
             124) echo "::error::The 75m budget was not enough for one day of changes, which means the budget or the scope is wrong."; exit 1 ;;
             *)   echo "::error::cargo-mutants exited $code."; exit 1 ;;
           esac
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: mutants-report-diff
@@ -189,7 +189,7 @@ jobs:
             124) echo "::error::Shard ${{ matrix.shard }} did not finish in 150m. The sweep is larger than the budget: re-measure and raise the shard count."; exit 1 ;;
             *)   echo "::error::cargo-mutants exited $code in shard ${{ matrix.shard }}."; exit 1 ;;
           esac
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: mutants-report-shard-${{ matrix.shard }}
