@@ -84,8 +84,12 @@ test("each agent says how far its word is backed, why, and what would back it fu
   await expect(cursor.locator("[data-no-instance]")).toHaveText("No instance started in a jail yet.");
   await expect(cursor.locator("[data-confine-step]")).toHaveCount(0);
 
-  // The one Active Defence line of the page, and what people decided.
-  await expect(page.locator('[data-offer="agent_kernel"]')).toHaveCount(1);
+  // No Active Defence line on Agents (spec 6.4), and what people decided is
+  // evidence: the technical view's.
+  await expect(page.locator("[data-offer]")).toHaveCount(0);
+  await expect(page.locator('a[href^="https://innerwarden.com"]')).toHaveCount(0);
+  await expect(page.locator("[data-agent-changes]")).toHaveCount(0);
+  await page.getByRole("checkbox", { name: "Show technical detail" }).check();
   const changes = page.locator("[data-agent-changes]");
   await expect(changes).toBeVisible();
   await expect(changes.locator("li")).toHaveCount(2);
@@ -96,8 +100,8 @@ test("each agent says how far its word is backed, why, and what would back it fu
 test("an instance's session opens its case, which says which layer decided and why", async ({ page }) => {
   await page.goto("/?view=agents");
   const observed = row(page, "claude-code").locator(`[data-instance="${OBSERVED}"]`);
-  await observed.getByRole("button", { name: "9d2f41b8 (open case)" }).click();
-  const card = page.locator('section[data-case="cmd:contain:2"]');
+  await observed.getByRole("link", { name: "9d2f41b8 (open decision)" }).click();
+  const card = page.locator('section[data-decision="cmd:contain:2"]');
   await expect(card).toBeVisible();
   const identity = card.locator("[data-case-identity]");
   await expect(identity).toContainText("instance 9d2f41b8");
@@ -108,7 +112,7 @@ test("an instance's session opens its case, which says which layer decided and w
   const withheld = card.locator("[data-relaxation-withheld]");
   await expect(withheld).toHaveCount(1);
   await expect(withheld).toHaveText(
-    "Per-agent relaxations apply on Linux with Active Defence, for an agent started with innerwarden contain --identity.",
+    "Per-agent relaxations apply on Linux with InnerWarden Pro, for an agent started with innerwarden contain --identity.",
   );
   await noProtectedWords(page);
 });

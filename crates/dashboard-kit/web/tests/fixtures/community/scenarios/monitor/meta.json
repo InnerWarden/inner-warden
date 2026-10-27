@@ -1,0 +1,9 @@
+{
+  "version": "1.5.0-fixture",
+  "exposed": false,
+  "edition": "community",
+  "guardrail": {
+    "mode": "monitor",
+    "guarded_agents": 3
+  }
+}

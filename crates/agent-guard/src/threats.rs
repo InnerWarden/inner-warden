@@ -516,7 +516,9 @@ pub const SECURITY_TAMPER_INDICATORS: &[&str] = &[
     "pkill innerwarden",
     "pkill -f innerwarden",
     "killall innerwarden",
-    // InnerWarden CLI self-disable / removal.
+    // InnerWarden CLI self-disable / removal. Its own `--dry-run` and help
+    // remove nothing ([`uninstall_only_asks`]; live gate of Active Defence
+    // 0.17.6, K2).
     "innerwarden uninstall",
     "innerwarden disable",
     // Host security monitors (universal defense-evasion).
@@ -606,8 +608,87 @@ fn dangerous_command_regexes() -> &'static [(regex::Regex, &'static str, bool)] 
 ///
 /// Returns `(what, score)`.
 pub fn check_guard_self_disable(content: &str) -> Option<(&'static str, u32)> {
+    // As the shell reads it: a variable set earlier on the line stands for
+    // its value (`I=iw; $I dry-run`), and a name built from quoted pieces is
+    // the name (`'i'w dry-run`) (live gate of Active Defence 0.17.7, L1).
+    if let Some(expanded) = with_assignments_expanded(content) {
+        if let Some(hit) = check_guard_self_disable(&expanded) {
+            return Some(hit);
+        }
+    }
+    let unquoted: String = content
+        .chars()
+        .filter(|c| !matches!(c, '\'' | '"' | '\\'))
+        .collect();
+    // A name split by quotes reads as the name once the quotes are dropped:
+    // the `iw` alias (`'i'w`), and the full name too (`'inner'warden agent
+    // install-hook --remove`; live gate v0.17.8, F0). Only act on the unquoted
+    // reading when it reveals a guard name the quoted form hid.
+    let reveals_guard =
+        |text: &str| text.to_ascii_lowercase().contains("innerwarden") || names_guard_alias(text);
+    if unquoted != content && !reveals_guard(content) && reveals_guard(&unquoted) {
+        if let Some(hit) = guard_self_disable_in(&unquoted) {
+            return Some(hit);
+        }
+    }
+    check_guard_self_disable_read(content)
+}
+
+/// PURE. `content` with every `$NAME` / `${NAME}` of a variable set on the
+/// same line (`NAME=value`, `export NAME=value`) replaced by its value, or
+/// `None` when nothing was replaced.
+fn with_assignments_expanded(content: &str) -> Option<String> {
+    if !content.contains('$') || !content.contains('=') {
+        return None;
+    }
+    static ASSIGN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let assign = ASSIGN.get_or_init(|| {
+        regex::Regex::new(
+            r#"(?:^|[\s;&|(])(?:(?:export|local|readonly|declare)\s+)?([A-Za-z_][A-Za-z0-9_]*)=(?:'([^']*)'|"([^"$`]*)"|([^\s;&|()'"$`]*))"#,
+        )
+        .expect("a valid pattern")
+    });
+    let mut out = content.to_string();
+    let mut changed = false;
+    for capture in assign.captures_iter(content) {
+        let name = &capture[1];
+        let value = capture
+            .get(2)
+            .or_else(|| capture.get(3))
+            .or_else(|| capture.get(4))
+            .map_or("", |m| m.as_str());
+        for reference in [format!("${{{name}}}"), format!("${name}")] {
+            let mut next = String::with_capacity(out.len());
+            let mut rest = out.as_str();
+            while let Some(at) = rest.find(&reference) {
+                let after = &rest[at + reference.len()..];
+                // `$IW` is not `$I`: the name ends where the shell ends it.
+                let ends = reference.ends_with('}')
+                    || !after
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+                next.push_str(&rest[..at]);
+                if ends {
+                    next.push_str(value);
+                    changed = true;
+                } else {
+                    next.push_str(&reference);
+                }
+                rest = after;
+            }
+            next.push_str(rest);
+            out = next;
+        }
+    }
+    changed.then_some(out)
+}
+
+/// [`check_guard_self_disable`] on the command as written.
+fn check_guard_self_disable_read(content: &str) -> Option<(&'static str, u32)> {
     const NEEDLES: &[&str] = &[
         "innerwarden",
+        "openclaw",
         "settings.json",
         ".claude.json",
         "mcp.json",
@@ -674,9 +755,10 @@ const GUARD_DISARMED: &str = "disarms the guard, or asks it to authorise itself"
 /// What [`check_guard_self_disable`] says of the guard's own loosening
 /// verbs ([`runs_guard_loosening_verb`]).
 const GUARD_LOOSENING_VERB: &str =
-    "runs the guard's own allow, mute or monitor command, or one of its agent \
-     decisions (approve, profile, allow, revoke), which only the person supervising \
-     the agent may run, from their own terminal";
+    "runs the guard's own allow, mute or monitor command, one of its agent \
+     decisions (approve, profile, allow, revoke), disconnects an agent or connects or \
+     installs it in monitor, uninstalls it, or starts a jail, which only the person \
+     supervising the agent may run, from their own terminal";
 
 /// [`check_guard_self_disable`] on one spelling of the command.
 fn guard_self_disable_in(content: &str) -> Option<(&'static str, u32)> {
@@ -729,7 +811,7 @@ fn guard_self_disable_in(content: &str) -> Option<(&'static str, u32)> {
         // Round two of the same evaluation found these, all of which reach the
         // configuration the guard is carried by without naming a guard verb.
         add(
-            r#"(?i)\bsed\b[^|;&]*-i[^|;&]*(?:settings(?:\.local)?\.json|\.claude\.json|mcp\.json)"#,
+            r#"(?i)\bsed\b[^|;&]*-i[^|;&]*(?:settings(?:\.local)?\.json|\.claude\.json|mcp\.json|openclaw\.json)"#,
             "edits an agent's configuration in place to remove the guard",
             60,
         );
@@ -750,6 +832,35 @@ fn guard_self_disable_in(content: &str) -> Option<(&'static str, u32)> {
         add(
             r#"(?i)\brm\b[^|;&]*(?:hooks?/[^\s]*innerwarden|innerwarden[^\s]*\.(?:sh|json))"#,
             "deletes the guard's hook script",
+            60,
+        );
+        // OpenClaw loads the guard that screens its own tools, and the hook
+        // that records its chats, from its home folder: removing, moving or
+        // emptying them, or the folders that hold them, takes the guard off.
+        add(
+            r#"(?i)(?:\brm\b|\bmv\b|\bunlink\b|\btruncate\b|\bchmod\b|\bshred\b)[^|;&]*(?:(?:extensions|hooks)/[^\s/'"]*innerwarden|\.openclaw[^/\s'"]*/(?:extensions|hooks)(?:/?(?:[\s'"]|$)))"#,
+            "removes or moves aside the plugin or hook that carries the guard in OpenClaw",
+            60,
+        );
+        // OpenClaw's own commands that turn a plugin or hook off, or rewrite
+        // the plugin and MCP wiring the guard is carried by. Reading
+        // (`openclaw plugins list`, `inspect`, `config get`) is not here.
+        add(
+            r#"(?i)\bopenclaw\b[^|;&]*\b(?:plugins?|hooks?)\b[^|;&]*\b(?:disable|uninstall|remove|rm|delete|off)\b[^|;&]*innerwarden"#,
+            "turns off the OpenClaw plugin or hook that carries the guard",
+            60,
+        );
+        add(
+            r#"(?i)\bopenclaw\b[^|;&]*\bconfig\b[^|;&]*\b(?:set|unset|delete|rm|patch|edit|apply)\b[^|;&]*(?:plugins|innerwarden|mcp|hooks)"#,
+            "rewrites the OpenClaw plugin or MCP wiring that carries the guard",
+            60,
+        );
+        // A plugin runs inside the gateway and is asked about every tool call
+        // after the guard: one an agent adds can change the call the guard
+        // screened, or wave it through. Adding one is the person's.
+        add(
+            r#"(?i)\bopenclaw\b[^|;&]*\bplugins?\b[^|;&]*\b(?:install|enable|link|update)\b"#,
+            "adds or enables an OpenClaw plugin, which runs inside the gateway and is asked about every call the guard screens",
             60,
         );
         // The guard's own verb for what the `rm` above does to its record.
@@ -2061,6 +2172,12 @@ fn words_run_guard_loosening_verb_fed(words: &[String], depth: u8, mut fed: bool
             let arguments = &words[index + 1..];
             return guard_verb_loosens(arguments) || (fed && guard_verb_is_fed(arguments));
         }
+        // Active Defence's ctl takes the guard off an agent with verbs of its
+        // own (`agent disconnect`, `agent install-hook --remove|--monitor`,
+        // `uninstall`): read through the same parse.
+        if base == "innerwarden-ctl" {
+            return ctl_verb_loosens(&words[index + 1..]);
+        }
         if base == "find" {
             // `find ... -exec innerwarden allow {} \;`: the command after
             // `-exec` runs once per file found, with the file as an argument.
@@ -2101,7 +2218,11 @@ fn words_run_guard_loosening_verb_fed(words: &[String], depth: u8, mut fed: bool
         // interpreter, a remote or container exec): the verb inside the text
         // it is given is run by it, whatever the quoting.
         if is_code_runner(base) {
-            return code_text_runs_guard_verb(&words[index + 1..].join(" "));
+            // The text it is handed, and the guard's CLI by any of its names
+            // as a word of it (`watch -n 1 iw-guard uninstall`, `ssh host iw
+            // dry-run`; live gate of Active Defence 0.17.6, K1).
+            return code_text_runs_guard_verb(&words[index + 1..].join(" "))
+                || guard_cli_named_later_loosens(&words[index + 1..]);
         }
         let skippable = after_option
             || dollar
@@ -2114,12 +2235,134 @@ fn words_run_guard_loosening_verb_fed(words: &[String], depth: u8, mut fed: bool
                 .parse::<f64>()
                 .is_ok();
         if !skippable {
-            return false;
+            // A program this parse does not unwrap (`flock /tmp/x`,
+            // `taskset -c 0`, `systemd-run --user -q`, `prlimit`, `unshare
+            // -U`, `cpulimit`, `watch`, any other): the guard's CLI named
+            // after it with a verb that loosens is read as run, whatever the
+            // program in front (live gate of Active Defence 0.17.6, K1: a
+            // wrapper not on a list took the hook off). A program that only
+            // reads or prints text holds the name as text.
+            return !words_only_read(&words[index..])
+                && guard_cli_named_later_loosens(&words[index + 1..]);
         }
         after_option = word.starts_with('-') && !word.contains('=') && !after_option;
         in_substitution = dollar;
     }
     false
+}
+
+/// PURE. Whether every `innerwarden uninstall` in `lower` only asks: its own
+/// arguments (up to `--` or the end of the simple command) hold `--dry-run`,
+/// `--help` or `-h` (live gate of Active Defence 0.17.6, K2: the literal
+/// refused the dry run the CHANGELOG says stays open). Any other occurrence
+/// removes, and keeps the tamper verdict.
+fn uninstall_only_asks(lower: &str) -> bool {
+    let mut seen = false;
+    for (at, _) in lower.match_indices("innerwarden uninstall") {
+        seen = true;
+        let tail = &lower[at + "innerwarden uninstall".len()..];
+        let end = tail.find([';', '|', '&', '\n', ')']).unwrap_or(tail.len());
+        let own: Vec<&str> = tail[..end]
+            .split_whitespace()
+            .take_while(|word| *word != "--")
+            .collect();
+        if !own
+            .iter()
+            .any(|word| matches!(*word, "--dry-run" | "--help" | "-h"))
+        {
+            return false;
+        }
+    }
+    seen
+}
+
+/// Whether `words` hold the guard's CLI (any of its names, by any path)
+/// followed by arguments that loosen the guard ([`guard_verb_loosens`]), or
+/// Active Defence's `innerwarden-ctl` followed by a verb of its own that
+/// lowers the guard ([`ctl_verb_loosens`]; live gate 0.17.8, F1: a wrapper
+/// `guard_cli_named_later_loosens` reads past, like `taskset` or `flock`, in
+/// front of `innerwarden-ctl agent install-hook --monitor`).
+fn guard_cli_named_later_loosens(words: &[String]) -> bool {
+    words.iter().enumerate().any(|(index, word)| {
+        let lower = word.to_ascii_lowercase();
+        let base = token_basename(lower.trim_matches('`'));
+        let base = base.strip_suffix(".exe").unwrap_or(base);
+        if is_guard_cli_name(base) {
+            return guard_verb_loosens(&words[index + 1..]);
+        }
+        base == "innerwarden-ctl" && ctl_verb_loosens(&words[index + 1..])
+    })
+}
+
+/// Whether the arguments after Active Defence's `innerwarden-ctl` name one of
+/// its own guard-lowering verbs (`agent disconnect`, `agent install-hook
+/// --remove|--monitor`, `uninstall`), read through [`guard_verb_loosens`]. The
+/// free CLI (and its `iw`/`iw-guard` aliases) forwards an unknown verb to the
+/// ctl, so [`is_guard_cli_name`] with [`guard_verb_loosens`] covers those.
+fn ctl_verb_loosens(arguments: &[String]) -> bool {
+    let arguments = skip_leading_options(arguments);
+    let verb = arguments.first().map(|word| word.to_ascii_lowercase());
+    matches!(verb.as_deref(), Some("agent" | "uninstall")) && guard_verb_loosens(arguments)
+}
+
+/// Active Defence's ctl, and its `agent` subcommand, take global options before
+/// the verb that follows (`innerwarden-ctl --data-dir X agent disconnect`,
+/// `innerwarden-ctl agent --data-dir X disconnect`; live gate v0.17.8, F0). The
+/// options that take a value consume the next word too. `skip_leading_options`
+/// drops those leading options so the verb is read where it actually is; it
+/// stops at the first word that is not an option (the verb or subcommand), so a
+/// `--monitor` or `--remove` that belongs to the subcommand is never skipped.
+const GLOBAL_VALUE_OPTIONS: &[&str] = &[
+    "--data-dir",
+    "--agent-config",
+    "--sensor-config",
+    "--config",
+    "--url",
+];
+
+/// The first non-option word in `args`, with the value of a value-taking option
+/// skipped too. The `&str` twin of [`skip_leading_options`], for the subcommand
+/// after `agent`/`agents` (`agent --data-dir X disconnect`; live gate F0).
+fn first_positional<'a>(args: &[&'a str]) -> Option<&'a str> {
+    let mut index = 0;
+    while let Some(&word) = args.get(index) {
+        if word == "--" || (word.starts_with("--") && word.contains('=')) {
+            index += 1;
+        } else if word.starts_with('-') {
+            index += 1;
+            if GLOBAL_VALUE_OPTIONS.contains(&word)
+                && args.get(index).is_some_and(|value| !value.starts_with('-'))
+            {
+                index += 1;
+            }
+        } else {
+            return Some(word);
+        }
+    }
+    None
+}
+
+/// The arguments with any leading options (and the value of a value-taking one)
+/// dropped. See [`GLOBAL_VALUE_OPTIONS`].
+fn skip_leading_options(mut arguments: &[String]) -> &[String] {
+    while let Some(word) = arguments.first() {
+        if word == "--" || (word.starts_with("--") && word.contains('=')) {
+            arguments = &arguments[1..];
+        } else if word.starts_with('-') {
+            let takes_value = GLOBAL_VALUE_OPTIONS.contains(&word.as_str());
+            arguments = &arguments[1..];
+            if takes_value
+                && arguments
+                    .first()
+                    .is_some_and(|value| !value.starts_with('-'))
+            {
+                arguments = &arguments[1..];
+            }
+        } else {
+            break;
+        }
+    }
+    arguments
 }
 
 /// The command string a shell (`-c`), `script` (`-c`, `--command`) or `su`
@@ -2223,15 +2466,27 @@ fn code_text_runs_guard_verb(text: &str) -> bool {
 }
 
 /// [`code_text_runs_guard_verb`] for the verbs in `only` (every verb when it
-/// is empty).
+/// is empty), under any of the CLI's names: `innerwarden`, Active Defence's
+/// `innerwarden-ctl`, and the installer's `iw-guard` and `iw` (live gate of
+/// Active Defence 0.17.7, L1: `env -S 'iw dry-run'`, `flock -c 'iw dry-run'`
+/// and `busybox sh -c 'iw dry-run'` hid the alias inside a command string only
+/// this backstop reads; live gate 0.17.8, F1: the same forms carried the ctl's
+/// own guard-lowering verbs, which the name `innerwarden-ctl` and the verb
+/// `agent` were missing from this search).
 fn text_runs_guard_verb(text: &str, only: &[&str]) -> bool {
-    const NAME: &str = "innerwarden";
+    ["innerwarden-ctl", "innerwarden", "iw-guard", "iw"]
+        .iter()
+        .any(|name| text_runs_guard_verb_named(text, only, name))
+}
+
+/// [`text_runs_guard_verb`] for one of the CLI's names.
+fn text_runs_guard_verb_named(text: &str, only: &[&str], name: &str) -> bool {
     // Same byte offsets as `text`, which is what the slices below rely on.
     let lower = text.to_ascii_lowercase();
     let mut from = 0usize;
-    while let Some(found) = lower[from..].find(NAME) {
+    while let Some(found) = lower[from..].find(name) {
         let start = from + found;
-        let after = start + NAME.len();
+        let after = start + name.len();
         from = after;
         // `$'x:\n\tinnerwarden ...'`: an escaped tab or newline before the
         // name is a separator once the shell decodes it.
@@ -2278,7 +2533,23 @@ fn text_runs_guard_verb(text: &str, only: &[&str]) -> bool {
 /// The verbs that switch the guard to recording only (`dry-run`, `monitor`)
 /// or silence its rules (`mute`). `dry-run` has no terminal check of its own,
 /// so the guard's reading of the agent's command is the only thing in its way.
-const MODE_VERBS: &[&str] = &["mute", "dry-run", "monitor"];
+/// `agents`, `contain`, `install` and `uninstall` are read here too, for
+/// their forms that take the hook off or rewire it ([`guard_verb_loosens`]),
+/// and `agent` for Active Defence's `innerwarden-ctl` verbs (`agent
+/// disconnect`, `agent install-hook --remove|--monitor`; live gate 0.17.8, F1).
+/// The text of a file the agent WRITES is not read here (a Write or Edit
+/// carries no command): a script it writes and runs is held by the CLI,
+/// which refuses these verbs inside an AI agent's shell, the script's too.
+const MODE_VERBS: &[&str] = &[
+    "mute",
+    "dry-run",
+    "monitor",
+    "agents",
+    "agent",
+    "contain",
+    "install",
+    "uninstall",
+];
 
 /// Whether `innerwarden mute|dry-run|monitor`, with arguments that widen what
 /// is let through, appears in the command anywhere but in a simple command
@@ -2287,8 +2558,11 @@ const MODE_VERBS: &[&str] = &["mute", "dry-run", "monitor"];
 /// This is the backstop behind [`runs_guard_loosening_verb`], which finds the
 /// verb only where it knows the program that runs it. A launcher it does not
 /// know (`flock`, `strace`, `systemd-run`, `socat EXEC:`, a `git` alias, an
-/// editor's `!`, a file written and then run) still carries the verb in the
-/// text. So the text decides, and only a search, a commit message or an
+/// editor's `!`, a file written and then run IN THE SAME COMMAND, `echo ...
+/// > x.sh && sh x.sh`) still carries the verb in the text. A file written by
+/// a Write or Edit tool call is not a command and is not read here (the CLI
+/// refuses these verbs in an AI agent's shell, a script's too). So the text
+/// decides, and only a search, a commit message or an
 /// `echo` that goes nowhere is let through. Reading the lists and asking for
 /// help (`mute --list`, `--help`) are not a widening, wherever they appear.
 fn mode_verb_text_outside_a_reader(content: &str) -> bool {
@@ -2415,11 +2689,10 @@ fn guard_verb_is_fed(arguments: &[String]) -> bool {
 
 /// The arguments after `innerwarden`: whether they widen what is let through.
 fn guard_verb_loosens(arguments: &[String]) -> bool {
-    // `npm exec innerwarden -- allow x`: the `--` belongs to the launcher.
-    let arguments = match arguments.first() {
-        Some(first) if first == "--" => &arguments[1..],
-        _ => arguments,
-    };
+    // `npm exec innerwarden -- allow x`: the `--` belongs to the launcher. A
+    // global option spliced before the verb (`innerwarden-ctl --data-dir X
+    // agent disconnect`; live gate v0.17.8, F0) is stepped past the same way.
+    let arguments = skip_leading_options(arguments);
     let Some(verb) = arguments.first() else {
         return false;
     };
@@ -2444,12 +2717,82 @@ fn guard_verb_loosens(arguments: &[String]) -> bool {
         // agents, connecting them and asking for help are not decisions.
         "agents" => {
             !asks_for_help
-                && rest.first().is_some_and(|first| {
-                    AGENT_DECISION_VERBS.contains(&first.to_ascii_lowercase().as_str())
+                && first_positional(&rest).is_some_and(|first| {
+                    let sub = first.to_ascii_lowercase();
+                    AGENT_DECISION_VERBS.contains(&sub.as_str())
+                        // Taking the hook off an agent, or rewiring it to
+                        // record only, lowers the guard that screens it
+                        // (live gate of Active Defence 0.17.4, G1).
+                        || sub == "disconnect"
+                        || (sub == "connect" && rest.contains(&"--monitor"))
                 })
+        }
+        // `innerwarden contain` rewires the agent's hook (`--setup` too): a
+        // jail is the person's to start. Asking for help, or for the argv it
+        // would run (its own `--dry-run`), changes nothing; both are read
+        // among its OWN arguments only, as the CLI reads them
+        // ([`contain_own_args`]): a `-h` or `--dry-run` of the agent's
+        // command is the agent's (review of 1.6.6, H2: `contain --setup
+        // --monitor -- -h` and `contain --monitor true --dry-run` rewired the
+        // hook while the guard read them as help or a dry run).
+        "contain" => {
+            let own = contain_own_args(&rest);
+            !own.iter().any(|a| matches!(*a, "--help" | "-h")) && !own.contains(&"--dry-run")
+        }
+        // `innerwarden install <agent> --monitor` rewires the agent's hook to
+        // record only, as `agents connect --monitor` does (review of 1.6.6,
+        // H1). Installing in enforce, or asking for help, lowers nothing.
+        "install" => !asks_for_help && rest.contains(&"--monitor"),
+        // `innerwarden-ctl agent disconnect` and `agent install-hook
+        // --remove` take the guard off an agent, and `install-hook
+        // --monitor` rewires it to record only (`innerwarden agent ...`
+        // reaches the same ctl). Installing, scanning and help lower
+        // nothing.
+        "agent" => {
+            !asks_for_help
+                && first_positional(&rest).is_some_and(|first| {
+                    let sub = first.to_ascii_lowercase();
+                    sub == "disconnect"
+                        || (sub == "install-hook"
+                            && (rest.contains(&"--remove") || rest.contains(&"--monitor")))
+                })
+        }
+        // `innerwarden uninstall [<agent>]` takes the hook off (all of it, or
+        // one agent's): read through the same parse as every other verb, so
+        // `iw uninstall`, quotes and spacing are the same command (live gate
+        // of Active Defence 0.17.5, J1: only the literal text was refused).
+        // Its own `--dry-run` and help change nothing.
+        "uninstall" => {
+            // Its own arguments end at `--` (live gate of Active Defence
+            // 0.17.6, K4: a `--dry-run` or `-h` after it was read as its own).
+            let own: Vec<&str> = rest.iter().copied().take_while(|a| *a != "--").collect();
+            !own.iter().any(|a| matches!(*a, "--help" | "-h")) && !own.contains(&"--dry-run")
         }
         _ => false,
     }
+}
+
+/// The flags of `innerwarden contain` that take the next argument as their
+/// value (`contain::parse_contain_args`).
+const CONTAIN_VALUE_FLAGS: &[&str] = &["--agent", "--project", "--deny-read"];
+
+/// PURE. The arguments of `innerwarden contain` that are its own, as the CLI
+/// reads them (`parse_contain_args`, `help::own_args`): up to `--` or the
+/// first bare word, which starts the agent's command, a value flag taking its
+/// value with it.
+fn contain_own_args<'a>(rest: &[&'a str]) -> Vec<&'a str> {
+    let mut own = Vec::new();
+    let mut words = rest.iter();
+    while let Some(word) = words.next() {
+        if *word == "--" || !word.starts_with('-') {
+            break;
+        }
+        own.push(*word);
+        if CONTAIN_VALUE_FLAGS.contains(word) {
+            words.next();
+        }
+    }
+    own
 }
 
 /// The `innerwarden agents` verbs that decide about an agent.
@@ -4730,9 +5073,11 @@ fn rm_target_is_credential_store(target: &str) -> bool {
         .strip_prefix("/home/")
         .or_else(|| base.strip_prefix("/users/"))
     {
+        // `collapse_path` drops empty segments, so the user is never empty
+        // (nightly mutant 2026-10-24: a guard on it could never be false).
         match rest.split_once('/') {
-            Some((user, rest)) if !user.is_empty() => rest,
-            _ => return false,
+            Some((_user, rest)) => rest,
+            None => return false,
         }
     } else {
         return false;
@@ -6674,6 +7019,7 @@ pub fn check_security_tamper(content: &str) -> Option<(&'static str, u32)> {
     if let Some(i) = SECURITY_TAMPER_INDICATORS
         .iter()
         .find(|i| lower.contains(*i))
+        .filter(|i| !(**i == "innerwarden uninstall" && uninstall_only_asks(&lower)))
     {
         return Some((*i, 60));
     }
@@ -7849,9 +8195,16 @@ const PRIVILEGED_WRITE_TARGETS: &[PrivilegedGroup] = &[
             Place::Components("openclaw.json"),
             // The OpenClaw message hook and reply plugin `innerwarden observe
             // install` lays down (`HOOK_NAME` and `PLUGIN_ID` in the CLI's
-            // observe_io.rs), in any OpenClaw profile.
+            // observe_io.rs), and the guard plugin `agents connect openclaw`
+            // lays down (`openclaw_guard::PLUGIN_ID`), in any OpenClaw
+            // profile. And every plugin and hook OpenClaw loads from its home
+            // folder: a plugin there runs inside the gateway and can rewrite
+            // or wave through the calls the guard screens.
             Place::Components("hooks/innerwarden-attempts"),
             Place::Components("extensions/innerwarden-replies"),
+            Place::Components("extensions/innerwarden-guard"),
+            Place::Components(".openclaw/extensions"),
+            Place::Components(".openclaw/hooks"),
             // The Community configuration, its allow rules and its record.
             Place::Components(".config/innerwarden"),
             // INNERWARDEN_SELF_PATHS, but for the binary, which is a program.
@@ -10816,6 +11169,8 @@ mod tests {
             "systemctl stop innerwarden",
             "pkill -f innerwarden",
             "innerwarden uninstall",
+            "innerwarden uninstall claude-code -- --dry-run",
+            "innerwarden uninstall --dry-run; innerwarden uninstall",
         ] {
             assert!(
                 check_security_tamper(evil).is_some(),
@@ -13041,6 +13396,295 @@ mod brq_evaluation_tests {
         }
     }
 
+    /// Live gate of Active Defence 0.17.4, G1: under an enforce hook, an
+    /// agent could lower or take off its own guard with `agents connect
+    /// --monitor`, `agents disconnect` or `contain` (which rewrites the hook),
+    /// while `dry-run` and `monitor` were refused. Each is the person's; a
+    /// read, a connect that keeps enforcing, help, and `contain`'s own
+    /// `--dry-run` are not.
+    ///
+    /// FAILS ON REVERT: drop the `disconnect`, `connect --monitor` or
+    /// `contain` arm and its forms are `None` again.
+    #[test]
+    fn an_agent_cannot_lower_its_own_guard_by_wiring_or_a_jail() {
+        for cmd in [
+            "innerwarden agents connect claude-code --monitor",
+            "innerwarden agents connect --all --monitor",
+            "innerwarden agents disconnect --all",
+            "innerwarden agents disconnect claude-code",
+            "innerwarden contain -- true",
+            "innerwarden contain --identity --agent claude-code -- true",
+            "innerwarden contain --setup",
+            "npx innerwarden agents disconnect --all",
+            "env -u CLAUDECODE innerwarden contain -- claude",
+            "flock /tmp/x innerwarden agents disconnect --all",
+        ] {
+            assert!(
+                check_guard_self_disable(cmd).is_some(),
+                "an agent must not lower the guard screening it: {cmd}"
+            );
+        }
+        for cmd in [
+            "innerwarden agents list",
+            "innerwarden agents connect claude-code",
+            "innerwarden agents --help",
+            "innerwarden agents disconnect --help",
+            "innerwarden contain --help",
+            "innerwarden contain --dry-run -- claude",
+            "echo innerwarden agents disconnect --all",
+            "grep 'innerwarden contain' README.md",
+        ] {
+            assert!(
+                check_guard_self_disable(cmd).is_none(),
+                "{cmd} lowers nothing: {:?}",
+                check_guard_self_disable(cmd)
+            );
+        }
+    }
+
+    /// OpenClaw's guard plugin is the person's to take off, and so is the
+    /// guard Active Defence's ctl wires: from inside OpenClaw (whose own
+    /// exec the plugin screens) an agent removing the plugin, turning it off
+    /// with OpenClaw's own commands, or running the ctl's disconnect and
+    /// `install-hook --remove|--monitor` is refused. Reading them is not.
+    ///
+    /// FAILS ON REVERT: drop the OpenClaw rules or the ctl arm and these are
+    /// `None` again (the ctl forms were let through until this change).
+    #[test]
+    fn an_agent_cannot_take_off_the_openclaw_guard_or_the_ctl_guard() {
+        for cmd in [
+            "rm -rf ~/.openclaw/extensions/innerwarden-guard",
+            "rm -rf /home/lab/.openclaw/extensions/innerwarden-guard/",
+            "mv ~/.openclaw/extensions/innerwarden-guard /tmp/x",
+            "rm -rf ~/.openclaw/extensions",
+            "rm -rf ~/.openclaw/hooks/innerwarden-attempts",
+            "rm -rf ~/.openclaw-work/extensions/",
+            "openclaw plugins disable innerwarden-guard",
+            "openclaw plugins uninstall innerwarden-guard --force",
+            "openclaw hooks disable innerwarden-attempts",
+            "openclaw config set plugins.entries.innerwarden-guard.config.mode monitor",
+            "openclaw config set plugins.enabled false",
+            "openclaw config unset mcp.servers.innerwarden",
+            "openclaw plugins install ./rewriter",
+            "openclaw plugins enable some-plugin",
+            "sed -i 's/enforce/monitor/' ~/.openclaw/openclaw.json",
+            "innerwarden-ctl agent disconnect openclaw-1",
+            "sudo innerwarden-ctl agent install-hook --remove",
+            "/usr/local/bin/innerwarden-ctl agent install-hook --agent claude-code --monitor",
+            "innerwarden agent install-hook --remove",
+            "innerwarden-ctl uninstall",
+        ] {
+            assert!(
+                check_guard_self_disable(cmd).is_some(),
+                "an agent must not take off the guard screening it: {cmd}"
+            );
+        }
+        for cmd in [
+            "openclaw plugins list",
+            "openclaw plugins inspect innerwarden-guard",
+            "openclaw config get plugins.entries.innerwarden-guard",
+            "ls ~/.openclaw/extensions",
+            "cat ~/.openclaw/extensions/innerwarden-guard/index.js",
+            "openclaw status",
+            "innerwarden-ctl agent install-hook --agent claude-code",
+            "innerwarden-ctl agent scan",
+            "innerwarden-ctl agent install-hook --help",
+            "innerwarden-ctl uninstall --dry-run",
+            "innerwarden-ctl get status",
+        ] {
+            assert!(
+                check_guard_self_disable(cmd).is_none(),
+                "{cmd} lowers nothing: {:?}",
+                check_guard_self_disable(cmd)
+            );
+        }
+    }
+
+    /// Review of 1.6.6: H1, `install <agent> --monitor` rewires the hook to
+    /// record only, as `agents connect --monitor` does; H2, a help flag or a
+    /// `--dry-run` of the AGENT's command (after `--`, or after the first bare
+    /// word, which starts it) is not `contain`'s own, as the CLI reads them.
+    ///
+    /// FAILS ON REVERT: drop the `install` arm, or read help and `--dry-run`
+    /// across every argument, and these are `None` again.
+    #[test]
+    fn install_in_monitor_and_a_jail_behind_the_agents_own_help_are_the_persons() {
+        for cmd in [
+            "innerwarden install claude-code --monitor",
+            "innerwarden install --monitor",
+            "iw-guard install claude-code --settings /tmp/s.json --monitor",
+            "innerwarden contain --setup --monitor -- -h",
+            "innerwarden contain --monitor -- claude --help",
+            "innerwarden contain --monitor true --dry-run",
+            "innerwarden contain claude --dry-run",
+            "env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT innerwarden contain --setup --monitor -- -h",
+        ] {
+            assert!(
+                check_guard_self_disable(cmd).is_some(),
+                "an agent must not lower the guard screening it: {cmd}"
+            );
+        }
+        for cmd in [
+            "innerwarden install claude-code",
+            "innerwarden install --help",
+            "innerwarden install claude-code --block-review",
+            "innerwarden contain --help",
+            "innerwarden contain --agent claude-code --help",
+            "innerwarden contain --project /tmp/p --dry-run -- claude",
+            "innerwarden contain --dry-run claude",
+        ] {
+            assert!(
+                check_guard_self_disable(cmd).is_none(),
+                "{cmd} lowers nothing: {:?}",
+                check_guard_self_disable(cmd)
+            );
+        }
+    }
+
+    /// Live gate of Active Defence 0.17.5, J1 and J2: only the literal text
+    /// `innerwarden uninstall` was refused, so `iw uninstall`, quotes and
+    /// spacing took the hook off; and a script a command writes and runs
+    /// carries the verb behind an escaped newline. Every spelling the shell
+    /// runs is the same command; its own `--dry-run` and help lower nothing.
+    ///
+    /// FAILS ON REVERT: drop the `uninstall` arm and the parsed spellings are
+    /// `None` again.
+    #[test]
+    fn uninstalling_the_guard_is_the_persons_whatever_its_spelling() {
+        for cmd in [
+            "innerwarden uninstall claude-code",
+            "iw uninstall claude-code",
+            "innerwarden  uninstall claude-code",
+            "innerwarden 'uninstall' claude-code",
+            "innerwarden \"uninstall\" claude-code",
+            "\"innerwarden\" uninstall claude-code",
+            "innerwarden uninstall",
+            "innerwarden uninstall --purge",
+            "iw-guard uninstall claude-code",
+            "printf '#!/bin/sh\\ninnerwarden dry-run\\n' > tidy.sh && sh tidy.sh",
+            "printf '#!/bin/sh\\ninnerwarden dry-run\\n' > tidy.sh",
+        ] {
+            assert!(
+                check_guard_self_disable(cmd).is_some(),
+                "an agent must not take off the guard screening it: {cmd}"
+            );
+        }
+        for cmd in [
+            "innerwarden uninstall --dry-run",
+            "innerwarden uninstall --help",
+            "grep 'innerwarden uninstall' README.md",
+        ] {
+            assert!(
+                check_guard_self_disable(cmd).is_none(),
+                "{cmd} lowers nothing: {:?}",
+                check_guard_self_disable(cmd)
+            );
+        }
+    }
+
+    /// Live gate of Active Defence 0.17.6, K1: a program the parse did not
+    /// unwrap in front of `iw` (flock, taskset, systemd-run --user, prlimit,
+    /// unshare, cpulimit, watch) let the verb through, and the agent took its
+    /// hook off in one command. Behind any unknown program the guard's CLI
+    /// with a verb that loosens is run; a reader holds it as text. K2: its
+    /// own `--dry-run` and help stay open. K4: they are its own only before
+    /// `--`.
+    ///
+    /// FAILS ON REVERT: an unknown program in front returns "nothing run",
+    /// and every wrapper form is `None` again.
+    #[test]
+    fn a_wrapper_in_front_of_the_guards_cli_hides_nothing() {
+        for cmd in [
+            "systemd-run --user --wait -q iw uninstall claude-code",
+            "flock /tmp/x env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT iw uninstall claude-code",
+            "flock /tmp/x iw dry-run",
+            "taskset -c 0 iw uninstall claude-code",
+            "systemd-run --user --wait -q iw dry-run",
+            "prlimit --nofile=64 iw agents disconnect --all",
+            "unshare -U iw uninstall claude-code",
+            "cpulimit -l 50 iw monitor",
+            "watch -n 1 /usr/local/bin/iw-guard uninstall",
+            "some-new-wrapper --opt v iw install claude-code --monitor",
+            "iw uninstall claude-code -- --dry-run",
+            "iw uninstall -- -h",
+        ] {
+            assert!(
+                check_guard_self_disable(cmd).is_some(),
+                "an agent must not take off the guard screening it: {cmd}"
+            );
+        }
+        for cmd in [
+            "innerwarden uninstall --dry-run",
+            "innerwarden uninstall --help",
+            "innerwarden uninstall -h",
+            "innerwarden uninstall claude-code --dry-run",
+            "flock /tmp/x iw uninstall --dry-run",
+            "taskset -c 0 iw agents list",
+            "grep -rn iw uninstall docs/",
+            "echo iw dry-run",
+            "flock /tmp/x cargo build",
+        ] {
+            assert!(
+                check_guard_self_disable(cmd).is_none(),
+                "{cmd} lowers nothing: {:?}",
+                check_guard_self_disable(cmd)
+            );
+            assert!(
+                check_security_tamper(cmd).is_none(),
+                "{cmd} is not tampering: {:?}",
+                check_security_tamper(cmd)
+            );
+        }
+    }
+
+    /// Live gate of Active Defence 0.17.7, L1: the `iw` alias passed both
+    /// hooks inside a command string (`env -S`, `flock -c`, `busybox sh -c`),
+    /// built from quoted pieces (`'i'w`), and behind a variable set on the
+    /// same line (`I=iw; $I`); `innerwarden` in the same forms was refused.
+    /// The CLI's names are one name to the guard, read as the shell reads
+    /// them.
+    ///
+    /// FAILS ON REVERT: the text backstop knows only `innerwarden`, or the
+    /// line is not read with its quotes and assignments, and these are `None`.
+    #[test]
+    fn the_clis_alias_is_its_name_in_a_command_string_a_quote_or_a_variable() {
+        for cmd in [
+            "env -S 'iw dry-run'",
+            "busybox sh -c 'iw dry-run'",
+            "'i'w dry-run",
+            "\"i\"w uninstall claude-code",
+            "i\\w dry-run",
+            "flock -x /tmp/x -c 'iw dry-run'",
+            "flock -x /tmp/x -c 'env -u CLAUDECODE iw uninstall claude-code'",
+            "I=iw; $I dry-run",
+            "export I=iw && ${I} uninstall claude-code",
+            "G=iw-guard; V=dry-run; $G $V",
+            "env -S 'iw-guard monitor'",
+        ] {
+            assert!(
+                check_guard_self_disable(cmd).is_some(),
+                "an agent must not lower the guard screening it: {cmd}"
+            );
+        }
+        for cmd in [
+            "iw dev wlan0 scan",
+            "iw list",
+            "I=iw; echo $I dry-run",
+            "IW=1; echo $IW",
+            "echo 'iw dry-run'",
+            "grep -rn 'iw uninstall' docs/",
+            "env -S 'ls -la'",
+            "flock -x /tmp/x -c 'cargo build'",
+            "review='done'; echo $review",
+        ] {
+            assert!(
+                check_guard_self_disable(cmd).is_none(),
+                "{cmd} lowers nothing: {:?}",
+                check_guard_self_disable(cmd)
+            );
+        }
+    }
+
     /// Any force-allow or mute an agent runs is a bypass it grants itself, a
     /// narrow one included: `innerwarden allow 'rm -rf /'` lifts exactly the
     /// block it was just given. Only the person at their own terminal decides
@@ -14135,6 +14779,10 @@ mod privileged_write_target_tests {
             "/home/dev/.openclaw-work/openclaw.json",
             "/home/dev/.openclaw/hooks/innerwarden-attempts/handler.js",
             "~/.openclaw/extensions/innerwarden-replies/index.js",
+            "~/.openclaw/extensions/innerwarden-guard/index.js",
+            "/home/dev/.openclaw-work/extensions/innerwarden-guard/bin.json",
+            "/home/dev/.openclaw/extensions/another-plugin/index.js",
+            "/home/dev/.openclaw/hooks/another-hook/handler.js",
             "~/.config/innerwarden/agents.toml",
             "/home/dev/.config/innerwarden/guard-events.jsonl",
             "~/.CONFIG/InnerWarden/allow.toml",
@@ -14287,7 +14935,9 @@ mod privileged_write_target_tests {
         for cmd in [
             "innerwarden agents",
             "innerwarden agents list",
-            "innerwarden agents connect claude-code --monitor",
+            // A connect that keeps enforcing; `--monitor` lowers the guard
+            // and is refused (an_agent_cannot_lower_its_own_guard_by_wiring_or_a_jail).
+            "innerwarden agents connect claude-code",
             "innerwarden agents approve --help",
             "grep 'innerwarden agents approve' docs/README.md",
         ] {

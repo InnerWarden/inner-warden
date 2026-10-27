@@ -29,6 +29,10 @@ the agent is about to do, and gives a verdict a hook or a proxy can enforce.
 - **Open rules, open engine.** Written in Rust, Apache-2.0, with YAML rules
   you can read and extend.
 
+Releases: this repository carries the `guard-vX.Y.Z` tags but no GitHub
+Releases. Every Community release, its signed binaries and its notes are at
+[InnerWarden/innerwarden-releases](https://github.com/InnerWarden/innerwarden-releases/releases).
+
 ## See it work
 
 ```console
@@ -139,7 +143,15 @@ Whatever agent you run, there is a mechanism and a command for it:
   `Edit`, `MultiEdit`, `NotebookEdit`) make to a privileged file: its settings,
   the guard's configuration, shell startup files, SSH keys, scheduled jobs and
   services, and stored credentials. Ordinary project edits are not judged.
-- **Cursor, Codex CLI, Gemini CLI, OpenClaw** - no pre-execution hook exists, so
+- **OpenClaw** - its own tools (`exec`, `process`, `write`, `edit`,
+  `apply_patch`) are asked about through its `before_tool_call` plugin hook,
+  which needs OpenClaw 2026.9.7 or newer: `innerwarden agents connect
+  openclaw` installs the `innerwarden-guard` plugin next to the MCP proxy
+  that carries its MCP servers. Monitor (the default) records only; after
+  `innerwarden enforce` a deny is refused (the model is told only "Refused by
+  InnerWarden.") and a review asks you to allow it once or deny it.
+  Reversible with `agents disconnect openclaw`.
+- **Cursor, Codex CLI, Gemini CLI** - no pre-execution hook exists, so
   the guard wires their MCP configuration to run through its proxy:
   `innerwarden agents connect <agent>`. Reversible with `agents disconnect`.
   OpenClaw has one more surface, and it observes rather than enforces: its

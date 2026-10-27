@@ -44,13 +44,15 @@ list, with every limit.
   `deny`; the record's `signals` name the reading that scored it. Every record
   names who decided (`guard_denied`, `kernel_denied`, `model_refused` only
   when a caller states it, or `undetermined` when that could not be seen, a
-  reply included: its words are not read, and a tool the guard does not
-  screen leaves nothing, so a reply does not show the agent declined;
+  reply included: its words are not read, and a call the guard let run (or
+  did not see) leaves nothing, so a reply does not show the agent declined;
   `guard_denied` only for a refusal the guard made for that agent, in that
   conversation's session, in a turn whose reply was seen, never for an action
   monitor mode let run) and a model refusal is never reported as a block:
   `innerwarden observe status` says whether this host sees them at all.
-  OpenClaw today, via its message hooks.
+  OpenClaw today, via its message hooks; `kernel_denied` only where
+  InnerWarden Pro's Execution Gate, in enforce for that agent, refused a
+  program during a call of that conversation, as Pro recorded it.
 
 The verdict is JSON: a recommendation (`allow` / `review` / `deny`), a risk
 score, matched signals, and a short explanation.

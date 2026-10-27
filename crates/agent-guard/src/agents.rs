@@ -533,7 +533,8 @@ mod tests {
         let openclaw = KNOWN.iter().find(|k| k.name == "openclaw").unwrap();
         assert!(
             !openclaw.hookable && openclaw.mcp_json == Some(".openclaw/openclaw.json"),
-            "OpenClaw has no hook surface and is guarded through its MCP config"
+            "OpenClaw takes no settings hook: `agents connect` wires its MCP config and \
+             lays the plugin that screens its own tools"
         );
         let codex = KNOWN.iter().find(|k| k.name == "codex").unwrap();
         assert!(

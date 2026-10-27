@@ -542,7 +542,7 @@ pub fn applies_sentence(agent: &str, confined: usize, other: usize) -> String {
 pub fn ask_host_sentence(agent: &str, confined: usize, other: usize) -> String {
     let all = confined + other;
     format!(
-        "From its next action, Active Defence on this host is asked about every shell command \
+        "From its next action, InnerWarden Pro on this host is asked about every shell command \
          of {agent}'s identified instances, confined or not, and may refuse one your general \
          rules allow. {all} identified {} today.",
         instances_word(all)
@@ -598,7 +598,7 @@ pub fn effect(
     let applies_done = if asks_more {
         let all = confined + other;
         let asked = format!(
-            "Active Defence on this host is asked about every shell command of its {all} \
+            "InnerWarden Pro on this host is asked about every shell command of its {all} \
              identified {}.",
             instances_word(all)
         );
@@ -1242,13 +1242,13 @@ mod tests {
         assert_eq!(
             e.before,
             "Change the claude-code profile from General rules to kernel. From its next action, \
-             Active Defence on this host is asked about every shell command of claude-code's \
+             InnerWarden Pro on this host is asked about every shell command of claude-code's \
              identified instances, confined or not, and may refuse one your general rules \
              allow. 2 identified instances today."
         );
         assert_eq!(
             e.done,
-            "maria changed the claude-code profile from General rules to kernel. Active Defence \
+            "maria changed the claude-code profile from General rules to kernel. InnerWarden Pro \
              on this host is asked about every shell command of its 2 identified instances."
         );
         // With an allowance too, both are said.
@@ -1281,7 +1281,7 @@ mod tests {
         assert_eq!(
             e.done,
             "maria changed the claude-code profile from General rules to kernel. Applies to 1 \
-             confined instance. Active Defence on this host is asked about every shell command \
+             confined instance. InnerWarden Pro on this host is asked about every shell command \
              of its 2 identified instances."
         );
     }

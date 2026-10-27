@@ -246,8 +246,18 @@ const HOME_GUARD_FILES: &[&str] = &[
 ];
 
 /// Privileged directories in the account's home outside [`HOME_PLACES`].
+/// OpenClaw's plugin and hook folders hold the guard that screens its own
+/// tools (`innerwarden-guard`) and the hook that records its chats: code the
+/// gateway loads, so an agent that could change them could take its own
+/// guard off or plant a plugin that rewrites the calls the guard screened.
 #[cfg(unix)]
-const HOME_GUARD_TREES: &[&str] = &[".config/innerwarden", ".ssh", ".gnupg"];
+const HOME_GUARD_TREES: &[&str] = &[
+    ".config/innerwarden",
+    ".ssh",
+    ".gnupg",
+    ".openclaw/extensions",
+    ".openclaw/hooks",
+];
 
 /// The account's home from the account database, for a hook run without
 /// `HOME`.
@@ -647,6 +657,18 @@ mod tests {
                 "/home/dev/.codex/config.toml",
                 "the guard's own configuration",
             ),
+            (
+                "/home/dev/.openclaw/extensions/innerwarden-guard/index.js",
+                "the guard's own configuration",
+            ),
+            (
+                "~/.openclaw/extensions/a-new-plugin/index.js",
+                "the guard's own configuration",
+            ),
+            (
+                "/home/dev/.openclaw/hooks/innerwarden-attempts/handler.js",
+                "the guard's own configuration",
+            ),
             ("/home/dev/.ssh/authorized_keys", "SSH"),
             ("/home/dev/.bashrc", "startup files"),
             ("~/.zshrc", "startup files"),
@@ -807,6 +829,45 @@ mod tests {
         for path in ["plain.json", "../dotfiles/README.md", "new.txt"] {
             assert_eq!(privileged_file_write(path, &ctx), None, "{path}");
         }
+    }
+
+    /// OpenClaw's plugin and hook folders hold the guard that screens its
+    /// own tools: reached by another name (the folder a link in the home
+    /// leads to), a write into them is refused as a write into them.
+    ///
+    /// FAILS ON REVERT: take `.openclaw/extensions` and `.openclaw/hooks` out
+    /// of `HOME_GUARD_TREES` and both paths are allowed.
+    #[cfg(unix)]
+    #[test]
+    fn openclaws_plugin_folders_are_refused_under_another_name() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let home = dir.path().join("home");
+        let proj = home.join("proj");
+        let kept = home.join("kept");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::create_dir_all(home.join(".openclaw")).unwrap();
+        std::fs::create_dir_all(kept.join("ext/innerwarden-guard")).unwrap();
+        std::fs::create_dir_all(kept.join("hooks/innerwarden-attempts")).unwrap();
+        std::os::unix::fs::symlink(kept.join("ext"), home.join(".openclaw/extensions")).unwrap();
+        std::os::unix::fs::symlink(kept.join("hooks"), home.join(".openclaw/hooks")).unwrap();
+        let ctx = WriteContext {
+            cwd: Some(&proj),
+            home: Some(&home),
+            guard_program: None,
+        };
+        for path in [
+            "../kept/ext/innerwarden-guard/index.js",
+            "../kept/hooks/innerwarden-attempts/handler.js",
+            "../kept/ext/new-plugin/index.js",
+        ] {
+            let found = privileged_file_write(path, &ctx)
+                .unwrap_or_else(|| panic!("{path} is OpenClaw's plugin folder under another name"));
+            assert!(
+                found.contains("the guard's own configuration"),
+                "{path}: {found}"
+            );
+        }
+        assert_eq!(privileged_file_write("../kept/notes.txt", &ctx), None);
     }
 
     /// A hook run without `HOME` still knows the account's home, from the

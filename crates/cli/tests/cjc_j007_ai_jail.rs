@@ -27,6 +27,18 @@ fn scratch_graph() -> &'static std::path::Path {
 fn cli() -> Command {
     let mut command = Command::new(bin());
     command.env("IW_GRAPH_FILE", scratch_graph());
+    // The person's shell, even when the suite runs under an AI agent's: a
+    // jail is refused inside one (`an_agent_cannot_lower_its_own_guard.rs`).
+    for marker in [
+        "CLAUDECODE",
+        "CLAUDE_CODE_ENTRYPOINT",
+        "CODEX_SANDBOX",
+        "CODEX_SANDBOX_NETWORK_DISABLED",
+        "GEMINI_CLI",
+        "OPENCLAW_SHELL",
+    ] {
+        command.env_remove(marker);
+    }
     command
 }
 
@@ -457,7 +469,7 @@ fn identity_flag_mounts_the_record_read_only_inside_and_keeps_a_private_copy() {
     assert!(stderr.contains("identity is at most observed"), "{stderr}");
     assert!(
         !stderr.contains("system scope"),
-        "no Active Defence, no request: {stderr}"
+        "no InnerWarden Pro, no request: {stderr}"
     );
     // The namespace the launcher recorded is the one the jailed process saw.
     let inside: u64 = ns_line
@@ -1022,14 +1034,14 @@ fn a_jail_the_host_did_not_admit_never_runs_its_command() {
     assert_eq!(status.code(), Some(2), "{stderr}");
     assert!(
         stderr.contains(
-            "innerwarden contain: Active Defence on this host did not admit this jail, and its \
+            "innerwarden contain: InnerWarden Pro on this host did not admit this jail, and its \
              profile starts it only when admitted."
         ),
         "{stderr}"
     );
     assert!(
         stderr.contains(&format!(
-            "innerwarden contain: Check that Active Defence is running (systemctl status \
+            "innerwarden contain: Check that InnerWarden Pro is running (systemctl status \
              innerwarden-agent), then try again. The jail waits for it because of start = \
              \"only_when_admitted\" in {}.",
             home.path()

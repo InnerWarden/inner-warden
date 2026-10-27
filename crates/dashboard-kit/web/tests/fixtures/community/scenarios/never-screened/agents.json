@@ -1,0 +1,104 @@
+{
+  "agents": [
+    {
+      "auto_connect_eligible": false,
+      "detected_by": [
+        "executable_on_path",
+        "configuration_file"
+      ],
+      "display_name": "Claude Code",
+      "guardrail": {
+        "config_changed_at": "2026-09-29T14:04:00Z",
+        "last_observed_at": "2026-09-29T14:03:00Z",
+        "mechanism": "pretooluse_hook",
+        "mode": "monitor",
+        "setup_support": "automatic"
+      },
+      "id": "claude-code",
+      "installed": true,
+      "judges": "shell_and_privileged_files",
+      "judges_line": "Shell commands, and file changes (Write, Edit, MultiEdit, NotebookEdit) to privileged files such as its settings, the guard's configuration and your shell startup files. Its other tools are recorded after they run.",
+      "mode_steps": {
+        "enforce": {
+          "command": "innerwarden agents connect claude-code",
+          "label": "To refuse a deny for this agent only:",
+          "line": "Switches this agent to Enforce: a deny is refused before it runs. Your other agents keep their mode."
+        }
+      },
+      "next_step": {
+        "command": "innerwarden enforce",
+        "label": "To refuse a deny as well:",
+        "line": "Switches every connected agent from Monitor to Enforce: a deny is refused before it runs."
+      },
+      "restart": {
+        "how": "In Claude Code, type /exit, then run claude.",
+        "why": "An agent reads its hook or MCP config only when it starts."
+      },
+      "running": null
+    },
+    {
+      "auto_connect_eligible": false,
+      "detected_by": [
+        "executable_on_path",
+        "configuration_file"
+      ],
+      "display_name": "Codex",
+      "guardrail": {
+        "config_changed_at": "2026-09-29T13:35:00Z",
+        "last_observed_at": "2026-09-29T12:05:00Z",
+        "mechanism": "mcp_proxy",
+        "mode": "monitor",
+        "setup_support": "automatic"
+      },
+      "id": "codex",
+      "installed": true,
+      "judges": "mcp_server_calls",
+      "judges_line": "Calls to its MCP servers. Its built-in tools are not screened by this edition.",
+      "mcp": {
+        "remote": 0,
+        "stdio": 2,
+        "wrapped": 2
+      },
+      "mode_steps": {
+        "enforce": {
+          "command": "innerwarden agents connect codex",
+          "label": "To refuse a deny for this agent only:",
+          "line": "Switches this agent to Enforce: a deny is refused before it runs. Your other agents keep their mode."
+        }
+      },
+      "next_step": {
+        "command": "innerwarden enforce",
+        "label": "To refuse a deny as well:",
+        "line": "Switches every connected agent from Monitor to Enforce: a deny is refused before it runs."
+      },
+      "restart": {
+        "how": "Quit Codex and start it again.",
+        "why": "An agent reads its hook or MCP config only when it starts."
+      },
+      "running": null
+    }
+  ],
+  "auto_connect": {
+    "enabled": true,
+    "mode": "monitor",
+    "refresh_interval_secs": 60,
+    "status": "available",
+    "watcher": {
+      "effective_policy_mode": null,
+      "last_reconcile_at_ms": null,
+      "lifecycle": "unavailable",
+      "policy_available": false,
+      "policy_enabled": null,
+      "reason_code": "watcher_unavailable"
+    }
+  },
+  "availability": "available",
+  "discovery_limited": false,
+  "generated_at_ms": 1790690700000,
+  "schema_version": 2,
+  "screened_by_channel": {
+    "hook": "2026-09-29T14:03:00Z",
+    "mcp": "2026-09-29T12:05:00Z"
+  },
+  "unnamed_by_channel": {}
+}

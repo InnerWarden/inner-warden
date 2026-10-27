@@ -7,14 +7,15 @@
     "dev": "vite",
     "test": "npm run test:unit",
     "test:unit": "vitest run",
-    "test:bundle": "node --test scripts/bundle-manifest.test.mjs",
+    "test:bundle": "node --test scripts/bundle-manifest.test.mjs scripts/shared-css.test.mjs scripts/bundle-budget.test.mjs",
     "test:browser": "playwright test",
     "typecheck": "tsc -b",
     "build": "npm run typecheck && vite build && node scripts/bundle-manifest.mjs write",
     "bundle:check": "node scripts/bundle-manifest.mjs check",
     "preview": "vite preview",
-    "ci": "npm run test:unit && npm run test:bundle && npm run build && npm run bundle:check && npm run bundle:reproducible && npm run test:browser",
-    "bundle:reproducible": "node scripts/reproducible.mjs"
+    "ci": "npm run test:unit && npm run test:bundle && npm run build && npm run bundle:check && npm run css:shared && npm run bundle:reproducible && npm run test:browser",
+    "bundle:reproducible": "node scripts/reproducible.mjs",
+    "css:shared": "node scripts/shared-css.mjs check"
   },
   "dependencies": {
     "react": "^19.0.0",
@@ -22,6 +23,8 @@
   },
   "devDependencies": {
     "@playwright/test": "^1.61.1",
+    "@tailwindcss/node": "4.3.2",
+    "@tailwindcss/oxide": "4.3.2",
     "@tailwindcss/vite": "^4.0.0",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",

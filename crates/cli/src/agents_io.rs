@@ -6,6 +6,16 @@ use innerwarden_agent_guard::{agents_ops, hook};
 use crate::agent_policy::{self, DesiredMode};
 
 /// `innerwarden agents [connect|disconnect [--all|<name>]]` - discover + connect.
+/// PURE. Whether `innerwarden agents <rest>` lowers a guard: a disconnect, or
+/// a connect in monitor.
+pub(crate) fn lowers_a_guard(rest: &[String]) -> bool {
+    match rest.first().map(String::as_str) {
+        Some("disconnect") => true,
+        Some("connect") => rest.iter().any(|a| a == "--monitor"),
+        _ => false,
+    }
+}
+
 pub fn cmd(rest: &[String]) -> std::process::ExitCode {
     // The person's decisions about an agent (approve, profile, allow,
     // revoke): verbs of their own, never part of discovery or wiring.
@@ -32,6 +42,18 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
         return cmd_auto_connect(&home, &rest[1..]);
     }
 
+    // Taking the hook off an agent, or rewiring it to record only, lowers the
+    // guard that screens it: the person's, never a command an AI agent's
+    // shell runs (live gate of Active Defence 0.17.4, G1). The guard refuses
+    // the agent running it; this holds where the guard cannot see the call.
+    if lowers_a_guard(rest) && crate::suppress_io::in_agent_shell() {
+        eprintln!(
+            "innerwarden agents: refused inside an AI agent's shell. Disconnecting an agent, \
+             or connecting it in monitor, lowers the guard that screens it, so it is done \
+             by the person, from their own terminal. Nothing was changed."
+        );
+        return std::process::ExitCode::from(1);
+    }
     let mutating = matches!(
         rest.first().map(String::as_str),
         Some("connect" | "disconnect")
@@ -70,7 +92,11 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
     let outcome = if mutating {
         match agent_policy::with_lock(&home, || {
             prepare_policy_for_agent_command(&home, rest)?;
-            Ok(agents_ops::run_outcome(&home, rest))
+            let mut outcome = agents_ops::run_outcome(&home, rest);
+            // OpenClaw's own tools never reach the MCP proxy: the plugin
+            // that screens them goes in (and out) next to it.
+            outcome.lines.extend(openclaw_guard_lines(&home, rest));
+            Ok(outcome)
         }) {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -85,6 +111,14 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
     for line in &outcome.lines {
         println!("{line}");
     }
+    if matches!(rest.first().map(String::as_str), None | Some("list"))
+        && crate::observe_io::openclaw_config(&home).is_file()
+    {
+        println!();
+        for line in crate::openclaw_guard_io::status_lines(&home) {
+            println!("{line}");
+        }
+    }
     // An agent reads its hook / MCP configuration at STARTUP. Without this the
     // command printed "connected" and the user went back to a session that was
     // still running unscreened, believing it was protected.
@@ -94,13 +128,67 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
     // restart after deliberately unwiring. Same wording as `dry-run`/`enforce`
     // so the product says one thing.
     if outcome.configured > 0 {
-        println!("{}", crate::RESTART_GUARDED_AGENTS);
+        let target = command_target(rest);
+        let connected: Vec<String> = agents_ops::rows(&home)
+            .into_iter()
+            .filter(|agent| {
+                agent.guardable()
+                    && agent.guarded
+                    && target.is_none_or(|name| agent.name.eq_ignore_ascii_case(name))
+            })
+            .map(|agent| agent.name)
+            .collect();
+        for line in restart_footer(&connected) {
+            println!("{line}");
+        }
     }
     if failed {
         std::process::ExitCode::from(1)
     } else {
         std::process::ExitCode::SUCCESS
     }
+}
+
+/// How to restart one agent so it reads its changed hook or MCP config, and
+/// why that is needed. The person restarts it: nothing here says it was.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct RestartWords {
+    pub how: String,
+    pub why: &'static str,
+}
+
+/// Why a running agent needs a restart after its config changed.
+pub(crate) const RESTART_WHY: &str = "An agent reads its hook or MCP config only when it starts.";
+
+/// The restart words for one agent: Claude Code and Codex by their own
+/// steps, any other agent by the generic one, named by `display_name`.
+pub(crate) fn restart_words(agent_id: &str, display_name: &str) -> RestartWords {
+    let how = match agent_id {
+        "claude-code" | "claude" => "In Claude Code, type /exit, then run claude.".to_string(),
+        "codex" => "Quit Codex and start it again.".to_string(),
+        _ => format!("Quit {display_name} and start it again."),
+    };
+    RestartWords {
+        how,
+        why: RESTART_WHY,
+    }
+}
+
+/// What a command that changed agents' configs prints at its end: the
+/// shared restart line, byte for byte as it always was, then one line per
+/// agent saying how to restart that one. Each agent once, in the order given.
+pub(crate) fn restart_footer(agent_ids: &[String]) -> Vec<String> {
+    let mut lines = vec![crate::RESTART_GUARDED_AGENTS.to_string()];
+    let mut seen: Vec<&str> = Vec::new();
+    for id in agent_ids {
+        if seen.contains(&id.as_str()) {
+            continue;
+        }
+        seen.push(id);
+        let name = crate::dashboard_community::agent_name(id);
+        lines.push(format!("  {name}: {}", restart_words(id, &name).how));
+    }
+    lines
 }
 
 fn is_known_agent_name(name: &str) -> bool {
@@ -127,7 +215,7 @@ pub(crate) fn help_text() -> String {
          agent in agent-profiles.toml, confirmed at your terminal. Only\n  \
          /etc/innerwarden/agent-profiles.toml (--system, as root) may relax a rule,\n  \
          and a relaxation applies only to an instance that runs confined. Confined\n  \
-         needs a witness outside the jail (Active Defence): read from inside the\n  \
+         needs a witness outside the jail (InnerWarden Pro): read from inside the\n  \
          jail an instance is at most observed, so with Community alone a relaxation\n  \
          is recorded and your general rules keep deciding.",
         decisions = crate::agent_decisions::usage()
@@ -136,6 +224,45 @@ pub(crate) fn help_text() -> String {
 
 fn print_agents_help() {
     println!("{}", help_text());
+}
+
+/// PURE. Whether an `agents connect` or `disconnect` reaches OpenClaw: it
+/// names it, or names no agent (every agent detected).
+pub(crate) fn names_openclaw(rest: &[String]) -> bool {
+    command_target(rest).is_none_or(|name| name.eq_ignore_ascii_case("openclaw"))
+}
+
+/// The guard plugin, installed by a connect that reaches a detected OpenClaw
+/// (in monitor unless the entry holds a mode, and in monitor with
+/// `--monitor`), taken out by a disconnect that reaches it.
+fn openclaw_guard_lines(home: &std::path::Path, rest: &[String]) -> Vec<String> {
+    use crate::openclaw_guard::Mode;
+    use crate::openclaw_guard_io as guard;
+    if !names_openclaw(rest) {
+        return Vec::new();
+    }
+    match rest.first().map(String::as_str) {
+        Some("connect") => {
+            let detected = agents_ops::rows(home)
+                .iter()
+                .any(|agent| agent.guardable() && agent.name.eq_ignore_ascii_case("openclaw"));
+            if !detected {
+                return Vec::new();
+            }
+            let mut installed = guard::install(home, &agents_ops::guard_bin());
+            if rest.iter().any(|a| a == "--monitor") {
+                if let guard::Installed::Enabled { mode, .. } = &mut installed {
+                    match guard::set_mode(home, Mode::Monitor) {
+                        Ok(_) => *mode = Mode::Monitor,
+                        Err(error) => installed = guard::Installed::Failed(error),
+                    }
+                }
+            }
+            guard::install_lines(&installed, home)
+        }
+        Some("disconnect") => guard::uninstall(home),
+        _ => Vec::new(),
+    }
 }
 
 fn command_target(rest: &[String]) -> Option<&str> {
@@ -286,6 +413,80 @@ fn print_auto_connect_help() {
 mod tests {
     use super::*;
 
+    /// Claude Code and Codex get their own steps; any other agent the
+    /// generic one under its own name. Every one says why.
+    #[test]
+    fn restart_words_cover_claude_code_codex_and_a_generic_agent() {
+        assert_eq!(
+            restart_words("claude-code", "Claude Code"),
+            RestartWords {
+                how: "In Claude Code, type /exit, then run claude.".into(),
+                why: "An agent reads its hook or MCP config only when it starts.",
+            }
+        );
+        assert_eq!(
+            restart_words("codex", "Codex").how,
+            "Quit Codex and start it again."
+        );
+        assert_eq!(
+            restart_words("gemini", "Gemini CLI").how,
+            "Quit Gemini CLI and start it again."
+        );
+        assert_eq!(restart_words("gemini", "Gemini CLI").why, RESTART_WHY);
+    }
+
+    /// The person restarts the agent; no word says it happened, or that a
+    /// change was taken up.
+    #[test]
+    fn restart_words_never_say_restarted_or_reloaded() {
+        for (id, name) in [
+            ("claude-code", "Claude Code"),
+            ("codex", "Codex"),
+            ("cursor", "Cursor"),
+            ("openclaw", "OpenClaw"),
+            ("some-agent", "Some Agent"),
+        ] {
+            let words = restart_words(id, name);
+            let text = format!("{} {}", words.how, words.why).to_lowercase();
+            for banned in [
+                "restarted",
+                "reloaded",
+                "picked up",
+                "now protected",
+                "protected",
+            ] {
+                assert!(!text.contains(banned), "{id}: {text}");
+            }
+            assert!(!text.contains('\u{2014}') && !text.contains('\u{2013}'));
+        }
+    }
+
+    /// After a mode switch or a connect: the shared restart line exactly as
+    /// it always was, then one line per agent whose config changed, each
+    /// once. FAILS ON REVERT of the per-agent lines: only the shared line is
+    /// printed.
+    #[test]
+    fn mode_switch_prints_each_connected_agents_restart_words() {
+        let lines = restart_footer(&[
+            "claude-code".to_string(),
+            "codex".to_string(),
+            "claude-code".to_string(),
+            "cursor".to_string(),
+        ]);
+        assert_eq!(
+            lines,
+            vec![
+                "  Restart guarded agents so they reload their hook or MCP configuration."
+                    .to_string(),
+                "  Claude Code: In Claude Code, type /exit, then run claude.".to_string(),
+                "  Codex: Quit Codex and start it again.".to_string(),
+                "  Cursor: Quit Cursor and start it again.".to_string(),
+            ]
+        );
+        assert_eq!(lines[0], crate::RESTART_GUARDED_AGENTS);
+        assert_eq!(restart_footer(&[]), vec![crate::RESTART_GUARDED_AGENTS]);
+    }
+
     #[test]
     fn disconnect_excludes_connect_includes_and_disconnect_all_disables() {
         let home = tempfile::TempDir::new().unwrap();
@@ -327,5 +528,25 @@ mod tests {
         assert!(is_known_agent_name("claude-code"));
         assert!(!is_known_agent_name("cursor-mcp"));
         assert!(!is_known_agent_name("c"));
+    }
+}
+
+#[cfg(test)]
+mod openclaw_guard_tests {
+    use super::names_openclaw;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// A connect or disconnect that names OpenClaw, or names no agent,
+    /// reaches the guard plugin; one naming another agent does not.
+    #[test]
+    fn the_guard_follows_a_connect_that_reaches_openclaw() {
+        assert!(names_openclaw(&args(&["connect", "openclaw"])));
+        assert!(names_openclaw(&args(&["connect", "OpenClaw", "--monitor"])));
+        assert!(names_openclaw(&args(&["connect", "--all"])));
+        assert!(names_openclaw(&args(&["disconnect"])));
+        assert!(!names_openclaw(&args(&["connect", "claude-code"])));
     }
 }

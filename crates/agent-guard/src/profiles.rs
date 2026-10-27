@@ -1976,11 +1976,11 @@ pub fn describe(profile: Option<&AgentProfile>) -> Vec<String> {
         &profile.jail.hide_home,
     );
     if profile.jail.start() == JailStart::OnlyWhenAdmitted {
-        out.push("The jail starts only when Active Defence on this host admits it.".to_string());
+        out.push("The jail starts only when InnerWarden Pro on this host admits it.".to_string());
     }
     if profile.ask_host == Some(AskHost::EveryCommand) {
         out.push(
-            "In a jail, Active Defence on this host is asked about every shell command, not \
+            "In a jail, InnerWarden Pro on this host is asked about every shell command, not \
              only a review."
                 .to_string(),
         );
@@ -2908,7 +2908,7 @@ net = true
         assert_eq!(
             describe(after),
             [
-                "In a jail, Active Defence on this host is asked about every shell command, \
+                "In a jail, InnerWarden Pro on this host is asked about every shell command, \
                  not only a review."
             ]
         );
@@ -3142,7 +3142,7 @@ net = true
             describe(strict_p),
             [
                 "Hidden from the home in the jail: .cache/git/credential.",
-                "The jail starts only when Active Defence on this host admits it.",
+                "The jail starts only when InnerWarden Pro on this host admits it.",
             ]
         );
     }

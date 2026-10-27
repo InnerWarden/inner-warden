@@ -21,19 +21,26 @@ import { readDecisionDetail, readDecisionsPage, readHistory, readRecordHealth } 
  */
 const answers = new Map<string, unknown>();
 
+function answered(lookup: string) {
+  const data = answers.get(lookup);
+  return data === undefined
+    ? { loading: true, stale: false, refresh: () => undefined }
+    : { data, loading: false, stale: false, refresh: () => undefined };
+}
+
 vi.mock("./poll", () => ({
-  usePolled: (_load: unknown, _delay: number, key = "") => {
-    const lookup = key.startsWith("{") ? "decisions" : key.startsWith("recent-without:") ? "recent-without" : key;
-    const data = answers.get(lookup);
-    return data === undefined
-      ? { loading: true, stale: false, refresh: () => undefined }
-      : { data, loading: false, stale: false, refresh: () => undefined };
-  },
+  usePolled: (_load: unknown, _delay: number, key = "") =>
+    answered(key.startsWith("{") ? "decisions" : key.startsWith("recent-without:") ? "recent-without" : key),
+}));
+
+// The shared sources answer from the same table, by their key.
+vi.mock("./store", () => ({
+  useSource: (key: string) => answered(key),
 }));
 
 const { CommunityOverview } = await import("./Overview");
 const { CommunityAgents } = await import("./Agents");
-const { CaseDetail } = await import("./CaseDetail");
+const { DecisionDetail } = await import("./DecisionDetail");
 
 const META: DashboardMeta = { version: "1.5.0", exposed: false, edition: "community", guardrail: { mode: "partial", guarded_agents: 3 } };
 
@@ -187,7 +194,7 @@ describe("with no identity data the screens are what they were", () => {
   it("a case with no identity has no identity block and no layer line", () => {
     const [id] = Object.keys(byId);
     const detail = readDecisionDetail((byId as Record<string, unknown>)[id]);
-    const html = render(<CaseDetail item={detail.item} before={[]} after={[]} os="macos" installed={false} onOpen={() => undefined} onSession={() => undefined} />);
+    const html = render(<DecisionDetail item={detail.item} before={[]} after={[]} os="macos" installed={false} onOpen={() => undefined} onSession={() => undefined} />);
     expect(html).not.toContain("data-case-identity");
     expect(html).not.toContain("data-decided-by-layer");
   });
@@ -207,7 +214,9 @@ describe("the Agents page with identity data", () => {
     expect(text).toContain("dev in payments-api");
     expect(text).toContain("Refuses");
     expect(text).toContain("The launcher is installed in your home folder, so any program you run could replace it: install it system-wide.");
-    expect(text).toContain("a1b2c3d4 (open case)");
+    expect(text).toContain("a1b2c3d4 (open decision)");
+    // The session opens its decision as a real link, so a middle click works.
+    expect(row).toContain('href="?view=activity&amp;decision=cmd%3Aabc%3A0"');
     expect(text).toContain("Start it in a jail");
     expect(text).toContain("innerwarden contain --identity -- claude");
     expect(text).toContain("innerwarden agents approve claude-code");
@@ -219,16 +228,20 @@ describe("the Agents page with identity data", () => {
     expect(codex).toContain("No instance started in a jail yet.");
   });
 
-  it("makes one Active Defence line when a contained agent is shown, and the installed line on a host that has it", () => {
+  /**
+   * Agents makes no Active Defence offer of its own (spec 6.4): the one
+   * generic line is on Protection, so the page links nowhere outside.
+   */
+  it("makes no InnerWarden Pro line, contained agent or not, and on a host that has it", () => {
     seed(withIdentity());
     const html = render(<CommunityAgents context={context()} />, withIdentity());
-    expect(html.match(/data-offer=/g)?.length).toBe(1);
-    expect(html).toContain('data-offer="agent_kernel"');
-    expect(textOf(html)).toContain("Contained agents are checked by the kernel with Active Defence.");
-    expect([...html.matchAll(/href="(https:\/\/innerwarden\.com[^"]*)"/g)].map((m) => m[1])).toEqual(["https://innerwarden.com/pricing"]);
+    expect(html).not.toContain("data-offer");
+    expect(html).not.toContain("data-ad-state");
+    expect(textOf(html)).not.toContain("InnerWarden Pro");
+    expect([...html.matchAll(/href="(https:\/\/innerwarden\.com[^"]*)"/g)]).toEqual([]);
     const installed = render(<CommunityAgents context={context({ ...META, active_defence_installed: true })} />, withIdentity());
     expect(installed).not.toContain("data-offer");
-    expect(installed).toContain('data-ad-state="installed"');
+    expect(installed).not.toContain("data-ad-state");
   });
 
   it("makes no offer when no instance is shown", () => {
@@ -241,6 +254,9 @@ describe("the Agents page with identity data", () => {
   it("lists what people decided, newest as the CLI sent it, refusals included", () => {
     seed(withIdentity());
     answers.set("history", readHistory({ ...historyFixture, agent_decisions: DECISION_LINES }));
+    // What people decided is evidence: the technical view's (spec 6.4).
+    expect(textOf(render(<CommunityAgents context={context()} />, withIdentity()))).not.toContain("dev approved Codex");
+    setTechnicalDetail(true);
     const text = textOf(render(<CommunityAgents context={context()} />, withIdentity()));
     expect(text).toContain("dev approved Codex, owner maria, profile Engineering.");
     expect(text).toContain("dev changed the Codex profile from General rules to Engineering. Applies to 1 confined instance.");
@@ -321,18 +337,16 @@ describe("user namespaces inside the jail, in the technical view", () => {
 });
 
 describe("the Overview with identity data", () => {
-  it("says how far the agents are backed in one sentence, and counts the ones waiting", () => {
+  it("counts the agents waiting for approval, and leaves how far each is backed to the Agents page", () => {
     const agents = withIdentity();
     seed(agents);
     const html = render(<CommunityOverview context={context()} />, agents);
     const text = textOf(html);
-    // The CLI's payload claims host_verified for one instance; a reading from
-    // inside the jail is shown at observed, so nothing here runs confined.
-    expect(text).toContain("3 agents on this Mac. 2 run in a jail nothing outside it has confirmed; 1 runs as you, and only its own word says what it is.");
-    expect(text).not.toContain("runs confined");
     expect(text).toContain("1 new agent waits for your approval.");
-    const waiting = html.slice(html.indexOf("data-agents-waiting") - 80);
-    expect(waiting.slice(0, 200)).toContain("data-needs-you");
+    expect(html).toContain("data-agents-waiting");
+    // How far each agent's word is backed is said per agent on Agents, never summed up here.
+    expect(text).not.toContain("runs confined");
+    expect(html).not.toContain("data-agent-trust");
   });
 
   it("adds nothing when the CLI sends no instance", () => {
@@ -350,7 +364,7 @@ describe("a case with identity", () => {
   }
   const html = (identity: Record<string, unknown>, recommendation: string, os: "macos" | "linux" = "macos", installed = false, more: Record<string, unknown> = {}) => {
     const detail = detailWith(identity, recommendation, more);
-    return render(<CaseDetail item={detail.item} before={[]} after={[]} os={os} installed={installed} onOpen={() => undefined} onSession={() => undefined} />);
+    return render(<DecisionDetail item={detail.item} before={[]} after={[]} os={os} installed={installed} onOpen={() => undefined} onSession={() => undefined} />);
   };
 
   // FAILS ON REVERT: word the "Decided by" line from the recorded layer
@@ -370,8 +384,8 @@ describe("a case with identity", () => {
     };
     const out = html(refused, "deny", "linux", true, { decided_by: "host" });
     const text = textOf(out);
-    expect(text).toContain("Refused by Active Defence on this host.");
-    expect(text).toContain("decided by Active Defence on this host");
+    expect(text).toContain("Refused by InnerWarden Pro on this host.");
+    expect(text).toContain("Deny, by InnerWarden Pro on this host");
     expect(text).not.toContain("Refused by your general rules.");
     expect(text).not.toContain("kept your general rules");
     expect(text).not.toContain("kernel_a_word_never_heard");
@@ -379,7 +393,7 @@ describe("a case with identity", () => {
     // The same record decided by the general rules keeps their words.
     const rules = textOf(html(refused, "deny", "linux", true, { decided_by: "rules" }));
     expect(rules).toContain("Refused by your general rules.");
-    expect(rules).not.toContain("Refused by Active Defence on this host.");
+    expect(rules).not.toContain("Refused by InnerWarden Pro on this host.");
   });
 
   it("names the instance and session, the trust and why, and the layer that decided", () => {
@@ -396,19 +410,19 @@ describe("a case with identity", () => {
   it("says why a relaxation did not apply in the words of the page it is on", () => {
     const withheld = { instance_id: ID_A, trust: "observed", trust_reason: "confined_by_namespace", deciding_layer: "general", profile: "claude-code", relaxation_withheld: true };
     expect(textOf(html(withheld, "review", "linux", false))).toContain(
-      "Per-agent relaxations apply on Linux with Active Defence, for an agent started with innerwarden contain --identity.",
+      "Per-agent relaxations apply on Linux with InnerWarden Pro, for an agent started with innerwarden contain --identity.",
     );
-    expect(textOf(html(withheld, "review", "linux", true))).toContain("Active Defence on this host did not decide this command, so your general rules decided.");
+    expect(textOf(html(withheld, "review", "linux", true))).toContain("InnerWarden Pro on this host did not decide this command, so your general rules decided.");
     const kept = { ...withheld, trust_source: "host", host_decision: "0f1e2d3c4b5a69788796a5b4c3d2e1f0", host_withheld: "a_word_never_heard" };
     const text = textOf(html(kept, "review", "linux", true));
-    expect(text).toContain("Active Defence on this host kept your general rules for this command.");
+    expect(text).toContain("InnerWarden Pro on this host kept your general rules for this command.");
     expect(text).not.toContain("a_word_never_heard");
     // The technical view names who read the trust and who decided the rules,
     // and still never the host's word: the one sentence is all it says.
     setTechnicalDetail(true);
     const technical = textOf(html(kept, "review", "linux", true));
     expect(technical).toContain("Trust read by: the hook inside the jail (confined_by_namespace).");
-    expect(technical).toContain("Rules decided by: Active Defence on this host (decision 0f1e2d3c4b5a69788796a5b4c3d2e1f0).");
+    expect(technical).toContain("Rules decided by: InnerWarden Pro on this host (decision 0f1e2d3c4b5a69788796a5b4c3d2e1f0).");
     expect(technical).not.toContain("Trust decided by");
     expect(technical).not.toContain("a_word_never_heard");
     expect(technical).not.toContain("Host word");
@@ -430,11 +444,11 @@ describe("a case with identity", () => {
     };
     const out = html(decided, "allow", "linux", true);
     const text = textOf(out);
-    expect(text).toContain("decided by Active Defence on this host.");
+    expect(text).toContain("decided by InnerWarden Pro on this host.");
     expect(out).not.toContain("data-identity-conflict");
     expect(text).toContain("Observed");
     expect(text).not.toContain("Confined");
-    expect(out).toContain('title="Read from inside the jail; Active Defence on this host decided its rules."');
+    expect(out).toContain('title="Read from inside the jail; InnerWarden Pro on this host decided its rules."');
     // A host label without the host's decision is not taken as one.
     const bare = { ...decided, host_decision: undefined };
     expect(html(bare, "allow", "linux", true)).toContain("data-identity-conflict");

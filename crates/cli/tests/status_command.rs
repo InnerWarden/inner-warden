@@ -26,6 +26,18 @@ fn cli(home: &Path) -> Command {
         // force on every platform this binary ships to.
         .env("USERPROFILE", home)
         .env("IW_GRAPH_FILE", home.join("graph.json"));
+    // Run as the person, not from inside an AI agent's shell: the suite may
+    // itself run under one, whose markers the CLI reads.
+    for marker in [
+        "CLAUDECODE",
+        "CLAUDE_CODE_ENTRYPOINT",
+        "CODEX_SANDBOX",
+        "CODEX_SANDBOX_NETWORK_DISABLED",
+        "GEMINI_CLI",
+        "OPENCLAW_SHELL",
+    ] {
+        command.env_remove(marker);
+    }
     command
 }
 

@@ -1,0 +1,8 @@
+{
+  "recording": false,
+  "code": "graph_write_failed",
+  "since_unix": 1790686800,
+  "seconds": 3900,
+  "lost_actions": 37,
+  "summary": "InnerWarden has not recorded for 65 minutes (37 action(s) lost, graph_write_failed). Screening still ran; only the local record is affected. Run `innerwarden graph --stats` after the next command to confirm recovery."
+}

@@ -1,12 +1,12 @@
 import { expect } from "@playwright/test";
 import { test } from "./clock";
-import { expectHonestUpsell, FIXTURE_NOW_MS, fulfillJson, guardRoute, META } from "./support";
+import { EDITION_LINES, expectHonestUpsell, FIXTURE_NOW_MS, fulfillJson, guardRoute, META } from "./support";
 
 /**
- * Where Community says what Active Defence adds: the card for attacks on this
- * machine, which Community does not watch. One offer per page, one link out,
- * and on a host that already runs Active Defence, a line saying it is
- * installed and nothing about what it does there.
+ * Where Community says what Active Defence adds: the Protection page, which
+ * lists what Community covers on this machine. The Overview makes no offer.
+ * One offer per page, one link out, and on a host that already runs Active
+ * Defence, a line saying it is installed and nothing about what it does there.
  *
  * THE DEFECT this began with. The card rendered unconditionally for the
  * Community edition. On a host with the whole paid stack running, the
@@ -15,31 +15,39 @@ import { expectHonestUpsell, FIXTURE_NOW_MS, fulfillJson, guardRoute, META } fro
  * protected", on a host that was.
  */
 
-test.describe("CJC-J006 the Active Defence card reads the host", () => {
+test.describe("CJC-J006 the InnerWarden Pro card reads the host", () => {
   test("stops offering the product on a host that already runs it", async ({ page }) => {
     await page.route(guardRoute("meta"), (route) => fulfillJson(route, { ...META, active_defence_installed: true }));
-    await page.goto("/");
-    const installed = page.locator('[data-lane="server_attacks"] [data-ad-state="installed"]');
+    await page.goto("/?view=posture");
+    const installed = page.locator('[data-tour="upgrade"] [data-ad-state="installed"]');
     await expect(installed).toBeVisible();
     await expect(page.locator('[data-ad-state="offer"]')).toHaveCount(0);
     await expect(page.locator('a[href^="https://innerwarden.com"]')).toHaveCount(0);
     // It says where the answer it cannot give actually lives.
     await expect(installed.locator("[data-command]")).toHaveText("innerwarden get status");
+    await expect(installed).toContainText(EDITION_LINES.installed);
+    await expectHonestUpsell(page);
   });
 
   test("still offers it on a host that does not, once, in the card Community does not cover", async ({ page }) => {
     // The other half. Deleting the card outright would pass the test above, and
     // would take the product's only mention of host protection with it.
     await page.route(guardRoute("meta"), (route) => fulfillJson(route, META));
+    // The Overview makes none: its band and its step are the reader's own.
     await page.goto("/");
-    const offer = page.locator('[data-lane="server_attacks"] [data-ad-state="offer"]');
+    await expect(page.locator("#verdict-title")).toBeVisible();
+    await expect(page.locator("[data-ad-state]")).toHaveCount(0);
+    await expect(page.locator('a[href^="https://innerwarden.com"]')).toHaveCount(0);
+    await page.goto("/?view=posture");
+    const offer = page.locator('[data-tour="upgrade"] [data-ad-state="offer"]');
     await expect(offer).toBeVisible();
-    // It leads with this machine's own count, then the one capability about the agent.
-    await expect(offer).toContainText("flagged commands ran here since 25 Sept 2026: Community relies on your agent asking first.");
-    await expect(offer).toContainText("the kernel Execution Gate, and watches the server itself with the host sensor, an SSH decoy and automatic response");
-    // This fixture host is not Linux: the offer does not pretend it can run here.
-    await expect(offer).toContainText("On a Linux server, Active Defence adds");
+    // The one generic line, never that it would have stopped anything here:
+    // one link to the editions page, with no query string, and Not now.
+    await expect(offer.locator("p").first()).toHaveText(EDITION_LINES.generic);
     await expect(offer).not.toContainText("would have");
+    const link = offer.getByRole("link", { name: /Compare the editions/ });
+    await expect(link).toHaveAttribute("href", "https://innerwarden.com/docs/editions-and-guarantees");
+    await expect(offer.getByRole("button", { name: "Not now: hide this offer" })).toBeVisible();
     await expect(page.locator('[data-ad-state="offer"]')).toHaveCount(1);
     await expectHonestUpsell(page);
   });
@@ -49,7 +57,7 @@ test.describe("CJC-J006 the Active Defence card reads the host", () => {
     // a kernel guard is ARMED is not a thing it can see, and a security product
     // that overstates its own coverage is worse than one that says too little.
     await page.route(guardRoute("meta"), (route) => fulfillJson(route, { ...META, active_defence_installed: true }));
-    await page.goto("/");
+    await page.goto("/?view=posture");
     const card = page.locator('[data-ad-state="installed"]');
     await expect(card).toBeVisible();
     const text = ((await card.textContent()) ?? "").toLowerCase();
@@ -65,7 +73,7 @@ test.describe("CJC-J006 the Active Defence card reads the host", () => {
     // the same bytes. Reading absence as installed would silence the card on
     // every host running an older binary.
     await page.route(guardRoute("meta"), (route) => fulfillJson(route, META));
-    await page.goto("/");
+    await page.goto("/?view=posture");
     await expect(page.locator('[data-ad-state="offer"]')).toBeVisible();
   });
 

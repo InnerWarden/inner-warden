@@ -1049,6 +1049,18 @@ pub fn judge_iwguard_hooks(
         .cloned()
 }
 
+/// PURE: the `(block_review, monitor)` flags of the mode these hooks already
+/// have (the strongest, as [`install_mode_flag`] keeps it), `None` where no
+/// hook of ours screens Bash. A rewrite that asked for no mode keeps this one,
+/// so it never lowers an enforcing hook to monitor.
+pub fn kept_hook_flags(settings: &Value) -> Option<(bool, bool)> {
+    strongest_effective_iwguard_hook_mode(settings).map(|mode| match mode {
+        HookProtection::Monitor => (false, true),
+        HookProtection::Enforce => (false, false),
+        HookProtection::BlockReview => (true, false),
+    })
+}
+
 /// PURE: the `install` flag that rewrites these hooks in the mode they already
 /// have, so the remedy for a broken hook never changes what it does. Mixed
 /// wiring keeps its strongest half, as automatic repair does.
@@ -2062,8 +2074,8 @@ mod tests {
             "must name the automatic mechanism that covers it: {err}"
         );
         assert!(
-            err.contains("relays"),
-            "and must explain why a hook is not the mechanism: {err}"
+            err.contains("plugin") && err.contains("its own tools"),
+            "and must say what screens its own tools: {err}"
         );
     }
 
@@ -2674,5 +2686,31 @@ mod automatic_write_tests {
             Ok(_) => panic!("an unrecognisable command must not be written"),
         }
         assert_eq!(std::fs::read(&settings).unwrap(), before);
+    }
+
+    /// Live gate of Active Defence 0.17.4, G2: the flags of the mode the
+    /// hooks already have, so a rewrite that asked for none keeps it; `None`
+    /// where no hook of ours screens Bash. FAILS ON REVERT of any arm.
+    #[test]
+    fn the_kept_flags_are_the_mode_the_hook_already_has() {
+        let with = |command: &str| {
+            json!({ "hooks": { "PreToolUse": [ { "matcher": "Bash", "hooks": [
+                { "type": "command", "command": command }
+            ] } ] } })
+        };
+        assert_eq!(
+            kept_hook_flags(&with("innerwarden hook --agent claude-code")),
+            Some((false, false))
+        );
+        assert_eq!(
+            kept_hook_flags(&with("innerwarden hook --monitor --agent claude-code")),
+            Some((false, true))
+        );
+        assert_eq!(
+            kept_hook_flags(&with("innerwarden hook --block-review --agent claude-code")),
+            Some((true, false))
+        );
+        assert_eq!(kept_hook_flags(&json!({})), None);
+        assert_eq!(kept_hook_flags(&with("their-own-audit.sh")), None);
     }
 }

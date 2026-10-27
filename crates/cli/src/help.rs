@@ -229,7 +229,7 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
              With --identity the hook inside the jail tells this instance apart from\n  \
              the agent's other runs. Read from inside the jail, the instance is at most\n  \
              `observed`: confined needs a witness outside the jail. On Linux, where\n  \
-             Active Defence runs on the same host, the hook asks it about a shell\n  \
+             InnerWarden Pro runs on the same host, the hook asks it about a shell\n  \
              command sent to review and the host decides whether a profile rule that\n  \
              relaxes your general rules applies; the stricter verdict wins. Without it\n  \
              the relaxation is recorded and not applied. MCP tools and file edits keep\n  \
@@ -241,7 +241,7 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
              \n  \
              A profile of schema 2, in either file, can say when its jail starts and\n  \
              what of the home it hides. start = \"only_when_admitted\": the agent\n  \
-             starts only once Active Defence on the host admitted the jail; otherwise\n  \
+             starts only once InnerWarden Pro on the host admitted the jail; otherwise\n  \
              contain says what to check and exits 2, having started nothing (a launcher\n  \
              stopped while it waits starts nothing either). hide_home: home paths the\n  \
              jail covers with an empty mount, or denies on macOS; a path that leads\n  \
@@ -384,6 +384,7 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
              --clear   delete the local record"
         ),
         "observe" => crate::observe_io::help_text(),
+        "openclaw" => crate::openclaw_guard_io::help_text(),
         "llm" => format!(
             "{p} llm [status]\n\
              {p} llm set --url <chat-completions-URL> --model <name> [--provider azure]\n\
@@ -398,8 +399,8 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
         ),
         "host" => format!(
             "{p} host <command> [args...]\n  \
-             Run a command in the Active Defence host layer, even when this binary has\n  \
-             a verb by the same name. Without Active Defence installed it says so\n  \
+             Run a command in the InnerWarden Pro host layer, even when this binary has\n  \
+             a verb by the same name. Without InnerWarden Pro installed it says so\n  \
              rather than guessing."
         ),
         _ => return None,
@@ -564,7 +565,7 @@ mod tests {
         for said in [
             "A review the hook would block on its line is still asked about, because the host may relax it",
             "your suppressions included, is made stricter only by a refusal of the host's own",
-            "and so does an older Active Defence on the host, which reads the same file",
+            "and so does an older InnerWarden Pro on the host, which reads the same file",
         ] {
             assert!(readme.contains(said), "README lacks {said:?}");
         }
@@ -583,7 +584,7 @@ mod tests {
         let flat = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
         let help = flat(&usage("contain", &[]).expect("contain has usage"));
         for said in [
-            "start = \"only_when_admitted\": the agent starts only once Active Defence on the host admitted the jail",
+            "start = \"only_when_admitted\": the agent starts only once InnerWarden Pro on the host admitted the jail",
             "contain says what to check and exits 2, having started nothing",
             "hide_home: home paths the jail covers with an empty mount, or denies on macOS",
             "is printed as `innerwarden contain: <note>`",
@@ -601,7 +602,7 @@ mod tests {
             .join("\n"),
         );
         for said in [
-            "`start = \"only_when_admitted\"`: `contain --identity` starts the agent only once Active Defence on the host has admitted the jail",
+            "`start = \"only_when_admitted\"`: `contain --identity` starts the agent only once InnerWarden Pro on the host has admitted the jail",
             "and exits 2 with nothing started",
             "`hide_home = [\".cache/git/credential\"]`: home paths the jail covers",
             "it prints it as `innerwarden contain: <note>`",
@@ -1018,6 +1019,67 @@ mod tests {
         }
     }
 
+    /// The commands the dashboard prints with no per-agent argument
+    /// (`FIXED_COMMANDS` in the Community pages' `words.ts`), read out of the
+    /// list one quoted command per line.
+    fn dashboard_fixed_commands() -> Vec<String> {
+        let words = include_str!("../../dashboard-kit/web/src/community/words.ts");
+        let start = words
+            .find("export const FIXED_COMMANDS = [")
+            .expect("words.ts names FIXED_COMMANDS");
+        let body = &words[start..];
+        let end = body.find("] as const;").expect("FIXED_COMMANDS ends");
+        body[..end]
+            .lines()
+            .skip(1)
+            .filter_map(|line| {
+                let line = line.trim().trim_end_matches(',');
+                line.strip_prefix('"')
+                    .and_then(|rest| rest.strip_suffix('"'))
+                    .map(str::to_string)
+            })
+            .collect()
+    }
+
+    /// Every fixed command a dashboard page tells a person to type is one this
+    /// binary answers: its verb is dispatched natively, and every subcommand
+    /// and flag it carries is in that verb's own usage. A `<placeholder>` and
+    /// the `--` before a wrapped command are the person's to fill in.
+    ///
+    /// FAILS ON REVERT: a misspelt verb or flag in `words.ts`
+    /// (`innerwarden enforce --all`, `innerwarden agent connect`) has no usage
+    /// that holds it.
+    #[test]
+    fn dashboard_fixed_commands_are_real_cli_verbs() {
+        let commands = dashboard_fixed_commands();
+        assert!(
+            commands.len() >= 10,
+            "the list was read, not skipped: {commands:?}"
+        );
+        for command in &commands {
+            let mut words = command.split_whitespace();
+            assert_eq!(words.next(), Some("innerwarden"), "{command}");
+            let verb = words.next().unwrap_or_else(|| panic!("{command}: no verb"));
+            assert!(
+                NATIVE_VERBS.contains(&verb),
+                "{command}: `{verb}` is not a verb this binary dispatches"
+            );
+            let rest: Vec<String> = words.clone().map(str::to_string).collect();
+            let text = usage(verb, &rest)
+                .unwrap_or_else(|| panic!("{command}: `{verb}` has no usage of its own"));
+            for word in words {
+                if word == "--" || (word.starts_with('<') && word.ends_with('>')) {
+                    continue;
+                }
+                assert!(
+                    text.split(|c: char| c.is_whitespace() || "[]|".contains(c))
+                        .any(|token| token == word),
+                    "{command}: `{word}` is not in the usage of `{verb}`:\n{text}"
+                );
+            }
+        }
+    }
+
     /// Every verb `main` dispatches natively. Kept beside the usage table so the
     /// synopsis rule above is checked against all of them.
     const NATIVE_VERBS: &[&str] = &[
@@ -1042,6 +1104,7 @@ mod tests {
         "mute",
         "notify",
         "observe",
+        "openclaw",
         "graph",
         "llm",
         "host",

@@ -125,6 +125,22 @@ pub(crate) fn current() -> SuppressConfig {
     load()
 }
 
+/// [`current`], and the allow patterns the file holds that the load ignores
+/// because they match every command, so the dashboard can say they do
+/// nothing. Read from the same file, once.
+pub(crate) fn current_with_ignored() -> (SuppressConfig, Vec<String>) {
+    let Some(text) = config_path().and_then(|p| std::fs::read_to_string(p).ok()) else {
+        return (SuppressConfig::default(), Vec::new());
+    };
+    let ignored = toml::from_str::<SuppressConfig>(&text)
+        .unwrap_or_default()
+        .allow
+        .into_iter()
+        .filter(|pattern| is_universal_pattern(pattern))
+        .collect();
+    (SuppressConfig::load(&text).0, ignored)
+}
+
 /// Apply user suppression to a rules verdict (best-effort). Returns an overriding
 /// verdict when the command is allowed/muted, else `None`.
 ///
@@ -143,13 +159,16 @@ pub fn consider_reporting(command: &str, verdict: &Value) -> Option<Value> {
 
 /// Environment variables an AI coding agent sets in the shell it runs
 /// commands in. Any of them set (non-empty) means the caller is, or was
-/// started by, such an agent.
-const AGENT_SHELL_MARKERS: &[&str] = &[
+/// started by, such an agent. OpenClaw sets `OPENCLAW_SHELL=exec` in every
+/// command its `exec` tool runs, a PTY and a sandbox included (OpenClaw
+/// 2026.9.7, `docs/tools/exec.md`).
+pub(crate) const AGENT_SHELL_MARKERS: &[&str] = &[
     "CLAUDECODE",
     "CLAUDE_CODE_ENTRYPOINT",
     "CODEX_SANDBOX",
     "CODEX_SANDBOX_NETWORK_DISABLED",
     "GEMINI_CLI",
+    "OPENCLAW_SHELL",
 ];
 
 /// Whether this process runs in an AI agent's shell, by its markers.

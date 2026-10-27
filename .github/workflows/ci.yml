@@ -166,6 +166,17 @@ jobs:
           IW_REQUIRE_SECCOMP: "1"
         run: cargo test --workspace
 
+      # The guard-lowering corpus, driven through the REAL hook binary, not only
+      # through analyze_command as the unit test does. Every release from Active
+      # Defence 0.17.4 to 0.17.8 was cut by a spelling of this class found by
+      # hand on a VM; this runs the same corpus Active Defence's host gate runs,
+      # against the freshly built hook, on every push.
+      - name: Guard-lowering corpus through the hook
+        if: runner.os == 'Linux'
+        run: |
+          cargo build --bin innerwarden
+          bash scripts/check-guard-lowering.sh target/debug/innerwarden
+
       # Windows used to run fmt + clippy only, on the reasoning that the platform
       # is experimental and its file-write integration has rough edges (audit
       # TEST-06). But the project SIGNS AND PUBLISHES Windows binaries, so
@@ -375,6 +386,13 @@ jobs:
       - name: Committed bundle must match its sources
         run: npm run bundle:check
 
+      # A composing build leaves the Community pages out of its stylesheet and
+      # has little CSS room: a utility a shared file starts to use is paid for
+      # there. This fails when the stylesheet the shared files produce changes
+      # from the committed baseline.
+      - name: Shared stylesheet must not grow
+        run: npm run css:shared
+
       - name: Bundle must not be built out of its own output
         run: npm run bundle:reproducible
 
@@ -384,13 +402,15 @@ jobs:
       # as "executable evidence" that the journey passes, so an entirely broken
       # journey satisfied the contract as long as the file parsed as a test.
       #
-      # Only the Community specs run. The enterprise ones belong to the paid
-      # bundle and are not built here.
+      # The Community specs run, and the one enterprise spec that tests the
+      # kit's own shell wiring (the licence notice) against the kit's bundle.
+      # The other enterprise specs belong to the paid bundle and are not
+      # built here.
       - name: Install Playwright browsers
         run: npx playwright install --with-deps chromium
 
       - name: Browser journeys
-        run: npx playwright test tests/community
+        run: npx playwright test tests/community tests/enterprise/plan-notice.spec.ts
 
   # Audit SUP-02 / CI-07: the repo had no supply-chain gate. This is it. It runs
   # on every push, so an advisory or an incompatible licence fails a PR instead

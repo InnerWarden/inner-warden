@@ -389,6 +389,18 @@ pub const INSTANCE_DECIDE_VERSION: u32 = 1;
 ///   then does not start, with no reason given.
 pub const INSTANCE_DECIDE_EVERY_COMMAND_VERSION: u32 = 2;
 
+/// The version of a REPORT, not a question: the hook refused a shell command
+/// of the instance itself (a general deny, a hard rule, a profile's refusal)
+/// and tells the host so, for the session's case (spec 104 acceptance 2, live
+/// gate v0.17.4 G5: the refusals made inside a jail never reached the host).
+/// `hook_verdict` is always [`Verdict::Deny`] and `hook_layer` the layer that
+/// refused. The hook sends it only for a command it refuses (outside
+/// monitor), after it has decided, and reads nothing from the reply: a
+/// refusal of the hook's stays the hook's, and the host records it and
+/// decides nothing. A host that does not know this version refuses the body,
+/// and nothing changes.
+pub const INSTANCE_DECIDE_REFUSAL_VERSION: u32 = 3;
+
 /// The start of every word ([`is_withheld_word`]) the host answers a `deny`
 /// with when the refusal is its own: it will not start a program in the
 /// command, whatever the hook's rules say. See
@@ -526,6 +538,9 @@ where
 ///
 /// Under a profile that asks about every command the same body goes with
 /// `"v":2`, and `hook_verdict` is the general verdict, `allow` or `review`.
+/// A refusal of the hook's own is reported with `"v":3`
+/// ([`INSTANCE_DECIDE_REFUSAL_VERSION`]), `hook_verdict` `deny` and the
+/// layer that refused.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InstanceDecideRequest {
@@ -551,23 +566,30 @@ pub struct InstanceDecideRequest {
     /// The general verdict the hook asks about: always [`Verdict::Review`] in
     /// a request of [`INSTANCE_DECIDE_VERSION`]; [`Verdict::Allow`] or
     /// [`Verdict::Review`] in one of [`INSTANCE_DECIDE_EVERY_COMMAND_VERSION`].
-    /// Never [`Verdict::Deny`]: a refusal of the hook's stays the hook's.
+    /// [`Verdict::Deny`] only in a report of
+    /// [`INSTANCE_DECIDE_REFUSAL_VERSION`]: never asked about, a refusal of
+    /// the hook's stays the hook's.
     pub hook_verdict: Verdict,
-    /// Always [`RuleLayer::General`].
+    /// [`RuleLayer::General`] in a question; the layer that refused in a
+    /// report of [`INSTANCE_DECIDE_REFUSAL_VERSION`].
     pub hook_layer: RuleLayer,
 }
 
 impl InstanceDecideRequest {
     /// Whether every field holds what the contract lets it hold.
     pub fn is_valid(&self) -> bool {
-        let asked = match self.v {
-            INSTANCE_DECIDE_VERSION => self.hook_verdict == Verdict::Review,
+        let shape = match self.v {
+            INSTANCE_DECIDE_VERSION => {
+                self.hook_verdict == Verdict::Review && self.hook_layer == RuleLayer::General
+            }
             INSTANCE_DECIDE_EVERY_COMMAND_VERSION => {
                 matches!(self.hook_verdict, Verdict::Allow | Verdict::Review)
+                    && self.hook_layer == RuleLayer::General
             }
+            INSTANCE_DECIDE_REFUSAL_VERSION => self.hook_verdict == Verdict::Deny,
             _ => false,
         };
-        asked
+        shape
             && is_instance_id(&self.instance_id)
             && self
                 .claimed_agent_type
@@ -578,7 +600,13 @@ impl InstanceDecideRequest {
             && self.hook_signals.len() <= MAX_HOOK_SIGNALS
             && self.hook_signals.iter().all(|s| is_hook_signal(s))
             && self.hook_signals.windows(2).all(|pair| pair[0] < pair[1])
-            && self.hook_layer == RuleLayer::General
+    }
+
+    /// Whether this body reports a refusal of the hook's own
+    /// ([`INSTANCE_DECIDE_REFUSAL_VERSION`]): the host records it and decides
+    /// nothing.
+    pub fn is_refusal_report(&self) -> bool {
+        self.v == INSTANCE_DECIDE_REFUSAL_VERSION
     }
 
     /// PURE. Whether the host may let a program of this command start on
@@ -693,6 +721,36 @@ pub fn instance_decide_request_v2(
             tainted,
         },
     )
+}
+
+/// The report of a shell command the hook refused itself, by `layer`
+/// ([`INSTANCE_DECIDE_REFUSAL_VERSION`]). `None` without an instance id of
+/// the contract's shape, or with an empty command.
+pub fn instance_decide_refusal(
+    instance_id: &str,
+    claimed_agent_type: Option<&str>,
+    session_id: Option<&str>,
+    command: &str,
+    charged: &[&str],
+    tainted: bool,
+    layer: RuleLayer,
+) -> Option<InstanceDecideRequest> {
+    build_instance_decide_request(
+        INSTANCE_DECIDE_REFUSAL_VERSION,
+        Verdict::Deny,
+        RequestFacts {
+            instance_id,
+            claimed_agent_type,
+            session_id,
+            command,
+            charged,
+            tainted,
+        },
+    )
+    .map(|request| InstanceDecideRequest {
+        hook_layer: layer,
+        ..request
+    })
 }
 
 /// What a request says about the command, whatever its version.
@@ -2906,6 +2964,64 @@ mod tests {
         layer["hook_layer"] = json!("agent_type");
         let read: InstanceDecideRequest = serde_json::from_value(layer).unwrap();
         assert!(!read.is_valid());
+    }
+
+    /// Live gate v0.17.4 G5: a refusal of the hook's own is REPORTED with
+    /// version 3, `deny` and the layer that refused, and only so: a deny is
+    /// never a question of version 1 or 2, and a report never says another
+    /// verdict. The host decides nothing from it.
+    ///
+    /// FAILS ON REVERT: without version 3 no report reads as the
+    /// contract's, so the refusals made in a jail never reach the host.
+    #[test]
+    fn a_refusal_of_the_hooks_own_is_reported_with_version_3() {
+        for (layer, word) in [
+            (RuleLayer::General, "general"),
+            (RuleLayer::Hard, "hard"),
+            (RuleLayer::AgentType, "agent_type"),
+        ] {
+            let report = instance_decide_refusal(
+                OWN,
+                Some("claude-code"),
+                Some("s-1"),
+                "rm -rf ~/.ssh",
+                &["destructive_command"],
+                false,
+                layer,
+            )
+            .unwrap();
+            assert!(report.is_valid(), "{word}");
+            assert!(report.is_refusal_report());
+            assert_eq!(
+                serde_json::to_value(&report).unwrap(),
+                json!({
+                    "v": 3,
+                    "instance_id": OWN,
+                    "claimed_agent_type": "claude-code",
+                    "session_id": "s-1",
+                    "command": "rm -rf ~/.ssh",
+                    "hook_signals": ["destructive_command"],
+                    "tainted": false,
+                    "hook_verdict": "deny",
+                    "hook_layer": word,
+                })
+            );
+        }
+        let mut allow = serde_json::to_value(
+            instance_decide_refusal(OWN, None, None, "ls", &[], false, RuleLayer::General).unwrap(),
+        )
+        .unwrap();
+        allow["hook_verdict"] = json!("allow");
+        let read: InstanceDecideRequest = serde_json::from_value(allow).unwrap();
+        assert!(!read.is_valid(), "a report says only a refusal");
+        assert!(!instance_decide_request(OWN, None, None, "ls", &[], false)
+            .unwrap()
+            .is_refusal_report());
+        assert_eq!(
+            instance_decide_refusal("../x", None, None, "ls", &[], false, RuleLayer::Hard),
+            None
+        );
+        assert_eq!(INSTANCE_DECIDE_REFUSAL_VERSION, 3);
     }
 
     fn answer() -> Value {

@@ -1,0 +1,76 @@
+{
+  "generated_at_ms": 1790690700000,
+  "items": [
+    {
+      "agent": "Claude Code",
+      "agent_id": "claude-code",
+      "by_outcome": {
+        "allowed": 51,
+        "flagged_ran": 10,
+        "would_have_refused": 6
+      },
+      "channel": "hook",
+      "decisions": 67,
+      "first_at": "2026-09-25T22:26:00Z",
+      "flagged": 16,
+      "id": "4b1d9c2e-demo-4000-8000-000000000001",
+      "last_at": "2026-09-29T14:03:00Z",
+      "project": "my-app"
+    },
+    {
+      "agent": "Claude Code",
+      "agent_id": "claude-code",
+      "by_outcome": {
+        "allowed": 14,
+        "flagged_ran": 9,
+        "refused_before_run": 2
+      },
+      "channel": "hook",
+      "decisions": 25,
+      "first_at": "2026-09-25T17:34:00Z",
+      "flagged": 11,
+      "id": "7e0a55f1-demo-4000-8000-000000000002",
+      "last_at": "2026-09-29T13:35:00Z",
+      "project": "infra"
+    },
+    {
+      "agent": "Cursor",
+      "agent_id": "cursor",
+      "by_outcome": {
+        "flagged_ran": 1,
+        "refused_before_run": 1,
+        "unsafe_may_have_run": 1
+      },
+      "channel": "mcp",
+      "decisions": 3,
+      "first_at": "2026-09-29T02:05:00Z",
+      "flagged": 3,
+      "id": "mcp:cursor",
+      "last_at": "2026-09-29T12:05:00Z",
+      "project": null
+    },
+    {
+      "agent": null,
+      "agent_id": null,
+      "by_outcome": {
+        "checked_only": 1
+      },
+      "channel": "check",
+      "decisions": 1,
+      "first_at": "2026-09-29T07:05:00Z",
+      "flagged": 0,
+      "id": "local",
+      "last_at": "2026-09-29T07:05:00Z",
+      "project": null
+    }
+  ],
+  "record": {
+    "capped": false,
+    "checked": 1,
+    "decisions": 96,
+    "flagged": 30,
+    "newest_at": "2026-09-29T14:03:00Z",
+    "oldest_at": "2026-09-25T17:34:00Z"
+  },
+  "schema_version": 1
+}

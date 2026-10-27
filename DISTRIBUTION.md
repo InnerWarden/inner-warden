@@ -235,11 +235,15 @@ reproducible and a rollback possible:
 
 ```sh
 # install an exact cut
-IW_GUARD_TAG=guard-v1.3.7 curl -fsSL https://innerwarden.com/free | sh
+curl -fsSL https://innerwarden.com/free | IW_GUARD_TAG=guard-v1.6.10 sh
 
 # roll a host back to the last known-good one
-IW_GUARD_TAG=guard-v1.3.6 curl -fsSL https://innerwarden.com/free | sh
+curl -fsSL https://innerwarden.com/free | IW_GUARD_TAG=guard-v1.6.9 sh
 ```
+
+The variable goes on the `sh` side of the pipe: the installer reads it
+(`RELEASE_TAG="${IW_GUARD_TAG:-iw-guard}"`). Written before `curl`, it reaches
+only `curl`, and the installer silently installs the newest build.
 
 Rolling back the DEFAULT install (what `https://innerwarden.com/free` serves
 with no variable set) means re-running `release-guard.yml` from the older

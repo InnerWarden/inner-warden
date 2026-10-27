@@ -3,6 +3,190 @@
 All notable changes to InnerWarden are documented here. This project
 follows semantic versioning.
 
+## 1.6.11 - 2026-10-24
+
+### Added
+
+- **OpenClaw's own tools are screened before they run.** Until now only the
+  MCP servers `agents connect openclaw` wraps went through the guard:
+  OpenClaw's own `exec`, `process`, `write`, `edit` and `apply_patch` never
+  reached it. `innerwarden agents connect openclaw` now also installs the
+  `innerwarden-guard` plugin on OpenClaw's `before_tool_call` hook (OpenClaw
+  2026.9.7), which asks `innerwarden openclaw screen` about each call: the
+  screening the Claude Code hook uses (the general rules, your allow and mute
+  rules, the per-agent profiles, the privileged-file rule for what a file tool
+  writes) and, where InnerWarden Pro is installed, Pro's `check-command` too.
+  Monitor (the default) records only. After `innerwarden enforce` a deny is
+  refused, and the model is told only "Refused by InnerWarden."; a review asks
+  you to allow it once or deny it, and nobody answering in time is a refusal.
+  The record credits each refusal to the chat it belonged to (the session
+  key). The plugin answers first and last among OpenClaw's plugins, so the
+  call that runs is the copy that was screened, not a rewrite another plugin
+  made in between.
+- On a host with InnerWarden Pro, the approval card, `innerwarden agents list`
+  and the dashboard's OpenClaw card say what Pro holds there (the Execution
+  Gate for this agent, the DNS Guard, the licence), as Pro reads it. A
+  conversation attempt is recorded as `kernel_denied` only where Pro's
+  Execution Gate, in enforce for that agent, refused a program during a call
+  of that chat, as Pro recorded it.
+- A one line suggestion about InnerWarden Pro, to the owner only (the Control
+  UI approval card, `agents list`, the dashboard), on a measured fact: a
+  program this agent tried to run was refused or held for review, or monitor
+  let through a call enforce would have stopped. At most once a week unasked,
+  never in a reply to a chat, never on macOS or Windows; on a host with Pro
+  it names the next step for the gate instead.
+
+### Security
+
+- **The CLI's short names are its name to the guard everywhere.** The hook
+  refused `innerwarden dry-run` in a command string, built from quoted pieces
+  or behind a variable, but not the same with the installer's `iw` or
+  `iw-guard`: `env -S 'iw dry-run'`, `flock -c 'iw dry-run'`, `busybox sh -c
+  'iw dry-run'`, `'i'w dry-run` and `I=iw; $I dry-run` passed. The guard now
+  reads every name of the CLI in command strings, with the line's quotes and
+  the variables it sets resolved as the shell resolves them.
+- An agent can no longer take off the OpenClaw guard: a file tool may not
+  write into `~/.openclaw/extensions` or `~/.openclaw/hooks`, and the hook
+  refuses removing them, `openclaw plugins disable|uninstall` of InnerWarden's
+  plugin or hook, adding or enabling an OpenClaw plugin, `openclaw config set`
+  of the plugin or MCP wiring, and `sed -i` on `openclaw.json`.
+- Active Defence's own guard-lowering verbs are refused like the free CLI's:
+  `innerwarden-ctl agent disconnect`, `agent install-hook --remove` and
+  `--monitor`, and `innerwarden-ctl uninstall`.
+- OpenClaw's exec shell is recognised as an AI agent's shell
+  (`OPENCLAW_SHELL`), so `agents disconnect`, `connect --monitor`, `install
+  --monitor`, `contain`, `dry-run`, `monitor` and `uninstall` refuse there as
+  they do in Claude Code's, Codex's and Gemini CLI's.
+- Stated limit: a plugin that freezes a rewrite of its own under an approval
+  of its own, before the guard answers, decides what runs; the guard records
+  that the call ran other than as screened, after it ran.
+
+## 1.6.10 - 2026-10-24
+
+### Security
+
+- **A wrapper in front of the CLI no longer hides it from the guard.** A
+  program the guard did not unwrap (`flock`, `taskset`, `systemd-run --user`,
+  `prlimit`, `unshare`, `cpulimit`, `watch`) in front of `iw` let `uninstall`,
+  `dry-run` or `agents disconnect` through the enforcing hook, and
+  `systemd-run --user` or `env -u` then ran it without the agent's shell
+  markers, so the CLI did not refuse it either. Behind any program the guard
+  does not know, the CLI named with a verb that lowers the guard is now read
+  as run (a program that only reads or prints text keeps it as text).
+
+### Fixed
+
+- The hook no longer refuses `innerwarden uninstall --dry-run`, `--help` and
+  `-h`, which remove nothing, and reads them as `uninstall`'s own only before
+  `--`.
+- Stated limit, widened: a Bash command that only writes a guard verb into a
+  file (`echo ... > x.sh`, `printf`, a heredoc) is not screened as running it,
+  like a Write or Edit tool call; the CLI refuses the verb when the agent's
+  shell runs the file with its markers.
+
+## 1.6.9 - 2026-10-24
+
+### Security
+
+- **An agent can no longer take its guard off with `uninstall`, or lower it
+  from a script.** Under an enforcing hook, the hook refused only the literal
+  text `innerwarden uninstall`: `iw uninstall claude-code`, a quoted verb or
+  two spaces took the hook off. And `innerwarden dry-run`, `monitor` and
+  `uninstall` had no refusal of their own in the CLI, so a script the agent
+  wrote and ran lowered or removed the hook. The hook now reads `uninstall`
+  as the person's whatever its spelling (its own `--dry-run` and help stay
+  open), and the CLI refuses `uninstall`, `dry-run` and `monitor` inside an AI
+  agent's shell, a script it runs included.
+- Stated limit: the CLI's refusal reads the agent's shell markers, which a
+  script can unset, and the content of a file the agent writes with a Write
+  or Edit tool call is not screened for these verbs.
+
+## 1.6.8 - 2026-10-24
+
+### Security
+
+- **Two more ways an agent could lower its own guard are closed.** Under an
+  enforcing hook, `innerwarden install <agent> --monitor` rewired the hook to
+  record only, as `agents connect --monitor` did before 1.6.6, and was let
+  through. And the hook read a help flag or a `--dry-run` anywhere in a
+  `contain` line, including in the agent's own command after `--` (`contain
+  --setup --monitor -- -h`) or after the first word (`contain --monitor true
+  --dry-run`), so it let through a `contain` that then rewired the hook. The
+  hook now refuses `install --monitor` as the person's, the CLI refuses it
+  inside an AI agent's shell, and `contain`'s help and dry run are read among
+  its own arguments only, as the CLI reads them.
+- Stated limit, unchanged: the CLI's own refusal reads the agent's shell
+  markers, which a script the agent writes can unset, and the hook knows the
+  CLI by its names (`innerwarden`, `iw`, `iw-guard`), so a renamed copy run
+  from a script is not seen. The hook refuses every spelling it can read.
+
+## 1.6.7 - 2026-10-24
+
+### Added
+
+- **A refusal made in a jail reaches the host's case.** Inside a jail started
+  with `contain --identity`, where Active Defence runs on the host, the hook
+  now reports each shell command it refuses itself (a deny of the general
+  rules, a hard rule, a profile's refusal) to the host once the refusal
+  stands, so the host's case of that session lists it beside the commands it
+  was asked about. The refusal is the hook's, and nothing the host answers
+  changes it. An older Active Defence refuses the report, and nothing else
+  changes.
+
+### Fixed
+
+- Tests for three gaps the nightly mutation sweep found (the account's keys
+  removed behind a rewrite, the remote MCP server count of a Codex file, and a
+  guard that could never be false in the credential-store check).
+
+## 1.6.6 - 2026-10-24
+
+### Security
+
+- **An agent can no longer lower the guard that screens it.** Under an
+  enforcing hook, `innerwarden agents connect <agent> --monitor`,
+  `innerwarden agents disconnect` and `innerwarden contain` (which rewrites
+  the agent's hook) were let through, while `dry-run` and `monitor` were
+  refused. The hook now refuses all of them as the person's, and the CLI
+  refuses them inside an AI agent's shell, where the hook cannot see the call
+  (a script the agent wrote). A read, a connect that keeps enforcing, help and
+  `contain --dry-run` stay open.
+
+### Fixed
+
+- **`innerwarden contain` keeps the hook's mode.** With no mode asked, it set
+  an enforcing hook to monitor, unsaid, also when the jail then failed to
+  start. It now keeps the mode the hook already has (a first wiring takes
+  monitor), and says the mode on every run.
+
+## 1.6.5 - 2026-10-24
+
+1.6.4 was tagged and not published: its new jail check on macOS started
+`sandbox-exec` with the account's environment. 1.6.5 is 1.6.4 with that check
+under the launcher's own environment (root's two folders as `PATH`, no loader
+variable), as every program a launch starts.
+
+
+### Added
+
+- **The dashboard shows what the free product does.** Overview, Decisions,
+  Protection, Agents and Tokens were rebuilt on one foundation: each agent
+  with its mode, what it screens and how to restart it (Claude Code: `/exit`,
+  then `claude`; Codex: quit and start again), the decision history by day
+  with the reason in words, recent sessions, the allow and mute lists with
+  their remove step, the jail check, and how many MCP servers each agent has
+  (local and remote). A value that could not be read is said as not read,
+  never as off or zero, and monitor is said plainly.
+- **One plan notice for an Active Defence host**: its licence ending soon,
+  partly covered, lapsed to free mode, or not read, with the one step that
+  fixes it. A Community install draws none.
+- `install`, `agents connect`, `enforce` and `dry-run` say how to restart each
+  agent they changed.
+
+### Changed
+
+- tokio 1.53.3 (RUSTSEC-2026-0386).
+
 ## 1.6.3 - 2026-10-23
 
 ### Fixed

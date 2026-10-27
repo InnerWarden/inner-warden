@@ -1,0 +1,60 @@
+{
+  "actual_blocks": 0,
+  "allow_verdicts": 0,
+  "allowed": 0,
+  "blocked": 0,
+  "commands": 0,
+  "denies_without_block": 0,
+  "deny_verdicts": 0,
+  "lanes": {
+    "agent_actions": {
+      "availability": "available",
+      "count": 0,
+      "count_of": "commands",
+      "lane": "agent_actions",
+      "sentence": "Connected. Nothing screened yet.",
+      "window": "7d"
+    },
+    "agent_messages": {
+      "availability": "available",
+      "breakdown": [
+        {
+          "count": 2,
+          "key": "answered",
+          "label": "Answered"
+        }
+      ],
+      "count": 2,
+      "count_of": "messages",
+      "lane": "agent_messages",
+      "latest": {
+        "at": "2026-09-27T14:40:00Z",
+        "case_id": "bf282d6c8936a3ff",
+        "title": "Someone on Telegram asked your agent: Summarise this page for me \\u{E0049}\\u{E0047}\\u{E004E}\\u{E004F}\\u{E0052}\\u{E004…"
+      },
+      "sentence": "2 risky messages reached your agent in the last 7 days. Observe records them; it does not block them.",
+      "window": "7d"
+    },
+    "server_attacks": {
+      "availability": "no_source",
+      "lane": "server_attacks",
+      "sentence": "Community watches what your AI agents try to run. It does not watch this machine itself."
+    }
+  },
+  "outcomes_unknown": 0,
+  "recent_blocks": [],
+  "recent_decisions": [],
+  "record": {
+    "capped": false,
+    "checked": 0,
+    "decisions": 0,
+    "flagged": 0
+  },
+  "review": 0,
+  "review_verdicts": 0,
+  "screened": 0,
+  "sessions": 0,
+  "top_categories": [],
+  "unknown_verdicts": 0,
+  "would_block": 0
+}

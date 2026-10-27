@@ -27,6 +27,17 @@ pub fn cmd(rest: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // A jail rewires the agent's hook: it is the person's to start, never a
+    // command an AI agent's shell runs (live gate of Active Defence 0.17.4,
+    // G1). Its own `--dry-run` changes nothing and stays open.
+    if !args.dry_run && crate::suppress_io::in_agent_shell() {
+        eprintln!(
+            "innerwarden contain: refused inside an AI agent's shell. A jail rewires the \
+             agent's hook, so it is started by the person, from their own terminal. Nothing \
+             was changed."
+        );
+        return ExitCode::from(1);
+    }
 
     let home = match std::env::var_os("HOME").map(PathBuf::from) {
         Some(h) if !h.as_os_str().is_empty() => h,
@@ -51,6 +62,30 @@ pub fn cmd(rest: &[String]) -> ExitCode {
     // --setup intentionally only arms the hook and therefore needs no project.
     // Every normal run validates all future writable binds BEFORE this host
     // mutation; an unsafe project must fail closed without changing settings.
+    // A mode asked for on the command line is set; with none, the hook keeps
+    // the mode it already has (live gate of Active Defence 0.17.4, G2: a plain
+    // `contain` rewired an enforcing hook to monitor, unsaid, a failed start
+    // included). Only a first wiring takes the default.
+    let mode_given = rest
+        .iter()
+        .take_while(|a| *a != "--")
+        .any(|a| matches!(a.as_str(), "--monitor" | "--enforce" | "--block-review"));
+    let mut args = args;
+    if !mode_given {
+        if let Some((block_review, monitor)) =
+            std::fs::read_to_string(home.join(".claude/settings.json"))
+                .ok()
+                .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+                .as_ref()
+                .and_then(hook::kept_hook_flags)
+        {
+            args.mode = match (block_review, monitor) {
+                (true, _) => crate::contain::Mode::BlockReview,
+                (false, true) => crate::contain::Mode::Monitor,
+                (false, false) => crate::contain::Mode::Enforce,
+            };
+        }
+    }
     let (block_review, monitor) = args.mode.hook_flags();
     if args.setup_only {
         match hook::install_hook(&home, &args.agent, None, &iw_binary, block_review, monitor) {
@@ -90,7 +125,6 @@ pub fn cmd(rest: &[String]) -> ExitCode {
     // An identified launch takes its jail settings from the agent type's
     // profile, where a profiles file exists; a flag given here still wins.
     // Without `--identity` no profile is read and the jail is what it was.
-    let mut args = args;
     if args.identity {
         match crate::agent_profiles_io::load() {
             crate::agent_profiles::ProfilesState::Off => {}
@@ -166,7 +200,17 @@ pub fn cmd(rest: &[String]) -> ExitCode {
             block_review,
             monitor,
         ) {
-            Ok(_) => {}
+            // Said every time, so a change of mode is never silent.
+            Ok(_) => eprintln!(
+                "innerwarden contain: the guard hook for {} is in {}{}.",
+                input.args.agent,
+                match input.args.mode {
+                    crate::contain::Mode::Monitor => "monitor (records, never blocks)",
+                    crate::contain::Mode::Enforce => "enforce (blocks dangerous commands)",
+                    crate::contain::Mode::BlockReview => "enforce with review",
+                },
+                if mode_given { "" } else { ", as it was" }
+            ),
             Err(e) => eprintln!(
                 "innerwarden contain: could not arm the in-jail hook: {e} (running with walls only)"
             ),
@@ -1884,13 +1928,78 @@ pub(crate) fn jail_backend() -> Option<&'static str> {
 /// before it builds one: `None` without a backend it trusts (as
 /// [`jail_backend`]); otherwise `Ok`, or the lines `contain` says and stops
 /// on (on Linux, a kernel that restricts unprivileged user namespaces and
-/// a bwrap with no profile that grants it one).
+/// a bwrap with no profile that grants it one). On macOS, finding
+/// `sandbox-exec` is not a check: it starts one sandboxed `true`
+/// ([`sandbox_exec_starts`]), so "ready" is said only for a sandbox that
+/// started here (one already inside a sandbox cannot start another).
 pub(crate) fn jail_start_here() -> Option<Result<(), Vec<String>>> {
     if cfg!(target_os = "linux") {
         let bwrap = resolve_backend(BWRAP_PATHS)?;
         Some(restriction_advice(&bwrap, true).map_or(Ok(()), Err))
+    } else if cfg!(target_os = "macos") {
+        let sandbox = resolve_backend(&["/usr/bin/sandbox-exec"])?;
+        Some(sandbox_start_answer(sandbox_exec_starts(&sandbox)))
     } else {
         jail_backend().map(|_| Ok(()))
+    }
+}
+
+/// The profile of the test start: it allows everything, so what it measures
+/// is that `sandbox-exec` can put a process in a sandbox here at all.
+const SANDBOX_TEST_PROFILE: &str = "(version 1)(allow default)";
+
+/// Run `/usr/bin/true` under `sandbox-exec` once: `Some((exited 0, the
+/// first line it said on stderr))`, or `None` when it could not be started
+/// or did not end within 5 s (killed).
+fn sandbox_exec_starts(sandbox: &Path) -> Option<(bool, String)> {
+    let mut command = Command::new(sandbox);
+    command
+        .args(["-p", SANDBOX_TEST_PROFILE, "/usr/bin/true"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    // As every program a launch starts: root's two folders as PATH and no
+    // loader variable, so the account's environment cannot pick what
+    // answers "a sandbox started".
+    helper_env(&mut command);
+    let mut child = command.spawn().ok()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut said = String::new();
+                if let Some(mut stderr) = child.stderr.take() {
+                    let _ = std::io::Read::read_to_string(&mut stderr, &mut said);
+                }
+                let first = said.lines().next().unwrap_or("").trim().to_string();
+                return Some((status.success(), first));
+            }
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
+/// What the test start of `sandbox-exec` says: ready only when it ran and
+/// exited 0; otherwise the line a person reads, with what it said. Pure.
+fn sandbox_start_answer(outcome: Option<(bool, String)>) -> Result<(), Vec<String>> {
+    match outcome {
+        Some((true, _)) => Ok(()),
+        Some((false, said)) if !said.is_empty() => Err(vec![format!(
+            "sandbox-exec could not start a sandboxed process here: {said}"
+        )]),
+        Some((false, _)) => Err(vec![
+            "sandbox-exec could not start a sandboxed process here.".to_string(),
+        ]),
+        None => Err(vec![
+            "sandbox-exec did not start a sandboxed process within 5 seconds here.".to_string(),
+        ]),
     }
 }
 
@@ -2305,7 +2414,7 @@ fn host_key() -> Option<[u8; 32]> {
     if key.is_none() && std::fs::symlink_metadata(path).is_ok() {
         eprintln!(
             "innerwarden contain: {} is not a key this launcher believes (it must be root's, in \
-             folders only root can write), so the jail's hook will not ask Active Defence",
+             folders only root can write), so the jail's hook will not ask InnerWarden Pro",
             path.display()
         );
     }
@@ -3218,7 +3327,7 @@ fn await_system_scope<T>(
 /// The environment of a program the launcher runs to start an identified
 /// jail: [`crate::contain::HELPER_PATH`] and no dynamic loader variable. The
 /// jail's command gets its own back through bwrap ([`JailInputs::child_env`]).
-#[cfg(target_os = "linux")]
+/// On every platform: the jail check on macOS starts `sandbox-exec` under it.
 fn helper_env(command: &mut Command) {
     for name in crate::contain::launch_env(std::env::vars_os()).helper_remove {
         command.env_remove(name);
@@ -3644,6 +3753,78 @@ fn print_plan_env(env: &[(String, String)]) {
 
 #[cfg(test)]
 mod tests {
+    /// Every program this file starts outside the launch paths runs under
+    /// `helper_env` (root's two folders as PATH, no loader variable): Active
+    /// Defence reads the same rule off the shipped source before it pins a
+    /// release (1.6.4's jail check started `sandbox-exec` with the account's
+    /// environment and was held back). The launch paths themselves start the
+    /// person's own agent. FAILS ON REVERT of `helper_env` in any helper.
+    #[test]
+    fn every_helper_this_file_starts_runs_under_helper_env() {
+        const LAUNCH_PATHS: &[&str] = &["run_in_place", "run_plain", "run_macos"];
+        // Asks the bubblewrap it resolved from absolute paths for its own
+        // `--help` and nothing else (Active Defence reads it as allowed as it
+        // is, and refuses any argument or environment added to it).
+        const HELP_PROBE: &str = "bwrap_binds_fds";
+        let text = include_str!("contain_io.rs");
+        let shipped = &text[..text.find("#[cfg(test)]\nmod tests {").unwrap_or(text.len())];
+        let mut checked = 0;
+        for chunk in shipped.split("\nfn ").skip(1) {
+            let name = chunk.split(['(', '<']).next().unwrap_or("");
+            let body = &chunk[..chunk.find("\n}\n").unwrap_or(chunk.len())];
+            if !body.contains("Command::new(") || LAUNCH_PATHS.contains(&name) || name == HELP_PROBE
+            {
+                continue;
+            }
+            checked += 1;
+            assert!(
+                body.contains("helper_env(&mut "),
+                "{name} starts a program without helper_env"
+            );
+        }
+        assert!(
+            checked >= 3,
+            "only {checked} helpers read: the scan stopped matching"
+        );
+    }
+
+    /// Finding `sandbox-exec` is not a check: ready only when a sandboxed
+    /// `true` ran and exited 0; a failed or hung start says so, with what
+    /// `sandbox-exec` said. FAILS ON REVERT to the lookup alone (every macOS
+    /// read "Ready" with no start made).
+    #[test]
+    fn a_macos_jail_is_ready_only_when_a_sandbox_started() {
+        assert_eq!(sandbox_start_answer(Some((true, String::new()))), Ok(()));
+        assert_eq!(
+            sandbox_start_answer(Some((false, "sandbox-exec: sandbox_apply: Operation not permitted".into()))),
+            Err(vec!["sandbox-exec could not start a sandboxed process here: sandbox-exec: sandbox_apply: Operation not permitted".to_string()])
+        );
+        assert_eq!(
+            sandbox_start_answer(Some((false, String::new()))),
+            Err(vec![
+                "sandbox-exec could not start a sandboxed process here.".to_string()
+            ])
+        );
+        assert_eq!(
+            sandbox_start_answer(None),
+            Err(vec![
+                "sandbox-exec did not start a sandboxed process within 5 seconds here.".to_string()
+            ])
+        );
+    }
+
+    /// On a Mac the check starts a real sandbox, and its answer is a check
+    /// that ran: never the bare lookup's `Ok` for a start that failed.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_macos_jail_check_starts_a_sandbox() {
+        let Some(sandbox) = resolve_backend(&["/usr/bin/sandbox-exec"]) else {
+            return;
+        };
+        let outcome = sandbox_exec_starts(&sandbox).expect("sandbox-exec answers within 5 s");
+        assert_eq!(jail_start_here(), Some(sandbox_start_answer(Some(outcome))));
+    }
+
     use super::*;
 
     /// Set in a child these tests start: what it answers.

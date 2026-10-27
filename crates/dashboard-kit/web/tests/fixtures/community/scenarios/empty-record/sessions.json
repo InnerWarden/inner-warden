@@ -1,0 +1,11 @@
+{
+  "generated_at_ms": 1790690700000,
+  "items": [],
+  "record": {
+    "capped": false,
+    "checked": 0,
+    "decisions": 0,
+    "flagged": 0
+  },
+  "schema_version": 1
+}

@@ -37,6 +37,19 @@ fn cli() -> Command {
     // a developer running the suite on a host with an agent never gets the
     // suite's fake attacks as cases; the one test of the report turns it on.
     command.env("INNERWARDEN_AGENT_URL", "off");
+    // The person's shell, even when the suite runs under an AI agent's: a
+    // jail and the wiring that lowers a guard are refused inside one. A test
+    // about an agent's shell sets its marker again; the later value wins.
+    for marker in [
+        "CLAUDECODE",
+        "CLAUDE_CODE_ENTRYPOINT",
+        "CODEX_SANDBOX",
+        "CODEX_SANDBOX_NETWORK_DISABLED",
+        "GEMINI_CLI",
+        "OPENCLAW_SHELL",
+    ] {
+        command.env_remove(marker);
+    }
     command
 }
 
@@ -1167,6 +1180,7 @@ fn graph_records_checks_and_narrates() {
         .env_remove("CODEX_SANDBOX")
         .env_remove("CODEX_SANDBOX_NETWORK_DISABLED")
         .env_remove("GEMINI_CLI")
+        .env_remove("OPENCLAW_SHELL")
         .output()
         .expect("run graph clear");
     assert!(

@@ -42,6 +42,8 @@ mod http_io;
 mod notify_io;
 mod observe;
 mod observe_io;
+mod openclaw_guard;
+mod openclaw_guard_io;
 mod record_health;
 mod release_verify;
 mod safer_alternative;
@@ -153,24 +155,7 @@ fn status_io_cmd() -> std::process::ExitCode {
     let tool_classes: Vec<status::ToolClasses> = home
         .as_deref()
         .map(|home| {
-            rows.iter()
-                .filter(|r| wired_agents.contains(&r.name))
-                .filter_map(|r| {
-                    if !r.hookable {
-                        return Some(status::ToolClasses::Proxy {
-                            agent: r.name.clone(),
-                        });
-                    }
-                    let settings = std::fs::read(home.join(".claude/settings.json"))
-                        .ok()
-                        .and_then(|body| serde_json::from_slice::<serde_json::Value>(&body).ok())?;
-                    Some(status::ToolClasses::Hook {
-                        agent: r.name.clone(),
-                        file_tools: hook::iwguard_judges_file_tools(&settings),
-                        next: innerwarden_agent_guard::agents_ops::hook_repair_command(home, r),
-                    })
-                })
-                .collect()
+            status::tool_classes_for(home, rows.iter().filter(|r| wired_agents.contains(&r.name)))
         })
         .unwrap_or_default();
 
@@ -313,6 +298,9 @@ fn main() -> std::process::ExitCode {
         // the asks the model refused, which produce no command and so reach
         // nothing else in the product.
         Some("observe") => observe_io::cmd(&args[1..]),
+        // OpenClaw's own tools, screened by the plugin `agents connect
+        // openclaw` installs.
+        Some("openclaw") => openclaw_guard_io::cmd(&args[1..]),
         Some("graph") => graph_io::cmd(&args[1..]),
         Some("llm") => second_opinion_io::cmd(&args[1..]),
         // Explicit passthrough to the host layer. The catch-all below only
@@ -913,21 +901,141 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
         return exit;
     }
 
-    let command = match classify_hook_input(&buf) {
-        HookInput::Command(command) => command,
-        // A well-formed call for a tool with no command: never wedge it.
-        HookInput::NotAShellCall => return std::process::ExitCode::SUCCESS,
-        HookInput::Unreadable(why) => return hook_unreadable(why, monitor),
+    let options = ShellScreenOptions {
+        monitor,
+        block_review,
+        record: true,
+        host: None,
     };
-    let Some((command, rules)) = hook_verdict_for(&command, hook_context(&buf).as_ref()) else {
-        return std::process::ExitCode::SUCCESS;
+    let screened = match screen_shell(&buf, rest, &options) {
+        ShellScreen::Nothing => return std::process::ExitCode::SUCCESS,
+        ShellScreen::Unreadable(why) => return hook_unreadable(why, monitor),
+        ShellScreen::ProfilesInvalid(why) => return hook_profiles_invalid(&why),
+        ShellScreen::Screened(screened) => screened,
+    };
+    let ShellScreened {
+        command,
+        verdict,
+        blocks: would_block_under_policy,
+        ..
+    } = screened;
+
+    if !monitor && would_block_under_policy {
+        let rec = verdict
+            .get("recommendation")
+            .and_then(|r| r.as_str())
+            .unwrap_or("deny");
+        let expl = verdict
+            .get("explanation")
+            .and_then(|e| e.as_str())
+            .unwrap_or("");
+        eprintln!("InnerWarden blocked this command (recommendation={rec}): {expl}");
+        // Offer the safer neighbour BEFORE the override, when one exists.
+        //
+        // The two lines are not equivalent and their order is the point. An
+        // override tells the operator how to do the blocked thing anyway; a
+        // safer alternative tells them how to get what they wanted without it.
+        // Printing the override first makes it the obvious move, which is how a
+        // guardrail trains people to wave things through.
+        //
+        // This only ever prints. The exit code below is unchanged and nothing
+        // here can turn a deny into a pass.
+        if let Some(alternative) = safer_alternative::for_command(&command) {
+            eprintln!("  Try instead: {}", alternative.command);
+            eprintln!("    ({})", alternative.because);
+        }
+        // Say how to proceed. A block with no stated remedy leaves the operator one
+        // obvious move, which is to remove the guard, and that is the outcome this
+        // control exists to avoid. The remedy is deliberately a decision the PERSON
+        // makes, in their own shell, and never something the agent can grant itself.
+        //
+        // So it is addressed to the person and is not a command line. This text
+        // reaches the agent first, and a ready-to-run `innerwarden allow '<cmd>'`
+        // here was an instruction the agent could follow to lift its own block.
+        eprintln!("{}", hook_block_remedy(&verdict));
+        std::process::ExitCode::from(2)
+    } else {
+        std::process::ExitCode::SUCCESS
+    }
+}
+
+/// How a caller of [`screen_shell`] wants one shell command screened.
+pub(crate) struct ShellScreenOptions<'a> {
+    /// Record only, never refuse: a deny is recorded as `would_block`.
+    pub monitor: bool,
+    /// A `review` refuses too (the Claude Code hook's `--block-review`).
+    pub block_review: bool,
+    /// Record the decision here. False where its outcome is not known yet
+    /// (OpenClaw's guard asks the person to approve a review), so the caller
+    /// records it once it is.
+    pub record: bool,
+    /// Asked after the hook's own decision, with the command: the host's own
+    /// recommendation for it (`allow`, `review` or `deny`), or `None` when
+    /// the host did not answer. It only ever makes the decision stricter
+    /// ([`stricter_with_host`]). `None` here asks no host, as the Claude Code
+    /// hook always did.
+    pub host: Option<HostAsk<'a>>,
+}
+
+/// The host's reading of one command (see [`ShellScreenOptions::host`]).
+pub(crate) type HostAsk<'a> = &'a dyn Fn(&str) -> Option<String>;
+
+/// One shell command, screened.
+pub(crate) struct ShellScreened {
+    pub command: String,
+    /// The verdict that stands, as it was recorded.
+    pub verdict: serde_json::Value,
+    /// Whether the policy refuses it (deny, or a review under
+    /// `block_review`), whatever the mode.
+    pub blocks: bool,
+    /// The layer that decided, where per-agent profiles are in force.
+    pub layer: Option<graph_io::LayerLabel>,
+}
+
+/// What [`screen_shell`] made of one hook payload.
+pub(crate) enum ShellScreen {
+    /// A well-formed call for a tool with no command: never wedge it.
+    Nothing,
+    /// The call could not be read.
+    Unreadable(&'static str),
+    /// The profiles file cannot be used, in enforce: the call is refused.
+    ProfilesInvalid(String),
+    Screened(ShellScreened),
+}
+
+/// The hook's screening of the shell command in one payload: the general
+/// rules, the person's suppressions, the second opinion, the session's
+/// behaviour and taint, the per-agent profiles (with the host's decision for
+/// a jailed instance), then, where the caller asks one, the host's own
+/// reading ([`ShellScreenOptions::host`]). Recorded and alerted on as the
+/// Claude Code hook always recorded it, unless the caller records it itself.
+/// Nothing is said to the agent here: that is the caller's.
+pub(crate) fn screen_shell(
+    buf: &str,
+    rest: &[String],
+    options: &ShellScreenOptions<'_>,
+) -> ShellScreen {
+    let ShellScreenOptions {
+        monitor,
+        block_review,
+        record,
+        host,
+    } = *options;
+    let command = match classify_hook_input(buf) {
+        HookInput::Command(command) => command,
+        HookInput::NotAShellCall => return ShellScreen::Nothing,
+        HookInput::Unreadable(why) => return ShellScreen::Unreadable(why),
+    };
+    let Some((command, rules)) = hook_verdict_for(&command, hook_context(buf).as_ref()) else {
+        return ShellScreen::Nothing;
     };
     // User suppression first, then an optional LLM second opinion for the rest.
-    let verdict = suppress_io::consider(&command, &rules)
+    let suppressed = suppress_io::consider(&command, &rules);
+    let person_allowed = suppressed.is_some();
+    let verdict = suppressed
         .or_else(|| second_opinion_io::consider(&command, &rules))
         .unwrap_or(rules);
-    let source_session = hook_session(&buf);
-    let source_event_id = hook_event_id(&buf);
+    let source_session = hook_session(buf);
     // Inside an identified jail the hook knows more about who is calling; with
     // no record there this is `None` and nothing below changes.
     let identity = hook_identity::current(agent_flag(rest).as_deref(), source_session.as_deref());
@@ -954,7 +1062,7 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
     let (verdict, would_block_under_policy, deciding_layer) = match &profiles_state {
         agent_profiles::ProfilesState::Off => (verdict, blocks_today, None),
         agent_profiles::ProfilesState::Invalid(why) if !monitor => {
-            return hook_profiles_invalid(why);
+            return ShellScreen::ProfilesInvalid(why.clone());
         }
         agent_profiles::ProfilesState::Invalid(why) => {
             eprintln!(
@@ -1013,6 +1121,16 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
             )
         }
     };
+    // The host's own reading, where the caller asks one: never a relaxation.
+    let (verdict, would_block_under_policy) = match host {
+        Some(ask) if verdict.get("recommendation").and_then(|r| r.as_str()) != Some("deny") => {
+            let answer = ask(&command);
+            let verdict = stricter_with_host(verdict, answer.as_deref(), person_allowed);
+            let blocks = would_block_under_policy || hook_blocks(&verdict, block_review);
+            (verdict, blocks)
+        }
+        _ => (verdict, would_block_under_policy),
+    };
 
     // Record EVERY screened command into the narrative graph (allow AND deny).
     // Persist recommendation and real outcome separately: monitor records a deny
@@ -1020,61 +1138,110 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
     // The record is written BEFORE the verdict is returned, so nothing in it
     // may wait without a bound: every lock it takes gives up after
     // `GRAPH_LOCK_TIMEOUT` and the loss is reported as an outage.
+    if record {
+        record_shell(
+            buf,
+            rest,
+            &command,
+            &verdict,
+            monitor,
+            would_block_under_policy,
+            deciding_layer.clone(),
+        );
+    }
+    ShellScreen::Screened(ShellScreened {
+        command,
+        verdict,
+        blocks: would_block_under_policy,
+        layer: deciding_layer,
+    })
+}
+
+/// Record one screened shell command of `buf` and alert on a refusal, as the
+/// hook records every command it screens: in monitor a refusal is a
+/// `would_block`, in enforce `blocked` (`would_block` says the policy refuses
+/// it). The payload's event id makes a delivery idempotent.
+pub(crate) fn record_shell(
+    buf: &str,
+    rest: &[String],
+    command: &str,
+    verdict: &serde_json::Value,
+    monitor: bool,
+    would_block: bool,
+    layer: Option<graph_io::LayerLabel>,
+) {
+    let source_session = hook_session(buf);
+    let identity = hook_identity::current(agent_flag(rest).as_deref(), source_session.as_deref());
     graph_io::record_hook(
-        &command,
-        &verdict,
+        command,
+        verdict,
         monitor,
-        would_block_under_policy,
+        would_block,
         source_session.as_deref(),
-        source_event_id.as_deref(),
+        hook_event_id(buf).as_deref(),
         agent_flag(rest).as_deref(),
-        hook_cwd(&buf).as_deref(),
+        hook_cwd(buf).as_deref(),
         identity.as_ref(),
-        deciding_layer,
+        layer,
     );
-    if would_block_under_policy {
+    if would_block {
         // In monitor mode this is a would-block alert; in enforce it accompanies
         // the real block. Alerting must not change the hook outcome.
-        notify_io::fire(&command, &verdict);
+        notify_io::fire(command, verdict);
     }
+}
 
-    if !monitor && would_block_under_policy {
-        let rec = verdict
-            .get("recommendation")
-            .and_then(|r| r.as_str())
-            .unwrap_or("deny");
-        let expl = verdict
+/// The words a record keeps for a recommendation of the host's own.
+pub(crate) const HOST_READING_WORDS: &str = "InnerWarden Pro on this host";
+
+/// PURE. The verdict once the host's own recommendation is heard: the
+/// stricter of the two (`deny` over `review` over `allow`), with what the host
+/// said kept beside it. A command the person allowed (`innerwarden allow`)
+/// is made stricter only by a host `deny`: the host's reading of the general
+/// rules never overrides the person's own decision, and its refusal does. No
+/// answer changes nothing.
+pub(crate) fn stricter_with_host(
+    mut verdict: serde_json::Value,
+    host: Option<&str>,
+    person_allowed: bool,
+) -> serde_json::Value {
+    let rank = |rec: &str| match rec {
+        "deny" => 2,
+        "review" => 1,
+        _ => 0,
+    };
+    let Some(host) = host.filter(|rec| matches!(*rec, "allow" | "review" | "deny")) else {
+        return verdict;
+    };
+    let Some(obj) = verdict.as_object_mut() else {
+        return verdict;
+    };
+    obj.insert("host_recommendation".into(), host.into());
+    let own = obj
+        .get("recommendation")
+        .and_then(|r| r.as_str())
+        .unwrap_or("allow")
+        .to_string();
+    let raises = rank(host) > rank(&own) && (!person_allowed || host == "deny");
+    if raises {
+        obj.insert("recommendation".into(), host.into());
+        let previous = obj
             .get("explanation")
             .and_then(|e| e.as_str())
-            .unwrap_or("");
-        eprintln!("InnerWarden blocked this command (recommendation={rec}): {expl}");
-        // Offer the safer neighbour BEFORE the override, when one exists.
-        //
-        // The two lines are not equivalent and their order is the point. An
-        // override tells the operator how to do the blocked thing anyway; a
-        // safer alternative tells them how to get what they wanted without it.
-        // Printing the override first makes it the obvious move, which is how a
-        // guardrail trains people to wave things through.
-        //
-        // This only ever prints. The exit code below is unchanged and nothing
-        // here can turn a deny into a pass.
-        if let Some(alternative) = safer_alternative::for_command(&command) {
-            eprintln!("  Try instead: {}", alternative.command);
-            eprintln!("    ({})", alternative.because);
-        }
-        // Say how to proceed. A block with no stated remedy leaves the operator one
-        // obvious move, which is to remove the guard, and that is the outcome this
-        // control exists to avoid. The remedy is deliberately a decision the PERSON
-        // makes, in their own shell, and never something the agent can grant itself.
-        //
-        // So it is addressed to the person and is not a command line. This text
-        // reaches the agent first, and a ready-to-run `innerwarden allow '<cmd>'`
-        // here was an instruction the agent could follow to lift its own block.
-        eprintln!("{}", hook_block_remedy(&verdict));
-        std::process::ExitCode::from(2)
-    } else {
-        std::process::ExitCode::SUCCESS
+            .unwrap_or("")
+            .to_string();
+        let reason = format!("{HOST_READING_WORDS} answered {host}");
+        let joined = if previous.is_empty() {
+            reason
+        } else {
+            format!("{previous}; {reason}")
+        };
+        obj.insert("explanation".into(), joined.into());
+        let floor = if host == "deny" { 80 } else { 25 };
+        let score = obj.get("risk_score").and_then(|s| s.as_u64()).unwrap_or(0);
+        obj.insert("risk_score".into(), score.max(floor).into());
     }
+    verdict
 }
 
 /// Screen a `Write`, `Edit`, `MultiEdit` or `NotebookEdit` call (see
@@ -1093,6 +1260,44 @@ fn screen_file_tool(buf: &str, rest: &[String], monitor: bool) -> Option<std::pr
         FileToolCall::Unreadable(why) => return Some(hook_unreadable(why, monitor)),
         FileToolCall::Writes { tool, paths } => (tool, paths),
     };
+    Some(
+        match screen_file_writes(buf, rest, monitor, &tool, &paths) {
+            FileScreen::Pass => std::process::ExitCode::SUCCESS,
+            FileScreen::Refused { explanation } => {
+                if monitor {
+                    return Some(std::process::ExitCode::SUCCESS);
+                }
+                eprintln!(
+                    "InnerWarden blocked this file change (recommendation=deny): {explanation}"
+                );
+                eprintln!("{}", FILE_BLOCK_REMEDY);
+                std::process::ExitCode::from(2)
+            }
+        },
+    )
+}
+
+/// What [`screen_file_writes`] decided about one file tool call.
+pub(crate) enum FileScreen {
+    /// Not a privileged file and not a revoked agent: it goes through, and
+    /// nothing was recorded.
+    Pass,
+    /// Refused (in enforce; recorded as `would_block` in monitor), with the
+    /// person's words for why.
+    Refused { explanation: String },
+}
+
+/// The file side of the hook, for the paths one call writes (`tool` is the
+/// name the record shows): a privileged file is refused by the hard rule, a
+/// revoked agent every file change; each refusal recorded and alerted on.
+pub(crate) fn screen_file_writes(
+    buf: &str,
+    rest: &[String],
+    monitor: bool,
+    tool: &str,
+    paths: &[String],
+) -> FileScreen {
+    use innerwarden_agent_guard::file_tools;
     let cwd = hook_cwd(buf)
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::current_dir().ok());
@@ -1109,9 +1314,9 @@ fn screen_file_tool(buf: &str, rest: &[String], monitor: bool) -> Option<std::pr
         // A revoked agent is refused every file change too, where profiles
         // are in force. With no profiles file this is one failed open of
         // each file and the edit goes through, as before.
-        return Some(file_tool_revoked(buf, rest, monitor, &tool, &paths));
+        return file_tool_revoked(buf, rest, monitor, tool, paths);
     };
-    let verdict = file_tools::refusal_verdict(&tool, path, what);
+    let verdict = file_tools::refusal_verdict(tool, path, what);
     let command = format!("{tool} {}", path.trim());
     let payload_session = hook_session(buf);
     let identity = hook_identity::current(agent_flag(rest).as_deref(), payload_session.as_deref());
@@ -1134,30 +1339,24 @@ fn screen_file_tool(buf: &str, rest: &[String], monitor: bool) -> Option<std::pr
         deciding_layer,
     );
     notify_io::fire(&command, &verdict);
-    if monitor {
-        return Some(std::process::ExitCode::SUCCESS);
+    FileScreen::Refused {
+        explanation: file_tools::refusal_explanation(tool, path, what),
     }
-    eprintln!(
-        "InnerWarden blocked this file change (recommendation=deny): {}",
-        file_tools::refusal_explanation(&tool, path, what)
-    );
-    eprintln!("{}", FILE_BLOCK_REMEDY);
-    Some(std::process::ExitCode::from(2))
 }
 
 /// A file change that is not to a privileged file: refused (outside monitor)
 /// only when the profiles in force revoked the agent or its instance, and
-/// then recorded like any refusal, by the hard layer. Otherwise exit 0 and
-/// nothing recorded, as before.
+/// then recorded like any refusal, by the hard layer. Otherwise it passes
+/// and nothing is recorded, as before.
 fn file_tool_revoked(
     buf: &str,
     rest: &[String],
     monitor: bool,
     tool: &str,
     paths: &[String],
-) -> std::process::ExitCode {
+) -> FileScreen {
     let agent_profiles::ProfilesState::On(profiles) = agent_profiles_io::load() else {
-        return std::process::ExitCode::SUCCESS;
+        return FileScreen::Pass;
     };
     let payload_session = hook_session(buf);
     let hook_agent = agent_flag(rest);
@@ -1167,7 +1366,7 @@ fn file_tool_revoked(
         agent_type.as_deref(),
         identity.as_ref().and_then(|id| id.instance_id.as_deref()),
     ) else {
-        return std::process::ExitCode::SUCCESS;
+        return FileScreen::Pass;
     };
     let path = paths.first().map(|p| p.trim()).unwrap_or("");
     let command = format!("{tool} {path}");
@@ -1190,15 +1389,9 @@ fn file_tool_revoked(
         identity.as_ref(),
         Some(innerwarden_agent_guard::identity::RuleLayer::Hard.into()),
     );
-    if monitor {
-        return std::process::ExitCode::SUCCESS;
+    FileScreen::Refused {
+        explanation: revoked.sentence().to_string(),
     }
-    eprintln!(
-        "InnerWarden blocked this file change (recommendation=deny): {}",
-        revoked.sentence()
-    );
-    eprintln!("{}", FILE_BLOCK_REMEDY);
-    std::process::ExitCode::from(2)
 }
 
 /// A profiles file that cannot be used, in enforce: the call is refused, as a
@@ -1238,7 +1431,7 @@ fn hook_block_remedy(verdict: &serde_json::Value) -> &'static str {
 
 /// The remedy after a refusal of Active Defence's own on the host.
 const HOST_BLOCK_REMEDY: &str =
-    "  For the person supervising this agent: Active Defence on this host refused \
+    "  For the person supervising this agent: InnerWarden Pro on this host refused \
      this command on its own, and `innerwarden allow` does not lift that; its settings \
      on this host decide. An agent cannot authorise it and should ask you instead of \
      retrying.";
@@ -1255,6 +1448,17 @@ fn cmd_mode(rest: &[String], monitor: bool) -> std::process::ExitCode {
             rest[0]
         );
         return std::process::ExitCode::from(2);
+    }
+    // Monitor (dry-run) lowers the guard that screens the agent: the
+    // person's, never a command an AI agent's shell runs, a script it wrote
+    // included (live gate of Active Defence 0.17.5, J2). Enforce raises it.
+    if monitor && suppress_io::in_agent_shell() {
+        eprintln!(
+            "innerwarden dry-run: refused inside an AI agent's shell. Monitor lowers the guard \
+             that screens the agent, so it is set by the person, from their own terminal. \
+             Nothing was changed."
+        );
+        return std::process::ExitCode::from(1);
     }
     let home = match hook::home_dir() {
         Ok(h) => h,
@@ -1276,6 +1480,7 @@ fn cmd_mode(rest: &[String], monitor: bool) -> std::process::ExitCode {
         let mut flipped = 0usize;
         let mut attempted = 0usize;
         let mut failed = 0usize;
+        let mut configured: Vec<String> = Vec::new();
         for agent in &agents {
             if !innerwarden_agent_guard::agents_ops::status_has_guard_wiring(&home, agent) {
                 continue;
@@ -1286,15 +1491,43 @@ fn cmd_mode(rest: &[String], monitor: bool) -> std::process::ExitCode {
             );
             if result.configured() {
                 flipped += 1;
+                configured.push(agent.name.clone());
             }
             if result.effect == innerwarden_agent_guard::agents_ops::ConnectEffect::Failed {
                 failed += 1;
             }
             println!("{}", result.line);
         }
-        Ok((attempted, failed, flipped))
+        // OpenClaw's own tools: the guard plugin's mode follows, where it is
+        // installed. Its entry is in the same `openclaw.json`.
+        let mode = if monitor {
+            openclaw_guard::Mode::Monitor
+        } else {
+            openclaw_guard::Mode::Enforce
+        };
+        match openclaw_guard_io::set_mode(&home, mode) {
+            Ok(false) => {}
+            Ok(true) => {
+                attempted += 1;
+                flipped += 1;
+                if !configured.iter().any(|name| name == "openclaw") {
+                    configured.push("openclaw".to_string());
+                }
+                println!(
+                    "  openclaw - its own tools: {} ({})",
+                    mode.as_str(),
+                    openclaw_guard::PLUGIN_ID
+                );
+            }
+            Err(error) => {
+                attempted += 1;
+                failed += 1;
+                println!("  openclaw - failed: the guard plugin's mode could not be set ({error})");
+            }
+        }
+        Ok((attempted, failed, flipped, configured))
     });
-    let (attempted, failed, flipped) = match mode_result {
+    let (attempted, failed, flipped, configured) = match mode_result {
         Ok(counts) => counts,
         Err(error) => {
             eprintln!(
@@ -1328,7 +1561,9 @@ fn cmd_mode(rest: &[String], monitor: bool) -> std::process::ExitCode {
         );
         println!("  Back to observe-only:  innerwarden dry-run");
     }
-    println!("{RESTART_GUARDED_AGENTS}");
+    for line in agents_io::restart_footer(&configured) {
+        println!("{line}");
+    }
     std::process::ExitCode::SUCCESS
 }
 
@@ -1438,6 +1673,18 @@ fn cmd_install(rest: &[String]) -> std::process::ExitCode {
             return std::process::ExitCode::from(2);
         }
     };
+    // Installing the hook in monitor rewires it to record only, as `agents
+    // connect --monitor` does: the person's, never a command an AI agent's
+    // shell runs (review of 1.6.6, H1). The guard refuses the agent running
+    // it; this holds where the guard cannot see the call.
+    if monitor && suppress_io::in_agent_shell() {
+        eprintln!(
+            "innerwarden install: refused inside an AI agent's shell. Installing the hook in \
+             monitor lowers the guard that screens the agent, so it is done by the person, \
+             from their own terminal. Nothing was changed."
+        );
+        return std::process::ExitCode::from(1);
+    }
 
     let home = match hook::home_dir() {
         Ok(h) => h,
@@ -1497,6 +1744,8 @@ fn cmd_install(rest: &[String]) -> std::process::ExitCode {
                 } else {
                     println!("before it runs; a dangerous one is blocked. Restart Claude Code to load it.");
                 }
+                let name = dashboard_community::agent_name(&agent);
+                println!("  {name}: {}", agents_io::restart_words(&agent, &name).how);
             } else {
                 println!(
                     "Note: Claude Code was not detected here (no `claude` on PATH, no ~/.claude)."
@@ -1521,6 +1770,18 @@ fn cmd_install(rest: &[String]) -> std::process::ExitCode {
 /// installed (removes 0). Does not delete the binary: it names the full
 /// `uninstall`, which decides whether the binary is this install's to delete.
 fn cmd_uninstall(rest: &[String]) -> std::process::ExitCode {
+    // Taking InnerWarden off, all of it or one agent's hook, takes off the
+    // guard that screens the agent: the person's, never a command an AI
+    // agent's shell runs, a script it wrote included (live gate of Active
+    // Defence 0.17.5, J1 and J2). A dry run changes nothing.
+    if !rest.iter().any(|a| a == "--dry-run") && suppress_io::in_agent_shell() {
+        eprintln!(
+            "innerwarden uninstall: refused inside an AI agent's shell. Uninstalling takes off \
+             the guard that screens the agent, so it is done by the person, from their own \
+             terminal. Nothing was changed."
+        );
+        return std::process::ExitCode::from(1);
+    }
     // Bare `uninstall` (or with --all / --purge) removes InnerWarden entirely:
     // the agent hook, the config directory, the binary and its shortcuts. `uninstall
     // claude-code` (a named agent) removes only that agent's hook.
@@ -2303,7 +2564,7 @@ fn help_text() -> String {
          AI-agent guardrail (cross-platform: Linux, macOS, Windows)\n\
          \n\
          Screen an AI agent's shell command for danger before it runs.\n\
-         InnerWarden Active Defence adds host telemetry and response; on Linux it\n\
+         InnerWarden Pro adds host telemetry and response; on Linux it\n\
          also adds eBPF and the kernel Execution Gate under the SAME `{p}` command.\n\
          What you learn here carries over 1:1.\n\
          \n\
@@ -2321,7 +2582,7 @@ fn help_text() -> String {
            \x20                                wire a PreToolUse hook into Claude Code (--monitor = records, never blocks)\n  \
            {p} uninstall claude-code     remove that hook (leaves other settings untouched)\n  \
            {p} upgrade                   update to the latest signed release (verifies before replacing)\n  \
-         {p} host <command>            run a command in the Active Defence host layer\n  \
+         {p} host <command>            run a command in the InnerWarden Pro host layer\n  \
            {p} uninstall                 remove InnerWarden entirely: hook, config, binary and its iw shortcuts\n  \
            {p} agents [connect [--monitor]|disconnect [--all|<name>]]\n  \
            \x20                                find AI agents on this machine + connect the guard\n  \
@@ -2340,15 +2601,17 @@ fn help_text() -> String {
            {p} observe [status|install|inbound|reply]\n  \
            \x20                                record dangerous asks that reach an agent in conversation,\n  \
            \x20                                including the ones the model refuses (observation, not enforcement)\n  \
+           {p} openclaw [status]         OpenClaw's own tools, screened by the plugin `agents connect\n  \
+           \x20                                openclaw` installs (monitor by default; `enforce` refuses)\n  \
            {p} dashboard [--bind IP:PORT]  local UI + read-only APIs; optional agent watcher\n  \
            {p} llm [set ...|set-key|status]  optional own-model second opinion on ambiguous cmds\n  \
            \x20                                (setup wizard collects the key for you; set-key adds it later)\n  \
            {p} --version\n\
          \n\
-         Active Defence (licensed host layer - Linux eBPF, exec-gate, incident triage):\n  \
+         InnerWarden Pro (licensed host layer - Linux eBPF, exec-gate, incident triage):\n  \
            {p} get | action | trust | stream | rule | system | exec-gate | scan | harden\n  \
-           \x20                                run these once Active Defence is installed;\n  \
-           \x20                                without it they explain how to get it. → innerwarden.com/defend\n\
+           \x20                                run these once InnerWarden Pro is installed;\n  \
+           \x20                                without it they explain how to get it. → innerwarden.com/pricing\n\
          \n\
          `check` prints a human summary on a terminal, JSON when piped (or with --json),\n\
          and exits 1 on `deny`, so a PreToolUse hook can gate:\n  \
@@ -2442,7 +2705,7 @@ mod tests {
         let said = super::hook_block_remedy(&host);
         assert!(!said.contains("innerwarden allow --help"), "{said}");
         assert!(
-            said.contains("Active Defence on this host refused this command on its own"),
+            said.contains("InnerWarden Pro on this host refused this command on its own"),
             "{said}"
         );
         for other in [
@@ -2536,6 +2799,22 @@ mod tests {
             "claude-code".into(),
             "--purge".into()
         ]));
+    }
+
+    /// Customers buy InnerWarden Community, InnerWarden Pro and Enterprise.
+    /// "Active Defence" names only the paid repository and its release line
+    /// (operator, 2026-10-24), so `--help` names the paid tier as it is sold
+    /// and points at the page that sells it, not at the free install page.
+    ///
+    /// FAILS ON REVERT: put "Active Defence" back in `help_text()`, or the
+    /// `/defend` link, and this fails.
+    #[test]
+    fn help_names_the_paid_tier_as_it_is_sold() {
+        let help = help_text();
+        assert!(help.contains("InnerWarden Pro"), "{help}");
+        assert!(!help.contains("Active Defen"), "{help}");
+        assert!(help.contains("innerwarden.com/pricing"), "{help}");
+        assert!(!help.contains("innerwarden.com/defend"), "{help}");
     }
 
     #[test]
@@ -3201,5 +3480,53 @@ mod flag_parse_tests {
         let bogus = vec!["--bogus".to_string()];
         let err = parse_status_flags(&bogus).unwrap_err();
         assert!(err.contains("`--bogus`"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod host_reading_tests {
+    use super::stricter_with_host;
+    use serde_json::json;
+
+    /// The host's own reading only ever makes the decision stricter; a
+    /// command the person allowed is made stricter only by a host refusal;
+    /// no answer, or a word the contract does not use, changes nothing.
+    ///
+    /// FAILS ON REVERT: take the host's answer as it comes and an `allow`
+    /// lowers a review.
+    #[test]
+    fn the_hosts_reading_never_relaxes_and_never_overrides_the_person() {
+        let review = json!({"recommendation": "review", "risk_score": 20, "explanation": "x"});
+        let kept = stricter_with_host(review.clone(), Some("allow"), false);
+        assert_eq!(kept["recommendation"], "review");
+        assert_eq!(kept["host_recommendation"], "allow");
+        let raised = stricter_with_host(review.clone(), Some("deny"), false);
+        assert_eq!(raised["recommendation"], "deny");
+        assert!(raised["risk_score"].as_u64().unwrap() >= 80);
+        assert!(raised["explanation"]
+            .as_str()
+            .unwrap()
+            .contains("InnerWarden Pro on this host answered deny"));
+
+        let allowed = json!({"recommendation": "allow", "risk_score": 0});
+        assert_eq!(
+            stricter_with_host(allowed.clone(), Some("review"), true)["recommendation"],
+            "allow",
+            "the person's allow stands over the host's review"
+        );
+        assert_eq!(
+            stricter_with_host(allowed.clone(), Some("deny"), true)["recommendation"],
+            "deny",
+            "and falls to the host's refusal"
+        );
+        assert_eq!(
+            stricter_with_host(allowed.clone(), Some("review"), false)["recommendation"],
+            "review"
+        );
+        assert_eq!(stricter_with_host(allowed.clone(), None, false), allowed);
+        assert_eq!(
+            stricter_with_host(allowed.clone(), Some("loud"), false),
+            allowed
+        );
     }
 }

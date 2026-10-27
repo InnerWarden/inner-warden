@@ -1,6 +1,6 @@
 # InnerWarden Community Edition - the AI-agent guardrail, anywhere
 
-InnerWarden Community Edition is free and source-available. Its technical crate
+InnerWarden Community Edition is free and open source (Apache-2.0). Its technical crate
 and compatibility binary, `innerwarden`, provide a single, dependency-light CLI
 that screens what an AI agent tries to do **before it runs** and tags every
 verdict with its OWASP Agentic Top 10 id. Two surfaces, two bodies of signal:
@@ -12,7 +12,7 @@ alias `iw`).
 
 It is a thin wrapper over InnerWarden's `check-command` engine
 (`crates/agent-guard`). It does **not** need a sensor, kernel component, service,
-or system install. InnerWarden Active Defence adds host telemetry and response on
+or system install. InnerWarden Pro adds host telemetry and response on
 supported hosts; its eBPF sensor and Execution Gate are Linux-only. Community
 runs the same on **Linux, macOS, and Windows**, right where a developer runs an
 AI coding agent.
@@ -92,6 +92,6 @@ innerwarden check "$COMMAND" || { echo "blocked by InnerWarden"; exit 1; }
 ## Scope
 
 InnerWarden Community Edition is the **guardrail** half of InnerWarden - the
-layer that screens what an AI agent tries to do. InnerWarden Active Defence adds
+layer that screens what an AI agent tries to do. InnerWarden Pro adds
 the kernel-enforced host layer (eBPF detection and the Execution Gate that makes
 a denied binary impossible to run) on Linux.
