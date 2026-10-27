@@ -275,7 +275,22 @@ fn read_key_input(rest: &[String]) -> String {
 /// `innerwarden llm [set --url U --model M [--provider azure] [--key-env NAME]
 /// [--key-file PATH] | set-key [--stdin] | status]` - configure or show the
 /// optional second-opinion endpoint. Thin I/O.
+/// `llm` takes subcommands, not flags; a leading flag is refused by name
+/// instead of falling through to the status view (#223).
+fn parse_llm_flags(rest: &[String]) -> Result<(), String> {
+    match rest.first() {
+        Some(a) if a.starts_with('-') => {
+            Err(format!("unknown flag `{a}` for `llm`; use a subcommand (set, set-key)"))
+        }
+        _ => Ok(()),
+    }
+}
+
 pub fn cmd(rest: &[String]) -> std::process::ExitCode {
+    if let Err(msg) = parse_llm_flags(rest) {
+        eprintln!("innerwarden llm: {msg}");
+        return std::process::ExitCode::from(2);
+    }
     match rest.first().map(String::as_str) {
         Some("set") => {
             let mut cfg = load_config().unwrap_or_default();
@@ -360,5 +375,25 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
             }
             std::process::ExitCode::SUCCESS
         }
+    }
+}
+
+#[cfg(test)]
+mod flag_parse_tests {
+    use super::*;
+
+    #[test]
+    fn llm_without_a_leading_flag_is_fine() {
+        let none: Vec<String> = vec![];
+        assert!(parse_llm_flags(&none).is_ok());
+        let set = vec!["set".to_string(), "--url".to_string(), "http://x".to_string()];
+        assert!(parse_llm_flags(&set).is_ok());
+    }
+
+    #[test]
+    fn llm_refuses_a_leading_flag_by_name() {
+        let bogus = vec!["--bogus".to_string()];
+        let err = parse_llm_flags(&bogus).unwrap_err();
+        assert!(err.contains("`--bogus`") && err.contains("subcommand"), "{err}");
     }
 }
