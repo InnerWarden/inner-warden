@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { expect, test, type Page } from "@playwright/test";
 
 /**
@@ -33,6 +34,18 @@ test.beforeEach(async ({ page }) => {
   await page.clock.install({ time: FIXTURE_NOW });
 });
 
+test("the Enterprise tab title follows navigation and back", async ({ page }) => {
+  const bootstrap = JSON.parse(readFileSync(new URL("../fixtures/enterprise/cases-bootstrap.json", import.meta.url), "utf8"));
+  await page.route("**/api/dashboard/v1/bootstrap", (route) => route.fulfill({ json: bootstrap }));
+  await page.goto("/");
+  await expect(page).toHaveTitle("Overview - InnerWarden Enterprise");
+
+  await page.getByRole("navigation", { name: "Dashboard views" }).getByRole("button", { name: "Protection", exact: true }).click();
+  await expect(page).toHaveTitle("Protection - InnerWarden Enterprise");
+  await page.goBack();
+  await expect(page).toHaveTitle("Overview - InnerWarden Enterprise");
+});
+
 test("free mode: the host's line and step, Enterprise, free mode in the header and the title, and no Hide", async ({ page }) => {
   await withPlan(page, "free-mode");
   await page.goto("/");
@@ -48,7 +61,7 @@ test("free mode: the host's line and step, Enterprise, free mode in the header a
   await expect(notice(page).getByRole("button", { name: "Copy command: fixture-licence renew" })).toBeVisible();
   await expect(notice(page).getByRole("button", { name: "Hide" })).toHaveCount(0);
   await expect(page.getByText("Enterprise, free mode", { exact: true })).toBeVisible();
-  await expect(page).toHaveTitle("InnerWarden Enterprise, free mode: Agent Security");
+  await expect(page).toHaveTitle("Overview - InnerWarden Enterprise, free mode");
 });
 
 test("free mode is kept, notice and label, when a later bootstrap read fails, and is read again within a minute", async ({ page }) => {
@@ -76,6 +89,7 @@ test("a renewal is confirmed after the next read, says nothing is back on, and l
   await expect(notice(page)).toContainText("Each control shows its own state on Protection.");
   await expect(notice(page)).not.toContainText(/back on|restored|re-?enabled|protected/i);
   await expect(page.getByText("Enterprise", { exact: true })).toBeVisible();
+  await expect(page).toHaveTitle("Overview - InnerWarden Enterprise");
   // No read lands from here on: the confirmation still ends on time.
   await page.route("**/api/dashboard/v1/bootstrap", (route) => route.fulfill({ status: 503, json: { error: "unavailable" } }));
   await page.clock.fastForward(10 * 60_000 + 1_000);
@@ -113,5 +127,5 @@ test("no plan: the live region is there and empty, and the header says Enterpris
   await expect(page.getByText("Enterprise", { exact: true })).toBeVisible();
   await expect(page.locator("main > [data-shell-notice]")).toHaveCount(1);
   await expect(page.locator("[data-plan-notice]")).toHaveCount(0);
-  await expect(page).toHaveTitle("InnerWarden Enterprise: Agent Security");
+  await expect(page).toHaveTitle("Overview - InnerWarden Enterprise");
 });

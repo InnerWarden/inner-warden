@@ -671,6 +671,13 @@ export function App({
   const version = bootstrap?.product_version ?? (edition === "community" ? meta?.version : undefined);
   const community = edition === "community" ? communityScreens : undefined;
   const navigation = deriveShellNavigation(bootstrap, edition, contributed, community?.screens);
+  // A contributed screen can render its own unavailable state without a tab.
+  // It still names that page; loading without a known screen keeps the generic title.
+  const pageLabel = navigation.find((item) => item.route === route)?.label
+    ?? (edition === "enterprise" ? contributed.find((screen) => screen.route === route)?.label : undefined);
+  const pageTitle = pageLabel === undefined
+    ? `InnerWarden ${editionLabel}: Agent Security`
+    : `${pageLabel} - InnerWarden ${editionLabel}`;
   // The address's query string, kept in state so a Community screen re-reads
   // its own parameters when they change without the route changing.
   const [search, setSearch] = useState(() => window.location.search);
@@ -704,8 +711,8 @@ export function App({
   }, [alias]);
 
   useEffect(() => {
-    document.title = `InnerWarden ${editionLabel}: Agent Security`;
-  }, [editionLabel]);
+    document.title = pageTitle;
+  }, [pageTitle]);
 
   // Fed the last bootstrap read well: a failed read keeps the retained one,
   // so it never changes what the notice says (`planStep`).
