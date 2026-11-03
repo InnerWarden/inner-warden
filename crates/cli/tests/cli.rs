@@ -94,11 +94,12 @@ fn benign_command_allows_with_exit_0() {
 }
 
 #[test]
-fn reads_command_from_stdin() {
+fn check_reads_command_from_stdin_without_stderr_noise() {
     let mut child = cli()
         .arg("check")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("spawn innerwarden");
     child
@@ -114,6 +115,11 @@ fn reads_command_from_stdin() {
         "reverse shell on stdin must deny"
     );
     assert!(String::from_utf8_lossy(&out.stdout).contains("\"deny\""));
+    assert!(
+        out.stderr.is_empty(),
+        "piped check must stay quiet on stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]
