@@ -14968,3 +14968,19 @@ mod mutant_kills_t5;
 #[cfg(test)]
 #[path = "mutant_kills/threats_t6.rs"]
 mod mutant_kills_t6;
+
+#[cfg(test)]
+#[path = "mutant_kills/threats_t7.rs"]
+mod mutant_kills_t7;
+
+#[cfg(test)]
+#[path = "mutant_kills/threats_t8.rs"]
+mod mutant_kills_t8;
+
+#[cfg(test)]
+#[path = "mutant_kills/threats_t9.rs"]
+mod mutant_kills_t9;
+
+#[cfg(test)]
+#[path = "mutant_kills/threats_t11.rs"]
+mod mutant_kills_t11;
