@@ -212,6 +212,17 @@ jobs:
         # tests ran and no test binary ran under the cap, the shard fails: a
         # protection that is silently absent is how a third of this sweep went
         # missing.
+        #
+        # KNOWN SURVIVORS. The first sweep to finish all forty shards (run
+        # 42634801508, 2026-11-09, 58 to 107 minutes a shard) tested 4,372
+        # mutants and left 1,023 survivors: 899 missed and 124 timeouts. Red
+        # every Sunday for those says nothing new, so they are listed in
+        # crates/agent-guard/mutants-baseline.txt with a reason each, and a
+        # shard fails only on a survivor that is NOT in the list
+        # (scripts/mutants-baseline-check.sh). The list is burned down by
+        # priority: a test that kills one deletes its line in the same commit.
+        # A timeout counts as a survivor. The nightly diff job does not read
+        # the list: code changed today must have no survivor at all.
         run: |
           triple=$(rustc -vV | sed -n 's/^host: //p')
           export "CARGO_TARGET_$(printf '%s' "$triple" | tr 'a-z-' 'A-Z_')_RUNNER=$GITHUB_WORKSPACE/scripts/mutants-test-runner.sh"
@@ -231,9 +242,15 @@ jobs:
             exit 1
           fi
           case "$code" in
-            0)   echo "Shard ${{ matrix.shard }}/40 clean." ;;
-            2)   echo "::error::A mutant survived in shard ${{ matrix.shard }}: the tests do not check that line."; exit 1 ;;
-            3)   echo "::error::cargo-mutants hit its own per-mutant timeout in shard ${{ matrix.shard }}."; exit 1 ;;
+            # 0 clean, 2 survivors, 3 timeouts: the shard finished, and the
+            # baseline decides whether any survivor is new.
+            0|2|3)
+              if bash scripts/mutants-baseline-check.sh crates/agent-guard/mutants-baseline.txt mutants.out; then
+                echo "Shard ${{ matrix.shard }}/40: no survivor outside crates/agent-guard/mutants-baseline.txt."
+              else
+                echo "::error::A mutant survived in shard ${{ matrix.shard }} that is not in crates/agent-guard/mutants-baseline.txt: a line the tests do not check. Kill it with a test; list it only if it is equivalent, with the reason."
+                exit 1
+              fi ;;
             124) echo "::error::Shard ${{ matrix.shard }} did not finish in 150m. The sweep is larger than the budget: re-measure and raise the shard count."; exit 1 ;;
             *)   echo "::error::cargo-mutants exited $code in shard ${{ matrix.shard }}."; exit 1 ;;
           esac
