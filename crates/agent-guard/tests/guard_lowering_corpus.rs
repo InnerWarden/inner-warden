@@ -293,6 +293,50 @@ fn deny_cases() -> Vec<(String, String)> {
         "innerwarden-'ctl' agent disconnect claude-code".into(),
         "quote-split|innerwarden-ctl|disconnect".into(),
     ));
+    // An inner shell handed the invocation as one backslash-escaped word,
+    // through double quotes: `sh -c "sh -c innerwarden\ allow\ x"`. Inside
+    // double quotes the shell keeps a backslash before a space, so the inner
+    // shell gets `innerwarden\ allow\ x` and runs the CLI with its verb. The
+    // tokeniser dropped those backslashes and read the bare CLI (2026-11-09,
+    // measured: the command ran `innerwarden allow x` under sh and bash).
+    for name in NAMES {
+        for verb in VERBS {
+            if name.ctl_name && !verb.ctl {
+                continue;
+            }
+            let command = format!("{} {}", name.program, verb.tail);
+            if command.contains('\'') {
+                continue;
+            }
+            let escaped = command.replace(' ', "\\ ");
+            for shell in ["sh", "bash"] {
+                cases.push((
+                    format!("{shell} -c \"sh -c {escaped}\""),
+                    format!("{}|{}|{shell} -c dq-escaped", name.program, verb.tail),
+                ));
+            }
+        }
+    }
+    // A code runner handed the verb with an escaped `-`: awk decodes `\-` to
+    // `-` itself, and perl's system() hands `dry\-run` to sh, which does. The
+    // code-runner backstop split the verb at the backslash once double-quoted
+    // text kept it (2026-11-09, measured: both ran the verb).
+    for name in NAMES {
+        for verb in VERBS {
+            if name.ctl_name && !verb.ctl || !verb.tail.contains('-') || verb.tail.contains('\'') {
+                continue;
+            }
+            let command = format!("{} {}", name.program, verb.tail.replace('-', "\\-"));
+            cases.push((
+                format!("awk \"BEGIN{{system(\\\"{command}\\\")}}\""),
+                format!("{}|{}|awk escaped-dash", name.program, verb.tail),
+            ));
+            cases.push((
+                format!("perl -e \"system('{command}')\""),
+                format!("{}|{}|perl escaped-dash", name.program, verb.tail),
+            ));
+        }
+    }
     cases
 }
 
@@ -324,6 +368,10 @@ fn allow_cases() -> Vec<(String, String)> {
         ("echo 'iw dry-run'".into(), "control|echo".into()),
         ("env -S 'ls -la'".into(), "control|env-ls".into()),
         ("I=iw; echo $I".into(), "control|echo-var".into()),
+        (
+            "sh -c \"echo innerwarden\\ dry-run\"".into(),
+            "control|dq-escaped-echo".into(),
+        ),
     ]
 }
 

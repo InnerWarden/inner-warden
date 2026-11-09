@@ -2509,12 +2509,26 @@ fn text_runs_guard_verb_named(text: &str, only: &[&str], name: &str) -> bool {
         let end = tail
             .find([';', '|', '&', ')', ']', '\n'])
             .unwrap_or(tail.len());
-        let arguments: Vec<String> = tail[..end]
-            // A `\` splits too: `'innerwarden dry-run\n'` in a `printf`
-            // or `$'...'` string ends the verb at the escape.
-            .split(|c: char| {
-                c.is_whitespace() || matches!(c, '\'' | '"' | ',' | '[' | '(' | '`' | '\\')
-            })
+        // Escapes as the program handed the text reads them: `\n`, `\t` and
+        // `\r` in a `printf` or `$'...'` string end the verb at the escape
+        // (`'innerwarden dry-run\n'`); any other escaped character is that
+        // character, so `dry\-run` is `dry-run` to sh, perl's system() and
+        // awk alike. Splitting there instead read `dry` and `-run` and missed
+        // the verb, once double-quoted text kept its backslashes.
+        let mut decoded = String::with_capacity(end);
+        let mut characters = tail[..end].chars();
+        while let Some(character) = characters.next() {
+            if character != '\\' {
+                decoded.push(character);
+                continue;
+            }
+            match characters.next() {
+                Some('n' | 't' | 'r') | None => decoded.push(' '),
+                Some(escaped) => decoded.push(escaped),
+            }
+        }
+        let arguments: Vec<String> = decoded
+            .split(|c: char| c.is_whitespace() || matches!(c, '\'' | '"' | ',' | '[' | '(' | '`'))
             .filter(|token| !token.is_empty())
             .map(str::to_string)
             .collect();
@@ -9194,13 +9208,24 @@ pub(crate) fn shell_tokens(segment: &str) -> Vec<String> {
     let mut single_quoted = false;
     let mut double_quoted = false;
     let mut escaped = false;
-    for character in segment.chars() {
+    let mut characters = segment.chars().peekable();
+    while let Some(character) = characters.next() {
         if escaped {
             word.push(character);
             escaped = false;
             continue;
         }
         if character == '\\' && !single_quoted {
+            // Inside double quotes a backslash escapes only `$`, `` ` ``, `"`,
+            // `\` and a newline; before anything else the shell keeps it. So
+            // `sh -c "sh -c innerwarden\ allow\ x"` hands the inner shell
+            // `innerwarden\ allow\ x`, which it reads as ONE word: the CLI with
+            // its verb, run. Dropping the backslash here read the inner line as
+            // the bare CLI with arguments, and the lowering was allowed.
+            if double_quoted && !matches!(characters.peek(), Some('$' | '`' | '"' | '\\' | '\n')) {
+                word.push(character);
+                continue;
+            }
             escaped = true;
             continue;
         }
@@ -14946,5 +14971,47 @@ mod privileged_write_target_tests {
                 "not a decision: {cmd}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod shell_tokens_tests {
+    use super::shell_tokens;
+
+    /// Inside double quotes the shell keeps a backslash unless it escapes `$`,
+    /// `` ` ``, `"`, `\` or a newline. `sh -c "sh -c innerwarden\ allow\ x"`
+    /// hands the inner shell `innerwarden\ allow\ x`, one word to it, and that
+    /// ran `innerwarden allow x` under sh and bash while the guard read the
+    /// bare CLI and allowed it (2026-11-09).
+    ///
+    /// FAILS ON REVERT: drop the double-quoted branch that keeps the
+    /// backslash, and the inner line loses its escapes.
+    #[test]
+    fn a_double_quoted_backslash_is_kept_unless_it_escapes_something() {
+        assert_eq!(
+            shell_tokens(r#"sh -c "sh -c innerwarden\ allow\ x""#),
+            ["sh", "-c", r"sh -c innerwarden\ allow\ x"],
+            "the inner shell must get the escapes the outer one leaves"
+        );
+        assert_eq!(
+            shell_tokens(r#"echo "\$HOME \" \\ \` \a""#),
+            ["echo", "$HOME \" \\ ` \\a"],
+            "`$`, `\"`, `\\` and the backtick lose the backslash; `\\a` keeps it"
+        );
+        assert_eq!(
+            shell_tokens(r#"echo "C:\Users\x""#),
+            ["echo", r"C:\Users\x"],
+            "a Windows path in double quotes keeps its backslashes"
+        );
+        assert_eq!(
+            shell_tokens(r"sh -c innerwarden\ allow\ x"),
+            ["sh", "-c", "innerwarden allow x"],
+            "outside quotes a backslash escapes any character"
+        );
+        assert_eq!(
+            shell_tokens(r"echo 'a\ b'"),
+            ["echo", r"a\ b"],
+            "inside single quotes nothing is an escape"
+        );
     }
 }
