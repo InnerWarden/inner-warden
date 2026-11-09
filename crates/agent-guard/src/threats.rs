@@ -2163,25 +2163,27 @@ fn words_run_guard_loosening_verb_fed(words: &[String], depth: u8, mut fed: bool
     // substitution's output is the command word.
     let mut in_substitution = false;
     for (index, word) in words.iter().enumerate() {
+        // The words after this one: its arguments, or the command line a
+        // launcher in front of it hands on. Every arm below reads these.
+        let rest = &words[index + 1..];
         let dollar = word == "$";
         let lower = word.to_ascii_lowercase();
         let lower = lower.trim_matches('`');
         let base = token_basename(lower);
         let base = base.strip_suffix(".exe").unwrap_or(base);
         if is_guard_cli_name(base) {
-            let arguments = &words[index + 1..];
-            return guard_verb_loosens(arguments) || (fed && guard_verb_is_fed(arguments));
+            return guard_verb_loosens(rest) || (fed && guard_verb_is_fed(rest));
         }
         // Active Defence's ctl takes the guard off an agent with verbs of its
         // own (`agent disconnect`, `agent install-hook --remove|--monitor`,
         // `uninstall`): read through the same parse.
         if base == "innerwarden-ctl" {
-            return ctl_verb_loosens(&words[index + 1..]);
+            return ctl_verb_loosens(rest);
         }
         if base == "find" {
             // `find ... -exec innerwarden allow {} \;`: the command after
             // `-exec` runs once per file found, with the file as an argument.
-            return words[index + 1..]
+            return rest
                 .iter()
                 .position(|w| matches!(w.as_str(), "-exec" | "-execdir" | "-ok" | "-okdir"))
                 .is_some_and(|at| {
@@ -2200,15 +2202,15 @@ fn words_run_guard_loosening_verb_fed(words: &[String], depth: u8, mut fed: bool
             continue;
         }
         if SHELLS.contains(&base) || matches!(base, "script" | "su") {
-            return command_string_argument(base, &words[index + 1..])
+            return command_string_argument(base, rest)
                 .is_some_and(|payload| runs_guard_loosening_verb(payload, depth + 1));
         }
         if base == "eval" {
-            return runs_guard_loosening_verb(&words[index + 1..].join(" "), depth + 1);
+            return runs_guard_loosening_verb(&rest.join(" "), depth + 1);
         }
         if matches!(base, "npm" | "pnpm" | "yarn" | "bun")
-            && words
-                .get(index + 1)
+            && rest
+                .first()
                 .is_some_and(|next| matches!(next.as_str(), "exec" | "dlx" | "x"))
         {
             after_option = true;
@@ -2221,9 +2223,8 @@ fn words_run_guard_loosening_verb_fed(words: &[String], depth: u8, mut fed: bool
             // The text it is handed, and the guard's CLI by any of its names
             // as a word of it (`watch -n 1 iw-guard uninstall`, `ssh host iw
             // dry-run`; live gate of Active Defence 0.17.6, K1).
-            let handed = &words[index + 1..];
-            return code_text_runs_guard_verb(&handed.join(" "))
-                || guard_cli_named_later_loosens(handed);
+            return code_text_runs_guard_verb(&rest.join(" "))
+                || guard_cli_named_later_loosens(rest);
         }
         let skippable = after_option
             || dollar
@@ -2243,8 +2244,7 @@ fn words_run_guard_loosening_verb_fed(words: &[String], depth: u8, mut fed: bool
             // program in front (live gate of Active Defence 0.17.6, K1: a
             // wrapper not on a list took the hook off). A program that only
             // reads or prints text holds the name as text.
-            return !words_only_read(&words[index..])
-                && guard_cli_named_later_loosens(&words[index + 1..]);
+            return !words_only_read(&words[index..]) && guard_cli_named_later_loosens(rest);
         }
         after_option = word.starts_with('-') && !word.contains('=') && !after_option;
         in_substitution = dollar;
@@ -14965,3 +14965,6 @@ mod mutant_kills_t4;
 #[cfg(test)]
 #[path = "mutant_kills/threats_t5.rs"]
 mod mutant_kills_t5;
+#[cfg(test)]
+#[path = "mutant_kills/threats_t6.rs"]
+mod mutant_kills_t6;
