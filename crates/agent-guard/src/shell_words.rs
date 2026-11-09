@@ -754,6 +754,109 @@ fn matching_close(chars: &[char], start: usize, open: char, close: char) -> Opti
     None
 }
 
+/// What an unquoted `(` opened, for the byte-at-a-time readers of a line
+/// (`threats::shell_command_segments`, `threats::shell_tokens`, the
+/// projection's `shell::text_as_the_shell_reads`), which need to know what
+/// its `)` does to the word around it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParenKind {
+    /// A `(` where a word starts: a subshell, or the outer `(` of an
+    /// arithmetic command `((`. Its `)` is an operator, so a word starts
+    /// after it and a `#` there opens a comment (`(true)#x` runs `true`
+    /// alone, in sh, bash and dash).
+    Operator,
+    /// A `(` glued to the word before it (`$(`, `a=(`, `@(`) or to a
+    /// redirection operator (`<(`, `>(`): its `)` is a character of that
+    /// word, which goes on. `a=$(date)#;innerwarden allow x` holds no
+    /// comment to the shell, and the lowering after the `;` runs (measured
+    /// 2026-11-09 in sh, bash and dash; `<(` in bash).
+    InWord,
+    /// The second `(` of `$((` or `((`: arithmetic, where `<<` is a shift
+    /// and opens no here-document.
+    Arithmetic,
+    /// Not a `(`: a `case` read and its `esac` not yet, so a `)` with no
+    /// `(` open since is a pattern's end, an operator (`a)# note` holds a
+    /// comment), and does not close the `$(` the `case` is in.
+    Case,
+}
+
+/// The `(` still open while a line is read, innermost last. One entry per
+/// unquoted `(` read and not yet closed, and per `case` not yet ended, so it
+/// holds no more than the line is long.
+#[derive(Debug, Default)]
+pub(crate) struct OpenParens {
+    open: Vec<ParenKind>,
+    arithmetic: usize,
+}
+
+impl OpenParens {
+    /// An unquoted `(` is read. `glued` when it follows a character of a
+    /// word or a redirection operator, `after_paren` when the character right
+    /// before it is an unquoted `(`.
+    pub(crate) fn open(&mut self, glued: bool, after_paren: bool) {
+        let kind = if after_paren {
+            ParenKind::Arithmetic
+        } else if glued {
+            ParenKind::InWord
+        } else {
+            ParenKind::Operator
+        };
+        self.arithmetic += usize::from(kind == ParenKind::Arithmetic);
+        self.open.push(kind);
+    }
+
+    /// An unquoted `)` is read: whether the word it is in goes on after it.
+    /// A `)` with no `(` open and no `case` (a `(` this reading missed) is
+    /// taken to go on: a `#` right after it is then a character, which reads
+    /// more of the line, never less, than taking it for a comment.
+    pub(crate) fn close_continues_word(&mut self) -> bool {
+        let Some(&kind) = self.open.last() else {
+            return true;
+        };
+        if kind == ParenKind::Case {
+            return false;
+        }
+        self.open.pop();
+        match kind {
+            ParenKind::Operator | ParenKind::Case => false,
+            ParenKind::Arithmetic => {
+                self.arithmetic -= 1;
+                true
+            }
+            ParenKind::InWord => true,
+        }
+    }
+
+    /// An unquoted word starts where a command does, with `rest` (the line
+    /// from its first character; five are read): `case` opens a case, whose
+    /// pattern `)`s are operators, and `esac` ends the innermost one when
+    /// nothing opened after it is still open. Read only where a command
+    /// starts, as the shell reads them: `$(echo case x)#` is one word. A
+    /// `case` after a word this reading does not take for a command's start
+    /// (`then case`, `{ case`) is missed, and its pattern `)` is then read
+    /// as going on, which reads more of the line, never less.
+    pub(crate) fn command_word_starts(&mut self, rest: impl Iterator<Item = char>) {
+        let head: Vec<char> = rest.take(5).collect();
+        let ends_word = |c: Option<&char>| {
+            c.is_none_or(|c| c.is_whitespace() || matches!(c, ';' | '&' | '|' | ')'))
+        };
+        if head.starts_with(&['c', 'a', 's', 'e']) && head.get(4).is_some_and(|c| c.is_whitespace())
+        {
+            self.open.push(ParenKind::Case);
+        } else if head.starts_with(&['e', 's', 'a', 'c'])
+            && ends_word(head.get(4))
+            && self.open.last() == Some(&ParenKind::Case)
+        {
+            self.open.pop();
+        }
+    }
+
+    /// Inside `$((...))` or `((...))`, where `<<` is a shift.
+    pub(crate) fn in_arithmetic(&self) -> bool {
+        self.arithmetic > 0
+    }
+}
+
 /// One escape of a `$'...'` string, `chars` starting after its backslash:
 /// the character it stands for (none for `\c` at the end) and how many
 /// characters it used. Shared with the guard's own word reading
@@ -800,6 +903,31 @@ pub(crate) fn ansi_c_escape(chars: &[char]) -> (Option<char>, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What a `)` does to the word around it, as sh, bash and dash read it
+    /// (measured 2026-11-09): a substitution's or an array's leaves it going
+    /// on, a subshell's and a `case` pattern's end it, and in `$((`/`((` a
+    /// `<<` is a shift.
+    #[test]
+    fn a_closing_paren_ends_the_word_as_the_shell_ends_it() {
+        let mut parens = OpenParens::default();
+        parens.open(true, false);
+        parens.open(false, true);
+        assert!(parens.in_arithmetic(), "$((");
+        assert!(parens.close_continues_word());
+        assert!(!parens.in_arithmetic());
+        assert!(parens.close_continues_word(), "the `)` of `$(` goes on");
+        parens.open(false, false);
+        assert!(!parens.close_continues_word(), "a subshell's `)` ends it");
+        parens.command_word_starts("case x in".chars());
+        assert!(!parens.close_continues_word(), "a pattern's `)` ends it");
+        assert!(!parens.close_continues_word(), "and keeps the case open");
+        parens.command_word_starts("esac;".chars());
+        assert!(parens.close_continues_word(), "a stray `)` reads on");
+        parens.command_word_starts("cases".chars());
+        parens.command_word_starts("esac".chars());
+        assert!(parens.close_continues_word(), "`cases` opens no case");
+    }
 
     fn words(line: &Line) -> Vec<Vec<String>> {
         line.commands

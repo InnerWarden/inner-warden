@@ -718,7 +718,7 @@ fn check_guard_self_disable_read(content: &str) -> Option<(&'static str, u32)> {
         if changes_kernel_protection(content) {
             return Some((KERNEL_PROTECTION_CHANGE, 60));
         }
-        if content.contains(['*', '?', '[']) && runs_guard_loosening_verb(content, 0) {
+        if content.contains(['*', '?', '[']) && runs_guard_loosening_verb(content) {
             return Some((GUARD_LOOSENING_VERB, 60));
         }
         let normalized = normalize_command(content);
@@ -907,7 +907,7 @@ fn guard_self_disable_in(content: &str) -> Option<(&'static str, u32)> {
     {
         return None;
     }
-    if runs_guard_loosening_verb(content, 0) {
+    if runs_guard_loosening_verb(content) {
         return Some((GUARD_LOOSENING_VERB, 60));
     }
     if mode_verb_text_outside_a_reader(content) {
@@ -2071,8 +2071,110 @@ const COMMAND_LAUNCHERS: &[&str] = &[
 ///
 /// Reading the lists (`allow --list`, a bare `allow`) and removing an entry
 /// (`--remove`, which only narrows) are not a loosening.
-fn runs_guard_loosening_verb(content: &str, depth: u8) -> bool {
+///
+/// The reading is paid from one [`ReadingBudget`] for the whole line. When it
+/// runs out (a line built to cost more than its length allows, or nested
+/// deeper than four command strings), a line that names the guard or a verb
+/// that lowers it is taken to lower it: the hook has a 9 to 17 s timeout, and
+/// a harness that goes on after a timeout would turn a slow reading into a
+/// bypass.
+fn runs_guard_loosening_verb(content: &str) -> bool {
+    let budget = ReadingBudget::for_line(content);
+    runs_guard_loosening_verb_in(content, 0, &budget)
+        || (budget.ran_out() && line_touches_guard(content))
+}
+
+/// What one reading of a line for a guard lowering may spend, in bytes and
+/// words read: a bounded multiple of the line's length. Every reading of a
+/// part of the line again (a `sh -c` string, an `env -S` string, a process
+/// substitution, text piped into a shell, `eval`) pays from it, so no way of
+/// nesting them makes the line cost more than that, and the reading stops
+/// short instead (review of 1877717, 2026-11-09: a run of bare `<` read the
+/// rest of the line again at each one, 2^k readings, and 180 bytes kept the
+/// hook past its timeout).
+struct ReadingBudget {
+    left: std::cell::Cell<usize>,
+    ran_out: std::cell::Cell<bool>,
+}
+
+impl ReadingBudget {
+    /// Sixteen times the line, and a floor for a short one: a line nested
+    /// four deep reads each byte about twice per level, well inside it.
+    fn for_line(content: &str) -> Self {
+        Self {
+            left: std::cell::Cell::new(content.len().saturating_mul(16).saturating_add(4096)),
+            ran_out: std::cell::Cell::new(false),
+        }
+    }
+
+    /// Pays `cost`: `false` when not enough is left, and the reading is
+    /// then cut short.
+    fn spend(&self, cost: usize) -> bool {
+        match self.left.get().checked_sub(cost) {
+            Some(left) => {
+                self.left.set(left);
+                true
+            }
+            None => {
+                self.cut_short();
+                false
+            }
+        }
+    }
+
+    fn cut_short(&self) {
+        self.left.set(0);
+        self.ran_out.set(true);
+    }
+
+    fn ran_out(&self) -> bool {
+        self.ran_out.get()
+    }
+}
+
+/// Words that lower the guard after its CLI's name, or tell it to.
+const GUARD_LOWERING_WORDS: &[&str] = &[
+    "allow",
+    "mute",
+    "dry-run",
+    "monitor",
+    "--monitor",
+    "disconnect",
+    "uninstall",
+    "contain",
+    "install-hook",
+    "--remove",
+    "approve",
+    "profile",
+    "revoke",
+];
+
+/// Whether a line names the guard's CLI by any of its names (Active
+/// Defence's ctl too), or a word that lowers the guard, once the shell's
+/// quoting is read (`$'\151w'`, `i''w`): the lines a reading cut short
+/// refuses, rather than lets through.
+fn line_touches_guard(content: &str) -> bool {
+    content.to_ascii_lowercase().contains("innerwarden")
+        || names_guard_alias(content)
+        || shell_tokens(content).iter().any(|word| {
+            let lower = word.to_ascii_lowercase();
+            let lower = lower.trim_matches('`');
+            let base = token_basename(lower);
+            let base = base.strip_suffix(".exe").unwrap_or(base);
+            base.contains("innerwarden")
+                || is_guard_cli_name(base)
+                || GUARD_LOWERING_WORDS.contains(&lower)
+        })
+}
+
+/// [`runs_guard_loosening_verb`] at `depth` command strings in, paying from
+/// `budget`.
+fn runs_guard_loosening_verb_in(content: &str, depth: u8, budget: &ReadingBudget) -> bool {
     if depth > 4 {
+        budget.cut_short();
+        return false;
+    }
+    if !budget.spend(content.len().saturating_add(1)) {
         return false;
     }
     let segments = shell_command_segments(content);
@@ -2088,7 +2190,16 @@ fn runs_guard_loosening_verb(content: &str, depth: u8) -> bool {
     }
     for (index, segment) in segments.iter().enumerate() {
         let words = shell_tokens(segment);
-        if words_run_guard_loosening_verb(&words, depth) {
+        if words_run_guard_loosening_verb(&words, depth, budget) {
+            return true;
+        }
+        // `<(innerwarden allow x)`, `cat <(iw dry-run)`, `tee >(sh)`: the
+        // command in a process substitution runs, wherever it stands in the
+        // line (bash; measured 2026-11-09).
+        if process_substitutions(segment)
+            .into_iter()
+            .any(|inner| runs_guard_loosening_verb_in(inner, depth + 1, budget))
+        {
             return true;
         }
         // `echo "os.system('innerwarden mute x')" | python3`
@@ -2121,7 +2232,7 @@ fn runs_guard_loosening_verb(content: &str, depth: u8) -> bool {
                     "echo" | "printf"
                 )
             })
-            && runs_guard_loosening_verb(&words[1..].join(" "), depth + 1)
+            && runs_guard_loosening_verb_in(&words[1..].join(" "), depth + 1, budget)
         {
             return true;
         }
@@ -2129,9 +2240,68 @@ fn runs_guard_loosening_verb(content: &str, depth: u8) -> bool {
     false
 }
 
+/// The command text of each process substitution (`<(...)`, `>(...)`)
+/// outside quotes in `segment`, nested ones left inside the text of the one
+/// they are in (a reading of that text finds them). A substitution that does
+/// not close in the segment runs to its end: the segment was cut at a `;` or
+/// a `|` inside it, and what follows is a segment of its own. One pass over
+/// the segment.
+fn process_substitutions(segment: &str) -> Vec<&str> {
+    let bytes = segment.as_bytes();
+    let mut found = Vec::new();
+    let mut quote: Option<u8> = None;
+    let mut ansi_c = false;
+    // Inside a substitution: where its text starts, and the `(` still open.
+    let mut open: Option<(usize, usize)> = None;
+    let mut index = 0usize;
+    while let Some(&byte) = bytes.get(index) {
+        index += 1;
+        match (quote, byte) {
+            (Some(b'\''), b'\\') if ansi_c => index += 1,
+            (Some(b'\''), b'\'') => {
+                quote = None;
+                ansi_c = false;
+            }
+            (Some(b'\''), _) => {}
+            (_, b'\\') => index += 1,
+            (Some(b'"'), b'"') => quote = None,
+            (Some(_), _) => {}
+            (None, b'\'') => {
+                quote = Some(b'\'');
+                ansi_c = index >= 2 && bytes[index - 2] == b'$';
+            }
+            (None, b'"') => quote = Some(b'"'),
+            (None, b'<' | b'>') if open.is_none() && bytes.get(index) == Some(&b'(') => {
+                index += 1;
+                open = Some((index, 1));
+            }
+            (None, b'(') => {
+                if let Some((_, depth)) = open.as_mut() {
+                    *depth += 1;
+                }
+            }
+            (None, b')') => {
+                if let Some((start, depth)) = open {
+                    if depth == 1 {
+                        found.push(&segment[start..index - 1]);
+                        open = None;
+                    } else {
+                        open = Some((start, depth - 1));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some((start, _)) = open {
+        found.push(&segment[start.min(segment.len())..]);
+    }
+    found
+}
+
 /// [`runs_guard_loosening_verb`] on the words of one simple command.
-fn words_run_guard_loosening_verb(words: &[String], depth: u8) -> bool {
-    words_run_guard_loosening_verb_fed(words, depth, false)
+fn words_run_guard_loosening_verb(words: &[String], depth: u8, budget: &ReadingBudget) -> bool {
+    words_run_guard_loosening_verb_fed(words, depth, false, budget)
 }
 
 /// Words that run a later word as a command and hand it arguments of their
@@ -2157,29 +2327,47 @@ fn is_guard_cli_name(base: &str) -> bool {
 
 /// [`words_run_guard_loosening_verb`], with `fed` set when a word before the
 /// command (`xargs`, `parallel`, `find -exec`) supplies arguments of its own.
-fn words_run_guard_loosening_verb_fed(words: &[String], depth: u8, mut fed: bool) -> bool {
+///
+/// One pass over the words, paid from `budget`; a reading of a part of them
+/// again (`env -S`) happens at most once per pass.
+fn words_run_guard_loosening_verb_fed(
+    words: &[String],
+    depth: u8,
+    mut fed: bool,
+    budget: &ReadingBudget,
+) -> bool {
+    // `find -exec find -exec ...` and `env -S` strings read words again one
+    // level in: past four, the reading is cut short, as a command string is.
+    if depth > 4 {
+        budget.cut_short();
+        return false;
+    }
+    if !budget.spend(words.len().saturating_add(1)) {
+        return false;
+    }
     let mut after_option = false;
     // `$(echo innerwarden) allow x` and `` `echo innerwarden` allow x ``: the
     // substitution's output is the command word.
     let mut in_substitution = false;
     // The word before was a redirection whose target this word is.
     let mut redirection_target = false;
+    // An `env -S` string was already read as a command line in this pass.
+    let mut env_split_read = false;
     for (index, word) in words.iter().enumerate() {
         // A redirection, and its target, are not words of the command: the
         // command is the first word that is neither (`</bin/cat innerwarden
         // allow x` runs `innerwarden allow x` with `/bin/cat` on its input,
         // and `3</bin/wc` is the same on descriptor 3; measured 2026-11-09,
-        // the reader the target names was taken for the command).
+        // the reader the target names was taken for the command). The
+        // command of a process substitution (`<(innerwarden allow x)`, which
+        // reaches here as `<` and its words) is read from the segment's text
+        // ([`process_substitutions`]), not by reading the words after every
+        // `<` again: that cost 2^k readings for k of them (review of
+        // 1877717).
         if std::mem::take(&mut redirection_target) {
             continue;
         }
         if let Some(target_follows) = redirection_word(word) {
-            // `<(innerwarden allow x)` reaches here as `<` and the words of
-            // the substitution, which runs: that reading is kept.
-            if target_follows && words_run_guard_loosening_verb_fed(&words[index + 1..], depth, fed)
-            {
-                return true;
-            }
             redirection_target = target_follows;
             continue;
         }
@@ -2189,14 +2377,15 @@ fn words_run_guard_loosening_verb_fed(words: &[String], depth: u8, mut fed: bool
         let base = token_basename(lower);
         let base = base.strip_suffix(".exe").unwrap_or(base);
         if is_guard_cli_name(base) {
-            let arguments = &words[index + 1..];
-            return guard_verb_loosens(arguments) || (fed && guard_verb_is_fed(arguments));
+            return guard_arguments_loosen(&words[index + 1..], |arguments| {
+                guard_verb_loosens(arguments) || (fed && guard_verb_is_fed(arguments))
+            });
         }
         // Active Defence's ctl takes the guard off an agent with verbs of its
         // own (`agent disconnect`, `agent install-hook --remove|--monitor`,
         // `uninstall`): read through the same parse.
         if base == "innerwarden-ctl" {
-            return ctl_verb_loosens(&words[index + 1..]);
+            return guard_arguments_loosen(&words[index + 1..], ctl_verb_loosens);
         }
         if base == "find" {
             // `find ... -exec innerwarden allow {} \;`: the command after
@@ -2210,7 +2399,7 @@ fn words_run_guard_loosening_verb_fed(words: &[String], depth: u8, mut fed: bool
                         .take_while(|w| !matches!(w.as_str(), ";" | "+"))
                         .cloned()
                         .collect();
-                    words_run_guard_loosening_verb_fed(&command, depth, true)
+                    words_run_guard_loosening_verb_fed(&command, depth + 1, true, budget)
                 });
         }
         if ARGUMENT_FEEDERS.contains(&base) {
@@ -2222,31 +2411,39 @@ fn words_run_guard_loosening_verb_fed(words: &[String], depth: u8, mut fed: bool
         if SHELLS.contains(&base) || matches!(base, "script" | "su") {
             let arguments = &words[index + 1..];
             if let Some(payload) = command_string_argument(base, arguments) {
-                return runs_guard_loosening_verb(payload, depth + 1);
+                return runs_guard_loosening_verb_in(payload, depth + 1, budget);
             }
             // `sh <<<'innerwarden allow x'`: a shell given no command string
             // and no script file reads its commands from its input, and a
             // here-string is that input (measured 2026-11-09).
             return SHELLS.contains(&base)
                 && shell_here_string_script(arguments)
-                    .is_some_and(|script| runs_guard_loosening_verb(script, depth + 1));
+                    .is_some_and(|script| runs_guard_loosening_verb_in(script, depth + 1, budget));
         }
         if base == "eval" {
-            return runs_guard_loosening_verb(&words[index + 1..].join(" "), depth + 1);
+            return runs_guard_loosening_verb_in(&words[index + 1..].join(" "), depth + 1, budget);
         }
         // `env -S 'innerwarden allow x'`: env splits the string into words
         // and runs them, the words after it appended, so the string is read
         // as a command line, as `sh -c` is, not as an option's value
         // (measured 2026-11-09: only the text backstop read it, and its verb
         // list has no `allow`). The reading without it below still runs.
-        if base == "env" && depth < 4 {
+        // Once per pass: that reading holds the rest of the words, and a
+        // later `env -S` in them is read there, one level in, so `env -S
+        // X=1` repeated k times costs one pass per level, not the k^4
+        // passes a reading at each one cost (80 of them, 880 bytes, took
+        // 15 s on the lab box, 2026-11-09). A chain deeper than the levels
+        // allowed cuts the reading short, which refuses a line naming the
+        // guard ([`runs_guard_loosening_verb`]).
+        if base == "env" && !env_split_read {
             let split = env_split_string(&words[index + 1..])
                 .and_then(|(split, after)| Some((env_split_words(split)?, after)));
             if let Some((split, after)) = split {
+                env_split_read = true;
                 let mut line = vec!["env".to_string()];
                 line.extend(split);
                 line.extend(words[index + 1 + after..].iter().cloned());
-                if words_run_guard_loosening_verb_fed(&line, depth + 1, fed) {
+                if words_run_guard_loosening_verb_fed(&line, depth + 1, fed, budget) {
                     return true;
                 }
             }
@@ -2297,12 +2494,17 @@ fn words_run_guard_loosening_verb_fed(words: &[String], depth: u8, mut fed: bool
 }
 
 /// A redirection as [`shell_tokens`] hands it: `Some(true)` for an operator
-/// whose target is the next word (`<`, `2>`, `<<<`, `<<-`), `Some(false)` for
-/// one whose target is glued on (`</bin/cat`, `3</bin/wc`, `2>/dev/null`,
-/// `<<<text`) or that needs none (`>&-`), and `None` for a word that is not
-/// a redirection.
+/// whose target is the next word (`<`, `2>`, `&>`, `<<<`, `<<-`),
+/// `Some(false)` for one whose target is glued on (`</bin/cat`, `3</bin/wc`,
+/// `2>/dev/null`, `2>&1`, `<<<text`) or that needs none (`>&-`), and `None`
+/// for a word that is not a redirection.
 fn redirection_word(word: &str) -> Option<bool> {
     let rest = word.trim_start_matches(|c: char| c.is_ascii_digit());
+    // bash's `&>file` and `&>>file` send both outputs to the file.
+    let rest = rest
+        .strip_prefix('&')
+        .filter(|after| after.starts_with('>'))
+        .unwrap_or(rest);
     if !rest.starts_with(['<', '>']) {
         return None;
     }
@@ -2525,10 +2727,42 @@ fn guard_cli_named_later_loosens(words: &[String]) -> bool {
         let base = token_basename(lower.trim_matches('`'));
         let base = base.strip_suffix(".exe").unwrap_or(base);
         if is_guard_cli_name(base) {
-            return guard_verb_loosens(&words[index + 1..]);
+            return guard_arguments_loosen(&words[index + 1..], guard_verb_loosens);
         }
-        base == "innerwarden-ctl" && ctl_verb_loosens(&words[index + 1..])
+        base == "innerwarden-ctl" && guard_arguments_loosen(&words[index + 1..], ctl_verb_loosens)
     })
+}
+
+/// Whether the arguments after the guard's CLI loosen it, by `loosens`,
+/// read as written and again with every redirection and its target taken
+/// out: the shell removes them from the arguments wherever they stand, so
+/// `innerwarden 2>/dev/null allow x` and `innerwarden>/dev/null allow x` run
+/// `innerwarden allow x` (measured 2026-11-09 in sh, bash and dash). Both
+/// readings count, since a quoted `'>'` is an argument that the words no
+/// longer show was quoted.
+fn guard_arguments_loosen(arguments: &[String], loosens: impl Fn(&[String]) -> bool) -> bool {
+    if loosens(arguments) {
+        return true;
+    }
+    if !arguments
+        .iter()
+        .any(|word| redirection_word(word).is_some())
+    {
+        return false;
+    }
+    let mut kept = Vec::with_capacity(arguments.len());
+    let mut target = false;
+    for word in arguments {
+        if std::mem::take(&mut target) {
+            continue;
+        }
+        if let Some(target_follows) = redirection_word(word) {
+            target = target_follows;
+            continue;
+        }
+        kept.push(word.clone());
+    }
+    loosens(&kept)
 }
 
 /// Whether the arguments after Active Defence's `innerwarden-ctl` name one of
@@ -6254,7 +6488,10 @@ pub fn check_sensitive_read(content: &str) -> Option<(&'static str, u32)> {
 /// newline, `#` is the word `a#` and no comment; a backtick substitution
 /// ends at the first backtick not escaped, closing any quote its text left
 /// open; and in a `$'...'` string `\'` does not end it. A comment is not
-/// part of the segment it ends.
+/// part of the segment it ends. The `)` that closes a substitution (`$(`,
+/// `$((`, `<(`, `>(`) or an array (`a=(`) does not end the word it is in, so
+/// `a=$(date)#;innerwarden allow x` holds no comment: the `;` ends a command
+/// and the lowering after it runs ([`crate::shell_words::OpenParens`]).
 pub(crate) fn shell_command_segments(content: &str) -> Vec<&str> {
     let bytes = content.as_bytes();
     let mut segments = Vec::new();
@@ -6265,10 +6502,19 @@ pub(crate) fn shell_command_segments(content: &str) -> Vec<&str> {
     let mut double_quoted = false;
     let mut backtick: Option<bool> = None;
     let mut word_started = false;
+    let mut parens = crate::shell_words::OpenParens::default();
+    // The byte before, when it was read unquoted and outside every quote
+    // and escape: a `(` after `<`, `>` or another `(` opens a process
+    // substitution or arithmetic.
+    let mut previous: Option<u8> = None;
+    // No word of the command being read has started yet: a `case` here is
+    // the keyword.
+    let mut command_start = true;
 
     while index < bytes.len() {
         let byte = bytes[index];
         let next = bytes.get(index + 1).copied();
+        let before = previous.take();
         if ansi_c {
             match byte {
                 b'\\' => index += 2,
@@ -6297,13 +6543,18 @@ pub(crate) fn shell_command_segments(content: &str) -> Vec<&str> {
                     word_started = false;
                 }
             }
+            command_start = backtick.is_some();
             index += 1;
             continue;
         }
         if byte == b'\\' && !single_quoted {
-            // A line continuation leaves the word it is in going on.
-            if next != Some(b'\n') {
+            // A line continuation leaves the word it is in going on, and the
+            // byte before it is what the next one follows.
+            if next == Some(b'\n') {
+                previous = before;
+            } else {
                 word_started = true;
+                command_start = false;
             }
             index += 2;
             continue;
@@ -6313,18 +6564,21 @@ pub(crate) fn shell_command_segments(content: &str) -> Vec<&str> {
             single_quoted = true;
             ansi_c = true;
             word_started = true;
+            command_start = false;
             index += 2;
             continue;
         }
         if byte == b'\'' && !double_quoted {
             single_quoted = !single_quoted;
             word_started = true;
+            command_start = false;
             index += 1;
             continue;
         }
         if byte == b'"' && !single_quoted {
             double_quoted = !double_quoted;
             word_started = true;
+            command_start = false;
             index += 1;
             continue;
         }
@@ -6350,7 +6604,16 @@ pub(crate) fn shell_command_segments(content: &str) -> Vec<&str> {
             }
             continue;
         }
-        if unquoted && matches!(byte, b';' | b'\n' | b'|' | b'&') {
+        // `2>&1`, `<&3`, `>|file` and bash's `&>file` are redirections:
+        // their `&` or `|` ends no command. Taken for one, `innerwarden 2>&1
+        // allow x` was cut into `innerwarden 2>` and `1 allow x`, and the
+        // lowering bash, sh and dash run was missed (measured 2026-11-09).
+        let in_redirection = match byte {
+            b'&' => matches!(before, Some(b'<' | b'>')) || next == Some(b'>'),
+            b'|' => before == Some(b'>'),
+            _ => false,
+        };
+        if unquoted && matches!(byte, b';' | b'\n' | b'|' | b'&') && !in_redirection {
             let segment = content[start..index].trim();
             if !segment.is_empty() {
                 segments.push(segment);
@@ -6361,10 +6624,37 @@ pub(crate) fn shell_command_segments(content: &str) -> Vec<&str> {
             }
             start = index;
             word_started = false;
+            command_start = true;
             continue;
         }
-        word_started = !(unquoted
-            && (byte.is_ascii_whitespace() || matches!(byte, b'(' | b')' | b'<' | b'>')));
+        if unquoted && byte == b'(' {
+            parens.open(
+                word_started || matches!(before, Some(b'<' | b'>')),
+                before == Some(b'('),
+            );
+            word_started = false;
+            command_start = true;
+            previous = Some(byte);
+            index += 1;
+            continue;
+        }
+        if unquoted && byte == b')' {
+            word_started = parens.close_continues_word();
+            command_start = false;
+            index += 1;
+            continue;
+        }
+        let blank = unquoted && (byte.is_ascii_whitespace() || matches!(byte, b'<' | b'>'));
+        if unquoted {
+            previous = Some(byte);
+            if command_start && !word_started && !blank {
+                parens.command_word_starts(bytes[index..].iter().map(|&b| char::from(b)));
+            }
+        }
+        if !blank {
+            command_start = false;
+        }
+        word_started = !blank;
         index += 1;
     }
     let tail = content[start..].trim();
@@ -9635,9 +9925,19 @@ pub(crate) fn shell_tokens(segment: &str) -> Vec<String> {
     // The word being read has begun (a quote begins one too), so a `#` here
     // is a character of it, not a comment.
     let mut word_started = false;
+    // What each `(` still open opened: the `)` of a substitution leaves the
+    // word going on (`a=$(date)#` holds no comment).
+    let mut parens = crate::shell_words::OpenParens::default();
+    // The character before, when it was read unquoted and outside every
+    // quote and escape.
+    let mut previous: Option<char> = None;
+    // No word of the command being read has started yet: a `case` here is
+    // the keyword, whose pattern `)` ends no substitution.
+    let mut command_start = true;
     let mut at = 0usize;
     while let Some(&character) = chars.get(at) {
         let next = chars.get(at + 1).copied();
+        let before = previous.take();
         if ansi_c {
             match character {
                 '\'' => {
@@ -9677,6 +9977,7 @@ pub(crate) fn shell_tokens(segment: &str) -> Vec<String> {
                     word_started = false;
                 }
             }
+            command_start = backtick.is_some();
             at += 1;
             continue;
         }
@@ -9684,6 +9985,7 @@ pub(crate) fn shell_tokens(segment: &str) -> Vec<String> {
             // A line continuation: the shell joins the two lines, inside a
             // word too, so the word goes on.
             if next == Some('\n') {
+                previous = before;
                 at += 2;
                 continue;
             }
@@ -9709,6 +10011,7 @@ pub(crate) fn shell_tokens(segment: &str) -> Vec<String> {
                 }
             }
             word_started = true;
+            command_start = false;
             continue;
         }
         let unquoted = !single_quoted && !double_quoted;
@@ -9720,18 +10023,21 @@ pub(crate) fn shell_tokens(segment: &str) -> Vec<String> {
                 double_quoted = true;
             }
             word_started = true;
+            command_start = false;
             at += 2;
             continue;
         }
         if character == '\'' && !double_quoted {
             single_quoted = !single_quoted;
             word_started = true;
+            command_start = false;
             at += 1;
             continue;
         }
         if character == '"' && !single_quoted {
             double_quoted = !double_quoted;
             word_started = true;
+            command_start = false;
             at += 1;
             continue;
         }
@@ -9749,10 +10055,25 @@ pub(crate) fn shell_tokens(segment: &str) -> Vec<String> {
             if !word.is_empty() {
                 words.push(std::mem::take(&mut word));
             }
-            // `(` and `)` are operators, so a word starts after them; a brace
-            // is a character the shell reads in place (`${#x}`).
-            if matches!(character, '(' | ')') {
-                word_started = false;
+            // A `(` and the `)` of a subshell are operators, so a word starts
+            // after them; the `)` of a substitution or an array is not, and
+            // the word it is in goes on; a brace is a character the shell
+            // reads in place (`${#x}`).
+            match character {
+                '(' => {
+                    parens.open(
+                        word_started || matches!(before, Some('<' | '>')),
+                        before == Some('('),
+                    );
+                    word_started = false;
+                    command_start = true;
+                    previous = Some(character);
+                }
+                ')' => {
+                    word_started = parens.close_continues_word();
+                    command_start = false;
+                }
+                _ => command_start = false,
             }
             at += 1;
             continue;
@@ -9767,6 +10088,16 @@ pub(crate) fn shell_tokens(segment: &str) -> Vec<String> {
             // (`2>`) and the operator's own characters (`<<<`) stay with it.
             words.push(std::mem::take(&mut word));
         }
+        let blank = unquoted && (character.is_whitespace() || matches!(character, '<' | '>'));
+        if unquoted {
+            previous = Some(character);
+            if command_start && !word_started && !blank {
+                parens.command_word_starts(chars[at..].iter().copied());
+            }
+        }
+        if !blank {
+            command_start = false;
+        }
         if character.is_whitespace() && unquoted {
             if !word.is_empty() {
                 words.push(std::mem::take(&mut word));
@@ -9774,7 +10105,7 @@ pub(crate) fn shell_tokens(segment: &str) -> Vec<String> {
             word_started = false;
         } else {
             word.push(character);
-            word_started = !(unquoted && matches!(character, '<' | '>'));
+            word_started = !blank;
         }
         at += 1;
     }
@@ -15630,5 +15961,110 @@ mod env_split_words_tests {
         for refused in [r"innerwarden \allow x", "$HOME", "\"a", r#""x\cy""#] {
             assert_eq!(env_split_words(refused), None, "{refused}");
         }
+    }
+}
+
+#[cfg(test)]
+mod guard_reading_tests {
+    use super::{
+        process_substitutions, runs_guard_loosening_verb_in, shell_command_segments, shell_tokens,
+        ReadingBudget,
+    };
+
+    /// The `)` of a substitution or an array leaves the word going on, so a
+    /// `#` after it is a character and the line goes on; the `)` of a
+    /// subshell or of a `case` pattern is an operator, and a `#` after it
+    /// opens a comment. `2>&1`, `&>` and `>|` are redirections.
+    ///
+    /// FAILS ON REVERT: every `)` ended the word, and `a=$(date)#;iw dry-run`
+    /// was the one segment `a=$(date)`; `2>&1` cut the command in two.
+    #[test]
+    fn a_closing_paren_ends_the_word_only_where_the_shell_ends_it() {
+        assert_eq!(
+            shell_command_segments("a=$(date)#;iw dry-run"),
+            ["a=$(date)#", "iw dry-run"]
+        );
+        assert_eq!(
+            shell_command_segments("a=(1 2)#;iw dry-run"),
+            ["a=(1 2)#", "iw dry-run"]
+        );
+        assert_eq!(
+            shell_command_segments("x=$(case y in y) echo;; esac)#;iw dry-run"),
+            ["x=$(case y in y) echo", "esac)#", "iw dry-run"]
+        );
+        assert_eq!(shell_command_segments("(true)#;iw dry-run"), ["(true)"]);
+        assert_eq!(shell_command_segments("((1+2))#;iw dry-run"), ["((1+2))"]);
+        assert_eq!(
+            shell_command_segments("case x in a)#;iw dry-run\nesac"),
+            ["case x in a)", "esac"]
+        );
+        assert_eq!(
+            shell_command_segments("iw 2>&1 dry-run &>/dev/null x >|y; z"),
+            ["iw 2>&1 dry-run &>/dev/null x >|y", "z"]
+        );
+        assert_eq!(shell_tokens("a=$(date)#x"), ["a=$", "date", "#x"]);
+        assert_eq!(shell_tokens("(true)#x"), ["true"]);
+        assert_eq!(
+            shell_tokens("echo $(true)\\\n#x"),
+            ["echo", "$", "true", "#x"]
+        );
+    }
+
+    /// The command text of each process substitution outside quotes, nested
+    /// ones left in the text of the one they are in.
+    #[test]
+    fn process_substitutions_are_found_outside_quotes() {
+        assert_eq!(
+            process_substitutions("diff <(a) >(b <(c)) '<(d)' \"<(e)\" $'\\'<(f)'"),
+            ["a", "b <(c)"]
+        );
+        assert_eq!(
+            process_substitutions("cat <(echo \")\" x)"),
+            ["echo \")\" x"]
+        );
+        assert_eq!(process_substitutions("cat <(iw dry-run"), ["iw dry-run"]);
+        assert!(process_substitutions("echo $(a) (b) x<y").is_empty());
+    }
+
+    /// The reading pays a bounded multiple of the line whatever its shape
+    /// (bounded step count, independent of the host's speed): the lines of
+    /// the review of 1877717 that cost 2^k readings, and nesting of every
+    /// kind the reading follows, stay within a few times their length and
+    /// never run out. A chain deeper than the levels followed runs out.
+    ///
+    /// FAILS ON REVERT: the reading of the words after every bare `<` spent
+    /// the budget on the first two lines and ran out.
+    #[test]
+    fn the_reading_of_a_line_stays_within_its_budget() {
+        let spent = |line: &str| {
+            let budget = ReadingBudget::for_line(line);
+            let before = budget.left.get();
+            runs_guard_loosening_verb_in(line, 0, &budget);
+            (before - budget.left.get(), budget.ran_out())
+        };
+        let lines = [
+            format!(
+                "{}innerwarden status; innerwarden allow x",
+                "< -a ".repeat(28)
+            ),
+            format!("{}iw --version && iw dry-run", "< 1 ".repeat(28)),
+            format!("{}innerwarden status", "< ".repeat(400)),
+            format!("{}innerwarden status", "env -S X=1 ".repeat(3)),
+            "sh -c \"bash -c 'eval env -S \\\"cat <(iw status)\\\"'\"".to_string(),
+            format!("{}true", "echo x | ".repeat(500)),
+            "git commit -m 'a long message about innerwarden allow and mute' ".repeat(200),
+        ];
+        for line in &lines {
+            let (cost, ran_out) = spent(line);
+            assert!(!ran_out, "{:?}", &line[..line.len().min(60)]);
+            assert!(
+                cost <= 6 * line.len() + 64,
+                "{cost} for {} bytes: {:?}",
+                line.len(),
+                &line[..line.len().min(60)]
+            );
+        }
+        let chain = format!("{}env -S 'iw dry-run'", "env -S X=1 ".repeat(5));
+        assert!(spent(&chain).1, "a chain deeper than the levels runs out");
     }
 }

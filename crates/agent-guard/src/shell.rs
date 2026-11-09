@@ -122,9 +122,9 @@ pub(crate) fn project(source: &str) -> ShellProjection {
     }
 }
 
-/// The command with the two spellings rewritten that tree-sitter-bash reads
+/// The command with the spellings rewritten that tree-sitter-bash reads
 /// differently from the shell, so the projection masks what the shell
-/// treats as data and nothing else (measured 2026-11-09, both hid a guard
+/// treats as data and nothing else (measured 2026-11-09, each hid a guard
 /// lowering the shell ran):
 ///
 /// - A here-document delimiter quoted in part (`E"O"F`, `E''`, `E""`,
@@ -138,6 +138,14 @@ pub(crate) fn project(source: &str) -> ShellProjection {
 ///   newline, `#` is the word `a#`: no comment starts there. The grammar
 ///   opened one and masked the rest of the line. That continuation is
 ///   removed. A `#` after a blank does start a comment, and stays one.
+/// - A `#` right after the `)` of an array (`a=(1 2)#`) or a substitution
+///   is a character of the word (bash), and is written escaped (`\#`, the
+///   same character to the shell): the grammar opened a comment there.
+///
+/// A `)` ends the word it is in only when it closes a subshell or a `case`
+/// pattern, and in `$((...))` or `((...))` a `<<` is a shift, which opens no
+/// here-document (`$((1<<2))` had queued a body, so a partly quoted
+/// delimiter after it was never rewritten).
 ///
 /// Quotes, substitutions in backticks, comments and here-document bodies
 /// are copied as they are. `None` when nothing is rewritten.
@@ -148,6 +156,16 @@ fn text_as_the_shell_reads(source: &str) -> Option<String> {
     let mut at = 0usize;
     // The word being read has begun, so a `#` is a character of it.
     let mut word_started = false;
+    // What each `(` still open opened: the `)` of `$(`, `$((` or `<(` leaves
+    // the word going on (`echo $(true)\`, newline, `#` holds no comment), and
+    // in `$((...))` a `<<` is a shift, not a here-document (`$((1<<2))`
+    // queued a body that swallowed the lines after it; measured 2026-11-09).
+    let mut parens = crate::shell_words::OpenParens::default();
+    // The character before, when it was read outside every quote.
+    let mut previous: Option<char> = None;
+    // No word of the command being read has started yet: a `case` here is
+    // the keyword, whose pattern `)` ends no substitution.
+    let mut command_start = true;
     // Here-documents whose bodies start after the next newline: the
     // delimiter with its quotes removed, and whether `<<-` strips tabs.
     let mut pending: Vec<(String, bool)> = Vec::new();
@@ -173,6 +191,7 @@ fn text_as_the_shell_reads(source: &str) -> Option<String> {
     };
     while let Some(&c) = chars.get(at) {
         let next = chars.get(at + 1).copied();
+        let before = previous.take();
         match c {
             '\\' => match next {
                 Some('\n') => {
@@ -182,12 +201,16 @@ fn text_as_the_shell_reads(source: &str) -> Option<String> {
                         out.push_str("\\\n");
                     }
                     at += 2;
+                    // The shell never sees a continuation: what came before
+                    // it is what the next character follows.
+                    previous = before;
                 }
                 Some(escaped) => {
                     out.push('\\');
                     out.push(escaped);
                     at += 2;
                     word_started = true;
+                    command_start = false;
                 }
                 None => {
                     out.push('\\');
@@ -197,20 +220,24 @@ fn text_as_the_shell_reads(source: &str) -> Option<String> {
             '\'' => {
                 copy_quoted(&mut out, &mut at, '\'', false);
                 word_started = true;
+                command_start = false;
             }
             '$' if next == Some('\'') => {
                 out.push('$');
                 at += 1;
                 copy_quoted(&mut out, &mut at, '\'', true);
                 word_started = true;
+                command_start = false;
             }
             '"' => {
                 copy_quoted(&mut out, &mut at, '"', true);
                 word_started = true;
+                command_start = false;
             }
             '`' => {
                 copy_quoted(&mut out, &mut at, '`', true);
                 word_started = true;
+                command_start = false;
             }
             '#' if !word_started => {
                 while let Some(&c) = chars.get(at).filter(|c| **c != '\n') {
@@ -222,6 +249,7 @@ fn text_as_the_shell_reads(source: &str) -> Option<String> {
                 out.push('\n');
                 at += 1;
                 word_started = false;
+                command_start = true;
                 for (delimiter, strip_tabs) in std::mem::take(&mut pending) {
                     while at < chars.len() {
                         let end = chars[at..]
@@ -246,12 +274,15 @@ fn text_as_the_shell_reads(source: &str) -> Option<String> {
                     }
                 }
             }
-            '<' if next == Some('<') && chars.get(at + 2) == Some(&'<') => {
+            '<' if next == Some('<')
+                && chars.get(at + 2) == Some(&'<')
+                && !parens.in_arithmetic() =>
+            {
                 out.push_str("<<<");
                 at += 3;
                 word_started = false;
             }
-            '<' if next == Some('<') => {
+            '<' if next == Some('<') && !parens.in_arithmetic() => {
                 out.push_str("<<");
                 at += 2;
                 let strip_tabs = chars.get(at) == Some(&'-');
@@ -329,15 +360,51 @@ fn text_as_the_shell_reads(source: &str) -> Option<String> {
                 }
                 word_started = false;
             }
-            ' ' | '\t' | ';' | '&' | '|' | '(' | ')' | '<' | '>' => {
+            '(' => {
+                parens.open(
+                    word_started || matches!(before, Some('<' | '>')),
+                    before == Some('('),
+                );
                 out.push(c);
                 at += 1;
                 word_started = false;
+                command_start = true;
+                previous = Some(c);
+            }
+            ')' => {
+                out.push(c);
+                at += 1;
+                word_started = parens.close_continues_word();
+                command_start = false;
+                previous = Some(c);
+            }
+            // `a=(1 2)#;innerwarden allow x`: after the `)` of an array or a
+            // substitution the word goes on, so to bash the `#` is a
+            // character and the `;` ends a command. The grammar opened a
+            // comment there and masked the lowering after it (measured
+            // 2026-11-09). An escaped `#` is the same character to the shell
+            // and no comment to the grammar.
+            '#' if word_started && before == Some(')') => {
+                out.push_str("\\#");
+                at += 1;
+                changed = true;
+            }
+            ' ' | '\t' | ';' | '&' | '|' | '<' | '>' => {
+                out.push(c);
+                at += 1;
+                word_started = false;
+                command_start |= matches!(c, ';' | '&' | '|');
+                previous = Some(c);
             }
             _ => {
+                if command_start && !word_started {
+                    parens.command_word_starts(chars[at..].iter().copied());
+                }
                 out.push(c);
                 at += 1;
                 word_started = true;
+                command_start = false;
+                previous = Some(c);
             }
         }
     }
@@ -5925,5 +5992,41 @@ mod tests {
         let data = project("cat <<E''\niw dry-run\nE");
         assert!(data.parsed);
         assert!(!data.scan.contains("iw dry-run"), "{}", data.scan);
+    }
+
+    /// The `)` of a substitution or an array leaves the word going on, so
+    /// a continuation and a `#` after it join that word, and a `#` right
+    /// after it is a character the grammar is shown escaped; in `$((...))`
+    /// a `<<` is a shift and queues no here-document body (review of
+    /// 1877717, 2026-11-09).
+    ///
+    /// FAILS ON REVERT: the `<<2` took the next lines for a body and the
+    /// partly quoted delimiter after it was never rewritten; `a=(1 2)#`
+    /// masked the rest of the line as a comment.
+    #[test]
+    fn the_projection_reads_a_closing_paren_and_a_shift_as_the_shell() {
+        assert_eq!(
+            text_as_the_shell_reads("echo $((1<<2))\ncat <<E\"O\"F\nEOF\niw dry-run\nE\"O\"F")
+                .as_deref(),
+            Some("echo $((1<<2))\ncat <<'EOF'\nEOF\niw dry-run\nE\"O\"F")
+        );
+        assert_eq!(
+            text_as_the_shell_reads("echo $(true)\\\n#; iw dry-run").as_deref(),
+            Some("echo $(true)\\#; iw dry-run")
+        );
+        assert_eq!(
+            text_as_the_shell_reads("a=(1 2)#;iw dry-run").as_deref(),
+            Some("a=(1 2)\\#;iw dry-run")
+        );
+        for unchanged in [
+            "(true)#; iw dry-run",
+            "((1+2))#; iw dry-run",
+            "case x in a)# iw dry-run\nesac",
+            "echo $(date) # iw dry-run",
+        ] {
+            assert_eq!(text_as_the_shell_reads(unchanged), None, "{unchanged}");
+        }
+        let projected = project("a=(1 2)#;iw dry-run");
+        assert!(projected.scan.contains("iw dry-run"), "{}", projected.scan);
     }
 }

@@ -10,6 +10,8 @@
 //! lowers the guard) are asserted not `deny`, so the fix reads the shell's
 //! grammar and does not refuse a spelling.
 
+use std::time::{Duration, Instant};
+
 use innerwarden_agent_guard::mcp::analyze_command;
 
 fn verdict(command: &str) -> String {
@@ -231,4 +233,170 @@ fn a_here_string_fed_to_a_shell_is_commands() {
         "cat <<<'innerwarden allow x'",
         "grep -c allow <<<'innerwarden allow x'",
     ]);
+}
+
+/// The `)` that closes a substitution (`$(`, `$((`, `<(`) or an array
+/// (`a=(`) does not end the word it is in: a `#` right after it is a
+/// character, so the `;` after it ends a command and the lowering after it
+/// runs (review of 1877717, 2026-11-09: each was denied before and allowed
+/// after, while sh, bash and dash ran it; `<(` and arrays in bash). The `)`
+/// of a subshell, and of a `case` pattern, is an operator, and a `#` after
+/// it does open a comment.
+#[test]
+fn a_hash_after_a_substitution_is_a_character() {
+    assert_denied(&[
+        "a=$(date)#;innerwarden allow x",
+        "a=$(true)#; innerwarden allow x",
+        "a=$(date)#;sudo innerwarden allow x",
+        "a=<(true)#;innerwarden allow x",
+        "export a=$(date)#;innerwarden allow x",
+        "ts=$(date +%s)#;iw dry-run",
+        "local_ts=$(date)#;innerwarden allow x",
+        "sh -c 'a=$(date)#;innerwarden allow x'",
+        "a=$(date)#&&innerwarden allow x",
+        "a=$(date)#|innerwarden allow x",
+        "cd $(pwd)#;innerwarden allow x",
+        "a=$(date)#;bash -c 'innerwarden allow x'",
+        "echo $((1+2))#;iw dry-run",
+        "x=$(echo $(date))#;innerwarden-ctl agent disconnect claude-code",
+        "cat <(true)#;iw-guard monitor",
+        "echo $(case x in x) echo y;; esac)#; innerwarden allow x",
+        "a=(1 2)#;innerwarden allow x",
+        "echo $(true)\\\n#; innerwarden allow x",
+        "a=$(true)\\\n#;innerwarden allow x",
+    ]);
+    assert_not_denied(&[
+        "(true)#; innerwarden allow x",
+        "((1+2))#; innerwarden allow x",
+        "echo $(date) # innerwarden allow x",
+        "a=$(date) #;innerwarden allow x",
+        "ts=$(date +%s)#build-tag",
+        "case $x in a)# innerwarden allow x\n;; esac",
+    ]);
+}
+
+/// The command in a process substitution runs, wherever it stands in the
+/// line (bash). It is read from the text between the `(` and its `)`, once,
+/// not by reading the words after every `<` again.
+#[test]
+fn a_process_substitution_runs_its_command() {
+    assert_denied(&[
+        "<(innerwarden allow x)",
+        "cat <(iw dry-run)",
+        "< <(innerwarden allow x) cat",
+        "echo hi > >(innerwarden allow x)",
+        "diff <(true) <(sudo innerwarden allow x)",
+        "bash -c 'wc -l <(innerwarden-ctl agent disconnect claude-code)'",
+    ]);
+    assert_not_denied(&[
+        "diff <(sort a.txt) <(sort b.txt)",
+        "cat <(echo innerwarden allow x)",
+        "comm -12 <(ls a) <(ls b)",
+        "echo \"<(innerwarden allow x)\"",
+        "grep x <(innerwarden allow --list)",
+    ]);
+}
+
+/// The shell takes a redirection out of the arguments wherever it stands,
+/// so one between the CLI and its verb is not the verb, and `2>&1`, `&>`
+/// and `>|` are redirections, not the end of a command (measured
+/// 2026-11-09: sh, bash and dash ran each lowering below; `&>` in bash).
+#[test]
+fn a_redirection_after_the_cli_is_not_its_verb() {
+    assert_denied(&[
+        "innerwarden 2>/dev/null allow x",
+        "innerwarden>/dev/null allow x",
+        "innerwarden 2>&1 allow x",
+        "innerwarden &>/dev/null allow x",
+        "innerwarden >|/dev/null allow x",
+        "iw </dev/null dry-run",
+        "innerwarden-ctl >/dev/null agent disconnect claude-code",
+        "sudo innerwarden 2>/dev/null allow x",
+    ]);
+    assert_not_denied(&[
+        "innerwarden allow --list > rules.txt",
+        "innerwarden status 2>/dev/null",
+        "innerwarden > allow x",
+        "iw agents list 2>&1 | head",
+        "make 2>&1 | tee build.log",
+        "ls -la 2>&1 >/dev/null; echo done",
+    ]);
+}
+
+/// In `$((...))` and `((...))` a `<<` is a shift and opens no here-document,
+/// so the lines after it are not taken for a body, and a here-document
+/// after it ends where the shell ends it.
+#[test]
+fn an_arithmetic_shift_opens_no_here_document() {
+    assert_denied(&[
+        "echo $((1<<2))\ncat <<E\"O\"F\nEOF\niw dry-run\nE\"O\"F",
+        "x=$((1<<2))\ncat <<E\"O\"F\nEOF\niw dry-run\nE\"O\"F",
+        "(( y = 1<<2 ))\ncat <<E''\nE\ninnerwarden allow x\nE''",
+    ]);
+    assert_not_denied(&[
+        "echo $((1<<2))\ncat <<'EOF'\niw dry-run\nEOF",
+        "echo $((1<<2))",
+    ]);
+}
+
+/// A chain of command strings deeper than the reading follows is refused
+/// when it names the guard: the reading is cut short there, and a line it
+/// cannot read to the end is not let through on what it did read.
+#[test]
+fn a_reading_cut_short_refuses_a_line_naming_the_guard() {
+    assert_denied(&[&format!(
+        "{}env -S 'innerwarden allow x'",
+        "env -S X=1 ".repeat(5)
+    )]);
+    assert_not_denied(&["env -S X=1 env -S Y=2 env TZ=UTC date"]);
+}
+
+/// Lines built to make the guard's reading slow (review of 1877717,
+/// 2026-11-09, on the lab box in release: 179 bytes of `< -a` before a
+/// lowering took over 40 s, and 880 bytes of `env -S X=1` took 15 s, past
+/// the hook's 9 to 17 s timeout). The reading is one pass per level now,
+/// paid from a budget that is a bounded multiple of the line. The ceiling
+/// is for a debug build on a loaded runner and is far above what these
+/// take (milliseconds); what it catches is the exponential reading, which
+/// takes minutes.
+///
+/// FAILS ON REVERT: with the reading of the words after every bare `<`, or
+/// of every `env -S` string in a pass, the first cases run for minutes.
+#[test]
+fn a_line_built_to_be_slow_to_read_is_read_in_bounded_time() {
+    let ceiling = Duration::from_secs(3);
+    let lowerings = [
+        format!(
+            "{}innerwarden status; innerwarden allow x",
+            "< -a ".repeat(28)
+        ),
+        format!("{}iw --version && iw dry-run", "< 1 ".repeat(28)),
+        format!(
+            "{}innerwarden status; innerwarden allow x",
+            "env -S X=1 ".repeat(80)
+        ),
+    ];
+    let others = [
+        format!("{}innerwarden status", "< ".repeat(60)),
+        format!("{}innerwarden status", "< -a ".repeat(40)),
+        format!("{}innerwarden status", "env -S X=1 ".repeat(200)),
+        format!("{}true", "find . -exec ".repeat(200)),
+        format!("{}true", "<(".repeat(2000)),
+        format!("{}true", "a=$(".repeat(2000)),
+        "case x in a) ;; esac ".repeat(2000),
+    ];
+    for command in lowerings.iter().chain(&others) {
+        let start = Instant::now();
+        let verdict = verdict(command);
+        let took = start.elapsed();
+        assert!(
+            took < ceiling,
+            "{} bytes took {took:?}: {:?}",
+            command.len(),
+            &command[..command.len().min(80)]
+        );
+        if lowerings.contains(command) {
+            assert_eq!(verdict, "deny", "{:?}", &command[..command.len().min(80)]);
+        }
+    }
 }
