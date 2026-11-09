@@ -123,12 +123,25 @@ jobs:
         # mutant no test catches runs the whole suite, so one that ran a little
         # slow at -j 2 was reported as a timeout instead of a survivor (run
         # 42585938875). A real hang still times out, and still fails the job.
+        #
+        # Each test binary runs under an address-space cap
+        # (scripts/mutants-test-runner.sh): a mutant that allocates without
+        # end then fails its own test run instead of killing the runner. The
+        # full sweep below says why; the log check proves the cap was on.
         run: |
+          triple=$(rustc -vV | sed -n 's/^host: //p')
+          export "CARGO_TARGET_$(printf '%s' "$triple" | tr 'a-z-' 'A-Z_')_RUNNER=$GITHUB_WORKSPACE/scripts/mutants-test-runner.sh"
+          export MUTANTS_TEST_RUNNER_LOG="$RUNNER_TEMP/mutants-test-runner.log"
           set +e
           timeout 75m cargo mutants --package innerwarden-agent-guard \
             --in-diff day.diff --timeout-multiplier 3 -j 2
           code=$?
           set -e
+          if jq -e '.outcomes | any(.scenario == "Baseline")' mutants.out/outcomes.json >/dev/null 2>&1 \
+            && [ ! -s "$MUTANTS_TEST_RUNNER_LOG" ]; then
+            echo "::error::The tests ran but no test binary ran under the memory cap: cargo did not use scripts/mutants-test-runner.sh, so a runaway mutant could still kill the runner."
+            exit 1
+          fi
           case "$code" in
             0)   echo "No surviving mutants in the changed lines." ;;
             2)   echo "::error::A mutant survived in code changed since yesterday: the tests do not check that line. See the uploaded report."; exit 1 ;;
@@ -186,7 +199,23 @@ jobs:
         #
         # The per-mutant timeout is relative to the baseline for the reason
         # given on the diff job above.
+        #
+        # MEMORY CAP. On 2026-11-09 (run 42585938875) thirteen of the forty
+        # shards died with "The runner has received a shutdown signal" and
+        # uploaded nothing: a third of the sweep, unseen. Measured: a mutant
+        # that sends a loop back onto the word it has just pushed (`index += 1`
+        # to `index -= 1` in output_redirect_targets) grows the test process
+        # until the runner has no memory left, long before any timeout. Each
+        # test binary now runs under an address-space cap
+        # (scripts/mutants-test-runner.sh, which says why not a cgroup), so
+        # that mutant aborts its own test run and is counted as caught. If the
+        # tests ran and no test binary ran under the cap, the shard fails: a
+        # protection that is silently absent is how a third of this sweep went
+        # missing.
         run: |
+          triple=$(rustc -vV | sed -n 's/^host: //p')
+          export "CARGO_TARGET_$(printf '%s' "$triple" | tr 'a-z-' 'A-Z_')_RUNNER=$GITHUB_WORKSPACE/scripts/mutants-test-runner.sh"
+          export MUTANTS_TEST_RUNNER_LOG="$RUNNER_TEMP/mutants-test-runner.log"
           set +e
           timeout 150m cargo mutants --package innerwarden-agent-guard \
             --file 'crates/agent-guard/src/threats.rs' \
@@ -196,6 +225,11 @@ jobs:
             --timeout-multiplier 3 --no-shuffle -j 2
           code=$?
           set -e
+          if jq -e '.outcomes | any(.scenario == "Baseline")' mutants.out/outcomes.json >/dev/null 2>&1 \
+            && [ ! -s "$MUTANTS_TEST_RUNNER_LOG" ]; then
+            echo "::error::The tests ran in shard ${{ matrix.shard }} but no test binary ran under the memory cap: cargo did not use scripts/mutants-test-runner.sh."
+            exit 1
+          fi
           case "$code" in
             0)   echo "Shard ${{ matrix.shard }}/40 clean." ;;
             2)   echo "::error::A mutant survived in shard ${{ matrix.shard }}: the tests do not check that line."; exit 1 ;;
