@@ -132,6 +132,7 @@ jobs:
           triple=$(rustc -vV | sed -n 's/^host: //p')
           export "CARGO_TARGET_$(printf '%s' "$triple" | tr 'a-z-' 'A-Z_')_RUNNER=$GITHUB_WORKSPACE/scripts/mutants-test-runner.sh"
           export MUTANTS_TEST_RUNNER_LOG="$RUNNER_TEMP/mutants-test-runner.log"
+          export IW_NO_WALL_CLOCK_CEILINGS=1 # see WALL-CLOCK CEILINGS on the full sweep
           set +e
           timeout 75m cargo mutants --package innerwarden-agent-guard \
             --in-diff day.diff --timeout-multiplier 3 -j 2
@@ -213,10 +214,25 @@ jobs:
         # protection that is silently absent is how a third of this sweep went
         # missing.
         #
+        # WALL-CLOCK CEILINGS. tests/hot_path_budget.rs fails when screening
+        # runs past a time ceiling, and cargo-mutants counts any failing test
+        # as the test that caught the mutant. Two sweeps of the same 4,372
+        # mutants on 2026-11-09 disagreed because of it: run 42634801508
+        # reported 139 mutants caught that had failed a ceiling and nothing
+        # else, run 42699554438 found 104 of those 139 alive, and in that run a
+        # ceiling "caught" 92 mutants the first had seen survive. A busy
+        # runner decided which mutants a sweep saw, and 18 of the 40 shards of
+        # the second run failed on survivors the list did not hold.
+        # IW_NO_WALL_CLOCK_CEILINGS turns the ceilings off for the sweep (the
+        # test file says what is still asserted); the ordinary test jobs keep
+        # them.
+        #
         # KNOWN SURVIVORS. The first sweep to finish all forty shards (run
         # 42634801508, 2026-11-09, 58 to 107 minutes a shard) tested 4,372
-        # mutants and left 1,023 survivors: 899 missed and 124 timeouts. Red
-        # every Sunday for those says nothing new, so they are listed in
+        # mutants and by its own count left 1,023 survivors: 899 missed and
+        # 124 timeouts. That count was low, for the reason above; the list
+        # says how it was corrected. Red every Sunday for known survivors
+        # says nothing new, so they are listed in
         # crates/agent-guard/mutants-baseline.txt with a reason each, and a
         # shard fails only on a survivor that is NOT in the list
         # (scripts/mutants-baseline-check.sh). The list is burned down by
@@ -227,6 +243,7 @@ jobs:
           triple=$(rustc -vV | sed -n 's/^host: //p')
           export "CARGO_TARGET_$(printf '%s' "$triple" | tr 'a-z-' 'A-Z_')_RUNNER=$GITHUB_WORKSPACE/scripts/mutants-test-runner.sh"
           export MUTANTS_TEST_RUNNER_LOG="$RUNNER_TEMP/mutants-test-runner.log"
+          export IW_NO_WALL_CLOCK_CEILINGS=1
           set +e
           timeout 150m cargo mutants --package innerwarden-agent-guard \
             --file 'crates/agent-guard/src/threats.rs' \
