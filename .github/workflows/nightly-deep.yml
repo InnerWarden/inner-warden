@@ -118,10 +118,15 @@ jobs:
         # different things and are now reported differently:
         #   0 clean · 2 mutants survived · 3 cargo-mutants timed out
         #   124 the outer `timeout` killed it · anything else is a real error
+        # The per-mutant timeout is three times the unmutated test run, not a
+        # fixed 120s: on 2026-11-09 the baseline took 86s on this runner, and a
+        # mutant no test catches runs the whole suite, so one that ran a little
+        # slow at -j 2 was reported as a timeout instead of a survivor (run
+        # 42585938875). A real hang still times out, and still fails the job.
         run: |
           set +e
           timeout 75m cargo mutants --package innerwarden-agent-guard \
-            --in-diff day.diff --timeout 120 -j 2
+            --in-diff day.diff --timeout-multiplier 3 -j 2
           code=$?
           set -e
           case "$code" in
@@ -178,6 +183,9 @@ jobs:
         # reports success is how this check stayed broken for fourteen nights:
         # the run went red for a reason nobody read, and the finding it did
         # produce was filed as a warning next to it.
+        #
+        # The per-mutant timeout is relative to the baseline for the reason
+        # given on the diff job above.
         run: |
           set +e
           timeout 150m cargo mutants --package innerwarden-agent-guard \
@@ -185,7 +193,7 @@ jobs:
             --file 'crates/agent-guard/src/shell.rs' \
             --file 'crates/agent-guard/src/session.rs' \
             --shard ${{ matrix.shard }}/40 \
-            --timeout 120 --no-shuffle -j 2
+            --timeout-multiplier 3 --no-shuffle -j 2
           code=$?
           set -e
           case "$code" in
