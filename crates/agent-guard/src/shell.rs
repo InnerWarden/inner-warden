@@ -24,6 +24,10 @@ pub(crate) struct ShellProjection {
 }
 
 pub(crate) fn project(source: &str) -> ShellProjection {
+    // Parsed, masked and scanned as the shell reads it; on any failure the
+    // command as written is scanned, as before.
+    let rewritten = text_as_the_shell_reads(source);
+    let text = rewritten.as_deref().unwrap_or(source);
     let mut parser = tree_sitter::Parser::new();
     if parser
         .set_language(&tree_sitter_bash::LANGUAGE.into())
@@ -34,7 +38,7 @@ pub(crate) fn project(source: &str) -> ShellProjection {
             parsed: false,
         };
     }
-    let Some(tree) = parser.parse(source, None) else {
+    let Some(tree) = parser.parse(text, None) else {
         return ShellProjection {
             scan: source.to_owned(),
             parsed: false,
@@ -61,16 +65,16 @@ pub(crate) fn project(source: &str) -> ShellProjection {
     let mut masked = Vec::new();
     let mut executable_inside_mask = Vec::new();
     let mut unreachable = Vec::new();
-    collect_literal_unreachable_ranges(tree.root_node(), source.as_bytes(), &mut unreachable, 0);
+    collect_literal_unreachable_ranges(tree.root_node(), text.as_bytes(), &mut unreachable, 0);
     collect_ranges(
         tree.root_node(),
-        source.as_bytes(),
+        text.as_bytes(),
         &mut masked,
         &mut executable_inside_mask,
         0,
     );
 
-    let mut hide = vec![false; source.len()];
+    let mut hide = vec![false; text.len()];
     for range in masked {
         for slot in hide
             .get_mut(range)
@@ -104,7 +108,7 @@ pub(crate) fn project(source: &str) -> ShellProjection {
         }
     }
 
-    let mut bytes = source.as_bytes().to_vec();
+    let mut bytes = text.as_bytes().to_vec();
     for (index, byte) in bytes.iter_mut().enumerate() {
         if hide[index] && *byte != b'\n' && *byte != b'\r' {
             *byte = b' ';
@@ -116,6 +120,228 @@ pub(crate) fn project(source: &str) -> ShellProjection {
         scan: String::from_utf8(bytes).unwrap_or_else(|_| source.to_owned()),
         parsed: true,
     }
+}
+
+/// The command with the two spellings rewritten that tree-sitter-bash reads
+/// differently from the shell, so the projection masks what the shell
+/// treats as data and nothing else (measured 2026-11-09, both hid a guard
+/// lowering the shell ran):
+///
+/// - A here-document delimiter quoted in part (`E"O"F`, `E''`, `E""`,
+///   `\EOF`) is the word with its quotes removed (`EOF`, `E`): the body ends
+///   at the first line that is that word. The grammar matched the delimiter
+///   as written, so the body ran on past that line and masked the commands
+///   after it. The delimiter is written fully quoted (`'EOF'`), which the
+///   grammar reads right and which means the same to the shell: any quote
+///   in a delimiter keeps the body literal.
+/// - A line continuation is removed before comments are found, so `a\`,
+///   newline, `#` is the word `a#`: no comment starts there. The grammar
+///   opened one and masked the rest of the line. That continuation is
+///   removed. A `#` after a blank does start a comment, and stays one.
+///
+/// Quotes, substitutions in backticks, comments and here-document bodies
+/// are copied as they are. `None` when nothing is rewritten.
+fn text_as_the_shell_reads(source: &str) -> Option<String> {
+    let chars: Vec<char> = source.chars().collect();
+    let mut out = String::with_capacity(source.len());
+    let mut changed = false;
+    let mut at = 0usize;
+    // The word being read has begun, so a `#` is a character of it.
+    let mut word_started = false;
+    // Here-documents whose bodies start after the next newline: the
+    // delimiter with its quotes removed, and whether `<<-` strips tabs.
+    let mut pending: Vec<(String, bool)> = Vec::new();
+    // Copies `chars[at]` up to and including the next `close` not escaped
+    // (a backslash escapes only when `escapes` is set).
+    let copy_quoted = |out: &mut String, at: &mut usize, close: char, escapes: bool| {
+        out.push(chars[*at]);
+        *at += 1;
+        while let Some(&c) = chars.get(*at) {
+            out.push(c);
+            *at += 1;
+            if escapes && c == '\\' {
+                if let Some(&escaped) = chars.get(*at) {
+                    out.push(escaped);
+                    *at += 1;
+                }
+                continue;
+            }
+            if c == close {
+                break;
+            }
+        }
+    };
+    while let Some(&c) = chars.get(at) {
+        let next = chars.get(at + 1).copied();
+        match c {
+            '\\' => match next {
+                Some('\n') => {
+                    if word_started && chars.get(at + 2) == Some(&'#') {
+                        changed = true;
+                    } else {
+                        out.push_str("\\\n");
+                    }
+                    at += 2;
+                }
+                Some(escaped) => {
+                    out.push('\\');
+                    out.push(escaped);
+                    at += 2;
+                    word_started = true;
+                }
+                None => {
+                    out.push('\\');
+                    at += 1;
+                }
+            },
+            '\'' => {
+                copy_quoted(&mut out, &mut at, '\'', false);
+                word_started = true;
+            }
+            '$' if next == Some('\'') => {
+                out.push('$');
+                at += 1;
+                copy_quoted(&mut out, &mut at, '\'', true);
+                word_started = true;
+            }
+            '"' => {
+                copy_quoted(&mut out, &mut at, '"', true);
+                word_started = true;
+            }
+            '`' => {
+                copy_quoted(&mut out, &mut at, '`', true);
+                word_started = true;
+            }
+            '#' if !word_started => {
+                while let Some(&c) = chars.get(at).filter(|c| **c != '\n') {
+                    out.push(c);
+                    at += 1;
+                }
+            }
+            '\n' => {
+                out.push('\n');
+                at += 1;
+                word_started = false;
+                for (delimiter, strip_tabs) in std::mem::take(&mut pending) {
+                    while at < chars.len() {
+                        let end = chars[at..]
+                            .iter()
+                            .position(|c| *c == '\n')
+                            .map_or(chars.len(), |found| at + found);
+                        let line: String = chars[at..end].iter().collect();
+                        out.push_str(&line);
+                        at = end;
+                        if at < chars.len() {
+                            out.push('\n');
+                            at += 1;
+                        }
+                        let compared = if strip_tabs {
+                            line.trim_start_matches('\t')
+                        } else {
+                            line.as_str()
+                        };
+                        if compared == delimiter {
+                            break;
+                        }
+                    }
+                }
+            }
+            '<' if next == Some('<') && chars.get(at + 2) == Some(&'<') => {
+                out.push_str("<<<");
+                at += 3;
+                word_started = false;
+            }
+            '<' if next == Some('<') => {
+                out.push_str("<<");
+                at += 2;
+                let strip_tabs = chars.get(at) == Some(&'-');
+                if strip_tabs {
+                    out.push('-');
+                    at += 1;
+                }
+                while let Some(&blank) = chars.get(at).filter(|c| matches!(c, ' ' | '\t')) {
+                    out.push(blank);
+                    at += 1;
+                }
+                let begin = at;
+                let mut delimiter = String::new();
+                let mut quoted = false;
+                while let Some(&d) = chars.get(at) {
+                    match d {
+                        ' ' | '\t' | '\n' | ';' | '&' | '|' | '<' | '>' | '(' | ')' => break,
+                        '\'' => {
+                            quoted = true;
+                            at += 1;
+                            while let Some(&q) = chars.get(at) {
+                                at += 1;
+                                if q == '\'' {
+                                    break;
+                                }
+                                delimiter.push(q);
+                            }
+                        }
+                        '"' => {
+                            quoted = true;
+                            at += 1;
+                            while let Some(&q) = chars.get(at) {
+                                at += 1;
+                                if q == '"' {
+                                    break;
+                                }
+                                if q == '\\' {
+                                    if let Some(&e @ ('"' | '\\' | '$' | '`')) = chars.get(at) {
+                                        delimiter.push(e);
+                                        at += 1;
+                                        continue;
+                                    }
+                                }
+                                delimiter.push(q);
+                            }
+                        }
+                        '\\' => {
+                            quoted = true;
+                            at += 1;
+                            if let Some(&escaped) = chars.get(at) {
+                                delimiter.push(escaped);
+                                at += 1;
+                            }
+                        }
+                        _ => {
+                            delimiter.push(d);
+                            at += 1;
+                        }
+                    }
+                }
+                let written: String = chars[begin..at].iter().collect();
+                let fully_quoted = format!("'{delimiter}'");
+                let rewrite = quoted
+                    && written != fully_quoted
+                    && written != format!("\"{delimiter}\"")
+                    && !delimiter.contains(['\'', '\n']);
+                if rewrite {
+                    out.push_str(&fully_quoted);
+                    changed = true;
+                } else {
+                    out.push_str(&written);
+                }
+                if begin < at {
+                    pending.push((delimiter, strip_tabs));
+                }
+                word_started = false;
+            }
+            ' ' | '\t' | ';' | '&' | '|' | '(' | ')' | '<' | '>' => {
+                out.push(c);
+                at += 1;
+                word_started = false;
+            }
+            _ => {
+                out.push(c);
+                at += 1;
+                word_started = true;
+            }
+        }
+    }
+    changed.then_some(out)
 }
 
 /// Whether bytes produced by one command are structurally fed into a code
@@ -5659,5 +5885,45 @@ mod tests {
         ] {
             assert!(!has_executable_data_flow(command), "{command}");
         }
+    }
+
+    /// tree-sitter-bash matched a here-document delimiter quoted in part as
+    /// written and opened a comment after a line continuation inside a
+    /// word; the shell does neither (measured 2026-11-09). The rewrite gives
+    /// the grammar the shell's reading, and only where they differ.
+    ///
+    /// FAILS ON REVERT: without the rewrite the commands after the real end
+    /// of the body, or after the joined `a#`, are masked.
+    #[test]
+    fn the_projection_reads_delimiters_and_continuations_as_the_shell() {
+        assert_eq!(
+            text_as_the_shell_reads("cat <<E\"O\"F\nEOF\niw dry-run\nE\"O\"F").as_deref(),
+            Some("cat <<'EOF'\nEOF\niw dry-run\nE\"O\"F")
+        );
+        assert_eq!(
+            text_as_the_shell_reads("cat <<-E''\n\tE\niw dry-run").as_deref(),
+            Some("cat <<-'E'\n\tE\niw dry-run")
+        );
+        assert_eq!(
+            text_as_the_shell_reads("echo a\\\n#; iw dry-run").as_deref(),
+            Some("echo a#; iw dry-run")
+        );
+        for unchanged in [
+            "cat <<'EOF'\nx\nEOF",
+            "cat <<\"EOF\"\nx\nEOF",
+            "cat <<EOF\nx\nEOF",
+            "echo a \\\n# a comment",
+            "docker run \\\n  -v /x:/y img",
+            "echo '<<E\"O\"F' # <<E''",
+            "cat <<'EOF'\n<<E''\nEOF",
+        ] {
+            assert_eq!(text_as_the_shell_reads(unchanged), None, "{unchanged}");
+        }
+        let projected = project("cat <<E''\nE\niw dry-run\nE''");
+        assert!(projected.parsed);
+        assert!(projected.scan.contains("iw dry-run"), "{}", projected.scan);
+        let data = project("cat <<E''\niw dry-run\nE");
+        assert!(data.parsed);
+        assert!(!data.scan.contains("iw dry-run"), "{}", data.scan);
     }
 }

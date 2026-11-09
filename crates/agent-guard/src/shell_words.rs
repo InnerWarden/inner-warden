@@ -241,6 +241,17 @@ impl Lexer {
                     self.end_command(false);
                     self.at += 1;
                 }
+                // A `#` where a word starts opens a comment to the end of
+                // the line: a quote inside it opens nothing. Read as a word,
+                // `done #'` opened a quote that hid every later line from
+                // the reading (measured 2026-11-09). A `#` inside a word
+                // (`a#b`, a line continuation before it included) is a
+                // character, as it is to the shell.
+                '#' if self.word.is_none() => {
+                    while self.peek(0).is_some_and(|c| c != '\n') {
+                        self.at += 1;
+                    }
+                }
                 _ => self.word_unit(),
             }
         }
@@ -745,8 +756,9 @@ fn matching_close(chars: &[char], start: usize, open: char, close: char) -> Opti
 
 /// One escape of a `$'...'` string, `chars` starting after its backslash:
 /// the character it stands for (none for `\c` at the end) and how many
-/// characters it used.
-fn ansi_c_escape(chars: &[char]) -> (Option<char>, usize) {
+/// characters it used. Shared with the guard's own word reading
+/// (`threats::shell_tokens`), so both decode `$'\151nnerwarden'` alike.
+pub(crate) fn ansi_c_escape(chars: &[char]) -> (Option<char>, usize) {
     let Some(&first) = chars.first() else {
         return (Some('\\'), 0);
     };

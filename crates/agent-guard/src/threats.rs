@@ -2162,7 +2162,27 @@ fn words_run_guard_loosening_verb_fed(words: &[String], depth: u8, mut fed: bool
     // `$(echo innerwarden) allow x` and `` `echo innerwarden` allow x ``: the
     // substitution's output is the command word.
     let mut in_substitution = false;
+    // The word before was a redirection whose target this word is.
+    let mut redirection_target = false;
     for (index, word) in words.iter().enumerate() {
+        // A redirection, and its target, are not words of the command: the
+        // command is the first word that is neither (`</bin/cat innerwarden
+        // allow x` runs `innerwarden allow x` with `/bin/cat` on its input,
+        // and `3</bin/wc` is the same on descriptor 3; measured 2026-11-09,
+        // the reader the target names was taken for the command).
+        if std::mem::take(&mut redirection_target) {
+            continue;
+        }
+        if let Some(target_follows) = redirection_word(word) {
+            // `<(innerwarden allow x)` reaches here as `<` and the words of
+            // the substitution, which runs: that reading is kept.
+            if target_follows && words_run_guard_loosening_verb_fed(&words[index + 1..], depth, fed)
+            {
+                return true;
+            }
+            redirection_target = target_follows;
+            continue;
+        }
         let dollar = word == "$";
         let lower = word.to_ascii_lowercase();
         let lower = lower.trim_matches('`');
@@ -2200,11 +2220,36 @@ fn words_run_guard_loosening_verb_fed(words: &[String], depth: u8, mut fed: bool
             continue;
         }
         if SHELLS.contains(&base) || matches!(base, "script" | "su") {
-            return command_string_argument(base, &words[index + 1..])
-                .is_some_and(|payload| runs_guard_loosening_verb(payload, depth + 1));
+            let arguments = &words[index + 1..];
+            if let Some(payload) = command_string_argument(base, arguments) {
+                return runs_guard_loosening_verb(payload, depth + 1);
+            }
+            // `sh <<<'innerwarden allow x'`: a shell given no command string
+            // and no script file reads its commands from its input, and a
+            // here-string is that input (measured 2026-11-09).
+            return SHELLS.contains(&base)
+                && shell_here_string_script(arguments)
+                    .is_some_and(|script| runs_guard_loosening_verb(script, depth + 1));
         }
         if base == "eval" {
             return runs_guard_loosening_verb(&words[index + 1..].join(" "), depth + 1);
+        }
+        // `env -S 'innerwarden allow x'`: env splits the string into words
+        // and runs them, the words after it appended, so the string is read
+        // as a command line, as `sh -c` is, not as an option's value
+        // (measured 2026-11-09: only the text backstop read it, and its verb
+        // list has no `allow`). The reading without it below still runs.
+        if base == "env" && depth < 4 {
+            let split = env_split_string(&words[index + 1..])
+                .and_then(|(split, after)| Some((env_split_words(split)?, after)));
+            if let Some((split, after)) = split {
+                let mut line = vec!["env".to_string()];
+                line.extend(split);
+                line.extend(words[index + 1 + after..].iter().cloned());
+                if words_run_guard_loosening_verb_fed(&line, depth + 1, fed) {
+                    return true;
+                }
+            }
         }
         if matches!(base, "npm" | "pnpm" | "yarn" | "bun")
             && words
@@ -2249,6 +2294,198 @@ fn words_run_guard_loosening_verb_fed(words: &[String], depth: u8, mut fed: bool
         in_substitution = dollar;
     }
     false
+}
+
+/// A redirection as [`shell_tokens`] hands it: `Some(true)` for an operator
+/// whose target is the next word (`<`, `2>`, `<<<`, `<<-`), `Some(false)` for
+/// one whose target is glued on (`</bin/cat`, `3</bin/wc`, `2>/dev/null`,
+/// `<<<text`) or that needs none (`>&-`), and `None` for a word that is not
+/// a redirection.
+fn redirection_word(word: &str) -> Option<bool> {
+    let rest = word.trim_start_matches(|c: char| c.is_ascii_digit());
+    if !rest.starts_with(['<', '>']) {
+        return None;
+    }
+    let at = rest
+        .find(|c: char| !matches!(c, '<' | '>' | '&' | '|'))
+        .unwrap_or(rest.len());
+    let (operator, target) = rest.split_at(at);
+    let target = match operator {
+        "<<" => target.strip_prefix('-').unwrap_or(target),
+        _ => target,
+    };
+    Some(target.is_empty())
+}
+
+/// The commands a shell reads from a here-string (`sh <<<'innerwarden allow
+/// x'`, `bash -x <<< "..."`): its text, when the shell is given no script
+/// file to run (or `-s`, which reads the script from the input whatever
+/// follows). A command string is looked for first, by
+/// [`command_string_argument`].
+fn shell_here_string_script(arguments: &[String]) -> Option<&str> {
+    let mut script = None;
+    let mut operand = false;
+    let mut options_end = false;
+    let mut from_input = false;
+    let mut index = 0usize;
+    while let Some(word) = arguments.get(index) {
+        index += 1;
+        let rest = word.trim_start_matches(|c: char| c.is_ascii_digit());
+        if let Some(text) = rest.strip_prefix("<<<") {
+            if text.is_empty() {
+                script = arguments.get(index).map(String::as_str);
+                index += 1;
+            } else {
+                script = Some(text);
+            }
+            continue;
+        }
+        if let Some(target_follows) = redirection_word(word) {
+            index += usize::from(target_follows);
+            continue;
+        }
+        if options_end || operand || !word.starts_with(['-', '+']) {
+            operand = true;
+            continue;
+        }
+        if word == "--" {
+            options_end = true;
+        } else if matches!(word.as_str(), "-o" | "+o" | "-O" | "+O") {
+            index += 1;
+        } else if !word.starts_with("--") && word[1..].contains('s') {
+            from_input = true;
+        }
+    }
+    script.filter(|_| !operand || from_input)
+}
+
+/// The string `env -S` (`-SSTRING`, `--split-string[=]`) is handed before
+/// the command env runs, and how many of `arguments` (the words after
+/// `env`) run up to it, the string included. `None` when env runs its
+/// command with no such string.
+fn env_split_string(arguments: &[String]) -> Option<(&str, usize)> {
+    let mut index = 0usize;
+    while let Some(word) = arguments.get(index) {
+        index += 1;
+        if is_environment_assignment(word) {
+            continue;
+        }
+        if word == "--" || !word.starts_with('-') {
+            return None;
+        }
+        if let Some(value) = word.strip_prefix("--split-string=") {
+            return Some((value, index));
+        }
+        if word == "--split-string" {
+            return arguments
+                .get(index)
+                .map(|value| (value.as_str(), index + 1));
+        }
+        if word.starts_with("--") {
+            if matches!(word.as_str(), "--unset" | "--chdir") {
+                index += 1;
+            }
+            continue;
+        }
+        // A cluster of short options; `-S`, `-u` and `-C` take a value,
+        // glued on or the next word.
+        let flags = &word[1..];
+        for (at, flag) in flags.char_indices() {
+            let glued = &flags[at + flag.len_utf8()..];
+            match flag {
+                'S' if glued.is_empty() => {
+                    return arguments
+                        .get(index)
+                        .map(|value| (value.as_str(), index + 1));
+                }
+                'S' => return Some((glued, index)),
+                'u' | 'C' => {
+                    index += usize::from(glued.is_empty());
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+/// The words GNU `env -S` splits its string into (coreutils 9.4, checked on
+/// the lab box 2026-11-09): blanks separate; single quotes keep everything
+/// but `\\` and `\'`; double quotes group, with escapes; `\_` separates
+/// outside quotes and is a space inside double quotes; `\c` ends the string
+/// outside quotes; a `#` starting a word opens a comment; `${NAME}` is a
+/// value, kept as written. `None` when env refuses the string (an escape it
+/// does not know, `\c` in double quotes, a `$` that does not start
+/// `${NAME}`, a quote left open): it then runs nothing.
+fn env_split_words(text: &str) -> Option<Vec<String>> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut words = Vec::new();
+    let mut word: Option<String> = None;
+    let mut quote: Option<char> = None;
+    let mut at = 0usize;
+    while let Some(&c) = chars.get(at) {
+        at += 1;
+        match (quote, c) {
+            (None, ' ' | '\t' | '\n' | '\r' | '\u{b}' | '\u{c}') => {
+                words.extend(word.take());
+            }
+            (None, '#') if word.is_none() => break,
+            (None, '\'' | '"') => {
+                quote = Some(c);
+                word.get_or_insert_with(String::new);
+            }
+            (Some(open), _) if c == open => quote = None,
+            (Some('\''), '\\') => {
+                let escaped = chars.get(at).filter(|e| matches!(e, '\\' | '\''));
+                let current = word.get_or_insert_with(String::new);
+                match escaped {
+                    Some(&e) => {
+                        current.push(e);
+                        at += 1;
+                    }
+                    None => current.push('\\'),
+                }
+            }
+            (Some('\''), _) => word.get_or_insert_with(String::new).push(c),
+            (_, '\\') => {
+                let escaped = *chars.get(at)?;
+                at += 1;
+                let decoded = match escaped {
+                    'c' if quote.is_none() => break,
+                    '_' if quote.is_none() => {
+                        words.extend(word.take());
+                        continue;
+                    }
+                    '_' => ' ',
+                    'f' => '\u{c}',
+                    'n' => '\n',
+                    'r' => '\r',
+                    't' => '\t',
+                    'v' => '\u{b}',
+                    '#' | '$' | '"' | '\'' | '\\' => escaped,
+                    _ => return None,
+                };
+                word.get_or_insert_with(String::new).push(decoded);
+            }
+            (_, '$') => {
+                if chars.get(at) != Some(&'{') {
+                    return None;
+                }
+                let close = chars[at..].iter().position(|e| *e == '}')? + at;
+                let current = word.get_or_insert_with(String::new);
+                current.push('$');
+                current.extend(&chars[at..=close]);
+                at = close + 1;
+            }
+            _ => word.get_or_insert_with(String::new).push(c),
+        }
+    }
+    if quote.is_some() {
+        return None;
+    }
+    words.extend(word);
+    Some(words)
 }
 
 /// PURE. Whether every `innerwarden uninstall` in `lower` only asks: its own
@@ -4167,6 +4404,11 @@ fn normalize_block(mut s: String) -> String {
     // A line continuation joins two lines into one, inside a word too
     // (`ker\<newline>nel`): the shell never sees the break.
     s = s.replace("\\\r\n", "").replace("\\\n", "");
+    // `$'\151nnerwarden'` is the word the shell decodes it to, before the
+    // backslash pass below turns `\151` into `151` (measured 2026-11-09).
+    if let Some(decoded) = decode_ansi_c_strings(&s) {
+        s = decoded;
+    }
     for _ in 0..5 {
         let before = s.clone();
         // Brace expansion (`k{e..e}rnel`, `{rm,x} -rf`): the shell hands the
@@ -4364,6 +4606,11 @@ pub fn strip_shell_noops(cmd: &str) -> String {
             )
         })
         .collect();
+    // Decoded first: the backslash collapse below read `$'\x69nnerwarden'` as
+    // `$'x69nnerwarden'`, a word the shell never makes (measured 2026-11-09).
+    if let Some(decoded) = decode_ansi_c_strings(&s) {
+        s = decoded;
+    }
     for _ in 0..5 {
         let before = s.clone();
         s = s.replace("${IFS}", " ").replace("$IFS", " ");
@@ -4374,6 +4621,81 @@ pub fn strip_shell_noops(cmd: &str) -> String {
         }
     }
     s
+}
+
+/// PURE. `text` with every `$'...'` string (outside other quotes) written as
+/// the single-quoted string bash decodes it to (`\n`, `\t`, `\xHH`, `\NNN`,
+/// `\uHHHH`, `\cX` and the rest; a `'` inside as `'"'"'`; a NUL ends it, as
+/// it ends the shell's), so a reading that drops quotes and backslashes
+/// sees the word the program gets. `None` when there is none.
+fn decode_ansi_c_strings(text: &str) -> Option<String> {
+    if !text.contains("$'") {
+        return None;
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut single_quoted = false;
+    let mut double_quoted = false;
+    let mut changed = false;
+    let mut at = 0usize;
+    while let Some(&c) = chars.get(at) {
+        if single_quoted {
+            single_quoted = c != '\'';
+            out.push(c);
+            at += 1;
+            continue;
+        }
+        match c {
+            '\\' => {
+                out.push(c);
+                if let Some(&escaped) = chars.get(at + 1) {
+                    out.push(escaped);
+                }
+                at += 2;
+            }
+            '\'' if !double_quoted => {
+                single_quoted = true;
+                out.push(c);
+                at += 1;
+            }
+            '"' => {
+                double_quoted = !double_quoted;
+                out.push(c);
+                at += 1;
+            }
+            '$' if !double_quoted && chars.get(at + 1) == Some(&'\'') => {
+                changed = true;
+                at += 2;
+                let mut value = String::new();
+                let mut ended = false;
+                while let Some(&inner) = chars.get(at) {
+                    at += 1;
+                    let decoded = match inner {
+                        '\'' => break,
+                        '\\' => {
+                            let (decoded, used) = crate::shell_words::ansi_c_escape(&chars[at..]);
+                            at += used;
+                            decoded
+                        }
+                        other => Some(other),
+                    };
+                    match decoded {
+                        Some('\0') => ended = true,
+                        Some(decoded) if !ended => value.push(decoded),
+                        _ => {}
+                    }
+                }
+                out.push('\'');
+                out.push_str(&value.replace('\'', "'\"'\"'"));
+                out.push('\'');
+            }
+            _ => {
+                out.push(c);
+                at += 1;
+            }
+        }
+    }
+    changed.then_some(out)
 }
 
 /// Check for dangerous commands. Returns description and whether to block.
@@ -5923,38 +6245,112 @@ pub fn check_sensitive_read(content: &str) -> Option<(&'static str, u32)> {
 /// Split a shell command list at real command boundaries while preserving
 /// separators carried inside quoted data. This is intentionally a small lexical
 /// helper, not an evaluator: it never expands variables or executes input.
+///
+/// The quoting it follows is the shell's (measured 2026-11-09, each one a
+/// lowering the guard allowed because a quote here hid the command after
+/// it): a `#` where a word starts opens a comment to the end of the line
+/// (or of the backtick substitution it is in), and a quote inside it opens
+/// nothing; a line continuation does not end the word before it, so `a\`,
+/// newline, `#` is the word `a#` and no comment; a backtick substitution
+/// ends at the first backtick not escaped, closing any quote its text left
+/// open; and in a `$'...'` string `\'` does not end it. A comment is not
+/// part of the segment it ends.
 pub(crate) fn shell_command_segments(content: &str) -> Vec<&str> {
     let bytes = content.as_bytes();
     let mut segments = Vec::new();
     let mut start = 0usize;
     let mut index = 0usize;
     let mut single_quoted = false;
+    let mut ansi_c = false;
     let mut double_quoted = false;
-    let mut escaped = false;
+    let mut backtick: Option<bool> = None;
+    let mut word_started = false;
 
     while index < bytes.len() {
         let byte = bytes[index];
-        if escaped {
-            escaped = false;
+        let next = bytes.get(index + 1).copied();
+        if ansi_c {
+            match byte {
+                b'\\' => index += 2,
+                b'\'' => {
+                    ansi_c = false;
+                    single_quoted = false;
+                    index += 1;
+                }
+                _ => index += 1,
+            }
+            continue;
+        }
+        if backtick.is_some() && byte == b'\\' && next == Some(b'`') {
+            index += 2;
+            continue;
+        }
+        if byte == b'`' && (!single_quoted || backtick.is_some()) {
+            match backtick.take() {
+                Some(outside) => {
+                    single_quoted = false;
+                    double_quoted = outside;
+                    word_started = true;
+                }
+                None => {
+                    backtick = Some(double_quoted);
+                    word_started = false;
+                }
+            }
             index += 1;
             continue;
         }
         if byte == b'\\' && !single_quoted {
-            escaped = true;
-            index += 1;
+            // A line continuation leaves the word it is in going on.
+            if next != Some(b'\n') {
+                word_started = true;
+            }
+            index += 2;
+            continue;
+        }
+        let unquoted = !single_quoted && !double_quoted;
+        if unquoted && byte == b'$' && next == Some(b'\'') {
+            single_quoted = true;
+            ansi_c = true;
+            word_started = true;
+            index += 2;
             continue;
         }
         if byte == b'\'' && !double_quoted {
             single_quoted = !single_quoted;
+            word_started = true;
             index += 1;
             continue;
         }
         if byte == b'"' && !single_quoted {
             double_quoted = !double_quoted;
+            word_started = true;
             index += 1;
             continue;
         }
-        if !single_quoted && !double_quoted && matches!(byte, b';' | b'\n' | b'|' | b'&') {
+        if unquoted && byte == b'#' && !word_started {
+            // A comment in a backtick substitution ends with it and stays in
+            // the segment, whose words skip it; one outside ends the segment.
+            if backtick.is_none() {
+                let segment = content[start..index].trim();
+                if !segment.is_empty() {
+                    segments.push(segment);
+                }
+            }
+            while let Some(&c) = bytes.get(index) {
+                let ends_substitution =
+                    backtick.is_some() && c == b'`' && bytes[index - 1] != b'\\';
+                if c == b'\n' || ends_substitution {
+                    break;
+                }
+                index += 1;
+            }
+            if backtick.is_none() {
+                start = index;
+            }
+            continue;
+        }
+        if unquoted && matches!(byte, b';' | b'\n' | b'|' | b'&') {
             let segment = content[start..index].trim();
             if !segment.is_empty() {
                 segments.push(segment);
@@ -5964,8 +6360,11 @@ pub(crate) fn shell_command_segments(content: &str) -> Vec<&str> {
                 index += 1;
             }
             start = index;
+            word_started = false;
             continue;
         }
+        word_started = !(unquoted
+            && (byte.is_ascii_whitespace() || matches!(byte, b'(' | b')' | b'<' | b'>')));
         index += 1;
     }
     let tail = content[start..].trim();
@@ -9202,57 +9601,182 @@ fn shell_noexec_mode(words: &[String]) -> bool {
         })
 }
 
+/// The words of one simple command, quotes and escapes taken out, as the
+/// shell hands them to the program. Substitutions are not run: their text
+/// stays in the words (a backtick included), split at blanks like the rest,
+/// so the command inside one is read as words too.
+///
+/// What the shell does to the text before any word is made is done here as
+/// well, because the guard's refusal of its own lowering reads these words
+/// (measured 2026-11-09, every one of them a lowering the guard allowed):
+/// - `$'...'` is decoded as bash decodes it (`$'\151nnerwarden'`,
+///   `al$'low'`, `--$'monitor'`, `$''disconnect`), and `$"..."` is a double
+///   quote;
+/// - a backslash before a newline is a line continuation: both go;
+/// - a `#` where a word starts opens a comment to the end of the line (or of
+///   the backtick substitution it is in), and a quote inside it opens
+///   nothing (`done #'`);
+/// - a backtick substitution ends at the first backtick not escaped, whatever
+///   quote its text left open (`` `true '` ``);
+/// - an unquoted `<` or `>` ends the word before it (`sh<<<"..."` is `sh`
+///   and its here-string), as the shell's metacharacters do.
 pub(crate) fn shell_tokens(segment: &str) -> Vec<String> {
+    let chars: Vec<char> = segment.chars().collect();
     let mut words = Vec::new();
     let mut word = String::new();
     let mut single_quoted = false;
+    // The single quote was opened by `$'`: a backslash escape inside it is
+    // decoded, and `\'` does not close it.
+    let mut ansi_c = false;
     let mut double_quoted = false;
-    let mut escaped = false;
-    let mut characters = segment.chars().peekable();
-    while let Some(character) = characters.next() {
-        if escaped {
-            word.push(character);
-            escaped = false;
+    // Inside a backtick substitution: the quote state outside it, restored
+    // when it ends.
+    let mut backtick: Option<bool> = None;
+    // The word being read has begun (a quote begins one too), so a `#` here
+    // is a character of it, not a comment.
+    let mut word_started = false;
+    let mut at = 0usize;
+    while let Some(&character) = chars.get(at) {
+        let next = chars.get(at + 1).copied();
+        if ansi_c {
+            match character {
+                '\'' => {
+                    ansi_c = false;
+                    single_quoted = false;
+                    at += 1;
+                }
+                '\\' => {
+                    let (decoded, used) = crate::shell_words::ansi_c_escape(&chars[at + 1..]);
+                    word.extend(decoded);
+                    at += 1 + used;
+                }
+                _ => {
+                    word.push(character);
+                    at += 1;
+                }
+            }
+            continue;
+        }
+        // In a backtick substitution `` \` `` is a backtick of the command
+        // inside, whatever that command quotes.
+        if backtick.is_some() && character == '\\' && next == Some('`') {
+            word.push('`');
+            at += 2;
+            continue;
+        }
+        if character == '`' && (!single_quoted || backtick.is_some()) {
+            word.push('`');
+            match backtick.take() {
+                Some(outside) => {
+                    single_quoted = false;
+                    double_quoted = outside;
+                    word_started = true;
+                }
+                None => {
+                    backtick = Some(double_quoted);
+                    word_started = false;
+                }
+            }
+            at += 1;
             continue;
         }
         if character == '\\' && !single_quoted {
+            // A line continuation: the shell joins the two lines, inside a
+            // word too, so the word goes on.
+            if next == Some('\n') {
+                at += 2;
+                continue;
+            }
             // Inside double quotes a backslash escapes only `$`, `` ` ``, `"`,
             // `\` and a newline; before anything else the shell keeps it. So
             // `sh -c "sh -c innerwarden\ allow\ x"` hands the inner shell
             // `innerwarden\ allow\ x`, which it reads as ONE word: the CLI with
             // its verb, run. Dropping the backslash here read the inner line as
             // the bare CLI with arguments, and the lowering was allowed.
-            if double_quoted && !matches!(characters.peek(), Some('$' | '`' | '"' | '\\' | '\n')) {
+            if double_quoted && !matches!(next, Some('$' | '`' | '"' | '\\')) {
                 word.push(character);
+                at += 1;
                 continue;
             }
-            escaped = true;
+            match next {
+                Some(escaped) => {
+                    word.push(escaped);
+                    at += 2;
+                }
+                None => {
+                    word.push('\\');
+                    at += 1;
+                }
+            }
+            word_started = true;
+            continue;
+        }
+        let unquoted = !single_quoted && !double_quoted;
+        if unquoted && character == '$' && matches!(next, Some('\'' | '"')) {
+            if next == Some('\'') {
+                single_quoted = true;
+                ansi_c = true;
+            } else {
+                double_quoted = true;
+            }
+            word_started = true;
+            at += 2;
             continue;
         }
         if character == '\'' && !double_quoted {
             single_quoted = !single_quoted;
+            word_started = true;
+            at += 1;
             continue;
         }
         if character == '"' && !single_quoted {
             double_quoted = !double_quoted;
+            word_started = true;
+            at += 1;
             continue;
         }
-        if !single_quoted && !double_quoted && matches!(character, '(' | ')' | '{' | '}') {
-            if !word.is_empty() {
-                words.push(std::mem::take(&mut word));
+        if unquoted && character == '#' && !word_started {
+            while let Some(&c) = chars.get(at) {
+                let ends_substitution = backtick.is_some() && c == '`' && chars[at - 1] != '\\';
+                if c == '\n' || ends_substitution {
+                    break;
+                }
+                at += 1;
             }
             continue;
         }
-        if character.is_whitespace() && !single_quoted && !double_quoted {
+        if unquoted && matches!(character, '(' | ')' | '{' | '}') {
             if !word.is_empty() {
                 words.push(std::mem::take(&mut word));
             }
+            // `(` and `)` are operators, so a word starts after them; a brace
+            // is a character the shell reads in place (`${#x}`).
+            if matches!(character, '(' | ')') {
+                word_started = false;
+            }
+            at += 1;
+            continue;
+        }
+        if unquoted
+            && matches!(character, '<' | '>')
+            && !word
+                .chars()
+                .all(|c| c.is_ascii_digit() || matches!(c, '<' | '>' | '&' | '|'))
+        {
+            // The word before a redirection ends there; a descriptor number
+            // (`2>`) and the operator's own characters (`<<<`) stay with it.
+            words.push(std::mem::take(&mut word));
+        }
+        if character.is_whitespace() && unquoted {
+            if !word.is_empty() {
+                words.push(std::mem::take(&mut word));
+            }
+            word_started = false;
         } else {
             word.push(character);
+            word_started = !(unquoted && matches!(character, '<' | '>'));
         }
-    }
-    if escaped {
-        word.push('\\');
+        at += 1;
     }
     if !word.is_empty() {
         words.push(word);
@@ -15013,5 +15537,98 @@ mod shell_tokens_tests {
             ["echo", r"a\ b"],
             "inside single quotes nothing is an escape"
         );
+    }
+
+    /// The words are the ones the shell makes (measured 2026-11-09): `$'...'`
+    /// decoded, `$"..."` a double quote, a line continuation removed, a
+    /// comment skipped, a backtick substitution closing what it opened, and
+    /// a redirection ending the word before it.
+    ///
+    /// FAILS ON REVERT: each assertion is one reading the old tokenizer got
+    /// wrong (`$\151nnerwarden`, `al$low`, `#\ninnerwarden allow x`, ...).
+    #[test]
+    fn the_words_are_what_the_shell_makes() {
+        assert_eq!(
+            shell_tokens(r"$'\151nnerwarden' al$'low' --$'\x6donitor' $''x $'it\'s'"),
+            ["innerwarden", "allow", "--monitor", "x", "it's"]
+        );
+        assert_eq!(shell_tokens(r#"$"iw" $"dry-run""#), ["iw", "dry-run"]);
+        assert_eq!(shell_tokens("ec\\\nho a\\\n#b"), ["echo", "a#b"]);
+        assert_eq!(shell_tokens("done #'"), ["done"]);
+        assert_eq!(shell_tokens("echo ${#x} a#b"), ["echo", "$", "#x", "a#b"]);
+        assert_eq!(
+            shell_tokens("true `true '` x"),
+            ["true", "`true", "`", "x"],
+            "the quote opened inside the backticks closes with them"
+        );
+        assert_eq!(shell_tokens("true `#'` x"), ["true", "``", "x"]);
+        assert_eq!(
+            shell_tokens(r#"sh<<<"a b" 2>/dev/null x>out <in"#),
+            ["sh", "<<<a b", "2>/dev/null", "x", ">out", "<in"]
+        );
+        assert_eq!(shell_tokens(r"echo '<' a=b"), ["echo", "<", "a=b"]);
+    }
+}
+
+#[cfg(test)]
+mod shell_command_segments_tests {
+    use super::shell_command_segments;
+
+    /// A quote inside a comment, or one a backtick substitution leaves open,
+    /// opens nothing, and a line continuation keeps the word before it going
+    /// (measured 2026-11-09: each hid the command after it).
+    ///
+    /// FAILS ON REVERT: the old segmenter read one quoted segment to the end.
+    #[test]
+    fn a_comment_or_a_closed_substitution_ends_no_quote() {
+        assert_eq!(
+            shell_command_segments("for x do true; done #'\ninnerwarden allow x"),
+            ["for x do true", "done", "innerwarden allow x"]
+        );
+        assert_eq!(
+            shell_command_segments("true `#'` ; innerwarden allow x"),
+            ["true `#'`", "innerwarden allow x"]
+        );
+        assert_eq!(
+            shell_command_segments("true `true '` ; iw dry-run #'"),
+            ["true `true '`", "iw dry-run"]
+        );
+        assert_eq!(
+            shell_command_segments("echo a\\\n#; innerwarden allow x"),
+            ["echo a\\\n#", "innerwarden allow x"]
+        );
+        assert_eq!(
+            shell_command_segments("echo $'it\\'s; x' ; echo 'a;b' # c; d"),
+            ["echo $'it\\'s; x'", "echo 'a;b'"]
+        );
+    }
+}
+
+#[cfg(test)]
+mod env_split_words_tests {
+    use super::env_split_words;
+
+    /// GNU env's own splitting of a `-S` string (coreutils 9.4 on the lab
+    /// box, 2026-11-09), and the strings it refuses, which run nothing.
+    ///
+    /// FAILS ON REVERT: reading the string with the shell's rules instead
+    /// takes `\a` for `a` and `\_` for `_`.
+    #[test]
+    fn env_splits_its_string_as_env_does() {
+        let split = |text: &str| env_split_words(text).map(|words| words.join("|"));
+        assert_eq!(
+            split(r"innerwarden\_allow\_x").as_deref(),
+            Some("innerwarden|allow|x")
+        );
+        assert_eq!(
+            split(r#"a "b\_c" 'd\ne' f\tg"#).as_deref(),
+            Some("a|b c|d\\ne|f\tg")
+        );
+        assert_eq!(split(r"x \c y z").as_deref(), Some("x"));
+        assert_eq!(split("a#b #c d").as_deref(), Some("a#b"));
+        assert_eq!(split("${HOME}/x").as_deref(), Some("${HOME}/x"));
+        for refused in [r"innerwarden \allow x", "$HOME", "\"a", r#""x\cy""#] {
+            assert_eq!(env_split_words(refused), None, "{refused}");
+        }
     }
 }
