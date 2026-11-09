@@ -2221,8 +2221,9 @@ fn words_run_guard_loosening_verb_fed(words: &[String], depth: u8, mut fed: bool
             // The text it is handed, and the guard's CLI by any of its names
             // as a word of it (`watch -n 1 iw-guard uninstall`, `ssh host iw
             // dry-run`; live gate of Active Defence 0.17.6, K1).
-            return code_text_runs_guard_verb(&words[index + 1..].join(" "))
-                || guard_cli_named_later_loosens(&words[index + 1..]);
+            let handed = &words[index + 1..];
+            return code_text_runs_guard_verb(&handed.join(" "))
+                || guard_cli_named_later_loosens(handed);
         }
         let skippable = after_option
             || dollar
@@ -14948,3 +14949,19 @@ mod privileged_write_target_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "mutant_kills/threats_t1.rs"]
+mod mutant_kills_t1;
+#[cfg(test)]
+#[path = "mutant_kills/threats_t2.rs"]
+mod mutant_kills_t2;
+#[cfg(test)]
+#[path = "mutant_kills/threats_t3.rs"]
+mod mutant_kills_t3;
+#[cfg(test)]
+#[path = "mutant_kills/threats_t4.rs"]
+mod mutant_kills_t4;
+#[cfg(test)]
+#[path = "mutant_kills/threats_t5.rs"]
+mod mutant_kills_t5;
