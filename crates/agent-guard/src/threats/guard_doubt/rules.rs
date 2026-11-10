@@ -286,6 +286,9 @@ fn command_index(words: &[Word]) -> Head {
         else {
             break;
         };
+        if base == "command" && looks_up(&words[k + 1..]) {
+            break;
+        }
         k += 1;
         launched = true;
         fed |= base == "xargs" || base == "parallel";
@@ -314,8 +317,29 @@ fn command_index(words: &[Word]) -> Head {
     }
 }
 
+/// The options after `command` hold `-v` or `-V`: it prints where each name
+/// is found and runs none of them, so it is no launcher there.
+fn looks_up(after: &[Word]) -> bool {
+    after
+        .iter()
+        .take_while(|w| !w.dynamic() && w.lit.len() > 1 && w.lit.starts_with('-') && w.lit != "--")
+        .any(|w| !w.lit.starts_with("--") && w.lit.contains(['v', 'V']))
+}
+
 fn lits(words: &[Word]) -> Vec<String> {
     words.iter().map(|w| w.lit.clone()).collect()
+}
+
+/// The words spelled out after a command word that is not, read as the
+/// arguments of a guard CLI, lower it. A word that is not spelled out may be
+/// empty when the line runs, so it is left out of the reading.
+fn spells_lowering(arguments: &[Word]) -> bool {
+    let spelled: Vec<String> = arguments
+        .iter()
+        .filter(|w| !w.dynamic() && !w.lit.contains(EXPANSION))
+        .map(|w| w.lit.clone())
+        .collect();
+    loosens("innerwarden", &spelled) || loosens("innerwarden-ctl", &spelled)
 }
 
 fn loosens(name: &str, arguments: &[String]) -> bool {
@@ -719,20 +743,77 @@ fn code_strings(words: &[Word], head: &Head) -> Vec<(String, bool, bool)> {
             }
         }
         "ssh" => {
-            let own: Vec<Word> = args
-                .iter()
-                .filter(|a| !a.lit.starts_with('-'))
-                .skip(1)
-                .cloned()
-                .collect();
-            for arg in &own {
+            let own = ssh_command(args, &mut found);
+            for arg in own {
                 found.push((arg.lit.clone(), false, false));
             }
-            found.push((join(&own), false, false));
+            found.push((join(own), false, false));
         }
         _ => {}
     }
     found
+}
+
+/// The options of `ssh` that take a value, as its option reading has them.
+const SSH_VALUED: &str = "BbcDEeFIiJLlmOoPpQRSWw";
+
+/// The words `ssh` hands the far shell as its command: what stands after the
+/// options and the host. An option's value is not the host (`-p 2222 web1`),
+/// and options may stand after the host as well. The value of a `-o` is
+/// pushed as code when it sets something: several of them name a command
+/// that ssh runs (`ProxyCommand`, `LocalCommand`, `RemoteCommand`).
+fn ssh_command<'a>(args: &'a [Word], found: &mut Vec<(String, bool, bool)>) -> &'a [Word] {
+    let mut options = true;
+    let mut host = false;
+    let mut j = 0;
+    while let Some(arg) = args.get(j) {
+        let lit = arg.lit.as_str();
+        if options && lit == "--" {
+            options = false;
+            j += 1;
+            continue;
+        }
+        if options && lit.len() > 1 && lit.starts_with('-') {
+            j += 1;
+            // Flags run to the first letter that takes a value: the value is
+            // the rest of the word, or the next word when nothing is left.
+            let letters = lit[1..].split(EXPANSION).next().unwrap_or("");
+            let Some(at) = letters.find(|c| SSH_VALUED.contains(c)) else {
+                continue;
+            };
+            let attached = &lit[1 + at + 1..];
+            let value = if attached.is_empty() {
+                j += 1;
+                args.get(j - 1).map_or("", |w| w.lit.as_str())
+            } else {
+                attached
+            };
+            if letters.as_bytes()[at] == b'o' {
+                if let Some((_, set)) = value.split_once(['=', ' ']) {
+                    found.push((set.to_string(), false, false));
+                }
+            }
+            continue;
+        }
+        if !host {
+            host = true;
+            j += 1;
+            continue;
+        }
+        return &args[j..];
+    }
+    &[]
+}
+
+/// A guard verb is a token of the command's words or of the text it is fed.
+fn prints_verb(command: &Command) -> bool {
+    command
+        .words
+        .iter()
+        .chain(&command.herestrings)
+        .map(|w| w.lit.as_str())
+        .chain(command.heredocs.iter().map(|h| h.body.as_str()))
+        .any(|text| guard_tokens(text.as_bytes(), &[]).1)
 }
 
 struct Judge {
@@ -746,6 +827,9 @@ struct Judge {
     raw: bool,
     /// Only that: no name or verb is a token of the shell's reading.
     raw_only: bool,
+    /// A guard verb stands in the text of a substitution read so far: what
+    /// it prints may be the whole lowering, name and all.
+    built: bool,
 }
 
 type Deny = Option<String>;
@@ -776,6 +860,7 @@ impl Judge {
         }
         self.functions.extend(lexed.functions.iter().cloned());
         let commands = &lexed.commands;
+        self.built |= commands.iter().any(|c| c.substituted && prints_verb(c));
         let created = created_files(commands);
         let run = runs_created(commands, &created);
         if run && self.verb && (self.name || created.dynamic) {
@@ -844,6 +929,14 @@ impl Judge {
         {
             return deny("interpreter-code");
         }
+        // The guard's name is nowhere on the line, only a word that is also
+        // one of its verbs. An expansion that held the name could hold the
+        // verb as well, and that line is not refused (see the module's
+        // limits), so here an expansion is in doubt only where the words
+        // spelled out after a command word lower the guard. A verb in the
+        // text of a substitution is another matter: the command that prints
+        // it is on the line, and it may print the name beside it.
+        let nameless = !self.name && !self.raw && !self.built;
         let mut runs_input = feeds;
         'direct: {
             if self.raw_only {
@@ -895,7 +988,10 @@ impl Judge {
                     if cmd.glob && cmd.lit.contains('{') {
                         return deny("brace-command");
                     }
-                    if base.contains(EXPANSION) || (head.fed && cmd.lit.contains("{}")) {
+                    if head.fed && cmd.lit.contains("{}") {
+                        return deny("dynamic-command");
+                    }
+                    if base.contains(EXPANSION) && (!nameless || spells_lowering(args)) {
                         return deny("dynamic-command");
                     }
                     if cmd.expansion && self.name {
@@ -933,7 +1029,11 @@ impl Judge {
                                     return deny("argument-dynamic");
                                 }
                             }
-                        } else if arg_base.contains(EXPANSION) && spelled && !rest.is_empty() {
+                        } else if arg_base.contains(EXPANSION)
+                            && spelled
+                            && !rest.is_empty()
+                            && !nameless
+                        {
                             // It may be any program, a guard CLI too: what follows
                             // it is read as that CLI's arguments.
                             if scan < rest.len() {
@@ -987,7 +1087,8 @@ impl Judge {
             }
         }
         for (code, outer, strict) in code_strings(words, &head) {
-            if outer && strict {
+            // An empty code stands for one that could not be read.
+            if outer && strict && (!nameless || code.is_empty()) {
                 return deny("dynamic-code");
             }
             if let Some(reason) = self.relex(&code, depth) {
@@ -1129,6 +1230,7 @@ pub(super) fn judge(text: &[u8], flat: bool) -> Option<String> {
         flat,
         raw,
         raw_only,
+        built: false,
     };
     judge.context(&lexed, 0)
 }

@@ -58,6 +58,9 @@ pub struct Command {
     pub alt_start: Option<usize>,
     /// Read inside `(( ))`: arithmetic unless the reading is in doubt.
     pub arithmetic: bool,
+    /// Read inside `$( )`, backticks or `<( )`: what it prints is text of
+    /// the line that holds it.
+    pub substituted: bool,
     id: usize,
 }
 
@@ -288,6 +291,9 @@ impl<'a> Lexer<'a> {
         let id = self.next_id;
         self.next_id += 1;
         let body_text = self.heredoc_body && self.frames.len() == 1;
+        let substituted = self.frames.iter().any(|f| {
+            matches!(f.kind, Kind::Subst | Kind::Backtick) || (f.kind == Kind::Dual && f.dollar)
+        });
         let frame = self.top();
         frame.redirect = Redirect::None;
         frame.lead = true;
@@ -300,6 +306,7 @@ impl<'a> Lexer<'a> {
         );
         command.pipe_next = pipe;
         command.arithmetic = frame.kind == Kind::Dual;
+        command.substituted = substituted;
         let keep = frame.kind != Kind::Param && frame.kind != Kind::Array && !body_text;
         if keep
             && (!command.words.is_empty()

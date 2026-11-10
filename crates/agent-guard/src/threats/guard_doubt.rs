@@ -145,6 +145,133 @@ mod tests {
         }
     }
 
+    /// A line with one of the guard's verbs on it and the guard's name
+    /// nowhere. A command word that is not spelled out is refused when the
+    /// words spelled out after it lower the guard, and only then: `uninstall`,
+    /// `allow` and `monitor` are words of many programs, and a line that
+    /// hides the name can hide the verb the same way, which this rule does
+    /// not refuse (see the limits in `rules.rs`).
+    ///
+    /// FAILS ON REVERT: drop `spells_lowering` from the rule on a command
+    /// word that is not spelled out and the first list is let through; drop
+    /// `nameless` from that rule, from the one on an argument that is not
+    /// spelled out, or from the one on code that holds an expansion, and
+    /// lines of the second list are refused.
+    #[test]
+    fn a_line_without_the_guards_name_is_refused_only_where_its_words_lower_it() {
+        for line in [
+            "$X allow y",
+            "$X $EMPTY allow y",
+            r#"sh -c "$X allow y""#,
+            r#"eval "$X allow y""#,
+            "$(echo aW5uZXJ3YXJkZW4= | base64 -d) allow x",
+            "~/.local/bin/inner$W allow x",
+        ] {
+            assert!(unread_beside_guard_word(line), "{line}");
+            assert!(engine_refuses(line), "{line}");
+        }
+        for line in [
+            r#"eval "$(pyenv init -)" && pip uninstall -y foo"#,
+            r#"trap "rm -rf $TMPDIR" EXIT; npm uninstall left-pad"#,
+            r#"bash -c "echo $HOME && ufw allow 22""#,
+            r#"docker exec app sh -c "npm uninstall $PKG""#,
+            r#"su - deploy -c "cd $APP_DIR && npm uninstall left-pad""#,
+            r#"$EDITOR notes.md && git commit -m "allow empty names""#,
+            r#"helm --namespace "$NS" uninstall preview-1234"#,
+            r#"adb -s "$SERIAL" uninstall com.example.app"#,
+            r#"npm --prefix "$APP_DIR" uninstall left-pad"#,
+            r#"sudo ip -n "$NS" monitor route"#,
+        ] {
+            assert!(!unread_beside_guard_word(line), "{line}");
+            assert!(!engine_refuses(line), "{line}");
+        }
+    }
+
+    /// A verb in the text of a substitution keeps the line strict: the
+    /// command that prints it is on the line and may print the name beside
+    /// it, so what it prints is not run as a command or as code.
+    ///
+    /// FAILS ON REVERT: drop `built` from `nameless` and the lines of the
+    /// first list are let through.
+    #[test]
+    fn a_verb_printed_by_a_substitution_keeps_the_line_strict() {
+        for line in [
+            r#"eval "$(printf 'i%s dry-run' w)""#,
+            "$(printf 'i%s dry-run' w)",
+            "`printf 'i%s dry-run' w`",
+            r#"sh -c 'eval "$(printf "i%s dry-run" w)"'"#,
+            r#"eval "$(printf 'i%s %s' w dry-run)""#,
+        ] {
+            assert!(unread_beside_guard_word(line), "{line}");
+            assert!(engine_refuses(line), "{line}");
+        }
+        for line in [
+            r#"echo "removed: $(npm uninstall left-pad 2>&1 | tail -n 1)""#,
+            r#"git commit -m "$(printf 'allow %s to revoke a rule' "$ROLE")""#,
+        ] {
+            assert!(!unread_beside_guard_word(line), "{line}");
+            assert!(!engine_refuses(line), "{line}");
+        }
+    }
+
+    /// What `ssh` hands the far shell stands after its options and the host.
+    /// The value of an option is not the host, and a host that is not
+    /// spelled out is not a command.
+    ///
+    /// FAILS ON REVERT: take every word without a dash for the host and the
+    /// command, as the reading did, and the second list is refused: the
+    /// value of `-o` or `-p` is taken for the host and the host for a command
+    /// word that is not spelled out.
+    #[test]
+    fn ssh_hands_the_far_shell_what_stands_after_its_options_and_the_host() {
+        for line in [
+            r#"ssh "$HOST" innerwarden allow x"#,
+            "ssh -p 2222 web1 innerwarden --data-dir /tmp/d dry-run",
+            "ssh web1 -p 2222 innerwarden allow x",
+            "ssh -4p 2222 web1 'innerwarden allow x'",
+            "ssh -o RemoteCommand='innerwarden allow x' web1",
+            r#"ssh -o "ProxyCommand innerwarden dry-run" web1 true"#,
+        ] {
+            assert!(unread_beside_guard_word(line), "{line}");
+        }
+        for line in [
+            r#"ssh -o ConnectTimeout=5 "$HOST" 'innerwarden status'"#,
+            r#"ssh -J "$BASTION" "$HOST" 'innerwarden doctor'"#,
+            r#"ssh -p "$SSH_PORT" "$DB_HOST" 'innerwarden status'"#,
+            r#"for h in web1 web2; do ssh -o BatchMode=yes "$h" 'sudo innerwarden-ctl get status'; done"#,
+            r#"ssh -p 2222 "$HOST" 'sudo ufw allow 443/tcp'"#,
+            "ssh -i ~/.ssh/deploy -p 2222 web1 'sudo ufw allow 22'",
+        ] {
+            assert!(!unread_beside_guard_word(line), "{line}");
+            assert!(!engine_refuses(line), "{line}");
+        }
+    }
+
+    /// `command -v NAME` prints where a name is found and runs nothing, so
+    /// the word after it is not a command word. Without `-v` or `-V` it runs
+    /// that word.
+    ///
+    /// FAILS ON REVERT: take `command` for a launcher whatever its options
+    /// are and the second list is refused.
+    #[test]
+    fn command_v_looks_a_name_up_and_runs_nothing() {
+        for line in [
+            r#"for t in innerwarden; do command "$t" allow x; done"#,
+            r#"for t in innerwarden; do command -p "$t" allow x; done"#,
+        ] {
+            assert!(unread_beside_guard_word(line), "{line}");
+        }
+        for line in [
+            r#"for t in jq innerwarden; do command -v "$t"; done"#,
+            r#"for t in innerwarden jq git; do command -v "$t" >/dev/null 2>&1 && echo "$t ok" || echo "$t missing"; done"#,
+            "command -pv innerwarden >/dev/null && echo ok",
+            "command -V innerwarden",
+        ] {
+            assert!(!unread_beside_guard_word(line), "{line}");
+            assert!(!engine_refuses(line), "{line}");
+        }
+    }
+
     /// The rule takes a guard CLI's first word for harmless when it is not in
     /// `GUARD_VERB_HEADS`, so the list has to hold every verb the reading
     /// refuses and no verb it never does.
