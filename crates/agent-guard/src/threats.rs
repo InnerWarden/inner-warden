@@ -7323,10 +7323,25 @@ pub fn check_sensitive_read(content: &str) -> Option<(&'static str, u32)> {
 /// beside the line `as_written`. What a line prints is not in `content`,
 /// and `printf -v NAME` prints into a variable: the names a line may set
 /// are asked of both texts.
+///
+/// The line is read as written and then as its own assignments make it
+/// ([`assignment_readings`]): a secret behind a variable the line sets to a
+/// plain value (`F=/etc/shadow; cat $F`) is the secret. A variable set any
+/// other way (a loop, `read`, a value that holds another variable) is not
+/// followed.
 pub(crate) fn check_sensitive_read_as_written(
     content: &str,
     as_written: &str,
 ) -> Option<(&'static str, u32)> {
+    let (readings, _) = assignment_readings(content);
+    readings
+        .iter()
+        .filter_map(|reading| sensitive_read_in(reading, as_written))
+        .max_by_key(|&(_, score)| score)
+}
+
+/// [`check_sensitive_read_as_written`] on one reading of the line.
+fn sensitive_read_in(content: &str, as_written: &str) -> Option<(&'static str, u32)> {
     static READER: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let reader = READER.get_or_init(|| {
         regex::Regex::new(
