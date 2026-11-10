@@ -1746,7 +1746,7 @@ fn analyze_command_as_read(
     // Built-in credential stores are guarded only when the command consumes
     // their contents. This preserves strong coverage for private keys/shadow
     // without treating documentation, echo or restrictive chmod as a read.
-    if let Some((path, s)) = threats::check_sensitive_read(scan_cmd) {
+    if let Some((path, s)) = threats::check_sensitive_read_as_written(scan_cmd, cmd) {
         signals.push(AnalysisSignal {
             signal: "sensitive_credential_read".into(),
             score: s,
