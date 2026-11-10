@@ -20,10 +20,12 @@ see: [The guard and its own switches](docs/features.md#the-guard-and-its-own-swi
   double quotes (`sh -c "sh -c innerwarden\ allow\ x"`), ANSI-C quoting
   (`$'...'`), a comment, a here-document or a redirection between the words
   (`innerwarden 2>/dev/null allow x`), a name built from another value on the
-  same line (`A=inner; B=${A}warden; $B monitor`), or the `-c` argument of
-  `tcsh` and the other shells the list did not hold. Each is now read as the
-  shell reads it, at a cost that grows with the length of the line and no
-  faster.
+  same line (`A=inner; B=${A}warden; $B monitor`) or cut out of a longer one
+  (`${X%/}`), the replace string of `xargs`, an `ssh` option that names a
+  command, a backslash as a C shell keeps it inside double quotes, or the
+  `-c` argument of `tcsh` and the other shells the list did not hold. Each is
+  now read as the shell reads it, at a cost that grows with the length of the
+  line and no faster.
 - **A line the guard cannot read is refused when it names the guard.** Where
   a part of such a line stays unread (a command word that is a variable
   nothing on the line settles, a substitution that prints the command), the
@@ -36,7 +38,10 @@ see: [The guard and its own switches](docs/features.md#the-guard-and-its-own-swi
   write from the shell was not: a redirection, `tee`, `cp`, `mv`, `rm`, `ln`,
   `install`, `sed -i`, `dd`, a download saved over the file, a `chmod` that
   closes it to its owner. Removing, moving or locking an agent's own settings
-  folder is refused with it.
+  folder is refused with it. The writer is found beside a redirection of its
+  own, behind a loop word or a wrapper's options, with its target directory
+  or its in-place option in any spelling, and under a relative name after a
+  `cd` into the folder.
 - **Every command that lowers an InnerWarden Pro kernel guard through Pro's
   own tools is refused**, not only the ones the list named.
 - **An ssh key used twice on a line is a read of the key.** A key given as
@@ -68,10 +73,16 @@ says they are the person's to run: a program run from a variable on a line
 that also names the guard (`P=innerwarden; $P --version`), an agent that
 copies a new `innerwarden` binary into place, one that writes a project's
 `.mcp.json` or `.claude/settings.json` from the shell, removes a project's
-`.claude` folder, or sets an agent's settings file to a mode that takes a bit
-from its owner (`chmod 600`). A line that costs more to read than the guard
-spends on one line, with a variable in a command left unread, is refused with
-the way to shorten it.
+`.claude` folder, or sets an agent's settings file to a mode that takes the
+read or the write from its owner (`chmod 400`; `chmod 600` is let through).
+The guard's name inside a longer word, a folder such as
+`~/src/innerwarden-site`, counts as naming it where the line also holds a
+command the guard cannot read and a loosening word. After a `cd` into an
+agent's settings folder, a later write to a settings file by its bare name is
+refused, also behind a second `cd`. A line that costs more to read than the
+guard spends on one line, with a variable in a command left unread or with
+more changes of directory than the guard follows, is refused with the way to
+shorten it.
 
 ## 1.6.11 - 2026-10-24
 

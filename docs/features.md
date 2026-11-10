@@ -99,6 +99,10 @@ The guard reads the text of one command, before it runs. It does not see:
 - A write whose target the text does not spell: one found by a pattern or a
   search, made from inside an editor or by code handed to an interpreter, or
   carried in an archive or a patch.
+- A writing command (`cp`, `mv`, `tee` and the like) that the line runs from
+  inside a function it defines, a `case` arm or a command substitution. A
+  redirection is read in those places; the commands are read where they
+  stand as a command of the line.
 - Anything in monitor mode, which records and refuses nothing.
 
 An agent's hook lets a call run unless the guard answers with a refusal. A
