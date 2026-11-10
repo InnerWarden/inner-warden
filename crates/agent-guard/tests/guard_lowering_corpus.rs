@@ -202,6 +202,29 @@ const WRAPPERS: &[Wrapper] = &[
     },
 ];
 
+/// A line of Active Defence's own programs that lowers a kernel guard: it
+/// authorises a program on the exec gate, takes a path out of the secret
+/// guard's care, clears the scope a guard is held to, or sets the kernel mode
+/// back. Each is crossed with every WRAPPER, with and without `sudo`.
+const KERNEL_GUARD_LINES: &[&str] = &[
+    "innerwarden-ctl exec-gate arm --pid 1234 --observe --path /tmp/tool",
+    "innerwarden-ctl exec-gate disarm",
+    "innerwarden-config-sign exec-gate trust-path /tmp/tool",
+    "innerwarden-config-sign exec-gate scan",
+    "innerwarden-config-sign exec-gate approve 0123abcd",
+    "innerwarden-config-sign exec-gate seed-essentials",
+    "innerwarden-config-sign exec-gate import-rules",
+    "innerwarden-config-sign exec-gate disarm",
+    "innerwarden-config-sign exec-gate scope-agent --clear",
+    "innerwarden-config-sign secret-guard scope-agent --clear",
+    "innerwarden-config-sign secret-guard unprotect /home/dev/.ssh",
+    "innerwarden-config-sign secret-guard disarm",
+    "innerwarden-config-sign dns-guard disarm",
+    "innerwarden-config-sign userns-guard disarm",
+    "innerwarden-config-sign lsm --apply",
+    "innerwarden-config-sign lsm --mode disabled --apply",
+];
+
 /// Every command the corpus denies, with a short label of how it was built.
 fn deny_cases() -> Vec<(String, String)> {
     let mut cases = Vec::new();
@@ -337,6 +360,111 @@ fn deny_cases() -> Vec<(String, String)> {
             ));
         }
     }
+    // A value the line builds and then runs, and the shell's own syntax
+    // around the invocation (the forms of the 2026-11-10 review). `quoted`
+    // marks a form that holds the verb inside single quotes, which a verb
+    // with a quote of its own cannot take.
+    for name in NAMES {
+        for verb in VERBS {
+            if name.ctl_name && !verb.ctl {
+                continue;
+            }
+            let (program, tail) = (name.program, verb.tail);
+            let (head, rest) = program.split_at(program.len() / 2);
+            let forms = [
+                // The program, the verb or the whole invocation in a variable
+                // set on the same line.
+                (
+                    format!("P={program}; $P {tail}"),
+                    "program in a variable",
+                    false,
+                ),
+                (
+                    format!("P={program}; Q=$P; $Q {tail}"),
+                    "program copied through a variable",
+                    false,
+                ),
+                (
+                    format!("A={head}; B={rest}; $A$B {tail}"),
+                    "program joined from two halves",
+                    false,
+                ),
+                (
+                    format!("V='{tail}'; {program} $V"),
+                    "verb in a variable",
+                    true,
+                ),
+                (
+                    format!("C='{program} {tail}'; $C"),
+                    "invocation in a variable",
+                    true,
+                ),
+                (
+                    format!("C='{program} {tail}'; eval \"$C\""),
+                    "invocation through eval",
+                    true,
+                ),
+                (
+                    format!("C='{program} {tail}'; sh -c \"$C\""),
+                    "invocation through sh -c",
+                    true,
+                ),
+                // A redirection before or inside the invocation, a comment
+                // with a quote in it, and a shell handed the line.
+                (
+                    format!(">/dev/null {program} {tail}"),
+                    "redirection first",
+                    false,
+                ),
+                (
+                    format!("{program} 2>/dev/null {tail}"),
+                    "redirection inside",
+                    false,
+                ),
+                (
+                    format!("{program} {tail} # it's off"),
+                    "comment with a quote",
+                    false,
+                ),
+                (format!("sh <<< '{program} {tail}'"), "here-string", true),
+                (
+                    format!("bash -c $'{program} {tail}'"),
+                    "ansi-c string",
+                    true,
+                ),
+                (
+                    format!("echo '{program} {tail}' | sh"),
+                    "piped to a shell",
+                    true,
+                ),
+                (
+                    format!("sh < <(echo '{program} {tail}')"),
+                    "process substitution",
+                    true,
+                ),
+            ];
+            for (built, how, quoted) in forms {
+                if quoted && tail.contains('\'') {
+                    continue;
+                }
+                cases.push((built, format!("{program}|{tail}|{how}")));
+            }
+        }
+    }
+    // The kernel guards, lowered through Active Defence's own programs.
+    // Before 2026-11-10 the guard refused `exec-gate` with `allow`, `approve`
+    // or `disarm`, and no other verb.
+    for line in KERNEL_GUARD_LINES {
+        for sudo in ["", "sudo "] {
+            let command = format!("{sudo}{line}");
+            for wrapper in WRAPPERS {
+                cases.push((
+                    wrapper.template.replace("{C}", &command),
+                    format!("kernel-guard|{command}|{}", wrapper.label),
+                ));
+            }
+        }
+    }
     cases
 }
 
@@ -371,6 +499,37 @@ fn allow_cases() -> Vec<(String, String)> {
         (
             "sh -c \"echo innerwarden\\ dry-run\"".into(),
             "control|dq-escaped-echo".into(),
+        ),
+        // The new forms with a read or a set-up in them. (A read through a
+        // variable, `P=innerwarden; $P --version`, is not here: the guard
+        // refuses a line that names it and runs a variable as the program.)
+        (
+            ">/dev/null innerwarden --version".into(),
+            "read|version-redirected".into(),
+        ),
+        (
+            "innerwarden --version # it's on".into(),
+            "read|version-with-a-comment".into(),
+        ),
+        (
+            "sudo innerwarden-ctl exec-gate arm --pid 1234 --observe".into(),
+            "set-up|exec-gate-arm".into(),
+        ),
+        (
+            "sudo innerwarden-ctl exec-gate status".into(),
+            "read|exec-gate-status".into(),
+        ),
+        (
+            "sudo innerwarden-config-sign exec-gate list".into(),
+            "read|exec-gate-list".into(),
+        ),
+        (
+            "sudo innerwarden-config-sign secret-guard status".into(),
+            "read|secret-guard-status".into(),
+        ),
+        (
+            "sudo innerwarden-config-sign secret-guard protect --path /etc/app/prod.key".into(),
+            "set-up|secret-guard-protect".into(),
         ),
     ]
 }
