@@ -771,8 +771,9 @@ pub(crate) enum ParenKind {
     /// comment to the shell, and the lowering after the `;` runs (measured
     /// 2026-11-09 in sh, bash and dash; `<(` in bash).
     InWord,
-    /// The second `(` of `$((` or `((`: arithmetic, where `<<` is a shift
-    /// and opens no here-document.
+    /// The second `(` of `$((` or `((`, and a `(` that groups inside one:
+    /// arithmetic, where `<<` is a shift and opens no here-document, and
+    /// `case` is a variable's name.
     Arithmetic,
     /// Not a `(`: a `case` read and its `esac` not yet, so a `)` with no
     /// `(` open since is a pattern's end, an operator (`a)# note` holds a
@@ -792,9 +793,12 @@ pub(crate) struct OpenParens {
 impl OpenParens {
     /// An unquoted `(` is read. `glued` when it follows a character of a
     /// word or a redirection operator, `after_paren` when the character right
-    /// before it is an unquoted `(`.
-    pub(crate) fn open(&mut self, glued: bool, after_paren: bool) {
-        let kind = if after_paren {
+    /// before it is an unquoted `(`, `after_dollar` when it is an unquoted
+    /// `$`. Inside arithmetic only `$(` opens a substitution: any other `(`
+    /// groups (`$(( (1+2)*3 ))`, `$((1<(2)))`).
+    pub(crate) fn open(&mut self, glued: bool, after_paren: bool, after_dollar: bool) {
+        let grouping = self.open.last() == Some(&ParenKind::Arithmetic) && !after_dollar;
+        let kind = if after_paren || grouping {
             ParenKind::Arithmetic
         } else if glued {
             ParenKind::InWord
@@ -834,7 +838,10 @@ impl OpenParens {
     /// starts, as the shell reads them: `$(echo case x)#` is one word. A
     /// `case` after a word this reading does not take for a command's start
     /// (`then case`, `{ case`) is missed, and its pattern `)` is then read
-    /// as going on, which reads more of the line, never less.
+    /// as going on, which reads more of the line, never less. In arithmetic
+    /// `case` is a variable: `a=$((case +1))#;innerwarden allow x` holds no
+    /// case and no comment, and the lowering runs (review of c0d10d7,
+    /// 2026-11-09).
     pub(crate) fn command_word_starts(&mut self, rest: impl Iterator<Item = char>) {
         let head: Vec<char> = rest.take(5).collect();
         let ends_word = |c: Option<&char>| {
@@ -842,7 +849,9 @@ impl OpenParens {
         };
         if head.starts_with(&['c', 'a', 's', 'e']) && head.get(4).is_some_and(|c| c.is_whitespace())
         {
-            self.open.push(ParenKind::Case);
+            if self.open.last() != Some(&ParenKind::Arithmetic) {
+                self.open.push(ParenKind::Case);
+            }
         } else if head.starts_with(&['e', 's', 'a', 'c'])
             && ends_word(head.get(4))
             && self.open.last() == Some(&ParenKind::Case)
@@ -854,6 +863,15 @@ impl OpenParens {
     /// Inside `$((...))` or `((...))`, where `<<` is a shift.
     pub(crate) fn in_arithmetic(&self) -> bool {
         self.arithmetic > 0
+    }
+
+    /// The innermost thing open is a `case`: after a `)` a command starts
+    /// (the `)` ended a pattern, `x)` or `(x)`), so an `esac` there ends the
+    /// case. Missed, `a=$(case x in (x) esac)#;innerwarden allow x` kept the
+    /// case open, its `$(` never closed, and the `#` hid the lowering (review
+    /// of c0d10d7, 2026-11-09).
+    pub(crate) fn in_case(&self) -> bool {
+        self.open.last() == Some(&ParenKind::Case)
     }
 }
 
@@ -911,17 +929,34 @@ mod tests {
     #[test]
     fn a_closing_paren_ends_the_word_as_the_shell_ends_it() {
         let mut parens = OpenParens::default();
-        parens.open(true, false);
-        parens.open(false, true);
+        parens.open(true, false, true);
+        parens.open(false, true, false);
         assert!(parens.in_arithmetic(), "$((");
+        parens.command_word_starts("case +1".chars());
+        assert!(!parens.in_case(), "`case` is a variable in arithmetic");
+        parens.open(false, false, false);
+        parens.command_word_starts("case +1".chars());
+        assert!(parens.close_continues_word(), "a `(` there groups");
+        assert!(parens.in_arithmetic());
+        parens.open(true, false, true);
+        parens.command_word_starts("case x in".chars());
+        assert!(parens.in_case(), "a `$(` there holds commands");
+        assert!(!parens.close_continues_word(), "whose pattern ends");
+        parens.command_word_starts("esac".chars());
+        assert!(parens.close_continues_word(), "and it closes");
+        assert!(parens.in_arithmetic(), "back in the arithmetic");
         assert!(parens.close_continues_word());
         assert!(!parens.in_arithmetic());
         assert!(parens.close_continues_word(), "the `)` of `$(` goes on");
-        parens.open(false, false);
+        parens.open(false, false, false);
         assert!(!parens.close_continues_word(), "a subshell's `)` ends it");
         parens.command_word_starts("case x in".chars());
         assert!(!parens.close_continues_word(), "a pattern's `)` ends it");
         assert!(!parens.close_continues_word(), "and keeps the case open");
+        assert!(parens.in_case(), "so a command starts after it");
+        parens.open(false, false, false);
+        assert!(!parens.close_continues_word(), "`(x)` is a pattern too");
+        assert!(parens.in_case());
         parens.command_word_starts("esac;".chars());
         assert!(parens.close_continues_word(), "a stray `)` reads on");
         parens.command_word_starts("cases".chars());

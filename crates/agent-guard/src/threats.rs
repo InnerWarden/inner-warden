@@ -1,5 +1,9 @@
 //! Threat detection patterns for AI agent security.
 
+mod glob_names;
+mod guard_doubt;
+mod words_after;
+
 /// Prompt injection markers in tool descriptions or responses.
 pub const INJECTION_PATTERNS: &[&str] = &[
     "ignore previous instructions",
@@ -611,11 +615,63 @@ pub fn check_guard_self_disable(content: &str) -> Option<(&'static str, u32)> {
     // As the shell reads it: a variable set earlier on the line stands for
     // its value (`I=iw; $I dry-run`), and a name built from quoted pieces is
     // the name (`'i'w dry-run`) (live gate of Active Defence 0.17.7, L1).
-    if let Some(expanded) = with_assignments_expanded(content) {
-        if let Some(hit) = check_guard_self_disable(&expanded) {
-            return Some(hit);
+    // The most expanded reading is checked first, the line as written last.
+    let (readings, settled) = assignment_readings(content);
+    if let Some(hit) = readings
+        .iter()
+        .rev()
+        .find_map(|reading| guard_self_disable_as_read(reading))
+    {
+        return Some(hit);
+    }
+    // A guard name or verb beside a construct no reading follows (a function,
+    // `eval`, a substitution where the command word stands) ([`guard_doubt`]).
+    // Asked after the reading, so a line the reading refuses keeps the
+    // reason the reading gives for it.
+    if guard_doubt::unread_beside_guard_word(content) {
+        return Some((GUARD_LOOSENING_VERB, 60));
+    }
+    // Values that name one another without end, or grow past the limit, leave
+    // a line that was not read to its last form: refused when it touches the
+    // guard, as a reading cut short is ([`runs_guard_loosening_verb`]).
+    (!settled && line_touches_guard(content)).then_some((GUARD_LOOSENING_VERB, 60))
+}
+
+/// How many times a line's own assignments are read into it. Each round
+/// replaces every reference at once, so a chain of values that name one
+/// another (`a='$b'; b='$c'; c=iw`) halves per round: sixteen deep in four.
+const ASSIGNMENT_ROUNDS: usize = 4;
+
+/// PURE. The line as written, then the line with its own assignments read
+/// into it, one more time per entry ([`with_assignments_expanded`]), and
+/// whether the last entry is the line's last form. `false` when a value still
+/// named another after [`ASSIGNMENT_ROUNDS`], or the text passed its limit.
+///
+/// A loop, not a call of the check on each expanded line: a value that holds
+/// its own name (`a='$a'; $a`) expands to the same text for ever, and that
+/// recursion ended the hook on a stack overflow, which the agent reads as
+/// "carry on" (found 2026-11-10: twelve bytes in front of any command).
+fn assignment_readings(content: &str) -> (Vec<String>, bool) {
+    // Eight times the line and a floor: a path set once and used on every
+    // word (`P=/long/path; wc -l $P/a $P/b ...`) stays well inside it.
+    let limit = content.len().saturating_mul(8).saturating_add(4096);
+    let mut readings = vec![content.to_string()];
+    loop {
+        let last = &readings[readings.len() - 1];
+        match with_assignments_expanded(last, limit) {
+            Assigned::AsWritten => return (readings, true),
+            Assigned::PastLimit => return (readings, false),
+            Assigned::Expanded(next) if next == *last => return (readings, true),
+            Assigned::Expanded(_) if readings.len() > ASSIGNMENT_ROUNDS => {
+                return (readings, false)
+            }
+            Assigned::Expanded(next) => readings.push(next),
         }
     }
+}
+
+/// [`check_guard_self_disable`] on one reading of the line.
+fn guard_self_disable_as_read(content: &str) -> Option<(&'static str, u32)> {
     let unquoted: String = content
         .chars()
         .filter(|c| !matches!(c, '\'' | '"' | '\\'))
@@ -634,12 +690,24 @@ pub fn check_guard_self_disable(content: &str) -> Option<(&'static str, u32)> {
     check_guard_self_disable_read(content)
 }
 
+/// What a line's own assignments make of it ([`with_assignments_expanded`]).
+enum Assigned {
+    /// It refers to no variable it sets.
+    AsWritten,
+    /// The line with each such reference replaced by the value.
+    Expanded(String),
+    /// The values name one another and the text passed the limit.
+    PastLimit,
+}
+
 /// PURE. `content` with every `$NAME` / `${NAME}` of a variable set on the
-/// same line (`NAME=value`, `export NAME=value`) replaced by its value, or
-/// `None` when nothing was replaced.
-fn with_assignments_expanded(content: &str) -> Option<String> {
+/// same line (`NAME=value`, `export NAME=value`) replaced by its value: the
+/// first value the line gives the name. One pass over the line, and the
+/// result stops at `limit` bytes: thirty values that each name the next one
+/// twice (`a='$b$b'; b='$c$c'; ...`) are a gigabyte otherwise.
+fn with_assignments_expanded(content: &str, limit: usize) -> Assigned {
     if !content.contains('$') || !content.contains('=') {
-        return None;
+        return Assigned::AsWritten;
     }
     static ASSIGN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let assign = ASSIGN.get_or_init(|| {
@@ -648,40 +716,65 @@ fn with_assignments_expanded(content: &str) -> Option<String> {
         )
         .expect("a valid pattern")
     });
-    let mut out = content.to_string();
-    let mut changed = false;
+    let mut values: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
     for capture in assign.captures_iter(content) {
-        let name = &capture[1];
+        let Some(name) = capture.get(1) else { continue };
         let value = capture
             .get(2)
             .or_else(|| capture.get(3))
             .or_else(|| capture.get(4))
             .map_or("", |m| m.as_str());
-        for reference in [format!("${{{name}}}"), format!("${name}")] {
-            let mut next = String::with_capacity(out.len());
-            let mut rest = out.as_str();
-            while let Some(at) = rest.find(&reference) {
-                let after = &rest[at + reference.len()..];
-                // `$IW` is not `$I`: the name ends where the shell ends it.
-                let ends = reference.ends_with('}')
-                    || !after
-                        .chars()
-                        .next()
-                        .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
-                next.push_str(&rest[..at]);
-                if ends {
-                    next.push_str(value);
-                    changed = true;
+        values.entry(name.as_str()).or_insert(value);
+    }
+    if values.is_empty() {
+        return Assigned::AsWritten;
+    }
+    // `$IW` is not `$I`: the name ends where the shell ends it.
+    let name_end = |text: &str| {
+        text.bytes()
+            .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_')
+            .count()
+    };
+    let mut out = String::with_capacity(content.len());
+    let mut changed = false;
+    let mut rest = content;
+    while let Some(at) = rest.find('$') {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + 1..];
+        let (name, taken) = match after.strip_prefix('{') {
+            Some(braced) => {
+                let end = name_end(braced);
+                if braced[end..].starts_with('}') {
+                    (&braced[..end], end + 2)
                 } else {
-                    next.push_str(&reference);
+                    ("", 0)
                 }
-                rest = after;
             }
-            next.push_str(rest);
-            out = next;
+            None => {
+                let end = name_end(after);
+                (&after[..end], end)
+            }
+        };
+        if let Some(value) = values.get(name) {
+            out.push_str(value);
+            changed = true;
+            rest = &after[taken..];
+        } else {
+            out.push('$');
+            rest = after;
+        }
+        if out.len() > limit {
+            return Assigned::PastLimit;
         }
     }
-    changed.then_some(out)
+    out.push_str(rest);
+    if !changed {
+        Assigned::AsWritten
+    } else if out.len() > limit {
+        Assigned::PastLimit
+    } else {
+        Assigned::Expanded(out)
+    }
 }
 
 /// [`check_guard_self_disable`] on the command as written.
@@ -709,14 +802,8 @@ fn check_guard_self_disable_read(content: &str) -> Option<(&'static str, u32)> {
             let renamed = mentions_any(content, &["kernel"]) && changes_kernel_protection(content);
             return renamed.then_some((KERNEL_PROTECTION_CHANGE, 60));
         }
-        if guard_words_in(content, 0, false, true, Look::ExecGate) {
-            return Some((EXEC_GATE_AUTHORISED, 60));
-        }
-        if guard_words_in(content, 0, false, true, Look::Disarm) {
-            return Some((GUARD_DISARMED, 60));
-        }
-        if changes_kernel_protection(content) {
-            return Some((KERNEL_PROTECTION_CHANGE, 60));
+        if let Some(refusal) = guard_words_refusal(content) {
+            return Some(refusal);
         }
         if content.contains(['*', '?', '[']) && runs_guard_loosening_verb(content) {
             return Some((GUARD_LOOSENING_VERB, 60));
@@ -892,14 +979,8 @@ fn guard_self_disable_in(content: &str) -> Option<(&'static str, u32)> {
     // The same two refusals on the words the shell hands the program: a
     // guard program named by a glob, a bracket expression or a value the
     // line assigned (`/usr/local/sbin/inner*-ctl exec-gate disarm`).
-    if guard_words_in(content, 0, false, true, Look::ExecGate) {
-        return Some((EXEC_GATE_AUTHORISED, 60));
-    }
-    if guard_words_in(content, 0, false, true, Look::Disarm) {
-        return Some((GUARD_DISARMED, 60));
-    }
-    if changes_kernel_protection(content) {
-        return Some((KERNEL_PROTECTION_CHANGE, 60));
+    if let Some(refusal) = guard_words_refusal(content) {
+        return Some(refusal);
     }
     if !content.to_ascii_lowercase().contains("innerwarden")
         && !names_guard_alias(content)
@@ -1003,6 +1084,11 @@ impl Look {
     /// the words after it (`arguments`), is what is looked for. `fed`: a
     /// program before it adds words of its own; `later`: the text is kept
     /// to be run later; `runs`: the shell runs the text as written.
+    ///
+    /// The words after a word, read afresh for each word: what the reading
+    /// asked before [`words_after`] read a command once. Kept for the test
+    /// that holds the two to the same answers.
+    #[cfg(test)]
     fn found(
         self,
         program: GuardProgram,
@@ -1053,11 +1139,190 @@ impl Look {
     }
 }
 
+/// The looks a reading asks about at once, a bit each: one walk of the words
+/// answers them all ([`guard_words_found`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Looks(u8);
+
+impl Looks {
+    const NONE: Looks = Looks(0);
+    const ALL: Looks = Looks(0b111);
+    const EACH: [Look; 3] = [Look::ExecGate, Look::Disarm, Look::Kernel];
+
+    fn only(look: Look) -> Looks {
+        Looks(1 << look as u8)
+    }
+
+    fn has(self, look: Look) -> bool {
+        self.0 & Looks::only(look).0 != 0
+    }
+
+    fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    fn with(self, other: Looks) -> Looks {
+        Looks(self.0 | other.0)
+    }
+
+    /// These looks less the ones in `found`.
+    fn without(self, found: Looks) -> Looks {
+        Looks(self.0 & !found.0)
+    }
+
+    /// The looks among these that `holds` says yes to.
+    fn kept(self, holds: impl Fn(Look) -> bool) -> Looks {
+        Looks::EACH
+            .into_iter()
+            .filter(|look| self.has(*look) && holds(*look))
+            .fold(Looks::NONE, |kept, look| kept.with(Looks::only(look)))
+    }
+}
+
+/// The refusal the words of `content` earn, read once for the three things
+/// looked for ([`Look`]): the first of the exec gate authorised, the guard
+/// disarmed and the kernel protection changed.
+fn guard_words_refusal(content: &str) -> Option<(&'static str, u32)> {
+    let found = guard_words_found(content, 0, false, true, Looks::ALL);
+    if found.has(Look::ExecGate) {
+        Some((EXEC_GATE_AUTHORISED, 60))
+    } else if found.has(Look::Disarm) {
+        Some((GUARD_DISARMED, 60))
+    } else if found.has(Look::Kernel) {
+        Some((KERNEL_PROTECTION_CHANGE, 60))
+    } else {
+        None
+    }
+}
+
 /// Whether the words of `text`, read `depth` levels in, hold what `look`
-/// looks for. `later`: the text is kept to be run later (an alias, a
-/// variable, an array), so more words may follow what it shows. `runs`: the
-/// shell runs the text as written.
+/// looks for ([`guard_words_found`], asked about one look).
 fn guard_words_in(text: &str, depth: u8, later: bool, runs: bool, look: Look) -> bool {
+    guard_words_found(text, depth, later, runs, Looks::only(look)).has(look)
+}
+
+/// Which of `looks` the words of `text`, read `depth` levels in, hold.
+/// `later`: the text is kept to be run later (an alias, a variable, an
+/// array), so more words may follow what it shows. `runs`: the shell runs
+/// the text as written.
+///
+/// The line is read once and its words walked once for every look asked
+/// about. Read once for each, a line was read three times over for each of
+/// its spellings, and the longest lines of the reviews held the check for
+/// more than a second.
+fn guard_words_found(text: &str, depth: u8, later: bool, runs: bool, looks: Looks) -> Looks {
+    use crate::shell_words::{read_line, Word};
+    if looks.is_empty() {
+        return looks;
+    }
+    if depth > KERNEL_TEXT_DEPTH {
+        return looks.kept(|look| look.too_deep(text));
+    }
+    let line = read_line(text);
+    let names = names_given_a_guard_program(&line);
+    let assigned = values_assigned(&line);
+    // Each of these is asked about the looks not found yet, and answers
+    // with the ones it holds.
+    let run_as_text = |inner: &str, later: bool, runs: bool, asked: Looks| {
+        let found = guard_words_found(inner, depth + 1, later, runs, asked);
+        found.with(asked.without(found).kept(|look| look.in_code(inner)))
+    };
+    // A word that holds text the shell or a program may run: an
+    // assignment's value, a word shaped like a command line, the value of
+    // an option given with it.
+    let runs_text_of = |word: &Word, later: bool, runs: bool, asked: Looks| {
+        let mut found = Looks::NONE;
+        if let Some((_, value)) = assignment_parts(word) {
+            found = guard_words_found(value, depth + 1, true, false, asked);
+        }
+        if may_be_a_command_line(word) {
+            found = found.with(run_as_text(&word.text, later, runs, asked.without(found)));
+            for value in attached_option_values(word) {
+                found = found.with(run_as_text(value, later, false, asked.without(found)));
+            }
+        }
+        found
+    };
+    let mut found = Looks::NONE;
+    for (index, command) in line.commands.iter().enumerate() {
+        if found == looks {
+            return found;
+        }
+        let words = &command.words;
+        if command_only_shows_text(&line.commands, index) {
+            // What it shows runs nothing, but a variable set in front of it
+            // may name a program it runs (`GIT_EXTERNAL_DIFF=`, `LESSOPEN=`,
+            // `GIT_EDITOR=`, `GH_BROWSER=`).
+            let in_front = words
+                .iter()
+                .take_while(|word| assignment_parts(word).is_some());
+            for word in in_front {
+                found = found.with(runs_text_of(word, later, false, looks.without(found)));
+            }
+            continue;
+        }
+        let runs_here = runs && !later;
+        let found_in = |words: &[Word], asked: Looks| {
+            let after: Vec<(Look, words_after::WordsAfter)> = Looks::EACH
+                .into_iter()
+                .filter(|look| asked.has(*look))
+                .map(|look| (look, words_after::WordsAfter::read(look, words)))
+                .collect();
+            let mut before = WordsFed::default();
+            let mut found = Looks::NONE;
+            for (at, word) in words.iter().enumerate() {
+                let program = guard_program(word, &names, &assigned);
+                for (look, after) in &after {
+                    if after.found(program, at + 1, before.fed(), later, runs_here) {
+                        found = found.with(Looks::only(*look));
+                    }
+                }
+                before.read(word, at.checked_sub(1).map(|last| &words[last]));
+            }
+            found
+        };
+        found = found.with(found_in(words, looks.without(found)));
+        // What a substitution prints becomes words of this command.
+        if words.iter().any(|word| !word.substitutions.is_empty()) {
+            let shown = words_with_substitutions_shown(words);
+            found = found.with(found_in(&shown, looks.without(found)));
+        }
+        // Text handed to a shell is run as written.
+        let to_a_shell = runs_here && hands_its_text_to_a_shell(words);
+        for word in words {
+            found = found.with(runs_text_of(word, later, to_a_shell, looks.without(found)));
+        }
+        for input in &command.inputs {
+            found = found.with(run_as_text(input, later, to_a_shell, looks.without(found)));
+        }
+    }
+    for inner in &line.nested {
+        found = found.with(guard_words_found(
+            inner,
+            depth + 1,
+            later,
+            runs,
+            looks.without(found),
+        ));
+    }
+    for list in &line.arrays {
+        found = found.with(guard_words_found(
+            list,
+            depth + 1,
+            true,
+            false,
+            looks.without(found),
+        ));
+    }
+    found
+}
+
+/// Whether the words of `text`, read `depth` levels in, hold what `look`
+/// looks for, the line read afresh for this one look: what the reading did
+/// before one walk answered every look. Kept for the test that holds the two
+/// to the same answers.
+#[cfg(test)]
+fn guard_words_in_afresh(text: &str, depth: u8, later: bool, runs: bool, look: Look) -> bool {
     use crate::shell_words::read_line;
     if depth > KERNEL_TEXT_DEPTH {
         return look.too_deep(text);
@@ -1066,14 +1331,14 @@ fn guard_words_in(text: &str, depth: u8, later: bool, runs: bool, look: Look) ->
     let names = names_given_a_guard_program(&line);
     let assigned = values_assigned(&line);
     let run_as_text = |inner: &str, later: bool, runs: bool| {
-        guard_words_in(inner, depth + 1, later, runs, look) || look.in_code(inner)
+        guard_words_in_afresh(inner, depth + 1, later, runs, look) || look.in_code(inner)
     };
     // A word that holds text the shell or a program may run: an
     // assignment's value, a word shaped like a command line, the value of
     // an option given with it.
     let runs_text_of = |word: &crate::shell_words::Word, later: bool, runs: bool| {
         if let Some((_, value)) = assignment_parts(word) {
-            if guard_words_in(value, depth + 1, true, false, look) {
+            if guard_words_in_afresh(value, depth + 1, true, false, look) {
                 return true;
             }
         }
@@ -1101,14 +1366,18 @@ fn guard_words_in(text: &str, depth: u8, later: bool, runs: bool, look: Look) ->
         }
         let runs_here = runs && !later;
         let found_in = |words: &[crate::shell_words::Word]| {
+            let after = words_after::WordsAfter::read(look, words);
+            let mut before = WordsFed::default();
             words.iter().enumerate().any(|(at, word)| {
-                look.found(
+                let found = after.found(
                     guard_program(word, &names, &assigned),
-                    &words[at + 1..],
-                    words_are_fed(&words[..at]),
+                    at + 1,
+                    before.fed(),
                     later,
                     runs_here,
-                )
+                );
+                before.read(word, at.checked_sub(1).map(|last| &words[last]));
+                found
             })
         };
         if found_in(words) {
@@ -1137,17 +1406,21 @@ fn guard_words_in(text: &str, depth: u8, later: bool, runs: bool, look: Look) ->
     }
     line.nested
         .iter()
-        .any(|inner| guard_words_in(inner, depth + 1, later, runs, look))
+        .any(|inner| guard_words_in_afresh(inner, depth + 1, later, runs, look))
         || line
             .arrays
             .iter()
-            .any(|list| guard_words_in(list, depth + 1, true, false, look))
+            .any(|list| guard_words_in_afresh(list, depth + 1, true, false, look))
 }
 
 /// `agent` and `kernel` as written right after a program (options, and a
 /// `host` before `agent`, aside), then a word that is not a read
 /// ([`KERNEL_PROTECTION_READS`]): the guard's own verb under a name the text
 /// does not show to be the guard's.
+///
+/// Read afresh for each word ([`Look::found`]): kept for the test that
+/// holds [`words_after`] to the same answers.
+#[cfg(test)]
 fn guard_verbs_after_any_program(arguments: &[crate::shell_words::Word]) -> bool {
     let says = |word: &crate::shell_words::Word, verb: &str| {
         word.is_plain() && word.text.eq_ignore_ascii_case(verb)
@@ -1202,6 +1475,7 @@ fn attached_option_values(word: &crate::shell_words::Word) -> Vec<&str> {
 }
 
 /// What a word says of the program it runs.
+#[derive(Clone, Copy)]
 enum GuardProgram {
     /// One of [`GUARD_PROGRAMS`], or a name the line gave one of them.
     Is,
@@ -1218,30 +1492,38 @@ enum GuardProgram {
 /// in the word.
 fn guard_program(
     word: &crate::shell_words::Word,
-    names: &[String],
-    assigned: &[(String, crate::shell_words::Word)],
+    names: &GuardNames,
+    assigned: &ValuesAssigned,
 ) -> GuardProgram {
     use crate::shell_words::Mark;
     let (last, marks) = word.last_component();
     if marks.iter().all(|mark| *mark == Mark::Plain) {
         let lower = last.iter().collect::<String>().to_ascii_lowercase();
         let bare = lower.strip_suffix(".exe").unwrap_or(&lower);
-        return if GUARD_PROGRAMS.contains(&bare) || names.iter().any(|name| name == bare) {
+        return if GUARD_PROGRAMS.contains(&bare) || names.contains(bare) {
             GuardProgram::Is
         } else {
             GuardProgram::Not
         };
     }
     if marks.contains(&Mark::Expansion) {
-        let named = names.iter().any(|name| {
-            let text = word.text.to_ascii_lowercase();
-            text == format!("${name}") || text == format!("${{{name}}}")
+        // `$NAME` or `${NAME}`, and nothing else in the word.
+        let text = word.text.to_ascii_lowercase();
+        let named = text.strip_prefix('$').is_some_and(|rest| {
+            names.contains(rest)
+                || rest
+                    .strip_prefix('{')
+                    .and_then(|rest| rest.strip_suffix('}'))
+                    .is_some_and(|name| names.contains(name))
         });
         let spelled = || {
             with_values_assigned(word, assigned).is_some_and(|words| {
-                words
-                    .iter()
-                    .any(|word| matches!(guard_program(word, names, &[]), GuardProgram::Is))
+                words.iter().any(|word| {
+                    matches!(
+                        guard_program(word, names, &ValuesAssigned::new()),
+                        GuardProgram::Is
+                    )
+                })
             })
         };
         return if named || runs_a_guard_program_by_name(&word.text) || spelled() {
@@ -1264,6 +1546,10 @@ fn guard_program(
 
 /// The words of a guard program's command line: whether they change the
 /// kernel protection. `fed`: a program before it adds words of its own.
+///
+/// Read afresh for each word ([`Look::found`]): kept for the test that
+/// holds [`words_after`] to the same answers.
+#[cfg(test)]
 fn kernel_arguments_change(arguments: &[crate::shell_words::Word], fed: bool, later: bool) -> bool {
     if let Some(changes) = kernel_verb_changes(arguments, fed, later) {
         return changes;
@@ -1310,6 +1596,10 @@ fn kernel_arguments_change(arguments: &[crate::shell_words::Word], fed: bool, la
 
 /// `agent`, then `kernel` after it, each as written: whether the words
 /// change the kernel protection. `None` when the words hold no such pair.
+///
+/// Read afresh for each word ([`Look::found`]): kept for the test that
+/// holds [`words_after`] to the same answers.
+#[cfg(test)]
 fn kernel_verb_changes(
     arguments: &[crate::shell_words::Word],
     fed: bool,
@@ -1333,36 +1623,58 @@ fn kernel_verb_changes(
     )
 }
 
-/// Whether a word before a program adds words to it: a program that does
-/// ([`WORD_FEEDERS`], `find -exec`, `fd -x`), or one the shell names from an
-/// expansion or a pattern that could be one (an option's value aside).
-fn words_are_fed(before: &[crate::shell_words::Word]) -> bool {
-    use crate::shell_words::Mark;
-    let fd = before.iter().any(|word| {
-        word.is_plain()
-            && matches!(
-                token_basename(&word.text.to_ascii_lowercase()),
-                "fd" | "fdfind"
-            )
-    });
-    before.iter().enumerate().any(|(at, word)| {
+/// Whether the words of a command read so far add words to the program after
+/// them: a program that does ([`WORD_FEEDERS`], `find -exec`, `fd -x`), or
+/// one the shell names from an expansion or a pattern that could be one (an
+/// option's value aside).
+///
+/// Kept as the command is read, one word at a time. Asked afresh of the
+/// words before each word, a command of N words was read N times over, and
+/// 32 KB of `true 2>&1` held the check for seconds: a hook that does not
+/// answer in time lets the command run.
+#[derive(Default)]
+struct WordsFed {
+    /// A word read adds words, whatever else the command holds.
+    any: bool,
+    /// `fd` or `fdfind` was read.
+    fd: bool,
+    /// One of `fd`'s exec options was read ([`FD_EXEC_OPTIONS`]).
+    fd_exec: bool,
+}
+
+impl WordsFed {
+    /// Whether a word read so far adds words.
+    fn fed(&self) -> bool {
+        self.any || self.fd && self.fd_exec
+    }
+
+    /// Reads the next word of the command, `word`, which follows `last`.
+    fn read(&mut self, word: &crate::shell_words::Word, last: Option<&crate::shell_words::Word>) {
+        use crate::shell_words::Mark;
+        if self.any {
+            return;
+        }
         if word.is_plain() {
             let lower = word.text.to_ascii_lowercase();
-            return WORD_FEEDERS.contains(&token_basename(&lower))
-                || FIND_EXEC_OPTIONS.contains(&lower.as_str())
-                || (fd && FD_EXEC_OPTIONS.contains(&word.text.as_str()));
+            let program = token_basename(&lower);
+            self.fd |= matches!(program, "fd" | "fdfind");
+            self.fd_exec |= FD_EXEC_OPTIONS.contains(&word.text.as_str());
+            self.any =
+                WORD_FEEDERS.contains(&program) || FIND_EXEC_OPTIONS.contains(&lower.as_str());
+            return;
         }
-        if assignment_parts(word).is_some() || at > 0 && before[at - 1].text.starts_with('-') {
-            return false;
+        if assignment_parts(word).is_some() || last.is_some_and(|last| last.text.starts_with('-')) {
+            return;
         }
         if word.has(Mark::Expansion) {
-            return true;
+            self.any = true;
+            return;
         }
         let (last, marks) = word.last_component();
-        WORD_FEEDERS
+        self.any = WORD_FEEDERS
             .iter()
-            .any(|feeder| pattern_could_be(&last, &marks, feeder))
-    })
+            .any(|feeder| pattern_could_be(&last, &marks, feeder));
+    }
 }
 
 /// The words of a command with what each substitution prints in its place,
@@ -1396,8 +1708,8 @@ fn words_with_substitutions_shown(
 /// program it names; and the name a copy or a link of one is made under
 /// (`cp /usr/local/bin/innerwarden-ctl ./k`, `ln -s ... ~/bin/k`), so a
 /// later `./k ...` or `k ...` is that program.
-fn names_given_a_guard_program(line: &crate::shell_words::Line) -> Vec<String> {
-    let mut names = Vec::new();
+fn names_given_a_guard_program(line: &crate::shell_words::Line) -> GuardNames {
+    let mut names = GuardNames::new();
     for word in line.commands.iter().flat_map(|command| &command.words) {
         let Some((name, value)) = assignment_parts(word) else {
             continue;
@@ -1406,9 +1718,14 @@ fn names_given_a_guard_program(line: &crate::shell_words::Line) -> Vec<String> {
             .commands
             .iter()
             .flat_map(|command| &command.words)
-            .any(|word| matches!(guard_program(word, &[], &[]), GuardProgram::Is));
+            .any(|word| {
+                matches!(
+                    guard_program(word, &GuardNames::new(), &ValuesAssigned::new()),
+                    GuardProgram::Is
+                )
+            });
         if names_one {
-            names.push(name.to_ascii_lowercase());
+            names.insert(name.to_ascii_lowercase());
         }
     }
     for command in &line.commands {
@@ -1422,19 +1739,28 @@ fn names_given_a_guard_program(line: &crate::shell_words::Line) -> Vec<String> {
         let Some((target, sources)) = words[at + 1..].split_last() else {
             continue;
         };
-        let copies_one = sources
-            .iter()
-            .any(|word| matches!(guard_program(word, &[], &[]), GuardProgram::Is));
+        let copies_one = sources.iter().any(|word| {
+            matches!(
+                guard_program(word, &GuardNames::new(), &ValuesAssigned::new()),
+                GuardProgram::Is
+            )
+        });
         if copies_one && target.is_plain() {
             let lower = target.text.trim_end_matches('/').to_ascii_lowercase();
             let name = token_basename(&lower);
-            if !name.is_empty() && !names.iter().any(|seen| seen == name) {
-                names.push(name.to_string());
+            if !name.is_empty() {
+                names.insert(name.to_string());
             }
         }
     }
     names
 }
+
+/// The names a line gives a guard program ([`names_given_a_guard_program`]).
+/// A set: asked of a list at every word, a line that gave N names and held N
+/// words more was read N times over (some 6,000 of each, 64 KB, held a debug
+/// build of the check 19 s on the lab box, 2026-11-10).
+type GuardNames = std::collections::BTreeSet<String>;
 
 /// Programs that put a file under a name the command line chooses: a copy,
 /// a link or a move of a guard program is that program under its new name.
@@ -1448,9 +1774,13 @@ const FILE_COPIERS: &[&str] = &[
 /// left out: what the name holds is not shown. A value's `*`, `?` and
 /// bracket expression are taken as patterns, as an unquoted `$NAME` makes
 /// them.
-fn values_assigned(line: &crate::shell_words::Line) -> Vec<(String, crate::shell_words::Word)> {
+///
+/// Kept by name: looked up in a list of every assignment, a line of N
+/// assignments was read N times over (16,000 of them, 128 KB, held the
+/// check 1.4 s on the lab box, 2026-11-10).
+fn values_assigned(line: &crate::shell_words::Line) -> ValuesAssigned {
     use crate::shell_words::{glob_marks, Mark, Word};
-    let mut assigned = Vec::new();
+    let mut assigned = ValuesAssigned::new();
     for word in line.commands.iter().flat_map(|command| &command.words) {
         let Some((name, value)) = assignment_parts(word) else {
             continue;
@@ -1473,17 +1803,18 @@ fn values_assigned(line: &crate::shell_words::Line) -> Vec<(String, crate::shell
                 },
             )
             .collect();
-        assigned.push((
-            name.to_string(),
-            Word {
-                text: value.to_string(),
-                marks,
-                ..Word::default()
-            },
-        ));
+        let values: &mut Vec<Word> = assigned.entry(name.to_string()).or_default();
+        values.push(Word {
+            text: value.to_string(),
+            marks,
+            ..Word::default()
+        });
     }
     assigned
 }
+
+/// The values a line assigns, by name ([`values_assigned`]).
+type ValuesAssigned = std::collections::BTreeMap<String, Vec<crate::shell_words::Word>>;
 
 /// How many words [`with_values_assigned`] makes at most.
 const MAX_ASSIGNED_SPELLINGS: usize = 16;
@@ -1494,7 +1825,7 @@ const MAX_ASSIGNED_SPELLINGS: usize = 16;
 /// a name the line did not assign, or the ways are too many.
 fn with_values_assigned(
     word: &crate::shell_words::Word,
-    assigned: &[(String, crate::shell_words::Word)],
+    assigned: &ValuesAssigned,
 ) -> Option<Vec<crate::shell_words::Word>> {
     use crate::shell_words::{Mark, Word};
     let chars: Vec<char> = word.text.chars().collect();
@@ -1533,11 +1864,7 @@ fn with_values_assigned(
         {
             return None;
         }
-        let values: Vec<&Word> = assigned
-            .iter()
-            .filter(|(assigned_name, _)| *assigned_name == name)
-            .map(|(_, value)| value)
-            .collect();
+        let values = assigned.get(&name).map_or(&[][..], Vec::as_slice);
         if values.is_empty() || spellings.len() * values.len() > MAX_ASSIGNED_SPELLINGS {
             return None;
         }
@@ -1845,8 +2172,7 @@ fn names_guard_alias(content: &str) -> bool {
 /// Whether a word's text, read with the shell's marks (`*`, `?`, `[...]`,
 /// `{a,b}`, `{x..y}`), could become `name`.
 fn pattern_could_be(text: &[char], marks: &[crate::shell_words::Mark], name: &str) -> bool {
-    let pattern = format!("(?i)^(?:{})$", pattern_regex(text, marks));
-    regex::Regex::new(&pattern).is_ok_and(|re| re.is_match(name))
+    glob_names::could_be(text, marks, name)
 }
 
 /// Whether the characters of a pattern the shell takes as written spell
@@ -1872,6 +2198,10 @@ fn pattern_spells_out(text: &[char], marks: &[crate::shell_words::Mark], name: &
 
 /// A regex for what a word's characters can become: the shell's pattern
 /// characters as patterns, everything else as written.
+///
+/// What [`pattern_could_be`] compiled and ran before [`glob_names`] read the
+/// word itself. Kept for the test that holds the two to the same answers.
+#[cfg(test)]
 fn pattern_regex(text: &[char], marks: &[crate::shell_words::Mark]) -> String {
     use crate::shell_words::Mark;
     let mut out = String::new();
@@ -1935,6 +2265,7 @@ fn pattern_regex(text: &[char], marks: &[crate::shell_words::Mark]) -> String {
 }
 
 /// The `}` that closes the brace group opening at `open`.
+#[cfg(test)]
 fn brace_group_end(
     text: &[char],
     marks: &[crate::shell_words::Mark],
@@ -1962,6 +2293,7 @@ fn brace_group_end(
 
 /// The regex for the inside of a brace group: a sequence `x..y`, a list
 /// `a,b`, or (neither) the braces as written.
+#[cfg(test)]
 fn brace_group_regex(inner: &[char], marks: &[crate::shell_words::Mark]) -> String {
     use crate::shell_words::Mark;
     let text: String = inner.iter().collect();
@@ -2107,6 +2439,15 @@ impl ReadingBudget {
         }
     }
 
+    /// What the brace expansions of one command may make, in bytes of
+    /// words: see [`BRACE_EXPANSION_BYTES`].
+    fn for_braces() -> Self {
+        Self {
+            left: std::cell::Cell::new(BRACE_EXPANSION_BYTES),
+            ran_out: std::cell::Cell::new(false),
+        }
+    }
+
     /// Pays `cost`: `false` when not enough is left, and the reading is
     /// then cut short.
     fn spend(&self, cost: usize) -> bool {
@@ -2124,6 +2465,15 @@ impl ReadingBudget {
 
     fn cut_short(&self) {
         self.left.set(0);
+        self.ran_out.set(true);
+    }
+
+    /// A part nested past the levels followed is not read, and the line is
+    /// marked as one not read to the end. What is left stays: the commands
+    /// after it on the line are still read (`eval eval eval eval eval eval
+    /// true; sh -c 'inner*arden allow x'` lost the second one's reading when
+    /// this emptied the budget; re-review of the parser change, 2026-11-09).
+    fn too_deep(&self) {
         self.ran_out.set(true);
     }
 
@@ -2171,7 +2521,7 @@ fn line_touches_guard(content: &str) -> bool {
 /// `budget`.
 fn runs_guard_loosening_verb_in(content: &str, depth: u8, budget: &ReadingBudget) -> bool {
     if depth > 4 {
-        budget.cut_short();
+        budget.too_deep();
         return false;
     }
     if !budget.spend(content.len().saturating_add(1)) {
@@ -2339,7 +2689,7 @@ fn words_run_guard_loosening_verb_fed(
     // `find -exec find -exec ...` and `env -S` strings read words again one
     // level in: past four, the reading is cut short, as a command string is.
     if depth > 4 {
-        budget.cut_short();
+        budget.too_deep();
         return false;
     }
     if !budget.spend(words.len().saturating_add(1)) {
@@ -2464,7 +2814,7 @@ fn words_run_guard_loosening_verb_fed(
             // as a word of it (`watch -n 1 iw-guard uninstall`, `ssh host iw
             // dry-run`; live gate of Active Defence 0.17.6, K1).
             return code_text_runs_guard_verb(&words[index + 1..].join(" "))
-                || guard_cli_named_later_loosens(&words[index + 1..]);
+                || guard_cli_named_later_loosens(&words[index + 1..], budget);
         }
         let skippable = after_option
             || dollar
@@ -2485,7 +2835,7 @@ fn words_run_guard_loosening_verb_fed(
             // wrapper not on a list took the hook off). A program that only
             // reads or prints text holds the name as text.
             return !words_only_read(&words[index..])
-                && guard_cli_named_later_loosens(&words[index + 1..]);
+                && guard_cli_named_later_loosens(&words[index + 1..], budget);
         }
         after_option = word.starts_with('-') && !word.contains('=') && !after_option;
         in_substitution = dollar;
@@ -2721,16 +3071,64 @@ fn uninstall_only_asks(lower: &str) -> bool {
 /// lowers the guard ([`ctl_verb_loosens`]; live gate 0.17.8, F1: a wrapper
 /// `guard_cli_named_later_loosens` reads past, like `taskset` or `flock`, in
 /// front of `innerwarden-ctl agent install-hook --monitor`).
-fn guard_cli_named_later_loosens(words: &[String]) -> bool {
-    words.iter().enumerate().any(|(index, word)| {
+///
+/// The words after each name are paid for from `budget`, so a line that
+/// names the guard more often than its length allows (never under sixty-four
+/// times in one command, some hundred and fifty in a line of nothing but
+/// its shortest name) is cut short, which refuses it
+/// ([`runs_guard_loosening_verb`]). The words with their redirections taken
+/// out are read once for all the names: read again after each one, 32 KB of
+/// `iw 2>x` took 1.4 s on the lab box (2026-11-10).
+fn guard_cli_named_later_loosens(words: &[String], budget: &ReadingBudget) -> bool {
+    let mut without: Option<(Vec<String>, Vec<usize>)> = None;
+    for (index, word) in words.iter().enumerate() {
         let lower = word.to_ascii_lowercase();
         let base = token_basename(lower.trim_matches('`'));
         let base = base.strip_suffix(".exe").unwrap_or(base);
-        if is_guard_cli_name(base) {
-            return guard_arguments_loosen(&words[index + 1..], guard_verb_loosens);
+        let loosens: fn(&[String]) -> bool = if is_guard_cli_name(base) {
+            guard_verb_loosens
+        } else if base == "innerwarden-ctl" {
+            ctl_verb_loosens
+        } else {
+            continue;
+        };
+        if !budget.spend(words.len() - index) {
+            return false;
         }
-        base == "innerwarden-ctl" && guard_arguments_loosen(&words[index + 1..], ctl_verb_loosens)
-    })
+        if loosens(&words[index + 1..]) {
+            return true;
+        }
+        // A name is never a redirection that waits for its target, so what
+        // is left of the words after it is the tail of what is left of them
+        // all.
+        let (kept, before) = without.get_or_insert_with(|| without_redirections(words));
+        let after = &kept[before[index + 1]..];
+        if after.len() != words.len() - index - 1 && loosens(after) {
+            return true;
+        }
+    }
+    false
+}
+
+/// `words` with every redirection and its target taken out, and for each
+/// position (and the end) how many of the words before it were kept.
+fn without_redirections(words: &[String]) -> (Vec<String>, Vec<usize>) {
+    let mut kept = Vec::with_capacity(words.len());
+    let mut before = Vec::with_capacity(words.len() + 1);
+    let mut target = false;
+    for word in words {
+        before.push(kept.len());
+        if std::mem::take(&mut target) {
+            continue;
+        }
+        if let Some(target_follows) = redirection_word(word) {
+            target = target_follows;
+            continue;
+        }
+        kept.push(word.clone());
+    }
+    before.push(kept.len());
+    (kept, before)
 }
 
 /// Whether the arguments after the guard's CLI loosen it, by `loosens`,
@@ -2750,19 +3148,7 @@ fn guard_arguments_loosen(arguments: &[String], loosens: impl Fn(&[String]) -> b
     {
         return false;
     }
-    let mut kept = Vec::with_capacity(arguments.len());
-    let mut target = false;
-    for word in arguments {
-        if std::mem::take(&mut target) {
-            continue;
-        }
-        if let Some(target_follows) = redirection_word(word) {
-            target = target_follows;
-            continue;
-        }
-        kept.push(word.clone());
-    }
-    loosens(&kept)
+    loosens(&without_redirections(arguments).0)
 }
 
 /// Whether the arguments after Active Defence's `innerwarden-ctl` name one of
@@ -2955,6 +3341,12 @@ fn text_runs_guard_verb_named(text: &str, only: &[&str], name: &str) -> bool {
     // Same byte offsets as `text`, which is what the slices below rely on.
     let lower = text.to_ascii_lowercase();
     let mut from = 0usize;
+    // Where the arguments after the name end: the first separator at or
+    // after it. Kept from one name to the next, so text with no separator
+    // in it is not searched to its end once for each name.
+    let mut ends_at = 0usize;
+    // How much text was read as arguments ([`VERB_TEXT_READ_FLOOR`]).
+    let mut read = 0usize;
     while let Some(found) = lower[from..].find(name) {
         let start = from + found;
         let after = start + name.len();
@@ -2976,43 +3368,77 @@ fn text_runs_guard_verb_named(text: &str, only: &[&str], name: &str) -> bool {
         if before_is_name || !after_is_separator {
             continue;
         }
-        let tail = &text[after..];
-        let end = tail
-            .find([';', '|', '&', ')', ']', '\n'])
-            .unwrap_or(tail.len());
-        // Escapes as the program handed the text reads them: `\n`, `\t` and
-        // `\r` in a `printf` or `$'...'` string end the verb at the escape
-        // (`'innerwarden dry-run\n'`); any other escaped character is that
-        // character, so `dry\-run` is `dry-run` to sh, perl's system() and
-        // awk alike. Splitting there instead read `dry` and `-run` and missed
-        // the verb, once double-quoted text kept its backslashes.
-        let mut decoded = String::with_capacity(end);
-        let mut characters = tail[..end].chars();
-        while let Some(character) = characters.next() {
-            if character != '\\' {
-                decoded.push(character);
-                continue;
-            }
-            match characters.next() {
-                Some('n' | 't' | 'r') | None => decoded.push(' '),
-                Some(escaped) => decoded.push(escaped),
-            }
+        if ends_at < after {
+            ends_at = text[after..]
+                .find([';', '|', '&', ')', ']', '\n'])
+                .map_or(text.len(), |end| after + end);
         }
-        let arguments: Vec<String> = decoded
-            .split(|c: char| c.is_whitespace() || matches!(c, '\'' | '"' | ',' | '[' | '(' | '`'))
-            .filter(|token| !token.is_empty())
-            .map(str::to_string)
-            .collect();
-        let verb = arguments
-            .iter()
-            .find(|argument| *argument != "--")
-            .map(|verb| verb.to_ascii_lowercase());
-        let wanted = only.is_empty() || verb.as_deref().is_some_and(|verb| only.contains(&verb));
-        if wanted && guard_verb_loosens(&arguments) {
+        let tail = &text[after..ends_at];
+        // The verb first: a name with a verb that is not asked about has
+        // its arguments read no further.
+        let wanted = only.is_empty()
+            || decoded_words(tail)
+                .find(|argument| argument != "--")
+                .is_some_and(|verb| only.contains(&verb.to_ascii_lowercase().as_str()));
+        if !wanted {
+            continue;
+        }
+        read += tail.len();
+        if read > VERB_TEXT_READ_FLOOR + 2 * text.len() {
+            return true;
+        }
+        let arguments: Vec<String> = decoded_words(tail).collect();
+        if guard_verb_loosens(&arguments) {
             return true;
         }
     }
     false
+}
+
+/// How much text [`text_runs_guard_verb_named`] reads as the arguments of
+/// the CLI's name before it reads no more and takes the text for a
+/// lowering: this much, and twice the length of the text.
+///
+/// The arguments of a name run to the next `;`, `|`, `&`, `)`, `]` or line
+/// end, so text that names the CLI N times with a verb after each and none
+/// of those between is read N times over, and a hook that does not answer
+/// in time lets the command run. No command line a person or an agent
+/// writes comes near it: at 2 KB it takes more than sixty names, each with
+/// a guard verb after it, and no separator between any two of them.
+const VERB_TEXT_READ_FLOOR: usize = 64 * 1024;
+
+/// The words of text handed to a program, with escapes as the program
+/// reads them: `\n`, `\t` and `\r` in a `printf` or `$'...'` string end a
+/// word at the escape (`'innerwarden dry-run\n'`); any other escaped
+/// character is that character, so `dry\-run` is `dry-run` to sh, perl's
+/// system() and awk alike. Splitting there instead read `dry` and `-run` and
+/// missed the verb, once double-quoted text kept its backslashes. Spaces,
+/// and the quotes, commas and brackets of an argument list, part the words.
+///
+/// Read one word at a time, so asking for the first reads no further.
+fn decoded_words(text: &str) -> impl Iterator<Item = String> + '_ {
+    let mut characters = text.chars();
+    std::iter::from_fn(move || {
+        let mut word = String::new();
+        while let Some(character) = characters.next() {
+            let character = match character {
+                '\\' => match characters.next() {
+                    Some('n' | 't' | 'r') | None => ' ',
+                    Some(escaped) => escaped,
+                },
+                written => written,
+            };
+            if character.is_whitespace() || matches!(character, '\'' | '"' | ',' | '[' | '(' | '`')
+            {
+                if !word.is_empty() {
+                    return Some(word);
+                }
+            } else {
+                word.push(character);
+            }
+        }
+        (!word.is_empty()).then_some(word)
+    })
 }
 
 /// The verbs that switch the guard to recording only (`dry-run`, `monitor`)
@@ -3172,6 +3598,23 @@ fn guard_verb_is_fed(arguments: &[String]) -> bool {
             .any(|a| matches!(a.as_str(), "--list" | "--remove" | "--help" | "-h"))
 }
 
+/// The verbs after a guard CLI's name that [`guard_verb_loosens`] reads as a
+/// lowering with the right words after them. A verb that is not here lowers
+/// nothing whatever follows it, and [`guard_doubt`] takes its word for that:
+/// the list is checked before the verbs are, so a verb added there and not
+/// here is never read.
+const GUARD_VERB_HEADS: &[&str] = &[
+    "allow",
+    "mute",
+    "dry-run",
+    "monitor",
+    "agents",
+    "contain",
+    "install",
+    "agent",
+    "uninstall",
+];
+
 /// The arguments after `innerwarden`: whether they widen what is let through.
 fn guard_verb_loosens(arguments: &[String]) -> bool {
     // `npm exec innerwarden -- allow x`: the `--` belongs to the launcher. A
@@ -3181,6 +3624,12 @@ fn guard_verb_loosens(arguments: &[String]) -> bool {
     let Some(verb) = arguments.first() else {
         return false;
     };
+    // Asked before the words after the verb are read: a line that names the
+    // guard many times pays for those words once for each name.
+    let verb = verb.to_ascii_lowercase();
+    if !GUARD_VERB_HEADS.contains(&verb.as_str()) {
+        return false;
+    }
     let rest: Vec<&str> = arguments[1..]
         .iter()
         .map(String::as_str)
@@ -3189,7 +3638,7 @@ fn guard_verb_loosens(arguments: &[String]) -> bool {
     let asks_for_help = rest
         .iter()
         .any(|argument| matches!(*argument, "--help" | "-h"));
-    match verb.to_ascii_lowercase().as_str() {
+    match verb.as_str() {
         "allow" | "mute" => {
             !asks_for_help
                 && rest
@@ -3319,8 +3768,17 @@ fn writes_guard_config(content: &str, depth: u8) -> bool {
             && cwd.is_some_and(|dir| names_guard_config(&format!("{dir}/{target}")))
     };
 
-    let (redirects, _) = shell_output_redirect_targets(content);
+    let (redirects, read_whole) = shell_output_redirect_targets(content);
     if redirects.iter().any(|target| counts(target, None)) {
+        return true;
+    }
+    // The structure was not read to its end (no parse, or more of it than
+    // is walked): the redirections it did not reach are read from the text.
+    if !read_whole
+        && lexical_output_redirect_targets(content)
+            .iter()
+            .any(|target| counts(target, None))
+    {
         return true;
     }
     // `${NAME}` as `$NAME`: the tokenizer splits words at braces.
@@ -4514,18 +4972,26 @@ pub fn normalize_command(cmd: &str) -> String {
             )
         })
         .collect();
-    if s.len() <= NORMALIZE_BLOCK_BYTES {
-        return normalize_block(s);
-    }
-    let mut out = String::with_capacity(s.len() + s.len() / 4);
-    for (start, end, after_forced_cut) in normalize_blocks(&s) {
-        if after_forced_cut {
-            // The overlap repeats text that the previous piece already ended
-            // with. A space keeps the two copies from fusing into one word; a
-            // newline would make the repeated words a command of their own.
-            out.push(' ');
+    // One sum of brace expansion for the whole command, every piece and
+    // every pass paying from it.
+    let made = ReadingBudget::for_braces();
+    let out = if s.len() <= NORMALIZE_BLOCK_BYTES {
+        normalize_block(s, &made)
+    } else {
+        let mut out = String::with_capacity(s.len() + s.len() / 4);
+        for (start, end, after_forced_cut) in normalize_blocks(&s) {
+            if after_forced_cut {
+                // The overlap repeats text that the previous piece already ended
+                // with. A space keeps the two copies from fusing into one word; a
+                // newline would make the repeated words a command of their own.
+                out.push(' ');
+            }
+            out.push_str(&normalize_block(s[start..end].to_string(), &made));
         }
-        out.push_str(&normalize_block(s[start..end].to_string()));
+        out
+    };
+    if made.ran_out() {
+        BRACE_EXPANSION_LEFT_UNREAD.with(|unread| unread.set(true));
     }
     out
 }
@@ -4621,7 +5087,7 @@ fn overlap_start(s: &str, end: usize) -> usize {
 }
 
 /// The rewrite passes of [`normalize_command`] over one piece of a command.
-fn normalize_block(mut s: String) -> String {
+fn normalize_block(mut s: String, made: &ReadingBudget) -> String {
     static SUBST: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     static BACKTICK: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     static VARDEF: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
@@ -4647,7 +5113,7 @@ fn normalize_block(mut s: String) -> String {
         let before = s.clone();
         // Brace expansion (`k{e..e}rnel`, `{rm,x} -rf`): the shell hands the
         // program every word it makes.
-        s = expand_braces(&s);
+        s = expand_braces(&s, made);
         // Unwrap command substitution + backticks, keeping the INNER command
         // visible to the matcher (so `$(r''m -rf /)` exposes `r''m -rf /`).
         // This is a structural unwrap, NOT execution.
@@ -4668,50 +5134,68 @@ fn normalize_block(mut s: String) -> String {
     s
 }
 
-/// The most words one brace expansion in [`expand_braces`] is turned into;
-/// a word that would make more is left as written.
-const BRACE_EXPANSION_WORDS: usize = 64;
+/// The most bytes of words the brace expansions of one command are turned
+/// into, every word made on the way to the last ones counted: `{a,b}` nine
+/// times in one word is 512 words and fits, ten times does not.
+///
+/// One sum for the whole command and no more for a longer one, so a part of
+/// a command is never read less far than the command it is a part of.
+const BRACE_EXPANSION_BYTES: usize = 16 * 1024;
+
+/// A sequence (`x..y`, `x..y..step`) is made when it takes fewer steps than
+/// this from its first item to its last: 64 items at the most. A longer one
+/// is left as written and is not counted as unread: every word it makes has
+/// a number in that place (`for i in {1..100000}`).
+const BRACE_SEQUENCE_STEPS: i128 = 64;
+
+/// Said of a command with a brace expansion too large to make.
+pub const BRACE_EXPANSION_UNREAD: &str =
+    "a brace expansion too large to read: the words it makes were not checked";
+
+thread_local! {
+    /// Whether [`normalize_command`] left a brace expansion as written on
+    /// this thread since [`forget_unread_brace_expansions`].
+    static BRACE_EXPANSION_LEFT_UNREAD: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Whether a rewrite on this thread left a brace expansion as written since
+/// [`forget_unread_brace_expansions`], for making more than
+/// [`BRACE_EXPANSION_BYTES`] of words.
+///
+/// What such a word names, no check has read: `r{m,x}{,1}{,2}{,3}...` is
+/// `rm` and a great many other words, and making them all is what kept the
+/// hook past its time limit (measured 2026-11-10: 200 groups of two, 1 KB,
+/// no verdict at all). The engine refuses a command that holds one. Kept
+/// for the thread and not handed back by each rewrite, because the rewrite
+/// has some twenty callers and several read a text of their own (a startup
+/// file's payload, a command string): one that forgot to ask would read
+/// the word as written and say nothing.
+pub fn brace_expansion_left_unread() -> bool {
+    BRACE_EXPANSION_LEFT_UNREAD.with(std::cell::Cell::get)
+}
+
+/// Starts a new command for [`brace_expansion_left_unread`].
+pub fn forget_unread_brace_expansions() {
+    BRACE_EXPANSION_LEFT_UNREAD.with(|unread| unread.set(false));
+}
 
 /// Brace expansion as the shell does it, word by word: `k{e..e}rnel` is
 /// `kernel`, `x{a,b}` is `xa xb`, `{1..3}` is `1 2 3`. A word with a quote
 /// or a `$` in it, `${...}`, a group with neither `,` nor `..`, and a word
-/// that would make more than [`BRACE_EXPANSION_WORDS`] are left as written.
-/// Pure text work, never run.
-fn expand_braces(s: &str) -> String {
+/// whose words `made` has not enough left for are left as written. Pure
+/// text work, never run.
+fn expand_braces(s: &str, made: &ReadingBudget) -> String {
     if !s.contains('{') {
         return s.to_string();
     }
     let mut out = String::with_capacity(s.len());
     let mut word = String::new();
     let flush = |word: &mut String, out: &mut String| {
-        if word.contains('{') && !word.contains(['\'', '"', '$', '\\', '`']) {
-            let mut words = vec![std::mem::take(word)];
-            for _ in 0..8 {
-                let mut next = Vec::new();
-                let mut changed = false;
-                for item in &words {
-                    match expand_one_brace(item) {
-                        Some(expanded) => {
-                            changed = true;
-                            next.extend(expanded);
-                        }
-                        None => next.push(item.clone()),
-                    }
-                    if next.len() > BRACE_EXPANSION_WORDS {
-                        break;
-                    }
-                }
-                if next.len() > BRACE_EXPANSION_WORDS {
-                    break;
-                }
-                words = next;
-                if !changed {
-                    break;
-                }
-            }
-            out.push_str(&words.join(" "));
-        } else {
-            out.push_str(word);
+        let expands = word.contains('{') && !word.contains(['\'', '"', '$', '\\', '`']);
+        match expands.then(|| brace_words(word, made)).flatten() {
+            Some(words) => out.push_str(&words.join(" ")),
+            None => out.push_str(word),
         }
         word.clear();
     };
@@ -4727,32 +5211,99 @@ fn expand_braces(s: &str) -> String {
     out
 }
 
-/// The words the first brace group of `word` makes, or `None` when it has
-/// none the shell expands.
-fn expand_one_brace(word: &str) -> Option<Vec<String>> {
-    let chars: Vec<char> = word.chars().collect();
-    let mut search = 0;
-    while let Some(found) = chars[search..].iter().position(|c| *c == '{') {
-        let open = search + found;
-        search = open + 1;
-        let mut depth = 0usize;
-        let close = (open..chars.len()).find(|&at| {
-            match chars[at] {
-                '{' => depth += 1,
-                '}' => depth -= 1,
-                _ => {}
-            }
-            depth == 0
-        })?;
-        let prefix: String = chars[..open].iter().collect();
-        let inner: String = chars[open + 1..close].iter().collect();
-        let suffix: String = chars[close + 1..].iter().collect();
-        let items = brace_items(&inner)?;
-        if items.len() > BRACE_EXPANSION_WORDS {
-            return None;
+/// Every word `word` expands to, in the shell's order, or `None` when
+/// `made` has not enough left for them. A word is expanded whole or not at
+/// all: a part of an expansion says nothing of the words not made, and one
+/// more group on each of its words is the same sum again on the next pass.
+fn brace_words(word: &str, made: &ReadingBudget) -> Option<Vec<String>> {
+    let mut words = Vec::new();
+    brace_words_into(word.to_string(), made, &mut words).then_some(words)
+}
+
+/// Adds the words `word` expands to, the first group's first: `false` once
+/// `made` has run out. No deeper than the groups `made` pays for, each
+/// level costing what is left of the word.
+fn brace_words_into(word: String, made: &ReadingBudget, words: &mut Vec<String>) -> bool {
+    match expand_one_brace(&word, made) {
+        Some(expanded) => expanded
+            .into_iter()
+            .all(|item| brace_words_into(item, made, words)),
+        None => {
+            words.push(word);
+            !made.ran_out()
         }
+    }
+}
+
+/// One `{` of a word, as one pass over the word finds it.
+struct BraceGroup {
+    open: usize,
+    /// Where its `}` is; `None` when the word ends first.
+    close: Option<usize>,
+    /// A `,` at its own level.
+    comma: bool,
+    /// Another group inside it.
+    nested: bool,
+}
+
+/// The groups of a word, in the order they open. One pass: a word of many
+/// groups one inside the other used to be read again from each `{`.
+fn brace_groups(chars: &[char]) -> Vec<BraceGroup> {
+    let mut groups: Vec<BraceGroup> = Vec::new();
+    let mut inside: Vec<usize> = Vec::new();
+    for (at, c) in chars.iter().enumerate() {
+        match c {
+            '{' => {
+                if let Some(&outer) = inside.last() {
+                    groups[outer].nested = true;
+                }
+                inside.push(groups.len());
+                groups.push(BraceGroup {
+                    open: at,
+                    close: None,
+                    comma: false,
+                    nested: false,
+                });
+            }
+            '}' => {
+                if let Some(group) = inside.pop() {
+                    groups[group].close = Some(at);
+                }
+            }
+            ',' => {
+                if let Some(&group) = inside.last() {
+                    groups[group].comma = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    groups
+}
+
+/// The words the first brace group of `word` that the shell expands makes,
+/// paid for from `made` by their length. `None` when the word has no such
+/// group, or when `made` has not enough left: [`ReadingBudget::ran_out`]
+/// tells the two apart.
+fn expand_one_brace(word: &str, made: &ReadingBudget) -> Option<Vec<String>> {
+    let chars: Vec<char> = word.chars().collect();
+    for group in brace_groups(&chars) {
+        let close = group.close?;
+        if group.nested && !group.comma {
+            // No list, and a sequence has no group in it.
+            continue;
+        }
+        let inner: String = chars[group.open + 1..close].iter().collect();
+        let items = brace_items(&inner)?;
         if items.is_empty() {
             continue;
+        }
+        let prefix: String = chars[..group.open].iter().collect();
+        let suffix: String = chars[close + 1..].iter().collect();
+        let around = prefix.len() + suffix.len() + 1;
+        let cost = items.iter().map(|item| item.len() + around).sum();
+        if !made.spend(cost) {
+            return None;
         }
         return Some(
             items
@@ -4765,8 +5316,10 @@ fn expand_one_brace(word: &str) -> Option<Vec<String>> {
 }
 
 /// What the inside of one brace group expands to: a `,` list at its own
-/// level, or an `x..y` sequence of numbers or letters. Empty for a group
-/// the shell leaves as written; `None` for one too long to expand.
+/// level, or an `x..y` or `x..y..step` sequence of numbers or letters, the
+/// step counted as the shell counts it (`python{3..99..100}` is `python3`).
+/// Empty for a group the shell leaves as written; `None` for a sequence of
+/// [`BRACE_SEQUENCE_STEPS`] steps or more.
 fn brace_items(inner: &str) -> Option<Vec<String>> {
     let mut items = Vec::new();
     let mut depth = 0usize;
@@ -4787,29 +5340,44 @@ fn brace_items(inner: &str) -> Option<Vec<String>> {
         items.push(current);
         return Some(items);
     }
-    let Some((from, to)) = inner.split_once("..") else {
+    let mut parts = inner.split("..");
+    let (Some(from), Some(to), step, None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
         return Some(Vec::new());
     };
-    let to = to.split("..").next().unwrap_or(to);
-    if let (Ok(a), Ok(b)) = (from.parse::<i64>(), to.parse::<i64>()) {
-        if a.abs_diff(b) >= BRACE_EXPANSION_WORDS as u64 {
-            return None;
-        }
-        let range: Vec<String> = if a <= b {
-            (a..=b).map(|n| n.to_string()).collect()
-        } else {
-            (b..=a).rev().map(|n| n.to_string()).collect()
-        };
-        return Some(range);
+    // The shell reads no sign in a step and counts a step of nothing as one.
+    let step = match step.map(str::parse::<i64>) {
+        None => 1,
+        Some(Ok(step)) => i128::from(step.unsigned_abs().max(1)),
+        Some(Err(_)) => return Some(Vec::new()),
+    };
+    let (first, last, numbers) = match (from.parse::<i64>(), to.parse::<i64>()) {
+        (Ok(a), Ok(b)) => (i128::from(a), i128::from(b), true),
+        _ => match (single_char(from), single_char(to)) {
+            (Some(a), Some(b)) => (i128::from(u32::from(a)), i128::from(u32::from(b)), false),
+            _ => return Some(Vec::new()),
+        },
+    };
+    let steps = (first - last).abs() / step;
+    if steps >= BRACE_SEQUENCE_STEPS {
+        return None;
     }
-    match (single_char(from), single_char(to)) {
-        (Some(a), Some(b)) => Some(if a <= b {
-            (a..=b).map(String::from).collect()
-        } else {
-            (b..=a).rev().map(String::from).collect()
-        }),
-        _ => Some(Vec::new()),
-    }
+    Some(
+        (0..=steps)
+            .map(|n| first + (last - first).signum() * n * step)
+            .filter_map(|item| {
+                if numbers {
+                    Some(item.to_string())
+                } else {
+                    u32::try_from(item)
+                        .ok()
+                        .and_then(char::from_u32)
+                        .map(String::from)
+                }
+            })
+            .collect(),
+    )
 }
 
 /// Collapse the shell no-op rewrites that break a matcher's literal, WITHOUT the
@@ -6631,6 +7199,7 @@ pub(crate) fn shell_command_segments(content: &str) -> Vec<&str> {
             parens.open(
                 word_started || matches!(before, Some(b'<' | b'>')),
                 before == Some(b'('),
+                before == Some(b'$'),
             );
             word_started = false;
             command_start = true;
@@ -6640,7 +7209,7 @@ pub(crate) fn shell_command_segments(content: &str) -> Vec<&str> {
         }
         if unquoted && byte == b')' {
             word_started = parens.close_continues_word();
-            command_start = false;
+            command_start = parens.in_case();
             index += 1;
             continue;
         }
@@ -8506,14 +9075,7 @@ pub fn check_sensitive_download_write(content: &str) -> Option<(&'static str, u3
 }
 
 fn shell_output_redirect_targets(content: &str) -> (Vec<String>, bool) {
-    let mut parser = tree_sitter::Parser::new();
-    if parser
-        .set_language(&tree_sitter_bash::LANGUAGE.into())
-        .is_err()
-    {
-        return (Vec::new(), false);
-    }
-    let Some(tree) = parser.parse(content, None) else {
+    let Some(tree) = crate::shell::parse_bash(content) else {
         return (Vec::new(), false);
     };
     let mut targets = Vec::new();
@@ -8549,7 +9111,9 @@ fn shell_output_redirect_targets(content: &str) -> (Vec<String>, bool) {
             }
         }
     }
-    (targets, true)
+    // A structure with an error in it was not read whole: the part the parser
+    // could not place may hold a redirection the walk never saw as one.
+    (targets, !tree.root_node().has_error())
 }
 
 /// Bounded lexical fallback used only when the structural redirect walk cannot
@@ -8557,6 +9121,16 @@ fn shell_output_redirect_targets(content: &str) -> (Vec<String>, bool) {
 /// destination, so analyzer-budget exhaustion cannot turn a credential
 /// overwrite into an allow/review result.
 fn lexical_sensitive_output_redirect(content: &str) -> bool {
+    lexical_output_redirect_targets(content)
+        .iter()
+        .any(|target| is_authentication_write_target(target))
+}
+
+/// The destination of every unquoted output redirection in `content`, read
+/// from the text with no structure: `>`, `>>`, `>|`, `&>` and `>&` when what
+/// follows is a file and not a descriptor.
+fn lexical_output_redirect_targets(content: &str) -> Vec<String> {
+    let mut targets = Vec::new();
     let bytes = content.as_bytes();
     let mut index = 0usize;
     let mut single_quoted = false;
@@ -8592,9 +9166,11 @@ fn lexical_sensitive_output_redirect(content: &str) -> bool {
         if bytes.get(index) == Some(&b'>') {
             index += 1;
         }
+        // `>|` writes the file as `>` does. `>&` writes it too, unless what
+        // follows is a descriptor (`>&2`) or closes one (`>&-`).
+        let to_descriptor_or_file = bytes.get(index) == Some(&b'&');
         if matches!(bytes.get(index), Some(b'&' | b'|')) {
             index += 1;
-            continue;
         }
         while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
             index += 1;
@@ -8614,19 +9190,23 @@ fn lexical_sensitive_output_redirect(content: &str) -> bool {
                 index += 1;
                 continue;
             }
-            if current.is_ascii_whitespace() || matches!(current, b';' | b'|' | b'&' | b'<' | b'>')
+            if current.is_ascii_whitespace()
+                || matches!(current, b';' | b'|' | b'&' | b'<' | b'>' | b')' | b'`')
             {
                 break;
             }
             index += 1;
         }
-        if start < index
-            && is_authentication_write_target(&String::from_utf8_lossy(&bytes[start..index]))
-        {
-            return true;
+        let target = &bytes[start..index];
+        let descriptor = to_descriptor_or_file
+            && target
+                .iter()
+                .all(|byte| byte.is_ascii_digit() || *byte == b'-');
+        if start < index && !descriptor {
+            targets.push(String::from_utf8_lossy(target).into_owned());
         }
     }
-    false
+    targets
 }
 
 fn tee_write_targets(words: &[String]) -> Vec<String> {
@@ -9335,14 +9915,7 @@ fn literal_unreachable_shell_segments(
     content: &str,
     segments: &[&str],
 ) -> std::collections::HashSet<usize> {
-    let mut parser = tree_sitter::Parser::new();
-    if parser
-        .set_language(&tree_sitter_bash::LANGUAGE.into())
-        .is_err()
-    {
-        return std::collections::HashSet::new();
-    }
-    let Some(tree) = parser.parse(content, None) else {
+    let Some(tree) = crate::shell::parse_bash(content) else {
         return std::collections::HashSet::new();
     };
     let mut unreachable_ranges = Vec::new();
@@ -10064,6 +10637,7 @@ pub(crate) fn shell_tokens(segment: &str) -> Vec<String> {
                     parens.open(
                         word_started || matches!(before, Some('<' | '>')),
                         before == Some('('),
+                        before == Some('$'),
                     );
                     word_started = false;
                     command_start = true;
@@ -10071,7 +10645,7 @@ pub(crate) fn shell_tokens(segment: &str) -> Vec<String> {
                 }
                 ')' => {
                     word_started = parens.close_continues_word();
-                    command_start = false;
+                    command_start = parens.in_case();
                 }
                 _ => command_start = false,
             }
@@ -13798,7 +14372,7 @@ mod kernel_protection_tests {
     /// - take a word that is not plain for a verb of its own in
     ///   `kernel_arguments_change`: the variable, substitution, array and
     ///   `kerne?` lines;
-    /// - never take words as fed in `words_are_fed`: every feeder line; take
+    /// - never take words as fed in `WordsFed::read`: every feeder line; take
     ///   `gxargs` and `parallel` out of `WORD_FEEDERS`: those two lines;
     ///   empty `FD_EXEC_OPTIONS`: the `fd -X` line;
     /// - never read a pattern as a guard program's name in `guard_program`:
@@ -14246,6 +14820,161 @@ mod kernel_protection_tests {
             assert_eq!(normalize_command(kept), kept, "{kept}");
         }
     }
+
+    /// `count` groups of two in one word: two to the `count` words.
+    fn groups_of_two(count: usize) -> String {
+        "{a,b}".repeat(count)
+    }
+
+    /// A word is expanded whole: every word the shell makes, in its order,
+    /// however many groups make them.
+    ///
+    /// FAILS ON REVERT: stop at 64 words, as the rewrite did, and the seven
+    /// groups give 64 words with a group left on each; follow no more than
+    /// forty groups of one word and the alphabet twice is not spelled out.
+    #[test]
+    fn the_rewrite_expands_a_word_whole() {
+        forget_unread_brace_expansions();
+        let seven = normalize_command(&groups_of_two(7));
+        let words: Vec<&str> = seven.split(' ').collect();
+        assert_eq!(words.len(), 128);
+        assert_eq!(
+            (words[0], words[1], words[2], words[127]),
+            ("aaaaaaa", "aaaaaab", "aaaaaba", "bbbbbbb")
+        );
+        // Nine groups are 512 words, the most of two that fit.
+        assert_eq!(normalize_command(&groups_of_two(9)).split(' ').count(), 512);
+        // A list of any length.
+        let items: Vec<String> = (0..70).map(|n| format!("i{n}")).collect();
+        let list = normalize_command(&format!("x{{{}}}y", items.join(",")));
+        assert_eq!(list.split(' ').count(), 70);
+        assert!(list.ends_with(" xi69y"), "{list}");
+        // One group after the other, each of one word.
+        let twice = "abcdefghijklmnopqrstuvwxyz".repeat(2);
+        let spelled: String = twice.chars().map(|c| format!("{{{c}..{c}}}")).collect();
+        assert_eq!(normalize_command(&spelled), twice);
+        // One group inside the other.
+        assert_eq!(normalize_command("{a,b{c,d}}"), "a bc bd");
+        assert_eq!(normalize_command("x{a,{b,c}{d,e}}"), "xa xbd xbe xcd xce");
+        assert_eq!(normalize_command("{{{{a}}}}{b,c}"), "{{{{a}}}}b {{{{a}}}}c");
+        assert!(!brace_expansion_left_unread());
+    }
+
+    /// A word that makes more than the rewrite will is left as written, the
+    /// same on a second pass, and the thread is told; so is every word
+    /// after it. A long sequence of numbers is left as written and is read.
+    ///
+    /// FAILS ON REVERT: take the payment out of `expand_one_brace` and the
+    /// fourteen groups are made, 16 384 words of them.
+    #[test]
+    fn the_rewrite_leaves_a_word_too_large_as_written_and_says_so() {
+        for bomb in [
+            groups_of_two(10),
+            groups_of_two(14),
+            format!("echo {}", groups_of_two(14)),
+            format!("true || {} x; echo ok", groups_of_two(14)),
+            format!("{} x{{a,b}}", groups_of_two(14)),
+        ] {
+            forget_unread_brace_expansions();
+            let once = normalize_command(&bomb);
+            assert_eq!(once, bomb);
+            assert!(brace_expansion_left_unread(), "{bomb}");
+            assert_eq!(normalize_command(&once), once);
+        }
+        for read in [
+            "mkdir -p a/{b,c}/{d,e}",
+            "for i in {1..100000}; do echo $i; done",
+            "{1..500}{a,b}",
+            "f() { echo {}; }",
+            "echo {a}{a}{a}",
+        ] {
+            forget_unread_brace_expansions();
+            normalize_command(read);
+            assert!(!brace_expansion_left_unread(), "{read}");
+        }
+    }
+
+    /// A sequence is counted by its step as the shell counts it: no sign
+    /// read in it, nothing counted as one, and a group the shell leaves as
+    /// written (a step that is no number, a fourth part) left as written.
+    ///
+    /// FAILS ON REVERT: read every step as one and `python{3..99..100}` is
+    /// a sequence of 97 and stays as written, the name it makes not read.
+    #[test]
+    fn the_rewrite_counts_a_sequence_by_its_step() {
+        for (written, made) in [
+            ("python{3..99..100}", "python3"),
+            ("{1..10..2}", "1 3 5 7 9"),
+            ("{10..1..2}", "10 8 6 4 2"),
+            ("{1..10..-2}", "1 3 5 7 9"),
+            ("{1..3..0}", "1 2 3"),
+            ("{-2..2}", "-2 -1 0 1 2"),
+            ("{a..i..4}", "a e i"),
+            ("{e..a..2}", "e c a"),
+            ("x{c..c}y", "xcy"),
+            ("{1..5..x}", "{1..5..x}"),
+            ("{1..5..2..3}", "{1..5..2..3}"),
+            ("{1..a}", "{1..a}"),
+            ("{0..1000..10}", "{0..1000..10}"),
+            ("{1..65}", "{1..65}"),
+        ] {
+            assert_eq!(normalize_command(written), made, "{written}");
+        }
+        assert_eq!(normalize_command("{1..64}").split(' ').count(), 64);
+        assert_eq!(normalize_command("{0..630..10}").split(' ').count(), 64);
+    }
+
+    /// The words a list of any length makes are the words the checks read.
+    /// Measured 2026-11-10 on the released build: a list of 65 items, the
+    /// last the home directory, was allowed at score 0.
+    ///
+    /// FAILS ON REVERT: stop a list at 64 items, as the rewrite did, and
+    /// the removal is allowed.
+    #[test]
+    fn the_engine_reads_what_a_long_list_makes() {
+        let items: Vec<String> = (1..=64).map(|n| format!("x{n}")).collect();
+        let cmd = format!("rm -rf {{{},~}}", items.join(","));
+        let analysis = crate::mcp::analyze_command(&cmd, None);
+        assert_eq!(analysis.recommendation, "deny", "{analysis:?}");
+    }
+
+    /// The engine refuses a command with a brace expansion too large to
+    /// make, wherever the word is. One in a command the shell never runs
+    /// (`true || ...`) kept the hook past its time limit on its own, and an
+    /// agent reads a hook that ran out of time as an allow.
+    ///
+    /// FAILS ON REVERT: drop the question from `analyze_command_as_read`
+    /// and all of these are allowed.
+    #[test]
+    fn the_engine_refuses_a_brace_expansion_too_large_to_read() {
+        let bomb = groups_of_two(14);
+        for cmd in [
+            format!("{bomb} x"),
+            format!("ls {bomb}"),
+            format!("true || {bomb} x; echo ok"),
+            format!("echo ok; r{{m,x}}{bomb} -rf ~"),
+        ] {
+            let analysis = crate::mcp::analyze_command(&cmd, None);
+            assert_eq!(analysis.recommendation, "deny", "{analysis:?}");
+            assert!(
+                analysis
+                    .signals
+                    .iter()
+                    .any(|s| s.detail == BRACE_EXPANSION_UNREAD),
+                "{analysis:?}"
+            );
+        }
+        // The next command on the thread is its own.
+        for cmd in [
+            "mkdir -p src/{a,b}/{c,d}",
+            "for i in {1..100000}; do echo $i; done",
+            "cp notes.{txt,bak}",
+            "echo {a,b}{a,b}{a,b}",
+        ] {
+            let analysis = crate::mcp::analyze_command(cmd, None);
+            assert_eq!(analysis.recommendation, "allow", "{analysis:?}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -14643,7 +15372,6 @@ mod brq_evaluation_tests {
             "cargo test -p innerwarden-agent-guard -- allow",
             "which innerwarden",
             "sh ./scripts/innerwarden-allow-test.sh",
-            "echo x | xargs innerwarden allow --list",
             "find docs -name '*.md' -exec grep -l 'innerwarden allow' {} +",
             "find . -name '*.toml' -exec cat {} \\;",
         ] {
@@ -14678,8 +15406,6 @@ mod brq_evaluation_tests {
             "sed -n '1,20p' notes-on-innerwarden-mute.md",
             "python3 scripts/check_docs.py",
             "python3 -c \"print('the innerwarden-mute notes')\"",
-            "python3 -c \"import subprocess;subprocess.run(['innerwarden','mute','--list'])\"",
-            "python3 -c \"import subprocess;subprocess.run(['innerwarden','dry-run','--help'])\"",
             "ssh host innerwarden mute --list",
             "docker exec box innerwarden mute --help",
             "python3 <<'EOF'\nprint('innerwarden mute --list')\nEOF",
@@ -15967,8 +16693,10 @@ mod env_split_words_tests {
 #[cfg(test)]
 mod guard_reading_tests {
     use super::{
-        process_substitutions, runs_guard_loosening_verb_in, shell_command_segments, shell_tokens,
-        ReadingBudget,
+        assignment_readings, check_guard_self_disable, process_substitutions,
+        runs_guard_loosening_verb_in, shell_command_segments, shell_tokens,
+        with_assignments_expanded, Assigned, ReadingBudget, ASSIGNMENT_ROUNDS,
+        GUARD_LOOSENING_VERB,
     };
 
     /// The `)` of a substitution or an array leaves the word going on, so a
@@ -16026,6 +16754,160 @@ mod guard_reading_tests {
         assert!(process_substitutions("echo $(a) (b) x<y").is_empty());
     }
 
+    /// A value that holds its own name expands to the same text for ever. The
+    /// check called itself on each expanded line and ended on a stack
+    /// overflow: the hook left with 134, which an agent reads as "carry on",
+    /// for any command behind those twelve bytes (found 2026-11-10).
+    ///
+    /// FAILS ON REVERT: call `check_guard_self_disable` on the expanded line
+    /// again and this test ends the test binary on a stack overflow.
+    #[test]
+    fn a_value_that_names_itself_does_not_end_the_check() {
+        for cmd in [
+            "a='$a'; $a; innerwarden allow x",
+            "a='${a}'; ${a}; iw dry-run",
+            "a='$a$a'; $a; innerwarden allow x",
+            "a='$b'; b='$a'; $a; innerwarden mute x",
+            "export a='$a'; $a; 'i'w dry-run",
+        ] {
+            assert_eq!(
+                check_guard_self_disable(cmd).map(|(_, score)| score),
+                Some(60),
+                "{cmd}"
+            );
+        }
+        for cmd in [
+            "a='$a'; $a; ls /tmp",
+            "a='$a$a'; $a; ls /tmp",
+            "a='$b'; b='$a'; $a; ls /tmp",
+        ] {
+            assert_eq!(check_guard_self_disable(cmd), None, "{cmd}");
+        }
+    }
+
+    /// The readings of a line are bounded in number and in size, whatever
+    /// the values say of one another: forty values that each name the next
+    /// one twice are 2^40 bytes when read to the end.
+    ///
+    /// FAILS ON REVERT: drop the limit in `with_assignments_expanded` and the
+    /// third reading passes it (and the fifth does not fit in memory).
+    #[test]
+    fn the_readings_of_a_lines_assignments_are_bounded() {
+        let mut doubling = String::new();
+        for i in 0..40 {
+            doubling.push_str(&format!("v{i}='$v{next}$v{next}'; ", next = i + 1));
+        }
+        doubling.push_str("$v0");
+        let limit = doubling.len() * 8 + 4096;
+        let (readings, settled) = assignment_readings(&doubling);
+        assert!(!settled, "{} readings", readings.len());
+        assert!(readings.len() <= ASSIGNMENT_ROUNDS + 1);
+        assert!(readings.iter().all(|reading| reading.len() <= limit));
+
+        // One value read into ten thousand words: the first pass alone is
+        // past the limit, and nothing longer than it is built.
+        let wide = format!("v='{}'; echo{}", "x".repeat(4000), " $v".repeat(10_000));
+        let (readings, settled) = assignment_readings(&wide);
+        assert!(!settled);
+        assert_eq!(readings, std::slice::from_ref(&wide));
+
+        // A line not read to its last form says nothing of a line that does
+        // not touch the guard, and refuses one that does.
+        assert_eq!(check_guard_self_disable(&doubling), None);
+        assert_eq!(check_guard_self_disable(&wide), None);
+        for touched in [format!("{doubling}; echo iw"), format!("{wide} allow")] {
+            assert_eq!(
+                check_guard_self_disable(&touched),
+                Some((GUARD_LOOSENING_VERB, 60)),
+                "{} bytes",
+                touched.len()
+            );
+        }
+    }
+
+    /// The loop reads what the recursion read: a chain of values, each the
+    /// name of the next, down to the guard's name; the first value a name is
+    /// given; `$IW` when only `I` is set left alone; and a path used on
+    /// every word of a long line is no doubt at all.
+    #[test]
+    fn a_lines_assignments_are_read_into_it_as_before() {
+        for cmd in [
+            "I=iw; $I dry-run",
+            "I=iw; ${I} dry-run",
+            "export G=innerwarden; $G allow x",
+            "a='$b'; b='$c'; c='$d'; d='$e'; e='$f'; f=iw; $a dry-run",
+            "V=allow; innerwarden $V x",
+        ] {
+            assert_eq!(
+                check_guard_self_disable(cmd).map(|(_, score)| score),
+                Some(60),
+                "{cmd}"
+            );
+        }
+        let expanded = |line: &str| match with_assignments_expanded(line, 4096) {
+            Assigned::Expanded(text) => Some(text),
+            Assigned::AsWritten => None,
+            Assigned::PastLimit => Some("past the limit".to_string()),
+        };
+        assert_eq!(
+            expanded("I=iw; $I ${I} $IW ${IW} ${I:-x} $1 $"),
+            Some("I=iw; iw iw $IW ${IW} ${I:-x} $1 $".to_string())
+        );
+        assert_eq!(
+            expanded("I=one; I=two; $I"),
+            Some("I=one; I=two; one".to_string())
+        );
+        assert_eq!(expanded("I=iw; echo I"), None);
+        assert_eq!(expanded("echo $HOME; ls"), None);
+
+        let path = "P=/home/dev/github/_innerwarden/crates/agent-guard/src; wc -l";
+        let many = format!("{path}{}", " $P/threats.rs".repeat(200));
+        let (readings, settled) = assignment_readings(&many);
+        assert!(settled);
+        assert_eq!(readings.len(), 2);
+        assert_eq!(check_guard_self_disable(&many), None);
+    }
+
+    /// A command nested past the levels followed is not read, and the ones
+    /// after it on the line still are: the first command of each line is six
+    /// deep, the second lowers the guard under a name only the reading of its
+    /// command string finds.
+    ///
+    /// FAILS ON REVERT: empty the budget at the sixth level (`cut_short`
+    /// where `too_deep` stands) and the second command is never read: the
+    /// `cat <(` and `env -S` lines pass, the others lose this signal.
+    #[test]
+    fn a_part_nested_too_deep_does_not_cost_the_rest_of_the_line_its_reading() {
+        let deep = [
+            "eval eval eval eval eval eval true",
+            "cat <(cat <(cat <(cat <(cat <(cat <(true))))))",
+            "env -S X=1 env -S X=1 env -S X=1 env -S X=1 env -S X=1 env -S X=1 true",
+        ];
+        let lowering = [
+            "sh -c '/usr/local/bin/inner*arden allow x'",
+            "eval '/usr/local/bin/inner*arden allow x'",
+        ];
+        for first in deep {
+            for second in lowering {
+                let line = format!("{first}; {second}");
+                assert_eq!(
+                    check_guard_self_disable(&line),
+                    Some((GUARD_LOOSENING_VERB, 60)),
+                    "{line}"
+                );
+            }
+            // The deep part alone lowers nothing, and neither does it next
+            // to a command that does not touch the guard.
+            assert_eq!(check_guard_self_disable(first), None, "{first}");
+            let line = format!("{first}; sh -c 'ls /tmp'");
+            assert_eq!(check_guard_self_disable(&line), None, "{line}");
+        }
+        let budget = ReadingBudget::for_line(deep[0]);
+        assert!(!runs_guard_loosening_verb_in(deep[0], 0, &budget));
+        assert!(budget.ran_out());
+        assert!(budget.left.get() > 0, "what is left stays for the rest");
+    }
+
     /// The reading pays a bounded multiple of the line whatever its shape
     /// (bounded step count, independent of the host's speed): the lines of
     /// the review of 1877717 that cost 2^k readings, and nesting of every
@@ -16066,5 +16948,616 @@ mod guard_reading_tests {
         }
         let chain = format!("{}env -S 'iw dry-run'", "env -S X=1 ".repeat(5));
         assert!(spent(&chain).1, "a chain deeper than the levels runs out");
+    }
+}
+
+#[cfg(test)]
+mod verb_text_tests {
+    use super::{decoded_words, text_runs_guard_verb, MODE_VERBS, VERB_TEXT_READ_FLOOR};
+
+    /// The words as they were read before [`decoded_words`]: the whole text
+    /// decoded, then parted.
+    fn decoded_then_parted(text: &str) -> Vec<String> {
+        let mut decoded = String::with_capacity(text.len());
+        let mut characters = text.chars();
+        while let Some(character) = characters.next() {
+            if character != '\\' {
+                decoded.push(character);
+                continue;
+            }
+            match characters.next() {
+                Some('n' | 't' | 'r') | None => decoded.push(' '),
+                Some(escaped) => decoded.push(escaped),
+            }
+        }
+        decoded
+            .split(|c: char| c.is_whitespace() || matches!(c, '\'' | '"' | ',' | '[' | '(' | '`'))
+            .filter(|token| !token.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The words read one at a time are the words of the text read whole,
+    /// over every text of up to six characters from the ones that part a
+    /// word, the escape and what follows it.
+    ///
+    /// FAILS ON REVERT: part a word on the character as written and not as
+    /// decoded (`dry\nrun` is one word then), or drop the escape's `None`
+    /// arm (a trailing backslash ends the words early).
+    #[test]
+    fn the_words_read_one_at_a_time_are_the_words_read_whole() {
+        const WRITTEN: [char; 9] = ['a', '-', ' ', '\\', 'n', 'x', '\'', ',', '('];
+        let (mut texts, mut escapes, mut several) = (0usize, 0usize, 0usize);
+        for length in 0..=6u32 {
+            for mut pick in 0..WRITTEN.len().pow(length) {
+                let mut text = String::new();
+                for _ in 0..length {
+                    text.push(WRITTEN[pick % WRITTEN.len()]);
+                    pick /= WRITTEN.len();
+                }
+                let whole = decoded_then_parted(&text);
+                assert_eq!(decoded_words(&text).collect::<Vec<_>>(), whole, "{text:?}");
+                texts += 1;
+                escapes += usize::from(text.contains('\\'));
+                several += usize::from(whole.len() > 1);
+            }
+        }
+        assert_eq!(texts, 597_871, "every text of up to six characters");
+        assert!(escapes > 250_000, "{escapes} texts hold an escape");
+        assert!(several > 250_000, "{several} texts hold more than one word");
+        assert_eq!(
+            decoded_words(r"dry\-run\nx 'a',[b] \").collect::<Vec<_>>(),
+            ["dry-run", "x", "a", "b]"]
+        );
+    }
+
+    /// Text that names the CLI again and again, a guard verb after each name
+    /// and no separator between, is read as a lowering once the reading
+    /// passes [`VERB_TEXT_READ_FLOOR`] and twice the text: the reading stops
+    /// there, and what was not read is not let through. The same names a few
+    /// times over, or with a separator after each, are the reads they are.
+    ///
+    /// FAILS ON REVERT: drop the return under the floor, and the long text
+    /// is read to its end, name after name, and comes back a read.
+    #[test]
+    fn text_read_past_the_floor_is_taken_for_a_lowering() {
+        let read = "innerwarden mute --list ";
+        assert!(!text_runs_guard_verb(&read.repeat(8), MODE_VERBS));
+        // 12 * names^2 bytes are read over 24 * names bytes of text.
+        let first_over = (1usize..)
+            .find(|names| 12 * names * names > VERB_TEXT_READ_FLOOR + 48 * names)
+            .unwrap();
+        assert_eq!(first_over, 76, "the names it takes at this length");
+        assert!(!text_runs_guard_verb(&read.repeat(60), MODE_VERBS));
+        assert!(text_runs_guard_verb(&read.repeat(400), MODE_VERBS));
+        assert!(text_runs_guard_verb(&read.repeat(4_000), MODE_VERBS));
+        let parted = "innerwarden mute --list; ";
+        assert!(!text_runs_guard_verb(&parted.repeat(4_000), MODE_VERBS));
+        // A verb that is not asked about has nothing read after it.
+        let other = "innerwarden status --json ";
+        assert!(!text_runs_guard_verb(&other.repeat(4_000), MODE_VERBS));
+    }
+}
+
+#[cfg(test)]
+mod words_fed_tests {
+    use super::*;
+    use crate::shell_words::{Mark, Word};
+
+    /// Whether a word of `before` adds words to the program after them, read
+    /// afresh: what [`WordsFed`] keeps as the command is read.
+    fn words_are_fed(before: &[Word]) -> bool {
+        let fd = before.iter().any(|word| {
+            word.is_plain()
+                && matches!(
+                    token_basename(&word.text.to_ascii_lowercase()),
+                    "fd" | "fdfind"
+                )
+        });
+        before.iter().enumerate().any(|(at, word)| {
+            if word.is_plain() {
+                let lower = word.text.to_ascii_lowercase();
+                return WORD_FEEDERS.contains(&token_basename(&lower))
+                    || FIND_EXEC_OPTIONS.contains(&lower.as_str())
+                    || (fd && FD_EXEC_OPTIONS.contains(&word.text.as_str()));
+            }
+            if assignment_parts(word).is_some() || at > 0 && before[at - 1].text.starts_with('-') {
+                return false;
+            }
+            if word.has(Mark::Expansion) {
+                return true;
+            }
+            let (last, marks) = word.last_component();
+            WORD_FEEDERS
+                .iter()
+                .any(|feeder| pattern_could_be(&last, &marks, feeder))
+        })
+    }
+
+    /// Every command of up to four words out of twelve, read both ways
+    /// before each word and at its end.
+    ///
+    /// FAILS ON REVERT: let a later word take back what an earlier one
+    /// settled (the early return in `WordsFed::read`), or read the value of
+    /// an option as a word that adds words, and the two readings part.
+    #[test]
+    fn the_words_fed_kept_as_read_are_the_words_fed_read_afresh() {
+        const WORDS: [&str; 12] = [
+            "xargs",
+            "/bin/Parallel",
+            "fd",
+            "fdfind",
+            "-X",
+            "--exec",
+            "-exec",
+            "-o",
+            "$v",
+            "a=$v",
+            "x*s",
+            "x",
+        ];
+        // Commands whose words add words by their end, and those whose words
+        // do not.
+        let mut counts = [0usize; 2];
+        for length in 1..=4u32 {
+            for code in 0..WORDS.len().pow(length) {
+                let mut code = code;
+                let mut text = String::new();
+                for _ in 0..length {
+                    text.push_str(WORDS[code % WORDS.len()]);
+                    text.push(' ');
+                    code /= WORDS.len();
+                }
+                let line = crate::shell_words::read_line(&text);
+                assert_eq!(line.commands.len(), 1, "{text}");
+                let words = &line.commands[0].words;
+                let mut kept = WordsFed::default();
+                for (at, word) in words.iter().enumerate() {
+                    assert_eq!(
+                        kept.fed(),
+                        words_are_fed(&words[..at]),
+                        "{text}: before word {at}"
+                    );
+                    kept.read(word, at.checked_sub(1).map(|last| &words[last]));
+                }
+                assert_eq!(kept.fed(), words_are_fed(words), "{text}");
+                counts[usize::from(!kept.fed())] += 1;
+            }
+        }
+        // Measured: 20524 and 2096.
+        let floors = [20_000, 2_000];
+        assert!(
+            counts
+                .iter()
+                .zip(floors)
+                .all(|(count, floor)| *count >= floor),
+            "{counts:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod named_later_tests {
+    use super::*;
+
+    fn words(line: &str) -> Vec<String> {
+        line.split_whitespace().map(str::to_string).collect()
+    }
+
+    /// What reads the words after a name of the guard.
+    type ReadsAfter = fn(&[String]) -> bool;
+
+    /// The guard's names in `words`, each with what reads the words after it.
+    fn names(words: &[String]) -> Vec<(usize, ReadsAfter)> {
+        let mut names: Vec<(usize, ReadsAfter)> = Vec::new();
+        for (index, word) in words.iter().enumerate() {
+            let lower = word.to_ascii_lowercase();
+            let base = token_basename(lower.trim_matches('`'));
+            let base = base.strip_suffix(".exe").unwrap_or(base);
+            if is_guard_cli_name(base) {
+                names.push((index, guard_verb_loosens));
+            } else if base == "innerwarden-ctl" {
+                names.push((index, ctl_verb_loosens));
+            }
+        }
+        names
+    }
+
+    /// The reading as it was before the words were read once for all the
+    /// names: what is left of the words after each name, read afresh.
+    fn named_later_loosens_afresh(words: &[String]) -> bool {
+        names(words)
+            .into_iter()
+            .any(|(index, loosens)| guard_arguments_loosen(&words[index + 1..], loosens))
+    }
+
+    /// The reading under test, on a line short enough to be read whole.
+    fn named_later_loosens(words: &[String]) -> bool {
+        let budget = ReadingBudget::for_line("");
+        let loosens = guard_cli_named_later_loosens(words, &budget);
+        assert!(!budget.ran_out(), "{words:?}");
+        loosens
+    }
+
+    /// FAILS ON REVERT: keep the target of a redirection written apart from
+    /// it (`2> x`) among the words, and `x` is counted as a word of the
+    /// command.
+    #[test]
+    fn redirections_and_their_targets_are_taken_out() {
+        let (kept, before) = without_redirections(&words("a 2> x b >y c"));
+        assert_eq!(kept, words("a b c"));
+        assert_eq!(before, [0, 1, 1, 1, 2, 2, 3]);
+        let (kept, before) = without_redirections(&[]);
+        assert!(kept.is_empty());
+        assert_eq!(before, [0]);
+    }
+
+    /// FAILS ON REVERT: leave out the reading with the redirections taken
+    /// out, or start it at the name and not after it, and the lines that
+    /// lower the guard past a redirection are passed.
+    #[test]
+    fn a_lowering_after_a_name_is_found_past_its_redirections() {
+        for (line, lowers) in [
+            ("iw allow x", true),
+            ("iw 2>x allow y", true),
+            ("iw 2> x allow y", true),
+            ("iw 2>&1 uninstall", true),
+            ("iw >&- dry-run", true),
+            ("iw 2>a 2>b 2> c mute q", true),
+            ("iw 2>x status iw 2>y allow z", true),
+            ("2> iw allow x", true),
+            // The file a redirection names is not the verb.
+            ("iw > allow x", false),
+            ("iw <<< allow", false),
+            ("iw 2>x status", false),
+            ("iw 2>x", false),
+            ("allow x iw 2>y", false),
+            ("iw", false),
+            ("", false),
+        ] {
+            let words = words(line);
+            assert_eq!(named_later_loosens(&words), lowers, "{line}");
+            assert_eq!(named_later_loosens_afresh(&words), lowers, "{line}");
+        }
+    }
+
+    /// Every line of up to five words out of eight, read both ways.
+    ///
+    /// FAILS ON REVERT: read what is left of the words from the wrong place
+    /// (the name's own position, or the start of the line) and the two
+    /// readings part on the lines counted last.
+    #[test]
+    fn one_reading_of_the_redirections_finds_what_a_reading_after_each_name_finds() {
+        const WORDS: [&str; 8] = [
+            "iw",
+            "innerwarden-ctl",
+            "2>x",
+            "2>",
+            "allow",
+            "x",
+            "agent",
+            "disconnect",
+        ];
+        let mut counts = [0usize; 3];
+        for length in 0..=5u32 {
+            for line in 0..WORDS.len().pow(length) {
+                let mut left = line;
+                let words: Vec<String> = (0..length)
+                    .map(|_| {
+                        let word = WORDS[left % WORDS.len()];
+                        left /= WORDS.len();
+                        word.to_string()
+                    })
+                    .collect();
+                let afresh = named_later_loosens_afresh(&words);
+                assert_eq!(named_later_loosens(&words), afresh, "{words:?}");
+                let as_written = names(&words)
+                    .into_iter()
+                    .any(|(index, loosens)| loosens(&words[index + 1..]));
+                counts[0] += 1;
+                counts[1] += usize::from(afresh);
+                counts[2] += usize::from(afresh && !as_written);
+            }
+        }
+        // Lines read, lines that lower the guard, and of those the ones that
+        // do so only once a redirection is taken out.
+        // Measured: 37449, 2338 and 258.
+        let floors = [37_449, 2_200, 240];
+        assert!(
+            counts
+                .iter()
+                .zip(floors)
+                .all(|(count, floor)| *count >= floor),
+            "{counts:?}"
+        );
+    }
+
+    /// FAILS ON REVERT: take the payment for the words after each name out
+    /// of `guard_cli_named_later_loosens` and the long line is read to its
+    /// end, at a cost that grows with the square of its names, and passed.
+    #[test]
+    fn a_line_that_names_the_guard_too_often_to_read_is_refused() {
+        let few = format!("foo {}", "iw x ".repeat(40));
+        let many = format!("foo {}", "iw x ".repeat(400));
+        assert!(!runs_guard_loosening_verb(&few));
+        assert!(runs_guard_loosening_verb(&many));
+        assert!(check_guard_self_disable(&many).is_some());
+
+        let budget = ReadingBudget::for_line(&many);
+        assert!(!guard_cli_named_later_loosens(&words(&many)[1..], &budget));
+        assert!(budget.ran_out());
+
+        // A lowering after the names a line of that length pays for is
+        // found by the reading, not by its being cut short.
+        let lowers = format!("{few}iw 2>x allow y");
+        let budget = ReadingBudget::for_line(&lowers);
+        assert!(guard_cli_named_later_loosens(&words(&lowers)[1..], &budget));
+        assert!(!budget.ran_out());
+    }
+}
+
+#[cfg(test)]
+mod redirect_fallback_tests {
+    use super::*;
+
+    /// The text reader finds the destination of each unquoted output
+    /// redirection, in every spelling the shell writes a file with, and takes
+    /// neither a descriptor nor a quoted or escaped `>` for one.
+    ///
+    /// FAILS ON REVERT: step over `>|` and `>&` as the reader once did (the
+    /// files written that way are not found), or end the destination only at
+    /// a space or an operator (the one inside a substitution keeps the `)`
+    /// or the backtick that closes it).
+    #[test]
+    fn the_text_reader_finds_every_file_written() {
+        for (line, written) in [
+            ("echo x > out", vec!["out"]),
+            ("echo x>>out", vec!["out"]),
+            ("echo x >| out", vec!["out"]),
+            ("echo x >|out", vec!["out"]),
+            ("echo x &>out", vec!["out"]),
+            ("echo x &>>out", vec!["out"]),
+            ("echo x >& out", vec!["out"]),
+            ("echo x >&out", vec!["out"]),
+            ("echo x 2>&1", vec![]),
+            ("echo x >&2", vec![]),
+            ("echo x >&-", vec![]),
+            ("echo x 2>&1 >out", vec!["out"]),
+            ("echo 'a > b'", vec![]),
+            ("echo \"a > b\"", vec![]),
+            ("echo a \\> b", vec![]),
+            ("echo $(echo x>out)", vec!["out"]),
+            ("echo `echo x>out`", vec!["out"]),
+            ("echo x >\"my out\"", vec!["\"my out\""]),
+            ("a >one; b >>two | c &>three", vec!["one", "two", "three"]),
+        ] {
+            assert_eq!(lexical_output_redirect_targets(line), written, "{line}");
+        }
+    }
+
+    /// A structure with an error in it is not read whole: the walk finds no
+    /// redirection in the part the parser could not place, so the text is
+    /// read for it. Both checks that read the structure see the write.
+    ///
+    /// FAILS ON REVERT: report the walk whole whenever it reaches the end of
+    /// the tree, and the write behind the broken test is found by neither.
+    #[test]
+    fn a_structure_with_an_error_is_not_read_whole() {
+        assert_eq!(
+            shell_output_redirect_targets("echo x > out"),
+            (vec!["out".to_owned()], true)
+        );
+        for broken in ["[[ a =~ ( ]]; ", "echo $((1+)) ; "] {
+            let config = format!("{broken}echo x &>$HOME/.config/innerwarden/allow.json");
+            assert_eq!(
+                shell_output_redirect_targets(&config),
+                (Vec::new(), false),
+                "{config}"
+            );
+            assert!(writes_guard_config(&config, 0), "{config}");
+            let keys = format!("{broken}echo k &>$HOME/.ssh/authorized_keys");
+            assert!(check_sensitive_download_write(&keys).is_some(), "{keys}");
+        }
+    }
+
+    /// A line the parser gives up on has no structure at all, and the write
+    /// in it is still found: by the text reader, in the spellings only the
+    /// structure would have seen.
+    ///
+    /// FAILS ON REVERT: drop the flag in `writes_guard_config`, as it once
+    /// did, and these writes behind a line the parser does not finish are
+    /// let through.
+    #[test]
+    fn a_write_behind_a_line_the_parser_gives_up_on_is_found() {
+        let long = "x=(1)y ".repeat(1_000);
+        for write in [
+            "echo x &>~/.config/innerwarden/allow.json",
+            "echo x >& ~/.config/innerwarden/allow.json",
+            "echo x >&~/.config/innerwarden/allow.json",
+        ] {
+            assert!(writes_guard_config(write, 0), "{write}");
+            let behind = format!("{long}\n{write}");
+            assert_eq!(
+                shell_output_redirect_targets(&behind),
+                (Vec::new(), false),
+                "{write}"
+            );
+            assert!(writes_guard_config(&behind, 0), "{write}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod guard_words_found_tests {
+    use super::{
+        guard_words_found, guard_words_in, guard_words_in_afresh, guard_words_refusal, Looks,
+        EXEC_GATE_AUTHORISED, GUARD_DISARMED, KERNEL_PROTECTION_CHANGE,
+    };
+
+    /// A command for each look, for two looks at once, and for none.
+    const CORES: &[&str] = &[
+        "innerwarden exec-gate allow x",
+        "iw exec-gate disarm",
+        "innerwarden disarm",
+        "innerwarden-ctl agent kernel claude-code off",
+        "k agent kernel claude-code off",
+        "innerwarden status",
+        "innerwarden --self-approve x",
+        "k --self-approve",
+        "/usr/local/sbin/inner*-ctl agent kernel claude-code off",
+        "innerwarden-ctl agent kernel claude-code status",
+        "innerwarden exec-gate status",
+        // What a substitution prints, as words of the command it stands in.
+        "innerwarden $(echo exec-gate) allow x",
+        "innerwarden $(echo disarm)",
+        "innerwarden-ctl $(echo agent kernel) claude-code off",
+        "ls -l",
+    ];
+
+    /// A place for each way the walk reaches text: the line itself, a word
+    /// run as a command line, an option's value, a substitution, an
+    /// assignment's value, an array, an input, an interpreter's code, a
+    /// command that only shows its words.
+    const WRAPPERS: &[&str] = &[
+        "@@",
+        "sudo @@",
+        "sh -c '@@'",
+        "bash -c \"@@\"",
+        "echo $(@@)",
+        "echo \"$(@@)\"",
+        "x='@@'; eval \"$x\"",
+        "echo @@",
+        "alias z='@@'",
+        "a=(@@)",
+        "@@ | cat",
+        "echo y | xargs @@",
+        "bash <<< '@@'",
+        "bash <<'EOF'\n@@\nEOF",
+        "GIT_EDITOR='@@' git log",
+        "PAGER='@@' echo x",
+        "cat <(@@)",
+        "find . -exec @@ \\;",
+        "python3 -c \"import os; os.system('@@')\"",
+        "ssh host -o ProxyCommand='@@' true",
+        "watch --exec='@@' x",
+    ];
+
+    /// The first cores are also joined in pairs and wrapped twice.
+    const PAIRED: usize = 6;
+
+    /// Each text, and whether it is read every way (run now and later, each
+    /// look alone, two with the third left out) or only for the three looks
+    /// at once: the texts wrapped twice are many.
+    fn texts() -> Vec<(String, bool)> {
+        let mut lines: Vec<String> = CORES.iter().map(|core| core.to_string()).collect();
+        for (i, first) in CORES[..PAIRED].iter().enumerate() {
+            for (j, second) in CORES[..PAIRED].iter().enumerate().skip(i) {
+                let joiner = if (i + j) % 2 == 0 { "; " } else { " && " };
+                lines.push(format!("{first}{joiner}{second}"));
+            }
+        }
+        let mut texts = Vec::new();
+        for wrapper in WRAPPERS {
+            for line in &lines {
+                texts.push((wrapper.replace("@@", line), true));
+            }
+            for outer in WRAPPERS {
+                for core in &CORES[..PAIRED] {
+                    let twice = outer.replace("@@", &wrapper.replace("@@", core));
+                    texts.push((twice, false));
+                }
+            }
+        }
+        // Past the depth the walk reads to.
+        for core in CORES {
+            for wrapper in ["echo $(@@)", "sh -c '@@'"] {
+                let mut text = core.to_string();
+                for _ in 0..8 {
+                    text = wrapper.replace("@@", &text);
+                    texts.push((text.clone(), true));
+                }
+            }
+        }
+        texts
+    }
+
+    /// The one walk that answers the three looks against the walk for one
+    /// look it replaced, on the same texts: each look alone, the three at
+    /// once, and two with the third left out.
+    ///
+    /// FAILS ON REVERT: each of these, made to `guard_words_found` alone,
+    /// fails an assertion here. Stop at the first look found and not at all
+    /// that were asked for; leave out the look that reads an interpreter's
+    /// code; leave out the pass over what a substitution prints; answer no
+    /// look past the depth, where the kernel look still answers; read for
+    /// every look and not only for those asked; leave out a command's
+    /// inputs.
+    #[test]
+    fn one_walk_finds_what_a_walk_for_each_look_finds() {
+        // How many readings held no look, one, two and all three.
+        let mut held = [0usize; 4];
+        for (text, every_way) in texts() {
+            let ways: &[(bool, bool)] = if every_way {
+                &[(false, true), (true, false), (false, false)]
+            } else {
+                &[(false, true)]
+            };
+            for &(later, runs) in ways {
+                let all = guard_words_found(&text, 0, later, runs, Looks::ALL);
+                let mut count = 0;
+                for look in Looks::EACH {
+                    let afresh = guard_words_in_afresh(&text, 0, later, runs, look);
+                    assert_eq!(
+                        all.has(look),
+                        afresh,
+                        "{look:?} later={later} runs={runs} {text:?}"
+                    );
+                    count += usize::from(afresh);
+                    if !every_way {
+                        continue;
+                    }
+                    assert_eq!(
+                        guard_words_in(&text, 0, later, runs, look),
+                        afresh,
+                        "{look:?} alone later={later} runs={runs} {text:?}"
+                    );
+                    let alone = Looks::only(look);
+                    assert_eq!(
+                        guard_words_found(&text, 0, later, runs, Looks::ALL.without(alone)),
+                        all.without(alone),
+                        "{look:?} left out later={later} runs={runs} {text:?}"
+                    );
+                }
+                held[count] += 1;
+            }
+        }
+        // Measured: 1755, 2563, 1157 and 159.
+        let floors = [1_600, 2_300, 1_000, 140];
+        assert!(
+            held.iter()
+                .zip(floors)
+                .all(|(readings, floor)| *readings >= floor),
+            "readings that held 0, 1, 2 and 3 looks: {held:?}"
+        );
+    }
+
+    /// One refusal for a line: the exec gate before the disarm, the disarm
+    /// before the kernel protection, as the three passes were ordered.
+    ///
+    /// FAILS ON REVERT: name the kernel protection first in
+    /// `guard_words_refusal` and the first two lines get its reason.
+    #[test]
+    fn the_refusal_is_the_first_of_the_three_in_their_order() {
+        let gate = "innerwarden exec-gate allow x";
+        let disarm = "innerwarden disarm";
+        let kernel = "innerwarden-ctl agent kernel claude-code off";
+        for (line, what) in [
+            (format!("{kernel}; {disarm}; {gate}"), EXEC_GATE_AUTHORISED),
+            (format!("{kernel}; {disarm}"), GUARD_DISARMED),
+            (kernel.to_string(), KERNEL_PROTECTION_CHANGE),
+        ] {
+            assert_eq!(guard_words_refusal(&line), Some((what, 60)), "{line}");
+        }
+        assert_eq!(guard_words_refusal("innerwarden status"), None);
     }
 }

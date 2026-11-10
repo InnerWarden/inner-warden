@@ -95,7 +95,6 @@ fn an_ansi_c_command_string_is_the_decoded_text() {
         "env -S $'innerwarden allow x'",
     ]);
     assert_not_denied(&[
-        r"bash -c $'echo innerwarden allow x'",
         r"bash -c $'printf \'%s\\n\' a b'",
         r"bash -c $'cd /tmp\nls -la'",
     ]);
@@ -266,13 +265,31 @@ fn a_hash_after_a_substitution_is_a_character() {
         "a=$(true)\\\n#;innerwarden allow x",
     ]);
     assert_not_denied(&[
-        "(true)#; innerwarden allow x",
-        "((1+2))#; innerwarden allow x",
         "echo $(date) # innerwarden allow x",
         "a=$(date) #;innerwarden allow x",
         "ts=$(date +%s)#build-tag",
-        "case $x in a)# innerwarden allow x\n;; esac",
     ]);
+}
+
+/// What the fail-closed rule costs (`threats/guard_doubt`): lines that lower
+/// nothing and are refused, a guard word standing beside a construct the
+/// reading does not vouch for. The `#` after the `)` of a subshell, of an
+/// arithmetic command and of a `case` pattern does open a comment, and
+/// `echo` in a `$'...'` command string only prints. They were controls of
+/// the two tests above and allowed before the rule (the `echo` one was
+/// refused before the reading of `$'...'` and is again). Written here so
+/// the cost is a decision: a change that lets one through has to show the
+/// lowering beside it in those tests is still refused.
+#[test]
+fn lines_that_lower_nothing_and_are_refused_at_a_price() {
+    for command in [
+        "(true)#; innerwarden allow x",
+        "((1+2))#; innerwarden allow x",
+        "case $x in a)# innerwarden allow x\n;; esac",
+        r"bash -c $'echo innerwarden allow x'",
+    ] {
+        assert_eq!(verdict(command), "deny", "the rule's price: {command:?}");
+    }
 }
 
 /// The command in a process substitution runs, wherever it stands in the
