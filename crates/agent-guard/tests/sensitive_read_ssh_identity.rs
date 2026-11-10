@@ -161,6 +161,31 @@ fn a_key_behind_a_variable_is_read() {
     ]);
 }
 
+/// A key behind a value built from another value, or from a name the line
+/// does not set (`$HOME`), is the key: a value keeps the `$NAME` it holds
+/// and the line's assignments are read into it once per step.
+///
+/// Measured 2026-11-10: every line of the first group was allowed. A value
+/// was cut at its first `$`, so `K=$HOME/.ssh/id_rsa` gave `K` the empty
+/// value and `cat $K` was read as `cat` alone.
+#[test]
+fn a_key_behind_a_value_built_from_another_is_read() {
+    assert_denied(&[
+        "K=$HOME/.ssh/id_rsa; cat $K",
+        "F=${HOME}/.ssh/id_rsa; cat $F",
+        "D=~/.ssh; F=$D/id_rsa; cat $F",
+        "D=~/.ssh; F=\"$D/id_rsa\"; cat \"$F\"",
+        "H=.ssh; D=~/$H; F=$D/id_rsa; cat $F",
+        "D=$HOME/.ssh; F=$D/id_rsa; G=$F; cat $G",
+    ]);
+    assert_not_denied(&[
+        "D=src; F=$D/main.rs; cat $F",
+        "D=~/.ssh; K=$D/id_ed25519; ssh -i $K deploy@host uptime",
+        "K=$HOME/.ssh/id_ed25519; ssh -i $K deploy@host uptime",
+        "P=$HOME/.ssh/config; ls -l $P",
+    ]);
+}
+
 /// Key use, in the spellings a person and an agent write.
 #[test]
 fn key_use_is_not_refused() {

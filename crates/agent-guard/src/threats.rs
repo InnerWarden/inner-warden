@@ -626,9 +626,13 @@ pub fn check_guard_self_disable(content: &str) -> Option<(&'static str, u32)> {
     }
     // A guard name or verb beside a construct no reading follows (a function,
     // `eval`, a substitution where the command word stands) ([`guard_doubt`]).
-    // Asked after the reading, so a line the reading refuses keeps the
-    // reason the reading gives for it.
-    if guard_doubt::unread_beside_guard_word(content) {
+    // Asked of every reading: the verb may show only once a value is read
+    // into the line (`B=dry; $GUARDBIN ${B}-run`). Asked after the readings,
+    // so a line a reading refuses keeps the reason the reading gives for it.
+    if readings
+        .iter()
+        .any(|reading| guard_doubt::unread_beside_guard_word(reading))
+    {
         return Some((GUARD_LOOSENING_VERB, 60));
     }
     // Values that name one another without end, or grow past the limit, leave
@@ -702,9 +706,14 @@ enum Assigned {
 
 /// PURE. `content` with every `$NAME` / `${NAME}` of a variable set on the
 /// same line (`NAME=value`, `export NAME=value`) replaced by its value: the
-/// first value the line gives the name. One pass over the line, and the
-/// result stops at `limit` bytes: thirty values that each name the next one
-/// twice (`a='$b$b'; b='$c$c'; ...`) are a gigabyte otherwise.
+/// first value the line gives the name ([`assigned_value`]). One pass over
+/// the line, and the result stops at `limit` bytes: thirty values that each
+/// name the next one twice (`a='$b$b'; b='$c$c'; ...`) are a gigabyte
+/// otherwise.
+///
+/// A value keeps the `$NAME` it holds, and the next round reads it
+/// ([`assignment_readings`]). Cut at its first `$`, `F=$D/id_rsa` gave `F`
+/// no value at all and `cat $F` read as `cat` alone (found 2026-11-10).
 fn with_assignments_expanded(content: &str, limit: usize) -> Assigned {
     if !content.contains('$') || !content.contains('=') {
         return Assigned::AsWritten;
@@ -712,19 +721,24 @@ fn with_assignments_expanded(content: &str, limit: usize) -> Assigned {
     static ASSIGN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let assign = ASSIGN.get_or_init(|| {
         regex::Regex::new(
-            r#"(?:^|[\s;&|(])(?:(?:export|local|readonly|declare)\s+)?([A-Za-z_][A-Za-z0-9_]*)=(?:'([^']*)'|"([^"$`]*)"|([^\s;&|()'"$`]*))"#,
+            r"(?:^|[\s;&|(])(?:(?:export|local|readonly|declare)\s+)?([A-Za-z_][A-Za-z0-9_]*)=",
         )
         .expect("a valid pattern")
     });
-    let mut values: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
-    for capture in assign.captures_iter(content) {
-        let Some(name) = capture.get(1) else { continue };
-        let value = capture
-            .get(2)
-            .or_else(|| capture.get(3))
-            .or_else(|| capture.get(4))
-            .map_or("", |m| m.as_str());
-        values.entry(name.as_str()).or_insert(value);
+    let mut values: std::collections::HashMap<&str, String> = std::collections::HashMap::new();
+    let mut from = 0;
+    while let Some(capture) = assign.captures_at(content, from) {
+        let (Some(head), Some(name)) = (capture.get(0), capture.get(1)) else {
+            break;
+        };
+        let (value, taken) = assigned_value(&content[head.end()..]);
+        from = head.end() + taken;
+        // A value that holds its own name (`PATH=$PATH:/x`) says what the
+        // name held before, which the line does not show: read into itself
+        // it would grow on every round.
+        if let Some(value) = value.filter(|value| !text_expands_name(value, name.as_str())) {
+            values.entry(name.as_str()).or_insert(value);
+        }
     }
     if values.is_empty() {
         return Assigned::AsWritten;
@@ -775,6 +789,68 @@ fn with_assignments_expanded(content: &str, limit: usize) -> Assigned {
     } else {
         Assigned::Expanded(out)
     }
+}
+
+/// PURE. The value an assignment gives, read from the text after its `=`:
+/// the characters the word holds once the shell has dropped its quotes,
+/// with any `$NAME` still in it, and how many bytes of `text` the word
+/// took. No value when the text does not show it: a command substitution,
+/// an array.
+fn assigned_value(text: &str) -> (Option<String>, usize) {
+    let mut value = String::new();
+    let mut shown = true;
+    let mut end = text.len();
+    let mut chars = text.char_indices().peekable();
+    while let Some((at, c)) = chars.next() {
+        let next = chars.peek().map(|(_, c)| *c);
+        match c {
+            '\'' => value.extend(chars.by_ref().map(|(_, c)| c).take_while(|c| *c != '\'')),
+            '"' => {
+                while let Some((_, c)) = chars.next() {
+                    let next = chars.peek().map(|(_, c)| *c);
+                    match c {
+                        '"' => break,
+                        '\\' if matches!(next, Some('"' | '\\' | '$' | '`')) => {
+                            value.extend(chars.next().map(|(_, c)| c));
+                        }
+                        '`' => shown = false,
+                        '$' if next == Some('(') => shown = false,
+                        c => value.push(c),
+                    }
+                }
+            }
+            '\\' => value.extend(chars.next().map(|(_, c)| c)),
+            '`' => shown = false,
+            '$' if next == Some('(') => shown = false,
+            // `${NAME:-a b}` is one word, blanks and all.
+            '$' if next == Some('{') => {
+                value.push(c);
+                for (_, c) in chars.by_ref() {
+                    value.push(c);
+                    if c == '}' {
+                        break;
+                    }
+                }
+            }
+            c if c.is_whitespace() || matches!(c, ';' | '&' | '|' | '(' | ')') => {
+                // `NAME=(a b)` is an array.
+                shown &= !(c == '(' && value.is_empty());
+                end = at;
+                break;
+            }
+            c => value.push(c),
+        }
+    }
+    (shown.then_some(value), end)
+}
+
+/// Whether `text` holds `$name` or `${name}`.
+fn text_expands_name(text: &str, name: &str) -> bool {
+    let bare = format!("${name}");
+    text.contains(&format!("${{{name}}}"))
+        || text.match_indices(&bare).any(|(at, _)| {
+            !text[at + bare.len()..].starts_with(|c: char| c == '_' || c.is_ascii_alphanumeric())
+        })
 }
 
 /// [`check_guard_self_disable`] on the command as written.
@@ -829,6 +905,14 @@ fn check_guard_self_disable_read(content: &str) -> Option<(&'static str, u32)> {
 /// What [`check_guard_self_disable`] says of a change of the kernel
 /// protection ([`changes_kernel_protection`]).
 const KERNEL_PROTECTION_CHANGE: &str = "changes the kernel protection that contains it";
+
+/// What [`check_guard_self_disable`] says of a line that cost more to read
+/// than a line is given, with a word of a command left unread
+/// ([`Looks::NOT_READ`]). The line may lower nothing: it says how to write
+/// it so that it is read.
+const LINE_NOT_READ: &str =
+    "holds more than the guard reads of one line, with a variable in a command left \
+     unread: run it as shorter, separate commands, or keep the long value in a file";
 
 /// What [`check_guard_self_disable`] says of a kernel guard lowered by the
 /// guard's own programs ([`Look::ExecGate`]): a program authorised on the
@@ -1171,6 +1255,13 @@ struct Looks(u8);
 impl Looks {
     const NONE: Looks = Looks(0);
     const ALL: Looks = Looks(0b111);
+    /// Not a look, a note of why [`Look::Kernel`] is set, for the reason the
+    /// refusal gives: the line cost more to read than it is given and a
+    /// word of it was left unspelled ([`command_lines_spelled`]).
+    const NOT_READ: Looks = Looks(0b1000);
+    /// The same kind of note: a line spelled from values runs one of the
+    /// guard's own loosening verbs.
+    const SPELLED_VERB: Looks = Looks(0b1_0000);
     const EACH: [Look; 3] = [Look::ExecGate, Look::Disarm, Look::Kernel];
 
     fn only(look: Look) -> Looks {
@@ -1183,6 +1274,16 @@ impl Looks {
 
     fn is_empty(self) -> bool {
         self.0 == 0
+    }
+
+    /// Whether `note` is among these ([`Looks::NOT_READ`]).
+    fn notes(self, note: Looks) -> bool {
+        self.0 & note.0 != 0
+    }
+
+    /// These without the notes: the looks alone.
+    fn looks(self) -> Looks {
+        Looks(self.0 & Looks::ALL.0)
     }
 
     fn with(self, other: Looks) -> Looks {
@@ -1213,7 +1314,16 @@ fn guard_words_refusal(content: &str) -> Option<(&'static str, u32)> {
     } else if found.has(Look::Disarm) {
         Some((GUARD_DISARMED, 60))
     } else if found.has(Look::Kernel) {
-        Some((KERNEL_PROTECTION_CHANGE, 60))
+        // Refused for what was not read says so: the line may lower nothing,
+        // and written as shorter commands it is read to the end.
+        let what = if found.notes(Looks::NOT_READ) {
+            LINE_NOT_READ
+        } else if found.notes(Looks::SPELLED_VERB) {
+            GUARD_LOOSENING_VERB
+        } else {
+            KERNEL_PROTECTION_CHANGE
+        };
+        Some((what, 60))
     } else {
         None
     }
@@ -1235,6 +1345,23 @@ fn guard_words_in(text: &str, depth: u8, later: bool, runs: bool, look: Look) ->
 /// its spellings, and the longest lines of the reviews held the check for
 /// more than a second.
 fn guard_words_found(text: &str, depth: u8, later: bool, runs: bool, looks: Looks) -> Looks {
+    guard_words_found_within(text, depth, later, runs, looks, None)
+}
+
+/// [`guard_words_found`] of a text that is part of a line: `around` holds
+/// the values that line assigned. A value is read with them: built on a
+/// line (`C="${A}warden ${B}-run"`) and run by its name alone (`$C`), the
+/// program and the verb stood nowhere else, and a name given sixteen
+/// values ahead of that one kept it out of every reading (found
+/// 2026-11-10).
+fn guard_words_found_within(
+    text: &str,
+    depth: u8,
+    later: bool,
+    runs: bool,
+    looks: Looks,
+    around: Option<&ValuesAssigned<'_>>,
+) -> Looks {
     use crate::shell_words::{read_line, Word};
     if looks.is_empty() {
         return looks;
@@ -1244,11 +1371,12 @@ fn guard_words_found(text: &str, depth: u8, later: bool, runs: bool, looks: Look
     }
     let line = read_line(text);
     let names = names_given_a_guard_program(&line);
-    let assigned = values_assigned(&line);
+    let assigned = values_assigned(&line, text.len(), around);
+    let within = Some(&assigned);
     // Each of these is asked about the looks not found yet, and answers
     // with the ones it holds.
     let run_as_text = |inner: &str, later: bool, runs: bool, asked: Looks| {
-        let found = guard_words_found(inner, depth + 1, later, runs, asked);
+        let found = guard_words_found_within(inner, depth + 1, later, runs, asked, within);
         found.with(asked.without(found).kept(|look| look.in_code(inner)))
     };
     // A word that holds text the shell or a program may run: an
@@ -1257,7 +1385,7 @@ fn guard_words_found(text: &str, depth: u8, later: bool, runs: bool, looks: Look
     let runs_text_of = |word: &Word, later: bool, runs: bool, asked: Looks| {
         let mut found = Looks::NONE;
         if let Some((_, value)) = assignment_parts(word) {
-            found = guard_words_found(value, depth + 1, true, false, asked);
+            found = guard_words_found_within(value, depth + 1, true, false, asked, within);
         }
         if may_be_a_command_line(word) {
             found = found.with(run_as_text(&word.text, later, runs, asked.without(found)));
@@ -1269,7 +1397,7 @@ fn guard_words_found(text: &str, depth: u8, later: bool, runs: bool, looks: Look
     };
     let mut found = Looks::NONE;
     for (index, command) in line.commands.iter().enumerate() {
-        if found == looks {
+        if found.looks() == looks {
             return found;
         }
         let words = &command.words;
@@ -1311,6 +1439,42 @@ fn guard_words_found(text: &str, depth: u8, later: bool, runs: bool, looks: Look
             let shown = words_with_substitutions_shown(words);
             found = found.with(found_in(&shown, looks.without(found)));
         }
+        // What a value holds becomes words of this command, or text it
+        // hands on. At the last level read its words are not walked: one
+        // level on, naming the guard is all it takes ([`Look::too_deep`]),
+        // and a word with a `$` in it is read as text of its own down to
+        // that level, so a value that named the guard with a verb that
+        // reads (`C="inner${X} --json"; $C`, `X` holding `warden status`)
+        // was refused.
+        match command_lines_spelled(words, &assigned) {
+            Some(spelled) => {
+                for spelled in &spelled {
+                    let asked = looks.without(found);
+                    if depth < KERNEL_TEXT_DEPTH {
+                        found = found.with(guard_words_found_within(
+                            spelled,
+                            depth + 1,
+                            later,
+                            runs,
+                            asked,
+                            within,
+                        ));
+                    }
+                    if asked.has(Look::Kernel) && runs_guard_loosening_verb(spelled) {
+                        found = found
+                            .with(Looks::only(Look::Kernel))
+                            .with(Looks::SPELLED_VERB);
+                    }
+                }
+            }
+            None => {
+                // The note goes with the look it explains, never without it.
+                let kernel = looks.kept(|look| look == Look::Kernel);
+                if !kernel.is_empty() {
+                    found = found.with(kernel).with(Looks::NOT_READ);
+                }
+            }
+        }
         // Text handed to a shell is run as written.
         let to_a_shell = runs_here && hands_its_text_to_a_shell(words);
         for word in words {
@@ -1321,21 +1485,23 @@ fn guard_words_found(text: &str, depth: u8, later: bool, runs: bool, looks: Look
         }
     }
     for inner in &line.nested {
-        found = found.with(guard_words_found(
+        found = found.with(guard_words_found_within(
             inner,
             depth + 1,
             later,
             runs,
             looks.without(found),
+            within,
         ));
     }
     for list in &line.arrays {
-        found = found.with(guard_words_found(
+        found = found.with(guard_words_found_within(
             list,
             depth + 1,
             true,
             false,
             looks.without(found),
+            within,
         ));
     }
     found
@@ -1347,22 +1513,38 @@ fn guard_words_found(text: &str, depth: u8, later: bool, runs: bool, looks: Look
 /// to the same answers.
 #[cfg(test)]
 fn guard_words_in_afresh(text: &str, depth: u8, later: bool, runs: bool, look: Look) -> bool {
+    guard_words_in_afresh_within(text, depth, later, runs, look, None)
+}
+
+/// [`guard_words_in_afresh`] of a text that is part of a line
+/// ([`guard_words_found_within`]).
+#[cfg(test)]
+fn guard_words_in_afresh_within(
+    text: &str,
+    depth: u8,
+    later: bool,
+    runs: bool,
+    look: Look,
+    around: Option<&ValuesAssigned<'_>>,
+) -> bool {
     use crate::shell_words::read_line;
     if depth > KERNEL_TEXT_DEPTH {
         return look.too_deep(text);
     }
     let line = read_line(text);
     let names = names_given_a_guard_program(&line);
-    let assigned = values_assigned(&line);
+    let assigned = values_assigned(&line, text.len(), around);
+    let within = Some(&assigned);
     let run_as_text = |inner: &str, later: bool, runs: bool| {
-        guard_words_in_afresh(inner, depth + 1, later, runs, look) || look.in_code(inner)
+        guard_words_in_afresh_within(inner, depth + 1, later, runs, look, within)
+            || look.in_code(inner)
     };
     // A word that holds text the shell or a program may run: an
     // assignment's value, a word shaped like a command line, the value of
     // an option given with it.
     let runs_text_of = |word: &crate::shell_words::Word, later: bool, runs: bool| {
         if let Some((_, value)) = assignment_parts(word) {
-            if guard_words_in_afresh(value, depth + 1, true, false, look) {
+            if guard_words_in_afresh_within(value, depth + 1, true, false, look, within) {
                 return true;
             }
         }
@@ -1413,6 +1595,28 @@ fn guard_words_in_afresh(text: &str, depth: u8, later: bool, runs: bool, look: L
         {
             return true;
         }
+        // What a value holds becomes words of this command, or text it
+        // hands on.
+        match command_lines_spelled(words, &assigned) {
+            Some(spelled) => {
+                if spelled.iter().any(|spelled| {
+                    (depth < KERNEL_TEXT_DEPTH
+                        && guard_words_in_afresh_within(
+                            spelled,
+                            depth + 1,
+                            later,
+                            runs,
+                            look,
+                            within,
+                        ))
+                        || (look == Look::Kernel && runs_guard_loosening_verb(spelled))
+                }) {
+                    return true;
+                }
+            }
+            None if look == Look::Kernel => return true,
+            None => {}
+        }
         // Text handed to a shell is run as written.
         let to_a_shell = runs_here && hands_its_text_to_a_shell(words);
         for word in words {
@@ -1430,11 +1634,11 @@ fn guard_words_in_afresh(text: &str, depth: u8, later: bool, runs: bool, look: L
     }
     line.nested
         .iter()
-        .any(|inner| guard_words_in_afresh(inner, depth + 1, later, runs, look))
+        .any(|inner| guard_words_in_afresh_within(inner, depth + 1, later, runs, look, within))
         || line
             .arrays
             .iter()
-            .any(|list| guard_words_in_afresh(list, depth + 1, true, false, look))
+            .any(|list| guard_words_in_afresh_within(list, depth + 1, true, false, look, within))
 }
 
 /// `agent` and `kernel` as written right after a program (options, and a
@@ -1540,15 +1744,16 @@ fn guard_program(
                     .and_then(|rest| rest.strip_suffix('}'))
                     .is_some_and(|name| names.contains(name))
         });
-        let spelled = || {
-            with_values_assigned(word, assigned).is_some_and(|words| {
-                words.iter().any(|word| {
-                    matches!(
-                        guard_program(word, names, &ValuesAssigned::new()),
-                        GuardProgram::Is
-                    )
-                })
-            })
+        let spelled = || match with_values_assigned(word, assigned) {
+            Spelled::Words(words) => words.iter().any(|word| {
+                matches!(
+                    guard_program(word, names, &ValuesAssigned::new()),
+                    GuardProgram::Is
+                )
+            }),
+            // More values than are read: any of them may be the guard.
+            Spelled::TooMany => true,
+            Spelled::Unread => false,
         };
         return if named || runs_a_guard_program_by_name(&word.text) || spelled() {
             GuardProgram::Is
@@ -1863,27 +2068,50 @@ const FILE_COPIERS: &[&str] = &[
 
 /// The values a line assigns as written (`NAME=value`), each name with the
 /// value's characters and how the shell treats them: what a later `$NAME`
-/// or `${NAME}` on the line stands for. A value appended to (`NAME+=`) is
-/// left out: what the name holds is not shown. A value's `*`, `?` and
-/// bracket expression are taken as patterns, as an unquoted `$NAME` makes
-/// them.
+/// or `${NAME}` on the line stands for. A value's `*`, `?` and bracket
+/// expression are taken as patterns, as an unquoted `$NAME` makes them.
+///
+/// Every value a name is given is kept, not the one in effect where the
+/// name is used: an assignment the shell drops (`B=x true`, `(B=x)`) or
+/// runs later (a loop) is then no way to hide the value that counts.
+///
+/// A value built from other values (`B=${A}warden`, `A=${A}warden`,
+/// `A+=ner`) is read through the values those names have, again and again
+/// until nothing new comes ([`VALUE_ROUNDS`]): read one step deep only,
+/// `A=inner; B=${A}warden; C=dry; D=$C-run; $B $D` showed neither the
+/// program nor the verb, and a real shell ran it (found 2026-11-10).
 ///
 /// Kept by name: looked up in a list of every assignment, a line of N
 /// assignments was read N times over (16,000 of them, 128 KB, held the
 /// check 1.4 s on the lab box, 2026-11-10).
-fn values_assigned(line: &crate::shell_words::Line) -> ValuesAssigned {
+///
+/// `long`: how long the text of the line is, in bytes; `around`: the values
+/// of the line that text is a part of.
+fn values_assigned<'a>(
+    line: &crate::shell_words::Line,
+    long: usize,
+    around: Option<&'a ValuesAssigned<'a>>,
+) -> ValuesAssigned<'a> {
     use crate::shell_words::{glob_marks, Mark, Word};
-    let mut assigned = ValuesAssigned::new();
+    let mut assigned = ValuesAssigned {
+        around,
+        ..ValuesAssigned::default()
+    };
+    // The values that hold a `$NAME`, in the order the line gives them.
+    let mut built: Vec<(String, Word)> = Vec::new();
+    if around.is_none() {
+        assigned.most = long
+            .saturating_mul(VALUE_READING_PER_BYTE)
+            .saturating_add(VALUE_READING_FLOOR);
+    }
     for word in line.commands.iter().flat_map(|command| &command.words) {
         let Some((name, value)) = assignment_parts(word) else {
             continue;
         };
-        if word.text[name.len()..].starts_with("+=") {
-            continue;
-        }
-        let from = name.chars().count() + 1;
+        let appended = word.text[name.len()..].starts_with("+=");
+        let from = name.chars().count() + 1 + usize::from(appended);
         let (_, globs) = glob_marks(value);
-        let marks = word.marks[from..]
+        let mut marks: Vec<Mark> = word.marks[from..]
             .iter()
             .zip(globs)
             .map(
@@ -1896,48 +2124,264 @@ fn values_assigned(line: &crate::shell_words::Line) -> ValuesAssigned {
                 },
             )
             .collect();
-        let values: &mut Vec<Word> = assigned.entry(name.to_string()).or_default();
-        values.push(Word {
-            text: value.to_string(),
+        let mut text = value.to_string();
+        if appended {
+            // `NAME+=value` is `NAME=${NAME}value`.
+            let own = format!("${{{name}}}");
+            marks.splice(0..0, own.chars().map(|_| Mark::Expansion));
+            text.insert_str(0, &own);
+        }
+        let value = Word {
+            text,
             marks,
             ..Word::default()
-        });
+        };
+        if value.marks.contains(&Mark::Expansion) {
+            built.push((name.to_string(), value));
+        } else {
+            assigned.keep(name, value);
+        }
     }
+    for round in 0..VALUE_ROUNDS {
+        let mut changed = false;
+        for (name, value) in &built {
+            // A value that holds its own name grows for ever: read into
+            // itself a few times only.
+            if round >= OWN_NAME_ROUNDS && text_expands_name(&value.text, name) {
+                continue;
+            }
+            match with_values_assigned(value, &assigned) {
+                Spelled::Words(words) => {
+                    for word in words {
+                        changed |= assigned.keep(name, word);
+                    }
+                }
+                Spelled::TooMany => changed |= assigned.many.insert(name.clone()),
+                Spelled::Unread => {}
+            }
+            if !assigned.pays(value.text.len()) {
+                assigned.unread = true;
+                return assigned;
+            }
+        }
+        if !changed {
+            return assigned;
+        }
+    }
+    assigned.unread = true;
     assigned
 }
 
-/// The values a line assigns, by name ([`values_assigned`]).
-type ValuesAssigned = std::collections::BTreeMap<String, Vec<crate::shell_words::Word>>;
+/// How many times the values a line builds from other values are read
+/// through them ([`values_assigned`]). The values are read in the order the
+/// line gives them, so a chain written in order is read in one round at any
+/// depth; the rounds are for a chain written backwards inside a loop.
+const VALUE_ROUNDS: usize = 8;
 
-/// How many words [`with_values_assigned`] makes at most.
+/// How many of those rounds read a value into itself (`A=${A}x`, `A+=x`).
+const OWN_NAME_ROUNDS: usize = 4;
+
+/// What reading the values of a line into its words and into one another
+/// may cost, in bytes of value read and made ([`ValuesAssigned::pays`]): so
+/// many per byte of the line (`long`, the text read; what it hands a
+/// command on its input counts), and a floor. Past it the values count as
+/// not read, and every name may then be any program.
+///
+/// Values that each hold the one before twice (`a1=$a0$a0; a2=$a1$a1; ...`)
+/// double at every step: sixty of them, 800 bytes of line, held the check
+/// past twenty seconds, and a hook that runs out of time lets the command
+/// through (measured 2026-11-10). No value is too long to read by itself:
+/// with a length each value had to keep under, a value padded past it hid
+/// the program and the verb it held.
+const VALUE_READING_PER_BYTE: usize = 16;
+const VALUE_READING_FLOOR: usize = 65_536;
+
+/// The values a line assigns, by name ([`values_assigned`]).
+#[derive(Default)]
+struct ValuesAssigned<'a> {
+    /// Each name's values that hold no expansion.
+    shown: std::collections::BTreeMap<String, Vec<crate::shell_words::Word>>,
+    /// The names given more values than are kept.
+    many: std::collections::BTreeSet<String>,
+    /// The values were still changing when the reading stopped, or cost
+    /// more to read than a line is given ([`values_assigned`]).
+    unread: bool,
+    /// The values of the line this text is a part of (a value, a command
+    /// line in quotes): a name has those too.
+    around: Option<&'a ValuesAssigned<'a>>,
+    /// Some value holds a blank: a word it is put into may be several.
+    blank: bool,
+    /// What reading values has cost so far, in bytes, and what it may cost
+    /// at most ([`ValuesAssigned::pays`]). Counted on the outermost line.
+    read: std::cell::Cell<usize>,
+    most: usize,
+}
+
+impl ValuesAssigned<'_> {
+    /// No value, and no limit to what reading costs: the table a word with
+    /// nothing left to read into it is asked with.
+    fn new() -> Self {
+        Self {
+            most: usize::MAX,
+            ..Self::default()
+        }
+    }
+
+    /// Counts `bytes` of value read or made against what the outermost line
+    /// is given ([`VALUE_READING_PER_BYTE`]). Whether it still had some to
+    /// give. One count for the line and every text inside it: counted for
+    /// each text apart, a line of N words that each read a long value cost
+    /// N times what one may.
+    fn pays(&self, bytes: usize) -> bool {
+        match self.around {
+            Some(around) => around.pays(bytes),
+            None => {
+                let read = self.read.get().saturating_add(bytes);
+                self.read.set(read);
+                read <= self.most
+            }
+        }
+    }
+
+    /// Whether the line has read more than it is given ([`Self::pays`]).
+    fn ran_out(&self) -> bool {
+        !self.pays(0)
+    }
+
+    /// Whether a value holds a blank, on this line or on one around it.
+    fn holds_a_blank(&self) -> bool {
+        self.blank || self.around.is_some_and(ValuesAssigned::holds_a_blank)
+    }
+
+    /// Whether `name` has more values than are read, on this line or on
+    /// one around it.
+    fn past_reading(&self, name: &str) -> bool {
+        self.unread
+            || self.many.contains(name)
+            || self.around.is_some_and(|around| around.past_reading(name))
+    }
+
+    /// Every value `name` is given, on this line and on the ones around it.
+    fn values(&self, name: &str) -> Vec<&crate::shell_words::Word> {
+        let mut values: Vec<_> = self.shown.get(name).into_iter().flatten().collect();
+        if let Some(around) = self.around {
+            values.extend(around.values(name));
+        }
+        values
+    }
+
+    /// Adds `value` to the values of `name`. Whether that changed what is
+    /// known of the name: a new value, or one too many to keep.
+    fn keep(&mut self, name: &str, value: crate::shell_words::Word) -> bool {
+        if self.many.contains(name) {
+            return false;
+        }
+        let values = self.shown.entry(name.to_string()).or_default();
+        if values
+            .iter()
+            .any(|known| known.text == value.text && known.marks == value.marks)
+        {
+            return false;
+        }
+        if values.len() == MAX_ASSIGNED_SPELLINGS {
+            self.many.insert(name.to_string());
+        } else {
+            self.blank |= value.text.contains(char::is_whitespace);
+            values.push(value);
+        }
+        true
+    }
+}
+
+/// How many words [`with_values_assigned`] makes at most, and how many
+/// values of one name [`values_assigned`] keeps.
 const MAX_ASSIGNED_SPELLINGS: usize = 16;
 
-/// `word` with each `$NAME` and `${NAME}` in it replaced by a value the
-/// line assigned that name ([`values_assigned`]): one word per way the
-/// values combine. `None` when an expansion in it is anything else, names
-/// a name the line did not assign, or the ways are too many.
-fn with_values_assigned(
-    word: &crate::shell_words::Word,
+/// What the values a line assigns make of a word ([`with_values_assigned`]).
+enum Spelled {
+    /// One word per way the values combine.
+    Words(Vec<crate::shell_words::Word>),
+    /// The ways are more than are read.
+    TooMany,
+    /// An expansion in it is no `$NAME`, or names a name with no value
+    /// shown on the line.
+    Unread,
+}
+
+/// The command lines the values of a line make of a command's words. A
+/// word with a `$NAME` in it, spelled with a value that holds a blank, is
+/// several words to the shell (`$C`), and text a shell or an `eval` handed
+/// it runs whole (`sh -c "$C"`): each such spelling that names the guard,
+/// or a word that lowers it ([`line_touches_guard`]), with the words after
+/// it. `None` when they cost more to read than the line is given
+/// ([`ValuesAssigned::pays`]).
+///
+/// With the blank between the program and the verb inside a value of its
+/// own (`X="warden dry"; C="inner${X}-run"; $C`), the word was one that
+/// named no program to [`guard_program`], and the reading of the line's
+/// assignments into it knew the first value of `X` only (found 2026-11-10).
+fn command_lines_spelled(
+    words: &[crate::shell_words::Word],
     assigned: &ValuesAssigned,
-) -> Option<Vec<crate::shell_words::Word>> {
+) -> Option<Vec<String>> {
+    use crate::shell_words::Mark;
+    let mut lines = Vec::new();
+    if !assigned.holds_a_blank() {
+        return Some(lines);
+    }
+    for (at, word) in words.iter().enumerate() {
+        if !word.has(Mark::Expansion) || assignment_parts(word).is_some() {
+            continue;
+        }
+        let spellings = match with_values_assigned(word, assigned) {
+            Spelled::Words(spellings) => spellings,
+            // Not made, and the line has read all it is given: with the
+            // words in front of it costly enough, the word that lowered
+            // the guard was the one left unread (found 2026-11-10).
+            Spelled::TooMany if assigned.ran_out() => return None,
+            Spelled::TooMany | Spelled::Unread => continue,
+        };
+        for spelling in spellings {
+            if !spelling.text.contains(char::is_whitespace) || !line_touches_guard(&spelling.text) {
+                continue;
+            }
+            let mut line = spelling.text;
+            for word in &words[at + 1..] {
+                line.push(' ');
+                line.push_str(&word.text);
+            }
+            if !assigned.pays(line.len()) {
+                return None;
+            }
+            lines.push(line);
+        }
+    }
+    Some(lines)
+}
+
+/// `word` with each `$NAME` and `${NAME}` in it replaced by a value the
+/// line assigned that name ([`values_assigned`]).
+fn with_values_assigned(word: &crate::shell_words::Word, assigned: &ValuesAssigned) -> Spelled {
     use crate::shell_words::{Mark, Word};
     let chars: Vec<char> = word.text.chars().collect();
-    let mut spellings = vec![Word::default()];
+    // The names in the word, each with where it starts and ends and the
+    // values it has. Found before a word is made: the ways they combine and
+    // the length they come to are known without a character copied.
+    let mut names: Vec<(usize, usize, Vec<&Word>)> = Vec::new();
+    let (mut ways, mut longest) = (1, 0);
     let mut at = 0;
     while at < chars.len() {
         if word.marks[at] != Mark::Expansion {
-            for spelling in &mut spellings {
-                spelling.text.push(chars[at]);
-                spelling.marks.push(word.marks[at]);
-            }
             at += 1;
             continue;
         }
         if chars[at] != '$' {
-            return None;
+            return Spelled::Unread;
         }
         let (name, end) = if chars.get(at + 1) == Some(&'{') {
-            let close = (at + 2..chars.len()).find(|&i| chars[i] == '}')?;
+            let Some(close) = (at + 2..chars.len()).find(|&i| chars[i] == '}') else {
+                return Spelled::Unread;
+            };
             (chars[at + 2..close].iter().collect::<String>(), close + 1)
         } else {
             let end = (at + 1..chars.len())
@@ -1955,11 +2399,37 @@ fn with_values_assigned(
                 .iter()
                 .any(|mark| *mark != Mark::Expansion)
         {
-            return None;
+            return Spelled::Unread;
         }
-        let values = assigned.get(&name).map_or(&[][..], Vec::as_slice);
-        if values.is_empty() || spellings.len() * values.len() > MAX_ASSIGNED_SPELLINGS {
-            return None;
+        if assigned.past_reading(&name) {
+            return Spelled::TooMany;
+        }
+        let values = assigned.values(&name);
+        if values.is_empty() {
+            return Spelled::Unread;
+        }
+        ways *= values.len();
+        longest += values
+            .iter()
+            .map(|value| value.text.len())
+            .max()
+            .unwrap_or(0);
+        if ways > MAX_ASSIGNED_SPELLINGS {
+            return Spelled::TooMany;
+        }
+        names.push((at, end, values));
+        at = end;
+    }
+    // Paid before a word is made: the words to make come to this at most.
+    if !assigned.pays(ways.saturating_mul(longest.saturating_add(chars.len()))) {
+        return Spelled::TooMany;
+    }
+    let mut spellings = vec![Word::default()];
+    let mut at = 0;
+    for (start, end, values) in &names {
+        for spelling in &mut spellings {
+            spelling.text.extend(&chars[at..*start]);
+            spelling.marks.extend(&word.marks[at..*start]);
         }
         spellings = spellings
             .iter()
@@ -1972,9 +2442,13 @@ fn with_values_assigned(
                 })
             })
             .collect();
-        at = end;
+        at = *end;
     }
-    Some(spellings)
+    for spelling in &mut spellings {
+        spelling.text.extend(&chars[at..]);
+        spelling.marks.extend(&word.marks[at..]);
+    }
+    Spelled::Words(spellings)
 }
 
 /// `name=value` (or `name+=value`) with the name as written: the name and
@@ -17175,10 +17649,10 @@ mod env_split_words_tests {
 #[cfg(test)]
 mod guard_reading_tests {
     use super::{
-        assignment_readings, check_guard_self_disable, process_substitutions,
-        runs_guard_loosening_verb_in, shell_command_segments, shell_tokens,
-        with_assignments_expanded, Assigned, ReadingBudget, ASSIGNMENT_ROUNDS,
-        GUARD_LOOSENING_VERB,
+        assigned_value, assignment_readings, check_guard_self_disable, command_lines_spelled,
+        process_substitutions, runs_guard_loosening_verb_in, shell_command_segments, shell_tokens,
+        text_expands_name, values_assigned, with_assignments_expanded, with_values_assigned,
+        Assigned, ReadingBudget, Spelled, ASSIGNMENT_ROUNDS, GUARD_LOOSENING_VERB,
     };
 
     /// The `)` of a substitution or an array leaves the word going on, so a
@@ -17348,6 +17822,286 @@ mod guard_reading_tests {
         assert!(settled);
         assert_eq!(readings.len(), 2);
         assert_eq!(check_guard_self_disable(&many), None);
+    }
+
+    /// The value of an assignment is the whole word the shell makes of it:
+    /// its quotes dropped, the `$NAME` it holds kept for the next round.
+    ///
+    /// FAILS ON REVERT: with each value cut at its first `$`, quote or
+    /// backslash, `F=$D/id_rsa` gave `F` the empty value and `cat $F` read as
+    /// `cat` alone; `A=in'ner'` gave `in`.
+    #[test]
+    fn an_assigned_value_is_the_whole_word_with_its_quotes_dropped() {
+        for (text, value, taken) in [
+            ("iw; $I", Some("iw"), 2),
+            ("'a b' c", Some("a b"), 5),
+            ("in'ner'; x", Some("inner"), 7),
+            ("\"in\"ner x", Some("inner"), 7),
+            ("in\\ner x", Some("inner"), 6),
+            ("$D/id_rsa; cat $F", Some("$D/id_rsa"), 9),
+            ("\"$C ${B}-run\"; $D", Some("$C ${B}-run"), 13),
+            ("\"a \\\"b\\\" \\$c\" d", Some("a \"b\" $c"), 13),
+            ("${D:-a b}/x y", Some("${D:-a b}/x"), 11),
+            ("; ls", Some(""), 0),
+            ("", Some(""), 0),
+            // Not shown by the text: a substitution, an array.
+            ("$(date) x", None, 1),
+            ("`date` x", None, 6),
+            ("\"$(date)\" x", None, 9),
+            ("(a b) x", None, 0),
+        ] {
+            assert_eq!(
+                assigned_value(text),
+                (value.map(str::to_string), taken),
+                "{text:?}"
+            );
+        }
+        for (text, name, holds) in [
+            ("$PATH:/x", "PATH", true),
+            ("/x:${PATH}", "PATH", true),
+            ("$PATHS$PATH", "PATH", true),
+            ("$PATHS:/x", "PATH", false),
+            ("$PATH_X", "PATH", false),
+            ("PATH", "PATH", false),
+        ] {
+            assert_eq!(text_expands_name(text, name), holds, "{text:?}");
+        }
+    }
+
+    /// A value built from another value is read in two rounds, and a value
+    /// that holds its own name is not read into the line at all: it says
+    /// what the name held before, and would grow on every round.
+    ///
+    /// FAILS ON REVERT: record a value that holds its own name and
+    /// `PATH=$PATH:/x/bin; innerwarden status` never settles: a line that
+    /// names the guard and does not settle is refused.
+    #[test]
+    fn a_value_built_from_another_is_read_and_one_built_on_itself_is_not() {
+        let expanded = |line: &str| match with_assignments_expanded(line, 4096) {
+            Assigned::Expanded(text) => Some(text),
+            Assigned::AsWritten => None,
+            Assigned::PastLimit => Some("past the limit".to_string()),
+        };
+        assert_eq!(
+            expanded("D=~/.ssh; F=$D/id_rsa; cat $F"),
+            Some("D=~/.ssh; F=~/.ssh/id_rsa; cat $D/id_rsa".to_string())
+        );
+        let (readings, settled) = assignment_readings("D=~/.ssh; F=$D/id_rsa; cat $F");
+        assert!(settled);
+        assert_eq!(
+            readings.last().map(String::as_str),
+            Some("D=~/.ssh; F=~/.ssh/id_rsa; cat ~/.ssh/id_rsa")
+        );
+        assert_eq!(
+            expanded("A=in'n'er; ${A}warden x"),
+            Some("A=in'n'er; innerwarden x".to_string())
+        );
+        assert_eq!(expanded("PATH=$PATH:/x/bin; echo $PATH"), None);
+        assert_eq!(
+            expanded("A=1; A=$A$A; echo $A"),
+            Some("A=1; A=11; echo 1".to_string())
+        );
+        for line in [
+            "PATH=$PATH:/x/bin; innerwarden status",
+            "export PATH=\"$HOME/.cargo/bin:$PATH\"; innerwarden status",
+        ] {
+            let (_, settled) = assignment_readings(line);
+            assert!(settled, "{line}");
+            assert_eq!(check_guard_self_disable(line), None, "{line}");
+        }
+        // Three values that each name the next one twice still end.
+        let (readings, settled) = assignment_readings("a=$b$b; b=$c$c; c=$a$a; echo $a");
+        assert!(!settled);
+        assert!(readings.len() <= ASSIGNMENT_ROUNDS + 1);
+    }
+
+    /// The values a line builds from other values are read through them: a
+    /// chain, a name the line gives two values, a name appended to. A name
+    /// with more values than are kept, and values still changing when the
+    /// rounds end, are marked: a word that holds such a name may be anything.
+    ///
+    /// FAILS ON REVERT: leave out the values that hold a `$NAME` and `B` and
+    /// `D` have no value on the first line, so `$B $D` shows neither the
+    /// guard's program nor the verb.
+    #[test]
+    fn the_values_a_line_builds_from_other_values_are_read_through_them() {
+        let values = |line: &str, name: &str| {
+            let assigned = values_assigned(&crate::shell_words::read_line(line), line.len(), None);
+            let mut texts: Vec<String> = assigned
+                .shown
+                .get(name)
+                .map(|values| values.iter().map(|value| value.text.clone()).collect())
+                .unwrap_or_default();
+            texts.sort();
+            (texts, assigned.many.contains(name), assigned.unread)
+        };
+        let shown = |texts: &[&str]| {
+            let texts: Vec<String> = texts.iter().map(|text| (*text).to_string()).collect();
+            (texts, false, false)
+        };
+        let chain = "A=inner; B=${A}warden; C=dry; D=$C-run; $B $D";
+        assert_eq!(values(chain, "B"), shown(&["innerwarden"]));
+        assert_eq!(values(chain, "D"), shown(&["dry-run"]));
+        // Every value of a name, whichever one the shell keeps.
+        assert_eq!(
+            values("A=x; A=inner; B=${A}warden", "B"),
+            shown(&["innerwarden", "xwarden"])
+        );
+        assert_eq!(
+            values("A=inner; B=${A}warden; B=x true; (B=y)", "B"),
+            shown(&["innerwarden", "x", "y"])
+        );
+        // Appended to: read into itself a few times, then left.
+        assert_eq!(
+            values("A=in; A+=ner", "A"),
+            shown(&["in", "inner", "innerner", "innernerner", "innernernerner"])
+        );
+        // No value shown for the name it is built from: no value.
+        assert_eq!(values("B=${HOME}/bin/tool", "B"), shown(&[]));
+        // Two pieces appended in any order are more values than are kept.
+        let (_, many, unread) = values("A=in; A+=ner; A+=warden", "A");
+        assert!(many && !unread);
+        // A chain written backwards takes one round per step.
+        let backwards = |steps: usize| {
+            let mut line = String::new();
+            for step in (1..=steps).rev() {
+                line.push_str(&format!("A{step}=$A{}; ", step - 1));
+            }
+            line + "A0=x"
+        };
+        assert_eq!(values(&backwards(7), "A7"), shown(&["x"]));
+        assert!(values(&backwards(9), "A9").2);
+
+        for line in [
+            chain,
+            "A=x; A=inner; B=${A}warden; C=dry; $B ${C}-run",
+            "A=in; A+=ner; B=dry; ${A}warden ${B}-run",
+            "A=in; A+=ner; A+=warden; B=dr; B+=y-run; $A $B",
+        ] {
+            // The score, not the reason: the reader of the line's words
+            // answers first, with its own.
+            assert_eq!(
+                check_guard_self_disable(line).map(|hit| hit.1),
+                Some(60),
+                "{line}"
+            );
+        }
+        for line in [
+            "A=make; B=$A; C=test; $B $C",
+            "T=te; T+=st; C=$T; $C $ARGS",
+            "A=src; B=$A/main.rs; C=$B; wc -l $C",
+        ] {
+            assert_eq!(check_guard_self_disable(line), None, "{line}");
+        }
+    }
+
+    /// A word is spelled from the values of its names while the line has
+    /// reading left, however long a value is. What the words made come to
+    /// is counted against the line, on the outermost line for a text inside
+    /// one; when the line has read all it is given no word is spelled, and
+    /// the table says the line ran out.
+    ///
+    /// FAILS ON REVERT: stop counting the words made (`pays` in
+    /// `with_values_assigned`) and the same word is spelled without end;
+    /// leave a value longer than 4096 bytes unread and the first word is
+    /// not spelled.
+    #[test]
+    fn a_word_is_spelled_from_its_values_while_the_line_has_reading_left() {
+        let long = "x".repeat(5000);
+        let line = format!("V='{long}'; W=ab; true $V $W");
+        let read = crate::shell_words::read_line(&line);
+        let assigned = values_assigned(&read, line.len(), None);
+        let words = &read.commands.last().expect("a command").words;
+        let (long_word, short_word) = (&words[1], &words[2]);
+        let texts = |spelled: Spelled| match spelled {
+            Spelled::Words(words) => {
+                Some(words.into_iter().map(|word| word.text).collect::<Vec<_>>())
+            }
+            Spelled::TooMany | Spelled::Unread => None,
+        };
+        assert_eq!(
+            texts(with_values_assigned(long_word, &assigned)),
+            Some(vec![long.clone()])
+        );
+        assert!(!assigned.ran_out());
+
+        // The same word again and again: each making is counted, so the
+        // line runs out after a bounded number of them.
+        let made = (0..10_000)
+            .take_while(|_| {
+                matches!(
+                    with_values_assigned(long_word, &assigned),
+                    Spelled::Words(_)
+                )
+            })
+            .count();
+        assert!(made > 0 && made < 10_000, "made {made} times");
+        assert!(assigned.ran_out());
+        // And then no word is, not even a short one.
+        assert!(matches!(
+            with_values_assigned(short_word, &assigned),
+            Spelled::TooMany
+        ));
+
+        // A text inside the line counts on the line's table.
+        let outer = values_assigned(&read, line.len(), None);
+        let inner_text = "true $V";
+        let inner_read = crate::shell_words::read_line(inner_text);
+        let inner = values_assigned(&inner_read, inner_text.len(), Some(&outer));
+        let before = outer.read.get();
+        assert_eq!(
+            texts(with_values_assigned(
+                &inner_read.commands[0].words[1],
+                &inner
+            )),
+            Some(vec![long])
+        );
+        assert!(outer.read.get() > before, "counted on the outermost line");
+        assert_eq!(inner.read.get(), 0);
+        assert!(!outer.pays(usize::MAX));
+        assert!(inner.ran_out());
+    }
+
+    /// The lines a command's words spell once the values of their names are
+    /// read in: only where a value holds a blank, only the spellings that
+    /// hold one and touch the guard, each with the words after it. A line
+    /// that has read all it is given has no answer.
+    ///
+    /// FAILS ON REVERT: answer with no lines where the reading ran out
+    /// (`Spelled::TooMany if assigned.ran_out()` left out) and the fourth
+    /// line is read as spelling nothing.
+    #[test]
+    fn the_command_lines_a_word_spells_are_the_ones_that_touch_the_guard() {
+        let spelled = |line: &str, read_out: bool| {
+            let read = crate::shell_words::read_line(line);
+            let assigned = values_assigned(&read, line.len(), None);
+            if read_out {
+                assert!(!assigned.pays(usize::MAX));
+            }
+            command_lines_spelled(&read.commands.last().expect("a command").words, &assigned)
+        };
+        let lines = |texts: &[&str]| {
+            Some(
+                texts
+                    .iter()
+                    .map(|text| (*text).to_string())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let blank = "X=q; X=\"warden dry\"; C=\"inner${X}-run\"; $C now";
+        assert_eq!(spelled(blank, false), lines(&["innerwarden dry-run now"]));
+        // A blank in a value that touches nothing of the guard.
+        assert_eq!(
+            spelled("CMD=make; CMD+=\" -j4\"; $CMD all", false),
+            lines(&[])
+        );
+        // No value holds a blank: no word is two.
+        let no_blank = "A=inner; B=${A}warden; $B status";
+        assert_eq!(spelled(no_blank, false), lines(&[]));
+        // Read out: not known.
+        assert_eq!(spelled(blank, true), None);
+        // Read out with no blank in a value: still no word is two.
+        assert_eq!(spelled(no_blank, true), lines(&[]));
     }
 
     /// A command nested past the levels followed is not read, and the ones
@@ -17872,8 +18626,9 @@ mod redirect_fallback_tests {
 #[cfg(test)]
 mod guard_words_found_tests {
     use super::{
-        guard_words_found, guard_words_in, guard_words_in_afresh, guard_words_refusal, Looks,
-        EXEC_GATE_AUTHORISED, GUARD_DISARMED, KERNEL_PROTECTION_CHANGE,
+        check_guard_self_disable, guard_words_found, guard_words_in, guard_words_in_afresh,
+        guard_words_refusal, Looks, EXEC_GATE_AUTHORISED, GUARD_DISARMED, GUARD_LOOSENING_VERB,
+        KERNEL_PROTECTION_CHANGE, LINE_NOT_READ,
     };
 
     /// A command for each look, for two looks at once, and for none.
@@ -18004,9 +18759,12 @@ mod guard_words_found_tests {
                         "{look:?} alone later={later} runs={runs} {text:?}"
                     );
                     let alone = Looks::only(look);
+                    // The looks alone: a note of why the kernel look is set
+                    // goes with that look, so it is not there once the
+                    // look is left out.
                     assert_eq!(
-                        guard_words_found(&text, 0, later, runs, Looks::ALL.without(alone)),
-                        all.without(alone),
+                        guard_words_found(&text, 0, later, runs, Looks::ALL.without(alone)).looks(),
+                        all.without(alone).looks(),
                         "{look:?} left out later={later} runs={runs} {text:?}"
                     );
                 }
@@ -18041,5 +18799,45 @@ mod guard_words_found_tests {
             assert_eq!(guard_words_refusal(&line), Some((what, 60)), "{line}");
         }
         assert_eq!(guard_words_refusal("innerwarden status"), None);
+    }
+
+    /// The kernel look is also set for a line spelled from values that runs
+    /// one of the guard's loosening verbs, and for a line that cost more to
+    /// read than it is given. The refusal says which: the first names the
+    /// verb, the second says how to write the line so that it is read, since
+    /// it may lower nothing.
+    ///
+    /// FAILS ON REVERT: leave either note unasked in `guard_words_refusal`
+    /// and the line is refused as a change of the kernel protection, which
+    /// it does not name.
+    #[test]
+    fn a_refusal_for_what_was_spelled_or_not_read_says_so() {
+        let spelled = "X=q; X=\"warden dry\"; C=\"inner${X}-run\"; $C";
+        assert_eq!(
+            guard_words_refusal(spelled),
+            Some((GUARD_LOOSENING_VERB, 60))
+        );
+
+        let costly = format!("v='{}'; {}", "x".repeat(4000), "true $v; ".repeat(40));
+        let lowering = format!("{costly}{spelled}");
+        let harmless = format!("{costly}X=q; X=\"a b\"; echo $X");
+        for line in [&lowering, &harmless] {
+            assert_eq!(guard_words_refusal(line), Some((LINE_NOT_READ, 60)));
+            assert_eq!(
+                check_guard_self_disable(line),
+                Some((LINE_NOT_READ, 60)),
+                "{} bytes",
+                line.len()
+            );
+        }
+
+        // The same text with no value that holds a blank is two words to no
+        // shell: nothing of it is left unread.
+        assert_eq!(guard_words_refusal(costly.trim_end_matches("; ")), None);
+        let kernel = "innerwarden-ctl agent kernel claude-code off";
+        assert_eq!(
+            guard_words_refusal(kernel),
+            Some((KERNEL_PROTECTION_CHANGE, 60))
+        );
     }
 }
