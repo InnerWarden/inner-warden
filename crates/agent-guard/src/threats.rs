@@ -8181,6 +8181,22 @@ pub fn check_protected_read(cmd: &str, protected: &[String]) -> Option<String> {
     None
 }
 
+/// The indicators of [`REVERSE_SHELL_INDICATORS`] that are netcat's name and
+/// its exec flag. They count where the name starts a word: `rsync -e "ssh -p
+/// 2222"` ends in the letters of `nc -e` and copies files.
+const NETCAT_EXEC_INDICATORS: &[&str] = &["nc -e", "ncat -e", "netcat -e"];
+
+/// True when `text` holds `name_and_flag` at the start of a word: at the start
+/// of the text, or after a byte that is not a letter or a digit.
+fn holds_at_a_word_start(text: &str, name_and_flag: &str) -> bool {
+    text.match_indices(name_and_flag).any(|(at, _)| {
+        !text[..at]
+            .bytes()
+            .next_back()
+            .is_some_and(|before| before.is_ascii_alphanumeric())
+    })
+}
+
 /// Check for reverse shell indicators. Returns (indicator, score).
 ///
 /// Two tiers, because "creates a socket" and "creates a socket wired to a shell"
@@ -8191,7 +8207,13 @@ pub fn check_protected_read(cmd: &str, protected: &[String]) -> Option<String> {
 pub fn check_reverse_shell(content: &str) -> Option<(&'static str, u32)> {
     let lower = content.to_ascii_lowercase();
     // Unambiguous signatures: these mean shell-over-socket on their own.
-    if let Some(i) = REVERSE_SHELL_INDICATORS.iter().find(|i| lower.contains(*i)) {
+    if let Some(i) = REVERSE_SHELL_INDICATORS.iter().find(|i| {
+        if NETCAT_EXEC_INDICATORS.contains(i) {
+            holds_at_a_word_start(&lower, i)
+        } else {
+            lower.contains(*i)
+        }
+    }) {
         return Some((*i, 60));
     }
     // A socket primitive only counts once something wires it to a shell.
@@ -16905,6 +16927,49 @@ mod round_three_rule_tests {
             "ssh -L 5432:localhost:5432 deploy@10.0.0.5",
         ] {
             assert!(check_reverse_shell(cmd).is_none(), "ordinary work: {cmd}");
+        }
+    }
+
+    /// `rsync -e "ssh -p 2222"` ends in the letters of `nc -e` and copies
+    /// files. Netcat's exec flag counts where the name starts a word, however
+    /// the program is reached.
+    ///
+    /// FAILS ON REVERT: with the indicator matched anywhere in the text the
+    /// rsync, fsync and func lines are refused as reverse shells; with it
+    /// matched at the start of the text only, the forms behind a path, a
+    /// separator or another program pass.
+    #[test]
+    fn a_netcat_exec_flag_counts_where_the_name_starts_a_word() {
+        for cmd in [
+            "rsync -e \"ssh -p 2222\" -a docs/ host:/srv/docs/",
+            "rsync -e ssh -a docs/ host:/srv/docs/",
+            "fsync -e data.bin",
+            "func -e x",
+            "truncat -e x",
+            "internetcat -e x",
+            "h2nc -e x",
+        ] {
+            assert!(check_reverse_shell(cmd).is_none(), "not netcat: {cmd}");
+        }
+        // The program handed to `-e` is not a shell here, so the name and its
+        // flag are the only indicator the line holds.
+        for cmd in [
+            "nc -e /opt/tool 198.51.100.13 443",
+            "/usr/bin/nc -e /opt/tool 198.51.100.13 443",
+            "sudo nc -e /opt/tool 198.51.100.13 443",
+            "cd /tmp;nc -e /opt/tool 198.51.100.13 443",
+            "true|nc -e /opt/tool 198.51.100.13 443",
+            "(nc -e /opt/tool 198.51.100.13 443)",
+            "\"\"nc -e /opt/tool 198.51.100.13 443",
+            "my-nc -e /opt/tool 198.51.100.13 443",
+            "ncat -e /opt/tool 198.51.100.13 443",
+            "/usr/bin/ncat -e /opt/tool 198.51.100.13 443",
+            "netcat -e /opt/tool 198.51.100.13 443",
+            "x=1 netcat -e /opt/tool 198.51.100.13 443",
+            "rsync -e ssh a host:b; nc -e /opt/tool 198.51.100.13 443",
+        ] {
+            let hit = check_reverse_shell(cmd);
+            assert_eq!(hit.map(|(_, score)| score), Some(60), "{cmd}");
         }
     }
 

