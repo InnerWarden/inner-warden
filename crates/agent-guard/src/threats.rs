@@ -830,10 +830,13 @@ fn check_guard_self_disable_read(content: &str) -> Option<(&'static str, u32)> {
 /// protection ([`changes_kernel_protection`]).
 const KERNEL_PROTECTION_CHANGE: &str = "changes the kernel protection that contains it";
 
-/// What [`check_guard_self_disable`] says of the guard's `exec-gate` run to
-/// authorise or disarm.
+/// What [`check_guard_self_disable`] says of a kernel guard lowered by the
+/// guard's own programs ([`Look::ExecGate`]): a program authorised on the
+/// exec gate, a guard disarmed, a path taken out of its care, its scope
+/// cleared, its mode set.
 const EXEC_GATE_AUTHORISED: &str =
-    "authorises or disarms the kernel execution gate that is containing it";
+    "authorises a program on the kernel execution gate that is containing it, or lowers \
+     one of the kernel guards beside it";
 
 /// What [`check_guard_self_disable`] says of the guard's `disarm` and its
 /// `--self-approve`.
@@ -1012,9 +1015,16 @@ fn guard_self_disable_in(content: &str) -> Option<(&'static str, u32)> {
 const KERNEL_PROTECTION_READS: &[&str] = &["status", "--technical", "--json", "--help", "-h"];
 
 /// The names the guard's programs run as: the Community CLI, Active
-/// Defence's ctl, and the short names the installer lays beside the CLI
-/// (copies of it, which take its verbs).
-const GUARD_PROGRAMS: &[&str] = &["innerwarden", "innerwarden-ctl", "iw", "iw-guard"];
+/// Defence's ctl and its signing tool (which keeps the kernel guards'
+/// lists), and the short names the installer lays beside the CLI (copies of
+/// it, which take its verbs).
+const GUARD_PROGRAMS: &[&str] = &[
+    "innerwarden",
+    "innerwarden-ctl",
+    "innerwarden-config-sign",
+    "iw",
+    "iw-guard",
+];
 
 /// Programs that run another with words of their own added (from their
 /// input, a list or a file): what that program gets is more than the text
@@ -1072,8 +1082,10 @@ fn changes_kernel_protection(content: &str) -> bool {
 enum Look {
     /// A change of the kernel protection ([`changes_kernel_protection`]).
     Kernel,
-    /// The guard's `exec-gate`, run to authorise or disarm the kernel
-    /// execution gate.
+    /// A kernel guard named to a guard program ([`words_after::KERNEL_GUARDS`])
+    /// and lowered: a program authorised on the exec gate, a guard
+    /// disarmed, a path taken out of its care, its scope cleared, a verb
+    /// the text does not show; or the signing tool's `lsm`, applied.
     ExecGate,
     /// The guard's `disarm`, or its `--self-approve`.
     Disarm,
@@ -1108,16 +1120,28 @@ impl Look {
             (Look::Kernel, GuardProgram::Not) => {
                 runs && !later && guard_verbs_after_any_program(arguments)
             }
-            (Look::ExecGate, GuardProgram::Is | GuardProgram::Maybe) => arguments
-                .iter()
-                .position(|word| says(word, "exec-gate"))
-                .is_some_and(|gate| {
-                    arguments[gate + 1..].iter().any(|word| {
-                        ["allow", "approve", "disarm"]
-                            .iter()
-                            .any(|verb| says(word, verb))
-                    })
-                }),
+            (Look::ExecGate, GuardProgram::Is) => {
+                kernel_guard_lowered(arguments, fed)
+                    || verb_among(arguments, |word| says(word, "lsm"))
+                        .ok()
+                        .filter(|&lsm| says(&arguments[lsm], "lsm"))
+                        .is_some_and(|lsm| {
+                            fed || arguments[lsm + 1..]
+                                .iter()
+                                .any(|word| says(word, "--apply") || !word.is_plain())
+                        })
+            }
+            (Look::ExecGate, GuardProgram::Maybe) => {
+                kernel_guard_lowered(arguments, fed)
+                    || verb_among(arguments, |word| says(word, "lsm"))
+                        .ok()
+                        .filter(|&lsm| says(&arguments[lsm], "lsm"))
+                        .is_some_and(|lsm| {
+                            arguments[lsm + 1..]
+                                .iter()
+                                .any(|word| says(word, "--apply"))
+                        })
+            }
             (Look::Disarm, GuardProgram::Is) => arguments
                 .iter()
                 .any(|word| says(word, "disarm") || says(word, "--self-approve")),
@@ -1542,6 +1566,75 @@ fn guard_program(
         }
     }
     found
+}
+
+/// The search for the word where a kernel guard's verb is: the first word
+/// that is not an option, nor may be the value of one. `Ok`: the place of
+/// that word, or of the first word `taken` takes wherever it stands;
+/// `Err(true)`: a word the text does not show whole came first;
+/// `Err(false)`: the words ended.
+///
+/// Read afresh for each word ([`Look::found`]): kept for the test that
+/// holds [`words_after`] to the same answers.
+#[cfg(test)]
+fn verb_among(
+    words: &[crate::shell_words::Word],
+    taken: impl Fn(&crate::shell_words::Word) -> bool,
+) -> Result<usize, bool> {
+    let mut may_be_a_value = false;
+    for (at, word) in words.iter().enumerate() {
+        if !word.is_plain() {
+            return Err(true);
+        }
+        if taken(word) {
+            return Ok(at);
+        }
+        if word.text.len() > 1 && word.text.starts_with('-') {
+            may_be_a_value = !word.text.contains('=');
+        } else if may_be_a_value {
+            may_be_a_value = false;
+        } else {
+            return Ok(at);
+        }
+    }
+    Err(false)
+}
+
+/// The words of a guard program's command line: whether they name a kernel
+/// guard and lower it. `fed`: a program before it adds words of its own,
+/// which come last.
+///
+/// Read afresh for each word ([`Look::found`]): kept for the test that
+/// holds [`words_after`] to the same answers.
+#[cfg(test)]
+fn kernel_guard_lowered(arguments: &[crate::shell_words::Word], fed: bool) -> bool {
+    let says = |word: &crate::shell_words::Word, verb: &str| {
+        word.is_plain() && word.text.eq_ignore_ascii_case(verb)
+    };
+    arguments.iter().enumerate().any(|(guard, word)| {
+        if !words_after::KERNEL_GUARDS
+            .iter()
+            .any(|name| says(word, name))
+        {
+            return false;
+        }
+        let rest = &arguments[guard + 1..];
+        let said = |verb: &str| rest.iter().position(|word| says(word, verb));
+        let verb_at = verb_among(rest, |_| false);
+        rest.iter().any(|word| {
+            words_after::KERNEL_GUARD_VERBS
+                .iter()
+                .any(|verb| says(word, verb))
+        }) || said("scope-agent")
+            .is_some_and(|scope| rest[scope + 1..].iter().any(|word| says(word, "--clear")))
+            || said("arm").is_some_and(|arm| {
+                (arm + 1..rest.len())
+                    .any(|at| words_after::widens_arm(&rest[at], Some(&rest[at - 1])))
+            })
+            || verb_at == Err(true)
+            || fed
+                && (said("arm").is_some() || said("scope-agent").is_some() || verb_at == Err(false))
+    })
 }
 
 /// The words of a guard program's command line: whether they change the
