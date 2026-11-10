@@ -6,7 +6,7 @@ use super::super::{
     GUARD_VERB_HEADS, SHELLS,
 };
 use super::lexer::{Command, Lexed, Lexer, Word, EXPANSION};
-use super::tokens::guard_tokens;
+use super::tokens::{guard_letters, guard_tokens};
 
 const MAX_DEPTH: usize = 6;
 const KEYWORDS: &[&str] = &[
@@ -261,11 +261,15 @@ struct Head {
     launched: bool,
     /// `xargs` or `parallel` stands before it: its input adds arguments.
     fed: bool,
+    /// The string that launcher puts a line of its input in place of, when
+    /// an option names one (`-I@`).
+    replace: Option<String>,
 }
 
 fn command_index(words: &[Word]) -> Head {
     let mut k = 0;
     let (mut launched, mut fed) = (false, false);
+    let mut replace = None;
     while let Some(word) = words.get(k) {
         if is_assignment(word) && !word.lit.starts_with(EXPANSION) {
             k += 1;
@@ -297,6 +301,9 @@ fn command_index(words: &[Word]) -> Head {
             let lit = next.lit.as_str();
             if lit.starts_with('-') && lit.len() > 1 && !next.dynamic() {
                 k += 1;
+                if base == "xargs" || base == "parallel" {
+                    replace = replace_string(lit, words.get(k)).or(replace);
+                }
                 if valued.contains(&lit) {
                     k += 1;
                 }
@@ -314,7 +321,22 @@ fn command_index(words: &[Word]) -> Head {
         at: k,
         launched,
         fed,
+        replace,
     }
+}
+
+/// The string an option of `xargs` or `parallel` names to be replaced with a
+/// line of the input: `-I R`, `-IR`, `-iR`, `--replace=R`.
+fn replace_string(option: &str, next: Option<&Word>) -> Option<String> {
+    let named = if option == "-I" {
+        next.map(|w| w.lit.as_str())?
+    } else {
+        option
+            .strip_prefix("-I")
+            .or_else(|| option.strip_prefix("-i"))
+            .or_else(|| option.strip_prefix("--replace="))?
+    };
+    (!named.is_empty()).then(|| named.to_string())
 }
 
 /// The options after `command` hold `-v` or `-V`: it prints where each name
@@ -330,16 +352,31 @@ fn lits(words: &[Word]) -> Vec<String> {
     words.iter().map(|w| w.lit.clone()).collect()
 }
 
-/// The words spelled out after a command word that is not, read as the
-/// arguments of a guard CLI, lower it. A word that is not spelled out may be
-/// empty when the line runs, so it is left out of the reading.
+/// The words after a command word that is not spelled out, read as the
+/// arguments of a guard CLI, lower it. A word among them that is not spelled
+/// out may be empty when the line runs, or an operand, so they are read both
+/// ways: without it, and with what is spelled of it.
 fn spells_lowering(arguments: &[Word]) -> bool {
-    let spelled: Vec<String> = arguments
+    let unspelled = |w: &Word| w.dynamic() || w.lit.contains(EXPANSION);
+    let without: Vec<String> = arguments
         .iter()
-        .filter(|w| !w.dynamic() && !w.lit.contains(EXPANSION))
+        .filter(|w| !unspelled(w))
         .map(|w| w.lit.clone())
         .collect();
-    loosens("innerwarden", &spelled) || loosens("innerwarden-ctl", &spelled)
+    let with: Vec<String> = arguments
+        .iter()
+        .map(|w| {
+            let spelled: String = w.lit.chars().filter(|c| *c != EXPANSION).collect();
+            if spelled.is_empty() {
+                "x".to_string()
+            } else {
+                spelled
+            }
+        })
+        .collect();
+    [without, with]
+        .iter()
+        .any(|read| loosens("innerwarden", read) || loosens("innerwarden-ctl", read))
 }
 
 fn loosens(name: &str, arguments: &[String]) -> bool {
@@ -401,6 +438,11 @@ fn shell_arguments(args: &[Word]) -> ShellArgs<'_> {
     let mut j = 0;
     while let Some(arg) = args.get(j) {
         let lit = arg.lit.as_str();
+        if !arg.dynamic() && lit == "-" {
+            // A lone `-` ends the options, as `--` does.
+            j += 1;
+            break;
+        }
         if arg.dynamic() || lit.len() < 2 || !(lit.starts_with('-') || lit.starts_with('+')) {
             break;
         }
@@ -754,14 +796,35 @@ fn code_strings(words: &[Word], head: &Head) -> Vec<(String, bool, bool)> {
     found
 }
 
+/// The keywords of `ssh -o` whose value is a command that ssh runs.
+const SSH_COMMAND_KEYS: &[&str] = &[
+    "proxycommand",
+    "localcommand",
+    "remotecommand",
+    "knownhostscommand",
+];
+
+/// The command a `-o` value sets, when its keyword takes a command or is
+/// not spelled out. ssh reads `Key=value`, `Key value` and `Key = value`,
+/// the keyword in any case.
+fn ssh_option_command(value: &str) -> Option<&str> {
+    let value = value.trim_start();
+    let end = value.find(|c: char| c == '=' || c.is_whitespace())?;
+    let key = value[..end].to_ascii_lowercase();
+    if !key.contains(EXPANSION) && !SSH_COMMAND_KEYS.contains(&key.as_str()) {
+        return None;
+    }
+    let rest = value[end..].trim_start();
+    Some(rest.strip_prefix('=').unwrap_or(rest).trim_start())
+}
+
 /// The options of `ssh` that take a value, as its option reading has them.
 const SSH_VALUED: &str = "BbcDEeFIiJLlmOoPpQRSWw";
 
 /// The words `ssh` hands the far shell as its command: what stands after the
 /// options and the host. An option's value is not the host (`-p 2222 web1`),
 /// and options may stand after the host as well. The value of a `-o` is
-/// pushed as code when it sets something: several of them name a command
-/// that ssh runs (`ProxyCommand`, `LocalCommand`, `RemoteCommand`).
+/// pushed as code when its keyword names a command that ssh runs.
 fn ssh_command<'a>(args: &'a [Word], found: &mut Vec<(String, bool, bool)>) -> &'a [Word] {
     let mut options = true;
     let mut host = false;
@@ -789,8 +852,8 @@ fn ssh_command<'a>(args: &'a [Word], found: &mut Vec<(String, bool, bool)>) -> &
                 attached
             };
             if letters.as_bytes()[at] == b'o' {
-                if let Some((_, set)) = value.split_once(['=', ' ']) {
-                    found.push((set.to_string(), false, false));
+                if let Some(run) = ssh_option_command(value) {
+                    found.push((run.to_string(), false, false));
                 }
             }
             continue;
@@ -830,6 +893,9 @@ struct Judge {
     /// A guard verb stands in the text of a substitution read so far: what
     /// it prints may be the whole lowering, name and all.
     built: bool,
+    /// The guard's letters stand in the text, inside a longer word as well:
+    /// the shell can cut that word down to the name.
+    letters: bool,
 }
 
 type Deny = Option<String>;
@@ -935,8 +1001,10 @@ impl Judge {
         // limits), so here an expansion is in doubt only where the words
         // spelled out after a command word lower the guard. A verb in the
         // text of a substitution is another matter: the command that prints
-        // it is on the line, and it may print the name beside it.
-        let nameless = !self.name && !self.raw && !self.built;
+        // it is on the line, and it may print the name beside it. So is a
+        // longer word that holds the guard's letters (`innerwarden/`): an
+        // expansion cuts it down to the name (`${X%/}`).
+        let nameless = !self.name && !self.raw && !self.built && !self.letters;
         let mut runs_input = feeds;
         'direct: {
             if self.raw_only {
@@ -988,7 +1056,13 @@ impl Judge {
                     if cmd.glob && cmd.lit.contains('{') {
                         return deny("brace-command");
                     }
-                    if head.fed && cmd.lit.contains("{}") {
+                    if head.fed
+                        && (cmd.lit.contains("{}")
+                            || head
+                                .replace
+                                .as_deref()
+                                .is_some_and(|named| cmd.lit.contains(named)))
+                    {
                         return deny("dynamic-command");
                     }
                     if base.contains(EXPANSION) && (!nameless || spells_lowering(args)) {
@@ -1231,6 +1305,7 @@ pub(super) fn judge(text: &[u8], flat: bool) -> Option<String> {
         raw,
         raw_only,
         built: false,
+        letters: guard_letters(text),
     };
     judge.context(&lexed, 0)
 }

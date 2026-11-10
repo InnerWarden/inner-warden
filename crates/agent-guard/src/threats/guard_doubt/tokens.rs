@@ -305,6 +305,34 @@ fn without_empty_substitutions(text: &[u8]) -> Option<Vec<u8>> {
     changed.then_some(out)
 }
 
+/// The guard's letters stand in the line, inside a longer word as well
+/// (`innerwarden/`, `innerwardenZ`, `_innerwarden`): `innerwarden` anywhere,
+/// or `iw` with no letter or digit on either side and no dash before it
+/// (`/opt/iw/`, not `grep -iw` or `kiwi`). The shell can cut such a word
+/// down to the name (`${X%/}`), so a line that holds it is not one that
+/// leaves the guard's name out.
+pub fn guard_letters(text: &[u8]) -> bool {
+    fn holds(reading: &[u8]) -> bool {
+        let low = reading.to_ascii_lowercase();
+        low.windows(11).any(|w| w == b"innerwarden")
+            || low.windows(2).enumerate().any(|(at, w)| {
+                w == b"iw"
+                    && !low[..at]
+                        .last()
+                        .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'-')
+                    && !low.get(at + 2).is_some_and(|b| b.is_ascii_alphanumeric())
+            })
+    }
+    let read = |text: &[u8]| {
+        let (mut kept, mut joined, mut tail) = (Vec::new(), Vec::new(), Vec::new());
+        readings(text, 0, &mut kept, &mut joined, &mut tail);
+        holds(&kept) || holds(&joined) || holds(&tail)
+    };
+    holds(text)
+        || read(text)
+        || without_empty_substitutions(text).is_some_and(|spliced| read(&spliced))
+}
+
 /// (a guard CLI name is a token of the line, a guard-lowering verb is).
 /// `extra`: more bytes that split words (an `IFS` the line sets).
 pub fn guard_tokens(text: &[u8], extra: &[u8]) -> (bool, bool) {

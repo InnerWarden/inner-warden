@@ -3633,6 +3633,10 @@ enum CurlDataValue {
     Literal,
 }
 
+/// The short options of `curl` that take a value. In a cluster the first of
+/// them takes the rest of the word (`-sSo FILE`, `-ofile`, `-d@body`).
+const CURL_VALUED_FLAGS: &str = "AbcCdDeEFHKmoPQrtTuUwxXyYz";
+
 fn safe_curl_data_arguments<'tree>(
     arguments: &[tree_sitter::Node<'tree>],
     source: &[u8],
@@ -3680,14 +3684,16 @@ fn safe_curl_data_arguments<'tree>(
             continue;
         }
 
-        // curl short options may be clustered; an option that consumes a value
-        // must be last, so everything after `d` is the data argument.
+        // curl short options may be clustered; the first one that takes a
+        // value ends the cluster, and the rest of the word is its value. Only
+        // where that one is `d` is the rest the data argument: the `d` in
+        // `-o$HOME/.claude/settings.json` is a letter of the file's name.
         if let Some(flags) = text
             .strip_prefix('-')
             .filter(|flags| !flags.starts_with('-'))
         {
-            if let Some(position) = flags.find('d') {
-                let value = &flags[position + 1..];
+            let valued = flags.find(|c: char| CURL_VALUED_FLAGS.contains(c));
+            if let Some(value) = valued.and_then(|at| flags[at..].strip_prefix('d')) {
                 if value.is_empty() {
                     expected = Some(CurlDataValue::AtFile);
                 } else if !curl_data_value_reads_sensitive_file(value, CurlDataValue::AtFile) {

@@ -214,6 +214,148 @@ mod tests {
         }
     }
 
+    /// The guard's letters inside a longer word count as its name being on
+    /// the line: an expansion cuts `innerwarden/` or `innerwardenZ` down to
+    /// the name, so such a line is not judged as one that leaves the name
+    /// out. The price is the last list: a folder that holds the letters,
+    /// beside a verb and a program run from a variable.
+    ///
+    /// FAILS ON REVERT: take `letters` out of `nameless` and the first and
+    /// the last list are let through; count `iw` inside any word (`-iw`,
+    /// `kiwi`) and the second list is refused.
+    #[test]
+    fn the_guards_letters_inside_a_longer_word_keep_the_line_strict() {
+        for line in [
+            r#"X=/usr/local/bin/innerwarden/; set -- allow x; ${X%/} "$@""#,
+            "X=/usr/local/bin/innerwarden/; ${X%/} {allow,x}",
+            r#"X=innerwardenZ; set -- allow x; ${X%Z} "$@""#,
+            r#"X=/opt/iw/; set -- dry-run; ${X%/} "$@""#,
+        ] {
+            assert!(unread_beside_guard_word(line), "{line}");
+            assert!(engine_refuses(line), "{line}");
+        }
+        for line in [
+            "$PAGER -iw notes.txt; ufw allow 22",
+            "$FRUIT kiwi; ufw allow 22",
+            r#"$RUNNER "$@"; ufw allow 22"#,
+        ] {
+            assert!(!unread_beside_guard_word(line), "{line}");
+            assert!(!engine_refuses(line), "{line}");
+        }
+        let line =
+            r#"cd ~/src/innerwarden/ && $EDITOR notes.md && git commit -m "allow empty names""#;
+        assert!(unread_beside_guard_word(line), "{line}");
+        assert!(engine_refuses(line), "{line}");
+    }
+
+    /// A word after the command word that is not spelled out may be empty
+    /// when the line runs, or an operand: the words are read both ways.
+    ///
+    /// FAILS ON REVERT: read the words only without those that are not
+    /// spelled out and the first list is let through.
+    #[test]
+    fn an_argument_that_is_not_spelled_out_is_read_as_an_operand_too() {
+        for line in [
+            "$X allow y$Z",
+            r#"$X "dry-run$Z""#,
+            r#"$X allow "$RULE""#,
+            "$X allow *",
+        ] {
+            assert!(unread_beside_guard_word(line), "{line}");
+            assert!(engine_refuses(line), "{line}");
+        }
+        for line in [
+            r#"$RUNNER "$@"; ufw allow 22"#,
+            r#""$PM" install "$PKG" && ufw allow 22"#,
+            r#"$RUNNER "$TARGET" --verbose; ufw allow 22"#,
+        ] {
+            assert!(!unread_beside_guard_word(line), "{line}");
+            assert!(!engine_refuses(line), "{line}");
+        }
+    }
+
+    /// The value of an `ssh -o` is read as a command only when its keyword
+    /// names one that ssh runs, however the keyword and the value are joined
+    /// (`Key=value`, `Key value`, `Key = value`).
+    ///
+    /// FAILS ON REVERT: push the value of every `-o` as code and the second
+    /// list is refused; cut the value at its first `=` or space only and the
+    /// first list is let through.
+    #[test]
+    fn ssh_o_is_code_only_where_its_keyword_names_a_command() {
+        for line in [
+            "ssh web1 -o 'ProxyCommand = $X allow y'",
+            "ssh -o 'ProxyCommand\t$X allow y' web1 true",
+            "ssh -o 'proxycommand  =  $X allow y' web1 true",
+            "ssh -o 'LocalCommand = $X dry-run' -o PermitLocalCommand=yes web1 true",
+        ] {
+            assert!(unread_beside_guard_word(line), "{line}");
+            assert!(engine_refuses(line), "{line}");
+        }
+        for line in [
+            "ssh -o ConnectTimeout=$TIMEOUT -o BatchMode=yes web1 'innerwarden status'",
+            "ssh -o IdentityAgent=$SSH_AUTH_SOCK web1 'innerwarden status'",
+            "ssh -o User=$DEPLOY_USER -o Port=$PORT web1 innerwarden status",
+            "ssh -o IdentityFile=$KEY -o ProxyJump=$BASTION web1 'innerwarden doctor'",
+        ] {
+            assert!(!unread_beside_guard_word(line), "{line}");
+            assert!(!engine_refuses(line), "{line}");
+        }
+    }
+
+    /// `xargs` and `parallel` put a line of their input where the string of
+    /// `-I` stands, whatever that string is: a command word that holds it is
+    /// what the input says.
+    ///
+    /// FAILS ON REVERT: look for `{}` only and the first list is let
+    /// through.
+    #[test]
+    fn a_command_word_that_holds_the_replace_string_is_the_inputs() {
+        for line in [
+            "command -v innerwarden | xargs -I@ @ uninstall",
+            "command -v innerwarden | xargs --replace=@ @ uninstall",
+            "which innerwarden | xargs -IR R allow x",
+            "which innerwarden | xargs -I R R allow x",
+            "which innerwarden | parallel -I @ @ allow x",
+        ] {
+            assert!(unread_beside_guard_word(line), "{line}");
+            assert!(engine_refuses(line), "{line}");
+        }
+        for line in [
+            "innerwarden agents list | xargs -I@ echo agent: @",
+            "ls docs | xargs -I@ grep -c innerwarden docs/@",
+        ] {
+            assert!(!unread_beside_guard_word(line), "{line}");
+            assert!(!engine_refuses(line), "{line}");
+        }
+    }
+
+    /// A lone `-` ends a shell's options as `--` does: the code of `-c` is
+    /// the word after it.
+    ///
+    /// FAILS ON REVERT: stop at the `-` without stepping over it and the `-`
+    /// is read as the code: the lines are let through.
+    #[test]
+    fn a_lone_dash_before_the_code_of_a_shell_is_stepped_over() {
+        for line in [
+            "sh -c - 'innerwarden allow x'",
+            "rbash -c - 'innerwarden allow x'",
+            "bash -c -- 'innerwarden allow x'",
+        ] {
+            assert!(unread_beside_guard_word(line), "{line}");
+            assert!(engine_refuses(line), "{line}");
+        }
+        let words = |line: &str| -> Vec<String> { line.split(' ').map(str::to_string).collect() };
+        assert_eq!(
+            super::super::command_string_argument("sh", &words("-c - code")),
+            Some("code")
+        );
+        assert_eq!(
+            super::super::command_string_argument("su", &words("-c - deploy")),
+            Some("-")
+        );
+    }
+
     /// What `ssh` hands the far shell stands after its options and the host.
     /// The value of an option is not the host, and a host that is not
     /// spelled out is not a command.
