@@ -3,7 +3,7 @@
 All notable changes to InnerWarden are documented here. This project
 follows semantic versioning.
 
-## 1.6.12 - 2026-11-10
+## 1.6.12 - 2026-11-11
 
 A correction first. 1.6.6 said "An agent can no longer lower the guard that
 screens it". That was not true as written: the guard reads the text of one
