@@ -36,6 +36,7 @@ mod first_run;
 mod graph_io;
 mod help;
 mod hook_identity;
+mod hook_net;
 mod host_decide;
 mod host_decide_io;
 mod http_io;
@@ -875,6 +876,11 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
     // day-to-day commands. Overrides --block-review.
     let monitor = rest.iter().any(|a| a == "--monitor");
     install_hook_panic_guard(monitor);
+    // Before stdin is read: a caller that never closes it is one of the
+    // ends the net is for.
+    if let Err(why) = hook_net::arm(monitor) {
+        return hook_unreadable(why, monitor);
+    }
 
     let mut buf = String::new();
     if std::io::stdin().read_to_string(&mut buf).is_err() {
