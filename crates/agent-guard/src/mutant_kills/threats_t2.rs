@@ -3,6 +3,14 @@
 
 use super::*;
 
+/// The reading alone, started `depth` command strings in. Since 1.6.12
+/// `runs_guard_loosening_verb` also refuses a line that names the guard when
+/// its reading was cut short; the tests here are about what the reading
+/// itself reaches.
+fn reads_a_loosening_verb(content: &str, depth: u8) -> bool {
+    runs_guard_loosening_verb_in(content, depth, &ReadingBudget::for_line(content))
+}
+
 /// A word's characters with the marks the shell reader gives a brace
 /// expansion in the middle of a word: `{`, `}` and `,` are pattern
 /// characters, everything else is handed to the program as written.
@@ -95,7 +103,10 @@ fn an_expansion_that_runs_a_guard_program_by_name_is_the_guard() {
     let line = crate::shell_words::read_line("$(command -v innerwarden-ctl) agent kernel off");
     let word = &line.commands[0].words[0];
     assert!(
-        matches!(guard_program(word, &[], &[]), GuardProgram::Is),
+        matches!(
+            guard_program(word, &GuardNames::new(), &ValuesAssigned::new()),
+            GuardProgram::Is
+        ),
         "a substitution that runs innerwarden-ctl by name must be taken for the guard \
          program itself, not a maybe: {}",
         word.text
@@ -160,15 +171,15 @@ fn a_brace_list_in_a_program_name_reads_as_its_alternatives() {
 /// in: `innerwarden dry-run` handed to a shell three levels deep is read at
 /// depth four and still refused. Only text deeper than that is left unread.
 ///
-/// FAILS ON REVERT: replace > with == in runs_guard_loosening_verb.
+/// FAILS ON REVERT: replace > with == in runs_guard_loosening_verb_in.
 #[test]
 fn a_loosening_verb_at_the_deepest_level_read_is_still_caught() {
     assert!(
-        runs_guard_loosening_verb("innerwarden dry-run", 4),
+        reads_a_loosening_verb("innerwarden dry-run", 4),
         "depth four is the last level read, not a level skipped"
     );
     assert!(
-        runs_guard_loosening_verb("sh -c 'innerwarden dry-run'", 3),
+        reads_a_loosening_verb("sh -c 'innerwarden dry-run'", 3),
         "a shell at depth three hands its string to depth four, which is still read"
     );
 }
@@ -194,7 +205,7 @@ fn the_subcommand_after_an_end_of_options_or_an_option_with_its_value_decides() 
             "innerwarden agents --data-dir=/tmp/iw list",
         ]
         .iter()
-        .map(|cmd| runs_guard_loosening_verb(cmd, 0))
+        .map(|cmd| reads_a_loosening_verb(cmd, 0))
         .collect();
         let _ = done_tx.send(verdicts);
     });

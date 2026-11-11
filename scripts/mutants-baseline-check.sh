@@ -26,7 +26,7 @@
 # unseen, or hung.
 #
 # Exit 0 when every survivor is known, 1 when one is new (each is printed),
-# 2 on a usage error.
+# 2 on a usage error or when OUTDIR holds no report to check.
 set -euo pipefail
 
 key_of_mutant() {
@@ -70,6 +70,11 @@ fi
 baseline=${1:?baseline file}
 outdir=${2:?cargo-mutants output directory}
 [ -f "$baseline" ] || { echo "no baseline file: $baseline" >&2; exit 2; }
+# A sweep that left no report has not been checked: that is not "no survivor".
+[ -f "$outdir/missed.txt" ] || [ -f "$outdir/timeout.txt" ] || {
+  echo "no missed.txt and no timeout.txt in $outdir: the sweep left no report to check" >&2
+  exit 2
+}
 
 survivors=$(survivor_keys "$outdir" | cut -f1-3)
 known=$(grep -v -E '^\s*(#|$)' "$baseline" | cut -f1-3)

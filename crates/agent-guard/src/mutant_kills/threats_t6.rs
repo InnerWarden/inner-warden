@@ -4,6 +4,14 @@
 
 use super::*;
 
+/// The reading alone, started `depth` command strings in. Since 1.6.12
+/// `runs_guard_loosening_verb` also refuses a line that names the guard when
+/// its reading was cut short; the tests here are about what the reading
+/// itself reaches.
+fn reads_a_loosening_verb(content: &str, depth: u8) -> bool {
+    runs_guard_loosening_verb_in(content, depth, &ReadingBudget::for_line(content))
+}
+
 /// `sh -c` wrapped `levels` times around `inner`, each level quoting the one
 /// inside it the way a shell needs (`'` closed, escaped and reopened).
 fn nested_sh(inner: &str, levels: usize) -> String {
@@ -24,25 +32,25 @@ fn nested_sh(inner: &str, levels: usize) -> String {
 /// in this test rather than on a host).
 ///
 /// FAILS ON REVERT: replace `+` with `*` in the `depth + 1` handed to
-/// `runs_guard_loosening_verb` by the shell arm, or by the `eval` arm.
+/// `runs_guard_loosening_verb_in` by the shell arm, or by the `eval` arm.
 #[test]
 fn every_nested_command_string_counts_toward_the_depth_bound() {
     let verb = "innerwarden allow x";
     assert!(
-        runs_guard_loosening_verb(&nested_sh(verb, 4), 0),
+        reads_a_loosening_verb(&nested_sh(verb, 4), 0),
         "four nested `sh -c` levels are read through to the verb"
     );
     assert!(
-        !runs_guard_loosening_verb(&nested_sh(verb, 5), 0),
+        !reads_a_loosening_verb(&nested_sh(verb, 5), 0),
         "the fifth `sh -c` level is past the bound: each level must add one"
     );
     let evals = |levels: usize| format!("{}{verb}", "eval ".repeat(levels));
     assert!(
-        runs_guard_loosening_verb(&evals(4), 0),
+        reads_a_loosening_verb(&evals(4), 0),
         "four nested `eval` levels are read through to the verb"
     );
     assert!(
-        !runs_guard_loosening_verb(&evals(5), 0),
+        !reads_a_loosening_verb(&evals(5), 0),
         "the fifth `eval` level is past the bound: each level must add one"
     );
     for deep in [nested_sh(verb, 5), nested_sh(verb, 8), evals(5), evals(8)] {
@@ -64,15 +72,15 @@ fn every_nested_command_string_counts_toward_the_depth_bound() {
 #[test]
 fn only_a_package_manager_steps_over_exec_to_the_package_it_runs() {
     assert!(
-        !runs_guard_loosening_verb("echo exec innerwarden allow 'rm -rf *'", 0),
+        !reads_a_loosening_verb("echo exec innerwarden allow 'rm -rf *'", 0),
         "`echo` prints `exec` and the rest; nothing runs"
     );
     assert!(
-        runs_guard_loosening_verb("npm exec sh -c 'innerwarden allow x'", 0),
+        reads_a_loosening_verb("npm exec sh -c 'innerwarden allow x'", 0),
         "`npm exec sh -c ...` runs the shell, which runs the verb"
     );
     assert!(
-        runs_guard_loosening_verb("pnpm dlx sh -c 'innerwarden dry-run'", 0),
+        reads_a_loosening_verb("pnpm dlx sh -c 'innerwarden dry-run'", 0),
         "`pnpm dlx` runs the package that follows the same way"
     );
 }
@@ -114,7 +122,7 @@ fn each_word_in_front_of_a_shell_is_stepped_over_on_its_own() {
             "a launcher's number is not the command",
         ),
     ] {
-        assert!(runs_guard_loosening_verb(command, 0), "{why}: {command}");
+        assert!(reads_a_loosening_verb(command, 0), "{why}: {command}");
     }
 }
 
@@ -130,11 +138,11 @@ fn each_word_in_front_of_a_shell_is_stepped_over_on_its_own() {
 #[test]
 fn only_an_option_makes_the_next_word_its_value() {
     assert!(
-        runs_guard_loosening_verb("env -u cat innerwarden allow x", 0),
+        reads_a_loosening_verb("env -u cat innerwarden allow x", 0),
         "`cat` is the name `env -u` unsets; env then runs the guard's CLI"
     );
     assert!(
-        !runs_guard_loosening_verb("sudo cat innerwarden allow x", 0),
+        !reads_a_loosening_verb("sudo cat innerwarden allow x", 0),
         "`sudo cat` runs `cat`, which only reads"
     );
 }

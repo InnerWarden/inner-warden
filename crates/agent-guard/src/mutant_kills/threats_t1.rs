@@ -64,24 +64,14 @@ fn a_verb_after_the_end_of_options_is_the_verb_even_when_words_are_fed() {
 /// be refused as a change. An expansion that stands where a program does
 /// (`$RUNNER`) may still add words.
 ///
-/// FAILS ON REVERT: replace `>` with `<` in `at > 0` in `words_are_fed`.
+/// Written against `words_are_fed` (`at > 0`), which 1.6.12 replaced with a
+/// table filled word by word (`WordsFed`): what stays is the behaviour.
 #[test]
 fn an_options_value_before_the_guard_program_feeds_it_no_words() {
     let read = "sudo -u $USER innerwarden agent kernel status";
-    let line = crate::shell_words::read_line(read);
-    let words = &line.commands[0].words;
-    assert!(
-        !words_are_fed(&words[..3]),
-        "`$USER` is the value of `-u`, not a program that adds words"
-    );
     assert!(
         !changes_kernel_protection(read),
         "`{read}` only reads the kernel protection and was refused"
-    );
-    let runner = crate::shell_words::read_line("$RUNNER innerwarden agent kernel status");
-    assert!(
-        words_are_fed(&runner.commands[0].words[..1]),
-        "a program named by an expansion may add words of its own"
     );
 }
 
@@ -120,10 +110,16 @@ fn the_words_a_substitution_prints_are_read_as_the_command() {
 /// `vec![(String::new(), Default::default())]`.
 #[test]
 fn a_value_the_line_assigned_names_the_program_a_variable_runs() {
-    let assigned = values_assigned(&crate::shell_words::read_line("P=innerwarden-ctl"));
+    let text = "P=innerwarden-ctl";
+    let assigned = values_assigned(&crate::shell_words::read_line(text), text.len(), None);
     let pairs: Vec<(&str, &str)> = assigned
+        .shown
         .iter()
-        .map(|(name, value)| (name.as_str(), value.text.as_str()))
+        .flat_map(|(name, values)| {
+            values
+                .iter()
+                .map(move |value| (name.as_str(), value.text.as_str()))
+        })
         .collect();
     assert_eq!(
         pairs,
@@ -145,18 +141,11 @@ fn a_value_the_line_assigned_names_the_program_a_variable_runs() {
 /// `n` turns into a pattern character, leaving too little written to name
 /// the guard.
 ///
-/// FAILS ON REVERT: replace `+` with `-` in `name.chars().count() + 1` in
-/// `values_assigned`.
+/// Written against the marks `values_assigned` kept for `P=x$Y`; since
+/// 1.6.12 it keeps only values that hold no expansion, so what stays is the
+/// pattern read in its place.
 #[test]
 fn an_assigned_values_marks_start_right_after_the_equals_sign() {
-    use crate::shell_words::Mark;
-    let assigned = values_assigned(&crate::shell_words::read_line("P=x$Y"));
-    assert_eq!(assigned.len(), 1, "one value assigned: {assigned:?}");
-    assert_eq!(
-        assigned[0].1.marks,
-        [Mark::Plain, Mark::Expansion, Mark::Expansion],
-        "`x` is written as it is and `$Y` is an expansion"
-    );
     let line = "P=i*en; /usr/bin/$P agent $X";
     assert!(
         changes_kernel_protection(line),
@@ -173,13 +162,13 @@ fn an_assigned_values_marks_start_right_after_the_equals_sign() {
 /// `with_values_assigned`.
 #[test]
 fn a_braced_variable_is_replaced_by_its_value_up_to_the_closing_brace() {
-    let read = crate::shell_words::read_line("P=inner; ${P}warden");
-    let assigned = values_assigned(&read);
-    let spelt: Vec<String> = with_values_assigned(&read.commands[1].words[0], &assigned)
-        .expect("`${P}` names a value the line assigned")
-        .into_iter()
-        .map(|word| word.text)
-        .collect();
+    let text = "P=inner; ${P}warden";
+    let read = crate::shell_words::read_line(text);
+    let assigned = values_assigned(&read, text.len(), None);
+    let Spelled::Words(words) = with_values_assigned(&read.commands[1].words[0], &assigned) else {
+        panic!("`${{P}}` names a value the line assigned");
+    };
+    let spelt: Vec<String> = words.into_iter().map(|word| word.text).collect();
     assert_eq!(spelt, ["innerwarden"], "`${{P}}warden` with `P=inner`");
     let line = "P=inner; ${P}warden agent $X";
     assert!(
@@ -222,14 +211,18 @@ fn a_word_may_make_exactly_the_most_spellings_allowed() {
         .collect();
     line.push_str("A=inner; ${A}warden agent $X");
     let read = crate::shell_words::read_line(&line);
-    let assigned = values_assigned(&read);
+    let assigned = values_assigned(&read, line.len(), None);
     let word = &read
         .commands
         .last()
         .expect("the line ends with the command that runs the word")
         .words[0];
+    let made = match with_values_assigned(word, &assigned) {
+        Spelled::Words(spellings) => Some(spellings.len()),
+        Spelled::TooMany | Spelled::Unread => None,
+    };
     assert_eq!(
-        with_values_assigned(word, &assigned).map(|spellings| spellings.len()),
+        made,
         Some(MAX_ASSIGNED_SPELLINGS),
         "exactly MAX_ASSIGNED_SPELLINGS ways are within the limit"
     );

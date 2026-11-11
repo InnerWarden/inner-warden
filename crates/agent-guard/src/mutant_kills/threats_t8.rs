@@ -6,6 +6,12 @@
 //! IdentityFile=KEY`, `rsync -e "ssh -i KEY"`), which is key use and not a
 //! read of the key's contents. Every other sensitive word in the segment must
 //! still be weighed, so a key given as a source word is still a read.
+//!
+//! Guard 1.6.12 rewrote the function after these tests were written: the
+//! excuse is now by place, and the options are read as the program's own
+//! getopt reads them. The behaviour each test pins holds in the new reader
+//! and the tests stay for it; a `FAILS ON REVERT` list below names lines of
+//! the reader before 1.6.12, which no longer exist.
 
 use super::*;
 
@@ -28,7 +34,7 @@ fn identity_use_only(segment: &str) -> bool {
     let owned = segment.to_string();
     let (done_tx, done_rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let _ = done_tx.send(ssh_identity_use_only(&owned));
+        let _ = done_tx.send(ssh_identity_use_only(&owned, &|_: &str| false));
     });
     match done_rx.recv_timeout(Duration::from_secs(10)) {
         Ok(verdict) => verdict,
@@ -45,10 +51,16 @@ fn identity_use_only(segment: &str) -> bool {
     }
 }
 
-/// `scp -i KEY`, `ssh --identity KEY` and `sftp --identity-file KEY`
-/// authenticate with the key; none of them reads the key out, so none is a
-/// sensitive read. Only an ssh-family program gets this reading: `cp -i` is
-/// "ask before overwrite", and the key after it is the file being copied.
+/// `scp -i KEY` authenticates with the key and does not read it out, so it
+/// is no sensitive read. Only an ssh-family program gets this reading:
+/// `cp -i` is "ask before overwrite", and the key after it is the file being
+/// copied.
+///
+/// Until 1.6.12 `ssh --identity KEY` and `sftp --identity-file KEY` were
+/// excused too. ssh, scp and sftp take no long option, so their own getopt
+/// refuses those lines; the reader no longer guesses at them and excuses
+/// nothing there. Of the three only `scp` copies files, so only its line is
+/// then weighed as a read.
 ///
 /// This is the false positive the function exists to remove: the operator's
 /// own deploys to their own servers would otherwise be denied as credential
@@ -64,21 +76,35 @@ fn identity_use_only(segment: &str) -> bool {
 /// in the final `all`.
 #[test]
 fn a_key_named_by_an_identity_flag_is_key_use_not_a_read() {
+    let deploy = "scp -i ~/.ssh/deploy_key build.tar deploy@host:/srv/";
+    assert!(
+        identity_use_only(deploy),
+        "the key is named only as the identity flag's value"
+    );
+    assert_eq!(
+        check_sensitive_read(deploy),
+        None,
+        "authenticating with a key is not a read of it"
+    );
+
     for segment in [
-        "scp -i ~/.ssh/deploy_key build.tar deploy@host:/srv/",
         "ssh --identity ~/.ssh/deploy_key deploy@host uptime",
         "sftp --identity-file ~/.ssh/deploy_key deploy@host",
     ] {
         assert!(
-            identity_use_only(segment),
-            "the key is named only as the identity flag's value: {segment}"
-        );
-        assert_eq!(
-            check_sensitive_read(segment),
-            None,
-            "authenticating with a key is not a read of it: {segment}"
+            !identity_use_only(segment),
+            "no ssh-family program takes a long option, so this names no identity: {segment}"
         );
     }
+    let long_flag = "scp --identity ~/.ssh/deploy_key build.tar deploy@host:/srv/";
+    assert!(
+        !identity_use_only(long_flag),
+        "scp takes no long option either"
+    );
+    assert!(
+        check_sensitive_read(long_flag).is_some(),
+        "a key at no identity place of a program that copies files is weighed as a read"
+    );
 
     let copy = "cp -i ~/.ssh/id_rsa /tmp/k";
     assert!(

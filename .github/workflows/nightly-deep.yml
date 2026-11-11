@@ -262,12 +262,19 @@ jobs:
             # 0 clean, 2 survivors, 3 timeouts: the shard finished, and the
             # baseline decides whether any survivor is new.
             0|2|3)
-              if bash scripts/mutants-baseline-check.sh crates/agent-guard/mutants-baseline.txt mutants.out; then
-                echo "Shard ${{ matrix.shard }}/40: no survivor outside crates/agent-guard/mutants-baseline.txt."
-              else
-                echo "::error::A mutant survived in shard ${{ matrix.shard }} that is not in crates/agent-guard/mutants-baseline.txt: a line the tests do not check. Kill it with a test; list it only if it is equivalent, with the reason."
-                exit 1
-              fi ;;
+              check=0
+              bash scripts/mutants-baseline-check.sh crates/agent-guard/mutants-baseline.txt mutants.out || check=$?
+              case "$check" in
+                0) echo "Shard ${{ matrix.shard }}/40: no survivor outside crates/agent-guard/mutants-baseline.txt." ;;
+                1)
+                  echo "::error::A mutant survived in shard ${{ matrix.shard }} that is not in crates/agent-guard/mutants-baseline.txt: a line the tests do not check. Kill it with a test; list it only if it is equivalent, with the reason."
+                  exit 1 ;;
+                # The check itself could not run (no baseline, no report):
+                # that is not a pass.
+                *)
+                  echo "::error::The baseline check could not run in shard ${{ matrix.shard }} (exit $check): nothing was compared."
+                  exit 1 ;;
+              esac ;;
             124) echo "::error::Shard ${{ matrix.shard }} did not finish in 150m. The sweep is larger than the budget: re-measure and raise the shard count."; exit 1 ;;
             *)   echo "::error::cargo-mutants exited $code in shard ${{ matrix.shard }}."; exit 1 ;;
           esac

@@ -1175,7 +1175,48 @@ pub fn analyze_command_in(
 /// payload that itself writes a startup file is analysed once more, no further.
 const STARTUP_PAYLOAD_DEPTH: u8 = 2;
 
+/// The command as bash reads it and, where sh and dash read it differently,
+/// as they do: the reading that scores higher is the verdict.
+///
+/// `a &>file b` sends both outputs of `a b` to the file in bash and zsh. sh
+/// and dash have no such operator: the `&` ends `a`, and `>file b` runs `b`
+/// next. Which shell runs the line, or a `sh -c` string inside it, is not
+/// the guard's to know, so a line that holds `&>` is read both ways
+/// (measured 2026-11-10: read as bash alone, `cd /tmp && true &>/dev/null
+/// ./x` lost the review it had; read as sh alone, `rm &>/dev/null -rf ~`
+/// was allowed). The second reading is the first with every `&>` spaced
+/// apart, quoted ones too: a quoted one is data either way, or a command
+/// string that the same shell family reads.
 fn analyze_command_at(
+    command: &str,
+    rule_engine: Option<&RuleEngine>,
+    protected_reads: &[String],
+    context: Option<&WorkingContext>,
+    depth: u8,
+) -> CommandAnalysis {
+    let as_bash = analyze_command_as_read(command, rule_engine, protected_reads, context, depth);
+    if !command.contains("&>") {
+        return as_bash;
+    }
+    let as_dash = analyze_command_as_read(
+        &command.replace("&>", "& >"),
+        rule_engine,
+        protected_reads,
+        context,
+        depth,
+    );
+    if as_dash.risk_score > as_bash.risk_score {
+        CommandAnalysis {
+            command: as_bash.command,
+            ..as_dash
+        }
+    } else {
+        as_bash
+    }
+}
+
+/// [`analyze_command_at`] on one reading of the command.
+fn analyze_command_as_read(
     command: &str,
     rule_engine: Option<&RuleEngine>,
     protected_reads: &[String],
@@ -1194,6 +1235,12 @@ fn analyze_command_at(
             atr_matches: Vec::new(),
             asi_ids: Vec::new(),
         };
+    }
+
+    // A new command: what an earlier one on this thread left unread is not
+    // this one's. A payload analysed inside it is the same command still.
+    if depth == 0 {
+        threats::forget_unread_brace_expansions();
     }
 
     // Parse once and scan the executable projection. Literal output, search
@@ -1294,11 +1341,20 @@ fn analyze_command_at(
     // The no-op collapse above turns `\x69` into `x69`, which also undoes a
     // `$'\x69...'` the shell decodes into a name; the projection as the
     // shell reads it gets its own look, so the collapse only adds.
-    let self_disable = threats::check_guard_self_disable(scan_cmd).or_else(|| {
-        (raw_scan != scan_cmd)
-            .then(|| threats::check_guard_self_disable(raw_scan))
-            .flatten()
-    });
+    // The projection leaves out what the shell never runs, judging by a name
+    // (`echo` prints, `true` succeeds, `cat` only reads) and by the text in
+    // view. A command that puts either in doubt is read as written as well.
+    let self_disable = threats::check_guard_self_disable(scan_cmd)
+        .or_else(|| {
+            (raw_scan != scan_cmd)
+                .then(|| threats::check_guard_self_disable(raw_scan))
+                .flatten()
+        })
+        .or_else(|| {
+            (projection.masks_in_doubt && cmd != raw_scan)
+                .then(|| threats::check_guard_self_disable(cmd))
+                .flatten()
+        });
     if let Some((what, s)) = self_disable {
         signals.push(AnalysisSignal {
             signal: "guard_self_disable".into(),
@@ -1690,7 +1746,7 @@ fn analyze_command_at(
     // Built-in credential stores are guarded only when the command consumes
     // their contents. This preserves strong coverage for private keys/shadow
     // without treating documentation, echo or restrictive chmod as a read.
-    if let Some((path, s)) = threats::check_sensitive_read(scan_cmd) {
+    if let Some((path, s)) = threats::check_sensitive_read_as_written(scan_cmd, cmd) {
         signals.push(AnalysisSignal {
             signal: "sensitive_credential_read".into(),
             score: s,
@@ -1859,6 +1915,19 @@ fn analyze_command_at(
             );
             score += 25;
         }
+    }
+
+    // A brace expansion too large to make was left as written by every
+    // rewrite above, so no check read the words it stands for
+    // (`r{m,x}{,1}{,2}{,3}...` is `rm` among a great many). Asked last,
+    // once every check has run: what was not read is refused.
+    if threats::brace_expansion_left_unread() {
+        signals.push(AnalysisSignal {
+            signal: "obfuscated_command".into(),
+            score: 60,
+            detail: threats::BRACE_EXPANSION_UNREAD.into(),
+        });
+        score += 60;
     }
 
     // Correlated evidence is not independent evidence. Do this after every rule has
@@ -2030,6 +2099,97 @@ mod tests {
             1,
             "the text is written once, in the constant"
         );
+    }
+
+    /// A line that holds `&>` is read as bash reads it and as sh and dash do,
+    /// and the reading that scores higher is the verdict. The command the
+    /// analysis reports is the one that was sent.
+    ///
+    /// FAILS ON REVERT: return the bash reading alone from
+    /// `analyze_command_at` and the lines only sh and dash run lose their
+    /// verdict; end a command at the `&` of `&>` in the segmenter instead and
+    /// the lines only bash runs lose theirs.
+    #[test]
+    fn a_line_with_bashs_both_outputs_redirection_is_read_as_each_shell_reads_it() {
+        for (cmd, expected) in [
+            // sh and dash: `true &`, then `>/dev/null ./x`.
+            ("cd /tmp && true &>/dev/null ./x", "review"),
+            ("echo &>/dev/null innerwarden allow x", "deny"),
+            ("innerwarden allow x &>/dev/null --help", "deny"),
+            // bash and zsh: one command, both outputs to the file.
+            ("rm &>/dev/null -rf ~", "deny"),
+            ("cat &>/tmp/o /etc/shadow", "deny"),
+            // Neither reading finds anything.
+            ("make -j4 &>build.log", "allow"),
+            ("cargo build &>>build.log; tail -3 build.log", "allow"),
+            ("innerwarden status &>/dev/null", "allow"),
+        ] {
+            let analysis = analyze_command(cmd, None);
+            assert_eq!(analysis.recommendation, expected, "{cmd}");
+            assert_eq!(analysis.command, cmd);
+        }
+    }
+
+    /// What the projection leaves out is judged by a name and by the text in
+    /// view. Each line of the first table lowered the guard in the sandbox
+    /// (2026-11-10, sh, bash and dash against a recording CLI) behind a mask
+    /// that trusted one: a function or an alias under the name of `echo`,
+    /// `true`, `false` or of the reader of a here-document, a condition that
+    /// is not one awaited command, a `#` that ends a word, text written to a
+    /// file and then run. The second table holds the same guard words where
+    /// nothing runs them, and stays allowed.
+    ///
+    /// FAILS ON REVERT: drop the reading of `cmd` under
+    /// `projection.masks_in_doubt` from `analyze_command_at` and the first
+    /// nine lines are allowed; read `cmd` for every line instead and the
+    /// second table is refused.
+    #[test]
+    fn a_guard_lowering_behind_a_mask_in_doubt_is_refused() {
+        for cmd in [
+            "echo() { \"$@\"; }; echo innerwarden allow x",
+            "true() { return 1; }; true || innerwarden allow x",
+            "false() { :; }; false && iw dry-run",
+            "alias cat='command sh'\ncat <<'EOF'\ninnerwarden allow x\nEOF",
+            "cat() { sh; }; cat <<'EOF'\niw dry-run\nEOF",
+            "enable -n false; PATH=.:$PATH; false && iw dry-run",
+            "printf '#!/bin/sh\\nexec sh\\n' > cat; chmod +x cat; PATH=.:$PATH cat <<'EOF'\niw dry-run\nEOF",
+            "echo 'iw dry-run' > s; bash < s",
+            "cat > s <<'EOF'\ninnerwarden allow x\nEOF\nbash < s",
+            // The projection itself read these wrong.
+            "if false; true; then iw dry-run; else :; fi",
+            "if false &\nthen iw dry-run; fi",
+            "if true && false & then iw dry-run; fi",
+            "if ! true & then innerwarden allow x; fi",
+            "a=(case x)#;innerwarden allow x",
+        ] {
+            let analysis = analyze_command(cmd, None);
+            assert_eq!(analysis.recommendation, "deny", "{cmd}");
+            assert!(
+                analysis
+                    .signals
+                    .iter()
+                    .any(|signal| signal.signal == "guard_self_disable"),
+                "{cmd}"
+            );
+        }
+        for cmd in [
+            "git commit -m \"Refuse \\`innerwarden dry-run\\` from agents\"",
+            "grep -rn \"innerwarden allow\" $(git ls-files '*.md')",
+            "cat <<'EOF'\nRun `innerwarden allow x` to let a command through.\nEOF",
+            "echo '{\"hint\": \"innerwarden allow x\"}'",
+            "false && innerwarden allow x",
+            "if false; then innerwarden allow x; fi",
+            "true # innerwarden allow x",
+        ] {
+            let analysis = analyze_command(cmd, None);
+            assert!(
+                !analysis
+                    .signals
+                    .iter()
+                    .any(|signal| signal.signal == "guard_self_disable"),
+                "{cmd}"
+            );
+        }
     }
 
     /// Every cloud's metadata service a shell can reach is an internal

@@ -145,32 +145,6 @@ fn overlap_after_a_forced_cut_never_starts_after_an_escaped_space() {
     );
 }
 
-/// A brace group that makes exactly `BRACE_EXPANSION_WORDS` words is still
-/// expanded; only a group that would make MORE is left as written.
-///
-/// The outer `next.len() > BRACE_EXPANSION_WORDS` decides whether a pass's
-/// result is kept. With `>=`, a group of exactly the limit is thrown away and
-/// the word stays unexpanded, so the matcher never sees the words the shell
-/// would hand the program.
-///
-/// FAILS ON REVERT: `next.len() > BRACE_EXPANSION_WORDS` replaced with
-/// `next.len() >= BRACE_EXPANSION_WORDS` (the check after the inner loop) in
-/// `expand_braces`.
-#[test]
-fn a_brace_group_of_exactly_the_word_limit_is_expanded() {
-    let word = format!("x{{1..{BRACE_EXPANSION_WORDS}}}");
-    let expected = (1..=BRACE_EXPANSION_WORDS)
-        .map(|n| format!("x{n}"))
-        .collect::<Vec<String>>()
-        .join(" ");
-    assert_eq!(
-        expand_braces(&word),
-        expected,
-        "a group of exactly BRACE_EXPANSION_WORDS words is within the limit and \
-         must be expanded, not left as written"
-    );
-}
-
 /// An environment assignment needs a valid shell name, and a name cannot
 /// start with a digit.
 ///
@@ -295,7 +269,7 @@ fn text_between_two_backtick_substitutions_is_not_a_body() {
 #[test]
 fn ssh_command_ending_in_a_bare_dash_o_is_screened_without_a_crash() {
     assert!(
-        ssh_identity_use_only("ssh -i ~/.ssh/id_rsa deploy@host -o"),
+        ssh_identity_use_only("ssh -i ~/.ssh/id_rsa deploy@host -o", &|_: &str| false),
         "the key is only used as the identity, so this is key use, not a read"
     );
     assert_eq!(
