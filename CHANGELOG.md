@@ -54,10 +54,12 @@ see: [The guard and its own switches](docs/features.md#the-guard-and-its-own-swi
 - **A hook that gives no answer refuses the call.** An agent blocks a call
   only when its hook answers with a refusal. A hook that crashed on a fault,
   or that took longer than the agent waits, let the call run, unscreened and
-  unrecorded. The hook now answers within ten seconds and handles the fault:
-  a refusal under an enforcing hook; in monitor, a line that says the call
-  went unscreened. Not closed: a hook that is killed outright, and a fault on
-  Windows.
+  unrecorded. The hook now answers within ten seconds (thirty where a second
+  opinion from a model is configured: that wait has twenty of its own) and
+  handles the fault: a refusal under an enforcing hook; in monitor, a line
+  that says the call went unscreened. Not closed: a hook that is killed
+  outright, a fault on Windows, and an agent set to wait less for its hook
+  than the hook takes.
 
 ### Fixed
 

@@ -106,8 +106,9 @@ The guard reads the text of one command, before it runs. It does not see:
 - Anything in monitor mode, which records and refuses nothing.
 
 An agent's hook lets a call run unless the guard answers with a refusal. A
-guard that takes too long answers with one (ten seconds, under an enforcing
-hook). A guard whose program is gone or cannot start answers nothing, and the
+guard that takes too long answers with one (ten seconds, thirty with a second
+opinion from a model configured, under an enforcing hook). A guard whose
+program is gone or cannot start answers nothing, and the
 call runs: that is why a write to the guard's program is refused above.
 
 Some ordinary lines are refused by the same rules, and the refusal says so: a
