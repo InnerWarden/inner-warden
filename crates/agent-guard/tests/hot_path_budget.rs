@@ -41,6 +41,27 @@ const BUDGET_MICROS: u128 = 10_000;
 /// Runs per case. Enough for a stable median without slowing the suite.
 const RUNS: usize = 50;
 
+/// Set by the mutation sweeps (`.github/workflows/nightly-deep.yml`). The
+/// wall-clock ceilings in this file are then not asserted; what each test
+/// asserts about behaviour still is.
+///
+/// A sweep runs this suite once per mutant, two at a time, on a shared runner,
+/// and cargo-mutants counts any failing test as the test that caught the
+/// mutant. A ceiling that fails because the runner was busy therefore hides a
+/// mutant that no test checks, and hides a different set on every run.
+/// Measured on 2026-11-09 over two sweeps of the same mutants: in run
+/// 42634801508, 139 of the 3,260 mutants reported caught had failed a ceiling
+/// here and nothing else, and run 42699554438 found 104 of those 139 alive,
+/// while a ceiling there "caught" 92 mutants that the first run had seen
+/// survive.
+///
+/// Outside a sweep the ceilings hold, which is where a slow change is caught.
+const NO_CEILINGS_ENV: &str = "IW_NO_WALL_CLOCK_CEILINGS";
+
+fn ceilings_are_asserted() -> bool {
+    std::env::var_os(NO_CEILINGS_ENV).is_none()
+}
+
 fn median_micros(command: &str, engine: &RuleEngine) -> u128 {
     let mut times: Vec<u128> = (0..RUNS)
         .map(|_| {
@@ -88,7 +109,7 @@ fn screening_stays_within_its_budget() {
         let median = median_micros(case, &engine);
         report.push(format!("  {median:>6}us  {case}"));
         assert!(
-            median <= BUDGET_MICROS,
+            !ceilings_are_asserted() || median <= BUDGET_MICROS,
             "screening blew its budget at {median}us (ceiling {BUDGET_MICROS}us) for: {case}\n\
              This runs before every agent tool call. Something got an order of magnitude \
              slower, which is what this test exists to catch.\nAll cases:\n{}",
@@ -134,7 +155,7 @@ fn the_shell_surface_loads_only_what_can_match_it() {
         shell.rule_count()
     );
     assert!(
-        shell_load <= SHELL_LOAD_BUDGET_MICROS,
+        !ceilings_are_asserted() || shell_load <= SHELL_LOAD_BUDGET_MICROS,
         "the shell-surface load took {shell_load}us (ceiling {SHELL_LOAD_BUDGET_MICROS}us). \
          The hook pays this on every agent tool call, so a regression here is felt by the user \
          on every command."
@@ -202,7 +223,7 @@ fn a_listing_heavy_mcp_session_stays_within_its_budget() {
     }
     let recorded = start.elapsed();
     assert!(
-        recorded.as_millis() <= 3_000,
+        !ceilings_are_asserted() || recorded.as_millis() <= 3_000,
         "recording 60 listings under one directory took {recorded:?}"
     );
 
@@ -218,7 +239,7 @@ fn a_listing_heavy_mcp_session_stays_within_its_budget() {
     let searched = start.elapsed();
     assert!(alert.is_none(), "nothing listed is in it: {alert:?}");
     assert!(
-        searched.as_millis() <= 1_000,
+        !ceilings_are_asserted() || searched.as_millis() <= 1_000,
         "searching a 240 KB argument full of paths under the root took {searched:?}"
     );
 }
@@ -257,5 +278,8 @@ fn tokens_sharing_a_start_do_not_slow_the_search_of_an_argument() {
     );
     let searched = start.elapsed();
     assert!(alert.is_none(), "no kept token is in it: {alert:?}");
-    assert!(searched.as_millis() <= 1_000, "searching took {searched:?}");
+    assert!(
+        !ceilings_are_asserted() || searched.as_millis() <= 1_000,
+        "searching took {searched:?}"
+    );
 }

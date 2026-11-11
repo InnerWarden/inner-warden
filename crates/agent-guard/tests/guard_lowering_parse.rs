@@ -14,6 +14,15 @@ use std::time::{Duration, Instant};
 
 use innerwarden_agent_guard::mcp::analyze_command;
 
+/// Set by a mutation sweep, which runs the suite once per mutant on a shared
+/// runner. The sweep of 2026-11-11 (run 43020449252) reported 76 mutants as
+/// caught on which the one test that failed was the ceiling below, at 3.0 to
+/// 4.9 s for the longest line: a busy runner, not the mutated line. Run again
+/// with the ceiling off, 69 of them survive. A mutant
+/// that does make the reading exponential runs past the sweep's own timeout
+/// and is counted there. Outside a sweep the ceiling holds.
+const NO_CEILINGS_ENV: &str = "IW_NO_WALL_CLOCK_CEILINGS";
+
 fn verdict(command: &str) -> String {
     analyze_command(command, None).recommendation
 }
@@ -402,12 +411,13 @@ fn a_line_built_to_be_slow_to_read_is_read_in_bounded_time() {
         format!("{}true", "a=$(".repeat(2000)),
         "case x in a) ;; esac ".repeat(2000),
     ];
+    let ceiling_is_asserted = std::env::var_os(NO_CEILINGS_ENV).is_none();
     for command in lowerings.iter().chain(&others) {
         let start = Instant::now();
         let verdict = verdict(command);
         let took = start.elapsed();
         assert!(
-            took < ceiling,
+            !ceiling_is_asserted || took < ceiling,
             "{} bytes took {took:?}: {:?}",
             command.len(),
             &command[..command.len().min(80)]

@@ -14,7 +14,7 @@ on:
   workflow_dispatch:
     inputs:
       full_sweep:
-        description: "Run the full sharded mutation sweep (20 jobs, ~2h each)"
+        description: "Run the full sharded mutation sweep (40 jobs, about an hour each)"
         type: boolean
         default: false
 
@@ -118,12 +118,31 @@ jobs:
         # different things and are now reported differently:
         #   0 clean · 2 mutants survived · 3 cargo-mutants timed out
         #   124 the outer `timeout` killed it · anything else is a real error
+        # The per-mutant timeout is three times the unmutated test run, not a
+        # fixed 120s: on 2026-11-09 the baseline took 86s on this runner, and a
+        # mutant no test catches runs the whole suite, so one that ran a little
+        # slow at -j 2 was reported as a timeout instead of a survivor (run
+        # 42585938875). A real hang still times out, and still fails the job.
+        #
+        # Each test binary runs under an address-space cap
+        # (scripts/mutants-test-runner.sh): a mutant that allocates without
+        # end then fails its own test run instead of killing the runner. The
+        # full sweep below says why; the log check proves the cap was on.
         run: |
+          triple=$(rustc -vV | sed -n 's/^host: //p')
+          export "CARGO_TARGET_$(printf '%s' "$triple" | tr 'a-z-' 'A-Z_')_RUNNER=$GITHUB_WORKSPACE/scripts/mutants-test-runner.sh"
+          export MUTANTS_TEST_RUNNER_LOG="$RUNNER_TEMP/mutants-test-runner.log"
+          export IW_NO_WALL_CLOCK_CEILINGS=1 # see WALL-CLOCK CEILINGS on the full sweep
           set +e
           timeout 75m cargo mutants --package innerwarden-agent-guard \
-            --in-diff day.diff --timeout 120 -j 2
+            --in-diff day.diff --timeout-multiplier 3 -j 2
           code=$?
           set -e
+          if jq -e '.outcomes | any(.scenario == "Baseline")' mutants.out/outcomes.json >/dev/null 2>&1 \
+            && [ ! -s "$MUTANTS_TEST_RUNNER_LOG" ]; then
+            echo "::error::The tests ran but no test binary ran under the memory cap: cargo did not use scripts/mutants-test-runner.sh, so a runaway mutant could still kill the runner."
+            exit 1
+          fi
           case "$code" in
             0)   echo "No surviving mutants in the changed lines." ;;
             2)   echo "::error::A mutant survived in code changed since yesterday: the tests do not check that line. See the uploaded report."; exit 1 ;;
@@ -139,25 +158,35 @@ jobs:
           path: mutants.out/
 
   mutants-full:
-    name: cargo-mutants full sweep (shard ${{ matrix.shard }}/20)
-    # Sunday only, or by hand. 2,540 mutants at the measured 0.93/min is about
-    # 45 hours of work; twenty shards puts each one near 135 minutes, inside the
-    # budget below with room for a slow runner.
-    # Manual runs do the cheap job only unless the box is ticked: twenty jobs
+    name: cargo-mutants full sweep (shard ${{ matrix.shard }}/40)
+    # Sunday only, or by hand. Sized when the list was 2,540 mutants: twenty
+    # shards near 135 minutes each. By 2026-11-08 the list had grown to 4,390
+    # and twenty shards no longer fit: six of them hit the 150-minute budget
+    # (the others took 46 to 144), so every Sunday from 2026-10-18 ended red
+    # with part of the sweep never run. Forty shards put the average near an
+    # hour, with room for the slow, timeout-heavy stretches that --no-shuffle
+    # keeps together. When the list grows again, re-measure before the budget
+    # is hit, not after: `cargo mutants --list` with the same --file flags.
+    # Re-measured on 2026-11-11 (run 43020449252), after guard 1.6.12: the
+    # list was 5,223 mutants, the suite was slower, and the shards took 75 to
+    # 142 minutes against a budget of 150. The budget is 180 minutes now; when
+    # the slowest shard passes 150 again, add shards.
+    # Manual runs do the cheap job only unless the box is ticked: forty jobs
     # by accident is a poor reward for clicking "Run workflow".
     if: github.event.schedule == '17 5 * * 0' || inputs.full_sweep
     runs-on: ubuntu-latest
-    timeout-minutes: 170
+    timeout-minutes: 200
     strategy:
       fail-fast: false # one slow shard must not hide the findings of the others
       matrix:
         # ZERO-INDEXED, and it matters. `--shard k/n` takes k in 0..n-1, so a
-        # 1..20 matrix silently drops shard 0 and wastes a job on an empty
-        # shard 20. Measured: shards 0..19 sum to exactly 2,540 mutants, which
-        # is the full list; `--shard 20/20` returns none. A sweep that looks
-        # complete and quietly skips 5% of itself is the failure this whole
-        # workflow exists to avoid.
-        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+        # 1..n matrix silently drops shard 0 and wastes a job on an empty
+        # shard n. Measured at twenty: shards 0..19 summed to exactly 2,540
+        # mutants, which was the full list; `--shard 20/20` returned none. A
+        # sweep that looks complete and quietly skips 5% of itself is the
+        # failure this whole workflow exists to avoid.
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+                20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
@@ -172,21 +201,91 @@ jobs:
         # reports success is how this check stayed broken for fourteen nights:
         # the run went red for a reason nobody read, and the finding it did
         # produce was filed as a warning next to it.
+        #
+        # The per-mutant timeout is relative to the baseline for the reason
+        # given on the diff job above.
+        #
+        # MEMORY CAP. On 2026-11-09 (run 42585938875) thirteen of the forty
+        # shards died with "The runner has received a shutdown signal" and
+        # uploaded nothing: a third of the sweep, unseen. Measured: a mutant
+        # that sends a loop back onto the word it has just pushed (`index += 1`
+        # to `index -= 1` in output_redirect_targets) grows the test process
+        # until the runner has no memory left, long before any timeout. Each
+        # test binary now runs under an address-space cap
+        # (scripts/mutants-test-runner.sh, which says why not a cgroup), so
+        # that mutant aborts its own test run and is counted as caught. If the
+        # tests ran and no test binary ran under the cap, the shard fails: a
+        # protection that is silently absent is how a third of this sweep went
+        # missing.
+        #
+        # WALL-CLOCK CEILINGS. tests/hot_path_budget.rs fails when screening
+        # runs past a time ceiling, and cargo-mutants counts any failing test
+        # as the test that caught the mutant. Two sweeps of the same 4,372
+        # mutants on 2026-11-09 disagreed because of it: run 42634801508
+        # reported 139 mutants caught that had failed a ceiling and nothing
+        # else, run 42699554438 found 104 of those 139 alive, and in that run a
+        # ceiling "caught" 92 mutants the first had seen survive. A busy
+        # runner decided which mutants a sweep saw, and 18 of the 40 shards of
+        # the second run failed on survivors the list did not hold.
+        # IW_NO_WALL_CLOCK_CEILINGS turns the ceilings off for the sweep (the
+        # test file says what is still asserted); the ordinary test jobs keep
+        # them. A test with a time ceiling that does not read the variable
+        # brings the same noise back: tests/guard_lowering_parse.rs gained
+        # one with guard 1.6.12, and in run 43020449252 (2026-11-11) it was
+        # the only test that failed for 76 mutants, at 3.0 to 4.9 s against
+        # a ceiling of 3 s. Run again with the ceiling off, 69 of the 76
+        # survive. It reads the variable now, and so must every test that
+        # asserts a time.
+        #
+        # KNOWN SURVIVORS. The first sweep to finish all forty shards (run
+        # 42634801508, 2026-11-09, 58 to 107 minutes a shard) tested 4,372
+        # mutants and by its own count left 1,023 survivors: 899 missed and
+        # 124 timeouts. That count was low, for the reason above; the list
+        # says how it was corrected. Red every Sunday for known survivors
+        # says nothing new, so they are listed in
+        # crates/agent-guard/mutants-baseline.txt with a reason each, and a
+        # shard fails only on a survivor that is NOT in the list
+        # (scripts/mutants-baseline-check.sh). The list is burned down by
+        # priority: a test that kills one deletes its line in the same commit.
+        # A timeout counts as a survivor. The nightly diff job does not read
+        # the list: code changed today must have no survivor at all.
         run: |
+          triple=$(rustc -vV | sed -n 's/^host: //p')
+          export "CARGO_TARGET_$(printf '%s' "$triple" | tr 'a-z-' 'A-Z_')_RUNNER=$GITHUB_WORKSPACE/scripts/mutants-test-runner.sh"
+          export MUTANTS_TEST_RUNNER_LOG="$RUNNER_TEMP/mutants-test-runner.log"
+          export IW_NO_WALL_CLOCK_CEILINGS=1
           set +e
-          timeout 150m cargo mutants --package innerwarden-agent-guard \
+          timeout 180m cargo mutants --package innerwarden-agent-guard \
             --file 'crates/agent-guard/src/threats.rs' \
             --file 'crates/agent-guard/src/shell.rs' \
             --file 'crates/agent-guard/src/session.rs' \
-            --shard ${{ matrix.shard }}/20 \
-            --timeout 120 --no-shuffle -j 2
+            --shard ${{ matrix.shard }}/40 \
+            --timeout-multiplier 3 --no-shuffle -j 2
           code=$?
           set -e
+          if jq -e '.outcomes | any(.scenario == "Baseline")' mutants.out/outcomes.json >/dev/null 2>&1 \
+            && [ ! -s "$MUTANTS_TEST_RUNNER_LOG" ]; then
+            echo "::error::The tests ran in shard ${{ matrix.shard }} but no test binary ran under the memory cap: cargo did not use scripts/mutants-test-runner.sh."
+            exit 1
+          fi
           case "$code" in
-            0)   echo "Shard ${{ matrix.shard }}/20 clean." ;;
-            2)   echo "::error::A mutant survived in shard ${{ matrix.shard }}: the tests do not check that line."; exit 1 ;;
-            3)   echo "::error::cargo-mutants hit its own per-mutant timeout in shard ${{ matrix.shard }}."; exit 1 ;;
-            124) echo "::error::Shard ${{ matrix.shard }} did not finish in 150m. The sweep is larger than the budget: re-measure and raise the shard count."; exit 1 ;;
+            # 0 clean, 2 survivors, 3 timeouts: the shard finished, and the
+            # baseline decides whether any survivor is new.
+            0|2|3)
+              check=0
+              bash scripts/mutants-baseline-check.sh crates/agent-guard/mutants-baseline.txt mutants.out || check=$?
+              case "$check" in
+                0) echo "Shard ${{ matrix.shard }}/40: no survivor outside crates/agent-guard/mutants-baseline.txt." ;;
+                1)
+                  echo "::error::A mutant survived in shard ${{ matrix.shard }} that is not in crates/agent-guard/mutants-baseline.txt: a line the tests do not check. Kill it with a test; list it only if it is equivalent, with the reason."
+                  exit 1 ;;
+                # The check itself could not run (no baseline, no report):
+                # that is not a pass.
+                *)
+                  echo "::error::The baseline check could not run in shard ${{ matrix.shard }} (exit $check): nothing was compared."
+                  exit 1 ;;
+              esac ;;
+            124) echo "::error::Shard ${{ matrix.shard }} did not finish in 180m. The sweep is larger than the budget: re-measure and raise the shard count."; exit 1 ;;
             *)   echo "::error::cargo-mutants exited $code in shard ${{ matrix.shard }}."; exit 1 ;;
           esac
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

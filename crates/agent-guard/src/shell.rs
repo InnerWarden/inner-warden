@@ -1938,8 +1938,9 @@ fn command_writes_download_tainted_value(command: tree_sitter::Node<'_>, source:
 }
 
 /// Whether `node` expands one of `tainted` as CONTENT: not inside a redirect
-/// destination (which only names a file) and not inside a quoted heredoc body
-/// (which the shell never expands).
+/// destination (which only names a file). A quoted heredoc body needs no check
+/// here: tree-sitter-bash scans it raw, so it holds no expansion node at all
+/// (pinned by `a_quoted_heredoc_body_has_no_expansion_nodes`).
 fn node_expands_tainted_variable(
     node: tree_sitter::Node<'_>,
     source: &[u8],
@@ -1970,9 +1971,6 @@ fn node_expands_tainted_variable(
                             && expansion.end_byte() <= destination.end_byte()
                     })
             {
-                return false;
-            }
-            if parent.kind() == "heredoc_redirect" && heredoc_start_is_quoted(parent, source) {
                 return false;
             }
             if parent.id() == node.id() {
@@ -6385,3 +6383,20 @@ mod tests {
         assert!(parse_bash(&once).is_some());
     }
 }
+
+#[cfg(test)]
+#[path = "mutant_kills/shell_sh1.rs"]
+mod mutant_kills_sh1;
+#[cfg(test)]
+#[path = "mutant_kills/shell_sh2.rs"]
+mod mutant_kills_sh2;
+#[cfg(test)]
+#[path = "mutant_kills/shell_sh3.rs"]
+mod mutant_kills_sh3;
+#[cfg(test)]
+#[path = "mutant_kills/shell_sh4.rs"]
+mod mutant_kills_sh4;
+
+#[cfg(test)]
+#[path = "mutant_kills/shell_sh5.rs"]
+mod mutant_kills_sh5;
