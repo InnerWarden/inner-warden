@@ -167,11 +167,15 @@ jobs:
     # hour, with room for the slow, timeout-heavy stretches that --no-shuffle
     # keeps together. When the list grows again, re-measure before the budget
     # is hit, not after: `cargo mutants --list` with the same --file flags.
+    # Re-measured on 2026-11-11 (run 43020449252), after guard 1.6.12: the
+    # list was 5,223 mutants, the suite was slower, and the shards took 75 to
+    # 142 minutes against a budget of 150. The budget is 180 minutes now; when
+    # the slowest shard passes 150 again, add shards.
     # Manual runs do the cheap job only unless the box is ticked: forty jobs
     # by accident is a poor reward for clicking "Run workflow".
     if: github.event.schedule == '17 5 * * 0' || inputs.full_sweep
     runs-on: ubuntu-latest
-    timeout-minutes: 170
+    timeout-minutes: 200
     strategy:
       fail-fast: false # one slow shard must not hide the findings of the others
       matrix:
@@ -225,7 +229,13 @@ jobs:
         # the second run failed on survivors the list did not hold.
         # IW_NO_WALL_CLOCK_CEILINGS turns the ceilings off for the sweep (the
         # test file says what is still asserted); the ordinary test jobs keep
-        # them.
+        # them. A test with a time ceiling that does not read the variable
+        # brings the same noise back: tests/guard_lowering_parse.rs gained
+        # one with guard 1.6.12, and in run 43020449252 (2026-11-11) it was
+        # the only test that failed for 76 mutants, at 3.0 to 4.9 s against
+        # a ceiling of 3 s. Run again with the ceiling off, 69 of the 76
+        # survive. It reads the variable now, and so must every test that
+        # asserts a time.
         #
         # KNOWN SURVIVORS. The first sweep to finish all forty shards (run
         # 42634801508, 2026-11-09, 58 to 107 minutes a shard) tested 4,372
@@ -245,7 +255,7 @@ jobs:
           export MUTANTS_TEST_RUNNER_LOG="$RUNNER_TEMP/mutants-test-runner.log"
           export IW_NO_WALL_CLOCK_CEILINGS=1
           set +e
-          timeout 150m cargo mutants --package innerwarden-agent-guard \
+          timeout 180m cargo mutants --package innerwarden-agent-guard \
             --file 'crates/agent-guard/src/threats.rs' \
             --file 'crates/agent-guard/src/shell.rs' \
             --file 'crates/agent-guard/src/session.rs' \
@@ -275,7 +285,7 @@ jobs:
                   echo "::error::The baseline check could not run in shard ${{ matrix.shard }} (exit $check): nothing was compared."
                   exit 1 ;;
               esac ;;
-            124) echo "::error::Shard ${{ matrix.shard }} did not finish in 150m. The sweep is larger than the budget: re-measure and raise the shard count."; exit 1 ;;
+            124) echo "::error::Shard ${{ matrix.shard }} did not finish in 180m. The sweep is larger than the budget: re-measure and raise the shard count."; exit 1 ;;
             *)   echo "::error::cargo-mutants exited $code in shard ${{ matrix.shard }}."; exit 1 ;;
           esac
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
