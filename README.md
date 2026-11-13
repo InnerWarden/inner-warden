@@ -96,6 +96,25 @@ installer sends one anonymous, opt-out install ping (version + OS + CPU arch
 only: no IP, no host data; set `INNERWARDEN_NO_TELEMETRY=1` to disable). A
 `cargo install` or from-source build sends nothing at all.
 
+## First commands
+
+Check the guard's status and screen a command without running it:
+
+```sh
+innerwarden status
+innerwarden check "git status"
+```
+
+Connect the agent you use:
+
+```sh
+innerwarden install claude-code       # Claude Code's PreToolUse hook
+innerwarden agents connect cursor    # or: codex, gemini, openclaw
+```
+
+For command options, JSON output and exit codes, see the
+[CLI reference](crates/cli/README.md).
+
 ## What it does
 
 - **Screens** shell commands and MCP/tool calls and returns a verdict
