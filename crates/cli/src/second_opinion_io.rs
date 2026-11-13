@@ -68,6 +68,9 @@ pub fn has_key() -> bool {
         .unwrap_or(false)
 }
 
+/// How long the user's endpoint has to answer one classification request.
+const LLM_ANSWER_BOUND: std::time::Duration = std::time::Duration::from_secs(20);
+
 /// POST the classification request to the user's endpoint. Best-effort: any error
 /// (no key, network, bad status) returns `None` so the caller keeps the `review`.
 fn call_llm(cfg: &LlmConfig, command: &str) -> Option<Value> {
@@ -76,7 +79,9 @@ fn call_llm(cfg: &LlmConfig, command: &str) -> Option<Value> {
     // model; the redacted form keeps the dangerous SHAPE, so the verdict is unaffected.
     let command = innerwarden_agent_guard::redact::redact_secrets(command).text;
     let body = build_body(&cfg.model, &command);
-    let mut req = crate::http_io::agent_with_timeout(std::time::Duration::from_secs(20))
+    // The hook's deadline does not count a wait this call bounds itself.
+    crate::hook_net::allow_wait(LLM_ANSWER_BOUND);
+    let mut req = crate::http_io::agent_with_timeout(LLM_ANSWER_BOUND)
         .post(&cfg.url)
         .header("Content-Type", "application/json");
     // Key precedence: the named env var (zero key-at-rest) first, then the 0600
