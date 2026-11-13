@@ -393,6 +393,18 @@ fn analyze(command: &str, engine: &RuleEngine) -> serde_json::Value {
 // `render_verdict` + `is_deny` now live in `innerwarden_agent_guard::render` so the
 // Active Defence's `innerwarden check` renders byte-identically (imported at the top).
 
+/// Explain a terminal stdin read without adding noise to hooks or pipelines.
+fn check_stdin_hint(stdin_is_terminal: bool) -> Option<&'static str> {
+    if !stdin_is_terminal {
+        return None;
+    }
+    Some(if cfg!(windows) {
+        "reading a command from stdin (end with Ctrl-Z then Enter), or pass it: innerwarden check \"<command>\""
+    } else {
+        "reading a command from stdin (end with Ctrl-D), or pass it: innerwarden check \"<command>\""
+    })
+}
+
 /// `innerwarden check "<cmd>"` - analyze a command (from argv, or stdin when none is
 /// given) and print the verdict. `--json` for the full machine output. Exits 1 on
 /// a `deny` so a PreToolUse hook can gate on the exit code, and fires any
@@ -411,6 +423,9 @@ fn cmd_check(rest: &[String]) -> std::process::ExitCode {
         .cloned()
         .collect();
     let command = if words.is_empty() {
+        if let Some(hint) = check_stdin_hint(std::io::IsTerminal::is_terminal(&std::io::stdin())) {
+            eprintln!("{hint}");
+        }
         let mut buf = String::new();
         if std::io::stdin().read_to_string(&mut buf).is_err() {
             eprintln!("innerwarden: failed to read command from stdin");
@@ -2663,6 +2678,25 @@ mod unknown_command_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn check_stdin_hint_explains_terminal_input() {
+        let hint = super::check_stdin_hint(true).expect("terminal input needs an explanation");
+        assert_eq!(hint.lines().count(), 1);
+        assert!(hint.contains("reading a command from stdin"));
+        assert!(hint.contains("innerwarden check \"<command>\""));
+        let eof_keys = if cfg!(windows) {
+            "Ctrl-Z then Enter"
+        } else {
+            "Ctrl-D"
+        };
+        assert!(hint.contains(eof_keys));
+    }
+
+    #[test]
+    fn check_stdin_hint_is_silent_for_pipes() {
+        assert_eq!(super::check_stdin_hint(false), None);
+    }
+
     /// A refusal of Active Defence's own on the host is not one a rule of the
     /// person's lifts: the remedy does not send them to `innerwarden allow`.
     /// Every other block still does.
