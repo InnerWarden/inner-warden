@@ -509,17 +509,18 @@ fn install_hook_with_link_policy(
     // never a bare refusal. The old message said "only 'claude-code' is
     // supported today", which on a host running anything else read as
     // "InnerWarden cannot protect this" and was false.
-    if agent != "claude-code" {
-        if let Some(target) = crate::hook_targets::by_id(agent) {
-            return Err(format!(
-                "{} does not expose a hook this can install into.\n  {}",
-                target.display,
-                crate::hook_targets::guidance(target)
-            ));
-        }
-        return Err(format!(
+    let target = crate::hook_targets::by_id(agent).ok_or_else(|| {
+        format!(
             "unknown agent '{agent}'. Known: {}",
             crate::hook_targets::known_ids()
+        )
+    })?;
+    let agent = target.id;
+    if agent != "claude-code" {
+        return Err(format!(
+            "{} does not expose a hook this can install into.\n  {}",
+            target.display,
+            crate::hook_targets::guidance(target)
         ));
     }
 
@@ -1947,6 +1948,42 @@ mod tests {
         install_hook(home.path(), "claude-code", None, iw, true, false).unwrap();
         let v2: Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
         assert_eq!(v2["hooks"]["PreToolUse"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn install_hook_accepts_claude_aliases_without_changing_agent_identity() {
+        let home = tempfile::TempDir::new().unwrap();
+        let iw = Path::new("/opt/innerwarden");
+        let report = install_hook(home.path(), "claude-code", None, iw, false, false).unwrap();
+        let expected = std::fs::read(&report.settings_path).unwrap();
+        for alias in ["claude", " CLAUDE ", "Claude Code", "CLAUDE-CODE"] {
+            let alias_home = tempfile::TempDir::new().unwrap();
+            let report = install_hook(alias_home.path(), alias, None, iw, false, false).unwrap();
+            assert_eq!(std::fs::read(&report.settings_path).unwrap(), expected);
+            assert!(report.hook_command.ends_with(" --agent claude-code"));
+
+            install_hook(alias_home.path(), "claude-code", None, iw, false, false).unwrap();
+            assert_eq!(std::fs::read(&report.settings_path).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn install_hook_aliases_print_the_same_guidance_without_writing() {
+        let home = tempfile::TempDir::new().unwrap();
+        let iw = Path::new("/opt/innerwarden");
+        for (alias, id) in [
+            ("codex", "codex-cli"),
+            ("openai-codex", "codex-cli"),
+            ("gemini", "gemini-cli"),
+            (" CODEX ", "codex-cli"),
+            (" GEMINI ", "gemini-cli"),
+        ] {
+            assert_eq!(
+                install_hook(home.path(), alias, None, iw, false, false).unwrap_err(),
+                install_hook(home.path(), id, None, iw, false, false).unwrap_err()
+            );
+        }
+        assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0);
     }
 
     #[test]
