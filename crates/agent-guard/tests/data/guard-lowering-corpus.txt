@@ -611,6 +611,1182 @@ DENY	innerwarden-ctl --url=https://127.0.0.1:8787 uninstall
 DENY	echo $(innerwarden-ctl uninstall)
 DENY	'inner'warden agent install-hook --remove
 DENY	innerwarden-'ctl' agent disconnect claude-code
+DENY	sh -c "sh -c innerwarden\ dry-run"
+DENY	bash -c "sh -c innerwarden\ dry-run"
+DENY	sh -c "sh -c innerwarden\ monitor"
+DENY	bash -c "sh -c innerwarden\ monitor"
+DENY	sh -c "sh -c innerwarden\ mute\ reverse_shell"
+DENY	bash -c "sh -c innerwarden\ mute\ reverse_shell"
+DENY	sh -c "sh -c innerwarden\ agents\ disconnect\ claude-code"
+DENY	bash -c "sh -c innerwarden\ agents\ disconnect\ claude-code"
+DENY	sh -c "sh -c innerwarden\ agents\ connect\ claude-code\ --monitor"
+DENY	bash -c "sh -c innerwarden\ agents\ connect\ claude-code\ --monitor"
+DENY	sh -c "sh -c innerwarden\ install\ claude-code\ --monitor"
+DENY	bash -c "sh -c innerwarden\ install\ claude-code\ --monitor"
+DENY	sh -c "sh -c innerwarden\ contain"
+DENY	bash -c "sh -c innerwarden\ contain"
+DENY	sh -c "sh -c innerwarden\ uninstall"
+DENY	bash -c "sh -c innerwarden\ uninstall"
+DENY	sh -c "sh -c innerwarden\ uninstall\ claude-code"
+DENY	bash -c "sh -c innerwarden\ uninstall\ claude-code"
+DENY	sh -c "sh -c innerwarden\ agent\ disconnect\ claude-code"
+DENY	bash -c "sh -c innerwarden\ agent\ disconnect\ claude-code"
+DENY	sh -c "sh -c innerwarden\ agent\ install-hook\ --remove"
+DENY	bash -c "sh -c innerwarden\ agent\ install-hook\ --remove"
+DENY	sh -c "sh -c innerwarden\ agent\ install-hook\ --monitor"
+DENY	bash -c "sh -c innerwarden\ agent\ install-hook\ --monitor"
+DENY	sh -c "sh -c innerwarden\ uninstall"
+DENY	bash -c "sh -c innerwarden\ uninstall"
+DENY	sh -c "sh -c iw\ dry-run"
+DENY	bash -c "sh -c iw\ dry-run"
+DENY	sh -c "sh -c iw\ monitor"
+DENY	bash -c "sh -c iw\ monitor"
+DENY	sh -c "sh -c iw\ mute\ reverse_shell"
+DENY	bash -c "sh -c iw\ mute\ reverse_shell"
+DENY	sh -c "sh -c iw\ agents\ disconnect\ claude-code"
+DENY	bash -c "sh -c iw\ agents\ disconnect\ claude-code"
+DENY	sh -c "sh -c iw\ agents\ connect\ claude-code\ --monitor"
+DENY	bash -c "sh -c iw\ agents\ connect\ claude-code\ --monitor"
+DENY	sh -c "sh -c iw\ install\ claude-code\ --monitor"
+DENY	bash -c "sh -c iw\ install\ claude-code\ --monitor"
+DENY	sh -c "sh -c iw\ contain"
+DENY	bash -c "sh -c iw\ contain"
+DENY	sh -c "sh -c iw\ uninstall"
+DENY	bash -c "sh -c iw\ uninstall"
+DENY	sh -c "sh -c iw\ uninstall\ claude-code"
+DENY	bash -c "sh -c iw\ uninstall\ claude-code"
+DENY	sh -c "sh -c iw\ agent\ disconnect\ claude-code"
+DENY	bash -c "sh -c iw\ agent\ disconnect\ claude-code"
+DENY	sh -c "sh -c iw\ agent\ install-hook\ --remove"
+DENY	bash -c "sh -c iw\ agent\ install-hook\ --remove"
+DENY	sh -c "sh -c iw\ agent\ install-hook\ --monitor"
+DENY	bash -c "sh -c iw\ agent\ install-hook\ --monitor"
+DENY	sh -c "sh -c iw\ uninstall"
+DENY	bash -c "sh -c iw\ uninstall"
+DENY	sh -c "sh -c iw-guard\ dry-run"
+DENY	bash -c "sh -c iw-guard\ dry-run"
+DENY	sh -c "sh -c iw-guard\ monitor"
+DENY	bash -c "sh -c iw-guard\ monitor"
+DENY	sh -c "sh -c iw-guard\ mute\ reverse_shell"
+DENY	bash -c "sh -c iw-guard\ mute\ reverse_shell"
+DENY	sh -c "sh -c iw-guard\ agents\ disconnect\ claude-code"
+DENY	bash -c "sh -c iw-guard\ agents\ disconnect\ claude-code"
+DENY	sh -c "sh -c iw-guard\ agents\ connect\ claude-code\ --monitor"
+DENY	bash -c "sh -c iw-guard\ agents\ connect\ claude-code\ --monitor"
+DENY	sh -c "sh -c iw-guard\ install\ claude-code\ --monitor"
+DENY	bash -c "sh -c iw-guard\ install\ claude-code\ --monitor"
+DENY	sh -c "sh -c iw-guard\ contain"
+DENY	bash -c "sh -c iw-guard\ contain"
+DENY	sh -c "sh -c iw-guard\ uninstall"
+DENY	bash -c "sh -c iw-guard\ uninstall"
+DENY	sh -c "sh -c iw-guard\ uninstall\ claude-code"
+DENY	bash -c "sh -c iw-guard\ uninstall\ claude-code"
+DENY	sh -c "sh -c iw-guard\ agent\ disconnect\ claude-code"
+DENY	bash -c "sh -c iw-guard\ agent\ disconnect\ claude-code"
+DENY	sh -c "sh -c iw-guard\ agent\ install-hook\ --remove"
+DENY	bash -c "sh -c iw-guard\ agent\ install-hook\ --remove"
+DENY	sh -c "sh -c iw-guard\ agent\ install-hook\ --monitor"
+DENY	bash -c "sh -c iw-guard\ agent\ install-hook\ --monitor"
+DENY	sh -c "sh -c iw-guard\ uninstall"
+DENY	bash -c "sh -c iw-guard\ uninstall"
+DENY	sh -c "sh -c innerwarden-ctl\ agent\ disconnect\ claude-code"
+DENY	bash -c "sh -c innerwarden-ctl\ agent\ disconnect\ claude-code"
+DENY	sh -c "sh -c innerwarden-ctl\ agent\ install-hook\ --remove"
+DENY	bash -c "sh -c innerwarden-ctl\ agent\ install-hook\ --remove"
+DENY	sh -c "sh -c innerwarden-ctl\ agent\ install-hook\ --monitor"
+DENY	bash -c "sh -c innerwarden-ctl\ agent\ install-hook\ --monitor"
+DENY	sh -c "sh -c innerwarden-ctl\ uninstall"
+DENY	bash -c "sh -c innerwarden-ctl\ uninstall"
+DENY	awk "BEGIN{system(\"innerwarden dry\-run\")}"
+DENY	perl -e "system('innerwarden dry\-run')"
+DENY	awk "BEGIN{system(\"innerwarden agents disconnect claude\-code\")}"
+DENY	perl -e "system('innerwarden agents disconnect claude\-code')"
+DENY	awk "BEGIN{system(\"innerwarden agents connect claude\-code \-\-monitor\")}"
+DENY	perl -e "system('innerwarden agents connect claude\-code \-\-monitor')"
+DENY	awk "BEGIN{system(\"innerwarden install claude\-code \-\-monitor\")}"
+DENY	perl -e "system('innerwarden install claude\-code \-\-monitor')"
+DENY	awk "BEGIN{system(\"innerwarden uninstall claude\-code\")}"
+DENY	perl -e "system('innerwarden uninstall claude\-code')"
+DENY	awk "BEGIN{system(\"innerwarden agent disconnect claude\-code\")}"
+DENY	perl -e "system('innerwarden agent disconnect claude\-code')"
+DENY	awk "BEGIN{system(\"innerwarden agent install\-hook \-\-remove\")}"
+DENY	perl -e "system('innerwarden agent install\-hook \-\-remove')"
+DENY	awk "BEGIN{system(\"innerwarden agent install\-hook \-\-monitor\")}"
+DENY	perl -e "system('innerwarden agent install\-hook \-\-monitor')"
+DENY	awk "BEGIN{system(\"iw dry\-run\")}"
+DENY	perl -e "system('iw dry\-run')"
+DENY	awk "BEGIN{system(\"iw agents disconnect claude\-code\")}"
+DENY	perl -e "system('iw agents disconnect claude\-code')"
+DENY	awk "BEGIN{system(\"iw agents connect claude\-code \-\-monitor\")}"
+DENY	perl -e "system('iw agents connect claude\-code \-\-monitor')"
+DENY	awk "BEGIN{system(\"iw install claude\-code \-\-monitor\")}"
+DENY	perl -e "system('iw install claude\-code \-\-monitor')"
+DENY	awk "BEGIN{system(\"iw uninstall claude\-code\")}"
+DENY	perl -e "system('iw uninstall claude\-code')"
+DENY	awk "BEGIN{system(\"iw agent disconnect claude\-code\")}"
+DENY	perl -e "system('iw agent disconnect claude\-code')"
+DENY	awk "BEGIN{system(\"iw agent install\-hook \-\-remove\")}"
+DENY	perl -e "system('iw agent install\-hook \-\-remove')"
+DENY	awk "BEGIN{system(\"iw agent install\-hook \-\-monitor\")}"
+DENY	perl -e "system('iw agent install\-hook \-\-monitor')"
+DENY	awk "BEGIN{system(\"iw-guard dry\-run\")}"
+DENY	perl -e "system('iw-guard dry\-run')"
+DENY	awk "BEGIN{system(\"iw-guard agents disconnect claude\-code\")}"
+DENY	perl -e "system('iw-guard agents disconnect claude\-code')"
+DENY	awk "BEGIN{system(\"iw-guard agents connect claude\-code \-\-monitor\")}"
+DENY	perl -e "system('iw-guard agents connect claude\-code \-\-monitor')"
+DENY	awk "BEGIN{system(\"iw-guard install claude\-code \-\-monitor\")}"
+DENY	perl -e "system('iw-guard install claude\-code \-\-monitor')"
+DENY	awk "BEGIN{system(\"iw-guard uninstall claude\-code\")}"
+DENY	perl -e "system('iw-guard uninstall claude\-code')"
+DENY	awk "BEGIN{system(\"iw-guard agent disconnect claude\-code\")}"
+DENY	perl -e "system('iw-guard agent disconnect claude\-code')"
+DENY	awk "BEGIN{system(\"iw-guard agent install\-hook \-\-remove\")}"
+DENY	perl -e "system('iw-guard agent install\-hook \-\-remove')"
+DENY	awk "BEGIN{system(\"iw-guard agent install\-hook \-\-monitor\")}"
+DENY	perl -e "system('iw-guard agent install\-hook \-\-monitor')"
+DENY	awk "BEGIN{system(\"innerwarden-ctl agent disconnect claude\-code\")}"
+DENY	perl -e "system('innerwarden-ctl agent disconnect claude\-code')"
+DENY	awk "BEGIN{system(\"innerwarden-ctl agent install\-hook \-\-remove\")}"
+DENY	perl -e "system('innerwarden-ctl agent install\-hook \-\-remove')"
+DENY	awk "BEGIN{system(\"innerwarden-ctl agent install\-hook \-\-monitor\")}"
+DENY	perl -e "system('innerwarden-ctl agent install\-hook \-\-monitor')"
+DENY	P=innerwarden; $P dry-run
+DENY	P=innerwarden; Q=$P; $Q dry-run
+DENY	A=inner; B=warden; $A$B dry-run
+DENY	V='dry-run'; innerwarden $V
+DENY	C='innerwarden dry-run'; $C
+DENY	C='innerwarden dry-run'; eval "$C"
+DENY	C='innerwarden dry-run'; sh -c "$C"
+DENY	>/dev/null innerwarden dry-run
+DENY	innerwarden 2>/dev/null dry-run
+DENY	innerwarden dry-run # it's off
+DENY	sh <<< 'innerwarden dry-run'
+DENY	bash -c $'innerwarden dry-run'
+DENY	echo 'innerwarden dry-run' | sh
+DENY	sh < <(echo 'innerwarden dry-run')
+DENY	P=innerwarden; $P monitor
+DENY	P=innerwarden; Q=$P; $Q monitor
+DENY	A=inner; B=warden; $A$B monitor
+DENY	V='monitor'; innerwarden $V
+DENY	C='innerwarden monitor'; $C
+DENY	C='innerwarden monitor'; eval "$C"
+DENY	C='innerwarden monitor'; sh -c "$C"
+DENY	>/dev/null innerwarden monitor
+DENY	innerwarden 2>/dev/null monitor
+DENY	innerwarden monitor # it's off
+DENY	sh <<< 'innerwarden monitor'
+DENY	bash -c $'innerwarden monitor'
+DENY	echo 'innerwarden monitor' | sh
+DENY	sh < <(echo 'innerwarden monitor')
+DENY	P=innerwarden; $P mute reverse_shell
+DENY	P=innerwarden; Q=$P; $Q mute reverse_shell
+DENY	A=inner; B=warden; $A$B mute reverse_shell
+DENY	V='mute reverse_shell'; innerwarden $V
+DENY	C='innerwarden mute reverse_shell'; $C
+DENY	C='innerwarden mute reverse_shell'; eval "$C"
+DENY	C='innerwarden mute reverse_shell'; sh -c "$C"
+DENY	>/dev/null innerwarden mute reverse_shell
+DENY	innerwarden 2>/dev/null mute reverse_shell
+DENY	innerwarden mute reverse_shell # it's off
+DENY	sh <<< 'innerwarden mute reverse_shell'
+DENY	bash -c $'innerwarden mute reverse_shell'
+DENY	echo 'innerwarden mute reverse_shell' | sh
+DENY	sh < <(echo 'innerwarden mute reverse_shell')
+DENY	P=innerwarden; $P allow 'rm -rf *'
+DENY	P=innerwarden; Q=$P; $Q allow 'rm -rf *'
+DENY	A=inner; B=warden; $A$B allow 'rm -rf *'
+DENY	>/dev/null innerwarden allow 'rm -rf *'
+DENY	innerwarden 2>/dev/null allow 'rm -rf *'
+DENY	innerwarden allow 'rm -rf *' # it's off
+DENY	P=innerwarden; $P agents disconnect claude-code
+DENY	P=innerwarden; Q=$P; $Q agents disconnect claude-code
+DENY	A=inner; B=warden; $A$B agents disconnect claude-code
+DENY	V='agents disconnect claude-code'; innerwarden $V
+DENY	C='innerwarden agents disconnect claude-code'; $C
+DENY	C='innerwarden agents disconnect claude-code'; eval "$C"
+DENY	C='innerwarden agents disconnect claude-code'; sh -c "$C"
+DENY	>/dev/null innerwarden agents disconnect claude-code
+DENY	innerwarden 2>/dev/null agents disconnect claude-code
+DENY	innerwarden agents disconnect claude-code # it's off
+DENY	sh <<< 'innerwarden agents disconnect claude-code'
+DENY	bash -c $'innerwarden agents disconnect claude-code'
+DENY	echo 'innerwarden agents disconnect claude-code' | sh
+DENY	sh < <(echo 'innerwarden agents disconnect claude-code')
+DENY	P=innerwarden; $P agents connect claude-code --monitor
+DENY	P=innerwarden; Q=$P; $Q agents connect claude-code --monitor
+DENY	A=inner; B=warden; $A$B agents connect claude-code --monitor
+DENY	V='agents connect claude-code --monitor'; innerwarden $V
+DENY	C='innerwarden agents connect claude-code --monitor'; $C
+DENY	C='innerwarden agents connect claude-code --monitor'; eval "$C"
+DENY	C='innerwarden agents connect claude-code --monitor'; sh -c "$C"
+DENY	>/dev/null innerwarden agents connect claude-code --monitor
+DENY	innerwarden 2>/dev/null agents connect claude-code --monitor
+DENY	innerwarden agents connect claude-code --monitor # it's off
+DENY	sh <<< 'innerwarden agents connect claude-code --monitor'
+DENY	bash -c $'innerwarden agents connect claude-code --monitor'
+DENY	echo 'innerwarden agents connect claude-code --monitor' | sh
+DENY	sh < <(echo 'innerwarden agents connect claude-code --monitor')
+DENY	P=innerwarden; $P install claude-code --monitor
+DENY	P=innerwarden; Q=$P; $Q install claude-code --monitor
+DENY	A=inner; B=warden; $A$B install claude-code --monitor
+DENY	V='install claude-code --monitor'; innerwarden $V
+DENY	C='innerwarden install claude-code --monitor'; $C
+DENY	C='innerwarden install claude-code --monitor'; eval "$C"
+DENY	C='innerwarden install claude-code --monitor'; sh -c "$C"
+DENY	>/dev/null innerwarden install claude-code --monitor
+DENY	innerwarden 2>/dev/null install claude-code --monitor
+DENY	innerwarden install claude-code --monitor # it's off
+DENY	sh <<< 'innerwarden install claude-code --monitor'
+DENY	bash -c $'innerwarden install claude-code --monitor'
+DENY	echo 'innerwarden install claude-code --monitor' | sh
+DENY	sh < <(echo 'innerwarden install claude-code --monitor')
+DENY	P=innerwarden; $P contain
+DENY	P=innerwarden; Q=$P; $Q contain
+DENY	A=inner; B=warden; $A$B contain
+DENY	V='contain'; innerwarden $V
+DENY	C='innerwarden contain'; $C
+DENY	C='innerwarden contain'; eval "$C"
+DENY	C='innerwarden contain'; sh -c "$C"
+DENY	>/dev/null innerwarden contain
+DENY	innerwarden 2>/dev/null contain
+DENY	innerwarden contain # it's off
+DENY	sh <<< 'innerwarden contain'
+DENY	bash -c $'innerwarden contain'
+DENY	echo 'innerwarden contain' | sh
+DENY	sh < <(echo 'innerwarden contain')
+DENY	P=innerwarden; $P uninstall
+DENY	P=innerwarden; Q=$P; $Q uninstall
+DENY	A=inner; B=warden; $A$B uninstall
+DENY	V='uninstall'; innerwarden $V
+DENY	C='innerwarden uninstall'; $C
+DENY	C='innerwarden uninstall'; eval "$C"
+DENY	C='innerwarden uninstall'; sh -c "$C"
+DENY	>/dev/null innerwarden uninstall
+DENY	innerwarden 2>/dev/null uninstall
+DENY	innerwarden uninstall # it's off
+DENY	sh <<< 'innerwarden uninstall'
+DENY	bash -c $'innerwarden uninstall'
+DENY	echo 'innerwarden uninstall' | sh
+DENY	sh < <(echo 'innerwarden uninstall')
+DENY	P=innerwarden; $P uninstall claude-code
+DENY	P=innerwarden; Q=$P; $Q uninstall claude-code
+DENY	A=inner; B=warden; $A$B uninstall claude-code
+DENY	V='uninstall claude-code'; innerwarden $V
+DENY	C='innerwarden uninstall claude-code'; $C
+DENY	C='innerwarden uninstall claude-code'; eval "$C"
+DENY	C='innerwarden uninstall claude-code'; sh -c "$C"
+DENY	>/dev/null innerwarden uninstall claude-code
+DENY	innerwarden 2>/dev/null uninstall claude-code
+DENY	innerwarden uninstall claude-code # it's off
+DENY	sh <<< 'innerwarden uninstall claude-code'
+DENY	bash -c $'innerwarden uninstall claude-code'
+DENY	echo 'innerwarden uninstall claude-code' | sh
+DENY	sh < <(echo 'innerwarden uninstall claude-code')
+DENY	P=innerwarden; $P agent disconnect claude-code
+DENY	P=innerwarden; Q=$P; $Q agent disconnect claude-code
+DENY	A=inner; B=warden; $A$B agent disconnect claude-code
+DENY	V='agent disconnect claude-code'; innerwarden $V
+DENY	C='innerwarden agent disconnect claude-code'; $C
+DENY	C='innerwarden agent disconnect claude-code'; eval "$C"
+DENY	C='innerwarden agent disconnect claude-code'; sh -c "$C"
+DENY	>/dev/null innerwarden agent disconnect claude-code
+DENY	innerwarden 2>/dev/null agent disconnect claude-code
+DENY	innerwarden agent disconnect claude-code # it's off
+DENY	sh <<< 'innerwarden agent disconnect claude-code'
+DENY	bash -c $'innerwarden agent disconnect claude-code'
+DENY	echo 'innerwarden agent disconnect claude-code' | sh
+DENY	sh < <(echo 'innerwarden agent disconnect claude-code')
+DENY	P=innerwarden; $P agent install-hook --remove
+DENY	P=innerwarden; Q=$P; $Q agent install-hook --remove
+DENY	A=inner; B=warden; $A$B agent install-hook --remove
+DENY	V='agent install-hook --remove'; innerwarden $V
+DENY	C='innerwarden agent install-hook --remove'; $C
+DENY	C='innerwarden agent install-hook --remove'; eval "$C"
+DENY	C='innerwarden agent install-hook --remove'; sh -c "$C"
+DENY	>/dev/null innerwarden agent install-hook --remove
+DENY	innerwarden 2>/dev/null agent install-hook --remove
+DENY	innerwarden agent install-hook --remove # it's off
+DENY	sh <<< 'innerwarden agent install-hook --remove'
+DENY	bash -c $'innerwarden agent install-hook --remove'
+DENY	echo 'innerwarden agent install-hook --remove' | sh
+DENY	sh < <(echo 'innerwarden agent install-hook --remove')
+DENY	P=innerwarden; $P agent install-hook --monitor
+DENY	P=innerwarden; Q=$P; $Q agent install-hook --monitor
+DENY	A=inner; B=warden; $A$B agent install-hook --monitor
+DENY	V='agent install-hook --monitor'; innerwarden $V
+DENY	C='innerwarden agent install-hook --monitor'; $C
+DENY	C='innerwarden agent install-hook --monitor'; eval "$C"
+DENY	C='innerwarden agent install-hook --monitor'; sh -c "$C"
+DENY	>/dev/null innerwarden agent install-hook --monitor
+DENY	innerwarden 2>/dev/null agent install-hook --monitor
+DENY	innerwarden agent install-hook --monitor # it's off
+DENY	sh <<< 'innerwarden agent install-hook --monitor'
+DENY	bash -c $'innerwarden agent install-hook --monitor'
+DENY	echo 'innerwarden agent install-hook --monitor' | sh
+DENY	sh < <(echo 'innerwarden agent install-hook --monitor')
+DENY	P=innerwarden; $P uninstall
+DENY	P=innerwarden; Q=$P; $Q uninstall
+DENY	A=inner; B=warden; $A$B uninstall
+DENY	V='uninstall'; innerwarden $V
+DENY	C='innerwarden uninstall'; $C
+DENY	C='innerwarden uninstall'; eval "$C"
+DENY	C='innerwarden uninstall'; sh -c "$C"
+DENY	>/dev/null innerwarden uninstall
+DENY	innerwarden 2>/dev/null uninstall
+DENY	innerwarden uninstall # it's off
+DENY	sh <<< 'innerwarden uninstall'
+DENY	bash -c $'innerwarden uninstall'
+DENY	echo 'innerwarden uninstall' | sh
+DENY	sh < <(echo 'innerwarden uninstall')
+DENY	P=iw; $P dry-run
+DENY	P=iw; Q=$P; $Q dry-run
+DENY	A=i; B=w; $A$B dry-run
+DENY	V='dry-run'; iw $V
+DENY	C='iw dry-run'; $C
+DENY	C='iw dry-run'; eval "$C"
+DENY	C='iw dry-run'; sh -c "$C"
+DENY	>/dev/null iw dry-run
+DENY	iw 2>/dev/null dry-run
+DENY	iw dry-run # it's off
+DENY	sh <<< 'iw dry-run'
+DENY	bash -c $'iw dry-run'
+DENY	echo 'iw dry-run' | sh
+DENY	sh < <(echo 'iw dry-run')
+DENY	P=iw; $P monitor
+DENY	P=iw; Q=$P; $Q monitor
+DENY	A=i; B=w; $A$B monitor
+DENY	V='monitor'; iw $V
+DENY	C='iw monitor'; $C
+DENY	C='iw monitor'; eval "$C"
+DENY	C='iw monitor'; sh -c "$C"
+DENY	>/dev/null iw monitor
+DENY	iw 2>/dev/null monitor
+DENY	iw monitor # it's off
+DENY	sh <<< 'iw monitor'
+DENY	bash -c $'iw monitor'
+DENY	echo 'iw monitor' | sh
+DENY	sh < <(echo 'iw monitor')
+DENY	P=iw; $P mute reverse_shell
+DENY	P=iw; Q=$P; $Q mute reverse_shell
+DENY	A=i; B=w; $A$B mute reverse_shell
+DENY	V='mute reverse_shell'; iw $V
+DENY	C='iw mute reverse_shell'; $C
+DENY	C='iw mute reverse_shell'; eval "$C"
+DENY	C='iw mute reverse_shell'; sh -c "$C"
+DENY	>/dev/null iw mute reverse_shell
+DENY	iw 2>/dev/null mute reverse_shell
+DENY	iw mute reverse_shell # it's off
+DENY	sh <<< 'iw mute reverse_shell'
+DENY	bash -c $'iw mute reverse_shell'
+DENY	echo 'iw mute reverse_shell' | sh
+DENY	sh < <(echo 'iw mute reverse_shell')
+DENY	P=iw; $P allow 'rm -rf *'
+DENY	P=iw; Q=$P; $Q allow 'rm -rf *'
+DENY	A=i; B=w; $A$B allow 'rm -rf *'
+DENY	>/dev/null iw allow 'rm -rf *'
+DENY	iw 2>/dev/null allow 'rm -rf *'
+DENY	iw allow 'rm -rf *' # it's off
+DENY	P=iw; $P agents disconnect claude-code
+DENY	P=iw; Q=$P; $Q agents disconnect claude-code
+DENY	A=i; B=w; $A$B agents disconnect claude-code
+DENY	V='agents disconnect claude-code'; iw $V
+DENY	C='iw agents disconnect claude-code'; $C
+DENY	C='iw agents disconnect claude-code'; eval "$C"
+DENY	C='iw agents disconnect claude-code'; sh -c "$C"
+DENY	>/dev/null iw agents disconnect claude-code
+DENY	iw 2>/dev/null agents disconnect claude-code
+DENY	iw agents disconnect claude-code # it's off
+DENY	sh <<< 'iw agents disconnect claude-code'
+DENY	bash -c $'iw agents disconnect claude-code'
+DENY	echo 'iw agents disconnect claude-code' | sh
+DENY	sh < <(echo 'iw agents disconnect claude-code')
+DENY	P=iw; $P agents connect claude-code --monitor
+DENY	P=iw; Q=$P; $Q agents connect claude-code --monitor
+DENY	A=i; B=w; $A$B agents connect claude-code --monitor
+DENY	V='agents connect claude-code --monitor'; iw $V
+DENY	C='iw agents connect claude-code --monitor'; $C
+DENY	C='iw agents connect claude-code --monitor'; eval "$C"
+DENY	C='iw agents connect claude-code --monitor'; sh -c "$C"
+DENY	>/dev/null iw agents connect claude-code --monitor
+DENY	iw 2>/dev/null agents connect claude-code --monitor
+DENY	iw agents connect claude-code --monitor # it's off
+DENY	sh <<< 'iw agents connect claude-code --monitor'
+DENY	bash -c $'iw agents connect claude-code --monitor'
+DENY	echo 'iw agents connect claude-code --monitor' | sh
+DENY	sh < <(echo 'iw agents connect claude-code --monitor')
+DENY	P=iw; $P install claude-code --monitor
+DENY	P=iw; Q=$P; $Q install claude-code --monitor
+DENY	A=i; B=w; $A$B install claude-code --monitor
+DENY	V='install claude-code --monitor'; iw $V
+DENY	C='iw install claude-code --monitor'; $C
+DENY	C='iw install claude-code --monitor'; eval "$C"
+DENY	C='iw install claude-code --monitor'; sh -c "$C"
+DENY	>/dev/null iw install claude-code --monitor
+DENY	iw 2>/dev/null install claude-code --monitor
+DENY	iw install claude-code --monitor # it's off
+DENY	sh <<< 'iw install claude-code --monitor'
+DENY	bash -c $'iw install claude-code --monitor'
+DENY	echo 'iw install claude-code --monitor' | sh
+DENY	sh < <(echo 'iw install claude-code --monitor')
+DENY	P=iw; $P contain
+DENY	P=iw; Q=$P; $Q contain
+DENY	A=i; B=w; $A$B contain
+DENY	V='contain'; iw $V
+DENY	C='iw contain'; $C
+DENY	C='iw contain'; eval "$C"
+DENY	C='iw contain'; sh -c "$C"
+DENY	>/dev/null iw contain
+DENY	iw 2>/dev/null contain
+DENY	iw contain # it's off
+DENY	sh <<< 'iw contain'
+DENY	bash -c $'iw contain'
+DENY	echo 'iw contain' | sh
+DENY	sh < <(echo 'iw contain')
+DENY	P=iw; $P uninstall
+DENY	P=iw; Q=$P; $Q uninstall
+DENY	A=i; B=w; $A$B uninstall
+DENY	V='uninstall'; iw $V
+DENY	C='iw uninstall'; $C
+DENY	C='iw uninstall'; eval "$C"
+DENY	C='iw uninstall'; sh -c "$C"
+DENY	>/dev/null iw uninstall
+DENY	iw 2>/dev/null uninstall
+DENY	iw uninstall # it's off
+DENY	sh <<< 'iw uninstall'
+DENY	bash -c $'iw uninstall'
+DENY	echo 'iw uninstall' | sh
+DENY	sh < <(echo 'iw uninstall')
+DENY	P=iw; $P uninstall claude-code
+DENY	P=iw; Q=$P; $Q uninstall claude-code
+DENY	A=i; B=w; $A$B uninstall claude-code
+DENY	V='uninstall claude-code'; iw $V
+DENY	C='iw uninstall claude-code'; $C
+DENY	C='iw uninstall claude-code'; eval "$C"
+DENY	C='iw uninstall claude-code'; sh -c "$C"
+DENY	>/dev/null iw uninstall claude-code
+DENY	iw 2>/dev/null uninstall claude-code
+DENY	iw uninstall claude-code # it's off
+DENY	sh <<< 'iw uninstall claude-code'
+DENY	bash -c $'iw uninstall claude-code'
+DENY	echo 'iw uninstall claude-code' | sh
+DENY	sh < <(echo 'iw uninstall claude-code')
+DENY	P=iw; $P agent disconnect claude-code
+DENY	P=iw; Q=$P; $Q agent disconnect claude-code
+DENY	A=i; B=w; $A$B agent disconnect claude-code
+DENY	V='agent disconnect claude-code'; iw $V
+DENY	C='iw agent disconnect claude-code'; $C
+DENY	C='iw agent disconnect claude-code'; eval "$C"
+DENY	C='iw agent disconnect claude-code'; sh -c "$C"
+DENY	>/dev/null iw agent disconnect claude-code
+DENY	iw 2>/dev/null agent disconnect claude-code
+DENY	iw agent disconnect claude-code # it's off
+DENY	sh <<< 'iw agent disconnect claude-code'
+DENY	bash -c $'iw agent disconnect claude-code'
+DENY	echo 'iw agent disconnect claude-code' | sh
+DENY	sh < <(echo 'iw agent disconnect claude-code')
+DENY	P=iw; $P agent install-hook --remove
+DENY	P=iw; Q=$P; $Q agent install-hook --remove
+DENY	A=i; B=w; $A$B agent install-hook --remove
+DENY	V='agent install-hook --remove'; iw $V
+DENY	C='iw agent install-hook --remove'; $C
+DENY	C='iw agent install-hook --remove'; eval "$C"
+DENY	C='iw agent install-hook --remove'; sh -c "$C"
+DENY	>/dev/null iw agent install-hook --remove
+DENY	iw 2>/dev/null agent install-hook --remove
+DENY	iw agent install-hook --remove # it's off
+DENY	sh <<< 'iw agent install-hook --remove'
+DENY	bash -c $'iw agent install-hook --remove'
+DENY	echo 'iw agent install-hook --remove' | sh
+DENY	sh < <(echo 'iw agent install-hook --remove')
+DENY	P=iw; $P agent install-hook --monitor
+DENY	P=iw; Q=$P; $Q agent install-hook --monitor
+DENY	A=i; B=w; $A$B agent install-hook --monitor
+DENY	V='agent install-hook --monitor'; iw $V
+DENY	C='iw agent install-hook --monitor'; $C
+DENY	C='iw agent install-hook --monitor'; eval "$C"
+DENY	C='iw agent install-hook --monitor'; sh -c "$C"
+DENY	>/dev/null iw agent install-hook --monitor
+DENY	iw 2>/dev/null agent install-hook --monitor
+DENY	iw agent install-hook --monitor # it's off
+DENY	sh <<< 'iw agent install-hook --monitor'
+DENY	bash -c $'iw agent install-hook --monitor'
+DENY	echo 'iw agent install-hook --monitor' | sh
+DENY	sh < <(echo 'iw agent install-hook --monitor')
+DENY	P=iw; $P uninstall
+DENY	P=iw; Q=$P; $Q uninstall
+DENY	A=i; B=w; $A$B uninstall
+DENY	V='uninstall'; iw $V
+DENY	C='iw uninstall'; $C
+DENY	C='iw uninstall'; eval "$C"
+DENY	C='iw uninstall'; sh -c "$C"
+DENY	>/dev/null iw uninstall
+DENY	iw 2>/dev/null uninstall
+DENY	iw uninstall # it's off
+DENY	sh <<< 'iw uninstall'
+DENY	bash -c $'iw uninstall'
+DENY	echo 'iw uninstall' | sh
+DENY	sh < <(echo 'iw uninstall')
+DENY	P=iw-guard; $P dry-run
+DENY	P=iw-guard; Q=$P; $Q dry-run
+DENY	A=iw-g; B=uard; $A$B dry-run
+DENY	V='dry-run'; iw-guard $V
+DENY	C='iw-guard dry-run'; $C
+DENY	C='iw-guard dry-run'; eval "$C"
+DENY	C='iw-guard dry-run'; sh -c "$C"
+DENY	>/dev/null iw-guard dry-run
+DENY	iw-guard 2>/dev/null dry-run
+DENY	iw-guard dry-run # it's off
+DENY	sh <<< 'iw-guard dry-run'
+DENY	bash -c $'iw-guard dry-run'
+DENY	echo 'iw-guard dry-run' | sh
+DENY	sh < <(echo 'iw-guard dry-run')
+DENY	P=iw-guard; $P monitor
+DENY	P=iw-guard; Q=$P; $Q monitor
+DENY	A=iw-g; B=uard; $A$B monitor
+DENY	V='monitor'; iw-guard $V
+DENY	C='iw-guard monitor'; $C
+DENY	C='iw-guard monitor'; eval "$C"
+DENY	C='iw-guard monitor'; sh -c "$C"
+DENY	>/dev/null iw-guard monitor
+DENY	iw-guard 2>/dev/null monitor
+DENY	iw-guard monitor # it's off
+DENY	sh <<< 'iw-guard monitor'
+DENY	bash -c $'iw-guard monitor'
+DENY	echo 'iw-guard monitor' | sh
+DENY	sh < <(echo 'iw-guard monitor')
+DENY	P=iw-guard; $P mute reverse_shell
+DENY	P=iw-guard; Q=$P; $Q mute reverse_shell
+DENY	A=iw-g; B=uard; $A$B mute reverse_shell
+DENY	V='mute reverse_shell'; iw-guard $V
+DENY	C='iw-guard mute reverse_shell'; $C
+DENY	C='iw-guard mute reverse_shell'; eval "$C"
+DENY	C='iw-guard mute reverse_shell'; sh -c "$C"
+DENY	>/dev/null iw-guard mute reverse_shell
+DENY	iw-guard 2>/dev/null mute reverse_shell
+DENY	iw-guard mute reverse_shell # it's off
+DENY	sh <<< 'iw-guard mute reverse_shell'
+DENY	bash -c $'iw-guard mute reverse_shell'
+DENY	echo 'iw-guard mute reverse_shell' | sh
+DENY	sh < <(echo 'iw-guard mute reverse_shell')
+DENY	P=iw-guard; $P allow 'rm -rf *'
+DENY	P=iw-guard; Q=$P; $Q allow 'rm -rf *'
+DENY	A=iw-g; B=uard; $A$B allow 'rm -rf *'
+DENY	>/dev/null iw-guard allow 'rm -rf *'
+DENY	iw-guard 2>/dev/null allow 'rm -rf *'
+DENY	iw-guard allow 'rm -rf *' # it's off
+DENY	P=iw-guard; $P agents disconnect claude-code
+DENY	P=iw-guard; Q=$P; $Q agents disconnect claude-code
+DENY	A=iw-g; B=uard; $A$B agents disconnect claude-code
+DENY	V='agents disconnect claude-code'; iw-guard $V
+DENY	C='iw-guard agents disconnect claude-code'; $C
+DENY	C='iw-guard agents disconnect claude-code'; eval "$C"
+DENY	C='iw-guard agents disconnect claude-code'; sh -c "$C"
+DENY	>/dev/null iw-guard agents disconnect claude-code
+DENY	iw-guard 2>/dev/null agents disconnect claude-code
+DENY	iw-guard agents disconnect claude-code # it's off
+DENY	sh <<< 'iw-guard agents disconnect claude-code'
+DENY	bash -c $'iw-guard agents disconnect claude-code'
+DENY	echo 'iw-guard agents disconnect claude-code' | sh
+DENY	sh < <(echo 'iw-guard agents disconnect claude-code')
+DENY	P=iw-guard; $P agents connect claude-code --monitor
+DENY	P=iw-guard; Q=$P; $Q agents connect claude-code --monitor
+DENY	A=iw-g; B=uard; $A$B agents connect claude-code --monitor
+DENY	V='agents connect claude-code --monitor'; iw-guard $V
+DENY	C='iw-guard agents connect claude-code --monitor'; $C
+DENY	C='iw-guard agents connect claude-code --monitor'; eval "$C"
+DENY	C='iw-guard agents connect claude-code --monitor'; sh -c "$C"
+DENY	>/dev/null iw-guard agents connect claude-code --monitor
+DENY	iw-guard 2>/dev/null agents connect claude-code --monitor
+DENY	iw-guard agents connect claude-code --monitor # it's off
+DENY	sh <<< 'iw-guard agents connect claude-code --monitor'
+DENY	bash -c $'iw-guard agents connect claude-code --monitor'
+DENY	echo 'iw-guard agents connect claude-code --monitor' | sh
+DENY	sh < <(echo 'iw-guard agents connect claude-code --monitor')
+DENY	P=iw-guard; $P install claude-code --monitor
+DENY	P=iw-guard; Q=$P; $Q install claude-code --monitor
+DENY	A=iw-g; B=uard; $A$B install claude-code --monitor
+DENY	V='install claude-code --monitor'; iw-guard $V
+DENY	C='iw-guard install claude-code --monitor'; $C
+DENY	C='iw-guard install claude-code --monitor'; eval "$C"
+DENY	C='iw-guard install claude-code --monitor'; sh -c "$C"
+DENY	>/dev/null iw-guard install claude-code --monitor
+DENY	iw-guard 2>/dev/null install claude-code --monitor
+DENY	iw-guard install claude-code --monitor # it's off
+DENY	sh <<< 'iw-guard install claude-code --monitor'
+DENY	bash -c $'iw-guard install claude-code --monitor'
+DENY	echo 'iw-guard install claude-code --monitor' | sh
+DENY	sh < <(echo 'iw-guard install claude-code --monitor')
+DENY	P=iw-guard; $P contain
+DENY	P=iw-guard; Q=$P; $Q contain
+DENY	A=iw-g; B=uard; $A$B contain
+DENY	V='contain'; iw-guard $V
+DENY	C='iw-guard contain'; $C
+DENY	C='iw-guard contain'; eval "$C"
+DENY	C='iw-guard contain'; sh -c "$C"
+DENY	>/dev/null iw-guard contain
+DENY	iw-guard 2>/dev/null contain
+DENY	iw-guard contain # it's off
+DENY	sh <<< 'iw-guard contain'
+DENY	bash -c $'iw-guard contain'
+DENY	echo 'iw-guard contain' | sh
+DENY	sh < <(echo 'iw-guard contain')
+DENY	P=iw-guard; $P uninstall
+DENY	P=iw-guard; Q=$P; $Q uninstall
+DENY	A=iw-g; B=uard; $A$B uninstall
+DENY	V='uninstall'; iw-guard $V
+DENY	C='iw-guard uninstall'; $C
+DENY	C='iw-guard uninstall'; eval "$C"
+DENY	C='iw-guard uninstall'; sh -c "$C"
+DENY	>/dev/null iw-guard uninstall
+DENY	iw-guard 2>/dev/null uninstall
+DENY	iw-guard uninstall # it's off
+DENY	sh <<< 'iw-guard uninstall'
+DENY	bash -c $'iw-guard uninstall'
+DENY	echo 'iw-guard uninstall' | sh
+DENY	sh < <(echo 'iw-guard uninstall')
+DENY	P=iw-guard; $P uninstall claude-code
+DENY	P=iw-guard; Q=$P; $Q uninstall claude-code
+DENY	A=iw-g; B=uard; $A$B uninstall claude-code
+DENY	V='uninstall claude-code'; iw-guard $V
+DENY	C='iw-guard uninstall claude-code'; $C
+DENY	C='iw-guard uninstall claude-code'; eval "$C"
+DENY	C='iw-guard uninstall claude-code'; sh -c "$C"
+DENY	>/dev/null iw-guard uninstall claude-code
+DENY	iw-guard 2>/dev/null uninstall claude-code
+DENY	iw-guard uninstall claude-code # it's off
+DENY	sh <<< 'iw-guard uninstall claude-code'
+DENY	bash -c $'iw-guard uninstall claude-code'
+DENY	echo 'iw-guard uninstall claude-code' | sh
+DENY	sh < <(echo 'iw-guard uninstall claude-code')
+DENY	P=iw-guard; $P agent disconnect claude-code
+DENY	P=iw-guard; Q=$P; $Q agent disconnect claude-code
+DENY	A=iw-g; B=uard; $A$B agent disconnect claude-code
+DENY	V='agent disconnect claude-code'; iw-guard $V
+DENY	C='iw-guard agent disconnect claude-code'; $C
+DENY	C='iw-guard agent disconnect claude-code'; eval "$C"
+DENY	C='iw-guard agent disconnect claude-code'; sh -c "$C"
+DENY	>/dev/null iw-guard agent disconnect claude-code
+DENY	iw-guard 2>/dev/null agent disconnect claude-code
+DENY	iw-guard agent disconnect claude-code # it's off
+DENY	sh <<< 'iw-guard agent disconnect claude-code'
+DENY	bash -c $'iw-guard agent disconnect claude-code'
+DENY	echo 'iw-guard agent disconnect claude-code' | sh
+DENY	sh < <(echo 'iw-guard agent disconnect claude-code')
+DENY	P=iw-guard; $P agent install-hook --remove
+DENY	P=iw-guard; Q=$P; $Q agent install-hook --remove
+DENY	A=iw-g; B=uard; $A$B agent install-hook --remove
+DENY	V='agent install-hook --remove'; iw-guard $V
+DENY	C='iw-guard agent install-hook --remove'; $C
+DENY	C='iw-guard agent install-hook --remove'; eval "$C"
+DENY	C='iw-guard agent install-hook --remove'; sh -c "$C"
+DENY	>/dev/null iw-guard agent install-hook --remove
+DENY	iw-guard 2>/dev/null agent install-hook --remove
+DENY	iw-guard agent install-hook --remove # it's off
+DENY	sh <<< 'iw-guard agent install-hook --remove'
+DENY	bash -c $'iw-guard agent install-hook --remove'
+DENY	echo 'iw-guard agent install-hook --remove' | sh
+DENY	sh < <(echo 'iw-guard agent install-hook --remove')
+DENY	P=iw-guard; $P agent install-hook --monitor
+DENY	P=iw-guard; Q=$P; $Q agent install-hook --monitor
+DENY	A=iw-g; B=uard; $A$B agent install-hook --monitor
+DENY	V='agent install-hook --monitor'; iw-guard $V
+DENY	C='iw-guard agent install-hook --monitor'; $C
+DENY	C='iw-guard agent install-hook --monitor'; eval "$C"
+DENY	C='iw-guard agent install-hook --monitor'; sh -c "$C"
+DENY	>/dev/null iw-guard agent install-hook --monitor
+DENY	iw-guard 2>/dev/null agent install-hook --monitor
+DENY	iw-guard agent install-hook --monitor # it's off
+DENY	sh <<< 'iw-guard agent install-hook --monitor'
+DENY	bash -c $'iw-guard agent install-hook --monitor'
+DENY	echo 'iw-guard agent install-hook --monitor' | sh
+DENY	sh < <(echo 'iw-guard agent install-hook --monitor')
+DENY	P=iw-guard; $P uninstall
+DENY	P=iw-guard; Q=$P; $Q uninstall
+DENY	A=iw-g; B=uard; $A$B uninstall
+DENY	V='uninstall'; iw-guard $V
+DENY	C='iw-guard uninstall'; $C
+DENY	C='iw-guard uninstall'; eval "$C"
+DENY	C='iw-guard uninstall'; sh -c "$C"
+DENY	>/dev/null iw-guard uninstall
+DENY	iw-guard 2>/dev/null uninstall
+DENY	iw-guard uninstall # it's off
+DENY	sh <<< 'iw-guard uninstall'
+DENY	bash -c $'iw-guard uninstall'
+DENY	echo 'iw-guard uninstall' | sh
+DENY	sh < <(echo 'iw-guard uninstall')
+DENY	P=innerwarden-ctl; $P agent disconnect claude-code
+DENY	P=innerwarden-ctl; Q=$P; $Q agent disconnect claude-code
+DENY	A=innerwa; B=rden-ctl; $A$B agent disconnect claude-code
+DENY	V='agent disconnect claude-code'; innerwarden-ctl $V
+DENY	C='innerwarden-ctl agent disconnect claude-code'; $C
+DENY	C='innerwarden-ctl agent disconnect claude-code'; eval "$C"
+DENY	C='innerwarden-ctl agent disconnect claude-code'; sh -c "$C"
+DENY	>/dev/null innerwarden-ctl agent disconnect claude-code
+DENY	innerwarden-ctl 2>/dev/null agent disconnect claude-code
+DENY	innerwarden-ctl agent disconnect claude-code # it's off
+DENY	sh <<< 'innerwarden-ctl agent disconnect claude-code'
+DENY	bash -c $'innerwarden-ctl agent disconnect claude-code'
+DENY	echo 'innerwarden-ctl agent disconnect claude-code' | sh
+DENY	sh < <(echo 'innerwarden-ctl agent disconnect claude-code')
+DENY	P=innerwarden-ctl; $P agent install-hook --remove
+DENY	P=innerwarden-ctl; Q=$P; $Q agent install-hook --remove
+DENY	A=innerwa; B=rden-ctl; $A$B agent install-hook --remove
+DENY	V='agent install-hook --remove'; innerwarden-ctl $V
+DENY	C='innerwarden-ctl agent install-hook --remove'; $C
+DENY	C='innerwarden-ctl agent install-hook --remove'; eval "$C"
+DENY	C='innerwarden-ctl agent install-hook --remove'; sh -c "$C"
+DENY	>/dev/null innerwarden-ctl agent install-hook --remove
+DENY	innerwarden-ctl 2>/dev/null agent install-hook --remove
+DENY	innerwarden-ctl agent install-hook --remove # it's off
+DENY	sh <<< 'innerwarden-ctl agent install-hook --remove'
+DENY	bash -c $'innerwarden-ctl agent install-hook --remove'
+DENY	echo 'innerwarden-ctl agent install-hook --remove' | sh
+DENY	sh < <(echo 'innerwarden-ctl agent install-hook --remove')
+DENY	P=innerwarden-ctl; $P agent install-hook --monitor
+DENY	P=innerwarden-ctl; Q=$P; $Q agent install-hook --monitor
+DENY	A=innerwa; B=rden-ctl; $A$B agent install-hook --monitor
+DENY	V='agent install-hook --monitor'; innerwarden-ctl $V
+DENY	C='innerwarden-ctl agent install-hook --monitor'; $C
+DENY	C='innerwarden-ctl agent install-hook --monitor'; eval "$C"
+DENY	C='innerwarden-ctl agent install-hook --monitor'; sh -c "$C"
+DENY	>/dev/null innerwarden-ctl agent install-hook --monitor
+DENY	innerwarden-ctl 2>/dev/null agent install-hook --monitor
+DENY	innerwarden-ctl agent install-hook --monitor # it's off
+DENY	sh <<< 'innerwarden-ctl agent install-hook --monitor'
+DENY	bash -c $'innerwarden-ctl agent install-hook --monitor'
+DENY	echo 'innerwarden-ctl agent install-hook --monitor' | sh
+DENY	sh < <(echo 'innerwarden-ctl agent install-hook --monitor')
+DENY	P=innerwarden-ctl; $P uninstall
+DENY	P=innerwarden-ctl; Q=$P; $Q uninstall
+DENY	A=innerwa; B=rden-ctl; $A$B uninstall
+DENY	V='uninstall'; innerwarden-ctl $V
+DENY	C='innerwarden-ctl uninstall'; $C
+DENY	C='innerwarden-ctl uninstall'; eval "$C"
+DENY	C='innerwarden-ctl uninstall'; sh -c "$C"
+DENY	>/dev/null innerwarden-ctl uninstall
+DENY	innerwarden-ctl 2>/dev/null uninstall
+DENY	innerwarden-ctl uninstall # it's off
+DENY	sh <<< 'innerwarden-ctl uninstall'
+DENY	bash -c $'innerwarden-ctl uninstall'
+DENY	echo 'innerwarden-ctl uninstall' | sh
+DENY	sh < <(echo 'innerwarden-ctl uninstall')
+DENY	innerwarden-ctl exec-gate arm --pid 1234 --observe --path /tmp/tool
+DENY	sh -c 'innerwarden-ctl exec-gate arm --pid 1234 --observe --path /tmp/tool'
+DENY	bash -c 'innerwarden-ctl exec-gate arm --pid 1234 --observe --path /tmp/tool'
+DENY	env -S 'innerwarden-ctl exec-gate arm --pid 1234 --observe --path /tmp/tool'
+DENY	flock -x /tmp/x -c 'innerwarden-ctl exec-gate arm --pid 1234 --observe --path /tmp/tool'
+DENY	busybox sh -c 'innerwarden-ctl exec-gate arm --pid 1234 --observe --path /tmp/tool'
+DENY	flock /tmp/x innerwarden-ctl exec-gate arm --pid 1234 --observe --path /tmp/tool
+DENY	taskset -c 0 innerwarden-ctl exec-gate arm --pid 1234 --observe --path /tmp/tool
+DENY	systemd-run --user --wait -q innerwarden-ctl exec-gate arm --pid 1234 --observe --path /tmp/tool
+DENY	unshare -U innerwarden-ctl exec-gate arm --pid 1234 --observe --path /tmp/tool
+DENY	watch -n 1 innerwarden-ctl exec-gate arm --pid 1234 --observe --path /tmp/tool
+DENY	nice innerwarden-ctl exec-gate arm --pid 1234 --observe --path /tmp/tool
+DENY	env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT innerwarden-ctl exec-gate arm --pid 1234 --observe --path /tmp/tool
+DENY	sudo innerwarden-ctl exec-gate arm --pid 1234 --observe --path /tmp/tool
+DENY	sh -c 'sudo innerwarden-ctl exec-gate arm --pid 1234 --observe --path /tmp/tool'
+DENY	bash -c 'sudo innerwarden-ctl exec-gate arm --pid 1234 --observe --path /tmp/tool'
+DENY	env -S 'sudo innerwarden-ctl exec-gate arm --pid 1234 --observe --path /tmp/tool'
+DENY	flock -x /tmp/x -c 'sudo innerwarden-ctl exec-gate arm --pid 1234 --observe --path /tmp/tool'
+DENY	busybox sh -c 'sudo innerwarden-ctl exec-gate arm --pid 1234 --observe --path /tmp/tool'
+DENY	flock /tmp/x sudo innerwarden-ctl exec-gate arm --pid 1234 --observe --path /tmp/tool
+DENY	taskset -c 0 sudo innerwarden-ctl exec-gate arm --pid 1234 --observe --path /tmp/tool
+DENY	systemd-run --user --wait -q sudo innerwarden-ctl exec-gate arm --pid 1234 --observe --path /tmp/tool
+DENY	unshare -U sudo innerwarden-ctl exec-gate arm --pid 1234 --observe --path /tmp/tool
+DENY	watch -n 1 sudo innerwarden-ctl exec-gate arm --pid 1234 --observe --path /tmp/tool
+DENY	nice sudo innerwarden-ctl exec-gate arm --pid 1234 --observe --path /tmp/tool
+DENY	env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT sudo innerwarden-ctl exec-gate arm --pid 1234 --observe --path /tmp/tool
+DENY	innerwarden-ctl exec-gate disarm
+DENY	sh -c 'innerwarden-ctl exec-gate disarm'
+DENY	bash -c 'innerwarden-ctl exec-gate disarm'
+DENY	env -S 'innerwarden-ctl exec-gate disarm'
+DENY	flock -x /tmp/x -c 'innerwarden-ctl exec-gate disarm'
+DENY	busybox sh -c 'innerwarden-ctl exec-gate disarm'
+DENY	flock /tmp/x innerwarden-ctl exec-gate disarm
+DENY	taskset -c 0 innerwarden-ctl exec-gate disarm
+DENY	systemd-run --user --wait -q innerwarden-ctl exec-gate disarm
+DENY	unshare -U innerwarden-ctl exec-gate disarm
+DENY	watch -n 1 innerwarden-ctl exec-gate disarm
+DENY	nice innerwarden-ctl exec-gate disarm
+DENY	env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT innerwarden-ctl exec-gate disarm
+DENY	sudo innerwarden-ctl exec-gate disarm
+DENY	sh -c 'sudo innerwarden-ctl exec-gate disarm'
+DENY	bash -c 'sudo innerwarden-ctl exec-gate disarm'
+DENY	env -S 'sudo innerwarden-ctl exec-gate disarm'
+DENY	flock -x /tmp/x -c 'sudo innerwarden-ctl exec-gate disarm'
+DENY	busybox sh -c 'sudo innerwarden-ctl exec-gate disarm'
+DENY	flock /tmp/x sudo innerwarden-ctl exec-gate disarm
+DENY	taskset -c 0 sudo innerwarden-ctl exec-gate disarm
+DENY	systemd-run --user --wait -q sudo innerwarden-ctl exec-gate disarm
+DENY	unshare -U sudo innerwarden-ctl exec-gate disarm
+DENY	watch -n 1 sudo innerwarden-ctl exec-gate disarm
+DENY	nice sudo innerwarden-ctl exec-gate disarm
+DENY	env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT sudo innerwarden-ctl exec-gate disarm
+DENY	innerwarden-config-sign exec-gate trust-path /tmp/tool
+DENY	sh -c 'innerwarden-config-sign exec-gate trust-path /tmp/tool'
+DENY	bash -c 'innerwarden-config-sign exec-gate trust-path /tmp/tool'
+DENY	env -S 'innerwarden-config-sign exec-gate trust-path /tmp/tool'
+DENY	flock -x /tmp/x -c 'innerwarden-config-sign exec-gate trust-path /tmp/tool'
+DENY	busybox sh -c 'innerwarden-config-sign exec-gate trust-path /tmp/tool'
+DENY	flock /tmp/x innerwarden-config-sign exec-gate trust-path /tmp/tool
+DENY	taskset -c 0 innerwarden-config-sign exec-gate trust-path /tmp/tool
+DENY	systemd-run --user --wait -q innerwarden-config-sign exec-gate trust-path /tmp/tool
+DENY	unshare -U innerwarden-config-sign exec-gate trust-path /tmp/tool
+DENY	watch -n 1 innerwarden-config-sign exec-gate trust-path /tmp/tool
+DENY	nice innerwarden-config-sign exec-gate trust-path /tmp/tool
+DENY	env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT innerwarden-config-sign exec-gate trust-path /tmp/tool
+DENY	sudo innerwarden-config-sign exec-gate trust-path /tmp/tool
+DENY	sh -c 'sudo innerwarden-config-sign exec-gate trust-path /tmp/tool'
+DENY	bash -c 'sudo innerwarden-config-sign exec-gate trust-path /tmp/tool'
+DENY	env -S 'sudo innerwarden-config-sign exec-gate trust-path /tmp/tool'
+DENY	flock -x /tmp/x -c 'sudo innerwarden-config-sign exec-gate trust-path /tmp/tool'
+DENY	busybox sh -c 'sudo innerwarden-config-sign exec-gate trust-path /tmp/tool'
+DENY	flock /tmp/x sudo innerwarden-config-sign exec-gate trust-path /tmp/tool
+DENY	taskset -c 0 sudo innerwarden-config-sign exec-gate trust-path /tmp/tool
+DENY	systemd-run --user --wait -q sudo innerwarden-config-sign exec-gate trust-path /tmp/tool
+DENY	unshare -U sudo innerwarden-config-sign exec-gate trust-path /tmp/tool
+DENY	watch -n 1 sudo innerwarden-config-sign exec-gate trust-path /tmp/tool
+DENY	nice sudo innerwarden-config-sign exec-gate trust-path /tmp/tool
+DENY	env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT sudo innerwarden-config-sign exec-gate trust-path /tmp/tool
+DENY	innerwarden-config-sign exec-gate scan
+DENY	sh -c 'innerwarden-config-sign exec-gate scan'
+DENY	bash -c 'innerwarden-config-sign exec-gate scan'
+DENY	env -S 'innerwarden-config-sign exec-gate scan'
+DENY	flock -x /tmp/x -c 'innerwarden-config-sign exec-gate scan'
+DENY	busybox sh -c 'innerwarden-config-sign exec-gate scan'
+DENY	flock /tmp/x innerwarden-config-sign exec-gate scan
+DENY	taskset -c 0 innerwarden-config-sign exec-gate scan
+DENY	systemd-run --user --wait -q innerwarden-config-sign exec-gate scan
+DENY	unshare -U innerwarden-config-sign exec-gate scan
+DENY	watch -n 1 innerwarden-config-sign exec-gate scan
+DENY	nice innerwarden-config-sign exec-gate scan
+DENY	env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT innerwarden-config-sign exec-gate scan
+DENY	sudo innerwarden-config-sign exec-gate scan
+DENY	sh -c 'sudo innerwarden-config-sign exec-gate scan'
+DENY	bash -c 'sudo innerwarden-config-sign exec-gate scan'
+DENY	env -S 'sudo innerwarden-config-sign exec-gate scan'
+DENY	flock -x /tmp/x -c 'sudo innerwarden-config-sign exec-gate scan'
+DENY	busybox sh -c 'sudo innerwarden-config-sign exec-gate scan'
+DENY	flock /tmp/x sudo innerwarden-config-sign exec-gate scan
+DENY	taskset -c 0 sudo innerwarden-config-sign exec-gate scan
+DENY	systemd-run --user --wait -q sudo innerwarden-config-sign exec-gate scan
+DENY	unshare -U sudo innerwarden-config-sign exec-gate scan
+DENY	watch -n 1 sudo innerwarden-config-sign exec-gate scan
+DENY	nice sudo innerwarden-config-sign exec-gate scan
+DENY	env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT sudo innerwarden-config-sign exec-gate scan
+DENY	innerwarden-config-sign exec-gate approve 0123abcd
+DENY	sh -c 'innerwarden-config-sign exec-gate approve 0123abcd'
+DENY	bash -c 'innerwarden-config-sign exec-gate approve 0123abcd'
+DENY	env -S 'innerwarden-config-sign exec-gate approve 0123abcd'
+DENY	flock -x /tmp/x -c 'innerwarden-config-sign exec-gate approve 0123abcd'
+DENY	busybox sh -c 'innerwarden-config-sign exec-gate approve 0123abcd'
+DENY	flock /tmp/x innerwarden-config-sign exec-gate approve 0123abcd
+DENY	taskset -c 0 innerwarden-config-sign exec-gate approve 0123abcd
+DENY	systemd-run --user --wait -q innerwarden-config-sign exec-gate approve 0123abcd
+DENY	unshare -U innerwarden-config-sign exec-gate approve 0123abcd
+DENY	watch -n 1 innerwarden-config-sign exec-gate approve 0123abcd
+DENY	nice innerwarden-config-sign exec-gate approve 0123abcd
+DENY	env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT innerwarden-config-sign exec-gate approve 0123abcd
+DENY	sudo innerwarden-config-sign exec-gate approve 0123abcd
+DENY	sh -c 'sudo innerwarden-config-sign exec-gate approve 0123abcd'
+DENY	bash -c 'sudo innerwarden-config-sign exec-gate approve 0123abcd'
+DENY	env -S 'sudo innerwarden-config-sign exec-gate approve 0123abcd'
+DENY	flock -x /tmp/x -c 'sudo innerwarden-config-sign exec-gate approve 0123abcd'
+DENY	busybox sh -c 'sudo innerwarden-config-sign exec-gate approve 0123abcd'
+DENY	flock /tmp/x sudo innerwarden-config-sign exec-gate approve 0123abcd
+DENY	taskset -c 0 sudo innerwarden-config-sign exec-gate approve 0123abcd
+DENY	systemd-run --user --wait -q sudo innerwarden-config-sign exec-gate approve 0123abcd
+DENY	unshare -U sudo innerwarden-config-sign exec-gate approve 0123abcd
+DENY	watch -n 1 sudo innerwarden-config-sign exec-gate approve 0123abcd
+DENY	nice sudo innerwarden-config-sign exec-gate approve 0123abcd
+DENY	env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT sudo innerwarden-config-sign exec-gate approve 0123abcd
+DENY	innerwarden-config-sign exec-gate seed-essentials
+DENY	sh -c 'innerwarden-config-sign exec-gate seed-essentials'
+DENY	bash -c 'innerwarden-config-sign exec-gate seed-essentials'
+DENY	env -S 'innerwarden-config-sign exec-gate seed-essentials'
+DENY	flock -x /tmp/x -c 'innerwarden-config-sign exec-gate seed-essentials'
+DENY	busybox sh -c 'innerwarden-config-sign exec-gate seed-essentials'
+DENY	flock /tmp/x innerwarden-config-sign exec-gate seed-essentials
+DENY	taskset -c 0 innerwarden-config-sign exec-gate seed-essentials
+DENY	systemd-run --user --wait -q innerwarden-config-sign exec-gate seed-essentials
+DENY	unshare -U innerwarden-config-sign exec-gate seed-essentials
+DENY	watch -n 1 innerwarden-config-sign exec-gate seed-essentials
+DENY	nice innerwarden-config-sign exec-gate seed-essentials
+DENY	env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT innerwarden-config-sign exec-gate seed-essentials
+DENY	sudo innerwarden-config-sign exec-gate seed-essentials
+DENY	sh -c 'sudo innerwarden-config-sign exec-gate seed-essentials'
+DENY	bash -c 'sudo innerwarden-config-sign exec-gate seed-essentials'
+DENY	env -S 'sudo innerwarden-config-sign exec-gate seed-essentials'
+DENY	flock -x /tmp/x -c 'sudo innerwarden-config-sign exec-gate seed-essentials'
+DENY	busybox sh -c 'sudo innerwarden-config-sign exec-gate seed-essentials'
+DENY	flock /tmp/x sudo innerwarden-config-sign exec-gate seed-essentials
+DENY	taskset -c 0 sudo innerwarden-config-sign exec-gate seed-essentials
+DENY	systemd-run --user --wait -q sudo innerwarden-config-sign exec-gate seed-essentials
+DENY	unshare -U sudo innerwarden-config-sign exec-gate seed-essentials
+DENY	watch -n 1 sudo innerwarden-config-sign exec-gate seed-essentials
+DENY	nice sudo innerwarden-config-sign exec-gate seed-essentials
+DENY	env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT sudo innerwarden-config-sign exec-gate seed-essentials
+DENY	innerwarden-config-sign exec-gate import-rules
+DENY	sh -c 'innerwarden-config-sign exec-gate import-rules'
+DENY	bash -c 'innerwarden-config-sign exec-gate import-rules'
+DENY	env -S 'innerwarden-config-sign exec-gate import-rules'
+DENY	flock -x /tmp/x -c 'innerwarden-config-sign exec-gate import-rules'
+DENY	busybox sh -c 'innerwarden-config-sign exec-gate import-rules'
+DENY	flock /tmp/x innerwarden-config-sign exec-gate import-rules
+DENY	taskset -c 0 innerwarden-config-sign exec-gate import-rules
+DENY	systemd-run --user --wait -q innerwarden-config-sign exec-gate import-rules
+DENY	unshare -U innerwarden-config-sign exec-gate import-rules
+DENY	watch -n 1 innerwarden-config-sign exec-gate import-rules
+DENY	nice innerwarden-config-sign exec-gate import-rules
+DENY	env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT innerwarden-config-sign exec-gate import-rules
+DENY	sudo innerwarden-config-sign exec-gate import-rules
+DENY	sh -c 'sudo innerwarden-config-sign exec-gate import-rules'
+DENY	bash -c 'sudo innerwarden-config-sign exec-gate import-rules'
+DENY	env -S 'sudo innerwarden-config-sign exec-gate import-rules'
+DENY	flock -x /tmp/x -c 'sudo innerwarden-config-sign exec-gate import-rules'
+DENY	busybox sh -c 'sudo innerwarden-config-sign exec-gate import-rules'
+DENY	flock /tmp/x sudo innerwarden-config-sign exec-gate import-rules
+DENY	taskset -c 0 sudo innerwarden-config-sign exec-gate import-rules
+DENY	systemd-run --user --wait -q sudo innerwarden-config-sign exec-gate import-rules
+DENY	unshare -U sudo innerwarden-config-sign exec-gate import-rules
+DENY	watch -n 1 sudo innerwarden-config-sign exec-gate import-rules
+DENY	nice sudo innerwarden-config-sign exec-gate import-rules
+DENY	env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT sudo innerwarden-config-sign exec-gate import-rules
+DENY	innerwarden-config-sign exec-gate disarm
+DENY	sh -c 'innerwarden-config-sign exec-gate disarm'
+DENY	bash -c 'innerwarden-config-sign exec-gate disarm'
+DENY	env -S 'innerwarden-config-sign exec-gate disarm'
+DENY	flock -x /tmp/x -c 'innerwarden-config-sign exec-gate disarm'
+DENY	busybox sh -c 'innerwarden-config-sign exec-gate disarm'
+DENY	flock /tmp/x innerwarden-config-sign exec-gate disarm
+DENY	taskset -c 0 innerwarden-config-sign exec-gate disarm
+DENY	systemd-run --user --wait -q innerwarden-config-sign exec-gate disarm
+DENY	unshare -U innerwarden-config-sign exec-gate disarm
+DENY	watch -n 1 innerwarden-config-sign exec-gate disarm
+DENY	nice innerwarden-config-sign exec-gate disarm
+DENY	env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT innerwarden-config-sign exec-gate disarm
+DENY	sudo innerwarden-config-sign exec-gate disarm
+DENY	sh -c 'sudo innerwarden-config-sign exec-gate disarm'
+DENY	bash -c 'sudo innerwarden-config-sign exec-gate disarm'
+DENY	env -S 'sudo innerwarden-config-sign exec-gate disarm'
+DENY	flock -x /tmp/x -c 'sudo innerwarden-config-sign exec-gate disarm'
+DENY	busybox sh -c 'sudo innerwarden-config-sign exec-gate disarm'
+DENY	flock /tmp/x sudo innerwarden-config-sign exec-gate disarm
+DENY	taskset -c 0 sudo innerwarden-config-sign exec-gate disarm
+DENY	systemd-run --user --wait -q sudo innerwarden-config-sign exec-gate disarm
+DENY	unshare -U sudo innerwarden-config-sign exec-gate disarm
+DENY	watch -n 1 sudo innerwarden-config-sign exec-gate disarm
+DENY	nice sudo innerwarden-config-sign exec-gate disarm
+DENY	env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT sudo innerwarden-config-sign exec-gate disarm
+DENY	innerwarden-config-sign exec-gate scope-agent --clear
+DENY	sh -c 'innerwarden-config-sign exec-gate scope-agent --clear'
+DENY	bash -c 'innerwarden-config-sign exec-gate scope-agent --clear'
+DENY	env -S 'innerwarden-config-sign exec-gate scope-agent --clear'
+DENY	flock -x /tmp/x -c 'innerwarden-config-sign exec-gate scope-agent --clear'
+DENY	busybox sh -c 'innerwarden-config-sign exec-gate scope-agent --clear'
+DENY	flock /tmp/x innerwarden-config-sign exec-gate scope-agent --clear
+DENY	taskset -c 0 innerwarden-config-sign exec-gate scope-agent --clear
+DENY	systemd-run --user --wait -q innerwarden-config-sign exec-gate scope-agent --clear
+DENY	unshare -U innerwarden-config-sign exec-gate scope-agent --clear
+DENY	watch -n 1 innerwarden-config-sign exec-gate scope-agent --clear
+DENY	nice innerwarden-config-sign exec-gate scope-agent --clear
+DENY	env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT innerwarden-config-sign exec-gate scope-agent --clear
+DENY	sudo innerwarden-config-sign exec-gate scope-agent --clear
+DENY	sh -c 'sudo innerwarden-config-sign exec-gate scope-agent --clear'
+DENY	bash -c 'sudo innerwarden-config-sign exec-gate scope-agent --clear'
+DENY	env -S 'sudo innerwarden-config-sign exec-gate scope-agent --clear'
+DENY	flock -x /tmp/x -c 'sudo innerwarden-config-sign exec-gate scope-agent --clear'
+DENY	busybox sh -c 'sudo innerwarden-config-sign exec-gate scope-agent --clear'
+DENY	flock /tmp/x sudo innerwarden-config-sign exec-gate scope-agent --clear
+DENY	taskset -c 0 sudo innerwarden-config-sign exec-gate scope-agent --clear
+DENY	systemd-run --user --wait -q sudo innerwarden-config-sign exec-gate scope-agent --clear
+DENY	unshare -U sudo innerwarden-config-sign exec-gate scope-agent --clear
+DENY	watch -n 1 sudo innerwarden-config-sign exec-gate scope-agent --clear
+DENY	nice sudo innerwarden-config-sign exec-gate scope-agent --clear
+DENY	env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT sudo innerwarden-config-sign exec-gate scope-agent --clear
+DENY	innerwarden-config-sign secret-guard scope-agent --clear
+DENY	sh -c 'innerwarden-config-sign secret-guard scope-agent --clear'
+DENY	bash -c 'innerwarden-config-sign secret-guard scope-agent --clear'
+DENY	env -S 'innerwarden-config-sign secret-guard scope-agent --clear'
+DENY	flock -x /tmp/x -c 'innerwarden-config-sign secret-guard scope-agent --clear'
+DENY	busybox sh -c 'innerwarden-config-sign secret-guard scope-agent --clear'
+DENY	flock /tmp/x innerwarden-config-sign secret-guard scope-agent --clear
+DENY	taskset -c 0 innerwarden-config-sign secret-guard scope-agent --clear
+DENY	systemd-run --user --wait -q innerwarden-config-sign secret-guard scope-agent --clear
+DENY	unshare -U innerwarden-config-sign secret-guard scope-agent --clear
+DENY	watch -n 1 innerwarden-config-sign secret-guard scope-agent --clear
+DENY	nice innerwarden-config-sign secret-guard scope-agent --clear
+DENY	env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT innerwarden-config-sign secret-guard scope-agent --clear
+DENY	sudo innerwarden-config-sign secret-guard scope-agent --clear
+DENY	sh -c 'sudo innerwarden-config-sign secret-guard scope-agent --clear'
+DENY	bash -c 'sudo innerwarden-config-sign secret-guard scope-agent --clear'
+DENY	env -S 'sudo innerwarden-config-sign secret-guard scope-agent --clear'
+DENY	flock -x /tmp/x -c 'sudo innerwarden-config-sign secret-guard scope-agent --clear'
+DENY	busybox sh -c 'sudo innerwarden-config-sign secret-guard scope-agent --clear'
+DENY	flock /tmp/x sudo innerwarden-config-sign secret-guard scope-agent --clear
+DENY	taskset -c 0 sudo innerwarden-config-sign secret-guard scope-agent --clear
+DENY	systemd-run --user --wait -q sudo innerwarden-config-sign secret-guard scope-agent --clear
+DENY	unshare -U sudo innerwarden-config-sign secret-guard scope-agent --clear
+DENY	watch -n 1 sudo innerwarden-config-sign secret-guard scope-agent --clear
+DENY	nice sudo innerwarden-config-sign secret-guard scope-agent --clear
+DENY	env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT sudo innerwarden-config-sign secret-guard scope-agent --clear
+DENY	innerwarden-config-sign secret-guard unprotect /home/dev/.ssh
+DENY	sh -c 'innerwarden-config-sign secret-guard unprotect /home/dev/.ssh'
+DENY	bash -c 'innerwarden-config-sign secret-guard unprotect /home/dev/.ssh'
+DENY	env -S 'innerwarden-config-sign secret-guard unprotect /home/dev/.ssh'
+DENY	flock -x /tmp/x -c 'innerwarden-config-sign secret-guard unprotect /home/dev/.ssh'
+DENY	busybox sh -c 'innerwarden-config-sign secret-guard unprotect /home/dev/.ssh'
+DENY	flock /tmp/x innerwarden-config-sign secret-guard unprotect /home/dev/.ssh
+DENY	taskset -c 0 innerwarden-config-sign secret-guard unprotect /home/dev/.ssh
+DENY	systemd-run --user --wait -q innerwarden-config-sign secret-guard unprotect /home/dev/.ssh
+DENY	unshare -U innerwarden-config-sign secret-guard unprotect /home/dev/.ssh
+DENY	watch -n 1 innerwarden-config-sign secret-guard unprotect /home/dev/.ssh
+DENY	nice innerwarden-config-sign secret-guard unprotect /home/dev/.ssh
+DENY	env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT innerwarden-config-sign secret-guard unprotect /home/dev/.ssh
+DENY	sudo innerwarden-config-sign secret-guard unprotect /home/dev/.ssh
+DENY	sh -c 'sudo innerwarden-config-sign secret-guard unprotect /home/dev/.ssh'
+DENY	bash -c 'sudo innerwarden-config-sign secret-guard unprotect /home/dev/.ssh'
+DENY	env -S 'sudo innerwarden-config-sign secret-guard unprotect /home/dev/.ssh'
+DENY	flock -x /tmp/x -c 'sudo innerwarden-config-sign secret-guard unprotect /home/dev/.ssh'
+DENY	busybox sh -c 'sudo innerwarden-config-sign secret-guard unprotect /home/dev/.ssh'
+DENY	flock /tmp/x sudo innerwarden-config-sign secret-guard unprotect /home/dev/.ssh
+DENY	taskset -c 0 sudo innerwarden-config-sign secret-guard unprotect /home/dev/.ssh
+DENY	systemd-run --user --wait -q sudo innerwarden-config-sign secret-guard unprotect /home/dev/.ssh
+DENY	unshare -U sudo innerwarden-config-sign secret-guard unprotect /home/dev/.ssh
+DENY	watch -n 1 sudo innerwarden-config-sign secret-guard unprotect /home/dev/.ssh
+DENY	nice sudo innerwarden-config-sign secret-guard unprotect /home/dev/.ssh
+DENY	env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT sudo innerwarden-config-sign secret-guard unprotect /home/dev/.ssh
+DENY	innerwarden-config-sign secret-guard disarm
+DENY	sh -c 'innerwarden-config-sign secret-guard disarm'
+DENY	bash -c 'innerwarden-config-sign secret-guard disarm'
+DENY	env -S 'innerwarden-config-sign secret-guard disarm'
+DENY	flock -x /tmp/x -c 'innerwarden-config-sign secret-guard disarm'
+DENY	busybox sh -c 'innerwarden-config-sign secret-guard disarm'
+DENY	flock /tmp/x innerwarden-config-sign secret-guard disarm
+DENY	taskset -c 0 innerwarden-config-sign secret-guard disarm
+DENY	systemd-run --user --wait -q innerwarden-config-sign secret-guard disarm
+DENY	unshare -U innerwarden-config-sign secret-guard disarm
+DENY	watch -n 1 innerwarden-config-sign secret-guard disarm
+DENY	nice innerwarden-config-sign secret-guard disarm
+DENY	env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT innerwarden-config-sign secret-guard disarm
+DENY	sudo innerwarden-config-sign secret-guard disarm
+DENY	sh -c 'sudo innerwarden-config-sign secret-guard disarm'
+DENY	bash -c 'sudo innerwarden-config-sign secret-guard disarm'
+DENY	env -S 'sudo innerwarden-config-sign secret-guard disarm'
+DENY	flock -x /tmp/x -c 'sudo innerwarden-config-sign secret-guard disarm'
+DENY	busybox sh -c 'sudo innerwarden-config-sign secret-guard disarm'
+DENY	flock /tmp/x sudo innerwarden-config-sign secret-guard disarm
+DENY	taskset -c 0 sudo innerwarden-config-sign secret-guard disarm
+DENY	systemd-run --user --wait -q sudo innerwarden-config-sign secret-guard disarm
+DENY	unshare -U sudo innerwarden-config-sign secret-guard disarm
+DENY	watch -n 1 sudo innerwarden-config-sign secret-guard disarm
+DENY	nice sudo innerwarden-config-sign secret-guard disarm
+DENY	env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT sudo innerwarden-config-sign secret-guard disarm
+DENY	innerwarden-config-sign dns-guard disarm
+DENY	sh -c 'innerwarden-config-sign dns-guard disarm'
+DENY	bash -c 'innerwarden-config-sign dns-guard disarm'
+DENY	env -S 'innerwarden-config-sign dns-guard disarm'
+DENY	flock -x /tmp/x -c 'innerwarden-config-sign dns-guard disarm'
+DENY	busybox sh -c 'innerwarden-config-sign dns-guard disarm'
+DENY	flock /tmp/x innerwarden-config-sign dns-guard disarm
+DENY	taskset -c 0 innerwarden-config-sign dns-guard disarm
+DENY	systemd-run --user --wait -q innerwarden-config-sign dns-guard disarm
+DENY	unshare -U innerwarden-config-sign dns-guard disarm
+DENY	watch -n 1 innerwarden-config-sign dns-guard disarm
+DENY	nice innerwarden-config-sign dns-guard disarm
+DENY	env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT innerwarden-config-sign dns-guard disarm
+DENY	sudo innerwarden-config-sign dns-guard disarm
+DENY	sh -c 'sudo innerwarden-config-sign dns-guard disarm'
+DENY	bash -c 'sudo innerwarden-config-sign dns-guard disarm'
+DENY	env -S 'sudo innerwarden-config-sign dns-guard disarm'
+DENY	flock -x /tmp/x -c 'sudo innerwarden-config-sign dns-guard disarm'
+DENY	busybox sh -c 'sudo innerwarden-config-sign dns-guard disarm'
+DENY	flock /tmp/x sudo innerwarden-config-sign dns-guard disarm
+DENY	taskset -c 0 sudo innerwarden-config-sign dns-guard disarm
+DENY	systemd-run --user --wait -q sudo innerwarden-config-sign dns-guard disarm
+DENY	unshare -U sudo innerwarden-config-sign dns-guard disarm
+DENY	watch -n 1 sudo innerwarden-config-sign dns-guard disarm
+DENY	nice sudo innerwarden-config-sign dns-guard disarm
+DENY	env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT sudo innerwarden-config-sign dns-guard disarm
+DENY	innerwarden-config-sign userns-guard disarm
+DENY	sh -c 'innerwarden-config-sign userns-guard disarm'
+DENY	bash -c 'innerwarden-config-sign userns-guard disarm'
+DENY	env -S 'innerwarden-config-sign userns-guard disarm'
+DENY	flock -x /tmp/x -c 'innerwarden-config-sign userns-guard disarm'
+DENY	busybox sh -c 'innerwarden-config-sign userns-guard disarm'
+DENY	flock /tmp/x innerwarden-config-sign userns-guard disarm
+DENY	taskset -c 0 innerwarden-config-sign userns-guard disarm
+DENY	systemd-run --user --wait -q innerwarden-config-sign userns-guard disarm
+DENY	unshare -U innerwarden-config-sign userns-guard disarm
+DENY	watch -n 1 innerwarden-config-sign userns-guard disarm
+DENY	nice innerwarden-config-sign userns-guard disarm
+DENY	env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT innerwarden-config-sign userns-guard disarm
+DENY	sudo innerwarden-config-sign userns-guard disarm
+DENY	sh -c 'sudo innerwarden-config-sign userns-guard disarm'
+DENY	bash -c 'sudo innerwarden-config-sign userns-guard disarm'
+DENY	env -S 'sudo innerwarden-config-sign userns-guard disarm'
+DENY	flock -x /tmp/x -c 'sudo innerwarden-config-sign userns-guard disarm'
+DENY	busybox sh -c 'sudo innerwarden-config-sign userns-guard disarm'
+DENY	flock /tmp/x sudo innerwarden-config-sign userns-guard disarm
+DENY	taskset -c 0 sudo innerwarden-config-sign userns-guard disarm
+DENY	systemd-run --user --wait -q sudo innerwarden-config-sign userns-guard disarm
+DENY	unshare -U sudo innerwarden-config-sign userns-guard disarm
+DENY	watch -n 1 sudo innerwarden-config-sign userns-guard disarm
+DENY	nice sudo innerwarden-config-sign userns-guard disarm
+DENY	env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT sudo innerwarden-config-sign userns-guard disarm
+DENY	innerwarden-config-sign lsm --apply
+DENY	sh -c 'innerwarden-config-sign lsm --apply'
+DENY	bash -c 'innerwarden-config-sign lsm --apply'
+DENY	env -S 'innerwarden-config-sign lsm --apply'
+DENY	flock -x /tmp/x -c 'innerwarden-config-sign lsm --apply'
+DENY	busybox sh -c 'innerwarden-config-sign lsm --apply'
+DENY	flock /tmp/x innerwarden-config-sign lsm --apply
+DENY	taskset -c 0 innerwarden-config-sign lsm --apply
+DENY	systemd-run --user --wait -q innerwarden-config-sign lsm --apply
+DENY	unshare -U innerwarden-config-sign lsm --apply
+DENY	watch -n 1 innerwarden-config-sign lsm --apply
+DENY	nice innerwarden-config-sign lsm --apply
+DENY	env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT innerwarden-config-sign lsm --apply
+DENY	sudo innerwarden-config-sign lsm --apply
+DENY	sh -c 'sudo innerwarden-config-sign lsm --apply'
+DENY	bash -c 'sudo innerwarden-config-sign lsm --apply'
+DENY	env -S 'sudo innerwarden-config-sign lsm --apply'
+DENY	flock -x /tmp/x -c 'sudo innerwarden-config-sign lsm --apply'
+DENY	busybox sh -c 'sudo innerwarden-config-sign lsm --apply'
+DENY	flock /tmp/x sudo innerwarden-config-sign lsm --apply
+DENY	taskset -c 0 sudo innerwarden-config-sign lsm --apply
+DENY	systemd-run --user --wait -q sudo innerwarden-config-sign lsm --apply
+DENY	unshare -U sudo innerwarden-config-sign lsm --apply
+DENY	watch -n 1 sudo innerwarden-config-sign lsm --apply
+DENY	nice sudo innerwarden-config-sign lsm --apply
+DENY	env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT sudo innerwarden-config-sign lsm --apply
+DENY	innerwarden-config-sign lsm --mode disabled --apply
+DENY	sh -c 'innerwarden-config-sign lsm --mode disabled --apply'
+DENY	bash -c 'innerwarden-config-sign lsm --mode disabled --apply'
+DENY	env -S 'innerwarden-config-sign lsm --mode disabled --apply'
+DENY	flock -x /tmp/x -c 'innerwarden-config-sign lsm --mode disabled --apply'
+DENY	busybox sh -c 'innerwarden-config-sign lsm --mode disabled --apply'
+DENY	flock /tmp/x innerwarden-config-sign lsm --mode disabled --apply
+DENY	taskset -c 0 innerwarden-config-sign lsm --mode disabled --apply
+DENY	systemd-run --user --wait -q innerwarden-config-sign lsm --mode disabled --apply
+DENY	unshare -U innerwarden-config-sign lsm --mode disabled --apply
+DENY	watch -n 1 innerwarden-config-sign lsm --mode disabled --apply
+DENY	nice innerwarden-config-sign lsm --mode disabled --apply
+DENY	env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT innerwarden-config-sign lsm --mode disabled --apply
+DENY	sudo innerwarden-config-sign lsm --mode disabled --apply
+DENY	sh -c 'sudo innerwarden-config-sign lsm --mode disabled --apply'
+DENY	bash -c 'sudo innerwarden-config-sign lsm --mode disabled --apply'
+DENY	env -S 'sudo innerwarden-config-sign lsm --mode disabled --apply'
+DENY	flock -x /tmp/x -c 'sudo innerwarden-config-sign lsm --mode disabled --apply'
+DENY	busybox sh -c 'sudo innerwarden-config-sign lsm --mode disabled --apply'
+DENY	flock /tmp/x sudo innerwarden-config-sign lsm --mode disabled --apply
+DENY	taskset -c 0 sudo innerwarden-config-sign lsm --mode disabled --apply
+DENY	systemd-run --user --wait -q sudo innerwarden-config-sign lsm --mode disabled --apply
+DENY	unshare -U sudo innerwarden-config-sign lsm --mode disabled --apply
+DENY	watch -n 1 sudo innerwarden-config-sign lsm --mode disabled --apply
+DENY	nice sudo innerwarden-config-sign lsm --mode disabled --apply
+DENY	env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT sudo innerwarden-config-sign lsm --mode disabled --apply
 ALLOW	innerwarden --version
 ALLOW	innerwarden-ctl agent kernel status
 ALLOW	innerwarden mute --list
@@ -623,3 +1799,11 @@ ALLOW	grep 'iw dry-run' docs/
 ALLOW	echo 'iw dry-run'
 ALLOW	env -S 'ls -la'
 ALLOW	I=iw; echo $I
+ALLOW	sh -c "echo innerwarden\ dry-run"
+ALLOW	>/dev/null innerwarden --version
+ALLOW	innerwarden --version # it's on
+ALLOW	sudo innerwarden-ctl exec-gate arm --pid 1234 --observe
+ALLOW	sudo innerwarden-ctl exec-gate status
+ALLOW	sudo innerwarden-config-sign exec-gate list
+ALLOW	sudo innerwarden-config-sign secret-guard status
+ALLOW	sudo innerwarden-config-sign secret-guard protect --path /etc/app/prod.key

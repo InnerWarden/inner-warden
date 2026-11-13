@@ -57,3 +57,68 @@ list, with every limit.
 The verdict is JSON: a recommendation (`allow` / `review` / `deny`), a risk
 score, matched signals, and a short explanation.
 
+## The guard and its own switches
+
+An agent that could turn its guard off would not be guarded. Under an
+enforcing hook (`innerwarden enforce`), the guard refuses an agent the
+following, and says they are the person's to run, from their own terminal.
+
+- The guard's own loosening commands: allow, mute, monitor and dry-run, the
+  agent decisions (approve, profile, allow, revoke), disconnecting an agent,
+  connecting or installing one in monitor, uninstalling, and starting a jail
+  (which rewrites the agent's hook). A read, help, a connect that keeps
+  enforcing and `contain --dry-run` stay open.
+- The commands of InnerWarden Pro's tools that disarm one of its guards or
+  widen what it lets through.
+- A write to what carries the guard: the agent settings that load its hook,
+  the guard's configuration and the guard's program. That holds through a
+  file tool and from the shell: a redirection, `tee`, `cp`, `mv`, `rm`, `ln`,
+  `install`, `sed -i`, `dd`, a download saved over it, a `chmod` that closes
+  it to its owner. Removing, moving or locking an agent's own settings folder
+  counts, because the settings go with it.
+- The same command however the line spells it: behind `sudo`, `env`, a lock
+  or a scheduling wrapper, as the argument of a shell or of `ssh`, in a
+  variable or a value the line builds, under a pattern that can match the
+  guard's name, or as text piped into a shell or an interpreter.
+- A line that names the guard and holds a part the guard cannot read. It is
+  refused, not guessed at, and the refusal says how to write the line so that
+  it can be read.
+
+The CLI is a second check. Run inside an AI agent's shell, where the hook does
+not see the call (a script the agent wrote), `innerwarden` refuses its own
+loosening commands.
+
+### Where this ends
+
+The guard reads the text of one command, before it runs. It does not see:
+
+- A name or a command that never appears in the text, because it is decoded
+  or put together only when the line runs.
+- What an earlier command prepared: a script, or a copy of a program under
+  another name.
+- A write whose target the text does not spell: one found by a pattern or a
+  search, made from inside an editor or by code handed to an interpreter, or
+  carried in an archive or a patch.
+- A writing command (`cp`, `mv`, `tee` and the like) that the line runs from
+  inside a function it defines, a `case` arm or a command substitution. A
+  redirection is read in those places; the commands are read where they
+  stand as a command of the line.
+- Anything in monitor mode, which records and refuses nothing.
+
+An agent's hook lets a call run unless the guard answers with a refusal. A
+guard that takes too long answers with one (ten seconds, thirty with a second
+opinion from a model configured, under an enforcing hook). A guard whose
+program is gone or cannot start answers nothing, and the
+call runs: that is why a write to the guard's program is refused above.
+
+Some ordinary lines are refused by the same rules, and the refusal says so: a
+program run from a variable on a line that also names the guard, an agent
+that copies a new `innerwarden` binary into place, or one that writes a
+project's `.mcp.json` or removes a project's `.claude` folder from the shell.
+Those are yours to run.
+
+These are the limits of a guard that reads text. InnerWarden Pro works below
+the text, at the host (Linux): armed for an agent, its Execution Gate decides
+in the kernel which programs that agent's processes may start, whatever the
+command line says. It is off until you arm it.
+
